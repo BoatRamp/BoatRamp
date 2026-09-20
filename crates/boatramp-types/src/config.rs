@@ -520,6 +520,13 @@ pub struct HandlerConfig {
     /// present it must **narrow within** the site ceiling ([`crate::tenancy::Tenancy::narrows_within`])
     /// — a widening is refused fail-closed at bind. Lets one site host handlers at different modes
     /// (e.g. an `own` page handler beside an `all` admin handler under a site ceiling of `all`).
+    ///
+    /// A route may deliberately EXCEED the site ceiling (task #470) via
+    /// [`Tenancy::Scoped::exceed_site_ceiling`](crate::tenancy::Tenancy::Scoped) — but only when the
+    /// site has also set [`HandlersSiteConfig::allow_ceiling_exceptions`], and only a scoped
+    /// read/write widening on the same tenant column (an `all` grant still needs the operator posture
+    /// at runtime). This is the authorized, greppable way to run an unscoped `all` route (e.g. an M2M
+    /// `/token`) under an otherwise `own`-ceilinged site.
     #[serde(
         default,
         deserialize_with = "crate::tenancy::de_opt_tenancy",
@@ -602,6 +609,41 @@ pub struct ConsumerConfig {
     /// forwarded bearer). Absent ⇒ the token source can't verify (fail-closed).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_claims: Option<HandlerGraphqlTokenClaims>,
+    /// Per-consumer redelivery **visibility timeout** in ms (≈ JetStream *AckWait*): how long a
+    /// claimed-but-unacked message stays leased before redelivery. `None` ⇒ the server default
+    /// (30 s). A short lease suits fast retry/DLQ; a long one suits big-blob work — one global
+    /// constant can't serve both. (JetStream-per-consumer-config parity, P1.)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_ms: Option<u64>,
+    /// Per-consumer **max delivery attempts** before a message is dead-lettered (≈ JetStream
+    /// *MaxDeliver*). `None` ⇒ the server default (5).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_attempts: Option<u32>,
+    /// Per-consumer **max messages claimed per tick** (the pull batch size). `None` ⇒ the server
+    /// default (16). Bounds the consumer's in-flight window per dispatch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_batch: Option<usize>,
+    /// Per-consumer **MaxAckPending** — the most leased-but-unacked messages this consumer may hold
+    /// at once, ACROSS ticks (≈ JetStream *MaxAckPending*). Back-pressure for a slow consumer: the
+    /// dispatcher claims only up to `max_ack_pending − current_in_flight` each tick, and nothing while
+    /// already at the cap. `None` ⇒ unbounded (only `max_batch` per-tick bounds it). (P2 flow control.)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_ack_pending: Option<usize>,
+    /// Per-consumer **redelivery backoff** in ms (≈ JetStream *BackOff*). On a failed delivery
+    /// (an explicit nack before `max_attempts`), the message is held invisible for
+    /// `backoff_ms × attempts` before it can be redelivered — a linear escalation that spaces out
+    /// retries of a persistently-failing message instead of hot-looping it. `None`/`0` ⇒ immediate
+    /// redelivery (the historical behavior). Bounded by `lease_ms`-style visibility; a crash without
+    /// a nack still redelivers on lease expiry (backoff applies only to explicit nacks). (P1.)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backoff_ms: Option<u64>,
+    /// Per-consumer **retention** in ms for a grouped topic's retained log/payload (≈ JetStream
+    /// stream *MaxAge*) — how long a fan-out message is kept for slow/absent groups before the
+    /// retention sweep reclaims it. `None` ⇒ the server default (24 h). Only meaningful for a
+    /// grouped consumer (the work-queue deletes on ack); a shorter value caps storage for a
+    /// high-volume bus, a longer one tolerates a slower group. (P1.)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention_ms: Option<u64>,
 }
 
 /// serde `skip_serializing_if` helper: a `Latest` start is the default and elided.
@@ -856,6 +898,17 @@ pub struct HandlersSiteConfig {
         skip_serializing_if = "Option::is_none"
     )]
     pub tenancy: Option<crate::tenancy::Tenancy>,
+    /// **Site-level enablement of per-route ceiling exceptions** (task #470, key 1 of the three-key
+    /// model). Default `false`. Set NEXT TO the site [`tenancy`](Self::tenancy) ceiling, this is the
+    /// baseline-definer affirmatively permitting routes to exceed its own baseline. While `false`,
+    /// EVERY route's [`Tenancy::Scoped::exceed_site_ceiling`](crate::tenancy::Tenancy::Scoped) token
+    /// is inert — a widening still fails closed. Turning it on unlocks nothing by itself (a route
+    /// must ALSO carry the token, and `all` still needs the operator posture). Keeping it default
+    /// `false` gives an honest one-line audit: a site with `allow_ceiling_exceptions = false` is
+    /// provably exception-free without scanning every route, and exceptions require a conscious
+    /// site-level decision rather than route-by-route sprinkling.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_ceiling_exceptions: bool,
 }
 
 /// Browser cookie session auth for a site (see [`HandlersSiteConfig::cookie_auth`]). boatramp
@@ -1189,6 +1242,29 @@ mod tests {
         assert_eq!(config.index, vec!["index.html".to_string()]);
         assert_eq!(config.trailing_slash, TrailingSlash::Preserve);
         assert!(config.redirects.is_empty());
+    }
+
+    #[test]
+    fn consumer_per_consumer_tuning_is_optional_and_round_trips() {
+        // Back-compat: a consumer with no tuning fields leaves them `None` (server defaults apply).
+        let bare: ConsumerConfig =
+            serde_json::from_str(r#"{"topic":"orders","component":"c.wasm"}"#).unwrap();
+        assert_eq!(bare.lease_ms, None);
+        assert_eq!(bare.max_attempts, None);
+        assert_eq!(bare.max_batch, None);
+        // Explicit per-consumer overrides (≈ JetStream AckWait/MaxDeliver/batch) round-trip.
+        let tuned: ConsumerConfig = serde_json::from_str(
+            r#"{"topic":"orders","component":"c.wasm","lease_ms":5000,"max_attempts":10,"max_batch":64}"#,
+        )
+        .unwrap();
+        assert_eq!(tuned.lease_ms, Some(5000));
+        assert_eq!(tuned.max_attempts, Some(10));
+        assert_eq!(tuned.max_batch, Some(64));
+        let reparsed: ConsumerConfig =
+            serde_json::from_str(&serde_json::to_string(&tuned).unwrap()).unwrap();
+        assert_eq!(reparsed.lease_ms, Some(5000));
+        assert_eq!(reparsed.max_attempts, Some(10));
+        assert_eq!(reparsed.max_batch, Some(64));
     }
 
     #[test]

@@ -34,7 +34,7 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 
-use crate::kv::KvStore;
+use crate::kv::{KvStore, WriteOp};
 use crate::{PutMeta, Storage};
 
 /// A message claimed for delivery to a consumer.
@@ -57,6 +57,10 @@ pub struct ClaimedMessage {
     /// the consumer's tenant resolver verifies it (signature + expiry) against the fleet anchor and
     /// resolves the `signed_context` source; a forged/absent envelope fails an "own" op closed.
     pub signed_context: Option<String>,
+    /// Whether this message's payload was **inlined** in its index record (A3) rather than stored
+    /// as a separate object — so `ack` can skip the object-store delete (there is no object to
+    /// delete). Set by the claim path from the record; internal bookkeeping, not guest-visible.
+    pub inline: bool,
 }
 
 // A new consumer group's start position — defined in `boatramp-types` (so the
@@ -72,12 +76,54 @@ pub enum MessagingError {
     /// A stored record could not be decoded.
     #[error("messaging decode error: {0}")]
     Decode(String),
+    /// The backend does not support the requested operator control (e.g. a per-topic policy on a
+    /// backend that can't persist/enforce one). A **fail-closed** refusal: an operator's cap is
+    /// rejected loudly rather than silently dropped.
+    #[error("messaging operation not supported by this backend: {0}")]
+    Unsupported(String),
+    /// A publish was rejected because the topic's backlog is already at its operator-configured
+    /// `max_depth` (Feature B, fail-closed): nothing was enqueued. The producer must back off / retry.
+    #[error("publish rejected: topic {0:?} backlog is at its configured max_depth")]
+    DepthExceeded(String),
+    /// A publish was rejected because the topic's per-node publish rate exceeded its
+    /// operator-configured `max_rate_per_sec` (Feature B, best-effort token bucket): nothing was
+    /// enqueued. The producer must back off / retry.
+    #[error("publish rejected: topic {0:?} exceeded its configured max_rate_per_sec")]
+    RateExceeded(String),
 }
 
 impl MessagingError {
     fn backend<E: std::fmt::Display>(err: E) -> Self {
         Self::Backend(err.to_string())
     }
+}
+
+/// A per-topic operator flow-control policy (v0.4.24), stored in the KV under [`mqpolicy_key`] as
+/// JSON (mirroring the [`pause_key`] marker pattern — a tiny per-topic KV record). Every field is
+/// optional: a `None` field means "no cap on that axis", so an all-`None` policy (or no policy at
+/// all) is exactly the pre-v0.4.24 behavior. Set via [`Messaging::set_topic_policy`], read (cached)
+/// on the publish hot path via [`Messaging::topic_policy`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TopicPolicy {
+    /// **Backlog cap (fail-closed).** When set, a publish is rejected with
+    /// [`MessagingError::DepthExceeded`] if the topic's current [`backlog`](Messaging::backlog) is
+    /// already `>= max_depth` — nothing is enqueued. `None` ⇒ unbounded (and the hot path never even
+    /// calls `backlog`, so an uncapped topic pays nothing).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_depth: Option<usize>,
+    /// **Per-node publish rate cap (best-effort).** When set, a per-node per-topic token bucket
+    /// refilling at this many tokens/sec gates publishes; a publish with no token is rejected with
+    /// [`MessagingError::RateExceeded`]. Deliberately **per-node** (each node enforces its own bucket
+    /// independently) — a cluster-wide exact rate would need a replicated counter on the hot path.
+    /// `None` ⇒ unlimited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_rate_per_sec: Option<u32>,
+    /// **Per-topic relaxed-durability budget (single-node only).** Overrides the node-wide
+    /// [`LogMessaging::with_max_unflushed`] budget FOR THIS TOPIC: how many of this topic's messages
+    /// may fast-ack on the memtable before a durable checkpoint is forced. `None` ⇒ inherit the node
+    /// default. Inert on the cluster (its durability is replication, a different axis).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_unflushed: Option<usize>,
 }
 
 /// A durable pub/sub topic substrate with at-least-once consumer delivery. The
@@ -103,6 +149,72 @@ pub trait Messaging: Send + Sync {
         _signed_context: Option<&str>,
     ) -> Result<(), MessagingError> {
         self.publish(topic, payload).await
+    }
+
+    /// Publish a **batch** of messages in ONE durable commit — the guest-facing pipelined-publish
+    /// primitive (A4). Each entry is `(topic, payload)`; entries may target different topics. Every
+    /// message shares the one host-minted `signed_context`: a batch comes from a single producer
+    /// invocation, so there is exactly one producer principal and no cross-tenant mixing. Returns
+    /// only after the WHOLE batch is durably committed (at-least-once); on failure NONE are
+    /// acknowledged as published (fail-all, symmetric to the group-commit contract). An empty batch
+    /// is a no-op `Ok`. The default impl publishes sequentially (correct but uncoalesced); the
+    /// durable backends override it to coalesce every message's index write into a single
+    /// `write_batch` / one Raft entry — the whole point of the primitive.
+    async fn publish_batch_ctx(
+        &self,
+        messages: &[(String, Vec<u8>)],
+        signed_context: Option<&str>,
+    ) -> Result<(), MessagingError> {
+        for (topic, payload) in messages {
+            self.publish_ctx(topic, payload, signed_context).await?;
+        }
+        Ok(())
+    }
+
+    /// Publish with a visibility **delay** (P2 delivery modes): the message is durably enqueued now but
+    /// is not claimable until `delay` elapses — scheduled/delayed delivery, and the basis for
+    /// redelivery backoff. `delay == 0` is identical to [`publish_ctx`](Self::publish_ctx). Reuses the
+    /// lease/visibility mechanism: the message's initial not-before is set to `now + delay`, so a claim
+    /// before then skips it exactly as it skips a leased message, and after then delivers it as
+    /// attempt 1. The default drops the delay and delegates to `publish_ctx`; the durable backends
+    /// honor it.
+    async fn publish_delayed_ctx(
+        &self,
+        topic: &str,
+        payload: &[u8],
+        _delay: Duration,
+        signed_context: Option<&str>,
+    ) -> Result<(), MessagingError> {
+        self.publish_ctx(topic, payload, signed_context).await
+    }
+
+    /// Publish with a **TTL** (P2 delivery modes): an un-delivered message is dead-lettered (reason
+    /// `ttl-expired`) once `ttl` elapses, instead of being delivered — for time-sensitive work that
+    /// is worthless if stale. `ttl == 0` ⇒ no expiry (identical to [`publish_ctx`](Self::publish_ctx)).
+    /// The default drops the TTL and delegates; the durable backends honor it via the record's
+    /// `expires_at_ms`, enforced in [`plan_claim`].
+    async fn publish_with_ttl_ctx(
+        &self,
+        topic: &str,
+        payload: &[u8],
+        _ttl: Duration,
+        signed_context: Option<&str>,
+    ) -> Result<(), MessagingError> {
+        self.publish_ctx(topic, payload, signed_context).await
+    }
+
+    /// Publish with a **priority** (P2 delivery modes): higher-priority messages are leased first, with
+    /// FIFO among equal priorities. `priority == 0` is normal (identical to [`publish_ctx`](Self::
+    /// publish_ctx)). Work-queue only. The default drops the priority and delegates; the durable
+    /// backends honor it via the record's `priority`, ordered in [`plan_claim`].
+    async fn publish_with_priority_ctx(
+        &self,
+        topic: &str,
+        payload: &[u8],
+        _priority: u8,
+        signed_context: Option<&str>,
+    ) -> Result<(), MessagingError> {
+        self.publish_ctx(topic, payload, signed_context).await
     }
 
     /// Atomically claim up to `max_batch` deliverable messages from `topic`,
@@ -151,6 +263,17 @@ pub trait Messaging: Send + Sync {
     /// count is preserved, so it still dead-letters after `max_attempts`.
     async fn nack(&self, msg: &ClaimedMessage) -> Result<(), MessagingError>;
 
+    /// Negative-acknowledge with a **redelivery backoff**: keep the message invisible (leased) for
+    /// `delay_ms` before it becomes claimable again, instead of immediately (P1 per-consumer
+    /// `backoff_ms`). The attempt count is still preserved (it dead-letters after `max_attempts`),
+    /// and a `delay_ms` of 0 is exactly [`nack`](Self::nack). The default impl ignores the delay and
+    /// delegates to [`nack`](Self::nack), so a backend without a visibility field still redelivers
+    /// (just without the spacing) — never strands the message.
+    async fn nack_after(&self, msg: &ClaimedMessage, delay_ms: u64) -> Result<(), MessagingError> {
+        let _ = delay_ms;
+        self.nack(msg).await
+    }
+
     /// Number of messages still queued on `topic` (claimable *or* leased) — the
     /// consumer backlog / lag, for ops introspection. Default
     /// `0` for backends without introspection.
@@ -161,6 +284,30 @@ pub trait Messaging: Send + Sync {
     /// Number of dead-lettered messages on `topic` (exhausted `max_attempts`),
     /// for ops introspection. Default `0`.
     async fn dead_letter_count(&self, _topic: &str) -> Result<usize, MessagingError> {
+        Ok(0)
+    }
+
+    /// Age in ms of the OLDEST still-pending message on `topic` (the earliest live id, claimable or
+    /// leased), or `None` if empty — the "how stale is my backlog" signal (≈ JetStream's
+    /// oldest-unacked age). Ids are time-ordered, so it's the age of the earliest live id. Scoped to
+    /// the work-queue index (grouped topics track a per-group frontier — use group lag). Default
+    /// `None` for backends without introspection.
+    async fn oldest_pending_ms(&self, _topic: &str) -> Result<Option<u64>, MessagingError> {
+        Ok(None)
+    }
+
+    /// Number of IN-FLIGHT (leased-but-unacked) messages on `topic` — distinct from `backlog`
+    /// (claimable *plus* leased), so an operator can tell "queued and draining" from "queued and
+    /// wedged" (≈ JetStream's ack-pending). Counts the work-queue's leased records and every
+    /// consumer group's in-flight set. Default `0`.
+    async fn in_flight_count(&self, _topic: &str) -> Result<usize, MessagingError> {
+        Ok(0)
+    }
+
+    /// Consumer-group **lag** on a grouped `topic`: retained messages `group` has not yet leased
+    /// (log ids strictly beyond its high-water). The fan-out analog of `backlog` — the "who's
+    /// lagging" signal. `0` for the work-queue (empty group) or an unknown group. Default `0`.
+    async fn group_lag(&self, _topic: &str, _group: &str) -> Result<usize, MessagingError> {
         Ok(0)
     }
 
@@ -181,13 +328,165 @@ pub trait Messaging: Send + Sync {
         Ok(0)
     }
 
+    /// Record a sanitized HOST reason for the most recent failed delivery of `msg`, so it survives
+    /// into the dead-letter record for `dlq ls/show` and `--match` (P1/SEC6). Called by the
+    /// dispatcher on a failed consume (before the message may later dead-letter). `reason` is a host
+    /// classification (never guest bytes); the backend sanitizes + bounds it via
+    /// [`sanitize_reason`]. A no-op on a message that has since been acked/gone. Default no-op
+    /// (backends without a per-message record).
+    async fn set_last_error(
+        &self,
+        _msg: &ClaimedMessage,
+        _reason: &str,
+    ) -> Result<(), MessagingError> {
+        Ok(())
+    }
+
+    /// **List** the dead-letters on `topic` matching `filter` (P1 `dlq ls`) — metadata only
+    /// (`DeadLetter::payload` is `None`; use [`show_dead_letter`](Self::show_dead_letter) for a body).
+    /// Covers BOTH the work-queue and every consumer group's DLQ, ordered by id. Default empty.
+    async fn list_dead_letters(
+        &self,
+        _topic: &str,
+        _filter: &DeadLetterFilter,
+    ) -> Result<Vec<DeadLetter>, MessagingError> {
+        Ok(Vec::new())
+    }
+
+    /// **Show** one dead-letter in full, including its payload (P1 `dlq show <topic> <id>`). `group`
+    /// selects the lane (`""` = work-queue). `None` if no such dead-letter. Default `None`.
+    async fn show_dead_letter(
+        &self,
+        _topic: &str,
+        _group: &str,
+        _id: &str,
+    ) -> Result<Option<DeadLetter>, MessagingError> {
+        Ok(None)
+    }
+
+    /// **Redrive** only the dead-letters matching `filter` (P1 `dlq redrive --id|--older-than|--match
+    /// |--limit`). Same re-arm semantics as [`redrive_dead_letters`](Self::redrive_dead_letters) but
+    /// selective. Returns the number redriven. Default no-op (`0`).
+    async fn redrive_dead_letters_filtered(
+        &self,
+        _topic: &str,
+        _filter: &DeadLetterFilter,
+    ) -> Result<usize, MessagingError> {
+        Ok(0)
+    }
+
+    /// **Discard** only the dead-letters matching `filter` (P1 `dlq discard …`) — delete the records
+    /// (+ work-queue payloads), never re-queuing. The selective analog of
+    /// [`purge_dead_letters`](Self::purge_dead_letters). Returns the number discarded. Default `0`.
+    async fn discard_dead_letters(
+        &self,
+        _topic: &str,
+        _filter: &DeadLetterFilter,
+    ) -> Result<usize, MessagingError> {
+        Ok(0)
+    }
+
+    /// **Peek** up to `limit` messages on `topic`'s work-queue WITHOUT claiming them — no lease is
+    /// taken and no attempt is charged, so it is a pure read (`queue peek`). Ordered by id (delivery
+    /// order); each carries whether it is currently `leased` (in-flight) or claimable. Default empty.
+    async fn peek(
+        &self,
+        _topic: &str,
+        _limit: usize,
+    ) -> Result<Vec<PeekedMessage>, MessagingError> {
+        Ok(Vec::new())
+    }
+
+    /// **Replay** a grouped `topic`'s retained history from `after` (exclusive; `None` = the start),
+    /// up to `limit`, WITHOUT consuming or touching any group's cursor (P2 durable replay). The
+    /// read-from-offset companion to [`subscribe`](Self::subscribe) (live tail) and
+    /// [`reset_group`](Self::reset_group) (a group re-consuming): re-read history for debugging or to
+    /// rebuild state, without disturbing live consumers. Only GROUPED topics retain history — the
+    /// work-queue deletes on ack (use [`peek`](Self::peek) there). Ordered by id. Default empty.
+    async fn replay(
+        &self,
+        _topic: &str,
+        _after: Option<&str>,
+        _limit: usize,
+    ) -> Result<Vec<PeekedMessage>, MessagingError> {
+        Ok(Vec::new())
+    }
+
+    /// **List** the consumer groups registered on a grouped `topic` (P2 `queue groups`) with each
+    /// group's cursor + health (hwm, in-flight, lag). Read-only. Default empty (no groups).
+    async fn list_groups(&self, _topic: &str) -> Result<Vec<GroupInfo>, MessagingError> {
+        Ok(Vec::new())
+    }
+
+    /// **Reset** a consumer group's cursor (P2 `queue group-reset`): move its high-water to `start`
+    /// (`Earliest` ⇒ re-consume the whole retained backlog; `Latest` ⇒ skip to the current head) and
+    /// drop its in-flight set. An admin action — a deliberate re-consume/skip. Default: refuse
+    /// (backends without consumer groups), so an unsupported reset fails closed rather than silently
+    /// doing nothing.
+    async fn reset_group(
+        &self,
+        _topic: &str,
+        _group: &str,
+        _start: StartPosition,
+    ) -> Result<(), MessagingError> {
+        Err(MessagingError::Backend(
+            "this messaging backend does not support consumer groups".into(),
+        ))
+    }
+
+    /// **Delete** a consumer group (P2 `queue group-delete`): remove its durable state + its
+    /// dead-letters. The shared retained log/payloads it was pinning are reclaimed by the retention
+    /// sweep once no remaining group needs them. Default no-op (`0` groups to delete).
+    async fn delete_group(&self, _topic: &str, _group: &str) -> Result<(), MessagingError> {
+        Ok(())
+    }
+
+    /// **Pause / resume** a topic (P2 flow control `queue pause|resume|drain`). While paused, `claim`
+    /// and `claim_grouped` deliver NOTHING (new deliveries suppressed) — publish still durably
+    /// enqueues, and in-flight leases still ack/nack/expire, so "drain" = pause + let outstanding
+    /// finish. An operator backpressure/maintenance control. Default no-op.
+    async fn set_paused(&self, _topic: &str, _paused: bool) -> Result<(), MessagingError> {
+        Ok(())
+    }
+
+    /// Whether `topic` is currently paused (P2 flow control) — for stats/CLI. Default `false`.
+    async fn is_paused(&self, _topic: &str) -> Result<bool, MessagingError> {
+        Ok(false)
+    }
+
+    /// **Set** a per-topic operator flow-control policy ([`TopicPolicy`], v0.4.24): backlog cap,
+    /// per-node rate cap, and (single-node) relaxed-durability override. Persisted as JSON in the KV
+    /// (mirroring the pause marker) and enforced on the publish path. Default: **refuse** with
+    /// [`MessagingError::Unsupported`], so a backend that cannot persist/enforce a policy fails closed
+    /// (an operator's cap is never silently dropped) rather than pretending to accept it.
+    async fn set_topic_policy(
+        &self,
+        _topic: &str,
+        _policy: TopicPolicy,
+    ) -> Result<(), MessagingError> {
+        Err(MessagingError::Unsupported(
+            "per-topic policy is not supported by this messaging backend".into(),
+        ))
+    }
+
+    /// **Read** a topic's operator policy ([`TopicPolicy`]), or `None` if none is set. Default `None`
+    /// (no policy ⇒ pre-v0.4.24 unbounded behavior). The durable backends cache this so the publish
+    /// hot path does not KV-read on every publish.
+    async fn topic_policy(&self, _topic: &str) -> Result<Option<TopicPolicy>, MessagingError> {
+        Ok(None)
+    }
+
     /// Reclaim the retained fan-out log + payloads on a **grouped** `topic` that
     /// every consumer group has already consumed (a message below every group's
     /// high-water with none holding it in-flight), with an age-based TTL backstop.
     /// A *periodic* maintenance sweep the scheduler calls off the hot claim path —
     /// bounds a grouped topic's storage without slowing delivery. Returns the
     /// number reclaimed; default no-op (`0`) for backends without a retained log.
-    async fn retention_sweep(&self, _topic: &str) -> Result<usize, MessagingError> {
+    async fn retention_sweep(
+        &self,
+        _topic: &str,
+        _retention_ms: u64,
+    ) -> Result<usize, MessagingError> {
         Ok(0)
     }
 
@@ -241,6 +540,113 @@ pub struct Record {
     /// (`skip_serializing_if`). Verified — never trusted — at consume time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signed_context: Option<String>,
+    /// **Inlined payload** (A3): for a small work-queue message (`<= INLINE_MAX`, no consumer
+    /// groups) the body rides IN this index record instead of a separate object-store object — so
+    /// publish is one local durable write (no object-store round-trip) and claim needs no fetch. It
+    /// travels with the record through lease/dead-letter/redrive transparently. `None` ⇒ the payload
+    /// lives in [`Storage`] at [`payload_key`] (grouped topics + payloads over `INLINE_MAX`). Elided
+    /// when absent so pre-A3 records stay byte-identical (`#[serde(default)]` + `skip_serializing_if`).
+    #[serde(default, with = "inline_b64", skip_serializing_if = "Option::is_none")]
+    pub inline: Option<Vec<u8>>,
+    /// **Last failure reason** (P1 selective DLQ, SEC6): a sanitized, host-classified reason for the
+    /// most recent failed delivery (e.g. `guest-error`, `guest-trap`, `timeout`) — never guest-supplied
+    /// bytes and never PII, capped at [`LAST_ERROR_MAX`] chars. Set by the dispatcher via
+    /// [`set_last_error`](Messaging::set_last_error) so it survives into the dead-letter record for
+    /// `dlq ls/show` and `--match` filtering. `None` for a message that never failed, or written by an
+    /// older binary. Elided when absent (`skip_serializing_if`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    /// **Message expiry** (P2 delivery-mode TTL): absolute unix-ms after which an un-delivered message
+    /// is dead-lettered (reason `ttl-expired`) instead of leased — set from a publish-time TTL. `0` =
+    /// no expiry. Checked in [`plan_claim`] after the lease skip, so a leased message is (re)checked on
+    /// its next claim. Elided when `0` (`skip_serializing_if`) so pre-TTL records stay byte-identical.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub expires_at_ms: u64,
+    /// **Delivery priority** (P2 delivery modes): higher is delivered first; ties break by id (so it
+    /// is priority-then-FIFO). `0` = normal (the default — every message equal ⇒ pure FIFO, so
+    /// pre-priority behavior is unchanged). Work-queue only (grouped fan-out is append-log-ordered).
+    /// Elided when `0` (`skip_serializing_if`) so pre-priority records stay byte-identical.
+    #[serde(default, skip_serializing_if = "is_zero_u8")]
+    pub priority: u8,
+}
+
+/// serde `skip_serializing_if` for a `u8` elided when `0` (keeps pre-priority records byte-identical).
+fn is_zero_u8(v: &u8) -> bool {
+    *v == 0
+}
+
+/// serde `skip_serializing_if` for a `u64` that is elided when `0` (keeps pre-TTL records byte-identical).
+fn is_zero_u64(v: &u64) -> bool {
+    *v == 0
+}
+
+/// serde codec for [`Record::inline`]: base64 (not a JSON byte-array) so an inlined payload stays
+/// compact in the record's JSON — the whole point of inlining is to avoid a fat encoding on the
+/// hot durable-write path (and in the Raft log for a cluster).
+mod inline_b64 {
+    use base64::Engine as _;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(v: &Option<Vec<u8>>, s: S) -> Result<S::Ok, S::Error> {
+        match v {
+            Some(bytes) => {
+                s.serialize_str(&base64::engine::general_purpose::STANDARD.encode(bytes))
+            }
+            None => s.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<u8>>, D::Error> {
+        let opt = Option::<String>::deserialize(d)?;
+        match opt {
+            Some(text) => base64::engine::general_purpose::STANDARD
+                .decode(text.as_bytes())
+                .map(Some)
+                .map_err(serde::de::Error::custom),
+            None => Ok(None),
+        }
+    }
+}
+
+/// Max payload size (bytes) inlined into the index record (A3). Above this, the payload takes the
+/// object-store path (boatramp's large-blob strength). Conservative on purpose: inlined payloads
+/// ride the durable index (and the Raft log/snapshots in a cluster), so this bounds per-message
+/// index bloat. (SA1 aggregate-cap-with-fallback is a documented pre-release hardening.)
+pub const INLINE_MAX: usize = 4096;
+
+/// Aggregate cap (SA1): total inline-payload bytes a node keeps in-flight before new publishes fall
+/// back to the object-store path — so a stuck consumer + small-message flood can't grow the durable
+/// index (and the replicated Raft log/snapshots) without bound. Sized so the worst-case inline
+/// footprint stays modest (32 MiB ≈ 8k messages at `INLINE_MAX`); large-blob loads are unaffected
+/// (they never inline). A soft, per-node guard (see [`LogMessaging::inline_inflight_bytes`]).
+pub const INLINE_INFLIGHT_MAX_BYTES: usize = 32 * 1024 * 1024;
+
+/// Group-commit (A2): the soft per-turn budget of index writes (OPS, not jobs) coalesced into one
+/// durable `write_batch`. Concurrent publishers that pile up during a flush form the next group; the
+/// committer drains jobs until this many ops accumulate (always ≥1 job for progress), so neither a
+/// burst of single publishes nor a large `publish_batch` (A4, itself bounded by the host's
+/// PUBLISH_BATCH_MAX) can build an unbounded batch. The queue is self-bounded — every pusher is a
+/// gate-waiter.
+const GROUP_COMMIT_MAX: usize = 512;
+
+/// One publisher's contribution to a group commit (A2): its index ops + a one-shot to signal the
+/// durable outcome. The committer coalesces many of these into ONE `write_batch` then signals each —
+/// a publisher's `publish` returns only AFTER its group's commit is durable (at-least-once), and a
+/// failed group commit fails EVERY member (no partial success on the synchronous path).
+struct PublishJob {
+    ops: Vec<WriteOp>,
+    /// How many MESSAGES this job carries (1 for a single publish, N for a `publish_batch`) — the
+    /// unit the relaxed-durability un-flushed budget counts, so the crash-loss window is bounded in
+    /// messages regardless of how many index ops each message needs.
+    msgs: usize,
+    /// The RESOLVED relaxed-durability budget for this job's message(s) (Feature C, v0.4.24): the
+    /// topic's [`TopicPolicy::max_unflushed`] if set, else the node default
+    /// [`LogMessaging::max_unflushed`]. The group-commit coalesces jobs ACROSS topics into one
+    /// `write_batch`, so the effective budget for a drained batch is the **MINIMUM** of its jobs'
+    /// `max_unflushed` — a single strong (`0`) topic anywhere forces the whole batch durable (the
+    /// safe over-approximation), and `0` everywhere is byte-for-byte the strong path.
+    max_unflushed: usize,
+    done: futures::channel::oneshot::Sender<Result<(), MessagingError>>,
 }
 
 impl Record {
@@ -252,8 +658,141 @@ impl Record {
             attempts: 0,
             lease_until_ms: 0,
             signed_context,
+            inline: None,
+            last_error: None,
+            expires_at_ms: 0,
+            priority: 0,
         }
     }
+}
+
+/// The most bytes a [`Record::last_error`] may hold (SEC6): a bounded, sanitized host reason — long
+/// enough to be useful, short enough that it can never bloat the durable index or a log line.
+pub const LAST_ERROR_MAX: usize = 256;
+
+/// Sanitize a host failure reason for durable storage as [`Record::last_error`] (SEC6): control
+/// characters (newlines, escapes) become spaces so it can never break a JSON field or a log line,
+/// then it is byte-bounded to [`LAST_ERROR_MAX`]. The dispatcher already passes a HOST classification
+/// (never raw guest bytes); this is the defensive floor.
+pub fn sanitize_reason(reason: &str) -> String {
+    let mut out = String::new();
+    for c in reason.chars() {
+        let c = if c.is_control() { ' ' } else { c };
+        if out.len() + c.len_utf8() > LAST_ERROR_MAX {
+            break;
+        }
+        out.push(c);
+    }
+    out.trim().to_string()
+}
+
+/// An inspectable dead-letter (P1 `dlq ls`/`show`). Host-side metadata; `payload` is populated only
+/// by [`show_dead_letter`](Messaging::show_dead_letter) (a listing is metadata-only, so `dlq ls`
+/// never loads bodies). `group` is `""` for a work-queue dead-letter, else the consumer group.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeadLetter {
+    /// The message's durable id (time-ordered).
+    pub id: String,
+    /// The consumer group (`""` = the competing-consumer work queue).
+    pub group: String,
+    /// Delivery attempts charged before it dead-lettered.
+    pub attempts: u32,
+    /// The sanitized host reason for the last failed delivery (see [`Record::last_error`]).
+    pub last_error: Option<String>,
+    /// The producer's durable signed-context envelope, if any (carried through the DLQ).
+    pub signed_context: Option<String>,
+    /// The message body — `Some` only from `show_dead_letter`; `None` in a metadata listing.
+    pub payload: Option<Vec<u8>>,
+}
+
+/// A message peeked from a live work-queue (P1 `queue peek`) — inspected WITHOUT claiming it (no
+/// lease taken, no attempt charged). `leased` marks a message currently in-flight to a consumer (vs
+/// claimable now); `payload` is the message body.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PeekedMessage {
+    /// The message's durable id (time-ordered = delivery order).
+    pub id: String,
+    /// Delivery attempts charged so far.
+    pub attempts: u32,
+    /// Currently leased (in-flight to a consumer) rather than claimable now.
+    pub leased: bool,
+    /// The producer's durable signed-context envelope, if any.
+    pub signed_context: Option<String>,
+    /// The message body.
+    pub payload: Vec<u8>,
+}
+
+/// A consumer group's operator-facing summary (P2 group lifecycle `queue groups`): its name plus the
+/// same health signals as the per-consumer stat, read from the group's compact durable state.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GroupInfo {
+    /// The consumer group name.
+    pub group: String,
+    /// High-water: the max log id ever leased to this group (its cursor).
+    pub hwm: String,
+    /// Leased-but-unacked messages currently held by this group.
+    pub in_flight: usize,
+    /// Retained messages this group has not yet leased (log ids strictly beyond `hwm`).
+    pub lag: usize,
+}
+
+/// An AND-composed filter over a topic's dead-letters (P1 selective DLQ). A dead-letter matches iff
+/// it satisfies EVERY set predicate; an all-`None` filter matches everything (the whole-DLQ op). Used
+/// by [`list_dead_letters`](Messaging::list_dead_letters),
+/// [`redrive_dead_letters_filtered`](Messaging::redrive_dead_letters_filtered), and
+/// [`discard_dead_letters`](Messaging::discard_dead_letters).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DeadLetterFilter {
+    /// Exact message id.
+    pub id: Option<String>,
+    /// Restrict to a lane: `Some("")` = work-queue only, `Some(group)` = that group, `None` = all.
+    pub group: Option<String>,
+    /// Only messages published more than this many ms ago (age derived from the time-ordered id — no
+    /// dead-letter timestamp is stored). `--older-than`.
+    pub older_than_ms: Option<u64>,
+    /// Case-sensitive substring match on `last_error` (a dead-letter with no `last_error` never
+    /// matches). `--match`, scoped to the host reason only (never the payload).
+    pub match_last_error: Option<String>,
+    /// Cap the number acted on / listed (applied after ordering by id). `--limit`.
+    pub limit: Option<usize>,
+}
+
+impl DeadLetterFilter {
+    /// Does `dl` satisfy every set predicate? `now_ms` anchors the age test. Public so a backend in
+    /// another crate (the cluster coordinator) applies the identical AND-composition.
+    pub fn matches(&self, dl: &DeadLetter, now_ms: u64) -> bool {
+        if let Some(id) = &self.id {
+            if &dl.id != id {
+                return false;
+            }
+        }
+        if let Some(group) = &self.group {
+            if &dl.group != group {
+                return false;
+            }
+        }
+        if let Some(older) = self.older_than_ms {
+            match id_age_ms(&dl.id, now_ms) {
+                Some(age) if age >= older => {}
+                _ => return false,
+            }
+        }
+        if let Some(needle) = &self.match_last_error {
+            match &dl.last_error {
+                Some(err) if err.contains(needle.as_str()) => {}
+                _ => return false,
+            }
+        }
+        true
+    }
+}
+
+/// The age in ms of a message from its time-ordered id (the `{:013}` unix-millis prefix), or `None`
+/// if the prefix doesn't parse (a foreign id shape) — a non-parsing id is never matched by an
+/// age filter (fail-closed: `--older-than` can't accidentally sweep it).
+fn id_age_ms(id: &str, now_ms: u64) -> Option<u64> {
+    let millis: u64 = id.split('-').next()?.parse().ok()?;
+    Some(now_ms.saturating_sub(millis))
 }
 
 /// One transition the [`plan_claim`] decision produces for a single message.
@@ -294,8 +833,10 @@ pub fn plan_claim(
     max_batch: usize,
     max_attempts: u32,
 ) -> Vec<ClaimAction> {
-    // Lexical order on `{millis}-{...}` ids ≈ publish order (best-effort FIFO).
-    records.sort_by(|a, b| a.0.cmp(&b.0));
+    // Priority-then-FIFO: higher `priority` leases first; ties break by id (lexical `{millis}-{...}`
+    // ≈ publish order). All-default priority (0) ⇒ pure best-effort FIFO (unchanged). Deterministic
+    // (a total order), so every replica computes the same lease sequence.
+    records.sort_by(|a, b| b.1.priority.cmp(&a.1.priority).then_with(|| a.0.cmp(&b.0)));
     let mut actions = Vec::new();
     let mut leased = 0;
     for (id, mut record) in records {
@@ -304,6 +845,14 @@ pub fn plan_claim(
         }
         if record.lease_until_ms > now_ms {
             continue; // still leased to someone else
+        }
+        // TTL (P2 delivery modes): an expired, un-delivered message is dead-lettered (reason
+        // `ttl-expired`) rather than delivered — visible/redrivable like any dead-letter. Checked
+        // after the lease skip, so a currently-leased message is re-checked on its next claim.
+        if record.expires_at_ms != 0 && record.expires_at_ms <= now_ms {
+            record.last_error = Some("ttl-expired".to_string());
+            actions.push(ClaimAction::DeadLetter { id, record });
+            continue;
         }
         if record.attempts >= max_attempts {
             actions.push(ClaimAction::DeadLetter { id, record });
@@ -336,6 +885,17 @@ pub fn dead_key(topic: &str, id: &str) -> String {
 /// KV/state prefix for a topic's dead-lettered records.
 pub fn dead_prefix(topic: &str) -> String {
     format!("mqdead/{topic}/")
+}
+/// KV/state key for a topic's **pause** flag (P2 flow control): its existence = paused (new
+/// deliveries suppressed; publish + in-flight ack/nack unaffected). A tiny marker; absent = flowing.
+pub fn pause_key(topic: &str) -> String {
+    format!("mqpause/{topic}")
+}
+/// KV/state key for a topic's **operator policy** ([`TopicPolicy`], v0.4.24): a tiny per-topic JSON
+/// record (mirroring [`pause_key`]) carrying the backlog/rate/relaxed-durability caps. Absent = no
+/// policy (unbounded).
+pub fn mqpolicy_key(topic: &str) -> String {
+    format!("mqpolicy/{topic}")
 }
 
 // --- consumer-group (durable fan-out) keyspace: the offset-log model ---
@@ -381,6 +941,23 @@ pub fn logmax_key(topic: &str) -> String {
 /// KV key for a group's dead-lettered record.
 pub fn gdead_key(topic: &str, group: &str, id: &str) -> String {
     format!("mqgd/{topic}/{group}/{id}")
+}
+/// KV prefix over ALL of a topic's grouped dead-letters (every group). Entries below it are
+/// `{group}/{id}` (two segments), NOT direct children — iterate with [`split_group_id`].
+pub fn gdead_topic_prefix(topic: &str) -> String {
+    format!("mqgd/{topic}/")
+}
+/// Split a `mqgd/{topic}/` suffix into `(group, id)`. A valid entry is exactly two non-empty
+/// segments (`{group}/{id}`); the id is `{millis}-{hex}` (no `/`) and the group is a validated
+/// single-segment name. Returns `None` for anything else — in particular a **subtopic** bleed
+/// (`{subtopic}/{group}/{id}`, ≥3 segments) is rejected so a topic's ops never touch a subtopic's
+/// grouped dead-letters (the grouped analog of [`is_direct_child`]).
+pub fn split_group_id(suffix: &str) -> Option<(&str, &str)> {
+    let (group, id) = suffix.split_once('/')?;
+    if group.is_empty() || id.is_empty() || id.contains('/') {
+        return None;
+    }
+    Some((group, id))
 }
 
 /// One leased-but-unacked message in a consumer group's [`GroupState`]. The set
@@ -649,6 +1226,68 @@ pub struct LogMessaging {
     /// pays nothing extra). `None` until lazily loaded from the persisted
     /// group-state registry on first use.
     grouped_topics: std::sync::Mutex<Option<std::collections::HashSet<String>>>,
+    /// Approximate count of inline-payload bytes currently in-flight on this node (A3/SA1): the
+    /// aggregate-inline budget. Incremented when a publish inlines, decremented when an inline
+    /// message is acked. Once it reaches [`INLINE_INFLIGHT_MAX_BYTES`] a publish falls back to the
+    /// object-store path — so a stuck consumer + small-message flood can't grow the durable index
+    /// (and the Raft log/snapshots in a cluster) unbounded. Deliberately a soft guard: it only
+    /// **over**-counts (a dead-lettered/purged inline record isn't decremented until acked, and a
+    /// restart resets it to `0` — under-count is bounded to one budget-worth of pre-existing inline),
+    /// and over-counting is the SAFE direction (it just falls back to object storage sooner).
+    inline_inflight_bytes: std::sync::atomic::AtomicUsize,
+    /// The aggregate-inline budget in bytes (default [`INLINE_INFLIGHT_MAX_BYTES`]); a publish inlines
+    /// only while `inline_inflight_bytes` stays under it, else falls back to object storage. Tunable
+    /// via [`with_inline_budget`](Self::with_inline_budget).
+    inline_budget_bytes: usize,
+    /// Group-commit (A2), runtime-agnostic (no spawned task — core uses `futures`, not `tokio`):
+    /// a publisher pushes its index ops here, then takes [`commit_gate`](Self::commit_gate); whoever
+    /// holds the gate drains this queue and commits everyone's ops in ONE `write_batch`, signalling
+    /// each. Self-bounding — every pusher is also a gate-waiter, so the queue never holds more than
+    /// the number of concurrent publishers.
+    commit_queue: std::sync::Mutex<Vec<PublishJob>>,
+    /// The group-commit gate (A2): the single durable-flush turn. Held only across the drain +
+    /// `write_batch`, so publishers that pile up during a flush coalesce into the next batch.
+    commit_gate: futures::lock::Mutex<()>,
+    /// **Relaxed-publish-durability COUNT budget** (operator opt-in): the maximum number of published
+    /// messages that may be acked on the in-memory memtable insert (via
+    /// [`KvStore::write_batch_relaxed`]) BEFORE a durable checkpoint is forced. **`0` (the default) ==
+    /// strong durability** — every publish awaits the durable flush, byte-for-byte the original
+    /// behavior. `N > 0` fast-acks up to N messages, then the next commit is a durable `write_batch`
+    /// that flushes the whole WAL buffer and resets the counter.
+    ///
+    /// This is the COUNT half of a JetStream-style **count + time** pairing. The TIME half is the
+    /// store's own `flush_interval` (SlateDB's `max_flush_interval`, ~5ms in a boatramp deploy — vs
+    /// JetStream's 2s): the background WAL-flush timer persists every buffered write within one
+    /// interval *regardless* of publish activity, so a slow trickle can't leave a message un-durable
+    /// longer than `flush_interval`. So the un-durable (crash-loss) window is bounded by BOTH — at
+    /// most `N` messages AND at most one `flush_interval` of time, whichever comes first. The count
+    /// checkpoint is the burst/memory backstop (bounding the un-durable *set* when publishes outpace
+    /// the timer); the flush interval is the steady-state time bound. Publish path ONLY (ack/claim/
+    /// dead-letter always durable). Set via [`with_max_unflushed`](Self::with_max_unflushed).
+    max_unflushed: usize,
+    /// Messages committed via the relaxed path since the last durable checkpoint (only ever non-zero
+    /// when `max_unflushed > 0`). The group-commit leader reads+updates it under the commit gate, so
+    /// it needs no stronger ordering than `Relaxed`.
+    unflushed: std::sync::atomic::AtomicUsize,
+    /// Per-topic operator policy cache (Feature A, v0.4.24): the publish hot path resolves a topic's
+    /// [`TopicPolicy`] from here instead of KV-reading every publish. Populated lazily on first
+    /// resolve (a KV read of [`mqpolicy_key`]), INVALIDATED on [`set_topic_policy`]. `None` value ==
+    /// "resolved: no policy" (a negative cache entry — an uncapped topic is not re-read every publish).
+    policy_cache: std::sync::Mutex<HashMap<String, Option<TopicPolicy>>>,
+    /// Per-node per-topic publish **token bucket** (Feature B `max_rate_per_sec`, best-effort): the
+    /// live `(tokens, last_refill_ms)` per rate-capped topic, refilled at the topic's configured rate.
+    /// Only touched when a topic actually sets a rate cap, so an uncapped topic pays nothing.
+    rate_buckets: std::sync::Mutex<HashMap<String, TokenBucket>>,
+}
+
+/// A per-node per-topic token bucket for the best-effort publish rate cap (Feature B). Refills at
+/// `max_rate_per_sec` tokens/sec (capped at the burst = the rate), draining one token per message.
+#[derive(Debug, Clone, Copy)]
+struct TokenBucket {
+    /// Available tokens (fractional refill accumulates across sub-second calls).
+    tokens: f64,
+    /// Unix-ms of the last refill, used to compute elapsed time on the next draw.
+    last_refill_ms: u64,
 }
 
 /// How long a grouped topic retains a message (its log + payload) before the
@@ -677,7 +1316,271 @@ impl LogMessaging {
             seq: AtomicU64::new(0),
             hubs: StreamHubs::new(),
             grouped_topics: std::sync::Mutex::new(None),
+            inline_inflight_bytes: std::sync::atomic::AtomicUsize::new(0),
+            inline_budget_bytes: INLINE_INFLIGHT_MAX_BYTES,
+            commit_queue: std::sync::Mutex::new(Vec::new()),
+            commit_gate: futures::lock::Mutex::new(()),
+            max_unflushed: 0, // strong durability by default (== the original always-await-flush path)
+            unflushed: std::sync::atomic::AtomicUsize::new(0),
+            policy_cache: std::sync::Mutex::new(HashMap::new()),
+            rate_buckets: std::sync::Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Opt into **relaxed publish durability** with an un-flushed budget of `max` messages (operator
+    /// choice; `0` keeps the strong default). When `max > 0`, publishes ack on the memtable insert up
+    /// to `max` messages, then a durable checkpoint flushes the WAL buffer — bounding the
+    /// process-crash loss window to at most `max` acked-but-unflushed messages. See
+    /// [`max_unflushed`](Self::max_unflushed). A weaker guarantee than the strong default; the caller
+    /// (node config) is responsible for the operator opt-in + the startup warning.
+    #[must_use]
+    pub fn with_max_unflushed(mut self, max: usize) -> Self {
+        self.max_unflushed = max;
+        self
+    }
+
+    /// Resolve `topic`'s operator [`TopicPolicy`] (Feature A), serving from the in-memory cache and
+    /// lazily loading (a single KV read of [`mqpolicy_key`]) on a miss. A `None` result is cached as
+    /// a negative entry, so an uncapped topic is NOT KV-read on every publish. A KV-read error
+    /// propagates (the publish path fails closed — never silently treats an unreadable policy as
+    /// "no cap").
+    async fn resolve_policy(&self, topic: &str) -> Result<Option<TopicPolicy>, MessagingError> {
+        {
+            let cache = self.policy_cache.lock().unwrap();
+            if let Some(hit) = cache.get(topic) {
+                return Ok(hit.clone());
+            }
+        }
+        let policy = match self
+            .kv
+            .get(&mqpolicy_key(topic))
+            .await
+            .map_err(MessagingError::backend)?
+        {
+            Some(raw) => Some(
+                serde_json::from_slice::<TopicPolicy>(&raw)
+                    .map_err(|e| MessagingError::Decode(e.to_string()))?,
+            ),
+            None => None,
+        };
+        self.policy_cache
+            .lock()
+            .unwrap()
+            .insert(topic.to_string(), policy.clone());
+        Ok(policy)
+    }
+
+    /// Enforce a resolved [`TopicPolicy`] against a publish of `n` messages onto `topic` (Feature B),
+    /// BEFORE anything is enqueued. Fail-closed in order: (1) `max_depth` — reject with
+    /// [`MessagingError::DepthExceeded`] if the current backlog is already at the cap (only queried
+    /// when a cap is set, so an uncapped topic never calls `backlog`); (2) `max_rate_per_sec` — a
+    /// per-node token bucket, reject with [`MessagingError::RateExceeded`] if `n` tokens aren't
+    /// available. A `None`/absent policy is a no-op (the fast path — the caller only calls this when
+    /// `resolve_policy` returned `Some`).
+    async fn enforce_publish_policy(
+        &self,
+        topic: &str,
+        policy: &TopicPolicy,
+        n: usize,
+    ) -> Result<(), MessagingError> {
+        // 1) Depth (fail-closed). Only touch `backlog` when a cap is actually configured — an
+        //    uncapped topic pays ZERO added cost (the hot-path requirement).
+        if let Some(max_depth) = policy.max_depth {
+            let backlog = self.backlog(topic).await?;
+            if backlog >= max_depth {
+                return Err(MessagingError::DepthExceeded(topic.to_string()));
+            }
+        }
+        // 2) Rate (best-effort, per-node token bucket). A whole batch draws `n` tokens at once, so a
+        //    publish_batch is gated as one unit (simple + fail-closed): if the batch doesn't fit the
+        //    remaining budget, the whole publish is rejected and nothing is enqueued.
+        if let Some(rate) = policy.max_rate_per_sec {
+            if !self.try_take_tokens(topic, rate, n) {
+                return Err(MessagingError::RateExceeded(topic.to_string()));
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolve `topic`'s policy (cached), enforce depth/rate for `n` messages (Feature B, fail-closed
+    /// — nothing is enqueued on a breach), and return the effective relaxed-durability budget for the
+    /// publish (Feature C): the topic override, else the node default. The shared front half of every
+    /// publish variant. `None` policy (the common case) skips enforcement and yields the node default.
+    async fn enforce_and_resolve_budget(
+        &self,
+        topic: &str,
+        n: usize,
+    ) -> Result<usize, MessagingError> {
+        match self.resolve_policy(topic).await? {
+            Some(p) => {
+                self.enforce_publish_policy(topic, &p, n).await?;
+                Ok(p.max_unflushed.unwrap_or(self.max_unflushed))
+            }
+            None => Ok(self.max_unflushed),
+        }
+    }
+
+    /// Draw `n` tokens from `topic`'s per-node bucket, refilling at `rate` tokens/sec since the last
+    /// draw (burst capped at `rate`). Returns whether the draw succeeded. A fresh bucket starts full
+    /// (`rate` tokens), so the first burst up to the rate is admitted. Best-effort, per-node.
+    fn try_take_tokens(&self, topic: &str, rate: u32, n: usize) -> bool {
+        let now = now_unix_ms();
+        let cap = f64::from(rate);
+        let mut buckets = self.rate_buckets.lock().unwrap();
+        let bucket = buckets.entry(topic.to_string()).or_insert(TokenBucket {
+            tokens: cap,
+            last_refill_ms: now,
+        });
+        // Refill for the elapsed time (fractional), clamped to the burst cap.
+        let elapsed_ms = now.saturating_sub(bucket.last_refill_ms);
+        if elapsed_ms > 0 {
+            bucket.tokens = (bucket.tokens + (elapsed_ms as f64) * cap / 1000.0).min(cap);
+            bucket.last_refill_ms = now;
+        }
+        let need = n as f64;
+        if bucket.tokens >= need {
+            bucket.tokens -= need;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Group-commit a publisher's index ops (A2): push the job, take the gate, and — as whoever holds
+    /// the gate — drain the queue and commit EVERYONE's ops in one `write_batch`, signalling each.
+    /// A publisher that pushed but was flushed by an earlier gate-holder simply finds its one-shot
+    /// already resolved. Returns only after this job's group is durably committed (at-least-once); a
+    /// failed group commit fails every member (no partial success). Runtime-agnostic: no spawned task.
+    async fn group_commit(
+        &self,
+        ops: Vec<WriteOp>,
+        msgs: usize,
+        max_unflushed: usize,
+    ) -> Result<(), MessagingError> {
+        use futures::future::{select, Either};
+        let (done_tx, mut done_rx) = futures::channel::oneshot::channel();
+        self.commit_queue.lock().unwrap().push(PublishJob {
+            ops,
+            msgs,
+            max_unflushed,
+            done: done_tx,
+        });
+        // Become the LEADER only if the commit gate is free; otherwise our just-pushed job is
+        // committed by the current leader's drain loop (which re-checks the queue until empty), so a
+        // waiter does NOT serialize through the gate — it simply awaits its durable ack. THIS is what
+        // lets concurrent publishes coalesce in steady state: while one leader's flush is in flight,
+        // every other publisher's job piles up in the queue and the next drain commits them all in one
+        // `write_batch`. The `select` closes the only stranding race — a publisher either wins the gate
+        // (becoming leader and committing its own job) or its `done` fires first (a leader committed
+        // it); it can never both-miss.
+        let gate = self.commit_gate.lock();
+        futures::pin_mut!(gate);
+        match select(gate, &mut done_rx).await {
+            // The current leader durably committed our job while we waited — done.
+            Either::Right((res, _gate)) => {
+                return res
+                    .map_err(|_| MessagingError::backend("group-commit dropped before durable"))?
+            }
+            // We hold the gate: drain + commit in a loop until the queue is empty, so a job pushed
+            // during our flush (even after a prior empty check) is never stranded. Our OWN job is in
+            // the queue (or a prior leader already committed it), so it is durable by the time we
+            // release; we then read our outcome from `done_rx` below.
+            Either::Left((_turn, _done)) => loop {
+                let batch: Vec<PublishJob> = {
+                    let mut q = self.commit_queue.lock().unwrap();
+                    if q.is_empty() {
+                        break;
+                    }
+                    // Bound the drain on OPS, not jobs (a batch job carries many ops) — else one turn
+                    // could build an unbounded `write_batch`. Always take ≥1 so an oversized single
+                    // batch (host-bounded by PUBLISH_BATCH_MAX) still makes progress.
+                    let mut n = 0;
+                    let mut op_count = 0;
+                    while n < q.len() {
+                        if n > 0 && op_count + q[n].ops.len() > GROUP_COMMIT_MAX {
+                            break;
+                        }
+                        op_count += q[n].ops.len();
+                        n += 1;
+                    }
+                    q.drain(..n).collect()
+                };
+                let mut all_ops = Vec::new();
+                let mut dones = Vec::with_capacity(batch.len());
+                let mut msgs = 0usize;
+                // Feature C: the effective relaxed-durability budget for this coalesced batch is the
+                // MINIMUM `max_unflushed` across its jobs — a strong (0) topic anywhere forces the
+                // whole batch durable (the safe over-approximation). `usize::MAX` is the identity for
+                // `min`; a non-empty drain always lowers it to a real per-job budget.
+                let mut batch_max_unflushed = usize::MAX;
+                for mut job in batch {
+                    all_ops.append(&mut job.ops);
+                    msgs += job.msgs;
+                    batch_max_unflushed = batch_max_unflushed.min(job.max_unflushed);
+                    dones.push(job.done);
+                }
+                let outcome = self.commit_group(all_ops, msgs, batch_max_unflushed).await;
+                for done in dones {
+                    // A dropped receiver (cancelled publisher) is harmless — the message is still
+                    // durably committed; at-least-once/redelivery is unaffected.
+                    let _ = done.send(outcome.clone());
+                }
+            },
+        }
+        // We were the leader; our own job was committed in the drain loop above (or by a prior leader
+        // before we acquired the gate). Read the outcome our commit recorded.
+        done_rx
+            .await
+            .map_err(|_| MessagingError::backend("group-commit dropped before durable"))?
+    }
+
+    /// Durably commit one drained group of `msgs` messages, honoring the relaxed-durability budget.
+    ///
+    /// `max_unflushed` is the **effective** budget for this coalesced batch — the MINIMUM across the
+    /// drained jobs' resolved per-topic budgets (Feature C), which the node default (0 == strong)
+    /// when no topic overrides it. With `max_unflushed == 0` the `prior + msgs <= 0` guard is never
+    /// true for a non-empty group, so this ALWAYS takes the durable `write_batch` branch —
+    /// byte-for-byte the strong path (the owner's `budget-0 == strong` invariant, now per-batch).
+    /// With `max_unflushed > 0` it fast-acks via `write_batch_relaxed` while the running un-flushed
+    /// count stays within budget, and forces a durable `write_batch` checkpoint the moment admitting
+    /// this group would exceed it. A durable `write_batch` flushes SlateDB's whole WAL buffer (every
+    /// prior relaxed write with it), so the checkpoint truly drains the un-durable set — hence the
+    /// node-wide `unflushed` counter resets to 0. The counter is only touched on the success path (a
+    /// failed commit leaves it unchanged; the caller fails the whole group).
+    async fn commit_group(
+        &self,
+        ops: Vec<WriteOp>,
+        msgs: usize,
+        max_unflushed: usize,
+    ) -> Result<(), MessagingError> {
+        use std::sync::atomic::Ordering;
+        let prior = self.unflushed.load(Ordering::Relaxed);
+        if prior + msgs <= max_unflushed {
+            // Under budget (only reachable when max_unflushed > 0): fast-ack on the memtable insert.
+            self.kv
+                .write_batch_relaxed(ops)
+                .await
+                .map_err(MessagingError::backend)?;
+            self.unflushed.fetch_add(msgs, Ordering::Relaxed);
+        } else {
+            // Durable checkpoint (and the ONLY branch when max_unflushed == 0): await the WAL flush,
+            // which persists every buffered relaxed write too — so the un-durable set is now empty.
+            self.kv
+                .write_batch(ops)
+                .await
+                .map_err(MessagingError::backend)?;
+            self.unflushed.store(0, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
+    /// Set the aggregate-inline byte budget (SA1) — the total inline-payload bytes this node keeps
+    /// in-flight before publishes fall back to object storage. Defaults to
+    /// [`INLINE_INFLIGHT_MAX_BYTES`]; lower it on a memory-tight node (or in tests).
+    #[must_use]
+    pub fn with_inline_budget(mut self, bytes: usize) -> Self {
+        self.inline_budget_bytes = bytes;
+        self
     }
 
     /// Whether `topic` has ≥1 registered consumer group (so `publish` retains the
@@ -706,6 +1609,105 @@ impl LogMessaging {
         let has = set.contains(topic);
         *self.grouped_topics.lock().unwrap() = Some(set);
         has
+    }
+
+    /// Build one message's durable INDEX ops, performing any object-store payload write FIRST
+    /// (payload-first ordering: a committed record never references a missing payload). Shared by
+    /// [`publish_ctx`](Self::publish_ctx) (single) and [`publish_batch_ctx`](Self::publish_batch_ctx)
+    /// (A4 batch) so both take the identical A3-inline / SA1-budget / grouped-retain decisions.
+    /// Returns the minted id (for the post-commit broadcast) + the ops the caller's group-commit will
+    /// durably commit. The SA1 inline-budget `fetch_add` happens here; if the caller then fails to
+    /// commit, the budget over-counts — the documented safe direction (falls back to object storage
+    /// sooner), and a restart resets it.
+    async fn build_publish_ops(
+        &self,
+        topic: &str,
+        payload: &[u8],
+        signed_context: Option<&str>,
+        not_before_ms: u64,
+        expires_at_ms: u64,
+        priority: u8,
+    ) -> Result<(String, Vec<WriteOp>), MessagingError> {
+        let id = format!(
+            "{:013}-{:016x}",
+            now_unix_ms(),
+            self.seq.fetch_add(1, Ordering::Relaxed)
+        );
+        let retain = self.topic_has_groups(topic).await;
+        // A3 — inline a small work-queue payload IN the index record: it is then written in the one
+        // batch below (no object-store round-trip) and read straight off the record at claim. Only
+        // for the work-queue (a retained/grouped topic keeps the shared object-store copy every group
+        // reads) and only up to `INLINE_MAX` (larger payloads take the object-store path — boatramp's
+        // large-blob strength). Otherwise: payload first to object storage, then the index record —
+        // so the record never references a missing payload.
+        // SA1: only inline while under the aggregate in-flight budget; past it, fall back to the
+        // object-store path so a stuck consumer can't grow the durable index unbounded.
+        let inline = !retain
+            && payload.len() <= INLINE_MAX
+            && self
+                .inline_inflight_bytes
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .saturating_add(payload.len())
+                <= self.inline_budget_bytes;
+        if inline {
+            self.inline_inflight_bytes
+                .fetch_add(payload.len(), std::sync::atomic::Ordering::Relaxed);
+        }
+        if !inline {
+            let bytes = bytes::Bytes::copy_from_slice(payload);
+            let body = futures::stream::once(async move { Ok(bytes) }).boxed();
+            self.storage
+                .put(&payload_key(topic, &id), body, PutMeta::default())
+                .await
+                .map_err(MessagingError::backend)?;
+        }
+        // Coalesce this publish's INDEX writes into ONE durable `write_batch` (A1): the meta record
+        // (carrying an inlined payload when A3 applies), and — on a grouped topic — the retained-log
+        // marker + the `logmax` gate advance, in a single flush instead of 2–4 separate awaited puts.
+        // The durable signed-context (R1) rides on the meta record, deleted with it on ack/dead-letter.
+        let mut ops: Vec<WriteOp> = Vec::with_capacity(3);
+        let mut record = Record::fresh(signed_context.map(str::to_owned));
+        // Delivery-mode delay (P2): a not-before in the future rides the lease field — attempts stay 0,
+        // so a claim before then skips it (leased) and after then delivers it as the first attempt.
+        record.lease_until_ms = not_before_ms;
+        // Delivery-mode TTL (P2): 0 = no expiry; else the absolute time after which claim dead-letters it.
+        record.expires_at_ms = expires_at_ms;
+        // Delivery-mode priority (P2): 0 = normal; higher leases first (ties FIFO by id).
+        record.priority = priority;
+        if inline {
+            record.inline = Some(payload.to_vec());
+        }
+        ops.push(WriteOp::Put(
+            meta_key(topic, &id),
+            serde_json::to_vec(&record).map_err(MessagingError::backend)?,
+        ));
+        // Grouped (fan-out) topics keep a **retained** copy of the payload + an append-only log
+        // entry, so each group consumes on its own high-water long after the work-queue ack would
+        // have deleted it, and advance the per-topic `logmax` gate marker (so an idle group's claim
+        // early-returns without a scan). Only paid on topics with a registered group.
+        if retain {
+            let bytes = bytes::Bytes::copy_from_slice(payload);
+            let body = futures::stream::once(async move { Ok(bytes) }).boxed();
+            self.storage
+                .put(&gpayload_key(topic, &id), body, PutMeta::default())
+                .await
+                .map_err(MessagingError::backend)?;
+            ops.push(WriteOp::Put(glog_key(topic, &id), Vec::new()));
+            // Advance the gate to the max id seen — never backward, so two concurrent same-ms
+            // publishes can't leave it below a retained id (which would wrongly close the gate on
+            // the higher one).
+            let cur = self
+                .kv
+                .get(&logmax_key(topic))
+                .await
+                .map_err(MessagingError::backend)?
+                .map(|v| String::from_utf8_lossy(&v).into_owned())
+                .unwrap_or_default();
+            if id.as_str() > cur.as_str() {
+                ops.push(WriteOp::Put(logmax_key(topic), id.clone().into_bytes()));
+            }
+        }
+        Ok((id, ops))
     }
 
     /// Mark `topic` as grouped in the in-memory cache (called when a group first
@@ -766,6 +1768,66 @@ impl LogMessaging {
             .await
             .map_err(MessagingError::backend)?;
         Ok(keys.iter().filter(|k| is_direct_child(k, prefix)).count())
+    }
+
+    /// Read every dead-letter on `topic` as [`DeadLetter`] METADATA (no payload) across BOTH lanes —
+    /// the work-queue (`mqdead/{topic}/{id}`) and every consumer group (`mqgd/{topic}/{group}/{id}`) —
+    /// ordered by id. The shared read path behind `list`/`redrive_filtered`/`discard` (P1 selective
+    /// DLQ). Payloads are loaded lazily by `show_dead_letter`, so a large DLQ lists cheaply.
+    async fn collect_dead_letters(&self, topic: &str) -> Result<Vec<DeadLetter>, MessagingError> {
+        let mut out = Vec::new();
+        // Work-queue lane.
+        let wq_prefix = dead_prefix(topic);
+        for key in self
+            .kv
+            .list_prefix(&wq_prefix)
+            .await
+            .map_err(MessagingError::backend)?
+        {
+            if !is_direct_child(&key, &wq_prefix) {
+                continue;
+            }
+            let Some(raw) = self.kv.get(&key).await.map_err(MessagingError::backend)? else {
+                continue;
+            };
+            let record: Record =
+                serde_json::from_slice(&raw).map_err(|e| MessagingError::Decode(e.to_string()))?;
+            out.push(DeadLetter {
+                id: key[wq_prefix.len()..].to_string(),
+                group: String::new(),
+                attempts: record.attempts,
+                last_error: record.last_error,
+                signed_context: record.signed_context,
+                payload: None,
+            });
+        }
+        // Grouped lanes (every group).
+        let gprefix = gdead_topic_prefix(topic);
+        for key in self
+            .kv
+            .list_prefix(&gprefix)
+            .await
+            .map_err(MessagingError::backend)?
+        {
+            let Some((group, id)) = split_group_id(&key[gprefix.len()..]) else {
+                continue;
+            };
+            let Some(raw) = self.kv.get(&key).await.map_err(MessagingError::backend)? else {
+                continue;
+            };
+            let record: Record =
+                serde_json::from_slice(&raw).map_err(|e| MessagingError::Decode(e.to_string()))?;
+            out.push(DeadLetter {
+                id: id.to_string(),
+                group: group.to_string(),
+                attempts: record.attempts,
+                last_error: record.last_error,
+                signed_context: record.signed_context,
+                payload: None,
+            });
+        }
+        out.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(out)
     }
 
     /// The per-topic `logmax` gate marker: the id of the last message published
@@ -869,7 +1931,11 @@ impl LogMessaging {
     /// (leased, unacked) **or** `id > hwm` (future backlog it hasn't leased yet).
     /// A message below every group's high-water with no group holding it in-flight
     /// has been consumed by all and is safe to drop.
-    pub async fn gc_grouped(&self, topic: &str) -> Result<usize, MessagingError> {
+    pub async fn gc_grouped(
+        &self,
+        topic: &str,
+        retention_ms: u64,
+    ) -> Result<usize, MessagingError> {
         let _guard = self.claim_lock.lock().await;
         let now = now_unix_ms();
 
@@ -891,6 +1957,23 @@ impl LogMessaging {
             }
         }
 
+        // A dead-lettered message PINS its retained payload against reclaim (any group's dead-letter
+        // for this topic), so a redrive/purge always has the payload — no separate dead-letter copy
+        // needed, and this is the ONE mechanism that also works cluster-side (the deterministic Raft
+        // apply cannot write to object storage). Gather the dead-lettered ids across all groups once.
+        let gdead_prefix = gdead_topic_prefix(topic);
+        let mut dead_ids = std::collections::HashSet::new();
+        for key in self
+            .kv
+            .list_prefix(&gdead_prefix)
+            .await
+            .map_err(MessagingError::backend)?
+        {
+            if let Some((_, id)) = split_group_id(&key[gdead_prefix.len()..]) {
+                dead_ids.insert(id.to_string());
+            }
+        }
+
         let log_prefix = glog_prefix(topic);
         let log_keys = self
             .kv
@@ -903,9 +1986,12 @@ impl LogMessaging {
                 continue;
             }
             let id = &key[log_prefix.len()..];
+            // A dead-lettered message's payload is pinned unconditionally (even past retention age)
+            // until the dead-letter is redriven or purged — so a redrive always has its payload.
+            let pinned = dead_ids.contains(id);
             let needed = grouped_message_needed(&states, id);
-            let expired = id_millis(id) + GROUP_RETENTION_MS < now;
-            if !needed || expired {
+            let expired = id_millis(id) + retention_ms < now;
+            if !pinned && (!needed || expired) {
                 let _ = self.storage.delete(&gpayload_key(topic, id)).await;
                 let _ = self.kv.delete(&glog_key(topic, id)).await;
                 reclaimed += 1;
@@ -927,63 +2013,142 @@ impl Messaging for LogMessaging {
         payload: &[u8],
         signed_context: Option<&str>,
     ) -> Result<(), MessagingError> {
-        let id = format!(
-            "{:013}-{:016x}",
-            now_unix_ms(),
-            self.seq.fetch_add(1, Ordering::Relaxed)
-        );
-        // Payload first, then the index record — so the record never references
-        // a missing payload.
-        let bytes = bytes::Bytes::copy_from_slice(payload);
-        let body = futures::stream::once(async move { Ok(bytes) }).boxed();
-        self.storage
-            .put(&payload_key(topic, &id), body, PutMeta::default())
-            .await
-            .map_err(MessagingError::backend)?;
-        // The durable signed-context (R1) rides on the index record, so it is deleted with the
-        // record on ack/dead-letter (no separate keyspace to clean up).
-        let json = serde_json::to_vec(&Record::fresh(signed_context.map(str::to_owned)))
-            .map_err(MessagingError::backend)?;
-        self.kv
-            .put(&meta_key(topic, &id), json)
-            .await
-            .map_err(MessagingError::backend)?;
-        // Grouped (fan-out) topics keep a **retained** copy of the payload + an
-        // append-only log entry, so each group can consume the message on its own
-        // high-water long after the default queue's ack would have deleted it, and
-        // advance the per-topic `logmax` gate marker (so an idle group's claim
-        // early-returns without a scan). Only paid on topics with a registered group.
-        if self.topic_has_groups(topic).await {
-            let bytes = bytes::Bytes::copy_from_slice(payload);
-            let body = futures::stream::once(async move { Ok(bytes) }).boxed();
-            self.storage
-                .put(&gpayload_key(topic, &id), body, PutMeta::default())
-                .await
-                .map_err(MessagingError::backend)?;
-            self.kv
-                .put(&glog_key(topic, &id), Vec::new())
-                .await
-                .map_err(MessagingError::backend)?;
-            // Advance the gate to the max id seen — never backward, so two
-            // concurrent same-ms publishes can't leave it below a retained id
-            // (which would wrongly close the gate on the higher one).
-            let cur = self
-                .kv
-                .get(&logmax_key(topic))
-                .await
-                .map_err(MessagingError::backend)?
-                .map(|v| String::from_utf8_lossy(&v).into_owned())
-                .unwrap_or_default();
-            if id.as_str() > cur.as_str() {
-                self.kv
-                    .put(&logmax_key(topic), id.clone().into_bytes())
-                    .await
-                    .map_err(MessagingError::backend)?;
+        // Feature B/C: resolve (cached) the topic's operator policy, enforce depth/rate BEFORE
+        // building anything (a breach rejects the publish with nothing enqueued), and take the
+        // effective relaxed-durability budget (policy override, else node default). Most topics have
+        // no policy — the fast path skips enforcement and yields the node default at zero KV cost.
+        let max_unflushed = self.enforce_and_resolve_budget(topic, 1).await?;
+        // Build this message's index ops (doing any object-store payload write first), then commit
+        // them in one durable group-commit. Factored so `publish_batch_ctx` reuses the identical
+        // A3-inline / SA1-budget / grouped-retain decisions and coalesces N messages into one commit.
+        let (id, ops) = self
+            .build_publish_ops(topic, payload, signed_context, 0, 0, 0)
+            .await?;
+        // Group-commit (A2): concurrent publishes coalesce their index writes into one durable
+        // `write_batch`. Returns only after this message's group is durably committed
+        // (at-least-once); a failed group fails this publish too. Payloads (object store) were
+        // already written by `build_publish_ops` (payload-first), so only the index writes are here.
+        self.group_commit(ops, 1, max_unflushed).await?;
+        // Notify live SSE subscribers (best-effort, separate from the durable queue above).
+        self.hubs.broadcast(topic, &id, payload);
+        Ok(())
+    }
+
+    async fn publish_delayed_ctx(
+        &self,
+        topic: &str,
+        payload: &[u8],
+        delay: Duration,
+        signed_context: Option<&str>,
+    ) -> Result<(), MessagingError> {
+        // Feature B/C: enforce the topic's operator policy (depth/rate) and resolve its relaxed budget.
+        let max_unflushed = self.enforce_and_resolve_budget(topic, 1).await?;
+        // Delivery-mode delay (P2): initial not-before = now + delay (0 ⇒ claimable now). The message
+        // is durably committed immediately; the lease field defers its first delivery.
+        let not_before_ms = if delay.is_zero() {
+            0
+        } else {
+            now_unix_ms().saturating_add(delay.as_millis() as u64)
+        };
+        let (id, ops) = self
+            .build_publish_ops(topic, payload, signed_context, not_before_ms, 0, 0)
+            .await?;
+        self.group_commit(ops, 1, max_unflushed).await?;
+        // A delayed message isn't live yet; still notify SSE (best-effort) so a live tail sees it.
+        self.hubs.broadcast(topic, &id, payload);
+        Ok(())
+    }
+
+    async fn publish_with_ttl_ctx(
+        &self,
+        topic: &str,
+        payload: &[u8],
+        ttl: Duration,
+        signed_context: Option<&str>,
+    ) -> Result<(), MessagingError> {
+        // Feature B/C: enforce the topic's operator policy (depth/rate) and resolve its relaxed budget.
+        let max_unflushed = self.enforce_and_resolve_budget(topic, 1).await?;
+        // Delivery-mode TTL (P2): expires_at = now + ttl (0 ⇒ no expiry). The message is durably
+        // committed now; a claim after expiry dead-letters it (reason ttl-expired) instead of delivering.
+        let expires_at_ms = if ttl.is_zero() {
+            0
+        } else {
+            now_unix_ms().saturating_add(ttl.as_millis() as u64)
+        };
+        let (id, ops) = self
+            .build_publish_ops(topic, payload, signed_context, 0, expires_at_ms, 0)
+            .await?;
+        self.group_commit(ops, 1, max_unflushed).await?;
+        self.hubs.broadcast(topic, &id, payload);
+        Ok(())
+    }
+
+    async fn publish_with_priority_ctx(
+        &self,
+        topic: &str,
+        payload: &[u8],
+        priority: u8,
+        signed_context: Option<&str>,
+    ) -> Result<(), MessagingError> {
+        // Feature B/C: enforce the topic's operator policy (depth/rate) and resolve its relaxed budget.
+        let max_unflushed = self.enforce_and_resolve_budget(topic, 1).await?;
+        // Delivery-mode priority (P2): higher leases first (ties FIFO); 0 = normal. Work-queue only.
+        let (id, ops) = self
+            .build_publish_ops(topic, payload, signed_context, 0, 0, priority)
+            .await?;
+        self.group_commit(ops, 1, max_unflushed).await?;
+        self.hubs.broadcast(topic, &id, payload);
+        Ok(())
+    }
+
+    async fn publish_batch_ctx(
+        &self,
+        messages: &[(String, Vec<u8>)],
+        signed_context: Option<&str>,
+    ) -> Result<(), MessagingError> {
+        if messages.is_empty() {
+            return Ok(());
+        }
+        // Feature B/C — enforce each distinct topic's policy ONCE for the count of messages the batch
+        // carries on it (fail-closed: a breach returns before we build/commit, so NOTHING in the batch
+        // is enqueued — the same all-or-nothing the durable commit already gives), and resolve the
+        // batch's effective relaxed-durability budget = the MINIMUM `max_unflushed` across its topics
+        // (a strong topic anywhere forces the whole batch durable). Most topics have no policy, so
+        // this is one cached resolve per distinct topic and no enforcement.
+        let mut per_topic_count: HashMap<&str, usize> = HashMap::new();
+        for (topic, _) in messages {
+            *per_topic_count.entry(topic.as_str()).or_insert(0) += 1;
+        }
+        let mut batch_max_unflushed = usize::MAX;
+        for (topic, count) in &per_topic_count {
+            match self.resolve_policy(topic).await? {
+                Some(p) => {
+                    self.enforce_publish_policy(topic, &p, *count).await?;
+                    batch_max_unflushed =
+                        batch_max_unflushed.min(p.max_unflushed.unwrap_or(self.max_unflushed));
+                }
+                None => batch_max_unflushed = batch_max_unflushed.min(self.max_unflushed),
             }
         }
-        // Notify live SSE subscribers (best-effort, separate from the durable
-        // queue above).
-        self.hubs.broadcast(topic, &id, payload);
+        // A4 — coalesce the WHOLE batch's index writes into ONE durable `write_batch`: build every
+        // message's ops (each doing its own payload-first object-store write + A3/SA1 decision), then
+        // a single `group_commit`. Fail-all: any build error returns before we commit, so no message
+        // in the batch is delivered (the same all-or-nothing the single group-commit gives). Every
+        // message shares the one host-minted `signed_context` (one producer principal per batch).
+        let mut all_ops: Vec<WriteOp> = Vec::with_capacity(messages.len());
+        let mut broadcasts: Vec<(&str, String, &[u8])> = Vec::with_capacity(messages.len());
+        for (topic, payload) in messages {
+            let (id, ops) = self
+                .build_publish_ops(topic, payload, signed_context, 0, 0, 0)
+                .await?;
+            all_ops.extend(ops);
+            broadcasts.push((topic.as_str(), id, payload.as_slice()));
+        }
+        self.group_commit(all_ops, messages.len(), batch_max_unflushed)
+            .await?;
+        for (topic, id, payload) in &broadcasts {
+            self.hubs.broadcast(topic, id, payload);
+        }
         Ok(())
     }
 
@@ -994,6 +2159,10 @@ impl Messaging for LogMessaging {
         max_batch: usize,
         max_attempts: u32,
     ) -> Result<Vec<ClaimedMessage>, MessagingError> {
+        // Flow control (P2): a paused topic delivers nothing (publish + in-flight ack/nack unaffected).
+        if self.is_paused(topic).await? {
+            return Ok(Vec::new());
+        }
         // Single-writer: only one claim runs at a time, so a message is leased
         // to exactly one consumer (the per-process coordinator — a cluster swaps
         // this mutex for the Raft leader applying the same `plan_claim`).
@@ -1037,7 +2206,12 @@ impl Messaging for LogMessaging {
                         .put(&meta_key(topic, &id), json)
                         .await
                         .map_err(MessagingError::backend)?;
-                    let payload = self.read_payload(topic, &id).await?;
+                    // A3: an inlined payload rides the record — no object-store fetch.
+                    let inline = record.inline.is_some();
+                    let payload = match record.inline {
+                        Some(bytes) => bytes,
+                        None => self.read_payload(topic, &id).await?,
+                    };
                     claimed.push(ClaimedMessage {
                         id,
                         topic: topic.to_string(),
@@ -1045,6 +2219,7 @@ impl Messaging for LogMessaging {
                         attempts: record.attempts,
                         group: String::new(),
                         signed_context: record.signed_context,
+                        inline,
                     });
                 }
                 ClaimAction::DeadLetter { id, record } => {
@@ -1078,6 +2253,10 @@ impl Messaging for LogMessaging {
         if group.is_empty() {
             return self.claim(topic, lease, max_batch, max_attempts).await;
         }
+        // Flow control (P2): a paused topic delivers nothing to any group.
+        if self.is_paused(topic).await? {
+            return Ok(Vec::new());
+        }
         let _guard = self.claim_lock.lock().await;
         let now = now_unix_ms();
         let lease_ms = lease.as_millis() as u64;
@@ -1109,15 +2288,27 @@ impl Messaging for LogMessaging {
         // tells us what to deliver and what to dead-letter.
         let plan = plan_claim_grouped(&mut state, now, lease_ms, max_batch, max_attempts, &new_ids);
 
-        // Dead-letter the exhausted ones (preserve the record under the group's DLQ).
+        // Dead-letter the exhausted ones under the group's DLQ, capturing the producer's
+        // signed-context so a redriven message still resolves its tenant. The retained payload
+        // (`mqgp/…`) is left in place and PINNED against the retention sweep by the dead-letter
+        // record (see `gc_grouped`) — so the DLQ is inspectable/redrivable/purgeable without a
+        // separate payload copy (the mechanism that also works cluster-side).
         for (id, attempts) in &plan.dead {
+            let signed_context = self.read_ctx(topic, id).await;
             let record = Record {
                 version: crate::SCHEMA_VERSION,
                 attempts: *attempts,
                 lease_until_ms: 0,
-                // The group's offset log doesn't carry the per-message context; a redriven grouped
-                // dead-letter re-resolves via the message's index record if still present.
-                signed_context: None,
+                signed_context,
+                // Grouped payloads are object-store retained (pinned by this dead-letter), never inlined.
+                inline: None,
+                // Grouped last_error capture needs a per-in-flight reason (GroupState::InFlight) — a
+                // follow-up; work-queue dead-letters carry it today (that's construens' poison path).
+                last_error: None,
+                // A dead-letter is terminal — no further expiry.
+                expires_at_ms: 0,
+                // Grouped is append-log-ordered; priority is a work-queue concept.
+                priority: 0,
             };
             let json = serde_json::to_vec(&record).map_err(MessagingError::backend)?;
             self.kv
@@ -1145,6 +2336,8 @@ impl Messaging for LogMessaging {
                         attempts,
                         group: group.to_string(),
                         signed_context,
+                        // Grouped/fan-out payloads are always object-store retained, never inlined.
+                        inline: false,
                     });
                 }
                 Err(_) => continue,
@@ -1178,10 +2371,23 @@ impl Messaging for LogMessaging {
             .delete(&meta_key(&msg.topic, &msg.id))
             .await
             .map_err(MessagingError::backend)?;
-        self.storage
-            .delete(&payload_key(&msg.topic, &msg.id))
-            .await
-            .map_err(MessagingError::backend)?;
+        // A3: an inlined payload lived IN the record just deleted — no object-store object exists, so
+        // skip the delete (avoids a wasted object-store round-trip, the whole point of inlining), and
+        // release its bytes from the SA1 aggregate-inline budget.
+        if msg.inline {
+            // Saturating (never wrap on underflow — a post-restart ack of a pre-restart inline
+            // message would otherwise underflow the counter and wedge the budget at "full").
+            let _ = self.inline_inflight_bytes.fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |v| Some(v.saturating_sub(msg.payload.len())),
+            );
+        } else {
+            self.storage
+                .delete(&payload_key(&msg.topic, &msg.id))
+                .await
+                .map_err(MessagingError::backend)?;
+        }
         Ok(())
     }
 
@@ -1189,13 +2395,125 @@ impl Messaging for LogMessaging {
         self.count_direct(&meta_prefix(topic)).await
     }
 
+    async fn oldest_pending_ms(&self, topic: &str) -> Result<Option<u64>, MessagingError> {
+        // The earliest live work-queue id (ids are time-ordered; `list_prefix` is sorted, so the
+        // first direct child is the oldest). Age = now − its embedded publish time.
+        let prefix = meta_prefix(topic);
+        let mut oldest: Option<u64> = None;
+        for key in self
+            .kv
+            .list_prefix(&prefix)
+            .await
+            .map_err(MessagingError::backend)?
+        {
+            if !is_direct_child(&key, &prefix) {
+                continue;
+            }
+            let ms = id_millis(&key[prefix.len()..]);
+            oldest = Some(oldest.map_or(ms, |o| o.min(ms)));
+        }
+        Ok(oldest.map(|ms| now_unix_ms().saturating_sub(ms)))
+    }
+
+    async fn in_flight_count(&self, topic: &str) -> Result<usize, MessagingError> {
+        let now = now_unix_ms();
+        // Work-queue: records currently leased (lease_until_ms in the future).
+        let prefix = meta_prefix(topic);
+        let mut count = 0;
+        for key in self
+            .kv
+            .list_prefix(&prefix)
+            .await
+            .map_err(MessagingError::backend)?
+        {
+            if !is_direct_child(&key, &prefix) {
+                continue;
+            }
+            if let Some(raw) = self.kv.get(&key).await.map_err(MessagingError::backend)? {
+                if let Ok(rec) = serde_json::from_slice::<Record>(&raw) {
+                    if rec.lease_until_ms > now {
+                        count += 1;
+                    }
+                }
+            }
+        }
+        // Grouped: every registered group's currently-leased in-flight entries.
+        let gprefix = gstate_prefix(topic);
+        for key in self
+            .kv
+            .list_prefix(&gprefix)
+            .await
+            .map_err(MessagingError::backend)?
+        {
+            if !is_direct_child(&key, &gprefix) {
+                continue;
+            }
+            let group = &key[gprefix.len()..];
+            if let Some(state) = self.get_group_state(topic, group).await? {
+                count += state
+                    .in_flight
+                    .iter()
+                    .filter(|f| f.lease_until_ms > now)
+                    .count();
+            }
+        }
+        Ok(count)
+    }
+
+    async fn group_lag(&self, topic: &str, group: &str) -> Result<usize, MessagingError> {
+        let Some(state) = self.get_group_state(topic, group).await? else {
+            return Ok(0);
+        };
+        // Retained log ids strictly beyond the group's high-water = not-yet-leased for this group.
+        let prefix = glog_prefix(topic);
+        let mut lag = 0;
+        for key in self
+            .kv
+            .list_prefix(&prefix)
+            .await
+            .map_err(MessagingError::backend)?
+        {
+            if !is_direct_child(&key, &prefix) {
+                continue;
+            }
+            if key[prefix.len()..] > *state.hwm {
+                lag += 1;
+            }
+        }
+        Ok(lag)
+    }
+
     async fn dead_letter_count(&self, topic: &str) -> Result<usize, MessagingError> {
-        self.count_direct(&dead_prefix(topic)).await
+        // Work-queue dead-letters (`mqdead/{topic}/{id}`) PLUS every consumer group's dead-letters
+        // (`mqgd/{topic}/{group}/{id}`). Before v0.4.24 only the work-queue keyspace was counted, so
+        // a fan-out consumer's poison messages reported `0` and were invisible to the operator.
+        let wq = self.count_direct(&dead_prefix(topic)).await?;
+        let gprefix = gdead_topic_prefix(topic);
+        let grouped = self
+            .kv
+            .list_prefix(&gprefix)
+            .await
+            .map_err(MessagingError::backend)?
+            .into_iter()
+            .filter(|k| split_group_id(&k[gprefix.len()..]).is_some())
+            .count();
+        Ok(wq + grouped)
     }
 
     async fn nack(&self, msg: &ClaimedMessage) -> Result<(), MessagingError> {
-        // A grouped nack resets the in-flight entry's lease to `0` (claimable now)
-        // in the compact group-state value; serialized with `claim`.
+        self.nack_after(msg, 0).await
+    }
+
+    async fn nack_after(&self, msg: &ClaimedMessage, delay_ms: u64) -> Result<(), MessagingError> {
+        // Redelivery visibility: 0 ⇒ claimable now (plain nack); else hold it leased until now+delay
+        // so a persistently-failing message's retries are spaced out (backoff) instead of hot-looping.
+        let until = if delay_ms == 0 {
+            0
+        } else {
+            now_unix_ms().saturating_add(delay_ms)
+        };
+        // A grouped nack resets the in-flight entry's lease in the compact group-state value;
+        // serialized with `claim`.
         if !msg.group.is_empty() {
             let _guard = self.claim_lock.lock().await;
             let Some(mut state) = self.get_group_state(&msg.topic, &msg.group).await? else {
@@ -1204,7 +2522,7 @@ impl Messaging for LogMessaging {
             let mut changed = false;
             for entry in &mut state.in_flight {
                 if entry.id == msg.id {
-                    entry.lease_until_ms = 0;
+                    entry.lease_until_ms = until;
                     changed = true;
                     break;
                 }
@@ -1220,7 +2538,7 @@ impl Messaging for LogMessaging {
         };
         let mut record: Record =
             serde_json::from_slice(&raw).map_err(|e| MessagingError::Decode(e.to_string()))?;
-        record.lease_until_ms = 0; // claimable again now
+        record.lease_until_ms = until;
         let json = serde_json::to_vec(&record).map_err(MessagingError::backend)?;
         self.kv
             .put(&key, json)
@@ -1230,24 +2548,67 @@ impl Messaging for LogMessaging {
     }
 
     async fn purge_dead_letters(&self, topic: &str) -> Result<usize, MessagingError> {
+        let mut purged = 0;
+        // Work-queue dead-letters: drop the preserved payload then the record (payload-then-index,
+        // mirroring `ack`).
         let prefix = dead_prefix(topic);
-        let keys = self
+        for key in self
             .kv
             .list_prefix(&prefix)
             .await
-            .map_err(MessagingError::backend)?;
-        let mut purged = 0;
-        for key in keys {
+            .map_err(MessagingError::backend)?
+        {
             if !is_direct_child(&key, &prefix) {
                 continue; // a subtopic's dead letters aren't this topic's
             }
             let id = &key[prefix.len()..];
-            // Drop the preserved payload (kept at dead-letter time) then the
-            // dead record — order mirrors `ack` (payload, then index).
-            self.storage
-                .delete(&payload_key(topic, id))
+            // An inlined dead record carried its payload IN the record (no object to free); a
+            // non-inlined one has an object-store payload to delete.
+            let inline_len = self
+                .kv
+                .get(&key)
+                .await
+                .map_err(MessagingError::backend)?
+                .and_then(|raw| serde_json::from_slice::<Record>(&raw).ok())
+                .and_then(|r| r.inline.map(|p| p.len()));
+            match inline_len {
+                // C2: an inline dead-letter's bytes were still charged to the SA1 aggregate-inline
+                // budget (they persisted in `mqdead/` after dead-lettering, never ack'd). Purging is
+                // where they finally leave the node — release them, saturating so a post-restart purge
+                // of a pre-restart record can't underflow and wedge the budget at "full".
+                Some(len) => {
+                    let _ = self.inline_inflight_bytes.fetch_update(
+                        std::sync::atomic::Ordering::Relaxed,
+                        std::sync::atomic::Ordering::Relaxed,
+                        |v| Some(v.saturating_sub(len)),
+                    );
+                }
+                None => {
+                    self.storage
+                        .delete(&payload_key(topic, id))
+                        .await
+                        .map_err(MessagingError::backend)?;
+                }
+            }
+            self.kv
+                .delete(&key)
                 .await
                 .map_err(MessagingError::backend)?;
+            purged += 1;
+        }
+        // Grouped dead-letters (every group): drop the dead-letter record. That un-pins the shared
+        // retained payload (`mqgp/…`); the retention sweep reclaims it once no group needs it — we
+        // don't delete it here because other groups may still be consuming that message.
+        let gprefix = gdead_topic_prefix(topic);
+        for key in self
+            .kv
+            .list_prefix(&gprefix)
+            .await
+            .map_err(MessagingError::backend)?
+        {
+            if split_group_id(&key[gprefix.len()..]).is_none() {
+                continue;
+            }
             self.kv
                 .delete(&key)
                 .await
@@ -1258,32 +2619,38 @@ impl Messaging for LogMessaging {
     }
 
     async fn redrive_dead_letters(&self, topic: &str) -> Result<usize, MessagingError> {
+        let mut redriven = 0;
+        // Work-queue: re-arm a fresh, immediately-claimable `mq/` record (the payload is still
+        // present), *then* drop the dead record — a crash in between leaves the message recoverable
+        // (live) rather than orphaning its payload. Carry the preserved signed-context forward so a
+        // redriven message still resolves the producer's tenant on retry.
         let prefix = dead_prefix(topic);
-        let keys = self
+        for key in self
             .kv
             .list_prefix(&prefix)
             .await
-            .map_err(MessagingError::backend)?;
-        let mut redriven = 0;
-        for key in keys {
+            .map_err(MessagingError::backend)?
+        {
             if !is_direct_child(&key, &prefix) {
                 continue;
             }
             let id = &key[prefix.len()..];
-            // Re-arm a fresh, immediately-claimable record (the payload is still
-            // present), *then* drop the dead record — so a crash in between leaves
-            // the message recoverable (live) rather than orphaning its payload.
-            // Carry the preserved signed-context forward so a redriven message still resolves the
-            // producer's tenant on retry (the dead record kept it verbatim).
-            let signed_context = self
+            // Re-arm from the preserved dead record: reset attempts + lease (claimable now) but KEEP
+            // its signed-context AND its inlined payload (A3) — so a redriven inline message still
+            // carries its body without any object-store object.
+            let mut record = self
                 .kv
                 .get(&key)
                 .await
                 .map_err(MessagingError::backend)?
                 .and_then(|raw| serde_json::from_slice::<Record>(&raw).ok())
-                .and_then(|r| r.signed_context);
-            let json = serde_json::to_vec(&Record::fresh(signed_context))
-                .map_err(MessagingError::backend)?;
+                .unwrap_or_else(|| Record::fresh(None));
+            record.attempts = 0;
+            record.lease_until_ms = 0;
+            record.last_error = None; // a fresh life — the prior failure reason no longer applies.
+            record.expires_at_ms = 0; // and clear any TTL: a redrive is a deliberate operator retry
+                                      // (else a ttl-expired dead-letter would immediately re-expire).
+            let json = serde_json::to_vec(&record).map_err(MessagingError::backend)?;
             self.kv
                 .put(&meta_key(topic, id), json)
                 .await
@@ -1294,11 +2661,507 @@ impl Messaging for LogMessaging {
                 .map_err(MessagingError::backend)?;
             redriven += 1;
         }
+        // Grouped: restore each dead-letter's preserved payload into the shared retained slot, re-arm
+        // the id in its group's in-flight (fresh attempts, claimable now), then drop the dead record
+        // + its preserved payload. Serialized with `claim` — it mutates the compact group state.
+        let gprefix = gdead_topic_prefix(topic);
+        let gkeys = self
+            .kv
+            .list_prefix(&gprefix)
+            .await
+            .map_err(MessagingError::backend)?;
+        if !gkeys.is_empty() {
+            let _guard = self.claim_lock.lock().await;
+            for key in gkeys {
+                let Some((group, id)) = split_group_id(&key[gprefix.len()..]) else {
+                    continue;
+                };
+                // The retained payload (`mqgp/…`) is still present — it was pinned by this dead-letter
+                // record against the retention sweep — so we only re-arm the id in the group's
+                // in-flight (fresh attempts, claimable now) and drop the dead record. Create the
+                // group at the current head if it was deregistered, so only the redriven id is
+                // in-flight (no backlog replay).
+                let mut state = match self.get_group_state(topic, group).await? {
+                    Some(state) => state,
+                    None => {
+                        self.mark_grouped(topic);
+                        GroupState::new(self.read_logmax(topic).await?)
+                    }
+                };
+                if !state.in_flight.iter().any(|f| f.id == id) {
+                    state.in_flight.push(InFlight {
+                        id: id.to_string(),
+                        attempts: 0,
+                        lease_until_ms: 0,
+                    });
+                }
+                self.put_group_state(topic, group, &state).await?;
+                self.kv
+                    .delete(&key)
+                    .await
+                    .map_err(MessagingError::backend)?;
+                redriven += 1;
+            }
+        }
         Ok(redriven)
     }
 
-    async fn retention_sweep(&self, topic: &str) -> Result<usize, MessagingError> {
-        self.gc_grouped(topic).await
+    async fn set_last_error(
+        &self,
+        msg: &ClaimedMessage,
+        reason: &str,
+    ) -> Result<(), MessagingError> {
+        // Grouped last_error capture (GroupState::InFlight) is a follow-up; today the work-queue lane
+        // records it (construens' poison path). A grouped call is a safe no-op, never an error.
+        if !msg.group.is_empty() {
+            return Ok(());
+        }
+        let key = meta_key(&msg.topic, &msg.id);
+        let Some(raw) = self.kv.get(&key).await.map_err(MessagingError::backend)? else {
+            return Ok(()); // acked/gone since the failed delivery — nothing to annotate.
+        };
+        let mut record: Record =
+            serde_json::from_slice(&raw).map_err(|e| MessagingError::Decode(e.to_string()))?;
+        record.last_error = Some(sanitize_reason(reason));
+        let json = serde_json::to_vec(&record).map_err(MessagingError::backend)?;
+        self.kv
+            .put(&key, json)
+            .await
+            .map_err(MessagingError::backend)?;
+        Ok(())
+    }
+
+    async fn list_dead_letters(
+        &self,
+        topic: &str,
+        filter: &DeadLetterFilter,
+    ) -> Result<Vec<DeadLetter>, MessagingError> {
+        let now = now_unix_ms();
+        let mut matched: Vec<DeadLetter> = self
+            .collect_dead_letters(topic)
+            .await?
+            .into_iter()
+            .filter(|dl| filter.matches(dl, now))
+            .collect();
+        if let Some(limit) = filter.limit {
+            matched.truncate(limit); // collect_dead_letters ordered by id, so this keeps the earliest.
+        }
+        Ok(matched)
+    }
+
+    async fn show_dead_letter(
+        &self,
+        topic: &str,
+        group: &str,
+        id: &str,
+    ) -> Result<Option<DeadLetter>, MessagingError> {
+        let key = if group.is_empty() {
+            dead_key(topic, id)
+        } else {
+            gdead_key(topic, group, id)
+        };
+        let Some(raw) = self.kv.get(&key).await.map_err(MessagingError::backend)? else {
+            return Ok(None);
+        };
+        let record: Record =
+            serde_json::from_slice(&raw).map_err(|e| MessagingError::Decode(e.to_string()))?;
+        // Payload: an inlined body rides in the record (A3); otherwise it is object-store retained —
+        // the work-queue copy (`payload_key`) or the shared grouped copy (`gpayload_key`, pinned by
+        // this dead-letter). A missing object yields an empty body rather than failing the inspection.
+        let payload = if let Some(inline) = record.inline.clone() {
+            inline
+        } else if group.is_empty() {
+            self.read_payload(topic, id).await.unwrap_or_default()
+        } else {
+            self.read_gpayload(topic, id).await.unwrap_or_default()
+        };
+        Ok(Some(DeadLetter {
+            id: id.to_string(),
+            group: group.to_string(),
+            attempts: record.attempts,
+            last_error: record.last_error,
+            signed_context: record.signed_context,
+            payload: Some(payload),
+        }))
+    }
+
+    async fn redrive_dead_letters_filtered(
+        &self,
+        topic: &str,
+        filter: &DeadLetterFilter,
+    ) -> Result<usize, MessagingError> {
+        let now = now_unix_ms();
+        let matched: Vec<DeadLetter> = {
+            let mut m: Vec<DeadLetter> = self
+                .collect_dead_letters(topic)
+                .await?
+                .into_iter()
+                .filter(|dl| filter.matches(dl, now))
+                .collect();
+            if let Some(limit) = filter.limit {
+                m.truncate(limit);
+            }
+            m
+        };
+        let mut redriven = 0;
+        // Work-queue matches: re-arm a fresh `mq/` record from the preserved dead record (attempts +
+        // lease reset, signed-context + inline payload kept), then drop the dead record.
+        for dl in matched.iter().filter(|dl| dl.group.is_empty()) {
+            let dead = dead_key(topic, &dl.id);
+            let Some(raw) = self.kv.get(&dead).await.map_err(MessagingError::backend)? else {
+                continue;
+            };
+            let mut record: Record =
+                serde_json::from_slice(&raw).map_err(|e| MessagingError::Decode(e.to_string()))?;
+            record.attempts = 0;
+            record.lease_until_ms = 0;
+            record.last_error = None; // a fresh life — the prior failure reason no longer applies.
+            record.expires_at_ms = 0; // clear any TTL: a redrive is a deliberate retry (else a
+                                      // ttl-expired dead-letter would immediately re-expire on claim).
+            let json = serde_json::to_vec(&record).map_err(MessagingError::backend)?;
+            self.kv
+                .put(&meta_key(topic, &dl.id), json)
+                .await
+                .map_err(MessagingError::backend)?;
+            self.kv
+                .delete(&dead)
+                .await
+                .map_err(MessagingError::backend)?;
+            redriven += 1;
+        }
+        // Grouped matches: re-arm each id in its group's in-flight (fresh attempts, claimable now) and
+        // drop the dead record — the retained payload stays pinned until then. One `claim_lock` turn.
+        let grouped: Vec<&DeadLetter> = matched.iter().filter(|dl| !dl.group.is_empty()).collect();
+        if !grouped.is_empty() {
+            let _guard = self.claim_lock.lock().await;
+            for dl in grouped {
+                let dead = gdead_key(topic, &dl.group, &dl.id);
+                if self
+                    .kv
+                    .get(&dead)
+                    .await
+                    .map_err(MessagingError::backend)?
+                    .is_none()
+                {
+                    continue;
+                }
+                let mut state = match self.get_group_state(topic, &dl.group).await? {
+                    Some(state) => state,
+                    None => {
+                        self.mark_grouped(topic);
+                        GroupState::new(self.read_logmax(topic).await?)
+                    }
+                };
+                if !state.in_flight.iter().any(|f| f.id == dl.id) {
+                    state.in_flight.push(InFlight {
+                        id: dl.id.clone(),
+                        attempts: 0,
+                        lease_until_ms: 0,
+                    });
+                }
+                self.put_group_state(topic, &dl.group, &state).await?;
+                self.kv
+                    .delete(&dead)
+                    .await
+                    .map_err(MessagingError::backend)?;
+                redriven += 1;
+            }
+        }
+        Ok(redriven)
+    }
+
+    async fn discard_dead_letters(
+        &self,
+        topic: &str,
+        filter: &DeadLetterFilter,
+    ) -> Result<usize, MessagingError> {
+        let now = now_unix_ms();
+        let matched: Vec<DeadLetter> = {
+            let mut m: Vec<DeadLetter> = self
+                .collect_dead_letters(topic)
+                .await?
+                .into_iter()
+                .filter(|dl| filter.matches(dl, now))
+                .collect();
+            if let Some(limit) = filter.limit {
+                m.truncate(limit);
+            }
+            m
+        };
+        let mut discarded = 0;
+        for dl in &matched {
+            if dl.group.is_empty() {
+                // Work-queue: drop the object-store payload (unless inlined) then the record.
+                let dead = dead_key(topic, &dl.id);
+                let inline_len = self
+                    .kv
+                    .get(&dead)
+                    .await
+                    .map_err(MessagingError::backend)?
+                    .and_then(|raw| serde_json::from_slice::<Record>(&raw).ok())
+                    .and_then(|r| r.inline.map(|p| p.len()));
+                match inline_len {
+                    // C2: release an inline dead-letter's bytes from the SA1 budget on discard
+                    // (saturating — see purge_dead_letters).
+                    Some(len) => {
+                        let _ = self.inline_inflight_bytes.fetch_update(
+                            std::sync::atomic::Ordering::Relaxed,
+                            std::sync::atomic::Ordering::Relaxed,
+                            |v| Some(v.saturating_sub(len)),
+                        );
+                    }
+                    None => {
+                        self.storage
+                            .delete(&payload_key(topic, &dl.id))
+                            .await
+                            .map_err(MessagingError::backend)?;
+                    }
+                }
+                self.kv
+                    .delete(&dead)
+                    .await
+                    .map_err(MessagingError::backend)?;
+            } else {
+                // Grouped: drop the dead record; the shared retained payload un-pins and the sweep
+                // reclaims it once no group needs it (another group may still consume this message).
+                self.kv
+                    .delete(&gdead_key(topic, &dl.group, &dl.id))
+                    .await
+                    .map_err(MessagingError::backend)?;
+            }
+            discarded += 1;
+        }
+        Ok(discarded)
+    }
+
+    async fn peek(&self, topic: &str, limit: usize) -> Result<Vec<PeekedMessage>, MessagingError> {
+        let now = now_unix_ms();
+        let prefix = meta_prefix(topic);
+        let mut keys: Vec<String> = self
+            .kv
+            .list_prefix(&prefix)
+            .await
+            .map_err(MessagingError::backend)?
+            .into_iter()
+            .filter(|k| is_direct_child(k, &prefix))
+            .collect();
+        keys.sort(); // ids are time-ordered ⇒ delivery order.
+        let mut out = Vec::new();
+        for key in keys.into_iter().take(limit) {
+            let Some(raw) = self.kv.get(&key).await.map_err(MessagingError::backend)? else {
+                continue;
+            };
+            let record: Record =
+                serde_json::from_slice(&raw).map_err(|e| MessagingError::Decode(e.to_string()))?;
+            let id = key[prefix.len()..].to_string();
+            // Read-only: never mutate the lease or attempts. Inline rides in the record; otherwise the
+            // object-store copy (a missing object yields an empty body rather than failing the peek).
+            let payload = match &record.inline {
+                Some(bytes) => bytes.clone(),
+                None => self.read_payload(topic, &id).await.unwrap_or_default(),
+            };
+            out.push(PeekedMessage {
+                id,
+                attempts: record.attempts,
+                leased: record.lease_until_ms > now,
+                signed_context: record.signed_context,
+                payload,
+            });
+        }
+        Ok(out)
+    }
+
+    async fn replay(
+        &self,
+        topic: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<PeekedMessage>, MessagingError> {
+        // Read the retained grouped-fan-out log (existence markers under `mqglog/{topic}/`), not the
+        // work-queue index — a grouped topic keeps its history until the retention sweep, independent
+        // of any group's cursor. Purely non-destructive: no lease, no attempt charge, no cursor touch,
+        // so a live tail (`subscribe`) and every group's drain are undisturbed.
+        let prefix = glog_prefix(topic);
+        let mut ids: Vec<String> = self
+            .kv
+            .list_prefix(&prefix)
+            .await
+            .map_err(MessagingError::backend)?
+            .into_iter()
+            .filter(|k| is_direct_child(k, &prefix))
+            .map(|k| k[prefix.len()..].to_string())
+            .collect();
+        ids.sort(); // ids are time-ordered ⇒ publish order.
+        let mut out = Vec::new();
+        for id in ids {
+            // `after` is exclusive — skip everything at or before the caller's last-seen offset.
+            if let Some(after) = after {
+                if id.as_str() <= after {
+                    continue;
+                }
+            }
+            if out.len() >= limit {
+                break;
+            }
+            // The retained fan-out payload (a missing object yields an empty body rather than failing
+            // the replay); context re-read from the shared index record, best-effort.
+            let payload = self.read_gpayload(topic, &id).await.unwrap_or_default();
+            let signed_context = self.read_ctx(topic, &id).await;
+            out.push(PeekedMessage {
+                id,
+                attempts: 0,   // history entries carry no per-group delivery count.
+                leased: false, // replay never leases.
+                signed_context,
+                payload,
+            });
+        }
+        Ok(out)
+    }
+
+    async fn list_groups(&self, topic: &str) -> Result<Vec<GroupInfo>, MessagingError> {
+        let gprefix = gstate_prefix(topic);
+        let group_keys = self
+            .kv
+            .list_prefix(&gprefix)
+            .await
+            .map_err(MessagingError::backend)?;
+        // The retained log ids once, for each group's lag (ids strictly beyond its hwm).
+        let log_prefix = glog_prefix(topic);
+        let log_ids: Vec<String> = self
+            .kv
+            .list_prefix(&log_prefix)
+            .await
+            .map_err(MessagingError::backend)?
+            .into_iter()
+            .filter(|k| is_direct_child(k, &log_prefix))
+            .map(|k| k[log_prefix.len()..].to_string())
+            .collect();
+        let mut out = Vec::new();
+        for key in group_keys {
+            if !is_direct_child(&key, &gprefix) {
+                continue;
+            }
+            let group = key[gprefix.len()..].to_string();
+            let Some(state) = self.get_group_state(topic, &group).await? else {
+                continue;
+            };
+            let lag = log_ids
+                .iter()
+                .filter(|id| id.as_str() > state.hwm.as_str())
+                .count();
+            out.push(GroupInfo {
+                group,
+                hwm: state.hwm,
+                in_flight: state.in_flight.len(),
+                lag,
+            });
+        }
+        out.sort_by(|a, b| a.group.cmp(&b.group));
+        Ok(out)
+    }
+
+    async fn reset_group(
+        &self,
+        topic: &str,
+        group: &str,
+        start: StartPosition,
+    ) -> Result<(), MessagingError> {
+        // Serialize with claim/ack — it replaces the group's compact state.
+        let _guard = self.claim_lock.lock().await;
+        if self.get_group_state(topic, group).await?.is_none() {
+            return Err(MessagingError::Backend(format!(
+                "no such consumer group {group:?} on topic {topic:?}"
+            )));
+        }
+        // Move the cursor + DROP the in-flight set: Earliest ⇒ hwm "" (re-consume the whole retained
+        // backlog), Latest ⇒ hwm = current logmax (skip to the head). GroupState::new clears in_flight.
+        let hwm = match start {
+            StartPosition::Earliest => String::new(),
+            StartPosition::Latest => self.read_logmax(topic).await?,
+        };
+        self.put_group_state(topic, group, &GroupState::new(hwm))
+            .await?;
+        Ok(())
+    }
+
+    async fn delete_group(&self, topic: &str, group: &str) -> Result<(), MessagingError> {
+        let _guard = self.claim_lock.lock().await;
+        // Delete this group's dead-letters, then its state. The shared retained log/payloads it pinned
+        // are reclaimed by the retention sweep once no remaining group needs them.
+        let dprefix = format!("mqgd/{topic}/{group}/");
+        for key in self
+            .kv
+            .list_prefix(&dprefix)
+            .await
+            .map_err(MessagingError::backend)?
+        {
+            self.kv
+                .delete(&key)
+                .await
+                .map_err(MessagingError::backend)?;
+        }
+        self.kv
+            .delete(&gstate_key(topic, group))
+            .await
+            .map_err(MessagingError::backend)?;
+        Ok(())
+    }
+
+    async fn set_paused(&self, topic: &str, paused: bool) -> Result<(), MessagingError> {
+        let key = pause_key(topic);
+        if paused {
+            self.kv
+                .put(&key, Vec::new())
+                .await
+                .map_err(MessagingError::backend)?;
+        } else {
+            self.kv
+                .delete(&key)
+                .await
+                .map_err(MessagingError::backend)?;
+        }
+        Ok(())
+    }
+
+    async fn is_paused(&self, topic: &str) -> Result<bool, MessagingError> {
+        Ok(self
+            .kv
+            .get(&pause_key(topic))
+            .await
+            .map_err(MessagingError::backend)?
+            .is_some())
+    }
+
+    async fn set_topic_policy(
+        &self,
+        topic: &str,
+        policy: TopicPolicy,
+    ) -> Result<(), MessagingError> {
+        // Feature A: persist the policy as JSON under `mqpolicy/{topic}` (mirroring the pause marker),
+        // then INVALIDATE the in-memory cache so the next publish resolves the fresh value. An
+        // all-`None` policy is still persisted (an explicit "no caps" that overrides a prior policy);
+        // the cache is invalidated either way. Write-then-invalidate: a concurrent publish either
+        // sees the old cached policy or re-reads the new one — never a torn state.
+        let json = serde_json::to_vec(&policy).map_err(MessagingError::backend)?;
+        self.kv
+            .put(&mqpolicy_key(topic), json)
+            .await
+            .map_err(MessagingError::backend)?;
+        self.policy_cache.lock().unwrap().remove(topic);
+        Ok(())
+    }
+
+    async fn topic_policy(&self, topic: &str) -> Result<Option<TopicPolicy>, MessagingError> {
+        // Served through the same cache the publish path uses (lazily loaded on a miss).
+        self.resolve_policy(topic).await
+    }
+
+    async fn retention_sweep(
+        &self,
+        topic: &str,
+        retention_ms: u64,
+    ) -> Result<usize, MessagingError> {
+        self.gc_grouped(topic, retention_ms).await
     }
 
     fn subscribe(
@@ -1404,6 +3267,133 @@ mod tests {
 
     fn mq() -> LogMessaging {
         LogMessaging::new(Arc::new(MemStorage::default()), Arc::new(MemoryKv::new()))
+    }
+
+    /// A `KvStore` whose durable-commit boundary (`put`/`write_batch`) always fails — drives the
+    /// group-commit fail-all path (`publish`/`publish_batch` → `group_commit` → `write_batch` → error).
+    struct FailingKv;
+    #[async_trait]
+    impl KvStore for FailingKv {
+        async fn get(&self, _: &str) -> Result<Option<Vec<u8>>, crate::kv::KvError> {
+            Ok(None)
+        }
+        async fn put(&self, _: &str, _: Vec<u8>) -> Result<(), crate::kv::KvError> {
+            Err(crate::kv::KvError::backend("commit failed"))
+        }
+        async fn delete(&self, _: &str) -> Result<(), crate::kv::KvError> {
+            Ok(())
+        }
+        async fn list_prefix(&self, _: &str) -> Result<Vec<String>, crate::kv::KvError> {
+            Ok(Vec::new())
+        }
+        async fn write_batch(&self, _: Vec<crate::kv::WriteOp>) -> Result<(), crate::kv::KvError> {
+            Err(crate::kv::KvError::backend("commit failed"))
+        }
+    }
+
+    /// A `KvStore` that delegates to an inner [`MemoryKv`] and counts `write_batch` calls — proves a
+    /// group/batch coalesces into ONE durable commit rather than one per message.
+    struct CountingKv {
+        inner: MemoryKv,
+        batches: std::sync::atomic::AtomicUsize,
+        relaxed: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait]
+    impl KvStore for CountingKv {
+        async fn get(&self, k: &str) -> Result<Option<Vec<u8>>, crate::kv::KvError> {
+            self.inner.get(k).await
+        }
+        async fn put(&self, k: &str, v: Vec<u8>) -> Result<(), crate::kv::KvError> {
+            self.inner.put(k, v).await
+        }
+        async fn delete(&self, k: &str) -> Result<(), crate::kv::KvError> {
+            self.inner.delete(k).await
+        }
+        async fn list_prefix(&self, p: &str) -> Result<Vec<String>, crate::kv::KvError> {
+            self.inner.list_prefix(p).await
+        }
+        async fn write_batch(
+            &self,
+            ops: Vec<crate::kv::WriteOp>,
+        ) -> Result<(), crate::kv::KvError> {
+            self.batches
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.write_batch(ops).await
+        }
+        async fn write_batch_relaxed(
+            &self,
+            ops: Vec<crate::kv::WriteOp>,
+        ) -> Result<(), crate::kv::KvError> {
+            // Count relaxed vs durable separately so a test can assert the checkpoint cadence. The
+            // inner MemoryKv is always durable, so correctness (all messages present) is preserved.
+            self.relaxed
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.write_batch(ops).await
+        }
+    }
+
+    /// A `KvStore` that delegates to an inner [`MemoryKv`] but BLOCKS the first `write_batch` until
+    /// released — so a test can hold one publisher inside the durable commit (holding the group-commit
+    /// gate) while it stages another publisher behind it. `new()` returns the store plus an `entered`
+    /// receiver (fires when the first commit begins) and a `release` sender (unblocks it). Uses
+    /// `futures::channel::oneshot` (core's runtime-agnostic dep; tokio's `sync` isn't enabled here).
+    struct GateKv {
+        inner: MemoryKv,
+        calls: std::sync::atomic::AtomicUsize,
+        entered_tx: std::sync::Mutex<Option<futures::channel::oneshot::Sender<()>>>,
+        release_rx: std::sync::Mutex<Option<futures::channel::oneshot::Receiver<()>>>,
+    }
+    impl GateKv {
+        fn new() -> (
+            Arc<Self>,
+            futures::channel::oneshot::Receiver<()>,
+            futures::channel::oneshot::Sender<()>,
+        ) {
+            let (entered_tx, entered_rx) = futures::channel::oneshot::channel();
+            let (release_tx, release_rx) = futures::channel::oneshot::channel();
+            let kv = Arc::new(Self {
+                inner: MemoryKv::new(),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                entered_tx: std::sync::Mutex::new(Some(entered_tx)),
+                release_rx: std::sync::Mutex::new(Some(release_rx)),
+            });
+            (kv, entered_rx, release_tx)
+        }
+    }
+    #[async_trait]
+    impl KvStore for GateKv {
+        async fn get(&self, k: &str) -> Result<Option<Vec<u8>>, crate::kv::KvError> {
+            self.inner.get(k).await
+        }
+        async fn put(&self, k: &str, v: Vec<u8>) -> Result<(), crate::kv::KvError> {
+            self.inner.put(k, v).await
+        }
+        async fn delete(&self, k: &str) -> Result<(), crate::kv::KvError> {
+            self.inner.delete(k).await
+        }
+        async fn list_prefix(&self, p: &str) -> Result<Vec<String>, crate::kv::KvError> {
+            self.inner.list_prefix(p).await
+        }
+        async fn write_batch(
+            &self,
+            ops: Vec<crate::kv::WriteOp>,
+        ) -> Result<(), crate::kv::KvError> {
+            if self
+                .calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                == 0
+            {
+                if let Some(tx) = self.entered_tx.lock().unwrap().take() {
+                    let _ = tx.send(());
+                }
+                // Take the receiver OUT of the lock before awaiting (never hold a std guard across await).
+                let rx = self.release_rx.lock().unwrap().take();
+                if let Some(rx) = rx {
+                    let _ = rx.await;
+                }
+            }
+            self.inner.write_batch(ops).await
+        }
     }
 
     const LEASE: Duration = Duration::from_secs(30);
@@ -1636,7 +3626,7 @@ mod tests {
             mq.ack(m).await.unwrap();
         }
         // Nothing is reclaimable: "two" still needs both (id > its hwm of "").
-        assert_eq!(mq.gc_grouped(t).await.unwrap(), 0);
+        assert_eq!(mq.gc_grouped(t, GROUP_RETENTION_MS).await.unwrap(), 0);
 
         // "two" claims + acks both → now every group has consumed both.
         let two = mq
@@ -1648,7 +3638,7 @@ mod tests {
             mq.ack(m).await.unwrap();
         }
         // Both are fully consumed → the sweep reclaims both log entries + payloads.
-        assert_eq!(mq.gc_grouped(t).await.unwrap(), 2);
+        assert_eq!(mq.gc_grouped(t, GROUP_RETENTION_MS).await.unwrap(), 2);
         let ids: Vec<String> = one.iter().map(|m| m.id.clone()).collect();
         for id in &ids {
             assert!(
@@ -1716,6 +3706,93 @@ mod tests {
         let second = mq.claim("t", LEASE, 10, 5).await.unwrap();
         assert_eq!(second.len(), 1);
         assert_eq!(second[0].attempts, 2); // redelivered, attempt charged again
+    }
+
+    // P2 delivery modes: a far-future delay defers delivery; a no-delay companion is claimable now.
+    // (Delivery AFTER the delay elapses is exercised in the cluster crate's conformance, which has a
+    // tokio time driver; the mechanism — an expired not-before on an attempts-0 record — is the same
+    // lease-expiry path as `lease_expiry_redelivers`.)
+    #[tokio::test]
+    async fn delayed_publish_defers_until_its_not_before() {
+        let mq = mq();
+        mq.publish_delayed_ctx("t", b"later", Duration::from_secs(3600), None)
+            .await
+            .unwrap();
+        mq.publish_delayed_ctx("t", b"now", Duration::ZERO, None)
+            .await
+            .unwrap();
+        assert_eq!(mq.backlog("t").await.unwrap(), 2, "both durably enqueued");
+        let ready = mq.claim("t", LEASE, 10, 5).await.unwrap();
+        assert_eq!(
+            payloads(&ready),
+            vec![b"now".to_vec()],
+            "delayed one deferred"
+        );
+        assert_eq!(ready[0].attempts, 1);
+    }
+
+    // P2 delivery-mode TTL: plan_claim dead-letters an expired (past-`expires_at`) undelivered message
+    // with reason `ttl-expired`, instead of leasing it; a live one leases normally. Pure + deterministic
+    // (plan_claim takes `now_ms`), so no clock/sleep needed.
+    #[test]
+    fn plan_claim_dead_letters_an_expired_message() {
+        let expired = Record {
+            expires_at_ms: 100, // expired at t=100
+            ..Record::fresh(None)
+        };
+        let live = Record::fresh(None); // no expiry
+        let actions = plan_claim(
+            vec![
+                ("0000000000100-a".to_string(), expired),
+                ("0000000000200-b".to_string(), live),
+            ],
+            1_000, // now = 1000 > 100 ⇒ the first is expired
+            30_000,
+            10,
+            5,
+        );
+        assert!(
+            matches!(&actions[0], ClaimAction::DeadLetter { record, .. }
+                if record.last_error.as_deref() == Some("ttl-expired")),
+            "the expired message dead-letters with the ttl-expired reason"
+        );
+        assert!(
+            matches!(&actions[1], ClaimAction::Lease { .. }),
+            "the live message leases normally"
+        );
+    }
+
+    // P2 delivery-mode priority: plan_claim leases higher priority first, FIFO within a priority.
+    // Pure + deterministic (a total sort order → same lease sequence on every replica).
+    #[test]
+    fn plan_claim_orders_by_priority_then_fifo() {
+        let hi = Record {
+            priority: 5,
+            ..Record::fresh(None)
+        };
+        let actions = plan_claim(
+            vec![
+                ("0000000000001-a".to_string(), Record::fresh(None)), // id 1, prio 0
+                ("0000000000002-b".to_string(), hi),                  // id 2, prio 5
+                ("0000000000003-c".to_string(), Record::fresh(None)), // id 3, prio 0
+            ],
+            1_000,
+            30_000,
+            10,
+            5,
+        );
+        let leased: Vec<&str> = actions
+            .iter()
+            .filter_map(|a| match a {
+                ClaimAction::Lease { id, .. } => Some(id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            leased,
+            vec!["0000000000002-b", "0000000000001-a", "0000000000003-c"],
+            "high-priority b leases first, then a & c FIFO within the default priority"
+        );
     }
 
     #[tokio::test]
@@ -1799,6 +3876,840 @@ mod tests {
         assert_eq!(mq.dead_letter_count("t").await.unwrap(), 1);
     }
 
+    // A **grouped** (fan-out) consumer's poison message must land in an INSPECTABLE dead-letter
+    // store — counted, redrivable (with its payload), purgeable — not silently invisible. Before
+    // the fix, grouped dead-letters went to `mqgd/…` while the operator ops scanned only `mqdead/…`,
+    // so `dead_letters` reported 0 for exactly the construens fan-out case. Mirrors the work-queue
+    // DLQ tests, for a group.
+    #[tokio::test]
+    async fn grouped_dead_letters_are_visible_redrivable_and_purgeable() {
+        let mq = mq();
+        let t = "bus/sync";
+        // Register the group (first claim), publish one poison message.
+        assert!(mq
+            .claim_grouped(t, "worker", StartPosition::Latest, Duration::ZERO, 10, 2)
+            .await
+            .unwrap()
+            .is_empty());
+        mq.publish(t, b"poison").await.unwrap();
+        // max_attempts = 2: two deliveries (ZERO lease ⇒ immediate re-claim), then the 3rd
+        // dead-letters instead of delivering.
+        for expected in 1..=2 {
+            let m = mq
+                .claim_grouped(t, "worker", StartPosition::Latest, Duration::ZERO, 10, 2)
+                .await
+                .unwrap();
+            assert_eq!(m.len(), 1, "grouped attempt {expected}");
+            assert_eq!(m[0].attempts, expected);
+        }
+        assert!(mq
+            .claim_grouped(t, "worker", StartPosition::Latest, Duration::ZERO, 10, 2)
+            .await
+            .unwrap()
+            .is_empty());
+        // VISIBLE: the grouped poison message is counted (the fix).
+        assert_eq!(mq.dead_letter_count(t).await.unwrap(), 1);
+
+        // REDRIVABLE: requeues exactly it, and it redelivers with its payload + fresh attempts.
+        assert_eq!(mq.redrive_dead_letters(t).await.unwrap(), 1);
+        assert_eq!(mq.dead_letter_count(t).await.unwrap(), 0);
+        let again = mq
+            .claim_grouped(t, "worker", StartPosition::Latest, Duration::ZERO, 10, 2)
+            .await
+            .unwrap();
+        assert_eq!(payloads(&again), vec![b"poison".to_vec()]);
+        assert_eq!(again[0].attempts, 1, "redrive reset the attempt count");
+
+        // PURGEABLE: exhaust it again (attempt 2, then dead), then purge removes exactly it.
+        assert_eq!(
+            mq.claim_grouped(t, "worker", StartPosition::Latest, Duration::ZERO, 10, 2)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(mq
+            .claim_grouped(t, "worker", StartPosition::Latest, Duration::ZERO, 10, 2)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(mq.dead_letter_count(t).await.unwrap(), 1);
+        assert_eq!(mq.purge_dead_letters(t).await.unwrap(), 1);
+        assert_eq!(mq.dead_letter_count(t).await.unwrap(), 0);
+    }
+
+    // P1 inspection stats: in-flight (leased-but-unacked) is a subset of backlog, and
+    // oldest_pending_ms exposes the backlog frontier — so an operator can tell "draining" from
+    // "wedged" and "how stale". Read-only; never mutate the queue.
+    #[tokio::test]
+    async fn stats_expose_in_flight_and_oldest_pending() {
+        let mq = mq();
+        // Empty topic: nothing pending, nothing in-flight.
+        assert_eq!(mq.oldest_pending_ms("t").await.unwrap(), None);
+        assert_eq!(mq.in_flight_count("t").await.unwrap(), 0);
+        // Published but unclaimed: pending (an age exists — the id carries the publish time), but
+        // nothing is leased yet.
+        mq.publish("t", b"a").await.unwrap();
+        mq.publish("t", b"b").await.unwrap();
+        assert!(mq.oldest_pending_ms("t").await.unwrap().is_some());
+        assert_eq!(mq.in_flight_count("t").await.unwrap(), 0);
+        // Claim both with a long lease → in-flight == 2 (backlog also 2, still pending).
+        let claimed = mq.claim("t", Duration::from_secs(60), 10, 5).await.unwrap();
+        assert_eq!(claimed.len(), 2);
+        assert_eq!(mq.in_flight_count("t").await.unwrap(), 2);
+        assert_eq!(mq.backlog("t").await.unwrap(), 2);
+        // Ack one → in-flight drops to 1 and backlog to 1.
+        mq.ack(&claimed[0]).await.unwrap();
+        assert_eq!(mq.in_flight_count("t").await.unwrap(), 1);
+        assert_eq!(mq.backlog("t").await.unwrap(), 1);
+
+        // Group lag: a group registered `earliest` then two messages published → lag 2; after it
+        // leases them, lag 0 (they're beyond nothing / at its high-water).
+        let g = "bus/lag";
+        assert!(mq
+            .claim_grouped(g, "w", StartPosition::Earliest, LEASE, 10, 5)
+            .await
+            .unwrap()
+            .is_empty());
+        mq.publish(g, b"x").await.unwrap();
+        mq.publish(g, b"y").await.unwrap();
+        assert_eq!(
+            mq.group_lag(g, "w").await.unwrap(),
+            2,
+            "two retained, none leased yet"
+        );
+        let got = mq
+            .claim_grouped(g, "w", StartPosition::Earliest, LEASE, 10, 5)
+            .await
+            .unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(
+            mq.group_lag(g, "w").await.unwrap(),
+            0,
+            "caught up to the high-water"
+        );
+    }
+
+    // A3: a small work-queue payload rides IN the index record (no object-store object), so publish
+    // is one local durable write and claim needs no fetch; a large payload keeps the object path.
+    #[tokio::test]
+    async fn small_work_queue_payload_is_inlined_large_takes_object_store() {
+        let storage: Arc<dyn Storage> = Arc::new(MemStorage::default());
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let mq = LogMessaging::new(storage.clone(), kv);
+
+        // Small → inlined.
+        mq.publish("t", b"small").await.unwrap();
+        let m = mq.claim("t", Duration::from_secs(60), 10, 5).await.unwrap();
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].payload, b"small");
+        assert!(m[0].inline, "small payload inlined into the record");
+        assert!(
+            storage.head(&payload_key("t", &m[0].id)).await.is_err(),
+            "inlined ⇒ no object-store object written"
+        );
+        // Ack cleans up (no object-store object to free); nothing left.
+        mq.ack(&m[0]).await.unwrap();
+        assert_eq!(mq.backlog("t").await.unwrap(), 0);
+
+        // Larger than INLINE_MAX → object-store path (boatramp's large-blob strength).
+        let big = vec![7u8; INLINE_MAX + 1];
+        mq.publish("t", &big).await.unwrap();
+        let m = mq.claim("t", Duration::from_secs(60), 10, 5).await.unwrap();
+        assert_eq!(m[0].payload, big);
+        assert!(!m[0].inline, "large payload not inlined");
+        assert!(
+            storage.head(&payload_key("t", &m[0].id)).await.is_ok(),
+            "large payload lives in object storage"
+        );
+    }
+
+    // SA1: the aggregate-inline budget bounds inline bytes in-flight — past it, publishes fall back
+    // to the object-store path; acking an inline message frees budget so later publishes inline again.
+    #[tokio::test]
+    async fn inline_budget_falls_back_to_object_store_when_exhausted() {
+        let storage: Arc<dyn Storage> = Arc::new(MemStorage::default());
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        // Budget = 10 bytes: the first 5-byte payload inlines; the second would exceed it → object store.
+        let mq = LogMessaging::new(storage.clone(), kv).with_inline_budget(10);
+        mq.publish("t", b"aaaaa").await.unwrap(); // 5 bytes inline (5 <= 10)
+        mq.publish("t", b"bbbbb").await.unwrap(); // 5 + 5 = 10 <= 10 → inline
+        mq.publish("t", b"ccccc").await.unwrap(); // 10 + 5 = 15 > 10 → object store
+        let got = mq.claim("t", Duration::from_secs(60), 10, 5).await.unwrap();
+        assert_eq!(got.len(), 3);
+        let inline_count = got.iter().filter(|m| m.inline).count();
+        assert_eq!(
+            inline_count, 2,
+            "budget admitted exactly two inline messages"
+        );
+        // The third rode object storage.
+        let obj = got.iter().find(|m| !m.inline).unwrap();
+        assert!(
+            storage.head(&payload_key("t", &obj.id)).await.is_ok(),
+            "the over-budget message fell back to the object store"
+        );
+        // Ack an inline message → frees budget → a new small publish inlines again.
+        let inline_msg = got.iter().find(|m| m.inline).unwrap().clone();
+        mq.ack(&inline_msg).await.unwrap();
+        mq.publish("t", b"ddddd").await.unwrap();
+        let more = mq.claim("t", Duration::from_secs(60), 10, 5).await.unwrap();
+        assert!(
+            more.iter().any(|m| m.payload == b"ddddd" && m.inline),
+            "after ack freed budget, the next small publish inlines again"
+        );
+    }
+
+    // A2: many concurrent publishes coalesce through the group-commit gate; each returns Ok ONLY
+    // after its group is durably committed (at-least-once), and every message is claimable.
+    #[tokio::test]
+    async fn group_commit_coalesces_concurrent_publishes() {
+        let mq = Arc::new(mq());
+        let mut handles = Vec::new();
+        for i in 0..64u32 {
+            let mq = mq.clone();
+            handles.push(tokio::spawn(async move {
+                mq.publish("t", format!("m{i}").as_bytes()).await
+            }));
+        }
+        for h in handles {
+            h.await
+                .unwrap()
+                .expect("each publish returns Ok after its durable group commit");
+        }
+        // All 64 are durably enqueued and claimable (nothing lost, no double-count).
+        let mut seen = 0;
+        loop {
+            let batch = mq
+                .claim("t", Duration::from_secs(60), 100, 5)
+                .await
+                .unwrap();
+            if batch.is_empty() {
+                break;
+            }
+            seen += batch.len();
+        }
+        assert_eq!(
+            seen, 64,
+            "all concurrent publishes were durably committed and claimable"
+        );
+    }
+
+    // A2 fail-all: when the group's durable commit fails, EVERY member publish fails — no partial
+    // success (a publisher never believes it succeeded when its message wasn't committed).
+    #[tokio::test]
+    async fn group_commit_fails_all_members_when_the_commit_fails() {
+        let mq = Arc::new(LogMessaging::new(
+            Arc::new(MemStorage::default()),
+            Arc::new(FailingKv),
+        ));
+        // A single publish surfaces the group-commit failure.
+        assert!(
+            mq.publish("t", b"x").await.is_err(),
+            "a failed group commit fails the publish"
+        );
+        // Concurrent publishes ALL fail — fail-all, no partial success.
+        let mut handles = Vec::new();
+        for i in 0..16u32 {
+            let mq = mq.clone();
+            handles.push(tokio::spawn(async move {
+                mq.publish("t", format!("m{i}").as_bytes()).await
+            }));
+        }
+        for h in handles {
+            assert!(
+                h.await.unwrap().is_err(),
+                "every member of a failed group commit fails (fail-all)"
+            );
+        }
+    }
+
+    // A4: a publish_batch commits the WHOLE batch in ONE durable write_batch (not one per message),
+    // across mixed topics, and every message is claimable carrying the shared producer context.
+    #[tokio::test]
+    async fn publish_batch_commits_all_messages_in_one_write_batch() {
+        use std::sync::atomic::Ordering as O;
+        let kv = Arc::new(CountingKv {
+            inner: MemoryKv::new(),
+            batches: std::sync::atomic::AtomicUsize::new(0),
+            relaxed: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let mq = LogMessaging::new(Arc::new(MemStorage::default()), kv.clone());
+        // Five messages across two topics in one batch.
+        let msgs: Vec<(String, Vec<u8>)> = (0..5)
+            .map(|i| (format!("t{}", i % 2), format!("m{i}").into_bytes()))
+            .collect();
+        mq.publish_batch_ctx(&msgs, Some("ctx-1")).await.unwrap();
+        assert_eq!(
+            kv.batches.load(O::Relaxed),
+            1,
+            "the whole batch was durably committed in ONE write_batch"
+        );
+        // Every message is durably enqueued on its topic, carrying the shared host context.
+        let t0 = mq.claim("t0", LEASE, 10, 5).await.unwrap();
+        let t1 = mq.claim("t1", LEASE, 10, 5).await.unwrap();
+        assert_eq!(
+            t0.len() + t1.len(),
+            5,
+            "all batch messages durably enqueued and claimable"
+        );
+        assert!(
+            t0.iter()
+                .chain(&t1)
+                .all(|m| m.signed_context.as_deref() == Some("ctx-1")),
+            "every message carries the one shared producer context"
+        );
+    }
+
+    // A4 fail-all: a failed durable commit fails the WHOLE batch — nothing is enqueued (all-or-nothing,
+    // the same contract the single group-commit gives, extended to the batch primitive).
+    #[tokio::test]
+    async fn publish_batch_fails_whole_when_the_commit_fails() {
+        let mq = LogMessaging::new(Arc::new(MemStorage::default()), Arc::new(FailingKv));
+        let msgs: Vec<(String, Vec<u8>)> =
+            (0..8).map(|i| ("t".to_string(), vec![i as u8])).collect();
+        assert!(
+            mq.publish_batch_ctx(&msgs, None).await.is_err(),
+            "a failed commit fails the whole batch"
+        );
+    }
+
+    // A4: publish_batch preserves publish order — claim returns the batch in the order it was handed
+    // in (a durable work-queue must not reorder a producer's own batch). JetStream: stream order.
+    #[tokio::test]
+    async fn publish_batch_preserves_publish_order() {
+        let mq = mq();
+        let msgs: Vec<(String, Vec<u8>)> = (0..20)
+            .map(|i| ("t".to_string(), format!("m{i:02}").into_bytes()))
+            .collect();
+        mq.publish_batch_ctx(&msgs, None).await.unwrap();
+        let got = mq.claim("t", LEASE, 100, 5).await.unwrap();
+        assert_eq!(
+            payloads(&got),
+            msgs.iter().map(|(_, p)| p.clone()).collect::<Vec<_>>(),
+            "the batch is claimable in publish order"
+        );
+    }
+
+    // A2/A4 op-bounded drain: a single batch whose op count exceeds GROUP_COMMIT_MAX is still taken
+    // WHOLE and committed in ONE write_batch — proves the drain always makes progress on an oversized
+    // single job (the `n > 0` guard) rather than starving it.
+    #[tokio::test]
+    async fn oversized_single_batch_commits_whole_in_one_write_batch() {
+        use std::sync::atomic::Ordering as O;
+        let kv = Arc::new(CountingKv {
+            inner: MemoryKv::new(),
+            batches: std::sync::atomic::AtomicUsize::new(0),
+            relaxed: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let mq = LogMessaging::new(Arc::new(MemStorage::default()), kv.clone());
+        // GROUP_COMMIT_MAX + 100 messages = one PublishJob whose op count exceeds the per-turn budget.
+        let n = GROUP_COMMIT_MAX + 100;
+        let msgs: Vec<(String, Vec<u8>)> =
+            (0..n).map(|i| ("t".to_string(), vec![i as u8])).collect();
+        mq.publish_batch_ctx(&msgs, None).await.unwrap();
+        assert_eq!(
+            kv.batches.load(O::Relaxed),
+            1,
+            "the oversized single batch committed in exactly one write_batch (drain took it whole)"
+        );
+        let mut seen = 0;
+        loop {
+            let b = mq.claim("t", LEASE, 10_000, 5).await.unwrap();
+            if b.is_empty() {
+                break;
+            }
+            seen += b.len();
+        }
+        assert_eq!(
+            seen, n,
+            "every message in the oversized batch is durably enqueued"
+        );
+    }
+
+    // A2 durability edge (JetStream-parity: at-least-once never loses an in-flight write): a publisher
+    // CANCELLED after pushing its group-commit job but before taking the gate is still committed by a
+    // LATER gate-holder. A cancelled publish may thus still deliver (the safe direction) — it must
+    // NEVER silently vanish mid-commit.
+    #[tokio::test]
+    async fn cancelled_publisher_is_still_committed_by_a_later_gate_holder() {
+        let (kv, entered_rx, release_tx) = GateKv::new();
+        let mq = Arc::new(LogMessaging::new(Arc::new(MemStorage::default()), kv));
+
+        // Q: a publish that blocks inside its durable commit → holds the group-commit gate.
+        let q = {
+            let mq = mq.clone();
+            tokio::spawn(async move { mq.publish("t", b"Q").await })
+        };
+        entered_rx.await.unwrap(); // Q is now inside write_batch, holding the gate.
+
+        // P: drive one poll so it builds its ops and PUSHES its job, then blocks on the held gate —
+        // then drop the future (cancel P after it enqueued but before it could commit).
+        {
+            let mut p = Box::pin(mq.publish("t", b"P"));
+            let polled = futures::poll!(p.as_mut());
+            assert!(
+                polled.is_pending(),
+                "P pushed its job and is now blocked on the gate Q holds"
+            );
+        } // P dropped — cancelled after pushing.
+
+        // Release Q: it commits its own job; P's job stays queued (its owner is gone).
+        release_tx.send(()).unwrap();
+        q.await.unwrap().unwrap();
+
+        // R: a later publisher drains the queue — including P's orphaned job — and commits both.
+        mq.publish("t", b"R").await.unwrap();
+
+        let mut seen = Vec::new();
+        loop {
+            let b = mq.claim("t", LEASE, 100, 5).await.unwrap();
+            if b.is_empty() {
+                break;
+            }
+            seen.extend(b.into_iter().map(|m| m.payload));
+        }
+        assert!(seen.contains(&b"Q".to_vec()), "Q committed");
+        assert!(seen.contains(&b"R".to_vec()), "R committed");
+        assert!(
+            seen.contains(&b"P".to_vec()),
+            "the cancelled publisher's message was still durably committed (never silently lost)"
+        );
+    }
+
+    /// Leader-only group-commit gate (the fix for the steady-state coalesce-depth-1 bug): while a
+    /// leader is blocked inside its durable commit HOLDING the gate, other publishers pile up as
+    /// WAITERS — they push their job and park WITHOUT each acquiring the gate — and the leader's drain
+    /// loop commits ALL of them in ONE further `write_batch`. So K piled-up publishes cost the
+    /// leader's own commit + ONE coalesced commit, never K separate commits, and no waiter is stranded
+    /// or lost. (This is a single-burst guard exercising the `select`+drain-loop path; steady-state
+    /// coalescing DEPTH across many rounds is guarded empirically by the messaging bench —
+    /// `crates/boatramp-storage/examples/messaging_bench.rs` — since a timer-free unit test cannot
+    /// stage repeated flush windows.)
+    #[tokio::test]
+    async fn group_commit_coalesces_piled_up_waiters_into_one_batch() {
+        use std::sync::atomic::Ordering;
+        let (kv, entered_rx, release_tx) = GateKv::new();
+        let mq = Arc::new(LogMessaging::new(
+            Arc::new(MemStorage::default()),
+            kv.clone(),
+        ));
+
+        // Leader L: blocks inside its first `write_batch`, holding the gate.
+        let l = {
+            let mq = mq.clone();
+            tokio::spawn(async move { mq.publish("t", b"L").await })
+        };
+        entered_rx.await.unwrap(); // L is now inside write_batch, holding the gate.
+
+        // K waiters: drive each ONE poll so it pushes its job and parks (Pending) — it registers as a
+        // gate-waiter but does NOT hold the gate L holds. Keep the pinned futures to finish later.
+        const K: usize = 8;
+        let mut waiters = Vec::new();
+        for i in 0..K {
+            let mut w = Box::pin({
+                let mq = mq.clone();
+                async move { mq.publish("t", format!("w{i}").as_bytes()).await }
+            });
+            assert!(
+                futures::poll!(w.as_mut()).is_pending(),
+                "waiter {i} pushed its job and parked without taking the gate L holds"
+            );
+            waiters.push(w);
+        }
+
+        // Release L: its first write_batch (its own job) completes, then its drain loop finds the K
+        // piled-up waiters and commits them in ONE further write_batch.
+        release_tx.send(()).unwrap();
+        l.await.unwrap().expect("leader publish ok");
+        for w in waiters {
+            w.await
+                .expect("a piled-up waiter completes (never stranded)");
+        }
+
+        // Exactly two durable commits: L's own + one coalesced batch of all K waiters (NOT K commits).
+        assert_eq!(
+            kv.calls.load(Ordering::Relaxed),
+            2,
+            "the K piled-up waiters coalesced into ONE write_batch after the leader's own commit"
+        );
+        // Nothing stranded or lost: leader + all K waiters are durably claimable.
+        let mut seen = 0;
+        loop {
+            let b = mq.claim("t", LEASE, 100, 5).await.unwrap();
+            if b.is_empty() {
+                break;
+            }
+            seen += b.len();
+        }
+        assert_eq!(seen, K + 1, "leader + all K waiters were durably committed");
+    }
+
+    /// The DEFAULT (`max_unflushed = 0`) is byte-for-byte Option B (strong durability): every publish
+    /// goes through the durable `write_batch`, the relaxed path is NEVER taken. Guards the owner's
+    /// requirement that relaxed-with-budget-0 == strong.
+    #[tokio::test]
+    async fn max_unflushed_zero_is_strong_durability() {
+        use std::sync::atomic::Ordering as O;
+        let kv = Arc::new(CountingKv {
+            inner: MemoryKv::new(),
+            batches: std::sync::atomic::AtomicUsize::new(0),
+            relaxed: std::sync::atomic::AtomicUsize::new(0),
+        });
+        // Default construction — no with_max_unflushed → max_unflushed == 0.
+        let mq = LogMessaging::new(Arc::new(MemStorage::default()), kv.clone());
+        for i in 0..20u32 {
+            mq.publish("t", format!("m{i}").as_bytes()).await.unwrap();
+        }
+        assert_eq!(
+            kv.relaxed.load(O::Relaxed),
+            0,
+            "strong default NEVER acks on the relaxed (memtable) path"
+        );
+        assert_eq!(
+            kv.batches.load(O::Relaxed),
+            20,
+            "every publish took the durable write_batch (== Option B)"
+        );
+    }
+
+    /// With `max_unflushed = N > 0`, sequential publishes fast-ack on the relaxed path and force a
+    /// durable checkpoint every N messages — so the un-durable (crash-loss) window is bounded to ≤ N,
+    /// and every message is still durably present. Guards the checkpoint cadence + the bound.
+    #[tokio::test]
+    async fn relaxed_durability_checkpoints_every_n_messages() {
+        use std::sync::atomic::Ordering as O;
+        let kv = Arc::new(CountingKv {
+            inner: MemoryKv::new(),
+            batches: std::sync::atomic::AtomicUsize::new(0),
+            relaxed: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let mq =
+            LogMessaging::new(Arc::new(MemStorage::default()), kv.clone()).with_max_unflushed(4);
+        // 12 sequential single publishes, each committing 1 message. Cadence with budget 4: 4 relaxed
+        // acks fill the budget, the 5th would exceed it → durable checkpoint (resets to 0), repeat.
+        // So publishes 1-4 relaxed, 5 durable, 6-9 relaxed, 10 durable, 11-12 relaxed = 10 relaxed +
+        // 2 durable. The un-durable count never exceeds 4 at any instant (the assertions below only
+        // pin the floors — ≥2 durable, ≥8 relaxed — so the test is robust to drain-grouping).
+        for i in 0..12u32 {
+            mq.publish("t", format!("m{i}").as_bytes()).await.unwrap();
+        }
+        let relaxed = kv.relaxed.load(O::Relaxed);
+        let durable = kv.batches.load(O::Relaxed);
+        assert_eq!(
+            relaxed + durable,
+            12,
+            "every message was committed exactly once"
+        );
+        // A durable checkpoint fired at least floor(12/ (4+1)) times → un-flushed never exceeded 4.
+        assert!(
+            durable >= 2,
+            "durable checkpoints bounded the un-flushed window (got {durable} durable, {relaxed} relaxed)"
+        );
+        assert!(
+            relaxed >= 8,
+            "most publishes fast-acked on the relaxed path (got {relaxed} relaxed, {durable} durable)"
+        );
+        // All 12 are durably claimable (nothing lost — MemoryKv is durable, so this checks the queue
+        // index is intact regardless of ack path).
+        let mut seen = 0;
+        loop {
+            let b = mq.claim("t", LEASE, 100, 5).await.unwrap();
+            if b.is_empty() {
+                break;
+            }
+            seen += b.len();
+        }
+        assert_eq!(
+            seen, 12,
+            "every relaxed-and-checkpointed publish is claimable"
+        );
+    }
+
+    // ---- Feature A/B/C: per-topic operator policy (v0.4.24) -----------------
+
+    /// Feature A roundtrip: set_topic_policy persists + topic_policy reads it back (through the
+    /// cache), and set invalidates the cache so the fresh value is seen.
+    #[tokio::test]
+    async fn topic_policy_set_and_get_roundtrips_and_invalidates_cache() {
+        let mq = mq();
+        assert_eq!(
+            mq.topic_policy("t").await.unwrap(),
+            None,
+            "no policy initially"
+        );
+        mq.set_topic_policy(
+            "t",
+            TopicPolicy {
+                max_depth: Some(5),
+                max_rate_per_sec: None,
+                max_unflushed: Some(3),
+            },
+        )
+        .await
+        .unwrap();
+        let got = mq.topic_policy("t").await.unwrap().expect("policy set");
+        assert_eq!(got.max_depth, Some(5));
+        assert_eq!(got.max_unflushed, Some(3));
+        // Overwrite → the cache must not serve the stale value.
+        mq.set_topic_policy(
+            "t",
+            TopicPolicy {
+                max_depth: Some(9),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            mq.topic_policy("t").await.unwrap().unwrap().max_depth,
+            Some(9),
+            "set invalidated the cache; the fresh cap is read"
+        );
+    }
+
+    /// Feature B `max_depth` (fail-closed): a publish is rejected once the backlog is at the cap, and
+    /// nothing is enqueued by the rejected call; publishes strictly under the cap succeed.
+    #[tokio::test]
+    async fn max_depth_rejects_publish_at_cap() {
+        let mq = mq();
+        mq.set_topic_policy(
+            "t",
+            TopicPolicy {
+                max_depth: Some(3),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        // Backlog 0,1,2 → all under the cap of 3, admitted.
+        for i in 0..3u32 {
+            mq.publish("t", format!("m{i}").as_bytes())
+                .await
+                .unwrap_or_else(|e| panic!("under-cap publish {i} should pass, got {e:?}"));
+        }
+        assert_eq!(mq.backlog("t").await.unwrap(), 3);
+        // Backlog is now 3 == max_depth → the next publish is rejected, fail-closed.
+        let err = mq.publish("t", b"overflow").await.unwrap_err();
+        assert!(
+            matches!(err, MessagingError::DepthExceeded(ref topic) if topic == "t"),
+            "publish at the cap is rejected with DepthExceeded, got {err:?}"
+        );
+        assert_eq!(
+            mq.backlog("t").await.unwrap(),
+            3,
+            "the rejected publish enqueued nothing (backlog unchanged)"
+        );
+        // Draining below the cap re-opens the topic.
+        let claimed = mq.claim("t", LEASE, 1, 5).await.unwrap();
+        mq.ack(&claimed[0]).await.unwrap();
+        assert_eq!(mq.backlog("t").await.unwrap(), 2);
+        mq.publish("t", b"now-fits")
+            .await
+            .expect("under-cap again after a drain");
+    }
+
+    /// Feature B `max_depth` uncapped fast path: with no policy (or a `None` depth), a publish never
+    /// consults the backlog cap — an uncapped topic accepts unboundedly (regression guard).
+    #[tokio::test]
+    async fn no_policy_leaves_publishing_unbounded() {
+        let mq = mq();
+        for i in 0..50u32 {
+            mq.publish("t", format!("m{i}").as_bytes()).await.unwrap();
+        }
+        assert_eq!(mq.backlog("t").await.unwrap(), 50);
+    }
+
+    /// Feature B `max_rate_per_sec` (best-effort): a fresh bucket admits a burst up to the rate, then
+    /// rejects with RateExceeded once the tokens are spent (no real time elapses in the test, so no
+    /// refill happens between the tightly-looped publishes).
+    #[tokio::test]
+    async fn max_rate_rejects_when_tokens_exhausted() {
+        let mq = mq();
+        mq.set_topic_policy(
+            "t",
+            TopicPolicy {
+                max_rate_per_sec: Some(3),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        // Burst of 3 fits the full bucket.
+        let mut ok = 0;
+        let mut rate_rejected = 0;
+        for i in 0..8u32 {
+            match mq.publish("t", format!("m{i}").as_bytes()).await {
+                Ok(()) => ok += 1,
+                Err(MessagingError::RateExceeded(_)) => rate_rejected += 1,
+                Err(e) => panic!("unexpected error {e:?}"),
+            }
+        }
+        assert!(
+            ok >= 3,
+            "the initial burst up to the rate was admitted (got {ok})"
+        );
+        assert!(
+            rate_rejected > 0,
+            "once the bucket drained, further publishes were rate-rejected (got {rate_rejected})"
+        );
+        assert_eq!(ok + rate_rejected, 8);
+    }
+
+    /// Feature C: a per-topic `max_unflushed` OVERRIDES the node default in `commit_group`. A STRONG
+    /// per-topic override (0) forces durable even when the node is relaxed — asserted via the
+    /// CountingKv write_batch-vs-write_batch_relaxed counters (mirrors the durability tests).
+    #[tokio::test]
+    async fn per_topic_max_unflushed_override_forces_durable() {
+        use std::sync::atomic::Ordering as O;
+        let kv = Arc::new(CountingKv {
+            inner: MemoryKv::new(),
+            batches: std::sync::atomic::AtomicUsize::new(0),
+            relaxed: std::sync::atomic::AtomicUsize::new(0),
+        });
+        // Node is RELAXED (budget 8) — absent a policy, publishes fast-ack on the relaxed path.
+        let mq =
+            LogMessaging::new(Arc::new(MemStorage::default()), kv.clone()).with_max_unflushed(8);
+        // A per-topic STRONG override (0) on topic "s".
+        mq.set_topic_policy(
+            "s",
+            TopicPolicy {
+                max_unflushed: Some(0),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        for i in 0..6u32 {
+            mq.publish("s", format!("m{i}").as_bytes()).await.unwrap();
+        }
+        assert_eq!(
+            kv.relaxed.load(O::Relaxed),
+            0,
+            "the strong per-topic override NEVER took the relaxed path (durable, like budget 0)"
+        );
+        assert_eq!(
+            kv.batches.load(O::Relaxed),
+            6,
+            "every publish on the strong-override topic took a durable write_batch"
+        );
+        // A topic WITHOUT an override inherits the relaxed node default → fast-acks.
+        for i in 0..6u32 {
+            mq.publish("r", format!("m{i}").as_bytes()).await.unwrap();
+        }
+        assert!(
+            kv.relaxed.load(O::Relaxed) > 0,
+            "a topic with no override inherits the node's relaxed budget (fast-acked at least once)"
+        );
+    }
+
+    /// Feature C min-over-batch: a single `publish_batch` mixing a STRONG-override topic (0) with a
+    /// relaxed topic commits the WHOLE coalesced batch durably — the minimum budget across the
+    /// batch's topics wins (the safe over-approximation), so the strong topic anywhere forces durable.
+    #[tokio::test]
+    async fn batch_min_over_topics_forces_durable_when_any_is_strong() {
+        use std::sync::atomic::Ordering as O;
+        let kv = Arc::new(CountingKv {
+            inner: MemoryKv::new(),
+            batches: std::sync::atomic::AtomicUsize::new(0),
+            relaxed: std::sync::atomic::AtomicUsize::new(0),
+        });
+        // Node relaxed (budget 100 — a batch of 4 would otherwise fast-ack).
+        let mq =
+            LogMessaging::new(Arc::new(MemStorage::default()), kv.clone()).with_max_unflushed(100);
+        // Topic "strong" pins the whole batch durable via its 0 override; "relaxed" has none.
+        mq.set_topic_policy(
+            "strong",
+            TopicPolicy {
+                max_unflushed: Some(0),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let msgs: Vec<(String, Vec<u8>)> = vec![
+            ("relaxed".into(), b"a".to_vec()),
+            ("strong".into(), b"b".to_vec()),
+            ("relaxed".into(), b"c".to_vec()),
+            ("relaxed".into(), b"d".to_vec()),
+        ];
+        mq.publish_batch_ctx(&msgs, None).await.unwrap();
+        assert_eq!(
+            kv.relaxed.load(O::Relaxed),
+            0,
+            "the strong-override topic in the batch forced the whole coalesced batch durable"
+        );
+        assert_eq!(
+            kv.batches.load(O::Relaxed),
+            1,
+            "still ONE coalesced durable write_batch for the batch"
+        );
+    }
+
+    /// Fail-closed: an unsupported backend (the trait default) REFUSES set_topic_policy with
+    /// Unsupported, so an operator's cap is never silently dropped. A bare Messaging impl (only the
+    /// required methods) inherits the defaults.
+    #[tokio::test]
+    async fn unsupported_backend_refuses_set_topic_policy() {
+        struct BareBackend;
+        #[async_trait]
+        impl Messaging for BareBackend {
+            async fn publish(&self, _: &str, _: &[u8]) -> Result<(), MessagingError> {
+                Ok(())
+            }
+            async fn claim(
+                &self,
+                _: &str,
+                _: Duration,
+                _: usize,
+                _: u32,
+            ) -> Result<Vec<ClaimedMessage>, MessagingError> {
+                Ok(Vec::new())
+            }
+            async fn ack(&self, _: &ClaimedMessage) -> Result<(), MessagingError> {
+                Ok(())
+            }
+            async fn nack(&self, _: &ClaimedMessage) -> Result<(), MessagingError> {
+                Ok(())
+            }
+        }
+        let mq = BareBackend;
+        let err = mq
+            .set_topic_policy("t", TopicPolicy::default())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, MessagingError::Unsupported(_)),
+            "the default set_topic_policy fails closed, got {err:?}"
+        );
+        assert_eq!(
+            mq.topic_policy("t").await.unwrap(),
+            None,
+            "the default topic_policy reads None"
+        );
+    }
+
+    // A3 × DLQ: an inlined message that dead-letters keeps its payload in the record, so redrive
+    // redelivers it with its body and purge needs no object-store touch.
+    #[tokio::test]
+    async fn inlined_message_dead_letters_and_redrives_with_its_payload() {
+        let mq = mq();
+        mq.publish("t", b"poison").await.unwrap();
+        // max_attempts=1: one delivery, next claim dead-letters.
+        let m = mq.claim("t", Duration::ZERO, 10, 1).await.unwrap();
+        assert!(m[0].inline);
+        assert!(mq
+            .claim("t", Duration::ZERO, 10, 1)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(mq.dead_letter_count("t").await.unwrap(), 1);
+        // Redrive → redelivers with the inlined payload intact.
+        assert_eq!(mq.redrive_dead_letters("t").await.unwrap(), 1);
+        let back = mq.claim("t", Duration::from_secs(60), 10, 1).await.unwrap();
+        assert_eq!(back[0].payload, b"poison");
+        assert!(back[0].inline);
+    }
+
     #[tokio::test]
     async fn purge_dead_letters_clears_records_and_payloads() {
         let storage: Arc<dyn Storage> = Arc::new(MemStorage::default());
@@ -1847,6 +4758,249 @@ mod tests {
         assert_eq!(again.len(), 1);
         assert_eq!(again[0].payload, b"x");
         assert_eq!(again[0].attempts, 1, "fresh attempts after redrive");
+    }
+
+    // P1 selective DLQ: last_error capture (sanitized), list/show, and redrive/discard by an
+    // AND-composed filter (--id / --match / --limit), work-queue lane.
+    #[tokio::test]
+    async fn selective_dlq_list_show_redrive_discard_by_filter() {
+        let mq = mq();
+        for p in [b"aaa".as_slice(), b"bbb", b"ccc"] {
+            mq.publish("t", p).await.unwrap();
+        }
+        // Deliver once (attempt 1, max_attempts=1), annotate "bbb" with a host failure reason that
+        // includes control characters (must be sanitized), then the next claim dead-letters all three.
+        let first = mq.claim("t", Duration::ZERO, 10, 1).await.unwrap();
+        let bbb = first.iter().find(|m| m.payload == b"bbb").unwrap().clone();
+        mq.set_last_error(&bbb, "guest-trap:\n injected\u{7} reason")
+            .await
+            .unwrap();
+        assert!(mq
+            .claim("t", Duration::ZERO, 10, 1)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(mq.dead_letter_count("t").await.unwrap(), 3);
+
+        // list: metadata only (no payloads); "bbb" carries the SANITIZED reason (control chars gone).
+        let all = mq
+            .list_dead_letters("t", &DeadLetterFilter::default())
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 3);
+        assert!(all.iter().all(|d| d.payload.is_none()));
+        let bbb_dl = all.iter().find(|d| d.id == bbb.id).unwrap();
+        let err = bbb_dl.last_error.as_deref().unwrap();
+        assert!(err.contains("guest-trap"));
+        assert!(
+            !err.contains('\n') && !err.contains('\u{7}'),
+            "control characters are sanitized out of last_error"
+        );
+
+        // --match (substring on last_error) → only bbb.
+        let matched = mq
+            .list_dead_letters(
+                "t",
+                &DeadLetterFilter {
+                    match_last_error: Some("guest-trap".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].id, bbb.id);
+
+        // --limit caps the (id-ordered) result.
+        let limited = mq
+            .list_dead_letters(
+                "t",
+                &DeadLetterFilter {
+                    limit: Some(2),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(limited.len(), 2);
+
+        // show returns the full body + reason.
+        let shown = mq
+            .show_dead_letter("t", "", &bbb.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(shown.payload.as_deref(), Some(b"bbb".as_slice()));
+        assert!(shown.last_error.as_deref().unwrap().contains("guest-trap"));
+
+        // redrive ONLY bbb (by id) → back on the live queue with a fresh life; DLQ now 2.
+        let n = mq
+            .redrive_dead_letters_filtered(
+                "t",
+                &DeadLetterFilter {
+                    id: Some(bbb.id.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(mq.dead_letter_count("t").await.unwrap(), 2);
+        let back = mq.claim("t", LEASE, 10, 5).await.unwrap();
+        let revived = back.iter().find(|m| m.payload == b"bbb").unwrap();
+        assert_eq!(revived.attempts, 1, "redrive resets attempts");
+
+        // discard the remaining two (all-match filter) → DLQ empty.
+        let d = mq
+            .discard_dead_letters("t", &DeadLetterFilter::default())
+            .await
+            .unwrap();
+        assert_eq!(d, 2);
+        assert_eq!(mq.dead_letter_count("t").await.unwrap(), 0);
+    }
+
+    // P1 selective DLQ: --older-than filters by the message's own age (derived from its time-ordered
+    // id), and a foreign/unparseable id is never swept by an age filter (fail-closed).
+    #[tokio::test]
+    async fn selective_dlq_older_than_uses_id_age() {
+        let mq = mq();
+        mq.publish("t", b"recent").await.unwrap();
+        assert_eq!(mq.claim("t", Duration::ZERO, 10, 1).await.unwrap().len(), 1);
+        assert!(mq
+            .claim("t", Duration::ZERO, 10, 1)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(mq.dead_letter_count("t").await.unwrap(), 1);
+        // The message was published moments ago, so a 1-hour `older_than` matches nothing…
+        let none = mq
+            .list_dead_letters(
+                "t",
+                &DeadLetterFilter {
+                    older_than_ms: Some(3_600_000),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            none.is_empty(),
+            "a just-published dead-letter isn't 'older than' 1h"
+        );
+        // …but `older_than: 0` matches it (age >= 0).
+        let any = mq
+            .list_dead_letters(
+                "t",
+                &DeadLetterFilter {
+                    older_than_ms: Some(0),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(any.len(), 1);
+    }
+
+    // P2 security: group + pause ops are confined to their namespaced topic — a delete/pause on one
+    // site's namespace never touches another site's group state or pause marker (literal KV keys).
+    #[tokio::test]
+    async fn group_and_pause_ops_are_confined_to_their_namespaced_topic() {
+        let mq = mq();
+        for t in ["siteA/ev", "siteB/ev"] {
+            assert!(mq
+                .claim_grouped(t, "g", StartPosition::Earliest, LEASE, 10, 5)
+                .await
+                .unwrap()
+                .is_empty());
+            mq.publish(t, b"m").await.unwrap();
+        }
+        // Pausing siteA does NOT pause siteB.
+        mq.set_paused("siteA/ev", true).await.unwrap();
+        assert!(mq.is_paused("siteA/ev").await.unwrap());
+        assert!(
+            !mq.is_paused("siteB/ev").await.unwrap(),
+            "pausing one site's topic never pauses another's"
+        );
+        // Deleting siteA's group leaves siteB's group intact.
+        mq.delete_group("siteA/ev", "g").await.unwrap();
+        assert!(mq.list_groups("siteA/ev").await.unwrap().is_empty());
+        assert_eq!(
+            mq.list_groups("siteB/ev").await.unwrap().len(),
+            1,
+            "another site's group is untouched by a delete"
+        );
+        // siteB (unpaused) still delivers; siteA (paused) delivers nothing.
+        assert!(mq
+            .claim_grouped("siteA/ev", "g", StartPosition::Earliest, LEASE, 10, 5)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            mq.claim_grouped("siteB/ev", "g", StartPosition::Earliest, LEASE, 10, 5)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "the other site's grouped delivery is unaffected"
+        );
+    }
+
+    // SEC6: sanitize_reason strips control characters (no log/JSON injection) and byte-bounds to
+    // LAST_ERROR_MAX without splitting a multi-byte char (the security review's UTF-8-boundary note).
+    #[test]
+    fn sanitize_reason_strips_control_chars_and_bounds_bytes() {
+        let s = sanitize_reason("guest-trap:\n\t\u{7}boom");
+        assert!(s.contains("guest-trap") && s.contains("boom"));
+        assert!(!s.chars().any(char::is_control), "no control chars survive");
+        // 4-byte chars: 100 emoji = 400 bytes → bounded to <=256, still valid UTF-8 (a String always
+        // is; the point is the boundary check never panics or truncates mid-char).
+        let emoji = sanitize_reason(&"😀".repeat(100));
+        assert!(emoji.len() <= LAST_ERROR_MAX);
+        assert_eq!(
+            emoji.len() % 4,
+            0,
+            "bounded on a whole 4-byte char boundary"
+        );
+        // 3-byte chars.
+        assert!(sanitize_reason(&"€".repeat(200)).len() <= LAST_ERROR_MAX);
+        // All-control input collapses to empty (trimmed).
+        assert_eq!(sanitize_reason("\n\r\t\u{0}"), "");
+    }
+
+    // Site-confinement underpinning (the review's traversal note): a DLQ op is confined to its
+    // namespaced topic — listing/discarding one site's queue never sees or touches another's, because
+    // the KV keyspace is literal-prefixed (no path normalization). Proven at the substrate that the
+    // operator's `{site}/…` namespacing relies on.
+    #[tokio::test]
+    async fn dead_letter_ops_are_confined_to_their_namespaced_topic() {
+        let mq = mq();
+        for t in ["siteA/orders", "siteB/orders"] {
+            mq.publish(t, format!("{t}-poison").as_bytes())
+                .await
+                .unwrap();
+            assert_eq!(mq.claim(t, Duration::ZERO, 10, 1).await.unwrap().len(), 1);
+            assert!(mq.claim(t, Duration::ZERO, 10, 1).await.unwrap().is_empty());
+        }
+        // A list on site A sees ONLY A's dead-letter.
+        let a = mq
+            .list_dead_letters("siteA/orders", &DeadLetterFilter::default())
+            .await
+            .unwrap();
+        assert_eq!(a.len(), 1);
+        assert!(!a[0].id.is_empty() && a.iter().all(|d| !d.id.contains("siteB")));
+        // A discard on site A leaves site B's dead-letter untouched.
+        assert_eq!(
+            mq.discard_dead_letters("siteA/orders", &DeadLetterFilter::default())
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(mq.dead_letter_count("siteA/orders").await.unwrap(), 0);
+        assert_eq!(
+            mq.dead_letter_count("siteB/orders").await.unwrap(),
+            1,
+            "another site's DLQ is untouched"
+        );
     }
 
     /// The "survives restart" guarantee: queue state

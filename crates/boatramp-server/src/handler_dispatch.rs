@@ -549,9 +549,15 @@ async fn resolve_gateway_caller_facts(
     let effective = match handler.tenancy.as_ref() {
         Some(h) => {
             if let Some(ceiling) = site_handlers.tenancy.as_ref() {
-                if !h.narrows_within(ceiling) {
+                // A per-route widening is refused unless BOTH the site enables exceptions
+                // (`allow_ceiling_exceptions`, key 1) AND the route carries `exceed_site_ceiling`
+                // (key 2). The runtime clamp on `all` (key 3, the operator posture) stays separate.
+                // This is the fail-closed backstop; the deploy validator produces the speaking error.
+                if !h.narrows_within_authorized(ceiling, site_handlers.allow_ceiling_exceptions) {
                     return Err(graphql_guard::error_response(
-                        "tenancy: the /graphql handler declares a tenancy that widens the site ceiling",
+                        "tenancy: the /graphql handler declares a tenancy that widens the site \
+                         ceiling (authorize it with `exceed_site_ceiling: true` on the route AND \
+                         `allow_ceiling_exceptions = true` on the site, or narrow the tenancy)",
                     ));
                 }
             }
@@ -1443,11 +1449,17 @@ pub(super) async fn build_bindings(
         let effective_tenancy = match handler_tenancy {
             Some(h) => {
                 if let Some(ceiling) = site_handlers.tenancy.as_ref() {
-                    if !h.narrows_within(ceiling) {
+                    // A per-route widening is refused unless BOTH the site enables exceptions
+                    // (`allow_ceiling_exceptions`, key 1) AND the route carries `exceed_site_ceiling`
+                    // (key 2). `all` still needs the operator posture at runtime (key 3, `cap()`).
+                    // Fail-closed backstop; the deploy validator emits the speaking, key-aware error.
+                    if !h.narrows_within_authorized(ceiling, site_handlers.allow_ceiling_exceptions)
+                    {
                         return Err(BindingsError::Refused(format!(
                             "tenancy: a handler on site `{site}` declares a tenancy that widens the \
                              site ceiling (a per-handler decision may narrow within the site's \
-                             `tenancy`, never widen it)"
+                             `tenancy`; to widen deliberately, set `exceed_site_ceiling: true` on the \
+                             route AND `allow_ceiling_exceptions = true` on the site)"
                         )));
                     }
                 }
@@ -2088,7 +2100,28 @@ pub(super) async fn dispatch_consumer_batch(
     lease: Duration,
     max_attempts: u32,
     batch: usize,
+    max_ack_pending: Option<usize>,
+    // Per-consumer redelivery backoff base (ms); the redelivery of a failed message is held
+    // `backoff_ms × attempts` before it's claimable again. 0 ⇒ immediate (historical behavior).
+    backoff_ms: u64,
 ) -> usize {
+    // Flow control (P2 MaxAckPending): cap the claim so total leased-but-unacked never exceeds the
+    // ceiling, across ticks. `in_flight_count` is the topic's outstanding (a slight over-count for a
+    // single group — the safe direction: it caps sooner). At/over the cap, claim nothing this tick.
+    let batch = match max_ack_pending {
+        Some(cap) => {
+            let in_flight = messaging
+                .in_flight_count(namespaced_topic)
+                .await
+                .unwrap_or(0);
+            let available = cap.saturating_sub(in_flight);
+            if available == 0 {
+                return 0;
+            }
+            batch.min(available)
+        }
+        None => batch,
+    };
     let claimed = match messaging
         .claim_grouped(namespaced_topic, group, start, lease, batch, max_attempts)
         .await
@@ -2126,7 +2159,9 @@ pub(super) async fn dispatch_consumer_batch(
                         %err,
                         "consumer per-message bindings refused; redelivering"
                     );
-                    let _ = messaging.nack(&msg).await;
+                    let _ = messaging
+                        .nack_after(&msg, backoff_ms.saturating_mul(u64::from(msg.attempts)))
+                        .await;
                     continue;
                 }
             },
@@ -2151,12 +2186,13 @@ pub(super) async fn dispatch_consumer_batch(
                 limits,
             )
             .await;
+        let outcome = metrics::Outcome::from_result(&result);
         metrics.observe(
             site,
             metrics::Trigger::Consumer,
             guest_topic,
             component_hash,
-            metrics::Outcome::from_result(&result),
+            outcome,
             start.elapsed(),
         );
         match result {
@@ -2171,7 +2207,17 @@ pub(super) async fn dispatch_consumer_batch(
                     %err,
                     "consumer failed; redelivering (dead-letters after max attempts)"
                 );
-                let _ = messaging.nack(&msg).await;
+                // Record the host-classified failure reason (P1/SEC6: never the guest's error text)
+                // so it survives into the dead-letter for `dlq ls/show` + `--match`. ONLY on the
+                // final attempt (whose failure dead-letters the message next claim): last_error means
+                // "why it dead-lettered", not a transient retry — and this keeps the hot redelivery
+                // path a single write (nack). Best-effort — annotating must never block redelivery.
+                if msg.attempts >= max_attempts {
+                    let _ = messaging.set_last_error(&msg, outcome.as_str()).await;
+                }
+                let _ = messaging
+                    .nack_after(&msg, backoff_ms.saturating_mul(u64::from(msg.attempts)))
+                    .await;
             }
         }
     }

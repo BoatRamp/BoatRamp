@@ -149,12 +149,28 @@ pub async fn build_handler_runtime(
     .await?;
     // The `wasi:messaging` substrate: single-node `LogMessaging` over the same
     // blob/KV backends by default, or the cluster coordinator when one is given.
+    // Relaxed messaging-publish durability (operator opt-in; 0/absent ⇒ strong, the default). A
+    // node that opts in acks publishes on the in-memory buffer with a durable checkpoint every N
+    // messages — bounding the crash-loss window to N acked-but-unflushed messages. Loud WARN so the
+    // weakened guarantee is never a silent surprise; control-plane durability is unaffected.
+    let max_unflushed = handlers_cfg
+        .and_then(|h| h.messaging_max_unflushed_msgs)
+        .unwrap_or(0);
+    if max_unflushed > 0 {
+        tracing::warn!(
+            max_unflushed,
+            "messaging: RELAXED publish durability ENABLED (messaging_max_unflushed_msgs={max_unflushed}) \
+             — publish() acks before the WAL flush; up to {max_unflushed} acknowledged-but-unflushed \
+             messages are lost on a process crash / OOM / SIGKILL / power loss. Control-plane \
+             durability is UNAFFECTED. Set 0 (the default) for stronger-than-JetStream durability."
+        );
+    }
     let messaging: Arc<dyn boatramp_core::messaging::Messaging> = messaging_override
         .unwrap_or_else(|| {
-            Arc::new(boatramp_core::messaging::LogMessaging::new(
-                storage.clone(),
-                kv.clone(),
-            ))
+            Arc::new(
+                boatramp_core::messaging::LogMessaging::new(storage.clone(), kv.clone())
+                    .with_max_unflushed(max_unflushed),
+            )
         });
     // Keep a KV handle for the internal secret store before `kv` is moved into the
     // runtime below.

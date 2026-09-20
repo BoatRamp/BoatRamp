@@ -367,6 +367,58 @@ pub struct CreateDeploymentResponse {
     pub missing: Vec<String>,
 }
 
+/// An AND-composed dead-letter filter for the `dlq` commands (mirrors the server's wire filter).
+/// Serializes `match_last_error` as `match`. All-`None` = the whole DLQ.
+#[derive(Debug, Default, Serialize)]
+pub struct DlqFilter {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub older_than_ms: Option<u64>,
+    #[serde(rename = "match", skip_serializing_if = "Option::is_none")]
+    pub match_last_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+}
+
+/// One consumer group returned by `queue groups`.
+#[derive(Debug, Deserialize)]
+pub struct GroupEntry {
+    pub group: String,
+    #[serde(default)]
+    pub hwm: String,
+    pub in_flight: usize,
+    pub lag: usize,
+}
+
+/// One live message returned by `queue peek` (payload base64).
+#[derive(Debug, Deserialize)]
+pub struct QueuePeekEntry {
+    pub id: String,
+    pub attempts: u32,
+    #[serde(default)]
+    pub leased: bool,
+    #[serde(default)]
+    pub signed_context_present: bool,
+    pub payload_b64: String,
+}
+
+/// One dead-letter as returned by the `dlq` list/show/dry-run views.
+#[derive(Debug, Deserialize)]
+pub struct DlqEntry {
+    pub id: String,
+    pub group: String,
+    pub attempts: u32,
+    pub last_error: Option<String>,
+    #[serde(default)]
+    pub signed_context_present: bool,
+    /// Present only from a `show` (base64 payload).
+    #[serde(default)]
+    pub payload_b64: Option<String>,
+}
+
 /// An authenticated control-plane connection: an [`ApiClient`] bound to a
 /// resolved server base URL. The request methods key off it, so the client and
 /// server base are threaded once (at construction) instead of by hand at every
@@ -375,6 +427,42 @@ pub struct ControlPlane {
     http: ApiClient,
     base: String,
     project: String,
+}
+
+/// Which operator queue/DLQ surface a `queue`/`dlq` op targets: a single **site's** own
+/// queues (with an optional background-`alias` scope), or the **shared project bus**
+/// (`{project}/bus/{topic}`, common to every site in the project). The two differ only in
+/// the endpoint path (site: `/api/<sites-seg>/<site>/_boatramp/…`; bus:
+/// `/api/projects/<proj>/_boatramp/bus/…`) and that the bus has no `alias` axis — the
+/// request/response shapes are identical, so every client method takes an `OpScope` and
+/// the CLI picks one from a `--bus` flag.
+#[derive(Debug, Clone, Copy)]
+pub enum OpScope<'a> {
+    /// A single site's queues, optionally under a background-alias (`{site}/{alias}`) scope.
+    Site {
+        /// The site name.
+        site: &'a str,
+        /// The background-alias scope, if any.
+        alias: Option<&'a str>,
+    },
+    /// The shared, project-scoped bus (authorized at `Project·Read`/`Project·Admin`).
+    Bus,
+}
+
+impl<'a> OpScope<'a> {
+    /// The site surface under an optional background-alias scope.
+    pub fn site_alias(site: &'a str, alias: Option<&'a str>) -> Self {
+        Self::Site { site, alias }
+    }
+
+    /// The background-alias scope carried in a POST body / GET query. Always `None` for
+    /// the project bus (it is not per-deployment).
+    fn alias(&self) -> Option<&'a str> {
+        match self {
+            Self::Site { alias, .. } => *alias,
+            Self::Bus => None,
+        }
+    }
 }
 
 impl ControlPlane {
@@ -403,6 +491,29 @@ impl ControlPlane {
     /// (byte-identical legacy `/api/compute/...`), else `projects/<proj>/compute`.
     fn compute_seg(&self) -> String {
         project_seg(&self.project, "compute")
+    }
+
+    /// The project-BUS operator path prefix: always the project-scoped
+    /// `projects/<proj>/_boatramp/bus` form (there is no legacy/unscoped bus route —
+    /// even the `default` project's shared bus is addressed project-scoped), so a
+    /// `boatramp queue|dlq --bus` targets the right project's shared bus. The server
+    /// authorizes this path at `Project·Read` (GET) / `Project·Admin` (destructive POST).
+    fn bus_prefix(&self) -> String {
+        format!("projects/{}/_boatramp/bus", self.project)
+    }
+
+    /// The full operator-endpoint URL for a given [`OpScope`] and operation suffix
+    /// (`"dlq"`, `"queue/peek"`, …): the per-site `…/<sites-seg>/<site>/_boatramp/<op>` for
+    /// [`OpScope::Site`], or the shared `…/projects/<proj>/_boatramp/bus/<op>` for
+    /// [`OpScope::Bus`]. The single place the site-vs-bus path split lives.
+    fn op_url(&self, scope: OpScope<'_>, op: &str) -> String {
+        match scope {
+            OpScope::Site { site, .. } => {
+                let seg = self.sites_seg();
+                format!("{}/api/{seg}/{site}/_boatramp/{op}", self.base)
+            }
+            OpScope::Bus => format!("{}/api/{}/{op}", self.base, self.bus_prefix()),
+        }
     }
 
     /// Fetch the manifest for a specific deployment id.
@@ -890,46 +1001,272 @@ impl ControlPlane {
             .await?)
     }
 
-    /// Run a dead-letter operation (`purge` or `redrive`) on a consumer `topic`
-    /// (scope-relative; `alias` for a background-alias consumer). Returns the number
-    /// of dead-lettered messages affected (`POST …/_boatramp/dlq`).
+    /// Run a dead-letter mutation (`purge` / `redrive` / `discard`) on a consumer `topic`
+    /// (scope-relative; `alias` for a background-alias consumer), optionally filter-selective and/or
+    /// `dry_run`. Returns the number affected plus (for a dry-run) the matching preview
+    /// (`POST …/_boatramp/dlq`).
     pub async fn operate_dlq(
         &self,
-        site: &str,
+        scope: OpScope<'_>,
         topic: &str,
-        alias: Option<&str>,
         action: &str,
-    ) -> Result<usize> {
-        let seg = self.sites_seg();
-        let Self {
-            http: client,
-            base: server,
-            ..
-        } = self;
+        filter: &DlqFilter,
+        dry_run: bool,
+    ) -> Result<(usize, Vec<DlqEntry>)> {
+        let url = self.op_url(scope, "dlq");
+        let client = &self.http;
         #[derive(Serialize)]
         struct Request<'a> {
             topic: &'a str,
             #[serde(skip_serializing_if = "Option::is_none")]
             alias: Option<&'a str>,
             action: &'a str,
+            filter: &'a DlqFilter,
+            dry_run: bool,
         }
         #[derive(Deserialize)]
         struct DlqResponse {
             affected: usize,
+            #[serde(default)]
+            matched: Vec<DlqEntry>,
         }
         let resp: DlqResponse = client
-            .post(format!("{server}/api/{seg}/{site}/_boatramp/dlq"))
+            .post(url)
             .json(&Request {
                 topic,
-                alias,
+                alias: scope.alias(),
                 action,
+                filter,
+                dry_run,
             })
             .send()
             .await?
             .error_for_status()?
             .json()
             .await?;
-        Ok(resp.affected)
+        Ok((resp.affected, resp.matched))
+    }
+
+    /// Pause or resume a topic (`POST …/_boatramp/queue/pause`, P2 flow control).
+    pub async fn pause_queue(&self, scope: OpScope<'_>, topic: &str, paused: bool) -> Result<()> {
+        let url = self.op_url(scope, "queue/pause");
+        let client = &self.http;
+        #[derive(Serialize)]
+        struct Request<'a> {
+            topic: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            alias: Option<&'a str>,
+            paused: bool,
+        }
+        client
+            .post(url)
+            .json(&Request {
+                topic,
+                alias: scope.alias(),
+                paused,
+            })
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+
+    /// Set a topic's per-topic operator flow-control policy (`POST …/_boatramp/queue/policy`,
+    /// v0.4.24). Each cap is optional (`None` = uncapped on that axis).
+    pub async fn set_topic_policy(
+        &self,
+        scope: OpScope<'_>,
+        topic: &str,
+        max_depth: Option<usize>,
+        max_rate_per_sec: Option<u32>,
+        max_unflushed: Option<usize>,
+    ) -> Result<()> {
+        let url = self.op_url(scope, "queue/policy");
+        let client = &self.http;
+        #[derive(Serialize)]
+        struct Request<'a> {
+            topic: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            alias: Option<&'a str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            max_depth: Option<usize>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            max_rate_per_sec: Option<u32>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            max_unflushed: Option<usize>,
+        }
+        client
+            .post(url)
+            .json(&Request {
+                topic,
+                alias: scope.alias(),
+                max_depth,
+                max_rate_per_sec,
+                max_unflushed,
+            })
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+
+    /// List a topic's consumer groups (`GET …/_boatramp/queue/groups`).
+    pub async fn list_groups(&self, scope: OpScope<'_>, topic: &str) -> Result<Vec<GroupEntry>> {
+        let url = self.op_url(scope, "queue/groups");
+        let client = &self.http;
+        #[derive(Deserialize)]
+        struct GroupsResponse {
+            #[allow(dead_code)]
+            version: u32,
+            groups: Vec<GroupEntry>,
+        }
+        let mut req = client.get(url).query(&[("topic", topic)]);
+        if let Some(alias) = scope.alias() {
+            req = req.query(&[("alias", alias)]);
+        }
+        let resp: GroupsResponse = req.send().await?.error_for_status()?.json().await?;
+        Ok(resp.groups)
+    }
+
+    /// Reset or delete a consumer group (`POST …/_boatramp/queue/group`). For `reset`, `start` is
+    /// `"earliest"` or `"latest"`.
+    pub async fn group_op(
+        &self,
+        scope: OpScope<'_>,
+        topic: &str,
+        group: &str,
+        action: &str,
+        start: Option<&str>,
+    ) -> Result<()> {
+        let url = self.op_url(scope, "queue/group");
+        let client = &self.http;
+        #[derive(Serialize)]
+        struct Request<'a> {
+            topic: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            alias: Option<&'a str>,
+            group: &'a str,
+            action: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            start: Option<&'a str>,
+        }
+        client
+            .post(url)
+            .json(&Request {
+                topic,
+                alias: scope.alias(),
+                group,
+                action,
+                start,
+            })
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+
+    /// Peek the head of a topic's LIVE work-queue without consuming (`GET …/_boatramp/queue/peek`).
+    pub async fn peek_queue(
+        &self,
+        scope: OpScope<'_>,
+        topic: &str,
+        limit: Option<usize>,
+    ) -> Result<Vec<QueuePeekEntry>> {
+        let url = self.op_url(scope, "queue/peek");
+        let client = &self.http;
+        #[derive(Deserialize)]
+        struct QueuePeekResponse {
+            #[allow(dead_code)]
+            version: u32,
+            messages: Vec<QueuePeekEntry>,
+        }
+        let mut req = client.get(url).query(&[("topic", topic)]);
+        if let Some(alias) = scope.alias() {
+            req = req.query(&[("alias", alias)]);
+        }
+        if let Some(limit) = limit {
+            req = req.query(&[("limit", limit.to_string())]);
+        }
+        let resp: QueuePeekResponse = req.send().await?.error_for_status()?.json().await?;
+        Ok(resp.messages)
+    }
+
+    /// Replay a GROUPED topic's retained history from an offset without consuming
+    /// (`GET …/_boatramp/queue/replay`, P2). Returns the messages plus the `next_after` cursor to
+    /// page forward (`None` when the history is exhausted).
+    pub async fn replay_queue(
+        &self,
+        scope: OpScope<'_>,
+        topic: &str,
+        after: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<(Vec<QueuePeekEntry>, Option<String>)> {
+        let url = self.op_url(scope, "queue/replay");
+        let client = &self.http;
+        #[derive(Deserialize)]
+        struct QueueReplayResponse {
+            #[allow(dead_code)]
+            version: u32,
+            messages: Vec<QueuePeekEntry>,
+            #[serde(default)]
+            next_after: Option<String>,
+        }
+        let mut req = client.get(url).query(&[("topic", topic)]);
+        if let Some(alias) = scope.alias() {
+            req = req.query(&[("alias", alias)]);
+        }
+        if let Some(after) = after {
+            req = req.query(&[("after", after)]);
+        }
+        if let Some(limit) = limit {
+            req = req.query(&[("limit", limit.to_string())]);
+        }
+        let resp: QueueReplayResponse = req.send().await?.error_for_status()?.json().await?;
+        Ok((resp.messages, resp.next_after))
+    }
+
+    /// List (or `show`) a topic's dead-letters (`GET …/_boatramp/dlq`), filter-matching. `show` with
+    /// `filter.id` set returns the single dead-letter in full (with `payload_b64`); otherwise a
+    /// metadata listing.
+    pub async fn list_dlq(
+        &self,
+        scope: OpScope<'_>,
+        topic: &str,
+        show: bool,
+        filter: &DlqFilter,
+    ) -> Result<Vec<DlqEntry>> {
+        let url = self.op_url(scope, "dlq");
+        let client = &self.http;
+        #[derive(Deserialize)]
+        struct DlqListResponse {
+            #[allow(dead_code)]
+            version: u32,
+            dead_letters: Vec<DlqEntry>,
+        }
+        let mut req = client.get(url).query(&[("topic", topic)]);
+        if let Some(alias) = scope.alias() {
+            req = req.query(&[("alias", alias)]);
+        }
+        if show {
+            req = req.query(&[("show", "true")]);
+        }
+        if let Some(id) = &filter.id {
+            req = req.query(&[("id", id)]);
+        }
+        if let Some(group) = &filter.group {
+            req = req.query(&[("group", group)]);
+        }
+        if let Some(older) = filter.older_than_ms {
+            req = req.query(&[("older_than_ms", older.to_string())]);
+        }
+        if let Some(m) = &filter.match_last_error {
+            req = req.query(&[("match", m)]);
+        }
+        if let Some(limit) = filter.limit {
+            req = req.query(&[("limit", limit.to_string())]);
+        }
+        let resp: DlqListResponse = req.send().await?.error_for_status()?.json().await?;
+        Ok(resp.dead_letters)
     }
 
     /// Upload a file as a content-addressed blob (`PUT /api/blobs/<hash>`, streamed).

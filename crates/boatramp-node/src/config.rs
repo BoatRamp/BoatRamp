@@ -1220,6 +1220,19 @@ pub struct HandlersConfig {
     /// timeout bounds only wall-clock; without a fuel bound a CPU-bound guest can
     /// spin for the whole window. Absent ⇒ unmetered (same as the sync default).
     pub async_max_fuel: Option<u64>,
+    /// **Relaxed messaging-publish durability** — the max number of published
+    /// messages that may be acknowledged from the in-memory buffer BEFORE a durable
+    /// checkpoint is forced. **Absent / `0` ⇒ strong durability (the default):**
+    /// every `publish()` returns only after the message is crash-durable — a
+    /// *stronger* guarantee than NATS JetStream's default sync publish. Set `N > 0`
+    /// to opt a node into fast-ack (publish returns on the buffer insert, ~10µs
+    /// instead of ~one flush interval), at the cost of a **bounded loss window: up
+    /// to `N` acknowledged-but-unflushed messages are lost on a process crash / OOM
+    /// / SIGKILL / power loss** before the next flush. Affects ONLY the messaging
+    /// bus publish path — control-plane, auth, and consumer ack/redelivery
+    /// durability are unaffected. Single-node only (cluster durability is
+    /// replication). A node with `N > 0` logs a warning at startup.
+    pub messaging_max_unflushed_msgs: Option<usize>,
     /// Max wall-clock for a *streaming-lane* response (a `#[handler(stream)]`
     /// route — SSE, chunked, agent token streaming), milliseconds. A client is
     /// connected but the body is written incrementally over seconds-to-minutes,

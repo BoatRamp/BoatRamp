@@ -999,6 +999,12 @@ mod tests {
                 imports: vec!["sql".into()],
                 group: String::new(),
                 start: Default::default(),
+                lease_ms: None,
+                max_attempts: None,
+                max_batch: None,
+                max_ack_pending: None,
+                backoff_ms: None,
+                retention_ms: None,
             }],
             crons: vec![CronConfig {
                 schedule: "0 * * * *".into(),

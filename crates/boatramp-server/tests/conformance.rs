@@ -1598,6 +1598,7 @@ async fn handler_route_dispatches_through_engine() {
                     graphql: None,
                     cookie_auth: None,
                     tenancy: None,
+                    allow_ceiling_exceptions: false,
                 }),
                 ..Default::default()
             },
@@ -2773,6 +2774,108 @@ async fn bus_queue_trigger_drains_the_shared_project_bus() {
     assert!(n >= 1, "worker did not drain the bus: {n}");
 }
 
+/// The PROJECT-BUS operator surface (`/api/projects/<proj>/_boatramp/bus/…`, v0.4.24)
+/// inspects + manages the SHARED project bus (`{project}/bus/{topic}`) — the operator
+/// counterpart to the site surface, but namespaced to the project (default → bare
+/// `bus/…`, named → `<proj>/bus/…`). This drives the endpoints through the real router
+/// and asserts the critical property: each project's endpoint touches ONLY its own bus
+/// namespace (cross-project isolation), the peek shape matches the site surface, and a
+/// destructive DLQ POST returns the versioned response.
+#[cfg(feature = "handlers")]
+#[tokio::test]
+async fn project_bus_operator_surface_is_project_namespaced() {
+    use boatramp_core::messaging::{LogMessaging, Messaging};
+    use boatramp_handlers::{HandlerEngine, Limits};
+
+    let storage = Arc::new(MemStorage::default());
+    let kv = Arc::new(MemoryKv::new());
+    let deploy = DeployStore::new(storage.clone(), kv.clone());
+
+    let messaging: Arc<dyn Messaging> = Arc::new(LogMessaging::new(storage.clone(), kv.clone()));
+    // Two DISTINCT project buses carry different payloads: the default project's bus is
+    // the bare `bus/<topic>` keyspace; a named project's is `<proj>/bus/<topic>`.
+    messaging.publish("bus/jobs", b"default-job").await.unwrap();
+    messaging
+        .publish("acme/bus/jobs", b"acme-job")
+        .await
+        .unwrap();
+
+    let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
+    let runtime = HandlerRuntime::new(engine, kv.clone(), storage, None, Some(messaging.clone()));
+    let app = router(deploy, Auth::disabled(), runtime);
+
+    // Peek the DEFAULT project's bus: sees only `bus/jobs` (its own namespace), never
+    // acme's — even though both share the `jobs` scope-relative topic.
+    let peek = |proj: &str| {
+        let app = app.clone();
+        let uri = format!("/api/projects/{proj}/_boatramp/bus/queue/peek?topic=jobs&limit=10");
+        async move {
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri(uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()
+        }
+    };
+
+    use base64::Engine as _;
+    let b64 = |s: &str| base64::engine::general_purpose::STANDARD.encode(s);
+
+    let default_view = peek("default").await;
+    assert_eq!(
+        default_view["version"], 1,
+        "peek carries the DLQ_VIEW_VERSION"
+    );
+    let default_msgs = default_view["messages"].as_array().unwrap();
+    assert_eq!(
+        default_msgs.len(),
+        1,
+        "default bus has exactly its own message"
+    );
+    assert_eq!(default_msgs[0]["payload_b64"], b64("default-job"));
+
+    // Peek the ACME project's bus: sees only `acme/bus/jobs`. This is the isolation
+    // property — the `<proj>` path segment is the tenant boundary, so acme's endpoint
+    // never returns the default project's message and vice versa.
+    let acme_view = peek("acme").await;
+    let acme_msgs = acme_view["messages"].as_array().unwrap();
+    assert_eq!(acme_msgs.len(), 1, "acme bus has exactly its own message");
+    assert_eq!(acme_msgs[0]["payload_b64"], b64("acme-job"));
+
+    // A destructive DLQ POST on acme's bus returns the versioned affected-count response
+    // (empty DLQ ⇒ 0), and — critically — targets acme's namespace only, so the default
+    // bus's live message is untouched.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/projects/acme/_boatramp/bus/dlq")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"topic":"jobs","action":"purge"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let purged: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(purged["affected"], 0, "acme DLQ was empty");
+
+    // The default bus's live message survived acme's purge (namespaces are disjoint).
+    let still_there = messaging.peek("bus/jobs", 10).await.unwrap();
+    assert_eq!(still_there.len(), 1);
+    assert_eq!(still_there[0].payload, b"default-job");
+}
+
 /// A `blob` trigger fires the function when an object appears under the watched
 /// prefix — notify-only, so it fires for *any* writer (here a direct storage
 /// write). Requires a backend that natively watches (`FsStorage`).
@@ -3210,6 +3313,7 @@ async fn activation_during_traffic_drops_no_requests() {
                     graphql: None,
                     cookie_auth: None,
                     tenancy: None,
+                    allow_ceiling_exceptions: false,
                 }),
                 ..Default::default()
             },
@@ -3352,6 +3456,7 @@ async fn preview_runs_handlers_scoped_off_live_state() {
                     graphql: None,
                     cookie_auth: None,
                     tenancy: None,
+                    allow_ceiling_exceptions: false,
                 }),
                 ..Default::default()
             },
@@ -3469,6 +3574,7 @@ async fn activation_refuses_broken_component() {
                     graphql: None,
                     cookie_auth: None,
                     tenancy: None,
+                    allow_ceiling_exceptions: false,
                 }),
                 ..Default::default()
             },
@@ -3545,11 +3651,17 @@ async fn activation_refuses_a_non_consumer_component() {
             consumers: vec![ConsumerConfig {
                 tenancy: None,
                 token_claims: None,
+                backoff_ms: None,
+                retention_ms: None,
                 topic: "orders/created".to_string(),
                 component: "consumer.wasm".to_string(),
                 imports: Vec::new(),
                 group: String::new(),
                 start: Default::default(),
+                lease_ms: None,
+                max_attempts: None,
+                max_batch: None,
+                max_ack_pending: None,
             }],
             ..Default::default()
         },
@@ -3577,6 +3689,7 @@ async fn activation_refuses_a_non_consumer_component() {
                     graphql: None,
                     cookie_auth: None,
                     tenancy: None,
+                    allow_ceiling_exceptions: false,
                 }),
                 ..Default::default()
             },
@@ -3691,6 +3804,7 @@ async fn activation_refuses_disallowed_import() {
                     graphql: None,
                     cookie_auth: None,
                     tenancy: None,
+                    allow_ceiling_exceptions: false,
                 }),
                 ..Default::default()
             },
@@ -3792,6 +3906,7 @@ async fn activation_refuses_oversized_component() {
                     graphql: None,
                     cookie_auth: None,
                     tenancy: None,
+                    allow_ceiling_exceptions: false,
                 }),
                 ..Default::default()
             },
@@ -3896,6 +4011,7 @@ async fn handler_route_with_sql_dispatches_through_engine() {
                     cookie_auth: None,
                     // A sql importer declares tenancy (this test isn't about tenancy).
                     tenancy: Some(boatramp_core::tenancy::Tenancy::Disabled),
+                    allow_ceiling_exceptions: false,
                 }),
                 ..Default::default()
             },
@@ -4150,6 +4266,7 @@ async fn per_site_timeout_cap_applies() {
                     graphql: None,
                     cookie_auth: None,
                     tenancy: None,
+                    allow_ceiling_exceptions: false,
                 }),
                 ..Default::default()
             },
@@ -4637,11 +4754,17 @@ async fn operator_endpoint_reports_invocation_and_consumer_stats() {
             consumers: vec![ConsumerConfig {
                 tenancy: None,
                 token_claims: None,
+                backoff_ms: None,
+                retention_ms: None,
                 topic: "orders/created".to_string(),
                 component: "consumer.wasm".to_string(),
                 imports: vec!["wasi:keyvalue".to_string()],
                 group: String::new(),
                 start: Default::default(),
+                lease_ms: None,
+                max_attempts: None,
+                max_batch: None,
+                max_ack_pending: None,
             }],
             ..Default::default()
         },
