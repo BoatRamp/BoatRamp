@@ -2274,20 +2274,33 @@ impl Messaging for LogMessaging {
                 continue; // a subtopic's dead letters aren't this topic's
             }
             let id = &key[prefix.len()..];
-            // Only delete an object-store payload for a NON-inlined dead record; an inlined one's
-            // payload lived in the record we're about to delete (no object exists to free).
-            let inline = self
+            // An inlined dead record carried its payload IN the record (no object to free); a
+            // non-inlined one has an object-store payload to delete.
+            let inline_len = self
                 .kv
                 .get(&key)
                 .await
                 .map_err(MessagingError::backend)?
                 .and_then(|raw| serde_json::from_slice::<Record>(&raw).ok())
-                .is_some_and(|r| r.inline.is_some());
-            if !inline {
-                self.storage
-                    .delete(&payload_key(topic, id))
-                    .await
-                    .map_err(MessagingError::backend)?;
+                .and_then(|r| r.inline.map(|p| p.len()));
+            match inline_len {
+                // C2: an inline dead-letter's bytes were still charged to the SA1 aggregate-inline
+                // budget (they persisted in `mqdead/` after dead-lettering, never ack'd). Purging is
+                // where they finally leave the node — release them, saturating so a post-restart purge
+                // of a pre-restart record can't underflow and wedge the budget at "full".
+                Some(len) => {
+                    let _ = self.inline_inflight_bytes.fetch_update(
+                        std::sync::atomic::Ordering::Relaxed,
+                        std::sync::atomic::Ordering::Relaxed,
+                        |v| Some(v.saturating_sub(len)),
+                    );
+                }
+                None => {
+                    self.storage
+                        .delete(&payload_key(topic, id))
+                        .await
+                        .map_err(MessagingError::backend)?;
+                }
             }
             self.kv
                 .delete(&key)
@@ -2592,18 +2605,29 @@ impl Messaging for LogMessaging {
             if dl.group.is_empty() {
                 // Work-queue: drop the object-store payload (unless inlined) then the record.
                 let dead = dead_key(topic, &dl.id);
-                let inline = self
+                let inline_len = self
                     .kv
                     .get(&dead)
                     .await
                     .map_err(MessagingError::backend)?
                     .and_then(|raw| serde_json::from_slice::<Record>(&raw).ok())
-                    .is_some_and(|r| r.inline.is_some());
-                if !inline {
-                    self.storage
-                        .delete(&payload_key(topic, &dl.id))
-                        .await
-                        .map_err(MessagingError::backend)?;
+                    .and_then(|r| r.inline.map(|p| p.len()));
+                match inline_len {
+                    // C2: release an inline dead-letter's bytes from the SA1 budget on discard
+                    // (saturating — see purge_dead_letters).
+                    Some(len) => {
+                        let _ = self.inline_inflight_bytes.fetch_update(
+                            std::sync::atomic::Ordering::Relaxed,
+                            std::sync::atomic::Ordering::Relaxed,
+                            |v| Some(v.saturating_sub(len)),
+                        );
+                    }
+                    None => {
+                        self.storage
+                            .delete(&payload_key(topic, &dl.id))
+                            .await
+                            .map_err(MessagingError::backend)?;
+                    }
                 }
                 self.kv
                     .delete(&dead)

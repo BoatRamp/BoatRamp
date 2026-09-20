@@ -830,6 +830,23 @@ impl Messaging for RaftMessaging {
         // Work-queue: also drop the preserved payload from shared storage. Grouped: delete only the
         // dead record — that un-pins the shared retained payload for the retention sweep, which
         // reclaims it once no group needs it (other groups may still be consuming that message).
+        // Classify each work-queue dead record BEFORE the delete proposal removes it: an inline one
+        // carried its payload in the record (no object to free) and its bytes are still charged to
+        // the SA1 aggregate-inline budget; a non-inline one has an object-store payload to delete.
+        let mut inline_release = 0usize;
+        let mut object_ids: Vec<String> = Vec::new();
+        for id in &ids {
+            let inline_len = self
+                .state
+                .get(&messaging::dead_key(topic, id))
+                .await
+                .and_then(|raw| serde_json::from_slice::<messaging::Record>(&raw).ok())
+                .and_then(|r| r.inline.map(|p| p.len()));
+            match inline_len {
+                Some(len) => inline_release += len,
+                None => object_ids.push(id.clone()),
+            }
+        }
         let mut deletes: Vec<WriteOp> = ids
             .iter()
             .map(|id| WriteOp::Delete {
@@ -842,11 +859,19 @@ impl Messaging for RaftMessaging {
             });
         }
         self.propose(WriteOp::Batch(deletes)).await?;
-        for id in &ids {
+        for id in &object_ids {
             self.storage
                 .delete(&messaging::payload_key(topic, id))
                 .await
                 .map_err(|e| MessagingError::Backend(e.to_string()))?;
+        }
+        // C2: release the purged inline dead-letters' bytes from the SA1 budget (saturating).
+        if inline_release > 0 {
+            let _ = self.inline_inflight_bytes.fetch_update(
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+                |v| Some(v.saturating_sub(inline_release)),
+            );
         }
         Ok(ids.len() + grouped.len())
     }
@@ -1049,21 +1074,45 @@ impl Messaging for RaftMessaging {
         // Replicate the dead-record deletes in one batch; then drop the work-queue payloads from
         // shared storage (grouped payloads stay — un-pinned, the sweep reclaims them once no group
         // needs them).
+        // Classify each work-queue dead-letter BEFORE the delete proposal removes its record: inline
+        // ⇒ release its bytes from the SA1 budget (C2), non-inline ⇒ delete the object-store payload.
         let mut deletes: Vec<WriteOp> = Vec::with_capacity(matched.len());
+        let mut inline_release = 0usize;
+        let mut object_ids: Vec<String> = Vec::new();
         for dl in &matched {
-            let key = if dl.group.is_empty() {
-                messaging::dead_key(topic, &dl.id)
+            if dl.group.is_empty() {
+                let inline_len = self
+                    .state
+                    .get(&messaging::dead_key(topic, &dl.id))
+                    .await
+                    .and_then(|raw| serde_json::from_slice::<messaging::Record>(&raw).ok())
+                    .and_then(|r| r.inline.map(|p| p.len()));
+                match inline_len {
+                    Some(len) => inline_release += len,
+                    None => object_ids.push(dl.id.clone()),
+                }
+                deletes.push(WriteOp::Delete {
+                    key: messaging::dead_key(topic, &dl.id),
+                });
             } else {
-                messaging::gdead_key(topic, &dl.group, &dl.id)
-            };
-            deletes.push(WriteOp::Delete { key });
+                deletes.push(WriteOp::Delete {
+                    key: messaging::gdead_key(topic, &dl.group, &dl.id),
+                });
+            }
         }
         self.propose(WriteOp::Batch(deletes)).await?;
-        for dl in matched.iter().filter(|dl| dl.group.is_empty()) {
+        for id in &object_ids {
             self.storage
-                .delete(&messaging::payload_key(topic, &dl.id))
+                .delete(&messaging::payload_key(topic, id))
                 .await
                 .map_err(|e| MessagingError::Backend(e.to_string()))?;
+        }
+        if inline_release > 0 {
+            let _ = self.inline_inflight_bytes.fetch_update(
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+                |v| Some(v.saturating_sub(inline_release)),
+            );
         }
         Ok(matched.len())
     }
