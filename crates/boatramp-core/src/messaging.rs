@@ -418,7 +418,11 @@ pub trait Messaging: Send + Sync {
     /// A *periodic* maintenance sweep the scheduler calls off the hot claim path —
     /// bounds a grouped topic's storage without slowing delivery. Returns the
     /// number reclaimed; default no-op (`0`) for backends without a retained log.
-    async fn retention_sweep(&self, _topic: &str) -> Result<usize, MessagingError> {
+    async fn retention_sweep(
+        &self,
+        _topic: &str,
+        _retention_ms: u64,
+    ) -> Result<usize, MessagingError> {
         Ok(0)
     }
 
@@ -1702,7 +1706,11 @@ impl LogMessaging {
     /// (leased, unacked) **or** `id > hwm` (future backlog it hasn't leased yet).
     /// A message below every group's high-water with no group holding it in-flight
     /// has been consumed by all and is safe to drop.
-    pub async fn gc_grouped(&self, topic: &str) -> Result<usize, MessagingError> {
+    pub async fn gc_grouped(
+        &self,
+        topic: &str,
+        retention_ms: u64,
+    ) -> Result<usize, MessagingError> {
         let _guard = self.claim_lock.lock().await;
         let now = now_unix_ms();
 
@@ -1757,7 +1765,7 @@ impl LogMessaging {
             // until the dead-letter is redriven or purged — so a redrive always has its payload.
             let pinned = dead_ids.contains(id);
             let needed = grouped_message_needed(&states, id);
-            let expired = id_millis(id) + GROUP_RETENTION_MS < now;
+            let expired = id_millis(id) + retention_ms < now;
             if !pinned && (!needed || expired) {
                 let _ = self.storage.delete(&gpayload_key(topic, id)).await;
                 let _ = self.kv.delete(&glog_key(topic, id)).await;
@@ -2866,8 +2874,12 @@ impl Messaging for LogMessaging {
             .is_some())
     }
 
-    async fn retention_sweep(&self, topic: &str) -> Result<usize, MessagingError> {
-        self.gc_grouped(topic).await
+    async fn retention_sweep(
+        &self,
+        topic: &str,
+        retention_ms: u64,
+    ) -> Result<usize, MessagingError> {
+        self.gc_grouped(topic, retention_ms).await
     }
 
     fn subscribe(
@@ -3332,7 +3344,7 @@ mod tests {
             mq.ack(m).await.unwrap();
         }
         // Nothing is reclaimable: "two" still needs both (id > its hwm of "").
-        assert_eq!(mq.gc_grouped(t).await.unwrap(), 0);
+        assert_eq!(mq.gc_grouped(t, GROUP_RETENTION_MS).await.unwrap(), 0);
 
         // "two" claims + acks both → now every group has consumed both.
         let two = mq
@@ -3344,7 +3356,7 @@ mod tests {
             mq.ack(m).await.unwrap();
         }
         // Both are fully consumed → the sweep reclaims both log entries + payloads.
-        assert_eq!(mq.gc_grouped(t).await.unwrap(), 2);
+        assert_eq!(mq.gc_grouped(t, GROUP_RETENTION_MS).await.unwrap(), 2);
         let ids: Vec<String> = one.iter().map(|m| m.id.clone()).collect();
         for id in &ids {
             assert!(
