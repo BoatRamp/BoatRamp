@@ -196,9 +196,14 @@ With `N > 0`, `publish()` acknowledges on the in-memory buffer insert (≈tens o
 
 - **What you gain:** single-publisher publish drops from ≈one flush interval to
   ≈tens of µs; aggregate throughput rises accordingly.
-- **What you give up:** up to `N` acknowledged-but-unflushed messages are **lost
-  on a process crash, OOM, `SIGKILL`, or power loss** before the next flush. The
-  loss window is bounded to `N` messages — pick `N` against your tolerance.
+- **What you give up:** acknowledged-but-unflushed messages are **lost on a
+  process crash, OOM, `SIGKILL`, or power loss** before the next flush. The loss
+  window is bounded by **both count and time** — at most `N` messages **and** at
+  most one store `flush_interval` (the background WAL-flush timer persists every
+  buffered write within one interval regardless of publish activity, ~5 ms in a
+  boatramp deploy vs JetStream's 2 s fsync interval), whichever comes first. So a
+  slow trickle can't leave a message un-durable longer than `flush_interval`, and a
+  burst can't leave more than `N` un-durable. Pick `N` against your tolerance.
 - **Honest positioning:** this is *weaker* than the strong default, and — because
   boatramp's buffer is in process memory — also **weaker than JetStream's
   default** (whose page-cache ack survives a *process* crash; boatramp's does

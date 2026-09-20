@@ -1156,13 +1156,21 @@ pub struct LogMessaging {
     /// The group-commit gate (A2): the single durable-flush turn. Held only across the drain +
     /// `write_batch`, so publishers that pile up during a flush coalesce into the next batch.
     commit_gate: futures::lock::Mutex<()>,
-    /// **Relaxed-publish-durability budget** (operator opt-in): the maximum number of published
+    /// **Relaxed-publish-durability COUNT budget** (operator opt-in): the maximum number of published
     /// messages that may be acked on the in-memory memtable insert (via
     /// [`KvStore::write_batch_relaxed`]) BEFORE a durable checkpoint is forced. **`0` (the default) ==
     /// strong durability** — every publish awaits the durable flush, byte-for-byte the original
     /// behavior. `N > 0` fast-acks up to N messages, then the next commit is a durable `write_batch`
-    /// that flushes the whole WAL buffer and resets the counter — so at most N acked-but-unflushed
-    /// messages can be lost on a process crash before the next flush. Publish path ONLY (ack/claim/
+    /// that flushes the whole WAL buffer and resets the counter.
+    ///
+    /// This is the COUNT half of a JetStream-style **count + time** pairing. The TIME half is the
+    /// store's own `flush_interval` (SlateDB's `max_flush_interval`, ~5ms in a boatramp deploy — vs
+    /// JetStream's 2s): the background WAL-flush timer persists every buffered write within one
+    /// interval *regardless* of publish activity, so a slow trickle can't leave a message un-durable
+    /// longer than `flush_interval`. So the un-durable (crash-loss) window is bounded by BOTH — at
+    /// most `N` messages AND at most one `flush_interval` of time, whichever comes first. The count
+    /// checkpoint is the burst/memory backstop (bounding the un-durable *set* when publishes outpace
+    /// the timer); the flush interval is the steady-state time bound. Publish path ONLY (ack/claim/
     /// dead-letter always durable). Set via [`with_max_unflushed`](Self::with_max_unflushed).
     max_unflushed: usize,
     /// Messages committed via the relaxed path since the last durable checkpoint (only ever non-zero
