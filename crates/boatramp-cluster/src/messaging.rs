@@ -2310,6 +2310,59 @@ mod tests {
         println!("MESSAGING GROUPED DLQ MATRIX OK [cluster]");
     }
 
+    /// **Cluster group-commit throughput bench** — proves the leader-only-gate fix coalesces
+    /// concurrent publishes on the Raft path (each group ⇒ ONE `WriteOp::Batch` round-trip, not one
+    /// per message). `#[ignore]`d (a perf measurement, not a merge gate); run manually / on a box:
+    /// `cargo test -p boatramp-cluster --features raft,http --lib cluster_group_commit_concurrent_bench -- --ignored --nocapture`
+    #[serial_test::serial]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    #[ignore = "cluster perf bench — run manually with --ignored"]
+    async fn cluster_group_commit_concurrent_bench() {
+        let (rafts, mqs) = cluster_mq(3).await;
+        let leader = rafts[&1].metrics().borrow().current_leader.unwrap();
+        let mq = mqs[&leader].clone();
+        let payload = vec![b'x'; 256];
+
+        // Baseline: one sequential publisher — one Raft round-trip per message.
+        let seq_n = 500usize;
+        let t = std::time::Instant::now();
+        for _ in 0..seq_n {
+            mq.publish("bench-seq", &payload).await.unwrap();
+        }
+        let seq = seq_n as f64 / t.elapsed().as_secs_f64();
+
+        // Concurrent: CONC publishers in flight — the leader-only group-commit should drain them into
+        // ONE WriteOp::Batch per round-trip, so aggregate throughput vastly exceeds the serial floor.
+        let conc = 128usize;
+        let per = 40usize;
+        let t = std::time::Instant::now();
+        let mut hs = Vec::with_capacity(conc);
+        for _ in 0..conc {
+            let mq = mq.clone();
+            let p = payload.clone();
+            hs.push(tokio::spawn(async move {
+                for _ in 0..per {
+                    mq.publish("bench-conc", &p).await.unwrap();
+                }
+            }));
+        }
+        for h in hs {
+            h.await.unwrap();
+        }
+        let conc_rate = (conc * per) as f64 / t.elapsed().as_secs_f64();
+        shutdown(rafts).await;
+
+        println!(
+            "CLUSTER GROUP-COMMIT BENCH: single {seq:.0} msg/s, concurrent(CONC={conc}) {conc_rate:.0} msg/s ({:.1}x)",
+            conc_rate / seq
+        );
+        assert!(
+            conc_rate > seq * 3.0,
+            "the Raft group-commit must coalesce concurrent publishes: concurrent {conc_rate:.0} msg/s \
+             should be >>3x the serial floor {seq:.0} msg/s"
+        );
+    }
+
     /// **Grouped no-double-delivery across nodes.** A group registered cluster-wide
     /// is drained concurrently from every node; the leader serializes each group's
     /// claim, so each message is delivered to the group exactly once regardless of
