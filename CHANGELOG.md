@@ -5,6 +5,82 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.4.24] - 2026-09-20
+
+The messaging **JetStream-parity** release: boatramp's bus is rebuilt for durable
+throughput (measured against NATS JetStream on a real box) and gains a full
+operator surface — reliable/inspectable DLQ, per-consumer tuning, flow control,
+delivery modes, group lifecycle, and durable replay. Plus an **authorized inline
+per-route tenancy exception** so one route can run cross-tenant on an otherwise
+`own`-ceilinged site. Every piece shipped behind a Security-Engineer review to
+convergence and a CI-hard gate; the messaging plan and the relaxed-durability knob
+additionally passed a 3-role (Architect + UX + Security) panel.
+
+Measured single-node, 256 B, vs `nats bench js pub` file-storage on the same host:
+concurrent aggregate **~55k msg/s** and batched **~326k msg/s** (beating JetStream
+async); a single sequential durable publish is flush-bound (~6 ms) — a *stronger*
+guarantee than JetStream's default (crash+power durable). An opt-in relaxed mode
+trades that for JetStream-class latency (below).
+
+### Added
+
+- **Durable-publish write-path redesign (P0).** A publish coalesces its index
+  writes into one durable commit (A1); a per-node **group-commit** lets concurrent
+  publishers share one fsync / one Raft batch entry — a **leader-only gate** so
+  waiters never serialize through it (the shape that actually coalesces in steady
+  state — 165→55k msg/s concurrent on the single node, 15.9× on the cluster path);
+  small work-queue payloads ride **inline** in the index record (A3, ≤4 KiB, with a
+  per-node aggregate-inline byte budget + object-store fallback, SA1); and a
+  **batch/async** guest+host API (`publish_batch`) commits N messages in one flush.
+- **Selective, inspectable dead-letter queue (P1).** `boatramp dlq ls|show|redrive|
+  discard|purge` with `--id`/`--group`/`--older-than`/`--match`/`--limit` filters,
+  `--dry-run`/`--yes`; a captured `last_error` (host-classified, sanitized);
+  operator `GET/POST …/_boatramp/dlq`. Grouped/fan-out dead-letters are now
+  counted, redrivable, and purgeable (they were previously invisible).
+- **Live-queue inspection + per-consumer tuning (P1).** `boatramp queue peek`;
+  inspection stats (in-flight, oldest-pending age, per-group lag); per-consumer
+  `lease_ms` / `max_attempts` / `max_batch` / `max_ack_pending`.
+- **Flow control, delivery modes, group lifecycle, durable replay (P2).**
+  `boatramp queue pause|resume`, `groups`, `group-reset`, `group-delete`, `replay`;
+  delivery modes **delayed**, **TTL**, and **priority** publish; consumer-group
+  list/reset/delete; non-destructive `replay` of a grouped topic's retained history
+  from an offset. New guest producer WIT (`publish-batch`/`publish-delayed`/
+  `publish-with-ttl`/`publish-with-priority`) with the shim revved to match.
+- **Opt-in relaxed publish durability (`[handlers] messaging_max_unflushed_msgs`).**
+  Default `0` = the strong durable path (unchanged). `N > 0` fast-acks publishes on
+  the in-memory buffer (≈tens of µs vs ≈one flush interval), bounding the crash-loss
+  window by **both** count (≤ N acked-but-unflushed messages) **and** time (the
+  store flush interval, ~5 ms). Bus publish path only; control-plane, guest-kv, and
+  consumer ack/redelivery durability are unaffected; operator-only, single-node, with
+  a startup warning and a CI guard enforcing the sole-caller boundary. Honestly
+  *weaker* than the strong default (and than JetStream's page-cache default) — not
+  "JetStream parity", but faster.
+- **Authorized inline per-route tenancy exception (task #470).** A site route may
+  deliberately exceed its site's tenancy ceiling via `exceed_site_ceiling: true`,
+  under a **three-key** model: the site opts in
+  (`SiteConfig.handlers.allow_ceiling_exceptions`), the route carries the token, and
+  the operator posture (`allow_cross_tenant_db`) still gates `all` at runtime. The
+  exception can only widen a scoped read/write on the same tenant column — never
+  remove scoping or switch the target axis. A deploy that widens without both
+  deployer keys is refused with a speaking, key-aware error; `apply --dry-run` flags
+  each exceeding route. Lets an `own`-ceilinged site host an unscoped `all` route
+  (M2M `/token`, `/svc/*`) without a camouflaging function indirection.
+
+### Changed
+
+- Publish returns `Ok` only after a durable commit (at-least-once); a failed group
+  commit fails every member. The bus keeps strong durability by default — see the
+  new [Publish durability](./how-to/background-work.md) how-to.
+
+### Fixed
+
+- **Grouped/fan-out dead-letters are now visible and manageable.** They previously
+  landed in a separate keyspace the DLQ operators didn't scan, so `dead_letters`
+  reported 0 for a fan-out topic.
+- **Group-commit steady-state coalescing.** Concurrent durable publishes serialized
+  at the flush latency because every waiter acquired the commit gate; the leader-only
+  gate fixes it on both the single-node and Raft backends (a benchmark caught it).
+
 ## [0.4.23] - 2026-09-19
 
 Fixes a v0.4.22 regression and generalizes how a declarative `apply` coexists with imperatively-written
