@@ -142,6 +142,24 @@ jobs:
         # that passes the hook passes CI.
         uses: crate-ci/typos@v1.47.0
 
+      - name: Relaxed-durability sole-caller guard
+        # `KvStore::write_batch_relaxed` acks BEFORE the durable flush — it may be called ONLY by the
+        # messaging bus publish path (`LogMessaging::commit_group`) and the `CachedKv` decorator that
+        # forwards it, both in `boatramp-core`. A call from any other crate/module (a control-plane,
+        # auth, guest-kv, or messaging ack/claim path) would silently weaken a durability guarantee on
+        # the SHARED store — so a stray caller must fail the build, not a review. (Definitions/impls
+        # `fn write_batch_relaxed` are excluded; we match call syntax `.write_batch_relaxed(`.)
+        run: |
+          set -eo pipefail
+          stray=$(grep -rn '\.write_batch_relaxed(' crates/*/src \
+            | grep -vE 'crates/boatramp-core/src/(kv|messaging)\.rs:' || true)
+          if [ -n "$stray" ]; then
+            echo "::error::write_batch_relaxed called outside the allowed bus publish path:" >&2
+            echo "$stray" >&2
+            exit 1
+          fi
+          echo "relaxed-durability sole-caller guard OK"
+
   clippy:
     name: clippy (default features)
     runs-on: ubuntu-latest
