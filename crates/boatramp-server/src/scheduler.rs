@@ -476,7 +476,15 @@ pub(super) async fn run_scheduler_tick(
                                 .is_none_or(|stamp| *stamp != now.minute_stamp)
                         {
                             sweep_state.insert(consumer_topic.clone(), now.minute_stamp);
-                            match messaging.retention_sweep(&consumer_topic).await {
+                            match messaging
+                                .retention_sweep(
+                                    &consumer_topic,
+                                    consumer
+                                        .retention_ms
+                                        .unwrap_or(boatramp_core::messaging::GROUP_RETENTION_MS),
+                                )
+                                .await
+                            {
                                 Ok(n) if n > 0 => tracing::debug!(
                                     topic = %consumer_topic,
                                     reclaimed = n,

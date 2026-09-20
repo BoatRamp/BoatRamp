@@ -1307,30 +1307,81 @@ impl Messaging for RaftMessaging {
         Ok(self.state.get(&messaging::pause_key(topic)).await.is_some())
     }
 
-    async fn retention_sweep(&self, topic: &str) -> Result<usize, MessagingError> {
-        // The state machine reclaims the replicated log entries no group needs and
-        // returns their ids; only the client can delete the `Storage` payloads
-        // (consensus never touches `Storage`). Idempotent under concurrent sweeps:
-        // the SM applies proposals in order, so a second sweep sees the first's
-        // deletions, and a repeated `Storage` delete is a no-op.
-        let response = self
-            .propose(WriteOp::MqSweepGrouped {
-                topic: topic.to_string(),
-                now_ms: now_unix_ms(),
+    async fn retention_sweep(
+        &self,
+        topic: &str,
+        retention_ms: u64,
+    ) -> Result<usize, MessagingError> {
+        // The LEADER computes the exact reclaim set from its applied state (same decision as the
+        // single-node `gc_grouped`: a log id is reclaimed when it is not dead-letter-pinned AND either
+        // no group still needs it OR it is older than `retention_ms`) and proposes EXPLICIT deletes.
+        // This is deliberately NOT a "sweep with a retention param the apply re-evaluates": a
+        // per-proposal retention that the apply reads would diverge a mixed-version cluster (an old
+        // replica ignoring the field would reclaim a different set). Explicit deletes apply identically
+        // on every replica regardless of version. Only the client deletes `Storage` payloads
+        // (consensus never touches `Storage`). Idempotent under concurrent sweeps (a repeated delete is
+        // a no-op). Same TOCTOU as single-node (a group reset between read and apply is a rare admin op).
+        let now = now_unix_ms();
+
+        // Every registered group's compact state (for the "still needed by some group" check).
+        let state_prefix = messaging::gstate_prefix(topic);
+        let mut states = Vec::new();
+        for key in self.state.list_prefix(&state_prefix).await {
+            if !messaging::is_direct_child(&key, &state_prefix) {
+                continue;
+            }
+            if let Some(raw) = self.state.get(&key).await {
+                if let Ok(state) = serde_json::from_slice::<messaging::GroupState>(&raw) {
+                    states.push(state);
+                }
+            }
+        }
+        // Dead-lettered ids (any group) pin their retained log+payload against reclaim.
+        let dead_ids: std::collections::HashSet<String> = self
+            .grouped_dead(topic)
+            .await
+            .into_iter()
+            .map(|(_, id)| id)
+            .collect();
+        // Every retained log id.
+        let log_prefix = messaging::glog_prefix(topic);
+        let ids: Vec<String> = self
+            .state
+            .list_prefix(&log_prefix)
+            .await
+            .into_iter()
+            .filter(|k| messaging::is_direct_child(k, &log_prefix))
+            .map(|k| k[log_prefix.len()..].to_string())
+            .collect();
+
+        let mut reclaim: Vec<String> = Vec::new();
+        for id in ids {
+            let pinned = dead_ids.contains(&id);
+            let needed = messaging::grouped_message_needed(&states, &id);
+            let expired = messaging::id_millis(&id) + retention_ms < now;
+            if !pinned && (!needed || expired) {
+                reclaim.push(id);
+            }
+        }
+        if reclaim.is_empty() {
+            return Ok(0);
+        }
+        // Replicate the explicit log-entry deletes in one batch (version-independent apply).
+        let deletes: Vec<WriteOp> = reclaim
+            .iter()
+            .map(|id| WriteOp::Delete {
+                key: messaging::glog_key(topic, id),
             })
-            .await?;
-        let WriteResponse::Reclaimed(ids) = response else {
-            return Err(MessagingError::Backend(
-                "sweep proposal returned a non-sweep response".into(),
-            ));
-        };
-        for id in &ids {
+            .collect();
+        self.propose(WriteOp::Batch(deletes)).await?;
+        // Then free the `Storage` payloads (client-side; consensus never touches Storage).
+        for id in &reclaim {
             self.storage
                 .delete(&messaging::gpayload_key(topic, id))
                 .await
                 .map_err(|e| MessagingError::Backend(e.to_string()))?;
         }
-        Ok(ids.len())
+        Ok(reclaim.len())
     }
 
     fn subscribe(
@@ -2205,7 +2256,12 @@ mod tests {
             mq.ack(m).await.unwrap();
         }
         // "two" still needs both → nothing reclaimable yet.
-        assert_eq!(mq.retention_sweep(&gc).await.unwrap(), 0);
+        assert_eq!(
+            mq.retention_sweep(&gc, messaging::GROUP_RETENTION_MS)
+                .await
+                .unwrap(),
+            0
+        );
         let two = mq
             .claim_grouped(&gc, "two", StartPosition::Earliest, LEASE, 10, 5)
             .await
@@ -2215,9 +2271,16 @@ mod tests {
             mq.ack(m).await.unwrap();
         }
         // Both consumed by every group → the sweep reclaims both, idempotently.
-        assert_eq!(mq.retention_sweep(&gc).await.unwrap(), 2);
         assert_eq!(
-            mq.retention_sweep(&gc).await.unwrap(),
+            mq.retention_sweep(&gc, messaging::GROUP_RETENTION_MS)
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            mq.retention_sweep(&gc, messaging::GROUP_RETENTION_MS)
+                .await
+                .unwrap(),
             0,
             "sweep is idempotent"
         );
