@@ -4045,10 +4045,11 @@ mod tests {
         });
         let mq =
             LogMessaging::new(Arc::new(MemStorage::default()), kv.clone()).with_max_unflushed(4);
-        // 12 sequential single publishes. Each commits 1 message. Cadence: 4 relaxed acks fill the
-        // budget, the 5th would exceed it → durable checkpoint (resets), repeat. So of every 5
-        // commits, 4 are relaxed + 1 durable; 12 messages → relaxed at counts 1,2,3,4, 6,7,8,9,
-        // 11,12 (10) and durable checkpoints at 5,10 plus the trailing 2 never hit a checkpoint...
+        // 12 sequential single publishes, each committing 1 message. Cadence with budget 4: 4 relaxed
+        // acks fill the budget, the 5th would exceed it → durable checkpoint (resets to 0), repeat.
+        // So publishes 1-4 relaxed, 5 durable, 6-9 relaxed, 10 durable, 11-12 relaxed = 10 relaxed +
+        // 2 durable. The un-durable count never exceeds 4 at any instant (the assertions below only
+        // pin the floors — ≥2 durable, ≥8 relaxed — so the test is robust to drain-grouping).
         for i in 0..12u32 {
             mq.publish("t", format!("m{i}").as_bytes()).await.unwrap();
         }
