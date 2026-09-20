@@ -611,6 +611,75 @@ async fn queue_pause_core(
     }
 }
 
+/// `POST …/_boatramp/queue/policy` request: set a per-topic operator flow-control policy (v0.4.24).
+/// Each policy field is optional (omit = no cap on that axis); the request carries the topic + the
+/// [`TopicPolicy`](boatramp_core::messaging::TopicPolicy) fields flattened.
+#[cfg(feature = "handlers")]
+#[derive(Deserialize)]
+pub(super) struct QueuePolicyRequest {
+    topic: String,
+    #[serde(default)]
+    alias: Option<String>,
+    /// Reject a publish once the backlog is at/above this (fail-closed).
+    #[serde(default)]
+    max_depth: Option<usize>,
+    /// Per-node publish rate cap (tokens/sec, best-effort).
+    #[serde(default)]
+    max_rate_per_sec: Option<u32>,
+    /// Per-topic relaxed-durability budget override (single-node only; inert on the cluster).
+    #[serde(default)]
+    max_unflushed: Option<usize>,
+}
+
+/// Operator flow-control MUTATION (`POST …/_boatramp/queue/policy`, write → `Site·Write`): set a
+/// topic's per-topic policy. Site-scoped so an operator only controls their own site's topics.
+#[cfg(feature = "handlers")]
+pub(super) async fn operator_queue_policy(
+    Extension(handlers): Extension<Arc<HandlerRuntime>>,
+    Path(site): Path<String>,
+    Json(req): Json<QueuePolicyRequest>,
+) -> Response {
+    let messaging = match messaging_or_unavailable(&handlers) {
+        Ok(m) => m,
+        Err(resp) => return resp,
+    };
+    let namespaced = dlq_namespace(&site, &req.alias, &req.topic);
+    queue_policy_core(messaging.as_ref(), &namespaced, &req).await
+}
+
+/// Shared inner logic of the policy MUTATION, over an already-namespaced topic. Refuses (fail-closed)
+/// on any backend that doesn't support per-topic policy — surfaced as a `501 Not Implemented` so an
+/// operator's cap is never silently dropped.
+#[cfg(feature = "handlers")]
+async fn queue_policy_core(
+    messaging: &dyn boatramp_core::messaging::Messaging,
+    namespaced: &str,
+    req: &QueuePolicyRequest,
+) -> Response {
+    let policy = boatramp_core::messaging::TopicPolicy {
+        max_depth: req.max_depth,
+        max_rate_per_sec: req.max_rate_per_sec,
+        max_unflushed: req.max_unflushed,
+    };
+    match messaging.set_topic_policy(namespaced, policy).await {
+        Ok(()) => Json(serde_json::json!({
+            "ok": true,
+            "max_depth": req.max_depth,
+            "max_rate_per_sec": req.max_rate_per_sec,
+            "max_unflushed": req.max_unflushed,
+        }))
+        .into_response(),
+        Err(boatramp_core::messaging::MessagingError::Unsupported(msg)) => {
+            (StatusCode::NOT_IMPLEMENTED, format!("{msg}\n")).into_response()
+        }
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("set policy failed: {err}\n"),
+        )
+            .into_response(),
+    }
+}
+
 /// Which group-lifecycle mutation `POST …/_boatramp/queue/group` runs.
 #[cfg(feature = "handlers")]
 #[derive(Deserialize)]
@@ -951,6 +1020,45 @@ pub(super) async fn operator_bus_queue_pause(
     };
     let namespaced = bus_namespace(&project.as_ref(), &req.topic);
     queue_pause_core(messaging.as_ref(), &namespaced, req.paused).await
+}
+
+/// `POST …/bus/queue/policy` request on the project bus (no `alias` — the bus has no per-deployment
+/// scope). Carries the topic + the flattened [`TopicPolicy`](boatramp_core::messaging::TopicPolicy)
+/// fields.
+#[cfg(feature = "handlers")]
+#[derive(Deserialize)]
+pub(super) struct BusQueuePolicyRequest {
+    topic: String,
+    #[serde(default)]
+    max_depth: Option<usize>,
+    #[serde(default)]
+    max_rate_per_sec: Option<u32>,
+    #[serde(default)]
+    max_unflushed: Option<usize>,
+}
+
+/// Project-bus flow-control MUTATION (`POST …/bus/queue/policy`, write → `Project·Admin`): set a
+/// bus topic's per-topic policy for the shared project bus.
+#[cfg(feature = "handlers")]
+pub(super) async fn operator_bus_queue_policy(
+    Extension(handlers): Extension<Arc<HandlerRuntime>>,
+    Extension(project): Extension<crate::project_scope::ProjectContext>,
+    Json(req): Json<BusQueuePolicyRequest>,
+) -> Response {
+    let messaging = match messaging_or_unavailable(&handlers) {
+        Ok(m) => m,
+        Err(resp) => return resp,
+    };
+    let namespaced = bus_namespace(&project.as_ref(), &req.topic);
+    // Reuse the shared core over a synthesized site-shaped request (no alias on the bus).
+    let site_req = QueuePolicyRequest {
+        topic: req.topic.clone(),
+        alias: None,
+        max_depth: req.max_depth,
+        max_rate_per_sec: req.max_rate_per_sec,
+        max_unflushed: req.max_unflushed,
+    };
+    queue_policy_core(messaging.as_ref(), &namespaced, &site_req).await
 }
 
 /// `POST …/bus/queue/group` request on the project bus.

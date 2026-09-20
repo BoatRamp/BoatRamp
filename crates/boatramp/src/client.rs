@@ -1071,6 +1071,45 @@ impl ControlPlane {
         Ok(())
     }
 
+    /// Set a topic's per-topic operator flow-control policy (`POST …/_boatramp/queue/policy`,
+    /// v0.4.24). Each cap is optional (`None` = uncapped on that axis).
+    pub async fn set_topic_policy(
+        &self,
+        scope: OpScope<'_>,
+        topic: &str,
+        max_depth: Option<usize>,
+        max_rate_per_sec: Option<u32>,
+        max_unflushed: Option<usize>,
+    ) -> Result<()> {
+        let url = self.op_url(scope, "queue/policy");
+        let client = &self.http;
+        #[derive(Serialize)]
+        struct Request<'a> {
+            topic: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            alias: Option<&'a str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            max_depth: Option<usize>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            max_rate_per_sec: Option<u32>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            max_unflushed: Option<usize>,
+        }
+        client
+            .post(url)
+            .json(&Request {
+                topic,
+                alias: scope.alias(),
+                max_depth,
+                max_rate_per_sec,
+                max_unflushed,
+            })
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+
     /// List a topic's consumer groups (`GET …/_boatramp/queue/groups`).
     pub async fn list_groups(&self, scope: OpScope<'_>, topic: &str) -> Result<Vec<GroupEntry>> {
         let url = self.op_url(scope, "queue/groups");

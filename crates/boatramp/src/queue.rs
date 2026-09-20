@@ -138,6 +138,24 @@ enum QueueCommand {
         #[arg(long)]
         alias: Option<String>,
     },
+    /// Set a per-topic operator flow-control policy (v0.4.24). Omit a flag to leave that axis
+    /// uncapped. `--max-unflushed` is single-node only (inert on a cluster).
+    Policy {
+        /// Consumer topic.
+        topic: String,
+        /// Reject a publish once the backlog is at/above this (fail-closed). Omit = unbounded.
+        #[arg(long)]
+        max_depth: Option<usize>,
+        /// Per-node publish rate cap (messages/sec, best-effort token bucket). Omit = unlimited.
+        #[arg(long)]
+        max_rate: Option<u32>,
+        /// Per-topic relaxed-durability budget override (single-node only). Omit = node default.
+        #[arg(long)]
+        max_unflushed: Option<usize>,
+        /// Background-alias scope (`{site}/{alias}`); omit for the live site.
+        #[arg(long)]
+        alias: Option<String>,
+    },
 }
 
 /// Entry point for `boatramp queue`.
@@ -207,6 +225,24 @@ pub async fn run(args: QueueArgs, config: &ProjectConfig) -> Result<()> {
             let scope = queue_scope(args.bus, &site, alias.as_deref())?;
             cp.pause_queue(scope, topic, false).await?;
             println!("resumed topic {topic:?}");
+        }
+        QueueCommand::Policy {
+            topic,
+            max_depth,
+            max_rate,
+            max_unflushed,
+            alias,
+        } => {
+            let scope = queue_scope(args.bus, &site, alias.as_deref())?;
+            cp.set_topic_policy(scope, topic, *max_depth, *max_rate, *max_unflushed)
+                .await?;
+            let fmt = |v: Option<usize>| v.map_or_else(|| "-".to_string(), |n| n.to_string());
+            println!(
+                "set policy on topic {topic:?}: max_depth={} max_rate={} max_unflushed={}",
+                fmt(*max_depth),
+                max_rate.map_or_else(|| "-".to_string(), |n| n.to_string()),
+                fmt(*max_unflushed),
+            );
         }
     }
     Ok(())

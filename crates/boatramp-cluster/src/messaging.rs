@@ -121,6 +121,23 @@ pub struct RaftMessaging {
     commit_queue: StdMutex<Vec<ClusterPublishJob>>,
     /// The group-commit gate (A2): the single propose turn (see [`commit_queue`](Self::commit_queue)).
     commit_gate: futures::lock::Mutex<()>,
+    /// Per-topic operator policy cache (Feature A, v0.4.24): the publish hot path resolves a topic's
+    /// [`messaging::TopicPolicy`] from here instead of reading applied state every publish. Populated
+    /// lazily (from `self.state`), INVALIDATED on `set_topic_policy` (after the replicated Put
+    /// applies locally). `None` == a negative cache entry (an uncapped topic is not re-read).
+    policy_cache: StdMutex<std::collections::HashMap<String, Option<messaging::TopicPolicy>>>,
+    /// Per-node per-topic publish **token bucket** (Feature B `max_rate_per_sec`, best-effort): the
+    /// live `(tokens, last_refill_ms)` per rate-capped topic. Per-node by design (a cluster-wide exact
+    /// rate would need a replicated counter on the hot path). Only touched by rate-capped topics.
+    rate_buckets: StdMutex<std::collections::HashMap<String, ClusterTokenBucket>>,
+}
+
+/// A per-node per-topic token bucket for the best-effort publish rate cap (Feature B), refilling at
+/// `max_rate_per_sec` tokens/sec (burst capped at the rate). Mirrors the single-node bucket.
+#[derive(Debug, Clone, Copy)]
+struct ClusterTokenBucket {
+    tokens: f64,
+    last_refill_ms: u64,
 }
 
 /// One publisher's contribution to a cluster group commit (A2/A4): its `MqPublish` op(s) + a
@@ -155,6 +172,98 @@ impl RaftMessaging {
             inline_inflight_bytes: AtomicUsize::new(0),
             commit_queue: StdMutex::new(Vec::new()),
             commit_gate: futures::lock::Mutex::new(()),
+            policy_cache: StdMutex::new(std::collections::HashMap::new()),
+            rate_buckets: StdMutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// Resolve `topic`'s operator [`messaging::TopicPolicy`] (Feature A), serving from the in-memory
+    /// cache and lazily loading from this node's applied state (`mqpolicy/{topic}`) on a miss. A
+    /// `None` result is cached as a negative entry, so an uncapped topic is NOT read on every publish.
+    /// A decode error propagates (the publish path fails closed rather than treating an unreadable
+    /// policy as "no cap").
+    async fn resolve_policy(
+        &self,
+        topic: &str,
+    ) -> Result<Option<messaging::TopicPolicy>, MessagingError> {
+        {
+            let cache = self.policy_cache.lock().unwrap();
+            if let Some(hit) = cache.get(topic) {
+                return Ok(hit.clone());
+            }
+        }
+        let policy = match self.state.get(&messaging::mqpolicy_key(topic)).await {
+            Some(raw) => Some(
+                serde_json::from_slice::<messaging::TopicPolicy>(&raw)
+                    .map_err(|e| MessagingError::Decode(e.to_string()))?,
+            ),
+            None => None,
+        };
+        self.policy_cache
+            .lock()
+            .unwrap()
+            .insert(topic.to_string(), policy.clone());
+        Ok(policy)
+    }
+
+    /// Enforce a resolved policy against a publish of `n` messages onto `topic` (Feature B), BEFORE
+    /// proposing anything. Fail-closed in order: (1) `max_depth` — reject with
+    /// [`MessagingError::DepthExceeded`] if the current backlog is already at the cap (only queried
+    /// when a cap is set — an uncapped topic never reads the backlog); (2) `max_rate_per_sec` — a
+    /// per-node token bucket, reject with [`MessagingError::RateExceeded`]. `max_unflushed` is inert
+    /// on the cluster (its durability is replication, a different axis).
+    async fn enforce_publish_policy(
+        &self,
+        topic: &str,
+        policy: &messaging::TopicPolicy,
+        n: usize,
+    ) -> Result<(), MessagingError> {
+        if let Some(max_depth) = policy.max_depth {
+            let backlog = self.backlog(topic).await?;
+            if backlog >= max_depth {
+                return Err(MessagingError::DepthExceeded(topic.to_string()));
+            }
+        }
+        if let Some(rate) = policy.max_rate_per_sec {
+            if !self.try_take_tokens(topic, rate, n) {
+                return Err(MessagingError::RateExceeded(topic.to_string()));
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolve `topic`'s policy (cached) and enforce depth/rate for `n` messages (Feature B). A
+    /// `None` policy (the common case) is a no-op. Shared front half of every publish variant.
+    async fn enforce_topic_policy(&self, topic: &str, n: usize) -> Result<(), MessagingError> {
+        if let Some(p) = self.resolve_policy(topic).await? {
+            self.enforce_publish_policy(topic, &p, n).await?;
+        }
+        Ok(())
+    }
+
+    /// Draw `n` tokens from `topic`'s per-node bucket, refilling at `rate` tokens/sec since the last
+    /// draw (burst capped at `rate`). A fresh bucket starts full. Best-effort, per-node.
+    fn try_take_tokens(&self, topic: &str, rate: u32, n: usize) -> bool {
+        let now = now_unix_ms();
+        let cap = f64::from(rate);
+        let mut buckets = self.rate_buckets.lock().unwrap();
+        let bucket = buckets
+            .entry(topic.to_string())
+            .or_insert(ClusterTokenBucket {
+                tokens: cap,
+                last_refill_ms: now,
+            });
+        let elapsed_ms = now.saturating_sub(bucket.last_refill_ms);
+        if elapsed_ms > 0 {
+            bucket.tokens = (bucket.tokens + (elapsed_ms as f64) * cap / 1000.0).min(cap);
+            bucket.last_refill_ms = now;
+        }
+        let need = n as f64;
+        if bucket.tokens >= need {
+            bucket.tokens -= need;
+            true
+        } else {
+            false
         }
     }
 
@@ -471,6 +580,10 @@ impl Messaging for RaftMessaging {
         payload: &[u8],
         signed_context: Option<&str>,
     ) -> Result<(), MessagingError> {
+        // Feature B: enforce the topic's operator policy (depth/rate) BEFORE building/proposing —
+        // a breach rejects the publish with nothing replicated. (`max_unflushed` is inert here: the
+        // cluster's durability is replication, not the single-node relaxed-flush axis.)
+        self.enforce_topic_policy(topic, 1).await?;
         // Build this message's replicated `MqPublish` op (doing any object-store payload write first),
         // then commit it in one group-commit. Factored so `publish_batch_ctx` reuses the identical
         // A3/SA1/retain decisions and coalesces N messages into one Raft entry.
@@ -494,6 +607,8 @@ impl Messaging for RaftMessaging {
         delay: Duration,
         signed_context: Option<&str>,
     ) -> Result<(), MessagingError> {
+        // Feature B: enforce the topic's operator policy (depth/rate) before proposing.
+        self.enforce_topic_policy(topic, 1).await?;
         // Delivery-mode delay (P2): the issuing node stamps the absolute not-before (deterministic
         // across replicas — the apply just copies it into the record's lease). 0 ⇒ claimable now.
         let not_before_ms = if delay.is_zero() {
@@ -516,6 +631,8 @@ impl Messaging for RaftMessaging {
         ttl: Duration,
         signed_context: Option<&str>,
     ) -> Result<(), MessagingError> {
+        // Feature B: enforce the topic's operator policy (depth/rate) before proposing.
+        self.enforce_topic_policy(topic, 1).await?;
         // Delivery-mode TTL (P2): the issuing node stamps the absolute expires-at (deterministic).
         // 0 ⇒ no expiry. A claim after expiry dead-letters it (ttl-expired) instead of delivering.
         let expires_at_ms = if ttl.is_zero() {
@@ -538,6 +655,8 @@ impl Messaging for RaftMessaging {
         priority: u8,
         signed_context: Option<&str>,
     ) -> Result<(), MessagingError> {
+        // Feature B: enforce the topic's operator policy (depth/rate) before proposing.
+        self.enforce_topic_policy(topic, 1).await?;
         // Delivery-mode priority (P2): higher leases first (ties FIFO); 0 = normal. Work-queue only.
         let (id, op) = self
             .build_publish_op(topic, payload, signed_context, 0, 0, priority)
@@ -554,6 +673,17 @@ impl Messaging for RaftMessaging {
     ) -> Result<(), MessagingError> {
         if messages.is_empty() {
             return Ok(());
+        }
+        // Feature B — enforce each distinct topic's policy ONCE for the count of messages the batch
+        // carries on it (fail-closed: a breach returns before we build/propose, so NOTHING in the
+        // batch is replicated). Most topics have no policy → one cached resolve per distinct topic.
+        let mut per_topic_count: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::new();
+        for (topic, _) in messages {
+            *per_topic_count.entry(topic.as_str()).or_insert(0) += 1;
+        }
+        for (topic, count) in &per_topic_count {
+            self.enforce_topic_policy(topic, *count).await?;
         }
         // A4 — coalesce the WHOLE batch into ONE replicated `WriteOp::Batch`: build every message's
         // `MqPublish` op (each doing its own payload-first object-store write + A3/SA1 decision), then
@@ -1307,6 +1437,34 @@ impl Messaging for RaftMessaging {
         Ok(self.state.get(&messaging::pause_key(topic)).await.is_some())
     }
 
+    async fn set_topic_policy(
+        &self,
+        topic: &str,
+        policy: messaging::TopicPolicy,
+    ) -> Result<(), MessagingError> {
+        // Feature A: policy is OPERATOR STATE, so it must REPLICATE — a plain `WriteOp::Put` of the
+        // JSON under `mqpolicy/{topic}` through the state machine (durable + applied on every node,
+        // and naturally version-independent: a plain KV Put, no new op variant, so rolling-upgrade
+        // safe). Then invalidate this node's cache so a subsequent local publish re-reads it; other
+        // nodes' caches self-heal on their next miss / lazily (a stale cap is best-effort by design).
+        let value =
+            serde_json::to_vec(&policy).map_err(|e| MessagingError::Backend(e.to_string()))?;
+        self.propose(WriteOp::Put {
+            key: messaging::mqpolicy_key(topic),
+            value,
+        })
+        .await?;
+        self.policy_cache.lock().unwrap().remove(topic);
+        Ok(())
+    }
+
+    async fn topic_policy(
+        &self,
+        topic: &str,
+    ) -> Result<Option<messaging::TopicPolicy>, MessagingError> {
+        self.resolve_policy(topic).await
+    }
+
     async fn retention_sweep(
         &self,
         topic: &str,
@@ -1921,6 +2079,51 @@ mod tests {
             mq.ack(m).await.unwrap();
         }
         assert_eq!(mq.backlog(topic).await.unwrap(), 0);
+
+        // --- v0.4.24 per-topic operator policy (Feature A/B, both backends) -----------------------
+        // Runs on a fresh child topic so it does not disturb the running backlog sequence on `topic`.
+        // set/get roundtrips through the (replicated, on cluster) policy store + the node cache.
+        let ptopic = &format!("{topic}/policy");
+        assert_eq!(
+            mq.topic_policy(ptopic).await.unwrap(),
+            None,
+            "no policy initially"
+        );
+        mq.set_topic_policy(
+            ptopic,
+            messaging::TopicPolicy {
+                max_depth: Some(2),
+                max_rate_per_sec: None,
+                max_unflushed: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            mq.topic_policy(ptopic).await.unwrap().unwrap().max_depth,
+            Some(2),
+            "policy roundtrips (replicated on the cluster, KV on single-node)"
+        );
+        // Feature B max_depth fail-closed: two fit (backlog 0,1), the third is rejected at the cap of
+        // 2, and the rejected publish enqueues nothing.
+        mq.publish(ptopic, b"p0").await.unwrap();
+        mq.publish(ptopic, b"p1").await.unwrap();
+        let over = mq.publish(ptopic, b"p2").await.unwrap_err();
+        assert!(
+            matches!(over, MessagingError::DepthExceeded(_)),
+            "publish at max_depth is rejected fail-closed, got {over:?}"
+        );
+        assert_eq!(
+            mq.backlog(ptopic).await.unwrap(),
+            2,
+            "the rejected publish enqueued nothing"
+        );
+        // Drain the policy topic so it leaves no residue.
+        let drained = mq.claim(ptopic, LEASE, 10, 5).await.unwrap();
+        for m in &drained {
+            mq.ack(m).await.unwrap();
+        }
+        assert_eq!(mq.backlog(ptopic).await.unwrap(), 0);
 
         // --- P2 delivery modes: delayed publish (both backends, deterministic deferral) -----------
         // A far-future delay defers delivery; a no-delay companion flows immediately. (Delivery AFTER
