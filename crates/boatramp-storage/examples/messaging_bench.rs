@@ -46,11 +46,19 @@ async fn main() {
     let conc = env_usize("CONC", 256).max(1);
     let chunk = env_usize("CHUNK", 1000).max(1);
     let flush_ms = env_usize("FLUSH_MS", 5) as u64;
+    // MAX_UNFLUSHED=0 (default) = strong durability (Option B — every publish awaits the flush).
+    // N>0 opts into the shipping relaxed path: fast-ack up to N un-durable messages, then a durable
+    // checkpoint (LogMessaging::with_max_unflushed) — the actual code that ships, not a raw prototype.
+    let max_unflushed = env_usize("MAX_UNFLUSHED", 0);
     let payload = vec![b'x'; size];
 
     // A fresh production-shaped store per profile (SlateDB at the node flush interval + FsStorage),
     // so a prior profile's backlog never skews the next.
-    async fn fresh(tag: &str, flush_ms: u64) -> (Arc<LogMessaging>, std::path::PathBuf) {
+    async fn fresh(
+        tag: &str,
+        flush_ms: u64,
+        max_unflushed: usize,
+    ) -> (Arc<LogMessaging>, std::path::PathBuf) {
         let base =
             std::env::temp_dir().join(format!("bramp-msgbench-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
@@ -60,14 +68,15 @@ async fn main() {
                 .await
                 .unwrap();
         let storage = Arc::new(FsStorage::new(base.join("blobs")));
-        (Arc::new(LogMessaging::new(storage, Arc::new(kv))), base)
+        let mq = LogMessaging::new(storage, Arc::new(kv)).with_max_unflushed(max_unflushed);
+        (Arc::new(mq), base)
     }
 
     let rate = |count: usize, elapsed: Duration| count as f64 / elapsed.as_secs_f64();
 
     // ── Profile 1: single publisher, sequential awaited durable publishes (latency floor). ────────
     let seq_n = n.min(5_000); // sequential is the slow floor — a smaller N keeps wall-clock sane.
-    let (mq, base) = fresh("seq", flush_ms).await;
+    let (mq, base) = fresh("seq", flush_ms, max_unflushed).await;
     let mut lat_us: Vec<u128> = Vec::with_capacity(seq_n);
     let t = Instant::now();
     for _ in 0..seq_n {
@@ -83,7 +92,7 @@ async fn main() {
     let (p50, p99) = (pct(0.50), pct(0.99));
 
     // ── Profile 2: CONC concurrent publishers, aggregate throughput (group-commit coalescing). ────
-    let (mq, base) = fresh("conc", flush_ms).await;
+    let (mq, base) = fresh("conc", flush_ms, max_unflushed).await;
     let per = n / conc;
     let t = Instant::now();
     let mut tasks = Vec::with_capacity(conc);
@@ -104,7 +113,7 @@ async fn main() {
     let _ = std::fs::remove_dir_all(&base);
 
     // ── Profile 3: publish_batch of CHUNK messages per durable commit (pipelined path). ───────────
-    let (mq, base) = fresh("batch", flush_ms).await;
+    let (mq, base) = fresh("batch", flush_ms, max_unflushed).await;
     let t = Instant::now();
     let mut sent = 0usize;
     while sent < n {
@@ -119,7 +128,7 @@ async fn main() {
     let _ = std::fs::remove_dir_all(&base);
 
     println!(
-        "boatramp single-node durable publish — SlateDB(flush={flush_ms}ms)+FsStorage, {size}B payload\n"
+        "boatramp single-node durable publish — SlateDB(flush={flush_ms}ms, max_unflushed={max_unflushed})+FsStorage, {size}B payload\n"
     );
     println!(
         "  single  (seq, awaited)   | {:>10.0} msg/s   (p50 {:.3} ms, p99 {:.3} ms, n={})",
