@@ -39,13 +39,27 @@ trades that for JetStream-class latency (below).
   counted, redrivable, and purgeable (they were previously invisible).
 - **Live-queue inspection + per-consumer tuning (P1).** `boatramp queue peek`;
   inspection stats (in-flight, oldest-pending age, per-group lag); per-consumer
-  `lease_ms` / `max_attempts` / `max_batch` / `max_ack_pending`.
+  `lease_ms` / `max_attempts` / `max_batch` / `max_ack_pending`, plus **`backoff_ms`**
+  (a linear per-attempt redelivery backoff — a nacked message is held leased for
+  `backoff_ms × attempts` before it is re-claimable, via a new `nack_after` on the
+  coordinator) and **`retention_ms`** (per-consumer override of how long a grouped
+  topic's retained history is kept before the sweep reclaims it, replacing the fixed
+  default for that consumer's topic).
 - **Flow control, delivery modes, group lifecycle, durable replay (P2).**
   `boatramp queue pause|resume`, `groups`, `group-reset`, `group-delete`, `replay`;
   delivery modes **delayed**, **TTL**, and **priority** publish; consumer-group
   list/reset/delete; non-destructive `replay` of a grouped topic's retained history
   from an offset. New guest producer WIT (`publish-batch`/`publish-delayed`/
   `publish-with-ttl`/`publish-with-priority`) with the shim revved to match.
+- **Per-topic operator flow-control policy (`boatramp queue policy`).** An operator
+  sets, per topic (site or `--bus`), a `--max-depth` (publish is rejected fail-closed
+  once the backlog is at/above the cap — `DepthExceeded`), a `--max-rate`
+  (messages/sec, a best-effort per-node token bucket — `RateExceeded`), and a
+  `--max-unflushed` (a per-topic override of the node's relaxed-durability budget;
+  `0` forces the strong path for that topic; single-node only, inert on a cluster).
+  Stored per topic (replicated through Raft on the cluster, read from applied state
+  per publish so a change is fleet-wide immediately). Every axis is opt-in — an
+  omitted flag leaves that axis uncapped.
 - **Project-bus operator surface + project-admin grade.** The shared **project bus**
   (`{project}/bus/{topic}`, the destination of a `bus:<topic>` publish, common to
   every site in a project) now has its own operator surface, mirroring the per-site
@@ -91,6 +105,14 @@ trades that for JetStream-class latency (below).
 - **Group-commit steady-state coalescing.** Concurrent durable publishes serialized
   at the flush latency because every waiter acquired the commit gate; the leader-only
   gate fixes it on both the single-node and Raft backends (a benchmark caught it).
+- **Inline-payload budget leak on dead-letter purge (C2).** A small work-queue
+  payload that rides inline in the index record (A3/SA1) is charged to the per-node
+  aggregate-inline budget; when it dead-lettered and was then `discard`ed/`purge`d,
+  its bytes were never released, so a flood of small messages that all dead-lettered
+  would permanently pin the budget and force every later publish onto the slower
+  object-store path. `discard_dead_letters`/`purge_dead_letters` now classify each
+  removed dead record and release its inline bytes back to the budget, on both
+  backends.
 
 ## [0.4.23] - 2026-09-19
 
