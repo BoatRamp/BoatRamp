@@ -3261,6 +3261,7 @@ mod tests {
             5,
             10,
             Some(2),
+            0,
         )
         .await;
         assert_eq!(
@@ -3307,6 +3308,7 @@ mod tests {
                 5,
                 10,
                 None,
+                0,
             )
             .await;
             if acked == 0 {
@@ -3341,6 +3343,7 @@ mod tests {
                 2,
                 10,
                 None,
+                0,
             )
             .await;
         }
@@ -3390,6 +3393,7 @@ mod tests {
                 5,
                 10,
                 None,
+                0,
             )
             .await;
             assert_eq!(n, 0, "no events yet for group {g}");
@@ -3417,6 +3421,7 @@ mod tests {
                 5,
                 10,
                 None,
+                0,
             )
             .await;
             assert_eq!(n, 1, "group {g} should receive the message");
@@ -3466,6 +3471,8 @@ mod tests {
                 consumers: vec![ConsumerConfig {
                     tenancy: None,
                     token_claims: None,
+                    backoff_ms: None,
+                    retention_ms: None,
                     topic: "orders/created".into(),
                     component: "consumer.wasm".into(),
                     imports: vec!["wasi:keyvalue".into()],
