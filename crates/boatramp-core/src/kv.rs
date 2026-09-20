@@ -95,6 +95,28 @@ pub trait KvStore: Send + Sync {
         Ok(())
     }
 
+    /// A **durability-relaxed** grouped write: the same atomic group as
+    /// [`write_batch`](Self::write_batch), but the backend MAY acknowledge on an
+    /// in-memory buffer insert **before** the write is durably persisted (the flush
+    /// follows asynchronously). The default impl is **identical to `write_batch`
+    /// (fully durable)** — a backend that cannot (or must not) relax durability
+    /// simply inherits the strong path, so this can never silently weaken a store
+    /// that doesn't opt in. Only [`SlateKv`](../../boatramp_storage/struct.SlateKv.html)
+    /// overrides it (SlateDB `await_durable: false`).
+    ///
+    /// **SAFETY BOUNDARY — bus publish path ONLY.** The ONLY permitted caller is the
+    /// single-node messaging group-commit
+    /// ([`LogMessaging::group_commit`](crate::messaging::LogMessaging)), and only when
+    /// the operator has opted the node into relaxed messaging durability. Every
+    /// control-plane write (deploy/config/domain/auth), every guest `wasi:keyvalue`
+    /// write, and every messaging **ack/claim/dead-letter** transition MUST use the
+    /// durable [`write_batch`](Self::write_batch) — a shared `KvStore` backs all of
+    /// them, so relaxing any of those would be a control-plane / redelivery hazard. A
+    /// CI test enforces the sole-caller rule.
+    async fn write_batch_relaxed(&self, ops: Vec<WriteOp>) -> Result<(), KvError> {
+        self.write_batch(ops).await
+    }
+
     /// Drop any locally-cached entries, so subsequent reads come from the
     /// backing store. The default is a no-op (uncached stores — and the cluster
     /// `RaftKv`, which reads local applied state — see every committed write
@@ -245,6 +267,37 @@ impl CachedKv {
             publisher.publish(&keys).await;
         }
     }
+
+    /// Commit `ops` to the backing store FIRST (its batch is the atomic/durable one — durable via
+    /// `write_batch`, or memtable-acked via `write_batch_relaxed` when `relaxed`), then mirror each
+    /// write into the cache — so a failed commit never leaves the cache ahead of the store. The
+    /// relaxation is purely the inner store's ack timing; the cache ordering is identical.
+    async fn commit_then_mirror(&self, ops: Vec<WriteOp>, relaxed: bool) -> Result<(), KvError> {
+        if relaxed {
+            self.inner.write_batch_relaxed(ops.clone()).await?;
+        } else {
+            self.inner.write_batch(ops.clone()).await?;
+        }
+        let mut changed = Vec::with_capacity(ops.len());
+        {
+            let mut cache = self.cache.lock().unwrap();
+            for op in ops {
+                match op {
+                    WriteOp::Put(key, value) => {
+                        changed.push(key.clone());
+                        cache.put(key, value);
+                    }
+                    WriteOp::Delete(key) => {
+                        cache.pop(&key);
+                        changed.push(key);
+                    }
+                }
+            }
+        }
+        // One announce for the whole batch (the lock is dropped first).
+        self.announce(changed).await;
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -292,29 +345,13 @@ impl KvStore for CachedKv {
     }
 
     async fn write_batch(&self, ops: Vec<WriteOp>) -> Result<(), KvError> {
-        // Commit to the backing store first (its batch is the atomic/durable
-        // one); only then mirror each write into the cache so a failed commit
-        // never leaves the cache ahead of the store.
-        self.inner.write_batch(ops.clone()).await?;
-        let mut changed = Vec::with_capacity(ops.len());
-        {
-            let mut cache = self.cache.lock().unwrap();
-            for op in ops {
-                match op {
-                    WriteOp::Put(key, value) => {
-                        changed.push(key.clone());
-                        cache.put(key, value);
-                    }
-                    WriteOp::Delete(key) => {
-                        cache.pop(&key);
-                        changed.push(key);
-                    }
-                }
-            }
-        }
-        // One announce for the whole batch (the lock is dropped first).
-        self.announce(changed).await;
-        Ok(())
+        self.commit_then_mirror(ops, false).await
+    }
+
+    async fn write_batch_relaxed(&self, ops: Vec<WriteOp>) -> Result<(), KvError> {
+        // Forward the relaxed path to the inner store (only it can weaken durability), preserving the
+        // identical commit-then-mirror ordering so a failed commit never leaves the cache ahead.
+        self.commit_then_mirror(ops, true).await
     }
 
     fn invalidate_cache(&self) {

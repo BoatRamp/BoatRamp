@@ -556,6 +556,10 @@ const GROUP_COMMIT_MAX: usize = 512;
 /// failed group commit fails EVERY member (no partial success on the synchronous path).
 struct PublishJob {
     ops: Vec<WriteOp>,
+    /// How many MESSAGES this job carries (1 for a single publish, N for a `publish_batch`) — the
+    /// unit the relaxed-durability un-flushed budget counts, so the crash-loss window is bounded in
+    /// messages regardless of how many index ops each message needs.
+    msgs: usize,
     done: futures::channel::oneshot::Sender<Result<(), MessagingError>>,
 }
 
@@ -1152,6 +1156,19 @@ pub struct LogMessaging {
     /// The group-commit gate (A2): the single durable-flush turn. Held only across the drain +
     /// `write_batch`, so publishers that pile up during a flush coalesce into the next batch.
     commit_gate: futures::lock::Mutex<()>,
+    /// **Relaxed-publish-durability budget** (operator opt-in): the maximum number of published
+    /// messages that may be acked on the in-memory memtable insert (via
+    /// [`KvStore::write_batch_relaxed`]) BEFORE a durable checkpoint is forced. **`0` (the default) ==
+    /// strong durability** — every publish awaits the durable flush, byte-for-byte the original
+    /// behavior. `N > 0` fast-acks up to N messages, then the next commit is a durable `write_batch`
+    /// that flushes the whole WAL buffer and resets the counter — so at most N acked-but-unflushed
+    /// messages can be lost on a process crash before the next flush. Publish path ONLY (ack/claim/
+    /// dead-letter always durable). Set via [`with_max_unflushed`](Self::with_max_unflushed).
+    max_unflushed: usize,
+    /// Messages committed via the relaxed path since the last durable checkpoint (only ever non-zero
+    /// when `max_unflushed > 0`). The group-commit leader reads+updates it under the commit gate, so
+    /// it needs no stronger ordering than `Relaxed`.
+    unflushed: std::sync::atomic::AtomicUsize,
 }
 
 /// How long a grouped topic retains a message (its log + payload) before the
@@ -1184,7 +1201,21 @@ impl LogMessaging {
             inline_budget_bytes: INLINE_INFLIGHT_MAX_BYTES,
             commit_queue: std::sync::Mutex::new(Vec::new()),
             commit_gate: futures::lock::Mutex::new(()),
+            max_unflushed: 0, // strong durability by default (== the original always-await-flush path)
+            unflushed: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+
+    /// Opt into **relaxed publish durability** with an un-flushed budget of `max` messages (operator
+    /// choice; `0` keeps the strong default). When `max > 0`, publishes ack on the memtable insert up
+    /// to `max` messages, then a durable checkpoint flushes the WAL buffer — bounding the
+    /// process-crash loss window to at most `max` acked-but-unflushed messages. See
+    /// [`max_unflushed`](Self::max_unflushed). A weaker guarantee than the strong default; the caller
+    /// (node config) is responsible for the operator opt-in + the startup warning.
+    #[must_use]
+    pub fn with_max_unflushed(mut self, max: usize) -> Self {
+        self.max_unflushed = max;
+        self
     }
 
     /// Group-commit a publisher's index ops (A2): push the job, take the gate, and — as whoever holds
@@ -1192,13 +1223,14 @@ impl LogMessaging {
     /// A publisher that pushed but was flushed by an earlier gate-holder simply finds its one-shot
     /// already resolved. Returns only after this job's group is durably committed (at-least-once); a
     /// failed group commit fails every member (no partial success). Runtime-agnostic: no spawned task.
-    async fn group_commit(&self, ops: Vec<WriteOp>) -> Result<(), MessagingError> {
+    async fn group_commit(&self, ops: Vec<WriteOp>, msgs: usize) -> Result<(), MessagingError> {
         use futures::future::{select, Either};
         let (done_tx, mut done_rx) = futures::channel::oneshot::channel();
-        self.commit_queue
-            .lock()
-            .unwrap()
-            .push(PublishJob { ops, done: done_tx });
+        self.commit_queue.lock().unwrap().push(PublishJob {
+            ops,
+            msgs,
+            done: done_tx,
+        });
         // Become the LEADER only if the commit gate is free; otherwise our just-pushed job is
         // committed by the current leader's drain loop (which re-checks the queue until empty), so a
         // waiter does NOT serialize through the gate — it simply awaits its durable ack. THIS is what
@@ -1241,15 +1273,13 @@ impl LogMessaging {
                 };
                 let mut all_ops = Vec::new();
                 let mut dones = Vec::with_capacity(batch.len());
+                let mut msgs = 0usize;
                 for mut job in batch {
                     all_ops.append(&mut job.ops);
+                    msgs += job.msgs;
                     dones.push(job.done);
                 }
-                let outcome = self
-                    .kv
-                    .write_batch(all_ops)
-                    .await
-                    .map_err(MessagingError::backend);
+                let outcome = self.commit_group(all_ops, msgs).await;
                 for done in dones {
                     // A dropped receiver (cancelled publisher) is harmless — the message is still
                     // durably committed; at-least-once/redelivery is unaffected.
@@ -1262,6 +1292,38 @@ impl LogMessaging {
         done_rx
             .await
             .map_err(|_| MessagingError::backend("group-commit dropped before durable"))?
+    }
+
+    /// Durably commit one drained group of `msgs` messages, honoring the relaxed-durability budget.
+    ///
+    /// With `max_unflushed == 0` (the default) the `prior + msgs <= 0` guard is never true for a
+    /// non-empty group, so this ALWAYS takes the durable `write_batch` branch — byte-for-byte the
+    /// strong path. With `max_unflushed > 0` it fast-acks via `write_batch_relaxed` while the running
+    /// un-flushed count stays within budget, and forces a durable `write_batch` checkpoint the moment
+    /// admitting this group would exceed it. A durable `write_batch` flushes SlateDB's whole WAL
+    /// buffer (every prior relaxed write with it), so the checkpoint truly drains the un-durable set —
+    /// hence the counter resets to 0. The counter is only touched on the success path (a failed commit
+    /// leaves it unchanged; the caller fails the whole group).
+    async fn commit_group(&self, ops: Vec<WriteOp>, msgs: usize) -> Result<(), MessagingError> {
+        use std::sync::atomic::Ordering;
+        let prior = self.unflushed.load(Ordering::Relaxed);
+        if prior + msgs <= self.max_unflushed {
+            // Under budget (only reachable when max_unflushed > 0): fast-ack on the memtable insert.
+            self.kv
+                .write_batch_relaxed(ops)
+                .await
+                .map_err(MessagingError::backend)?;
+            self.unflushed.fetch_add(msgs, Ordering::Relaxed);
+        } else {
+            // Durable checkpoint (and the ONLY branch when max_unflushed == 0): await the WAL flush,
+            // which persists every buffered relaxed write too — so the un-durable set is now empty.
+            self.kv
+                .write_batch(ops)
+                .await
+                .map_err(MessagingError::backend)?;
+            self.unflushed.store(0, Ordering::Relaxed);
+        }
+        Ok(())
     }
 
     /// Set the aggregate-inline byte budget (SA1) — the total inline-payload bytes this node keeps
@@ -1709,7 +1771,7 @@ impl Messaging for LogMessaging {
         // `write_batch`. Returns only after this message's group is durably committed
         // (at-least-once); a failed group fails this publish too. Payloads (object store) were
         // already written by `build_publish_ops` (payload-first), so only the index writes are here.
-        self.group_commit(ops).await?;
+        self.group_commit(ops, 1).await?;
         // Notify live SSE subscribers (best-effort, separate from the durable queue above).
         self.hubs.broadcast(topic, &id, payload);
         Ok(())
@@ -1732,7 +1794,7 @@ impl Messaging for LogMessaging {
         let (id, ops) = self
             .build_publish_ops(topic, payload, signed_context, not_before_ms, 0, 0)
             .await?;
-        self.group_commit(ops).await?;
+        self.group_commit(ops, 1).await?;
         // A delayed message isn't live yet; still notify SSE (best-effort) so a live tail sees it.
         self.hubs.broadcast(topic, &id, payload);
         Ok(())
@@ -1755,7 +1817,7 @@ impl Messaging for LogMessaging {
         let (id, ops) = self
             .build_publish_ops(topic, payload, signed_context, 0, expires_at_ms, 0)
             .await?;
-        self.group_commit(ops).await?;
+        self.group_commit(ops, 1).await?;
         self.hubs.broadcast(topic, &id, payload);
         Ok(())
     }
@@ -1771,7 +1833,7 @@ impl Messaging for LogMessaging {
         let (id, ops) = self
             .build_publish_ops(topic, payload, signed_context, 0, 0, priority)
             .await?;
-        self.group_commit(ops).await?;
+        self.group_commit(ops, 1).await?;
         self.hubs.broadcast(topic, &id, payload);
         Ok(())
     }
@@ -1798,7 +1860,7 @@ impl Messaging for LogMessaging {
             all_ops.extend(ops);
             broadcasts.push((topic.as_str(), id, payload.as_slice()));
         }
-        self.group_commit(all_ops).await?;
+        self.group_commit(all_ops, messages.len()).await?;
         for (topic, id, payload) in &broadcasts {
             self.hubs.broadcast(topic, id, payload);
         }
@@ -2886,6 +2948,7 @@ mod tests {
     struct CountingKv {
         inner: MemoryKv,
         batches: std::sync::atomic::AtomicUsize,
+        relaxed: std::sync::atomic::AtomicUsize,
     }
     #[async_trait]
     impl KvStore for CountingKv {
@@ -2906,6 +2969,16 @@ mod tests {
             ops: Vec<crate::kv::WriteOp>,
         ) -> Result<(), crate::kv::KvError> {
             self.batches
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.write_batch(ops).await
+        }
+        async fn write_batch_relaxed(
+            &self,
+            ops: Vec<crate::kv::WriteOp>,
+        ) -> Result<(), crate::kv::KvError> {
+            // Count relaxed vs durable separately so a test can assert the checkpoint cadence. The
+            // inner MemoryKv is always durable, so correctness (all messages present) is preserved.
+            self.relaxed
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.inner.write_batch(ops).await
         }
@@ -3710,6 +3783,7 @@ mod tests {
         let kv = Arc::new(CountingKv {
             inner: MemoryKv::new(),
             batches: std::sync::atomic::AtomicUsize::new(0),
+            relaxed: std::sync::atomic::AtomicUsize::new(0),
         });
         let mq = LogMessaging::new(Arc::new(MemStorage::default()), kv.clone());
         // Five messages across two topics in one batch.
@@ -3777,6 +3851,7 @@ mod tests {
         let kv = Arc::new(CountingKv {
             inner: MemoryKv::new(),
             batches: std::sync::atomic::AtomicUsize::new(0),
+            relaxed: std::sync::atomic::AtomicUsize::new(0),
         });
         let mq = LogMessaging::new(Arc::new(MemStorage::default()), kv.clone());
         // GROUP_COMMIT_MAX + 100 messages = one PublishJob whose op count exceeds the per-turn budget.
@@ -3919,6 +3994,86 @@ mod tests {
             seen += b.len();
         }
         assert_eq!(seen, K + 1, "leader + all K waiters were durably committed");
+    }
+
+    /// The DEFAULT (`max_unflushed = 0`) is byte-for-byte Option B (strong durability): every publish
+    /// goes through the durable `write_batch`, the relaxed path is NEVER taken. Guards the owner's
+    /// requirement that relaxed-with-budget-0 == strong.
+    #[tokio::test]
+    async fn max_unflushed_zero_is_strong_durability() {
+        use std::sync::atomic::Ordering as O;
+        let kv = Arc::new(CountingKv {
+            inner: MemoryKv::new(),
+            batches: std::sync::atomic::AtomicUsize::new(0),
+            relaxed: std::sync::atomic::AtomicUsize::new(0),
+        });
+        // Default construction — no with_max_unflushed → max_unflushed == 0.
+        let mq = LogMessaging::new(Arc::new(MemStorage::default()), kv.clone());
+        for i in 0..20u32 {
+            mq.publish("t", format!("m{i}").as_bytes()).await.unwrap();
+        }
+        assert_eq!(
+            kv.relaxed.load(O::Relaxed),
+            0,
+            "strong default NEVER acks on the relaxed (memtable) path"
+        );
+        assert_eq!(
+            kv.batches.load(O::Relaxed),
+            20,
+            "every publish took the durable write_batch (== Option B)"
+        );
+    }
+
+    /// With `max_unflushed = N > 0`, sequential publishes fast-ack on the relaxed path and force a
+    /// durable checkpoint every N messages — so the un-durable (crash-loss) window is bounded to ≤ N,
+    /// and every message is still durably present. Guards the checkpoint cadence + the bound.
+    #[tokio::test]
+    async fn relaxed_durability_checkpoints_every_n_messages() {
+        use std::sync::atomic::Ordering as O;
+        let kv = Arc::new(CountingKv {
+            inner: MemoryKv::new(),
+            batches: std::sync::atomic::AtomicUsize::new(0),
+            relaxed: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let mq =
+            LogMessaging::new(Arc::new(MemStorage::default()), kv.clone()).with_max_unflushed(4);
+        // 12 sequential single publishes. Each commits 1 message. Cadence: 4 relaxed acks fill the
+        // budget, the 5th would exceed it → durable checkpoint (resets), repeat. So of every 5
+        // commits, 4 are relaxed + 1 durable; 12 messages → relaxed at counts 1,2,3,4, 6,7,8,9,
+        // 11,12 (10) and durable checkpoints at 5,10 plus the trailing 2 never hit a checkpoint...
+        for i in 0..12u32 {
+            mq.publish("t", format!("m{i}").as_bytes()).await.unwrap();
+        }
+        let relaxed = kv.relaxed.load(O::Relaxed);
+        let durable = kv.batches.load(O::Relaxed);
+        assert_eq!(
+            relaxed + durable,
+            12,
+            "every message was committed exactly once"
+        );
+        // A durable checkpoint fired at least floor(12/ (4+1)) times → un-flushed never exceeded 4.
+        assert!(
+            durable >= 2,
+            "durable checkpoints bounded the un-flushed window (got {durable} durable, {relaxed} relaxed)"
+        );
+        assert!(
+            relaxed >= 8,
+            "most publishes fast-acked on the relaxed path (got {relaxed} relaxed, {durable} durable)"
+        );
+        // All 12 are durably claimable (nothing lost — MemoryKv is durable, so this checks the queue
+        // index is intact regardless of ack path).
+        let mut seen = 0;
+        loop {
+            let b = mq.claim("t", LEASE, 100, 5).await.unwrap();
+            if b.is_empty() {
+                break;
+            }
+            seen += b.len();
+        }
+        assert_eq!(
+            seen, 12,
+            "every relaxed-and-checkpointed publish is claimable"
+        );
     }
 
     // A3 × DLQ: an inlined message that dead-letters keeps its payload in the record, so redrive
