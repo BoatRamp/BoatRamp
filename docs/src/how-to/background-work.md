@@ -165,3 +165,54 @@ A growing `lag` means consumers are falling behind the incoming rate; a nonzero
 dead-letter count is messages waiting for you to redrive or purge. For tailing
 guest output and the full metric surface, see
 [Observe a running server](./observe.md).
+
+## Publish durability: strong by default
+
+`publish()` returns only after the message is **crash-durable** — written and
+flushed to the durable store (its WAL persisted to object storage), so an
+acknowledged publish survives a process crash *and* a power loss. This is a
+**stronger** guarantee than NATS JetStream's default synchronous publish, which
+acknowledges once the message is in the server's memory with the fsync deferred.
+That safety costs latency: a single sequential publisher pays roughly one flush
+interval per message. Concurrent publishers amortize it — the per-node
+group-commit coalesces everything landing in one flush window into a single
+durable write — and `publish_batch` commits a whole batch in one flush, so the
+throughput you care about for a fan-out fabric stays high while every ack means
+*persisted*. **Reach for a weaker mode only if single-publisher latency is your
+bottleneck after batching.**
+
+### Opt into fast-ack (`messaging_max_unflushed_msgs`)
+
+If a workload needs JetStream-like publish latency and can tolerate a bounded
+loss window, an operator can set, in the node's `[handlers]` config:
+
+```toml
+[handlers]
+messaging_max_unflushed_msgs = 256   # 0 (default) = strong durability
+```
+
+With `N > 0`, `publish()` acknowledges on the in-memory buffer insert (≈tens of
+µs) and a durable checkpoint is forced every `N` messages. The trade is explicit:
+
+- **What you gain:** single-publisher publish drops from ≈one flush interval to
+  ≈tens of µs; aggregate throughput rises accordingly.
+- **What you give up:** up to `N` acknowledged-but-unflushed messages are **lost
+  on a process crash, OOM, `SIGKILL`, or power loss** before the next flush. The
+  loss window is bounded to `N` messages — pick `N` against your tolerance.
+- **Honest positioning:** this is *weaker* than the strong default, and — because
+  boatramp's buffer is in process memory — also **weaker than JetStream's
+  default** (whose page-cache ack survives a *process* crash; boatramp's does
+  not). It is faster than both. It is **not** "JetStream parity."
+
+Scope and safety:
+
+- **Bus publish only.** Consumer at-least-once is unchanged: a message that *was*
+  flushed still redelivers on lease expiry, and ack/claim/dead-letter transitions
+  are always fully durable. The only new failure is a just-published,
+  not-yet-flushed message vanishing on a crash.
+- **Control plane is never affected.** Deploy/config/domain/auth state and guest
+  `wasi:keyvalue` writes stay fully durable regardless of this knob, even though
+  they share the same store.
+- **Operator-only, single-node.** It lives in daemon config (a site can't set
+  it); a node with `N > 0` logs a warning at startup. In a cluster, publish
+  durability is replication and this knob has no effect.
