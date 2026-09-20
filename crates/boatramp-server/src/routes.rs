@@ -359,6 +359,42 @@ pub fn router_with_fast(
             "/api/sites/{site}/_boatramp/queue/pause",
             post(operator_queue_pause),
         )
+        // Project-BUS operator surface: the same DLQ/queue ops as the per-site surface
+        // above, but for the SHARED project bus (`{project}/bus/{topic}`, the keyspace a
+        // `bus:<topic>` publish routes to across every site in the project) rather than a
+        // single site's queues. Registered under the literal `/api/projects/{project}/…`
+        // form — `_boatramp` is deliberately NOT a `PROJECT_SCOPED_FAMILIES` member, so the
+        // `project_scope` layer tags the request with its `ProjectContext` but does NOT
+        // rewrite the path; these handlers read that context to namespace the bus. Authz
+        // grades GET at `Project·Read` and the destructive POSTs at `Project·Admin` (see
+        // `authz::Right::required`'s `_boatramp` arm) — stronger than the site surface's
+        // `Site·Write`, because the bus is a project-wide shared resource. The `{project}`
+        // path segment is the tenant boundary: a token scoped to project P reaches only P's
+        // bus.
+        .route(
+            "/api/projects/{project}/_boatramp/bus/dlq",
+            get(operator_bus_dlq_list).post(operator_bus_dlq),
+        )
+        .route(
+            "/api/projects/{project}/_boatramp/bus/queue/peek",
+            get(operator_bus_queue_peek),
+        )
+        .route(
+            "/api/projects/{project}/_boatramp/bus/queue/replay",
+            get(operator_bus_queue_replay),
+        )
+        .route(
+            "/api/projects/{project}/_boatramp/bus/queue/groups",
+            get(operator_bus_queue_groups),
+        )
+        .route(
+            "/api/projects/{project}/_boatramp/bus/queue/group",
+            post(operator_bus_queue_group),
+        )
+        .route(
+            "/api/projects/{project}/_boatramp/bus/queue/pause",
+            post(operator_bus_queue_pause),
+        )
         // Captured guest logs for a function — symmetric to the per-site logs endpoint,
         // reading the same store under the function's project-qualified scope. Project-
         // owned read (the `/api/functions/*` authz mapping), so a project token reaches

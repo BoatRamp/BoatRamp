@@ -10,7 +10,7 @@
 
 use clap::Subcommand;
 
-use crate::client::{self, GroupEntry, QueuePeekEntry};
+use crate::client::{self, GroupEntry, OpScope, QueuePeekEntry};
 use crate::config::ProjectConfig;
 
 /// A failure in the `queue` subcommand.
@@ -19,6 +19,9 @@ pub enum Error {
     /// Resolving the target or talking to the control plane failed.
     #[error(transparent)]
     Client(#[from] crate::client::ClientError),
+    /// `--alias` was combined with `--bus` (the shared project bus is not per-deployment).
+    #[error("--alias cannot be combined with --bus: the shared project bus has no background-alias scope")]
+    AliasWithBus,
 }
 
 /// `queue` module result; `Err` is [`Error`].
@@ -33,9 +36,28 @@ pub struct QueueArgs {
     /// Site whose queues to inspect (overrides [deploy].site).
     #[arg(long, global = true)]
     site: Option<String>,
+    /// Target the SHARED PROJECT BUS (`{project}/bus/{topic}`, the destination of a
+    /// `bus:<topic>` publish, common to every site in the project) instead of a single
+    /// site's queues. Authorized project-wide: reads need `Project·Read`, the destructive
+    /// ops (group reset/delete, pause) need `Project·Admin`. Incompatible with `--alias`.
+    #[arg(long, global = true)]
+    bus: bool,
 
     #[command(subcommand)]
     command: QueueCommand,
+}
+
+/// Build the [`OpScope`] a `queue` op targets: the shared project bus under `--bus`
+/// (rejecting a nonsensical `--alias`), else the site (with any background-alias).
+fn queue_scope<'a>(bus: bool, site: &'a str, alias: Option<&'a str>) -> Result<OpScope<'a>> {
+    if bus {
+        if alias.is_some() {
+            return Err(Error::AliasWithBus);
+        }
+        Ok(OpScope::Bus)
+    } else {
+        Ok(OpScope::site_alias(site, alias))
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -132,9 +154,8 @@ pub async fn run(args: QueueArgs, config: &ProjectConfig) -> Result<()> {
             alias,
             limit,
         } => {
-            let msgs = cp
-                .peek_queue(&site, topic, alias.as_deref(), *limit)
-                .await?;
+            let scope = queue_scope(args.bus, &site, alias.as_deref())?;
+            let msgs = cp.peek_queue(scope, topic, *limit).await?;
             print_peek(topic, &msgs);
         }
         QueueCommand::Replay {
@@ -143,13 +164,15 @@ pub async fn run(args: QueueArgs, config: &ProjectConfig) -> Result<()> {
             limit,
             alias,
         } => {
+            let scope = queue_scope(args.bus, &site, alias.as_deref())?;
             let (msgs, next_after) = cp
-                .replay_queue(&site, topic, alias.as_deref(), after.as_deref(), *limit)
+                .replay_queue(scope, topic, after.as_deref(), *limit)
                 .await?;
             print_replay(topic, &msgs, next_after.as_deref());
         }
         QueueCommand::Groups { topic, alias } => {
-            let groups = cp.list_groups(&site, topic, alias.as_deref()).await?;
+            let scope = queue_scope(args.bus, &site, alias.as_deref())?;
+            let groups = cp.list_groups(scope, topic).await?;
             print_groups(topic, &groups);
         }
         QueueCommand::GroupReset {
@@ -159,9 +182,10 @@ pub async fn run(args: QueueArgs, config: &ProjectConfig) -> Result<()> {
             earliest: _,
             alias,
         } => {
+            let scope = queue_scope(args.bus, &site, alias.as_deref())?;
             // Default is earliest (re-consume); --latest skips to the head.
             let start = if *latest { "latest" } else { "earliest" };
-            cp.group_op(&site, topic, alias.as_deref(), group, "reset", Some(start))
+            cp.group_op(scope, topic, group, "reset", Some(start))
                 .await?;
             println!("reset group {group:?} on topic {topic:?} to {start}");
         }
@@ -170,17 +194,18 @@ pub async fn run(args: QueueArgs, config: &ProjectConfig) -> Result<()> {
             group,
             alias,
         } => {
-            cp.group_op(&site, topic, alias.as_deref(), group, "delete", None)
-                .await?;
+            let scope = queue_scope(args.bus, &site, alias.as_deref())?;
+            cp.group_op(scope, topic, group, "delete", None).await?;
             println!("deleted group {group:?} on topic {topic:?}");
         }
         QueueCommand::Pause { topic, alias } => {
-            cp.pause_queue(&site, topic, alias.as_deref(), true).await?;
+            let scope = queue_scope(args.bus, &site, alias.as_deref())?;
+            cp.pause_queue(scope, topic, true).await?;
             println!("paused topic {topic:?} (delivery suppressed; publish still flows)");
         }
         QueueCommand::Resume { topic, alias } => {
-            cp.pause_queue(&site, topic, alias.as_deref(), false)
-                .await?;
+            let scope = queue_scope(args.bus, &site, alias.as_deref())?;
+            cp.pause_queue(scope, topic, false).await?;
             println!("resumed topic {topic:?}");
         }
     }

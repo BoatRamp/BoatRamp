@@ -299,6 +299,25 @@ impl Right {
                     Some(proj.to_string()),
                     if get { Action::Read } else { Action::Admin },
                 ),
+                // The project-bus operator surface (`/api/projects/<proj>/_boatramp/bus/…`):
+                // dead-letter + work-queue inspection/management for the **shared project
+                // bus** (the `{project}/bus/{topic}` keyspace a `bus:<topic>` publish routes
+                // to, common to every site in the project). Because the bus is a
+                // project-wide shared resource — one operator managing it affects every
+                // site — the destructive ops are gated ABOVE the deploy-grade publisher
+                // right: read (`ls`/`show`/`peek`/`replay`/`groups`) with `Project·Read`,
+                // but the destructive POSTs (`dlq` purge/redrive/discard, `queue/group`
+                // reset/delete, `queue/pause`) with **`Project·Admin`** — stronger than the
+                // per-SITE `Site·Write` the site bus surface uses, and never satisfied by a
+                // `project_publisher`. The `proj` segment is the tenant boundary (parsed via
+                // the shared `project_api_path`), so a token scoped to project P can reach
+                // ONLY P's bus. Gated explicitly, above the general project-owned catch-all,
+                // so a publisher cannot redrive/purge the shared bus.
+                Some((&"_boatramp", _)) => Self::new(
+                    Resource::Project,
+                    Some(proj.to_string()),
+                    if get { Action::Read } else { Action::Admin },
+                ),
                 // Project-owned resources (functions/compute/workflows/config/…):
                 // read with `Project·Read`, mutate with `Project·Deploy`.
                 Some(_) => Self::new(
@@ -1441,6 +1460,88 @@ mod tests {
                 Action::Read
             ))
         );
+    }
+
+    #[test]
+    fn project_bus_operator_surface_is_project_scoped_and_admin_gated() {
+        // The project-bus operator surface (`/api/projects/<proj>/_boatramp/bus/…`)
+        // manages the SHARED project bus (`{project}/bus/{topic}`), so:
+        //   - reads (`ls`/`show`/`peek`/`replay`/`groups`) grade as `Project·Read`;
+        //   - destructive writes (dlq purge/redrive/discard, queue group reset/delete,
+        //     pause) grade as `Project·Admin` — stronger than the per-site `Site·Write`
+        //     the site bus surface uses — because one operator's redrive/purge affects
+        //     every site in the project.
+        let read = |proj: &str| Right::new(Resource::Project, Some(proj.to_string()), Action::Read);
+        let admin =
+            |proj: &str| Right::new(Resource::Project, Some(proj.to_string()), Action::Admin);
+        let reads = [
+            ("GET", "/api/projects/acme/_boatramp/bus/dlq"),
+            ("GET", "/api/projects/acme/_boatramp/bus/queue/peek"),
+            ("GET", "/api/projects/acme/_boatramp/bus/queue/replay"),
+            ("GET", "/api/projects/acme/_boatramp/bus/queue/groups"),
+        ];
+        for (method, path) in reads {
+            assert_eq!(
+                Right::required(method, path),
+                Some(read("acme")),
+                "{method} {path} must be Project·Read"
+            );
+        }
+        let writes = [
+            ("POST", "/api/projects/acme/_boatramp/bus/dlq"),
+            ("POST", "/api/projects/acme/_boatramp/bus/queue/group"),
+            ("POST", "/api/projects/acme/_boatramp/bus/queue/pause"),
+        ];
+        for (method, path) in writes {
+            assert_eq!(
+                Right::required(method, path),
+                Some(admin("acme")),
+                "{method} {path} must be Project·Admin"
+            );
+        }
+
+        // The destructive project-bus POST needs `Project·Admin`: a `project_admin`
+        // token on the SAME project satisfies it; a `project_publisher` (deploy-grade)
+        // and `project_viewer` do NOT — they can ship code / read, but must never be
+        // able to redrive/purge the shared bus.
+        let policy = AuthzPolicy::default_policy();
+        let purge = Right::required("POST", "/api/projects/acme/_boatramp/bus/dlq")
+            .expect("route is gated");
+        assert!(
+            policy
+                .rights_for(&[GrantedRole::scoped("project_admin", "acme")])
+                .allows(&purge),
+            "project_admin:acme must be able to purge its own project bus"
+        );
+        for role in ["project_publisher", "project_viewer"] {
+            assert!(
+                !policy
+                    .rights_for(&[GrantedRole::scoped(role, "acme")])
+                    .allows(&purge),
+                "{role}:acme must NOT be able to purge the shared project bus"
+            );
+        }
+
+        // Cross-project isolation (the security-critical property): a token scoped to a
+        // DIFFERENT project — even a `project_admin` on it — must be refused on acme's
+        // bus, for both the read and the destructive-write grades. The `proj` path
+        // segment is the tenant boundary.
+        let peek = Right::required("GET", "/api/projects/acme/_boatramp/bus/queue/peek")
+            .expect("route is gated");
+        for role in ["project_admin", "project_publisher", "project_viewer"] {
+            let other = policy.rights_for(&[GrantedRole::scoped(role, "globex")]);
+            assert!(
+                !other.allows(&purge),
+                "{role}:globex must be refused on acme's project bus (write)"
+            );
+            assert!(
+                !other.allows(&peek),
+                "{role}:globex must be refused on acme's project bus (read)"
+            );
+        }
+        // A node admin (global) satisfies both, as for every project resource.
+        let node_admin = policy.rights_for(&[GrantedRole::global("admin")]);
+        assert!(node_admin.allows(&purge) && node_admin.allows(&peek));
     }
 
     #[test]

@@ -254,6 +254,9 @@ Present with the `handlers` feature.
 | `GET` | `/api/sites/:site/_boatramp/logs` | Captured per-site guest logs. |
 | `GET` | `/api/sites/:site/_boatramp/logs/stream` | Stream per-site logs (SSE). |
 | `POST` | `/api/sites/:site/_boatramp/dlq` | Dead-letter-queue operations. |
+| `GET`/`POST` | `/api/projects/:project/_boatramp/bus/dlq` | Shared **project-bus** DLQ: inspect (`Project·Read`) / purge·redrive·discard (`Project·Admin`). Since 0.4.24. |
+| `GET` | `/api/projects/:project/_boatramp/bus/queue/{peek,replay,groups}` | Project-bus live-queue inspection (`Project·Read`). Since 0.4.24. |
+| `POST` | `/api/projects/:project/_boatramp/bus/queue/{group,pause}` | Project-bus group reset·delete / pause·resume (`Project·Admin`). Since 0.4.24. |
 | `GET` | `/api/functions/:name/_boatramp/logs` | Captured per-function guest logs (project-owned read). Since 0.3.17. |
 | `GET` | `/api/functions/:name/_boatramp/logs/stream` | Stream per-function logs (SSE). Since 0.3.17. |
 
