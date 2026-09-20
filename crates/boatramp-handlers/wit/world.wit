@@ -346,6 +346,13 @@ interface messaging-types {
     data: list<u8>,
   }
 
+  /// One message to publish in a batch: a (guest-relative) topic + its payload.
+  /// Structurally a `message`, named apart for the producing direction.
+  record outgoing {
+    topic: string,
+    data: list<u8>,
+  }
+
   /// Why a messaging operation failed.
   variant error {
     /// The capability was not granted to this handler.
@@ -358,10 +365,33 @@ interface messaging-types {
 /// The producer half: publish a message to a topic. Imported by request
 /// handlers and consumers alike (whatever the site grants `wasi:messaging`).
 interface messaging-producer {
-  use messaging-types.{error};
+  use messaging-types.{error, outgoing};
 
   /// Publish `data` to `topic` (host-namespaced). Returns once durably enqueued.
   publish: func(topic: string, data: list<u8>) -> result<_, error>;
+
+  /// Publish many messages in ONE host call — the pipelined-publish primitive.
+  /// The whole batch is committed in a single durable write (one fsync / one
+  /// replicated entry) and returns only once every message is durably enqueued;
+  /// on failure NONE are enqueued (all-or-nothing). Entries may target different
+  /// topics (each host-namespaced independently). Bounded: a batch larger than
+  /// the host's limit is rejected whole with `other`. Prefer this over a loop of
+  /// `publish` when emitting a burst — it is how a guest reaches high throughput.
+  publish-batch: func(messages: list<outgoing>) -> result<_, error>;
+
+  /// Publish `data` to `topic` with a visibility DELAY: durably enqueued now, but
+  /// not deliverable to a consumer until `delay-ms` elapses (scheduled/delayed
+  /// work; delayed retries). `delay-ms == 0` is identical to `publish`.
+  publish-delayed: func(topic: string, data: list<u8>, delay-ms: u64) -> result<_, error>;
+
+  /// Publish `data` to `topic` with a TTL: if not consumed within `ttl-ms`, the
+  /// message is dead-lettered (reason `ttl-expired`) instead of delivered — for
+  /// time-sensitive work that is worthless if stale. `ttl-ms == 0` = no expiry.
+  publish-with-ttl: func(topic: string, data: list<u8>, ttl-ms: u64) -> result<_, error>;
+
+  /// Publish `data` to `topic` with a delivery PRIORITY: higher `priority` is
+  /// delivered before lower, FIFO within a priority. `priority == 0` = normal.
+  publish-with-priority: func(topic: string, data: list<u8>, priority: u8) -> result<_, error>;
 }
 
 /// The consumer half: the host calls `handle` once per delivered message. A

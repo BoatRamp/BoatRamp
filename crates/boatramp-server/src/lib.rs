@@ -161,8 +161,12 @@ mod operator;
 pub(crate) use operator::prometheus_metrics;
 #[cfg(feature = "handlers")]
 pub(crate) use operator::{
-    operator_dlq, operator_function_logs, operator_function_logs_stream, operator_handler_stats,
-    operator_logs, operator_logs_stream,
+    operator_bus_dlq, operator_bus_dlq_list, operator_bus_queue_group, operator_bus_queue_groups,
+    operator_bus_queue_pause, operator_bus_queue_peek, operator_bus_queue_policy,
+    operator_bus_queue_replay, operator_dlq, operator_dlq_list, operator_function_logs,
+    operator_function_logs_stream, operator_handler_stats, operator_logs, operator_logs_stream,
+    operator_queue_group, operator_queue_groups, operator_queue_pause, operator_queue_peek,
+    operator_queue_policy, operator_queue_replay,
 };
 mod proxy;
 pub use proxy::spawn_compute_reconcile;
@@ -860,6 +864,7 @@ impl HandlerRuntime {
         deploy: &DeployStore,
         manifest: &Manifest,
         site_config: Option<&SiteConfig>,
+        project: &str,
     ) -> Result<(), String> {
         let Some(inner) = self.inner.as_ref() else {
             return Ok(());
@@ -906,8 +911,97 @@ impl HandlerRuntime {
             }
         }
 
+        // The operator posture governing `all` (key 3) — used only to WARN (never refuse) when an
+        // authorized ceiling-exceeding route to `all` would be clamped to `own` at runtime.
+        let allow_cross_tenant = inner.project_tenancy_knobs(project).allow_cross_tenant_db;
+
         // Same import/size/compile gate for every handler and consumer component.
         for handler in &manifest.config.handlers {
+            // #470 tenancy-ceiling precheck (BEFORE activation): a per-route `tenancy` may narrow
+            // within the site ceiling, and may EXCEED it only under the authorized three-key model.
+            // Catch a violation here with a speaking, key-aware error instead of the opaque runtime
+            // bind refusal (which stays as the fail-closed backstop). Covers BOTH runtime enforcement
+            // sites — the `/graphql` gateway route is itself a `HandlerConfig` in this list.
+            if let (Some(route_tenancy), Some(ceiling)) =
+                (handler.tenancy.as_ref(), site_handlers.tenancy.as_ref())
+            {
+                use boatramp_core::tenancy::{AccessMode, Tenancy};
+                let route = &handler.route;
+                let methods = handler.methods.join(",");
+                if !route_tenancy
+                    .narrows_within_authorized(ceiling, site_handlers.allow_ceiling_exceptions)
+                {
+                    // Distinguish the failing key(s) so the deployer knows exactly what to turn.
+                    let has_token = matches!(
+                        route_tenancy,
+                        Tenancy::Scoped {
+                            exceed_site_ceiling: true,
+                            ..
+                        }
+                    );
+                    let fix = if has_token && !site_handlers.allow_ceiling_exceptions {
+                        format!(
+                            "route {route:?} [{methods}] carries `exceed_site_ceiling: true` but \
+                             this site does not permit ceiling exceptions — set \
+                             `allow_ceiling_exceptions = true` on the site to authorize it, or \
+                             narrow the route's tenancy"
+                        )
+                    } else if has_token {
+                        format!(
+                            "route {route:?} [{methods}] declares `exceed_site_ceiling` but its \
+                             tenancy is not a scoped read/write widening on the site ceiling's \
+                             tenant column — the exception can only widen read/write (up to `all`) \
+                             on the SAME column, never change the column or switch the own/target \
+                             axis. Align the route with the site ceiling"
+                        )
+                    } else if site_handlers.allow_ceiling_exceptions {
+                        format!(
+                            "route {route:?} [{methods}] declares a tenancy that widens the site \
+                             ceiling. This site permits ceiling exceptions — add \
+                             `exceed_site_ceiling: true` to this route to authorize it, or narrow \
+                             the route's tenancy"
+                        )
+                    } else {
+                        format!(
+                            "route {route:?} [{methods}] declares a tenancy that widens the site \
+                             ceiling (a per-route tenancy may narrow within the site's `tenancy`, \
+                             never widen it). To widen deliberately, set `exceed_site_ceiling: \
+                             true` on the route AND `allow_ceiling_exceptions = true` on the site; \
+                             otherwise narrow the route"
+                        )
+                    };
+                    return Err(format!(
+                        "tenancy: {fix}. (An `all` grant additionally requires the operator posture \
+                         `allow_cross_tenant_db` to permit cross-tenant, else it is clamped to \
+                         `own` at runtime.)"
+                    ));
+                } else if !route_tenancy.narrows_within(ceiling) {
+                    // Reached the `else` only via the authorized exception (plain `narrows_within`
+                    // failed) — a genuine, deliberate widening. If it reaches `all` but the operator
+                    // posture is off, it will clamp to `own` at runtime; surface that now (#9) so the
+                    // deployer sees the effective tenancy rather than a silent demotion.
+                    let wants_all = matches!(
+                        route_tenancy,
+                        Tenancy::Scoped {
+                            read: AccessMode::All,
+                            ..
+                        }
+                    ) || matches!(
+                        route_tenancy,
+                        Tenancy::Scoped {
+                            write: AccessMode::All,
+                            ..
+                        }
+                    );
+                    if wants_all && !allow_cross_tenant {
+                        tracing::warn!(
+                            "route {route:?} [{methods}] is authorized to exceed the site ceiling to \
+                             `all`, but the operator posture `allow_cross_tenant_db` is off — it will \
+                             run as `own` at runtime until the posture permits cross-tenant"
+                        );
+                    }
+                }
+            }
             if let Some(ms) = handler.limits.as_ref().and_then(|l| l.timeout_ms) {
                 if u64::from(ms) > sync_ceiling {
                     let route = &handler.route;
@@ -1000,6 +1094,7 @@ impl HandlerRuntime {
         _deploy: &DeployStore,
         _manifest: &Manifest,
         _site_config: Option<&SiteConfig>,
+        _project: &str,
     ) -> Result<(), String> {
         Ok(())
     }
@@ -3135,6 +3230,49 @@ mod tests {
         assert!(compute_endpoints(&deploy, "beta", "web").await.is_empty());
     }
 
+    /// P2 flow control: `max_ack_pending` caps the claim window (across the per-tick `max_batch`),
+    /// so a consumer never holds more than N leased-but-unacked at once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn max_ack_pending_caps_the_claim_window() {
+        use boatramp_handlers::{Bindings, HandlerEngine, Limits};
+        let storage = Arc::new(MemStorage::default());
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let mq = LogMessaging::new(storage, kv.clone());
+        let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
+        let hash = boatramp_core::deploy::sha256_hex(EVENT_CONSUMER);
+        let bindings = Bindings::new("blog").with_keyvalue("blog", kv.clone());
+        let topic = "blog/orders/created";
+        for _ in 0..5 {
+            mq.publish(topic, b"ok").await.unwrap();
+        }
+        // max_batch=10 would take all 5 in one tick; max_ack_pending=2 caps the window to 2.
+        let acked = dispatch_consumer_batch(
+            &engine,
+            &mq,
+            &metrics::Metrics::default(),
+            "blog",
+            topic,
+            "blog/",
+            "",
+            boatramp_core::messaging::StartPosition::Latest,
+            &hash,
+            EVENT_CONSUMER,
+            &bindings,
+            None,
+            Limits::default(),
+            Duration::from_secs(30),
+            5,
+            10,
+            Some(2),
+            0,
+        )
+        .await;
+        assert_eq!(
+            acked, 2,
+            "MaxAckPending=2 caps the batch to 2 even though max_batch=10 and 5 are queued"
+        );
+    }
+
     /// The delivery gate: a consumer receives every published message at-least-once
     /// (acked, counted once each), and a message that keeps failing is
     /// redelivered and then dead-lettered after `max_attempts`.
@@ -3172,6 +3310,8 @@ mod tests {
                 Duration::from_secs(30),
                 5,
                 10,
+                None,
+                0,
             )
             .await;
             if acked == 0 {
@@ -3205,6 +3345,8 @@ mod tests {
                 Duration::ZERO,
                 2,
                 10,
+                None,
+                0,
             )
             .await;
         }
@@ -3253,6 +3395,8 @@ mod tests {
                 Duration::from_secs(30),
                 5,
                 10,
+                None,
+                0,
             )
             .await;
             assert_eq!(n, 0, "no events yet for group {g}");
@@ -3279,6 +3423,8 @@ mod tests {
                 Duration::from_secs(30),
                 5,
                 10,
+                None,
+                0,
             )
             .await;
             assert_eq!(n, 1, "group {g} should receive the message");
@@ -3328,11 +3474,17 @@ mod tests {
                 consumers: vec![ConsumerConfig {
                     tenancy: None,
                     token_claims: None,
+                    backoff_ms: None,
+                    retention_ms: None,
                     topic: "orders/created".into(),
                     component: "consumer.wasm".into(),
                     imports: vec!["wasi:keyvalue".into()],
                     group: String::new(),
                     start: Default::default(),
+                    lease_ms: None,
+                    max_attempts: None,
+                    max_batch: None,
+                    max_ack_pending: None,
                 }],
                 ..Default::default()
             },
@@ -3630,6 +3782,7 @@ mod tests {
                     sources: vec![TenantSource::None],
                     read: AccessMode::Own,
                     write: AccessMode::None,
+                    exceed_site_ceiling: false,
                 }),
                 ..Default::default()
             },
@@ -3807,6 +3960,7 @@ mod tests {
                     sources: vec![TenantSource::None],
                     read: AccessMode::Own,
                     write: AccessMode::None,
+                    exceed_site_ceiling: false,
                 }),
                 ..Default::default()
             },
@@ -3980,6 +4134,7 @@ mod tests {
                     sources: vec![TenantSource::None],
                     read: AccessMode::Own,
                     write: AccessMode::None,
+                    exceed_site_ceiling: false,
                 }),
                 ..Default::default()
             },
@@ -4138,6 +4293,7 @@ mod tests {
                     sources: vec![TenantSource::None],
                     read: AccessMode::Own,
                     write: AccessMode::None,
+                    exceed_site_ceiling: false,
                 }),
                 ..Default::default()
             },
@@ -4292,6 +4448,7 @@ mod tests {
                 sources: vec![TenantSource::None],
                 read: AccessMode::Own,
                 write: AccessMode::None,
+                exceed_site_ceiling: false,
             }),
             ..Default::default()
         };
@@ -5515,6 +5672,7 @@ mod tests {
             sources: vec![TenantSource::SignedContext],
             read: AccessMode::Own,
             write: AccessMode::Own,
+            exceed_site_ceiling: false,
         };
         let site = HandlersSiteConfig {
             enabled: true,

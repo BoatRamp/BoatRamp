@@ -64,7 +64,9 @@ impl Outcome {
         }
     }
 
-    fn as_str(self) -> &'static str {
+    /// The stable host-classification label. Also used as the dead-letter `last_error` (SEC6:
+    /// host-reason-only), so the DLQ reason aligns with the operator's invocation-outcome buckets.
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Ok => "ok",
             Self::Timeout => "timeout",

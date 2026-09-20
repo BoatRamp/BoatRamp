@@ -129,6 +129,59 @@ An async worker resolves its own tenant from the producer-stamped context:
 tenancy: (mode: "scoped", column: "tenant_id", sources: [(kind: "signed_context")], read: "own", write: "own")
 ```
 
+## An unscoped `all` route under an `own` site (authorized exception)
+
+Sometimes one route on an otherwise `own`-ceilinged site must legitimately reach **every** tenant —
+an M2M `/token` endpoint that validates a client credential across the fleet, an internal `/svc/*`
+admin, a payment webhook. A per-route tenancy normally may only *narrow* within the site ceiling, so
+`read: all` on an `own` site is refused. Rather than smuggle the broad reach into a top-level `all`
+function (which hides *what* is broad behind a `function:` indirection), declare the exception
+**inline and greppably** — under a **three-key** model where no single actor, and no single line,
+reaches `all`:
+
+1. **The site owner** opts the site in:
+   [`SiteConfig.handlers.allow_ceiling_exceptions = true`](../reference/siteconfig.md#handlersallow_ceiling_exceptions).
+   Default `false`; while `false`, every route's exception token is inert. A site left at the default
+   is provably exception-free without scanning its routes.
+2. **The deployer** marks the specific route with `exceed_site_ceiling: true` on its `scoped` tenancy:
+
+   ```ron
+   # apply.cfg — one route deliberately broader than the site ceiling
+   (route: "/token", methods: ["POST"], component: "token.wasm", imports: ["sql"],
+    tenancy: (mode: "scoped", column: "tenant_id", sources: [(kind: "token", claim: "tid")],
+              read: "all", write: "all", exceed_site_ceiling: true))
+   ```
+
+3. **The operator** must still permit crossing tenants at all — the
+   [`allow_cross_tenant_db`](../reference/boatramp-cfg.md#security) posture. With it **off**, an
+   authorized `all` route is clamped to `own` at runtime (and `apply` warns you it will be).
+
+The exception is deliberately narrow: it can only widen the **read/write access mode** (up to `all`)
+of a `scoped` route on the **same tenant column**. It can never remove scoping (`disabled`), switch to
+the target axis, or change the column — those would escape the operator posture backstop, so they stay
+refused. `exceed_site_ceiling: true` is a *separate* field from `read`/`write` on purpose: a bare
+`read: all` without it still fails closed, so a config typo never silently widens.
+
+A widening that lacks either deployer key is refused **at deploy** with a message naming the route and
+the exact fix (not an opaque runtime error), and `boatramp apply --dry-run` flags every route that
+declares an exception:
+
+```text
+  ⚠ route "/token" [POST]: exceeds the site tenancy ceiling (authorized via `exceed_site_ceiling`;
+    the site must set `allow_ceiling_exceptions`, and an `all` grant also needs the operator posture
+    `allow_cross_tenant_db`).
+```
+
+The `/graphql` gateway is its own route — a token on `/token` never widens the gateway (or any
+sibling); each route carries its own exception.
+
+### Migrating from an `all`-ceilinged site
+
+If you set the whole site to `all` just to allow one broad route, tighten it: flip the site ceiling to
+`own`, set `allow_ceiling_exceptions = true`, and add `exceed_site_ceiling: true` to **only** the routes
+that need it. Every other route is now provably confined to its own tenant, and the broad ones are
+greppable in one place.
+
 ## Both query surfaces are scoped the same way
 
 Whichever way a handler queries, the host applies the **same** tenant predicate:

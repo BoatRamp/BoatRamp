@@ -66,6 +66,7 @@ mod gateway;
 mod graphql;
 mod handler_validate;
 mod handlers;
+mod queue;
 mod workflow;
 // Joiner-side dynamic cluster join (CJ-2/CJ-3): the ticket codec, root-anchored
 // verification, founding decision, and `join_cluster` orchestration wired into
@@ -198,6 +199,8 @@ enum Command {
     Stats(logs::StatsArgs),
     /// Purge or redrive a consumer topic's dead-letter queue.
     Dlq(dlq::DlqArgs),
+    /// Inspect a consumer topic's live work-queue (peek without consuming).
+    Queue(queue::QueueArgs),
     /// Delete orphan deployments and unreferenced blobs (--dry-run to only report).
     Prune(manage::PruneArgs),
     /// Verify every stored blob still hashes to its key (integrity scrub).
@@ -495,6 +498,7 @@ async fn async_main() -> Result<(), CliError> {
         Command::Logs(args) => logs::run(args, &config).await?,
         Command::Stats(args) => logs::stats(args, &config).await?,
         Command::Dlq(args) => dlq::run(args, &config).await?,
+        Command::Queue(args) => queue::run(args, &config).await?,
         Command::Prune(args) => manage::prune(args, &config).await?,
         Command::Scrub(args) => manage::scrub(args, &config).await?,
         Command::CertStatus(args) => manage::cert_status(args, &config).await?,

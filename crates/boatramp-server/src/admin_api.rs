@@ -184,7 +184,7 @@ pub(super) async fn activate_deployment(
                 Err(err) => return deploy_error_response(err),
             };
             if let Err(reason) = handlers
-                .precheck_activation(&deploy, &manifest, site_config.as_ref())
+                .precheck_activation(&deploy, &manifest, site_config.as_ref(), &project.0)
                 .await
             {
                 tracing::warn!(site, id, reason, "activation refused by handler pre-check");

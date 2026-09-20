@@ -128,6 +128,27 @@ pub enum WriteOp {
         /// `MqPublish` (no field) applies as an unscoped publish.
         #[serde(default)]
         signed_context: Option<String>,
+        /// **Inlined payload** (A3): for a small work-queue message the body rides in the replicated
+        /// index record instead of shared object storage — so no object-store round-trip, at the cost
+        /// of bounded (`INLINE_MAX`) Raft-log/snapshot bytes. `#[serde(default)]` (base64 in JSON) so
+        /// an older node's `MqPublish` applies with the payload in object storage as before.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        inline: Option<Vec<u8>>,
+        /// **Delivery-mode delay** (P2): the absolute unix-ms not-before time; the applied record's
+        /// lease is set to this, so the message isn't claimable until then. `0`/absent = claimable now.
+        /// The issuing node stamps the absolute time (deterministic across replicas). `#[serde(default)]`
+        /// so an older node's `MqPublish` applies as an immediately-claimable publish.
+        #[serde(default)]
+        not_before_ms: u64,
+        /// **Delivery-mode TTL** (P2): the absolute unix-ms after which an un-delivered message is
+        /// dead-lettered (`ttl-expired`) instead of leased. `0`/absent = no expiry. Stamped by the
+        /// issuing node (deterministic). `#[serde(default)]` so an older node's `MqPublish` never expires.
+        #[serde(default)]
+        expires_at_ms: u64,
+        /// **Delivery priority** (P2): higher leases first (ties FIFO by id). `0`/absent = normal.
+        /// `#[serde(default)]` so an older node's `MqPublish` applies at normal priority.
+        #[serde(default)]
+        priority: u8,
     },
     /// Atomically claim up to `max_batch` deliverable messages on `topic`,
     /// leasing each until `now_ms + lease_ms` and dead-lettering exhausted ones.
@@ -145,10 +166,24 @@ pub enum WriteOp {
         topic: String,
         id: String,
     },
-    /// Reset a message's lease so it is immediately claimable again (nack).
+    /// Reset a message's lease so it is claimable again (nack). `until_ms` is the redelivery
+    /// visibility deadline (per-consumer backoff): `0` = claimable now (plain nack); else the leader
+    /// stamps `now + delay` and the apply holds the message leased until then, spacing out retries.
+    /// `#[serde(default)]` for rolling-upgrade safety (an old replica reads `0` ⇒ immediate).
     MqNack {
         topic: String,
         id: String,
+        #[serde(default)]
+        until_ms: u64,
+    },
+    /// Record a sanitized HOST failure reason on a message's live record (P1 selective DLQ / SEC6),
+    /// so it survives into the dead-letter for `dlq ls/show` + `--match`. `reason` is already
+    /// sanitized+bounded by the caller (deterministic bytes → identical on every replica); the apply
+    /// is a read-modify-write of the meta record, a no-op if the message was acked in the meantime.
+    MqSetLastError {
+        topic: String,
+        id: String,
+        reason: String,
     },
     /// Atomically claim up to `max_batch` messages for a **consumer group** (the
     /// durable fan-out path). The leader applies the shared offset-log decision
@@ -173,11 +208,45 @@ pub enum WriteOp {
         group: String,
         id: String,
     },
-    /// Nack a grouped delivery: reset its in-flight lease so it redelivers.
+    /// Nack a grouped delivery: reset its in-flight lease so it redelivers. `until_ms` = the backoff
+    /// visibility deadline (0 = now; else leader-stamped `now + delay`), serde-default for
+    /// rolling-upgrade safety.
     MqNackGrouped {
         topic: String,
         group: String,
         id: String,
+        #[serde(default)]
+        until_ms: u64,
+    },
+    /// **Redrive** a grouped dead-letter: re-arm the id in its group's in-flight (fresh attempts,
+    /// claimable now) and drop the dead-letter record — the operator DLQ redrive for a fan-out
+    /// group. The retained payload/log is still present (a dead-letter pins it against the sweep).
+    /// Deterministic: creates the group at the current log head if it was deregistered, so only the
+    /// redriven id is in-flight (no backlog replay); no clock needed (lease 0 = claimable now).
+    MqRedriveGroupedDead {
+        topic: String,
+        group: String,
+        id: String,
+    },
+    /// **Reset** a consumer group's cursor (P2 group lifecycle): move its high-water per `start`
+    /// (`Earliest` ⇒ `""` re-consume backlog; `Latest` ⇒ the current logmax, read deterministically
+    /// from applied state at apply time) and drop its in-flight set. A no-op if the group is gone.
+    MqResetGroup {
+        topic: String,
+        group: String,
+        start: messaging::StartPosition,
+    },
+    /// **Delete** a consumer group (P2 group lifecycle): remove its state + its dead-letter records.
+    /// The shared retained log/payloads it pinned are reclaimed by the sweep once no group needs them.
+    MqDeleteGroup {
+        topic: String,
+        group: String,
+    },
+    /// **Pause / resume** a topic (P2 flow control): set/clear the pause marker in replicated state.
+    /// While set, claims deliver nothing (publish + in-flight ack/nack unaffected).
+    MqSetPaused {
+        topic: String,
+        paused: bool,
     },
     /// **Retention sweep** for a grouped topic: reclaim the replicated log entries
     /// that no group still needs (with an id-age TTL backstop), returning the
@@ -308,13 +377,25 @@ pub(crate) fn apply_op(target: &mut ApplyTarget, op: WriteOp) -> WriteResponse {
             id,
             retain,
             signed_context,
+            inline,
+            not_before_ms,
+            expires_at_ms,
+            priority,
         } => {
             // Idempotent append: a distinct key per message, never overwriting
             // an existing (possibly already-claimed) record.
             let key = messaging::meta_key(&topic, &id);
             if !target.data.contains_key(&key) {
-                let fresh = serde_json::to_vec(&messaging::Record::fresh(signed_context))
-                    .expect("record serializes");
+                let mut record = messaging::Record::fresh(signed_context);
+                // A3: a small work-queue payload rides IN the replicated record (no object store).
+                record.inline = inline;
+                // Delivery-mode delay (P2): defer first delivery via the lease field (attempts stay 0).
+                record.lease_until_ms = not_before_ms;
+                // Delivery-mode TTL (P2): claim dead-letters it once past this (0 = no expiry).
+                record.expires_at_ms = expires_at_ms;
+                // Delivery-mode priority (P2): higher leases first (0 = normal).
+                record.priority = priority;
+                let fresh = serde_json::to_vec(&record).expect("record serializes");
                 target.put(key, fresh);
             }
             if retain {
@@ -355,11 +436,29 @@ pub(crate) fn apply_op(target: &mut ApplyTarget, op: WriteOp) -> WriteResponse {
             target.remove(messaging::meta_key(&topic, &id));
             WriteResponse::Kv
         }
-        WriteOp::MqNack { topic, id } => {
+        WriteOp::MqNack {
+            topic,
+            id,
+            until_ms,
+        } => {
             let key = messaging::meta_key(&topic, &id);
             if let Some(raw) = target.data.get(&key) {
                 if let Ok(mut record) = serde_json::from_slice::<messaging::Record>(raw) {
-                    record.lease_until_ms = 0; // claimable again now
+                    record.lease_until_ms = until_ms; // 0 = claimable now; else held until the backoff deadline
+                    if let Ok(json) = serde_json::to_vec(&record) {
+                        target.put(key, json);
+                    }
+                }
+            }
+            WriteResponse::Kv
+        }
+        WriteOp::MqSetLastError { topic, id, reason } => {
+            // Read-modify-write the live record's last_error (already sanitized by the caller). A
+            // no-op if the message was acked/gone since the failed delivery.
+            let key = messaging::meta_key(&topic, &id);
+            if let Some(raw) = target.data.get(&key) {
+                if let Ok(mut record) = serde_json::from_slice::<messaging::Record>(raw) {
+                    record.last_error = Some(reason);
                     if let Ok(json) = serde_json::to_vec(&record) {
                         target.put(key, json);
                     }
@@ -395,12 +494,17 @@ pub(crate) fn apply_op(target: &mut ApplyTarget, op: WriteOp) -> WriteResponse {
             }
             WriteResponse::Kv
         }
-        WriteOp::MqNackGrouped { topic, group, id } => {
+        WriteOp::MqNackGrouped {
+            topic,
+            group,
+            id,
+            until_ms,
+        } => {
             if let Some(mut state) = load_group_state(target, &topic, &group) {
                 let mut changed = false;
                 for entry in &mut state.in_flight {
                     if entry.id == id {
-                        entry.lease_until_ms = 0; // claimable again now
+                        entry.lease_until_ms = until_ms; // 0 = now; else held until the backoff deadline
                         changed = true;
                         break;
                     }
@@ -408,6 +512,75 @@ pub(crate) fn apply_op(target: &mut ApplyTarget, op: WriteOp) -> WriteResponse {
                 if changed {
                     put_group_state(target, &topic, &group, &state);
                 }
+            }
+            WriteResponse::Kv
+        }
+        WriteOp::MqRedriveGroupedDead { topic, group, id } => {
+            // Re-arm the id in the group's in-flight (fresh attempts, claimable now) and drop the
+            // dead-letter record. Create the group at the current head if it was deregistered, so
+            // only the redriven id is in-flight (no backlog replay). The retained payload/log is
+            // still present — a dead-letter pins it against the sweep (see apply_mq_sweep_grouped).
+            let mut state = load_group_state(target, &topic, &group).unwrap_or_else(|| {
+                let hwm = target
+                    .data
+                    .get(&messaging::logmax_key(&topic))
+                    .map(|v| String::from_utf8_lossy(v).into_owned())
+                    .unwrap_or_default();
+                messaging::GroupState::new(hwm)
+            });
+            if !state.in_flight.iter().any(|f| f.id == id) {
+                state.in_flight.push(messaging::InFlight {
+                    id: id.clone(),
+                    attempts: 0,
+                    lease_until_ms: 0,
+                });
+            }
+            put_group_state(target, &topic, &group, &state);
+            target.remove(messaging::gdead_key(&topic, &group, &id));
+            WriteResponse::Kv
+        }
+        WriteOp::MqResetGroup {
+            topic,
+            group,
+            start,
+        } => {
+            // Reset only an existing group (no-op if gone — deterministic). hwm from `start`, read
+            // from applied state so every replica computes the identical value. Drops in-flight.
+            if load_group_state(target, &topic, &group).is_some() {
+                let hwm = match start {
+                    messaging::StartPosition::Earliest => String::new(),
+                    messaging::StartPosition::Latest => target
+                        .data
+                        .get(&messaging::logmax_key(&topic))
+                        .map(|v| String::from_utf8_lossy(v).into_owned())
+                        .unwrap_or_default(),
+                };
+                put_group_state(target, &topic, &group, &messaging::GroupState::new(hwm));
+            }
+            WriteResponse::Kv
+        }
+        WriteOp::MqDeleteGroup { topic, group } => {
+            // Remove the group's dead-letter records, then its state. Collect keys first (can't mutate
+            // `target.data` while ranging it). Retained log/payloads reclaim via the sweep.
+            let dprefix = format!("mqgd/{topic}/{group}/");
+            let dead: Vec<String> = target
+                .data
+                .range(dprefix.clone()..)
+                .take_while(|(k, _)| k.starts_with(&dprefix))
+                .map(|(k, _)| k.clone())
+                .collect();
+            for key in dead {
+                target.remove(key);
+            }
+            target.remove(messaging::gstate_key(&topic, &group));
+            WriteResponse::Kv
+        }
+        WriteOp::MqSetPaused { topic, paused } => {
+            let key = messaging::pause_key(&topic);
+            if paused {
+                target.put(key, Vec::new());
+            } else {
+                target.remove(key);
             }
             WriteResponse::Kv
         }
@@ -485,6 +658,9 @@ fn apply_mq_claim(
                     id,
                     attempts: record.attempts,
                     signed_context: record.signed_context,
+                    // A3: carry an inlined payload back to the claiming node (it's in the replicated
+                    // record, not object storage, so the node can't fetch it separately).
+                    inline: record.inline,
                 });
             }
             messaging::ClaimAction::DeadLetter { id, record } => {
@@ -592,15 +768,28 @@ fn apply_mq_claim_grouped(
         &new_ids,
     );
 
-    // Dead-letter the exhausted ids (preserve the record under the group's DLQ).
+    // Dead-letter the exhausted ids under the group's DLQ, capturing the producer's signed-context
+    // from the shared index record (deterministic applied state) so a redriven grouped dead-letter
+    // still resolves its tenant. The retained payload is pinned against the sweep by this record.
     for (id, attempts) in &plan.dead {
+        let signed_context = target
+            .data
+            .get(&messaging::meta_key(topic, id))
+            .and_then(|raw| serde_json::from_slice::<messaging::Record>(raw).ok())
+            .and_then(|r| r.signed_context);
         let record = messaging::Record {
             version: boatramp_core::SCHEMA_VERSION,
             attempts: *attempts,
             lease_until_ms: 0,
-            // The group offset log doesn't carry per-message context; a redriven grouped
-            // dead-letter re-resolves via the shared index record if still present.
-            signed_context: None,
+            signed_context,
+            // Grouped payloads are object-store retained (pinned by this dead-letter), never inlined.
+            inline: None,
+            // Grouped last_error capture is a follow-up (needs a per-in-flight reason).
+            last_error: None,
+            // A dead-letter is terminal — no further expiry.
+            expires_at_ms: 0,
+            // Grouped is append-log-ordered; priority is a work-queue concept.
+            priority: 0,
         };
         let json = serde_json::to_vec(&record).expect("record serializes");
         target.put(messaging::gdead_key(topic, group, id), json);
@@ -626,6 +815,8 @@ fn apply_mq_claim_grouped(
                 id,
                 attempts,
                 signed_context,
+                // Grouped payloads are always object-store retained, never inlined.
+                inline: None,
             }
         })
         .collect()
@@ -663,11 +854,25 @@ fn apply_mq_sweep_grouped(target: &mut ApplyTarget, topic: &str, now_ms: u64) ->
         }
     }
 
+    // A dead-lettered message (any group) PINS its retained log+payload against reclaim until the
+    // dead-letter is redriven or purged — so a redrive always has the payload. Gather the dead ids.
+    let gdead_prefix = messaging::gdead_topic_prefix(topic);
+    let mut dead_ids = std::collections::HashSet::new();
+    for (key, _) in target.data.range(gdead_prefix.clone()..) {
+        if !key.starts_with(&gdead_prefix) {
+            break;
+        }
+        if let Some((_, id)) = messaging::split_group_id(&key[gdead_prefix.len()..]) {
+            dead_ids.insert(id.to_string());
+        }
+    }
+
     let mut reclaimed = Vec::new();
     for id in ids {
+        let pinned = dead_ids.contains(&id);
         let needed = messaging::grouped_message_needed(&states, &id);
         let expired = messaging::id_millis(&id) + messaging::GROUP_RETENTION_MS < now_ms;
-        if !needed || expired {
+        if !pinned && (!needed || expired) {
             target.remove(messaging::glog_key(topic, &id));
             reclaimed.push(id);
         }
@@ -688,6 +893,12 @@ pub struct ClaimedRecord {
     /// rolling upgrade (an older leader's claim response omits it ⇒ no context ⇒ fail closed).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signed_context: Option<String>,
+    /// The message's **inlined payload** (A3), if the body rode in the replicated record instead of
+    /// object storage — carried back so the claiming node delivers it without a `Storage` fetch.
+    /// `None` ⇒ fetch from `Storage` at [`messaging::payload_key`]. `#[serde(default)]` for a
+    /// rolling upgrade.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inline: Option<Vec<u8>>,
 }
 
 /// The result of applying a [`WriteOp`]: empty for KV/ack/nack/publish, or the

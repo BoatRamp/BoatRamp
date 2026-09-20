@@ -2086,6 +2086,19 @@ async fn dispatch_function_queue(
         if delivered {
             let _ = messaging.ack(&msg).await;
         } else {
+            // Record a host-classified failure reason (P1/SEC6: never guest body bytes) so it
+            // survives into the dead-letter for `dlq ls/show` + `--match`. ONLY on the final attempt
+            // (the one whose failure dead-letters the message on the next claim): last_error means
+            // "why it dead-lettered", not a transient retry that may yet succeed — and this keeps the
+            // hot redelivery path a single write (nack), not two.
+            if msg.attempts >= CONSUMER_MAX_ATTEMPTS {
+                let reason = match status {
+                    StatusCode::GATEWAY_TIMEOUT => "timeout",
+                    StatusCode::SERVICE_UNAVAILABLE => "unavailable",
+                    _ => "error",
+                };
+                let _ = messaging.set_last_error(&msg, reason).await;
+            }
             let _ = messaging.nack(&msg).await;
         }
     }

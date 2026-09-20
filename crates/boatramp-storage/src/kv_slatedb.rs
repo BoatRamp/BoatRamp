@@ -312,6 +312,35 @@ impl KvStore for SlateKv {
         self.writer()?.write(batch).await.map_err(backend)?;
         Ok(())
     }
+
+    /// Durability-relaxed grouped write (see [`KvStore::write_batch_relaxed`]): commit the group to
+    /// the in-memory memtable/WAL buffer and return WITHOUT awaiting the object-store flush (SlateDB
+    /// `WriteOptions { await_durable: false }`). The buffered entries are flushed on the store's
+    /// configured `flush_interval` — OR sooner when a later durable [`write_batch`](Self::write_batch)
+    /// (the messaging checkpoint) forces the WAL buffer out. The batch is still atomic; only the
+    /// *ack timing* changes. On a process crash before the next flush, entries acked here are lost —
+    /// which is why only the bus publish path may call it, bounded to N un-durable messages by the
+    /// caller's checkpoint (see `LogMessaging`).
+    async fn write_batch_relaxed(&self, ops: Vec<WriteOp>) -> Result<(), KvError> {
+        let mut batch = WriteBatch::new();
+        for op in ops {
+            match op {
+                WriteOp::Put(key, value) => batch.put(key.as_bytes(), &value),
+                WriteOp::Delete(key) => batch.delete(key.as_bytes()),
+            }
+        }
+        self.writer()?
+            .write_with_options(
+                batch,
+                &slatedb::config::WriteOptions {
+                    await_durable: false,
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(backend)?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
