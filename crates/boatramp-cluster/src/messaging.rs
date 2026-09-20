@@ -723,11 +723,24 @@ impl Messaging for RaftMessaging {
     }
 
     async fn nack(&self, msg: &ClaimedMessage) -> Result<(), MessagingError> {
+        self.nack_after(msg, 0).await
+    }
+
+    async fn nack_after(&self, msg: &ClaimedMessage, delay_ms: u64) -> Result<(), MessagingError> {
+        // The leader stamps the absolute backoff deadline (now + delay) into the proposal so every
+        // replica applies the identical lease (the state machine reads no clock) — same discipline as
+        // the delayed/TTL publish stamping. 0 ⇒ claimable now (plain nack).
+        let until_ms = if delay_ms == 0 {
+            0
+        } else {
+            now_unix_ms().saturating_add(delay_ms)
+        };
         if !msg.group.is_empty() {
             self.propose(WriteOp::MqNackGrouped {
                 topic: msg.topic.clone(),
                 group: msg.group.clone(),
                 id: msg.id.clone(),
+                until_ms,
             })
             .await?;
             return Ok(());
@@ -735,6 +748,7 @@ impl Messaging for RaftMessaging {
         self.propose(WriteOp::MqNack {
             topic: msg.topic.clone(),
             id: msg.id.clone(),
+            until_ms,
         })
         .await?;
         Ok(())

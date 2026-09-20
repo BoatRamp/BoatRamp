@@ -629,6 +629,21 @@ pub struct ConsumerConfig {
     /// already at the cap. `None` ⇒ unbounded (only `max_batch` per-tick bounds it). (P2 flow control.)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_ack_pending: Option<usize>,
+    /// Per-consumer **redelivery backoff** in ms (≈ JetStream *BackOff*). On a failed delivery
+    /// (an explicit nack before `max_attempts`), the message is held invisible for
+    /// `backoff_ms × attempts` before it can be redelivered — a linear escalation that spaces out
+    /// retries of a persistently-failing message instead of hot-looping it. `None`/`0` ⇒ immediate
+    /// redelivery (the historical behavior). Bounded by `lease_ms`-style visibility; a crash without
+    /// a nack still redelivers on lease expiry (backoff applies only to explicit nacks). (P1.)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backoff_ms: Option<u64>,
+    /// Per-consumer **retention** in ms for a grouped topic's retained log/payload (≈ JetStream
+    /// stream *MaxAge*) — how long a fan-out message is kept for slow/absent groups before the
+    /// retention sweep reclaims it. `None` ⇒ the server default (24 h). Only meaningful for a
+    /// grouped consumer (the work-queue deletes on ack); a shorter value caps storage for a
+    /// high-volume bus, a longer one tolerates a slower group. (P1.)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention_ms: Option<u64>,
 }
 
 /// serde `skip_serializing_if` helper: a `Latest` start is the default and elided.

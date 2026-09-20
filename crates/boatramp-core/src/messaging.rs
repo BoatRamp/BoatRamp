@@ -221,6 +221,17 @@ pub trait Messaging: Send + Sync {
     /// count is preserved, so it still dead-letters after `max_attempts`.
     async fn nack(&self, msg: &ClaimedMessage) -> Result<(), MessagingError>;
 
+    /// Negative-acknowledge with a **redelivery backoff**: keep the message invisible (leased) for
+    /// `delay_ms` before it becomes claimable again, instead of immediately (P1 per-consumer
+    /// `backoff_ms`). The attempt count is still preserved (it dead-letters after `max_attempts`),
+    /// and a `delay_ms` of 0 is exactly [`nack`](Self::nack). The default impl ignores the delay and
+    /// delegates to [`nack`](Self::nack), so a backend without a visibility field still redelivers
+    /// (just without the spacing) — never strands the message.
+    async fn nack_after(&self, msg: &ClaimedMessage, delay_ms: u64) -> Result<(), MessagingError> {
+        let _ = delay_ms;
+        self.nack(msg).await
+    }
+
     /// Number of messages still queued on `topic` (claimable *or* leased) — the
     /// consumer backlog / lag, for ops introspection. Default
     /// `0` for backends without introspection.
@@ -2224,8 +2235,19 @@ impl Messaging for LogMessaging {
     }
 
     async fn nack(&self, msg: &ClaimedMessage) -> Result<(), MessagingError> {
-        // A grouped nack resets the in-flight entry's lease to `0` (claimable now)
-        // in the compact group-state value; serialized with `claim`.
+        self.nack_after(msg, 0).await
+    }
+
+    async fn nack_after(&self, msg: &ClaimedMessage, delay_ms: u64) -> Result<(), MessagingError> {
+        // Redelivery visibility: 0 ⇒ claimable now (plain nack); else hold it leased until now+delay
+        // so a persistently-failing message's retries are spaced out (backoff) instead of hot-looping.
+        let until = if delay_ms == 0 {
+            0
+        } else {
+            now_unix_ms().saturating_add(delay_ms)
+        };
+        // A grouped nack resets the in-flight entry's lease in the compact group-state value;
+        // serialized with `claim`.
         if !msg.group.is_empty() {
             let _guard = self.claim_lock.lock().await;
             let Some(mut state) = self.get_group_state(&msg.topic, &msg.group).await? else {
@@ -2234,7 +2256,7 @@ impl Messaging for LogMessaging {
             let mut changed = false;
             for entry in &mut state.in_flight {
                 if entry.id == msg.id {
-                    entry.lease_until_ms = 0;
+                    entry.lease_until_ms = until;
                     changed = true;
                     break;
                 }
@@ -2250,7 +2272,7 @@ impl Messaging for LogMessaging {
         };
         let mut record: Record =
             serde_json::from_slice(&raw).map_err(|e| MessagingError::Decode(e.to_string()))?;
-        record.lease_until_ms = 0; // claimable again now
+        record.lease_until_ms = until;
         let json = serde_json::to_vec(&record).map_err(MessagingError::backend)?;
         self.kv
             .put(&key, json)

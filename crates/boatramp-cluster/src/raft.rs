@@ -166,10 +166,15 @@ pub enum WriteOp {
         topic: String,
         id: String,
     },
-    /// Reset a message's lease so it is immediately claimable again (nack).
+    /// Reset a message's lease so it is claimable again (nack). `until_ms` is the redelivery
+    /// visibility deadline (per-consumer backoff): `0` = claimable now (plain nack); else the leader
+    /// stamps `now + delay` and the apply holds the message leased until then, spacing out retries.
+    /// `#[serde(default)]` for rolling-upgrade safety (an old replica reads `0` ⇒ immediate).
     MqNack {
         topic: String,
         id: String,
+        #[serde(default)]
+        until_ms: u64,
     },
     /// Record a sanitized HOST failure reason on a message's live record (P1 selective DLQ / SEC6),
     /// so it survives into the dead-letter for `dlq ls/show` + `--match`. `reason` is already
@@ -203,11 +208,15 @@ pub enum WriteOp {
         group: String,
         id: String,
     },
-    /// Nack a grouped delivery: reset its in-flight lease so it redelivers.
+    /// Nack a grouped delivery: reset its in-flight lease so it redelivers. `until_ms` = the backoff
+    /// visibility deadline (0 = now; else leader-stamped `now + delay`), serde-default for
+    /// rolling-upgrade safety.
     MqNackGrouped {
         topic: String,
         group: String,
         id: String,
+        #[serde(default)]
+        until_ms: u64,
     },
     /// **Redrive** a grouped dead-letter: re-arm the id in its group's in-flight (fresh attempts,
     /// claimable now) and drop the dead-letter record — the operator DLQ redrive for a fan-out
@@ -427,11 +436,15 @@ pub(crate) fn apply_op(target: &mut ApplyTarget, op: WriteOp) -> WriteResponse {
             target.remove(messaging::meta_key(&topic, &id));
             WriteResponse::Kv
         }
-        WriteOp::MqNack { topic, id } => {
+        WriteOp::MqNack {
+            topic,
+            id,
+            until_ms,
+        } => {
             let key = messaging::meta_key(&topic, &id);
             if let Some(raw) = target.data.get(&key) {
                 if let Ok(mut record) = serde_json::from_slice::<messaging::Record>(raw) {
-                    record.lease_until_ms = 0; // claimable again now
+                    record.lease_until_ms = until_ms; // 0 = claimable now; else held until the backoff deadline
                     if let Ok(json) = serde_json::to_vec(&record) {
                         target.put(key, json);
                     }
@@ -481,12 +494,17 @@ pub(crate) fn apply_op(target: &mut ApplyTarget, op: WriteOp) -> WriteResponse {
             }
             WriteResponse::Kv
         }
-        WriteOp::MqNackGrouped { topic, group, id } => {
+        WriteOp::MqNackGrouped {
+            topic,
+            group,
+            id,
+            until_ms,
+        } => {
             if let Some(mut state) = load_group_state(target, &topic, &group) {
                 let mut changed = false;
                 for entry in &mut state.in_flight {
                     if entry.id == id {
-                        entry.lease_until_ms = 0; // claimable again now
+                        entry.lease_until_ms = until_ms; // 0 = now; else held until the backoff deadline
                         changed = true;
                         break;
                     }

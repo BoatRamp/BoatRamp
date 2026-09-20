@@ -3549,6 +3549,8 @@ async fn activation_refuses_a_non_consumer_component() {
             consumers: vec![ConsumerConfig {
                 tenancy: None,
                 token_claims: None,
+                backoff_ms: None,
+                retention_ms: None,
                 topic: "orders/created".to_string(),
                 component: "consumer.wasm".to_string(),
                 imports: Vec::new(),
@@ -4650,6 +4652,8 @@ async fn operator_endpoint_reports_invocation_and_consumer_stats() {
             consumers: vec![ConsumerConfig {
                 tenancy: None,
                 token_claims: None,
+                backoff_ms: None,
+                retention_ms: None,
                 topic: "orders/created".to_string(),
                 component: "consumer.wasm".to_string(),
                 imports: vec!["wasi:keyvalue".to_string()],

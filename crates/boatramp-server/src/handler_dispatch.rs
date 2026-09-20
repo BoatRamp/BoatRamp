@@ -2101,6 +2101,9 @@ pub(super) async fn dispatch_consumer_batch(
     max_attempts: u32,
     batch: usize,
     max_ack_pending: Option<usize>,
+    // Per-consumer redelivery backoff base (ms); the redelivery of a failed message is held
+    // `backoff_ms × attempts` before it's claimable again. 0 ⇒ immediate (historical behavior).
+    backoff_ms: u64,
 ) -> usize {
     // Flow control (P2 MaxAckPending): cap the claim so total leased-but-unacked never exceeds the
     // ceiling, across ticks. `in_flight_count` is the topic's outstanding (a slight over-count for a
@@ -2156,7 +2159,9 @@ pub(super) async fn dispatch_consumer_batch(
                         %err,
                         "consumer per-message bindings refused; redelivering"
                     );
-                    let _ = messaging.nack(&msg).await;
+                    let _ = messaging
+                        .nack_after(&msg, backoff_ms.saturating_mul(u64::from(msg.attempts)))
+                        .await;
                     continue;
                 }
             },
@@ -2210,7 +2215,9 @@ pub(super) async fn dispatch_consumer_batch(
                 if msg.attempts >= max_attempts {
                     let _ = messaging.set_last_error(&msg, outcome.as_str()).await;
                 }
-                let _ = messaging.nack(&msg).await;
+                let _ = messaging
+                    .nack_after(&msg, backoff_ms.saturating_mul(u64::from(msg.attempts)))
+                    .await;
             }
         }
     }
