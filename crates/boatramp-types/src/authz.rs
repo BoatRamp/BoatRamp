@@ -1491,6 +1491,8 @@ mod tests {
             ("POST", "/api/projects/acme/_boatramp/bus/dlq"),
             ("POST", "/api/projects/acme/_boatramp/bus/queue/group"),
             ("POST", "/api/projects/acme/_boatramp/bus/queue/pause"),
+            // v0.4.24 per-topic operator policy on the shared project bus.
+            ("POST", "/api/projects/acme/_boatramp/bus/queue/policy"),
         ];
         for (method, path) in writes {
             assert_eq!(
@@ -1499,6 +1501,13 @@ mod tests {
                 "{method} {path} must be Project·Admin"
             );
         }
+        // The per-SITE policy POST grades at Site·Write (the same `_boatramp/queue/*` write arm as
+        // pause/group), not Project·Admin — verified via the site-scoped path.
+        assert_eq!(
+            Right::required("POST", "/api/sites/blog/_boatramp/queue/policy"),
+            Right::required("POST", "/api/sites/blog/_boatramp/queue/pause"),
+            "site queue/policy grades identically to queue/pause (Site·Write)"
+        );
 
         // The destructive project-bus POST needs `Project·Admin`: a `project_admin`
         // token on the SAME project satisfies it; a `project_publisher` (deploy-grade)

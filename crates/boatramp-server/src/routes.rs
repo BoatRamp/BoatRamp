@@ -359,6 +359,10 @@ pub fn router_with_fast(
             "/api/sites/{site}/_boatramp/queue/pause",
             post(operator_queue_pause),
         )
+        .route(
+            "/api/sites/{site}/_boatramp/queue/policy",
+            post(operator_queue_policy),
+        )
         // Project-BUS operator surface: the same DLQ/queue ops as the per-site surface
         // above, but for the SHARED project bus (`{project}/bus/{topic}`, the keyspace a
         // `bus:<topic>` publish routes to across every site in the project) rather than a
@@ -394,6 +398,10 @@ pub fn router_with_fast(
         .route(
             "/api/projects/{project}/_boatramp/bus/queue/pause",
             post(operator_bus_queue_pause),
+        )
+        .route(
+            "/api/projects/{project}/_boatramp/bus/queue/policy",
+            post(operator_bus_queue_policy),
         )
         // Captured guest logs for a function — symmetric to the per-site logs endpoint,
         // reading the same store under the function's project-qualified scope. Project-

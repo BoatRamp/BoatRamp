@@ -76,12 +76,54 @@ pub enum MessagingError {
     /// A stored record could not be decoded.
     #[error("messaging decode error: {0}")]
     Decode(String),
+    /// The backend does not support the requested operator control (e.g. a per-topic policy on a
+    /// backend that can't persist/enforce one). A **fail-closed** refusal: an operator's cap is
+    /// rejected loudly rather than silently dropped.
+    #[error("messaging operation not supported by this backend: {0}")]
+    Unsupported(String),
+    /// A publish was rejected because the topic's backlog is already at its operator-configured
+    /// `max_depth` (Feature B, fail-closed): nothing was enqueued. The producer must back off / retry.
+    #[error("publish rejected: topic {0:?} backlog is at its configured max_depth")]
+    DepthExceeded(String),
+    /// A publish was rejected because the topic's per-node publish rate exceeded its
+    /// operator-configured `max_rate_per_sec` (Feature B, best-effort token bucket): nothing was
+    /// enqueued. The producer must back off / retry.
+    #[error("publish rejected: topic {0:?} exceeded its configured max_rate_per_sec")]
+    RateExceeded(String),
 }
 
 impl MessagingError {
     fn backend<E: std::fmt::Display>(err: E) -> Self {
         Self::Backend(err.to_string())
     }
+}
+
+/// A per-topic operator flow-control policy (v0.4.24), stored in the KV under [`mqpolicy_key`] as
+/// JSON (mirroring the [`pause_key`] marker pattern — a tiny per-topic KV record). Every field is
+/// optional: a `None` field means "no cap on that axis", so an all-`None` policy (or no policy at
+/// all) is exactly the pre-v0.4.24 behavior. Set via [`Messaging::set_topic_policy`], read (cached)
+/// on the publish hot path via [`Messaging::topic_policy`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TopicPolicy {
+    /// **Backlog cap (fail-closed).** When set, a publish is rejected with
+    /// [`MessagingError::DepthExceeded`] if the topic's current [`backlog`](Messaging::backlog) is
+    /// already `>= max_depth` — nothing is enqueued. `None` ⇒ unbounded (and the hot path never even
+    /// calls `backlog`, so an uncapped topic pays nothing).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_depth: Option<usize>,
+    /// **Per-node publish rate cap (best-effort).** When set, a per-node per-topic token bucket
+    /// refilling at this many tokens/sec gates publishes; a publish with no token is rejected with
+    /// [`MessagingError::RateExceeded`]. Deliberately **per-node** (each node enforces its own bucket
+    /// independently) — a cluster-wide exact rate would need a replicated counter on the hot path.
+    /// `None` ⇒ unlimited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_rate_per_sec: Option<u32>,
+    /// **Per-topic relaxed-durability budget (single-node only).** Overrides the node-wide
+    /// [`LogMessaging::with_max_unflushed`] budget FOR THIS TOPIC: how many of this topic's messages
+    /// may fast-ack on the memtable before a durable checkpoint is forced. `None` ⇒ inherit the node
+    /// default. Inert on the cluster (its durability is replication, a different axis).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_unflushed: Option<usize>,
 }
 
 /// A durable pub/sub topic substrate with at-least-once consumer delivery. The
@@ -412,6 +454,28 @@ pub trait Messaging: Send + Sync {
         Ok(false)
     }
 
+    /// **Set** a per-topic operator flow-control policy ([`TopicPolicy`], v0.4.24): backlog cap,
+    /// per-node rate cap, and (single-node) relaxed-durability override. Persisted as JSON in the KV
+    /// (mirroring the pause marker) and enforced on the publish path. Default: **refuse** with
+    /// [`MessagingError::Unsupported`], so a backend that cannot persist/enforce a policy fails closed
+    /// (an operator's cap is never silently dropped) rather than pretending to accept it.
+    async fn set_topic_policy(
+        &self,
+        _topic: &str,
+        _policy: TopicPolicy,
+    ) -> Result<(), MessagingError> {
+        Err(MessagingError::Unsupported(
+            "per-topic policy is not supported by this messaging backend".into(),
+        ))
+    }
+
+    /// **Read** a topic's operator policy ([`TopicPolicy`]), or `None` if none is set. Default `None`
+    /// (no policy ⇒ pre-v0.4.24 unbounded behavior). The durable backends cache this so the publish
+    /// hot path does not KV-read on every publish.
+    async fn topic_policy(&self, _topic: &str) -> Result<Option<TopicPolicy>, MessagingError> {
+        Ok(None)
+    }
+
     /// Reclaim the retained fan-out log + payloads on a **grouped** `topic` that
     /// every consumer group has already consumed (a message below every group's
     /// high-water with none holding it in-flight), with an age-based TTL backstop.
@@ -575,6 +639,13 @@ struct PublishJob {
     /// unit the relaxed-durability un-flushed budget counts, so the crash-loss window is bounded in
     /// messages regardless of how many index ops each message needs.
     msgs: usize,
+    /// The RESOLVED relaxed-durability budget for this job's message(s) (Feature C, v0.4.24): the
+    /// topic's [`TopicPolicy::max_unflushed`] if set, else the node default
+    /// [`LogMessaging::max_unflushed`]. The group-commit coalesces jobs ACROSS topics into one
+    /// `write_batch`, so the effective budget for a drained batch is the **MINIMUM** of its jobs'
+    /// `max_unflushed` — a single strong (`0`) topic anywhere forces the whole batch durable (the
+    /// safe over-approximation), and `0` everywhere is byte-for-byte the strong path.
+    max_unflushed: usize,
     done: futures::channel::oneshot::Sender<Result<(), MessagingError>>,
 }
 
@@ -819,6 +890,12 @@ pub fn dead_prefix(topic: &str) -> String {
 /// deliveries suppressed; publish + in-flight ack/nack unaffected). A tiny marker; absent = flowing.
 pub fn pause_key(topic: &str) -> String {
     format!("mqpause/{topic}")
+}
+/// KV/state key for a topic's **operator policy** ([`TopicPolicy`], v0.4.24): a tiny per-topic JSON
+/// record (mirroring [`pause_key`]) carrying the backlog/rate/relaxed-durability caps. Absent = no
+/// policy (unbounded).
+pub fn mqpolicy_key(topic: &str) -> String {
+    format!("mqpolicy/{topic}")
 }
 
 // --- consumer-group (durable fan-out) keyspace: the offset-log model ---
@@ -1192,6 +1269,25 @@ pub struct LogMessaging {
     /// when `max_unflushed > 0`). The group-commit leader reads+updates it under the commit gate, so
     /// it needs no stronger ordering than `Relaxed`.
     unflushed: std::sync::atomic::AtomicUsize,
+    /// Per-topic operator policy cache (Feature A, v0.4.24): the publish hot path resolves a topic's
+    /// [`TopicPolicy`] from here instead of KV-reading every publish. Populated lazily on first
+    /// resolve (a KV read of [`mqpolicy_key`]), INVALIDATED on [`set_topic_policy`]. `None` value ==
+    /// "resolved: no policy" (a negative cache entry — an uncapped topic is not re-read every publish).
+    policy_cache: std::sync::Mutex<HashMap<String, Option<TopicPolicy>>>,
+    /// Per-node per-topic publish **token bucket** (Feature B `max_rate_per_sec`, best-effort): the
+    /// live `(tokens, last_refill_ms)` per rate-capped topic, refilled at the topic's configured rate.
+    /// Only touched when a topic actually sets a rate cap, so an uncapped topic pays nothing.
+    rate_buckets: std::sync::Mutex<HashMap<String, TokenBucket>>,
+}
+
+/// A per-node per-topic token bucket for the best-effort publish rate cap (Feature B). Refills at
+/// `max_rate_per_sec` tokens/sec (capped at the burst = the rate), draining one token per message.
+#[derive(Debug, Clone, Copy)]
+struct TokenBucket {
+    /// Available tokens (fractional refill accumulates across sub-second calls).
+    tokens: f64,
+    /// Unix-ms of the last refill, used to compute elapsed time on the next draw.
+    last_refill_ms: u64,
 }
 
 /// How long a grouped topic retains a message (its log + payload) before the
@@ -1226,6 +1322,8 @@ impl LogMessaging {
             commit_gate: futures::lock::Mutex::new(()),
             max_unflushed: 0, // strong durability by default (== the original always-await-flush path)
             unflushed: std::sync::atomic::AtomicUsize::new(0),
+            policy_cache: std::sync::Mutex::new(HashMap::new()),
+            rate_buckets: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -1241,17 +1339,130 @@ impl LogMessaging {
         self
     }
 
+    /// Resolve `topic`'s operator [`TopicPolicy`] (Feature A), serving from the in-memory cache and
+    /// lazily loading (a single KV read of [`mqpolicy_key`]) on a miss. A `None` result is cached as
+    /// a negative entry, so an uncapped topic is NOT KV-read on every publish. A KV-read error
+    /// propagates (the publish path fails closed — never silently treats an unreadable policy as
+    /// "no cap").
+    async fn resolve_policy(&self, topic: &str) -> Result<Option<TopicPolicy>, MessagingError> {
+        {
+            let cache = self.policy_cache.lock().unwrap();
+            if let Some(hit) = cache.get(topic) {
+                return Ok(hit.clone());
+            }
+        }
+        let policy = match self
+            .kv
+            .get(&mqpolicy_key(topic))
+            .await
+            .map_err(MessagingError::backend)?
+        {
+            Some(raw) => Some(
+                serde_json::from_slice::<TopicPolicy>(&raw)
+                    .map_err(|e| MessagingError::Decode(e.to_string()))?,
+            ),
+            None => None,
+        };
+        self.policy_cache
+            .lock()
+            .unwrap()
+            .insert(topic.to_string(), policy.clone());
+        Ok(policy)
+    }
+
+    /// Enforce a resolved [`TopicPolicy`] against a publish of `n` messages onto `topic` (Feature B),
+    /// BEFORE anything is enqueued. Fail-closed in order: (1) `max_depth` — reject with
+    /// [`MessagingError::DepthExceeded`] if the current backlog is already at the cap (only queried
+    /// when a cap is set, so an uncapped topic never calls `backlog`); (2) `max_rate_per_sec` — a
+    /// per-node token bucket, reject with [`MessagingError::RateExceeded`] if `n` tokens aren't
+    /// available. A `None`/absent policy is a no-op (the fast path — the caller only calls this when
+    /// `resolve_policy` returned `Some`).
+    async fn enforce_publish_policy(
+        &self,
+        topic: &str,
+        policy: &TopicPolicy,
+        n: usize,
+    ) -> Result<(), MessagingError> {
+        // 1) Depth (fail-closed). Only touch `backlog` when a cap is actually configured — an
+        //    uncapped topic pays ZERO added cost (the hot-path requirement).
+        if let Some(max_depth) = policy.max_depth {
+            let backlog = self.backlog(topic).await?;
+            if backlog >= max_depth {
+                return Err(MessagingError::DepthExceeded(topic.to_string()));
+            }
+        }
+        // 2) Rate (best-effort, per-node token bucket). A whole batch draws `n` tokens at once, so a
+        //    publish_batch is gated as one unit (simple + fail-closed): if the batch doesn't fit the
+        //    remaining budget, the whole publish is rejected and nothing is enqueued.
+        if let Some(rate) = policy.max_rate_per_sec {
+            if !self.try_take_tokens(topic, rate, n) {
+                return Err(MessagingError::RateExceeded(topic.to_string()));
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolve `topic`'s policy (cached), enforce depth/rate for `n` messages (Feature B, fail-closed
+    /// — nothing is enqueued on a breach), and return the effective relaxed-durability budget for the
+    /// publish (Feature C): the topic override, else the node default. The shared front half of every
+    /// publish variant. `None` policy (the common case) skips enforcement and yields the node default.
+    async fn enforce_and_resolve_budget(
+        &self,
+        topic: &str,
+        n: usize,
+    ) -> Result<usize, MessagingError> {
+        match self.resolve_policy(topic).await? {
+            Some(p) => {
+                self.enforce_publish_policy(topic, &p, n).await?;
+                Ok(p.max_unflushed.unwrap_or(self.max_unflushed))
+            }
+            None => Ok(self.max_unflushed),
+        }
+    }
+
+    /// Draw `n` tokens from `topic`'s per-node bucket, refilling at `rate` tokens/sec since the last
+    /// draw (burst capped at `rate`). Returns whether the draw succeeded. A fresh bucket starts full
+    /// (`rate` tokens), so the first burst up to the rate is admitted. Best-effort, per-node.
+    fn try_take_tokens(&self, topic: &str, rate: u32, n: usize) -> bool {
+        let now = now_unix_ms();
+        let cap = f64::from(rate);
+        let mut buckets = self.rate_buckets.lock().unwrap();
+        let bucket = buckets.entry(topic.to_string()).or_insert(TokenBucket {
+            tokens: cap,
+            last_refill_ms: now,
+        });
+        // Refill for the elapsed time (fractional), clamped to the burst cap.
+        let elapsed_ms = now.saturating_sub(bucket.last_refill_ms);
+        if elapsed_ms > 0 {
+            bucket.tokens = (bucket.tokens + (elapsed_ms as f64) * cap / 1000.0).min(cap);
+            bucket.last_refill_ms = now;
+        }
+        let need = n as f64;
+        if bucket.tokens >= need {
+            bucket.tokens -= need;
+            true
+        } else {
+            false
+        }
+    }
+
     /// Group-commit a publisher's index ops (A2): push the job, take the gate, and — as whoever holds
     /// the gate — drain the queue and commit EVERYONE's ops in one `write_batch`, signalling each.
     /// A publisher that pushed but was flushed by an earlier gate-holder simply finds its one-shot
     /// already resolved. Returns only after this job's group is durably committed (at-least-once); a
     /// failed group commit fails every member (no partial success). Runtime-agnostic: no spawned task.
-    async fn group_commit(&self, ops: Vec<WriteOp>, msgs: usize) -> Result<(), MessagingError> {
+    async fn group_commit(
+        &self,
+        ops: Vec<WriteOp>,
+        msgs: usize,
+        max_unflushed: usize,
+    ) -> Result<(), MessagingError> {
         use futures::future::{select, Either};
         let (done_tx, mut done_rx) = futures::channel::oneshot::channel();
         self.commit_queue.lock().unwrap().push(PublishJob {
             ops,
             msgs,
+            max_unflushed,
             done: done_tx,
         });
         // Become the LEADER only if the commit gate is free; otherwise our just-pushed job is
@@ -1297,12 +1508,18 @@ impl LogMessaging {
                 let mut all_ops = Vec::new();
                 let mut dones = Vec::with_capacity(batch.len());
                 let mut msgs = 0usize;
+                // Feature C: the effective relaxed-durability budget for this coalesced batch is the
+                // MINIMUM `max_unflushed` across its jobs — a strong (0) topic anywhere forces the
+                // whole batch durable (the safe over-approximation). `usize::MAX` is the identity for
+                // `min`; a non-empty drain always lowers it to a real per-job budget.
+                let mut batch_max_unflushed = usize::MAX;
                 for mut job in batch {
                     all_ops.append(&mut job.ops);
                     msgs += job.msgs;
+                    batch_max_unflushed = batch_max_unflushed.min(job.max_unflushed);
                     dones.push(job.done);
                 }
-                let outcome = self.commit_group(all_ops, msgs).await;
+                let outcome = self.commit_group(all_ops, msgs, batch_max_unflushed).await;
                 for done in dones {
                     // A dropped receiver (cancelled publisher) is harmless — the message is still
                     // durably committed; at-least-once/redelivery is unaffected.
@@ -1319,18 +1536,26 @@ impl LogMessaging {
 
     /// Durably commit one drained group of `msgs` messages, honoring the relaxed-durability budget.
     ///
-    /// With `max_unflushed == 0` (the default) the `prior + msgs <= 0` guard is never true for a
-    /// non-empty group, so this ALWAYS takes the durable `write_batch` branch — byte-for-byte the
-    /// strong path. With `max_unflushed > 0` it fast-acks via `write_batch_relaxed` while the running
-    /// un-flushed count stays within budget, and forces a durable `write_batch` checkpoint the moment
-    /// admitting this group would exceed it. A durable `write_batch` flushes SlateDB's whole WAL
-    /// buffer (every prior relaxed write with it), so the checkpoint truly drains the un-durable set —
-    /// hence the counter resets to 0. The counter is only touched on the success path (a failed commit
-    /// leaves it unchanged; the caller fails the whole group).
-    async fn commit_group(&self, ops: Vec<WriteOp>, msgs: usize) -> Result<(), MessagingError> {
+    /// `max_unflushed` is the **effective** budget for this coalesced batch — the MINIMUM across the
+    /// drained jobs' resolved per-topic budgets (Feature C), which the node default (0 == strong)
+    /// when no topic overrides it. With `max_unflushed == 0` the `prior + msgs <= 0` guard is never
+    /// true for a non-empty group, so this ALWAYS takes the durable `write_batch` branch —
+    /// byte-for-byte the strong path (the owner's `budget-0 == strong` invariant, now per-batch).
+    /// With `max_unflushed > 0` it fast-acks via `write_batch_relaxed` while the running un-flushed
+    /// count stays within budget, and forces a durable `write_batch` checkpoint the moment admitting
+    /// this group would exceed it. A durable `write_batch` flushes SlateDB's whole WAL buffer (every
+    /// prior relaxed write with it), so the checkpoint truly drains the un-durable set — hence the
+    /// node-wide `unflushed` counter resets to 0. The counter is only touched on the success path (a
+    /// failed commit leaves it unchanged; the caller fails the whole group).
+    async fn commit_group(
+        &self,
+        ops: Vec<WriteOp>,
+        msgs: usize,
+        max_unflushed: usize,
+    ) -> Result<(), MessagingError> {
         use std::sync::atomic::Ordering;
         let prior = self.unflushed.load(Ordering::Relaxed);
-        if prior + msgs <= self.max_unflushed {
+        if prior + msgs <= max_unflushed {
             // Under budget (only reachable when max_unflushed > 0): fast-ack on the memtable insert.
             self.kv
                 .write_batch_relaxed(ops)
@@ -1788,6 +2013,11 @@ impl Messaging for LogMessaging {
         payload: &[u8],
         signed_context: Option<&str>,
     ) -> Result<(), MessagingError> {
+        // Feature B/C: resolve (cached) the topic's operator policy, enforce depth/rate BEFORE
+        // building anything (a breach rejects the publish with nothing enqueued), and take the
+        // effective relaxed-durability budget (policy override, else node default). Most topics have
+        // no policy — the fast path skips enforcement and yields the node default at zero KV cost.
+        let max_unflushed = self.enforce_and_resolve_budget(topic, 1).await?;
         // Build this message's index ops (doing any object-store payload write first), then commit
         // them in one durable group-commit. Factored so `publish_batch_ctx` reuses the identical
         // A3-inline / SA1-budget / grouped-retain decisions and coalesces N messages into one commit.
@@ -1798,7 +2028,7 @@ impl Messaging for LogMessaging {
         // `write_batch`. Returns only after this message's group is durably committed
         // (at-least-once); a failed group fails this publish too. Payloads (object store) were
         // already written by `build_publish_ops` (payload-first), so only the index writes are here.
-        self.group_commit(ops, 1).await?;
+        self.group_commit(ops, 1, max_unflushed).await?;
         // Notify live SSE subscribers (best-effort, separate from the durable queue above).
         self.hubs.broadcast(topic, &id, payload);
         Ok(())
@@ -1811,6 +2041,8 @@ impl Messaging for LogMessaging {
         delay: Duration,
         signed_context: Option<&str>,
     ) -> Result<(), MessagingError> {
+        // Feature B/C: enforce the topic's operator policy (depth/rate) and resolve its relaxed budget.
+        let max_unflushed = self.enforce_and_resolve_budget(topic, 1).await?;
         // Delivery-mode delay (P2): initial not-before = now + delay (0 ⇒ claimable now). The message
         // is durably committed immediately; the lease field defers its first delivery.
         let not_before_ms = if delay.is_zero() {
@@ -1821,7 +2053,7 @@ impl Messaging for LogMessaging {
         let (id, ops) = self
             .build_publish_ops(topic, payload, signed_context, not_before_ms, 0, 0)
             .await?;
-        self.group_commit(ops, 1).await?;
+        self.group_commit(ops, 1, max_unflushed).await?;
         // A delayed message isn't live yet; still notify SSE (best-effort) so a live tail sees it.
         self.hubs.broadcast(topic, &id, payload);
         Ok(())
@@ -1834,6 +2066,8 @@ impl Messaging for LogMessaging {
         ttl: Duration,
         signed_context: Option<&str>,
     ) -> Result<(), MessagingError> {
+        // Feature B/C: enforce the topic's operator policy (depth/rate) and resolve its relaxed budget.
+        let max_unflushed = self.enforce_and_resolve_budget(topic, 1).await?;
         // Delivery-mode TTL (P2): expires_at = now + ttl (0 ⇒ no expiry). The message is durably
         // committed now; a claim after expiry dead-letters it (reason ttl-expired) instead of delivering.
         let expires_at_ms = if ttl.is_zero() {
@@ -1844,7 +2078,7 @@ impl Messaging for LogMessaging {
         let (id, ops) = self
             .build_publish_ops(topic, payload, signed_context, 0, expires_at_ms, 0)
             .await?;
-        self.group_commit(ops, 1).await?;
+        self.group_commit(ops, 1, max_unflushed).await?;
         self.hubs.broadcast(topic, &id, payload);
         Ok(())
     }
@@ -1856,11 +2090,13 @@ impl Messaging for LogMessaging {
         priority: u8,
         signed_context: Option<&str>,
     ) -> Result<(), MessagingError> {
+        // Feature B/C: enforce the topic's operator policy (depth/rate) and resolve its relaxed budget.
+        let max_unflushed = self.enforce_and_resolve_budget(topic, 1).await?;
         // Delivery-mode priority (P2): higher leases first (ties FIFO); 0 = normal. Work-queue only.
         let (id, ops) = self
             .build_publish_ops(topic, payload, signed_context, 0, 0, priority)
             .await?;
-        self.group_commit(ops, 1).await?;
+        self.group_commit(ops, 1, max_unflushed).await?;
         self.hubs.broadcast(topic, &id, payload);
         Ok(())
     }
@@ -1872,6 +2108,27 @@ impl Messaging for LogMessaging {
     ) -> Result<(), MessagingError> {
         if messages.is_empty() {
             return Ok(());
+        }
+        // Feature B/C — enforce each distinct topic's policy ONCE for the count of messages the batch
+        // carries on it (fail-closed: a breach returns before we build/commit, so NOTHING in the batch
+        // is enqueued — the same all-or-nothing the durable commit already gives), and resolve the
+        // batch's effective relaxed-durability budget = the MINIMUM `max_unflushed` across its topics
+        // (a strong topic anywhere forces the whole batch durable). Most topics have no policy, so
+        // this is one cached resolve per distinct topic and no enforcement.
+        let mut per_topic_count: HashMap<&str, usize> = HashMap::new();
+        for (topic, _) in messages {
+            *per_topic_count.entry(topic.as_str()).or_insert(0) += 1;
+        }
+        let mut batch_max_unflushed = usize::MAX;
+        for (topic, count) in &per_topic_count {
+            match self.resolve_policy(topic).await? {
+                Some(p) => {
+                    self.enforce_publish_policy(topic, &p, *count).await?;
+                    batch_max_unflushed =
+                        batch_max_unflushed.min(p.max_unflushed.unwrap_or(self.max_unflushed));
+                }
+                None => batch_max_unflushed = batch_max_unflushed.min(self.max_unflushed),
+            }
         }
         // A4 — coalesce the WHOLE batch's index writes into ONE durable `write_batch`: build every
         // message's ops (each doing its own payload-first object-store write + A3/SA1 decision), then
@@ -1887,7 +2144,8 @@ impl Messaging for LogMessaging {
             all_ops.extend(ops);
             broadcasts.push((topic.as_str(), id, payload.as_slice()));
         }
-        self.group_commit(all_ops, messages.len()).await?;
+        self.group_commit(all_ops, messages.len(), batch_max_unflushed)
+            .await?;
         for (topic, id, payload) in &broadcasts {
             self.hubs.broadcast(topic, id, payload);
         }
@@ -2872,6 +3130,30 @@ impl Messaging for LogMessaging {
             .await
             .map_err(MessagingError::backend)?
             .is_some())
+    }
+
+    async fn set_topic_policy(
+        &self,
+        topic: &str,
+        policy: TopicPolicy,
+    ) -> Result<(), MessagingError> {
+        // Feature A: persist the policy as JSON under `mqpolicy/{topic}` (mirroring the pause marker),
+        // then INVALIDATE the in-memory cache so the next publish resolves the fresh value. An
+        // all-`None` policy is still persisted (an explicit "no caps" that overrides a prior policy);
+        // the cache is invalidated either way. Write-then-invalidate: a concurrent publish either
+        // sees the old cached policy or re-reads the new one — never a torn state.
+        let json = serde_json::to_vec(&policy).map_err(MessagingError::backend)?;
+        self.kv
+            .put(&mqpolicy_key(topic), json)
+            .await
+            .map_err(MessagingError::backend)?;
+        self.policy_cache.lock().unwrap().remove(topic);
+        Ok(())
+    }
+
+    async fn topic_policy(&self, topic: &str) -> Result<Option<TopicPolicy>, MessagingError> {
+        // Served through the same cache the publish path uses (lazily loaded on a miss).
+        self.resolve_policy(topic).await
     }
 
     async fn retention_sweep(
@@ -4140,6 +4422,269 @@ mod tests {
         assert_eq!(
             seen, 12,
             "every relaxed-and-checkpointed publish is claimable"
+        );
+    }
+
+    // ---- Feature A/B/C: per-topic operator policy (v0.4.24) -----------------
+
+    /// Feature A roundtrip: set_topic_policy persists + topic_policy reads it back (through the
+    /// cache), and set invalidates the cache so the fresh value is seen.
+    #[tokio::test]
+    async fn topic_policy_set_and_get_roundtrips_and_invalidates_cache() {
+        let mq = mq();
+        assert_eq!(
+            mq.topic_policy("t").await.unwrap(),
+            None,
+            "no policy initially"
+        );
+        mq.set_topic_policy(
+            "t",
+            TopicPolicy {
+                max_depth: Some(5),
+                max_rate_per_sec: None,
+                max_unflushed: Some(3),
+            },
+        )
+        .await
+        .unwrap();
+        let got = mq.topic_policy("t").await.unwrap().expect("policy set");
+        assert_eq!(got.max_depth, Some(5));
+        assert_eq!(got.max_unflushed, Some(3));
+        // Overwrite → the cache must not serve the stale value.
+        mq.set_topic_policy(
+            "t",
+            TopicPolicy {
+                max_depth: Some(9),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            mq.topic_policy("t").await.unwrap().unwrap().max_depth,
+            Some(9),
+            "set invalidated the cache; the fresh cap is read"
+        );
+    }
+
+    /// Feature B `max_depth` (fail-closed): a publish is rejected once the backlog is at the cap, and
+    /// nothing is enqueued by the rejected call; publishes strictly under the cap succeed.
+    #[tokio::test]
+    async fn max_depth_rejects_publish_at_cap() {
+        let mq = mq();
+        mq.set_topic_policy(
+            "t",
+            TopicPolicy {
+                max_depth: Some(3),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        // Backlog 0,1,2 → all under the cap of 3, admitted.
+        for i in 0..3u32 {
+            mq.publish("t", format!("m{i}").as_bytes())
+                .await
+                .unwrap_or_else(|e| panic!("under-cap publish {i} should pass, got {e:?}"));
+        }
+        assert_eq!(mq.backlog("t").await.unwrap(), 3);
+        // Backlog is now 3 == max_depth → the next publish is rejected, fail-closed.
+        let err = mq.publish("t", b"overflow").await.unwrap_err();
+        assert!(
+            matches!(err, MessagingError::DepthExceeded(ref topic) if topic == "t"),
+            "publish at the cap is rejected with DepthExceeded, got {err:?}"
+        );
+        assert_eq!(
+            mq.backlog("t").await.unwrap(),
+            3,
+            "the rejected publish enqueued nothing (backlog unchanged)"
+        );
+        // Draining below the cap re-opens the topic.
+        let claimed = mq.claim("t", LEASE, 1, 5).await.unwrap();
+        mq.ack(&claimed[0]).await.unwrap();
+        assert_eq!(mq.backlog("t").await.unwrap(), 2);
+        mq.publish("t", b"now-fits")
+            .await
+            .expect("under-cap again after a drain");
+    }
+
+    /// Feature B `max_depth` uncapped fast path: with no policy (or a `None` depth), a publish never
+    /// consults the backlog cap — an uncapped topic accepts unboundedly (regression guard).
+    #[tokio::test]
+    async fn no_policy_leaves_publishing_unbounded() {
+        let mq = mq();
+        for i in 0..50u32 {
+            mq.publish("t", format!("m{i}").as_bytes()).await.unwrap();
+        }
+        assert_eq!(mq.backlog("t").await.unwrap(), 50);
+    }
+
+    /// Feature B `max_rate_per_sec` (best-effort): a fresh bucket admits a burst up to the rate, then
+    /// rejects with RateExceeded once the tokens are spent (no real time elapses in the test, so no
+    /// refill happens between the tightly-looped publishes).
+    #[tokio::test]
+    async fn max_rate_rejects_when_tokens_exhausted() {
+        let mq = mq();
+        mq.set_topic_policy(
+            "t",
+            TopicPolicy {
+                max_rate_per_sec: Some(3),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        // Burst of 3 fits the full bucket.
+        let mut ok = 0;
+        let mut rate_rejected = 0;
+        for i in 0..8u32 {
+            match mq.publish("t", format!("m{i}").as_bytes()).await {
+                Ok(()) => ok += 1,
+                Err(MessagingError::RateExceeded(_)) => rate_rejected += 1,
+                Err(e) => panic!("unexpected error {e:?}"),
+            }
+        }
+        assert!(
+            ok >= 3,
+            "the initial burst up to the rate was admitted (got {ok})"
+        );
+        assert!(
+            rate_rejected > 0,
+            "once the bucket drained, further publishes were rate-rejected (got {rate_rejected})"
+        );
+        assert_eq!(ok + rate_rejected, 8);
+    }
+
+    /// Feature C: a per-topic `max_unflushed` OVERRIDES the node default in `commit_group`. A STRONG
+    /// per-topic override (0) forces durable even when the node is relaxed — asserted via the
+    /// CountingKv write_batch-vs-write_batch_relaxed counters (mirrors the durability tests).
+    #[tokio::test]
+    async fn per_topic_max_unflushed_override_forces_durable() {
+        use std::sync::atomic::Ordering as O;
+        let kv = Arc::new(CountingKv {
+            inner: MemoryKv::new(),
+            batches: std::sync::atomic::AtomicUsize::new(0),
+            relaxed: std::sync::atomic::AtomicUsize::new(0),
+        });
+        // Node is RELAXED (budget 8) — absent a policy, publishes fast-ack on the relaxed path.
+        let mq =
+            LogMessaging::new(Arc::new(MemStorage::default()), kv.clone()).with_max_unflushed(8);
+        // A per-topic STRONG override (0) on topic "s".
+        mq.set_topic_policy(
+            "s",
+            TopicPolicy {
+                max_unflushed: Some(0),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        for i in 0..6u32 {
+            mq.publish("s", format!("m{i}").as_bytes()).await.unwrap();
+        }
+        assert_eq!(
+            kv.relaxed.load(O::Relaxed),
+            0,
+            "the strong per-topic override NEVER took the relaxed path (durable, like budget 0)"
+        );
+        assert_eq!(
+            kv.batches.load(O::Relaxed),
+            6,
+            "every publish on the strong-override topic took a durable write_batch"
+        );
+        // A topic WITHOUT an override inherits the relaxed node default → fast-acks.
+        for i in 0..6u32 {
+            mq.publish("r", format!("m{i}").as_bytes()).await.unwrap();
+        }
+        assert!(
+            kv.relaxed.load(O::Relaxed) > 0,
+            "a topic with no override inherits the node's relaxed budget (fast-acked at least once)"
+        );
+    }
+
+    /// Feature C min-over-batch: a single `publish_batch` mixing a STRONG-override topic (0) with a
+    /// relaxed topic commits the WHOLE coalesced batch durably — the minimum budget across the
+    /// batch's topics wins (the safe over-approximation), so the strong topic anywhere forces durable.
+    #[tokio::test]
+    async fn batch_min_over_topics_forces_durable_when_any_is_strong() {
+        use std::sync::atomic::Ordering as O;
+        let kv = Arc::new(CountingKv {
+            inner: MemoryKv::new(),
+            batches: std::sync::atomic::AtomicUsize::new(0),
+            relaxed: std::sync::atomic::AtomicUsize::new(0),
+        });
+        // Node relaxed (budget 100 — a batch of 4 would otherwise fast-ack).
+        let mq =
+            LogMessaging::new(Arc::new(MemStorage::default()), kv.clone()).with_max_unflushed(100);
+        // Topic "strong" pins the whole batch durable via its 0 override; "relaxed" has none.
+        mq.set_topic_policy(
+            "strong",
+            TopicPolicy {
+                max_unflushed: Some(0),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let msgs: Vec<(String, Vec<u8>)> = vec![
+            ("relaxed".into(), b"a".to_vec()),
+            ("strong".into(), b"b".to_vec()),
+            ("relaxed".into(), b"c".to_vec()),
+            ("relaxed".into(), b"d".to_vec()),
+        ];
+        mq.publish_batch_ctx(&msgs, None).await.unwrap();
+        assert_eq!(
+            kv.relaxed.load(O::Relaxed),
+            0,
+            "the strong-override topic in the batch forced the whole coalesced batch durable"
+        );
+        assert_eq!(
+            kv.batches.load(O::Relaxed),
+            1,
+            "still ONE coalesced durable write_batch for the batch"
+        );
+    }
+
+    /// Fail-closed: an unsupported backend (the trait default) REFUSES set_topic_policy with
+    /// Unsupported, so an operator's cap is never silently dropped. A bare Messaging impl (only the
+    /// required methods) inherits the defaults.
+    #[tokio::test]
+    async fn unsupported_backend_refuses_set_topic_policy() {
+        struct BareBackend;
+        #[async_trait]
+        impl Messaging for BareBackend {
+            async fn publish(&self, _: &str, _: &[u8]) -> Result<(), MessagingError> {
+                Ok(())
+            }
+            async fn claim(
+                &self,
+                _: &str,
+                _: Duration,
+                _: usize,
+                _: u32,
+            ) -> Result<Vec<ClaimedMessage>, MessagingError> {
+                Ok(Vec::new())
+            }
+            async fn ack(&self, _: &ClaimedMessage) -> Result<(), MessagingError> {
+                Ok(())
+            }
+            async fn nack(&self, _: &ClaimedMessage) -> Result<(), MessagingError> {
+                Ok(())
+            }
+        }
+        let mq = BareBackend;
+        let err = mq
+            .set_topic_policy("t", TopicPolicy::default())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, MessagingError::Unsupported(_)),
+            "the default set_topic_policy fails closed, got {err:?}"
+        );
+        assert_eq!(
+            mq.topic_policy("t").await.unwrap(),
+            None,
+            "the default topic_policy reads None"
         );
     }
 
