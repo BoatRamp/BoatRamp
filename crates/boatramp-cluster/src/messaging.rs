@@ -121,11 +121,6 @@ pub struct RaftMessaging {
     commit_queue: StdMutex<Vec<ClusterPublishJob>>,
     /// The group-commit gate (A2): the single propose turn (see [`commit_queue`](Self::commit_queue)).
     commit_gate: futures::lock::Mutex<()>,
-    /// Per-topic operator policy cache (Feature A, v0.4.24): the publish hot path resolves a topic's
-    /// [`messaging::TopicPolicy`] from here instead of reading applied state every publish. Populated
-    /// lazily (from `self.state`), INVALIDATED on `set_topic_policy` (after the replicated Put
-    /// applies locally). `None` == a negative cache entry (an uncapped topic is not re-read).
-    policy_cache: StdMutex<std::collections::HashMap<String, Option<messaging::TopicPolicy>>>,
     /// Per-node per-topic publish **token bucket** (Feature B `max_rate_per_sec`, best-effort): the
     /// live `(tokens, last_refill_ms)` per rate-capped topic. Per-node by design (a cluster-wide exact
     /// rate would need a replicated counter on the hot path). Only touched by rate-capped topics.
@@ -172,38 +167,29 @@ impl RaftMessaging {
             inline_inflight_bytes: AtomicUsize::new(0),
             commit_queue: StdMutex::new(Vec::new()),
             commit_gate: futures::lock::Mutex::new(()),
-            policy_cache: StdMutex::new(std::collections::HashMap::new()),
             rate_buckets: StdMutex::new(std::collections::HashMap::new()),
         }
     }
 
-    /// Resolve `topic`'s operator [`messaging::TopicPolicy`] (Feature A), serving from the in-memory
-    /// cache and lazily loading from this node's applied state (`mqpolicy/{topic}`) on a miss. A
-    /// `None` result is cached as a negative entry, so an uncapped topic is NOT read on every publish.
-    /// A decode error propagates (the publish path fails closed rather than treating an unreadable
-    /// policy as "no cap").
+    /// Resolve `topic`'s operator [`messaging::TopicPolicy`] (Feature A) by reading this node's
+    /// applied state (`mqpolicy/{topic}`) directly — NO cache. Deliberately uncached on the cluster:
+    /// the read is an in-memory applied-state lookup, and a publish already pays a Raft round-trip
+    /// that dwarfs it, so caching buys nothing but a correctness hazard — a per-node cache would not
+    /// see a policy set/changed on ANOTHER node (the operator call can land on any node) until that
+    /// node restarted, silently under-enforcing a just-set cap. Reading applied state per publish is
+    /// always current fleet-wide (the policy store is replicated). A decode error propagates (the
+    /// publish path fails closed rather than treating an unreadable policy as "no cap").
     async fn resolve_policy(
         &self,
         topic: &str,
     ) -> Result<Option<messaging::TopicPolicy>, MessagingError> {
-        {
-            let cache = self.policy_cache.lock().unwrap();
-            if let Some(hit) = cache.get(topic) {
-                return Ok(hit.clone());
-            }
-        }
-        let policy = match self.state.get(&messaging::mqpolicy_key(topic)).await {
-            Some(raw) => Some(
+        match self.state.get(&messaging::mqpolicy_key(topic)).await {
+            Some(raw) => Ok(Some(
                 serde_json::from_slice::<messaging::TopicPolicy>(&raw)
                     .map_err(|e| MessagingError::Decode(e.to_string()))?,
-            ),
-            None => None,
-        };
-        self.policy_cache
-            .lock()
-            .unwrap()
-            .insert(topic.to_string(), policy.clone());
-        Ok(policy)
+            )),
+            None => Ok(None),
+        }
     }
 
     /// Enforce a resolved policy against a publish of `n` messages onto `topic` (Feature B), BEFORE
@@ -1454,7 +1440,8 @@ impl Messaging for RaftMessaging {
             value,
         })
         .await?;
-        self.policy_cache.lock().unwrap().remove(topic);
+        // No cache to invalidate — `resolve_policy` reads applied state per publish, so the new
+        // policy is enforced fleet-wide as soon as the replicated Put applies (no per-node staleness).
         Ok(())
     }
 
@@ -2082,7 +2069,8 @@ mod tests {
 
         // --- v0.4.24 per-topic operator policy (Feature A/B, both backends) -----------------------
         // Runs on a fresh child topic so it does not disturb the running backlog sequence on `topic`.
-        // set/get roundtrips through the (replicated, on cluster) policy store + the node cache.
+        // set/get roundtrips through the policy store — replicated on the cluster (read from applied
+        // Raft state per publish, no node-local cache), KV on single-node.
         let ptopic = &format!("{topic}/policy");
         assert_eq!(
             mq.topic_policy(ptopic).await.unwrap(),
@@ -2124,6 +2112,31 @@ mod tests {
             mq.ack(m).await.unwrap();
         }
         assert_eq!(mq.backlog(ptopic).await.unwrap(), 0);
+
+        // --- P1 redelivery backoff: nack_after holds a message leased, both backends --------------
+        let btopic = format!("{topic}/backoff");
+        mq.publish(&btopic, b"boff").await.unwrap();
+        let claimed = mq.claim(&btopic, LEASE, 10, 5).await.unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].attempts, 1);
+        // A far-future backoff: the message is NOT immediately re-claimable (held leased until the
+        // deadline), but its attempt count is preserved (it still dead-letters at max_attempts).
+        mq.nack_after(&claimed[0], 3_600_000).await.unwrap();
+        assert!(
+            mq.claim(&btopic, LEASE, 10, 5).await.unwrap().is_empty(),
+            "a backed-off nack holds the message leased until the backoff elapses"
+        );
+        // A plain nack (delay 0) makes it claimable immediately; the attempt is then re-charged.
+        mq.nack(&claimed[0]).await.unwrap();
+        let again = mq.claim(&btopic, LEASE, 10, 5).await.unwrap();
+        assert_eq!(again.len(), 1, "nack (no backoff) redelivers immediately");
+        assert_eq!(
+            again[0].attempts, 2,
+            "attempts preserved across backoff then nack"
+        );
+        for m in &again {
+            mq.ack(m).await.unwrap();
+        }
 
         // --- P2 delivery modes: delayed publish (both backends, deterministic deferral) -----------
         // A far-future delay defers delivery; a no-delay companion flows immediately. (Delivery AFTER
@@ -2690,6 +2703,57 @@ mod tests {
             "the Raft group-commit must coalesce concurrent publishes: concurrent {conc_rate:.0} msg/s \
              should be >>3x the serial floor {seq:.0} msg/s"
         );
+    }
+
+    /// **C2 (cluster): purging an inline dead-letter releases its SA1 budget.** An A3-inlined
+    /// work-queue payload is charged to `inline_inflight_bytes` at publish and stays charged while
+    /// it sits dead-lettered (the record still carries the bytes). `purge_dead_letters` must release
+    /// that charge — otherwise a flood of small messages that all dead-letter would permanently pin
+    /// the aggregate-inline budget and force every later publish onto the object-store path. This is
+    /// the cluster analog of the single-node C2 release; it reads the dead record from applied Raft
+    /// state, classifies it inline, and decrements the budget.
+    #[serial_test::serial]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cluster_purge_releases_inline_budget() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (rafts, mqs) = cluster_mq(1).await;
+        let mq = mqs[&1].clone();
+
+        // Small work-queue payload ⇒ A3-inline ⇒ charged to the SA1 aggregate budget.
+        let payload = b"inline-dead";
+        mq.publish("t", payload).await.unwrap();
+        assert_eq!(
+            mq.inline_inflight_bytes.load(Relaxed),
+            payload.len(),
+            "an inlined work-queue publish charges the SA1 budget"
+        );
+
+        // Force a dead-letter: max_attempts=2 ⇒ two zero-lease claims, then the third dead-letters.
+        for expected in 1..=2 {
+            let m = mq.claim("t", Duration::ZERO, 10, 2).await.unwrap();
+            assert_eq!(m.len(), 1, "attempt {expected}");
+        }
+        assert!(mq
+            .claim("t", Duration::ZERO, 10, 2)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(mq.dead_letter_count("t").await.unwrap(), 1);
+        assert_eq!(
+            mq.inline_inflight_bytes.load(Relaxed),
+            payload.len(),
+            "the charge persists while the inline payload sits dead-lettered (record still holds it)"
+        );
+
+        // C2: purging the dead-letter releases the inline bytes back to the budget.
+        assert_eq!(mq.purge_dead_letters("t").await.unwrap(), 1);
+        assert_eq!(
+            mq.inline_inflight_bytes.load(Relaxed),
+            0,
+            "purge releases the inline dead-letter's bytes from the SA1 budget"
+        );
+
+        shutdown(rafts).await;
     }
 
     /// **Grouped no-double-delivery across nodes.** A group registered cluster-wide
