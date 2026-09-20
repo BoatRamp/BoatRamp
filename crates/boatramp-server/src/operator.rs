@@ -243,6 +243,34 @@ fn dlq_namespace(site: &str, alias: &Option<String>, topic: &str) -> String {
     }
 }
 
+/// Namespace a project-bus topic exactly as the dispatcher does for a `bus:<topic>` publish:
+/// `{project}/bus/{topic}` (bare `bus/{topic}` for the reserved `default` project, matching
+/// [`ProjectRef::qualified`]) — the shared, project-scoped bus keyspace common to every site in
+/// the project (see `handler_dispatch`'s `project.qualified("bus")`). An operator token scoped to
+/// project P thus only ever touches P's bus.
+#[cfg(feature = "handlers")]
+fn bus_namespace(project: &ProjectRef<'_>, topic: &str) -> String {
+    project.qualified(&format!("bus/{topic}"))
+}
+
+/// The `messaging` backend, or the shared "not configured" 503 the DLQ/queue endpoints all return
+/// when no bus is wired — hoisted so the site and project-bus handlers share one guard.
+#[cfg(feature = "handlers")]
+fn messaging_or_unavailable(
+    handlers: &HandlerRuntime,
+) -> Result<&std::sync::Arc<dyn boatramp_core::messaging::Messaging>, Response> {
+    let Some(inner) = handlers.inner.as_ref() else {
+        return Err(not_found());
+    };
+    inner.messaging.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "messaging backend not configured\n",
+        )
+            .into_response()
+    })
+}
+
 /// Operator dead-letter INSPECTION (`GET …/_boatramp/dlq`, read): `ls` (filter-matching metadata) or
 /// `show` (one dead-letter in full, incl. payload). Site-scoped like the mutating POST.
 #[cfg(feature = "handlers")]
@@ -251,23 +279,30 @@ pub(super) async fn operator_dlq_list(
     Path(site): Path<String>,
     axum::extract::Query(q): axum::extract::Query<DlqListQuery>,
 ) -> Response {
-    let Some(inner) = handlers.inner.as_ref() else {
-        return not_found();
-    };
-    let Some(messaging) = inner.messaging.as_ref() else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "messaging backend not configured\n",
-        )
-            .into_response();
+    let messaging = match messaging_or_unavailable(&handlers) {
+        Ok(m) => m,
+        Err(resp) => return resp,
     };
     let namespaced = dlq_namespace(&site, &q.alias, &q.topic);
-    if q.show {
-        let Some(id) = q.filter.id.clone() else {
+    dlq_list_core(messaging.as_ref(), &namespaced, q.show, q.filter).await
+}
+
+/// Shared inner logic of the DLQ INSPECTION endpoint (`ls`/`show`), over an
+/// already-namespaced topic — so the site (`{site}/{topic}`) and project-bus
+/// (`{project}/bus/{topic}`) endpoints share one implementation and one response shape.
+#[cfg(feature = "handlers")]
+async fn dlq_list_core(
+    messaging: &dyn boatramp_core::messaging::Messaging,
+    namespaced: &str,
+    show: bool,
+    filter: DlqFilterWire,
+) -> Response {
+    if show {
+        let Some(id) = filter.id.clone() else {
             return (StatusCode::BAD_REQUEST, "show requires ?id=<id>\n").into_response();
         };
-        let group = q.filter.group.clone().unwrap_or_default();
-        return match messaging.show_dead_letter(&namespaced, &group, &id).await {
+        let group = filter.group.clone().unwrap_or_default();
+        return match messaging.show_dead_letter(namespaced, &group, &id).await {
             Ok(Some(dl)) => Json(DlqListResponse {
                 version: DLQ_VIEW_VERSION,
                 dead_letters: vec![DlqEntry::from_dead(dl)],
@@ -282,7 +317,7 @@ pub(super) async fn operator_dlq_list(
         };
     }
     match messaging
-        .list_dead_letters(&namespaced, &q.filter.into_core())
+        .list_dead_letters(namespaced, &filter.into_core())
         .await
     {
         Ok(list) => Json(DlqListResponse {
@@ -340,19 +375,23 @@ pub(super) async fn operator_queue_peek(
     Path(site): Path<String>,
     axum::extract::Query(q): axum::extract::Query<QueuePeekQuery>,
 ) -> Response {
-    let Some(inner) = handlers.inner.as_ref() else {
-        return not_found();
-    };
-    let Some(messaging) = inner.messaging.as_ref() else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "messaging backend not configured\n",
-        )
-            .into_response();
+    let messaging = match messaging_or_unavailable(&handlers) {
+        Ok(m) => m,
+        Err(resp) => return resp,
     };
     let namespaced = dlq_namespace(&site, &q.alias, &q.topic);
-    let limit = q.limit.unwrap_or(10).min(QUEUE_PEEK_MAX);
-    match messaging.peek(&namespaced, limit).await {
+    queue_peek_core(messaging.as_ref(), &namespaced, q.limit).await
+}
+
+/// Shared inner logic of the live-queue PEEK endpoint, over an already-namespaced topic.
+#[cfg(feature = "handlers")]
+async fn queue_peek_core(
+    messaging: &dyn boatramp_core::messaging::Messaging,
+    namespaced: &str,
+    limit: Option<usize>,
+) -> Response {
+    let limit = limit.unwrap_or(10).min(QUEUE_PEEK_MAX);
+    match messaging.peek(namespaced, limit).await {
         Ok(msgs) => {
             use base64::Engine as _;
             let messages = msgs
@@ -414,22 +453,24 @@ pub(super) async fn operator_queue_replay(
     Path(site): Path<String>,
     axum::extract::Query(q): axum::extract::Query<QueueReplayQuery>,
 ) -> Response {
-    let Some(inner) = handlers.inner.as_ref() else {
-        return not_found();
-    };
-    let Some(messaging) = inner.messaging.as_ref() else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "messaging backend not configured\n",
-        )
-            .into_response();
+    let messaging = match messaging_or_unavailable(&handlers) {
+        Ok(m) => m,
+        Err(resp) => return resp,
     };
     let namespaced = dlq_namespace(&site, &q.alias, &q.topic);
-    let limit = q.limit.unwrap_or(10).min(QUEUE_PEEK_MAX);
-    match messaging
-        .replay(&namespaced, q.after.as_deref(), limit)
-        .await
-    {
+    queue_replay_core(messaging.as_ref(), &namespaced, q.after.as_deref(), q.limit).await
+}
+
+/// Shared inner logic of the durable-REPLAY endpoint, over an already-namespaced topic.
+#[cfg(feature = "handlers")]
+async fn queue_replay_core(
+    messaging: &dyn boatramp_core::messaging::Messaging,
+    namespaced: &str,
+    after: Option<&str>,
+    limit: Option<usize>,
+) -> Response {
+    let limit = limit.unwrap_or(10).min(QUEUE_PEEK_MAX);
+    match messaging.replay(namespaced, after, limit).await {
         Ok(msgs) => {
             use base64::Engine as _;
             let next_after = msgs.last().map(|m| m.id.clone());
@@ -490,18 +531,21 @@ pub(super) async fn operator_queue_groups(
     Path(site): Path<String>,
     axum::extract::Query(q): axum::extract::Query<QueueGroupsQuery>,
 ) -> Response {
-    let Some(inner) = handlers.inner.as_ref() else {
-        return not_found();
-    };
-    let Some(messaging) = inner.messaging.as_ref() else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "messaging backend not configured\n",
-        )
-            .into_response();
+    let messaging = match messaging_or_unavailable(&handlers) {
+        Ok(m) => m,
+        Err(resp) => return resp,
     };
     let namespaced = dlq_namespace(&site, &q.alias, &q.topic);
-    match messaging.list_groups(&namespaced).await {
+    queue_groups_core(messaging.as_ref(), &namespaced).await
+}
+
+/// Shared inner logic of the consumer-group LISTING endpoint, over an already-namespaced topic.
+#[cfg(feature = "handlers")]
+async fn queue_groups_core(
+    messaging: &dyn boatramp_core::messaging::Messaging,
+    namespaced: &str,
+) -> Response {
+    match messaging.list_groups(namespaced).await {
         Ok(groups) => Json(QueueGroupsResponse {
             version: DLQ_VIEW_VERSION,
             groups: groups
@@ -542,19 +586,23 @@ pub(super) async fn operator_queue_pause(
     Path(site): Path<String>,
     Json(req): Json<QueuePauseRequest>,
 ) -> Response {
-    let Some(inner) = handlers.inner.as_ref() else {
-        return not_found();
-    };
-    let Some(messaging) = inner.messaging.as_ref() else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "messaging backend not configured\n",
-        )
-            .into_response();
+    let messaging = match messaging_or_unavailable(&handlers) {
+        Ok(m) => m,
+        Err(resp) => return resp,
     };
     let namespaced = dlq_namespace(&site, &req.alias, &req.topic);
-    match messaging.set_paused(&namespaced, req.paused).await {
-        Ok(()) => Json(serde_json::json!({ "ok": true, "paused": req.paused })).into_response(),
+    queue_pause_core(messaging.as_ref(), &namespaced, req.paused).await
+}
+
+/// Shared inner logic of the pause/resume MUTATION, over an already-namespaced topic.
+#[cfg(feature = "handlers")]
+async fn queue_pause_core(
+    messaging: &dyn boatramp_core::messaging::Messaging,
+    namespaced: &str,
+    paused: bool,
+) -> Response {
+    match messaging.set_paused(namespaced, paused).await {
+        Ok(()) => Json(serde_json::json!({ "ok": true, "paused": paused })).into_response(),
         Err(err) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("pause/resume failed: {err}\n"),
@@ -596,25 +644,37 @@ pub(super) async fn operator_queue_group(
     Path(site): Path<String>,
     Json(req): Json<QueueGroupRequest>,
 ) -> Response {
-    let Some(inner) = handlers.inner.as_ref() else {
-        return not_found();
-    };
-    let Some(messaging) = inner.messaging.as_ref() else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "messaging backend not configured\n",
-        )
-            .into_response();
+    let messaging = match messaging_or_unavailable(&handlers) {
+        Ok(m) => m,
+        Err(resp) => return resp,
     };
     let namespaced = dlq_namespace(&site, &req.alias, &req.topic);
-    let result = match req.action {
+    queue_group_core(
+        messaging.as_ref(),
+        &namespaced,
+        req.group,
+        req.action,
+        req.start,
+    )
+    .await
+}
+
+/// Shared inner logic of the consumer-group MUTATION (reset/delete), over an
+/// already-namespaced topic.
+#[cfg(feature = "handlers")]
+async fn queue_group_core(
+    messaging: &dyn boatramp_core::messaging::Messaging,
+    namespaced: &str,
+    group: String,
+    action: GroupAction,
+    start: Option<boatramp_core::messaging::StartPosition>,
+) -> Response {
+    let result = match action {
         GroupAction::Reset => {
-            let start = req
-                .start
-                .unwrap_or(boatramp_core::messaging::StartPosition::Earliest);
-            messaging.reset_group(&namespaced, &req.group, start).await
+            let start = start.unwrap_or(boatramp_core::messaging::StartPosition::Earliest);
+            messaging.reset_group(namespaced, &group, start).await
         }
-        GroupAction::Delete => messaging.delete_group(&namespaced, &req.group).await,
+        GroupAction::Delete => messaging.delete_group(namespaced, &group).await,
     };
     match result {
         Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
@@ -635,24 +695,38 @@ pub(super) async fn operator_dlq(
     Path(site): Path<String>,
     Json(req): Json<DlqRequest>,
 ) -> Response {
-    let Some(inner) = handlers.inner.as_ref() else {
-        return not_found();
-    };
-    let Some(messaging) = inner.messaging.as_ref() else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "messaging backend not configured\n",
-        )
-            .into_response();
+    let messaging = match messaging_or_unavailable(&handlers) {
+        Ok(m) => m,
+        Err(resp) => return resp,
     };
     let namespaced = dlq_namespace(&site, &req.alias, &req.topic);
-    let selective = !req.filter.is_empty();
+    dlq_mutate_core(
+        messaging.as_ref(),
+        &namespaced,
+        req.action,
+        req.filter,
+        req.dry_run,
+    )
+    .await
+}
+
+/// Shared inner logic of the DLQ MUTATION endpoint (purge/redrive/discard, whole-or-selective,
+/// with a `dry_run` preview), over an already-namespaced topic.
+#[cfg(feature = "handlers")]
+async fn dlq_mutate_core(
+    messaging: &dyn boatramp_core::messaging::Messaging,
+    namespaced: &str,
+    action: DlqAction,
+    filter: DlqFilterWire,
+    dry_run: bool,
+) -> Response {
+    let selective = !filter.is_empty();
 
     // `--dry-run`: return exactly the matching set (never mutate), so an operator can confirm a
     // redrive/discard before it runs. A whole-DLQ dry-run lists everything.
-    if req.dry_run {
-        let filter = req.filter.into_core();
-        return match messaging.list_dead_letters(&namespaced, &filter).await {
+    if dry_run {
+        let filter = filter.into_core();
+        return match messaging.list_dead_letters(namespaced, &filter).await {
             Ok(list) => {
                 let matched: Vec<DlqEntry> = list.into_iter().map(DlqEntry::from_dead).collect();
                 Json(DlqResponse {
@@ -669,29 +743,29 @@ pub(super) async fn operator_dlq(
         };
     }
 
-    let result = match req.action {
+    let result = match action {
         DlqAction::Purge => {
             // Purge is whole-DLQ; if a filter was supplied, honor it as a selective discard instead.
             if selective {
                 messaging
-                    .discard_dead_letters(&namespaced, &req.filter.into_core())
+                    .discard_dead_letters(namespaced, &filter.into_core())
                     .await
             } else {
-                messaging.purge_dead_letters(&namespaced).await
+                messaging.purge_dead_letters(namespaced).await
             }
         }
         DlqAction::Discard => {
             messaging
-                .discard_dead_letters(&namespaced, &req.filter.into_core())
+                .discard_dead_letters(namespaced, &filter.into_core())
                 .await
         }
         DlqAction::Redrive => {
             if selective {
                 messaging
-                    .redrive_dead_letters_filtered(&namespaced, &req.filter.into_core())
+                    .redrive_dead_letters_filtered(namespaced, &filter.into_core())
                     .await
             } else {
-                messaging.redrive_dead_letters(&namespaced).await
+                messaging.redrive_dead_letters(namespaced).await
             }
         }
     };
@@ -707,6 +781,209 @@ pub(super) async fn operator_dlq(
         )
             .into_response(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Project-bus operator surface (`/api/projects/<proj>/_boatramp/bus/…`).
+//
+// The SITE surface above manages a site's own per-site queues (`{site}/…`). This
+// mirror manages the SHARED PROJECT BUS — the `{project}/bus/{topic}` keyspace a
+// `bus:<topic>` publish routes to (see `handler_dispatch`'s `project.qualified("bus")`),
+// common to every site in the project. The tenant boundary is the request path's
+// `<proj>` segment: these handlers read it from the injected [`ProjectContext`] (set
+// by the `project_scope` middleware) and namespace via [`bus_namespace`], so a token
+// authorized (via `authz::Right::required`) for project P can only ever touch P's bus.
+// There is no `alias` axis — the bus is not per-deployment. Each handler is thin: it
+// resolves the messaging backend + namespace, then delegates to the same `*_core`
+// helper the site handler uses, for an identical response shape (`DLQ_VIEW_VERSION`).
+// ---------------------------------------------------------------------------
+
+/// `GET …/bus/dlq` query: list (metadata) or show one (with payload) on the project bus.
+#[cfg(feature = "handlers")]
+#[derive(Deserialize)]
+pub(super) struct BusDlqListQuery {
+    topic: String,
+    #[serde(default)]
+    show: bool,
+    #[serde(flatten)]
+    filter: DlqFilterWire,
+}
+
+/// Project-bus dead-letter INSPECTION (`GET …/bus/dlq`, read → `Project·Read`).
+#[cfg(feature = "handlers")]
+pub(super) async fn operator_bus_dlq_list(
+    Extension(handlers): Extension<Arc<HandlerRuntime>>,
+    Extension(project): Extension<crate::project_scope::ProjectContext>,
+    axum::extract::Query(q): axum::extract::Query<BusDlqListQuery>,
+) -> Response {
+    let messaging = match messaging_or_unavailable(&handlers) {
+        Ok(m) => m,
+        Err(resp) => return resp,
+    };
+    let namespaced = bus_namespace(&project.as_ref(), &q.topic);
+    dlq_list_core(messaging.as_ref(), &namespaced, q.show, q.filter).await
+}
+
+/// `POST …/bus/dlq` request: purge/redrive/discard on the project bus (destructive → `Project·Admin`).
+#[cfg(feature = "handlers")]
+#[derive(Deserialize)]
+pub(super) struct BusDlqRequest {
+    topic: String,
+    action: DlqAction,
+    #[serde(default)]
+    filter: DlqFilterWire,
+    #[serde(default)]
+    dry_run: bool,
+}
+
+/// Project-bus dead-letter MUTATION (`POST …/bus/dlq`, write → `Project·Admin`).
+#[cfg(feature = "handlers")]
+pub(super) async fn operator_bus_dlq(
+    Extension(handlers): Extension<Arc<HandlerRuntime>>,
+    Extension(project): Extension<crate::project_scope::ProjectContext>,
+    Json(req): Json<BusDlqRequest>,
+) -> Response {
+    let messaging = match messaging_or_unavailable(&handlers) {
+        Ok(m) => m,
+        Err(resp) => return resp,
+    };
+    let namespaced = bus_namespace(&project.as_ref(), &req.topic);
+    dlq_mutate_core(
+        messaging.as_ref(),
+        &namespaced,
+        req.action,
+        req.filter,
+        req.dry_run,
+    )
+    .await
+}
+
+/// `GET …/bus/queue/peek` query on the project bus.
+#[cfg(feature = "handlers")]
+#[derive(Deserialize)]
+pub(super) struct BusQueuePeekQuery {
+    topic: String,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+/// Project-bus live-queue PEEK (`GET …/bus/queue/peek`, read → `Project·Read`).
+#[cfg(feature = "handlers")]
+pub(super) async fn operator_bus_queue_peek(
+    Extension(handlers): Extension<Arc<HandlerRuntime>>,
+    Extension(project): Extension<crate::project_scope::ProjectContext>,
+    axum::extract::Query(q): axum::extract::Query<BusQueuePeekQuery>,
+) -> Response {
+    let messaging = match messaging_or_unavailable(&handlers) {
+        Ok(m) => m,
+        Err(resp) => return resp,
+    };
+    let namespaced = bus_namespace(&project.as_ref(), &q.topic);
+    queue_peek_core(messaging.as_ref(), &namespaced, q.limit).await
+}
+
+/// `GET …/bus/queue/replay` query on the project bus.
+#[cfg(feature = "handlers")]
+#[derive(Deserialize)]
+pub(super) struct BusQueueReplayQuery {
+    topic: String,
+    #[serde(default)]
+    after: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+/// Project-bus durable REPLAY (`GET …/bus/queue/replay`, read → `Project·Read`).
+#[cfg(feature = "handlers")]
+pub(super) async fn operator_bus_queue_replay(
+    Extension(handlers): Extension<Arc<HandlerRuntime>>,
+    Extension(project): Extension<crate::project_scope::ProjectContext>,
+    axum::extract::Query(q): axum::extract::Query<BusQueueReplayQuery>,
+) -> Response {
+    let messaging = match messaging_or_unavailable(&handlers) {
+        Ok(m) => m,
+        Err(resp) => return resp,
+    };
+    let namespaced = bus_namespace(&project.as_ref(), &q.topic);
+    queue_replay_core(messaging.as_ref(), &namespaced, q.after.as_deref(), q.limit).await
+}
+
+/// `GET …/bus/queue/groups` query on the project bus.
+#[cfg(feature = "handlers")]
+#[derive(Deserialize)]
+pub(super) struct BusQueueGroupsQuery {
+    topic: String,
+}
+
+/// Project-bus consumer-group LISTING (`GET …/bus/queue/groups`, read → `Project·Read`).
+#[cfg(feature = "handlers")]
+pub(super) async fn operator_bus_queue_groups(
+    Extension(handlers): Extension<Arc<HandlerRuntime>>,
+    Extension(project): Extension<crate::project_scope::ProjectContext>,
+    axum::extract::Query(q): axum::extract::Query<BusQueueGroupsQuery>,
+) -> Response {
+    let messaging = match messaging_or_unavailable(&handlers) {
+        Ok(m) => m,
+        Err(resp) => return resp,
+    };
+    let namespaced = bus_namespace(&project.as_ref(), &q.topic);
+    queue_groups_core(messaging.as_ref(), &namespaced).await
+}
+
+/// `POST …/bus/queue/pause` request on the project bus.
+#[cfg(feature = "handlers")]
+#[derive(Deserialize)]
+pub(super) struct BusQueuePauseRequest {
+    topic: String,
+    paused: bool,
+}
+
+/// Project-bus flow-control MUTATION (`POST …/bus/queue/pause`, write → `Project·Admin`).
+#[cfg(feature = "handlers")]
+pub(super) async fn operator_bus_queue_pause(
+    Extension(handlers): Extension<Arc<HandlerRuntime>>,
+    Extension(project): Extension<crate::project_scope::ProjectContext>,
+    Json(req): Json<BusQueuePauseRequest>,
+) -> Response {
+    let messaging = match messaging_or_unavailable(&handlers) {
+        Ok(m) => m,
+        Err(resp) => return resp,
+    };
+    let namespaced = bus_namespace(&project.as_ref(), &req.topic);
+    queue_pause_core(messaging.as_ref(), &namespaced, req.paused).await
+}
+
+/// `POST …/bus/queue/group` request on the project bus.
+#[cfg(feature = "handlers")]
+#[derive(Deserialize)]
+pub(super) struct BusQueueGroupRequest {
+    topic: String,
+    group: String,
+    action: GroupAction,
+    #[serde(default)]
+    start: Option<boatramp_core::messaging::StartPosition>,
+}
+
+/// Project-bus consumer-group MUTATION (`POST …/bus/queue/group`, write → `Project·Admin`).
+#[cfg(feature = "handlers")]
+pub(super) async fn operator_bus_queue_group(
+    Extension(handlers): Extension<Arc<HandlerRuntime>>,
+    Extension(project): Extension<crate::project_scope::ProjectContext>,
+    Json(req): Json<BusQueueGroupRequest>,
+) -> Response {
+    let messaging = match messaging_or_unavailable(&handlers) {
+        Ok(m) => m,
+        Err(resp) => return resp,
+    };
+    let namespaced = bus_namespace(&project.as_ref(), &req.topic);
+    queue_group_core(
+        messaging.as_ref(),
+        &namespaced,
+        req.group,
+        req.action,
+        req.start,
+    )
+    .await
 }
 
 /// Gather consumer backlog + dead-letter counts for every consumer across a

@@ -148,6 +148,27 @@ purge: 12 dead-lettered message(s) on topic "emails"
 To scope either command to a background alias rather than the live site, add
 `--alias {site}/{alias}`.
 
+### Operate the shared project bus
+
+The commands above manage a **single site's** queues. To inspect or manage the
+shared **project bus** — the `bus:<topic>` keyspace every site in a project
+publishes to and consumes from — add `--bus` instead of `--site`:
+
+```sh
+boatramp dlq ls orders.created --bus
+boatramp dlq redrive orders.created --bus
+boatramp queue peek orders.created --bus
+boatramp queue pause orders.created --bus
+```
+
+The project comes from your config's `[publish].project` (or `--project`). Because
+the bus is shared across the whole project, its **destructive** operations
+(`dlq redrive`/`discard`/`purge`, `queue group-reset`/`group-delete`/`pause`) require
+a **project-admin** token — stronger than the per-site write a site's own DLQ needs;
+inspection (`dlq ls`/`show`, `queue peek`/`replay`/`groups`) requires project-read. A
+token scoped to one project can only ever reach that project's bus. `--bus` and
+`--alias` are mutually exclusive (the bus is not per-deployment).
+
 ## Watch lag and dead-letters
 
 Check consumer backlog and dead-letter counts with `boatramp stats`:

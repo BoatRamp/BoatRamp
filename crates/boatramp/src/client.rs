@@ -429,6 +429,42 @@ pub struct ControlPlane {
     project: String,
 }
 
+/// Which operator queue/DLQ surface a `queue`/`dlq` op targets: a single **site's** own
+/// queues (with an optional background-`alias` scope), or the **shared project bus**
+/// (`{project}/bus/{topic}`, common to every site in the project). The two differ only in
+/// the endpoint path (site: `/api/<sites-seg>/<site>/_boatramp/…`; bus:
+/// `/api/projects/<proj>/_boatramp/bus/…`) and that the bus has no `alias` axis — the
+/// request/response shapes are identical, so every client method takes an `OpScope` and
+/// the CLI picks one from a `--bus` flag.
+#[derive(Debug, Clone, Copy)]
+pub enum OpScope<'a> {
+    /// A single site's queues, optionally under a background-alias (`{site}/{alias}`) scope.
+    Site {
+        /// The site name.
+        site: &'a str,
+        /// The background-alias scope, if any.
+        alias: Option<&'a str>,
+    },
+    /// The shared, project-scoped bus (authorized at `Project·Read`/`Project·Admin`).
+    Bus,
+}
+
+impl<'a> OpScope<'a> {
+    /// The site surface under an optional background-alias scope.
+    pub fn site_alias(site: &'a str, alias: Option<&'a str>) -> Self {
+        Self::Site { site, alias }
+    }
+
+    /// The background-alias scope carried in a POST body / GET query. Always `None` for
+    /// the project bus (it is not per-deployment).
+    fn alias(&self) -> Option<&'a str> {
+        match self {
+            Self::Site { alias, .. } => *alias,
+            Self::Bus => None,
+        }
+    }
+}
+
 impl ControlPlane {
     /// Wrap an already-built client and resolved server base.
     pub fn new(base: String, http: ApiClient, project: String) -> Self {
@@ -455,6 +491,29 @@ impl ControlPlane {
     /// (byte-identical legacy `/api/compute/...`), else `projects/<proj>/compute`.
     fn compute_seg(&self) -> String {
         project_seg(&self.project, "compute")
+    }
+
+    /// The project-BUS operator path prefix: always the project-scoped
+    /// `projects/<proj>/_boatramp/bus` form (there is no legacy/unscoped bus route —
+    /// even the `default` project's shared bus is addressed project-scoped), so a
+    /// `boatramp queue|dlq --bus` targets the right project's shared bus. The server
+    /// authorizes this path at `Project·Read` (GET) / `Project·Admin` (destructive POST).
+    fn bus_prefix(&self) -> String {
+        format!("projects/{}/_boatramp/bus", self.project)
+    }
+
+    /// The full operator-endpoint URL for a given [`OpScope`] and operation suffix
+    /// (`"dlq"`, `"queue/peek"`, …): the per-site `…/<sites-seg>/<site>/_boatramp/<op>` for
+    /// [`OpScope::Site`], or the shared `…/projects/<proj>/_boatramp/bus/<op>` for
+    /// [`OpScope::Bus`]. The single place the site-vs-bus path split lives.
+    fn op_url(&self, scope: OpScope<'_>, op: &str) -> String {
+        match scope {
+            OpScope::Site { site, .. } => {
+                let seg = self.sites_seg();
+                format!("{}/api/{seg}/{site}/_boatramp/{op}", self.base)
+            }
+            OpScope::Bus => format!("{}/api/{}/{op}", self.base, self.bus_prefix()),
+        }
     }
 
     /// Fetch the manifest for a specific deployment id.
@@ -948,19 +1007,14 @@ impl ControlPlane {
     /// (`POST …/_boatramp/dlq`).
     pub async fn operate_dlq(
         &self,
-        site: &str,
+        scope: OpScope<'_>,
         topic: &str,
-        alias: Option<&str>,
         action: &str,
         filter: &DlqFilter,
         dry_run: bool,
     ) -> Result<(usize, Vec<DlqEntry>)> {
-        let seg = self.sites_seg();
-        let Self {
-            http: client,
-            base: server,
-            ..
-        } = self;
+        let url = self.op_url(scope, "dlq");
+        let client = &self.http;
         #[derive(Serialize)]
         struct Request<'a> {
             topic: &'a str,
@@ -977,10 +1031,10 @@ impl ControlPlane {
             matched: Vec<DlqEntry>,
         }
         let resp: DlqResponse = client
-            .post(format!("{server}/api/{seg}/{site}/_boatramp/dlq"))
+            .post(url)
             .json(&Request {
                 topic,
-                alias,
+                alias: scope.alias(),
                 action,
                 filter,
                 dry_run,
@@ -994,19 +1048,9 @@ impl ControlPlane {
     }
 
     /// Pause or resume a topic (`POST …/_boatramp/queue/pause`, P2 flow control).
-    pub async fn pause_queue(
-        &self,
-        site: &str,
-        topic: &str,
-        alias: Option<&str>,
-        paused: bool,
-    ) -> Result<()> {
-        let seg = self.sites_seg();
-        let Self {
-            http: client,
-            base: server,
-            ..
-        } = self;
+    pub async fn pause_queue(&self, scope: OpScope<'_>, topic: &str, paused: bool) -> Result<()> {
+        let url = self.op_url(scope, "queue/pause");
+        let client = &self.http;
         #[derive(Serialize)]
         struct Request<'a> {
             topic: &'a str,
@@ -1015,10 +1059,10 @@ impl ControlPlane {
             paused: bool,
         }
         client
-            .post(format!("{server}/api/{seg}/{site}/_boatramp/queue/pause"))
+            .post(url)
             .json(&Request {
                 topic,
-                alias,
+                alias: scope.alias(),
                 paused,
             })
             .send()
@@ -1028,28 +1072,17 @@ impl ControlPlane {
     }
 
     /// List a topic's consumer groups (`GET …/_boatramp/queue/groups`).
-    pub async fn list_groups(
-        &self,
-        site: &str,
-        topic: &str,
-        alias: Option<&str>,
-    ) -> Result<Vec<GroupEntry>> {
-        let seg = self.sites_seg();
-        let Self {
-            http: client,
-            base: server,
-            ..
-        } = self;
+    pub async fn list_groups(&self, scope: OpScope<'_>, topic: &str) -> Result<Vec<GroupEntry>> {
+        let url = self.op_url(scope, "queue/groups");
+        let client = &self.http;
         #[derive(Deserialize)]
         struct GroupsResponse {
             #[allow(dead_code)]
             version: u32,
             groups: Vec<GroupEntry>,
         }
-        let mut req = client
-            .get(format!("{server}/api/{seg}/{site}/_boatramp/queue/groups"))
-            .query(&[("topic", topic)]);
-        if let Some(alias) = alias {
+        let mut req = client.get(url).query(&[("topic", topic)]);
+        if let Some(alias) = scope.alias() {
             req = req.query(&[("alias", alias)]);
         }
         let resp: GroupsResponse = req.send().await?.error_for_status()?.json().await?;
@@ -1060,19 +1093,14 @@ impl ControlPlane {
     /// `"earliest"` or `"latest"`.
     pub async fn group_op(
         &self,
-        site: &str,
+        scope: OpScope<'_>,
         topic: &str,
-        alias: Option<&str>,
         group: &str,
         action: &str,
         start: Option<&str>,
     ) -> Result<()> {
-        let seg = self.sites_seg();
-        let Self {
-            http: client,
-            base: server,
-            ..
-        } = self;
+        let url = self.op_url(scope, "queue/group");
+        let client = &self.http;
         #[derive(Serialize)]
         struct Request<'a> {
             topic: &'a str,
@@ -1084,10 +1112,10 @@ impl ControlPlane {
             start: Option<&'a str>,
         }
         client
-            .post(format!("{server}/api/{seg}/{site}/_boatramp/queue/group"))
+            .post(url)
             .json(&Request {
                 topic,
-                alias,
+                alias: scope.alias(),
                 group,
                 action,
                 start,
@@ -1101,27 +1129,20 @@ impl ControlPlane {
     /// Peek the head of a topic's LIVE work-queue without consuming (`GET …/_boatramp/queue/peek`).
     pub async fn peek_queue(
         &self,
-        site: &str,
+        scope: OpScope<'_>,
         topic: &str,
-        alias: Option<&str>,
         limit: Option<usize>,
     ) -> Result<Vec<QueuePeekEntry>> {
-        let seg = self.sites_seg();
-        let Self {
-            http: client,
-            base: server,
-            ..
-        } = self;
+        let url = self.op_url(scope, "queue/peek");
+        let client = &self.http;
         #[derive(Deserialize)]
         struct QueuePeekResponse {
             #[allow(dead_code)]
             version: u32,
             messages: Vec<QueuePeekEntry>,
         }
-        let mut req = client
-            .get(format!("{server}/api/{seg}/{site}/_boatramp/queue/peek"))
-            .query(&[("topic", topic)]);
-        if let Some(alias) = alias {
+        let mut req = client.get(url).query(&[("topic", topic)]);
+        if let Some(alias) = scope.alias() {
             req = req.query(&[("alias", alias)]);
         }
         if let Some(limit) = limit {
@@ -1136,18 +1157,13 @@ impl ControlPlane {
     /// page forward (`None` when the history is exhausted).
     pub async fn replay_queue(
         &self,
-        site: &str,
+        scope: OpScope<'_>,
         topic: &str,
-        alias: Option<&str>,
         after: Option<&str>,
         limit: Option<usize>,
     ) -> Result<(Vec<QueuePeekEntry>, Option<String>)> {
-        let seg = self.sites_seg();
-        let Self {
-            http: client,
-            base: server,
-            ..
-        } = self;
+        let url = self.op_url(scope, "queue/replay");
+        let client = &self.http;
         #[derive(Deserialize)]
         struct QueueReplayResponse {
             #[allow(dead_code)]
@@ -1156,10 +1172,8 @@ impl ControlPlane {
             #[serde(default)]
             next_after: Option<String>,
         }
-        let mut req = client
-            .get(format!("{server}/api/{seg}/{site}/_boatramp/queue/replay"))
-            .query(&[("topic", topic)]);
-        if let Some(alias) = alias {
+        let mut req = client.get(url).query(&[("topic", topic)]);
+        if let Some(alias) = scope.alias() {
             req = req.query(&[("alias", alias)]);
         }
         if let Some(after) = after {
@@ -1177,28 +1191,21 @@ impl ControlPlane {
     /// metadata listing.
     pub async fn list_dlq(
         &self,
-        site: &str,
+        scope: OpScope<'_>,
         topic: &str,
-        alias: Option<&str>,
         show: bool,
         filter: &DlqFilter,
     ) -> Result<Vec<DlqEntry>> {
-        let seg = self.sites_seg();
-        let Self {
-            http: client,
-            base: server,
-            ..
-        } = self;
+        let url = self.op_url(scope, "dlq");
+        let client = &self.http;
         #[derive(Deserialize)]
         struct DlqListResponse {
             #[allow(dead_code)]
             version: u32,
             dead_letters: Vec<DlqEntry>,
         }
-        let mut req = client
-            .get(format!("{server}/api/{seg}/{site}/_boatramp/dlq"))
-            .query(&[("topic", topic)]);
-        if let Some(alias) = alias {
+        let mut req = client.get(url).query(&[("topic", topic)]);
+        if let Some(alias) = scope.alias() {
             req = req.query(&[("alias", alias)]);
         }
         if show {

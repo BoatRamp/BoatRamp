@@ -16,7 +16,7 @@
 
 use clap::Subcommand;
 
-use crate::client::{self, DlqEntry, DlqFilter};
+use crate::client::{self, DlqEntry, DlqFilter, OpScope};
 use crate::config::ProjectConfig;
 
 /// A failure in the `dlq` subcommand.
@@ -28,6 +28,9 @@ pub enum Error {
     /// A whole-DLQ mutation was refused without `--yes`.
     #[error("refusing to {action} the ENTIRE dead-letter queue for topic {topic:?} without --yes (or narrow it with --id/--older-than/--match)")]
     ConfirmRequired { action: String, topic: String },
+    /// `--alias` was combined with `--bus` (the shared project bus is not per-deployment).
+    #[error("--alias cannot be combined with --bus: the shared project bus has no background-alias scope")]
+    AliasWithBus,
 }
 
 /// `dlq` module result; `Err` is [`Error`].
@@ -82,9 +85,28 @@ pub struct DlqArgs {
     /// Site whose queues to manage (overrides [deploy].site).
     #[arg(long, global = true)]
     site: Option<String>,
+    /// Target the SHARED PROJECT BUS's dead-letters (`{project}/bus/{topic}`, common to
+    /// every site in the project) instead of a single site's DLQ. Authorized project-wide:
+    /// `ls`/`show` need `Project·Read`, and the destructive ops (`redrive`/`discard`/`purge`)
+    /// need `Project·Admin`. Incompatible with `--alias`.
+    #[arg(long, global = true)]
+    bus: bool,
 
     #[command(subcommand)]
     command: DlqCommand,
+}
+
+/// Build the [`OpScope`] a `dlq` op targets: the shared project bus under `--bus`
+/// (rejecting a nonsensical `--alias`), else the site (with any background-alias).
+fn dlq_scope<'a>(bus: bool, site: &'a str, alias: Option<&'a str>) -> Result<OpScope<'a>> {
+    if bus {
+        if alias.is_some() {
+            return Err(Error::AliasWithBus);
+        }
+        Ok(OpScope::Bus)
+    } else {
+        Ok(OpScope::site_alias(site, alias))
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -172,8 +194,9 @@ pub async fn run(args: DlqArgs, config: &ProjectConfig) -> Result<()> {
             alias,
             filter,
         } => {
+            let scope = dlq_scope(args.bus, &site, alias.as_deref())?;
             let entries = cp
-                .list_dlq(&site, topic, alias.as_deref(), false, &filter.to_filter())
+                .list_dlq(scope, topic, false, &filter.to_filter())
                 .await?;
             print_list(topic, &entries);
         }
@@ -183,14 +206,13 @@ pub async fn run(args: DlqArgs, config: &ProjectConfig) -> Result<()> {
             group,
             alias,
         } => {
+            let scope = dlq_scope(args.bus, &site, alias.as_deref())?;
             let filter = DlqFilter {
                 id: Some(id.clone()),
                 group: group.clone(),
                 ..Default::default()
             };
-            let entries = cp
-                .list_dlq(&site, topic, alias.as_deref(), true, &filter)
-                .await?;
+            let entries = cp.list_dlq(scope, topic, true, &filter).await?;
             match entries.into_iter().next() {
                 Some(entry) => print_show(&entry),
                 None => println!("no dead-letter {id:?} on topic {topic:?}"),
@@ -203,13 +225,13 @@ pub async fn run(args: DlqArgs, config: &ProjectConfig) -> Result<()> {
             dry_run,
             yes,
         } => {
+            let scope = dlq_scope(args.bus, &site, alias.as_deref())?;
             mutate(
                 &cp,
-                &site,
+                scope,
                 Mutation {
                     action: "redrive",
                     topic,
-                    alias,
                     filter,
                     dry_run: *dry_run,
                     yes: *yes,
@@ -224,13 +246,13 @@ pub async fn run(args: DlqArgs, config: &ProjectConfig) -> Result<()> {
             dry_run,
             yes,
         } => {
+            let scope = dlq_scope(args.bus, &site, alias.as_deref())?;
             mutate(
                 &cp,
-                &site,
+                scope,
                 Mutation {
                     action: "discard",
                     topic,
-                    alias,
                     filter,
                     dry_run: *dry_run,
                     yes: *yes,
@@ -239,6 +261,7 @@ pub async fn run(args: DlqArgs, config: &ProjectConfig) -> Result<()> {
             .await?;
         }
         DlqCommand::Purge { topic, alias, yes } => {
+            let scope = dlq_scope(args.bus, &site, alias.as_deref())?;
             let empty = FilterFlags {
                 id: None,
                 group: None,
@@ -248,11 +271,10 @@ pub async fn run(args: DlqArgs, config: &ProjectConfig) -> Result<()> {
             };
             mutate(
                 &cp,
-                &site,
+                scope,
                 Mutation {
                     action: "purge",
                     topic,
-                    alias,
                     filter: &empty,
                     dry_run: false,
                     yes: *yes,
@@ -268,14 +290,13 @@ pub async fn run(args: DlqArgs, config: &ProjectConfig) -> Result<()> {
 struct Mutation<'a> {
     action: &'a str,
     topic: &'a str,
-    alias: &'a Option<String>,
     filter: &'a FilterFlags,
     dry_run: bool,
     yes: bool,
 }
 
 /// Run a mutating op with the shared dry-run + whole-DLQ confirmation policy.
-async fn mutate(cp: &client::ControlPlane, site: &str, m: Mutation<'_>) -> Result<()> {
+async fn mutate(cp: &client::ControlPlane, scope: OpScope<'_>, m: Mutation<'_>) -> Result<()> {
     // A filter-less mutation touches the WHOLE queue — require an explicit --yes (unless it's a
     // preview). A filtered op is already narrowed, so it proceeds.
     if !m.dry_run && m.filter.is_empty() && !m.yes {
@@ -285,14 +306,7 @@ async fn mutate(cp: &client::ControlPlane, site: &str, m: Mutation<'_>) -> Resul
         });
     }
     let (affected, matched) = cp
-        .operate_dlq(
-            site,
-            m.topic,
-            m.alias.as_deref(),
-            m.action,
-            &m.filter.to_filter(),
-            m.dry_run,
-        )
+        .operate_dlq(scope, m.topic, m.action, &m.filter.to_filter(), m.dry_run)
         .await?;
     if m.dry_run {
         println!(

@@ -46,6 +46,17 @@ trades that for JetStream-class latency (below).
   list/reset/delete; non-destructive `replay` of a grouped topic's retained history
   from an offset. New guest producer WIT (`publish-batch`/`publish-delayed`/
   `publish-with-ttl`/`publish-with-priority`) with the shim revved to match.
+- **Project-bus operator surface + project-admin grade.** The shared **project bus**
+  (`{project}/bus/{topic}`, the destination of a `bus:<topic>` publish, common to
+  every site in a project) now has its own operator surface, mirroring the per-site
+  one but namespaced to the project: `GET/POST /api/projects/<proj>/_boatramp/bus/{dlq,
+  queue/peek,queue/replay,queue/groups,queue/group,queue/pause}`, reachable from the
+  CLI with `boatramp queue --bus` / `boatramp dlq --bus`. Because the bus is a
+  project-wide shared resource, the destructive ops (DLQ purge/redrive/discard, group
+  reset/delete, pause) are gated at **`Project·Admin`** — stronger than the per-site
+  `Site·Write` — while inspection (`ls`/`show`/`peek`/`replay`/`groups`) needs
+  `Project·Read`. The request path's `<proj>` segment is the tenant boundary, so a
+  token scoped to project P can inspect/manage only P's bus, never another project's.
 - **Opt-in relaxed publish durability (`[handlers] messaging_max_unflushed_msgs`).**
   Default `0` = the strong durable path (unchanged). `N > 0` fast-acks publishes on
   the in-memory buffer (≈tens of µs vs ≈one flush interval), bounding the crash-loss
