@@ -753,6 +753,21 @@ jobs:
             grep -qF "$m" messaging-dlq.log \
               || { echo "::error::missing poison-pill/DLQ matrix marker: $m (a DLQ regression or a skipped cell)" >&2; exit 1; }
           done
+      # v0.4.26: the read-only messaging-stats binding is tenant-scoped by a host-filled `{tenant}`
+      # template — per-topic depth/DLQ counts are a cross-tenant oracle otherwise. This host-level
+      # conformance gate drives the REAL substrate + the tenant-substitution security property end to
+      # end: own-tenant read via the declared template, a foreign/undeclared topic refused, a
+      # slash-bearing resolved tenant that would reshape the topic to a foreign one refused, and an
+      # ungranted component access-denied. A tenant-scoping regression (the oracle) fails the merge.
+      - name: messaging-stats tenant-scoped gate marker (v0.4.26)
+        run: |
+          set -eo pipefail
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-server \
+            --features handlers --test conformance messaging_stats_reads_own_tenant -- --nocapture 2>&1 | tee messaging-stats.log
+          grep -qE 'test result: ok\. 1 passed' messaging-stats.log \
+            || { echo "::error::messaging-stats gate did not run (silent skip or a failure)" >&2; exit 1; }
+          grep -q 'MESSAGING-STATS TENANT-SCOPED OK' messaging-stats.log \
+            || { echo "::error::messaging-stats gate never reached its marker (a tenant-scoping/cross-tenant-oracle regression)" >&2; exit 1; }
 
   deny:
     name: cargo-deny
