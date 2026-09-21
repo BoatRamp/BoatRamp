@@ -1087,9 +1087,12 @@ impl boatramp_core::sql::MigrationRunner for NodeMigrationRunner {
                             Err(e) => Err(e.to_string()),
                         }
                     } else {
-                        // Atomic: DDL + ledger insert commit together (or roll back together).
+                        // Atomic: DDL + ledger insert commit together (or roll back together). A
+                        // trailing `;` after the script guards a script that omits its own final
+                        // semicolon (else it would merge with the ledger INSERT into one invalid
+                        // statement); a doubled `;;` is just an empty statement, harmless.
                         let batch = format!(
-                            "BEGIN;\n{script}\n{insert}\nCOMMIT;",
+                            "BEGIN;\n{script};\n{insert}\nCOMMIT;",
                             insert = Self::ledger_insert(step, ordinal)
                         );
                         owner.run_script(&batch).await.map_err(|e| e.to_string())
