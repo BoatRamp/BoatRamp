@@ -1947,6 +1947,23 @@ mod tests {
 
     const LEASE: Duration = Duration::from_secs(60);
 
+    /// Poll `mq`'s applied ready-set until it equals `want` (order-insensitive), within a bounded
+    /// window — a cluster read is only linearizable AFTER the write applies locally, so a bare read
+    /// right after a forwarded write can race replication. Returns whether it converged.
+    async fn poll_ready(mq: &RaftMessaging, want: &[&str]) -> bool {
+        let mut want: Vec<String> = want.iter().map(ToString::to_string).collect();
+        want.sort();
+        for _ in 0..100 {
+            let mut got = mq.ready_topics().await.unwrap();
+            got.sort();
+            if got == want {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        false
+    }
+
     /// **C4 gate:** consumers on every node, **no double-delivery**. Publish a
     /// batch, then have all three nodes claim concurrently (every claim forwards
     /// to the leader, which applies it atomically). With a long lease and no
@@ -2068,18 +2085,17 @@ mod tests {
         // The leader is node 1 (initialized + elected). Read the ready-set from it (linearizable
         // after a forwarded publish/claim, which applies on the leader).
         assert!(mqs[&1].supports_ready_set(), "cluster apply is atomic (B1)");
-        assert!(mqs[&1].ready_topics().await.unwrap().is_empty());
+        assert!(poll_ready(&mqs[&1], &[]).await, "starts empty");
         mqs[&2].publish("t", b"x").await.unwrap();
-        assert_eq!(
-            mqs[&1].ready_topics().await.unwrap(),
-            vec!["t".to_string()],
+        assert!(
+            poll_ready(&mqs[&1], &["t"]).await,
             "publish (from any node) flags the topic in the replicated ready-set (B1)"
         );
         // Claim the only message on node 3 → topic drains → marker pruned in the same apply (B4).
         let batch = mqs[&3].claim("t", LEASE, 10, 5).await.unwrap();
         assert_eq!(batch.len(), 1);
         assert!(
-            mqs[&1].ready_topics().await.unwrap().is_empty(),
+            poll_ready(&mqs[&1], &[]).await,
             "a claim that drains the topic prunes the replicated marker (B4)"
         );
         mqs[&1].ack(&batch[0]).await.unwrap();
@@ -2107,12 +2123,14 @@ mod tests {
             "marker lost"
         );
         assert_eq!(mqs[&1].backlog("t").await.unwrap(), 1, "message NOT lost");
-        // Rebuild (from any node — here a follower) re-derives + proposes the marker.
-        let n = mqs[&2].rebuild_ready_set().await.unwrap();
-        assert_eq!(n, 1);
-        assert_eq!(
-            mqs[&1].ready_topics().await.unwrap(),
-            vec!["t".to_string()],
+        // Rebuild on the LEADER (node 1) — the drainer runs the rebuild leader-gated, and the leader's
+        // applied state is current (it just applied the publish + the delete), so the derive sees the
+        // live `mq/t/...` record. It re-derives the work-set and PROPOSES the reconciling marker add.
+        let n = mqs[&1].rebuild_ready_set().await.unwrap();
+        assert_eq!(n, 1, "rebuild finds the one topic with work");
+        // The re-added marker replicates + applies asynchronously; poll node 1's applied view for it.
+        assert!(
+            poll_ready(&mqs[&1], &["t"]).await,
             "rebuild re-adds the lost marker from the replicated index (B6/B18)"
         );
         // And it is claimable.
@@ -2307,12 +2325,11 @@ mod tests {
             .pop()
             .unwrap();
         // The claim drained the topic → marker pruned.
-        assert!(mqs[&1].ready_topics().await.unwrap().is_empty());
+        assert!(poll_ready(&mqs[&1], &[]).await, "drained → marker pruned");
         // Nack from another node re-arms the marker (claimable again).
         mqs[&2].nack(&m).await.unwrap();
-        assert_eq!(
-            mqs[&1].ready_topics().await.unwrap(),
-            vec!["t".to_string()],
+        assert!(
+            poll_ready(&mqs[&1], &["t"]).await,
             "a nack re-arms the replicated ready marker (B1)"
         );
         shutdown(rafts).await;
