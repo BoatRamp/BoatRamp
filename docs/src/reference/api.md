@@ -190,6 +190,25 @@ writes are additionally posture-gated. Top-level paths target the `default` proj
 | `POST` | `/api/sql/:db/query` | Run a single query and return its rows. |
 | `POST` | `/api/sql/:db/ping` | Active per-replica reachability probe (bypasses the stored-health gate). |
 
+## Schema migrations (owner-gated)
+
+Apply an ordered migration step set — `function` / `sql` / `extension` steps — to a
+managed database `:db`, run as the project's non-superuser **owner** role and tracked in
+a host-owned ledger. Input is **upload-then-trigger**: the JSON step-set bundle is
+uploaded via `PUT /api/blobs/:hash` and referenced by hash. The mutating verbs are gated
+at `project` · `admin` (never the deploy-grade publisher right `/api/sql/` uses); `status`
+needs only `project` · `read`. Top-level paths target the `default` project;
+`/api/projects/:project/migrate/…` scopes to another project. Since 0.4.25 (Postgres only).
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `POST` | `/api/migrate/:db/apply` | Apply the pending suffix of the bundle; body `{ bundle }`. `project` · `admin`. |
+| `POST` | `/api/migrate/:db/dry-run` | Report which ids would apply, running nothing; body `{ bundle }`. `project` · `admin`. |
+| `POST` | `/api/migrate/:db/baseline` | Record the prefix through `up_to` as already-applied without running it; body `{ bundle, up_to }`. `project` · `admin`. |
+| `GET` | `/api/migrate/:db/status` | Read the applied-migration ledger (id, ordinal, hash, kind, applied-at, origin). `project` · `read`. |
+
+See [Run owner-gated schema migrations](../how-to/in-app-migrations.md).
+
 ## Secrets & email profiles
 
 Project-scoped credential stores, gated by the `secrets` right (see
