@@ -386,14 +386,11 @@ impl RaftMessaging {
     /// reshuffles as little of the topic space as possible. Pure + deterministic (no clock, no live
     /// metrics) so it is safe to recompute per drain cycle and agrees fleet-wide (B8).
     fn hrw_owner(topic: &str, voters: &[NodeId]) -> Option<NodeId> {
-        voters
-            .iter()
-            .copied()
-            .max_by(|&a, &b| {
-                hrw_score(topic, a)
-                    .cmp(&hrw_score(topic, b))
-                    .then(a.cmp(&b))
-            })
+        voters.iter().copied().max_by(|&a, &b| {
+            hrw_score(topic, a)
+                .cmp(&hrw_score(topic, b))
+                .then(a.cmp(&b))
+        })
     }
 
     /// Build one message's replicated `MqPublish` op, performing any object-store payload write FIRST
@@ -1646,7 +1643,9 @@ impl Messaging for RaftMessaging {
             let Some(rest) = key.strip_prefix("mqgstate/") else {
                 continue;
             };
-            let Some(slash) = rest.rfind('/') else { continue };
+            let Some(slash) = rest.rfind('/') else {
+                continue;
+            };
             let topic = rest[..slash].to_string();
             let group = &rest[slash + 1..];
             if topic.is_empty() || group.is_empty() || with_work.contains(&topic) {
@@ -1668,7 +1667,13 @@ impl Messaging for RaftMessaging {
                 with_work.insert(topic);
             }
         }
-        // 3) Reconcile against the current markers; propose the delta as ONE replicated batch.
+        // 3) Reconcile: **ADD-ONLY** — heal MISSING markers (a lost publish-wake add / fresh-node
+        //    self-populate); do NOT prune (Security review A-1). `with_work` is computed from a stale
+        //    applied-state read, so a stale-marker delete proposed here races a concurrent `MqPublish`
+        //    applied in between — the same class H-1 closed for the claim path — and would strand the
+        //    just-published message until the next rebuild. Pruning is owned SOLELY by `apply_mq_claim`
+        //    (empty-only, inside one leader-serialized apply, race-free); a stale marker here just
+        //    costs one cheap empty claim that then prunes it (B5). Propose the adds as ONE batch.
         let existing: std::collections::HashSet<String> = self
             .state
             .list_prefix(messaging::READY_PREFIX)
@@ -1683,12 +1688,7 @@ impl Messaging for RaftMessaging {
                 value: Vec::new(),
             });
         }
-        for topic in existing.difference(&with_work) {
-            ops.push(WriteOp::Delete {
-                key: messaging::ready_key(topic),
-            });
-        }
-        let added_any = with_work.difference(&existing).next().is_some();
+        let added_any = !ops.is_empty();
         if !ops.is_empty() {
             self.propose(WriteOp::Batch(ops)).await?;
         }
@@ -1715,7 +1715,9 @@ impl Messaging for RaftMessaging {
             let Some(rest) = key.strip_prefix("mq/") else {
                 continue;
             };
-            let Some(slash) = rest.rfind('/') else { continue };
+            let Some(slash) = rest.rfind('/') else {
+                continue;
+            };
             let topic = rest[..slash].to_string();
             if let Some(raw) = self.state.get(&key).await {
                 if let Ok(rec) = serde_json::from_slice::<messaging::Record>(&raw) {
@@ -1727,7 +1729,9 @@ impl Messaging for RaftMessaging {
             let Some(rest) = key.strip_prefix("mqgstate/") else {
                 continue;
             };
-            let Some(slash) = rest.rfind('/') else { continue };
+            let Some(slash) = rest.rfind('/') else {
+                continue;
+            };
             let topic = rest[..slash].to_string();
             if let Some(raw) = self.state.get(&key).await {
                 if let Ok(state) = serde_json::from_slice::<messaging::GroupState>(&raw) {
@@ -2179,7 +2183,11 @@ mod tests {
             *counts.entry(o).or_insert(0u32) += 1;
         }
         for id in three {
-            assert!(counts[&id] > 500, "node {id} owns a fair share ({:?})", counts);
+            assert!(
+                counts[&id] > 500,
+                "node {id} owns a fair share ({:?})",
+                counts
+            );
         }
         // Minimal churn on node-loss: removing node 3, a topic MOVES only if node 3 owned it. Every
         // topic owned by 1 or 2 keeps its owner (rendezvous hashing's defining property).
@@ -2230,7 +2238,11 @@ mod tests {
                 assert!(union.insert(t.clone()), "topic {t} owned by two nodes");
             }
         }
-        assert_eq!(union.len(), candidates.len(), "every candidate is owned by some node");
+        assert_eq!(
+            union.len(),
+            candidates.len(),
+            "every candidate is owned by some node"
+        );
         shutdown(rafts).await;
     }
 
@@ -2276,7 +2288,10 @@ mod tests {
         const TOPICS: usize = 60;
         for i in 0..TOPICS {
             let topic = format!("orders/{i}");
-            mqs[&1].publish(&topic, format!("m-{i}").as_bytes()).await.unwrap();
+            mqs[&1]
+                .publish(&topic, format!("m-{i}").as_bytes())
+                .await
+                .unwrap();
         }
 
         // Collect every delivered id exactly-once across the whole test. A drain step: each surviving
@@ -2316,7 +2331,10 @@ mod tests {
         // BEFORE its share is drained — so its owned topics are orphaned (the node-loss transition).
         for i in 0..TOPICS {
             let topic = format!("orders/{i}");
-            mqs[&1].publish(&topic, format!("w2-{i}").as_bytes()).await.unwrap();
+            mqs[&1]
+                .publish(&topic, format!("w2-{i}").as_bytes())
+                .await
+                .unwrap();
         }
         // Kill node 3 and remove it from membership so HRW reassigns its share to {1,2}.
         rafts.remove(&3).unwrap().shutdown().await.unwrap();
