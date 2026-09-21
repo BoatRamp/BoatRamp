@@ -63,7 +63,9 @@ use boatramp_core::{ByteStream, GetObject, ObjectMeta, PutMeta, Storage, Storage
 use boatramp_node::config::{ExternalDatabaseConfig, TenantIsolation, TenantScope};
 use boatramp_node::managed_sql::ManagedSqlCredentials;
 use boatramp_node::tenant_sql::{provision_tenant, tenant_key, TenantNames};
-use boatramp_storage::tenant_provision::{sanitize_ident, tenant_db_name, tenant_role_name};
+use boatramp_storage::tenant_provision::{
+    sanitize_ident, tenant_db_name, tenant_owner_role_name, tenant_role_name,
+};
 use bytes::Bytes;
 use futures::StreamExt;
 
@@ -446,6 +448,7 @@ fn tenant_names_for(binding: &ExternalDatabaseConfig, project: &str) -> TenantNa
     TenantNames {
         database: tenant_db_name(database, &ident),
         role: tenant_role_name(compute, &ident),
+        owner_role: tenant_owner_role_name(compute, &ident),
         workload: compute.to_string(),
     }
 }
