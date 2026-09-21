@@ -278,9 +278,7 @@ pub fn add_to_linker<T: Send + 'static>(
 mod tests {
     use super::messaging_stats::Host;
     use super::*;
-    use boatramp_core::messaging::{
-        ClaimedMessage, GroupInfo, MessagingError, StartPosition,
-    };
+    use boatramp_core::messaging::{ClaimedMessage, GroupInfo, MessagingError, StartPosition};
     use std::collections::HashMap;
     use std::sync::Mutex;
     use std::time::Duration;
@@ -320,17 +318,41 @@ mod tests {
         }
         async fn dead_letter_count(&self, topic: &str) -> Result<usize, MessagingError> {
             self.reads.lock().unwrap().push(topic.to_string());
-            Ok(self.gauges.lock().unwrap().get(topic).map(|g| g.0).unwrap_or(0))
+            Ok(self
+                .gauges
+                .lock()
+                .unwrap()
+                .get(topic)
+                .map(|g| g.0)
+                .unwrap_or(0))
         }
         async fn backlog(&self, topic: &str) -> Result<usize, MessagingError> {
-            Ok(self.gauges.lock().unwrap().get(topic).map(|g| g.1).unwrap_or(0))
+            Ok(self
+                .gauges
+                .lock()
+                .unwrap()
+                .get(topic)
+                .map(|g| g.1)
+                .unwrap_or(0))
         }
         async fn in_flight_count(&self, topic: &str) -> Result<usize, MessagingError> {
-            Ok(self.gauges.lock().unwrap().get(topic).map(|g| g.2).unwrap_or(0))
+            Ok(self
+                .gauges
+                .lock()
+                .unwrap()
+                .get(topic)
+                .map(|g| g.2)
+                .unwrap_or(0))
         }
         async fn list_groups(&self, topic: &str) -> Result<Vec<GroupInfo>, MessagingError> {
             self.reads.lock().unwrap().push(topic.to_string());
-            Ok(self.groups.lock().unwrap().get(topic).cloned().unwrap_or_default())
+            Ok(self
+                .groups
+                .lock()
+                .unwrap()
+                .get(topic)
+                .cloned()
+                .unwrap_or_default())
         }
         async fn claim_grouped(
             &self,
@@ -461,7 +483,9 @@ mod tests {
         let b = binding(backend.clone(), &["sync/{tenant}/import"], None);
         let mut host = StatsHost::new(Some(&b));
         assert!(matches!(
-            host.get("bus:sync/{tenant}/import".into()).await.unwrap_err(),
+            host.get("bus:sync/{tenant}/import".into())
+                .await
+                .unwrap_err(),
             messaging_stats_types::StatsError::NotDeclared
         ));
     }
@@ -500,7 +524,9 @@ mod tests {
             let mut host = StatsHost::new(Some(&b));
             assert!(
                 matches!(
-                    host.get("bus:sync/{tenant}/import".into()).await.unwrap_err(),
+                    host.get("bus:sync/{tenant}/import".into())
+                        .await
+                        .unwrap_err(),
                     messaging_stats_types::StatsError::NotDeclared
                 ),
                 "empty/whitespace tenant {bad:?} must fail closed"
@@ -540,11 +566,17 @@ mod tests {
         );
         let b = binding(backend.clone(), &["sync/{tenant}/import"], Some("t-42"));
         let mut host = StatsHost::new(Some(&b));
-        let groups = host.groups("bus:sync/{tenant}/import".into()).await.unwrap();
+        let groups = host
+            .groups("bus:sync/{tenant}/import".into())
+            .await
+            .unwrap();
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].group, "workers");
         assert_eq!(groups[0].in_flight, 4);
         assert_eq!(groups[0].lag, 11);
-        assert_eq!(backend.reads.lock().unwrap()[0], "acme/bus/sync/t-42/import");
+        assert_eq!(
+            backend.reads.lock().unwrap()[0],
+            "acme/bus/sync/t-42/import"
+        );
     }
 }

@@ -34,13 +34,13 @@ pub mod invoke;
 pub mod keyvalue;
 #[cfg(feature = "messaging")]
 pub mod messaging;
-#[cfg(feature = "migrate")]
-pub mod migrate;
 /// The read-only `messaging-stats` binding: surface the ALREADY-computed per-topic bus gauges
 /// (dead-letter count / backlog / in-flight / per-group depth) to a granted guest, tenant-scoped by a
 /// host-filled `{tenant}` template. A messaging-substrate concern, so gated with `messaging`.
 #[cfg(feature = "messaging")]
 pub mod messaging_stats;
+#[cfg(feature = "migrate")]
+pub mod migrate;
 #[cfg(feature = "sql")]
 pub mod orm;
 #[cfg(feature = "session")]
