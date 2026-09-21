@@ -15,9 +15,10 @@ name: Nightly
 #                            shared via cachix (each leg substitutes it, never recompiles).
 #   • nix (flake eval …)   — whole-flake eval hygiene (`--no-build`) + the fast pre-commit
 #                            check (rustfmt · typos · anyhow-ban), kept off the heavy legs.
-# all-features *compile* coverage on musl lives in the nix `musl-clippy` check; the
-# per-push fast CI compiles + tests the shipped surface on musl. So the only thing left
-# on the host toolchain here is this all-features test *run* (target-agnostic logic).
+# all-features *compile* coverage on musl now runs PER-PUSH as CI's `shipped-clippy`
+# Tier 1 gate (the crane-cached `musl-clippy` check), not here — so the only thing left
+# on the host toolchain in this workflow is the all-features test *run* (target-agnostic
+# logic a network-capable runner can host, which the nix sandbox can't).
 on:
   schedule:
     - cron: "0 4 * * *" # 04:00 UTC daily
@@ -78,9 +79,9 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # all-features *clippy* is now the nix `checks.musl-clippy` derivation (compiled for
-      # the shipped musl target, cachix-cached). This lane runs the all-features test
-      # *suite* on a network-capable runner (the nix sandbox can't host it).
+      # all-features *clippy* runs per-push as CI's `shipped-clippy` gate (the crane-cached
+      # `checks.musl-clippy` derivation on the shipped musl target). This lane runs the
+      # all-features test *suite* on a network-capable runner (the nix sandbox can't host it).
       - name: Test (all features)
         run: cargo test --workspace --all-features
 
@@ -110,8 +111,10 @@ jobs:
         leg:
           - label: glibc clippy
             build: .#checks.x86_64-linux.clippy
-          - label: musl clippy
-            build: .#checks.x86_64-linux.musl-clippy
+          # musl clippy (--all-features --all-targets on the shipped target) now runs
+          # per-push as CI's `shipped-clippy` Tier 1 gate, so it's dropped here to avoid
+          # duplicating a ~30-min leg on the same commit. glibc clippy stays — a distinct
+          # target that catches glibc-only lints the musl gate can't.
           - label: nixos-service vm
             build: .#checks.x86_64-linux.nixos-service
           - label: release artifacts + OCI images

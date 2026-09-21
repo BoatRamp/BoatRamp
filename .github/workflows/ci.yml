@@ -1,51 +1,47 @@
 name: CI
 
-# Fast per-push / per-PR gate, split into parallel jobs so intra-day feedback is
-# quick:
-#   • quick          — instant source checks (fmt, typos, anyhow ban): no
-#                       workspace compile, so a format nit or typo fails within
-#                       seconds instead of behind a multi-minute clippy build.
-#   • clippy         — workspace clippy, default features.
-#   • feature-clippy — clippy the CLI's cfg-gated `serve` dispatch under the
-#                      cluster+tls+acme-dns feature union (a light slice of
-#                      --all-features) so a feature-combination regression fails
-#                      the PR gate, not only nightly.
-#   • test           — workspace tests, lean fs+SlateDB slice.
-#   • test-server-features — the `boatramp-server` feature-gated integration surface
-#                      (handlers/oidc/mcp/compression/dns-verify) AT THE MERGE GATE.
-#                      The lean `test` lane can't see this code; running it nightly-only
-#                      is how two total failures shipped through green CI, so it gates now.
-#   • test-cluster   — the embedded-Raft cluster tests (consensus + leader-loss failover),
-#                      behind the `raft`/`http` features — also nightly-only before, now gated.
-#   • test-orm-tenancy — the Stage 0 in-site tenant-isolation proof on a REAL libsql engine
-#                      (`sql`-feature-gated, so the lean `test` lane skips it); asserts a success
-#                      marker so a silent skip or a cross-tenant regression fails the merge.
-#   • test-orm-tenancy-sqlx — the SAME in-site tenant-isolation proof on a REAL Postgres AND MySQL
-#                      (service containers): the ORM renders the scope per-dialect, so isolation is
-#                      proven on every engine it targets, not only SQLite. Marker-gated per engine.
-#   • test-gdc-target — the Stage 5a GraphQL target-tenant READ isolation proof on a REAL libsql
-#                      engine (`@tenant(scope: target)` confines to another tenant's PUBLIC subset;
-#                      deny-by-default on an undeclared subset). Ignore-gated → host lane, marker-gated.
-#   • test-target-plain-wasm — the SAME target-read isolation for a non-federated `Tenancy::Target`
-#                      route, over BOTH the `orm` binding and raw `sql` ({scope} marker), on a REAL
-#                      libsql engine. Ignore-gated → host lane, marker-gated.
-#   • deny           — cargo-deny bans/licenses/sources (+ non-blocking advisories).
-# clippy and test are the two full workspace compiles; running them as separate
-# jobs lets them build concurrently on separate runners instead of one after the
-# other, roughly halving the critical path versus the old single-job pipeline.
+# TIER 1 — the blocking merge gate, split by WHAT it protects (not by clock). See
+# ../../boatramp-roadmap/plans/PLAN-ci-tiering-policy.md. The guarantee it gives:
+# "does the SHIPPED artifact hold?" — the `default` feature set ≈ the full ~30-feature
+# set, so the release binary + OCI images ship essentially `--all-features`.
 #
-# The shipped `default` feature set is now **all** features (batteries-included),
-# so per-push compiles deliberately opt DOWN to a lean fs+SlateDB slice
-# (`--no-default-features --features boatramp/fs,boatramp/slatedb`) plus the light
-# feature-clippy slice — so those jobs stay quick. But feature-gated *integration
-# tests* must still gate merges (not run nightly-only), so `test-server-features`
-# runs the server's handlers/oidc/mcp/compression/dns-verify surface per-push; the
-# heavier openraft/cloud-SDK feature unions stay in nightly's `--all-features` lane.
-# The full default (`--all-features` == default) clippy + test and the reproducible
-# `nix flake check` run in the nightly workflow (.github/workflows/nightly.yml).
+#   • quick          — instant source checks (fmt, typos, bans, #[ignore]-reasons,
+#                       README pins, relaxed-durability sole-caller): no compile, fails
+#                       in seconds.
+#   • shipped-clippy — THE compile guarantee: `clippy --all-features --all-targets` on
+#                       the shipped musl target via the crane-cached nix check.
+#                       `--all-targets` compiles EVERY feature-gated test target, so an
+#                       arity/type/shared-signature break fails the merge, not nightly
+#                       (the blind spot that shipped two total failures through green CI).
+#                       Replaces the old narrow `fs,slatedb` + `cluster,tls,acme-dns`
+#                       clippy legs (they validated a config nobody ships). Dep closure
+#                       substitutes from the public cachix cache → only our ~17 crates
+#                       recompile per push.
+#   • test           — a lean fs+SlateDB workspace test RUN for fast broad execution.
+#   • the live-run gates — EXECUTE the security/correctness invariants on real engines
+#                       (compile of them is already covered by shipped-clippy):
+#                       test-server-features (handlers/oidc/mcp/compression/dns-verify +
+#                       count tripwire), test-cluster (raft consensus + messaging DLQ
+#                       matrix), test-orm-tenancy (in-site isolation on libsql),
+#                       test-orm-tenancy-sqlx (SAME on real Postgres + MySQL service
+#                       containers, per-dialect), test-gdc-target + test-target-plain-wasm
+#                       (target-tenant read/write isolation + the #470 three-key gate),
+#                       helm-chart (CRD drift + least-privilege), coverage-gate, deny.
+#                       All secret-free, so they run on fork PRs too.
+#
+# TIER 2/3 live in nightly.yml + release.yml (privileged / secret-bearing / slow, and
+# kept as a release precondition per owner): glibc clippy, the NixOS-service VM, the
+# full `--all-features` test RUN, darwin/windows builds, reproducible OCI images, the
+# combinatorial matrix, operator e2e. Fork PRs never reach a secret-bearing step — the
+# cachix PUSH + release run only on push-to-main / tags; Tier 1 only PULLS (anonymous).
 on:
+  # Fire on EVERY branch push — merges land both as PRs and as client-side pushes
+  # straight to a branch / to main, so the gate can't assume the PR flow. A maintainer
+  # sees Tier 1 before a client-side merge, and again when it lands on main. Release
+  # tags don't match `branches`, so they stay owned by release.yml.
   push:
-    branches: [main]
+    branches: ['**']
+  # Fork / contributor code (which can't push to the repo) is gated here instead.
   pull_request:
 
 concurrency:
@@ -160,51 +156,51 @@ jobs:
           fi
           echo "relaxed-durability sole-caller guard OK"
 
-  clippy:
-    name: clippy (default features)
+  # TIER 1 compile guarantee. Clippy the SHIPPED config — `--all-features --all-targets`
+  # on the musl target the release binary + OCI images ship — via the crane-cached nix
+  # check. `--all-targets` COMPILES every feature-gated test target (sql live tests,
+  # graphql, raft, dns-verify), so a shared-signature/arity/type break in code that no
+  # narrow slice compiled fails HERE at the merge gate rather than nightly (the exact
+  # blind spot that shipped two total failures through green CI). This REPLACES the old
+  # narrow `fs,slatedb` + `cluster,tls,acme-dns` clippy legs, which validated a config
+  # nobody ships. The heavy third-party dep closure substitutes from the public
+  # boatramp cachix cache (kept warm by cache.yml on every push to main), so a push
+  # that doesn't touch Cargo.lock recompiles only our ~17 crates (minutes); a Cargo.lock
+  # change rebuilds the dep layer once (the disk/swap dance below absorbs its RAM peak).
+  # Runnable client-side before a merge: `nix build .#checks.x86_64-linux.musl-clippy`.
+  shipped-clippy:
+    name: clippy (shipped config — all features, musl)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-
-      # Lint the SHIPPED musl target via cargo-zigbuild's clippy subcommand (it owns the
-      # C-dep cross-compile + arg translation). A lean fs+SlateDB slice for fast feedback;
-      # the full default set is clippy'd nightly, the serve union in `feature-clippy`.
-      - uses: ./.github/actions/setup-musl
+      # Reclaim preinstalled toolchains + add swap (mirrors the nightly nix legs) so a
+      # cold dep-layer rebuild of the all-features closure can't OOM the runner.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          df -h /
+      - name: Add swap
+        run: |
+          sudo swapoff -a || true
+          sudo rm -f /mnt/swapfile
+          sudo fallocate -l 12G /mnt/swapfile
+          sudo chmod 600 /mnt/swapfile
+          sudo mkswap /mnt/swapfile
+          sudo swapon /mnt/swapfile
+          free -h
+      - uses: DeterminateSystems/nix-installer-action@main
+      # Pull the crane dep closure from the PUBLIC boatramp cache. On a fork PR the push
+      # token (`CACHIX_AUTH_TOKEN`) is absent — cachix-action then configures the cache
+      # PULL-only, which is all Tier 1 needs (anonymous substitution of the dep layer);
+      # only cache.yml/release PUSH the cache. So Tier 1 never depends on a secret.
+      - uses: cachix/cachix-action@v15
         with:
-          components: clippy
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: clippy-musl
-
-      - name: Clippy (musl)
-        run: cargo-zigbuild clippy --target x86_64-unknown-linux-musl --workspace --all-targets --no-default-features --features boatramp/fs,boatramp/slatedb -- -D warnings
-
-  feature-clippy:
-    name: clippy (serve feature union)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-
-      - uses: ./.github/actions/setup-musl
-        with:
-          components: clippy
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: feature-clippy-musl
-
-      # The CLI's `serve` dispatch is cfg-gated per TLS/cluster feature — the
-      # `match args.tls` arms and the `serve::Error` `#[from]` variants differ by
-      # feature. Default-features CI can't see those combinations, so a
-      # feature-union regression (a missing `TlsMode::Rpk` arm, a colliding
-      # `From<RpkError>`/`From<MeshError>`) previously only surfaced nightly. Clippy
-      # the `cluster + tls + acme-dns` union of just the `boatramp` crate per-push
-      # to catch it in the PR gate. This is a light slice — no wasmtime/handlers, no
-      # cloud-signer SDKs, no s3/compute — so it stays quick; the full
-      # `--all-features` clippy + test remains the nightly backstop.
-      - name: Clippy (cluster + tls + acme-dns, musl)
-        run: cargo-zigbuild clippy --target x86_64-unknown-linux-musl -p boatramp --no-default-features --features cluster,tls,acme-dns --all-targets -- -D warnings
+          name: boatramp
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+      - name: Clippy — shipped config (--all-features --all-targets, musl)
+        run: nix build .#checks.x86_64-linux.musl-clippy --print-build-logs --max-jobs 1 --cores 4
 
   helm-chart:
     name: operator Helm chart (lint + CRD drift)
@@ -239,7 +235,7 @@ jobs:
           helm template t charts/boatramp-operator --namespace boatramp-system >/dev/null
 
   test:
-    name: test (default features)
+    name: test (lean fs+slatedb run)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
