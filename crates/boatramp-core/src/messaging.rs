@@ -574,6 +574,16 @@ pub trait Messaging: Send + Sync {
         true
     }
 
+    /// Filter `topics` to the ones THIS node owns, computing the assignment against a SINGLE
+    /// membership snapshot (B8: "recompute once per drain cycle") — so the drainer pays one applied-
+    /// membership read per cycle, not one per topic. The default returns every topic (single-node /
+    /// unsharded). `RaftMessaging` overrides it to snapshot `applied_voters` once and HRW-filter
+    /// against it. A correctness-neutral optimization of per-topic [`shard_owns`](Self::shard_owns);
+    /// the unsharded safety-net pass (B7) covers any apply-lag divergence.
+    async fn shard_owned(&self, topics: Vec<String>) -> Vec<String> {
+        topics
+    }
+
     /// Subscribe to a **live, at-most-once** broadcast of `topic` — for SSE
     /// streams, *not* the durable consumer path. Every
     /// message published after the subscription is delivered once to each live
@@ -1504,13 +1514,6 @@ pub struct LogMessaging {
     /// nack-to-now durably commits (B12) so the drainer re-checks the ready-set promptly. Lossy — a
     /// missed pulse only costs latency (the durable ready-set + safety-net are the authority).
     wake: Wake,
-    /// **Publish generation** (B4 prune-race guard): bumped once AFTER each publish's ready-set add
-    /// durably commits. `claim` snapshots this before its record scan and re-reads it before emitting
-    /// the ready-set prune; if it changed, a publish raced concurrently (its ready-add may not have
-    /// been visible to the scan), so `claim` SKIPS the prune rather than clobbering the racing
-    /// publish's just-added marker — closing the prune-vs-publish stranding race directly (not merely
-    /// relying on the rebuild). Publish is lock-free; this atomic is the only cross-talk needed.
-    publish_gen: AtomicU64,
     /// Unix-ms this node last completed a full [`rebuild_ready_set`](Messaging::rebuild_ready_set)
     /// pass, for the `last_rebuild_age_ms` delivery stat (B14). `0` = not yet rebuilt since start.
     last_rebuild_ms: AtomicU64,
@@ -1557,7 +1560,6 @@ impl LogMessaging {
             commit_queue: std::sync::Mutex::new(Vec::new()),
             commit_gate: futures::lock::Mutex::new(()),
             wake: Wake::new(),
-            publish_gen: AtomicU64::new(0),
             last_rebuild_ms: AtomicU64::new(0),
             max_unflushed: 0, // strong durability by default (== the original always-await-flush path)
             unflushed: std::sync::atomic::AtomicUsize::new(0),
@@ -1823,12 +1825,12 @@ impl LogMessaging {
     }
 
     /// Signal that work became ready, AFTER a publish (or nack-to-now) durably committed its
-    /// ready-set marker (B12): bump the publish generation (so a concurrent `claim`'s prune sees a
-    /// race and skips, B4) THEN fire the lossy in-process wake (so the drainer re-checks the ready-set
-    /// promptly). Ordering matters — the marker is durable before either, so a woken drainer always
-    /// finds it. A dropped/coalesced wake is harmless (the safety-net still delivers).
+    /// ready-set marker (B12): fire the lossy in-process wake so the drainer re-checks the ready-set
+    /// promptly. The marker is durable before this, so a woken drainer always finds it; a
+    /// dropped/coalesced wake is harmless (the safety-net still delivers). The prune-vs-publish race
+    /// (B4) is closed in `claim` itself (it re-verifies emptiness while holding the publish
+    /// commit-gate), NOT by any signal here.
     fn signal_ready(&self) {
-        self.publish_gen.fetch_add(1, Ordering::Relaxed);
         self.wake.notify();
     }
 
@@ -2431,11 +2433,6 @@ impl Messaging for LogMessaging {
         // to exactly one consumer (the per-process coordinator — a cluster swaps
         // this mutex for the Raft leader applying the same `plan_claim`).
         let _guard = self.claim_lock.lock().await;
-        // B4 prune-race guard: snapshot the publish generation BEFORE the record scan. A publish is
-        // lock-free (it does not take `claim_lock`), so one may commit a fresh record + ready marker
-        // AFTER our scan but BEFORE our prune. We re-read this after the scan; if it changed, we
-        // SKIP the ready-set prune rather than clobber the racing publish's just-added marker.
-        let gen_before = self.publish_gen.load(Ordering::Relaxed);
         let now = now_unix_ms();
         let prefix = meta_prefix(topic);
         let keys = self
@@ -2512,35 +2509,59 @@ impl Messaging for LogMessaging {
             }
         }
 
-        // B4/B5 — conditional ready-set prune. The marker is per-TOPIC and covers EVERY lane (the
-        // work-queue + every consumer group), so a work-queue claim may prune it ONLY when the whole
-        // topic is drained. This claim only sees the work-queue lane, so it prunes only for a topic
-        // with NO groups (the common case): a grouped topic keeps its marker here and the periodic
-        // ready-set rebuild prunes it once ALL lanes are empty (B5: a stale marker costs one cheap
-        // empty claim, never a stranding — never prune while another lane has work).
-        //
-        // Drained (work-queue) iff every claimable-now record got leased by this plan: the residual
-        // claimable count is `claimable_before − leased` (a dead-letter was NOT claimable, so it never
-        // counted). Prune ONLY if that is zero AND no publish raced (gen unchanged) — a concurrent
-        // publish may have committed a fresh claimable record + marker after our scan, invisible here,
-        // so its marker must survive; skip the delete and let the next claim / rebuild reconcile.
-        let residual_claimable = claimable_before.saturating_sub(leased);
-        let wq_drained = residual_claimable == 0;
-        if wq_drained
-            && !self.topic_has_groups(topic).await
-            && self.publish_gen.load(Ordering::Relaxed) == gen_before
-        {
-            ops.push(WriteOp::Delete(ready_key(topic)));
-        }
-
+        // Commit the lease writes + dead-letter moves FIRST, in ONE durable atomic batch (B1/B3,
+        // never the relaxed path). The conditional ready-set prune is handled separately below,
+        // because it must re-verify emptiness against a publish-serialized view (B4).
         if !ops.is_empty() {
-            // Durable, atomic (B1/B3): the lease writes, dead-letter moves, and the conditional
-            // ready-prune commit together or not at all — a claim never leaves a leased record
-            // without its (still-present-or-pruned-together) marker.
             self.kv
                 .write_batch(ops)
                 .await
                 .map_err(MessagingError::backend)?;
+        }
+
+        // B4/B5 — conditional ready-set prune, RACE-FREE. The marker is per-TOPIC and covers EVERY
+        // lane (the work-queue + every consumer group), so a work-queue claim may prune it ONLY when
+        // the whole topic is drained; this claim only sees the work-queue lane, so it prunes only for
+        // a topic with NO groups (a grouped topic keeps its marker; the periodic rebuild prunes it
+        // once ALL lanes empty — B5, a stale marker costs one cheap empty claim, never a stranding).
+        //
+        // The prune-vs-publish race (a publish committing its atomic `{record, marker}` batch between
+        // our scan and our delete would otherwise have its just-added marker clobbered → the message
+        // stranded until the next rebuild) is closed DIRECTLY by re-verifying emptiness while holding
+        // the publish **commit gate**: a publish commits its record+marker only as the gate-holder in
+        // `group_commit`, so while we hold `commit_gate` NO publish can make a new record/marker
+        // durable. Under the gate we re-list the topic's records fresh; only if it is STILL empty do
+        // we delete the marker — and we do it in the same gated window, so a publish that lands right
+        // after re-adds its marker AFTER our delete (never a lost marker). Publishes to this or any
+        // topic queue for the brief gated re-list (claims are serialized + far rarer than publishes),
+        // then coalesce as usual. The marker stays in the publish's atomic batch (B1 intact).
+        let residual_claimable = claimable_before.saturating_sub(leased);
+        let wq_drained = residual_claimable == 0;
+        if wq_drained && !self.topic_has_groups(topic).await {
+            // Hold the publish commit-gate so no publish can commit a fresh `{record, marker}` while
+            // we re-verify + delete. (Same gate `group_commit` takes to become the durable-commit
+            // leader — see `LogMessaging::group_commit`.)
+            let _commit = self.commit_gate.lock().await;
+            let prefix = meta_prefix(topic);
+            // Any live `mq/{topic}/…` record — claimable now, leased-but-pending (its lease will
+            // expire → redelivery), or destined to dead-letter on its next claim — means the topic
+            // still has work the drainer must revisit, so the marker must stay. Prune ONLY when the
+            // work-queue is COMPLETELY empty (strictly safe: never prunes while any record exists).
+            let has_any_record = self
+                .kv
+                .list_prefix(&prefix)
+                .await
+                .map_err(MessagingError::backend)?
+                .iter()
+                .any(|k| is_direct_child(k, &prefix));
+            if !has_any_record {
+                // Fresh, authoritative under the gate: the work-queue is empty and no publish can have
+                // slipped a marker in. A grouped lane can't exist here (checked above). Delete durably.
+                self.kv
+                    .write_batch(vec![WriteOp::Delete(ready_key(topic))])
+                    .await
+                    .map_err(MessagingError::backend)?;
+            }
         }
         Ok(claimed)
     }
@@ -5612,16 +5633,23 @@ mod tests {
             vec!["t".to_string()],
             "a publish flags the topic ready (B1)"
         );
-        // Claim + ack the only message → the topic drains → the marker is pruned (B4).
+        // Claim the only message: the marker STAYS (a leased-but-unacked message is still pending
+        // work — it will need redelivery if the lease expires unacked). Pruning here would be unsafe.
         let batch = mq.claim("t", LEASE, 16, 5).await.unwrap();
         assert_eq!(batch.len(), 1);
-        // The topic is now all-leased (nothing claimable), so the claim pruned the marker.
+        assert_eq!(
+            mq.ready_topics().await.unwrap(),
+            vec!["t".to_string()],
+            "a leased-but-unacked message keeps the marker (still pending work)"
+        );
+        // Ack it → the work-queue is now EMPTY → the NEXT claim's gated re-verify prunes the marker.
+        mq.ack(&batch[0]).await.unwrap();
+        let empty = mq.claim("t", LEASE, 16, 5).await.unwrap();
+        assert!(empty.is_empty(), "nothing left to claim");
         assert!(
             mq.ready_topics().await.unwrap().is_empty(),
-            "a claim that drains the topic to all-leased prunes the ready marker (B4)"
+            "a claim over the now-empty work-queue prunes the ready marker (B4)"
         );
-        mq.ack(&batch[0]).await.unwrap();
-        assert!(mq.ready_topics().await.unwrap().is_empty());
     }
 
     /// Gate 3 (core): a crash between the index put and the ready-set put strands the marker (not the
@@ -5652,32 +5680,66 @@ mod tests {
         assert_eq!(mq.claim("t", LEASE, 16, 5).await.unwrap().len(), 1);
     }
 
-    /// Gate 4 (core): the prune-vs-publish generation guard. A publish that commits AFTER a claim's
-    /// record scan but BEFORE its prune must NOT have its marker clobbered. We can't interleave the
-    /// lock-free publish inside `claim` deterministically here, so we assert the guard's invariant
-    /// directly: bumping the publish generation between scan and prune skips the delete.
-    #[tokio::test]
-    async fn concurrent_publish_marker_is_not_pruned_by_a_draining_claim() {
-        let mq = mq();
-        // One message; claim it (leases it, topic becomes all-leased → would prune).
-        mq.publish("t", b"a").await.unwrap();
-        let first = mq.claim("t", LEASE, 16, 5).await.unwrap();
-        assert_eq!(first.len(), 1);
-        // Marker pruned (no race).
-        assert!(mq.ready_topics().await.unwrap().is_empty());
-        // Now a fresh publish re-adds the marker; a subsequent claim of the leased-only topic must
-        // NOT prune it (a claimable message exists again).
-        mq.publish("t", b"b").await.unwrap();
-        assert_eq!(mq.ready_topics().await.unwrap(), vec!["t".to_string()]);
-        // Claim drains "b" too → marker pruned again (no concurrent publish).
-        let second = mq.claim("t", LEASE, 16, 5).await.unwrap();
-        assert_eq!(second.len(), 1);
-        assert!(
-            mq.ready_topics().await.unwrap().is_empty(),
-            "with no racing publish, the drain prunes the marker"
+    /// Gate 4 (core), REAL race: many lock-free publishers hammering a topic CONCURRENTLY with a
+    /// draining claim/ack loop that prunes the marker whenever the topic empties. Every published
+    /// message MUST end up delivered (acked) with NO reliance on a rebuild — proving the claim's
+    /// gated re-verify closes the prune-vs-publish stranding window DIRECTLY (a publish committing its
+    /// `{record, marker}` between a claim's scan and its prune must never have its marker clobbered).
+    /// This genuinely interleaves the lock-free publish path against the prune, on a multi-thread
+    /// runtime — the test the earlier gen-guard version could not provide.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_publish_is_never_stranded_by_a_draining_prune() {
+        let mq = Arc::new(mq());
+        const PUBLISHERS: u32 = 8;
+        const PER: u32 = 60;
+        let total = PUBLISHERS * PER;
+
+        // Publishers: fire lock-free publishes as fast as possible (contending the prune window).
+        let mut pubs = Vec::new();
+        for p in 0..PUBLISHERS {
+            let mq = mq.clone();
+            pubs.push(tokio::spawn(async move {
+                for i in 0..PER {
+                    mq.publish("t", format!("{p}-{i}").as_bytes()).await.unwrap();
+                    tokio::task::yield_now().await;
+                }
+            }));
+        }
+        // Drainer: claim + ack in a tight loop (each drain that empties the topic runs the gated
+        // prune). Runs until every message is delivered — WITHOUT ever calling `rebuild_ready_set`.
+        let mq_drain = mq.clone();
+        let drainer = tokio::spawn(async move {
+            let mut delivered = std::collections::HashSet::new();
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            while delivered.len() < total as usize {
+                if std::time::Instant::now() > deadline {
+                    break;
+                }
+                let batch = mq_drain.claim("t", LEASE, 8, 5).await.unwrap();
+                if batch.is_empty() {
+                    // Nothing claimable right now. If publishers are done and we're still short, the
+                    // ready marker + a re-claim must still find any straggler — loop again (the marker
+                    // is our only guide; if it was wrongly pruned, this would spin to the deadline).
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+                for m in batch {
+                    delivered.insert(String::from_utf8(m.payload.clone()).unwrap());
+                    mq_drain.ack(&m).await.unwrap();
+                }
+            }
+            delivered
+        });
+        for h in pubs {
+            h.await.unwrap();
+        }
+        let delivered = drainer.await.unwrap();
+        assert_eq!(
+            delivered.len(),
+            total as usize,
+            "gate 4: every published message was delivered with NO stranding (no rebuild used) — \
+             the prune-vs-publish race is closed directly"
         );
-        mq.ack(&first[0]).await.unwrap();
-        mq.ack(&second[0]).await.unwrap();
     }
 
     /// Gate 7 (core): two distinct topics (e.g. two projects' same-named topic, namespaced by the
@@ -5696,13 +5758,16 @@ mod tests {
         );
         assert_eq!(ready_key("projA/orders"), "mqready/projA/orders");
         assert_ne!(ready_key("projA/orders"), ready_key("projB/orders"));
-        // Draining one leaves the other's marker intact.
+        // Fully drain projA (claim + ack → empty → next claim prunes ITS marker only); projB's marker
+        // is never touched — the prune is per-topic-key.
         let a = mq.claim("projA/orders", LEASE, 16, 5).await.unwrap();
         assert_eq!(a.len(), 1);
+        mq.ack(&a[0]).await.unwrap();
+        assert!(mq.claim("projA/orders", LEASE, 16, 5).await.unwrap().is_empty());
         assert_eq!(
             mq.ready_topics().await.unwrap(),
             vec!["projB/orders".to_string()],
-            "draining projA leaves projB's marker untouched"
+            "draining projA prunes only projA's key; projB's marker is untouched (gate 7)"
         );
     }
 

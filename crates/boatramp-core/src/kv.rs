@@ -126,10 +126,17 @@ pub trait KvStore: Send + Sync {
     /// ([`LogMessaging::group_commit`](crate::messaging::LogMessaging)), and only when
     /// the operator has opted the node into relaxed messaging durability. Every
     /// control-plane write (deploy/config/domain/auth), every guest `wasi:keyvalue`
-    /// write, and every messaging **ack/claim/dead-letter** transition MUST use the
-    /// durable [`write_batch`](Self::write_batch) — a shared `KvStore` backs all of
-    /// them, so relaxing any of those would be a control-plane / redelivery hazard. A
-    /// CI test enforces the sole-caller rule.
+    /// write, and every messaging **ack/claim/dead-letter** transition (INCLUDING the
+    /// event-driven ready-set removals/re-adds — B3) MUST use the durable
+    /// [`write_batch`](Self::write_batch) — a shared `KvStore` backs all of them, so
+    /// relaxing any of those would be a control-plane / redelivery hazard.
+    ///
+    /// The sole-caller property is enforced behaviorally: the `CountingKv` durability tests assert
+    /// the relaxed path is taken ONLY on the opted-in publish path (zero relaxed calls under the
+    /// strong default, and never for a claim-drain prune or nack re-add — see
+    /// `ready_set_removals_and_readds_are_never_relaxed`), and the sole in-tree caller is
+    /// [`LogMessaging::commit_group`](crate::messaging::LogMessaging). (This is not a source-scanning
+    /// lint — a future caller would have to be caught by these tests or review.)
     async fn write_batch_relaxed(&self, ops: Vec<WriteOp>) -> Result<(), KvError> {
         self.write_batch(ops).await
     }

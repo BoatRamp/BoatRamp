@@ -1781,6 +1781,19 @@ impl Messaging for RaftMessaging {
             None => true, // no applied membership yet ⇒ unsharded (own all)
         }
     }
+
+    async fn shard_owned(&self, topics: Vec<String>) -> Vec<String> {
+        // B8: snapshot the applied voter set ONCE, then HRW-filter all topics against it — one
+        // membership read per drain cycle (not per topic). Empty voter set ⇒ unsharded (own all).
+        let voters = self.state.applied_voters().await;
+        if voters.is_empty() {
+            return topics;
+        }
+        topics
+            .into_iter()
+            .filter(|t| Self::hrw_owner(t, &voters) == Some(self.node_id))
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -2091,14 +2104,21 @@ mod tests {
             poll_ready(&mqs[&1], &["t"]).await,
             "publish (from any node) flags the topic in the replicated ready-set (B1)"
         );
-        // Claim the only message on node 3 → topic drains → marker pruned in the same apply (B4).
+        // Claim the only message on node 3: the marker STAYS (a leased-but-unacked message is still
+        // pending work — matches single-node's "prune only when the work-queue is empty" rule).
         let batch = mqs[&3].claim("t", LEASE, 10, 5).await.unwrap();
         assert_eq!(batch.len(), 1);
         assert!(
-            poll_ready(&mqs[&1], &[]).await,
-            "a claim that drains the topic prunes the replicated marker (B4)"
+            poll_ready(&mqs[&1], &["t"]).await,
+            "a leased-but-unacked message keeps the replicated marker"
         );
+        // Ack it → work-queue empty → the NEXT claim's apply prunes the marker (leader-serialized, B4).
         mqs[&1].ack(&batch[0]).await.unwrap();
+        assert!(mqs[&3].claim("t", LEASE, 10, 5).await.unwrap().is_empty());
+        assert!(
+            poll_ready(&mqs[&1], &[]).await,
+            "a claim over the now-empty work-queue prunes the replicated marker (B4)"
+        );
         shutdown(rafts).await;
     }
 
@@ -2182,6 +2202,36 @@ mod tests {
     #[test]
     fn hrw_empty_voters_owns_nothing_so_caller_owns_all() {
         assert_eq!(RaftMessaging::hrw_owner("t", &[]), None);
+    }
+
+    /// Phase D — the batch `shard_owned` (B8, one membership snapshot for the whole cycle) agrees
+    /// exactly with per-topic `shard_owns`, and partitions the candidate set across the cluster (the
+    /// union of every node's `shard_owned` == the whole candidate set, disjointly).
+    #[serial_test::serial]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cluster_shard_owned_batch_agrees_with_per_topic_and_partitions() {
+        let (rafts, mqs) = cluster_mq(3).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let candidates: Vec<String> = (0..90).map(|i| format!("orders/{i}")).collect();
+        let mut union: HashSet<String> = HashSet::new();
+        for id in 1..=3u64 {
+            let owned = mqs[&id].shard_owned(candidates.clone()).await;
+            // Batch agrees with per-topic for this node.
+            for t in &candidates {
+                let per_topic = mqs[&id].shard_owns(t).await;
+                assert_eq!(
+                    owned.contains(t),
+                    per_topic,
+                    "shard_owned batch disagrees with shard_owns for {t} on node {id}"
+                );
+            }
+            // Disjoint across nodes.
+            for t in &owned {
+                assert!(union.insert(t.clone()), "topic {t} owned by two nodes");
+            }
+        }
+        assert_eq!(union.len(), candidates.len(), "every candidate is owned by some node");
+        shutdown(rafts).await;
     }
 
     /// Phase D — over a real 3-node cluster, `shard_owns` partitions the topic space: every topic is
@@ -2324,9 +2374,16 @@ mod tests {
             .unwrap()
             .pop()
             .unwrap();
-        // The claim drained the topic → marker pruned.
-        assert!(poll_ready(&mqs[&1], &[]).await, "drained → marker pruned");
-        // Nack from another node re-arms the marker (claimable again).
+        // Simulate a pruned/lost marker (e.g. a claim had emptied it, or a crash lost it) so the nack's
+        // re-arm is observable: delete the marker directly (the leased record itself is untouched).
+        mqs[&1]
+            .propose(WriteOp::Delete {
+                key: messaging::ready_key("t"),
+            })
+            .await
+            .unwrap();
+        assert!(poll_ready(&mqs[&1], &[]).await, "marker cleared");
+        // Nack from another node re-arms the marker in the replicated apply (claimable again, B1).
         mqs[&2].nack(&m).await.unwrap();
         assert!(
             poll_ready(&mqs[&1], &["t"]).await,

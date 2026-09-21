@@ -661,21 +661,9 @@ fn apply_mq_claim(
             records.push((key[prefix.len()..].to_string(), record));
         }
     }
-    // Emptiness-after-this-claim (B4), computed from the same snapshot the plan runs over — inside
-    // ONE leader-serialized apply, so there is NO prune-vs-publish race (a concurrent MqPublish is a
-    // separate apply, ordered before or after this one; the double-owner window is safe by
-    // construction). A record counts as claimable-now iff its lease has expired, it is not TTL-dead,
-    // and it is under max_attempts (the same predicate `plan_claim` leases by).
-    let claimable_now = |rec: &messaging::Record| -> bool {
-        rec.lease_until_ms <= now_ms
-            && !(rec.expires_at_ms != 0 && rec.expires_at_ms <= now_ms)
-            && rec.attempts < max_attempts
-    };
-    let claimable_before = records.iter().filter(|(_, r)| claimable_now(r)).count();
     let actions = messaging::plan_claim(records, now_ms, lease_ms, max_batch, max_attempts);
 
     let mut claimed = Vec::new();
-    let mut leased = 0usize;
     for action in actions {
         match action {
             messaging::ClaimAction::Lease { id, record } => {
@@ -689,7 +677,6 @@ fn apply_mq_claim(
                     // record, not object storage, so the node can't fetch it separately).
                     inline: record.inline,
                 });
-                leased += 1;
             }
             messaging::ClaimAction::DeadLetter { id, record } => {
                 let json = serde_json::to_vec(&record).expect("record serializes");
@@ -698,14 +685,23 @@ fn apply_mq_claim(
             }
         }
     }
-    // B4/B5 — conditional ready-set prune. The per-topic marker covers every lane, and this
-    // work-queue claim only sees the work-queue lane, so prune ONLY for a topic with NO registered
-    // groups (else the periodic rebuild prunes it once ALL lanes drain — a stale marker costs one
-    // cheap empty claim, never a stranding). Work-queue drained iff every claimable-now record got
-    // leased (residual `claimable_before − leased == 0`). No gen guard needed — the leader serializes
-    // this apply against every MqPublish, so nothing races within the apply.
-    let wq_drained = claimable_before.saturating_sub(leased) == 0;
-    if wq_drained && !topic_has_groups_applied(target, topic) {
+    // B4/B5 — conditional ready-set prune, computed from the POST-plan applied state (the leases +
+    // dead-letter removals above already mutated `target.data`), inside this ONE leader-serialized
+    // apply — so there is NO prune-vs-publish race (a concurrent MqPublish is a separate apply,
+    // ordered strictly before or after this one). Prune ONLY when the work-queue is now COMPLETELY
+    // empty (no `mq/{topic}/…` record remains) AND the topic has no consumer groups (the per-topic
+    // marker covers every lane, so a grouped topic keeps its marker and the periodic rebuild prunes
+    // it once ALL lanes drain — B5). A leased-but-unacked record is still pending work (redelivery on
+    // lease expiry), so it KEEPS the marker — matching the single-node prune's "empty only" rule.
+    let wq_empty = {
+        let prefix = messaging::meta_prefix(topic);
+        !target
+            .data
+            .range(prefix.clone()..)
+            .take_while(|(k, _)| k.starts_with(&prefix))
+            .any(|(k, _)| messaging::is_direct_child(k, &prefix))
+    };
+    if wq_empty && !topic_has_groups_applied(target, topic) {
         target.remove(messaging::ready_key(topic));
     }
     claimed

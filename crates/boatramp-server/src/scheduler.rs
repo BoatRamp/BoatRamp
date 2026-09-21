@@ -239,28 +239,33 @@ async fn run_delivery_drainer(inner: Arc<HandlerRuntimeInner>, deploy: DeploySto
         // leader-serialized atomic claim delivers each message exactly once, C4/B9), so the worst case
         // is a cheap redundant empty claim — never a double-delivery, never a stranding.
         let unsharded_pass = last_unsharded.elapsed() >= cfg.safetynet_interval;
-        let mut topics: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for topic in ready {
-            if unsharded_pass || messaging.shard_owns(&topic).await {
-                topics.insert(topic);
-            }
-        }
-        // Pop every due topic (deadline <= now) off the heap and add it — a leased message whose
-        // lease expired is now claimable again (redelivery), even if its ready marker was pruned. On
-        // the sharded per-wake pass, only if this node owns it (the new owner drains it after a
-        // rebalance); on the unsharded safety-net pass, unconditionally (the no-owner backstop).
+        // Candidate topics = the ready-set ∪ the topics whose lease-expiry deadline has passed (popped
+        // off the due-heap — a leased message whose lease expired is claimable again, even if its
+        // marker was pruned). The whole set is shard-filtered together against ONE membership snapshot.
+        let mut candidates: Vec<String> = ready;
         while let Some(std::cmp::Reverse((deadline, topic))) = due_heap.peek().cloned() {
             if deadline > now_ms {
                 break; // the heap is min-ordered — nothing else is due yet
             }
             due_heap.pop();
-            if unsharded_pass || messaging.shard_owns(&topic).await {
-                topics.insert(topic);
-            }
+            candidates.push(topic);
         }
-        if unsharded_pass {
+        let topics: std::collections::HashSet<String> = if unsharded_pass {
+            // Unsharded backstop (B7): drain the WHOLE candidate set regardless of ownership, closing
+            // the sharding no-owner window (a dead node's orphaned topics get picked up here). Also
+            // the single-node/degenerate path (`shard_owned` would return everything anyway).
             last_unsharded = tokio::time::Instant::now();
-        }
+            candidates.into_iter().collect()
+        } else {
+            // Sharded per-wake fast path: only the topics this node OWNS under the applied-membership
+            // HRW assignment — filtered as one batch against a single snapshot (B8: recompute once per
+            // drain cycle). Single-node / LogMessaging owns all, so this is a no-op there.
+            messaging
+                .shard_owned(candidates)
+                .await
+                .into_iter()
+                .collect()
+        };
 
         if !topics.is_empty() {
             // Dispatch exactly the ready/due topics (the drainer's `Topics` filter): no cron/async/
