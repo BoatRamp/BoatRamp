@@ -8760,4 +8760,28 @@ async fn messaging_stats_reads_own_tenant_dlq_and_refuses_others() {
         StatsRefused::NotDeclared,
         "a {tenant} template with no resolved tenant is refused"
     );
+
+    // (4) SECURITY (review HIGH-1) end-to-end: a resolved tenant that contains `/` must NOT be able
+    // to reshape a `{tenant}` template into another tenant's topic. A binding whose host-resolved
+    // tenant is `victim/import`, filling template `sync/{tenant}`, would otherwise resolve to
+    // `acme/bus/sync/victim/import` — the foreign topic seeded above. It must be REFUSED.
+    let slash = Bindings::new("import-worker").with_messaging_stats(
+        "acme/import-worker/",
+        "acme/bus/",
+        messaging.clone(),
+        vec!["sync/{tenant}".to_string()],
+        Some("victim/import".to_string()),
+    );
+    assert_eq!(
+        slash
+            .messaging_stats()
+            .expect("granted")
+            .read_topic_stats("bus:sync/{tenant}")
+            .await
+            .unwrap_err(),
+        StatsRefused::NotDeclared,
+        "a slash-bearing resolved tenant cannot reshape the topic to a foreign tenant's"
+    );
+
+    println!("MESSAGING-STATS TENANT-SCOPED OK");
 }
