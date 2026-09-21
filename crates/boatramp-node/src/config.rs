@@ -1324,6 +1324,14 @@ pub struct SqlBindingConfig {
     /// hard-drop immediately (the engine/cell can't be renamed aside safely), so this
     /// knob only affects the Shared-Postgres cell.
     pub deprovision_grace_secs: Option<u64>,
+    /// **Trusted-extension allowlist** for the owner-gated schema-migration surface — the ONLY
+    /// Postgres extensions a migration `Extension` step may enable (a name not here is refused
+    /// fail-closed). A raw `sql` migration step may not `CREATE EXTENSION` at all, so this list is
+    /// the single, operator-controlled gate on which extensions a project can install via
+    /// migrations. Empty / `None` ⇒ no extension may be enabled through a migration (the safest
+    /// default). Keep it tight (e.g. `["pgcrypto", "uuid-ossp", "citext"]`); an entry like
+    /// `dblink`/`postgres_fdw` deliberately widens cross-database reach, so add those only knowingly.
+    pub migrate_trusted_extensions: Option<Vec<String>>,
 }
 
 /// One external SQL database for the handler `sql` binding. Its **source** is one

@@ -374,6 +374,19 @@ impl Right {
                 let action = if get { Action::Read } else { Action::Deploy };
                 Self::new(Resource::Project, Some(default_project.clone()), action)
             }
+            // The owner-gated **schema-migration** surface (`/api/migrate/{db}/{apply,dry-run,
+            // status}`): boatramp applies an ordered migration set as the project's non-superuser
+            // OWNER role (owner-authority DDL — CREATE/ALTER/DROP tables, RLS policies, allowlisted
+            // extensions). Because DDL redraws the schema — at least as boundary-critical as the
+            // tenancy schema above — the mutating verbs are gated at **`Project·Admin`**, NEVER the
+            // deploy-grade publisher right the `/api/sql/` path below uses (a ship-only CI token must
+            // not be able to migrate the schema). Read-only `status` needs only `Project·Read`.
+            // Gated explicitly ABOVE the `/api/sql/` catch-all so a publisher cannot reach it.
+            p if p.starts_with("/api/migrate/") => Self::new(
+                Resource::Project,
+                Some(default_project.clone()),
+                if get { Action::Read } else { Action::Admin },
+            ),
             // Operator SQL to a managed database (project-owned): migrations + queries
             // are operator tools scoped to the default project. `project·deploy` (they
             // are POST bodies that mutate or read the project's managed DB); the
@@ -1921,6 +1934,45 @@ mod tests {
         assert!(
             admin.allows(&put_tenancy),
             "a project_admin must be able to PUT the tenancy schema",
+        );
+    }
+
+    /// The owner-gated schema-migration surface (`/api/migrate/…`) applies owner-authority DDL,
+    /// so — like the tenancy schema — its mutating verbs require `Project·Admin`, never the
+    /// deploy-grade publisher right the sibling `/api/sql/` path uses. A `project_publisher` (who
+    /// can ship code) must be REFUSED; a `project_admin` allowed. Read-only `status` is `Project·Read`.
+    #[test]
+    fn migrate_surface_write_is_project_admin_not_publisher() {
+        // The path maps to the default project (a global operator path, like /api/sql).
+        let default_admin = Right::new(Resource::Project, Some("default".into()), Action::Admin);
+        for path in ["/api/migrate/appdb/apply", "/api/migrate/appdb/dry-run"] {
+            assert_eq!(
+                Right::required("POST", path),
+                Some(default_admin.clone()),
+                "POST {path} must require Project·Admin",
+            );
+        }
+        // Read-only status is a Project·Read.
+        assert_eq!(
+            Right::required("GET", "/api/migrate/appdb/status"),
+            Some(Right::new(
+                Resource::Project,
+                Some("default".into()),
+                Action::Read
+            )),
+        );
+        // A publisher on the default project ships code but MUST NOT migrate the schema; an admin can.
+        let apply = Right::required("POST", "/api/migrate/appdb/apply").unwrap();
+        let policy = AuthzPolicy::default_policy();
+        let publisher = policy.rights_for(&[GrantedRole::scoped("project_publisher", "default")]);
+        assert!(
+            !publisher.allows(&apply),
+            "a project_publisher must not be able to run migrations",
+        );
+        let admin = policy.rights_for(&[GrantedRole::scoped("project_admin", "default")]);
+        assert!(
+            admin.allows(&apply),
+            "a project_admin must be able to run migrations",
         );
     }
 
