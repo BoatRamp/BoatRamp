@@ -12,7 +12,7 @@
 //!     --features slatedb --example messaging_bench
 //! ```
 //!
-//! Three profiles, each the analog of a `nats bench js pub` mode:
+//! Three publish profiles, each the analog of a `nats bench js pub` mode:
 //! - **single (sequential, awaited)** — one publisher, one durable commit per message. The strict
 //!   floor: latency ≈ one flush interval. Compare to `nats bench js pub --pub 1` (sync).
 //! - **concurrent (aggregate)** — `CONC` publishers in flight; the per-node group-commit (A2)
@@ -20,6 +20,16 @@
 //!   `nats bench js pub --pub N`.
 //! - **batch (`publish_batch`)** — `CHUNK` messages per durable commit (A4 pipelined path). Compare
 //!   to `nats bench js pub` async / batched.
+//!
+//! Plus the **event-driven delivery idle-scaling sweep** (gate 8 — the headline of
+//! PLAN-messaging-event-driven-delivery): with `IDLE_SWEEP=1`, create 10 / 1 000 / 10 000 *idle*
+//! topics (each published-then-drained, so no claimable work remains) and measure one drainer
+//! "look for work" cycle (`ready_topics()` ∪ `due_topics()`). The whole point of the ready-set is
+//! that this cost is ~FLAT in the idle-topic count (the old poll was O(#topics)×2/sec). A regression
+//! here — cost rising with idle topics — is the feature failing. Run:
+//! ```sh
+//! IDLE_SWEEP=1 cargo run --release -p boatramp-storage --features slatedb --example messaging_bench
+//! ```
 
 #[cfg(not(feature = "slatedb"))]
 fn main() {
@@ -152,4 +162,62 @@ async fn main() {
     println!(
         "\ncompare on the SAME box:  nats bench js pub bench --msgs {n} --size {size} [--pub 1|--pub {conc}]"
     );
+
+    // ── Gate 8: the idle-scaling sweep (the headline). Cost of one drainer "look for work" cycle vs
+    //    the number of IDLE topics. Event-driven delivery makes this ~flat (an idle topic is absent
+    //    from the ready-set); the old poll was O(#topics). Opt-in (it creates up to 10k topics).
+    if std::env::var("IDLE_SWEEP").ok().as_deref() == Some("1") {
+        println!("\nevent-driven delivery — idle-scaling sweep (gate 8): drainer look-for-work cost vs idle topics");
+        let (mq, base) = fresh("idle", flush_ms, 0).await;
+        let mut created = 0usize;
+        for &target in &[10usize, 1_000, 10_000] {
+            // Grow the idle-topic set to `target`, each fully drained (publish → claim → ack), so it
+            // leaves NO ready marker and NO pending work — a genuinely idle topic.
+            while created < target {
+                let topic = format!("idle-{created}");
+                mq.publish(&topic, b"x").await.unwrap();
+                let claimed = mq
+                    .claim(&topic, Duration::from_secs(30), 16, 5)
+                    .await
+                    .unwrap();
+                for m in &claimed {
+                    mq.ack(m).await.unwrap();
+                }
+                created += 1;
+            }
+            // Sanity: no idle topic left a ready marker (all drained).
+            let ready = mq.ready_topics().await.unwrap();
+            // Measure the drainer's per-WAKE hot path — `ready_topics()` (the durable ready-set
+            // scan) — separately from the periodic `due_topics()` rebuild (safety-net cadence only,
+            // NOT every wake). The per-wake cost is the one that must stay flat in idle-topic count.
+            const ITERS: u32 = 20;
+            let t = Instant::now();
+            for _ in 0..ITERS {
+                let _ = mq.ready_topics().await.unwrap();
+            }
+            let per_ready = t.elapsed() / ITERS;
+            let t = Instant::now();
+            for _ in 0..ITERS {
+                let _ = mq.due_topics().await.unwrap();
+            }
+            let per_due = t.elapsed() / ITERS;
+            println!(
+                "  {target:>6} idle topics | ready_topics {:>8.1} µs (per wake) | due_topics {:>8.1} µs (per safety-net) | ready-set size {}",
+                per_ready.as_secs_f64() * 1e6,
+                per_due.as_secs_f64() * 1e6,
+                ready.len(),
+            );
+        }
+        let _ = std::fs::remove_dir_all(&base);
+        println!(
+            "  ready_topics() is the PER-WAKE hot path (scans only the ready-set: absent markers ⇒ ~0);\n  \
+             due_topics() runs only on the safety-net cadence (bounded by LEASED messages, not topics).\n  \
+             Note: this sweep BURST-creates then drains every idle topic immediately before measuring, so\n  \
+             the scan also walks the just-churned marker TOMBSTONES (an LSM artifact that compacts away);\n  \
+             a genuinely-idle fleet (markers long compacted) pays only for its LIVE markers — the design's\n  \
+             invariant is 'an idle topic is ABSENT from the ready-set', which the ready-set-size 0 confirms."
+        );
+    } else {
+        println!("\n(run with IDLE_SWEEP=1 for the event-driven delivery idle-scaling sweep — gate 8)");
+    }
 }

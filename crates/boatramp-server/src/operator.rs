@@ -44,6 +44,31 @@ struct ConsumerStat {
     /// For a fan-out (grouped) consumer: retained messages this group has not yet leased ("who's
     /// lagging"). `0` for the default work-queue (there `backlog` is the lag). (Additive.)
     lag: usize,
+    /// Which node currently DRAINS this topic (event-driven delivery, B15) — so `stats` answers
+    /// "which node owns delivery for this topic". Single-node: this one node (or omitted). In a
+    /// sharded cluster (Phase D) it is the topic's shard owner; a `null`/absent owner + rising
+    /// backlog is the shard-gap diagnostic (B16). (Additive.)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    owning_node: Option<String>,
+}
+
+/// The delivery-plane block on the operator response (B14/B16): ready-set size, due-heap depth,
+/// last-rebuild age, and this node's delivery identity — so "why is a topic backed up" is answerable
+/// from `stats` with no server logs. Absent when the backend has no ready-set (a poll-only backend).
+#[cfg(feature = "handlers")]
+#[derive(Serialize)]
+struct DeliveryStatsWire {
+    /// Topics currently flagged with claimable work (the drainer's work list). `0` = idle.
+    ready_set_size: usize,
+    /// Leased messages this node tracks for lease-expiry redelivery (the due-heap depth).
+    due_heap_depth: usize,
+    /// Ms since this node last completed a ready-set rebuild; `null` = not yet since start. A stale
+    /// age + rising backlog is the "reconcile wedged" signal.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_rebuild_age_ms: Option<u64>,
+    /// This node's delivery identity (the `owning_node` a consumer maps to on a single node).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    this_node: String,
 }
 
 /// The `/_boatramp/handlers` operator response: per-`(trigger, route)`
@@ -54,6 +79,9 @@ struct OperatorStats {
     handlers: Vec<metrics::HandlerStat>,
     consumers: Vec<ConsumerStat>,
     stream_connections: usize,
+    /// The delivery-plane health block (B14) — `None` on a backend without a ready-set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    delivery: Option<DeliveryStatsWire>,
 }
 
 /// Authenticated per-site operator stats (`site:<site>` scope via the API auth
@@ -72,8 +100,25 @@ pub(super) async fn operator_handler_stats(
     };
     let handler_stats = inner.metrics.snapshot_site(&site);
     let mut consumers = Vec::new();
+    // The delivery-plane block (B14/B16): this node's ready-set/due-heap/rebuild-age view + its
+    // delivery identity. `None` when the backend has no ready-set (a poll-only backend reports no
+    // block rather than a fabricated zero — the `Unsupported` default). The `owning_node` stamped on
+    // each consumer below is this same `this_node` (single node / Phase A: this node drains all).
+    let mut delivery = None;
+    let mut owning_node = None;
     if let Some(messaging) = &inner.messaging {
-        match collect_consumer_stats(&deploy, messaging.as_ref(), &site).await {
+        if let Ok(stats) = messaging.delivery_stats("").await {
+            owning_node = (!stats.this_node.is_empty()).then(|| stats.this_node.clone());
+            delivery = Some(DeliveryStatsWire {
+                ready_set_size: stats.ready_set_size,
+                due_heap_depth: stats.due_heap_depth,
+                last_rebuild_age_ms: stats.last_rebuild_age_ms,
+                this_node: stats.this_node,
+            });
+        }
+        match collect_consumer_stats(&deploy, messaging.as_ref(), &site, owning_node.as_deref())
+            .await
+        {
             Ok(stats) => consumers = stats,
             Err(err) => return deploy_error_response(err),
         }
@@ -82,6 +127,7 @@ pub(super) async fn operator_handler_stats(
         handlers: handler_stats,
         consumers,
         stream_connections: inner.stream_connections_for_site(&site),
+        delivery,
     })
     .into_response()
 }
@@ -515,6 +561,11 @@ struct GroupEntry {
     hwm: String,
     in_flight: usize,
     lag: usize,
+    /// Which node currently drains this topic's group (event-driven delivery, B15) — so
+    /// `queue groups` answers "which node owns delivery". Single-node / Phase A = this node; omitted
+    /// on a backend without a delivery identity. (Additive.)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    owning_node: Option<String>,
 }
 
 #[cfg(feature = "handlers")]
@@ -545,6 +596,12 @@ async fn queue_groups_core(
     messaging: &dyn boatramp_core::messaging::Messaging,
     namespaced: &str,
 ) -> Response {
+    // The node draining this topic (B15): single-node / Phase A = this node's delivery identity.
+    let owning_node = messaging
+        .delivery_stats("")
+        .await
+        .ok()
+        .and_then(|s| (!s.this_node.is_empty()).then_some(s.this_node));
     match messaging.list_groups(namespaced).await {
         Ok(groups) => Json(QueueGroupsResponse {
             version: DLQ_VIEW_VERSION,
@@ -555,6 +612,7 @@ async fn queue_groups_core(
                     hwm: g.hwm,
                     in_flight: g.in_flight,
                     lag: g.lag,
+                    owning_node: owning_node.clone(),
                 })
                 .collect(),
         })
@@ -1102,6 +1160,9 @@ async fn collect_consumer_stats(
     deploy: &DeployStore,
     messaging: &dyn boatramp_core::messaging::Messaging,
     site: &str,
+    // The node currently draining these topics (B15): single-node / Phase A = this node, so every
+    // consumer maps to it; `None` on a backend without a delivery identity (omitted from the view).
+    owning_node: Option<&str>,
 ) -> Result<Vec<ConsumerStat>, DeployError> {
     let mut out = Vec::new();
     let Some(site_config) = deploy.get_site_config(ProjectRef::DEFAULT, site).await? else {
@@ -1143,6 +1204,7 @@ async fn collect_consumer_stats(
                         .await
                         .unwrap_or(0)
                 },
+                owning_node: owning_node.map(str::to_owned),
             });
         }
     }
@@ -1351,8 +1413,9 @@ pub(super) async fn prometheus_metrics(
             // than failing the whole scrape.
             if let Ok(sites) = deploy.list_sites(ProjectRef::DEFAULT).await {
                 for site in sites {
+                    // The Prometheus consumer gauges need only backlog/dlq, not the owning node.
                     if let Ok(stats) =
-                        collect_consumer_stats(&deploy, messaging.as_ref(), &site).await
+                        collect_consumer_stats(&deploy, messaging.as_ref(), &site, None).await
                     {
                         for s in stats {
                             rows.push(metrics::ConsumerGauge {
