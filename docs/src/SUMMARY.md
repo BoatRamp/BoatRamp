@@ -39,6 +39,7 @@
 - [Compose components into one handler](./how-to/compose.md)
 - [Use kv / sql / blobstore / messaging](./how-to/handler-bindings.md)
 - [Isolate tenants within a project](./how-to/tenant-isolation.md)
+- [Run owner-gated schema migrations](./how-to/in-app-migrations.md)
 - [Serve a GraphQL API](./how-to/graphql.md)
 - [Mint a delegated capability](./how-to/delegated-capabilities.md)
 - [Run consumers, crons, and streams](./how-to/background-work.md)
