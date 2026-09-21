@@ -207,28 +207,59 @@ async fn run_delivery_drainer(inner: Arc<HandlerRuntimeInner>, deploy: DeploySto
     rebuild_due_heap(messaging.as_ref(), &mut due_heap).await;
     let mut last_rebuild = tokio::time::Instant::now();
     let mut last_heap_rebuild = tokio::time::Instant::now();
+    // Phase D: when this node last did an UNSHARDED safety-net drain (B7 no-owner backstop). Start in
+    // the past so the FIRST drain after spawn is unsharded — a node joining/restarting immediately
+    // picks up any orphaned topic rather than waiting a full interval.
+    let mut last_unsharded =
+        tokio::time::Instant::now() - cfg.safetynet_interval.min(Duration::from_secs(60));
 
     loop {
         // (1) Drain everything ready right now: the durable ready-set ∪ the topics whose lease-expiry
         // deadline has passed (popped from the due-heap). Both map to the same dispatch.
         let now_ms = boatramp_core::time::now_unix_ms();
-        let mut topics: std::collections::HashSet<String> = match messaging.ready_topics().await {
-            Ok(t) => t.into_iter().collect(),
+        let ready = match messaging.ready_topics().await {
+            Ok(t) => t,
             Err(err) => {
                 // A backend that lost ready-set support at runtime (shouldn't happen) — fall back to
                 // a full rebuild next cycle rather than silently delivering nothing.
                 tracing::warn!(%err, "ready_topics failed; will rely on rebuild");
-                std::collections::HashSet::new()
+                Vec::new()
             }
         };
+        // Phase D topic sharding (B8/B9): the per-wake fast path drives only the topics THIS node
+        // OWNS under the applied-membership HRW assignment — so each node scans its ~1/N share and the
+        // leader is no longer the single funnel. Single-node / LogMessaging owns everything
+        // (`shard_owns` defaults true), so the filter is a no-op there.
+        //
+        // BUT the periodic safety-net pass is UNSHARDED (B7): every `safetynet_interval` this node
+        // drains the WHOLE ready-set regardless of ownership. This closes the sharding **no-owner
+        // window** — when a node dies, its owned topics have no surviving owner until the membership
+        // change applies; the unsharded pass means SOME node still drains them within one safety-net
+        // interval. Redundant claims across the old+new owner during a rebalance are SAFE (the
+        // leader-serialized atomic claim delivers each message exactly once, C4/B9), so the worst case
+        // is a cheap redundant empty claim — never a double-delivery, never a stranding.
+        let unsharded_pass = last_unsharded.elapsed() >= cfg.safetynet_interval;
+        let mut topics: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for topic in ready {
+            if unsharded_pass || messaging.shard_owns(&topic).await {
+                topics.insert(topic);
+            }
+        }
         // Pop every due topic (deadline <= now) off the heap and add it — a leased message whose
-        // lease expired is now claimable again (redelivery), even if its ready marker was pruned.
+        // lease expired is now claimable again (redelivery), even if its ready marker was pruned. On
+        // the sharded per-wake pass, only if this node owns it (the new owner drains it after a
+        // rebalance); on the unsharded safety-net pass, unconditionally (the no-owner backstop).
         while let Some(std::cmp::Reverse((deadline, topic))) = due_heap.peek().cloned() {
             if deadline > now_ms {
                 break; // the heap is min-ordered — nothing else is due yet
             }
             due_heap.pop();
-            topics.insert(topic);
+            if unsharded_pass || messaging.shard_owns(&topic).await {
+                topics.insert(topic);
+            }
+        }
+        if unsharded_pass {
+            last_unsharded = tokio::time::Instant::now();
         }
 
         if !topics.is_empty() {

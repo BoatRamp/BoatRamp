@@ -89,6 +89,27 @@ impl StreamBus for InProcessStreamBus {
 /// (one Raft entry vs one `write_batch`).
 const GROUP_COMMIT_MAX: usize = 512;
 
+/// The rendezvous-hashing (HRW) score of a `(topic, node)` pair (Phase D topic sharding): a **stable,
+/// portable** hash (FNV-1a over the topic bytes mixed with the node id) — NOT [`std::hash`], whose
+/// output is not guaranteed identical across builds/architectures, because every node in the cluster
+/// MUST compute the identical scores to agree on the owner. The topic with the maximal score for a
+/// node is owned by that node ([`RaftMessaging::hrw_owner`]).
+fn hrw_score(topic: &str, node: NodeId) -> u64 {
+    // FNV-1a 64-bit over the node id bytes then the topic bytes — deterministic and well-distributed.
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = OFFSET;
+    for b in node.to_le_bytes() {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(PRIME);
+    }
+    for b in topic.as_bytes() {
+        hash ^= u64::from(*b);
+        hash = hash.wrapping_mul(PRIME);
+    }
+    hash
+}
+
 /// The cluster [`Messaging`]: a durable log whose **index** is the Raft state
 /// machine and whose **payloads** live in a shared [`Storage`]. The single-writer
 /// coordinator is the Raft leader (claim/ack/nack/publish are proposals).
@@ -355,6 +376,24 @@ impl RaftMessaging {
             self.node_id,
             self.seq.fetch_add(1, Ordering::Relaxed)
         )
+    }
+
+    /// Phase D — the topic's **shard owner** under rendezvous (HRW) hashing over the applied voter
+    /// set: the node whose `hrw_score(topic, node)` is maximal (ties broken by the larger node id, a
+    /// total order so every node computes the identical winner). `None` when the voter set is empty
+    /// (unsharded — the caller treats this node as owning everything). Rendezvous hashing gives
+    /// MINIMAL reassignment on a join/leave (only ~`1/N` of topics move), so a membership change
+    /// reshuffles as little of the topic space as possible. Pure + deterministic (no clock, no live
+    /// metrics) so it is safe to recompute per drain cycle and agrees fleet-wide (B8).
+    fn hrw_owner(topic: &str, voters: &[NodeId]) -> Option<NodeId> {
+        voters
+            .iter()
+            .copied()
+            .max_by(|&a, &b| {
+                hrw_score(topic, a)
+                    .cmp(&hrw_score(topic, b))
+                    .then(a.cmp(&b))
+            })
     }
 
     /// Build one message's replicated `MqPublish` op, performing any object-store payload write FIRST
@@ -1727,6 +1766,21 @@ impl Messaging for RaftMessaging {
     fn wake_handle(&self) -> Option<messaging::Wake> {
         Some(self.wake.clone())
     }
+
+    async fn shard_owns(&self, topic: &str) -> bool {
+        // Phase D: this node owns `topic`'s delivery iff it is the HRW winner over the APPLIED voter
+        // set (B8 — replicated membership, NOT raft.metrics()). An empty voter set (not yet
+        // initialized / a degenerate single node) ⇒ own everything (unsharded), so delivery never
+        // stalls before membership is known. Recomputed per call (the drain cycle reads it per ready
+        // topic); pure + deterministic, so every node agrees. NEVER a correctness gate — a transient
+        // wrong answer during a membership change costs at most a redundant/absent empty claim, and
+        // the atomic leader claim + the unsharded rebuild (B7) keep at-least-once intact.
+        let voters = self.state.applied_voters().await;
+        match Self::hrw_owner(topic, &voters) {
+            Some(owner) => owner == self.node_id,
+            None => true, // no applied membership yet ⇒ unsharded (own all)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2064,6 +2118,179 @@ mod tests {
         // And it is claimable.
         assert_eq!(mqs[&3].claim("t", LEASE, 10, 5).await.unwrap().len(), 1);
         shutdown(rafts).await;
+    }
+
+    /// Phase D — HRW ownership is deterministic, total (a unique owner per topic), and reshuffles
+    /// MINIMALLY on a membership change (only topics that hashed to the departing node move). Pure
+    /// function test (no cluster needed) — the property every node relies on to agree (B8).
+    #[test]
+    fn hrw_ownership_is_deterministic_total_and_minimal_churn() {
+        let three = [1u64, 2, 3];
+        // Deterministic + total: every topic has exactly one owner, stable across calls.
+        for i in 0..200 {
+            let t = format!("topic-{i}");
+            let o1 = RaftMessaging::hrw_owner(&t, &three).unwrap();
+            let o2 = RaftMessaging::hrw_owner(&t, &three).unwrap();
+            assert_eq!(o1, o2, "owner is stable");
+            assert!(three.contains(&o1), "owner is a member");
+        }
+        // Roughly balanced across the 3 nodes (not a hard bound — just not degenerate).
+        let mut counts = std::collections::HashMap::new();
+        for i in 0..3000 {
+            let o = RaftMessaging::hrw_owner(&format!("t{i}"), &three).unwrap();
+            *counts.entry(o).or_insert(0u32) += 1;
+        }
+        for id in three {
+            assert!(counts[&id] > 500, "node {id} owns a fair share ({:?})", counts);
+        }
+        // Minimal churn on node-loss: removing node 3, a topic MOVES only if node 3 owned it. Every
+        // topic owned by 1 or 2 keeps its owner (rendezvous hashing's defining property).
+        let two = [1u64, 2];
+        let mut moved = 0;
+        for i in 0..3000 {
+            let t = format!("t{i}");
+            let before = RaftMessaging::hrw_owner(&t, &three).unwrap();
+            let after = RaftMessaging::hrw_owner(&t, &two).unwrap();
+            if before != after {
+                moved += 1;
+                assert_eq!(before, 3, "only topics owned by the departed node 3 move");
+            }
+        }
+        assert!(moved > 0, "some topics did move (node 3's share)");
+    }
+
+    /// Phase D — an empty voter set (membership not yet applied) ⇒ own everything (unsharded), so a
+    /// node never stalls delivery before it knows the cluster.
+    #[test]
+    fn hrw_empty_voters_owns_nothing_so_caller_owns_all() {
+        assert_eq!(RaftMessaging::hrw_owner("t", &[]), None);
+    }
+
+    /// Phase D — over a real 3-node cluster, `shard_owns` partitions the topic space: every topic is
+    /// owned by EXACTLY ONE node (no gap, no overlap in steady state), and every node's applied voter
+    /// view agrees. This is the assignment the drainers use to each drive their ~1/N share (B8/B9).
+    #[serial_test::serial]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cluster_shard_owns_partitions_every_topic_to_one_node() {
+        let (rafts, mqs) = cluster_mq(3).await;
+        // Let membership fully apply on every node.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        for i in 0..60 {
+            let topic = format!("orders/{i}");
+            let mut owners = Vec::new();
+            for id in 1..=3u64 {
+                if mqs[&id].shard_owns(&topic).await {
+                    owners.push(id);
+                }
+            }
+            assert_eq!(
+                owners.len(),
+                1,
+                "topic {topic} must be owned by exactly one node, got {owners:?}"
+            );
+        }
+        shutdown(rafts).await;
+    }
+
+    /// **Gate 6 — sharding node-loss.** Topics distributed across a 3-node cluster (each node drains
+    /// its HRW-owned share), a node is KILLED and removed from membership, and its orphaned topics
+    /// keep delivering — with NO double-delivery AND NO stranding across the transition, INCLUDING the
+    /// no-owner window. Models the server drainer: each node claims its owned topics (sharded), then
+    /// an UNSHARDED backstop pass (B7) drains any topic no surviving node yet owns. The atomic
+    /// leader-claim guarantees exactly-once regardless of how many drainers look (C4/B9).
+    #[serial_test::serial]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn gate6_sharding_node_loss_no_double_delivery_no_stranding() {
+        let (mut rafts, mqs) = cluster_mq(3).await;
+        tokio::time::sleep(Duration::from_millis(300)).await; // let membership apply everywhere
+
+        // Publish one message to each of many topics (spread across all three shard owners).
+        const TOPICS: usize = 60;
+        for i in 0..TOPICS {
+            let topic = format!("orders/{i}");
+            mqs[&1].publish(&topic, format!("m-{i}").as_bytes()).await.unwrap();
+        }
+
+        // Collect every delivered id exactly-once across the whole test. A drain step: each surviving
+        // node claims (a) its OWNED topics (the sharded fast path) and, when `unsharded`, (b) EVERY
+        // topic (the B7 no-owner backstop). Ack each so it is delivered once. Redundant claims are
+        // safe (leader-serialized), so an id can be claimed by at most one node per message.
+        let delivered: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
+        async fn drain_once(
+            mqs: &BTreeMap<NodeId, Arc<RaftMessaging>>,
+            alive: &[NodeId],
+            unsharded: bool,
+            delivered: &Arc<StdMutex<Vec<String>>>,
+        ) {
+            for &id in alive {
+                let mq = &mqs[&id];
+                for i in 0..TOPICS {
+                    let topic = format!("orders/{i}");
+                    if !unsharded && !mq.shard_owns(&topic).await {
+                        continue; // sharded pass: only my share
+                    }
+                    let batch = mq
+                        .claim(&topic, Duration::from_secs(60), 8, 5)
+                        .await
+                        .unwrap();
+                    for m in batch {
+                        delivered.lock().unwrap().push(m.id.clone());
+                        mq.ack(&m).await.unwrap();
+                    }
+                }
+            }
+        }
+
+        // (1) Steady-state sharded drain across all three nodes — each drains its ~1/3 share.
+        drain_once(&mqs, &[1, 2, 3], false, &delivered).await;
+
+        // (2) Publish a SECOND wave, then KILL node whose share is non-empty (node 3) mid-flight —
+        // BEFORE its share is drained — so its owned topics are orphaned (the node-loss transition).
+        for i in 0..TOPICS {
+            let topic = format!("orders/{i}");
+            mqs[&1].publish(&topic, format!("w2-{i}").as_bytes()).await.unwrap();
+        }
+        // Kill node 3 and remove it from membership so HRW reassigns its share to {1,2}.
+        rafts.remove(&3).unwrap().shutdown().await.unwrap();
+        let new_leader = rafts[&1].metrics().borrow().current_leader.unwrap_or(1);
+        // Best-effort membership shrink to {1,2} (so `shard_owns` reassigns node 3's topics). If the
+        // leader was 3 the survivors re-elect first; give it a moment.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let leader_id = rafts
+            .values()
+            .find_map(|r| {
+                let m = r.metrics();
+                let b = m.borrow();
+                (b.current_leader == Some(b.id)).then_some(b.id)
+            })
+            .unwrap_or(new_leader);
+        let _ = rafts[&leader_id]
+            .change_membership(std::collections::BTreeSet::from([1u64, 2u64]), false)
+            .await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // (3) The survivors drain: first the UNSHARDED backstop (covers node 3's orphaned share
+        // during/after the transition — the no-owner window), then a sharded pass for good measure.
+        drain_once(&mqs, &[1, 2], true, &delivered).await;
+        drain_once(&mqs, &[1, 2], false, &delivered).await;
+
+        // Invariant: every id delivered EXACTLY once (no double-delivery), and BOTH waves' messages
+        // were delivered (no stranding) — 2 waves × TOPICS messages, minus none.
+        let ids = std::mem::take(&mut *delivered.lock().unwrap());
+        let unique: HashSet<&str> = ids.iter().map(String::as_str).collect();
+        assert_eq!(
+            unique.len(),
+            ids.len(),
+            "gate 6: a message was double-delivered across the node-loss transition"
+        );
+        assert_eq!(
+            ids.len(),
+            TOPICS * 2,
+            "gate 6: every message from both waves delivered (no stranding across the no-owner window)"
+        );
+        for raft in rafts.into_values() {
+            let _ = raft.shutdown().await;
+        }
     }
 
     /// A nack re-arms the topic's ready marker in the replicated apply (B1), so a redelivery is

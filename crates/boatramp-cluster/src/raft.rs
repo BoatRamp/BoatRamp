@@ -1125,6 +1125,16 @@ pub trait AppliedState: Send + Sync {
     async fn get(&self, key: &str) -> Option<Vec<u8>>;
     /// Keys with `prefix` in local applied state.
     async fn list_prefix(&self, prefix: &str) -> Vec<String>;
+    /// The **applied, replicated** voter set — the node ids in the last APPLIED membership
+    /// (`StoredMembership::voter_ids`), NOT the live `raft.metrics()` voter view (B8, Phase D
+    /// topic sharding). Derived from applied state so every node converges to the identical set (any
+    /// divergence bounded by apply lag), which is what makes a deterministic consistent-hash topic→
+    /// node assignment agree fleet-wide with no coordinator chatter. Sorted ascending. The default is
+    /// empty — a backend/mode with no membership concept (single-node) owns everything, so an empty
+    /// set means "unsharded" (the caller treats it as "this node owns all topics").
+    async fn applied_voters(&self) -> Vec<NodeId> {
+        Vec::new()
+    }
 }
 
 /// Notified after each committed batch is applied by the durable state machine,
@@ -1170,6 +1180,18 @@ impl AppliedState for StateMachineStore {
     }
     async fn list_prefix(&self, prefix: &str) -> Vec<String> {
         Self::list_prefix(self, prefix).await
+    }
+    async fn applied_voters(&self) -> Vec<NodeId> {
+        // The last APPLIED membership's voter ids (B8) — replicated state, so identical across nodes.
+        let mut ids: Vec<NodeId> = self
+            .inner
+            .lock()
+            .await
+            .last_membership
+            .voter_ids()
+            .collect();
+        ids.sort_unstable();
+        ids
     }
 }
 
