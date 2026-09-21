@@ -1146,6 +1146,189 @@ pub(super) async fn sql_ping(
 }
 
 // ---------------------------------------------------------------------------
+// Owner-gated schema migrations (`/api/migrate/{db}/{apply,dry-run,status}`)
+// ---------------------------------------------------------------------------
+
+/// One migration step on the wire. Exactly one of `sql` / `extension` must be set: `sql` is a
+/// DDL/DML script (rejected if it contains `CREATE EXTENSION`); `extension` enables an
+/// allowlisted extension by name. `no_transaction` (sql only) applies it outside a wrapping
+/// transaction (for `CREATE INDEX CONCURRENTLY`-class DDL).
+#[derive(Deserialize)]
+pub(super) struct MigrateStepInput {
+    pub id: String,
+    #[serde(default)]
+    pub sql: Option<String>,
+    #[serde(default)]
+    pub no_transaction: bool,
+    #[serde(default)]
+    pub extension: Option<String>,
+}
+
+/// The body of `POST /api/migrate/{db}/{apply,dry-run}` — the ordered migration set.
+#[derive(Deserialize)]
+pub(super) struct MigrateApplyRequest {
+    pub steps: Vec<MigrateStepInput>,
+}
+
+/// Convert a wire step to the core [`MigrationStep`](boatramp_core::sql::MigrationStep), or a
+/// per-step error string (malformed step — neither or both of sql/extension).
+fn to_migration_step(
+    s: MigrateStepInput,
+) -> Result<boatramp_core::sql::MigrationStep, (String, String)> {
+    use boatramp_core::sql::{MigrationAction, MigrationStep};
+    let action = match (s.sql, s.extension) {
+        (Some(script), None) => MigrationAction::Sql {
+            script,
+            no_transaction: s.no_transaction,
+        },
+        (None, Some(name)) => MigrationAction::Extension { name },
+        (None, None) => return Err((s.id, "step has neither `sql` nor `extension`".to_string())),
+        (Some(_), Some(_)) => {
+            return Err((
+                s.id,
+                "step has both `sql` and `extension` (set exactly one)".to_string(),
+            ))
+        }
+    };
+    Ok(MigrationStep { id: s.id, action })
+}
+
+/// Map a [`MigrationError`](boatramp_core::sql::MigrationError) to an HTTP response — reserving
+/// non-2xx status codes for "couldn't attempt correctly" (a step that RAN but failed comes back
+/// as a `200`/`422` report body instead, via [`migration_report_response`]).
+fn migration_error_response(e: boatramp_core::sql::MigrationError) -> Response {
+    use boatramp_core::sql::MigrationError as E;
+    match e {
+        E::NotConfigured => (
+            StatusCode::NOT_IMPLEMENTED,
+            "schema migrations are not available on this node (no managed database configured)\n"
+                .to_string(),
+        )
+            .into_response(),
+        // A managed DB still starting — retryable, mirrors the v0.4.19 readiness gate.
+        E::Unavailable(m) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(axum::http::header::RETRY_AFTER, "1")],
+            format!("managed database not ready: {m}\n"),
+        )
+            .into_response(),
+        // The requested set is inconsistent with the recorded ledger — a conflict.
+        E::PrefixDivergence(m) => (
+            StatusCode::CONFLICT,
+            format!("migration set diverged from the ledger: {m}\n"),
+        )
+            .into_response(),
+        E::ContentChanged(id) => (
+            StatusCode::CONFLICT,
+            format!("migration {id:?} was modified after it was applied\n"),
+        )
+            .into_response(),
+        E::RawCreateExtension => (
+            StatusCode::BAD_REQUEST,
+            "a sql migration step may not CREATE EXTENSION — use an extension step\n".to_string(),
+        )
+            .into_response(),
+        E::ExtensionNotAllowed(name) => (
+            StatusCode::BAD_REQUEST,
+            format!("extension {name:?} is not on the operator trusted-extension allowlist\n"),
+        )
+            .into_response(),
+        E::Sql(inner) => (
+            StatusCode::BAD_REQUEST,
+            format!("migration failed: {inner}\n"),
+        )
+            .into_response(),
+        E::Other(m) => (StatusCode::BAD_REQUEST, format!("migration error: {m}\n")).into_response(),
+    }
+}
+
+/// Turn a [`MigrationReport`](boatramp_core::sql::MigrationReport) into a response: `200` when no
+/// step failed, `422` when one did (the body carries the structured report either way, so a thin
+/// client can always parse `failed{id,error}` AND branch on the status).
+fn migration_report_response(report: boatramp_core::sql::MigrationReport) -> Response {
+    let status = if report.failed.is_some() {
+        StatusCode::UNPROCESSABLE_ENTITY
+    } else {
+        StatusCode::OK
+    };
+    (status, Json(report)).into_response()
+}
+
+/// Shared body of `apply` / `dry-run`.
+async fn migrate_run(
+    runner: Option<Arc<dyn boatramp_core::sql::MigrationRunner>>,
+    project: &str,
+    db: &str,
+    req: MigrateApplyRequest,
+    dry_run: bool,
+) -> Response {
+    let Some(runner) = runner else {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            "schema migrations are not available on this node (no managed database configured)\n",
+        )
+            .into_response();
+    };
+    let mut steps = Vec::with_capacity(req.steps.len());
+    for s in req.steps {
+        match to_migration_step(s) {
+            Ok(step) => steps.push(step),
+            Err((id, error)) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("invalid migration step {id:?}: {error}\n"),
+                )
+                    .into_response()
+            }
+        }
+    }
+    match runner.apply(project, db, &steps, dry_run).await {
+        Ok(report) => migration_report_response(report),
+        Err(e) => migration_error_response(e),
+    }
+}
+
+/// Apply the pending suffix of an ordered migration set to managed database `db`, as the
+/// project's non-superuser OWNER role, tracked in the host-owned ledger. `Project·Admin`.
+pub(super) async fn migrate_apply(
+    Extension(project): Extension<ProjectContext>,
+    Extension(runner): Extension<Option<Arc<dyn boatramp_core::sql::MigrationRunner>>>,
+    Path(db): Path<String>,
+    Json(req): Json<MigrateApplyRequest>,
+) -> Response {
+    migrate_run(runner, project.as_ref().as_str(), &db, req, false).await
+}
+
+/// Compute the migration plan (which ids WOULD apply) without applying anything. `Project·Admin`.
+pub(super) async fn migrate_dry_run(
+    Extension(project): Extension<ProjectContext>,
+    Extension(runner): Extension<Option<Arc<dyn boatramp_core::sql::MigrationRunner>>>,
+    Path(db): Path<String>,
+    Json(req): Json<MigrateApplyRequest>,
+) -> Response {
+    migrate_run(runner, project.as_ref().as_str(), &db, req, true).await
+}
+
+/// Read the applied-migration ledger for managed database `db`. `Project·Read`.
+pub(super) async fn migrate_status(
+    Extension(project): Extension<ProjectContext>,
+    Extension(runner): Extension<Option<Arc<dyn boatramp_core::sql::MigrationRunner>>>,
+    Path(db): Path<String>,
+) -> Response {
+    let Some(runner) = runner else {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            "schema migrations are not available on this node (no managed database configured)\n",
+        )
+            .into_response();
+    };
+    match runner.status(project.as_ref().as_str(), &db).await {
+        Ok(status) => (StatusCode::OK, Json(status)).into_response(),
+        Err(e) => migration_error_response(e),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Run a command inside a running workload (`POST /api/compute/{name}/exec`)
 // ---------------------------------------------------------------------------
 

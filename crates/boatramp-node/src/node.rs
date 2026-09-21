@@ -480,22 +480,48 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
         crate::managed_sql::auto_register_managed_db_workloads(&deploy, &sql.databases).await;
     }
 
-    // Operator SQL capability (managed-DB migrations/queries via the sealed
-    // credential, resolved server-side) — backs `POST /api/sql/{db}/{exec,query}`.
+    // Operator SQL capability (managed-DB migrations/queries via the sealed credential, resolved
+    // server-side) — backs `POST /api/sql/{db}/{exec,query}`. The SAME concrete NodeOperatorSql
+    // also backs the owner-gated schema-migration runner (which reuses its owner + superuser
+    // backends), so build it ONCE and share it.
     #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
-    let operator_sql: Option<Arc<dyn boatramp_core::sql::OperatorSql>> = config
+    let (operator_sql, migration_runner): (
+        Option<Arc<dyn boatramp_core::sql::OperatorSql>>,
+        Option<Arc<dyn boatramp_core::sql::MigrationRunner>>,
+    ) = match config
         .handlers
         .as_ref()
         .and_then(|h| h.bindings.sql.as_ref())
         .filter(|sql| !sql.databases.is_empty())
-        .map(|sql| {
-            Arc::new(crate::managed_sql::NodeOperatorSql::new(
+    {
+        Some(sql) => {
+            let node_op = Arc::new(crate::managed_sql::NodeOperatorSql::new(
                 sql.databases.clone(),
                 kv.clone(),
                 operator_envelope,
                 deploy.clone(),
-            )) as Arc<_>
-        });
+            ));
+            // The operator's trusted-extension allowlist — the only extensions a migration may
+            // enable (empty ⇒ none). See ExternalSqlConfig::migrate_trusted_extensions.
+            let trusted: std::collections::BTreeSet<String> = sql
+                .migrate_trusted_extensions
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
+            let runner = Arc::new(crate::managed_sql::NodeMigrationRunner::new(
+                node_op.clone(),
+                trusted,
+            )) as Arc<dyn boatramp_core::sql::MigrationRunner>;
+            (
+                Some(node_op as Arc<dyn boatramp_core::sql::OperatorSql>),
+                Some(runner),
+            )
+        }
+        None => (None, None),
+    };
+    #[cfg(not(any(feature = "sql-postgres", feature = "sql-mysql")))]
+    let migration_runner: Option<Arc<dyn boatramp_core::sql::MigrationRunner>> = None;
     #[cfg(not(any(feature = "sql-postgres", feature = "sql-mysql")))]
     let operator_sql: Option<Arc<dyn boatramp_core::sql::OperatorSql>> = None;
 
@@ -608,6 +634,7 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
     // Wire the operator capabilities onto the options the router is built from.
     let mut options = options;
     options.operator_sql = operator_sql;
+    options.migration_runner = migration_runner;
     options.tenant_deprovisioner = tenant_deprovisioner;
     options.compute_exec = compute_exec;
     options.compute_volumes = compute_volumes;

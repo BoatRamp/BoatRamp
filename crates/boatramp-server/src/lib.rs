@@ -45,9 +45,10 @@ pub(crate) use admin_api::{
     create_deployment, current_deployment, delete_compute, delete_compute_volume,
     delete_project_tenancy, delete_site, get_compute, get_daemon_config, get_deployment,
     get_project_tenancy, get_site_config, invalidate_cache, list_aliases, list_compute,
-    list_compute_volumes, list_deployments, list_sites, prune_delete, prune_report, put_blob,
-    put_compute, put_daemon_config, put_project_tenancy, put_site_config, remove_alias,
-    rollback_daemon_config, scrub_blobs, set_alias, sql_exec, sql_ping, sql_query,
+    list_compute_volumes, list_deployments, list_sites, migrate_apply, migrate_dry_run,
+    migrate_status, prune_delete, prune_report, put_blob, put_compute, put_daemon_config,
+    put_project_tenancy, put_site_config, remove_alias, rollback_daemon_config, scrub_blobs,
+    set_alias, sql_exec, sql_ping, sql_query,
 };
 #[cfg(feature = "handlers")]
 pub(crate) use admin_api::{
@@ -1187,6 +1188,11 @@ pub struct ServerOptions {
     /// sealed credential, resolved server-side). Backs `POST /api/sql/{db}/{exec,query}`;
     /// `None` ⇒ those routes return `501`. Wired by the node when a managed DB exists.
     pub operator_sql: Option<Arc<dyn boatramp_core::sql::OperatorSql>>,
+    /// Owner-gated schema-migration capability for managed databases: applies an ordered
+    /// migration set as the project's non-superuser OWNER role, tracked in a host-owned
+    /// ledger. Backs the `Project·Admin`-gated `/api/migrate/{db}/{apply,dry-run,status}`;
+    /// `None` ⇒ those routes return `501`. Wired by the node when a managed DB exists.
+    pub migration_runner: Option<Arc<dyn boatramp_core::sql::MigrationRunner>>,
     /// Tenant-deprovision capability: drops a deleted tenant's managed databases +
     /// roles + sealed credentials on project/site delete. `None` ⇒ delete does no
     /// managed-DB teardown. Wired by the node when a compute-backed managed database

@@ -48,6 +48,7 @@ pub fn router_with_fast(
     // `Option<Arc>` clones; they ride as `api` extensions read by the admin handlers.
     // (`_cap` suffix so they don't shadow the `sql_exec`/`compute_exec` handler fns.)
     let operator_sql_cap = options.operator_sql.clone();
+    let migration_runner_cap = options.migration_runner.clone();
     let tenant_deprovisioner_cap = options.tenant_deprovisioner.clone();
     let compute_exec_cap = options.compute_exec.clone();
     let compute_volumes_cap = options.compute_volumes.clone();
@@ -311,7 +312,14 @@ pub fn router_with_fast(
         .route("/api/sql/{db}/query", post(sql_query))
         // Active per-replica reachability probe (bypasses the stored-health gate).
         // Same project-owned `sql`-family right (`/api/sql/*` → Project·Deploy).
-        .route("/api/sql/{db}/ping", post(sql_ping));
+        .route("/api/sql/{db}/ping", post(sql_ping))
+        // Owner-gated schema migrations: apply an ordered set / dry-run the plan / read the
+        // ledger, run as the project's non-superuser OWNER role. `/api/migrate/*` is gated at
+        // `Project·Admin` for the mutating verbs (never the deploy-grade publisher), `Project·Read`
+        // for status — see `Right::required`.
+        .route("/api/migrate/{db}/apply", post(migrate_apply))
+        .route("/api/migrate/{db}/dry-run", post(migrate_dry_run))
+        .route("/api/migrate/{db}/status", get(migrate_status));
     // OIDC → token exchange: validate the IdP JWT (presented as
     // the Bearer; `Right::required` returns None so the auth middleware lets it
     // through) and mint a short-TTL token. Only with the `oidc` feature.
@@ -522,6 +530,7 @@ pub fn router_with_fast(
         .layer(Extension(mesh_control))
         .layer(Extension(probe))
         .layer(Extension(operator_sql_cap))
+        .layer(Extension(migration_runner_cap))
         .layer(Extension(tenant_deprovisioner_cap))
         .layer(Extension(compute_exec_cap))
         .layer(Extension(compute_volumes_cap))
