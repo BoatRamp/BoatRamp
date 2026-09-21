@@ -8701,10 +8701,25 @@ async fn messaging_stats_reads_own_tenant_dlq_and_refuses_others() {
         "seeded a real dead-letter on the OWN tenant's bus topic"
     );
     // Also seed one on the FOREIGN tenant's topic, so a leak would be observable if the guard failed.
-    messaging.publish(foreign_bus_topic, b"secret").await.unwrap();
-    let _ = messaging.claim(foreign_bus_topic, Duration::ZERO, 10, 1).await.unwrap();
-    let _ = messaging.claim(foreign_bus_topic, Duration::ZERO, 10, 1).await.unwrap();
-    assert_eq!(messaging.dead_letter_count(foreign_bus_topic).await.unwrap(), 1);
+    messaging
+        .publish(foreign_bus_topic, b"secret")
+        .await
+        .unwrap();
+    let _ = messaging
+        .claim(foreign_bus_topic, Duration::ZERO, 10, 1)
+        .await
+        .unwrap();
+    let _ = messaging
+        .claim(foreign_bus_topic, Duration::ZERO, 10, 1)
+        .await
+        .unwrap();
+    assert_eq!(
+        messaging
+            .dead_letter_count(foreign_bus_topic)
+            .await
+            .unwrap(),
+        1
+    );
 
     // Build the granted binding exactly as the server's `build_bindings` does: the component-private
     // prefix, the shared `{project}/bus/` prefix, the DECLARED template, and the host-resolved tenant.
@@ -8723,25 +8738,37 @@ async fn messaging_stats_reads_own_tenant_dlq_and_refuses_others() {
         .read_topic_stats("bus:sync/{tenant}/import")
         .await
         .expect("own-tenant read allowed");
-    assert_eq!(own.dead_letter_count, 1, "read t-42's seeded DLQ via the host-filled template");
+    assert_eq!(
+        own.dead_letter_count, 1,
+        "read t-42's seeded DLQ via the host-filled template"
+    );
     assert_eq!(own.in_flight, 0);
 
     // (2a) Naming a DIFFERENT tenant's concrete topic (not the declared template) is REFUSED — the
     // guest can never read another tenant's bus stats, even though a dead-letter exists there.
     assert_eq!(
-        stats.read_topic_stats("bus:sync/victim/import").await.unwrap_err(),
+        stats
+            .read_topic_stats("bus:sync/victim/import")
+            .await
+            .unwrap_err(),
         StatsRefused::NotDeclared,
         "a foreign-tenant bus topic is refused (no oracle)"
     );
     // (2b) A bus topic outside any declared template is refused.
     assert_eq!(
-        stats.read_topic_stats("bus:some/other/topic").await.unwrap_err(),
+        stats
+            .read_topic_stats("bus:some/other/topic")
+            .await
+            .unwrap_err(),
         StatsRefused::NotDeclared
     );
 
     // (3) An ungranted component (no messaging-stats binding) is access-denied at the WIT layer.
     let ungranted = Bindings::new("import-worker");
-    assert!(ungranted.messaging_stats().is_none(), "no grant ⇒ no binding ⇒ access-denied");
+    assert!(
+        ungranted.messaging_stats().is_none(),
+        "no grant ⇒ no binding ⇒ access-denied"
+    );
 
     // A component with NO resolved tenant cannot read a `{tenant}` template (fail-closed).
     let anon = Bindings::new("import-worker").with_messaging_stats(

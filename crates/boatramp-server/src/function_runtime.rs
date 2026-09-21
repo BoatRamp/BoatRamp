@@ -143,9 +143,7 @@ fn ctx_stamp(value: &boatramp_core::sql::SqlValue) -> Option<String> {
 /// injector resolved. `None` for an unscoped/anonymous invocation or a non-scalar tenant value — a
 /// `{tenant}` template is then refused (the stats binding fails closed). The guest never supplies it.
 #[cfg(feature = "handlers")]
-pub(super) fn resolved_tenant_string(
-    principal: &[boatramp_handlers::ScopeFact],
-) -> Option<String> {
+pub(super) fn resolved_tenant_string(principal: &[boatramp_handlers::ScopeFact]) -> Option<String> {
     principal
         .iter()
         .find(|f| f.axis == boatramp_core::tenancy::ScopeAxis::Tenant)
