@@ -661,6 +661,40 @@ jobs:
           # unset GUC stay fail-closed. A leak (marker over-opening) fails the assertion.
           grep -q 'RLS ALL-READ MARKER OK \[postgres\]' rls-guc.log \
             || { echo "::error::RLS all-read marker never reached its marker (the marker didn't open an opted-in all-read, or it leaked to a non-opted table / a write)" >&2; exit 1; }
+      - name: Owner-gated schema-migration owner-role confinement on a real Postgres (v0.4.25)
+        env:
+          BOATRAMP_TEST_PG_URL: postgres://boatramp:boatramp@localhost:5432/boatramp
+        run: |
+          set -eo pipefail
+          # v0.4.25: the owner-gated migration surface runs DDL as a per-project NON-superuser owner
+          # role (the owner's constraint), never the cluster superuser. On a real PG, the REAL
+          # provision_ddl three-identity model is stood up and, as the owner role, every cluster-escape
+          # primitive (CREATE DATABASE/ROLE, ALTER ROLE SUPERUSER, COPY TO PROGRAM, CREATE EXTENSION
+          # dblink/postgres_fdw, pg_read_file) is DENIED by privilege while a legit CREATE TABLE + FORCE
+          # RLS succeeds; the runtime role gets default-privileges DML but is a non-owner and cannot
+          # escalate. A confinement breach (any escape succeeding) fails the assertion.
+          cargo test -p boatramp-storage --features sql-postgres \
+            --test migrate_owner_role_sqlx_live -- --nocapture 2>&1 | tee migrate-owner.log
+          grep -qE 'test result: ok\. 1 passed' migrate-owner.log \
+            || { echo "::error::migrate owner-role confinement gate did not run (a silent skip or a failure)" >&2; exit 1; }
+          grep -q 'MIGRATE OWNER-ROLE CONFINEMENT OK \[postgres\]' migrate-owner.log \
+            || { echo "::error::migrate owner-role confinement never reached its marker (a cluster-escape succeeded as the non-superuser owner, or the runtime role gained ownership/escalation)" >&2; exit 1; }
+      - name: Owner-gated schema-migration runner ledger on a real Postgres (v0.4.25)
+        env:
+          BOATRAMP_TEST_PG_URL: postgres://boatramp:boatramp@localhost:5432/boatramp
+        run: |
+          set -eo pipefail
+          # v0.4.25: the migration runner applies an ordered set once each, tracked in a host-owned
+          # ledger — dry-run, idempotent re-apply, content-hash immutability, prefix-divergence fail-
+          # closed, ATOMIC per-step (a failing 2nd statement leaves no table + no ledger row + is
+          # retryable), extension allowlist, and raw-CREATE-EXTENSION rejection — all on a real engine.
+          # A ledger/atomicity/allowlist regression fails the assertion.
+          cargo test -p boatramp-node --features sql-postgres \
+            --test migrate_runner_sqlx_live -- --nocapture 2>&1 | tee migrate-runner.log
+          grep -qE 'test result: ok\. 1 passed' migrate-runner.log \
+            || { echo "::error::migrate runner ledger gate did not run (a silent skip or a failure)" >&2; exit 1; }
+          grep -q 'MIGRATE RUNNER LEDGER OK \[postgres\]' migrate-runner.log \
+            || { echo "::error::migrate runner ledger never reached its marker (a ledger/atomic-rollback/prefix/content-hash/extension-allowlist regression)" >&2; exit 1; }
 
   # The embedded-Raft cluster tests (consensus, leader-loss failover, mesh admit,
   # cron single-firing) live behind the `raft`/`http` features and so ran ONLY in
