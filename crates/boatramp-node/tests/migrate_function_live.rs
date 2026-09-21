@@ -233,7 +233,7 @@ async fn migrate_function_step_end_to_end_on_a_real_engine() {
         &substrate,
         "default",
         DB,
-        &[s1.clone()],
+        std::slice::from_ref(&s1),
         MigrateMode::Apply,
     )
     .await
