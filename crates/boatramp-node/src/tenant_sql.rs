@@ -93,7 +93,7 @@ use boatramp_storage::sql_compute::{
 use boatramp_storage::sql_sqlx::PerTenantSqlResolver;
 use boatramp_storage::tenant_provision::{
     grant_app_role_ddl, provision_ddl, recover_soft_deprovision_ddl, sanitize_ident,
-    soft_deprovision_ddl, tenant_db_name, tenant_role_name,
+    soft_deprovision_ddl, tenant_db_name, tenant_owner_role_name, tenant_role_name,
 };
 use boatramp_storage::ExternalSqlKind;
 
@@ -181,6 +181,11 @@ pub struct TenantNames {
     pub database: String,
     /// The tenant's login role (per `(tenant, server)`); used only for `Shared`.
     pub role: String,
+    /// The tenant's **owner/DDL role** (per `(tenant, server)`, Shared Postgres only) — the
+    /// non-superuser role that owns the schema and runs migrations, distinct from `role` so the
+    /// runtime role stays a non-owner and RLS holds. For the default tenant / Single it equals the
+    /// plain identity (no separate role); migrations there run as the existing per-workload user.
+    pub owner_role: String,
     /// The compute workload backing the connection.
     pub workload: String,
 }
@@ -205,6 +210,9 @@ pub(crate) fn tenant_names(
         return TenantNames {
             database: database.to_string(),
             role: database.to_string(),
+            // Default tenant: no separate owner role — the plain configured user already owns its
+            // one ordinary database, so a migration runs as it (already <= project-owner).
+            owner_role: database.to_string(),
             workload: compute.to_string(),
         };
     }
@@ -222,6 +230,10 @@ pub(crate) fn tenant_names(
         // workload), so a tenant with several bindings on the same shared server
         // shares ONE role, granted on each of its databases. Used only for Shared.
         role: tenant_role_name(compute, &ident),
+        // One owner/DDL role per (tenant, server), same base as `role` (the server), so a tenant
+        // with several bindings on one shared server shares ONE owner role. Shared Postgres only;
+        // inert for Single (the per-workload user is the owner) and MySQL.
+        owner_role: tenant_owner_role_name(compute, &ident),
         workload,
     }
 }
@@ -238,6 +250,15 @@ pub(crate) fn tenant_names(
 /// sanitized tenant identity.
 pub(crate) fn credential_workload_key(compute: &str, tenant_ident: &str) -> String {
     format!("{compute}/{tenant_ident}")
+}
+
+/// The KV workload segment for a tenant's **owner/DDL-role** sealed credential (Shared Postgres
+/// only) — the [`credential_workload_key`] scheme with a trailing `/owner`, so the owner-role
+/// password is sealed under a key distinct from both the runtime-role password
+/// (`<compute>/<ident>`) and the superuser (`<compute>` under the default project). The migration
+/// path resolves this to connect as the owner role; it is never handed to the handler runtime.
+pub(crate) fn owner_credential_workload_key(compute: &str, tenant_ident: &str) -> String {
+    format!("{compute}/{tenant_ident}/owner")
 }
 
 /// The KV **project** segment for a `Single`-mode workload's sealed credential: the
@@ -452,6 +473,16 @@ async fn provision_shared(
         .await
         .map_err(|e| format!("per-tenant credential ({}): {e}", names.role))?;
 
+    // The per-tenant OWNER/DDL-role password, sealed under a distinct key. This is the identity a
+    // schema migration connects as (a non-superuser role that owns this tenant's schema) — minted
+    // here at provision so it is present before the first migration; the migrate path resolves the
+    // same key. Never handed to the handler runtime.
+    let owner_cred_workload = owner_credential_workload_key(compute, tenant_ident);
+    let owner_pw = creds
+        .password(project, &owner_cred_workload)
+        .await
+        .map_err(|e| format!("per-tenant owner credential ({}): {e}", names.owner_role))?;
+
     // Connect to the MAINTENANCE database as the superuser (CREATE DATABASE cannot run
     // inside the database being created). Reuses the same endpoint-resolving backend
     // the handler path uses, so it follows the server across restarts.
@@ -476,7 +507,14 @@ async fn provision_shared(
     // caller (`resolve`) propagates this error and hands back no connection, a
     // partially-created (created-but-not-yet-revoked) database is never served; the
     // next resolve re-runs the idempotent DDL and completes the lockdown. (L2 + M2)
-    for stmt in provision_ddl(kind, &names.database, &names.role, &tenant_pw) {
+    for stmt in provision_ddl(
+        kind,
+        &names.database,
+        &names.role,
+        &tenant_pw,
+        &names.owner_role,
+        &owner_pw,
+    ) {
         if let Err(e) = admin.run_script(&stmt).await {
             let is_create_database = stmt.to_ascii_uppercase().contains("CREATE DATABASE");
             if is_create_database && is_database_exists_error(&e) {
@@ -487,15 +525,16 @@ async fn provision_shared(
     }
 
     // Grant the tenant's non-superuser login role the everyday app privileges on the
-    // objects in its OWN database (Postgres `Shared` only — the schema is loaded by the
-    // superuser, so without this the role can't touch its tables; `grant_app_role_ddl`
-    // is empty for MySQL, whose `db.*` grant already covers it). Runs INSIDE the tenant
-    // database — schema grants + `ALTER DEFAULT PRIVILEGES` are database-local, so this
-    // needs its own connection (the loop above is on the maintenance database). The
-    // superuser reaches the locked-down database because superusers bypass the
-    // `CONNECT` gate. Idempotent, so a re-provision (incl. the lazy per-resolve one that
-    // heals a tenant provisioned by an older version) is safe.
-    let grants = grant_app_role_ddl(kind, &names.role, superuser);
+    // objects in its OWN database (Postgres `Shared` only — schema objects are OWNER-role-owned
+    // now, so without this the runtime role can't touch its tables; `grant_app_role_ddl` is empty
+    // for MySQL, whose `db.*` grant already covers it). The `owner` argument is the per-project
+    // OWNER role — so `ALTER DEFAULT PRIVILEGES FOR ROLE <owner>` fires on the objects a migration
+    // (which runs as that owner role) creates; otherwise the runtime role would get
+    // `permission denied` on every migration-created table. Runs INSIDE the tenant database —
+    // schema grants + `ALTER DEFAULT PRIVILEGES` are database-local — as the superuser (which
+    // bypasses the CONNECT gate and can set default privileges on behalf of any role). Idempotent;
+    // the migrate path re-runs it after each apply so newly-created tables are covered too.
+    let grants = grant_app_role_ddl(kind, &names.role, &names.owner_role);
     if !grants.is_empty() {
         let tenant_resolver =
             Arc::new(DeployEndpointResolver::new(deploy.clone(), DEFAULT_PROJECT));
