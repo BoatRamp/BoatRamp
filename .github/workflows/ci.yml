@@ -679,22 +679,41 @@ jobs:
             || { echo "::error::migrate owner-role confinement gate did not run (a silent skip or a failure)" >&2; exit 1; }
           grep -q 'MIGRATE OWNER-ROLE CONFINEMENT OK \[postgres\]' migrate-owner.log \
             || { echo "::error::migrate owner-role confinement never reached its marker (a cluster-escape succeeded as the non-superuser owner, or the runtime role gained ownership/escalation)" >&2; exit 1; }
-      - name: Owner-gated schema-migration runner ledger on a real Postgres (v0.4.25)
+      - name: Owner-gated schema-migration SUBSTRATE ledger on a real Postgres (v0.4.25)
         env:
           BOATRAMP_TEST_PG_URL: postgres://boatramp:boatramp@localhost:5432/boatramp
         run: |
           set -eo pipefail
-          # v0.4.25: the migration runner applies an ordered set once each, tracked in a host-owned
-          # ledger — dry-run, idempotent re-apply, content-hash immutability, prefix-divergence fail-
-          # closed, ATOMIC per-step (a failing 2nd statement leaves no table + no ledger row + is
-          # retryable), extension allowlist, and raw-CREATE-EXTENSION rejection — all on a real engine.
-          # A ledger/atomicity/allowlist regression fails the assertion.
-          cargo test -p boatramp-node --features sql-postgres \
+          # v0.4.25: the migration SUBSTRATE (the node seam the server orchestrator drives) applies a
+          # sql/extension step + records its ledger row atomically, ATOMIC per-step (a failing 2nd
+          # statement leaves no table + no ledger row), the extension allowlist + raw-CREATE-EXTENSION
+          # rejection, the owner-DDL seam's S3 ledger-schema + S4 transaction-control guards (incl. the
+          # comment-evasion cases the byte scan missed), and the U6 baseline origin — all on a real
+          # engine. Needs the `migrate` feature (the owner-DDL seam). A regression fails the assertion.
+          cargo test -p boatramp-node --features sql-postgres,migrate \
             --test migrate_runner_sqlx_live -- --nocapture 2>&1 | tee migrate-runner.log
           grep -qE 'test result: ok\. 1 passed' migrate-runner.log \
-            || { echo "::error::migrate runner ledger gate did not run (a silent skip or a failure)" >&2; exit 1; }
+            || { echo "::error::migrate substrate ledger gate did not run (a silent skip or a failure)" >&2; exit 1; }
           grep -q 'MIGRATE RUNNER LEDGER OK \[postgres\]' migrate-runner.log \
-            || { echo "::error::migrate runner ledger never reached its marker (a ledger/atomic-rollback/prefix/content-hash/extension-allowlist regression)" >&2; exit 1; }
+            || { echo "::error::migrate substrate ledger never reached its marker (a ledger/atomic-rollback/extension-allowlist/owner-DDL-guard/baseline-origin regression)" >&2; exit 1; }
+      - name: Owner-gated schema-migration FUNCTION-STEP path on a real Postgres (v0.4.25)
+        env:
+          BOATRAMP_TEST_PG_URL: postgres://boatramp:boatramp@localhost:5432/boatramp
+        run: |
+          set -eo pipefail
+          # v0.4.25: the function-step BASE, end to end with a REAL compiled guest + REAL engine + REAL
+          # orchestrator + REAL substrate. Proves: a function step's migrate::exec runs owner DDL and is
+          # recorded (kind=function); the S1 binding-split (the function sees NO tenant sql binding); the
+          # S2 context-gate (the same component as a normal request => not-a-migration, DDL never runs);
+          # the S3 ledger-schema guard via a function; S7 at-least-once (a failed step is not recorded +
+          # re-attempted); and #480 baseline (record without running, then suffix-only apply). Any of
+          # these regressing fails the assertion.
+          cargo test -p boatramp-node --features sql-postgres,migrate \
+            --test migrate_function_live -- --nocapture 2>&1 | tee migrate-fn.log
+          grep -qE 'test result: ok\. 1 passed' migrate-fn.log \
+            || { echo "::error::migrate function-step gate did not run (a silent skip or a failure)" >&2; exit 1; }
+          grep -q 'MIGRATE FUNCTION-STEP OK \[postgres\]' migrate-fn.log \
+            || { echo "::error::migrate function-step never reached its marker (a function-DDL/binding-split/context-gate/ledger-guard/idempotent/baseline regression)" >&2; exit 1; }
 
   # The embedded-Raft cluster tests (consensus, leader-loss failover, mesh admit,
   # cron single-firing) live behind the `raft`/`http` features and so ran ONLY in

@@ -157,6 +157,13 @@ build-fixtures:
       cp "examples/compose/$name/target/wasm32-wasip2/release/boatramp_compose_${name}.wasm" "$cdest/compose-$name.wasm"
       echo "   -> $cdest/compose-$name.wasm"
     done
+    # The migration-function guest the `boatramp-node` function-step live gate loads (imports
+    # boatramp:handlers/migrate-ddl + sql). Copied into the NODE fixtures dir (not handlers).
+    echo "== building migrate-fn =="
+    ( cd "examples/handlers/migrate-fn" && cargo build --release --target wasm32-wasip2 )
+    cp "examples/handlers/migrate-fn/target/wasm32-wasip2/release/boatramp_example_migrate_fn.wasm" \
+       "crates/boatramp-node/tests/fixtures/migrate-fn.wasm"
+    echo "   -> crates/boatramp-node/tests/fixtures/migrate-fn.wasm"
     echo "fixtures rebuilt"
 
 # Run the ACME DNS-01 wildcard-cert end-to-end test against a local Pebble CA.
