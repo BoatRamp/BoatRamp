@@ -1146,16 +1146,26 @@ pub(super) async fn sql_ping(
 }
 
 // ---------------------------------------------------------------------------
-// Owner-gated schema migrations (`/api/migrate/{db}/{apply,dry-run,status}`)
+// Owner-gated schema migrations (`/api/migrate/{db}/{apply,dry-run,baseline,status}`)
 // ---------------------------------------------------------------------------
+//
+// Input is **upload-then-trigger** (content-addressed): the ordered step set is a JSON bundle
+// uploaded via the existing `PUT /api/blobs/{hash}`, then apply/dry-run/baseline reference it by
+// hash. The host reads the blob, parses the manifest, and drives the server-side orchestrator
+// (`crate::migrate`). A step is a `function` (the base — a project function doing arbitrary work,
+// DDL via the owner-role `migrate-ddl` capability), `sql` sugar (a DDL script run as the owner
+// role), or `extension` sugar (an allowlisted `CREATE EXTENSION`).
 
-/// One migration step on the wire. Exactly one of `sql` / `extension` must be set: `sql` is a
-/// DDL/DML script (rejected if it contains `CREATE EXTENSION`); `extension` enables an
-/// allowlisted extension by name. `no_transaction` (sql only) applies it outside a wrapping
-/// transaction (for `CREATE INDEX CONCURRENTLY`-class DDL).
+/// One migration step in the uploaded JSON bundle. Exactly one of `function` / `sql` / `extension`
+/// must be set. `function` names a project function (+ optional pinned `version` and opaque `args`
+/// string passed as the invoke body); `sql` is a DDL/DML script (rejected if it contains
+/// `CREATE EXTENSION`), `no_transaction` applying it outside the wrapping transaction (for
+/// `CREATE INDEX CONCURRENTLY`-class DDL); `extension` enables an allowlisted extension by name.
 #[derive(Deserialize)]
 pub(super) struct MigrateStepInput {
     pub id: String,
+    #[serde(default)]
+    pub function: Option<FunctionStepInput>,
     #[serde(default)]
     pub sql: Option<String>,
     #[serde(default)]
@@ -1164,33 +1174,156 @@ pub(super) struct MigrateStepInput {
     pub extension: Option<String>,
 }
 
-/// The body of `POST /api/migrate/{db}/{apply,dry-run}` — the ordered migration set.
+/// A `function` step's reference: the project function name, an optional pinned component `version`
+/// (defaults to the function's active version), and an opaque `args` string handed to the function
+/// as the invoke request body.
 #[derive(Deserialize)]
-pub(super) struct MigrateApplyRequest {
+pub(super) struct FunctionStepInput {
+    pub name: String,
+    #[serde(default)]
+    pub version: Option<String>,
+    #[serde(default)]
+    pub args: Option<String>,
+}
+
+/// The uploaded bundle manifest (the blob body): the ordered step set. A hand-authored and a
+/// CLI-generated bundle serialize identically (JSON, stable field set), so they hash-agree (U1).
+#[derive(Deserialize)]
+pub(super) struct BundleManifest {
     pub steps: Vec<MigrateStepInput>,
 }
 
+/// The body of `POST /api/migrate/{db}/{apply,dry-run,baseline}` — a reference to the uploaded,
+/// content-addressed bundle by hash, plus (baseline only) the inclusive boundary id `up_to`.
+#[derive(Deserialize)]
+pub(super) struct MigrateTriggerRequest {
+    /// The content hash of the uploaded step-set bundle (`PUT /api/blobs/{hash}`).
+    pub bundle: String,
+    /// Baseline only: record the prefix through (and including) this id. Unset ⇒ the whole set.
+    #[serde(default)]
+    pub up_to: Option<String>,
+}
+
+/// Which migrate verb to run (ungated so the axum handlers stay uniform across feature sets).
+enum MigrateModeArg {
+    Apply,
+    DryRun,
+    Baseline { up_to: Option<String> },
+}
+
 /// Convert a wire step to the core [`MigrationStep`](boatramp_core::sql::MigrationStep), or a
-/// per-step error string (malformed step — neither or both of sql/extension).
+/// per-step error string (malformed step — not exactly one of function/sql/extension).
 fn to_migration_step(
     s: MigrateStepInput,
 ) -> Result<boatramp_core::sql::MigrationStep, (String, String)> {
     use boatramp_core::sql::{MigrationAction, MigrationStep};
-    let action = match (s.sql, s.extension) {
-        (Some(script), None) => MigrationAction::Sql {
+    let action = match (s.function, s.sql, s.extension) {
+        (Some(f), None, None) => MigrationAction::Function {
+            name: f.name,
+            version: f.version,
+            args: f.args,
+        },
+        (None, Some(script), None) => MigrationAction::Sql {
             script,
             no_transaction: s.no_transaction,
         },
-        (None, Some(name)) => MigrationAction::Extension { name },
-        (None, None) => return Err((s.id, "step has neither `sql` nor `extension`".to_string())),
-        (Some(_), Some(_)) => {
+        (None, None, Some(name)) => MigrationAction::Extension { name },
+        (None, None, None) => {
             return Err((
                 s.id,
-                "step has both `sql` and `extension` (set exactly one)".to_string(),
+                "step has none of `function` / `sql` / `extension`".to_string(),
+            ))
+        }
+        _ => {
+            return Err((
+                s.id,
+                "step sets more than one of `function` / `sql` / `extension` (set exactly one)"
+                    .to_string(),
             ))
         }
     };
     Ok(MigrationStep { id: s.id, action })
+}
+
+/// Parse an uploaded bundle blob into the ordered step set.
+fn parse_bundle(bytes: &[u8]) -> Result<Vec<boatramp_core::sql::MigrationStep>, String> {
+    let manifest: BundleManifest =
+        serde_json::from_slice(bytes).map_err(|e| format!("bundle is not valid JSON: {e}"))?;
+    if manifest.steps.is_empty() {
+        return Err("bundle has no steps".to_string());
+    }
+    let mut out = Vec::with_capacity(manifest.steps.len());
+    for s in manifest.steps {
+        out.push(to_migration_step(s).map_err(|(id, e)| format!("step {id:?}: {e}"))?);
+    }
+    Ok(out)
+}
+
+/// The `501` a migrate route returns when no managed database is configured (no substrate).
+fn migrate_unavailable() -> Response {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        "schema migrations are not available on this node (no managed database configured)\n",
+    )
+        .into_response()
+}
+
+/// Read + parse the bundle, then drive the server-side orchestrator (needs the handler runtime for
+/// `function` steps). `handlers`-gated; a lean build returns `501`.
+#[cfg(feature = "handlers")]
+#[allow(clippy::too_many_arguments)]
+async fn run_migrate_bundle(
+    handlers: &HandlerRuntime,
+    substrate: Option<Arc<dyn boatramp_core::sql::MigrationSubstrate>>,
+    deploy: &DeployStore,
+    project: &str,
+    db: &str,
+    bundle_hash: &str,
+    mode: MigrateModeArg,
+) -> Response {
+    let Some(substrate) = substrate else {
+        return migrate_unavailable();
+    };
+    let bytes = match crate::handler_dispatch::read_blob_fully(deploy, bundle_hash).await {
+        Ok(b) => b,
+        Err(resp) => return resp,
+    };
+    let steps = match parse_bundle(&bytes) {
+        Ok(s) => s,
+        Err(msg) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("invalid migration bundle: {msg}\n"),
+            )
+                .into_response()
+        }
+    };
+    let core_mode = match mode {
+        MigrateModeArg::Apply => crate::migrate::MigrateMode::Apply,
+        MigrateModeArg::DryRun => crate::migrate::MigrateMode::DryRun,
+        MigrateModeArg::Baseline { up_to } => crate::migrate::MigrateMode::Baseline { up_to },
+    };
+    let inner = handlers.inner.as_ref().map(std::convert::AsRef::as_ref);
+    match crate::migrate::orchestrate(inner, deploy, &substrate, project, db, &steps, core_mode)
+        .await
+    {
+        Ok(report) => migration_report_response(report),
+        Err(e) => migration_error_response(e),
+    }
+}
+
+#[cfg(not(feature = "handlers"))]
+#[allow(clippy::too_many_arguments)]
+async fn run_migrate_bundle(
+    _handlers: &HandlerRuntime,
+    _substrate: Option<Arc<dyn boatramp_core::sql::MigrationSubstrate>>,
+    _deploy: &DeployStore,
+    _project: &str,
+    _db: &str,
+    _bundle_hash: &str,
+    _mode: MigrateModeArg,
+) -> Response {
+    migrate_unavailable()
 }
 
 /// Map a [`MigrationError`](boatramp_core::sql::MigrationError) to an HTTP response — reserving
@@ -1254,76 +1387,89 @@ fn migration_report_response(report: boatramp_core::sql::MigrationReport) -> Res
     (status, Json(report)).into_response()
 }
 
-/// Shared body of `apply` / `dry-run`.
-async fn migrate_run(
-    runner: Option<Arc<dyn boatramp_core::sql::MigrationRunner>>,
-    project: &str,
-    db: &str,
-    req: MigrateApplyRequest,
-    dry_run: bool,
-) -> Response {
-    let Some(runner) = runner else {
-        return (
-            StatusCode::NOT_IMPLEMENTED,
-            "schema migrations are not available on this node (no managed database configured)\n",
-        )
-            .into_response();
-    };
-    let mut steps = Vec::with_capacity(req.steps.len());
-    for s in req.steps {
-        match to_migration_step(s) {
-            Ok(step) => steps.push(step),
-            Err((id, error)) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    format!("invalid migration step {id:?}: {error}\n"),
-                )
-                    .into_response()
-            }
-        }
-    }
-    match runner.apply(project, db, &steps, dry_run).await {
-        Ok(report) => migration_report_response(report),
-        Err(e) => migration_error_response(e),
-    }
-}
-
-/// Apply the pending suffix of an ordered migration set to managed database `db`, as the
-/// project's non-superuser OWNER role, tracked in the host-owned ledger. `Project·Admin`.
+/// Apply the pending suffix of the uploaded bundle to managed database `db`, running each step
+/// as the project's non-superuser OWNER role (a `function` step via the invoke kernel + owner-role
+/// `migrate-ddl`), tracked in the host-owned ledger. `Project·Admin`.
 pub(super) async fn migrate_apply(
+    State(deploy): State<DeployStore>,
     Extension(project): Extension<ProjectContext>,
-    Extension(runner): Extension<Option<Arc<dyn boatramp_core::sql::MigrationRunner>>>,
+    Extension(handlers): Extension<Arc<HandlerRuntime>>,
+    Extension(substrate): Extension<Option<Arc<dyn boatramp_core::sql::MigrationSubstrate>>>,
     Path(db): Path<String>,
-    Json(req): Json<MigrateApplyRequest>,
+    Json(req): Json<MigrateTriggerRequest>,
 ) -> Response {
-    migrate_run(runner, project.as_ref().as_str(), &db, req, false).await
+    run_migrate_bundle(
+        &handlers,
+        substrate,
+        &deploy,
+        project.as_ref().as_str(),
+        &db,
+        &req.bundle,
+        MigrateModeArg::Apply,
+    )
+    .await
 }
 
 /// Compute the migration plan (which ids WOULD apply) without applying anything. `Project·Admin`.
 pub(super) async fn migrate_dry_run(
+    State(deploy): State<DeployStore>,
     Extension(project): Extension<ProjectContext>,
-    Extension(runner): Extension<Option<Arc<dyn boatramp_core::sql::MigrationRunner>>>,
+    Extension(handlers): Extension<Arc<HandlerRuntime>>,
+    Extension(substrate): Extension<Option<Arc<dyn boatramp_core::sql::MigrationSubstrate>>>,
     Path(db): Path<String>,
-    Json(req): Json<MigrateApplyRequest>,
+    Json(req): Json<MigrateTriggerRequest>,
 ) -> Response {
-    migrate_run(runner, project.as_ref().as_str(), &db, req, true).await
+    run_migrate_bundle(
+        &handlers,
+        substrate,
+        &deploy,
+        project.as_ref().as_str(),
+        &db,
+        &req.bundle,
+        MigrateModeArg::DryRun,
+    )
+    .await
 }
 
-/// Read the applied-migration ledger for managed database `db`. `Project·Read`.
+/// Record the bundle prefix through `up_to` as already-applied WITHOUT running any step — the
+/// owner-assertion adoption op for a pre-existing/populated DB (#480). `Project·Admin`, audited,
+/// prefix-consistent (an empty ledger or a strict consistent extension; divergence → `409`).
+pub(super) async fn migrate_baseline(
+    State(deploy): State<DeployStore>,
+    Extension(project): Extension<ProjectContext>,
+    Extension(handlers): Extension<Arc<HandlerRuntime>>,
+    Extension(substrate): Extension<Option<Arc<dyn boatramp_core::sql::MigrationSubstrate>>>,
+    Path(db): Path<String>,
+    Json(req): Json<MigrateTriggerRequest>,
+) -> Response {
+    run_migrate_bundle(
+        &handlers,
+        substrate,
+        &deploy,
+        project.as_ref().as_str(),
+        &db,
+        &req.bundle,
+        MigrateModeArg::Baseline { up_to: req.up_to },
+    )
+    .await
+}
+
+/// Read the applied-migration ledger for managed database `db`. `Project·Read`. Needs only the
+/// substrate (no invoke kernel), so it is uniform across feature sets.
 pub(super) async fn migrate_status(
     Extension(project): Extension<ProjectContext>,
-    Extension(runner): Extension<Option<Arc<dyn boatramp_core::sql::MigrationRunner>>>,
+    Extension(substrate): Extension<Option<Arc<dyn boatramp_core::sql::MigrationSubstrate>>>,
     Path(db): Path<String>,
 ) -> Response {
-    let Some(runner) = runner else {
-        return (
-            StatusCode::NOT_IMPLEMENTED,
-            "schema migrations are not available on this node (no managed database configured)\n",
-        )
-            .into_response();
+    let Some(substrate) = substrate else {
+        return migrate_unavailable();
     };
-    match runner.status(project.as_ref().as_str(), &db).await {
-        Ok(status) => (StatusCode::OK, Json(status)).into_response(),
+    match substrate.preflight(project.as_ref().as_str(), &db).await {
+        Ok(applied) => (
+            StatusCode::OK,
+            Json(boatramp_core::sql::MigrationStatus { applied }),
+        )
+            .into_response(),
         Err(e) => migration_error_response(e),
     }
 }

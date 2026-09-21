@@ -92,6 +92,11 @@ email = ["handlers", "boatramp-server/email"]
 # ServerAdminController at startup for the posture-enabled surfaces. Enables the server's
 # `admin` feature (which pulls `boatramp-handlers/admin`); implies handlers.
 admin = ["handlers", "boatramp-server/admin", "boatramp-handlers/admin"]
+# Owner-gated schema-migration `function` steps: the node wires the migration substrate (owner
+# connection + ledger + owner-DDL seam) and the server orchestrator attaches the `migrate-ddl`
+# capability for a Project·Admin migration run. Enables the server's `migrate` feature (which pulls
+# `boatramp-handlers/migrate`); implies handlers.
+migrate = ["handlers", "boatramp-server/migrate", "boatramp-handlers/migrate"]
 # The guest capability-minting capability (`boatramp:handlers/capability`,
 # PLAN-delegable-capabilities): the node enables minting at startup when the posture allows, reusing
 # the fleet session signer. Enables the server's `capability` feature; implies handlers.

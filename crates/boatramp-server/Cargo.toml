@@ -45,6 +45,13 @@ email = ["handlers", "boatramp-handlers/email"]
 # `ServerAdminController`. Implies `handlers`. On in batteries-included builds, off in lean.
 admin = ["handlers", "boatramp-handlers/admin"]
 
+# The owner-gated schema-migration `function` step's `migrate-ddl` capability
+# (`boatramp:handlers/migrate-ddl`): a migration function runs owner-role DDL/DML/verification via
+# the node's owner-connection substrate, attached only inside a Project·Admin migration run. Implies
+# `handlers` (which pulls `boatramp-handlers/sql`). On in batteries-included builds, off in lean
+# (then sql/extension migration steps still work; function steps fail closed with a clear message).
+migrate = ["handlers", "boatramp-handlers/migrate"]
+
 # The guest capability-minting capability (`boatramp:handlers/capability`, PLAN-delegable-capabilities):
 # a guest mints a fleet-signed, own-project-only target capability via the `ServerCapabilityMinter`
 # (which reaches the fleet signer). Implies `handlers`. On in batteries-included builds, off in lean.

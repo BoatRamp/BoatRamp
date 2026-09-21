@@ -38,6 +38,23 @@ pub(super) enum FnTenant {
     Background,
 }
 
+/// SECURITY (S1/S2): the capability context for a **migration step** invocation. Its presence is the
+/// HARD structural gate that (a) attaches the owner-role `migrate-ddl` capability and (b) applies the
+/// tenant-`sql` binding-split — a migration invocation gets a KNOWN-MINIMAL binding set
+/// (kv/blob/logging/env + migrate-ddl), never the tenant `sql`/`orm`/messaging/admin/… grants, so a
+/// function that disables RLS via owner-DDL has no tenant binding to then read cross-tenant through.
+///
+/// It is a SEPARATE context flag, not a [`FnTenant`] variant (Backend A2): the migration function's
+/// tenant is irrelevant — all its DB work runs at owner altitude via `migrate-ddl`. It is
+/// constructible ONLY on the `Project·Admin` migration orchestrator path ([`crate::migrate`]) — never
+/// from a request/consumer/cron trigger — so owner-DDL is unreachable outside an owner-authenticated
+/// migration run. Carries the owner-DDL seam the host runs each `migrate::exec` on.
+#[cfg(feature = "handlers")]
+pub(crate) struct MigrationContext {
+    /// The orchestrator-owned owner-role DDL seam for this `(project, db)`.
+    pub ddl: std::sync::Arc<dyn boatramp_core::sql::MigrateDdl>,
+}
+
 /// The authority the engine sees for an invoked function. `wasi:http` needs a
 /// scheme + authority; the public control-plane path is the host's concern, so
 /// every function is invoked at `http://function.invoke/`.
@@ -566,6 +583,8 @@ pub(super) async fn execute_function(
         &tenant,
         bearer.as_deref(),
         domain_context.as_deref(),
+        // Not a migration step — the normal (full, tenancy-resolved) binding path.
+        None,
     )
     .await
     {
@@ -636,6 +655,96 @@ pub(super) async fn execute_function(
     (response, elapsed.as_millis() as u64)
 }
 
+/// Invoke a function as a **migration step** (Security S1/S2, Backend A4). A dedicated path — not
+/// [`execute_function`] — because the migration invocation has distinct, security-load-bearing
+/// semantics that must not leak into the normal invoke path:
+///
+/// - **Quota-exempt (A4):** it acquires NO per-function concurrency permit, so an admin migration
+///   never `503`s under serving load (a migration is a control-plane op, not request traffic).
+/// - **Migration bindings (S1/S2):** it passes a [`MigrationContext`] to `build_function_bindings`,
+///   which force the owner-role `migrate-ddl` grant + the tenant-`sql` binding-split.
+/// - **No request tenant:** the tenant source is `Background` — the function does all DB work at
+///   owner altitude via `migrate-ddl`, never a request-derived tenant binding.
+/// - **Async lane:** a migration can run long (external-source sync, big DDL); it uses the isolated
+///   async pool with the large ceiling, like the durable drain.
+///
+/// `component` is the orchestrator-pinned blob hash (Backend A3), so a replay runs identical bytes.
+/// Returns the guest's `Response` (its status distinguishes success from an author-returned / trap
+/// failure) plus the elapsed ms.
+#[cfg(all(feature = "handlers", feature = "migrate"))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn execute_migration_function(
+    inner: &HandlerRuntimeInner,
+    deploy: &DeployStore,
+    project: ProjectRef<'_>,
+    function: &boatramp_core::function::Function,
+    component: &str,
+    request: Request,
+    ddl: std::sync::Arc<dyn boatramp_core::sql::MigrateDdl>,
+) -> (Response, u64) {
+    let wasm = match read_blob_fully(deploy, component).await {
+        Ok(bytes) => bytes,
+        Err(response) => return (response, 0),
+    };
+    let fn_ident = format!("fn/{}", function.name);
+    let scope = project.qualified(&fn_ident);
+    let ctx = MigrationContext { ddl };
+    let bindings = match build_function_bindings(
+        inner,
+        project,
+        &scope,
+        &fn_ident,
+        &function.config,
+        0,
+        &FnTenant::Background,
+        None,
+        None,
+        Some(&ctx),
+    )
+    .await
+    {
+        Ok(bindings) => bindings,
+        Err(super::handler_dispatch::BindingsError::NotReady {
+            detail,
+            retry_after_secs,
+        }) => {
+            tracing::info!(function = %function.name, %detail, "migration function not ready: managed database starting");
+            return (sql_starting_response(retry_after_secs), 0);
+        }
+        Err(super::handler_dispatch::BindingsError::Refused(err)) => {
+            tracing::warn!(function = %function.name, %err, "migration function bindings refused");
+            return (handler_unavailable(), 0);
+        }
+    };
+    let limits = function_limits(function.config.limits.as_ref());
+    let request = prepare_invoke_request(request);
+    let start = std::time::Instant::now();
+    let result = inner
+        .engine
+        .serve_with_limits_async(component, &wasm, request, bindings, limits)
+        .await;
+    let elapsed = start.elapsed();
+    inner.metrics.observe(
+        &function.name,
+        metrics::Trigger::Invoke,
+        "migrate",
+        component,
+        metrics::Outcome::from_result(&result),
+        elapsed,
+    );
+    let response = match result {
+        Ok(response) => {
+            let (parts, body) = response.into_parts();
+            axum::http::Response::from_parts(parts, axum::body::Body::new(body))
+        }
+        Err(err) => {
+            tracing::warn!(function = %function.name, %err, "migration function invocation failed");
+            handler_error_response(&err)
+        }
+    };
+    (response, elapsed.as_millis() as u64)
+}
+
 /// Build a top-level function's bindings. Unlike a site handler (whose grants are
 /// the site allowlist ∩ its imports), a top-level function is admin-deployed, so
 /// its declared `imports` **are** its grants — served under its own `fn/<name>`
@@ -652,10 +761,50 @@ pub(super) async fn build_function_bindings(
     tenant: &FnTenant,
     bearer: Option<&str>,
     domain_context: Option<&str>,
+    // SECURITY (S1/S2): `Some` iff this is a `Project·Admin` migration-step invocation. It forces a
+    // KNOWN-MINIMAL binding set (kv/blob/logging/env + owner-role `migrate-ddl`) and DROPS the tenant
+    // `sql`/`orm` + every other grant — see [`MigrationContext`]. Constructible only on the
+    // orchestrator path, so a normal request can never reach this branch.
+    migration: Option<&MigrationContext>,
 ) -> Result<boatramp_handlers::Bindings, super::handler_dispatch::BindingsError> {
     use super::handler_dispatch::BindingsError;
     let granted = |name: &str| config.imports.iter().any(|i| i == name);
     let mut bindings = boatramp_handlers::Bindings::new(scope);
+
+    // Migration-step early return (Security S1 binding-split): a migration invocation gets ONLY the
+    // owner-role `migrate-ddl` capability plus the non-DB conveniences (kv/blob for staging an
+    // external-source sync, logging, env). It is NOT given the tenant `sql`/`orm` binding — nor
+    // messaging/email/admin/capability/invoke/graphql/session — so even if the function's owner-DDL
+    // disables RLS on a table, it holds no tenant-scoped connection to read another tenant through.
+    // `wasi:http` remains engine-level (for external-source sync). This explicit allowlist is the
+    // auditable proof of S1 (gate MIGRATE-DDL RLS-INVARIANT OK).
+    if let Some(_ctx) = migration {
+        if granted("wasi:keyvalue") {
+            bindings = bindings.with_keyvalue(scope, inner.kv.clone());
+        }
+        if granted("wasi:blobstore") {
+            let max_blob = inner.max_blob_bytes.get().copied().unwrap_or(0);
+            bindings = bindings.with_blobstore(scope, inner.storage.clone(), max_blob);
+        }
+        #[cfg(feature = "migrate")]
+        {
+            bindings = bindings.with_migrate(_ctx.ddl.clone());
+        }
+        inner.logs.configure(scope, None);
+        bindings = bindings.with_logging(scope.to_string(), None, inner.logs.clone());
+        let allow_env_secret_refs = inner.allow_env_secret_refs.get().copied().unwrap_or(false);
+        let env = resolve_secret_env(
+            scope,
+            project,
+            &config.env,
+            &config.secrets,
+            allow_env_secret_refs,
+            inner.secret_store.get().map(std::convert::AsRef::as_ref),
+        )
+        .await?;
+        return Ok(bindings.with_env(env));
+    }
+
     if granted("wasi:keyvalue") {
         bindings = bindings.with_keyvalue(scope, inner.kv.clone());
     }

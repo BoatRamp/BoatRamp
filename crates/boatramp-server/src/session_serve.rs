@@ -588,6 +588,8 @@ pub(super) async fn dispatch_session_post(
         &crate::function_runtime::FnTenant::Inherited(caller_tenant),
         bearer.as_deref(),
         domain_context.as_deref(),
+        // A session re-entry is never a migration step.
+        None,
     )
     .await
     {
