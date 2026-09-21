@@ -484,11 +484,15 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
     // server-side) — backs `POST /api/sql/{db}/{exec,query}`. The SAME concrete NodeOperatorSql
     // also backs the owner-gated schema-migration runner (which reuses its owner + superuser
     // backends), so build it ONCE and share it.
+    // Build the SAME concrete NodeOperatorSql once (when a managed DB is configured) and share it:
+    // it backs both `operator_sql` (the sql exec/query cap) and the migration runner (which reuses
+    // its owner + superuser backends). Two separate bindings so neither annotation is a complex type.
     #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
-    let (operator_sql, migration_runner): (
-        Option<Arc<dyn boatramp_core::sql::OperatorSql>>,
-        Option<Arc<dyn boatramp_core::sql::MigrationRunner>>,
-    ) = match config
+    let operator_sql: Option<Arc<dyn boatramp_core::sql::OperatorSql>>;
+    #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+    let migration_runner: Option<Arc<dyn boatramp_core::sql::MigrationRunner>>;
+    #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+    match config
         .handlers
         .as_ref()
         .and_then(|h| h.bindings.sql.as_ref())
@@ -509,17 +513,18 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
                 .unwrap_or_default()
                 .into_iter()
                 .collect();
-            let runner = Arc::new(crate::managed_sql::NodeMigrationRunner::new(
+            migration_runner = Some(Arc::new(crate::managed_sql::NodeMigrationRunner::new(
                 node_op.clone(),
                 trusted,
-            )) as Arc<dyn boatramp_core::sql::MigrationRunner>;
-            (
-                Some(node_op as Arc<dyn boatramp_core::sql::OperatorSql>),
-                Some(runner),
-            )
+            ))
+                as Arc<dyn boatramp_core::sql::MigrationRunner>);
+            operator_sql = Some(node_op as Arc<dyn boatramp_core::sql::OperatorSql>);
         }
-        None => (None, None),
-    };
+        None => {
+            operator_sql = None;
+            migration_runner = None;
+        }
+    }
     #[cfg(not(any(feature = "sql-postgres", feature = "sql-mysql")))]
     let migration_runner: Option<Arc<dyn boatramp_core::sql::MigrationRunner>> = None;
     #[cfg(not(any(feature = "sql-postgres", feature = "sql-mysql")))]
