@@ -299,6 +299,12 @@ impl KvStore for SlateKv {
         Ok(out)
     }
 
+    fn atomic_write_batch(&self) -> bool {
+        // One SlateDB `WriteBatch` = a single atomic, durable commit (below), so the ready-set
+        // fast path (B2) is safe over SlateKv: the ready marker rides the same batch as the index.
+        true
+    }
+
     async fn write_batch(&self, ops: Vec<WriteOp>) -> Result<(), KvError> {
         // Collect the whole group into one SlateDB WriteBatch: a single atomic,
         // durable commit (one flush) rather than one per key.

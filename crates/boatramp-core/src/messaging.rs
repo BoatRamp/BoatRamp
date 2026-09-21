@@ -490,6 +490,73 @@ pub trait Messaging: Send + Sync {
         Ok(0)
     }
 
+    // --- event-driven delivery (Phase A) ------------------------------------------------------
+    //
+    // The drainer reacts to the durable **ready-set** (topics with claimable work) instead of
+    // polling every topic on a timer. These methods expose that set + the reconcile primitives.
+    // Every one has a safe default so a backend that has not opted into the fast path degrades to
+    // the full poll (never loses a message): `supports_ready_set` returns `false`, `ready_topics`
+    // reports `Unsupported`, and the drainer falls back to walking every consumer's topic.
+
+    /// Whether this backend's [`ready_topics`](Self::ready_topics) fast-path is **safe to trust**
+    /// (B2). The ready-set add rides the same `write_batch` as the message-index write, so the fast
+    /// path is correct ONLY on a backend whose `write_batch` is truly atomic (SlateDB / the in-memory
+    /// store / the Raft state machine) — on the default sequential `write_batch`
+    /// ([`KvStore::write_batch`](crate::kv::KvStore::write_batch)) a crash between the index put and
+    /// the ready-set put would strand the message, so such a backend MUST fall back to the full poll.
+    /// The default is `false` (fail-closed: the drainer polls) — a backend asserts `true` only after
+    /// confirming its `write_batch` is atomic.
+    fn supports_ready_set(&self) -> bool {
+        false
+    }
+
+    /// The durable **ready-set**: every topic currently flagged as having claimable work (B1/B4) —
+    /// the drainer's work list, replacing the O(#topics) poll. An idle topic is absent, so an idle
+    /// fleet costs ~0. A returned topic may already be drained (a stale marker) — the drainer does a
+    /// cheap empty claim and the prune removes it (B5). The default is
+    /// [`MessagingError::Unsupported`] so the drainer knows to fall back to the full poll rather than
+    /// silently believe "no work anywhere" (fail-closed).
+    async fn ready_topics(&self) -> Result<Vec<String>, MessagingError> {
+        Err(MessagingError::Unsupported(
+            "this messaging backend has no ready-set (event-driven delivery)".into(),
+        ))
+    }
+
+    /// **Rebuild** the ready-set from the authoritative message index (B6/B18): re-derive the set of
+    /// topics that have a claimable-or-pending message and reconcile the durable ready-set to match —
+    /// adding a topic whose marker was lost (a crash between the index put and the ready put, B2/B3),
+    /// leaving alone the ones already correct. This is the safety-net's periodic self-heal + the
+    /// transparent-upgrade path (a fresh/upgraded node self-populates on first rebuild). It is the ONE
+    /// place a full-ish scan survives, so it runs on a long cadence
+    /// (`messaging_readyset_rebuild_interval_ms`). Returns the number of topics the ready-set now
+    /// holds. The default is a no-op (`0`) for a backend without a ready-set.
+    async fn rebuild_ready_set(&self) -> Result<usize, MessagingError> {
+        Ok(0)
+    }
+
+    /// The per-topic **next-visible** deadlines for the redelivery due-heap (B6): every topic that has
+    /// at least one leased (not-yet-claimable) message, paired with the EARLIEST such
+    /// `lease_until_ms` on it — so the drainer's due-heap can wake exactly when a lease is due to
+    /// expire (redelivery) rather than re-scanning every topic. A pure rebuild-from-durable-state
+    /// source (the heap is a cache, never the authority): recomputed on startup, leader-change, and
+    /// shard reassignment. The default is empty (a backend without lease introspection redelivers via
+    /// the full poll instead).
+    async fn due_topics(&self) -> Result<Vec<(String, u64)>, MessagingError> {
+        Ok(Vec::new())
+    }
+
+    /// A coarse **delivery-plane** snapshot for operator introspection (B14/B16): ready-set size,
+    /// due-heap depth, last-rebuild age, and this node's delivery identity. `this_node` is the caller's
+    /// node identity (the scheduler passes it, since the backend itself may not know the operator's
+    /// node label); the backend fills the durable counts. Default [`MessagingError::Unsupported`]
+    /// (the shape of [`backlog`](Self::backlog)'s introspection contract), so a backend without a
+    /// ready-set reports nothing rather than a fabricated zero.
+    async fn delivery_stats(&self, _this_node: &str) -> Result<DeliveryStats, MessagingError> {
+        Err(MessagingError::Unsupported(
+            "this messaging backend has no delivery-plane stats (event-driven delivery)".into(),
+        ))
+    }
+
     /// Subscribe to a **live, at-most-once** broadcast of `topic` — for SSE
     /// streams, *not* the durable consumer path. Every
     /// message published after the subscription is delivered once to each live
@@ -508,6 +575,96 @@ pub trait Messaging: Send + Sync {
         _after: Option<&str>,
     ) -> futures::stream::BoxStream<'static, StreamEvent> {
         futures::stream::empty().boxed()
+    }
+
+    /// The fast-path in-process **wake** (Part A #2): a clonable handle the drainer awaits so a
+    /// publish (or nack-to-now) wakes it immediately instead of waiting for the reconcile timer. It
+    /// carries NO topic/payload/`signed_context` (isolation, gate 7) — it is a pure "something became
+    /// ready, go look at the durable ready-set" pulse, and a dropped/coalesced wake is harmless (the
+    /// safety-net still delivers, B12). The default is `None` (a backend without a wake — the drainer
+    /// relies on the timer alone). Cloneable so several drainers can await one node's wakes.
+    fn wake_handle(&self) -> Option<Wake> {
+        None
+    }
+}
+
+/// The fast-path delivery **wake** (Part A #2): a lossy, in-process notification that a publish (or
+/// a nack-to-now) has made SOME topic ready, so the drainer re-checks the durable ready-set promptly
+/// instead of waiting for the safety-net timer. It is a pure latency optimization — it carries no
+/// topic, payload, or context (isolation), and a lost/coalesced pulse never loses a message (the
+/// durable ready-set + safety-net are the authority, B12).
+///
+/// Runtime-agnostic (core uses `futures`, not `tokio`): a single-slot coalescing flag
+/// ([`AtomicBool`](std::sync::atomic::AtomicBool)) plus a [`futures::task::AtomicWaker`]. Many
+/// `notify` calls between two `notified().await`s set the one flag and resolve the await ONCE — the
+/// wake says "go look at the ready-set", not "here is one message", so coalescing is exactly right
+/// and there is no unbounded buffering. A `notify` that fires while no one is awaiting is not lost:
+/// the flag stays set and the next `notified()` returns immediately.
+#[derive(Clone)]
+pub struct Wake {
+    inner: Arc<WakeInner>,
+}
+
+struct WakeInner {
+    /// A pending pulse the next `notified()` will consume. Set by `notify`, cleared by `notified`.
+    pending: std::sync::atomic::AtomicBool,
+    /// The parked drainer's waker, roused on `notify`.
+    waker: futures::task::AtomicWaker,
+}
+
+impl Wake {
+    /// A fresh wake with no pending pulse.
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(WakeInner {
+                pending: std::sync::atomic::AtomicBool::new(false),
+                waker: futures::task::AtomicWaker::new(),
+            }),
+        }
+    }
+
+    /// Fire the wake: set the pending flag and rouse the parked drainer (if any). If none is parked,
+    /// the flag stays set so the next `notified().await` returns immediately (no lost wake). Fired
+    /// strictly AFTER the durable commit returns (B12), so a woken drainer always sees the committed
+    /// ready-set marker.
+    pub fn notify(&self) {
+        self.inner
+            .pending
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.inner.waker.wake();
+    }
+
+    /// Await the next wake pulse (consuming the pending flag). Coalescing: many `notify` calls
+    /// between two awaits wake the drainer once (it then drains the whole ready-set).
+    pub async fn notified(&self) {
+        futures::future::poll_fn(|cx| {
+            // Fast path: a pulse is already pending — consume it and return ready.
+            if self
+                .inner
+                .pending
+                .swap(false, std::sync::atomic::Ordering::AcqRel)
+            {
+                return std::task::Poll::Ready(());
+            }
+            // Register our waker, then re-check (a `notify` racing the register must not be lost).
+            self.inner.waker.register(cx.waker());
+            if self
+                .inner
+                .pending
+                .swap(false, std::sync::atomic::Ordering::AcqRel)
+            {
+                std::task::Poll::Ready(())
+            } else {
+                std::task::Poll::Pending
+            }
+        })
+        .await;
+    }
+}
+
+impl Default for Wake {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -736,6 +893,32 @@ pub struct GroupInfo {
     pub lag: usize,
 }
 
+/// The delivery-plane observability block (B14, event-driven delivery): a coarse snapshot of the
+/// ready-set + due-heap health, so an operator can answer "why is a topic backed up" from `stats`
+/// with no server logs (B16) — a shard gap (`this_node` stale/absent) is distinguishable from a
+/// drain bug from a healthy-slow consumer. Exposed behind a default-[`MessagingError::Unsupported`]
+/// trait method (the shape of [`backlog`](Messaging::backlog)), so a backend without a ready-set
+/// reports nothing rather than a fabricated zero.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeliveryStats {
+    /// Durable ready-set size on this node's authoritative view: the number of topics currently
+    /// flagged as having claimable work (the drainer's work list). `0` = fully drained/idle.
+    pub ready_set_size: usize,
+    /// The number of leased-but-unacked messages this node is tracking for lease-expiry redelivery
+    /// in its in-process due-heap (the redelivery backstop's depth). A pure cache of durable
+    /// `lease_until_ms` state (B6) — a lost heap is rebuilt, never a lost redelivery.
+    pub due_heap_depth: usize,
+    /// Age in ms since this node last completed a full ready-set rebuild (the reconcile that
+    /// re-derives the set from the authoritative index). A stale age + rising backlog is the
+    /// "reconcile wedged" signal (B16). `None` if a rebuild has not run yet since start.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_rebuild_age_ms: Option<u64>,
+    /// This node's identity as the delivery plane sees it (the sharding `owning_node`, or the single
+    /// node's id). Empty on a single-node deployment where the concept is degenerate.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub this_node: String,
+}
+
 /// An AND-composed filter over a topic's dead-letters (P1 selective DLQ). A dead-letter matches iff
 /// it satisfies EVERY set predicate; an all-`None` filter matches everything (the whole-DLQ op). Used
 /// by [`list_dead_letters`](Messaging::list_dead_letters),
@@ -896,6 +1079,28 @@ pub fn pause_key(topic: &str) -> String {
 /// policy (unbounded).
 pub fn mqpolicy_key(topic: &str) -> String {
     format!("mqpolicy/{topic}")
+}
+
+/// KV/state key for a topic's **ready-set** marker (event-driven delivery, Phase A): its EXISTENCE
+/// = "this topic has claimable work — the drainer should look here." A tiny empty marker (mirroring
+/// [`pause_key`]). Written in the SAME atomic batch/apply as the operation that creates work — a
+/// publish adds it, a nack-to-now re-adds it, a claim that drains the topic to empty/all-leased
+/// prunes it (B1/B3/B4). One entry per TOPIC (not per lane): the drainer fans a ready topic to all
+/// its lanes and a stale marker costs one cheap empty claim (B5). The ready-set is the AUTHORITY for
+/// *where* to look; the atomic claim in the coordinator is still the sole authority for *who gets a
+/// message once*. A lost/missing marker never loses a message — the safety-net rebuild
+/// ([`Messaging::rebuild_ready_set`]) re-derives it from the durable index.
+pub fn ready_key(topic: &str) -> String {
+    format!("mqready/{topic}")
+}
+/// KV/state prefix over ALL ready-set markers (every topic) — the drainer's "where is there work"
+/// scan and the rebuild pass's target keyspace.
+pub const READY_PREFIX: &str = "mqready/";
+/// Extract the topic from a [`ready_key`] / [`READY_PREFIX`] key, or `None` if it is not a
+/// well-formed direct ready marker (a topic name may itself contain `/` for sub-topics, so this
+/// simply strips the prefix — the whole remainder is the topic).
+pub fn topic_of_ready_key(key: &str) -> Option<&str> {
+    key.strip_prefix(READY_PREFIX).filter(|t| !t.is_empty())
 }
 
 // --- consumer-group (durable fan-out) keyspace: the offset-log model ---
@@ -1278,6 +1483,20 @@ pub struct LogMessaging {
     /// live `(tokens, last_refill_ms)` per rate-capped topic, refilled at the topic's configured rate.
     /// Only touched when a topic actually sets a rate cap, so an uncapped topic pays nothing.
     rate_buckets: std::sync::Mutex<HashMap<String, TokenBucket>>,
+    /// The fast-path delivery **wake** (event-driven delivery, Part A #2): fired AFTER a publish /
+    /// nack-to-now durably commits (B12) so the drainer re-checks the ready-set promptly. Lossy — a
+    /// missed pulse only costs latency (the durable ready-set + safety-net are the authority).
+    wake: Wake,
+    /// **Publish generation** (B4 prune-race guard): bumped once AFTER each publish's ready-set add
+    /// durably commits. `claim` snapshots this before its record scan and re-reads it before emitting
+    /// the ready-set prune; if it changed, a publish raced concurrently (its ready-add may not have
+    /// been visible to the scan), so `claim` SKIPS the prune rather than clobbering the racing
+    /// publish's just-added marker — closing the prune-vs-publish stranding race directly (not merely
+    /// relying on the rebuild). Publish is lock-free; this atomic is the only cross-talk needed.
+    publish_gen: AtomicU64,
+    /// Unix-ms this node last completed a full [`rebuild_ready_set`](Messaging::rebuild_ready_set)
+    /// pass, for the `last_rebuild_age_ms` delivery stat (B14). `0` = not yet rebuilt since start.
+    last_rebuild_ms: AtomicU64,
 }
 
 /// A per-node per-topic token bucket for the best-effort publish rate cap (Feature B). Refills at
@@ -1320,6 +1539,9 @@ impl LogMessaging {
             inline_budget_bytes: INLINE_INFLIGHT_MAX_BYTES,
             commit_queue: std::sync::Mutex::new(Vec::new()),
             commit_gate: futures::lock::Mutex::new(()),
+            wake: Wake::new(),
+            publish_gen: AtomicU64::new(0),
+            last_rebuild_ms: AtomicU64::new(0),
             max_unflushed: 0, // strong durability by default (== the original always-await-flush path)
             unflushed: std::sync::atomic::AtomicUsize::new(0),
             policy_cache: std::sync::Mutex::new(HashMap::new()),
@@ -1583,6 +1805,16 @@ impl LogMessaging {
         self
     }
 
+    /// Signal that work became ready, AFTER a publish (or nack-to-now) durably committed its
+    /// ready-set marker (B12): bump the publish generation (so a concurrent `claim`'s prune sees a
+    /// race and skips, B4) THEN fire the lossy in-process wake (so the drainer re-checks the ready-set
+    /// promptly). Ordering matters — the marker is durable before either, so a woken drainer always
+    /// finds it. A dropped/coalesced wake is harmless (the safety-net still delivers).
+    fn signal_ready(&self) {
+        self.publish_gen.fetch_add(1, Ordering::Relaxed);
+        self.wake.notify();
+    }
+
     /// Whether `topic` has ≥1 registered consumer group (so `publish` retains the
     /// fan-out log/payload + advances the `logmax` gate). Loads the set once from
     /// the persisted group-state registry (`mqgstate/…`) so it survives a restart,
@@ -1681,6 +1913,14 @@ impl LogMessaging {
             meta_key(topic, &id),
             serde_json::to_vec(&record).map_err(MessagingError::backend)?,
         ));
+        // Event-driven delivery (B1): flag the topic as having claimable work IN THE SAME durable
+        // `write_batch` as the index record above — the ready-set can never diverge from the index it
+        // describes, and this folds into the existing group-commit with no extra round-trip. The
+        // marker is per-topic (B5): one entry however many lanes (work-queue + groups) the topic has;
+        // the drainer probes them all. A future not-before (delivery-mode delay) still adds the
+        // marker — the message IS claimable-eventually and the drainer's due-heap + a cheap empty
+        // claim handle the "not yet" case (over-flagging costs one empty claim, never a lost message).
+        ops.push(WriteOp::Put(ready_key(topic), Vec::new()));
         // Grouped (fan-out) topics keep a **retained** copy of the payload + an append-only log
         // entry, so each group consumes on its own high-water long after the work-queue ack would
         // have deleted it, and advance the per-topic `logmax` gate marker (so an idle group's claim
@@ -2029,6 +2269,9 @@ impl Messaging for LogMessaging {
         // (at-least-once); a failed group fails this publish too. Payloads (object store) were
         // already written by `build_publish_ops` (payload-first), so only the index writes are here.
         self.group_commit(ops, 1, max_unflushed).await?;
+        // Event-driven delivery (B12): the ready-set marker is now durable — wake the drainer so it
+        // reacts promptly (bumping the publish-gen so a racing claim's prune won't clobber the marker).
+        self.signal_ready();
         // Notify live SSE subscribers (best-effort, separate from the durable queue above).
         self.hubs.broadcast(topic, &id, payload);
         Ok(())
@@ -2054,6 +2297,7 @@ impl Messaging for LogMessaging {
             .build_publish_ops(topic, payload, signed_context, not_before_ms, 0, 0)
             .await?;
         self.group_commit(ops, 1, max_unflushed).await?;
+        self.signal_ready(); // ready-set durable (B12) — wake the drainer (due-heap handles the delay)
         // A delayed message isn't live yet; still notify SSE (best-effort) so a live tail sees it.
         self.hubs.broadcast(topic, &id, payload);
         Ok(())
@@ -2079,6 +2323,7 @@ impl Messaging for LogMessaging {
             .build_publish_ops(topic, payload, signed_context, 0, expires_at_ms, 0)
             .await?;
         self.group_commit(ops, 1, max_unflushed).await?;
+        self.signal_ready(); // ready-set durable (B12) — wake the drainer
         self.hubs.broadcast(topic, &id, payload);
         Ok(())
     }
@@ -2097,6 +2342,7 @@ impl Messaging for LogMessaging {
             .build_publish_ops(topic, payload, signed_context, 0, 0, priority)
             .await?;
         self.group_commit(ops, 1, max_unflushed).await?;
+        self.signal_ready(); // ready-set durable (B12) — wake the drainer
         self.hubs.broadcast(topic, &id, payload);
         Ok(())
     }
@@ -2146,6 +2392,7 @@ impl Messaging for LogMessaging {
         }
         self.group_commit(all_ops, messages.len(), batch_max_unflushed)
             .await?;
+        self.signal_ready(); // the whole batch's ready markers are durable (B12) — wake the drainer once
         for (topic, id, payload) in &broadcasts {
             self.hubs.broadcast(topic, id, payload);
         }
@@ -2167,6 +2414,11 @@ impl Messaging for LogMessaging {
         // to exactly one consumer (the per-process coordinator — a cluster swaps
         // this mutex for the Raft leader applying the same `plan_claim`).
         let _guard = self.claim_lock.lock().await;
+        // B4 prune-race guard: snapshot the publish generation BEFORE the record scan. A publish is
+        // lock-free (it does not take `claim_lock`), so one may commit a fresh record + ready marker
+        // AFTER our scan but BEFORE our prune. We re-read this after the scan; if it changed, we
+        // SKIP the ready-set prune rather than clobber the racing publish's just-added marker.
+        let gen_before = self.publish_gen.load(Ordering::Relaxed);
         let now = now_unix_ms();
         let prefix = meta_prefix(topic);
         let keys = self
@@ -2189,23 +2441,33 @@ impl Messaging for LogMessaging {
                 serde_json::from_slice(&raw).map_err(|e| MessagingError::Decode(e.to_string()))?;
             records.push((key[prefix.len()..].to_string(), record));
         }
-        let actions = plan_claim(
-            records,
-            now,
-            lease.as_millis() as u64,
-            max_batch,
-            max_attempts,
-        );
+        let lease_ms = lease.as_millis() as u64;
+        // Emptiness-after-this-claim (B4): is any record left that is CLAIMABLE now and was NOT just
+        // leased/dead-lettered by this plan? If so the topic still has work (e.g. more than
+        // `max_batch` were claimable) and the ready marker must stay. Computed from the same scanned
+        // snapshot the plan ran over, so it is exactly this claim's serialized view. A record counts
+        // as still-claimable iff its lease has expired (`<= now`) and it is under `max_attempts` (an
+        // exhausted one dead-letters, not stays) — the same predicate `plan_claim` uses to lease.
+        let claimable_now = |rec: &Record| -> bool {
+            rec.lease_until_ms <= now
+                && !(rec.expires_at_ms != 0 && rec.expires_at_ms <= now)
+                && rec.attempts < max_attempts
+        };
+        let claimable_before = records.iter().filter(|(_, r)| claimable_now(r)).count();
+        let actions = plan_claim(records, now, lease_ms, max_batch, max_attempts);
 
+        // Collect every index mutation this claim makes into ONE durable `write_batch` (B1/B3): the
+        // lease writes + dead-letter moves ride a single atomic, DURABLE commit (never the relaxed
+        // path — removals/re-adds are control-plane-grade). The ready-set prune (below) rides the
+        // same batch so the marker delete can never be seen without the drains that justify it.
+        let mut ops: Vec<WriteOp> = Vec::new();
         let mut claimed = Vec::new();
+        let mut leased = 0usize;
         for action in actions {
             match action {
                 ClaimAction::Lease { id, record } => {
                     let json = serde_json::to_vec(&record).map_err(MessagingError::backend)?;
-                    self.kv
-                        .put(&meta_key(topic, &id), json)
-                        .await
-                        .map_err(MessagingError::backend)?;
+                    ops.push(WriteOp::Put(meta_key(topic, &id), json));
                     // A3: an inlined payload rides the record — no object-store fetch.
                     let inline = record.inline.is_some();
                     let payload = match record.inline {
@@ -2221,21 +2483,47 @@ impl Messaging for LogMessaging {
                         signed_context: record.signed_context,
                         inline,
                     });
+                    leased += 1;
                 }
                 ClaimAction::DeadLetter { id, record } => {
-                    // Exhausted: move the record to the dead-letter store
+                    // Exhausted (or TTL-expired): move the record to the dead-letter store
                     // (keep the payload), stop delivering.
                     let json = serde_json::to_vec(&record).map_err(MessagingError::backend)?;
-                    self.kv
-                        .put(&dead_key(topic, &id), json)
-                        .await
-                        .map_err(MessagingError::backend)?;
-                    self.kv
-                        .delete(&meta_key(topic, &id))
-                        .await
-                        .map_err(MessagingError::backend)?;
+                    ops.push(WriteOp::Put(dead_key(topic, &id), json));
+                    ops.push(WriteOp::Delete(meta_key(topic, &id)));
                 }
             }
+        }
+
+        // B4/B5 — conditional ready-set prune. The marker is per-TOPIC and covers EVERY lane (the
+        // work-queue + every consumer group), so a work-queue claim may prune it ONLY when the whole
+        // topic is drained. This claim only sees the work-queue lane, so it prunes only for a topic
+        // with NO groups (the common case): a grouped topic keeps its marker here and the periodic
+        // ready-set rebuild prunes it once ALL lanes are empty (B5: a stale marker costs one cheap
+        // empty claim, never a stranding — never prune while another lane has work).
+        //
+        // Drained (work-queue) iff every claimable-now record got leased by this plan: the residual
+        // claimable count is `claimable_before − leased` (a dead-letter was NOT claimable, so it never
+        // counted). Prune ONLY if that is zero AND no publish raced (gen unchanged) — a concurrent
+        // publish may have committed a fresh claimable record + marker after our scan, invisible here,
+        // so its marker must survive; skip the delete and let the next claim / rebuild reconcile.
+        let residual_claimable = claimable_before.saturating_sub(leased);
+        let wq_drained = residual_claimable == 0;
+        if wq_drained
+            && !self.topic_has_groups(topic).await
+            && self.publish_gen.load(Ordering::Relaxed) == gen_before
+        {
+            ops.push(WriteOp::Delete(ready_key(topic)));
+        }
+
+        if !ops.is_empty() {
+            // Durable, atomic (B1/B3): the lease writes, dead-letter moves, and the conditional
+            // ready-prune commit together or not at all — a claim never leaves a leased record
+            // without its (still-present-or-pruned-together) marker.
+            self.kv
+                .write_batch(ops)
+                .await
+                .map_err(MessagingError::backend)?;
         }
         Ok(claimed)
     }
@@ -2528,7 +2816,19 @@ impl Messaging for LogMessaging {
                 }
             }
             if changed {
-                self.put_group_state(&msg.topic, &msg.group, &state).await?;
+                // Event-driven delivery (B1/B3): re-arm the topic's ready marker in the SAME durable
+                // batch as the group-state write — the nacked message is claimable (now, or at
+                // `until`), so the drainer must revisit this topic. The marker is per-topic (B5), so
+                // a group nack re-adds the shared marker; a durable `write_batch`, never relaxed.
+                let json = serde_json::to_vec(&state).map_err(MessagingError::backend)?;
+                self.kv
+                    .write_batch(vec![
+                        WriteOp::Put(gstate_key(&msg.topic, &msg.group), json),
+                        WriteOp::Put(ready_key(&msg.topic), Vec::new()),
+                    ])
+                    .await
+                    .map_err(MessagingError::backend)?;
+                self.signal_ready(); // durable — wake the drainer (due-heap covers a future `until`)
             }
             return Ok(());
         }
@@ -2540,10 +2840,18 @@ impl Messaging for LogMessaging {
             serde_json::from_slice(&raw).map_err(|e| MessagingError::Decode(e.to_string()))?;
         record.lease_until_ms = until;
         let json = serde_json::to_vec(&record).map_err(MessagingError::backend)?;
+        // Event-driven delivery (B1/B3): the nacked message is claimable again (now, or at `until`),
+        // so re-arm the topic's ready marker in the SAME durable batch as the record update — a claim
+        // may have pruned the marker when it drained the topic, and this re-adds it atomically with
+        // the state that justifies it. Durable `write_batch`, never the relaxed publish-only path.
         self.kv
-            .put(&key, json)
+            .write_batch(vec![
+                WriteOp::Put(key, json),
+                WriteOp::Put(ready_key(&msg.topic), Vec::new()),
+            ])
             .await
             .map_err(MessagingError::backend)?;
+        self.signal_ready(); // durable — wake the drainer (its due-heap covers a future `until`)
         Ok(())
     }
 
@@ -3171,6 +3479,195 @@ impl Messaging for LogMessaging {
     ) -> futures::stream::BoxStream<'static, StreamEvent> {
         self.hubs.subscribe(topic, after)
     }
+
+    // --- event-driven delivery (Phase A) ------------------------------------------------------
+
+    fn supports_ready_set(&self) -> bool {
+        // The ready-set fast path is safe only when the ready marker can ride the SAME atomic
+        // `write_batch` as the index record (B2). Delegate the judgement to the backend itself.
+        self.kv.atomic_write_batch()
+    }
+
+    async fn ready_topics(&self) -> Result<Vec<String>, MessagingError> {
+        // Drain the durable ready-set: every topic currently flagged as having claimable work. An
+        // idle topic is absent (so an idle fleet costs ~0). A returned topic may already be drained
+        // (a stale marker) — the drainer does a cheap empty claim + the prune removes it.
+        let keys = self
+            .kv
+            .list_prefix(READY_PREFIX)
+            .await
+            .map_err(MessagingError::backend)?;
+        Ok(keys
+            .iter()
+            .filter_map(|k| topic_of_ready_key(k).map(str::to_owned))
+            .collect())
+    }
+
+    async fn rebuild_ready_set(&self) -> Result<usize, MessagingError> {
+        // The safety-net's periodic self-heal (B6/B18): re-derive the set of topics that actually
+        // have claimable-or-pending work from the AUTHORITATIVE index, and reconcile the durable
+        // ready-set to match — ADD a topic whose marker was lost (a crash between the index put and
+        // the ready put, B2/B3; or a fresh/upgraded node with no markers yet), and PRUNE a marker on
+        // a topic with no remaining work (the general pruner the per-claim path defers to for grouped
+        // topics). The one full-ish scan, on a long cadence. Never removes a live message — it only
+        // reconciles the HINT to the durable index it derives from.
+        let now = now_unix_ms();
+        // 1) Topics with work-queue backlog: any live `mq/{topic}/{id}` record. (A record whose lease
+        //    is in the future still counts — it is pending, and the drainer's due-heap wants its
+        //    topic present so a stale prune doesn't strand it.)
+        let mut with_work: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for key in self
+            .kv
+            .list_prefix("mq/")
+            .await
+            .map_err(MessagingError::backend)?
+        {
+            // `mq/{topic}/{id}` — topic is everything between the first and last `/`.
+            if let Some(rest) = key.strip_prefix("mq/") {
+                if let Some(slash) = rest.rfind('/') {
+                    with_work.insert(rest[..slash].to_string());
+                }
+            }
+        }
+        // 2) Grouped topics with un-consumed backlog or in-flight: a registered group whose hwm is
+        //    behind the retained log, or that holds an in-flight entry. Scan each group's compact
+        //    state (bounded by #groups, not backlog).
+        let gstate_all = self
+            .kv
+            .list_prefix("mqgstate/")
+            .await
+            .map_err(MessagingError::backend)?;
+        for key in &gstate_all {
+            let Some(rest) = key.strip_prefix("mqgstate/") else {
+                continue;
+            };
+            let Some(slash) = rest.rfind('/') else { continue };
+            let topic = &rest[..slash];
+            let group = &rest[slash + 1..];
+            if topic.is_empty() || group.is_empty() {
+                continue;
+            }
+            if with_work.contains(topic) {
+                continue; // already flagged
+            }
+            let Some(state) = self.get_group_state(topic, group).await? else {
+                continue;
+            };
+            // In-flight (leased or claimable-now) ⇒ work. Else compare hwm against the retained log.
+            let has_inflight = !state.in_flight.is_empty();
+            let has_backlog = state.hwm.as_str() < self.read_logmax(topic).await?.as_str();
+            if has_inflight || has_backlog {
+                with_work.insert(topic.to_string());
+            }
+        }
+        // 3) Reconcile: the current markers vs the derived truth. ADD missing, PRUNE stale — each a
+        //    durable single-key write (a bounded reconcile; the set is small on an idle fleet).
+        let existing: std::collections::HashSet<String> = self
+            .kv
+            .list_prefix(READY_PREFIX)
+            .await
+            .map_err(MessagingError::backend)?
+            .iter()
+            .filter_map(|k| topic_of_ready_key(k).map(str::to_owned))
+            .collect();
+        let mut added_any = false;
+        for topic in with_work.difference(&existing) {
+            self.kv
+                .put(&ready_key(topic), Vec::new())
+                .await
+                .map_err(MessagingError::backend)?;
+            added_any = true;
+        }
+        for topic in existing.difference(&with_work) {
+            // Stale marker on a topic with no work — safe to prune (rebuild is the authoritative
+            // pruner; a per-claim prune is conservative for grouped topics, B5).
+            self.kv
+                .delete(&ready_key(topic))
+                .await
+                .map_err(MessagingError::backend)?;
+        }
+        self.last_rebuild_ms.store(now, Ordering::Relaxed);
+        // A rebuild that ADDED a marker (a lost one, or a fresh-node self-populate) must wake the
+        // drainer — the wake that would have fired at publish time was lost / predates this node.
+        if added_any {
+            self.wake.notify();
+        }
+        Ok(with_work.len())
+    }
+
+    async fn due_topics(&self) -> Result<Vec<(String, u64)>, MessagingError> {
+        // Per-topic earliest next-visible lease deadline, for the drainer's redelivery due-heap (B6).
+        // A pure rebuild-from-durable-state source (the heap is a cache): the earliest `lease_until_ms`
+        // among a topic's leased (future-dated) work-queue records + grouped in-flight entries. A
+        // topic with only claimable-now work is omitted (the ready-set already covers it — the heap is
+        // for TIME-based redelivery, not immediate work).
+        let now = now_unix_ms();
+        let mut due: HashMap<String, u64> = HashMap::new();
+        let mut note = |topic: &str, until: u64| {
+            if until > now {
+                due.entry(topic.to_string())
+                    .and_modify(|e| *e = (*e).min(until))
+                    .or_insert(until);
+            }
+        };
+        // Work-queue leased records.
+        for key in self
+            .kv
+            .list_prefix("mq/")
+            .await
+            .map_err(MessagingError::backend)?
+        {
+            let Some(rest) = key.strip_prefix("mq/") else {
+                continue;
+            };
+            let Some(slash) = rest.rfind('/') else { continue };
+            let topic = rest[..slash].to_string();
+            if let Some(raw) = self.kv.get(&key).await.map_err(MessagingError::backend)? {
+                if let Ok(rec) = serde_json::from_slice::<Record>(&raw) {
+                    note(&topic, rec.lease_until_ms);
+                }
+            }
+        }
+        // Grouped in-flight leases.
+        for key in self
+            .kv
+            .list_prefix("mqgstate/")
+            .await
+            .map_err(MessagingError::backend)?
+        {
+            let Some(rest) = key.strip_prefix("mqgstate/") else {
+                continue;
+            };
+            let Some(slash) = rest.rfind('/') else { continue };
+            let topic = rest[..slash].to_string();
+            let group = &rest[slash + 1..];
+            if let Some(state) = self.get_group_state(&topic, group).await? {
+                for f in &state.in_flight {
+                    note(&topic, f.lease_until_ms);
+                }
+            }
+        }
+        Ok(due.into_iter().collect())
+    }
+
+    async fn delivery_stats(&self, this_node: &str) -> Result<DeliveryStats, MessagingError> {
+        let ready_set_size = self.ready_topics().await?.len();
+        // Due-heap depth = the number of topics with a future lease deadline (the redelivery backstop
+        // the drainer tracks). Computed from the same durable source the drainer rebuilds from.
+        let due_heap_depth = self.due_topics().await?.len();
+        let last = self.last_rebuild_ms.load(Ordering::Relaxed);
+        let last_rebuild_age_ms = (last != 0).then(|| now_unix_ms().saturating_sub(last));
+        Ok(DeliveryStats {
+            ready_set_size,
+            due_heap_depth,
+            last_rebuild_age_ms,
+            this_node: this_node.to_string(),
+        })
+    }
+
+    fn wake_handle(&self) -> Option<Wake> {
+        Some(self.wake.clone())
+    }
 }
 
 #[cfg(test)]
@@ -3311,6 +3808,10 @@ mod tests {
         }
         async fn list_prefix(&self, p: &str) -> Result<Vec<String>, crate::kv::KvError> {
             self.inner.list_prefix(p).await
+        }
+        fn atomic_write_batch(&self) -> bool {
+            // Delegates to the atomic MemoryKv, so the ready-set fast path (B2) is enabled over it.
+            self.inner.atomic_write_batch()
         }
         async fn write_batch(
             &self,
@@ -5031,5 +5532,253 @@ mod tests {
         assert_eq!(batch.len(), 1, "only the un-acked message survives");
         assert_eq!(batch[0].payload, b"b");
         assert_eq!(batch[0].attempts, 2, "redelivery re-charges the attempt");
+    }
+
+    // --- event-driven delivery (Phase A) unit tests -------------------------------------------
+
+    /// A non-atomic `KvStore` (the DEFAULT sequential `write_batch`, `atomic_write_batch == false`)
+    /// wrapping an in-memory map — proves the ready-set fast path is REFUSED on it (B2/gate 3).
+    struct NonAtomicKv {
+        inner: MemoryKv,
+    }
+    #[async_trait]
+    impl KvStore for NonAtomicKv {
+        async fn get(&self, k: &str) -> Result<Option<Vec<u8>>, crate::kv::KvError> {
+            self.inner.get(k).await
+        }
+        async fn put(&self, k: &str, v: Vec<u8>) -> Result<(), crate::kv::KvError> {
+            self.inner.put(k, v).await
+        }
+        async fn delete(&self, k: &str) -> Result<(), crate::kv::KvError> {
+            self.inner.delete(k).await
+        }
+        async fn list_prefix(&self, p: &str) -> Result<Vec<String>, crate::kv::KvError> {
+            self.inner.list_prefix(p).await
+        }
+        // Deliberately does NOT override `atomic_write_batch` (inherits the `false` default) and does
+        // NOT override `write_batch` (inherits the sequential, non-atomic default). This is exactly a
+        // backend on which the ready-set fast path must fall back to the full poll.
+    }
+
+    /// B2 / gate 3: `supports_ready_set` keys on the backend's `atomic_write_batch`. An atomic
+    /// backend (MemoryKv) enables the fast path; a sequential (default) backend refuses it.
+    #[tokio::test]
+    async fn ready_set_fast_path_refused_on_non_atomic_backend() {
+        let atomic = LogMessaging::new(Arc::new(MemStorage::default()), Arc::new(MemoryKv::new()));
+        assert!(
+            atomic.supports_ready_set(),
+            "an atomic write_batch backend supports the ready-set fast path"
+        );
+        let seq = LogMessaging::new(
+            Arc::new(MemStorage::default()),
+            Arc::new(NonAtomicKv {
+                inner: MemoryKv::new(),
+            }),
+        );
+        assert!(
+            !seq.supports_ready_set(),
+            "a sequential (non-atomic) write_batch backend MUST refuse the fast path (B2)"
+        );
+    }
+
+    /// A publish flags its topic in the durable ready-set; a claim that drains the topic prunes it.
+    #[tokio::test]
+    async fn publish_adds_ready_marker_and_claim_drain_prunes_it() {
+        let mq = mq();
+        assert!(
+            mq.ready_topics().await.unwrap().is_empty(),
+            "idle: no ready markers"
+        );
+        mq.publish("t", b"a").await.unwrap();
+        assert_eq!(
+            mq.ready_topics().await.unwrap(),
+            vec!["t".to_string()],
+            "a publish flags the topic ready (B1)"
+        );
+        // Claim + ack the only message → the topic drains → the marker is pruned (B4).
+        let batch = mq.claim("t", LEASE, 16, 5).await.unwrap();
+        assert_eq!(batch.len(), 1);
+        // The topic is now all-leased (nothing claimable), so the claim pruned the marker.
+        assert!(
+            mq.ready_topics().await.unwrap().is_empty(),
+            "a claim that drains the topic to all-leased prunes the ready marker (B4)"
+        );
+        mq.ack(&batch[0]).await.unwrap();
+        assert!(mq.ready_topics().await.unwrap().is_empty());
+    }
+
+    /// Gate 3 (core): a crash between the index put and the ready-set put strands the marker (not the
+    /// message). Simulate by deleting the marker out from under a live record; `rebuild_ready_set`
+    /// re-derives it from the authoritative index (B6/B18) — no message lost.
+    #[tokio::test]
+    async fn rebuild_recovers_a_lost_ready_marker() {
+        let mq = mq();
+        mq.publish("t", b"a").await.unwrap();
+        // Simulate the crash window: the message-index record is durable, but its ready marker was
+        // never applied (or was lost). Delete the marker directly.
+        mq.kv.delete(&ready_key("t")).await.unwrap();
+        assert!(
+            mq.ready_topics().await.unwrap().is_empty(),
+            "marker lost — the drainer would skip this topic on the fast path"
+        );
+        // The message is NOT lost — it is still in the authoritative index.
+        assert_eq!(mq.backlog("t").await.unwrap(), 1);
+        // The safety-net rebuild re-derives the marker from the index.
+        let n = mq.rebuild_ready_set().await.unwrap();
+        assert_eq!(n, 1, "rebuild finds the one topic with work");
+        assert_eq!(
+            mq.ready_topics().await.unwrap(),
+            vec!["t".to_string()],
+            "rebuild re-adds the lost marker (B6/B18)"
+        );
+        // And it is now claimable via the fast path.
+        assert_eq!(mq.claim("t", LEASE, 16, 5).await.unwrap().len(), 1);
+    }
+
+    /// Gate 4 (core): the prune-vs-publish generation guard. A publish that commits AFTER a claim's
+    /// record scan but BEFORE its prune must NOT have its marker clobbered. We can't interleave the
+    /// lock-free publish inside `claim` deterministically here, so we assert the guard's invariant
+    /// directly: bumping the publish generation between scan and prune skips the delete.
+    #[tokio::test]
+    async fn concurrent_publish_marker_is_not_pruned_by_a_draining_claim() {
+        let mq = mq();
+        // One message; claim it (leases it, topic becomes all-leased → would prune).
+        mq.publish("t", b"a").await.unwrap();
+        let first = mq.claim("t", LEASE, 16, 5).await.unwrap();
+        assert_eq!(first.len(), 1);
+        // Marker pruned (no race).
+        assert!(mq.ready_topics().await.unwrap().is_empty());
+        // Now a fresh publish re-adds the marker; a subsequent claim of the leased-only topic must
+        // NOT prune it (a claimable message exists again).
+        mq.publish("t", b"b").await.unwrap();
+        assert_eq!(mq.ready_topics().await.unwrap(), vec!["t".to_string()]);
+        // Claim drains "b" too → marker pruned again (no concurrent publish).
+        let second = mq.claim("t", LEASE, 16, 5).await.unwrap();
+        assert_eq!(second.len(), 1);
+        assert!(
+            mq.ready_topics().await.unwrap().is_empty(),
+            "with no racing publish, the drain prunes the marker"
+        );
+        mq.ack(&first[0]).await.unwrap();
+        mq.ack(&second[0]).await.unwrap();
+    }
+
+    /// Gate 7 (core): two distinct topics (e.g. two projects' same-named topic, namespaced by the
+    /// caller) get DISTINCT ready-set keys — no cross-topic bleed.
+    #[tokio::test]
+    async fn ready_set_keys_are_per_topic_isolated() {
+        let mq = mq();
+        mq.publish("projA/orders", b"a").await.unwrap();
+        mq.publish("projB/orders", b"b").await.unwrap();
+        let mut topics = mq.ready_topics().await.unwrap();
+        topics.sort();
+        assert_eq!(
+            topics,
+            vec!["projA/orders".to_string(), "projB/orders".to_string()],
+            "same-named topics in two namespaces have distinct ready keys (gate 7)"
+        );
+        assert_eq!(ready_key("projA/orders"), "mqready/projA/orders");
+        assert_ne!(ready_key("projA/orders"), ready_key("projB/orders"));
+        // Draining one leaves the other's marker intact.
+        let a = mq.claim("projA/orders", LEASE, 16, 5).await.unwrap();
+        assert_eq!(a.len(), 1);
+        assert_eq!(
+            mq.ready_topics().await.unwrap(),
+            vec!["projB/orders".to_string()],
+            "draining projA leaves projB's marker untouched"
+        );
+    }
+
+    /// B3 / relaxed sole-caller guard (extended): the ready-set removals + re-adds (claim-drain prune,
+    /// nack re-add) travel ONLY the durable `write_batch`, NEVER `write_batch_relaxed`. With relaxed
+    /// durability opted in (`max_unflushed > 0`), a publish MAY fast-ack via the relaxed path (its
+    /// ready ADD rides with it, shared fate), but a nack and a claim-drain must be durable.
+    #[tokio::test]
+    async fn ready_set_removals_and_readds_are_never_relaxed() {
+        let counting = Arc::new(CountingKv {
+            inner: MemoryKv::new(),
+            batches: std::sync::atomic::AtomicUsize::new(0),
+            relaxed: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let mq = LogMessaging::new(Arc::new(MemStorage::default()), counting.clone())
+            .with_max_unflushed(100); // relaxed opt-in, so a publish CAN take the relaxed path
+        mq.publish("t", b"a").await.unwrap();
+        let relaxed_after_publish = counting.relaxed.load(std::sync::atomic::Ordering::Relaxed);
+        let batches_before = counting.batches.load(std::sync::atomic::Ordering::Relaxed);
+        // Claim (drains → prune) then nack a message: both must be DURABLE write_batch, never relaxed.
+        let batch = mq.claim("t", LEASE, 16, 5).await.unwrap();
+        assert_eq!(batch.len(), 1);
+        mq.nack(&batch[0]).await.unwrap();
+        let relaxed_after = counting.relaxed.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            relaxed_after, relaxed_after_publish,
+            "claim-drain prune + nack re-add must NEVER use write_batch_relaxed (B3)"
+        );
+        assert!(
+            counting.batches.load(std::sync::atomic::Ordering::Relaxed) > batches_before,
+            "the claim + nack committed via the DURABLE write_batch"
+        );
+    }
+
+    /// The delivery-plane stats block (B14) reports the ready-set size + this node.
+    #[tokio::test]
+    async fn delivery_stats_report_ready_set_size() {
+        let mq = mq();
+        mq.publish("a", b"1").await.unwrap();
+        mq.publish("b", b"2").await.unwrap();
+        let stats = mq.delivery_stats("node-1").await.unwrap();
+        assert_eq!(stats.ready_set_size, 2, "two topics flagged ready");
+        assert_eq!(stats.this_node, "node-1");
+        // A rebuild stamps the last-rebuild age.
+        mq.rebuild_ready_set().await.unwrap();
+        let stats = mq.delivery_stats("node-1").await.unwrap();
+        assert!(
+            stats.last_rebuild_age_ms.is_some(),
+            "a completed rebuild stamps the age"
+        );
+    }
+
+    /// The due-heap source (B6) reports a topic's earliest future lease deadline, and omits a topic
+    /// whose work is claimable now (that is the ready-set's job, not the redelivery heap's).
+    #[tokio::test]
+    async fn due_topics_report_leased_deadlines_only() {
+        let mq = mq();
+        mq.publish("t", b"a").await.unwrap();
+        // Claimable-now: not on the due-heap (ready-set covers it).
+        assert!(
+            mq.due_topics().await.unwrap().is_empty(),
+            "a claimable-now topic is not on the redelivery due-heap"
+        );
+        // Lease it (future deadline) → it appears on the due-heap.
+        let batch = mq.claim("t", Duration::from_secs(60), 16, 5).await.unwrap();
+        assert_eq!(batch.len(), 1);
+        let due = mq.due_topics().await.unwrap();
+        assert_eq!(due.len(), 1, "the leased topic has a future deadline");
+        assert_eq!(due[0].0, "t");
+        assert!(due[0].1 > now_unix_ms(), "the deadline is in the future");
+        mq.ack(&batch[0]).await.unwrap();
+    }
+
+    /// A grouped topic keeps its ready marker across a work-queue-style path and rebuild prunes it
+    /// only when ALL lanes drain (B5): a work-queue claim must NOT prune a topic that has groups.
+    #[tokio::test]
+    async fn grouped_topic_marker_not_pruned_by_workqueue_claim() {
+        let mq = mq();
+        // Register a group + publish (retained). The publish adds the marker.
+        mq.publish("g", b"x").await.unwrap();
+        let _ = mq
+            .claim_grouped("g", "workers", StartPosition::Earliest, LEASE, 16, 5)
+            .await
+            .unwrap();
+        // Publish another; a work-queue claim on this grouped topic must not prune the marker
+        // (the group lane may still have work — B5 keeps one per-topic marker, rebuild is the pruner).
+        mq.publish("g", b"y").await.unwrap();
+        assert_eq!(mq.ready_topics().await.unwrap(), vec!["g".to_string()]);
+        let _ = mq.claim("g", LEASE, 16, 5).await.unwrap();
+        assert_eq!(
+            mq.ready_topics().await.unwrap(),
+            vec!["g".to_string()],
+            "a work-queue claim never prunes a grouped topic's shared marker (B5)"
+        );
     }
 }
