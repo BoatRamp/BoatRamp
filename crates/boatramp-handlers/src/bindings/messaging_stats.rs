@@ -127,6 +127,21 @@ impl StatsBinding {
             let Some(tenant) = self.resolved_tenant.as_deref() else {
                 return Err(messaging_stats_types::StatsError::NotDeclared);
             };
+            // SECURITY (review HIGH-1/MEDIUM-1): `{tenant}` fills a single topic SEGMENT. The resolved
+            // tenant is host-derived but NOT constrained to one segment — a claim value legitimately
+            // containing `/` (an org-path / email / URL-ish id), or empty/whitespace, or `..`, could
+            // reshape the resolved topic to byte-match ANOTHER tenant's topic (or a parent prefix that
+            // aggregates siblings), turning this read-only gauge into the cross-tenant oracle the
+            // capability exists to prevent. Unlike a publish (which carries the tenant only inside a
+            // COSE-signed envelope, never as a topic segment), this is the first place a tenant is
+            // interpolated into a topic key, so validate it here and fail CLOSED.
+            let clean = !tenant.trim().is_empty()
+                && !tenant.contains('/')
+                && !tenant.contains(TENANT_PLACEHOLDER)
+                && !tenant.contains("..");
+            if !clean {
+                return Err(messaging_stats_types::StatsError::NotDeclared);
+            }
             bus_name.replace(TENANT_PLACEHOLDER, tenant)
         } else {
             bus_name.to_string()
@@ -207,7 +222,12 @@ impl<'a> StatsHost<'a> {
 fn to_wit(refused: StatsRefused) -> messaging_stats_types::StatsError {
     match refused {
         StatsRefused::NotDeclared => messaging_stats_types::StatsError::NotDeclared,
-        StatsRefused::Backend(m) => messaging_stats_types::StatsError::Other(m),
+        // Review LOW-1: don't surface raw substrate error text to the guest (it could leak internal
+        // detail); a generic message. The detail stays host-side in the `StatsRefused::Backend`.
+        StatsRefused::Backend(detail) => {
+            tracing::warn!(%detail, "messaging-stats backend read failed");
+            messaging_stats_types::StatsError::Other("failed to read messaging stats".to_string())
+        }
     }
 }
 
@@ -444,6 +464,49 @@ mod tests {
             host.get("bus:sync/{tenant}/import".into()).await.unwrap_err(),
             messaging_stats_types::StatsError::NotDeclared
         ));
+    }
+
+    #[tokio::test]
+    async fn a_slash_bearing_tenant_cannot_reshape_the_topic() {
+        // Review HIGH-1: a resolved tenant that legitimately/maliciously contains `/` must NOT be
+        // able to reshape `bus:sync/{tenant}` into another tenant's topic. Seed a victim's real
+        // topic; the attacker's resolved tenant is `victim/import`; the read must be REFUSED before
+        // it ever reaches the substrate (fail closed).
+        let backend = Arc::new(FakeMessaging::default());
+        backend
+            .gauges
+            .lock()
+            .unwrap()
+            .insert("acme/bus/sync/victim/import".into(), (99, 0, 0));
+        let b = binding(backend.clone(), &["sync/{tenant}"], Some("victim/import"));
+        let mut host = StatsHost::new(Some(&b));
+        assert!(matches!(
+            host.get("bus:sync/{tenant}".into()).await.unwrap_err(),
+            messaging_stats_types::StatsError::NotDeclared
+        ));
+        assert!(
+            backend.reads.lock().unwrap().is_empty(),
+            "a slash-bearing tenant is refused before reaching the backend"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_or_whitespace_tenant_fails_closed() {
+        // Review MEDIUM-1: an empty/whitespace resolved tenant must not resolve to a parent prefix
+        // that aggregates siblings.
+        for bad in ["", "   "] {
+            let backend = Arc::new(FakeMessaging::default());
+            let b = binding(backend.clone(), &["sync/{tenant}/import"], Some(bad));
+            let mut host = StatsHost::new(Some(&b));
+            assert!(
+                matches!(
+                    host.get("bus:sync/{tenant}/import".into()).await.unwrap_err(),
+                    messaging_stats_types::StatsError::NotDeclared
+                ),
+                "empty/whitespace tenant {bad:?} must fail closed"
+            );
+            assert!(backend.reads.lock().unwrap().is_empty());
+        }
     }
 
     #[tokio::test]
