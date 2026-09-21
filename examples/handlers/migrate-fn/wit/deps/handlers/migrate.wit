@@ -1,0 +1,21 @@
+// The boatramp `migrate-ddl` capability interfaces, vendored for the guest (part of the
+// `boatramp:handlers` package declared in sql.wit). These must match the host's definitions in
+// boatramp-handlers (crates/boatramp-handlers/wit/world.wit) exactly so the component links against
+// the engine's binding.
+
+interface migrate-ddl-types {
+  variant migrate-error {
+    not-a-migration,
+    ledger-protected,
+    txn-control,
+    sql(string),
+  }
+}
+
+interface migrate-ddl {
+  use migrate-ddl-types.{migrate-error};
+
+  exec: func(script: string) -> result<_, migrate-error>;
+  exec-batch: func(scripts: list<string>) -> result<_, migrate-error>;
+  query: func(sql: string) -> result<string, migrate-error>;
+}
