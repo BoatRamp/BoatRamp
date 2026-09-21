@@ -5,6 +5,48 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.4.25] - 2026-09-21
+
+An **owner-gated, in-app schema-migration surface**: boatramp owns the migrator (an
+ordered, tracked, transactional, idempotent apply of a migration set) and you trigger
+it with an admin token — the first instance of a general "admin-CLI → owner-only admin
+API" pattern. The design cleared a 3-role panel (Backend + UX + Security) and shipped
+behind a Security-Engineer review to convergence + two CI-hard live gates on real
+Postgres. Postgres only in this release.
+
+The load-bearing safety property (an owner constraint): schema DDL runs as a **dedicated
+per-project, non-superuser owner role** — never the cluster superuser — so on a Shared
+multi-tenant server Postgres itself denies the migration path `DROP DATABASE other`,
+`ALTER ROLE … SUPERUSER`, `COPY … TO PROGRAM`, and untrusted `CREATE EXTENSION`, by
+privilege. The runtime app role stays a non-owner, so row-level security is still
+enforced against it.
+
+### Added
+
+- **Owner-gated schema migrations (`/api/migrate/{db}/{apply,dry-run,status}`).** Supply
+  an ordered set of steps — each a `sql` script or an allowlisted `extension` — and
+  boatramp applies the pending suffix in order, once each, tracked in a host-owned
+  `schema_migrations` ledger. Each `sql` step commits atomically with its ledger row
+  (a `no_transaction` opt-out covers DDL Postgres forbids in a transaction, e.g.
+  `CREATE INDEX CONCURRENTLY`). Ordering is fixed by **prefix-consistency + content-hash
+  immutability** — a reordered set, or a changed already-applied migration, is refused
+  fail-closed. A step that runs but fails comes back as a structured
+  `failed { id, error }` (HTTP 422) so a thin client sees exactly which migration failed
+  and why; a not-ready managed DB returns a retryable `503`. Reachable per project via
+  `/api/projects/<proj>/migrate/…`, gated at **`Project·Admin`** for the mutating verbs
+  (never the deploy-grade publisher right the sibling `/api/sql/*` path uses),
+  `Project·Read` for `status`.
+- **Per-project non-superuser owner/DDL role** in managed-database provisioning (Postgres
+  Shared): a three-identity model — the cluster superuser provisions the shells, a new
+  per-project **owner role** (`NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS`) owns the
+  schema and runs migrations, and the existing runtime login role stays a non-owner
+  (RLS-subject). New tenants provision with the model automatically; existing tenants are
+  migrated by a documented one-shot operator step (see the how-to).
+- **Trusted-extension allowlist** (`[handlers.bindings.sql] migrate_trusted_extensions`):
+  the only extensions a migration may enable. A raw `sql` step may not `CREATE EXTENSION`;
+  the sole path is an allowlist-gated, host-templated `extension` step.
+- How-to: `docs/src/how-to/in-app-migrations.md`.
+
 ## [0.4.24] - 2026-09-20
 
 The messaging **JetStream-parity** release: boatramp's bus is rebuilt for durable
