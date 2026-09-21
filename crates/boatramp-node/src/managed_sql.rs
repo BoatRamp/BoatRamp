@@ -18,7 +18,10 @@ use boatramp_core::kv::KvStore;
 use boatramp_core::project::ProjectRef;
 use boatramp_core::sql::SqlError;
 #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
-use boatramp_core::sql::{MigrationError, MigrationReport, MigrationStatus, MigrationStep};
+use boatramp_core::sql::{
+    AppliedMigration, LedgerOrigin, MigrateDdl, MigrateDdlError, MigrationError, MigrationStep,
+    MigrationSubstrate, SubstrateStepOutcome,
+};
 use boatramp_storage::sql_compute::{ComputeEndpointResolver, ReplicaDiag};
 use boatramp_storage::ExternalSqlKind;
 
@@ -899,6 +902,71 @@ fn mentions_txn_control(script: &str) -> bool {
         .any(|tok| matches!(tok, "BEGIN" | "START" | "COMMIT" | "END" | "ROLLBACK"))
 }
 
+/// Whether `script` references the host-owned migration-ledger schema (`boatramp_migrations`). The
+/// owner role OWNS that schema, so an unguarded `migrate::exec` from a function step could rewrite
+/// prefix-consistency/immutability history. Refused fail-closed (Security S3). Case-insensitive
+/// substring match on the schema name as a whole word (so `boatramp_migrations_backup` is still
+/// caught by the prefix — deliberately broad; the ledger schema is reserved, nothing legitimate
+/// touches it). Belt-and-braces beside the schema isolation (the runtime tenant role has no grant on
+/// it at all); this stops the OWNER-role path a function step runs on.
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+fn mentions_ledger_schema(script: &str) -> bool {
+    script
+        .to_ascii_lowercase()
+        .contains(&LEDGER_SCHEMA.to_ascii_lowercase())
+}
+
+/// The host-mediated owner-role DDL seam backing the guest `migrate-ddl` capability of a `function`
+/// step (Security S5). Holds the orchestrator-owned OWNER-role backend for one `(project, db)`; the
+/// guest never holds the credential. Each call enforces the ledger-schema (S3) + transaction-control
+/// (S4) guards host-side before touching the wire, then auto-commits via `run_script`/`run_query`.
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+pub(crate) struct OwnerDdl {
+    owner: Arc<dyn boatramp_core::sql::SqlBackend>,
+}
+
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+impl OwnerDdl {
+    /// Guard a guest-supplied script/query: refuse a ledger-schema reference (S3) or its own
+    /// transaction control (S4) before it reaches the owner connection.
+    fn guard(script: &str) -> Result<(), MigrateDdlError> {
+        if mentions_ledger_schema(script) {
+            return Err(MigrateDdlError::LedgerProtected);
+        }
+        if mentions_txn_control(script) {
+            return Err(MigrateDdlError::TxnControl);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+#[async_trait]
+impl MigrateDdl for OwnerDdl {
+    async fn exec(&self, script: &str) -> Result<(), MigrateDdlError> {
+        Self::guard(script)?;
+        self.owner
+            .run_script(script)
+            .await
+            .map_err(|e| MigrateDdlError::Sql(sanitize_migration_error(&e.to_string())))
+    }
+
+    async fn exec_batch(&self, scripts: Vec<String>) -> Result<(), MigrateDdlError> {
+        for script in &scripts {
+            self.exec(script).await?;
+        }
+        Ok(())
+    }
+
+    async fn query(&self, sql: &str) -> Result<boatramp_core::sql::SqlRows, MigrateDdlError> {
+        Self::guard(sql)?;
+        self.owner
+            .run_query(sql)
+            .await
+            .map_err(|e| MigrateDdlError::Sql(sanitize_migration_error(&e.to_string())))
+    }
+}
+
 #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
 impl NodeMigrationRunner {
     /// Build over a [`NodeOperatorSql`] (for the owner + superuser backends) and the operator's
@@ -923,15 +991,25 @@ impl NodeMigrationRunner {
         )
     }
 
-    /// The host-built ledger INSERT for one applied step (all values host-controlled + quoted).
-    fn ledger_insert(step: &MigrationStep, ordinal: usize) -> String {
+    /// The host-built ledger INSERT for one recorded step (all values host-controlled + quoted). The
+    /// orchestrator supplies the **effective** hash (== the intrinsic content hash for sql/extension;
+    /// blob-bound for a function step) and the `origin` (`apply` vs `baseline`, recorded in
+    /// `applied_by` for the U6 marker).
+    fn ledger_insert(
+        step: &MigrationStep,
+        ordinal: usize,
+        effective_hash: &str,
+        origin: LedgerOrigin,
+    ) -> String {
         format!(
-            "INSERT INTO {ledger} (id, ordinal, content_hash, kind) VALUES ({id}, {ord}, {hash}, {kind});",
+            "INSERT INTO {ledger} (id, ordinal, content_hash, kind, applied_by) \
+             VALUES ({id}, {ord}, {hash}, {kind}, {origin});",
             ledger = Self::ledger(),
             id = sql_quote_literal(&step.id),
             ord = ordinal,
-            hash = sql_quote_literal(&step.content_hash()),
+            hash = sql_quote_literal(effective_hash),
             kind = sql_quote_literal(step.kind()),
+            origin = sql_quote_literal(origin.as_str()),
         )
     }
 
@@ -960,15 +1038,16 @@ impl NodeMigrationRunner {
         Ok(())
     }
 
-    /// Read the applied ledger rows, ordered by `ordinal`.
+    /// Read the applied ledger rows, ordered by `ordinal`. `applied_by` maps to the row `origin`
+    /// (`baseline` when it was baselined, else `apply` — covering NULL/legacy rows via the default).
     async fn read_applied(
         &self,
         owner: &Arc<dyn boatramp_core::sql::SqlBackend>,
-    ) -> Result<Vec<boatramp_core::sql::AppliedMigration>, SqlError> {
-        use boatramp_core::sql::{AppliedMigration, SqlValue};
+    ) -> Result<Vec<AppliedMigration>, SqlError> {
+        use boatramp_core::sql::SqlValue;
         let rows = owner
             .run_query(&format!(
-                "SELECT id, ordinal, content_hash, kind, applied_at::text \
+                "SELECT id, ordinal, content_hash, kind, applied_at::text, applied_by \
                  FROM {ledger} ORDER BY ordinal;",
                 ledger = Self::ledger()
             ))
@@ -984,212 +1063,198 @@ impl NodeMigrationRunner {
         Ok(rows
             .rows
             .iter()
-            .map(|r| AppliedMigration {
-                id: r.first().map(&text).unwrap_or_default(),
-                ordinal: r.get(1).map(&int).unwrap_or_default(),
-                content_hash: r.get(2).map(&text).unwrap_or_default(),
-                kind: r.get(3).map(&text).unwrap_or_default(),
-                applied_at: r.get(4).map(&text).unwrap_or_default(),
+            .map(|r| {
+                let origin = match r.get(5) {
+                    Some(SqlValue::Text(s)) if s == LedgerOrigin::Baseline.as_str() => {
+                        LedgerOrigin::Baseline.as_str().to_string()
+                    }
+                    _ => LedgerOrigin::Apply.as_str().to_string(),
+                };
+                AppliedMigration {
+                    id: r.first().map(&text).unwrap_or_default(),
+                    ordinal: r.get(1).map(&int).unwrap_or_default(),
+                    content_hash: r.get(2).map(&text).unwrap_or_default(),
+                    kind: r.get(3).map(&text).unwrap_or_default(),
+                    applied_at: r.get(4).map(&text).unwrap_or_default(),
+                    origin,
+                }
             })
             .collect())
     }
 }
 
 #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
-#[async_trait]
-impl boatramp_core::sql::MigrationRunner for NodeMigrationRunner {
-    async fn apply(
+impl NodeMigrationRunner {
+    /// Engine gate: Postgres only in this release (the owner-role/RLS model + transactional DDL are
+    /// Postgres semantics; MySQL Shared has no owner/runtime split). Fail closed + clear.
+    fn engine_gate(&self, db: &str) -> Result<(), MigrationError> {
+        match self.op.engine_kind(db) {
+            Some(ExternalSqlKind::Postgres) => Ok(()),
+            Some(_) => Err(MigrationError::Other(format!(
+                "database {db:?}: schema migrations are supported on Postgres only in this release"
+            ))),
+            None => Err(MigrationError::NotConfigured),
+        }
+    }
+
+    /// Connect as the OWNER role (never the superuser). A managed DB still starting surfaces as
+    /// `Unavailable` → a retryable 503 at the API, not a permanent failure.
+    async fn connect_owner(
         &self,
         project: &str,
         db: &str,
-        steps: &[MigrationStep],
-        dry_run: bool,
-    ) -> Result<MigrationReport, MigrationError> {
-        use boatramp_core::sql::{MigrationAction, MigrationFailure};
-
-        // Engine gate: Postgres only in this release (the owner-role/RLS model + transactional DDL
-        // are Postgres semantics; MySQL Shared has no owner/runtime split). Fail closed + clear.
-        match self.op.engine_kind(db) {
-            Some(ExternalSqlKind::Postgres) => {}
-            Some(_) => {
-                return Err(MigrationError::Other(format!(
-                "database {db:?}: schema migrations are supported on Postgres only in this release"
-            )))
-            }
-            None => return Err(MigrationError::NotConfigured),
-        }
-
-        // Connect as the OWNER role (never the superuser). A managed DB still starting surfaces as
-        // Unavailable → a retryable 503 at the API, not a permanent failure.
-        let owner = self
-            .op
+    ) -> Result<Arc<dyn boatramp_core::sql::SqlBackend>, MigrationError> {
+        self.op
             .owner_backend_for(project, db)
             .await
             .map_err(|e| match e {
                 SqlError::Unavailable(m) => MigrationError::Unavailable(m),
                 other => MigrationError::Sql(other),
-            })?;
+            })
+    }
+}
+
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+#[async_trait]
+impl MigrationSubstrate for NodeMigrationRunner {
+    async fn preflight(
+        &self,
+        project: &str,
+        db: &str,
+    ) -> Result<Vec<AppliedMigration>, MigrationError> {
+        self.engine_gate(db)?;
+        let owner = self.connect_owner(project, db).await?;
         self.ensure_ledger(&owner).await?;
-        let applied = self.read_applied(&owner).await?;
+        Ok(self.read_applied(&owner).await?)
+    }
 
-        // Prefix-consistency + content-hash immutability: the recorded ids must be an ordered
-        // prefix of the requested steps, same id@ordinal@hash. A divergence (reordered/dropped) or a
-        // changed applied body is refused fail-closed — never a silent re-apply or reordering.
-        if applied.len() > steps.len() {
-            return Err(MigrationError::PrefixDivergence(format!(
-                "the ledger has {} applied migrations but only {} were supplied",
-                applied.len(),
-                steps.len()
-            )));
+    async fn apply_substrate_step(
+        &self,
+        project: &str,
+        db: &str,
+        step: &MigrationStep,
+        ordinal: usize,
+        effective_hash: &str,
+    ) -> Result<SubstrateStepOutcome, MigrationError> {
+        use boatramp_core::sql::MigrationAction;
+
+        // Defensive: the orchestrator already validated ids, but this layer builds the ledger SQL, so
+        // re-check (a bad id is a per-step failure, not an infra error).
+        if !valid_migration_id(&step.id) {
+            return Ok(SubstrateStepOutcome::Failed(
+                "invalid migration id (allowed: A-Za-z0-9._-)".to_string(),
+            ));
         }
-        for (i, rec) in applied.iter().enumerate() {
-            if steps[i].id != rec.id {
-                return Err(MigrationError::PrefixDivergence(format!(
-                    "position {i}: ledger has {:?} but the set has {:?}",
-                    rec.id, steps[i].id
-                )));
+        let owner = self.connect_owner(project, db).await?;
+        let ledger_insert = Self::ledger_insert(step, ordinal, effective_hash, LedgerOrigin::Apply);
+        let outcome: Result<(), String> = match &step.action {
+            MigrationAction::Sql {
+                script,
+                no_transaction,
+            } => {
+                if mentions_create_extension(script) {
+                    Err("a sql step may not CREATE EXTENSION — use an extension step".to_string())
+                } else if mentions_ledger_schema(script) {
+                    Err(
+                        "a sql step may not reference the host-owned migration-ledger schema"
+                            .to_string(),
+                    )
+                } else if !*no_transaction && mentions_txn_control(script) {
+                    Err("a transactional sql step may not contain its own \
+                         BEGIN/COMMIT/ROLLBACK (it would desync the atomic wrapper) — use a \
+                         no_transaction step to manage the transaction yourself"
+                        .to_string())
+                } else if *no_transaction {
+                    // Non-transactional DDL: run the script, then record the ledger row.
+                    match owner.run_script(script).await {
+                        Ok(()) => owner
+                            .run_script(&ledger_insert)
+                            .await
+                            .map_err(|e| e.to_string()),
+                        Err(e) => Err(e.to_string()),
+                    }
+                } else {
+                    // Atomic: DDL + ledger insert commit together (or roll back together). A trailing
+                    // `;` after the script guards a script that omits its own final semicolon (else it
+                    // would merge with the ledger INSERT into one invalid statement); a doubled `;;`
+                    // is just an empty statement, harmless.
+                    let batch = format!("BEGIN;\n{script};\n{ledger_insert}\nCOMMIT;");
+                    owner.run_script(&batch).await.map_err(|e| e.to_string())
+                }
             }
-            if steps[i].content_hash() != rec.content_hash {
-                return Err(MigrationError::ContentChanged(rec.id.clone()));
-            }
-        }
-
-        let already_applied: Vec<String> = applied.iter().map(|a| a.id.clone()).collect();
-        let pending: Vec<&MigrationStep> = steps[applied.len()..].iter().collect();
-
-        if dry_run {
-            return Ok(MigrationReport {
-                newly_applied: Vec::new(),
-                already_applied,
-                pending: pending.iter().map(|s| s.id.clone()).collect(),
-                failed: None,
-            });
-        }
-
-        let mut newly_applied = Vec::new();
-        for (offset, step) in pending.iter().enumerate() {
-            let ordinal = applied.len() + offset;
-            // Per-step validation → a per-step failure (report.failed), not a whole-request error.
-            if !valid_migration_id(&step.id) {
-                return Ok(MigrationReport {
-                    newly_applied,
-                    already_applied,
-                    pending: Vec::new(),
-                    failed: Some(MigrationFailure {
-                        id: step.id.clone(),
-                        error: "invalid migration id (allowed: A-Za-z0-9._-)".to_string(),
-                    }),
-                });
-            }
-            let outcome: Result<(), String> = match &step.action {
-                MigrationAction::Sql {
-                    script,
-                    no_transaction,
-                } => {
-                    if mentions_create_extension(script) {
-                        Err(
-                            "a sql step may not CREATE EXTENSION — use an extension step"
-                                .to_string(),
-                        )
-                    } else if !*no_transaction && mentions_txn_control(script) {
-                        Err("a transactional sql step may not contain its own \
-                             BEGIN/COMMIT/ROLLBACK (it would desync the atomic wrapper) — use a \
-                             no_transaction step to manage the transaction yourself"
-                            .to_string())
-                    } else if *no_transaction {
-                        // Non-transactional DDL: run the script, then record the ledger row.
-                        match owner.run_script(script).await {
+            MigrationAction::Extension { name } => {
+                if !self.trusted_extensions.contains(name) {
+                    Err(format!(
+                        "extension {name:?} is not on the operator trusted-extension allowlist"
+                    ))
+                } else {
+                    use boatramp_storage::tenant_provision::quote_ident;
+                    // Host-templated + allowlist-bounded; run via the superuser so an allowlisted
+                    // superuser-only extension also works. IF NOT EXISTS keeps it idempotent, so a
+                    // crash before the ledger insert re-runs harmlessly.
+                    let create = format!(
+                        "CREATE EXTENSION IF NOT EXISTS {};",
+                        quote_ident(ExternalSqlKind::Postgres, name)
+                    );
+                    match self.op.backend_for(project, db).await {
+                        Ok(su) => match su.run_script(&create).await {
                             Ok(()) => owner
-                                .run_script(&Self::ledger_insert(step, ordinal))
+                                .run_script(&ledger_insert)
                                 .await
                                 .map_err(|e| e.to_string()),
                             Err(e) => Err(e.to_string()),
-                        }
-                    } else {
-                        // Atomic: DDL + ledger insert commit together (or roll back together). A
-                        // trailing `;` after the script guards a script that omits its own final
-                        // semicolon (else it would merge with the ledger INSERT into one invalid
-                        // statement); a doubled `;;` is just an empty statement, harmless.
-                        let batch = format!(
-                            "BEGIN;\n{script};\n{insert}\nCOMMIT;",
-                            insert = Self::ledger_insert(step, ordinal)
-                        );
-                        owner.run_script(&batch).await.map_err(|e| e.to_string())
+                        },
+                        Err(e) => Err(e.to_string()),
                     }
-                }
-                MigrationAction::Extension { name } => {
-                    if !self.trusted_extensions.contains(name) {
-                        Err(format!(
-                            "extension {name:?} is not on the operator trusted-extension allowlist"
-                        ))
-                    } else {
-                        use boatramp_storage::tenant_provision::quote_ident;
-                        // Host-templated + allowlist-bounded; run via the superuser so an allowlisted
-                        // superuser-only extension also works. IF NOT EXISTS keeps it idempotent, so a
-                        // crash before the ledger insert re-runs harmlessly.
-                        let create = format!(
-                            "CREATE EXTENSION IF NOT EXISTS {};",
-                            quote_ident(ExternalSqlKind::Postgres, name)
-                        );
-                        match self.op.backend_for(project, db).await {
-                            Ok(su) => match su.run_script(&create).await {
-                                Ok(()) => owner
-                                    .run_script(&Self::ledger_insert(step, ordinal))
-                                    .await
-                                    .map_err(|e| e.to_string()),
-                                Err(e) => Err(e.to_string()),
-                            },
-                            Err(e) => Err(e.to_string()),
-                        }
-                    }
-                }
-            };
-            match outcome {
-                Ok(()) => newly_applied.push(step.id.clone()),
-                Err(error) => {
-                    return Ok(MigrationReport {
-                        newly_applied,
-                        already_applied,
-                        pending: Vec::new(),
-                        failed: Some(MigrationFailure {
-                            id: step.id.clone(),
-                            error: sanitize_migration_error(&error),
-                        }),
-                    })
                 }
             }
-        }
-
-        Ok(MigrationReport {
-            newly_applied,
-            already_applied,
-            pending: Vec::new(),
-            failed: None,
+            // A `function` step is invoked by the server-side orchestrator (it needs the invoke
+            // kernel) and recorded via `record` — it must never reach the substrate executor.
+            MigrationAction::Function { .. } => {
+                return Err(MigrationError::Other(
+                    "internal: a function step must be invoked by the orchestrator, not the \
+                     substrate"
+                        .to_string(),
+                ))
+            }
+        };
+        Ok(match outcome {
+            Ok(()) => SubstrateStepOutcome::Applied,
+            Err(error) => SubstrateStepOutcome::Failed(sanitize_migration_error(&error)),
         })
     }
 
-    async fn status(&self, project: &str, db: &str) -> Result<MigrationStatus, MigrationError> {
-        match self.op.engine_kind(db) {
-            Some(ExternalSqlKind::Postgres) => {}
-            Some(_) => {
-                return Err(MigrationError::Other(format!(
-                "database {db:?}: schema migrations are supported on Postgres only in this release"
-            )))
-            }
-            None => return Err(MigrationError::NotConfigured),
+    async fn record(
+        &self,
+        project: &str,
+        db: &str,
+        step: &MigrationStep,
+        ordinal: usize,
+        effective_hash: &str,
+        origin: LedgerOrigin,
+    ) -> Result<(), MigrationError> {
+        if !valid_migration_id(&step.id) {
+            return Err(MigrationError::Other(format!(
+                "invalid migration id {:?} (allowed: A-Za-z0-9._-)",
+                step.id
+            )));
         }
-        let owner = self
-            .op
-            .owner_backend_for(project, db)
-            .await
-            .map_err(|e| match e {
-                SqlError::Unavailable(m) => MigrationError::Unavailable(m),
-                other => MigrationError::Sql(other),
-            })?;
+        let owner = self.connect_owner(project, db).await?;
         self.ensure_ledger(&owner).await?;
-        Ok(MigrationStatus {
-            applied: self.read_applied(&owner).await?,
-        })
+        owner
+            .run_script(&Self::ledger_insert(step, ordinal, effective_hash, origin))
+            .await?;
+        Ok(())
+    }
+
+    async fn owner_ddl(
+        &self,
+        project: &str,
+        db: &str,
+    ) -> Result<Arc<dyn MigrateDdl>, MigrationError> {
+        self.engine_gate(db)?;
+        let owner = self.connect_owner(project, db).await?;
+        Ok(Arc::new(OwnerDdl { owner }))
     }
 }
 

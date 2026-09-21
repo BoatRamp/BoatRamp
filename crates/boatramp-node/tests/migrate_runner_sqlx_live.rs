@@ -1,28 +1,37 @@
-//! **Live gate: the schema-migration runner on a real Postgres.**
+//! **Live gate: the schema-migration SUBSTRATE on a real Postgres.**
 //!
-//! Drives [`NodeMigrationRunner`] end to end against a real Postgres (via a bring-your-own-URL
-//! managed binding, so no compute/resolver stack is needed) and proves the ledger contract:
+//! Drives the node-side [`MigrationSubstrate`] (the `NodeMigrationRunner`) end to end against a real
+//! Postgres (via a bring-your-own-URL managed binding, so no compute/resolver stack is needed) and
+//! proves the substrate contract the server-side orchestrator relies on:
 //!
-//! - **dry-run** reports the pending ids without applying;
-//! - **apply** applies the pending suffix in order and records the ledger; a **re-apply** is an
-//!   idempotent no-op (already-applied);
+//! - **preflight** ensures the ledger and returns the applied rows in order;
+//! - **apply_substrate_step** applies a `sql`/`extension` step + records its ledger row (with the
+//!   supplied effective hash + `apply` origin), atomically for a transactional step;
 //! - **atomic per step** — a step whose (multi-statement) script errors mid-way leaves NO schema
-//!   change AND NO ledger row (the whole `BEGIN … COMMIT` rolled back); a re-apply then retries;
-//! - **content-hash immutability** — re-submitting an applied id with a changed body is refused;
-//! - **prefix-divergence** — a reordered set is refused fail-closed;
+//!   change AND NO ledger row (the whole `BEGIN … COMMIT` rolled back);
 //! - **extension allowlist** — an allowlisted `Extension` step applies; a non-allowlisted one and a
-//!   raw `sql` step that `CREATE EXTENSION`s are refused (per-step failures).
+//!   raw `sql` step that `CREATE EXTENSION`s are per-step failures;
+//! - **transaction-control refusal** — a transactional `sql` step carrying its own BEGIN/COMMIT is
+//!   refused (it would desync the atomic wrapper);
+//! - **owner-DDL guards (S3/S4)** — the `migrate-ddl` seam refuses a ledger-schema reference and
+//!   guest transaction control, and runs plain owner DDL + a verification query;
+//! - **baseline origin (U6)** — a `record(…, Baseline)` row reads back with `origin = "baseline"`.
 //!
-//! Requires `BOATRAMP_TEST_PG_URL` (skips when unset). Prints `MIGRATE RUNNER LEDGER OK [postgres]`.
+//! The server-side orchestrator adds the prefix-consistency / content-hash / function-step /
+//! context-gate / RLS-invariant / bundle gates on top (see the server live gates). Requires
+//! `BOATRAMP_TEST_PG_URL` (skips when unset). Prints `MIGRATE RUNNER LEDGER OK [postgres]`.
 
-#![cfg(feature = "sql-postgres")]
+#![cfg(all(feature = "sql-postgres", feature = "migrate"))]
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use boatramp_core::deploy::DeployStore;
 use boatramp_core::kv::MemoryKv;
-use boatramp_core::sql::{MigrationAction, MigrationRunner, MigrationStep};
+use boatramp_core::sql::{
+    LedgerOrigin, MigrateDdlError, MigrationAction, MigrationStep, MigrationSubstrate,
+    SubstrateStepOutcome,
+};
 use boatramp_node::config::{ExternalDatabaseConfig, TenantIsolation, TenantScope};
 use boatramp_node::managed_sql::{NodeMigrationRunner, NodeOperatorSql};
 use boatramp_storage::FsStorage;
@@ -85,15 +94,30 @@ fn runner_for() -> Option<NodeMigrationRunner> {
     Some(NodeMigrationRunner::new(op, allow))
 }
 
+/// Apply a `sql`/`extension` step at `ordinal`, recording the intrinsic content hash (the effective
+/// hash for these kinds) with the `apply` origin — the exact call the orchestrator makes.
+async fn apply(
+    sub: &NodeMigrationRunner,
+    step: &MigrationStep,
+    ordinal: usize,
+) -> SubstrateStepOutcome {
+    let eff = step.content_hash();
+    sub.apply_substrate_step("default", DB, step, ordinal, &eff)
+        .await
+        .expect("substrate step (infra)")
+}
+
+fn applied_ids(applied: &[boatramp_core::sql::AppliedMigration]) -> Vec<String> {
+    applied.iter().map(|a| a.id.clone()).collect()
+}
+
 #[tokio::test]
-async fn migrate_runner_ledger_and_atomicity_on_a_real_engine() {
-    let Some(runner) = runner_for() else {
-        eprintln!("skip migrate_runner: BOATRAMP_TEST_PG_URL unset");
+async fn migrate_substrate_ledger_atomicity_and_owner_ddl_on_a_real_engine() {
+    let Some(sub) = runner_for() else {
+        eprintln!("skip migrate_substrate: BOATRAMP_TEST_PG_URL unset");
         return;
     };
-    // Clean slate (re-runnable): drop the ledger schema + test tables via a DIRECT connection, so
-    // the runner starts against a truly empty ledger (cleaning up through the runner would record
-    // the cleanup steps and pollute it).
+    // Clean slate (re-runnable): drop the ledger schema + test tables via a DIRECT connection.
     {
         use boatramp_storage::sql_sqlx::{connect, ExternalSqlKind, ExternalSqlOptions};
         let url = std::env::var("BOATRAMP_TEST_PG_URL").unwrap();
@@ -102,177 +126,180 @@ async fn migrate_runner_ledger_and_atomicity_on_a_real_engine() {
             "DROP SCHEMA IF EXISTS boatramp_migrations CASCADE",
             "DROP TABLE IF EXISTS widget",
             "DROP TABLE IF EXISTS gadget",
+            "DROP TABLE IF EXISTS baselined",
         ] {
             let _ = c.run_script(stmt).await;
         }
     }
 
-    // --- dry-run: reports pending, applies nothing ---
-    let set = vec![
-        sql_step(
-            "0001_widget",
-            "CREATE TABLE widget (id int primary key, name text)",
-        ),
-        sql_step("0002_seed", "INSERT INTO widget (id, name) VALUES (1, 'a')"),
-    ];
-    let plan = runner.apply("default", DB, &set, true).await.unwrap();
-    assert_eq!(plan.pending, vec!["0001_widget", "0002_seed"]);
-    assert!(plan.newly_applied.is_empty(), "dry-run applies nothing");
+    // --- preflight on an empty ledger returns nothing ---
+    let applied = sub.preflight("default", DB).await.unwrap();
+    assert!(applied.is_empty(), "empty ledger");
 
-    // --- apply: both applied, in order ---
-    let rep = runner.apply("default", DB, &set, false).await.unwrap();
-    assert_eq!(rep.newly_applied, vec!["0001_widget", "0002_seed"]);
-    assert!(rep.failed.is_none());
-
-    // --- re-apply: idempotent no-op ---
-    let rep2 = runner.apply("default", DB, &set, false).await.unwrap();
-    assert!(
-        rep2.newly_applied.is_empty(),
-        "re-apply applies nothing new"
+    // --- apply two sql steps in order; the ledger records them with origin=apply ---
+    let s1 = sql_step(
+        "0001_widget",
+        "CREATE TABLE widget (id int primary key, name text)",
     );
-    assert_eq!(rep2.already_applied, vec!["0001_widget", "0002_seed"]);
-
-    // --- status reflects the ledger ---
-    let st = runner.status("default", DB).await.unwrap();
+    let s2 = sql_step("0002_seed", "INSERT INTO widget (id, name) VALUES (1, 'a')");
+    assert!(matches!(
+        apply(&sub, &s1, 0).await,
+        SubstrateStepOutcome::Applied
+    ));
+    assert!(matches!(
+        apply(&sub, &s2, 1).await,
+        SubstrateStepOutcome::Applied
+    ));
+    let applied = sub.preflight("default", DB).await.unwrap();
+    assert_eq!(applied_ids(&applied), vec!["0001_widget", "0002_seed"]);
+    assert!(
+        applied.iter().all(|a| a.origin == "apply"),
+        "applied rows carry origin=apply"
+    );
     assert_eq!(
-        st.applied.iter().map(|a| a.id.clone()).collect::<Vec<_>>(),
-        vec!["0001_widget", "0002_seed"]
-    );
-
-    // --- content-hash immutability: same id, changed body → refused (checked while exactly the
-    //     2-step prefix is applied, so this is a content mismatch, not a length divergence) ---
-    let tampered = [
-        set[0].clone(),
-        sql_step(
-            "0002_seed",
-            "INSERT INTO widget (id, name) VALUES (2, 'CHANGED')",
-        ),
-    ];
-    let err = runner
-        .apply("default", DB, &tampered, false)
-        .await
-        .unwrap_err();
-    assert!(
-        matches!(err, boatramp_core::sql::MigrationError::ContentChanged(_)),
-        "a changed applied migration body is refused, got {err:?}"
-    );
-
-    // --- prefix-divergence: reordered applied prefix → refused ---
-    let reordered = [set[1].clone(), set[0].clone()];
-    let err2 = runner
-        .apply("default", DB, &reordered, false)
-        .await
-        .unwrap_err();
-    assert!(
-        matches!(
-            err2,
-            boatramp_core::sql::MigrationError::PrefixDivergence(_)
-        ),
-        "a reordered set is refused, got {err2:?}"
+        applied[0].content_hash,
+        s1.content_hash(),
+        "the recorded hash is the effective hash the orchestrator supplied"
     );
 
     // --- atomic per-step: a step whose 2nd statement errors leaves NO table + NO ledger row ---
-    let bad = [
-        set[0].clone(),
-        set[1].clone(),
-        sql_step(
-            "0003_atomic",
-            "CREATE TABLE gadget (id int primary key); INSERT INTO gadget (id) VALUES ('not-an-int')",
-        ),
-    ];
-    let rep3 = runner.apply("default", DB, &bad, false).await.unwrap();
-    assert_eq!(
-        rep3.failed.as_ref().map(|f| f.id.as_str()),
-        Some("0003_atomic"),
-        "the failing step is reported"
+    let bad = sql_step(
+        "0003_atomic",
+        "CREATE TABLE gadget (id int primary key); INSERT INTO gadget (id) VALUES ('not-an-int')",
     );
-    // The gadget table must NOT exist (the CREATE rolled back with the failing INSERT), and 0003 is
-    // NOT in the ledger — proven by a dry-run showing it still pending + a status without it.
-    let after = runner.status("default", DB).await.unwrap();
     assert!(
-        !after.applied.iter().any(|a| a.id == "0003_atomic"),
+        matches!(apply(&sub, &bad, 2).await, SubstrateStepOutcome::Failed(_)),
+        "a mid-script error is a per-step failure"
+    );
+    let after = sub.preflight("default", DB).await.unwrap();
+    assert!(
+        !after.iter().any(|a| a.id == "0003_atomic"),
         "a rolled-back step must not be recorded"
     );
-    // gadget must be gone → recreating it in a fresh step must succeed (would fail if it lingered).
-    let fix = [
-        set[0].clone(),
-        set[1].clone(),
-        sql_step("0003_atomic", "CREATE TABLE gadget (id int primary key)"),
-    ];
-    let rep_fix = runner.apply("default", DB, &fix, false).await.unwrap();
-    assert_eq!(
-        rep_fix.newly_applied,
-        vec!["0003_atomic"],
+    // gadget must be gone → a clean recreate succeeds (would fail if it lingered).
+    let fix = sql_step("0003_atomic", "CREATE TABLE gadget (id int primary key)");
+    assert!(
+        matches!(apply(&sub, &fix, 2).await, SubstrateStepOutcome::Applied),
         "retry after rollback applies cleanly"
     );
 
-    // --- extension allowlist: allowlisted applies; non-allowlisted + raw CREATE EXTENSION refused ---
-    let with_ext = [
-        set[0].clone(),
-        set[1].clone(),
-        sql_step("0003_atomic", "CREATE TABLE gadget (id int primary key)"),
-        ext_step("0004_citext", "citext"),
-    ];
-    let rep_ext = runner.apply("default", DB, &with_ext, false).await.unwrap();
-    assert_eq!(
-        rep_ext.newly_applied,
-        vec!["0004_citext"],
-        "allowlisted extension applies"
+    // --- extension allowlist: allowlisted applies; non-allowlisted refused ---
+    assert!(matches!(
+        apply(&sub, &ext_step("0004_citext", "citext"), 3).await,
+        SubstrateStepOutcome::Applied
+    ));
+    assert!(
+        matches!(
+            apply(&sub, &ext_step("0005_dblink", "dblink"), 4).await,
+            SubstrateStepOutcome::Failed(_)
+        ),
+        "a non-allowlisted extension is a per-step failure"
     );
 
-    let bad_ext = [
-        set[0].clone(),
-        set[1].clone(),
-        sql_step("0003_atomic", "CREATE TABLE gadget (id int primary key)"),
-        ext_step("0004_citext", "citext"),
-        ext_step("0005_dblink", "dblink"),
-    ];
-    let rep_bad = runner.apply("default", DB, &bad_ext, false).await.unwrap();
-    assert_eq!(
-        rep_bad.failed.as_ref().map(|f| f.id.as_str()),
-        Some("0005_dblink"),
-        "a non-allowlisted extension is refused (per-step failure)"
-    );
-
-    let raw_ext = [
-        set[0].clone(),
-        set[1].clone(),
-        sql_step("0003_atomic", "CREATE TABLE gadget (id int primary key)"),
-        ext_step("0004_citext", "citext"),
-        sql_step("0005_raw", "CREATE EXTENSION IF NOT EXISTS pgcrypto"),
-    ];
-    let rep_raw = runner.apply("default", DB, &raw_ext, false).await.unwrap();
-    assert_eq!(
-        rep_raw.failed.as_ref().map(|f| f.id.as_str()),
-        Some("0005_raw"),
-        "a raw sql step that CREATE EXTENSIONs is refused (per-step failure)"
-    );
-
-    // --- a transactional sql step carrying its own BEGIN/COMMIT is refused (would desync the
-    //     atomic wrapper) — a per-step failure, not applied. ---
-    let txn_ctrl = [
-        set[0].clone(),
-        set[1].clone(),
-        sql_step("0003_atomic", "CREATE TABLE gadget (id int primary key)"),
-        ext_step("0004_citext", "citext"),
-        sql_step("0006_txn", "BEGIN; CREATE TABLE sneaky (x int); COMMIT;"),
-    ];
-    let rep_txn = runner.apply("default", DB, &txn_ctrl, false).await.unwrap();
-    assert_eq!(
-        rep_txn.failed.as_ref().map(|f| f.id.as_str()),
-        Some("0006_txn"),
-        "a transactional step with its own BEGIN/COMMIT is refused"
-    );
-
-    // Final cleanup.
-    let _ = runner
-        .apply(
-            "default",
-            DB,
-            &[sql_step("z", "DROP SCHEMA IF EXISTS boatramp_migrations CASCADE; DROP TABLE IF EXISTS widget; DROP TABLE IF EXISTS gadget;")],
-            false,
+    // --- raw CREATE EXTENSION in a sql step is refused ---
+    assert!(matches!(
+        apply(
+            &sub,
+            &sql_step("0005_raw", "CREATE EXTENSION IF NOT EXISTS pgcrypto"),
+            4
         )
-        .await;
+        .await,
+        SubstrateStepOutcome::Failed(_)
+    ));
+
+    // --- a transactional sql step carrying its own BEGIN/COMMIT is refused ---
+    assert!(matches!(
+        apply(
+            &sub,
+            &sql_step("0006_txn", "BEGIN; CREATE TABLE sneaky (x int); COMMIT;"),
+            4
+        )
+        .await,
+        SubstrateStepOutcome::Failed(_)
+    ));
+
+    // --- owner-DDL seam (the migrate-ddl backing): guards + a real DDL + a verification query ---
+    let ddl = sub.owner_ddl("default", DB).await.unwrap();
+    // S3: a ledger-schema reference is refused.
+    assert!(matches!(
+        ddl.exec("SELECT * FROM boatramp_migrations.schema_migrations")
+            .await
+            .unwrap_err(),
+        MigrateDdlError::LedgerProtected
+    ));
+    // S4: guest transaction control is refused.
+    assert!(matches!(
+        ddl.exec("BEGIN; CREATE TABLE x(i int); COMMIT")
+            .await
+            .unwrap_err(),
+        MigrateDdlError::TxnControl
+    ));
+    // A plain owner DDL runs (auto-commit), and a verification query reads it back as owner.
+    ddl.exec("CREATE TABLE IF NOT EXISTS owner_made (n int)")
+        .await
+        .unwrap();
+    ddl.exec("INSERT INTO owner_made (n) VALUES (7)")
+        .await
+        .unwrap();
+    let rows = ddl
+        .query("SELECT n FROM owner_made ORDER BY n")
+        .await
+        .unwrap();
+    assert_eq!(rows.rows.len(), 1, "the owner sees the row it just wrote");
+    let _ = ddl.exec("DROP TABLE owner_made").await;
+
+    // --- baseline origin (U6): record without running reads back origin=baseline ---
+    let baselined = sql_step("0007_baselined", "CREATE TABLE baselined (id int)");
+    sub.record(
+        "default",
+        DB,
+        &baselined,
+        4,
+        &baselined.content_hash(),
+        LedgerOrigin::Baseline,
+    )
+    .await
+    .unwrap();
+    let after = sub.preflight("default", DB).await.unwrap();
+    let row = after
+        .iter()
+        .find(|a| a.id == "0007_baselined")
+        .expect("baselined row present");
+    assert_eq!(row.origin, "baseline", "a baselined row is marked as such");
+    // ...and the table was NOT created (record runs nothing).
+    {
+        use boatramp_storage::sql_sqlx::{connect, ExternalSqlKind, ExternalSqlOptions};
+        let url = std::env::var("BOATRAMP_TEST_PG_URL").unwrap();
+        let c = connect(ExternalSqlKind::Postgres, &ExternalSqlOptions::new(url)).unwrap();
+        let exists = c
+            .run_query("SELECT to_regclass('public.baselined') IS NOT NULL AS e")
+            .await
+            .unwrap();
+        // to_regclass returns NULL (→ false) when the table was never created.
+        assert!(
+            matches!(
+                exists.rows.first().and_then(|r| r.first()),
+                Some(boatramp_core::sql::SqlValue::Boolean(false))
+                    | Some(boatramp_core::sql::SqlValue::Null)
+            ),
+            "baseline records without running the step"
+        );
+    }
+
+    // Final cleanup (direct connection so it isn't ledgered).
+    {
+        use boatramp_storage::sql_sqlx::{connect, ExternalSqlKind, ExternalSqlOptions};
+        let url = std::env::var("BOATRAMP_TEST_PG_URL").unwrap();
+        let c = connect(ExternalSqlKind::Postgres, &ExternalSqlOptions::new(url)).unwrap();
+        for stmt in [
+            "DROP SCHEMA IF EXISTS boatramp_migrations CASCADE",
+            "DROP TABLE IF EXISTS widget",
+            "DROP TABLE IF EXISTS gadget",
+            "DROP TABLE IF EXISTS baselined",
+        ] {
+            let _ = c.run_script(stmt).await;
+        }
+    }
 
     println!("MIGRATE RUNNER LEDGER OK [postgres]");
 }

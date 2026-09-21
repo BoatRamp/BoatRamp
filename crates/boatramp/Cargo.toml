@@ -56,6 +56,7 @@ default = [
   "orm-subquery",
   "email",
   "admin",
+  "migrate",
   "capability",
   "session",
   "cluster",
@@ -180,6 +181,11 @@ email = ["handlers", "boatramp-node/email", "boatramp-server/email"]
 # Implies `handlers`; forwards to the node + server `admin` features. In the batteries-included
 # default; drop it for a build with no guest self-config.
 admin = ["handlers", "boatramp-node/admin", "boatramp-server/admin"]
+# Owner-gated schema-migration `function` steps (`boatramp:handlers/migrate-ddl`) — a migration
+# function runs owner-role DDL/DML/verification, attached only inside a Project·Admin migration run
+# (sql/extension steps work without it). Implies `handlers`; forwards to the node + server `migrate`
+# features. In the batteries-included default; drop it for a build with no function migration steps.
+migrate = ["handlers", "boatramp-node/migrate", "boatramp-server/migrate"]
 # The guest capability-minting capability (`boatramp:handlers/capability`, PLAN-delegable-capabilities)
 # — a guest mints a fleet-signed, own-project-only target capability (audience host-forced, TTL-clamped,
 # deny-by-default). Implies `handlers`; forwards to the node + server `capability` features. In the

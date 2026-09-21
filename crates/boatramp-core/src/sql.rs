@@ -815,7 +815,8 @@ impl LedgerOrigin {
     }
 }
 
-/// The outcome of a [`MigrationRunner::apply`].
+/// The outcome of a migration apply / dry-run / baseline (the server orchestrator over
+/// [`MigrationSubstrate`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MigrationReport {
     /// Ids applied by THIS call, in order.
@@ -850,7 +851,7 @@ pub struct MigrationStatus {
     pub applied: Vec<AppliedMigration>,
 }
 
-/// A failure from the [`MigrationRunner`].
+/// A failure from a migration apply/dry-run/baseline.
 #[derive(Debug, thiserror::Error)]
 pub enum MigrationError {
     /// The managed backend is still starting (transient — retry / `503`), mirrors

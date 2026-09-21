@@ -490,7 +490,7 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
     #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
     let operator_sql: Option<Arc<dyn boatramp_core::sql::OperatorSql>>;
     #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
-    let migration_runner: Option<Arc<dyn boatramp_core::sql::MigrationRunner>>;
+    let migration_substrate: Option<Arc<dyn boatramp_core::sql::MigrationSubstrate>>;
     #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
     match config
         .handlers
@@ -513,20 +513,20 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
                 .unwrap_or_default()
                 .into_iter()
                 .collect();
-            migration_runner = Some(Arc::new(crate::managed_sql::NodeMigrationRunner::new(
+            migration_substrate = Some(Arc::new(crate::managed_sql::NodeMigrationRunner::new(
                 node_op.clone(),
                 trusted,
             ))
-                as Arc<dyn boatramp_core::sql::MigrationRunner>);
+                as Arc<dyn boatramp_core::sql::MigrationSubstrate>);
             operator_sql = Some(node_op as Arc<dyn boatramp_core::sql::OperatorSql>);
         }
         None => {
             operator_sql = None;
-            migration_runner = None;
+            migration_substrate = None;
         }
     }
     #[cfg(not(any(feature = "sql-postgres", feature = "sql-mysql")))]
-    let migration_runner: Option<Arc<dyn boatramp_core::sql::MigrationRunner>> = None;
+    let migration_substrate: Option<Arc<dyn boatramp_core::sql::MigrationSubstrate>> = None;
     #[cfg(not(any(feature = "sql-postgres", feature = "sql-mysql")))]
     let operator_sql: Option<Arc<dyn boatramp_core::sql::OperatorSql>> = None;
 
@@ -639,7 +639,7 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
     // Wire the operator capabilities onto the options the router is built from.
     let mut options = options;
     options.operator_sql = operator_sql;
-    options.migration_runner = migration_runner;
+    options.migration_substrate = migration_substrate;
     options.tenant_deprovisioner = tenant_deprovisioner;
     options.compute_exec = compute_exec;
     options.compute_volumes = compute_volumes;

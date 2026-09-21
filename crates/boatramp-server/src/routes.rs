@@ -48,7 +48,7 @@ pub fn router_with_fast(
     // `Option<Arc>` clones; they ride as `api` extensions read by the admin handlers.
     // (`_cap` suffix so they don't shadow the `sql_exec`/`compute_exec` handler fns.)
     let operator_sql_cap = options.operator_sql.clone();
-    let migration_runner_cap = options.migration_runner.clone();
+    let migration_substrate_cap = options.migration_substrate.clone();
     let tenant_deprovisioner_cap = options.tenant_deprovisioner.clone();
     let compute_exec_cap = options.compute_exec.clone();
     let compute_volumes_cap = options.compute_volumes.clone();
@@ -319,6 +319,10 @@ pub fn router_with_fast(
         // for status — see `Right::required`.
         .route("/api/migrate/{db}/apply", post(migrate_apply))
         .route("/api/migrate/{db}/dry-run", post(migrate_dry_run))
+        // Baseline: record a prefix as already-applied WITHOUT running it (adopt a populated DB).
+        // `Project·Admin` (an owner assertion of applied-state), audited — matched by the `/apply`
+        // POST prefix in `Right::required`.
+        .route("/api/migrate/{db}/baseline", post(migrate_baseline))
         .route("/api/migrate/{db}/status", get(migrate_status));
     // OIDC → token exchange: validate the IdP JWT (presented as
     // the Bearer; `Right::required` returns None so the auth middleware lets it
@@ -530,7 +534,7 @@ pub fn router_with_fast(
         .layer(Extension(mesh_control))
         .layer(Extension(probe))
         .layer(Extension(operator_sql_cap))
-        .layer(Extension(migration_runner_cap))
+        .layer(Extension(migration_substrate_cap))
         .layer(Extension(tenant_deprovisioner_cap))
         .layer(Extension(compute_exec_cap))
         .layer(Extension(compute_volumes_cap))
