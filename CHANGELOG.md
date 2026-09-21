@@ -5,6 +5,34 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.4.26] - 2026-09-21
+
+A read-only, **tenant-scoped `messaging-stats` guest capability**: a granted wasm component reads
+the bus gauges boatramp already computes — per-topic dead-letter count, backlog, in-flight, and
+per-consumer-group depth/lag — for observability (the "is this flow backed up or dead-lettering?"
+view). Read-only; no claim/redrive/purge. Behind a Security-Engineer review to convergence + a
+CI-hard tenant-isolation gate.
+
+The security-sensitive part: per-topic counts are a cross-tenant activity oracle, so a guest may
+**not** read another tenant's topic. A component declares a tenant-templated bus topic
+(`bus:sync/{tenant}/import`); the guest names that template verbatim and the **host** substitutes
+this invocation's resolved tenant into `{tenant}` — the guest never supplies the tenant, so it is
+structurally unable to name another tenant's topic. The resolved tenant is validated to be a single
+clean segment (no `/`, empty, or `..`), so a slash-bearing tenant claim can't reshape the topic to a
+foreign tenant's. A plain (non-`bus:`) topic resolves under the component's own private namespace,
+exactly as a publish. Deny-by-default: an ungranted component has no binding.
+
+### Added
+
+- **`boatramp:handlers/messaging-stats`** — `get(topic) -> { dead_letter_count, backlog, in_flight }`
+  and `groups(topic) -> [{ group, in_flight, lag }]`, over the ALREADY-computed
+  `dead_letter_count`/`backlog`/`in_flight_count`/`list_groups` substrate gauges (no new bookkeeping).
+  Granted per component via a `messaging-stats` import + declared `stats_topics` templates; attached
+  to functions, request handlers, and consumers with the invocation's host-resolved tenant.
+- **Shim:** a `compat::messaging_stats` guest module (`boatramp-uchron-shim`, off-by-default
+  `messaging-stats` feature) — `messaging_stats::get` / `groups` — imported in the function + consumer
+  worlds.
+
 ## [0.4.25] - 2026-09-21
 
 An **owner-gated, in-app schema-migration surface** whose base primitive is **wasm
