@@ -1562,6 +1562,7 @@ async fn handler_route_dispatches_through_engine() {
             limits: None,
             env: BTreeMap::new(),
             invoke_targets: Vec::new(),
+            stats_topics: Vec::new(),
         }],
         ..Default::default()
     };
@@ -1682,6 +1683,7 @@ async fn cookie_auth_csrf_gate_fires_in_the_pipeline() {
             limits: None,
             env: BTreeMap::new(),
             invoke_targets: Vec::new(),
+            stats_topics: Vec::new(),
         }],
         ..Default::default()
     };
@@ -3259,6 +3261,7 @@ async fn activation_during_traffic_drops_no_requests() {
         limits: None,
         env: BTreeMap::new(),
         invoke_targets: Vec::new(),
+        stats_topics: Vec::new(),
     };
     // Two distinct deployments serving the same handler. B adds a (non-matching)
     // redirect so its manifest hashes differently — a real `current` flip.
@@ -3422,6 +3425,7 @@ async fn preview_runs_handlers_scoped_off_live_state() {
                 limits: None,
                 env: BTreeMap::new(),
                 invoke_targets: Vec::new(),
+                stats_topics: Vec::new(),
             }],
             ..Default::default()
         },
@@ -3547,6 +3551,7 @@ async fn activation_refuses_broken_component() {
                 limits: None,
                 env: BTreeMap::new(),
                 invoke_targets: Vec::new(),
+                stats_topics: Vec::new(),
             }],
             ..Default::default()
         },
@@ -3653,6 +3658,7 @@ async fn activation_refuses_a_non_consumer_component() {
                 token_claims: None,
                 backoff_ms: None,
                 retention_ms: None,
+                stats_topics: Vec::new(),
                 topic: "orders/created".to_string(),
                 component: "consumer.wasm".to_string(),
                 imports: Vec::new(),
@@ -3776,6 +3782,7 @@ async fn activation_refuses_disallowed_import() {
                 limits: None,
                 env: BTreeMap::new(),
                 invoke_targets: Vec::new(),
+                stats_topics: Vec::new(),
             }],
             ..Default::default()
         },
@@ -3878,6 +3885,7 @@ async fn activation_refuses_oversized_component() {
                 limits: None,
                 env: BTreeMap::new(),
                 invoke_targets: Vec::new(),
+                stats_topics: Vec::new(),
             }],
             ..Default::default()
         },
@@ -3983,6 +3991,7 @@ async fn handler_route_with_sql_dispatches_through_engine() {
                 limits: None,
                 env: BTreeMap::new(),
                 invoke_targets: Vec::new(),
+                stats_topics: Vec::new(),
             }],
             ..Default::default()
         },
@@ -4113,6 +4122,7 @@ async fn handler_opens_named_sql_databases_with_least_privilege() {
                 limits: None,
                 env: BTreeMap::new(),
                 invoke_targets: Vec::new(),
+                stats_topics: Vec::new(),
             }],
             ..Default::default()
         },
@@ -4239,6 +4249,7 @@ async fn per_site_timeout_cap_applies() {
                 limits: None,
                 env: BTreeMap::new(),
                 invoke_targets: Vec::new(),
+                stats_topics: Vec::new(),
             }],
             ..Default::default()
         },
@@ -4750,12 +4761,14 @@ async fn operator_endpoint_reports_invocation_and_consumer_stats() {
                 limits: None,
                 env: BTreeMap::new(),
                 invoke_targets: Vec::new(),
+                stats_topics: Vec::new(),
             }],
             consumers: vec![ConsumerConfig {
                 tenancy: None,
                 token_claims: None,
                 backoff_ms: None,
                 retention_ms: None,
+                stats_topics: Vec::new(),
                 topic: "orders/created".to_string(),
                 component: "consumer.wasm".to_string(),
                 imports: vec!["wasi:keyvalue".to_string()],
@@ -4900,6 +4913,7 @@ async fn guest_logs_captured_and_served() {
                 limits: None,
                 env: BTreeMap::new(),
                 invoke_targets: Vec::new(),
+                stats_topics: Vec::new(),
             }],
             ..Default::default()
         },
@@ -5033,6 +5047,7 @@ async fn guest_logs_suppressed_when_capture_disabled() {
                 limits: None,
                 env: BTreeMap::new(),
                 invoke_targets: Vec::new(),
+                stats_topics: Vec::new(),
             }],
             ..Default::default()
         },
@@ -5228,6 +5243,7 @@ async fn handler_env_injected_host_env_not_inherited() {
                 limits: None,
                 env: BTreeMap::from([("GREETING".to_string(), "hello".to_string())]),
                 invoke_targets: Vec::new(),
+                stats_topics: Vec::new(),
             }],
             ..Default::default()
         },
@@ -6728,6 +6744,7 @@ async fn mesh_dispatch(
                 limits: None,
                 env: BTreeMap::new(),
                 invoke_targets,
+                stats_topics: Vec::new(),
             }],
             ..Default::default()
         },
@@ -6911,6 +6928,7 @@ async fn federation_gateway_stitches_real_subgraph_functions() {
                 limits: None,
                 env: BTreeMap::new(),
                 invoke_targets: Vec::new(),
+                stats_topics: Vec::new(),
             }],
             ..Default::default()
         },
@@ -7049,6 +7067,7 @@ async fn federation_gateway_executes_a_mutation_forwarding_its_argument() {
                 limits: None,
                 env: BTreeMap::new(),
                 invoke_targets: Vec::new(),
+                stats_topics: Vec::new(),
             }],
             ..Default::default()
         },
@@ -7248,6 +7267,7 @@ async fn graphql_data_connector_serves_from_the_database_with_row_isolation() {
                 limits: None,
                 env: BTreeMap::new(),
                 invoke_targets: Vec::new(),
+                stats_topics: Vec::new(),
             }],
             ..Default::default()
         },
@@ -7491,6 +7511,7 @@ async fn graphql_data_connector_delegates_a_field_to_a_wasm_function() {
                 limits: None,
                 env: BTreeMap::new(),
                 invoke_targets: Vec::new(),
+                stats_topics: Vec::new(),
             }],
             ..Default::default()
         },
@@ -7637,6 +7658,7 @@ async fn graphql_data_connector_mutations_write_with_row_isolation() {
                 limits: None,
                 env: BTreeMap::new(),
                 invoke_targets: Vec::new(),
+                stats_topics: Vec::new(),
             }],
             ..Default::default()
         },
@@ -7852,6 +7874,7 @@ async fn federation_composes_a_sql_subgraph_with_a_wasm_subgraph() {
                 limits: None,
                 env: BTreeMap::new(),
                 invoke_targets: Vec::new(),
+                stats_topics: Vec::new(),
             }],
             ..Default::default()
         },
@@ -8002,6 +8025,7 @@ async fn registering_a_sql_subgraph_via_the_admin_api_composes_and_serves() {
                 limits: None,
                 env: BTreeMap::new(),
                 invoke_targets: Vec::new(),
+                stats_topics: Vec::new(),
             }],
             ..Default::default()
         },
@@ -8251,6 +8275,7 @@ async fn graphql_data_connector_isolates_by_a_verified_app_token_claim() {
                 limits: None,
                 env: BTreeMap::new(),
                 invoke_targets: Vec::new(),
+                stats_topics: Vec::new(),
             }],
             ..Default::default()
         },
@@ -8620,4 +8645,119 @@ async fn writing_to_a_nonexistent_project_is_rejected_not_ghosted() {
         .await
         .unwrap()
         .is_none());
+}
+
+/// DRAFT live-gate for the read-only `messaging-stats` capability, driven against the REAL
+/// `LogMessaging` substrate (Postgres not needed — messaging is KV/state-backed).
+///
+/// It seeds a genuine dead-letter on a tenant's bus topic (publish → claim past `max_attempts` with a
+/// zero lease, exactly how the substrate dead-letters), then drives the host `StatsBinding` a granted
+/// guest would hit:
+///   * the granted component reads its OWN resolved tenant's dead-letter count via the declared
+///     `bus:sync/{tenant}/import` template — the host fills `{tenant}` with the resolved tenant;
+///   * a bus topic naming a DIFFERENT (foreign) tenant, or one outside the declared template, is
+///     REFUSED (`not-declared`) — the guest can never name another tenant's bus topic;
+///   * an ungranted component (no binding) is `access-denied`.
+///
+/// NOTE (shim): a fully-compiled guest live-gate additionally needs the `messaging-stats` guest
+/// interface wrapped in `boatramp-uchron-shim` (a `compat` fn), tracked separately. This host-level
+/// gate exercises the real substrate + the real tenant-substitution security property end to end.
+#[cfg(feature = "handlers")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn messaging_stats_reads_own_tenant_dlq_and_refuses_others() {
+    use boatramp_core::messaging::{LogMessaging, Messaging};
+    use boatramp_handlers::{Bindings, StatsRefused};
+    use std::time::Duration;
+
+    let storage = Arc::new(MemStorage::default());
+    let kv = Arc::new(MemoryKv::new());
+    let log = Arc::new(LogMessaging::new(storage.clone(), kv.clone()));
+    let messaging: Arc<dyn Messaging> = log.clone();
+
+    // The resolved tenant this invocation is confined to (the same value the SQL scope injector would
+    // resolve from the principal). The declared bus template carries a `{tenant}` the host fills.
+    let tenant = "t-42";
+    // The concrete bus topic THIS tenant's stats template resolves to (`{project}/bus/` + filled name).
+    let own_bus_topic = "acme/bus/sync/t-42/import";
+    // A DIFFERENT tenant's topic — the oracle a guest must never be able to read.
+    let foreign_bus_topic = "acme/bus/sync/victim/import";
+
+    // Seed a real dead-letter on the OWN tenant's topic: publish one message, then claim it past
+    // `max_attempts = 1` with a zero lease so the next claim dead-letters it (the substrate's own
+    // dead-letter path — no synthetic bookkeeping).
+    messaging.publish(own_bus_topic, b"job-1").await.unwrap();
+    let _first = messaging
+        .claim(own_bus_topic, Duration::ZERO, 10, 1)
+        .await
+        .unwrap();
+    // Next claim: the message has hit max_attempts → dead-lettered.
+    let _second = messaging
+        .claim(own_bus_topic, Duration::ZERO, 10, 1)
+        .await
+        .unwrap();
+    assert_eq!(
+        messaging.dead_letter_count(own_bus_topic).await.unwrap(),
+        1,
+        "seeded a real dead-letter on the OWN tenant's bus topic"
+    );
+    // Also seed one on the FOREIGN tenant's topic, so a leak would be observable if the guard failed.
+    messaging.publish(foreign_bus_topic, b"secret").await.unwrap();
+    let _ = messaging.claim(foreign_bus_topic, Duration::ZERO, 10, 1).await.unwrap();
+    let _ = messaging.claim(foreign_bus_topic, Duration::ZERO, 10, 1).await.unwrap();
+    assert_eq!(messaging.dead_letter_count(foreign_bus_topic).await.unwrap(), 1);
+
+    // Build the granted binding exactly as the server's `build_bindings` does: the component-private
+    // prefix, the shared `{project}/bus/` prefix, the DECLARED template, and the host-resolved tenant.
+    let bindings = Bindings::new("import-worker").with_messaging_stats(
+        "acme/import-worker/",
+        "acme/bus/",
+        messaging.clone(),
+        vec!["sync/{tenant}/import".to_string()],
+        Some(tenant.to_string()),
+    );
+    let stats = bindings.messaging_stats().expect("granted");
+
+    // (1) The granted component reads its OWN resolved tenant's dead-letter count via the template —
+    // the host substituted `{tenant}` = `t-42`.
+    let own = stats
+        .read_topic_stats("bus:sync/{tenant}/import")
+        .await
+        .expect("own-tenant read allowed");
+    assert_eq!(own.dead_letter_count, 1, "read t-42's seeded DLQ via the host-filled template");
+    assert_eq!(own.in_flight, 0);
+
+    // (2a) Naming a DIFFERENT tenant's concrete topic (not the declared template) is REFUSED — the
+    // guest can never read another tenant's bus stats, even though a dead-letter exists there.
+    assert_eq!(
+        stats.read_topic_stats("bus:sync/victim/import").await.unwrap_err(),
+        StatsRefused::NotDeclared,
+        "a foreign-tenant bus topic is refused (no oracle)"
+    );
+    // (2b) A bus topic outside any declared template is refused.
+    assert_eq!(
+        stats.read_topic_stats("bus:some/other/topic").await.unwrap_err(),
+        StatsRefused::NotDeclared
+    );
+
+    // (3) An ungranted component (no messaging-stats binding) is access-denied at the WIT layer.
+    let ungranted = Bindings::new("import-worker");
+    assert!(ungranted.messaging_stats().is_none(), "no grant ⇒ no binding ⇒ access-denied");
+
+    // A component with NO resolved tenant cannot read a `{tenant}` template (fail-closed).
+    let anon = Bindings::new("import-worker").with_messaging_stats(
+        "acme/import-worker/",
+        "acme/bus/",
+        messaging.clone(),
+        vec!["sync/{tenant}/import".to_string()],
+        None,
+    );
+    assert_eq!(
+        anon.messaging_stats()
+            .unwrap()
+            .read_topic_stats("bus:sync/{tenant}/import")
+            .await
+            .unwrap_err(),
+        StatsRefused::NotDeclared,
+        "a {tenant} template with no resolved tenant is refused"
+    );
 }

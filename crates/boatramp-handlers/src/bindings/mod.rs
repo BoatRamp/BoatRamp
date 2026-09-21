@@ -34,6 +34,11 @@ pub mod invoke;
 pub mod keyvalue;
 #[cfg(feature = "messaging")]
 pub mod messaging;
+/// The read-only `messaging-stats` binding: surface the ALREADY-computed per-topic bus gauges
+/// (dead-letter count / backlog / in-flight / per-group depth) to a granted guest, tenant-scoped by a
+/// host-filled `{tenant}` template. A messaging-substrate concern, so gated with `messaging`.
+#[cfg(feature = "messaging")]
+pub mod messaging_stats;
 #[cfg(feature = "sql")]
 pub mod orm;
 #[cfg(feature = "session")]
@@ -97,6 +102,11 @@ pub struct Bindings {
     /// the producer-context cell. `None` = not granted (`present-token` ⇒ `access-denied`).
     #[cfg(feature = "messaging")]
     tenancy_present: Option<tenancy::TenancyBinding>,
+    /// The read-only `messaging-stats` grant: read per-topic bus gauges (dead-letter, backlog,
+    /// in-flight, per-group depth). Bus topics are addressed through a host-filled `{tenant}` template,
+    /// so the guest never names a tenant. `None` = not granted (every stats call ⇒ `access-denied`).
+    #[cfg(feature = "messaging")]
+    messaging_stats: Option<messaging_stats::StatsBinding>,
     /// Where this invocation's captured stdout/stderr is sent.
     /// `None` = the guest's stdio is left inherited (host stdio).
     logging: Option<crate::logging::LoggingBinding>,
@@ -439,5 +449,38 @@ impl Bindings {
     #[cfg(feature = "messaging")]
     pub(crate) fn tenancy_present(&self) -> Option<&tenancy::TenancyBinding> {
         self.tenancy_present.as_ref()
+    }
+
+    /// Grant the read-only `messaging-stats` capability: read per-topic bus gauges from `messaging`.
+    /// A plain topic resolves under `prefix` (the component-private namespace, identical to
+    /// [`with_messaging`](Self::with_messaging)); a `bus:<name>` topic must match one of `bus_templates`
+    /// (the component's declared stats-topic templates) and the host substitutes `resolved_tenant` for
+    /// each template's `{tenant}` placeholder — so the guest can only ever read stats for its own
+    /// namespace or, on the bus, exactly its own resolved tenant's topic. `resolved_tenant` is the
+    /// host-resolved tenant value (never guest input); `None` ⇒ a `{tenant}` template is refused.
+    #[cfg(feature = "messaging")]
+    pub fn with_messaging_stats(
+        mut self,
+        prefix: impl Into<String>,
+        bus_prefix: impl Into<String>,
+        messaging: Arc<dyn Messaging>,
+        bus_templates: Vec<String>,
+        resolved_tenant: Option<String>,
+    ) -> Self {
+        self.messaging_stats = Some(messaging_stats::StatsBinding {
+            messaging,
+            prefix: prefix.into(),
+            bus_prefix: bus_prefix.into(),
+            bus_templates,
+            resolved_tenant,
+        });
+        self
+    }
+
+    /// The granted `messaging-stats` binding, if any. Public so a host-side caller (e.g. a live-gate
+    /// test) can drive the read-only stats reads against the real substrate without a wasm guest.
+    #[cfg(feature = "messaging")]
+    pub fn messaging_stats(&self) -> Option<&messaging_stats::StatsBinding> {
+        self.messaging_stats.as_ref()
     }
 }

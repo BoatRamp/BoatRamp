@@ -1102,6 +1102,10 @@ impl HandlerEngine {
         bindings::tenancy::add_to_linker(&mut linker, |state: &mut HostState| {
             bindings::tenancy::TenancyHost::new(state.bindings.tenancy_present())
         })?;
+        #[cfg(feature = "messaging")]
+        bindings::messaging_stats::add_to_linker(&mut linker, |state: &mut HostState| {
+            bindings::messaging_stats::StatsHost::new(state.bindings.messaging_stats())
+        })?;
         #[cfg(feature = "invoke")]
         bindings::invoke::add_to_linker(&mut linker, |state: &mut HostState| {
             bindings::invoke::InvokeHost::new(&mut state.table, state.bindings.invoke())
