@@ -442,6 +442,37 @@ struct HandlerRuntimeInner {
     tenancy_posture_overrides: std::sync::OnceLock<
         Arc<std::collections::BTreeMap<String, boatramp_core::security::ResolvedProjectTenancy>>,
     >,
+    /// Event-driven delivery cadences (Phase A, B17): the two operator `[handlers]` knobs the
+    /// delivery drainer reads — the safety-net reconcile interval and the ready-set rebuild interval.
+    /// Set once at startup via [`HandlerRuntime::set_delivery_config`]; **unset ⇒ the built-in
+    /// defaults** ([`DeliveryConfig::default`]). Never affects at-least-once (the durable ready-set +
+    /// due-heap are the authority regardless of cadence) — only latency vs idle-wakeup tradeoff.
+    #[cfg(feature = "handlers")]
+    delivery_config: std::sync::OnceLock<DeliveryConfig>,
+}
+
+/// The two event-driven-delivery cadences (B17), resolved from the node `[handlers]` config (absent ⇒
+/// default). Both are pure latency/idle-cost tradeoffs — the durable ready-set + due-heap remain the
+/// at-least-once authority whatever the cadence, so a mis-set knob can never lose or strand a message.
+#[cfg(feature = "handlers")]
+#[derive(Debug, Clone, Copy)]
+pub struct DeliveryConfig {
+    /// The safety-net reconcile cadence: how often the drainer wakes on the timer (absent a fast-path
+    /// wake) to drain the ready-set + fire due lease-expiry redelivery. Default ~2 s.
+    pub safetynet_interval: Duration,
+    /// The ready-set rebuild cadence: how often the drainer re-derives the ready-set from the
+    /// authoritative index (the lost-marker / fresh-node self-heal). Default ~30 s.
+    pub rebuild_interval: Duration,
+}
+
+#[cfg(feature = "handlers")]
+impl Default for DeliveryConfig {
+    fn default() -> Self {
+        Self {
+            safetynet_interval: Duration::from_millis(2000),
+            rebuild_interval: Duration::from_millis(30_000),
+        }
+    }
 }
 
 #[cfg(feature = "handlers")]
@@ -472,6 +503,13 @@ impl HandlerRuntimeInner {
             #[cfg(not(feature = "capability"))]
             capability_max_ttl_secs: None,
         }
+    }
+
+    /// The resolved event-driven-delivery cadences (B17): the operator's `[handlers]` knobs if set,
+    /// else [`DeliveryConfig::default`]. Read by the delivery drainer.
+    #[cfg(feature = "handlers")]
+    fn delivery_config(&self) -> DeliveryConfig {
+        self.delivery_config.get().copied().unwrap_or_default()
     }
 }
 
@@ -544,6 +582,8 @@ impl HandlerRuntime {
                 capability_max_ttl_secs: std::sync::OnceLock::new(),
                 #[cfg(feature = "handlers")]
                 tenancy_posture_overrides: std::sync::OnceLock::new(),
+                #[cfg(feature = "handlers")]
+                delivery_config: std::sync::OnceLock::new(),
             })),
         }
     }
@@ -856,6 +896,16 @@ impl HandlerRuntime {
     pub fn set_cron_leader_gate(&self, gate: CronLeaderGate) {
         if let Some(inner) = self.inner.as_ref() {
             let _ = inner.cron_leader_gate.set(gate);
+        }
+    }
+
+    /// Set the event-driven-delivery cadences (B17) from the node `[handlers]` config. Set once at
+    /// startup; a no-op runtime ignores it, and an unset runtime uses [`DeliveryConfig::default`].
+    /// Never affects at-least-once — only the latency/idle-cost tradeoff.
+    #[cfg(feature = "handlers")]
+    pub fn set_delivery_config(&self, config: DeliveryConfig) {
+        if let Some(inner) = self.inner.as_ref() {
+            let _ = inner.delivery_config.set(config);
         }
     }
 
@@ -2053,6 +2103,7 @@ mod drain_tests {
 #[cfg(all(test, feature = "handlers"))]
 mod tests {
     use super::*;
+    use crate::scheduler::ConsumerFilter;
     use boatramp_core::cose::{LocalSigner, TokenAlg};
     use boatramp_core::project::ProjectRef;
 
@@ -3549,7 +3600,7 @@ mod tests {
             minute_stamp: 0,
         };
         for _ in 0..3 {
-            run_scheduler_tick(&inner, &deploy, &mut cache, &mut crons, &mut sweep, now)
+            run_scheduler_tick(&inner, &deploy, &mut cache, &mut crons, &mut sweep, now, ConsumerFilter::All)
                 .await
                 .unwrap();
         }
@@ -4724,7 +4775,7 @@ mod tests {
     /// queue would never drain at all.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn scheduler_drains_a_non_default_projects_invocation_in_its_own_tenant() {
-        use crate::scheduler::{run_scheduler_tick, CronNow};
+        use crate::scheduler::{run_scheduler_tick, ConsumerFilter, CronNow};
         use boatramp_core::deploy::DeployStore;
         use boatramp_core::function::{
             Function, FunctionVersion, Invocation, InvocationStatus, InvokeMode, Lifecycle, Owner,
@@ -4801,6 +4852,7 @@ mod tests {
             &mut cron_state,
             &mut sweep,
             now,
+            ConsumerFilter::All,
         )
         .await
         .unwrap();
@@ -4858,7 +4910,7 @@ mod tests {
     #[cfg(feature = "handlers")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn drain_reclaims_an_expired_lease_and_skips_a_live_one() {
-        use crate::scheduler::{run_scheduler_tick, CronNow};
+        use crate::scheduler::{run_scheduler_tick, ConsumerFilter, CronNow};
         use boatramp_core::deploy::DeployStore;
         use boatramp_core::function::{
             Function, FunctionVersion, Invocation, InvocationStatus, InvokeMode, Lifecycle, Owner,
@@ -4953,6 +5005,7 @@ mod tests {
             &mut cron_state,
             &mut sweep,
             now,
+            ConsumerFilter::All,
         )
         .await
         .unwrap();
@@ -5179,7 +5232,7 @@ mod tests {
 
         // Fires once for the minute.
         let (_, handles) =
-            run_scheduler_tick(&inner, &deploy, &mut wasm, &mut crons, &mut sweep, at(100))
+            run_scheduler_tick(&inner, &deploy, &mut wasm, &mut crons, &mut sweep, at(100), ConsumerFilter::All)
                 .await
                 .unwrap();
         for h in handles {
@@ -5189,7 +5242,7 @@ mod tests {
 
         // Same minute → deduped (no fire).
         let (_, handles) =
-            run_scheduler_tick(&inner, &deploy, &mut wasm, &mut crons, &mut sweep, at(100))
+            run_scheduler_tick(&inner, &deploy, &mut wasm, &mut crons, &mut sweep, at(100), ConsumerFilter::All)
                 .await
                 .unwrap();
         assert!(handles.is_empty());
@@ -5197,7 +5250,7 @@ mod tests {
 
         // Next minute → fires again.
         let (_, handles) =
-            run_scheduler_tick(&inner, &deploy, &mut wasm, &mut crons, &mut sweep, at(101))
+            run_scheduler_tick(&inner, &deploy, &mut wasm, &mut crons, &mut sweep, at(101), ConsumerFilter::All)
                 .await
                 .unwrap();
         for h in handles {
@@ -5214,7 +5267,7 @@ mod tests {
             .running
             .store(true, Ordering::Release);
         let (_, handles) =
-            run_scheduler_tick(&inner, &deploy, &mut wasm, &mut crons, &mut sweep, at(102))
+            run_scheduler_tick(&inner, &deploy, &mut wasm, &mut crons, &mut sweep, at(102), ConsumerFilter::All)
                 .await
                 .unwrap();
         assert!(handles.is_empty());
@@ -5314,7 +5367,7 @@ mod tests {
         };
 
         let (_, handles) =
-            run_scheduler_tick(&inner, &deploy, &mut wasm, &mut crons, &mut sweep, now)
+            run_scheduler_tick(&inner, &deploy, &mut wasm, &mut crons, &mut sweep, now, ConsumerFilter::All)
                 .await
                 .unwrap();
         // No cron fired (a follower); the counter was never written.

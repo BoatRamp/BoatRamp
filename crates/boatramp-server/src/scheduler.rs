@@ -19,6 +19,23 @@ pub(super) const CONSUMER_MAX_ATTEMPTS: u32 = 5;
 #[cfg(feature = "handlers")]
 pub(super) const CONSUMER_BATCH: usize = 16;
 
+/// Which consumers a scheduler pass drives (event-driven delivery). Selects the topic set only — the
+/// binding-build + claim + dispatch body is identical whichever is chosen.
+#[cfg(feature = "handlers")]
+#[derive(Clone, Copy)]
+pub(super) enum ConsumerFilter<'a> {
+    /// Drive EVERY active consumer (the fallback full poll for a backend without a ready-set, and the
+    /// legacy path every existing caller/test uses). Also runs crons + the async lane + retention.
+    All,
+    /// Drive NO consumers this pass — the event-driven drainer owns delivery — but still run the
+    /// maintenance work (crons, async lane, retention sweep, session reap). The maintenance-loop pass
+    /// when the ready-set drainer is active.
+    Skip,
+    /// Drive exactly the consumers whose namespaced topic is in this set (the ready topics). Skips
+    /// crons/async/retention (those are the maintenance loop's job) — a pure delivery drain.
+    Topics(&'a std::collections::HashSet<String>),
+}
+
 /// Per-invocation limits from the site's caps only (consumers have no
 /// per-component limit config), clamped to the engine ceiling downstream.
 #[cfg(feature = "handlers")]
@@ -82,26 +99,46 @@ impl HandlerRuntime {
     #[cfg(feature = "handlers")]
     pub fn spawn_scheduler(&self, deploy: DeployStore) -> Option<tokio::task::JoinHandle<()>> {
         let inner = self.inner.clone()?;
+        // Event-driven delivery: is a durable ready-set available? If the messaging backend supports
+        // it (an atomic `write_batch` — B2), delivery is driven by the ready-set DRAINER and the
+        // maintenance tick skips the per-consumer poll. Otherwise (no messaging, or a non-atomic
+        // backend) the maintenance tick keeps the legacy full poll — never losing a message, just
+        // paying the old O(#topics) cost. Decided once at spawn (the backend doesn't change).
+        let ready_set = inner
+            .messaging
+            .as_ref()
+            .is_some_and(|m| m.supports_ready_set());
+
         Some(tokio::spawn(async move {
-            // Content-addressed component bytes never change, so cache them
-            // across ticks (avoids re-reading the blob when a consumer is idle).
+            // --- the delivery drainer (event-driven), spawned only when the ready-set is available.
+            // It reacts to the durable ready-set (∪ the due-heap) instead of polling every topic. On a
+            // non-ready-set backend this is not spawned and the maintenance tick below does the full
+            // poll (fallback), so delivery is never lost — only the idle-scaling win is forgone.
+            let drainer = ready_set.then(|| {
+                let inner = inner.clone();
+                let deploy = deploy.clone();
+                tokio::spawn(async move { run_delivery_drainer(inner, deploy).await })
+            });
+
+            // --- the maintenance tick (crons, async lane, workflows, retention sweep, session reap,
+            // blob watchers) on the coarse periodic timer. When the drainer owns delivery it passes
+            // `ConsumerFilter::Skip` (no per-consumer poll); on the fallback it passes `All`.
             let mut wasm_cache: std::collections::HashMap<String, Vec<u8>> =
                 std::collections::HashMap::new();
             let mut cron_state: std::collections::HashMap<String, CronEntry> =
                 std::collections::HashMap::new();
-            // Last minute-stamp a grouped topic's retention sweep ran, so the sweep
-            // fires at most once per minute per topic (off the hot claim path).
             let mut sweep_state: std::collections::HashMap<String, i64> =
                 std::collections::HashMap::new();
-            // Live blob-change watchers, keyed by `<function>|<trigger id>`; each
-            // owns a native watch stream + its drain task (FA-5).
             let mut blob_watchers: std::collections::HashMap<String, tokio::task::JoinHandle<()>> =
                 std::collections::HashMap::new();
             let mut interval = tokio::time::interval(SCHEDULER_TICK);
+            let consumers = if ready_set {
+                ConsumerFilter::Skip // the drainer delivers; the tick only does maintenance
+            } else {
+                ConsumerFilter::All // no ready-set: the tick keeps the legacy full poll (fallback)
+            };
             loop {
                 interval.tick().await;
-                // Spawned cron fires are detached (bounded by the invocation
-                // timeout); their handles are dropped here.
                 if let Err(err) = run_scheduler_tick(
                     &inner,
                     &deploy,
@@ -109,16 +146,170 @@ impl HandlerRuntime {
                     &mut cron_state,
                     &mut sweep_state,
                     CronNow::now(),
+                    consumers,
                 )
                 .await
                 {
                     tracing::warn!(%err, "scheduler tick failed");
                 }
-                // Reconcile blob-change watchers (FA-5): spawn one per live
-                // `Blob` trigger, drop those whose trigger is gone.
                 reconcile_blob_watchers(&inner, &deploy, &mut blob_watchers).await;
+                // If the drainer task ever exits (it shouldn't — it loops forever), the maintenance
+                // loop keeps running; delivery would then rely on the drainer being respawned by a
+                // restart. Abort it with us on shutdown (the caller aborts this outer handle).
+                let _ = &drainer;
             }
         }))
+    }
+}
+
+/// The **event-driven delivery drainer** (Phase A): react to the durable ready-set + due-heap instead
+/// of polling every topic. It (1) waits on the fast-path wake OR the safety-net timer (whichever
+/// first), (2) drains the ready-set — mapping each ready topic to its consumer(s) and dispatching —
+/// (3) fires lease-expiry redelivery from a per-message-deadline due-heap, and (4) periodically
+/// rebuilds the ready-set from the authoritative index (the lost-marker / fresh-node self-heal). An
+/// idle topic costs nothing: it is absent from the ready-set, so 10 000 idle topics cost the same as
+/// 10 (the headline win). The durable ready-set is the AUTHORITY for *where* to look; the wake is a
+/// pure latency optimization (a dropped wake ⇒ the safety-net still delivers, B12).
+#[cfg(feature = "handlers")]
+async fn run_delivery_drainer(inner: Arc<HandlerRuntimeInner>, deploy: DeployStore) {
+    let Some(messaging) = inner.messaging.clone() else {
+        return; // no messaging backend — nothing to drain (defensive; spawn already checked)
+    };
+    let cfg = inner.delivery_config();
+    // The fast-path wake, if the backend offers one (a publish/nack fires it post-commit). Absent ⇒
+    // the drainer relies on the safety-net timer alone (still correct, just higher latency).
+    let wake = messaging.wake_handle();
+    // Component-byte cache, shared across drains (content-addressed, never changes).
+    let mut wasm_cache: std::collections::HashMap<String, Vec<u8>> =
+        std::collections::HashMap::new();
+    // A throwaway cron/sweep state — the drainer never fires crons/sweeps (it passes `Topics`), so
+    // these are never touched; they satisfy `run_scheduler_tick`'s signature only.
+    let mut cron_state: std::collections::HashMap<String, CronEntry> =
+        std::collections::HashMap::new();
+    let mut sweep_state: std::collections::HashMap<String, i64> =
+        std::collections::HashMap::new();
+
+    // The redelivery **due-heap** (B6): a pure rebuild-from-durable-state cache of per-topic next
+    // lease-expiry deadlines. NEVER the authority — rebuilt from the index on start (below) and on a
+    // periodic cadence, so a lost heap costs bounded latency, never a lost redelivery.
+    let mut due_heap: std::collections::BinaryHeap<std::cmp::Reverse<(u64, String)>> =
+        std::collections::BinaryHeap::new();
+
+    // Startup safety-net (B6): before trusting the wake/heap, do a full ready-set rebuild AND a full
+    // due-heap rebuild once, so a marker/heap lost across a restart is recovered before we rely on
+    // the fast path. A fresh/upgraded node self-populates its ready-set here (B18).
+    let leader = || inner.cron_leader_gate.get().is_none_or(|gate| gate());
+    if leader() {
+        if let Err(err) = messaging.rebuild_ready_set().await {
+            tracing::warn!(%err, "initial ready-set rebuild failed");
+        }
+    }
+    rebuild_due_heap(messaging.as_ref(), &mut due_heap).await;
+    let mut last_rebuild = tokio::time::Instant::now();
+    let mut last_heap_rebuild = tokio::time::Instant::now();
+
+    loop {
+        // (1) Drain everything ready right now: the durable ready-set ∪ the topics whose lease-expiry
+        // deadline has passed (popped from the due-heap). Both map to the same dispatch.
+        let now_ms = boatramp_core::time::now_unix_ms();
+        let mut topics: std::collections::HashSet<String> = match messaging.ready_topics().await {
+            Ok(t) => t.into_iter().collect(),
+            Err(err) => {
+                // A backend that lost ready-set support at runtime (shouldn't happen) — fall back to
+                // a full rebuild next cycle rather than silently delivering nothing.
+                tracing::warn!(%err, "ready_topics failed; will rely on rebuild");
+                std::collections::HashSet::new()
+            }
+        };
+        // Pop every due topic (deadline <= now) off the heap and add it — a leased message whose
+        // lease expired is now claimable again (redelivery), even if its ready marker was pruned.
+        while let Some(std::cmp::Reverse((deadline, topic))) = due_heap.peek().cloned() {
+            if deadline > now_ms {
+                break; // the heap is min-ordered — nothing else is due yet
+            }
+            due_heap.pop();
+            topics.insert(topic);
+        }
+
+        if !topics.is_empty() {
+            // Dispatch exactly the ready/due topics (the drainer's `Topics` filter): no cron/async/
+            // sweep, no full walk — just the consumers whose topic is ready. Re-add the just-drained
+            // topics' new deadlines to the due-heap afterward (below).
+            if let Err(err) = run_scheduler_tick(
+                &inner,
+                &deploy,
+                &mut wasm_cache,
+                &mut cron_state,
+                &mut sweep_state,
+                CronNow::now(),
+                ConsumerFilter::Topics(&topics),
+            )
+            .await
+            {
+                tracing::warn!(%err, "delivery drain failed");
+            }
+        }
+
+        // (2) Periodic ready-set rebuild (B6/B18) — the lost-marker / stale-marker / fresh-node
+        // self-heal, on a LONG cadence (the one full-ish scan). Leader-gated in Phase A (it proposes
+        // reconciling writes; a follower rebuild would be redundant, though safe — B7).
+        if last_rebuild.elapsed() >= cfg.rebuild_interval {
+            if leader() {
+                if let Err(err) = messaging.rebuild_ready_set().await {
+                    tracing::warn!(%err, "ready-set rebuild failed");
+                }
+            }
+            last_rebuild = tokio::time::Instant::now();
+        }
+        // (3) Periodic due-heap rebuild from durable lease state (B6) — cheaper than the ready-set
+        // rebuild (bounded by leased records), on the safety-net cadence, so a lease taken on another
+        // node (cluster) or a heap gap is reflected.
+        if last_heap_rebuild.elapsed() >= cfg.safetynet_interval {
+            rebuild_due_heap(messaging.as_ref(), &mut due_heap).await;
+            last_heap_rebuild = tokio::time::Instant::now();
+        }
+
+        // (4) Sleep until the NEXT of: a fast-path wake, the safety-net timer, or the next due
+        // deadline. The safety-net timer is the backstop for a dropped wake and for time-based
+        // visibility; it never scans idle topics (an absent ready-set entry costs nothing).
+        let until_due = due_heap
+            .peek()
+            .map(|std::cmp::Reverse((deadline, _))| {
+                Duration::from_millis(deadline.saturating_sub(now_ms))
+            })
+            .unwrap_or(cfg.safetynet_interval);
+        let sleep_for = until_due.min(cfg.safetynet_interval);
+        match &wake {
+            Some(w) => {
+                // Wake OR timer, whichever first. A wake resolves immediately if one is pending
+                // (coalesced), so a burst of publishes drains in one pass.
+                tokio::select! {
+                    _ = w.notified() => {}
+                    _ = tokio::time::sleep(sleep_for) => {}
+                }
+            }
+            None => tokio::time::sleep(sleep_for).await,
+        }
+    }
+}
+
+/// Rebuild the redelivery due-heap from the messaging backend's durable lease state (B6): replace the
+/// heap with one entry per topic that has a future lease deadline, min-ordered by deadline. A pure
+/// cache refresh — the durable records are the authority. A backend without `due_topics` support
+/// yields an empty heap (redelivery then rides the safety-net's ready-set drain + lease-expiry claim).
+#[cfg(feature = "handlers")]
+async fn rebuild_due_heap(
+    messaging: &dyn boatramp_core::messaging::Messaging,
+    heap: &mut std::collections::BinaryHeap<std::cmp::Reverse<(u64, String)>>,
+) {
+    heap.clear();
+    match messaging.due_topics().await {
+        Ok(due) => {
+            for (topic, deadline) in due {
+                heap.push(std::cmp::Reverse((deadline, topic)));
+            }
+        }
+        Err(err) => tracing::warn!(%err, "due-heap rebuild failed"),
     }
 }
 
@@ -284,10 +475,20 @@ pub(super) async fn run_scheduler_tick(
     cron_state: &mut std::collections::HashMap<String, CronEntry>,
     sweep_state: &mut std::collections::HashMap<String, i64>,
     now: CronNow,
+    // Event-driven delivery: which consumers this pass drives (see [`ConsumerFilter`]). The legacy
+    // full poll is `All`; the maintenance loop passes `Skip` (drainer owns delivery); the drainer
+    // passes `Topics(ready)`. Crons + the async lane run only on a maintenance pass (`All`/`Skip`),
+    // never on a per-ready-topic drain (`Topics`).
+    consumers: ConsumerFilter<'_>,
 ) -> Result<(usize, Vec<tokio::task::JoinHandle<()>>), DeployError> {
     use std::sync::atomic::Ordering;
     let mut acked = 0;
     let mut cron_handles = Vec::new();
+    // Crons, the async lane, workflows, blob watchers, and the session reap are MAINTENANCE work,
+    // never part of a per-ready-topic delivery drain — so they run only when this is a maintenance
+    // pass (`All` or `Skip`), not the drainer's `Topics(..)` pass. `All` keeps every existing
+    // caller/test byte-identical (it is a maintenance pass that also drives all consumers).
+    let maintenance = !matches!(consumers, ConsumerFilter::Topics(_));
     // Fan out over every project: a same-named site/function/workflow in two
     // projects is scheduled independently (its background jobs run under its own
     // tenant, never `default`). For a single default-only store this is one pass.
@@ -297,8 +498,9 @@ pub(super) async fn run_scheduler_tick(
         // Session GC: reap this project's idle/closed session records, at most once per minute — the
         // enforcement side of the idle-TTL (paired with the per-project open cap), so the KV can't
         // accumulate dead session records. Throttled via `sweep_state` like the retention sweep.
+        // Maintenance-only (never on a per-ready-topic drain pass — B13).
         #[cfg(feature = "session")]
-        {
+        if maintenance {
             let reap_key = format!("__session_reap/{project_name}");
             if sweep_state
                 .get(&reap_key)
@@ -342,75 +544,15 @@ pub(super) async fn run_scheduler_tick(
                     continue;
                 };
                 // --- consumers (only with a messaging backend) ---
+                // Event-driven delivery: `consumers` selects WHICH topics to drive this pass.
+                // `ConsumerFilter::All` = the full walk (the fallback poll for a non-ready-set backend,
+                // and every existing caller/test); `Skip` = the ready-set drainer owns delivery, so this
+                // maintenance pass only does the retention sweep; `Topics(set)` = drive exactly the
+                // ready topics (the drainer). The retention sweep + binding-build + dispatch body are
+                // unchanged — only the topic selection is new.
                 if let Some(messaging) = inner.messaging.clone() {
                     for consumer in &manifest.config.consumers {
-                        let Some(entry) = manifest.files.get(&consumer.component) else {
-                            tracing::warn!(site, component = %consumer.component, "consumer component missing");
-                            continue;
-                        };
-                        // Cache the (content-addressed) component bytes by hash.
-                        if !wasm_cache.contains_key(&entry.hash) {
-                            match read_blob_bytes(deploy, &entry.hash).await {
-                                Ok(bytes) => {
-                                    wasm_cache.insert(entry.hash.clone(), bytes);
-                                }
-                                Err(err) => {
-                                    tracing::warn!(site, %err, "reading consumer component failed");
-                                    continue;
-                                }
-                            }
-                        }
-                        let wasm = &wasm_cache[&entry.hash];
-                        let bindings = match build_bindings(
-                            inner,
-                            project,
-                            &site,
-                            &scope,
-                            None,
-                            &consumer.imports,
-                            site_handlers,
-                            // Consumers have no deploy `env`; site secrets still apply.
-                            &std::collections::BTreeMap::new(),
-                            // Consumers do not get the invoke capability (no allowlist field).
-                            &[],
-                            0,
-                            // Background consumers have no request context to correlate with.
-                            None,
-                            // No HTTP request ⇒ no token/domain tenant source; an `own` scope
-                            // fails closed (a consumer uses `null`/`all`, or signed-context once
-                            // wired).
-                            None,
-                            None,
-                            // No request cookie ⇒ no R3 session fact on a background trigger.
-                            None,
-                            // No HTTP request ⇒ no `?handle=` slug (a background trigger is never a
-                            // handle-sourced target route).
-                            None,
-                            // Per-consumer tenancy (Gap 2). This once-per-tick build has no message,
-                            // so `signed_context` is `None` here; a consumer declaring that source is
-                            // rebuilt PER MESSAGE in `dispatch_consumer_batch` with the drained
-                            // envelope (below), and this prebuilt binding is used only for
-                            // non-signed-context consumers.
-                            consumer.tenancy.as_ref(),
-                            consumer.token_claims.as_ref(),
-                            None,
-                        )
-                        .await
-                        {
-                            Ok(bindings) => bindings,
-                            // A refused secret ref (host-env ref under the multi-tenant
-                            // posture, or an unsupported scheme) fails the consumer
-                            // closed — skip dispatch rather than run with a leaked value.
-                            Err(err) => {
-                                tracing::warn!(site, topic = %consumer.topic, %err, "consumer bindings refused");
-                                continue;
-                            }
-                        };
-                        // A `bus:<topic>` consumer subscribes to the shared,
-                        // project-scoped bus (so it consumes events a *different*
-                        // component published); a plain topic drains its own site
-                        // scope (back-compat). The prefix is stripped before the
-                        // guest sees the topic.
+                        // `bus:<topic>` consumes the shared project bus; a plain topic its site scope.
                         let (consumer_topic, consumer_prefix) = match consumer
                             .topic
                             .strip_prefix(boatramp_handlers::BUS_TOPIC_SELECTOR)
@@ -421,55 +563,131 @@ pub(super) async fn run_scheduler_tick(
                             }
                             None => (format!("{scope}/{}", consumer.topic), format!("{scope}/")),
                         };
-                        // R1 async lane: a consumer declaring `sources: [signed_context]` must resolve
-                        // EACH message's sealed originator tenant, so its bindings are rebuilt per
-                        // message from that message's envelope (the built-once `bindings` above can't
-                        // carry a per-message context). A consumer that does not declare it reuses the
-                        // built-once binding (`rebuild = None`), unchanged.
-                        let rebuild = consumer
-                            .tenancy
-                            .as_ref()
-                            .filter(|t| t.declares_signed_context())
-                            .map(|_| crate::handler_dispatch::ConsumerRebuild {
+                        // Should this pass DISPATCH this consumer (claim + run)? `All` yes; `Skip` no
+                        // (the drainer owns it); `Topics` only if this consumer's topic is ready.
+                        let dispatch = match consumers {
+                            ConsumerFilter::All => true,
+                            ConsumerFilter::Skip => false,
+                            ConsumerFilter::Topics(set) => set.contains(&consumer_topic),
+                        };
+                        if dispatch {
+                            let Some(entry) = manifest.files.get(&consumer.component) else {
+                                tracing::warn!(site, component = %consumer.component, "consumer component missing");
+                                continue;
+                            };
+                            // Cache the (content-addressed) component bytes by hash.
+                            if !wasm_cache.contains_key(&entry.hash) {
+                                match read_blob_bytes(deploy, &entry.hash).await {
+                                    Ok(bytes) => {
+                                        wasm_cache.insert(entry.hash.clone(), bytes);
+                                    }
+                                    Err(err) => {
+                                        tracing::warn!(site, %err, "reading consumer component failed");
+                                        continue;
+                                    }
+                                }
+                            }
+                            let wasm = &wasm_cache[&entry.hash];
+                            let bindings = match build_bindings(
                                 inner,
                                 project,
-                                site: &site,
-                                scope: &scope,
-                                imports: &consumer.imports,
+                                &site,
+                                &scope,
+                                None,
+                                &consumer.imports,
                                 site_handlers,
-                                tenancy: consumer.tenancy.as_ref(),
-                                token_claims: consumer.token_claims.as_ref(),
-                            });
-                        acked += dispatch_consumer_batch(
-                            &inner.engine,
-                            messaging.as_ref(),
-                            &inner.metrics,
-                            &site,
-                            &consumer_topic,
-                            &consumer_prefix,
-                            &consumer.group,
-                            consumer.start,
-                            &entry.hash,
-                            wasm,
-                            &bindings,
-                            rebuild.as_ref(),
-                            site_limits(site_handlers),
-                            // Per-consumer overrides (≈ JetStream AckWait/MaxDeliver/batch), each
-                            // falling back to the server default when unset (back-compat).
-                            consumer
-                                .lease_ms
-                                .map(Duration::from_millis)
-                                .unwrap_or(CONSUMER_LEASE),
-                            consumer.max_attempts.unwrap_or(CONSUMER_MAX_ATTEMPTS),
-                            consumer.max_batch.unwrap_or(CONSUMER_BATCH),
-                            consumer.max_ack_pending,
-                            consumer.backoff_ms.unwrap_or(0),
-                        )
-                        .await;
-                        // A grouped (fan-out) topic keeps a retained log; reclaim
-                        // fully-consumed messages once a minute per topic, off the
-                        // hot claim path, on the leader only (single node = always).
-                        if !consumer.group.is_empty()
+                                // Consumers have no deploy `env`; site secrets still apply.
+                                &std::collections::BTreeMap::new(),
+                                // Consumers do not get the invoke capability (no allowlist field).
+                                &[],
+                                0,
+                                // Background consumers have no request context to correlate with.
+                                None,
+                                // No HTTP request ⇒ no token/domain tenant source; an `own` scope
+                                // fails closed (a consumer uses `null`/`all`, or signed-context once
+                                // wired).
+                                None,
+                                None,
+                                // No request cookie ⇒ no R3 session fact on a background trigger.
+                                None,
+                                // No HTTP request ⇒ no `?handle=` slug (a background trigger is never a
+                                // handle-sourced target route).
+                                None,
+                                // Per-consumer tenancy (Gap 2). This once-per-tick build has no message,
+                                // so `signed_context` is `None` here; a consumer declaring that source is
+                                // rebuilt PER MESSAGE in `dispatch_consumer_batch` with the drained
+                                // envelope (below), and this prebuilt binding is used only for
+                                // non-signed-context consumers.
+                                consumer.tenancy.as_ref(),
+                                consumer.token_claims.as_ref(),
+                                None,
+                            )
+                            .await
+                            {
+                                Ok(bindings) => bindings,
+                                // A refused secret ref (host-env ref under the multi-tenant
+                                // posture, or an unsupported scheme) fails the consumer
+                                // closed — skip dispatch rather than run with a leaked value.
+                                Err(err) => {
+                                    tracing::warn!(site, topic = %consumer.topic, %err, "consumer bindings refused");
+                                    continue;
+                                }
+                            };
+                            // R1 async lane: a consumer declaring `sources: [signed_context]` must resolve
+                            // EACH message's sealed originator tenant, so its bindings are rebuilt per
+                            // message from that message's envelope (the built-once `bindings` above can't
+                            // carry a per-message context). A consumer that does not declare it reuses the
+                            // built-once binding (`rebuild = None`), unchanged.
+                            let rebuild = consumer
+                                .tenancy
+                                .as_ref()
+                                .filter(|t| t.declares_signed_context())
+                                .map(|_| crate::handler_dispatch::ConsumerRebuild {
+                                    inner,
+                                    project,
+                                    site: &site,
+                                    scope: &scope,
+                                    imports: &consumer.imports,
+                                    site_handlers,
+                                    tenancy: consumer.tenancy.as_ref(),
+                                    token_claims: consumer.token_claims.as_ref(),
+                                });
+                            acked += dispatch_consumer_batch(
+                                &inner.engine,
+                                messaging.as_ref(),
+                                &inner.metrics,
+                                &site,
+                                &consumer_topic,
+                                &consumer_prefix,
+                                &consumer.group,
+                                consumer.start,
+                                &entry.hash,
+                                wasm,
+                                &bindings,
+                                rebuild.as_ref(),
+                                site_limits(site_handlers),
+                                // Per-consumer overrides (≈ JetStream AckWait/MaxDeliver/batch), each
+                                // falling back to the server default when unset (back-compat).
+                                consumer
+                                    .lease_ms
+                                    .map(Duration::from_millis)
+                                    .unwrap_or(CONSUMER_LEASE),
+                                consumer.max_attempts.unwrap_or(CONSUMER_MAX_ATTEMPTS),
+                                consumer.max_batch.unwrap_or(CONSUMER_BATCH),
+                                consumer.max_ack_pending,
+                                consumer.backoff_ms.unwrap_or(0),
+                            )
+                            .await;
+                        }
+                        // A grouped (fan-out) topic keeps a retained log; reclaim fully-consumed
+                        // messages once a minute per topic, off the hot claim path, on the leader only
+                        // (single node = always). Runs on the FULL/maintenance pass regardless of the
+                        // dispatch filter (B13: an idle grouped topic must still be swept), but never on
+                        // a per-ready-topic drain pass (`Topics`) — that would re-introduce per-tick
+                        // sweep work. `All` and `Skip` are the maintenance passes; `Topics` is the drainer.
+                        let sweep_this_pass = !matches!(consumers, ConsumerFilter::Topics(_));
+                        if sweep_this_pass
+                            && !consumer.group.is_empty()
                             && inner.cron_leader_gate.get().is_none_or(|gate| gate())
                             && sweep_state
                                 .get(&consumer_topic)
@@ -502,8 +720,10 @@ pub(super) async fn run_scheduler_tick(
                 // --- crons (leader-only in cluster mode) ---
                 // The gate fires crons on exactly one node; consumers above run on
                 // every node (leased dispatch distributes them). `None` = single
-                // node, always fires.
-                let cron_enabled = inner.cron_leader_gate.get().is_none_or(|gate| gate());
+                // node, always fires. Crons run only on a maintenance pass (never on the
+                // drainer's per-ready-topic pass).
+                let cron_enabled =
+                    maintenance && inner.cron_leader_gate.get().is_none_or(|gate| gate());
                 for (idx, cron) in manifest.config.crons.iter().enumerate() {
                     if !cron_enabled {
                         break;
@@ -567,7 +787,8 @@ pub(super) async fn run_scheduler_tick(
     // the tick, so a long background job never stalls this loop (crons, other
     // drains, workflow progress) and a crash mid-run is reclaimed when the lease
     // elapses.
-    let invoke_enabled = inner.cron_leader_gate.get().is_none_or(|gate| gate());
+    let invoke_enabled =
+        maintenance && inner.cron_leader_gate.get().is_none_or(|gate| gate());
     if invoke_enabled {
         // Same per-project fan-out as the site loop: each project's functions +
         // workflows drain under their own tenant.
