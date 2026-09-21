@@ -2273,6 +2273,52 @@ pub(super) struct InvalidateRequest {
 mod tests {
     use super::*;
 
+    #[test]
+    fn bundle_parses_function_sql_extension_and_rejects_ambiguity() {
+        use boatramp_core::sql::MigrationAction;
+        // A well-formed bundle with all three step kinds (U1 JSON format).
+        let json = br#"{
+            "steps": [
+                { "id": "0001_fn", "function": { "name": "backfill", "version": "v3", "args": "{}" } },
+                { "id": "0002_sql", "sql": "CREATE TABLE t (id int)", "no_transaction": true },
+                { "id": "0003_ext", "extension": "citext" }
+            ]
+        }"#;
+        let steps = parse_bundle(json).expect("valid bundle parses");
+        assert_eq!(steps.len(), 3);
+        assert_eq!(steps[0].kind(), "function");
+        assert_eq!(steps[1].kind(), "sql");
+        assert_eq!(steps[2].kind(), "extension");
+        assert!(
+            matches!(&steps[0].action, MigrationAction::Function { name, version, .. }
+            if name == "backfill" && version.as_deref() == Some("v3"))
+        );
+        assert!(matches!(
+            &steps[1].action,
+            MigrationAction::Sql {
+                no_transaction: true,
+                ..
+            }
+        ));
+
+        // A step that sets more than one of function/sql/extension is refused (U1 exactly-one).
+        let ambiguous = br#"{"steps":[{"id":"x","sql":"SELECT 1","extension":"citext"}]}"#;
+        assert!(
+            parse_bundle(ambiguous).is_err(),
+            "a multi-kind step is refused"
+        );
+        // A step with none is refused.
+        let empty = br#"{"steps":[{"id":"x"}]}"#;
+        assert!(parse_bundle(empty).is_err(), "a kindless step is refused");
+        // An empty bundle is refused.
+        assert!(
+            parse_bundle(br#"{"steps":[]}"#).is_err(),
+            "an empty bundle is refused"
+        );
+        // Non-JSON is refused (not silently accepted).
+        assert!(parse_bundle(b"not json").is_err());
+    }
+
     #[cfg(feature = "handlers")]
     #[test]
     fn is_wasm_component_matches_component_not_module_or_asset() {

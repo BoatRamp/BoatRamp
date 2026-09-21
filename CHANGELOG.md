@@ -7,35 +7,62 @@ versions.
 
 ## [0.4.25] - 2026-09-21
 
-An **owner-gated, in-app schema-migration surface**: boatramp owns the migrator (an
-ordered, tracked, transactional, idempotent apply of a migration set) and you trigger
-it with an admin token — the first instance of a general "admin-CLI → owner-only admin
-API" pattern. The design cleared a 3-role panel (Backend + UX + Security) and shipped
-behind a Security-Engineer review to convergence + two CI-hard live gates on real
-Postgres. Postgres only in this release.
+An **owner-gated, in-app schema-migration surface** whose base primitive is **wasm
+functions**: a migration is an ordered set of steps, and a step is a `function` (the
+base — a project function that verifies data, syncs an external source, runs DML, **and
+does DDL** via a host-mediated owner-role capability), a `sql` script (sugar), or an
+allowlisted `extension` (sugar). boatramp owns the ordering, the durable ledger,
+idempotency, and transactionality; you upload the step set as a content-addressed bundle
+and trigger it with an admin token. The design cleared a 3-role panel (Backend + UX +
+Security), then a Security-Engineer review to convergence (SHIP-WITH-FIXES → fixes
+applied), and ships behind CI-hard live gates on real Postgres. Postgres only in this
+release.
 
-The load-bearing safety property (an owner constraint): schema DDL runs as a **dedicated
-per-project, non-superuser owner role** — never the cluster superuser — so on a Shared
-multi-tenant server Postgres itself denies the migration path `DROP DATABASE other`,
-`ALTER ROLE … SUPERUSER`, `COPY … TO PROGRAM`, and untrusted `CREATE EXTENSION`, by
-privilege. The runtime app role stays a non-owner, so row-level security is still
-enforced against it.
+The load-bearing safety property (an owner constraint): DDL — whether from a `sql`
+sugar-step or a function's owner-DDL capability — runs as a **dedicated per-project,
+non-superuser owner role**, never the cluster superuser, so on a Shared multi-tenant
+server Postgres itself denies `DROP DATABASE other`, `ALTER ROLE … SUPERUSER`,
+`COPY … TO PROGRAM`, and untrusted `CREATE EXTENSION`, by privilege. A migration function
+gets the owner-DDL capability **only** inside a `Project·Admin` migration run and is NOT
+also handed its tenant-scoped `sql` binding (the binding-split), so it can never disable
+RLS and then read cross-tenant. The runtime app role stays a non-owner, RLS-subject.
 
 ### Added
 
-- **Owner-gated schema migrations (`/api/migrate/{db}/{apply,dry-run,status}`).** Supply
-  an ordered set of steps — each a `sql` script or an allowlisted `extension` — and
-  boatramp applies the pending suffix in order, once each, tracked in a host-owned
-  `schema_migrations` ledger. Each `sql` step commits atomically with its ledger row
-  (a `no_transaction` opt-out covers DDL Postgres forbids in a transaction, e.g.
-  `CREATE INDEX CONCURRENTLY`). Ordering is fixed by **prefix-consistency + content-hash
-  immutability** — a reordered set, or a changed already-applied migration, is refused
-  fail-closed. A step that runs but fails comes back as a structured
-  `failed { id, error }` (HTTP 422) so a thin client sees exactly which migration failed
-  and why; a not-ready managed DB returns a retryable `503`. Reachable per project via
-  `/api/projects/<proj>/migrate/…`, gated at **`Project·Admin`** for the mutating verbs
-  (never the deploy-grade publisher right the sibling `/api/sql/*` path uses),
-  `Project·Read` for `status`.
+- **Owner-gated schema migrations (`/api/migrate/{db}/{apply,dry-run,baseline,status}`).**
+  A migration step is one of:
+  - **`function` (the base):** boatramp invokes a project function that does whatever the
+    migration needs — data verification, external-source sync (`wasi:http`), DML, and DDL
+    via a new host-mediated **`boatramp:handlers/migrate-ddl`** capability (`exec` /
+    `exec-batch` / `query`). The host runs each statement on an orchestrator-owned
+    owner-role connection — the guest never holds the credential. The capability is
+    attached **only** for a migration-step invocation (a normal request/consumer/cron gets
+    `not-a-migration`), and the function's tenant-`sql` binding is dropped for that run
+    (the binding-split). A function step is at-least-once + author-idempotent: its ledger
+    row is written only after a successful return, so a crash mid-function re-runs it.
+  - **`sql` (sugar):** a DDL/DML script run as the owner role, committed atomically with
+    its ledger row (a `no_transaction` opt-out covers DDL Postgres forbids in a
+    transaction, e.g. `CREATE INDEX CONCURRENTLY`).
+  - **`extension` (sugar):** an allowlist-gated, host-templated `CREATE EXTENSION`.
+
+  Ordering is fixed by **prefix-consistency + content-hash immutability** — a reordered
+  set, or a changed already-applied step, is refused fail-closed; a `function` step binds
+  its **resolved component blob** into the recorded hash, so a redeploy under the same
+  version tag is caught. A step that runs but fails comes back as a structured
+  `failed { id, error }` (HTTP 422); a not-ready managed DB returns a retryable `503`.
+  Reachable per project via `/api/projects/<proj>/migrate/…`, gated at **`Project·Admin`**
+  for the mutating verbs (never the deploy-grade publisher right the sibling `/api/sql/*`
+  path uses), `Project·Read` for `status`.
+- **Upload-then-trigger input.** The ordered step set is a JSON bundle uploaded via the
+  existing `PUT /api/blobs/{hash}` (content-addressed, verified); apply/dry-run/baseline
+  reference it as `{ "bundle": "<hash>", "up_to"?: "<id>" }`. A hand-authored and a
+  CLI-generated bundle hash-agree.
+- **`baseline`** (`POST …/migrate/{db}/baseline`): record a prefix (through `up_to`) as
+  already-applied **without running any step**, so a pre-existing/populated database
+  (provisioned before this surface) adopts the migrator at its current state and a later
+  `apply` runs only the genuinely-pending suffix. `Project·Admin`, audited,
+  prefix-consistent (an empty ledger or a strict consistent extension; a divergence →
+  `409`); recorded rows carry an `origin = baseline` marker.
 - **Per-project non-superuser owner/DDL role** in managed-database provisioning (Postgres
   Shared): a three-identity model — the cluster superuser provisions the shells, a new
   per-project **owner role** (`NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS`) owns the
@@ -43,9 +70,14 @@ enforced against it.
   (RLS-subject). New tenants provision with the model automatically; existing tenants are
   migrated by a documented one-shot operator step (see the how-to).
 - **Trusted-extension allowlist** (`[handlers.bindings.sql] migrate_trusted_extensions`):
-  the only extensions a migration may enable. A raw `sql` step may not `CREATE EXTENSION`;
-  the sole path is an allowlist-gated, host-templated `extension` step.
-- How-to: `docs/src/how-to/in-app-migrations.md`.
+  the only extensions a migration may enable. Neither a raw `sql` step nor a function's
+  `migrate::exec` may `CREATE EXTENSION`; the sole path is an allowlist-gated,
+  host-templated `extension` step.
+- **Shim:** a `compat::migrate` guest module (`boatramp-uchron-shim`, off-by-default
+  `migrate` feature) so a migration function calls `migrate::exec(ddl)` / `migrate::query`
+  ergonomically.
+- How-to: `docs/src/how-to/in-app-migrations.md` (leads with function steps + the bundle
+  format + baseline); `/api/migrate/*` API reference.
 
 ## [0.4.24] - 2026-09-20
 
