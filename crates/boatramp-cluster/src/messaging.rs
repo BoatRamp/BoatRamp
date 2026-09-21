@@ -125,6 +125,16 @@ pub struct RaftMessaging {
     /// live `(tokens, last_refill_ms)` per rate-capped topic. Per-node by design (a cluster-wide exact
     /// rate would need a replicated counter on the hot path). Only touched by rate-capped topics.
     rate_buckets: StdMutex<std::collections::HashMap<String, ClusterTokenBucket>>,
+    /// The fast-path delivery **wake** (event-driven delivery, Part A #2): fired AFTER a publish /
+    /// nack / redrive proposal replicates+applies (B12) so this node's leader-gated drainer re-checks
+    /// the ready-set promptly instead of waiting for the safety-net timer. Lossy — a missed pulse only
+    /// costs latency (the durable, replicated ready-set + safety-net are the authority). In Phase A the
+    /// drainer is leader-gated, so waking the local wake on the node that proposed (⇒ the leader that
+    /// applied) reaches the draining node.
+    wake: messaging::Wake,
+    /// Unix-ms this node last completed a full [`rebuild_ready_set`](messaging::Messaging::rebuild_ready_set)
+    /// pass, for the `last_rebuild_age_ms` delivery stat (B14). `0` = not yet rebuilt since start.
+    last_rebuild_ms: AtomicU64,
 }
 
 /// A per-node per-topic token bucket for the best-effort publish rate cap (Feature B), refilling at
@@ -168,6 +178,8 @@ impl RaftMessaging {
             commit_queue: StdMutex::new(Vec::new()),
             commit_gate: futures::lock::Mutex::new(()),
             rate_buckets: StdMutex::new(std::collections::HashMap::new()),
+            wake: messaging::Wake::new(),
+            last_rebuild_ms: AtomicU64::new(0),
         }
     }
 
@@ -316,6 +328,12 @@ impl RaftMessaging {
                 // caller may retry and produce a tolerable duplicate. Never invert this into a false
                 // positive (Ok on an uncommitted group).
                 let outcome = self.propose(WriteOp::Batch(ops)).await.map(|_| ());
+                // Event-driven delivery (B12): the batch (with its ready markers) is now replicated +
+                // applied — wake this node's drainer. Fired only on the success path; a failed propose
+                // is retried by the caller and its later success wakes then. Lossy + harmless.
+                if outcome.is_ok() {
+                    self.wake.notify();
+                }
                 for done in dones {
                     // Clone the shared outcome to every member (fail-all on a failed proposal).
                     let _ = done.send(outcome.clone());
@@ -859,6 +877,9 @@ impl Messaging for RaftMessaging {
                 until_ms,
             })
             .await?;
+            // Event-driven delivery (B12): the nack re-armed the topic's ready marker (in the apply) —
+            // wake this node's drainer so it revisits promptly (the due-heap covers a future `until_ms`).
+            self.wake.notify();
             return Ok(());
         }
         self.propose(WriteOp::MqNack {
@@ -867,6 +888,7 @@ impl Messaging for RaftMessaging {
             until_ms,
         })
         .await?;
+        self.wake.notify(); // ready marker re-armed in the apply (B12) — wake the drainer
         Ok(())
     }
 
@@ -1049,7 +1071,10 @@ impl Messaging for RaftMessaging {
                 id: id.clone(),
             });
         }
-        self.propose(WriteOp::Batch(ops)).await?;
+        if !ops.is_empty() {
+            self.propose(WriteOp::Batch(ops)).await?;
+            self.wake.notify(); // redriven messages are claimable again (markers re-armed) — wake (B12)
+        }
         Ok(ids.len() + grouped.len())
     }
 
@@ -1179,7 +1204,10 @@ impl Messaging for RaftMessaging {
                 });
             }
         }
-        self.propose(WriteOp::Batch(ops)).await?;
+        if !ops.is_empty() {
+            self.propose(WriteOp::Batch(ops)).await?;
+            self.wake.notify(); // redriven messages are claimable again (markers re-armed) — wake (B12)
+        }
         Ok(matched.len())
     }
 
@@ -1538,6 +1566,167 @@ impl Messaging for RaftMessaging {
         // bus's broadcast into these same hubs.
         self.hubs.subscribe(topic, after)
     }
+
+    // --- event-driven delivery (Phase A) ------------------------------------------------------
+
+    fn supports_ready_set(&self) -> bool {
+        // The cluster ready-set lives in the Raft state machine: a publish/nack/claim's ready-set
+        // mutation rides the SAME `apply_op` (⇒ the same replicated entry) as the index write, so
+        // atomicity holds BY CONSTRUCTION (B1/B2) regardless of the underlying persistence backend.
+        true
+    }
+
+    async fn ready_topics(&self) -> Result<Vec<String>, MessagingError> {
+        // Read this node's applied ready-set (replicated state — every node converges to it).
+        Ok(self
+            .state
+            .list_prefix(messaging::READY_PREFIX)
+            .await
+            .iter()
+            .filter_map(|k| messaging::topic_of_ready_key(k).map(str::to_owned))
+            .collect())
+    }
+
+    async fn rebuild_ready_set(&self) -> Result<usize, MessagingError> {
+        // The safety-net self-heal (B6/B18), cluster edition: re-derive the topics-with-work set from
+        // the AUTHORITATIVE replicated index, then PROPOSE reconciling ready-marker adds/prunes
+        // through the leader (the marker is applied state). Per B7 the rebuild is NOT sharded — any
+        // node re-derives the identical GLOBAL set (claims are leader-serialized, so a redundant add
+        // is safe), so there is never a no-owner gap. The one full-ish scan, on a long cadence.
+        let mut with_work: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // 1) Work-queue backlog: any live `mq/{topic}/{id}`.
+        for key in self.state.list_prefix("mq/").await {
+            if let Some(rest) = key.strip_prefix("mq/") {
+                if let Some(slash) = rest.rfind('/') {
+                    with_work.insert(rest[..slash].to_string());
+                }
+            }
+        }
+        // 2) Grouped backlog/in-flight: a registered group behind the retained log or holding work.
+        for key in self.state.list_prefix("mqgstate/").await {
+            let Some(rest) = key.strip_prefix("mqgstate/") else {
+                continue;
+            };
+            let Some(slash) = rest.rfind('/') else { continue };
+            let topic = rest[..slash].to_string();
+            let group = &rest[slash + 1..];
+            if topic.is_empty() || group.is_empty() || with_work.contains(&topic) {
+                continue;
+            }
+            let Some(raw) = self.state.get(&key).await else {
+                continue;
+            };
+            let Ok(state) = serde_json::from_slice::<messaging::GroupState>(&raw) else {
+                continue;
+            };
+            let logmax = self
+                .state
+                .get(&messaging::logmax_key(&topic))
+                .await
+                .map(|v| String::from_utf8_lossy(&v).into_owned())
+                .unwrap_or_default();
+            if !state.in_flight.is_empty() || state.hwm.as_str() < logmax.as_str() {
+                with_work.insert(topic);
+            }
+        }
+        // 3) Reconcile against the current markers; propose the delta as ONE replicated batch.
+        let existing: std::collections::HashSet<String> = self
+            .state
+            .list_prefix(messaging::READY_PREFIX)
+            .await
+            .iter()
+            .filter_map(|k| messaging::topic_of_ready_key(k).map(str::to_owned))
+            .collect();
+        let mut ops: Vec<WriteOp> = Vec::new();
+        for topic in with_work.difference(&existing) {
+            ops.push(WriteOp::Put {
+                key: messaging::ready_key(topic),
+                value: Vec::new(),
+            });
+        }
+        for topic in existing.difference(&with_work) {
+            ops.push(WriteOp::Delete {
+                key: messaging::ready_key(topic),
+            });
+        }
+        let added_any = with_work.difference(&existing).next().is_some();
+        if !ops.is_empty() {
+            self.propose(WriteOp::Batch(ops)).await?;
+        }
+        self.last_rebuild_ms.store(now_unix_ms(), Ordering::Relaxed);
+        if added_any {
+            self.wake.notify(); // a re-added (lost / fresh-node) marker — wake the drainer
+        }
+        Ok(with_work.len())
+    }
+
+    async fn due_topics(&self) -> Result<Vec<(String, u64)>, MessagingError> {
+        // Per-topic earliest future lease deadline for the redelivery due-heap (B6), read from this
+        // node's applied state. A pure rebuild-from-durable-state source (the heap is a cache).
+        let now = now_unix_ms();
+        let mut due: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+        let mut note = |topic: &str, until: u64| {
+            if until > now {
+                due.entry(topic.to_string())
+                    .and_modify(|e| *e = (*e).min(until))
+                    .or_insert(until);
+            }
+        };
+        for key in self.state.list_prefix("mq/").await {
+            let Some(rest) = key.strip_prefix("mq/") else {
+                continue;
+            };
+            let Some(slash) = rest.rfind('/') else { continue };
+            let topic = rest[..slash].to_string();
+            if let Some(raw) = self.state.get(&key).await {
+                if let Ok(rec) = serde_json::from_slice::<messaging::Record>(&raw) {
+                    note(&topic, rec.lease_until_ms);
+                }
+            }
+        }
+        for key in self.state.list_prefix("mqgstate/").await {
+            let Some(rest) = key.strip_prefix("mqgstate/") else {
+                continue;
+            };
+            let Some(slash) = rest.rfind('/') else { continue };
+            let topic = rest[..slash].to_string();
+            if let Some(raw) = self.state.get(&key).await {
+                if let Ok(state) = serde_json::from_slice::<messaging::GroupState>(&raw) {
+                    for f in &state.in_flight {
+                        note(&topic, f.lease_until_ms);
+                    }
+                }
+            }
+        }
+        Ok(due.into_iter().collect())
+    }
+
+    async fn delivery_stats(
+        &self,
+        this_node: &str,
+    ) -> Result<messaging::DeliveryStats, MessagingError> {
+        let ready_set_size = self.ready_topics().await?.len();
+        let due_heap_depth = self.due_topics().await?.len();
+        let last = self.last_rebuild_ms.load(Ordering::Relaxed);
+        let last_rebuild_age_ms = (last != 0).then(|| now_unix_ms().saturating_sub(last));
+        // Prefer the caller's node label; fall back to this node's Raft id so the block always
+        // identifies WHICH node's delivery view this is (the shard-gap diagnostic, B16).
+        let node = if this_node.is_empty() {
+            self.node_id.to_string()
+        } else {
+            this_node.to_string()
+        };
+        Ok(messaging::DeliveryStats {
+            ready_set_size,
+            due_heap_depth,
+            last_rebuild_age_ms,
+            this_node: node,
+        })
+    }
+
+    fn wake_handle(&self) -> Option<messaging::Wake> {
+        Some(self.wake.clone())
+    }
 }
 
 #[cfg(test)]
@@ -1812,6 +2001,93 @@ mod tests {
             .is_empty());
         assert_eq!(mqs[&1].backlog("t").await.unwrap(), 0);
 
+        shutdown(rafts).await;
+    }
+
+    /// Event-driven delivery (B1, cluster): a publish flags the topic in the REPLICATED ready-set (in
+    /// the same apply as the index record), and a claim that drains it prunes the marker — all
+    /// through the leader-serialized apply, so there is no prune-vs-publish race (B4 by construction).
+    #[serial_test::serial]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cluster_ready_set_add_on_publish_and_prune_on_drain() {
+        let (rafts, mqs) = cluster_mq(3).await;
+        // The leader is node 1 (initialized + elected). Read the ready-set from it (linearizable
+        // after a forwarded publish/claim, which applies on the leader).
+        assert!(mqs[&1].supports_ready_set(), "cluster apply is atomic (B1)");
+        assert!(mqs[&1].ready_topics().await.unwrap().is_empty());
+        mqs[&2].publish("t", b"x").await.unwrap();
+        assert_eq!(
+            mqs[&1].ready_topics().await.unwrap(),
+            vec!["t".to_string()],
+            "publish (from any node) flags the topic in the replicated ready-set (B1)"
+        );
+        // Claim the only message on node 3 → topic drains → marker pruned in the same apply (B4).
+        let batch = mqs[&3].claim("t", LEASE, 10, 5).await.unwrap();
+        assert_eq!(batch.len(), 1);
+        assert!(
+            mqs[&1].ready_topics().await.unwrap().is_empty(),
+            "a claim that drains the topic prunes the replicated marker (B4)"
+        );
+        mqs[&1].ack(&batch[0]).await.unwrap();
+        shutdown(rafts).await;
+    }
+
+    /// Gate 3 (cluster): a lost ready marker (a crash / snapshot-skew that dropped it) is re-derived
+    /// by `rebuild_ready_set` from the authoritative replicated index — no message lost. The rebuild
+    /// is NOT sharded (B7): any node re-derives the identical global set and proposes the reconcile.
+    #[serial_test::serial]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cluster_rebuild_recovers_a_lost_ready_marker() {
+        let (rafts, mqs) = cluster_mq(3).await;
+        mqs[&1].publish("t", b"x").await.unwrap();
+        // Simulate the lost marker: propose a direct delete of the ready key (leaving the index
+        // record — the message — intact). Goes through the leader like any write.
+        mqs[&1]
+            .propose(WriteOp::Delete {
+                key: messaging::ready_key("t"),
+            })
+            .await
+            .unwrap();
+        assert!(
+            mqs[&1].ready_topics().await.unwrap().is_empty(),
+            "marker lost"
+        );
+        assert_eq!(mqs[&1].backlog("t").await.unwrap(), 1, "message NOT lost");
+        // Rebuild (from any node — here a follower) re-derives + proposes the marker.
+        let n = mqs[&2].rebuild_ready_set().await.unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(
+            mqs[&1].ready_topics().await.unwrap(),
+            vec!["t".to_string()],
+            "rebuild re-adds the lost marker from the replicated index (B6/B18)"
+        );
+        // And it is claimable.
+        assert_eq!(mqs[&3].claim("t", LEASE, 10, 5).await.unwrap().len(), 1);
+        shutdown(rafts).await;
+    }
+
+    /// A nack re-arms the topic's ready marker in the replicated apply (B1), so a redelivery is
+    /// visible in the ready-set on every node.
+    #[serial_test::serial]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cluster_nack_rearms_ready_marker() {
+        let (rafts, mqs) = cluster_mq(3).await;
+        mqs[&1].publish("t", b"x").await.unwrap();
+        let m = mqs[&1]
+            .claim("t", LEASE, 10, 5)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        // The claim drained the topic → marker pruned.
+        assert!(mqs[&1].ready_topics().await.unwrap().is_empty());
+        // Nack from another node re-arms the marker (claimable again).
+        mqs[&2].nack(&m).await.unwrap();
+        assert_eq!(
+            mqs[&1].ready_topics().await.unwrap(),
+            vec!["t".to_string()],
+            "a nack re-arms the replicated ready marker (B1)"
+        );
         shutdown(rafts).await;
     }
 

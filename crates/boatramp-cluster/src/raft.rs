@@ -398,6 +398,11 @@ pub(crate) fn apply_op(target: &mut ApplyTarget, op: WriteOp) -> WriteResponse {
                 let fresh = serde_json::to_vec(&record).expect("record serializes");
                 target.put(key, fresh);
             }
+            // Event-driven delivery (B1): flag the topic ready IN THIS SAME apply — the ready marker
+            // rides the identical replicated entry as the index record it describes, so it can never
+            // diverge and needs no extra proposal/round-trip. Cluster atomicity is by construction:
+            // one apply's recorded `muts` persist together in the state machine.
+            target.put(messaging::ready_key(&topic), Vec::new());
             if retain {
                 // Fan-out log entry (existence marker) + the per-topic gate marker,
                 // advanced to the max id seen so out-of-order applies (ids carry a
@@ -448,6 +453,10 @@ pub(crate) fn apply_op(target: &mut ApplyTarget, op: WriteOp) -> WriteResponse {
                     if let Ok(json) = serde_json::to_vec(&record) {
                         target.put(key, json);
                     }
+                    // Event-driven delivery (B1): a nacked message is claimable again (now, or at
+                    // `until_ms`), so re-arm the topic's ready marker in this same apply — a prior
+                    // claim-drain may have pruned it. The due-heap covers a future `until_ms`.
+                    target.put(messaging::ready_key(&topic), Vec::new());
                 }
             }
             WriteResponse::Kv
@@ -511,6 +520,9 @@ pub(crate) fn apply_op(target: &mut ApplyTarget, op: WriteOp) -> WriteResponse {
                 }
                 if changed {
                     put_group_state(target, &topic, &group, &state);
+                    // Event-driven delivery (B1): the nacked grouped message is claimable again — re-arm
+                    // the topic's shared per-topic ready marker (B5) in this same apply.
+                    target.put(messaging::ready_key(&topic), Vec::new());
                 }
             }
             WriteResponse::Kv
@@ -537,6 +549,9 @@ pub(crate) fn apply_op(target: &mut ApplyTarget, op: WriteOp) -> WriteResponse {
             }
             put_group_state(target, &topic, &group, &state);
             target.remove(messaging::gdead_key(&topic, &group, &id));
+            // Event-driven delivery (B1): a redriven dead-letter is claimable again for its group —
+            // re-arm the topic's shared ready marker in this same apply.
+            target.put(messaging::ready_key(&topic), Vec::new());
             WriteResponse::Kv
         }
         WriteOp::MqResetGroup {
@@ -646,9 +661,21 @@ fn apply_mq_claim(
             records.push((key[prefix.len()..].to_string(), record));
         }
     }
+    // Emptiness-after-this-claim (B4), computed from the same snapshot the plan runs over — inside
+    // ONE leader-serialized apply, so there is NO prune-vs-publish race (a concurrent MqPublish is a
+    // separate apply, ordered before or after this one; the double-owner window is safe by
+    // construction). A record counts as claimable-now iff its lease has expired, it is not TTL-dead,
+    // and it is under max_attempts (the same predicate `plan_claim` leases by).
+    let claimable_now = |rec: &messaging::Record| -> bool {
+        rec.lease_until_ms <= now_ms
+            && !(rec.expires_at_ms != 0 && rec.expires_at_ms <= now_ms)
+            && rec.attempts < max_attempts
+    };
+    let claimable_before = records.iter().filter(|(_, r)| claimable_now(r)).count();
     let actions = messaging::plan_claim(records, now_ms, lease_ms, max_batch, max_attempts);
 
     let mut claimed = Vec::new();
+    let mut leased = 0usize;
     for action in actions {
         match action {
             messaging::ClaimAction::Lease { id, record } => {
@@ -662,6 +689,7 @@ fn apply_mq_claim(
                     // record, not object storage, so the node can't fetch it separately).
                     inline: record.inline,
                 });
+                leased += 1;
             }
             messaging::ClaimAction::DeadLetter { id, record } => {
                 let json = serde_json::to_vec(&record).expect("record serializes");
@@ -670,7 +698,30 @@ fn apply_mq_claim(
             }
         }
     }
+    // B4/B5 — conditional ready-set prune. The per-topic marker covers every lane, and this
+    // work-queue claim only sees the work-queue lane, so prune ONLY for a topic with NO registered
+    // groups (else the periodic rebuild prunes it once ALL lanes drain — a stale marker costs one
+    // cheap empty claim, never a stranding). Work-queue drained iff every claimable-now record got
+    // leased (residual `claimable_before − leased == 0`). No gen guard needed — the leader serializes
+    // this apply against every MqPublish, so nothing races within the apply.
+    let wq_drained = claimable_before.saturating_sub(leased) == 0;
+    if wq_drained && !topic_has_groups_applied(target, topic) {
+        target.remove(messaging::ready_key(topic));
+    }
     claimed
+}
+
+/// Whether `topic` has ≥1 registered consumer group in the applied state (any `mqgstate/{topic}/…`
+/// key) — the per-topic ready-marker prune (B5) fires only for a group-less topic, so a grouped
+/// topic's shared marker is never dropped by a work-queue claim while a group lane may still have
+/// work. A bounded range scan over the group-state prefix (one entry per group, not per message).
+fn topic_has_groups_applied(target: &ApplyTarget, topic: &str) -> bool {
+    let gprefix = messaging::gstate_prefix(topic);
+    target
+        .data
+        .range(gprefix.clone()..)
+        .take_while(|(k, _)| k.starts_with(&gprefix))
+        .any(|(k, _)| messaging::is_direct_child(k, &gprefix))
 }
 
 /// Load a consumer group's compact state from the applied map (`None` if the
