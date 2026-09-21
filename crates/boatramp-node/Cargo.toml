@@ -121,3 +121,5 @@ tower = { version = "0.5", features = ["util"] }
 # helpers the container backend's live test uses.
 bytes.workspace = true
 futures.workspace = true
+# Reading an invoke response body in the migrate function-step live gate (the S2 context-gate probe).
+http-body-util.workspace = true
