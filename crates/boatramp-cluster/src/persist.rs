@@ -373,6 +373,19 @@ impl crate::raft::AppliedState for PersistentStateMachine {
     async fn list_prefix(&self, prefix: &str) -> Vec<String> {
         Self::list_prefix(self, prefix).await
     }
+    async fn applied_voters(&self) -> Vec<NodeId> {
+        // The last APPLIED membership's voter ids (B8), from the durable state machine — replicated,
+        // so identical across nodes (divergence bounded by apply lag).
+        let mut ids: Vec<NodeId> = self
+            .inner
+            .lock()
+            .await
+            .last_membership
+            .voter_ids()
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
 }
 
 impl RaftSnapshotBuilder<TypeConfig> for PersistentStateMachine {

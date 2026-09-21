@@ -557,6 +557,23 @@ pub trait Messaging: Send + Sync {
         ))
     }
 
+    /// **Does THIS node own `topic`'s delivery?** (Phase D cross-node topic sharding.) A cluster
+    /// partitions the topic space across nodes by a deterministic consistent-hash (rendezvous/HRW)
+    /// over the **applied, replicated membership** (B8), so each node drains only its ~`1/N` share and
+    /// the leader is no longer the single funnel that scans everything. Computed from applied state so
+    /// every node converges to the identical assignment with no coordinator chatter.
+    ///
+    /// The default is `true` — a single node (and the default [`LogMessaging`]) owns EVERY topic, so
+    /// the drainer's `shard_owns`-filter is a no-op there and there is no separate single-node loop to
+    /// maintain. On a cluster, `RaftMessaging` returns whether this node is the HRW winner for `topic`.
+    /// A transient double-owner during a membership change is SAFE (the leader-serialized atomic claim
+    /// still delivers each message once); the safety-net rebuild is NOT sharded (B7), so the no-owner
+    /// window is covered. Delivery correctness never depends on this — it only steers WHERE the scan
+    /// runs; the atomic claim remains the sole authority for who-gets-a-message-once (B9).
+    async fn shard_owns(&self, _topic: &str) -> bool {
+        true
+    }
+
     /// Subscribe to a **live, at-most-once** broadcast of `topic` — for SSE
     /// streams, *not* the durable consumer path. Every
     /// message published after the subscription is delivered once to each live
