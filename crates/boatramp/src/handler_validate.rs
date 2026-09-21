@@ -637,6 +637,7 @@ mod imp {
                     limits: None,
                     env: BTreeMap::new(),
                     invoke_targets: vec![],
+                    stats_topics: Vec::new(),
                 }],
                 ..Default::default()
             };

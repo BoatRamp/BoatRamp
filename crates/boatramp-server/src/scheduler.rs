@@ -373,6 +373,8 @@ pub(super) async fn run_scheduler_tick(
                             &std::collections::BTreeMap::new(),
                             // Consumers do not get the invoke capability (no allowlist field).
                             &[],
+                            // The consumer's declared `bus:` stats-topic templates (messaging-stats).
+                            &consumer.stats_topics,
                             0,
                             // Background consumers have no request context to correlate with.
                             None,
@@ -439,6 +441,7 @@ pub(super) async fn run_scheduler_tick(
                                 site_handlers,
                                 tenancy: consumer.tenancy.as_ref(),
                                 token_claims: consumer.token_claims.as_ref(),
+                                stats_topics: &consumer.stats_topics,
                             });
                         acked += dispatch_consumer_batch(
                             &inner.engine,
@@ -630,6 +633,7 @@ async fn fire_cron(
         // A cron-triggered handler is also the root of a call chain (depth 0); its
         // invoke allowlist applies the same as on the HTTP path.
         &handler.invoke_targets,
+        &handler.stats_topics,
         0,
         // A cron trigger has no inbound request to correlate with.
         None,
