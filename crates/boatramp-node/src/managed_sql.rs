@@ -17,6 +17,8 @@ use boatramp_core::envelope::KeyEnvelope;
 use boatramp_core::kv::KvStore;
 use boatramp_core::project::ProjectRef;
 use boatramp_core::sql::SqlError;
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+use boatramp_core::sql::{MigrationError, MigrationReport, MigrationStatus, MigrationStep};
 use boatramp_storage::sql_compute::{ComputeEndpointResolver, ReplicaDiag};
 use boatramp_storage::ExternalSqlKind;
 
@@ -516,11 +518,45 @@ impl NodeOperatorSql {
     }
 
     /// Resolve + connect the SQL backend for database `db` in `project` (managed or
-    /// bring-your-own), mirroring the handler runtime's per-database construction.
-    async fn backend_for(
+    /// bring-your-own), mirroring the handler runtime's per-database construction. The
+    /// operator path (`sql exec/query/ping`) — connects as the configured identity (the
+    /// superuser on a Shared server).
+    pub(crate) async fn backend_for(
         &self,
         project: &str,
         db: &str,
+    ) -> Result<Arc<dyn boatramp_core::sql::SqlBackend>, SqlError> {
+        self.connect_for(project, db, false).await
+    }
+
+    /// Resolve + connect as the project **owner** role (the schema-migration path). Identical
+    /// to [`backend_for`](Self::backend_for) except on a Shared server it connects as the
+    /// per-project non-superuser owner role with the sealed owner credential — never the
+    /// cluster superuser (see [`owner_target`]).
+    pub(crate) async fn owner_backend_for(
+        &self,
+        project: &str,
+        db: &str,
+    ) -> Result<Arc<dyn boatramp_core::sql::SqlBackend>, SqlError> {
+        self.connect_for(project, db, true).await
+    }
+
+    /// The SQL engine of managed database `db`, if configured (for the migration runner's
+    /// engine gate — schema migrations are Postgres-only in this release).
+    pub(crate) fn engine_kind(&self, db: &str) -> Option<ExternalSqlKind> {
+        self.databases
+            .get(db)
+            .and_then(|cfg| ExternalSqlKind::parse(&cfg.kind))
+    }
+
+    /// Shared body of [`backend_for`](Self::backend_for) / [`owner_backend_for`](Self::owner_backend_for):
+    /// `owner` selects [`owner_target`] (the non-superuser owner role) over [`operator_target`]
+    /// (the configured/superuser identity) for the compute-backed case.
+    async fn connect_for(
+        &self,
+        project: &str,
+        db: &str,
+        owner: bool,
     ) -> Result<Arc<dyn boatramp_core::sql::SqlBackend>, SqlError> {
         use boatramp_storage::sql_compute::ComputeResolvedSqlBackend;
         use boatramp_storage::sql_sqlx::{connect, ExternalSqlOptions};
@@ -537,7 +573,11 @@ impl NodeOperatorSql {
             // binding is **per-tenant**, so derive the tenant the SAME way the resolver
             // does — otherwise operator `sql exec/query` would target the tenant-blind
             // bare `<compute>`/`default` (Bug 2's operator arm) and reach the wrong DB.
-            let target = operator_target(cfg, project, db)?;
+            let target = if owner {
+                owner_target(cfg, project, db)?
+            } else {
+                operator_target(cfg, project, db)?
+            };
 
             // The password source: an operator-supplied `password_env` (brought
             // credential) reads the env var as before; a managed credential is unsealed
@@ -682,6 +722,49 @@ pub(crate) fn operator_target(
     })
 }
 
+/// Derive the connection target for a **schema migration** against a compute-backed managed
+/// binding — identical to [`operator_target`] EXCEPT, on a multi-tenant **Shared** server, it
+/// connects as the per-project non-superuser **owner role** with the sealed owner credential,
+/// NOT the cluster superuser. This is the whole point of the owner-gated migration surface: DDL
+/// runs bounded to project-owner authority (Postgres denies the owner role cross-database /
+/// role-escalation / `COPY … TO PROGRAM` by privilege), never as a cluster superuser.
+///
+/// - **Shared, real tenant** — user = `names.owner_role`, credential keyed by
+///   `(project, owner_credential_workload_key(<compute>, <ident>))` (the sealed owner password
+///   minted at provision). This is the security-critical deviation from `operator_target`.
+/// - **Shared, default tenant** / **Single** / **bring-your-own** — identical to `operator_target`
+///   (the configured user is already the DB owner and is `<= project-owner`: a single-tenant
+///   install's own user, a per-workload Single user, or the operator's own external credential).
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+pub(crate) fn owner_target(
+    cfg: &crate::config::ExternalDatabaseConfig,
+    project: &str,
+    db: &str,
+) -> Result<OperatorTarget, SqlError> {
+    use crate::config::{TenantIsolation, TenantScope};
+    use crate::tenant_sql::{owner_credential_workload_key, tenant_key, tenant_names};
+
+    // Start from the operator derivation, then override the identity/credential for the one case
+    // that must NOT be the superuser: a real tenant on a Shared server.
+    let mut target = operator_target(cfg, project, db)?;
+
+    if matches!(cfg.tenant, TenantIsolation::Shared)
+        && !matches!(cfg.tenant_scope, TenantScope::Site)
+    {
+        let compute = cfg.compute.as_deref().unwrap_or_default();
+        let database = cfg.database.as_deref().unwrap_or_default();
+        let (tenant_ident_raw, is_default) = tenant_key(cfg.tenant_scope, project, "");
+        if !is_default {
+            let names = tenant_names(cfg.tenant, compute, database, &tenant_ident_raw, is_default);
+            let ident = boatramp_storage::tenant_provision::sanitize_ident(&tenant_ident_raw);
+            target.user = names.owner_role;
+            target.cred_project = project.to_string();
+            target.cred_workload = owner_credential_workload_key(compute, &ident);
+        }
+    }
+    Ok(target)
+}
+
 #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
 #[async_trait]
 impl boatramp_core::sql::OperatorSql for NodeOperatorSql {
@@ -748,6 +831,355 @@ impl boatramp_core::sql::OperatorSql for NodeOperatorSql {
             });
         }
         Ok(out)
+    }
+}
+
+/// The schema-migration runner (Postgres). Owns the ordered `schema_migrations` ledger and applies
+/// the pending suffix of a step set, once each, transactionally-where-possible, connecting as the
+/// per-project non-superuser **owner** role (via [`NodeOperatorSql::owner_backend_for`]) for the
+/// ledger + `sql` steps, and as the superuser (via [`NodeOperatorSql::backend_for`]) ONLY for the
+/// allowlist-gated, host-templated `CREATE EXTENSION`. boatramp owns ordering/idempotency/atomicity;
+/// the caller supplies the ordered steps. `Project·Admin`-gated at the API.
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+pub struct NodeMigrationRunner {
+    op: Arc<NodeOperatorSql>,
+    /// The operator's trusted-extension allowlist — the ONLY extensions an `Extension` step may
+    /// enable (a name not here is refused fail-closed).
+    trusted_extensions: std::collections::BTreeSet<String>,
+}
+
+/// The host-owned schema holding the migration ledger — owner-role-owned, and NOT in `public`, so
+/// the runtime tenant role (which only ever gets DML on `public` via `grant_app_role_ddl`) has no
+/// access to it: the ledger is append-only from the app's perspective by schema isolation.
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+const LEDGER_SCHEMA: &str = "boatramp_migrations";
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+const LEDGER_TABLE: &str = "schema_migrations";
+
+/// Quote a SQL string literal (single-quoted, doubling embedded `'`). The ledger id/hash reaching
+/// this are already validated ([`valid_migration_id`]) / hex, but we quote defensively so no value
+/// can break out of its literal in the host-built ledger INSERT.
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+fn sql_quote_literal(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
+/// A migration id is restricted to `[A-Za-z0-9._-]+` (non-empty) — defensive belt beside the
+/// literal-quoting, and it keeps ledger ids clean/greppable. Anything else is refused fail-closed.
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+fn valid_migration_id(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+/// Whether `script` contains a `CREATE EXTENSION` statement (whitespace-normalized, case-insensitive).
+/// Raw `sql` steps are refused if so — extensions must go through an allowlist-gated `Extension` step.
+/// (This is a UX/allowlist-consistency guard; the security boundary is that the owner role is
+/// non-superuser and so cannot create an UNtrusted extension regardless.)
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+fn mentions_create_extension(script: &str) -> bool {
+    let up = script.to_ascii_uppercase();
+    let normalized: String = up.split_whitespace().collect::<Vec<_>>().join(" ");
+    normalized.contains("CREATE EXTENSION")
+}
+
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+impl NodeMigrationRunner {
+    /// Build over a [`NodeOperatorSql`] (for the owner + superuser backends) and the operator's
+    /// trusted-extension allowlist.
+    pub fn new(
+        op: Arc<NodeOperatorSql>,
+        trusted_extensions: std::collections::BTreeSet<String>,
+    ) -> Self {
+        Self {
+            op,
+            trusted_extensions,
+        }
+    }
+
+    /// The fully-qualified, quoted ledger table name.
+    fn ledger() -> String {
+        use boatramp_storage::tenant_provision::quote_ident;
+        format!(
+            "{}.{}",
+            quote_ident(ExternalSqlKind::Postgres, LEDGER_SCHEMA),
+            quote_ident(ExternalSqlKind::Postgres, LEDGER_TABLE)
+        )
+    }
+
+    /// The host-built ledger INSERT for one applied step (all values host-controlled + quoted).
+    fn ledger_insert(step: &MigrationStep, ordinal: usize) -> String {
+        format!(
+            "INSERT INTO {ledger} (id, ordinal, content_hash, kind) VALUES ({id}, {ord}, {hash}, {kind});",
+            ledger = Self::ledger(),
+            id = sql_quote_literal(&step.id),
+            ord = ordinal,
+            hash = sql_quote_literal(&step.content_hash()),
+            kind = sql_quote_literal(step.kind()),
+        )
+    }
+
+    /// Ensure the ledger schema + table exist (idempotent), as the owner role.
+    async fn ensure_ledger(
+        &self,
+        owner: &Arc<dyn boatramp_core::sql::SqlBackend>,
+    ) -> Result<(), SqlError> {
+        use boatramp_storage::tenant_provision::quote_ident;
+        let schema = quote_ident(ExternalSqlKind::Postgres, LEDGER_SCHEMA);
+        owner
+            .run_script(&format!("CREATE SCHEMA IF NOT EXISTS {schema};"))
+            .await?;
+        owner
+            .run_script(&format!(
+                "CREATE TABLE IF NOT EXISTS {ledger} (\
+                 id text PRIMARY KEY, \
+                 ordinal integer NOT NULL, \
+                 content_hash text NOT NULL, \
+                 kind text NOT NULL, \
+                 applied_at timestamptz NOT NULL DEFAULT now(), \
+                 applied_by text);",
+                ledger = Self::ledger()
+            ))
+            .await?;
+        Ok(())
+    }
+
+    /// Read the applied ledger rows, ordered by `ordinal`.
+    async fn read_applied(
+        &self,
+        owner: &Arc<dyn boatramp_core::sql::SqlBackend>,
+    ) -> Result<Vec<boatramp_core::sql::AppliedMigration>, SqlError> {
+        use boatramp_core::sql::{AppliedMigration, SqlValue};
+        let rows = owner
+            .run_query(&format!(
+                "SELECT id, ordinal, content_hash, kind, applied_at::text \
+                 FROM {ledger} ORDER BY ordinal;",
+                ledger = Self::ledger()
+            ))
+            .await?;
+        let text = |v: &SqlValue| match v {
+            SqlValue::Text(s) => s.clone(),
+            other => format!("{other:?}"),
+        };
+        let int = |v: &SqlValue| match v {
+            SqlValue::Integer(n) => *n,
+            _ => 0,
+        };
+        Ok(rows
+            .rows
+            .iter()
+            .map(|r| AppliedMigration {
+                id: r.first().map(&text).unwrap_or_default(),
+                ordinal: r.get(1).map(&int).unwrap_or_default(),
+                content_hash: r.get(2).map(&text).unwrap_or_default(),
+                kind: r.get(3).map(&text).unwrap_or_default(),
+                applied_at: r.get(4).map(&text).unwrap_or_default(),
+            })
+            .collect())
+    }
+}
+
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+#[async_trait]
+impl boatramp_core::sql::MigrationRunner for NodeMigrationRunner {
+    async fn apply(
+        &self,
+        project: &str,
+        db: &str,
+        steps: &[MigrationStep],
+        dry_run: bool,
+    ) -> Result<MigrationReport, MigrationError> {
+        use boatramp_core::sql::{MigrationAction, MigrationFailure};
+
+        // Engine gate: Postgres only in this release (the owner-role/RLS model + transactional DDL
+        // are Postgres semantics; MySQL Shared has no owner/runtime split). Fail closed + clear.
+        match self.op.engine_kind(db) {
+            Some(ExternalSqlKind::Postgres) => {}
+            Some(_) => {
+                return Err(MigrationError::Other(format!(
+                "database {db:?}: schema migrations are supported on Postgres only in this release"
+            )))
+            }
+            None => return Err(MigrationError::NotConfigured),
+        }
+
+        // Connect as the OWNER role (never the superuser). A managed DB still starting surfaces as
+        // Unavailable → a retryable 503 at the API, not a permanent failure.
+        let owner = self
+            .op
+            .owner_backend_for(project, db)
+            .await
+            .map_err(|e| match e {
+                SqlError::Unavailable(m) => MigrationError::Unavailable(m),
+                other => MigrationError::Sql(other),
+            })?;
+        self.ensure_ledger(&owner).await?;
+        let applied = self.read_applied(&owner).await?;
+
+        // Prefix-consistency + content-hash immutability: the recorded ids must be an ordered
+        // prefix of the requested steps, same id@ordinal@hash. A divergence (reordered/dropped) or a
+        // changed applied body is refused fail-closed — never a silent re-apply or reordering.
+        if applied.len() > steps.len() {
+            return Err(MigrationError::PrefixDivergence(format!(
+                "the ledger has {} applied migrations but only {} were supplied",
+                applied.len(),
+                steps.len()
+            )));
+        }
+        for (i, rec) in applied.iter().enumerate() {
+            if steps[i].id != rec.id {
+                return Err(MigrationError::PrefixDivergence(format!(
+                    "position {i}: ledger has {:?} but the set has {:?}",
+                    rec.id, steps[i].id
+                )));
+            }
+            if steps[i].content_hash() != rec.content_hash {
+                return Err(MigrationError::ContentChanged(rec.id.clone()));
+            }
+        }
+
+        let already_applied: Vec<String> = applied.iter().map(|a| a.id.clone()).collect();
+        let pending: Vec<&MigrationStep> = steps[applied.len()..].iter().collect();
+
+        if dry_run {
+            return Ok(MigrationReport {
+                newly_applied: Vec::new(),
+                already_applied,
+                pending: pending.iter().map(|s| s.id.clone()).collect(),
+                failed: None,
+            });
+        }
+
+        let mut newly_applied = Vec::new();
+        for (offset, step) in pending.iter().enumerate() {
+            let ordinal = applied.len() + offset;
+            // Per-step validation → a per-step failure (report.failed), not a whole-request error.
+            if !valid_migration_id(&step.id) {
+                return Ok(MigrationReport {
+                    newly_applied,
+                    already_applied,
+                    pending: Vec::new(),
+                    failed: Some(MigrationFailure {
+                        id: step.id.clone(),
+                        error: "invalid migration id (allowed: A-Za-z0-9._-)".to_string(),
+                    }),
+                });
+            }
+            let outcome: Result<(), String> = match &step.action {
+                MigrationAction::Sql {
+                    script,
+                    no_transaction,
+                } => {
+                    if mentions_create_extension(script) {
+                        Err(
+                            "a sql step may not CREATE EXTENSION — use an extension step"
+                                .to_string(),
+                        )
+                    } else if *no_transaction {
+                        // Non-transactional DDL: run the script, then record the ledger row.
+                        match owner.run_script(script).await {
+                            Ok(()) => owner
+                                .run_script(&Self::ledger_insert(step, ordinal))
+                                .await
+                                .map_err(|e| e.to_string()),
+                            Err(e) => Err(e.to_string()),
+                        }
+                    } else {
+                        // Atomic: DDL + ledger insert commit together (or roll back together).
+                        let batch = format!(
+                            "BEGIN;\n{script}\n{insert}\nCOMMIT;",
+                            insert = Self::ledger_insert(step, ordinal)
+                        );
+                        owner.run_script(&batch).await.map_err(|e| e.to_string())
+                    }
+                }
+                MigrationAction::Extension { name } => {
+                    if !self.trusted_extensions.contains(name) {
+                        Err(format!(
+                            "extension {name:?} is not on the operator trusted-extension allowlist"
+                        ))
+                    } else {
+                        use boatramp_storage::tenant_provision::quote_ident;
+                        // Host-templated + allowlist-bounded; run via the superuser so an allowlisted
+                        // superuser-only extension also works. IF NOT EXISTS keeps it idempotent, so a
+                        // crash before the ledger insert re-runs harmlessly.
+                        let create = format!(
+                            "CREATE EXTENSION IF NOT EXISTS {};",
+                            quote_ident(ExternalSqlKind::Postgres, name)
+                        );
+                        match self.op.backend_for(project, db).await {
+                            Ok(su) => match su.run_script(&create).await {
+                                Ok(()) => owner
+                                    .run_script(&Self::ledger_insert(step, ordinal))
+                                    .await
+                                    .map_err(|e| e.to_string()),
+                                Err(e) => Err(e.to_string()),
+                            },
+                            Err(e) => Err(e.to_string()),
+                        }
+                    }
+                }
+            };
+            match outcome {
+                Ok(()) => newly_applied.push(step.id.clone()),
+                Err(error) => {
+                    return Ok(MigrationReport {
+                        newly_applied,
+                        already_applied,
+                        pending: Vec::new(),
+                        failed: Some(MigrationFailure {
+                            id: step.id.clone(),
+                            error: sanitize_migration_error(&error),
+                        }),
+                    })
+                }
+            }
+        }
+
+        Ok(MigrationReport {
+            newly_applied,
+            already_applied,
+            pending: Vec::new(),
+            failed: None,
+        })
+    }
+
+    async fn status(&self, project: &str, db: &str) -> Result<MigrationStatus, MigrationError> {
+        match self.op.engine_kind(db) {
+            Some(ExternalSqlKind::Postgres) => {}
+            Some(_) => {
+                return Err(MigrationError::Other(format!(
+                "database {db:?}: schema migrations are supported on Postgres only in this release"
+            )))
+            }
+            None => return Err(MigrationError::NotConfigured),
+        }
+        let owner = self
+            .op
+            .owner_backend_for(project, db)
+            .await
+            .map_err(|e| match e {
+                SqlError::Unavailable(m) => MigrationError::Unavailable(m),
+                other => MigrationError::Sql(other),
+            })?;
+        self.ensure_ledger(&owner).await?;
+        Ok(MigrationStatus {
+            applied: self.read_applied(&owner).await?,
+        })
+    }
+}
+
+/// Trim a driver error string to a first line and a bounded length so a migration failure returned
+/// to the client can't carry a wall of internal DSN/schema detail (defense against info leakage).
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+fn sanitize_migration_error(e: &str) -> String {
+    let first = e.lines().next().unwrap_or(e);
+    if first.len() > 300 {
+        format!("{}…", &first[..300])
+    } else {
+        first.to_string()
     }
 }
 

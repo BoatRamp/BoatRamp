@@ -616,6 +616,172 @@ pub struct SqlPingReplica {
     pub tcp_reachable: bool,
 }
 
+/// One ordered step in a schema migration set. A step has a stable, author-given `id`
+/// (recorded in the ledger and NEVER re-ordered or renumbered — the ledger enforces
+/// prefix-consistency against the recorded order) and an [`action`](MigrationAction).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigrationStep {
+    /// Stable migration identity, e.g. `"0001_init"`. Unique within a set.
+    pub id: String,
+    /// What the step does.
+    pub action: MigrationAction,
+}
+
+/// What a [`MigrationStep`] applies. Deliberately NOT arbitrary SQL-anytime: a `Sql`
+/// step is refused if it contains `CREATE EXTENSION`, so the ONLY way to enable an
+/// extension is an [`Extension`](MigrationAction::Extension) step — which is
+/// allowlist-gated and host-templated. (Hook steps — a normal wasm invocation for
+/// data verification / backfills — are a planned follow-up workstation, not this set.)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MigrationAction {
+    /// A DDL/DML script applied as the project **owner** role (a non-superuser role
+    /// confined to the project's own database). Rejected fail-closed if it contains
+    /// `CREATE EXTENSION`. `no_transaction` applies it OUTSIDE a wrapping transaction —
+    /// for the DDL Postgres forbids inside one (`CREATE INDEX CONCURRENTLY`,
+    /// `CREATE DATABASE`, `ALTER TYPE … ADD VALUE`, `VACUUM`); the ledger row is then
+    /// recorded in a following statement, so the author owns that step's idempotency.
+    Sql {
+        /// The migration SQL (one or more statements).
+        script: String,
+        /// Apply outside a wrapping transaction (for non-transactional DDL).
+        no_transaction: bool,
+    },
+    /// Enable a Postgres extension by name — validated against the operator's
+    /// trusted-extension allowlist and run through a host-templated
+    /// `CREATE EXTENSION IF NOT EXISTS "<name>"` (no guest SQL, no injection). The only
+    /// admitted extension path; a name not on the allowlist is refused fail-closed.
+    Extension {
+        /// The extension name (allowlist-checked; quoted as an identifier when emitted).
+        name: String,
+    },
+}
+
+impl MigrationStep {
+    /// The ledger `kind` tag for this step.
+    pub fn kind(&self) -> &'static str {
+        match self.action {
+            MigrationAction::Sql { .. } => "sql",
+            MigrationAction::Extension { .. } => "extension",
+        }
+    }
+
+    /// A stable content hash over the step's identity + kind + body — recorded in the
+    /// ledger so re-submitting an already-applied `id` with a CHANGED body is detected
+    /// and refused (tamper/drift evidence), and so re-ordering is caught.
+    pub fn content_hash(&self) -> String {
+        let body = match &self.action {
+            MigrationAction::Sql {
+                script,
+                no_transaction,
+            } => format!("sql:{no_transaction}:{script}"),
+            MigrationAction::Extension { name } => format!("extension:{name}"),
+        };
+        crate::deploy::sha256_hex(format!("{}\n{body}", self.id).as_bytes())
+    }
+}
+
+/// One applied migration as recorded in the `schema_migrations` ledger.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AppliedMigration {
+    /// The migration id.
+    pub id: String,
+    /// Its application order (0-based).
+    pub ordinal: i64,
+    /// The content hash recorded at apply time.
+    pub content_hash: String,
+    /// The ledger `kind` (`sql` / `extension`).
+    pub kind: String,
+    /// When it was applied (RFC3339, best-effort formatting from the engine).
+    pub applied_at: String,
+}
+
+/// The outcome of a [`MigrationRunner::apply`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MigrationReport {
+    /// Ids applied by THIS call, in order.
+    pub newly_applied: Vec<String>,
+    /// Ids skipped because they were already recorded (idempotent no-op).
+    pub already_applied: Vec<String>,
+    /// Ids that WOULD apply (populated only for a dry run; empty on a real apply).
+    pub pending: Vec<String>,
+    /// The step that failed (application halts there; the prefix before it is applied).
+    pub failed: Option<MigrationFailure>,
+}
+
+/// A failed migration step, surfaced structurally so a thin client can show which one
+/// failed and why without server-log access.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MigrationFailure {
+    /// The failing step's id.
+    pub id: String,
+    /// The (sanitized) failure reason.
+    pub error: String,
+}
+
+/// The applied-migration state of a database's ledger.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MigrationStatus {
+    /// Every applied migration, in application order.
+    pub applied: Vec<AppliedMigration>,
+}
+
+/// A failure from the [`MigrationRunner`].
+#[derive(Debug, thiserror::Error)]
+pub enum MigrationError {
+    /// The managed backend is still starting (transient — retry / `503`), mirrors
+    /// [`SqlError::Unavailable`].
+    #[error("migration backend not ready: {0}")]
+    Unavailable(String),
+    /// The requested set diverges from the recorded application order (a reordered or
+    /// gapped prefix) — refused fail-closed rather than silently applying out of order.
+    #[error("migration order diverged from the recorded ledger: {0}")]
+    PrefixDivergence(String),
+    /// An already-applied `id` was re-submitted with a different body.
+    #[error("migration {0} was modified after it was applied (content-hash mismatch)")]
+    ContentChanged(String),
+    /// An `Extension` step named an extension not on the operator allowlist.
+    #[error("extension {0:?} is not on the operator trusted-extension allowlist")]
+    ExtensionNotAllowed(String),
+    /// A raw `Sql` step contained `CREATE EXTENSION` (use an `Extension` step instead).
+    #[error(
+        "a sql migration step may not CREATE EXTENSION — use an extension step (allowlist-gated)"
+    )]
+    RawCreateExtension,
+    /// No managed SQL is configured on this node (mirrors the `501` of the sql-exec API).
+    #[error("managed sql is not configured on this node")]
+    NotConfigured,
+    /// A backend/transport error during application.
+    #[error(transparent)]
+    Sql(#[from] SqlError),
+    /// Anything else.
+    #[error("{0}")]
+    Other(String),
+}
+
+/// The operator-facing **schema-migration** capability for a managed database: apply an
+/// ordered set of migration steps, once each, transactionally-where-possible, tracked in
+/// a host-owned `schema_migrations` ledger, connecting as the project's non-superuser
+/// **owner** role (never the cluster superuser). Backs the `Project·Admin`-gated
+/// `POST /api/migrate/{db}/{apply,dry-run}` + `GET /api/migrate/{db}/status`. boatramp
+/// owns sequencing/ordering/idempotency/atomicity; the caller supplies the ordered steps.
+#[async_trait]
+pub trait MigrationRunner: Send + Sync {
+    /// Apply the pending suffix of `steps` (those whose `id` is not already recorded) in
+    /// the given order, each `Sql` step + its ledger row committed atomically (unless
+    /// `no_transaction`). Fails closed on a diverged prefix or a changed applied step.
+    /// `dry_run` computes the plan (pending ids) WITHOUT applying anything.
+    async fn apply(
+        &self,
+        project: &str,
+        db: &str,
+        steps: &[MigrationStep],
+        dry_run: bool,
+    ) -> Result<MigrationReport, MigrationError>;
+
+    /// The applied-migration ledger state for managed database `db` in `project`.
+    async fn status(&self, project: &str, db: &str) -> Result<MigrationStatus, MigrationError>;
+}
+
 /// Tear down a deleted tenant's **managed** databases — the delete-time counterpart
 /// to the create-time provisioning of a per-tenant managed `sql` binding. When a
 /// project (or site) is deleted through the control plane, boatramp drops *that
