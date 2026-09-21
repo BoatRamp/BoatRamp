@@ -654,6 +654,25 @@ pub enum MigrationAction {
         /// The extension name (allowlist-checked; quoted as an identifier when emitted).
         name: String,
     },
+    /// **The base step:** invoke a project **function** that does arbitrary migration work — data
+    /// verification, external-source sync, DML, and DDL (the latter via the host-mediated owner-role
+    /// `migrate-ddl` capability, granted ONLY for a migration-step invocation). The orchestrator runs
+    /// it on the async lane, quota-exempt, under a host-set migration context; the function's own
+    /// DDL is no more powerful than a `Sql` step (both = the confined owner role). At-least-once +
+    /// author-idempotent (a crash mid-function leaves the step unrecorded → it re-runs whole; the
+    /// author owns within-step idempotency). Its ledger row is written by the orchestrator only after
+    /// the invocation returns delivered-success.
+    Function {
+        /// The project function to invoke (resolved strictly within the caller's own project).
+        name: String,
+        /// The pinned deploy version to run for a deterministic re-apply; `None` ⇒ the orchestrator
+        /// pins the active version's component blob hash at apply time and records it, so replay runs
+        /// identical bytes. Never `function.active` re-resolved on each apply.
+        version: Option<String>,
+        /// Canonical (stable-serialized) invocation arguments, folded into the content hash so a
+        /// changed arg set under a used id is caught.
+        args: Option<String>,
+    },
 }
 
 impl MigrationStep {
@@ -662,12 +681,16 @@ impl MigrationStep {
         match self.action {
             MigrationAction::Sql { .. } => "sql",
             MigrationAction::Extension { .. } => "extension",
+            MigrationAction::Function { .. } => "function",
         }
     }
 
-    /// A stable content hash over the step's identity + kind + body — recorded in the
-    /// ledger so re-submitting an already-applied `id` with a CHANGED body is detected
-    /// and refused (tamper/drift evidence), and so re-ordering is caught.
+    /// A stable **intrinsic** content hash over the step's identity + kind + body — recorded in the
+    /// ledger so re-submitting an already-applied `id` with a CHANGED body is detected and refused
+    /// (tamper/drift evidence), and so re-ordering is caught. For a `Function` step this covers
+    /// name + version + canonical args; the orchestrator additionally binds the RESOLVED component
+    /// blob hash via [`effective_hash`](Self::effective_hash) so a redeploy under the same version
+    /// tag is caught (a `Function`'s body is a reference, not self-contained text).
     pub fn content_hash(&self) -> String {
         let body = match &self.action {
             MigrationAction::Sql {
@@ -675,8 +698,31 @@ impl MigrationStep {
                 no_transaction,
             } => format!("sql:{no_transaction}:{script}"),
             MigrationAction::Extension { name } => format!("extension:{name}"),
+            MigrationAction::Function {
+                name,
+                version,
+                args,
+            } => format!(
+                "function:{name}:{}:{}",
+                version.as_deref().unwrap_or("active"),
+                args.as_deref().unwrap_or_default()
+            ),
         };
         crate::deploy::sha256_hex(format!("{}\n{body}", self.id).as_bytes())
+    }
+
+    /// The hash the ledger records + prefix-consistency compares. For `Sql`/`Extension` it is the
+    /// intrinsic [`content_hash`](Self::content_hash). For a `Function` step the orchestrator passes
+    /// the RESOLVED component blob hash (content-addressed wasm bytes it pinned), and this binds it in
+    /// — so re-apply provably runs identical bytes and a redeploy-under-same-version-tag is refused
+    /// (Backend BR-6 / Security immutability). `resolved_blob` is `None` for non-function steps.
+    pub fn effective_hash(&self, resolved_blob: Option<&str>) -> String {
+        match resolved_blob {
+            Some(blob) => {
+                crate::deploy::sha256_hex(format!("{}\n{blob}", self.content_hash()).as_bytes())
+            }
+            None => self.content_hash(),
+        }
     }
 }
 
