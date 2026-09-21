@@ -187,13 +187,16 @@ impl KvStore for MemoryKv {
     }
 
     async fn list_prefix(&self, prefix: &str) -> Result<Vec<String>, KvError> {
+        // Range-seek to the prefix and walk forward only while keys still match — O(keys-under-prefix)
+        // on the sorted map, NOT O(total keys). This matters for the event-driven-delivery ready-set
+        // scan (`mqready/…`): an idle fleet with many other keys must not pay to scan them all.
         Ok(self
             .inner
             .lock()
             .unwrap()
-            .keys()
-            .filter(|key| key.starts_with(prefix))
-            .cloned()
+            .range(prefix.to_string()..)
+            .take_while(|(key, _)| key.starts_with(prefix))
+            .map(|(key, _)| key.clone())
             .collect())
     }
 
