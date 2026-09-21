@@ -877,43 +877,43 @@ fn valid_migration_id(id: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 
-/// Whether `script` contains a `CREATE EXTENSION` statement (whitespace-normalized, case-insensitive).
-/// Raw `sql` steps are refused if so — extensions must go through an allowlist-gated `Extension` step.
-/// (This is a UX/allowlist-consistency guard; the security boundary is that the owner role is
-/// non-superuser and so cannot create an UNtrusted extension regardless.)
+/// Whether `script` contains a `CREATE EXTENSION` statement. Raw `sql` steps are refused if so —
+/// extensions must go through an allowlist-gated `Extension` step. (A UX/allowlist-consistency guard;
+/// the security boundary is that the owner role is non-superuser and so cannot create an UNtrusted
+/// extension regardless.) Delegates to the comment-/casing-immune tokenizer ([Security review
+/// HIGH-1]: a byte scan is evadable via `CREATE/**/EXTENSION`; the tokenizer strips comments and
+/// fails closed on an unlexable script).
 #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
 fn mentions_create_extension(script: &str) -> bool {
-    let up = script.to_ascii_uppercase();
-    let normalized: String = up.split_whitespace().collect::<Vec<_>>().join(" ");
-    normalized.contains("CREATE EXTENSION")
+    boatramp_core::sql::script_has_create_extension(script)
 }
 
-/// Whether `script` issues its own transaction control (`BEGIN`/`START TRANSACTION`/`COMMIT`/`END`/
-/// `ROLLBACK`). A transactional (`!no_transaction`) step is wrapped by the runner in
-/// `BEGIN;…;<ledger-insert>;COMMIT;`, so an author's own `COMMIT`/`ROLLBACK` would desync that wrapper
-/// (e.g. a `ROLLBACK` reverts the DDL but the ledger INSERT then auto-commits, recording a step that
-/// didn't apply). Reject it fail-closed so the ledger can never diverge from applied state; an author
-/// that genuinely needs its own transaction control uses a `no_transaction` step. Word-boundary match
-/// (whitespace/`;`-delimited tokens) so an identifier like `commit_log` isn't a false positive.
+/// Whether `script` issues its own transaction control (`BEGIN`/`START`/`COMMIT`/`END`/`ROLLBACK`/
+/// `ABORT`/`SAVEPOINT`/`RELEASE`). A transactional (`!no_transaction`) step is wrapped by the runner
+/// in `BEGIN;…;<ledger-insert>;COMMIT;`, so an author's own `COMMIT`/`ROLLBACK` would desync that
+/// wrapper (a `ROLLBACK` reverts the DDL but the ledger INSERT then auto-commits, recording a step
+/// that didn't apply). Reject it fail-closed so the ledger can never diverge from applied state; an
+/// author that genuinely needs its own transaction control uses a `no_transaction` step.
+///
+/// Delegates to the SQL **tokenizer** ([Security review HIGH-1/HIGH-2]): the earlier byte scan was
+/// comment-evadable (`COMMIT-- x`, `/*c*/BEGIN`), missed `ABORT`/`SAVEPOINT`/`RELEASE`, and
+/// false-positived on `CASE … END` and PL/pgSQL `$$ BEGIN … END $$` bodies. The tokenizer is
+/// comment-/casing-/string-immune, CASE-aware, and fails closed on an unlexable script.
 #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
 fn mentions_txn_control(script: &str) -> bool {
-    let up = script.to_ascii_uppercase();
-    up.split(|c: char| c.is_whitespace() || c == ';' || c == '(')
-        .any(|tok| matches!(tok, "BEGIN" | "START" | "COMMIT" | "END" | "ROLLBACK"))
+    boatramp_core::sql::script_has_txn_control(script)
 }
 
 /// Whether `script` references the host-owned migration-ledger schema (`boatramp_migrations`). The
 /// owner role OWNS that schema, so an unguarded `migrate::exec` from a function step could rewrite
-/// prefix-consistency/immutability history. Refused fail-closed (Security S3). Case-insensitive
-/// substring match on the schema name as a whole word (so `boatramp_migrations_backup` is still
-/// caught by the prefix — deliberately broad; the ledger schema is reserved, nothing legitimate
-/// touches it). Belt-and-braces beside the schema isolation (the runtime tenant role has no grant on
-/// it at all); this stops the OWNER-role path a function step runs on.
+/// prefix-consistency/immutability history. Refused fail-closed (Security S3). Uses the tokenizer so
+/// a reference can't be hidden in a comment ([Security review HIGH-1]) and a string literal
+/// mentioning the name is not a false positive; matches the schema as a whole word token (quoted or
+/// not). Belt-and-braces beside the schema isolation (the runtime tenant role has no grant on it at
+/// all); this stops the OWNER-role path a function step runs on.
 #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
 fn mentions_ledger_schema(script: &str) -> bool {
-    script
-        .to_ascii_lowercase()
-        .contains(&LEDGER_SCHEMA.to_ascii_lowercase())
+    boatramp_core::sql::script_references_word(script, LEDGER_SCHEMA)
 }
 
 /// The host-mediated owner-role DDL seam backing the guest `migrate-ddl` capability of a `function`
@@ -960,12 +960,30 @@ impl MigrateDdl for OwnerDdl {
 
     async fn query(&self, sql: &str) -> Result<boatramp_core::sql::SqlRows, MigrateDdlError> {
         Self::guard(sql)?;
-        self.owner
+        let rows = self
+            .owner
             .run_query(sql)
             .await
-            .map_err(|e| MigrateDdlError::Sql(sanitize_migration_error(&e.to_string())))
+            .map_err(|e| MigrateDdlError::Sql(sanitize_migration_error(&e.to_string())))?;
+        // Bound the result handed to the guest ([Security review MEDIUM-2]): a verification query
+        // is expected to return a small, checkable set; refuse an unbounded read rather than encode
+        // a huge JSON blob into host memory + across the boundary. The author adds a `LIMIT`.
+        if rows.rows.len() > MIGRATE_QUERY_MAX_ROWS {
+            return Err(MigrateDdlError::Sql(format!(
+                "query returned {} rows (cap {MIGRATE_QUERY_MAX_ROWS}); add a LIMIT — a migration \
+                 verification query should read a bounded set",
+                rows.rows.len()
+            )));
+        }
+        Ok(rows)
     }
 }
+
+/// The row cap on a `migrate-ddl` `query` result (Security MEDIUM-2). A verification query reads a
+/// bounded, checkable set; beyond this it is refused so a migration function can't drive an unbounded
+/// owner-visibility read into a huge host-side JSON string.
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+const MIGRATE_QUERY_MAX_ROWS: usize = 100_000;
 
 #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
 impl NodeMigrationRunner {
@@ -1263,8 +1281,12 @@ impl MigrationSubstrate for NodeMigrationRunner {
 #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
 fn sanitize_migration_error(e: &str) -> String {
     let first = e.lines().next().unwrap_or(e);
-    if first.len() > 300 {
-        format!("{}…", &first[..300])
+    // Truncate on a CHAR boundary, not a byte index ([Security review MEDIUM-3]): a driver error can
+    // carry multi-byte UTF-8 (non-ASCII table/collation names, a localized Postgres message) that a
+    // migration author influences, so `&first[..300]` could panic mid-codepoint.
+    if first.chars().count() > 300 {
+        let truncated: String = first.chars().take(300).collect();
+        format!("{truncated}…")
     } else {
         first.to_string()
     }

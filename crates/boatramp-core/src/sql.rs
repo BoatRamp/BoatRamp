@@ -553,6 +553,184 @@ pub fn reject_reserved_session_writes(
     Ok(())
 }
 
+/// Tokenize `script` (generic dialect) into its significant **word** tokens (lowercased), dropping
+/// whitespace + comments and treating string / dollar-quoted bodies as opaque single tokens (so a
+/// `--`/`/* */` comment, a `'…'` literal, or a `$$ … $$` function body can neither hide nor forge a
+/// keyword). `None` if the script cannot be lexed — the migration guards then fail **closed**
+/// (refuse), so an unlexable step can never smuggle a guarded construct past a naive byte scan.
+///
+/// This backs the owner-gated migration guards ([`script_has_txn_control`],
+/// [`script_references_word`], [`script_has_create_extension`]): the earlier byte-scan versions were
+/// comment- and casing-evadable (`/*c*/BEGIN`, `COMMIT-- x`) — Postgres strips comments before
+/// parse, so a scan of the raw bytes saw a different statement than the server ran.
+fn significant_words(script: &str) -> Option<Vec<String>> {
+    use sqlparser::dialect::GenericDialect;
+    use sqlparser::tokenizer::{Token, Tokenizer, Word};
+    let raw = Tokenizer::new(&GenericDialect {}, script).tokenize().ok()?;
+    Some(
+        raw.iter()
+            .filter_map(|t| match t {
+                // Quoted identifiers keep their inner (unquoted) text, so a `"boatramp_migrations"`
+                // still matches — quote-immune as well as comment-immune.
+                Token::Word(Word { value, .. }) => Some(value.to_ascii_lowercase()),
+                _ => None,
+            })
+            .collect(),
+    )
+}
+
+/// Whether `script` issues its own **transaction control** — `BEGIN`/`START`/`COMMIT`/`END`/
+/// `ROLLBACK`/`ABORT`/`SAVEPOINT`/`RELEASE` as a keyword token. Comment-, casing-, string- and
+/// dollar-quote-immune (a PL/pgSQL `$$ BEGIN … END $$` body is one opaque token, so it is NOT
+/// flagged — fixing a latent false positive the byte scan had). `END` is flagged only at CASE-depth
+/// 0, so a `CASE … END` expression is not mistaken for a transaction end. Fails **closed** (returns
+/// `true`) if the script cannot be lexed.
+pub fn script_has_txn_control(script: &str) -> bool {
+    let Some(words) = significant_words(script) else {
+        return true; // fail closed
+    };
+    let mut case_depth: u32 = 0;
+    for w in &words {
+        match w.as_str() {
+            "case" => case_depth += 1,
+            "end" => {
+                if case_depth == 0 {
+                    return true; // a bare `END` = COMMIT
+                }
+                case_depth -= 1;
+            }
+            "begin" | "start" | "commit" | "rollback" | "abort" | "savepoint" | "release" => {
+                return true
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Whether `script` references identifier `needle` (case-insensitive) as a **word** token — a string
+/// literal, comment, or dollar-quoted body never matches. Backs the ledger-schema guard (`needle =
+/// "boatramp_migrations"`). Fails **closed** (returns `true`) if the script cannot be lexed.
+pub fn script_references_word(script: &str, needle: &str) -> bool {
+    let needle = needle.to_ascii_lowercase();
+    match significant_words(script) {
+        Some(words) => words.iter().any(|w| *w == needle),
+        None => true, // fail closed
+    }
+}
+
+/// Whether `script` contains `CREATE EXTENSION` as adjacent word tokens (comment-/casing-immune).
+/// Fails **closed** (returns `true`) if the script cannot be lexed.
+pub fn script_has_create_extension(script: &str) -> bool {
+    match significant_words(script) {
+        Some(words) => words
+            .windows(2)
+            .any(|w| w[0] == "create" && w[1] == "extension"),
+        None => true, // fail closed
+    }
+}
+
+#[cfg(test)]
+mod migration_guard_tests {
+    use super::{script_has_create_extension, script_has_txn_control, script_references_word};
+
+    #[test]
+    fn txn_control_is_comment_and_casing_immune() {
+        // Plain forms.
+        for s in [
+            "BEGIN; DROP TABLE t; COMMIT",
+            "commit",
+            "ROLLBACK",
+            "abort",
+            "SAVEPOINT x",
+            "RELEASE SAVEPOINT x",
+            "END",
+        ] {
+            assert!(script_has_txn_control(s), "should flag: {s:?}");
+        }
+        // Comment-evasion attempts the byte scan missed.
+        for s in [
+            "/*c*/BEGIN",
+            "COMMIT-- trailing",
+            "COMMIT/**/",
+            "BEGIN--\nDROP TABLE t",
+            "cOmMiT",
+        ] {
+            assert!(
+                script_has_txn_control(s),
+                "should flag (comment/casing): {s:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn txn_control_does_not_false_positive() {
+        // A CASE…END expression is not transaction control.
+        assert!(!script_has_txn_control(
+            "UPDATE t SET s = CASE WHEN x > 0 THEN 'a' ELSE 'b' END"
+        ));
+        // A PL/pgSQL body's BEGIN/END lives inside a dollar-quoted (opaque) token.
+        assert!(!script_has_txn_control(
+            "CREATE FUNCTION f() RETURNS int AS $$ BEGIN RETURN 1; END $$ LANGUAGE plpgsql"
+        ));
+        // `commit` inside a string literal is not control.
+        assert!(!script_has_txn_control(
+            "INSERT INTO log (msg) VALUES ('commit happened')"
+        ));
+        // Plain DDL.
+        assert!(!script_has_txn_control(
+            "CREATE TABLE t (id int primary key)"
+        ));
+    }
+
+    #[test]
+    fn ledger_schema_reference_is_comment_and_quote_immune() {
+        assert!(script_references_word(
+            "SELECT * FROM boatramp_migrations.schema_migrations",
+            "boatramp_migrations"
+        ));
+        assert!(script_references_word(
+            "DROP TABLE /*x*/ boatramp_migrations.schema_migrations",
+            "boatramp_migrations"
+        ));
+        assert!(script_references_word(
+            "SELECT * FROM \"boatramp_migrations\".t",
+            "boatramp_migrations"
+        ));
+        // Not referenced inside a string literal.
+        assert!(!script_references_word(
+            "INSERT INTO t (note) VALUES ('boatramp_migrations is host-owned')",
+            "boatramp_migrations"
+        ));
+        assert!(!script_references_word(
+            "CREATE TABLE app.widget (id int)",
+            "boatramp_migrations"
+        ));
+    }
+
+    #[test]
+    fn create_extension_is_comment_immune() {
+        assert!(script_has_create_extension("CREATE EXTENSION pgcrypto"));
+        assert!(script_has_create_extension(
+            "create/**/extension if not exists citext"
+        ));
+        assert!(!script_has_create_extension("CREATE TABLE t (id int)"));
+        // The word 'extension' alone (e.g. a column) is not CREATE EXTENSION.
+        assert!(!script_has_create_extension(
+            "CREATE TABLE t (extension text)"
+        ));
+    }
+
+    #[test]
+    fn unlexable_fails_closed() {
+        // An unterminated string can't be lexed → every guard refuses.
+        let bad = "SELECT 'unterminated";
+        assert!(script_has_txn_control(bad));
+        assert!(script_references_word(bad, "boatramp_migrations"));
+        assert!(script_has_create_extension(bad));
+    }
+}
+
 /// How a **preview** deployment's SQL database relates to the site's live one
 /// (operator policy; see the per-site/server config). The default is the safe,
 /// isolated choice.
@@ -809,8 +987,8 @@ impl LedgerOrigin {
     /// The stable string persisted in the ledger.
     pub fn as_str(self) -> &'static str {
         match self {
-            LedgerOrigin::Apply => "apply",
-            LedgerOrigin::Baseline => "baseline",
+            Self::Apply => "apply",
+            Self::Baseline => "baseline",
         }
     }
 }

@@ -234,6 +234,21 @@ async fn migrate_substrate_ledger_atomicity_and_owner_ddl_on_a_real_engine() {
             .unwrap_err(),
         MigrateDdlError::TxnControl
     ));
+    // S4 (comment-evasion, Security review HIGH-1): a trailing-comment COMMIT that a byte scan
+    // missed but Postgres executes is refused by the tokenizer guard on the REAL seam.
+    assert!(matches!(
+        ddl.exec("CREATE TABLE y(i int); COMMIT-- sneak")
+            .await
+            .unwrap_err(),
+        MigrateDdlError::TxnControl
+    ));
+    // S3 (comment-evasion): a ledger reference hidden behind a block comment is still refused.
+    assert!(matches!(
+        ddl.exec("DROP TABLE /*x*/ boatramp_migrations.schema_migrations")
+            .await
+            .unwrap_err(),
+        MigrateDdlError::LedgerProtected
+    ));
     // A plain owner DDL runs (auto-commit), and a verification query reads it back as owner.
     ddl.exec("CREATE TABLE IF NOT EXISTS owner_made (n int)")
         .await
