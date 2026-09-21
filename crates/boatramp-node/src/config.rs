@@ -1233,6 +1233,20 @@ pub struct HandlersConfig {
     /// durability are unaffected. Single-node only (cluster durability is
     /// replication). A node with `N > 0` logs a warning at startup.
     pub messaging_max_unflushed_msgs: Option<usize>,
+    /// **Event-driven delivery — safety-net reconcile cadence** (ms). The coarse timer the delivery
+    /// drainer falls back to when no fast-path wake fires: it drains the durable ready-set and fires
+    /// lease-expiry redelivery via the per-message due-heap, so a dropped wake or a time-based
+    /// visibility never stalls delivery beyond this interval. It never scans idle topics (an idle
+    /// fleet costs ~0). Absent ⇒ ~2 s. Lower for tighter redelivery latency at more wakeups; raise to
+    /// quiet a large idle fleet further.
+    pub messaging_safetynet_interval_ms: Option<u64>,
+    /// **Event-driven delivery — ready-set rebuild cadence** (ms). The long-cadence self-heal that
+    /// re-derives the ready-set from the authoritative message index — recovering a marker lost to a
+    /// crash between the index write and the ready write, pruning a stale marker, and self-populating
+    /// a fresh/upgraded node's ready-set. This is the one full-ish scan, so it runs rarely. Absent ⇒
+    /// ~30 s. The correctness backstop for the ready-set (a lost marker costs at most one rebuild
+    /// interval of latency, never a lost message).
+    pub messaging_readyset_rebuild_interval_ms: Option<u64>,
     /// Max wall-clock for a *streaming-lane* response (a `#[handler(stream)]`
     /// route — SSE, chunked, agent token streaming), milliseconds. A client is
     /// connected but the body is written incrementally over seconds-to-minutes,

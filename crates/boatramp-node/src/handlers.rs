@@ -189,6 +189,23 @@ pub async fn build_handler_runtime(
     // Apply the posture's host-side blob cap + component-size cap.
     runtime.set_max_blob_bytes(max_blob_bytes);
     runtime.set_max_component_bytes(max_component_bytes);
+    // Event-driven delivery cadences (B17): the two operator `[handlers]` knobs (absent ⇒ default).
+    // Pure latency/idle-cost tradeoff — never affects at-least-once.
+    {
+        let defaults = boatramp_server::DeliveryConfig::default();
+        let safetynet = handlers_cfg
+            .and_then(|h| h.messaging_safetynet_interval_ms)
+            .map(std::time::Duration::from_millis)
+            .unwrap_or(defaults.safetynet_interval);
+        let rebuild = handlers_cfg
+            .and_then(|h| h.messaging_readyset_rebuild_interval_ms)
+            .map(std::time::Duration::from_millis)
+            .unwrap_or(defaults.rebuild_interval);
+        runtime.set_delivery_config(boatramp_server::DeliveryConfig {
+            safetynet_interval: safetynet,
+            rebuild_interval: rebuild,
+        });
+    }
     // Apply the posture's host-env secret-ref gate (fail-closed if never set).
     runtime.set_allow_env_secret_refs(allow_env_secret_refs);
     // Apply the posture's in-site tenancy knobs (Stage 0; fail-closed if never set).
