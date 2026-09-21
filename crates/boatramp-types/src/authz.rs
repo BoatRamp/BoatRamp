@@ -299,6 +299,17 @@ impl Right {
                     Some(proj.to_string()),
                     if get { Action::Read } else { Action::Admin },
                 ),
+                // Owner-gated schema migrations (`/api/projects/<proj>/migrate/…`) apply
+                // owner-authority DDL — at least as boundary-critical as the tenancy schema — so the
+                // mutating verbs (apply/dry-run) gate at **`Project·Admin`**, never the deploy-grade
+                // publisher the general project-owned catch-all below would grant; read-only status is
+                // `Project·Read`. Gated explicitly here, above that catch-all, so a `project_publisher`
+                // can never migrate a project's schema.
+                Some((&"migrate", _)) => Self::new(
+                    Resource::Project,
+                    Some(proj.to_string()),
+                    if get { Action::Read } else { Action::Admin },
+                ),
                 // The project-bus operator surface (`/api/projects/<proj>/_boatramp/bus/…`):
                 // dead-letter + work-queue inspection/management for the **shared project
                 // bus** (the `{project}/bus/{topic}` keyspace a `bus:<topic>` publish routes
@@ -1973,6 +1984,34 @@ mod tests {
         assert!(
             admin.allows(&apply),
             "a project_admin must be able to run migrations",
+        );
+
+        // The PROJECT-SCOPED form (`/api/projects/<p>/migrate/…`, the one a non-default tenant uses)
+        // must ALSO gate mutate at Project·Admin on THAT project — never the deploy-grade publisher.
+        for path in [
+            "/api/projects/acme/migrate/appdb/apply",
+            "/api/projects/acme/migrate/appdb/dry-run",
+        ] {
+            assert_eq!(
+                Right::required("POST", path),
+                Some(Right::new(
+                    Resource::Project,
+                    Some("acme".into()),
+                    Action::Admin
+                )),
+                "POST {path} must require Project·Admin on acme",
+            );
+        }
+        let acme_apply = Right::required("POST", "/api/projects/acme/migrate/appdb/apply").unwrap();
+        let acme_pub = policy.rights_for(&[GrantedRole::scoped("project_publisher", "acme")]);
+        assert!(
+            !acme_pub.allows(&acme_apply),
+            "a project_publisher on acme must not be able to migrate acme's schema",
+        );
+        let acme_admin = policy.rights_for(&[GrantedRole::scoped("project_admin", "acme")]);
+        assert!(
+            acme_admin.allows(&acme_apply),
+            "a project_admin on acme must be able to migrate acme's schema",
         );
     }
 

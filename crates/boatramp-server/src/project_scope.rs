@@ -48,6 +48,14 @@ pub const PROJECT_SCOPED_FAMILIES: &[&str] = &[
     // tool (it resolved to the bare `pg`/default workload). The `sql_exec`/`sql_query`
     // handlers already honor the injected `ProjectContext`.
     "sql",
+    // Owner-gated schema migrations to a project's managed database
+    // (`/api/projects/<proj>/migrate/<db>/{apply,dry-run,status}`). Like `sql` above, without this
+    // a non-default project's per-tenant managed DB would be unreachable (the bare `/api/migrate`
+    // form hardcodes the default project) — so a Shared multi-tenant project could never migrate
+    // its own schema, the headline use case. The migrate handlers honor the injected
+    // `ProjectContext`, and authz still sees the original project-qualified path and gates the
+    // mutating verbs at `Project·Admin` (see `authz::Right::required`).
+    "migrate",
     // The project's tenancy schema (`/api/projects/<proj>/tenancy`) — the per-table
     // tenant-key map the scope injector consults. Rewrites onto the global
     // `/api/tenancy` handler, tagged with the tenant, so `boatramp tenancy show/apply`
@@ -262,6 +270,13 @@ mod tests {
         let s = scope_of("/api/projects/acme/tenancy");
         assert_eq!(s.project, "acme");
         assert_eq!(s.rewrite.as_deref(), Some("/api/tenancy"));
+
+        // Owner-gated schema migrations to a project's managed DB rewrite onto the global
+        // `/api/migrate/<db>/…` handler, tagged with the tenant — so a non-default (Shared
+        // multi-tenant) project can migrate its OWN managed database.
+        let s = scope_of("/api/projects/acme/migrate/appdb/apply");
+        assert_eq!(s.project, "acme");
+        assert_eq!(s.rewrite.as_deref(), Some("/api/migrate/appdb/apply"));
     }
 
     #[test]

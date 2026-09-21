@@ -885,6 +885,20 @@ fn mentions_create_extension(script: &str) -> bool {
     normalized.contains("CREATE EXTENSION")
 }
 
+/// Whether `script` issues its own transaction control (`BEGIN`/`START TRANSACTION`/`COMMIT`/`END`/
+/// `ROLLBACK`). A transactional (`!no_transaction`) step is wrapped by the runner in
+/// `BEGIN;…;<ledger-insert>;COMMIT;`, so an author's own `COMMIT`/`ROLLBACK` would desync that wrapper
+/// (e.g. a `ROLLBACK` reverts the DDL but the ledger INSERT then auto-commits, recording a step that
+/// didn't apply). Reject it fail-closed so the ledger can never diverge from applied state; an author
+/// that genuinely needs its own transaction control uses a `no_transaction` step. Word-boundary match
+/// (whitespace/`;`-delimited tokens) so an identifier like `commit_log` isn't a false positive.
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+fn mentions_txn_control(script: &str) -> bool {
+    let up = script.to_ascii_uppercase();
+    up.split(|c: char| c.is_whitespace() || c == ';' || c == '(')
+        .any(|tok| matches!(tok, "BEGIN" | "START" | "COMMIT" | "END" | "ROLLBACK"))
+}
+
 #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
 impl NodeMigrationRunner {
     /// Build over a [`NodeOperatorSql`] (for the owner + superuser backends) and the operator's
@@ -1077,6 +1091,11 @@ impl boatramp_core::sql::MigrationRunner for NodeMigrationRunner {
                             "a sql step may not CREATE EXTENSION — use an extension step"
                                 .to_string(),
                         )
+                    } else if !*no_transaction && mentions_txn_control(script) {
+                        Err("a transactional sql step may not contain its own \
+                             BEGIN/COMMIT/ROLLBACK (it would desync the atomic wrapper) — use a \
+                             no_transaction step to manage the transaction yourself"
+                            .to_string())
                     } else if *no_transaction {
                         // Non-transactional DDL: run the script, then record the ledger row.
                         match owner.run_script(script).await {
