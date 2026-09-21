@@ -395,6 +395,7 @@ pub(super) async fn dispatch_handler(
         site_handlers,
         &handler.env,
         &handler.invoke_targets,
+        &handler.stats_topics,
         // A site handler is the entry point of a call chain (reached over HTTP), so it
         // invokes siblings at depth 0; the host caps each subsequent hop.
         0,
@@ -1341,6 +1342,10 @@ pub(super) async fn build_bindings(
     site_handlers: &boatramp_core::config::HandlersSiteConfig,
     deploy_env: &std::collections::BTreeMap<String, String>,
     invoke_targets: &[String],
+    // Declared `bus:` stats-topic templates for the read-only `messaging-stats` capability. Each may
+    // carry a literal `{tenant}` placeholder the host fills with this invocation's resolved tenant;
+    // the guest can never name the tenant. Empty ⇒ no bus stats readable (deny-by-default).
+    stats_topics: &[String],
     depth: u32,
     request_id: Option<&str>,
     // Stage 0 tenant-source inputs (the verified bearer for a token source; the routed domain's
@@ -1642,6 +1647,25 @@ pub(super) async fn build_bindings(
                 format!("{}/", project.qualified("bus")),
                 messaging.clone(),
                 signed_context,
+            );
+        }
+    }
+    // The read-only `messaging-stats` capability: surface the already-computed per-topic bus gauges
+    // (dead-letter/backlog/in-flight + per-group depth) to a granted guest. A plain topic resolves
+    // under the same component-private `scope` prefix as `with_messaging`; a `bus:<template>` topic
+    // must be one of `stats_topics`, and the host substitutes THIS invocation's resolved tenant for
+    // the template's `{tenant}` placeholder — the guest never names a tenant, so no cross-tenant
+    // oracle. Deny-by-default (needs the import, the site allowlist, and the messaging substrate).
+    if granted("messaging-stats") {
+        if let Some(messaging) = &inner.messaging {
+            let resolved_tenant =
+                super::function_runtime::resolved_tenant_string(&handler_caller_tenant);
+            bindings = bindings.with_messaging_stats(
+                format!("{scope}/"),
+                format!("{}/", project.qualified("bus")),
+                messaging.clone(),
+                stats_topics.to_vec(),
+                resolved_tenant,
             );
         }
     }
@@ -2036,6 +2060,8 @@ pub(super) struct ConsumerRebuild<'a> {
     pub site_handlers: &'a boatramp_core::config::HandlersSiteConfig,
     pub tenancy: Option<&'a boatramp_core::tenancy::Tenancy>,
     pub token_claims: Option<&'a boatramp_core::config::HandlerGraphqlTokenClaims>,
+    /// The consumer's declared `bus:` stats-topic templates for the `messaging-stats` capability.
+    pub stats_topics: &'a [String],
 }
 
 #[cfg(feature = "handlers")]
@@ -2058,6 +2084,7 @@ impl ConsumerRebuild<'_> {
             self.site_handlers,
             &std::collections::BTreeMap::new(),
             &[],
+            self.stats_topics,
             0,
             None,
             None,

@@ -3489,6 +3489,7 @@ mod tests {
                     token_claims: None,
                     backoff_ms: None,
                     retention_ms: None,
+                    stats_topics: Vec::new(),
                     topic: "orders/created".into(),
                     component: "consumer.wasm".into(),
                     imports: vec!["wasi:keyvalue".into()],
@@ -5131,6 +5132,7 @@ mod tests {
                     limits: None,
                     env: std::collections::BTreeMap::new(),
                     invoke_targets: Vec::new(),
+                    stats_topics: Vec::new(),
                 }],
                 crons: vec![CronConfig {
                     schedule: "* * * * *".into(),
@@ -5265,6 +5267,7 @@ mod tests {
                     limits: None,
                     env: std::collections::BTreeMap::new(),
                     invoke_targets: Vec::new(),
+                    stats_topics: Vec::new(),
                 }],
                 crons: vec![CronConfig {
                     schedule: "* * * * *".into(),
@@ -5411,6 +5414,7 @@ mod tests {
                     site,
                     env,
                     &[],
+                    &[],
                     0,
                     None,
                     None,
@@ -5541,6 +5545,7 @@ mod tests {
                 &imports,
                 &site,
                 &env,
+                &[],
                 &[],
                 0,
                 None,
@@ -5703,6 +5708,7 @@ mod tests {
             site_handlers: &site,
             tenancy: Some(&tenancy),
             token_claims: None,
+            stats_topics: &[],
         };
 
         // Force the resolved own-read scope onto a SELECT and run it on the real engine.
