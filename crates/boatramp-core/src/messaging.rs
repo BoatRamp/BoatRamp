@@ -2317,7 +2317,7 @@ impl Messaging for LogMessaging {
             .await?;
         self.group_commit(ops, 1, max_unflushed).await?;
         self.signal_ready(); // ready-set durable (B12) — wake the drainer (due-heap handles the delay)
-        // A delayed message isn't live yet; still notify SSE (best-effort) so a live tail sees it.
+                             // A delayed message isn't live yet; still notify SSE (best-effort) so a live tail sees it.
         self.hubs.broadcast(topic, &id, payload);
         Ok(())
     }
@@ -3579,7 +3579,9 @@ impl Messaging for LogMessaging {
             let Some(rest) = key.strip_prefix("mqgstate/") else {
                 continue;
             };
-            let Some(slash) = rest.rfind('/') else { continue };
+            let Some(slash) = rest.rfind('/') else {
+                continue;
+            };
             let topic = &rest[..slash];
             let group = &rest[slash + 1..];
             if topic.is_empty() || group.is_empty() {
@@ -3598,8 +3600,15 @@ impl Messaging for LogMessaging {
                 with_work.insert(topic.to_string());
             }
         }
-        // 3) Reconcile: the current markers vs the derived truth. ADD missing, PRUNE stale — each a
-        //    durable single-key write (a bounded reconcile; the set is small on an idle fleet).
+        // 3) Reconcile: **ADD-ONLY** — rebuild only heals a MISSING marker (a lost publish-wake add,
+        //    or a fresh-node self-populate, B18); it must NOT prune (Security review A-1). A prune
+        //    here is the same race class H-1 closed for the claim path: a publish committing
+        //    `{record, marker}` between this scan and a stale-marker `delete` would have its
+        //    just-added marker clobbered and the message stranded until the next rebuild (~30s).
+        //    Pruning is owned SOLELY by the gated claim path (which re-verifies emptiness under
+        //    `commit_gate`, race-free), so a stale marker here just costs one cheap empty claim that
+        //    then prunes it (the plan's B5: "a stale entry costs one cheap empty claim"). Each add is
+        //    a durable single-key write (bounded; the set is small on an idle fleet).
         let existing: std::collections::HashSet<String> = self
             .kv
             .list_prefix(READY_PREFIX)
@@ -3615,14 +3624,6 @@ impl Messaging for LogMessaging {
                 .await
                 .map_err(MessagingError::backend)?;
             added_any = true;
-        }
-        for topic in existing.difference(&with_work) {
-            // Stale marker on a topic with no work — safe to prune (rebuild is the authoritative
-            // pruner; a per-claim prune is conservative for grouped topics, B5).
-            self.kv
-                .delete(&ready_key(topic))
-                .await
-                .map_err(MessagingError::backend)?;
         }
         self.last_rebuild_ms.store(now, Ordering::Relaxed);
         // A rebuild that ADDED a marker (a lost one, or a fresh-node self-populate) must wake the
@@ -3658,7 +3659,9 @@ impl Messaging for LogMessaging {
             let Some(rest) = key.strip_prefix("mq/") else {
                 continue;
             };
-            let Some(slash) = rest.rfind('/') else { continue };
+            let Some(slash) = rest.rfind('/') else {
+                continue;
+            };
             let topic = rest[..slash].to_string();
             if let Some(raw) = self.kv.get(&key).await.map_err(MessagingError::backend)? {
                 if let Ok(rec) = serde_json::from_slice::<Record>(&raw) {
@@ -3676,7 +3679,9 @@ impl Messaging for LogMessaging {
             let Some(rest) = key.strip_prefix("mqgstate/") else {
                 continue;
             };
-            let Some(slash) = rest.rfind('/') else { continue };
+            let Some(slash) = rest.rfind('/') else {
+                continue;
+            };
             let topic = rest[..slash].to_string();
             let group = &rest[slash + 1..];
             if let Some(state) = self.get_group_state(&topic, group).await? {
@@ -5680,6 +5685,43 @@ mod tests {
         assert_eq!(mq.claim("t", LEASE, 16, 5).await.unwrap().len(), 1);
     }
 
+    /// Security review A-1: `rebuild_ready_set` is ADD-ONLY — it heals a MISSING marker but never
+    /// PRUNES a stale one. A rebuild prune would be the same race class H-1 closed for the claim path
+    /// (a publish committing `{record, marker}` between the rebuild's scan and its delete could be
+    /// clobbered + stranded ~one rebuild interval). Pruning is owned solely by the gated claim path;
+    /// a stale marker just costs one cheap empty claim that then prunes it.
+    #[tokio::test]
+    async fn rebuild_is_add_only_never_prunes_a_stale_marker() {
+        let mq = mq();
+        // A STALE marker: a ready marker for a topic with NO work (no records).
+        mq.kv.put(&ready_key("stale"), Vec::new()).await.unwrap();
+        // A REAL topic with work whose marker was lost (rebuild must heal it).
+        mq.publish("real", b"a").await.unwrap();
+        mq.kv.delete(&ready_key("real")).await.unwrap();
+
+        let _ = mq.rebuild_ready_set().await.unwrap();
+        let ready: std::collections::HashSet<String> =
+            mq.ready_topics().await.unwrap().into_iter().collect();
+        assert!(
+            ready.contains("real"),
+            "rebuild HEALS the missing marker for a topic with work"
+        );
+        assert!(
+            ready.contains("stale"),
+            "rebuild does NOT prune the stale marker (A-1: pruning is the gated claim path's job, \
+             never the racy rebuild)"
+        );
+        // The stale marker self-heals via the claim path: a claim over the empty topic prunes it.
+        assert!(mq.claim("stale", LEASE, 16, 5).await.unwrap().is_empty());
+        assert!(
+            !mq.ready_topics()
+                .await
+                .unwrap()
+                .contains(&"stale".to_string()),
+            "a cheap empty claim over the stale-marked topic prunes it (B5)"
+        );
+    }
+
     /// Gate 4 (core), REAL race: many lock-free publishers hammering a topic CONCURRENTLY with a
     /// draining claim/ack loop that prunes the marker whenever the topic empties. Every published
     /// message MUST end up delivered (acked) with NO reliance on a rebuild — proving the claim's
@@ -5700,7 +5742,9 @@ mod tests {
             let mq = mq.clone();
             pubs.push(tokio::spawn(async move {
                 for i in 0..PER {
-                    mq.publish("t", format!("{p}-{i}").as_bytes()).await.unwrap();
+                    mq.publish("t", format!("{p}-{i}").as_bytes())
+                        .await
+                        .unwrap();
                     tokio::task::yield_now().await;
                 }
             }));
@@ -5763,7 +5807,11 @@ mod tests {
         let a = mq.claim("projA/orders", LEASE, 16, 5).await.unwrap();
         assert_eq!(a.len(), 1);
         mq.ack(&a[0]).await.unwrap();
-        assert!(mq.claim("projA/orders", LEASE, 16, 5).await.unwrap().is_empty());
+        assert!(mq
+            .claim("projA/orders", LEASE, 16, 5)
+            .await
+            .unwrap()
+            .is_empty());
         assert_eq!(
             mq.ready_topics().await.unwrap(),
             vec!["projB/orders".to_string()],
