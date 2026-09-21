@@ -31,7 +31,7 @@ use boatramp_core::sql::{
 use crate::HandlerRuntimeInner;
 
 /// What a migrate request does.
-pub(crate) enum MigrateMode {
+pub enum MigrateMode {
     /// Apply the pending suffix (run each step + record it).
     Apply,
     /// Compute the plan (pending ids) without running or recording anything.
@@ -121,6 +121,22 @@ fn failed(
         }),
         kinds: kinds_of(steps),
     }
+}
+
+/// Public embedder / live-gate seam: drive a migration given the public [`HandlerRuntime`] plus the
+/// node [`MigrationSubstrate`]. The HTTP handlers call [`orchestrate`] directly (they already hold
+/// the private runtime inner); this wraps it for a caller holding only the public runtime.
+pub async fn run_migration(
+    runtime: &crate::HandlerRuntime,
+    deploy: &DeployStore,
+    substrate: &Arc<dyn MigrationSubstrate>,
+    project: &str,
+    db: &str,
+    steps: &[MigrationStep],
+    mode: MigrateMode,
+) -> Result<MigrationReport, MigrationError> {
+    let inner = runtime.inner.as_ref().map(std::convert::AsRef::as_ref);
+    orchestrate(inner, deploy, substrate, project, db, steps, mode).await
 }
 
 /// Drive an apply / dry-run / baseline over the ordered `steps`. `inner` is the handler runtime

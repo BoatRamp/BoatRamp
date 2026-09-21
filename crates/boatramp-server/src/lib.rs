@@ -237,6 +237,8 @@ pub(crate) use function_runtime::{
     get_invocation_record, invoke_function, list_triggers_handler, new_invocation_id,
     put_trigger_handler, webhook_ingress,
 };
+#[cfg(feature = "handlers")]
+pub use migrate::{run_migration, MigrateMode};
 /// SSE-out + POST-in serving of the duplex/resumable `session` capability
 /// (PLAN-session-primitive Stage 4): a `GET` opens the resumable outbound stream, a `POST` delivers
 /// an inbound frame that re-enters the guest `session-handler`.

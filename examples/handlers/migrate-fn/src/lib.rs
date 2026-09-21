@@ -47,9 +47,12 @@ impl Guest for Component {
                 Ok(()) => (500, "failed-after-partial-work".to_string()),
                 Err(e) => (500, format!("exec-err:{}", reason(&e))),
             },
-            // Binding-split probe: a migration invocation must have NO tenant sql binding.
+            // Binding-split probe (Security S1): a migration invocation must have NO tenant sql
+            // binding. `absent` is the CORRECT outcome → 200 (the step applies); `present` is a
+            // binding-split LEAK → 500, so the migration report surfaces it as a failed step and a
+            // gate catches the regression.
             "sql-open" => match sql_query::open("") {
-                Ok(_) => (200, "sql:present".to_string()),
+                Ok(_) => (500, "sql:present-LEAK".to_string()),
                 Err(_) => (200, "sql:absent".to_string()),
             },
             _ => (200, "noop".to_string()),
