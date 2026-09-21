@@ -64,6 +64,48 @@ pub struct SqlRows {
     pub rows: Vec<Vec<SqlValue>>,
 }
 
+impl SqlRows {
+    /// Encode the rows as a compact JSON string: an object with `columns` (the column names) and
+    /// `rows` (an array of row arrays), each cell a JSON scalar — `null`, a number (Integer/Real), a
+    /// bool, or a string (Text; Json passthrough as its JSON text; Blob as lossy UTF-8). This is the
+    /// wire form the `migrate-ddl` `query` verb returns to a migration function for verification.
+    pub fn to_json_string(&self) -> String {
+        use serde_json::{Map, Number, Value};
+        let cell = |v: &SqlValue| -> Value {
+            match v {
+                SqlValue::Null => Value::Null,
+                SqlValue::Boolean(b) => Value::Bool(*b),
+                SqlValue::Integer(n) => Value::Number((*n).into()),
+                SqlValue::Real(f) => Number::from_f64(*f)
+                    .map(Value::Number)
+                    .unwrap_or(Value::Null),
+                SqlValue::Text(s) => Value::String(s.clone()),
+                SqlValue::Json(s) => {
+                    serde_json::from_str(s).unwrap_or_else(|_| Value::String(s.clone()))
+                }
+                SqlValue::Blob(b) => Value::String(String::from_utf8_lossy(b).into_owned()),
+            }
+        };
+        let rows: Vec<Value> = self
+            .rows
+            .iter()
+            .map(|r| Value::Array(r.iter().map(cell).collect()))
+            .collect();
+        let mut obj = Map::new();
+        obj.insert(
+            "columns".into(),
+            Value::Array(
+                self.columns
+                    .iter()
+                    .map(|c| Value::String(c.clone()))
+                    .collect(),
+            ),
+        );
+        obj.insert("rows".into(), Value::Array(rows));
+        Value::Object(obj).to_string()
+    }
+}
+
 /// Why a SQL operation failed.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum SqlError {
@@ -733,12 +775,44 @@ pub struct AppliedMigration {
     pub id: String,
     /// Its application order (0-based).
     pub ordinal: i64,
-    /// The content hash recorded at apply time.
+    /// The **effective** hash recorded at apply time (for a `function` step this binds the resolved
+    /// component blob; for `sql`/`extension` it equals the intrinsic content hash).
     pub content_hash: String,
-    /// The ledger `kind` (`sql` / `extension`).
+    /// The ledger `kind` (`sql` / `extension` / `function`).
     pub kind: String,
     /// When it was applied (RFC3339, best-effort formatting from the engine).
     pub applied_at: String,
+    /// How the row entered the ledger — `"apply"` (the step ran here) or `"baseline"` (an owner
+    /// assertion that it was already applied; the step was NOT run here). U6 origin marker; older
+    /// rows without the column read back as `"apply"`.
+    #[serde(default = "default_origin")]
+    pub origin: String,
+}
+
+/// The default ledger origin for a row (and for pre-U6 rows lacking the column): the step ran here.
+fn default_origin() -> String {
+    LedgerOrigin::Apply.as_str().to_string()
+}
+
+/// How a ledger row came to be — an executed step, or an owner *assertion* (baseline) that recorded
+/// it as already-applied without running it. Persisted in the ledger's `applied_by` column so an
+/// operator can later tell a baselined prefix (never run on this DB) from a genuinely applied one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LedgerOrigin {
+    /// The step was executed on this database and then recorded.
+    Apply,
+    /// The step was recorded as already-applied WITHOUT running it (the `baseline` verb).
+    Baseline,
+}
+
+impl LedgerOrigin {
+    /// The stable string persisted in the ledger.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LedgerOrigin::Apply => "apply",
+            LedgerOrigin::Baseline => "baseline",
+        }
+    }
 }
 
 /// The outcome of a [`MigrationRunner::apply`].
@@ -752,6 +826,11 @@ pub struct MigrationReport {
     pub pending: Vec<String>,
     /// The step that failed (application halts there; the prefix before it is applied).
     pub failed: Option<MigrationFailure>,
+    /// Per-reported-id `kind` (`sql` / `extension` / `function`), so a thin client can tell what
+    /// each id in `newly_applied` / `already_applied` / `pending` / `failed` was without re-parsing
+    /// the bundle (U3). Covers every id the report mentions.
+    #[serde(default)]
+    pub kinds: std::collections::BTreeMap<String, String>,
 }
 
 /// A failed migration step, surfaced structurally so a thin client can show which one
@@ -804,28 +883,104 @@ pub enum MigrationError {
     Other(String),
 }
 
-/// The operator-facing **schema-migration** capability for a managed database: apply an
-/// ordered set of migration steps, once each, transactionally-where-possible, tracked in
-/// a host-owned `schema_migrations` ledger, connecting as the project's non-superuser
-/// **owner** role (never the cluster superuser). Backs the `Project·Admin`-gated
-/// `POST /api/migrate/{db}/{apply,dry-run}` + `GET /api/migrate/{db}/status`. boatramp
-/// owns sequencing/ordering/idempotency/atomicity; the caller supplies the ordered steps.
+/// Why a host-mediated owner-role DDL call ([`MigrateDdl`]) was refused or failed. The guest sees
+/// a self-explaining variant (never a bare access-denied), so a migration author can tell a
+/// protected-schema attempt from its own bad DDL.
+#[derive(Debug, thiserror::Error)]
+pub enum MigrateDdlError {
+    /// The statement referenced the host-owned migration-ledger schema (`boatramp_migrations`). The
+    /// owner role owns that schema, so an unguarded `exec` could corrupt prefix-consistency — refused
+    /// host-side (S3).
+    #[error("migrate: the migration-ledger schema is host-owned and may not be touched by a migration step")]
+    LedgerProtected,
+    /// The statement issued its own transaction control (`BEGIN`/`COMMIT`/`ROLLBACK`). Each `exec`
+    /// auto-commits on the host-held owner connection; a guest-managed transaction would desync the
+    /// host's per-step ledger contract — refused (S4).
+    #[error("migrate: a migration step may not issue its own BEGIN/COMMIT/ROLLBACK — each exec auto-commits")]
+    TxnControl,
+    /// The underlying owner-connection SQL error (sanitized).
+    #[error("migrate: {0}")]
+    Sql(String),
+}
+
+/// The **host-mediated owner-role DDL seam** backing the guest `boatramp:handlers/migrate-ddl`
+/// capability (Security S5). Implemented by the node over the migration orchestrator's **owner-role**
+/// connection for one `(project, db)`; the guest never holds the credential — it calls the host
+/// functions and the host runs each statement on the owner connection it owns (v0.4.25 BR-7). The
+/// binding is attached **only** for a `Project·Admin` migration-step invocation (context-gated, S2);
+/// a normal request/consumer/cron invocation has no binding (`access-denied`). The implementation
+/// enforces the ledger-schema (S3) and transaction-control (S4) guards before touching the wire; each
+/// `exec` auto-commits.
 #[async_trait]
-pub trait MigrationRunner: Send + Sync {
-    /// Apply the pending suffix of `steps` (those whose `id` is not already recorded) in
-    /// the given order, each `Sql` step + its ledger row committed atomically (unless
-    /// `no_transaction`). Fails closed on a diverged prefix or a changed applied step.
-    /// `dry_run` computes the plan (pending ids) WITHOUT applying anything.
-    async fn apply(
+pub trait MigrateDdl: Send + Sync {
+    /// Run a DDL/DML `script` (one or more statements) as the owner role; auto-commits on success.
+    async fn exec(&self, script: &str) -> Result<(), MigrateDdlError>;
+    /// Run several scripts in order, each auto-committing (a convenience over repeated `exec`).
+    async fn exec_batch(&self, scripts: Vec<String>) -> Result<(), MigrateDdlError>;
+    /// Run a read `query` as the owner role and return the rows (for in-migration verification —
+    /// the owner sees all rows, which is correct for a schema/data migration check).
+    async fn query(&self, sql: &str) -> Result<SqlRows, MigrateDdlError>;
+}
+
+/// The outcome of running one substrate (`sql`/`extension`) step via [`MigrationSubstrate`].
+#[derive(Debug)]
+pub enum SubstrateStepOutcome {
+    /// The step ran and its ledger row was recorded.
+    Applied,
+    /// The step failed (sanitized reason) — apply halts, the prior prefix stands.
+    Failed(String),
+}
+
+/// The node-side **substrate** the server-side migration orchestrator (A1) drives: the owner-role
+/// connection, the host-owned `schema_migrations` ledger, and the direct `sql`/`extension` execution
+/// path. The orchestrator owns ordering, prefix-consistency, `function`-step invocation (which needs
+/// the server's invoke kernel and cannot live here), and dry-run planning; this seam owns the
+/// database IO. Everything runs as the project's non-superuser **owner** role (never the cluster
+/// superuser), except the allowlist-gated host-templated `CREATE EXTENSION`.
+#[async_trait]
+pub trait MigrationSubstrate: Send + Sync {
+    /// Engine gate (Postgres-only this release), ensure the ledger schema+table exist, and return
+    /// the applied rows in order. `Unavailable` (managed DB still starting) maps to a retryable 503.
+    async fn preflight(
         &self,
         project: &str,
         db: &str,
-        steps: &[MigrationStep],
-        dry_run: bool,
-    ) -> Result<MigrationReport, MigrationError>;
+    ) -> Result<Vec<AppliedMigration>, MigrationError>;
 
-    /// The applied-migration ledger state for managed database `db` in `project`.
-    async fn status(&self, project: &str, db: &str) -> Result<MigrationStatus, MigrationError>;
+    /// Execute a `sql` or `extension` `step` as the owner role and record its ledger row (atomically
+    /// for a transactional `sql` step). `ordinal` is its 0-based position; `effective_hash` is the
+    /// hash the orchestrator computed (== the intrinsic content hash for these kinds). A `function`
+    /// step must NOT be passed here — the orchestrator invokes it and calls [`record`](Self::record).
+    async fn apply_substrate_step(
+        &self,
+        project: &str,
+        db: &str,
+        step: &MigrationStep,
+        ordinal: usize,
+        effective_hash: &str,
+    ) -> Result<SubstrateStepOutcome, MigrationError>;
+
+    /// Record a ledger row WITHOUT running the step — for a `function` step after a successful
+    /// invocation (the orchestrator ran it via the invoke kernel), and for every step of a
+    /// `baseline`. `origin` distinguishes the two (U6).
+    async fn record(
+        &self,
+        project: &str,
+        db: &str,
+        step: &MigrationStep,
+        ordinal: usize,
+        effective_hash: &str,
+        origin: LedgerOrigin,
+    ) -> Result<(), MigrationError>;
+
+    /// The owner-role DDL seam for `(project, db)` backing the `migrate-ddl` capability of a
+    /// `function` step (S5). Returned as an `Arc<dyn MigrateDdl>` the orchestrator hands to the
+    /// function invocation's binding; the owner credential never leaves this seam.
+    async fn owner_ddl(
+        &self,
+        project: &str,
+        db: &str,
+    ) -> Result<std::sync::Arc<dyn MigrateDdl>, MigrationError>;
 }
 
 /// Tear down a deleted tenant's **managed** databases — the delete-time counterpart

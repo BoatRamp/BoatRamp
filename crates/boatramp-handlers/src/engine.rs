@@ -1118,6 +1118,10 @@ impl HandlerEngine {
         bindings::admin::add_to_linker(&mut linker, |state: &mut HostState| {
             bindings::admin::AdminHost::new(state.bindings.admin())
         })?;
+        #[cfg(feature = "migrate")]
+        bindings::migrate::add_to_linker(&mut linker, |state: &mut HostState| {
+            bindings::migrate::MigrateHost::new(state.bindings.migrate())
+        })?;
         #[cfg(feature = "capability")]
         bindings::capability::add_to_linker(&mut linker, |state: &mut HostState| {
             bindings::capability::CapabilityHost::new(state.bindings.capability())
