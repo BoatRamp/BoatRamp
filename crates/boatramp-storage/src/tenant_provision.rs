@@ -212,6 +212,22 @@ pub fn tenant_role_name(base: &str, tenant_ident: &str) -> String {
     sanitize_ident_capped(&format!("{base}_{tenant_ident}_role"), MAX_ROLE_IDENT_LEN)
 }
 
+/// Derive the per-tenant **owner/DDL role** name (Shared Postgres only).
+///
+/// Scheme: `<base>_<tenant_ident>_owner`, re-sanitized and length-capped. Distinct
+/// from [`tenant_role_name`] (`_role`) and [`tenant_db_name`] (no suffix) by the same
+/// whole-input digest, so the owner role can never collide with the runtime login role
+/// or the database name even when the cosmetic marker is truncated for a long tenant.
+///
+/// This is the non-superuser role that **owns the tenant's schema objects** and runs
+/// schema migrations (owner-authority DDL), kept separate from the runtime login role
+/// so the runtime role stays a non-owner and row-level security is still enforced
+/// against it, and separate from the cluster superuser so a migration can never reach
+/// beyond this tenant's own database (the superuser only ever provisions the shells).
+pub fn tenant_owner_role_name(base: &str, tenant_ident: &str) -> String {
+    sanitize_ident_capped(&format!("{base}_{tenant_ident}_owner"), MAX_ROLE_IDENT_LEN)
+}
+
 /// Quote a SQL **identifier** for `kind`, doubling the embedded quote char and
 /// wrapping it: Postgres uses `"double quotes"`, MySQL uses `` `backticks` ``.
 ///
@@ -277,7 +293,14 @@ fn mysql_user(role: &str) -> String {
 /// 4. `GRANT ALL PRIVILEGES ON <db>.* TO '<role>'@'%'` — scoped to *this*
 ///    database only (that `<db>.*` scope is the isolation boundary).
 /// 5. `FLUSH PRIVILEGES`.
-pub fn provision_ddl(kind: ExternalSqlKind, db: &str, role: &str, password: &str) -> Vec<String> {
+pub fn provision_ddl(
+    kind: ExternalSqlKind,
+    db: &str,
+    role: &str,
+    password: &str,
+    owner_role: &str,
+    owner_password: &str,
+) -> Vec<String> {
     let db_id = quote_ident(kind, db);
     let role_id = quote_ident(kind, role);
     let pw_lit = quote_literal(password);
@@ -285,21 +308,47 @@ pub fn provision_ddl(kind: ExternalSqlKind, db: &str, role: &str, password: &str
     match kind {
         ExternalSqlKind::Postgres => {
             let role_lit = quote_literal(role);
+            let owner_id = quote_ident(kind, owner_role);
+            let owner_lit = quote_literal(owner_role);
+            let owner_pw_lit = quote_literal(owner_password);
             vec![
-                // 1. Idempotent role create (CREATE ROLE has no IF NOT EXISTS).
+                // 1. Idempotent runtime-role create (CREATE ROLE has no IF NOT EXISTS).
                 format!(
                     "DO $$ BEGIN \
                      IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = {role_lit}) THEN \
                      CREATE ROLE {role_id} LOGIN PASSWORD {pw_lit}; \
                      END IF; END $$;"
                 ),
-                // 2. Keep the password in sync on re-provision.
+                // 2. Keep the runtime-role password in sync on re-provision.
                 format!("ALTER ROLE {role_id} WITH LOGIN PASSWORD {pw_lit};"),
-                // 3. Bare CREATE DATABASE — "already exists" is the caller's OK.
-                format!("CREATE DATABASE {db_id} OWNER {role_id};"),
-                // 4-6. Lock the database down to this tenant's role only.
+                // 3. Idempotent owner/DDL-role create. Explicitly NON-superuser and unable to
+                //    create databases/roles — it owns THIS tenant's schema (so migrations can run
+                //    owner-authority DDL) but Postgres denies it any cluster-level reach (no
+                //    `DROP DATABASE other`, no `ALTER ROLE … SUPERUSER`, no `COPY … TO PROGRAM`, no
+                //    untrusted `CREATE EXTENSION`) by privilege. Kept separate from the runtime role
+                //    above so that role stays a non-owner and RLS is still enforced against it.
+                format!(
+                    "DO $$ BEGIN \
+                     IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = {owner_lit}) THEN \
+                     CREATE ROLE {owner_id} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS NOREPLICATION PASSWORD {owner_pw_lit}; \
+                     END IF; END $$;"
+                ),
+                // 4. Re-assert the safe attributes + password every provision (heals a role that an
+                //    older version created with different attributes).
+                format!(
+                    "ALTER ROLE {owner_id} WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS NOREPLICATION PASSWORD {owner_pw_lit};"
+                ),
+                // 5. Bare CREATE DATABASE owned by the OWNER role — "already exists" is the caller's
+                //    OK. The owner role owns the schema objects a migration creates; the runtime role
+                //    (granted below) is a non-owner.
+                format!("CREATE DATABASE {db_id} OWNER {owner_id};"),
+                // 6. Lock the database down: strip the default everyone-can-connect grant, then admit
+                //    only this tenant's two roles (owner for migrations, runtime for serving).
                 format!("REVOKE CONNECT ON DATABASE {db_id} FROM PUBLIC;"),
+                format!("GRANT CONNECT ON DATABASE {db_id} TO {owner_id};"),
                 format!("GRANT CONNECT ON DATABASE {db_id} TO {role_id};"),
+                // 7. The runtime role gets database-level privileges (CONNECT/TEMP; CREATE is unused —
+                //    DDL is the owner role's job). Table privileges come from `grant_app_role_ddl`.
                 format!("GRANT ALL PRIVILEGES ON DATABASE {db_id} TO {role_id};"),
             ]
         }
@@ -890,31 +939,57 @@ mod tests {
             "appdb_acme",
             "appdb_acme_role",
             "deadbeef",
+            "appdb_acme_owner",
+            "0wnerpw",
         );
         let joined = stmts.join("\n");
-        // The isolation core.
+        // The isolation core: PUBLIC stripped, both this tenant's roles admitted.
         assert!(
             joined.contains("REVOKE CONNECT ON DATABASE \"appdb_acme\" FROM PUBLIC"),
             "missing PUBLIC revoke:\n{joined}"
         );
+        assert!(joined.contains("GRANT CONNECT ON DATABASE \"appdb_acme\" TO \"appdb_acme_owner\""));
         assert!(joined.contains("GRANT CONNECT ON DATABASE \"appdb_acme\" TO \"appdb_acme_role\""));
         assert!(joined
             .contains("GRANT ALL PRIVILEGES ON DATABASE \"appdb_acme\" TO \"appdb_acme_role\""));
-        // Idempotent role create + password sync.
+        // Idempotent runtime-role create + password sync.
         assert!(joined.contains("pg_roles WHERE rolname = 'appdb_acme_role'"));
         assert!(joined.contains("CREATE ROLE \"appdb_acme_role\" LOGIN PASSWORD 'deadbeef'"));
         assert!(joined.contains("ALTER ROLE \"appdb_acme_role\" WITH LOGIN PASSWORD 'deadbeef'"));
-        // Bare CREATE DATABASE (no IF NOT EXISTS, standalone).
-        assert!(joined.contains("CREATE DATABASE \"appdb_acme\" OWNER \"appdb_acme_role\""));
+        // The owner/DDL role is created NON-superuser and unable to create databases/roles, and
+        // that posture is RE-asserted on ALTER (heals an older-version role). This is the load-
+        // bearing confinement: a non-superuser owner cannot escape its own database.
+        assert!(joined.contains("pg_roles WHERE rolname = 'appdb_acme_owner'"));
+        assert!(joined.contains(
+            "CREATE ROLE \"appdb_acme_owner\" LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS NOREPLICATION PASSWORD '0wnerpw'"
+        ));
+        assert!(joined.contains(
+            "ALTER ROLE \"appdb_acme_owner\" WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS NOREPLICATION PASSWORD '0wnerpw'"
+        ));
+        // The database is owned by the OWNER role (not the runtime role), so migration-created
+        // objects are owner-owned and the runtime role is a non-owner (RLS holds).
+        assert!(joined.contains("CREATE DATABASE \"appdb_acme\" OWNER \"appdb_acme_owner\""));
         assert!(!joined.contains("CREATE DATABASE IF NOT EXISTS"));
-        // The password is only ever a quoted literal, never a bare token.
+        // Passwords are only ever quoted literals, never bare tokens.
         assert!(!joined.contains(" deadbeef"), "unquoted password leaked");
+        assert!(
+            !joined.contains(" 0wnerpw"),
+            "unquoted owner password leaked"
+        );
+        // The owner role is never granted superuser anywhere in the provisioning DDL.
+        for s in &stmts {
+            if s.contains("appdb_acme_owner") {
+                assert!(
+                    !s.to_ascii_uppercase().contains(" SUPERUSER"),
+                    "owner role must never be granted SUPERUSER: {s}"
+                );
+            }
+        }
 
-        // Ordering: role DO-block before ALTER before CREATE DATABASE before
-        // the REVOKE.
+        // Ordering: runtime role, then owner role, then CREATE DATABASE, then the REVOKE lockdown.
         let idx = |needle: &str| stmts.iter().position(|s| s.contains(needle)).unwrap();
-        assert!(idx("CREATE ROLE") < idx("ALTER ROLE"));
-        assert!(idx("ALTER ROLE") < idx("CREATE DATABASE"));
+        assert!(idx("rolname = 'appdb_acme_role'") < idx("rolname = 'appdb_acme_owner'"));
+        assert!(idx("rolname = 'appdb_acme_owner'") < idx("CREATE DATABASE"));
         assert!(idx("CREATE DATABASE") < idx("REVOKE CONNECT"));
     }
 
@@ -927,9 +1002,18 @@ mod tests {
             "appdb_acme",
             "appdb_acme_role",
             "deadbeef",
+            "appdb_acme_owner",
+            "0wnerpw",
         );
         let joined = stmts.join("\n");
         assert!(joined.contains("CREATE DATABASE IF NOT EXISTS `appdb_acme`"));
+        // MySQL Shared isolation is per-database `db.*` grants (no RLS owner/runtime split), so the
+        // owner params are inert here — the tenant user already holds db-scoped DDL, bounded to its
+        // own database (≤ project-owner). No separate owner role is created.
+        assert!(
+            !joined.contains("appdb_acme_owner"),
+            "MySQL should not create an owner role"
+        );
         assert!(joined
             .contains("CREATE USER IF NOT EXISTS 'appdb_acme_role'@'%' IDENTIFIED BY 'deadbeef'"));
         assert!(joined.contains("ALTER USER 'appdb_acme_role'@'%' IDENTIFIED BY 'deadbeef'"));
@@ -1034,8 +1118,22 @@ mod tests {
     fn malicious_password_is_neutralized() {
         let evil = "'; DROP DATABASE postgres; --";
         for stmts in [
-            provision_ddl(ExternalSqlKind::Postgres, "appdb_x", "appdb_x_role", evil),
-            provision_ddl(ExternalSqlKind::Mysql, "appdb_x", "appdb_x_role", evil),
+            provision_ddl(
+                ExternalSqlKind::Postgres,
+                "appdb_x",
+                "appdb_x_role",
+                evil,
+                "appdb_x_owner",
+                evil,
+            ),
+            provision_ddl(
+                ExternalSqlKind::Mysql,
+                "appdb_x",
+                "appdb_x_role",
+                evil,
+                "appdb_x_owner",
+                evil,
+            ),
             rotate_ddl(ExternalSqlKind::Postgres, "appdb_x_role", evil),
             rotate_ddl(ExternalSqlKind::Mysql, "appdb_x_role", evil),
         ] {
