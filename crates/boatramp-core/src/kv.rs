@@ -81,6 +81,23 @@ pub trait KvStore: Send + Sync {
         Ok(())
     }
 
+    /// Whether [`write_batch`](Self::write_batch) is **atomic** — all-or-nothing across the group, so
+    /// a crash can never leave a partially-applied batch. The default is `false`: the default
+    /// `write_batch` applies each op sequentially (each atomic per KEY, but not across the group), so
+    /// a crash between two ops leaves the first applied and the second not. Backends whose batch is a
+    /// single durable commit (SlateDB's `WriteBatch`, the in-memory store under one lock, the Raft
+    /// state machine's per-entry apply) override this to `true`.
+    ///
+    /// This is a **hard prerequisite** for event-driven delivery's ready-set fast path (B2): the
+    /// ready-set marker must ride the SAME atomic `write_batch` as the message-index write, else a
+    /// crash between the (durable) index put and the (separate) ready put strands the message. A
+    /// backend that returns `false` here MUST fall back to the full poll — see
+    /// [`Messaging::supports_ready_set`](crate::messaging::Messaging::supports_ready_set), which keys
+    /// on this. Fail-closed: an unsure backend inherits the default `false` and simply polls.
+    fn atomic_write_batch(&self) -> bool {
+        false
+    }
+
     /// Apply several writes together. The default applies them sequentially
     /// (each atomic per key); backends that support grouped commits (e.g.
     /// SlateDB's `WriteBatch`) override this to commit the whole group in one
@@ -198,6 +215,13 @@ impl KvStore for MemoryKv {
             .take(limit)
             .map(|(key, _)| key.clone())
             .collect())
+    }
+
+    fn atomic_write_batch(&self) -> bool {
+        // The whole group applies under one mutex (below): other readers see all of it or none of
+        // it, and there is no crash boundary within an in-memory store — so its batch is atomic and
+        // the ready-set fast path (B2) is safe over it.
+        true
     }
 
     async fn write_batch(&self, ops: Vec<WriteOp>) -> Result<(), KvError> {
@@ -342,6 +366,12 @@ impl KvStore for CachedKv {
     async fn list_prefix(&self, prefix: &str) -> Result<Vec<String>, KvError> {
         // Listing is not cached; it is only used on administrative paths.
         self.inner.list_prefix(prefix).await
+    }
+
+    fn atomic_write_batch(&self) -> bool {
+        // The cache is a pure read-through mirror; the backing store's batch is the atomic/durable
+        // one (`commit_then_mirror` commits it FIRST). So the cache is as atomic as its inner store.
+        self.inner.atomic_write_batch()
     }
 
     async fn write_batch(&self, ops: Vec<WriteOp>) -> Result<(), KvError> {
