@@ -3620,6 +3620,310 @@ mod tests {
         );
     }
 
+    // ---- event-driven delivery CI-hard gates (Phase A) ---------------------
+    //
+    // These spin up the REAL spawned scheduler (`spawn_scheduler` → the ready-set drainer) over a
+    // real `LogMessaging` + a real `event-consumer.wasm` guest, and assert delivery survives the new
+    // failure modes. Delivery is observed via the guest's durable keyvalue write
+    // (`hkv/blog/delivered/orders/created` = the count). The gates are the correctness oracle — none
+    // of them weakens at-least-once to pass.
+
+    /// Deploy the `event-consumer.wasm` guest as a work-queue consumer on `blog/orders/created`, over
+    /// the given backends, and return the runtime (unspawned) + deploy store. Shared by the gates so
+    /// each drives the SAME real consumer path the production scheduler uses.
+    #[cfg(feature = "handlers")]
+    async fn setup_delivery_consumer(
+        storage: Arc<MemStorage>,
+        kv: Arc<dyn KvStore>,
+        messaging: Arc<dyn Messaging>,
+    ) -> (HandlerRuntime, boatramp_core::deploy::DeployStore) {
+        use boatramp_core::config::{ConsumerConfig, DeployConfig, HandlersSiteConfig, SiteConfig};
+        use boatramp_core::deploy::{DeployStore, FileEntry, Manifest};
+        use boatramp_handlers::{HandlerEngine, Limits};
+        use futures::StreamExt;
+
+        let deploy = DeployStore::new(storage.clone(), kv.clone());
+        let hash = boatramp_core::deploy::sha256_hex(EVENT_CONSUMER);
+        let stream: ByteStream =
+            futures::stream::once(async move { Ok(bytes::Bytes::from_static(EVENT_CONSUMER)) })
+                .boxed();
+        deploy.put_blob(&hash, stream).await.unwrap();
+        let mut files = std::collections::BTreeMap::new();
+        files.insert(
+            "consumer.wasm".to_string(),
+            FileEntry {
+                hash: hash.clone(),
+                size: EVENT_CONSUMER.len() as u64,
+                content_type: None,
+                variants: std::collections::BTreeMap::new(),
+            },
+        );
+        let manifest = Manifest {
+            files,
+            config: DeployConfig {
+                consumers: vec![ConsumerConfig {
+                    tenancy: None,
+                    token_claims: None,
+                    backoff_ms: None,
+                    retention_ms: None,
+                    topic: "orders/created".into(),
+                    component: "consumer.wasm".into(),
+                    imports: vec!["wasi:keyvalue".into()],
+                    group: String::new(),
+                    start: Default::default(),
+                    // A short lease so the restart/lease-expiry gate redelivers within the test window.
+                    lease_ms: Some(1000),
+                    max_attempts: None,
+                    max_batch: None,
+                    max_ack_pending: None,
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let id = deploy.put_manifest(&manifest).await.unwrap();
+        deploy.activate(ProjectRef::DEFAULT, "blog", &id).await.unwrap();
+        deploy
+            .set_site_config(
+                ProjectRef::DEFAULT,
+                "blog",
+                &SiteConfig {
+                    handlers: Some(HandlersSiteConfig {
+                        enabled: true,
+                        allow_imports: vec!["wasi:keyvalue".into()],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
+        let rt = HandlerRuntime::new(engine, kv, storage, None, Some(messaging));
+        (rt, deploy)
+    }
+
+    /// Poll `kv` for the consumer's delivery counter to reach `want` within `deadline`, returning
+    /// whether it did (so a gate can assert delivery WITHOUT a fixed sleep — the drainer is async).
+    #[cfg(feature = "handlers")]
+    async fn await_delivered(kv: &Arc<dyn KvStore>, want: &[u8], deadline: Duration) -> bool {
+        let start = std::time::Instant::now();
+        while start.elapsed() < deadline {
+            if kv
+                .get("hkv/blog/delivered/orders/created")
+                .await
+                .unwrap()
+                .as_deref()
+                == Some(want)
+            {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        false
+    }
+
+    /// **Gate 2 — lost wake.** With the fast-path wake never fired (we publish AFTER the drainer is
+    /// already parked, and force a tiny safety-net so the timer is the only thing that can deliver),
+    /// the message is STILL delivered by the safety-net reconcile — proving the durable ready-set +
+    /// timer, not the notification, is the authority. To make "wake lost" unambiguous we wrap the
+    /// backend so its `wake_handle` returns `None` (the drainer has no wake at all).
+    #[cfg(feature = "handlers")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gate2_lost_wake_safetynet_still_delivers() {
+        let storage = Arc::new(MemStorage::default());
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        // A backend that supports the ready-set but offers NO wake — so the ONLY delivery path is the
+        // safety-net timer draining the durable ready-set (a maximally-lost wake).
+        let messaging: Arc<dyn Messaging> = Arc::new(NoWakeMessaging(LogMessaging::new(
+            storage.clone(),
+            kv.clone(),
+        )));
+        let (rt, deploy) = setup_delivery_consumer(storage, kv.clone(), messaging.clone()).await;
+        // A tight safety-net so the test is quick; the drainer relies on it entirely (no wake).
+        rt.set_delivery_config(DeliveryConfig {
+            safetynet_interval: Duration::from_millis(100),
+            rebuild_interval: Duration::from_millis(500),
+        });
+        let handle = rt.spawn_scheduler(deploy).unwrap();
+        // Publish AFTER the drainer is spawned/parked — with no wake, only the safety-net can deliver.
+        messaging.publish("blog/orders/created", b"x").await.unwrap();
+        assert!(
+            await_delivered(&kv, b"1", Duration::from_secs(5)).await,
+            "gate 2: with the wake dropped, the safety-net still delivers the message"
+        );
+        handle.abort();
+    }
+
+    /// **Gate 3 (end-to-end) — crash between the durable commit and the ready-set.** Publish, then
+    /// simulate the crash window by deleting the ready marker out from under the (durable) message.
+    /// The safety-net's periodic ready-set REBUILD re-derives the marker from the authoritative index
+    /// and the message is delivered — no loss, no operator action.
+    #[cfg(feature = "handlers")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gate3_crash_between_commit_and_ready_set_recovers_via_rebuild() {
+        use boatramp_core::messaging::ready_key;
+        let storage = Arc::new(MemStorage::default());
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let messaging: Arc<dyn Messaging> =
+            Arc::new(LogMessaging::new(storage.clone(), kv.clone()));
+        let (rt, deploy) = setup_delivery_consumer(storage, kv.clone(), messaging.clone()).await;
+        rt.set_delivery_config(DeliveryConfig {
+            safetynet_interval: Duration::from_millis(100),
+            // A short rebuild so the lost marker is recovered within the test window.
+            rebuild_interval: Duration::from_millis(200),
+        });
+        // Publish, then DELETE the ready marker (the crash window: index durable, marker not applied).
+        messaging.publish("blog/orders/created", b"x").await.unwrap();
+        kv.delete(&ready_key("blog/orders/created")).await.unwrap();
+        assert!(
+            messaging.ready_topics().await.unwrap().is_empty(),
+            "precondition: the ready marker is lost"
+        );
+        assert_eq!(
+            messaging.backlog("blog/orders/created").await.unwrap(),
+            1,
+            "precondition: the message itself is NOT lost"
+        );
+        let handle = rt.spawn_scheduler(deploy).unwrap();
+        assert!(
+            await_delivered(&kv, b"1", Duration::from_secs(5)).await,
+            "gate 3: the rebuild re-derives the lost marker and the message is delivered"
+        );
+        handle.abort();
+    }
+
+    /// **Gate 4 — prune-vs-publish race.** Hammer publishes concurrently with the drainer's
+    /// claim-drain-prune; every published message must still be delivered (no stranding), WITHOUT
+    /// waiting for the rebuild (a long rebuild interval proves the prune guard, not the rebuild,
+    /// closes the race).
+    #[cfg(feature = "handlers")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn gate4_prune_vs_publish_race_never_strands() {
+        let storage = Arc::new(MemStorage::default());
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let messaging: Arc<dyn Messaging> =
+            Arc::new(LogMessaging::new(storage.clone(), kv.clone()));
+        let (rt, deploy) = setup_delivery_consumer(storage, kv.clone(), messaging.clone()).await;
+        rt.set_delivery_config(DeliveryConfig {
+            safetynet_interval: Duration::from_millis(50),
+            // A LONG rebuild so recovery can only come from the prune guard + wake/safety-net, not the
+            // rebuild — the gate proves the race is closed directly (B4).
+            rebuild_interval: Duration::from_secs(3600),
+        });
+        let handle = rt.spawn_scheduler(deploy).unwrap();
+        // Publish N messages one at a time with the drainer running concurrently, so each publish can
+        // race a claim that just drained the topic to empty (the prune window).
+        const N: u32 = 40;
+        for _ in 0..N {
+            messaging.publish("blog/orders/created", b"x").await.unwrap();
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // Every message must be delivered (the counter reaches N) well before the 1h rebuild.
+        assert!(
+            await_delivered(&kv, N.to_string().as_bytes(), Duration::from_secs(15)).await,
+            "gate 4: no message stranded by a prune racing a publish (delivered without the rebuild)"
+        );
+        handle.abort();
+    }
+
+    /// **Gate 5 — restart / due-heap loss lease-expiry redelivery.** A message is leased (claimed but
+    /// its guest run never acks — simulated by a claim we drop), then the drainer is (re)started with
+    /// a FRESH due-heap. The startup rebuild + the safety-net's lease-expiry claim must redeliver it
+    /// on time — a lost heap costs latency, never a lost redelivery (B6).
+    #[cfg(feature = "handlers")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gate5_restart_discards_heap_but_lease_expiry_still_redelivers() {
+        let storage = Arc::new(MemStorage::default());
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let messaging: Arc<dyn Messaging> =
+            Arc::new(LogMessaging::new(storage.clone(), kv.clone()));
+        // Publish + claim-with-a-short-lease OUT OF BAND (no ack), so the message is leased-but-pending
+        // — exactly the state a crash leaves behind. Then start the drainer fresh (empty due-heap).
+        messaging.publish("blog/orders/created", b"x").await.unwrap();
+        let leased = messaging
+            .claim("blog/orders/created", Duration::from_millis(500), 10, 5)
+            .await
+            .unwrap();
+        assert_eq!(leased.len(), 1, "the message is leased (unacked)");
+        drop(leased); // never acked — the lease will expire and it must redeliver
+        let (rt, deploy) = setup_delivery_consumer(storage, kv.clone(), messaging.clone()).await;
+        rt.set_delivery_config(DeliveryConfig {
+            safetynet_interval: Duration::from_millis(100),
+            rebuild_interval: Duration::from_millis(500),
+        });
+        // Fresh drainer: its due-heap starts empty and is rebuilt from the durable lease state at
+        // startup (B6). Once the 500ms lease expires, the safety-net claim redelivers to the guest.
+        let handle = rt.spawn_scheduler(deploy).unwrap();
+        assert!(
+            await_delivered(&kv, b"1", Duration::from_secs(6)).await,
+            "gate 5: a fresh (empty) due-heap still redelivers the leased-then-expired message"
+        );
+        handle.abort();
+    }
+
+    /// A `Messaging` wrapper that delegates to an inner [`LogMessaging`] but reports NO wake handle,
+    /// so the delivery drainer over it has ONLY the safety-net timer (gate 2: maximally-lost wake).
+    #[cfg(feature = "handlers")]
+    struct NoWakeMessaging(LogMessaging);
+    #[cfg(feature = "handlers")]
+    #[async_trait::async_trait]
+    impl Messaging for NoWakeMessaging {
+        async fn publish(
+            &self,
+            topic: &str,
+            payload: &[u8],
+        ) -> Result<(), boatramp_core::messaging::MessagingError> {
+            self.0.publish(topic, payload).await
+        }
+        async fn claim(
+            &self,
+            topic: &str,
+            lease: Duration,
+            max_batch: usize,
+            max_attempts: u32,
+        ) -> Result<
+            Vec<boatramp_core::messaging::ClaimedMessage>,
+            boatramp_core::messaging::MessagingError,
+        > {
+            self.0.claim(topic, lease, max_batch, max_attempts).await
+        }
+        async fn ack(
+            &self,
+            msg: &boatramp_core::messaging::ClaimedMessage,
+        ) -> Result<(), boatramp_core::messaging::MessagingError> {
+            self.0.ack(msg).await
+        }
+        async fn nack(
+            &self,
+            msg: &boatramp_core::messaging::ClaimedMessage,
+        ) -> Result<(), boatramp_core::messaging::MessagingError> {
+            self.0.nack(msg).await
+        }
+        fn supports_ready_set(&self) -> bool {
+            self.0.supports_ready_set()
+        }
+        async fn ready_topics(
+            &self,
+        ) -> Result<Vec<String>, boatramp_core::messaging::MessagingError> {
+            self.0.ready_topics().await
+        }
+        async fn rebuild_ready_set(
+            &self,
+        ) -> Result<usize, boatramp_core::messaging::MessagingError> {
+            self.0.rebuild_ready_set().await
+        }
+        async fn due_topics(
+            &self,
+        ) -> Result<Vec<(String, u64)>, boatramp_core::messaging::MessagingError> {
+            self.0.due_topics().await
+        }
+        // The point of the wrapper: NO wake, so the drainer relies solely on the safety-net timer.
+        fn wake_handle(&self) -> Option<boatramp_core::messaging::Wake> {
+            None
+        }
+    }
+
     // ---- cron driver (#18) -------------------------------------------------
 
     /// A `wasi:http` handler that increments `hits` per request (`kv-counter`),
