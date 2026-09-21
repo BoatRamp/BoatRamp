@@ -248,6 +248,22 @@ async fn migrate_runner_ledger_and_atomicity_on_a_real_engine() {
         "a raw sql step that CREATE EXTENSIONs is refused (per-step failure)"
     );
 
+    // --- a transactional sql step carrying its own BEGIN/COMMIT is refused (would desync the
+    //     atomic wrapper) — a per-step failure, not applied. ---
+    let txn_ctrl = [
+        set[0].clone(),
+        set[1].clone(),
+        sql_step("0003_atomic", "CREATE TABLE gadget (id int primary key)"),
+        ext_step("0004_citext", "citext"),
+        sql_step("0006_txn", "BEGIN; CREATE TABLE sneaky (x int); COMMIT;"),
+    ];
+    let rep_txn = runner.apply("default", DB, &txn_ctrl, false).await.unwrap();
+    assert_eq!(
+        rep_txn.failed.as_ref().map(|f| f.id.as_str()),
+        Some("0006_txn"),
+        "a transactional step with its own BEGIN/COMMIT is refused"
+    );
+
     // Final cleanup.
     let _ = runner
         .apply(
