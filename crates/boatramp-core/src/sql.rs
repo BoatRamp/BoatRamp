@@ -614,7 +614,7 @@ pub fn script_has_txn_control(script: &str) -> bool {
 pub fn script_references_word(script: &str, needle: &str) -> bool {
     let needle = needle.to_ascii_lowercase();
     match significant_words(script) {
-        Some(words) => words.iter().any(|w| *w == needle),
+        Some(words) => words.contains(&needle),
         None => true, // fail closed
     }
 }
