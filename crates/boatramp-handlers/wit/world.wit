@@ -822,6 +822,52 @@ world admin-host {
   import admin;
 }
 
+/// Value types for the host-mediated owner-role `migrate-ddl` capability (owner-gated schema
+/// migrations). A migration **function step** imports this to run DDL / DML / verification queries
+/// as the project's non-superuser **owner** role: the host executes each statement on an
+/// orchestrator-owned owner connection, so the guest never holds the credential. The binding is
+/// attached ONLY inside a `Project·Admin` migration run (host-stamped context); a normal
+/// request/consumer/cron invocation of the same component has no binding, so every verb returns
+/// `not-a-migration`. Deny-by-default. The DDL runs at project-owner altitude (Postgres denies the
+/// owner role cross-database / role-escalation / `COPY … TO PROGRAM`), never as a cluster superuser.
+interface migrate-ddl-types {
+  /// Why a `migrate-ddl` call was refused or failed — always self-explaining (never a bare
+  /// access-denied), so a migration author can tell a context/guard refusal from its own bad DDL.
+  variant migrate-error {
+    /// This component was NOT invoked as a migration step: the capability is inert outside a
+    /// migration run. It tells the author the function is running as a normal request/consumer/cron,
+    /// where owner-DDL is unavailable — not that the DDL itself was wrong.
+    not-a-migration,
+    /// The statement referenced the host-owned migration-ledger schema (`boatramp_migrations`) —
+    /// refused so a step can never corrupt the ledger it is tracked in.
+    ledger-protected,
+    /// The statement issued its own `BEGIN`/`COMMIT`/`ROLLBACK` — refused; each `exec` auto-commits
+    /// on the host-held owner connection.
+    txn-control,
+    /// The owner connection rejected the statement (sanitized message).
+    sql(string),
+  }
+}
+
+/// The `migrate-ddl` capability: host-mediated owner-role DDL for a migration function step.
+interface migrate-ddl {
+  use migrate-ddl-types.{migrate-error};
+
+  /// Run a DDL/DML `script` (one or more statements) as the owner role; auto-commits on success.
+  exec: func(script: string) -> result<_, migrate-error>;
+  /// Run several scripts in order, each auto-committing (a convenience over repeated `exec`).
+  exec-batch: func(scripts: list<string>) -> result<_, migrate-error>;
+  /// Run a read `query` as the owner role and return the rows as a **JSON string** — an array of
+  /// row arrays, each cell a JSON scalar (null / number / bool / string). For in-migration
+  /// verification (the owner sees all rows, which is correct for a schema/data-migration check).
+  query: func(sql: string) -> result<string, migrate-error>;
+}
+
+/// The `migrate-ddl` capability world (imported into a migration **function** step).
+world migrate-ddl-host {
+  import migrate-ddl;
+}
+
 /// The `wasi:logging` capability world. A guest that imports `wasi:logging/logging`
 /// gets its structured `log(level, context, message)` messages captured into the same
 /// host sink as stdout/stderr, with the level preserved. Like stdio capture (and unlike

@@ -34,6 +34,8 @@ pub mod invoke;
 pub mod keyvalue;
 #[cfg(feature = "messaging")]
 pub mod messaging;
+#[cfg(feature = "migrate")]
+pub mod migrate;
 #[cfg(feature = "sql")]
 pub mod orm;
 #[cfg(feature = "session")]
@@ -85,6 +87,10 @@ pub struct Bindings {
     /// the granted config surfaces. `None` = admin not granted.
     #[cfg(feature = "admin")]
     admin: Option<admin::AdminBinding>,
+    /// The `migrate-ddl` grant (a migration function step runs owner-role DDL): the project+db-scoped
+    /// owner-DDL seam. `None` = not a migration step (`migrate::*` ⇒ `not-a-migration`).
+    #[cfg(feature = "migrate")]
+    migrate: Option<migrate::MigrateBinding>,
     /// The `capability` grant (mint a fleet-signed target capability): the project-scoped minter +
     /// the operator TTL ceiling. `None` = capability minting not granted.
     #[cfg(feature = "capability")]
@@ -379,6 +385,22 @@ impl Bindings {
     #[cfg(feature = "admin")]
     pub(crate) fn admin(&self) -> Option<&admin::AdminBinding> {
         self.admin.as_ref()
+    }
+
+    /// Grant the `migrate-ddl` capability for a migration function step: `ddl` is the server-side
+    /// owner-role seam for this project+db. SECURITY: the server attaches this ONLY inside a
+    /// `Project·Admin` migration run (context-gated); a normal invocation leaves it `None`, so every
+    /// `migrate::*` verb returns `not-a-migration`.
+    #[cfg(feature = "migrate")]
+    pub fn with_migrate(mut self, ddl: Arc<dyn boatramp_core::sql::MigrateDdl>) -> Self {
+        self.migrate = Some(migrate::MigrateBinding { ddl });
+        self
+    }
+
+    /// The granted migrate-ddl binding, if any.
+    #[cfg(feature = "migrate")]
+    pub(crate) fn migrate(&self) -> Option<&migrate::MigrateBinding> {
+        self.migrate.as_ref()
     }
 
     /// Grant the `capability` capability: `minter` signs a target capability (reaching the fleet

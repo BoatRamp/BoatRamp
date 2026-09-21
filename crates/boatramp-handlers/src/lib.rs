@@ -30,6 +30,8 @@ pub use bindings::invoke::{
 };
 #[cfg(feature = "messaging")]
 pub use bindings::messaging::{ProducerContext, BUS_TOPIC_SELECTOR};
+#[cfg(feature = "migrate")]
+pub use bindings::migrate::MigrateBinding;
 #[cfg(feature = "session")]
 pub use bindings::session::{SessionBinding, SessionController, SessionError};
 #[cfg(feature = "messaging")]
