@@ -545,11 +545,74 @@ impl NodeOperatorSql {
     }
 
     /// The SQL engine of managed database `db`, if configured (for the migration runner's
-    /// engine gate — schema migrations are Postgres-only in this release).
+    /// engine gate).
     pub(crate) fn engine_kind(&self, db: &str) -> Option<ExternalSqlKind> {
         self.databases
             .get(db)
             .and_then(|cfg| ExternalSqlKind::parse(&cfg.kind))
+    }
+
+    /// Connect as the **MySQL DDL identity** — the owner-role analog for a backend with no
+    /// owner/runtime role split. MySQL never mints a separate DDL user at provision (the runtime
+    /// user gets `GRANT ALL ON <db>.*`, so it is itself DDL-capable within its schema); running
+    /// migration DDL as that runtime tenant identity would violate the surface's core safety
+    /// (`DDL runs as a non-runtime identity`). So the DDL identity must be supplied **explicitly**
+    /// via `migration_url_env`, and it must be **distinct** from the runtime binding. Absent it —
+    /// or if it resolves to the very same URL as the runtime `url_env` — we **refuse** fail-closed
+    /// rather than run owner-DDL as the runtime user (there is no owner-role fallback on MySQL).
+    ///
+    /// The DDL URL is read from the environment (the operator supplies an admin/DDL login DSN,
+    /// e.g. a purpose-made `_migrate` grant or an admin account), never from anything a guest
+    /// influences. The credential stays on the node (as with every other `sql` connection).
+    async fn mysql_ddl_backend_for(
+        &self,
+        db: &str,
+    ) -> Result<Arc<dyn boatramp_core::sql::SqlBackend>, SqlError> {
+        use boatramp_storage::sql_sqlx::{connect, ExternalSqlOptions};
+        let cfg = self
+            .databases
+            .get(db)
+            .ok_or_else(|| SqlError::other(format!("no database named {db:?}")))?;
+        let migration_var = cfg
+            .migration_url_env
+            .as_deref()
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| {
+                SqlError::other(format!(
+                    "database {db:?}: MySQL schema migrations require a distinct DDL identity — set \
+                     `migration_url_env` to an admin/DDL connection URL that is NOT the runtime \
+                     `user`/`url_env` (MySQL has no owner/runtime role split; running DDL as the \
+                     runtime tenant user is refused fail-closed)"
+                ))
+            })?;
+        let ddl_url = std::env::var(migration_var).map_err(|_| {
+            SqlError::other(format!(
+                "env var {migration_var} (migration/DDL url for {db:?}) is unset"
+            ))
+        })?;
+
+        // Fail closed if the DDL URL is the SAME identity as the runtime binding. For a
+        // bring-your-own-URL binding the runtime identity IS `url_env`; a compute-backed binding
+        // has no runtime URL (its identity is the managed `user`), so any distinct DDL URL is fine.
+        if !cfg.url_env.is_empty() {
+            if let Ok(runtime_url) = std::env::var(&cfg.url_env) {
+                if runtime_url == ddl_url {
+                    return Err(SqlError::other(format!(
+                        "database {db:?}: `migration_url_env` resolves to the SAME connection as the \
+                         runtime `url_env` — the MySQL DDL identity must be distinct from the runtime \
+                         user (refused fail-closed)"
+                    )));
+                }
+            }
+        }
+
+        let timeout = cfg.connect_timeout_secs.map(std::time::Duration::from_secs);
+        let opts = ExternalSqlOptions::new(ddl_url)
+            .with_max_connections(cfg.pool_max)
+            // The DDL connection must be writable — never inherit the binding's `read_only`.
+            .read_only(false)
+            .with_connect_timeout(timeout);
+        connect(ExternalSqlKind::Mysql, &opts)
     }
 
     /// Shared body of [`backend_for`](Self::backend_for) / [`owner_backend_for`](Self::owner_backend_for):
@@ -843,12 +906,23 @@ impl boatramp_core::sql::OperatorSql for NodeOperatorSql {
     }
 }
 
-/// The schema-migration runner (Postgres). Owns the ordered `schema_migrations` ledger and applies
-/// the pending suffix of a step set, once each, transactionally-where-possible, connecting as the
-/// per-project non-superuser **owner** role (via [`NodeOperatorSql::owner_backend_for`]) for the
-/// ledger + `sql` steps, and as the superuser (via [`NodeOperatorSql::backend_for`]) ONLY for the
-/// allowlist-gated, host-templated `CREATE EXTENSION`. boatramp owns ordering/idempotency/atomicity;
-/// the caller supplies the ordered steps. `Project·Admin`-gated at the API.
+/// The schema-migration runner (Postgres + MySQL). Owns the ordered `schema_migrations` ledger and
+/// applies the pending suffix of a step set, once each, connecting as a **DDL identity distinct from
+/// the runtime user** for the ledger + `sql` steps:
+///
+/// - **Postgres** — the per-project non-superuser **owner** role (via
+///   [`NodeOperatorSql::owner_backend_for`]); transactional DDL, so a `sql` step + its ledger row
+///   commit atomically. `extension` steps run the allowlist-gated, host-templated `CREATE EXTENSION`
+///   via the superuser ([`NodeOperatorSql::backend_for`]).
+/// - **MySQL** — an operator-supplied DDL login (`migration_url_env`, via
+///   [`NodeOperatorSql::mysql_ddl_backend_for`]), refused fail-closed if absent or identical to the
+///   runtime identity (no owner/runtime role split to fall back on). MySQL **implicitly commits per
+///   DDL statement**, so a `sql` step is NOT atomic: the DDL runs first, then the ledger row is
+///   recorded, and a mid-step failure is reported as a **partially-applied** step (never claimed
+///   atomic). The `extension` step kind is **refused** on MySQL (no `CREATE EXTENSION`).
+///
+/// boatramp owns ordering/idempotency; the caller supplies the ordered steps. `Project·Admin`-gated
+/// at the API.
 #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
 pub struct NodeMigrationRunner {
     op: Arc<NodeOperatorSql>,
@@ -857,9 +931,16 @@ pub struct NodeMigrationRunner {
     trusted_extensions: std::collections::BTreeSet<String>,
 }
 
-/// The host-owned schema holding the migration ledger — owner-role-owned, and NOT in `public`, so
-/// the runtime tenant role (which only ever gets DML on `public` via `grant_app_role_ddl`) has no
-/// access to it: the ledger is append-only from the app's perspective by schema isolation.
+/// The host-owned schema (Postgres) / database (MySQL) holding the migration ledger.
+///
+/// - **Postgres** — a SCHEMA `boatramp_migrations` inside the tenant database, owner-role-owned and
+///   NOT in `public`, so the runtime tenant role (which only gets DML on `public` via
+///   `grant_app_role_ddl`) has no access: the ledger is append-only from the app's perspective by
+///   schema isolation.
+/// - **MySQL** — a separate DATABASE `boatramp_migrations` (MySQL has no schema-within-database
+///   namespace), created + owned by the DDL identity. The runtime tenant user was granted only
+///   `<its-db>.*`, so it has NO privilege on the `boatramp_migrations` database at all — the same
+///   append-only-by-isolation property, by database grant rather than schema grant.
 #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
 const LEDGER_SCHEMA: &str = "boatramp_migrations";
 #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
@@ -890,8 +971,19 @@ fn valid_migration_id(id: &str) -> bool {
 /// HIGH-1]: a byte scan is evadable via `CREATE/**/EXTENSION`; the tokenizer strips comments and
 /// fails closed on an unlexable script).
 #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
-fn mentions_create_extension(script: &str) -> bool {
-    boatramp_core::sql::script_has_create_extension(script)
+fn mentions_create_extension(script: &str, kind: ExternalSqlKind) -> bool {
+    boatramp_core::sql::script_has_create_extension_in(script, guard_dialect(kind))
+}
+
+/// The [`boatramp_core::sql::GuardDialect`] for a managed engine — so a raw `sql` step is tokenized
+/// under the ENGINE's own comment/quote rules (MySQL `#` line comments + backtick identifiers),
+/// closing an engine-specific evasion the generic lexer wouldn't catch.
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+fn guard_dialect(kind: ExternalSqlKind) -> boatramp_core::sql::GuardDialect {
+    match kind {
+        ExternalSqlKind::Mysql => boatramp_core::sql::GuardDialect::Mysql,
+        ExternalSqlKind::Postgres => boatramp_core::sql::GuardDialect::Postgres,
+    }
 }
 
 /// Whether `script` issues its own transaction control (`BEGIN`/`START`/`COMMIT`/`END`/`ROLLBACK`/
@@ -906,8 +998,8 @@ fn mentions_create_extension(script: &str) -> bool {
 /// false-positived on `CASE … END` and PL/pgSQL `$$ BEGIN … END $$` bodies. The tokenizer is
 /// comment-/casing-/string-immune, CASE-aware, and fails closed on an unlexable script.
 #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
-fn mentions_txn_control(script: &str) -> bool {
-    boatramp_core::sql::script_has_txn_control(script)
+fn mentions_txn_control(script: &str, kind: ExternalSqlKind) -> bool {
+    boatramp_core::sql::script_has_txn_control_in(script, guard_dialect(kind))
 }
 
 /// Whether `script` references the host-owned migration-ledger schema (`boatramp_migrations`). The
@@ -918,8 +1010,8 @@ fn mentions_txn_control(script: &str) -> bool {
 /// not). Belt-and-braces beside the schema isolation (the runtime tenant role has no grant on it at
 /// all); this stops the OWNER-role path a function step runs on.
 #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
-fn mentions_ledger_schema(script: &str) -> bool {
-    boatramp_core::sql::script_references_word(script, LEDGER_SCHEMA)
+fn mentions_ledger_schema(script: &str, kind: ExternalSqlKind) -> bool {
+    boatramp_core::sql::script_references_word_in(script, LEDGER_SCHEMA, guard_dialect(kind))
 }
 
 /// The host-mediated owner-role DDL seam backing the guest `migrate-ddl` capability of a `function`
@@ -929,17 +1021,23 @@ fn mentions_ledger_schema(script: &str) -> bool {
 #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
 pub(crate) struct OwnerDdl {
     owner: Arc<dyn boatramp_core::sql::SqlBackend>,
+    /// The target engine — selects the dialect-aware guard tokenizer (MySQL `#` comments +
+    /// backticks) so an engine-specific evasion can't slip a guarded construct past.
+    kind: ExternalSqlKind,
 }
 
 #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
 impl OwnerDdl {
     /// Guard a guest-supplied script/query: refuse a ledger-schema reference (S3) or its own
-    /// transaction control (S4) before it reaches the owner connection.
-    fn guard(script: &str) -> Result<(), MigrateDdlError> {
-        if mentions_ledger_schema(script) {
+    /// transaction control (S4) before it reaches the owner connection. Tokenized under the target
+    /// engine's dialect. On MySQL, transaction control is doubly meaningful: DDL implicitly commits,
+    /// so a guest `BEGIN` would not even bound the following statements — refusing it keeps the
+    /// per-statement auto-commit contract explicit and identical across engines.
+    fn guard(&self, script: &str) -> Result<(), MigrateDdlError> {
+        if mentions_ledger_schema(script, self.kind) {
             return Err(MigrateDdlError::LedgerProtected);
         }
-        if mentions_txn_control(script) {
+        if mentions_txn_control(script, self.kind) {
             return Err(MigrateDdlError::TxnControl);
         }
         Ok(())
@@ -950,7 +1048,7 @@ impl OwnerDdl {
 #[async_trait]
 impl MigrateDdl for OwnerDdl {
     async fn exec(&self, script: &str) -> Result<(), MigrateDdlError> {
-        Self::guard(script)?;
+        self.guard(script)?;
         self.owner
             .run_script(script)
             .await
@@ -965,7 +1063,7 @@ impl MigrateDdl for OwnerDdl {
     }
 
     async fn query(&self, sql: &str) -> Result<boatramp_core::sql::SqlRows, MigrateDdlError> {
-        Self::guard(sql)?;
+        self.guard(sql)?;
         let rows = self
             .owner
             .run_query(sql)
@@ -1005,21 +1103,23 @@ impl NodeMigrationRunner {
         }
     }
 
-    /// The fully-qualified, quoted ledger table name.
-    fn ledger() -> String {
+    /// The fully-qualified, quoted ledger table name for `kind` — `"boatramp_migrations"."schema_migrations"`
+    /// on Postgres (schema.table), `` `boatramp_migrations`.`schema_migrations` `` on MySQL (database.table).
+    fn ledger(kind: ExternalSqlKind) -> String {
         use boatramp_storage::tenant_provision::quote_ident;
         format!(
             "{}.{}",
-            quote_ident(ExternalSqlKind::Postgres, LEDGER_SCHEMA),
-            quote_ident(ExternalSqlKind::Postgres, LEDGER_TABLE)
+            quote_ident(kind, LEDGER_SCHEMA),
+            quote_ident(kind, LEDGER_TABLE)
         )
     }
 
     /// The host-built ledger INSERT for one recorded step (all values host-controlled + quoted). The
     /// orchestrator supplies the **effective** hash (== the intrinsic content hash for sql/extension;
     /// blob-bound for a function step) and the `origin` (`apply` vs `baseline`, recorded in
-    /// `applied_by` for the U6 marker).
+    /// `applied_by` for the U6 marker). Column list + literal quoting are identical across engines.
     fn ledger_insert(
+        kind: ExternalSqlKind,
         step: &MigrationStep,
         ordinal: usize,
         effective_hash: &str,
@@ -1027,53 +1127,87 @@ impl NodeMigrationRunner {
     ) -> String {
         format!(
             "INSERT INTO {ledger} (id, ordinal, content_hash, kind, applied_by) \
-             VALUES ({id}, {ord}, {hash}, {kind}, {origin});",
-            ledger = Self::ledger(),
+             VALUES ({id}, {ord}, {hash}, {step_kind}, {origin});",
+            ledger = Self::ledger(kind),
             id = sql_quote_literal(&step.id),
             ord = ordinal,
             hash = sql_quote_literal(effective_hash),
-            kind = sql_quote_literal(step.kind()),
+            step_kind = sql_quote_literal(step.kind()),
             origin = sql_quote_literal(origin.as_str()),
         )
     }
 
-    /// Ensure the ledger schema + table exist (idempotent), as the owner role.
+    /// Ensure the ledger schema/database + table exist (idempotent), as the DDL identity.
+    ///
+    /// - **Postgres** — a SCHEMA inside the tenant database + a table with `timestamptz DEFAULT now()`.
+    /// - **MySQL** — a separate DATABASE (no schema-within-db) + an InnoDB table with bounded
+    ///   `VARCHAR` keys (MySQL can't use an unbounded `TEXT`/`BLOB` as a PRIMARY KEY without a prefix
+    ///   length) and a `TIMESTAMP DEFAULT CURRENT_TIMESTAMP`.
     async fn ensure_ledger(
         &self,
+        kind: ExternalSqlKind,
         owner: &Arc<dyn boatramp_core::sql::SqlBackend>,
     ) -> Result<(), SqlError> {
         use boatramp_storage::tenant_provision::quote_ident;
-        let schema = quote_ident(ExternalSqlKind::Postgres, LEDGER_SCHEMA);
-        owner
-            .run_script(&format!("CREATE SCHEMA IF NOT EXISTS {schema};"))
-            .await?;
-        owner
-            .run_script(&format!(
-                "CREATE TABLE IF NOT EXISTS {ledger} (\
-                 id text PRIMARY KEY, \
-                 ordinal integer NOT NULL, \
-                 content_hash text NOT NULL, \
-                 kind text NOT NULL, \
-                 applied_at timestamptz NOT NULL DEFAULT now(), \
-                 applied_by text);",
-                ledger = Self::ledger()
-            ))
-            .await?;
+        match kind {
+            ExternalSqlKind::Postgres => {
+                let schema = quote_ident(kind, LEDGER_SCHEMA);
+                owner
+                    .run_script(&format!("CREATE SCHEMA IF NOT EXISTS {schema};"))
+                    .await?;
+                owner
+                    .run_script(&format!(
+                        "CREATE TABLE IF NOT EXISTS {ledger} (\
+                         id text PRIMARY KEY, \
+                         ordinal integer NOT NULL, \
+                         content_hash text NOT NULL, \
+                         kind text NOT NULL, \
+                         applied_at timestamptz NOT NULL DEFAULT now(), \
+                         applied_by text);",
+                        ledger = Self::ledger(kind)
+                    ))
+                    .await?;
+            }
+            ExternalSqlKind::Mysql => {
+                let db = quote_ident(kind, LEDGER_SCHEMA);
+                owner
+                    .run_script(&format!("CREATE DATABASE IF NOT EXISTS {db};"))
+                    .await?;
+                owner
+                    .run_script(&format!(
+                        "CREATE TABLE IF NOT EXISTS {ledger} (\
+                         id VARCHAR(255) PRIMARY KEY, \
+                         ordinal INT NOT NULL, \
+                         content_hash VARCHAR(255) NOT NULL, \
+                         kind VARCHAR(32) NOT NULL, \
+                         applied_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, \
+                         applied_by VARCHAR(32)) ENGINE=InnoDB;",
+                        ledger = Self::ledger(kind)
+                    ))
+                    .await?;
+            }
+        }
         Ok(())
     }
 
     /// Read the applied ledger rows, ordered by `ordinal`. `applied_by` maps to the row `origin`
     /// (`baseline` when it was baselined, else `apply` — covering NULL/legacy rows via the default).
+    /// The `applied_at` cast differs by dialect (`::text` on Postgres, `CAST(… AS CHAR)` on MySQL).
     async fn read_applied(
         &self,
+        kind: ExternalSqlKind,
         owner: &Arc<dyn boatramp_core::sql::SqlBackend>,
     ) -> Result<Vec<AppliedMigration>, SqlError> {
         use boatramp_core::sql::SqlValue;
+        let applied_at = match kind {
+            ExternalSqlKind::Postgres => "applied_at::text",
+            ExternalSqlKind::Mysql => "CAST(applied_at AS CHAR)",
+        };
         let rows = owner
             .run_query(&format!(
-                "SELECT id, ordinal, content_hash, kind, applied_at::text, applied_by \
+                "SELECT id, ordinal, content_hash, kind, {applied_at}, applied_by \
                  FROM {ledger} ORDER BY ordinal;",
-                ledger = Self::ledger()
+                ledger = Self::ledger(kind)
             ))
             .await?;
         let text = |v: &SqlValue| match v {
@@ -1109,32 +1243,43 @@ impl NodeMigrationRunner {
 
 #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
 impl NodeMigrationRunner {
-    /// Engine gate: Postgres only in this release (the owner-role/RLS model + transactional DDL are
-    /// Postgres semantics; MySQL Shared has no owner/runtime split). Fail closed + clear.
-    fn engine_gate(&self, db: &str) -> Result<(), MigrationError> {
+    /// Engine gate: **Postgres and MySQL** are supported. The embedded libsql/SQLite backend has no
+    /// migration substrate yet (a later parity phase) — but it is not an [`ExternalSqlKind`], so it
+    /// never reaches here; a database of an unknown/unconfigured engine returns `NotConfigured`. Fail
+    /// closed + clear. Returns the resolved engine so callers thread it into the dialect-aware ledger.
+    fn engine_gate(&self, db: &str) -> Result<ExternalSqlKind, MigrationError> {
         match self.op.engine_kind(db) {
-            Some(ExternalSqlKind::Postgres) => Ok(()),
-            Some(_) => Err(MigrationError::Other(format!(
-                "database {db:?}: schema migrations are supported on Postgres only in this release"
-            ))),
+            Some(kind @ (ExternalSqlKind::Postgres | ExternalSqlKind::Mysql)) => Ok(kind),
             None => Err(MigrationError::NotConfigured),
         }
     }
 
-    /// Connect as the OWNER role (never the superuser). A managed DB still starting surfaces as
-    /// `Unavailable` → a retryable 503 at the API, not a permanent failure.
-    async fn connect_owner(
+    /// Connect as the migration **DDL identity** — never the runtime tenant user.
+    ///
+    /// - **Postgres** — the per-project non-superuser owner role (via `owner_backend_for`); the
+    ///   default-tenant / single-tenant case connects as the configured user, which is already the
+    ///   DB owner (`<= project-owner`).
+    /// - **MySQL** — the operator-supplied `migration_url_env` DDL login (via
+    ///   `mysql_ddl_backend_for`), refused fail-closed if absent or identical to the runtime
+    ///   identity. There is NO owner-role fallback: MySQL never mints a distinct DDL role, so
+    ///   without an explicit distinct identity we cannot run DDL off the runtime user.
+    ///
+    /// A managed DB still starting surfaces as `Unavailable` → a retryable 503 at the API, not a
+    /// permanent failure.
+    async fn connect_ddl(
         &self,
         project: &str,
         db: &str,
     ) -> Result<Arc<dyn boatramp_core::sql::SqlBackend>, MigrationError> {
-        self.op
-            .owner_backend_for(project, db)
-            .await
-            .map_err(|e| match e {
-                SqlError::Unavailable(m) => MigrationError::Unavailable(m),
-                other => MigrationError::Sql(other),
-            })
+        let kind = self.engine_gate(db)?;
+        let result = match kind {
+            ExternalSqlKind::Postgres => self.op.owner_backend_for(project, db).await,
+            ExternalSqlKind::Mysql => self.op.mysql_ddl_backend_for(db).await,
+        };
+        result.map_err(|e| match e {
+            SqlError::Unavailable(m) => MigrationError::Unavailable(m),
+            other => MigrationError::Sql(other),
+        })
     }
 }
 
@@ -1146,10 +1291,10 @@ impl MigrationSubstrate for NodeMigrationRunner {
         project: &str,
         db: &str,
     ) -> Result<Vec<AppliedMigration>, MigrationError> {
-        self.engine_gate(db)?;
-        let owner = self.connect_owner(project, db).await?;
-        self.ensure_ledger(&owner).await?;
-        Ok(self.read_applied(&owner).await?)
+        let kind = self.engine_gate(db)?;
+        let owner = self.connect_ddl(project, db).await?;
+        self.ensure_ledger(kind, &owner).await?;
+        Ok(self.read_applied(kind, &owner).await?)
     }
 
     async fn apply_substrate_step(
@@ -1169,69 +1314,106 @@ impl MigrationSubstrate for NodeMigrationRunner {
                 "invalid migration id (allowed: A-Za-z0-9._-)".to_string(),
             ));
         }
-        let owner = self.connect_owner(project, db).await?;
-        let ledger_insert = Self::ledger_insert(step, ordinal, effective_hash, LedgerOrigin::Apply);
+        let kind = self.engine_gate(db)?;
+        let owner = self.connect_ddl(project, db).await?;
+        let ledger_insert =
+            Self::ledger_insert(kind, step, ordinal, effective_hash, LedgerOrigin::Apply);
         let outcome: Result<(), String> = match &step.action {
             MigrationAction::Sql {
                 script,
                 no_transaction,
             } => {
-                if mentions_create_extension(script) {
-                    Err("a sql step may not CREATE EXTENSION — use an extension step".to_string())
-                } else if mentions_ledger_schema(script) {
+                if mentions_create_extension(script, kind) {
+                    let hint = match kind {
+                        ExternalSqlKind::Postgres => "use an extension step",
+                        ExternalSqlKind::Mysql => "MySQL has no CREATE EXTENSION",
+                    };
+                    Err(format!("a sql step may not CREATE EXTENSION — {hint}"))
+                } else if mentions_ledger_schema(script, kind) {
                     Err(
                         "a sql step may not reference the host-owned migration-ledger schema"
                             .to_string(),
                     )
-                } else if !*no_transaction && mentions_txn_control(script) {
-                    Err("a transactional sql step may not contain its own \
-                         BEGIN/COMMIT/ROLLBACK (it would desync the atomic wrapper) — use a \
-                         no_transaction step to manage the transaction yourself"
-                        .to_string())
-                } else if *no_transaction {
-                    // Non-transactional DDL: run the script, then record the ledger row.
-                    match owner.run_script(script).await {
-                        Ok(()) => owner
-                            .run_script(&ledger_insert)
-                            .await
-                            .map_err(|e| e.to_string()),
-                        Err(e) => Err(e.to_string()),
-                    }
+                } else if mentions_txn_control(script, kind)
+                    && (kind == ExternalSqlKind::Mysql || !*no_transaction)
+                {
+                    // Postgres: a transactional step may not carry its own txn control (it would
+                    // desync the atomic wrapper) — a `no_transaction` step may. MySQL: DDL implicitly
+                    // commits, so there is NO atomic wrapper and a guest BEGIN/COMMIT is always
+                    // meaningless/misleading — refuse it regardless of `no_transaction`.
+                    let why = match kind {
+                        ExternalSqlKind::Postgres => {
+                            "a transactional sql step may not contain its own BEGIN/COMMIT/ROLLBACK \
+                             (it would desync the atomic wrapper) — use a no_transaction step to \
+                             manage the transaction yourself"
+                        }
+                        ExternalSqlKind::Mysql => {
+                            "a MySQL sql step may not contain its own BEGIN/COMMIT/ROLLBACK — DDL \
+                             implicitly commits on MySQL, so there is no transaction to control (a \
+                             multi-DDL step is applied per-statement, not atomically)"
+                        }
+                    };
+                    Err(why.to_string())
                 } else {
-                    // Atomic: DDL + ledger insert commit together (or roll back together). A trailing
-                    // `;` after the script guards a script that omits its own final semicolon (else it
-                    // would merge with the ledger INSERT into one invalid statement); a doubled `;;`
-                    // is just an empty statement, harmless.
-                    let batch = format!("BEGIN;\n{script};\n{ledger_insert}\nCOMMIT;");
-                    owner.run_script(&batch).await.map_err(|e| e.to_string())
-                }
-            }
-            MigrationAction::Extension { name } => {
-                if !self.trusted_extensions.contains(name) {
-                    Err(format!(
-                        "extension {name:?} is not on the operator trusted-extension allowlist"
-                    ))
-                } else {
-                    use boatramp_storage::tenant_provision::quote_ident;
-                    // Host-templated + allowlist-bounded; run via the superuser so an allowlisted
-                    // superuser-only extension also works. IF NOT EXISTS keeps it idempotent, so a
-                    // crash before the ledger insert re-runs harmlessly.
-                    let create = format!(
-                        "CREATE EXTENSION IF NOT EXISTS {};",
-                        quote_ident(ExternalSqlKind::Postgres, name)
-                    );
-                    match self.op.backend_for(project, db).await {
-                        Ok(su) => match su.run_script(&create).await {
+                    match kind {
+                        ExternalSqlKind::Postgres if !*no_transaction => {
+                            // Atomic (Postgres transactional DDL): DDL + ledger insert commit together
+                            // (or roll back together). A trailing `;` after the script guards a script
+                            // that omits its own final semicolon (else it would merge with the ledger
+                            // INSERT into one invalid statement); a doubled `;;` is an empty statement.
+                            let batch = format!("BEGIN;\n{script};\n{ledger_insert}\nCOMMIT;");
+                            owner.run_script(&batch).await.map_err(|e| e.to_string())
+                        }
+                        // Postgres `no_transaction`, OR **every** MySQL sql step (MySQL DDL is never
+                        // transactional): run the script, then record the ledger row as a following
+                        // statement. NOT atomic — see [`mysql_partial_apply_note`].
+                        _ => match owner.run_script(script).await {
                             Ok(()) => owner
                                 .run_script(&ledger_insert)
                                 .await
-                                .map_err(|e| e.to_string()),
-                            Err(e) => Err(e.to_string()),
+                                // The DDL applied but its ledger row did not — mark the honest partial
+                                // (a re-apply re-runs the WHOLE step; author-idempotent, S7).
+                                .map_err(|e| {
+                                    mysql_partial_apply_note(kind, &step.id, &e.to_string())
+                                }),
+                            Err(e) => Err(mysql_multi_ddl_note(kind, &step.id, &e.to_string())),
                         },
-                        Err(e) => Err(e.to_string()),
                     }
                 }
             }
+            MigrationAction::Extension { name } => match kind {
+                // No `CREATE EXTENSION` on MySQL → the extension step kind is refused outright.
+                ExternalSqlKind::Mysql => Err(format!(
+                    "extension step {name:?} is not supported on MySQL (MySQL has no CREATE \
+                     EXTENSION) — install any plugin operator-side and use a plain sql step"
+                )),
+                ExternalSqlKind::Postgres => {
+                    if !self.trusted_extensions.contains(name) {
+                        Err(format!(
+                            "extension {name:?} is not on the operator trusted-extension allowlist"
+                        ))
+                    } else {
+                        use boatramp_storage::tenant_provision::quote_ident;
+                        // Host-templated + allowlist-bounded; run via the superuser so an allowlisted
+                        // superuser-only extension also works. IF NOT EXISTS keeps it idempotent, so a
+                        // crash before the ledger insert re-runs harmlessly.
+                        let create = format!(
+                            "CREATE EXTENSION IF NOT EXISTS {};",
+                            quote_ident(kind, name)
+                        );
+                        match self.op.backend_for(project, db).await {
+                            Ok(su) => match su.run_script(&create).await {
+                                Ok(()) => owner
+                                    .run_script(&ledger_insert)
+                                    .await
+                                    .map_err(|e| e.to_string()),
+                                Err(e) => Err(e.to_string()),
+                            },
+                            Err(e) => Err(e.to_string()),
+                        }
+                    }
+                }
+            },
             // A `function` step is invoked by the server-side orchestrator (it needs the invoke
             // kernel) and recorded via `record` — it must never reach the substrate executor.
             MigrationAction::Function { .. } => {
@@ -1263,10 +1445,17 @@ impl MigrationSubstrate for NodeMigrationRunner {
                 step.id
             )));
         }
-        let owner = self.connect_owner(project, db).await?;
-        self.ensure_ledger(&owner).await?;
+        let kind = self.engine_gate(db)?;
+        let owner = self.connect_ddl(project, db).await?;
+        self.ensure_ledger(kind, &owner).await?;
         owner
-            .run_script(&Self::ledger_insert(step, ordinal, effective_hash, origin))
+            .run_script(&Self::ledger_insert(
+                kind,
+                step,
+                ordinal,
+                effective_hash,
+                origin,
+            ))
             .await?;
         Ok(())
     }
@@ -1276,9 +1465,43 @@ impl MigrationSubstrate for NodeMigrationRunner {
         project: &str,
         db: &str,
     ) -> Result<Arc<dyn MigrateDdl>, MigrationError> {
-        self.engine_gate(db)?;
-        let owner = self.connect_owner(project, db).await?;
-        Ok(Arc::new(OwnerDdl { owner }))
+        let kind = self.engine_gate(db)?;
+        let owner = self.connect_ddl(project, db).await?;
+        Ok(Arc::new(OwnerDdl { owner, kind }))
+    }
+}
+
+/// Annotate a MySQL `sql`-step failure whose (multi-statement) DDL errored **mid-way**: on MySQL
+/// each DDL implicitly commits, so any statements before the failing one have ALREADY applied and
+/// are NOT rolled back. The step is recorded as failed (no ledger row), and a re-apply re-runs the
+/// WHOLE step — so the migration author must make each DDL step idempotent (or one DDL per step). On
+/// Postgres this can't happen for a transactional step (the whole thing rolls back), so the note is
+/// MySQL-only.
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+fn mysql_multi_ddl_note(kind: ExternalSqlKind, id: &str, err: &str) -> String {
+    match kind {
+        ExternalSqlKind::Mysql => format!(
+            "step {id:?} failed mid-way and may be PARTIALLY APPLIED (MySQL commits each DDL \
+             statement implicitly; earlier statements were not rolled back). Re-apply re-runs the \
+             whole step — make it idempotent. Underlying error: {err}"
+        ),
+        ExternalSqlKind::Postgres => err.to_string(),
+    }
+}
+
+/// Annotate the honest partial-apply case where a MySQL step's DDL SUCCEEDED but recording its
+/// ledger row then failed: the schema change is live but unrecorded. A re-apply re-runs the whole
+/// step (author-idempotent, S7), so this is recoverable — but it must be reported as partial, never
+/// as applied.
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+fn mysql_partial_apply_note(kind: ExternalSqlKind, id: &str, err: &str) -> String {
+    match kind {
+        ExternalSqlKind::Mysql => format!(
+            "step {id:?} DDL applied but its ledger row could not be recorded — the step is \
+             PARTIALLY APPLIED (schema changed, unrecorded). Re-apply re-runs the whole step \
+             (make it idempotent). Underlying error: {err}"
+        ),
+        ExternalSqlKind::Postgres => err.to_string(),
     }
 }
 
@@ -1896,6 +2119,198 @@ mod tests {
         assert!(
             msg.contains("site-scoped"),
             "the error explains a site-scoped DB needs a site: {msg}"
+        );
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // MySQL migration-substrate parity (host-side, no live DB needed).
+    // ---------------------------------------------------------------------------------------------
+
+    /// A [`NodeOperatorSql`] over a single bring-your-own-URL binding named `main` of engine `kind`,
+    /// with optional `migration_url_env`. Runtime `url_env = RUNTIME_URL_ENV`.
+    #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+    fn op_for(kind: &str, migration_url_env: Option<&str>) -> Arc<NodeOperatorSql> {
+        use crate::config::{TenantIsolation, TenantScope};
+        let mut databases = BTreeMap::new();
+        databases.insert(
+            "main".to_string(),
+            ExternalDatabaseConfig {
+                kind: kind.to_string(),
+                url_env: "RUNTIME_URL_ENV".to_string(),
+                migration_url_env: migration_url_env.map(Into::into),
+                pool_max: Some(2),
+                read_only: false,
+                connect_timeout_secs: Some(5),
+                tenant: TenantIsolation::Shared,
+                tenant_scope: TenantScope::Project,
+                ..Default::default()
+            },
+        );
+        Arc::new(NodeOperatorSql::new(
+            databases,
+            Arc::new(MemoryKv::new()),
+            None,
+            DeployStore::new(Arc::new(NullStorage), Arc::new(MemoryKv::new())),
+        ))
+    }
+
+    #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+    fn runner_over(op: Arc<NodeOperatorSql>) -> NodeMigrationRunner {
+        NodeMigrationRunner::new(op, std::collections::BTreeSet::new())
+    }
+
+    /// The engine gate admits BOTH Postgres and MySQL now (parity), and returns the resolved engine;
+    /// an unconfigured database is `NotConfigured`.
+    #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+    #[test]
+    fn engine_gate_admits_postgres_and_mysql() {
+        let pg = runner_over(op_for("postgres", None));
+        assert!(matches!(
+            pg.engine_gate("main"),
+            Ok(ExternalSqlKind::Postgres)
+        ));
+        let my = runner_over(op_for("mysql", Some("X")));
+        assert!(matches!(my.engine_gate("main"), Ok(ExternalSqlKind::Mysql)));
+        // An unknown database name is NotConfigured, not a panic.
+        assert!(matches!(
+            pg.engine_gate("absent"),
+            Err(MigrationError::NotConfigured)
+        ));
+    }
+
+    /// MySQL migrations REFUSE fail-closed when no distinct DDL identity is supplied (no
+    /// `migration_url_env`) — the owner-role analog is mandatory; we never run DDL as the runtime
+    /// tenant user. `preflight` surfaces the refusal (via `connect_ddl`).
+    #[cfg(feature = "sql-mysql")]
+    #[tokio::test]
+    async fn mysql_refuses_without_a_distinct_ddl_user() {
+        let sub = runner_over(op_for("mysql", None));
+        let err = sub.preflight("default", "main").await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("migration_url_env") && msg.contains("distinct"),
+            "MySQL migrate must refuse without a distinct DDL identity: {msg}"
+        );
+    }
+
+    /// MySQL migrations REFUSE when `migration_url_env` resolves to the SAME connection as the
+    /// runtime `url_env` — the DDL identity must be distinct from the runtime user.
+    #[cfg(feature = "sql-mysql")]
+    #[tokio::test]
+    async fn mysql_refuses_when_ddl_url_equals_runtime_url() {
+        // Same value for both env vars → refused.
+        std::env::set_var("RUNTIME_URL_ENV", "mysql://app:pw@localhost:3306/appdb");
+        std::env::set_var(
+            "MIGRATE_URL_ENV_SAME",
+            "mysql://app:pw@localhost:3306/appdb",
+        );
+        let sub = runner_over(op_for("mysql", Some("MIGRATE_URL_ENV_SAME")));
+        let err = sub.preflight("default", "main").await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("SAME connection") || msg.contains("distinct"),
+            "a DDL url identical to the runtime url must be refused: {msg}"
+        );
+        std::env::remove_var("RUNTIME_URL_ENV");
+        std::env::remove_var("MIGRATE_URL_ENV_SAME");
+    }
+
+    /// The MySQL DDL identity's env var being unset (declared but absent) is a clear error, not a
+    /// silent fallback to the runtime user.
+    #[cfg(feature = "sql-mysql")]
+    #[tokio::test]
+    async fn mysql_ddl_url_env_unset_is_a_clear_error() {
+        std::env::remove_var("MIGRATE_URL_ENV_MISSING");
+        let sub = runner_over(op_for("mysql", Some("MIGRATE_URL_ENV_MISSING")));
+        let err = sub.preflight("default", "main").await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("MIGRATE_URL_ENV_MISSING") && msg.contains("unset"),
+            "an unset migration url env must be reported clearly: {msg}"
+        );
+    }
+
+    /// The ledger identifier is dialect-quoted: `"…"."…"` on Postgres, `` `…`.`…` `` on MySQL —
+    /// and the same InnoDB `boatramp_migrations` database name on MySQL.
+    #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+    #[test]
+    fn ledger_name_is_dialect_quoted() {
+        assert_eq!(
+            NodeMigrationRunner::ledger(ExternalSqlKind::Postgres),
+            "\"boatramp_migrations\".\"schema_migrations\""
+        );
+        assert_eq!(
+            NodeMigrationRunner::ledger(ExternalSqlKind::Mysql),
+            "`boatramp_migrations`.`schema_migrations`"
+        );
+    }
+
+    /// The ledger INSERT is host-built, value-quoted, and identical in column shape across engines.
+    #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+    #[test]
+    fn ledger_insert_quotes_all_values() {
+        use boatramp_core::sql::{MigrationAction, MigrationStep};
+        let step = MigrationStep {
+            id: "0001_init".to_string(),
+            action: MigrationAction::Sql {
+                script: "CREATE TABLE t (id int)".to_string(),
+                no_transaction: false,
+            },
+        };
+        let sql = NodeMigrationRunner::ledger_insert(
+            ExternalSqlKind::Mysql,
+            &step,
+            0,
+            "abc123",
+            LedgerOrigin::Apply,
+        );
+        assert!(sql.contains("`boatramp_migrations`.`schema_migrations`"));
+        assert!(sql.contains("'0001_init'"));
+        assert!(sql.contains("'abc123'"));
+        assert!(sql.contains("'sql'"));
+        assert!(sql.contains("'apply'"));
+    }
+
+    /// The guard tokenizer dialect follows the engine (MySQL vs Postgres).
+    #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+    #[test]
+    fn guard_dialect_follows_engine() {
+        use boatramp_core::sql::GuardDialect;
+        assert_eq!(guard_dialect(ExternalSqlKind::Mysql), GuardDialect::Mysql);
+        assert_eq!(
+            guard_dialect(ExternalSqlKind::Postgres),
+            GuardDialect::Postgres
+        );
+        // A MySQL `#` line comment hiding a COMMIT is NOT flagged (the engine strips it), while a
+        // real COMMIT is — proving the substrate uses the MySQL lexer.
+        assert!(!mentions_txn_control(
+            "CREATE TABLE t (id int) # COMMIT",
+            ExternalSqlKind::Mysql
+        ));
+        assert!(mentions_txn_control(
+            "DROP TABLE t; COMMIT",
+            ExternalSqlKind::Mysql
+        ));
+    }
+
+    /// The partial-apply / mid-DDL notes carry the greppable `PARTIALLY APPLIED` marker on MySQL
+    /// (an honest non-atomic report) and pass the raw error through untouched on Postgres.
+    #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+    #[test]
+    fn mysql_partial_apply_notes_are_marked_and_postgres_passthrough() {
+        let my_mid = mysql_multi_ddl_note(ExternalSqlKind::Mysql, "0002_x", "boom");
+        assert!(my_mid.contains("PARTIALLY APPLIED") && my_mid.contains("0002_x"));
+        assert!(my_mid.contains("boom"));
+        let my_ledger = mysql_partial_apply_note(ExternalSqlKind::Mysql, "0002_x", "ledger down");
+        assert!(my_ledger.contains("PARTIALLY APPLIED") && my_ledger.contains("unrecorded"));
+        // Postgres passes the raw error through (its transactional path can't partially apply).
+        assert_eq!(
+            mysql_multi_ddl_note(ExternalSqlKind::Postgres, "0002_x", "boom"),
+            "boom"
+        );
+        assert_eq!(
+            mysql_partial_apply_note(ExternalSqlKind::Postgres, "0002_x", "boom"),
+            "boom"
         );
     }
 }
