@@ -82,6 +82,11 @@ struct OperatorStats {
     /// The delivery-plane health block (B14) — `None` on a backend without a ready-set.
     #[serde(skip_serializing_if = "Option::is_none")]
     delivery: Option<DeliveryStatsWire>,
+    /// The async-lane shard block (B10/B14/B15): which functions THIS node drains + the safety-net-only
+    /// drain counter. `None` on a no-runtime build. Node-scoped (not site-scoped) — a function is a
+    /// top-level, project-scoped entity, so the same block appears whichever site's stats are queried.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    async_shards: Option<crate::AsyncShardStats>,
 }
 
 /// Authenticated per-site operator stats (`site:<site>` scope via the API auth
@@ -123,11 +128,14 @@ pub(super) async fn operator_handler_stats(
             Err(err) => return deploy_error_response(err),
         }
     }
+    // The async-lane shard block (B10): which functions this node drains + the shard-gap counter.
+    let async_shards = handlers.async_shard_stats(&deploy).await;
     Json(OperatorStats {
         handlers: handler_stats,
         consumers,
         stream_connections: inner.stream_connections_for_site(&site),
         delivery,
+        async_shards,
     })
     .into_response()
 }
