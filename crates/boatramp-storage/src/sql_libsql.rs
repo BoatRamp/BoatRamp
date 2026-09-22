@@ -597,6 +597,15 @@ fn validate_db_name(kind: &str, value: &str) -> Result<(), SqlError> {
     if value.is_empty() {
         return Ok(());
     }
+    // Stay a strict SUBSET of the canonical `validate_resource_name` (v0.5.0 uniform screening):
+    // honour the same length bound so this storage boundary never accepts an overlong name the
+    // operator/URL-path validator rejects (pinned by `libsql_db_name_rule_is_a_subset_of_the_canonical_validator`).
+    if value.len() > boatramp_core::project::MAX_RESOURCE_NAME_LEN {
+        return Err(SqlError::other(format!(
+            "invalid {kind} name {value:?}: exceeds {} bytes",
+            boatramp_core::project::MAX_RESOURCE_NAME_LEN
+        )));
+    }
     let safe = !value.starts_with('.')
         && value
             .chars()
@@ -732,6 +741,52 @@ mod tests {
                 matches!(validate_db_name("database", bad), Err(SqlError::Other(_))),
                 "{bad:?} must be rejected as SqlError::Other"
             );
+        }
+    }
+
+    /// Drift-guard (v0.5.0 uniform-screening MEDIUM-1): this libsql storage-boundary rule is a
+    /// deliberately-stricter local validator, NOT the canonical `validate_resource_name`. It must
+    /// stay a **subset in the dangerous direction** — it may never ACCEPT a name the canonical
+    /// operator/URL-path validator REJECTS, with the single documented exception of the empty
+    /// default name `""` (which libsql keeps until the name-independent-path work lands). If this
+    /// ever regresses (libsql loosens, or the canonical validator tightens past it), fix it here —
+    /// do not let a third divergent rule set appear.
+    #[test]
+    fn libsql_db_name_rule_is_a_subset_of_the_canonical_validator() {
+        let corpus = [
+            "",
+            "blog",
+            "my-db_1",
+            "site.example",
+            "A1_b-2",
+            "default", // ordinary / default
+            "..",
+            ".",
+            ".hidden",
+            "/",
+            "a/b",
+            "a\\b",
+            "../../etc/passwd",
+            "a\0b",
+            "naïve",
+            "a b",
+            "a:b",
+            "a*b",
+            "a\tb",
+            &"x".repeat(300), // dangerous shapes + overlong
+        ];
+        for name in corpus {
+            let canonical_ok =
+                boatramp_core::project::validate_resource_name("database", name).is_ok();
+            let libsql_ok = validate_db_name("database", name).is_ok();
+            if libsql_ok && !canonical_ok {
+                // The ONLY tolerated divergence is the legacy empty default.
+                assert_eq!(
+                    name, "",
+                    "libsql accepts {name:?} but the canonical validator rejects it — a new \
+                     divergence that could let an un-addressable name reach the storage layer"
+                );
+            }
         }
     }
 
