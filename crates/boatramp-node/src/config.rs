@@ -1439,6 +1439,27 @@ pub struct ExternalDatabaseConfig {
     /// Optional env var holding a **read-replica** connection URL. When set,
     /// `open-read-only` transactions route there; writes stay on `url_env`.
     pub read_url_env: Option<String>,
+    /// Optional env var holding a **DDL/migration** connection URL for the
+    /// **owner-role analog** of the schema-migration surface — a login that is
+    /// DDL-capable *and distinct from the runtime binding user* (`user` /
+    /// `url_env`). Its whole purpose is to keep migration DDL off the runtime
+    /// tenant identity, mirroring the Postgres owner-role split (Postgres mints a
+    /// per-tenant non-superuser owner role automatically; MySQL has no such role
+    /// model, so the DDL identity must be supplied explicitly).
+    ///
+    /// **MySQL:** required to run schema migrations. Point it at an admin/DDL
+    /// login (e.g. `mysql://root:…@host/db` or a purpose-made `_migrate` grant
+    /// with `CREATE, ALTER, DROP, INDEX, REFERENCES` on the schema) that is **not**
+    /// the runtime `user`. If it is unset (or resolves to the same identity as the
+    /// runtime binding), migrate **refuses** fail-closed rather than run owner-DDL
+    /// as the runtime tenant user — there is no owner/runtime split to fall back
+    /// on. Ignored by the normal handler `sql` path; read only by the migration
+    /// runner.
+    ///
+    /// **Postgres:** ignored — the per-project non-superuser owner role +
+    /// its sealed credential are minted automatically at provision, so no
+    /// operator-supplied DDL URL is needed (a set value is harmless and unused).
+    pub migration_url_env: Option<String>,
     /// The name of a **compute workload** (a Postgres/MySQL server boatramp runs)
     /// to source this database from, instead of `url_env`. boatramp resolves the
     /// workload's live endpoint and builds the connection. Mutually exclusive with

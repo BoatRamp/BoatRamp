@@ -553,25 +553,58 @@ pub fn reject_reserved_session_writes(
     Ok(())
 }
 
-/// Tokenize `script` (generic dialect) into its significant **word** tokens (lowercased), dropping
+/// The migration-guard **tokenizer dialect** — selects the sqlparser lexer rules so a script is
+/// tokenized the way the target engine will read it. Postgres/generic strip `--` + `/* */` comments,
+/// `'…'` strings and `$$…$$` dollar-quoted bodies; MySQL additionally treats `# …` as a line comment
+/// and `` `…` `` as a quoted identifier. Using the engine's own rules keeps a guard from being
+/// evaded by an engine-specific comment/quote form the generic lexer wouldn't strip (e.g. a MySQL
+/// `# COMMIT` line comment, or a keyword hidden behind a `#`-comment on MySQL).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuardDialect {
+    /// Postgres / generic lexer rules (the historical default).
+    Postgres,
+    /// MySQL lexer rules (`#` line comments, backtick identifiers).
+    Mysql,
+}
+
+impl From<Dialect> for GuardDialect {
+    fn from(d: Dialect) -> Self {
+        match d {
+            Dialect::Mysql => GuardDialect::Mysql,
+            // SQLite/libsql shares the generic/Postgres comment + quoting rules for guard purposes.
+            Dialect::Postgres | Dialect::Sqlite => GuardDialect::Postgres,
+        }
+    }
+}
+
+/// Tokenize `script` under `dialect` into its significant **word** tokens (lowercased), dropping
 /// whitespace + comments and treating string / dollar-quoted bodies as opaque single tokens (so a
-/// `--`/`/* */` comment, a `'…'` literal, or a `$$ … $$` function body can neither hide nor forge a
-/// keyword). `None` if the script cannot be lexed — the migration guards then fail **closed**
-/// (refuse), so an unlexable step can never smuggle a guarded construct past a naive byte scan.
+/// `--`/`/* */`/`#` comment, a `'…'` literal, or a `$$ … $$` function body can neither hide nor
+/// forge a keyword). `None` if the script cannot be lexed — the migration guards then fail
+/// **closed** (refuse), so an unlexable step can never smuggle a guarded construct past a naive byte
+/// scan.
 ///
 /// This backs the owner-gated migration guards ([`script_has_txn_control`],
 /// [`script_references_word`], [`script_has_create_extension`]): the earlier byte-scan versions were
-/// comment- and casing-evadable (`/*c*/BEGIN`, `COMMIT-- x`) — Postgres strips comments before
-/// parse, so a scan of the raw bytes saw a different statement than the server ran.
-fn significant_words(script: &str) -> Option<Vec<String>> {
-    use sqlparser::dialect::GenericDialect;
+/// comment- and casing-evadable (`/*c*/BEGIN`, `COMMIT-- x`, `COMMIT# x` on MySQL) — the engine
+/// strips comments before parse, so a scan of the raw bytes saw a different statement than the
+/// server ran.
+fn significant_words_in(script: &str, dialect: GuardDialect) -> Option<Vec<String>> {
+    use sqlparser::dialect::{GenericDialect, MySqlDialect};
     use sqlparser::tokenizer::{Token, Tokenizer, Word};
-    let raw = Tokenizer::new(&GenericDialect {}, script).tokenize().ok()?;
+    // Tokenize with the engine's own lexer so its comment/quote forms are honored (MySQL `#`
+    // comments + backtick identifiers). `GenericDialect` for Postgres/SQLite keeps the historical
+    // behavior byte-for-byte.
+    let raw = match dialect {
+        GuardDialect::Mysql => Tokenizer::new(&MySqlDialect {}, script).tokenize().ok()?,
+        GuardDialect::Postgres => Tokenizer::new(&GenericDialect {}, script).tokenize().ok()?,
+    };
     Some(
         raw.iter()
             .filter_map(|t| match t {
                 // Quoted identifiers keep their inner (unquoted) text, so a `"boatramp_migrations"`
-                // still matches — quote-immune as well as comment-immune.
+                // (or a MySQL `` `boatramp_migrations` ``) still matches — quote-immune as well as
+                // comment-immune.
                 Token::Word(Word { value, .. }) => Some(value.to_ascii_lowercase()),
                 _ => None,
             })
@@ -579,18 +612,11 @@ fn significant_words(script: &str) -> Option<Vec<String>> {
     )
 }
 
-/// Whether `script` issues its own **transaction control** — `BEGIN`/`START`/`COMMIT`/`END`/
-/// `ROLLBACK`/`ABORT`/`SAVEPOINT`/`RELEASE` as a keyword token. Comment-, casing-, string- and
-/// dollar-quote-immune (a PL/pgSQL `$$ BEGIN … END $$` body is one opaque token, so it is NOT
-/// flagged — fixing a latent false positive the byte scan had). `END` is flagged only at CASE-depth
-/// 0, so a `CASE … END` expression is not mistaken for a transaction end. Fails **closed** (returns
-/// `true`) if the script cannot be lexed.
-pub fn script_has_txn_control(script: &str) -> bool {
-    let Some(words) = significant_words(script) else {
-        return true; // fail closed
-    };
+/// Whether `words` (already-tokenized, lowercased) issue transaction control — see
+/// [`script_has_txn_control`].
+fn words_have_txn_control(words: &[String]) -> bool {
     let mut case_depth: u32 = 0;
-    for w in &words {
+    for w in words {
         match w.as_str() {
             "case" => case_depth += 1,
             "end" => {
@@ -608,21 +634,53 @@ pub fn script_has_txn_control(script: &str) -> bool {
     false
 }
 
+/// Whether `script` issues its own **transaction control** — `BEGIN`/`START`/`COMMIT`/`END`/
+/// `ROLLBACK`/`ABORT`/`SAVEPOINT`/`RELEASE` as a keyword token. Comment-, casing-, string- and
+/// dollar-quote-immune (a PL/pgSQL `$$ BEGIN … END $$` body is one opaque token, so it is NOT
+/// flagged — fixing a latent false positive the byte scan had). `END` is flagged only at CASE-depth
+/// 0, so a `CASE … END` expression is not mistaken for a transaction end. Fails **closed** (returns
+/// `true`) if the script cannot be lexed. Postgres/generic lexer; see
+/// [`script_has_txn_control_in`] for a dialect-aware variant.
+pub fn script_has_txn_control(script: &str) -> bool {
+    script_has_txn_control_in(script, GuardDialect::Postgres)
+}
+
+/// Dialect-aware [`script_has_txn_control`] — tokenizes under `dialect` so a MySQL `# COMMIT` line
+/// comment (which the generic lexer would not strip) can't hide transaction control.
+pub fn script_has_txn_control_in(script: &str, dialect: GuardDialect) -> bool {
+    match significant_words_in(script, dialect) {
+        Some(words) => words_have_txn_control(&words),
+        None => true, // fail closed
+    }
+}
+
 /// Whether `script` references identifier `needle` (case-insensitive) as a **word** token — a string
 /// literal, comment, or dollar-quoted body never matches. Backs the ledger-schema guard (`needle =
 /// "boatramp_migrations"`). Fails **closed** (returns `true`) if the script cannot be lexed.
+/// Postgres/generic lexer; see [`script_references_word_in`] for a dialect-aware variant.
 pub fn script_references_word(script: &str, needle: &str) -> bool {
+    script_references_word_in(script, needle, GuardDialect::Postgres)
+}
+
+/// Dialect-aware [`script_references_word`].
+pub fn script_references_word_in(script: &str, needle: &str, dialect: GuardDialect) -> bool {
     let needle = needle.to_ascii_lowercase();
-    match significant_words(script) {
+    match significant_words_in(script, dialect) {
         Some(words) => words.contains(&needle),
         None => true, // fail closed
     }
 }
 
 /// Whether `script` contains `CREATE EXTENSION` as adjacent word tokens (comment-/casing-immune).
-/// Fails **closed** (returns `true`) if the script cannot be lexed.
+/// Fails **closed** (returns `true`) if the script cannot be lexed. Postgres/generic lexer; see
+/// [`script_has_create_extension_in`] for a dialect-aware variant.
 pub fn script_has_create_extension(script: &str) -> bool {
-    match significant_words(script) {
+    script_has_create_extension_in(script, GuardDialect::Postgres)
+}
+
+/// Dialect-aware [`script_has_create_extension`].
+pub fn script_has_create_extension_in(script: &str, dialect: GuardDialect) -> bool {
+    match significant_words_in(script, dialect) {
         Some(words) => words
             .windows(2)
             .any(|w| w[0] == "create" && w[1] == "extension"),
@@ -728,6 +786,39 @@ mod migration_guard_tests {
         assert!(script_has_txn_control(bad));
         assert!(script_references_word(bad, "boatramp_migrations"));
         assert!(script_has_create_extension(bad));
+    }
+
+    #[test]
+    fn mysql_dialect_guards_honor_hash_comments_and_backticks() {
+        use super::{script_has_txn_control_in, script_references_word_in, GuardDialect};
+        // MySQL `#` line comment: a `# COMMIT` following a real statement IS transaction control the
+        // MySQL server will execute (the text after `#` is stripped as a comment, so the `COMMIT`
+        // must be BEFORE it to matter). A `COMMIT` hidden AFTER a `#` is a comment and must NOT flag.
+        assert!(
+            script_has_txn_control_in("DROP TABLE t; COMMIT # done", GuardDialect::Mysql),
+            "a real COMMIT before a # comment is transaction control"
+        );
+        assert!(
+            !script_has_txn_control_in("CREATE TABLE t (id int) # COMMIT", GuardDialect::Mysql),
+            "COMMIT inside a MySQL # line comment is stripped, not control"
+        );
+        // A backtick-quoted identifier matching the ledger schema is still caught (quote-immune).
+        assert!(script_references_word_in(
+            "SELECT * FROM `boatramp_migrations`.`schema_migrations`",
+            "boatramp_migrations",
+            GuardDialect::Mysql,
+        ));
+        // The ledger name inside a MySQL # comment is NOT a reference.
+        assert!(!script_references_word_in(
+            "CREATE TABLE t (id int) # touches boatramp_migrations later",
+            "boatramp_migrations",
+            GuardDialect::Mysql,
+        ));
+        // Plain MySQL DDL is not transaction control.
+        assert!(!script_has_txn_control_in(
+            "CREATE TABLE `widget` (id int primary key)",
+            GuardDialect::Mysql,
+        ));
     }
 }
 
@@ -1153,16 +1244,22 @@ pub enum SubstrateStepOutcome {
     Failed(String),
 }
 
-/// The node-side **substrate** the server-side migration orchestrator (A1) drives: the owner-role
+/// The node-side **substrate** the server-side migration orchestrator (A1) drives: the DDL-identity
 /// connection, the host-owned `schema_migrations` ledger, and the direct `sql`/`extension` execution
 /// path. The orchestrator owns ordering, prefix-consistency, `function`-step invocation (which needs
 /// the server's invoke kernel and cannot live here), and dry-run planning; this seam owns the
-/// database IO. Everything runs as the project's non-superuser **owner** role (never the cluster
-/// superuser), except the allowlist-gated host-templated `CREATE EXTENSION`.
+/// database IO. The DDL identity is always **distinct from the runtime tenant user** — on Postgres
+/// the per-project non-superuser **owner role** (never the cluster superuser); on MySQL an
+/// operator-supplied DDL login distinct from the runtime user (refused fail-closed if absent, since
+/// MySQL has no owner/runtime role split). The allowlist-gated host-templated `CREATE EXTENSION` is
+/// Postgres-only (refused on MySQL). Backend-honest per engine: Postgres DDL is transactional
+/// (atomic per step), MySQL DDL implicitly commits (per-step, non-atomic — a mid-step failure is
+/// reported as partially applied).
 #[async_trait]
 pub trait MigrationSubstrate: Send + Sync {
-    /// Engine gate (Postgres-only this release), ensure the ledger schema+table exist, and return
-    /// the applied rows in order. `Unavailable` (managed DB still starting) maps to a retryable 503.
+    /// Engine gate (Postgres + MySQL; the embedded libsql backend is a later parity phase), ensure
+    /// the ledger schema/database + table exist, and return the applied rows in order. `Unavailable`
+    /// (managed DB still starting) maps to a retryable 503.
     async fn preflight(
         &self,
         project: &str,

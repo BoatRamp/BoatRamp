@@ -728,6 +728,33 @@ jobs:
             || { echo "::error::migrate function-step gate did not run (a silent skip or a failure)" >&2; exit 1; }
           grep -q 'MIGRATE FUNCTION-STEP OK \[postgres\]' migrate-fn.log \
             || { echo "::error::migrate function-step never reached its marker (a function-DDL/binding-split/context-gate/ledger-guard/idempotent/baseline regression)" >&2; exit 1; }
+      - name: Schema-migration MySQL parity SUBSTRATE on a real MySQL
+        env:
+          BOATRAMP_TEST_MYSQL_URL: mysql://boatramp:boatramp@localhost:3306/boatramp
+          # The DDL identity (owner-role analog) MUST be distinct from the runtime user — the CI
+          # service container's root account. The test derives the DDL URL from these + the runtime
+          # host/port/db, so migration DDL never runs as the runtime `boatramp` tenant user.
+          BOATRAMP_TEST_MYSQL_ROOT_USER: root
+          BOATRAMP_TEST_MYSQL_ROOT_PASSWORD: boatramp
+        run: |
+          set -eo pipefail
+          # MySQL backend parity for `project migrate` (PLAN-migrate-backend-parity, MySQL stage). On a
+          # REAL MySQL the substrate: connects as a DISTINCT DDL login (`migration_url_env`), never the
+          # runtime user (absent it, migrate REFUSES fail-closed — asserted in unit tests); creates the
+          # InnoDB `boatramp_migrations` ledger DATABASE + table; applies + records a `sql` step
+          # (origin=apply, recorded effective hash for the immutability signal); reports a mid-DDL
+          # failure as PARTIALLY APPLIED with the 1st statement NOT rolled back (MySQL auto-commits each
+          # DDL — the honest weaker-than-Postgres caveat, the inverse of the PG rollback gate); refuses
+          # the `extension` step kind (no CREATE EXTENSION on MySQL) + a raw CREATE EXTENSION + a
+          # self-managed BEGIN/COMMIT; enforces the owner-DDL S3 ledger-DB + S4 txn-control guards under
+          # the MySQL dialect (a `#`-comment can't hide a COMMIT); and records a baseline without running
+          # it (U6 origin). A regression fails the assertion.
+          cargo test -p boatramp-node --features sql-mysql,migrate \
+            --test migrate_runner_mysql_live -- --nocapture 2>&1 | tee migrate-mysql.log
+          grep -qE 'test result: ok\. 1 passed' migrate-mysql.log \
+            || { echo "::error::migrate MySQL parity gate did not run (a silent skip — BOATRAMP_TEST_MYSQL_URL unset — or a failure)" >&2; exit 1; }
+          grep -q 'MIGRATE MYSQL PARITY OK' migrate-mysql.log \
+            || { echo "::error::migrate MySQL parity never reached its marker (a ledger/DDL-identity/partial-apply/extension-refusal/owner-DDL-guard/baseline regression)" >&2; exit 1; }
 
   # The embedded-Raft cluster tests (consensus, leader-loss failover, mesh admit,
   # cron single-firing) live behind the `raft`/`http` features and so ran ONLY in
