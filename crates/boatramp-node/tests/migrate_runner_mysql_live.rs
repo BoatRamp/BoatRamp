@@ -175,6 +175,7 @@ async fn migrate_substrate_mysql_parity_on_a_real_engine() {
             "DROP TABLE IF EXISTS boatramp.gadget",
             "DROP TABLE IF EXISTS boatramp.baselined",
             "DROP TABLE IF EXISTS boatramp.owner_made",
+            "DROP TABLE IF EXISTS boatramp.z",
         ] {
             let _ = c.run_script(stmt).await;
         }
@@ -370,6 +371,44 @@ async fn migrate_substrate_mysql_parity_on_a_real_engine() {
             .unwrap_err(),
         MigrateDdlError::LedgerProtected
     ));
+    // S4 (MySQL executable-comment evasion, Security review CRITICAL-1): MySQL EXECUTES a
+    // `/*! … */` comment body while the block-comment lexer would drop it, so a `/*! COMMIT */`
+    // could smuggle transaction control past the S4 guard. It is refused (txn-control) — proving the
+    // fix holds against a REAL MySQL that would actually run the comment.
+    assert!(matches!(
+        ddl.exec("CREATE TABLE z(a int); /*! COMMIT */")
+            .await
+            .unwrap_err(),
+        MigrateDdlError::TxnControl
+    ));
+    // S3 (MySQL executable-comment evasion, CRITICAL-1): a ledger write hidden in an executable
+    // comment is refused (ledger-protected) — the sole barrier for the DDL identity on MySQL.
+    assert!(matches!(
+        ddl.exec("/*! DELETE FROM boatramp_migrations.schema_migrations */")
+            .await
+            .unwrap_err(),
+        MigrateDdlError::LedgerProtected
+    ));
+    // Verify the executable-comment guard did NOT actually run `CREATE TABLE z` (the `/*! COMMIT */`
+    // above was refused BEFORE the owner connection — no statement should have reached the wire).
+    {
+        let c = ddl_conn().await;
+        let rows = c
+            .run_query(
+                "SELECT COUNT(*) FROM information_schema.tables \
+                 WHERE table_schema = 'boatramp' AND table_name = 'z'",
+            )
+            .await
+            .unwrap();
+        let n = match rows.rows.first().and_then(|r| r.first()) {
+            Some(boatramp_core::sql::SqlValue::Integer(n)) => *n,
+            other => panic!("unexpected tables count: {other:?}"),
+        };
+        assert_eq!(
+            n, 0,
+            "a refused executable-comment step must never touch the owner connection"
+        );
+    }
     // A plain owner DDL runs (auto-commit), and a verification query reads it back.
     ddl.exec("CREATE TABLE IF NOT EXISTS boatramp.owner_made (n int)")
         .await
@@ -432,6 +471,7 @@ async fn migrate_substrate_mysql_parity_on_a_real_engine() {
             "DROP TABLE IF EXISTS boatramp.gadget2",
             "DROP TABLE IF EXISTS boatramp.baselined",
             "DROP TABLE IF EXISTS boatramp.owner_made",
+            "DROP TABLE IF EXISTS boatramp.z",
         ] {
             let _ = c.run_script(stmt).await;
         }

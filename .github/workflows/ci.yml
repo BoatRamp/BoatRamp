@@ -755,6 +755,34 @@ jobs:
             || { echo "::error::migrate MySQL parity gate did not run (a silent skip — BOATRAMP_TEST_MYSQL_URL unset — or a failure)" >&2; exit 1; }
           grep -q 'MIGRATE MYSQL PARITY OK' migrate-mysql.log \
             || { echo "::error::migrate MySQL parity never reached its marker (a ledger/DDL-identity/partial-apply/extension-refusal/owner-DDL-guard/baseline regression)" >&2; exit 1; }
+      - name: Schema-migration MySQL refusal + guard UNIT tests (no live DB)
+        run: |
+          set -eo pipefail
+          # Security review MEDIUM-1: the live gate above proves the happy path, but the
+          # SECURITY-CRITICAL refusals are host-side unit tests that never touch a live DB and so
+          # would otherwise only run in nightly `--all-features`. Run the boatramp-node `sql-mysql`
+          # unit tests here so a regression in ANY of them fails the merge: the distinct-DDL-identity
+          # refusal (HIGH-1: no `migration_url_env`, an identical URL, an equivalent DSN that
+          # authenticates as the SAME username), the compute-backed-managed refusal (HIGH-2), and —
+          # transitively via boatramp-core — the `/*! … */` executable-comment guard (CRITICAL-1).
+          cargo test -p boatramp-node --features sql-mysql --lib managed_sql -- --nocapture 2>&1 | tee migrate-mysql-unit.log
+          grep -qE 'test result: ok\.' migrate-mysql-unit.log \
+            || { echo "::error::MySQL migrate unit tests did not run (a compile/skip regression)" >&2; exit 1; }
+          for t in mysql_refuses_without_a_distinct_ddl_user \
+                   mysql_refuses_when_ddl_url_equals_runtime_url \
+                   mysql_refuses_same_username_even_when_dsn_strings_differ \
+                   mysql_allows_a_distinct_ddl_username \
+                   mysql_refuses_compute_backed_managed_migration; do
+            grep -q "$t ... ok" migrate-mysql-unit.log \
+              || { echo "::error::MySQL migrate refusal unit test '$t' did not pass (a distinctness/compute-backed refusal regression)" >&2; exit 1; }
+          done
+          # The `/*! … */` executable-comment guard (CRITICAL-1) lives in boatramp-core; run it too so
+          # a regression in the neutralization / classification fails the merge.
+          cargo test -p boatramp-core --lib sql::migration_guard_tests -- --nocapture 2>&1 | tee migrate-guard-unit.log
+          grep -q 'mysql_executable_comment_is_refused_by_every_guard ... ok' migrate-guard-unit.log \
+            || { echo "::error::MySQL executable-comment guard test did not pass (a /*! */ evasion regression)" >&2; exit 1; }
+          grep -q 'postgres_treats_executable_comment_syntax_as_inert ... ok' migrate-guard-unit.log \
+            || { echo "::error::Postgres executable-comment inertness test did not pass (a PG guard regression)" >&2; exit 1; }
 
   # The embedded-Raft cluster tests (consensus, leader-loss failover, mesh admit,
   # cron single-firing) live behind the `raft`/`http` features and so ran ONLY in
