@@ -5,6 +5,42 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.4.27] - 2026-09-22
+
+**Event-driven message delivery + cross-node topic sharding** — delivery no longer scales with the
+*total* number of topics. Message delivery was a 500 ms polling scheduler that walked every topic
+twice a second (O(#topics), paid whether or not a topic had work); it is replaced by react-to-work,
+and on a cluster the topic space is sharded across nodes so no single node scans everything. An idle
+topic now costs ~0; 10 000 idle topics cost about the same as 10. **At-least-once is unchanged** — the
+durable index + lease/claim remain the sole authority; the cross-mode conformance battery stays green
+byte-for-byte. No guest-facing API change. Behind a Security-Engineer review to convergence (a High
+prune-vs-publish stranding race + its rebuild-path sibling both fixed) and eight CI-hard gates.
+
+### Added / changed
+
+- **Durable ready-set** (`mqready/{topic}`) — the authority for *where* to look. A publish adds the
+  topic in the SAME atomic batch/`WriteOp` as the index record (no extra round-trip); a nack re-adds
+  it; a claim that drains a topic to empty prunes it (empty-only, under the publish commit-gate /
+  one leader-serialized apply — race-free). On a non-atomic KV backend the fast path is disabled and
+  delivery falls back to the full poll (never loses a message).
+- **Lossy in-process wake** (latency only, fires after the durable commit) + a **coarse safety-net
+  reconcile** with a per-message next-visible **due-heap** for lease-expiry redelivery (O(due), not
+  O(topics)). The ready-set is rebuilt from the authoritative index on a long cadence (**add-only** —
+  pruning is owned solely by the gated claim path); the due-heap is a rebuild-from-durable cache, never
+  the authority.
+- **Cross-node topic sharding** (cluster): a deterministic HRW/rendezvous assignment (stable FNV-1a)
+  over the **applied** Raft membership (`StoredMembership`), so every node converges to the identical
+  assignment and drains only its share. The safety-net/rebuild pass stays **unsharded** so a
+  membership transition never leaves a topic owned by no node. The atomic lease-write is still
+  leader-serialized (exactly-once); a transient double-owner during rebalance is at worst a redundant
+  empty claim. Single-node = the trivial one-node assignment (owns all topics), same code path.
+- **Observability:** an `OperatorStats.delivery` block (`ready_set_size`, `due_heap_depth`,
+  `last_rebuild_age_ms`, `this_node`) + an `owning_node` on the per-consumer stat and `queue groups`,
+  so "why is this topic backed up" is answerable from `stats`/`queue groups` with no logs.
+- **Two `[handlers]` knobs** (`Option<u64>`, absent ⇒ default): `messaging_safetynet_interval_ms`
+  (~2 s) and `messaging_readyset_rebuild_interval_ms` (~30 s). Crons, the async-lane function drain,
+  blob watchers, and the retention sweep stay on the coarse maintenance timer.
+
 ## [0.4.26] - 2026-09-21
 
 A read-only, **tenant-scoped `messaging-stats` guest capability**: a granted wasm component reads

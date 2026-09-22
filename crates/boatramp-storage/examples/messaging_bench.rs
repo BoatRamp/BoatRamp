@@ -193,7 +193,8 @@ async fn main() {
                         .get(key)
                         .cloned()
                         .ok_or_else(|| boatramp_core::StorageError::NotFound(key.into()))?;
-                    let body = futures::stream::once(async move { Ok(bytes::Bytes::from(b)) }).boxed();
+                    let body =
+                        futures::stream::once(async move { Ok(bytes::Bytes::from(b)) }).boxed();
                     Ok(boatramp_core::GetObject {
                         meta: boatramp_core::ObjectMeta {
                             key: key.into(),
@@ -215,7 +216,8 @@ async fn main() {
                     key: &str,
                     mut body: boatramp_core::ByteStream,
                     _: boatramp_core::PutMeta,
-                ) -> Result<boatramp_core::ObjectMeta, boatramp_core::StorageError> {
+                ) -> Result<boatramp_core::ObjectMeta, boatramp_core::StorageError>
+                {
                     let mut buf = Vec::new();
                     while let Some(c) = body.next().await {
                         buf.extend_from_slice(&c?);
@@ -229,7 +231,8 @@ async fn main() {
                 async fn head(
                     &self,
                     key: &str,
-                ) -> Result<boatramp_core::ObjectMeta, boatramp_core::StorageError> {
+                ) -> Result<boatramp_core::ObjectMeta, boatramp_core::StorageError>
+                {
                     Ok(boatramp_core::ObjectMeta {
                         key: key.into(),
                         ..Default::default()
@@ -242,12 +245,15 @@ async fn main() {
                 async fn list(
                     &self,
                     _: &str,
-                ) -> Result<Vec<boatramp_core::ObjectMeta>, boatramp_core::StorageError> {
+                ) -> Result<Vec<boatramp_core::ObjectMeta>, boatramp_core::StorageError>
+                {
                     Ok(Vec::new())
                 }
             }
             let mq = LogMessaging::new(
-                Arc::new(MemBlob(std::sync::Mutex::new(std::collections::HashMap::new()))),
+                Arc::new(MemBlob(std::sync::Mutex::new(
+                    std::collections::HashMap::new(),
+                ))),
                 Arc::new(MemoryKv::new()),
             );
             // 5 always-active topics (a live marker each), so the scan has real work.
@@ -334,6 +340,8 @@ async fn main() {
              invariant is 'an idle topic is ABSENT from the ready-set', which the ready-set-size 0 confirms."
         );
     } else {
-        println!("\n(run with IDLE_SWEEP=1 for the event-driven delivery idle-scaling sweep — gate 8)");
+        println!(
+            "\n(run with IDLE_SWEEP=1 for the event-driven delivery idle-scaling sweep — gate 8)"
+        );
     }
 }
