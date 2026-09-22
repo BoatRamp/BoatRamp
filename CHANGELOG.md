@@ -5,6 +5,41 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.4.29] - 2026-09-22
+
+**Async-lane sharding (cluster)** — the async-lane function drain, crons, and blob watchers no longer
+run only on the leader. On a clustered, CAS-capable backend they shard across nodes by a stable hash
+over the applied Raft membership (the same assignment the messaging topic drainer uses), so the
+scan/compute/watch work spreads across the fleet instead of funnelling through the leader.
+**At-least-once is unchanged**: each invocation is claimed by a compare-and-set (the `Queued`→`Running`
+transition, and any settle, win for at most one node), and an **unsharded safety-net** pass is the
+backstop for the brief no-owner window of a membership change — so no double-execution and no
+stranding across a node loss. Single-node behaviour is byte-for-byte unchanged; a backend without a
+linearizable CAS stays leader-gated (fail-closed). Behind a Security-review-to-convergence + a 3-role
+panel, an 8-gate battery, and a **true multi-node node-loss live gate** (a real 3-node cluster: kill
+the owner mid-drain, assert exactly-once + no stranding).
+
+### Added / changed
+
+- **Cross-node async sharding**: crons + blob watchers fire on the owning node (not the leader); the
+  async-lane drain claims only its HRW share on the fast path. The atomic claim **write** is still a
+  single leader apply (`WriteOp::CompareAndSwap`) — sharding distributes the drain decision, queue
+  scan, payload I/O, and guest compute, not the tiny claim write; don't read it as "the leader stops
+  being a bottleneck" for the write path.
+- **CAS invocation claim + settle** (`compare_and_swap` on the whole record): removing the
+  single-writer leader-gate means two nodes can briefly both drain a function, so the claim and the
+  settle are now conditional — at most one node runs a given invocation, and a stale owner that lost
+  its lease to a reclaimer drops its outcome instead of clobbering the successor.
+- **Change-triggered enqueues are idempotent**: a cron fires at most once per minute (create-if-absent
+  on a minute-stamped id); a blob change coalesces into an in-flight run (a debounce) and re-fires
+  after it settles — a re-observed change can never resurrect a claimed/settled invocation.
+- **Observability**: an `async_shards` block on operator stats (`owning_node` + `queued` per drained
+  function, and a `safetynet_only_drains` counter) answers "which node drains this function?" and
+  distinguishes a shard gap from a slow drain. No new config knobs — the async safety-net reuses the
+  existing delivery cadence.
+- **Transparent rolling upgrade**: an old node behaves as owns-all (leader-gated); no function is
+  unowned during the skew, and the CAS makes a new node's redundant drains safe.
+
 ## [0.4.28] - 2026-09-22
 
 **CLI for schema migrations** — `boatramp project migrate`. The owner-gated schema-migration surface
