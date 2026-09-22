@@ -768,6 +768,20 @@ jobs:
             || { echo "::error::messaging-stats gate did not run (silent skip or a failure)" >&2; exit 1; }
           grep -q 'MESSAGING-STATS TENANT-SCOPED OK' messaging-stats.log \
             || { echo "::error::messaging-stats gate never reached its marker (a tenant-scoping/cross-tenant-oracle regression)" >&2; exit 1; }
+      # B10 (async-lane sharding): the whole async-lane shard gate battery — CAS claim race,
+      # node-loss transition (double-owner ⇒ exactly one execution, no-owner ⇒ safety-net rescues,
+      # never a stranding), lease-expiry reclaim, blob-watcher single-fire, cron single-fire, and the
+      # transparent-upgrade skew — with the THE-gate marker `ASYNC-SHARD NODE-LOSS OK`. A double-
+      # execution / stranding regression (the async-lane at-least-once contract) fails the merge.
+      - name: async-lane sharding gate battery (B10)
+        run: |
+          set -eo pipefail
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-server \
+            --features handlers --lib b10_async_shard_tests -- --nocapture 2>&1 | tee async-shard.log
+          grep -qE 'test result: ok\. 7 passed' async-shard.log \
+            || { echo "::error::B10 async-shard battery did not run all 7 gates (silent skip or a failure)" >&2; exit 1; }
+          grep -q 'ASYNC-SHARD NODE-LOSS OK' async-shard.log \
+            || { echo "::error::B10 node-loss gate never reached its marker (a double-execution or stranding regression)" >&2; exit 1; }
 
   deny:
     name: cargo-deny

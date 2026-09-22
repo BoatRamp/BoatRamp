@@ -1635,6 +1635,10 @@ pub(super) async fn drain_function_invocations(
     deploy: &DeployStore,
     project: ProjectRef<'_>,
     function: &boatramp_core::function::Function,
+    // Whether this drain is the unsharded safety-net backstop (B10) rather than the sharded/owner
+    // fast path. When a claim wins on the safety net, bump the `safetynet_only_drains` observability
+    // counter (B14) — a rising count flags a shard/ownership gap that the backstop is covering.
+    is_safety_net: bool,
 ) {
     use boatramp_core::function::InvocationStatus;
     let queued = match deploy.list_invocations(project, &function.name).await {
@@ -1680,7 +1684,15 @@ pub(super) async fn drain_function_invocations(
         claimed.lease_expires = Some(now.saturating_add(lease_ttl_secs(inner)));
         claimed.updated = now;
         match deploy.claim_invocation(project, &observed, &claimed).await {
-            Ok(true) => {} // won the claim — run it
+            Ok(true) => {
+                // Won the claim — run it. If the safety-net (not the owner's fast path) won it, this
+                // was a shard/ownership gap the backstop covered (B14): meter it for the operator.
+                if is_safety_net {
+                    inner
+                        .safetynet_only_drains
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
             Ok(false) => {
                 // Lost the race (another node claimed it first) or the record moved on since the
                 // scan — skip it, don't double-execute. Redundant scans (the unsharded safety-net)

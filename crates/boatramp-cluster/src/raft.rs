@@ -397,7 +397,7 @@ pub(crate) fn apply_op(target: &mut ApplyTarget, op: WriteOp) -> WriteResponse {
             // B10 cross-node CAS: swap only if the applied value still equals `expected`. A pure
             // comparison of replicated bytes inside this one leader-serialized apply, so two racing
             // proposals apply in a serial order and only the first matches — the linearizable claim.
-            let current = target.data.get(&key).map(|v| v.as_slice());
+            let current = target.data.get(&key).map(Vec::as_slice);
             let swapped = current == expected.as_deref();
             if swapped {
                 target.put(key, value);

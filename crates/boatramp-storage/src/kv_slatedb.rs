@@ -493,6 +493,54 @@ mod tests {
         .await;
     }
 
+    /// SlateKv's compare-and-swap (B10): the single-writer `cas_lock` makes it a linearizable CAS
+    /// within the writer process — expected-absent create, exact-bytes match, stale-expected refusal,
+    /// and a concurrent-racer set with exactly one winner (the property the async-lane claim needs).
+    #[serial_test::serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn slatedb_compare_and_swap_is_linearizable() {
+        with_fresh_slatedb_dir("cas", |dir| async move {
+            let kv = Arc::new(
+                SlateKv::open_local_settings(&dir, test_settings(None))
+                    .await
+                    .unwrap(),
+            );
+            assert!(kv.supports_cas(), "the writer advertises a linearizable CAS");
+
+            // Expected-absent creates; expected-absent on a present key does not swap.
+            assert!(kv.compare_and_swap("inv/1", None, b"queued".to_vec()).await.unwrap());
+            assert_eq!(kv.get("inv/1").await.unwrap(), Some(b"queued".to_vec()));
+            assert!(!kv.compare_and_swap("inv/1", None, b"x".to_vec()).await.unwrap());
+            // A stale expected does not swap; the exact prior bytes do.
+            assert!(!kv.compare_and_swap("inv/1", Some(b"WRONG"), b"x".to_vec()).await.unwrap());
+            assert_eq!(kv.get("inv/1").await.unwrap(), Some(b"queued".to_vec()));
+            assert!(kv.compare_and_swap("inv/1", Some(b"queued"), b"running".to_vec()).await.unwrap());
+            assert_eq!(kv.get("inv/1").await.unwrap(), Some(b"running".to_vec()));
+
+            // Race: many tasks in this single writer process try queued→<id>; exactly one wins.
+            kv.put("inv/2", b"queued".to_vec()).await.unwrap();
+            let mut set = tokio::task::JoinSet::new();
+            for i in 0..16u32 {
+                let kv = kv.clone();
+                set.spawn(async move {
+                    kv.compare_and_swap("inv/2", Some(b"queued"), i.to_le_bytes().to_vec())
+                        .await
+                        .unwrap()
+                });
+            }
+            let mut wins = 0;
+            while let Some(r) = set.join_next().await {
+                if r.unwrap() {
+                    wins += 1;
+                }
+            }
+            assert_eq!(wins, 1, "exactly one racing CAS wins on the single-writer store");
+
+            Arc::try_unwrap(kv).ok().unwrap().close().await.unwrap();
+        })
+        .await;
+    }
+
     #[serial_test::serial]
     #[tokio::test(flavor = "multi_thread")]
     async fn flush_persists_then_reopens() {

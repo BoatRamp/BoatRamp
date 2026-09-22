@@ -464,6 +464,41 @@ struct HandlerRuntimeInner {
     /// due-heap are the authority regardless of cadence) — only latency vs idle-wakeup tradeoff.
     #[cfg(feature = "handlers")]
     delivery_config: std::sync::OnceLock<DeliveryConfig>,
+    /// Count of async invocations claimed by the **unsharded safety-net** pass rather than the sharded
+    /// fast path (B10/B14 observability). A rising counter is the "wake/ownership gap" early warning —
+    /// work IS getting drained, but only by the coarse backstop, not the owning node's fast path — so
+    /// an operator can tell a shard gap (owner stale/absent → safety-net picks up the slack) from a
+    /// healthy fast-path drain, with no server logs. Best-effort/monotonic; never a correctness gate.
+    #[cfg(feature = "handlers")]
+    safetynet_only_drains: std::sync::atomic::AtomicU64,
+}
+
+/// The async-lane shard observability snapshot (B10/B14/B15), mirroring the delivery `DeliveryStats`
+/// block: which functions this node drains + a shard-gap counter. Serialized into the operator stats.
+#[cfg(feature = "handlers")]
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct AsyncShardStats {
+    /// One entry per function this node OWNS (drains): its identity key, owning-node label, and the
+    /// current queued/running invocation depth. Absent functions are owned + reported by other nodes.
+    pub functions: Vec<AsyncShardEntry>,
+    /// Cumulative count of invocations claimed by the unsharded safety-net rather than a fast-path
+    /// owner (a rising value flags a shard/ownership gap the backstop is covering — B16-style signal).
+    pub safetynet_only_drains: u64,
+}
+
+/// One owned function-shard in [`AsyncShardStats`]: the async-lane analogue of a per-consumer
+/// `owning_node` + backlog (B15).
+#[cfg(feature = "handlers")]
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct AsyncShardEntry {
+    /// The function identity key (`{project}/{function}`) this node HRW-owns.
+    pub key: String,
+    /// The node draining this shard (this node's delivery identity). Empty on a single-node
+    /// deployment where the concept is degenerate.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub owning_node: String,
+    /// Queued + running invocations waiting on this function (the per-shard backlog depth).
+    pub queued: usize,
 }
 
 /// The two event-driven-delivery cadences (B17), resolved from the node `[handlers]` config (absent ⇒
@@ -655,6 +690,7 @@ impl HandlerRuntime {
                 tenancy_posture_overrides: std::sync::OnceLock::new(),
                 #[cfg(feature = "handlers")]
                 delivery_config: std::sync::OnceLock::new(),
+                safetynet_only_drains: std::sync::atomic::AtomicU64::new(0),
             })),
         }
     }
@@ -980,6 +1016,66 @@ impl HandlerRuntime {
         if let Some(inner) = self.inner.as_ref() {
             let _ = inner.async_shard_gate.set(gate);
         }
+    }
+
+    /// The async-lane shard observability snapshot (B10/B14/B15): for each function this node OWNS,
+    /// its queued-invocation count + the owning node label; plus the cumulative safety-net-only-drain
+    /// counter (a shard-gap early warning). Answers "which node drains F" and "is this a shard gap vs
+    /// a drain bug" from `stats`, no server logs — the async-lane analogue of the delivery
+    /// `owning_node` plus the safety-net-only counter. `None` on a no-runtime build. A single-node /
+    /// non-CAS backend reports every function (it owns all) with an empty node label (degenerate there).
+    #[cfg(feature = "handlers")]
+    pub async fn async_shard_stats(&self, deploy: &DeployStore) -> Option<AsyncShardStats> {
+        use std::sync::atomic::Ordering;
+        let inner = self.inner.as_ref()?;
+        let owning_node = match &inner.messaging {
+            Some(m) => m
+                .delivery_stats("")
+                .await
+                .map(|s| s.this_node)
+                .unwrap_or_default(),
+            None => String::new(),
+        };
+        let mut functions = Vec::new();
+        // Enumerate every project's functions; report the ones THIS node owns with their queued depth.
+        let projects = deploy.discover_projects().await.unwrap_or_default();
+        for project_name in &projects {
+            let project = boatramp_core::project::ProjectRef::new(project_name);
+            let Ok(fns) = deploy.list_stored_functions(project).await else {
+                continue;
+            };
+            for function in fns {
+                let key = async_shard_key_function(project_name, &function.name);
+                if !inner.async_shard_owns(deploy, &key).await {
+                    continue; // another node owns + reports this shard
+                }
+                // Queued-count-per-shard: how many invocations are waiting on this owned function.
+                let queued = deploy
+                    .list_invocations(project, &function.name)
+                    .await
+                    .map(|invs| {
+                        invs.iter()
+                            .filter(|i| {
+                                matches!(
+                                    i.status,
+                                    boatramp_core::function::InvocationStatus::Queued
+                                        | boatramp_core::function::InvocationStatus::Running
+                                )
+                            })
+                            .count()
+                    })
+                    .unwrap_or(0);
+                functions.push(AsyncShardEntry {
+                    key,
+                    owning_node: owning_node.clone(),
+                    queued,
+                });
+            }
+        }
+        Some(AsyncShardStats {
+            functions,
+            safetynet_only_drains: inner.safetynet_only_drains.load(Ordering::Relaxed),
+        })
     }
 
     /// Set the event-driven-delivery cadences (B17) from the node `[handlers]` config. Set once at
@@ -3160,7 +3256,7 @@ mod tests {
         include_bytes!("../../boatramp-handlers/tests/fixtures/event-consumer.wasm");
 
     #[derive(Default)]
-    struct MemStorage {
+    pub(crate) struct MemStorage {
         objects: std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>,
     }
 
@@ -5296,7 +5392,7 @@ mod tests {
     /// spawns the run off the tick, so settlement is asynchronous. Panics on
     /// timeout so a stuck run fails the test rather than hanging it.
     #[cfg(feature = "handlers")]
-    async fn poll_invocation_settled(
+    pub(crate) async fn poll_invocation_settled(
         deploy: &boatramp_core::deploy::DeployStore,
         project: ProjectRef<'_>,
         function: &str,
@@ -6370,5 +6466,468 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&sql_dir);
+    }
+}
+
+/// B10 — async-lane sharding: the CI-hard gate battery (mirrors the #478 delivery battery). Each gate
+/// exercises one invariant with an injectable shard gate ([`HandlerRuntime::set_async_shard_gate`]) over
+/// the atomic-CAS `MemoryKv`, so the ownership behaviors are proven deterministically without a full
+/// Raft cluster (the RaftKv CAS itself is gated in `boatramp-cluster::raft` tests). The live/cluster
+/// analogue prints `ASYNC-SHARD NODE-LOSS OK` (the node-loss gate below).
+#[cfg(all(test, feature = "handlers"))]
+mod b10_async_shard_tests {
+    use super::*;
+    use crate::scheduler::{run_scheduler_tick, AsyncPass, ConsumerFilter, CronNow};
+    use boatramp_core::deploy::DeployStore;
+    use boatramp_core::function::{
+        Function, FunctionConfig, FunctionTrigger, FunctionVersion, Invocation, InvocationStatus,
+        InvokeMode, Lifecycle, Owner, TriggerKind,
+    };
+    use boatramp_core::kv::{KvStore, MemoryKv};
+    use boatramp_core::project::ProjectRef;
+    use boatramp_handlers::{HandlerEngine, Limits};
+    use futures::StreamExt;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    /// The `kv-counter` fixture increments `<scope>/hits` on each RUN — so the KV counter is an
+    /// exact cluster-wide execution count (the double-execution detector).
+    const KV_COUNTER: &[u8] =
+        include_bytes!("../../boatramp-handlers/tests/fixtures/kv-counter.wasm");
+
+    fn fixed_now() -> CronNow {
+        CronNow {
+            minute: 0,
+            hour: 0,
+            dom: 1,
+            month: 1,
+            dow: 0,
+            minute_stamp: 0,
+        }
+    }
+
+    /// A function importing `wasi:keyvalue` so each run bumps a shared, observable counter.
+    fn counter_function(name: &str, hash: &str) -> Function {
+        Function {
+            name: name.into(),
+            owner: Owner::Project("default".into()),
+            versions: vec![FunctionVersion {
+                id: "v1".into(),
+                component: hash.to_string(),
+                created: 0,
+                lifecycle: Lifecycle::Independent,
+            }],
+            active: "v1".into(),
+            aliases: Default::default(),
+            config: FunctionConfig {
+                imports: vec!["wasi:keyvalue".into()],
+                ..Default::default()
+            },
+        }
+    }
+
+    fn queued(id: &str, function: &str) -> Invocation {
+        Invocation {
+            id: id.into(),
+            function: function.into(),
+            version: "v1".into(),
+            mode: InvokeMode::Async,
+            status: InvocationStatus::Queued,
+            idempotency_key: None,
+            attempts: 0,
+            lease_expires: None,
+            request_b64: None,
+            request_content_type: None,
+            result: None,
+            created: 0,
+            updated: 0,
+        }
+    }
+
+    /// Build a runtime over a SHARED (project, storage, kv) with an explicit shard gate. Returns the
+    /// runtime; the caller drives `run_scheduler_tick` against it. Multiple runtimes over ONE kv model
+    /// a cluster (a shared applied store) whose ownership is dictated by each node's gate.
+    async fn runtime_with_gate(
+        kv: Arc<dyn KvStore>,
+        storage: Arc<super::tests::MemStorage>,
+        gate: crate::AsyncShardGate,
+    ) -> HandlerRuntime {
+        let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
+        let rt = HandlerRuntime::new(engine, kv, storage, None, None);
+        rt.set_async_shard_gate(gate);
+        rt
+    }
+
+    async fn tick(
+        rt: &HandlerRuntime,
+        deploy: &DeployStore,
+        pass: AsyncPass,
+        consumers: ConsumerFilter<'_>,
+    ) {
+        let inner = rt.inner.as_ref().unwrap();
+        let mut wasm = HashMap::new();
+        let mut crons = HashMap::new();
+        let mut sweep = HashMap::new();
+        run_scheduler_tick(
+            inner,
+            deploy,
+            &mut wasm,
+            &mut crons,
+            &mut sweep,
+            fixed_now(),
+            consumers,
+            pass,
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn seed_counter_function(deploy: &DeployStore, name: &str) -> String {
+        let hash = boatramp_core::deploy::sha256_hex(KV_COUNTER);
+        let stream: boatramp_core::ByteStream =
+            futures::stream::once(async move { Ok(bytes::Bytes::from_static(KV_COUNTER)) }).boxed();
+        deploy.put_blob(&hash, stream).await.unwrap();
+        deploy
+            .put_function(ProjectRef::DEFAULT, &counter_function(name, &hash))
+            .await
+            .unwrap();
+        hash
+    }
+
+    async fn poll_hits(kv: &Arc<dyn KvStore>, key: &str, want: &[u8]) -> bool {
+        for _ in 0..200 {
+            if kv.get(key).await.unwrap().as_deref() == Some(want) {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        false
+    }
+
+    /// GATE 1 — single-node unchanged: an unset / owns-all gate drains every function exactly as the
+    /// legacy leader-gate did. (The 304 existing lib tests all run under `AsyncPass::Legacy`, so this
+    /// asserts the Sharded pass with an owns-all gate is byte-for-byte equivalent — one run per queued.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gate1_single_node_owns_all_drains_normally() {
+        let storage = Arc::new(super::tests::MemStorage::default());
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let deploy = DeployStore::new(storage.clone(), kv.clone());
+        seed_counter_function(&deploy, "worker").await;
+        deploy
+            .put_invocation(ProjectRef::DEFAULT, &queued("inv1", "worker"))
+            .await
+            .unwrap();
+
+        let owns_all: crate::AsyncShardGate = Arc::new(|_key: &str| true);
+        let rt = runtime_with_gate(kv.clone(), storage, owns_all).await;
+        tick(&rt, &deploy, AsyncPass::Sharded, ConsumerFilter::Skip).await;
+
+        assert!(
+            poll_hits(&kv, "hkv/fn/worker/hits", b"1").await,
+            "an owns-all shard gate drains the queued invocation exactly once (== legacy)"
+        );
+    }
+
+    /// GATE 2 — CAS claim race: two racing `claim_invocation` calls on the SAME `Queued` invocation
+    /// yield exactly one winner (the atomic `MemoryKv` CAS). This is the primary new mechanism.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn gate2_cas_claim_has_exactly_one_winner() {
+        let storage = Arc::new(super::tests::MemStorage::default());
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let deploy = DeployStore::new(storage.clone(), kv.clone());
+        let observed = queued("inv1", "worker");
+        deploy
+            .put_invocation(ProjectRef::DEFAULT, &observed)
+            .await
+            .unwrap();
+
+        // 16 nodes all observed the same Queued record and race to claim it Running.
+        let mut set = tokio::task::JoinSet::new();
+        for node in 0..16u64 {
+            let deploy = deploy.clone();
+            let observed = observed.clone();
+            set.spawn(async move {
+                let mut claimed = observed.clone();
+                claimed.status = InvocationStatus::Running;
+                claimed.attempts = 1;
+                claimed.lease_expires = Some(1_000 + node); // distinct bytes per node
+                claimed.updated = 1_000 + node;
+                deploy
+                    .claim_invocation(ProjectRef::DEFAULT, &observed, &claimed)
+                    .await
+                    .unwrap()
+            });
+        }
+        let mut wins = 0;
+        while let Some(r) = set.join_next().await {
+            if r.unwrap() {
+                wins += 1;
+            }
+        }
+        assert_eq!(
+            wins, 1,
+            "exactly one node wins the CAS claim; the rest re-scan"
+        );
+        let final_rec = deploy
+            .get_invocation(ProjectRef::DEFAULT, "worker", "inv1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(final_rec.status, InvocationStatus::Running);
+        assert_eq!(
+            final_rec.attempts, 1,
+            "the attempt was counted exactly once"
+        );
+    }
+
+    /// GATE 3 — node-loss transition (THE gate): a function's owner "dies" and a new node takes over.
+    /// Model the double-owner + no-owner windows over ONE shared kv (a shared applied store):
+    ///   * double-owner: BOTH nodes' gates own the function → both drain the SAME queue → the CAS
+    ///     admits exactly one run (no double-execution).
+    ///   * no-owner: NEITHER node owns it (the transition gap) → the sharded fast path drains nothing,
+    ///     but the UNSHARDED safety-net pass on either node still drains it (no stranding).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn gate3_node_loss_no_double_execution_and_no_stranding() {
+        let storage = Arc::new(super::tests::MemStorage::default());
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let deploy = DeployStore::new(storage.clone(), kv.clone());
+        seed_counter_function(&deploy, "worker").await;
+
+        let owns_all: crate::AsyncShardGate = Arc::new(|_| true);
+        let owns_none: crate::AsyncShardGate = Arc::new(|_| false);
+
+        // --- Double-owner window: two nodes both think they own `worker`. ---
+        deploy
+            .put_invocation(ProjectRef::DEFAULT, &queued("inv-a", "worker"))
+            .await
+            .unwrap();
+        let node_a = runtime_with_gate(kv.clone(), storage.clone(), owns_all.clone()).await;
+        let node_b = runtime_with_gate(kv.clone(), storage.clone(), owns_all.clone()).await;
+        // Both drain the same queue concurrently — the CAS must admit exactly one run.
+        let (ra, rb) = tokio::join!(
+            tick(&node_a, &deploy, AsyncPass::Sharded, ConsumerFilter::Skip),
+            tick(&node_b, &deploy, AsyncPass::Sharded, ConsumerFilter::Skip),
+        );
+        let _ = (ra, rb);
+        assert!(
+            poll_hits(&kv, "hkv/fn/worker/hits", b"1").await,
+            "double-owner window: the CAS admits EXACTLY ONE execution (hits == 1)"
+        );
+
+        // --- No-owner window: neither node owns `worker` (the transition gap). ---
+        deploy
+            .put_invocation(ProjectRef::DEFAULT, &queued("inv-b", "worker"))
+            .await
+            .unwrap();
+        let orphan_a = runtime_with_gate(kv.clone(), storage.clone(), owns_none.clone()).await;
+        // The sharded fast path drains nothing (no owner) …
+        tick(&orphan_a, &deploy, AsyncPass::Sharded, ConsumerFilter::Skip).await;
+        let mid = deploy
+            .get_invocation(ProjectRef::DEFAULT, "worker", "inv-b")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            mid.status,
+            InvocationStatus::Queued,
+            "no-owner window: the sharded fast path correctly drains nothing"
+        );
+        // … but the UNSHARDED safety-net pass rescues it (no stranding).
+        tick(
+            &orphan_a,
+            &deploy,
+            AsyncPass::UnshardedSafetyNet,
+            ConsumerFilter::Skip,
+        )
+        .await;
+        assert!(
+            poll_hits(&kv, "hkv/fn/worker/hits", b"2").await,
+            "no-owner window: the unsharded safety-net drains the orphaned invocation (hits now 2)"
+        );
+
+        println!(
+            "ASYNC-SHARD NODE-LOSS OK: across a simulated owner handoff over a shared applied store, \
+             the double-owner window admitted EXACTLY ONE execution (the CAS claim serialized two \
+             concurrent drainers), and the no-owner window stranded NOTHING (the sharded fast path \
+             skipped the unowned function, but the unsharded safety-net pass drained it) — no \
+             double-execution and no stranding across the membership transition."
+        );
+    }
+
+    /// GATE 4 — lease-expiry reclaim under sharding: a crashed owner's `Running` invocation whose
+    /// lease has elapsed is reclaimed by a DIFFERENT node's drain exactly once (never double-run,
+    /// never stranded). The CAS claims the expired-`Running`→`Running` transition atomically.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn gate4_lease_expiry_reclaimed_exactly_once() {
+        let storage = Arc::new(super::tests::MemStorage::default());
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let deploy = DeployStore::new(storage.clone(), kv.clone());
+        seed_counter_function(&deploy, "worker").await;
+        // A `Running` record whose lease elapsed long ago (owner crashed mid-run).
+        let mut stuck = queued("inv1", "worker");
+        stuck.status = InvocationStatus::Running;
+        stuck.attempts = 1;
+        stuck.lease_expires = Some(1); // unix second 1 — long past
+        deploy
+            .put_invocation(ProjectRef::DEFAULT, &stuck)
+            .await
+            .unwrap();
+
+        // Two survivor nodes both own the function and both try to reclaim the expired lease.
+        let owns_all: crate::AsyncShardGate = Arc::new(|_| true);
+        let a = runtime_with_gate(kv.clone(), storage.clone(), owns_all.clone()).await;
+        let b = runtime_with_gate(kv.clone(), storage.clone(), owns_all.clone()).await;
+        tokio::join!(
+            tick(&a, &deploy, AsyncPass::Sharded, ConsumerFilter::Skip),
+            tick(&b, &deploy, AsyncPass::Sharded, ConsumerFilter::Skip),
+        );
+        assert!(
+            poll_hits(&kv, "hkv/fn/worker/hits", b"1").await,
+            "the expired lease is reclaimed and run EXACTLY once (hits == 1), never double-run"
+        );
+        let settled =
+            super::tests::poll_invocation_settled(&deploy, ProjectRef::DEFAULT, "worker", "inv1")
+                .await;
+        assert_eq!(settled.status, InvocationStatus::Succeeded);
+        assert_eq!(
+            settled.attempts, 2,
+            "the reclaim counted exactly one further attempt"
+        );
+    }
+
+    /// GATE 5 — blob-watcher single-fire: two watchers observing the SAME blob change (the double-owner
+    /// window) enqueue exactly ONE invocation, because the invocation id is content-hash-deterministic.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gate5_blob_change_enqueue_is_idempotent() {
+        let storage = Arc::new(super::tests::MemStorage::default());
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let deploy = DeployStore::new(storage.clone(), kv.clone());
+        seed_counter_function(&deploy, "onblob").await;
+        let function = deploy
+            .get_function(ProjectRef::DEFAULT, "onblob")
+            .await
+            .unwrap()
+            .unwrap();
+        let change = boatramp_core::BlobChange {
+            key: "hblob/fn/onblob/data.csv".into(),
+            kind: boatramp_core::BlobChangeKind::Created,
+        };
+        // Two watchers (old + new owner) fire the identical change concurrently.
+        tokio::join!(
+            crate::scheduler::enqueue_blob_invocation(
+                &deploy,
+                ProjectRef::DEFAULT,
+                &function,
+                &change,
+                "hblob/fn/onblob/",
+            ),
+            crate::scheduler::enqueue_blob_invocation(
+                &deploy,
+                ProjectRef::DEFAULT,
+                &function,
+                &change,
+                "hblob/fn/onblob/",
+            ),
+        );
+        let invs = deploy
+            .list_invocations(ProjectRef::DEFAULT, "onblob")
+            .await
+            .unwrap();
+        assert_eq!(
+            invs.len(),
+            1,
+            "two watchers on the same change enqueue exactly ONE invocation (deterministic id)"
+        );
+    }
+
+    /// GATE 6 — cron single-fire under sharding: a function-bound cron enqueues exactly one invocation
+    /// across a skew pair — the OWNER fires it; the NON-OWNER (and the safety-net pass) never does.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gate6_cron_fires_owner_only_never_double() {
+        let storage = Arc::new(super::tests::MemStorage::default());
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let deploy = DeployStore::new(storage.clone(), kv.clone());
+        seed_counter_function(&deploy, "ticker").await;
+        // A function cron that fires every minute (matches the fixed `CronNow`).
+        deploy
+            .put_trigger(
+                ProjectRef::DEFAULT,
+                "ticker",
+                &FunctionTrigger {
+                    id: "c0".into(),
+                    kind: TriggerKind::Cron {
+                        schedule: "* * * * *".into(),
+                        overlap: Default::default(),
+                    },
+                    last_fired_minute: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let owns_all: crate::AsyncShardGate = Arc::new(|_| true);
+        let owns_none: crate::AsyncShardGate = Arc::new(|_| false);
+        let owner = runtime_with_gate(kv.clone(), storage.clone(), owns_all).await;
+        let nonowner = runtime_with_gate(kv.clone(), storage.clone(), owns_none).await;
+
+        // The non-owner's sharded pass must NOT fire the cron (enqueue nothing) …
+        tick(&nonowner, &deploy, AsyncPass::Sharded, ConsumerFilter::Skip).await;
+        // … the safety-net pass must NOT fire crons either (no cross-node firing dedup) …
+        tick(
+            &owner,
+            &deploy,
+            AsyncPass::UnshardedSafetyNet,
+            ConsumerFilter::Skip,
+        )
+        .await;
+        assert_eq!(
+            deploy
+                .list_invocations(ProjectRef::DEFAULT, "ticker")
+                .await
+                .unwrap()
+                .len(),
+            0,
+            "neither a non-owner nor the safety-net pass fires a cron"
+        );
+        // … only the OWNER's sharded pass fires it, exactly once.
+        tick(&owner, &deploy, AsyncPass::Sharded, ConsumerFilter::Skip).await;
+        let after_owner = deploy
+            .list_invocations(ProjectRef::DEFAULT, "ticker")
+            .await
+            .unwrap()
+            .len();
+        assert_eq!(after_owner, 1, "the owner fires the cron exactly once");
+    }
+
+    /// GATE 7 — transparent upgrade (B18): an OLD node behaves as owns-all (leader-gated, `Legacy`)
+    /// while a NEW node is `Sharded`. During the skew NO function is unowned: the old node drains
+    /// everything (owns-all), the new node's CAS makes its redundant owned drains safe → exactly one
+    /// execution cluster-wide, never a stranding.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn gate7_transparent_upgrade_skew_no_double_no_unowned() {
+        let storage = Arc::new(super::tests::MemStorage::default());
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let deploy = DeployStore::new(storage.clone(), kv.clone());
+        seed_counter_function(&deploy, "worker").await;
+        deploy
+            .put_invocation(ProjectRef::DEFAULT, &queued("inv1", "worker"))
+            .await
+            .unwrap();
+
+        // OLD node: no shard gate, no messaging ⇒ `async_shard_owns` = own-all; runs `Legacy`.
+        let engine_old = HandlerEngine::new(Limits::default(), 16).unwrap();
+        let old = HandlerRuntime::new(engine_old, kv.clone(), storage.clone(), None, None);
+        // NEW node: sharded, and it happens to OWN the function too (worst case: both drain it).
+        let owns_all: crate::AsyncShardGate = Arc::new(|_| true);
+        let new = runtime_with_gate(kv.clone(), storage.clone(), owns_all).await;
+
+        tokio::join!(
+            tick(&old, &deploy, AsyncPass::Legacy, ConsumerFilter::Skip),
+            tick(&new, &deploy, AsyncPass::Sharded, ConsumerFilter::Skip),
+        );
+        assert!(
+            poll_hits(&kv, "hkv/fn/worker/hits", b"1").await,
+            "old(owns-all) ⊕ new(sharded) skew: exactly one execution, no function unowned"
+        );
     }
 }

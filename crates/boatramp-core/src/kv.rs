@@ -303,7 +303,7 @@ impl KvStore for MemoryKv {
         // Compare + conditional insert under ONE lock — no other writer can interleave, so this is a
         // true atomic CAS (unlike the trait default's separate read-then-write).
         let mut map = self.inner.lock().unwrap();
-        let current = map.get(key).map(|v| v.as_slice());
+        let current = map.get(key).map(Vec::as_slice);
         if current != expected {
             return Ok(false);
         }

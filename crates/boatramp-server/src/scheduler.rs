@@ -584,7 +584,7 @@ fn blob_change_invocation_id(
 /// kind as the JSON request body (the function-relative key, `hblob/fn/<name>/`
 /// stripped).
 #[cfg(feature = "handlers")]
-async fn enqueue_blob_invocation(
+pub(super) async fn enqueue_blob_invocation(
     deploy: &DeployStore,
     project: ProjectRef<'_>,
     function: &boatramp_core::function::Function,
@@ -640,7 +640,12 @@ async fn enqueue_blob_invocation(
 /// active deployments. Consumers are processed inline (claim+dispatch); crons
 /// that are due are fired as detached tasks (loopback dispatch). Returns the
 /// number of messages acked and the spawned cron-fire handles (for tests).
+// The tick threads the delivery topic-selection (`consumers`) AND the async-lane pass mode
+// (`async_pass`, B10) alongside its four mutable state maps — over the 7-arg clippy soft cap, but
+// each is load-bearing and grouping them into a struct would only move the noise. Same allow as the
+// other wide scheduler/binding builders in this crate.
 #[cfg(feature = "handlers")]
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn run_scheduler_tick(
     inner: &Arc<HandlerRuntimeInner>,
     deploy: &DeployStore,
@@ -1025,7 +1030,14 @@ pub(super) async fn run_scheduler_tick(
                 if async_pass != AsyncPass::UnshardedSafetyNet {
                     dispatch_function_triggers(inner, deploy, project, &function, &now).await;
                 }
-                drain_function_invocations(inner, deploy, project, &function).await;
+                drain_function_invocations(
+                    inner,
+                    deploy,
+                    project,
+                    &function,
+                    async_pass == AsyncPass::UnshardedSafetyNet,
+                )
+                .await;
             }
             // --- workflow runs (FA-6): strictly leader-gated, NOT sharded (B10 residual) ---
             if leader && async_pass != AsyncPass::UnshardedSafetyNet {
