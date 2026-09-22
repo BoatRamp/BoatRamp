@@ -604,7 +604,7 @@ pub trait Messaging: Send + Sync {
         futures::stream::empty().boxed()
     }
 
-    /// The fast-path in-process **wake** (Part A #2): a clonable handle the drainer awaits so a
+    /// The fast-path in-process **wake** (Part A #2): a cloneable handle the drainer awaits so a
     /// publish (or nack-to-now) wakes it immediately instead of waiting for the reconcile timer. It
     /// carries NO topic/payload/`signed_context` (isolation, gate 7) — it is a pure "something became
     /// ready, go look at the durable ready-set" pulse, and a dropped/coalesced wake is harmless (the
