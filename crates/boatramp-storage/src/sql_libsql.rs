@@ -595,6 +595,14 @@ impl SqlBackends for LibsqlSqlBackends {
                     .map_err(SqlError::other)?;
             }
         }
+        // AND screen both endpoints through the STORAGE-boundary rule that governs whether the
+        // binding can later be OPENED (`database()` runs `validate_db_name` on the name). Without
+        // this, a move could accept a name the canonical validator allows but the open path rejects
+        // (e.g. a leading-dot `.hidden`) and strand the moved data at an un-addressable path — the
+        // exact cross-surface divergence this screening effort exists to close. `validate_db_name`
+        // accepts the empty/default spellings, so the default endpoints still pass.
+        validate_db_name("database", from_name)?;
+        validate_db_name("database", to_name)?;
         // These are the same separately-validated components `database` composes; run
         // them through the storage-boundary validator so a hostile site/project can't
         // reach the filesystem here either.
@@ -1606,14 +1614,24 @@ mod tests {
         let from = backends.database("default", "blog", "src").await.unwrap();
         put(&from, "CREATE TABLE t (v TEXT)").await;
 
-        // Rejected by the CANONICAL `validate_resource_name` (the one the move screens
-        // through, matching every operator/URL-path ingress): path separators, `.`/`..`,
-        // whitespace, `*`, control chars, and overlong. Note `""` / `"default"` are
-        // legitimate default endpoints for the storage method (a move can target the
-        // default), so they are NOT here — the CLI/API layer additionally requires a
-        // non-default `--to`. (`.hidden` is accepted by the canonical validator, so it
-        // is likewise not a rejection here.)
-        for bad in ["a/b", "..", "a b", "x*y", "a\tb", &"x".repeat(64)] {
+        // Rejected: the move screens through BOTH the canonical `validate_resource_name`
+        // (path separators, `.`/`..`, whitespace, `*`, control chars, overlong) AND libsql's
+        // stricter storage-boundary `validate_db_name` — the rule `database()` will enforce on
+        // OPEN — so a name the move accepts is always one the open path can address. `.hidden`
+        // is the headline case: the canonical validator allows a leading dot, but the storage
+        // boundary rejects it, so the move must refuse it too (otherwise the data would land at
+        // an un-openable `blog/.hidden.db`). `""` / `"default"` are legitimate default endpoints
+        // (a move can target the default), so they are NOT here — the CLI/API additionally
+        // requires a non-default `--to`.
+        for bad in [
+            "a/b",
+            "..",
+            ".hidden",
+            "a b",
+            "x*y",
+            "a\tb",
+            &"x".repeat(64),
+        ] {
             assert!(
                 matches!(
                     backends.move_database("default", "blog", "src", bad).await,
