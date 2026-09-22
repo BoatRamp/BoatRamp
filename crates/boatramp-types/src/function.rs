@@ -118,6 +118,14 @@ pub struct FunctionConfig {
     /// `invoke`. Only consulted when `imports` contains `invoke`.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub invoke_targets: Vec<String>,
+    /// Declared `bus:` stats-topic templates for the read-only `messaging-stats` capability: each a
+    /// `bus:`-relative topic with an optional literal `{tenant}` placeholder the HOST fills with this
+    /// invocation's resolved tenant (e.g. `sync/{tenant}/import`). A guest's `messaging-stats` call for
+    /// a `bus:` topic must name one of these verbatim; the host substitutes the tenant, so the guest
+    /// can never read another tenant's bus stats. Deny by default: empty ⇒ no bus stats readable. Only
+    /// consulted when `imports` contains `messaging-stats`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stats_topics: Vec<String>,
     /// In-site tenancy decision for this function's `sql`/`orm` access (Dimension 0). Absent ⇒
     /// *undeclared* (refused under the `multi-tenant` posture, treated as `Disabled` — plain
     /// queries — under single-tenant/dev). `Scoped` opts into host-injected row scoping. Parsed via
@@ -201,6 +209,9 @@ impl FunctionConfig {
             quota: FunctionQuota::default(),
             webhook: None,
             invoke_targets: Vec::new(),
+            // Carry the handler's declared `messaging-stats` bus-topic templates onto the desugared
+            // function so the grant surface is identical whichever path serves it.
+            stats_topics: h.stats_topics.clone(),
             // A desugared handler-function carries its own per-handler tenancy when declared;
             // absent ⇒ inherit the site config (the dispatch path applies the site decision).
             tenancy: h.tenancy.clone(),
@@ -214,6 +225,8 @@ impl FunctionConfig {
             // claims are carried onto the desugared function it runs as.
             tenancy: c.tenancy.clone(),
             token_claims: c.token_claims.clone(),
+            // Carry the consumer's declared `messaging-stats` bus-topic templates.
+            stats_topics: c.stats_topics.clone(),
             ..Default::default()
         }
     }
@@ -970,6 +983,7 @@ mod tests {
             limits: None,
             env: BTreeMap::new(),
             invoke_targets: Vec::new(),
+            stats_topics: Vec::new(),
         }
     }
 
@@ -1005,6 +1019,7 @@ mod tests {
                 max_ack_pending: None,
                 backoff_ms: None,
                 retention_ms: None,
+                stats_topics: Vec::new(),
             }],
             crons: vec![CronConfig {
                 schedule: "0 * * * *".into(),

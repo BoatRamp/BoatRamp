@@ -362,16 +362,21 @@ fn check_import(import: &str) -> Result<(), ConfigError> {
     // `KNOWN_IMPORTS`: the host advertises it as Experimental only when the `messaging` feature is
     // compiled, so the `requires` ABI gate enforces host support at activation while a deploy
     // targeting any host build still parses offline.
+    // `messaging-stats` (read-only per-topic bus gauges) is accepted here but, like `session` and
+    // `tenancy`, intentionally NOT in `KNOWN_IMPORTS`: the host advertises it as Experimental only
+    // when the `messaging` feature is compiled, so the `requires` ABI gate enforces host support at
+    // activation while a deploy targeting any host build still parses offline.
     if KNOWN_IMPORTS.contains(&import)
         || import == "session"
         || import == "tenancy"
+        || import == "messaging-stats"
         || is_named_sql_import(import)
         || is_named_admin_import(import)
     {
         Ok(())
     } else {
         Err(ConfigError::parse(format!(
-            "unknown handler import {import:?}; allowed: {}, `session`, `tenancy`, a named SQL binding `sql:<name>` / `sql:*`, or an admin surface `admin:{{domains,email,site,secrets}}`",
+            "unknown handler import {import:?}; allowed: {}, `session`, `tenancy`, `messaging-stats`, a named SQL binding `sql:<name>` / `sql:*`, or an admin surface `admin:{{domains,email,site,secrets}}`",
             KNOWN_IMPORTS.join(", ")
         )))
     }
@@ -515,6 +520,15 @@ pub struct HandlerConfig {
     /// `allow_imports` permits it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub invoke_targets: Vec<String>,
+    /// Declared `bus:` stats-topic templates for the read-only `messaging-stats` capability. Each is
+    /// a `bus:`-relative topic that may contain a literal `{tenant}` placeholder the HOST fills with
+    /// this invocation's resolved tenant (e.g. `sync/{tenant}/import`). A guest's `messaging-stats`
+    /// call for a `bus:` topic must name one of these verbatim; the host substitutes the tenant, so
+    /// the guest can never read another tenant's bus stats. Deny by default: empty ⇒ no bus stats
+    /// readable (a plain private-namespace topic never needs a template). Only consulted when
+    /// `imports` contains `messaging-stats` and the site allows it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stats_topics: Vec<String>,
     /// Per-handler in-site tenancy decision (Dimension 0), overriding the site-level
     /// [`HandlersSiteConfig::tenancy`] for this route. Absent ⇒ inherit the site decision. When
     /// present it must **narrow within** the site ceiling ([`crate::tenancy::Tenancy::narrows_within`])
@@ -644,6 +658,13 @@ pub struct ConsumerConfig {
     /// high-volume bus, a longer one tolerates a slower group. (P1.)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retention_ms: Option<u64>,
+    /// Declared `bus:` stats-topic templates for the read-only `messaging-stats` capability (same
+    /// contract as [`HandlerConfig::stats_topics`]): a `bus:`-relative topic with an optional literal
+    /// `{tenant}` placeholder the host fills with the consumer's resolved tenant. A common shape for a
+    /// consumer that also wants to observe its own bus DLQ depth. Deny by default: empty ⇒ no bus
+    /// stats. Only consulted when `imports` contains `messaging-stats` and the site allows it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stats_topics: Vec<String>,
 }
 
 /// serde `skip_serializing_if` helper: a `Latest` start is the default and elided.
@@ -722,6 +743,10 @@ pub struct SessionConfig {
     /// Function-to-function invoke allowlist (same contract as a handler's `invoke_targets`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub invoke_targets: Vec<String>,
+    /// Declared `bus:` stats-topic templates for the read-only `messaging-stats` capability (same
+    /// contract as [`HandlerConfig::stats_topics`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stats_topics: Vec<String>,
     /// In-site tenancy decision for this session's `sql`/`orm` (Dimension 0). Resolved once at
     /// **open** from the verified source and carried across every re-entry, so a frame-triggered
     /// query is host-scoped identically to a normal handler. Absent ⇒ plain (project = database).
@@ -1377,6 +1402,7 @@ mod tests {
                 limits: None,
                 env: BTreeMap::from([("AWS_KEY".to_string(), "AKIAIOSFODNN7EXAMPLE".to_string())]),
                 invoke_targets: Vec::new(),
+                stats_topics: Vec::new(),
             }],
             ..Default::default()
         };
@@ -1478,6 +1504,11 @@ mod tests {
         assert!(check_import("sql:").is_err());
         assert!(check_import("sql:a/b").is_err());
         assert!(check_import("sql:a b").is_err());
+        // The experimental capability tokens accepted offline (like `session`/`tenancy`) but
+        // advertised only when the host build compiled them.
+        assert!(check_import("session").is_ok());
+        assert!(check_import("tenancy").is_ok());
+        assert!(check_import("messaging-stats").is_ok());
         // A wholly-unknown import is still rejected.
         assert!(check_import("wasi:filesystem").is_err());
     }
@@ -1505,25 +1536,37 @@ mod tests {
             handlers: [
                 ( route: "/api/orders/*", methods: ["GET", "POST"],
                   component: "handlers/orders.wasm",
-                  imports: ["sql", "wasi:keyvalue", "wasi:messaging"],
+                  imports: ["sql", "wasi:keyvalue", "wasi:messaging", "messaging-stats"],
+                  stats_topics: ["bus:sync/{tenant}/import"],
                   limits: ( memory_mb: 64, timeout_ms: 10000 ),
                   env: { "LOG_LEVEL": "info" } ),
             ],
             consumers: [
                 ( topic: "orders/created", component: "handlers/agg.wasm",
-                  imports: ["sql"] ),
+                  imports: ["sql", "messaging-stats"],
+                  stats_topics: ["bus:sync/{tenant}/import"] ),
             ],
             crons: [ ( schedule: "0 */6 * * *", route: "/api/orders/reindex", overlap: Skip ) ],
             streams: [ ( route: "/events/orders", topics: ["orders/created"] ) ],
         )"#;
         let config = DeployConfig::from_ron(text).unwrap();
         assert_eq!(config.handlers.len(), 1);
-        assert_eq!(config.handlers[0].imports.len(), 3);
+        assert_eq!(config.handlers[0].imports.len(), 4);
         assert_eq!(
             config.handlers[0].limits.as_ref().unwrap().memory_mb,
             Some(64)
         );
+        // The new `messaging-stats` bus-topic template parses (and the `messaging-stats` import is
+        // accepted by `check_import`, which `DeployConfig::from_ron` runs).
+        assert_eq!(
+            config.handlers[0].stats_topics,
+            vec!["bus:sync/{tenant}/import".to_string()]
+        );
         assert_eq!(config.consumers.len(), 1);
+        assert_eq!(
+            config.consumers[0].stats_topics,
+            vec!["bus:sync/{tenant}/import".to_string()]
+        );
         assert_eq!(config.crons[0].overlap, Overlap::Skip);
         assert_eq!(config.streams[0].topics, vec!["orders/created".to_string()]);
     }

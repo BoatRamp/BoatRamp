@@ -284,6 +284,17 @@ pub fn host_capability_features_detailed() -> Vec<CapabilityFeature> {
             lifecycle: Experimental,
         });
     }
+    // The read-only `messaging-stats` capability: surface the already-computed per-topic bus gauges
+    // (dead-letter/backlog/in-flight + per-group depth) to a granted guest, tenant-scoped by a
+    // host-filled `{tenant}` template. Available whenever handlers are compiled (which pulls in the
+    // messaging binding it rides); experimental until the shape settles. A guest declares
+    // `requires = ["messaging-stats"]`; a deploy against a host without it is refused cleanly.
+    if cfg!(feature = "handlers") {
+        f.push(CapabilityFeature {
+            name: "messaging-stats",
+            lifecycle: Experimental,
+        });
+    }
     if cfg!(feature = "orm-subquery") {
         // Correlated roll-ups ship off-by-default (the riskiest query surface) — experimental
         // until the shape settles.
@@ -830,6 +841,9 @@ mod tests {
         );
         // The session capability is cargo-gated too: advertised iff this build enabled it.
         assert_eq!(host.contains(&"session"), cfg!(feature = "session"));
+        // The read-only messaging-stats capability is advertised whenever handlers are compiled
+        // (this test only runs under `handlers`), as an Experimental feature.
+        assert!(host.contains(&"messaging-stats"));
         // The detailed registry pairs each name with a lifecycle, and its names are exactly the
         // flat list (one source of truth — the flat list derives from the detailed one).
         let detailed = host_capability_features_detailed();

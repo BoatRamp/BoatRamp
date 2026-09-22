@@ -46,6 +46,35 @@ site does not permit is refused at activation.
   the publishing handler and the consuming component, and match the topic name on
   each side. See [Run consumers, crons, and streams](./background-work.md).
 
+## Read bus stats (`messaging-stats`)
+
+A component that needs to *show* how a flow is doing — "is this customer's sync backed up or
+dead-lettering?" — grants the read-only **`messaging-stats`** capability and reads the gauges
+boatramp already computes for a topic: `get(topic)` returns `{ dead_letter_count, backlog,
+in_flight }`, and `groups(topic)` returns per-consumer-group `{ group, in_flight, lag }`. It is
+**read-only** — there is no claim/redrive/purge here. (Since v0.4.26. With the shim:
+`messaging_stats::get(topic)` / `groups(topic)`.)
+
+It is tenant-scoped **host-side**, because per-topic depth/DLQ counts are otherwise a cross-tenant
+oracle:
+
+- A **plain** topic reads the component's own private namespace (host-prefixed), exactly like a
+  publish — a component only ever sees its own.
+- A **`bus:` topic** must be one the component **declared** in its `stats_topics`, and a per-tenant
+  topic is declared as a **template** with a `{tenant}` placeholder (e.g. `bus:sync/{tenant}/import`).
+  The guest names that template verbatim; the **host** substitutes *this invocation's* resolved
+  tenant into `{tenant}` before reading — the guest never supplies the tenant, so it cannot name
+  another tenant's topic. A `bus:` topic that isn't a declared template, or a `{tenant}` template
+  with no resolved tenant, is refused (`not-declared`, fail-closed); an ungranted component gets
+  `access-denied`.
+
+```ron
+// A subgraph that shows per-flow depth/DLQ declares the template it will read:
+( name: "subgraph-sync",
+  imports: ["messaging-stats", "graphql"],
+  stats_topics: ["bus:sync/{tenant}/import"] )
+```
+
 ## Invoke a sibling function
 
 A handler can call a sibling [top-level function](./functions.md) **in-process**,

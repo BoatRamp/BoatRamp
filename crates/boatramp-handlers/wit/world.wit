@@ -416,6 +416,68 @@ world consumer {
   export messaging-handler;
 }
 
+/// Value types for the read-only **messaging-stats** capability: surface the ALREADY-computed
+/// per-topic bus gauges (dead-letter count, in-flight, backlog) to a granted guest — observability
+/// only, no claim/redrive/purge. Deny-by-default. Tenant-scoped by construction: a `bus:` topic is
+/// addressed through a component-declared, host-controlled **`{tenant}` template**; the guest supplies
+/// only the fixed parts, and the HOST substitutes THIS invocation's resolved tenant into `{tenant}`,
+/// so the guest is structurally unable to name another tenant's topic (no cross-tenant oracle). A
+/// plain (non-`bus:`) topic needs no template — it is already host-namespaced to the component's own
+/// private prefix, which a guest can only ever name for itself.
+interface messaging-stats-types {
+  /// A snapshot of a topic's gauges (all host-computed from existing state — no new bookkeeping).
+  record topic-stats {
+    /// Dead-lettered messages retained on the topic (exhausted `max-attempts` or ttl-expired).
+    dead-letter-count: u64,
+    /// Queued messages (claimable *or* leased) — the consumer backlog/lag.
+    backlog: u64,
+    /// In-flight (leased-but-unacked) messages — "queued and draining" vs "queued and wedged".
+    in-flight: u64,
+  }
+
+  /// A per-consumer-group gauge for a grouped topic (from the host's `group-info`): the group name
+  /// plus its in-flight (leased-unacked) and lag (retained-but-unleased) depths.
+  record group-stats {
+    group: string,
+    in-flight: u64,
+    lag: u64,
+  }
+
+  /// Why a stats read was refused.
+  variant stats-error {
+    /// The `messaging-stats` capability was not granted to this component (deny-by-default).
+    access-denied,
+    /// The (host-substituted) topic is not one of the component's declared stats templates, or a
+    /// `bus:` template was named without a resolved tenant to fill `{tenant}` — fail-closed, so a
+    /// guest can never read stats for a topic it did not declare or a tenant it is not.
+    not-declared,
+    /// Any other backend error.
+    other(string),
+  }
+}
+
+/// The `messaging-stats` capability: read-only gauges over a topic the component is entitled to.
+/// A plain `topic` names the component's own private namespace (host-prefixed). A `bus:<template>`
+/// topic must match one of the component's declared `stats_topics` templates; the host substitutes
+/// this invocation's resolved tenant for the `{tenant}` placeholder before reading — the guest
+/// supplies only the fixed parts and can never name another tenant's bus topic.
+interface messaging-stats {
+  use messaging-stats-types.{topic-stats, group-stats, stats-error};
+
+  /// The gauges for `topic`. For a `bus:` topic, `topic` is the DECLARED template (with a literal
+  /// `{tenant}` placeholder the host fills); for a plain topic it is the guest-relative name.
+  get: func(topic: string) -> result<topic-stats, stats-error>;
+
+  /// The per-group gauges for a grouped `topic` (same template rules as `get`). Empty for a
+  /// work-queue topic (no consumer groups).
+  groups: func(topic: string) -> result<list<group-stats>, stats-error>;
+}
+
+/// The messaging-stats capability world (imported into request handlers / functions / consumers).
+world messaging-stats-host {
+  import messaging-stats;
+}
+
 /// Value types for the `invoke` capability: a small HTTP-shaped request/response
 /// so one function can call another the same way the platform invokes it from
 /// the outside (functions are `wasi:http` handlers, so the natural call shape is
