@@ -570,11 +570,95 @@ pub enum GuardDialect {
 impl From<Dialect> for GuardDialect {
     fn from(d: Dialect) -> Self {
         match d {
-            Dialect::Mysql => GuardDialect::Mysql,
+            Dialect::Mysql => Self::Mysql,
             // SQLite/libsql shares the generic/Postgres comment + quoting rules for guard purposes.
-            Dialect::Postgres | Dialect::Sqlite => GuardDialect::Postgres,
+            Dialect::Postgres | Dialect::Sqlite => Self::Postgres,
         }
     }
+}
+
+/// Whether `s` contains a MySQL **executable-comment** marker `/*!` (case-insensitive; the version
+/// number `/*!40000` is a superset, still opened by `/*!`). MySQL executes the body of such a comment
+/// while a generic/MySQL block-comment lexer drops it — a guard-evasion vector on MySQL (Security
+/// review CRITICAL-1).
+///
+/// Used as the **belt** in [`significant_words_in`]'s MySQL path: after
+/// [`neutralize_mysql_executable_comments`] rewrites every executable-comment framing to spaces, this
+/// re-scans the neutralized text and, if ANY marker survived (a neutralization bug), fails the whole
+/// tokenization **closed** so the hidden body can never be dropped-then-executed. On correctly
+/// neutralized SQL no `/*!` remains, so it never misfires. Scoped to the MySQL guard path — Postgres
+/// treats `/*! */` as inert.
+fn mysql_has_executable_comment(s: &str) -> bool {
+    let script = s;
+    let bytes = script.as_bytes();
+    let mut i = 0;
+    while i + 2 < bytes.len() {
+        if bytes[i] == b'/' && bytes[i + 1] == b'*' && bytes[i + 2] == b'!' {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Neutralize MySQL **executable-comment** framing so its body lexes as LIVE tokens under the MySQL
+/// lexer (Security review CRITICAL-1). For every `/*!` (optionally followed by a run of digits — the
+/// `/*!NNNNN` version gate) the opening marker + digits are rewritten to spaces, and the matching
+/// closing `*/` is rewritten to spaces, so `/*! COMMIT */` becomes `      COMMIT   ` — which the
+/// normal word scan then flags as transaction control. Nested block comments are not a MySQL thing
+/// (MySQL does not nest `/* */`), so a simple first-`*/`-after-the-marker match is faithful to how
+/// MySQL bounds the comment. Returns `None` (→ guards fail closed) if a marker has no closing `*/`,
+/// so a truncated/unbalanced executable comment can never be silently accepted.
+///
+/// Only the executable form (`/*!`) is touched: ordinary `/* … */` block comments and every other
+/// construct pass through unchanged, so the historical behavior for a plain comment is preserved and
+/// only the MySQL-executed body is un-hidden. Called ONLY on the MySQL guard path; Postgres treats
+/// `/*! */` as an inert comment and its lexing is left byte-for-byte unchanged.
+fn neutralize_mysql_executable_comments(script: &str) -> Option<String> {
+    // All framing bytes we split on (`/`, `*`, `!`, ASCII digits) are single-byte and can never be
+    // a continuation byte of a multi-byte UTF-8 sequence, so byte indices are always char
+    // boundaries here — we copy the untouched regions as `&str` slices to keep non-ASCII content
+    // (identifiers/string bodies) intact.
+    let bytes = script.as_bytes();
+    let mut out = String::with_capacity(script.len());
+    let mut i = 0; // scan cursor
+    let mut copied = 0; // next byte not yet flushed to `out`
+    while i + 2 < bytes.len() {
+        if bytes[i] == b'/' && bytes[i + 1] == b'*' && bytes[i + 2] == b'!' {
+            // Flush the verbatim run before the marker.
+            out.push_str(&script[copied..i]);
+            // Blank the `/*!`.
+            out.push_str("   ");
+            i += 3;
+            // Blank any `/*!NNNNN` version-gate digits so `/*!40000 COMMIT */` → `COMMIT`.
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                out.push(' ');
+                i += 1;
+            }
+            // Find the matching `*/`; MySQL does not nest block comments so the first one bounds it.
+            let body_start = i;
+            loop {
+                if i + 1 >= bytes.len() {
+                    // Unterminated executable comment — fail closed.
+                    return None;
+                }
+                if bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                    break;
+                }
+                i += 1;
+            }
+            // Copy the inner body verbatim (its own tokens are now live), then blank the `*/`.
+            out.push_str(&script[body_start..i]);
+            out.push_str("  ");
+            i += 2;
+            copied = i;
+            continue;
+        }
+        i += 1;
+    }
+    // Flush the tail (including any trailing bytes past the scan window that held no marker).
+    out.push_str(&script[copied..]);
+    Some(out)
 }
 
 /// Tokenize `script` under `dialect` into its significant **word** tokens (lowercased), dropping
@@ -596,7 +680,33 @@ fn significant_words_in(script: &str, dialect: GuardDialect) -> Option<Vec<Strin
     // comments + backtick identifiers). `GenericDialect` for Postgres/SQLite keeps the historical
     // behavior byte-for-byte.
     let raw = match dialect {
-        GuardDialect::Mysql => Tokenizer::new(&MySqlDialect {}, script).tokenize().ok()?,
+        GuardDialect::Mysql => {
+            // MySQL's `/*! … */` (and version-gated `/*!NNNNN … */`) **executable comment** is a
+            // MySQL-only special form: MySQL EXECUTES the body, but sqlparser's MySQL tokenizer
+            // (0.53) treats it as an ordinary block comment and DROPS the body — so `/*! COMMIT */`,
+            // `/*! DELETE FROM boatramp_migrations… */`, `/*! CREATE EXTENSION x */` would lex to
+            // NOTHING and slip past every word-scan guard (S3/S4/extension). Neutralize the framing
+            // (rewrite the opening `/*!`+digits and the matching `*/` to spaces) so the inner text
+            // lexes as LIVE tokens and the normal scans catch it — WITH the correct classification
+            // (a `/*! COMMIT */` is seen as transaction control, a `/*! DELETE … boatramp_migrations
+            // … */` as a ledger reference), which a blanket byte-scan refusal could not give.
+            // Postgres treats `/*! */` as an inert comment, so this only applies to the MySQL lexer
+            // path (Security review CRITICAL-1). Fails **closed** (`None` → guards refuse) if the
+            // framing can't be resolved to lexable inner text.
+            let neutralized = neutralize_mysql_executable_comments(script)?;
+            // Belt (defense-in-depth beside the neutralization braces): if ANY executable-comment
+            // marker survived neutralization (a neutralization bug / an edge case it failed to
+            // rewrite), the MySQL lexer below would drop that body as a comment and the hidden
+            // construct would escape — so fail **closed** instead. On correctly-neutralized input
+            // no `/*!` remains, so this never misfires on legitimate SQL and never changes the
+            // classification of a comment we DID neutralize.
+            if mysql_has_executable_comment(&neutralized) {
+                return None;
+            }
+            Tokenizer::new(&MySqlDialect {}, &neutralized)
+                .tokenize()
+                .ok()?
+        }
         GuardDialect::Postgres => Tokenizer::new(&GenericDialect {}, script).tokenize().ok()?,
     };
     Some(
@@ -646,7 +756,10 @@ pub fn script_has_txn_control(script: &str) -> bool {
 }
 
 /// Dialect-aware [`script_has_txn_control`] — tokenizes under `dialect` so a MySQL `# COMMIT` line
-/// comment (which the generic lexer would not strip) can't hide transaction control.
+/// comment (which the generic lexer would not strip) can't hide transaction control. On MySQL a
+/// `/*! … */` executable comment is un-hidden by the tokenizer-honest neutralization in
+/// [`significant_words_in`] (its body lexes live), so a `/*! COMMIT */` is caught here as
+/// transaction control (Security review CRITICAL-1).
 pub fn script_has_txn_control_in(script: &str, dialect: GuardDialect) -> bool {
     match significant_words_in(script, dialect) {
         Some(words) => words_have_txn_control(&words),
@@ -662,7 +775,14 @@ pub fn script_references_word(script: &str, needle: &str) -> bool {
     script_references_word_in(script, needle, GuardDialect::Postgres)
 }
 
-/// Dialect-aware [`script_references_word`].
+/// Dialect-aware [`script_references_word`]. On MySQL a `/*! … */` executable comment is handled by
+/// the tokenizer-honest neutralization in [`significant_words_in`] (its body lexes as LIVE tokens),
+/// so a `boatramp_migrations` reference hidden in one is caught by the normal word scan and — unlike
+/// the txn-control / create-extension guards — classified precisely as a ledger reference rather than
+/// blanket-refused, so `OwnerDdl::guard`'s ledger-then-txn ordering reports the RIGHT reason for an
+/// executable-comment `COMMIT` vs an executable-comment ledger write (Security review CRITICAL-1). A
+/// marker that survives (neutralization can't resolve) makes `significant_words_in` return `None` →
+/// this guard fails closed anyway.
 pub fn script_references_word_in(script: &str, needle: &str, dialect: GuardDialect) -> bool {
     let needle = needle.to_ascii_lowercase();
     match significant_words_in(script, dialect) {
@@ -678,7 +798,10 @@ pub fn script_has_create_extension(script: &str) -> bool {
     script_has_create_extension_in(script, GuardDialect::Postgres)
 }
 
-/// Dialect-aware [`script_has_create_extension`].
+/// Dialect-aware [`script_has_create_extension`]. On MySQL a `/*! … */` executable comment is
+/// un-hidden by the tokenizer-honest neutralization in [`significant_words_in`] (its body lexes
+/// live), so a `/*! CREATE EXTENSION x */` is caught here as a create-extension (Security review
+/// CRITICAL-1).
 pub fn script_has_create_extension_in(script: &str, dialect: GuardDialect) -> bool {
     match significant_words_in(script, dialect) {
         Some(words) => words
@@ -819,6 +942,161 @@ mod migration_guard_tests {
             "CREATE TABLE `widget` (id int primary key)",
             GuardDialect::Mysql,
         ));
+    }
+
+    /// Security review CRITICAL-1: MySQL's `/*! … */` (and version-gated `/*!NNNNN … */`) executable
+    /// comment is EXECUTED by MySQL but dropped as an ordinary block comment by the lexer, so its
+    /// body could smuggle a `COMMIT` (S4), a `boatramp_migrations` write (S3), or a `CREATE
+    /// EXTENSION` past the word-scan guards. Under the MySQL dialect every guard must REFUSE such a
+    /// script — via BOTH the raw-marker backstop and the tokenizer-honest neutralization (each
+    /// input is caught even if the other layer were removed).
+    #[test]
+    fn mysql_executable_comment_is_refused_by_every_guard() {
+        use super::{
+            script_has_create_extension_in, script_has_txn_control_in, script_references_word_in,
+            GuardDialect,
+        };
+        // S4 — transaction control hidden in an executable comment.
+        for s in [
+            "/*! COMMIT */",
+            "/*!40000 COMMIT */",
+            "CREATE TABLE z(a int); /*! COMMIT */",
+            "/*!50000 ROLLBACK */",
+        ] {
+            assert!(
+                script_has_txn_control_in(s, GuardDialect::Mysql),
+                "MySQL must refuse txn-control in an executable comment: {s:?}"
+            );
+        }
+        // S3 — a ledger write hidden in an executable comment.
+        for s in [
+            "/*! DELETE FROM boatramp_migrations.schema_migrations */",
+            "/*!40000 DELETE FROM boatramp_migrations.schema_migrations */",
+        ] {
+            assert!(
+                script_references_word_in(s, "boatramp_migrations", GuardDialect::Mysql),
+                "MySQL must refuse a ledger reference in an executable comment: {s:?}"
+            );
+        }
+        // Extension — a `CREATE EXTENSION` hidden in an executable comment.
+        for s in [
+            "/*! CREATE EXTENSION evil */",
+            "/*!40000 CREATE EXTENSION x */",
+        ] {
+            assert!(
+                script_has_create_extension_in(s, GuardDialect::Mysql),
+                "MySQL must refuse CREATE EXTENSION in an executable comment: {s:?}"
+            );
+        }
+        // Classification precision (so the substrate/OwnerDdl ordering reports the RIGHT reason):
+        // a `/*! COMMIT */` is txn-control ONLY — not a create-extension nor a ledger reference —
+        // and a `/*! DELETE … boatramp_migrations … */` is a ledger reference ONLY. This is what a
+        // blanket byte-scan belt could not give (it would flag whichever guard runs first).
+        let commit = "CREATE TABLE z(a int); /*! COMMIT */";
+        assert!(script_has_txn_control_in(commit, GuardDialect::Mysql));
+        assert!(!script_has_create_extension_in(commit, GuardDialect::Mysql));
+        assert!(!script_references_word_in(
+            commit,
+            "boatramp_migrations",
+            GuardDialect::Mysql
+        ));
+        let ledger = "/*! DELETE FROM boatramp_migrations.schema_migrations */";
+        assert!(script_references_word_in(
+            ledger,
+            "boatramp_migrations",
+            GuardDialect::Mysql
+        ));
+        assert!(!script_has_txn_control_in(ledger, GuardDialect::Mysql));
+        assert!(!script_has_create_extension_in(ledger, GuardDialect::Mysql));
+    }
+
+    /// Security review CRITICAL-1 (the PG-unchanged assertion): Postgres/generic treats `/*! … */`
+    /// as an inert block comment (there is no executable-comment special form), so the SAME inputs
+    /// behave as before under the Postgres dialect — the comment body is dropped and NOT flagged.
+    /// This proves the CRITICAL-1 fix is scoped to `GuardDialect::Mysql` and never regresses PG.
+    #[test]
+    fn postgres_treats_executable_comment_syntax_as_inert() {
+        use super::{
+            script_has_create_extension_in, script_has_txn_control_in, script_references_word_in,
+            GuardDialect,
+        };
+        // A `/*! COMMIT */` is a plain comment on Postgres — no transaction control.
+        assert!(!script_has_txn_control_in(
+            "/*! COMMIT */",
+            GuardDialect::Postgres
+        ));
+        assert!(!script_has_txn_control_in(
+            "/*!40000 COMMIT */",
+            GuardDialect::Postgres
+        ));
+        // A ledger name inside the comment is not a reference on Postgres.
+        assert!(!script_references_word_in(
+            "/*! DELETE FROM boatramp_migrations.schema_migrations */",
+            "boatramp_migrations",
+            GuardDialect::Postgres,
+        ));
+        // A `CREATE EXTENSION` inside the comment is not flagged on Postgres.
+        assert!(!script_has_create_extension_in(
+            "/*! CREATE EXTENSION evil */",
+            GuardDialect::Postgres,
+        ));
+        // A real Postgres statement AROUND the inert comment still lexes normally (the neutralizer
+        // is never run on the PG path, so a genuine COMMIT outside the comment is still caught).
+        assert!(script_has_txn_control_in(
+            "DROP TABLE t; /*! nop */ COMMIT",
+            GuardDialect::Postgres
+        ));
+    }
+
+    /// The neutralization does not corrupt a script that merely CONTAINS the marker characters in a
+    /// place MySQL would still execute around it: a real statement before a `/*! … */` executable
+    /// comment is still lexed (`CREATE TABLE z(a int)` here is followed by the neutralized `COMMIT`),
+    /// and a genuinely benign MySQL script with no executable comment is unaffected.
+    #[test]
+    fn mysql_neutralization_preserves_surrounding_statements() {
+        use super::{
+            neutralize_mysql_executable_comments, script_has_txn_control_in, GuardDialect,
+        };
+        // The real statement survives; the executable-comment COMMIT is un-hidden and flagged.
+        assert!(script_has_txn_control_in(
+            "CREATE TABLE z(a int); /*! COMMIT */",
+            GuardDialect::Mysql
+        ));
+        // A plain MySQL script with no `/*!` is unchanged by the neutralizer.
+        assert_eq!(
+            neutralize_mysql_executable_comments("CREATE TABLE `t` (id int)").unwrap(),
+            "CREATE TABLE `t` (id int)"
+        );
+        // An unterminated executable comment fails closed (None → guards refuse).
+        assert!(neutralize_mysql_executable_comments("/*! COMMIT").is_none());
+        assert!(script_has_txn_control_in("/*! COMMIT", GuardDialect::Mysql));
+        // Non-ASCII content around a neutralized comment is preserved intact (UTF-8 safety); only
+        // the `/*!` opener (→3 spaces) and the `*/` closer (→2 spaces) are blanked, the body `x`
+        // is copied through so it lexes live.
+        assert_eq!(
+            neutralize_mysql_executable_comments("SELECT 'café' /*! x */ , 'naïve'").unwrap(),
+            "SELECT 'café'     x    , 'naïve'"
+        );
+        // TWO executable comments in one script are both un-hidden (each `COMMIT` un-hidden).
+        assert!(script_has_txn_control_in(
+            "/*! SELECT 1 */ CREATE TABLE t(a int); /*!40000 ROLLBACK */",
+            GuardDialect::Mysql
+        ));
+        // An empty-bodied `/*!*/` and a version-only `/*!40000 */` neutralize to whitespace with no
+        // smuggled token (they lex to nothing, not to a dropped-then-executed body).
+        assert_eq!(
+            neutralize_mysql_executable_comments("SELECT 1 /*!*/").unwrap(),
+            "SELECT 1      "
+        );
+        assert!(!script_has_txn_control_in(
+            "SELECT 1 /*!40000 */",
+            GuardDialect::Mysql
+        ));
+        // A `*/` with no preceding `/*!` opener is left alone (not an executable comment).
+        assert_eq!(
+            neutralize_mysql_executable_comments("SELECT 1 -- */").unwrap(),
+            "SELECT 1 -- */"
+        );
     }
 }
 

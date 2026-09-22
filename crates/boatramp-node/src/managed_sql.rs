@@ -557,9 +557,17 @@ impl NodeOperatorSql {
     /// user gets `GRANT ALL ON <db>.*`, so it is itself DDL-capable within its schema); running
     /// migration DDL as that runtime tenant identity would violate the surface's core safety
     /// (`DDL runs as a non-runtime identity`). So the DDL identity must be supplied **explicitly**
-    /// via `migration_url_env`, and it must be **distinct** from the runtime binding. Absent it —
-    /// or if it resolves to the very same URL as the runtime `url_env` — we **refuse** fail-closed
-    /// rather than run owner-DDL as the runtime user (there is no owner-role fallback on MySQL).
+    /// via `migration_url_env`, and it must be a **distinct login** from the runtime binding. Absent
+    /// it — or if it resolves to the same URL, or authenticates as the same **username**, as the
+    /// runtime `url_env` — we **refuse** fail-closed rather than run owner-DDL as the runtime user
+    /// (there is no owner-role fallback on MySQL). The distinctness invariant is "DDL login ≠ runtime
+    /// tenant login," not "different string" ([Security review HIGH-1]) — two equivalent DSNs that
+    /// authenticate as the same user are treated as the same identity.
+    ///
+    /// A **compute-backed managed** MySQL binding (`compute` set, empty `url_env`) is **refused
+    /// outright** this release ([Security review HIGH-2]): there is no runtime URL to check the DDL
+    /// identity against, and boatramp cannot yet auto-mint a distinct least-privilege DDL grant for a
+    /// managed MySQL database — so running migration DDL for it would skip the distinctness barrier.
     ///
     /// The DDL URL is read from the environment (the operator supplies an admin/DDL login DSN,
     /// e.g. a purpose-made `_migrate` grant or an admin account), never from anything a guest
@@ -573,6 +581,23 @@ impl NodeOperatorSql {
             .databases
             .get(db)
             .ok_or_else(|| SqlError::other(format!("no database named {db:?}")))?;
+
+        // [Security review HIGH-2] A **compute-backed managed** MySQL binding (`compute` set, no
+        // runtime `url_env`) gets NO distinctness enforcement in the block below (there is no
+        // runtime URL to compare against), and boatramp cannot yet auto-mint a distinct
+        // least-privilege DDL identity for a managed MySQL database. Rather than run migration DDL
+        // as an under-checked identity, refuse it fail-closed this release. (Auto-minting a
+        // `<db>_migrate` grant is a documented follow-up.)
+        let compute_backed = cfg.compute.as_deref().is_some_and(|c| !c.is_empty());
+        if compute_backed && cfg.url_env.is_empty() {
+            return Err(SqlError::other(format!(
+                "database {db:?}: compute-backed managed MySQL migration is not supported this \
+                 release: boatramp cannot yet auto-derive a distinct least-privilege DDL identity \
+                 for a managed MySQL database; use an external MySQL binding with a distinct \
+                 `migration_url_env`, or await the auto-minted DDL-grant follow-up"
+            )));
+        }
+
         let migration_var = cfg
             .migration_url_env
             .as_deref()
@@ -592,8 +617,12 @@ impl NodeOperatorSql {
         })?;
 
         // Fail closed if the DDL URL is the SAME identity as the runtime binding. For a
-        // bring-your-own-URL binding the runtime identity IS `url_env`; a compute-backed binding
-        // has no runtime URL (its identity is the managed `user`), so any distinct DDL URL is fine.
+        // bring-your-own-URL binding the runtime identity IS `url_env` (a compute-backed managed
+        // binding was already refused above). The invariant is "DDL login ≠ runtime tenant login,"
+        // NOT "different string" ([Security review HIGH-1]) — so parse both DSNs and refuse when the
+        // **username** matches (two equivalent DSNs like `…/db` vs `…/db?charset=utf8` authenticate
+        // as the same user). The byte-equality check is kept as an additional cheap catch; a DSN
+        // that won't parse falls back to it (fail-closed on the strictest available signal).
         if !cfg.url_env.is_empty() {
             if let Ok(runtime_url) = std::env::var(&cfg.url_env) {
                 if runtime_url == ddl_url {
@@ -602,6 +631,25 @@ impl NodeOperatorSql {
                          runtime `url_env` — the MySQL DDL identity must be distinct from the runtime \
                          user (refused fail-closed)"
                     )));
+                }
+                // The username-distinctness parse needs sqlx's MySQL DSN parser (the `sql-mysql`
+                // feature). A MySQL binding can only actually connect under that feature anyway (the
+                // `connect(Mysql, …)` below refuses without it), so a `sql-postgres`-only build keeps
+                // just the byte-equality catch above — it can never run MySQL DDL regardless.
+                #[cfg(feature = "sql-mysql")]
+                {
+                    let ddl_user = boatramp_storage::sql_sqlx::mysql_dsn_username(&ddl_url);
+                    let runtime_user = boatramp_storage::sql_sqlx::mysql_dsn_username(&runtime_url);
+                    if let (Some(ddl_user), Some(runtime_user)) = (&ddl_user, &runtime_user) {
+                        if ddl_user == runtime_user {
+                            return Err(SqlError::other(format!(
+                                "database {db:?}: `migration_url_env` authenticates as the SAME \
+                                 MySQL user ({ddl_user:?}) as the runtime `url_env` — the DDL login \
+                                 must be a DISTINCT identity from the runtime tenant login (refused \
+                                 fail-closed)"
+                            )));
+                        }
+                    }
                 }
             }
         }
@@ -938,9 +986,14 @@ pub struct NodeMigrationRunner {
 ///   `grant_app_role_ddl`) has no access: the ledger is append-only from the app's perspective by
 ///   schema isolation.
 /// - **MySQL** — a separate DATABASE `boatramp_migrations` (MySQL has no schema-within-database
-///   namespace), created + owned by the DDL identity. The runtime tenant user was granted only
-///   `<its-db>.*`, so it has NO privilege on the `boatramp_migrations` database at all — the same
-///   append-only-by-isolation property, by database grant rather than schema grant.
+///   namespace), created + owned by the DDL identity. The append-only-by-isolation property holds
+///   for the **runtime tenant user** only: it was granted `GRANT … ON <its-db>.*`, so it has NO
+///   privilege on the `boatramp_migrations` database at all. It does **NOT** hold for the DDL/root
+///   login the migrate path (and the guest `migrate-ddl` seam) uses — that identity reaches
+///   `boatramp_migrations` fully (it created + owns it), so on MySQL the S3 ledger-schema guard
+///   ([`mentions_ledger_schema`], which refuses any step touching `boatramp_migrations`) is the
+///   **sole** barrier protecting the ledger from the DDL identity, not belt-and-braces with the
+///   grant isolation (which only fences the runtime user).
 #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
 const LEDGER_SCHEMA: &str = "boatramp_migrations";
 #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
@@ -2227,6 +2280,133 @@ mod tests {
         assert!(
             msg.contains("MIGRATE_URL_ENV_MISSING") && msg.contains("unset"),
             "an unset migration url env must be reported clearly: {msg}"
+        );
+    }
+
+    /// A [`NodeMigrationRunner`] over a single MySQL binding whose runtime `url_env` and
+    /// `migration_url_env` are the NAMED env vars, so a test can vary each independently (the shared
+    /// `op_for` hardcodes `RUNTIME_URL_ENV`, which would race across parallel env-mutating tests).
+    #[cfg(feature = "sql-mysql")]
+    fn mysql_runner_with_env(runtime_env: &str, migrate_env: &str) -> NodeMigrationRunner {
+        use crate::config::{TenantIsolation, TenantScope};
+        let mut databases = BTreeMap::new();
+        databases.insert(
+            "main".to_string(),
+            ExternalDatabaseConfig {
+                kind: "mysql".to_string(),
+                url_env: runtime_env.to_string(),
+                migration_url_env: Some(migrate_env.to_string()),
+                pool_max: Some(2),
+                read_only: false,
+                connect_timeout_secs: Some(5),
+                tenant: TenantIsolation::Shared,
+                tenant_scope: TenantScope::Project,
+                ..Default::default()
+            },
+        );
+        runner_over(Arc::new(NodeOperatorSql::new(
+            databases,
+            Arc::new(MemoryKv::new()),
+            None,
+            DeployStore::new(Arc::new(NullStorage), Arc::new(MemoryKv::new())),
+        )))
+    }
+
+    /// [Security review HIGH-1] Distinctness is by **login username**, not byte-equality: a DDL DSN
+    /// that authenticates as the SAME MySQL user as the runtime DSN is refused even when the two
+    /// strings differ (equivalent DSNs — added query param, omitted default port, trailing `/`). A
+    /// genuinely different username is allowed through the distinctness check (it then fails later
+    /// only because there is no live DB, which is not this refusal).
+    #[cfg(feature = "sql-mysql")]
+    #[tokio::test]
+    async fn mysql_refuses_same_username_even_when_dsn_strings_differ() {
+        // Each pair: (runtime DSN, DDL DSN) that are byte-different but the SAME user → REFUSED.
+        let same_user_pairs = [
+            // Added `?charset=…` query param.
+            (
+                "mysql://app:pw@host:3306/db",
+                "mysql://app:pw@host:3306/db?charset=utf8",
+            ),
+            // Default port present vs omitted.
+            ("mysql://app:pw@host:3306/db", "mysql://app:pw@host/db"),
+            // Trailing slash / no database segment.
+            ("mysql://app:pw@host:3306/db", "mysql://app:pw@host:3306/"),
+            // Same user, different password (still the same LOGIN identity for our purposes).
+            (
+                "mysql://app:pw@host/db",
+                "mysql://app:other@host:3306/otherdb",
+            ),
+        ];
+        for (i, (runtime, ddl)) in same_user_pairs.iter().enumerate() {
+            let rvar = format!("HIGH1_RT_{i}");
+            let mvar = format!("HIGH1_DDL_{i}");
+            std::env::set_var(&rvar, runtime);
+            std::env::set_var(&mvar, ddl);
+            let sub = mysql_runner_with_env(&rvar, &mvar);
+            let err = sub.preflight("default", "main").await.unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("SAME MySQL user") || msg.contains("SAME connection"),
+                "same-username DSNs {runtime:?} vs {ddl:?} must be refused: {msg}"
+            );
+            std::env::remove_var(&rvar);
+            std::env::remove_var(&mvar);
+        }
+    }
+
+    /// [Security review HIGH-1] A genuinely DISTINCT username passes the distinctness check (it does
+    /// NOT trip the same-user / same-connection refusal). It then fails only because no live MySQL
+    /// is reachable — proving the refusal we assert against is the username barrier, not a connect
+    /// failure.
+    #[cfg(feature = "sql-mysql")]
+    #[tokio::test]
+    async fn mysql_allows_a_distinct_ddl_username() {
+        // A connection-refused loopback port keeps the (expected) connect failure fast + offline.
+        std::env::set_var("HIGH1_RT_OK", "mysql://app:pw@127.0.0.1:1/db");
+        std::env::set_var("HIGH1_DDL_OK", "mysql://root_migrate:pw@127.0.0.1:1/db");
+        let sub = mysql_runner_with_env("HIGH1_RT_OK", "HIGH1_DDL_OK");
+        // preflight will try to connect lazily; with no live DB it errors, but NOT with the
+        // distinctness refusal — that is the point of this test.
+        let err = sub.preflight("default", "main").await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("SAME MySQL user") && !msg.contains("SAME connection"),
+            "a distinct DDL username must pass the distinctness barrier: {msg}"
+        );
+        std::env::remove_var("HIGH1_RT_OK");
+        std::env::remove_var("HIGH1_DDL_OK");
+    }
+
+    /// [Security review HIGH-2] A **compute-backed managed** MySQL binding (`compute` set, empty
+    /// `url_env`) is refused outright for migration — boatramp cannot yet auto-derive a distinct
+    /// least-privilege DDL identity, so the distinctness barrier can't be enforced and we fail
+    /// closed rather than run DDL under-checked. The error names the unsupported case and the
+    /// remedy.
+    #[cfg(feature = "sql-mysql")]
+    #[tokio::test]
+    async fn mysql_refuses_compute_backed_managed_migration() {
+        use crate::config::{TenantIsolation, TenantScope};
+        let mut databases = BTreeMap::new();
+        // Compute-backed managed: `compute` set, empty `url_env`, no `password_env` (managed cred).
+        let mut cfg = db("mysql", Some("my-compute"), "", None);
+        cfg.tenant = TenantIsolation::Shared;
+        cfg.tenant_scope = TenantScope::Project;
+        // Even if an operator ALSO set a migration_url_env, a compute-backed managed binding is
+        // still refused this release (the runtime identity is the managed per-tenant user, which we
+        // have no runtime URL to compare against).
+        cfg.migration_url_env = Some("SOME_DDL_URL".to_string());
+        databases.insert("main".to_string(), cfg);
+        let sub = runner_over(Arc::new(NodeOperatorSql::new(
+            databases,
+            Arc::new(MemoryKv::new()),
+            None,
+            DeployStore::new(Arc::new(NullStorage), Arc::new(MemoryKv::new())),
+        )));
+        let err = sub.preflight("default", "main").await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("compute-backed managed MySQL migration is not supported"),
+            "compute-backed managed MySQL migrate must be refused fail-closed: {msg}"
         );
     }
 

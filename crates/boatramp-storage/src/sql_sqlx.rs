@@ -1204,6 +1204,24 @@ mod mysql_backend {
     }
 }
 
+/// The **login username** a MySQL connection `dsn` authenticates as, parsed with sqlx's own
+/// [`MySqlConnectOptions`](sqlx::mysql::MySqlConnectOptions) so it is byte-identical to what the pool
+/// would actually connect with (Security review HIGH-1: the DDL-vs-runtime distinctness check is
+/// "different login," not "different string" — two equivalent DSNs like `…/db` vs `…/db?charset=utf8`
+/// authenticate as the SAME user and must be treated as the same identity).
+///
+/// A DSN that omits the userinfo parses (per MySQL) as the default `root` login, so two
+/// user-omitting DSNs both resolve to `root` and correctly compare equal — the fail-closed direction.
+/// Returns `None` if the DSN is malformed (the caller then fails closed).
+#[cfg(feature = "sql-mysql")]
+pub fn mysql_dsn_username(dsn: &str) -> Option<String> {
+    use sqlx::mysql::MySqlConnectOptions;
+    use std::str::FromStr;
+    MySqlConnectOptions::from_str(dsn)
+        .ok()
+        .map(|o| o.get_username().to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1237,6 +1255,45 @@ mod tests {
     fn kind_reports_its_feature() {
         assert_eq!(ExternalSqlKind::Postgres.feature(), "sql-postgres");
         assert_eq!(ExternalSqlKind::Mysql.feature(), "sql-mysql");
+    }
+
+    /// [Security review HIGH-1] `mysql_dsn_username` extracts the LOGIN username sqlx would actually
+    /// authenticate with, so two byte-different-but-equivalent DSNs resolve to the SAME user (the
+    /// distinctness check compares logins, not strings), a distinct user resolves distinctly, and a
+    /// user-omitting DSN resolves to MySQL's default `root`.
+    #[cfg(feature = "sql-mysql")]
+    #[test]
+    fn mysql_dsn_username_is_login_equivalent_not_string_equal() {
+        // Same user across equivalent DSNs.
+        assert_eq!(
+            mysql_dsn_username("mysql://app:pw@host:3306/db").as_deref(),
+            Some("app")
+        );
+        assert_eq!(
+            mysql_dsn_username("mysql://app:pw@host:3306/db?charset=utf8").as_deref(),
+            Some("app")
+        );
+        assert_eq!(
+            mysql_dsn_username("mysql://app:pw@host/db").as_deref(),
+            Some("app")
+        );
+        assert_eq!(
+            mysql_dsn_username("mysql://app:pw@host:3306/").as_deref(),
+            Some("app")
+        );
+        // A distinct user resolves distinctly.
+        assert_eq!(
+            mysql_dsn_username("mysql://root_migrate:pw@host/db").as_deref(),
+            Some("root_migrate")
+        );
+        // A user-omitting DSN is MySQL's default `root` (so two user-less DSNs compare equal — the
+        // fail-closed direction for the distinctness check).
+        assert_eq!(
+            mysql_dsn_username("mysql://host:3306/db").as_deref(),
+            Some("root")
+        );
+        // A malformed DSN yields None (caller falls back to the byte-equality catch / fails closed).
+        assert_eq!(mysql_dsn_username("not a url"), None);
     }
 
     #[test]
