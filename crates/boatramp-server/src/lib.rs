@@ -215,13 +215,14 @@ pub(crate) use serve_pipeline::{
 /// control-plane root keys behind the [`boatramp_core::cose::Signer`] seam.
 pub mod signer;
 mod srvmetrics;
-#[cfg(all(feature = "handlers", test))]
-use scheduler::run_scheduler_tick;
 #[cfg(feature = "handlers")]
 pub(crate) use scheduler::{
     acquire_site_permit, effective_limits, handler_error_response, handler_unavailable,
     sql_starting_response, CronNow,
 };
+#[cfg(all(feature = "handlers", test))]
+#[cfg(feature = "handlers")]
+use scheduler::{run_scheduler_tick, AsyncPass};
 #[cfg(feature = "handlers")]
 use scheduler::{CONSUMER_BATCH, CONSUMER_LEASE, CONSUMER_MAX_ATTEMPTS};
 #[cfg(feature = "handlers")]
@@ -325,6 +326,20 @@ struct HandlerRuntimeInner {
     /// always fires. Consumers are *not* gated — leased dispatch distributes
     /// them across nodes.
     cron_leader_gate: std::sync::OnceLock<CronLeaderGate>,
+    /// Optional **async-lane shard gate** (B10): in cluster mode the scheduler drains a function's
+    /// async invocations / crons / blob watchers on exactly the ONE node that HRW-owns the function
+    /// identity, so the leader is no longer the single async funnel. "Do I own this key?" — the key
+    /// is `{project}/{function}` (or `{project}/{site}#cron:{id}` for a site-level cron). `None`
+    /// (single node / unset / a non-CAS backend) ⇒ own everything, so single-node behavior is
+    /// byte-for-byte unchanged and a backend without a linearizable CAS stays leader-gated.
+    ///
+    /// This is a TEST/wiring **override**; the production gate is derived from the messaging
+    /// substrate's `shard_owns` (the same applied-membership HRW the topic drainer uses) — see
+    /// [`HandlerRuntimeInner::async_shard_owns`], which prefers this override when set and otherwise
+    /// consults `messaging`. NEVER a correctness gate: a transient wrong answer during a membership
+    /// change costs a redundant/absent scan, and the CAS claim + the unsharded safety-net keep
+    /// at-least-once intact (Invariants 1+2).
+    async_shard_gate: std::sync::OnceLock<AsyncShardGate>,
     /// Max bytes a `wasi:blobstore` host read/range/copy may buffer (`0` =
     /// unlimited), from the security posture. Set once at serve
     /// startup via [`HandlerRuntime::set_max_blob_bytes`]; unset reads as `0`.
@@ -511,11 +526,66 @@ impl HandlerRuntimeInner {
     fn delivery_config(&self) -> DeliveryConfig {
         self.delivery_config.get().copied().unwrap_or_default()
     }
+
+    /// **Does THIS node own the async-lane work for `key`?** (B10 — the async-lane shard gate.) The
+    /// key is a function/cron identity (see [`async_shard_key_function`]/[`async_shard_key_site_cron`]).
+    ///
+    /// Resolution order:
+    /// 1. A test/wiring **override** ([`async_shard_gate`](Self::async_shard_gate)) if set.
+    /// 2. Otherwise the messaging substrate's applied-membership HRW ([`Messaging::shard_owns`]) — the
+    ///    SAME assignment the Phase-D topic drainer uses, so async work and topic delivery agree on
+    ///    ownership per node.
+    ///
+    /// Fail-safe defaults to **own-all** (`true`) whenever sharding can't be applied safely, so the
+    /// single-node path is byte-for-byte unchanged and a fleet on a non-linearizable-CAS backend
+    /// stays leader-gated (Invariant: never shard a claim we can't make race-safe — B18):
+    /// - no messaging substrate (nothing to derive an assignment from), or
+    /// - the KV backend has no linearizable CAS (`!supports_invocation_cas`) — sharding would open the
+    ///   double-owner window with a plain read-then-write claim, which is exactly the double-execution
+    ///   hazard. The drain stays owns-all/leader-gated there instead.
+    #[cfg(feature = "handlers")]
+    async fn async_shard_owns(&self, deploy: &DeployStore, key: &str) -> bool {
+        if let Some(gate) = self.async_shard_gate.get() {
+            return gate(key);
+        }
+        // Only shard when the claim can be made race-safe by a linearizable CAS (B10); otherwise own
+        // all so a plain read-then-write claim never races a second node.
+        if !deploy.supports_invocation_cas() {
+            return true;
+        }
+        match &self.messaging {
+            Some(m) => m.shard_owns(key).await,
+            None => true,
+        }
+    }
 }
 
 /// Predicate gating cron firing to the cluster leader (see
 /// [`HandlerRuntime::set_cron_leader_gate`]).
 pub type CronLeaderGate = Arc<dyn Fn() -> bool + Send + Sync>;
+
+/// Predicate answering "does THIS node own the async-lane work for `key`?" (B10 async-lane sharding),
+/// keyed on function identity (`{project}/{function}`, or `{project}/{site}#cron:{id}` for a
+/// site-level cron). A test/wiring override for [`HandlerRuntime::set_async_shard_gate`]; the
+/// production gate is normally derived from the messaging substrate's applied-membership HRW
+/// (`shard_owns`). Returning `true` for a key = own it (drain/fire/watch it here). Unset ⇒ own all.
+pub type AsyncShardGate = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
+/// The async-lane ownership key (B10) for a **top-level function**: `{project}/{function}`. All of a
+/// function's invocations, crons, and blob watchers HRW-own to one node via this key, so they stay
+/// colocated (the drain, the cron that enqueues into it, and the watcher that feeds it are one shard).
+#[cfg(feature = "handlers")]
+pub(crate) fn async_shard_key_function(project: &str, function: &str) -> String {
+    format!("{project}/{function}")
+}
+
+/// The async-lane ownership key (B10) for a **site-level cron** (not function-bound):
+/// `{project}/{site}#cron:{idx}`. Distinct keyspace from a function key so a site's crons shard
+/// independently of any same-named function.
+#[cfg(feature = "handlers")]
+pub(crate) fn async_shard_key_site_cron(project: &str, site: &str, idx: usize) -> String {
+    format!("{project}/{site}#cron:{idx}")
+}
 
 impl HandlerRuntime {
     /// An empty runtime — handler dispatch disabled (the static path is unchanged).
@@ -555,6 +625,7 @@ impl HandlerRuntime {
                 #[cfg(feature = "handlers")]
                 graphql_cache: graphql_cache::GraphqlCache::default(),
                 cron_leader_gate: std::sync::OnceLock::new(),
+                async_shard_gate: std::sync::OnceLock::new(),
                 max_blob_bytes: std::sync::OnceLock::new(),
                 max_component_bytes: std::sync::OnceLock::new(),
                 allow_env_secret_refs: std::sync::OnceLock::new(),
@@ -896,6 +967,18 @@ impl HandlerRuntime {
     pub fn set_cron_leader_gate(&self, gate: CronLeaderGate) {
         if let Some(inner) = self.inner.as_ref() {
             let _ = inner.cron_leader_gate.set(gate);
+        }
+    }
+
+    /// Override the **async-lane shard gate** (B10) with an explicit "do I own this key?" predicate,
+    /// bypassing the messaging-derived default. Set once at startup; a no-op runtime ignores it.
+    /// Mainly for tests + embedders that shard the async lane on their own assignment; the normal
+    /// cluster path leaves it unset and lets [`HandlerRuntimeInner::async_shard_owns`] derive
+    /// ownership from the messaging substrate's applied-membership HRW.
+    #[cfg(feature = "handlers")]
+    pub fn set_async_shard_gate(&self, gate: AsyncShardGate) {
+        if let Some(inner) = self.inner.as_ref() {
+            let _ = inner.async_shard_gate.set(gate);
         }
     }
 
@@ -3609,6 +3692,7 @@ mod tests {
                 &mut sweep,
                 now,
                 ConsumerFilter::All,
+                AsyncPass::Legacy,
             )
             .await
             .unwrap();
@@ -5104,7 +5188,7 @@ mod tests {
     /// queue would never drain at all.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn scheduler_drains_a_non_default_projects_invocation_in_its_own_tenant() {
-        use crate::scheduler::{run_scheduler_tick, ConsumerFilter, CronNow};
+        use crate::scheduler::{run_scheduler_tick, AsyncPass, ConsumerFilter, CronNow};
         use boatramp_core::deploy::DeployStore;
         use boatramp_core::function::{
             Function, FunctionVersion, Invocation, InvocationStatus, InvokeMode, Lifecycle, Owner,
@@ -5182,6 +5266,7 @@ mod tests {
             &mut sweep,
             now,
             ConsumerFilter::All,
+            AsyncPass::Legacy,
         )
         .await
         .unwrap();
@@ -5239,7 +5324,7 @@ mod tests {
     #[cfg(feature = "handlers")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn drain_reclaims_an_expired_lease_and_skips_a_live_one() {
-        use crate::scheduler::{run_scheduler_tick, ConsumerFilter, CronNow};
+        use crate::scheduler::{run_scheduler_tick, AsyncPass, ConsumerFilter, CronNow};
         use boatramp_core::deploy::DeployStore;
         use boatramp_core::function::{
             Function, FunctionVersion, Invocation, InvocationStatus, InvokeMode, Lifecycle, Owner,
@@ -5335,6 +5420,7 @@ mod tests {
             &mut sweep,
             now,
             ConsumerFilter::All,
+            AsyncPass::Legacy,
         )
         .await
         .unwrap();
@@ -5569,6 +5655,7 @@ mod tests {
             &mut sweep,
             at(100),
             ConsumerFilter::All,
+            AsyncPass::Legacy,
         )
         .await
         .unwrap();
@@ -5586,6 +5673,7 @@ mod tests {
             &mut sweep,
             at(100),
             ConsumerFilter::All,
+            AsyncPass::Legacy,
         )
         .await
         .unwrap();
@@ -5601,6 +5689,7 @@ mod tests {
             &mut sweep,
             at(101),
             ConsumerFilter::All,
+            AsyncPass::Legacy,
         )
         .await
         .unwrap();
@@ -5625,6 +5714,7 @@ mod tests {
             &mut sweep,
             at(102),
             ConsumerFilter::All,
+            AsyncPass::Legacy,
         )
         .await
         .unwrap();
@@ -5733,6 +5823,7 @@ mod tests {
             &mut sweep,
             now,
             ConsumerFilter::All,
+            AsyncPass::Legacy,
         )
         .await
         .unwrap();

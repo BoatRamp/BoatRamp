@@ -112,6 +112,60 @@ pub trait KvStore: Send + Sync {
         Ok(())
     }
 
+    /// Whether [`compare_and_swap`](Self::compare_and_swap) is a **linearizable** compare-and-set —
+    /// the read-of-`expected` and the conditional write happen as ONE atomic step with respect to
+    /// every other writer, so two racing swappers of the same key can never both succeed. The default
+    /// is `false`: the default `compare_and_swap` is a best-effort read-then-write, which is safe only
+    /// where there is a single logical writer (a single-node scheduler serializes its own drains), NOT
+    /// across concurrent nodes.
+    ///
+    /// This is the **hard prerequisite for the async-lane shard's CAS claim (B10)**: with the async
+    /// drain sharded, the old and new owner of a function may briefly both run its drain (the
+    /// double-owner window), and only a linearizable CAS on the invocation record guarantees at most
+    /// one node transitions a `Queued`/expired-`Running` invocation to `Running`. A backend that
+    /// returns `false` here MUST keep the async drain leader-gated (owns-all, today's behavior) rather
+    /// than shard it — see the server's `async_shard_gate`, which keys the shard fast-path on this.
+    /// Fail-closed: an unsure backend inherits the default `false` and simply stays unsharded.
+    ///
+    /// Backends whose CAS is genuinely atomic override this to `true`: [`MemoryKv`] (under its lock),
+    /// SlateDB (a single-writer process serialized by an in-process CAS mutex), and the Raft state
+    /// machine (a single leader-serialized apply). A non-transactional remote KV (Cloudflare KV) keeps
+    /// the default `false`.
+    fn supports_cas(&self) -> bool {
+        false
+    }
+
+    /// **Compare-and-set** `key`: write `new` IFF the current value equals `expected` (`None` =
+    /// "expect the key absent"), returning `true` when the swap happened and `false` when the observed
+    /// value did not match (so the caller lost the race / the record moved on).
+    ///
+    /// The default is a **best-effort** read-then-write: it reads the current value, compares, and
+    /// writes if it matches — atomic per key, but the read and the write are two operations, so a
+    /// second writer can interleave between them. That is safe ONLY on a single-writer node (the async
+    /// drain runs from one scheduler loop, and a single-node deployment has exactly one process
+    /// writing invocation records). It is NOT safe across concurrent cluster nodes — which is exactly
+    /// why [`supports_cas`](Self::supports_cas) gates the sharded fast-path, and a backend without a
+    /// linearizable CAS stays leader-gated (owns-all). See B10.
+    ///
+    /// Callers compare on the EXACT prior bytes they read (whole-record equality), so any concurrent
+    /// mutation — a claim by another node, a settle, a redeploy — changes the bytes and the CAS
+    /// correctly fails. `expected: None` is a create-if-absent (used for idempotent first writes).
+    async fn compare_and_swap(
+        &self,
+        key: &str,
+        expected: Option<&[u8]>,
+        new: Vec<u8>,
+    ) -> Result<bool, KvError> {
+        // Best-effort default: read, compare, write-if-matched. Atomic only under a single logical
+        // writer (see the method + `supports_cas` docs). A linearizable backend overrides this.
+        let current = self.get(key).await?;
+        if current.as_deref() != expected {
+            return Ok(false);
+        }
+        self.put(key, new).await?;
+        Ok(true)
+    }
+
     /// A **durability-relaxed** grouped write: the same atomic group as
     /// [`write_batch`](Self::write_batch), but the backend MAY acknowledge on an
     /// in-memory buffer insert **before** the write is durably persisted (the flush
@@ -232,6 +286,29 @@ impl KvStore for MemoryKv {
         // it, and there is no crash boundary within an in-memory store — so its batch is atomic and
         // the ready-set fast path (B2) is safe over it.
         true
+    }
+
+    fn supports_cas(&self) -> bool {
+        // The compare + swap below happen under one mutex, so it is a linearizable CAS: two racing
+        // swappers of the same key can never both win. Safe for the async-lane shard's claim (B10).
+        true
+    }
+
+    async fn compare_and_swap(
+        &self,
+        key: &str,
+        expected: Option<&[u8]>,
+        new: Vec<u8>,
+    ) -> Result<bool, KvError> {
+        // Compare + conditional insert under ONE lock — no other writer can interleave, so this is a
+        // true atomic CAS (unlike the trait default's separate read-then-write).
+        let mut map = self.inner.lock().unwrap();
+        let current = map.get(key).map(|v| v.as_slice());
+        if current != expected {
+            return Ok(false);
+        }
+        map.insert(key.to_string(), new);
+        Ok(true)
     }
 
     async fn write_batch(&self, ops: Vec<WriteOp>) -> Result<(), KvError> {
@@ -382,6 +459,33 @@ impl KvStore for CachedKv {
         // The cache is a pure read-through mirror; the backing store's batch is the atomic/durable
         // one (`commit_then_mirror` commits it FIRST). So the cache is as atomic as its inner store.
         self.inner.atomic_write_batch()
+    }
+
+    fn supports_cas(&self) -> bool {
+        // The cache never serves the CAS compare (the override below goes straight to the inner
+        // store, whose value is authoritative), so the CAS is as atomic as the inner store's.
+        self.inner.supports_cas()
+    }
+
+    async fn compare_and_swap(
+        &self,
+        key: &str,
+        expected: Option<&[u8]>,
+        new: Vec<u8>,
+    ) -> Result<bool, KvError> {
+        // The CAS compare MUST run against the backing store's authoritative value, never the LRU
+        // (a stale cached value would make the compare wrong and could double-swap). So forward the
+        // whole CAS to the inner store, then mirror the new value into the cache only on success —
+        // a lost CAS leaves the cache untouched, and a failed inner call never advances it.
+        let swapped = self
+            .inner
+            .compare_and_swap(key, expected, new.clone())
+            .await?;
+        if swapped {
+            self.cache.lock().unwrap().put(key.to_string(), new);
+            self.announce(vec![key.to_string()]).await;
+        }
+        Ok(swapped)
     }
 
     async fn write_batch(&self, ops: Vec<WriteOp>) -> Result<(), KvError> {
@@ -556,6 +660,82 @@ mod tests {
             .unwrap();
         assert_eq!(store.get("k/2").await.unwrap(), Some(b"two".to_vec()));
         assert_eq!(store.get("k/empty").await.unwrap(), None);
+
+        // compare_and_swap (B10) — the same semantics on every backend, atomic or best-effort.
+        // Create-if-absent: expected=None swaps only when the key is missing.
+        assert!(
+            store
+                .compare_and_swap("cas/k", None, b"v1".to_vec())
+                .await
+                .unwrap(),
+            "expected-absent CAS on a missing key swaps"
+        );
+        assert_eq!(store.get("cas/k").await.unwrap(), Some(b"v1".to_vec()));
+        assert!(
+            !store
+                .compare_and_swap("cas/k", None, b"v2".to_vec())
+                .await
+                .unwrap(),
+            "expected-absent CAS on a present key does NOT swap"
+        );
+        assert_eq!(store.get("cas/k").await.unwrap(), Some(b"v1".to_vec()));
+        // Match on the exact prior bytes swaps; a stale expected does not.
+        assert!(
+            !store
+                .compare_and_swap("cas/k", Some(b"WRONG"), b"v3".to_vec())
+                .await
+                .unwrap(),
+            "CAS with a non-matching expected leaves the value"
+        );
+        assert_eq!(store.get("cas/k").await.unwrap(), Some(b"v1".to_vec()));
+        assert!(
+            store
+                .compare_and_swap("cas/k", Some(b"v1"), b"v4".to_vec())
+                .await
+                .unwrap(),
+            "CAS with the matching expected swaps"
+        );
+        assert_eq!(store.get("cas/k").await.unwrap(), Some(b"v4".to_vec()));
+    }
+
+    /// The atomic-CAS race property (B10): with a linearizable `compare_and_swap`, exactly one of
+    /// many racing swappers of the same key from the same observed value wins — the primitive the
+    /// async-lane shard claim is built on. Runs only against a backend that advertises
+    /// [`KvStore::supports_cas`]; a best-effort backend is exercised by the single-writer suite above.
+    async fn cas_race_has_exactly_one_winner(store: Arc<dyn KvStore>) {
+        if !store.supports_cas() {
+            return;
+        }
+        store.put("race/k", b"start".to_vec()).await.unwrap();
+        // 32 tasks all try to swap start→<their id>; a linearizable CAS admits exactly one.
+        let mut set = tokio::task::JoinSet::new();
+        for i in 0..32u32 {
+            let store = store.clone();
+            set.spawn(async move {
+                store
+                    .compare_and_swap("race/k", Some(b"start"), i.to_le_bytes().to_vec())
+                    .await
+                    .unwrap()
+            });
+        }
+        let mut wins = 0;
+        while let Some(res) = set.join_next().await {
+            if res.unwrap() {
+                wins += 1;
+            }
+        }
+        assert_eq!(wins, 1, "exactly one racing CAS wins");
+    }
+
+    #[tokio::test]
+    async fn memorykv_cas_race_has_exactly_one_winner() {
+        cas_race_has_exactly_one_winner(Arc::new(MemoryKv::new())).await;
+    }
+
+    #[tokio::test]
+    async fn cachedkv_cas_race_has_exactly_one_winner() {
+        cas_race_has_exactly_one_winner(Arc::new(CachedKv::new(Arc::new(MemoryKv::new()), 16)))
+            .await;
     }
 
     #[tokio::test]
