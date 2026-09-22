@@ -421,7 +421,12 @@ impl Right {
             "/api/certs" => Self::new(Resource::Certs, None, Action::Read),
             "/api/cache/invalidate" => Self::new(Resource::Cache, None, Action::Write),
             "/api/metrics" => Self::new(Resource::System, None, Action::Read),
-            "/api/prune" | "/api/scrub" => Self::new(Resource::System, None, Action::Admin),
+            // Prune/scrub are node-level destructive maintenance ops; so is a libsql
+            // database relocation (`sql move`, which vacuums a copy and removes the
+            // source file). All three gate at `system·admin`.
+            "/api/prune" | "/api/scrub" | "/api/sql-move" => {
+                Self::new(Resource::System, None, Action::Admin)
+            }
             p if p == "/api/tokens" || p.starts_with("/api/tokens/") => {
                 Self::new(Resource::Tokens, None, Action::Admin)
             }
@@ -1253,6 +1258,13 @@ mod tests {
             (
                 "POST",
                 "/api/scrub",
+                Some(Right::new(Resource::System, None, Action::Admin)),
+            ),
+            // Relocating a libsql database is a node-level destructive maintenance
+            // op → `system·admin`, alongside prune/scrub.
+            (
+                "POST",
+                "/api/sql-move",
                 Some(Right::new(Resource::System, None, Action::Admin)),
             ),
             (

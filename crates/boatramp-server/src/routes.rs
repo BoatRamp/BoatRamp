@@ -240,6 +240,11 @@ pub fn router_with_fast(
         .route("/api/cluster/promote", post(cluster_promote))
         .route("/api/prune", get(prune_report).post(prune_delete))
         .route("/api/scrub", post(scrub_blobs))
+        // Relocate a libsql database (`(project, site, from)` → `to`), data intact —
+        // a destructive, node-level maintenance op like prune/scrub, so gated at
+        // `system·admin` in `authz::Right::required`. Local single-node only; a
+        // remote/sqld backend is refused with a typed error.
+        .route("/api/sql-move", post(sql_move))
         .route("/api/certs", get(cert_status))
         .route("/api/cache/invalidate", post(invalidate_cache))
         .route(
@@ -581,6 +586,16 @@ pub fn router_with_fast(
     // from identical state. `handlers` is bound as its `Arc` here so the layer below and the
     // bypass share one runtime.
     let handlers = Arc::new(handlers);
+    // The per-site guest SQL data-plane provider (the libsql/managed `SqlBackends`),
+    // for the operator `sql move` maintenance op. Only present with the handlers
+    // runtime (no guest SQL ⇒ nothing to relocate); a lean static server leaves it
+    // `None`, and the move handler then fails closed with a clear 501. Rides as an
+    // app-level extension so it reaches the merged control-plane API.
+    #[cfg(feature = "handlers")]
+    let sql_backends_cap: Option<Arc<dyn boatramp_core::sql::SqlBackends>> =
+        handlers.sql_backends();
+    #[cfg(not(feature = "handlers"))]
+    let sql_backends_cap: Option<Arc<dyn boatramp_core::sql::SqlBackends>> = None;
     let fast = crate::serve_pipeline::FastServe {
         deploy: deploy.clone(),
         limiter: rate_limiter.clone(),
@@ -606,6 +621,9 @@ pub fn router_with_fast(
         // both the public serving routes and the control-plane API (activation
         // runs the handler compile-gate). An empty runtime means handlers off.
         .layer(Extension(handlers))
+        // The guest SQL data-plane provider, for the `sql move` maintenance op
+        // (`None` on a node without handlers ⇒ the handler returns 501).
+        .layer(Extension(sql_backends_cap))
         // Whether an unmatched host may resolve implicitly (first-label / sole
         // site); gated to dev/single-tenant/loopback by `serve`.
         .layer(Extension(implicit_routing))

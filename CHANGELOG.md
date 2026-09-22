@@ -36,12 +36,18 @@ boundary — so **no guest change is required**; an operator now addresses it as
     database** — data and the migration ledger are intact, and it is addressable as
     `--db default`. If you literally wrote an empty-string key in `boatramp.cfg`
     (`databases: { "": (…) }`), rename that key to `"default"`.
-  - *Managed embedded (libsql) default DB*: the on-disk/namespace layout keys the
-    default DB by the empty name (`<site>.db`), so renaming it to `default` **moves
-    physical data** — that is out of scope for this change and needs the dedicated
-    migration tooling. Until then the guest `sql.open("")` path is unchanged (the alias
-    keeps it working); do **not** hand-rename a libsql default DB.
-    <!-- (1)/(2) libsql cure -->
+  - *Managed embedded (libsql) default DB*: **no action needed** — the fix is automatic,
+    exactly like the external auto-cure. The default libsql database **keeps its existing
+    on-disk file / sqld namespace** (`<site>.db` / `bramp-<site>`), and both spellings —
+    the guest's `sql.open("")` and an operator's `--db default` — are folded to that one
+    canonical location at the backend-resolution boundary. So the default is addressable
+    as `--db default` with its data unmoved; nothing to hand-rename. To give a libsql
+    binding a **real name** (or otherwise relocate one), use the new
+    `boatramp sql move --db <from> --to <name>` — a data-preserving relocate that snapshots
+    a consistent copy to the destination, verifies it, then removes the source. It is
+    **local single-node only**; remote sqld namespace relocation is a follow-up (it needs
+    an atomic sqld namespace-fork API, so a lossy app-level copy is refused rather than
+    attempted).
 - **A rejected non-path-segment db name** (`/`, `\`, `..`, whitespace, `*`, control
   chars, or > 63 bytes). Rename the binding at creation to a safe segment
   (`[A-Za-z0-9._-]`, non-empty). There is no automatic cure — the old name was never a
@@ -72,6 +78,21 @@ boundary — so **no guest change is required**; an operator now addresses it as
   **real axum route match** (`/api/sql/{db}/…`, `/api/migrate/{db}/…`) with no
   malformed (`//` / empty / truncated) segment — a real detector, gated in CI by the
   `DB-NAME SCREENING CROSS-SURFACE OK` marker.
+- **Unified default libsql path (zero data movement).** The libsql backend folds both
+  `""` and `default` to one canonical location — the **pre-existing** default file
+  (`<site>.db`) / namespace (`bramp-<site>`) — at the resolution boundary (the cache key
+  **and** the path/namespace derivation), so the two spellings share a single physical
+  database and the raw `default` name no longer derives a second `<site>/default.db`
+  file. Named bindings are unchanged. No migration, no data moved.
+- **`boatramp sql move --db <from> --to <name>`** — a general, data-preserving libsql
+  relocate (not special-cased to the default). Wired like the prune/scrub maintenance
+  ops: a `system·admin`-gated `POST /api/sql-move` (`SqlBackends::move_database`).
+  **Local single-node only**: it resolves source + destination (honouring the
+  `""`/`default` fold), refuses an absent source or an existing non-empty destination,
+  `VACUUM INTO`s a consistent snapshot, verifies it (`PRAGMA integrity_check`), then
+  removes the source and its `-wal`/`-shm` sidecars. A **remote/sqld** backend is refused
+  with a typed error (an atomic namespace-fork API is a follow-up; a lossy app-level copy
+  is never attempted). Both names are screened through the canonical validator.
 
 ## [0.4.29] - 2026-09-22
 

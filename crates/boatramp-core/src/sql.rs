@@ -797,6 +797,43 @@ pub trait SqlBackends: Send + Sync {
         )
         .await
     }
+
+    /// **Relocate** the database `from_name` of `site` within tenant `project` to
+    /// `to_name` (same project + site), data intact — a destructive, operator-grade
+    /// maintenance op backing `boatramp sql move`. The general use is giving a
+    /// libsql binding a real name (e.g. moving the default `""`/`"default"` database
+    /// to `"analytics"`), but it is **not** special-cased to the default.
+    ///
+    /// The default implementation refuses: a backend that has no relocatable notion
+    /// (an external/shared or managed database is a single fixed endpoint — its data
+    /// does not move by renaming a binding) returns [`SqlError::Other`]. Only the
+    /// single-node libsql backend implements a real, data-preserving move.
+    async fn move_database(
+        &self,
+        _project: &str,
+        _site: &str,
+        _from_name: &str,
+        _to_name: &str,
+    ) -> Result<MoveDatabaseReport, SqlError> {
+        Err(SqlError::Other(
+            "database move is not supported for this backend (only a single-node libsql \
+             database can be relocated; an external or managed binding is a fixed endpoint)"
+                .to_string(),
+        ))
+    }
+}
+
+/// The outcome of a [`SqlBackends::move_database`] relocation — the resolved
+/// source/destination locators plus the verified row/integrity signal, for the
+/// operator's JSON report.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct MoveDatabaseReport {
+    /// The resolved source locator (a filesystem path in single-node mode).
+    pub from: String,
+    /// The resolved destination locator.
+    pub to: String,
+    /// The `PRAGMA integrity_check` result on the destination (`"ok"` on success).
+    pub integrity: String,
 }
 
 /// The operator-facing SQL capability for a **managed** database: run a migration
