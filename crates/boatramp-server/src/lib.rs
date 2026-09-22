@@ -6897,6 +6897,46 @@ mod b10_async_shard_tests {
             .unwrap()
             .len();
         assert_eq!(after_owner, 1, "the owner fires the cron exactly once");
+
+        // Double-owner window: two owners both fire the SAME cron in the SAME minute (racing before
+        // either persists `last_fired_minute`). The deterministic per-minute id collapses them to one
+        // invocation record — so a transient double-owner never double-enqueues a scheduled fire.
+        let function = deploy
+            .get_function(ProjectRef::DEFAULT, "ticker")
+            .await
+            .unwrap()
+            .unwrap();
+        let before = deploy
+            .list_invocations(ProjectRef::DEFAULT, "ticker")
+            .await
+            .unwrap()
+            .len();
+        // A distinct minute (99) so this fire has its own deterministic id, independent of the
+        // earlier minute-0 fire; both concurrent enqueues share that id.
+        tokio::join!(
+            crate::function_runtime::enqueue_scheduled_invocation(
+                &deploy,
+                ProjectRef::DEFAULT,
+                &function,
+                99
+            ),
+            crate::function_runtime::enqueue_scheduled_invocation(
+                &deploy,
+                ProjectRef::DEFAULT,
+                &function,
+                99
+            ),
+        );
+        let after = deploy
+            .list_invocations(ProjectRef::DEFAULT, "ticker")
+            .await
+            .unwrap()
+            .len();
+        assert_eq!(
+            after - before,
+            1,
+            "two concurrent same-minute cron fires add EXACTLY ONE invocation (deterministic id)"
+        );
     }
 
     /// GATE 7 — transparent upgrade (B18): an OLD node behaves as owns-all (leader-gated, `Legacy`)

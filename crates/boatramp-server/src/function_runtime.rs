@@ -2161,7 +2161,7 @@ pub(super) async fn dispatch_function_triggers(
                 if trigger.last_fired_minute == Some(now.minute_stamp) {
                     continue; // already fired this minute
                 }
-                enqueue_scheduled_invocation(deploy, project, function).await;
+                enqueue_scheduled_invocation(deploy, project, function, now.minute_stamp).await;
                 trigger.last_fired_minute = Some(now.minute_stamp);
                 let _ = deploy.put_trigger(project, &function.name, &trigger).await;
             }
@@ -2180,17 +2180,50 @@ pub(super) async fn dispatch_function_triggers(
     }
 }
 
+/// The **deterministic** id for a scheduled (function-cron) fire: a SHA-256 over `(project, function,
+/// version, minute_stamp)`, so two owners firing the same cron in the same minute (the double-owner
+/// window) collapse to one invocation record (B10 Invariant 5).
+#[cfg(feature = "handlers")]
+fn scheduled_invocation_id(
+    project: &str,
+    function: &str,
+    version: &str,
+    minute_stamp: i64,
+) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    for field in [project, function, version] {
+        hasher.update((field.len() as u64).to_le_bytes());
+        hasher.update(field.as_bytes());
+    }
+    hasher.update(minute_stamp.to_le_bytes());
+    format!("cron-{}", hex::encode(hasher.finalize()))
+}
+
 /// Enqueue a durable async invocation of a function's active version with no body
 /// — the scheduled (cron) fire. The existing invoke drain runs it.
+///
+/// The id is **deterministic** per `(project, function, version, minute_stamp)` (B10 Invariant 5): a
+/// function cron fires owner-only, but in the double-owner window of a membership transition the old
+/// and new owner could both fire it in the same minute — a deterministic id means both enqueue the
+/// IDENTICAL record key, so the second write overwrites an identical `Queued` record instead of
+/// creating a duplicate. One logical scheduled invocation per minute, cluster-wide.
 #[cfg(feature = "handlers")]
-async fn enqueue_scheduled_invocation(
+pub(super) async fn enqueue_scheduled_invocation(
     deploy: &DeployStore,
     project: ProjectRef<'_>,
     function: &boatramp_core::function::Function,
+    minute_stamp: i64,
 ) {
     let now = now_unix();
+    let id = scheduled_invocation_id(
+        project.as_str(),
+        &function.name,
+        &function.active,
+        minute_stamp,
+    );
     let inv = boatramp_core::function::Invocation {
-        id: new_invocation_id(),
+        id,
         function: function.name.clone(),
         version: function.active.clone(),
         mode: boatramp_core::function::InvokeMode::Async,
