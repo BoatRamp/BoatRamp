@@ -89,6 +89,22 @@ enum SqlCommand {
         #[arg(long, default_value = boatramp_core::project::DEFAULT_DB_NAME)]
         db: String,
     },
+    /// **Relocate** a site's libsql database, data intact — e.g. give the default
+    /// database a real name, or move a named database. Local single-node only; a
+    /// remote/sqld backend is refused. A destructive, admin-scoped maintenance op:
+    /// it vacuums a consistent copy to the destination, verifies it, then removes the
+    /// source. Refuses to overwrite an existing destination.
+    Move {
+        /// The **source** database binding name (`default` = the site's default database).
+        #[arg(long, default_value = boatramp_core::project::DEFAULT_DB_NAME)]
+        db: String,
+        /// The **destination** binding name (must be a valid, non-existing database name).
+        #[arg(long)]
+        to: String,
+        /// The site whose database is being relocated (falls back to `publish.site`).
+        #[arg(long)]
+        site: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
@@ -195,6 +211,46 @@ pub async fn run(args: SqlArgs, config: &ProjectConfig) -> Result<()> {
                 println!("{endpoint:<21}  {reachable:<9}  {healthy:<7}  {phase}");
             }
         }
+        SqlCommand::Move { db, to, site } => {
+            // Screen both endpoint names client-side, before a request is built — the
+            // reserved default (`default`) is the one accepted "empty" spelling for the
+            // source. The destination must be a real, valid name (never the empty/default).
+            if db != boatramp_core::project::DEFAULT_DB_NAME {
+                validate_db(&db)?;
+            }
+            validate_db(&to)?;
+            // The move is per-(project, site, db). Resolve the site (flag → config), and
+            // reuse the same project resolution the other sql subcommands use.
+            let site = site
+                .or_else(|| config.publish.site.clone())
+                .ok_or_else(|| Error::InvalidDb("no site configured; pass --site".into()))?;
+            let project = client::resolve_project(config);
+            // `/api/sql-move` is a node-level (`system·admin`) maintenance op carrying the
+            // tenant in the body — not the project-segmented `sql` path the other verbs use.
+            let resp = http
+                .post(format!("{server}/api/sql-move"))
+                .json(&serde_json::json!({
+                    "project": project,
+                    "site": site,
+                    "from": db,
+                    "to": to,
+                }))
+                .send()
+                .await?;
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            if !status.is_success() {
+                return Err(Error::Server(format!(
+                    "sql move failed: {status}: {}",
+                    body.trim()
+                )));
+            }
+            // Print the server's JSON report ({status, from, to, integrity}).
+            match serde_json::from_str::<serde_json::Value>(&body) {
+                Ok(v) => println!("{}", serde_json::to_string_pretty(&v)?),
+                Err(_) => println!("{}", body.trim()),
+            }
+        }
     }
     Ok(())
 }
@@ -295,6 +351,37 @@ mod tests {
                 assert_eq!(db, boatramp_core::project::DEFAULT_DB_NAME);
             }
             other => panic!("expected ping, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn move_parses_source_default_and_requires_destination() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Harness {
+            #[command(subcommand)]
+            command: SqlCommand,
+        }
+        // `--to` is required (no default); `--db` defaults to the reserved default.
+        let h = Harness::try_parse_from(["boatramp", "move", "--to", "analytics"])
+            .expect("move parses with just --to");
+        match h.command {
+            SqlCommand::Move { db, to, site } => {
+                assert_eq!(db, boatramp_core::project::DEFAULT_DB_NAME);
+                assert_eq!(to, "analytics");
+                assert!(site.is_none());
+            }
+            other => panic!("expected move, got {other:?}"),
+        }
+        // Missing `--to` is a parse error.
+        assert!(
+            Harness::try_parse_from(["boatramp", "move"]).is_err(),
+            "move requires --to"
+        );
+        // An invalid `--to` is rejected client-side by the same canonical validator
+        // the server enforces (before any request is built).
+        for bad in ["a/b", "..", "a b", "proj*"] {
+            assert!(validate_db(bad).is_err(), "{bad:?} should be rejected");
         }
     }
 }

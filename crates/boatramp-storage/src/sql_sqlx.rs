@@ -459,6 +459,38 @@ impl boatramp_core::sql::SqlBackends for CompositeSqlBackends {
             .preview_database(project, site, name, preview)
             .await
     }
+
+    async fn move_database(
+        &self,
+        project: &str,
+        site: &str,
+        from_name: &str,
+        to_name: &str,
+    ) -> Result<boatramp_core::sql::MoveDatabaseReport, SqlError> {
+        // A per-tenant or external binding is a single fixed endpoint (a managed
+        // server / a bring-your-own database): its data does not move by renaming a
+        // binding, so a move against a configured named binding is refused — only the
+        // managed libsql fall-through (`{site}.db` per site) has a relocatable file.
+        // Match on the SOURCE name; the fall-through keys its file off the original
+        // name, so it (and the `""`/`default` default) is what a move can relocate.
+        if lookup(&self.per_tenant, from_name).is_some() {
+            return Err(SqlError::Other(format!(
+                "database `{from_name}` is a per-tenant managed binding (a fixed server \
+                 endpoint), which cannot be relocated by `sql move`"
+            )));
+        }
+        if lookup(&self.external, from_name).is_some() {
+            return Err(SqlError::Other(format!(
+                "database `{from_name}` is an external (bring-your-own) binding (a fixed \
+                 endpoint), which cannot be relocated by `sql move`"
+            )));
+        }
+        // Fall-through: the managed per-site libsql default. Pass the ORIGINAL names
+        // (no default-alias) so the libsql move applies its own canonical fold.
+        self.default
+            .move_database(project, site, from_name, to_name)
+            .await
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1289,6 +1321,22 @@ mod tests {
         {
             Ok(std::sync::Arc::new(TagBackend("DEFAULT")))
         }
+
+        // A distinguishable move so the composite-forwarding test can prove a move
+        // reached the managed default (rather than the trait's refusing fallback).
+        async fn move_database(
+            &self,
+            _project: &str,
+            _site: &str,
+            from: &str,
+            to: &str,
+        ) -> Result<boatramp_core::sql::MoveDatabaseReport, boatramp_core::sql::SqlError> {
+            Ok(boatramp_core::sql::MoveDatabaseReport {
+                from: format!("DEFAULT:{from}"),
+                to: format!("DEFAULT:{to}"),
+                integrity: "ok".into(),
+            })
+        }
     }
 
     // Which backend did the composite return? Its `begin` fails with the tag
@@ -1421,6 +1469,45 @@ mod tests {
             tag(composite.database("default", "s", "analytics").await).await,
             "sql error: DEFAULT",
             "a non-default unregistered name is not aliased"
+        );
+    }
+
+    /// A composite `move_database` forwards a default/unregistered source to the
+    /// managed backend, but REFUSES a configured external/per-tenant binding (a fixed
+    /// endpoint whose data does not move by renaming).
+    #[tokio::test]
+    async fn composite_move_forwards_default_and_refuses_fixed_bindings() {
+        use boatramp_core::sql::{SqlBackends, SqlError};
+        let composite = CompositeSqlBackends::new(std::sync::Arc::new(DefaultBackends))
+            .with_external(
+                "analytics",
+                std::sync::Arc::new(TagBackend("EXTERNAL")),
+                false,
+            );
+
+        // The default (`""` / `"default"`) forwards to the managed backend's move.
+        let report = composite
+            .move_database("default", "s", "", "renamed")
+            .await
+            .expect("default move forwards to the managed backend");
+        assert_eq!(report.from, "DEFAULT:");
+        assert_eq!(report.to, "DEFAULT:renamed");
+
+        // An unregistered source name likewise forwards to the managed default.
+        let report = composite
+            .move_database("default", "s", "logs", "logs2")
+            .await
+            .expect("unregistered source forwards to the managed default");
+        assert_eq!(report.from, "DEFAULT:logs");
+
+        // A configured EXTERNAL binding is refused — its data is a fixed endpoint.
+        let err = composite
+            .move_database("default", "s", "analytics", "elsewhere")
+            .await
+            .expect_err("an external binding cannot be relocated");
+        assert!(
+            matches!(err, SqlError::Other(m) if m.contains("external") && m.contains("fixed")),
+            "external move must be refused with the fixed-endpoint message"
         );
     }
 

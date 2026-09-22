@@ -2275,6 +2275,75 @@ pub(super) async fn scrub_blobs(State(deploy): State<DeployStore>) -> Response {
     }
 }
 
+/// The body of a `POST /api/sql-move`: relocate the libsql database
+/// `(project, site, from)` to `to` (same project + site), data intact.
+#[derive(Deserialize)]
+pub(super) struct SqlMoveRequest {
+    /// The owning project (`default` for the reserved / pre-project project).
+    pub project: String,
+    /// The site whose database is being relocated.
+    pub site: String,
+    /// The source binding name (`default` = the site's default database).
+    pub from: String,
+    /// The destination binding name.
+    pub to: String,
+}
+
+/// Relocate a libsql database, data-preserving — a destructive, node-level
+/// maintenance op like prune/scrub (`system·admin`-gated in
+/// [`authz::Right::required`](boatramp_types::authz::Right::required)). Backs
+/// `boatramp sql move`. Local single-node only; a remote/sqld backend is refused
+/// with a typed error (surfaced as `422`). `501` if this node has no guest SQL
+/// data plane (no handlers runtime). Both names are validated through the canonical
+/// [`validate_resource_name`](boatramp_core::project::validate_resource_name); an
+/// invalid name is `422`. Reports the resolved `{status, from, to, integrity}` JSON.
+pub(super) async fn sql_move(
+    Extension(sql): Extension<Option<Arc<dyn boatramp_core::sql::SqlBackends>>>,
+    Json(req): Json<SqlMoveRequest>,
+) -> Response {
+    // Screen both endpoint names at the ingress with the ONE canonical validator so a
+    // malformed/`//`-collapsing/traversal name is rejected `422` before any lookup —
+    // the reserved default (`default`) is explicitly allowed as either endpoint.
+    for name in [&req.from, &req.to] {
+        if name != boatramp_core::project::DEFAULT_DB_NAME {
+            if let Some(bad) = reject_invalid_db(name) {
+                return bad;
+            }
+        }
+    }
+    let Some(sql) = sql else {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            "SQL database relocation is not available on this node (no guest SQL data plane \
+             configured)\n",
+        )
+            .into_response();
+    };
+    match sql
+        .move_database(&req.project, &req.site, &req.from, &req.to)
+        .await
+    {
+        Ok(report) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "moved",
+                "from": report.from,
+                "to": report.to,
+                "integrity": report.integrity,
+            })),
+        )
+            .into_response(),
+        // A refusal (remote-unsupported, absent source, existing destination, name
+        // validation, no-op) is a well-formed request the backend declined — surface it
+        // as `422`, distinct from a `500` transport/IO fault.
+        Err(e) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("sql move failed: {e}\n"),
+        )
+            .into_response(),
+    }
+}
+
 /// Cluster-managed cert status (domain + expiry; never key material).
 pub(super) async fn cert_status(State(deploy): State<DeployStore>) -> Response {
     match deploy.cert_status().await {
@@ -2908,6 +2977,82 @@ mod tests {
             StatusCode::OK,
             "a valid db passes the screen"
         );
+    }
+
+    /// `POST /api/sql-move` end-to-end at the handler: a real local libsql backend, a
+    /// successful move (200 + `{status, from, to, integrity}`), an invalid name (422
+    /// before any lookup), and no backend wired (501).
+    #[tokio::test]
+    async fn sql_move_relocates_locally_and_reports_json() {
+        use boatramp_core::sql::{SqlBackends, SqlValue};
+        let dir = std::env::temp_dir().join(format!("boatramp-sqlmove-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let backends = Arc::new(boatramp_storage::LibsqlSqlBackends::local(&dir));
+        // Seed the default database via the empty spelling.
+        let db = backends.database("default", "blog", "").await.unwrap();
+        {
+            let mut tx = db.begin().await.unwrap();
+            tx.execute("CREATE TABLE t (v TEXT)", &[]).await.unwrap();
+            tx.execute("INSERT INTO t VALUES ('x')", &[]).await.unwrap();
+            tx.commit().await.unwrap();
+        }
+        let sql: Arc<dyn SqlBackends> = backends.clone();
+
+        // Invalid destination name → 422, before any move.
+        let resp = sql_move(
+            Extension(Some(sql.clone())),
+            Json(SqlMoveRequest {
+                project: "default".into(),
+                site: "blog".into(),
+                from: "default".into(),
+                to: "a/b".into(),
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        // Valid move (default → analytics) → 200 with the JSON report.
+        let resp = sql_move(
+            Extension(Some(sql.clone())),
+            Json(SqlMoveRequest {
+                project: "default".into(),
+                site: "blog".into(),
+                from: "default".into(),
+                to: "analytics".into(),
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["status"], "moved");
+        assert_eq!(body["integrity"], "ok");
+        assert!(body["to"].as_str().unwrap().ends_with("blog/analytics.db"));
+
+        // The data landed at the destination, and the source is gone.
+        let moved = backends
+            .database("default", "blog", "analytics")
+            .await
+            .unwrap();
+        let mut tx = moved.begin().await.unwrap();
+        let rows = tx.query("SELECT v FROM t", &[]).await.unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(rows.rows[0][0], SqlValue::Text("x".into()));
+        assert!(!dir.join("blog.db").exists());
+
+        // No SQL data plane wired → 501.
+        let resp = sql_move(
+            Extension(None),
+            Json(SqlMoveRequest {
+                project: "default".into(),
+                site: "blog".into(),
+                from: "default".into(),
+                to: "analytics".into(),
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

@@ -18,7 +18,8 @@ use async_trait::async_trait;
 use boatramp_core::deploy::sha256_hex;
 use boatramp_core::project::ProjectRef;
 use boatramp_core::sql::{
-    PreviewSqlMode, SqlBackend, SqlBackends, SqlError, SqlRows, SqlTransaction, SqlValue,
+    MoveDatabaseReport, PreviewSqlMode, SqlBackend, SqlBackends, SqlError, SqlRows, SqlTransaction,
+    SqlValue,
 };
 use libsql::{Builder, Connection, Database, Value as LibsqlValue};
 use tokio::sync::Mutex;
@@ -347,9 +348,13 @@ impl LibsqlSqlBackends {
         self
     }
 
-    /// The on-disk path for a site's named database (single-node). The default
-    /// (empty) name lives directly under `dir`; named databases get a per-site
-    /// subdirectory.
+    /// The on-disk path for a site's named database (single-node). The **default**
+    /// database lives directly under `dir` as `{site}.db` and is canonically
+    /// addressable as either the empty name `""` **or** the reserved
+    /// [`DEFAULT_DB_NAME`](boatramp_core::project::DEFAULT_DB_NAME) (`"default"`) —
+    /// both are folded to `""` by [`canonical_name`] before they reach here (v0.5.0),
+    /// so the pre-existing `{site}.db` file is the one home of the default and no data
+    /// is ever moved. A named database gets a per-site subdirectory (`{site}/{name}.db`).
     ///
     /// `site` and `name` are assumed already validated by [`validate_db_name`]
     /// at the `SqlBackends` boundary (`database` / `preview_database`), so they
@@ -372,7 +377,12 @@ impl LibsqlSqlBackends {
         format!("{site}/_preview/{preview}")
     }
 
-    /// The sqld namespace for a site's named database (empty name = default).
+    /// The sqld namespace for a site's named database. The **default** database is
+    /// canonically `bramp-{site}` and is addressable as either the empty name `""`
+    /// **or** the reserved [`DEFAULT_DB_NAME`](boatramp_core::project::DEFAULT_DB_NAME)
+    /// (`"default"`) — both are folded to `""` by [`canonical_name`] before they reach
+    /// here (v0.5.0), so the two spellings resolve to the same pre-existing namespace
+    /// and no data is ever moved. A named database is `bramp-{site}-{name}`.
     fn namespace(site: &str, name: &str) -> String {
         if name.is_empty() {
             format!("bramp-{}", dns_token(site))
@@ -382,8 +392,12 @@ impl LibsqlSqlBackends {
     }
 
     /// Open (without caching) the libsql database for `(site, name)` under the
-    /// configured single-node/cluster mode.
+    /// configured single-node/cluster mode. The `name` is folded through
+    /// [`canonical_name`] so the reserved default (`""` / `"default"`) always derives
+    /// the SAME physical file / namespace — the pre-existing default location, never a
+    /// second file.
     async fn open_one(&self, site: &str, name: &str) -> Result<LibsqlSql, SqlError> {
+        let name = canonical_name(name);
         match &self.mode {
             Mode::Local { dir } => {
                 let path = Self::local_path(dir, site, name);
@@ -486,6 +500,11 @@ impl SqlBackends for LibsqlSqlBackends {
         validate_site_ident(site)?;
         validate_db_name("database", name)?;
         validate_db_name("preview", preview)?;
+        // Fold the reserved default (`""` / `"default"`) to its canonical spelling so
+        // every branch below — the cache key, the `Branch`-mode `local_path`, and the
+        // delegated `open_one` — sees one name, and both spellings resolve to the same
+        // preview database.
+        let name = canonical_name(name);
         // Project-qualify the site first (default → bare, back-compat), so the
         // preview namespace nests under the tenant's site identity.
         let ident = ProjectRef::new(project).qualified(site);
@@ -543,6 +562,159 @@ impl SqlBackends for LibsqlSqlBackends {
             }
         }
     }
+
+    /// Relocate the libsql database for `(project, site, from_name)` to `to_name`
+    /// (same site), data intact. **Single-node (local) only** — remote sqld
+    /// namespace relocation needs an atomic server-side fork API, so it is refused
+    /// fail-closed rather than attempted as a lossy app-level copy.
+    ///
+    /// LOCAL move steps (data-preserving, no-clobber, re-runnable-safe):
+    /// 1. Validate both names through the canonical `validate_resource_name`.
+    /// 2. Resolve the source + destination file paths (folding `""`/`default`).
+    /// 3. Refuse if the source is absent, or the destination already exists non-empty.
+    /// 4. `VACUUM INTO` the destination (an online-consistent SQLite snapshot).
+    /// 5. Verify the destination with `PRAGMA integrity_check`.
+    /// 6. Only then remove the source file and its `-wal`/`-shm` sidecars.
+    /// 7. Drop any cached backend for the source so a re-open sees the new layout.
+    async fn move_database(
+        &self,
+        project: &str,
+        site: &str,
+        from_name: &str,
+        to_name: &str,
+    ) -> Result<MoveDatabaseReport, SqlError> {
+        // Both endpoints screen through the ONE canonical resource-name validator
+        // (same rule as every operator/URL-path ingress). The default is addressable
+        // as `""` or `"default"`; the canonical validator rejects `""`, but the CLI /
+        // API layer supplies `"default"` there, and we fold below — so the storage
+        // method itself accepts either the empty or the reserved default spelling for
+        // the endpoints (a bare `""` would only arrive from an in-process caller).
+        for (kind, raw) in [("database", from_name), ("database", to_name)] {
+            if !raw.is_empty() && raw != boatramp_core::project::DEFAULT_DB_NAME {
+                boatramp_core::project::validate_resource_name(kind, raw)
+                    .map_err(SqlError::other)?;
+            }
+        }
+        // These are the same separately-validated components `database` composes; run
+        // them through the storage-boundary validator so a hostile site/project can't
+        // reach the filesystem here either.
+        validate_db_name("project", project)?;
+        validate_site_ident(site)?;
+
+        let from = canonical_name(from_name);
+        let to = canonical_name(to_name);
+        if from == to {
+            return Err(SqlError::other(format!(
+                "database move is a no-op: source and destination resolve to the same name {:?}",
+                if from.is_empty() {
+                    boatramp_core::project::DEFAULT_DB_NAME
+                } else {
+                    from
+                }
+            )));
+        }
+
+        // REMOTE (sqld): refuse — a namespace relocation must be atomic (an app-level
+        // copy could lose writes racing the copy), which needs a server-side fork API
+        // sqld does not yet expose. Detected structurally from how the backend was
+        // constructed (`Mode::Remote`), never from a name.
+        let Mode::Local { dir } = &self.mode else {
+            return Err(SqlError::other(
+                "libsql move is supported for local single-node databases only; remote sqld \
+                 namespace relocation is not yet supported (needs an atomic sqld \
+                 namespace-fork API)",
+            ));
+        };
+
+        let ident = ProjectRef::new(project).qualified(site);
+        let src_path = Self::local_path(dir, &ident, from);
+        let dst_path = Self::local_path(dir, &ident, to);
+
+        // Source must exist (a non-empty file). An absent source is a clear error, not
+        // a silent success — the operator named a database that was never created.
+        match std::fs::metadata(&src_path) {
+            Ok(meta) if meta.len() > 0 => {}
+            Ok(_) => {
+                return Err(SqlError::other(format!(
+                    "source database is empty (nothing to move): {}",
+                    src_path.display()
+                )));
+            }
+            Err(_) => {
+                return Err(SqlError::other(format!(
+                    "source database not found: {}",
+                    src_path.display()
+                )));
+            }
+        }
+        // Destination must not already hold data — never clobber. (A zero-byte stub,
+        // e.g. from a prior interrupted attempt, is tolerated and overwritten.)
+        if let Ok(meta) = std::fs::metadata(&dst_path) {
+            if meta.len() > 0 {
+                return Err(SqlError::other(format!(
+                    "destination database already exists (refusing to overwrite): {}",
+                    dst_path.display()
+                )));
+            }
+        }
+        if let Some(parent) = dst_path.parent() {
+            std::fs::create_dir_all(parent).map_err(SqlError::other)?;
+        }
+        // A stale zero-byte stub would make `VACUUM INTO` fail ("output file already
+        // exists"); remove it first so the snapshot is the sole writer of `dst_path`.
+        let _ = std::fs::remove_file(&dst_path);
+
+        // Snapshot the live source into the destination (online-consistent).
+        let source = self.open_one(&ident, from).await?;
+        source.vacuum_into(&dst_path).await?;
+
+        // Verify the destination is a sound SQLite database before we drop the source.
+        let dst = LibsqlSql::open_local(&dst_path).await?;
+        let integrity = {
+            let mut tx = dst.begin_read_only().await?;
+            let rows = tx.query("PRAGMA integrity_check", &[]).await?;
+            tx.commit().await?;
+            match rows.rows.first().and_then(|r| r.first()) {
+                Some(SqlValue::Text(s)) => s.clone(),
+                other => {
+                    return Err(SqlError::other(format!(
+                        "destination integrity_check returned an unexpected result: {other:?}"
+                    )));
+                }
+            }
+        };
+        if integrity != "ok" {
+            // The destination is corrupt — leave the source in place and remove the bad
+            // copy so a re-run starts clean.
+            let _ = std::fs::remove_file(&dst_path);
+            return Err(SqlError::other(format!(
+                "destination integrity_check failed after copy (source left intact): {integrity}"
+            )));
+        }
+
+        // The copy is verified — remove the source and its WAL/SHM sidecars.
+        std::fs::remove_file(&src_path).map_err(SqlError::other)?;
+        for suffix in ["-wal", "-shm"] {
+            let mut sidecar = src_path.clone().into_os_string();
+            sidecar.push(suffix);
+            let _ = std::fs::remove_file(std::path::PathBuf::from(sidecar));
+        }
+
+        // Evict any cached backend keyed at the (now-removed) source so a later
+        // `database(project, site, from)` reopens a fresh (recreated-empty) file
+        // rather than a handle to the deleted inode.
+        {
+            let mut cache = self.cache.lock().await;
+            cache.remove(&(ident.clone(), from.to_string()));
+            cache.remove(&(ident.clone(), to.to_string()));
+        }
+
+        Ok(MoveDatabaseReport {
+            from: src_path.display().to_string(),
+            to: dst_path.display().to_string(),
+            integrity,
+        })
+    }
 }
 
 impl LibsqlSqlBackends {
@@ -556,6 +728,11 @@ impl LibsqlSqlBackends {
         ident: &str,
         name: &str,
     ) -> Result<Arc<dyn SqlBackend>, SqlError> {
+        // Fold the reserved default (`""` / `"default"`) to one canonical cache key so
+        // both spellings share a SINGLE cache entry (and, via `open_one`, one physical
+        // file) — never two backends over the same default data. Named bindings key
+        // verbatim.
+        let name = canonical_name(name);
         let key = (ident.to_string(), name.to_string());
         let mut cache = self.cache.lock().await;
         if let Some(backend) = cache.get(&key) {
@@ -645,6 +822,28 @@ fn validate_site_ident(site: &str) -> Result<(), SqlError> {
         validate_db_name("site", segment)?;
     }
     Ok(())
+}
+
+/// Fold a libsql binding `name` to its **canonical** spelling so the reserved
+/// default database has exactly one physical home. The default is canonically the
+/// empty name `""` (local `{site}.db`, remote `bramp-{site}`); a caller may address
+/// it as either `""` or [`DEFAULT_DB_NAME`](boatramp_core::project::DEFAULT_DB_NAME)
+/// (`"default"`), and this collapses both to `""`. Every other name is returned
+/// unchanged.
+///
+/// This is the v0.5.0 default-libsql-path cure: post-uniform-screening a guest still
+/// opens `""` while an operator addresses `--db default`, but the raw `"default"`
+/// name would otherwise derive a *second* file (`{site}/default.db`) distinct from
+/// the pre-existing default at `{site}.db`. Applying this fold at the libsql
+/// resolution boundary — before the cache key **and** before path/namespace
+/// derivation — makes both spellings resolve to the one, unmoved default file. The
+/// named-binding path (`{site}/{name}.db`) is untouched.
+fn canonical_name(name: &str) -> &str {
+    if name == boatramp_core::project::DEFAULT_DB_NAME {
+        ""
+    } else {
+        name
+    }
 }
 
 /// A DNS-label-safe token from arbitrary input: `[a-z0-9]` only (so it's valid
@@ -1184,6 +1383,270 @@ mod tests {
         assert_eq!(
             LibsqlSqlBackends::local_path(&dir, "blog", ""),
             dir.join("blog.db")
+        );
+    }
+
+    // ---- (2) default-libsql-path unification --------------------------------
+
+    /// `canonical_name` folds the reserved default (`""` / `"default"`) to `""` and
+    /// leaves every other name verbatim — the unit of the (2) cure.
+    #[test]
+    fn canonical_name_folds_only_the_default() {
+        assert_eq!(canonical_name(""), "");
+        assert_eq!(canonical_name(boatramp_core::project::DEFAULT_DB_NAME), "");
+        assert_eq!(canonical_name("default"), "");
+        assert_eq!(canonical_name("analytics"), "analytics");
+        assert_eq!(canonical_name("logs"), "logs");
+    }
+
+    /// The (2) cure, proven end-to-end WITHOUT any data movement: `database(p,s,"")`
+    /// and `database(p,s,"default")` resolve to the SAME physical file — a row written
+    /// through one spelling is read back through the other, and only the pre-existing
+    /// `{site}.db` exists (no second `{site}/default.db`). A NAMED binding is
+    /// unaffected (its own `{site}/{name}.db`).
+    #[tokio::test]
+    async fn empty_and_default_share_one_physical_file_named_unaffected() {
+        let dir = factory_dir("default-unify");
+        let backends = LibsqlSqlBackends::local(dir.clone());
+
+        // Seed the default database via the EMPTY spelling (the pre-existing home).
+        let via_empty = backends.database("default", "blog", "").await.unwrap();
+        put(&via_empty, "CREATE TABLE t (v TEXT)").await;
+        put(&via_empty, "INSERT INTO t VALUES ('shared')").await;
+
+        // Read it back through the `default` spelling — same data, so same file.
+        let via_default = backends
+            .database("default", "blog", boatramp_core::project::DEFAULT_DB_NAME)
+            .await
+            .unwrap();
+        assert_eq!(
+            one(&via_default, "SELECT v FROM t").await,
+            vec![SqlValue::Text("shared".into())],
+            "`default` must see the row written through the empty-name default"
+        );
+        // And a write through `default` is visible through the empty spelling.
+        put(&via_default, "INSERT INTO t VALUES ('again')").await;
+        assert_eq!(
+            one(&via_empty, "SELECT count(*) FROM t").await,
+            vec![SqlValue::Integer(2)]
+        );
+
+        // ZERO data movement: only the pre-existing `{site}.db` exists; the raw
+        // `default` name did NOT derive a second `{site}/default.db` file.
+        assert!(
+            dir.join("blog.db").exists(),
+            "the canonical default file exists"
+        );
+        assert!(
+            !dir.join("blog").join("default.db").exists(),
+            "the `default` spelling must NOT create a second file — the data is unmoved"
+        );
+        // The path derivation agrees: both spellings map to `{site}.db`.
+        assert_eq!(
+            LibsqlSqlBackends::local_path(&dir, "blog", canonical_name("")),
+            dir.join("blog.db")
+        );
+        assert_eq!(
+            LibsqlSqlBackends::local_path(
+                &dir,
+                "blog",
+                canonical_name(boatramp_core::project::DEFAULT_DB_NAME)
+            ),
+            dir.join("blog.db")
+        );
+
+        // A NAMED binding is untouched: its own `{site}/{name}.db`, distinct data.
+        let named = backends
+            .database("default", "blog", "analytics")
+            .await
+            .unwrap();
+        put(&named, "CREATE TABLE t (v TEXT)").await;
+        put(&named, "INSERT INTO t VALUES ('named')").await;
+        assert!(dir.join("blog").join("analytics.db").exists());
+        assert_eq!(
+            one(&named, "SELECT v FROM t").await,
+            vec![SqlValue::Text("named".into())],
+            "the named binding keeps its own separate data"
+        );
+    }
+
+    /// The remote namespace is likewise one identity for `""` / `"default"` (the fold
+    /// is applied in `open_one` for remote too) — asserted at the derivation level.
+    #[test]
+    fn empty_and_default_share_one_namespace() {
+        assert_eq!(
+            LibsqlSqlBackends::namespace("blog", canonical_name("")),
+            LibsqlSqlBackends::namespace(
+                "blog",
+                canonical_name(boatramp_core::project::DEFAULT_DB_NAME)
+            )
+        );
+        // A named binding still gets its own distinct namespace.
+        assert_ne!(
+            LibsqlSqlBackends::namespace("blog", canonical_name("")),
+            LibsqlSqlBackends::namespace("blog", "analytics")
+        );
+    }
+
+    // ---- (1) libsql move / relocate -----------------------------------------
+
+    /// A LOCAL move preserves data: write to `from`, move to `to`, read the row back
+    /// from `to`, and assert the source file (and its sidecars) are gone.
+    #[tokio::test]
+    async fn move_local_preserves_data_and_removes_source() {
+        let dir = factory_dir("move-ok");
+        let backends = LibsqlSqlBackends::local(dir.clone());
+
+        // Seed the default database (the common "give the default a name" case).
+        let from = backends.database("default", "blog", "").await.unwrap();
+        put(&from, "CREATE TABLE t (v TEXT)").await;
+        put(&from, "INSERT INTO t VALUES ('keepme')").await;
+        // Force a WAL sidecar to exist so we prove it's cleaned up too.
+        assert!(dir.join("blog.db").exists());
+
+        let report = backends
+            .move_database("default", "blog", "", "analytics")
+            .await
+            .expect("local move succeeds");
+        assert_eq!(report.integrity, "ok");
+        assert!(report.from.ends_with("blog.db"));
+        assert!(report.to.ends_with("blog/analytics.db"));
+
+        // The destination holds the data.
+        let to = backends
+            .database("default", "blog", "analytics")
+            .await
+            .unwrap();
+        assert_eq!(
+            one(&to, "SELECT v FROM t").await,
+            vec![SqlValue::Text("keepme".into())]
+        );
+
+        // The source file + WAL/SHM sidecars are gone.
+        assert!(
+            !dir.join("blog.db").exists(),
+            "the source default file must be removed after a verified move"
+        );
+        assert!(!dir.join("blog.db-wal").exists());
+        assert!(!dir.join("blog.db-shm").exists());
+        assert!(dir.join("blog").join("analytics.db").exists());
+    }
+
+    /// A move refuses to clobber an existing (non-empty) destination — fail-closed,
+    /// the source is left intact.
+    #[tokio::test]
+    async fn move_refuses_existing_destination() {
+        let dir = factory_dir("move-clobber");
+        let backends = LibsqlSqlBackends::local(dir.clone());
+
+        let from = backends.database("default", "blog", "src").await.unwrap();
+        put(&from, "CREATE TABLE t (v TEXT)").await;
+        put(&from, "INSERT INTO t VALUES ('src')").await;
+        // Pre-create a non-empty destination.
+        let dst = backends.database("default", "blog", "dst").await.unwrap();
+        put(&dst, "CREATE TABLE t (v TEXT)").await;
+        put(&dst, "INSERT INTO t VALUES ('dst')").await;
+
+        let err = backends
+            .move_database("default", "blog", "src", "dst")
+            .await
+            .expect_err("must refuse to overwrite an existing destination");
+        assert!(
+            matches!(&err, SqlError::Other(m) if m.contains("already exists")),
+            "got {err:?}"
+        );
+        // Source is intact (nothing moved).
+        assert_eq!(
+            one(&from, "SELECT v FROM t").await,
+            vec![SqlValue::Text("src".into())]
+        );
+        assert!(dir.join("blog").join("src.db").exists());
+    }
+
+    /// A move refuses when the source is absent — a clear error, not a silent success.
+    #[tokio::test]
+    async fn move_refuses_absent_source() {
+        let backends = LibsqlSqlBackends::local(factory_dir("move-absent"));
+        let err = backends
+            .move_database("default", "blog", "nope", "somewhere")
+            .await
+            .expect_err("absent source must error");
+        assert!(
+            matches!(&err, SqlError::Other(m) if m.contains("not found")),
+            "got {err:?}"
+        );
+    }
+
+    /// A move is a refused no-op when source and destination fold to the same name
+    /// (e.g. `"" → "default"`, both the default).
+    #[tokio::test]
+    async fn move_refuses_default_to_default_noop() {
+        let backends = LibsqlSqlBackends::local(factory_dir("move-noop"));
+        let err = backends
+            .move_database(
+                "default",
+                "blog",
+                "",
+                boatramp_core::project::DEFAULT_DB_NAME,
+            )
+            .await
+            .expect_err("`\"\"` → `default` is a no-op");
+        assert!(
+            matches!(&err, SqlError::Other(m) if m.contains("no-op")),
+            "got {err:?}"
+        );
+    }
+
+    /// Name validation: an invalid destination is rejected (through the canonical
+    /// validator) before any file work, and the source is left intact.
+    #[tokio::test]
+    async fn move_rejects_invalid_destination_name() {
+        let dir = factory_dir("move-badname");
+        let backends = LibsqlSqlBackends::local(dir.clone());
+        let from = backends.database("default", "blog", "src").await.unwrap();
+        put(&from, "CREATE TABLE t (v TEXT)").await;
+
+        // Rejected by the CANONICAL `validate_resource_name` (the one the move screens
+        // through, matching every operator/URL-path ingress): path separators, `.`/`..`,
+        // whitespace, `*`, control chars, and overlong. Note `""` / `"default"` are
+        // legitimate default endpoints for the storage method (a move can target the
+        // default), so they are NOT here — the CLI/API layer additionally requires a
+        // non-default `--to`. (`.hidden` is accepted by the canonical validator, so it
+        // is likewise not a rejection here.)
+        for bad in ["a/b", "..", "a b", "x*y", "a\tb", &"x".repeat(64)] {
+            assert!(
+                matches!(
+                    backends.move_database("default", "blog", "src", bad).await,
+                    Err(SqlError::Other(_))
+                ),
+                "invalid destination {bad:?} must be rejected"
+            );
+        }
+        // The source is untouched by any rejected attempt.
+        assert!(dir.join("blog").join("src.db").exists());
+    }
+
+    /// A move against a REMOTE (sqld) backend is refused with the typed
+    /// remote-unsupported error — an app-level copy could lose concurrent writes, so a
+    /// non-atomic relocation is never attempted. (Constructed without contacting a
+    /// server; the refusal short-circuits before any network use.)
+    #[tokio::test]
+    async fn move_refuses_remote_backend() {
+        let backends = LibsqlSqlBackends::remote(
+            "http://sqld.internal:8080",
+            "http://sqld.internal:8081",
+            "",
+            None,
+        );
+        let err = backends
+            .move_database("default", "blog", "", "analytics")
+            .await
+            .expect_err("remote move must be refused");
+        assert!(
+            matches!(&err, SqlError::Other(m)
+                if m.contains("local single-node databases only")
+                    && m.contains("namespace-fork")),
+            "got {err:?}"
         );
     }
 }
