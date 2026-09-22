@@ -40,6 +40,12 @@ use slatedb::{Db, DbReader, DbReaderBuilder, Settings, WriteBatch};
 #[derive(Clone)]
 pub struct SlateKv {
     backend: Backend,
+    /// Serializes [`compare_and_swap`](KvStore::compare_and_swap) within this writer process (B10):
+    /// SlateDB has no read-conditional-write primitive, but it is single-writer (manifest fencing),
+    /// so the only concurrent CAS racers are tasks in THIS process. Holding this async mutex across
+    /// the get→compare→write makes the CAS linearizable within the writer — the property the
+    /// async-lane shard claim needs. Cheap (contended only by the drain's claims, off the hot path).
+    cas_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 #[derive(Clone)]
@@ -140,6 +146,7 @@ impl SlateKv {
             .map_err(backend)?;
         Ok(Self {
             backend: Backend::Writer(Arc::new(db)),
+            cas_lock: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 
@@ -155,6 +162,7 @@ impl SlateKv {
             .map_err(backend)?;
         Ok(Self {
             backend: Backend::Reader(Arc::new(reader)),
+            cas_lock: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 
@@ -303,6 +311,32 @@ impl KvStore for SlateKv {
         // One SlateDB `WriteBatch` = a single atomic, durable commit (below), so the ready-set
         // fast path (B2) is safe over SlateKv: the ready marker rides the same batch as the index.
         true
+    }
+
+    fn supports_cas(&self) -> bool {
+        // SlateDB is single-writer (manifest fencing), and the CAS below holds `cas_lock` across the
+        // get→compare→write — so it is linearizable within this writer process (the only place a CAS
+        // racer can be). Safe for the async-lane shard claim (B10) on a single-node SlateDB deploy.
+        matches!(self.backend, Backend::Writer(_))
+    }
+
+    async fn compare_and_swap(
+        &self,
+        key: &str,
+        expected: Option<&[u8]>,
+        value: Vec<u8>,
+    ) -> Result<bool, KvError> {
+        // Hold the process-local CAS lock across read→compare→write so no other task in THIS writer
+        // interleaves. SlateDB is single-writer, so no other process writes this store — making this
+        // a linearizable compare-and-set. A durable `put` (awaited flush) commits the swap.
+        let _guard = self.cas_lock.lock().await;
+        let db = self.writer()?;
+        let current = db.get(key.as_bytes()).await.map_err(backend)?;
+        if current.as_deref() != expected {
+            return Ok(false);
+        }
+        db.put(key.as_bytes(), &value).await.map_err(backend)?;
+        Ok(true)
     }
 
     async fn write_batch(&self, ops: Vec<WriteOp>) -> Result<(), KvError> {

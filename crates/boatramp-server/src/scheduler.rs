@@ -36,6 +36,28 @@ pub(super) enum ConsumerFilter<'a> {
     Topics(&'a std::collections::HashSet<String>),
 }
 
+/// How a maintenance pass treats the async lane / crons / blob watchers under Phase-D sharding (B10).
+/// Orthogonal to [`ConsumerFilter`] (which selects the *delivery* topics): this selects the *async*
+/// work. Only meaningful on a maintenance pass (`All`/`Skip`); a `Topics` delivery drain ignores it.
+#[cfg(feature = "handlers")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum AsyncPass {
+    /// The legacy leader-gate (pre-B10, and every existing caller/test): crons, the async drain, and
+    /// blob watchers run iff this node passes `cron_leader_gate` (single node ⇒ always). Byte-for-byte
+    /// the pre-sharding behavior — no shard gate is consulted. Used where sharding isn't wired.
+    Legacy,
+    /// The **sharded fast path** (B10 common case): drain/fire/watch only the function/cron identities
+    /// this node HRW-OWNS (`async_shard_owns`). Each node does its ~1/N share; the leader is no longer
+    /// the single async funnel. Crons + blob watchers fire ONLY here (owner-only single-fire).
+    Sharded,
+    /// The **unsharded safety-net** (B10 backstop, B7 no-owner window): drain EVERY function's async
+    /// invocations regardless of ownership, so a function orphaned during a membership transition still
+    /// gets drained by some node within one safety-net interval. Safe because the claim is a CAS
+    /// (redundant scans are idempotent — Invariant 2). Crons + blob watchers are NOT run on this pass
+    /// (they have no cross-node dedup for *firing/watching*, so a non-owner must not fire/watch them).
+    UnshardedSafetyNet,
+}
+
 /// Per-invocation limits from the site's caps only (consumers have no
 /// per-component limit config), clamped to the engine ceiling downstream.
 #[cfg(feature = "handlers")]
@@ -137,8 +159,29 @@ impl HandlerRuntime {
             } else {
                 ConsumerFilter::All // no ready-set: the tick keeps the legacy full poll (fallback)
             };
+            // Phase-D async sharding (B10) is ACTIVE only when the async claim can be made race-safe:
+            // a linearizable-CAS KV backend AND a messaging substrate to derive the HRW assignment
+            // from. Otherwise the async lane stays on the legacy leader-gate (owns-all), byte-for-byte
+            // unchanged — the fail-closed default (single node, a non-CAS remote KV, an old node
+            // during version skew — B18). Decided once at spawn (the backend/topology is fixed).
+            let shard_active = deploy.supports_invocation_cas() && inner.messaging.is_some();
+            // The async pass this node runs every fast tick: the sharded fast path when sharding is
+            // active (owner-only crons/watchers + owner + safety-net invocation drains), else the
+            // legacy leader-gate. On single node both resolve to "own all" identically.
+            let fast_pass = if shard_active {
+                AsyncPass::Sharded
+            } else {
+                AsyncPass::Legacy
+            };
+            // The unsharded safety-net cadence (B7 no-owner backstop) reuses the delivery safety-net
+            // interval (B17: no new knob) — a coarse periodic full drain that re-derives every
+            // function's queue so a function orphaned by a membership transition drains within one
+            // interval. Only meaningful on a live shard; skipped entirely when sharding is inactive.
+            let safetynet_interval = inner.delivery_config().safetynet_interval;
+            let mut last_safetynet = tokio::time::Instant::now();
             loop {
                 interval.tick().await;
+                // (1) The fast pass: sharded owner-only work (or the legacy leader-gate).
                 if let Err(err) = run_scheduler_tick(
                     &inner,
                     &deploy,
@@ -147,12 +190,37 @@ impl HandlerRuntime {
                     &mut sweep_state,
                     CronNow::now(),
                     consumers,
+                    fast_pass,
                 )
                 .await
                 {
                     tracing::warn!(%err, "scheduler tick failed");
                 }
-                reconcile_blob_watchers(&inner, &deploy, &mut blob_watchers).await;
+                reconcile_blob_watchers(&inner, &deploy, &mut blob_watchers, fast_pass).await;
+                // (2) The unsharded safety-net pass (B7): every `safetynet_interval`, on a live shard,
+                // drain EVERY function's queue regardless of ownership so a no-owner window can't
+                // strand work. Safe by the CAS claim (redundant scans are no-ops — Invariant 2). Crons
+                // + blob watchers are NOT touched here (`UnshardedSafetyNet` skips them — no cross-node
+                // firing dedup). Never runs on single node / a non-CAS backend (nothing to back up).
+                if shard_active && last_safetynet.elapsed() >= safetynet_interval {
+                    last_safetynet = tokio::time::Instant::now();
+                    if let Err(err) = run_scheduler_tick(
+                        &inner,
+                        &deploy,
+                        &mut wasm_cache,
+                        &mut cron_state,
+                        &mut sweep_state,
+                        CronNow::now(),
+                        // The safety net is an async-only backstop; it drives no consumer delivery
+                        // (the drainer / the fast pass own that) — `Skip` keeps it maintenance-only.
+                        ConsumerFilter::Skip,
+                        AsyncPass::UnshardedSafetyNet,
+                    )
+                    .await
+                    {
+                        tracing::warn!(%err, "async safety-net pass failed");
+                    }
+                }
                 // If the drainer task ever exits (it shouldn't — it loops forever), the maintenance
                 // loop keeps running; delivery would then rely on the drainer being respawned by a
                 // restart. Abort it with us on shutdown (the caller aborts this outer handle).
@@ -278,6 +346,10 @@ async fn run_delivery_drainer(inner: Arc<HandlerRuntimeInner>, deploy: DeploySto
                 &mut sweep_state,
                 CronNow::now(),
                 ConsumerFilter::Topics(&topics),
+                // A `Topics` delivery drain never touches the async lane / crons / watchers (it's a
+                // pure per-ready-topic dispatch — `maintenance` is false), so the async pass is
+                // irrelevant here; `Legacy` is the inert choice.
+                AsyncPass::Legacy,
             )
             .await
             {
@@ -350,16 +422,34 @@ async fn rebuild_due_heap(
 
 /// Reconcile the live blob-change watchers against the stored `Blob` triggers:
 /// spawn a watcher for each new trigger, abort + drop watchers whose trigger was
-/// removed. Leader-gated (shared-FS clusters would otherwise fire per-node).
+/// removed. Single-fire cluster-wide (shared-FS clusters would otherwise fire per-node).
+///
+/// Pre-B10 this was strictly leader-gated (only the leader watched). Under Phase-D sharding
+/// (`AsyncPass::Sharded`) a function's watchers run on the ONE node that HRW-OWNS the function
+/// identity — so exactly one node watches ⇒ exactly one enqueue per change (Invariant 4), and the
+/// watch load spreads off the leader. Ownership is folded into the `desired` set, so the `retain`
+/// step below AUTOMATICALLY aborts a watcher this node no longer owns after a membership change
+/// (rebuild-on-change, mirroring B11's rebuild-on-deploy-change) — re-covering the no-owner window.
+/// A change that slips through during a transition is caught by the content-hash-idempotent enqueue
+/// (the blob change body is deterministic) + the periodic re-reconcile.
 #[cfg(feature = "handlers")]
 async fn reconcile_blob_watchers(
     inner: &Arc<HandlerRuntimeInner>,
     deploy: &DeployStore,
     watchers: &mut std::collections::HashMap<String, tokio::task::JoinHandle<()>>,
+    async_pass: AsyncPass,
 ) {
     use boatramp_core::function::TriggerKind;
-    // Only the leader (or a single node) dispatches, matching cron/invoke.
-    if inner.cron_leader_gate.get().is_some_and(|gate| !gate()) {
+    // The unsharded safety-net pass never (re)spawns watchers — a non-owner watching would double-
+    // enqueue every change. Watchers are owner-only, reconciled on the sharded/legacy pass; the
+    // safety net's job is the CAS-idempotent invocation drain, not watching.
+    if async_pass == AsyncPass::UnshardedSafetyNet {
+        return;
+    }
+    // Legacy leader-gate (single node ⇒ always): the pre-B10 behavior for the `Legacy` pass.
+    let legacy_gated =
+        async_pass == AsyncPass::Legacy && inner.cron_leader_gate.get().is_some_and(|gate| !gate());
+    if legacy_gated {
         for (_, handle) in watchers.drain() {
             handle.abort();
         }
@@ -376,6 +466,16 @@ async fn reconcile_blob_watchers(
             Err(_) => continue,
         };
         for function in functions {
+            // Sharded (B10): only the node that owns this function's identity watches its blobs, so
+            // exactly one node enqueues per change. Owns-all on single node / non-CAS backend (no-op).
+            // A function this node doesn't own is simply left OUT of `desired`, so any watcher it had
+            // is aborted by the `retain` below on the next reconcile after a membership change.
+            if async_pass == AsyncPass::Sharded {
+                let key = crate::async_shard_key_function(&project_name, &function.name);
+                if !inner.async_shard_owns(deploy, &key).await {
+                    continue;
+                }
+            }
             let triggers = deploy
                 .list_triggers(project, &function.name)
                 .await
@@ -457,6 +557,29 @@ pub(super) async fn spawn_blob_watcher(
     }))
 }
 
+/// The **deterministic** invocation id for a blob change (B10 Invariant 4): a SHA-256 over the
+/// change's identity — project, function, pinned version, changed key, and change kind — so two
+/// watchers that both observe the same change (the double-owner window of a membership transition)
+/// mint the IDENTICAL id and thus enqueue exactly one logical invocation (the second write overwrites
+/// an identical `Queued` record). Folding the version in means a genuinely new deploy re-fires.
+#[cfg(feature = "handlers")]
+fn blob_change_invocation_id(
+    project: &str,
+    function: &str,
+    version: &str,
+    key: &str,
+    kind: &str,
+) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    // Length-prefix each field so distinct tuples can never collide by concatenation.
+    for field in [project, function, version, key, kind] {
+        hasher.update((field.len() as u64).to_le_bytes());
+        hasher.update(field.as_bytes());
+    }
+    format!("blob-{}", hex::encode(hasher.finalize()))
+}
+
 /// Enqueue a durable async invocation for a blob change, with the changed key +
 /// kind as the JSON request body (the function-relative key, `hblob/fn/<name>/`
 /// stripped).
@@ -478,8 +601,23 @@ async fn enqueue_blob_invocation(
     let body = serde_json::json!({ "key": key, "kind": kind });
     let payload = serde_json::to_vec(&body).unwrap_or_default();
     let now = now_unix();
+    // Content-hash-idempotent id (B10 Invariant 4): derive the invocation id from the CHANGE itself
+    // (project + function + version + changed key + kind), NOT a random nonce. During the double-owner
+    // window of a membership transition the old and new owner may both observe the same change; a
+    // deterministic id means both enqueue the SAME record key, so the second write overwrites an
+    // identical `Queued` record instead of creating a duplicate invocation — exactly one logical
+    // enqueue per change, cluster-wide. (A settled record with this id is not resurrected: the drain
+    // only claims `Queued`/expired-`Running`, and a re-observed change after settlement is a genuinely
+    // new event only if the version advanced, which the id folds in.)
+    let id = blob_change_invocation_id(
+        project.as_str(),
+        &function.name,
+        &function.active,
+        key,
+        kind,
+    );
     let inv = boatramp_core::function::Invocation {
-        id: new_invocation_id(),
+        id,
         function: function.name.clone(),
         version: function.active.clone(),
         mode: boatramp_core::function::InvokeMode::Async,
@@ -515,6 +653,9 @@ pub(super) async fn run_scheduler_tick(
     // passes `Topics(ready)`. Crons + the async lane run only on a maintenance pass (`All`/`Skip`),
     // never on a per-ready-topic drain (`Topics`).
     consumers: ConsumerFilter<'_>,
+    // Phase-D async-lane sharding (B10): how this maintenance pass treats the async drain / crons /
+    // blob watchers (see [`AsyncPass`]). `Legacy` = the pre-B10 leader-gate (every existing caller).
+    async_pass: AsyncPass,
 ) -> Result<(usize, Vec<tokio::task::JoinHandle<()>>), DeployError> {
     use std::sync::atomic::Ordering;
     let mut acked = 0;
@@ -755,16 +896,37 @@ pub(super) async fn run_scheduler_tick(
                         }
                     }
                 }
-                // --- crons (leader-only in cluster mode) ---
-                // The gate fires crons on exactly one node; consumers above run on
-                // every node (leased dispatch distributes them). `None` = single
-                // node, always fires. Crons run only on a maintenance pass (never on the
-                // drainer's per-ready-topic pass).
-                let cron_enabled =
-                    maintenance && inner.cron_leader_gate.get().is_none_or(|gate| gate());
+                // --- crons (single-fire cluster-wide) ---
+                // A cron fires on exactly ONE node so a scheduled job runs once cluster-wide.
+                // Pre-B10 that node was the Raft leader (`cron_leader_gate`); under Phase-D sharding
+                // (B10, `AsyncPass::Sharded`) it is the node that HRW-OWNS the cron's identity, so
+                // crons spread across the fleet instead of all landing on the leader. Crons NEVER fire
+                // on the unsharded safety-net pass (Invariant 5: a cron has no cross-node dedup for
+                // *firing* — only the per-node `cron_state` within-minute guard — so a non-owner firing
+                // would double-fire; a tick missed during a rare membership transition is bounded/
+                // acceptable). Consumers above run on every node (leased dispatch distributes them).
+                let cron_maintenance = match async_pass {
+                    // Legacy leader-gate (single node ⇒ always) — byte-for-byte the pre-B10 behavior.
+                    AsyncPass::Legacy => {
+                        maintenance && inner.cron_leader_gate.get().is_none_or(|gate| gate())
+                    }
+                    // Sharded: owner-only, checked per-cron on its identity below.
+                    AsyncPass::Sharded => maintenance,
+                    // Safety-net: crons never fire here (would double-fire on a non-owner).
+                    AsyncPass::UnshardedSafetyNet => false,
+                };
                 for (idx, cron) in manifest.config.crons.iter().enumerate() {
-                    if !cron_enabled {
+                    if !cron_maintenance {
                         break;
+                    }
+                    // Sharded pass: fire only if THIS node owns the cron's identity
+                    // (`{project}/{site}#cron:{idx}`). Owns-all on single node / non-CAS backend, so
+                    // this is a no-op there. Skip a cron this node doesn't own (its owner fires it).
+                    if async_pass == AsyncPass::Sharded {
+                        let cron_key = crate::async_shard_key_site_cron(project_name, &scope, idx);
+                        if !inner.async_shard_owns(deploy, &cron_key).await {
+                            continue;
+                        }
                     }
                     let Ok(schedule) = boatramp_core::cron::CronSchedule::parse(&cron.schedule)
                     else {
@@ -818,29 +980,58 @@ pub(super) async fn run_scheduler_tick(
             }
         }
     }
-    // --- async function invocations (FA-3) ---
-    // Drain each top-level function's queued invocations. Leader-gated like crons
-    // (`None` = single node) so a durable async call is claimed exactly once
-    // cluster-wide; the claim is persisted with a lease and the run is spawned off
-    // the tick, so a long background job never stalls this loop (crons, other
-    // drains, workflow progress) and a crash mid-run is reclaimed when the lease
-    // elapses.
-    let invoke_enabled = maintenance && inner.cron_leader_gate.get().is_none_or(|gate| gate());
-    if invoke_enabled {
-        // Same per-project fan-out as the site loop: each project's functions +
-        // workflows drain under their own tenant.
+    // --- async function invocations (FA-3) + function triggers + workflow runs ---
+    // Phase-D sharding (B10) partitions this the same way as crons above:
+    //   * `Legacy`  — leader-gated (single node ⇒ always), byte-for-byte the pre-B10 behavior.
+    //   * `Sharded` — this node handles only the FUNCTIONS it HRW-OWNS (`{project}/{function}`), so
+    //                 each node does its ~1/N share and the leader is no longer the async funnel.
+    //   * `UnshardedSafetyNet` — DRAIN every function's queue regardless of ownership (the B7 no-owner
+    //                 backstop): a function orphaned during a membership transition still drains within
+    //                 one safety-net interval. Safe because `drain_function_invocations` now claims via
+    //                 a CAS (Invariant 1), so a redundant scan on the owner + a safety-net node can
+    //                 never double-execute — the loser's CAS is a no-op (Invariant 2).
+    //
+    // Split by race-safety:
+    //   * `drain_function_invocations` — CAS-claimed ⇒ runs on the owner (Sharded) AND on the safety
+    //     net (idempotent). This is the guarantee that no invocation is ever stranded.
+    //   * `dispatch_function_triggers` — fires FUNCTION-level crons (each enqueues an invocation) and
+    //     queue triggers; the cron enqueue has NO cross-node dedup, so it runs ONLY on the owner /
+    //     leader, NEVER on the safety-net pass (else a non-owner double-enqueues the cron). A queue
+    //     trigger skipped on the safety-net pass is fine (owner ticks drive it; the messaging claim is
+    //     idempotent regardless).
+    //   * `drain_workflow_runs` — OUT OF B10 SCOPE (its run record has no CAS-safe claim), so it stays
+    //     strictly leader-gated and is never sharded — a documented residual for the review panel.
+    if maintenance {
+        let leader = inner.cron_leader_gate.get().is_none_or(|gate| gate());
         for project_name in &projects {
             let project = ProjectRef::new(project_name);
             for function in deploy.list_stored_functions(project).await? {
-                // Fire due triggers first (a cron enqueues an invocation this
-                // tick), then drain the queue so a just-enqueued call runs without
-                // waiting.
-                dispatch_function_triggers(inner, deploy, project, &function, &now).await;
+                let owns = match async_pass {
+                    AsyncPass::Legacy => leader,
+                    AsyncPass::Sharded => {
+                        let key = crate::async_shard_key_function(project_name, &function.name);
+                        inner.async_shard_owns(deploy, &key).await
+                    }
+                    // The safety net drains everyone's queues (owner or not); the CAS makes it safe.
+                    AsyncPass::UnshardedSafetyNet => true,
+                };
+                if !owns {
+                    continue;
+                }
+                // Fire due triggers first (a function cron enqueues an invocation this tick), then
+                // drain the queue so a just-enqueued call runs without waiting. Triggers fire only on
+                // the OWNER/LEADER (single-fire, no CAS dedup for the enqueue) — never on the safety
+                // net; the queue drain runs everywhere it's reached (CAS-idempotent).
+                if async_pass != AsyncPass::UnshardedSafetyNet {
+                    dispatch_function_triggers(inner, deploy, project, &function, &now).await;
+                }
                 drain_function_invocations(inner, deploy, project, &function).await;
             }
-            // --- workflow runs (FA-6), same leader gate ---
-            for workflow in deploy.list_workflows(project).await? {
-                drain_workflow_runs(inner, deploy, project, &workflow).await;
+            // --- workflow runs (FA-6): strictly leader-gated, NOT sharded (B10 residual) ---
+            if leader && async_pass != AsyncPass::UnshardedSafetyNet {
+                for workflow in deploy.list_workflows(project).await? {
+                    drain_workflow_runs(inner, deploy, project, &workflow).await;
+                }
             }
         }
     }

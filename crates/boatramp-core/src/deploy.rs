@@ -1466,6 +1466,52 @@ impl DeployStore {
         Ok(out)
     }
 
+    /// Whether the KV backend offers a **linearizable** compare-and-set (B10). When `true`, the
+    /// async-lane drain can be sharded safely — the CAS claim ([`claim_invocation`](Self::claim_invocation))
+    /// guarantees at most one node transitions an invocation to `Running` even in the double-owner
+    /// window of a membership change. When `false` (a non-transactional remote KV), the drain MUST
+    /// stay leader-gated (owns-all), so a plain read-then-write claim never races a second node.
+    pub fn supports_invocation_cas(&self) -> bool {
+        self.kv.supports_cas()
+    }
+
+    /// **Atomically claim** a queued (or lease-expired `Running`) invocation for execution (B10 — the
+    /// central shard mechanism). Reads the current record, verifies it is still claimable as of that
+    /// read, then compare-and-sets the claimed record (`Running` + a fresh lease + `attempts+1`) onto
+    /// the EXACT bytes it observed. The CAS admits the transition for **at most one** node: a second
+    /// node in the double-owner window reads the same `Queued` record, computes its own claim, and its
+    /// CAS fails because the first node already changed the bytes — so it re-scans instead of
+    /// double-executing (Invariant 1).
+    ///
+    /// `lease_expires`/`attempts`/`updated` are set by the caller on `claimed` (the drain sizes the
+    /// lease to the async ceiling and counts the attempt before running, so a crash still advances
+    /// toward the dead-letter cap). Returns `Ok(true)` when this node won the claim, `Ok(false)` when
+    /// it lost the race (or the record moved on — settled, redeployed) and must skip it.
+    ///
+    /// The compare is whole-record: any concurrent mutation changes the serialized bytes, so the CAS
+    /// correctly fails closed. On a best-effort-CAS backend (`supports_invocation_cas() == false`)
+    /// this is still correct **only** under a single writer — which is why a non-CAS backend keeps the
+    /// drain leader-gated. Idempotent redundant scans (the unsharded safety-net, B7) are made safe by
+    /// exactly this CAS.
+    pub async fn claim_invocation(
+        &self,
+        project: ProjectRef<'_>,
+        observed: &crate::function::Invocation,
+        claimed: &crate::function::Invocation,
+    ) -> Result<bool, DeployError> {
+        let key =
+            crate::function::keys::invocation(project.as_str(), &observed.function, &observed.id);
+        // The bytes we must still see for the claim to be valid — re-serialize the observed record so
+        // the compare is against exactly what a `get`/`list` returned (the CAS is whole-record).
+        let expected =
+            serde_json::to_vec(observed).map_err(|e| DeployError::Serde(e.to_string()))?;
+        let next = serde_json::to_vec(claimed).map_err(|e| DeployError::Serde(e.to_string()))?;
+        Ok(self
+            .kv
+            .compare_and_swap(&key, Some(&expected), next)
+            .await?)
+    }
+
     /// Bind an idempotency key to an invocation id (the dedup pointer). The value
     /// is the raw invocation id.
     pub async fn put_idempotency(

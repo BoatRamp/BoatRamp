@@ -112,6 +112,23 @@ pub enum WriteOp {
         key: String,
     },
     Batch(Vec<Self>),
+    /// **Compare-and-set** `key` (B10 — the async-lane shard claim's cross-node CAS): write `value`
+    /// IFF the current applied value equals `expected` (`None` = expect the key absent). Applied as
+    /// ONE leader-serialized apply, so it is linearizable cluster-wide — two nodes in a function's
+    /// double-owner window that both read the same `Queued` invocation and both propose a CAS onto
+    /// those bytes will apply in SOME serial order, and only the first observes the match; the second
+    /// sees the already-swapped bytes and is a no-op. The apply returns [`WriteResponse::Cas`] with
+    /// whether the swap happened, which the loser reads as "re-scan, don't double-execute." Determinism:
+    /// the decision is a pure byte comparison of replicated applied state — identical on every replica.
+    CompareAndSwap {
+        key: String,
+        /// The exact prior bytes the claimer observed; the swap fires only if the applied value still
+        /// equals this. `#[serde(default)]` (base64 in JSON) so a rolling-upgrade replica decodes it;
+        /// `None` = expect-absent (create-if-missing).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected: Option<Vec<u8>>,
+        value: Vec<u8>,
+    },
     /// Append a message's index record (`attempts=0`, claimable now). The
     /// payload was already written to shared `Storage` by the publisher. When
     /// `retain` (the publisher observed a registered consumer group on the topic),
@@ -371,6 +388,21 @@ pub(crate) fn apply_op(target: &mut ApplyTarget, op: WriteOp) -> WriteResponse {
                 apply_op(target, op);
             }
             WriteResponse::Kv
+        }
+        WriteOp::CompareAndSwap {
+            key,
+            expected,
+            value,
+        } => {
+            // B10 cross-node CAS: swap only if the applied value still equals `expected`. A pure
+            // comparison of replicated bytes inside this one leader-serialized apply, so two racing
+            // proposals apply in a serial order and only the first matches — the linearizable claim.
+            let current = target.data.get(&key).map(|v| v.as_slice());
+            let swapped = current == expected.as_deref();
+            if swapped {
+                target.put(key, value);
+            }
+            WriteResponse::Cas(swapped)
         }
         WriteOp::MqPublish {
             topic,
@@ -957,6 +989,9 @@ pub enum WriteResponse {
     Kv,
     /// A claim's leased records (id + attempt count).
     Claimed(Vec<ClaimedRecord>),
+    /// A [`WriteOp::CompareAndSwap`] outcome (B10): whether the swap happened (the observed value
+    /// still matched `expected`). The loser of an async-lane claim race reads `false` and re-scans.
+    Cas(bool),
     /// A grouped retention sweep's reclaimed message ids (the caller deletes their
     /// `Storage` payloads).
     Reclaimed(Vec<String>),
@@ -1674,6 +1709,35 @@ impl boatramp_core::kv::KvStore for RaftKv {
             .collect();
         self.propose(WriteOp::Batch(batch)).await
     }
+
+    fn supports_cas(&self) -> bool {
+        // The CAS is a single leader-serialized apply (`WriteOp::CompareAndSwap`), so it is
+        // linearizable cluster-wide — the async-lane shard claim (B10) is safe over RaftKv.
+        true
+    }
+
+    async fn compare_and_swap(
+        &self,
+        key: &str,
+        expected: Option<&[u8]>,
+        value: Vec<u8>,
+    ) -> Result<bool, boatramp_core::kv::KvError> {
+        // Propose the CAS to the leader; the apply compares the replicated bytes and swaps at most
+        // once cluster-wide. Read back whether THIS proposal won (the loser re-scans, never re-runs).
+        let resp = self
+            .propose_with_response(WriteOp::CompareAndSwap {
+                key: key.to_string(),
+                expected: expected.map(<[u8]>::to_vec),
+                value,
+            })
+            .await?;
+        match resp {
+            WriteResponse::Cas(swapped) => Ok(swapped),
+            // A non-CAS response can only mean a programming error (wrong op); fail closed (no swap)
+            // rather than claim a win we didn't get.
+            _ => Ok(false),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1738,6 +1802,119 @@ mod tests {
         );
         assert_eq!(second, WriteResponse::Admitted(AdmitOutcome::Admitted));
         assert!(data.contains_key(&trust_key_hex(6, "cc03")));
+    }
+
+    /// B10 cross-node CAS: [`WriteOp::CompareAndSwap`] applies deterministically and swaps at most
+    /// once for a given observed value. Two racing claimers of the same `Queued` invocation both
+    /// propose a CAS onto the SAME observed bytes; when the applies serialize, only the FIRST sees
+    /// the match — the second sees the already-swapped bytes and is a no-op. This is the exact
+    /// serialization the async-lane shard claim relies on for "at most one node runs an invocation."
+    #[test]
+    fn compare_and_swap_swaps_at_most_once_per_observed_value() {
+        let mut data = BTreeMap::new();
+        data.insert("inv/1".to_string(), b"queued".to_vec());
+
+        // Node A's claim: observed "queued" → wants "running-A". Applies first → wins.
+        let mut t = ApplyTarget::new(&mut data);
+        let a = apply_op(
+            &mut t,
+            WriteOp::CompareAndSwap {
+                key: "inv/1".into(),
+                expected: Some(b"queued".to_vec()),
+                value: b"running-A".to_vec(),
+            },
+        );
+        assert_eq!(a, WriteResponse::Cas(true), "first claimer wins");
+        assert_eq!(
+            data.get("inv/1").map(Vec::as_slice),
+            Some(&b"running-A"[..])
+        );
+
+        // Node B's claim in the double-owner window: it ALSO observed "queued" and proposes onto it,
+        // but its apply serializes AFTER A's → the value is now "running-A" ≠ "queued" → no swap.
+        let mut t2 = ApplyTarget::new(&mut data);
+        let b = apply_op(
+            &mut t2,
+            WriteOp::CompareAndSwap {
+                key: "inv/1".into(),
+                expected: Some(b"queued".to_vec()),
+                value: b"running-B".to_vec(),
+            },
+        );
+        assert_eq!(
+            b,
+            WriteResponse::Cas(false),
+            "the loser's stale-expected CAS is a no-op"
+        );
+        assert_eq!(
+            data.get("inv/1").map(Vec::as_slice),
+            Some(&b"running-A"[..]),
+            "the record is NOT overwritten by the loser"
+        );
+
+        // Expect-absent (create-if-missing) semantics: swaps only when the key is absent.
+        let mut t3 = ApplyTarget::new(&mut data);
+        let miss = apply_op(
+            &mut t3,
+            WriteOp::CompareAndSwap {
+                key: "inv/2".into(),
+                expected: None,
+                value: b"created".to_vec(),
+            },
+        );
+        assert_eq!(miss, WriteResponse::Cas(true));
+        assert_eq!(data.get("inv/2").map(Vec::as_slice), Some(&b"created"[..]));
+    }
+
+    /// End-to-end over a live single-node Raft: [`RaftKv::compare_and_swap`] forwards through the
+    /// leader apply, so two concurrent claimers of the same value yield exactly one winner cluster-
+    /// wide. This is the CAS-claim race gate at the RaftKv seam (the KV the cluster deploy store uses).
+    #[tokio::test]
+    async fn raftkv_compare_and_swap_has_exactly_one_winner() {
+        use boatramp_core::kv::KvStore;
+
+        let registry = Registry::default();
+        let config = Arc::new(Config::default().validate().unwrap());
+        let (log, sm) = (LogStore::default(), StateMachineStore::default());
+        let network = NetworkFactory::new(registry.clone());
+        let raft = Raft::new(1, config, network, log, sm.clone())
+            .await
+            .unwrap();
+        registry.register(1, raft.clone());
+        raft.initialize(std::collections::BTreeSet::from([1]))
+            .await
+            .unwrap();
+        // Wait for this node to become leader before proposing.
+        for _ in 0..50 {
+            if is_leader(&raft, 1) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let kv: Arc<dyn KvStore> =
+            Arc::new(RaftKv::in_process(raft, registry, Arc::new(sm.clone())));
+        kv.put("inv/x", b"queued".to_vec()).await.unwrap();
+
+        // 16 racers all try queued→<id>; the leader-serialized apply admits exactly one.
+        let mut set = tokio::task::JoinSet::new();
+        for i in 0..16u32 {
+            let kv = kv.clone();
+            set.spawn(async move {
+                kv.compare_and_swap("inv/x", Some(b"queued"), i.to_le_bytes().to_vec())
+                    .await
+                    .unwrap()
+            });
+        }
+        let mut wins = 0;
+        while let Some(res) = set.join_next().await {
+            if res.unwrap() {
+                wins += 1;
+            }
+        }
+        assert_eq!(
+            wins, 1,
+            "exactly one racing CAS wins through the Raft apply"
+        );
     }
 
     /// A revocation tombstone bars re-admission (F6): once `mesh/revoked/{key}`

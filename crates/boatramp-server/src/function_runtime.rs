@@ -1662,20 +1662,37 @@ pub(super) async fn drain_function_invocations(
         let Ok(permit) = inner.async_drain_gate.clone().try_acquire_owned() else {
             break;
         };
-        // Claim: pin `Running` + a lease sized to the async ceiling, count the
-        // attempt, and persist. The persisted lease is the cluster-wide claim —
-        // another leader won't re-run it until the lease elapses; counting the
-        // attempt *before* running means a run that crashes the node still
-        // advances toward the dead-letter cap, so a poison job can't loop forever.
+        // Claim: pin `Running` + a lease sized to the async ceiling, count the attempt, and persist
+        // — but via a **compare-and-set** on the exact record we observed (B10), NOT a blind write.
+        // Sharding removed the leader-gate that made a plain read-then-write safe: in a membership
+        // transition the old and new owner may briefly both drain this function (the double-owner
+        // window), so the Queued→Running (or expired-lease reclaim) transition MUST succeed for at
+        // most ONE node. The CAS admits exactly one: a racing node observed the SAME record, computes
+        // its own claim, and its CAS fails because our swap already changed the bytes — it re-scans
+        // instead of double-executing (Invariant 1). Counting the attempt *before* running means a
+        // run that crashes the node still advances toward the dead-letter cap (a poison job can't
+        // loop forever). The lease is the cluster-wide hold: a crashed owner's expired `Running` is
+        // reclaimable by any node via this same CAS (Invariant 2, lease-expiry reclaim).
+        let observed = inv.clone();
         let mut claimed = inv;
         claimed.status = InvocationStatus::Running;
         claimed.attempts = claimed.attempts.saturating_add(1);
         claimed.lease_expires = Some(now.saturating_add(lease_ttl_secs(inner)));
         claimed.updated = now;
-        if let Err(err) = deploy.put_invocation(project, &claimed).await {
-            tracing::warn!(function = %function.name, %err, "claiming invocation failed");
-            drop(permit);
-            continue;
+        match deploy.claim_invocation(project, &observed, &claimed).await {
+            Ok(true) => {} // won the claim — run it
+            Ok(false) => {
+                // Lost the race (another node claimed it first) or the record moved on since the
+                // scan — skip it, don't double-execute. Redundant scans (the unsharded safety-net)
+                // are idempotent precisely because of this CAS.
+                drop(permit);
+                continue;
+            }
+            Err(err) => {
+                tracing::warn!(function = %function.name, %err, "claiming invocation failed");
+                drop(permit);
+                continue;
+            }
         }
         let inner = inner.clone();
         let deploy = deploy.clone();
