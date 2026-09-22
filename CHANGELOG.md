@@ -5,6 +5,33 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.4.28] - 2026-09-22
+
+**CLI for schema migrations** — `boatramp project migrate`. The owner-gated schema-migration surface
+shipped server-side in 0.4.25 (`/api/migrate/{db}/{apply,dry-run,baseline,status}`), but the only way
+to drive it was raw HTTP. This adds a first-class client, nested under `project` (a schema migration
+is a project-scoped `Project·Admin` operation, and the top-level `boatramp migrate` is the unrelated
+pre-0.2.0 control-plane store re-key). No server change — the API, its authz gate, and its Security
+review are unchanged from 0.4.25.
+
+### Added
+
+- `boatramp project migrate apply|dry-run|baseline|status --db <db> [--dir <dir> | --file <manifest>]
+  [--up-to <id>] [--json]`. The mutating verbs assemble/serialize the step set, upload it as a
+  content-addressed blob (reusing the existing blob endpoint), then trigger by hash; `status` reads
+  the applied ledger. A human summary/table by default, the raw `MigrationReport` / `MigrationStatus`
+  JSON under `--json`.
+- **Migrations directory (`--dir`)** — the everyday authoring path: one file per step, `id` = file
+  name minus its kind suffix, applied in lexicographic filename order. The suffix picks the kind —
+  `NNNN_x.sql` (sql), `NNNN_x.notx.sql` (sql, `no_transaction`), `NNNN_x.ext` (extension name),
+  `NNNN_x.fn.json` (`{ name, version?, args? }`). An unrecognized suffix or a duplicate id is a hard
+  error (a mistyped migration is never silently dropped or reordered). `--file` still takes a
+  pre-authored canonical `{ "steps": [ … ] }` bundle; the two forms hash-agree for the same steps.
+- A step that **ran but failed** (HTTP `422`, whose body still carries the full report with `failed`
+  set) is printed with the failing step and exits **non-zero**, so a deploy pipeline halts on it;
+  bundle/ledger errors (`400`/`409`/`501`/`503`) surface verbatim. The mutating verbs need a
+  `Project·Admin` token, `status` only `Project·Read` (documented in the command help + the how-to).
+
 ## [0.4.27] - 2026-09-22
 
 **Event-driven message delivery + cross-node topic sharding** — delivery no longer scales with the

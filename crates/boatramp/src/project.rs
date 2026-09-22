@@ -23,6 +23,9 @@ pub enum Error {
     /// The operator aborted (or could not be prompted for) a destructive delete.
     #[error("{0}")]
     Aborted(String),
+    /// A `project migrate` subcommand failure.
+    #[error(transparent)]
+    Migrate(#[from] crate::project_migrate::Error),
 }
 
 /// `project` module result; `Err` is [`Error`].
@@ -80,6 +83,10 @@ enum ProjectCommand {
         #[arg(long, short = 'y')]
         yes: bool,
     },
+    /// Drive this project's owner-gated schema migrations for a managed database
+    /// (`migrate apply|dry-run|baseline|status`). The mutating verbs run as the project's
+    /// non-superuser owner role and need a `Project·Admin` token; `status` needs `Project·Read`.
+    Migrate(crate::project_migrate::MigrateArgs),
 }
 
 /// Whether a `--force` confirmation `typed` at the prompt authorizes deleting
@@ -192,9 +199,9 @@ fn summarize_plan(name: &str, plan: &serde_json::Value) -> String {
 /// Entry point for `boatramp project`.
 pub async fn run(args: ProjectArgs, config: &ProjectConfig) -> Result<()> {
     let (server, http) = client::connect(args.server, config)?;
-    // The `project` subcommand only calls project-collection endpoints (list/create/
-    // get/delete), which are not site-scoped, so the resolved project is inert here —
-    // passed only to satisfy the constructor.
+    // The project-collection endpoints (list/create/get/delete) are not project-scoped, so
+    // the resolved project is inert for them; `migrate`, however, targets the active
+    // `--project`'s migrate surface via its `project_seg`, so we resolve it here.
     let cp = client::ControlPlane::new(server, http, client::resolve_project(config));
 
     match args.command {
@@ -295,6 +302,9 @@ pub async fn run(args: ProjectArgs, config: &ProjectConfig) -> Result<()> {
                     Err(e) => return Err(e.into()),
                 }
             }
+        }
+        ProjectCommand::Migrate(margs) => {
+            crate::project_migrate::run(margs, &cp).await?;
         }
     }
     Ok(())
