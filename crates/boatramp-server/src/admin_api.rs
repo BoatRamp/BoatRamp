@@ -1007,16 +1007,18 @@ pub(super) async fn delete_compute(
 // ---------------------------------------------------------------------------
 
 /// Reject a `{db}` path param that is not a safe URL path segment, short-circuiting the
-/// handler with `400` before any lookup. The name arrives already percent-decoded by
-/// axum's `Path` extractor, so a smuggled `%2F` is caught as a literal `/`. Routes
-/// through the one canonical [`validate_resource_name`](boatramp_core::project::validate_resource_name)
+/// handler before any lookup. The name arrives already percent-decoded by axum's `Path`
+/// extractor, so a smuggled `%2F` is caught as a literal `/`. Routes through the one
+/// canonical [`validate_resource_name`](boatramp_core::project::validate_resource_name)
 /// (`kind = "database"`) so the accept/reject rule matches config load, the CLI `--db`,
-/// and the handler lookup. `None` = the name is fine. `400` (not `422`) to match the
-/// existing `sql`/`migrate` handlers' bad-input style.
+/// and the handler lookup. `None` = the name is fine. Returns **`422`** — a well-formed
+/// request carrying a semantically-invalid resource identifier — to match the other
+/// resource-name path-param rejections (`reject_invalid_name`), so the "one spec" surfaces
+/// as one status code across every resource-identifier ingress.
 fn reject_invalid_db(db: &str) -> Option<Response> {
     boatramp_core::project::validate_resource_name("database", db)
         .err()
-        .map(|err| (StatusCode::BAD_REQUEST, format!("{err}\n")).into_response())
+        .map(|err| (StatusCode::UNPROCESSABLE_ENTITY, format!("{err}\n")).into_response())
 }
 
 /// A managed-DB migration script (multiple statements; simple-query protocol).
@@ -2871,13 +2873,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sql_handlers_reject_an_invalid_db_path_param_with_400() {
+    async fn sql_handlers_reject_an_invalid_db_path_param_with_422() {
         // Every `{db}` ingress fails closed on a name that is not a safe URL path
-        // segment — BEFORE any lookup — with `400` and the canonical validator's
-        // reason. The empty-string `{db}` (a `/api/sql//exec` collapse) and a
-        // separator-bearing `{db}` (a smuggled `%2F`, arriving decoded as `/`) are the
-        // headline cases. The `op`/`substrate` extension is present (so a `501`/`503`
-        // can't mask the rejection).
+        // segment — BEFORE any lookup — with `422` (a well-formed request bearing a
+        // semantically-invalid resource identifier, matching the other resource-name
+        // path-param rejections) and the canonical validator's reason. The empty-string
+        // `{db}` (a `/api/sql//exec` collapse) and a separator-bearing `{db}` (a smuggled
+        // `%2F`, arriving decoded as `/`) are the headline cases. The `op`/`substrate`
+        // extension is present (so a `501`/`503` can't mask the rejection).
         let op: Arc<dyn boatramp_core::sql::OperatorSql> = Arc::new(FakePingSql(vec![]));
         for bad in ["", "a/b", "..", "proj*"] {
             let resp = sql_ping(
@@ -2888,8 +2891,8 @@ mod tests {
             .await;
             assert_eq!(
                 resp.status(),
-                StatusCode::BAD_REQUEST,
-                "db {bad:?} should be rejected with 400"
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "db {bad:?} should be rejected with 422"
             );
         }
         // A valid `{db}` passes the screen (reaches the handler; here `default` pings

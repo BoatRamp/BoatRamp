@@ -80,11 +80,22 @@ pub const MAX_RESOURCE_NAME_LEN: usize = 63;
 /// `project/<proj>/…` key prefix, collide with the store's fixed sub-key grammar,
 /// smuggle a (possibly percent-decoded) path separator, break Cedar entity/target
 /// construction, or — for a SQL db-binding name threaded into `/api/sql/{db}/…` —
-/// collapse into an empty or `//` URL path segment. This is the **one** canonical
-/// resource-identifier validator; every ingress (config load, control-plane API path
-/// params, CLI `--db`, handler lookup) routes through it so the accept/reject rule is
-/// identical everywhere. `kind` is a free-form label for the error message
-/// (`"project"`, `"site"`, `"function"`, `"database"`, …); the rule set is uniform.
+/// collapse into an empty or `//` URL path segment. This is the canonical
+/// resource-identifier validator for every **operator / control-plane / URL-path** ingress
+/// (config load, control-plane API path params, CLI `--db`, handler lookup) — they all route
+/// through it so the accept/reject rule is identical there. `kind` is a free-form label for
+/// the error message (`"project"`, `"site"`, `"function"`, `"database"`, …); the rule set is
+/// uniform.
+///
+/// Two *guest-facing* db-name boundaries keep their own, deliberately **stricter** rules and
+/// are NOT this function (they are provable subsets in the dangerous direction, so they never
+/// accept what this rejects — enforced by subset tests, so the relationship can't silently
+/// drift): the `sql:<name>` allow-import grant
+/// ([`is_named_sql_import`](crate::config) — a tight `[A-Za-z0-9_-]` allowlist on what a guest
+/// may name in `sql.open`), and the libsql storage boundary
+/// (`boatramp-storage`'s `validate_db_name` — same class, but it still accepts `""` for the
+/// legacy default until the name-independent-path work lands). Do not add a third divergent
+/// rule set; extend one of these or this function.
 ///
 /// Rejects: the empty string, names longer than [`MAX_RESOURCE_NAME_LEN`] bytes,
 /// `.` / `..`, and any name containing a path separator (`/` or `\`), a `*` (the
