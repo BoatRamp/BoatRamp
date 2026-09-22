@@ -1350,6 +1350,25 @@ impl ControlPlane {
         Ok(hash)
     }
 
+    /// Hash an in-memory blob (sha256-hex, identical to [`hash_file`]) and upload it; returns its
+    /// content-address. For a bundle the CLI assembles in memory — e.g. `project migrate` reading a
+    /// migrations directory — rather than a file already on disk.
+    pub async fn put_bytes_blob(&self, bytes: Vec<u8>) -> Result<String> {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(&bytes);
+        let hash = hex::encode(hasher.finalize());
+        let Self {
+            http, base: server, ..
+        } = self;
+        http.put(format!("{server}/api/blobs/{hash}"))
+            .body(bytes)
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(hash)
+    }
+
     /// Resolve an **artifact reference** — a `--kernel` / `--rootfs` value — to a blob
     /// hash the server can stage. Accepts three forms:
     /// - a 64-hex content-address ⇒ used as-is (assumed already uploaded);
