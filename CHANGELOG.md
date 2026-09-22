@@ -5,7 +5,7 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
-## [Unreleased] - 0.5.0
+## [0.5.0] - 2026-09-22
 
 **BREAKING — uniform resource-identifier screening at every ingress + the default SQL
 database binding is now named `default`.** A single canonical validator
