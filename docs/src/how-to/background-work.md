@@ -121,6 +121,12 @@ validated mailer.wasm — consumer topic "emails"
 activated my-site -> a1b2c3d4
 ```
 
+In a cluster a cron fires on the one node that **owns** it (a stable hash over the live
+membership), so cron work spreads across the fleet — it fires **once per minute**, cluster-wide,
+not once per node. During a rare membership change (a node joining or leaving) a single tick may be
+missed; crons are best-effort periodic, so a skipped minute during a reshuffle is expected, not a
+failure. On a single node this is unchanged — every scheduled minute fires.
+
 ## Operate the dead-letter queue
 
 When a message exhausts `max_attempts`, boatramp dead-letters it and retains the

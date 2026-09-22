@@ -230,8 +230,12 @@ $ boatramp function trigger rm greeter tick
   backend's native change notification (inotify/FSEvents locally, S3→SQS in the
   cloud). The changed key + kind arrive as the invocation's JSON body. It needs a
   **watch-capable** storage backend: on one that can't watch, adding the trigger is
-  refused (a `400`, never a silent no-op). In a cluster the scheduler fires each
-  trigger on the leader, exactly once.
+  refused (a `400`, never a silent no-op). In a cluster each trigger fires on the one
+  node that **owns** the function (a stable hash over the live membership), not the
+  leader, so the watch work spreads across the fleet; a change is enqueued exactly once
+  cluster-wide. A change that arrives while the previous run for the same key is still
+  in flight **coalesces** into that run (a debounce) rather than queuing a second run;
+  a change after the previous run has settled re-fires normally.
 
 ### Cloud blob triggers (auto-provisioning)
 
