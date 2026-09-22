@@ -137,6 +137,19 @@ fn ctx_stamp(value: &boatramp_core::sql::SqlValue) -> Option<String> {
     }
 }
 
+/// The PLAIN resolved own-tenant value of a principal, as a string — the literal tenant segment an
+/// app uses (NOT the COSE-signed durable envelope [`mint_producer_context`] mints). Used to fill the
+/// `{tenant}` placeholder in a `messaging-stats` bus-topic template with the SAME tenant the SQL scope
+/// injector resolved. `None` for an unscoped/anonymous invocation or a non-scalar tenant value — a
+/// `{tenant}` template is then refused (the stats binding fails closed). The guest never supplies it.
+#[cfg(feature = "handlers")]
+pub(super) fn resolved_tenant_string(principal: &[boatramp_handlers::ScopeFact]) -> Option<String> {
+    principal
+        .iter()
+        .find(|f| f.axis == boatramp_core::tenancy::ScopeAxis::Tenant)
+        .and_then(|f| ctx_stamp(&f.value))
+}
+
 /// The tenant claim a component's `token` source names (Gap 3) — the first `TenantSource::Token`
 /// in a `Scoped` tenancy decision. `None` when the component declares no token source (so
 /// `present-token` has nothing to verify against → deny-by-default).
@@ -988,6 +1001,23 @@ pub(super) async fn build_function_bindings(
                 format!("{}/", project.qualified("bus")),
                 messaging.clone(),
                 signed_context,
+            );
+        }
+    }
+    // The read-only `messaging-stats` capability: surface the already-computed per-topic bus gauges
+    // to a granted function. Plain topics resolve under the function's own `scope` prefix; a
+    // `bus:<template>` topic must be one of the function's declared `stats_topics`, and the host
+    // substitutes THIS invocation's resolved tenant for the template's `{tenant}` placeholder — the
+    // guest never names a tenant, so no cross-tenant oracle. Deny-by-default.
+    if granted("messaging-stats") {
+        if let Some(messaging) = &inner.messaging {
+            let resolved_tenant = resolved_tenant_string(&caller_tenant);
+            bindings = bindings.with_messaging_stats(
+                format!("{scope}/"),
+                format!("{}/", project.qualified("bus")),
+                messaging.clone(),
+                config.stats_topics.clone(),
+                resolved_tenant,
             );
         }
     }

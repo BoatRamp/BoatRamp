@@ -186,8 +186,7 @@ async fn run_delivery_drainer(inner: Arc<HandlerRuntimeInner>, deploy: DeploySto
     // these are never touched; they satisfy `run_scheduler_tick`'s signature only.
     let mut cron_state: std::collections::HashMap<String, CronEntry> =
         std::collections::HashMap::new();
-    let mut sweep_state: std::collections::HashMap<String, i64> =
-        std::collections::HashMap::new();
+    let mut sweep_state: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
 
     // The redelivery **due-heap** (B6): a pure rebuild-from-durable-state cache of per-topic next
     // lease-expiry deadlines. NEVER the authority — rebuilt from the index on start (below) and on a
@@ -636,6 +635,8 @@ pub(super) async fn run_scheduler_tick(
                                 &std::collections::BTreeMap::new(),
                                 // Consumers do not get the invoke capability (no allowlist field).
                                 &[],
+                                // The consumer's declared `bus:` stats-topic templates (messaging-stats).
+                                &consumer.stats_topics,
                                 0,
                                 // Background consumers have no request context to correlate with.
                                 None,
@@ -687,6 +688,7 @@ pub(super) async fn run_scheduler_tick(
                                     site_handlers,
                                     tenancy: consumer.tenancy.as_ref(),
                                     token_claims: consumer.token_claims.as_ref(),
+                                    stats_topics: &consumer.stats_topics,
                                 });
                             acked += dispatch_consumer_batch(
                                 &inner.engine,
@@ -823,8 +825,7 @@ pub(super) async fn run_scheduler_tick(
     // the tick, so a long background job never stalls this loop (crons, other
     // drains, workflow progress) and a crash mid-run is reclaimed when the lease
     // elapses.
-    let invoke_enabled =
-        maintenance && inner.cron_leader_gate.get().is_none_or(|gate| gate());
+    let invoke_enabled = maintenance && inner.cron_leader_gate.get().is_none_or(|gate| gate());
     if invoke_enabled {
         // Same per-project fan-out as the site loop: each project's functions +
         // workflows drain under their own tenant.
@@ -887,6 +888,7 @@ async fn fire_cron(
         // A cron-triggered handler is also the root of a call chain (depth 0); its
         // invoke allowlist applies the same as on the HTTP path.
         &handler.invoke_targets,
+        &handler.stats_topics,
         0,
         // A cron trigger has no inbound request to correlate with.
         None,

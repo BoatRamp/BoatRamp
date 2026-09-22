@@ -3540,6 +3540,7 @@ mod tests {
                     token_claims: None,
                     backoff_ms: None,
                     retention_ms: None,
+                    stats_topics: Vec::new(),
                     topic: "orders/created".into(),
                     component: "consumer.wasm".into(),
                     imports: vec!["wasi:keyvalue".into()],
@@ -3600,9 +3601,17 @@ mod tests {
             minute_stamp: 0,
         };
         for _ in 0..3 {
-            run_scheduler_tick(&inner, &deploy, &mut cache, &mut crons, &mut sweep, now, ConsumerFilter::All)
-                .await
-                .unwrap();
+            run_scheduler_tick(
+                &inner,
+                &deploy,
+                &mut cache,
+                &mut crons,
+                &mut sweep,
+                now,
+                ConsumerFilter::All,
+            )
+            .await
+            .unwrap();
         }
 
         // The production message was delivered + counted.
@@ -3682,7 +3691,10 @@ mod tests {
             ..Default::default()
         };
         let id = deploy.put_manifest(&manifest).await.unwrap();
-        deploy.activate(ProjectRef::DEFAULT, "blog", &id).await.unwrap();
+        deploy
+            .activate(ProjectRef::DEFAULT, "blog", &id)
+            .await
+            .unwrap();
         deploy
             .set_site_config(
                 ProjectRef::DEFAULT,
@@ -3747,7 +3759,10 @@ mod tests {
         });
         let handle = rt.spawn_scheduler(deploy).unwrap();
         // Publish AFTER the drainer is spawned/parked — with no wake, only the safety-net can deliver.
-        messaging.publish("blog/orders/created", b"x").await.unwrap();
+        messaging
+            .publish("blog/orders/created", b"x")
+            .await
+            .unwrap();
         assert!(
             await_delivered(&kv, b"1", Duration::from_secs(5)).await,
             "gate 2: with the wake dropped, the safety-net still delivers the message"
@@ -3774,7 +3789,10 @@ mod tests {
             rebuild_interval: Duration::from_millis(200),
         });
         // Publish, then DELETE the ready marker (the crash window: index durable, marker not applied).
-        messaging.publish("blog/orders/created", b"x").await.unwrap();
+        messaging
+            .publish("blog/orders/created", b"x")
+            .await
+            .unwrap();
         kv.delete(&ready_key("blog/orders/created")).await.unwrap();
         assert!(
             messaging.ready_topics().await.unwrap().is_empty(),
@@ -3816,7 +3834,10 @@ mod tests {
         // race a claim that just drained the topic to empty (the prune window).
         const N: u32 = 40;
         for _ in 0..N {
-            messaging.publish("blog/orders/created", b"x").await.unwrap();
+            messaging
+                .publish("blog/orders/created", b"x")
+                .await
+                .unwrap();
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         // Every message must be delivered (the counter reaches N) well before the 1h rebuild.
@@ -3840,7 +3861,10 @@ mod tests {
             Arc::new(LogMessaging::new(storage.clone(), kv.clone()));
         // Publish + claim-with-a-short-lease OUT OF BAND (no ack), so the message is leased-but-pending
         // — exactly the state a crash leaves behind. Then start the drainer fresh (empty due-heap).
-        messaging.publish("blog/orders/created", b"x").await.unwrap();
+        messaging
+            .publish("blog/orders/created", b"x")
+            .await
+            .unwrap();
         let leased = messaging
             .claim("blog/orders/created", Duration::from_millis(500), 10, 5)
             .await
@@ -5488,6 +5512,7 @@ mod tests {
                     limits: None,
                     env: std::collections::BTreeMap::new(),
                     invoke_targets: Vec::new(),
+                    stats_topics: Vec::new(),
                 }],
                 crons: vec![CronConfig {
                     schedule: "* * * * *".into(),
@@ -5535,28 +5560,49 @@ mod tests {
         };
 
         // Fires once for the minute.
-        let (_, handles) =
-            run_scheduler_tick(&inner, &deploy, &mut wasm, &mut crons, &mut sweep, at(100), ConsumerFilter::All)
-                .await
-                .unwrap();
+        let (_, handles) = run_scheduler_tick(
+            &inner,
+            &deploy,
+            &mut wasm,
+            &mut crons,
+            &mut sweep,
+            at(100),
+            ConsumerFilter::All,
+        )
+        .await
+        .unwrap();
         for h in handles {
             h.await.unwrap();
         }
         assert_eq!(kv.get("hkv/blog/hits").await.unwrap(), Some(b"1".to_vec()));
 
         // Same minute → deduped (no fire).
-        let (_, handles) =
-            run_scheduler_tick(&inner, &deploy, &mut wasm, &mut crons, &mut sweep, at(100), ConsumerFilter::All)
-                .await
-                .unwrap();
+        let (_, handles) = run_scheduler_tick(
+            &inner,
+            &deploy,
+            &mut wasm,
+            &mut crons,
+            &mut sweep,
+            at(100),
+            ConsumerFilter::All,
+        )
+        .await
+        .unwrap();
         assert!(handles.is_empty());
         assert_eq!(kv.get("hkv/blog/hits").await.unwrap(), Some(b"1".to_vec()));
 
         // Next minute → fires again.
-        let (_, handles) =
-            run_scheduler_tick(&inner, &deploy, &mut wasm, &mut crons, &mut sweep, at(101), ConsumerFilter::All)
-                .await
-                .unwrap();
+        let (_, handles) = run_scheduler_tick(
+            &inner,
+            &deploy,
+            &mut wasm,
+            &mut crons,
+            &mut sweep,
+            at(101),
+            ConsumerFilter::All,
+        )
+        .await
+        .unwrap();
         for h in handles {
             h.await.unwrap();
         }
@@ -5570,10 +5616,17 @@ mod tests {
             .unwrap()
             .running
             .store(true, Ordering::Release);
-        let (_, handles) =
-            run_scheduler_tick(&inner, &deploy, &mut wasm, &mut crons, &mut sweep, at(102), ConsumerFilter::All)
-                .await
-                .unwrap();
+        let (_, handles) = run_scheduler_tick(
+            &inner,
+            &deploy,
+            &mut wasm,
+            &mut crons,
+            &mut sweep,
+            at(102),
+            ConsumerFilter::All,
+        )
+        .await
+        .unwrap();
         assert!(handles.is_empty());
         assert_eq!(kv.get("hkv/blog/hits").await.unwrap(), Some(b"2".to_vec()));
     }
@@ -5622,6 +5675,7 @@ mod tests {
                     limits: None,
                     env: std::collections::BTreeMap::new(),
                     invoke_targets: Vec::new(),
+                    stats_topics: Vec::new(),
                 }],
                 crons: vec![CronConfig {
                     schedule: "* * * * *".into(),
@@ -5670,10 +5724,17 @@ mod tests {
             minute_stamp: 100,
         };
 
-        let (_, handles) =
-            run_scheduler_tick(&inner, &deploy, &mut wasm, &mut crons, &mut sweep, now, ConsumerFilter::All)
-                .await
-                .unwrap();
+        let (_, handles) = run_scheduler_tick(
+            &inner,
+            &deploy,
+            &mut wasm,
+            &mut crons,
+            &mut sweep,
+            now,
+            ConsumerFilter::All,
+        )
+        .await
+        .unwrap();
         // No cron fired (a follower); the counter was never written.
         assert!(handles.is_empty(), "a non-leader must not fire crons");
         assert_eq!(kv.get("hkv/blog/hits").await.unwrap(), None);
@@ -5767,6 +5828,7 @@ mod tests {
                     &imports,
                     site,
                     env,
+                    &[],
                     &[],
                     0,
                     None,
@@ -5898,6 +5960,7 @@ mod tests {
                 &imports,
                 &site,
                 &env,
+                &[],
                 &[],
                 0,
                 None,
@@ -6060,6 +6123,7 @@ mod tests {
             site_handlers: &site,
             tenancy: Some(&tenancy),
             token_claims: None,
+            stats_topics: &[],
         };
 
         // Force the resolved own-read scope onto a SELECT and run it on the real engine.

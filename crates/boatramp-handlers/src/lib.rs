@@ -30,6 +30,11 @@ pub use bindings::invoke::{
 };
 #[cfg(feature = "messaging")]
 pub use bindings::messaging::{ProducerContext, BUS_TOPIC_SELECTOR};
+#[cfg(feature = "messaging")]
+pub use bindings::messaging_stats::{
+    GroupStats as StatsGroupStats, StatsBinding, StatsRefused, TopicStats as StatsTopicStats,
+    TENANT_PLACEHOLDER as STATS_TENANT_PLACEHOLDER,
+};
 #[cfg(feature = "migrate")]
 pub use bindings::migrate::MigrateBinding;
 #[cfg(feature = "session")]
