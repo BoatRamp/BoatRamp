@@ -29,6 +29,20 @@ pub enum Error {
     /// The control-plane returned an error response.
     #[error("{0}")]
     Server(String),
+    /// The `--db` name is not a safe URL path segment (validated client-side, before
+    /// building the request URL, so a malformed name fails fast with a clear message
+    /// instead of an opaque server error or a `//`-collapsed path).
+    #[error("{0}")]
+    InvalidDb(String),
+}
+
+/// Validate a `--db` name through the one canonical resource-identifier validator
+/// (`kind = "database"`) before it is threaded into the control-plane URL. Rejects an
+/// empty/`//`-collapsing or path-separator-bearing name with the same rule the server
+/// and config load enforce.
+fn validate_db(db: &str) -> Result<()> {
+    boatramp_core::project::validate_resource_name("database", db)
+        .map_err(|err| Error::InvalidDb(err.to_string()))
 }
 
 /// Arguments for `boatramp sql`.
@@ -48,8 +62,8 @@ enum SqlCommand {
     /// tables, RLS, chained DDL/DML) to a managed database. Reads from `--file` or
     /// standard input.
     Exec {
-        /// The database binding name (empty = the site's default database).
-        #[arg(long, default_value = "")]
+        /// The database binding name (`default` = the project's default database).
+        #[arg(long, default_value = boatramp_core::project::DEFAULT_DB_NAME)]
         db: String,
         /// Read the script from this file instead of standard input.
         #[arg(long)]
@@ -59,8 +73,8 @@ enum SqlCommand {
     Query {
         /// The SQL query (a single statement).
         sql: String,
-        /// The database binding name (empty = the site's default database).
-        #[arg(long, default_value = "")]
+        /// The database binding name (`default` = the project's default database).
+        #[arg(long, default_value = boatramp_core::project::DEFAULT_DB_NAME)]
         db: String,
         /// Output format.
         #[arg(long, value_enum, default_value_t = Format::Table)]
@@ -71,8 +85,8 @@ enum SqlCommand {
     /// actually down" from "the DB is up but the resolver won't serve it"
     /// (`REACHABLE=yes` + `HEALTHY=no`). Admin-scoped.
     Ping {
-        /// The database binding name (empty = the site's default database).
-        #[arg(long, default_value = "")]
+        /// The database binding name (`default` = the project's default database).
+        #[arg(long, default_value = boatramp_core::project::DEFAULT_DB_NAME)]
         db: String,
     },
 }
@@ -96,6 +110,7 @@ pub async fn run(args: SqlArgs, config: &ProjectConfig) -> Result<()> {
 
     match args.command {
         SqlCommand::Exec { db, file } => {
+            validate_db(&db)?;
             let sql = match file {
                 Some(path) => std::fs::read_to_string(path)?,
                 None => {
@@ -121,6 +136,7 @@ pub async fn run(args: SqlArgs, config: &ProjectConfig) -> Result<()> {
             eprintln!("ok");
         }
         SqlCommand::Query { db, sql, format } => {
+            validate_db(&db)?;
             let resp = http
                 .post(format!("{server}/api/{seg}/{db}/query"))
                 .json(&serde_json::json!({ "sql": sql }))
@@ -141,6 +157,7 @@ pub async fn run(args: SqlArgs, config: &ProjectConfig) -> Result<()> {
             }
         }
         SqlCommand::Ping { db } => {
+            validate_db(&db)?;
             let resp = http
                 .post(format!("{server}/api/{seg}/{db}/ping"))
                 .send()
@@ -245,4 +262,39 @@ fn print_table(out: &serde_json::Value) {
         cells.len(),
         if cells.len() == 1 { "" } else { "s" }
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_db_accepts_default_and_rejects_unsafe_segments() {
+        // The reserved default name and ordinary names pass; the legacy empty name and
+        // any non-path-segment name fail client-side, before a URL is ever built.
+        assert!(validate_db(boatramp_core::project::DEFAULT_DB_NAME).is_ok());
+        assert!(validate_db("analytics").is_ok());
+        for bad in ["", "a/b", "..", "a b", "proj*"] {
+            assert!(validate_db(bad).is_err(), "{bad:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn db_flag_defaults_to_the_reserved_default_name() {
+        use clap::Parser;
+        // A tiny harness mirroring how `main` wires `SqlArgs`, so the clap
+        // `default_value` is exercised (it must be `default`, never `""`).
+        #[derive(Parser)]
+        struct Harness {
+            #[command(subcommand)]
+            command: SqlCommand,
+        }
+        let h = Harness::try_parse_from(["boatramp", "ping"]).expect("ping parses");
+        match h.command {
+            SqlCommand::Ping { db } => {
+                assert_eq!(db, boatramp_core::project::DEFAULT_DB_NAME);
+            }
+            other => panic!("expected ping, got {other:?}"),
+        }
+    }
 }

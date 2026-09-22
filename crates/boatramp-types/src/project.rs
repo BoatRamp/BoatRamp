@@ -28,6 +28,20 @@ use crate::manifest::sha256_hex;
 /// is written (everything else references this constant).
 pub const DEFAULT_PROJECT: &str = "default";
 
+/// The reserved real name of the **default SQL database binding** — the binding a
+/// guest opens as `sql.open("")` and an operator/CLI addresses as `--db default`.
+///
+/// Historically the default binding was keyed by the *empty string* (`""`), which is
+/// not a valid URL path segment (it collapses `/api/sql//exec` to a `//` and cannot be
+/// typed on the CLI). As of v0.5.0 the config `DEFAULT` env token and the CLI `--db`
+/// default both resolve to this reserved name, so every db-name ingress carries a
+/// non-empty, path-segment-safe identifier that passes
+/// [`validate_resource_name`]`("database", …)`. The guest-facing empty-name contract
+/// (`sql.open("")` = the default DB) is preserved by aliasing `""` ⇄ this name at the
+/// backend-resolution boundary, so no guest change is required. This is the **only**
+/// place the literal is written.
+pub const DEFAULT_DB_NAME: &str = "default";
+
 /// KV prefix for the mutable pointer `projectmeta/<name>` → active spec hash.
 pub const POINTER_PREFIX: &str = "projectmeta/";
 /// KV prefix for the immutable, content-addressed project spec body.

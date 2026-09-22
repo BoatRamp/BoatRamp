@@ -563,6 +563,12 @@ impl NodeOperatorSql {
     ) -> Result<Arc<dyn boatramp_core::sql::SqlBackend>, SqlError> {
         use boatramp_storage::sql_compute::ComputeResolvedSqlBackend;
         use boatramp_storage::sql_sqlx::{connect, ExternalSqlOptions};
+        // Defense-in-depth: the API path param + CLI `--db` are validated before they
+        // reach here, but this is the single lookup choke point for every operator
+        // SQL / migration caller, so re-run the one canonical validator (`database`)
+        // to fail closed on any db name that is not a safe URL path segment.
+        boatramp_core::project::validate_resource_name("database", db)
+            .map_err(|err| SqlError::other(err.to_string()))?;
         let cfg = self
             .databases
             .get(db)

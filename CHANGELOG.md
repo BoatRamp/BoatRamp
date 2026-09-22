@@ -5,6 +5,74 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [Unreleased] - 0.5.0
+
+**BREAKING — uniform resource-identifier screening at every ingress + the default SQL
+database binding is now named `default`.** A single canonical validator
+(`boatramp_core::project::validate_resource_name`) that project/site/function/topic
+names already passed is now enforced on **SQL db-binding names** at every point one
+enters the system: config load, the control-plane `{db}` path params
+(`/api/sql/{db}/…`, `/api/migrate/{db}/…`), the CLI `--db`, and the handler-side
+lookup. A db name must be a safe URL path segment — non-empty, no `/` / `\` / `..` /
+whitespace / control chars, ≤ 63 bytes — so it can never collapse a control-plane path
+to `//`, smuggle a (percent-decoded) separator, or escape a store-key prefix.
+
+The load-bearing consequence: the **default database binding is no longer keyed by the
+empty string**. The reserved `DEFAULT` config token and the CLI `--db` default both now
+resolve to the real name **`default`** (a valid path segment; the new shared const
+`boatramp_core::project::DEFAULT_DB_NAME`). A guest still opens the default DB as
+`sql.open("")` — the empty name is aliased to `default` at the backend-resolution
+boundary — so **no guest change is required**; an operator now addresses it as
+`--db default`.
+
+### How to fix each finding (upgrade guide)
+
+- **A rejected empty / `""` / legacy-`DEFAULT` db name.** The default binding is now
+  named `default`.
+  - *External binding* (bring-your-own `url_env`, or a managed compute-backed DB): the
+    fix is automatic on upgrade. An external binding is a pure label over its
+    connection params, so `BOATRAMP_HANDLERS_SQL_DB_DEFAULT_*` (or a file `databases`
+    entry) now yields a binding **named `default` pointing at the SAME physical
+    database** — data and the migration ledger are intact, and it is addressable as
+    `--db default`. If you literally wrote an empty-string key in `boatramp.cfg`
+    (`databases: { "": (…) }`), rename that key to `"default"`.
+  - *Managed embedded (libsql) default DB*: the on-disk/namespace layout keys the
+    default DB by the empty name (`<site>.db`), so renaming it to `default` **moves
+    physical data** — that is out of scope for this change and needs the dedicated
+    migration tooling. Until then the guest `sql.open("")` path is unchanged (the alias
+    keeps it working); do **not** hand-rename a libsql default DB.
+    <!-- (1)/(2) libsql cure -->
+- **A rejected non-path-segment db name** (`/`, `\`, `..`, whitespace, `*`, control
+  chars, or > 63 bytes). Rename the binding at creation to a safe segment
+  (`[A-Za-z0-9._-]`, non-empty). There is no automatic cure — the old name was never a
+  valid URL path segment.
+
+### Added / changed
+
+- **One canonical validator, one rule set.** `validate_resource_name` gained a
+  `"database"` kind (no special-casing — it rides the same accept/reject rule as
+  project/site/function names) and a sharpened doc contract. `DEFAULT_DB_NAME` is the
+  single source of the reserved default-DB name.
+- **Config load fails closed** on any `handlers.bindings.sql.databases` name that is not
+  a safe path segment (`ConfigError::InvalidDbName`, checked in both
+  `ServerConfig::parse` and after the env merge), with a clear error naming the binding
+  and its reason; the empty/legacy-default case points at the `default` cure.
+- **Control-plane API** validates the `{db}` path param in the `sql` + `migrate`
+  handlers before any lookup → `400` with the reason.
+- **CLI** `--db` defaults to `default` (was `""`) for `boatramp sql {exec,query,ping}`
+  and `boatramp project migrate {apply,dry-run,baseline,status}`, and validates `--db`
+  **client-side** before building the request URL — so the path is always
+  `/api/…/default/…` (no more `//`).
+- **Handler lookup** re-runs the validator before the databases-map lookup
+  (defense-in-depth: the one lookup choke point for every operator-SQL / migration
+  caller).
+- **Cross-surface consistency guard** (CI): a property/oracle unit test asserts the
+  validator accepts a value **iff** it is a safe URL path segment, plus an integration
+  test that round-trips every accepted value through the CLI path construction and a
+  **real axum route match** (`/api/sql/{db}/…`, `/api/migrate/{db}/…`) with no
+  malformed (`//` / empty / truncated) segment — a real detector, gated in CI by the
+  `DB-NAME SCREENING CROSS-SURFACE OK` marker.
+
 ## [0.4.29] - 2026-09-22
 
 **Async-lane sharding (cluster)** — the async-lane function drain, crons, and blob watchers no longer

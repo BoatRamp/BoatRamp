@@ -296,8 +296,11 @@ impl CompositeSqlBackends {
 
     /// Register a named **shared external** backend (built via [`connect`]) — a
     /// bring-your-own `url_env` database, a single shared endpoint. `allow_preview`
-    /// permits preview deployments to reach it; naming it `""` replaces the
-    /// site's default managed database with the shared external one.
+    /// permits preview deployments to reach it; naming it the reserved
+    /// [`DEFAULT_DB_NAME`](boatramp_core::project::DEFAULT_DB_NAME) (`"default"`) — or,
+    /// for back-compat, the empty string `""` — replaces the site's default managed
+    /// database with the shared external one, reachable by a guest's `sql.open("")`
+    /// via the `"" ⇄ "default"` alias (see the `SqlBackends` impl's `lookup`).
     pub fn with_external(
         mut self,
         name: impl Into<String>,
@@ -372,6 +375,32 @@ impl CompositeSqlBackends {
     }
 }
 
+/// Resolve the lookup key for an external / per-tenant binding, aliasing the guest's
+/// empty default-DB name (`sql.open("")`) to the reserved real name `"default"` — and
+/// vice-versa — so a default binding registered under either spelling is found either
+/// way. This preserves the guest-facing empty-name contract now that the config keys
+/// the default binding by its reserved real name
+/// ([`DEFAULT_DB_NAME`](boatramp_core::project::DEFAULT_DB_NAME), v0.5.0): a guest
+/// still opens `""`, an operator addresses `--db default`, and both reach the SAME
+/// registered backend. The managed libsql fall-through is deliberately NOT aliased —
+/// it keys its per-site file/namespace off the *original* empty name (`{site}.db`), so
+/// renaming there would move physical data (handled by the libsql move tool, a
+/// separate deliverable).
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+fn lookup<'a, V>(map: &'a std::collections::HashMap<String, V>, name: &str) -> Option<&'a V> {
+    if let Some(v) = map.get(name) {
+        return Some(v);
+    }
+    let alias = if name.is_empty() {
+        boatramp_core::project::DEFAULT_DB_NAME
+    } else if name == boatramp_core::project::DEFAULT_DB_NAME {
+        ""
+    } else {
+        return None;
+    };
+    map.get(alias)
+}
+
 #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
 #[async_trait::async_trait]
 impl boatramp_core::sql::SqlBackends for CompositeSqlBackends {
@@ -382,17 +411,19 @@ impl boatramp_core::sql::SqlBackends for CompositeSqlBackends {
         name: &str,
     ) -> Result<Arc<dyn boatramp_core::sql::SqlBackend>, SqlError> {
         // A per-tenant managed binding resolves to the caller's OWN tenant database
-        // (the isolation perimeter), keyed by (project, site) per its grain.
-        if let Some(entry) = self.per_tenant.get(name) {
+        // (the isolation perimeter), keyed by (project, site) per its grain. The
+        // default binding is matched under `""` ⇄ `"default"` (see `lookup`).
+        if let Some(entry) = lookup(&self.per_tenant, name) {
             return self.resolve_per_tenant(entry, project, site).await;
         }
         // A bring-your-own external database is a single *shared* endpoint by design
         // (see the type docs): every project/site opening the name reaches it.
-        if let Some(entry) = self.external.get(name) {
+        if let Some(entry) = lookup(&self.external, name) {
             return Ok(entry.backend.clone());
         }
         // Fall-through: the managed `default` (per-site libsql), which qualifies the
-        // site by `project` itself.
+        // site by `project` itself. Pass the ORIGINAL `name` (no default-alias) so the
+        // libsql path derivation is unchanged.
         self.default.database(project, site, name).await
     }
 
@@ -403,7 +434,7 @@ impl boatramp_core::sql::SqlBackends for CompositeSqlBackends {
         name: &str,
         preview: &str,
     ) -> Result<Arc<dyn boatramp_core::sql::SqlBackend>, SqlError> {
-        if let Some(entry) = self.per_tenant.get(name) {
+        if let Some(entry) = lookup(&self.per_tenant, name) {
             if entry.allow_preview {
                 // A preview shares its parent tenant's managed database (there is no
                 // separate per-preview managed server); the parent's isolation still
@@ -415,7 +446,7 @@ impl boatramp_core::sql::SqlBackends for CompositeSqlBackends {
                  (set `allow_preview` on it to permit that)"
             )));
         }
-        if let Some(entry) = self.external.get(name) {
+        if let Some(entry) = lookup(&self.external, name) {
             if entry.allow_preview {
                 return Ok(entry.backend.clone());
             }
@@ -1326,6 +1357,70 @@ mod tests {
                 .await)
             .await,
             "sql error: DEFAULT"
+        );
+    }
+
+    #[tokio::test]
+    async fn default_binding_is_reachable_under_both_empty_and_default_names() {
+        // The load-bearing v0.5.0 preservation: an external default binding is keyed by
+        // its reserved real name `"default"` (config remap), yet a guest still opens it
+        // via `sql.open("")` — so `""` must alias to `"default"` at resolution. An
+        // operator addressing `--db default` reaches the SAME backend, and a guest that
+        // opens `""` reaches it too. A non-default name is NOT aliased (falls through).
+        use boatramp_core::sql::SqlBackends;
+
+        // Register the default external binding under the RESERVED name only.
+        let composite = CompositeSqlBackends::new(std::sync::Arc::new(DefaultBackends))
+            .with_external(
+                boatramp_core::project::DEFAULT_DB_NAME,
+                std::sync::Arc::new(TagBackend("EXTERNAL_DEFAULT")),
+                true,
+            );
+
+        // Guest empty-name contract: `sql.open("")` reaches the renamed default binding.
+        assert_eq!(
+            tag(composite.database("default", "s", "").await).await,
+            "sql error: EXTERNAL_DEFAULT",
+            "an empty guest name aliases to the reserved `default` binding"
+        );
+        // Operator addressing `--db default` reaches the SAME backend.
+        assert_eq!(
+            tag(composite
+                .database("default", "s", boatramp_core::project::DEFAULT_DB_NAME)
+                .await)
+            .await,
+            "sql error: EXTERNAL_DEFAULT",
+            "the reserved `default` name reaches the same binding"
+        );
+        // Preview honors the alias too (this binding is allow_preview).
+        assert_eq!(
+            tag(composite.preview_database("default", "s", "", "pr1").await).await,
+            "sql error: EXTERNAL_DEFAULT"
+        );
+
+        // The reverse alias also holds: a binding registered under the legacy `""`
+        // key is still reachable as `"default"` (back-compat for a runtime that built
+        // the composite the old way).
+        let legacy = CompositeSqlBackends::new(std::sync::Arc::new(DefaultBackends)).with_external(
+            "",
+            std::sync::Arc::new(TagBackend("LEGACY_EMPTY")),
+            false,
+        );
+        assert_eq!(
+            tag(legacy
+                .database("default", "s", boatramp_core::project::DEFAULT_DB_NAME)
+                .await)
+            .await,
+            "sql error: LEGACY_EMPTY",
+            "`default` aliases back to a legacy empty-keyed binding"
+        );
+
+        // A NON-default name is never default-aliased — an unregistered name falls
+        // through to the managed default (no accidental capture of `""`/`"default"`).
+        assert_eq!(
+            tag(composite.database("default", "s", "analytics").await).await,
+            "sql error: DEFAULT",
+            "a non-default unregistered name is not aliased"
         );
     }
 
