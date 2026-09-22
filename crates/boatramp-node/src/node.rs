@@ -487,11 +487,21 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
     // Build the SAME concrete NodeOperatorSql once (when a managed DB is configured) and share it:
     // it backs both `operator_sql` (the sql exec/query cap) and the migration runner (which reuses
     // its owner + superuser backends). Two separate bindings so neither annotation is a complex type.
+    // The migration substrate is a single dispatcher (crate::managed_sql::DispatchMigrationRunner)
+    // routing each `(project, db)` to its engine's substrate: the sqlx NodeMigrationRunner for a
+    // Postgres/MySQL binding, the LibsqlMigrationRunner for a `libsql` binding. It compiles whenever a
+    // sqlx engine OR `migrate` (⇒ libsql) is on, so the embedded-libsql default can migrate even on a
+    // node with no external sqlx engine. `operator_sql` (the `POST /api/sql/{db}/{exec,query}` cap)
+    // stays sqlx-only — a libsql file has no operator-SQL/credential seam.
     #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
     let operator_sql: Option<Arc<dyn boatramp_core::sql::OperatorSql>>;
-    #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+    // Late-init: the match arms assign it (and, under sqlx, `operator_sql` in the same block), and the
+    // arms differ by feature-cfg — so a direct `let … = match {…}` would need cfg'd arm bodies. The
+    // late-init keeps that readable; the value is always assigned before use.
+    #[cfg(any(feature = "sql-postgres", feature = "sql-mysql", feature = "migrate"))]
+    #[allow(clippy::needless_late_init)]
     let migration_substrate: Option<Arc<dyn boatramp_core::sql::MigrationSubstrate>>;
-    #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+    #[cfg(any(feature = "sql-postgres", feature = "sql-mysql", feature = "migrate"))]
     match config
         .handlers
         .as_ref()
@@ -499,6 +509,9 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
         .filter(|sql| !sql.databases.is_empty())
     {
         Some(sql) => {
+            // The sqlx (Postgres/MySQL) arm — the shared NodeOperatorSql backs both the operator-SQL
+            // cap and the sqlx migration runner. Only built when a sqlx engine is compiled in.
+            #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
             let node_op = Arc::new(crate::managed_sql::NodeOperatorSql::new(
                 sql.databases.clone(),
                 kv.clone(),
@@ -507,27 +520,44 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
             ));
             // The operator's trusted-extension allowlist — the only extensions a migration may
             // enable (empty ⇒ none). See ExternalSqlConfig::migrate_trusted_extensions.
+            #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
             let trusted: std::collections::BTreeSet<String> = sql
                 .migrate_trusted_extensions
                 .clone()
                 .unwrap_or_default()
                 .into_iter()
                 .collect();
-            migration_substrate = Some(Arc::new(crate::managed_sql::NodeMigrationRunner::new(
+            migration_substrate = Some(Arc::new(crate::managed_sql::DispatchMigrationRunner::new(
+                #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
                 node_op.clone(),
+                #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
                 trusted,
+                #[cfg(feature = "migrate")]
+                sql.databases.clone(),
             ))
                 as Arc<dyn boatramp_core::sql::MigrationSubstrate>);
-            operator_sql = Some(node_op as Arc<dyn boatramp_core::sql::OperatorSql>);
+            #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+            {
+                operator_sql = Some(node_op as Arc<dyn boatramp_core::sql::OperatorSql>);
+            }
         }
         None => {
-            operator_sql = None;
+            #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+            {
+                operator_sql = None;
+            }
             migration_substrate = None;
         }
     }
-    #[cfg(not(any(feature = "sql-postgres", feature = "sql-mysql")))]
+    // When only `migrate` (no sqlx) is compiled, the operator-SQL cap does not exist.
+    #[cfg(all(
+        not(any(feature = "sql-postgres", feature = "sql-mysql")),
+        feature = "migrate"
+    ))]
+    let operator_sql: Option<Arc<dyn boatramp_core::sql::OperatorSql>> = None;
+    #[cfg(not(any(feature = "sql-postgres", feature = "sql-mysql", feature = "migrate")))]
     let migration_substrate: Option<Arc<dyn boatramp_core::sql::MigrationSubstrate>> = None;
-    #[cfg(not(any(feature = "sql-postgres", feature = "sql-mysql")))]
+    #[cfg(not(any(feature = "sql-postgres", feature = "sql-mysql", feature = "migrate")))]
     let operator_sql: Option<Arc<dyn boatramp_core::sql::OperatorSql>> = None;
 
     // Tenant-deprovision capability (drop a deleted tenant's managed DB/role/sealed

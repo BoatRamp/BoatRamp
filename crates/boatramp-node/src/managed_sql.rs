@@ -5,31 +5,44 @@
 //! cleartext**. The same password configures the DB workload's server env at launch
 //! and connects the handler `sql` binding, so an operator sets no DB secret at all.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use boatramp_core::compute::{ManagedDbEnvResolver, PrivilegeDirective, ReplicaPhase};
 
-use crate::config::ManagedDbPrivilege;
-use boatramp_core::deploy::DeployStore;
-use boatramp_core::envelope::KeyEnvelope;
-use boatramp_core::kv::KvStore;
-use boatramp_core::project::ProjectRef;
-use boatramp_core::sql::SqlError;
+// The Postgres/MySQL managed-credential + operator-SQL machinery (sqlx) uses these; a migrate-only
+// build (embedded libsql substrate, no sqlx engine) does not, so they are gated on the sqlx features.
 #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+use crate::config::ManagedDbPrivilege;
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+use boatramp_core::compute::{ManagedDbEnvResolver, PrivilegeDirective, ReplicaPhase};
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+use boatramp_core::deploy::DeployStore;
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+use boatramp_core::envelope::KeyEnvelope;
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+use boatramp_core::kv::KvStore;
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+use boatramp_core::project::ProjectRef;
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+use boatramp_core::sql::SqlError;
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql", feature = "migrate"))]
 use boatramp_core::sql::{
     AppliedMigration, LedgerOrigin, MigrateDdl, MigrateDdlError, MigrationError, MigrationStep,
     MigrationSubstrate, SubstrateStepOutcome,
 };
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
 use boatramp_storage::sql_compute::{ComputeEndpointResolver, ReplicaDiag};
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
 use boatramp_storage::ExternalSqlKind;
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+use std::collections::HashMap;
 
 /// The env vars a managed DB server image reads to **initialize on first boot** with
 /// boatramp's managed credential — so the handler can then connect as `user`/`password`
 /// to `database`. (Postgres: `POSTGRES_*`; MySQL: `MYSQL_*`, incl. a root password —
 /// unused by handlers but required by the image to init.) Injected into the DB
 /// workload's env at launch (P2-b); the values come from [`ManagedSqlCredentials`].
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
 #[cfg_attr(not(feature = "handlers"), allow(dead_code))]
 pub fn managed_db_server_env(
     kind: ExternalSqlKind,
@@ -55,12 +68,14 @@ pub fn managed_db_server_env(
 }
 
 /// Generates + seals + persists a stable password per managed-DB workload.
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
 #[cfg_attr(not(feature = "handlers"), allow(dead_code))]
 pub struct ManagedSqlCredentials {
     kv: Arc<dyn KvStore>,
     envelope: Arc<dyn KeyEnvelope>,
 }
 
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
 impl ManagedSqlCredentials {
     /// Build over the control-plane KV and the secrets envelope. A managed DB
     /// requires an envelope (`[secrets]`) so the password is never stored in clear.
@@ -121,6 +136,7 @@ impl ManagedSqlCredentials {
 
 /// One managed database's non-secret connection parts, keyed in [`ManagedDbEnv`]
 /// by the compute **workload** that backs it.
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
 #[cfg_attr(not(feature = "handlers"), allow(dead_code))]
 struct ManagedDbSpec {
     kind: ExternalSqlKind,
@@ -141,6 +157,7 @@ struct ManagedDbSpec {
 /// non-managed workload gets nothing. Both sides (this injector and the handler's
 /// [`ComputeResolvedSqlBackend`]) read the **same** sealed credential, so the DB is
 /// initialized with exactly the password the handler later connects with.
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
 #[cfg_attr(not(feature = "handlers"), allow(dead_code))]
 pub struct ManagedDbEnv {
     dbs: HashMap<String, ManagedDbSpec>,
@@ -153,6 +170,7 @@ pub struct ManagedDbEnv {
 /// The uid:gid a stock DB image runs its server process as — both the official
 /// `postgres` and `mysql` images use `999:999`. Used for the rootless strategy so the
 /// entrypoint owns its pre-chowned volume without needing any capability.
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
 #[cfg_attr(not(feature = "handlers"), allow(dead_code))]
 fn managed_db_default_ids(_kind: ExternalSqlKind) -> (u32, u32) {
     (999, 999)
@@ -160,6 +178,7 @@ fn managed_db_default_ids(_kind: ExternalSqlKind) -> (u32, u32) {
 
 /// The minimal capabilities a stock DB entrypoint needs when it runs as root: `chown`
 /// its data dir + socket dir, then `gosu`/`su-exec` drop to the DB user.
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
 #[cfg_attr(not(feature = "handlers"), allow(dead_code))]
 fn managed_db_caps() -> Vec<String> {
     ["CHOWN", "DAC_OVERRIDE", "FOWNER", "SETUID", "SETGID"]
@@ -168,6 +187,7 @@ fn managed_db_caps() -> Vec<String> {
         .collect()
 }
 
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
 impl ManagedDbEnv {
     /// Build from the handler `sql` `databases` config + the credential store,
     /// selecting only the **managed** ones (compute-backed, no `password_env`).
@@ -250,6 +270,7 @@ impl ManagedDbEnv {
     }
 }
 
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
 #[async_trait]
 impl ManagedDbEnvResolver for ManagedDbEnv {
     async fn managed_db_env(&self, project: &str, workload: &str) -> Vec<(String, String)> {
@@ -433,12 +454,14 @@ async fn register_shared_server(
 /// index) as `(host, port)`, scoped to a fixed project. Backs the handler's
 /// [`ComputeResolvedSqlBackend`](boatramp_storage::sql_compute::ComputeResolvedSqlBackend)
 /// so a managed `sql` binding follows its DB workload across restarts.
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
 #[cfg_attr(not(feature = "handlers"), allow(dead_code))]
 pub struct DeployEndpointResolver {
     deploy: DeployStore,
     project: String,
 }
 
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
 impl DeployEndpointResolver {
     #[cfg_attr(not(feature = "handlers"), allow(dead_code))]
     pub fn new(deploy: DeployStore, project: impl Into<String>) -> Self {
@@ -449,6 +472,7 @@ impl DeployEndpointResolver {
     }
 }
 
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
 #[async_trait]
 impl ComputeEndpointResolver for DeployEndpointResolver {
     async fn endpoints(&self, workload: &str) -> Result<Vec<(String, u16)>, SqlError> {
@@ -994,22 +1018,25 @@ pub struct NodeMigrationRunner {
 ///   ([`mentions_ledger_schema`], which refuses any step touching `boatramp_migrations`) is the
 ///   **sole** barrier protecting the ledger from the DDL identity, not belt-and-braces with the
 ///   grant isolation (which only fences the runtime user).
-#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+/// - **SQLite/libsql** — SQLite has no schema namespace at all; the ledger is a single table named
+///   `boatramp_migrations_schema_migrations` in the tenant's own database file (see
+///   [`libsql_ledger`]). Isolation is by the file boundary + the same S3/S4 word-scan guards.
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql", feature = "migrate"))]
 const LEDGER_SCHEMA: &str = "boatramp_migrations";
-#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql", feature = "migrate"))]
 const LEDGER_TABLE: &str = "schema_migrations";
 
 /// Quote a SQL string literal (single-quoted, doubling embedded `'`). The ledger id/hash reaching
 /// this are already validated ([`valid_migration_id`]) / hex, but we quote defensively so no value
 /// can break out of its literal in the host-built ledger INSERT.
-#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql", feature = "migrate"))]
 fn sql_quote_literal(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
 
 /// A migration id is restricted to `[A-Za-z0-9._-]+` (non-empty) — defensive belt beside the
 /// literal-quoting, and it keeps ledger ids clean/greppable. Anything else is refused fail-closed.
-#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql", feature = "migrate"))]
 fn valid_migration_id(id: &str) -> bool {
     !id.is_empty()
         && id
@@ -1139,7 +1166,7 @@ impl MigrateDdl for OwnerDdl {
 /// The row cap on a `migrate-ddl` `query` result (Security MEDIUM-2). A verification query reads a
 /// bounded, checkable set; beyond this it is refused so a migration function can't drive an unbounded
 /// owner-visibility read into a huge host-side JSON string.
-#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql", feature = "migrate"))]
 const MIGRATE_QUERY_MAX_ROWS: usize = 100_000;
 
 #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
@@ -1560,7 +1587,7 @@ fn mysql_partial_apply_note(kind: ExternalSqlKind, id: &str, err: &str) -> Strin
 
 /// Trim a driver error string to a first line and a bounded length so a migration failure returned
 /// to the client can't carry a wall of internal DSN/schema detail (defense against info leakage).
-#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql", feature = "migrate"))]
 fn sanitize_migration_error(e: &str) -> String {
     let first = e.lines().next().unwrap_or(e);
     // Truncate on a CHAR boundary, not a byte index ([Security review MEDIUM-3]): a driver error can
@@ -1574,7 +1601,585 @@ fn sanitize_migration_error(e: &str) -> String {
     }
 }
 
-#[cfg(test)]
+// ═════════════════════════════════════════════════════════════════════════════════════════════════
+// Embedded libsql / SQLite migration substrate (PLAN-migrate-backend-parity, libsql stage).
+//
+// The third staged backend, mirroring the Postgres + MySQL substrate above but SQLite-shaped. The
+// orchestrator (`boatramp-server::migrate`) is unchanged — same step model, same ledger contract
+// (append-only / prefix-consistent / content-hash-immutable / baseline), same `migrate-ddl` guest
+// ABI — only the substrate differs.
+//
+// Backend-honest semantics (the plan's rule: never a guarantee the engine can't keep):
+//   * **No owner/runtime split, N/A owner-role safety.** SQLite is a single-connection file — no
+//     roles, no RLS. There is NOTHING to enforce a non-runtime DDL identity against: the FILE is the
+//     trust boundary (whoever can open it can do anything). We state this plainly rather than pretend
+//     an owner role exists — there is no `migration_url_env` analog and no superuser to avoid. The
+//     guest still NEVER holds a DB credential/handle: every statement is host-mediated, exactly as on
+//     Postgres/MySQL (the host owns the `LibsqlSql`; the guest calls `migrate-ddl` functions).
+//   * **Transactional per-step DDL (libsql's strength).** SQLite has transactional DDL, so a `sql`
+//     step runs its DDL + its ledger row inside ONE transaction and rolls back cleanly on any
+//     failure — the INVERSE of MySQL's non-atomic partial-apply. A step whose 2nd statement fails
+//     leaves the 1st statement's effect ROLLED BACK and no ledger row (asserted in the live gate).
+//   * **`extension` step refused.** SQLite loadable extensions are native host-controlled `.so`/`.dll`
+//     files, never guest-loadable; the `extension` step kind is refused outright with a clear error.
+//   * **`function` steps work.** The host runs the guest's `migrate::exec`/`exec-batch`/`query` on the
+//     libsql connection via the `migrate-ddl` capability (unchanged ABI), each call auto-committing.
+//   * **Guards ported under the SQLite dialect.** The comment-immune sqlparser guards tokenize a raw
+//     `sql` step / a `migrate-ddl` script under `GuardDialect::Sqlite` (sqlparser `SQLiteDialect`), so
+//     transaction control (`COMMIT`/`BEGIN`) or the ledger-table name can't be smuggled past under a
+//     SQLite comment/quoted-identifier form the generic lexer wouldn't strip.
+// ═════════════════════════════════════════════════════════════════════════════════════════════════
+
+/// Resolve the on-disk libsql file for a named single-node `libsql` managed database from the handler
+/// `sql` `databases` config. Independent of the Postgres/MySQL `NodeOperatorSql` (libsql has no
+/// compute/credential/resolver machinery — it's a local file), so the libsql substrate compiles under
+/// `feature = "migrate"` with no dependency on the sqlx engines.
+#[cfg(feature = "migrate")]
+#[cfg_attr(not(feature = "handlers"), allow(dead_code))]
+pub struct LibsqlMigrationRunner {
+    databases: std::collections::BTreeMap<String, crate::config::ExternalDatabaseConfig>,
+}
+
+/// Whether a config `kind` string names the embedded libsql/SQLite engine (case-insensitive). The
+/// engine gate keys on this — libsql is NOT an [`ExternalSqlKind`] (the sqlx enum is Postgres/MySQL
+/// only), so a libsql binding is identified here by its `kind` alone.
+#[cfg(feature = "migrate")]
+pub(crate) fn kind_is_libsql(kind: &str) -> bool {
+    matches!(
+        kind.trim().to_ascii_lowercase().as_str(),
+        "libsql" | "sqlite" | "sqlite3"
+    )
+}
+
+/// The bare (unquoted) libsql ledger **table** name — the reserved-prefixed single table SQLite uses
+/// for the ledger. Also the **word token** the ledger-reference guard ([`LibsqlDdl::guard`],
+/// [`LibsqlMigrationRunner::apply_substrate_step`]) matches: on SQLite the ledger is ONE table named
+/// `boatramp_migrations_schema_migrations`, so a reference to it lexes as this single identifier token
+/// (unlike Postgres, whose `boatramp_migrations.schema_migrations` has a distinct `boatramp_migrations`
+/// schema-name token). Matching the full table name is exactly the protection needed — a migration
+/// step may not touch the host-owned ledger.
+#[cfg(feature = "migrate")]
+const LIBSQL_LEDGER_WORD: &str = concat!("boatramp_migrations", "_", "schema_migrations");
+
+/// The fully-qualified, quoted libsql ledger table name — `"boatramp_migrations_schema_migrations"`.
+/// SQLite has **no schema-within-database namespace** (no `CREATE SCHEMA`, and `ATTACH` is a separate
+/// file), so — unlike Postgres (a schema) / MySQL (a separate database) — the ledger is a single
+/// table in the site's own database, its name PREFIXED with the reserved `boatramp_migrations_`
+/// namespace so it can't collide with an app table. Double-quoted (SQLite's standard identifier quote)
+/// so the reserved name is inert even if it somehow contained a keyword.
+#[cfg(feature = "migrate")]
+fn libsql_ledger() -> String {
+    format!("\"{LEDGER_SCHEMA}_{LEDGER_TABLE}\"")
+}
+
+#[cfg(feature = "migrate")]
+#[cfg_attr(not(feature = "handlers"), allow(dead_code))]
+impl LibsqlMigrationRunner {
+    /// Build over the handler `sql` `databases` config (the same map the Postgres/MySQL runner reads).
+    /// Only `libsql`-kind entries are ever addressed; a non-libsql name returns `NotConfigured`.
+    pub fn new(
+        databases: std::collections::BTreeMap<String, crate::config::ExternalDatabaseConfig>,
+    ) -> Self {
+        Self { databases }
+    }
+
+    /// Whether database `db` is a configured single-node `libsql` binding (for the engine gate).
+    pub(crate) fn is_libsql(&self, db: &str) -> bool {
+        self.databases
+            .get(db)
+            .is_some_and(|cfg| kind_is_libsql(&cfg.kind))
+    }
+
+    /// Engine gate: the database must be a configured **`libsql`** binding, else `NotConfigured`.
+    /// (A Postgres/MySQL binding is handled by the sqlx runner, not this one.)
+    fn engine_gate(&self, db: &str) -> Result<(), MigrationError> {
+        if self.is_libsql(db) {
+            Ok(())
+        } else {
+            Err(MigrationError::NotConfigured)
+        }
+    }
+
+    /// Open the `LibsqlSql` for a single-node `libsql` binding.
+    ///
+    /// The FILE is the whole trust boundary (no owner/runtime role split exists on SQLite — the
+    /// owner-role safety Postgres provides is N/A here), and the host owns this handle: the guest
+    /// never receives a connection/credential. Only the single-node (`path`) case is supported for
+    /// migrations today; a remote-sqld `libsql` binding (`url_env`) returns a clear error rather than
+    /// silently running DDL against a shared cluster primary.
+    async fn open(&self, db: &str) -> Result<boatramp_storage::LibsqlSql, MigrationError> {
+        let cfg = self
+            .databases
+            .get(db)
+            .ok_or(MigrationError::NotConfigured)?;
+        let Some(path) = cfg.path.as_deref().filter(|p| !p.as_os_str().is_empty()) else {
+            return Err(MigrationError::Other(format!(
+                "libsql database {db:?}: schema migrations need a single-node `path` (the embedded \
+                 file); a remote-sqld `libsql` binding is not a migration target"
+            )));
+        };
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| MigrationError::Other(format!("libsql database {db:?}: {e}")))?;
+            }
+        }
+        boatramp_storage::LibsqlSql::open_local(path)
+            .await
+            .map_err(MigrationError::Sql)
+    }
+
+    /// The host-built ledger INSERT for one recorded step — identical column shape + literal quoting
+    /// to the Postgres/MySQL runner ([`NodeMigrationRunner::ledger_insert`]), against the libsql
+    /// ledger table. All values are host-controlled + quoted.
+    fn ledger_insert(
+        step: &MigrationStep,
+        ordinal: usize,
+        effective_hash: &str,
+        origin: LedgerOrigin,
+    ) -> String {
+        format!(
+            "INSERT INTO {ledger} (id, ordinal, content_hash, kind, applied_by) \
+             VALUES ({id}, {ord}, {hash}, {step_kind}, {origin});",
+            ledger = libsql_ledger(),
+            id = sql_quote_literal(&step.id),
+            ord = ordinal,
+            hash = sql_quote_literal(effective_hash),
+            step_kind = sql_quote_literal(step.kind()),
+            origin = sql_quote_literal(origin.as_str()),
+        )
+    }
+
+    /// Ensure the ledger table exists (idempotent). A single SQLite table (no schema/db namespace) with
+    /// a `TEXT` primary key and a `CURRENT_TIMESTAMP` default — the same columns/semantics the other
+    /// engines use.
+    async fn ensure_ledger(&self, sql: &boatramp_storage::LibsqlSql) -> Result<(), MigrationError> {
+        use boatramp_core::sql::SqlBackend;
+        sql.run_script(&format!(
+            "CREATE TABLE IF NOT EXISTS {ledger} (\
+             id TEXT PRIMARY KEY, \
+             ordinal INTEGER NOT NULL, \
+             content_hash TEXT NOT NULL, \
+             kind TEXT NOT NULL, \
+             applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, \
+             applied_by TEXT);",
+            ledger = libsql_ledger()
+        ))
+        .await
+        .map_err(MigrationError::Sql)
+    }
+
+    /// Read the applied ledger rows, ordered by `ordinal` (same shape as the sqlx runner's
+    /// `read_applied`). `applied_by` maps to the row origin (`baseline` when baselined, else `apply`).
+    async fn read_applied(
+        &self,
+        sql: &boatramp_storage::LibsqlSql,
+    ) -> Result<Vec<AppliedMigration>, MigrationError> {
+        use boatramp_core::sql::{SqlBackend, SqlValue};
+        let rows = sql
+            .run_query(&format!(
+                "SELECT id, ordinal, content_hash, kind, applied_at, applied_by \
+                 FROM {ledger} ORDER BY ordinal;",
+                ledger = libsql_ledger()
+            ))
+            .await
+            .map_err(MigrationError::Sql)?;
+        let text = |v: &SqlValue| match v {
+            SqlValue::Text(s) => s.clone(),
+            other => format!("{other:?}"),
+        };
+        let int = |v: &SqlValue| match v {
+            SqlValue::Integer(n) => *n,
+            _ => 0,
+        };
+        Ok(rows
+            .rows
+            .iter()
+            .map(|r| {
+                let origin = match r.get(5) {
+                    Some(SqlValue::Text(s)) if s == LedgerOrigin::Baseline.as_str() => {
+                        LedgerOrigin::Baseline.as_str().to_string()
+                    }
+                    _ => LedgerOrigin::Apply.as_str().to_string(),
+                };
+                AppliedMigration {
+                    id: r.first().map(&text).unwrap_or_default(),
+                    ordinal: r.get(1).map(&int).unwrap_or_default(),
+                    content_hash: r.get(2).map(&text).unwrap_or_default(),
+                    kind: r.get(3).map(&text).unwrap_or_default(),
+                    applied_at: r.get(4).map(&text).unwrap_or_default(),
+                    origin,
+                }
+            })
+            .collect())
+    }
+}
+
+#[cfg(feature = "migrate")]
+#[async_trait]
+impl MigrationSubstrate for LibsqlMigrationRunner {
+    async fn preflight(
+        &self,
+        _project: &str,
+        db: &str,
+    ) -> Result<Vec<AppliedMigration>, MigrationError> {
+        self.engine_gate(db)?;
+        let sql = self.open(db).await?;
+        self.ensure_ledger(&sql).await?;
+        self.read_applied(&sql).await
+    }
+
+    async fn apply_substrate_step(
+        &self,
+        _project: &str,
+        db: &str,
+        step: &MigrationStep,
+        ordinal: usize,
+        effective_hash: &str,
+    ) -> Result<SubstrateStepOutcome, MigrationError> {
+        use boatramp_core::sql::{MigrationAction, SqlBackend};
+
+        if !valid_migration_id(&step.id) {
+            return Ok(SubstrateStepOutcome::Failed(
+                "invalid migration id (allowed: A-Za-z0-9._-)".to_string(),
+            ));
+        }
+        self.engine_gate(db)?;
+        let sql = self.open(db).await?;
+        let ledger_insert = Self::ledger_insert(step, ordinal, effective_hash, LedgerOrigin::Apply);
+        let dialect = boatramp_core::sql::GuardDialect::Sqlite;
+
+        let outcome: Result<(), String> = match &step.action {
+            MigrationAction::Sql {
+                script,
+                no_transaction,
+            } => {
+                if boatramp_core::sql::script_has_create_extension_in(script, dialect) {
+                    Err(
+                        "a sql step may not CREATE EXTENSION — SQLite loadable extensions are \
+                         host-controlled, never enabled by a migration step"
+                            .to_string(),
+                    )
+                } else if boatramp_core::sql::script_references_word_in(
+                    script,
+                    LIBSQL_LEDGER_WORD,
+                    dialect,
+                ) {
+                    Err(
+                        "a sql step may not reference the host-owned migration-ledger table"
+                            .to_string(),
+                    )
+                } else if boatramp_core::sql::script_has_txn_control_in(script, dialect)
+                    && !*no_transaction
+                {
+                    // A transactional step may not carry its own BEGIN/COMMIT/ROLLBACK — it would
+                    // desync the atomic wrapper (SQLite has transactional DDL, so the wrapper is real).
+                    // A `no_transaction` step manages its own transaction (parity with Postgres).
+                    Err("a transactional sql step may not contain its own BEGIN/COMMIT/ROLLBACK (it \
+                         would desync the atomic wrapper) — use a no_transaction step to manage the \
+                         transaction yourself"
+                        .to_string())
+                } else if *no_transaction {
+                    // Author-managed transaction (for the rare DDL that can't run inside one): run the
+                    // script, then record the ledger row as a following statement (NOT atomic — the
+                    // author owns idempotency, same contract as Postgres `no_transaction`).
+                    match sql.run_script(script).await {
+                        Ok(()) => sql
+                            .run_script(&ledger_insert)
+                            .await
+                            .map_err(|e| e.to_string()),
+                        Err(e) => Err(e.to_string()),
+                    }
+                } else {
+                    // The atomic path (SQLite transactional DDL): BEGIN → DDL → ledger row → COMMIT,
+                    // rolling the WHOLE thing back on ANY failure. This is libsql's strength — the
+                    // inverse of MySQL's per-DDL implicit commit.
+                    sql.run_migration_txn(script, &ledger_insert)
+                        .await
+                        .map_err(|e| e.to_string())
+                }
+            }
+            MigrationAction::Extension { name } => Err(format!(
+                "extension step {name:?} is not supported on libsql/SQLite — SQLite loadable \
+                 extensions are native host-controlled files, never enabled by a migration step; \
+                 install any extension operator-side and use a plain sql step"
+            )),
+            MigrationAction::Function { .. } => {
+                return Err(MigrationError::Other(
+                    "internal: a function step must be invoked by the orchestrator, not the \
+                     substrate"
+                        .to_string(),
+                ))
+            }
+        };
+        Ok(match outcome {
+            Ok(()) => SubstrateStepOutcome::Applied,
+            Err(error) => SubstrateStepOutcome::Failed(sanitize_migration_error(&error)),
+        })
+    }
+
+    async fn record(
+        &self,
+        _project: &str,
+        db: &str,
+        step: &MigrationStep,
+        ordinal: usize,
+        effective_hash: &str,
+        origin: LedgerOrigin,
+    ) -> Result<(), MigrationError> {
+        use boatramp_core::sql::SqlBackend;
+        if !valid_migration_id(&step.id) {
+            return Err(MigrationError::Other(format!(
+                "invalid migration id {:?} (allowed: A-Za-z0-9._-)",
+                step.id
+            )));
+        }
+        self.engine_gate(db)?;
+        let sql = self.open(db).await?;
+        self.ensure_ledger(&sql).await?;
+        sql.run_script(&Self::ledger_insert(step, ordinal, effective_hash, origin))
+            .await
+            .map_err(MigrationError::Sql)
+    }
+
+    async fn owner_ddl(
+        &self,
+        _project: &str,
+        db: &str,
+    ) -> Result<Arc<dyn MigrateDdl>, MigrationError> {
+        self.engine_gate(db)?;
+        let sql = self.open(db).await?;
+        Ok(Arc::new(LibsqlDdl { sql }))
+    }
+}
+
+/// The host-mediated DDL seam backing the guest `migrate-ddl` capability of a `function` step on
+/// libsql (Security S5, SQLite shape). Holds the orchestrator-owned `LibsqlSql` for one database; the
+/// guest NEVER holds the handle or any credential — it calls the `migrate-ddl` functions and the host
+/// runs each statement on the connection it owns. Each call enforces the ledger-table (S3) +
+/// transaction-control (S4) guards host-side under the SQLite dialect, then auto-commits via
+/// `run_script`/`run_query`.
+#[cfg(feature = "migrate")]
+#[cfg_attr(not(feature = "handlers"), allow(dead_code))]
+pub(crate) struct LibsqlDdl {
+    sql: boatramp_storage::LibsqlSql,
+}
+
+#[cfg(feature = "migrate")]
+impl LibsqlDdl {
+    /// Guard a guest-supplied script/query: refuse a ledger-table reference (S3) or its own
+    /// transaction control (S4) before it reaches the connection. Tokenized under the SQLite dialect
+    /// so a SQLite comment/quoted-identifier form can't hide the construct.
+    fn guard(&self, script: &str) -> Result<(), MigrateDdlError> {
+        let dialect = boatramp_core::sql::GuardDialect::Sqlite;
+        if boatramp_core::sql::script_references_word_in(script, LIBSQL_LEDGER_WORD, dialect) {
+            return Err(MigrateDdlError::LedgerProtected);
+        }
+        if boatramp_core::sql::script_has_txn_control_in(script, dialect) {
+            return Err(MigrateDdlError::TxnControl);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "migrate")]
+#[async_trait]
+impl MigrateDdl for LibsqlDdl {
+    async fn exec(&self, script: &str) -> Result<(), MigrateDdlError> {
+        use boatramp_core::sql::SqlBackend;
+        self.guard(script)?;
+        self.sql
+            .run_script(script)
+            .await
+            .map_err(|e| MigrateDdlError::Sql(sanitize_migration_error(&e.to_string())))
+    }
+
+    async fn exec_batch(&self, scripts: Vec<String>) -> Result<(), MigrateDdlError> {
+        for script in &scripts {
+            self.exec(script).await?;
+        }
+        Ok(())
+    }
+
+    async fn query(&self, sql: &str) -> Result<boatramp_core::sql::SqlRows, MigrateDdlError> {
+        use boatramp_core::sql::SqlBackend;
+        self.guard(sql)?;
+        let rows = self
+            .sql
+            .run_query(sql)
+            .await
+            .map_err(|e| MigrateDdlError::Sql(sanitize_migration_error(&e.to_string())))?;
+        if rows.rows.len() > MIGRATE_QUERY_MAX_ROWS {
+            return Err(MigrateDdlError::Sql(format!(
+                "query returned {} rows (cap {MIGRATE_QUERY_MAX_ROWS}); add a LIMIT — a migration \
+                 verification query should read a bounded set",
+                rows.rows.len()
+            )));
+        }
+        Ok(rows)
+    }
+}
+
+/// The node's single [`MigrationSubstrate`], dispatching each `(project, db)` to the substrate for
+/// that database's engine: the sqlx [`NodeMigrationRunner`] for a Postgres/MySQL binding, the
+/// [`LibsqlMigrationRunner`] for a `libsql` binding. The orchestrator sees ONE substrate; the
+/// dispatch is by the named binding's `kind`, so a node can carry an external Postgres/MySQL AND the
+/// embedded libsql default at once, each migrating on its own engine-honest semantics.
+///
+/// A database that matches neither configured engine returns `NotConfigured` (fail-closed) — the same
+/// error the individual runners give for an unknown name.
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql", feature = "migrate"))]
+#[cfg_attr(not(feature = "handlers"), allow(dead_code))]
+pub struct DispatchMigrationRunner {
+    /// The Postgres/MySQL substrate (owner-role/DDL-identity + sqlx). Present only when a sqlx engine
+    /// is compiled in.
+    #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+    sqlx: NodeMigrationRunner,
+    /// The embedded libsql/SQLite substrate. Present only when `migrate` (⇒ libsql) is compiled in.
+    #[cfg(feature = "migrate")]
+    libsql: LibsqlMigrationRunner,
+}
+
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql", feature = "migrate"))]
+#[cfg_attr(not(feature = "handlers"), allow(dead_code))]
+impl DispatchMigrationRunner {
+    /// Build the dispatcher from the shared operator-SQL handle (Postgres/MySQL), the extension
+    /// allowlist, and the handler `sql` `databases` config (for the libsql arm). Each arm is only
+    /// wired for the engine features actually compiled in.
+    pub fn new(
+        #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))] op: Arc<NodeOperatorSql>,
+        #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+        trusted_extensions: std::collections::BTreeSet<String>,
+        #[cfg(feature = "migrate")] databases: std::collections::BTreeMap<
+            String,
+            crate::config::ExternalDatabaseConfig,
+        >,
+    ) -> Self {
+        Self {
+            #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+            sqlx: NodeMigrationRunner::new(op, trusted_extensions),
+            #[cfg(feature = "migrate")]
+            libsql: LibsqlMigrationRunner::new(databases),
+        }
+    }
+
+    /// Whether `db` is a `libsql` binding (routes to the libsql substrate). Only defined — and only
+    /// called — when the `migrate` feature (⇒ the embedded libsql runner) is compiled in; the dispatch
+    /// methods gate their libsql arm on the same feature, so without `migrate` there is nothing to
+    /// route and this helper is absent.
+    #[cfg(feature = "migrate")]
+    fn routes_to_libsql(&self, db: &str) -> bool {
+        self.libsql.is_libsql(db)
+    }
+}
+
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql", feature = "migrate"))]
+#[async_trait]
+impl MigrationSubstrate for DispatchMigrationRunner {
+    async fn preflight(
+        &self,
+        project: &str,
+        db: &str,
+    ) -> Result<Vec<AppliedMigration>, MigrationError> {
+        #[cfg(feature = "migrate")]
+        if self.routes_to_libsql(db) {
+            return self.libsql.preflight(project, db).await;
+        }
+        #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+        {
+            return self.sqlx.preflight(project, db).await;
+        }
+        #[cfg(not(any(feature = "sql-postgres", feature = "sql-mysql")))]
+        {
+            let _ = (project, db);
+            Err(MigrationError::NotConfigured)
+        }
+    }
+
+    async fn apply_substrate_step(
+        &self,
+        project: &str,
+        db: &str,
+        step: &MigrationStep,
+        ordinal: usize,
+        effective_hash: &str,
+    ) -> Result<SubstrateStepOutcome, MigrationError> {
+        #[cfg(feature = "migrate")]
+        if self.routes_to_libsql(db) {
+            return self
+                .libsql
+                .apply_substrate_step(project, db, step, ordinal, effective_hash)
+                .await;
+        }
+        #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+        {
+            return self
+                .sqlx
+                .apply_substrate_step(project, db, step, ordinal, effective_hash)
+                .await;
+        }
+        #[cfg(not(any(feature = "sql-postgres", feature = "sql-mysql")))]
+        {
+            let _ = (project, db, step, ordinal, effective_hash);
+            Err(MigrationError::NotConfigured)
+        }
+    }
+
+    async fn record(
+        &self,
+        project: &str,
+        db: &str,
+        step: &MigrationStep,
+        ordinal: usize,
+        effective_hash: &str,
+        origin: LedgerOrigin,
+    ) -> Result<(), MigrationError> {
+        #[cfg(feature = "migrate")]
+        if self.routes_to_libsql(db) {
+            return self
+                .libsql
+                .record(project, db, step, ordinal, effective_hash, origin)
+                .await;
+        }
+        #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+        {
+            return self
+                .sqlx
+                .record(project, db, step, ordinal, effective_hash, origin)
+                .await;
+        }
+        #[cfg(not(any(feature = "sql-postgres", feature = "sql-mysql")))]
+        {
+            let _ = (project, db, step, ordinal, effective_hash, origin);
+            Err(MigrationError::NotConfigured)
+        }
+    }
+
+    async fn owner_ddl(
+        &self,
+        project: &str,
+        db: &str,
+    ) -> Result<Arc<dyn MigrateDdl>, MigrationError> {
+        #[cfg(feature = "migrate")]
+        if self.routes_to_libsql(db) {
+            return self.libsql.owner_ddl(project, db).await;
+        }
+        #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+        {
+            return self.sqlx.owner_ddl(project, db).await;
+        }
+        #[cfg(not(any(feature = "sql-postgres", feature = "sql-mysql")))]
+        {
+            let _ = (project, db);
+            Err(MigrationError::NotConfigured)
+        }
+    }
+}
+
+// The Postgres/MySQL managed-SQL tests exercise the sqlx credential/env/operator-target/runner
+// machinery, so they compile only with a sqlx engine. The embedded-libsql substrate tests are a
+// separate `libsql_migrate_tests` module (gated on `migrate`).
+#[cfg(all(test, any(feature = "sql-postgres", feature = "sql-mysql")))]
 mod tests {
     use super::*;
     use async_trait::async_trait;
@@ -2492,5 +3097,384 @@ mod tests {
             mysql_partial_apply_note(ExternalSqlKind::Postgres, "0002_x", "boom"),
             "boom"
         );
+    }
+
+    /// The dispatcher routes each `(project, db)` to the correct engine's substrate: a `libsql` binding
+    /// to the libsql runner, a Postgres/MySQL binding to the sqlx runner, and an unknown name to
+    /// `NotConfigured` fail-closed. Asserted on the pure `routes_to_libsql` decision (no live DB), so a
+    /// wrong route can't silently send a libsql DB to the sqlx path (or vice versa).
+    #[cfg(feature = "migrate")]
+    #[test]
+    fn dispatch_routes_by_engine_kind() {
+        let mut databases = BTreeMap::new();
+        databases.insert("lite".to_string(), db("libsql", None, "", None));
+        databases.get_mut("lite").unwrap().path = Some("/tmp/lite.db".into());
+        databases.insert("pg".to_string(), db("postgres", None, "PG_URL", None));
+
+        let op = Arc::new(NodeOperatorSql::new(
+            databases.clone(),
+            Arc::new(MemoryKv::new()),
+            None,
+            DeployStore::new(Arc::new(NullStorage), Arc::new(MemoryKv::new())),
+        ));
+        let dispatch =
+            DispatchMigrationRunner::new(op, std::collections::BTreeSet::new(), databases);
+
+        assert!(
+            dispatch.routes_to_libsql("lite"),
+            "a libsql binding routes to the libsql substrate"
+        );
+        assert!(
+            !dispatch.routes_to_libsql("pg"),
+            "a postgres binding does NOT route to the libsql substrate"
+        );
+        assert!(
+            !dispatch.routes_to_libsql("absent"),
+            "an unknown name does not route to libsql (the sqlx path then returns NotConfigured)"
+        );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+// Embedded libsql / SQLite migration-substrate tests. Self-contained (no sqlx helpers), so they
+// compile under `feature = "migrate"` alone (the libsql substrate's gate). The pure host-side tests
+// (ledger name, extension-refused, guard-under-SQLite-dialect, guest-holds-no-credential) always run;
+// the tests that open a real embedded libsql file are `#[ignore]`d (a static-musl test binary
+// segfaults in libsql's bundled SQLite — the same runtime quirk the orm-tenancy gate documents) and
+// run unignored on the host toolchain in the migrate-libsql live gate.
+#[cfg(all(test, feature = "migrate"))]
+mod libsql_migrate_tests {
+    use super::*;
+    use boatramp_core::sql::{
+        GuardDialect, LedgerOrigin, MigrateDdl, MigrateDdlError, MigrationAction, MigrationStep,
+        MigrationSubstrate, SubstrateStepOutcome,
+    };
+    use std::collections::BTreeMap;
+
+    fn sql_step(id: &str, script: &str) -> MigrationStep {
+        MigrationStep {
+            id: id.to_string(),
+            action: MigrationAction::Sql {
+                script: script.to_string(),
+                no_transaction: false,
+            },
+        }
+    }
+
+    /// A libsql-kind binding named `app`, backed by a throwaway file under a per-process temp dir.
+    fn runner_and_db(tag: &str) -> (LibsqlMigrationRunner, String) {
+        let dir = std::env::temp_dir().join(format!(
+            "boatramp-migrate-libsql-{tag}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("app.db");
+        let mut databases = BTreeMap::new();
+        databases.insert(
+            "app".to_string(),
+            crate::config::ExternalDatabaseConfig {
+                kind: "libsql".to_string(),
+                path: Some(path),
+                ..Default::default()
+            },
+        );
+        (LibsqlMigrationRunner::new(databases), "app".to_string())
+    }
+
+    /// The libsql ledger is a single reserved-prefixed table (no schema/db namespace on SQLite),
+    /// double-quoted so the name is inert.
+    #[test]
+    fn libsql_ledger_name_is_a_single_prefixed_table() {
+        assert_eq!(libsql_ledger(), "\"boatramp_migrations_schema_migrations\"");
+    }
+
+    /// The engine gate admits ONLY a `libsql`/`sqlite` binding; any other kind (or an unknown name)
+    /// is `NotConfigured` (the Postgres/MySQL runner owns those).
+    #[test]
+    fn engine_gate_admits_only_libsql_kinds() {
+        assert!(kind_is_libsql("libsql"));
+        assert!(kind_is_libsql("LibSQL"));
+        assert!(kind_is_libsql("sqlite"));
+        assert!(kind_is_libsql("sqlite3"));
+        assert!(!kind_is_libsql("postgres"));
+        assert!(!kind_is_libsql("mysql"));
+
+        let mut databases = BTreeMap::new();
+        databases.insert(
+            "app".to_string(),
+            crate::config::ExternalDatabaseConfig {
+                kind: "libsql".to_string(),
+                path: Some("/tmp/x.db".into()),
+                ..Default::default()
+            },
+        );
+        databases.insert(
+            "pg".to_string(),
+            crate::config::ExternalDatabaseConfig {
+                kind: "postgres".to_string(),
+                url_env: "X".into(),
+                ..Default::default()
+            },
+        );
+        let sub = LibsqlMigrationRunner::new(databases);
+        assert!(sub.is_libsql("app"));
+        assert!(!sub.is_libsql("pg"));
+        assert!(!sub.is_libsql("absent"));
+        assert!(matches!(
+            sub.engine_gate("pg"),
+            Err(MigrationError::NotConfigured)
+        ));
+        assert!(matches!(
+            sub.engine_gate("absent"),
+            Err(MigrationError::NotConfigured)
+        ));
+        assert!(sub.engine_gate("app").is_ok());
+    }
+
+    /// The ledger INSERT is host-built, value-quoted, and identical in column shape to the other
+    /// engines — against the libsql ledger table.
+    #[test]
+    fn libsql_ledger_insert_quotes_all_values() {
+        let step = sql_step("0001_init", "CREATE TABLE t (id integer)");
+        let sql = LibsqlMigrationRunner::ledger_insert(&step, 0, "abc123", LedgerOrigin::Apply);
+        assert!(sql.contains("\"boatramp_migrations_schema_migrations\""));
+        assert!(sql.contains("'0001_init'"));
+        assert!(sql.contains("'abc123'"));
+        assert!(sql.contains("'sql'"));
+        assert!(sql.contains("'apply'"));
+    }
+
+    /// The guards are tokenized under the SQLite dialect (sqlparser `SQLiteDialect`): a `COMMIT`
+    /// hidden behind a SQLite `--` comment is stripped (not flagged), a real one is; the ledger-table
+    /// name is caught under SQLite `[bracketed]` / `` `backtick` `` identifier forms the generic lexer
+    /// wouldn't. This is the LibsqlDdl guard the `migrate-ddl` seam runs.
+    #[test]
+    fn libsql_guards_use_the_sqlite_dialect() {
+        // Sanity on the dialect selection itself.
+        assert!(boatramp_core::sql::script_has_txn_control_in(
+            "DROP TABLE t; COMMIT",
+            GuardDialect::Sqlite
+        ));
+        assert!(!boatramp_core::sql::script_has_txn_control_in(
+            "CREATE TABLE t (id int) -- COMMIT",
+            GuardDialect::Sqlite
+        ));
+        // On SQLite the ledger is ONE table `boatramp_migrations_schema_migrations`; a reference to
+        // it lexes as that single identifier token (bracketed, backtick, or bare), which the guard
+        // needle `LIBSQL_LEDGER_WORD` matches.
+        assert!(boatramp_core::sql::script_references_word_in(
+            "SELECT * FROM [boatramp_migrations_schema_migrations]",
+            LIBSQL_LEDGER_WORD,
+            GuardDialect::Sqlite
+        ));
+        assert!(boatramp_core::sql::script_references_word_in(
+            "DROP TABLE `boatramp_migrations_schema_migrations`",
+            LIBSQL_LEDGER_WORD,
+            GuardDialect::Sqlite
+        ));
+
+        // The LibsqlDdl guard maps those to the fail-closed MigrateDdlError variants. Build one over a
+        // throwaway file so `guard` (pure, no IO) can be exercised.
+        let dir =
+            std::env::temp_dir().join(format!("boatramp-libsql-guard-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sql = futures_lite_block_on(boatramp_storage::LibsqlSql::open_local(dir.join("g.db")))
+            .unwrap();
+        let ddl = LibsqlDdl { sql };
+        assert!(matches!(
+            ddl.guard("SELECT * FROM `boatramp_migrations_schema_migrations`"),
+            Err(MigrateDdlError::LedgerProtected)
+        ));
+        assert!(matches!(
+            ddl.guard("BEGIN; CREATE TABLE x(i int); COMMIT"),
+            Err(MigrateDdlError::TxnControl)
+        ));
+        // Plain owner DDL passes the guard.
+        assert!(ddl.guard("CREATE TABLE x (i integer)").is_ok());
+    }
+
+    /// A tiny synchronous block-on so the one guard test above can open a file without a tokio
+    /// runtime (the async tests below use `#[tokio::test]`).
+    fn futures_lite_block_on<F: std::future::Future>(f: F) -> F::Output {
+        // A minimal executor: the libsql `open_local` future is driven to completion on a fresh
+        // current-thread tokio runtime.
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(f)
+    }
+
+    /// The guest NEVER holds a DB credential or handle: `owner_ddl` returns a host-owned
+    /// `Arc<dyn MigrateDdl>` (a `LibsqlDdl` wrapping the host's `LibsqlSql`) — the guest only ever
+    /// calls the `migrate-ddl` functions, and every statement runs on the host-owned connection. There
+    /// is no path to a raw connection/path/credential in the returned trait object. (The file is the
+    /// trust boundary; there is no owner/runtime role split to model on SQLite — stated plainly.)
+    #[tokio::test]
+    #[ignore = "opens a real embedded libsql file; run unignored on the host toolchain (static-musl segfaults in libsql)"]
+    async fn owner_ddl_is_host_mediated_guest_holds_no_credential() {
+        let (sub, db) = runner_and_db("nocred");
+        let ddl: Arc<dyn MigrateDdl> = sub.owner_ddl("default", &db).await.unwrap();
+        // The returned object is a MigrateDdl trait object — the ONLY surface is exec/exec_batch/query.
+        // It runs host-side (auto-commit) and enforces the guards; there is no accessor for the file
+        // path / connection. A real exec proves the host runs it.
+        ddl.exec("CREATE TABLE proof (n integer)").await.unwrap();
+        ddl.exec("INSERT INTO proof (n) VALUES (1)").await.unwrap();
+        let rows = ddl.query("SELECT n FROM proof").await.unwrap();
+        assert_eq!(rows.rows.len(), 1);
+        // And the guards fire on the host-mediated seam.
+        assert!(matches!(
+            ddl.exec("SELECT * FROM boatramp_migrations_schema_migrations")
+                .await
+                .unwrap_err(),
+            MigrateDdlError::LedgerProtected
+        ));
+    }
+
+    /// TRANSACTIONAL ROLLBACK (the SQLite strength, inverse of MySQL): a `sql` step whose 2nd
+    /// statement fails leaves the 1st statement's effect ROLLED BACK and no ledger row — the whole
+    /// step is atomic. This is the core libsql-parity guarantee.
+    #[tokio::test]
+    #[ignore = "opens a real embedded libsql file; run unignored on the host toolchain (static-musl segfaults in libsql)"]
+    async fn sql_step_rolls_back_cleanly_on_failure() {
+        let (sub, db) = runner_and_db("rollback");
+
+        // preflight on an empty ledger returns nothing + creates the ledger table.
+        assert!(sub.preflight("default", &db).await.unwrap().is_empty());
+
+        // A step whose 2nd statement errors (duplicate table) must roll the 1st back entirely.
+        let bad = sql_step(
+            "0001_atomic",
+            "CREATE TABLE widget (id integer primary key); \
+             CREATE TABLE widget (id integer primary key)", // 2nd fails: already exists
+        );
+        let eff = bad.content_hash();
+        match sub
+            .apply_substrate_step("default", &db, &bad, 0, &eff)
+            .await
+            .unwrap()
+        {
+            SubstrateStepOutcome::Failed(_) => {}
+            other => panic!("expected a failed step, got {other:?}"),
+        }
+        // No ledger row for the failed step…
+        let applied = sub.preflight("default", &db).await.unwrap();
+        assert!(!applied.iter().any(|a| a.id == "0001_atomic"));
+
+        // …and the 1st statement's table was ROLLED BACK — a clean recreate succeeds (it would fail
+        // with "table widget already exists" if the 1st CREATE had leaked, as it does on MySQL).
+        let good = sql_step(
+            "0001_atomic",
+            "CREATE TABLE widget (id integer primary key)",
+        );
+        assert!(matches!(
+            sub.apply_substrate_step("default", &db, &good, 0, &good.content_hash())
+                .await
+                .unwrap(),
+            SubstrateStepOutcome::Applied
+        ));
+        let applied = sub.preflight("default", &db).await.unwrap();
+        assert_eq!(applied.len(), 1);
+        assert_eq!(applied[0].id, "0001_atomic");
+        assert_eq!(applied[0].origin, "apply");
+        assert_eq!(
+            applied[0].content_hash,
+            good.content_hash(),
+            "the ledger records the effective hash"
+        );
+    }
+
+    /// An `extension` step is refused outright on libsql/SQLite (no guest-loadable native extensions).
+    #[tokio::test]
+    #[ignore = "opens a real embedded libsql file; run unignored on the host toolchain (static-musl segfaults in libsql)"]
+    async fn extension_step_is_refused_on_libsql() {
+        let (sub, db) = runner_and_db("ext");
+        let step = MigrationStep {
+            id: "0001_ext".to_string(),
+            action: MigrationAction::Extension {
+                name: "spellfix".to_string(),
+            },
+        };
+        match sub
+            .apply_substrate_step("default", &db, &step, 0, &step.content_hash())
+            .await
+            .unwrap()
+        {
+            SubstrateStepOutcome::Failed(msg) => {
+                assert!(
+                    msg.contains("libsql") || msg.contains("SQLite"),
+                    "extension refused on libsql: {msg}"
+                );
+            }
+            other => panic!("expected extension refused, got {other:?}"),
+        }
+        // A raw `CREATE EXTENSION` inside a sql step is likewise refused.
+        let raw = sql_step("0001_rawext", "CREATE EXTENSION IF NOT EXISTS whatever");
+        assert!(matches!(
+            sub.apply_substrate_step("default", &db, &raw, 0, &raw.content_hash())
+                .await
+                .unwrap(),
+            SubstrateStepOutcome::Failed(_)
+        ));
+    }
+
+    /// A transactional `sql` step carrying its own BEGIN/COMMIT is refused under the SQLite dialect
+    /// (it would desync the atomic wrapper) — and a ledger-table reference is refused too.
+    #[tokio::test]
+    #[ignore = "opens a real embedded libsql file; run unignored on the host toolchain (static-musl segfaults in libsql)"]
+    async fn txn_control_and_ledger_reference_are_refused_under_sqlite_dialect() {
+        let (sub, db) = runner_and_db("guards");
+        let txn = sql_step("0001_txn", "BEGIN; CREATE TABLE x (i int); COMMIT");
+        assert!(matches!(
+            sub.apply_substrate_step("default", &db, &txn, 0, &txn.content_hash())
+                .await
+                .unwrap(),
+            SubstrateStepOutcome::Failed(_)
+        ));
+        let ledger = sql_step(
+            "0001_led",
+            "INSERT INTO boatramp_migrations_schema_migrations (id) VALUES ('x')",
+        );
+        assert!(matches!(
+            sub.apply_substrate_step("default", &db, &ledger, 0, &ledger.content_hash())
+                .await
+                .unwrap(),
+            SubstrateStepOutcome::Failed(_)
+        ));
+    }
+
+    /// baseline: `record(…, Baseline)` writes a ledger row WITHOUT running the step, read back with
+    /// origin=baseline; and prefix ordering is preserved.
+    #[tokio::test]
+    #[ignore = "opens a real embedded libsql file; run unignored on the host toolchain (static-musl segfaults in libsql)"]
+    async fn baseline_records_without_running() {
+        let (sub, db) = runner_and_db("baseline");
+        let baselined = sql_step("0001_baselined", "CREATE TABLE never_run (id integer)");
+        sub.record(
+            "default",
+            &db,
+            &baselined,
+            0,
+            &baselined.content_hash(),
+            LedgerOrigin::Baseline,
+        )
+        .await
+        .unwrap();
+        let applied = sub.preflight("default", &db).await.unwrap();
+        let row = applied
+            .iter()
+            .find(|a| a.id == "0001_baselined")
+            .expect("baselined row present");
+        assert_eq!(row.origin, "baseline");
+        // The step was NOT run: the table doesn't exist, so a fresh CREATE of the same name succeeds.
+        let good = sql_step("0002_after", "CREATE TABLE never_run (id integer)");
+        assert!(matches!(
+            sub.apply_substrate_step("default", &db, &good, 1, &good.content_hash())
+                .await
+                .unwrap(),
+            SubstrateStepOutcome::Applied
+        ));
     }
 }
