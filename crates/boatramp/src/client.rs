@@ -622,6 +622,64 @@ impl ControlPlane {
         Ok(())
     }
 
+    // ---- schema migrations (0.4.x) -----------------------------------------
+
+    /// Read a managed database's applied-migration ledger, in order
+    /// (`GET /api/{seg}/migrate/{db}/status`; `Project·Read`).
+    pub async fn migrate_status(&self, db: &str) -> Result<boatramp_core::sql::MigrationStatus> {
+        let seg = project_seg(&self.project, "migrate");
+        let Self {
+            http: client,
+            base: server,
+            ..
+        } = self;
+        Ok(client
+            .get(format!("{server}/api/{seg}/{db}/status"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
+    }
+
+    /// Trigger a schema-migration `verb` (`apply` / `dry-run` / `baseline`) over an
+    /// already-uploaded step-set bundle (`POST /api/{seg}/migrate/{db}/{verb}`;
+    /// `Project·Admin`). A step failure comes back as `422` whose body is still a valid
+    /// [`MigrationReport`](boatramp_core::sql::MigrationReport) with `failed` set — returned
+    /// as `Ok` so the caller can show which step failed and exit non-zero. A bundle/ledger
+    /// error (`400`/`409`/`501`/`503`) is surfaced verbatim as [`ClientError::Refused`].
+    pub async fn migrate_trigger(
+        &self,
+        db: &str,
+        verb: &str,
+        bundle: &str,
+        up_to: Option<&str>,
+    ) -> Result<boatramp_core::sql::MigrationReport> {
+        let seg = project_seg(&self.project, "migrate");
+        let Self {
+            http: client,
+            base: server,
+            ..
+        } = self;
+        let resp = client
+            .post(format!("{server}/api/{seg}/{db}/{verb}"))
+            .json(&serde_json::json!({ "bundle": bundle, "up_to": up_to }))
+            .send()
+            .await?;
+        let status = resp.status();
+        // 200 = clean; 422 = a step failed but the body is still a full report (halted at
+        // the failing step, prefix applied). Both carry a `MigrationReport` to render.
+        if status.is_success() || status == reqwest::StatusCode::UNPROCESSABLE_ENTITY {
+            Ok(resp.json().await?)
+        } else {
+            let body = resp.text().await.unwrap_or_default();
+            Err(ClientError::Refused(format!(
+                "schema migrate {verb} refused ({status}): {}",
+                body.trim()
+            )))
+        }
+    }
+
     /// Clear the project's tenancy schema (revert to legacy `Uniform` scoping).
     pub async fn clear_project_tenancy(&self) -> Result<()> {
         let seg = project_seg(&self.project, "tenancy");

@@ -165,7 +165,21 @@ of `function` / `sql` / `extension`:
   the active version), and an opaque `args` string handed to the function as its invoke
   request body — boatramp does not interpret `args`; the function parses it.
 
-Upload the bundle (its hash is the sha256-hex; the endpoint verifies it), then trigger:
+The `boatramp` CLI does the upload-then-trigger in one step — point it at the bundle file:
+
+```sh
+# apply the pending steps against managed database `appdb` in project `acme`
+boatramp project migrate apply --project acme --db appdb -f migrations.json
+```
+
+It hashes `migrations.json`, `PUT`s it to the blob endpoint, then `POST`s the trigger, and
+renders the `MigrationReport` (a step that ran-but-failed exits non-zero, so a deploy script
+halts on it). `--json` emits the raw report. The verb lives under `project` (not the top-level
+`boatramp migrate`, which is the unrelated pre-0.2.0 store re-key) because a schema migration is
+a project-scoped admin operation.
+
+Equivalently, the raw HTTP contract the CLI drives — upload the bundle (its hash is the
+sha256-hex; the endpoint verifies it), then trigger:
 
 ```sh
 # 1. upload the content-addressed bundle
@@ -182,9 +196,9 @@ curl -sS -X POST https://cp.example.com/api/projects/acme/migrate/appdb/apply \
 ```
 
 Paths target the named project; the top-level `/api/migrate/…` counterpart targets the
-`default` project. The boatramp migrate client is a **thin uploader** — it assembles the
-bundle from whatever on-disk layout you keep, PUTs the blob, and POSTs the trigger. boatramp
-stays agnostic to your directory shape; the HTTP surface above is the contract.
+`default` project (with the CLI, omit `--project`). The migrate client is a **thin uploader** —
+it assembles the bundle from whatever on-disk layout you keep, PUTs the blob, and POSTs the
+trigger. boatramp stays agnostic to your directory shape; the HTTP surface above is the contract.
 
 ## apply / dry-run / baseline / status
 
@@ -215,6 +229,8 @@ Four verbs on a managed database `:db`, all referencing an uploaded bundle by ha
 `pending` lists the ids that would apply:
 
 ```sh
+boatramp project migrate dry-run --project acme --db appdb -f migrations.json
+# raw HTTP:
 curl -sS -X POST .../migrate/appdb/dry-run -H "Authorization: Bearer $BOATRAMP_TOKEN" \
   -H 'content-type: application/json' -d "{ \"bundle\": \"$HASH\" }"
 ```
@@ -223,6 +239,8 @@ curl -sS -X POST .../migrate/appdb/dry-run -H "Authorization: Bearer $BOATRAMP_T
 `origin` marker — `apply` vs `baseline`):
 
 ```sh
+boatramp project migrate status --project acme --db appdb   # add --json for the raw ledger
+# raw HTTP:
 curl -sS .../migrate/appdb/status -H "Authorization: Bearer $BOATRAMP_TOKEN"
 ```
 
@@ -364,6 +382,9 @@ populated database (a `422`). `baseline` closes that gap: it **records a prefix 
 as already-applied WITHOUT running any step**.
 
 ```sh
+boatramp project migrate baseline --project acme --db appdb \
+  -f migrations.json --up-to 0097_last_old_path_migration
+# raw HTTP:
 curl -sS -X POST .../migrate/appdb/baseline -H "Authorization: Bearer $BOATRAMP_TOKEN" \
   -H 'content-type: application/json' \
   -d "{ \"bundle\": \"$HASH\", \"up_to\": \"0097_last_old_path_migration\" }"

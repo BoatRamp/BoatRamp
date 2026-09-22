@@ -83,6 +83,7 @@ mod migrate;
 #[cfg(feature = "operator")]
 mod operator;
 mod project;
+mod project_migrate;
 mod secrets;
 mod security;
 mod security_headers;
