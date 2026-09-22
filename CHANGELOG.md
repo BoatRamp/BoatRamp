@@ -64,14 +64,21 @@ boundary — so **no guest change is required**; an operator now addresses it as
   `ServerConfig::parse` and after the env merge), with a clear error naming the binding
   and its reason; the empty/legacy-default case points at the `default` cure.
 - **Control-plane API** validates the `{db}` path param in the `sql` + `migrate`
-  handlers before any lookup → `400` with the reason.
+  handlers before any lookup → `422` with the reason (a well-formed request carrying a
+  semantically-invalid resource identifier, matching the other resource-name path-param
+  rejections).
 - **CLI** `--db` defaults to `default` (was `""`) for `boatramp sql {exec,query,ping}`
   and `boatramp project migrate {apply,dry-run,baseline,status}`, and validates `--db`
   **client-side** before building the request URL — so the path is always
   `/api/…/default/…` (no more `//`).
-- **Handler lookup** re-runs the validator before the databases-map lookup
-  (defense-in-depth: the one lookup choke point for every operator-SQL / migration
-  caller).
+- **Operator-SQL / migration lookup** (`crates/boatramp-node/src/managed_sql.rs::connect_for`)
+  re-runs the canonical validator before the databases-map lookup (defense-in-depth: the one
+  lookup choke point for every operator-SQL / migration caller — it addresses the default
+  explicitly as `default`). This is NOT the guest `sql.open(name)` path: a guest legitimately
+  opens the default as `""`, which the canonical validator rejects, so that path is guarded
+  separately — by the stricter `is_named_sql_import` (a `[A-Za-z0-9_-]` guest-grant allowlist,
+  at grant time) and libsql's `validate_db_name` (at the storage boundary) — not by the
+  canonical validator.
 - **Cross-surface consistency guard** (CI): a property/oracle unit test asserts the
   validator accepts a value **iff** it is a safe URL path segment, plus an integration
   test that round-trips every accepted value through the CLI path construction and a
@@ -90,9 +97,13 @@ boundary — so **no guest change is required**; an operator now addresses it as
   **Local single-node only**: it resolves source + destination (honouring the
   `""`/`default` fold), refuses an absent source or an existing non-empty destination,
   `VACUUM INTO`s a consistent snapshot, verifies it (`PRAGMA integrity_check`), then
-  removes the source and its `-wal`/`-shm` sidecars. A **remote/sqld** backend is refused
-  with a typed error (an atomic namespace-fork API is a follow-up; a lossy app-level copy
-  is never attempted). Both names are screened through the canonical validator.
+  removes the source and its `-wal`/`-shm` sidecars. It is **not** crash-atomic across the
+  whole op, but it is ordered to be **safe to re-run**: the **source remains authoritative
+  until the destination passes `integrity_check`** — the source is never removed until the
+  verified copy exists, so an interruption (or a re-run) at worst leaves the source intact
+  and a discardable partial/verified copy at the destination, never data loss. A **remote/sqld**
+  backend is refused with a typed error (an atomic namespace-fork API is a follow-up; a lossy
+  app-level copy is never attempted). Both names are screened through the canonical validator.
 
 ## [0.4.29] - 2026-09-22
 

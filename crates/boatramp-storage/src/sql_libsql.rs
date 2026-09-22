@@ -718,6 +718,8 @@ impl SqlBackends for LibsqlSqlBackends {
         }
 
         Ok(MoveDatabaseReport {
+            project: project.to_string(),
+            site: site.to_string(),
             from: src_path.display().to_string(),
             to: dst_path.display().to_string(),
             integrity,
@@ -1517,6 +1519,10 @@ mod tests {
             .await
             .expect("local move succeeds");
         assert_eq!(report.integrity, "ok");
+        // The report echoes the resolved (project, site) so an operator can confirm
+        // which site's default was relocated, not just the filesystem paths.
+        assert_eq!(report.project, "default");
+        assert_eq!(report.site, "blog");
         assert!(report.from.ends_with("blog.db"));
         assert!(report.to.ends_with("blog/analytics.db"));
 

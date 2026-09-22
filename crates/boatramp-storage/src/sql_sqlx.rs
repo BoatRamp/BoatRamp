@@ -1326,12 +1326,14 @@ mod tests {
         // reached the managed default (rather than the trait's refusing fallback).
         async fn move_database(
             &self,
-            _project: &str,
-            _site: &str,
+            project: &str,
+            site: &str,
             from: &str,
             to: &str,
         ) -> Result<boatramp_core::sql::MoveDatabaseReport, boatramp_core::sql::SqlError> {
             Ok(boatramp_core::sql::MoveDatabaseReport {
+                project: project.to_string(),
+                site: site.to_string(),
                 from: format!("DEFAULT:{from}"),
                 to: format!("DEFAULT:{to}"),
                 integrity: "ok".into(),
@@ -1492,6 +1494,9 @@ mod tests {
             .expect("default move forwards to the managed backend");
         assert_eq!(report.from, "DEFAULT:");
         assert_eq!(report.to, "DEFAULT:renamed");
+        // The (project, site) the move ran against is echoed through the composite.
+        assert_eq!(report.project, "default");
+        assert_eq!(report.site, "s");
 
         // An unregistered source name likewise forwards to the managed default.
         let report = composite

@@ -824,10 +824,16 @@ pub trait SqlBackends: Send + Sync {
 }
 
 /// The outcome of a [`SqlBackends::move_database`] relocation — the resolved
-/// source/destination locators plus the verified row/integrity signal, for the
-/// operator's JSON report.
+/// `(project, site)` the relocation ran against plus the source/destination
+/// locators and the verified integrity signal, for the operator's JSON report.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct MoveDatabaseReport {
+    /// The project the relocation ran against (echoed so the operator can confirm
+    /// which tenant's database was moved, not just the filesystem paths).
+    pub project: String,
+    /// The site the relocation ran against — for the default binding this is the
+    /// site whose default was relocated.
+    pub site: String,
     /// The resolved source locator (a filesystem path in single-node mode).
     pub from: String,
     /// The resolved destination locator.

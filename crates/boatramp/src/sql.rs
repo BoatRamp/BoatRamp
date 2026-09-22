@@ -39,10 +39,20 @@ pub enum Error {
 /// Validate a `--db` name through the one canonical resource-identifier validator
 /// (`kind = "database"`) before it is threaded into the control-plane URL. Rejects an
 /// empty/`//`-collapsing or path-separator-bearing name with the same rule the server
-/// and config load enforce.
+/// and config load enforce. For the empty-name case — the single most common upgrade
+/// snag (the legacy default was the empty string) — the error carries a one-line cure
+/// pointing at the new `default` name; every other invalid name keeps the plain reason.
 fn validate_db(db: &str) -> Result<()> {
-    boatramp_core::project::validate_resource_name("database", db)
-        .map_err(|err| Error::InvalidDb(err.to_string()))
+    boatramp_core::project::validate_resource_name("database", db).map_err(|err| {
+        if db.is_empty() {
+            Error::InvalidDb(format!(
+                "{err}; {}",
+                boatramp_core::project::EMPTY_DB_NAME_CURE
+            ))
+        } else {
+            Error::InvalidDb(err.to_string())
+        }
+    })
 }
 
 /// Arguments for `boatramp sql`.
@@ -333,6 +343,27 @@ mod tests {
         for bad in ["", "a/b", "..", "a b", "proj*"] {
             assert!(validate_db(bad).is_err(), "{bad:?} should be rejected");
         }
+    }
+
+    #[test]
+    fn empty_db_name_rejection_carries_the_cure() {
+        // The empty-name case (the common v0.5.0 upgrade snag) appends the one-line cure
+        // pointing at the new `default` name; other invalid names keep the plain reason.
+        let Err(Error::InvalidDb(msg)) = validate_db("") else {
+            panic!("empty --db must be rejected");
+        };
+        assert!(
+            msg.contains(boatramp_core::project::EMPTY_DB_NAME_CURE),
+            "empty-name error must carry the cure, got: {msg}"
+        );
+        // A different invalid name does NOT get the cure (it is not the empty-default case).
+        let Err(Error::InvalidDb(other)) = validate_db("a/b") else {
+            panic!("`a/b` must be rejected");
+        };
+        assert!(
+            !other.contains(boatramp_core::project::EMPTY_DB_NAME_CURE),
+            "a non-empty invalid name must not carry the empty-name cure, got: {other}"
+        );
     }
 
     #[test]

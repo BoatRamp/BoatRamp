@@ -1018,7 +1018,17 @@ pub(super) async fn delete_compute(
 fn reject_invalid_db(db: &str) -> Option<Response> {
     boatramp_core::project::validate_resource_name("database", db)
         .err()
-        .map(|err| (StatusCode::UNPROCESSABLE_ENTITY, format!("{err}\n")).into_response())
+        .map(|err| {
+            // The empty name is the common v0.5.0 upgrade snag (the legacy default was
+            // keyed by `""`), so its 422 body carries a one-line cure pointing at the
+            // new `default` name; any other invalid name keeps the plain canonical reason.
+            let body = if db.is_empty() {
+                format!("{err}; {}\n", boatramp_core::project::EMPTY_DB_NAME_CURE)
+            } else {
+                format!("{err}\n")
+            };
+            (StatusCode::UNPROCESSABLE_ENTITY, body).into_response()
+        })
 }
 
 /// A managed-DB migration script (multiple statements; simple-query protocol).
@@ -2327,6 +2337,8 @@ pub(super) async fn sql_move(
             StatusCode::OK,
             Json(serde_json::json!({
                 "status": "moved",
+                "project": report.project,
+                "site": report.site,
                 "from": report.from,
                 "to": report.to,
                 "integrity": report.integrity,
@@ -2979,6 +2991,36 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn empty_db_name_422_body_carries_the_cure() {
+        // The empty `{db}` (the common v0.5.0 upgrade snag — the legacy default was keyed
+        // by `""`) is rejected `422` with the canonical reason PLUS a one-line cure
+        // pointing at the new `default` name, so an operator is told the fix in the body.
+        let resp = reject_invalid_db("").expect("empty db is rejected");
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let body = String::from_utf8(bytes.to_vec()).expect("utf8 body");
+        assert!(
+            body.contains(boatramp_core::project::EMPTY_DB_NAME_CURE),
+            "empty-name 422 body must carry the cure, got: {body}"
+        );
+
+        // A different invalid name is still `422`, but WITHOUT the empty-name cure — it
+        // keeps the plain canonical reason.
+        let resp = reject_invalid_db("a/b").expect("`a/b` is rejected");
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let body = String::from_utf8(bytes.to_vec()).expect("utf8 body");
+        assert!(
+            !body.contains(boatramp_core::project::EMPTY_DB_NAME_CURE),
+            "a non-empty invalid name must not carry the empty-name cure, got: {body}"
+        );
+    }
+
     /// `POST /api/sql-move` end-to-end at the handler: a real local libsql backend, a
     /// successful move (200 + `{status, from, to, integrity}`), an invalid name (422
     /// before any lookup), and no backend wired (501).
@@ -3026,6 +3068,10 @@ mod tests {
         let body = body_json(resp).await;
         assert_eq!(body["status"], "moved");
         assert_eq!(body["integrity"], "ok");
+        // The report echoes the resolved (project, site) so an operator sees which
+        // site's default was relocated, not only the filesystem paths.
+        assert_eq!(body["project"], "default");
+        assert_eq!(body["site"], "blog");
         assert!(body["to"].as_str().unwrap().ends_with("blog/analytics.db"));
 
         // The data landed at the destination, and the source is gone.

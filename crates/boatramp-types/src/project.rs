@@ -42,6 +42,15 @@ pub const DEFAULT_PROJECT: &str = "default";
 /// place the literal is written.
 pub const DEFAULT_DB_NAME: &str = "default";
 
+/// The one-line cure appended to an **empty** (`""`) db-name rejection, at every
+/// surface that screens a db name (the CLI `--db`, the control-plane `{db}` body).
+/// The empty name is the single most common v0.5.0 upgrade snag — the legacy default
+/// binding was keyed by the empty string — so the rejection points straight at the
+/// new name instead of leaving the operator to guess. Kept next to [`DEFAULT_DB_NAME`]
+/// so the two never drift.
+pub const EMPTY_DB_NAME_CURE: &str =
+    "the default database is now named `default` — use `--db default`";
+
 /// KV prefix for the mutable pointer `projectmeta/<name>` → active spec hash.
 pub const POINTER_PREFIX: &str = "projectmeta/";
 /// KV prefix for the immutable, content-addressed project spec body.
