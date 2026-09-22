@@ -1811,7 +1811,8 @@ mod tests {
     use openraft::{BasicNode, Config, Raft};
 
     use crate::raft::{
-        InProcessForwarder, LogStore, NetworkFactory, Registry, StateMachineStore, TypeConfig,
+        InProcessForwarder, LogStore, NetworkFactory, RaftKv, Registry, StateMachineStore,
+        TypeConfig,
     };
 
     /// Minimal in-memory **shared** blob store for the cluster messaging tests
@@ -2374,6 +2375,368 @@ mod tests {
             TOPICS * 2,
             "gate 6: every message from both waves delivered (no stranding across the no-owner window)"
         );
+        for raft in rafts.into_values() {
+            let _ = raft.shutdown().await;
+        }
+    }
+
+    /// An initialized `n`-node in-process cluster where each node exposes BOTH a [`RaftKv`] (the
+    /// control-plane KV the [`DeployStore`](boatramp_core::deploy::DeployStore) async-lane queue lives
+    /// on) AND a [`RaftMessaging`] (whose `shard_owns` is the applied-membership HRW the async drainer
+    /// consults). Both facades on a node share the SAME per-node [`StateMachineStore`] and the SAME
+    /// registry/forwarder, so the applied membership a `RaftKv` CAS commits is the identical voter set
+    /// `shard_owns` reads — exactly the shared-applied-state coupling the server relies on (the KV CAS
+    /// serializes claims; the messaging HRW decides ownership). Mirrors [`cluster_mq`] and additionally
+    /// builds the `RaftKv` per node. Returns the rafts (for shutdown/kill), the KVs, and the mqs.
+    async fn cluster_kv_mq(
+        n: u64,
+    ) -> (
+        BTreeMap<NodeId, Raft<TypeConfig>>,
+        BTreeMap<NodeId, Arc<RaftKv>>,
+        BTreeMap<NodeId, Arc<RaftMessaging>>,
+    ) {
+        let registry = Registry::default();
+        let storage: Arc<dyn Storage> = Arc::new(MemStorage::default());
+        let bus = InProcessStreamBus::new();
+        let config = Arc::new(
+            Config {
+                heartbeat_interval: 150,
+                election_timeout_min: 300,
+                election_timeout_max: 600,
+                ..Default::default()
+            }
+            .validate()
+            .unwrap(),
+        );
+        let mut rafts = BTreeMap::new();
+        let mut kvs = BTreeMap::new();
+        let mut mqs = BTreeMap::new();
+        for id in 1..=n {
+            let sm = StateMachineStore::default();
+            let raft = Raft::new(
+                id,
+                config.clone(),
+                NetworkFactory::new(registry.clone()),
+                LogStore::default(),
+                sm.clone(),
+            )
+            .await
+            .unwrap();
+            registry.register(id, raft.clone());
+            // The control-plane KV facade — forwards writes to the leader, reads THIS node's applied
+            // state (the same `sm` the mq reads), so a claim CAS is leader-serialized cluster-wide.
+            let kv = Arc::new(RaftKv::in_process(
+                raft.clone(),
+                registry.clone(),
+                Arc::new(sm.clone()),
+            ));
+            let forward = Arc::new(InProcessForwarder::new(raft.clone(), registry.clone()));
+            let mq = Arc::new(RaftMessaging::new(
+                storage.clone(),
+                forward,
+                Arc::new(sm),
+                id,
+                bus.register(),
+                Arc::new(bus.clone()),
+            ));
+            rafts.insert(id, raft);
+            kvs.insert(id, kv);
+            mqs.insert(id, mq);
+        }
+        let members: BTreeMap<NodeId, BasicNode> =
+            (1..=n).map(|id| (id, BasicNode::default())).collect();
+        rafts[&1].initialize(members).await.unwrap();
+        rafts[&1]
+            .wait(Some(Duration::from_secs(10)))
+            .metrics(|m| m.current_leader.is_some(), "leader elected")
+            .await
+            .unwrap();
+        (rafts, kvs, mqs)
+    }
+
+    /// **Async-lane sharding — multi-node node-loss (the load-bearing safety gate).** The real
+    /// async-lane analog of the messaging [`gate6_sharding_node_loss_no_double_delivery_no_stranding`]:
+    /// a 3-node in-process Raft cluster runs the *server's* async drain over a `DeployStore`-on-`RaftKv`
+    /// queue, sharded by the messaging `shard_owns` HRW. A wave of queued invocations is drained
+    /// sharded; a second wave is enqueued; the node that owns a non-empty share is KILLED and removed
+    /// from membership; the survivors drain (unsharded backstop, then sharded). The invariant, mirroring
+    /// gate6's exactly-once + no-stranding:
+    ///   * **No double-execution** (gate6: no double-delivery) — a winning claim is unique per (fn,id).
+    ///     The whole-record CAS in [`claim_invocation`](boatramp_core::deploy::DeployStore::claim_invocation)
+    ///     admits the `Queued`→`Running` transition for at most ONE node even in the double-owner window,
+    ///     exactly as gate6's atomic leader-claim serializes concurrent drainers.
+    ///   * **No stranding** (gate6: all delivered) — every seeded invocation is claimed exactly once
+    ///     across the transition INCLUDING the no-owner window, because the survivors' UNSHARDED
+    ///     backstop pass (B7/B10 safety-net) claims any invocation no surviving node yet owns, just as
+    ///     gate6's unsharded rebuild drains the killed node's orphaned topics.
+    ///
+    /// This is a REAL detector (not a tautology): it drives the SAME `shard_owns` gate + `claim_invocation`
+    /// CAS the server uses, and its two invariants are guarded by two INDEPENDENT mechanisms, each
+    /// mutation-verified to make the gate fail:
+    ///   * **CAS ⇒ no double-execution.** The alive nodes drain CONCURRENTLY, racing the shared queue.
+    ///     Replacing the whole-record CAS with a blind `put_invocation` lets every racing drainer "win"
+    ///     the same record → the `unique.len() == wins.len()` assertion fails (observed ~84/60). This
+    ///     is the exactly-once guard: over-claiming (even a broken ownership gate that owns-all) is safe
+    ///     BECAUSE the CAS serializes it — which is exactly why over-ownership alone can NOT double-run,
+    ///     the same property the template gate6 has (its atomic leader-claim, not ownership, is the
+    ///     exactly-once guard).
+    ///   * **Ownership ⇒ no stranding.** The steady-state SHARDED-only wave-1 pass (no backstop) must
+    ///     cover every record, which holds only if ownership PARTITIONS the functions across the live
+    ///     nodes. A broken `shard_owns` that under-owns (nothing owned) strands wave 1 → the wave-1
+    ///     completeness assertion fails (observed 0/30). The post-kill unsharded backstop then proves
+    ///     the no-owner window strands nothing either.
+    #[serial_test::serial]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn gate_async_shard_multinode_node_loss_no_double_execution_no_stranding() {
+        use boatramp_core::deploy::DeployStore;
+        use boatramp_core::function::{Invocation, InvocationStatus, InvokeMode};
+        use boatramp_core::project::{ProjectRef, DEFAULT_PROJECT};
+        use boatramp_core::time::now_unix;
+
+        let (mut rafts, kvs, mqs) = cluster_kv_mq(3).await;
+        tokio::time::sleep(Duration::from_millis(300)).await; // let membership apply everywhere
+
+        // The async-lane shard key is the function identity `{project}/{function}` (mirrors the
+        // server's `async_shard_key_function`). ALL invocations of one function share ONE owner, so to
+        // spread the seed across all three shard owners we use N DISTINCT functions (one invocation
+        // each) — the HRW distributes `default/fn-i` across the nodes, exactly as gate6 uses 60 distinct
+        // topics. The shared blob store is unused by the queue (records live in the KV), so the drain
+        // never touches it — a claim CAS is the whole mechanism.
+        const N: usize = 30;
+        let shard_key = |i: usize| format!("{DEFAULT_PROJECT}/fn-{i}");
+        let seed_wave = |kv: Arc<RaftKv>, tag: &'static str| async move {
+            let deploy = DeployStore::new(
+                Arc::new(MemStorage::default()) as Arc<dyn Storage>,
+                kv as Arc<dyn boatramp_core::kv::KvStore>,
+            );
+            let now = now_unix();
+            for i in 0..N {
+                let inv = Invocation {
+                    id: format!("{tag}-{i}"),
+                    function: format!("fn-{i}"),
+                    version: "hashA".into(),
+                    mode: InvokeMode::Async,
+                    status: InvocationStatus::Queued,
+                    idempotency_key: None,
+                    attempts: 0,
+                    lease_expires: None,
+                    request_b64: None,
+                    request_content_type: None,
+                    result: None,
+                    created: now,
+                    updated: now,
+                };
+                deploy
+                    .put_invocation(ProjectRef::DEFAULT, &inv)
+                    .await
+                    .unwrap();
+            }
+        };
+
+        // One drain step, modeling the server's `drain_function_invocations` over a cluster. The alive
+        // nodes drain CONCURRENTLY — that is the real double-owner window and what makes the CAS
+        // load-bearing (gate6's `cluster_claim_never_double_delivers` + the server's gate3 both drive
+        // concurrent drainers). Per node, per function: consult ownership (IFF `!unsharded`, the B7
+        // backstop owns everything), list the queued record, and for each CLAIMABLE record run the
+        // server's whole-record CAS claim (Queued/expired-Running → Running + attempts+1 + a lease). A
+        // won claim (`Ok(true)` == the server would run the guest) records the (function,id): that is
+        // one EXECUTION. Because the alive nodes race the SAME records, the CAS is the exactly-once
+        // guard: it admits at most one claim per record even when several drainers observed it Queued
+        // (Invariant 1) — a blind `put_invocation` instead would let every racing drainer "win",
+        // double-executing (see the mutation tests for this gate). A long lease means a `Running`
+        // record is NOT reclaimable within the test, so redelivery (at-least-once) is never conflated
+        // with double-execution; the only re-claims are the legitimate no-owner backstop scans, which
+        // the CAS makes idempotent.
+        let executed: Arc<StdMutex<Vec<(String, String)>>> = Arc::new(StdMutex::new(Vec::new()));
+        async fn drain_node(
+            deploy: DeployStore,
+            mq: Arc<RaftMessaging>,
+            unsharded: bool,
+            executed: Arc<StdMutex<Vec<(String, String)>>>,
+        ) {
+            use boatramp_core::function::InvocationStatus;
+            use boatramp_core::project::{ProjectRef, DEFAULT_PROJECT};
+            use boatramp_core::time::now_unix;
+
+            for i in 0..N {
+                let function = format!("fn-{i}");
+                let key = format!("{DEFAULT_PROJECT}/{function}");
+                if !unsharded && !mq.shard_owns(&key).await {
+                    continue; // sharded pass: only my HRW share
+                }
+                let queued = deploy
+                    .list_invocations(ProjectRef::DEFAULT, &function)
+                    .await
+                    .unwrap();
+                let now = now_unix();
+                for observed in queued {
+                    // Claimable = freshly queued (or an expired-lease `Running` reclaim); mirror the
+                    // server's `claimable` predicate. Settled records are skipped (idempotent).
+                    let claimable = match observed.status {
+                        InvocationStatus::Queued => true,
+                        InvocationStatus::Running => {
+                            observed.lease_expires.is_none_or(|e| e <= now)
+                        }
+                        InvocationStatus::Succeeded | InvocationStatus::Failed => false,
+                    };
+                    if !claimable {
+                        continue;
+                    }
+                    // Compute the claimed record exactly as the drainer does: Running + a fresh (long)
+                    // lease + attempts+1, then CAS it onto the EXACT observed bytes. Yield right before
+                    // the CAS so concurrent drainers on the same record are actually interleaved (both
+                    // observed it Queued) — the CAS, not scheduling luck, is what serializes them.
+                    let mut claimed = observed.clone();
+                    claimed.status = InvocationStatus::Running;
+                    claimed.attempts = claimed.attempts.saturating_add(1);
+                    claimed.lease_expires = Some(now.saturating_add(60));
+                    claimed.updated = now;
+                    tokio::task::yield_now().await;
+                    if deploy
+                        .claim_invocation(ProjectRef::DEFAULT, &observed, &claimed)
+                        .await
+                        .unwrap()
+                    {
+                        // Won the CAS — this is the one execution for this record.
+                        executed
+                            .lock()
+                            .unwrap()
+                            .push((observed.function.clone(), observed.id.clone()));
+                    }
+                }
+            }
+        }
+        async fn drain_once(
+            kvs: &BTreeMap<NodeId, Arc<RaftKv>>,
+            mqs: &BTreeMap<NodeId, Arc<RaftMessaging>>,
+            alive: &[NodeId],
+            unsharded: bool,
+            executed: &Arc<StdMutex<Vec<(String, String)>>>,
+        ) {
+            // Drain the alive nodes CONCURRENTLY so they genuinely race the shared queue.
+            let mut tasks = Vec::new();
+            for &id in alive {
+                let deploy = DeployStore::new(
+                    Arc::new(MemStorage::default()) as Arc<dyn Storage>,
+                    kvs[&id].clone() as Arc<dyn boatramp_core::kv::KvStore>,
+                );
+                tasks.push(tokio::spawn(drain_node(
+                    deploy,
+                    mqs[&id].clone(),
+                    unsharded,
+                    executed.clone(),
+                )));
+            }
+            for t in tasks {
+                t.await.unwrap();
+            }
+        }
+
+        // (1) Seed wave 1 on node 1's KV (replicates to all nodes) and drain it sharded across all three
+        // — each node claims only its ~1/3 HRW share (steady state). NB the sharded pass alone (no
+        // unsharded backstop) must cover EVERY wave-1 record: that only holds if ownership partitions
+        // the functions across the live nodes. This is a load-bearing ownership assertion — if the
+        // shard gate under-owned (a function no live node claims), the sharded-only drain would strand
+        // it and this count would fall short (the backstop that would otherwise mask it runs only after
+        // the kill, in step 3).
+        seed_wave(kvs[&1].clone(), "w1").await;
+        drain_once(&kvs, &mqs, &[1, 2, 3], false, &executed).await;
+        assert_eq!(
+            executed.lock().unwrap().len(),
+            N,
+            "async-shard: the steady-state SHARDED pass alone drained every wave-1 invocation — \
+             ownership must partition the functions across the live nodes (no stranding, no gap)"
+        );
+
+        // (2) Seed wave 2, then KILL the node that owns a non-empty share (mirror gate6's node-3 kill)
+        // BEFORE its share is drained, so its owned functions are orphaned (the node-loss transition).
+        seed_wave(kvs[&1].clone(), "w2").await;
+        // Pick a victim with a non-empty applied-membership HRW share (prefer node 3, like gate6). If
+        // node 3 somehow owns nothing right now, fall back to any node that owns at least one function.
+        let victim = {
+            let mut pick = 3u64;
+            let mut best_nonempty = None;
+            for &cand in &[3u64, 2, 1] {
+                let mut owns = 0usize;
+                for i in 0..N {
+                    if mqs[&cand].shard_owns(&shard_key(i)).await {
+                        owns += 1;
+                    }
+                }
+                if cand == 3 && owns > 0 {
+                    pick = 3;
+                    best_nonempty = Some(3);
+                    break;
+                }
+                if best_nonempty.is_none() && owns > 0 {
+                    best_nonempty = Some(cand);
+                }
+            }
+            best_nonempty.unwrap_or(pick)
+        };
+        let survivors: Vec<NodeId> = [1u64, 2, 3].into_iter().filter(|&n| n != victim).collect();
+
+        // Kill the victim and shrink membership to the survivors so `shard_owns` reassigns its share.
+        rafts.remove(&victim).unwrap().shutdown().await.unwrap();
+        let fallback = rafts[&survivors[0]]
+            .metrics()
+            .borrow()
+            .current_leader
+            .unwrap_or(survivors[0]);
+        // If the victim was the leader the survivors re-elect first; give it a moment, then find a live
+        // self-leader and best-effort shrink membership (mirror gate6).
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let leader_id = rafts
+            .values()
+            .find_map(|r| {
+                let m = r.metrics();
+                let b = m.borrow();
+                (b.current_leader == Some(b.id)).then_some(b.id)
+            })
+            .unwrap_or(fallback);
+        let _ = rafts[&leader_id]
+            .change_membership(
+                survivors
+                    .iter()
+                    .copied()
+                    .collect::<std::collections::BTreeSet<NodeId>>(),
+                false,
+            )
+            .await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // (3) The survivors drain: first the UNSHARDED backstop (covers the killed node's orphaned share
+        // during/after the transition — the no-owner window), then a sharded pass for good measure.
+        drain_once(&kvs, &mqs, &survivors, true, &executed).await;
+        drain_once(&kvs, &mqs, &survivors, false, &executed).await;
+
+        // Invariant (mirrors gate6): every winning claim is UNIQUE (no invocation executed twice across
+        // the handoff — no double-execution), AND every seeded invocation (both waves, 2 × N) was
+        // claimed exactly once (no stranding across the no-owner window).
+        let wins = std::mem::take(&mut *executed.lock().unwrap());
+        let unique: HashSet<(String, String)> = wins.iter().cloned().collect();
+        assert_eq!(
+            unique.len(),
+            wins.len(),
+            "async-shard: an invocation was claimed/executed more than once across the node-loss transition (double-execution)"
+        );
+        assert_eq!(
+            wins.len(),
+            N * 2,
+            "async-shard: every seeded invocation from both waves was claimed exactly once (no stranding across the no-owner window)"
+        );
+
+        println!(
+            "ASYNC-SHARD MULTINODE NODE-LOSS OK: over a real 3-node in-process Raft cluster (RaftKv \
+             async queue + RaftMessaging HRW ownership on one shared applied state), a wave was drained \
+             sharded, a second wave was enqueued, and the shard-owning node (node {victim}) was KILLED \
+             and removed from membership mid-flight — the survivors' unsharded backstop + sharded passes \
+             claimed every one of {} seeded invocations EXACTLY once (the whole-record CAS serialized \
+             concurrent/handoff claimers) with NO double-execution and NO stranding across the no-owner \
+             window.",
+            N * 2
+        );
+
         for raft in rafts.into_values() {
             let _ = raft.shutdown().await;
         }

@@ -1561,15 +1561,27 @@ impl DeployStore {
                     // Overwrite ONLY a terminal record (a real re-fire). Anything else — Queued,
                     // Running (incl. lease-expired: the drain reclaims it), or an unparsable record —
                     // is treated as in-flight and left alone, so we never resurrect it.
-                    let terminal = serde_json::from_slice::<crate::function::Invocation>(&current)
-                        .map(|i| {
-                            matches!(
-                                i.status,
-                                crate::function::InvocationStatus::Succeeded
-                                    | crate::function::InvocationStatus::Failed
-                            )
-                        })
-                        .unwrap_or(false);
+                    let terminal = match serde_json::from_slice::<crate::function::Invocation>(
+                        &current,
+                    ) {
+                        Ok(rec) => matches!(
+                            rec.status,
+                            crate::function::InvocationStatus::Succeeded
+                                | crate::function::InvocationStatus::Failed
+                        ),
+                        Err(e) => {
+                            // Fail safe (never resurrect), but a corrupt record silently wedges
+                            // re-fires for this id — surface it so an operator can clear it.
+                            tracing::warn!(
+                                key = %key,
+                                error = %e,
+                                "refire_invocation: existing invocation record is unparsable; \
+                                 leaving it in place (not resurrecting), re-fires for this id are \
+                                 wedged until it is cleared"
+                            );
+                            false
+                        }
+                    };
                     if !terminal {
                         return Ok(false);
                     }
@@ -1585,6 +1597,32 @@ impl DeployStore {
             }
         }
         Ok(false)
+    }
+
+    /// **Settle** a claimed invocation via CAS on the exact claimed bytes (B10). A drain settles the
+    /// record it CAS-claimed; if a peer reclaimed an elapsed lease in the meantime (the double-owner
+    /// window — now reachable by a mere lease-exceeding stall, not only a crash, once the lane is
+    /// sharded), the stored bytes no longer equal `claimed`, the CAS fails, and this node **drops**
+    /// its stale settle rather than blind-writing it. A blind settle here would clobber the live
+    /// successor's claim — resetting a requeued outcome back to a claimable `Queued` (a second
+    /// execution of a side-effecting function) or overwriting it with a stale `Succeeded`. Returns
+    /// whether this node's settle won; a `false` means a peer legitimately took over and this run's
+    /// result is discarded. Same whole-record CAS as [`claim_invocation`](Self::claim_invocation).
+    pub async fn settle_invocation(
+        &self,
+        project: ProjectRef<'_>,
+        claimed: &crate::function::Invocation,
+        settled: &crate::function::Invocation,
+    ) -> Result<bool, DeployError> {
+        let key =
+            crate::function::keys::invocation(project.as_str(), &claimed.function, &claimed.id);
+        let expected =
+            serde_json::to_vec(claimed).map_err(|e| DeployError::Serde(e.to_string()))?;
+        let next = serde_json::to_vec(settled).map_err(|e| DeployError::Serde(e.to_string()))?;
+        Ok(self
+            .kv
+            .compare_and_swap(&key, Some(&expected), next)
+            .await?)
     }
 
     /// Bind an idempotency key to an invocation id (the dedup pointer). The value

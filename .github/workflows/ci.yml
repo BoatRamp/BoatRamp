@@ -753,6 +753,26 @@ jobs:
             grep -qF "$m" messaging-dlq.log \
               || { echo "::error::missing poison-pill/DLQ matrix marker: $m (a DLQ regression or a skipped cell)" >&2; exit 1; }
           done
+      # B10 (async-lane sharding) MULTI-NODE node-loss HARD GATE. The real 3-node in-process Raft
+      # analog of the messaging gate6: a RaftKv async queue + RaftMessaging HRW ownership over one
+      # shared applied state, drained sharded, a second wave enqueued, the shard-owning node KILLED +
+      # removed from membership, then the survivors drain (unsharded backstop + sharded). Two
+      # independent, mutation-verified detectors: the whole-record CAS claim ⇒ no double-execution
+      # (concurrent drainers, a blind put would double-count), and correct ownership ⇒ no stranding
+      # (the sharded-only wave must partition; under-ownership strands it, the no-owner window is
+      # backstopped). Distinct from the boatramp-server B10 battery's `ASYNC-SHARD NODE-LOSS OK` (7→8
+      # gate) — this asserts the MULTI-NODE marker. It runs in the lane above, but a rename/`#[ignore]`
+      # reports `ok`, so re-run the specific test with `--nocapture` and assert the marker + pass count.
+      - name: async-lane sharding MULTI-NODE node-loss marker (B10)
+        run: |
+          set -eo pipefail
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-cluster \
+            --features raft,http gate_async_shard_multinode_node_loss_no_double_execution_no_stranding \
+            -- --nocapture 2>&1 | tee async-shard-multinode.log
+          grep -qE 'test result: ok\. 1 passed' async-shard-multinode.log \
+            || { echo "::error::B10 multi-node node-loss gate did not run (silent skip or a failure)" >&2; exit 1; }
+          grep -q 'ASYNC-SHARD MULTINODE NODE-LOSS OK' async-shard-multinode.log \
+            || { echo "::error::B10 multi-node node-loss gate never reached its marker (a double-execution or stranding regression across a real Raft node loss)" >&2; exit 1; }
       # v0.4.26: the read-only messaging-stats binding is tenant-scoped by a host-filled `{tenant}`
       # template — per-topic depth/DLQ counts are a cross-tenant oracle otherwise. This host-level
       # conformance gate drives the REAL substrate + the tenant-substitution security property end to
@@ -778,8 +798,8 @@ jobs:
           set -eo pipefail
           cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-server \
             --features handlers --lib b10_async_shard_tests -- --nocapture 2>&1 | tee async-shard.log
-          grep -qE 'test result: ok\. 7 passed' async-shard.log \
-            || { echo "::error::B10 async-shard battery did not run all 7 gates (silent skip or a failure)" >&2; exit 1; }
+          grep -qE 'test result: ok\. 8 passed' async-shard.log \
+            || { echo "::error::B10 async-shard battery did not run all 8 gates (silent skip or a failure)" >&2; exit 1; }
           grep -q 'ASYNC-SHARD NODE-LOSS OK' async-shard.log \
             || { echo "::error::B10 node-loss gate never reached its marker (a double-execution or stranding regression)" >&2; exit 1; }
 

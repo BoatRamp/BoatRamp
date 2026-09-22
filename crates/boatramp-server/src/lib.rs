@@ -7116,4 +7116,69 @@ mod b10_async_shard_tests {
             "old(owns-all) ⊕ new(sharded) skew: exactly one execution, no function unowned"
         );
     }
+
+    /// GATE 8 — a stale settle never clobbers a reclaimer (MEDIUM-1): node A claims an invocation
+    /// (Running); its lease elapses and node B reclaims it (Running, attempts+1); A finishes its
+    /// stale run and settles via CAS on its OLD claimed bytes → the CAS LOSES (the record is now
+    /// B's), so A drops its outcome and B's live claim is intact. With the old blind `put_invocation`
+    /// settle, A would reset the record to a claimable state and re-arm a second execution.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gate8_stale_settle_never_clobbers_a_reclaimer() {
+        let storage = Arc::new(super::tests::MemStorage::default());
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let deploy = DeployStore::new(storage.clone(), kv.clone());
+        seed_counter_function(&deploy, "worker").await;
+
+        // Node A's claim: Running with an elapsed lease (attempts=1).
+        let mut claimed_a = queued("inv1", "worker");
+        claimed_a.status = InvocationStatus::Running;
+        claimed_a.attempts = 1;
+        claimed_a.lease_expires = Some(1); // unix second 1 — long past
+        deploy
+            .put_invocation(ProjectRef::DEFAULT, &claimed_a)
+            .await
+            .unwrap();
+
+        // Node B reclaims the elapsed lease via the drain's claim CAS (Running, attempts=2).
+        let mut claimed_b = claimed_a.clone();
+        claimed_b.attempts = 2;
+        claimed_b.lease_expires = Some(u64::MAX);
+        assert!(
+            deploy
+                .claim_invocation(ProjectRef::DEFAULT, &claimed_a, &claimed_b)
+                .await
+                .unwrap(),
+            "node B reclaims the elapsed lease"
+        );
+
+        // Node A finishes its stale run and tries to settle to a retryable `Queued` (the dangerous
+        // resurrection case) on its OLD claimed bytes → must LOSE the CAS.
+        let mut settled_a = claimed_a.clone();
+        settled_a.status = InvocationStatus::Queued;
+        settled_a.lease_expires = None;
+        let won = deploy
+            .settle_invocation(ProjectRef::DEFAULT, &claimed_a, &settled_a)
+            .await
+            .unwrap();
+        assert!(
+            !won,
+            "A's stale settle loses the CAS (the stored record is now B's claim)"
+        );
+
+        // The stored record is STILL B's live claim — never reset to a claimable Queued.
+        let rec = deploy
+            .get_invocation(ProjectRef::DEFAULT, "worker", "inv1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            rec.status,
+            InvocationStatus::Running,
+            "B's live claim is intact — A's stale settle did not resurrect it"
+        );
+        assert_eq!(
+            rec.attempts, 2,
+            "still B's claim (attempts=2); the stale settle was dropped"
+        );
+    }
 }

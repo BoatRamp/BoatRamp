@@ -1749,13 +1749,18 @@ async fn run_claimed_invocation(
     mut inv: boatramp_core::function::Invocation,
 ) {
     use boatramp_core::function::InvocationStatus;
+    // Snapshot the exact claimed record (what the drain CAS-wrote and what is stored right now). We
+    // settle via a CAS on these bytes (B10): if a peer reclaimed an elapsed lease while this run was
+    // in flight, the store no longer holds `claimed`, the settle CAS fails, and we drop our stale
+    // outcome instead of clobbering the live successor into a second execution.
+    let claimed = inv.clone();
     // The version was pinned at enqueue; a later deploy can't silently change it.
     let Some(component) = function.resolve(&inv.version).map(str::to_owned) else {
         // The pinned version is gone (rolled off / pruned) — unrunnable, so fail.
         inv.status = InvocationStatus::Failed;
         inv.lease_expires = None;
         inv.updated = now_unix();
-        let _ = deploy.put_invocation(project, &inv).await;
+        let _ = deploy.settle_invocation(project, &claimed, &inv).await;
         return;
     };
     let bytes_in = inv
@@ -1803,7 +1808,25 @@ async fn run_claimed_invocation(
     // invocation has settled (terminal or requeued for a later tick).
     inv.lease_expires = None;
     inv.updated = now_unix();
-    let _ = deploy.put_invocation(project, &inv).await;
+    // Settle via CAS on the claimed bytes: if a peer reclaimed our elapsed lease mid-run, this fails
+    // and we drop the stale outcome rather than clobbering the successor (B10 MEDIUM-1).
+    match deploy.settle_invocation(project, &claimed, &inv).await {
+        Ok(true) => {} // our settle won — fall through to metering
+        Ok(false) => {
+            // A peer reclaimed our elapsed lease mid-run; drop the stale outcome (it settled the
+            // successor's run, not ours) — never meter or clobber.
+            tracing::warn!(
+                function = %function.name,
+                id = %inv.id,
+                "settle skipped: a peer reclaimed this invocation's lease mid-run (stale outcome dropped)"
+            );
+            return;
+        }
+        Err(err) => {
+            tracing::warn!(function = %function.name, id = %inv.id, %err, "settling invocation failed");
+            return;
+        }
+    }
     // Meter a settled attempt (a requeue-for-retry is not yet a completed
     // invocation, so only the terminal transition is metered).
     if matches!(

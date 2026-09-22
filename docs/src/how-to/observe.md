@@ -133,6 +133,14 @@ Messages that exhaust their retry budget are dead-lettered — kept with their
 payload and counted here. Inspect the cause in `logs`, then redrive or purge
 them; see [Run consumers, crons, and streams](./background-work.md).
 
+On a cluster, the stats JSON also carries an `async_shards` block: for each function this node
+drains, its `owning_node` and `queued` depth, plus a `safetynet_only_drains` counter. Use it to
+answer "which node drains this function?" and to tell a **shard gap** (a function briefly owned by no
+node) from a slow drain: a rising `safetynet_only_drains` means the unsharded backstop is covering
+work the owner isn't picking up (work is still draining), whereas a climbing `queued` with a flat
+counter is a genuinely stalled drain. The `messaging_safetynet_interval_ms` knob (which paces the
+delivery backstop) also bounds how quickly that async no-owner gap is recovered.
+
 Captured guest lines are also mirrored to the server log under the `boatramp::guest` target (at
 `debug`), so `RUST_LOG=boatramp=debug` surfaces guest output in `serve.log` too — handy in
 development. Each captured line carries the request's `request_id` (above). A site that opts out
