@@ -165,7 +165,44 @@ of `function` / `sql` / `extension`:
   the active version), and an opaque `args` string handed to the function as its invoke
   request body — boatramp does not interpret `args`; the function parses it.
 
-Upload the bundle (its hash is the sha256-hex; the endpoint verifies it), then trigger:
+The `boatramp` CLI does the upload-then-trigger in one step. You give it the step set one of two
+ways — a **migrations directory** it assembles (the everyday path), or a pre-authored bundle file.
+
+**From a migrations directory (`--dir`).** Keep one file per step in a directory; the CLI reads
+them, assembles the canonical bundle, uploads, and triggers:
+
+```sh
+migrations/
+  0001_init.sql              # → sql step (file body is the script)
+  0002_pgcrypto.ext          # → extension step (file body is the extension name)
+  0003_orders_idx.notx.sql   # → sql step with no_transaction (CREATE INDEX CONCURRENTLY)
+  0004_backfill.fn.json      # → function step: {"name":"backfill-orders","version":"v3","args":"…"}
+
+boatramp project migrate apply --project acme --db appdb -d migrations/
+```
+
+The step `id` is the file name minus its kind suffix, and steps apply in **lexicographic filename
+order** (zero-pad your prefixes). The suffix picks the kind — `.sql`, `.notx.sql`, `.ext`,
+`.fn.json` — so nothing is silently miscategorized; a file with any other suffix is a hard error
+(a mistyped migration must not vanish), and two files resolving to the same `id` are refused. An
+`extension` must be an `.ext` file because a raw `sql` step may not `CREATE EXTENSION` (below).
+
+**From a pre-authored bundle (`--file`).** If you generate the canonical `{ "steps": [ … ] }`
+document yourself, upload it directly instead:
+
+```sh
+boatramp project migrate apply --project acme --db appdb -f migrations.json
+```
+
+Either way the CLI `PUT`s the bundle to the blob endpoint, `POST`s the trigger, and renders the
+`MigrationReport` (a step that ran-but-failed exits non-zero, so a deploy script halts on it);
+`--json` emits the raw report. The verb lives under `project` (not the top-level `boatramp
+migrate`, which is the unrelated pre-0.2.0 store re-key) because a schema migration is a
+project-scoped admin operation. A directory-assembled bundle and a hand-authored one with the same
+steps serialize to the same canonical form, so they **hash-agree**.
+
+Equivalently, the raw HTTP contract the CLI drives — upload the bundle (its hash is the
+sha256-hex; the endpoint verifies it), then trigger:
 
 ```sh
 # 1. upload the content-addressed bundle
@@ -182,9 +219,9 @@ curl -sS -X POST https://cp.example.com/api/projects/acme/migrate/appdb/apply \
 ```
 
 Paths target the named project; the top-level `/api/migrate/…` counterpart targets the
-`default` project. The boatramp migrate client is a **thin uploader** — it assembles the
-bundle from whatever on-disk layout you keep, PUTs the blob, and POSTs the trigger. boatramp
-stays agnostic to your directory shape; the HTTP surface above is the contract.
+`default` project (with the CLI, omit `--project`). The migrate client is a **thin uploader** —
+it assembles the bundle from whatever on-disk layout you keep, PUTs the blob, and POSTs the
+trigger. boatramp stays agnostic to your directory shape; the HTTP surface above is the contract.
 
 ## apply / dry-run / baseline / status
 
@@ -215,6 +252,8 @@ Four verbs on a managed database `:db`, all referencing an uploaded bundle by ha
 `pending` lists the ids that would apply:
 
 ```sh
+boatramp project migrate dry-run --project acme --db appdb -d migrations/
+# raw HTTP:
 curl -sS -X POST .../migrate/appdb/dry-run -H "Authorization: Bearer $BOATRAMP_TOKEN" \
   -H 'content-type: application/json' -d "{ \"bundle\": \"$HASH\" }"
 ```
@@ -223,6 +262,8 @@ curl -sS -X POST .../migrate/appdb/dry-run -H "Authorization: Bearer $BOATRAMP_T
 `origin` marker — `apply` vs `baseline`):
 
 ```sh
+boatramp project migrate status --project acme --db appdb   # add --json for the raw ledger
+# raw HTTP:
 curl -sS .../migrate/appdb/status -H "Authorization: Bearer $BOATRAMP_TOKEN"
 ```
 
@@ -364,6 +405,9 @@ populated database (a `422`). `baseline` closes that gap: it **records a prefix 
 as already-applied WITHOUT running any step**.
 
 ```sh
+boatramp project migrate baseline --project acme --db appdb \
+  -d migrations/ --up-to 0097_last_old_path_migration
+# raw HTTP:
 curl -sS -X POST .../migrate/appdb/baseline -H "Authorization: Bearer $BOATRAMP_TOKEN" \
   -H 'content-type: application/json' \
   -d "{ \"bundle\": \"$HASH\", \"up_to\": \"0097_last_old_path_migration\" }"
