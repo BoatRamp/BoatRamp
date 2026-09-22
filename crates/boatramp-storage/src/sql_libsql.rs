@@ -105,6 +105,56 @@ impl LibsqlSql {
         Ok(())
     }
 
+    /// Run a migration `sql` step **atomically** with its host-built ledger INSERT — the embedded
+    /// engine's transactional-DDL strength (the whole point of the libsql migrate substrate, and the
+    /// inverse of MySQL's non-atomic per-DDL-implicit-commit path).
+    ///
+    /// On ONE connection: `BEGIN`, run the step's `script` (multi-statement), run the host-owned
+    /// `ledger_insert`, then `COMMIT`. If **any** statement fails — the DDL, or the ledger row — the
+    /// whole transaction is rolled back, so the database is left byte-identical to before the step
+    /// (SQLite transactional DDL undoes every statement that ran, including an earlier one in a
+    /// multi-statement step) and NO ledger row is recorded. The `Err` carries the underlying failure;
+    /// a best-effort `ROLLBACK` runs first (if it too fails the transaction is abandoned when the
+    /// connection drops, which SQLite also treats as a rollback).
+    ///
+    /// `ledger_insert` is fully host-built + value-quoted by the caller (never guest text), and the
+    /// `script` has already passed the host-side guards (no transaction control, no ledger-schema
+    /// reference, no `CREATE EXTENSION`), so a guest cannot desync this wrapper with its own
+    /// `COMMIT`/`ROLLBACK`.
+    pub async fn run_migration_txn(
+        &self,
+        script: &str,
+        ledger_insert: &str,
+    ) -> Result<(), SqlError> {
+        let conn = self.db.connect().map_err(SqlError::other)?;
+        if self.local {
+            // A contended writer waits for the lock instead of erroring (local only).
+            run_pragma(&conn, &format!("PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")).await?;
+        }
+        conn.execute("BEGIN", ()).await.map_err(SqlError::other)?;
+        // Run the step's DDL/DML, then the ledger row, inside the open transaction. On ANY failure,
+        // roll the WHOLE thing back (best effort) and surface the original error.
+        let result = async {
+            conn.execute_batch(script).await.map_err(SqlError::other)?;
+            conn.execute_batch(ledger_insert)
+                .await
+                .map_err(SqlError::other)?;
+            Ok::<(), SqlError>(())
+        }
+        .await;
+        match result {
+            Ok(()) => {
+                conn.execute("COMMIT", ()).await.map_err(SqlError::other)?;
+                Ok(())
+            }
+            Err(e) => {
+                // Best-effort rollback; if it fails the dropped connection rolls back anyway.
+                let _ = conn.execute("ROLLBACK", ()).await;
+                Err(e)
+            }
+        }
+    }
+
     /// Copy this database to `path` as a transactionally consistent snapshot
     /// (SQLite `VACUUM INTO`) — safe to run online against a live database.
     async fn vacuum_into(&self, path: &Path) -> Result<(), SqlError> {
@@ -148,6 +198,25 @@ impl SqlBackend for LibsqlSql {
             Some(replica) => self.begin_on(replica).await,
             None => self.begin_on(&self.db).await,
         }
+    }
+
+    /// Run a multi-statement DDL/DML **script** as one unit (auto-commit), backing the
+    /// operator/migration path on the embedded engine. Unlike the per-site handler `sql` binding
+    /// (which rejects raw scripts — it is a guest surface), this is an OPERATOR tool: the owner-gated
+    /// schema-migration substrate uses it for the ledger DDL, the `record` ledger INSERT, a
+    /// `no_transaction` step, and the host-mediated `migrate-ddl` seam of a `function` step. It runs
+    /// each statement on a fresh connection off the shared primary, exactly like the Postgres/MySQL
+    /// backends' `run_script`. (SQLite runs a bare `execute_batch` in autocommit mode, so each
+    /// statement commits as it succeeds — the transactional per-step atomicity the migration surface
+    /// needs is provided separately by [`run_migration_txn`](Self::run_migration_txn).)
+    async fn run_script(&self, sql: &str) -> Result<(), SqlError> {
+        self.db
+            .connect()
+            .map_err(SqlError::other)?
+            .execute_batch(sql)
+            .await
+            .map_err(SqlError::other)?;
+        Ok(())
     }
 }
 

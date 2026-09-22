@@ -565,14 +565,21 @@ pub enum GuardDialect {
     Postgres,
     /// MySQL lexer rules (`#` line comments, backtick identifiers).
     Mysql,
+    /// SQLite / libsql lexer rules (`sqlparser`'s [`SQLiteDialect`]): like the generic lexer for
+    /// `--` + `/* */` comments and `'…'` strings, but additionally understands SQLite's
+    /// `` `…` `` (backtick) and `[…]` (bracketed) quoted identifiers. Selecting it for the embedded
+    /// libsql backend keeps a raw `sql` migration step from smuggling transaction control (`COMMIT`)
+    /// or the ledger-table name past the guard hidden inside a SQLite-specific quoted-identifier form
+    /// the generic lexer would tokenize differently.
+    Sqlite,
 }
 
 impl From<Dialect> for GuardDialect {
     fn from(d: Dialect) -> Self {
         match d {
             Dialect::Mysql => Self::Mysql,
-            // SQLite/libsql shares the generic/Postgres comment + quoting rules for guard purposes.
-            Dialect::Postgres | Dialect::Sqlite => Self::Postgres,
+            Dialect::Sqlite => Self::Sqlite,
+            Dialect::Postgres => Self::Postgres,
         }
     }
 }
@@ -776,11 +783,11 @@ fn mysql_strip_comments_faithfully(script: &str) -> Option<String> {
 /// strips comments before parse, so a scan of the raw bytes saw a different statement than the
 /// server ran.
 fn significant_words_in(script: &str, dialect: GuardDialect) -> Option<Vec<String>> {
-    use sqlparser::dialect::{GenericDialect, MySqlDialect};
+    use sqlparser::dialect::{GenericDialect, MySqlDialect, SQLiteDialect};
     use sqlparser::tokenizer::{Token, Tokenizer, Word};
     // Tokenize with the engine's own lexer so its comment/quote forms are honored (MySQL `#`
-    // comments + backtick identifiers). `GenericDialect` for Postgres/SQLite keeps the historical
-    // behavior byte-for-byte.
+    // comments + backtick identifiers; SQLite backtick + `[…]` bracketed identifiers).
+    // `GenericDialect` for Postgres keeps the historical behavior byte-for-byte.
     let raw = match dialect {
         GuardDialect::Mysql => {
             // MySQL/MariaDB comment semantics diverge from sqlparser's MySqlDialect in two ways that
@@ -800,6 +807,7 @@ fn significant_words_in(script: &str, dialect: GuardDialect) -> Option<Vec<Strin
                 .tokenize()
                 .ok()?
         }
+        GuardDialect::Sqlite => Tokenizer::new(&SQLiteDialect {}, script).tokenize().ok()?,
         GuardDialect::Postgres => Tokenizer::new(&GenericDialect {}, script).tokenize().ok()?,
     };
     Some(
@@ -1267,6 +1275,51 @@ mod migration_guard_tests {
             GuardDialect::Mysql
         ));
     }
+
+    #[test]
+    fn sqlite_dialect_guards_honor_comments_and_quoted_identifiers() {
+        use super::{script_has_txn_control_in, script_references_word_in, GuardDialect};
+        // A real COMMIT under the SQLite dialect is transaction control.
+        assert!(script_has_txn_control_in(
+            "DROP TABLE t; COMMIT",
+            GuardDialect::Sqlite,
+        ));
+        // A COMMIT hidden behind a `--` line comment is stripped by SQLite → not control.
+        assert!(!script_has_txn_control_in(
+            "CREATE TABLE t (id int) -- COMMIT",
+            GuardDialect::Sqlite,
+        ));
+        // A COMMIT trailing a `--` comment (the byte-scan-evasion form) is still caught when it is
+        // BEFORE the comment (SQLite executes it), not after.
+        assert!(script_has_txn_control_in(
+            "DROP TABLE t; COMMIT -- done",
+            GuardDialect::Sqlite,
+        ));
+        // SQLite `` `backtick` `` AND `[bracketed]` quoted identifiers still match the ledger name —
+        // the whole reason the SQLite dialect is selected over the generic lexer (which tokenizes
+        // `[…]` differently). Quote-immune under both SQLite identifier forms.
+        assert!(script_references_word_in(
+            "SELECT * FROM `boatramp_migrations`.`schema_migrations`",
+            "boatramp_migrations",
+            GuardDialect::Sqlite,
+        ));
+        assert!(script_references_word_in(
+            "SELECT * FROM [boatramp_migrations].[schema_migrations]",
+            "boatramp_migrations",
+            GuardDialect::Sqlite,
+        ));
+        // The ledger name inside a string literal is NOT a reference.
+        assert!(!script_references_word_in(
+            "INSERT INTO t (note) VALUES ('boatramp_migrations is host-owned')",
+            "boatramp_migrations",
+            GuardDialect::Sqlite,
+        ));
+        // Plain SQLite DDL is not transaction control.
+        assert!(!script_has_txn_control_in(
+            "CREATE TABLE widget (id INTEGER PRIMARY KEY, name TEXT)",
+            GuardDialect::Sqlite,
+        ));
+    }
 }
 
 /// How a **preview** deployment's SQL database relates to the site's live one
@@ -1695,18 +1748,21 @@ pub enum SubstrateStepOutcome {
 /// connection, the host-owned `schema_migrations` ledger, and the direct `sql`/`extension` execution
 /// path. The orchestrator owns ordering, prefix-consistency, `function`-step invocation (which needs
 /// the server's invoke kernel and cannot live here), and dry-run planning; this seam owns the
-/// database IO. The DDL identity is always **distinct from the runtime tenant user** — on Postgres
-/// the per-project non-superuser **owner role** (never the cluster superuser); on MySQL an
+/// database IO. The DDL identity is **distinct from the runtime tenant user** — on Postgres the
+/// per-project non-superuser **owner role** (never the cluster superuser); on MySQL an
 /// operator-supplied DDL login distinct from the runtime user (refused fail-closed if absent, since
-/// MySQL has no owner/runtime role split). The allowlist-gated host-templated `CREATE EXTENSION` is
-/// Postgres-only (refused on MySQL). Backend-honest per engine: Postgres DDL is transactional
-/// (atomic per step), MySQL DDL implicitly commits (per-step, non-atomic — a mid-step failure is
-/// reported as partially applied).
+/// MySQL has no owner/runtime role split). On **embedded libsql/SQLite** there is no role model at
+/// all: the single-connection FILE is the trust boundary, so the owner-role safety is **N/A** (stated
+/// plainly, not pretended) — the guest still never holds a credential (host-mediated as elsewhere).
+/// The allowlist-gated host-templated `CREATE EXTENSION` is Postgres-only (refused on MySQL and
+/// libsql). Backend-honest per engine: Postgres and **libsql** DDL are transactional (atomic per step
+/// — a failed libsql step rolls back cleanly), while MySQL DDL implicitly commits (per-step,
+/// non-atomic — a mid-step failure is reported as partially applied).
 #[async_trait]
 pub trait MigrationSubstrate: Send + Sync {
-    /// Engine gate (Postgres + MySQL; the embedded libsql backend is a later parity phase), ensure
-    /// the ledger schema/database + table exist, and return the applied rows in order. `Unavailable`
-    /// (managed DB still starting) maps to a retryable 503.
+    /// Engine gate (Postgres + MySQL + embedded libsql/SQLite), ensure the ledger schema/database +
+    /// table exist, and return the applied rows in order. `Unavailable` (managed DB still starting)
+    /// maps to a retryable 503.
     async fn preflight(
         &self,
         project: &str,

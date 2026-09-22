@@ -1430,11 +1430,16 @@ pub struct SqlBindingConfig {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct ExternalDatabaseConfig {
-    /// Engine: `postgres` (aliases `postgresql`/`pg`) or `mysql` (alias
-    /// `mariadb`).
+    /// Engine: `postgres` (aliases `postgresql`/`pg`), `mysql` (alias
+    /// `mariadb`), or `libsql` (aliases `sqlite`/`sqlite3`) — the embedded
+    /// SQLite-compatible engine (single-node file, or a remote sqld primary via
+    /// `url_env`). A `libsql` entry needs neither `compute` nor an external URL for
+    /// the single-node case: it names an on-disk file via [`path`](Self::path).
     pub kind: String,
     /// Name of the env var holding the connection URL (e.g.
-    /// `postgres://user:pw@host/db`). Required unless `compute` is set.
+    /// `postgres://user:pw@host/db`). Required unless `compute` is set — or, for a
+    /// single-node `libsql` database, unless `path` is set (an embedded file needs
+    /// no URL/secret).
     pub url_env: String,
     /// Optional env var holding a **read-replica** connection URL. When set,
     /// `open-read-only` transactions route there; writes stay on `url_env`.
@@ -1556,6 +1561,12 @@ pub struct ExternalDatabaseConfig {
     /// can never set it — the `tenant_guc` namespace is already reserved against guest writes.
     #[serde(default)]
     pub tenant_all_marker: Option<String>,
+    /// The on-disk file path for a single-node **`libsql`** database (`kind: "libsql"`), e.g.
+    /// `/data/app.db`. The parent directory is created if absent. Used only by the embedded engine;
+    /// ignored for `postgres`/`mysql` and for a remote-sqld `libsql` binding (which uses `url_env`).
+    /// A `libsql` entry sets exactly one of `path` (single-node file) or `url_env` (remote sqld).
+    #[serde(default)]
+    pub path: Option<PathBuf>,
 }
 
 /// How a managed compute-backed database is physically isolated per tenant (2×2 axis
@@ -1598,6 +1609,46 @@ impl ExternalDatabaseConfig {
     pub fn validate(&self, name: &str) -> Result<(), String> {
         let has_url = !self.url_env.is_empty();
         let has_compute = self.compute.as_deref().is_some_and(|c| !c.is_empty());
+        let has_path = self
+            .path
+            .as_deref()
+            .is_some_and(|p| !p.as_os_str().is_empty());
+
+        // A `libsql`/`sqlite` entry is the embedded engine: single-node via `path`, or remote sqld
+        // via `url_env` — never `compute` (boatramp doesn't run a libsql server workload). Validate
+        // it on its own axis (exactly one of `path` / `url_env`), and reject `path` on the external
+        // engines (a Postgres/MySQL binding has no on-disk file).
+        let is_libsql = matches!(
+            self.kind.trim().to_ascii_lowercase().as_str(),
+            "libsql" | "sqlite" | "sqlite3"
+        );
+        if is_libsql {
+            if has_compute {
+                return Err(format!(
+                    "sql database {name:?}: a `libsql` database is the embedded engine — set `path` \
+                     (single-node file) or `url_env` (remote sqld), not `compute`"
+                ));
+            }
+            return match (has_path, has_url) {
+                (true, true) => Err(format!(
+                    "sql database {name:?}: a `libsql` database sets exactly one of `path` \
+                     (single-node file) or `url_env` (remote sqld), not both"
+                )),
+                (false, false) => Err(format!(
+                    "sql database {name:?}: a `libsql` database needs a source — set `path` \
+                     (single-node file) or `url_env` (remote sqld)"
+                )),
+                _ => Ok(()),
+            };
+        }
+        if has_path {
+            return Err(format!(
+                "sql database {name:?}: `path` is only valid for a `libsql` database (the embedded \
+                 engine); a {} binding uses `url_env` or `compute`",
+                self.kind
+            ));
+        }
+
         match (has_url, has_compute) {
             (true, true) => Err(format!(
                 "sql database {name:?}: set exactly one of `url_env` or `compute`, not both"
@@ -3015,6 +3066,61 @@ mod tests {
         };
         assert!(managed.validate("db").is_ok());
         assert!(managed.is_managed_credential());
+    }
+
+    #[test]
+    fn libsql_source_is_exactly_one_of_path_or_url() {
+        // A single-node `libsql` file (path only) → ok.
+        let file = ExternalDatabaseConfig {
+            kind: "libsql".into(),
+            path: Some("/data/app.db".into()),
+            ..Default::default()
+        };
+        assert!(file.validate("app").is_ok());
+        // `sqlite` alias works the same.
+        let sqlite = ExternalDatabaseConfig {
+            kind: "sqlite".into(),
+            path: Some("/data/app.db".into()),
+            ..Default::default()
+        };
+        assert!(sqlite.validate("app").is_ok());
+        // A remote-sqld `libsql` (url_env only) → ok.
+        let remote = ExternalDatabaseConfig {
+            kind: "libsql".into(),
+            url_env: "LIBSQL_URL".into(),
+            ..Default::default()
+        };
+        assert!(remote.validate("app").is_ok());
+        // Neither `path` nor `url_env` → error.
+        let neither = ExternalDatabaseConfig {
+            kind: "libsql".into(),
+            ..Default::default()
+        };
+        assert!(neither.validate("app").is_err());
+        // Both `path` and `url_env` → error (exactly one).
+        let both = ExternalDatabaseConfig {
+            kind: "libsql".into(),
+            path: Some("/data/app.db".into()),
+            url_env: "LIBSQL_URL".into(),
+            ..Default::default()
+        };
+        assert!(both.validate("app").is_err());
+        // `compute` on a `libsql` binding → error (boatramp doesn't run a libsql server workload).
+        let compute = ExternalDatabaseConfig {
+            kind: "libsql".into(),
+            compute: Some("x".into()),
+            path: Some("/data/app.db".into()),
+            ..Default::default()
+        };
+        assert!(compute.validate("app").is_err());
+        // `path` on a NON-libsql (postgres) binding → error (only libsql has an on-disk file).
+        let pg_path = ExternalDatabaseConfig {
+            kind: "postgres".into(),
+            url_env: "PG_URL".into(),
+            path: Some("/data/app.db".into()),
+            ..Default::default()
+        };
+        assert!(pg_path.validate("db").is_err());
     }
 
     /// Path to a file at the repo root (two levels up from this crate).

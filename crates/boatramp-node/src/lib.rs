@@ -23,7 +23,11 @@ pub mod config;
 pub mod error;
 pub use error::Error;
 pub mod handlers;
-#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+// The managed-SQL module carries the Postgres/MySQL operator-SQL + credential machinery (sqlx) AND
+// the migration substrate. It compiles whenever a sqlx engine OR `migrate` (⇒ the embedded libsql
+// migration runner) is on, so the libsql migrate parity is reachable on a node with no external sqlx
+// engine. The sqlx-specific items inside the module stay gated on the sqlx features.
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql", feature = "migrate"))]
 pub mod managed_sql;
 pub mod node;
 #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]

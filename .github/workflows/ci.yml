@@ -350,6 +350,30 @@ jobs:
             || { echo "::error::ORM TenantOrSession disjunct never reached its success marker (an R3 anon/tenant isolation breach or a skipped test)" >&2; exit 1; }
           grep -q 'ORM DURABLE SIGNED-CONTEXT ISOLATION OK' orm-tenancy.log \
             || { echo "::error::ORM durable signed-context lane never reached its success marker (a Stage 4 async-lane isolation breach or a skipped test)" >&2; exit 1; }
+      - name: Owner-gated schema-migration libsql/SQLite parity SUBSTRATE on a real embedded file
+        run: |
+          set -eo pipefail
+          # Embedded-libsql backend parity for `project migrate` (PLAN-migrate-backend-parity, libsql
+          # stage). On a REAL embedded libsql file the substrate (LibsqlMigrationRunner): creates the
+          # reserved-prefixed `boatramp_migrations_schema_migrations` ledger table; applies + records a
+          # `sql` step (origin=apply, recorded effective hash = the immutability signal); rolls a failed
+          # multi-statement step back CLEANLY — the 1st statement's DDL is UNDONE (SQLite transactional
+          # DDL, the INVERSE of the MySQL partial-apply gate); refuses the `extension` step kind (no
+          # guest-loadable SQLite extensions) + a raw CREATE EXTENSION + a self-managed BEGIN/COMMIT +
+          # a ledger-table reference, all tokenized under the SQLite dialect (sqlparser SQLiteDialect,
+          # so a `--`-comment can't hide a COMMIT); host-mediates the owner-DDL seam (the guest holds
+          # NO credential — the file is the trust boundary, there is no owner/runtime role split to
+          # model); and records a baseline without running it (U6 origin). Runs on the HOST toolchain
+          # (a static-musl test binary segfaults in libsql's bundled SQLite — same quirk as the ORM
+          # tenancy gate above), needs no service container (an embedded file under a temp dir), and
+          # only the `migrate` feature (⇒ the embedded libsql substrate). A regression fails the
+          # assertion.
+          cargo test -p boatramp-node --no-default-features --features migrate \
+            --test migrate_runner_libsql_live -- --nocapture 2>&1 | tee migrate-libsql.log
+          grep -qE 'test result: ok\. 1 passed' migrate-libsql.log \
+            || { echo "::error::migrate libsql parity gate did not run (a silent skip or a failure)" >&2; exit 1; }
+          grep -q 'MIGRATE LIBSQL PARITY OK' migrate-libsql.log \
+            || { echo "::error::migrate libsql parity never reached its marker (a ledger/transactional-rollback/extension-refusal/txn-control-guard/ledger-guard/owner-DDL/baseline regression)" >&2; exit 1; }
 
   # Stage 5a GraphQL Data Connector TARGET-tenant read isolation HARD GATE. A `@tenant(scope:
   # target)` read must confine to another tenant `B`'s declared PUBLIC subset on a REAL libsql
