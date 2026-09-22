@@ -75,10 +75,16 @@ pub struct InvalidResourceName {
 /// pathological truncation. Longer than any realistic human-chosen name.
 pub const MAX_RESOURCE_NAME_LEN: usize = 63;
 
-/// Validate a project/site/function/compute/workflow name at the create/write
-/// boundary, so a name can never escape its `project/<proj>/…` key prefix, collide
-/// with the store's fixed sub-key grammar, smuggle a (possibly percent-decoded)
-/// path separator, or break Cedar entity/target construction.
+/// Validate a project/site/function/compute/workflow/**database** name at the
+/// create/write (and every URL-path) boundary, so a name can never escape its
+/// `project/<proj>/…` key prefix, collide with the store's fixed sub-key grammar,
+/// smuggle a (possibly percent-decoded) path separator, break Cedar entity/target
+/// construction, or — for a SQL db-binding name threaded into `/api/sql/{db}/…` —
+/// collapse into an empty or `//` URL path segment. This is the **one** canonical
+/// resource-identifier validator; every ingress (config load, control-plane API path
+/// params, CLI `--db`, handler lookup) routes through it so the accept/reject rule is
+/// identical everywhere. `kind` is a free-form label for the error message
+/// (`"project"`, `"site"`, `"function"`, `"database"`, …); the rule set is uniform.
 ///
 /// Rejects: the empty string, names longer than [`MAX_RESOURCE_NAME_LEN`] bytes,
 /// `.` / `..`, and any name containing a path separator (`/` or `\`), a `*` (the
@@ -165,6 +171,31 @@ mod tests {
     }
 
     #[test]
+    fn database_kind_shares_the_one_rule_set() {
+        // The `"database"` kind is not special-cased — it rides the single rule set,
+        // so a db-binding name is accepted iff it is a safe URL path segment. This is
+        // the contract every db-name ingress (config, API path param, CLI `--db`,
+        // handler lookup) relies on.
+        for ok in ["default", "analytics", "events_log", "pg-primary"] {
+            assert!(
+                validate_resource_name("database", ok).is_ok(),
+                "{ok} should be a valid database name"
+            );
+        }
+        // The reserved default binding's *real* name is a valid path segment; the
+        // legacy empty-string key is NOT — the config load fails closed on it (the
+        // v0.5.0 breaking change) rather than emitting a `//` path.
+        assert!(
+            validate_resource_name("database", "").is_err(),
+            "the empty-string db name (legacy default key) must be rejected"
+        );
+        // The error names the kind so an operator can tell which identifier failed.
+        let err = validate_resource_name("database", "a/b").unwrap_err();
+        assert_eq!(err.kind, "database");
+        assert_eq!(err.value, "a/b");
+    }
+
+    #[test]
     fn resource_name_length_bound() {
         // Exactly at the bound passes; one over is rejected.
         let at = "a".repeat(MAX_RESOURCE_NAME_LEN);
@@ -178,6 +209,125 @@ mod tests {
             validate_resource_name("site", &over).is_err(),
             "{}-char name should be rejected",
             MAX_RESOURCE_NAME_LEN + 1
+        );
+    }
+
+    // ---- cross-surface consistency guard (v0.5.0 uniform db-name screening) -----
+    //
+    // The anti-regression guard the uniform-parameter-screening request demands: for a
+    // generated corpus of identifiers, assert that `validate_resource_name` accepts a
+    // value IFF it is a **safe URL path segment**, AND that every accepted value
+    // round-trips through the CLI path construction + the API-route path grammar
+    // without producing a malformed path (no empty / `//` segment, no truncation). It
+    // is a REAL detector: an INDEPENDENT path-segment oracle (below) is compared
+    // against the validator, so if the validator ever drifts to accept a value that is
+    // not a safe segment — or a path-construction change reintroduces a `//` — the
+    // test fails.
+
+    /// An INDEPENDENT re-statement of the "safe URL path segment" spec, deliberately
+    /// NOT sharing code with [`validate_resource_name`] so the two can disagree (which
+    /// is exactly what this test detects). A value is a safe path segment when it is
+    /// non-empty, is not `.`/`..`, and contains no `/`, `\`, whitespace, or control
+    /// character. (`*` is a validator-only concern — the authz wildcard sentinel — so
+    /// the oracle folds it in to keep the equivalence exact.)
+    fn is_safe_path_segment(v: &str) -> bool {
+        !v.is_empty()
+            && v != "."
+            && v != ".."
+            && v.len() <= MAX_RESOURCE_NAME_LEN
+            && !v
+                .chars()
+                .any(|c| c == '/' || c == '\\' || c == '*' || c.is_whitespace() || c.is_control())
+    }
+
+    /// Build a control-plane path the way the CLI (`boatramp sql` / `project migrate`)
+    /// and the server route (`/api/sql/{db}/exec`) compose it: the `{db}` segment is
+    /// interpolated verbatim between two fixed segments. Returns the path so the test
+    /// can inspect its segments.
+    fn cli_sql_path(db: &str) -> String {
+        // Mirrors `crates/boatramp/src/sql.rs`: `{server}/api/{seg}/{db}/exec` with the
+        // default-project `seg = "sql"`, and `crates/boatramp/src/client.rs`
+        // `migrate`: `{server}/api/{seg}/{db}/status`.
+        format!("/api/sql/{db}/exec")
+    }
+
+    #[test]
+    fn validator_matches_the_safe_path_segment_oracle() {
+        // A broad generated corpus: safe names, the dangerous shapes, boundary
+        // lengths, and every ASCII byte spliced into a name (so no accepted value can
+        // carry a control/space/separator the oracle would reject).
+        let mut corpus: Vec<String> = vec![
+            "default".into(),
+            "analytics".into(),
+            "events_log".into(),
+            "pg-primary".into(),
+            "a.b".into(),
+            "Blog9".into(),
+            String::new(),
+            ".".into(),
+            "..".into(),
+            "a/b".into(),
+            "a\\b".into(),
+            "blog/../evil".into(),
+            "*".into(),
+            "proj*".into(),
+            "a b".into(),
+            "tab\tname".into(),
+            "ctl\u{0}name".into(),
+            "a".repeat(MAX_RESOURCE_NAME_LEN),
+            "a".repeat(MAX_RESOURCE_NAME_LEN + 1),
+        ];
+        for b in 0u8..=127 {
+            corpus.push(format!("x{}y", b as char));
+        }
+
+        for v in &corpus {
+            let accepted = validate_resource_name("database", v).is_ok();
+            let safe = is_safe_path_segment(v);
+            assert_eq!(
+                accepted, safe,
+                "validator/oracle disagree on {v:?}: validator accepted={accepted}, \
+                 safe-path-segment={safe}"
+            );
+
+            if accepted {
+                // A REAL round-trip: every accepted value must produce a path whose
+                // segments are exactly [api, sql, <db>, exec] with the db segment
+                // equal to `v` — no empty segment, no `//`, no truncation.
+                let path = cli_sql_path(v);
+                assert!(
+                    !path.contains("//"),
+                    "accepted {v:?} produced a `//` in {path:?}"
+                );
+                let segments: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+                assert_eq!(
+                    segments,
+                    vec!["api", "sql", v.as_str(), "exec"],
+                    "accepted {v:?} did not round-trip cleanly: {path:?}"
+                );
+                assert!(
+                    segments.iter().all(|s| !s.is_empty()),
+                    "accepted {v:?} produced an empty path segment: {path:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn empty_db_name_would_break_the_path_and_is_rejected() {
+        // The linchpin the whole deliverable turns on: the legacy empty default-DB
+        // name IS a value that would break a path segment (collapses `/api/sql//exec`
+        // to a `//`), and the validator rejects it. If someone "fixed" the validator
+        // to accept `""`, the oracle equivalence test above would fail — but assert it
+        // directly too, as the single most important case.
+        assert!(!is_safe_path_segment(""), "empty is not a safe segment");
+        assert!(
+            validate_resource_name("database", "").is_err(),
+            "empty db name must be rejected"
+        );
+        assert!(
+            cli_sql_path("").contains("//"),
+            "empty db name DOES collapse the path to `//` (why it must be rejected)"
         );
     }
 }

@@ -93,6 +93,19 @@ pub enum Error {
     /// Serializing the assembled bundle failed.
     #[error("serializing the assembled bundle: {0}")]
     Assemble(#[source] serde_json::Error),
+    /// The `--db` name is not a safe URL path segment (validated client-side before the
+    /// request URL is built), so a malformed name fails fast with a clear message
+    /// rather than an opaque server error or a `//`-collapsed path.
+    #[error("{0}")]
+    InvalidDb(String),
+}
+
+/// Validate a `--db` name through the one canonical resource-identifier validator
+/// (`kind = "database"`) before it is threaded into the migrate URL. Same rule the
+/// server, config load, and `boatramp sql` enforce.
+fn validate_db(db: &str) -> Result<()> {
+    boatramp_core::project::validate_resource_name("database", db)
+        .map_err(|err| Error::InvalidDb(err.to_string()))
 }
 
 /// `project_migrate` module result; `Err` is [`Error`].
@@ -124,8 +137,8 @@ enum MigrateCommand {
     /// Apply every pending step, in order (`Project·Admin`). Already-recorded steps are skipped
     /// (idempotent); application halts at the first failure, leaving the prefix before it applied.
     Apply {
-        /// The managed-database binding name (empty = the project's default database).
-        #[arg(long, default_value = "")]
+        /// The managed-database binding name (`default` = the project's default database).
+        #[arg(long, default_value = boatramp_core::project::DEFAULT_DB_NAME)]
         db: String,
         #[command(flatten)]
         source: BundleSource,
@@ -135,8 +148,8 @@ enum MigrateCommand {
     },
     /// Preview which steps WOULD apply, running nothing (`Project·Admin`).
     DryRun {
-        /// The managed-database binding name (empty = the project's default database).
-        #[arg(long, default_value = "")]
+        /// The managed-database binding name (`default` = the project's default database).
+        #[arg(long, default_value = boatramp_core::project::DEFAULT_DB_NAME)]
         db: String,
         #[command(flatten)]
         source: BundleSource,
@@ -148,8 +161,8 @@ enum MigrateCommand {
     /// database (`Project·Admin`). `--up-to <id>` records through that id inclusive; omitted
     /// baselines the entire set.
     Baseline {
-        /// The managed-database binding name (empty = the project's default database).
-        #[arg(long, default_value = "")]
+        /// The managed-database binding name (`default` = the project's default database).
+        #[arg(long, default_value = boatramp_core::project::DEFAULT_DB_NAME)]
         db: String,
         #[command(flatten)]
         source: BundleSource,
@@ -162,8 +175,8 @@ enum MigrateCommand {
     },
     /// Show the applied-migration ledger, in order (`Project·Read`).
     Status {
-        /// The managed-database binding name (empty = the project's default database).
-        #[arg(long, default_value = "")]
+        /// The managed-database binding name (`default` = the project's default database).
+        #[arg(long, default_value = boatramp_core::project::DEFAULT_DB_NAME)]
         db: String,
         /// Emit the raw `MigrationStatus` JSON instead of a human table.
         #[arg(long)]
@@ -177,12 +190,14 @@ enum MigrateCommand {
 pub async fn run(args: MigrateArgs, cp: &ControlPlane) -> Result<()> {
     match args.command {
         MigrateCommand::Apply { db, source, json } => {
+            validate_db(&db)?;
             let bundle = resolve_bundle(cp, &source).await?;
             let report = cp.migrate_trigger(&db, "apply", &bundle, None).await?;
             render_report(&report, json)?;
             fail_if_step_failed(report)?;
         }
         MigrateCommand::DryRun { db, source, json } => {
+            validate_db(&db)?;
             let bundle = resolve_bundle(cp, &source).await?;
             let report = cp.migrate_trigger(&db, "dry-run", &bundle, None).await?;
             render_report(&report, json)?;
@@ -195,6 +210,7 @@ pub async fn run(args: MigrateArgs, cp: &ControlPlane) -> Result<()> {
             up_to,
             json,
         } => {
+            validate_db(&db)?;
             let bundle = resolve_bundle(cp, &source).await?;
             let report = cp
                 .migrate_trigger(&db, "baseline", &bundle, up_to.as_deref())
@@ -203,6 +219,7 @@ pub async fn run(args: MigrateArgs, cp: &ControlPlane) -> Result<()> {
             fail_if_step_failed(report)?;
         }
         MigrateCommand::Status { db, json } => {
+            validate_db(&db)?;
             let status = cp.migrate_status(&db).await?;
             render_status(&status, json)?;
         }
@@ -505,10 +522,11 @@ mod tests {
 
     #[test]
     fn apply_and_baseline_flags_parse() {
-        // `apply -f file` with the default db + no --json.
+        // `apply -f file` with the default db + no --json. The default `--db` is the
+        // reserved `default` name (v0.5.0), never the empty string.
         match parse(&["migrate", "apply", "-f", "m.json"]) {
             Ok(MigrateCommand::Apply { db, source, json }) => {
-                assert_eq!(db, "");
+                assert_eq!(db, boatramp_core::project::DEFAULT_DB_NAME);
                 assert_eq!(source.file, Some(PathBuf::from("m.json")));
                 assert_eq!(source.dir, None);
                 assert!(!json);
@@ -552,6 +570,17 @@ mod tests {
         }
         // `--file` and `--dir` are mutually exclusive (clap rejects both).
         assert!(parse(&["migrate", "apply", "-f", "m.json", "-d", "migrations"]).is_err());
+    }
+
+    #[test]
+    fn validate_db_gates_unsafe_names_client_side() {
+        // The reserved default + ordinary names pass; the legacy empty name and any
+        // non-path-segment name are refused before the migrate URL is built.
+        assert!(validate_db(boatramp_core::project::DEFAULT_DB_NAME).is_ok());
+        assert!(validate_db("main").is_ok());
+        for bad in ["", "a/b", "..", "a b"] {
+            assert!(validate_db(bad).is_err(), "{bad:?} should be rejected");
+        }
     }
 
     #[test]

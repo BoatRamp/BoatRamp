@@ -55,6 +55,20 @@ pub enum ConfigError {
         /// Why the value was rejected.
         reason: String,
     },
+    /// A `handlers.bindings.sql.databases` binding name is not a safe URL path
+    /// segment — it is threaded verbatim into `/api/sql/{db}/…` and `--db`, so an
+    /// empty/`//`-collapsing or path-separator-bearing name is refused at load
+    /// (fail-closed) rather than emitting a malformed control-plane path.
+    #[error("SQL database binding {name:?}: {reason}{cure}")]
+    InvalidDbName {
+        /// The offending binding name (the `databases` map key).
+        name: String,
+        /// Why it was rejected (from the canonical validator).
+        reason: &'static str,
+        /// A trailing remediation hint (empty unless this is the legacy empty-name
+        /// default case, where it points at the `default` cure).
+        cure: &'static str,
+    },
 }
 
 /// Project configuration, loaded from `project.cfg` (RON) in the project folder.
@@ -171,9 +185,14 @@ impl Default for VaultSecretsConfig {
 }
 
 impl ServerConfig {
-    /// Parse a `boatramp.cfg` document (RON).
+    /// Parse a `boatramp.cfg` document (RON). Db-binding names declared in the file
+    /// are validated here (the same fail-closed check `load` re-runs after the env
+    /// merge), so a file-only config path — e.g. `boatramp cloudflare` rendering, or
+    /// the operator-resources loader — is guarded even without going through `load`.
     pub fn parse(text: &str) -> Result<Self, ConfigError> {
-        Ok(ron_options().from_str(text)?)
+        let config: Self = ron_options().from_str(text)?;
+        config.validate_sql_db_names()?;
+        Ok(config)
     }
 
     /// Load from `path` (RON), then layer `BOATRAMP_*` environment overrides on
@@ -444,10 +463,16 @@ impl ServerConfig {
         // (overriding, per field, by key) whatever the file already declared under
         // that name — the same env-over-file precedence as the scalars.
         //
-        // The map key may be the **empty string** (the default database that a
-        // handler opens as `sql.open("")`); it can't appear in a variable name, so
-        // the reserved name token `DEFAULT` addresses it:
-        // `BOATRAMP_HANDLERS_SQL_DB_DEFAULT_KIND` populates the `""` key.
+        // The default database (the binding a handler opens as `sql.open("")`) is
+        // addressed by the reserved `DEFAULT` token, which can't appear as a literal
+        // in a variable name: `BOATRAMP_HANDLERS_SQL_DB_DEFAULT_KIND` populates the
+        // reserved [`DEFAULT_DB_NAME`](boatramp_core::project::DEFAULT_DB_NAME) key
+        // (`"default"`). As of v0.5.0 this is a real, path-segment-safe name (never the
+        // empty string), so the binding is addressable as `--db default` and every
+        // db-name ingress carries a valid URL path segment. The guest-facing
+        // `sql.open("")` contract is preserved by aliasing `"" ⇄ "default"` at the
+        // backend-resolution boundary — external bindings are a pure label over their
+        // connection params, so the renamed binding points at the SAME physical DB.
         if source.any_with_prefix(SQL_DB_ENV_PREFIX) {
             let handlers = self.handlers.get_or_insert_with(HandlersConfig::default);
             let sql = handlers
@@ -455,9 +480,10 @@ impl ServerConfig {
                 .sql
                 .get_or_insert_with(SqlBindingConfig::default);
             for name in source.sql_database_names() {
-                // `DEFAULT` is the reserved token for the `""` (default) database.
+                // `DEFAULT` is the reserved token for the default database; it maps to
+                // the reserved real name `"default"` (v0.5.0; was the empty string).
                 let key = if name == "DEFAULT" {
-                    String::new()
+                    boatramp_core::project::DEFAULT_DB_NAME.to_string()
                 } else {
                     name.clone()
                 };
@@ -634,6 +660,50 @@ impl ServerConfig {
             }
         }
 
+        // Fail closed on any db-binding name that is not a safe URL path segment.
+        // Runs on the fully merged (file + env) `databases` map, so it catches a name
+        // from either source — and (crucially) the legacy empty-string default key,
+        // which is no longer produced by the `DEFAULT` token but could still be
+        // written literally in a `boatramp.cfg` file.
+        self.validate_sql_db_names()?;
+        Ok(())
+    }
+
+    /// Validate every configured `handlers.bindings.sql.databases` binding name
+    /// through the one canonical [`validate_resource_name`](boatramp_core::project::validate_resource_name)
+    /// (`kind = "database"`). A db-binding name is threaded verbatim into the
+    /// control-plane URL (`/api/sql/{db}/…`, `/api/migrate/{db}/…`) and the CLI
+    /// `--db`, so it must be a non-empty, path-segment-safe identifier — the same rule
+    /// project/site/function names already pass. The empty-string legacy default key
+    /// gets a targeted cure pointing at the reserved `default` name.
+    fn validate_sql_db_names(&self) -> Result<(), ConfigError> {
+        let Some(databases) = self
+            .handlers
+            .as_ref()
+            .and_then(|h| h.bindings.sql.as_ref())
+            .map(|s| &s.databases)
+        else {
+            return Ok(());
+        };
+        for name in databases.keys() {
+            if let Err(err) = boatramp_core::project::validate_resource_name("database", name) {
+                // The empty-string case is the pre-v0.5.0 default binding key: point
+                // at the cure (name it `default`, or set nothing and let the reserved
+                // `DEFAULT` token map to `default` automatically).
+                let cure = if name.is_empty() {
+                    " — name your default binding `default` (or set \
+                     BOATRAMP_HANDLERS_SQL_DB_DEFAULT_*, which now maps to `default` \
+                     automatically); see the v0.5.0 CHANGELOG"
+                } else {
+                    ""
+                };
+                return Err(ConfigError::InvalidDbName {
+                    name: err.value,
+                    reason: err.reason,
+                    cure,
+                });
+            }
+        }
         Ok(())
     }
 }
@@ -2049,16 +2119,17 @@ mod tests {
     fn env_configures_managed_postgres_secrets_and_privilege_with_no_file() {
         // The construens acceptance case: with NO `boatramp.cfg` at all, the
         // environment alone stands up a managed co-located Postgres. It configures
-        // the default (`""`-named) database in `handlers.bindings.sql.databases`
-        // (kind=postgres, compute=pg, database+user set), the `[secrets]` envelope
-        // (local + a kek path so the managed credential can be sealed), and
-        // `compute.managed_db_privilege = rootless`. All three sections start absent.
+        // the default (`"default"`-named, v0.5.0) database in
+        // `handlers.bindings.sql.databases` (kind=postgres, compute=pg, database+user
+        // set), the `[secrets]` envelope (local + a kek path so the managed credential
+        // can be sealed), and `compute.managed_db_privilege = rootless`. All three
+        // sections start absent.
         let mut cfg = ServerConfig::default();
         assert!(cfg.handlers.is_none() && cfg.secrets.is_none() && cfg.compute.is_none());
 
         cfg.apply_env_overrides(&env(&[
             // The default database is addressed by the reserved `DEFAULT` token,
-            // which maps to the empty-string map key.
+            // which maps to the reserved real name `"default"` (v0.5.0).
             ("BOATRAMP_HANDLERS_SQL_DB_DEFAULT_KIND", "postgres"),
             ("BOATRAMP_HANDLERS_SQL_DB_DEFAULT_COMPUTE", "pg"),
             ("BOATRAMP_HANDLERS_SQL_DB_DEFAULT_DATABASE", "appdb"),
@@ -2071,7 +2142,7 @@ mod tests {
         ]))
         .expect("valid env overrides apply");
 
-        // The default (`""`-keyed) managed database exists with the right source.
+        // The default (`"default"`-keyed) managed database exists with the right source.
         let sql = cfg
             .handlers
             .expect("handlers materialised from env")
@@ -2080,8 +2151,12 @@ mod tests {
             .expect("sql binding materialised from env");
         let db = sql
             .databases
-            .get("")
-            .expect("the default `\"\"`-named database was created from DEFAULT");
+            .get(boatramp_core::project::DEFAULT_DB_NAME)
+            .expect("the default `default`-named database was created from DEFAULT");
+        assert!(
+            !sql.databases.contains_key(""),
+            "the empty-string key is never produced (v0.5.0)"
+        );
         assert_eq!(db.kind, "postgres");
         assert_eq!(db.compute.as_deref(), Some("pg"));
         assert_eq!(db.database.as_deref(), Some("appdb"));
@@ -2159,6 +2234,81 @@ mod tests {
     }
 
     #[test]
+    fn default_token_maps_to_the_reserved_default_name_not_empty() {
+        // v0.5.0 breaking change: the reserved `DEFAULT` env token maps to the real
+        // name `"default"` (a valid URL path segment), never the empty string. This is
+        // what makes the default binding addressable as `--db default` and keeps every
+        // db-name ingress path-segment-safe.
+        let mut cfg = ServerConfig::default();
+        cfg.apply_env_overrides(&env(&[
+            ("BOATRAMP_HANDLERS_SQL_DB_DEFAULT_KIND", "postgres"),
+            ("BOATRAMP_HANDLERS_SQL_DB_DEFAULT_URL_ENV", "PG_URL"),
+        ]))
+        .expect("valid env overrides apply");
+        let databases = cfg.handlers.unwrap().bindings.sql.unwrap().databases;
+        assert!(
+            databases.contains_key(boatramp_core::project::DEFAULT_DB_NAME),
+            "DEFAULT → the reserved `default` key"
+        );
+        assert!(
+            !databases.contains_key(""),
+            "the empty-string key is never produced"
+        );
+    }
+
+    #[test]
+    fn empty_string_db_binding_name_is_rejected_with_a_cure() {
+        // A `boatramp.cfg` that literally writes the legacy empty-string default key
+        // fails closed on load (it would emit a `//` control-plane path), and the
+        // error points at the cure (`default`).
+        let err = ServerConfig::parse(
+            r#"(
+                handlers: ( bindings: ( sql: (
+                    databases: {
+                        "": ( kind: "postgres", url_env: "PG_URL" ),
+                    },
+                ) ) ),
+            )"#,
+        )
+        .expect_err("an empty-string db binding name is refused");
+        match err {
+            ConfigError::InvalidDbName { name, reason, cure } => {
+                assert_eq!(name, "");
+                assert!(reason.contains("empty"), "reason names the emptiness");
+                assert!(
+                    cure.contains("default") && cure.contains("CHANGELOG"),
+                    "the cure points at `default` + the CHANGELOG"
+                );
+            }
+            other => panic!("expected ConfigError::InvalidDbName, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn path_separator_db_binding_name_is_rejected() {
+        // A non-path-segment name (contains `/`) is refused with no default-cure (the
+        // fix is to rename it, not adopt `default`).
+        let err = ServerConfig::parse(
+            r#"(
+                handlers: ( bindings: ( sql: (
+                    databases: {
+                        "a/b": ( kind: "postgres", url_env: "PG_URL" ),
+                    },
+                ) ) ),
+            )"#,
+        )
+        .expect_err("a `/`-bearing db binding name is refused");
+        match err {
+            ConfigError::InvalidDbName { name, reason, cure } => {
+                assert_eq!(name, "a/b");
+                assert!(reason.contains("path separator"));
+                assert!(cure.is_empty(), "no default-cure for a non-default name");
+            }
+            other => panic!("expected ConfigError::InvalidDbName, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn env_sets_managed_db_startup_grace() {
         // The per-binding startup-grace override is env-settable like the other
         // managed scalars, discovered by the `_STARTUP_GRACE_SECS` suffix.
@@ -2171,7 +2321,8 @@ mod tests {
             ("BOATRAMP_HANDLERS_SQL_DB_DEFAULT_STARTUP_GRACE_SECS", "90"),
         ]))
         .expect("valid env overrides apply");
-        let db = &cfg.handlers.unwrap().bindings.sql.unwrap().databases[""];
+        let db = &cfg.handlers.unwrap().bindings.sql.unwrap().databases
+            [boatramp_core::project::DEFAULT_DB_NAME];
         assert_eq!(db.startup_grace_secs, Some(90));
     }
 
@@ -2195,7 +2346,8 @@ mod tests {
             ("BOATRAMP_HANDLERS_SQL_DB_DEFAULT_TENANT_ALL_MARKER", "*"),
         ]))
         .expect("valid env overrides apply");
-        let db = &cfg.handlers.unwrap().bindings.sql.unwrap().databases[""];
+        let db = &cfg.handlers.unwrap().bindings.sql.unwrap().databases
+            [boatramp_core::project::DEFAULT_DB_NAME];
         assert_eq!(db.tenant_guc.as_deref(), Some("app.tenant_id"));
         assert_eq!(db.session_guc.as_deref(), Some("app.session_id"));
         assert_eq!(db.tenant_all_marker.as_deref(), Some("*"));

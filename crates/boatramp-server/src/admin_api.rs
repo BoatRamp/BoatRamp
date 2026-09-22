@@ -1006,6 +1006,19 @@ pub(super) async fn delete_compute(
 // Operator SQL to a managed co-located database (`/api/sql/{db}/{exec,query}`)
 // ---------------------------------------------------------------------------
 
+/// Reject a `{db}` path param that is not a safe URL path segment, short-circuiting the
+/// handler with `400` before any lookup. The name arrives already percent-decoded by
+/// axum's `Path` extractor, so a smuggled `%2F` is caught as a literal `/`. Routes
+/// through the one canonical [`validate_resource_name`](boatramp_core::project::validate_resource_name)
+/// (`kind = "database"`) so the accept/reject rule matches config load, the CLI `--db`,
+/// and the handler lookup. `None` = the name is fine. `400` (not `422`) to match the
+/// existing `sql`/`migrate` handlers' bad-input style.
+fn reject_invalid_db(db: &str) -> Option<Response> {
+    boatramp_core::project::validate_resource_name("database", db)
+        .err()
+        .map(|err| (StatusCode::BAD_REQUEST, format!("{err}\n")).into_response())
+}
+
 /// A managed-DB migration script (multiple statements; simple-query protocol).
 #[derive(Deserialize)]
 pub(super) struct SqlExecRequest {
@@ -1056,6 +1069,9 @@ pub(super) async fn sql_exec(
     Path(db): Path<String>,
     Json(req): Json<SqlExecRequest>,
 ) -> Response {
+    if let Some(bad) = reject_invalid_db(&db) {
+        return bad;
+    }
     let Some(op) = op else {
         return (
             StatusCode::NOT_IMPLEMENTED,
@@ -1079,6 +1095,9 @@ pub(super) async fn sql_query(
     Path(db): Path<String>,
     Json(req): Json<SqlQueryRequest>,
 ) -> Response {
+    if let Some(bad) = reject_invalid_db(&db) {
+        return bad;
+    }
     let Some(op) = op else {
         return (
             StatusCode::NOT_IMPLEMENTED,
@@ -1121,6 +1140,9 @@ pub(super) async fn sql_ping(
     Extension(op): Extension<Option<Arc<dyn boatramp_core::sql::OperatorSql>>>,
     Path(db): Path<String>,
 ) -> Response {
+    if let Some(bad) = reject_invalid_db(&db) {
+        return bad;
+    }
     let Some(op) = op else {
         return (
             StatusCode::NOT_IMPLEMENTED,
@@ -1398,6 +1420,9 @@ pub(super) async fn migrate_apply(
     Path(db): Path<String>,
     Json(req): Json<MigrateTriggerRequest>,
 ) -> Response {
+    if let Some(bad) = reject_invalid_db(&db) {
+        return bad;
+    }
     run_migrate_bundle(
         &handlers,
         substrate,
@@ -1419,6 +1444,9 @@ pub(super) async fn migrate_dry_run(
     Path(db): Path<String>,
     Json(req): Json<MigrateTriggerRequest>,
 ) -> Response {
+    if let Some(bad) = reject_invalid_db(&db) {
+        return bad;
+    }
     run_migrate_bundle(
         &handlers,
         substrate,
@@ -1442,6 +1470,9 @@ pub(super) async fn migrate_baseline(
     Path(db): Path<String>,
     Json(req): Json<MigrateTriggerRequest>,
 ) -> Response {
+    if let Some(bad) = reject_invalid_db(&db) {
+        return bad;
+    }
     run_migrate_bundle(
         &handlers,
         substrate,
@@ -1461,6 +1492,9 @@ pub(super) async fn migrate_status(
     Extension(substrate): Extension<Option<Arc<dyn boatramp_core::sql::MigrationSubstrate>>>,
     Path(db): Path<String>,
 ) -> Response {
+    if let Some(bad) = reject_invalid_db(&db) {
+        return bad;
+    }
     let Some(substrate) = substrate else {
         return migrate_unavailable();
     };
@@ -2834,6 +2868,43 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+    }
+
+    #[tokio::test]
+    async fn sql_handlers_reject_an_invalid_db_path_param_with_400() {
+        // Every `{db}` ingress fails closed on a name that is not a safe URL path
+        // segment — BEFORE any lookup — with `400` and the canonical validator's
+        // reason. The empty-string `{db}` (a `/api/sql//exec` collapse) and a
+        // separator-bearing `{db}` (a smuggled `%2F`, arriving decoded as `/`) are the
+        // headline cases. The `op`/`substrate` extension is present (so a `501`/`503`
+        // can't mask the rejection).
+        let op: Arc<dyn boatramp_core::sql::OperatorSql> = Arc::new(FakePingSql(vec![]));
+        for bad in ["", "a/b", "..", "proj*"] {
+            let resp = sql_ping(
+                Extension(ProjectContext("construens".into())),
+                Extension(Some(op.clone())),
+                Path(bad.into()),
+            )
+            .await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "db {bad:?} should be rejected with 400"
+            );
+        }
+        // A valid `{db}` passes the screen (reaches the handler; here `default` pings
+        // the fake op and returns 200 with no replicas).
+        let resp = sql_ping(
+            Extension(ProjectContext("construens".into())),
+            Extension(Some(op)),
+            Path(boatramp_core::project::DEFAULT_DB_NAME.into()),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a valid db passes the screen"
+        );
     }
 
     #[tokio::test]

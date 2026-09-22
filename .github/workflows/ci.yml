@@ -252,6 +252,20 @@ jobs:
       - name: Test (musl)
         run: cargo-zigbuild test --target x86_64-unknown-linux-musl --workspace --no-default-features --features boatramp/fs,boatramp/slatedb
 
+      # Uniform db-name parameter screening (v0.5.0): the cross-surface consistency
+      # guard must actually RUN — a silent skip is not evidence. Run the integration
+      # test with `--nocapture` and assert its gate marker, so a `#[cfg]`/rename that
+      # drops the test fails the merge rather than passing quietly (mirrors the
+      # `… OK` live-gate convention used elsewhere).
+      - name: DB-name screening cross-surface guard
+        run: |
+          set -eo pipefail
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp \
+            --no-default-features --features fs,slatedb \
+            --test db_name_screening -- --nocapture 2>&1 | tee db-name-screen.log
+          grep -q 'DB-NAME SCREENING CROSS-SURFACE OK' db-name-screen.log \
+            || { echo "::error::db-name screening cross-surface guard did not run/pass"; exit 1; }
+
   # The lean `test` lane above opts down to `fs,slatedb` for speed, which enables
   # NEITHER `handlers` NOR the other feature-gated surfaces — so the whole GraphQL /
   # federation / data-connector suite (245 handlers-gated cfgs) plus oidc/mcp/
