@@ -505,16 +505,31 @@ mod tests {
                     .await
                     .unwrap(),
             );
-            assert!(kv.supports_cas(), "the writer advertises a linearizable CAS");
+            assert!(
+                kv.supports_cas(),
+                "the writer advertises a linearizable CAS"
+            );
 
             // Expected-absent creates; expected-absent on a present key does not swap.
-            assert!(kv.compare_and_swap("inv/1", None, b"queued".to_vec()).await.unwrap());
+            assert!(kv
+                .compare_and_swap("inv/1", None, b"queued".to_vec())
+                .await
+                .unwrap());
             assert_eq!(kv.get("inv/1").await.unwrap(), Some(b"queued".to_vec()));
-            assert!(!kv.compare_and_swap("inv/1", None, b"x".to_vec()).await.unwrap());
+            assert!(!kv
+                .compare_and_swap("inv/1", None, b"x".to_vec())
+                .await
+                .unwrap());
             // A stale expected does not swap; the exact prior bytes do.
-            assert!(!kv.compare_and_swap("inv/1", Some(b"WRONG"), b"x".to_vec()).await.unwrap());
+            assert!(!kv
+                .compare_and_swap("inv/1", Some(b"WRONG"), b"x".to_vec())
+                .await
+                .unwrap());
             assert_eq!(kv.get("inv/1").await.unwrap(), Some(b"queued".to_vec()));
-            assert!(kv.compare_and_swap("inv/1", Some(b"queued"), b"running".to_vec()).await.unwrap());
+            assert!(kv
+                .compare_and_swap("inv/1", Some(b"queued"), b"running".to_vec())
+                .await
+                .unwrap());
             assert_eq!(kv.get("inv/1").await.unwrap(), Some(b"running".to_vec()));
 
             // Race: many tasks in this single writer process try queued→<id>; exactly one wins.
@@ -534,7 +549,10 @@ mod tests {
                     wins += 1;
                 }
             }
-            assert_eq!(wins, 1, "exactly one racing CAS wins on the single-writer store");
+            assert_eq!(
+                wins, 1,
+                "exactly one racing CAS wins on the single-writer store"
+            );
 
             Arc::try_unwrap(kv).ok().unwrap().close().await.unwrap();
         })
