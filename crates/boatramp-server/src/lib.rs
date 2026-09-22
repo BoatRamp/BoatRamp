@@ -453,7 +453,7 @@ struct HandlerRuntimeInner {
 
 /// The two event-driven-delivery cadences (B17), resolved from the node `[handlers]` config (absent ⇒
 /// default). Both are pure latency/idle-cost tradeoffs — the durable ready-set + due-heap remain the
-/// at-least-once authority whatever the cadence, so a mis-set knob can never lose or strand a message.
+/// at-least-once authority whatever the cadence, so a misconfigured knob can never lose or strand a message.
 #[cfg(feature = "handlers")]
 #[derive(Debug, Clone, Copy)]
 pub struct DeliveryConfig {
