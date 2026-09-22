@@ -631,7 +631,12 @@ pub(super) async fn enqueue_blob_invocation(
         created: now,
         updated: now,
     };
-    if let Err(err) = deploy.put_invocation(project, &inv).await {
+    // Create-if-absent-or-terminal (B10): never overwrite a `Queued`/`Running` record, so a second
+    // observation of this change (the double-owner window, or a duplicate watcher event) coalesces
+    // into the in-flight invocation instead of resurrecting it into a second run; a change after the
+    // previous run settled re-fires. (The blind `put_invocation` here reset an in-flight record to
+    // `Queued`, re-arming a second execution.)
+    if let Err(err) = deploy.refire_invocation(project, &inv).await {
         tracing::warn!(function = %function.name, %err, "enqueuing blob invocation failed");
     }
 }

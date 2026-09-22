@@ -1512,6 +1512,81 @@ impl DeployStore {
             .await?)
     }
 
+    /// **Enqueue only if no record exists** for this invocation id (B10). A create-if-absent CAS:
+    /// writes `inv` iff the key is currently absent; returns whether it created the record. It NEVER
+    /// overwrites an existing record of any status, so a second enqueue under the same *deterministic*
+    /// id — e.g. a cron the old and new owner both fire in the double-owner window of a membership
+    /// change — is a no-op and can never resurrect a claimed (`Running`) or settled record back to
+    /// `Queued`. (The blind `put_invocation` it replaces could: it reset an in-flight record to
+    /// `Queued`, re-arming it for a second execution.) Correct on a linearizable-CAS backend (atomic)
+    /// and, under the leader-gate, on the best-effort default (single writer). Used by the cron path,
+    /// whose id folds in the minute — so the *next* minute is a fresh id, not blocked by this one.
+    pub async fn enqueue_invocation_if_absent(
+        &self,
+        project: ProjectRef<'_>,
+        inv: &crate::function::Invocation,
+    ) -> Result<bool, DeployError> {
+        let key = crate::function::keys::invocation(project.as_str(), &inv.function, &inv.id);
+        let bytes = serde_json::to_vec(inv).map_err(|e| DeployError::Serde(e.to_string()))?;
+        Ok(self.kv.compare_and_swap(&key, None, bytes).await?)
+    }
+
+    /// **Enqueue or re-fire** a change-triggered invocation (B10, blob watchers). Creates the record
+    /// when absent, and overwrites only a **terminal** (`Succeeded`/`Failed`) record — a legitimate
+    /// re-fire after the previous run for this id finished. It NEVER overwrites a `Queued` or
+    /// `Running` record: a second observation of the same change (the double-owner window, or a
+    /// duplicate watcher event) therefore *coalesces* into the in-flight invocation instead of
+    /// resurrecting it into a second execution. A crashed owner's lease-expired `Running` record is
+    /// left untouched here — the drain's own CAS lease-reclaim handles it (so the original event still
+    /// completes exactly once). Returns whether a (re-)enqueue happened. Bounded CAS retries absorb a
+    /// lost race against a concurrent claimer/enqueuer; on exhaustion it yields (a record already
+    /// exists, so at-least-once holds).
+    pub async fn refire_invocation(
+        &self,
+        project: ProjectRef<'_>,
+        inv: &crate::function::Invocation,
+    ) -> Result<bool, DeployError> {
+        let key = crate::function::keys::invocation(project.as_str(), &inv.function, &inv.id);
+        let next = serde_json::to_vec(inv).map_err(|e| DeployError::Serde(e.to_string()))?;
+        for _ in 0..4 {
+            match self.kv.get(&key).await? {
+                // Absent — create it. A lost create race means a concurrent enqueuer/claimer beat us;
+                // re-read and re-evaluate (it may now be Queued/Running → we'll coalesce).
+                None => {
+                    if self.kv.compare_and_swap(&key, None, next.clone()).await? {
+                        return Ok(true);
+                    }
+                }
+                Some(current) => {
+                    // Overwrite ONLY a terminal record (a real re-fire). Anything else — Queued,
+                    // Running (incl. lease-expired: the drain reclaims it), or an unparsable record —
+                    // is treated as in-flight and left alone, so we never resurrect it.
+                    let terminal = serde_json::from_slice::<crate::function::Invocation>(&current)
+                        .map(|i| {
+                            matches!(
+                                i.status,
+                                crate::function::InvocationStatus::Succeeded
+                                    | crate::function::InvocationStatus::Failed
+                            )
+                        })
+                        .unwrap_or(false);
+                    if !terminal {
+                        return Ok(false);
+                    }
+                    if self
+                        .kv
+                        .compare_and_swap(&key, Some(&current), next.clone())
+                        .await?
+                    {
+                        return Ok(true);
+                    }
+                    // Lost the race against a concurrent writer — re-read and re-evaluate.
+                }
+            }
+        }
+        Ok(false)
+    }
+
     /// Bind an idempotency key to an invocation id (the dedup pointer). The value
     /// is the raw invocation id.
     pub async fn put_idempotency(

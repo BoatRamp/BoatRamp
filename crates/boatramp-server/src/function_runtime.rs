@@ -2237,7 +2237,11 @@ pub(super) async fn enqueue_scheduled_invocation(
         created: now,
         updated: now,
     };
-    if let Err(err) = deploy.put_invocation(project, &inv).await {
+    // Create-if-absent (B10): the minute-stamped id means one record per minute; a second fire in the
+    // same minute (the double-owner window) is a no-op and can never resurrect a claimed/settled
+    // record back to `Queued`. The next minute is a fresh id. (Replaces a blind `put_invocation` that
+    // reset an in-flight record to `Queued`, re-arming a second execution.)
+    if let Err(err) = deploy.enqueue_invocation_if_absent(project, &inv).await {
         tracing::warn!(function = %function.name, %err, "enqueuing scheduled invocation failed");
     }
 }

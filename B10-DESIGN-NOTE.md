@@ -18,6 +18,33 @@ succeeds for **at most one node**. The sharded fast-path is the common case; an 
 safety-net drain** is the backstop for the no-owner window. A backend without a linearizable CAS
 stays leader-gated (owns-all) — the fail-closed default.
 
+## Post-review hardening (2026-09-22) — read this first
+
+An independent review (author + two adversarial reviewers) found the CAS *claim* sound but caught a
+real double-execution hole in the *enqueue* path, plus a hollow gate. Fixed before panel:
+
+- **Enqueue was a blind `put_invocation`** at both change-triggered sites — it could overwrite a
+  `Running`/`Succeeded` invocation back to `Queued` in the double-owner window (or on a duplicate
+  watcher event), re-arming a **second execution**. Replaced with CAS-guarded enqueues in
+  `deploy.rs`: **cron → `enqueue_invocation_if_absent`** (strict create-if-absent; its minute-stamped
+  id gives one fire per minute, the next minute a fresh id); **blob → `refire_invocation`**
+  (create-if-absent, and overwrite only a *terminal* record = a legitimate re-fire after the prior
+  run finished; never a `Queued`/`Running` one). Both use the same linearizable CAS as the claim, so
+  they are correct on a CAS backend and, under the leader-gate, on the single-writer default.
+- **Gate 5/6 were hollow** — they only raced two `Queued`-vs-`Queued` enqueues (the safe case). Now
+  they claim the invocation to `Running`, re-enqueue, and assert it is **not** reset to `Queued`
+  (resurrection), and (blob) that a post-settle change **does** re-fire. These fail on the old blind
+  put and pass on the fix. Gate 3 now also asserts the double-owner counter **stays** exactly 1.
+- **`set_async_shard_gate` bypassed the CAS-capability guard** — reordered so `!supports_invocation_cas`
+  forces own-all *before* any override, so no wiring can shard a non-CAS backend.
+- **Whole-record CAS serde-stability** is now guarded by a round-trip assertion in gate 2.
+
+Residual (now the honest cost, down from a safety bug): a blob change arriving **while the previous
+run is still in-flight** coalesces into it (a debounce) rather than queuing a distinct second run;
+sequential changes (after settle) re-fire normally. Folding an object etag/mtime into the blob id to
+distinguish overlapping-but-distinct events would need a `Storage`/`BlobChange` change and is a
+deliberate future enhancement, not required for safety.
+
 ## The five invariants (as implemented)
 
 ### Invariant 1 — no double-execution (the central gate)

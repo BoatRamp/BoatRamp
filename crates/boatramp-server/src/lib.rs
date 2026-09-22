@@ -221,7 +221,6 @@ pub(crate) use scheduler::{
     sql_starting_response, CronNow,
 };
 #[cfg(all(feature = "handlers", test))]
-#[cfg(feature = "handlers")]
 use scheduler::{run_scheduler_tick, AsyncPass};
 #[cfg(feature = "handlers")]
 use scheduler::{CONSUMER_BATCH, CONSUMER_LEASE, CONSUMER_MAX_ATTEMPTS};
@@ -565,28 +564,28 @@ impl HandlerRuntimeInner {
     /// **Does THIS node own the async-lane work for `key`?** (B10 — the async-lane shard gate.) The
     /// key is a function/cron identity (see [`async_shard_key_function`]/[`async_shard_key_site_cron`]).
     ///
-    /// Resolution order:
-    /// 1. A test/wiring **override** ([`async_shard_gate`](Self::async_shard_gate)) if set.
-    /// 2. Otherwise the messaging substrate's applied-membership HRW ([`Messaging::shard_owns`]) — the
-    ///    SAME assignment the Phase-D topic drainer uses, so async work and topic delivery agree on
-    ///    ownership per node.
-    ///
     /// Fail-safe defaults to **own-all** (`true`) whenever sharding can't be applied safely, so the
     /// single-node path is byte-for-byte unchanged and a fleet on a non-linearizable-CAS backend
     /// stays leader-gated (Invariant: never shard a claim we can't make race-safe — B18):
-    /// - no messaging substrate (nothing to derive an assignment from), or
     /// - the KV backend has no linearizable CAS (`!supports_invocation_cas`) — sharding would open the
     ///   double-owner window with a plain read-then-write claim, which is exactly the double-execution
-    ///   hazard. The drain stays owns-all/leader-gated there instead.
+    ///   hazard. **This guard is checked FIRST**, so not even a test/wiring override can shard a
+    ///   non-CAS backend; or
+    /// - no messaging substrate (nothing to derive an assignment from).
+    ///
+    /// Otherwise: a test/wiring **override** ([`async_shard_gate`](Self::async_shard_gate)) if set,
+    /// else the messaging substrate's applied-membership HRW ([`Messaging::shard_owns`]) — the SAME
+    /// assignment the Phase-D topic drainer uses, so async work and topic delivery agree on ownership.
     #[cfg(feature = "handlers")]
     async fn async_shard_owns(&self, deploy: &DeployStore, key: &str) -> bool {
-        if let Some(gate) = self.async_shard_gate.get() {
-            return gate(key);
-        }
         // Only shard when the claim can be made race-safe by a linearizable CAS (B10); otherwise own
-        // all so a plain read-then-write claim never races a second node.
+        // all so a plain read-then-write claim never races a second node. Checked before the override
+        // so `set_async_shard_gate` can never defeat the fail-closed posture on a non-CAS backend.
         if !deploy.supports_invocation_cas() {
             return true;
+        }
+        if let Some(gate) = self.async_shard_gate.get() {
+            return gate(key);
         }
         match &self.messaging {
             Some(m) => m.shard_owns(key).await,
@@ -6641,6 +6640,19 @@ mod b10_async_shard_tests {
             .await
             .unwrap();
 
+        // Whole-record-CAS invariant (B10 MEDIUM guard): `claim_invocation` compares `to_vec(observed)`
+        // against the stored bytes, so the claim is sound only if an `Invocation` round-trips
+        // byte-identically. Assert it here — a future non-canonical field (a map/float/`flatten`) would
+        // otherwise silently make every claim's compare mismatch and starve the drain.
+        let stored = serde_json::to_vec(&observed).unwrap();
+        let reparsed: boatramp_core::function::Invocation =
+            serde_json::from_slice(&stored).unwrap();
+        assert_eq!(
+            serde_json::to_vec(&reparsed).unwrap(),
+            stored,
+            "Invocation must serialize byte-stably for the whole-record CAS claim"
+        );
+
         // 16 nodes all observed the same Queued record and race to claim it Running.
         let mut set = tokio::task::JoinSet::new();
         for node in 0..16u64 {
@@ -6712,6 +6724,15 @@ mod b10_async_shard_tests {
         assert!(
             poll_hits(&kv, "hkv/fn/worker/hits", b"1").await,
             "double-owner window: the CAS admits EXACTLY ONE execution (hits == 1)"
+        );
+        // Harden the detector (gate2 is the direct CAS proof; this guards the integration path): the
+        // loser's CAS failed so it never spawned a run — confirm the counter STAYS exactly 1. A broken
+        // claim that admitted both drainers would advance it toward 2.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert_eq!(
+            kv.get("hkv/fn/worker/hits").await.unwrap().as_deref(),
+            Some(b"1".as_ref()),
+            "double-owner window: exactly one execution — the counter never reaches 2"
         );
 
         // --- No-owner window: neither node owns `worker` (the transition gap). ---
@@ -6795,8 +6816,12 @@ mod b10_async_shard_tests {
         );
     }
 
-    /// GATE 5 — blob-watcher single-fire: two watchers observing the SAME blob change (the double-owner
-    /// window) enqueue exactly ONE invocation, because the invocation id is content-hash-deterministic.
+    /// GATE 5 — blob-watcher single-fire AND no-resurrection: (a) two watchers observing the SAME
+    /// change (the double-owner window) enqueue exactly ONE invocation (deterministic id); (b) a
+    /// re-observed change must NEVER resurrect an in-flight (`Running`) invocation back to `Queued`
+    /// (the blind-`put` double-execution bug — `refire_invocation` overwrites only a terminal record);
+    /// (c) after the run settles, a later change still re-fires (terminal → `Queued`), so a change is
+    /// not silently dropped forever.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn gate5_blob_change_enqueue_is_idempotent() {
         let storage = Arc::new(super::tests::MemStorage::default());
@@ -6837,6 +6862,82 @@ mod b10_async_shard_tests {
             invs.len(),
             1,
             "two watchers on the same change enqueue exactly ONE invocation (deterministic id)"
+        );
+        let id = invs[0].id.clone();
+
+        // (b) NO RESURRECTION (the CRITICAL fix): the invocation is CLAIMED (Running); a re-observed
+        // change — a duplicate watcher event, or the other owner mid-transition — must NOT reset it to
+        // `Queued`. With the old blind `put_invocation` it did (re-arming a second run); `refire_invocation`
+        // overwrites only a terminal record, so an in-flight one is left untouched.
+        let mut running = invs[0].clone();
+        running.status = InvocationStatus::Running;
+        running.attempts = 1;
+        running.lease_expires = Some(u64::MAX); // never-expiring ⇒ unambiguously in-flight
+        deploy
+            .put_invocation(ProjectRef::DEFAULT, &running)
+            .await
+            .unwrap();
+        crate::scheduler::enqueue_blob_invocation(
+            &deploy,
+            ProjectRef::DEFAULT,
+            &function,
+            &change,
+            "hblob/fn/onblob/",
+        )
+        .await;
+        let after = deploy
+            .get_invocation(ProjectRef::DEFAULT, "onblob", &id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after.status,
+            InvocationStatus::Running,
+            "a re-observed change must NOT resurrect an in-flight (Running) invocation back to Queued"
+        );
+        assert_eq!(
+            after.attempts, 1,
+            "the in-flight record is left untouched (attempts not reset)"
+        );
+        assert_eq!(
+            deploy
+                .list_invocations(ProjectRef::DEFAULT, "onblob")
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "still exactly one record — no duplicate enqueued"
+        );
+
+        // (c) LEGITIMATE RE-FIRE: once the run settled (`Succeeded`), a later change to the same key
+        // re-fires it (terminal → `Queued`) — the change is not dropped forever.
+        let mut done = after.clone();
+        done.status = InvocationStatus::Succeeded;
+        deploy
+            .put_invocation(ProjectRef::DEFAULT, &done)
+            .await
+            .unwrap();
+        crate::scheduler::enqueue_blob_invocation(
+            &deploy,
+            ProjectRef::DEFAULT,
+            &function,
+            &change,
+            "hblob/fn/onblob/",
+        )
+        .await;
+        let refired = deploy
+            .get_invocation(ProjectRef::DEFAULT, "onblob", &id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            refired.status,
+            InvocationStatus::Queued,
+            "a change after the previous run settled re-fires (Succeeded → Queued)"
+        );
+        assert_eq!(
+            refired.attempts, 0,
+            "the re-fire is a fresh invocation (attempts reset)"
         );
     }
 
@@ -6936,6 +7037,51 @@ mod b10_async_shard_tests {
             after - before,
             1,
             "two concurrent same-minute cron fires add EXACTLY ONE invocation (deterministic id)"
+        );
+
+        // NO RESURRECTION: mark every existing cron invocation in-flight (Running), then a same-minute
+        // re-fire (the double-owner window) must be a create-if-absent no-op — never resetting a claimed
+        // record back to `Queued`. With the old blind `put_invocation` the minute-99 record would reset
+        // to `Queued` and re-run; `enqueue_invocation_if_absent` leaves it alone.
+        for mut inv in deploy
+            .list_invocations(ProjectRef::DEFAULT, "ticker")
+            .await
+            .unwrap()
+        {
+            inv.status = InvocationStatus::Running;
+            inv.attempts = 1;
+            inv.lease_expires = Some(u64::MAX);
+            deploy
+                .put_invocation(ProjectRef::DEFAULT, &inv)
+                .await
+                .unwrap();
+        }
+        let n_before = deploy
+            .list_invocations(ProjectRef::DEFAULT, "ticker")
+            .await
+            .unwrap()
+            .len();
+        crate::function_runtime::enqueue_scheduled_invocation(
+            &deploy,
+            ProjectRef::DEFAULT,
+            &function,
+            99, // same minute ⇒ same deterministic id as the record now marked Running
+        )
+        .await;
+        let ticker_after = deploy
+            .list_invocations(ProjectRef::DEFAULT, "ticker")
+            .await
+            .unwrap();
+        assert_eq!(
+            ticker_after.len(),
+            n_before,
+            "a same-minute cron re-fire creates no new record"
+        );
+        assert!(
+            ticker_after
+                .iter()
+                .all(|i| i.status == InvocationStatus::Running),
+            "no in-flight cron invocation was resurrected to Queued"
         );
     }
 
