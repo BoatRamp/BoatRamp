@@ -3685,6 +3685,7 @@ mod tests {
                     max_attempts: None,
                     max_batch: None,
                     max_ack_pending: None,
+                    stats_topics: Vec::new(),
                 }],
                 ..Default::default()
             },
