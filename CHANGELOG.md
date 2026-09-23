@@ -5,7 +5,43 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
-## [0.5.0] - 2026-09-22
+## [0.5.1] - 2026-09-23
+
+**`boatramp project migrate` backend parity — MySQL and embedded libsql/SQLite.** The
+owner-gated schema-migration surface (previously Postgres-only) now runs on MySQL and
+the embedded default (libsql/SQLite) too, each reconciled to that engine's honest model.
+
+### Added
+
+- **MySQL migration substrate.** DDL runs as a **distinct DDL identity** supplied via the
+  binding's `migration_url_env` (MySQL has no owner/runtime role split — the runtime user
+  is itself DDL-capable, so migrations require a separate admin login that must NOT equal
+  the runtime `url_env`, enforced by URL and parsed-username distinctness). A compute-backed
+  managed MySQL (no distinct login derivable yet) is refused fail-closed. MySQL DDL
+  **implicitly commits** per statement, so a mid-step failure is reported honestly as
+  `PARTIALLY APPLIED` (the inverse of the Postgres rollback guarantee); the `extension`
+  step kind is refused (no `CREATE EXTENSION`). Live gate `MIGRATE MYSQL PARITY OK`.
+- **Embedded libsql/SQLite migration substrate.** The site's own embedded database; a
+  reserved-prefixed ledger table (SQLite has no schemas). SQLite has **transactional DDL**,
+  so a failed multi-statement step **rolls back cleanly** (no partial schema, no ledger
+  row) — the opposite of MySQL. No roles/RLS (the file is the boundary); the guest still
+  never holds a DB handle (host-mediated owner-DDL seam). Live gate `MIGRATE LIBSQL PARITY OK`.
+
+### Security
+
+- **Migration guard hardening (comment-confusion evasions).** The owner-gated migration
+  guards (S3 ledger-reference, S4 transaction-control, `CREATE EXTENSION`) tokenize a step's
+  SQL to stay comment/quote/casing-immune. Three engine-specific lexer divergences that could
+  hide a guarded keyword from the tokenizer while the **server executes it** are now closed
+  (each verified against a real engine + mutation-tested):
+  - **MySQL/MariaDB executable comments** `/*! … */` and `/*M! … */` (executed by the server,
+    dropped by the tokenizer) — un-hidden and classified.
+  - **MySQL non-nesting `/* */`** vs sqlparser's nesting: `/* a /* b */ <kw> -- */` executes a
+    live keyword on the server but read as one nested comment by the tokenizer — closed via a
+    MySQL-faithful non-nesting comment strip.
+  - **SQLite non-nesting `/* */`** (the same class): the SQLite guard now strips comments
+    non-nesting too (Postgres is left on the nesting tokenizer because real Postgres *does*
+    nest, so the same text is inert to both — safe).
 
 **BREAKING — uniform resource-identifier screening at every ingress + the default SQL
 database binding is now named `default`.** A single canonical validator
