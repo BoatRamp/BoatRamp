@@ -141,6 +141,35 @@ impl ManagedSqlCredentials {
             .is_some())
     }
 
+    /// The **read-only** unseal branch of [`password`](Self::password): return the plaintext
+    /// credential for `workload` in `project` if one is already sealed in the store, else
+    /// `Ok(None)`. Unlike [`password`](Self::password) it NEVER generates / `wrap`s / `put`s —
+    /// so it is safe to call from a provisioning drift-repair **dry-run** that must be provably
+    /// side-effect-free (a dry-run needs the plaintext to attempt a diagnostic connect, but must
+    /// never create-if-absent the credential the way `password` does). `Ok(None)` means the
+    /// credential has not been sealed yet (e.g. a pre-v0.4.25 tenant whose owner role — and thus
+    /// owner credential — never existed); the caller reports that role's connectivity as an
+    /// as-yet-unverifiable `skipped`, not an error or a KV write.
+    #[cfg_attr(not(feature = "handlers"), allow(dead_code))]
+    pub async fn get_sealed_password(
+        &self,
+        project: &str,
+        workload: &str,
+    ) -> Result<Option<String>, String> {
+        let key = Self::key(project, workload);
+        let Some(sealed) = self.kv.get(&key).await.map_err(|e| e.to_string())? else {
+            return Ok(None);
+        };
+        let plain = self
+            .envelope
+            .unwrap(&sealed)
+            .await
+            .map_err(|e| e.to_string())?;
+        String::from_utf8(plain)
+            .map(Some)
+            .map_err(|_| format!("managed sql credential for {workload:?} is not valid UTF-8"))
+    }
+
     /// Delete a workload's sealed credential (a tenant deprovision hook). Idempotent:
     /// deleting an absent credential is a no-op (the underlying KV `delete` treats a
     /// missing key as success), so re-running a teardown is harmless.
