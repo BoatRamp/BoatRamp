@@ -41,6 +41,8 @@ pub use bindings::migrate::MigrateBinding;
 pub use bindings::session::{SessionBinding, SessionController, SessionError};
 #[cfg(feature = "messaging")]
 pub use bindings::tenancy::ProducerContextSource;
+#[cfg(feature = "tenant-secrets")]
+pub use bindings::tenant_secrets::{TenantSecretRefused, TenantSecretsBinding};
 #[cfg(feature = "engine")]
 pub use bindings::Bindings;
 #[cfg(feature = "session")]

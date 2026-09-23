@@ -341,6 +341,21 @@ impl Right {
                     Some(proj.to_string()),
                     if get { Action::Read } else { Action::Admin },
                 ),
+                // The project's per-tenant sealed-secret store (`/api/projects/<proj>/
+                // tenant-secrets/<tenant>/<name>`, task #493) — sealed per-tenant credentials (each
+                // firm's OWN third-party OAuth `client_secret`), at least as sensitive as the
+                // project `secrets/` store. Gated with the DEDICATED `Resource::Secrets` (list/show
+                // with `Read`, set/delete with `Write` — both satisfied by a `Secrets·Admin` grant,
+                // matching `/api/secrets`), NOT the general project mapping below. This mirrors the
+                // `secrets`/`email` arms and is placed ABOVE the `Some(_)` catch-all so a
+                // `project_publisher` (whose deploy-grade right the catch-all would grant) can NEVER
+                // write a firm's OAuth secret (Security HIGH-1 — the `/api/repair` escalation
+                // lesson). Target = the project.
+                Some((&"tenant-secrets", _)) => Self::new(
+                    Resource::Secrets,
+                    Some(proj.to_string()),
+                    if get { Action::Read } else { Action::Write },
+                ),
                 // Project-owned resources (functions/compute/workflows/config/…):
                 // read with `Project·Read`, mutate with `Project·Deploy`.
                 Some(_) => Self::new(
@@ -1397,6 +1412,37 @@ mod tests {
                     Action::Write,
                 )),
             ),
+            // Per-tenant sealed secrets (task #493): the SAME dedicated `Resource::Secrets`
+            // mapping (list/show Read, set/delete Write), NOT the deploy-grade project catch-all —
+            // so a `project_publisher` can never write a firm's OAuth secret (Security HIGH-1). The
+            // `<tenant>`/`<name>` path segments do not change the resource/action.
+            (
+                "GET",
+                "/api/projects/acme/tenant-secrets/firm-42",
+                Some(Right::new(
+                    Resource::Secrets,
+                    Some("acme".into()),
+                    Action::Read,
+                )),
+            ),
+            (
+                "PUT",
+                "/api/projects/acme/tenant-secrets/firm-42/oauth_secret",
+                Some(Right::new(
+                    Resource::Secrets,
+                    Some("acme".into()),
+                    Action::Write,
+                )),
+            ),
+            (
+                "DELETE",
+                "/api/projects/acme/tenant-secrets/firm-42/oauth_secret",
+                Some(Right::new(
+                    Resource::Secrets,
+                    Some("acme".into()),
+                    Action::Write,
+                )),
+            ),
         ];
         for (method, path, expected) in cases {
             assert_eq!(
@@ -1834,6 +1880,59 @@ mod tests {
             Some("globex".into()),
             Action::Write
         )));
+    }
+
+    /// Task #493 (Security HIGH-1, the `/api/repair` escalation lesson): the per-tenant sealed-secret
+    /// routes gate on the dedicated `Resource::Secrets` (Read to list, Write to mutate), NOT the
+    /// deploy-grade project catch-all — so a `project_publisher` cannot write a firm's OAuth secret.
+    /// Drives the WHOLE route→required-right→role-allows path, both the global and project-scoped
+    /// role forms, so it fails if the `tenant-secrets` arm is removed and the route falls to the
+    /// catch-all (which a publisher WOULD satisfy).
+    #[test]
+    fn tenant_secrets_routes_gate_on_secrets_not_publisher() {
+        let policy = AuthzPolicy::default_policy();
+
+        let list = Right::required("GET", "/api/projects/acme/tenant-secrets/firm-42")
+            .expect("route is gated");
+        let write = Right::required(
+            "PUT",
+            "/api/projects/acme/tenant-secrets/firm-42/oauth_secret",
+        )
+        .expect("route is gated");
+        let del = Right::required(
+            "DELETE",
+            "/api/projects/acme/tenant-secrets/firm-42/oauth_secret",
+        )
+        .expect("route is gated");
+
+        // Each maps to the dedicated Resource::Secrets on the project (NOT Resource::Project).
+        assert_eq!(list.resource, Resource::Secrets);
+        assert_eq!(write.resource, Resource::Secrets);
+        assert_eq!(del.resource, Resource::Secrets);
+        assert_eq!(write.action, Action::Write);
+        assert_eq!(list.action, Action::Read);
+
+        // A `project_publisher` (deploy-grade) does NOT satisfy the write — the whole point.
+        let publisher = policy.rights_for(&[GrantedRole::scoped("project_publisher", "acme")]);
+        assert!(
+            !publisher.allows(&write),
+            "a publisher must NOT write a tenant secret"
+        );
+        assert!(
+            !publisher.allows(&list),
+            "a publisher must NOT even list tenant-secret names"
+        );
+
+        // A `Secrets·Admin` (project_admin) DOES — via both the scoped and global admin forms.
+        let admin = policy.rights_for(&[GrantedRole::scoped("project_admin", "acme")]);
+        assert!(admin.allows(&write) && admin.allows(&list) && admin.allows(&del));
+        let root = policy.rights_for(&[GrantedRole::global("admin")]);
+        assert!(root.allows(&write) && root.allows(&list) && root.allows(&del));
+
+        // The tenant boundary holds: acme's project-admin cannot write globex's tenant secrets.
+        let globex_write =
+            Right::required("PUT", "/api/projects/globex/tenant-secrets/firm-9/k").unwrap();
+        assert!(!admin.allows(&globex_write));
     }
 
     #[test]

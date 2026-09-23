@@ -5,7 +5,44 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
-## [0.5.3] - 2026-09-23
+## [0.5.4] - 2026-09-24
+
+**Per-tenant sealed-secret guest capability — `boatramp:handlers/tenant-secrets`.** A granted
+wasm component can `get`/`set`/`delete`/`list` secrets sealed to the invocation's **host-resolved
+tenant**, keyed `(project, tenant, name)`, using the same `[secrets]` envelope as the project store.
+The guest names only the secret `name`; the host supplies the tenant (from the same own
+`ScopeAxis::Tenant` fact the `sql`/`orm` bindings use), so a guest can never address another tenant's
+secret. For a multi-tenant app where each tenant brings its own third-party credential (per-firm OAuth
+`client_secret`, per-tenant API/SMTP keys) that must never live in the app's own DB.
+
+### Added
+
+- **Guest capability** (off-by-default `tenant-secrets` feature): `get(name) -> option<list<u8>>`
+  (unset ⇒ `none`, not an error), `set(name, value) -> secret-meta`, `delete(name) -> bool`,
+  `list() -> [secret-meta]` (names+metadata, never values). Two **independent** grants:
+  `tenant-secrets:read` (get/list) and `tenant-secrets:admin` (set/delete), each separate from the
+  deploy/publisher right; deny-by-default. A per-handler `tenant_secret_names` allowlist scopes WHICH
+  names a component may address (empty ⇒ deny-all). A handler with no resolved tenant
+  (`all`/anonymous/unscoped) gets `no-resolved-tenant` on every call.
+- **Control-plane CRUD** `PUT/GET/DELETE /api/projects/{p}/tenant-secrets/{tenant}[/{name}]` gated
+  **`Secrets·Admin`** (Read for the value-free GET), audited — for an operator/console to seal a
+  tenant's secret server-side (value in the JSON body, never the path). `GET /{tenant}` lists that
+  tenant's names+metadata only.
+- **CLI** `boatramp project tenant-secrets set/ls/rm/rotate --tenant <t> <name>`.
+- `TenantSecretStore` (`boatramp-core`) reuses the project store's seal/record/envelope, keyed per
+  tenant; both the resolved tenant and the control-plane `{tenant}` path segment are screened by the
+  canonical `validate_resource_name` **before** keying (single-segment, fail-closed) so guest reads
+  and operator writes key byte-identical namespaces; `list` is per-`(project, tenant)` (never
+  project-wide); 64 KiB value + 256 name-per-tenant caps.
+
+### Notes
+
+- A guest WIT addition ⇒ **shim rev**; `HOST_HANDLERS_VERSION` → `0.5.0`. Rebuild guests against the
+  updated shim to import `tenant-secrets`.
+- Distinct from the project `boatramp:<name>` env-injected secret store and the v0.5.3 per-site
+  `[handlers].secrets` allowlist — this is a runtime, per-tenant, guest-called store.
+- Scoped by the CI-hard, mutation-verified live gate `TENANT SECRETS SCOPED OK` (tenant A cannot read
+  tenant B's secret; a `/`-bearing or no-resolved-tenant invocation is refused before store access).
 
 **Opt-in per-guest secret allowlist over the per-site `[handlers].secrets` pool.** Previously
 the whole site secret pool was injected into every site handler's (and consumer's) guest

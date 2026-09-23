@@ -126,6 +126,13 @@ pub struct FunctionConfig {
     /// consulted when `imports` contains `messaging-stats`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stats_topics: Vec<String>,
+    /// Per-component name allowlist for the per-tenant sealed-secret capability
+    /// (`boatramp:handlers/tenant-secrets`, task #493): the secret names this function may address
+    /// for its resolved tenant. Least-privilege: **empty ⇒ deny-all**. A name not in the list is
+    /// `access-denied`; the resolved tenant is always host-supplied. Only consulted when `imports`
+    /// contains a `tenant-secrets:*` right.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tenant_secret_names: Vec<String>,
     /// In-site tenancy decision for this function's `sql`/`orm` access (Dimension 0). Absent ⇒
     /// *undeclared* (refused under the `multi-tenant` posture, treated as `Disabled` — plain
     /// queries — under single-tenant/dev). `Scoped` opts into host-injected row scoping. Parsed via
@@ -212,6 +219,8 @@ impl FunctionConfig {
             // Carry the handler's declared `messaging-stats` bus-topic templates onto the desugared
             // function so the grant surface is identical whichever path serves it.
             stats_topics: h.stats_topics.clone(),
+            // Carry the handler's tenant-secret name allowlist likewise (grant surface parity).
+            tenant_secret_names: h.tenant_secret_names.clone(),
             // A desugared handler-function carries its own per-handler tenancy when declared;
             // absent ⇒ inherit the site config (the dispatch path applies the site decision).
             tenancy: h.tenancy.clone(),
@@ -227,6 +236,8 @@ impl FunctionConfig {
             token_claims: c.token_claims.clone(),
             // Carry the consumer's declared `messaging-stats` bus-topic templates.
             stats_topics: c.stats_topics.clone(),
+            // Carry the consumer's tenant-secret name allowlist likewise.
+            tenant_secret_names: c.tenant_secret_names.clone(),
             ..Default::default()
         }
     }
@@ -985,6 +996,7 @@ mod tests {
             secrets: Vec::new(),
             invoke_targets: Vec::new(),
             stats_topics: Vec::new(),
+            tenant_secret_names: Vec::new(),
         }
     }
 
@@ -1022,6 +1034,7 @@ mod tests {
                 backoff_ms: None,
                 retention_ms: None,
                 stats_topics: Vec::new(),
+                tenant_secret_names: Vec::new(),
             }],
             crons: vec![CronConfig {
                 schedule: "0 * * * *".into(),

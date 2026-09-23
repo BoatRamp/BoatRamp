@@ -736,6 +736,89 @@ pub(super) async fn delete_secret(
     }
 }
 
+// ---- Project-scoped PER-TENANT sealed secret store (admin API) -----------
+//
+// Task #493. The `/api/projects/{proj}/tenant-secrets/{tenant}{,/{name}}` surface is rewritten by
+// `project_scope` onto the global `/api/tenant-secrets/{tenant}{,/{name}}` handlers below, which
+// read the project from the `ProjectContext` extension. Authorization is enforced upstream by
+// `require_auth` against the *original* project-scoped path (the dedicated `Resource::Secrets`
+// mapping — Read to list, Write to mutate — NOT the deploy-grade publisher right; see
+// `authz::Right::required`).
+//
+// Every value is sealed with the `[secrets]` envelope; these handlers set/list/delete NAMES +
+// METADATA and NEVER return a value (there is no value-GET endpoint — a value leaves the store only
+// into a guest at point-of-use via the `tenant-secrets` capability, never over the API). The
+// `{tenant}` and `{name}` PATH segments are validated fail-closed INSIDE the store
+// (`validate_resource_name` / `validate_name`), so a `..`/`/`-bearing segment is a `400` before it
+// can reshape the key to a sibling tenant's — the guest read and this write compose byte-identical
+// segments (Security HIGH-2).
+
+/// The per-tenant secret store, injected as an extension by the node when a `[secrets]` envelope is
+/// present. `None` ⇒ the endpoints fail closed with a clear `501` (`no_secret_store_response`).
+type TenantSecretStoreExt = Option<Arc<boatramp_core::secret_store::TenantSecretStore>>;
+
+#[derive(Deserialize)]
+pub(super) struct SetTenantSecretRequest {
+    /// The plaintext value — sealed server-side; never stored in the clear, logged, or returned.
+    value: String,
+}
+
+/// `PUT /api/projects/{proj}/tenant-secrets/{tenant}/{name}` — seal `value` server-side under
+/// `(project, tenant, name)` (rotation = PUT an existing name) and return the value-free
+/// [`SecretMeta`] as `201`. Never echoes the value. `501` when no envelope is configured; `400` on
+/// an invalid tenant/name segment (rejected fail-closed inside the store, before any write).
+pub(super) async fn set_tenant_secret(
+    Extension(store): Extension<TenantSecretStoreExt>,
+    Extension(project): Extension<ProjectContext>,
+    Path((tenant, name)): Path<(String, String)>,
+    Json(request): Json<SetTenantSecretRequest>,
+) -> Response {
+    let Some(store) = store else {
+        return no_secret_store_response();
+    };
+    match store
+        .set(project.as_ref(), &tenant, &name, request.value.as_bytes())
+        .await
+    {
+        Ok(meta) => (StatusCode::CREATED, Json(meta)).into_response(),
+        Err(err) => secret_error_response(err),
+    }
+}
+
+/// `GET /api/projects/{proj}/tenant-secrets/{tenant}` — list one tenant's secret **names +
+/// metadata** (sorted), never a value, per-tenant (never project-wide → no cross-tenant name
+/// oracle). `501` when no envelope; `400` on an invalid tenant segment.
+pub(super) async fn list_tenant_secrets(
+    Extension(store): Extension<TenantSecretStoreExt>,
+    Extension(project): Extension<ProjectContext>,
+    Path(tenant): Path<String>,
+) -> Response {
+    let Some(store) = store else {
+        return no_secret_store_response();
+    };
+    match store.list(project.as_ref(), &tenant).await {
+        Ok(metas) => Json(metas).into_response(),
+        Err(err) => secret_error_response(err),
+    }
+}
+
+/// `DELETE /api/projects/{proj}/tenant-secrets/{tenant}/{name}` — remove a secret; `204` if it
+/// existed, `404` if not. `501` when no envelope; `400` on an invalid tenant/name segment.
+pub(super) async fn delete_tenant_secret(
+    Extension(store): Extension<TenantSecretStoreExt>,
+    Extension(project): Extension<ProjectContext>,
+    Path((tenant, name)): Path<(String, String)>,
+) -> Response {
+    let Some(store) = store else {
+        return no_secret_store_response();
+    };
+    match store.delete(project.as_ref(), &tenant, &name).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, "no matching secret\n").into_response(),
+        Err(err) => secret_error_response(err),
+    }
+}
+
 // ---- Project-scoped SMTP email profiles (admin API) ----------------------
 //
 // The `/api/projects/{proj}/email/profiles{,/{name}}` surface is rewritten by

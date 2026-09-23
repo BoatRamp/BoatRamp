@@ -1106,6 +1106,10 @@ impl HandlerEngine {
         bindings::messaging_stats::add_to_linker(&mut linker, |state: &mut HostState| {
             bindings::messaging_stats::StatsHost::new(state.bindings.messaging_stats())
         })?;
+        #[cfg(feature = "tenant-secrets")]
+        bindings::tenant_secrets::add_to_linker(&mut linker, |state: &mut HostState| {
+            bindings::tenant_secrets::TenantSecretsHost::new(state.bindings.tenant_secrets())
+        })?;
         #[cfg(feature = "invoke")]
         bindings::invoke::add_to_linker(&mut linker, |state: &mut HostState| {
             bindings::invoke::InvokeHost::new(&mut state.table, state.bindings.invoke())

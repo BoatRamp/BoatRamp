@@ -275,6 +275,27 @@ pub(crate) mod keys {
         format!("project/{project}/secret/")
     }
 
+    /// A per-tenant sealed secret: `project/<proj>/tenant-secret/<tenant>/<name>` → an
+    /// envelope-sealed value plus small clear metadata. The `tenant-secret/` infix is a
+    /// DISTINCT keyspace from the project-scoped `secret/` (a `boatramp:` env ref) above,
+    /// so the runtime tenant store and the project env store can never collide even for the
+    /// same `<name>`. Both the `<tenant>` and `<name>` segments are
+    /// [`validate_resource_name`](crate::project::validate_resource_name)/`validate_name`-screened
+    /// (fail-closed) by [`TenantSecretStore`](crate::secret_store::TenantSecretStore) BEFORE they
+    /// reach here, so neither can carry a `/` and reshape the key to a sibling tenant's — the guest
+    /// read and the control-plane write compose the SAME byte-identical segments.
+    pub fn tenant_secret(project: ProjectRef<'_>, tenant: &str, name: &str) -> String {
+        format!("project/{project}/tenant-secret/{tenant}/{name}")
+    }
+
+    /// The prefix listing ONE tenant's secrets within a project
+    /// (`project/<proj>/tenant-secret/<tenant>/`) — keyed on the TENANT, never project-wide, so a
+    /// `list` can only ever enumerate the resolved tenant's own names (no cross-tenant name oracle).
+    /// The `strip_prefix` tail is a single `<name>` segment.
+    pub fn tenant_secret_prefix(project: ProjectRef<'_>, tenant: &str) -> String {
+        format!("project/{project}/tenant-secret/{tenant}/")
+    }
+
     /// A project-scoped SMTP email profile: `project/<proj>/email/<name>` → the
     /// clear connection config plus an envelope-sealed password. Project-scoped so
     /// the `email` guest capability resolves only within its own project's

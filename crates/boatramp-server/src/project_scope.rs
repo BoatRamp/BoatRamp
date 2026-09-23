@@ -70,6 +70,14 @@ pub const PROJECT_SCOPED_FAMILIES: &[&str] = &[
     // reaches the right project. (Authz still sees the original project-qualified path
     // and gates mutation at `Project·Admin` — see `authz::Right::required`.)
     "tenancy",
+    // The project's per-tenant sealed-secret store (`/api/projects/<proj>/tenant-secrets/
+    // <tenant>/<name>`, task #493). Rewrites onto the global `/api/tenant-secrets/…` handlers,
+    // tagged with the project, so a per-tenant OAuth `client_secret` is set/listed/removed within
+    // the right project's sealed keyspace. Authz still sees the original project-qualified path and
+    // gates it with the dedicated `Resource::Secrets` (Read to list, Write to mutate — NOT the
+    // deploy-grade publisher right), so a `project_publisher` cannot write a firm's secret. Without
+    // this entry the route would 404.
+    "tenant-secrets",
 ];
 
 /// The tenant project a request targets, injected as a request extension by

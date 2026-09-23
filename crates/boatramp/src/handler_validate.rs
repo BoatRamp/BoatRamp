@@ -160,6 +160,15 @@ mod imp {
             // (`admin:domains|email|site|secrets`), so it maps to the `admin` token here and
             // the declared per-surface grant satisfies it via the `token:`-prefix match above.
             ("boatramp:handlers", "admin-types" | "admin") => Some("admin"),
+            // The per-tenant sealed-secret capability (task #493). A component imports the single
+            // `tenant-secrets` interface and declares one or both INDEPENDENT rights
+            // (`tenant-secrets:read` / `tenant-secrets:admin`); it maps to the `tenant-secrets`
+            // token here, and either declared `tenant-secrets:<right>` satisfies the import via the
+            // `token:`-prefix match above (else `boatramp sync` would refuse a component using it —
+            // the v0.4.10 lesson). `tenant-secrets-types` (the `use`d record/variant) rides the same.
+            ("boatramp:handlers", "tenant-secrets" | "tenant-secrets-types") => {
+                Some("tenant-secrets")
+            }
             _ => None,
         }
     }
@@ -171,7 +180,7 @@ mod imp {
     /// function-manifest `requires`, checked at deploy — see
     /// `PLAN-capability-contract-versioning-v2`. Bump when the capability surface
     /// changes so operators can see it; it links nothing.
-    const HOST_HANDLERS_VERSION: (u64, u64, u64) = (0, 4, 0);
+    const HOST_HANDLERS_VERSION: (u64, u64, u64) = (0, 5, 0);
 
     /// The capability surface a host advertises (see the crate-level re-export).
     #[derive(Debug, serde::Serialize)]
@@ -556,6 +565,35 @@ mod imp {
         }
 
         #[test]
+        fn policy_gates_tenant_secrets_by_either_declared_right() {
+            // Task #493 + the v0.4.10 lesson: a component importing the single `tenant-secrets`
+            // interface must deploy via `sync` when it declares EITHER independent right
+            // (`tenant-secrets:read` or `tenant-secrets:admin`) — both satisfy the `tenant-secrets`
+            // token via the `token:`-prefix match. Undeclared ⇒ refused, naming the token; a
+            // different capability's token does not satisfy it.
+            let exports = [lbl("wasi:http", "incoming-handler")];
+            let ts = [
+                lbl("boatramp:handlers", "tenant-secrets"),
+                lbl("boatramp:handlers", "tenant-secrets-types"),
+            ];
+            for right in ["tenant-secrets:read", "tenant-secrets:admin"] {
+                assert!(
+                    check_interface_policy(&ts, &exports, &[right.into()], Role::Handler).is_ok(),
+                    "declaring `{right}` must satisfy the tenant-secrets import"
+                );
+            }
+            // Undeclared → refused, message names the `tenant-secrets` token.
+            let err = check_interface_policy(&ts, &exports, &[], Role::Handler).unwrap_err();
+            assert!(err.contains("`tenant-secrets`"), "{err}");
+            // A bare `tenant-secrets` grant is not a valid deploy import (deny-by-default), and a
+            // different capability's token does not satisfy the import.
+            assert!(
+                check_interface_policy(&ts, &exports, &["email".into()], Role::Handler).is_err(),
+                "the `email` token must NOT satisfy tenant-secrets"
+            );
+        }
+
+        #[test]
         fn policy_gates_messaging_producer_and_consumer_export() {
             // A request handler may import the messaging producer under a
             // `wasi:messaging` grant (the host interface is boatramp:handlers/*).
@@ -639,6 +677,7 @@ mod imp {
                     secrets: Vec::new(),
                     invoke_targets: vec![],
                     stats_topics: Vec::new(),
+                    tenant_secret_names: Vec::new(),
                 }],
                 ..Default::default()
             };

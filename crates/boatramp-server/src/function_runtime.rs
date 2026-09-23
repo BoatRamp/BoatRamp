@@ -150,6 +150,44 @@ pub(super) fn resolved_tenant_string(principal: &[boatramp_handlers::ScopeFact])
         .and_then(|f| ctx_stamp(&f.value))
 }
 
+#[cfg(all(test, feature = "handlers"))]
+mod resolved_tenant_axis_tests {
+    use super::resolved_tenant_string;
+    use boatramp_core::sql::SqlValue;
+    use boatramp_core::tenancy::ScopeAxis;
+    use boatramp_handlers::ScopeFact;
+
+    /// The load-bearing cross-tenant invariant behind `tenant-secrets` (#493) + `messaging-stats`:
+    /// the resolved tenant is the OWN `ScopeAxis::Tenant` fact ONLY. A capability/anonymous funnel
+    /// resolves the peer on the `TargetTenant` axis, which MUST NOT become the resolved tenant — else
+    /// a funnel could key another firm's sealed secret. This pins the axis split against a future
+    /// refactor that unifies the axes (the Security review's regression-pin recommendation).
+    #[test]
+    fn resolved_tenant_is_own_axis_only_never_target_or_anon() {
+        let own = [ScopeFact {
+            axis: ScopeAxis::Tenant,
+            value: SqlValue::Text("acme".into()),
+        }];
+        assert_eq!(resolved_tenant_string(&own), Some("acme".to_string()));
+
+        let target = [ScopeFact {
+            axis: ScopeAxis::TargetTenant,
+            value: SqlValue::Text("victim".into()),
+        }];
+        assert_eq!(
+            resolved_tenant_string(&target),
+            None,
+            "a TargetTenant fact must NOT resolve as the own tenant (cross-tenant funnel guard)"
+        );
+
+        assert_eq!(
+            resolved_tenant_string(&[]),
+            None,
+            "anonymous/unscoped resolves to no tenant"
+        );
+    }
+}
+
 /// The tenant claim a component's `token` source names (Gap 3) — the first `TenantSource::Token`
 /// in a `Scoped` tenancy decision. `None` when the component declares no token source (so
 /// `present-token` has nothing to verify against → deny-by-default).
@@ -1018,6 +1056,26 @@ pub(super) async fn build_function_bindings(
                 messaging.clone(),
                 config.stats_topics.clone(),
                 resolved_tenant,
+            );
+        }
+    }
+    // The per-tenant sealed-secret capability (task #493): read/write secrets sealed to THIS
+    // invocation's resolved OWN-tenant. Two INDEPENDENT rights (`tenant-secrets:read` get/list,
+    // `tenant-secrets:admin` set/delete), each separately declared; the binding carries both flags
+    // for a per-call right re-check. The resolved tenant is `resolved_tenant_string` of the OWN-
+    // `Tenant` fact — `None` ⇒ every call `no-resolved-tenant`. `tenant_secret_names` is the name
+    // allowlist (empty ⇒ deny-all). Deny-by-default: no `[secrets]` envelope (no store) OR neither
+    // right ⇒ no binding. The guest never names a tenant (the host injects the resolved one).
+    if granted("tenant-secrets:read") || granted("tenant-secrets:admin") {
+        if let Some(store) = inner.tenant_secret_store.get() {
+            let resolved_tenant = resolved_tenant_string(&caller_tenant);
+            bindings = bindings.with_tenant_secrets(
+                store.clone(),
+                project.as_str(),
+                resolved_tenant,
+                config.tenant_secret_names.clone(),
+                granted("tenant-secrets:read"),
+                granted("tenant-secrets:admin"),
             );
         }
     }

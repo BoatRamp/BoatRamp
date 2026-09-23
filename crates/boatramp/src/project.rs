@@ -29,6 +29,9 @@ pub enum Error {
     /// A `project repair` subcommand failure.
     #[error(transparent)]
     Repair(#[from] crate::project_repair::Error),
+    /// A `project tenant-secrets` subcommand failure.
+    #[error(transparent)]
+    TenantSecrets(#[from] crate::project_tenant_secrets::Error),
 }
 
 /// `project` module result; `Err` is [`Error`].
@@ -94,6 +97,12 @@ enum ProjectCommand {
     /// `project migrate`). Defaults to a dry-run; `--apply` converges. Fixes provisioning so
     /// migrate can run; never touches schema or data. `Project·Admin`.
     Repair(crate::project_repair::RepairArgs),
+    /// Manage this project's PER-TENANT sealed secrets (task #493): each firm's own third-party
+    /// credential (e.g. an OAuth `client_secret`), sealed server-side under `(tenant, name)`.
+    /// `set`/`rotate`/`ls`/`rm`, each `--tenant <t>`. Distinct from the per-project `boatramp
+    /// secrets` env store. Mutating verbs need `Secrets·Write`; `ls` needs `Secrets·Read`.
+    #[command(name = "tenant-secrets")]
+    TenantSecrets(crate::project_tenant_secrets::TenantSecretsArgs),
 }
 
 /// Whether a `--force` confirmation `typed` at the prompt authorizes deleting
@@ -315,6 +324,9 @@ pub async fn run(args: ProjectArgs, config: &ProjectConfig) -> Result<()> {
         }
         ProjectCommand::Repair(rargs) => {
             crate::project_repair::run(rargs, &cp).await?;
+        }
+        ProjectCommand::TenantSecrets(tsargs) => {
+            crate::project_tenant_secrets::run(tsargs, &cp).await?;
         }
     }
     Ok(())

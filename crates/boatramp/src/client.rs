@@ -419,6 +419,22 @@ pub struct DlqEntry {
     pub payload_b64: Option<String>,
 }
 
+/// Value-free metadata for one per-tenant sealed secret (task #493), the shape the
+/// `/api/…/tenant-secrets/…` control-plane returns. Never carries a value.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct TenantSecretMeta {
+    pub name: String,
+    // Part of the returned metadata contract; the `ls` view prints `updated_at`, but the field is
+    // kept so a caller/JSON consumer sees the full shape.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub created_at: u64,
+    #[serde(default)]
+    pub updated_at: u64,
+    #[serde(default)]
+    pub revision: u32,
+}
+
 /// An authenticated control-plane connection: an [`ApiClient`] bound to a
 /// resolved server base URL. The request methods key off it, so the client and
 /// server base are threaded once (at construction) instead of by hand at every
@@ -675,6 +691,93 @@ impl ControlPlane {
             let body = resp.text().await.unwrap_or_default();
             Err(ClientError::Refused(format!(
                 "schema migrate {verb} refused ({status}): {}",
+                body.trim()
+            )))
+        }
+    }
+
+    // ---- per-tenant sealed secrets (task #493) -----------------------------
+
+    /// Seal `value` under `(project, tenant, name)` (`PUT /api/{seg}/{tenant}/{name}`;
+    /// `Secrets·Write`). Rotation = PUT an existing name. Returns the value-free
+    /// [`TenantSecretMeta`]; the value is never echoed. A `501` (no envelope), `400` (invalid
+    /// tenant/name) or other non-2xx is surfaced verbatim as [`ClientError::Refused`].
+    pub async fn tenant_secret_set(
+        &self,
+        tenant: &str,
+        name: &str,
+        value: &str,
+    ) -> Result<TenantSecretMeta> {
+        let seg = project_seg(&self.project, "tenant-secrets");
+        let Self {
+            http: client,
+            base: server,
+            ..
+        } = self;
+        let resp = client
+            .put(format!("{server}/api/{seg}/{tenant}/{name}"))
+            .json(&serde_json::json!({ "value": value }))
+            .send()
+            .await?;
+        let status = resp.status();
+        if status.is_success() {
+            Ok(resp.json().await?)
+        } else {
+            let body = resp.text().await.unwrap_or_default();
+            Err(ClientError::Refused(format!(
+                "tenant-secret set refused ({status}): {}",
+                body.trim()
+            )))
+        }
+    }
+
+    /// List ONE tenant's secret names + metadata (`GET /api/{seg}/{tenant}`; `Secrets·Read`),
+    /// never a value, never project-wide.
+    pub async fn tenant_secret_list(&self, tenant: &str) -> Result<Vec<TenantSecretMeta>> {
+        let seg = project_seg(&self.project, "tenant-secrets");
+        let Self {
+            http: client,
+            base: server,
+            ..
+        } = self;
+        let resp = client
+            .get(format!("{server}/api/{seg}/{tenant}"))
+            .send()
+            .await?;
+        let status = resp.status();
+        if status.is_success() {
+            Ok(resp.json().await?)
+        } else {
+            let body = resp.text().await.unwrap_or_default();
+            Err(ClientError::Refused(format!(
+                "tenant-secret ls refused ({status}): {}",
+                body.trim()
+            )))
+        }
+    }
+
+    /// Delete `(project, tenant, name)` (`DELETE /api/{seg}/{tenant}/{name}`; `Secrets·Write`).
+    /// `Ok(true)` if it existed, `Ok(false)` on a `404`, else [`ClientError::Refused`].
+    pub async fn tenant_secret_delete(&self, tenant: &str, name: &str) -> Result<bool> {
+        let seg = project_seg(&self.project, "tenant-secrets");
+        let Self {
+            http: client,
+            base: server,
+            ..
+        } = self;
+        let resp = client
+            .delete(format!("{server}/api/{seg}/{tenant}/{name}"))
+            .send()
+            .await?;
+        let status = resp.status();
+        if status.is_success() {
+            Ok(true)
+        } else if status == reqwest::StatusCode::NOT_FOUND {
+            Ok(false)
+        } else {
+            let body = resp.text().await.unwrap_or_default();
+            Err(ClientError::Refused(format!(
+                "tenant-secret rm refused ({status}): {}",
                 body.trim()
             )))
         }
