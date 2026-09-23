@@ -245,6 +245,28 @@ async fn migrate_substrate_libsql_parity_on_a_real_embedded_file() {
         SubstrateStepOutcome::Failed(_)
     ));
 
+    // --- comment-nesting evasion is REFUSED (task #490 re-review — it is NOT "fail-safe") ---
+    // sqlparser's `SQLiteDialect` NESTS `/* … */`, but real SQLite does NOT (first `*/` closes), so
+    // `/* a /* b */ <kw> -- */` is a VALID statement the engine EXECUTES (the trailing `-- */` is a
+    // line comment, NOT a dangling `*/`) — verified live that a `CREATE TABLE` after such a comment
+    // runs. So it is the SAME critical evasion as MySQL. The guard now strips comments NON-nesting, so
+    // the hidden `COMMIT` is flagged and the whole step is refused BEFORE anything runs — `victim`
+    // never gets created. (Mutation: revert the SQLite non-nesting strip and this leaks `victim`.)
+    let hidden_commit = sql_step(
+        "0004_nestcomment",
+        "CREATE TABLE victim (x integer); /* a /* b */ COMMIT -- */",
+    );
+    match apply(&sub, &hidden_commit, 3).await {
+        SubstrateStepOutcome::Failed(_) => {}
+        other => {
+            panic!("a nested-comment-hidden COMMIT must be REFUSED (txn control), got {other:?}")
+        }
+    }
+    assert!(
+        !table_exists(&path, "victim").await,
+        "a refused nested-comment step must never run its CREATE (the hidden COMMIT is flagged)"
+    );
+
     // --- owner-DDL seam (the migrate-ddl backing a function step): the guest NEVER holds a DB
     //     credential/handle — it calls exec/query and the HOST runs each statement (auto-commit) on
     //     the connection it owns. Guards fire host-side under the SQLite dialect. ---
@@ -275,6 +297,18 @@ async fn migrate_substrate_libsql_parity_on_a_real_embedded_file() {
             .await
             .unwrap_err(),
         MigrateDdlError::TxnControl
+    ));
+    // S4/S3 (task #490 re-review): SQLite is NON-nesting, so `/* a /* b */ <kw> -- */` EXECUTES on the
+    // real engine — the guard (now a non-nesting comment strip) must refuse it, same as MySQL.
+    assert!(matches!(
+        ddl.exec("/* a /* b */ COMMIT -- */").await.unwrap_err(),
+        MigrateDdlError::TxnControl
+    ));
+    assert!(matches!(
+        ddl.exec("/* a /* b */ DROP TABLE boatramp_migrations_schema_migrations -- */")
+            .await
+            .unwrap_err(),
+        MigrateDdlError::LedgerProtected
     ));
     // A plain host-mediated DDL runs (auto-commit), and a verification query reads it back.
     ddl.exec("CREATE TABLE IF NOT EXISTS owner_made (n integer)")

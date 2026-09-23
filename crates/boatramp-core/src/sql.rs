@@ -614,8 +614,21 @@ impl From<Dialect> for GuardDialect {
 ///
 /// The result contains **no comments**, so when [`significant_words_in`] hands it to sqlparser the
 /// nesting bug (evasion 2) can never fire; strings/backticks survive so quote-immunity is kept.
-/// Called ONLY on the MySQL guard path; Postgres/generic lexing is untouched.
-fn mysql_strip_comments_faithfully(script: &str) -> Option<String> {
+/// Called on the MySQL AND SQLite guard paths (both engines lex `/* */` NON-nesting, unlike
+/// sqlparser's MySqlDialect/SQLiteDialect); Postgres/generic lexing is untouched (real Postgres DOES
+/// nest, so sqlparser's nesting matches it). [`StripOpts`] selects the per-engine comment forms.
+#[derive(Clone, Copy)]
+struct StripOpts {
+    /// `/*! … */` (MySQL) / `/*M! … */` (MariaDB) executable comments — body exposed live. Off for
+    /// SQLite (a `/*!` there is just an ordinary comment the engine drops).
+    exec_comments: bool,
+    /// `#` line comment to EOL (MySQL). Off for SQLite (`#` is not a comment there).
+    hash_comments: bool,
+    /// `[ … ]` bracketed identifier (SQLite) — copied verbatim so a `/*` inside it is never a comment.
+    bracket_idents: bool,
+}
+
+fn strip_comments_faithfully(script: &str, opts: StripOpts) -> Option<String> {
     let b = script.as_bytes();
     let n = b.len();
     let mut out: Vec<u8> = Vec::with_capacity(n);
@@ -691,8 +704,24 @@ fn mysql_strip_comments_faithfully(script: &str) -> Option<String> {
                     i += 1;
                 }
             }
+            // SQLite `[ … ]` bracketed identifier: copy verbatim (a `/*` inside is not a comment).
+            b'[' if opts.bracket_idents => {
+                out.push(c);
+                i += 1;
+                loop {
+                    if i >= n {
+                        return None; // unterminated bracket identifier
+                    }
+                    out.push(b[i]);
+                    let closed = b[i] == b']';
+                    i += 1;
+                    if closed {
+                        break;
+                    }
+                }
+            }
             // `#` line comment to EOL → one separator space (keep the newline for the next line).
-            b'#' => {
+            b'#' if opts.hash_comments => {
                 out.push(b' ');
                 i += 1;
                 while i < n && b[i] != b'\n' {
@@ -720,9 +749,11 @@ fn mysql_strip_comments_faithfully(script: &str) -> Option<String> {
             // Block comment — ordinary vs executable.
             b'/' if i + 1 < n && b[i + 1] == b'*' => {
                 let after = i + 2;
-                let is_exec_mysql = after < n && b[after] == b'!';
-                let is_exec_maria =
-                    after + 1 < n && (b[after] == b'M' || b[after] == b'm') && b[after + 1] == b'!';
+                let is_exec_mysql = opts.exec_comments && after < n && b[after] == b'!';
+                let is_exec_maria = opts.exec_comments
+                    && after + 1 < n
+                    && (b[after] == b'M' || b[after] == b'm')
+                    && b[after + 1] == b'!';
                 if is_exec_mysql || is_exec_maria {
                     // Executable comment: blank the framing (+ version digits) and keep lexing the
                     // body in NORMAL mode until its matching top-level `*/` (handled by the `*/` arm
@@ -802,12 +833,37 @@ fn significant_words_in(script: &str, dialect: GuardDialect) -> Option<Vec<Strin
             // text, ordinary/line comments removed non-nesting, strings/backticks preserved) and hand
             // sqlparser a comment-free string where neither divergence can occur. Fails **closed**
             // (`None` → guards refuse) on any unterminated string/identifier/comment.
-            let stripped = mysql_strip_comments_faithfully(script)?;
+            let stripped = strip_comments_faithfully(
+                script,
+                StripOpts {
+                    exec_comments: true,
+                    hash_comments: true,
+                    bracket_idents: false,
+                },
+            )?;
             Tokenizer::new(&MySqlDialect {}, &stripped)
                 .tokenize()
                 .ok()?
         }
-        GuardDialect::Sqlite => Tokenizer::new(&SQLiteDialect {}, script).tokenize().ok()?,
+        GuardDialect::Sqlite => {
+            // SQLite lexes `/* … */` NON-nesting (first `*/` closes), but sqlparser's SQLiteDialect
+            // NESTS — so `/* a /* b */ COMMIT -- */` hides a live keyword from the tokenizer while
+            // real SQLite executes it (verified live, task #490 re-review — the inverse of the safe
+            // Postgres case, which nests to match real Postgres). SQLite has NO executable comments
+            // and no `#` comments, but DOES have `[ … ]` bracket identifiers. So strip comments
+            // faithfully (non-nesting) first, then tokenize the comment-free text.
+            let stripped = strip_comments_faithfully(
+                script,
+                StripOpts {
+                    exec_comments: false,
+                    hash_comments: false,
+                    bracket_idents: true,
+                },
+            )?;
+            Tokenizer::new(&SQLiteDialect {}, &stripped)
+                .tokenize()
+                .ok()?
+        }
         GuardDialect::Postgres => Tokenizer::new(&GenericDialect {}, script).tokenize().ok()?,
     };
     Some(
@@ -1154,7 +1210,20 @@ mod migration_guard_tests {
     /// comment is still lexed and a benign script is left semantically intact.
     #[test]
     fn mysql_faithful_strip_exposes_and_preserves() {
-        use super::{mysql_strip_comments_faithfully, script_has_txn_control_in, GuardDialect};
+        use super::{
+            script_has_txn_control_in, strip_comments_faithfully, GuardDialect, StripOpts,
+        };
+        // Thin alias so these MySQL-path assertions read as before the stripper was generalized.
+        fn mysql_strip_comments_faithfully(s: &str) -> Option<String> {
+            strip_comments_faithfully(
+                s,
+                StripOpts {
+                    exec_comments: true,
+                    hash_comments: true,
+                    bracket_idents: false,
+                },
+            )
+        }
         // The real statement survives; the executable-comment COMMIT is un-hidden and flagged.
         assert!(script_has_txn_control_in(
             "CREATE TABLE z(a int); /*! COMMIT */",
@@ -1317,6 +1386,55 @@ mod migration_guard_tests {
         // Plain SQLite DDL is not transaction control.
         assert!(!script_has_txn_control_in(
             "CREATE TABLE widget (id INTEGER PRIMARY KEY, name TEXT)",
+            GuardDialect::Sqlite,
+        ));
+    }
+
+    /// Comment-nesting divergence between the guard's lexer and the real SQLite engine (task #490
+    /// re-review — the earlier "fail-safe" reading was WRONG). sqlparser's `SQLiteDialect` **NESTS**
+    /// `/* … */`, but real SQLite does **not** (first `*/` closes). Crucially the hidden keyword form
+    /// `/* a /* b */ <kw> -- */` is a VALID statement real SQLite EXECUTES (the trailing `-- */` is a
+    /// line comment, NOT a dangling `*/`) — verified live: `CREATE TABLE` after such a comment ran.
+    /// So it is the SAME critical evasion as MySQL, and the guard must REFUSE it: the SQLite path now
+    /// strips comments NON-nesting first, so every one of these is flagged. (Postgres is left on the
+    /// nesting tokenizer because real Postgres DOES nest — there the same text hides the keyword from
+    /// BOTH, which is safe.)
+    #[test]
+    fn sqlite_nested_block_comment_bypass_is_refused() {
+        use super::{script_has_txn_control_in, script_references_word_in, GuardDialect};
+        for s in [
+            "/* a /* b */ COMMIT -- */", // executes on real SQLite — must refuse
+            "/* /* */ COMMIT -- */",     // executes on real SQLite — must refuse
+            "/* a /* b */ COMMIT",       // unbalanced — fail-closed anyway
+            "/* x */ COMMIT",            // plain comment then live COMMIT
+        ] {
+            assert!(
+                script_has_txn_control_in(s, GuardDialect::Sqlite),
+                "SQLite guard must refuse comment-hidden txn control: {s:?}"
+            );
+        }
+        assert!(script_references_word_in(
+            "/* a /* b */ DELETE FROM boatramp_migrations -- */",
+            "boatramp_migrations",
+            GuardDialect::Sqlite,
+        ));
+        // SQLite has NO executable comments: `/*! … */` is an ordinary comment the engine DROPS, so a
+        // `/*! COMMIT */` does not execute and is (correctly) NOT flagged — matching the engine.
+        assert!(!script_has_txn_control_in(
+            "/*! COMMIT */",
+            GuardDialect::Sqlite
+        ));
+        // `[ … ]` bracketed identifier is quote-immune (a ledger name in brackets is a real
+        // reference; a `/*` inside brackets is NOT a comment).
+        assert!(script_references_word_in(
+            "SELECT * FROM [boatramp_migrations]",
+            "boatramp_migrations",
+            GuardDialect::Sqlite,
+        ));
+        // …but the ledger name inside a string is not a reference (no false positive).
+        assert!(!script_references_word_in(
+            "INSERT INTO t(note) VALUES('boatramp_migrations here')",
+            "boatramp_migrations",
             GuardDialect::Sqlite,
         ));
     }
