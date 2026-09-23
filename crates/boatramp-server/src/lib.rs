@@ -47,8 +47,9 @@ pub(crate) use admin_api::{
     get_project_tenancy, get_site_config, invalidate_cache, list_aliases, list_compute,
     list_compute_volumes, list_deployments, list_sites, migrate_apply, migrate_baseline,
     migrate_dry_run, migrate_status, prune_delete, prune_report, put_blob, put_compute,
-    put_daemon_config, put_project_tenancy, put_site_config, remove_alias, rollback_daemon_config,
-    scrub_blobs, set_alias, sql_exec, sql_move, sql_ping, sql_query,
+    put_daemon_config, put_project_tenancy, put_site_config, remove_alias, repair_apply,
+    repair_dry_run, rollback_daemon_config, scrub_blobs, set_alias, sql_exec, sql_move, sql_ping,
+    sql_query,
 };
 #[cfg(feature = "handlers")]
 pub(crate) use admin_api::{
@@ -1428,6 +1429,12 @@ pub struct ServerOptions {
     /// steps. Backs the `Project·Admin`-gated `/api/migrate/{db}/{apply,dry-run,baseline,status}`;
     /// `None` ⇒ those routes return `501`. Wired by the node when a managed DB exists.
     pub migration_substrate: Option<Arc<dyn boatramp_core::sql::MigrationSubstrate>>,
+    /// Owner-gated provisioning **drift-repair** capability for managed databases: diffs a shared
+    /// tenant's actual provisioning against spec and converges the delta (owner-model retrofit —
+    /// create/seal the owner role, re-own the db + objects + ledger to it), idempotent +
+    /// data-preserving. Backs the `Project·Admin`-gated `/api/repair/{db}` + `/dry-run`; `None` ⇒
+    /// those routes return `501`. Wired by the node when a managed DB exists.
+    pub tenant_repair: Option<Arc<dyn boatramp_core::sql::TenantRepair>>,
     /// Tenant-deprovision capability: drops a deleted tenant's managed databases +
     /// roles + sealed credentials on project/site delete. `None` ⇒ delete does no
     /// managed-DB teardown. Wired by the node when a compute-backed managed database

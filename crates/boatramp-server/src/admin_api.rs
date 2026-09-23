@@ -1400,12 +1400,40 @@ fn migration_error_response(e: boatramp_core::sql::MigrationError) -> Response {
             format!("extension {name:?} is not on the operator trusted-extension allowlist\n"),
         )
             .into_response(),
-        E::Sql(inner) => (
+        E::Sql(inner) => {
+            let inner = inner.to_string();
+            (
+                StatusCode::BAD_REQUEST,
+                format!("migration failed: {inner}{}\n", repair_cure_hint(&inner)),
+            )
+                .into_response()
+        }
+        E::Other(m) => (
             StatusCode::BAD_REQUEST,
-            format!("migration failed: {inner}\n"),
+            format!("migration error: {m}{}\n", repair_cure_hint(&m)),
         )
             .into_response(),
-        E::Other(m) => (StatusCode::BAD_REQUEST, format!("migration error: {m}\n")).into_response(),
+    }
+}
+
+/// A "the error carries its cure" hint (house style, per `EMPTY_DB_NAME_CURE`): a permission-denied
+/// migration failure on a Shared managed tenant is the classic pre-v0.4.25 owner-model drift — the
+/// db is owned by the runtime role, there is no owner role, so the owner-role migrate connection is
+/// denied. Point the operator straight at the fix (`boatramp project repair --db <name> --dry-run`).
+/// Returns a leading `; try: …` fragment when the message looks like a permission/ownership refusal,
+/// else empty (so a plain syntax error isn't cluttered).
+fn repair_cure_hint(msg: &str) -> String {
+    let lower = msg.to_ascii_lowercase();
+    let looks_like_permission = lower.contains("permission denied")
+        || lower.contains("must be owner")
+        || lower.contains("must be member")
+        || (lower.contains("owner") && lower.contains("denied"));
+    if looks_like_permission {
+        "; try: boatramp project repair --db <name> --dry-run \
+         (fixes provisioning so migrate can run; never touches schema or data)"
+            .to_string()
+    } else {
+        String::new()
     }
 }
 
@@ -1518,6 +1546,139 @@ pub(super) async fn migrate_status(
             .into_response(),
         Err(e) => migration_error_response(e),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Owner-gated provisioning drift-repair (`/api/repair/{db}` + `/api/repair/{db}/dry-run`)
+// ---------------------------------------------------------------------------
+//
+// Repair converges a shared managed tenant's provisioning against spec (the owner-model retrofit:
+// create/seal the owner role, re-own the db + objects + ledger to it) — idempotent, data-preserving.
+// `POST /api/repair/{db}` applies; `POST /api/repair/{db}/dry-run` reports only (the default posture
+// the CLI uses). BOTH are `Project·Admin`-gated (see `authz::Right::required`; NOT under `/api/sql/`,
+// whose catch-all a publisher satisfies), audited, and carry the `{db}` path through the same
+// `reject_invalid_db` 422 screen the sql/migrate routes use.
+
+/// The `501` a repair route returns when no managed database is configured (no repair capability).
+fn repair_unavailable() -> Response {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        "provisioning drift-repair is not available on this node (no managed database configured)\n",
+    )
+        .into_response()
+}
+
+/// Map a [`RepairError`](boatramp_core::sql::RepairError) to an HTTP response — reserving non-2xx for
+/// "couldn't produce a report at all"; a run that produced a report (even with errored checks) comes
+/// back `200`/`422` via [`repair_report_response`].
+fn repair_error_response(e: boatramp_core::sql::RepairError) -> Response {
+    use boatramp_core::sql::RepairError as E;
+    match e {
+        E::NotConfigured => repair_unavailable(),
+        E::Unavailable(m) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(axum::http::header::RETRY_AFTER, "1")],
+            format!("managed database not ready: {m}\n"),
+        )
+            .into_response(),
+        E::Other(m) => (StatusCode::BAD_REQUEST, format!("repair error: {m}\n")).into_response(),
+    }
+}
+
+/// Turn a [`RepairReport`](boatramp_core::sql::RepairReport) into a response: `200` when no check
+/// errored, `422` when one did (the structured report rides in the body either way, so a thin client
+/// can always parse the per-check verdicts AND branch on the status — mirrors
+/// [`migration_report_response`]).
+fn repair_report_response(report: boatramp_core::sql::RepairReport) -> Response {
+    let status = if report.any_error() {
+        StatusCode::UNPROCESSABLE_ENTITY
+    } else {
+        StatusCode::OK
+    };
+    (status, Json(report)).into_response()
+}
+
+/// Defense-in-depth (Backend §4 / Security HIGH-1): re-derive the right the authoritative table
+/// requires for THIS repair request and assert it is `Project·Admin` before running any privileged
+/// DDL. The auth middleware already enforced it; this is a second, independent check inside the
+/// handler so a future routing/table regression can't silently downgrade the gate. Reconstructs the
+/// canonical repair path from the resolved `ProjectContext` (default → the global form, else the
+/// project-scoped form), so it holds for both request shapes. Returns `Some(403)` if — against
+/// expectation — the required right is not Admin.
+fn assert_repair_is_admin(project: &str) -> Option<Response> {
+    use boatramp_core::authz::{Action, Right};
+    // A representative repair path for this project (the `{db}` segment is irrelevant to the arm).
+    let path = if project == boatramp_core::project::DEFAULT_PROJECT {
+        "/api/repair/_/dry-run".to_string()
+    } else {
+        format!("/api/projects/{project}/repair/_/dry-run")
+    };
+    match Right::required("POST", &path) {
+        Some(right) if right.action == Action::Admin => None,
+        _ => Some(
+            (
+                StatusCode::FORBIDDEN,
+                "provisioning repair requires Project·Admin\n",
+            )
+                .into_response(),
+        ),
+    }
+}
+
+/// Drive a repair `mode` over managed database `db` (shared body of the apply + dry-run handlers).
+async fn run_repair(
+    repair: Option<Arc<dyn boatramp_core::sql::TenantRepair>>,
+    project: &str,
+    db: &str,
+    mode: boatramp_core::sql::RepairMode,
+) -> Response {
+    if let Some(bad) = reject_invalid_db(db) {
+        return bad;
+    }
+    if let Some(forbidden) = assert_repair_is_admin(project) {
+        return forbidden;
+    }
+    let Some(repair) = repair else {
+        return repair_unavailable();
+    };
+    match repair.repair(project, db, mode).await {
+        Ok(report) => repair_report_response(report),
+        Err(e) => repair_error_response(e),
+    }
+}
+
+/// Converge managed database `db`'s provisioning against spec (`POST /api/repair/{db}`). The
+/// mutating verb — creates/seals the owner role, re-owns the db + objects + ledger. `Project·Admin`,
+/// audited. Never touches schema or data (only roles/ownership/grants/credentials/scaffolding).
+pub(super) async fn repair_apply(
+    Extension(project): Extension<ProjectContext>,
+    Extension(repair): Extension<Option<Arc<dyn boatramp_core::sql::TenantRepair>>>,
+    Path(db): Path<String>,
+) -> Response {
+    run_repair(
+        repair,
+        project.as_ref().as_str(),
+        &db,
+        boatramp_core::sql::RepairMode::Apply,
+    )
+    .await
+}
+
+/// Report the provisioning drift of managed database `db` WITHOUT converging anything
+/// (`POST /api/repair/{db}/dry-run`) — the default posture. Provably side-effect-free (read-only
+/// probes; no DDL, no KV write). `Project·Admin`.
+pub(super) async fn repair_dry_run(
+    Extension(project): Extension<ProjectContext>,
+    Extension(repair): Extension<Option<Arc<dyn boatramp_core::sql::TenantRepair>>>,
+    Path(db): Path<String>,
+) -> Response {
+    run_repair(
+        repair,
+        project.as_ref().as_str(),
+        &db,
+        boatramp_core::sql::RepairMode::DryRun,
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------

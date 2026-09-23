@@ -84,6 +84,7 @@ mod migrate;
 mod operator;
 mod project;
 mod project_migrate;
+mod project_repair;
 mod secrets;
 mod security;
 mod security_headers;

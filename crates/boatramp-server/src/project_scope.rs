@@ -56,6 +56,14 @@ pub const PROJECT_SCOPED_FAMILIES: &[&str] = &[
     // `ProjectContext`, and authz still sees the original project-qualified path and gates the
     // mutating verbs at `Project·Admin` (see `authz::Right::required`).
     "migrate",
+    // Owner-gated provisioning drift-repair to a project's managed database
+    // (`/api/projects/<proj>/repair/<db>` + `/dry-run`). Like `migrate` above, without this a
+    // non-default (Shared multi-tenant) project's per-tenant managed DB would be unreachable (the
+    // bare `/api/repair` form hardcodes the default project) — so an owner could never retrofit
+    // its own tenant's owner model, the headline use case. The repair handlers honor the injected
+    // `ProjectContext`, and authz still sees the original project-qualified path and gates BOTH
+    // verbs at `Project·Admin` (see `authz::Right::required`).
+    "repair",
     // The project's tenancy schema (`/api/projects/<proj>/tenancy`) — the per-table
     // tenant-key map the scope injector consults. Rewrites onto the global
     // `/api/tenancy` handler, tagged with the tenant, so `boatramp tenancy show/apply`
@@ -277,6 +285,16 @@ mod tests {
         let s = scope_of("/api/projects/acme/migrate/appdb/apply");
         assert_eq!(s.project, "acme");
         assert_eq!(s.rewrite.as_deref(), Some("/api/migrate/appdb/apply"));
+
+        // Owner-gated provisioning drift-repair to a project's managed DB rewrites onto the global
+        // `/api/repair/<db>` handler, tagged with the tenant — so a non-default (Shared multi-tenant)
+        // project can repair its OWN provisioning. Both the apply + dry-run forms rewrite.
+        let s = scope_of("/api/projects/acme/repair/appdb");
+        assert_eq!(s.project, "acme");
+        assert_eq!(s.rewrite.as_deref(), Some("/api/repair/appdb"));
+        let s = scope_of("/api/projects/acme/repair/appdb/dry-run");
+        assert_eq!(s.project, "acme");
+        assert_eq!(s.rewrite.as_deref(), Some("/api/repair/appdb/dry-run"));
     }
 
     #[test]

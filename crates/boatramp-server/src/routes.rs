@@ -49,6 +49,7 @@ pub fn router_with_fast(
     // (`_cap` suffix so they don't shadow the `sql_exec`/`compute_exec` handler fns.)
     let operator_sql_cap = options.operator_sql.clone();
     let migration_substrate_cap = options.migration_substrate.clone();
+    let tenant_repair_cap = options.tenant_repair.clone();
     let tenant_deprovisioner_cap = options.tenant_deprovisioner.clone();
     let compute_exec_cap = options.compute_exec.clone();
     let compute_volumes_cap = options.compute_volumes.clone();
@@ -328,7 +329,16 @@ pub fn router_with_fast(
         // `Project·Admin` (an owner assertion of applied-state), audited — matched by the `/apply`
         // POST prefix in `Right::required`.
         .route("/api/migrate/{db}/baseline", post(migrate_baseline))
-        .route("/api/migrate/{db}/status", get(migrate_status));
+        .route("/api/migrate/{db}/status", get(migrate_status))
+        // Owner-gated provisioning DRIFT-REPAIR (owner-model retrofit / reconcile): converge a
+        // shared managed tenant's provisioning against spec (create/seal the owner role, re-own the
+        // db + objects + ledger to it) — idempotent, data-preserving. Deliberately NOT under
+        // `/api/sql/` (whose catch-all resolves to `Project·Deploy`, which a ship-only publisher
+        // satisfies — an escalation); its own `/api/repair/*` prefix gates at `Project·Admin` for
+        // BOTH the apply and the dry-run (see `Right::required`). `POST /api/repair/{db}` = apply,
+        // `POST /api/repair/{db}/dry-run` = report-only (the default posture the CLI uses).
+        .route("/api/repair/{db}", post(repair_apply))
+        .route("/api/repair/{db}/dry-run", post(repair_dry_run));
     // OIDC → token exchange: validate the IdP JWT (presented as
     // the Bearer; `Right::required` returns None so the auth middleware lets it
     // through) and mint a short-TTL token. Only with the `oidc` feature.
@@ -540,6 +550,7 @@ pub fn router_with_fast(
         .layer(Extension(probe))
         .layer(Extension(operator_sql_cap))
         .layer(Extension(migration_substrate_cap))
+        .layer(Extension(tenant_repair_cap))
         .layer(Extension(tenant_deprovisioner_cap))
         .layer(Extension(compute_exec_cap))
         .layer(Extension(compute_volumes_cap))

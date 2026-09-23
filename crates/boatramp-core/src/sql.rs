@@ -1781,6 +1781,183 @@ pub struct MigrationStatus {
     pub applied: Vec<AppliedMigration>,
 }
 
+// ---------------------------------------------------------------------------
+// Provisioning drift-repair (the owner-model retrofit / reconcile verb).
+// ---------------------------------------------------------------------------
+
+/// Whether a [`TenantRepair`] run only *reports* the drift it finds (`DryRun` — the
+/// default posture, provably side-effect-free: no DDL, no credential seal, no KV write)
+/// or *converges* it (`Apply` — the privileged, host-derived DDL runs). Repair defaults
+/// to `DryRun`, a deliberate divergence from the migrate surface, because it runs
+/// host-derived privileged provisioning DDL (role creation, `ALTER DATABASE OWNER`,
+/// `REASSIGN OWNED`), not an operator-authored, content-addressed step set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RepairMode {
+    /// Probe actual state, report the verdict + the DDL that WOULD run, change nothing.
+    DryRun,
+    /// Probe, then converge each drifted check's DDL, re-probe, report.
+    Apply,
+}
+
+impl RepairMode {
+    /// The stable string for the report header / audit line.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::DryRun => "dry-run",
+            Self::Apply => "apply",
+        }
+    }
+}
+
+/// The five-state verdict of one repair [check](RepairCheck).
+///
+/// - `Ok` — the probe found the check already satisfied; nothing to do.
+/// - `Drift` — the probe found the check unsatisfied; the `ddl`/detail describe what a
+///   converge WOULD do. Reported by a `DryRun` (or by `Apply` when the check is not
+///   itself convergeable — e.g. a terminal connectivity probe).
+/// - `Repaired` — an `Apply` found drift and converged it (the DDL ran, the re-probe passed).
+/// - `Error` — the check could not be resolved (a probe failed, a precondition — e.g. the
+///   maintenance identity is not superuser — is unmet, or the converge DDL failed). Fail-closed,
+///   per-check: the rest still run.
+/// - `Skipped` — the check does not apply to this topology/engine (with a `detail` reason),
+///   or a dependency check errored so this one could not be attempted safely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RepairStatus {
+    /// The probe found the check already satisfied.
+    Ok,
+    /// The probe found drift; the DDL/detail describe the converge (nothing ran — dry-run,
+    /// or a terminal report).
+    Drift,
+    /// An apply found drift and converged it (DDL ran, re-probe passed).
+    Repaired,
+    /// The check could not be resolved (probe failure / unmet precondition / converge failure).
+    Error,
+    /// The check does not apply here (topology/engine), or a dependency errored — see `detail`.
+    Skipped,
+}
+
+impl RepairStatus {
+    /// The stable slug for the report / audit line.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Drift => "drift",
+            Self::Repaired => "repaired",
+            Self::Error => "error",
+            Self::Skipped => "skipped",
+        }
+    }
+}
+
+/// One check in a [`RepairReport`] — a single provisioning invariant, its verdict, a
+/// human `detail`, and (when relevant) the converge `ddl` that ran or would run.
+///
+/// `ddl` is a parenthetical-free, greppable statement string tagged in the render by
+/// `check` (the stable slug). A credential-seal action carries `ddl = None` (it is a KV
+/// write, not SQL) — the `detail` says so, so the report never shows fake SQL.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RepairCheck {
+    /// The stable check slug (e.g. `owner-role-exists`, `db-owner`, `object-ownership`).
+    pub check: String,
+    /// The verdict.
+    pub status: RepairStatus,
+    /// A one-line, human-readable explanation (what the probe found / what converged / why skipped).
+    pub detail: String,
+    /// The converge DDL this check ran (`Apply`) or would run (`DryRun` on drift), if any. `None`
+    /// for a check with no SQL converge (an `ok`/`skipped` check, a terminal probe, or a
+    /// credential-seal, which is a KV write shown only in `detail`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ddl: Option<String>,
+}
+
+/// The outcome of a `repair` run over one managed tenant: the resolved tenant identity, the
+/// backend/topology class, the mode, and the per-check verdicts in a stable order. Distinct from
+/// [`MigrationReport`] (no id-buckets) — repair is a fixed set of provisioning invariants, not an
+/// operator step set; only the *conventions* (`#[serde(default)]` collections, structured failures,
+/// 200-vs-422) are shared.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RepairReport {
+    /// The resolved tenant identity the repair targeted (the derived database name, or the
+    /// tenant/binding descriptor for a skipped topology), for the audit trail + operator display.
+    pub tenant: String,
+    /// The backend/topology class this run applied to (e.g. `shared-postgres`, `single-postgres`,
+    /// `mysql`, `libsql`), so a `skipped` result is self-explaining.
+    pub backend: String,
+    /// The mode this run used (`dry-run` / `apply`).
+    pub mode: String,
+    /// The per-check verdicts, in the fixed check order.
+    #[serde(default)]
+    pub checks: Vec<RepairCheck>,
+}
+
+impl RepairReport {
+    /// Whether any check errored — the report-level "convergence was PARTIAL" / non-zero-exit signal.
+    /// (`Drift` on a dry-run is NOT an error; only an `Error` verdict is.)
+    pub fn any_error(&self) -> bool {
+        self.checks.iter().any(|c| c.status == RepairStatus::Error)
+    }
+
+    /// The slug of the first errored check, if any (for the CLI's `FAILED at [check]` summary).
+    pub fn first_error(&self) -> Option<&str> {
+        self.checks
+            .iter()
+            .find(|c| c.status == RepairStatus::Error)
+            .map(|c| c.check.as_str())
+    }
+
+    /// Whether the report found any drift at all — a dry-run with drift is a no-op the operator
+    /// should act on (used by the CLI's opt-in `--exit-nonzero-on-drift`). `Repaired` counts as
+    /// drift-was-found too (an apply that had to converge something).
+    pub fn found_drift(&self) -> bool {
+        self.checks
+            .iter()
+            .any(|c| matches!(c.status, RepairStatus::Drift | RepairStatus::Repaired))
+    }
+}
+
+/// Drive an owner-gated, idempotent, **data-preserving** provisioning drift-repair of a managed
+/// SQL tenant: diff its actual provisioning against what a fresh provision of the same binding
+/// would produce and converge the delta (roles / ownership / grants / sealed credentials / ledger
+/// scaffolding — never a `DROP`/`TRUNCATE`/`DELETE`/`UPDATE` of tenant rows). The first drift class
+/// it subsumes is the pre-v0.4.25 owner-model retrofit (a db owned by the runtime role, no `_owner`
+/// role), so `project migrate` (which connects as the sealed owner role) can run.
+///
+/// Every db/role/owner name is derived DETERMINISTICALLY from `(project, db)` exactly as
+/// `tenant_provision` does — NEVER from operator input or a probe result. Backs the
+/// `Project·Admin`-gated `/api/repair/{db}` + `/dry-run`; `None` on the router ⇒ those routes
+/// return `501`. Wired by the node when a managed DB exists.
+#[async_trait]
+pub trait TenantRepair: Send + Sync {
+    /// Repair (or, in [`RepairMode::DryRun`], report) the provisioning of managed database `db`
+    /// in `project`. Returns the structured [`RepairReport`] even when drift is found; an `Err`
+    /// is reserved for a failure that prevented the run from producing a report at all (e.g. the
+    /// binding is unknown, or the managed backend could not be reached).
+    async fn repair(
+        &self,
+        project: &str,
+        db: &str,
+        mode: RepairMode,
+    ) -> Result<RepairReport, RepairError>;
+}
+
+/// Why a [`TenantRepair::repair`] run could not produce a report at all (distinct from a per-check
+/// `Error` verdict, which IS reported). Mirrors [`MigrationError`]'s status split: `NotConfigured`
+/// ⇒ `501`, `Unavailable` ⇒ a retryable `503`, `Other` ⇒ `400`.
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum RepairError {
+    /// No managed SQL binding named `db` (or no managed SQL at all) — nothing to repair.
+    #[error("no managed database to repair")]
+    NotConfigured,
+    /// The managed backend is still starting / has no healthy replica — retryable.
+    #[error("managed database not ready: {0}")]
+    Unavailable(String),
+    /// Any other failure that prevented the run (a connect/auth failure the repair can't resolve).
+    #[error("{0}")]
+    Other(String),
+}
+
 /// A failure from a migration apply/dry-run/baseline.
 #[derive(Debug, thiserror::Error)]
 pub enum MigrationError {
