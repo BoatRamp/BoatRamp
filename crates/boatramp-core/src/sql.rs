@@ -577,88 +577,190 @@ impl From<Dialect> for GuardDialect {
     }
 }
 
-/// Whether `s` contains a MySQL **executable-comment** marker `/*!` (case-insensitive; the version
-/// number `/*!40000` is a superset, still opened by `/*!`). MySQL executes the body of such a comment
-/// while a generic/MySQL block-comment lexer drops it — a guard-evasion vector on MySQL (Security
-/// review CRITICAL-1).
+/// Strip MySQL/MariaDB comments **faithfully to how the server itself lexes them**, so the guard's
+/// word scan sees exactly the tokens the server will EXECUTE. This replaces the earlier
+/// context-blind `neutralize_mysql_executable_comments` + raw-byte belt (Security review CRITICAL-1
+/// **re-review**, task #489). Those closed the reported `/*! COMMIT */` string but left two more
+/// evasions, both verified live (guard PASS + a real statement executed via `sqlx::raw_sql`, which
+/// forwards comments to the server verbatim):
+///   1. `/* /*! */ <kw> -- */` — the old neutralizer treated a `/*!` occurring INSIDE an ordinary
+///      `/* … */` comment as an executable-comment opener and consumed that ordinary comment's own
+///      `*/`, un-closing it so the guard's lexer swallowed the following LIVE statement while MySQL
+///      ran it.
+///   2. `/* a /* b */ <kw> -- */` — no `/*!` at all: **sqlparser's MySqlDialect NESTS `/* … */`
+///      block comments, but MySQL/MariaDB do NOT** (the first `*/` closes), so a nested-looking
+///      comment hid a live keyword from the tokenizer while the server executed it.
 ///
-/// Used as the **belt** in [`significant_words_in`]'s MySQL path: after
-/// [`neutralize_mysql_executable_comments`] rewrites every executable-comment framing to spaces, this
-/// re-scans the neutralized text and, if ANY marker survived (a neutralization bug), fails the whole
-/// tokenization **closed** so the hidden body can never be dropped-then-executed. On correctly
-/// neutralized SQL no `/*!` remains, so it never misfires. Scoped to the MySQL guard path — Postgres
-/// treats `/*! */` as inert.
-fn mysql_has_executable_comment(s: &str) -> bool {
-    let script = s;
-    let bytes = script.as_bytes();
+/// One MySQL-faithful lexical pass:
+///   - `'…'` / `"…"` strings and `` `…` `` quoted identifiers are copied **verbatim** (so a `/*`
+///     inside a string is never mistaken for a comment, and the tokenizer still sees the string /
+///     identifier for quote-immunity), honoring `\`-escapes (default `sql_mode`) and doubled-quote
+///     escapes; an unterminated one returns `None` (→ guards fail closed).
+///   - `-- ` (dash-dash then whitespace/EOL) and `#` line comments run to end-of-line and collapse
+///     to a single space — a **token separator**, so `create/**/extension` stays two words.
+///   - ordinary `/* … */` block comments are **non-nesting** (first `*/` closes, matching the
+///     server) and collapse to a single space.
+///   - `/*! … */` (MySQL) and `/*M! … */` (MariaDB) **executable** comments have their framing (and
+///     any `/*!NNNNN` / `/*M!NNNNNN` version digits) blanked and their body copied **verbatim as
+///     live text**, so a `COMMIT` / ledger write / `CREATE EXTENSION` hidden in one is scanned and
+///     classified rather than dropped.
+///
+/// The result contains **no comments**, so when [`significant_words_in`] hands it to sqlparser the
+/// nesting bug (evasion 2) can never fire; strings/backticks survive so quote-immunity is kept.
+/// Called ONLY on the MySQL guard path; Postgres/generic lexing is untouched.
+fn mysql_strip_comments_faithfully(script: &str) -> Option<String> {
+    let b = script.as_bytes();
+    let n = b.len();
+    let mut out: Vec<u8> = Vec::with_capacity(n);
     let mut i = 0;
-    while i + 2 < bytes.len() {
-        if bytes[i] == b'/' && bytes[i + 1] == b'*' && bytes[i + 2] == b'!' {
-            return true;
-        }
-        i += 1;
-    }
-    false
-}
-
-/// Neutralize MySQL **executable-comment** framing so its body lexes as LIVE tokens under the MySQL
-/// lexer (Security review CRITICAL-1). For every `/*!` (optionally followed by a run of digits — the
-/// `/*!NNNNN` version gate) the opening marker + digits are rewritten to spaces, and the matching
-/// closing `*/` is rewritten to spaces, so `/*! COMMIT */` becomes `      COMMIT   ` — which the
-/// normal word scan then flags as transaction control. Nested block comments are not a MySQL thing
-/// (MySQL does not nest `/* */`), so a simple first-`*/`-after-the-marker match is faithful to how
-/// MySQL bounds the comment. Returns `None` (→ guards fail closed) if a marker has no closing `*/`,
-/// so a truncated/unbalanced executable comment can never be silently accepted.
-///
-/// Only the executable form (`/*!`) is touched: ordinary `/* … */` block comments and every other
-/// construct pass through unchanged, so the historical behavior for a plain comment is preserved and
-/// only the MySQL-executed body is un-hidden. Called ONLY on the MySQL guard path; Postgres treats
-/// `/*! */` as an inert comment and its lexing is left byte-for-byte unchanged.
-fn neutralize_mysql_executable_comments(script: &str) -> Option<String> {
-    // All framing bytes we split on (`/`, `*`, `!`, ASCII digits) are single-byte and can never be
-    // a continuation byte of a multi-byte UTF-8 sequence, so byte indices are always char
-    // boundaries here — we copy the untouched regions as `&str` slices to keep non-ASCII content
-    // (identifiers/string bodies) intact.
-    let bytes = script.as_bytes();
-    let mut out = String::with_capacity(script.len());
-    let mut i = 0; // scan cursor
-    let mut copied = 0; // next byte not yet flushed to `out`
-    while i + 2 < bytes.len() {
-        if bytes[i] == b'/' && bytes[i + 1] == b'*' && bytes[i + 2] == b'!' {
-            // Flush the verbatim run before the marker.
-            out.push_str(&script[copied..i]);
-            // Blank the `/*!`.
-            out.push_str("   ");
-            i += 3;
-            // Blank any `/*!NNNNN` version-gate digits so `/*!40000 COMMIT */` → `COMMIT`.
-            while i < bytes.len() && bytes[i].is_ascii_digit() {
-                out.push(' ');
+    // How many executable comments (`/*!` / `/*M!`) are currently open. Their bodies lex as NORMAL
+    // SQL (so inner ordinary `/* */` comments, strings and line comments are consumed while we look
+    // for the top-level `*/` that closes the executable comment) — matching the server, which
+    // executes a `/*! /* */ COMMIT */` (the inner `/* */` is a nested comment, the exec closes at the
+    // LAST `*/`). Verified live: a first-literal-`*/` scan wrongly kept `COMMIT` hidden here.
+    let mut exec_depth: u32 = 0;
+    while i < n {
+        let c = b[i];
+        match c {
+            // String literals: copy verbatim, honoring `\` escapes and doubled-quote escapes. A `*/`
+            // inside a string is string content (not an exec close), exactly as the server lexes an
+            // exec body.
+            b'\'' | b'"' => {
+                let quote = c;
+                out.push(c);
+                i += 1;
+                loop {
+                    if i >= n {
+                        return None; // unterminated string
+                    }
+                    let d = b[i];
+                    if d == b'\\' {
+                        out.push(d);
+                        i += 1;
+                        if i >= n {
+                            return None; // trailing backslash — unterminated
+                        }
+                        out.push(b[i]);
+                        i += 1;
+                        continue;
+                    }
+                    if d == quote {
+                        // Doubled quote inside the string is an escaped quote, not the end.
+                        if i + 1 < n && b[i + 1] == quote {
+                            out.push(quote);
+                            out.push(quote);
+                            i += 2;
+                            continue;
+                        }
+                        out.push(quote);
+                        i += 1;
+                        break; // string closed
+                    }
+                    out.push(d);
+                    i += 1;
+                }
+            }
+            // Backtick-quoted identifier: copy verbatim, doubled backtick escapes.
+            b'`' => {
+                out.push(c);
+                i += 1;
+                loop {
+                    if i >= n {
+                        return None; // unterminated identifier
+                    }
+                    let d = b[i];
+                    if d == b'`' {
+                        if i + 1 < n && b[i + 1] == b'`' {
+                            out.push(b'`');
+                            out.push(b'`');
+                            i += 2;
+                            continue;
+                        }
+                        out.push(b'`');
+                        i += 1;
+                        break;
+                    }
+                    out.push(d);
+                    i += 1;
+                }
+            }
+            // `#` line comment to EOL → one separator space (keep the newline for the next line).
+            b'#' => {
+                out.push(b' ');
+                i += 1;
+                while i < n && b[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            // `-- ` line comment: MySQL requires whitespace/EOL after the double dash.
+            b'-' if i + 1 < n
+                && b[i + 1] == b'-'
+                && (i + 2 >= n || b[i + 2].is_ascii_whitespace()) =>
+            {
+                out.push(b' ');
+                i += 2;
+                while i < n && b[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            // A top-level `*/` while an executable comment is open closes it (its body was emitted
+            // live). A bare `*/` in normal SQL (`exec_depth == 0`) is not special — fall through.
+            b'*' if i + 1 < n && b[i + 1] == b'/' && exec_depth > 0 => {
+                out.extend_from_slice(b"  ");
+                exec_depth -= 1;
+                i += 2;
+            }
+            // Block comment — ordinary vs executable.
+            b'/' if i + 1 < n && b[i + 1] == b'*' => {
+                let after = i + 2;
+                let is_exec_mysql = after < n && b[after] == b'!';
+                let is_exec_maria =
+                    after + 1 < n && (b[after] == b'M' || b[after] == b'm') && b[after + 1] == b'!';
+                if is_exec_mysql || is_exec_maria {
+                    // Executable comment: blank the framing (+ version digits) and keep lexing the
+                    // body in NORMAL mode until its matching top-level `*/` (handled by the `*/` arm
+                    // above). The body's live tokens are therefore scanned + classified.
+                    let mut j = if is_exec_mysql {
+                        out.extend_from_slice(b"   "); // blank `/*!`
+                        after + 1
+                    } else {
+                        out.extend_from_slice(b"    "); // blank `/*M!`
+                        after + 2
+                    };
+                    while j < n && b[j].is_ascii_digit() {
+                        out.push(b' ');
+                        j += 1;
+                    }
+                    exec_depth += 1;
+                    i = j;
+                } else {
+                    // Ordinary block comment, NON-NESTING: first `*/` closes → one separator space.
+                    // (Applies inside an exec body too — the server treats it as a nested comment.)
+                    let mut k = i + 2;
+                    loop {
+                        if k + 1 >= n {
+                            return None; // unterminated block comment
+                        }
+                        if b[k] == b'*' && b[k + 1] == b'/' {
+                            break;
+                        }
+                        k += 1;
+                    }
+                    out.push(b' ');
+                    i = k + 2;
+                }
+            }
+            _ => {
+                out.push(c);
                 i += 1;
             }
-            // Find the matching `*/`; MySQL does not nest block comments so the first one bounds it.
-            let body_start = i;
-            loop {
-                if i + 1 >= bytes.len() {
-                    // Unterminated executable comment — fail closed.
-                    return None;
-                }
-                if bytes[i] == b'*' && bytes[i + 1] == b'/' {
-                    break;
-                }
-                i += 1;
-            }
-            // Copy the inner body verbatim (its own tokens are now live), then blank the `*/`.
-            out.push_str(&script[body_start..i]);
-            out.push_str("  ");
-            i += 2;
-            copied = i;
-            continue;
         }
-        i += 1;
     }
-    // Flush the tail (including any trailing bytes past the scan window that held no marker).
-    out.push_str(&script[copied..]);
-    Some(out)
+    if exec_depth != 0 {
+        return None; // unterminated executable comment — fail closed
+    }
+    // `out` is only original bytes or ASCII spaces, so it is valid UTF-8 whenever `script` was.
+    String::from_utf8(out).ok()
 }
 
 /// Tokenize `script` under `dialect` into its significant **word** tokens (lowercased), dropping
@@ -681,29 +783,20 @@ fn significant_words_in(script: &str, dialect: GuardDialect) -> Option<Vec<Strin
     // behavior byte-for-byte.
     let raw = match dialect {
         GuardDialect::Mysql => {
-            // MySQL's `/*! … */` (and version-gated `/*!NNNNN … */`) **executable comment** is a
-            // MySQL-only special form: MySQL EXECUTES the body, but sqlparser's MySQL tokenizer
-            // (0.53) treats it as an ordinary block comment and DROPS the body — so `/*! COMMIT */`,
-            // `/*! DELETE FROM boatramp_migrations… */`, `/*! CREATE EXTENSION x */` would lex to
-            // NOTHING and slip past every word-scan guard (S3/S4/extension). Neutralize the framing
-            // (rewrite the opening `/*!`+digits and the matching `*/` to spaces) so the inner text
-            // lexes as LIVE tokens and the normal scans catch it — WITH the correct classification
-            // (a `/*! COMMIT */` is seen as transaction control, a `/*! DELETE … boatramp_migrations
-            // … */` as a ledger reference), which a blanket byte-scan refusal could not give.
-            // Postgres treats `/*! */` as an inert comment, so this only applies to the MySQL lexer
-            // path (Security review CRITICAL-1). Fails **closed** (`None` → guards refuse) if the
-            // framing can't be resolved to lexable inner text.
-            let neutralized = neutralize_mysql_executable_comments(script)?;
-            // Belt (defense-in-depth beside the neutralization braces): if ANY executable-comment
-            // marker survived neutralization (a neutralization bug / an edge case it failed to
-            // rewrite), the MySQL lexer below would drop that body as a comment and the hidden
-            // construct would escape — so fail **closed** instead. On correctly-neutralized input
-            // no `/*!` remains, so this never misfires on legitimate SQL and never changes the
-            // classification of a comment we DID neutralize.
-            if mysql_has_executable_comment(&neutralized) {
-                return None;
-            }
-            Tokenizer::new(&MySqlDialect {}, &neutralized)
+            // MySQL/MariaDB comment semantics diverge from sqlparser's MySqlDialect in two ways that
+            // are guard-evasion vectors (Security review CRITICAL-1 + re-review, task #489):
+            //   - `/*! … */` (MySQL) / `/*M! … */` (MariaDB) **executable comments** are EXECUTED by
+            //     the server but DROPPED as ordinary comments by sqlparser — so a `COMMIT` / ledger
+            //     write / `CREATE EXTENSION` hidden in one would lex to nothing.
+            //   - sqlparser **nests** `/* … */`; the server does **not** (first `*/` closes) — so a
+            //     `/* a /* b */ <kw> -- */` hides a live keyword from sqlparser while the server runs
+            //     it.
+            // So we do our OWN MySQL-faithful comment strip first (executable bodies exposed as live
+            // text, ordinary/line comments removed non-nesting, strings/backticks preserved) and hand
+            // sqlparser a comment-free string where neither divergence can occur. Fails **closed**
+            // (`None` → guards refuse) on any unterminated string/identifier/comment.
+            let stripped = mysql_strip_comments_faithfully(script)?;
+            Tokenizer::new(&MySqlDialect {}, &stripped)
                 .tokenize()
                 .ok()?
         }
@@ -1048,55 +1141,131 @@ mod migration_guard_tests {
         ));
     }
 
-    /// The neutralization does not corrupt a script that merely CONTAINS the marker characters in a
-    /// place MySQL would still execute around it: a real statement before a `/*! … */` executable
-    /// comment is still lexed (`CREATE TABLE z(a int)` here is followed by the neutralized `COMMIT`),
-    /// and a genuinely benign MySQL script with no executable comment is unaffected.
+    /// The MySQL-faithful strip exposes executable-comment bodies as live text, removes ordinary/line
+    /// comments (non-nesting), and preserves strings/identifiers — so a real statement around a
+    /// comment is still lexed and a benign script is left semantically intact.
     #[test]
-    fn mysql_neutralization_preserves_surrounding_statements() {
-        use super::{
-            neutralize_mysql_executable_comments, script_has_txn_control_in, GuardDialect,
-        };
+    fn mysql_faithful_strip_exposes_and_preserves() {
+        use super::{mysql_strip_comments_faithfully, script_has_txn_control_in, GuardDialect};
         // The real statement survives; the executable-comment COMMIT is un-hidden and flagged.
         assert!(script_has_txn_control_in(
             "CREATE TABLE z(a int); /*! COMMIT */",
             GuardDialect::Mysql
         ));
-        // A plain MySQL script with no `/*!` is unchanged by the neutralizer.
+        // A plain MySQL script with no comment is byte-for-byte unchanged (backtick ident preserved).
         assert_eq!(
-            neutralize_mysql_executable_comments("CREATE TABLE `t` (id int)").unwrap(),
+            mysql_strip_comments_faithfully("CREATE TABLE `t` (id int)").unwrap(),
             "CREATE TABLE `t` (id int)"
         );
         // An unterminated executable comment fails closed (None → guards refuse).
-        assert!(neutralize_mysql_executable_comments("/*! COMMIT").is_none());
+        assert!(mysql_strip_comments_faithfully("/*! COMMIT").is_none());
         assert!(script_has_txn_control_in("/*! COMMIT", GuardDialect::Mysql));
-        // Non-ASCII content around a neutralized comment is preserved intact (UTF-8 safety); only
-        // the `/*!` opener (→3 spaces) and the `*/` closer (→2 spaces) are blanked, the body `x`
-        // is copied through so it lexes live.
-        assert_eq!(
-            neutralize_mysql_executable_comments("SELECT 'café' /*! x */ , 'naïve'").unwrap(),
-            "SELECT 'café'     x    , 'naïve'"
-        );
-        // TWO executable comments in one script are both un-hidden (each `COMMIT` un-hidden).
+        // Non-ASCII content around a stripped comment is preserved intact (UTF-8 safety): the strings
+        // survive verbatim and the executable-comment body `x` is exposed live.
+        let s = mysql_strip_comments_faithfully("SELECT 'café' /*! x */ , 'naïve'").unwrap();
+        assert!(s.contains("'café'") && s.contains("'naïve'") && s.contains(" x "));
+        assert!(!s.contains("/*") && !s.contains("*/"));
+        // TWO executable comments in one script are both un-hidden (each keyword un-hidden).
         assert!(script_has_txn_control_in(
             "/*! SELECT 1 */ CREATE TABLE t(a int); /*!40000 ROLLBACK */",
             GuardDialect::Mysql
         ));
-        // An empty-bodied `/*!*/` and a version-only `/*!40000 */` neutralize to whitespace with no
-        // smuggled token (they lex to nothing, not to a dropped-then-executed body).
-        assert_eq!(
-            neutralize_mysql_executable_comments("SELECT 1 /*!*/").unwrap(),
-            "SELECT 1      "
-        );
+        // An empty-bodied `/*!*/` and a version-only `/*!40000 */` strip to whitespace with no
+        // smuggled token.
+        assert!(!script_has_txn_control_in(
+            "SELECT 1 /*!*/",
+            GuardDialect::Mysql
+        ));
         assert!(!script_has_txn_control_in(
             "SELECT 1 /*!40000 */",
             GuardDialect::Mysql
         ));
-        // A `*/` with no preceding `/*!` opener is left alone (not an executable comment).
+        // Ordinary + line comments collapse to a single separator space (so adjacent tokens stay
+        // separate — `create/**/extension` remains two words).
+        assert_eq!(mysql_strip_comments_faithfully("a/* c */b").unwrap(), "a b");
         assert_eq!(
-            neutralize_mysql_executable_comments("SELECT 1 -- */").unwrap(),
-            "SELECT 1 -- */"
+            mysql_strip_comments_faithfully("SELECT 1 -- x\nSELECT 2").unwrap(),
+            "SELECT 1  \nSELECT 2"
         );
+    }
+
+    /// Security review CRITICAL-1 **re-review** (task #489): two more evasions the first fix
+    /// (`2bee40f`) missed, both verified live (guard PASS + a real statement executed via
+    /// `sqlx::raw_sql`). Each MUST now be REFUSED by every guard under the MySQL dialect. These are
+    /// the mutation gate — reverting the faithful strip re-opens them.
+    #[test]
+    fn mysql_comment_confusion_bypasses_are_refused() {
+        use super::{
+            script_has_create_extension_in, script_has_txn_control_in, script_references_word_in,
+            GuardDialect,
+        };
+        // (1) A `/*!` INSIDE an ordinary `/* … */` comment must NOT let the ordinary comment's `*/`
+        //     be consumed and the following live keyword swallowed.
+        for s in [
+            "/* /*! */ COMMIT -- */",
+            "/* /*! */ COMMIT /* x */",
+            "CREATE TABLE ok(a int); /* /*! */ COMMIT /* */",
+        ] {
+            assert!(
+                script_has_txn_control_in(s, GuardDialect::Mysql),
+                "must refuse comment-nested /*! txn evasion: {s:?}"
+            );
+        }
+        assert!(script_references_word_in(
+            "/* /*! */ DELETE FROM boatramp_migrations -- */",
+            "boatramp_migrations",
+            GuardDialect::Mysql,
+        ));
+        assert!(script_has_create_extension_in(
+            "/* /*! */ CREATE EXTENSION evil -- */",
+            GuardDialect::Mysql,
+        ));
+        // (2) sqlparser NESTS `/* */` but MySQL does not — a nested-looking comment must not hide a
+        //     live keyword. No `/*!` needed.
+        for s in [
+            "/* a /* b */ COMMIT -- */",
+            "/* /* */ COMMIT -- */",
+            "SELECT 1; /* x /* y */ COMMIT -- */",
+        ] {
+            assert!(
+                script_has_txn_control_in(s, GuardDialect::Mysql),
+                "must refuse nested-comment txn evasion: {s:?}"
+            );
+        }
+        assert!(script_references_word_in(
+            "/* a /* b */ INSERT INTO boatramp_migrations VALUES(1) -- */",
+            "boatramp_migrations",
+            GuardDialect::Mysql,
+        ));
+        // (3) An executable comment whose body contains an inner `/* */` (or is empty) does NOT
+        //     close at the first `*/`: the server lexes the body as normal SQL and closes at the
+        //     top-level `*/`, EXECUTING the keyword after the inner comment. Verified live (a real
+        //     CREATE TABLE ran). Must be flagged.
+        for s in [
+            "/*! /* */ COMMIT */",
+            "/*!/**/COMMIT*/",
+            "/*! /* nested */ DROP */ COMMIT */",
+        ] {
+            assert!(
+                script_has_txn_control_in(s, GuardDialect::Mysql),
+                "must refuse exec-comment body with inner comment: {s:?}"
+            );
+        }
+        // (4) MariaDB executable comment `/*M! … */` is also EXECUTED by the server — un-hide it.
+        assert!(script_has_txn_control_in(
+            "/*M! COMMIT */",
+            GuardDialect::Mysql
+        ));
+        assert!(script_has_txn_control_in(
+            "/*M!100000 ROLLBACK */",
+            GuardDialect::Mysql
+        ));
+        // Negative: a keyword genuinely inside a string is NOT flagged (no false positive), matching
+        // the server (adjacent-string splicing keeps it a literal).
+        assert!(!script_has_txn_control_in(
+            "INSERT INTO t(note) VALUES('/*! COMMIT */')",
+            GuardDialect::Mysql
+        ));
     }
 }
 
