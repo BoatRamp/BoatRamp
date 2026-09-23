@@ -199,7 +199,7 @@ derived-owner-only invariant.
 **Live gate must additionally prove:** seed a **superuser-owned SEQUENCE** and a **superuser-owned
 FUNCTION** (e.g. a trigger fn + an overloaded fn) in the pre-v0.4.25 tenant; after `repair --apply`
 their `relowner`/`proowner` == the owner role; and MUTATION-verify the gate FAILS if the
-`ALTER SEQUENCE`/`ALTER FUNCTION` arms are dropped (a table-only converge must leave them mis-owned).
+`ALTER SEQUENCE`/`ALTER FUNCTION` arms are dropped (a table-only converge must leave them wrongly owned).
 
 ## JOB 2 — a per-backend `RepairModel` for every backend
 
