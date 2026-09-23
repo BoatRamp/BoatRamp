@@ -276,7 +276,13 @@ fn targeted_reown_function_args_guard_fails_closed() {
         semi.is_err(),
         "a ';' in the function args must fail the object closed: {semi:?}"
     );
-    assert!(semi.unwrap_err().contains(';') || true);
+    // The guard must surface a non-empty reason naming the offending construct + the DDL it refuses
+    // to emit (not a bare empty error), so an operator can see WHY the reown was skipped.
+    let e = semi.unwrap_err();
+    assert!(
+        !e.is_empty() && e.contains("ALTER FUNCTION") && e.contains("statement separator"),
+        "the fail-closed error must name the refused DDL + the statement-separator reason: {e:?}"
+    );
 
     // An unbalanced single quote → skipped (Err).
     let squote = targeted_reown_ddl(&d, "public", "evil", "function", "text = 'x");

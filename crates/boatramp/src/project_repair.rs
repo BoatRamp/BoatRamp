@@ -71,9 +71,9 @@ fn validate_db(db: &str) -> Result<()> {
 /// Arguments for `boatramp project repair` — the flags sit directly on the verb (no nested
 /// subcommand), matching the spec `boatramp project repair --db <name> [--apply] [--json]`.
 ///
-/// Diffs a managed tenant's provisioning against spec and (with `--apply`) converges the delta —
-/// the owner-model retrofit that unblocks `project migrate`. DEFAULT is a dry-run (reports the drift
-/// + the DDL it would run, changes nothing). Fixes provisioning so migrate can run; NEVER touches
+/// Diffs a managed tenant's provisioning against spec and (with `--apply`) converges the delta — the
+/// owner-model retrofit that unblocks `project migrate`. DEFAULT is a dry-run (reports the drift and
+/// the DDL it would run, changing nothing). Fixes provisioning so migrate can run; NEVER touches
 /// schema or data. `Project·Admin`.
 #[derive(Debug, clap::Args)]
 pub struct RepairArgs {
@@ -146,7 +146,8 @@ fn render_report(report: &boatramp_core::sql::RepairReport, json: bool) -> Resul
     println!();
 
     // Per-check table: CHECK / STATUS / DETAIL.
-    println!("{:<24} {:<9} {}", "CHECK", "STATUS", "DETAIL");
+    let (h_check, h_status, h_detail) = ("CHECK", "STATUS", "DETAIL");
+    println!("{h_check:<24} {h_status:<9} {h_detail}");
     for c in &report.checks {
         println!("{:<24} {:<9} {}", c.check, c.status.as_str(), c.detail);
     }
