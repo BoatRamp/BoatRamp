@@ -1129,6 +1129,32 @@ impl HandlerRuntime {
         crate::handler_dispatch::admit_secret_refs(&site_handlers.secrets, allow_env_secret_refs)
             .map_err(|err| format!("handler secrets: {err}"))?;
 
+        // Per-guest secret allowlist (task #492): every name a handler/consumer declares in its
+        // `secrets` allowlist must be a KEY of the site `[handlers].secrets` pool. Validated here
+        // (not in the offline `DeployConfig::check_handlers`) because the pool lives in the
+        // site-scoped `HandlersSiteConfig`, which the deploy manifest can't see. An unknown name is a
+        // hard refusal that names the guest + the offending secret (typo/rot protection); a guest
+        // that declares any allowlist while the site pool is EMPTY is refused too (there is nothing
+        // to grant). An empty allowlist means "inject the whole pool" and is never checked.
+        for handler in &manifest.config.handlers {
+            crate::handler_dispatch::admit_secret_allowlist(
+                &site_handlers.secrets,
+                &handler.secrets,
+                &format!(
+                    "handler route {:?} [{}]",
+                    handler.route,
+                    handler.methods.join(",")
+                ),
+            )?;
+        }
+        for consumer in &manifest.config.consumers {
+            crate::handler_dispatch::admit_secret_allowlist(
+                &site_handlers.secrets,
+                &consumer.secrets,
+                &format!("consumer {:?}", consumer.topic),
+            )?;
+        }
+
         // Sync-timeout footgun: a handler/site timeout above the sync ceiling is
         // silently clamped for connection-bearing (sync HTTP) calls, so a legit
         // long call dies as a mysterious runtime 504. Warn loudly at deploy. The
@@ -2838,6 +2864,80 @@ mod tests {
         assert!(!gateway_addr_allowed(metadata, &loose));
     }
 
+    /// Task #492 per-guest secret allowlist at the REAL `resolve_env` choke point (the exact
+    /// function `build_bindings` calls). Two guests share one 2-entry site pool: guest A declares
+    /// an allowlist of one key, guest B declares none. Asserts A's resolved env carries ONLY its
+    /// granted secret (the other is ABSENT) while B carries both. Non-hollow: drop the filter and
+    /// A's resolved env would carry the ungranted secret, failing the `!any(... == "SECRET_B")`
+    /// assertion. This is the resolved-env layer that complements the end-to-end guest gate in
+    /// `conformance.rs::handler_secret_allowlist_scopes_the_site_pool_end_to_end`.
+    #[tokio::test]
+    async fn resolve_env_applies_the_per_guest_secret_allowlist() {
+        use boatramp_core::config::HandlersSiteConfig;
+
+        std::env::set_var("BOATRAMP_TEST_ALLOWLIST_A", "value-a");
+        std::env::set_var("BOATRAMP_TEST_ALLOWLIST_B", "value-b");
+
+        let deploy_env = std::collections::BTreeMap::new();
+        // One shared 2-entry pool for BOTH guests on the site.
+        let site_handlers = HandlersSiteConfig {
+            enabled: true,
+            secrets: std::collections::BTreeMap::from([
+                (
+                    "SECRET_A".to_string(),
+                    "env:BOATRAMP_TEST_ALLOWLIST_A".to_string(),
+                ),
+                (
+                    "SECRET_B".to_string(),
+                    "env:BOATRAMP_TEST_ALLOWLIST_B".to_string(),
+                ),
+            ]),
+            ..Default::default()
+        };
+
+        // Guest A: allowlist grants ONLY SECRET_A → SECRET_B must be filtered out.
+        let a = resolve_env(
+            "blog",
+            boatramp_core::project::ProjectRef::DEFAULT,
+            &deploy_env,
+            &site_handlers,
+            &["SECRET_A".to_string()],
+            true,
+            None,
+        )
+        .await
+        .expect("resolves");
+        assert!(
+            a.contains(&("SECRET_A".to_string(), "value-a".to_string())),
+            "granted secret is injected: {a:?}"
+        );
+        assert!(
+            !a.iter().any(|(k, _)| k == "SECRET_B"),
+            "an UNGRANTED secret must be absent (the load-bearing property): {a:?}"
+        );
+
+        // Guest B: no allowlist ⇒ the whole pool (today's default).
+        let b = resolve_env(
+            "blog",
+            boatramp_core::project::ProjectRef::DEFAULT,
+            &deploy_env,
+            &site_handlers,
+            &[],
+            true,
+            None,
+        )
+        .await
+        .expect("resolves");
+        assert!(b.contains(&("SECRET_A".to_string(), "value-a".to_string())));
+        assert!(
+            b.contains(&("SECRET_B".to_string(), "value-b".to_string())),
+            "no allowlist ⇒ the whole pool: {b:?}"
+        );
+
+        std::env::remove_var("BOATRAMP_TEST_ALLOWLIST_A");
+        std::env::remove_var("BOATRAMP_TEST_ALLOWLIST_B");
+    }
+
     #[tokio::test]
     async fn resolve_env_merges_static_and_host_secrets() {
         use boatramp_core::config::HandlersSiteConfig;
@@ -2875,6 +2975,8 @@ mod tests {
             boatramp_core::project::ProjectRef::DEFAULT,
             &deploy_env,
             &site_handlers,
+            // Empty allowlist ⇒ the whole site pool (the default, non-breaking behavior).
+            &[],
             true,
             None,
         )
@@ -2915,6 +3017,7 @@ mod tests {
             boatramp_core::project::ProjectRef::DEFAULT,
             &deploy_env,
             &bare,
+            &[],
             false,
             None,
         )
@@ -2947,6 +3050,7 @@ mod tests {
             boatramp_core::project::ProjectRef::DEFAULT,
             &deploy_env,
             &explicit,
+            &[],
             false,
             None,
         )
@@ -2967,6 +3071,7 @@ mod tests {
             boatramp_core::project::ProjectRef::DEFAULT,
             &deploy_env,
             &reserved,
+            &[],
             true,
             None,
         )
@@ -2990,6 +3095,7 @@ mod tests {
             boatramp_core::project::ProjectRef::DEFAULT,
             &deploy_env,
             &arbitrary,
+            &[],
             true,
             None,
         )
@@ -3723,6 +3829,7 @@ mod tests {
                 consumers: vec![ConsumerConfig {
                     tenancy: None,
                     token_claims: None,
+                    secrets: Vec::new(),
                     backoff_ms: None,
                     retention_ms: None,
                     stats_topics: Vec::new(),
@@ -3859,6 +3966,7 @@ mod tests {
                 consumers: vec![ConsumerConfig {
                     tenancy: None,
                     token_claims: None,
+                    secrets: Vec::new(),
                     backoff_ms: None,
                     retention_ms: None,
                     topic: "orders/created".into(),
@@ -5700,6 +5808,7 @@ mod tests {
                     streaming: false,
                     limits: None,
                     env: std::collections::BTreeMap::new(),
+                    secrets: Vec::new(),
                     invoke_targets: Vec::new(),
                     stats_topics: Vec::new(),
                 }],
@@ -5867,6 +5976,7 @@ mod tests {
                     streaming: false,
                     limits: None,
                     env: std::collections::BTreeMap::new(),
+                    secrets: Vec::new(),
                     invoke_targets: Vec::new(),
                     stats_topics: Vec::new(),
                 }],
@@ -6024,6 +6134,8 @@ mod tests {
                     env,
                     &[],
                     &[],
+                    // Per-guest secret allowlist (task #492): empty ⇒ the whole site pool.
+                    &[],
                     0,
                     None,
                     None,
@@ -6155,6 +6267,8 @@ mod tests {
                 &site,
                 &env,
                 &[],
+                &[],
+                // Per-guest secret allowlist (task #492): empty ⇒ the whole site pool.
                 &[],
                 0,
                 None,
@@ -6318,6 +6432,7 @@ mod tests {
             tenancy: Some(&tenancy),
             token_claims: None,
             stats_topics: &[],
+            secret_allowlist: &[],
         };
 
         // Force the resolved own-read scope onto a SELECT and run it on the real engine.

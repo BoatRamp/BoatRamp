@@ -905,6 +905,21 @@ jobs:
             || { echo "::error::messaging-stats gate did not run (silent skip or a failure)" >&2; exit 1; }
           grep -q 'MESSAGING-STATS TENANT-SCOPED OK' messaging-stats.log \
             || { echo "::error::messaging-stats gate never reached its marker (a tenant-scoping/cross-tenant-oracle regression)" >&2; exit 1; }
+      # v0.5.x: opt-in per-guest secret allowlist over the per-site `[handlers].secrets` pool. The
+      # pool is injected into a guest's env at one choke point (`resolve_env`); a guest that declares
+      # a `secrets` allowlist receives ONLY those keys, a non-declaring guest the whole pool (opt-in,
+      # non-breaking). This gate drives the REAL router→dispatch→build_bindings→engine path: handler
+      # A (with an allowlist) sees only its granted secret and NOT a sibling's, while a non-declaring
+      # handler sees both. A filter regression (cross-handler secret-pool leak) fails the merge.
+      - name: per-guest secret allowlist gate marker
+        run: |
+          set -eo pipefail
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-server \
+            --features handlers --test conformance handler_secret_allowlist_scopes_the_site_pool_end_to_end -- --nocapture 2>&1 | tee secret-allowlist.log
+          grep -qE 'test result: ok\. 1 passed' secret-allowlist.log \
+            || { echo "::error::secret-allowlist gate did not run (silent skip or a failure)" >&2; exit 1; }
+          grep -q 'SECRET ALLOWLIST SCOPED OK' secret-allowlist.log \
+            || { echo "::error::secret-allowlist gate never reached its marker (a cross-handler secret-pool leak regression)" >&2; exit 1; }
       # B10 (async-lane sharding): the whole async-lane shard gate battery — CAS claim race,
       # node-loss transition (double-owner ⇒ exactly one execution, no-owner ⇒ safety-net rescues,
       # never a stranding), lease-expiry reclaim, blob-watcher single-fire, cron single-fire, and the
