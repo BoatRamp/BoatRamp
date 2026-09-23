@@ -91,6 +91,12 @@ capability = ["engine", "dep:async-trait"]
 # session store + re-entry driver + serving live a layer up (boatramp-server); this gates the WIT
 # `session` interface + the guest-export/host-import binding. Off by default (experimental).
 session = ["engine", "dep:async-trait"]
+# The per-tenant sealed-secret binding (`boatramp:handlers/tenant-secrets`, task #493): a guest
+# reads/writes secrets sealed to THIS invocation's resolved tenant via a `boatramp_core`
+# `TenantSecretStore` (KV + the `[secrets]` envelope; the store itself is NOT handlers-gated so the
+# control-plane routes compile on a lean node). This gates only the WIT interface + host binding +
+# linker. Off by default; the server turns it on inside its `handlers` feature.
+tenant-secrets = ["engine", "dep:async-trait"]
 
 [dependencies]
 boatramp-core.workspace = true

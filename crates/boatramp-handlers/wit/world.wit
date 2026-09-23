@@ -478,6 +478,104 @@ world messaging-stats-host {
   import messaging-stats;
 }
 
+/// The per-tenant sealed-secret capability (`boatramp:handlers/tenant-secrets`, task #493): a
+/// granted guest reads/writes secrets **sealed to THIS invocation's resolved tenant** — the host
+/// keys every op `(project, resolved-tenant, name)`, sealing with the operator's `[secrets]`
+/// envelope. Deny-by-default: an ungranted component has no binding and every call returns
+/// `access-denied`.
+///
+/// # The tenant is HOST-supplied — you never pass it
+/// This interface has NO tenant parameter, only the secret `name`. The host substitutes THIS
+/// invocation's resolved tenant (the SAME own-`tenant` fact the SQL scope injector uses) — a guest
+/// can neither name, override, nor forge another tenant's secret. To USE the capability, DECLARE
+/// the import: grant `tenant-secrets:read` (for `get`/`list`) and/or `tenant-secrets:admin` (for
+/// `set`/`delete`) in the component's deploy `imports`; the two are INDEPENDENT rights, neither
+/// implied by deploy/publish, each re-checked per call. A per-component `tenant_secret_names`
+/// allowlist further restricts WHICH names are reachable (empty ⇒ deny-all).
+///
+/// # Footgun: an `all` / anonymous / unscoped handler ALWAYS gets `no-resolved-tenant`
+/// The host reads the OWN-`tenant` scope fact ONLY. A handler that runs with no single resolved
+/// tenant — an `all`-scoped admin route, an anonymous funnel, a `target`-only principal — has no
+/// tenant to confine to, so EVERY tenant-secrets call returns `no-resolved-tenant` (fail-closed,
+/// BEFORE any store access), never a project-wide or "first" tenant. Put the capability behind a
+/// per-tenant (`own`) route.
+///
+/// # Two DIFFERENT secret stores — do not confuse them
+/// - The project `boatramp:<name>` **env** store (`secrets` map, resolved into a component's env at
+///   instantiation) is per-PROJECT — one value per project, host-injected as an environment
+///   variable. Use it for a project-wide operator credential.
+/// - THIS runtime **tenant** store is per-`(project, tenant, name)`, read/written at point-of-use
+///   via these calls, with the plaintext transient in the guest — never in the guest's env. Use it
+///   for a per-tenant secret (e.g. each firm's OWN third-party OAuth `client_secret`).
+interface tenant-secrets-types {
+  /// Value-free metadata for one secret (`list`, and the `set` acknowledgement). Never carries the
+  /// sealed bytes — a value leaves the store only into the calling guest via `get`.
+  record secret-meta {
+    /// The secret name (the guest-supplied `name`; the resolved tenant is never echoed).
+    name: string,
+    /// First-set time, unix seconds (preserved across rotations).
+    created-at: u64,
+    /// Last-set time, unix seconds.
+    updated-at: u64,
+    /// Write counter — bumped on every `set`, so a rotation is observable without reading a value.
+    revision: u32,
+  }
+
+  /// Why a tenant-secret op was refused. NOTE there is deliberately NO `not-found`: an unconfigured
+  /// name is `get` ⇒ `ok(none)`, not an error — branch on the `option`, never on an error.
+  variant secret-error {
+    /// The `tenant-secrets` capability (the needed read/admin right) was not granted to this
+    /// component (deny-by-default), or the name is outside the component's `tenant_secret_names`
+    /// allowlist. Distinct from `no-resolved-tenant` so the two are not conflated.
+    access-denied,
+    /// This invocation has no single resolved tenant (an `all`/anonymous/unscoped handler), so
+    /// there is no tenant to confine to — every call fails closed here BEFORE any store access.
+    no-resolved-tenant,
+    /// No `[secrets]` key envelope is configured on the node, so there is no sealed store (mirrors
+    /// the control-plane `501`). The capability is structurally unavailable, not merely ungranted.
+    not-configured,
+    /// The secret `name` is not a valid key segment (empty, too long, or contains a disallowed
+    /// character). Carries a client-safe message about the request.
+    invalid-name(string),
+    /// The value exceeds the store's per-secret size cap (64 KiB). Carries a client-safe message.
+    value-too-large(string),
+    /// Any other host/backend error (KV / envelope failure); the detail is generic (internals are
+    /// logged host-side, never surfaced to the guest).
+    other(string),
+  }
+}
+
+/// The `tenant-secrets` capability: CRUD over secrets sealed to THIS invocation's resolved tenant.
+/// The guest supplies only the secret `name`; the host keys `(project, resolved-tenant, name)`.
+interface tenant-secrets {
+  use tenant-secrets-types.{secret-meta, secret-error};
+
+  /// Fetch + unseal the secret `name` for this invocation's resolved tenant. An UNCONFIGURED name
+  /// is `ok(none)` (NOT an error — branch on the option). `access-denied` without the read right or
+  /// if `name` is outside the allowlist; `no-resolved-tenant` for an unscoped invocation.
+  get: func(name: string) -> result<option<list<u8>>, secret-error>;
+
+  /// Seal `value` under the secret `name` for this invocation's resolved tenant, overwriting an
+  /// existing value (rotation). Returns the value-free `secret-meta`. Needs the admin right.
+  set: func(name: string, value: list<u8>) -> result<secret-meta, secret-error>;
+
+  /// Delete the secret `name` for this invocation's resolved tenant. Returns whether it existed.
+  /// Needs the admin right.
+  delete: func(name: string) -> result<bool, secret-error>;
+
+  /// Value-free metadata for every secret of THIS invocation's resolved tenant (names + metadata,
+  /// NEVER values), sorted by name. Needs the read right; enumerates only the resolved tenant's own
+  /// names (no cross-tenant name oracle). (`list` is a WIT keyword, so the function is escaped
+  /// `%list`; the guest imports it as `list`.)
+  %list: func() -> result<list<secret-meta>, secret-error>;
+}
+
+/// The per-tenant sealed-secret capability world (imported into request handlers / functions /
+/// consumers). A guest WIT addition ⇒ a shim rev + a `HOST_HANDLERS_VERSION` bump.
+world tenant-secrets-host {
+  import tenant-secrets;
+}
+
 /// Value types for the `invoke` capability: a small HTTP-shaped request/response
 /// so one function can call another the same way the platform invokes it from
 /// the outside (functions are `wasi:http` handlers, so the natural call shape is

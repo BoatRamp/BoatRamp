@@ -396,6 +396,8 @@ pub(super) async fn dispatch_handler(
         &handler.env,
         &handler.invoke_targets,
         &handler.stats_topics,
+        // Per-component tenant-secret name allowlist (task #493): empty ⇒ deny-all.
+        &handler.tenant_secret_names,
         // Per-guest secret allowlist (task #492): empty ⇒ the whole site pool, else only these keys.
         &handler.secrets,
         // A site handler is the entry point of a call chain (reached over HTTP), so it
@@ -1348,6 +1350,11 @@ pub(super) async fn build_bindings(
     // carry a literal `{tenant}` placeholder the host fills with this invocation's resolved tenant;
     // the guest can never name the tenant. Empty ⇒ no bus stats readable (deny-by-default).
     stats_topics: &[String],
+    // Per-component tenant-secret name allowlist (task #493): the secret names this component may
+    // address for its resolved tenant via `boatramp:handlers/tenant-secrets`. Empty ⇒ deny-all
+    // (least-privilege). Only consulted when a `tenant-secrets:*` right is granted + the substrate
+    // (a `[secrets]` envelope) is wired.
+    tenant_secret_names: &[String],
     // Per-guest secret allowlist (task #492): the subset of the site `[handlers].secrets` pool KEYS
     // this guest is granted. Empty ⇒ inject the whole pool (default, non-breaking); non-empty ⇒ inject
     // only the named keys (least-privilege). Filtered at the `resolve_env` choke point below.
@@ -1672,6 +1679,29 @@ pub(super) async fn build_bindings(
                 messaging.clone(),
                 stats_topics.to_vec(),
                 resolved_tenant,
+            );
+        }
+    }
+    // The per-tenant sealed-secret capability (task #493): read/write secrets sealed to THIS
+    // invocation's resolved OWN-tenant. Two INDEPENDENT rights — `tenant-secrets:read` (get/list)
+    // and `tenant-secrets:admin` (set/delete) — each separately granted (import ∩ site allowlist);
+    // the binding carries both flags so the host re-checks the right per call. The resolved tenant
+    // is `resolved_tenant_string` of the OWN-`Tenant` fact (the SAME value the SQL scope injector
+    // uses); `None` ⇒ every call is `no-resolved-tenant`. `tenant_secret_names` is the per-component
+    // name allowlist (empty ⇒ deny-all). Deny-by-default: without a `[secrets]` envelope (no store)
+    // OR without either right the binding is not built and every call fails closed. The guest never
+    // names a tenant — the host injects the resolved one.
+    if granted("tenant-secrets:read") || granted("tenant-secrets:admin") {
+        if let Some(store) = inner.tenant_secret_store.get() {
+            let resolved_tenant =
+                super::function_runtime::resolved_tenant_string(&handler_caller_tenant);
+            bindings = bindings.with_tenant_secrets(
+                store.clone(),
+                project.as_str(),
+                resolved_tenant,
+                tenant_secret_names.to_vec(),
+                granted("tenant-secrets:read"),
+                granted("tenant-secrets:admin"),
             );
         }
     }
@@ -2149,6 +2179,9 @@ pub(super) struct ConsumerRebuild<'a> {
     pub token_claims: Option<&'a boatramp_core::config::HandlerGraphqlTokenClaims>,
     /// The consumer's declared `bus:` stats-topic templates for the `messaging-stats` capability.
     pub stats_topics: &'a [String],
+    /// The consumer's per-component tenant-secret name allowlist (task #493). Empty ⇒ deny-all.
+    /// Threaded so a per-message rebuild scopes tenant secrets identically to the once-per-tick build.
+    pub tenant_secret_names: &'a [String],
     /// The consumer's per-guest secret allowlist (task #492): the subset of the site pool KEYS it is
     /// granted. Empty ⇒ the whole pool. Threaded so a per-message rebuild scopes secrets identically
     /// to the once-per-tick build.
@@ -2176,6 +2209,7 @@ impl ConsumerRebuild<'_> {
             &std::collections::BTreeMap::new(),
             &[],
             self.stats_topics,
+            self.tenant_secret_names,
             self.secret_allowlist,
             0,
             None,

@@ -1564,6 +1564,7 @@ async fn handler_route_dispatches_through_engine() {
             env: BTreeMap::new(),
             invoke_targets: Vec::new(),
             stats_topics: Vec::new(),
+            tenant_secret_names: Vec::new(),
         }],
         ..Default::default()
     };
@@ -1686,6 +1687,7 @@ async fn cookie_auth_csrf_gate_fires_in_the_pipeline() {
             env: BTreeMap::new(),
             invoke_targets: Vec::new(),
             stats_topics: Vec::new(),
+            tenant_secret_names: Vec::new(),
         }],
         ..Default::default()
     };
@@ -3265,6 +3267,7 @@ async fn activation_during_traffic_drops_no_requests() {
         env: BTreeMap::new(),
         invoke_targets: Vec::new(),
         stats_topics: Vec::new(),
+        tenant_secret_names: Vec::new(),
     };
     // Two distinct deployments serving the same handler. B adds a (non-matching)
     // redirect so its manifest hashes differently — a real `current` flip.
@@ -3430,6 +3433,7 @@ async fn preview_runs_handlers_scoped_off_live_state() {
                 env: BTreeMap::new(),
                 invoke_targets: Vec::new(),
                 stats_topics: Vec::new(),
+                tenant_secret_names: Vec::new(),
             }],
             ..Default::default()
         },
@@ -3557,6 +3561,7 @@ async fn activation_refuses_broken_component() {
                 env: BTreeMap::new(),
                 invoke_targets: Vec::new(),
                 stats_topics: Vec::new(),
+                tenant_secret_names: Vec::new(),
             }],
             ..Default::default()
         },
@@ -3665,6 +3670,7 @@ async fn activation_refuses_a_non_consumer_component() {
                 backoff_ms: None,
                 retention_ms: None,
                 stats_topics: Vec::new(),
+                tenant_secret_names: Vec::new(),
                 topic: "orders/created".to_string(),
                 component: "consumer.wasm".to_string(),
                 imports: Vec::new(),
@@ -3790,6 +3796,7 @@ async fn activation_refuses_disallowed_import() {
                 env: BTreeMap::new(),
                 invoke_targets: Vec::new(),
                 stats_topics: Vec::new(),
+                tenant_secret_names: Vec::new(),
             }],
             ..Default::default()
         },
@@ -3894,6 +3901,7 @@ async fn activation_refuses_oversized_component() {
                 env: BTreeMap::new(),
                 invoke_targets: Vec::new(),
                 stats_topics: Vec::new(),
+                tenant_secret_names: Vec::new(),
             }],
             ..Default::default()
         },
@@ -4001,6 +4009,7 @@ async fn handler_route_with_sql_dispatches_through_engine() {
                 env: BTreeMap::new(),
                 invoke_targets: Vec::new(),
                 stats_topics: Vec::new(),
+                tenant_secret_names: Vec::new(),
             }],
             ..Default::default()
         },
@@ -4133,6 +4142,7 @@ async fn handler_opens_named_sql_databases_with_least_privilege() {
                 env: BTreeMap::new(),
                 invoke_targets: Vec::new(),
                 stats_topics: Vec::new(),
+                tenant_secret_names: Vec::new(),
             }],
             ..Default::default()
         },
@@ -4261,6 +4271,7 @@ async fn per_site_timeout_cap_applies() {
                 env: BTreeMap::new(),
                 invoke_targets: Vec::new(),
                 stats_topics: Vec::new(),
+                tenant_secret_names: Vec::new(),
             }],
             ..Default::default()
         },
@@ -4774,6 +4785,7 @@ async fn operator_endpoint_reports_invocation_and_consumer_stats() {
                 env: BTreeMap::new(),
                 invoke_targets: Vec::new(),
                 stats_topics: Vec::new(),
+                tenant_secret_names: Vec::new(),
             }],
             consumers: vec![ConsumerConfig {
                 secrets: Vec::new(),
@@ -4782,6 +4794,7 @@ async fn operator_endpoint_reports_invocation_and_consumer_stats() {
                 backoff_ms: None,
                 retention_ms: None,
                 stats_topics: Vec::new(),
+                tenant_secret_names: Vec::new(),
                 topic: "orders/created".to_string(),
                 component: "consumer.wasm".to_string(),
                 imports: vec!["wasi:keyvalue".to_string()],
@@ -4928,6 +4941,7 @@ async fn guest_logs_captured_and_served() {
                 env: BTreeMap::new(),
                 invoke_targets: Vec::new(),
                 stats_topics: Vec::new(),
+                tenant_secret_names: Vec::new(),
             }],
             ..Default::default()
         },
@@ -5063,6 +5077,7 @@ async fn guest_logs_suppressed_when_capture_disabled() {
                 env: BTreeMap::new(),
                 invoke_targets: Vec::new(),
                 stats_topics: Vec::new(),
+                tenant_secret_names: Vec::new(),
             }],
             ..Default::default()
         },
@@ -5260,6 +5275,7 @@ async fn handler_env_injected_host_env_not_inherited() {
                 secrets: Vec::new(),
                 invoke_targets: Vec::new(),
                 stats_topics: Vec::new(),
+                tenant_secret_names: Vec::new(),
             }],
             ..Default::default()
         },
@@ -5386,6 +5402,7 @@ async fn handler_secret_allowlist_scopes_the_site_pool_end_to_end() {
                     secrets: allowlist,
                     invoke_targets: Vec::new(),
                     stats_topics: Vec::new(),
+                    tenant_secret_names: Vec::new(),
                 }],
                 ..Default::default()
             },
@@ -6929,6 +6946,7 @@ async fn mesh_dispatch(
                 env: BTreeMap::new(),
                 invoke_targets,
                 stats_topics: Vec::new(),
+                tenant_secret_names: Vec::new(),
             }],
             ..Default::default()
         },
@@ -7114,6 +7132,7 @@ async fn federation_gateway_stitches_real_subgraph_functions() {
                 env: BTreeMap::new(),
                 invoke_targets: Vec::new(),
                 stats_topics: Vec::new(),
+                tenant_secret_names: Vec::new(),
             }],
             ..Default::default()
         },
@@ -7254,6 +7273,7 @@ async fn federation_gateway_executes_a_mutation_forwarding_its_argument() {
                 env: BTreeMap::new(),
                 invoke_targets: Vec::new(),
                 stats_topics: Vec::new(),
+                tenant_secret_names: Vec::new(),
             }],
             ..Default::default()
         },
@@ -7455,6 +7475,7 @@ async fn graphql_data_connector_serves_from_the_database_with_row_isolation() {
                 env: BTreeMap::new(),
                 invoke_targets: Vec::new(),
                 stats_topics: Vec::new(),
+                tenant_secret_names: Vec::new(),
             }],
             ..Default::default()
         },
@@ -7700,6 +7721,7 @@ async fn graphql_data_connector_delegates_a_field_to_a_wasm_function() {
                 env: BTreeMap::new(),
                 invoke_targets: Vec::new(),
                 stats_topics: Vec::new(),
+                tenant_secret_names: Vec::new(),
             }],
             ..Default::default()
         },
@@ -7848,6 +7870,7 @@ async fn graphql_data_connector_mutations_write_with_row_isolation() {
                 env: BTreeMap::new(),
                 invoke_targets: Vec::new(),
                 stats_topics: Vec::new(),
+                tenant_secret_names: Vec::new(),
             }],
             ..Default::default()
         },
@@ -8065,6 +8088,7 @@ async fn federation_composes_a_sql_subgraph_with_a_wasm_subgraph() {
                 env: BTreeMap::new(),
                 invoke_targets: Vec::new(),
                 stats_topics: Vec::new(),
+                tenant_secret_names: Vec::new(),
             }],
             ..Default::default()
         },
@@ -8217,6 +8241,7 @@ async fn registering_a_sql_subgraph_via_the_admin_api_composes_and_serves() {
                 env: BTreeMap::new(),
                 invoke_targets: Vec::new(),
                 stats_topics: Vec::new(),
+                tenant_secret_names: Vec::new(),
             }],
             ..Default::default()
         },
@@ -8468,6 +8493,7 @@ async fn graphql_data_connector_isolates_by_a_verified_app_token_claim() {
                 env: BTreeMap::new(),
                 invoke_targets: Vec::new(),
                 stats_topics: Vec::new(),
+                tenant_secret_names: Vec::new(),
             }],
             ..Default::default()
         },
@@ -9003,4 +9029,219 @@ async fn messaging_stats_reads_own_tenant_dlq_and_refuses_others() {
     );
 
     println!("MESSAGING-STATS TENANT-SCOPED OK");
+}
+
+/// CI-hard live gate for the per-tenant sealed-secret capability (task #493). Drives the REAL
+/// `TenantSecretStore` (memory KV + a reversible XOR envelope) + the REAL guest binding
+/// (`Bindings::with_tenant_secrets`, the exact call the server's `build_bindings` makes) + the REAL
+/// control-plane router, asserting the LIVE outcome at every step (never the report):
+///
+/// * tenant A `set`s `oauth_secret`, A `get` returns EXACTLY it, **B `get` returns `none`** for the
+///   same name over the SAME store (structural per-tenant isolation);
+/// * a no-resolved-tenant invocation is refused with `no-resolved-tenant` BEFORE any store access
+///   (the value is never written, so B cannot observe it);
+/// * a `/`-bearing resolved tenant is refused before store access (the host validates the resolved
+///   tenant is a single key segment — a mutation that read a guest-supplied/unvalidated tenant would
+///   let it reshape the key to a sibling's and this assertion would fail);
+/// * a control-plane `PUT tenant=A` then a guest `get` resolving to A returns it / to B `none`
+///   (the control-plane write + the guest read compose byte-identical segments over ONE store);
+/// * a `*`/`..`-bearing control-plane `{tenant}` is `400` before any store write;
+/// * the value never appears in a `list` (names + metadata only) or in the control-plane list body.
+///
+/// Non-hollow by construction: every assertion observes the sealed store's actual bytes (A's value,
+/// B's absence) or the actual HTTP status — a regression that dropped the tenant confinement, read a
+/// guest-supplied tenant, skipped the segment validation, or leaked a value would flip a concrete
+/// assertion, not merely a printed string. Runs entirely in-engine with a memory store — NO live DB.
+// The server's `handlers` feature unconditionally enables `boatramp-handlers/tenant-secrets`, so
+// gating on `handlers` is sufficient (the binding + `with_tenant_secrets` are always present here).
+#[cfg(feature = "handlers")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tenant_secrets_scoped_end_to_end() {
+    use boatramp_core::envelope::{EnvelopeError, KeyEnvelope};
+    use boatramp_core::secret_store::TenantSecretStore;
+    use boatramp_handlers::Bindings;
+
+    // A reversible XOR envelope: a "sealed" blob is visibly different from the plaintext (so we can
+    // assert at-rest confidentiality) yet round-trips — the same double the store's unit tests use.
+    struct XorEnvelope;
+    #[async_trait::async_trait]
+    impl KeyEnvelope for XorEnvelope {
+        async fn wrap(&self, p: &[u8]) -> Result<Vec<u8>, EnvelopeError> {
+            Ok(p.iter().map(|b| b ^ 0x5a).collect())
+        }
+        async fn unwrap(&self, c: &[u8]) -> Result<Vec<u8>, EnvelopeError> {
+            Ok(c.iter().map(|b| b ^ 0x5a).collect())
+        }
+    }
+
+    let kv = Arc::new(MemoryKv::new());
+    let store = Arc::new(TenantSecretStore::new(kv.clone(), Arc::new(XorEnvelope)));
+
+    // The load-bearing secret + its two firms. `SECRET_VALUE` must NEVER appear at rest, on a list,
+    // or in a log.
+    const SECRET_VALUE: &[u8] = b"firm-a-oauth-client-secret";
+
+    // Build the guest binding exactly as `build_bindings` does for a resolved-tenant invocation:
+    // the store, the project (host-stamped), the resolved OWN-tenant, the name allowlist, and the
+    // two independent rights. This is the REAL binding the engine links.
+    let bind = |tenant: Option<&str>, read: bool, write: bool| {
+        Bindings::new("social")
+            .with_tenant_secrets(
+                store.clone(),
+                "default",
+                tenant.map(str::to_owned),
+                vec!["oauth_secret".to_string()],
+                read,
+                write,
+            )
+            .tenant_secrets()
+            .cloned()
+            .expect("granted")
+    };
+
+    // (1) Tenant A writes then reads its OWN secret.
+    let a = bind(Some("firm-a"), true, true);
+    let meta = a.write("oauth_secret", SECRET_VALUE).await.expect("A set");
+    assert_eq!(meta.name, "oauth_secret");
+    assert_eq!(meta.revision, 1);
+    let got_a = a.read("oauth_secret").await.expect("A get ok");
+    assert_eq!(
+        got_a.as_deref(),
+        Some(SECRET_VALUE),
+        "A reads back exactly its own value"
+    );
+    // (at-rest sealing — the plaintext never in the clear — is proven by the core store unit test
+    // `tenant_set_get_round_trips_and_is_sealed_at_rest`, which reaches the raw KV key directly.)
+
+    // (2) THE isolation property: tenant B — same store, same name — sees NOTHING.
+    let b = bind(Some("firm-b"), true, true);
+    let got_b = b.read("oauth_secret").await.expect("B get ok");
+    assert!(
+        got_b.is_none(),
+        "tenant B must not see tenant A's secret (structural per-tenant isolation)"
+    );
+
+    // (2b) B's list never reveals A's name (per-tenant, not project-wide) — no cross-tenant oracle.
+    let b_list = b.names().await.expect("B list ok");
+    assert!(b_list.is_empty(), "B enumerates none of A's names");
+
+    // (3) A no-resolved-tenant invocation (an `all`/anonymous handler) is refused BEFORE any store
+    // access — distinct from access-denied, and it never writes, so B cannot later observe a value.
+    let anon = bind(None, true, true);
+    assert_eq!(
+        anon.read("oauth_secret").await.unwrap_err(),
+        boatramp_handlers::TenantSecretRefused::NoResolvedTenant,
+        "no resolved tenant ⇒ no-resolved-tenant (distinct from access-denied)"
+    );
+    assert!(
+        anon.write("oauth_secret", b"x").await.is_err(),
+        "an unscoped invocation cannot write"
+    );
+    // The unscoped write never happened — firm-b still sees nothing (mutation-proof of fail-closed).
+    assert!(b.read("oauth_secret").await.unwrap().is_none());
+
+    // (4) SECURITY: a `/`-bearing RESOLVED tenant must be refused before it can reshape the key to a
+    // sibling's. Seed a "victim" secret under `firm-b` via a normal binding, then a binding whose
+    // resolved tenant is `firm-b/..`-ish (`firm-a/../firm-b`) must NOT be able to read it.
+    let victim = bind(Some("firm-b"), true, true);
+    victim
+        .write("oauth_secret", b"victim-value")
+        .await
+        .expect("seed victim");
+    let slash = bind(Some("firm-a/../firm-b"), true, true);
+    assert!(
+        slash.read("oauth_secret").await.is_err(),
+        "a slash-bearing resolved tenant is refused before reaching the store (no key reshape)"
+    );
+
+    // (5) The control-plane write path + the guest read path over ONE store. Build a router with the
+    // SAME store wired, `PUT` tenant=`firm-c`, then a guest binding resolving to firm-c reads it,
+    // firm-d gets none. Auth disabled (the authz gate is unit-tested separately in authz.rs).
+    let deploy = DeployStore::new(Arc::new(MemStorage::default()), Arc::new(MemoryKv::new()));
+    let options = ServerOptions {
+        tenant_secret_store: Some(store.clone()),
+        ..Default::default()
+    };
+    let app = router_with(
+        deploy.clone(),
+        Auth::disabled(),
+        HandlerRuntime::disabled(),
+        options.clone(),
+    );
+    let cp_value = "firm-c-console-secret";
+    let put = Request::builder()
+        .method("PUT")
+        .uri("/api/tenant-secrets/firm-c/oauth_secret")
+        .header("content-type", "application/json")
+        .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40000))))
+        .body(Body::from(format!(r#"{{"value":"{cp_value}"}}"#)))
+        .unwrap();
+    let put_resp = app.clone().oneshot(put).await.unwrap();
+    assert_eq!(
+        put_resp.status(),
+        StatusCode::CREATED,
+        "control-plane PUT seals the value and returns 201"
+    );
+    // The 201 body is value-free metadata — the value must not be echoed.
+    let put_body = to_bytes(put_resp.into_body(), usize::MAX).await.unwrap();
+    assert!(
+        !String::from_utf8_lossy(&put_body).contains(cp_value),
+        "the PUT response must never echo the value"
+    );
+
+    // A guest resolving to firm-c reads exactly the control-plane-sealed value; firm-d gets none.
+    let c = bind(Some("firm-c"), true, true);
+    assert_eq!(
+        c.read("oauth_secret").await.unwrap().as_deref(),
+        Some(cp_value.as_bytes()),
+        "a guest resolving to firm-c reads the control-plane-sealed value"
+    );
+    let d = bind(Some("firm-d"), true, true);
+    assert!(
+        d.read("oauth_secret").await.unwrap().is_none(),
+        "firm-d sees none of firm-c's control-plane secret"
+    );
+
+    // (5b) The control-plane list is per-tenant + value-free.
+    let list_req = Request::builder()
+        .method("GET")
+        .uri("/api/tenant-secrets/firm-c")
+        .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40000))))
+        .body(Body::empty())
+        .unwrap();
+    let list_resp = app.clone().oneshot(list_req).await.unwrap();
+    assert_eq!(list_resp.status(), StatusCode::OK);
+    let list_body = to_bytes(list_resp.into_body(), usize::MAX).await.unwrap();
+    let list_text = String::from_utf8_lossy(&list_body);
+    assert!(
+        list_text.contains("oauth_secret") && !list_text.contains(cp_value),
+        "the list carries names + metadata, NEVER a value"
+    );
+
+    // (6) A control-plane `{tenant}` segment that would escape the key prefix is `400` before any
+    // store write (the store validates it via `validate_resource_name`, fail-closed). A literal `*`
+    // reaches the handler intact; a percent-encoded `/` (`%2F`) decodes to a raw path separator in
+    // the `{tenant}` param — exactly the value that could reshape the key to a sibling tenant's — and
+    // must be refused. (A bare `../`/`/` in the URI is normalized by HTTP path handling before the
+    // handler; `%2F` is the smuggling vector that actually reaches the store validator.)
+    for bad_uri in [
+        "/api/tenant-secrets/star*name/oauth_secret",
+        "/api/tenant-secrets/firm-a%2F..%2Ffirm-b/oauth_secret",
+    ] {
+        let bad = Request::builder()
+            .method("PUT")
+            .uri(bad_uri)
+            .header("content-type", "application/json")
+            .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40000))))
+            .body(Body::from(r#"{"value":"should-not-be-written"}"#))
+            .unwrap();
+        let resp = app.clone().oneshot(bad).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "a bad tenant segment ({bad_uri}) is 400 (rejected fail-closed in the store)"
+        );
+    }
+
+    println!("TENANT SECRETS SCOPED OK");
 }

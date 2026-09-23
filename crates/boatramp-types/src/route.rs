@@ -771,6 +771,7 @@ mod tests {
             secrets: Vec::new(),
             invoke_targets: Vec::new(),
             stats_topics: Vec::new(),
+            tenant_secret_names: Vec::new(),
         };
         let handlers = vec![
             handler("/api/orders/*", &["GET", "POST"]),

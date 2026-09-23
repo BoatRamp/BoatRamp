@@ -351,6 +351,17 @@ pub fn is_named_admin_import(import: &str) -> bool {
     )
 }
 
+/// Whether `import` is a **per-tenant sealed-secret** grant (task #493): `tenant-secrets:read`
+/// (grants the guest `get`/`list` on the `boatramp:handlers/tenant-secrets` capability) or
+/// `tenant-secrets:admin` (grants `set`/`delete`). The two are INDEPENDENT rights, each separate
+/// from the deploy/publisher right and from each other — a read-granted component cannot write. A
+/// bare `tenant-secrets` is deliberately NOT a grant (a component must name the specific right,
+/// deny-by-default / least-privilege), and there is no `tenant-secrets:*`. A typo (e.g.
+/// `tenant-secrets:write`) is not recognized here and so fails at deploy.
+pub fn is_named_tenant_secrets_import(import: &str) -> bool {
+    matches!(import, "tenant-secrets:read" | "tenant-secrets:admin")
+}
+
 fn check_import(import: &str) -> Result<(), ConfigError> {
     // `session` is accepted here (client-side cfg vocabulary) but is intentionally NOT in
     // `KNOWN_IMPORTS`: a session route grants the session binding intrinsically, and the host
@@ -366,17 +377,22 @@ fn check_import(import: &str) -> Result<(), ConfigError> {
     // `tenancy`, intentionally NOT in `KNOWN_IMPORTS`: the host advertises it as Experimental only
     // when the `messaging` feature is compiled, so the `requires` ABI gate enforces host support at
     // activation while a deploy targeting any host build still parses offline.
+    // `tenant-secrets:{read,admin}` (per-tenant sealed-secret CRUD, task #493) are accepted here but,
+    // like the above, intentionally NOT in `KNOWN_IMPORTS`: the host advertises the capability as
+    // Experimental only when the `tenant-secrets` feature is compiled, so the `requires` ABI gate
+    // enforces host support at activation while a deploy targeting any host build still parses offline.
     if KNOWN_IMPORTS.contains(&import)
         || import == "session"
         || import == "tenancy"
         || import == "messaging-stats"
         || is_named_sql_import(import)
         || is_named_admin_import(import)
+        || is_named_tenant_secrets_import(import)
     {
         Ok(())
     } else {
         Err(ConfigError::parse(format!(
-            "unknown handler import {import:?}; allowed: {}, `session`, `tenancy`, `messaging-stats`, a named SQL binding `sql:<name>` / `sql:*`, or an admin surface `admin:{{domains,email,site,secrets}}`",
+            "unknown handler import {import:?}; allowed: {}, `session`, `tenancy`, `messaging-stats`, a named SQL binding `sql:<name>` / `sql:*`, an admin surface `admin:{{domains,email,site,secrets}}`, or a tenant-secret right `tenant-secrets:{{read,admin}}`",
             KNOWN_IMPORTS.join(", ")
         )))
     }
@@ -539,6 +555,16 @@ pub struct HandlerConfig {
     /// `imports` contains `messaging-stats` and the site allows it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stats_topics: Vec<String>,
+    /// Per-component name allowlist for the per-tenant sealed-secret capability
+    /// (`boatramp:handlers/tenant-secrets`, task #493): the secret names this component may address
+    /// for its resolved tenant. Least-privilege, mirroring [`stats_topics`](Self::stats_topics):
+    /// **empty ⇒ deny-all** (a component that declares `tenant-secrets:{read,admin}` but names no
+    /// secrets can reach nothing). A `get`/`set`/`delete` of a name NOT in this list returns
+    /// `access-denied` (before any store access); a `list` returns only the allowlisted names. The
+    /// resolved tenant is always host-supplied — this bounds only WHICH names, never WHICH tenant.
+    /// Only consulted when `imports` contains a `tenant-secrets:*` right and the site allows it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tenant_secret_names: Vec<String>,
     /// Per-handler in-site tenancy decision (Dimension 0), overriding the site-level
     /// [`HandlersSiteConfig::tenancy`] for this route. Absent ⇒ inherit the site decision. When
     /// present it must **narrow within** the site ceiling ([`crate::tenancy::Tenancy::narrows_within`])
@@ -683,6 +709,11 @@ pub struct ConsumerConfig {
     /// stats. Only consulted when `imports` contains `messaging-stats` and the site allows it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stats_topics: Vec<String>,
+    /// Per-component tenant-secret name allowlist (same contract as
+    /// [`HandlerConfig::tenant_secret_names`]): the secret names this consumer may address for its
+    /// resolved tenant via `boatramp:handlers/tenant-secrets`. Empty ⇒ deny-all.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tenant_secret_names: Vec<String>,
 }
 
 /// serde `skip_serializing_if` helper: a `Latest` start is the default and elided.
@@ -1465,6 +1496,7 @@ mod tests {
                 secrets: Vec::new(),
                 invoke_targets: Vec::new(),
                 stats_topics: Vec::new(),
+                tenant_secret_names: Vec::new(),
             }],
             ..Default::default()
         };
@@ -1571,6 +1603,18 @@ mod tests {
         assert!(check_import("session").is_ok());
         assert!(check_import("tenancy").is_ok());
         assert!(check_import("messaging-stats").is_ok());
+        // The two INDEPENDENT per-tenant sealed-secret rights (task #493) are accepted; a bare
+        // `tenant-secrets`, a wildcard, or a typo'd right is rejected (deny-by-default,
+        // least-privilege — a component names the specific right).
+        assert!(check_import("tenant-secrets:read").is_ok());
+        assert!(check_import("tenant-secrets:admin").is_ok());
+        assert!(super::is_named_tenant_secrets_import("tenant-secrets:read"));
+        assert!(super::is_named_tenant_secrets_import(
+            "tenant-secrets:admin"
+        ));
+        assert!(check_import("tenant-secrets").is_err());
+        assert!(check_import("tenant-secrets:*").is_err());
+        assert!(check_import("tenant-secrets:write").is_err());
         // A wholly-unknown import is still rejected.
         assert!(check_import("wasi:filesystem").is_err());
     }

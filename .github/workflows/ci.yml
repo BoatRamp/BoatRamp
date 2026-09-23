@@ -905,6 +905,22 @@ jobs:
             || { echo "::error::messaging-stats gate did not run (silent skip or a failure)" >&2; exit 1; }
           grep -q 'MESSAGING-STATS TENANT-SCOPED OK' messaging-stats.log \
             || { echo "::error::messaging-stats gate never reached its marker (a tenant-scoping/cross-tenant-oracle regression)" >&2; exit 1; }
+      # task #493: the per-tenant sealed-secret capability. This gate drives the REAL TenantSecretStore
+      # + the REAL guest binding + the REAL control-plane router end to end: tenant A sets a secret and
+      # reads it back, tenant B gets none over the SAME store (per-tenant isolation), a no-resolved-
+      # tenant invocation is refused before store access, a slash-bearing resolved tenant is refused
+      # before it can reshape the key, a control-plane PUT tenant=A is read by a guest resolving to A
+      # (none to B), a `%2F`/`*`-bearing control-plane {tenant} is 400, and the value never appears on
+      # a list. A cross-tenant leak / tenant-forgery / segment-validation regression fails the merge.
+      - name: tenant-secrets scoped gate marker (#493)
+        run: |
+          set -eo pipefail
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-server \
+            --features handlers --test conformance tenant_secrets_scoped_end_to_end -- --nocapture 2>&1 | tee tenant-secrets.log
+          grep -qE 'test result: ok\. 1 passed' tenant-secrets.log \
+            || { echo "::error::tenant-secrets gate did not run (silent skip or a failure)" >&2; exit 1; }
+          grep -q 'TENANT SECRETS SCOPED OK' tenant-secrets.log \
+            || { echo "::error::tenant-secrets gate never reached its marker (a cross-tenant leak / tenant-forgery / segment-validation regression)" >&2; exit 1; }
       # v0.5.x: opt-in per-guest secret allowlist over the per-site `[handlers].secrets` pool. The
       # pool is injected into a guest's env at one choke point (`resolve_env`); a guest that declares
       # a `secrets` allowlist receives ONLY those keys, a non-declaring guest the whole pool (opt-in,

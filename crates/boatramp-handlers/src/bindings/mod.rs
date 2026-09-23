@@ -53,6 +53,12 @@ pub mod target_context;
 /// `messaging` binding stamps — a messaging-lane concern, so gated with `messaging`.
 #[cfg(feature = "messaging")]
 pub mod tenancy;
+/// The per-tenant sealed-secret binding (`boatramp:handlers/tenant-secrets`, task #493): a granted
+/// guest reads/writes secrets sealed to THIS invocation's host-resolved tenant. Its own off-by-
+/// default `tenant-secrets` feature (the store lives in boatramp-core, so the control-plane path
+/// compiles without it).
+#[cfg(feature = "tenant-secrets")]
+pub mod tenant_secrets;
 pub mod wasi_logging;
 
 /// The per-site capability handles for one handler invocation.
@@ -113,6 +119,12 @@ pub struct Bindings {
     /// so the guest never names a tenant. `None` = not granted (every stats call ⇒ `access-denied`).
     #[cfg(feature = "messaging")]
     messaging_stats: Option<messaging_stats::StatsBinding>,
+    /// The `tenant-secrets` grant (task #493): read/write secrets sealed to THIS invocation's
+    /// host-resolved tenant. `None` = not granted (every call ⇒ `access-denied`). The binding
+    /// carries the two independent rights + the per-component name allowlist; the guest never names
+    /// a tenant (the host injects the resolved one).
+    #[cfg(feature = "tenant-secrets")]
+    tenant_secrets: Option<tenant_secrets::TenantSecretsBinding>,
     /// Where this invocation's captured stdout/stderr is sent.
     /// `None` = the guest's stdio is left inherited (host stdio).
     logging: Option<crate::logging::LoggingBinding>,
@@ -504,5 +516,42 @@ impl Bindings {
     #[cfg(feature = "messaging")]
     pub fn messaging_stats(&self) -> Option<&messaging_stats::StatsBinding> {
         self.messaging_stats.as_ref()
+    }
+
+    /// Grant the `tenant-secrets` capability (task #493): `store` is the sealed per-tenant store,
+    /// `project` is host-stamped (the guest never names it), `resolved_tenant` is THIS invocation's
+    /// host-resolved own-tenant (`None` ⇒ every call is `no-resolved-tenant`), `allow_names` is the
+    /// component's `tenant_secret_names` allowlist (empty ⇒ deny-all), and `can_read`/`can_write`
+    /// are the two INDEPENDENT rights (`tenant-secrets:read` / `tenant-secrets:admin`). Deny-by-
+    /// default: without this grant every call returns `access-denied`. The guest supplies only the
+    /// secret name; the host keys `(project, resolved_tenant, name)`.
+    #[cfg(feature = "tenant-secrets")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_tenant_secrets(
+        mut self,
+        store: Arc<boatramp_core::secret_store::TenantSecretStore>,
+        project: impl Into<String>,
+        resolved_tenant: Option<String>,
+        allow_names: Vec<String>,
+        can_read: bool,
+        can_write: bool,
+    ) -> Self {
+        self.tenant_secrets = Some(tenant_secrets::TenantSecretsBinding {
+            store,
+            project: project.into(),
+            resolved_tenant,
+            allow_names,
+            can_read,
+            can_write,
+        });
+        self
+    }
+
+    /// The granted `tenant-secrets` binding, if any. Public so a host-side caller (a live-gate test)
+    /// can drive the sealed CRUD against the real store + envelope without instantiating a wasm
+    /// guest — the same pattern as [`messaging_stats`](Self::messaging_stats).
+    #[cfg(feature = "tenant-secrets")]
+    pub fn tenant_secrets(&self) -> Option<&tenant_secrets::TenantSecretsBinding> {
+        self.tenant_secrets.as_ref()
     }
 }

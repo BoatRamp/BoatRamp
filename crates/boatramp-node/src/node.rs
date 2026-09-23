@@ -201,6 +201,17 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
             envelope,
         ))
     });
+    // The per-TENANT sealed secret store (task #493), sealed with the SAME `[secrets]` envelope.
+    // Backs both the control-plane CRUD (threaded into `ServerOptions` below) and — when the
+    // `tenant-secrets` feature is compiled — the runtime guest binding (the SAME `Arc` handed to
+    // `set_tenant_secret_store`). `None` when no envelope is configured, so the endpoints fail
+    // closed with a clear 501 and the guest binding is not built.
+    let tenant_secret_store = secrets_envelope.clone().map(|envelope| {
+        Arc::new(boatramp_core::secret_store::TenantSecretStore::new(
+            kv.clone(),
+            envelope,
+        ))
+    });
     // The project-scoped SMTP email-profile store, built from the same KV + envelope
     // (the password is sealed at rest). Backs the admin API (`options` below,
     // unconditionally, so it works on a lean node) and — when the `email` feature +
@@ -244,6 +255,15 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
         secrets_envelope.clone(),
     )
     .await?;
+    // Hand the runtime the SAME per-tenant secret store `Arc` the control-plane routes hold (task
+    // #493), so a guest `tenant-secrets` `get` and a control-plane `PUT` seal/unseal against ONE
+    // store. Unset when no `[secrets]` envelope, so the guest binding is not built (fail-closed).
+    // Handlers-gated: `set_tenant_secret_store` lives on the handler runtime, so a lean (no-handlers)
+    // node has no guest binding to wire (the control-plane routes still work via `ServerOptions`).
+    #[cfg(feature = "handlers")]
+    if let Some(store) = tenant_secret_store.clone() {
+        handlers.set_tenant_secret_store(store);
+    }
     // Wire the fleet session-cookie signer (R3, PLAN-tenancy-principal): the same issuer that mints
     // control-plane tokens signs + verifies the host-issued anonymous session cookie AND the
     // delegable capabilities (PLAN-delegable-capabilities). Handlers-gated: the session-cookie
@@ -705,6 +725,9 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
     // The internal secret store backs the admin secrets API (set/list/delete). Not
     // handlers-gated — it must be reachable even on a lean node.
     options.secret_store = secret_store;
+    // The per-tenant sealed secret store backs the control-plane CRUD (task #493). Like the secret
+    // store it is not handlers-gated, so the endpoints work on a lean node.
+    options.tenant_secret_store = tenant_secret_store;
     // The email-profile store backs the admin API (`/api/email/profiles`); like the
     // secret store it is not handlers-gated, so it works on a lean node.
     options.email_profile_store = email_profile_store;

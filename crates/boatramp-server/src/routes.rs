@@ -58,6 +58,10 @@ pub fn router_with_fast(
     // is configured — the admin secrets endpoints then fail closed with a clear 501).
     // Rides as an `api` extension read by the secrets handlers; not handlers-gated.
     let secret_store_cap = options.secret_store.clone();
+    // The per-tenant sealed secret store (task #493) — `None` when no `[secrets]` envelope, so the
+    // tenant-secret endpoints fail closed with a clear 501. Rides as an `api` extension read by the
+    // tenant-secret handlers; not handlers-gated.
+    let tenant_secret_store_cap = options.tenant_secret_store.clone();
     // The project-scoped SMTP email-profile store (`None` when no `[secrets]`
     // envelope is configured — the admin email endpoints then fail closed with a
     // clear 501). Rides as an `api` extension read by the email handlers.
@@ -190,6 +194,20 @@ pub fn router_with_fast(
                 .layer(axum::extract::DefaultBodyLimit::max(512 * 1024)),
         )
         .route("/api/secrets/{name}", axum::routing::delete(delete_secret))
+        // The per-tenant sealed secret store (task #493), rewritten from
+        // `/api/projects/<proj>/tenant-secrets/<tenant>{,/<name>}`. Value in the JSON body (64 KiB
+        // capped in the store); the `<tenant>`/`<name>` path segments are validated fail-closed in
+        // the store. `list` is per-tenant + value-free. Same 512 KiB body headroom as `/api/secrets`.
+        .route(
+            "/api/tenant-secrets/{tenant}",
+            axum::routing::get(list_tenant_secrets),
+        )
+        .route(
+            "/api/tenant-secrets/{tenant}/{name}",
+            axum::routing::put(set_tenant_secret)
+                .delete(delete_tenant_secret)
+                .layer(axum::extract::DefaultBodyLimit::max(512 * 1024)),
+        )
         // The project's tenancy schema (rewritten from `/api/projects/<proj>/tenancy`).
         // The per-table tenant-key map the scope injector consults; read with
         // `Project·Read`, replace/clear with `Project·Admin` (see `authz::Right::required`
@@ -556,6 +574,7 @@ pub fn router_with_fast(
         .layer(Extension(compute_volumes_cap))
         .layer(Extension(compute_control_cap))
         .layer(Extension(secret_store_cap))
+        .layer(Extension(tenant_secret_store_cap))
         .layer(Extension(email_store_cap))
         .layer(Extension(upload_guard));
     #[cfg(feature = "oidc")]

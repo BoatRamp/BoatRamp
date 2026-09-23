@@ -87,9 +87,9 @@ pub(crate) use content::{
 pub(crate) use control_api::{
     add_root_anchor, auth_whoami, bootstrap_token, cluster_join, cluster_members, cluster_promote,
     cluster_revoke, cluster_rotate_key, create_join_token, create_token, delete_email_profile,
-    delete_secret, get_authz_policy, list_email_profiles, list_root_anchors, list_secrets,
-    list_tokens, put_authz_policy, remove_root_anchor, revoke_token, set_email_profile, set_secret,
-    show_email_profile,
+    delete_secret, delete_tenant_secret, get_authz_policy, list_email_profiles, list_root_anchors,
+    list_secrets, list_tenant_secrets, list_tokens, put_authz_policy, remove_root_anchor,
+    revoke_token, set_email_profile, set_secret, set_tenant_secret, show_email_profile,
 };
 #[cfg(all(test, feature = "handlers"))]
 use control_api::{BootstrapRequest, CreateJoinTokenRequest, JoinRequest};
@@ -375,6 +375,13 @@ struct HandlerRuntimeInner {
     /// [`HandlerRuntime::set_secret_store`]; **unset means no `boatramp:` ref can
     /// resolve** (fail-closed — `resolve_secret_env` errors rather than injecting).
     secret_store: std::sync::OnceLock<Arc<boatramp_core::secret_store::SecretStore>>,
+    /// The per-**tenant** sealed secret store (task #493) backing the guest
+    /// `boatramp:handlers/tenant-secrets` binding. Set once at startup via
+    /// [`HandlerRuntime::set_tenant_secret_store`] (the SAME `Arc` the control-plane routes hold),
+    /// gated on the `[secrets]` envelope. Unset ⇒ the binding is not built (every call
+    /// `access-denied`/`not-configured`). Only consulted when the `tenant-secrets` feature is
+    /// compiled; the field is present regardless so the setter has one home.
+    tenant_secret_store: std::sync::OnceLock<Arc<boatramp_core::secret_store::TenantSecretStore>>,
     /// Per-function locks serializing the metering + rate-limit read-modify-write
     /// (FA-4), so concurrent invocations of one function can't lose an update.
     /// Created on first use, keyed by function name.
@@ -667,6 +674,7 @@ impl HandlerRuntime {
                 require_tenancy_declaration: std::sync::OnceLock::new(),
                 allow_cross_tenant_db: std::sync::OnceLock::new(),
                 secret_store: std::sync::OnceLock::new(),
+                tenant_secret_store: std::sync::OnceLock::new(),
                 function_meter_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
                 function_semaphores: std::sync::Mutex::new(std::collections::HashMap::new()),
                 watch_provider: std::sync::OnceLock::new(),
@@ -940,6 +948,22 @@ impl HandlerRuntime {
     pub fn set_secret_store(&self, store: Arc<boatramp_core::secret_store::SecretStore>) {
         if let Some(inner) = self.inner.as_ref() {
             let _ = inner.secret_store.set(store);
+        }
+    }
+
+    /// Wire the per-**tenant** sealed secret store (task #493) that backs the guest
+    /// `boatramp:handlers/tenant-secrets` binding — the SAME `Arc` the control-plane routes hold, so
+    /// a guest `get` and a control-plane `PUT` seal/unseal against ONE store. Set once at startup,
+    /// gated on the `[secrets]` envelope; if never set the binding is not built and every
+    /// tenant-secret call fails closed. Present regardless of the `tenant-secrets` feature so the
+    /// node has one call site; the binding is only actually constructed when the feature is on.
+    #[cfg(feature = "handlers")]
+    pub fn set_tenant_secret_store(
+        &self,
+        store: Arc<boatramp_core::secret_store::TenantSecretStore>,
+    ) {
+        if let Some(inner) = self.inner.as_ref() {
+            let _ = inner.tenant_secret_store.set(store);
         }
     }
 
@@ -1487,6 +1511,14 @@ pub struct ServerOptions {
     /// panic. Not `handlers`-gated: `SecretStore` lives in boatramp-core, so the admin
     /// API works on a lean node too. Wired by the node alongside the envelope.
     pub secret_store: Option<Arc<boatramp_core::secret_store::SecretStore>>,
+    /// The per-**tenant** sealed secret store (task #493), sealed with the SAME `[secrets]`
+    /// envelope. Backs both the control-plane CRUD (`/api/projects/{p}/tenant-secrets/{tenant}
+    /// {,/{name}}`, rewritten onto `/api/tenant-secrets/…`) and — when the `tenant-secrets` feature
+    /// is compiled — the runtime guest binding (the node hands the SAME `Arc` to both). `None` ⇒ no
+    /// `[secrets]` envelope was configured, and every tenant-secret endpoint returns a clear `501`,
+    /// never a panic. Not `handlers`-gated: `TenantSecretStore` lives in boatramp-core, so the
+    /// control-plane API compiles on a lean node too (Backend C5).
+    pub tenant_secret_store: Option<Arc<boatramp_core::secret_store::TenantSecretStore>>,
     /// The per-project SMTP email-profile store backing the admin API
     /// (`/api/email/profiles{,/{name}}`) — set/list/show/delete of a profile's
     /// **redacted** config (the password is never returned). `None` ⇒ no
@@ -3833,6 +3865,7 @@ mod tests {
                     backoff_ms: None,
                     retention_ms: None,
                     stats_topics: Vec::new(),
+                    tenant_secret_names: Vec::new(),
                     topic: "orders/created".into(),
                     component: "consumer.wasm".into(),
                     imports: vec!["wasi:keyvalue".into()],
@@ -3980,6 +4013,7 @@ mod tests {
                     max_batch: None,
                     max_ack_pending: None,
                     stats_topics: Vec::new(),
+                    tenant_secret_names: Vec::new(),
                 }],
                 ..Default::default()
             },
@@ -5811,6 +5845,7 @@ mod tests {
                     secrets: Vec::new(),
                     invoke_targets: Vec::new(),
                     stats_topics: Vec::new(),
+                    tenant_secret_names: Vec::new(),
                 }],
                 crons: vec![CronConfig {
                     schedule: "* * * * *".into(),
@@ -5979,6 +6014,7 @@ mod tests {
                     secrets: Vec::new(),
                     invoke_targets: Vec::new(),
                     stats_topics: Vec::new(),
+                    tenant_secret_names: Vec::new(),
                 }],
                 crons: vec![CronConfig {
                     schedule: "* * * * *".into(),
@@ -6134,6 +6170,8 @@ mod tests {
                     env,
                     &[],
                     &[],
+                    // Tenant-secret name allowlist (task #493): empty ⇒ deny-all.
+                    &[],
                     // Per-guest secret allowlist (task #492): empty ⇒ the whole site pool.
                     &[],
                     0,
@@ -6267,6 +6305,8 @@ mod tests {
                 &site,
                 &env,
                 &[],
+                &[],
+                // Tenant-secret name allowlist (task #493): empty ⇒ deny-all.
                 &[],
                 // Per-guest secret allowlist (task #492): empty ⇒ the whole site pool.
                 &[],
@@ -6432,6 +6472,7 @@ mod tests {
             tenancy: Some(&tenancy),
             token_claims: None,
             stats_topics: &[],
+            tenant_secret_names: &[],
             secret_allowlist: &[],
         };
 
