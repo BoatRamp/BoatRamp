@@ -5,7 +5,48 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
-## [0.5.1] - 2026-09-23
+## [0.5.2] - 2026-09-23
+
+**Generic provisioning drift-repair — `boatramp project repair`.** A new owner-gated
+(`Project·Admin`, audited), idempotent, data-preserving operator verb that diffs a managed
+SQL tenant's provisioning against the current expected model and converges the delta
+(drift-detect → probe → converge → re-probe). Its first use is retrofitting tenants
+provisioned by a pre-v0.4.25 boatramp (database owned by the runtime role, no `_owner`
+role) so `boatramp project migrate` — which connects as the sealed owner role — can adopt
+them; but it is shaped as the general reconcile primitive, not a version-specific cure.
+
+### Added
+
+- **CLI** `boatramp project repair --db <name> [--apply] [--dry-run] [--json]
+  [--exit-nonzero-on-drift]` — **defaults to dry-run** (repair runs host-derived privileged
+  DDL, so it previews by default; `--apply` converges). Per-check report (`ok` / `drift` /
+  `repaired` / `error` / `skipped`) with a `backend`/`mode` header; exit 0 (no drift /
+  repaired), 1 (a check errored), 2 (drift found, under `--exit-nonzero-on-drift`).
+- **Control-plane** `POST /api/repair/{db}` + `/api/repair/{db}/dry-run` (+ project-scoped),
+  gated `Project·Admin` (a dedicated route family, NOT under `/api/sql/`, so a ship-only
+  `Project·Deploy` token can never invoke it), audited, with an in-handler Admin assertion.
+- **All SQL backends**, each reconciled to its own provisioning model: **shared Postgres**
+  (the full three-identity owner-model retrofit — create + seal the `_owner` role, re-own
+  the database + objects incl. sequences/functions via `REASSIGN OWNED` / `ALTER … OWNER`,
+  re-grant the runtime + owner-keyed default privileges, ensure + re-own the migrate ledger);
+  **dedicated Postgres** (workload + sealed credential + ledger + connectivity); **MySQL**
+  (runtime user + grants + the distinct `migration_url_env` DDL identity + ledger); **libsql/
+  SQLite** (on-disk file + ledger); **external/BYO** (ledger + connectivity). Non-applicable
+  checks report `skipped` with a reason (the run still exits 0), never an error.
+- The `migrate` permission-denied error now points at `repair` (discoverability cure).
+
+### Guarantees
+
+- **Data-preserving:** only roles / ownership / grants / sealed credentials / ledger
+  scaffolding — never `DROP`/`TRUNCATE`/`DELETE`/`UPDATE` of tenant rows. `REASSIGN OWNED`
+  changes ownership, not data; the runtime role retains DML on its (re-owned) tables.
+- **Idempotent + converging:** `repair` then `repair` again ⇒ a reported no-op.
+- **Dry-run is side-effect-free:** read-only probes only — no DDL, no credential seal, no KV
+  write. All names are host-DERIVED from `(project, binding)` — never operator input or a
+  probe result; `REASSIGN OWNED`'s source is always the derived runtime role (never a
+  superuser), run only against the tenant's own database (guarded by `current_database()`),
+  and requires a superuser maintenance connection (fail-closed, never a role-membership
+  workaround). CI-hard live gate `PROVISION REPAIR RECONCILE OK` (mutation-verified).
 
 **`boatramp project migrate` backend parity — MySQL and embedded libsql/SQLite.** The
 owner-gated schema-migration surface (previously Postgres-only) now runs on MySQL and

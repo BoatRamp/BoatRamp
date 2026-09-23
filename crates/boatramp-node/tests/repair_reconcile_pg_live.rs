@@ -664,7 +664,7 @@ async fn provision_repair_reconciles_pre_v0425_shared_postgres_tenant() {
     );
     // BOTH tables (runtime-owned AND superuser-owned), the SEQUENCE, and BOTH function overloads are
     // re-owned to the owner — via pg_class.relowner / pg_proc.proowner (the load-bearing check-4
-    // proof: a table-only converge would leave the sequence + functions mis-owned).
+    // proof: a table-only converge would leave the sequence + functions wrongly owned).
     assert_eq!(
         rel_owner(&a_db, "public", "runtime_widget").await,
         a.owner_role,
