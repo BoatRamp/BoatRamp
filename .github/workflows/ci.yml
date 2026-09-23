@@ -734,6 +734,30 @@ jobs:
             || { echo "::error::migrate substrate ledger gate did not run (a silent skip or a failure)" >&2; exit 1; }
           grep -q 'MIGRATE RUNNER LEDGER OK \[postgres\]' migrate-runner.log \
             || { echo "::error::migrate substrate ledger never reached its marker (a ledger/atomic-rollback/extension-allowlist/owner-DDL-guard/baseline-origin regression)" >&2; exit 1; }
+      - name: Provisioning drift-repair reconcile on a real Postgres (#491)
+        env:
+          BOATRAMP_TEST_PG_URL: postgres://boatramp:boatramp@localhost:5432/boatramp
+        run: |
+          set -eo pipefail
+          # #491: the owner-gated, idempotent, DATA-PRESERVING `repair` verb reconciles a pre-v0.4.25
+          # shared-Postgres tenant (db owned by the runtime role, no `_owner` role) on a real Postgres,
+          # driving the SHIPPED NodeTenantRepair. A tenant is provisioned then MUTATED to the pre-model
+          # shape (dropped owner role, db re-owned to runtime, a runtime-owned table, a superuser-owned
+          # table, a superuser-owned SEQUENCE, and an overloaded superuser-owned FUNCTION). The gate
+          # asserts against the LIVE pg catalog (not the report): a dry-run reports drift + re-owns
+          # NOTHING; an apply recreates + seals the owner role (safe attrs) and re-owns the db + BOTH
+          # tables + the sequence + BOTH function overloads + the ledger to the owner (so a table-only
+          # converge that missed the sequence/function arms would FAIL); a re-apply converges NOTHING
+          # (idempotent); a second tenant's ownership is UNTOUCHED (scope); the runtime role still
+          # connects; and repair over a soft-deleted tenant is a zero-action no-op. A regression on any
+          # of these fails the assertion. The BOATRAMP_TEST_PG_URL user is a superuser (CREATE ROLE /
+          # CREATE DATABASE / ALTER DATABASE OWNER / REASSIGN OWNED).
+          cargo test -p boatramp-node --features sql-postgres,migrate \
+            --test repair_reconcile_pg_live -- --nocapture 2>&1 | tee repair-reconcile.log
+          grep -qE 'test result: ok\. 1 passed' repair-reconcile.log \
+            || { echo "::error::provisioning drift-repair gate did not run (a silent skip — BOATRAMP_TEST_PG_URL unset — or a failure)" >&2; exit 1; }
+          grep -q 'PROVISION REPAIR RECONCILE OK' repair-reconcile.log \
+            || { echo "::error::provisioning drift-repair never reached its marker (a re-ownership/idempotency/scope/isolation/soft-delete regression — the db/table/sequence/function was not re-owned to the owner role, or repair touched a soft-deleted or second tenant)" >&2; exit 1; }
       - name: Owner-gated schema-migration FUNCTION-STEP path on a real Postgres (v0.4.25)
         env:
           BOATRAMP_TEST_PG_URL: postgres://boatramp:boatramp@localhost:5432/boatramp
