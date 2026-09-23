@@ -389,6 +389,45 @@ async fn migrate_substrate_mysql_parity_on_a_real_engine() {
             .unwrap_err(),
         MigrateDdlError::LedgerProtected
     ));
+    // Security review CRITICAL-1 RE-REVIEW (task #489): the first `/*!` fix was ITSELF bypassable in
+    // three more ways, each verified live (guard passed + this REAL MySQL executed the hidden
+    // statement via `sqlx::raw_sql`). Every one MUST now be refused BEFORE the owner wire.
+    // (1) a `/*!` INSIDE an ordinary `/* */` comment must not steal that comment's `*/` and let the
+    //     following live keyword through.
+    assert!(matches!(
+        ddl.exec("/* /*! */ COMMIT -- */").await.unwrap_err(),
+        MigrateDdlError::TxnControl
+    ));
+    assert!(matches!(
+        ddl.exec("/* /*! */ DELETE FROM boatramp_migrations -- */")
+            .await
+            .unwrap_err(),
+        MigrateDdlError::LedgerProtected
+    ));
+    // (2) sqlparser NESTS `/* */` but MySQL does NOT (first `*/` closes) — a nested-looking comment
+    //     must not hide a live keyword. No `/*!` needed.
+    assert!(matches!(
+        ddl.exec("/* a /* b */ COMMIT -- */").await.unwrap_err(),
+        MigrateDdlError::TxnControl
+    ));
+    assert!(matches!(
+        ddl.exec("/* a /* b */ DELETE FROM boatramp_migrations -- */")
+            .await
+            .unwrap_err(),
+        MigrateDdlError::LedgerProtected
+    ));
+    // (3) an executable-comment body is lexed as normal SQL: the inner `/* */` is a nested comment and
+    //     the exec closes at the TOP-LEVEL `*/`, so MySQL EXECUTES the keyword after the inner comment.
+    assert!(matches!(
+        ddl.exec("/*! /* */ COMMIT */").await.unwrap_err(),
+        MigrateDdlError::TxnControl
+    ));
+    // (4) MariaDB executable comment `/*M! … */` is also executed by the server (kind `Mysql` connects
+    //     to MariaDB too) — un-hidden + refused.
+    assert!(matches!(
+        ddl.exec("/*M! COMMIT */").await.unwrap_err(),
+        MigrateDdlError::TxnControl
+    ));
     // Verify the executable-comment guard did NOT actually run `CREATE TABLE z` (the `/*! COMMIT */`
     // above was refused BEFORE the owner connection — no statement should have reached the wire).
     {
