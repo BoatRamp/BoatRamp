@@ -5,6 +5,42 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.5.3] - 2026-09-23
+
+**Opt-in per-guest secret allowlist over the per-site `[handlers].secrets` pool.** Previously
+the whole site secret pool was injected into every site handler's (and consumer's) guest
+environment — a handler that needed only one secret still saw all of them (a within-project
+least-privilege gap; functions were already per-function isolated). A guest may now declare a
+`secrets` allowlist to receive **only** the named subset.
+
+### Added
+
+- `HandlerConfig.secrets` and `ConsumerConfig.secrets` — an optional `Vec<String>` of secret
+  env-var names (keys of the site `[handlers].secrets` pool) this guest is granted. **Empty (the
+  default) ⇒ the whole pool is injected (unchanged, non-breaking); non-empty ⇒ only those keys.**
+  Filtering happens at the single injection choke point (`resolve_env`) **before** resolution, so
+  an ungranted secret's host-env/store referent is never even read for that guest. A cron inherits
+  its matched handler's allowlist; functions/sessions use their own `FunctionConfig.secrets` and are
+  unaffected.
+- **Fail-closed validation at activation:** an allowlist entry that is not a key of the site pool
+  (or a non-empty allowlist against an empty pool) refuses the deploy activation with a `422` naming
+  the guest + the unknown secret — a typo/rotation can never silently broaden or silently drop.
+
+### How to adopt (upgrade guide)
+
+The change is **opt-in and non-breaking** — existing deploys behave exactly as before. To tighten a
+handler to least-privilege, add the secret env-var names it actually uses:
+
+```
+[[handlers]]
+route = "/auth/social"
+component = "social-auth"
+secrets = ["SOCIAL_CLIENT_SECRET"]   # this handler now sees ONLY this key, not the whole site pool
+```
+
+Handlers with no `secrets` line keep seeing the full pool. Scoped by a CI-hard gate
+`SECRET ALLOWLIST SCOPED OK` (a handler with an allowlist provably cannot see a sibling's secret).
+
 ## [0.5.2] - 2026-09-23
 
 **Generic provisioning drift-repair — `boatramp project repair`.** A new owner-gated

@@ -511,6 +511,16 @@ pub struct HandlerConfig {
     /// Static environment variables (never secrets).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, String>,
+    /// Per-guest **secret allowlist** (task #492): the subset of the site
+    /// `[handlers].secrets` pool KEYS (env-var names) this handler is granted at
+    /// instantiation. Empty ⇒ inject the whole site pool (the default, non-breaking);
+    /// non-empty ⇒ inject **only** these keys (least-privilege opt-in), so one site's
+    /// handlers no longer all share the same secret env. Every entry must be a key of
+    /// the site `[handlers].secrets` map (an unknown name is a hard activation error —
+    /// typo/rot protection). Only the site pool is filtered; a handler's own static
+    /// `env` is unaffected.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secrets: Vec<String>,
     /// Function-to-function invoke allowlist (FI): the target names this handler may
     /// call through the `invoke` capability (same contract as
     /// [`FunctionConfig::invoke_targets`](crate::function::FunctionConfig)). Each entry
@@ -623,6 +633,14 @@ pub struct ConsumerConfig {
     /// forwarded bearer). Absent ⇒ the token source can't verify (fail-closed).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_claims: Option<HandlerGraphqlTokenClaims>,
+    /// Per-guest **secret allowlist** (task #492), identical contract to
+    /// [`HandlerConfig::secrets`]: the subset of the site `[handlers].secrets` pool KEYS
+    /// this consumer is granted. Empty ⇒ inject the whole site pool (default,
+    /// non-breaking); non-empty ⇒ inject **only** these keys (least-privilege opt-in).
+    /// Every entry must be a key of the site pool (an unknown name is a hard activation
+    /// error).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secrets: Vec<String>,
     /// Per-consumer redelivery **visibility timeout** in ms (≈ JetStream *AckWait*): how long a
     /// claimed-but-unacked message stays leased before redelivery. `None` ⇒ the server default
     /// (30 s). A short lease suits fast retry/DLQ; a long one suits big-blob work — one global
@@ -1293,6 +1311,49 @@ mod tests {
     }
 
     #[test]
+    fn secret_allowlist_field_defaults_empty_and_round_trips() {
+        // Task #492: the per-guest `secrets` allowlist is an optional opt-in. Absent ⇒ empty ⇒
+        // "inject the whole site pool" (non-breaking), so a pre-#492 handler config still parses.
+        let bare: HandlerConfig =
+            serde_json::from_str(r#"{"route":"/*","component":"h.wasm"}"#).unwrap();
+        assert!(
+            bare.secrets.is_empty(),
+            "absent ⇒ empty (inject-all default)"
+        );
+
+        // A non-empty allowlist deserializes and round-trips verbatim.
+        let scoped: HandlerConfig = serde_json::from_str(
+            r#"{"route":"/*","component":"h.wasm","secrets":["SECRET_A","SECRET_B"]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            scoped.secrets,
+            vec!["SECRET_A".to_string(), "SECRET_B".to_string()]
+        );
+        let reparsed: HandlerConfig =
+            serde_json::from_str(&serde_json::to_string(&scoped).unwrap()).unwrap();
+        assert_eq!(reparsed.secrets, scoped.secrets);
+
+        // And an empty allowlist is elided on serialize (skip_serializing_if), so a config that
+        // never used the feature serializes byte-identically to before.
+        let json = serde_json::to_string(&bare).unwrap();
+        assert!(
+            !json.contains("secrets"),
+            "empty allowlist is not serialized: {json}"
+        );
+
+        // Same contract on a consumer.
+        let consumer: ConsumerConfig = serde_json::from_str(
+            r#"{"topic":"orders","component":"c.wasm","secrets":["SECRET_A"]}"#,
+        )
+        .unwrap();
+        assert_eq!(consumer.secrets, vec!["SECRET_A".to_string()]);
+        let bare_consumer: ConsumerConfig =
+            serde_json::from_str(r#"{"topic":"orders","component":"c.wasm"}"#).unwrap();
+        assert!(bare_consumer.secrets.is_empty());
+    }
+
+    #[test]
     fn transport_redirect_https_canonical_and_noop() {
         let mut domains = DomainConfig {
             primary: Some("example.com".into()),
@@ -1401,6 +1462,7 @@ mod tests {
                 streaming: false,
                 limits: None,
                 env: BTreeMap::from([("AWS_KEY".to_string(), "AKIAIOSFODNN7EXAMPLE".to_string())]),
+                secrets: Vec::new(),
                 invoke_targets: Vec::new(),
                 stats_topics: Vec::new(),
             }],

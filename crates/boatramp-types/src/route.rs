@@ -768,6 +768,7 @@ mod tests {
             streaming: false,
             limits: None,
             env: BTreeMap::new(),
+            secrets: Vec::new(),
             invoke_targets: Vec::new(),
             stats_topics: Vec::new(),
         };

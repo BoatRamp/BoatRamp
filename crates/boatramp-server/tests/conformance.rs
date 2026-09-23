@@ -1552,6 +1552,7 @@ async fn handler_route_dispatches_through_engine() {
     );
     let config = DeployConfig {
         handlers: vec![HandlerConfig {
+            secrets: Vec::new(),
             tenancy: None,
             token_claims: None,
             route: "/count".to_string(),
@@ -1673,6 +1674,7 @@ async fn cookie_auth_csrf_gate_fires_in_the_pipeline() {
     );
     let config = DeployConfig {
         handlers: vec![HandlerConfig {
+            secrets: Vec::new(),
             tenancy: None,
             token_claims: None,
             route: "/api".to_string(),
@@ -3251,6 +3253,7 @@ async fn activation_during_traffic_drops_no_requests() {
         },
     );
     let handler = HandlerConfig {
+        secrets: Vec::new(),
         tenancy: None,
         token_claims: None,
         route: "/count".to_string(),
@@ -3415,6 +3418,7 @@ async fn preview_runs_handlers_scoped_off_live_state() {
         files,
         config: DeployConfig {
             handlers: vec![HandlerConfig {
+                secrets: Vec::new(),
                 tenancy: None,
                 token_claims: None,
                 route: "/count".to_string(),
@@ -3541,6 +3545,7 @@ async fn activation_refuses_broken_component() {
         files,
         config: DeployConfig {
             handlers: vec![HandlerConfig {
+                secrets: Vec::new(),
                 tenancy: None,
                 token_claims: None,
                 route: "/x".to_string(),
@@ -3654,6 +3659,7 @@ async fn activation_refuses_a_non_consumer_component() {
         files,
         config: DeployConfig {
             consumers: vec![ConsumerConfig {
+                secrets: Vec::new(),
                 tenancy: None,
                 token_claims: None,
                 backoff_ms: None,
@@ -3772,6 +3778,7 @@ async fn activation_refuses_disallowed_import() {
         files,
         config: DeployConfig {
             handlers: vec![HandlerConfig {
+                secrets: Vec::new(),
                 tenancy: None,
                 token_claims: None,
                 route: "/count".to_string(),
@@ -3875,6 +3882,7 @@ async fn activation_refuses_oversized_component() {
         files,
         config: DeployConfig {
             handlers: vec![HandlerConfig {
+                secrets: Vec::new(),
                 tenancy: None,
                 token_claims: None,
                 route: "/count".to_string(),
@@ -3981,6 +3989,7 @@ async fn handler_route_with_sql_dispatches_through_engine() {
         files,
         config: DeployConfig {
             handlers: vec![HandlerConfig {
+                secrets: Vec::new(),
                 tenancy: None,
                 token_claims: None,
                 route: "/count".to_string(),
@@ -4111,6 +4120,7 @@ async fn handler_opens_named_sql_databases_with_least_privilege() {
         files,
         config: DeployConfig {
             handlers: vec![HandlerConfig {
+                secrets: Vec::new(),
                 tenancy: None,
                 token_claims: None,
                 route: "/sql".to_string(),
@@ -4239,6 +4249,7 @@ async fn per_site_timeout_cap_applies() {
         files,
         config: DeployConfig {
             handlers: vec![HandlerConfig {
+                secrets: Vec::new(),
                 tenancy: None,
                 token_claims: None,
                 route: "/loop".to_string(),
@@ -4751,6 +4762,7 @@ async fn operator_endpoint_reports_invocation_and_consumer_stats() {
         files,
         config: DeployConfig {
             handlers: vec![HandlerConfig {
+                secrets: Vec::new(),
                 tenancy: None,
                 token_claims: None,
                 route: "/count".to_string(),
@@ -4764,6 +4776,7 @@ async fn operator_endpoint_reports_invocation_and_consumer_stats() {
                 stats_topics: Vec::new(),
             }],
             consumers: vec![ConsumerConfig {
+                secrets: Vec::new(),
                 tenancy: None,
                 token_claims: None,
                 backoff_ms: None,
@@ -4903,6 +4916,7 @@ async fn guest_logs_captured_and_served() {
         files,
         config: DeployConfig {
             handlers: vec![HandlerConfig {
+                secrets: Vec::new(),
                 tenancy: None,
                 token_claims: None,
                 route: "/log".to_string(),
@@ -5037,6 +5051,7 @@ async fn guest_logs_suppressed_when_capture_disabled() {
         files,
         config: DeployConfig {
             handlers: vec![HandlerConfig {
+                secrets: Vec::new(),
                 tenancy: None,
                 token_claims: None,
                 route: "/log".to_string(),
@@ -5242,6 +5257,7 @@ async fn handler_env_injected_host_env_not_inherited() {
                 streaming: false,
                 limits: None,
                 env: BTreeMap::from([("GREETING".to_string(), "hello".to_string())]),
+                secrets: Vec::new(),
                 invoke_targets: Vec::new(),
                 stats_topics: Vec::new(),
             }],
@@ -5287,6 +5303,173 @@ async fn handler_env_injected_host_env_not_inherited() {
     // Declared env is visible; the host's PATH (always set in the test process)
     // is not — the guest gets only what the deploy/site granted.
     assert_eq!(text, "greeting=hello path_leaked=false", "got: {text}");
+}
+
+/// **Task #492 — per-guest secret allowlist, END-TO-END, CI-hard.** Two handlers sharing an
+/// IDENTICAL 2-entry `[handlers].secrets` pool. Handler A declares an allowlist that grants ONLY
+/// `SECRET_A`; handler B declares nothing (⇒ the whole pool). Each is served at route `/env` — the
+/// only path the committed `http-200` guest branches on (it echoes the `GREETING` env var) — so the
+/// two live on distinct sites (`blog-a`/`blog-b`) carrying the SAME pool definition; the difference
+/// under test is purely the per-handler allowlist. `GREETING` is the guest-observable proxy for "the
+/// secret A must NOT receive": if A's filter drops it, A's guest reports `greeting=unset`; B's guest,
+/// with the whole pool, reports the injected value.
+///
+/// Driven through the REAL `router()` → handler dispatch → `build_bindings` → `resolve_env` →
+/// engine, so the filter is load-bearing end-to-end. **Non-hollow:** it asserts A's guest sees
+/// `greeting=unset` (the ungranted secret is ABSENT). Remove the `filter_site_secrets` call from the
+/// resolve choke point and A would receive the whole pool, its guest would echo the injected value,
+/// and this assertion fails — the exact regression the field exists to prevent. (The positive grant
+/// — A DOES receive its granted `SECRET_A` — is asserted at the resolved-env layer in
+/// `boatramp_server`'s `resolve_env_applies_the_per_guest_secret_allowlist`, since the guest only
+/// surfaces `GREETING`.)
+#[cfg(feature = "handlers")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn handler_secret_allowlist_scopes_the_site_pool_end_to_end() {
+    use boatramp_core::config::{HandlerConfig, HandlersSiteConfig};
+    use boatramp_handlers::{HandlerEngine, Limits};
+
+    const HTTP_200: &[u8] = include_bytes!("../../boatramp-handlers/tests/fixtures/http-200.wasm");
+
+    // Two host env vars back the shared pool. `GREETING` is the guest-observable proxy for the
+    // secret handler A must NOT receive; `SECRET_A` is the one A IS granted. Unique names so a
+    // concurrently-running test can't clobber them.
+    std::env::set_var("BR_ALLOWLIST_GATE_GREETING", "leaked-secret-b");
+    std::env::set_var("BR_ALLOWLIST_GATE_A", "value-a");
+
+    let storage = Arc::new(MemStorage::default());
+    let kv = Arc::new(MemoryKv::new());
+    let deploy = DeployStore::new(storage.clone(), kv.clone());
+    let hash = sha256_hex(HTTP_200);
+    let stream: ByteStream =
+        futures::stream::once(async move { Ok(bytes::Bytes::from_static(HTTP_200)) }).boxed();
+    deploy.put_blob(&hash, stream).await.unwrap();
+
+    // One `[handlers].secrets` pool DEFINITION, injected to each handler — the shared pool.
+    let pool = || {
+        BTreeMap::from([
+            (
+                "GREETING".to_string(),
+                "env:BR_ALLOWLIST_GATE_GREETING".to_string(),
+            ),
+            (
+                "SECRET_A".to_string(),
+                "env:BR_ALLOWLIST_GATE_A".to_string(),
+            ),
+        ])
+    };
+    // The same component on route `/env` (the only path the http-200 guest echoes env for), with a
+    // per-handler `secrets` allowlist — the #492 field under test.
+    let manifest = |allowlist: Vec<String>| {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "h.wasm".to_string(),
+            FileEntry {
+                hash: hash.clone(),
+                size: HTTP_200.len() as u64,
+                content_type: None,
+                variants: BTreeMap::new(),
+            },
+        );
+        Manifest {
+            files,
+            config: DeployConfig {
+                handlers: vec![HandlerConfig {
+                    tenancy: None,
+                    token_claims: None,
+                    route: "/env".to_string(),
+                    methods: Vec::new(),
+                    component: "h.wasm".to_string(),
+                    imports: Vec::new(),
+                    streaming: false,
+                    limits: None,
+                    env: BTreeMap::new(),
+                    secrets: allowlist,
+                    invoke_targets: Vec::new(),
+                    stats_topics: Vec::new(),
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    };
+    let site = |cfg: Option<HandlersSiteConfig>| SiteConfig {
+        handlers: cfg,
+        ..Default::default()
+    };
+
+    // Site A: handler granted ONLY `SECRET_A` — the pool's `GREETING` must be filtered out.
+    let id_a = deploy
+        .put_manifest(&manifest(vec!["SECRET_A".to_string()]))
+        .await
+        .unwrap();
+    deploy
+        .activate(ProjectRef::DEFAULT, "blog-a", &id_a)
+        .await
+        .unwrap();
+    // Site B: handler declares no allowlist ⇒ the whole (identical) pool.
+    let id_b = deploy.put_manifest(&manifest(Vec::new())).await.unwrap();
+    deploy
+        .activate(ProjectRef::DEFAULT, "blog-b", &id_b)
+        .await
+        .unwrap();
+    for s in ["blog-a", "blog-b"] {
+        deploy
+            .set_site_config(
+                ProjectRef::DEFAULT,
+                s,
+                &site(Some(HandlersSiteConfig {
+                    enabled: true,
+                    secrets: pool(),
+                    ..Default::default()
+                })),
+            )
+            .await
+            .unwrap();
+    }
+
+    let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
+    let runtime = HandlerRuntime::new(engine, kv, storage, None, None);
+    // Single-tenant/dev posture so the pool's `env:` refs resolve from the host env (the
+    // multi-tenant default refuses them — unrelated to this feature).
+    runtime.set_allow_env_secret_refs(true);
+    let app = router(deploy, Auth::disabled(), runtime);
+
+    let call = |app: axum::Router, site: &str| {
+        let uri = format!("/_sites/{site}/env");
+        async move {
+            let mut req = Request::builder()
+                .method("GET")
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap();
+            req.extensions_mut()
+                .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40001))));
+            let response = app.oneshot(req).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            String::from_utf8_lossy(&body).to_string()
+        }
+    };
+
+    // Handler A's allowlist grants only `SECRET_A`, so the pool's `GREETING` entry is FILTERED
+    // OUT — the guest sees no GREETING and reports `unset`. (If the filter were removed, A would
+    // receive the whole pool and report `greeting=leaked-secret-b`, failing here.)
+    let a = call(app.clone(), "blog-a").await;
+    assert_eq!(
+        a, "greeting=unset path_leaked=false",
+        "handler A must NOT receive the ungranted `GREETING` secret; got: {a}"
+    );
+
+    // Handler B declares no allowlist ⇒ the whole pool, so it DOES receive `GREETING`.
+    let b = call(app, "blog-b").await;
+    assert_eq!(
+        b, "greeting=leaked-secret-b path_leaked=false",
+        "handler B (no allowlist) must receive the whole site pool; got: {b}"
+    );
+
+    std::env::remove_var("BR_ALLOWLIST_GATE_GREETING");
+    std::env::remove_var("BR_ALLOWLIST_GATE_A");
+    println!("SECRET ALLOWLIST SCOPED OK");
 }
 
 // ---- domain ownership verification -----------------------------------------
@@ -6734,6 +6917,7 @@ async fn mesh_dispatch(
         files,
         config: DeployConfig {
             handlers: vec![HandlerConfig {
+                secrets: Vec::new(),
                 tenancy: None,
                 token_claims: None,
                 route: "/run".into(),
@@ -6918,6 +7102,7 @@ async fn federation_gateway_stitches_real_subgraph_functions() {
         files,
         config: DeployConfig {
             handlers: vec![HandlerConfig {
+                secrets: Vec::new(),
                 tenancy: None,
                 token_claims: None,
                 route: "/graphql".into(),
@@ -7057,6 +7242,7 @@ async fn federation_gateway_executes_a_mutation_forwarding_its_argument() {
         files,
         config: DeployConfig {
             handlers: vec![HandlerConfig {
+                secrets: Vec::new(),
                 tenancy: None,
                 token_claims: None,
                 route: "/graphql".into(),
@@ -7257,6 +7443,7 @@ async fn graphql_data_connector_serves_from_the_database_with_row_isolation() {
         files,
         config: DeployConfig {
             handlers: vec![HandlerConfig {
+                secrets: Vec::new(),
                 tenancy: None,
                 token_claims: None,
                 route: "/graphql".into(),
@@ -7501,6 +7688,7 @@ async fn graphql_data_connector_delegates_a_field_to_a_wasm_function() {
         files,
         config: DeployConfig {
             handlers: vec![HandlerConfig {
+                secrets: Vec::new(),
                 tenancy: None,
                 token_claims: None,
                 route: "/graphql".into(),
@@ -7648,6 +7836,7 @@ async fn graphql_data_connector_mutations_write_with_row_isolation() {
         files,
         config: DeployConfig {
             handlers: vec![HandlerConfig {
+                secrets: Vec::new(),
                 tenancy: None,
                 token_claims: None,
                 route: "/graphql".into(),
@@ -7864,6 +8053,7 @@ async fn federation_composes_a_sql_subgraph_with_a_wasm_subgraph() {
         files,
         config: DeployConfig {
             handlers: vec![HandlerConfig {
+                secrets: Vec::new(),
                 tenancy: None,
                 token_claims: None,
                 route: "/graphql".into(),
@@ -8015,6 +8205,7 @@ async fn registering_a_sql_subgraph_via_the_admin_api_composes_and_serves() {
         files,
         config: DeployConfig {
             handlers: vec![HandlerConfig {
+                secrets: Vec::new(),
                 tenancy: None,
                 token_claims: None,
                 route: "/graphql".into(),
@@ -8265,6 +8456,7 @@ async fn graphql_data_connector_isolates_by_a_verified_app_token_claim() {
         files,
         config: DeployConfig {
             handlers: vec![HandlerConfig {
+                secrets: Vec::new(),
                 tenancy: None,
                 token_claims: None,
                 route: "/graphql".into(),

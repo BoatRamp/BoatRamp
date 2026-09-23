@@ -396,6 +396,8 @@ pub(super) async fn dispatch_handler(
         &handler.env,
         &handler.invoke_targets,
         &handler.stats_topics,
+        // Per-guest secret allowlist (task #492): empty ⇒ the whole site pool, else only these keys.
+        &handler.secrets,
         // A site handler is the entry point of a call chain (reached over HTTP), so it
         // invokes siblings at depth 0; the host caps each subsequent hop.
         0,
@@ -1346,6 +1348,10 @@ pub(super) async fn build_bindings(
     // carry a literal `{tenant}` placeholder the host fills with this invocation's resolved tenant;
     // the guest can never name the tenant. Empty ⇒ no bus stats readable (deny-by-default).
     stats_topics: &[String],
+    // Per-guest secret allowlist (task #492): the subset of the site `[handlers].secrets` pool KEYS
+    // this guest is granted. Empty ⇒ inject the whole pool (default, non-breaking); non-empty ⇒ inject
+    // only the named keys (least-privilege). Filtered at the `resolve_env` choke point below.
+    secret_allowlist: &[String],
     depth: u32,
     request_id: Option<&str>,
     // Stage 0 tenant-source inputs (the verified bearer for a token source; the routed domain's
@@ -1826,6 +1832,7 @@ pub(super) async fn build_bindings(
         project,
         deploy_env,
         site_handlers,
+        secret_allowlist,
         allow_env_secret_refs,
         inner.secret_store.get().map(std::convert::AsRef::as_ref),
     )
@@ -1834,9 +1841,43 @@ pub(super) async fn build_bindings(
     Ok(bindings)
 }
 
+/// Filter the site `[handlers].secrets` pool to a per-guest **allowlist** (task #492):
+/// the single choke point every guest kind that injects the site pool (handlers,
+/// consumers, and cron-triggered handlers) shares, so they can never diverge.
+///
+/// - `allowlist` **empty** ⇒ return the whole pool (today's behavior; the field is a
+///   non-breaking opt-in, so an absent/empty allowlist means "inject everything").
+/// - `allowlist` **non-empty** ⇒ keep only the pool entries whose KEY (the guest env-var
+///   name) is named in the allowlist — least-privilege. An allowlist name that is not a
+///   pool key is silently dropped **here** (the resolve path is not the enforcement point
+///   for typos); activation-time validation ([`SecurityRuntime::precheck_activation`]) is
+///   what turns an unknown name into a hard error, so this stays a pure projection.
+///
+/// The map is cloned (returned owned) so the caller can pass it to
+/// [`resolve_secret_env`] alongside a `deploy_env` borrow without a lifetime tangle; the
+/// pool is small (a handful of entries), so the clone is negligible.
+#[cfg(feature = "handlers")]
+pub(super) fn filter_site_secrets(
+    pool: &std::collections::BTreeMap<String, String>,
+    allowlist: &[String],
+) -> std::collections::BTreeMap<String, String> {
+    if allowlist.is_empty() {
+        return pool.clone();
+    }
+    pool.iter()
+        .filter(|(key, _)| allowlist.iter().any(|a| a == *key))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
+}
+
 /// Assemble the guest environment: static deploy `env` first, then site
 /// `secrets` resolved from the host environment (a missing referent is logged
 /// and skipped, never injected as empty). A secret name overrides a static one.
+///
+/// `secret_allowlist` is the per-guest opt-in subset of the site pool KEYS
+/// ([`filter_site_secrets`]): empty ⇒ the whole pool (default), non-empty ⇒ only the
+/// named keys (least-privilege). Applied **before** resolution, so a secret the guest is
+/// not granted is never even read from the store/env for this guest.
 ///
 /// `allow_env_secret_refs` is the security posture's `allow_env_secret_refs`
 /// (on under single-tenant/dev, off under multi-tenant): when off, a bare /
@@ -1848,14 +1889,16 @@ pub(super) async fn resolve_env(
     project: boatramp_core::project::ProjectRef<'_>,
     deploy_env: &std::collections::BTreeMap<String, String>,
     site_handlers: &boatramp_core::config::HandlersSiteConfig,
+    secret_allowlist: &[String],
     allow_env_secret_refs: bool,
     secret_store: Option<&boatramp_core::secret_store::SecretStore>,
 ) -> Result<Vec<(String, String)>, String> {
+    let scoped = filter_site_secrets(&site_handlers.secrets, secret_allowlist);
     resolve_secret_env(
         site,
         project,
         deploy_env,
-        &site_handlers.secrets,
+        &scoped,
         allow_env_secret_refs,
         secret_store,
     )
@@ -2003,6 +2046,50 @@ pub(super) fn admit_secret_refs(
     Ok(())
 }
 
+/// Deploy-time admission for a guest's per-guest **secret allowlist** (task #492): every
+/// name in `allowlist` must be a KEY of the site `[handlers].secrets` `pool`. Mirrors the
+/// unknown-import check ([`boatramp_core::config`]'s `check_import`) — a typo or a
+/// removed/rotated secret name is caught at activation with a speaking error naming the
+/// guest (`label`) + the offending name, rather than silently injecting nothing at
+/// runtime. `Err(msg)` refuses the activation.
+///
+/// - An **empty** allowlist means "inject the whole pool" (the non-breaking default) and
+///   is never an error, even when the pool itself is empty.
+/// - A **non-empty** allowlist against an **empty** pool is refused: the guest asks to be
+///   granted named secrets but the site defines none — there is nothing to grant, so this
+///   is a misconfiguration, not a silent no-op.
+/// - Otherwise every name must be a key of the pool; the first unknown name errors.
+#[cfg(feature = "handlers")]
+pub(super) fn admit_secret_allowlist(
+    pool: &std::collections::BTreeMap<String, String>,
+    allowlist: &[String],
+    label: &str,
+) -> Result<(), String> {
+    if allowlist.is_empty() {
+        return Ok(());
+    }
+    if pool.is_empty() {
+        return Err(format!(
+            "{label} declares a secret allowlist {allowlist:?} but the site defines no \
+             [handlers].secrets pool — add the named secrets to the site pool, or drop the \
+             allowlist (an empty allowlist injects the whole pool)"
+        ));
+    }
+    for name in allowlist {
+        if !pool.contains_key(name) {
+            let mut known: Vec<&str> = pool.keys().map(String::as_str).collect();
+            known.sort_unstable();
+            return Err(format!(
+                "{label} secret allowlist names {name:?}, which is not a key of the site \
+                 [handlers].secrets pool (known: {}) — a typo or a removed/rotated secret. Fix the \
+                 name or add it to the site pool",
+                known.join(", ")
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// A parsed secret reference from a `secrets` map value.
 #[cfg(feature = "handlers")]
 enum SecretRef<'a> {
@@ -2062,6 +2149,10 @@ pub(super) struct ConsumerRebuild<'a> {
     pub token_claims: Option<&'a boatramp_core::config::HandlerGraphqlTokenClaims>,
     /// The consumer's declared `bus:` stats-topic templates for the `messaging-stats` capability.
     pub stats_topics: &'a [String],
+    /// The consumer's per-guest secret allowlist (task #492): the subset of the site pool KEYS it is
+    /// granted. Empty ⇒ the whole pool. Threaded so a per-message rebuild scopes secrets identically
+    /// to the once-per-tick build.
+    pub secret_allowlist: &'a [String],
 }
 
 #[cfg(feature = "handlers")]
@@ -2085,6 +2176,7 @@ impl ConsumerRebuild<'_> {
             &std::collections::BTreeMap::new(),
             &[],
             self.stats_topics,
+            self.secret_allowlist,
             0,
             None,
             None,
@@ -2569,5 +2661,119 @@ mod cookie_auth_tests {
             cookie_auth_outcome(&headers(&[("cookie", "session=tok")]), None),
             CookieAuthOutcome::None
         ));
+    }
+}
+
+/// Task #492 per-guest secret allowlist: the pure projection ([`filter_site_secrets`]) and the
+/// activation-time admission ([`admit_secret_allowlist`]). These are the two halves the choke point
+/// relies on — the filter is what a bound guest actually sees, the admission is what a typo trips.
+#[cfg(all(test, feature = "handlers"))]
+mod secret_allowlist_tests {
+    use super::{admit_secret_allowlist, filter_site_secrets};
+    use std::collections::BTreeMap;
+
+    fn pool(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
+        entries
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
+    }
+
+    fn allow(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn filter_keeps_only_declared_keys() {
+        let p = pool(&[
+            ("SECRET_A", "env:HOST_A"),
+            ("SECRET_B", "env:HOST_B"),
+            ("SECRET_C", "boatramp:c"),
+        ]);
+        let scoped = filter_site_secrets(&p, &allow(&["SECRET_A"]));
+        // Only the declared key survives — the very property the gate observes (B must be ABSENT).
+        assert_eq!(scoped.len(), 1);
+        assert!(scoped.contains_key("SECRET_A"));
+        assert!(!scoped.contains_key("SECRET_B"));
+        assert!(!scoped.contains_key("SECRET_C"));
+        // The kept entry's VALUE (the ref) is preserved verbatim for resolution.
+        assert_eq!(
+            scoped.get("SECRET_A").map(String::as_str),
+            Some("env:HOST_A")
+        );
+
+        // A multi-name allowlist keeps exactly that set.
+        let two = filter_site_secrets(&p, &allow(&["SECRET_A", "SECRET_C"]));
+        assert_eq!(two.len(), 2);
+        assert!(two.contains_key("SECRET_A") && two.contains_key("SECRET_C"));
+        assert!(!two.contains_key("SECRET_B"));
+    }
+
+    #[test]
+    fn empty_allowlist_passes_the_whole_pool() {
+        // The non-breaking default: absent/empty ⇒ inject everything (today's behavior).
+        let p = pool(&[("SECRET_A", "env:HOST_A"), ("SECRET_B", "env:HOST_B")]);
+        let all = filter_site_secrets(&p, &[]);
+        assert_eq!(all, p);
+    }
+
+    #[test]
+    fn filter_drops_an_unknown_allowlist_name_without_inventing_entries() {
+        // The projection is not the enforcement point for typos (admission is) — it must never
+        // fabricate a key. An allowlist naming only an unknown key yields an EMPTY scoped map.
+        let p = pool(&[("SECRET_A", "env:HOST_A")]);
+        let scoped = filter_site_secrets(&p, &allow(&["NOPE"]));
+        assert!(scoped.is_empty());
+    }
+
+    #[test]
+    fn admit_accepts_a_known_allowlist_and_an_empty_one() {
+        let p = pool(&[("SECRET_A", "env:HOST_A"), ("SECRET_B", "env:HOST_B")]);
+        // Every name is a pool key ⇒ OK.
+        admit_secret_allowlist(&p, &allow(&["SECRET_A"]), "handler route \"/a\" [GET]")
+            .expect("a known allowlist is admitted");
+        // Empty allowlist ⇒ inject-all, always OK (even against an empty pool).
+        admit_secret_allowlist(&p, &[], "handler route \"/b\" [GET]").expect("empty is admitted");
+        admit_secret_allowlist(&BTreeMap::new(), &[], "handler route \"/c\" [GET]")
+            .expect("empty allowlist against empty pool is admitted");
+    }
+
+    #[test]
+    fn admit_rejects_an_undefined_secret_naming_the_guest_and_the_name() {
+        let p = pool(&[("SECRET_A", "env:HOST_A")]);
+        let err =
+            admit_secret_allowlist(&p, &allow(&["SECRET_TYPO"]), "handler route \"/x\" [POST]")
+                .expect_err("an allowlist naming an undefined secret is refused");
+        // The error names BOTH the offending guest (its label) and the unknown secret — typo/rot help.
+        assert!(
+            err.contains("handler route \"/x\" [POST]"),
+            "names the guest: {err}"
+        );
+        assert!(
+            err.contains("SECRET_TYPO"),
+            "names the unknown secret: {err}"
+        );
+        // And it lists what IS known, so the fix is obvious.
+        assert!(err.contains("SECRET_A"), "lists the known keys: {err}");
+    }
+
+    #[test]
+    fn admit_rejects_any_allowlist_when_the_site_pool_is_empty() {
+        // A guest asking to be granted named secrets while the site defines none is a
+        // misconfiguration, not a silent no-op (there is nothing to grant).
+        let err = admit_secret_allowlist(
+            &BTreeMap::new(),
+            &allow(&["SECRET_A"]),
+            "consumer \"orders\"",
+        )
+        .expect_err("a non-empty allowlist against an empty pool is refused");
+        assert!(
+            err.contains("consumer \"orders\""),
+            "names the guest: {err}"
+        );
+        assert!(
+            err.contains("no") && err.contains("[handlers].secrets"),
+            "explains the empty pool: {err}"
+        );
     }
 }

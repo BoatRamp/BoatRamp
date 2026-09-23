@@ -788,6 +788,8 @@ pub(super) async fn run_scheduler_tick(
                                 &[],
                                 // The consumer's declared `bus:` stats-topic templates (messaging-stats).
                                 &consumer.stats_topics,
+                                // Per-guest secret allowlist (task #492): empty ⇒ the whole site pool.
+                                &consumer.secrets,
                                 0,
                                 // Background consumers have no request context to correlate with.
                                 None,
@@ -840,6 +842,7 @@ pub(super) async fn run_scheduler_tick(
                                     tenancy: consumer.tenancy.as_ref(),
                                     token_claims: consumer.token_claims.as_ref(),
                                     stats_topics: &consumer.stats_topics,
+                                    secret_allowlist: &consumer.secrets,
                                 });
                             acked += dispatch_consumer_batch(
                                 &inner.engine,
@@ -1097,6 +1100,8 @@ async fn fire_cron(
         // invoke allowlist applies the same as on the HTTP path.
         &handler.invoke_targets,
         &handler.stats_topics,
+        // A cron-triggered handler inherits the matched handler's per-guest secret allowlist (#492).
+        &handler.secrets,
         0,
         // A cron trigger has no inbound request to correlate with.
         None,

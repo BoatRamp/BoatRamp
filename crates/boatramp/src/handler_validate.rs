@@ -636,6 +636,7 @@ mod imp {
                     streaming: false,
                     limits: None,
                     env: BTreeMap::new(),
+                    secrets: Vec::new(),
                     invoke_targets: vec![],
                     stats_topics: Vec::new(),
                 }],

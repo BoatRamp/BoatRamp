@@ -982,6 +982,7 @@ mod tests {
             streaming: false,
             limits: None,
             env: BTreeMap::new(),
+            secrets: Vec::new(),
             invoke_targets: Vec::new(),
             stats_topics: Vec::new(),
         }
@@ -1013,6 +1014,7 @@ mod tests {
                 imports: vec!["sql".into()],
                 group: String::new(),
                 start: Default::default(),
+                secrets: Vec::new(),
                 lease_ms: None,
                 max_attempts: None,
                 max_batch: None,
