@@ -26,6 +26,9 @@ pub enum Error {
     /// A `project migrate` subcommand failure.
     #[error(transparent)]
     Migrate(#[from] crate::project_migrate::Error),
+    /// A `project repair` subcommand failure.
+    #[error(transparent)]
+    Repair(#[from] crate::project_repair::Error),
 }
 
 /// `project` module result; `Err` is [`Error`].
@@ -87,6 +90,10 @@ enum ProjectCommand {
     /// (`migrate apply|dry-run|baseline|status`). The mutating verbs run as the project's
     /// non-superuser owner role and need a `Project·Admin` token; `status` needs `Project·Read`.
     Migrate(crate::project_migrate::MigrateArgs),
+    /// Repair a managed tenant's provisioning drift (the owner-model retrofit that unblocks
+    /// `project migrate`). Defaults to a dry-run; `--apply` converges. Fixes provisioning so
+    /// migrate can run; never touches schema or data. `Project·Admin`.
+    Repair(crate::project_repair::RepairArgs),
 }
 
 /// Whether a `--force` confirmation `typed` at the prompt authorizes deleting
@@ -305,6 +312,9 @@ pub async fn run(args: ProjectArgs, config: &ProjectConfig) -> Result<()> {
         }
         ProjectCommand::Migrate(margs) => {
             crate::project_migrate::run(margs, &cp).await?;
+        }
+        ProjectCommand::Repair(rargs) => {
+            crate::project_repair::run(rargs, &cp).await?;
         }
     }
     Ok(())

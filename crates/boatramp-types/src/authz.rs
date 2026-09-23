@@ -310,6 +310,18 @@ impl Right {
                     Some(proj.to_string()),
                     if get { Action::Read } else { Action::Admin },
                 ),
+                // Owner-gated provisioning DRIFT-REPAIR (`/api/projects/<proj>/repair/…`) runs
+                // host-derived privileged provisioning DDL (role create, `ALTER DATABASE OWNER`,
+                // `REASSIGN OWNED`) — an escalation risk at least as boundary-critical as the
+                // migrate surface. BOTH forms (apply = `POST …/repair/<db>`, dry-run = `POST
+                // …/repair/<db>/dry-run`) gate at **`Project·Admin`** on THIS project, never the
+                // deploy-grade publisher the general project catch-all below would grant. Gated
+                // explicitly here, above that catch-all, so a `project_publisher` can never run
+                // the superuser repair DDL. (`repair` is read-free — every verb is a POST — so
+                // even the dry-run stays Admin; the `get` branch is unreachable but harmless.)
+                Some((&"repair", _)) => {
+                    Self::new(Resource::Project, Some(proj.to_string()), Action::Admin)
+                }
                 // The project-bus operator surface (`/api/projects/<proj>/_boatramp/bus/…`):
                 // dead-letter + work-queue inspection/management for the **shared project
                 // bus** (the `{project}/bus/{topic}` keyspace a `bus:<topic>` publish routes
@@ -397,6 +409,20 @@ impl Right {
                 Resource::Project,
                 Some(default_project.clone()),
                 if get { Action::Read } else { Action::Admin },
+            ),
+            // The owner-gated provisioning DRIFT-REPAIR surface (`POST /api/repair/{db}` +
+            // `/api/repair/{db}/dry-run`): repair runs host-derived privileged provisioning DDL
+            // (role create, `ALTER DATABASE OWNER`, `REASSIGN OWNED`). Because `/api/repair/…`
+            // would OTHERWISE be swept by the `/api/sql/` catch-all below — which resolves to
+            // `Project·Deploy`, a right a ship-only publisher token holds — nesting it under `sql`
+            // would be an ESCALATION (a publisher could run the superuser repair DDL). So it gets
+            // its OWN prefix, gated at **`Project·Admin`** for BOTH apply and dry-run, placed
+            // ABOVE the `/api/sql/` arm. (Every repair verb is a POST, so the dry-run stays Admin
+            // too; the `get` branch is unreachable but kept uniform.)
+            p if p.starts_with("/api/repair/") => Self::new(
+                Resource::Project,
+                Some(default_project.clone()),
+                Action::Admin,
             ),
             // Operator SQL to a managed database (project-owned): migrations + queries
             // are operator tools scoped to the default project. `project·deploy` (they
@@ -2024,6 +2050,78 @@ mod tests {
         assert!(
             acme_admin.allows(&acme_apply),
             "a project_admin on acme must be able to migrate acme's schema",
+        );
+    }
+
+    /// The owner-gated provisioning DRIFT-REPAIR surface (`/api/repair/…`) runs host-derived
+    /// privileged provisioning DDL (role create, `ALTER DATABASE OWNER`, `REASSIGN OWNED`). It must
+    /// NOT be reachable at the `Project·Deploy` grade the sibling `/api/sql/` catch-all grants (which
+    /// a ship-only publisher holds) — that would be an escalation. BOTH the apply (`POST
+    /// /api/repair/{db}`) AND the dry-run (`POST /api/repair/{db}/dry-run`) gate at `Project·Admin`;
+    /// a `project_publisher` is REFUSED, a `project_admin` ALLOWED, for the global + project-scoped
+    /// forms alike.
+    #[test]
+    fn repair_surface_is_project_admin_not_publisher() {
+        let policy = AuthzPolicy::default_policy();
+
+        // ---- Global (default-project) form: apply + dry-run both map to default-project Admin. ----
+        let default_admin = Right::new(Resource::Project, Some("default".into()), Action::Admin);
+        for path in ["/api/repair/appdb", "/api/repair/appdb/dry-run"] {
+            assert_eq!(
+                Right::required("POST", path),
+                Some(default_admin.clone()),
+                "POST {path} must require Project·Admin (never the /api/sql Deploy grade)",
+            );
+        }
+        // A publisher on the default project ships code but MUST NOT run the repair DDL; an admin can.
+        let publisher = policy.rights_for(&[GrantedRole::scoped("project_publisher", "default")]);
+        let admin = policy.rights_for(&[GrantedRole::scoped("project_admin", "default")]);
+        for path in ["/api/repair/appdb", "/api/repair/appdb/dry-run"] {
+            let req = Right::required("POST", path).unwrap();
+            assert!(
+                !publisher.allows(&req),
+                "a project_publisher must NOT be able to run repair ({path})",
+            );
+            assert!(
+                admin.allows(&req),
+                "a project_admin must be able to run repair ({path})",
+            );
+        }
+
+        // ---- Project-scoped form (the one a non-default tenant uses). ----
+        for path in [
+            "/api/projects/acme/repair/appdb",
+            "/api/projects/acme/repair/appdb/dry-run",
+        ] {
+            assert_eq!(
+                Right::required("POST", path),
+                Some(Right::new(
+                    Resource::Project,
+                    Some("acme".into()),
+                    Action::Admin
+                )),
+                "POST {path} must require Project·Admin on acme",
+            );
+        }
+        let acme_apply = Right::required("POST", "/api/projects/acme/repair/appdb").unwrap();
+        let acme_dry = Right::required("POST", "/api/projects/acme/repair/appdb/dry-run").unwrap();
+        let acme_pub = policy.rights_for(&[GrantedRole::scoped("project_publisher", "acme")]);
+        let acme_admin = policy.rights_for(&[GrantedRole::scoped("project_admin", "acme")]);
+        for req in [&acme_apply, &acme_dry] {
+            assert!(
+                !acme_pub.allows(req),
+                "a project_publisher on acme must NOT be able to repair acme's provisioning",
+            );
+            assert!(
+                acme_admin.allows(req),
+                "a project_admin on acme must be able to repair acme's provisioning",
+            );
+        }
+        // Cross-tenant: an acme admin grant does NOT satisfy repairing globex's provisioning.
+        let globex_apply = Right::required("POST", "/api/projects/globex/repair/appdb").unwrap();
+        assert!(
+            !acme_admin.allows(&globex_apply),
+            "an acme grant must not reach globex's repair surface",
         );
     }
 

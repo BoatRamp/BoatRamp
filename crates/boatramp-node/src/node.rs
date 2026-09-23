@@ -431,6 +431,11 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
     // when one is present (same fail-closed gating as the managed-DB paths).
     #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
     let deprovision_envelope = secrets_envelope.clone();
+    // …and a clone for the provisioning drift-repair capability (owner-model retrofit /
+    // reconcile). Like the migrate path it connects as the sealed owner role and re-seals
+    // credentials, so it needs a real envelope; wired only when one is present.
+    #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+    let repair_envelope = secrets_envelope.clone();
     // …and a third clone for the soft-delete tombstone reaper (the leader-gated task
     // that hard-drops a Shared-Postgres tenant once its grace window elapses). It, too,
     // needs a real envelope to unseal the superuser credential + delete the per-tenant
@@ -595,6 +600,28 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
     #[cfg(not(any(feature = "sql-postgres", feature = "sql-mysql")))]
     let tenant_deprovisioner: Option<Arc<dyn boatramp_core::sql::TenantDeprovisioner>> = None;
 
+    // Provisioning drift-repair capability (owner-model retrofit / reconcile) — backs the
+    // `Project·Admin`-gated `/api/repair/{db}` + `/dry-run`. Same gating as operator_sql plus
+    // the envelope requirement (it re-seals the owner credential + connects as it). The
+    // envelope is threaded as `Some(_)` so a lean-but-managed node still gets a clear
+    // per-check error rather than a panic if none is configured.
+    #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+    let tenant_repair: Option<Arc<dyn boatramp_core::sql::TenantRepair>> = config
+        .handlers
+        .as_ref()
+        .and_then(|h| h.bindings.sql.as_ref())
+        .filter(|sql| !sql.databases.is_empty())
+        .map(|sql| {
+            Arc::new(crate::repair::NodeTenantRepair::new(
+                sql.databases.clone(),
+                deploy.clone(),
+                kv.clone(),
+                repair_envelope.clone(),
+            )) as Arc<_>
+        });
+    #[cfg(not(any(feature = "sql-postgres", feature = "sql-mysql")))]
+    let tenant_repair: Option<Arc<dyn boatramp_core::sql::TenantRepair>> = None;
+
     // Operator compute-exec capability (run a command inside a running workload) —
     // backs `POST /api/compute/{name}/exec`, gated by the `allow_compute_exec`
     // posture. Clone the backend registry before the reconcile loop consumes it.
@@ -670,6 +697,7 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
     let mut options = options;
     options.operator_sql = operator_sql;
     options.migration_substrate = migration_substrate;
+    options.tenant_repair = tenant_repair;
     options.tenant_deprovisioner = tenant_deprovisioner;
     options.compute_exec = compute_exec;
     options.compute_volumes = compute_volumes;

@@ -600,6 +600,38 @@ async fn shared_admin_backend(
     compute: &str,
     superuser: &str,
 ) -> Result<ComputeResolvedSqlBackend, String> {
+    shared_admin_backend_for_db(
+        deploy,
+        creds,
+        kind,
+        compute,
+        superuser,
+        maintenance_database(kind),
+    )
+    .await
+}
+
+/// Build the superuser backend for a Shared server connected to a **specific** database
+/// `database` (rather than the always-present maintenance db). Same endpoint-resolving,
+/// same sealed superuser credential — only the connect-target database differs. Mirrors
+/// the second-backend pattern [`provision_shared`] uses to run the tenant-db-local
+/// `grant_app_role_ddl` inside the tenant's own database.
+///
+/// The provisioning drift-repair path needs BOTH: the maintenance-db connection for
+/// `ALTER DATABASE … OWNER` (which can't run inside the db being altered) and a
+/// **tenant-db** connection for `REASSIGN OWNED` + ledger re-ownership (which must run
+/// connected to the tenant's own database). `database` is a caller-DERIVED, sanitized
+/// tenant db name — never operator input; the repair path additionally asserts
+/// `current_database()` equals it before any `REASSIGN OWNED` fires.
+#[cfg_attr(not(feature = "handlers"), allow(dead_code))]
+pub(crate) async fn shared_admin_backend_for_db(
+    deploy: &DeployStore,
+    creds: &ManagedSqlCredentials,
+    kind: ExternalSqlKind,
+    compute: &str,
+    superuser: &str,
+    database: &str,
+) -> Result<ComputeResolvedSqlBackend, String> {
     let superuser_pw = creds
         .password(DEFAULT_PROJECT, compute)
         .await
@@ -609,7 +641,7 @@ async fn shared_admin_backend(
         resolver,
         compute,
         kind,
-        maintenance_database(kind),
+        database.to_string(),
         superuser,
         superuser_pw,
         Some(1),

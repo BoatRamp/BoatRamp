@@ -680,6 +680,45 @@ impl ControlPlane {
         }
     }
 
+    // ---- provisioning drift-repair (v0.5.0) --------------------------------
+
+    /// Run a provisioning drift-repair over managed database `db`: `apply` (mutating —
+    /// `POST /api/{seg}/repair/{db}`) or `dry-run` (report-only —
+    /// `POST /api/{seg}/repair/{db}/dry-run`). Both are `Project·Admin`. A run that produced a
+    /// report (even with errored checks → `422`) comes back as `Ok` so the caller can render the
+    /// per-check verdicts + set the exit code; a run that couldn't produce a report at all
+    /// (`400`/`501`/`503`) is surfaced as [`ClientError::Refused`].
+    pub async fn repair_trigger(
+        &self,
+        db: &str,
+        apply: bool,
+    ) -> Result<boatramp_core::sql::RepairReport> {
+        let seg = project_seg(&self.project, "repair");
+        let Self {
+            http: client,
+            base: server,
+            ..
+        } = self;
+        let url = if apply {
+            format!("{server}/api/{seg}/{db}")
+        } else {
+            format!("{server}/api/{seg}/{db}/dry-run")
+        };
+        let resp = client.post(url).send().await?;
+        let status = resp.status();
+        // 200 = every check ok/repaired/skipped; 422 = a check errored but the body is still a
+        // full report. Both carry a `RepairReport` to render.
+        if status.is_success() || status == reqwest::StatusCode::UNPROCESSABLE_ENTITY {
+            Ok(resp.json().await?)
+        } else {
+            let body = resp.text().await.unwrap_or_default();
+            Err(ClientError::Refused(format!(
+                "provisioning repair refused ({status}): {}",
+                body.trim()
+            )))
+        }
+    }
+
     /// Clear the project's tenancy schema (revert to legacy `Uniform` scoping).
     pub async fn clear_project_tenancy(&self) -> Result<()> {
         let seg = project_seg(&self.project, "tenancy");

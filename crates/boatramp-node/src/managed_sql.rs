@@ -122,6 +122,25 @@ impl ManagedSqlCredentials {
         Ok(password)
     }
 
+    /// Whether a workload's sealed credential is already present in the store — a
+    /// **read-only** probe (`kv.get` only, NEVER `put`/`wrap`), so it is safe to call
+    /// from a provisioning drift-repair **dry-run** (which must be provably
+    /// side-effect-free). Unlike [`password`](Self::password) it does not create-if-absent
+    /// or seal anything; it just reports presence. The value is not unsealed (presence is
+    /// all a repair probe needs), so a corrupt/undecryptable blob still reads as "present"
+    /// — the apply path's [`password`](Self::password) is the one that would surface an
+    /// unseal error.
+    #[cfg_attr(not(feature = "handlers"), allow(dead_code))]
+    pub async fn is_sealed(&self, project: &str, workload: &str) -> Result<bool, String> {
+        let key = Self::key(project, workload);
+        Ok(self
+            .kv
+            .get(&key)
+            .await
+            .map_err(|e| e.to_string())?
+            .is_some())
+    }
+
     /// Delete a workload's sealed credential (a tenant deprovision hook). Idempotent:
     /// deleting an absent credential is a no-op (the underlying KV `delete` treats a
     /// missing key as success), so re-running a teardown is harmless.
@@ -2232,6 +2251,30 @@ mod tests {
 
         // A different workload gets a different password.
         assert_ne!(creds.password("default", "other").await.unwrap(), pw);
+    }
+
+    /// `is_sealed` is a read-only presence probe: it NEVER creates/seals a credential (so it is
+    /// safe on a provisioning drift-repair dry-run), and it reports presence accurately.
+    #[tokio::test]
+    async fn is_sealed_is_read_only_and_accurate() {
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let creds = ManagedSqlCredentials::new(kv.clone(), Arc::new(ReverseEnvelope));
+
+        // Absent ⇒ false, and — crucially — probing did NOT create the key (no side effect).
+        assert!(!creds.is_sealed("acme", "pg/tenant/owner").await.unwrap());
+        assert!(
+            kv.get("managed-sql-cred/acme/pg/tenant/owner")
+                .await
+                .unwrap()
+                .is_none(),
+            "is_sealed must not create the credential (dry-run purity)"
+        );
+
+        // Seal it via the (mutating) password path, then is_sealed reports true.
+        let _ = creds.password("acme", "pg/tenant/owner").await.unwrap();
+        assert!(creds.is_sealed("acme", "pg/tenant/owner").await.unwrap());
+        // A different workload is still absent.
+        assert!(!creds.is_sealed("acme", "pg/tenant").await.unwrap());
     }
 
     #[test]
