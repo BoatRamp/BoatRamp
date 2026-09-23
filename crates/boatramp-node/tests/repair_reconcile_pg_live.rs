@@ -68,8 +68,6 @@ use boatramp_storage::tenant_provision::{
 const COMPUTE: &str = "pg";
 /// The binding's configured base database name (per-tenant `appdb_<ident>`).
 const DATABASE: &str = "appdb";
-/// The binding's configured superuser (the maintenance/DDL identity). Must match the test URL's user.
-const SUPERUSER: &str = "postgres";
 /// The DB-binding name the operator addresses in `/api/repair/{db}` (the `databases` map key).
 const DB_BINDING: &str = "main";
 
@@ -96,12 +94,12 @@ impl KeyEnvelope for RevEnvelope {
 
 /// The `Shared` / `Project`-grain binding under test: one shared `pg` server, a per-tenant database
 /// (`appdb_<ident>`) + login role + owner role per project tenant, superuser = the test URL's user.
-fn shared_project_binding() -> ExternalDatabaseConfig {
+fn shared_project_binding(superuser: &str) -> ExternalDatabaseConfig {
     ExternalDatabaseConfig {
         kind: "postgres".into(),
         compute: Some(COMPUTE.into()),
         database: Some(DATABASE.into()),
-        user: Some(SUPERUSER.into()),
+        user: Some(superuser.into()),
         tenant: TenantIsolation::Shared,
         tenant_scope: TenantScope::Project,
         connect_timeout_secs: Some(10),
@@ -295,12 +293,10 @@ async fn provision_repair_reconciles_pre_v0425_shared_postgres_tenant() {
         return;
     };
     let p = parse_pg_url(&su_url);
-    assert_eq!(
-        p.user, SUPERUSER,
-        "this gate assumes the test URL's user is {SUPERUSER:?} (the derived-name model uses it as \
-         the binding superuser); got {:?}",
-        p.user
-    );
+    // The superuser is DYNAMIC = the test URL's user (the CI Postgres service user is `boatramp`,
+    // a local dev URL may be `postgres`). The derived-name model uses it as the binding superuser,
+    // and the pre-mutation/dry-run ownership assertions expect the seeded objects to be owned by it.
+    let superuser = p.user.clone();
 
     // --- Control-plane state: MemoryKv + a throwaway FsStorage → DeployStore, the sealed-credential
     // store over a reversible test envelope. The SAME KV backs the deploy state + credentials.
@@ -354,8 +350,8 @@ async fn provision_repair_reconciles_pre_v0425_shared_postgres_tenant() {
         .await
         .expect("seed healthy replica");
 
-    let databases = BTreeMap::from([(DB_BINDING.to_string(), shared_project_binding())]);
-    let binding = shared_project_binding();
+    let databases = BTreeMap::from([(DB_BINDING.to_string(), shared_project_binding(&superuser))]);
+    let binding = shared_project_binding(&superuser);
 
     // A direct superuser backend to the maintenance db (setup / mutation / verification), bypassing
     // the resolver.
@@ -452,17 +448,17 @@ async fn provision_repair_reconciles_pre_v0425_shared_postgres_tenant() {
         );
         assert_eq!(
             rel_owner(&a_db, "public", "super_gadget").await,
-            SUPERUSER,
+            superuser,
             "super_gadget is superuser-owned before repair"
         );
         assert_eq!(
             rel_owner(&a_db, "public", "super_counter").await,
-            SUPERUSER,
+            superuser,
             "super_counter (sequence) is superuser-owned before repair"
         );
         assert_eq!(
             fn_owners(&a_db, "public", "super_fn").await,
-            vec![SUPERUSER.to_string()],
+            vec![superuser.clone()],
             "both super_fn overloads are superuser-owned before repair"
         );
     }
@@ -567,17 +563,17 @@ async fn provision_repair_reconciles_pre_v0425_shared_postgres_tenant() {
     );
     assert_eq!(
         rel_owner(&a_db, "public", "super_gadget").await,
-        SUPERUSER,
+        superuser,
         "dry-run must NOT re-own the superuser table"
     );
     assert_eq!(
         rel_owner(&a_db, "public", "super_counter").await,
-        SUPERUSER,
+        superuser,
         "dry-run must NOT re-own the superuser sequence"
     );
     assert_eq!(
         fn_owners(&a_db, "public", "super_fn").await,
-        vec![SUPERUSER.to_string()],
+        vec![superuser.clone()],
         "dry-run must NOT re-own the superuser function overloads"
     );
     // The ledger must not have been scaffolded by the dry-run (it did not exist pre-repair).
