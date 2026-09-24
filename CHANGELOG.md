@@ -5,6 +5,44 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.5.6] - 2026-09-24
+
+**Edge-visibility for federated GraphQL operations (`@edgeHidden`).** A federated subgraph root field can
+now be marked *internal* — reachable via the internal paths (a first-party guest's `emit::invoke` and the
+safelisted `graphql::run`) but **excluded from the anonymous external browser `/graphql` edge**. An
+external operation that names an edge-hidden field fails to plan **exactly like an unknown field** (same
+generic error, no existence oracle), and its resolver is never invoked — regardless of the field's authz
+level. This separates the two axes that `authz(public)` conflated ("no bearer required" vs. "callable from
+anywhere"), so a trust-boundary operation that must only be invoked server-to-server (e.g. a social-login
+token exchange) can't become an escalation surface if it is ever mis-marked `public`. Default is
+edge-visible (opt-out only) — no existing operation changes.
+
+### Added
+
+- **`@edgeHidden` SDL directive** on a root Query/Mutation field (emitted by the guest shim's
+  `#[edge_hidden]` attribute, sibling to `#[tenant]`/`#[authz]`; needs the companion shim rev). Honored
+  at composition: an edge-hidden root is made structurally absent to the external planner. A `@edgeHidden`
+  on a non-root field is a composition error (refuses the deploy), never a silent no-op.
+- **Manifest opt-out** on `[handlers.graphql]`: `edge_hidden_operations = ["subgraph.field", …]` and
+  `edge_hidden_subgraphs = ["subgraph", …]` — an operator-side, redeploy-free way to hide specific
+  operations or a whole subgraph's root fields (e.g. to quarantine an unmarked/third-party op). Union of
+  denials with the directive; a guest can never remove a manifest denial. Unknown entries are ignored with
+  a warning. `edge_hidden_subgraphs` hides a subgraph's ROOT fields (an entity-field contribution reached
+  via a shared type is governed by that resolver's own authz — defense-in-depth, not a field firewall).
+
+### Security / correctness
+
+- The hide is enforced at one planner choke point and, as a hardening dividend, closed three pre-existing
+  fragment-handling gaps on the external edge via a shared cycle-guarded root-field expander: a
+  fragment-wrapped `{ ... on Query { __schema } }` no longer bypasses the introspection-off gate; a
+  fragment-wrapped target field can't evade the `target_eligible_fields` ceiling; and the plan cache is
+  now visibility-keyed so an internally-planned operation can never be served to an external caller.
+- Subscriptions on the federated edge: an edge-hidden (or unknown) subscription root is refused
+  identically to a visible-but-unknown one (no oracle on the subscription axis).
+- 3-role panel (Backend/UX/Security) + a Security convergence review of the implementation; a
+  mutation-verified CI live gate (`EDGE VISIBILITY INTERNAL OK`) proves an edge-hidden op's resolver never
+  runs on the anonymous edge (direct + fragment forms) while a visible sibling still resolves.
+
 ## [0.5.5] - 2026-09-24
 
 **Incident fix — control-plane KV unbootable with `Data error: empty SSTable`.** After a crash — or a

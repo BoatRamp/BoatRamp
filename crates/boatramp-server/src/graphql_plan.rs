@@ -81,7 +81,21 @@ struct DepFetch {
 }
 
 /// Plan `query` against the composed supergraph `sg`.
-pub(crate) fn plan(query: &str, sg: &Supergraph) -> Result<QueryPlan, PlanError> {
+///
+/// `edge_hidden` (#495) is the effective set of `(root_type, field)` pairs to treat as
+/// **structurally absent** — a name in it resolves to the identical [`PlanError::UnknownRootField`]
+/// as a genuinely-unknown field (no oracle). `None` = an **internal** path (`graphql::run`,
+/// `emit::invoke`): hide nothing. The external `/graphql` edge passes `Some(&effective_hidden)`.
+///
+/// Resolution runs against the **fragment-expanded** root set (via
+/// [`crate::graphql_root_fields::expanded_root_fields`]) so a hidden/unknown root wrapped in an
+/// inline fragment or a named spread fails the SAME way as a direct one — and an op selecting ANY
+/// hidden/unknown root fails as a **whole** (no partial execution).
+pub(crate) fn plan(
+    query: &str,
+    sg: &Supergraph,
+    edge_hidden: Option<&BTreeSet<(String, String)>>,
+) -> Result<QueryPlan, PlanError> {
     let doc =
         async_graphql_parser::parse_query(query).map_err(|e| PlanError::Parse(e.to_string()))?;
     // The operation to plan: the sole operation, or the first of a multi-operation document
@@ -100,6 +114,17 @@ pub(crate) fn plan(query: &str, sg: &Supergraph) -> Result<QueryPlan, PlanError>
     };
     let var_types = var_type_map(&op.variable_definitions);
 
+    // #495 choke point: resolve EVERY expanded root field (direct, aliased, inline-fragment, and
+    // named-fragment-spread) through `resolve_root`. A name that is edge-hidden OR unknown to the
+    // supergraph is the identical `UnknownRootField` outcome, so a hidden field is byte-for-byte
+    // indistinguishable from an unknown one. Any single failing root fails the WHOLE op (fail-closed,
+    // no partial execution). This runs BEFORE the fetch-body construction below, which is otherwise
+    // byte-identical to before — so an unmarked op plans exactly as it always did.
+    let fragments = crate::graphql_root_fields::document_fragments(&doc);
+    for (rt, fname) in crate::graphql_root_fields::expanded_root_fields(op, &fragments) {
+        resolve_root(rt.type_name(), &fname, roots, edge_hidden)?;
+    }
+
     // Group the root fields by `(owning subgraph, tenancy class)` → one root fetch per
     // (subgraph, class). Splitting on the class (R4/D8) means an own field and a target field of the
     // SAME subgraph land in separate fetches → separate wasm invocations, each under one host-bound
@@ -109,10 +134,9 @@ pub(crate) fn plan(query: &str, sg: &Supergraph) -> Result<QueryPlan, PlanError>
     for sel in &op.selection_set.node.items {
         if let Selection::Field(field) = &sel.node {
             let fname = field.node.name.node.as_str();
-            let owner = roots
-                .get(fname)
-                .cloned()
-                .ok_or_else(|| PlanError::UnknownRootField(fname.to_string()))?;
+            // Resolve through the same choke point (redundant with the expanded pass above for a
+            // direct field, but it keeps the direct arm and the fragment arm on ONE resolver — MF-2).
+            let owner = resolve_root(root_type, fname, roots, edge_hidden)?;
             let class = sg.root_tenancy.get(fname).cloned().unwrap_or_default();
             by_group
                 .entry((owner, class))
@@ -347,6 +371,33 @@ fn build_root_operation(
     format!("{keyword}{} {{ {body}}}", render_var_defs(used, types))
 }
 
+/// The single choke point (#495) that resolves a root field name to its owning subgraph, honoring
+/// edge visibility. A `(root_type, field)` that is present in `edge_hidden` OR absent from the
+/// supergraph's root map (`roots`) yields the IDENTICAL [`PlanError::UnknownRootField`] — an
+/// external caller cannot distinguish "exists but edge-hidden" from "does not exist" (no oracle).
+///
+/// `edge_hidden = None` ⇒ an internal path: hide nothing (only the real absent-from-map check
+/// applies). `edge_hidden = Some(set)` ⇒ the external edge: the union of the supergraph's directive
+/// roots and the site's resolved manifest roots is treated as absent. The direct root arm and the
+/// fragment-expanded pass both call this, so no walk can diverge on the visibility decision.
+/// `roots` is the operation's own root map (`root_query` or `root_mutation`).
+fn resolve_root(
+    root_type: &str,
+    field: &str,
+    roots: &BTreeMap<String, String>,
+    edge_hidden: Option<&BTreeSet<(String, String)>>,
+) -> Result<String, PlanError> {
+    // Treat an edge-hidden root exactly as absent (checked BEFORE the map lookup so the outcome is
+    // uniform whether the field is hidden or genuinely unknown).
+    if edge_hidden.is_some_and(|h| h.contains(&(root_type.to_string(), field.to_string()))) {
+        return Err(PlanError::UnknownRootField(field.to_string()));
+    }
+    roots
+        .get(field)
+        .cloned()
+        .ok_or_else(|| PlanError::UnknownRootField(field.to_string()))
+}
+
 /// Which subgraph resolves `field` on `parent_type` from the vantage of `current` — the
 /// current subgraph if it owns it (keep the fetch local), else the first owner.
 fn owner_of(sg: &Supergraph, parent_type: &str, field: &str, current: &str) -> Option<String> {
@@ -409,7 +460,7 @@ mod tests {
 
     #[test]
     fn a_single_subgraph_query_is_one_fetch() {
-        let plan = plan("{ me { name } }", &supergraph()).unwrap();
+        let plan = plan("{ me { name } }", &supergraph(), None).unwrap();
         assert_eq!(plan.fetches.len(), 1);
         assert_eq!(plan.fetches[0].subgraph, "accounts");
         assert!(plan.fetches[0].query.contains("me"));
@@ -418,7 +469,7 @@ mod tests {
 
     #[test]
     fn distinct_roots_split_into_a_fetch_per_owning_subgraph() {
-        let plan = plan("{ me { name } topReviews { body } }", &supergraph()).unwrap();
+        let plan = plan("{ me { name } topReviews { body } }", &supergraph(), None).unwrap();
         assert_eq!(plan.fetches.len(), 2);
         let subgraphs: Vec<&str> = plan.fetches.iter().map(|f| f.subgraph.as_str()).collect();
         assert!(subgraphs.contains(&"accounts") && subgraphs.contains(&"reviews"));
@@ -427,7 +478,7 @@ mod tests {
 
     #[test]
     fn a_cross_subgraph_entity_field_becomes_a_dependent_entities_fetch() {
-        let plan = plan("{ me { name reviews { body } } }", &supergraph()).unwrap();
+        let plan = plan("{ me { name reviews { body } } }", &supergraph(), None).unwrap();
         assert_eq!(plan.fetches.len(), 2);
 
         // Fetch 0: accounts resolves `me`, and must select the key + __typename to join.
@@ -454,7 +505,7 @@ mod tests {
     #[test]
     fn an_unknown_root_field_is_an_error() {
         assert!(matches!(
-            plan("{ nope }", &supergraph()),
+            plan("{ nope }", &supergraph(), None),
             Err(PlanError::UnknownRootField(f)) if f == "nope"
         ));
     }
@@ -478,6 +529,7 @@ mod tests {
         let mplan = plan(
             "mutation { agent(input: \"hi\") }",
             &supergraph_with_mutation(),
+            None,
         )
         .unwrap();
         assert_eq!(mplan.fetches.len(), 1);
@@ -489,7 +541,7 @@ mod tests {
         // on a fragment would pass even for a malformed splice; exact equality cannot.
         assert_eq!(mplan.fetches[0].query, "mutation { agent(input: \"hi\") }");
         // A query operation must NOT get the mutation keyword — also asserted exactly.
-        let qplan = plan("{ me { name } }", &supergraph_with_mutation()).unwrap();
+        let qplan = plan("{ me { name } }", &supergraph_with_mutation(), None).unwrap();
         assert_eq!(qplan.fetches[0].query, "{ me { name } }");
     }
 
@@ -501,6 +553,7 @@ mod tests {
         let mplan = plan(
             "mutation Turn($input: AgentInput!) { agent(input: $input) }",
             &supergraph_with_mutation(),
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -537,6 +590,7 @@ mod tests {
         let plan = plan(
             "query Q($n: Int){ me { reviews(first: $n) { body } } }",
             &sg,
+            None,
         )
         .unwrap();
         let dep = &plan.fetches[1];
@@ -578,7 +632,7 @@ mod tests {
             ),
         ];
         for (op, must_survive) in cases {
-            let plan = plan(op, &sg).unwrap();
+            let plan = plan(op, &sg, None).unwrap();
             let all: String = plan.fetches.iter().map(|f| f.query.as_str()).collect();
             for tok in *must_survive {
                 assert!(
@@ -600,6 +654,7 @@ mod tests {
         let plan = plan(
             "mutation T($n: Int, $t: Int, $o: Int){ agent(input: \"hi\", count: $n, tags: [$t], meta: {k: $o}) }",
             &sg,
+            None,
         )
         .unwrap();
         let q = &plan.fetches[0].query;
@@ -632,7 +687,7 @@ mod tests {
             ("reviews".into(), reviews.into()),
         ])
         .unwrap();
-        let plan = plan("{ topReviewer { name } }", &sg).unwrap();
+        let plan = plan("{ topReviewer { name } }", &sg, None).unwrap();
         assert_eq!(
             plan.fetches.len(),
             1,
@@ -659,7 +714,7 @@ mod tests {
             type Product { id: ID! }
         "#;
         let sg = compose(&[("shop".into(), shop.into())]).unwrap();
-        let plan = plan("{ me { id } publicProducts { id } }", &sg).unwrap();
+        let plan = plan("{ me { id } publicProducts { id } }", &sg, None).unwrap();
         assert_eq!(
             plan.fetches.len(),
             2,
@@ -679,12 +734,122 @@ mod tests {
     #[test]
     fn a_plain_query_yields_all_own_fetches() {
         // No `@tenant` anywhere ⇒ every fetch is Own (byte-identical planning to pre-Stage-5).
-        let plan = plan("{ me { name reviews { body } } }", &supergraph()).unwrap();
+        let plan = plan("{ me { name reviews { body } } }", &supergraph(), None).unwrap();
         assert!(
             plan.fetches.iter().all(|f| !f.class.is_target()),
             "no directive ⇒ all Own"
         );
         // And the dependent entity fetch inherited its provider's (Own) class.
         assert!(plan.fetches.iter().any(|f| f.requires.is_some()));
+    }
+
+    // #495 edge-visibility planner tests.
+
+    // A supergraph exposing a visible root `me` and a root `topReviews` we treat as edge-hidden.
+    fn hidden_set(pairs: &[(&str, &str)]) -> BTreeSet<(String, String)> {
+        pairs
+            .iter()
+            .map(|(t, f)| (t.to_string(), f.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn an_edge_hidden_root_field_plans_as_unknown_direct() {
+        // Direct form: an external plan (Some(hidden)) of a hidden root fails with the IDENTICAL
+        // `UnknownRootField` a genuinely-unknown field yields — no oracle.
+        let sg = supergraph();
+        let hidden = hidden_set(&[("Query", "topReviews")]);
+        let hidden_err = plan("{ topReviews { body } }", &sg, Some(&hidden));
+        let unknown_err = plan("{ definitelyNotAField }", &sg, Some(&hidden));
+        assert!(matches!(&hidden_err, Err(PlanError::UnknownRootField(f)) if f == "topReviews"));
+        assert!(matches!(&unknown_err, Err(PlanError::UnknownRootField(_))));
+        // Byte-identical variant of the error kind — both are `UnknownRootField`.
+        assert!(matches!(hidden_err, Err(PlanError::UnknownRootField(_))));
+    }
+
+    #[test]
+    fn an_edge_hidden_root_field_plans_as_unknown_aliased() {
+        // Aliased form: `x: topReviews` must still be caught (resolution is by field NAME).
+        let sg = supergraph();
+        let hidden = hidden_set(&[("Query", "topReviews")]);
+        assert!(matches!(
+            plan("{ x: topReviews { body } }", &sg, Some(&hidden)),
+            Err(PlanError::UnknownRootField(f)) if f == "topReviews"
+        ));
+    }
+
+    #[test]
+    fn an_edge_hidden_root_field_plans_as_unknown_via_fragments() {
+        // Inline-fragment and named-spread forms both fail (the fragment-expanding choke point).
+        let sg = supergraph();
+        let hidden = hidden_set(&[("Query", "topReviews")]);
+        assert!(matches!(
+            plan("{ ... on Query { topReviews { body } } }", &sg, Some(&hidden)),
+            Err(PlanError::UnknownRootField(f)) if f == "topReviews"
+        ));
+        assert!(matches!(
+            plan(
+                "query { ...F } fragment F on Query { topReviews { body } }",
+                &sg,
+                Some(&hidden)
+            ),
+            Err(PlanError::UnknownRootField(f)) if f == "topReviews"
+        ));
+    }
+
+    #[test]
+    fn a_mixed_op_with_a_hidden_root_fails_as_a_whole_no_partial_execution() {
+        // `{ me ... topReviews }` where `topReviews` is hidden → the WHOLE op fails; `me` is not
+        // planned/executed (fail-closed, no partial execution).
+        let sg = supergraph();
+        let hidden = hidden_set(&[("Query", "topReviews")]);
+        assert!(matches!(
+            plan("{ me { name } topReviews { body } }", &sg, Some(&hidden)),
+            Err(PlanError::UnknownRootField(f)) if f == "topReviews"
+        ));
+        // A mixed op where the hidden field is fragment-wrapped also fails as a whole.
+        assert!(matches!(
+            plan(
+                "query { me { name } ...F } fragment F on Query { topReviews { body } }",
+                &sg,
+                Some(&hidden)
+            ),
+            Err(PlanError::UnknownRootField(_))
+        ));
+    }
+
+    #[test]
+    fn the_internal_path_hides_nothing_none_plans_the_field() {
+        // `None` = internal path (graphql::run / emit::invoke): a "hidden" field still plans and
+        // executes normally. The same op that fails externally succeeds internally.
+        let sg = supergraph();
+        let hidden = hidden_set(&[("Query", "topReviews")]);
+        // External: fails.
+        assert!(plan("{ topReviews { body } }", &sg, Some(&hidden)).is_err());
+        // Internal: succeeds (visibility hides nothing).
+        let internal = plan("{ topReviews { body } }", &sg, None).unwrap();
+        assert_eq!(internal.fetches.len(), 1);
+        assert_eq!(internal.fetches[0].subgraph, "reviews");
+    }
+
+    #[test]
+    fn an_empty_external_hidden_set_plans_every_field_like_internal() {
+        // A site with no excludes passes an EMPTY external set — every current field stays visible
+        // (non-breaking), byte-identical to the internal plan.
+        let sg = supergraph();
+        let empty: BTreeSet<(String, String)> = BTreeSet::new();
+        let external = plan("{ me { name } }", &sg, Some(&empty)).unwrap();
+        let internal = plan("{ me { name } }", &sg, None).unwrap();
+        assert_eq!(external, internal);
+    }
+
+    #[test]
+    fn a_visible_field_plans_normally_even_when_a_sibling_is_hidden() {
+        // Hiding `topReviews` must not affect an op that only selects the visible `me`.
+        let sg = supergraph();
+        let hidden = hidden_set(&[("Query", "topReviews")]);
+        let external = plan("{ me { name } }", &sg, Some(&hidden)).unwrap();
+        assert_eq!(external.fetches.len(), 1);
+        assert_eq!(external.fetches[0].subgraph, "accounts");
     }
 }

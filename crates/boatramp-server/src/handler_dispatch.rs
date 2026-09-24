@@ -215,21 +215,43 @@ pub(super) async fn dispatch_handler(
                     // producer (a mutation, a function) publishes each execution result to
                     // that topic; the host frames it as graphql-sse `next`.
                     if let Some(topic) = graphql_subscription::subscription_topic(query) {
-                        let after = parts
-                            .headers
-                            .get("last-event-id")
-                            .and_then(|v| v.to_str().ok())
-                            .map(str::to_string);
-                        return crate::stream::serve_graphql_subscription(
-                            inner,
-                            site,
-                            site_handlers,
-                            &topic,
-                            after,
-                            client_ip,
-                            preview,
-                        )
-                        .await;
+                        // #495: on the FEDERATED external edge, an edge-hidden (or unknown) root
+                        // must not be streamable either — else a subscription would be an oracle /
+                        // escape hatch around the planner's hide. Resolve the subscription's root
+                        // through the SAME effective-hidden set as the planner; when it is hidden,
+                        // DON'T open the stream — fall through to `federation_gateway`, which returns
+                        // the generic "cannot be planned" outcome (a subscription is `Unsupported`
+                        // there), byte-identical to a truly-unknown/unsupported field (no oracle).
+                        // A non-federated graphql site is unaffected (streams as before).
+                        let hide_subscription = if gql.federated {
+                            subscription_root_is_hidden(
+                                inner,
+                                project,
+                                query,
+                                &gql.edge_hidden_operations,
+                                &gql.edge_hidden_subgraphs,
+                            )
+                            .await
+                        } else {
+                            false
+                        };
+                        if !hide_subscription {
+                            let after = parts
+                                .headers
+                                .get("last-event-id")
+                                .and_then(|v| v.to_str().ok())
+                                .map(str::to_string);
+                            return crate::stream::serve_graphql_subscription(
+                                inner,
+                                site,
+                                site_handlers,
+                                &topic,
+                                after,
+                                client_ip,
+                                preview,
+                            )
+                            .await;
+                        }
                     }
                     // Both server-side GraphQL paths (the federation gateway and the data
                     // connector's delegated-field invoke) fan out to subgraph/sibling FUNCTIONS
@@ -271,6 +293,12 @@ pub(super) async fn dispatch_handler(
                             domain_context.as_deref(),
                             target_handle.as_deref(),
                             caller_own,
+                            // #495: the site's edge-visibility manifest (per-operation +
+                            // per-subgraph excludes) — resolved fresh per request against the
+                            // supergraph inside the gateway, so a manifest change takes effect
+                            // immediately (no recomposition lag) and never widens.
+                            &gql.edge_hidden_operations,
+                            &gql.edge_hidden_subgraphs,
                         )
                         .await;
                     }
@@ -644,6 +672,11 @@ async fn federation_gateway(
     domain_context: Option<&str>,
     target_handle: Option<&str>,
     caller_own: Vec<boatramp_handlers::ScopeFact>,
+    // #495: the site's edge-visibility manifest — `"subgraph.field"` per-operation excludes and
+    // per-subgraph excludes. Resolved fresh per request against the supergraph (union-only, unknown
+    // entries ignored+warned) so a change takes effect immediately with no recomposition lag.
+    edge_hidden_operations: &[String],
+    edge_hidden_subgraphs: &[String],
 ) -> Response {
     // Compose + plan, memoized per project by composition version (and the operation hash for
     // the plan) — the same `graphql_cache` the in-process `graphql::run` path uses, so neither
@@ -663,18 +696,32 @@ async fn federation_gateway(
         }
     };
     let op_hash = crate::graphql_apq::sha256_hex(query);
-    let plan =
-        match inner
-            .graphql_cache
-            .plan(project, cached.version, &op_hash, query, &cached.supergraph)
-        {
-            Ok(plan) => plan,
-            Err(_) => {
-                return graphql_guard::error_response(
-                    "the query cannot be planned against the supergraph",
-                )
-            }
-        };
+    // #495: the EFFECTIVE hidden set for the external edge =
+    //   supergraph.edge_hidden_roots  ∪  resolve(edge_hidden_operations)  ∪  roots_owned_by(edge_hidden_subgraphs).
+    // Union-only (can never widen the surface); unknown manifest entries are ignored + logged. Then
+    // emit a server-side trace for each root this operation names that IS hidden (exists-but-hidden),
+    // distinct from a truly-unknown field — NEVER surfaced to the client (no oracle).
+    let effective_hidden = resolve_effective_hidden(
+        &cached.supergraph,
+        edge_hidden_operations,
+        edge_hidden_subgraphs,
+    );
+    log_hidden_root_decisions(query, &effective_hidden, &op_hash);
+    let plan = match inner.graphql_cache.plan(
+        project,
+        cached.version,
+        &op_hash,
+        query,
+        &cached.supergraph,
+        crate::graphql_cache::Visibility::External(&effective_hidden),
+    ) {
+        Ok(plan) => plan,
+        Err(_) => {
+            return graphql_guard::error_response(
+                "the query cannot be planned against the supergraph",
+            )
+        }
+    };
     let Some(invoker) = inner.invoker.get() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -739,6 +786,207 @@ async fn federation_gateway(
         }
     }
     axum::Json(crate::graphql_gateway::execute(&plan, &runner, variables).await).into_response()
+}
+
+/// Build the external edge's effective edge-hidden root set (#495) from the three sources, as a
+/// **canonical resolved** `BTreeSet<(root_type, field)>`:
+///
+/// 1. `supergraph.edge_hidden_roots` — the `@edgeHidden` directive roots (travel with the code).
+/// 2. `edge_hidden_operations` — each **qualified** `"subgraph.field"` resolved against the
+///    supergraph's `root_query`/`root_mutation` (the named field must exist AND be owned by the
+///    named subgraph). A **bare** (unqualified) entry is rejected+warned (UX-C3a); an entry naming
+///    a non-existent / wrong-owner root is ignored+warned (UX-C3b).
+/// 3. `edge_hidden_subgraphs` — every root field OWNED by a listed subgraph (root-only; entity-field
+///    jumps to shared types are NOT covered — that's the resolver's authz). A subgraph that owns no
+///    root field is ignored+warned.
+///
+/// The result is **union-only** — a manifest entry can only ever ADD to the hidden set, never widen
+/// the surface. It is the exact set both hashed into the plan-cache key and threaded into the
+/// planner, so key and plan agree.
+fn resolve_effective_hidden(
+    sg: &crate::graphql_federation::Supergraph,
+    edge_hidden_operations: &[String],
+    edge_hidden_subgraphs: &[String],
+) -> std::collections::BTreeSet<(String, String)> {
+    let mut hidden = sg.edge_hidden_roots.clone();
+
+    // Source 2 — qualified per-operation excludes.
+    for entry in edge_hidden_operations {
+        let Some((subgraph, field)) = entry.split_once('.') else {
+            tracing::warn!(
+                entry = %entry,
+                "graphql edge_hidden_operations: entry is not qualified `subgraph.field` — ignored \
+                 (a bare field name is ambiguous across subgraphs; qualify it)"
+            );
+            continue;
+        };
+        if subgraph.is_empty() || field.is_empty() {
+            tracing::warn!(
+                entry = %entry,
+                "graphql edge_hidden_operations: entry has an empty subgraph or field — ignored"
+            );
+            continue;
+        }
+        // The field must exist as a root AND be owned by the named subgraph (on either root type).
+        let mut matched = false;
+        for (root_type, roots) in [("Query", &sg.root_query), ("Mutation", &sg.root_mutation)] {
+            if roots.get(field).is_some_and(|owner| owner == subgraph) {
+                hidden.insert((root_type.to_string(), field.to_string()));
+                matched = true;
+            }
+        }
+        if !matched {
+            tracing::warn!(
+                entry = %entry,
+                "graphql edge_hidden_operations: no root Query/Mutation field `{field}` owned by \
+                 subgraph `{subgraph}` — ignored (never widens; the op may not exist yet)"
+            );
+        }
+    }
+
+    // Source 3 — per-subgraph excludes (all roots owned by the subgraph).
+    for subgraph in edge_hidden_subgraphs {
+        let mut owned_any = false;
+        for (root_type, roots) in [("Query", &sg.root_query), ("Mutation", &sg.root_mutation)] {
+            for (field, owner) in roots {
+                if owner == subgraph {
+                    hidden.insert((root_type.to_string(), field.to_string()));
+                    owned_any = true;
+                }
+            }
+        }
+        if !owned_any {
+            tracing::warn!(
+                subgraph = %subgraph,
+                "graphql edge_hidden_subgraphs: subgraph owns no root Query/Mutation field — \
+                 ignored (root-only; entity-field jumps are the resolver's authz)"
+            );
+        }
+    }
+
+    hidden
+}
+
+/// Emit a server-side trace for each ROOT field this external operation names that IS in the
+/// effective hidden set (#495, UX-C5) — an "exists-but-hidden" decision, distinct from a
+/// truly-unknown field. This is observability for the operator ONLY; the client still receives the
+/// generic `UnknownRootField` → "cannot be planned" outcome, byte-identical to an unknown field, so
+/// the trace can NEVER become an oracle. Routes through the shared fragment-expanding helper so a
+/// fragment-wrapped hidden root is logged too.
+fn log_hidden_root_decisions(
+    query: &str,
+    effective_hidden: &std::collections::BTreeSet<(String, String)>,
+    op_hash: &str,
+) {
+    if effective_hidden.is_empty() {
+        return;
+    }
+    let Ok(doc) = async_graphql_parser::parse_query(query) else {
+        return;
+    };
+    let fragments = crate::graphql_root_fields::document_fragments(&doc);
+    let ops = match &doc.operations {
+        async_graphql_parser::types::DocumentOperations::Single(op) => vec![&op.node],
+        async_graphql_parser::types::DocumentOperations::Multiple(m) => {
+            m.values().map(|o| &o.node).collect()
+        }
+    };
+    for op in ops {
+        for (root_type, field) in crate::graphql_root_fields::expanded_root_fields(op, &fragments) {
+            let pair = (root_type.type_name().to_string(), field.clone());
+            if effective_hidden.contains(&pair) {
+                tracing::info!(
+                    root_type = root_type.type_name(),
+                    field = %field,
+                    op_hash = %op_hash,
+                    "graphql edge: refused a hidden root field on the external /graphql edge \
+                     (planned as unknown — no client oracle)"
+                );
+            }
+        }
+    }
+}
+
+/// Whether the external federated edge must REFUSE to stream this subscription (#495): its root
+/// field is edge-hidden (or otherwise not an edge-visible operation). Resolved through the SAME
+/// effective-hidden set the planner uses, so a subscription can't be an escape hatch around a
+/// hidden operation. Returns `false` (stream normally) on any resolution failure that isn't a hit —
+/// the planner remains the hard gate for query/mutation, and a non-hidden subscription is served.
+///
+/// A subscription's root is not a federation-planned root (`plan` returns `Unsupported`), so
+/// "hidden" here means the root **field name** matches a hidden `(Query|Mutation, field)` pair OR a
+/// `(Subscription, field)` pair — a same-named operation marked edge-hidden implies its subscription
+/// counterpart is edge-internal too (fail-closed). Routes the subscription's root through the shared
+/// fragment-expanding helper so a fragment-wrapped root is caught.
+async fn subscription_root_is_hidden(
+    inner: &HandlerRuntimeInner,
+    project: &str,
+    query: &str,
+    edge_hidden_operations: &[String],
+    edge_hidden_subgraphs: &[String],
+) -> bool {
+    // Load the composed supergraph (cached by version). On a composition error, don't special-case
+    // the subscription — let the normal path proceed (the planner/edge stays the authority).
+    let Ok(cached) = inner
+        .graphql_cache
+        .supergraph(inner.kv.as_ref(), project)
+        .await
+    else {
+        return false;
+    };
+    let effective_hidden = resolve_effective_hidden(
+        &cached.supergraph,
+        edge_hidden_operations,
+        edge_hidden_subgraphs,
+    );
+    if effective_hidden.is_empty() {
+        // Nothing is edge-hidden on this site ⇒ no hidden name to distinguish ⇒ no oracle; stream as
+        // before. (A compose error above also returns here — during an outage every subscription
+        // streams uniformly, so there is still no oracle.)
+        return false;
+    }
+    let hidden_names: std::collections::BTreeSet<&str> =
+        effective_hidden.iter().map(|(_, f)| f.as_str()).collect();
+    // The edge-VISIBLE root field names. A federated bus subscription's topic mirrors a Query/Mutation
+    // root a producer publishes to, so we stream ONLY when the subscription's root is a known,
+    // edge-visible root. A root that is edge-hidden OR simply unknown is refused IDENTICALLY (falls
+    // through to the generic "cannot be planned" outcome) — so a hidden op is byte-indistinguishable
+    // from an unknown one on the subscription axis. Closes the C1 existence oracle: previously a direct
+    // `subscription { unknownField }` streamed while `subscription { hiddenOp }` errored.
+    let visible_roots: std::collections::BTreeSet<&str> = cached
+        .supergraph
+        .root_query
+        .keys()
+        .chain(cached.supergraph.root_mutation.keys())
+        .map(String::as_str)
+        .filter(|f| !hidden_names.contains(f))
+        .collect();
+    let Ok(doc) = async_graphql_parser::parse_query(query) else {
+        return false;
+    };
+    let fragments = crate::graphql_root_fields::document_fragments(&doc);
+    let ops = match &doc.operations {
+        async_graphql_parser::types::DocumentOperations::Single(op) => vec![&op.node],
+        async_graphql_parser::types::DocumentOperations::Multiple(m) => {
+            m.values().map(|o| &o.node).collect()
+        }
+    };
+    for op in ops {
+        if op.ty != async_graphql_parser::types::OperationType::Subscription {
+            continue;
+        }
+        for (_, field) in crate::graphql_root_fields::expanded_root_fields(op, &fragments) {
+            if !visible_roots.contains(field.as_str()) {
+                tracing::info!(
+                    field = %field,
+                    "graphql edge: refused a non-edge-visible root on an external /graphql subscription \
+                     (edge-hidden OR unknown — not streamed; identical outcome, no client oracle)"
+                );
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// The declarative data connector: serve a GraphQL query from the site's managed database.

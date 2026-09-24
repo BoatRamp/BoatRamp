@@ -7354,6 +7354,185 @@ async fn federation_gateway_executes_a_mutation_forwarding_its_argument() {
     );
 }
 
+// ---- GraphQL edge-visibility end-to-end (#495) ------------------------------
+
+/// #495 edge-visibility HARD GATE. A federated root field marked `@edgeHidden` (here the trust-boundary
+/// `Mutation.agent`) must be UNREACHABLE from the anonymous external `/graphql` edge — the op fails to
+/// plan EXACTLY like an unknown field (no existence oracle) and the subgraph resolver is NEVER invoked —
+/// while a visible sibling (`Query.users`) still resolves (non-breaking). Drives the real router →
+/// compose → plan → execute path with two real subgraph functions.
+///
+/// The `agent` fixture echoes `ran:<input>` when it runs, so a leak is directly observable: if the edge
+/// ever plans+dispatches the hidden op, `ran:probe` appears in the external response. **Mutation-verified:**
+/// neutering the hidden-root check in `graphql_plan::resolve_root` makes `agent` run and `ran:probe`
+/// appear → this gate FAILS (proven locally by reverting that check).
+#[cfg(feature = "handlers")]
+#[tokio::test]
+async fn edge_visibility_hides_an_internal_op_from_the_external_edge() {
+    use boatramp_core::config::{
+        DeployConfig, HandlerConfig, HandlerGraphqlConfig, HandlersSiteConfig, SiteConfig,
+    };
+    use boatramp_core::kv::KvStore;
+    use boatramp_handlers::{HandlerEngine, Limits};
+
+    const ACCOUNTS: &[u8] =
+        include_bytes!("../../boatramp-handlers/tests/fixtures/graphql-accounts.wasm");
+    const AGENT: &[u8] =
+        include_bytes!("../../boatramp-handlers/tests/fixtures/graphql-agent.wasm");
+    const HTTP_200: &[u8] = include_bytes!("../../boatramp-handlers/tests/fixtures/http-200.wasm");
+
+    let storage = Arc::new(MemStorage::default());
+    let kv = Arc::new(MemoryKv::new());
+    let deploy = DeployStore::new(storage.clone(), kv.clone());
+
+    deploy_test_function(&deploy, "accounts", ACCOUNTS, Vec::new()).await;
+    deploy_test_function(&deploy, "agent", AGENT, Vec::new()).await;
+
+    // `accounts` owns a VISIBLE `Query.users`. `agent` owns a `Mutation.agent` marked `@edgeHidden` —
+    // the internal, invoke-only op that must not be reachable from the browser edge.
+    kv.put(
+        "graphql/default/subgraph/accounts",
+        b"type Query { users: [User] } type User @key(fields: \"id\") { id: ID! name: String }"
+            .to_vec(),
+    )
+    .await
+    .unwrap();
+    kv.put(
+        "graphql/default/subgraph/agent",
+        b"type Query { ping: String } type Mutation { agent(input: String): String @edgeHidden }"
+            .to_vec(),
+    )
+    .await
+    .unwrap();
+
+    let gw_hash = sha256_hex(HTTP_200);
+    let gw_bytes = HTTP_200.to_vec();
+    let gw_stream: ByteStream =
+        futures::stream::once(async move { Ok(bytes::Bytes::from(gw_bytes)) }).boxed();
+    deploy.put_blob(&gw_hash, gw_stream).await.unwrap();
+    let mut files = BTreeMap::new();
+    files.insert(
+        "gw.wasm".to_string(),
+        FileEntry {
+            hash: gw_hash.clone(),
+            size: HTTP_200.len() as u64,
+            content_type: None,
+            variants: BTreeMap::new(),
+        },
+    );
+    let manifest = Manifest {
+        files,
+        config: DeployConfig {
+            handlers: vec![HandlerConfig {
+                secrets: Vec::new(),
+                tenancy: None,
+                token_claims: None,
+                route: "/graphql".into(),
+                methods: Vec::new(),
+                component: "gw.wasm".into(),
+                imports: Vec::new(),
+                streaming: false,
+                limits: None,
+                env: BTreeMap::new(),
+                invoke_targets: Vec::new(),
+                stats_topics: Vec::new(),
+                tenant_secret_names: Vec::new(),
+            }],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let id = deploy.put_manifest(&manifest).await.unwrap();
+    deploy
+        .activate(ProjectRef::DEFAULT, "gw", &id)
+        .await
+        .unwrap();
+    deploy
+        .set_site_config(
+            ProjectRef::DEFAULT,
+            "gw",
+            &SiteConfig {
+                handlers: Some(HandlersSiteConfig {
+                    enabled: true,
+                    graphql: Some(HandlerGraphqlConfig {
+                        enabled: true,
+                        federated: true,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
+    let runtime = HandlerRuntime::new(engine, kv.clone(), storage, None, None);
+    runtime.set_invoker(deploy.clone());
+    let app = router(deploy.clone(), Auth::disabled(), runtime);
+
+    async fn post(app: &axum::Router, body: &str) -> (StatusCode, String) {
+        let mut req = Request::builder()
+            .method("POST")
+            .uri("/_sites/gw/graphql")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        req.extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40000))));
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    // G7 — non-breaking: the VISIBLE root still resolves through the real invoke path.
+    let (vis_status, vis_body) = post(&app, r#"{"query":"{ users { name } }"}"#).await;
+    assert_eq!(vis_status, StatusCode::OK, "visible op body: {vis_body}");
+    assert!(
+        vis_body.contains("Alice"),
+        "the visible `users` op must still resolve (non-breaking): {vis_body}"
+    );
+
+    // Baseline: a genuinely-unknown root field's external outcome.
+    let (unknown_status, unknown_body) =
+        post(&app, r#"{"query":"mutation { totallyUnknownField }"}"#).await;
+
+    // G1 — the edge-hidden op must (a) be byte-identical to an unknown field (no existence oracle) and
+    // (b) NEVER invoke the `agent` resolver (no `ran:` echo).
+    let (hidden_status, hidden_body) =
+        post(&app, r#"{"query":"mutation { agent(input: \"probe\") }"}"#).await;
+    assert!(
+        !hidden_body.contains("ran:probe"),
+        "the edge-hidden `agent` resolver MUST NOT run on the anonymous external edge: {hidden_body}"
+    );
+    assert_eq!(
+        (hidden_status, hidden_body.as_str()),
+        (unknown_status, unknown_body.as_str()),
+        "an edge-hidden op must be byte-identical to an unknown field (no oracle)"
+    );
+
+    // G2 — a fragment-wrapped edge-hidden op is closed the same way (the shared `expanded_root_fields`
+    // helper covers inline + named-spread forms), still no execution, still oracle-free.
+    let (frag_status, frag_body) = post(
+        &app,
+        r#"{"query":"mutation { ...F } fragment F on Mutation { agent(input: \"probe2\") }"}"#,
+    )
+    .await;
+    assert!(
+        !frag_body.contains("ran:probe2"),
+        "a fragment-wrapped edge-hidden op MUST NOT run: {frag_body}"
+    );
+    assert_eq!(
+        (frag_status, frag_body.as_str()),
+        (unknown_status, unknown_body.as_str()),
+        "a fragment-wrapped edge-hidden op must also match the unknown-field outcome (no oracle)"
+    );
+
+    println!("EDGE VISIBILITY INTERNAL OK");
+}
+
 // ---- GraphQL declarative data connector end-to-end (real libsql) ------------
 
 /// A site configured with `[handlers.graphql.data]` serves a GraphQL API generated from its

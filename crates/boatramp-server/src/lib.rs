@@ -117,6 +117,8 @@ mod graphql_plan;
 #[cfg(feature = "handlers")]
 mod graphql_registry;
 #[cfg(feature = "handlers")]
+mod graphql_root_fields;
+#[cfg(feature = "handlers")]
 mod graphql_subscription;
 #[cfg(feature = "handlers")]
 mod handler_cache;
@@ -4696,7 +4698,7 @@ mod tests {
         let sdl = "type Query { items: [Item!]! @tenant(scope: target, via: [domain], public: \"items\") }\n\
                    type Item @key(fields: \"id\") { id: ID! }";
         let sg = crate::graphql_federation::compose(&[("scopeprobe".into(), sdl.into())]).unwrap();
-        let plan = crate::graphql_plan::plan("{ items { id } }", &sg).unwrap();
+        let plan = crate::graphql_plan::plan("{ items { id } }", &sg, None).unwrap();
 
         let mut schema = TenancySchema {
             default_tenant_key: "tenant_id".into(),
@@ -4869,7 +4871,7 @@ mod tests {
         // inherited-principal `invoke` path (not `invoke_target`).
         let sdl = "type Query { items: [Item!]! }\ntype Item @key(fields: \"id\") { id: ID! }";
         let sg = crate::graphql_federation::compose(&[("scopeprobe".into(), sdl.into())]).unwrap();
-        let plan = crate::graphql_plan::plan("{ items { id } }", &sg).unwrap();
+        let plan = crate::graphql_plan::plan("{ items { id } }", &sg, None).unwrap();
 
         let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
         let rt = HandlerRuntime::new(engine, kv.clone(), storage, Some(sql), None);
@@ -5028,7 +5030,7 @@ mod tests {
         let sdl = "type Query { items: [Item!]! @tenant(scope: target_or_null, via: [domain], public: \"items\") }\n\
                    type Item @key(fields: \"id\") { id: ID! }";
         let sg = crate::graphql_federation::compose(&[("scopeprobe".into(), sdl.into())]).unwrap();
-        let plan = crate::graphql_plan::plan("{ items { id } }", &sg).unwrap();
+        let plan = crate::graphql_plan::plan("{ items { id } }", &sg, None).unwrap();
 
         let mut schema = TenancySchema {
             default_tenant_key: "tenant_id".into(),

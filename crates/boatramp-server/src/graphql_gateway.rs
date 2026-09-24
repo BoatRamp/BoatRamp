@@ -271,7 +271,7 @@ pub(crate) fn target_root_fields(
     query: &str,
     sg: &crate::graphql_federation::Supergraph,
 ) -> Vec<String> {
-    use async_graphql_parser::types::{DocumentOperations, Selection};
+    use async_graphql_parser::types::DocumentOperations;
     let Ok(doc) = async_graphql_parser::parse_query(query) else {
         return Vec::new();
     };
@@ -282,21 +282,24 @@ pub(crate) fn target_root_fields(
             None => return Vec::new(),
         },
     };
-    op.selection_set
-        .node
-        .items
-        .iter()
-        .filter_map(|s| match &s.node {
-            Selection::Field(f) => {
-                let name = f.node.name.node.as_str();
-                sg.root_tenancy
-                    .get(name)
-                    .filter(|c| c.is_target())
-                    .map(|_| name.to_string())
-            }
-            _ => None,
-        })
-        .collect()
+    // #495: route through the shared fragment-expanding helper so a **fragment-wrapped** target
+    // root field (inline fragment / named spread) is subject to the operator's `target_eligible`
+    // ceiling too — a fragment-blind walk historically let it evade the gate. Deduplicated: a field
+    // named twice (direct + in a fragment) is reported once.
+    let fragments = crate::graphql_root_fields::document_fragments(&doc);
+    let mut seen = std::collections::BTreeSet::new();
+    let mut out = Vec::new();
+    for (_, name) in crate::graphql_root_fields::expanded_root_fields(op, &fragments) {
+        if sg
+            .root_tenancy
+            .get(&name)
+            .is_some_and(boatramp_core::tenancy::TenancyClass::is_target)
+            && seen.insert(name.clone())
+        {
+            out.push(name);
+        }
+    }
+    out
 }
 
 /// Lower a host-held [`PublicPredicate`](boatramp_core::tenancy::PublicPredicate) into GDC
@@ -738,9 +741,20 @@ impl boatramp_handlers::SupergraphRunner for FederationRunner {
             .map_err(|e| {
                 SupergraphRunError::Failed(format!("supergraph composition failed: {e}"))
             })?;
+        // #495: the internal `graphql::run` path hides NOTHING — an edge-hidden root field is still
+        // reachable here (the guest floor is the safelist gate above, independent of edge
+        // visibility). Pass `Visibility::Internal`, which keys the plan cache distinctly from the
+        // external edge's (possibly hidden) plan so the two never collide.
         let plan = inner
             .graphql_cache
-            .plan(project, cached.version, &hash, &query, &cached.supergraph)
+            .plan(
+                project,
+                cached.version,
+                &hash,
+                &query,
+                &cached.supergraph,
+                crate::graphql_cache::Visibility::Internal,
+            )
             .map_err(|_| SupergraphRunError::PlanFailed("the query cannot be planned".into()))?;
 
         let Some(invoker) = inner.invoker.get() else {
@@ -1013,7 +1027,7 @@ mod tests {
             ("reviews".into(), REVIEWS.into()),
         ])
         .unwrap();
-        let plan = plan("{ me { name } topReviews { body } }", &sg).unwrap();
+        let plan = plan("{ me { name } topReviews { body } }", &sg, None).unwrap();
         let mock = Mock(HashMap::from([
             ("accounts", json!({ "data": { "me": { "name": "Alice" } } })),
             (
@@ -1039,7 +1053,7 @@ mod tests {
             ("reviews".into(), REVIEWS.into()),
         ])
         .unwrap();
-        let plan = plan("{ me { name } }", &sg).unwrap();
+        let plan = plan("{ me { name } }", &sg, None).unwrap();
         let mock = Mock(HashMap::from([(
             "accounts",
             json!({ "data": null, "errors": [{ "message": "boom", "path": ["me"] }] }),
@@ -1061,7 +1075,7 @@ mod tests {
             ("reviews".into(), REVIEWS.into()),
         ])
         .unwrap();
-        let plan = plan("{ me { name } topReviews { body } }", &sg).unwrap();
+        let plan = plan("{ me { name } topReviews { body } }", &sg, None).unwrap();
         let mock = Mock(HashMap::from([
             ("accounts", json!({ "data": { "me": { "name": "Alice" } } })),
             (
@@ -1086,7 +1100,7 @@ mod tests {
             ("reviews".into(), REVIEWS.into()),
         ])
         .unwrap();
-        let plan = plan("{ me { name reviews { body } } }", &sg).unwrap();
+        let plan = plan("{ me { name reviews { body } } }", &sg, None).unwrap();
         let mock = Mock(HashMap::from([
             (
                 "accounts",
@@ -1114,7 +1128,7 @@ mod tests {
             ("reviews".into(), REVIEWS.into()),
         ])
         .unwrap();
-        let plan = plan("{ me { name reviews { body } } }", &sg).unwrap();
+        let plan = plan("{ me { name reviews { body } } }", &sg, None).unwrap();
         let mock = Mock(HashMap::from([
             (
                 "accounts",
@@ -1138,7 +1152,7 @@ mod tests {
             ("reviews".into(), REVIEWS.into()),
         ])
         .unwrap();
-        let plan = plan("{ users { name reviews { body } } }", &sg).unwrap();
+        let plan = plan("{ users { name reviews { body } } }", &sg, None).unwrap();
         let out = execute(&plan, &ContractRunner, &json!({})).await;
         // Each list element is joined to *its own* reviews by key — proving the
         // representations→`_entities`→stitch round-trip preserves per-element identity
@@ -1217,12 +1231,17 @@ mod tests {
         .unwrap();
 
         // Inline-argument form.
-        let plan_inline = plan("mutation { agent(input: \"hi\") }", &sg).unwrap();
+        let plan_inline = plan("mutation { agent(input: \"hi\") }", &sg, None).unwrap();
         let out = execute(&plan_inline, &MutationRunner, &json!({})).await;
         assert_eq!(out["data"]["agent"], json!("ok"), "out: {out}");
 
         // Variable form — the common client shape; the variable value must be forwarded.
-        let plan_var = plan("mutation T($input: String){ agent(input: $input) }", &sg).unwrap();
+        let plan_var = plan(
+            "mutation T($input: String){ agent(input: $input) }",
+            &sg,
+            None,
+        )
+        .unwrap();
         let out = execute(&plan_var, &MutationRunner, &json!({ "input": "hi" })).await;
         assert_eq!(out["data"]["agent"], json!("ok"), "out: {out}");
     }
@@ -1267,6 +1286,27 @@ mod tests {
         );
         assert_eq!(
             target_root_fields("{ me { id } publicProducts { id } }", &sg),
+            vec!["publicProducts".to_string()]
+        );
+        // #495: a FRAGMENT-WRAPPED target field must also be reported (else it evades the operator
+        // eligibility ceiling) — inline fragment and named spread both surface it, deduplicated.
+        assert_eq!(
+            target_root_fields("{ ... on Query { publicProducts { id } } }", &sg),
+            vec!["publicProducts".to_string()]
+        );
+        assert_eq!(
+            target_root_fields(
+                "query { ...F } fragment F on Query { publicProducts { id } }",
+                &sg
+            ),
+            vec!["publicProducts".to_string()]
+        );
+        // A field named both directly and in a fragment is reported ONCE (dedup).
+        assert_eq!(
+            target_root_fields(
+                "query { publicProducts { id } ...F } fragment F on Query { publicProducts { id } }",
+                &sg
+            ),
             vec!["publicProducts".to_string()]
         );
     }

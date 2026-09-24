@@ -12,7 +12,7 @@
 //! multi-tenant isolation, and only **successful** compositions are cached (a composition error
 //! is never cached, so an operator's fix takes effect on the very next read).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 
@@ -23,10 +23,75 @@ use crate::graphql_plan::{plan, PlanError, QueryPlan};
 use boatramp_core::config::HandlerGraphqlDataConfig;
 use boatramp_core::kv::KvStore;
 
+/// The edge-visibility dimension of a plan-cache lookup (#495). The plan cache is SHARED by the
+/// external `/graphql` edge and the internal `graphql::run` path; those two paths resolve the SAME
+/// operation against the SAME supergraph but under **different visibility** — the external path may
+/// hide root fields (they plan as `UnknownRootField`), the internal path hides nothing. Keying only
+/// on `(project, version, op_hash)` would let one path serve the other's plan — a fail-open trap
+/// (an internal plan of a hidden op, primed once, would then be served to the external edge). This
+/// discriminates the two so their plans never collide.
+#[derive(Clone)]
+pub(crate) enum Visibility<'a> {
+    /// An internal caller (`graphql::run`, `emit::invoke`): hide nothing (`plan(edge_hidden=None)`).
+    Internal,
+    /// The external `/graphql` edge: hide the resolved `(root_type, field)` set. The set is the
+    /// **canonical resolved** effective-hidden set (manifest entries already resolved against the
+    /// supergraph roots, unknowns dropped, unioned with the directive roots) — NOT raw manifest
+    /// strings, so two sites that resolve to the same hidden set share a warm plan. An EMPTY set
+    /// (a site with no excludes) is still `External` and keys **distinctly** from `Internal`.
+    External(&'a BTreeSet<(String, String)>),
+}
+
+impl Visibility<'_> {
+    /// The visibility component of the plan-cache key: a discriminated, stable string. `Internal`
+    /// is a fixed sentinel that can never collide with any external hash; `External` is a
+    /// deterministic hash over the CANONICAL RESOLVED hidden set (post-resolution), so it is stable
+    /// across nodes and equal iff the resolved hidden sets are equal. Internal and external-empty
+    /// are DISTINCT keys (`"i"` vs `"e:<hash-of-empty>"`).
+    fn cache_discriminant(&self) -> String {
+        match self {
+            Visibility::Internal => "i".to_string(),
+            Visibility::External(hidden) => format!("e:{}", hidden_hash(hidden)),
+        }
+    }
+
+    /// The `edge_hidden` argument to thread into [`plan`]: `None` for internal, the resolved set for
+    /// external. This is the SAME set the discriminant hashes, so the key and the plan agree.
+    fn edge_hidden(&self) -> Option<&BTreeSet<(String, String)>> {
+        match self {
+            Visibility::Internal => None,
+            Visibility::External(hidden) => Some(hidden),
+        }
+    }
+}
+
+/// A stable hex hash over a canonical resolved hidden set. The set is a `BTreeSet`, so iteration is
+/// already sorted and deterministic; the `(root_type, field)` pairs are hashed with an unambiguous
+/// separator so `("Query","ab")` and `("Query","a"),("Query","b")` can't collide. Uses the same
+/// SHA-256 helper the op-hash uses, so the key alphabet stays uniform.
+fn hidden_hash(hidden: &BTreeSet<(String, String)>) -> String {
+    let mut canonical = String::new();
+    for (ty, field) in hidden {
+        // Length-prefix each element so no concatenation is ambiguous (a delimiter alone could be
+        // forged by a field name containing it; a length prefix cannot).
+        canonical.push_str(&format!(
+            "{}:{ty}\u{1f}{}:{field}\u{1f}",
+            ty.len(),
+            field.len()
+        ));
+    }
+    crate::graphql_apq::sha256_hex(&canonical)
+}
+
 /// The SQL-backed subgraph routing table (`name → (site, data config)`), cached alongside the
 /// supergraph (it's the *other* uncached `list_prefix` on the hot path, and changes on the same
 /// version bump).
 type SqlSubgraphs = BTreeMap<String, (String, HandlerGraphqlDataConfig)>;
+
+/// The plan-cache key: `(project, version, op_hash, visibility_discriminant)` (#495). The trailing
+/// visibility discriminant separates the external edge's (possibly hidden) plan from the internal
+/// path's — see [`Visibility`].
+type PlanKey = (String, u64, String, String);
 
 /// A composed supergraph for a project at a specific composition version. Cheaply cloned (the
 /// heavy `Supergraph` + routing table are behind `Arc`s).
@@ -46,7 +111,10 @@ const PLAN_CAPACITY: usize = 1024;
 /// in-process `graphql::run` paths).
 pub(crate) struct GraphqlCache {
     supergraphs: Mutex<LruCache<String, CachedGraph>>,
-    plans: Mutex<LruCache<(String, u64, String), Arc<QueryPlan>>>,
+    /// Keyed `(project, version, op_hash, visibility)` (#495): the trailing `visibility` component
+    /// discriminates the external edge's (possibly hidden) plan from the internal path's — see
+    /// [`Visibility`]. Without it the shared cache would fail open across the two paths.
+    plans: Mutex<LruCache<PlanKey, Arc<QueryPlan>>>,
 }
 
 impl Default for GraphqlCache {
@@ -100,9 +168,11 @@ impl GraphqlCache {
         Ok(cached)
     }
 
-    /// The plan for `query` against `graph`, memoized by `(project, version, op_hash)`. The
-    /// planner is a pure function of (operation, supergraph), so `version` pins the supergraph
-    /// dimension and `op_hash` the operation. A plan error is returned **uncached**.
+    /// The plan for `query` against `graph`, memoized by `(project, version, op_hash, visibility)`.
+    /// The planner is a pure function of (operation, supergraph, edge_hidden), so `version` pins the
+    /// supergraph dimension, `op_hash` the operation, and `visibility` the edge-visibility dimension
+    /// (#495) — the external edge's (possibly hidden) plan never collides with the internal path's.
+    /// A plan error is returned **uncached**.
     pub(crate) fn plan(
         &self,
         project: &str,
@@ -110,13 +180,21 @@ impl GraphqlCache {
         op_hash: &str,
         query: &str,
         graph: &Supergraph,
+        visibility: Visibility<'_>,
     ) -> Result<Arc<QueryPlan>, PlanError> {
-        let key = (project.to_string(), version, op_hash.to_string());
+        let key = (
+            project.to_string(),
+            version,
+            op_hash.to_string(),
+            visibility.cache_discriminant(),
+        );
         let hit = self.plans.lock().unwrap().get(&key).cloned();
         if let Some(hit) = hit {
             return Ok(hit);
         }
-        let planned = Arc::new(plan(query, graph)?);
+        // Thread the SAME visibility into the planner that the key hashed, so the cached plan and its
+        // key agree (an external hidden op plans as `UnknownRootField`; an internal one plans it).
+        let planned = Arc::new(plan(query, graph, visibility.edge_hidden())?);
         self.plans.lock().unwrap().put(key, planned.clone());
         Ok(planned)
     }
@@ -223,6 +301,7 @@ mod tests {
                 "op-a",
                 "{ me { id } }",
                 &graph.supergraph,
+                Visibility::Internal,
             )
             .unwrap();
         // Same key → the very same Arc (cache hit).
@@ -233,6 +312,7 @@ mod tests {
                 "op-a",
                 "{ me { id } }",
                 &graph.supergraph,
+                Visibility::Internal,
             )
             .unwrap();
         assert!(Arc::ptr_eq(&p1, &p1_again), "same op → cached plan");
@@ -245,11 +325,88 @@ mod tests {
                 "op-a",
                 "{ me { id } }",
                 &graph.supergraph,
+                Visibility::Internal,
             )
             .unwrap();
         assert!(
             !Arc::ptr_eq(&p1, &p_other),
             "distinct projects never share a plan"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_visibility_dimension_distinguishes_cache_entries() {
+        // #495: the SAME (project, version, op_hash) under different visibility MUST NOT share a
+        // plan — a fail-open trap otherwise (an internal plan primed once would serve the edge).
+        let kv = MemoryKv::new();
+        crate::graphql_registry::publish(&kv, "acme", "accounts", ACCOUNTS)
+            .await
+            .unwrap();
+        let cache = GraphqlCache::default();
+        let graph = cache.supergraph(&kv, "acme").await.unwrap();
+        let empty: BTreeSet<(String, String)> = BTreeSet::new();
+        let non_empty: BTreeSet<(String, String)> =
+            BTreeSet::from([("Query".to_string(), "topReviews".to_string())]);
+
+        // Internal.
+        let internal = cache
+            .plan(
+                "acme",
+                graph.version,
+                "op-a",
+                "{ me { id } }",
+                &graph.supergraph,
+                Visibility::Internal,
+            )
+            .unwrap();
+        // External with an EMPTY hidden set — MUST be a distinct entry from Internal (distinct keys).
+        let external_empty = cache
+            .plan(
+                "acme",
+                graph.version,
+                "op-a",
+                "{ me { id } }",
+                &graph.supergraph,
+                Visibility::External(&empty),
+            )
+            .unwrap();
+        assert!(
+            !Arc::ptr_eq(&internal, &external_empty),
+            "Internal and External(empty) must be DISTINCT cache keys (no fail-open)"
+        );
+        // External with a NON-empty hidden set — distinct again (different resolved-set hash). The
+        // op only names `me`, so it still plans (the hidden `topReviews` isn't selected), but under
+        // a different key.
+        let external_hidden = cache
+            .plan(
+                "acme",
+                graph.version,
+                "op-a",
+                "{ me { id } }",
+                &graph.supergraph,
+                Visibility::External(&non_empty),
+            )
+            .unwrap();
+        assert!(
+            !Arc::ptr_eq(&external_empty, &external_hidden),
+            "distinct resolved hidden sets ⇒ distinct external cache keys"
+        );
+
+        // Re-priming External(empty) with the same set returns the SAME Arc (a warm hit — the hash
+        // is stable over the canonical set).
+        let external_empty_again = cache
+            .plan(
+                "acme",
+                graph.version,
+                "op-a",
+                "{ me { id } }",
+                &graph.supergraph,
+                Visibility::External(&BTreeSet::new()),
+            )
+            .unwrap();
+        assert!(
+            Arc::ptr_eq(&external_empty, &external_empty_again),
+            "the same resolved hidden set is a warm cache hit"
         );
     }
 }

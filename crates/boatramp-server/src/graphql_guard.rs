@@ -136,12 +136,16 @@ fn operations(doc: &ExecutableDocument) -> Vec<&OperationDefinition> {
 
 /// Whether any operation selects `__schema` or `__type` at its root — a schema
 /// introspection query. `__typename` (allowed anywhere) is deliberately not counted.
+///
+/// Routes through the shared [`crate::graphql_root_fields::expanded_root_fields`] helper so
+/// **fragment-wrapped** introspection (`{ ... on Query { __schema } }`, a named spread, a
+/// nested spread) is caught too — a fragment-blind check historically let it bypass the gate.
 fn has_root_introspection(doc: &ExecutableDocument) -> bool {
+    let fragments = crate::graphql_root_fields::document_fragments(doc);
     operations(doc).iter().any(|op| {
-        op.selection_set.node.items.iter().any(|sel| {
-            matches!(&sel.node, Selection::Field(f)
-                if f.node.name.node == "__schema" || f.node.name.node == "__type")
-        })
+        crate::graphql_root_fields::expanded_root_fields(op, &fragments)
+            .iter()
+            .any(|(_, name)| name == "__schema" || name == "__type")
     })
 }
 
@@ -283,6 +287,34 @@ mod tests {
         // __typename is not introspection.
         assert_eq!(
             guard_query("{ a __typename }", &limits(100, 100, false)),
+            GuardVerdict::Allow
+        );
+    }
+
+    #[test]
+    fn fragment_wrapped_introspection_is_gated() {
+        // Pre-existing latent vuln: a fragment-blind gate let `{ ... on Query { __schema } }`
+        // (and a named spread) bypass introspection-off. Routing the gate through the shared
+        // fragment-expanding helper closes it — every form must now be rejected.
+        for q in [
+            "{ ... on Query { __schema { types { name } } } }",
+            "query { ...I } fragment I on Query { __schema { types { name } } }",
+            "query { ...A } fragment A on Query { ...B } fragment B on Query { __type(name: \"X\") { name } }",
+        ] {
+            assert!(
+                matches!(
+                    guard_query(q, &limits(100, 100, false)),
+                    GuardVerdict::Reject(r) if r.contains("introspection")
+                ),
+                "fragment-wrapped introspection must be gated, query: {q}"
+            );
+        }
+        // ...and when introspection is enabled the same forms are allowed (no false positive).
+        assert_eq!(
+            guard_query(
+                "query { ...I } fragment I on Query { __schema { types { name } } }",
+                &limits(100, 100, true)
+            ),
             GuardVerdict::Allow
         );
     }
