@@ -1048,6 +1048,30 @@ pub struct HandlerGraphqlConfig {
     /// configured; exposure is deny-by-default.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<HandlerGraphqlDataConfig>,
+    /// **Edge-visibility per-operation excludes** (#495) for a `federated` gateway: root operations
+    /// to make **unreachable from the external `/graphql` edge** while internal paths (guest
+    /// `graphql::run`, `emit::invoke`) still reach them. Each entry is a **qualified**
+    /// `"<subgraph>.<rootField>"` (e.g. `"identity.socialLogin"`); the field must exist as a root
+    /// `Query`/`Mutation` field owned by that subgraph. A **bare** unqualified entry is rejected
+    /// (ignored + logged) — a field name alone is ambiguous across subgraphs. An entry naming a
+    /// non-existent / wrong-owner root is ignored + logged (never widens: this list can only ADD to
+    /// the hidden set). An external operation naming a hidden root fails to plan **exactly like a
+    /// genuinely-unknown field** (no oracle). This is the immediate, redeploy-free operator override
+    /// (it applies fresh per request, with no recomposition lag); the code-local equivalent is the
+    /// `@edgeHidden` SDL field directive. Default empty ⇒ nothing hidden (non-breaking, opt-out only).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub edge_hidden_operations: Vec<String>,
+    /// **Edge-visibility per-subgraph excludes** (#495) for a `federated` gateway: every ROOT
+    /// `Query`/`Mutation` field OWNED by a listed subgraph is made unreachable from the external
+    /// `/graphql` edge (internal paths still reach them). Lets an operator split edge-facing reads
+    /// into one subgraph and keep trust-boundary mutations in an invoke-only subgraph with a single
+    /// flag. **ROOT-ONLY:** this hides a subgraph's root fields; it does NOT hide that subgraph's
+    /// entity fields reached via a shared-type `_entities` jump from another root — a cross-type
+    /// entity jump is the resolver's own authz responsibility (whole-subgraph entity hiding is a
+    /// documented follow-up). A subgraph owning no root field is ignored + logged. Default empty ⇒
+    /// nothing hidden (non-breaking, opt-out only).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub edge_hidden_subgraphs: Vec<String>,
 }
 
 /// The declarative GraphQL data connector's configuration (see
@@ -1382,6 +1406,44 @@ mod tests {
         let bare_consumer: ConsumerConfig =
             serde_json::from_str(r#"{"topic":"orders","component":"c.wasm"}"#).unwrap();
         assert!(bare_consumer.secrets.is_empty());
+    }
+
+    #[test]
+    fn edge_hidden_fields_default_empty_and_round_trip() {
+        // #495: the edge-visibility manifest fields are opt-out (default empty ⇒ nothing hidden ⇒
+        // non-breaking). A pre-#495 graphql config still parses (they're absent).
+        let bare: HandlerGraphqlConfig =
+            serde_json::from_str(r#"{"enabled":true,"federated":true}"#).unwrap();
+        assert!(bare.edge_hidden_operations.is_empty());
+        assert!(bare.edge_hidden_subgraphs.is_empty());
+        // An empty manifest is elided on serialize (skip_serializing_if), so a config that never
+        // used the feature serializes byte-identically to before.
+        let json = serde_json::to_string(&bare).unwrap();
+        assert!(
+            !json.contains("edge_hidden"),
+            "empty edge-hidden manifest is not serialized: {json}"
+        );
+
+        // Non-empty manifests deserialize and round-trip verbatim.
+        let scoped: HandlerGraphqlConfig = serde_json::from_str(
+            r#"{"enabled":true,"federated":true,"edge_hidden_operations":["identity.socialLogin","identity.exchange"],"edge_hidden_subgraphs":["identity"]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            scoped.edge_hidden_operations,
+            vec![
+                "identity.socialLogin".to_string(),
+                "identity.exchange".to_string()
+            ]
+        );
+        assert_eq!(scoped.edge_hidden_subgraphs, vec!["identity".to_string()]);
+        let reparsed: HandlerGraphqlConfig =
+            serde_json::from_str(&serde_json::to_string(&scoped).unwrap()).unwrap();
+        assert_eq!(
+            reparsed.edge_hidden_operations,
+            scoped.edge_hidden_operations
+        );
+        assert_eq!(reparsed.edge_hidden_subgraphs, scoped.edge_hidden_subgraphs);
     }
 
     #[test]

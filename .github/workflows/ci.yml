@@ -968,6 +968,23 @@ jobs:
             || { echo "::error::secret-allowlist gate did not run (silent skip or a failure)" >&2; exit 1; }
           grep -q 'SECRET ALLOWLIST SCOPED OK' secret-allowlist.log \
             || { echo "::error::secret-allowlist gate never reached its marker (a cross-handler secret-pool leak regression)" >&2; exit 1; }
+      # #495: edge-visibility for federated GraphQL. An `@edgeHidden` (or manifest-listed) ROOT field is
+      # reachable via the internal paths (guest graphql::run, emit::invoke) but EXCLUDED from the
+      # anonymous external `/graphql` edge — it fails to plan EXACTLY like an unknown field (no oracle)
+      # and its resolver is NEVER invoked. This gate drives the REAL router→compose→plan→execute path
+      # with two subgraph functions: the edge-hidden `Mutation.agent` (whose fixture echoes `ran:<input>`
+      # when it runs) MUST NOT run on an anon external POST and must be byte-identical to an unknown
+      # field (direct AND fragment-wrapped), while the visible `Query.users` still resolves. A hide
+      # regression (the resolver runs / an existence oracle) fails the merge.
+      - name: edge-visibility internal-op gate marker (#495)
+        run: |
+          set -eo pipefail
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-server \
+            --features handlers --test conformance edge_visibility_hides_an_internal_op_from_the_external_edge -- --nocapture 2>&1 | tee edge-visibility.log
+          grep -qE 'test result: ok\. 1 passed' edge-visibility.log \
+            || { echo "::error::edge-visibility gate did not run (silent skip or a failure)" >&2; exit 1; }
+          grep -q 'EDGE VISIBILITY INTERNAL OK' edge-visibility.log \
+            || { echo "::error::edge-visibility gate never reached its marker (an edge-hidden op became reachable on the external edge, or an existence oracle appeared)" >&2; exit 1; }
       # B10 (async-lane sharding): the whole async-lane shard gate battery — CAS claim race,
       # node-loss transition (double-owner ⇒ exactly one execution, no-owner ⇒ safety-net rescues,
       # never a stranding), lease-expiry reclaim, blob-watcher single-fire, cron single-fire, and the

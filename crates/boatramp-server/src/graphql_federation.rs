@@ -47,6 +47,15 @@ pub(crate) struct Supergraph {
     /// still gated at publish by the operator's `TenancySchema.target_eligible_fields` (a separate
     /// check that needs the project schema — see the registry) before it may bind.
     pub root_tenancy: BTreeMap<String, TenancyClass>,
+    /// Root `(type, field)` pairs (`type` is `"Query"` or `"Mutation"`) marked **edge-hidden** by
+    /// an `@edgeHidden` field directive at composition (#495). An edge-hidden root is made
+    /// structurally absent to the EXTERNAL `/graphql` planner (→ the identical `UnknownRootField`
+    /// path as a genuinely-unknown field, no oracle), while internal paths (`graphql::run`,
+    /// `emit::invoke`) still reach it. Default empty ⇒ **non-breaking** (every current field stays
+    /// edge-visible; opt-OUT only). The manifest sources (`edge_hidden_operations` /
+    /// `edge_hidden_subgraphs`) union additional pairs at request time — this holds only the
+    /// directive-declared ones (they travel with the code).
+    pub edge_hidden_roots: BTreeSet<(String, String)>,
 }
 
 /// A composition failure.
@@ -68,6 +77,12 @@ pub(crate) enum CompositionError {
         field: String,
         reason: String,
     },
+    /// An `@edgeHidden` directive on a **non-root** field (#495). Edge visibility is a property of
+    /// a root operation only — a `@edgeHidden` on a nested object field cannot be honored by the
+    /// edge planner (which hides ROOT fields), so it is refused at publish rather than silently
+    /// ignored (fail-closed, mirroring [`Self::InvalidTenantDirective`]). Move the marker to the
+    /// root field, or gate the nested field with the resolver's own authz.
+    MisplacedEdgeHidden { type_name: String, field: String },
 }
 
 impl std::fmt::Display for CompositionError {
@@ -93,6 +108,12 @@ impl std::fmt::Display for CompositionError {
             } => write!(
                 f,
                 "field `{type_name}.{field}` has an invalid @tenant directive: {reason}"
+            ),
+            Self::MisplacedEdgeHidden { type_name, field } => write!(
+                f,
+                "field `{type_name}.{field}` carries @edgeHidden but is not a root Query/Mutation \
+                 field — @edgeHidden may only mark a root operation (move it to the root field, or \
+                 gate this field with the resolver's own authz)"
             ),
         }
     }
@@ -214,8 +235,27 @@ fn ingest_object(
                 {
                     sg.root_tenancy.insert(field_name.to_string(), class);
                 }
+                // #495: an `@edgeHidden` field directive marks this ROOT field edge-internal — the
+                // external `/graphql` planner treats it as absent (→ `UnknownRootField`, no oracle),
+                // while internal paths still reach it. A bare directive (no args to validate); an
+                // unknown-to-an-older-host `@edgeHidden` on a *root* simply composes cleanly
+                // (forward-safe). Only valid on a root — the non-root arm below refuses it.
+                if has_directive(&field.directives, "edgeHidden") {
+                    sg.edge_hidden_roots
+                        .insert((type_name.to_string(), field_name.to_string()));
+                }
             }
             _ => {
+                // #495: `@edgeHidden` is a ROOT-only marker. Edge visibility is a property of a root
+                // operation; the planner hides root fields, so a `@edgeHidden` on a nested object
+                // field cannot be honored. Refuse the deploy (fail-closed) rather than silently
+                // ignore it — a silent no-op would give a false sense of protection.
+                if has_directive(&field.directives, "edgeHidden") {
+                    return Err(CompositionError::MisplacedEdgeHidden {
+                        type_name: type_name.to_string(),
+                        field: field_name.to_string(),
+                    });
+                }
                 let owners = sg
                     .field_owners
                     .entry((type_name.to_string(), field_name.to_string()))
@@ -707,5 +747,85 @@ extend schema @link(
             compose(&[sub("s", bad_src)]).unwrap_err(),
             CompositionError::InvalidTenantDirective { .. }
         ));
+    }
+
+    #[test]
+    fn edge_hidden_directive_marks_root_query_and_mutation_fields() {
+        // #495: `@edgeHidden` on a root Query/Mutation field records the `(type, field)` pair; a
+        // field with no marker stays edge-visible (absent). A directive definition may be present
+        // (a real subgraph emits one) — composition ignores it and reads the usage.
+        let sdl = r#"
+            directive @edgeHidden on FIELD_DEFINITION
+            type Query {
+              visibleOp: String
+              hiddenOp: String @edgeHidden
+            }
+            type Mutation {
+              publicMutation: String
+              internalMutation: String @edgeHidden
+            }
+        "#;
+        let sg = compose(&[sub("identity", sdl)]).unwrap();
+        assert_eq!(
+            sg.edge_hidden_roots,
+            std::collections::BTreeSet::from([
+                ("Query".to_string(), "hiddenOp".to_string()),
+                ("Mutation".to_string(), "internalMutation".to_string()),
+            ])
+        );
+        // The marked roots are still owned/plannable (they're only hidden from the EXTERNAL edge).
+        assert_eq!(
+            sg.root_query.get("hiddenOp").map(String::as_str),
+            Some("identity")
+        );
+        assert_eq!(
+            sg.root_mutation.get("internalMutation").map(String::as_str),
+            Some("identity")
+        );
+        // An unmarked field never enters the hidden set (non-breaking default).
+        assert!(!sg
+            .edge_hidden_roots
+            .contains(&("Query".to_string(), "visibleOp".to_string())));
+    }
+
+    #[test]
+    fn edge_hidden_on_a_non_root_field_is_a_composition_error() {
+        // #495 / UX-C2: `@edgeHidden` is root-only. On a nested object field it can't be honored by
+        // the edge planner, so composition REFUSES the deploy (fail-closed) — never a silent no-op.
+        let sdl = r#"
+            type Query { me: User }
+            type User { id: ID! secret: String @edgeHidden }
+        "#;
+        let err = compose(&[sub("identity", sdl)]).unwrap_err();
+        assert!(
+            matches!(&err, CompositionError::MisplacedEdgeHidden { type_name, field }
+                if type_name == "User" && field == "secret"),
+            "got {err:?}"
+        );
+        // The operator-facing message must name the misplaced field + say root-only (guides the fix).
+        let msg = err.to_string();
+        assert!(
+            msg.contains("User.secret") && msg.contains("root"),
+            "unexpected message: {msg}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_edge_hidden_directive_on_a_root_composes_cleanly_forward_compat() {
+        // BA-C5: an older host that does not yet understand `@edgeHidden` must still COMPOSE SDL
+        // bearing it on a root (a subgraph publishing to a not-yet-upgraded host is forward-safe).
+        // Here composition simply reads the usage on a root field and never errors — proving the
+        // directive is purely additive on a root (no directive *definition* required, no arg
+        // validation). The only refusal is a NON-root placement (covered above).
+        let sdl = r#"
+            type Query {
+              exchange: String @edgeHidden
+            }
+        "#;
+        // Composes without error; the root is recorded as edge-hidden.
+        let sg = compose(&[sub("identity", sdl)]).expect("root @edgeHidden composes cleanly");
+        assert!(sg
+            .edge_hidden_roots
+            .contains(&("Query".to_string(), "exchange".to_string())));
     }
 }
