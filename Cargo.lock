@@ -1229,7 +1229,7 @@ dependencies = [
  "pin-project",
  "quick-xml 0.31.0",
  "rand 0.8.6",
- "reqwest",
+ "reqwest 0.12.28",
  "rustc_version",
  "serde",
  "serde_json",
@@ -1535,7 +1535,7 @@ dependencies = [
 
 [[package]]
 name = "boatramp"
-version = "0.5.4"
+version = "0.5.5"
 dependencies = [
  "async-trait",
  "axum",
@@ -1571,7 +1571,7 @@ dependencies = [
  "kube",
  "lightningcss",
  "rcgen",
- "reqwest",
+ "reqwest 0.12.28",
  "rolldown",
  "ron",
  "rustls 0.23.40",
@@ -1597,7 +1597,7 @@ dependencies = [
 
 [[package]]
 name = "boatramp-acme"
-version = "0.5.4"
+version = "0.5.5"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -1607,7 +1607,7 @@ dependencies = [
  "instant-acme",
  "pkcs8",
  "rcgen",
- "reqwest",
+ "reqwest 0.12.28",
  "ring",
  "rsa",
  "rustls 0.23.40",
@@ -1622,12 +1622,12 @@ dependencies = [
 
 [[package]]
 name = "boatramp-cloudflare"
-version = "0.5.4"
+version = "0.5.5"
 dependencies = [
  "async-trait",
  "boatramp-core",
  "hex",
- "reqwest",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -1637,7 +1637,7 @@ dependencies = [
 
 [[package]]
 name = "boatramp-cluster"
-version = "0.5.4"
+version = "0.5.5"
 dependencies = [
  "async-trait",
  "aws-lc-rs",
@@ -1648,7 +1648,7 @@ dependencies = [
  "bytes",
  "futures",
  "openraft",
- "reqwest",
+ "reqwest 0.12.28",
  "rustls 0.23.40",
  "serde",
  "serde_json",
@@ -1663,7 +1663,7 @@ dependencies = [
 
 [[package]]
 name = "boatramp-container"
-version = "0.5.4"
+version = "0.5.5"
 dependencies = [
  "async-trait",
  "boatramp-core",
@@ -1689,7 +1689,7 @@ dependencies = [
 
 [[package]]
 name = "boatramp-core"
-version = "0.5.4"
+version = "0.5.5"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1717,7 +1717,7 @@ dependencies = [
 
 [[package]]
 name = "boatramp-docker"
-version = "0.5.4"
+version = "0.5.5"
 dependencies = [
  "async-trait",
  "boatramp-core",
@@ -1731,7 +1731,7 @@ dependencies = [
 
 [[package]]
 name = "boatramp-firecracker"
-version = "0.5.4"
+version = "0.5.5"
 dependencies = [
  "async-trait",
  "boatramp-core",
@@ -1745,7 +1745,7 @@ dependencies = [
  "kvm-ioctls",
  "linux-loader",
  "nix 0.29.0",
- "reqwest",
+ "reqwest 0.12.28",
  "seccompiler",
  "serde",
  "serde_json",
@@ -1762,7 +1762,7 @@ dependencies = [
 
 [[package]]
 name = "boatramp-handlers"
-version = "0.5.4"
+version = "0.5.5"
 dependencies = [
  "async-trait",
  "boatramp-core",
@@ -1791,7 +1791,7 @@ dependencies = [
 
 [[package]]
 name = "boatramp-http"
-version = "0.5.4"
+version = "0.5.5"
 dependencies = [
  "bytes",
  "h2 0.4.14",
@@ -1810,13 +1810,13 @@ dependencies = [
 
 [[package]]
 name = "boatramp-mcp"
-version = "0.5.4"
+version = "0.5.5"
 dependencies = [
  "async-trait",
  "boatramp-core",
  "boatramp-rpktls",
  "http 1.4.2",
- "reqwest",
+ "reqwest 0.12.28",
  "rmcp",
  "schemars 1.2.1",
  "serde",
@@ -1829,7 +1829,7 @@ dependencies = [
 
 [[package]]
 name = "boatramp-node"
-version = "0.5.4"
+version = "0.5.5"
 dependencies = [
  "async-trait",
  "axum",
@@ -1860,7 +1860,7 @@ dependencies = [
 
 [[package]]
 name = "boatramp-rpktls"
-version = "0.5.4"
+version = "0.5.5"
 dependencies = [
  "aws-lc-rs",
  "rustls 0.23.40",
@@ -1872,7 +1872,7 @@ dependencies = [
 
 [[package]]
 name = "boatramp-server"
-version = "0.5.4"
+version = "0.5.5"
 dependencies = [
  "arc-swap",
  "async-compression",
@@ -1912,7 +1912,7 @@ dependencies = [
  "proptest",
  "quinn",
  "rand_core 0.6.4",
- "reqwest",
+ "reqwest 0.12.28",
  "rmcp",
  "rustls 0.23.40",
  "serde",
@@ -1934,7 +1934,7 @@ dependencies = [
 
 [[package]]
 name = "boatramp-storage"
-version = "0.5.4"
+version = "0.5.5"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -1955,12 +1955,13 @@ dependencies = [
  "lru 0.16.4",
  "memmap2",
  "notify",
- "object_store",
- "reqwest",
+ "object_store 0.14.2",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
  "serial_test",
- "slatedb",
+ "slatedb 0.13.1",
+ "slatedb 0.16.0",
  "sqlparser",
  "sqlx",
  "tokio",
@@ -1969,7 +1970,7 @@ dependencies = [
 
 [[package]]
 name = "boatramp-types"
-version = "0.5.4"
+version = "0.5.5"
 dependencies = [
  "argon2",
  "async-trait",
@@ -1988,7 +1989,7 @@ dependencies = [
 
 [[package]]
 name = "boatramp-vz"
-version = "0.5.4"
+version = "0.5.5"
 dependencies = [
  "async-trait",
  "block2",
@@ -3715,6 +3716,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "fail-parallel"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c29b33a0187823f1fa88b36980227dc96c7504ede2288e7d2a77d9d6d88b260c"
+dependencies = [
+ "log",
+ "once_cell",
+ "rand 0.9.4",
+ "tokio",
+]
+
+[[package]]
 name = "fallible-iterator"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4507,7 +4520,7 @@ dependencies = [
  "google-cloud-token",
  "home",
  "jsonwebtoken",
- "reqwest",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
@@ -4550,7 +4563,7 @@ version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d901aeb453fd80e51d64df4ee005014f6cf39f2d736dd64f7239c132d9d39a6a"
 dependencies = [
- "reqwest",
+ "reqwest 0.12.28",
  "thiserror 1.0.69",
  "tokio",
 ]
@@ -4594,7 +4607,7 @@ dependencies = [
  "percent-encoding",
  "pkcs8",
  "regex",
- "reqwest",
+ "reqwest 0.12.28",
  "reqwest-middleware",
  "ring",
  "serde",
@@ -5541,6 +5554,15 @@ name = "itertools"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2b192c782037fadd9cfa75548310488aabdbf3d2da73885b31bd0abd03351285"
+dependencies = [
+ "either",
+]
+
+[[package]]
+name = "itertools"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8b4baf93f58d4425749ca49a51c50ebab072c5df6994d08fed93541c331481dc"
 dependencies = [
  "either",
 ]
@@ -6594,6 +6616,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "nix"
+version = "0.31.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf20d2fde8ff38632c426f1165ed7436270b44f199fc55284c38276f9db47c3d"
+dependencies = [
+ "bitflags 2.13.0",
+ "cfg-if",
+ "cfg_aliases",
+ "libc",
+]
+
+[[package]]
 name = "nodejs-built-in-modules"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6877,7 +6911,7 @@ dependencies = [
  "percent-encoding",
  "quick-xml 0.38.4",
  "rand 0.9.4",
- "reqwest",
+ "reqwest 0.12.28",
  "ring",
  "serde",
  "serde_json",
@@ -6889,6 +6923,48 @@ dependencies = [
  "walkdir",
  "wasm-bindgen-futures",
  "web-time",
+]
+
+[[package]]
+name = "object_store"
+version = "0.14.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f1796bc93603f78c5760a69f2d58badc9618d22adade0a95385bb2adbae4eb94"
+dependencies = [
+ "async-trait",
+ "aws-lc-rs",
+ "base64 0.23.1",
+ "bytes",
+ "chrono",
+ "crc-fast",
+ "form_urlencoded",
+ "futures-channel",
+ "futures-core",
+ "futures-util",
+ "http 1.4.2",
+ "http-body-util",
+ "humantime",
+ "hyper 1.10.1",
+ "itertools 0.15.0",
+ "md-5 0.11.0",
+ "nix 0.31.3",
+ "parking_lot",
+ "percent-encoding",
+ "quick-xml 0.41.0",
+ "rand 0.10.2",
+ "reqwest 0.13.5",
+ "rustls-pki-types",
+ "serde",
+ "serde_json",
+ "serde_urlencoded",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "url",
+ "walkdir",
+ "wasm-bindgen-futures",
+ "web-time",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -8250,6 +8326,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "quick-xml"
+version = "0.41.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e660451e55124f798a69a5af3f49ccfbefbd41910eefd25caf2393e1f3473ec1"
+dependencies = [
+ "memchr",
+ "serde",
+]
+
+[[package]]
 name = "quinn"
 version = "0.11.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8276,6 +8362,7 @@ version = "0.11.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "434b42fec591c96ef50e21e886936e66d3cc3f737104fdb9b737c40ffb94c098"
 dependencies = [
+ "aws-lc-rs",
  "bytes",
  "fastbloom",
  "getrandom 0.3.4",
@@ -8677,9 +8764,48 @@ dependencies = [
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
- "wasm-streams",
+ "wasm-streams 0.4.2",
  "web-sys",
  "webpki-roots 1.0.7",
+]
+
+[[package]]
+name = "reqwest"
+version = "0.13.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "16a1cfa75cc186dd73d5818e510e042e40927bccc9c236b061cea97e1eb08029"
+dependencies = [
+ "base64 0.23.1",
+ "bytes",
+ "futures-core",
+ "futures-util",
+ "h2 0.4.14",
+ "http 1.4.2",
+ "http-body 1.0.1",
+ "http-body-util",
+ "hyper 1.10.1",
+ "hyper-rustls 0.27.9",
+ "hyper-util",
+ "js-sys",
+ "log",
+ "percent-encoding",
+ "pin-project-lite",
+ "quinn",
+ "rustls 0.23.40",
+ "rustls-pki-types",
+ "rustls-platform-verifier",
+ "sync_wrapper",
+ "tokio",
+ "tokio-rustls 0.26.4",
+ "tokio-util",
+ "tower 0.5.3",
+ "tower-http",
+ "tower-service",
+ "url",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "wasm-streams 0.5.0",
+ "web-sys",
 ]
 
 [[package]]
@@ -8691,7 +8817,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "http 1.4.2",
- "reqwest",
+ "reqwest 0.12.28",
  "serde",
  "thiserror 1.0.69",
  "tower-service",
@@ -10162,14 +10288,14 @@ dependencies = [
  "crossbeam-skiplist",
  "dotenvy",
  "duration-str",
- "fail-parallel",
+ "fail-parallel 0.5.2",
  "figment",
  "flatbuffers",
  "foyer",
  "futures",
  "log",
  "lru 0.18.0",
- "object_store",
+ "object_store 0.12.5",
  "once_cell",
  "ouroboros",
  "parking_lot",
@@ -10178,11 +10304,56 @@ dependencies = [
  "serde",
  "serde_json",
  "siphasher",
- "slatedb-common",
- "slatedb-txn-obj",
+ "slatedb-common 0.13.1",
+ "slatedb-txn-obj 0.13.1",
  "sysinfo",
  "thiserror 1.0.69",
  "thread_local",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "ulid",
+ "url",
+ "uuid",
+ "walkdir",
+]
+
+[[package]]
+name = "slatedb"
+version = "0.16.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fb40332f41e231926df3a0ef742c05316b43368ba4b520433d2a1eba1ab00f0f"
+dependencies = [
+ "async-channel 2.5.0",
+ "async-trait",
+ "atomic",
+ "backon",
+ "bitflags 2.13.0",
+ "bytes",
+ "chrono",
+ "crc32fast",
+ "crossbeam-skiplist",
+ "dotenvy",
+ "duration-str",
+ "fail-parallel 0.6.0",
+ "figment",
+ "flatbuffers",
+ "foyer",
+ "futures",
+ "log",
+ "lru 0.18.0",
+ "object_store 0.14.2",
+ "ouroboros",
+ "parking_lot",
+ "rand 0.9.4",
+ "serde",
+ "serde_json",
+ "siphasher",
+ "slatedb-common 0.16.0",
+ "slatedb-txn-obj 0.16.0",
+ "smallvec",
+ "sysinfo",
+ "thiserror 1.0.69",
  "tokio",
  "tokio-util",
  "tracing",
@@ -10205,6 +10376,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "slatedb-common"
+version = "0.16.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6b77f238f348e95e1653a5235f880ac703011b82582bd556f2aba405abf8180e"
+dependencies = [
+ "chrono",
+ "log",
+ "object_store 0.14.2",
+ "rand 0.9.4",
+ "rand_xoshiro",
+ "serde",
+ "thread_local",
+ "tokio",
+]
+
+[[package]]
 name = "slatedb-txn-obj"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10215,8 +10402,25 @@ dependencies = [
  "chrono",
  "futures",
  "log",
- "object_store",
- "slatedb-common",
+ "object_store 0.12.5",
+ "slatedb-common 0.13.1",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "slatedb-txn-obj"
+version = "0.16.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1ad63b6c250219e26d71f497820f970274c301f896366daa56915f2a05df0e0a"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "chrono",
+ "futures",
+ "log",
+ "object_store 0.14.2",
+ "parking_lot",
+ "slatedb-common 0.16.0",
  "thiserror 1.0.69",
 ]
 
@@ -11972,6 +12176,19 @@ name = "wasm-streams"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "15053d8d85c7eccdbefef60f06769760a563c7f0a9d6902a13d35c7800b0ad65"
+dependencies = [
+ "futures-util",
+ "js-sys",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+]
+
+[[package]]
+name = "wasm-streams"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9d1ec4f6517c9e11ae630e200b2b65d193279042e28edd4a2cda233e46670bbb"
 dependencies = [
  "futures-util",
  "js-sys",

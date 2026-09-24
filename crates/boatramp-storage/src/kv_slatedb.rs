@@ -237,8 +237,16 @@ impl KvStore for SlateKv {
     }
 
     async fn put(&self, key: &str, value: Vec<u8>) -> Result<(), KvError> {
+        // slatedb 0.16: `put`/`write` return a `WriteHandle` after the in-memory WAL/memtable update
+        // and are NOT durable until `await_durable()` (a semantics change from 0.13, where an awaited
+        // put was durable). The control plane needs durable writes — a deploy manifest / current
+        // pointer must survive a crash — so we await durability here, preserving 0.13's awaited-put
+        // behavior. (`write_batch_relaxed` deliberately does NOT await, for the bus fast path.)
         self.writer()?
             .put(key.as_bytes(), &value)
+            .await
+            .map_err(backend)?
+            .await_durable()
             .await
             .map_err(backend)?;
         Ok(())
@@ -247,6 +255,9 @@ impl KvStore for SlateKv {
     async fn delete(&self, key: &str) -> Result<(), KvError> {
         self.writer()?
             .delete(key.as_bytes())
+            .await
+            .map_err(backend)?
+            .await_durable()
             .await
             .map_err(backend)?;
         Ok(())
@@ -335,7 +346,13 @@ impl KvStore for SlateKv {
         if current.as_deref() != expected {
             return Ok(false);
         }
-        db.put(key.as_bytes(), &value).await.map_err(backend)?;
+        // Durable put (slatedb 0.16 await_durable, as in `put` above): the CAS swap must survive a crash.
+        db.put(key.as_bytes(), &value)
+            .await
+            .map_err(backend)?
+            .await_durable()
+            .await
+            .map_err(backend)?;
         Ok(true)
     }
 
@@ -349,7 +366,13 @@ impl KvStore for SlateKv {
                 WriteOp::Delete(key) => batch.delete(key.as_bytes()),
             }
         }
-        self.writer()?.write(batch).await.map_err(backend)?;
+        self.writer()?
+            .write(batch)
+            .await
+            .map_err(backend)?
+            .await_durable()
+            .await
+            .map_err(backend)?;
         Ok(())
     }
 
@@ -369,16 +392,12 @@ impl KvStore for SlateKv {
                 WriteOp::Delete(key) => batch.delete(key.as_bytes()),
             }
         }
-        self.writer()?
-            .write_with_options(
-                batch,
-                &slatedb::config::WriteOptions {
-                    await_durable: false,
-                    ..Default::default()
-                },
-            )
-            .await
-            .map_err(backend)?;
+        // slatedb 0.16: `write` returns after the in-memory WAL/memtable update and is durable only
+        // once `await_durable()` is called on the handle. We deliberately DROP the handle without
+        // awaiting it — the relaxed (non-durable) semantics the bus fast path wants (equivalent to
+        // 0.13's `WriteOptions { await_durable: false }`). The entries flush on the store's
+        // `flush_interval` or when a later durable `write_batch` forces the WAL buffer out.
+        self.writer()?.write(batch).await.map_err(backend)?;
         Ok(())
     }
 }
@@ -575,8 +594,13 @@ mod tests {
         use slatedb::object_store::memory::InMemory;
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
 
-        // A long flush interval so the periodic timer won't auto-persist; the explicit
-        // `flush()` (SHUT-1) must be what makes the write durable before close.
+        // A long flush interval so the periodic timer won't auto-persist; the explicit `flush()`
+        // (SHUT-1) must be what makes the write durable before close. NOTE (slatedb 0.16): a durable
+        // `put` now blocks on `await_durable()`, which waits for the timer-driven WAL flush — so with a
+        // 3600s interval it would hang ~an hour. We therefore use a **relaxed** (non-durable) write
+        // here, which returns immediately, and prove that the explicit `flush()` is what forces it
+        // durable before close. That is exactly this test's contract (flush persists), expressed for
+        // 0.16's write model. (The durable-put path is covered by the low-flush-interval tests above.)
         let kv = SlateKv::open_with(
             store.clone(),
             "kv",
@@ -584,7 +608,9 @@ mod tests {
         )
         .await
         .unwrap();
-        kv.put("k", b"v".to_vec()).await.unwrap();
+        kv.write_batch_relaxed(vec![WriteOp::Put("k".into(), b"v".to_vec())])
+            .await
+            .unwrap();
         kv.flush().await.unwrap(); // force durability now, not on the timer
         kv.close().await.unwrap();
 
@@ -665,6 +691,170 @@ mod tests {
             assert_eq!(kv.get("manifests/dep-1").await.unwrap(), None);
 
             kv.close().await.unwrap();
+        })
+        .await;
+    }
+
+    /// Incident regression (v0.5.5 — the `slatedb` 0.13.1 → 0.16.0 upgrade): a control-plane store whose
+    /// **tail WAL object was frozen at 0 bytes** — a crash, or a crash-consistent fly volume snapshot of
+    /// a *live* store, freezing a just-opened WAL object before its data blocks reached the device — must
+    /// still **open**, skipping only that never-durable empty tail, instead of failing fatally with
+    /// `Data error: empty SSTable` on *every* cold open (the production-down incident). Every committed
+    /// key (projects/sites/**sealed secrets**) must survive. SlateDB 0.16 tolerates it natively (an
+    /// object ≤ the SST footer is a fence marker with zero committed entries, so replay skips it); 0.13.1
+    /// (as v0.5.4 shipped) did NOT — this test fails against 0.13.1 and passes on 0.16.
+    ///
+    /// Setup uses `test_settings` (compactor + GC OFF) so the WAL objects linger on disk after close,
+    /// letting us inject a realistic empty tail object at `max_id + 1`. The injected object is > the
+    /// manifest's `replay_after_wal_id`, so it lands in the reopen's WAL replay range — exactly where a
+    /// frozen tail object sits. The reopen therefore reads the empty object during replay; only the
+    /// upstream tolerance makes it non-fatal.
+    #[serial_test::serial]
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "on-disk close→reopen stalls under the static-musl test harness (see test-orm-tenancy); \
+                the CI `test (slatedb WAL recovery)` job runs it unignored on the host toolchain"]
+    async fn empty_tail_wal_object_is_tolerated_and_data_survives() {
+        with_fresh_slatedb_dir("emptytail", |dir| async move {
+            // 1. A few durable control-plane writes, then a clean flush + close.
+            {
+                let kv = SlateKv::open_local_settings(
+                    &dir,
+                    test_settings(Some(Duration::from_millis(5))),
+                )
+                .await
+                .unwrap();
+                kv.write_batch(vec![
+                    WriteOp::Put("project/acme".into(), b"seed".to_vec()),
+                    WriteOp::Put("secret/acme/idp".into(), b"sealed".to_vec()),
+                ])
+                .await
+                .unwrap();
+                kv.put("current/console", b"deploy-7".to_vec())
+                    .await
+                    .unwrap();
+                kv.flush().await.unwrap();
+                kv.close().await.unwrap();
+            }
+
+            // 2. Inject the frozen tail: a 0-byte WAL object at (highest existing WAL id) + 1.
+            let wal_dir = dir.join("kv").join("wal");
+            let mut ids: Vec<u64> = std::fs::read_dir(&wal_dir)
+                .expect("wal/ dir should exist after writes")
+                .filter_map(Result::ok)
+                .filter_map(|e| {
+                    e.path()
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .and_then(|s| s.parse::<u64>().ok())
+                })
+                .collect();
+            ids.sort_unstable();
+            let max_id = *ids
+                .last()
+                .expect("expected WAL objects on disk (compactor/GC are off in test_settings)");
+            let empty = wal_dir.join(format!("{:020}.sst", max_id + 1));
+            std::fs::write(&empty, b"").unwrap();
+            assert_eq!(
+                std::fs::metadata(&empty).unwrap().len(),
+                0,
+                "the injected tail WAL object must be 0 bytes"
+            );
+
+            // 3. Reopen: the empty tail is tolerated and every committed key survives.
+            {
+                let kv = SlateKv::open_local_settings(
+                    &dir,
+                    test_settings(Some(Duration::from_millis(5))),
+                )
+                .await
+                .expect(
+                    "EMPTY WAL TAIL: reopen must tolerate the frozen 0-byte tail WAL object, not \
+                     fail with `empty SSTable`",
+                );
+                assert_eq!(
+                    kv.get("current/console").await.unwrap(),
+                    Some(b"deploy-7".to_vec())
+                );
+                assert_eq!(
+                    kv.get("project/acme").await.unwrap(),
+                    Some(b"seed".to_vec())
+                );
+                assert_eq!(
+                    kv.get("secret/acme/idp").await.unwrap(),
+                    Some(b"sealed".to_vec()),
+                    "the sealed secret must survive the recovery"
+                );
+                kv.close().await.unwrap();
+            }
+            eprintln!("EMPTY WAL TAIL RECOVERED OK");
+        })
+        .await;
+    }
+
+    /// Cross-version compatibility gate (v0.5.5 upgrade 0.13.1 → 0.16.0): the current slatedb (0.16,
+    /// via [`SlateKv`]) MUST open a control-plane store that was written by the PREVIOUS slatedb
+    /// (0.13.1, as boatramp v0.5.4 shipped). construens's crashed volume is a 0.13.1-written store, so
+    /// v0.5.5 recovering it depends on this backward compatibility. Writes with the `slatedb_013`
+    /// dev-dep alias, then reopens with the main dep and asserts every committed key — including a
+    /// sealed secret — survives. **Mutation check:** were the on-disk SST/manifest format
+    /// incompatible, the reopen `get`s would fail or return `None`.
+    #[serial_test::serial]
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "on-disk close→reopen stalls under the static-musl test harness (see test-orm-tenancy); \
+                the CI `test (slatedb WAL recovery)` job runs it unignored on the host toolchain"]
+    async fn slatedb_0_16_opens_a_store_written_by_0_13_1() {
+        with_fresh_slatedb_dir("crossver", |dir| async move {
+            // Write the store with the PREVIOUS slatedb (0.13.1), compactor/GC off (mirrors
+            // `test_settings`), a low flush interval, and a clean flush + close.
+            {
+                use slatedb_013::object_store::local::LocalFileSystem as LocalFs013;
+                use slatedb_013::{
+                    Db as Db013, Settings as Settings013, WriteBatch as WriteBatch013,
+                };
+                let settings = Settings013 {
+                    flush_interval: Some(Duration::from_millis(5)),
+                    compactor_options: None,
+                    garbage_collector_options: None,
+                    ..Settings013::default()
+                };
+                // `LocalFileSystem::new_with_prefix` canonicalizes (requires the dir to exist);
+                // `with_fresh_slatedb_dir` only hands us the path. (SlateKv creates it internally.)
+                std::fs::create_dir_all(&dir).unwrap();
+                let fs = LocalFs013::new_with_prefix(&dir).unwrap();
+                let db = Db013::builder("kv".to_string(), std::sync::Arc::new(fs))
+                    .with_settings(settings)
+                    .build()
+                    .await
+                    .unwrap();
+                let mut batch = WriteBatch013::new();
+                batch.put(b"project/acme", b"seed");
+                batch.put(b"secret/acme/idp", b"sealed");
+                db.write(batch).await.unwrap(); // 0.13.1: an awaited write is durable
+                db.put(b"current/console", b"deploy-7").await.unwrap();
+                db.flush().await.unwrap();
+                db.close().await.unwrap();
+            }
+            // Reopen with the CURRENT slatedb (0.16, via SlateKv) and confirm every key survived.
+            {
+                let kv = SlateKv::open_local_with_flush(&dir, Duration::from_millis(5))
+                    .await
+                    .expect("slatedb 0.16 must open a 0.13.1-written control-plane store");
+                assert_eq!(
+                    kv.get("current/console").await.unwrap(),
+                    Some(b"deploy-7".to_vec())
+                );
+                assert_eq!(
+                    kv.get("project/acme").await.unwrap(),
+                    Some(b"seed".to_vec())
+                );
+                assert_eq!(
+                    kv.get("secret/acme/idp").await.unwrap(),
+                    Some(b"sealed".to_vec()),
+                    "a sealed secret written by 0.13.1 must be readable by 0.16"
+                );
+                kv.close().await.unwrap();
+            }
+            eprintln!("SLATEDB 0.13->0.16 CROSS-VERSION OPEN OK");
         })
         .await;
     }

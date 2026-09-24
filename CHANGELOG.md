@@ -5,6 +5,43 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.5.5] - 2026-09-24
+
+**Incident fix — control-plane KV unbootable with `Data error: empty SSTable`.** After a crash — or a
+crash-consistent block snapshot of a *live* store (e.g. a fly volume auto-snapshot) — the embedded
+SlateDB control-plane KV (`<data>/kv`) could be left with a **zero-byte / never-durably-flushed tail WAL
+object** (its rename metadata reached the device before its data blocks). On every subsequent cold open,
+WAL replay tried to read that object, failed `EmptySSTable`, and **crash-looped on any boatramp version** —
+even though the store had been serving fine (a running SlateDB keeps that state in memory). A restore from
+a pre-crash snapshot failed identically, because the snapshot froze the same in-flight object.
+
+The bug is in SlateDB's WAL replay, and **upstream already fixed it** (a zero-byte WAL object is treated as
+a fence marker and replay continues past it). boatramp v0.5.4 pinned the pre-fix `slatedb 0.13.1`; **v0.5.5
+upgrades to `slatedb 0.16.0`**, which carries the fix — so a control-plane store frozen mid-flush now
+**boots automatically** on restart/upgrade, with zero committed-data loss.
+
+### Changed
+
+- **`slatedb` 0.13.1 → 0.16.0** (durable embedded KV). Verified backward-compatible: 0.16 opens a
+  0.13.1-written store and reads every committed key (the on-disk SST format is unchanged; a
+  cross-version open test gates it). No operator action or data migration is required to upgrade.
+- Adapted to two 0.16 API changes, behavior-preserving: the write path now returns a `WriteHandle` that
+  is durable only after `await_durable()` — the control plane awaits it, so a manifest / current-pointer
+  write is still durable before the call returns (`CONTROL_PLANE_FLUSH` = 5 ms keeps that fast); the
+  messaging bus fast path stays relaxed (non-durable) as before. `object_store` 0.12 → 0.14.
+
+### Recovery / operations
+
+- **Recover an already-broken (pre-v0.5.5) store immediately, without waiting for the new image:** stop
+  the node, and move aside the trailing zero-byte `*.sst` file(s) under `<data>/kv/wal/` (they hold no
+  committed data — a write is acked only after its footer is written), then reboot. A full runbook
+  (diagnose → quarantine) ships alongside this release. After upgrading to v0.5.5 a plain restart
+  self-heals, so the manual step is no longer needed.
+- **Backup guidance:** a block-level snapshot of a *live* SlateDB is not reliably restorable (it can
+  freeze a half-flushed WAL object — this incident). Prefer **quiesce-then-snapshot** (stop the writer —
+  boatramp flushes + closes SlateDB cleanly on `SIGTERM` — then snapshot) over relying on runtime volume
+  auto-snapshots for the control-plane volume.
+
 ## [0.5.4] - 2026-09-24
 
 **Per-tenant sealed-secret guest capability — `boatramp:handlers/tenant-secrets`.** A granted

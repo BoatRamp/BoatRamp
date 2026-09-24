@@ -309,6 +309,38 @@ jobs:
             exit 1
           fi
 
+  # SlateDB WAL-recovery HARD GATE (v0.5.5 incident: the control-plane KV was unbootable with
+  # `Data error: empty SSTable` after a crash / crash-consistent snapshot froze a zero-byte tail WAL
+  # object). Proves (a) a store with such a frozen tail WAL still OPENS — the incident fix
+  # (`slatedb` 0.16 treats a zero-byte WAL as a fence and replays past it) — with every committed key
+  # (incl. a sealed secret) intact, and (b) `slatedb` 0.16 opens a store WRITTEN BY 0.13.1 (the version
+  # v0.5.4 shipped, i.e. construens's crashed volume), so the upgrade recovers it without a data
+  # migration. Both tests are `#[ignore]`d (an on-disk close→reopen stalls under the static-musl
+  # workspace lane, like the ORM battery below) and run here UNIGNORED on the host toolchain; a silent
+  # skip or a regression fails the merge.
+  test-slatedb-wal-recovery:
+    name: test (slatedb WAL recovery)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: test-slatedb-wal-recovery-host
+      - name: SlateDB tolerates a frozen empty tail WAL + opens a 0.13.1-written store
+        run: |
+          set -eo pipefail
+          cargo test -p boatramp-storage --features slatedb --lib \
+            empty_tail_wal_object_is_tolerated_and_data_survives \
+            slatedb_0_16_opens_a_store_written_by_0_13_1 \
+            -- --ignored --nocapture 2>&1 | tee slatedb-wal.log
+          grep -qE 'test result: ok\. 2 passed' slatedb-wal.log \
+            || { echo "::error::slatedb WAL-recovery tests did not both pass (silent skip or failure?)" >&2; exit 1; }
+          grep -q 'EMPTY WAL TAIL RECOVERED OK' slatedb-wal.log \
+            || { echo "::error::empty-tail WAL recovery never reached its marker (the empty SSTable incident regressed)" >&2; exit 1; }
+          grep -q 'SLATEDB 0.13->0.16 CROSS-VERSION OPEN OK' slatedb-wal.log \
+            || { echo "::error::0.13->0.16 cross-version open never reached its marker (an existing 0.13.1 control-plane store may not open on the upgrade)" >&2; exit 1; }
+
   # Stage 0 in-site tenant isolation HARD GATE. The ORM/`sql` tenant scope must isolate tenants
   # on a REAL SQL engine (embedded libsql), not merely in the compiler's string output. The test
   # is `sql`-feature-gated, so the workspace lane (which enables only `boatramp/fs,slatedb`) would
