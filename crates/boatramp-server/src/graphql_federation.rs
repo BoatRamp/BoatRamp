@@ -812,7 +812,7 @@ extend schema @link(
 
     #[test]
     fn an_unknown_edge_hidden_directive_on_a_root_composes_cleanly_forward_compat() {
-        // BA-C5: an older host that does not yet understand `@edgeHidden` must still COMPOSE SDL
+        // Panel C5: an older host that does not yet understand `@edgeHidden` must still COMPOSE SDL
         // bearing it on a root (a subgraph publishing to a not-yet-upgraded host is forward-safe).
         // Here composition simply reads the usage on a root field and never errors — proving the
         // directive is purely additive on a root (no directive *definition* required, no arg

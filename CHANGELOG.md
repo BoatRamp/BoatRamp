@@ -14,7 +14,7 @@ external operation that names an edge-hidden field fails to plan **exactly like 
 generic error, no existence oracle), and its resolver is never invoked — regardless of the field's authz
 level. This separates the two axes that `authz(public)` conflated ("no bearer required" vs. "callable from
 anywhere"), so a trust-boundary operation that must only be invoked server-to-server (e.g. a social-login
-token exchange) can't become an escalation surface if it is ever mis-marked `public`. Default is
+token exchange) can't become an escalation surface if it is ever wrongly marked `public`. Default is
 edge-visible (opt-out only) — no existing operation changes.
 
 ### Added
