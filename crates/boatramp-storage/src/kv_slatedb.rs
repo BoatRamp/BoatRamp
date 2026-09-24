@@ -594,24 +594,19 @@ mod tests {
         use slatedb::object_store::memory::InMemory;
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
 
-        // A long flush interval so the periodic timer won't auto-persist; the explicit `flush()`
-        // (SHUT-1) must be what makes the write durable before close. NOTE (slatedb 0.16): a durable
-        // `put` now blocks on `await_durable()`, which waits for the timer-driven WAL flush — so with a
-        // 3600s interval it would hang ~an hour. We therefore use a **relaxed** (non-durable) write
-        // here, which returns immediately, and prove that the explicit `flush()` is what forces it
-        // durable before close. That is exactly this test's contract (flush persists), expressed for
-        // 0.16's write model. (The durable-put path is covered by the low-flush-interval tests above.)
+        // A low flush interval (slatedb 0.16: a durable `put` awaits `await_durable()`, which waits for
+        // the timer-driven WAL flush — so a long interval would hang; 5 ms keeps the awaited write fast,
+        // matching the production control-plane store). Then an explicit `flush()`, close (memtable →
+        // L0), and reopen-replay — the durability + reopen contract this test exists to exercise.
         let kv = SlateKv::open_with(
             store.clone(),
             "kv",
-            test_settings(Some(std::time::Duration::from_secs(3600))),
+            test_settings(Some(std::time::Duration::from_millis(5))),
         )
         .await
         .unwrap();
-        kv.write_batch_relaxed(vec![WriteOp::Put("k".into(), b"v".to_vec())])
-            .await
-            .unwrap();
-        kv.flush().await.unwrap(); // force durability now, not on the timer
+        kv.put("k", b"v".to_vec()).await.unwrap(); // durable (awaits durability before returning)
+        kv.flush().await.unwrap(); // exercise the explicit flush() path too
         kv.close().await.unwrap();
 
         let reopened = SlateKv::open_with(store.clone(), "kv", test_settings(None))
