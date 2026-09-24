@@ -23,8 +23,8 @@ upgrades to `slatedb 0.16.0`**, which carries the fix — so a control-plane sto
 ### Changed
 
 - **`slatedb` 0.13.1 → 0.16.0** (durable embedded KV). Verified backward-compatible: 0.16 opens a
-  0.13.1-written store and reads every committed key (the on-disk SST format is unchanged; a
-  cross-version open test gates it). No operator action or data migration is required to upgrade.
+  0.13.1-written store and reads every committed key (the on-disk SST format is unchanged; verified with
+  a cross-version open test during the upgrade). No operator action or data migration is required.
 - Adapted to two 0.16 API changes, behavior-preserving: the write path now returns a `WriteHandle` that
   is durable only after `await_durable()` — the control plane awaits it, so a manifest / current-pointer
   write is still durable before the call returns (`CONTROL_PLANE_FLUSH` = 5 ms keeps that fast); the

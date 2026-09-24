@@ -1955,13 +1955,12 @@ dependencies = [
  "lru 0.16.4",
  "memmap2",
  "notify",
- "object_store 0.14.2",
+ "object_store",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
  "serial_test",
- "slatedb 0.13.1",
- "slatedb 0.16.0",
+ "slatedb",
  "sqlparser",
  "sqlx",
  "tokio",
@@ -3701,18 +3700,6 @@ checksum = "8be9f3dfaaffdae2972880079a491a1a8bb7cbed0b8dd7a347f668b4150a3b93"
 dependencies = [
  "event-listener 5.4.1",
  "pin-project-lite",
-]
-
-[[package]]
-name = "fail-parallel"
-version = "0.5.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c6f4a147ba57fcd64323c54c8f69fd4e045456a99574163010ccf5eea3168aaa"
-dependencies = [
- "log",
- "once_cell",
- "rand 0.9.4",
- "tokio",
 ]
 
 [[package]]
@@ -6891,42 +6878,6 @@ dependencies = [
 
 [[package]]
 name = "object_store"
-version = "0.12.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fbfbfff40aeccab00ec8a910b57ca8ecf4319b335c542f2edcd19dd25a1e2a00"
-dependencies = [
- "async-trait",
- "base64 0.22.1",
- "bytes",
- "chrono",
- "form_urlencoded",
- "futures",
- "http 1.4.2",
- "http-body-util",
- "humantime",
- "hyper 1.10.1",
- "itertools 0.14.0",
- "md-5 0.10.6",
- "parking_lot",
- "percent-encoding",
- "quick-xml 0.38.4",
- "rand 0.9.4",
- "reqwest 0.12.28",
- "ring",
- "serde",
- "serde_json",
- "serde_urlencoded",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "url",
- "walkdir",
- "wasm-bindgen-futures",
- "web-time",
-]
-
-[[package]]
-name = "object_store"
 version = "0.14.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f1796bc93603f78c5760a69f2d58badc9618d22adade0a95385bb2adbae4eb94"
@@ -8317,16 +8268,6 @@ dependencies = [
 
 [[package]]
 name = "quick-xml"
-version = "0.38.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b66c2058c55a409d601666cffe35f04333cf1013010882cec174a7467cd4e21c"
-dependencies = [
- "memchr",
- "serde",
-]
-
-[[package]]
-name = "quick-xml"
 version = "0.41.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e660451e55124f798a69a5af3f49ccfbefbd41910eefd25caf2393e1f3473ec1"
@@ -8734,7 +8675,6 @@ dependencies = [
  "encoding_rs",
  "futures-core",
  "futures-util",
- "h2 0.4.14",
  "http 1.4.2",
  "http-body 1.0.1",
  "http-body-util",
@@ -8749,7 +8689,6 @@ dependencies = [
  "pin-project-lite",
  "quinn",
  "rustls 0.23.40",
- "rustls-native-certs 0.8.4",
  "rustls-pki-types",
  "serde",
  "serde_json",
@@ -10273,53 +10212,6 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
 name = "slatedb"
-version = "0.13.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f77abe3a47e3d669877cc9c83c5e853cb34d250cd1953ede8308b69e04e32c9d"
-dependencies = [
- "async-channel 2.5.0",
- "async-trait",
- "atomic",
- "backon",
- "bitflags 2.13.0",
- "bytes",
- "chrono",
- "crc32fast",
- "crossbeam-skiplist",
- "dotenvy",
- "duration-str",
- "fail-parallel 0.5.2",
- "figment",
- "flatbuffers",
- "foyer",
- "futures",
- "log",
- "lru 0.18.0",
- "object_store 0.12.5",
- "once_cell",
- "ouroboros",
- "parking_lot",
- "rand 0.9.4",
- "rand_xoshiro",
- "serde",
- "serde_json",
- "siphasher",
- "slatedb-common 0.13.1",
- "slatedb-txn-obj 0.13.1",
- "sysinfo",
- "thiserror 1.0.69",
- "thread_local",
- "tokio",
- "tokio-util",
- "tracing",
- "ulid",
- "url",
- "uuid",
- "walkdir",
-]
-
-[[package]]
-name = "slatedb"
 version = "0.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fb40332f41e231926df3a0ef742c05316b43368ba4b520433d2a1eba1ab00f0f"
@@ -10335,22 +10227,22 @@ dependencies = [
  "crossbeam-skiplist",
  "dotenvy",
  "duration-str",
- "fail-parallel 0.6.0",
+ "fail-parallel",
  "figment",
  "flatbuffers",
  "foyer",
  "futures",
  "log",
  "lru 0.18.0",
- "object_store 0.14.2",
+ "object_store",
  "ouroboros",
  "parking_lot",
  "rand 0.9.4",
  "serde",
  "serde_json",
  "siphasher",
- "slatedb-common 0.16.0",
- "slatedb-txn-obj 0.16.0",
+ "slatedb-common",
+ "slatedb-txn-obj",
  "smallvec",
  "sysinfo",
  "thiserror 1.0.69",
@@ -10365,46 +10257,18 @@ dependencies = [
 
 [[package]]
 name = "slatedb-common"
-version = "0.13.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "396a08a34b93becfc72e7d7286f620ac887b48ad37bdaa4768b024df7c0ea7f5"
-dependencies = [
- "chrono",
- "log",
- "serde",
- "tokio",
-]
-
-[[package]]
-name = "slatedb-common"
 version = "0.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6b77f238f348e95e1653a5235f880ac703011b82582bd556f2aba405abf8180e"
 dependencies = [
  "chrono",
  "log",
- "object_store 0.14.2",
+ "object_store",
  "rand 0.9.4",
  "rand_xoshiro",
  "serde",
  "thread_local",
  "tokio",
-]
-
-[[package]]
-name = "slatedb-txn-obj"
-version = "0.13.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "37172cf2255b0f0c56f0d2e98dbc865b2f6dd56333ed297147e9bba5d9ecf97a"
-dependencies = [
- "async-trait",
- "bytes",
- "chrono",
- "futures",
- "log",
- "object_store 0.12.5",
- "slatedb-common 0.13.1",
- "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -10418,9 +10282,9 @@ dependencies = [
  "chrono",
  "futures",
  "log",
- "object_store 0.14.2",
+ "object_store",
  "parking_lot",
- "slatedb-common 0.16.0",
+ "slatedb-common",
  "thiserror 1.0.69",
 ]
 
