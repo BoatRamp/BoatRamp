@@ -90,7 +90,7 @@ reqwest = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 slatedb = { workspace = true, optional = true }
-object_store = { version = "0.12", features = ["aws"], optional = true }
+object_store = { version = "0.14", features = ["aws"], optional = true }
 libsql = { workspace = true, optional = true }
 sqlparser = { workspace = true, optional = true }
 sqlx = { workspace = true, optional = true }
@@ -115,6 +115,11 @@ bytes.workspace = true
 # as a secondary guard (one instance at a time; distinct temp dirs, so it gates
 # concurrency, not correctness).
 serial_test = "3"
+# The PREVIOUS slatedb (as shipped in boatramp v0.5.4) under an alias, so a test can write a store with
+# 0.13.1 and reopen it with the current 0.16 dep — the cross-version compatibility gate for the v0.5.5
+# upgrade (construens's crashed volume was written by 0.13.1; v0.5.5 must open it). `=0.13.1` pins the
+# exact prior version; it coexists with the main 0.16 `slatedb` as a distinct crate in the test binary.
+slatedb_013 = { package = "slatedb", version = "=0.13.1" }
 
 [lints]
 workspace = true
