@@ -150,6 +150,139 @@ pub fn validate_resource_name(kind: &'static str, value: &str) -> Result<(), Inv
     Ok(())
 }
 
+/// The maximum length (bytes) of an external object key accepted by the S3
+/// ingress — matches the S3 object-key limit and bounds the derived storage path.
+pub const MAX_OBJECT_KEY_LEN: usize = 1024;
+
+/// Validate a **decoded** external object key destined for the storage path
+/// `hblob/{project-qualified-site}/{container}/{key}` (the S3 blob-ingress
+/// choke point).
+///
+/// Unlike [`validate_resource_name`] — which screens a single path *segment* and
+/// rejects `/` — an object key is a `/`-separated *path* that legitimately
+/// contains `/` (e.g. `avatars/<user>/<uuid>.jpg`). This is the traversal-safe
+/// screen enforced where the S3 face composes the storage key, so an uploaded
+/// object can never escape its scoped prefix on **any** backend (the `fs`
+/// traversal backstop does not exist for the cloud `Storage` backends).
+///
+/// The caller MUST percent-decode the key exactly once before calling this
+/// (SigV4 signs the encoded form; storage uses the decoded form).
+///
+/// Rejects: the empty string; keys longer than [`MAX_OBJECT_KEY_LEN`] bytes; a
+/// leading `/` (absolute) or any empty segment (`//`, a trailing `/`); any `.`
+/// or `..` segment (traversal); any segment in boatramp's reserved `.boatramp*`
+/// namespace (the container marker + multipart staging live there, so a client
+/// key must not collide with them); a backslash, a `*` (the authz wildcard
+/// sentinel), or any ASCII control character (incl. NUL / newline). Other bytes
+/// — spaces, mid-name dots — are allowed (S3 keys are liberal, and the key is
+/// otherwise host-scoped).
+pub fn validate_object_key(value: &str) -> Result<(), InvalidResourceName> {
+    let reject = |reason| {
+        Err(InvalidResourceName {
+            kind: "object key",
+            value: value.to_string(),
+            reason,
+        })
+    };
+    if value.is_empty() {
+        return reject("must not be empty");
+    }
+    if value.len() > MAX_OBJECT_KEY_LEN {
+        return reject("must not exceed 1024 bytes");
+    }
+    for c in value.chars() {
+        match c {
+            '\\' => return reject("must not contain a backslash"),
+            '*' => return reject("must not contain '*'"),
+            c if c.is_control() => return reject("must not contain control characters"),
+            _ => {}
+        }
+    }
+    for segment in value.split('/') {
+        if segment.is_empty() {
+            return reject("must not contain an empty path segment (no leading/trailing/doubled '/')");
+        }
+        if segment == "." || segment == ".." {
+            return reject("must not contain a '.' or '..' path segment");
+        }
+        // boatramp reserves the `.boatramp*` segment namespace for the container
+        // marker (`.boatramp-container`) and multipart staging (`.boatramp-uploads/`);
+        // a client key must not collide with it. Case-insensitive so a
+        // case-folding filesystem can't be tricked with `.BoatRamp*`.
+        if segment.to_ascii_lowercase().starts_with(".boatramp") {
+            return reject("must not use a reserved '.boatramp*' path segment");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod object_key_tests {
+    use super::*;
+
+    #[test]
+    fn accepts_ordinary_and_nested_keys() {
+        for ok in [
+            "avatars/u1/abc.jpg",
+            "abc123",
+            "a/b/c",
+            "file with spaces.png",
+            "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+            "a.b.c",
+            "deep/nested/path/ok.bin",
+            "images/2026/09/photo-01.png",
+        ] {
+            assert!(validate_object_key(ok).is_ok(), "{ok:?} should pass");
+        }
+    }
+
+    #[test]
+    fn rejects_traversal_and_absolute_and_empty_segments() {
+        for bad in [
+            "",            // empty
+            "/leading",    // absolute / leading slash → empty first segment
+            "trailing/",   // trailing slash → empty last segment
+            "a//b",        // doubled slash → empty middle segment
+            "..",          // traversal
+            ".",           // current-dir segment
+            "a/../b",      // embedded traversal
+            "a/./b",       // embedded current-dir
+            "../escape",   // prefix escape
+        ] {
+            assert!(validate_object_key(bad).is_err(), "{bad:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn rejects_reserved_boatramp_namespace() {
+        for bad in [
+            ".boatramp-container",   // the container marker
+            ".boatramp-uploads/x",   // multipart staging
+            "a/.boatramp-uploads/p", // reserved segment nested
+            ".BoatRamp-Container",   // case-folded trick
+        ] {
+            assert!(validate_object_key(bad).is_err(), "{bad:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn rejects_dangerous_bytes() {
+        assert!(validate_object_key("back\\slash").is_err());
+        assert!(validate_object_key("star*key").is_err());
+        assert!(validate_object_key("nul\0byte").is_err());
+        assert!(validate_object_key("new\nline").is_err());
+        assert!(validate_object_key("tab\tkey").is_err());
+    }
+
+    #[test]
+    fn rejects_over_length() {
+        let over = "a".repeat(MAX_OBJECT_KEY_LEN + 1);
+        assert!(validate_object_key(&over).is_err());
+        let at = "a".repeat(MAX_OBJECT_KEY_LEN);
+        assert!(validate_object_key(&at).is_ok());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
