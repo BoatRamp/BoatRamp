@@ -1352,7 +1352,9 @@ async fn run_cluster(
             let token = cluster_cfg
                 .join_token
                 .as_deref()
-                .and_then(|s| crate::join::resolve_join_token(s).transpose())
+                .and_then(|s| {
+                    crate::join::resolve_join_token(s, &boatramp_core::env::SystemEnv).transpose()
+                })
                 .transpose()
                 .map_err(|e| Error::ClusterStartup(e.to_string()))?
                 .ok_or_else(|| {
