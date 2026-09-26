@@ -39,6 +39,8 @@ mod admin_api;
 pub mod sql_shim;
 #[cfg(feature = "oidc")]
 pub(crate) use admin_api::auth_exchange;
+#[cfg(feature = "blob-upload")]
+pub(crate) use admin_api::blob_mint_upload;
 pub(crate) use admin_api::{
     activate_deployment, cert_status, compute_dns, compute_dns_resolve, compute_exec, compute_ipam,
     compute_netdiag, compute_reconcile, compute_restart, compute_set_health, compute_status,
@@ -1026,6 +1028,34 @@ impl HandlerRuntime {
         if let Some(inner) = self.inner.as_ref() {
             let _ = inner.blob_upload_config.set(config);
         }
+    }
+
+    /// The wired guest/operator blob-upload minter, if minting is enabled (the local S3 face was set
+    /// up via [`set_blob_upload_minting`](Self::set_blob_upload_minting) AND the fleet session signer
+    /// is present). `None` ⇒ minting is not offered on this node. Used by the operator control-plane
+    /// `POST /api/blob-mint-upload` route to mint a scoped credential (host-forcing project + site);
+    /// the guest binding wires its own instance in `build_bindings`. The operator ceilings
+    /// (`max_ttl_secs` / `max_bytes_ceiling`) are returned alongside so the caller clamps identically.
+    #[cfg(feature = "blob-upload")]
+    pub fn blob_upload_minter(
+        &self,
+    ) -> Option<(
+        crate::blob_upload_minter::ServerBlobUploadMinter,
+        u64,
+        Option<u64>,
+    )> {
+        let inner = self.inner.as_ref()?;
+        let cfg = inner.blob_upload_config.get()?;
+        let signer = inner.session_signer.get()?;
+        Some((
+            crate::blob_upload_minter::ServerBlobUploadMinter {
+                signer: signer.clone(),
+                secret: cfg.secret.clone(),
+                config: cfg.face.clone(),
+            },
+            cfg.max_ttl_secs,
+            cfg.max_bytes_ceiling,
+        ))
     }
 
     /// Wire the project-scoped internal secret store (sealed with the `[secrets]`

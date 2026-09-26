@@ -337,6 +337,17 @@ impl Right {
                 Some((&"repair", _)) => {
                     Self::new(Resource::Project, Some(proj.to_string()), Action::Admin)
                 }
+                // Operator S3 upload-credential minting (`POST /api/projects/<proj>/blob-mint-upload`,
+                // M3): gated with the DEDICATED `Resource::BlobUpload` (target `None` — the concrete
+                // `<project>/<site>/<container>` is host-forced from THIS project + the body, checked
+                // at the handler), NOT the deploy-grade publisher the general project catch-all below
+                // would grant. `BlobUpload` is admin/explicit-grant only (never the default
+                // publisher/deployer/project_* roles), so this surface stays operator-only. A
+                // POST-only surface ⇒ always `Action::Write`. Gated explicitly, above that catch-all,
+                // so a `project_publisher` can never mint an upload credential.
+                Some((&"blob-mint-upload", _)) => {
+                    Self::new(Resource::BlobUpload, None, Action::Write)
+                }
                 // The project-bus operator surface (`/api/projects/<proj>/_boatramp/bus/…`):
                 // dead-letter + work-queue inspection/management for the **shared project
                 // bus** (the `{project}/bus/{topic}` keyspace a `bus:<topic>` publish routes
@@ -454,6 +465,16 @@ impl Right {
                 Some(default_project.clone()),
                 Action::Admin,
             ),
+            // Operator S3 upload-credential minting (`POST /api/blob-mint-upload`, PLAN-blob-s3-ingress
+            // §6 / M3): mint a short-lived, scoped S3 upload credential for a project+site's blob
+            // container. Gated with the DEDICATED `Resource::BlobUpload` right (target `None` — the
+            // concrete `<project>/<site>/<container>` is host-forced from the token's project + the
+            // request body, checked at the handler), placed ABOVE the `/api/blobs` arm (which resolves
+            // to `Blobs·Deploy`, a right a ship-only publisher holds — nesting under it would be an
+            // ESCALATION, letting a publisher mint upload credentials). `BlobUpload` is NOT granted to
+            // the default publisher/deployer/project_* roles (only via `admin` / an explicit grant), so
+            // this surface stays operator-only. A POST-only surface ⇒ always `Action::Write`.
+            "/api/blob-mint-upload" => Self::new(Resource::BlobUpload, None, Action::Write),
             // Operator SQL to a managed database (project-owned): migrations + queries
             // are operator tools scoped to the default project. `project·deploy` (they
             // are POST bodies that mutate or read the project's managed DB); the
@@ -2317,6 +2338,44 @@ mod tests {
         assert!(
             !acme_admin.allows(&globex_apply),
             "an acme grant must not reach globex's repair surface",
+        );
+    }
+
+    /// The operator S3 upload-credential mint surface (`POST /api/blob-mint-upload`, M3) must gate at
+    /// the DEDICATED `BlobUpload·Write` right — NOT the `Blobs·Deploy` grade the sibling `/api/blobs`
+    /// path grants (which a ship-only publisher holds). A publisher/deployer must be REFUSED; only an
+    /// `admin` (which expands to `BlobUpload` via `Resource::ALL`) reaches it.
+    #[test]
+    fn blob_mint_upload_surface_is_blobupload_write_not_publisher() {
+        // The route maps to BlobUpload·Write (target None — the concrete container is host-forced +
+        // checked at the handler).
+        assert_eq!(
+            Right::required("POST", "/api/blob-mint-upload"),
+            Some(Right::new(Resource::BlobUpload, None, Action::Write)),
+            "POST /api/blob-mint-upload must require BlobUpload·Write",
+        );
+        let req = Right::required("POST", "/api/blob-mint-upload").unwrap();
+        let policy = AuthzPolicy::default_policy();
+        // The default content-shipping roles must NOT reach it (no escalation from Blobs·Deploy).
+        for role in ["publisher", "deployer"] {
+            let rights = policy.rights_for(&[GrantedRole::scoped(role, "acme/blog")]);
+            assert!(
+                !rights.allows(&req),
+                "a {role} must NOT be able to mint an upload credential (Blobs·Deploy is not BlobUpload)",
+            );
+        }
+        for role in ["project_publisher", "project_admin"] {
+            let rights = policy.rights_for(&[GrantedRole::scoped(role, "acme")]);
+            assert!(
+                !rights.allows(&req),
+                "a {role} must NOT expand to BlobUpload (it is admin/explicit-grant only)",
+            );
+        }
+        // An `admin` (via Resource::ALL) reaches it.
+        let admin = policy.rights_for(&[GrantedRole::global("admin")]);
+        assert!(
+            admin.allows(&req),
+            "an admin must be able to mint an upload credential",
         );
     }
 

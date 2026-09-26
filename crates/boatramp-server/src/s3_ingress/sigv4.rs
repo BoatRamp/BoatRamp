@@ -555,6 +555,9 @@ fn unix_to_civil(t: i64) -> (i64, i64, i64, i64, i64, i64) {
 /// (+ optional port), e.g. `http://127.0.0.1:9000`; the object path is `/{bucket}/{key}` (path-style).
 /// The returned URL carries `X-Amz-Algorithm/Credential/Date/Expires/SignedHeaders/Security-Token` and
 /// the final `X-Amz-Signature`.
+// The arguments are the cohesive presign inputs (endpoint/bucket/key + the credential scope + secret +
+// session token + clock); grouping them into a struct would add ceremony without clarifying the call.
+#[allow(clippy::too_many_arguments)]
 pub fn presign_put_url(
     endpoint_base: &str,
     bucket: &str,
