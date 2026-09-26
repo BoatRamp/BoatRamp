@@ -241,7 +241,7 @@ pub fn extract_raw_write_table(statement: &str, dialect: Dialect) -> Option<Stri
     // translates them to `$N` (Postgres) LATER, after this host tenancy layer runs. sqlparser's
     // Postgres dialect rejects `?N`, so parse the requested dialect first and FALL BACK to the
     // SQLite dialect (which tolerates `?N`) purely to recover the write's table name — the table of
-    // an INSERT/UPDATE/DELETE is dialect-agnostic, so the fallback cannot mis-identify it. Without
+    // an INSERT/UPDATE/DELETE is dialect-agnostic, so the fallback cannot misidentify it. Without
     // this, a Postgres write-global write would fail to parse here (`None`) and be wrongly refused,
     // breaking the cross-surface parity on Postgres. (`extract_raw_write_scope_value` keeps the
     // old-dialect-only parse: `None` there merely leaves an RLS GUC unset, which fails safe.)

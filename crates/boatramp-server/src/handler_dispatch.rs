@@ -2398,6 +2398,89 @@ pub(super) fn admit_secret_allowlist(
     Ok(())
 }
 
+/// **#503 apply-time validation** of a route's per-route write-global allowlist
+/// ([`Tenancy::Scoped::unscoped_writes`](boatramp_core::tenancy::Tenancy)) against the stored
+/// project tenancy `schema` — the defense-in-depth companion to the runtime resolve-gate (which
+/// stays the PRIMARY guard; this is fail-fast, NOT a replacement). An empty allowlist ⇒ `Ok`
+/// (nothing to check). Mirrors [`admit_secret_allowlist`]: an unknown/mis-classified entry is a
+/// hard **refusal** naming the guest + the offending table. A `warn` (never a refusal) is returned
+/// when an entry is REDUNDANT because the table is already declared `writable: true` (the kind
+/// authorizes the write project-wide, so listing it changes nothing). Rules (each fail-fast):
+/// - the table must EXIST in the schema (an unknown table is a typo/rot);
+/// - it must resolve to **plain `Unscoped`** — NOT a tenant kind (the list can never write a tenant
+///   table unstamped, so listing one is a misconfiguration), NOT undeclared, and (for the error
+///   case) NOT `writable: true` (that is the redundancy warning, not an error).
+///
+/// `Ok(warnings)` — the redundant-entry advisories to log; `Err` — the hard refusal.
+#[cfg(feature = "handlers")]
+pub(super) fn admit_unscoped_writes(
+    schema: Option<&boatramp_core::tenancy::TenancySchema>,
+    allowlist: &[String],
+    label: &str,
+) -> Result<Vec<String>, String> {
+    use boatramp_core::tenancy::{ResolvedScope, TableScope};
+    if allowlist.is_empty() {
+        return Ok(Vec::new());
+    }
+    // A route lists write-global tables but the project declares NO tenancy schema at all: the
+    // runtime binds the legacy `Uniform` posture (no `Unscoped` resolution exists), so the list can
+    // never fire — refuse it fail-fast rather than let it silently no-op.
+    let Some(schema) = schema else {
+        return Err(format!(
+            "{label} declares tenancy.unscoped_writes {allowlist:?} but the project has no tenancy \
+             schema — declare the tables (each `{{ \"kind\": \"unscoped\" }}`) in the project \
+             tenancy schema, or drop the allowlist"
+        ));
+    };
+    let mut warnings = Vec::new();
+    for table in allowlist {
+        match schema.tables.get(table) {
+            // The redundancy WARNING: the table is already project-wide write-global, so listing it
+            // per-route adds nothing (the kind authorizes it for every route).
+            Some(TableScope::Unscoped { writable: true }) => {
+                warnings.push(format!(
+                    "{label} tenancy.unscoped_writes lists {table:?}, but that table is already \
+                     declared write-global (`{{ \"kind\": \"unscoped\", \"writable\": true }}`) — \
+                     the per-route entry is redundant (the kind authorizes the write project-wide). \
+                     Remove it, or make the table plain `unscoped` if you want per-route control"
+                ));
+            }
+            // The one valid case: a plain read-only-reference global the route opts into writing.
+            Some(TableScope::Unscoped { writable: false }) => {}
+            // A tenant kind: the list can NEVER write it unstamped (G1 keeps it stamped at runtime);
+            // listing it is a misconfiguration — refuse fail-fast (defense-in-depth for G1).
+            Some(other) => {
+                // Resolve for a precise message (the identity table's key etc.).
+                let resolved = schema.resolve(table);
+                let kind = match resolved {
+                    Some(ResolvedScope::Column(_)) => "a per-tenant table",
+                    Some(ResolvedScope::TenantOrSession { .. }) => "an anonymous-first table",
+                    Some(ResolvedScope::TenantOrBase { .. }) => "a base-inclusive table",
+                    _ => "a non-global table",
+                };
+                let _ = other;
+                return Err(format!(
+                    "{label} tenancy.unscoped_writes lists {table:?}, but that table is {kind}, not \
+                     a global — a per-route write-global allowlist may only name a plain `unscoped` \
+                     table. Writes to a tenant table are always tenant-stamped; remove {table:?} \
+                     from the allowlist"
+                ));
+            }
+            None => {
+                let mut known: Vec<&str> = schema.tables.keys().map(String::as_str).collect();
+                known.sort_unstable();
+                return Err(format!(
+                    "{label} tenancy.unscoped_writes names {table:?}, which is not a table in the \
+                     project tenancy schema (known: {}) — a typo, or a table missing its \
+                     `{{ \"kind\": \"unscoped\" }}` declaration. Fix the name or declare the table",
+                    known.join(", ")
+                ));
+            }
+        }
+    }
+    Ok(warnings)
+}
+
 /// A parsed secret reference from a `secrets` map value.
 #[cfg(feature = "handlers")]
 enum SecretRef<'a> {
@@ -2981,7 +3064,7 @@ mod cookie_auth_tests {
 /// relies on — the filter is what a bound guest actually sees, the admission is what a typo trips.
 #[cfg(all(test, feature = "handlers"))]
 mod secret_allowlist_tests {
-    use super::{admit_secret_allowlist, filter_site_secrets};
+    use super::{admit_secret_allowlist, admit_unscoped_writes, filter_site_secrets};
     use std::collections::BTreeMap;
 
     fn pool(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
@@ -3087,5 +3170,92 @@ mod secret_allowlist_tests {
             err.contains("no") && err.contains("[handlers].secrets"),
             "explains the empty pool: {err}"
         );
+    }
+
+    // ---- #503: apply-time validation of tenancy.unscoped_writes -------------------------------
+
+    fn schema_503_apply() -> boatramp_core::tenancy::TenancySchema {
+        use boatramp_core::tenancy::{TableScope, TenancySchema};
+        let mut s = TenancySchema::default();
+        s.tables.insert("orders".into(), TableScope::Tenant);
+        s.tables
+            .insert("countries".into(), TableScope::Unscoped { writable: false });
+        s.tables.insert(
+            "oauth_state".into(),
+            TableScope::Unscoped { writable: true },
+        );
+        s
+    }
+
+    #[test]
+    fn admit_unscoped_writes_accepts_a_plain_global_and_empty() {
+        let s = schema_503_apply();
+        // Empty ⇒ OK, no warnings.
+        assert!(
+            admit_unscoped_writes(Some(&s), &[], "handler route \"/a\" [GET]")
+                .unwrap()
+                .is_empty()
+        );
+        // A plain `unscoped` table is the valid opt-in — accepted, no warning.
+        assert!(
+            admit_unscoped_writes(
+                Some(&s),
+                &["countries".to_string()],
+                "handler route \"/oauth\" [POST]"
+            )
+            .unwrap()
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn admit_unscoped_writes_warns_on_a_redundant_writable_true_entry() {
+        // Listing an already-`writable:true` table is redundant (the kind authorizes it) — a WARNING,
+        // never a refusal.
+        let s = schema_503_apply();
+        let warns = admit_unscoped_writes(
+            Some(&s),
+            &["oauth_state".to_string()],
+            "handler route \"/oauth\" [POST]",
+        )
+        .expect("a redundant entry is a warning, not an error");
+        assert_eq!(warns.len(), 1);
+        assert!(warns[0].contains("oauth_state") && warns[0].contains("redundant"));
+    }
+
+    #[test]
+    fn admit_unscoped_writes_refuses_a_tenant_table_and_an_unknown_table() {
+        let s = schema_503_apply();
+        // A tenant-kind table can NEVER be written unstamped via the list (G1) — refused fail-fast.
+        let err = admit_unscoped_writes(
+            Some(&s),
+            &["orders".to_string()],
+            "handler route \"/x\" [POST]",
+        )
+        .expect_err("a tenant table in the allowlist is refused");
+        assert!(err.contains("handler route \"/x\" [POST]") && err.contains("orders"));
+        assert!(err.contains("per-tenant"), "explains the kind: {err}");
+        // An unknown table names the guest + the table + lists the known tables.
+        let err2 =
+            admit_unscoped_writes(Some(&s), &["typo_table".to_string()], "consumer \"jobs\"")
+                .expect_err("an unknown table is refused");
+        assert!(err2.contains("consumer \"jobs\"") && err2.contains("typo_table"));
+        assert!(
+            err2.contains("orders") && err2.contains("countries"),
+            "lists known: {err2}"
+        );
+    }
+
+    #[test]
+    fn admit_unscoped_writes_refuses_a_list_with_no_project_schema() {
+        // A route listing write-global tables while the project has NO schema can never fire at
+        // runtime (legacy Uniform) — refuse it fail-fast rather than silently no-op.
+        let err = admit_unscoped_writes(
+            None,
+            &["countries".to_string()],
+            "handler route \"/a\" [GET]",
+        )
+        .expect_err("a list with no project schema is refused");
+        assert!(err.contains("no tenancy schema") && err.contains("countries"));
     }
 }
