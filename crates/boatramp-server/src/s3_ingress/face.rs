@@ -18,11 +18,13 @@ use boatramp_core::{ByteStream, PutMeta, StorageError};
 use futures::StreamExt as _;
 use sha2::{Digest, Sha256};
 
-use super::auth::{self, S3AuthInput, S3Op};
+use super::auth::{self, AuthedScope, S3AuthInput, S3Op};
+use super::chunked::{self, ChunkContext};
 use super::config::S3IngressState;
 use super::error::{S3Error, S3ErrorCode, refuse};
 use super::keypath;
 use super::multipart::{self, MultipartError};
+use super::sigv4::STREAMING_PAYLOAD;
 
 /// A fully-parsed S3 request the face acts on. The axum listener builds this from the live request
 /// (raw path/query/headers + streaming body); tests build it directly, so the engine is exercised
@@ -111,6 +113,11 @@ pub async fn handle(state: &S3IngressState, req: S3Request, now_unix: i64) -> Re
         return refuse(&reason);
     }
 
+    // If the client signed an aws-chunked (`STREAMING-...-PAYLOAD`) body, build the verification
+    // context now (the payload is de-framed + per-chunk-verified as it streams — never buffered). The
+    // trailing-checksum form was already rejected in `authenticate` (MEDIUM-2), so only the plain
+    // streaming form reaches here.
+    let chunk_ctx = build_chunk_context(&authed);
     let session = authed.session;
     // Destructure the route so the intent's owned fields don't conflict with borrowing bucket/raw_key.
     let Route {
@@ -122,7 +129,16 @@ pub async fn handle(state: &S3IngressState, req: S3Request, now_unix: i64) -> Re
     // Map the intent to the permission it requires + dispatch.
     match intent {
         Intent::PutObject => {
-            put_object(state, &session, &bucket, &raw_key, req.headers, req.body).await
+            put_object(
+                state,
+                &session,
+                &bucket,
+                &raw_key,
+                req.headers,
+                req.body,
+                chunk_ctx,
+            )
+            .await
         }
         Intent::CreateMultipart => create_multipart(state, &session, &bucket, &raw_key),
         Intent::UploadPart {
@@ -137,6 +153,7 @@ pub async fn handle(state: &S3IngressState, req: S3Request, now_unix: i64) -> Re
                 &upload_id,
                 part_number,
                 req.body,
+                chunk_ctx,
             )
             .await
         }
@@ -166,6 +183,7 @@ async fn put_object(
     raw_key: &str,
     headers: Vec<(String, String)>,
     body: Body,
+    chunk_ctx: Option<ChunkContext>,
 ) -> Response {
     // Scope: bucket = container, op = Put. Compose the key at the choke point.
     let (decoded_key, storage_key) =
@@ -214,7 +232,15 @@ async fn put_object(
             .unwrap_or(&decoded_key)
             .to_string()
     });
-    match stream_put(state, &storage_key, body, session, require_hash.as_deref()).await {
+    match stream_put(
+        state,
+        &storage_key,
+        body,
+        chunk_ctx,
+        require_hash.as_deref(),
+    )
+    .await
+    {
         Ok(()) => ok_empty(),
         Err(resp) => resp,
     }
@@ -261,6 +287,9 @@ fn create_multipart(
 
 /// `PUT /{bucket}/{key}?partNumber=N&uploadId=U` — UploadPart → an `ETag`. Re-verifies the uploadId's
 /// scope binding, then streams the part into staging.
+// The arguments are the cohesive request context (state + scope + route + upload id + part + body +
+// chunk ctx); grouping them into a struct would add ceremony without clarifying the single call site.
+#[allow(clippy::too_many_arguments)]
 async fn upload_part(
     state: &S3IngressState,
     session: &S3Session,
@@ -269,6 +298,7 @@ async fn upload_part(
     upload_id: &str,
     part_number: u32,
     body: Body,
+    chunk_ctx: Option<ChunkContext>,
 ) -> Response {
     if let Err(resp) = authorize_and_compose(session, bucket, raw_key, S3Op::Multipart) {
         return resp;
@@ -288,7 +318,9 @@ async fn upload_part(
         )
         .into_response();
     };
-    let stream = guarded_stream(state, body);
+    // De-frame + per-chunk-verify an aws-chunked part body (if any) BEFORE the size guard, so the guard
+    // caps the actual payload bytes, not the framing.
+    let stream = guarded_stream(state, payload_body(body, chunk_ctx));
     match multipart::stage_part(
         state.deploy.storage(),
         &session.scope,
@@ -565,15 +597,16 @@ fn tightest(a: Option<u64>, b: Option<u64>) -> Option<u64> {
 
 /// Stream a PUT body into `storage_key`, applying the `UploadGuard` size/idle cap and, when
 /// `require_hash` is `Some`, verifying the streamed bytes hash to that content-address (else delete +
-/// reject; no committed partial). On any stream error the object is deleted.
+/// reject; no committed partial). An aws-chunked body (`chunk_ctx = Some`) is de-framed + per-chunk
+/// verified first. On any stream error (a bad chunk signature, a size overflow) the object is deleted.
 async fn stream_put(
     state: &S3IngressState,
     storage_key: &str,
     body: Body,
-    session: &S3Session,
+    chunk_ctx: Option<ChunkContext>,
     require_hash: Option<&str>,
 ) -> Result<(), Response> {
-    let guarded = guarded_stream(state, body);
+    let guarded = guarded_stream(state, payload_body(body, chunk_ctx));
     // Cap the stream to the tightest of the credential's max_bytes and the container ceiling (the
     // guard's own max_upload_bytes is a coarser server-wide backstop).
     let hasher = require_hash.map(|_| std::sync::Arc::new(std::sync::Mutex::new(Sha256::new())));
@@ -602,6 +635,13 @@ async fn stream_put(
             )
             .into_response());
         }
+        // An aws-chunked de-framing/verification failure surfaces as a backend stream error — it is an
+        // authentication failure, so it collapses to the uniform 403 (no-oracle), and the partial is
+        // deleted (no committed object).
+        Err(StorageError::Backend(msg)) if msg.contains("aws-chunked") => {
+            let _ = state.deploy.storage().delete(storage_key).await;
+            return Err(refuse(&format!("aws-chunked body: {msg}")));
+        }
         Err(_) => {
             let _ = state.deploy.storage().delete(storage_key).await;
             return Err(S3Error::new(S3ErrorCode::InternalError, "storage error").into_response());
@@ -619,17 +659,38 @@ async fn stream_put(
             .into_response());
         }
     }
-    let _ = session; // (per-container blob-change notification is a wiring concern; see listener)
     Ok(())
 }
 
-/// Wrap a body as a size/idle-capped [`ByteStream`] via the shared `UploadGuard`.
-fn guarded_stream(state: &S3IngressState, body: Body) -> ByteStream {
-    let stream = body
+/// Wrap a payload [`ByteStream`] with the shared `UploadGuard` size/idle cap.
+fn guarded_stream(state: &S3IngressState, stream: ByteStream) -> ByteStream {
+    state.guard.limit_body(stream)
+}
+
+/// Convert the raw HTTP body into the payload [`ByteStream`] the storage backend receives: for an
+/// aws-chunked request (`chunk_ctx = Some`) the body is de-framed + per-chunk verified against the
+/// signature chain (never buffered whole); otherwise the raw data stream passes through unchanged.
+fn payload_body(body: Body, chunk_ctx: Option<ChunkContext>) -> ByteStream {
+    let raw = body
         .into_data_stream()
         .map(|chunk| chunk.map_err(|e| StorageError::backend(e.to_string())))
         .boxed();
-    state.guard.limit_body(stream)
+    match chunk_ctx {
+        Some(ctx) => chunked::dechunk_verified(raw, ctx),
+        None => raw,
+    }
+}
+
+/// Build the aws-chunked verification context from the authenticated request, when the client signed a
+/// streaming (`STREAMING-AWS4-HMAC-SHA256-PAYLOAD`) body. `None` for a real-hash / `UNSIGNED-PAYLOAD`
+/// request (those bodies are not chunk-framed). The trailer form was already rejected at auth.
+fn build_chunk_context(authed: &AuthedScope) -> Option<ChunkContext> {
+    (authed.payload_hash == STREAMING_PAYLOAD).then(|| ChunkContext {
+        secret: authed.secret.clone(),
+        scope: authed.parsed.scope.clone(),
+        amz_date: authed.parsed.amz_date.clone(),
+        seed_signature: authed.parsed.signature.clone(),
+    })
 }
 
 /// Whether an object exists at `storage_key` (the create-only precondition probe).
@@ -1207,6 +1268,116 @@ mod e2e {
                 .get_bytes(&format!("hblob/blog/cas/{real_hash}"))
                 .unwrap(),
             real_bytes
+        );
+    }
+
+    #[tokio::test]
+    async fn aws_chunked_put_deframes_verifies_and_lands_guest_readable() {
+        // A real STREAMING-AWS4-HMAC-SHA256-PAYLOAD (aws-chunked) PUT: the request is signed with the
+        // streaming marker, the body is chunk-framed with a per-chunk signature chain, and the face
+        // de-frames + verifies each chunk while streaming, landing the concatenated payload at the
+        // guest-readable hblob key.
+        let h = harness();
+        let scope = S3SessionScope {
+            project: "default".into(),
+            site: "blog".into(),
+            container: "photos".into(),
+            target: S3Target::Key("chunked.bin".into()),
+            perms: vec![S3Perm::Put],
+            constraints: S3Constraints::default(),
+        };
+        let token = mint_s3_session(&scope, 900, NOW as u64, &h.signer)
+            .await
+            .unwrap();
+        let session = verify_s3_session(&token, &h.signer.public_key(), NOW as u64).unwrap();
+        let akid = "BRUPCHUNKED";
+        let sak = h.secret.derive_secret(akid, &session.cti).unwrap();
+        let uri_path = "/photos/chunked.bin";
+        let scope_s = sigv4::CredentialScope {
+            access_key_id: akid.into(),
+            date: "20150830".into(),
+            region: LOCAL_REGION.into(),
+            service: LOCAL_SERVICE.into(),
+        };
+        // Sign the request with the streaming payload marker (that is what the client signs as the
+        // canonical payload hash for aws-chunked).
+        let headers = vec![
+            ("host".to_string(), "s3.local".to_string()),
+            ("x-amz-date".to_string(), AMZ_DATE.to_string()),
+            (
+                "x-amz-content-sha256".to_string(),
+                sigv4::STREAMING_PAYLOAD.to_string(),
+            ),
+            ("x-amz-security-token".to_string(), token.clone()),
+        ];
+        let signed = vec![
+            "host".to_string(),
+            "x-amz-content-sha256".to_string(),
+            "x-amz-date".to_string(),
+        ];
+        let creq_req = sigv4::CanonicalRequest {
+            method: "PUT",
+            uri_path,
+            query: "",
+            headers: &headers,
+            payload_hash: sigv4::STREAMING_PAYLOAD,
+        };
+        let (creq, signed_str) = sigv4::canonical_request_string(&creq_req, &signed).unwrap();
+        let sts = sigv4::string_to_sign(AMZ_DATE, &scope_s, &creq);
+        let seed = sigv4::compute_signature(&sak, &scope_s, &sts);
+        // Build the chunked wire body (two data chunks + the zero terminator), each signed off the seed
+        // chain — mirroring what an S3 SDK sends.
+        let mut verifier = sigv4::ChunkVerifier::new(&sak, &scope_s, AMZ_DATE, &seed);
+        let mut wire = Vec::new();
+        for data in [
+            b"Hello, ".as_slice(),
+            b"chunked!".as_slice(),
+            b"".as_slice(),
+        ] {
+            let chunk_sts = format!(
+                "AWS4-HMAC-SHA256-PAYLOAD\n{AMZ_DATE}\n{}\n{}\n{}\n{}",
+                scope_s.scope_string(),
+                verifier.current_signature(),
+                sigv4::EMPTY_SHA256,
+                sigv4::sha256_hex(data),
+            );
+            let key = sigv4::signing_key(&sak, &scope_s.date, &scope_s.region, &scope_s.service);
+            let sig = {
+                use aws_lc_rs::hmac;
+                let k = hmac::Key::new(hmac::HMAC_SHA256, key.as_ref());
+                hex::encode(hmac::sign(&k, chunk_sts.as_bytes()).as_ref())
+            };
+            wire.extend_from_slice(
+                format!("{:x};chunk-signature={}\r\n", data.len(), sig).as_bytes(),
+            );
+            wire.extend_from_slice(data);
+            wire.extend_from_slice(b"\r\n");
+            verifier.verify_chunk(data, &sig).unwrap();
+        }
+        let mut req_headers = headers.clone();
+        req_headers.push((
+            "authorization".to_string(),
+            format!(
+                "AWS4-HMAC-SHA256 Credential={akid}/20150830/{LOCAL_REGION}/{LOCAL_SERVICE}/aws4_request, SignedHeaders={signed_str}, Signature={seed}"
+            ),
+        ));
+        let req = S3Request {
+            method: "PUT".into(),
+            uri_path: uri_path.into(),
+            query: String::new(),
+            headers: req_headers,
+            body: Body::from(wire),
+        };
+        let resp = handle(&h.state, req, NOW).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a valid aws-chunked PUT succeeds"
+        );
+        assert_eq!(
+            h.map.get_bytes("hblob/blog/photos/chunked.bin").unwrap(),
+            b"Hello, chunked!",
+            "the de-framed payload lands guest-readable"
         );
     }
 

@@ -36,6 +36,7 @@
 //! The mint surfaces (M3) and cloud brokering (M4) build on top of these.
 
 pub mod auth;
+pub mod chunked;
 pub mod config;
 pub mod credential;
 pub mod error;
