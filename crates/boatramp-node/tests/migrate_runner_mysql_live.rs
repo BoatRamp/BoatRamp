@@ -157,9 +157,13 @@ fn applied_ids(applied: &[boatramp_core::sql::AppliedMigration]) -> Vec<String> 
     applied.iter().map(|a| a.id.clone()).collect()
 }
 
-/// A direct DDL-login connection for out-of-band setup / assertions (not ledgered).
+/// A direct DDL-login connection for out-of-band setup / assertions (not ledgered). Derives the DDL
+/// URL from `BOATRAMP_TEST_MYSQL_URL` the SAME way `runner_for` does — the runner now receives the URLs
+/// via an injected `MapEnv` (task #498), so the `DDL_URL_ENV` process var is intentionally never set;
+/// this out-of-band helper reads the real source var instead.
 async fn ddl_conn() -> Arc<dyn boatramp_core::sql::SqlBackend> {
-    let ddl = std::env::var(DDL_URL_ENV).unwrap();
+    let runtime = std::env::var("BOATRAMP_TEST_MYSQL_URL").unwrap();
+    let ddl = ddl_url_from_runtime(&runtime).unwrap();
     connect(ExternalSqlKind::Mysql, &ExternalSqlOptions::new(ddl)).unwrap()
 }
 
