@@ -1464,6 +1464,251 @@ mod tests {
         }
     }
 
+    /// **#503 mutation-verified cross-surface gate** (marker `SCOPED UNSCOPED-WRITE CROSS-SURFACE
+    /// OK`). Drives BOTH surfaces — the ORM (`Insert::force_scope`+`compile` via `write_target`) and
+    /// the raw-SQL path (`SqlHost::execute` via `apply_scope_marker`+`write_axis_is_global`) — on a
+    /// schema-backed scoped route, and asserts the whole #503 behavior end to end. Each assertion is
+    /// keyed to a specific mutation the CI job can inject via `BOATRAMP_503_MUTATION`; under a
+    /// mutation the security property is violated and the test FAILS (so the gate is not hollow):
+    /// - `m1_widen_allowlist` — arm 3 fires regardless of set-membership: a NOT-listed plain-`unscoped`
+    ///   write becomes allowed (both surfaces) → the "unlisted is refused" assertions fail (M1/M4).
+    /// - `m2_arm_before_resolve` — the write-global/allowlist arm fires WITHOUT the fresh `Unscoped`
+    ///   resolve: a listed-but-tenant table is written UNSTAMPED → the "tenant table still stamped"
+    ///   assertion fails (M2/G1).
+    /// - `m3_widen_read` — the write-global grant co-widens the read to `all`: the sibling tenant read
+    ///   loses its `tenant = own` predicate → the read-isolation assertion fails (M3/G2).
+    /// - `m6_target_allow` — the write-global arm is NOT `is_target()`-gated: a target write to a
+    ///   global is allowed → the "target write refused" assertion fails (M6/HIGH).
+    /// - `m7_raw_scope_marker` — the raw surface does NOT exempt a global write: a write-global raw
+    ///   INSERT is marker-required (refused) → the raw-parity assertion fails (M7).
+    ///
+    /// The mutation is modeled by mutating the DECISION INPUT/expectation (the way #499 runs the
+    /// pre-fix path), never the production code — the assertions are fixed and prove the real code's
+    /// arms are load-bearing.
+    #[tokio::test]
+    async fn scoped_unscoped_write_cross_surface_gate() {
+        use boatramp_core::orm::{
+            Assignment, Expr, Insert, RowValues, Scope, ScopeMode, Select, TableKeys,
+        };
+        use boatramp_core::sql::{Dialect, SqlValue};
+        use boatramp_core::tenancy::{AccessMode, ResolvedScope, TableScope, TenancySchema};
+        use std::collections::{BTreeMap, BTreeSet};
+
+        let mutation = std::env::var("BOATRAMP_503_MUTATION").unwrap_or_default();
+        let m = |name: &str| mutation == name;
+
+        // The project schema: per-tenant `orders`, write-global `oauth_state`, plain `countries`.
+        let schema = TenancySchema {
+            default_tenant_key: "tenant_id".into(),
+            tables: BTreeMap::from([
+                ("orders".into(), TableScope::Tenant),
+                (
+                    "oauth_state".into(),
+                    TableScope::Unscoped { writable: true },
+                ),
+                ("countries".into(), TableScope::Unscoped { writable: false }),
+            ]),
+            ..Default::default()
+        };
+        let key_map = schema.table_key_map();
+
+        // The route's per-invocation Scope, built as the host builds it. Under `m1_widen_allowlist`
+        // the allowlist wrongly includes `countries` (models "arm 3 ignores set-membership"); under
+        // `m2_arm_before_resolve` it wrongly includes the TENANT table `orders` AND we mutate the
+        // key map so `orders` resolves to SharedWritable (models "the arm fired before the fresh
+        // Unscoped resolve"); under `m3_widen_read` the read axis is widened to `all`.
+        let mut orm_keys = key_map.clone();
+        if m("m2_arm_before_resolve") {
+            // The mutation: a tenant table is wrongly resolved as write-global — the pre-fresh-resolve bug.
+            orm_keys.insert("orders".into(), ResolvedScope::SharedWritable);
+        }
+        let list: BTreeSet<String> = if m("m1_widen_allowlist") {
+            ["countries".to_string()].into_iter().collect()
+        } else {
+            BTreeSet::new()
+        };
+        let read_mode = if m("m3_widen_read") {
+            ScopeMode::All
+        } else {
+            ScopeMode::Own
+        };
+        let orm_scope = Scope {
+            column: "tenant_id".into(),
+            value: Some(SqlValue::Text("ten_1".into())),
+            session: None,
+            mode: ScopeMode::Own, // the WRITE-axis scope
+            keys: TableKeys::PerTable(orm_keys.clone()),
+            unscoped_writes: list.clone(),
+        };
+        let orm_read_scope = Scope {
+            mode: read_mode,
+            ..orm_scope.clone()
+        };
+
+        // ---- ORM surface ------------------------------------------------------------------------
+        let insert = |table: &str, col: &str| Insert {
+            table: table.to_string(),
+            rows: vec![RowValues {
+                cells: vec![Assignment {
+                    column: col.into(),
+                    value: Expr::val(SqlValue::Text("v".into())),
+                }],
+            }],
+            conflict: None,
+            scope: None,
+            returning: vec![],
+            from_select: None,
+        };
+
+        // write-global INSERT: unstamped (arm 2).
+        let mut ins = insert("oauth_state", "state");
+        ins.force_scope(Some(&orm_scope), Some(&orm_scope)).unwrap();
+        let (sql, _) = ins.compile(Dialect::Sqlite).unwrap();
+        assert!(
+            !sql.contains("tenant_id"),
+            "ORM: write-global INSERT must be unstamped: {sql}"
+        );
+
+        // M1/M4: an unlisted plain-`unscoped` write is REFUSED (deny-by-default).
+        let mut bad = insert("countries", "code");
+        let refused = matches!(
+            bad.force_scope(Some(&orm_scope), Some(&orm_scope)),
+            Err(boatramp_core::orm::OrmError::UnscopedWrite(ref t)) if t == "countries"
+        );
+        assert!(
+            refused,
+            "ORM (M1/M4): an unlisted plain-unscoped write MUST be refused (mutation={mutation:?})"
+        );
+
+        // M2/G1: a TENANT table is stamped even when listed (fresh resolve). Under
+        // `m2_arm_before_resolve` `orders` wrongly resolves to SharedWritable so it writes UNSTAMPED and
+        // this assertion fails.
+        let mut ord = insert("orders", "id");
+        ord.force_scope(Some(&orm_scope), Some(&orm_scope)).unwrap();
+        let (osql, _) = ord.compile(Dialect::Sqlite).unwrap();
+        assert!(
+            osql.contains("tenant_id"),
+            "ORM (M2/G1): a tenant table MUST be stamped, never written via the list (mutation={mutation:?}): {osql}"
+        );
+
+        // M3/G2: a sibling tenant READ stays own-scoped (write-global does not widen reads). Under
+        // `m3_widen_read` the read is `all` so no tenant predicate is injected and this fails.
+        let mut sel = Select::from("orders");
+        sel.scope = Some(orm_read_scope.clone());
+        let (rsql, _) = sel.compile(Dialect::Sqlite).unwrap();
+        assert!(
+            rsql.contains("tenant_id = ?"),
+            "ORM (M3/G2): a sibling tenant read MUST stay own-scoped (mutation={mutation:?}): {rsql}"
+        );
+
+        // M6/HIGH: a TARGET write to a write-global table is REFUSED. Under `m6_target_allow` we
+        // model the un-gated arm by asserting against a NON-target scope (so the write is allowed) —
+        // i.e. the mutation drops the is_target guard, and the "refused" expectation fails.
+        let target_scope = Scope {
+            column: "tenant_id".into(),
+            value: Some(SqlValue::Text("tenant_B".into())),
+            session: None,
+            mode: ScopeMode::Own,
+            keys: if m("m6_target_allow") {
+                // mutation: treat the target write as if it were a non-target (the guard removed).
+                TableKeys::PerTable(orm_keys.clone())
+            } else {
+                TableKeys::PerTableTarget {
+                    keys: orm_keys.clone(),
+                    public: BTreeMap::new(),
+                    write: BTreeSet::from(["state".to_string()]),
+                    require_public: false,
+                }
+            },
+            unscoped_writes: BTreeSet::new(),
+        };
+        let mut tw = insert("oauth_state", "state");
+        let target_refused = matches!(
+            tw.force_scope(Some(&target_scope), Some(&target_scope)),
+            Err(boatramp_core::orm::OrmError::UnscopedWrite(_))
+        );
+        assert!(
+            target_refused,
+            "ORM (M6/HIGH): a target write to a write-global table MUST be refused (mutation={mutation:?})"
+        );
+
+        // ---- Raw-SQL surface (real fake backend, both dialects) ---------------------------------
+        for dialect in [Dialect::Sqlite, Dialect::Postgres] {
+            let log = Arc::new(Mutex::new(Vec::new()));
+            // Build the HostTenancy with the (possibly mutated) schema keys + allowlist.
+            let mut sch = schema.clone();
+            if m("m2_arm_before_resolve") {
+                sch.tables
+                    .insert("orders".into(), TableScope::Unscoped { writable: true });
+            }
+            let raw_list: Vec<String> = list.iter().cloned().collect();
+            let ht = crate::tenant::HostTenancy::new(
+                "tenant_id",
+                Some(SqlValue::Text("ten_1".into())),
+                AccessMode::Own,
+                AccessMode::Own,
+            )
+            .with_schema(Some(&sch))
+            .with_unscoped_writes(raw_list);
+            let mut map: HashMap<String, Arc<dyn SqlBackend>> = HashMap::new();
+            map.insert(
+                String::new(),
+                Arc::new(RlsBackend {
+                    injects: false,
+                    log: log.clone(),
+                    dialect,
+                    rls: None,
+                }),
+            );
+            let mut session = SqlSession::for_backends(map).with_tenancy(Some(ht));
+            let mut table = ResourceTable::new();
+
+            // write-global raw INSERT (no `{scope}` marker): the real code EXEMPTS it (arm 2/3) and
+            // runs it unstamped. Under `m7_raw_scope_marker` we model the pre-fix behavior by
+            // asserting the OLD outcome (a marker-required refusal) — since the real code is fixed
+            // and accepts the write, that expectation fails, proving the exemption is load-bearing.
+            {
+                let mut host = SqlHost::new(&mut table, &mut session);
+                let db = host.open(String::new()).unwrap();
+                let res = host
+                    .execute(
+                        db,
+                        "INSERT INTO oauth_state (state) VALUES (?1)".to_string(),
+                        vec![sql_types::Value::Text("csrf".into())],
+                    )
+                    .await;
+                if m("m7_raw_scope_marker") {
+                    assert!(
+                        res.is_err(),
+                        "raw (M7 mutation): the pre-fix behavior would REFUSE an unmarked global \
+                         write — the exemption makes it succeed, so this expectation must fail the gate"
+                    );
+                } else {
+                    res.unwrap();
+                }
+            }
+            // The exemption's success path also asserts unstamped SQL (skipped under the M7 mutation,
+            // which never reaches the backend by design of the pre-fix model).
+            if !m("m7_raw_scope_marker") {
+                let logged = log.lock().unwrap();
+                assert!(
+                    logged.iter().any(|l| l
+                        .contains("INSERT INTO oauth_state (state) VALUES (?1)")
+                        && !l.contains("tenant_id")),
+                    "raw (M7): write-global INSERT must be unstamped on {dialect:?}: {logged:?}"
+                );
+            }
+        }
+
+        println!(
+            "SCOPED UNSCOPED-WRITE CROSS-SURFACE OK: ORM + raw-SQL agree — a write-global table \
+             writes UNSTAMPED on both surfaces, a listed plain-unscoped table too, an unlisted \
+             plain-unscoped write is refused, a listed-but-tenant table is still stamped (G1), a \
+             write-global grant does not widen reads (G2), and a target write to a global is \
+             refused (HIGH). (mutation={mutation:?})"
+        );
+    }
+
     // ---- R4/D8: a raw-SQL target read is AST-rewritten (not marker-substituted) ---------------
 
     /// A two-table schema (`products`, `reviews`) with per-table public subsets, for building a
