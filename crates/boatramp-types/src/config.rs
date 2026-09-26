@@ -1043,6 +1043,22 @@ pub struct HandlerGraphqlConfig {
     /// A developer convenience — off by default; pair with `introspection` for schema docs.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub graphiql: bool,
+    /// The route pattern of the GraphQL endpoint on this site (a
+    /// [`HandlerConfig::route`] value, e.g. `/graphql`). The GraphQL edge — the query
+    /// guard (depth / complexity / introspection), the federation / data-connector planner,
+    /// **and the GraphiQL explorer** — applies **only** to a request whose **path matches
+    /// this pattern**, so every other declared guest route on the same site (an OAuth
+    /// `/authorize`, `/jwks`, a social-login / SAML redirect start) is served by its own
+    /// handler **regardless of `Accept`** — a browser always sends `Accept: text/html`,
+    /// which previously got the GraphiQL IDE instead of the guest handler. Matched against
+    /// the request **path** (not the *matched handler's* route string), so a broader handler
+    /// declared before the graphql route cannot disable the edge/guard on the endpoint.
+    /// `None` ⇒ `/graphql` (the convention). **If the graphql endpoint lives at a non-default
+    /// path you MUST set this** — otherwise the edge (GraphiQL, APQ, and the query guard) will
+    /// not engage at that path. Should be a single literal endpoint path, not a wildcard (a
+    /// wildcard would re-widen the edge across sibling guest routes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route: Option<String>,
     /// Declarative data connector: serve the GraphQL API by generating it from a managed
     /// database (queries compiled to SQL) instead of running a wasm handler. Absent unless
     /// configured; exposure is deny-by-default.

@@ -95,7 +95,28 @@ pub(super) async fn dispatch_handler(
     // (not passed through), so no chunked or oversized request can bypass the guard. Only
     // an upload/form POST (`multipart/form-data`, `x-www-form-urlencoded`) — which carries
     // no inspectable query — passes through untouched.
-    if let Some(gql) = site_handlers.graphql.as_ref().filter(|g| g.enabled) {
+    // The GraphQL edge (query guard, federation / data-connector planner, and the GraphiQL
+    // explorer) is a property of the graphql ENDPOINT ROUTE — not a site-wide interceptor. It
+    // applies only when the REQUEST PATH matches the configured graphql route pattern (default
+    // `/graphql`), so every other declared guest route (OAuth `/authorize`, `/jwks`, redirect
+    // starts) is served by its own handler regardless of `Accept` — a browser always sends
+    // `Accept: text/html`, which otherwise shadowed the guest handler with the IDE.
+    //
+    // Matching the request PATH (not the *matched handler's* route string) is deliberate: under
+    // first-match routing a broader handler (e.g. `/**`) declared before the `/graphql` handler
+    // would otherwise win the match and — with a raw `handler.route ==` gate — silently disable
+    // the edge (query depth/complexity/introspection guard included) on the real endpoint. The
+    // path match keeps the guard engaged on `/graphql` whichever handler served it.
+    let is_graphql_endpoint = |g: &boatramp_core::config::HandlerGraphqlConfig| {
+        boatramp_core::matcher::Pattern::compile(g.route.as_deref().unwrap_or("/graphql"))
+            .map(|p| p.is_match(request_path))
+            .unwrap_or(false)
+    };
+    if let Some(gql) = site_handlers
+        .graphql
+        .as_ref()
+        .filter(|g| g.enabled && is_graphql_endpoint(g))
+    {
         // GraphiQL explorer: a browser GET (Accept: text/html) gets the IDE, which posts
         // queries back to the same URL.
         if gql.graphiql && request.method() == Method::GET {

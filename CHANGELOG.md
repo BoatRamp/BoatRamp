@@ -5,6 +5,32 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.5.7] - 2026-09-26
+
+**Fix: the GraphQL edge is scoped to the graphql endpoint route, not the whole site.** On a
+graphql-enabled site the GraphQL edge — the query guard, the federation / data-connector planner, and the
+built-in **GraphiQL explorer** — was applied to *every* matched route. So a browser `GET`
+(`Accept: text/html`) to any other declared guest route (an OIDC `/authorize`, `/jwks`,
+`/.well-known/openid-configuration`, a social-login / SAML redirect start) was served the GraphiQL IDE,
+**shadowing the guest's own handler** — and because a browser always sends `Accept: text/html`, every
+browser-navigated guest `GET` on a site that also exposed `/graphql` was unusable (OIDC / social-login /
+SAML browser flows blocked). The edge is now a property of the graphql **endpoint route**: it applies only
+to a request whose matched handler route is the graphql endpoint, so every other declared guest route is
+served by its own handler regardless of `Accept`.
+
+### Fixed
+
+- **GraphiQL no longer shadows sibling guest GET routes on a graphql site** (#500). The GraphQL edge
+  (query guard, federation / data-connector planner, and the GraphiQL explorer) is gated on the matched
+  handler being the graphql endpoint route — route match takes precedence over the playground. Fixes
+  browser-navigated OIDC / social-login / SAML guest `GET` handlers being shadowed by the IDE.
+
+### Added
+
+- **`[handlers.graphql].route`** (optional) — the route pattern of the graphql endpoint (default
+  `/graphql`). Set it only when the endpoint lives at a non-default path; the default is non-breaking for
+  the `/graphql` convention, so no site needs reconfiguration.
+
 ## [0.5.6] - 2026-09-24
 
 **Edge-visibility for federated GraphQL operations (`@edgeHidden`).** A federated subgraph root field can
