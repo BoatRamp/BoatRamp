@@ -229,6 +229,10 @@ pub(crate) use scheduler::{
 };
 #[cfg(feature = "handlers")]
 mod function_runtime;
+/// S3-compatible external blob ingress (PLAN-blob-s3-ingress) — M1 security core: the temporary-
+/// credential model (HKDF-derived secret from a dedicated ingress root + rotation overlap + the
+/// fail-closed multi-node guard) and the SigV4 sign/verify engine. Listener/mint/cloud wiring is M2+.
+pub mod s3_ingress;
 /// The server-side owner-gated schema-migration orchestrator (function/sql/extension steps over the
 /// node [`MigrationSubstrate`](boatramp_core::sql::MigrationSubstrate) seam).
 #[cfg(feature = "handlers")]
