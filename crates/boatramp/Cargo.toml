@@ -206,6 +206,14 @@ blob-upload = [
   "boatramp-node/blob-upload",
   "boatramp-server/blob-upload",
 ]
+# The M4 **cloud** blob-upload minters: broker a native scoped credential (AWS STS session policy /
+# GCS signed URL + CAB / Azure user-delegation SAS) for a cloud-backed blob container. Each pairs with
+# its storage backend (the minter is only useful when the node uses that cloud backend). Off in the
+# default; on in a cloud-batteries build.
+blob-upload-aws = ["blob-upload", "s3", "boatramp-server/blob-upload-aws"]
+blob-upload-gcs = ["blob-upload", "gcs", "boatramp-server/blob-upload-gcs"]
+blob-upload-azure = ["blob-upload", "azure", "boatramp-server/blob-upload-azure"]
+blob-upload-cloud = ["blob-upload-aws", "blob-upload-gcs", "blob-upload-azure"]
 session = ["handlers", "boatramp-server/session"]
 # Self-hosted **cluster mode** (`boatramp serve --mode cluster`): embedded Raft
 # over the HTTP peer mesh, durable per-node Raft stores, and the RaftKv /

@@ -796,6 +796,28 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
             serve_cfg.s3_ingress_mint_max_bytes,
         )?;
     }
+    // Cloud brokering (M4): when the node's blob backend is a cloud object store and
+    // `[serve.s3_ingress_cloud]` is set, install a cloud `BlobUploadMinter` (used instead of the local
+    // face) so a minted credential is a native scoped STS/CAB/SAS credential the client redeems
+    // directly against the real store. Independent of the local `s3_ingress_addr` listener — a
+    // cloud-only deployment never needs it. Gated on at least one cloud minter feature being compiled.
+    #[cfg(any(
+        feature = "blob-upload-aws",
+        feature = "blob-upload-gcs",
+        feature = "blob-upload-azure"
+    ))]
+    if let Some(cloud) = serve_cfg.s3_ingress_cloud.clone() {
+        wire_cloud_blob_upload(
+            &handlers,
+            &blob_args,
+            cloud,
+            serve_cfg
+                .s3_ingress_mint_max_ttl_secs
+                .unwrap_or(boatramp_node::config::DEFAULT_S3_INGRESS_MINT_MAX_TTL_SECS),
+            serve_cfg.s3_ingress_mint_max_bytes,
+        )
+        .await?;
+    }
     let serve_result = match args.tls {
         TlsMode::Off => boatramp_server::serve_with(addr, deploy, auth, handlers, options)
             .await
@@ -922,6 +944,89 @@ fn spawn_http_redirect(
 /// control-plane router or `serve_by_host`. Requires auth to be enabled (the face verifies fleet-signed
 /// session tokens against the trust anchor); with auth disabled the face is refused.
 #[allow(clippy::too_many_arguments)]
+/// Build + install the M4 **cloud** blob-upload minter from the node's blob backend + the
+/// `[serve.s3_ingress_cloud]` knobs (used INSTEAD of the local S3 face for a cloud-backed container).
+/// Also registers the operator mint ceilings so the guest binding + operator route are wired even when
+/// the local `s3_ingress_addr` listener is not enabled (a cloud-only deployment). No-op when the blob
+/// backend is `fs`/in-memory (the local face handles those), or the matching cloud feature is off.
+#[cfg(any(
+    feature = "blob-upload-aws",
+    feature = "blob-upload-gcs",
+    feature = "blob-upload-azure"
+))]
+async fn wire_cloud_blob_upload(
+    handlers: &boatramp_server::HandlerRuntime,
+    blob_args: &BlobArgs,
+    cloud: boatramp_node::config::S3IngressCloud,
+    mint_max_ttl_secs: u64,
+    mint_max_bytes: Option<u64>,
+) -> Result<()> {
+    use boatramp_server::blob_upload_minter::wiring::{CloudMinterSpec, build_cloud_minter};
+
+    if mint_max_ttl_secs == 0 {
+        return Ok(());
+    }
+    let spec = match blob_args.blobs {
+        BlobBackend::S3 => CloudMinterSpec::Aws {
+            bucket: blob_args.s3_bucket.clone().ok_or_else(|| {
+                Error::S3Ingress("cloud blob-upload (S3): --s3-bucket required".into())
+            })?,
+            region: blob_args.s3_region.clone().unwrap_or_default(),
+            endpoint: blob_args.s3_endpoint.clone(),
+            force_path_style: blob_args.s3_path_style,
+            role_arn: cloud.aws_role_arn.clone(),
+            use_federation_token: cloud.aws_use_federation_token,
+        },
+        BlobBackend::Gcs => CloudMinterSpec::Gcs {
+            bucket: blob_args.gcs_bucket.clone().ok_or_else(|| {
+                Error::S3Ingress("cloud blob-upload (GCS): --gcs-bucket required".into())
+            })?,
+            endpoint: blob_args.gcs_endpoint.clone(),
+        },
+        BlobBackend::Azure => {
+            let account = cloud
+                .azure_account
+                .clone()
+                .or_else(|| blob_args.azure_account.clone())
+                .ok_or_else(|| {
+                    Error::S3Ingress("cloud blob-upload (Azure): account name required".into())
+                })?;
+            let service_url = cloud
+                .azure_service_url
+                .clone()
+                .unwrap_or_else(|| format!("https://{account}.blob.core.windows.net/"));
+            let container = blob_args.azure_container.clone().ok_or_else(|| {
+                Error::S3Ingress("cloud blob-upload (Azure): --azure-container required".into())
+            })?;
+            CloudMinterSpec::Azure {
+                account,
+                service_url,
+                container,
+            }
+        }
+        // fs / in-memory ⇒ the local S3 face mints (no cloud brokering).
+        BlobBackend::Fs => return Ok(()),
+    };
+    let Some(minter) = build_cloud_minter(spec).await.map_err(Error::S3Ingress)? else {
+        // The matching cloud feature isn't compiled in ⇒ fall back to the local face (if wired).
+        return Ok(());
+    };
+    // Register the operator ceilings (the binding reads them from `blob_upload_config`); the cloud
+    // minter overrides the actual `mint`. The face secret/endpoint are unused for a cloud minter, so a
+    // throwaway ephemeral secret + a placeholder endpoint are harmless (never consulted).
+    let ephemeral = boatramp_server::s3_ingress::credential::S3IngressSecret::generate()
+        .map_err(|e| Error::S3Ingress(e.to_string()))?;
+    handlers.set_blob_upload_minting(boatramp_server::blob_upload_minter::mint_config(
+        ephemeral,
+        "cloud-brokered".to_string(),
+        mint_max_ttl_secs,
+        mint_max_bytes,
+    ));
+    handlers.set_blob_upload_cloud_minter(minter);
+    tracing::info!(backend = ?blob_args.blobs, "wired cloud blob-upload minter (native brokering)");
+    Ok(())
+}
+
 fn spawn_s3_ingress(
     addr: SocketAddr,
     deploy: DeployStore,

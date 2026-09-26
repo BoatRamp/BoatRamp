@@ -1771,7 +1771,7 @@ pub(super) async fn blob_mint_upload(
     Json(req): Json<MintUploadRequest>,
 ) -> Response {
     use boatramp_handlers::{
-        BlobUploadMinter, MintScope, MintedCredentials, UploadConstraints, UploadPerm, UploadTarget,
+        MintScope, MintedCredentials, UploadConstraints, UploadPerm, UploadTarget,
     };
 
     // The minter is wired only when the local S3 face + fleet signer are up.

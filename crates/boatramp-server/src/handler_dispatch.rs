@@ -2126,14 +2126,24 @@ pub(super) async fn build_bindings(
     // and `mint` fails closed. The two rights are INDEPENDENT (`:write` single-shot, `:multipart`).
     #[cfg(feature = "blob-upload")]
     if (granted("blob-upload:write") || granted("blob-upload:multipart"))
-        && let (Some(cfg), Some(signer)) =
-            (inner.blob_upload_config.get(), inner.session_signer.get())
+        && let Some(cfg) = inner.blob_upload_config.get()
+        // Prefer a wired cloud minter (M4); else the local-face minter (needs the fleet signer). Both
+        // are the SAME `BlobUploadMinter` seam — the binding still host-forces project+site + clamps.
+        && let Some(minter) = inner
+            .blob_upload_cloud_minter
+            .get()
+            .cloned()
+            .or_else(|| {
+                inner.session_signer.get().map(|signer| {
+                    std::sync::Arc::new(crate::blob_upload_minter::ServerBlobUploadMinter {
+                        signer: signer.clone(),
+                        secret: cfg.secret.clone(),
+                        config: cfg.face.clone(),
+                    })
+                        as std::sync::Arc<dyn boatramp_handlers::BlobUploadMinter>
+                })
+            })
     {
-        let minter = std::sync::Arc::new(crate::blob_upload_minter::ServerBlobUploadMinter {
-            signer: signer.clone(),
-            secret: cfg.secret.clone(),
-            config: cfg.face.clone(),
-        });
         bindings = bindings.with_blob_upload(
             project.as_str(),
             // The site is host-routed for a request handler — a single resolved site, always present
