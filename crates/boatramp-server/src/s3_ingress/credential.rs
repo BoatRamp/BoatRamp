@@ -77,6 +77,12 @@ pub enum CredentialError {
 /// This is DISTINCT from `LocalKek` (secrets-at-rest) and the COSE `Signer` key (token signing): the
 /// `secret_access_key` HKDF is keyed ONLY by this material, so compromising an S3 credential can never
 /// reveal — and is never derivable from — the KEK or the signing key, and vice-versa.
+///
+/// `Clone` is derived so the loaded secret can be SHARED between the local S3 face (verify path) and
+/// the guest/operator mint minter (derive path) — both MUST key off the identical material, so a
+/// single-node ephemeral `generate()` is loaded once and cloned, never re-generated (which would give
+/// the two sides different roots).
+#[derive(Clone)]
 pub struct S3IngressSecret {
     /// The current root — new credentials are minted (and preferentially verified) under this.
     current: [u8; INGRESS_SECRET_LEN],

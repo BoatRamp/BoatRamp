@@ -61,6 +61,11 @@ pub(crate) use admin_api::{
 #[cfg(feature = "admin")]
 mod admin_controller;
 mod auth;
+/// The server-side minter backing the guest `blob-upload` capability (S3 external ingress): mints the
+/// fleet-signed session token, derives the secret, and shapes the presigned-put | temp-credentials
+/// variant.
+#[cfg(feature = "blob-upload")]
+pub mod blob_upload_minter;
 #[cfg(feature = "console")]
 pub mod console;
 mod content;
@@ -469,6 +474,14 @@ struct HandlerRuntimeInner {
     /// [`session_signer`](Self::session_signer).
     #[cfg(feature = "capability")]
     capability_max_ttl_secs: std::sync::OnceLock<u64>,
+    /// The guest `blob-upload` minting config (S3 external ingress): the shared S3-ingress secret, the
+    /// endpoint/region the minted credential targets, and the operator TTL + max-bytes ceilings. Set at
+    /// startup via [`HandlerRuntime::set_blob_upload_minting`] **only when** the local S3 face is wired
+    /// (a shared secret + a reachable endpoint); **unset ⇒ guest blob-upload minting is not offered**
+    /// (the binding is never attached, so a granted guest's `mint` is `failed`). The fleet signer is
+    /// reused from [`session_signer`](Self::session_signer).
+    #[cfg(feature = "blob-upload")]
+    blob_upload_config: std::sync::OnceLock<BlobUploadMintConfig>,
     /// Per-project overrides (Gap 4a) of the resolved tenancy/capability knobs, project name →
     /// resolved knobs (base posture ⊕ the operator's `[security.projects.<p>]` override). Consulted
     /// at each in-project enforcement point via [`HandlerRuntimeInner::project_tenancy_knobs`];
@@ -543,6 +556,23 @@ impl Default for DeliveryConfig {
             rebuild_interval: Duration::from_millis(30_000),
         }
     }
+}
+
+/// The startup config for the guest `blob-upload` minting capability (S3 external ingress). Holds the
+/// shared S3-ingress secret + endpoint/region the minted credential targets + the operator ceilings.
+/// Set once via [`HandlerRuntime::set_blob_upload_minting`] when the local S3 face is wired.
+#[cfg(feature = "blob-upload")]
+#[derive(Clone)]
+pub struct BlobUploadMintConfig {
+    /// The dedicated S3-ingress secret, shared with the face (so a minted credential verifies).
+    pub secret: Arc<crate::s3_ingress::credential::S3IngressSecret>,
+    /// Endpoint + region/service the minted credential targets (the local S3 face).
+    pub face: crate::blob_upload_minter::BlobUploadFaceConfig,
+    /// The operator ceiling on a minted credential's TTL, seconds (`0` ⇒ minting disabled).
+    pub max_ttl_secs: u64,
+    /// The operator ceiling on a minted credential's `max_bytes`; `None` ⇒ no host-side clamp (the
+    /// per-container ceiling at the face still applies).
+    pub max_bytes_ceiling: Option<u64>,
 }
 
 #[cfg(feature = "handlers")]
@@ -733,6 +763,8 @@ impl HandlerRuntime {
                 session_signer: std::sync::OnceLock::new(),
                 #[cfg(feature = "capability")]
                 capability_max_ttl_secs: std::sync::OnceLock::new(),
+                #[cfg(feature = "blob-upload")]
+                blob_upload_config: std::sync::OnceLock::new(),
                 #[cfg(feature = "handlers")]
                 tenancy_posture_overrides: std::sync::OnceLock::new(),
                 #[cfg(feature = "handlers")]
@@ -976,6 +1008,23 @@ impl HandlerRuntime {
         }
         if let Some(inner) = self.inner.as_ref() {
             let _ = inner.capability_max_ttl_secs.set(max_ttl_secs);
+        }
+    }
+
+    /// Enable guest blob-upload minting (`boatramp:handlers/blob-upload`, S3 external ingress). Call
+    /// **only when** the local S3 face is wired: pass the SAME S3-ingress secret the face verifies
+    /// under (a shared `Arc`), the endpoint/region a minted credential targets, and the operator TTL +
+    /// max-bytes ceilings. Unset (or a `0` TTL ceiling) ⇒ the `blob-upload` binding is never attached,
+    /// so a granted guest's `mint` fails. Minting reuses the fleet
+    /// [`set_session_signer`](Self::set_session_signer) key (the session token is signed + verified
+    /// against the same anchor), so wire that too. No-op on a plain runtime.
+    #[cfg(feature = "blob-upload")]
+    pub fn set_blob_upload_minting(&self, config: BlobUploadMintConfig) {
+        if config.max_ttl_secs == 0 {
+            return;
+        }
+        if let Some(inner) = self.inner.as_ref() {
+            let _ = inner.blob_upload_config.set(config);
         }
     }
 
@@ -6242,6 +6291,8 @@ mod tests {
                     &[],
                     // Tenant-secret name allowlist (task #493): empty ⇒ deny-all.
                     &[],
+                    // Blob-upload container allowlist (S3 ingress): empty ⇒ deny-all.
+                    &[],
                     // Per-guest secret allowlist (task #492): empty ⇒ the whole site pool.
                     &[],
                     0,
@@ -6377,6 +6428,8 @@ mod tests {
                 &[],
                 &[],
                 // Tenant-secret name allowlist (task #493): empty ⇒ deny-all.
+                &[],
+                // Blob-upload container allowlist (S3 ingress): empty ⇒ deny-all.
                 &[],
                 // Per-guest secret allowlist (task #492): empty ⇒ the whole site pool.
                 &[],
@@ -6543,6 +6596,7 @@ mod tests {
             token_claims: None,
             stats_topics: &[],
             tenant_secret_names: &[],
+            upload_containers: &[],
             secret_allowlist: &[],
         };
 

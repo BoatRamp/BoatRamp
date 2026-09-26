@@ -1903,7 +1903,29 @@ pub struct ServeConfig {
     /// nodes). Prefer the `BOATRAMP_S3_INGRESS_SECRET_FILE` env / flag so the path stays out of the
     /// committed config where that matters operationally.
     pub s3_ingress_secret_file: Option<PathBuf>,
+    /// The publicly-reachable base URL an external client targets for the local S3 face — what a
+    /// **minted** upload credential (`boatramp:handlers/blob-upload` guest mint / `boatramp blob
+    /// mint-upload` operator) embeds as its endpoint (a presigned-put URL prefix, or the SDK endpoint
+    /// for temp-credentials). Absent ⇒ derived from `s3_ingress_addr` as `http://<addr>` (fine for a
+    /// same-host dev/test loop; set it explicitly to the TLS-terminated public URL in production).
+    /// Only consulted when guest/operator upload minting is wired (`blob-upload` feature + the face
+    /// enabled).
+    pub s3_ingress_public_url: Option<String>,
+    /// Operator ceiling (seconds) on a minted upload credential's TTL — a guest/operator can only
+    /// request a SHORTER lifetime (the mint clamps to this). Absent ⇒ a conservative default
+    /// ([`DEFAULT_S3_INGRESS_MINT_MAX_TTL_SECS`]). A `0` disables minting entirely (the binding is
+    /// never attached).
+    pub s3_ingress_mint_max_ttl_secs: Option<u64>,
+    /// Operator ceiling (bytes) on a minted credential's `max_bytes` constraint — a guest can only
+    /// request a SMALLER cap (clamped to this). Absent ⇒ no host-side max-bytes clamp (the per-container
+    /// ceiling at the face still applies).
+    pub s3_ingress_mint_max_bytes: Option<u64>,
 }
+
+/// The default operator ceiling on a minted S3 upload credential's TTL when
+/// `[serve].s3_ingress_mint_max_ttl_secs` is unset: 1 hour — long enough for a browser UGC upload or a
+/// bulk-agent burst, short enough to bound a leaked short-lived credential.
+pub const DEFAULT_S3_INGRESS_MINT_MAX_TTL_SECS: u64 = 3600;
 
 /// `[serve.console]` — the embedded web console (a Wasm SPA baked into the
 /// binary with the `console` build feature). Opt-in: the static shell holds no

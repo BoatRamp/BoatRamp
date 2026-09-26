@@ -784,6 +784,16 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
             &options,
             serve_cfg.s3_ingress_secret_file.clone(),
             boatramp_server::s3_ingress::config::Deployment::SingleNode,
+            #[cfg(feature = "blob-upload")]
+            &handlers,
+            #[cfg(feature = "blob-upload")]
+            serve_cfg.s3_ingress_public_url.clone(),
+            #[cfg(feature = "blob-upload")]
+            serve_cfg
+                .s3_ingress_mint_max_ttl_secs
+                .unwrap_or(boatramp_node::config::DEFAULT_S3_INGRESS_MINT_MAX_TTL_SECS),
+            #[cfg(feature = "blob-upload")]
+            serve_cfg.s3_ingress_mint_max_bytes,
         )?;
     }
     let serve_result = match args.tls {
@@ -911,6 +921,7 @@ fn spawn_http_redirect(
 /// spawns the listener on its OWN port — a separate SigV4 auth surface that never reaches the
 /// control-plane router or `serve_by_host`. Requires auth to be enabled (the face verifies fleet-signed
 /// session tokens against the trust anchor); with auth disabled the face is refused.
+#[allow(clippy::too_many_arguments)]
 fn spawn_s3_ingress(
     addr: SocketAddr,
     deploy: DeployStore,
@@ -918,6 +929,13 @@ fn spawn_s3_ingress(
     options: &boatramp_server::ServerOptions,
     secret_file: Option<PathBuf>,
     deployment: boatramp_server::s3_ingress::config::Deployment,
+    // Guest/operator upload-mint wiring (M3): the runtime to register the mint config on (its
+    // `session_signer` mints the session token), plus the public endpoint + operator ceilings. Only
+    // used with the `blob-upload` feature; ignored otherwise.
+    #[cfg(feature = "blob-upload")] handlers: &boatramp_server::HandlerRuntime,
+    #[cfg(feature = "blob-upload")] public_url: Option<String>,
+    #[cfg(feature = "blob-upload")] mint_max_ttl_secs: u64,
+    #[cfg(feature = "blob-upload")] mint_max_bytes: Option<u64>,
 ) -> Result<()> {
     use boatramp_server::s3_ingress::listener;
 
@@ -928,6 +946,20 @@ fn spawn_s3_ingress(
     })?;
     let secret = listener::load_ingress_secret(deployment, secret_file.as_deref())
         .map_err(|e| Error::S3Ingress(e.to_string()))?;
+    // Wire guest/operator upload minting: the minter shares the SAME secret the face verifies under
+    // (a clone, never a re-generate — a re-load would give a different single-node ephemeral root), and
+    // targets the operator's public endpoint (else derived from the bind addr). Deny-by-default:
+    // without this the `blob-upload` binding is never attached and a granted guest's `mint` fails.
+    #[cfg(feature = "blob-upload")]
+    if mint_max_ttl_secs > 0 {
+        let endpoint_base = public_url.unwrap_or_else(|| format!("http://{addr}"));
+        handlers.set_blob_upload_minting(boatramp_server::blob_upload_minter::mint_config(
+            secret.clone(),
+            endpoint_base,
+            mint_max_ttl_secs,
+            mint_max_bytes,
+        ));
+    }
     let guard = Arc::new(boatramp_server::UploadGuard::new(options.limits.clone()));
     let state = Arc::new(listener::build_state(public_key, secret, deploy, guard));
     tokio::spawn(async move {
@@ -1693,6 +1725,16 @@ async fn run_cluster(
             &options,
             cluster_serve_cfg.s3_ingress_secret_file.clone(),
             boatramp_server::s3_ingress::config::Deployment::MultiNode,
+            #[cfg(feature = "blob-upload")]
+            &handlers,
+            #[cfg(feature = "blob-upload")]
+            cluster_serve_cfg.s3_ingress_public_url.clone(),
+            #[cfg(feature = "blob-upload")]
+            cluster_serve_cfg
+                .s3_ingress_mint_max_ttl_secs
+                .unwrap_or(boatramp_node::config::DEFAULT_S3_INGRESS_MINT_MAX_TTL_SECS),
+            #[cfg(feature = "blob-upload")]
+            cluster_serve_cfg.s3_ingress_mint_max_bytes,
         )?;
     }
     let serve_result = match args.tls {
