@@ -190,6 +190,7 @@ fn resource_type(resource: Resource) -> &'static str {
         Resource::Project => "Project",
         Resource::Secrets => "Secrets",
         Resource::Blobs => "Blobs",
+        Resource::BlobUpload => "BlobUpload",
         Resource::Tokens => "Tokens",
         Resource::Certs => "Certs",
         Resource::Cache => "Cache",
@@ -249,9 +250,13 @@ fn resource_entity(required: &Right) -> Result<(EntityUid, Entity), Box<dyn Erro
             );
             (name, a)
         }
-        // Both project-target-scoped: keyed + `name`-attributed by the project, so
-        // the shared `RoleTarget` guard (`…_sites.contains(resource.name)`) matches.
-        Resource::Project | Resource::Secrets => {
+        // Target-scoped, keyed + `name`-attributed by the raw grant target, so the
+        // shared `RoleTarget` guard (`…_sites.contains(resource.name)`) matches:
+        // `Project`/`Secrets` by the project `"<project>"`, `BlobUpload` by the
+        // container triple `"<project>/<site>/<container>"`. (`BlobUpload` is granted
+        // only to `admin` today — an `AnyTarget` template with no guard — but keying
+        // it here means a future target-scoped grant of it authorizes correctly.)
+        Resource::Project | Resource::Secrets | Resource::BlobUpload => {
             let name = required.target.clone().unwrap_or_default();
             let mut a = HashMap::new();
             a.insert(
