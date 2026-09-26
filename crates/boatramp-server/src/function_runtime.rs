@@ -1097,6 +1097,63 @@ pub(super) async fn build_function_bindings(
             granted("tenant-secrets:admin"),
         );
     }
+    // Guest blob-upload minting for a STANDALONE top-level function (`boatramp:handlers/blob-upload`,
+    // S3 external ingress). A site handler mints for its own host-routed site (`build_bindings`); a
+    // standalone function has no single resolved site, so it names one in its config
+    // (`blob_upload_site`) — HOST-FORCED, never guest-supplied: the WIT surface still carries no
+    // project/site parameter, and the guest can only name a container/key|prefix/perms/constraints/ttl.
+    // The project is host-forced from the (host-routed) invocation `project`. Deny-by-default; the
+    // binding is attached only when:
+    //   - a `blob-upload:*` right is granted AND the mint config + a minter are wired (same as the
+    //     site path), AND
+    //   - `blob_upload_site` names a site that actually EXISTS in this function's project (the
+    //     cluster-uniform `site_pointer_exists` KV probe). An unset or cross-/non-existent site ⇒ no
+    //     binding, so every `mint` fails closed with `no-resolved-site`.
+    // The credential then lands objects at `hblob/{project-qualified-site}/{container}/{key}` — the
+    // same prefix the guest `compat::blob` read path serves — so nothing new is invented. The
+    // `upload_containers` allowlist + TTL/max-bytes clamps + the write/multipart right split all apply
+    // exactly as on the site path.
+    #[cfg(feature = "blob-upload")]
+    if (granted("blob-upload:write") || granted("blob-upload:multipart"))
+        && let Some(cfg) = inner.blob_upload_config.get()
+        && let Some(declared_site) = config.blob_upload_site.as_deref()
+        // Validate the config-declared site belongs to the host-forced project (host-side, cluster-
+        // uniform KV probe of the site pointer). Absent / cross-project / non-existent ⇒ fail closed
+        // (no binding), so `mint` returns `no-resolved-site` — never a credential for a site the
+        // guest's own project does not own.
+        && boatramp_core::deploy::site_pointer_exists(inner.kv.as_ref(), project, declared_site)
+            .await
+            .unwrap_or(false)
+        // Prefer a wired cloud minter (M4); else the local-face minter (needs the fleet signer). Both
+        // are the SAME `BlobUploadMinter` seam — the binding still host-forces project+site + clamps.
+        && let Some(minter) = inner
+            .blob_upload_cloud_minter
+            .get()
+            .cloned()
+            .or_else(|| {
+                inner.session_signer.get().map(|signer| {
+                    std::sync::Arc::new(crate::blob_upload_minter::ServerBlobUploadMinter {
+                        signer: signer.clone(),
+                        secret: cfg.secret.clone(),
+                        config: cfg.face.clone(),
+                    })
+                        as std::sync::Arc<dyn boatramp_handlers::BlobUploadMinter>
+                })
+            })
+    {
+        bindings = bindings.with_blob_upload(
+            project.as_str(),
+            // The site is HOST-FORCED from the function's own config (`blob_upload_site`), validated
+            // above to exist in this project — never guest-supplied. A guest can only narrow within it.
+            Some(declared_site.to_string()),
+            minter,
+            cfg.max_ttl_secs,
+            cfg.max_bytes_ceiling,
+            config.upload_containers.clone(),
+            granted("blob-upload:write"),
+            granted("blob-upload:multipart"),
+        );
+    }
     // Gap 3: `tenancy::present-token` — an emitter that verified a tenant credential IN-GUEST hands
     // it to the host, which RE-verifies it against this function's declared `token_claims` + `token`
     // source and seals the tenant onto the producer-context cell (so a subsequent `emit::message`
@@ -2776,6 +2833,265 @@ mod gap3_tests {
             cell.lock().unwrap().clone(),
             None,
             "message 2 must not inherit message 1's presented tenant (no cross-message leak)"
+        );
+    }
+}
+
+/// Standalone-function blob-upload minting (S3 external ingress): a top-level function has no single
+/// host-routed site, so it names one in its config (`blob_upload_site`). These tests drive the REAL
+/// [`build_function_bindings`] path — the same one a guest sees — and assert:
+///   - a valid `blob_upload_site` that EXISTS in the function's host-forced project ⇒ the `blob-upload`
+///     binding is attached with the project + site HOST-FORCED (a mint's session token carries them,
+///     the WIT surface has no project/site parameter);
+///   - `blob_upload_site` unset ⇒ NO binding (fail-closed `no-resolved-site`);
+///   - `blob_upload_site` naming a site that does NOT exist in the project ⇒ NO binding (the
+///     cross-/non-existent-site case, fail-closed);
+///   - the project is host-forced from the invocation, never the config-declared site's home — a
+///     function in project `shop` mints only under `hblob/shop/…`.
+#[cfg(all(test, feature = "handlers", feature = "blob-upload"))]
+mod blob_upload_function_tests {
+    use super::*;
+    use crate::tests::MemStorage;
+    use boatramp_core::cose::{LocalSigner, Signer, TokenAlg, verify_s3_session};
+    use boatramp_core::deploy::DeployStore;
+    use boatramp_core::function::FunctionConfig;
+    use boatramp_core::kv::{KvStore, MemoryKv};
+    use boatramp_handlers::{HandlerEngine, Limits, UploadConstraints, UploadPerm, UploadTarget};
+
+    /// A fixed 32-byte ingress root so the minter + a verify share the same derived-secret material.
+    const ROOT: [u8; 32] = [0x3c; 32];
+
+    /// Wire a runtime with the blob-upload mint config + a fleet signer, and deploy the given
+    /// `(project, site)` pairs so their site pointers exist (what `site_pointer_exists` probes).
+    /// Returns the runtime, deploy store, and the signer (for verifying a minted token).
+    async fn runtime_with_sites(
+        sites: &[(&str, &str)],
+    ) -> (HandlerRuntime, DeployStore, Arc<dyn Signer>) {
+        use boatramp_core::config::{HandlersSiteConfig, SiteConfig};
+
+        let storage = Arc::new(MemStorage::default());
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let deploy = DeployStore::new(storage.clone(), kv.clone());
+
+        // A deployed site = a written site-config pointer (`project/<proj>/site/<site>`).
+        for (project, site) in sites {
+            deploy
+                .set_site_config(
+                    ProjectRef::new(project),
+                    site,
+                    &SiteConfig {
+                        handlers: Some(HandlersSiteConfig {
+                            enabled: true,
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
+        let rt = HandlerRuntime::new(engine, kv, storage, None, None);
+        let signer: Arc<dyn Signer> = Arc::new(LocalSigner::generate(TokenAlg::Es256));
+        rt.set_session_signer(signer.clone());
+        rt.set_blob_upload_minting(crate::blob_upload_minter::mint_config(
+            crate::s3_ingress::credential::S3IngressSecret::from_bytes(&ROOT).unwrap(),
+            "http://127.0.0.1:9000".into(),
+            600,             // TTL ceiling
+            Some(1_000_000), // max-bytes ceiling
+        ));
+        (rt, deploy, signer)
+    }
+
+    /// A standalone function config that imports `blob-upload:write`, allows the `photos` container,
+    /// and names `blob_upload_site` (or `None`).
+    fn fn_config(blob_upload_site: Option<&str>) -> FunctionConfig {
+        FunctionConfig {
+            imports: vec!["blob-upload:write".into()],
+            upload_containers: vec!["photos".into()],
+            blob_upload_site: blob_upload_site.map(str::to_owned),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_declared_site_that_exists_in_the_project_mints_with_project_and_site_host_forced() {
+        // The function runs in project `shop` and declares `blob_upload_site = "blog"`, which is a
+        // deployed site in `shop`. The binding is attached; a mint's session token carries the
+        // host-forced (shop, blog) — the guest named neither.
+        let (rt, _deploy, signer) = runtime_with_sites(&[("shop", "blog")]).await;
+        let inner = rt.inner.as_ref().unwrap();
+        let config = fn_config(Some("blog"));
+
+        let bindings = build_function_bindings(
+            inner,
+            ProjectRef::new("shop"),
+            "shop/fn/uploader",
+            "fn/uploader",
+            &config,
+            0,
+            &FnTenant::Background,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("bindings build");
+
+        let binding = bindings
+            .blob_upload()
+            .expect("a valid, existing declared site attaches the blob-upload binding");
+        let creds = binding
+            .mint(
+                "photos",
+                UploadTarget::Key("avatars/u.jpg".into()),
+                vec![UploadPerm::Put],
+                UploadConstraints::default(),
+                300,
+            )
+            .await
+            .expect("an in-allowlist put mint succeeds");
+        // A single-key/put mint returns a presigned PUT whose URL targets the container/key path-style.
+        let url = match &creds {
+            boatramp_handlers::MintedCredentials::PresignedPut(p) => p.url.clone(),
+            other => panic!("expected a presigned-put for a single-key/put mint, got {other:?}"),
+        };
+        assert!(
+            url.contains("/photos/avatars/u.jpg"),
+            "the presigned URL targets the container/key path-style: {url}"
+        );
+
+        // A prefix/multipart mint returns temp-credentials with a session token; assert the
+        // host-forced scope directly on that shape (a fresh multipart-capable binding).
+        let multipart_config = FunctionConfig {
+            imports: vec!["blob-upload:multipart".into()],
+            upload_containers: vec!["photos".into()],
+            blob_upload_site: Some("blog".into()),
+            ..Default::default()
+        };
+        let mp_bindings = build_function_bindings(
+            inner,
+            ProjectRef::new("shop"),
+            "shop/fn/uploader",
+            "fn/uploader",
+            &multipart_config,
+            0,
+            &FnTenant::Background,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("bindings build");
+        let mp = mp_bindings
+            .blob_upload()
+            .expect("multipart binding attached");
+        let mp_creds = mp
+            .mint(
+                "photos",
+                UploadTarget::Prefix("ingest".into()),
+                vec![UploadPerm::Multipart],
+                UploadConstraints {
+                    require_sha256: true,
+                    ..Default::default()
+                },
+                300,
+            )
+            .await
+            .expect("a prefix/multipart mint succeeds");
+        let token = match &mp_creds {
+            boatramp_handlers::MintedCredentials::TempCredentials(t) => t.session_token.clone(),
+            other => panic!("expected temp-credentials for a prefix/multipart mint, got {other:?}"),
+        };
+        let session = verify_s3_session(&token, &signer.public_key(), 0).expect("token verifies");
+        assert_eq!(
+            session.scope.project, "shop",
+            "project host-forced from the invocation (the guest never named it)"
+        );
+        assert_eq!(
+            session.scope.site, "blog",
+            "site host-forced from the function's config-declared, project-validated blob_upload_site"
+        );
+        assert_eq!(session.scope.container, "photos");
+    }
+
+    #[tokio::test]
+    async fn an_unset_blob_upload_site_attaches_no_binding() {
+        // No `blob_upload_site` ⇒ a standalone function has no single resolved site ⇒ fail-closed: no
+        // binding is attached, so every `mint` is `no-resolved-site` / `access-denied`.
+        let (rt, _deploy, _signer) = runtime_with_sites(&[("shop", "blog")]).await;
+        let inner = rt.inner.as_ref().unwrap();
+        let config = fn_config(None);
+
+        let bindings = build_function_bindings(
+            inner,
+            ProjectRef::new("shop"),
+            "shop/fn/uploader",
+            "fn/uploader",
+            &config,
+            0,
+            &FnTenant::Background,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("bindings build");
+        assert!(
+            bindings.blob_upload().is_none(),
+            "an unset blob_upload_site must not attach the mint binding (fail-closed)"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_declared_site_absent_from_the_project_attaches_no_binding() {
+        // `blob_upload_site = "blog"` but `blog` exists only in a DIFFERENT project (`other`), not in
+        // this function's host-forced project (`shop`). The `site_pointer_exists(shop, blog)` probe
+        // fails ⇒ no binding. A function can never mint for a site outside its own project.
+        let (rt, _deploy, _signer) = runtime_with_sites(&[("other", "blog")]).await;
+        let inner = rt.inner.as_ref().unwrap();
+        let config = fn_config(Some("blog"));
+
+        let bindings = build_function_bindings(
+            inner,
+            ProjectRef::new("shop"),
+            "shop/fn/uploader",
+            "fn/uploader",
+            &config,
+            0,
+            &FnTenant::Background,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("bindings build");
+        assert!(
+            bindings.blob_upload().is_none(),
+            "a site that does not exist in the function's own project must not attach the binding \
+             (cross-/non-existent-site fail-closed)"
+        );
+
+        // And a site that exists in NEITHER project is likewise refused.
+        let ghost = fn_config(Some("ghost-site"));
+        let ghost_bindings = build_function_bindings(
+            inner,
+            ProjectRef::new("shop"),
+            "shop/fn/uploader",
+            "fn/uploader",
+            &ghost,
+            0,
+            &FnTenant::Background,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("bindings build");
+        assert!(
+            ghost_bindings.blob_upload().is_none(),
+            "a non-existent site must not attach the binding (fail-closed)"
         );
     }
 }
