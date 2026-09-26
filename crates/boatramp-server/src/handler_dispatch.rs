@@ -95,7 +95,17 @@ pub(super) async fn dispatch_handler(
     // (not passed through), so no chunked or oversized request can bypass the guard. Only
     // an upload/form POST (`multipart/form-data`, `x-www-form-urlencoded`) — which carries
     // no inspectable query — passes through untouched.
-    if let Some(gql) = site_handlers.graphql.as_ref().filter(|g| g.enabled) {
+    // The GraphQL edge (query guard, federation / data-connector planner, and the GraphiQL
+    // explorer) is a property of the graphql ENDPOINT ROUTE — not a site-wide interceptor.
+    // Gating it on "the matched handler IS the graphql route" keeps every other declared
+    // guest route (OAuth `/authorize`, `/jwks`, redirect starts) reachable regardless of the
+    // request's `Accept` — a browser always sends `Accept: text/html`, which otherwise
+    // shadowed the guest handler with the IDE. Endpoint route defaults to `/graphql`.
+    if let Some(gql) = site_handlers
+        .graphql
+        .as_ref()
+        .filter(|g| g.enabled && handler.route == g.route.as_deref().unwrap_or("/graphql"))
+    {
         // GraphiQL explorer: a browser GET (Accept: text/html) gets the IDE, which posts
         // queries back to the same URL.
         if gql.graphiql && request.method() == Method::GET {
