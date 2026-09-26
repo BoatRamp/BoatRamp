@@ -999,6 +999,37 @@ jobs:
             || { echo "::error::B10 async-shard battery did not run all 8 gates (silent skip or a failure)" >&2; exit 1; }
           grep -q 'ASYNC-SHARD NODE-LOSS OK' async-shard.log \
             || { echo "::error::B10 node-loss gate never reached its marker (a double-execution or stranding regression)" >&2; exit 1; }
+      # #499: a deploy-time compile MUST NOT stall a concurrent control-plane request on a single-
+      # worker runtime. The deploy-time subgraph introspection served the pending component, running
+      # the several-hundred-ms Cranelift compile INLINE on the tokio worker; on a fly.io shared-cpu-1x
+      # machine (1 core = 1 worker) that starves the executor so the next request (e.g. /healthz)
+      # can't be polled and crosses fly's ~10s edge timeout → 502. The fix warms the compile OFF the
+      # worker (precompile_gated / block_in_place). This gate runs on a 1-worker multi-thread runtime:
+      # a "healthz" responder answers pings while a REAL engine compile batch runs; healthz must stay
+      # responsive (< 2s, well under fly's 10s). Mutation-verified in the test doc-comment: setting
+      # BOATRAMP_499_INLINE_COMPILE_MUTATION=1 runs the SAME compiles inline (the pre-fix behaviour)
+      # and blows the bound. A regression that moves the deploy compile back onto the worker fails
+      # the merge. (Confirmed here: the env-set run also fails the bound — the gate is not hollow.)
+      - name: deploy-does-not-stall-healthz gate marker (#499)
+        run: |
+          set -eo pipefail
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-server \
+            --features handlers --test conformance deploy_does_not_stall_healthz_on_a_single_worker -- --nocapture 2>&1 | tee deploy-502.log
+          grep -qE 'test result: ok\. 1 passed' deploy-502.log \
+            || { echo "::error::#499 deploy-stall gate did not run (silent skip or a failure)" >&2; exit 1; }
+          grep -q 'DEPLOY DOES-NOT-STALL-HEALTHZ OK' deploy-502.log \
+            || { echo "::error::#499 gate never reached its marker (the deploy-time compile is starving the single worker again)" >&2; exit 1; }
+          # Mutation guard: the SAME test with the inline-compile mutation MUST fail the latency bound
+          # (proving the gate is sensitive to the fix, not hollow). We invert the exit code so a
+          # PASS-under-mutation (a hollow gate) fails the merge.
+          if BOATRAMP_499_INLINE_COMPILE_MUTATION=1 cargo-zigbuild test --target x86_64-unknown-linux-musl \
+            -p boatramp-server --features handlers --test conformance \
+            deploy_does_not_stall_healthz_on_a_single_worker -- --nocapture > deploy-502-mutation.log 2>&1; then
+            echo "::error::#499 gate is HOLLOW — it passed even with the inline-compile mutation (the off-runtime offload is not what keeps healthz responsive)" >&2
+            exit 1
+          else
+            echo "#499 mutation verified: the inline-compile mutation fails the healthz latency bound as expected."
+          fi
 
   deny:
     name: cargo-deny
