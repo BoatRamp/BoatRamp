@@ -93,6 +93,20 @@ blob-upload-azure = [
 # Convenience: all cloud blob-upload minters at once.
 blob-upload-cloud = ["blob-upload-aws", "blob-upload-gcs", "blob-upload-azure"]
 
+# TEST-ONLY, NEVER SHIPPED: the mutation seams that anti-hollow-verify the `S3 INGRESS SCOPED+SIGV4 OK`
+# live gate (M5). When this feature is on AND the matching `BOATRAMP_S3INGRESS_MUTATE_*` env var is set,
+# a single S3-ingress security choke point (the scope check, the SigV4 verify, the sha256 content-
+# address verify, or the create-only overwrite precondition) is NEUTERED — reproducing exactly what a
+# real regression at that choke point would do — so the gate can prove each check actually FAILS the
+# gate when broken (a hollow gate would pass even neutered). Implies only `blob-upload` (the LOCAL fs
+# face + minter), so the fs-face invariants (1-8 + guest read-through) build+run on the lean musl gate
+# lane WITHOUT the heavy cloud SDK stack. Invariant 9's cloud-policy-builder tightness assertions are
+# additionally compiled when `blob-upload-cloud` is ALSO on (they are pure functions — the gate runs
+# them on the host toolchain, no live cloud). The seams are `#[cfg(feature = "s3-ingress-gate-mutation")]`
+# so they are COMPILED OUT of every real build — zero production surface. CI runs the gate once clean
+# (must pass) then once per mutation (must fail).
+s3-ingress-gate-mutation = ["blob-upload"]
+
 # The duplex/resumable session capability (`boatramp:handlers/session`, PLAN-session-primitive):
 # a long-lived, client-addressable, bidirectional, resumable channel the host drives via
 # event-driven re-entry over the durable async lane. Implies `handlers`. Experimental.

@@ -546,6 +546,66 @@ async fn read_created_at(storage: &dyn Storage, marker: &str) -> Result<u64, Str
     }
 }
 
+/// **Test-support / gate helper (M5).** Read an object back through the REAL guest `wasi:blobstore`
+/// read-path — the same `container.get-data` → `incoming-value.consume` the guest `compat::blob.get`
+/// uses — over a [`BlobBinding`] confined to `hblob/{site}/`. Proves an object the S3-ingress face
+/// landed at `hblob/{site}/{container}/{key}` is genuinely guest-readable (PLAN §11 "guest
+/// read-through"), not merely present in the raw store.
+///
+/// This drives the actual host binding (`BlobHost::get_data`, which composes the
+/// `hblob/{site}/{container}/` prefix + the object name and reads via [`Storage::get_range`]), so it
+/// exercises the production read composition — a prefix/isolation regression would break it exactly as
+/// it would break a real guest. `#[doc(hidden)]` — for the live gate + integration tests only.
+#[doc(hidden)]
+pub async fn read_object_through_guest_binding(
+    storage: Arc<dyn Storage>,
+    site: &str,
+    container: &str,
+    object: &str,
+) -> Result<Vec<u8>, String> {
+    use blobstore::container::HostContainer as _;
+    use blobstore::types::HostIncomingValue as _;
+    let binding = BlobBinding {
+        storage,
+        prefix: format!("hblob/{site}/"),
+        max_bytes: 0,
+    };
+    let mut table = ResourceTable::new();
+    let mut host = BlobHost::new(&mut table, Some(&binding));
+    // Build a container handle exactly as `get_container` does (prefix `hblob/{site}/{container}/`) —
+    // without the marker probe, since the ingress face lands raw objects (a guest that already holds an
+    // open container handle reads them the same way).
+    let handle = host
+        .table
+        .push(Container {
+            storage: binding.storage.clone(),
+            prefix: format!("hblob/{site}/{container}/"),
+            name: container.to_string(),
+        })
+        .map_err(estr)?;
+    let rep = handle.rep();
+    // Read the whole object via the real ranged get-data path (offsets inclusive: `0..=len-1`).
+    let size = binding
+        .storage
+        .head(&format!("hblob/{site}/{container}/{object}"))
+        .await
+        .map_err(estr)?
+        .size
+        .unwrap_or(0);
+    if size == 0 {
+        // A present-but-empty object: consume a zero-length read rather than an inverted range.
+        let iv = host
+            .get_data(Resource::new_own(rep), object.to_string(), 0, 0)
+            .await?;
+        let bytes = host.incoming_value_consume_sync(iv)?;
+        return Ok(if bytes.len() == 1 { Vec::new() } else { bytes });
+    }
+    let iv = host
+        .get_data(Resource::new_own(rep), object.to_string(), 0, size - 1)
+        .await?;
+    host.incoming_value_consume_sync(iv)
+}
+
 /// Add the `wasi:blobstore` interfaces to `linker`, resolving the per-invocation
 /// [`BlobHost`] view via `host`.
 pub fn add_to_linker<T: Send + 'static>(

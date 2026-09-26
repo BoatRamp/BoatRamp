@@ -41,10 +41,20 @@ pub mod config;
 pub mod credential;
 pub mod error;
 pub mod face;
+pub mod gate_mutation;
 pub mod keypath;
 pub mod listener;
 pub mod multipart;
 pub mod sigv4;
 
+// The mutation-verified `S3 INGRESS SCOPED+SIGV4 OK` live gate (M5). Compiled only under the gate lane
+// feature AND `cfg(test)` (it is a `#[tokio::test]` battery + harness that exists solely to run under
+// `cargo test`); the mutation SEAMS it drives live in `gate_mutation` + the product choke points and are
+// compiled whenever the feature is on.
+#[cfg(all(test, feature = "s3-ingress-gate-mutation"))]
+mod gate;
+
+// The in-memory `MapStorage` test double is used by both the `#[cfg(test)]` e2e tests and the gate
+// battery; both are `cfg(test)`, so a plain `#[cfg(test)]` suffices.
 #[cfg(test)]
 pub(crate) mod test_support;
