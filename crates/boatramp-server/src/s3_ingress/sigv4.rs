@@ -1176,8 +1176,9 @@ mod tests {
 
         // Independently compute each expected chunk signature via the same chain the verifier uses,
         // then feed those to the verifier — this proves the chain construction + advancement, and the
-        // tamper checks prove fail-closed behavior. (The AWS-documented final values are asserted in
-        // `aws_chunked_matches_documented_vector` below.)
+        // tamper checks prove fail-closed behavior. (The AWS-documented chunk-data hash constant is
+        // asserted in `aws_chunked_chunk_data_hash_matches_the_documented_constant` below; a full
+        // external seed→per-chunk-signature vector is scheduled for the M5 differential-fuzz gate.)
         let mut expected_prev = seed.to_string();
         let mut expected_sigs = Vec::new();
         for data in [&chunk1, &chunk2, &chunk3] {

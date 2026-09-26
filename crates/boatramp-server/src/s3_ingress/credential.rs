@@ -155,17 +155,29 @@ impl S3IngressSecret {
     }
 }
 
-/// The HKDF-SHA256 core: `salt = access_key_id ‖ session_cti`, `info = HKDF_INFO`, keyed by `root`.
-/// Both the public id AND the token's `cti` are in the salt, so the secret is bound to that exact
-/// credential (a different id or a different token ⇒ a different, non-transferable secret).
+/// The HKDF-SHA256 core: `salt = len(access_key_id) ‖ access_key_id ‖ len(session_cti) ‖ session_cti`
+/// (each length a 4-byte big-endian prefix), `info = HKDF_INFO`, keyed by `root`. Both the public id
+/// AND the token's `cti` are in the salt, so the secret is bound to that exact credential (a different
+/// id or a different token ⇒ a different, non-transferable secret).
+///
+/// The length-prefix framing is a security invariant, NOT cosmetic: a bare `akid ‖ cti` concatenation
+/// is ambiguous — two distinct pairs whose byte-concatenations coincide (e.g. `("BRUPAB","CD0011")`
+/// and `("BRUPABCD","0011")`) would derive the SAME `secret_access_key`, a credential-forgery
+/// primitive. As wired both fields are fixed-width, but this primitive must not rely on that unstated
+/// caller convention — the explicit boundary makes distinct inputs derive distinct secrets regardless
+/// of field widths (proven by `salt_framing_is_unambiguous`).
 fn derive_raw(
     root: &[u8; INGRESS_SECRET_LEN],
     access_key_id: &str,
     session_cti: &str,
 ) -> Result<[u8; DERIVED_SECRET_LEN], CredentialError> {
-    let mut salt = Vec::with_capacity(access_key_id.len() + session_cti.len());
-    salt.extend_from_slice(access_key_id.as_bytes());
-    salt.extend_from_slice(session_cti.as_bytes());
+    let akid = access_key_id.as_bytes();
+    let cti = session_cti.as_bytes();
+    let mut salt = Vec::with_capacity(8 + akid.len() + cti.len());
+    salt.extend_from_slice(&(akid.len() as u32).to_be_bytes());
+    salt.extend_from_slice(akid);
+    salt.extend_from_slice(&(cti.len() as u32).to_be_bytes());
+    salt.extend_from_slice(cti);
     let prk = hkdf::Salt::new(hkdf::HKDF_SHA256, &salt).extract(root);
     let okm = prk
         .expand(&[HKDF_INFO], MyKeyLen)
@@ -185,10 +197,11 @@ impl hkdf::KeyType for MyKeyLen {
     }
 }
 
-/// Generate a fresh public `access_key_id`: `BRUP` + 20 base32 (Crockford, no padding) chars over 100
-/// random bits. Opaque + collision-safe; the prefix lets the face fast-reject a foreign id.
+/// Generate a fresh public `access_key_id`: `BRUP` + 21 base32 (Crockford, no padding) chars over 104
+/// random bits (a fixed 25-char id). Opaque + collision-safe; the prefix lets the face fast-reject a
+/// foreign id.
 pub fn generate_access_key_id() -> Result<String, CredentialError> {
-    let mut raw = [0u8; 13]; // 104 bits → 21 base32 chars (we take a fixed slice below)
+    let mut raw = [0u8; 13]; // 104 bits → 21 Crockford base32 chars (no padding, no truncation)
     SystemRandom::new()
         .fill(&mut raw)
         .map_err(|_| CredentialError::Rng)?;
@@ -281,13 +294,18 @@ mod tests {
             b.derive_secret(AKID, CTI).unwrap()
         );
 
-        // (2) Mutating the HKDF `info` domain string ⇒ a different secret. We derive by hand with a
-        //     tweaked info and confirm it differs from the production derivation.
+        // (2) Mutating the HKDF `info` domain string ⇒ a different secret. We derive by hand with the
+        //     SAME (length-prefixed) salt framing as `derive_raw` but a tweaked info, so this isolates
+        //     the info variable, and confirm it differs from the production derivation.
         let real = derive_raw(&ROOT_A, AKID, CTI).unwrap();
         let salt = {
+            let akid = AKID.as_bytes();
+            let cti = CTI.as_bytes();
             let mut s = Vec::new();
-            s.extend_from_slice(AKID.as_bytes());
-            s.extend_from_slice(CTI.as_bytes());
+            s.extend_from_slice(&(akid.len() as u32).to_be_bytes());
+            s.extend_from_slice(akid);
+            s.extend_from_slice(&(cti.len() as u32).to_be_bytes());
+            s.extend_from_slice(cti);
             s
         };
         let prk = hkdf::Salt::new(hkdf::HKDF_SHA256, &salt).extract(&ROOT_A);
@@ -304,6 +322,21 @@ mod tests {
         // (3) The production info is exactly the pinned v1 string (a change is a breaking, reviewed
         //     event, not a silent drift).
         assert_eq!(HKDF_INFO, b"boatramp-s3-ingress/hmac/v1");
+    }
+
+    #[test]
+    fn salt_framing_is_unambiguous() {
+        // HIGH-1 (M1 security review): the salt must frame (akid, cti) unambiguously. With a bare
+        // `akid ‖ cti` concatenation these two pairs collide (both concatenate to "BRUPABCD0011"),
+        // which would derive the SAME secret_access_key — a credential-forgery primitive. The
+        // length-prefixed framing MUST derive DIFFERENT secrets for them.
+        let s = S3IngressSecret::new(ROOT_A);
+        let a = s.derive_secret("BRUPAB", "CD0011").unwrap();
+        let b = s.derive_secret("BRUPABCD", "0011").unwrap();
+        assert_ne!(
+            a, b,
+            "distinct (akid, cti) pairs whose bare concatenations coincide must derive distinct secrets"
+        );
     }
 
     #[test]
