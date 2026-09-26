@@ -46,6 +46,12 @@
 ))]
 pub mod cloud;
 pub mod local;
+#[cfg(any(
+    feature = "blob-upload-aws",
+    feature = "blob-upload-gcs",
+    feature = "blob-upload-azure"
+))]
+pub mod wiring;
 
 #[cfg(feature = "blob-upload-aws")]
 pub mod aws;

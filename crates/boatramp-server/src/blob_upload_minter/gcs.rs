@@ -72,6 +72,34 @@ pub trait SubjectTokenSource: Send + Sync {
     async fn access_token(&self) -> Result<String, String>;
 }
 
+/// The production [`SubjectTokenSource`]: the node's Application Default Credentials access token (the
+/// base bearer the CAB exchange downscopes). Resolves ADC once at build; fetches a fresh token per
+/// mint (the auth crate caches internally).
+pub struct AdcSubjectToken {
+    creds: gcs_signer_auth::credentials::AccessTokenCredentials,
+}
+
+impl AdcSubjectToken {
+    /// Resolve ADC into an access-token source. Errors if no ADC is available on the host.
+    pub fn new() -> Result<Self, String> {
+        let creds = gcs_signer_auth::credentials::Builder::default()
+            .build_access_token_credentials()
+            .map_err(|e| format!("GCS ADC access-token credentials: {e}"))?;
+        Ok(Self { creds })
+    }
+}
+
+#[async_trait]
+impl SubjectTokenSource for AdcSubjectToken {
+    async fn access_token(&self) -> Result<String, String> {
+        self.creds
+            .access_token()
+            .await
+            .map(|t| t.token)
+            .map_err(|e| format!("GCS ADC access token: {e}"))
+    }
+}
+
 impl GcsBlobUploadMinter {
     /// Build a minter from a pre-built [`Signer`], an HTTP client, the config, and the subject-token
     /// source. Kept SDK-injectable so the policy/URL construction is unit-testable without live GCP.

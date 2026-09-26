@@ -1920,6 +1920,36 @@ pub struct ServeConfig {
     /// request a SMALLER cap (clamped to this). Absent ⇒ no host-side max-bytes clamp (the per-container
     /// ceiling at the face still applies).
     pub s3_ingress_mint_max_bytes: Option<u64>,
+    /// **Cloud brokering** (M4): when the node's blob backend is a cloud object store (S3/GCS/Azure)
+    /// and this is set, minting brokers a NATIVE scoped credential (STS session policy / signed URL +
+    /// CAB / user-delegation SAS) so the client uploads DIRECTLY to the real store (bytes never transit
+    /// the node) — INSTEAD of the local S3 face. Absent ⇒ the local face is used (an fs/in-memory
+    /// backend, or a cloud backend that re-transits through the local face). See [`S3IngressCloud`].
+    pub s3_ingress_cloud: Option<S3IngressCloud>,
+}
+
+/// `[serve.s3_ingress_cloud]` — the cloud-brokering knobs for the M4 blob-upload minter (which native
+/// credential the mint brokers when the node's blob backend is a cloud object store). Only the fields
+/// for the active blob backend are consulted; a `None` here ⇒ the local S3 face mints.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct S3IngressCloud {
+    /// **AWS**: the IAM role ARN the base credential assumes to broker the scoped session-policy
+    /// credential (`sts:AssumeRole`, the default). Absent AND `aws_use_federation_token = true` ⇒
+    /// `sts:GetFederationToken` is used instead (for an IAM-user base credential).
+    pub aws_role_arn: Option<String>,
+    /// **AWS**: use `sts:GetFederationToken` instead of `AssumeRole` (IAM-user deployments). Requires
+    /// the base credential to be a real IAM user, not itself a session.
+    #[serde(default)]
+    pub aws_use_federation_token: bool,
+    /// **GCS**: the service-account client email whose V4 signed URLs / IAM-signed uploads the minter
+    /// produces (used in the signing scope). Absent ⇒ resolved from ADC.
+    pub gcs_client_email: Option<String>,
+    /// **Azure**: the storage account name (for the SAS signature + the blob URL). Absent ⇒ taken from
+    /// the `azure_account` blob-backend arg.
+    pub azure_account: Option<String>,
+    /// **Azure**: the blob service URL (`https://{account}.blob.core.windows.net/`). Absent ⇒ derived
+    /// from the account name.
+    pub azure_service_url: Option<String>,
 }
 
 /// The default operator ceiling on a minted S3 upload credential's TTL when

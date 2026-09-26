@@ -484,6 +484,15 @@ struct HandlerRuntimeInner {
     /// reused from [`session_signer`](Self::session_signer).
     #[cfg(feature = "blob-upload")]
     blob_upload_config: std::sync::OnceLock<BlobUploadMintConfig>,
+    /// The **cloud** blob-upload minter (M4), set at startup ONLY when the node's blob backend is a
+    /// cloud object store (S3/GCS/Azure) AND that cloud's `blob-upload-*` feature is compiled in. When
+    /// present it is used INSTEAD of the local-face [`ServerBlobUploadMinter`] for both the guest
+    /// binding and the operator mint route — a different `BlobUploadMinter` behind the SAME seam,
+    /// brokering a native scoped credential so the client uploads directly to the real store. Unset ⇒
+    /// the local S3 face minter is used (an fs/in-memory backend). Type-erased so this layer needs no
+    /// cloud SDK. The operator ceilings still come from [`blob_upload_config`](Self::blob_upload_config).
+    #[cfg(feature = "blob-upload")]
+    blob_upload_cloud_minter: std::sync::OnceLock<Arc<dyn boatramp_handlers::BlobUploadMinter>>,
     /// Per-project overrides (Gap 4a) of the resolved tenancy/capability knobs, project name →
     /// resolved knobs (base posture ⊕ the operator's `[security.projects.<p>]` override). Consulted
     /// at each in-project enforcement point via [`HandlerRuntimeInner::project_tenancy_knobs`];
@@ -767,6 +776,8 @@ impl HandlerRuntime {
                 capability_max_ttl_secs: std::sync::OnceLock::new(),
                 #[cfg(feature = "blob-upload")]
                 blob_upload_config: std::sync::OnceLock::new(),
+                #[cfg(feature = "blob-upload")]
+                blob_upload_cloud_minter: std::sync::OnceLock::new(),
                 #[cfg(feature = "handlers")]
                 tenancy_posture_overrides: std::sync::OnceLock::new(),
                 #[cfg(feature = "handlers")]
@@ -1030,6 +1041,24 @@ impl HandlerRuntime {
         }
     }
 
+    /// Wire a **cloud** blob-upload minter (M4) — used INSTEAD of the local-face minter for both the
+    /// guest binding and the operator mint route when the node's blob backend is a cloud object store
+    /// (S3/GCS/Azure). It brokers a native scoped credential (STS session policy / signed URL + CAB /
+    /// user-delegation SAS) so the client uploads directly to the real store. A different
+    /// `BlobUploadMinter` behind the SAME seam — the pre-confined `MintScope` is unchanged, so a cloud
+    /// minter can only shape the returned credential, never widen scope. The operator ceilings still
+    /// come from [`set_blob_upload_minting`](Self::set_blob_upload_minting), which MUST also be called
+    /// (a `0` ceiling there disables minting even with a cloud minter set). No-op on a plain runtime.
+    #[cfg(feature = "blob-upload")]
+    pub fn set_blob_upload_cloud_minter(
+        &self,
+        minter: Arc<dyn boatramp_handlers::BlobUploadMinter>,
+    ) {
+        if let Some(inner) = self.inner.as_ref() {
+            let _ = inner.blob_upload_cloud_minter.set(minter);
+        }
+    }
+
     /// The wired guest/operator blob-upload minter, if minting is enabled (the local S3 face was set
     /// up via [`set_blob_upload_minting`](Self::set_blob_upload_minting) AND the fleet session signer
     /// is present). `None` ⇒ minting is not offered on this node. Used by the operator control-plane
@@ -1040,22 +1069,26 @@ impl HandlerRuntime {
     pub fn blob_upload_minter(
         &self,
     ) -> Option<(
-        crate::blob_upload_minter::ServerBlobUploadMinter,
+        Arc<dyn boatramp_handlers::BlobUploadMinter>,
         u64,
         Option<u64>,
     )> {
         let inner = self.inner.as_ref()?;
         let cfg = inner.blob_upload_config.get()?;
+        // A cloud minter (M4), if wired, takes precedence over the local-face minter — the node's blob
+        // backend is a cloud store, so credentials are brokered natively. Both are the SAME seam; the
+        // operator ceilings come from the config either way.
+        if let Some(cloud) = inner.blob_upload_cloud_minter.get() {
+            return Some((cloud.clone(), cfg.max_ttl_secs, cfg.max_bytes_ceiling));
+        }
         let signer = inner.session_signer.get()?;
-        Some((
-            crate::blob_upload_minter::ServerBlobUploadMinter {
+        let minter: Arc<dyn boatramp_handlers::BlobUploadMinter> =
+            Arc::new(crate::blob_upload_minter::ServerBlobUploadMinter {
                 signer: signer.clone(),
                 secret: cfg.secret.clone(),
                 config: cfg.face.clone(),
-            },
-            cfg.max_ttl_secs,
-            cfg.max_bytes_ceiling,
-        ))
+            });
+        Some((minter, cfg.max_ttl_secs, cfg.max_bytes_ceiling))
     }
 
     /// Wire the project-scoped internal secret store (sealed with the `[secrets]`
