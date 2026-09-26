@@ -64,8 +64,8 @@ use std::ops::ControlFlow;
 
 use sqlparser::ast::{
     Assignment, AssignmentTarget, BinaryOperator, Delete, Expr, FromTable, Ident, Insert,
-    JoinConstraint, JoinOperator, ObjectName, Query, Select, SetExpr, Statement, TableFactor,
-    Value, VisitMut, VisitorMut,
+    JoinConstraint, JoinOperator, ObjectName, Query, Select, SelectItem, SetExpr, Statement,
+    TableFactor, Value, VisitMut, VisitorMut,
 };
 use sqlparser::dialect::{Dialect as SpDialect, MySqlDialect, PostgreSqlDialect, SQLiteDialect};
 use sqlparser::parser::Parser;
@@ -381,7 +381,64 @@ pub fn rewrite_own_write(
             ));
         }
     }
+    // Fail-closed backstop (the write-path analog of the read walk's `pre_visit_table_factor` +
+    // CTE-refusal), resting on sqlparser's exhaustive VisitMut rather than on the per-statement
+    // confiner having reached every position. After the confinement above, walk the WHOLE confined
+    // statement and refuse any un-confinable table source (a TVF, a schema-qualified name, an exotic
+    // source) or a CTE ANYWHERE — including one carried by a future sqlparser field the per-statement
+    // confiner does not yet destructure. A recognised bare base table / derived subquery / nested
+    // join passes (its read-position subqueries were confined above); an unrecognised source is
+    // refused, never silently passed.
+    let mut detector = WriteBackstop;
+    if let ControlFlow::Break(err) = stmt.visit(&mut detector) {
+        return Err(err);
+    }
     Ok(statements[0].to_string())
+}
+
+/// The fail-closed backstop visitor over a confined write. Mirrors the read walk's
+/// [`Rewriter::pre_visit_table_factor`] + CTE refusal exactly, rested on sqlparser's exhaustive
+/// traversal: it visits EVERY `Query` and `TableFactor` reachable in the confined statement and
+/// refuses any un-confinable table source or CTE anywhere — so a read position the per-statement
+/// confiner did not reach (including a future sqlparser field) carrying an exotic / CTE source is
+/// caught here, never left unconfined. (A plain confined base table passes: its per-table tenant
+/// predicate was injected by the confiner / the read walk above.)
+struct WriteBackstop;
+
+impl VisitorMut for WriteBackstop {
+    type Break = TargetRewriteError;
+
+    fn pre_visit_query(&mut self, query: &mut Query) -> ControlFlow<Self::Break> {
+        // A CTE hides a base table under its own name (unresolvable to a confinement) — refuse it
+        // anywhere in the confined statement, exactly as the read walk does.
+        if query.with.is_some() {
+            return ControlFlow::Break(TargetRewriteError::CteNotAllowed);
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_table_factor(
+        &mut self,
+        table_factor: &mut TableFactor,
+    ) -> ControlFlow<Self::Break> {
+        // Belt-and-suspenders identical to the read walk: refuse any un-confinable table source
+        // ANYWHERE in the confined write (a TVF, a schema-qualified name, an exotic source). The
+        // write-target base table and ordinary derived/nested joins pass.
+        match table_factor {
+            TableFactor::Table { args: Some(_), .. } => ControlFlow::Break(
+                TargetRewriteError::UnsupportedTableSource("table-valued function".into()),
+            ),
+            TableFactor::Table { name, .. } if name.0.len() != 1 => ControlFlow::Break(
+                TargetRewriteError::QualifiedTableName(object_name_string(name)),
+            ),
+            TableFactor::Table { .. }
+            | TableFactor::Derived { .. }
+            | TableFactor::NestedJoin { .. } => ControlFlow::Continue(()),
+            other => ControlFlow::Break(TargetRewriteError::UnsupportedTableSource(
+                table_factor_kind(other).into(),
+            )),
+        }
+    }
 }
 
 /// Parse exactly one statement under `dialect` (multi-statement / empty batches refused).
@@ -484,10 +541,33 @@ fn confine_subqueries_in_expr(
     Ok(())
 }
 
+/// Confine every read-position sub-expression carried by a write's `RETURNING` clause through the
+/// SAME read walk — a `RETURNING (SELECT … FROM other)` scalar subquery, an aggregate over a joined
+/// table, etc. — so a `RETURNING` item can never read cross-tenant (the C1 fix). A `Wildcard` /
+/// `QualifiedWildcard` item carries no expression (it projects the write target's own — already
+/// confined — columns) and needs no walk. Applied to each item in place.
+fn confine_returning_items(
+    scope: &OwnScope<'_>,
+    returning: &mut [SelectItem],
+) -> Result<(), TargetRewriteError> {
+    for item in returning.iter_mut() {
+        match item {
+            SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
+                confine_subqueries_in_expr(scope, e)?;
+            }
+            // A bare / qualified `*` projects the (already-confined) write-target columns — no
+            // embedded read position.
+            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => {}
+        }
+    }
+    Ok(())
+}
+
 /// Confine an own/session `UPDATE`: parenthesise the guest `WHERE` and `AND` the tenant bound onto
 /// the target table; force any guest `SET tenant_col = …` back to `<own>` (an UPDATE can never
-/// re-tenant a row); confine any subquery in the SET values / WHERE through the read walk. The target
-/// must be a single bare base table (a joined/qualified/`FROM`-bearing UPDATE is refused).
+/// re-tenant a row); confine any subquery in the SET values / WHERE / RETURNING through the read
+/// walk. The target must be a single bare base table (a joined/qualified/`FROM`-bearing UPDATE is
+/// refused).
 fn confine_own_update(
     stmt: &mut Statement,
     scope: &OwnScope<'_>,
@@ -497,7 +577,10 @@ fn confine_own_update(
         assignments,
         from,
         selection,
-        ..
+        returning,
+        // `or` is a SQLite conflict-resolution keyword (`UPDATE OR REPLACE …`) — a modifier, not a
+        // read position; it carries no sub-expression and cannot widen the tenant bound.
+        or: _,
     } = stmt
     else {
         unreachable!("confine_own_update called on a non-UPDATE");
@@ -550,11 +633,19 @@ fn confine_own_update(
         Some(existing) => and(Expr::Nested(Box::new(existing)), bound),
         None => bound,
     });
+    // Confine any subquery in a RETURNING item (C1): `UPDATE … RETURNING (SELECT … FROM other)` must
+    // not read cross-tenant.
+    if let Some(items) = returning.as_mut() {
+        confine_returning_items(scope, items)?;
+    }
     Ok(())
 }
 
-/// Confine an own/session `DELETE`: parenthesise the guest `WHERE` and `AND` the tenant bound on. The
-/// target must be a single bare base table (a multi-table DELETE / `USING` join is refused).
+/// Confine an own/session `DELETE`: parenthesise the guest `WHERE` and `AND` the tenant bound on;
+/// confine any subquery in a RETURNING item through the read walk. The target must be a single bare
+/// base table (a multi-table DELETE / `USING` join is refused), and a MySQL `ORDER BY`/`LIMIT` on the
+/// DELETE is refused (its sub-expressions are read positions the single-table bound does not reach —
+/// and an ordered/limited confined single-table delete is expressible via the `orm` surface).
 fn confine_own_delete(
     stmt: &mut Statement,
     scope: &OwnScope<'_>,
@@ -567,11 +658,22 @@ fn confine_own_delete(
         from,
         using,
         selection,
-        ..
+        returning,
+        order_by,
+        limit,
     } = del;
     if !tables.is_empty() || using.is_some() {
         return Err(TargetRewriteError::UnsupportedWrite(
             "multi-table / USING DELETE".into(),
+        ));
+    }
+    // C3: a MySQL `DELETE … ORDER BY … LIMIT …` carries read-position sub-expressions (the ORDER BY
+    // keys, the LIMIT expr) the single-table tenant bound does not reach — refuse fail-closed rather
+    // than emit an under-confined delete. A confined single-table ordered/limited delete is
+    // expressible via the typed `orm` surface.
+    if !order_by.is_empty() || limit.is_some() {
+        return Err(TargetRewriteError::UnsupportedWrite(
+            "DELETE with ORDER BY / LIMIT".into(),
         ));
     }
     let relations = match from {
@@ -591,14 +693,27 @@ fn confine_own_delete(
         Some(existing) => and(Expr::Nested(Box::new(existing)), bound),
         None => bound,
     });
+    // Confine any subquery in a RETURNING item (C1): `DELETE … RETURNING (SELECT … FROM other)` must
+    // not read cross-tenant.
+    if let Some(items) = returning.as_mut() {
+        confine_returning_items(scope, items)?;
+    }
     Ok(())
 }
 
 /// Confine an own/session `INSERT`: force-stamp the tenant column in every `VALUES` row (a
-/// guest-supplied tenant is overridden), or, for an `INSERT … SELECT`, confine the source through the
-/// read walk and host-force the projected tenant column. Refuses an upsert `ON CONFLICT DO UPDATE`
-/// (its DO-UPDATE arm would need the same re-tenant guard as an UPDATE — deny-by-default on the raw
-/// path; use the typed `orm` surface), a `DEFAULT VALUES` insert, and an `Unscoped` target.
+/// guest-supplied tenant is overridden) and confine any subquery embedded in a VALUES cell / a
+/// RETURNING item through the read walk, or, for an `INSERT … SELECT`, confine the source through the
+/// read walk and host-force the projected tenant column. Refuses:
+/// - an upsert `ON CONFLICT DO UPDATE` (its DO-UPDATE arm would need the same re-tenant guard as an
+///   UPDATE — deny-by-default on the raw path; use the typed `orm` surface);
+/// - a MySQL `REPLACE INTO` (its implicit DELETE on a PK/unique collision carries no tenant predicate
+///   and could delete a victim's row — route it to the `orm` surface, matching the ON CONFLICT
+///   rationale);
+/// - an INSERT with no explicit column list (a positional INSERT — the host cannot locate the tenant
+///   column positionally to override a guest-supplied value; only an incidental arity mismatch would
+///   error, which is not fail-closed), or a column list naming the tenant column more than once;
+/// - a `DEFAULT VALUES` / partitioned insert, and an `Unscoped` target.
 fn confine_own_insert(
     stmt: &mut Statement,
     scope: &OwnScope<'_>,
@@ -607,45 +722,83 @@ fn confine_own_insert(
     let Statement::Insert(ins) = stmt else {
         unreachable!("confine_own_insert called on a non-INSERT");
     };
-    let Insert {
-        table_name,
-        table_alias,
-        columns,
-        source,
-        on,
-        partitioned,
-        after_columns,
-        ..
-    } = ins;
-    if on.is_some() {
+    // Up-front refusals read `ins` directly (before the field reborrows below) so the
+    // `SetExpr::Select` arm can re-pass `ins` to `confine_insert_select`, and so the RETURNING clause
+    // can be reborrowed (`ins.returning`) after the body match.
+    if ins.replace_into {
+        // MEDIUM: `REPLACE INTO …` parses as an INSERT with `replace_into = true`; on a PK/unique
+        // collision it performs an implicit DELETE with NO tenant predicate — it could delete a
+        // victim tenant's row. Refuse (route to the `orm` surface), matching the ON CONFLICT refusal.
+        return Err(TargetRewriteError::UnsupportedInsert(
+            "REPLACE INTO (implicit delete has no tenant predicate; use the orm surface)".into(),
+        ));
+    }
+    if ins.on.is_some() {
         return Err(TargetRewriteError::UnsupportedInsert(
             "ON CONFLICT / ON DUPLICATE upsert (use the orm surface)".into(),
         ));
     }
-    if partitioned.is_some() || !after_columns.is_empty() {
+    if ins.partitioned.is_some() || !ins.after_columns.is_empty() {
         return Err(TargetRewriteError::UnsupportedInsert(
             "partitioned INSERT".into(),
         ));
     }
-    if table_name.0.len() != 1 {
+    if ins.table_name.0.len() != 1 {
         return Err(TargetRewriteError::BadWriteTarget(object_name_string(
-            table_name,
+            &ins.table_name,
         )));
     }
-    let base = table_name.0[0].value.clone();
+    let base = ins.table_name.0[0].value.clone();
     // Resolve+validate the write target (deny-by-default: undeclared / Unscoped / no-principal).
     let (tenant_col, own_val) = write_target(scope, &base)?;
+    // Now reborrow the mutable fields the body rewrite needs. The remaining `Insert` fields are
+    // non-read-position modifiers (`or`/`ignore`/`priority`/`insert_alias`/`into`/`overwrite`/`table`
+    // and the already-checked `replace_into`/`on`/`partitioned`/`after_columns`/`table_name`): none
+    // carries a sub-expression that could read cross-tenant or widen the tenant stamp.
+    let Insert {
+        table_alias,
+        columns,
+        source,
+        ..
+    } = &mut *ins;
     let _ = table_alias;
     let Some(query) = source.as_deref_mut() else {
         return Err(TargetRewriteError::UnsupportedInsert(
             "INSERT without VALUES/SELECT (e.g. DEFAULT VALUES)".into(),
         ));
     };
-    match query.body.as_mut() {
-        // INSERT … VALUES: force-stamp the tenant column into every row. If the guest already named
-        // the tenant column, override that cell in place (a guest-supplied tenant is discarded);
-        // otherwise append the column + a stamped cell to every row.
+    // HIGH: a positional INSERT with no explicit column list can't be tenant-stamped — the host
+    // cannot locate the tenant column by position, so it could not override a guest-supplied tenant
+    // value (appending a column would only ever produce an arity mismatch, not a fail-closed
+    // override). Refuse. Likewise refuse a column list that names the tenant column more than once
+    // (the single-position override below would leave a second guest-controlled tenant cell).
+    if columns.is_empty() {
+        return Err(TargetRewriteError::UnsupportedInsert(
+            "INSERT without an explicit column list".into(),
+        ));
+    }
+    if columns
+        .iter()
+        .filter(|c| same_col(&c.value, &tenant_col))
+        .count()
+        > 1
+    {
+        return Err(TargetRewriteError::UnsupportedInsert(
+            "duplicate tenant column in the INSERT column list".into(),
+        ));
+    }
+    let confine_result = match query.body.as_mut() {
+        // INSERT … VALUES: confine any subquery in a guest VALUES cell (C2 — a
+        // `VALUES ('x', (SELECT … FROM other))` cell must not exfiltrate cross-tenant), then
+        // force-stamp the tenant column into every row. If the guest already named the tenant column,
+        // override that cell in place (a guest-supplied tenant is discarded); otherwise append the
+        // column + a stamped cell to every row.
         SetExpr::Values(values) => {
+            for row in &mut values.rows {
+                for cell in row.iter_mut() {
+                    confine_subqueries_in_expr(scope, cell)?;
+                }
+            }
             let col_pos = columns.iter().position(|c| same_col(&c.value, &tenant_col));
             let stamp = stamp_value_expr(&own_val)?;
             match col_pos {
@@ -680,7 +833,14 @@ fn confine_own_insert(
         SetExpr::Insert(_) | SetExpr::Update(_) | SetExpr::Table(_) => Err(
             TargetRewriteError::UnsupportedInsert("write in the INSERT source position".into()),
         ),
+    };
+    confine_result?;
+    // Confine any subquery in a RETURNING item (C1): `INSERT … RETURNING (SELECT … FROM other)` must
+    // not read cross-tenant. Reborrowed here (after the body match releases `ins`).
+    if let Some(items) = ins.returning.as_mut() {
+        confine_returning_items(scope, items)?;
     }
+    Ok(())
 }
 
 /// Confine an `INSERT … SELECT`: read-confine the source in place (every source table gets the
@@ -2582,5 +2742,176 @@ mod own_confinement_tests {
         .unwrap();
         // The host value is a host-derived literal; prove it is escaped (doubled quotes), not broken out.
         assert!(out.contains("'x'' OR ''1''=''1'"), "{out}");
+    }
+
+    // ---- the 5 Security-review findings (C1 RETURNING, C2 VALUES cell subquery, C3 DELETE
+    //      ORDER BY/LIMIT, HIGH INSERT no/dup collist, MEDIUM REPLACE INTO) ------------------------
+
+    #[test]
+    fn c1_returning_subqueries_are_confined_in_all_three_write_confiners() {
+        let k = keys();
+        let a = t("A");
+        let scope = own_scope(Some(&a), None, &k);
+        // UPDATE … RETURNING (SELECT … FROM lines): the RETURNING subquery is read-confined to A.
+        let out = rewrite_own_write(
+            "UPDATE orders SET status = 'x' WHERE id = 1 \
+             RETURNING (SELECT count(*) FROM lines) AS c",
+            &scope,
+            Dialect::Postgres,
+        )
+        .unwrap();
+        assert!(
+            out.contains("lines.tenant_id = 'A'"),
+            "UPDATE RETURNING: {out}"
+        );
+        // DELETE … RETURNING (SELECT … FROM lines).
+        let out = rewrite_own_write(
+            "DELETE FROM orders WHERE id = 'oA' RETURNING (SELECT count(*) FROM lines)",
+            &scope,
+            Dialect::Postgres,
+        )
+        .unwrap();
+        assert!(
+            out.contains("lines.tenant_id = 'A'"),
+            "DELETE RETURNING: {out}"
+        );
+        // INSERT … RETURNING (SELECT … FROM lines).
+        let out = rewrite_own_write(
+            "INSERT INTO orders (status) VALUES ('x') \
+             RETURNING (SELECT count(*) FROM lines)",
+            &scope,
+            Dialect::Postgres,
+        )
+        .unwrap();
+        assert!(
+            out.contains("lines.tenant_id = 'A'"),
+            "INSERT RETURNING: {out}"
+        );
+    }
+
+    #[test]
+    fn c2_insert_values_cell_subqueries_are_confined() {
+        let k = keys();
+        let a = t("A");
+        let scope = own_scope(Some(&a), None, &k);
+        // A subquery in a VALUES cell must be read-confined so it can't exfiltrate another tenant's
+        // data into the caller's own row.
+        let out = rewrite_own_write(
+            "INSERT INTO orders (id, status) VALUES ('x', (SELECT detail FROM lines LIMIT 1))",
+            &scope,
+            Dialect::Sqlite,
+        )
+        .unwrap();
+        assert!(
+            out.contains("lines.tenant_id = 'A'"),
+            "VALUES cell subquery: {out}"
+        );
+    }
+
+    #[test]
+    fn c3_delete_with_order_by_or_limit_is_refused() {
+        let k = keys();
+        let a = t("A");
+        let scope = own_scope(Some(&a), None, &k);
+        // A MySQL `DELETE … ORDER BY … LIMIT …` carries read-position sub-expressions the single-table
+        // bound does not reach — refuse fail-closed.
+        assert!(matches!(
+            rewrite_own_write(
+                "DELETE FROM orders WHERE id = 1 ORDER BY status LIMIT 1",
+                &scope,
+                Dialect::Mysql,
+            )
+            .unwrap_err(),
+            TargetRewriteError::UnsupportedWrite(_)
+        ));
+        assert!(matches!(
+            rewrite_own_write(
+                "DELETE FROM orders WHERE id = 1 LIMIT 1",
+                &scope,
+                Dialect::Mysql,
+            )
+            .unwrap_err(),
+            TargetRewriteError::UnsupportedWrite(_)
+        ));
+    }
+
+    #[test]
+    fn high_insert_without_column_list_is_refused() {
+        let k = keys();
+        let a = t("A");
+        let scope = own_scope(Some(&a), None, &k);
+        // A positional INSERT (no column list) can't be tenant-stamped — the host can't locate the
+        // tenant column positionally to override a guest-supplied value. Refuse.
+        assert!(matches!(
+            rewrite_own_write(
+                "INSERT INTO orders VALUES ('x', 'B', 'new')",
+                &scope,
+                Dialect::Sqlite,
+            )
+            .unwrap_err(),
+            TargetRewriteError::UnsupportedInsert(_)
+        ));
+        // Same for a positional INSERT … SELECT (the host can't align a positional projection either).
+        assert!(matches!(
+            rewrite_own_write(
+                "INSERT INTO orders SELECT * FROM lines",
+                &scope,
+                Dialect::Sqlite,
+            )
+            .unwrap_err(),
+            TargetRewriteError::UnsupportedInsert(_)
+        ));
+    }
+
+    #[test]
+    fn high_insert_with_duplicate_tenant_column_is_refused() {
+        let k = keys();
+        let a = t("A");
+        let scope = own_scope(Some(&a), None, &k);
+        // A column list naming the tenant column twice would leave a second guest-controlled tenant
+        // cell after the single-position override. Refuse.
+        assert!(matches!(
+            rewrite_own_write(
+                "INSERT INTO orders (tenant_id, tenant_id, status) VALUES ('B', 'B', 'x')",
+                &scope,
+                Dialect::Sqlite,
+            )
+            .unwrap_err(),
+            TargetRewriteError::UnsupportedInsert(_)
+        ));
+    }
+
+    #[test]
+    fn medium_replace_into_is_refused() {
+        let k = keys();
+        let a = t("A");
+        let scope = own_scope(Some(&a), None, &k);
+        // MySQL `REPLACE INTO` performs an implicit DELETE on a PK/unique collision with NO tenant
+        // predicate — it could delete a victim tenant's row. Refuse (route to the orm surface).
+        assert!(matches!(
+            rewrite_own_write(
+                "REPLACE INTO orders (id, status) VALUES ('oB', 'x')",
+                &scope,
+                Dialect::Mysql,
+            )
+            .unwrap_err(),
+            TargetRewriteError::UnsupportedInsert(_)
+        ));
+    }
+
+    #[test]
+    fn write_backstop_refuses_a_tvf_or_qualified_source_smuggled_into_a_read_position() {
+        let k = keys();
+        let a = t("A");
+        let scope = own_scope(Some(&a), None, &k);
+        // A schema-qualified table name in a WHERE subquery is refused by the read walk / backstop.
+        assert!(
+            rewrite_own_write(
+                "UPDATE orders SET status = 'x' WHERE id IN (SELECT order_id FROM other.lines)",
+                &scope,
+                Dialect::Postgres,
+            )
+            .is_err()
+        );
     }
 }
