@@ -1028,6 +1028,9 @@ async fn wire_cloud_blob_upload(
     Ok(())
 }
 
+// Private serve-wiring fn; the arg count only trips the lint under `--all-features` (the 4
+// `blob-upload` mint params). Grouping them would just move the churn — allow it here.
+#[allow(clippy::too_many_arguments)]
 fn spawn_s3_ingress(
     addr: SocketAddr,
     deploy: DeployStore,
