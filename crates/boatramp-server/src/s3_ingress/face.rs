@@ -811,25 +811,20 @@ fn parse_route(req: &S3Request) -> Option<Route> {
             .find(|(k, _)| k == name)
             .map(|(_, v)| v.clone())
     };
+    let upload_id = get("uploadId");
+    let part_number = get("partNumber").and_then(|v| v.parse::<u32>().ok());
 
-    let intent = match req.method.as_str() {
-        "OPTIONS" => Intent::Options,
-        "HEAD" => Intent::Head,
-        "POST" if has("uploads") => Intent::CreateMultipart,
-        "POST" if get("uploadId").is_some() => Intent::CompleteMultipart {
-            upload_id: get("uploadId").unwrap(),
+    let intent = match (req.method.as_str(), upload_id, part_number) {
+        ("OPTIONS", _, _) => Intent::Options,
+        ("HEAD", _, _) => Intent::Head,
+        ("POST", _, _) if has("uploads") => Intent::CreateMultipart,
+        ("POST", Some(upload_id), _) => Intent::CompleteMultipart { upload_id },
+        ("PUT", Some(upload_id), Some(part_number)) => Intent::UploadPart {
+            part_number,
+            upload_id,
         },
-        "PUT" if get("uploadId").is_some() && get("partNumber").is_some() => {
-            let part_number = get("partNumber").and_then(|v| v.parse::<u32>().ok())?;
-            Intent::UploadPart {
-                part_number,
-                upload_id: get("uploadId").unwrap(),
-            }
-        }
-        "PUT" => Intent::PutObject,
-        "DELETE" if get("uploadId").is_some() => Intent::AbortMultipart {
-            upload_id: get("uploadId").unwrap(),
-        },
+        ("PUT", None, _) => Intent::PutObject,
+        ("DELETE", Some(upload_id), _) => Intent::AbortMultipart { upload_id },
         _ => Intent::Unsupported,
     };
     Some(Route {
