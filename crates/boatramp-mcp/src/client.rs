@@ -88,9 +88,9 @@ impl HttpControlPlane {
     /// secret specs. Fails if a named secret can't be resolved or TLS pinning is
     /// misconfigured.
     pub fn from_instance(inst: &InstanceConfig) -> Result<Self> {
-        let token = resolve_secret(&inst.token)?;
+        let token = resolve_secret(&inst.token, &boatramp_core::env::SystemEnv)?;
         let holder = match &inst.holder_key {
-            Some(spec) => resolve_secret(spec)?,
+            Some(spec) => resolve_secret(spec, &boatramp_core::env::SystemEnv)?,
             None => None,
         };
         let mut builder = reqwest::Client::builder();
