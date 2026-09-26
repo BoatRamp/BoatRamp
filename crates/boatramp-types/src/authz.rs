@@ -35,8 +35,10 @@ pub enum Action {
 /// form), [`Resource::Project`] (target = `"<project>"`, governing the project's
 /// **own** resources — functions, compute, workflows, and the project entity itself),
 /// [`Resource::Secrets`] (target = `"<project>"`, the project's sealed secret
-/// store), and [`Resource::BlobUpload`] (target = `"<project>/<site>/<container>"`,
-/// minting an S3-ingress upload credential for one container). The rest are global.
+/// store), and [`Resource::BlobUpload`] (target = `"<project>"` at the mint route —
+/// the project derived from the request path, mirroring repair/migrate — while a
+/// *grant* may narrow to `"<project>/<site>/<container>"`; minting an S3-ingress
+/// upload credential for a container). The rest are global.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Resource {
@@ -51,9 +53,16 @@ pub enum Resource {
     Secrets,
     /// Content-addressed blob uploads (`PUT /api/blobs/<hash>`).
     Blobs,
-    /// **Minting a scoped S3-ingress upload credential** for a blob container
-    /// (`target` = `"<project>/<site>/<container>"`). This gates the *mint* verb
-    /// (the operator `boatramp blob mint-upload` route + the guest `blob-upload`
+    /// **Minting a scoped S3-ingress upload credential** for a blob container. The
+    /// *required* right at the mint route is `BlobUpload·Write` scoped to the
+    /// **project** the request path names (`target` = `"<project>"`, derived from the
+    /// path — mirroring the repair/migrate precedent), so a project-scoped
+    /// `BlobUpload·Write` grant can mint for its OWN project, a DIFFERENT project's
+    /// grant is refused, and a global `admin` / global `BlobUpload·Write` (target
+    /// `None`) still satisfies it. A *grant* may be narrower — a
+    /// `"<project>/<site>/<container>"` target — but that finer resolution is enforced
+    /// by the handler's host-forcing, not by this route mapping. This gates the *mint*
+    /// verb (the operator `boatramp blob mint-upload` route + the guest `blob-upload`
     /// binding's control-plane authorization), NOT the S3 ingress PUT itself — an
     /// upload is authorized by the short-lived temp credential it carries, never by
     /// this control-plane right. Deliberately **separate** from [`Resource::Blobs`]
@@ -338,15 +347,19 @@ impl Right {
                     Self::new(Resource::Project, Some(proj.to_string()), Action::Admin)
                 }
                 // Operator S3 upload-credential minting (`POST /api/projects/<proj>/blob-mint-upload`,
-                // M3): gated with the DEDICATED `Resource::BlobUpload` (target `None` — the concrete
-                // `<project>/<site>/<container>` is host-forced from THIS project + the body, checked
-                // at the handler), NOT the deploy-grade publisher the general project catch-all below
-                // would grant. `BlobUpload` is admin/explicit-grant only (never the default
-                // publisher/deployer/project_* roles), so this surface stays operator-only. A
-                // POST-only surface ⇒ always `Action::Write`. Gated explicitly, above that catch-all,
-                // so a `project_publisher` can never mint an upload credential.
+                // M3): gated with the DEDICATED `Resource::BlobUpload` scoped to THIS project (target
+                // `Some(<proj>)`, derived from the path — mirroring the repair/migrate precedent), NOT
+                // the deploy-grade publisher the general project catch-all below would grant. Scoping
+                // to the project (rather than a global `None`) lets a project-scoped `BlobUpload·Write`
+                // grant mint for ITS OWN project while a DIFFERENT project's grant is refused; a global
+                // `admin` / global `BlobUpload·Write` (target `None`) still satisfies it (the global
+                // wildcard covers every target). The concrete `<project>/<site>/<container>` is still
+                // host-forced from this project + the body at the handler. `BlobUpload` is
+                // admin/explicit-grant only (never the default publisher/deployer/project_* roles), so
+                // this surface stays operator-only. A POST-only surface ⇒ always `Action::Write`. Gated
+                // explicitly, above that catch-all, so a `project_publisher` can never mint a credential.
                 Some((&"blob-mint-upload", _)) => {
-                    Self::new(Resource::BlobUpload, None, Action::Write)
+                    Self::new(Resource::BlobUpload, Some(proj.to_string()), Action::Write)
                 }
                 // The project-bus operator surface (`/api/projects/<proj>/_boatramp/bus/…`):
                 // dead-letter + work-queue inspection/management for the **shared project
@@ -467,14 +480,22 @@ impl Right {
             ),
             // Operator S3 upload-credential minting (`POST /api/blob-mint-upload`, PLAN-blob-s3-ingress
             // §6 / M3): mint a short-lived, scoped S3 upload credential for a project+site's blob
-            // container. Gated with the DEDICATED `Resource::BlobUpload` right (target `None` — the
-            // concrete `<project>/<site>/<container>` is host-forced from the token's project + the
-            // request body, checked at the handler), placed ABOVE the `/api/blobs` arm (which resolves
-            // to `Blobs·Deploy`, a right a ship-only publisher holds — nesting under it would be an
+            // container. Gated with the DEDICATED `Resource::BlobUpload` scoped to the DEFAULT project
+            // (target `Some(default_project)` — this global path is the legacy default-project form, so
+            // it mirrors the sibling `/api/repair/` and `/api/migrate/` arms which likewise scope to the
+            // default project; the concrete `<project>/<site>/<container>` is host-forced from the
+            // token's project + the request body at the handler). A project-scoped `BlobUpload·Write`
+            // grant for the default project satisfies it; a global `admin` / global `BlobUpload·Write`
+            // (target `None`) still does too. Placed ABOVE the `/api/blobs` arm (which resolves to
+            // `Blobs·Deploy`, a right a ship-only publisher holds — nesting under it would be an
             // ESCALATION, letting a publisher mint upload credentials). `BlobUpload` is NOT granted to
             // the default publisher/deployer/project_* roles (only via `admin` / an explicit grant), so
             // this surface stays operator-only. A POST-only surface ⇒ always `Action::Write`.
-            "/api/blob-mint-upload" => Self::new(Resource::BlobUpload, None, Action::Write),
+            "/api/blob-mint-upload" => Self::new(
+                Resource::BlobUpload,
+                Some(default_project.clone()),
+                Action::Write,
+            ),
             // Operator SQL to a managed database (project-owned): migrations + queries
             // are operator tools scoped to the default project. `project·deploy` (they
             // are POST bodies that mutate or read the project's managed DB); the
@@ -2347,12 +2368,26 @@ mod tests {
     /// `admin` (which expands to `BlobUpload` via `Resource::ALL`) reaches it.
     #[test]
     fn blob_mint_upload_surface_is_blobupload_write_not_publisher() {
-        // The route maps to BlobUpload·Write (target None — the concrete container is host-forced +
-        // checked at the handler).
+        // MEDIUM-1 (M3 security review): the route maps to BlobUpload·Write scoped to the PROJECT the
+        // path names — the global form to the default project, the project-scoped form to `<proj>` —
+        // mirroring the repair/migrate precedent, so a project-scoped grant can reach its OWN project.
         assert_eq!(
             Right::required("POST", "/api/blob-mint-upload"),
-            Some(Right::new(Resource::BlobUpload, None, Action::Write)),
-            "POST /api/blob-mint-upload must require BlobUpload·Write",
+            Some(Right::new(
+                Resource::BlobUpload,
+                Some(crate::project::DEFAULT_PROJECT.to_string()),
+                Action::Write
+            )),
+            "POST /api/blob-mint-upload must require BlobUpload·Write scoped to the default project",
+        );
+        assert_eq!(
+            Right::required("POST", "/api/projects/acme/blob-mint-upload"),
+            Some(Right::new(
+                Resource::BlobUpload,
+                Some("acme".to_string()),
+                Action::Write
+            )),
+            "POST /api/projects/acme/blob-mint-upload must require BlobUpload·Write scoped to acme",
         );
         let req = Right::required("POST", "/api/blob-mint-upload").unwrap();
         let policy = AuthzPolicy::default_policy();
@@ -2377,6 +2412,57 @@ mod tests {
             admin.allows(&req),
             "an admin must be able to mint an upload credential",
         );
+    }
+
+    /// MEDIUM-1 (M3 security review): a **project-scoped** `BlobUpload·Write` grant can mint for ITS
+    /// OWN project but NOT another's — the whole point of scoping the route to `Some(<project>)`
+    /// (the pre-fix global `None`-target made this impossible: only a global grant could ever mint,
+    /// so a per-project grant was dead). A global `BlobUpload·Write` / `admin` still reaches every
+    /// project; the default ship-only roles never reach any.
+    #[test]
+    fn blob_mint_upload_is_reachable_by_a_project_scoped_grant_for_its_own_project_only() {
+        let acme_mint = Right::required("POST", "/api/projects/acme/blob-mint-upload").unwrap();
+        let other_mint = Right::required("POST", "/api/projects/other/blob-mint-upload").unwrap();
+
+        // A `BlobUpload·Write` grant scoped to `acme` can mint for acme, but NOT for `other`.
+        let acme_grant: RightSet = std::iter::once(Right::new(
+            Resource::BlobUpload,
+            Some("acme".to_string()),
+            Action::Write,
+        ))
+        .collect();
+        assert!(
+            acme_grant.allows(&acme_mint),
+            "a BlobUpload·Write grant scoped to acme must mint for acme",
+        );
+        assert!(
+            !acme_grant.allows(&other_mint),
+            "a BlobUpload·Write grant scoped to acme must NOT mint for a DIFFERENT project",
+        );
+
+        // A GLOBAL `BlobUpload·Write` grant (target None) reaches every project.
+        let global_grant: RightSet =
+            std::iter::once(Right::new(Resource::BlobUpload, None, Action::Write)).collect();
+        assert!(global_grant.allows(&acme_mint) && global_grant.allows(&other_mint));
+
+        // A global `admin` reaches every project (via Resource::ALL).
+        let policy = AuthzPolicy::default_policy();
+        let admin = policy.rights_for(&[GrantedRole::global("admin")]);
+        assert!(admin.allows(&acme_mint) && admin.allows(&other_mint));
+
+        // The default ship-only / project roles reach NEITHER project's mint surface.
+        for (role, target) in [
+            ("publisher", "acme/blog"),
+            ("deployer", "acme/blog"),
+            ("project_publisher", "acme"),
+            ("project_admin", "acme"),
+        ] {
+            let rights = policy.rights_for(&[GrantedRole::scoped(role, target)]);
+            assert!(
+                !rights.allows(&acme_mint) && !rights.allows(&other_mint),
+                "a {role} must NOT reach any blob-mint-upload surface",
+            );
+        }
     }
 
     /// A function's captured-guest-logs endpoint is a project-owned READ — it reuses the
