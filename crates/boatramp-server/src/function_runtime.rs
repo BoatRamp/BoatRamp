@@ -1567,6 +1567,25 @@ pub(super) async fn introspect_service_sdl(
         body,
     };
     let request = build_internal_request(invoke).map_err(SubgraphSdlError::InvokeFailed)?;
+    // Bug #499: warm the compile cache OFF the async worker before serving. The subgraph SDL
+    // introspection runs on the deploy request's critical path. Left to `execute_function` →
+    // `serve_lane` → `proxy_pre`, the several-hundred-ms Cranelift compile runs INLINE on the
+    // tokio worker; on a single-worker machine (fly.io shared-cpu-1x) that starves the executor,
+    // so the next control-plane request (e.g. `/healthz`) can't be polled and crosses fly's ~10s
+    // edge timeout → 502. `precompile_gated` runs the compile via `block_in_place` (off the async
+    // worker, behind the compile-concurrency gate), so the subsequent `serve_with_limits` hits the
+    // cache (keyed by the component hash — the same `hash` the serve path reads) and never compiles
+    // inline. A best-effort warm: a compile error here is surfaced by the serve below (which then
+    // fails the same way), never swallowed. A concurrent double-compile of the same hash is
+    // harmless — the cache insert is idempotent. NOT wrapped in an outer `block_in_place`
+    // (`precompile_gated` already does its own), so there is no nested `block_in_place`.
+    if let Ok(wasm) = super::handler_dispatch::read_blob_bytes(deploy, component).await {
+        if let Err(err) = inner.engine.precompile_gated(component, &wasm).await {
+            // Don't fail the introspection here — let the serve path report the compile error
+            // with its full context. This warm is purely to move the compile off the worker.
+            tracing::debug!(component, %err, "subgraph introspection precompile warm failed; serve will report");
+        }
+    }
     let run = tokio::time::timeout(
         std::time::Duration::from_secs(10),
         execute_function(
