@@ -9738,14 +9738,24 @@ async fn deploy_does_not_stall_healthz_on_a_single_worker() {
 
     // The deploy-time compile, modelled as production runs it: ONE uninterrupted CPU-bound stretch
     // on this runtime (a real component compile is a single several-hundred-ms Cranelift run). The
-    // fixture compiles fast, so we amplify to a realistic ~1s+ stretch by compiling it many times
-    // with distinct cache keys (each key forces a REAL recompile) — WITHOUT yielding between them,
+    // fixture compiles fast, so we amplify to a realistic multi-second stretch by compiling it with
+    // distinct cache keys (each key forces a REAL recompile) — WITHOUT yielding between them,
     // exactly as one inline compile never yields. This closure is the CPU work either path runs.
+    //
+    // The batch is bounded by WALL-CLOCK, not a fixed iteration count: a fixed count is
+    // runner-speed-dependent, and on a fast CI box 300 compiles finish in well under the 2s bound —
+    // so even the INLINE mutation's worst ping would slip under 2s and the mutation-verify check
+    // would (wrongly) report the gate hollow. Looping until `HOLD` elapses makes the inline hold a
+    // guaranteed >2s stretch on ANY runner, while the off-runtime path stays at ~ms.
+    const HOLD: Duration = Duration::from_secs(4);
     let engine2 = Arc::clone(&engine);
     let compile_batch = move || {
-        for i in 0..300u32 {
+        let start = Instant::now();
+        let mut i = 0u32;
+        while start.elapsed() < HOLD {
             let hash = format!("v499-{i}");
             let _ = engine2.precompile(&hash, KV_COUNTER);
+            i += 1;
         }
     };
 

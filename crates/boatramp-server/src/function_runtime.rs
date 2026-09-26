@@ -51,7 +51,10 @@ pub(super) enum FnTenant {
 /// migration run. Carries the owner-DDL seam the host runs each `migrate::exec` on.
 #[cfg(feature = "handlers")]
 pub(crate) struct MigrationContext {
-    /// The orchestrator-owned owner-role DDL seam for this `(project, db)`.
+    /// The orchestrator-owned owner-role DDL seam for this `(project, db)`. Read only on the
+    /// `migrate` path (`crate::migrate`); in a `handlers`-without-`migrate` build the field is
+    /// legitimately unread, so silence dead_code there rather than in the shipped all-features build.
+    #[cfg_attr(not(feature = "migrate"), allow(dead_code))]
     pub ddl: std::sync::Arc<dyn boatramp_core::sql::MigrateDdl>,
 }
 
