@@ -1594,12 +1594,12 @@ pub(super) async fn introspect_service_sdl(
     // fails the same way), never swallowed. A concurrent double-compile of the same hash is
     // harmless — the cache insert is idempotent. NOT wrapped in an outer `block_in_place`
     // (`precompile_gated` already does its own), so there is no nested `block_in_place`.
-    if let Ok(wasm) = super::handler_dispatch::read_blob_bytes(deploy, component).await {
-        if let Err(err) = inner.engine.precompile_gated(component, &wasm).await {
-            // Don't fail the introspection here — let the serve path report the compile error
-            // with its full context. This warm is purely to move the compile off the worker.
-            tracing::debug!(component, %err, "subgraph introspection precompile warm failed; serve will report");
-        }
+    if let Ok(wasm) = super::handler_dispatch::read_blob_bytes(deploy, component).await
+        && let Err(err) = inner.engine.precompile_gated(component, &wasm).await
+    {
+        // Don't fail the introspection here — let the serve path report the compile error
+        // with its full context. This warm is purely to move the compile off the worker.
+        tracing::debug!(component, %err, "subgraph introspection precompile warm failed; serve will report");
     }
     let run = tokio::time::timeout(
         std::time::Duration::from_secs(10),
