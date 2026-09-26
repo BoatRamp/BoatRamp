@@ -2188,6 +2188,7 @@ pub(super) fn filter_site_secrets(
 /// `env:`-scheme ref is **refused** (fail-closed) so an untrusted tenant's
 /// `secrets` map can't name an arbitrary host env var to exfiltrate it.
 #[cfg(feature = "handlers")]
+#[allow(clippy::too_many_arguments)] // env_source (task #498) is the 8th; a single choke point for site-secret env resolution
 pub(super) async fn resolve_env(
     site: &str,
     project: boatramp_core::project::ProjectRef<'_>,
