@@ -3,7 +3,7 @@
 //! chunked (if `Transfer-Encoding`) else `Content-Length` else close-delimited. Plus the
 //! response-head encoding (status line + reason). RED until implemented.
 
-use boatramp_http::h1::{encode_response_head, response_framing, ResponseFraming};
+use boatramp_http::h1::{ResponseFraming, encode_response_head, response_framing};
 use http::{HeaderMap, Method};
 
 fn hdr(pairs: &[(&str, &str)]) -> HeaderMap {
@@ -96,9 +96,10 @@ fn response_head_encodes_status_line_and_reason() {
         text.starts_with("HTTP/1.1 200 OK\r\n"),
         "status line: {text:?}"
     );
-    assert!(text
-        .to_ascii_lowercase()
-        .contains("content-type: text/plain\r\n"));
+    assert!(
+        text.to_ascii_lowercase()
+            .contains("content-type: text/plain\r\n")
+    );
     assert!(
         text.ends_with("\r\n\r\n"),
         "must end with CRLFCRLF: {text:?}"

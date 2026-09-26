@@ -80,13 +80,14 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use boatramp_core::compute::{
-    managed_db_spec, ComputeWorkload, ManagedDbEngine, PlacementConstraints,
+    ComputeWorkload, ManagedDbEngine, PlacementConstraints, managed_db_spec,
 };
 use boatramp_core::deploy::DeployStore;
 use boatramp_core::envelope::KeyEnvelope;
 use boatramp_core::kv::KvStore;
-use boatramp_core::project::{ProjectRef, DEFAULT_PROJECT};
+use boatramp_core::project::{DEFAULT_PROJECT, ProjectRef};
 use boatramp_core::sql::{SqlBackend, SqlError};
+use boatramp_storage::ExternalSqlKind;
 use boatramp_storage::sql_compute::{
     ComputeEndpointResolver, ComputeResolvedSqlBackend, SESSION_KEY_PROJECT, SESSION_KEY_SITE,
 };
@@ -95,7 +96,6 @@ use boatramp_storage::tenant_provision::{
     grant_app_role_ddl, provision_ddl, recover_soft_deprovision_ddl, sanitize_ident,
     soft_deprovision_ddl, tenant_db_name, tenant_owner_role_name, tenant_role_name,
 };
-use boatramp_storage::ExternalSqlKind;
 
 use crate::config::{ExternalDatabaseConfig, TenantIsolation, TenantScope};
 use crate::managed_sql::{DeployEndpointResolver, ManagedSqlCredentials};
@@ -1639,11 +1639,12 @@ mod tests {
         let _ = resolver.build_backend("default", "blog").await.unwrap();
         // Sealed under the plain `<default>/<compute>` key (matches server-init env),
         // NOT a per-tenant `pg/<ident>` key.
-        assert!(kv
-            .get("managed-sql-cred/default/pg")
-            .await
-            .unwrap()
-            .is_some());
+        assert!(
+            kv.get("managed-sql-cred/default/pg")
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 
     /// `deprovision_project("acme")` tears down EXACTLY acme's derived tenant (its
@@ -1680,11 +1681,13 @@ mod tests {
         let default_cred = "managed-sql-cred/default/pg"; // the install's own key
 
         // Preconditions: both tenants provisioned.
-        assert!(deploy
-            .get_compute_workload(ProjectRef::new("acme"), &acme_wl)
-            .await
-            .unwrap()
-            .is_some());
+        assert!(
+            deploy
+                .get_compute_workload(ProjectRef::new("acme"), &acme_wl)
+                .await
+                .unwrap()
+                .is_some()
+        );
         assert!(kv.get(&acme_cred).await.unwrap().is_some());
         assert!(kv.get(default_cred).await.unwrap().is_some());
 
@@ -1789,18 +1792,20 @@ mod tests {
         let _ = resolver.build_backend("acme", "blog").await.unwrap();
 
         // Default: bare `<default>/pg` (the server-init key of a single-tenant install).
-        assert!(kv
-            .get("managed-sql-cred/default/pg")
-            .await
-            .unwrap()
-            .is_some());
+        assert!(
+            kv.get("managed-sql-cred/default/pg")
+                .await
+                .unwrap()
+                .is_some()
+        );
         // Derived: `<project>/<compute>-<ident>` (the per-tenant container's own key).
         let ident = sanitize_ident("acme");
-        assert!(kv
-            .get(&format!("managed-sql-cred/acme/pg-{ident}"))
-            .await
-            .unwrap()
-            .is_some());
+        assert!(
+            kv.get(&format!("managed-sql-cred/acme/pg-{ident}"))
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 
     // ---- safe (soft) deprovision: the engine/cell split ------------------

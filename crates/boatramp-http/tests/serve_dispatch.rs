@@ -2,7 +2,7 @@
 //! HTTP/1.1 request line → the h1 loop; the HTTP/2 client preface → the h2 mux driver.
 //! Both are driven over one plaintext duplex through the SAME entry point.
 
-use boatramp_http::{response, serve_connection, Handler, Request, Response};
+use boatramp_http::{Handler, Request, Response, response, serve_connection};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 struct App;

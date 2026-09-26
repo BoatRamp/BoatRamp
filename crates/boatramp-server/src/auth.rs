@@ -15,13 +15,13 @@ use std::sync::{Arc, Mutex};
 
 use axum::body::Body;
 use axum::extract::{Request, State};
-use axum::http::{header, HeaderName, StatusCode};
+use axum::http::{HeaderName, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 
 use boatramp_core::authz::{self, AuthzPolicy, Right};
 use boatramp_core::cedar::CompiledCedar;
-use boatramp_core::cose::{self, PopClaims, TokenError, TokenPublicKey, POP_MAX_BODY_HASH_BYTES};
+use boatramp_core::cose::{self, POP_MAX_BODY_HASH_BYTES, PopClaims, TokenError, TokenPublicKey};
 use boatramp_core::kv::KvStore;
 
 /// The header carrying a per-request proof-of-possession (base64url `COSE_Sign1`),
@@ -518,7 +518,7 @@ async fn buffer_body_for_pop(request: Request) -> Result<(Request, Option<String
         // A body that exceeds the bound despite its declared length (or a broken
         // stream) — reject rather than silently drop the body binding.
         Err(_) => {
-            return Err((StatusCode::BAD_REQUEST, "could not read request body\n").into_response())
+            return Err((StatusCode::BAD_REQUEST, "could not read request body\n").into_response());
         }
     };
     let body_hash = if bytes.is_empty() {
@@ -649,10 +649,11 @@ mod tests {
         let now = now_unix();
         let token = cose::mint(&admin_claims(now), &root).await.unwrap();
         // A non-holder-bound token needs no proof when `require_pop` is off.
-        assert!(auth
-            .authorize(&token, "GET", PATH, None, None)
-            .await
-            .is_ok());
+        assert!(
+            auth.authorize(&token, "GET", PATH, None, None)
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
@@ -674,10 +675,11 @@ mod tests {
 
         // A valid proof (bound to the request + config origin + this token) → ok.
         let p = proof(&h, &token, "GET", PATH, ORIGIN, None, now).await;
-        assert!(auth
-            .authorize(&token, "GET", PATH, Some(&p), None)
-            .await
-            .is_ok());
+        assert!(
+            auth.authorize(&token, "GET", PATH, Some(&p), None)
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
@@ -693,17 +695,19 @@ mod tests {
 
         // Wrong method: proof says PUT, request is GET.
         let wrong_method = proof(&h, &token, "PUT", PATH, ORIGIN, None, now).await;
-        assert!(auth
-            .authorize(&token, "GET", PATH, Some(&wrong_method), None)
-            .await
-            .is_err());
+        assert!(
+            auth.authorize(&token, "GET", PATH, Some(&wrong_method), None)
+                .await
+                .is_err()
+        );
 
         // Wrong path.
         let wrong_path = proof(&h, &token, "GET", "/api/certs", ORIGIN, None, now).await;
-        assert!(auth
-            .authorize(&token, "GET", PATH, Some(&wrong_path), None)
-            .await
-            .is_err());
+        assert!(
+            auth.authorize(&token, "GET", PATH, Some(&wrong_path), None)
+                .await
+                .is_err()
+        );
 
         // Wrong origin (a captured proof relayed to a different fleet).
         let wrong_aud = proof(
@@ -716,33 +720,37 @@ mod tests {
             now,
         )
         .await;
-        assert!(auth
-            .authorize(&token, "GET", PATH, Some(&wrong_aud), None)
-            .await
-            .is_err());
+        assert!(
+            auth.authorize(&token, "GET", PATH, Some(&wrong_aud), None)
+                .await
+                .is_err()
+        );
 
         // Wrong token (proof paired with a different access token's `ath`).
         let other = cose::mint_delegatable(&admin_claims(now), &h.public_key(), &root)
             .await
             .unwrap();
         let wrong_ath = proof(&h, &other, "GET", PATH, ORIGIN, None, now).await;
-        assert!(auth
-            .authorize(&token, "GET", PATH, Some(&wrong_ath), None)
-            .await
-            .is_err());
+        assert!(
+            auth.authorize(&token, "GET", PATH, Some(&wrong_ath), None)
+                .await
+                .is_err()
+        );
 
         // Wrong body: proof binds one body, the request carries another.
         let bound = proof(&h, &token, "PUT", PATH, ORIGIN, Some(body.clone()), now).await;
         let tampered = cose::pop_sha256_hex(b"a-different-body");
-        assert!(auth
-            .authorize(&token, "PUT", PATH, Some(&bound), Some(tampered))
-            .await
-            .is_err());
+        assert!(
+            auth.authorize(&token, "PUT", PATH, Some(&bound), Some(tampered))
+                .await
+                .is_err()
+        );
         // ...but the matching body authorizes.
-        assert!(auth
-            .authorize(&token, "PUT", PATH, Some(&bound), Some(body))
-            .await
-            .is_ok());
+        assert!(
+            auth.authorize(&token, "PUT", PATH, Some(&bound), Some(body))
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
@@ -765,10 +773,11 @@ mod tests {
             .await
             .unwrap();
         let p = proof(&h, &token, "GET", PATH, ORIGIN, None, now).await;
-        assert!(auth
-            .authorize(&token, "GET", PATH, Some(&p), None)
-            .await
-            .is_ok());
+        assert!(
+            auth.authorize(&token, "GET", PATH, Some(&p), None)
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
@@ -785,18 +794,21 @@ mod tests {
 
         let auth = auth_with(&root, false); // pop_origin = ORIGIN
         let good = proof(&h, &token, "GET", PATH, ORIGIN, None, now).await;
-        assert!(auth
-            .authorize(&token, "GET", PATH, Some(&good), None)
-            .await
-            .is_ok());
+        assert!(
+            auth.authorize(&token, "GET", PATH, Some(&good), None)
+                .await
+                .is_ok()
+        );
 
         // With no origin configured, a `cnf` token can't be verified → fail closed.
         let unset: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
         let auth_unset = Auth::with_key(root.public_key(), unset).with_pop(None, false);
-        assert!(auth_unset
-            .authorize(&token, "GET", PATH, Some(&good), None)
-            .await
-            .is_err());
+        assert!(
+            auth_unset
+                .authorize(&token, "GET", PATH, Some(&good), None)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -818,16 +830,18 @@ mod tests {
         let auth = auth_with(&root, false);
         // Leaf holder (h2) → authorized.
         let leaf_proof = proof(&h2, &chain, "GET", PATH, ORIGIN, None, now).await;
-        assert!(auth
-            .authorize(&chain, "GET", PATH, Some(&leaf_proof), None)
-            .await
-            .is_ok());
+        assert!(
+            auth.authorize(&chain, "GET", PATH, Some(&leaf_proof), None)
+                .await
+                .is_ok()
+        );
         // Intermediate holder (h1) → rejected.
         let stale_proof = proof(&h1, &chain, "GET", PATH, ORIGIN, None, now).await;
-        assert!(auth
-            .authorize(&chain, "GET", PATH, Some(&stale_proof), None)
-            .await
-            .is_err());
+        assert!(
+            auth.authorize(&chain, "GET", PATH, Some(&stale_proof), None)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -842,10 +856,11 @@ mod tests {
         let p = proof(&h, &token, "GET", PATH, ORIGIN, None, now).await;
 
         // First use succeeds; the same proof (same `jti`) is then a replay → 401.
-        assert!(auth
-            .authorize(&token, "GET", PATH, Some(&p), None)
-            .await
-            .is_ok());
+        assert!(
+            auth.authorize(&token, "GET", PATH, Some(&p), None)
+                .await
+                .is_ok()
+        );
         let rej = auth
             .authorize(&token, "GET", PATH, Some(&p), None)
             .await

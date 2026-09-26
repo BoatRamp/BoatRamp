@@ -15,7 +15,7 @@ use crate::config::ServerConfig;
 
 /// The control-plane KV builder, reused by the standalone `boatramp migrate` command.
 pub(crate) use boatramp_node::backends::build_kv as build_control_plane_kv;
-use boatramp_node::blobs::{build_blobs, BlobArgs};
+use boatramp_node::blobs::{BlobArgs, build_blobs};
 
 /// A failure running `boatramp serve`: selecting/initialising a backend, wiring
 /// auth / OIDC / TLS, or the HTTP server itself exiting with an error. Most of
@@ -118,9 +118,7 @@ pub enum Error {
     UnknownDnsProvider(String),
     /// No certificate is available yet — the cluster leader hasn't issued one.
     #[cfg(all(feature = "cluster", feature = "acme-dns"))]
-    #[error(
-        "no certificates available yet — awaiting the cluster leader to issue (retry shortly)"
-    )]
+    #[error("no certificates available yet — awaiting the cluster leader to issue (retry shortly)")]
     NoCertsYet,
 
     // ---- propagated library errors (`#[from]`) ------------------------------
@@ -765,10 +763,10 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
     // In a TLS mode, optionally bind a second plain-HTTP listener that redirects
     // to HTTPS. Ignored for `--tls off`.
     #[cfg(feature = "tls")]
-    if !matches!(args.tls, TlsMode::Off) {
-        if let Some(redirect_addr) = args.http_redirect_addr.or(serve_cfg.http_redirect_addr) {
-            spawn_http_redirect(redirect_addr, deploy.clone(), posture);
-        }
+    if !matches!(args.tls, TlsMode::Off)
+        && let Some(redirect_addr) = args.http_redirect_addr.or(serve_cfg.http_redirect_addr)
+    {
+        spawn_http_redirect(redirect_addr, deploy.clone(), posture);
     }
     let serve_result = match args.tls {
         TlsMode::Off => boatramp_server::serve_with(addr, deploy, auth, handlers, options)
@@ -812,10 +810,10 @@ fn spawn_cache_poller(
             if !changed.is_empty() {
                 cache.invalidate_keys(&changed);
                 // A peer wrote dynamic daemon config → wake an immediate reload.
-                if let Some(daemon) = &daemon {
-                    if changed.iter().any(|k| k.starts_with("daemon/")) {
-                        daemon.notify_reload();
-                    }
+                if let Some(daemon) = &daemon
+                    && changed.iter().any(|k| k.starts_with("daemon/"))
+                {
+                    daemon.notify_reload();
                 }
             }
             since_trim += poll;
@@ -1145,7 +1143,7 @@ fn build_cert_envelope(
     secrets: Option<&crate::config::SecretsConfig>,
     data_dir: &Path,
 ) -> Result<Option<Arc<dyn boatramp_core::envelope::KeyEnvelope>>> {
-    use boatramp_server::envelope::{build_envelope, EnvelopeSpec};
+    use boatramp_server::envelope::{EnvelopeSpec, build_envelope};
     let Some(cfg) = secrets else {
         return Ok(None);
     };
@@ -1175,7 +1173,7 @@ fn build_cert_envelope(
         other => {
             return Err(Error::Envelope(format!(
                 "unknown secrets.envelope {other:?} (want \"local\" or \"vault\")"
-            )))
+            )));
         }
     };
     build_envelope(spec).map_err(|e| Error::Envelope(e.to_string()))
@@ -1217,7 +1215,7 @@ async fn run_cluster(
     built_blobs: boatramp_node::blobs::BuiltBlobs,
     mut options: boatramp_server::ServerOptions,
 ) -> Result<()> {
-    use boatramp_cluster::node::{build_node, ClusterParams};
+    use boatramp_cluster::node::{ClusterParams, build_node};
 
     // The blob backend; `built_blobs` also carries the optional FA-5b2 blob-change
     // watch provider + tier the handler runtime is wired with below.
@@ -2265,7 +2263,7 @@ async fn serve_acme(
     options: boatramp_server::ServerOptions,
 ) -> Result<()> {
     use futures::StreamExt;
-    use rustls_acme::{caches::DirCache, AcmeConfig};
+    use rustls_acme::{AcmeConfig, caches::DirCache};
 
     if args.acme_domain.is_empty() {
         return Err(Error::NoAcmeDomain);

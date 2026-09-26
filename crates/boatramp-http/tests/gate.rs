@@ -3,7 +3,7 @@
 //! a failure names exactly which part of the protocol regressed. RED until the parser
 //! lands (that's the TDD point); the corpus itself lives in `src/testkit/`.
 
-use boatramp_http::testkit::{cases, gen, satisfies, verdict, Case};
+use boatramp_http::testkit::{Case, cases, generators, satisfies, verdict};
 
 fn check(label: &str, cases: &[Case]) {
     let failures: Vec<String> = cases
@@ -30,7 +30,7 @@ fn check(label: &str, cases: &[Case]) {
     );
 }
 
-fn check_gen(label: &str, cases: Vec<gen::GenCase>) {
+fn check_gen(label: &str, cases: Vec<generators::GenCase>) {
     let total = cases.len();
     let failures: Vec<String> = cases
         .iter()
@@ -92,17 +92,17 @@ fn limits() {
 // --- layer 2: combinatorial generators --------------------------------------
 #[test]
 fn generated_framing_matrix() {
-    check_gen("framing_matrix", gen::framing_matrix());
+    check_gen("framing_matrix", generators::framing_matrix());
 }
 #[test]
 fn generated_whitespace() {
-    check_gen("whitespace", gen::whitespace());
+    check_gen("whitespace", generators::whitespace());
 }
 #[test]
 fn generated_versions() {
-    check_gen("versions", gen::versions());
+    check_gen("versions", generators::versions());
 }
 #[test]
 fn generated_header_bytes() {
-    check_gen("header_bytes", gen::header_bytes());
+    check_gen("header_bytes", generators::header_bytes());
 }

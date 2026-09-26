@@ -34,7 +34,7 @@ use openraft::{
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
-use crate::raft::{apply_op, ApplyTarget, NodeId, TypeConfig, WriteResponse};
+use crate::raft::{ApplyTarget, NodeId, TypeConfig, WriteResponse, apply_op};
 
 // ---- key layout (node-local durable store) ---------------------------------
 
@@ -589,8 +589,8 @@ impl RaftStateMachine<TypeConfig> for PersistentStateMachine {
 mod tests {
     use super::*;
     use boatramp_core::kv::MemoryKv;
-    use openraft::testing::StoreBuilder;
     use openraft::StorageError;
+    use openraft::testing::StoreBuilder;
 
     /// Builds fresh persistent stores over an in-memory `KvStore` for the
     /// openraft conformance suite. (Real on-disk durability is the `KvStore`

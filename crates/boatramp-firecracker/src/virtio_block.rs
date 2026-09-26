@@ -16,7 +16,7 @@ use virtio_queue::{DescriptorChain, Queue};
 use vm_memory::{Bytes, GuestMemoryMmap};
 
 use crate::device_manager::VirtioDeviceOps;
-use crate::embedded_vmm::{drain_available, VmmError};
+use crate::embedded_vmm::{VmmError, drain_available};
 use crate::virtio_mmio::VirtioDevice;
 
 /// virtio device type id for a block device.
@@ -301,9 +301,11 @@ mod tests {
         let mut st = [0u8; 1];
         mem.read_slice(&mut st, GuestAddress(STATUS_ADDR)).unwrap();
         assert_eq!(st[0], VIRTIO_BLK_S_OK);
-        assert!(rw.backing.get_ref()[..SECTOR_SIZE as usize]
-            .iter()
-            .all(|&b| b == 0xcd));
+        assert!(
+            rw.backing.get_ref()[..SECTOR_SIZE as usize]
+                .iter()
+                .all(|&b| b == 0xcd)
+        );
 
         // Read-only device: the write is rejected with an I/O error status.
         let mut ro = VirtioBlock::new(Cursor::new(vec![0u8; (SECTOR_SIZE * 2) as usize]), 2, true);

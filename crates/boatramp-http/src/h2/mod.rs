@@ -42,7 +42,7 @@ pub use settings::Settings;
 pub use stream::StreamState;
 // Re-export the shared serving types so `h2` is a self-contained facade (the h2 driver's
 // public API is `Handler`/`Request`/`Response`/`Body` + the `serve_connection*` fns).
-pub use crate::serving::{response, Body, BodyChunk, BodyError, Handler, Request, Response};
+pub use crate::serving::{Body, BodyChunk, BodyError, Handler, Request, Response, response};
 
 /// The HTTP/2 connection preface a client sends first (RFC 7540 §3.5).
 pub const CLIENT_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";

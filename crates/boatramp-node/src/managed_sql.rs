@@ -31,9 +31,9 @@ use boatramp_core::sql::{
     MigrationSubstrate, SubstrateStepOutcome,
 };
 #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
-use boatramp_storage::sql_compute::{ComputeEndpointResolver, ReplicaDiag};
-#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
 use boatramp_storage::ExternalSqlKind;
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+use boatramp_storage::sql_compute::{ComputeEndpointResolver, ReplicaDiag};
 #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
 use std::collections::HashMap;
 
@@ -435,7 +435,7 @@ async fn register_shared_server(
     workload: &str,
 ) {
     use boatramp_core::compute::{
-        managed_db_spec, ComputeWorkload, ManagedDbEngine, PlacementConstraints,
+        ComputeWorkload, ManagedDbEngine, PlacementConstraints, managed_db_spec,
     };
 
     /// 10 GiB — the default managed data-volume size when the config sets none.
@@ -666,7 +666,7 @@ impl NodeOperatorSql {
         &self,
         db: &str,
     ) -> Result<Arc<dyn boatramp_core::sql::SqlBackend>, SqlError> {
-        use boatramp_storage::sql_sqlx::{connect, ExternalSqlOptions};
+        use boatramp_storage::sql_sqlx::{ExternalSqlOptions, connect};
         let cfg = self
             .databases
             .get(db)
@@ -713,33 +713,33 @@ impl NodeOperatorSql {
         // **username** matches (two equivalent DSNs like `…/db` vs `…/db?charset=utf8` authenticate
         // as the same user). The byte-equality check is kept as an additional cheap catch; a DSN
         // that won't parse falls back to it (fail-closed on the strictest available signal).
-        if !cfg.url_env.is_empty() {
-            if let Some(runtime_url) = self.env_source.get(&cfg.url_env) {
-                if runtime_url == ddl_url {
-                    return Err(SqlError::other(format!(
-                        "database {db:?}: `migration_url_env` resolves to the SAME connection as the \
+        if !cfg.url_env.is_empty()
+            && let Some(runtime_url) = self.env_source.get(&cfg.url_env)
+        {
+            if runtime_url == ddl_url {
+                return Err(SqlError::other(format!(
+                    "database {db:?}: `migration_url_env` resolves to the SAME connection as the \
                          runtime `url_env` — the MySQL DDL identity must be distinct from the runtime \
                          user (refused fail-closed)"
-                    )));
-                }
-                // The username-distinctness parse needs sqlx's MySQL DSN parser (the `sql-mysql`
-                // feature). A MySQL binding can only actually connect under that feature anyway (the
-                // `connect(Mysql, …)` below refuses without it), so a `sql-postgres`-only build keeps
-                // just the byte-equality catch above — it can never run MySQL DDL regardless.
-                #[cfg(feature = "sql-mysql")]
+                )));
+            }
+            // The username-distinctness parse needs sqlx's MySQL DSN parser (the `sql-mysql`
+            // feature). A MySQL binding can only actually connect under that feature anyway (the
+            // `connect(Mysql, …)` below refuses without it), so a `sql-postgres`-only build keeps
+            // just the byte-equality catch above — it can never run MySQL DDL regardless.
+            #[cfg(feature = "sql-mysql")]
+            {
+                let ddl_user = boatramp_storage::sql_sqlx::mysql_dsn_username(&ddl_url);
+                let runtime_user = boatramp_storage::sql_sqlx::mysql_dsn_username(&runtime_url);
+                if let (Some(ddl_user), Some(runtime_user)) = (&ddl_user, &runtime_user)
+                    && ddl_user == runtime_user
                 {
-                    let ddl_user = boatramp_storage::sql_sqlx::mysql_dsn_username(&ddl_url);
-                    let runtime_user = boatramp_storage::sql_sqlx::mysql_dsn_username(&runtime_url);
-                    if let (Some(ddl_user), Some(runtime_user)) = (&ddl_user, &runtime_user) {
-                        if ddl_user == runtime_user {
-                            return Err(SqlError::other(format!(
-                                "database {db:?}: `migration_url_env` authenticates as the SAME \
+                    return Err(SqlError::other(format!(
+                        "database {db:?}: `migration_url_env` authenticates as the SAME \
                                  MySQL user ({ddl_user:?}) as the runtime `url_env` — the DDL login \
                                  must be a DISTINCT identity from the runtime tenant login (refused \
                                  fail-closed)"
-                            )));
-                        }
-                    }
+                    )));
                 }
             }
         }
@@ -763,7 +763,7 @@ impl NodeOperatorSql {
         owner: bool,
     ) -> Result<Arc<dyn boatramp_core::sql::SqlBackend>, SqlError> {
         use boatramp_storage::sql_compute::ComputeResolvedSqlBackend;
-        use boatramp_storage::sql_sqlx::{connect, ExternalSqlOptions};
+        use boatramp_storage::sql_sqlx::{ExternalSqlOptions, connect};
         // Defense-in-depth: the API path param + CLI `--db` are validated before they
         // reach here, but this is the single lookup choke point for every operator
         // SQL / migration caller, so re-run the one canonical validator (`database`)
@@ -827,10 +827,9 @@ impl NodeOperatorSql {
             )))
         } else {
             // Bring-your-own URL (a secret named indirectly by an env var).
-            let url = self
-                .env_source
-                .get(&cfg.url_env)
-                .ok_or_else(|| SqlError::other(format!("env var {} (url) is unset", cfg.url_env)))?;
+            let url = self.env_source.get(&cfg.url_env).ok_or_else(|| {
+                SqlError::other(format!("env var {} (url) is unset", cfg.url_env))
+            })?;
             let read_url = match &cfg.read_url_env {
                 Some(var) => Some(self.env_source.get(var).ok_or_else(|| {
                     SqlError::other(format!("env var {var} (read url) is unset"))
@@ -1570,7 +1569,7 @@ impl MigrationSubstrate for NodeMigrationRunner {
                     "internal: a function step must be invoked by the orchestrator, not the \
                      substrate"
                         .to_string(),
-                ))
+                ));
             }
         };
         Ok(match outcome {
@@ -1787,11 +1786,11 @@ impl LibsqlMigrationRunner {
                  file); a remote-sqld `libsql` binding is not a migration target"
             )));
         };
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|e| MigrationError::Other(format!("libsql database {db:?}: {e}")))?;
-            }
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| MigrationError::Other(format!("libsql database {db:?}: {e}")))?;
         }
         boatramp_storage::LibsqlSql::open_local(path)
             .await
@@ -1978,7 +1977,7 @@ impl MigrationSubstrate for LibsqlMigrationRunner {
                     "internal: a function step must be invoked by the orchestrator, not the \
                      substrate"
                         .to_string(),
-                ))
+                ));
             }
         };
         Ok(match outcome {
@@ -2928,7 +2927,11 @@ mod tests {
             pg.engine_gate("main"),
             Ok(ExternalSqlKind::Postgres)
         ));
-        let my = runner_over(op_for("mysql", Some("X"), boatramp_core::env::MapEnv::new()));
+        let my = runner_over(op_for(
+            "mysql",
+            Some("X"),
+            boatramp_core::env::MapEnv::new(),
+        ));
         assert!(matches!(my.engine_gate("main"), Ok(ExternalSqlKind::Mysql)));
         // An unknown database name is NotConfigured, not a panic.
         assert!(matches!(
@@ -2960,7 +2963,10 @@ mod tests {
         // Same value for both env vars (injected via MapEnv) → refused.
         let env = boatramp_core::env::MapEnv::new()
             .with("RUNTIME_URL_ENV", "mysql://app:pw@localhost:3306/appdb")
-            .with("MIGRATE_URL_ENV_SAME", "mysql://app:pw@localhost:3306/appdb");
+            .with(
+                "MIGRATE_URL_ENV_SAME",
+                "mysql://app:pw@localhost:3306/appdb",
+            );
         let sub = runner_over(op_for("mysql", Some("MIGRATE_URL_ENV_SAME"), env));
         let err = sub.preflight("default", "main").await.unwrap_err();
         let msg = err.to_string();

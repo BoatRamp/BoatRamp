@@ -215,12 +215,12 @@ impl ComputeBackend for CloudflareBackend {
             RootSource::Image(_) => {
                 return Err(BackendError::Materialize(
                     "cloudflare backend needs a non-empty OCI image reference".into(),
-                ))
+                ));
             }
             RootSource::Tar(_) | RootSource::Rootfs(_) => {
                 return Err(BackendError::Materialize(
                     "cloudflare backend requires an image reference (RootSource::Image)".into(),
-                ))
+                ));
             }
         };
         Ok(Artifact::Image { reference })

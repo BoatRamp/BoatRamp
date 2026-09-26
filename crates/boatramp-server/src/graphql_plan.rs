@@ -11,10 +11,10 @@
 //! Pure and deterministic — operation + model in, plan out; no I/O.
 
 use crate::graphql_federation::Supergraph;
+use async_graphql_parser::Positioned;
 use async_graphql_parser::types::{
     DocumentOperations, Field, OperationType, Selection, SelectionSet, VariableDefinition,
 };
-use async_graphql_parser::Positioned;
 use async_graphql_value::{Name, Value};
 use boatramp_core::tenancy::TenancyClass;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -678,10 +678,8 @@ mod tests {
     /// `owner_of` locality-guard weak spot a mutation-testing run surfaced.)
     #[test]
     fn a_shareable_field_the_current_subgraph_owns_stays_local() {
-        let accounts =
-            "type Query { me: User } type User @key(fields: \"id\") { id: ID! name: String @shareable }";
-        let reviews =
-            "type Query { topReviewer: User } extend type User @key(fields: \"id\") { id: ID! @external name: String @shareable }";
+        let accounts = "type Query { me: User } type User @key(fields: \"id\") { id: ID! name: String @shareable }";
+        let reviews = "type Query { topReviewer: User } extend type User @key(fields: \"id\") { id: ID! @external name: String @shareable }";
         let sg = compose(&[
             ("accounts".into(), accounts.into()),
             ("reviews".into(), reviews.into()),

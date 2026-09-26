@@ -1590,11 +1590,13 @@ mod tests {
             }],
             ..Default::default()
         };
-        assert!(no_component
-            .compile_check()
-            .unwrap_err()
-            .to_string()
-            .contains("empty component"));
+        assert!(
+            no_component
+                .compile_check()
+                .unwrap_err()
+                .to_string()
+                .contains("empty component")
+        );
 
         // An unknown import is rejected.
         let bad_import = DeployConfig {
@@ -1606,11 +1608,13 @@ mod tests {
             }],
             ..Default::default()
         };
-        assert!(bad_import
-            .compile_check()
-            .unwrap_err()
-            .to_string()
-            .contains("unknown handler import"));
+        assert!(
+            bad_import
+                .compile_check()
+                .unwrap_err()
+                .to_string()
+                .contains("unknown handler import")
+        );
     }
 
     #[test]
@@ -1792,27 +1796,35 @@ mod tests {
     #[test]
     fn handler_validation_rejects_bad_config() {
         // Unknown import.
-        assert!(DeployConfig::from_ron(
-            r#"( handlers: [ ( route: "/a", component: "a.wasm", imports: ["wasi:gpu"] ) ] )"#
-        )
-        .is_err());
+        assert!(
+            DeployConfig::from_ron(
+                r#"( handlers: [ ( route: "/a", component: "a.wasm", imports: ["wasi:gpu"] ) ] )"#
+            )
+            .is_err()
+        );
         // Bad HTTP method.
-        assert!(DeployConfig::from_ron(
-            r#"( handlers: [ ( route: "/a", component: "a.wasm", methods: ["FETCH"] ) ] )"#
-        )
-        .is_err());
+        assert!(
+            DeployConfig::from_ron(
+                r#"( handlers: [ ( route: "/a", component: "a.wasm", methods: ["FETCH"] ) ] )"#
+            )
+            .is_err()
+        );
         // Cron route not served by any handler.
-        assert!(DeployConfig::from_ron(
-            r#"( handlers: [ ( route: "/a", component: "a.wasm" ) ],
+        assert!(
+            DeployConfig::from_ron(
+                r#"( handlers: [ ( route: "/a", component: "a.wasm" ) ],
                  crons: [ ( schedule: "* * * * *", route: "/nope" ) ] )"#
-        )
-        .is_err());
+            )
+            .is_err()
+        );
         // A cron whose route IS served validates.
-        assert!(DeployConfig::from_ron(
-            r#"( handlers: [ ( route: "/tasks/*", component: "a.wasm" ) ],
+        assert!(
+            DeployConfig::from_ron(
+                r#"( handlers: [ ( route: "/tasks/*", component: "a.wasm" ) ],
                  crons: [ ( schedule: "0 0 * * *", route: "/tasks/x" ) ] )"#
-        )
-        .is_ok());
+            )
+            .is_ok()
+        );
     }
 
     #[test]

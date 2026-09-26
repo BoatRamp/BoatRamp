@@ -11,11 +11,11 @@
 
 use async_trait::async_trait;
 use base64::Engine;
+use rsa::RsaPrivateKey;
 use rsa::pkcs1v15::SigningKey;
 use rsa::pkcs8::DecodePrivateKey;
 use rsa::sha2::Sha256;
 use rsa::signature::{SignatureEncoding, Signer};
-use rsa::RsaPrivateKey;
 
 use crate::dns::{DnsError, DnsProvider, DnsRecord};
 

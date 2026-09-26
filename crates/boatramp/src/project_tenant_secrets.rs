@@ -182,54 +182,62 @@ mod tests {
 
     #[test]
     fn set_requires_tenant_and_exactly_one_value_source() {
-        assert!(parse(&[
-            "tenant-secrets",
-            "set",
-            "--tenant",
-            "firm-1",
-            "oauth",
-            "--value",
-            "s"
-        ])
-        .is_ok());
-        assert!(parse(&[
-            "tenant-secrets",
-            "set",
-            "--tenant",
-            "firm-1",
-            "oauth",
-            "--stdin"
-        ])
-        .is_ok());
+        assert!(
+            parse(&[
+                "tenant-secrets",
+                "set",
+                "--tenant",
+                "firm-1",
+                "oauth",
+                "--value",
+                "s"
+            ])
+            .is_ok()
+        );
+        assert!(
+            parse(&[
+                "tenant-secrets",
+                "set",
+                "--tenant",
+                "firm-1",
+                "oauth",
+                "--stdin"
+            ])
+            .is_ok()
+        );
         // Missing --tenant is a parse error.
         assert!(parse(&["tenant-secrets", "set", "oauth", "--value", "s"]).is_err());
         // Two value sources are mutually exclusive.
-        assert!(parse(&[
-            "tenant-secrets",
-            "set",
-            "--tenant",
-            "firm-1",
-            "oauth",
-            "--stdin",
-            "--value",
-            "x"
-        ])
-        .is_err());
+        assert!(
+            parse(&[
+                "tenant-secrets",
+                "set",
+                "--tenant",
+                "firm-1",
+                "oauth",
+                "--stdin",
+                "--value",
+                "x"
+            ])
+            .is_err()
+        );
     }
 
     #[test]
     fn ls_rm_rotate_parse_with_tenant() {
         assert!(parse(&["tenant-secrets", "ls", "--tenant", "firm-1"]).is_ok());
         assert!(parse(&["tenant-secrets", "rm", "--tenant", "firm-1", "oauth"]).is_ok());
-        assert!(parse(&[
-            "tenant-secrets",
-            "rotate",
-            "--tenant",
-            "firm-1",
-            "oauth",
-            "--stdin"
-        ])
-        .is_ok());
+        assert!(
+            parse(&[
+                "tenant-secrets",
+                "rotate",
+                "--tenant",
+                "firm-1",
+                "oauth",
+                "--stdin"
+            ])
+            .is_ok()
+        );
         // ls without --tenant is refused (never project-wide).
         assert!(parse(&["tenant-secrets", "ls"]).is_err());
     }

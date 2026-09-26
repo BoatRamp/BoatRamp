@@ -803,11 +803,7 @@ pub mod keys {
 /// (`/api/hello` → `api-hello`, `/` → `root`).
 pub fn handler_name(route: &str) -> String {
     let s = slug(route);
-    if s.is_empty() {
-        "root".to_string()
-    } else {
-        s
-    }
+    if s.is_empty() { "root".to_string() } else { s }
 }
 
 /// The site-scoped function name for a topic consumer (`orders` → `consumer-orders`).

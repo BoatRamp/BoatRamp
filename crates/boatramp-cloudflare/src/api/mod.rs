@@ -14,8 +14,8 @@ pub mod models;
 pub mod resources;
 pub mod workers;
 
-use serde::de::DeserializeOwned;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 
 /// The Cloudflare v4 API base (same as the other boatramp CF clients).
 const API_BASE: &str = "https://api.cloudflare.com/client/v4";

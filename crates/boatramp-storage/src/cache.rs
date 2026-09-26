@@ -419,7 +419,7 @@ mod tests {
         read_all(&cache, "a").await.unwrap(); // caches a
         read_all(&cache, "b").await.unwrap(); // caches b, evicts a
         read_all(&cache, "a").await.unwrap(); // a was evicted -> backend again
-                                              // a: miss, b: miss, a: miss again => 3 backend gets.
+        // a: miss, b: miss, a: miss again => 3 backend gets.
         assert_eq!(inner.get_count(), 3);
     }
 

@@ -57,7 +57,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::kv::{KvStore, WriteOp};
-use crate::project::{self, owner_kind, DomainOwner, DEFAULT_PROJECT};
+use crate::project::{self, DEFAULT_PROJECT, DomainOwner, owner_kind};
 use crate::time::now_unix;
 
 /// The global marker key recording the store's schema version + migration progress.
@@ -776,37 +776,38 @@ impl Step for BuildOwnerIndex {
         // Sites: the site-config pointer `project/default/site/<site>`.
         let site_prefix = format!("project/{DEFAULT_PROJECT}/site/");
         for key in kv.list_prefix(&site_prefix).await? {
-            if let Some(site) = key.strip_prefix(&site_prefix) {
-                if !site.is_empty() {
-                    ops.push(WriteOp::Put(
-                        project::owner_key(owner_kind::SITE, site),
-                        DEFAULT_PROJECT.as_bytes().to_vec(),
-                    ));
-                }
+            if let Some(site) = key.strip_prefix(&site_prefix)
+                && !site.is_empty()
+            {
+                ops.push(WriteOp::Put(
+                    project::owner_key(owner_kind::SITE, site),
+                    DEFAULT_PROJECT.as_bytes().to_vec(),
+                ));
             }
         }
         // Functions: the meta key `project/default/functions/<name>` (no further `/`).
         let fn_prefix = format!("project/{DEFAULT_PROJECT}/functions/");
         for key in kv.list_prefix(&fn_prefix).await? {
-            if let Some(rest) = key.strip_prefix(&fn_prefix) {
-                if !rest.is_empty() && !rest.contains('/') {
-                    ops.push(WriteOp::Put(
-                        project::owner_key(owner_kind::FUNCTION, rest),
-                        DEFAULT_PROJECT.as_bytes().to_vec(),
-                    ));
-                }
+            if let Some(rest) = key.strip_prefix(&fn_prefix)
+                && !rest.is_empty()
+                && !rest.contains('/')
+            {
+                ops.push(WriteOp::Put(
+                    project::owner_key(owner_kind::FUNCTION, rest),
+                    DEFAULT_PROJECT.as_bytes().to_vec(),
+                ));
             }
         }
         // Compute workloads: `project/default/compute/<name>`.
         let compute_prefix = format!("project/{DEFAULT_PROJECT}/compute/");
         for key in kv.list_prefix(&compute_prefix).await? {
-            if let Some(name) = key.strip_prefix(&compute_prefix) {
-                if !name.is_empty() {
-                    ops.push(WriteOp::Put(
-                        project::owner_key(owner_kind::COMPUTE, name),
-                        DEFAULT_PROJECT.as_bytes().to_vec(),
-                    ));
-                }
+            if let Some(name) = key.strip_prefix(&compute_prefix)
+                && !name.is_empty()
+            {
+                ops.push(WriteOp::Put(
+                    project::owner_key(owner_kind::COMPUTE, name),
+                    DEFAULT_PROJECT.as_bytes().to_vec(),
+                ));
             }
         }
         report.owner_entries += ops.len();
@@ -965,11 +966,12 @@ mod tests {
             kv.get("owner/function/resize").await.unwrap().as_deref(),
             Some(&b"default"[..])
         );
-        assert!(kv
-            .get("owner/function/resize/versions/v1")
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            kv.get("owner/function/resize/versions/v1")
+                .await
+                .unwrap()
+                .is_none()
+        );
 
         assert_eq!(status(&kv).await.unwrap(), Status::Ready);
         assert!(!report.already_migrated);
@@ -1005,11 +1007,12 @@ mod tests {
 
         assert!(report.total_rekeyed() > 0);
         assert!(report.created_default_project);
-        assert!(kv
-            .get("project/default/current/blog")
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            kv.get("project/default/current/blog")
+                .await
+                .unwrap()
+                .is_none()
+        );
         assert!(kv.get("current/blog").await.unwrap().is_some());
         assert!(kv.get("projectmeta/default").await.unwrap().is_none());
         assert_eq!(status(&kv).await.unwrap(), Status::NeedsMigration);
@@ -1031,11 +1034,12 @@ mod tests {
         .unwrap();
         assert!(staged.dual);
         assert_eq!(status(&kv).await.unwrap(), Status::Dual);
-        assert!(kv
-            .get("project/default/current/blog")
-            .await
-            .unwrap()
-            .is_some());
+        assert!(
+            kv.get("project/default/current/blog")
+                .await
+                .unwrap()
+                .is_some()
+        );
         assert!(
             kv.get("current/blog").await.unwrap().is_some(),
             "old key kept during dual soak"
@@ -1094,11 +1098,12 @@ mod tests {
         );
         assert!(kv.get("compute/api").await.unwrap().is_none());
         // No double-nesting from re-processing an already-done family.
-        assert!(kv
-            .get("project/default/project/default/current/blog")
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            kv.get("project/default/project/default/current/blog")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -1183,11 +1188,12 @@ mod tests {
             .unwrap();
 
         // Both migrations applied: v1 re-keyed the store, v2 wrote its sentinel.
-        assert!(kv
-            .get("project/default/current/blog")
-            .await
-            .unwrap()
-            .is_some());
+        assert!(
+            kv.get("project/default/current/blog")
+                .await
+                .unwrap()
+                .is_some()
+        );
         assert_eq!(
             kv.get("demo/v2").await.unwrap().as_deref(),
             Some(&b"ok"[..])

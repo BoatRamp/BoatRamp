@@ -44,7 +44,7 @@ pub fn validate_deploy(_dir: &Path, _config: &DeployConfig) -> Result<()> {
 }
 
 #[cfg(feature = "handlers")]
-pub use imp::{host_capabilities, validate_deploy, HostCapabilities};
+pub use imp::{HostCapabilities, host_capabilities, validate_deploy};
 
 /// The capability surface a host advertises (`boatramp capabilities` /
 /// `/api/capabilities`): the `boatramp:handlers` package version it implements and
@@ -72,7 +72,7 @@ pub fn host_capabilities() -> HostCapabilities {
 #[cfg(feature = "handlers")]
 mod imp {
     use super::*;
-    use wit_component::{decode, DecodedWasm};
+    use wit_component::{DecodedWasm, decode};
     use wit_parser::{Resolve, WorldId, WorldItem};
 
     /// `(package "ns:name", interface name)` interface labels.
@@ -241,19 +241,19 @@ mod imp {
                         d == token || d.strip_prefix(token).is_some_and(|r| r.starts_with(':'))
                     }) =>
                 {
-                    continue
+                    continue;
                 }
                 Some(token) => {
                     return Err(format!(
                         "component imports {pkg}/{iface} (the `{token}` capability) but the \
                          deploy does not declare it. Imports are component-scoped: every route \
                          binding this component must grant `{token}`, even routes that don't use it"
-                    ))
+                    ));
                 }
                 None => {
                     return Err(format!(
                         "component imports disallowed interface {pkg}/{iface}"
-                    ))
+                    ));
                 }
             }
         }
@@ -267,7 +267,7 @@ mod imp {
         let (resolve, world) = match &decoded {
             DecodedWasm::Component(resolve, world) => (resolve, *world),
             DecodedWasm::WitPackage(..) => {
-                return Err("file is a WIT package, not a component".to_string())
+                return Err("file is a WIT package, not a component".to_string());
             }
         };
         Ok((
@@ -402,13 +402,15 @@ mod imp {
         fn policy_gates_capability_imports() {
             let exports = [lbl("wasi:http", "incoming-handler")];
             let imports = [lbl("wasi:io", "streams"), lbl("wasi:keyvalue", "store")];
-            assert!(check_interface_policy(
-                &imports,
-                &exports,
-                &["wasi:keyvalue".into()],
-                Role::Handler
-            )
-            .is_ok());
+            assert!(
+                check_interface_policy(
+                    &imports,
+                    &exports,
+                    &["wasi:keyvalue".into()],
+                    Role::Handler
+                )
+                .is_ok()
+            );
             assert!(check_interface_policy(&imports, &exports, &[], Role::Handler).is_err());
         }
 
@@ -418,13 +420,10 @@ mod imp {
             // An unknown interface is refused even when named in `imports`:
             // declaring does not whitelist arbitrary packages.
             let fs = [lbl("wasi:filesystem", "types")];
-            assert!(check_interface_policy(
-                &fs,
-                &exports,
-                &["wasi:filesystem".into()],
-                Role::Handler
-            )
-            .is_err());
+            assert!(
+                check_interface_policy(&fs, &exports, &["wasi:filesystem".into()], Role::Handler)
+                    .is_err()
+            );
             // A foundational interface needs no declaration.
             let base = [lbl("wasi:clocks", "monotonic-clock")];
             assert!(check_interface_policy(&base, &exports, &[], Role::Handler).is_ok());
@@ -599,13 +598,15 @@ mod imp {
             // `wasi:messaging` grant (the host interface is boatramp:handlers/*).
             let http_export = [lbl("wasi:http", "incoming-handler")];
             let producer = [lbl("boatramp:handlers", "messaging-producer")];
-            assert!(check_interface_policy(
-                &producer,
-                &http_export,
-                &["wasi:messaging".into()],
-                Role::Handler
-            )
-            .is_ok());
+            assert!(
+                check_interface_policy(
+                    &producer,
+                    &http_export,
+                    &["wasi:messaging".into()],
+                    Role::Handler
+                )
+                .is_ok()
+            );
             assert!(check_interface_policy(&producer, &http_export, &[], Role::Handler).is_err());
 
             // A consumer must export boatramp:handlers/messaging-handler; a plain

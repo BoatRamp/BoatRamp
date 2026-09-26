@@ -200,12 +200,14 @@ mod tests {
         let ti = a.iter().position(|x| x == "--tree").unwrap();
         assert_eq!(a[ti + 1], "4242");
         // the mount-isolation trio that made restore work
-        assert!(a
-            .windows(2)
-            .any(|w| w[0] == "--root" && w[1] == "/data/rootfs/abc"));
-        assert!(a
-            .windows(2)
-            .any(|w| w[0] == "--ext-mount-map" && w[1] == "auto"));
+        assert!(
+            a.windows(2)
+                .any(|w| w[0] == "--root" && w[1] == "/data/rootfs/abc")
+        );
+        assert!(
+            a.windows(2)
+                .any(|w| w[0] == "--ext-mount-map" && w[1] == "auto")
+        );
         assert!(a.iter().any(|x| x == "--enable-external-masters"));
         // networking is managed by the launcher, not CRIU
         assert!(a.windows(2).any(|w| w[0] == "--empty-ns" && w[1] == "net"));
@@ -220,14 +222,16 @@ mod tests {
         );
         assert_eq!(a[0], "restore");
         assert!(a.iter().any(|x| x == "--restore-detached"));
-        assert!(a
-            .windows(2)
-            .any(|w| w[0] == "--pidfile" && w[1] == "/img/restore.pid"));
+        assert!(
+            a.windows(2)
+                .any(|w| w[0] == "--pidfile" && w[1] == "/img/restore.pid")
+        );
         // net ns is left empty; the backend re-attaches the veth afterward
         assert!(a.windows(2).any(|w| w[0] == "--empty-ns" && w[1] == "net"));
         // same isolation flags as dump, so the mount tree matches
-        assert!(a
-            .windows(2)
-            .any(|w| w[0] == "--root" && w[1] == "/data/rootfs/abc"));
+        assert!(
+            a.windows(2)
+                .any(|w| w[0] == "--root" && w[1] == "/data/rootfs/abc")
+        );
     }
 }

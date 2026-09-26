@@ -21,8 +21,8 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 use block2::RcBlock;
-use objc2::rc::Retained;
 use objc2::AllocAnyThread;
+use objc2::rc::Retained;
 use objc2_core_foundation::CFRunLoop;
 use objc2_foundation::{NSData, NSError, NSFileHandle, NSString, NSURL};
 use objc2_virtualization::{
@@ -33,7 +33,7 @@ use objc2_virtualization::{
     VZVirtualMachine, VZVirtualMachineConfiguration,
 };
 
-use crate::config::{full_cmdline, WorkerConfig};
+use crate::config::{WorkerConfig, full_cmdline};
 use crate::net::mac_for;
 
 /// Build a validated [`VZVirtualMachineConfiguration`] for `cfg`. Assembles the
@@ -144,16 +144,23 @@ unsafe fn block_device(
     read_only: bool,
 ) -> Result<Retained<objc2_virtualization::VZStorageDeviceConfiguration>, String> {
     let url = file_url(path);
-    let attachment = VZDiskImageStorageDeviceAttachment::initWithURL_readOnly_error(
-        VZDiskImageStorageDeviceAttachment::alloc(),
-        &url,
-        read_only,
-    )
+    // SAFETY: plain Obj-C object creation over a freshly-allocated attachment; returns an
+    // error (→ Err) if the disk image at `url` cannot be opened.
+    let attachment = unsafe {
+        VZDiskImageStorageDeviceAttachment::initWithURL_readOnly_error(
+            VZDiskImageStorageDeviceAttachment::alloc(),
+            &url,
+            read_only,
+        )
+    }
     .map_err(|e| format!("attach {path}: {}", ns_error(&e)))?;
-    let block = VZVirtioBlockDeviceConfiguration::initWithAttachment(
-        VZVirtioBlockDeviceConfiguration::alloc(),
-        &attachment,
-    );
+    // SAFETY: plain object creation wrapping the attachment we just built.
+    let block = unsafe {
+        VZVirtioBlockDeviceConfiguration::initWithAttachment(
+            VZVirtioBlockDeviceConfiguration::alloc(),
+            &attachment,
+        )
+    };
     Ok(Retained::into_super(block))
 }
 
@@ -197,7 +204,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 fn hex_decode(hex: &str) -> Option<Vec<u8>> {
-    if hex.len() % 2 != 0 {
+    if !hex.len().is_multiple_of(2) {
         return None;
     }
     (0..hex.len())
@@ -247,8 +254,8 @@ where
     while result.borrow().is_none() {
         CFRunLoop::run();
     }
-    let outcome = result.borrow_mut().take().unwrap_or(Ok(()));
-    outcome
+
+    result.borrow_mut().take().unwrap_or(Ok(()))
 }
 
 /// Run one VM to completion in **this** process. Called from the `__vz-run`

@@ -22,7 +22,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use boatramp_core::email_config::{EmailProfile, DEFAULT_PROFILE};
+use boatramp_core::email_config::{DEFAULT_PROFILE, EmailProfile};
 
 mod generated {
     wasmtime::component::bindgen!({
@@ -286,10 +286,10 @@ fn build_message(message: &OutboundEmail) -> Result<Message, String> {
             builder = builder.bcc(parse("bcc", bcc)?);
         }
     }
-    if let Some(reply_to) = &message.reply_to {
-        if !reply_to.trim().is_empty() {
-            builder = builder.reply_to(parse("reply-to", reply_to)?);
-        }
+    if let Some(reply_to) = &message.reply_to
+        && !reply_to.trim().is_empty()
+    {
+        builder = builder.reply_to(parse("reply-to", reply_to)?);
     }
     let built = match (&message.text, &message.html) {
         (Some(text), Some(html)) => builder.multipart(MultiPart::alternative_plain_html(

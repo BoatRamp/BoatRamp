@@ -2,7 +2,7 @@
 # `[workspace.lints.clippy]` table in the root `Cargo.toml`).
 
 # Pin the MSRV so clippy never suggests an API newer than what the crate targets.
-msrv = "1.82"
+msrv = "1.91"
 
 # Project/library nouns that the `doc_markdown` lint would otherwise flag as
 # "should be in backticks". Kept here so the list is ready if `doc_markdown` is

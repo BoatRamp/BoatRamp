@@ -107,7 +107,7 @@ use boatramp_core::sql::{OperatorSql, SqlBackend, SqlValue};
 use boatramp_core::{ByteStream, GetObject, ObjectMeta, PutMeta, Storage, StorageError};
 use boatramp_node::config::{ExternalDatabaseConfig, TenantIsolation, TenantScope};
 use boatramp_node::managed_sql::{ManagedSqlCredentials, NodeOperatorSql};
-use boatramp_node::tenant_sql::{provision_tenant, NodeTenantSqlResolver};
+use boatramp_node::tenant_sql::{NodeTenantSqlResolver, provision_tenant};
 use boatramp_storage::sql_sqlx::PerTenantSqlResolver;
 use bytes::Bytes;
 use futures::StreamExt;
@@ -475,7 +475,7 @@ async fn drive(
         other => {
             return Err(format!(
                 "operator query returned an unexpected row shape: {other:?}"
-            ))
+            ));
         }
     };
     // The Single container's internal database is the plain configured `DATABASE`, and the

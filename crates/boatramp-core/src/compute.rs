@@ -608,10 +608,10 @@ impl Node {
                 // silently runs always-on. Fail loud (no placement) instead.
                 && (!spec.scale_to_zero || b.scale_to_zero)
         };
-        if let Some(pref) = &spec.prefer_backend {
-            if let Some(b) = self.backends.iter().find(|b| &b.id == pref && eligible(b)) {
-                return Some(b.id.clone());
-            }
+        if let Some(pref) = &spec.prefer_backend
+            && let Some(b) = self.backends.iter().find(|b| &b.id == pref && eligible(b))
+        {
+            return Some(b.id.clone());
         }
         self.backends
             .iter()
@@ -857,14 +857,14 @@ pub fn reconcile_plan(
         } else if inst.phase == ReplicaPhase::Zero {
             zeroed.insert(ord);
             // Wake on activity; otherwise stay parked.
-            if matches!(activity, WorkloadActivity::Active) {
-                if let Some(snapshot) = inst.snapshot.clone() {
-                    actions.push(Action::Restore {
-                        snapshot,
-                        node: inst.node,
-                        backend: inst.backend.clone(),
-                    });
-                }
+            if matches!(activity, WorkloadActivity::Active)
+                && let Some(snapshot) = inst.snapshot.clone()
+            {
+                actions.push(Action::Restore {
+                    snapshot,
+                    node: inst.node,
+                    backend: inst.backend.clone(),
+                });
             }
         } else if inst.healthy {
             healthy.insert(ord);
@@ -1232,26 +1232,26 @@ pub async fn reconcile_once(
                 ));
                 continue;
             }
-            if let Some(backend) = backends.get(&state.backend) {
-                if let Ok(health) = backend.health(&state.handle).await {
-                    let now_healthy = matches!(health, Health::Healthy);
-                    // PERSIST a health transition. The endpoint resolver reads `healthy`
-                    // from the STORE, not from this in-memory refresh — so a replica that
-                    // becomes reachable *after* launch must have that recovery written
-                    // back. `launch_one` probes readiness *before* the guest binds its
-                    // port and persists `healthy: false`; without persisting the refresh,
-                    // that pre-bind `false` sticks forever and the resolver reports "no
-                    // healthy replica" for a perfectly reachable workload (a running
-                    // healthy replica needs no Launch/Stop action, so nothing else writes
-                    // it back). Only write on a change to keep the reconcile cheap.
-                    if now_healthy != state.healthy {
-                        state.healthy = now_healthy;
-                        if let Err(e) = deploy.set_replica_state(project, state).await {
-                            report.errors.push(format!(
-                                "{}/{}: persist health: {e}",
-                                state.handle.workload, state.handle.replica
-                            ));
-                        }
+            if let Some(backend) = backends.get(&state.backend)
+                && let Ok(health) = backend.health(&state.handle).await
+            {
+                let now_healthy = matches!(health, Health::Healthy);
+                // PERSIST a health transition. The endpoint resolver reads `healthy`
+                // from the STORE, not from this in-memory refresh — so a replica that
+                // becomes reachable *after* launch must have that recovery written
+                // back. `launch_one` probes readiness *before* the guest binds its
+                // port and persists `healthy: false`; without persisting the refresh,
+                // that pre-bind `false` sticks forever and the resolver reports "no
+                // healthy replica" for a perfectly reachable workload (a running
+                // healthy replica needs no Launch/Stop action, so nothing else writes
+                // it back). Only write on a change to keep the reconcile cheap.
+                if now_healthy != state.healthy {
+                    state.healthy = now_healthy;
+                    if let Err(e) = deploy.set_replica_state(project, state).await {
+                        report.errors.push(format!(
+                            "{}/{}: persist health: {e}",
+                            state.handle.workload, state.handle.replica
+                        ));
                     }
                 }
             }
@@ -1260,19 +1260,19 @@ pub async fn reconcile_once(
         // Keep the shim registry populated for every running replica (idempotent),
         // so a workload's bindings keep working across a server restart while the
         // guest is still up.
-        if let Some(resolver) = resolver {
-            if !spec.bindings.is_empty() {
-                for state in &observed {
-                    if state.phase == ReplicaPhase::Running {
-                        resolver
-                            .resolve(
-                                &project_name,
-                                &workload.name,
-                                state.handle.replica,
-                                &spec.bindings,
-                            )
-                            .await;
-                    }
+        if let Some(resolver) = resolver
+            && !spec.bindings.is_empty()
+        {
+            for state in &observed {
+                if state.phase == ReplicaPhase::Running {
+                    resolver
+                        .resolve(
+                            &project_name,
+                            &workload.name,
+                            state.handle.replica,
+                            &spec.bindings,
+                        )
+                        .await;
                 }
             }
         }
@@ -1348,12 +1348,11 @@ pub async fn reconcile_once(
                         .iter()
                         .find(|o| o.handle == handle)
                         .and_then(|o| backends.get(&o.backend))
+                        && let Err(e) = b.stop(&handle).await
                     {
-                        if let Err(e) = b.stop(&handle).await {
-                            report
-                                .errors
-                                .push(format!("{}/{}: stop: {e}", handle.workload, handle.replica));
-                        }
+                        report
+                            .errors
+                            .push(format!("{}/{}: stop: {e}", handle.workload, handle.replica));
                     }
                     match deploy
                         .delete_replica_state(project, &handle.workload, handle.replica)
@@ -1366,17 +1365,17 @@ pub async fn reconcile_once(
                         )),
                     }
                     // Revoke this replica's shim tokens.
-                    if let Some(resolver) = resolver {
-                        if !spec.bindings.is_empty() {
-                            resolver
-                                .release(
-                                    &project_name,
-                                    &handle.workload,
-                                    handle.replica,
-                                    &spec.bindings,
-                                )
-                                .await;
-                        }
+                    if let Some(resolver) = resolver
+                        && !spec.bindings.is_empty()
+                    {
+                        resolver
+                            .release(
+                                &project_name,
+                                &handle.workload,
+                                handle.replica,
+                                &spec.bindings,
+                            )
+                            .await;
                     }
                 }
                 Action::Snapshot { handle } => {
@@ -1830,14 +1829,16 @@ mod tests {
         let nodes = vec![container(1, "eu", 8, 8192)];
         let mut s = spec(1, 128);
         s.isolation = IsolationRequirement::Untrusted;
-        assert!(place_replicas(
-            2,
-            &PlacementConstraints::default(),
-            &s,
-            &nodes,
-            &BackendPolicy::default()
-        )
-        .is_empty());
+        assert!(
+            place_replicas(
+                2,
+                &PlacementConstraints::default(),
+                &s,
+                &nodes,
+                &BackendPolicy::default()
+            )
+            .is_empty()
+        );
         // A vmm node satisfies it.
         let nodes = vec![vmm(1, "eu", 8, 8192)];
         let placed = place_replicas(
@@ -2228,9 +2229,11 @@ mod tests {
             &s2z_caps(),
             u64::MAX,
         );
-        assert!(actions
-            .iter()
-            .any(|a| matches!(a, Action::Stop { handle } if handle.replica == 1)));
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::Stop { handle } if handle.replica == 1))
+        );
         assert!(
             !actions.iter().any(|a| matches!(a, Action::Restore { .. })),
             "out-of-range parked replica is stopped, not restored"
@@ -2303,12 +2306,16 @@ mod tests {
             &obs,
         );
         // ordinal 1 is stopped AND relaunched.
-        assert!(actions
-            .iter()
-            .any(|a| matches!(a, Action::Stop { handle } if handle.replica == 1)));
-        assert!(actions
-            .iter()
-            .any(|a| matches!(a, Action::Launch { replica: 1, .. })));
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::Stop { handle } if handle.replica == 1))
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::Launch { replica: 1, .. }))
+        );
     }
 
     /// An `observed` replica with an explicit `started_at`, for the startup-grace path.
@@ -2406,9 +2413,11 @@ mod tests {
                 .any(|a| matches!(a, Action::Stop { handle } if handle.replica == 0)),
             "None started_at preserves the prior immediate relaunch: {actions:?}"
         );
-        assert!(actions
-            .iter()
-            .any(|a| matches!(a, Action::Launch { replica: 0, .. })));
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::Launch { replica: 0, .. }))
+        );
     }
 
     #[test]
@@ -2976,11 +2985,13 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(r3.stopped, 2);
-        assert!(deploy
-            .list_replica_states(crate::project::ProjectRef::DEFAULT, "w")
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            deploy
+                .list_replica_states(crate::project::ProjectRef::DEFAULT, "w")
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// A2: a backend that records the `gc_ip_pool` parked-key set it was handed, so we

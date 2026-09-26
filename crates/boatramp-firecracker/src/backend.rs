@@ -13,12 +13,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use boatramp_core::compute::{
-    compute_instance_id, Artifact, BackendError, Capabilities, ComputeBackend, ComputeSpec,
-    Endpoint, Health, Instance, InstanceHandle, IsolationClass, LaunchRequest, RootSource, Scheme,
-    Snapshot,
-};
 use boatramp_core::Storage;
+use boatramp_core::compute::{
+    Artifact, BackendError, Capabilities, ComputeBackend, ComputeSpec, Endpoint, Health, Instance,
+    InstanceHandle, IsolationClass, LaunchRequest, RootSource, Scheme, Snapshot,
+    compute_instance_id,
+};
 use futures::StreamExt;
 use tokio::io::AsyncWriteExt;
 
@@ -166,7 +166,7 @@ impl ComputeBackend for VmmBackend {
             RootSource::Image(_) | RootSource::Tar(_) => {
                 return Err(BackendError::Materialize(
                     "firecracker microVM requires a rootfs image (RootSource::Rootfs)".into(),
-                ))
+                ));
             }
         };
         let rootfs_path = self.stage_blob(rootfs_hash, "rootfs", ".ext4").await?;
@@ -186,7 +186,7 @@ impl ComputeBackend for VmmBackend {
             _ => {
                 return Err(BackendError::Launch(
                     "VMM backend requires a VmImages artifact".into(),
-                ))
+                ));
             }
         };
 

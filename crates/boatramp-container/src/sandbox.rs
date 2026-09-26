@@ -283,10 +283,11 @@ mod tests {
         assert!(proc.flags.contains(&"noexec".to_string()));
         let sys = plan.mounts.iter().find(|m| m.target == "/sys").unwrap();
         assert!(sys.flags.contains(&"ro".to_string()), "/sys is read-only");
-        assert!(plan
-            .mounts
-            .iter()
-            .any(|m| m.target == "/tmp" && m.fstype == "tmpfs"));
+        assert!(
+            plan.mounts
+                .iter()
+                .any(|m| m.target == "/tmp" && m.fstype == "tmpfs")
+        );
         assert!(plan.mounts.iter().any(|m| m.target == "/dev"));
         // `/run` is a sticky, world-writable tmpfs so a stock image (e.g. Postgres
         // creating `/run/postgresql`) can write its runtime dir under a rootless uid.

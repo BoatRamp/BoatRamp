@@ -34,7 +34,7 @@ use boatramp_core::sql::{MigrationAction, MigrationStep, MigrationSubstrate, Sql
 use boatramp_handlers::{HandlerEngine, Limits};
 use boatramp_node::config::{ExternalDatabaseConfig, TenantIsolation, TenantScope};
 use boatramp_node::managed_sql::{NodeMigrationRunner, NodeOperatorSql};
-use boatramp_server::{run_migration, Auth, HandlerRuntime, MigrateMode, ServerOptions};
+use boatramp_server::{Auth, HandlerRuntime, MigrateMode, ServerOptions, run_migration};
 use boatramp_storage::FsStorage;
 use bytes::Bytes;
 use futures::StreamExt;
@@ -119,7 +119,7 @@ async fn deploy_fixture(deploy: &DeployStore) {
 
 /// A direct (non-ledgered) connection to the test PG for setup + verification.
 async fn direct() -> Arc<dyn boatramp_core::sql::SqlBackend> {
-    use boatramp_storage::sql_sqlx::{connect, ExternalSqlKind, ExternalSqlOptions};
+    use boatramp_storage::sql_sqlx::{ExternalSqlKind, ExternalSqlOptions, connect};
     let url = std::env::var("BOATRAMP_TEST_PG_URL").unwrap();
     connect(ExternalSqlKind::Postgres, &ExternalSqlOptions::new(url)).unwrap()
 }
@@ -182,13 +182,8 @@ async fn migrate_function_step_end_to_end_on_a_real_engine() {
     runtime.set_tenancy_posture(false, false);
 
     let op = Arc::new(
-        NodeOperatorSql::new(
-            databases(),
-            Arc::new(MemoryKv::new()),
-            None,
-            deploy.clone(),
-        )
-        .with_env_source(Arc::new(env)),
+        NodeOperatorSql::new(databases(), Arc::new(MemoryKv::new()), None, deploy.clone())
+            .with_env_source(Arc::new(env)),
     );
     let substrate: Arc<dyn MigrationSubstrate> = Arc::new(NodeMigrationRunner::new(
         op,
@@ -277,7 +272,8 @@ async fn migrate_function_step_end_to_end_on_a_real_engine() {
     .await
     .unwrap();
     assert_eq!(
-        rep.newly_applied, vec!["0002_sqlsplit"],
+        rep.newly_applied,
+        vec!["0002_sqlsplit"],
         "sql-open applied ⇒ the guest saw sql:absent (binding-split holds); a leak would 500: {rep:?}"
     );
 

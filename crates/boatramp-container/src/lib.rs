@@ -64,8 +64,8 @@ pub mod worker;
 
 #[cfg(target_os = "linux")]
 pub use backend::ContainerBackend;
+pub use net::VethNetwork;
 #[cfg(target_os = "linux")]
 pub use net::ensure_bridge;
-pub use net::VethNetwork;
 pub use sandbox::{CgroupLimits, Mount, Namespaces, SandboxPlan};
 pub use seccomp::default_allowlist;

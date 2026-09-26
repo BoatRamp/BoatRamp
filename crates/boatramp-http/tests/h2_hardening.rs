@@ -7,7 +7,7 @@ use boatramp_http::h2::error::ErrorCode;
 use boatramp_http::h2::frame::{self, FrameHeader, FrameType};
 use boatramp_http::h2::hpack::Hpack;
 use boatramp_http::h2::{
-    response, serve_connection_mux, Handler, Request, Response, CLIENT_PREFACE,
+    CLIENT_PREFACE, Handler, Request, Response, response, serve_connection_mux,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 

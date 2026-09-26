@@ -12,7 +12,7 @@
 use std::sync::Arc;
 
 use boatramp_core::kv::{KvStore, MemoryKv};
-use boatramp_handlers::{empty_body, Bindings, HandlerEngine, HandlerError, Limits};
+use boatramp_handlers::{Bindings, HandlerEngine, HandlerError, Limits, empty_body};
 use http_body_util::BodyExt;
 
 /// No capabilities granted — these fixtures exercise only the http path.

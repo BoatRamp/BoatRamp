@@ -712,17 +712,17 @@ mod harness {
         }
 
         let mut ok = true;
-        if let Some(exp) = expect_status {
-            if status != exp {
-                eprintln!("FAIL: expected status {exp}, got {status}");
-                ok = false;
-            }
+        if let Some(exp) = expect_status
+            && status != exp
+        {
+            eprintln!("FAIL: expected status {exp}, got {status}");
+            ok = false;
         }
-        if let Some(sub) = &expect_body {
-            if !text.contains(sub.as_str()) {
-                eprintln!("FAIL: body does not contain {sub:?}");
-                ok = false;
-            }
+        if let Some(sub) = &expect_body
+            && !text.contains(sub.as_str())
+        {
+            eprintln!("FAIL: body does not contain {sub:?}");
+            ok = false;
         }
         if ok {
             println!("ok");

@@ -39,10 +39,10 @@ use std::os::fd::{AsRawFd, IntoRawFd, OwnedFd};
 use std::path::Path;
 
 use boatramp_core::compute::{BackendError, ExecOutput};
-use nix::sched::{setns, CloneFlags};
-use nix::sys::wait::{waitpid, WaitStatus};
+use nix::sched::{CloneFlags, setns};
+use nix::sys::wait::{WaitStatus, waitpid};
 use nix::unistd::{
-    chdir, close, dup2, execvp, fork, pipe, setresgid, setresuid, ForkResult, Gid, Pid, Uid,
+    ForkResult, Gid, Pid, Uid, chdir, close, dup2, execvp, fork, pipe, setresgid, setresuid,
 };
 
 /// The namespaces we join (in this order — user first) to re-enter a running
@@ -322,7 +322,7 @@ fn parent_pump_and_reap(
         Ok(other) => {
             return Err(BackendError::Other(format!(
                 "exec: unexpected wait status {other:?}"
-            )))
+            )));
         }
         Err(e) => return Err(BackendError::Other(format!("exec: waitpid: {e}"))),
     };

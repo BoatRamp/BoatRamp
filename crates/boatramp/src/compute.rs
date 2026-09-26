@@ -479,12 +479,12 @@ pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<()> {
                 (None, None, None) => {
                     return Err(Error::Args(
                         "one of --image, --tar, or --rootfs is required".into(),
-                    ))
+                    ));
                 }
                 _ => {
                     return Err(Error::Args(
                         "give only one of --image, --tar, or --rootfs".into(),
-                    ))
+                    ));
                 }
             };
             // `--kernel` accepts a blob hash, a local file, or a URL.
@@ -671,13 +671,13 @@ pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<()> {
             match resp.status() {
                 s if s.is_success() => println!("removed {name}"),
                 reqwest::StatusCode::NOT_FOUND => {
-                    return Err(Error::Server(format!("no such volume {name:?}")))
+                    return Err(Error::Server(format!("no such volume {name:?}")));
                 }
                 reqwest::StatusCode::CONFLICT => {
                     return Err(Error::Server(format!(
                         "volume {name:?} in use by a registered workload; `compute rm` it \
                          first, or pass --force"
-                    )))
+                    )));
                 }
                 s => {
                     let text = resp.text().await.unwrap_or_default();
@@ -775,7 +775,7 @@ pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<()> {
                     return Err(Error::Server(format!(
                         "no such replica: {workload} #{replica} (in project {:?})",
                         client::resolve_project(config)
-                    )))
+                    )));
                 }
                 s => {
                     let text = resp.text().await.unwrap_or_default();
@@ -872,7 +872,7 @@ pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<()> {
                     return Err(Error::Server(format!(
                         "no such replica: {workload} #{replica} (in project {:?})",
                         client::resolve_project(config)
-                    )))
+                    )));
                 }
                 s => {
                     let text = resp.text().await.unwrap_or_default();

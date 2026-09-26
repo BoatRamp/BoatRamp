@@ -10,10 +10,10 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use axum::Router;
 use axum::body::Body;
 use axum::extract::ConnectInfo;
-use axum::http::{header::ALT_SVC, HeaderValue, Request, Response};
-use axum::Router;
+use axum::http::{HeaderValue, Request, Response, header::ALT_SVC};
 use bytes::Buf;
 use futures::StreamExt;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};

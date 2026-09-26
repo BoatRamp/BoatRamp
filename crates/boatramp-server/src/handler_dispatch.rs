@@ -154,7 +154,7 @@ pub(super) async fn dispatch_handler(
                         .await
                         {
                             graphql_apq::Resolved::Error(msg) => {
-                                return graphql_apq::error_response(&msg)
+                                return graphql_apq::error_response(&msg);
                             }
                             graphql_apq::Resolved::Query(q) => {
                                 // Inject the resolved query so the handler executes it.
@@ -351,17 +351,16 @@ pub(super) async fn dispatch_handler(
                 handler_cache::cache_key(&scope, request.method(), path_and_query)
             })
         });
-    if let Some(key) = &cache_key {
-        if let Some(hit) = handler_cache::lookup_response(
+    if let Some(key) = &cache_key
+        && let Some(hit) = handler_cache::lookup_response(
             inner.kv.as_ref(),
             key,
             request.headers(),
             handler_cache::now_secs(),
         )
         .await
-        {
-            return hit;
-        }
+    {
+        return hit;
     }
     let cache_write = match (&cache_cfg, &cache_key) {
         (Some(cfg), Some(key)) => Some((
@@ -473,7 +472,7 @@ pub(super) async fn dispatch_handler(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "site handler concurrency limit reached\n",
             )
-                .into_response()
+                .into_response();
         }
     };
 
@@ -542,12 +541,12 @@ pub(super) async fn dispatch_handler(
     };
     // Issue a freshly-minted R3 session cookie (added last so it lands on the guest's own response;
     // never cached — it is a per-visitor identity). Only present on a first anonymous request.
-    if let Some(set_cookie) = set_session_cookie {
-        if let Ok(value) = axum::http::HeaderValue::from_str(&set_cookie) {
-            response
-                .headers_mut()
-                .append(axum::http::header::SET_COOKIE, value);
-        }
+    if let Some(set_cookie) = set_session_cookie
+        && let Ok(value) = axum::http::HeaderValue::from_str(&set_cookie)
+    {
+        response
+            .headers_mut()
+            .append(axum::http::header::SET_COOKIE, value);
     }
     response
 }
@@ -693,7 +692,7 @@ async fn federation_gateway(
                 StatusCode::BAD_GATEWAY,
                 format!("supergraph composition failed: {err}\n"),
             )
-                .into_response()
+                .into_response();
         }
     };
     let op_hash = crate::graphql_apq::sha256_hex(query);
@@ -720,7 +719,7 @@ async fn federation_gateway(
         Err(_) => {
             return graphql_guard::error_response(
                 "the query cannot be planned against the supergraph",
-            )
+            );
         }
     };
     let Some(invoker) = inner.invoker.get() else {
@@ -1386,10 +1385,10 @@ async fn resolve_or_mint_session(
     let anchor = signer.public_key();
     let now = boatramp_core::time::now_unix();
     // Reuse a still-valid incoming cookie (its own per-fact lifetime); else mint fresh.
-    if let Some(cookie) = cookie_value(headers, SESSION_COOKIE_NAME) {
-        if boatramp_core::cose::verify_session(&cookie, &anchor, now).is_ok() {
-            return (Some(cookie), None);
-        }
+    if let Some(cookie) = cookie_value(headers, SESSION_COOKIE_NAME)
+        && boatramp_core::cose::verify_session(&cookie, &anchor, now).is_ok()
+    {
+        return (Some(cookie), None);
     }
     let Some(sid) = new_session_sid() else {
         return (None, None); // fail-closed on an RNG failure — no cookie rather than a weak one
@@ -1921,18 +1920,18 @@ pub(super) async fn build_bindings(
     // must be one of `stats_topics`, and the host substitutes THIS invocation's resolved tenant for
     // the template's `{tenant}` placeholder — the guest never names a tenant, so no cross-tenant
     // oracle. Deny-by-default (needs the import, the site allowlist, and the messaging substrate).
-    if granted("messaging-stats") {
-        if let Some(messaging) = &inner.messaging {
-            let resolved_tenant =
-                super::function_runtime::resolved_tenant_string(&handler_caller_tenant);
-            bindings = bindings.with_messaging_stats(
-                format!("{scope}/"),
-                format!("{}/", project.qualified("bus")),
-                messaging.clone(),
-                stats_topics.to_vec(),
-                resolved_tenant,
-            );
-        }
+    if granted("messaging-stats")
+        && let Some(messaging) = &inner.messaging
+    {
+        let resolved_tenant =
+            super::function_runtime::resolved_tenant_string(&handler_caller_tenant);
+        bindings = bindings.with_messaging_stats(
+            format!("{scope}/"),
+            format!("{}/", project.qualified("bus")),
+            messaging.clone(),
+            stats_topics.to_vec(),
+            resolved_tenant,
+        );
     }
     // The per-tenant sealed-secret capability (task #493): read/write secrets sealed to THIS
     // invocation's resolved OWN-tenant. Two INDEPENDENT rights — `tenant-secrets:read` (get/list)
@@ -1943,19 +1942,19 @@ pub(super) async fn build_bindings(
     // name allowlist (empty ⇒ deny-all). Deny-by-default: without a `[secrets]` envelope (no store)
     // OR without either right the binding is not built and every call fails closed. The guest never
     // names a tenant — the host injects the resolved one.
-    if granted("tenant-secrets:read") || granted("tenant-secrets:admin") {
-        if let Some(store) = inner.tenant_secret_store.get() {
-            let resolved_tenant =
-                super::function_runtime::resolved_tenant_string(&handler_caller_tenant);
-            bindings = bindings.with_tenant_secrets(
-                store.clone(),
-                project.as_str(),
-                resolved_tenant,
-                tenant_secret_names.to_vec(),
-                granted("tenant-secrets:read"),
-                granted("tenant-secrets:admin"),
-            );
-        }
+    if (granted("tenant-secrets:read") || granted("tenant-secrets:admin"))
+        && let Some(store) = inner.tenant_secret_store.get()
+    {
+        let resolved_tenant =
+            super::function_runtime::resolved_tenant_string(&handler_caller_tenant);
+        bindings = bindings.with_tenant_secrets(
+            store.clone(),
+            project.as_str(),
+            resolved_tenant,
+            tenant_secret_names.to_vec(),
+            granted("tenant-secrets:read"),
+            granted("tenant-secrets:admin"),
+        );
     }
     // Gap 3: `tenancy::present-token` — a site handler that verified a tenant credential IN-GUEST
     // (a POST-body app JWT, a cookie bearer) hands it to the host, which RE-verifies it against this
@@ -1996,29 +1995,30 @@ pub(super) async fn build_bindings(
     // chain, so it invokes at depth 0; the host caps the next hop. The callee's own
     // Authorization comes from the invoke-request headers, so the guest-side ambient
     // bearer forwarding reaches it unchanged.
-    if granted("invoke") && !invoke_targets.is_empty() {
-        if let Some(invoker) = inner.invoker.get() {
-            // A site handler invokes siblings within its own tenant project, propagating its
-            // resolved in-site tenant so the sibling inherits it (host-carried, not guest-set).
-            bindings = bindings.with_invoke(
-                invoker.scoped(project, handler_caller_tenant.clone()),
-                invoke_targets.to_vec(),
-                depth,
-            );
-        }
+    if granted("invoke")
+        && !invoke_targets.is_empty()
+        && let Some(invoker) = inner.invoker.get()
+    {
+        // A site handler invokes siblings within its own tenant project, propagating its
+        // resolved in-site tenant so the sibling inherits it (host-carried, not guest-set).
+        bindings = bindings.with_invoke(
+            invoker.scoped(project, handler_caller_tenant.clone()),
+            invoke_targets.to_vec(),
+            depth,
+        );
     }
     // GraphQL supergraph capability: a handler may run a GraphQL operation against the project's
     // composed supergraph in-process (cross-subgraph planning), forwarding its own bearer.
     // Granted when the site allows `graphql`, the handler imports it, and the runtime has a
     // supergraph runner. The handler is the root of the call chain (depth 0); the host caps the
     // next hop against the depth budget shared with invoke.
-    if granted("graphql") {
-        if let Some(runner) = inner.federation_runner.get() {
-            // Propagate the handler's resolved principal so a `graphql::run` sub-fetch inherits its
-            // tenancy (symmetric to `with_invoke` above), rather than failing closed on an `own` op.
-            bindings =
-                bindings.with_graphql(runner.scoped(project, handler_caller_tenant.clone()), depth);
-        }
+    if granted("graphql")
+        && let Some(runner) = inner.federation_runner.get()
+    {
+        // Propagate the handler's resolved principal so a `graphql::run` sub-fetch inherits its
+        // tenancy (symmetric to `with_invoke` above), rather than failing closed on an `own` op.
+        bindings =
+            bindings.with_graphql(runner.scoped(project, handler_caller_tenant.clone()), depth);
     }
     // Per-project SMTP email gateway: a handler may submit a finished message to one
     // of the project's SMTP profiles. Granted when the site allows `email`, the
@@ -2026,21 +2026,20 @@ pub(super) async fn build_bindings(
     // set — gated at startup by the `allow_guest_email` posture). The SMTP
     // credentials are resolved host-side and never exposed to the guest.
     #[cfg(feature = "email")]
-    if granted("email") {
-        if let (Some(store), Some(spool)) =
+    if granted("email")
+        && let (Some(store), Some(spool)) =
             (inner.email_profile_store.get(), inner.email_spool.get())
-        {
-            match store.resolve_all(project).await {
-                Ok(profiles) => {
-                    bindings = bindings.with_email(
-                        project.as_str(),
-                        std::sync::Arc::new(profiles),
-                        spool.clone(),
-                    );
-                }
-                Err(err) => {
-                    tracing::warn!(site, %err, "resolving email profiles failed; email not granted");
-                }
+    {
+        match store.resolve_all(project).await {
+            Ok(profiles) => {
+                bindings = bindings.with_email(
+                    project.as_str(),
+                    std::sync::Arc::new(profiles),
+                    spool.clone(),
+                );
+            }
+            Err(err) => {
+                tracing::warn!(site, %err, "resolving email profiles failed; email not granted");
             }
         }
     }
@@ -2576,10 +2575,10 @@ pub(super) async fn dispatch_consumer_batch(
                 }
             },
             None => {
-                if let Some(cell) = bindings.producer_context_cell() {
-                    if let Ok(mut guard) = cell.lock() {
-                        *guard = bind_time_context.clone();
-                    }
+                if let Some(cell) = bindings.producer_context_cell()
+                    && let Ok(mut guard) = cell.lock()
+                {
+                    *guard = bind_time_context.clone();
                 }
                 bindings.clone()
             }

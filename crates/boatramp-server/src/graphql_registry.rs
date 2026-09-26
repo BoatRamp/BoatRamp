@@ -5,7 +5,7 @@
 //! incompatible change** so a bad publish never corrupts the registry. The composed
 //! supergraph model is what the query planner (a later landing) plans against.
 
-use crate::graphql_federation::{compose, CompositionError, Supergraph};
+use crate::graphql_federation::{CompositionError, Supergraph, compose};
 use boatramp_core::config::HandlerGraphqlDataConfig;
 use boatramp_core::kv::{KvStore, WriteOp};
 use std::collections::BTreeMap;
@@ -160,11 +160,11 @@ async fn load_subgraphs(kv: &dyn KvStore, project: &str) -> Vec<(String, String)
     let prefix = subgraph_prefix(project);
     let mut out = Vec::new();
     for key in kv.list_prefix(&prefix).await.unwrap_or_default() {
-        if let Ok(Some(bytes)) = kv.get(&key).await {
-            if let Ok(sdl) = String::from_utf8(bytes) {
-                let name = key.strip_prefix(&prefix).unwrap_or(&key).to_string();
-                out.push((name, sdl));
-            }
+        if let Ok(Some(bytes)) = kv.get(&key).await
+            && let Ok(sdl) = String::from_utf8(bytes)
+        {
+            let name = key.strip_prefix(&prefix).unwrap_or(&key).to_string();
+            out.push((name, sdl));
         }
     }
     out
@@ -239,14 +239,14 @@ async fn load_pending(kv: &dyn KvStore, project: &str) -> Vec<(String, String, S
     let mut out = Vec::new();
     for key in kv.list_prefix(&prefix).await.unwrap_or_default() {
         let name = key.strip_prefix(&prefix).unwrap_or(&key).to_string();
-        if let Ok(Some(bytes)) = kv.get(&key).await {
-            if let Ok(sdl) = String::from_utf8(bytes) {
-                let hash = match kv.get(&pending_hash_key(project, &name)).await {
-                    Ok(Some(h)) => String::from_utf8(h).unwrap_or_default(),
-                    _ => String::new(),
-                };
-                out.push((name, sdl, hash));
-            }
+        if let Ok(Some(bytes)) = kv.get(&key).await
+            && let Ok(sdl) = String::from_utf8(bytes)
+        {
+            let hash = match kv.get(&pending_hash_key(project, &name)).await {
+                Ok(Some(h)) => String::from_utf8(h).unwrap_or_default(),
+                _ => String::new(),
+            };
+            out.push((name, sdl, hash));
         }
     }
     out
@@ -535,11 +535,12 @@ extend schema @link(
             Some("hashR")
         );
         assert_eq!(composition_version(&kv, "acme").await, v_before + 1);
-        assert!(kv
-            .list_prefix(&pending_prefix("acme"))
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            kv.list_prefix(&pending_prefix("acme"))
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     // MEDIUM-1 (the fail-closed half): a batch that does not compose promotes NOTHING and leaves
@@ -563,11 +564,12 @@ extend schema @link(
         assert_eq!(subgraph_names(&kv, "acme").await, vec!["a".to_string()]);
         assert_eq!(composition_version(&kv, "acme").await, v_before);
         assert!(subgraph_hash(&kv, "acme", "b").await.is_none());
-        assert!(!kv
-            .list_prefix(&pending_prefix("acme"))
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            !kv.list_prefix(&pending_prefix("acme"))
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     // MEDIUM-2: a manual/SQL `publish` clears the #4 component-hash sidecar, so a later function

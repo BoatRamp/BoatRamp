@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use boatramp_http::h2::{response, serve_connection_mux, Handler, Request, Response};
+use boatramp_http::h2::{Handler, Request, Response, response, serve_connection_mux};
 use bytes::Bytes;
 use tokio::sync::Notify;
 

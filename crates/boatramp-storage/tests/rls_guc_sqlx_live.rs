@@ -15,9 +15,9 @@
 #![cfg(feature = "sql-postgres")]
 
 use boatramp_core::orm::{Assignment, Expr, Insert, RowValues};
-use boatramp_core::sql::{render_set_local_guc, Dialect, SqlValue};
+use boatramp_core::sql::{Dialect, SqlValue, render_set_local_guc};
 use boatramp_core::target_sql::extract_raw_write_scope_value;
-use boatramp_storage::sql_sqlx::{connect, ExternalSqlKind, ExternalSqlOptions};
+use boatramp_storage::sql_sqlx::{ExternalSqlKind, ExternalSqlOptions, connect};
 
 fn text(s: &str) -> SqlValue {
     SqlValue::Text(s.to_string())

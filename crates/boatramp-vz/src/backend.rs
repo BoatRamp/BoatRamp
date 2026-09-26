@@ -27,16 +27,16 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use boatramp_core::Storage;
 use boatramp_core::compute::{
-    compute_instance_id, Artifact, BackendError, Capabilities, ComputeBackend, ComputeSpec,
-    Endpoint, Health, Instance, InstanceHandle, IsolationClass, LaunchRequest, RootSource, Scheme,
-    Snapshot, VolumeRef,
+    Artifact, BackendError, Capabilities, ComputeBackend, ComputeSpec, Endpoint, Health, Instance,
+    InstanceHandle, IsolationClass, LaunchRequest, RootSource, Scheme, Snapshot, VolumeRef,
+    compute_instance_id,
 };
 use boatramp_core::ipam::{IpAuthority, IpPool};
-use boatramp_core::Storage;
 use futures::StreamExt;
 
-use crate::config::{env_cmdline_fragment, WorkerConfig, WorkerVolume};
+use crate::config::{WorkerConfig, WorkerVolume, env_cmdline_fragment};
 use crate::{KernelVerifier, VZ_RUN_SUBCOMMAND};
 
 /// The content-addressed Storage key for a blob hash (`<2hex>/<hash>`) — matches
@@ -335,7 +335,7 @@ impl ComputeBackend for VzBackend {
             RootSource::Image(_) | RootSource::Tar(_) => {
                 return Err(BackendError::Materialize(
                     "macOS VMM requires a rootfs image (RootSource::Rootfs)".into(),
-                ))
+                ));
             }
         };
         let rootfs_path = self.stage_blob(rootfs_hash, "rootfs", ".ext4").await?;
@@ -365,7 +365,7 @@ impl ComputeBackend for VzBackend {
             _ => {
                 return Err(BackendError::Launch(
                     "macOS VMM backend requires a VmImages artifact".into(),
-                ))
+                ));
             }
         };
 

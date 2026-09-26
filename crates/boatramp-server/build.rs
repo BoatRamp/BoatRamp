@@ -30,11 +30,11 @@ fn main() {
     if src.is_dir() {
         for entry in fs::read_dir(&src).into_iter().flatten().flatten() {
             let path = entry.path();
-            if path.is_file() {
-                if let Some(name) = path.file_name() {
-                    fs::copy(&path, dest.join(name)).expect("copy console asset");
-                    copied += 1;
-                }
+            if path.is_file()
+                && let Some(name) = path.file_name()
+            {
+                fs::copy(&path, dest.join(name)).expect("copy console asset");
+                copied += 1;
             }
         }
     }

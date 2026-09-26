@@ -25,12 +25,12 @@ mod linux {
     use std::io;
     use std::sync::{Arc, Mutex};
 
-    use boatramp_http::h2::{response, serve_connection_mux, Handler, Request, Response};
+    use boatramp_http::h2::{Handler, Request, Response, response, serve_connection_mux};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
-    use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
-    use tokio_rustls::rustls::ServerConfig;
     use tokio_rustls::TlsAcceptor;
+    use tokio_rustls::rustls::ServerConfig;
+    use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
     fn upstream() -> String {
         std::env::var("UPSTREAM").unwrap_or_else(|_| "127.0.0.1:9000".to_string())

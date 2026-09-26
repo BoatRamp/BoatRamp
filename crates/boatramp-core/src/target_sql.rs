@@ -261,15 +261,15 @@ pub fn extract_raw_write_scope_value(
                 op: BinaryOperator::Eq,
                 right,
             } => {
-                if col_name(left).is_some_and(|c| c.eq_ignore_ascii_case(col)) {
-                    if let E::Value(v) = right.as_ref() {
-                        return lit(v);
-                    }
+                if col_name(left).is_some_and(|c| c.eq_ignore_ascii_case(col))
+                    && let E::Value(v) = right.as_ref()
+                {
+                    return lit(v);
                 }
-                if col_name(right).is_some_and(|c| c.eq_ignore_ascii_case(col)) {
-                    if let E::Value(v) = left.as_ref() {
-                        return lit(v);
-                    }
+                if col_name(right).is_some_and(|c| c.eq_ignore_ascii_case(col))
+                    && let E::Value(v) = left.as_ref()
+                {
+                    return lit(v);
                 }
                 None
             }
@@ -471,7 +471,7 @@ impl Rewriter<'_> {
                     other => {
                         return Err(TargetRewriteError::UnsupportedJoin(
                             join_operator_kind(other).into(),
-                        ))
+                        ));
                     }
                 }
             }
@@ -574,7 +574,7 @@ impl Rewriter<'_> {
                 None => {
                     return Err(TargetRewriteError::PublicSubsetUndeclared(
                         table.to_string(),
-                    ))
+                    ));
                 }
             }
         };
@@ -714,7 +714,7 @@ fn value_expr(value: &SqlValue) -> Result<Expr, TargetRewriteError> {
         SqlValue::Boolean(b) => Value::Boolean(*b),
         SqlValue::Real(f) if f.is_finite() => Value::Number(f.to_string(), false),
         SqlValue::Real(_) | SqlValue::Null | SqlValue::Blob(_) | SqlValue::Json(_) => {
-            return Err(TargetRewriteError::UnsupportedLiteral)
+            return Err(TargetRewriteError::UnsupportedLiteral);
         }
     }))
 }

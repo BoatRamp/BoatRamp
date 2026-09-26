@@ -221,23 +221,24 @@ fn rewrite(sql: &str, placeholders: &[Placeholder], sub: Substitution) -> String
     let mut chars = sql.chars().peekable();
 
     while let Some(&ch) = chars.peek() {
-        if let Some(p) = next.peek() {
-            if p.line == line && p.column == col {
-                // Emit the substitution, consume the placeholder's source chars.
-                match sub {
-                    Substitution::Dollar => {
-                        out.push('$');
-                        out.push_str(&p.text[1..]); // the digits after `?`
-                    }
-                    Substitution::Positional => out.push('?'),
+        if let Some(p) = next.peek()
+            && p.line == line
+            && p.column == col
+        {
+            // Emit the substitution, consume the placeholder's source chars.
+            match sub {
+                Substitution::Dollar => {
+                    out.push('$');
+                    out.push_str(&p.text[1..]); // the digits after `?`
                 }
-                for _ in p.text.chars() {
-                    chars.next();
-                    col += 1;
-                }
-                next.next();
-                continue;
+                Substitution::Positional => out.push('?'),
             }
+            for _ in p.text.chars() {
+                chars.next();
+                col += 1;
+            }
+            next.next();
+            continue;
         }
         out.push(ch);
         chars.next();

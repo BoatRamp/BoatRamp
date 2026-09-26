@@ -9,7 +9,7 @@
 
 use serde::Serialize;
 
-use super::{parse_envelope, ApiError, CfApi};
+use super::{ApiError, CfApi, parse_envelope};
 
 /// One binding attached to the Worker. Serializes with the `type` discriminant
 /// the script-upload metadata expects (`r2_bucket`, `d1`, `kv_namespace`,

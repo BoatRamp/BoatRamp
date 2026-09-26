@@ -607,9 +607,10 @@ mod tests {
             ]
         );
         // Happy path: no teardown (no `ip link del`) and no kill.
-        assert!(!ops
-            .iter()
-            .any(|o| o.contains("link del") || o.starts_with("kill:")));
+        assert!(
+            !ops.iter()
+                .any(|o| o.contains("link del") || o.starts_with("kill:"))
+        );
     }
 
     #[test]
@@ -713,9 +714,10 @@ mod tests {
     #[test]
     fn restore_rolls_back_when_load_fails() {
         let exec = dev_executor(RecordingHost::new(Some("api:/snapshot/load")));
-        assert!(exec
-            .restore("vm1", &tap(), "/s/vm1.snap", "/s/vm1.mem")
-            .is_err());
+        assert!(
+            exec.restore("vm1", &tap(), "/s/vm1.snap", "/s/vm1.mem")
+                .is_err()
+        );
         let ops = exec.host.ops();
         assert!(ops.iter().any(|o| o == "kill:4242"));
         assert_eq!(ops.last().unwrap(), "run:ip link del tap-vm1");

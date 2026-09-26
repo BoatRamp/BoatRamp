@@ -583,44 +583,42 @@ async fn serve_request(
     // Site-tier security response headers, applied (host-routed only) after the
     // response is built: HSTS (HTTPS only), plus opt-in CSP / X-Frame-Options.
     let mut security_headers: Vec<(HeaderName, String)> = Vec::new();
-    if host_routed {
-        if let Some(cfg) = site_config.as_ref() {
-            let host = request
-                .headers()
-                .get(header::HOST)
-                .and_then(|v| v.to_str().ok())
-                .map(strip_port)
-                .unwrap_or("");
-            let path_and_query = request
-                .uri()
-                .path_and_query()
-                .map(axum::http::uri::PathAndQuery::as_str)
-                .unwrap_or(request_path);
-            if let Some(target) = boatramp_core::config::transport_redirect(
-                &cfg.security,
-                &cfg.domains,
-                &effective_scheme,
-                host,
-                path_and_query,
-            ) {
-                return redirect_to(&target);
-            }
-            // HSTS only over HTTPS (it's meaningless / ignored over plain HTTP).
-            if effective_scheme == "https" {
-                if let Some(hsts) = cfg.security.hsts.as_ref() {
-                    security_headers.push((
-                        HeaderName::from_static("strict-transport-security"),
-                        hsts.header_value(),
-                    ));
-                }
-            }
-            // CSP + X-Frame-Options apply on either scheme, when configured.
-            if let Some(csp) = cfg.security.csp.as_deref() {
-                security_headers.push((header::CONTENT_SECURITY_POLICY, csp.to_string()));
-            }
-            if let Some(frame) = cfg.security.frame_options.as_deref() {
-                security_headers.push((header::X_FRAME_OPTIONS, frame.to_string()));
-            }
+    if host_routed && let Some(cfg) = site_config.as_ref() {
+        let host = request
+            .headers()
+            .get(header::HOST)
+            .and_then(|v| v.to_str().ok())
+            .map(strip_port)
+            .unwrap_or("");
+        let path_and_query = request
+            .uri()
+            .path_and_query()
+            .map(axum::http::uri::PathAndQuery::as_str)
+            .unwrap_or(request_path);
+        if let Some(target) = boatramp_core::config::transport_redirect(
+            &cfg.security,
+            &cfg.domains,
+            &effective_scheme,
+            host,
+            path_and_query,
+        ) {
+            return redirect_to(&target);
+        }
+        // HSTS only over HTTPS (it's meaningless / ignored over plain HTTP).
+        if effective_scheme == "https"
+            && let Some(hsts) = cfg.security.hsts.as_ref()
+        {
+            security_headers.push((
+                HeaderName::from_static("strict-transport-security"),
+                hsts.header_value(),
+            ));
+        }
+        // CSP + X-Frame-Options apply on either scheme, when configured.
+        if let Some(csp) = cfg.security.csp.as_deref() {
+            security_headers.push((header::CONTENT_SECURITY_POLICY, csp.to_string()));
+        }
+        if let Some(frame) = cfg.security.frame_options.as_deref() {
+            security_headers.push((header::X_FRAME_OPTIONS, frame.to_string()));
         }
     }
 
@@ -637,8 +635,8 @@ async fn serve_request(
 
     // Visitor access control (WAF → IP rules → rate limit → basic auth) runs
     // before any content is read.
-    if let Some(access) = access {
-        if let Some(denied) = enforce_access(
+    if let Some(access) = access
+        && let Some(denied) = enforce_access(
             access,
             site,
             request.headers(),
@@ -647,9 +645,8 @@ async fn serve_request(
             visitor.limiter,
         )
         .await
-        {
-            return denied;
-        }
+    {
+        return denied;
     }
 
     let manifest = match deploy.current_manifest(project_ref, site).await {
@@ -815,15 +812,15 @@ async fn enforce_access(
         tracing::debug!(%client_ip, site, "request blocked by IP rules");
         return Some((StatusCode::FORBIDDEN, "forbidden\n").into_response());
     }
-    if let Some(limit) = &access.rate_limit {
-        if !limiter.check(site, client_ip, limit).await {
-            return Some(too_many_requests());
-        }
+    if let Some(limit) = &access.rate_limit
+        && !limiter.check(site, client_ip, limit).await
+    {
+        return Some(too_many_requests());
     }
-    if let Some(basic) = &access.basic_auth {
-        if !verify_basic_auth(basic, req_headers) {
-            return Some(basic_auth_challenge(basic));
-        }
+    if let Some(basic) = &access.basic_auth
+        && !verify_basic_auth(basic, req_headers)
+    {
+        return Some(basic_auth_challenge(basic));
     }
     None
 }
@@ -1133,27 +1130,85 @@ async fn serve_resolved(
     // win over rewrites/static. A redirect short-circuits below; otherwise a
     // matching handler is dispatched in preference to the file/rewrite outcome.
     #[cfg(feature = "handlers")]
-    if !matches!(outcome, Outcome::Redirect { .. }) {
-        if let Some(site) = site {
-            if let Some(handler) = route::match_handler(
-                &manifest.config.handlers,
-                request.method().as_str(),
-                request_path,
+    if !matches!(outcome, Outcome::Redirect { .. })
+        && let Some(site) = site
+    {
+        if let Some(handler) = route::match_handler(
+            &manifest.config.handlers,
+            request.method().as_str(),
+            request_path,
+        ) {
+            return apply_vary(
+                dispatch_handler(
+                    handlers,
+                    deploy,
+                    manifest,
+                    // Handler dispatch only runs when `site` is Some, and the
+                    // project is threaded alongside it; default-project fallback
+                    // keeps a by-id preview reached via a non-resolving host safe.
+                    project.unwrap_or(ProjectRef::DEFAULT.as_str()),
+                    site,
+                    request_path,
+                    site_config,
+                    handler,
+                    request,
+                    client_ip,
+                    preview,
+                )
+                .await,
+                &vary,
+            );
+        }
+        // No handler matched: a GET to a configured SSE stream route fans out
+        // its messaging topics. Streams are GET-only.
+        if request.method() == Method::GET
+            && let Some(stream) = manifest
+                .config
+                .streams
+                .iter()
+                .find(|s| route_matches(&s.route, request_path))
+        {
+            if let (Some(inner), Some(site_handlers)) = (
+                handlers.inner.as_ref(),
+                site_config
+                    .and_then(|c| c.handlers.as_ref())
+                    .filter(|h| h.enabled),
             ) {
+                // A `websocket` stream upgraded by the client is served
+                // bidirectionally (WebSocket fan-out); otherwise it's SSE.
+                // serve_ws_stream does the RFC 6455 handshake + takes over the
+                // connection via boatramp-http's upgrade seam (the request body
+                // isn't held across an await — WS carries none).
+                if stream.websocket && is_upgrade_request(request.headers()) {
+                    return apply_vary(
+                        serve_ws_stream(
+                            inner,
+                            site,
+                            site_handlers,
+                            stream,
+                            request,
+                            client_ip,
+                            preview,
+                        )
+                        .await,
+                        &vary,
+                    );
+                }
+                // Pull the only field needed from the request as an owned
+                // value: `&Request` is not `Send` (the body isn't `Sync`),
+                // so it must not be held across the dispatch await.
+                let after = request
+                    .headers()
+                    .get("last-event-id")
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string);
                 return apply_vary(
-                    dispatch_handler(
-                        handlers,
-                        deploy,
-                        manifest,
-                        // Handler dispatch only runs when `site` is Some, and the
-                        // project is threaded alongside it; default-project fallback
-                        // keeps a by-id preview reached via a non-resolving host safe.
-                        project.unwrap_or(ProjectRef::DEFAULT.as_str()),
+                    serve_stream(
+                        inner,
                         site,
-                        request_path,
-                        site_config,
-                        handler,
-                        request,
+                        site_handlers,
+                        stream,
+                        after,
                         client_ip,
                         preview,
                     )
@@ -1161,212 +1216,144 @@ async fn serve_resolved(
                     &vary,
                 );
             }
-            // No handler matched: a GET to a configured SSE stream route fans out
-            // its messaging topics. Streams are GET-only.
-            if request.method() == Method::GET {
-                if let Some(stream) = manifest
-                    .config
-                    .streams
-                    .iter()
-                    .find(|s| route_matches(&s.route, request_path))
-                {
-                    if let (Some(inner), Some(site_handlers)) = (
-                        handlers.inner.as_ref(),
-                        site_config
-                            .and_then(|c| c.handlers.as_ref())
-                            .filter(|h| h.enabled),
-                    ) {
-                        // A `websocket` stream upgraded by the client is served
-                        // bidirectionally (WebSocket fan-out); otherwise it's SSE.
-                        // serve_ws_stream does the RFC 6455 handshake + takes over the
-                        // connection via boatramp-http's upgrade seam (the request body
-                        // isn't held across an await — WS carries none).
-                        if stream.websocket && is_upgrade_request(request.headers()) {
-                            return apply_vary(
-                                serve_ws_stream(
-                                    inner,
-                                    site,
-                                    site_handlers,
-                                    stream,
-                                    request,
-                                    client_ip,
-                                    preview,
-                                )
-                                .await,
-                                &vary,
-                            );
-                        }
-                        // Pull the only field needed from the request as an owned
-                        // value: `&Request` is not `Send` (the body isn't `Sync`),
-                        // so it must not be held across the dispatch await.
-                        let after = request
-                            .headers()
-                            .get("last-event-id")
-                            .and_then(|value| value.to_str().ok())
-                            .map(str::to_string);
-                        return apply_vary(
-                            serve_stream(
+            // A stream route on a site with handlers disabled / no runtime
+            // is not served (deny by default).
+            return apply_vary(not_found(), &vary);
+        }
+        // Sessions (duplex/resumable guest sessions): a `GET` opens the resumable outbound SSE
+        // stream, a `POST` delivers an inbound frame that re-enters the guest. Matched after
+        // handlers + streams (distinct route set); other methods are 405.
+        #[cfg(feature = "session")]
+        if let Some(session) = manifest
+            .config
+            .sessions
+            .iter()
+            .find(|s| route_matches(&s.route, request_path))
+        {
+            let enabled = site_config
+                .and_then(|c| c.handlers.as_ref())
+                .filter(|h| h.enabled);
+            if let (Some(inner), Some(site_handlers)) = (handlers.inner.as_ref(), enabled) {
+                let project = project.unwrap_or(ProjectRef::DEFAULT.as_str());
+                return apply_vary(
+                    match *request.method() {
+                        Method::GET => {
+                            crate::session_serve::serve_session_open(
                                 inner,
-                                site,
                                 site_handlers,
-                                stream,
-                                after,
+                                project,
+                                site,
+                                session,
+                                request,
                                 client_ip,
                                 preview,
                             )
-                            .await,
-                            &vary,
-                        );
-                    }
-                    // A stream route on a site with handlers disabled / no runtime
-                    // is not served (deny by default).
-                    return apply_vary(not_found(), &vary);
-                }
+                            .await
+                        }
+                        Method::POST => {
+                            crate::session_serve::dispatch_session_post(
+                                inner,
+                                deploy,
+                                manifest,
+                                site_handlers,
+                                project,
+                                site,
+                                session,
+                                request,
+                                client_ip,
+                                preview,
+                            )
+                            .await
+                        }
+                        _ => method_not_allowed(),
+                    },
+                    &vary,
+                );
             }
-            // Sessions (duplex/resumable guest sessions): a `GET` opens the resumable outbound SSE
-            // stream, a `POST` delivers an inbound frame that re-enters the guest. Matched after
-            // handlers + streams (distinct route set); other methods are 405.
-            #[cfg(feature = "session")]
-            if let Some(session) = manifest
-                .config
-                .sessions
-                .iter()
-                .find(|s| route_matches(&s.route, request_path))
-            {
-                let enabled = site_config
-                    .and_then(|c| c.handlers.as_ref())
-                    .filter(|h| h.enabled);
-                if let (Some(inner), Some(site_handlers)) = (handlers.inner.as_ref(), enabled) {
-                    let project = project.unwrap_or(ProjectRef::DEFAULT.as_str());
-                    return apply_vary(
-                        match *request.method() {
-                            Method::GET => {
-                                crate::session_serve::serve_session_open(
-                                    inner,
-                                    site_handlers,
-                                    project,
-                                    site,
-                                    session,
-                                    request,
-                                    client_ip,
-                                    preview,
-                                )
-                                .await
-                            }
-                            Method::POST => {
-                                crate::session_serve::dispatch_session_post(
-                                    inner,
-                                    deploy,
-                                    manifest,
-                                    site_handlers,
-                                    project,
-                                    site,
-                                    session,
-                                    request,
-                                    client_ip,
-                                    preview,
-                                )
-                                .await
-                            }
-                            _ => method_not_allowed(),
-                        },
-                        &vary,
-                    );
-                }
-                // A session route on a site with handlers disabled / no runtime is not served.
-                return apply_vary(not_found(), &vary);
-            }
+            // A session route on a site with handlers disabled / no runtime is not served.
+            return apply_vary(not_found(), &vary);
         }
     }
     // Gateway: an operator-declared route forwards to a private
     // upstream. Independent of the handlers feature; runs after redirects/
     // handlers and **wins over static files** (the operator declared it). Access
     // control already ran up front; only declared upstreams reach private addrs.
-    if !matches!(outcome, Outcome::Redirect { .. }) {
-        if let Some(gw) = site_config
+    if !matches!(outcome, Outcome::Redirect { .. })
+        && let Some(gw) = site_config
             .and_then(|c| c.gateway.as_ref())
             .filter(|g| g.is_enabled())
-        {
-            if let Some(route) = gw.match_route(request_path) {
-                return apply_vary(
-                    match gw.upstreams.get(&route.upstream) {
-                        Some(upstream) => {
-                            // A compute-backed upstream resolves its pool live from
-                            // the workload's healthy replica endpoints. Record
-                            // the request as activity so the reconcile loop
-                            // keeps the workload warm / wakes it, and only sleeps it
-                            // once genuinely idle.
-                            let (compute_backends, compute_regions) = match &upstream.compute {
-                                Some(workload) => {
-                                    // Resolve the compute upstream against the site's OWN
-                                    // project (not `default`), so a non-default tenant's
-                                    // replica state is found — closing the project-blind
-                                    // resolution that 502'd / never woke it.
-                                    let compute_project =
-                                        project.unwrap_or(ProjectRef::DEFAULT.as_str());
-                                    gateway::record_activity(workload);
-                                    let mut pool =
-                                        compute_endpoints(deploy, compute_project, workload).await;
-                                    // Wake-from-zero: no live replica but one
-                                    // is parked → nudge the reconcile loop to restore it
-                                    // and hold this request until it's serving. The cold
-                                    // start is invisible to the client; only a genuine
-                                    // restore failure (timeout) falls through to 502.
-                                    if pool.is_empty()
-                                        && has_parked_replica(deploy, compute_project, workload)
-                                            .await
-                                    {
-                                        gateway::wake_reconcile();
-                                        pool = await_warm(
-                                            deploy,
-                                            compute_project,
-                                            workload,
-                                            COMPUTE_WAKE_TIMEOUT,
-                                        )
-                                        .await;
-                                    }
-                                    // FA-8: for a nearest-region pool, tag each replica
-                                    // endpoint with its node's region (from placement).
-                                    let regions = if upstream.lb
-                                        == boatramp_core::gateway::LbPolicy::Nearest
-                                    {
-                                        Some(
-                                            compute_endpoint_regions(
-                                                deploy,
-                                                compute_project,
-                                                workload,
-                                            )
+        && let Some(route) = gw.match_route(request_path)
+    {
+        return apply_vary(
+            match gw.upstreams.get(&route.upstream) {
+                Some(upstream) => {
+                    // A compute-backed upstream resolves its pool live from
+                    // the workload's healthy replica endpoints. Record
+                    // the request as activity so the reconcile loop
+                    // keeps the workload warm / wakes it, and only sleeps it
+                    // once genuinely idle.
+                    let (compute_backends, compute_regions) = match &upstream.compute {
+                        Some(workload) => {
+                            // Resolve the compute upstream against the site's OWN
+                            // project (not `default`), so a non-default tenant's
+                            // replica state is found — closing the project-blind
+                            // resolution that 502'd / never woke it.
+                            let compute_project = project.unwrap_or(ProjectRef::DEFAULT.as_str());
+                            gateway::record_activity(workload);
+                            let mut pool =
+                                compute_endpoints(deploy, compute_project, workload).await;
+                            // Wake-from-zero: no live replica but one
+                            // is parked → nudge the reconcile loop to restore it
+                            // and hold this request until it's serving. The cold
+                            // start is invisible to the client; only a genuine
+                            // restore failure (timeout) falls through to 502.
+                            if pool.is_empty()
+                                && has_parked_replica(deploy, compute_project, workload).await
+                            {
+                                gateway::wake_reconcile();
+                                pool = await_warm(
+                                    deploy,
+                                    compute_project,
+                                    workload,
+                                    COMPUTE_WAKE_TIMEOUT,
+                                )
+                                .await;
+                            }
+                            // FA-8: for a nearest-region pool, tag each replica
+                            // endpoint with its node's region (from placement).
+                            let regions =
+                                if upstream.lb == boatramp_core::gateway::LbPolicy::Nearest {
+                                    Some(
+                                        compute_endpoint_regions(deploy, compute_project, workload)
                                             .await,
-                                        )
-                                    } else {
-                                        None
-                                    };
-                                    (Some(pool), regions)
-                                }
-                                None => (None, None),
-                            };
-                            dispatch_gateway(
-                                request,
-                                site.unwrap_or(""),
-                                &route.upstream,
-                                upstream,
-                                request_path,
-                                client_ip,
-                                compute_backends,
-                                compute_regions,
-                            )
-                            .await
+                                    )
+                                } else {
+                                    None
+                                };
+                            (Some(pool), regions)
                         }
-                        None => (
-                            StatusCode::BAD_GATEWAY,
-                            "gateway route references an unknown upstream\n",
-                        )
-                            .into_response(),
-                    },
-                    &vary,
-                );
-            }
-        }
+                        None => (None, None),
+                    };
+                    dispatch_gateway(
+                        request,
+                        site.unwrap_or(""),
+                        &route.upstream,
+                        upstream,
+                        request_path,
+                        client_ip,
+                        compute_backends,
+                        compute_regions,
+                    )
+                    .await
+                }
+                None => (
+                    StatusCode::BAD_GATEWAY,
+                    "gateway route references an unknown upstream\n",
+                )
+                    .into_response(),
+            },
+            &vary,
+        );
     }
     // Plaintext (not TLS) gates the zero-copy `sendfile` static body. The listener
     // stamps `ServedOverTls`; absent (an unusual direct call) defaults to plaintext,
@@ -1506,60 +1493,57 @@ async fn serve_entry(
     }
 
     // Range request (identity only).
-    if is_range {
-        if let Some(spec) = req_headers
+    if is_range
+        && let Some(spec) = req_headers
             .get(header::RANGE)
             .and_then(|value| value.to_str().ok())
-        {
-            match parse_ranges(spec, entry.size) {
-                // A single range → `206` with `Content-Range`, streamed.
-                Some(ranges) if ranges.len() == 1 => {
-                    let (offset, len) = ranges[0];
-                    let object = match deploy.open_blob_range(&entry.hash, offset, Some(len)).await
-                    {
-                        Ok(object) => object,
-                        Err(err) => return deploy_error_response(err),
-                    };
-                    let mut headers =
-                        response_headers(config, request_path, served_path, entry, &etag);
-                    set_header(&mut headers, header::CONTENT_LENGTH, &len.to_string());
-                    set_header(
-                        &mut headers,
-                        header::CONTENT_RANGE,
-                        &format!("bytes {}-{}/{}", offset, offset + len - 1, entry.size),
-                    );
-                    return (
-                        StatusCode::PARTIAL_CONTENT,
-                        headers,
-                        Body::from_stream(object.body),
-                    )
-                        .into_response();
-                }
-                // Several ranges → `206 multipart/byteranges`, streamed.
-                Some(ranges) if ranges.len() <= MAX_RANGES => {
-                    return multipart_byteranges(
-                        deploy,
-                        config,
-                        request_path,
-                        served_path,
-                        entry,
-                        &etag,
-                        &ranges,
-                    )
-                    .await;
-                }
-                // Too many ranges: ignore `Range`, serve the full `200` body.
-                Some(_) => {}
-                // Malformed / wholly unsatisfiable → `416`.
-                None => {
-                    let mut headers = HeaderMap::new();
-                    set_header(
-                        &mut headers,
-                        header::CONTENT_RANGE,
-                        &format!("bytes */{}", entry.size),
-                    );
-                    return (StatusCode::RANGE_NOT_SATISFIABLE, headers).into_response();
-                }
+    {
+        match parse_ranges(spec, entry.size) {
+            // A single range → `206` with `Content-Range`, streamed.
+            Some(ranges) if ranges.len() == 1 => {
+                let (offset, len) = ranges[0];
+                let object = match deploy.open_blob_range(&entry.hash, offset, Some(len)).await {
+                    Ok(object) => object,
+                    Err(err) => return deploy_error_response(err),
+                };
+                let mut headers = response_headers(config, request_path, served_path, entry, &etag);
+                set_header(&mut headers, header::CONTENT_LENGTH, &len.to_string());
+                set_header(
+                    &mut headers,
+                    header::CONTENT_RANGE,
+                    &format!("bytes {}-{}/{}", offset, offset + len - 1, entry.size),
+                );
+                return (
+                    StatusCode::PARTIAL_CONTENT,
+                    headers,
+                    Body::from_stream(object.body),
+                )
+                    .into_response();
+            }
+            // Several ranges → `206 multipart/byteranges`, streamed.
+            Some(ranges) if ranges.len() <= MAX_RANGES => {
+                return multipart_byteranges(
+                    deploy,
+                    config,
+                    request_path,
+                    served_path,
+                    entry,
+                    &etag,
+                    &ranges,
+                )
+                .await;
+            }
+            // Too many ranges: ignore `Range`, serve the full `200` body.
+            Some(_) => {}
+            // Malformed / wholly unsatisfiable → `416`.
+            None => {
+                let mut headers = HeaderMap::new();
+                set_header(
+                    &mut headers,
+                    header::CONTENT_RANGE,
+                    &format!("bytes */{}", entry.size),
+                );
+                return (StatusCode::RANGE_NOT_SATISFIABLE, headers).into_response();
             }
         }
     }
@@ -1577,16 +1561,18 @@ async fn serve_entry(
     // extension; the `http_serve` bridge turns it into a `Body::File`. TLS, remote
     // backends, and small (cached) blobs fall through to the mapped/cached/stream path,
     // byte-identical to before. HEAD is unaffected (the codec suppresses the body).
-    if *SENDFILE_ENABLED && plaintext && blob_size > *SENDFILE_MIN_BYTES {
-        if let Some(file) = deploy.blob_file(blob_hash) {
-            let mut resp = (base_status, headers, axum::body::Body::empty()).into_response();
-            resp.extensions_mut().insert(SendfileSource {
-                file: std::sync::Arc::new(file),
-                offset: 0,
-                len: blob_size,
-            });
-            return resp;
-        }
+    if *SENDFILE_ENABLED
+        && plaintext
+        && blob_size > *SENDFILE_MIN_BYTES
+        && let Some(file) = deploy.blob_file(blob_hash)
+    {
+        let mut resp = (base_status, headers, axum::body::Body::empty()).into_response();
+        resp.extensions_mut().insert(SendfileSource {
+            file: std::sync::Arc::new(file),
+            offset: 0,
+            len: blob_size,
+        });
+        return resp;
     }
 
     match deploy.open_blob_cached(blob_hash, blob_size).await {

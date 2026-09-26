@@ -148,30 +148,30 @@ fn summarize_plan(name: &str, plan: &serde_json::Value) -> String {
             functions.join(", ")
         ));
     }
-    if let Some(compute) = plan.get("compute").and_then(|v| v.as_array()) {
-        if !compute.is_empty() {
-            let items: Vec<String> = compute
-                .iter()
-                .map(|c| {
-                    let cname = c.get("name").and_then(|v| v.as_str()).unwrap_or("?");
-                    let vols: Vec<&str> = c
-                        .get("volumes")
-                        .and_then(|v| v.as_array())
-                        .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
-                        .unwrap_or_default();
-                    if vols.is_empty() {
-                        cname.to_string()
-                    } else {
-                        format!(
-                            "{cname} + volume{} {}",
-                            if vols.len() == 1 { "" } else { "s" },
-                            vols.join(", ")
-                        )
-                    }
-                })
-                .collect();
-            parts.push(format!("{} compute ({})", compute.len(), items.join("; ")));
-        }
+    if let Some(compute) = plan.get("compute").and_then(|v| v.as_array())
+        && !compute.is_empty()
+    {
+        let items: Vec<String> = compute
+            .iter()
+            .map(|c| {
+                let cname = c.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                let vols: Vec<&str> = c
+                    .get("volumes")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+                    .unwrap_or_default();
+                if vols.is_empty() {
+                    cname.to_string()
+                } else {
+                    format!(
+                        "{cname} + volume{} {}",
+                        if vols.len() == 1 { "" } else { "s" },
+                        vols.join(", ")
+                    )
+                }
+            })
+            .collect();
+        parts.push(format!("{} compute ({})", compute.len(), items.join("; ")));
     }
     let secrets = arr("secrets");
     if !secrets.is_empty() {
@@ -181,13 +181,13 @@ fn summarize_plan(name: &str, plan: &serde_json::Value) -> String {
             if secrets.len() == 1 { "" } else { "s" }
         ));
     }
-    if let Some(n) = plan.get("safelist").and_then(serde_json::Value::as_u64) {
-        if n > 0 {
-            parts.push(format!(
-                "{n} graphql safelist entr{}",
-                if n == 1 { "y" } else { "ies" }
-            ));
-        }
+    if let Some(n) = plan.get("safelist").and_then(serde_json::Value::as_u64)
+        && n > 0
+    {
+        parts.push(format!(
+            "{n} graphql safelist entr{}",
+            if n == 1 { "y" } else { "ies" }
+        ));
     }
     let subgraphs = arr("subgraphs");
     if !subgraphs.is_empty() {

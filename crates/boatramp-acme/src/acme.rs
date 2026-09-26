@@ -18,7 +18,7 @@ use instant_acme::{
     Account, AuthorizationStatus, ChallengeType, Identifier, NewAccount, NewOrder, OrderStatus,
 };
 
-use crate::dns::{acme_challenge_name, DnsProvider, DnsRecord, RecordKind};
+use crate::dns::{DnsProvider, DnsRecord, RecordKind, acme_challenge_name};
 
 /// A failure during ACME DNS-01 issuance.
 #[derive(Debug, thiserror::Error)]

@@ -14,10 +14,11 @@
 
 use async_trait::async_trait;
 use boatramp_core::compute::{
-    compute_instance_id, Artifact, BackendError, Capabilities, ComputeBackend, ComputeSpec,
-    Endpoint, ExecOutput, Health, Instance, InstanceHandle, IsolationClass, LaunchRequest,
-    RestartPolicy, RootSource, Scheme, VolumeRef,
+    Artifact, BackendError, Capabilities, ComputeBackend, ComputeSpec, Endpoint, ExecOutput,
+    Health, Instance, InstanceHandle, IsolationClass, LaunchRequest, RestartPolicy, RootSource,
+    Scheme, VolumeRef, compute_instance_id,
 };
+use bollard::Docker;
 use bollard::container::{
     Config, CreateContainerOptions, LogOutput, RemoveContainerOptions, StopContainerOptions,
 };
@@ -27,7 +28,6 @@ use bollard::models::{
     HostConfig, Mount, MountTypeEnum, PortBinding, RestartPolicy as DockerRestartPolicy,
     RestartPolicyNameEnum,
 };
-use bollard::Docker;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -423,7 +423,7 @@ impl ComputeBackend for DockerBackend {
             RootSource::Tar(_) | RootSource::Rootfs(_) => {
                 return Err(BackendError::Materialize(
                     "docker backend requires an image reference (RootSource::Image)".into(),
-                ))
+                ));
             }
         };
         // Split the reference into `from_image` + `tag`, defaulting an untagged
@@ -457,7 +457,7 @@ impl ComputeBackend for DockerBackend {
             _ => {
                 return Err(BackendError::Launch(
                     "docker backend requires an Image artifact".into(),
-                ))
+                ));
             }
         };
         let name = container_name(&req.project, &req.workload, req.replica);

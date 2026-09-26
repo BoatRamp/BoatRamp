@@ -11,13 +11,13 @@
 //! policy's row filter is combined into every access (the root and every relationship
 //! subquery), so tenant isolation is enforced at compile time, at every depth.
 
-use super::dialect::{sql_string_literal, Dialect};
+use super::dialect::{Dialect, sql_string_literal};
 use super::policy::{Claims, DataPolicy, PolicyError, TargetScope};
 use super::schema::{DbSchema, RelKind, Relationship, Table};
+use async_graphql_parser::Positioned;
 use async_graphql_parser::types::{
     DocumentOperations, ExecutableDocument, Field, OperationDefinition, OperationType, Selection,
 };
-use async_graphql_parser::Positioned;
 use async_graphql_value::Value;
 use boatramp_core::sql::SqlValue;
 use std::collections::BTreeMap;
@@ -384,7 +384,7 @@ pub(crate) fn compile(
         OperationType::Query => {}
         OperationType::Mutation => return Err(CompileError::Unsupported("mutations".into())),
         OperationType::Subscription => {
-            return Err(CompileError::Unsupported("subscriptions".into()))
+            return Err(CompileError::Unsupported("subscriptions".into()));
         }
     }
 
@@ -637,10 +637,10 @@ fn compile_write_where(
     cx: &mut Cx<'_>,
 ) -> Result<Option<String>, CompileError> {
     let mut clauses = Vec::new();
-    if let Some((_, where_arg)) = field.arguments.iter().find(|(n, _)| n.node == "where") {
-        if let Some(expr) = compile_bool_exp(&where_arg.node, table, "", policy, cx)? {
-            clauses.push(expr);
-        }
+    if let Some((_, where_arg)) = field.arguments.iter().find(|(n, _)| n.node == "where")
+        && let Some(expr) = compile_bool_exp(&where_arg.node, table, "", policy, cx)?
+    {
+        clauses.push(expr);
     }
     if let Some(filter) = policy.row_filter_with_target(&table.name, claims, None)? {
         for term in &filter.terms {
@@ -748,10 +748,10 @@ fn compile_root(
             let ph = cx.bind(value);
             clauses.push(format!("{col} = {ph}"));
         }
-    } else if let Some((_, where_arg)) = field.arguments.iter().find(|(n, _)| n.node == "where") {
-        if let Some(expr) = compile_bool_exp(&where_arg.node, table, &qualifier, policy, &mut cx)? {
-            clauses.push(expr);
-        }
+    } else if let Some((_, where_arg)) = field.arguments.iter().find(|(n, _)| n.node == "where")
+        && let Some(expr) = compile_bool_exp(&where_arg.node, table, &qualifier, policy, &mut cx)?
+    {
+        clauses.push(expr);
     }
 
     let select_list = if select_exprs.is_empty() {
@@ -1168,7 +1168,7 @@ fn compile_comparison(
                 _ => {
                     return Err(CompileError::Unsupported(
                         "_is_null expects a boolean".into(),
-                    ))
+                    ));
                 }
             },
             other => return Err(CompileError::Unsupported(format!("operator `{other}`"))),
@@ -1199,7 +1199,7 @@ fn order_by_clause(
         _ => {
             return Err(CompileError::Unsupported(
                 "order_by expects object(s)".into(),
-            ))
+            ));
         }
     };
     let mut terms = Vec::new();
@@ -1299,7 +1299,7 @@ fn json_to_sql(value: &serde_json::Value) -> Result<SqlValue, CompileError> {
         serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
             return Err(CompileError::Unsupported(
                 "a scalar variable was expected".into(),
-            ))
+            ));
         }
     })
 }
@@ -1516,10 +1516,11 @@ mod tests {
             r#"SELECT "users"."name", (SELECT json_group_array(json_object('id', "t1"."id")) FROM "posts" AS "t1" WHERE "t1"."author_id" = "users"."id") FROM "users""#
         );
         // The `posts` field is a JSON-sourced projection.
-        assert!(root
-            .projection
-            .iter()
-            .any(|f| f.key == "posts" && matches!(f.source, OutSource::Json(_))));
+        assert!(
+            root.projection
+                .iter()
+                .any(|f| f.key == "posts" && matches!(f.source, OutSource::Json(_)))
+        );
     }
 
     #[test]

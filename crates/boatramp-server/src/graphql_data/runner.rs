@@ -6,13 +6,13 @@
 //! partial result. The connector remains a translator: the database executes, this maps
 //! rows to JSON.
 
-use super::compile::{compile, Delegation, OutField, OutSource};
+use super::compile::{Delegation, OutField, OutSource, compile};
 use super::dialect::Dialect;
 use super::policy::{Claims, DataPolicy, TargetScope};
 use super::schema::DbSchema;
 use boatramp_core::sql::{SqlBackend, SqlRows, SqlValue};
 use boatramp_handlers::{InvokeRequest, Invoker};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 /// Execute `query` (with its `variables`) against `backend`, returning a GraphQL response
 /// (`{"data": …}` on success, `{"errors": …}` on a compile or SQL failure). `invoker`
@@ -492,10 +492,12 @@ mod tests {
         )
         .await;
         assert!(out["data"].is_null());
-        assert!(out["errors"][0]["message"]
-            .as_str()
-            .unwrap()
-            .contains("secret"));
+        assert!(
+            out["errors"][0]["message"]
+                .as_str()
+                .unwrap()
+                .contains("secret")
+        );
     }
 
     /// An invoker that reflects the `Authorization` header it received into the resolved

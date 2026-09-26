@@ -19,12 +19,12 @@
 
 use crate::sandbox::{Mount, SandboxPlan, VolumeMount};
 use nix::mount::{MntFlags, MsFlags};
-use nix::sched::{unshare, CloneFlags};
-use nix::sys::stat::{mknod, Mode, SFlag};
-use nix::sys::wait::{waitpid, WaitStatus};
+use nix::sched::{CloneFlags, unshare};
+use nix::sys::stat::{Mode, SFlag, mknod};
+use nix::sys::wait::{WaitStatus, waitpid};
 use nix::unistd::{
-    chdir, execve, fork, pivot_root, setgroups, sethostname, setresgid, setresuid, ForkResult, Gid,
-    Uid,
+    ForkResult, Gid, Uid, chdir, execve, fork, pivot_root, setgroups, sethostname, setresgid,
+    setresuid,
 };
 use std::convert::Infallible;
 use std::ffi::CString;

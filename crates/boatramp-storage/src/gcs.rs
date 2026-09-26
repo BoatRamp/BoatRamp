@@ -15,13 +15,13 @@ use bytes::Bytes;
 use futures::{Stream, StreamExt};
 
 use google_cloud_storage::client::{Client, ClientConfig};
+use google_cloud_storage::http::Error as GcsError;
+use google_cloud_storage::http::objects::Object;
 use google_cloud_storage::http::objects::delete::DeleteObjectRequest;
 use google_cloud_storage::http::objects::download::Range;
 use google_cloud_storage::http::objects::get::GetObjectRequest;
 use google_cloud_storage::http::objects::list::ListObjectsRequest;
 use google_cloud_storage::http::objects::upload::{Media, UploadObjectRequest, UploadType};
-use google_cloud_storage::http::objects::Object;
-use google_cloud_storage::http::Error as GcsError;
 
 /// Stores objects in a Google Cloud Storage bucket, streaming reads and writes.
 #[derive(Clone)]

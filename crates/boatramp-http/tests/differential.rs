@@ -10,8 +10,8 @@
 //!   same method+path. boatramp may be *stricter* (reject where hyper accepts — that's
 //!   the fail-closed direction), never looser about message boundaries.
 
-use boatramp_http::h1::{parse_request_head, BodyFraming, ParseResult};
-use boatramp_http::testkit::{self, gen, verdict, Verdict};
+use boatramp_http::h1::{BodyFraming, ParseResult, parse_request_head};
+use boatramp_http::testkit::{self, Verdict, generators, verdict};
 
 /// A request identity used for boundary agreement: `(method, path)`. Body *length* is
 /// deliberately not compared — hyper reports the decoded body size while boatramp reports
@@ -173,7 +173,7 @@ async fn agrees_with_hyper_on_well_formed_streams() {
 async fn boatramp_is_never_more_permissive_than_hyper() {
     // Every single-request input from the curated corpus + the generators.
     let mut inputs: Vec<Vec<u8>> = testkit::all().iter().map(|c| c.input.to_vec()).collect();
-    inputs.extend(gen::all().into_iter().map(|g| g.input));
+    inputs.extend(generators::all().into_iter().map(|g| g.input));
 
     let mut violations = Vec::new();
     for input in inputs {
@@ -223,7 +223,7 @@ impl XorShift {
         xs[(self.next() % xs.len() as u64) as usize]
     }
     fn chance(&mut self, n: u64) -> bool {
-        self.next() % n == 0
+        self.next().is_multiple_of(n)
     }
 }
 

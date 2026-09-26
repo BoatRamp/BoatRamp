@@ -312,10 +312,11 @@ mod tests {
                 .unwrap(),
             Some(b"hi".to_vec())
         );
-        assert!(host
-            .exists(Resource::new_own(rep), "greeting".into())
-            .await
-            .unwrap());
+        assert!(
+            host.exists(Resource::new_own(rep), "greeting".into())
+                .await
+                .unwrap()
+        );
 
         host.delete(Resource::new_own(rep), "greeting".into())
             .await

@@ -428,10 +428,10 @@ pub fn response_framing(
     if headers.contains_key(http::header::TRANSFER_ENCODING) {
         return ResponseFraming::Chunked;
     }
-    if let Some(cl) = headers.get(http::header::CONTENT_LENGTH) {
-        if let Some(n) = cl.to_str().ok().and_then(|s| s.trim().parse::<u64>().ok()) {
-            return ResponseFraming::Length(n);
-        }
+    if let Some(cl) = headers.get(http::header::CONTENT_LENGTH)
+        && let Some(n) = cl.to_str().ok().and_then(|s| s.trim().parse::<u64>().ok())
+    {
+        return ResponseFraming::Length(n);
     }
     ResponseFraming::CloseDelimited
 }
@@ -471,7 +471,7 @@ pub mod chunked {
         Reject(super::Reject),
     }
 
-    use super::{next_line, split_header, trim_ows, Line, Reject};
+    use super::{Line, Reject, next_line, split_header, trim_ows};
 
     /// Largest chunk-size line (`<hex>;<ext>`) accepted — bounds a size-line DoS.
     const MAX_CHUNK_SIZE_LINE: usize = 1024;

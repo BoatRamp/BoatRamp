@@ -37,7 +37,9 @@ pub enum Error {
     },
 
     /// No instances are registered at all.
-    #[error("no boatramp instances registered; run `boatramp mcp setup add <name> --server <url>` first")]
+    #[error(
+        "no boatramp instances registered; run `boatramp mcp setup add <name> --server <url>` first"
+    )]
     NoInstances,
 
     /// A required argument (e.g. a token spec that resolves empty) was missing.

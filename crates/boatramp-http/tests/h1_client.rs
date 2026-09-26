@@ -137,7 +137,7 @@ async fn client_matches_hyper_across_response_shapes() {
 /// the server's response decodes byte-identically back — the exact loop the proxy runs.
 #[tokio::test]
 async fn client_round_trips_against_boatramp_server() {
-    use boatramp_http::{response, serve_connection, Body, Handler, Request, Response};
+    use boatramp_http::{Body, Handler, Request, Response, response, serve_connection};
 
     #[derive(Clone, Copy)]
     struct App;

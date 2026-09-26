@@ -12,9 +12,9 @@ use boatramp_core::{ByteStream, GetObject, ObjectMeta, PutMeta, Storage, Storage
 use bytes::{Bytes, BytesMut};
 use futures::{StreamExt, TryStreamExt};
 
+use azure_core::StatusCode;
 use azure_core::error::ErrorKind;
 use azure_core::request_options::Range;
-use azure_core::StatusCode;
 use azure_storage::prelude::StorageCredentials;
 use azure_storage_blobs::blob::{Blob, BlobBlockType, BlockList};
 use azure_storage_blobs::prelude::{BlobClient, BlockId, ClientBuilder, ContainerClient};

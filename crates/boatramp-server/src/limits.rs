@@ -110,7 +110,7 @@ fn limited_stream(inner: ByteStream, max: Option<u64>, idle: Option<Duration>) -
                         return Some((
                             Err(StorageError::backend("upload idle timeout")),
                             (inner, sent, true),
-                        ))
+                        ));
                     }
                 },
                 None => inner.next().await,
@@ -120,15 +120,15 @@ fn limited_stream(inner: ByteStream, max: Option<u64>, idle: Option<Duration>) -
                 Some(Err(err)) => Some((Err(err), (inner, sent, true))),
                 Some(Ok(chunk)) => {
                     let sent = sent + chunk.len() as u64;
-                    if let Some(max) = max {
-                        if sent > max {
-                            return Some((
-                                Err(StorageError::backend(format!(
-                                    "upload exceeds the {max}-byte limit"
-                                ))),
-                                (inner, sent, true),
-                            ));
-                        }
+                    if let Some(max) = max
+                        && sent > max
+                    {
+                        return Some((
+                            Err(StorageError::backend(format!(
+                                "upload exceeds the {max}-byte limit"
+                            ))),
+                            (inner, sent, true),
+                        ));
                     }
                     Some((Ok(chunk), (inner, sent, false)))
                 }

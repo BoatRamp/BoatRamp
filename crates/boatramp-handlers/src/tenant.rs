@@ -414,7 +414,7 @@ impl HostTenancy {
         statement: &str,
         dialect: boatramp_core::sql::Dialect,
     ) -> Result<String, boatramp_core::target_sql::TargetRewriteError> {
-        use boatramp_core::target_sql::{rewrite_target_select, TargetRewriteError};
+        use boatramp_core::target_sql::{TargetRewriteError, rewrite_target_select};
         let TableKeys::PerTableTarget {
             keys,
             public,

@@ -1,8 +1,8 @@
 [package]
 name = "boatramp-console"
 version = "0.4.24"
-edition = "2021"
-rust-version = "1.82"
+edition = "2024"
+rust-version = "1.91"
 license = "MIT OR Apache-2.0"
 authors = ["Uranion <boatramp@uranion.ai>"]
 repository = "https://github.com/BoatRamp/BoatRamp"

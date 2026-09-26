@@ -3,7 +3,7 @@
 //! `chunked::scan`, which returns where a chunked body ends (and thus where the next
 //! pipelined request begins). RED until implemented.
 
-use boatramp_http::h1::chunked::{scan, ChunkScan};
+use boatramp_http::h1::chunked::{ChunkScan, scan};
 
 #[derive(Debug, PartialEq, Eq)]
 enum Out {

@@ -28,7 +28,7 @@ use aws_sdk_s3::types::{
     QueueConfiguration, S3KeyFilter,
 };
 use aws_sdk_sqs::types::QueueAttributeName;
-use boatramp_core::blob_notify::{prefix_slug, ManagedResource};
+use boatramp_core::blob_notify::{ManagedResource, prefix_slug};
 use boatramp_core::blob_provision::{ProvisionError, WatchProvider};
 use boatramp_core::{BlobChange, BlobChangeKind, ChangeStream};
 use futures::StreamExt;

@@ -29,11 +29,11 @@ use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use boatramp_container::dns::{Decision, ResolvedAddrs, Resolver, DEFAULT_INTERNAL_DOMAIN};
+use boatramp_container::dns::{DEFAULT_INTERNAL_DOMAIN, Decision, ResolvedAddrs, Resolver};
 use boatramp_core::compute::{
-    reconcile_once, AlwaysActive, Artifact, BackendError, BackendPolicy, Capabilities,
-    ComputeBackend, ComputeSpec, Endpoint, Health, Instance, InstanceHandle, IsolationClass,
-    LaunchRequest, Node, ObservedInstance, ReplicaPhase, Scheme, Snapshot,
+    AlwaysActive, Artifact, BackendError, BackendPolicy, Capabilities, ComputeBackend, ComputeSpec,
+    Endpoint, Health, Instance, InstanceHandle, IsolationClass, LaunchRequest, Node,
+    ObservedInstance, ReplicaPhase, Scheme, Snapshot, reconcile_once,
 };
 use boatramp_core::deploy::DeployStore;
 use boatramp_core::envelope::{EnvelopeError, KeyEnvelope};
@@ -44,7 +44,7 @@ use boatramp_core::{ByteStream, GetObject, ObjectMeta, PutMeta, Storage, Storage
 use boatramp_node::compute::adopt_running_replica_ips;
 use boatramp_node::config::{ExternalDatabaseConfig, TenantIsolation, TenantScope};
 use boatramp_node::managed_sql::{
-    auto_register_managed_db_workloads, DeployEndpointResolver, ManagedSqlCredentials,
+    DeployEndpointResolver, ManagedSqlCredentials, auto_register_managed_db_workloads,
 };
 use boatramp_node::tenant_sql::provision_tenant;
 use boatramp_storage::sql_compute::ComputeEndpointResolver;

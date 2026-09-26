@@ -9,14 +9,14 @@ pub mod serve;
 // The parser's public surface is re-exported at the `h1` level (the tests + the serve
 // loop + the fuzz targets consume `h1::parse_request_head`, `h1::chunked`, etc.).
 pub use parse::{
-    chunked, encode_response_head, parse_request_head, response_framing, BodyFraming, ParseResult,
-    Reject, RequestHead, ResponseFraming,
+    BodyFraming, ParseResult, Reject, RequestHead, ResponseFraming, chunked, encode_response_head,
+    parse_request_head, response_framing,
 };
 
 // The client codec (reverse-proxy upstream leg) — the mirror of the request parser +
 // serve loop above.
 pub use client::{
-    encode_request_head, parse_response_head, BodyReader, Conn, RespParse, ResponseHead,
+    BodyReader, Conn, RespParse, ResponseHead, encode_request_head, parse_response_head,
 };
 
-pub use serve::{serve_connection, serve_connection_with, DEFAULT_READ_TIMEOUT};
+pub use serve::{DEFAULT_READ_TIMEOUT, serve_connection, serve_connection_with};

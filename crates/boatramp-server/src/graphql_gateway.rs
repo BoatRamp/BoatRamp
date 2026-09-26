@@ -14,7 +14,7 @@
 //! response paths into the already-stitched tree.
 
 use crate::graphql_plan::QueryPlan;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 /// Dispatches one planned fetch to a subgraph and returns its GraphQL response JSON
 /// (an object with a `data` field, or a bare data object). `class` is the fetch's tenancy class
@@ -458,7 +458,7 @@ impl BackendRouter {
         let backend = match provider.database(&self.project, site, &config.source).await {
             Ok(backend) => backend,
             Err(err) => {
-                return json!({ "errors": [{ "message": format!("subgraph `{subgraph}` database unavailable: {err}") }] })
+                return json!({ "errors": [{ "message": format!("subgraph `{subgraph}` database unavailable: {err}") }] });
             }
         };
         let schema = match crate::graphql_data::introspect::introspect_sqlite(backend.as_ref())
@@ -466,18 +466,17 @@ impl BackendRouter {
         {
             Ok(schema) => schema,
             Err(err) => {
-                return json!({ "errors": [{ "message": format!("subgraph `{subgraph}` introspection failed: {err}") }] })
+                return json!({ "errors": [{ "message": format!("subgraph `{subgraph}` introspection failed: {err}") }] });
             }
         };
         let policy = crate::graphql_data::policy_from_config(config);
-        let claims =
-            crate::graphql_data::request_claims(
-                &self.project,
-                self.bearer.as_deref(),
-                config,
-                self.env_source.as_ref(),
-            )
-            .await;
+        let claims = crate::graphql_data::request_claims(
+            &self.project,
+            self.bearer.as_deref(),
+            config,
+            self.env_source.as_ref(),
+        )
+        .await;
         let dialect = crate::graphql_data::dialect::Sqlite;
         let invoker = Some(self.invoker.as_ref());
         // A SQL subgraph resolves both root fetches and — so it's a full federation entity
@@ -735,7 +734,7 @@ impl boatramp_handlers::SupergraphRunner for FederationRunner {
             (None, None) => {
                 return Err(SupergraphRunError::PlanFailed(
                     "no query or persisted hash supplied".into(),
-                ))
+                ));
             }
         };
         let Some(query) = crate::graphql_apq::safelisted_query(kv, project, &hash).await else {

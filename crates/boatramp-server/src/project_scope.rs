@@ -25,7 +25,7 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 
 use boatramp_core::deploy::DeployStore;
-use boatramp_core::project::{ProjectRef, DEFAULT_PROJECT};
+use boatramp_core::project::{DEFAULT_PROJECT, ProjectRef};
 
 /// The resource families a `/api/projects/<proj>/<family>/…` URL may address — the
 /// only sub-paths the middleware rewrites onto their global `/api/<family>/…`

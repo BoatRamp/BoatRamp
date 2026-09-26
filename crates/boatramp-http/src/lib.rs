@@ -19,17 +19,17 @@
 pub mod h1;
 pub mod h2;
 pub mod serve;
-pub use serve::{serve_connection, serve_connection_with, Config};
+pub use serve::{Config, serve_connection, serve_connection_with};
 
 // The shared serving abstraction (`Request`/`Response`/`Body`/`Handler`) — homed at the
 // crate root, the surface both codecs produce/consume.
 mod serving;
-pub use serving::{response, Body, BodyChunk, BodyError, Handler, ReqBody, Request, Response};
+pub use serving::{Body, BodyChunk, BodyError, Handler, ReqBody, Request, Response, response};
 
 // HTTP/1.1 connection upgrade (WebSocket + generic `Connection: upgrade`) — replaces
 // `hyper::upgrade` so the serving path owns upgrades.
 pub mod upgrade;
-pub use upgrade::{is_upgrade_request, on_upgrade, OnUpgrade, Upgraded};
+pub use upgrade::{OnUpgrade, Upgraded, is_upgrade_request, on_upgrade};
 
 // The verification kit (corpus + normalized-verdict model + combinatorial generators)
 // shared by the h1 gate, the differential-vs-hyper driver, and the fuzz targets — one

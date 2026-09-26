@@ -376,23 +376,22 @@ impl DaemonConfig {
                 crate::SCHEMA_VERSION
             ));
         }
-        if let Some(v) = self.max_upload_bytes {
-            if exceeds_ceiling(v, base.max_upload_ceiling) {
-                return Err(format!(
-                    "max_upload_bytes {v} exceeds the static ceiling {}",
-                    base.max_upload_ceiling
-                ));
-            }
+        if let Some(v) = self.max_upload_bytes
+            && exceeds_ceiling(v, base.max_upload_ceiling)
+        {
+            return Err(format!(
+                "max_upload_bytes {v} exceeds the static ceiling {}",
+                base.max_upload_ceiling
+            ));
         }
         if let (Some(v), Some(c)) = (
             self.max_concurrent_uploads,
             base.max_concurrent_uploads_ceiling,
-        ) {
-            if v > c {
-                return Err(format!(
-                    "max_concurrent_uploads {v} exceeds the static ceiling {c}"
-                ));
-            }
+        ) && v > c
+        {
+            return Err(format!(
+                "max_concurrent_uploads {v} exceeds the static ceiling {c}"
+            ));
         }
         let loosening = self.posture.loosening();
         if !loosening.is_empty() {

@@ -188,9 +188,5 @@ pub async fn run(args: SecurityHeadersArgs, config: &ProjectConfig) -> Result<()
 
 /// Render a bool as `on`/`off`.
 fn onoff(v: bool) -> &'static str {
-    if v {
-        "on"
-    } else {
-        "off"
-    }
+    if v { "on" } else { "off" }
 }

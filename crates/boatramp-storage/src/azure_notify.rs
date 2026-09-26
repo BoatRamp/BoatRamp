@@ -21,12 +21,12 @@
 use std::collections::VecDeque;
 
 use async_trait::async_trait;
-use azure_core::error::ErrorKind;
 use azure_core::StatusCode;
-use azure_storage_queues::prelude::{QueueClient, QueueServiceClient};
+use azure_core::error::ErrorKind;
 use azure_storage_queues::PopReceipt;
+use azure_storage_queues::prelude::{QueueClient, QueueServiceClient};
 use base64::Engine;
-use boatramp_core::blob_notify::{prefix_slug, ManagedResource};
+use boatramp_core::blob_notify::{ManagedResource, prefix_slug};
 use boatramp_core::blob_provision::{ProvisionError, WatchProvider};
 use boatramp_core::{BlobChange, BlobChangeKind, ChangeStream};
 use futures::StreamExt;
@@ -79,12 +79,12 @@ fn subject_to_key(subject: &str) -> Option<String> {
 /// Storage Queue delivery, so try base64 first (accepting it only if it decodes to
 /// JSON-looking UTF-8), else use the body as-is.
 fn decode_body(body: &str) -> String {
-    if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(body.trim()) {
-        if let Ok(text) = String::from_utf8(bytes) {
-            let trimmed = text.trim_start();
-            if trimmed.starts_with('{') || trimmed.starts_with('[') {
-                return text;
-            }
+    if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(body.trim())
+        && let Ok(text) = String::from_utf8(bytes)
+    {
+        let trimmed = text.trim_start();
+        if trimmed.starts_with('{') || trimmed.starts_with('[') {
+            return text;
         }
     }
     body.to_string()

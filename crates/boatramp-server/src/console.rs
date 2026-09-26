@@ -19,12 +19,12 @@
 use std::sync::Arc;
 
 use axum::{
+    Router,
     body::Body,
     extract::{Request, State},
-    http::{header, HeaderValue, StatusCode},
+    http::{HeaderValue, StatusCode, header},
     middleware::Next,
     response::{IntoResponse, Response},
-    Router,
 };
 
 /// The console's built assets, embedded at compile time. Staged into `OUT_DIR`
@@ -168,21 +168,21 @@ fn serve_console(mount: &ConsoleMount, req_path: &str) -> Response {
         .unwrap_or(req_path)
         .trim_start_matches('/');
     // A hashed asset serves that file; anything else is the SPA history-fallback.
-    if !sub.is_empty() {
-        if let Some(file) = CONSOLE_DIST.get_file(sub) {
-            let mut resp = Response::new(Body::from(file.contents()));
-            let h = resp.headers_mut();
-            h.insert(
-                header::CONTENT_TYPE,
-                HeaderValue::from_static(content_type(sub)),
-            );
-            // Filenames are content-hashed ⇒ safe to cache forever.
-            h.insert(
-                header::CACHE_CONTROL,
-                HeaderValue::from_static("public, max-age=31536000, immutable"),
-            );
-            return resp;
-        }
+    if !sub.is_empty()
+        && let Some(file) = CONSOLE_DIST.get_file(sub)
+    {
+        let mut resp = Response::new(Body::from(file.contents()));
+        let h = resp.headers_mut();
+        h.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static(content_type(sub)),
+        );
+        // Filenames are content-hashed ⇒ safe to cache forever.
+        h.insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("public, max-age=31536000, immutable"),
+        );
+        return resp;
     }
     let Some(index) = CONSOLE_DIST.get_file("index.html") else {
         return (StatusCode::INTERNAL_SERVER_ERROR, "console assets missing").into_response();
@@ -351,13 +351,14 @@ mod tests {
                 r.headers().get(header::CONTENT_TYPE).unwrap(),
                 "text/javascript; charset=utf-8"
             );
-            assert!(r
-                .headers()
-                .get(header::CACHE_CONTROL)
-                .unwrap()
-                .to_str()
-                .unwrap()
-                .contains("immutable"));
+            assert!(
+                r.headers()
+                    .get(header::CACHE_CONTROL)
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .contains("immutable")
+            );
         }
     }
 

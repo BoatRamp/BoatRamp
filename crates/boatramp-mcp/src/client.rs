@@ -14,7 +14,7 @@ use std::sync::Arc;
 use boatramp_core::cose::{self, LocalSigner, PopClaims};
 use boatramp_core::time::now_unix;
 
-use crate::config::{resolve_secret, InstanceConfig};
+use crate::config::{InstanceConfig, resolve_secret};
 use crate::error::{Error, Result};
 
 tokio::task_local! {
@@ -94,12 +94,12 @@ impl HttpControlPlane {
             None => None,
         };
         let mut builder = reqwest::Client::builder();
-        if let Some(token) = &token {
-            if let Ok(value) = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}")) {
-                let mut headers = reqwest::header::HeaderMap::new();
-                headers.insert(reqwest::header::AUTHORIZATION, value);
-                builder = builder.default_headers(headers);
-            }
+        if let Some(token) = &token
+            && let Ok(value) = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+        {
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert(reqwest::header::AUTHORIZATION, value);
+            builder = builder.default_headers(headers);
         }
         if inst.insecure {
             builder = builder.danger_accept_invalid_certs(true);

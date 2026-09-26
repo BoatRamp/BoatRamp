@@ -169,15 +169,17 @@ async fn main() {
     //    the number of IDLE topics. Event-driven delivery makes this ~flat (an idle topic is absent
     //    from the ready-set); the old poll was O(#topics). Opt-in (it creates up to 10k topics).
     if std::env::var("IDLE_SWEEP").ok().as_deref() == Some("1") {
-        println!("\nevent-driven delivery — idle-scaling sweep (gate 8): drainer look-for-work cost vs idle topics");
+        println!(
+            "\nevent-driven delivery — idle-scaling sweep (gate 8): drainer look-for-work cost vs idle topics"
+        );
 
         // (a) The ALGORITHM's cost, isolated from LSM compaction lag: over an in-memory KV (no
         //     tombstones), measure `ready_topics()` for a fixed set of ACTIVE topics while the number
         //     of fully-drained IDLE topics grows 10→1k→10k. This is the headline claim — the per-wake
         //     drain cost must be ~FLAT in the idle count (an idle topic is absent from the ready-set).
         {
-            use boatramp_core::kv::MemoryKv;
             use boatramp_core::Storage;
+            use boatramp_core::kv::MemoryKv;
             // A trivial in-memory blob store (payloads never touch the ready-set scan being measured).
             struct MemBlob(std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>);
             #[async_trait::async_trait]
@@ -262,7 +264,9 @@ async fn main() {
                 mq.publish(&format!("active-{i}"), b"x").await.unwrap();
             }
             let mut idle = 0usize;
-            println!("  (a) algorithm over in-memory KV (no compaction lag) — {ACTIVE} active topics, growing idle count:");
+            println!(
+                "  (a) algorithm over in-memory KV (no compaction lag) — {ACTIVE} active topics, growing idle count:"
+            );
             for &target in &[10usize, 1_000, 10_000] {
                 while idle < target {
                     let t = format!("idle-{idle}");
@@ -284,7 +288,9 @@ async fn main() {
                     mq.ready_topics().await.unwrap().len(),
                 );
             }
-            println!("      → FLAT (≈ constant) across 10→10k idle: an idle topic costs ~0 (gate 8, algorithm).");
+            println!(
+                "      → FLAT (≈ constant) across 10→10k idle: an idle topic costs ~0 (gate 8, algorithm)."
+            );
         }
 
         // (b) The production substrate (SlateDB): same sweep, subject to LSM compaction lag on the

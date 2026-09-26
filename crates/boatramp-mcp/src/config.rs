@@ -85,15 +85,15 @@ pub fn resolve_secret(
 /// `~/.config/boatramp` (honoring `$XDG_CONFIG_HOME`), falling back to `.` if no
 /// home is discoverable.
 pub fn config_dir() -> PathBuf {
-    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
-        if !xdg.is_empty() {
-            return PathBuf::from(xdg).join("boatramp");
-        }
+    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME")
+        && !xdg.is_empty()
+    {
+        return PathBuf::from(xdg).join("boatramp");
     }
-    if let Ok(home) = std::env::var("HOME") {
-        if !home.is_empty() {
-            return PathBuf::from(home).join(".config").join("boatramp");
-        }
+    if let Ok(home) = std::env::var("HOME")
+        && !home.is_empty()
+    {
+        return PathBuf::from(home).join(".config").join("boatramp");
     }
     PathBuf::from(".")
 }
@@ -101,10 +101,10 @@ pub fn config_dir() -> PathBuf {
 /// The config file path (`<config_dir>/mcp.toml`), overridable in full via
 /// `$BOATRAMP_MCP_CONFIG` (e.g. for tests or a non-standard location).
 pub fn config_path() -> PathBuf {
-    if let Ok(p) = std::env::var("BOATRAMP_MCP_CONFIG") {
-        if !p.is_empty() {
-            return PathBuf::from(p);
-        }
+    if let Ok(p) = std::env::var("BOATRAMP_MCP_CONFIG")
+        && !p.is_empty()
+    {
+        return PathBuf::from(p);
     }
     config_dir().join("mcp.toml")
 }

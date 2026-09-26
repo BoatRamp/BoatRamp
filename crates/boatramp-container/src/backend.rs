@@ -17,13 +17,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use boatramp_core::Storage;
 use boatramp_core::compute::{
-    compute_instance_id, Artifact, BackendError, Capabilities, ComputeBackend, ComputeSpec,
-    Endpoint, ExecOutput, Health, Instance, InstanceHandle, IsolationClass, LaunchRequest,
-    RootSource, Scheme, Snapshot, VolumeInfo,
+    Artifact, BackendError, Capabilities, ComputeBackend, ComputeSpec, Endpoint, ExecOutput,
+    Health, Instance, InstanceHandle, IsolationClass, LaunchRequest, RootSource, Scheme, Snapshot,
+    VolumeInfo, compute_instance_id,
 };
 use boatramp_core::ipam::{IpAuthority, IpPool};
-use boatramp_core::Storage;
 use futures::StreamExt;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -96,8 +96,8 @@ fn clamp_container_id(id: String) -> String {
     // distinct long ids), joined to a readable head that fills the rest of the budget.
     const DIGEST: usize = 11;
     let head = HOSTNAME_MAX - 1 - DIGEST; // room for "-" + the digest
-                                          // Ids are validated ASCII (`[a-z0-9-_]`), so a byte slice is a char boundary; guard
-                                          // anyway so a surprise multi-byte char can't panic.
+    // Ids are validated ASCII (`[a-z0-9-_]`), so a byte slice is a char boundary; guard
+    // anyway so a surprise multi-byte char can't panic.
     let head = id
         .get(..head)
         .unwrap_or_else(|| id.get(..head.min(id.len())).unwrap_or(&id));
@@ -721,7 +721,7 @@ impl ComputeBackend for ContainerBackend {
             _ => {
                 return Err(BackendError::Launch(
                     "container backend requires a Rootfs artifact".into(),
-                ))
+                ));
             }
         };
         let id = container_id(&req.project, &req.workload, req.replica);
@@ -986,7 +986,7 @@ impl ComputeBackend for ContainerBackend {
                 return Err(BackendError::Other(format!(
                     "read volumes dir {}: {e}",
                     root.display()
-                )))
+                )));
             }
         };
         let mut out = Vec::new();

@@ -459,7 +459,7 @@ pub fn reject_reserved_session_writes(
             Some("do") | Some("call") | Some("prepare") | Some("execute") => return refused(),
             // Defining a routine (single- or dollar-quoted body) on the guest path.
             Some("create") | Some("alter") if has_word("function") || has_word("procedure") => {
-                return refused()
+                return refused();
             }
             // A persistent GUC default: `ALTER ROLE/DATABASE/USER/SYSTEM … SET boatramp.*`
             // (scoped to those targets so an `ALTER TABLE`/`INDEX` isn't caught).
@@ -469,7 +469,7 @@ pub fn reject_reserved_session_writes(
                     Some("role") | Some("database") | Some("user") | Some("system")
                 ) && names_reserved() =>
             {
-                return refused()
+                return refused();
             }
             _ => {}
         }
@@ -484,10 +484,10 @@ pub fn reject_reserved_session_writes(
             "reset" => {
                 // `RESET boatramp.project` (target segment == namespace) or `RESET ALL`
                 // (clears custom GUCs too).
-                if let Some(target) = toks.get(1).and_then(|t| word_lc(t)) {
-                    if target == "all" || is_reserved_ns(&target) || is_reserved_var(&target) {
-                        return refused();
-                    }
+                if let Some(target) = toks.get(1).and_then(|t| word_lc(t))
+                    && (target == "all" || is_reserved_ns(&target) || is_reserved_var(&target))
+                {
+                    return refused();
                 }
             }
             "set" => {
@@ -893,7 +893,7 @@ fn words_have_txn_control(words: &[String]) -> bool {
                 case_depth -= 1;
             }
             "begin" | "start" | "commit" | "rollback" | "abort" | "savepoint" | "release" => {
-                return true
+                return true;
             }
             _ => {}
         }
@@ -1070,7 +1070,7 @@ mod migration_guard_tests {
 
     #[test]
     fn mysql_dialect_guards_honor_hash_comments_and_backticks() {
-        use super::{script_has_txn_control_in, script_references_word_in, GuardDialect};
+        use super::{GuardDialect, script_has_txn_control_in, script_references_word_in};
         // MySQL `#` line comment: a `# COMMIT` following a real statement IS transaction control the
         // MySQL server will execute (the text after `#` is stripped as a comment, so the `COMMIT`
         // must be BEFORE it to matter). A `COMMIT` hidden AFTER a `#` is a comment and must NOT flag.
@@ -1110,8 +1110,8 @@ mod migration_guard_tests {
     #[test]
     fn mysql_executable_comment_is_refused_by_every_guard() {
         use super::{
-            script_has_create_extension_in, script_has_txn_control_in, script_references_word_in,
-            GuardDialect,
+            GuardDialect, script_has_create_extension_in, script_has_txn_control_in,
+            script_references_word_in,
         };
         // S4 — transaction control hidden in an executable comment.
         for s in [
@@ -1174,8 +1174,8 @@ mod migration_guard_tests {
     #[test]
     fn postgres_treats_executable_comment_syntax_as_inert() {
         use super::{
-            script_has_create_extension_in, script_has_txn_control_in, script_references_word_in,
-            GuardDialect,
+            GuardDialect, script_has_create_extension_in, script_has_txn_control_in,
+            script_references_word_in,
         };
         // A `/*! COMMIT */` is a plain comment on Postgres — no transaction control.
         assert!(!script_has_txn_control_in(
@@ -1211,7 +1211,7 @@ mod migration_guard_tests {
     #[test]
     fn mysql_faithful_strip_exposes_and_preserves() {
         use super::{
-            script_has_txn_control_in, strip_comments_faithfully, GuardDialect, StripOpts,
+            GuardDialect, StripOpts, script_has_txn_control_in, strip_comments_faithfully,
         };
         // Thin alias so these MySQL-path assertions read as before the stripper was generalized.
         fn mysql_strip_comments_faithfully(s: &str) -> Option<String> {
@@ -1273,8 +1273,8 @@ mod migration_guard_tests {
     #[test]
     fn mysql_comment_confusion_bypasses_are_refused() {
         use super::{
-            script_has_create_extension_in, script_has_txn_control_in, script_references_word_in,
-            GuardDialect,
+            GuardDialect, script_has_create_extension_in, script_has_txn_control_in,
+            script_references_word_in,
         };
         // (1) A `/*!` INSIDE an ordinary `/* … */` comment must NOT let the ordinary comment's `*/`
         //     be consumed and the following live keyword swallowed.
@@ -1347,7 +1347,7 @@ mod migration_guard_tests {
 
     #[test]
     fn sqlite_dialect_guards_honor_comments_and_quoted_identifiers() {
-        use super::{script_has_txn_control_in, script_references_word_in, GuardDialect};
+        use super::{GuardDialect, script_has_txn_control_in, script_references_word_in};
         // A real COMMIT under the SQLite dialect is transaction control.
         assert!(script_has_txn_control_in(
             "DROP TABLE t; COMMIT",
@@ -1401,7 +1401,7 @@ mod migration_guard_tests {
     /// BOTH, which is safe.)
     #[test]
     fn sqlite_nested_block_comment_bypass_is_refused() {
-        use super::{script_has_txn_control_in, script_references_word_in, GuardDialect};
+        use super::{GuardDialect, script_has_txn_control_in, script_references_word_in};
         for s in [
             "/* a /* b */ COMMIT -- */", // executes on real SQLite — must refuse
             "/* /* */ COMMIT -- */",     // executes on real SQLite — must refuse
@@ -1999,12 +1999,16 @@ pub enum MigrateDdlError {
     /// The statement referenced the host-owned migration-ledger schema (`boatramp_migrations`). The
     /// owner role owns that schema, so an unguarded `exec` could corrupt prefix-consistency — refused
     /// host-side (S3).
-    #[error("migrate: the migration-ledger schema is host-owned and may not be touched by a migration step")]
+    #[error(
+        "migrate: the migration-ledger schema is host-owned and may not be touched by a migration step"
+    )]
     LedgerProtected,
     /// The statement issued its own transaction control (`BEGIN`/`COMMIT`/`ROLLBACK`). Each `exec`
     /// auto-commits on the host-held owner connection; a guest-managed transaction would desync the
     /// host's per-step ledger contract — refused (S4).
-    #[error("migrate: a migration step may not issue its own BEGIN/COMMIT/ROLLBACK — each exec auto-commits")]
+    #[error(
+        "migrate: a migration step may not issue its own BEGIN/COMMIT/ROLLBACK — each exec auto-commits"
+    )]
     TxnControl,
     /// The underlying owner-connection SQL error (sanitized).
     #[error("migrate: {0}")]

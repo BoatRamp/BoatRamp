@@ -17,13 +17,13 @@ use k8s_openapi::api::core::v1::{ConfigMap, Pod, Service};
 use k8s_openapi::api::policy::v1::PodDisruptionBudget;
 use kube::api::{Api, ListParams, Patch, PatchParams};
 use kube::runtime::controller::Action;
-use kube::runtime::{watcher, Controller};
+use kube::runtime::{Controller, watcher};
 use kube::{Client, Resource};
-use serde::de::DeserializeOwned;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 
 use super::crd::{BoatRampCluster, BoatRampClusterStatus, ClusterMode, Function, Site};
-use super::{membership, resources, Error, Result};
+use super::{Error, Result, membership, resources};
 
 /// The server-side-apply field manager: the operator owns the fields it sets.
 const FIELD_MANAGER: &str = "boatramp-operator";

@@ -5,12 +5,12 @@
 //! [`Handler`]) live at the crate root ([`crate::serving`]) and are re-exported here for
 //! the h2 driver's internal use.
 
-use http::{header, HeaderMap, HeaderName, HeaderValue, Method, Uri, Version};
+use http::{HeaderMap, HeaderName, HeaderValue, Method, Uri, Version, header};
 
 use crate::h2::error::{ErrorCode, H2Error};
 
 pub use crate::serving::{
-    response, Body, BodyChunk, BodyError, Handler, ReqBody, Request, Response,
+    Body, BodyChunk, BodyError, Handler, ReqBody, Request, Response, response,
 };
 
 /// Connection-specific header field names forbidden in HTTP/2 (RFC 7540 §8.1.2.2).

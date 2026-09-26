@@ -10,12 +10,12 @@
 
 use std::sync::Arc;
 
+use axum::Router;
 use axum::body::Body;
 use axum::extract::{Request, State};
-use axum::http::{header, StatusCode};
+use axum::http::{StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use axum::Router;
 use boatramp_mcp::{Backend, BoatrampMcp, ControlPlane, SingleBackend};
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::tower::{
@@ -23,8 +23,8 @@ use rmcp::transport::streamable_http_server::tower::{
 };
 use tower::ServiceExt;
 
-use crate::auth::{Auth, ChannelBearer};
 use crate::DaemonRuntime;
+use crate::auth::{Auth, ChannelBearer};
 
 /// The largest control-plane response we buffer from an in-process call (the API
 /// returns small JSON; this is a generous ceiling).

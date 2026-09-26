@@ -9,14 +9,14 @@ use std::collections::HashMap;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_stream::StreamExt as _;
 
+use crate::h2::CLIENT_PREFACE;
 use crate::h2::error::{ErrorCode, H2Error};
-use crate::h2::frame::{self, flag, FrameHeader, FrameType};
+use crate::h2::frame::{self, FrameHeader, FrameType, flag};
 use crate::h2::hpack::Hpack;
 use crate::h2::http::{self, Handler, Response};
 use crate::h2::settings::{self, Settings};
 use crate::h2::stream::StreamState;
 use crate::h2::wire::Wire;
-use crate::h2::CLIENT_PREFACE;
 
 /// Our advertised SETTINGS_MAX_FRAME_SIZE. 16 KiB (the default + minimum) keeps
 /// the frame-size checks simple and matches what the proxy body path wants anyway.
@@ -158,10 +158,10 @@ where
         }
 
         // While mid-header-block, only a CONTINUATION on the same stream is legal (§6.2).
-        if let Some(sid) = conn.expecting_continuation {
-            if header.kind != FrameType::Continuation || header.stream_id != sid {
-                return goaway(wire, conn.last_client_id, ErrorCode::ProtocolError).await;
-            }
+        if let Some(sid) = conn.expecting_continuation
+            && (header.kind != FrameType::Continuation || header.stream_id != sid)
+        {
+            return goaway(wire, conn.last_client_id, ErrorCode::ProtocolError).await;
         }
 
         match dispatch(&mut conn, wire, header, payload, &handler).await {
@@ -371,7 +371,7 @@ where
 {
     let sid = header.stream_id;
     // Client streams are odd and strictly increasing (§5.1.1).
-    if sid == 0 || sid % 2 == 0 {
+    if sid == 0 || sid.is_multiple_of(2) {
         return Err(H2Error::conn(ErrorCode::ProtocolError));
     }
     let new_stream = !conn.streams.contains_key(&sid);

@@ -266,10 +266,10 @@ async fn run_delivery_drainer(inner: Arc<HandlerRuntimeInner>, deploy: DeploySto
     // due-heap rebuild once, so a marker/heap lost across a restart is recovered before we rely on
     // the fast path. A fresh/upgraded node self-populates its ready-set here (B18).
     let leader = || inner.cron_leader_gate.get().is_none_or(|gate| gate());
-    if leader() {
-        if let Err(err) = messaging.rebuild_ready_set().await {
-            tracing::warn!(%err, "initial ready-set rebuild failed");
-        }
+    if leader()
+        && let Err(err) = messaging.rebuild_ready_set().await
+    {
+        tracing::warn!(%err, "initial ready-set rebuild failed");
     }
     rebuild_due_heap(messaging.as_ref(), &mut due_heap).await;
     let mut last_rebuild = tokio::time::Instant::now();
@@ -361,10 +361,10 @@ async fn run_delivery_drainer(inner: Arc<HandlerRuntimeInner>, deploy: DeploySto
         // self-heal, on a LONG cadence (the one full-ish scan). Leader-gated in Phase A (it proposes
         // reconciling writes; a follower rebuild would be redundant, though safe — B7).
         if last_rebuild.elapsed() >= cfg.rebuild_interval {
-            if leader() {
-                if let Err(err) = messaging.rebuild_ready_set().await {
-                    tracing::warn!(%err, "ready-set rebuild failed");
-                }
+            if leader()
+                && let Err(err) = messaging.rebuild_ready_set().await
+            {
+                tracing::warn!(%err, "ready-set rebuild failed");
             }
             last_rebuild = tokio::time::Instant::now();
         }
@@ -486,8 +486,8 @@ async fn reconcile_blob_watchers(
                 };
                 let watch_id = format!("{project_name}|{}|{}", function.name, trigger.id);
                 desired.insert(watch_id.clone());
-                if let std::collections::hash_map::Entry::Vacant(slot) = watchers.entry(watch_id) {
-                    if let Some(handle) = spawn_blob_watcher(
+                if let std::collections::hash_map::Entry::Vacant(slot) = watchers.entry(watch_id)
+                    && let Some(handle) = spawn_blob_watcher(
                         inner.clone(),
                         deploy.clone(),
                         project_name.clone(),
@@ -495,9 +495,8 @@ async fn reconcile_blob_watchers(
                         prefix,
                     )
                     .await
-                    {
-                        slot.insert(handle);
-                    }
+                {
+                    slot.insert(handle);
                 }
             }
         }

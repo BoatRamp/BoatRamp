@@ -7,10 +7,10 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use boatramp_acme::acme::CertRequest;
-use boatramp_acme::{domain_record, preview_record, preview_wildcard, PreviewTarget};
+use boatramp_acme::{PreviewTarget, domain_record, preview_record, preview_wildcard};
 
 use crate::acme_dns::{
-    build_provider, build_provider_opts, cloudflare_dns_from_env, obtain_or_load, DnsProviderKind,
+    DnsProviderKind, build_provider, build_provider_opts, cloudflare_dns_from_env, obtain_or_load,
 };
 use crate::config::ProjectConfig;
 

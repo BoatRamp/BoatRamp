@@ -4,7 +4,7 @@
 //! window makes the server stall and resume on WINDOW_UPDATE). Driven by the
 //! reference `h2` client, so the responses are validated against a real peer.
 
-use boatramp_http::h2::{response, serve_connection, Handler, Request, Response};
+use boatramp_http::h2::{Handler, Request, Response, response, serve_connection};
 use bytes::Bytes;
 
 struct App;

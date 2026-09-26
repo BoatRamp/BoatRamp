@@ -154,11 +154,11 @@ pub(crate) async fn list(
     let prefix = apq_prefix(scope);
     let mut out = Vec::new();
     for key in kv.list_prefix(&prefix).await.unwrap_or_default() {
-        if let Ok(Some(bytes)) = kv.get(&key).await {
-            if let Ok(query) = String::from_utf8(bytes) {
-                let hash = key.strip_prefix(&prefix).unwrap_or(&key).to_string();
-                out.push((hash, query));
-            }
+        if let Ok(Some(bytes)) = kv.get(&key).await
+            && let Ok(query) = String::from_utf8(bytes)
+        {
+            let hash = key.strip_prefix(&prefix).unwrap_or(&key).to_string();
+            out.push((hash, query));
         }
     }
     out

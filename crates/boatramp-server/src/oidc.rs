@@ -16,7 +16,7 @@
 use std::collections::HashMap;
 use std::sync::RwLock;
 
-use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
+use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use serde::Deserialize;
 
 /// Static OIDC settings (issuer + expected audience + which claim carries the
@@ -269,7 +269,7 @@ pub enum OidcError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use jsonwebtoken::{encode, EncodingKey, Header};
+    use jsonwebtoken::{EncodingKey, Header, encode};
 
     /// Build a verifier + matching signer using a symmetric (HS256) key — this
     /// exercises the exact decode/validate/scope-map path the RS256 production

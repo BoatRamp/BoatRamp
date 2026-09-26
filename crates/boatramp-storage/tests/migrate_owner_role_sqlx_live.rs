@@ -19,7 +19,7 @@
 
 #![cfg(feature = "sql-postgres")]
 
-use boatramp_storage::sql_sqlx::{connect, ExternalSqlKind, ExternalSqlOptions};
+use boatramp_storage::sql_sqlx::{ExternalSqlKind, ExternalSqlOptions, connect};
 use boatramp_storage::tenant_provision::{grant_app_role_ddl, provision_ddl};
 
 const DB: &str = "mig_appdb";

@@ -216,10 +216,10 @@ pub fn resolve_client_ip(
     }
     if let Some(chain) = forwarded_for {
         for hop in chain.split(',').rev() {
-            if let Ok(ip) = hop.trim().parse::<IpAddr>() {
-                if !ip_in_any(ip, trusted_proxies) {
-                    return ip;
-                }
+            if let Ok(ip) = hop.trim().parse::<IpAddr>()
+                && !ip_in_any(ip, trusted_proxies)
+            {
+                return ip;
             }
         }
     }

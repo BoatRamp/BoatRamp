@@ -9,10 +9,10 @@
 //! This is the foundation of the federation gateway: the schema registry composes on
 //! publish, and the query planner (a later landing) plans against this model.
 
+use async_graphql_parser::Positioned;
 use async_graphql_parser::types::{
     ConstDirective, FieldDefinition, TypeKind, TypeSystemDefinition,
 };
-use async_graphql_parser::Positioned;
 use async_graphql_value::ConstValue;
 use boatramp_core::tenancy::{TargetSource, TenancyClass};
 use std::collections::{BTreeMap, BTreeSet};
@@ -137,17 +137,17 @@ pub(crate) fn compose(subgraphs: &[(String, String)]) -> Result<Supergraph, Comp
             message: e.to_string(),
         })?;
         for def in &doc.definitions {
-            if let TypeSystemDefinition::Type(ty) = def {
-                if let TypeKind::Object(obj) = &ty.node.kind {
-                    ingest_object(
-                        &mut sg,
-                        &mut shareable,
-                        name,
-                        ty.node.name.node.as_str(),
-                        &ty.node.directives,
-                        &obj.fields,
-                    )?;
-                }
+            if let TypeSystemDefinition::Type(ty) = def
+                && let TypeKind::Object(obj) = &ty.node.kind
+            {
+                ingest_object(
+                    &mut sg,
+                    &mut shareable,
+                    name,
+                    ty.node.name.node.as_str(),
+                    &ty.node.directives,
+                    &obj.fields,
+                )?;
             }
         }
     }
@@ -299,7 +299,7 @@ fn parse_tenant_directive(
                 _ => {
                     return Err(
                         "scope: target requires a `public: \"<subset>\"` argument".to_string()
-                    )
+                    );
                 }
             };
             let via = match arg("via") {
@@ -421,7 +421,7 @@ mod tests {
     /// (the class of gap behind the federation-v2-SDL-rejected incident).
     #[test]
     fn composes_sdl_emitted_by_a_real_async_graphql_subgraph() {
-        use async_graphql::{EmptyMutation, EmptySubscription, Object, Schema, SimpleObject, ID};
+        use async_graphql::{EmptyMutation, EmptySubscription, ID, Object, Schema, SimpleObject};
 
         #[derive(SimpleObject)]
         struct User {
@@ -783,9 +783,10 @@ extend schema @link(
             Some("identity")
         );
         // An unmarked field never enters the hidden set (non-breaking default).
-        assert!(!sg
-            .edge_hidden_roots
-            .contains(&("Query".to_string(), "visibleOp".to_string())));
+        assert!(
+            !sg.edge_hidden_roots
+                .contains(&("Query".to_string(), "visibleOp".to_string()))
+        );
     }
 
     #[test]
@@ -824,8 +825,9 @@ extend schema @link(
         "#;
         // Composes without error; the root is recorded as edge-hidden.
         let sg = compose(&[sub("identity", sdl)]).expect("root @edgeHidden composes cleanly");
-        assert!(sg
-            .edge_hidden_roots
-            .contains(&("Query".to_string(), "exchange".to_string())));
+        assert!(
+            sg.edge_hidden_roots
+                .contains(&("Query".to_string(), "exchange".to_string()))
+        );
     }
 }

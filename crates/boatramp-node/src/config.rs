@@ -610,17 +610,17 @@ impl ServerConfig {
             // already declared `[cluster]`, its `listen` stands and the other env
             // fields layer over it even without `BOATRAMP_CLUSTER_LISTEN`.
             let listen = source.parse::<SocketAddr>("BOATRAMP_CLUSTER_LISTEN")?;
-            if self.cluster.is_none() {
-                if let Some(listen) = listen {
-                    self.cluster = Some(ClusterConfig {
-                        listen,
-                        root_pubkeys: Vec::new(),
-                        seeds: Vec::new(),
-                        join_token: None,
-                        store_dir: None,
-                        mesh: None,
-                    });
-                }
+            if self.cluster.is_none()
+                && let Some(listen) = listen
+            {
+                self.cluster = Some(ClusterConfig {
+                    listen,
+                    root_pubkeys: Vec::new(),
+                    seeds: Vec::new(),
+                    join_token: None,
+                    store_dir: None,
+                    mesh: None,
+                });
             }
             if let Some(cluster) = self.cluster.as_mut() {
                 // A `listen` override applies to an already-present section too (a

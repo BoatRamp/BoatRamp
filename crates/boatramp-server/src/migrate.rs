@@ -219,7 +219,7 @@ pub(crate) async fn orchestrate(
                     None => {
                         return Err(MigrationError::Other(format!(
                             "baseline up_to {id:?} is not in the supplied step set"
-                        )))
+                        )));
                     }
                 },
                 None => steps.len(),
@@ -238,7 +238,7 @@ pub(crate) async fn orchestrate(
                 let eff = match resolve_effective(deploy, project, step).await {
                     Ok((eff, _)) => eff,
                     Err(e) => {
-                        return Ok(failed(newly_applied, already_applied, steps, &step.id, e))
+                        return Ok(failed(newly_applied, already_applied, steps, &step.id, e));
                     }
                 };
                 substrate
@@ -261,7 +261,7 @@ pub(crate) async fn orchestrate(
                 let (eff, resolved_fn) = match resolve_effective(deploy, project, step).await {
                     Ok(r) => r,
                     Err(e) => {
-                        return Ok(failed(newly_applied, already_applied, steps, &step.id, e))
+                        return Ok(failed(newly_applied, already_applied, steps, &step.id, e));
                     }
                 };
                 match &step.action {
@@ -278,7 +278,7 @@ pub(crate) async fn orchestrate(
                                     steps,
                                     &step.id,
                                     error,
-                                ))
+                                ));
                             }
                         }
                     }
@@ -305,7 +305,7 @@ pub(crate) async fn orchestrate(
                                     steps,
                                     &step.id,
                                     error,
-                                ))
+                                ));
                             }
                         }
                     }

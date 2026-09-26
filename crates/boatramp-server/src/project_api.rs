@@ -7,7 +7,7 @@
 //! Pulls the shared response helpers in via `use super::*`.
 
 use super::*;
-use boatramp_core::project::{Project, ProjectConfig, ProjectMeta, DEFAULT_PROJECT};
+use boatramp_core::project::{DEFAULT_PROJECT, Project, ProjectConfig, ProjectMeta};
 use boatramp_core::time::now_unix;
 
 /// The `POST /api/projects` request body: a new project's identity + optional metadata.
@@ -59,7 +59,7 @@ pub(super) async fn create_project(
                 StatusCode::CONFLICT,
                 format!("project `{name}` already exists\n"),
             )
-                .into_response()
+                .into_response();
         }
         Ok(None) => {}
         Err(err) => return deploy_error_response(err),
@@ -536,18 +536,22 @@ mod tests {
 
         // Project + every family gone.
         assert!(deploy.get_project("acme").await.unwrap().is_none());
-        assert!(deploy
-            .kv()
-            .list_prefix(&boatramp_core::project::resource_prefix("acme"))
-            .await
-            .unwrap()
-            .is_empty());
-        assert!(deploy
-            .kv()
-            .get(&domain_key("acme.example"))
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            deploy
+                .kv()
+                .list_prefix(&boatramp_core::project::resource_prefix("acme"))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            deploy
+                .kv()
+                .get(&domain_key("acme.example"))
+                .await
+                .unwrap()
+                .is_none()
+        );
 
         // deprovision_project called exactly once, for acme.
         assert_eq!(*deprov.projects.lock().unwrap(), vec!["acme".to_string()]);
@@ -559,17 +563,21 @@ mod tests {
 
         // The second project is untouched.
         assert!(deploy.get_project("keepme").await.unwrap().is_some());
-        assert!(deploy
-            .get_site_config(ProjectRef::new("keepme"), "www")
-            .await
-            .unwrap()
-            .is_some());
-        assert!(deploy
-            .kv()
-            .get(&domain_key("keepme.example"))
-            .await
-            .unwrap()
-            .is_some());
+        assert!(
+            deploy
+                .get_site_config(ProjectRef::new("keepme"), "www")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            deploy
+                .kv()
+                .get(&domain_key("keepme.example"))
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[tokio::test]

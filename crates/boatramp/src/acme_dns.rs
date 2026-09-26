@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use boatramp_acme::dns::DnsProvider;
-use boatramp_acme::{preview_wildcard, ManualDnsProvider};
+use boatramp_acme::{ManualDnsProvider, preview_wildcard};
 use clap::ValueEnum;
 
 /// A failure in the ACME DNS-01 TLS path (the CLI `dns` subcommand and the
@@ -455,9 +455,10 @@ mod tests {
     #[test]
     fn cache_paths_encode_wildcard() {
         let (cert, key, stamp) = cache_paths(Path::new("/c"), "*.deploy.example.com");
-        assert!(cert
-            .to_string_lossy()
-            .contains("_wildcard_.deploy.example.com"));
+        assert!(
+            cert.to_string_lossy()
+                .contains("_wildcard_.deploy.example.com")
+        );
         assert!(key.ends_with("key.pem"));
         assert!(stamp.ends_with("issued_at"));
     }

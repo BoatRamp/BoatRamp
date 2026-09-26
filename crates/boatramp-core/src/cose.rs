@@ -20,8 +20,8 @@ use base64::Engine as _;
 use ciborium::value::Value as CborValue;
 use coset::cwt::{ClaimsSet, ClaimsSetBuilder, Timestamp};
 use coset::{
-    iana, Algorithm as CoseAlg, CborSerializable, CoseSign1, CoseSign1Builder, HeaderBuilder,
-    TaggedCborSerializable,
+    Algorithm as CoseAlg, CborSerializable, CoseSign1, CoseSign1Builder, HeaderBuilder,
+    TaggedCborSerializable, iana,
 };
 
 use boatramp_types::authz::GrantedRole;
@@ -194,10 +194,10 @@ impl Caveats {
         if self.read_only && required.action != crate::authz::Action::Read {
             return false;
         }
-        if let Some(site) = &self.only_site {
-            if required.target_term() != site {
-                return false;
-            }
+        if let Some(site) = &self.only_site
+            && required.target_term() != site
+        {
+            return false;
         }
         true
     }
@@ -1470,10 +1470,10 @@ fn check_exp(claims: &ClaimsSet, now_unix: u64) -> Result<Option<u64>, TokenErro
         Some(Timestamp::WholeSeconds(s)) => Some(s.max(0) as u64),
         _ => None,
     };
-    if let Some(exp) = exp {
-        if now_unix > exp {
-            return Err(TokenError::Expired);
-        }
+    if let Some(exp) = exp
+        && now_unix > exp
+    {
+        return Err(TokenError::Expired);
     }
     Ok(exp)
 }
@@ -1538,7 +1538,7 @@ fn split_tagged(spec: &str) -> Result<(TokenAlg, Vec<u8>), TokenError> {
         other => {
             return Err(TokenError::Key(format!(
                 "unknown token algorithm {other:?}"
-            )))
+            )));
         }
     };
     let bytes = hex::decode(hex_str).map_err(|e| TokenError::Key(format!("hex: {e}")))?;

@@ -374,7 +374,7 @@ pub(super) async fn put_site_config(
     match check_added_domains_verified(&deploy, project.as_ref(), &site, &config).await {
         Ok(DomainGuard::Ok) => {}
         Ok(DomainGuard::Unverified(reason)) => {
-            return (StatusCode::FORBIDDEN, format!("{reason}\n")).into_response()
+            return (StatusCode::FORBIDDEN, format!("{reason}\n")).into_response();
         }
         Err(err) => return deploy_error_response(err),
     }
@@ -547,14 +547,14 @@ pub(super) async fn put_graphql_sql_subgraph(
     let sg = match crate::graphql_registry::publish(kv, &project.0, &name, &sdl).await {
         Ok(sg) => sg,
         Err(crate::graphql_registry::PublishError::Composition(e)) => {
-            return (StatusCode::BAD_REQUEST, format!("{e}\n")).into_response()
+            return (StatusCode::BAD_REQUEST, format!("{e}\n")).into_response();
         }
         Err(crate::graphql_registry::PublishError::Store(e)) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("registry store error: {e}\n"),
             )
-                .into_response()
+                .into_response();
         }
     };
     // Record the SQL backend so the gateway routes this subgraph's fetches to the connector.
@@ -604,7 +604,7 @@ async fn introspect_function_sdl(
             return Err((
                 StatusCode::BAD_GATEWAY,
                 format!("subgraph `{name}` timed out answering `_service {{ sdl }}`\n"),
-            ))
+            ));
         }
         Ok(Err(boatramp_handlers::InvokeError::NotFound)) => {
             return Err((
@@ -612,19 +612,22 @@ async fn introspect_function_sdl(
                 format!(
                     "no function named `{name}` is deployed — deploy it before registering it as a subgraph\n"
                 ),
-            ))
+            ));
         }
         Ok(Err(boatramp_handlers::InvokeError::Failed(msg))) => {
             return Err((
                 StatusCode::BAD_GATEWAY,
                 format!("subgraph `{name}` failed answering `_service {{ sdl }}`: {msg}\n"),
-            ))
+            ));
         }
         Ok(Ok(response)) => response,
     };
     let parsed: serde_json::Value =
         serde_json::from_slice(&response.body).unwrap_or(serde_json::Value::Null);
-    match parsed.pointer("/data/_service/sdl").and_then(|v| v.as_str()) {
+    match parsed
+        .pointer("/data/_service/sdl")
+        .and_then(|v| v.as_str())
+    {
         Some(sdl) if !sdl.trim().is_empty() => Ok(sdl.to_string()),
         _ => Err((
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -672,14 +675,14 @@ pub(super) async fn put_graphql_function_subgraph(
     let sg = match crate::graphql_registry::publish(kv, &project.0, &name, &sdl).await {
         Ok(sg) => sg,
         Err(crate::graphql_registry::PublishError::Composition(e)) => {
-            return (StatusCode::BAD_REQUEST, format!("{e}\n")).into_response()
+            return (StatusCode::BAD_REQUEST, format!("{e}\n")).into_response();
         }
         Err(crate::graphql_registry::PublishError::Store(e)) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("registry store error: {e}\n"),
             )
-                .into_response()
+                .into_response();
         }
     };
     // Record the function backend explicitly (it is also the default) for parity with `/sql`.
@@ -958,7 +961,7 @@ pub(super) async fn put_compute(
                     "micro-VM workload has no kernel and no default kernel is configured; set \
                      one with `boatramp config set compute.default_kernel …`\n",
                 )
-                    .into_response()
+                    .into_response();
             }
         }
     }
@@ -1266,14 +1269,14 @@ fn to_migration_step(
             return Err((
                 s.id,
                 "step has none of `function` / `sql` / `extension`".to_string(),
-            ))
+            ));
         }
         _ => {
             return Err((
                 s.id,
                 "step sets more than one of `function` / `sql` / `extension` (set exactly one)"
                     .to_string(),
-            ))
+            ));
         }
     };
     Ok(MigrationStep { id: s.id, action })
@@ -1329,7 +1332,7 @@ async fn run_migrate_bundle(
                 StatusCode::BAD_REQUEST,
                 format!("invalid migration bundle: {msg}\n"),
             )
-                .into_response()
+                .into_response();
         }
     };
     let core_mode = match mode {
@@ -1736,7 +1739,7 @@ pub(super) async fn compute_exec(
     let stdin = match req.stdin_b64.as_deref().map(|s| b64.decode(s)).transpose() {
         Ok(v) => v,
         Err(_) => {
-            return (StatusCode::BAD_REQUEST, "stdin_b64 is not valid base64\n").into_response()
+            return (StatusCode::BAD_REQUEST, "stdin_b64 is not valid base64\n").into_response();
         }
     };
     match exec
@@ -2476,10 +2479,10 @@ pub(super) async fn sql_move(
     // malformed/`//`-collapsing/traversal name is rejected `422` before any lookup —
     // the reserved default (`default`) is explicitly allowed as either endpoint.
     for name in [&req.from, &req.to] {
-        if name != boatramp_core::project::DEFAULT_DB_NAME {
-            if let Some(bad) = reject_invalid_db(name) {
-                return bad;
-            }
+        if name != boatramp_core::project::DEFAULT_DB_NAME
+            && let Some(bad) = reject_invalid_db(name)
+        {
+            return bad;
         }
     }
     let Some(sql) = sql else {

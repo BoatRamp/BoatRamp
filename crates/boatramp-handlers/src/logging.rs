@@ -11,7 +11,7 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use wasmtime_wasi::{async_trait, OutputStream, Pollable, StdoutStream, StreamResult};
+use wasmtime_wasi::{OutputStream, Pollable, StdoutStream, StreamResult, async_trait};
 
 /// Which standard stream a captured line came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

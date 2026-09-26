@@ -14,12 +14,12 @@ use std::time::Duration;
 use boatramp_core::config::SiteConfig;
 use kube::api::{Api, ListParams, Patch, PatchParams};
 use kube::runtime::controller::Action;
-use kube::runtime::finalizer::{finalizer, Event};
+use kube::runtime::finalizer::{Event, finalizer};
 use kube::{Client, ResourceExt};
 use serde_json::json;
 
 use super::crd::{BoatRampCluster, Site, SiteStatus};
-use super::{executor, Error, Result};
+use super::{Error, Result, executor};
 
 /// The finalizer that guarantees a `Site` deletes its cluster-side state before
 /// the object is removed.
@@ -114,16 +114,16 @@ async fn apply(client: &Client, ns: &str, site: &Site) -> Result<Action> {
 /// A missing cluster/token is not fatal — the object still deletes.
 async fn cleanup(client: &Client, ns: &str, site: &Site) -> Result<Action> {
     let name = site.name_any();
-    if let Ok(brc) = resolve_cluster(client, ns, site.spec.cluster.as_deref()).await {
-        if let Ok(Some((http, base, token))) = executor::pinned_admin_pod0(client, ns, &brc).await {
-            let seg = site_seg(site.spec.project.as_deref(), &name);
-            let _ = http
-                .delete(format!("{base}/api/{seg}"))
-                .bearer_auth(&token)
-                .send()
-                .await
-                .and_then(reqwest::Response::error_for_status);
-        }
+    if let Ok(brc) = resolve_cluster(client, ns, site.spec.cluster.as_deref()).await
+        && let Ok(Some((http, base, token))) = executor::pinned_admin_pod0(client, ns, &brc).await
+    {
+        let seg = site_seg(site.spec.project.as_deref(), &name);
+        let _ = http
+            .delete(format!("{base}/api/{seg}"))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status);
     }
     Ok(Action::await_change())
 }

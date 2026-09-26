@@ -292,10 +292,10 @@ fn lookup(
     if let Some(entry) = files.get(key) {
         return Some((key.to_string(), entry.clone()));
     }
-    if case_insensitive {
-        if let Some((k, entry)) = files.iter().find(|(k, _)| k.eq_ignore_ascii_case(key)) {
-            return Some((k.clone(), entry.clone()));
-        }
+    if case_insensitive
+        && let Some((k, entry)) = files.iter().find(|(k, _)| k.eq_ignore_ascii_case(key))
+    {
+        return Some((k.clone(), entry.clone()));
     }
     None
 }
@@ -407,10 +407,10 @@ fn is_fingerprinted(path: &str) -> bool {
 
 /// Whether the response is HTML, by content type (preferred) or `.htm(l)` name.
 fn is_html(path: &str, content_type: Option<&str>) -> bool {
-    if let Some(ct) = content_type {
-        if ct.split(';').next().map(str::trim) == Some("text/html") {
-            return true;
-        }
+    if let Some(ct) = content_type
+        && ct.split(';').next().map(str::trim) == Some("text/html")
+    {
+        return true;
     }
     let name = last_segment(path);
     name.ends_with(".html") || name.ends_with(".htm")

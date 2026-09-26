@@ -10,7 +10,7 @@ use base64::Engine as _;
 
 use boatramp_core::cose::{Signer, TokenAlg, TokenError, TokenPublicKey};
 
-use super::{rest, SignerError};
+use super::{SignerError, rest};
 
 const BACKEND: &str = "vault";
 

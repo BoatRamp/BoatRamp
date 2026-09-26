@@ -99,7 +99,7 @@ pub(super) async fn start_workflow_run(
     let workflow = match deploy.get_workflow(project.as_ref(), &name).await {
         Ok(Some(w)) => w,
         Ok(None) => {
-            return (StatusCode::NOT_FOUND, format!("no workflow {name:?}\n")).into_response()
+            return (StatusCode::NOT_FOUND, format!("no workflow {name:?}\n")).into_response();
         }
         Err(err) => return deploy_error_response(err),
     };
@@ -110,7 +110,7 @@ pub(super) async fn start_workflow_run(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "workflow input exceeds the cap\n",
             )
-                .into_response()
+                .into_response();
         }
     };
     let now = now_unix();
@@ -269,26 +269,25 @@ async fn compensate_run(
         let Some(step) = workflow.step(step_id) else {
             continue;
         };
-        if let Some(compensate_fn) = &step.compensate {
-            if let Ok(Some(function)) = deploy.get_function(project, compensate_fn).await {
-                if let Some(component) = function.resolve(&function.active).map(str::to_owned) {
-                    let request = build_step_request(Vec::new());
-                    // Best-effort rollback; its outcome does not change the verdict.
-                    let _ = execute_function(
-                        inner,
-                        deploy,
-                        project,
-                        &function,
-                        &component,
-                        request,
-                        0,
-                        boatramp_handlers::Lane::Async,
-                        // Compensation step: durable background work, no live tenant source.
-                        crate::function_runtime::FnTenant::Background,
-                    )
-                    .await;
-                }
-            }
+        if let Some(compensate_fn) = &step.compensate
+            && let Ok(Some(function)) = deploy.get_function(project, compensate_fn).await
+            && let Some(component) = function.resolve(&function.active).map(str::to_owned)
+        {
+            let request = build_step_request(Vec::new());
+            // Best-effort rollback; its outcome does not change the verdict.
+            let _ = execute_function(
+                inner,
+                deploy,
+                project,
+                &function,
+                &component,
+                request,
+                0,
+                boatramp_handlers::Lane::Async,
+                // Compensation step: durable background work, no live tenant source.
+                crate::function_runtime::FnTenant::Background,
+            )
+            .await;
         }
         if let Some(sr) = run.steps.get_mut(step_id) {
             sr.status = boatramp_core::workflow::StepStatus::Compensated;

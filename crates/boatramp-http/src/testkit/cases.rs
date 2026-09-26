@@ -1,7 +1,7 @@
 //! The curated request-head corpus, grouped by protocol aspect — the auditable
 //! completeness checklist. Each case is an input + the verdict `parse_request_head` must
 //! produce. Combinatorial gaps (the full CL×TE matrix, whitespace/version permutations)
-//! are filled by [`super::gen`]; chunk-body and response framing have their own suites.
+//! are filled by [`super::generators`]; chunk-body and response framing have their own suites.
 
 use super::{Aspect::*, Case, Expect::*, Framing::*};
 
@@ -435,7 +435,7 @@ pub const TRANSFER_ENCODING: &[Case] = &[
     c(TransferEncoding, "chunked on HTTP/1.0", b"POST / HTTP/1.0\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n", Reject),
 ];
 
-// ---- C. The CL×TE framing matrix (a few anchors; gen.rs does the full grid) --
+// ---- C. The CL×TE framing matrix (a few anchors; generators.rs does the full grid) --
 pub const FRAMING_MATRIX: &[Case] = &[
     c(
         FramingMatrix,

@@ -11,9 +11,10 @@
 //! vCPUs run.
 
 use kvm_bindings::{
-    kvm_clock_data, kvm_cpuid_entry2, kvm_irqchip, kvm_lapic_state, kvm_mp_state, kvm_msr_entry,
-    kvm_pit_state2, kvm_regs, kvm_sregs, kvm_vcpu_events, kvm_xcrs, kvm_xsave, CpuId, Msrs,
-    KVM_IRQCHIP_IOAPIC, KVM_IRQCHIP_PIC_MASTER, KVM_IRQCHIP_PIC_SLAVE, KVM_MAX_CPUID_ENTRIES,
+    CpuId, KVM_IRQCHIP_IOAPIC, KVM_IRQCHIP_PIC_MASTER, KVM_IRQCHIP_PIC_SLAVE,
+    KVM_MAX_CPUID_ENTRIES, Msrs, kvm_clock_data, kvm_cpuid_entry2, kvm_irqchip, kvm_lapic_state,
+    kvm_mp_state, kvm_msr_entry, kvm_pit_state2, kvm_regs, kvm_sregs, kvm_vcpu_events, kvm_xcrs,
+    kvm_xsave,
 };
 use kvm_ioctls::{Kvm, VcpuFd, VmFd};
 

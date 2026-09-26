@@ -428,14 +428,14 @@ impl SessionStore {
         id: &str,
         now_ms: u64,
     ) -> Result<bool, StoreError> {
-        if let Some(rec) = self.load(project, id).await? {
-            if rec.state.is_expired(&self.limits, now_ms) {
-                self.kv
-                    .delete(&session_key(project, id))
-                    .await
-                    .map_err(|e| StoreError::Kv(e.to_string()))?;
-                return Ok(true);
-            }
+        if let Some(rec) = self.load(project, id).await?
+            && rec.state.is_expired(&self.limits, now_ms)
+        {
+            self.kv
+                .delete(&session_key(project, id))
+                .await
+                .map_err(|e| StoreError::Kv(e.to_string()))?;
+            return Ok(true);
         }
         Ok(false)
     }

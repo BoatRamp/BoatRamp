@@ -333,7 +333,7 @@ fn run_sandbox() -> Result<(), CliError> {
 /// (the embedded VMM is KVM-x86-specific).
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 fn run_vmm_worker(json: Option<String>) -> Result<(), CliError> {
-    use boatramp_firecracker::embedded_backend::{run_jailed_worker, WorkerConfig};
+    use boatramp_firecracker::embedded_backend::{WorkerConfig, run_jailed_worker};
     let json = json.ok_or(CliError::VmmMissingConfig)?;
     let cfg: WorkerConfig = serde_json::from_str(&json).map_err(CliError::VmmConfigParse)?;
     run_jailed_worker(cfg).map_err(CliError::VmmWorker)?;

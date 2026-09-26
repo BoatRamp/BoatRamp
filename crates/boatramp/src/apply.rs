@@ -693,11 +693,7 @@ fn is_conflict(err: &client::ClientError) -> bool {
 
 /// `"yes"`/`"no"` for a dry-run plan line.
 fn yes_no(b: bool) -> &'static str {
-    if b {
-        "yes"
-    } else {
-        "no"
-    }
+    if b { "yes" } else { "no" }
 }
 
 #[cfg(test)]

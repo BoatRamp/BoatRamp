@@ -45,8 +45,8 @@ exclude = [
 
 [workspace.package]
 version = "0.5.6"
-edition = "2021"
-rust-version = "1.82"
+edition = "2024"
+rust-version = "1.91"
 license = "MIT OR Apache-2.0"
 authors = ["Uranion <boatramp@uranion.ai>"]
 repository = "https://github.com/BoatRamp/BoatRamp"

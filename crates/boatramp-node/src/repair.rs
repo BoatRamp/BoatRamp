@@ -69,10 +69,10 @@ use boatramp_core::sql::{
     RepairCheck, RepairError, RepairMode, RepairReport, RepairStatus, SqlBackend, SqlError,
     SqlValue,
 };
+use boatramp_storage::ExternalSqlKind;
 use boatramp_storage::tenant_provision::{
     grant_app_role_ddl, provision_ddl, quote_ident, sanitize_ident,
 };
-use boatramp_storage::ExternalSqlKind;
 
 use boatramp_core::project::ProjectRef;
 
@@ -996,8 +996,7 @@ async fn repair_external(
     let mut report = base_report(binding, project, backend_class, mode);
     report.tenant = format!("{}@{} (external)", binding_db(binding), binding.url_env);
 
-    let operator_owned =
-        "operator-owned binding (bring-your-own url_env); boatramp owns no roles / \
+    let operator_owned = "operator-owned binding (bring-your-own url_env); boatramp owns no roles / \
                           ownership / grants here — nothing to reconcile";
     for check in [
         "owner-role",
@@ -1639,7 +1638,9 @@ fn targeted_reown_ddl(
                      to emit ALTER FUNCTION — reconcile this object manually"
                 ));
             }
-            if args.matches('\'').count() % 2 != 0 || args.matches('"').count() % 2 != 0 {
+            if !args.matches('\'').count().is_multiple_of(2)
+                || !args.matches('"').count().is_multiple_of(2)
+            {
                 return Err(format!(
                     "function identity-args {args:?} have an unbalanced quote; refusing to emit \
                      ALTER FUNCTION — reconcile this object manually"
@@ -2469,7 +2470,7 @@ fn build_external_backend(
     kind: ExternalSqlKind,
     env_source: &dyn boatramp_core::env::EnvSource,
 ) -> Result<Arc<dyn SqlBackend>, SqlError> {
-    use boatramp_storage::sql_sqlx::{connect, ExternalSqlOptions};
+    use boatramp_storage::sql_sqlx::{ExternalSqlOptions, connect};
     if binding.url_env.is_empty() {
         return Err(SqlError::other(
             "external binding has no `url_env` set".to_string(),
@@ -2741,35 +2742,35 @@ fn check_mysql_ddl_identity(
         }
     };
     // Distinctness vs the runtime `url_env` (byte + username), the fail-closed invariant.
-    if !binding.url_env.is_empty() {
-        if let Some(runtime_url) = env_source.get(&binding.url_env) {
-            if runtime_url == ddl_url {
+    if !binding.url_env.is_empty()
+        && let Some(runtime_url) = env_source.get(&binding.url_env)
+    {
+        if runtime_url == ddl_url {
+            report.checks.push(error_check(
+                "ddl-identity",
+                format!(
+                    "database {db:?}: `migration_url_env` resolves to the SAME connection as \
+                         the runtime `url_env` — the DDL identity must be DISTINCT (refused)"
+                ),
+            ));
+            return;
+        }
+        #[cfg(feature = "sql-mysql")]
+        {
+            let ddl_user = boatramp_storage::sql_sqlx::mysql_dsn_username(&ddl_url);
+            let runtime_user = boatramp_storage::sql_sqlx::mysql_dsn_username(&runtime_url);
+            if let (Some(du), Some(ru)) = (&ddl_user, &runtime_user)
+                && du == ru
+            {
                 report.checks.push(error_check(
                     "ddl-identity",
                     format!(
-                        "database {db:?}: `migration_url_env` resolves to the SAME connection as \
-                         the runtime `url_env` — the DDL identity must be DISTINCT (refused)"
+                        "database {db:?}: `migration_url_env` authenticates as the SAME \
+                                 MySQL user ({du:?}) as the runtime — the DDL login must be a \
+                                 DISTINCT identity (refused)"
                     ),
                 ));
                 return;
-            }
-            #[cfg(feature = "sql-mysql")]
-            {
-                let ddl_user = boatramp_storage::sql_sqlx::mysql_dsn_username(&ddl_url);
-                let runtime_user = boatramp_storage::sql_sqlx::mysql_dsn_username(&runtime_url);
-                if let (Some(du), Some(ru)) = (&ddl_user, &runtime_user) {
-                    if du == ru {
-                        report.checks.push(error_check(
-                            "ddl-identity",
-                            format!(
-                                "database {db:?}: `migration_url_env` authenticates as the SAME \
-                                 MySQL user ({du:?}) as the runtime — the DDL login must be a \
-                                 DISTINCT identity (refused)"
-                            ),
-                        ));
-                        return;
-                    }
-                }
             }
         }
     }

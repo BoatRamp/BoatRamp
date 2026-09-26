@@ -553,7 +553,9 @@ mod tests {
         }
         // `dry-run` is the kebab-cased `DryRun` variant.
         assert!(matches!(
-            parse(&["migrate", "dry-run", "--db", "main", "-f", "m.json", "--json"]),
+            parse(&[
+                "migrate", "dry-run", "--db", "main", "-f", "m.json", "--json"
+            ]),
             Ok(MigrateCommand::DryRun { .. })
         ));
         // `baseline --up-to` carries the id.

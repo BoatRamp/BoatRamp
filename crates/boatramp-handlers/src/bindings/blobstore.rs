@@ -726,10 +726,11 @@ mod tests {
             Some(&b"jpeg-bytes".to_vec())
         );
 
-        assert!(host
-            .has_object(Resource::new_own(crep), "cat.jpg".into())
-            .await
-            .unwrap());
+        assert!(
+            host.has_object(Resource::new_own(crep), "cat.jpg".into())
+                .await
+                .unwrap()
+        );
         let info = host
             .object_info(Resource::new_own(crep), "cat.jpg".into())
             .await
@@ -790,10 +791,12 @@ mod tests {
             .unwrap();
         // clear empties objects but keeps the container.
         host.clear(Resource::new_own(crep)).await.unwrap();
-        assert!(!host
-            .has_object(Resource::new_own(crep), "o".into())
-            .await
-            .unwrap());
+        assert!(
+            !host
+                .has_object(Resource::new_own(crep), "o".into())
+                .await
+                .unwrap()
+        );
         assert!(host.container_exists("c".into()).await.unwrap());
 
         // delete-container removes everything, including the marker.
@@ -832,12 +835,14 @@ mod tests {
         host.move_object(id("src", "f"), id("dst", "f3"))
             .await
             .unwrap();
-        assert!(storage
-            .map
-            .lock()
-            .unwrap()
-            .get("hblob/site-a/src/f")
-            .is_none());
+        assert!(
+            storage
+                .map
+                .lock()
+                .unwrap()
+                .get("hblob/site-a/src/f")
+                .is_none()
+        );
         assert_eq!(
             storage.map.lock().unwrap().get("hblob/site-a/dst/f3"),
             Some(&b"payload".to_vec())

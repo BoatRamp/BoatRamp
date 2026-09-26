@@ -14,9 +14,9 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use boatramp_core::Storage;
 use boatramp_core::deploy::DeployStore;
 use boatramp_core::kv::KvStore;
-use boatramp_core::Storage;
 
 use crate::config::ServerConfig;
 use crate::error::{Error, Result};
@@ -804,7 +804,7 @@ fn build_secrets_envelope(
     secrets: Option<&crate::config::SecretsConfig>,
     data_dir: &Path,
 ) -> Result<Option<Arc<dyn boatramp_core::envelope::KeyEnvelope>>> {
-    use boatramp_server::envelope::{build_envelope, EnvelopeSpec};
+    use boatramp_server::envelope::{EnvelopeSpec, build_envelope};
     let Some(cfg) = secrets else {
         return Ok(None);
     };
@@ -834,7 +834,7 @@ fn build_secrets_envelope(
         other => {
             return Err(Error::Envelope(format!(
                 "unknown secrets.envelope {other:?} (want \"local\" or \"vault\")"
-            )))
+            )));
         }
     };
     build_envelope(spec).map_err(|e| Error::Envelope(e.to_string()))

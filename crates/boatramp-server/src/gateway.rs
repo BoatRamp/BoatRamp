@@ -159,7 +159,7 @@ impl UpstreamState {
         now: Instant,
         client_region: Option<&str>,
     ) -> Vec<String> {
-        use boatramp_core::geo::{rank_by_nearest, RegionCandidate};
+        use boatramp_core::geo::{RegionCandidate, rank_by_nearest};
         let cands: Vec<RegionCandidate> = backends
             .iter()
             .map(|b| RegionCandidate {
@@ -514,9 +514,11 @@ mod tests {
         // While ejected, candidates never include "a".
         let mid = t0 + Duration::from_millis(500);
         for _ in 0..5 {
-            assert!(!state
-                .candidates(&bs, &up, mid, None)
-                .contains(&"a".to_string()));
+            assert!(
+                !state
+                    .candidates(&bs, &up, mid, None)
+                    .contains(&"a".to_string())
+            );
         }
         // After the cooldown it is a candidate again.
         let later = t0 + Duration::from_millis(1500);
@@ -588,7 +590,7 @@ mod tests {
         let state = UpstreamState::default();
         let cands = state.candidates(&backends(&up), &up, Instant::now(), None);
         assert_eq!(cands.len(), 3); // max_retries(2) + 1
-                                    // Distinct backends, contiguous in the rotation.
+        // Distinct backends, contiguous in the rotation.
         assert_eq!(
             cands.iter().collect::<std::collections::HashSet<_>>().len(),
             3

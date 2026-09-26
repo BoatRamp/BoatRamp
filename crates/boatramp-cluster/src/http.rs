@@ -10,17 +10,17 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use axum::extract::State;
-use axum::http::{header::AUTHORIZATION, HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode, header::AUTHORIZATION};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Extension, Json, Router};
+use openraft::BasicNode;
 use openraft::error::{ClientWriteError, NetworkError, RPCError, RaftError, RemoteError};
 use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
 use openraft::raft::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
     VoteRequest, VoteResponse,
 };
-use openraft::BasicNode;
 
 use boatramp_core::messaging::StreamHubs;
 

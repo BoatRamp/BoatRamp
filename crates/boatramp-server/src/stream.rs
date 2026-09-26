@@ -154,7 +154,7 @@ pub(super) async fn serve_stream(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "site stream connection limit reached\n",
             )
-                .into_response()
+                .into_response();
         }
     };
     let ip_guard = match acquire_stream_ip_slot(inner, &scope, client_ip) {
@@ -164,7 +164,7 @@ pub(super) async fn serve_stream(
                 StatusCode::TOO_MANY_REQUESTS,
                 "per-client stream connection limit reached\n",
             )
-                .into_response()
+                .into_response();
         }
     };
 
@@ -255,7 +255,7 @@ pub(super) async fn serve_graphql_subscription(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "site stream connection limit reached\n",
             )
-                .into_response()
+                .into_response();
         }
     };
     let ip_guard = match acquire_stream_ip_slot(inner, &scope, client_ip) {
@@ -265,7 +265,7 @@ pub(super) async fn serve_graphql_subscription(
                 StatusCode::TOO_MANY_REQUESTS,
                 "per-client stream connection limit reached\n",
             )
-                .into_response()
+                .into_response();
         }
     };
 
@@ -420,7 +420,7 @@ pub(super) async fn serve_ws_stream(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "site stream connection limit reached\n",
             )
-                .into_response()
+                .into_response();
         }
     };
     let ip_guard = match acquire_stream_ip_slot(inner, &scope, client_ip) {
@@ -430,7 +430,7 @@ pub(super) async fn serve_ws_stream(
                 StatusCode::TOO_MANY_REQUESTS,
                 "per-client stream connection limit reached\n",
             )
-                .into_response()
+                .into_response();
         }
     };
 
@@ -453,8 +453,8 @@ pub(super) async fn serve_ws_stream(
     // writes our 101). tungstenite drives the WebSocket framing over the raw stream.
     tokio::spawn(async move {
         use futures::SinkExt;
-        use tokio_tungstenite::tungstenite::protocol::Role;
         use tokio_tungstenite::tungstenite::Message;
+        use tokio_tungstenite::tungstenite::protocol::Role;
 
         let Ok(upgraded) = on_upgrade.await else {
             return;

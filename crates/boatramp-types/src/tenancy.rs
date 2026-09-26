@@ -815,9 +815,11 @@ mod tests {
             })
         );
         // Serializes back with the snake_case tag.
-        assert!(serde_json::to_string(&TableScope::TenantOrBase)
-            .unwrap()
-            .contains("tenant_or_base"));
+        assert!(
+            serde_json::to_string(&TableScope::TenantOrBase)
+                .unwrap()
+                .contains("tenant_or_base")
+        );
     }
 
     #[test]
@@ -1147,14 +1149,16 @@ mod tests {
         assert!(!scoped(All, Own).narrows_within(&scoped(Own, Own)));
         assert!(!scoped(Own, All).narrows_within(&scoped(Own, Own)));
         // A different tenant column is not a narrowing (fail-closed).
-        assert!(!Tenancy::Scoped {
-            column: "org_id".into(),
-            sources: vec![TenantSource::None],
-            read: Own,
-            write: Own,
-            exceed_site_ceiling: false,
-        }
-        .narrows_within(&scoped(All, All)));
+        assert!(
+            !Tenancy::Scoped {
+                column: "org_id".into(),
+                sources: vec![TenantSource::None],
+                read: Own,
+                write: Own,
+                exceed_site_ceiling: false,
+            }
+            .narrows_within(&scoped(All, All))
+        );
     }
 
     #[test]

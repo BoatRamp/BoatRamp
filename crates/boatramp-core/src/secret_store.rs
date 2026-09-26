@@ -229,10 +229,9 @@ impl SecretStore {
                 .get(&key)
                 .await
                 .map_err(|e| SecretError::Backend(e.to_string()))?
+                && let Ok(record) = serde_json::from_slice::<SecretRecord>(&bytes)
             {
-                if let Ok(record) = serde_json::from_slice::<SecretRecord>(&bytes) {
-                    out.push(record.meta(&name));
-                }
+                out.push(record.meta(&name));
             }
         }
         out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -408,10 +407,9 @@ impl TenantSecretStore {
                 .get(&key)
                 .await
                 .map_err(|e| SecretError::Backend(e.to_string()))?
+                && let Ok(record) = serde_json::from_slice::<SecretRecord>(&bytes)
             {
-                if let Ok(record) = serde_json::from_slice::<SecretRecord>(&bytes) {
-                    out.push(record.meta(&name));
-                }
+                out.push(record.meta(&name));
             }
         }
         out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -546,11 +544,13 @@ mod tests {
 
     #[tokio::test]
     async fn get_absent_is_none() {
-        assert!(store()
-            .get(ProjectRef::new("acme"), "nope")
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            store()
+                .get(ProjectRef::new("acme"), "nope")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -594,11 +594,12 @@ mod tests {
             .await
             .unwrap();
         // A different project can't read acme's secret of the same name.
-        assert!(s
-            .get(ProjectRef::new("globex"), "shared-name")
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            s.get(ProjectRef::new("globex"), "shared-name")
+                .await
+                .unwrap()
+                .is_none()
+        );
         assert!(s.list(ProjectRef::new("globex")).await.unwrap().is_empty());
     }
 
@@ -643,10 +644,11 @@ mod tests {
         let s = store();
         let p = ProjectRef::new("acme");
         // At the bound: fine. Over it: refused (before sealing/writing).
-        assert!(s
-            .set(p, "big", &vec![b'x'; MAX_SECRET_VALUE_LEN])
-            .await
-            .is_ok());
+        assert!(
+            s.set(p, "big", &vec![b'x'; MAX_SECRET_VALUE_LEN])
+                .await
+                .is_ok()
+        );
         let err = s
             .set(p, "toobig", &vec![b'x'; MAX_SECRET_VALUE_LEN + 1])
             .await
@@ -703,11 +705,13 @@ mod tests {
     #[tokio::test]
     async fn tenant_get_absent_is_none() {
         // An unconfigured secret is `None`, NEVER an error (the guest surface returns ok(none)).
-        assert!(tenant_store()
-            .get(ProjectRef::new("acme"), "firm-1", "nope")
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            tenant_store()
+                .get(ProjectRef::new("acme"), "firm-1", "nope")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -767,16 +771,18 @@ mod tests {
             .await
             .unwrap();
         // A different project can't read acme's secret of the same tenant+name.
-        assert!(s
-            .get(ProjectRef::new("globex"), "firm-1", "k")
-            .await
-            .unwrap()
-            .is_none());
-        assert!(s
-            .list(ProjectRef::new("globex"), "firm-1")
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            s.get(ProjectRef::new("globex"), "firm-1", "k")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            s.list(ProjectRef::new("globex"), "firm-1")
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -865,10 +871,11 @@ mod tests {
     async fn tenant_oversized_value_is_refused() {
         let s = tenant_store();
         let p = ProjectRef::new("acme");
-        assert!(s
-            .set(p, "firm-1", "big", &vec![b'x'; MAX_SECRET_VALUE_LEN])
-            .await
-            .is_ok());
+        assert!(
+            s.set(p, "firm-1", "big", &vec![b'x'; MAX_SECRET_VALUE_LEN])
+                .await
+                .is_ok()
+        );
         let err = s
             .set(p, "firm-1", "toobig", &vec![b'x'; MAX_SECRET_VALUE_LEN + 1])
             .await

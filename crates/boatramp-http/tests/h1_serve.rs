@@ -5,7 +5,7 @@
 //! asserted by driving the server with a real hyper client.
 
 use boatramp_http::h1::serve_connection;
-use boatramp_http::{response, Body, Handler, Request, Response};
+use boatramp_http::{Body, Handler, Request, Response, response};
 use bytes::Bytes;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -165,7 +165,7 @@ async fn streamed_body_error_truncates_without_a_clean_terminator() {
 
 #[tokio::test]
 async fn request_body_streams_through_before_it_is_complete() {
-    use tokio::time::{timeout, Duration};
+    use tokio::time::{Duration, timeout};
     // Prove the request body is NOT buffered: with a chunked echo-stream, the first
     // request chunk must come back in the response *before* we send the rest of the body.
     let mut c = spawn();
@@ -263,7 +263,7 @@ async fn keep_alive_serves_multiple_requests_then_pipelined() {
 
 #[tokio::test]
 async fn expect_100_continue_gets_an_interim_response_before_the_body() {
-    use tokio::time::{timeout, Duration};
+    use tokio::time::{Duration, timeout};
     let mut c = spawn();
     // Send only the head (with Expect) — NOT the body yet.
     c.write_all(

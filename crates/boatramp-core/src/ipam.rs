@@ -108,11 +108,11 @@ impl IpPool {
     /// backend's launch path makes; keeping it here makes it host-testable
     /// (the backend module is Linux-only).
     pub fn allocate_stable(&mut self, preferred: Option<Ipv4Addr>) -> Result<Ipv4Addr, IpamError> {
-        if let Some(ip) = preferred {
-            if self.is_free(ip) {
-                self.allocated.insert(ip.into());
-                return Ok(ip);
-            }
+        if let Some(ip) = preferred
+            && self.is_free(ip)
+        {
+            self.allocated.insert(ip.into());
+            return Ok(ip);
         }
         self.allocate()
     }
@@ -494,10 +494,9 @@ mod tests {
             if let Some(ip) =
                 self.assigned
                     .remove(&(project.to_string(), workload.to_string(), replica))
+                && !self.assigned.values().any(|&held| held == ip)
             {
-                if !self.assigned.values().any(|&held| held == ip) {
-                    self.pool.release(ip);
-                }
+                self.pool.release(ip);
             }
         }
 

@@ -48,8 +48,8 @@ pub mod azure_dns;
 pub mod akamai;
 
 pub use dns::{
-    acme_challenge_name, dns01_txt_value, domain_record, preview_record, preview_wildcard,
     DnsError, DnsOp, DnsProvider, DnsRecord, ManualDnsProvider, PreviewTarget, RecordKind,
+    acme_challenge_name, dns01_txt_value, domain_record, preview_record, preview_wildcard,
 };
 
 /// Seconds since the Unix epoch, for the request-signing timestamps the OCI and

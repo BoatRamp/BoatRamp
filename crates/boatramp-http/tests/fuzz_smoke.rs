@@ -5,7 +5,7 @@
 //! throughout — a regression here means the parser can panic or desync on adversarial
 //! bytes.
 
-use boatramp_http::h1::{parse_request_head, ParseResult};
+use boatramp_http::h1::{ParseResult, parse_request_head};
 
 proptest::proptest! {
     /// The parser must never panic and must never claim to have consumed more bytes than

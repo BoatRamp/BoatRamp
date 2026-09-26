@@ -15,9 +15,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use boatramp_core::Storage;
 use boatramp_core::kv::KvStore;
 use boatramp_core::messaging::{LogMessaging, Messaging, StartPosition};
-use boatramp_core::Storage;
 use boatramp_storage::{S3Options, S3Storage, S3StoreConfig, SlateKv};
 
 #[tokio::test]

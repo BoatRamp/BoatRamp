@@ -22,7 +22,7 @@ use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
 use boatramp_core::deploy::DeployStore;
 use boatramp_core::domain_verify::{
-    check_ownership, CheckResult, DomainProbe, VerificationMethod, VerifyError,
+    CheckResult, DomainProbe, VerificationMethod, VerifyError, check_ownership,
 };
 use boatramp_core::project::ProjectRef;
 use serde::Deserialize;
@@ -184,8 +184,8 @@ impl DomainProbe for ServerDomainProbe {
 /// cleanly fails), not an error.
 #[cfg(feature = "domain-verify-dns")]
 async fn resolve_txt(name: &str) -> Result<Vec<String>, VerifyError> {
-    use hickory_resolver::error::ResolveErrorKind;
     use hickory_resolver::TokioAsyncResolver;
+    use hickory_resolver::error::ResolveErrorKind;
 
     let resolver = match TokioAsyncResolver::tokio_from_system_conf() {
         Ok(resolver) => resolver,
@@ -392,7 +392,7 @@ pub(crate) async fn check_domain_verification(
                 StatusCode::NOT_FOUND,
                 "no verification challenge; start one with `domain add`\n",
             )
-                .into_response()
+                .into_response();
         }
         Err(err) => return deploy_error_response(err),
     };
@@ -776,11 +776,13 @@ mod tests {
             .await
             .unwrap();
         assert!(!v.verified);
-        assert!(deploy
-            .resolve_site_by_host("example.com")
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            deploy
+                .resolve_site_by_host("example.com")
+                .await
+                .unwrap()
+                .is_none()
+        );
 
         // The token is now served → one reconcile sweep verifies + attaches it.
         let probe = TokenProbe {

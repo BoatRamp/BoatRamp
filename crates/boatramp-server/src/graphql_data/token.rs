@@ -16,7 +16,7 @@
 //! - The host-asserted `project` claim is never sourced here, so a token can't spoof it.
 
 use jsonwebtoken::jwk::{AlgorithmParameters, EllipticCurve, Jwk, JwkSet};
-use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
+use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -123,7 +123,9 @@ pub(crate) async fn verified_claims(
     bearer: &str,
     env_source: &dyn boatramp_core::env::EnvSource,
 ) -> Option<serde_json::Map<String, serde_json::Value>> {
-    resolve_verifier(cfg, bearer, env_source).await?.verify(bearer)
+    resolve_verifier(cfg, bearer, env_source)
+        .await?
+        .verify(bearer)
 }
 
 /// Resolve the verifier for `cfg`: from the JWKS env var (fresh each call — rotation-safe), or
@@ -162,10 +164,10 @@ async fn resolve_url_verifier(
 ) -> Option<Arc<TokenVerifier>> {
     let token_kid = TokenVerifier::token_kid(bearer);
     // Fast path: a cached verifier that already knows this token's key.
-    if let Some(cached) = jwks_cache().lock().ok().and_then(|c| c.get(url).cloned()) {
-        if cached.knows_kid(token_kid.as_deref()) {
-            return Some(cached);
-        }
+    if let Some(cached) = jwks_cache().lock().ok().and_then(|c| c.get(url).cloned())
+        && cached.knows_kid(token_kid.as_deref())
+    {
+        return Some(cached);
     }
     // Cold, or the IdP rotated in a new `kid`: re-fetch (operator-configured URL, so not a
     // request-controlled fetch).
@@ -191,7 +193,7 @@ mod tests {
     use super::*;
     use base64::Engine;
     use ed25519_dalek::{Signer, SigningKey};
-    use jsonwebtoken::{encode, EncodingKey, Header};
+    use jsonwebtoken::{EncodingKey, Header, encode};
 
     const ISS: &str = "https://idp.test";
     fn far_future() -> i64 {
@@ -238,29 +240,32 @@ mod tests {
         let secret = b"secret-0123456789";
         let v = hs256(secret, "k1", None);
         // Wrong issuer.
-        assert!(v
-            .verify(&hs256_token(
+        assert!(
+            v.verify(&hs256_token(
                 secret,
                 "k1",
                 serde_json::json!({ "iss": "https://evil.test", "exp": far_future() })
             ))
-            .is_none());
+            .is_none()
+        );
         // Expired.
-        assert!(v
-            .verify(&hs256_token(
+        assert!(
+            v.verify(&hs256_token(
                 secret,
                 "k1",
                 serde_json::json!({ "iss": ISS, "exp": 1_000_000_000 })
             ))
-            .is_none());
+            .is_none()
+        );
         // Unknown kid.
-        assert!(v
-            .verify(&hs256_token(
+        assert!(
+            v.verify(&hs256_token(
                 secret,
                 "other-kid",
                 serde_json::json!({ "iss": ISS, "exp": far_future() })
             ))
-            .is_none());
+            .is_none()
+        );
         // Tampered signature.
         let good = hs256_token(
             secret,
@@ -269,33 +274,36 @@ mod tests {
         );
         assert!(v.verify(&format!("{good}x")).is_none());
         // Wrong signing key.
-        assert!(v
-            .verify(&hs256_token(
+        assert!(
+            v.verify(&hs256_token(
                 b"a-different-secret-999",
                 "k1",
                 serde_json::json!({ "iss": ISS, "exp": far_future() })
             ))
-            .is_none());
+            .is_none()
+        );
     }
 
     #[test]
     fn audience_is_enforced_when_pinned() {
         let secret = b"secret-0123456789";
         let v = hs256(secret, "k1", Some("orders-api"));
-        assert!(v
-            .verify(&hs256_token(
+        assert!(
+            v.verify(&hs256_token(
                 secret,
                 "k1",
                 serde_json::json!({ "iss": ISS, "aud": "other", "exp": far_future() })
             ))
-            .is_none());
-        assert!(v
-            .verify(&hs256_token(
+            .is_none()
+        );
+        assert!(
+            v.verify(&hs256_token(
                 secret,
                 "k1",
                 serde_json::json!({ "iss": ISS, "aud": "orders-api", "exp": far_future() })
             ))
-            .is_some());
+            .is_some()
+        );
     }
 
     // ---- the real production path: a JWKS-derived Ed25519 verifier + a signed token ----

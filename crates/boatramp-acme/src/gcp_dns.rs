@@ -144,11 +144,11 @@ impl DnsProvider for GcpDns {
         let desired = self.rrset(record);
         let current = self.current_rrset(record).await?;
         // Already correct (same ttl + rrdatas) → a no-op change would be rejected.
-        if let Some(cur) = &current {
-            if cur.get("ttl") == desired.get("ttl") && cur.get("rrdatas") == desired.get("rrdatas")
-            {
-                return Ok(());
-            }
+        if let Some(cur) = &current
+            && cur.get("ttl") == desired.get("ttl")
+            && cur.get("rrdatas") == desired.get("rrdatas")
+        {
+            return Ok(());
         }
         let change = serde_json::json!({
             "additions": [desired],
