@@ -7488,6 +7488,74 @@ async fn graphql_edge_is_scoped_to_the_endpoint_route_not_the_whole_site() {
     assert_eq!(status, StatusCode::OK);
     assert!(!body.contains("GraphiQL"), "{body}");
 
+    // (4) First-match hazard (Security review #1): a broader handler declared BEFORE the graphql
+    // handler (a `/**` catch-all) wins the route match, but the edge — the query
+    // depth/complexity/introspection guard, and GraphiQL — must STILL engage on `/graphql`, because
+    // it is keyed on the REQUEST PATH matching the graphql route, not on the matched handler's route
+    // string. A raw `handler.route == "/graphql"` gate would see the matched `/**` handler and
+    // silently disable the guard on the real endpoint. So GET `/graphql` here must still be GraphiQL.
+    let mut files2 = BTreeMap::new();
+    files2.insert(
+        "h.wasm".to_string(),
+        FileEntry {
+            hash: hash.clone(),
+            size: HTTP_200.len() as u64,
+            content_type: None,
+            variants: BTreeMap::new(),
+        },
+    );
+    let manifest2 = Manifest {
+        files: files2,
+        config: DeployConfig {
+            // `/**` is declared FIRST and matches every path (including `/graphql`).
+            handlers: vec![handler_on("/**"), handler_on("/graphql")],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let id2 = deploy.put_manifest(&manifest2).await.unwrap();
+    deploy
+        .activate(ProjectRef::DEFAULT, "gw2", &id2)
+        .await
+        .unwrap();
+    deploy
+        .set_site_config(
+            ProjectRef::DEFAULT,
+            "gw2",
+            &SiteConfig {
+                handlers: Some(HandlersSiteConfig {
+                    enabled: true,
+                    graphql: Some(HandlerGraphqlConfig {
+                        enabled: true,
+                        graphiql: true,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let mut req = Request::builder()
+        .method("GET")
+        .uri("/_sites/gw2/graphql")
+        .header(header::ACCEPT, "text/html")
+        .body(Body::empty())
+        .unwrap();
+    req.extensions_mut()
+        .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40003))));
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let raw = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let body = String::from_utf8_lossy(&raw);
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains("GraphiQL"),
+        "the edge (guard + GraphiQL) must engage on /graphql even when a broader handler is \
+         declared first — the guard must not be silently disabled: {body}"
+    );
+
     println!("GRAPHQL EDGE ROUTE-SCOPED OK");
 }
 
