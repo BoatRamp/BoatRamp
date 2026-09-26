@@ -36,6 +36,12 @@ pub mod azure;
 #[cfg(feature = "azure")]
 pub mod azure_notify;
 
+// The hand-rolled Shared Key (account-key/Azurite) request-signing policy for the 1.x
+// Azure SDK, which is AAD-first and dropped native shared-key auth. Shared by the blob
+// backend (`azure`) and the queue notify path (`azure_notify`).
+#[cfg(feature = "azure")]
+pub mod azure_shared_key;
+
 #[cfg(feature = "slatedb")]
 pub mod kv_slatedb;
 
