@@ -24,7 +24,10 @@ name: CI
 #                       count tripwire), test-cluster (raft consensus + messaging DLQ
 #                       matrix), test-orm-tenancy (in-site isolation on libsql),
 #                       test-orm-tenancy-sqlx (SAME on real Postgres + MySQL service
-#                       containers, per-dialect), test-gdc-target + test-target-plain-wasm
+#                       containers, per-dialect — now also the raw-SQL own/session
+#                       confinement gate + its mutation loop), test-rawsql-own-confinement
+#                       (the P0 marker-escape fix on libsql, mutation-verified),
+#                       test-gdc-target + test-target-plain-wasm
 #                       (target-tenant read/write isolation + the #470 three-key gate),
 #                       helm-chart (CRD drift + least-privilege), coverage-gate, deny.
 #                       All secret-free, so they run on fork PRs too.
@@ -407,6 +410,52 @@ jobs:
           grep -q 'MIGRATE LIBSQL PARITY OK' migrate-libsql.log \
             || { echo "::error::migrate libsql parity never reached its marker (a ledger/transactional-rollback/extension-refusal/txn-control-guard/ledger-guard/owner-DDL/baseline regression)" >&2; exit 1; }
 
+  # P0 raw-SQL OWN/SESSION confinement HARD GATE (`RAWSQL OWN-CONFINEMENT AST OK`). The raw-SQL
+  # `{scope}` marker for own/session was string-substituted with no AST check, so a guest OR-escaped
+  # it (`WHERE 1=1 OR {scope}` -> cross-tenant read+write). The fix force-injects the tenant
+  # confinement at the AST level (`boatramp_core::target_sql::rewrite_own_read`/`rewrite_own_write`)
+  # for own/session READ and WRITE, exactly as the target-read path + the ORM already do. This lane
+  # proves the fix BEHAVIORALLY on a REAL embedded libsql engine (victim tenant B's rows unchanged /
+  # not disclosed), then MUTATION-VERIFIES it: it reverts the confinement to the old escapable string
+  # marker (and to no-confinement) via `RAWSQL_CONFINE_MUTATION` and asserts the gate then FAILS
+  # (non-zero) — so a regression that re-opens the hole fails the merge. `#[ignore]`d (static-musl
+  # libsql SIGSEGV, like test-orm-tenancy); run unignored here on the host toolchain.
+  test-rawsql-own-confinement:
+    name: test (raw-SQL own-confinement AST)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: test-rawsql-own-confinement-host
+      - name: Raw-SQL own/session AST confinement on a real libsql engine
+        run: |
+          set -eo pipefail
+          # 1) The real fix must PASS + reach its marker (a silent skip / a cross-tenant breach fails).
+          cargo test -p boatramp-storage --features sql --test rawsql_own_confinement \
+            -- --ignored --nocapture 2>&1 | tee rawsql-confine.log
+          grep -qE 'test result: ok\. 1 passed' rawsql-confine.log \
+            || { echo "::error::raw-SQL own-confinement gate did not pass (silent skip or failure?)" >&2; exit 1; }
+          grep -q 'RAWSQL OWN-CONFINEMENT AST OK \[libsql\]' rawsql-confine.log \
+            || { echo "::error::raw-SQL own-confinement never reached its success marker (a cross-tenant breach or a skipped test)" >&2; exit 1; }
+      - name: Mutation-verify the gate genuinely detects the hole (each mutation MUST fail it)
+        run: |
+          set -eo pipefail
+          # Belt-and-suspenders that the gate is not hollow: reverting the AST injection to the OLD
+          # escapable string marker (`string-marker`) or to no confinement (`no-confinement`) MUST
+          # make the gate FAIL (non-zero). If either mutation still passes, the assertions don't
+          # actually depend on the fix — fail the merge.
+          for mut in string-marker no-confinement; do
+            if RAWSQL_CONFINE_MUTATION="$mut" cargo test -p boatramp-storage --features sql \
+                 --test rawsql_own_confinement -- --ignored >/dev/null 2>&1; then
+              echo "::error::mutation '$mut' did NOT fail the raw-SQL own-confinement gate — the gate is hollow (it does not depend on the AST fix)" >&2
+              exit 1
+            fi
+            echo "mutation '$mut' correctly FAILED the gate"
+          done
+          echo "RAWSQL OWN-CONFINEMENT MUTATION-VERIFIED OK"
+
   # Stage 5a GraphQL Data Connector TARGET-tenant read isolation HARD GATE. A `@tenant(scope:
   # target)` read must confine to another tenant `B`'s declared PUBLIC subset on a REAL libsql
   # engine (compile -> SQL -> execute -> shape), returning only B's published+non-deleted rows and
@@ -708,6 +757,42 @@ jobs:
           # so the ambiguity — and thus this regression — is only observable on a real Postgres.
           grep -q 'ORM UPSERT GUARD OK \[postgres\]' orm-sqlx.log \
             || { echo "::error::Postgres scoped-upsert guard never reached its marker (a DO-UPDATE ambiguity regression or a cross-tenant upsert clobber, or a skip)" >&2; exit 1; }
+      - name: Raw-SQL own/session AST confinement on real Postgres + MySQL (P0 fix)
+        env:
+          BOATRAMP_TEST_PG_URL: postgres://boatramp:boatramp@localhost:5432/boatramp
+          BOATRAMP_TEST_MYSQL_URL: mysql://boatramp:boatramp@localhost:3306/boatramp
+        run: |
+          set -eo pipefail
+          # The P0 raw-SQL own/session confinement fix, proven on the per-dialect SQL the rewrite
+          # emits (an OR-escape / re-tenant / force-stamp bug could manifest on one engine's grammar
+          # but not another). Both engines' batteries must RUN (URLs set) + reach their markers.
+          cargo test -p boatramp-storage --features sql-postgres,sql-mysql \
+            --test rawsql_own_confinement -- --nocapture --test-threads=1 2>&1 | tee rawsql-sqlx.log
+          grep -qE 'test result: ok\. 2 passed' rawsql-sqlx.log \
+            || { echo "::error::raw-SQL own-confinement did not run both engines (a silent skip or a failure)" >&2; exit 1; }
+          grep -q 'RAWSQL OWN-CONFINEMENT AST OK \[postgres\]' rawsql-sqlx.log \
+            || { echo "::error::Postgres raw-SQL own-confinement never reached its marker (a cross-tenant breach or a skip)" >&2; exit 1; }
+          grep -q 'RAWSQL OWN-CONFINEMENT AST OK \[mysql\]' rawsql-sqlx.log \
+            || { echo "::error::MySQL raw-SQL own-confinement never reached its marker (a cross-tenant breach or a skip)" >&2; exit 1; }
+      - name: Mutation-verify the raw-SQL confinement gate on Postgres + MySQL (each mutation MUST fail)
+        env:
+          BOATRAMP_TEST_PG_URL: postgres://boatramp:boatramp@localhost:5432/boatramp
+          BOATRAMP_TEST_MYSQL_URL: mysql://boatramp:boatramp@localhost:3306/boatramp
+        run: |
+          set -eo pipefail
+          # Reverting the AST injection to the OLD escapable string marker (`string-marker`) or to no
+          # confinement (`no-confinement`) MUST make the gate FAIL (non-zero) on the real engines too —
+          # so the per-dialect gate is not hollow.
+          for mut in string-marker no-confinement; do
+            if RAWSQL_CONFINE_MUTATION="$mut" cargo test -p boatramp-storage \
+                 --features sql-postgres,sql-mysql --test rawsql_own_confinement \
+                 -- --test-threads=1 >/dev/null 2>&1; then
+              echo "::error::mutation '$mut' did NOT fail the raw-SQL own-confinement gate on PG/MySQL — the gate is hollow" >&2
+              exit 1
+            fi
+            echo "mutation '$mut' correctly FAILED the gate on PG/MySQL"
+          done
+          echo "RAWSQL OWN-CONFINEMENT MUTATION-VERIFIED OK [postgres+mysql]"
       - name: RLS tenant session GUC backstop on a real non-superuser Postgres role (v0.4.20)
         env:
           BOATRAMP_TEST_PG_URL: postgres://boatramp:boatramp@localhost:5432/boatramp
