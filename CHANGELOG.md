@@ -5,6 +5,35 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [Unreleased] — S3 blob-ingress M4 (cloud brokering) — DRAFT, not yet released
+
+> Draft notes for the in-flight `blob-s3-ingress` branch. The version bump, the M5 live gate
+> (`S3 INGRESS SCOPED+SIGV4 OK`), the shim rev, and the recipes finalize this before release.
+
+### Added (in-flight)
+
+- **Cloud credential brokering for the S3 blob-ingress mint (M4).** When a project's blob container is
+  backed by a cloud object store, the guest/operator mint now brokers a **native, scoped, short-lived
+  cloud credential** so the external client uploads DIRECTLY to the real store (bytes never transit the
+  node) — behind the SAME `blob-upload` seam the local S3 face uses (guest WIT, `upload_containers`
+  allowlist, rights, CLI, and route unchanged from M3; the host still forces project+site and clamps
+  TTL/max-bytes before the minter runs, so a cloud minter can only shape the returned credential).
+  - **AWS** — `sts:AssumeRole` (default) / `sts:GetFederationToken` (IAM-user) with an inline session
+    policy **resource-scoped to the exact `hblob/{qualified-site}/{container}/…` prefix** and
+    **action-scoped to `s3:PutObject` + the multipart quartet only** (no get/list/delete/bucket-level);
+    a per-object **presigned PUT** for the single-key/browser shape.
+  - **GCS** — a per-object **V4 signed PUT URL** (official `google-cloud-storage` 1.x) for the single-key
+    shape; a hand-rolled **STS Credential-Access-Boundary** token-exchange
+    (`sts.googleapis.com/v1/token`) scoped to `resource.name.startsWith(hblob-prefix)` +
+    `roles/storage.objectCreator` for a prefix credential.
+  - **Azure** — a **user-delegation SAS** (AAD, no account key; new GA 1.x SDK) — blob-scoped for a
+    single key, directory-scoped for a prefix (the SAS scope-shape asymmetry is reflected honestly).
+  - **enforced vs advisory honesty**: a cloud minter labels a constraint it cannot cap in-policy (object
+    size, and content-type on a broad prefix) **`advisory`**, never `enforced`; content-addressing
+    (`require_sha256`) is the mandatory strong cross-cloud enforcement and is always `enforced`.
+  - New feature flags `blob-upload-{aws,gcs,azure,cloud}` (off in the lean/default build) and a new
+    `[serve.s3_ingress_cloud]` operator config selecting/authenticating the cloud backend.
+
 ## [0.5.7] - 2026-09-26
 
 Two production fixes for browser-facing federated-GraphQL sites plus two internal build-level changes: a
