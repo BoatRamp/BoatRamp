@@ -34,12 +34,16 @@ gcs = [
   "dep:bytes",
   "tokio/sync",
 ]
-# Azure Blob backend (native azure-sdk-for-rust 0.21).
+# Azure Blob backend (GA azure-sdk-for-rust 1.x — the single Azure generation).
+# Account-key/Azurite auth is preserved by a hand-rolled Shared Key signing policy
+# (`azure_shared_key`), so `hmac`/`sha2`/`subtle`/`time` come along for the ride.
 azure = [
-  "dep:azure_core",
-  "dep:azure_storage",
-  "dep:azure_storage_blobs",
-  "dep:azure_storage_queues",
+  "dep:azure_core_v1",
+  "dep:azure_storage_blob",
+  "dep:azure_storage_queue",
+  "dep:hmac",
+  "dep:sha2",
+  "dep:subtle",
   "dep:serde_json",
   "dep:base64",
   "dep:bytes",
@@ -81,10 +85,14 @@ aws-sdk-s3 = { workspace = true, optional = true }
 aws-sdk-sqs = { workspace = true, optional = true }
 google-cloud-storage = { workspace = true, optional = true }
 google-cloud-pubsub = { workspace = true, optional = true }
-azure_core = { workspace = true, optional = true }
-azure_storage = { workspace = true, optional = true }
-azure_storage_blobs = { workspace = true, optional = true }
-azure_storage_queues = { workspace = true, optional = true }
+azure_core_v1 = { workspace = true, optional = true }
+azure_storage_blob = { workspace = true, optional = true }
+azure_storage_queue = { workspace = true, optional = true }
+# Shared Key request signing (account-key/Azurite auth) — the 1.x SDK dropped native
+# shared-key auth, so `azure_shared_key` hand-rolls Azure's HMAC-SHA256 string-to-sign.
+hmac = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+subtle = { workspace = true, optional = true }
 base64 = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
