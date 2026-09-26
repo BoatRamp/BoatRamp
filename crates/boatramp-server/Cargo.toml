@@ -64,6 +64,35 @@ capability = ["handlers", "boatramp-handlers/capability"]
 # Implies `handlers`. On in batteries-included builds, off in lean.
 blob-upload = ["handlers", "boatramp-handlers/blob-upload"]
 
+# The **cloud** blob-upload minters (M4): for an S3/GCS/Azure-backed blob container, broker a NATIVE
+# scoped short-lived credential (AWS STS session policy / GCS signed-URL + CAB token exchange / Azure
+# user-delegation SAS) so the client uploads DIRECTLY to the real store — behind the SAME `BlobUploadMinter`
+# seam the local face uses, so the guest WIT / allowlist / rights / CLI / route are unchanged from M3.
+# Each cloud is independently toggleable; all imply `blob-upload`. Off in lean; on in the cloud-batteries
+# build.
+blob-upload-aws = [
+  "blob-upload",
+  "dep:aws-config",
+  "dep:aws-sdk-sts",
+  "dep:aws-sdk-s3",
+]
+blob-upload-gcs = [
+  "blob-upload",
+  "dep:gcs-signer",
+  "dep:gcs-signer-auth",
+]
+blob-upload-azure = [
+  "blob-upload",
+  "dep:azure_core_v1",
+  "dep:azure_identity",
+  "dep:azure_storage_blob",
+  "dep:azure_storage_sas",
+  "dep:azure_storage_common",
+  "dep:time",
+]
+# Convenience: all cloud blob-upload minters at once.
+blob-upload-cloud = ["blob-upload-aws", "blob-upload-gcs", "blob-upload-azure"]
+
 # The duplex/resumable session capability (`boatramp:handlers/session`, PLAN-session-primitive):
 # a long-lived, client-addressable, bidirectional, resumable channel the host drives via
 # event-driven re-entry over the durable async lane. Implies `handlers`. Experimental.
@@ -224,6 +253,36 @@ aws-sdk-kms = { version = "1", features = [
   "behavior-version-latest",
 ], optional = true }
 cryptoki = { version = "0.7", optional = true }
+
+# The M4 cloud blob-upload minters (feature-gated). AWS reuses the workspace aws-config +
+# the STS SDK for session-policy brokering + aws-sdk-s3 for the presigned-PUT shape. GCS uses
+# the OFFICIAL google-cloud-storage 1.x (package-renamed `gcs-signer` so it never aliases the
+# storage crate's community 0.24) for V4 signed URLs + a hand-rolled STS token-exchange over
+# the in-tree reqwest. Azure uses the new GA 1.x SDK generation for user-delegation SAS.
+aws-sdk-sts = { workspace = true, optional = true }
+aws-sdk-s3 = { workspace = true, optional = true }
+# `default-rustls-provider` keeps aws-lc-rs (the workspace primary rustls provider); no `unstable-*`
+# feature is needed for V4 signed URLs. Package-renamed so it never aliases the storage crate's 0.24.
+gcs-signer = { package = "google-cloud-storage", version = "1", default-features = false, features = [
+  "default-rustls-provider",
+], optional = true }
+# The Signer that backs `SignedUrlBuilder::sign_with` (ADC / service-account / Workload-Identity via IAM
+# signBlob, all resolved by ADC). Pinned to the auth version gcs-signer 1.x depends on.
+gcs-signer-auth = { package = "google-cloud-auth", version = "1", default-features = false, features = [
+  "default-rustls-provider",
+], optional = true }
+azure_core_v1 = { workspace = true, optional = true }
+azure_identity = { workspace = true, optional = true }
+azure_storage_blob = { workspace = true, optional = true }
+azure_storage_sas = { workspace = true, optional = true }
+# The shared model crate carrying `UserDelegationKey` — the SAME type both `azure_storage_blob`'s
+# `get_user_delegation_key` returns AND `azure_storage_sas::SasBuilder::new` signs with.
+azure_storage_common = { version = "1", optional = true }
+# `OffsetDateTime` (the time type the Azure 1.x SDK uses) formatting for the `<KeyInfo>` request body
+# + SAS expiry. Already in the tree via the azure crates; named directly for the RFC3339 formatter.
+time = { version = "0.3", default-features = false, features = [
+  "formatting",
+], optional = true }
 
 boatramp-handlers = { workspace = true, optional = true }
 # Byte buffers for the serving path (multipart/byteranges part headers) + the

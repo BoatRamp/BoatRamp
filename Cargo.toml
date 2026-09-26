@@ -196,6 +196,27 @@ aws-config = { version = "1", features = ["behavior-version-latest"] }
 aws-sdk-s3 = { version = "1", features = ["behavior-version-latest"] }
 # SQS client for the S3→SQS blob-change notification pipeline (FA-5b2).
 aws-sdk-sqs = { version = "1", features = ["behavior-version-latest"] }
+# STS client for the AWS **blob-upload cloud minter** (M4, S3 external ingress):
+# brokers a scoped `AssumeRole` / `GetFederationToken` session-policy credential.
+# Already in the tree transitively via aws-config; named directly so the minter can
+# call it. `behavior-version-latest` matches the other AWS SDKs.
+aws-sdk-sts = { version = "1", features = ["behavior-version-latest"] }
+
+# NOTE: the OFFICIAL Google Cloud Storage SDK 1.x for the GCS **blob-upload cloud minter**
+# (M4, V4 signed PUT URLs) is declared DIRECTLY in `boatramp-server` under a package rename
+# (`gcs-signer = { package = "google-cloud-storage", version = "1" }`) rather than here, so the
+# Google-published `google-cloud-storage` 1.x never aliases the community `google-cloud-storage`
+# 0.24 the `gcs` storage backend uses. Cargo keeps both compiled copies (semver-incompatible
+# majors) so the storage read/write path is untouched.
+
+# The new GA Azure SDK 1.x for the Azure **blob-upload cloud minter** (M4): user-delegation
+# SAS brokering (`get_user_delegation_key` + the SAS builder), a DIFFERENT crate generation
+# from the `azure_storage_blobs` 0.21 the `azure` storage backend uses (different crate names
+# ⇒ they coexist cleanly). rustls/reqwest, aws-lc-rs by default (matches the workspace).
+azure_core_v1 = { package = "azure_core", version = "1" }
+azure_identity = { version = "1" }
+azure_storage_blob = { version = "1" }
+azure_storage_sas = { version = "1" }
 
 # GCS backend (compiled only with `--features gcs`). Native SDK, matching the S3
 # backend's native-SDK choice. rustls (not openssl) to match the rest of the tree.
