@@ -851,6 +851,7 @@ pub(super) async fn build_function_bindings(
             &config.secrets,
             allow_env_secret_refs,
             inner.secret_store.get().map(std::convert::AsRef::as_ref),
+            inner.env_source(),
         )
         .await?;
         return Ok(bindings.with_env(env));
@@ -1192,6 +1193,7 @@ pub(super) async fn build_function_bindings(
         &config.secrets,
         allow_env_secret_refs,
         inner.secret_store.get().map(std::convert::AsRef::as_ref),
+        inner.env_source(),
     )
     .await?;
     Ok(bindings.with_env(env))

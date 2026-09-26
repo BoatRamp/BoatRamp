@@ -384,6 +384,13 @@ struct HandlerRuntimeInner {
     /// `access-denied`/`not-configured`). Only consulted when the `tenant-secrets` feature is
     /// compiled; the field is present regardless so the setter has one home.
     tenant_secret_store: std::sync::OnceLock<Arc<boatramp_core::secret_store::TenantSecretStore>>,
+    /// Injectable source for config-named host-env lookups (a site/function
+    /// `secrets` `env:`/bare ref, resolved by `resolve_secret_env`). **Unset ⇒
+    /// [`boatramp_core::env::SystemEnv`]** (the real process environment); a test
+    /// wires a `MapEnv` via [`HandlerRuntime::set_env_source`] so host-env secret
+    /// resolution is exercised without mutating (or racing on) the global process
+    /// environment (which is also `unsafe` to mutate in edition 2024).
+    env_source: std::sync::OnceLock<Arc<dyn boatramp_core::env::EnvSource>>,
     /// Per-function locks serializing the metering + rate-limit read-modify-write
     /// (FA-4), so concurrent invocations of one function can't lose an update.
     /// Created on first use, keyed by function name.
@@ -536,6 +543,20 @@ impl Default for DeliveryConfig {
 
 #[cfg(feature = "handlers")]
 impl HandlerRuntimeInner {
+    /// The injectable env source for config-named host-env secret lookups — the
+    /// real process environment ([`boatramp_core::env::SystemEnv`]) unless a test
+    /// wired a `MapEnv` via [`HandlerRuntime::set_env_source`]. Threaded into
+    /// `resolve_secret_env`/`resolve_env` so a bare/`env:` `secrets` ref reads
+    /// through this rather than calling `std::env::var` directly.
+    #[cfg(feature = "handlers")]
+    pub(crate) fn env_source(&self) -> &dyn boatramp_core::env::EnvSource {
+        static SYSTEM: boatramp_core::env::SystemEnv = boatramp_core::env::SystemEnv;
+        match self.env_source.get() {
+            Some(source) => source.as_ref(),
+            None => &SYSTEM as &dyn boatramp_core::env::EnvSource,
+        }
+    }
+
     /// Resolve the tenancy/capability knobs for `project` (Gap 4a): the operator's per-project
     /// override if one was declared, else the node base. The lookup key is the **host-routed**
     /// project (never guest input), so it can't be spoofed. Consulted at every in-project
@@ -677,6 +698,7 @@ impl HandlerRuntime {
                 allow_cross_tenant_db: std::sync::OnceLock::new(),
                 secret_store: std::sync::OnceLock::new(),
                 tenant_secret_store: std::sync::OnceLock::new(),
+                env_source: std::sync::OnceLock::new(),
                 function_meter_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
                 function_semaphores: std::sync::Mutex::new(std::collections::HashMap::new()),
                 watch_provider: std::sync::OnceLock::new(),
@@ -966,6 +988,18 @@ impl HandlerRuntime {
     ) {
         if let Some(inner) = self.inner.as_ref() {
             let _ = inner.tenant_secret_store.set(store);
+        }
+    }
+
+    /// Wire an injectable environment source for config-named host-env secret
+    /// lookups. Production leaves this unset (⇒ the real process env,
+    /// [`boatramp_core::env::SystemEnv`]); a test wires a `MapEnv` so host-env
+    /// secret resolution is exercised without mutating (or racing on) the global
+    /// process environment.
+    #[cfg(feature = "handlers")]
+    pub fn set_env_source(&self, source: Arc<dyn boatramp_core::env::EnvSource>) {
+        if let Some(inner) = self.inner.as_ref() {
+            let _ = inner.env_source.set(source);
         }
     }
 
@@ -2909,8 +2943,9 @@ mod tests {
     async fn resolve_env_applies_the_per_guest_secret_allowlist() {
         use boatramp_core::config::HandlersSiteConfig;
 
-        std::env::set_var("BOATRAMP_TEST_ALLOWLIST_A", "value-a");
-        std::env::set_var("BOATRAMP_TEST_ALLOWLIST_B", "value-b");
+        let env_source = boatramp_core::env::MapEnv::new()
+            .with("BOATRAMP_TEST_ALLOWLIST_A", "value-a")
+            .with("BOATRAMP_TEST_ALLOWLIST_B", "value-b");
 
         let deploy_env = std::collections::BTreeMap::new();
         // One shared 2-entry pool for BOTH guests on the site.
@@ -2938,6 +2973,7 @@ mod tests {
             &["SECRET_A".to_string()],
             true,
             None,
+            &env_source,
         )
         .await
         .expect("resolves");
@@ -2959,6 +2995,7 @@ mod tests {
             &[],
             true,
             None,
+            &env_source,
         )
         .await
         .expect("resolves");
@@ -2967,17 +3004,15 @@ mod tests {
             b.contains(&("SECRET_B".to_string(), "value-b".to_string())),
             "no allowlist ⇒ the whole pool: {b:?}"
         );
-
-        std::env::remove_var("BOATRAMP_TEST_ALLOWLIST_A");
-        std::env::remove_var("BOATRAMP_TEST_ALLOWLIST_B");
     }
 
     #[tokio::test]
     async fn resolve_env_merges_static_and_host_secrets() {
         use boatramp_core::config::HandlersSiteConfig;
 
-        // A uniquely-named host var holds the real secret value.
-        std::env::set_var("BOATRAMP_TEST_RESOLVE_SECRET", "topsecret");
+        // A uniquely-named host var holds the real secret value (injected via MapEnv).
+        let env_source =
+            boatramp_core::env::MapEnv::new().with("BOATRAMP_TEST_RESOLVE_SECRET", "topsecret");
 
         let deploy_env = std::collections::BTreeMap::from([
             ("GREETING".to_string(), "hi".to_string()),
@@ -3013,6 +3048,7 @@ mod tests {
             &[],
             true,
             None,
+            &env_source,
         )
         .await
         .expect("resolves");
@@ -3024,8 +3060,6 @@ mod tests {
         assert!(env.contains(&("SECRET_TOKEN".to_string(), "topsecret".to_string())));
         assert!(env.contains(&("OVERRIDE_ME".to_string(), "topsecret".to_string())));
         assert!(!env.iter().any(|(k, _)| k == "MISSING"));
-
-        std::env::remove_var("BOATRAMP_TEST_RESOLVE_SECRET");
     }
 
     #[tokio::test]
@@ -3036,7 +3070,10 @@ mod tests {
         // operator's host env var (bare or `env:`) in its site `secrets` map. Under
         // the multi-tenant posture (`allow_env_secret_refs = false`) the resolver
         // must REFUSE — never read the host env — and name the offending guest var.
-        std::env::set_var("BOATRAMP_TEST_OTHER_TENANT_SECRET", "leak-me");
+        // Present in the injected env — the test proves the resolver REFUSES without
+        // ever reading it (the value must never appear in the error).
+        let env_source =
+            boatramp_core::env::MapEnv::new().with("BOATRAMP_TEST_OTHER_TENANT_SECRET", "leak-me");
         let deploy_env = std::collections::BTreeMap::new();
         let bare = HandlersSiteConfig {
             enabled: true,
@@ -3054,6 +3091,7 @@ mod tests {
             &[],
             false,
             None,
+            &env_source,
         )
         .await
         .expect_err("multi-tenant must refuse a bare host-env ref");
@@ -3087,6 +3125,7 @@ mod tests {
             &[],
             false,
             None,
+            &env_source,
         )
         .await
         .is_err());
@@ -3108,6 +3147,7 @@ mod tests {
             &[],
             true,
             None,
+            &env_source,
         )
         .await
         .expect_err("a reserved scheme is not yet supported, even under single-tenant");
@@ -3132,6 +3172,7 @@ mod tests {
             &[],
             true,
             None,
+            &env_source,
         )
         .await
         .expect_err("any unknown scheme is reserved, even under single-tenant");
@@ -3139,8 +3180,6 @@ mod tests {
             err.contains("not yet supported") && err.contains("aws"),
             "provider-neutral reservation names the scheme: {err}"
         );
-
-        std::env::remove_var("BOATRAMP_TEST_OTHER_TENANT_SECRET");
     }
 
     #[tokio::test]
@@ -3149,7 +3188,8 @@ mod tests {
         // handler: `resolve_secret_env` reads the host env var named by the map's
         // value and injects it under the map's key. This is the SAME helper the
         // handler path uses, so the semantics are identical by construction.
-        std::env::set_var("BOATRAMP_TEST_FN_SECRET", "fnsecret");
+        let env_source =
+            boatramp_core::env::MapEnv::new().with("BOATRAMP_TEST_FN_SECRET", "fnsecret");
 
         let static_env = std::collections::BTreeMap::from([
             ("STAGE".to_string(), "prod".to_string()),
@@ -3177,6 +3217,7 @@ mod tests {
             &secrets,
             true,
             None,
+            &env_source,
         )
         .await
         .expect("resolves");
@@ -3188,8 +3229,6 @@ mod tests {
         assert!(env.contains(&("OVERRIDE_ME".to_string(), "fnsecret".to_string())));
         // Absent host var → skipped (matches the handler's missing-var behavior).
         assert!(!env.iter().any(|(k, _)| k == "MISSING"));
-
-        std::env::remove_var("BOATRAMP_TEST_FN_SECRET");
     }
 
     #[tokio::test]
@@ -3198,7 +3237,8 @@ mod tests {
         // `secrets` map naming a host env var must be REFUSED under the multi-tenant
         // posture (never read), using the SAME helper the handler path uses — so the
         // fail-closed semantics are identical by construction.
-        std::env::set_var("BOATRAMP_TEST_FN_LEAK", "leak-me");
+        let env_source =
+            boatramp_core::env::MapEnv::new().with("BOATRAMP_TEST_FN_LEAK", "leak-me");
         let static_env = std::collections::BTreeMap::new();
         let secrets = std::collections::BTreeMap::from([(
             "DB_URL".to_string(),
@@ -3213,6 +3253,7 @@ mod tests {
             &secrets,
             false,
             None,
+            &env_source,
         )
         .await
         .expect_err("multi-tenant must refuse a function host-env ref");
@@ -3233,12 +3274,11 @@ mod tests {
             &secrets,
             true,
             None,
+            &env_source,
         )
         .await
         .expect("resolves");
         assert!(env.contains(&("DB_URL".to_string(), "leak-me".to_string())));
-
-        std::env::remove_var("BOATRAMP_TEST_FN_LEAK");
     }
 
     #[tokio::test]
@@ -3274,6 +3314,8 @@ mod tests {
             .await
             .unwrap();
 
+        // No host-env refs in this test (boatramp: store only) — an empty env source.
+        let env_source = boatramp_core::env::MapEnv::new();
         let static_env = std::collections::BTreeMap::new();
         let secrets = std::collections::BTreeMap::from([
             ("API_KEY".to_string(), "boatramp:api-key".to_string()),
@@ -3289,6 +3331,7 @@ mod tests {
             &secrets,
             false,
             Some(&store),
+            &env_source,
         )
         .await
         .expect("boatramp refs resolve without the host-env gate");
@@ -3308,6 +3351,7 @@ mod tests {
             &other_secrets,
             false,
             Some(&store),
+            &env_source,
         )
         .await
         .expect("resolves (a foreign project's secret is simply absent → skipped)");
@@ -3324,6 +3368,7 @@ mod tests {
             &other_secrets,
             false,
             None,
+            &env_source,
         )
         .await
         .expect_err("no store configured must fail closed");
