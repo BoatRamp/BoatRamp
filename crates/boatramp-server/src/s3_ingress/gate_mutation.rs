@@ -43,6 +43,15 @@ pub fn skip_create_only() -> bool {
     env_flag("BOATRAMP_S3INGRESS_MUTATE_SKIP_CREATE_ONLY")
 }
 
+/// Whether a STANDALONE function's config-declared-site → host-forced-project validation should be
+/// neutered — a standalone function could then mint a `blob-upload` credential for a site OUTSIDE its
+/// own project (invariant 5, the standalone-function sub-case). `true` ⇒ `standalone_mint_site_ok`
+/// (`crate::function_runtime`) returns `true` without checking the site belongs to the project.
+#[inline]
+pub fn skip_standalone_site_check() -> bool {
+    env_flag("BOATRAMP_S3INGRESS_MUTATE_SKIP_STANDALONE_SITE")
+}
+
 /// Read a mutation env var: present + not `0`/empty ⇒ on. Deliberately permissive on the value (`1`,
 /// `true`, anything non-empty-non-`0`) so the CI wiring can just `export VAR=1`. Compiled to a constant
 /// `false` outside the gate-mutation feature so the choke-point `if`s vanish in every real build.

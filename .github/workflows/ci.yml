@@ -1074,7 +1074,7 @@ jobs:
             || { echo "::error::s3-ingress gate never reached its marker (a scope/SigV4/content-address/overwrite/multipart/mint regression)" >&2; exit 1; }
           # Mutation guards: neuter each choke point in turn; each MUST fail the gate. Invert the exit
           # code so a PASS-under-mutation (a hollow gate) fails the merge.
-          for mut in SKIP_SCOPE SKIP_SIGV4 SKIP_SHA256 SKIP_CREATE_ONLY; do
+          for mut in SKIP_SCOPE SKIP_SIGV4 SKIP_SHA256 SKIP_CREATE_ONLY SKIP_STANDALONE_SITE; do
             if env "BOATRAMP_S3INGRESS_MUTATE_${mut}=1" cargo-zigbuild test \
               --target x86_64-unknown-linux-musl -p boatramp-server \
               --features s3-ingress-gate-mutation --lib \
