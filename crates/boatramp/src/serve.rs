@@ -75,6 +75,11 @@ pub enum Error {
     #[cfg(all(feature = "cluster", feature = "acme-dns"))]
     #[error("secrets envelope: {0}")]
     Envelope(String),
+    /// Enabling the local S3-ingress face failed closed — e.g. a multi-node deployment with no
+    /// explicitly configured, cluster-uniform `s3_ingress_secret_file`, or a wrong-length secret
+    /// file. Refuse to serve rather than expose an un-verifiable-across-nodes face.
+    #[error("local S3-ingress face refused to enable: {0}")]
+    S3Ingress(String),
     /// Fetching the OIDC issuer's discovery document / JWKS failed.
     #[cfg(feature = "oidc")]
     #[error("OIDC setup failed: {0}")]
@@ -768,6 +773,19 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
     {
         spawn_http_redirect(redirect_addr, deploy.clone(), posture);
     }
+    // Optionally bind the dedicated local S3-ingress listener (PLAN-blob-s3-ingress, opt-in via
+    // `[serve].s3_ingress_addr`). Single-node here, so the fail-closed multi-node guard always admits;
+    // an explicit `s3_ingress_secret_file` is honored, else an ephemeral per-process root is used.
+    if let Some(s3_addr) = serve_cfg.s3_ingress_addr {
+        spawn_s3_ingress(
+            s3_addr,
+            deploy.clone(),
+            &auth,
+            &options,
+            serve_cfg.s3_ingress_secret_file.clone(),
+            boatramp_server::s3_ingress::config::Deployment::SingleNode,
+        )?;
+    }
     let serve_result = match args.tls {
         TlsMode::Off => boatramp_server::serve_with(addr, deploy, auth, handlers, options)
             .await
@@ -885,6 +903,41 @@ fn spawn_http_redirect(
             tracing::error!(%addr, %err, "HTTP redirect listener failed");
         }
     });
+}
+
+/// Build + spawn the dedicated local **S3-ingress** listener (PLAN-blob-s3-ingress, Architect HIGH-4).
+/// Runs the fail-closed multi-node secret guard (an error here refuses to serve, per the credential
+/// model), builds the face state from the fleet trust anchor + storage/KV + a fresh `UploadGuard`, and
+/// spawns the listener on its OWN port — a separate SigV4 auth surface that never reaches the
+/// control-plane router or `serve_by_host`. Requires auth to be enabled (the face verifies fleet-signed
+/// session tokens against the trust anchor); with auth disabled the face is refused.
+fn spawn_s3_ingress(
+    addr: SocketAddr,
+    deploy: DeployStore,
+    auth: &boatramp_server::Auth,
+    options: &boatramp_server::ServerOptions,
+    secret_file: Option<PathBuf>,
+    deployment: boatramp_server::s3_ingress::config::Deployment,
+) -> Result<()> {
+    use boatramp_server::s3_ingress::listener;
+
+    let public_key = auth.public_key().ok_or_else(|| {
+        Error::S3Ingress(
+            "the local S3 face needs a configured token trust anchor (enable auth)".into(),
+        )
+    })?;
+    let secret = listener::load_ingress_secret(deployment, secret_file.as_deref())
+        .map_err(|e| Error::S3Ingress(e.to_string()))?;
+    let guard = Arc::new(boatramp_server::UploadGuard::new(options.limits.clone()));
+    let state = Arc::new(listener::build_state(public_key, secret, deploy, guard));
+    tokio::spawn(async move {
+        tracing::info!(%addr, "serving local S3-ingress face (dedicated listener)");
+        if let Err(err) = listener::serve_s3(addr, state, boatramp_server::shutdown_signal()).await
+        {
+            tracing::error!(%addr, %err, "S3-ingress listener failed");
+        }
+    });
+    Ok(())
 }
 
 /// Run in **self-hosted cluster mode**: the control-plane
@@ -1627,6 +1680,20 @@ async fn run_cluster(
         if let Some(redirect_addr) = redirect {
             spawn_http_redirect(redirect_addr, deploy.clone(), options.posture);
         }
+    }
+    // Optionally bind the dedicated local S3-ingress listener. In cluster mode the deployment is
+    // treated as MULTI-NODE — so the fail-closed guard REQUIRES an explicitly configured, cluster-
+    // uniform `s3_ingress_secret_file` (never a per-node auto-generated key, which would make
+    // credentials un-verifiable across nodes).
+    if let Some(s3_addr) = cluster_serve_cfg.s3_ingress_addr {
+        spawn_s3_ingress(
+            s3_addr,
+            deploy.clone(),
+            &auth,
+            &options,
+            cluster_serve_cfg.s3_ingress_secret_file.clone(),
+            boatramp_server::s3_ingress::config::Deployment::MultiNode,
+        )?;
     }
     let serve_result = match args.tls {
         TlsMode::Off => boatramp_server::serve_with(addr, deploy, auth, handlers, options)

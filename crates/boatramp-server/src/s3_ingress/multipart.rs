@@ -201,7 +201,7 @@ pub async fn assemble(
     let storage_for_stream = storage.clone();
     let hasher = Arc::new(std::sync::Mutex::new(Sha256::new()));
     let tap = hasher.clone();
-    let assembled: ByteStream = futures::stream::iter(part_keys.into_iter())
+    let assembled: ByteStream = futures::stream::iter(part_keys)
         .flat_map(move |key| {
             let storage = storage_for_stream.clone();
             // Open the part's stream when we reach it (lazy).

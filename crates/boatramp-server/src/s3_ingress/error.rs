@@ -7,7 +7,7 @@
 //!   already parses, but with boatramp-specific `<Code>`s (`BoatrampScopeEscape`, `BoatrampCredExpired`,
 //!   …) so an operator can grep both server logs and client output for the exact failure. Non-auth
 //!   errors (a too-big object, a sha256 mismatch, an object that already exists) carry a specific code
-//!   + a helpful message — those are not an authentication oracle, they are the honest result of a
+//!   plus a helpful message — those are not an authentication oracle, they are the honest result of a
 //!   well-authenticated request that violated a constraint.
 //!
 //! - [`refuse`] — the **authentication** refusal. EVERY `SigV4Error` / `TokenError` /
@@ -225,15 +225,15 @@ mod tests {
             a.headers().get(header::CONTENT_TYPE),
             b.headers().get(header::CONTENT_TYPE)
         );
-        let (_pa, ba) = a.into_parts();
-        let (_pb, bb) = b.into_parts();
-        let ba = to_bytes(ba, usize::MAX).await.unwrap();
-        let bb = to_bytes(bb, usize::MAX).await.unwrap();
+        let (_pa, body_a) = a.into_parts();
+        let (_pb, body_b) = b.into_parts();
+        let body_a = to_bytes(body_a, usize::MAX).await.unwrap();
+        let body_b = to_bytes(body_b, usize::MAX).await.unwrap();
         assert_eq!(
-            ba, bb,
+            body_a, body_b,
             "refusal bodies must be byte-identical regardless of cause"
         );
-        assert!(String::from_utf8_lossy(&ba).contains("<Code>AccessDenied</Code>"));
+        assert!(String::from_utf8_lossy(&body_a).contains("<Code>AccessDenied</Code>"));
     }
 
     #[test]

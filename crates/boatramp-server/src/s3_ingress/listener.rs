@@ -12,6 +12,7 @@
 
 use std::future::Future;
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::Arc;
 
 use axum::Router;
@@ -19,9 +20,11 @@ use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::response::Response;
 use axum::routing::any;
+use boatramp_core::cose::TokenPublicKey;
+use boatramp_core::deploy::DeployStore;
 
 use super::config::{Deployment, S3IngressState};
-use super::credential::{CredentialError, multi_node_secret_ok};
+use super::credential::{CredentialError, S3IngressSecret, multi_node_secret_ok};
 use super::face::{self, S3Request};
 
 /// Percent-decode a raw query string into `(name, value)` pairs, decoding each key + value ONCE (the
@@ -53,6 +56,45 @@ pub fn s3_face_enable_guard(
     explicit_secret_configured: bool,
 ) -> Result<(), CredentialError> {
     multi_node_secret_ok(deployment.is_multi_node(), explicit_secret_configured)
+}
+
+/// Load the S3-ingress root secret for `deployment`, running the fail-closed multi-node guard, and
+/// return the [`S3IngressSecret`] to seed the face — or an error the caller surfaces at startup
+/// (refusing to serve rather than enabling an un-verifiable-across-nodes face).
+///
+/// - `secret_file = Some(path)`: read the raw 32-byte root from the file (the operator-distributed,
+///   cluster-uniform secret — mirrors `[secrets].kek_file`). A wrong-length file is an error.
+/// - `secret_file = None`: allowed ONLY on a single node (an ephemeral per-process root is generated);
+///   on a multi-node deployment this is [`CredentialError::MultiNodeSecretRequired`] (fail-closed).
+///
+/// The file-read/generation lives here (an IO concern); the pure guard is [`multi_node_secret_ok`].
+pub fn load_ingress_secret(
+    deployment: Deployment,
+    secret_file: Option<&Path>,
+) -> Result<S3IngressSecret, CredentialError> {
+    // Enforce the multi-node guard first: the boolean is whether an explicit secret is configured.
+    s3_face_enable_guard(deployment, secret_file.is_some())?;
+    match secret_file {
+        Some(path) => {
+            let bytes = std::fs::read(path).map_err(|_| CredentialError::BadSecretLen)?;
+            S3IngressSecret::from_bytes(&bytes)
+        }
+        // Single-node with no explicit secret: auto-generate an ephemeral per-process root (the guard
+        // above already proved this is single-node, so cross-node verifiability is not a concern).
+        None => S3IngressSecret::generate(),
+    }
+}
+
+/// Assemble the [`S3IngressState`] for the face from its parts — the trust anchor (fleet public key),
+/// the loaded ingress secret, the storage/KV handle, and the shared `UploadGuard`. Global policy
+/// defaults + per-container overrides are applied by the caller via the `S3IngressState` builder.
+pub fn build_state(
+    public_key: TokenPublicKey,
+    secret: S3IngressSecret,
+    deploy: DeployStore,
+    guard: Arc<crate::limits::UploadGuard>,
+) -> S3IngressState {
+    S3IngressState::new(public_key, secret, deploy, guard)
 }
 
 /// Build the dedicated S3-face [`Router`]. It has exactly ONE route: a catch-all fallback that
@@ -153,6 +195,34 @@ mod tests {
             s3_face_enable_guard(Deployment::MultiNode, false),
             Err(CredentialError::MultiNodeSecretRequired)
         ));
+    }
+
+    #[test]
+    fn load_ingress_secret_generates_single_node_and_refuses_multi_node() {
+        // Single node, no file ⇒ an ephemeral secret is generated.
+        assert!(load_ingress_secret(Deployment::SingleNode, None).is_ok());
+        // Multi node, no file ⇒ fail-closed (never auto-generate a per-node key).
+        assert!(matches!(
+            load_ingress_secret(Deployment::MultiNode, None),
+            Err(CredentialError::MultiNodeSecretRequired)
+        ));
+    }
+
+    #[test]
+    fn load_ingress_secret_reads_a_32_byte_file_and_rejects_wrong_length() {
+        // A 32-byte file loads on any deployment shape (it is the explicit, cluster-uniform secret).
+        let dir = std::env::temp_dir();
+        let good = dir.join(format!("br-s3-ingress-secret-good-{}", std::process::id()));
+        let bad = dir.join(format!("br-s3-ingress-secret-bad-{}", std::process::id()));
+        std::fs::write(&good, [0x11u8; 32]).unwrap();
+        std::fs::write(&bad, [0x11u8; 16]).unwrap();
+        assert!(load_ingress_secret(Deployment::MultiNode, Some(&good)).is_ok());
+        assert!(matches!(
+            load_ingress_secret(Deployment::SingleNode, Some(&bad)),
+            Err(CredentialError::BadSecretLen)
+        ));
+        let _ = std::fs::remove_file(&good);
+        let _ = std::fs::remove_file(&bad);
     }
 
     /// LISTENER ISOLATION (Architect HIGH-4): prove the S3 router never reaches the control-plane

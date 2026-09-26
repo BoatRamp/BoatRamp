@@ -846,3 +846,630 @@ mod tests {
         ));
     }
 }
+
+/// End-to-end tests over the full `handle` HTTP request→response path: a real minted+signed request
+/// drives the engine, and we assert on the response AND the resulting storage state (guest
+/// read-through). These prove the operations wire together and enforce the security invariants at the
+/// HTTP layer (not just in the pure sub-modules).
+#[cfg(test)]
+mod e2e {
+    use super::*;
+    use crate::s3_ingress::config::{LOCAL_REGION, LOCAL_SERVICE, S3IngressState};
+    use crate::s3_ingress::credential::S3IngressSecret;
+    use crate::s3_ingress::keypath;
+    use crate::s3_ingress::sigv4;
+    use axum::body::to_bytes;
+    use boatramp_core::cose::{
+        LocalSigner, S3Constraints, S3Perm, S3SessionScope, S3Target, Signer as _, TokenAlg,
+        mint_s3_session, verify_s3_session,
+    };
+    use boatramp_core::deploy::DeployStore;
+    use boatramp_core::kv::MemoryKv;
+    use std::sync::Arc;
+
+    const NOW: i64 = 1_440_938_160; // 20150830T123600Z
+    const AMZ_DATE: &str = "20150830T123600Z";
+
+    /// A test harness: a fleet signer, an ingress secret, and a face state over an in-memory store we
+    /// can assert on.
+    struct Harness {
+        signer: LocalSigner,
+        secret: S3IngressSecret,
+        map: Arc<crate::s3_ingress::test_support::MapStorage>,
+        state: S3IngressState,
+    }
+
+    fn harness() -> Harness {
+        harness_with(|s| s)
+    }
+
+    fn harness_with(f: impl FnOnce(S3IngressState) -> S3IngressState) -> Harness {
+        let signer = LocalSigner::generate(TokenAlg::Es256);
+        let map = Arc::new(crate::s3_ingress::test_support::MapStorage::default());
+        let deploy = DeployStore::new(map.clone(), Arc::new(MemoryKv::new()));
+        let guard = Arc::new(crate::limits::UploadGuard::new(Default::default()));
+        // The face state and the signing helper MUST derive `secret_access_key` under the SAME ingress
+        // root, so build both from one fixed 32-byte value (a random `generate()` would differ).
+        const ROOT: [u8; 32] = [0x5a; 32];
+        let state = f(S3IngressState::new(
+            signer.public_key(),
+            S3IngressSecret::from_bytes(&ROOT).unwrap(),
+            deploy,
+            guard,
+        ));
+        Harness {
+            signer,
+            secret: S3IngressSecret::from_bytes(&ROOT).unwrap(),
+            map,
+            state,
+        }
+    }
+
+    /// Mint + sign a request, returning a ready [`S3Request`]. `perms`/`constraints`/`target` shape the
+    /// credential scope; `body` is the request payload (its real sha256 is signed as the payload hash).
+    #[allow(clippy::too_many_arguments)]
+    async fn signed_request(
+        h: &Harness,
+        method: &str,
+        container: &str,
+        target: S3Target,
+        perms: Vec<S3Perm>,
+        constraints: S3Constraints,
+        uri_path: &str,
+        query: &str,
+        body: &[u8],
+        content_type: Option<&str>,
+    ) -> S3Request {
+        let scope = S3SessionScope {
+            project: "default".into(),
+            site: "blog".into(),
+            container: container.into(),
+            target,
+            perms,
+            constraints,
+        };
+        let token = mint_s3_session(&scope, 900, NOW as u64, &h.signer)
+            .await
+            .unwrap();
+        let session = verify_s3_session(&token, &h.signer.public_key(), NOW as u64).unwrap();
+        let akid = "BRUPE2ETEST";
+        let sak = h.secret.derive_secret(akid, &session.cti).unwrap();
+        let payload_hash = sigv4::sha256_hex(body);
+        let mut headers = vec![
+            ("host".to_string(), "s3.local".to_string()),
+            ("x-amz-date".to_string(), AMZ_DATE.to_string()),
+            ("x-amz-content-sha256".to_string(), payload_hash.clone()),
+            ("x-amz-security-token".to_string(), token.clone()),
+            ("content-length".to_string(), body.len().to_string()),
+        ];
+        if let Some(ct) = content_type {
+            headers.push(("content-type".to_string(), ct.to_string()));
+        }
+        // Sign the required header set (+ content-type when present).
+        let mut signed = vec![
+            "host".to_string(),
+            "x-amz-content-sha256".to_string(),
+            "x-amz-date".to_string(),
+        ];
+        if content_type.is_some() {
+            signed.push("content-type".to_string());
+            signed.sort();
+        }
+        let scope_s = sigv4::CredentialScope {
+            access_key_id: akid.into(),
+            date: "20150830".into(),
+            region: LOCAL_REGION.into(),
+            service: LOCAL_SERVICE.into(),
+        };
+        let req = sigv4::CanonicalRequest {
+            method,
+            uri_path,
+            query,
+            headers: &headers,
+            payload_hash: &payload_hash,
+        };
+        let (creq, signed_str) = sigv4::canonical_request_string(&req, &signed).unwrap();
+        let sts = sigv4::string_to_sign(AMZ_DATE, &scope_s, &creq);
+        let sig = sigv4::compute_signature(&sak, &scope_s, &sts);
+        let authorization = format!(
+            "AWS4-HMAC-SHA256 Credential={akid}/20150830/{LOCAL_REGION}/{LOCAL_SERVICE}/aws4_request, SignedHeaders={signed_str}, Signature={sig}"
+        );
+        headers.push(("authorization".to_string(), authorization));
+        S3Request {
+            method: method.to_string(),
+            uri_path: uri_path.to_string(),
+            query: query.to_string(),
+            headers,
+            body: Body::from(body.to_vec()),
+        }
+    }
+
+    #[tokio::test]
+    async fn put_object_lands_at_guest_readable_key() {
+        // A signed single-shot PUT to container "photos", key "avatars/u1.jpg" succeeds and lands at
+        // EXACTLY the hblob key the guest compat::blob binding reads.
+        let h = harness();
+        let body = b"the avatar bytes";
+        let req = signed_request(
+            &h,
+            "PUT",
+            "photos",
+            S3Target::Key("avatars/u1.jpg".into()),
+            vec![S3Perm::Put],
+            S3Constraints::default(),
+            "/photos/avatars/u1.jpg",
+            "",
+            body,
+            None,
+        )
+        .await;
+        let resp = handle(&h.state, req, NOW).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        // Guest read-through: the object is at hblob/blog/photos/avatars/u1.jpg (default project ⇒ no
+        // project segment), byte-identical.
+        let (_d, key) =
+            keypath::compose_object_key("default", "blog", "photos", "avatars/u1.jpg").unwrap();
+        assert_eq!(key, "hblob/blog/photos/avatars/u1.jpg");
+        assert_eq!(h.map.get_bytes(&key).unwrap(), body);
+    }
+
+    #[tokio::test]
+    async fn cross_container_and_key_escape_are_refused() {
+        // A credential scoped to "photos"/"avatars/u1.jpg". Driving it at a DIFFERENT container, or a
+        // traversal key, yields a refusal — never a committed object.
+        let h = harness();
+        // Cross-container: mint a credential for container "photos" but sign+send it to bucket "docs"
+        // in the URL. The scope authorization (bucket must == the SIGNED scope's container) refuses it.
+        let scope = S3SessionScope {
+            project: "default".into(),
+            site: "blog".into(),
+            container: "photos".into(),
+            target: S3Target::Key("avatars/u1.jpg".into()),
+            perms: vec![S3Perm::Put],
+            constraints: S3Constraints::default(),
+        };
+        let token = mint_s3_session(&scope, 900, NOW as u64, &h.signer)
+            .await
+            .unwrap();
+        let session = verify_s3_session(&token, &h.signer.public_key(), NOW as u64).unwrap();
+        let akid = "BRUPXCONT";
+        let sak = h.secret.derive_secret(akid, &session.cti).unwrap();
+        let body = b"x";
+        let payload_hash = sigv4::sha256_hex(body);
+        // Sign a request whose URL bucket is "docs" (mismatching the scope's "photos").
+        let headers = vec![
+            ("host".to_string(), "s3.local".to_string()),
+            ("x-amz-date".to_string(), AMZ_DATE.to_string()),
+            ("x-amz-content-sha256".to_string(), payload_hash.clone()),
+            ("x-amz-security-token".to_string(), token.clone()),
+            ("content-length".to_string(), "1".to_string()),
+        ];
+        let signed = vec![
+            "host".to_string(),
+            "x-amz-content-sha256".to_string(),
+            "x-amz-date".to_string(),
+        ];
+        let scope_s = sigv4::CredentialScope {
+            access_key_id: akid.into(),
+            date: "20150830".into(),
+            region: LOCAL_REGION.into(),
+            service: LOCAL_SERVICE.into(),
+        };
+        let creq_req = sigv4::CanonicalRequest {
+            method: "PUT",
+            uri_path: "/docs/avatars/u1.jpg",
+            query: "",
+            headers: &headers,
+            payload_hash: &payload_hash,
+        };
+        let (creq, signed_str) = sigv4::canonical_request_string(&creq_req, &signed).unwrap();
+        let sts = sigv4::string_to_sign(AMZ_DATE, &scope_s, &creq);
+        let sig = sigv4::compute_signature(&sak, &scope_s, &sts);
+        let mut xcont_headers = headers.clone();
+        xcont_headers.push((
+            "authorization".to_string(),
+            format!(
+                "AWS4-HMAC-SHA256 Credential={akid}/20150830/{LOCAL_REGION}/{LOCAL_SERVICE}/aws4_request, SignedHeaders={signed_str}, Signature={sig}"
+            ),
+        ));
+        let xcont = S3Request {
+            method: "PUT".into(),
+            uri_path: "/docs/avatars/u1.jpg".into(),
+            query: String::new(),
+            headers: xcont_headers,
+            body: Body::from(body.to_vec()),
+        };
+        let resp = handle(&h.state, xcont, NOW).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "cross-container must be refused"
+        );
+        assert!(
+            h.map.get_bytes("hblob/blog/docs/avatars/u1.jpg").is_none(),
+            "no object committed to the wrong container"
+        );
+
+        // Key escape: a percent-encoded traversal in the key ⇒ BoatrampScopeEscape (403), no object.
+        let esc = signed_request(
+            &h,
+            "PUT",
+            "photos",
+            S3Target::Prefix(String::new()), // whole-container so authorization passes if the key is ok
+            vec![S3Perm::Put],
+            S3Constraints::default(),
+            "/photos/%2e%2e%2fescape",
+            "",
+            b"x",
+            None,
+        )
+        .await;
+        let resp = handle(&h.state, esc, NOW).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let body_bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert!(String::from_utf8_lossy(&body_bytes).contains("BoatrampScopeEscape"));
+    }
+
+    #[tokio::test]
+    async fn create_only_credential_refuses_overwrite() {
+        // A create-only (UGC default) credential: the first PUT succeeds; a second PUT to the same key
+        // is refused with BoatrampOverwriteDenied (412), and the original bytes are untouched.
+        let h = harness();
+        async fn mk(h: &Harness, body: &'static [u8]) -> S3Request {
+            signed_request(
+                h,
+                "PUT",
+                "photos",
+                S3Target::Key("once.bin".into()),
+                vec![S3Perm::Put],
+                S3Constraints {
+                    create_only: true,
+                    ..Default::default()
+                },
+                "/photos/once.bin",
+                "",
+                body,
+                None,
+            )
+            .await
+        }
+        let first = handle(&h.state, mk(&h, b"first").await, NOW).await;
+        assert_eq!(first.status(), StatusCode::OK);
+        let key = "hblob/blog/photos/once.bin";
+        assert_eq!(h.map.get_bytes(key).unwrap(), b"first");
+        // Second PUT (overwrite) ⇒ refused, original preserved.
+        let second = handle(&h.state, mk(&h, b"second").await, NOW).await;
+        assert_eq!(second.status(), StatusCode::PRECONDITION_FAILED);
+        let body = to_bytes(second.into_body(), usize::MAX).await.unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("BoatrampOverwriteDenied"));
+        assert_eq!(
+            h.map.get_bytes(key).unwrap(),
+            b"first",
+            "overwrite must not have happened"
+        );
+    }
+
+    #[tokio::test]
+    async fn content_addressed_put_rejects_mismatched_bytes() {
+        // A require_sha256 credential: the key must equal sha256(bytes). Send bytes that DON'T hash to
+        // the declared key ⇒ BoatrampSha256Mismatch, no committed object.
+        let h = harness();
+        let real_bytes = b"hello world";
+        let real_hash = sigv4::sha256_hex(real_bytes);
+        // Declare a key that is NOT the hash of the bytes we send.
+        let wrong_key = "0000000000000000000000000000000000000000000000000000000000000000";
+        let req = signed_request(
+            &h,
+            "PUT",
+            "cas",
+            S3Target::Prefix(String::new()),
+            vec![S3Perm::Put],
+            S3Constraints {
+                require_sha256: true,
+                ..Default::default()
+            },
+            &format!("/cas/{wrong_key}"),
+            "",
+            real_bytes,
+            None,
+        )
+        .await;
+        let resp = handle(&h.state, req, NOW).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("BoatrampSha256Mismatch"));
+        assert!(
+            h.map
+                .get_bytes(&format!("hblob/blog/cas/{wrong_key}"))
+                .is_none(),
+            "no committed object on mismatch"
+        );
+        // The matching key ⇒ committed.
+        let ok = signed_request(
+            &h,
+            "PUT",
+            "cas",
+            S3Target::Prefix(String::new()),
+            vec![S3Perm::Put],
+            S3Constraints {
+                require_sha256: true,
+                ..Default::default()
+            },
+            &format!("/cas/{real_hash}"),
+            "",
+            real_bytes,
+            None,
+        )
+        .await;
+        assert_eq!(handle(&h.state, ok, NOW).await.status(), StatusCode::OK);
+        assert_eq!(
+            h.map
+                .get_bytes(&format!("hblob/blog/cas/{real_hash}"))
+                .unwrap(),
+            real_bytes
+        );
+    }
+
+    #[tokio::test]
+    async fn multipart_create_upload_complete_assembles_guest_readable_object() {
+        // The full multipart flow: Create → UploadPart×2 → Complete assembles a guest-readable object;
+        // the staging is gone afterward (no leak, no partial).
+        let h = harness();
+        let container = "bulk";
+        let key = "big/object.bin";
+        let target = S3Target::Prefix("big".into());
+        let perms = vec![S3Perm::Multipart];
+
+        // Create.
+        let create = signed_request(
+            &h,
+            "POST",
+            container,
+            target.clone(),
+            perms.clone(),
+            S3Constraints::default(),
+            &format!("/{container}/{key}"),
+            "uploads",
+            b"",
+            None,
+        )
+        .await;
+        let resp = handle(&h.state, create, NOW).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let xml = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let xml = String::from_utf8_lossy(&xml);
+        let upload_id = xml
+            .split("<UploadId>")
+            .nth(1)
+            .unwrap()
+            .split("</UploadId>")
+            .next()
+            .unwrap()
+            .to_string();
+
+        // UploadPart 1 + 2.
+        for (n, data) in [(1u32, b"AAAA".as_slice()), (2u32, b"BBBB".as_slice())] {
+            let up = signed_request(
+                &h,
+                "PUT",
+                container,
+                target.clone(),
+                perms.clone(),
+                S3Constraints::default(),
+                &format!("/{container}/{key}"),
+                &format!("partNumber={n}&uploadId={upload_id}"),
+                data,
+                None,
+            )
+            .await;
+            let r = handle(&h.state, up, NOW).await;
+            assert_eq!(r.status(), StatusCode::OK, "UploadPart {n}");
+        }
+
+        // Complete with the part list.
+        let complete_xml = "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber></Part>\
+             <Part><PartNumber>2</PartNumber></Part></CompleteMultipartUpload>"
+            .to_string();
+        let complete = signed_request(
+            &h,
+            "POST",
+            container,
+            target.clone(),
+            perms.clone(),
+            S3Constraints::default(),
+            &format!("/{container}/{key}"),
+            &format!("uploadId={upload_id}"),
+            complete_xml.as_bytes(),
+            None,
+        )
+        .await;
+        let r = handle(&h.state, complete, NOW).await;
+        assert_eq!(r.status(), StatusCode::OK);
+
+        // Guest read-through: the assembled object is at the hblob key, parts concatenated in order.
+        let final_key = format!("hblob/blog/{container}/{key}");
+        assert_eq!(h.map.get_bytes(&final_key).unwrap(), b"AAAABBBB");
+        // Staging is gone (GC'd on complete).
+        let staging = keypath::staging_prefix("default", "blog", container, &upload_id);
+        assert_eq!(h.map.count_with_prefix(&staging), 0, "staging must be GC'd");
+    }
+
+    #[tokio::test]
+    async fn abort_removes_staging_via_the_face() {
+        let h = harness();
+        let container = "bulk";
+        let key = "x/y";
+        let target = S3Target::Prefix("x".into());
+        let perms = vec![S3Perm::Multipart];
+        let create = signed_request(
+            &h,
+            "POST",
+            container,
+            target.clone(),
+            perms.clone(),
+            S3Constraints::default(),
+            &format!("/{container}/{key}"),
+            "uploads",
+            b"",
+            None,
+        )
+        .await;
+        let resp = handle(&h.state, create, NOW).await;
+        let xml = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let xml = String::from_utf8_lossy(&xml);
+        let upload_id = xml
+            .split("<UploadId>")
+            .nth(1)
+            .unwrap()
+            .split("</UploadId>")
+            .next()
+            .unwrap()
+            .to_string();
+        // Stage a part.
+        let up = signed_request(
+            &h,
+            "PUT",
+            container,
+            target.clone(),
+            perms.clone(),
+            S3Constraints::default(),
+            &format!("/{container}/{key}"),
+            &format!("partNumber=1&uploadId={upload_id}"),
+            b"data",
+            None,
+        )
+        .await;
+        assert_eq!(handle(&h.state, up, NOW).await.status(), StatusCode::OK);
+        let staging = keypath::staging_prefix("default", "blog", container, &upload_id);
+        assert_eq!(h.map.count_with_prefix(&staging), 1);
+        // Abort.
+        let abort = signed_request(
+            &h,
+            "DELETE",
+            container,
+            target,
+            perms,
+            S3Constraints::default(),
+            &format!("/{container}/{key}"),
+            &format!("uploadId={upload_id}"),
+            b"",
+            None,
+        )
+        .await;
+        assert_eq!(
+            handle(&h.state, abort, NOW).await.status(),
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            h.map.count_with_prefix(&staging),
+            0,
+            "abort GC'd the staging"
+        );
+    }
+
+    #[tokio::test]
+    async fn cors_preflight_never_wildcards_and_only_echoes_allowed_origin() {
+        // A container with one allowed origin. An OPTIONS preflight from that origin echoes it (never
+        // `*`); from a different origin gets a bare 403 with no CORS headers.
+        let h = harness_with(|s| {
+            s.with_container_policy(
+                "default",
+                "blog",
+                "photos",
+                crate::s3_ingress::config::ContainerPolicy {
+                    cors_allowed_origins: vec!["https://app.example".into()],
+                    ..Default::default()
+                },
+            )
+        });
+        // Allowed origin ⇒ echoed exactly, never `*`.
+        let req = S3Request {
+            method: "OPTIONS".into(),
+            uri_path: "/photos/x".into(),
+            query: String::new(),
+            headers: vec![("origin".to_string(), "https://app.example".to_string())],
+            body: Body::empty(),
+        };
+        let resp = handle(&h.state, req, NOW).await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        let echoed = resp
+            .headers()
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(echoed, "https://app.example");
+        assert_ne!(
+            echoed, "*",
+            "must never wildcard a credentialed write endpoint"
+        );
+        // Disallowed origin ⇒ 403, no CORS header (browser blocks it).
+        let req2 = S3Request {
+            method: "OPTIONS".into(),
+            uri_path: "/photos/x".into(),
+            query: String::new(),
+            headers: vec![("origin".to_string(), "https://evil.example".to_string())],
+            body: Body::empty(),
+        };
+        let resp2 = handle(&h.state, req2, NOW).await;
+        assert_eq!(resp2.status(), StatusCode::FORBIDDEN);
+        assert!(
+            resp2
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn multipart_upload_id_from_one_scope_is_rejected_by_another() {
+        // Invariant 8: A's uploadId can't be driven by B's credential. Create an upload under a
+        // credential for prefix "a", then present a valid credential for prefix "b" with A's uploadId —
+        // the scope re-verification refuses it (uniform 403).
+        let h = harness();
+        let create = signed_request(
+            &h,
+            "POST",
+            "bulk",
+            S3Target::Prefix("a".into()),
+            vec![S3Perm::Multipart],
+            S3Constraints::default(),
+            "/bulk/a/obj",
+            "uploads",
+            b"",
+            None,
+        )
+        .await;
+        let resp = handle(&h.state, create, NOW).await;
+        let xml = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let xml = String::from_utf8_lossy(&xml);
+        let upload_id = xml
+            .split("<UploadId>")
+            .nth(1)
+            .unwrap()
+            .split("</UploadId>")
+            .next()
+            .unwrap()
+            .to_string();
+        // A DIFFERENT credential (prefix "b") tries to UploadPart against A's uploadId.
+        let hijack = signed_request(
+            &h,
+            "PUT",
+            "bulk",
+            S3Target::Prefix("b".into()),
+            vec![S3Perm::Multipart],
+            S3Constraints::default(),
+            "/bulk/b/obj",
+            &format!("partNumber=1&uploadId={upload_id}"),
+            b"evil",
+            None,
+        )
+        .await;
+        let r = handle(&h.state, hijack, NOW).await;
+        assert_eq!(
+            r.status(),
+            StatusCode::FORBIDDEN,
+            "an uploadId bound to scope A must not be drivable by scope B's credential"
+        );
+    }
+}

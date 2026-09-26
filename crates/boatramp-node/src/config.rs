@@ -1887,6 +1887,22 @@ pub struct ServeConfig {
     /// `console.*` daemon-config override, which can enable/move it at runtime
     /// (`boatramp config set console.enabled true`) without a restart.
     pub console: Option<ConsoleConfig>,
+    /// Bind address for the **dedicated local S3-ingress listener** (PLAN-blob-s3-ingress,
+    /// Architect HIGH-4). Absent ⇒ the local S3 face is NOT served (it is opt-in — a deployment that
+    /// only mints cloud-brokered credentials never needs it). This is a SEPARATE listener from the
+    /// control-plane `addr`: it has its own SigV4 auth surface and never reaches `serve_by_host` or
+    /// the `/api` router.
+    pub s3_ingress_addr: Option<SocketAddr>,
+    /// Path to the **dedicated S3-ingress root secret** file (raw 32 bytes) — the independently-
+    /// rotatable HKDF root for `secret_access_key` derivation (hard domain separation from the
+    /// `[secrets]` KEK + the COSE signing key). Like `[secrets].kek_file`, this holds a *path*, never
+    /// key material in the config text, and (in a cluster) the **same file must be present on every
+    /// node** so every node derives the same `secret_access_key`. Absent on a single node ⇒ an
+    /// ephemeral per-process root is auto-generated; absent on a **multi-node** deployment ⇒ the S3
+    /// face is refused to enable (fail-closed — credentials would otherwise be un-verifiable across
+    /// nodes). Prefer the `BOATRAMP_S3_INGRESS_SECRET_FILE` env / flag so the path stays out of the
+    /// committed config where that matters operationally.
+    pub s3_ingress_secret_file: Option<PathBuf>,
 }
 
 /// `[serve.console]` — the embedded web console (a Wasm SPA baked into the

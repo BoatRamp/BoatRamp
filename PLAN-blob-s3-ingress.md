@@ -89,9 +89,11 @@ Mount at a distinct prefix/listener that cannot collide with `serve_by_host` fal
 (candidate: dedicated path root `/_s3/` or an optional dedicated listener port). Its own auth (SigV4),
 **outside** `require_auth`.
 
-**Multipart staging (local):** parts written to `hblob/{site}/{ctr}/.uploads/{uploadId}/part-N` (or KV);
-Complete concatenates in part order → writes the final key → deletes staging; Abort/expiry → GC deletes
-staging. UploadId isolation prevents cross-upload collision.
+**Multipart staging (local):** parts written to `hblob/{site}/{ctr}/.boatramp-uploads/{uploadId}/part-N`
+(the reserved `.boatramp*` namespace `validate_object_key` rejects for a client key, so a client key can
+never collide with staging — M1-review MEDIUM-3); Complete concatenates in part order → writes the final
+key → deletes staging; Abort/expiry → GC deletes staging. UploadId isolation prevents cross-upload
+collision.
 
 ## 5. Storage + key mapping (guest read-through)
 
@@ -131,7 +133,7 @@ via provisioning); **allowed perms** (write/multipart only unless explicitly gra
 
 ## 9. GC
 
-Local: sweep `…/.uploads/{uploadId}/` older than the staging TTL; Complete/Abort delete immediately.
+Local: sweep `…/.boatramp-uploads/{uploadId}/` older than the staging TTL; Complete/Abort delete immediately.
 Cloud: rely on the store's incomplete-multipart lifecycle rule (operator-set, or boatramp sets it via
 `blob_provision`). Committed-but-app-unreferenced objects are **app-owned** — the guest is the reference
 authority; the platform does not (cannot) infer "unreferenced" for committed objects.
@@ -248,10 +250,11 @@ browser-UGC and bulk-agent. One S3 protocol to the client everywhere.
   **S3-face key-composition choke point** so **cloud backends are covered** (the `fs::resolve` traversal
   backstop is fs-only). Container name stays a single segment (validator applies).
 - `uploadId` is fleet-issued and **scope-bound** (scope hash embedded, staging keyed under
-  `hblob/{site}/{ctr}/.uploads/{uploadId}/`); every `UploadPart`/`Complete`/`Abort` **re-verifies the
-  request scope matches the upload's origin scope** — never trust the `uploadId` alone.
-- **Guest cannot read in-flight parts**: guard the guest binding so `get`/`list` cannot reach the
-  `.uploads/` staging prefix.
+  `hblob/{site}/{ctr}/.boatramp-uploads/{uploadId}/`); every `UploadPart`/`Complete`/`Abort` **re-verifies
+  the request scope matches the upload's origin scope** — never trust the `uploadId` alone.
+- **Guest cannot read in-flight parts**: staging lives under the reserved `.boatramp*` segment namespace,
+  which `validate_object_key` rejects for a guest/client key — so `get`/`list` can never reach the
+  `.boatramp-uploads/` staging prefix.
 
 ### Overwrite / write-only (Security HIGH-1)
 - External face is **write/multipart-only** (no external GET/LIST/DELETE). Caller-chosen-key (UGC) creds
@@ -358,9 +361,15 @@ bytes.
   authz; the credential model (HKDF-derived secret from a dedicated ingress key + `KIND_S3_SESSION` COSE
   token + rotation + fail-closed multi-node guard); the SigV4 engine (canonical-request/string-to-sign/
   sign+verify incl. aws-chunked) built against AWS test vectors + differential fuzz. Pure, unit-testable.
-- **M2 — local S3 face**: dedicated listener, path-style, PutObject + multipart (fs/in-memory assembly) +
-  staging/GC, CORS, greppable S3 error codes, `UploadGuard` + DoS caps. Wired to `Arc<dyn Storage>` at
-  `hblob/…`.
+- **M2 — local S3 face** ✓ (done): dedicated listener (`s3_ingress::listener::serve_s3`, own SigV4 auth
+  surface, no `/api`/`serve_by_host`), path-style, PutObject + multipart quartet (fs/in-memory assembly)
+  + scope-bound `uploadId` + staging/GC under `.boatramp-uploads`, per-container CORS (never `*`),
+  greppable S3 error `<Code>` vocabulary, `UploadGuard` + DoS caps. Wired to `Arc<dyn Storage>` at
+  `hblob/{project-qualified-site}/{container}/{key}` (guest read-through). Folds the M1-review fixes:
+  MEDIUM-2 (trailer fail-closed), MEDIUM-3 (`.boatramp-uploads` staging namespace), LOW-1 (required
+  SignedHeaders), INFO-3 (uniform-403 no-oracle). Opt-in `cti` revocation. Config: `[serve]
+  .s3_ingress_addr` + `.s3_ingress_secret_file`, spawned single-node + cluster (fail-closed multi-node
+  secret guard). NOT yet: the guest `blob-upload` mint binding + CLI (M3).
 - **M3 — mint surfaces**: guest `blob-upload` binding (deny-by-default, host-forced project+site, clamps,
   `upload_containers` allowlist) + `boatramp blob mint-upload` CLI (`--emit env|aws|rclone|json`); the
   presigned-put | temp-credentials variant.
