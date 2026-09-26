@@ -7,29 +7,52 @@ versions.
 
 ## [0.5.7] - 2026-09-26
 
-**Fix: the GraphQL edge is scoped to the graphql endpoint route, not the whole site.** On a
-graphql-enabled site the GraphQL edge — the query guard, the federation / data-connector planner, and the
-built-in **GraphiQL explorer** — was applied to *every* matched route. So a browser `GET`
-(`Accept: text/html`) to any other declared guest route (an OIDC `/authorize`, `/jwks`,
-`/.well-known/openid-configuration`, a social-login / SAML redirect start) was served the GraphiQL IDE,
-**shadowing the guest's own handler** — and because a browser always sends `Accept: text/html`, every
-browser-navigated guest `GET` on a site that also exposed `/graphql` was unusable (OIDC / social-login /
-SAML browser flows blocked). The edge is now a property of the graphql **endpoint route**: it applies only
-to a request whose matched handler route is the graphql endpoint, so every other declared guest route is
-served by its own handler regardless of `Accept`.
+Two production fixes for browser-facing federated-GraphQL sites plus two internal build-level changes: a
+GraphiQL routing fix that unblocks browser-navigated guest routes, a control-plane fix for transient 502s
+during multi-function deploys, the move to Rust edition 2024, and an internal refactor that eliminates
+global-environment mutation. **MSRV is now Rust 1.91.** No public HTTP/CLI/config break; existing sites
+need no reconfiguration.
 
 ### Fixed
 
-- **GraphiQL no longer shadows sibling guest GET routes on a graphql site** (#500). The GraphQL edge
-  (query guard, federation / data-connector planner, and the GraphiQL explorer) is gated on the matched
-  handler being the graphql endpoint route — route match takes precedence over the playground. Fixes
-  browser-navigated OIDC / social-login / SAML guest `GET` handlers being shadowed by the IDE.
+- **GraphiQL no longer shadows sibling guest GET routes on a graphql site** (#500). On a graphql-enabled
+  site the GraphQL edge — the query guard (depth / complexity / introspection), the federation /
+  data-connector planner, and the built-in GraphiQL explorer — was applied to *every* matched route, so a
+  browser `GET` (`Accept: text/html`) to any other declared guest route (an OIDC `/authorize`, `/jwks`, a
+  social-login / SAML redirect start) was served the GraphiQL IDE, **shadowing the guest's own handler** —
+  and because a browser always sends `Accept: text/html`, every browser-navigated guest `GET` on a site
+  that also exposed `/graphql` was unusable. The edge is now a property of the graphql **endpoint route**:
+  it applies only to a request whose **path matches** the configured graphql route (default `/graphql`), so
+  every other declared guest route is served by its own handler regardless of `Accept`. Matching is on the
+  request path (not the matched handler's route string), so a broader handler declared before the graphql
+  route cannot disable the edge/guard on the endpoint.
+- **No transient 502 during a multi-function deploy** (#499). A function deploy's subgraph-SDL introspection
+  compiled the wasm component synchronously on a tokio worker; on a single-worker machine that starved the
+  executor, so the next control-plane request (a healthz probe, the next deploy) could cross the edge
+  timeout → 502, and an `apply` of many functions advanced only one-per-run. The deploy now warms the
+  compile **off the async worker** (`block_in_place`, compile-concurrency gated) before serving
+  introspection, so a deploy never stalls a concurrent request. `boatramp project apply` now drives the
+  **async** deploy (`?wait=false`, polling deploy status) and **deferred supergraph compose**
+  (`?compose=defer` + one final compose), making an N-function apply O(N) and off the request critical path.
+
+### Changed
+
+- **Rust edition 2024; MSRV raised to 1.91** (#498). Workspace-internal (no public API change); the
+  published library crates now require Rust 1.91.
+- **Internal: config-named environment reads go through an injectable source** (#498). The site/function
+  `secrets` (`env:`/bare host refs), a webhook `secret_env`, a GraphQL `jwks_env`, and a database `url_env`
+  now resolve host-env values through an injected `EnvSource` (the real process environment in production)
+  instead of reading process globals directly — eliminating global-environment mutation in tests. No
+  behavior change: the multi-tenant host-env-ref refusal, the `boatramp:` project-scoped store, and the
+  sealed per-tenant secret paths are unchanged, and an unset source reads the real environment (fail-safe).
 
 ### Added
 
 - **`[handlers.graphql].route`** (optional) — the route pattern of the graphql endpoint (default
-  `/graphql`). Set it only when the endpoint lives at a non-default path; the default is non-breaking for
-  the `/graphql` convention, so no site needs reconfiguration.
+  `/graphql`). **If the graphql endpoint lives at a non-default path you must set this**, or the edge
+  (GraphiQL, APQ, and the query guard) will not engage there. Should be a single literal endpoint path, not
+  a wildcard. Non-breaking for the `/graphql` convention, so no site on the default path needs
+  reconfiguration.
 
 ## [0.5.6] - 2026-09-24
 
