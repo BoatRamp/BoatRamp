@@ -561,6 +561,14 @@ impl DeployStore {
         &self.kv
     }
 
+    /// The underlying blob `storage`, for surfaces that write/read objects at their
+    /// own storage-key layout (e.g. the S3-ingress face, which lands objects at
+    /// `hblob/{project-qualified-site}/{container}/{key}` so the guest `compat::blob`
+    /// binding reads them unchanged).
+    pub fn storage(&self) -> &Arc<dyn Storage> {
+        &self.storage
+    }
+
     /// Readiness probe: confirm the metadata backend is reachable with a cheap
     /// read (a missing key is fine — it still proves the backend answered). The
     /// blob backend is exercised per-request rather than probed here.
