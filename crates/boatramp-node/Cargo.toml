@@ -105,6 +105,14 @@ capability = [
   "boatramp-server/capability",
   "boatramp-handlers/capability",
 ]
+# The guest blob-upload minting capability (`boatramp:handlers/blob-upload`, S3 external ingress):
+# the node enables minting when the S3-ingress face is wired, reusing the fleet session signer + the
+# S3-ingress secret. Enables the server's `blob-upload` feature; implies handlers.
+blob-upload = [
+  "handlers",
+  "boatramp-server/blob-upload",
+  "boatramp-handlers/blob-upload",
+]
 s3 = ["dep:boatramp-storage", "boatramp-storage/s3"]
 slatedb = ["dep:boatramp-storage", "boatramp-storage/slatedb"]
 tls = []

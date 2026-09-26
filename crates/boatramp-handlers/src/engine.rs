@@ -1134,6 +1134,10 @@ impl HandlerEngine {
         bindings::capability::add_to_linker(&mut linker, |state: &mut HostState| {
             bindings::capability::CapabilityHost::new(state.bindings.capability())
         })?;
+        #[cfg(feature = "blob-upload")]
+        bindings::blob_upload::add_to_linker(&mut linker, |state: &mut HostState| {
+            bindings::blob_upload::BlobUploadHost::new(state.bindings.blob_upload())
+        })?;
         #[cfg(feature = "sql")]
         bindings::target_context::add_to_linker(&mut linker, |state: &mut HostState| {
             bindings::target_context::TargetContextHost::new(

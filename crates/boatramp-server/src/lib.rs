@@ -3928,6 +3928,7 @@ mod tests {
                     retention_ms: None,
                     stats_topics: Vec::new(),
                     tenant_secret_names: Vec::new(),
+                    upload_containers: Vec::new(),
                     topic: "orders/created".into(),
                     component: "consumer.wasm".into(),
                     imports: vec!["wasi:keyvalue".into()],
@@ -4076,6 +4077,7 @@ mod tests {
                     max_ack_pending: None,
                     stats_topics: Vec::new(),
                     tenant_secret_names: Vec::new(),
+                    upload_containers: Vec::new(),
                 }],
                 ..Default::default()
             },
@@ -5912,6 +5914,7 @@ mod tests {
                     invoke_targets: Vec::new(),
                     stats_topics: Vec::new(),
                     tenant_secret_names: Vec::new(),
+                    upload_containers: Vec::new(),
                 }],
                 crons: vec![CronConfig {
                     schedule: "* * * * *".into(),
@@ -6081,6 +6084,7 @@ mod tests {
                     invoke_targets: Vec::new(),
                     stats_topics: Vec::new(),
                     tenant_secret_names: Vec::new(),
+                    upload_containers: Vec::new(),
                 }],
                 crons: vec![CronConfig {
                     schedule: "* * * * *".into(),

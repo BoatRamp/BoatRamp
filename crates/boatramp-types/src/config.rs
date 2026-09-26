@@ -565,6 +565,17 @@ pub struct HandlerConfig {
     /// Only consulted when `imports` contains a `tenant-secrets:*` right and the site allows it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tenant_secret_names: Vec<String>,
+    /// Per-component container allowlist for the guest blob-upload mint capability
+    /// (`boatramp:handlers/blob-upload`, S3 external ingress): the blob containers this component may
+    /// mint an upload credential for. Least-privilege, mirroring
+    /// [`tenant_secret_names`](Self::tenant_secret_names): **empty ⇒ deny-all** (a component that
+    /// declares `blob-upload:{write,multipart}` but names no containers can mint nothing). A `mint`
+    /// naming a container NOT in this list returns `access-denied` (before any signing). The project +
+    /// site are always host-forced from the resolved invocation scope — this bounds only WHICH
+    /// container, never WHICH project/site. Only consulted when `imports` contains a `blob-upload:*`
+    /// right and the site allows it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub upload_containers: Vec<String>,
     /// Per-handler in-site tenancy decision (Dimension 0), overriding the site-level
     /// [`HandlersSiteConfig::tenancy`] for this route. Absent ⇒ inherit the site decision. When
     /// present it must **narrow within** the site ceiling ([`crate::tenancy::Tenancy::narrows_within`])
@@ -714,6 +725,12 @@ pub struct ConsumerConfig {
     /// resolved tenant via `boatramp:handlers/tenant-secrets`. Empty ⇒ deny-all.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tenant_secret_names: Vec<String>,
+    /// Per-component container allowlist for the guest blob-upload mint capability (same contract as
+    /// [`HandlerConfig::upload_containers`]): the blob containers this consumer may mint an upload
+    /// credential for via `boatramp:handlers/blob-upload`. Empty ⇒ deny-all. Project + site are always
+    /// host-forced from the resolved invocation scope.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub upload_containers: Vec<String>,
 }
 
 /// serde `skip_serializing_if` helper: a `Latest` start is the default and elided.
@@ -1575,6 +1592,7 @@ mod tests {
                 invoke_targets: Vec::new(),
                 stats_topics: Vec::new(),
                 tenant_secret_names: Vec::new(),
+                upload_containers: Vec::new(),
             }],
             ..Default::default()
         };

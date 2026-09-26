@@ -829,6 +829,167 @@ world capability-host {
   import capability-minter;
 }
 
+/// Value types for the `blob-upload` capability (S3-compatible external blob ingress): a guest **mints
+/// a short-lived, scoped credential** an external client (a browser, a bulk agent) uses to upload
+/// binary objects DIRECTLY into one of the project's blob containers over the standard S3 protocol —
+/// which the wasm guest then reads by key via the unchanged `wasi:blobstore`. The guest never sees the
+/// store credentials; it only receives a scoped, TTL-bounded temporary credential.
+///
+/// # Project AND site are HOST-forced — you never pass them
+/// This interface has NO project/site parameter. The host stamps BOTH from THIS invocation's resolved
+/// scope, so a minted credential is structurally confined to its origin tenant — a guest can neither
+/// name nor widen them. The guest names only the container, the key OR prefix, the perms, the
+/// constraints, and a requested TTL (the host CLAMPS the TTL and max-bytes to the operator ceilings —
+/// a guest can only narrow). Deny-by-default: grant `blob-upload:write` (single-shot PUT) and/or
+/// `blob-upload:multipart` (resumable multipart) in the component's deploy `imports` — the two are
+/// INDEPENDENT rights (bare `blob-upload` is NOT a grant; there is no `blob-upload:*`). A per-component
+/// `upload_containers` allowlist further restricts WHICH containers are mintable (empty ⇒ deny-all).
+///
+/// # Footgun: an `all` / anonymous / unscoped handler gets `no-resolved-site`
+/// The host requires a single resolved site to stamp. A handler with no single resolved site — an
+/// `all`-scoped admin route, an anonymous funnel — has no site to confine to, so a `mint` returns
+/// `no-resolved-site` (fail-closed, before any signing), never a project-wide credential.
+interface blob-upload-types {
+  /// A single permitted S3 operation the minted credential may perform. Deliberately a small, explicit
+  /// set (write / multipart only) — an ingress credential is never a read / list / delete surface.
+  enum upload-perm {
+    /// Single-shot `PutObject`.
+    put,
+    /// The multipart quartet (create / upload-part / complete / abort) — resumable / large uploads.
+    multipart,
+  }
+
+  /// What the credential is bound to: exactly ONE object key, or a key prefix. A single-key credential
+  /// is the browser-UGC shape (create-only unless content-addressed); a prefix credential is the
+  /// bulk-agent shape. Exactly one must be set at the WIT boundary (both / neither is `invalid-request`).
+  record upload-target {
+    /// The single object key the credential may write (mutually exclusive with `prefix`).
+    key: option<string>,
+    /// The key prefix the credential may write under (mutually exclusive with `key`).
+    prefix: option<string>,
+  }
+
+  /// The upload constraints stamped into the credential. On the LOCAL S3 face these are hard,
+  /// fail-closed checks; on a CLOUD store some may be advisory (a store may not cap object size in a
+  /// session policy) — the returned credential's `enforced` vs `advisory` lists say which are which,
+  /// and content-addressing (`require-sha256`) is the strong cross-cloud enforcement.
+  record upload-constraints {
+    /// Max object size in bytes; the host CLAMPS this DOWN to the operator/container ceiling (a guest
+    /// can only narrow). `none` ⇒ the ceiling applies.
+    max-bytes: option<u64>,
+    /// Required `Content-Type` (exact, or a `type/*` family); `none` ⇒ any type.
+    content-type: option<string>,
+    /// Require the object key to equal `sha256(bytes)` (content-addressing) — the strong, replay-inert,
+    /// cross-cloud enforcement. Idempotent (same bytes ⇒ same key).
+    require-sha256: bool,
+    /// Refuse to overwrite an existing key (create-only, `If-None-Match: *`-style). Defaults on for a
+    /// single-key credential (UGC); overwrite is safe only for a content-addressed key.
+    create-only: bool,
+  }
+
+  /// A request to mint an upload credential. Project + site are NOT named — the host forces them.
+  record mint-request {
+    /// The blob container to upload into (a single segment; must be in the component's
+    /// `upload_containers` allowlist).
+    container: string,
+    /// The single key OR prefix the credential is bound to.
+    target: upload-target,
+    /// The permitted operations. Empty ⇒ the host defaults to write (single-shot) only.
+    perms: list<upload-perm>,
+    /// The upload constraints (size / content-type / content-addressing / create-only).
+    constraints: upload-constraints,
+    /// Requested lifetime in seconds; the host CLAMPS it to the operator ceiling.
+    ttl-seconds: u64,
+  }
+
+  /// The self-describing minted credential the client feeds VERBATIM to its S3 SDK / a `fetch()`.
+  /// One of two shapes:
+  /// - `presigned-put` — a single, ready-to-`fetch()` PUT URL for the single-key / PUT-only / browser
+  ///   case (no SigV4-in-JS needed): the client does `fetch(url, {method, headers: required-headers,
+  ///   body})`.
+  /// - `temp-credentials` — S3 STS-style temporary credentials for the prefix / multipart / bulk case:
+  ///   the client configures any S3 SDK with these (path-style, the given region + endpoint) and uploads
+  ///   with native multipart.
+  variant credentials {
+    presigned-put(presigned-put),
+    temp-credentials(temp-credentials),
+  }
+
+  /// A one-shot presigned PUT: the client uploads with a single `fetch(url, {method, headers, body})`.
+  record presigned-put {
+    /// The absolute presigned URL to PUT to.
+    url: string,
+    /// The HTTP method (always `PUT`).
+    method: string,
+    /// Headers the client MUST send verbatim with the PUT (e.g. `content-type` when constrained).
+    required-headers: list<tuple<string, string>>,
+    /// Absolute expiry, unix seconds.
+    expires-at: u64,
+    /// Lifetime in seconds (the CLAMPED ttl) — expires-at minus now, surfaced for convenience.
+    expires-in-secs: u64,
+  }
+
+  /// S3 STS-style temporary credentials for a full S3 SDK (prefix / multipart / bulk).
+  record temp-credentials {
+    /// The public access-key id.
+    access-key-id: string,
+    /// The secret access key (handed to the client ONCE, at mint; never re-derivable elsewhere).
+    secret: string,
+    /// The opaque session token (the client passes it as `x-amz-security-token`).
+    session-token: string,
+    /// The S3 endpoint base URL the SDK targets.
+    endpoint: string,
+    /// The SigV4 region the SDK must sign under.
+    region: string,
+    /// The bucket the SDK addresses (the container; path-style).
+    bucket: string,
+    /// Whether the SDK must use path-style addressing (always `true` for the local face).
+    force-path-style: bool,
+    /// Absolute expiry, unix seconds.
+    expires-at: u64,
+    /// Lifetime in seconds (the CLAMPED ttl).
+    expires-in-secs: u64,
+    /// The constraints that are HARD-enforced for this credential (e.g. `require-sha256`,
+    /// `create-only`, and on the local face `max-bytes` / `content-type`). A human-readable list.
+    enforced: list<string>,
+    /// The constraints that are ADVISORY only for this credential's backend (a cloud store that can't
+    /// cap them in-policy). A human-readable list; content-addressing is the strong fallback.
+    advisory: list<string>,
+  }
+
+  /// Why a mint failed.
+  variant mint-error {
+    /// The `blob-upload` capability (the needed write/multipart right) was not granted, or the
+    /// container is outside the component's `upload_containers` allowlist (deny-by-default).
+    access-denied,
+    /// This invocation has no single resolved site (an `all`/anonymous/unscoped handler), so there is
+    /// no site to confine the credential to — fail-closed here, BEFORE any signing.
+    no-resolved-site,
+    /// The request was malformed (empty container, both/neither key/prefix, a zero TTL, an empty perm
+    /// set with no default, or a bad container/key segment). Carries a client-safe reason.
+    invalid-request(string),
+    /// The host failed to mint the credential (no signer / no ingress face wired / a signing failure).
+    failed(string),
+  }
+}
+
+/// The `blob-upload` capability: mint a short-lived, scoped S3 upload credential for one of this
+/// guest's OWN project+site's blob containers. Project + site are host-forced; the TTL + max-bytes are
+/// clamped to the operator ceilings; the container is checked against the component's allowlist.
+interface blob-upload {
+  use blob-upload-types.{mint-request, credentials, mint-error};
+
+  /// Mint a scoped upload credential per `request`. Returns the self-describing `credentials` variant
+  /// (a `presigned-put` for the single-key/PUT-only case, else `temp-credentials`).
+  mint: func(request: mint-request) -> result<credentials, mint-error>;
+}
+
+/// The blob-upload minting world (imported into request handlers / functions / consumers). A guest WIT
+/// addition ⇒ a shim rev + a `HOST_HANDLERS_VERSION` bump (handled in M5).
+world blob-upload-host {
+  import blob-upload;
+}
+
 /// The `target-context` capability (PLAN-delegable-capabilities Stage D): a resolver reads back the
 /// opaque app-context a verified TARGET **capability** carried (its `br_app` claim — e.g. a per-client
 /// `sub`), so it can apply its OWN within-tenant filter (`client_id = sub`). The host-forced target

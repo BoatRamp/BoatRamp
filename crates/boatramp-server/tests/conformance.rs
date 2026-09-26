@@ -1567,6 +1567,7 @@ async fn handler_route_dispatches_through_engine() {
             invoke_targets: Vec::new(),
             stats_topics: Vec::new(),
             tenant_secret_names: Vec::new(),
+            upload_containers: Vec::new(),
         }],
         ..Default::default()
     };
@@ -1690,6 +1691,7 @@ async fn cookie_auth_csrf_gate_fires_in_the_pipeline() {
             invoke_targets: Vec::new(),
             stats_topics: Vec::new(),
             tenant_secret_names: Vec::new(),
+            upload_containers: Vec::new(),
         }],
         ..Default::default()
     };
@@ -3279,6 +3281,7 @@ async fn activation_during_traffic_drops_no_requests() {
         invoke_targets: Vec::new(),
         stats_topics: Vec::new(),
         tenant_secret_names: Vec::new(),
+        upload_containers: Vec::new(),
     };
     // Two distinct deployments serving the same handler. B adds a (non-matching)
     // redirect so its manifest hashes differently — a real `current` flip.
@@ -3445,6 +3448,7 @@ async fn preview_runs_handlers_scoped_off_live_state() {
                 invoke_targets: Vec::new(),
                 stats_topics: Vec::new(),
                 tenant_secret_names: Vec::new(),
+                upload_containers: Vec::new(),
             }],
             ..Default::default()
         },
@@ -3573,6 +3577,7 @@ async fn activation_refuses_broken_component() {
                 invoke_targets: Vec::new(),
                 stats_topics: Vec::new(),
                 tenant_secret_names: Vec::new(),
+                upload_containers: Vec::new(),
             }],
             ..Default::default()
         },
@@ -3682,6 +3687,7 @@ async fn activation_refuses_a_non_consumer_component() {
                 retention_ms: None,
                 stats_topics: Vec::new(),
                 tenant_secret_names: Vec::new(),
+                upload_containers: Vec::new(),
                 topic: "orders/created".to_string(),
                 component: "consumer.wasm".to_string(),
                 imports: Vec::new(),
@@ -3808,6 +3814,7 @@ async fn activation_refuses_disallowed_import() {
                 invoke_targets: Vec::new(),
                 stats_topics: Vec::new(),
                 tenant_secret_names: Vec::new(),
+                upload_containers: Vec::new(),
             }],
             ..Default::default()
         },
@@ -3913,6 +3920,7 @@ async fn activation_refuses_oversized_component() {
                 invoke_targets: Vec::new(),
                 stats_topics: Vec::new(),
                 tenant_secret_names: Vec::new(),
+                upload_containers: Vec::new(),
             }],
             ..Default::default()
         },
@@ -4021,6 +4029,7 @@ async fn handler_route_with_sql_dispatches_through_engine() {
                 invoke_targets: Vec::new(),
                 stats_topics: Vec::new(),
                 tenant_secret_names: Vec::new(),
+                upload_containers: Vec::new(),
             }],
             ..Default::default()
         },
@@ -4154,6 +4163,7 @@ async fn handler_opens_named_sql_databases_with_least_privilege() {
                 invoke_targets: Vec::new(),
                 stats_topics: Vec::new(),
                 tenant_secret_names: Vec::new(),
+                upload_containers: Vec::new(),
             }],
             ..Default::default()
         },
@@ -4283,6 +4293,7 @@ async fn per_site_timeout_cap_applies() {
                 invoke_targets: Vec::new(),
                 stats_topics: Vec::new(),
                 tenant_secret_names: Vec::new(),
+                upload_containers: Vec::new(),
             }],
             ..Default::default()
         },
@@ -4799,6 +4810,7 @@ async fn operator_endpoint_reports_invocation_and_consumer_stats() {
                 invoke_targets: Vec::new(),
                 stats_topics: Vec::new(),
                 tenant_secret_names: Vec::new(),
+                upload_containers: Vec::new(),
             }],
             consumers: vec![ConsumerConfig {
                 secrets: Vec::new(),
@@ -4808,6 +4820,7 @@ async fn operator_endpoint_reports_invocation_and_consumer_stats() {
                 retention_ms: None,
                 stats_topics: Vec::new(),
                 tenant_secret_names: Vec::new(),
+                upload_containers: Vec::new(),
                 topic: "orders/created".to_string(),
                 component: "consumer.wasm".to_string(),
                 imports: vec!["wasi:keyvalue".to_string()],
@@ -4955,6 +4968,7 @@ async fn guest_logs_captured_and_served() {
                 invoke_targets: Vec::new(),
                 stats_topics: Vec::new(),
                 tenant_secret_names: Vec::new(),
+                upload_containers: Vec::new(),
             }],
             ..Default::default()
         },
@@ -5091,6 +5105,7 @@ async fn guest_logs_suppressed_when_capture_disabled() {
                 invoke_targets: Vec::new(),
                 stats_topics: Vec::new(),
                 tenant_secret_names: Vec::new(),
+                upload_containers: Vec::new(),
             }],
             ..Default::default()
         },
@@ -5289,6 +5304,7 @@ async fn handler_env_injected_host_env_not_inherited() {
                 invoke_targets: Vec::new(),
                 stats_topics: Vec::new(),
                 tenant_secret_names: Vec::new(),
+                upload_containers: Vec::new(),
             }],
             ..Default::default()
         },
@@ -5415,6 +5431,7 @@ async fn handler_secret_allowlist_scopes_the_site_pool_end_to_end() {
                     invoke_targets: Vec::new(),
                     stats_topics: Vec::new(),
                     tenant_secret_names: Vec::new(),
+                    upload_containers: Vec::new(),
                 }],
                 ..Default::default()
             },
@@ -6969,6 +6986,7 @@ async fn mesh_dispatch(
                 invoke_targets,
                 stats_topics: Vec::new(),
                 tenant_secret_names: Vec::new(),
+                upload_containers: Vec::new(),
             }],
             ..Default::default()
         },
@@ -7157,6 +7175,7 @@ async fn federation_gateway_stitches_real_subgraph_functions() {
                 invoke_targets: Vec::new(),
                 stats_topics: Vec::new(),
                 tenant_secret_names: Vec::new(),
+                upload_containers: Vec::new(),
             }],
             ..Default::default()
         },
@@ -7298,6 +7317,7 @@ async fn federation_gateway_executes_a_mutation_forwarding_its_argument() {
                 invoke_targets: Vec::new(),
                 stats_topics: Vec::new(),
                 tenant_secret_names: Vec::new(),
+                upload_containers: Vec::new(),
             }],
             ..Default::default()
         },
@@ -7430,6 +7450,7 @@ async fn graphql_edge_is_scoped_to_the_endpoint_route_not_the_whole_site() {
         invoke_targets: Vec::new(),
         stats_topics: Vec::new(),
         tenant_secret_names: Vec::new(),
+        upload_containers: Vec::new(),
     };
     let manifest = Manifest {
         files,
@@ -7666,6 +7687,7 @@ async fn edge_visibility_hides_an_internal_op_from_the_external_edge() {
                 invoke_targets: Vec::new(),
                 stats_topics: Vec::new(),
                 tenant_secret_names: Vec::new(),
+                upload_containers: Vec::new(),
             }],
             ..Default::default()
         },
@@ -7884,6 +7906,7 @@ async fn graphql_data_connector_serves_from_the_database_with_row_isolation() {
                 invoke_targets: Vec::new(),
                 stats_topics: Vec::new(),
                 tenant_secret_names: Vec::new(),
+                upload_containers: Vec::new(),
             }],
             ..Default::default()
         },
@@ -8134,6 +8157,7 @@ async fn graphql_data_connector_delegates_a_field_to_a_wasm_function() {
                 invoke_targets: Vec::new(),
                 stats_topics: Vec::new(),
                 tenant_secret_names: Vec::new(),
+                upload_containers: Vec::new(),
             }],
             ..Default::default()
         },
@@ -8283,6 +8307,7 @@ async fn graphql_data_connector_mutations_write_with_row_isolation() {
                 invoke_targets: Vec::new(),
                 stats_topics: Vec::new(),
                 tenant_secret_names: Vec::new(),
+                upload_containers: Vec::new(),
             }],
             ..Default::default()
         },
@@ -8501,6 +8526,7 @@ async fn federation_composes_a_sql_subgraph_with_a_wasm_subgraph() {
                 invoke_targets: Vec::new(),
                 stats_topics: Vec::new(),
                 tenant_secret_names: Vec::new(),
+                upload_containers: Vec::new(),
             }],
             ..Default::default()
         },
@@ -8654,6 +8680,7 @@ async fn registering_a_sql_subgraph_via_the_admin_api_composes_and_serves() {
                 invoke_targets: Vec::new(),
                 stats_topics: Vec::new(),
                 tenant_secret_names: Vec::new(),
+                upload_containers: Vec::new(),
             }],
             ..Default::default()
         },
@@ -8906,6 +8933,7 @@ async fn graphql_data_connector_isolates_by_a_verified_app_token_claim() {
                 invoke_targets: Vec::new(),
                 stats_topics: Vec::new(),
                 tenant_secret_names: Vec::new(),
+                upload_containers: Vec::new(),
             }],
             ..Default::default()
         },
