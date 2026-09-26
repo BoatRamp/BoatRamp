@@ -130,6 +130,13 @@ impl GcsBlobUploadMinter {
     /// expression confines writes to `resource.name.startsWith('projects/_/buckets/{bucket}/objects/
     /// {hblob-prefix}')`. A neutered/bucket-wide/no-condition boundary would be a finding.
     ///
+    /// **Built with `serde_json`, NOT `format!`-splicing (Security HIGH-1):** the CEL condition embeds a
+    /// host-forced-but-composed object-prefix inside single quotes; a stray `'` (or `')`) in it must
+    /// never break out of the CEL string and inject a second, broader boundary rule. `serde_json`
+    /// escapes the value into the JSON string field, so the document structure is fixed by construction
+    /// — belt-and-suspenders with the charset screen at the mint choke point
+    /// ([`screen_upload_target`](boatramp_handlers::screen_upload_target), which rejects `'`/`"`).
+    ///
     /// Pure + deterministic ⇒ unit-testable without any live STS call. Returns the JSON string that goes
     /// verbatim into the `options` form field of the token-exchange request.
     pub fn cab_options_json(bucket: &str, scope: &MintScope) -> String {
@@ -140,14 +147,22 @@ impl GcsBlobUploadMinter {
             "resource.name.startsWith('projects/_/buckets/{bucket}/objects/{object_prefix}')"
         );
         let available_resource = format!("//storage.googleapis.com/projects/_/buckets/{bucket}");
-        // Hand-build the JSON so the exact byte shape is stable + greppable (the gate inspects it).
-        format!(
-            "{{\"accessBoundary\":{{\"accessBoundaryRules\":[{{\
-             \"availableResource\":\"{available_resource}\",\
-             \"availablePermissions\":[\"{GCS_OBJECT_CREATOR_ROLE}\"],\
-             \"availabilityCondition\":{{\"title\":\"boatramp-blob-ingress\",\
-             \"expression\":\"{cel}\"}}}}]}}}}"
-        )
+        // Build the document as structured JSON: the CEL expression (and the resource) are escaped
+        // string VALUES, so a metacharacter can only ever appear inside a quoted string — never as a new
+        // key or a second boundary rule. `to_string` cannot fail on this all-string value.
+        let options = serde_json::json!({
+            "accessBoundary": {
+                "accessBoundaryRules": [{
+                    "availableResource": available_resource,
+                    "availablePermissions": [GCS_OBJECT_CREATOR_ROLE],
+                    "availabilityCondition": {
+                        "title": "boatramp-blob-ingress",
+                        "expression": cel,
+                    },
+                }],
+            },
+        });
+        serde_json::to_string(&options).expect("CAB options JSON is always serializable")
     }
 
     /// The `x-www-form-urlencoded` body of the STS token-exchange (RFC 8693, Google downscoping profile).
@@ -363,5 +378,59 @@ mod tests {
         );
         assert!(advisory.contains(&"max_bytes=9000000".to_string()));
         assert!(advisory.contains(&"content_type=video/mp4".to_string()));
+    }
+
+    #[test]
+    fn unpinned_sha256_is_advisory_on_gcs_cab() {
+        // Security HIGH-2: the GCS CAB emits no checksum condition, so require_sha256 is advisory (the
+        // client uploads directly to GCS; boatramp never sees the bytes to verify `key == sha256`).
+        let c = UploadConstraints {
+            max_bytes: Some(1024),
+            require_sha256: true,
+            create_only: true,
+            ..Default::default()
+        };
+        let (enforced, advisory) = cloud::constraint_contract(&c, CloudEnforcement::NONE);
+        assert!(enforced.is_empty(), "CAB pins no hash: {enforced:?}");
+        assert!(advisory.contains(&"require_sha256".to_string()));
+        assert!(advisory.contains(&"max_bytes=1024".to_string()));
+        assert!(advisory.contains(&"create_only".to_string()));
+    }
+
+    #[test]
+    fn a_metacharacter_in_the_cab_prefix_cannot_restructure_the_boundary() {
+        // Security HIGH-1 belt-and-suspenders: a `')` in the object-prefix would, in a naive format!,
+        // close the CEL string + the JSON and let the rest inject a second, broader accessBoundaryRule.
+        // With serde_json construction it stays an escaped value inside the ONE rule's CEL string. We
+        // drive a hostile key directly past the screen (the pure builder is standalone).
+        let s = scope(
+            UploadTarget::Key(
+                "x')}]},{\"availableResource\":\"//storage.googleapis.com/projects/_/buckets/other"
+                    .into(),
+            ),
+            vec![UploadPerm::Put],
+            Default::default(),
+        );
+        let options = GcsBlobUploadMinter::cab_options_json("my-bucket", &s);
+        let v: serde_json::Value = serde_json::from_str(&options).expect("valid JSON");
+        let rules = v["accessBoundary"]["accessBoundaryRules"]
+            .as_array()
+            .expect("accessBoundaryRules array");
+        assert_eq!(rules.len(), 1, "exactly one boundary rule: {options}");
+        let cel = rules[0]["availabilityCondition"]["expression"]
+            .as_str()
+            .expect("CEL expression string");
+        // The metacharacter is confined INSIDE the single scoped CEL condition, not a new rule.
+        assert!(
+            cel.starts_with(
+                "resource.name.startsWith('projects/_/buckets/my-bucket/objects/hblob/acme/blog/photos/"
+            ),
+            "the metacharacter stayed inside the scoped CEL condition: {cel}"
+        );
+        assert_eq!(
+            rules[0]["availableResource"].as_str(),
+            Some("//storage.googleapis.com/projects/_/buckets/my-bucket"),
+            "the one rule's availableResource is the real bucket, not an injected `other`"
+        );
     }
 }
