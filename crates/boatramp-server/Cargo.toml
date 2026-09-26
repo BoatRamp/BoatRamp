@@ -58,6 +58,12 @@ migrate = ["handlers", "boatramp-handlers/migrate"]
 # (which reaches the fleet signer). Implies `handlers`. On in batteries-included builds, off in lean.
 capability = ["handlers", "boatramp-handlers/capability"]
 
+# The guest blob-upload minting capability (`boatramp:handlers/blob-upload`, S3 external ingress):
+# a guest mints a short-lived, scoped S3 upload credential for one of its OWN project+site's blob
+# containers via the `ServerBlobUploadMinter` (which reaches the fleet signer + the S3-ingress secret).
+# Implies `handlers`. On in batteries-included builds, off in lean.
+blob-upload = ["handlers", "boatramp-handlers/blob-upload"]
+
 # The duplex/resumable session capability (`boatramp:handlers/session`, PLAN-session-primitive):
 # a long-lived, client-addressable, bidirectional, resumable channel the host drives via
 # event-driven re-entry over the durable async lane. Implies `handlers`. Experimental.

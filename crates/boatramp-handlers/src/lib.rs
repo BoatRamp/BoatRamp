@@ -20,6 +20,11 @@ pub mod tenant;
 pub use bindings::Bindings;
 #[cfg(feature = "admin")]
 pub use bindings::admin::{AdminController, AdminError, DomainChallenge, Surface as AdminSurface};
+#[cfg(feature = "blob-upload")]
+pub use bindings::blob_upload::{
+    BlobUploadBinding, BlobUploadMinter, MintRefused, MintScope, MintedCredentials, PresignedPut,
+    TempCredentials, UploadConstraints, UploadPerm, UploadTarget,
+};
 #[cfg(feature = "capability")]
 pub use bindings::capability::{CapabilityBinding, CapabilityMinter};
 #[cfg(feature = "email")]

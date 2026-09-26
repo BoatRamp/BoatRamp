@@ -133,6 +133,13 @@ pub struct FunctionConfig {
     /// contains a `tenant-secrets:*` right.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tenant_secret_names: Vec<String>,
+    /// Per-component container allowlist for the guest blob-upload mint capability
+    /// (`boatramp:handlers/blob-upload`, S3 external ingress): the blob containers this function may
+    /// mint an upload credential for. Least-privilege: **empty ⇒ deny-all**. A container not in the
+    /// list is `access-denied`; the project + site are always host-forced from the resolved invocation
+    /// scope. Only consulted when `imports` contains a `blob-upload:*` right.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub upload_containers: Vec<String>,
     /// In-site tenancy decision for this function's `sql`/`orm` access (Dimension 0). Absent ⇒
     /// *undeclared* (refused under the `multi-tenant` posture, treated as `Disabled` — plain
     /// queries — under single-tenant/dev). `Scoped` opts into host-injected row scoping. Parsed via
@@ -221,6 +228,8 @@ impl FunctionConfig {
             stats_topics: h.stats_topics.clone(),
             // Carry the handler's tenant-secret name allowlist likewise (grant surface parity).
             tenant_secret_names: h.tenant_secret_names.clone(),
+            // Carry the handler's blob-upload container allowlist likewise (grant surface parity).
+            upload_containers: h.upload_containers.clone(),
             // A desugared handler-function carries its own per-handler tenancy when declared;
             // absent ⇒ inherit the site config (the dispatch path applies the site decision).
             tenancy: h.tenancy.clone(),
@@ -238,6 +247,8 @@ impl FunctionConfig {
             stats_topics: c.stats_topics.clone(),
             // Carry the consumer's tenant-secret name allowlist likewise.
             tenant_secret_names: c.tenant_secret_names.clone(),
+            // Carry the consumer's blob-upload container allowlist likewise.
+            upload_containers: c.upload_containers.clone(),
             ..Default::default()
         }
     }
@@ -993,6 +1004,7 @@ mod tests {
             invoke_targets: Vec::new(),
             stats_topics: Vec::new(),
             tenant_secret_names: Vec::new(),
+            upload_containers: Vec::new(),
         }
     }
 
@@ -1031,6 +1043,7 @@ mod tests {
                 retention_ms: None,
                 stats_topics: Vec::new(),
                 tenant_secret_names: Vec::new(),
+                upload_containers: Vec::new(),
             }],
             crons: vec![CronConfig {
                 schedule: "0 * * * *".into(),

@@ -97,6 +97,13 @@ session = ["engine", "dep:async-trait"]
 # control-plane routes compile on a lean node). This gates only the WIT interface + host binding +
 # linker. Off by default; the server turns it on inside its `handlers` feature.
 tenant-secrets = ["engine", "dep:async-trait"]
+# The `blob-upload` binding (S3-compatible external blob ingress): a guest mints a short-lived, scoped
+# S3 upload credential for one of its OWN project+site's blob containers, which an external client uses
+# to upload directly (the wasm guest then reads by key via `wasi:blobstore`). The host holds the fleet
+# signer + the S3-ingress secret and stamps project+site + clamps the TTL/max-bytes (the
+# `BlobUploadMinter` impl lives a layer up, boatramp-server); this gates only the WIT interface + the
+# object-safe minter seam + linker. Off by default; the server turns it on inside its `handlers` feature.
+blob-upload = ["engine", "dep:async-trait"]
 
 [dependencies]
 boatramp-core.workspace = true

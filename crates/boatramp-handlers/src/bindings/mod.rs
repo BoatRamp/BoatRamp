@@ -22,6 +22,12 @@ use boatramp_core::sql::SqlBackend;
 
 #[cfg(feature = "admin")]
 pub mod admin;
+/// The guest blob-upload mint binding (`boatramp:handlers/blob-upload`, S3 external ingress): a guest
+/// mints a short-lived, scoped S3 upload credential for one of its OWN project+site's blob containers.
+/// Its own off-by-default `blob-upload` feature (the S3-ingress security core lives in boatramp-server,
+/// so the control-plane path compiles without it).
+#[cfg(feature = "blob-upload")]
+pub mod blob_upload;
 pub mod blobstore;
 #[cfg(feature = "capability")]
 pub mod capability;
@@ -106,6 +112,12 @@ pub struct Bindings {
     /// the operator TTL ceiling. `None` = capability minting not granted.
     #[cfg(feature = "capability")]
     capability: Option<capability::CapabilityBinding>,
+    /// The `blob-upload` grant (mint a scoped S3 upload credential): the project+site-forced minter +
+    /// the operator TTL/max-bytes ceilings + the per-component container allowlist + the two
+    /// independent rights (write/multipart). `None` = blob-upload minting not granted (`mint` ⇒
+    /// `access-denied`).
+    #[cfg(feature = "blob-upload")]
+    blob_upload: Option<blob_upload::BlobUploadBinding>,
     /// The `session` grant (duplex/resumable session): the controller bound to the current
     /// session. `None` = session not granted.
     #[cfg(feature = "session")]
@@ -447,6 +459,48 @@ impl Bindings {
     #[cfg(feature = "capability")]
     pub(crate) fn capability(&self) -> Option<&capability::CapabilityBinding> {
         self.capability.as_ref()
+    }
+
+    /// Grant the `blob-upload` capability (S3 external ingress): `minter` signs + assembles a scoped S3
+    /// upload credential (reaching the fleet signer + the ingress secret host-side); `project` +
+    /// `site` are host-stamped as the credential's FORCED scope (the guest never names them — a `None`
+    /// site ⇒ every `mint` is `no-resolved-site`); `max_ttl_secs` / `max_bytes_ceiling` are the
+    /// operator ceilings the mint clamps to; `allow_containers` is the component's `upload_containers`
+    /// allowlist (empty ⇒ deny-all); `can_write`/`can_multipart` are the two INDEPENDENT rights
+    /// (`blob-upload:write` / `blob-upload:multipart`). Deny-by-default: without this grant `mint` is
+    /// `access-denied`.
+    #[cfg(feature = "blob-upload")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_blob_upload(
+        mut self,
+        project: impl Into<String>,
+        site: Option<String>,
+        minter: Arc<dyn blob_upload::BlobUploadMinter>,
+        max_ttl_secs: u64,
+        max_bytes_ceiling: Option<u64>,
+        allow_containers: Vec<String>,
+        can_write: bool,
+        can_multipart: bool,
+    ) -> Self {
+        self.blob_upload = Some(blob_upload::BlobUploadBinding {
+            project: project.into(),
+            site,
+            minter,
+            max_ttl_secs,
+            max_bytes_ceiling,
+            allow_containers,
+            can_write,
+            can_multipart,
+        });
+        self
+    }
+
+    /// The granted `blob-upload` binding, if any. Public so a host-side caller (a live-gate test) can
+    /// drive the real minter without a wasm guest, mirroring [`capability`](Self::capability) /
+    /// [`tenant_secrets`](Self::tenant_secrets).
+    #[cfg(feature = "blob-upload")]
+    pub fn blob_upload(&self) -> Option<&blob_upload::BlobUploadBinding> {
+        self.blob_upload.as_ref()
     }
 
     /// Bind the `session` grant: the controller for the current session (host-bound, so the guest
