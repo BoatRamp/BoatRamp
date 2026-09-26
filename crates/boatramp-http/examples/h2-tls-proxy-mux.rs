@@ -139,10 +139,10 @@ mod linux {
     fn content_length(head: &[u8]) -> Option<usize> {
         let s = std::str::from_utf8(head).ok()?;
         for line in s.split("\r\n") {
-            if let Some((k, v)) = line.split_once(':') {
-                if k.trim().eq_ignore_ascii_case("content-length") {
-                    return v.trim().parse().ok();
-                }
+            if let Some((k, v)) = line.split_once(':')
+                && k.trim().eq_ignore_ascii_case("content-length")
+            {
+                return v.trim().parse().ok();
             }
         }
         None

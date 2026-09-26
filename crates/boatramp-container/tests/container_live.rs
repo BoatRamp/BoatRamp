@@ -186,11 +186,11 @@ async fn container_live_launch_and_hold() {
         if let Ok(out) = std::process::Command::new("curl")
             .args(["-s", "--max-time", "2", &url])
             .output()
+            && out.status.success()
+            && !out.stdout.is_empty()
         {
-            if out.status.success() && !out.stdout.is_empty() {
-                nonce = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                break;
-            }
+            nonce = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            break;
         }
         std::thread::sleep(Duration::from_millis(500));
     }
@@ -314,21 +314,20 @@ async fn run_pg_e2e(host_root: bool) {
 
     // Also confirm the pgvector extension is installable (the whole point of the image).
     let mut ext = false;
-    if ok {
-        if let Ok(out) = std::process::Command::new("psql")
+    if ok
+        && let Ok(out) = std::process::Command::new("psql")
             .args([
                 &conn,
                 "-tAc",
                 "create extension if not exists vector; select extversion from pg_extension where extname='vector'",
             ])
             .output()
-        {
-            ext = out.status.success() && !out.stdout.is_empty();
-            eprintln!(
-                "pgvector extension: {}",
-                String::from_utf8_lossy(&out.stdout).trim()
-            );
-        }
+    {
+        ext = out.status.success() && !out.stdout.is_empty();
+        eprintln!(
+            "pgvector extension: {}",
+            String::from_utf8_lossy(&out.stdout).trim()
+        );
     }
 
     let _ = backend.stop(&inst.handle).await;
@@ -371,10 +370,10 @@ fn probe_nonce(host: &str, port: u16) -> String {
         if let Ok(out) = std::process::Command::new("curl")
             .args(["-s", "--max-time", "2", &url])
             .output()
+            && out.status.success()
+            && !out.stdout.is_empty()
         {
-            if out.status.success() && !out.stdout.is_empty() {
-                return String::from_utf8_lossy(&out.stdout).trim().to_string();
-            }
+            return String::from_utf8_lossy(&out.stdout).trim().to_string();
         }
         std::thread::sleep(Duration::from_millis(500));
     }

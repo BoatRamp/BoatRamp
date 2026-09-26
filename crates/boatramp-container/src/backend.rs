@@ -1795,10 +1795,9 @@ async fn net_debug_dump(
                                     if let netlink_packet_route::address::AddressAttribute::Address(
                                         addr,
                                     ) = attr
+                                        && addr.is_ipv4()
                                     {
-                                        if addr.is_ipv4() {
-                                            addrs.push(format!("{addr}/{prefix}"));
-                                        }
+                                        addrs.push(format!("{addr}/{prefix}"));
                                     }
                                 }
                             }
@@ -1936,22 +1935,23 @@ fn parse_fib_trie_locals(trie: &str) -> Vec<String> {
         let trimmed = line.trim_start_matches([' ', '|', '+', '-']);
         let trimmed = trimmed.trim();
         // A leaf address line: the token after the tree glyphs is a bare IPv4 literal.
-        if let Some(first) = trimmed.split_whitespace().next() {
-            if first.parse::<Ipv4Addr>().is_ok() {
-                current_ip = Some(first.to_string());
-                continue;
-            }
+        if let Some(first) = trimmed.split_whitespace().next()
+            && first.parse::<Ipv4Addr>().is_ok()
+        {
+            current_ip = Some(first.to_string());
+            continue;
         }
         // A prefix line under the current leaf: `/<plen> <scope> <type>`.
-        if trimmed.starts_with('/') && trimmed.contains("LOCAL") {
-            if let Some(ip) = &current_ip {
-                let plen = trimmed
-                    .split_whitespace()
-                    .next()
-                    .unwrap_or("")
-                    .trim_start_matches('/');
-                out.push(format!("{ip}/{plen}"));
-            }
+        if trimmed.starts_with('/')
+            && trimmed.contains("LOCAL")
+            && let Some(ip) = &current_ip
+        {
+            let plen = trimmed
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .trim_start_matches('/');
+            out.push(format!("{ip}/{plen}"));
         }
     }
     out

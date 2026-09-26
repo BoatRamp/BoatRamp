@@ -251,10 +251,10 @@ fn grandchild_exec(argv: &[String], out_w: i32, err_w: i32, stdin_r: Option<i32>
     if err_w > 2 {
         let _ = close(err_w);
     }
-    if let Some(fd) = stdin_r {
-        if fd > 2 {
-            let _ = close(fd);
-        }
+    if let Some(fd) = stdin_r
+        && fd > 2
+    {
+        let _ = close(fd);
     }
 
     // Run from the container root (the joined mount namespace's `/`), so a relative
