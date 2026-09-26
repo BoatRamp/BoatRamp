@@ -49,6 +49,16 @@ pub const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934c
 /// a stateful nonce cache. Mirrors the spirit of `cose::POP_SKEW_SECS`/`POP_WINDOW_SECS`.
 pub const MAX_CLOCK_SKEW_SECS: i64 = 300;
 
+/// Hard upper bound on the byte size a single aws-chunked chunk may declare in its header
+/// (`<hex-size>;chunk-signature=…`). 16 MiB — real S3 SDKs chunk at ≤8 MiB, so this is comfortably
+/// above any honest client while refusing a hostile header. This is a **security invariant, not a
+/// policy knob** (M2-review MEDIUM-1): `parse_chunk_header` parses the declared size with
+/// `usize::from_str_radix(.., 16)`, so an unbounded value near `usize::MAX` would let the downstream
+/// `data_start + size` / `data_end + 2` framing math in `chunked::take_one_chunk` wrap (release
+/// builds have no overflow checks) and panic on a bad slice range. A declared size over this bound is
+/// rejected up front as a [`SigV4Error::MalformedChunk`].
+pub const MAX_CHUNK_SIZE: usize = 16 * 1024 * 1024;
+
 /// A SigV4 verification/signing failure. **Uniform to the client**: the M2 face maps every variant
 /// to one indistinguishable 403 (`BoatrampSignatureMismatch`-class), so an attacker cannot learn
 /// *which* check failed. The variants are for host-side logs + these unit tests only.
@@ -651,6 +661,12 @@ pub fn parse_chunk_header(line: &str) -> Result<(usize, String), SigV4Error> {
     let (size_hex, rest) = line.split_once(';').ok_or(SigV4Error::MalformedChunk)?;
     let size =
         usize::from_str_radix(size_hex.trim(), 16).map_err(|_| SigV4Error::MalformedChunk)?;
+    // Bound the declared size (M2-review MEDIUM-1): an unbounded `size` near `usize::MAX` would make
+    // the framing math (`data_start + size`, `data_end + 2`) wrap and panic downstream. A honest SDK
+    // never declares more than a few MiB per chunk, so anything over `MAX_CHUNK_SIZE` is malformed.
+    if size > MAX_CHUNK_SIZE {
+        return Err(SigV4Error::MalformedChunk);
+    }
     let sig = rest
         .trim()
         .strip_prefix("chunk-signature=")
@@ -1399,6 +1415,30 @@ mod tests {
         assert_eq!(
             parse_chunk_header("1;chunk-signature=").unwrap_err(),
             SigV4Error::MalformedChunk
+        );
+    }
+
+    #[test]
+    fn parse_chunk_header_bounds_the_declared_size_no_overflow_panic() {
+        // M2-review MEDIUM-1: a hostile chunk header declaring an enormous size must yield a clean
+        // `Err(MalformedChunk)`, NOT a parse-then-overflow panic downstream.
+        // `ffffffffffffffff` = usize::MAX on a 64-bit target — the exact wrap-inducing value.
+        assert_eq!(
+            parse_chunk_header("ffffffffffffffff;chunk-signature=abc").unwrap_err(),
+            SigV4Error::MalformedChunk,
+            "a size ≈ usize::MAX must be rejected, not parsed"
+        );
+        // Exactly at the bound is accepted; one byte over is rejected.
+        let at = format!("{MAX_CHUNK_SIZE:x};chunk-signature=abc");
+        assert_eq!(
+            parse_chunk_header(&at).unwrap(),
+            (MAX_CHUNK_SIZE, "abc".to_string())
+        );
+        let over = format!("{:x};chunk-signature=abc", MAX_CHUNK_SIZE + 1);
+        assert_eq!(
+            parse_chunk_header(&over).unwrap_err(),
+            SigV4Error::MalformedChunk,
+            "one byte over MAX_CHUNK_SIZE must be rejected"
         );
     }
 }

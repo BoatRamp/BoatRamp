@@ -22,7 +22,7 @@
 //! never from the URL authority or a client header — so cross-container / cross-project is
 //! structurally impossible.
 
-use boatramp_core::project::{ProjectRef, validate_object_key};
+use boatramp_core::project::{ProjectRef, validate_object_key, validate_resource_name};
 
 /// The reserved staging-namespace segment for in-flight multipart uploads. It lives under the
 /// case-folded `.boatramp*` namespace that [`validate_object_key`] reserves — so a client object key
@@ -106,6 +106,13 @@ pub enum KeyError {
     /// `.boatramp*`, backslash, `*`, or a control byte) — a scope-escape attempt.
     #[error("object key escapes its scoped prefix: {0}")]
     ScopeEscape(String),
+    /// The scope's `container` is not a single safe path segment (empty, `.`/`..`, a `/`-escape, `*`,
+    /// whitespace, or a control byte) — a container-tree escape. Screened HERE at the S3-face choke
+    /// point (M2-review MEDIUM-2) so **cloud** backends are covered too (the `fs::resolve` backstop is
+    /// fs-only, and the object *key* being screened does not screen the *container*). Maps to the same
+    /// greppable `BoatrampScopeEscape` S3 code as [`ScopeEscape`](KeyError::ScopeEscape).
+    #[error("container escapes its scoped tree: {0}")]
+    ContainerEscape(String),
 }
 
 /// **The choke point.** Given a raw (wire, percent-encoded) object key from the URL and the
@@ -121,6 +128,13 @@ pub fn compose_object_key(
     container: &str,
     raw_wire_key: &str,
 ) -> Result<(String, String), KeyError> {
+    // Screen the container as a single safe segment BEFORE composing the prefix (M2-review MEDIUM-2).
+    // The scope's `container` is re-anchored verbatim into `hblob/{qualified_site}/{container}/`; a
+    // token whose container were `"../victim"` or `"a/b"` would otherwise escape the container tree —
+    // the object *key* is screened but the *container* is not. This is the S3-face choke point the
+    // folded Scope-confinement condition assigns the check to, so cloud backends are covered.
+    validate_resource_name("container", container)
+        .map_err(|e| KeyError::ContainerEscape(e.to_string()))?;
     let decoded = percent_decode_once(raw_wire_key);
     validate_object_key(&decoded).map_err(|e| KeyError::ScopeEscape(e.to_string()))?;
     let storage_key = format!("{}{decoded}", container_prefix(project, site, container));
@@ -200,6 +214,36 @@ mod tests {
         let part = staging_part_key("default", "s", "c", "UPLOADID", 3);
         assert_eq!(part, "hblob/s/c/.boatramp-uploads/UPLOADID/part-00000003");
         assert!(part.contains("/.boatramp-uploads/"));
+    }
+
+    #[test]
+    fn rejects_a_container_that_escapes_its_tree() {
+        // M2-review MEDIUM-2: the scope's `container` is re-anchored verbatim into the prefix, so it
+        // MUST be a single safe segment. A traversal container (`../x`) or a multi-segment container
+        // (`a/b`) escapes the container tree and is refused at compose (mapped to BoatrampScopeEscape
+        // by the face). The URL bucket can't carry a `/`, so this can only arrive via a crafted token
+        // scope — which is exactly what we drive here by passing the container directly.
+        assert!(matches!(
+            compose_object_key("default", "s", "../x", "k").unwrap_err(),
+            KeyError::ContainerEscape(_)
+        ));
+        assert!(matches!(
+            compose_object_key("default", "s", "a/b", "k").unwrap_err(),
+            KeyError::ContainerEscape(_)
+        ));
+        // Other single-segment escapes are also refused: empty, `.`/`..`, `*`, whitespace, control.
+        for bad in ["", ".", "..", "*", "a b", "a\0b", "a\\b"] {
+            assert!(
+                matches!(
+                    compose_object_key("default", "s", bad, "k"),
+                    Err(KeyError::ContainerEscape(_))
+                ),
+                "container {bad:?} must be refused as a container escape"
+            );
+        }
+        // A normal single-segment container still composes fine.
+        let (_, key) = compose_object_key("default", "s", "photos", "k").unwrap();
+        assert_eq!(key, "hblob/s/photos/k");
     }
 
     #[test]
