@@ -88,6 +88,12 @@ pub struct HostTenancy {
     /// scope predicate. Empty for an own/session principal or an anonymous `domain`/`handle` target.
     /// (PLAN-delegable-capabilities Stage D.)
     target_context: std::collections::BTreeMap<String, String>,
+    /// **Per-route write-global allowlist** (#503, strict opt-in). The plain-`Unscoped` table names
+    /// this route may WRITE unstamped — carried onto the per-invocation [`Scope`] (so the ORM
+    /// [`write_target`](boatramp_core::orm::Scope) consults it) AND consulted on the raw-SQL surface
+    /// ([`write_axis_is_global`](Self::write_axis_is_global)) so BOTH surfaces AGREE (the CRITICAL
+    /// cross-surface parity). Empty for a route that lists none / a target principal.
+    unscoped_writes: std::collections::BTreeSet<String>,
 }
 
 impl HostTenancy {
@@ -129,7 +135,23 @@ impl HostTenancy {
             write,
             keys: boatramp_core::orm::TableKeys::Uniform,
             target_context: std::collections::BTreeMap::new(),
+            unscoped_writes: std::collections::BTreeSet::new(),
         }
+    }
+
+    /// Attach this route's #503 per-route write-global allowlist (its
+    /// [`Tenancy::Scoped::unscoped_writes`](boatramp_core::tenancy::Tenancy)) — the plain-`Unscoped`
+    /// table names it may write unstamped. A builder so the common (empty) path and every test caller
+    /// need not name it. Threaded onto [`orm_scope`](Self::orm_scope)'s [`Scope`] AND consulted on the
+    /// raw-SQL surface, so the two surfaces agree. A no-op sink for a target principal (a target route
+    /// carries none; its writes to a global are refused regardless).
+    #[must_use]
+    pub fn with_unscoped_writes(
+        mut self,
+        unscoped_writes: impl IntoIterator<Item = String>,
+    ) -> Self {
+        self.unscoped_writes = unscoped_writes.into_iter().collect();
+        self
     }
 
     /// Build the **target-read** tenancy for a host-resolved target tenant `B` (R4/D8): a principal
@@ -205,6 +227,9 @@ impl HostTenancy {
                 require_public,
             },
             target_context: std::collections::BTreeMap::new(),
+            // A target route carries no per-route write-global allowlist (#503 is a `Scoped`-variant
+            // field); a target write to a global stays refused regardless.
+            unscoped_writes: std::collections::BTreeSet::new(),
         }
     }
 
@@ -322,7 +347,48 @@ impl HostTenancy {
                     Some(ResolvedScope::Column(c)) => Some(c.clone()),
                     Some(ResolvedScope::TenantOrSession { tenant, .. })
                     | Some(ResolvedScope::TenantOrBase { tenant }) => Some(tenant.clone()),
-                    Some(ResolvedScope::Unscoped) | None => None,
+                    // A global (plain `Unscoped` or write-global `SharedWritable`) has no per-tenant
+                    // column — no GUC to derive; undeclared/absent likewise.
+                    Some(ResolvedScope::Unscoped | ResolvedScope::SharedWritable) | None => None,
+                }
+            }
+        }
+    }
+
+    /// **#503 cross-surface parity.** Whether a raw-SQL WRITE to `table` is a permitted *global*
+    /// write — i.e. it lands in the ORM `write_target`'s "allow, no tenant stamp" arms, so the
+    /// raw-SQL path must AGREE: exempt it from the required-`{scope}`-marker rule and inject no
+    /// tenant predicate/GUC. Mirrors [`write_target`](boatramp_core::orm::Scope)'s arms EXACTLY,
+    /// resolving the table's scope FRESH from the per-table keys (the G1 drift guard — a
+    /// listed-but-now-tenant table returns `false` here, so it stays marker-required and scoped):
+    /// - **arm 2** — the table resolves to `SharedWritable` (write-global kind) and this is not a
+    ///   target principal; or
+    /// - **arm 3** — the table resolves to plain `Unscoped` and is listed in this route's
+    ///   `unscoped_writes` and this is not a target principal.
+    ///
+    /// `false` for a `Uniform` (legacy no-schema) principal (there is no `Unscoped`/`SharedWritable`
+    /// resolution — every table scopes on `column`), a plain-`Unscoped`-not-listed table
+    /// (deny-by-default — stays marker-required), a tenant/undeclared table, and any target
+    /// principal (the HIGH condition — a target write to a global is refused, so it is never exempt).
+    pub fn write_axis_is_global(&self, table: &str) -> bool {
+        use boatramp_core::orm::TableKeys;
+        use boatramp_core::tenancy::ResolvedScope;
+        // A target principal is never exempt — a target write to a global is refused (HIGH); the ORM
+        // refuses it, so the raw path must keep it marker-required too.
+        if self.is_target() {
+            return false;
+        }
+        match &self.keys {
+            // Legacy single-column: no global resolution exists (every table scopes on `column`).
+            TableKeys::Uniform => false,
+            TableKeys::PerTable(m) | TableKeys::PerTableTarget { keys: m, .. } => {
+                match m.get(table) {
+                    // arm 2: write-global kind.
+                    Some(ResolvedScope::SharedWritable) => true,
+                    // arm 3: plain global listed by this route (fresh resolve is the guard).
+                    Some(ResolvedScope::Unscoped) => self.unscoped_writes.contains(table),
+                    // tenant / disjunct / base / undeclared → stays scoped (marker required).
+                    _ => false,
                 }
             }
         }
@@ -388,6 +454,9 @@ impl HostTenancy {
             session,
             mode,
             keys: self.keys.clone(),
+            // #503: carry this route's per-route write-global allowlist onto the scope so the ORM
+            // `write_target` can admit a listed plain-`Unscoped` write unstamped (arm 3).
+            unscoped_writes: self.unscoped_writes.clone(),
         }))
     }
 
@@ -587,7 +656,7 @@ mod tests {
         );
         schema
             .tables
-            .insert("countries".into(), TableScope::Unscoped);
+            .insert("countries".into(), TableScope::Unscoped { writable: false });
         let ht = HostTenancy::new(
             "tenant_id",
             Some(t("acme")),
@@ -638,6 +707,75 @@ mod tests {
             TableKeys::PerTable(m) => assert!(m.is_empty(), "deny-all is an empty PerTable map"),
             other => panic!("deny-all must be PerTable(empty), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn write_axis_is_global_mirrors_the_orm_arms_and_is_drift_safe() {
+        // #503: the raw-SQL classification MUST mirror `write_target`'s allow arms exactly, resolving
+        // the table fresh from the schema (G1). Build a schema with a tenant `orders`, a plain global
+        // `countries`, and a write-global `oauth_state`.
+        use boatramp_core::tenancy::{TableScope, TenancySchema};
+        let mut schema = TenancySchema::default();
+        schema.tables.insert("orders".into(), TableScope::Tenant);
+        schema
+            .tables
+            .insert("countries".into(), TableScope::Unscoped { writable: false });
+        schema.tables.insert(
+            "oauth_state".into(),
+            TableScope::Unscoped { writable: true },
+        );
+        let build = |list: &[&str]| {
+            HostTenancy::new(
+                "tenant_id",
+                Some(t("acme")),
+                AccessMode::Own,
+                AccessMode::Own,
+            )
+            .with_schema(Some(&schema))
+            .with_unscoped_writes(list.iter().map(ToString::to_string))
+        };
+
+        let none = build(&[]);
+        // arm 2: write-global kind is exempt with NO list needed.
+        assert!(none.write_axis_is_global("oauth_state"));
+        // plain global not listed → NOT exempt (deny-by-default, marker-required).
+        assert!(!none.write_axis_is_global("countries"));
+        // tenant table → never exempt.
+        assert!(!none.write_axis_is_global("orders"));
+        // undeclared → never exempt.
+        assert!(!none.write_axis_is_global("secrets"));
+
+        // arm 3: a listed plain global is exempt; a listed TENANT table is NOT (G1 fresh resolve —
+        // the list entry is inert unless the table still resolves to plain `Unscoped`).
+        let listed = build(&["countries", "orders"]);
+        assert!(listed.write_axis_is_global("countries"));
+        assert!(
+            !listed.write_axis_is_global("orders"),
+            "G1: a listed-but-tenant table must NOT be exempted on the raw surface"
+        );
+
+        // A `Uniform` (no-schema legacy) principal has no global resolution → never exempt.
+        let uniform = HostTenancy::new(
+            "tenant_id",
+            Some(t("acme")),
+            AccessMode::Own,
+            AccessMode::Own,
+        )
+        .with_unscoped_writes(["oauth_state".to_string()]);
+        assert!(!uniform.write_axis_is_global("oauth_state"));
+
+        // HIGH: a target principal is NEVER exempt (a target write to a global is refused).
+        let target = HostTenancy::target(
+            SqlValue::Text("B".into()),
+            AccessMode::Own,
+            &schema,
+            "",
+            &["state".to_string()],
+            false,
+        )
+        .with_unscoped_writes(["oauth_state".to_string(), "countries".to_string()]);
+        assert!(!target.write_axis_is_global("oauth_state"));
+        assert!(!target.write_axis_is_global("countries"));
     }
 
     #[test]

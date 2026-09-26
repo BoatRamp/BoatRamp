@@ -587,6 +587,25 @@ fn apply_scope_marker(
             .rewrite_target_read(&neutralised, dialect)
             .map_err(|e| SqlError::Other(e.reason()));
     }
+    // #503 cross-surface parity: a WRITE to a write-global / route-listed (`unscoped_writes`) table
+    // is the raw-SQL analog of the ORM `write_target`'s "allow, no tenant stamp" arms. It must AGREE
+    // with the ORM — exempt from the required-`{scope}`-marker rule and injecting no tenant predicate
+    // (like `all`) — so ORM and raw SQL cannot diverge. The write table is resolved from the parsed
+    // statement (fail-closed: an unresolvable table is NOT global, so the marker stays required) and
+    // its scope is resolved FRESH from the per-table keys inside `write_axis_is_global` (the G1 drift
+    // guard). A plain-`Unscoped`-not-listed write is NOT exempt — it stays scoped/marker-required
+    // (today's fail-closed behavior). A DELETE of a global table is likewise exempt; a tenant table
+    // stays scoped. The NON-RLS (libsql) backend has no GUC backstop, so this exemption IS the
+    // whole story there: a global write lands unstamped, a non-global write stays marker-required.
+    if matches!(axis, crate::tenant::Axis::Write)
+        && let Some(table) = boatramp_core::target_sql::extract_raw_write_table(&statement, dialect)
+        && ht.write_axis_is_global(&table)
+    {
+        // Neutralise a stray/copied marker (a global write carries no tenant predicate) and inject
+        // NOTHING — byte-identical to the `all` write path's no-tenant-stamp, but authorized by the
+        // TABLE's global scope rather than an `all` grant, so the READ axis stays strict `own`.
+        return Ok(statement.replace(SCOPE_MARKER, "1 = 1"));
+    }
     let (pred, values) = ht
         .sql_marker(axis, params.len())
         .map_err(|d| SqlError::Other(d.reason().to_string()))?;
@@ -1264,6 +1283,185 @@ mod tests {
                 .iter()
                 .any(|l| l.contains("SELECT 1 WHERE 1 = 1"))
         );
+    }
+
+    // ---- #503: raw-SQL / ORM cross-surface parity for write-global + unscoped_writes ----------
+
+    /// A `PerTable` schema-backed scoped session (write:`Own`, read:`Own`) over `label` with:
+    /// `orders` = tenant, `countries` = plain `Unscoped`, `oauth_state` = write-global
+    /// (`SharedWritable`); the route lists `unscoped_writes` for the strict opt-in. `dialect` picks
+    /// the SQLite (libsql, non-RLS) vs Postgres backend so the parity is asserted on BOTH engines.
+    fn scoped_schema_session(
+        log: Log,
+        unscoped_writes: &[&str],
+        dialect: boatramp_core::sql::Dialect,
+    ) -> SqlSession {
+        use boatramp_core::tenancy::{TableScope, TenancySchema};
+        use std::collections::{BTreeMap, HashMap};
+        let schema = TenancySchema {
+            default_tenant_key: "tenant_id".into(),
+            tables: BTreeMap::from([
+                ("orders".into(), TableScope::Tenant),
+                ("countries".into(), TableScope::Unscoped { writable: false }),
+                (
+                    "oauth_state".into(),
+                    TableScope::Unscoped { writable: true },
+                ),
+            ]),
+            ..Default::default()
+        };
+        let ht = crate::tenant::HostTenancy::new(
+            "tenant_id",
+            Some(SqlValue::Text("ten_1".into())),
+            boatramp_core::tenancy::AccessMode::Own,
+            boatramp_core::tenancy::AccessMode::Own,
+        )
+        .with_schema(Some(&schema))
+        .with_unscoped_writes(unscoped_writes.iter().map(ToString::to_string));
+        let mut map: HashMap<String, Arc<dyn SqlBackend>> = HashMap::new();
+        map.insert(
+            String::new(),
+            Arc::new(RlsBackend {
+                injects: false,
+                log,
+                dialect,
+                rls: None,
+            }),
+        );
+        SqlSession::for_backends(map).with_tenancy(Some(ht))
+    }
+
+    #[tokio::test]
+    async fn m7_raw_sql_write_global_is_exempt_from_the_marker_on_both_engines() {
+        use boatramp_core::sql::Dialect;
+        // M7 (CRITICAL): a raw-SQL INSERT into a write-global (`oauth_state`) table needs NO `{scope}`
+        // marker and injects NO tenant predicate/param — identical to the ORM's "allow, no stamp".
+        // Asserted on SQLite (libsql, no RLS GUC backstop — this exemption IS the whole story) AND
+        // Postgres. No `unscoped_writes` needed: the KIND authorizes it.
+        for dialect in [Dialect::Sqlite, Dialect::Postgres] {
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let mut session = scoped_schema_session(log.clone(), &[], dialect);
+            let mut table = ResourceTable::new();
+            {
+                let mut host = SqlHost::new(&mut table, &mut session);
+                let db = host.open(String::new()).unwrap();
+                host.execute(
+                    db,
+                    "INSERT INTO oauth_state (state) VALUES (?1)".into(),
+                    vec![sql_types::Value::Text("csrf".into())],
+                )
+                .await
+                .unwrap();
+            }
+            let log = log.lock().unwrap();
+            let exec = log
+                .iter()
+                .find(|l| l.contains("execute INSERT INTO oauth_state"))
+                .unwrap_or_else(|| panic!("no INSERT reached the backend on {dialect:?}: {log:?}"));
+            // The write ran verbatim (only the guest's own param); NO tenant predicate/value injected.
+            assert!(
+                exec.contains("INSERT INTO oauth_state (state) VALUES (?1)")
+                    && !exec.contains("tenant_id")
+                    && !exec.contains("ten_1"),
+                "write-global raw write must be unstamped on {dialect:?}: {exec}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn m7_raw_sql_listed_plain_unscoped_is_exempt_but_unlisted_is_refused() {
+        use boatramp_core::sql::Dialect;
+        // M7 (CRITICAL): the per-route allowlist works on the raw-SQL surface too — a listed plain
+        // `Unscoped` table (`countries`) is writable unstamped, while the SAME table on a route that
+        // does NOT list it stays marker-required (deny-by-default, today's fail-closed behavior).
+        for dialect in [Dialect::Sqlite, Dialect::Postgres] {
+            // (a) `countries` listed ⇒ writable unstamped, no marker needed.
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let mut session = scoped_schema_session(log.clone(), &["countries"], dialect);
+            let mut table = ResourceTable::new();
+            {
+                let mut host = SqlHost::new(&mut table, &mut session);
+                let db = host.open(String::new()).unwrap();
+                host.execute(
+                    db,
+                    "INSERT INTO countries (code) VALUES (?1)".into(),
+                    vec![sql_types::Value::Text("US".into())],
+                )
+                .await
+                .unwrap();
+            }
+            assert!(
+                log.lock()
+                    .unwrap()
+                    .iter()
+                    .any(|l| l.contains("INSERT INTO countries (code) VALUES (?1)")
+                        && !l.contains("tenant_id")),
+                "listed plain-unscoped raw write must be unstamped on {dialect:?}"
+            );
+
+            // (b) NOT listed ⇒ the write is a scoped write to a plain global with no marker ⇒ refused
+            // fail-closed (a scoped raw write must carry the marker; a plain global has no arm to
+            // exempt it), and it never reaches the backend.
+            let log2 = Arc::new(Mutex::new(Vec::new()));
+            let mut session2 = scoped_schema_session(log2.clone(), &[], dialect);
+            let mut table2 = ResourceTable::new();
+            let mut host2 = SqlHost::new(&mut table2, &mut session2);
+            let db2 = host2.open(String::new()).unwrap();
+            let err = host2
+                .execute(
+                    db2,
+                    "INSERT INTO countries (code) VALUES (?1)".into(),
+                    vec![sql_types::Value::Text("US".into())],
+                )
+                .await
+                .unwrap_err();
+            let sql_types::Error::Other(msg) = &err else {
+                panic!("expected an Other refusal on {dialect:?}, got {err:?}");
+            };
+            assert!(
+                msg.contains("{scope}"),
+                "an unlisted plain-unscoped raw write must be refused for the missing marker on \
+                 {dialect:?}: {msg}"
+            );
+            assert!(
+                log2.lock().unwrap().is_empty(),
+                "the refused write must not reach the backend on {dialect:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn m7_raw_sql_tenant_table_stays_scoped_on_both_engines() {
+        use boatramp_core::sql::Dialect;
+        // M7 (CRITICAL): a NON-global (tenant) table stays scoped on the raw surface even when the
+        // route lists other globals — the marker is still required and the tenant predicate injected.
+        for dialect in [Dialect::Sqlite, Dialect::Postgres] {
+            let log = Arc::new(Mutex::new(Vec::new()));
+            // Route lists `oauth_state`/`countries` but `orders` is a tenant table — must stay scoped.
+            let mut session =
+                scoped_schema_session(log.clone(), &["oauth_state", "countries"], dialect);
+            let mut table = ResourceTable::new();
+            {
+                let mut host = SqlHost::new(&mut table, &mut session);
+                let db = host.open(String::new()).unwrap();
+                host.execute(
+                    db,
+                    "UPDATE orders SET status = ?1 WHERE id = ?2 AND {scope}".into(),
+                    vec![
+                        sql_types::Value::Text("paid".into()),
+                        sql_types::Value::Text("o_1".into()),
+                    ],
+                )
+                .await
+                .unwrap();
+            }
+            assert!(
+                log.lock().unwrap().iter().any(|l| l
+                    .contains("UPDATE orders SET status = ?1 WHERE id = ?2 AND tenant_id = ?3")
+                    && l.contains("ten_1")),
+                "a tenant table stays scoped on the raw surface on {dialect:?}"
+            );
+        }
     }
 
     // ---- R4/D8: a raw-SQL target read is AST-rewritten (not marker-substituted) ---------------
