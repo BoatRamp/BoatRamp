@@ -371,6 +371,26 @@ pub enum Tenancy {
         /// byte-identically. Enforced at bind via [`narrows_within_authorized`](Self::narrows_within_authorized).
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         exceed_site_ceiling: bool,
+        /// **Per-route write-global allowlist** (#503, the *strict*/least-privilege half of the
+        /// two-opt-in model). The set of plain-[`Unscoped`](TableScope::Unscoped) table names this
+        /// route may WRITE unstamped, even though the table is NOT declared
+        /// [`writable`](TableScope::Unscoped). A write of table `T` is admitted by this list **iff**
+        /// `T` resolves to [`ResolvedScope::Unscoped`] (a plain, read-only-reference global) **and**
+        /// `T ∈ unscoped_writes` — evaluated FRESH per write in
+        /// [`Scope::write_target`](crate::orm::Scope) (the G1 drift guard): if `T` is later
+        /// re-declared a tenant kind, the entry is inert and the normal tenant stamp applies, so a
+        /// listed-but-now-tenant table can NEVER be written unstamped. Reads are unaffected. Like
+        /// [`exceed_site_ceiling`](Self::Scoped::exceed_site_ceiling) it is a `Scoped`-variant
+        /// sub-field, so it is structurally unrepresentable on [`Disabled`](Self::Disabled) /
+        /// [`Target`](Self::Target) — a target route (which is [`Tenancy::Target`]) can never carry
+        /// it, making the target-write refusal (the HIGH condition) automatic on this path. The
+        /// developer's default recommendation for a sensitive/few-writer table: keep it plain
+        /// `unscoped` and list it here (least-privilege) rather than declaring it project-wide
+        /// `writable: true`. Elides when empty, so a pre-#503 config serializes byte-identically.
+        /// Validated at apply against the stored project schema (each entry must exist and resolve
+        /// to plain `Unscoped`) — a defense-in-depth 422, NOT a replacement for the runtime gate.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        unscoped_writes: Vec<String>,
     },
     /// **Target** (R4/D8): this route/handler reads (and, with a `write` grant, writes) a SECOND
     /// tenant `B`'s PUBLIC subset (never the caller's own). The non-federated (plain-wasm) analog of
@@ -419,6 +439,20 @@ impl Tenancy {
     /// own — the plain-wasm analog of a `@tenant(scope: target)` field.
     pub fn is_target(&self) -> bool {
         matches!(self, Self::Target { .. })
+    }
+
+    /// This route's per-route write-global allowlist (#503) — the plain-`Unscoped` table names the
+    /// route may write unstamped (see [`Scoped::unscoped_writes`](Self::Scoped)). Empty for a
+    /// [`Disabled`](Self::Disabled) / [`Target`](Self::Target) decision (structurally unrepresentable
+    /// there) or a `Scoped` route that lists none. The host threads this onto the per-invocation
+    /// [`Scope`](crate::orm::Scope) so [`Scope::write_target`](crate::orm::Scope) can consult it.
+    pub fn unscoped_writes(&self) -> &[String] {
+        match self {
+            Self::Scoped {
+                unscoped_writes, ..
+            } => unscoped_writes,
+            Self::Disabled | Self::Target { .. } => &[],
+        }
     }
 
     /// Whether this (own) decision names the R1 async-lane [`SignedContext`](TenantSource::SignedContext)
@@ -527,7 +561,27 @@ pub enum TableScope {
     /// principal-less request — fail-closed is per table-scope, not per invocation); writes are
     /// deny-by-default (a shared-data write is a cross-tenant blast). Host-declared, never
     /// guest-inferred (a guest can't mark a sensitive table global).
-    Unscoped,
+    ///
+    /// `writable` (#503) is the **write-global** opt-in: `false` (the default) is the classic
+    /// read-only-reference contract above — a scoped guest WRITE is refused
+    /// ([`ResolvedScope::Unscoped`]). `true` declares a *genuinely tenant-less* shared table
+    /// (an OAuth CSRF-`state` table, a cross-tenant counter): any **non-target** scoped route
+    /// may then INSERT/UPDATE it with **no** tenant stamp ([`ResolvedScope::SharedWritable`]),
+    /// while READS stay globally-unscoped exactly as before (`writable` changes nothing about
+    /// reads — it is a writes-only flag). This is the *project-wide* half of the two-opt-in model
+    /// (the *per-route* half is [`Tenancy::Scoped::unscoped_writes`]); a target write is refused
+    /// on either path. A pre-#503 `{"kind":"unscoped"}` deserializes byte-identically to
+    /// `writable: false`, and `writable: false` elides on serialize, so an unset flag round-trips.
+    /// Host-declared (an operator asserts the table is truly tenant-less — the host cannot verify
+    /// it), never guest-inferred.
+    Unscoped {
+        /// Write-global opt-in (#503): `true` ⇒ a non-target scoped route may write this table
+        /// unstamped; `false` (default) ⇒ the classic read-only-reference contract (writes
+        /// refused). Reads are unaffected either way. Elides when `false` for byte-identical
+        /// pre-#503 round-trips.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        writable: bool,
+    },
     /// An **anonymous-first** table (R3): rows are owned EITHER by a resolved tenant
     /// (`default_tenant_key = <Tenant fact>`) OR by an anonymous session
     /// ([`session_key`](TenancySchema::session_key)` = <Session fact>`, on `default_tenant_key IS
@@ -567,8 +621,21 @@ pub enum TableScope {
 pub enum ResolvedScope {
     /// Scope this table on `column` = the resolved tenant (the injector picks the mode/value).
     Column(String),
-    /// No tenant predicate — a globally-readable `Unscoped` table.
+    /// No tenant predicate — a globally-readable `Unscoped` table. Reads are global; a scoped
+    /// guest **write** is refused ([`OrmError::UnscopedWrite`](crate::orm::OrmError::UnscopedWrite))
+    /// unless the route lists the table in
+    /// [`Tenancy::Scoped::unscoped_writes`](crate::tenancy::Tenancy) (the per-route opt-in).
     Unscoped,
+    /// A **write-global** table (#503): [`TableScope::Unscoped`]` { writable: true }`. Reads are
+    /// **read-identical to [`Unscoped`](ResolvedScope::Unscoped)** (no tenant predicate — a
+    /// writes-only flag, never a read widening — this is the G2 security property), but a
+    /// **non-target** scoped write is ALLOWED with **no** tenant stamp (the genuinely-tenant-less
+    /// shared-data write, e.g. an OAuth CSRF-`state` row). A **target** write to it is still
+    /// refused (the write-global arm is `!is_target()`-gated — the HIGH condition). A DISTINCT
+    /// variant from [`Unscoped`](ResolvedScope::Unscoped) on purpose: the compiler forces every
+    /// `ResolvedScope` match arm to be revisited, so the write-allow can never leak into a read
+    /// site by a silent fall-through (Security's exhaustiveness requirement).
+    SharedWritable,
     /// The R3 anonymous-first disjunction: a read is `Or([tenant = <Tenant fact>, session =
     /// <Session fact>])` over whichever axis facts are present; a write stamps the actor's own axis
     /// (`tenant` if authenticated, else `session`, with the other column left `NULL`).
@@ -727,7 +794,11 @@ impl TenancySchema {
         match self.tables.get(table)? {
             TableScope::Tenant => Some(ResolvedScope::Column(self.default_tenant_key.clone())),
             TableScope::TenantKeyed { key } => Some(ResolvedScope::Column(key.clone())),
-            TableScope::Unscoped => Some(ResolvedScope::Unscoped),
+            // #503: a write-global `unscoped { writable: true }` resolves to the DISTINCT
+            // `SharedWritable` (read-identical to `Unscoped`, but a non-target write is allowed
+            // unstamped); a plain `unscoped` stays read-only-reference (`Unscoped`).
+            TableScope::Unscoped { writable: true } => Some(ResolvedScope::SharedWritable),
+            TableScope::Unscoped { writable: false } => Some(ResolvedScope::Unscoped),
             TableScope::TenantOrSession => Some(ResolvedScope::TenantOrSession {
                 tenant: self.default_tenant_key.clone(),
                 session: self.session_key.clone()?,
@@ -752,7 +823,9 @@ impl TenancySchema {
                 let resolved = match scope {
                     TableScope::Tenant => ResolvedScope::Column(self.default_tenant_key.clone()),
                     TableScope::TenantKeyed { key } => ResolvedScope::Column(key.clone()),
-                    TableScope::Unscoped => ResolvedScope::Unscoped,
+                    // #503: mirror `resolve` — write-global ⇒ `SharedWritable`, plain ⇒ `Unscoped`.
+                    TableScope::Unscoped { writable: true } => ResolvedScope::SharedWritable,
+                    TableScope::Unscoped { writable: false } => ResolvedScope::Unscoped,
                     TableScope::TenantOrSession => ResolvedScope::TenantOrSession {
                         tenant: self.default_tenant_key.clone(),
                         session: self.session_key.clone()?, // no session_key ⇒ omit ⇒ deny
@@ -792,6 +865,54 @@ mod tests {
         );
         assert_eq!(schema.resolve("countries"), Some(ResolvedScope::Unscoped));
         assert_eq!(schema.resolve("secrets_table"), None); // undeclared → deny-by-default
+    }
+
+    #[test]
+    fn unscoped_writable_flag_round_trips_and_resolves_distinctly() {
+        // #503 back-compat: a pre-#503 `{"kind":"unscoped"}` MUST deserialize byte-identically to
+        // `writable: false` and re-serialize WITHOUT the flag (byte-identical round-trip), while a
+        // `writable: true` resolves to the DISTINCT `SharedWritable` (not `Unscoped`).
+        let legacy: TableScope = serde_json::from_str(r#"{"kind":"unscoped"}"#).unwrap();
+        assert_eq!(legacy, TableScope::Unscoped { writable: false });
+        // Byte-identical: the elided flag means the re-serialized form is exactly `{"kind":"unscoped"}`.
+        assert_eq!(
+            serde_json::to_string(&legacy).unwrap(),
+            r#"{"kind":"unscoped"}"#
+        );
+
+        let explicit_false: TableScope =
+            serde_json::from_str(r#"{"kind":"unscoped","writable":false}"#).unwrap();
+        assert_eq!(explicit_false, TableScope::Unscoped { writable: false });
+
+        let writable: TableScope =
+            serde_json::from_str(r#"{"kind":"unscoped","writable":true}"#).unwrap();
+        assert_eq!(writable, TableScope::Unscoped { writable: true });
+        // A write-global table serializes with the flag present (non-default).
+        assert_eq!(
+            serde_json::to_string(&writable).unwrap(),
+            r#"{"kind":"unscoped","writable":true}"#
+        );
+
+        // The two conversions agree and are DISTINCT: plain → `Unscoped`, writable → `SharedWritable`.
+        let schema: TenancySchema = serde_json::from_str(
+            r#"{"default_tenant_key":"tenant_id","tables":{
+                 "countries":{"kind":"unscoped"},
+                 "oauth_state":{"kind":"unscoped","writable":true}}}"#,
+        )
+        .unwrap();
+        assert_eq!(schema.resolve("countries"), Some(ResolvedScope::Unscoped));
+        assert_eq!(
+            schema.resolve("oauth_state"),
+            Some(ResolvedScope::SharedWritable)
+        );
+        assert_eq!(
+            schema.table_key_map().get("countries"),
+            Some(&ResolvedScope::Unscoped)
+        );
+        assert_eq!(
+            schema.table_key_map().get("oauth_state"),
+            Some(&ResolvedScope::SharedWritable)
+        );
     }
 
     #[test]
@@ -837,7 +958,8 @@ mod tests {
         for ts in [
             TableScope::Tenant,
             TableScope::TenantKeyed { key: "id".into() },
-            TableScope::Unscoped,
+            TableScope::Unscoped { writable: false },
+            TableScope::Unscoped { writable: true },
             TableScope::TenantOrSession,
         ] {
             let j = serde_json::to_string(&ts).unwrap();
@@ -890,8 +1012,29 @@ mod tests {
                 read: AccessMode::Own,
                 write: AccessMode::Own,
                 exceed_site_ceiling: false,
+                // #503: absent ⇒ empty allowlist (byte-identical to a pre-#503 config).
+                unscoped_writes: Vec::new(),
             }
         );
+        // #503 back-compat: an empty `unscoped_writes` ELIDES on serialize, so a pre-#503 scoped
+        // config round-trips byte-for-byte (no new key appears).
+        let out = serde_json::to_string(&t).unwrap();
+        assert!(
+            !out.contains("unscoped_writes"),
+            "empty unscoped_writes must elide (got {out})"
+        );
+        // A populated allowlist DOES serialize (and round-trips).
+        let listed: Tenancy = serde_json::from_str(
+            r#"{"mode":"scoped","column":"tenant_id","unscoped_writes":["oauth_state"]}"#,
+        )
+        .unwrap();
+        assert_eq!(listed.unscoped_writes(), &["oauth_state".to_string()]);
+        assert_eq!(
+            listed,
+            serde_json::from_str::<Tenancy>(&serde_json::to_string(&listed).unwrap()).unwrap()
+        );
+        // The accessor is empty for the non-Scoped decisions (structurally unrepresentable there).
+        assert!(Tenancy::Disabled.unscoped_writes().is_empty());
         assert!(t.is_scoped());
     }
 
@@ -971,6 +1114,7 @@ mod tests {
             read: AccessMode::OwnOrNull,
             write: AccessMode::Own,
             exceed_site_ceiling: false,
+            unscoped_writes: Vec::new(),
         };
         let s = serde_json::to_string(&t).unwrap();
         assert_eq!(t, serde_json::from_str::<Tenancy>(&s).unwrap());
@@ -1115,6 +1259,7 @@ mod tests {
             read,
             write,
             exceed_site_ceiling: false,
+            unscoped_writes: Vec::new(),
         }
     }
 
@@ -1133,6 +1278,7 @@ mod tests {
                 read,
                 write,
                 exceed_site_ceiling: true,
+                unscoped_writes: Vec::new(),
             },
             _ => unreachable!(),
         }
@@ -1156,6 +1302,7 @@ mod tests {
                 read: Own,
                 write: Own,
                 exceed_site_ceiling: false,
+                unscoped_writes: Vec::new(),
             }
             .narrows_within(&scoped(All, All))
         );
@@ -1195,6 +1342,7 @@ mod tests {
                 read,
                 write,
                 exceed_site_ceiling,
+                unscoped_writes: Vec::new(),
             },
             _ => unreachable!(),
         };
@@ -1251,6 +1399,7 @@ mod tests {
             read: AccessMode::Own,
             write: AccessMode::Own,
             exceed_site_ceiling: false,
+            unscoped_writes: Vec::new(),
         };
         assert!(ctx.declares_signed_context());
         let mixed = Tenancy::Scoped {
@@ -1264,6 +1413,7 @@ mod tests {
             read: AccessMode::Own,
             write: AccessMode::Own,
             exceed_site_ceiling: false,
+            unscoped_writes: Vec::new(),
         };
         assert!(mixed.declares_signed_context());
         let no_ctx = Tenancy::Scoped {
@@ -1272,6 +1422,7 @@ mod tests {
             read: AccessMode::Null,
             write: AccessMode::Null,
             exceed_site_ceiling: false,
+            unscoped_writes: Vec::new(),
         };
         assert!(!no_ctx.declares_signed_context());
         assert!(!Tenancy::Disabled.declares_signed_context());
