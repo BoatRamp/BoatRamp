@@ -5,9 +5,11 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
-## [Unreleased]
+## [0.5.8] - 2026-09-26
 
-_Draft — pending Security re-review + version bump._
+A P0 security fix for the raw-SQL tenancy path, plus a new tenancy feature that lets a scoped route
+write a genuinely-global table via the typed `orm` binding. No public HTTP/CLI/config break; guests
+need no change.
 
 ### Added
 
@@ -28,23 +30,43 @@ _Draft — pending Security re-review + version bump._
   globally-readable, never wider); a **target** route (another tenant's public subset) can never use
   either opt-in (a target write to a global is refused). **Global writes go through the typed `orm`
   binding only.** The raw `sql` binding has **no** write-global exemption: a raw-SQL write to a global
-  table is treated like any other scoped write — it requires the `{scope}` marker (an unmarked write is
-  refused) and is scoped to the caller's own tenant. This is deliberate — a raw-SQL statement is opaque
-  text a parser must interpret, and a MySQL/MariaDB `/*! … */` version-comment (executed by the engine
-  but skipped by a parser) could redirect an apparently-global write to a tenant table; the `orm`
-  binding names the table as a typed value (nothing to hide) and scopes `INSERT … SELECT` sources, so it
-  is the safe and only path for an unstamped global write. The ORM decision is evaluated **fresh per
-  write** against the current schema, so a listed table re-declared as a tenant table is tenant-stamped
-  as normal (it can never be written unstamped once it stops being global). Apply-time validation fails
-  fast (422) on an `unscoped_writes` entry that is unknown or
-  resolves to a tenant kind, and warns on an entry made redundant by `writable: true`. The
-  deny-by-default posture is unchanged for every table that opts into neither mechanism (`countries`
-  stays refused; worst case == today). **Back-compat:** a pre-#503 `{ "kind": "unscoped" }` and a
-  scoped route with no `unscoped_writes` serialize byte-identically (both new fields elide when
-  false/empty). **Forward note:** a `writable: true` schema read by a pre-#503 binary fails closed to
-  deny-all (safe). See the how-to (`docs/src/how-to/tenant-isolation.md`) for the decision rule + three
-  recipes + the operator-trust residual (the host cannot verify a declared-global table is truly
-  tenant-less — a misdeclaration lets any granted route write across tenants).
+  table (write-global or plain) is **refused** by the same AST confinement introduced in the P0 fix
+  below. This is deliberate — a raw-SQL statement is opaque text a parser must interpret, and a
+  MySQL/MariaDB `/*! ... */` version-comment (executed by the engine but skipped by a parser) could
+  redirect an apparently-global write to a tenant table; the `orm` binding names the table as a typed
+  value (nothing to hide) and scopes `INSERT ... SELECT` sources, so it is the safe and only path for an
+  unstamped global write. The ORM decision is evaluated **fresh per write** against the current schema,
+  so a listed table re-declared as a tenant table is tenant-stamped as normal (it can never be written
+  unstamped once it stops being global). Apply-time validation fails fast (422) on an `unscoped_writes`
+  entry that is unknown or resolves to a tenant kind, and warns on an entry made redundant by
+  `writable: true`. The deny-by-default posture is unchanged for every table that opts into neither
+  mechanism (`countries` stays refused; worst case == today). **Back-compat:** a pre-#503
+  `{ "kind": "unscoped" }` and a scoped route with no `unscoped_writes` serialize byte-identically (both
+  new fields elide when false/empty). **Forward note:** a `writable: true` schema read by a pre-#503
+  binary fails closed to deny-all (safe). See the how-to (`docs/src/how-to/tenant-isolation.md`) for the
+  decision rule + three recipes + the operator-trust residual (the host cannot verify a declared-global
+  table is truly tenant-less — a misdeclaration lets any granted route write across tenants).
+
+### Security
+
+- **Raw-SQL `own`/`session` tenant scoping is now AST-injected and can no longer be `OR`-escaped** (P0;
+  pre-existing in 0.5.7 and earlier). The raw `sql` binding confined an `own`/`session`-scoped **read or
+  write** by substituting a guest-placed `{scope}` marker (`tenant = ?`) into the guest's SQL *text* — which
+  a hostile guest could neutralize with a top-level `OR` (`WHERE 1=1 OR {scope}`) or reposition, reading or
+  writing **another tenant's rows**. Unbackstopped on libsql/SQLite, MySQL, and BYO/external Postgres
+  (managed Postgres was covered only when the operator had enabled RLS *and* the app authored `WITH CHECK`
+  policies). The typed `orm` binding was **never** affected (it injects the scope structurally), and the
+  cross-tenant *target*-read path was already AST-confined — this closes the same gap for the own/session
+  axis. The own/session read and write paths now use the same parse-and-inject confinement as the target
+  path and the ORM: the tenant predicate is `AND`-ed onto the **parenthesized** guest query at the AST level
+  on **every** table reference (root, joins, subqueries, CTEs, set-ops); an INSERT force-stamps the tenant
+  column and confines `INSERT … SELECT`/VALUES/`RETURNING` sub-reads; and constructs that cannot be soundly
+  confined (CTE-led writes, `UPDATE … FROM`, multi-table/`USING` DELETE, upserts, `REPLACE`/`INSERT OR
+  REPLACE`, a positional INSERT with no column list, `DELETE … ORDER BY/LIMIT`) are **refused fail-closed**.
+  The `{scope}` marker is now optional and inert. Backend-independent (applies on libsql/SQLite, Postgres,
+  and MySQL regardless of database RLS). **Guests continue to work unchanged**; a global-table write now goes
+  through the `orm` binding. Closed under a three-iteration Security-review loop; regression-locked by the
+  mutation-verified gate `RAWSQL OWN-CONFINEMENT AST OK` (behavioral, on real libsql + Postgres + MySQL).
 
 ## [0.5.7] - 2026-09-26
 

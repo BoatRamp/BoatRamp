@@ -63,6 +63,29 @@ impl TenantDenied {
     }
 }
 
+/// Why an own/session raw-SQL confinement ([`HostTenancy::rewrite_own_read`] /
+/// [`HostTenancy::rewrite_own_write`]) refused (always fail-closed — the statement does not run). It
+/// distinguishes a **grant/config** denial ([`TenantDenied`] — a `None` grant, no principal, a bad
+/// column) from a **structural** refusal ([`TargetRewriteError`] — unparseable, undeclared table,
+/// unsupported shape) so the guest sees the right guest-safe reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OwnConfineError {
+    /// The axis grant / principal / column is denied or misconfigured.
+    Denied(TenantDenied),
+    /// The AST rewrite could not provably confine the statement.
+    Rewrite(boatramp_core::target_sql::TargetRewriteError),
+}
+
+impl OwnConfineError {
+    /// A short, guest-safe reason (no tenant values leaked).
+    pub fn reason(&self) -> String {
+        match self {
+            Self::Denied(d) => d.reason().to_string(),
+            Self::Rewrite(e) => e.reason(),
+        }
+    }
+}
+
 /// The host-resolved tenancy for one invocation. Built server-side: `value` is the tenant resolved
 /// from the verified source (`None` for anonymous / null-only), and `read`/`write` are the access
 /// modes **already capped by the operator posture** (so an `all` here is a deliberately-permitted
@@ -478,6 +501,97 @@ impl HostTenancy {
         )
     }
 
+    /// The field-level [`ScopeMode`] for `axis` (the raw-SQL analog of [`orm_scope`](Self::orm_scope)'s
+    /// mode selection), or a [`TenantDenied`] (fail-closed). `Ok(None)` ⇒ cross-tenant `all` (no
+    /// confinement — the guest SQL runs unconfined, its `all`-write RLS backstop applied separately).
+    fn own_mode(&self, axis: Axis) -> Result<Option<ScopeMode>, TenantDenied> {
+        Ok(match self.mode(axis) {
+            AccessMode::None => return Err(TenantDenied::NoAccess),
+            AccessMode::All => None,
+            AccessMode::Null => Some(ScopeMode::NullOnly),
+            AccessMode::Own => Some(ScopeMode::Own),
+            AccessMode::OwnOrNull => Some(ScopeMode::OwnOrNull),
+        })
+    }
+
+    /// The per-table key resolution ([`OwnKeys`]) for a raw-SQL own/session confinement: `Uniform`
+    /// (no project schema) scopes every table on `column`; `PerTable` borrows the project schema's
+    /// map. A target principal never reaches here (own/session and target never co-occur) — refused
+    /// fail-closed so a target statement can't slip through the own confiner.
+    fn own_keys(&self) -> Result<boatramp_core::target_sql::OwnKeys<'_>, TenantDenied> {
+        use boatramp_core::orm::TableKeys;
+        use boatramp_core::target_sql::OwnKeys;
+        match &self.keys {
+            TableKeys::Uniform => Ok(OwnKeys::Uniform(self.column.clone())),
+            TableKeys::PerTable(m) => Ok(OwnKeys::PerTable(m)),
+            // A target principal must go through `rewrite_target_read`, never the own confiner.
+            TableKeys::PerTableTarget { .. } => Err(TenantDenied::NoSource),
+        }
+    }
+
+    /// Confine a guest's raw-SQL **own/session READ** by AST-rewriting the whole statement so EVERY
+    /// table reference is scoped to the caller's own/session partition (the P0 fix — closing the
+    /// `{scope}` marker's reposition / `OR`-escape gaps for the own/session axes, exactly as
+    /// [`rewrite_target_read`](Self::rewrite_target_read) does for the target axis). The confinement
+    /// literals are host-held (never guest input) and injected as escaped literals, so the guest's own
+    /// positional params are undisturbed. Fail-closed: a `None` grant, an own read with no principal,
+    /// an undeclared table, or an unparseable statement → refused (never the escapable marker).
+    pub fn rewrite_own_read(
+        &self,
+        statement: &str,
+        dialect: boatramp_core::sql::Dialect,
+    ) -> Result<String, OwnConfineError> {
+        use boatramp_core::target_sql::{OwnScope, rewrite_own_read};
+        if !self.valid_column() {
+            return Err(OwnConfineError::Denied(TenantDenied::BadColumn));
+        }
+        let Some(mode) = self.own_mode(Axis::Read).map_err(OwnConfineError::Denied)? else {
+            // `all` read — no confinement (the caller routes an `all` read around the rewrite).
+            return Ok(statement.to_string());
+        };
+        let keys = self.own_keys().map_err(OwnConfineError::Denied)?;
+        let scope = OwnScope {
+            own: self.tenant_value(),
+            session: self.session_value(),
+            mode,
+            keys,
+        };
+        rewrite_own_read(statement, &scope, dialect).map_err(OwnConfineError::Rewrite)
+    }
+
+    /// Confine a guest's raw-SQL **own/session WRITE** (UPDATE / DELETE / INSERT) by AST-rewriting it
+    /// so the write is structurally bounded to the caller's own/session partition (the P0 fix):
+    /// UPDATE/DELETE get the tenant bound `AND`-ed onto their parenthesised guest `WHERE`; an UPDATE
+    /// cannot re-tenant a row; an INSERT force-stamps the tenant column (a guest-supplied tenant is
+    /// overridden) and read-confines any `INSERT … SELECT` source. An `Unscoped` (global) write stays
+    /// refused (deny-by-default). Fail-closed on a `None` grant, a no-principal own write, an
+    /// undeclared table, a multi-table / qualified target, or an unsupported shape.
+    pub fn rewrite_own_write(
+        &self,
+        statement: &str,
+        dialect: boatramp_core::sql::Dialect,
+    ) -> Result<String, OwnConfineError> {
+        use boatramp_core::target_sql::{OwnScope, rewrite_own_write};
+        if !self.valid_column() {
+            return Err(OwnConfineError::Denied(TenantDenied::BadColumn));
+        }
+        let Some(mode) = self
+            .own_mode(Axis::Write)
+            .map_err(OwnConfineError::Denied)?
+        else {
+            // `all` write — no confinement (the `all`-write RLS backstop is applied separately).
+            return Ok(statement.to_string());
+        };
+        let keys = self.own_keys().map_err(OwnConfineError::Denied)?;
+        let scope = OwnScope {
+            own: self.tenant_value(),
+            session: self.session_value(),
+            mode,
+            keys,
+        };
+        rewrite_own_write(statement, &scope, dialect).map_err(OwnConfineError::Rewrite)
+    }
+
     /// Whether raw SQL on `axis` must carry the [`SCOPE_MARKER`]. True whenever the axis actually
     /// restricts rows (null/own/own+null); false for cross-tenant `all` (nothing to inject) — a
     /// `None`-grant axis "requires" it moot-ly since it's denied outright.
@@ -676,12 +790,15 @@ mod tests {
     }
 
     #[test]
-    fn unscoped_writes_reaches_the_orm_scope_but_not_the_raw_marker_path() {
-        // #503 (post-security-fix): the per-route write-global allowlist is an ORM-ONLY fact. It
-        // flows onto the per-invocation ORM `Scope` (so `write_target` can admit a listed plain
-        // `Unscoped` write unstamped), but the raw-SQL surface has NO write-global exemption — a
-        // scoped raw-SQL write stays marker-required regardless of the list (global writes are
-        // ORM-only; the raw path offers no weaker route).
+    fn unscoped_writes_reaches_the_orm_scope_but_a_raw_global_write_is_refused() {
+        // #503 reconciled onto the P0 raw-SQL confinement fix: the per-route write-global allowlist
+        // is an ORM-ONLY fact. It flows onto the per-invocation ORM `Scope` (so `write_target` can
+        // admit a listed plain-`Unscoped` write unstamped), but the raw-SQL surface has NO
+        // write-global exemption — the P0 own/session write confiner (`rewrite_own_write`) REFUSES a
+        // write to a global table (plain `Unscoped` or write-global `SharedWritable`) fail-closed
+        // (global writes are ORM-only; the raw path offers no weaker route).
+        use boatramp_core::sql::Dialect;
+        use boatramp_core::target_sql::TargetRewriteError;
         use boatramp_core::tenancy::{TableScope, TenancySchema};
         let mut schema = TenancySchema::default();
         schema.tables.insert("orders".into(), TableScope::Tenant);
@@ -705,13 +822,35 @@ mod tests {
         let write_scope = ht.orm_scope(Axis::Write).unwrap().unwrap();
         assert!(write_scope.unscoped_writes.contains("countries"));
 
-        // The raw-SQL surface still REQUIRES the `{scope}` marker on the write axis for a scoped
-        // (non-`all`) principal — the list does not exempt anything here (no write-global exemption
-        // on the raw path). The marker fill is the own-tenant predicate, never a no-op tautology.
-        assert!(ht.requires_marker(Axis::Write));
-        let (pred, vals) = ht.sql_marker(Axis::Write, 0).unwrap();
-        assert_eq!(pred, "tenant_id = ?1");
-        assert_eq!(vals, vec![t("acme")]);
+        // A raw-SQL write to a **write-global** table is REFUSED (`UnscopedWrite`), not scoped — the
+        // raw path has no write-global exemption even for `SharedWritable` (post-P0: global writes
+        // are ORM-only).
+        assert!(matches!(
+            ht.rewrite_own_write(
+                "INSERT INTO oauth_state (id, val) VALUES ('s', 'v')",
+                Dialect::Sqlite,
+            ),
+            Err(OwnConfineError::Rewrite(TargetRewriteError::UnscopedWrite(t))) if t == "oauth_state"
+        ));
+        // A raw-SQL write to a plain read-only-reference global is refused identically.
+        assert!(matches!(
+            ht.rewrite_own_write(
+                "INSERT INTO countries (id, name) VALUES (1, 'x')",
+                Dialect::Sqlite,
+            ),
+            Err(OwnConfineError::Rewrite(TargetRewriteError::UnscopedWrite(t))) if t == "countries"
+        ));
+        // An ordinary tenant table stays confined (AST-stamped to the own tenant) on the raw path.
+        let confined = ht
+            .rewrite_own_write(
+                "INSERT INTO orders (id, tenant_id) VALUES (1, 'evil')",
+                Dialect::Sqlite,
+            )
+            .unwrap();
+        assert!(
+            confined.contains("'acme'"),
+            "own write must be force-stamped to the caller's own tenant: {confined}"
+        );
     }
 
     #[test]
