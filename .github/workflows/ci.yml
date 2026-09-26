@@ -747,7 +747,7 @@ jobs:
           # #503: the write-global / per-route-allowlist model on each engine — a read:own route reads
           # ONLY its own rows (a write-global grant does NOT widen reads, G2) AND writes a genuinely-
           # global table UNSTAMPED; a listed plain-unscoped table too; an unlisted plain-unscoped write
-          # stays refused. A cross-tenant read leak or a mis-scoped global write fails the assertion.
+          # stays refused. A cross-tenant read leak or a wrongly-scoped global write fails the assertion.
           grep -q 'SCOPED UNSCOPED-WRITE CROSS-SURFACE OK \[postgres\]' orm-sqlx.log \
             || { echo "::error::Postgres #503 write-global gate never reached its marker (a read-widening/G2 or write-global scoping regression, or a skip)" >&2; exit 1; }
           grep -q 'SCOPED UNSCOPED-WRITE CROSS-SURFACE OK \[mysql\]' orm-sqlx.log \
