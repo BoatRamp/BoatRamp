@@ -29,6 +29,10 @@ clen = "clen"
 # `HELO` = the SMTP greeting verb (RFC 5321), matched in the email capability's
 # live SMTP-sink test. Not a typo of "hello".
 HELO = "HELO"
+# `unparseable` = the spelling used across the codebase (messaging, gcs-notify, the
+# raw-SQL tenancy confinement) for "cannot be parsed". A newer `typos` dictionary
+# prefers "unparsable"; standardize on the existing spelling rather than churn.
+unparseable = "unparseable"
 
 [files]
 # Lockfiles and vendored third-party WIT (upstream WASI definitions, copied
