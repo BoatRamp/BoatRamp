@@ -212,7 +212,11 @@ impl hkdf::KeyType for MyKeyLen {
 /// random bits (a fixed 25-char id). Opaque + collision-safe; the prefix lets the face fast-reject a
 /// foreign id.
 pub fn generate_access_key_id() -> Result<String, CredentialError> {
-    let mut raw = [0u8; 13]; // 104 bits → 21 Crockford base32 chars (no padding, no truncation)
+    // 13 bytes = 104 bits. Crockford base32 packs 5 bits per char, so 104 bits fill 20 whole 5-bit
+    // groups (100 bits) plus a final group carrying the remaining 4 bits, left-padded with 1 zero bit
+    // → 21 chars (⌈104/5⌉). No input bits are dropped (no truncation); only the final group is padded.
+    // With the `BRUP` prefix the id is 25 chars.
+    let mut raw = [0u8; 13];
     SystemRandom::new()
         .fill(&mut raw)
         .map_err(|_| CredentialError::Rng)?;
