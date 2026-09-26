@@ -488,6 +488,14 @@ pub struct Scope {
     /// Per-table key resolution; [`TableKeys::Uniform`] (the default) preserves the pre-schema
     /// single-column behavior (every table scopes on `column`).
     pub keys: TableKeys,
+    /// **Per-route write-global allowlist** (#503, the strict/least-privilege opt-in). The
+    /// plain-[`Unscoped`](ResolvedScope::Unscoped) table names this route may WRITE unstamped —
+    /// threaded here from the route's [`Tenancy::Scoped::unscoped_writes`](crate::tenancy::Tenancy)
+    /// so [`write_target`](Self::write_target) can consult it. A per-**invocation** fact (NOT baked
+    /// into the project-wide [`TableKeys`]): it authorizes THIS route, and the table's scope is still
+    /// resolved fresh from the schema per write (the G1 drift guard). Empty for a route that lists
+    /// none (the common case — byte-identical to pre-#503 behavior).
+    pub unscoped_writes: std::collections::BTreeSet<String>,
 }
 
 impl Scope {
@@ -674,7 +682,9 @@ impl Scope {
                 ident(&col)?;
                 self.tenant_pred(&col, qualifier, false)?
             }
-            ResolvedScope::Unscoped => None,
+            // G2 (writes-only): a write-global table is READ-IDENTICAL to a plain `Unscoped` global —
+            // NO tenant predicate. `writable` is a writes-only flag; it never widens a read.
+            ResolvedScope::Unscoped | ResolvedScope::SharedWritable => None,
             ResolvedScope::TenantOrSession { tenant, session } => {
                 ident(&tenant)?;
                 ident(&session)?;
@@ -727,6 +737,29 @@ impl Scope {
             // neither create nor update a `NULL`-base row (base rows are operator-seeded via a
             // privileged `NullOnly`/`All` path, unreachable from a guest's `Own`-mode write).
             ResolvedScope::TenantOrBase { tenant } => Ok(tenant_stamp()?.map(|v| (tenant, v))),
+            // #503 arm 2 — the **write-global** table (`unscoped { writable: true }`): a non-target
+            // scoped route may write it with NO tenant stamp (the genuinely-tenant-less shared-data
+            // write). HIGH condition: `!is_target()` — a TARGET write to a write-global table is
+            // REFUSED (a target principal carries only `B`; stamping/allowing a global write under it
+            // would let a target route write across the tenant boundary), routed to the same
+            // `UnscopedWrite` refusal as a plain unlisted global so the message names both remedies.
+            ResolvedScope::SharedWritable if !self.is_target() => Ok(None),
+            ResolvedScope::SharedWritable => Err(OrmError::UnscopedWrite(table.to_string())),
+            // #503 arm 3 — the **per-route allowlist** (least-privilege): a non-target route may
+            // write a plain `Unscoped` (read-only-reference) table unstamped IFF the table is listed
+            // in this route's `unscoped_writes`. G1 (drift-safe): this arm is reached ONLY after
+            // `resolve_table` freshly resolved the table to `Unscoped` THIS call, so a
+            // listed-but-now-`Tenant` table falls into the `Column`/`TenantOrBase`/… arms above and
+            // is stamped normally — a tenant-kind table can NEVER be written unstamped via the list.
+            // A target route is `Tenancy::Target` (no `unscoped_writes` field), so `is_target()` here
+            // is a belt-and-suspenders guard even though the set is structurally always empty.
+            ResolvedScope::Unscoped
+                if !self.is_target() && self.unscoped_writes.contains(table) =>
+            {
+                Ok(None)
+            }
+            // A plain `Unscoped` not listed by this route (and every target write to a global) —
+            // deny-by-default, unchanged. `UnscopedWrite`'s message now names BOTH remedies.
             ResolvedScope::Unscoped => Err(OrmError::UnscopedWrite(table.to_string())),
             ResolvedScope::TenantOrSession { tenant, session } => {
                 if matches!(self.mode, ScopeMode::All) {
@@ -906,7 +939,9 @@ impl Scope {
                 // The tenant column is off-limits to a guest SET; its NULL base rows are never
                 // guest-writable, so a base-inclusive table protects the same one column.
                 ResolvedScope::TenantOrBase { tenant } => &[tenant],
-                ResolvedScope::Unscoped => &[],
+                // A global (plain or write-global) has no tenant column to protect here; the target
+                // gate is moot anyway (a target write to a global is refused in `write_target`).
+                ResolvedScope::Unscoped | ResolvedScope::SharedWritable => &[],
             };
             if tenant_cols.iter().any(|t| same_col(t, column)) {
                 return Err(denied());
@@ -1551,11 +1586,21 @@ pub enum OrmError {
     #[error("tenancy: table {0:?} has no declared scope (deny-by-default)")]
     TenancyUndeclared(String),
     /// A guest WRITE (INSERT/UPDATE/DELETE) targeted a table declared `Unscoped` (global reference
-    /// data). Reads of an `Unscoped` table are global by design, but writes are **deny-by-default**
-    /// (a shared-data write is a cross-tenant blast — the [`TableScope::Unscoped`](crate::tenancy::TableScope::Unscoped)
-    /// contract), so the host refuses them rather than running the write unbounded-by-tenant.
+    /// data) that this route is not permitted to write. Reads of an `Unscoped` table are global by
+    /// design, but writes are **deny-by-default** (a shared-data write is a cross-tenant blast — the
+    /// [`TableScope::Unscoped`](crate::tenancy::TableScope::Unscoped) contract), so the host refuses
+    /// them rather than running the write unbounded-by-tenant.
+    ///
+    /// The message names BOTH #503 remedies verbatim (a scoped route CAN write a genuinely-global
+    /// table now, two independent ways) so a developer is not dead-ended onto `write: "all"` (which
+    /// wrongly co-widens READS). Reads are unaffected by either remedy.
     #[error(
-        "tenancy: table {0:?} is Unscoped (global reference); guest writes are refused (deny-by-default)"
+        "tenancy: table {0:?} is Unscoped (global reference); a scoped guest write is refused \
+         (deny-by-default). If this table is genuinely tenant-less, allow the write one of two ways: \
+         (least-privilege) add {0:?} to this route's tenancy `unscoped_writes: [...]`, or \
+         (project-wide) declare the table `{{ \"kind\": \"unscoped\", \"writable\": true }}` in the \
+         project tenancy schema. Reads are unaffected. A TARGET-scope write to a global table stays \
+         refused regardless."
     )]
     UnscopedWrite(String),
     /// A scoped read/write needed a resolved principal (an own-tenant value, or — for a
@@ -2940,6 +2985,7 @@ mod tests {
                 session: None,
                 mode: ScopeMode::Own,
                 keys: TableKeys::Uniform,
+                unscoped_writes: std::collections::BTreeSet::new(),
             }),
             ..Select::from("party")
         };
@@ -2983,6 +3029,7 @@ mod tests {
                         ResolvedScope::Column("id".to_string()),
                     ),
                 ])),
+                unscoped_writes: std::collections::BTreeSet::new(),
             }),
             ..Select::from("storefront_config")
         };
@@ -3024,6 +3071,7 @@ mod tests {
                 ),
                 ("countries".to_string(), ResolvedScope::Unscoped),
             ])),
+            unscoped_writes: std::collections::BTreeSet::new(),
         })
         .unwrap();
         let (sql2, params2) = q2.compile(Dialect::Sqlite).unwrap();
@@ -3048,6 +3096,7 @@ mod tests {
                 "orders".to_string(),
                 ResolvedScope::Column("tenant_id".to_string()),
             )])),
+            unscoped_writes: std::collections::BTreeSet::new(),
         })
         .unwrap();
         assert!(matches!(
@@ -3076,6 +3125,7 @@ mod tests {
             session: None,
             mode: ScopeMode::OwnOrNull,
             keys: TableKeys::Uniform,
+            unscoped_writes: std::collections::BTreeSet::new(),
         })
         .unwrap();
         let (sql, params) = q.compile(Dialect::Sqlite).unwrap();
@@ -3111,6 +3161,7 @@ mod tests {
             session: None,
             mode: ScopeMode::All,
             keys: TableKeys::Uniform,
+            unscoped_writes: std::collections::BTreeSet::new(),
         })
         .unwrap();
         let (sql, params) = q.compile(Dialect::Sqlite).unwrap();
@@ -3160,6 +3211,7 @@ mod tests {
             session: None,
             mode: ScopeMode::OwnOrNull,
             keys: TableKeys::Uniform,
+            unscoped_writes: std::collections::BTreeSet::new(),
         })
         .unwrap();
         let (sql, _) = q.compile(Dialect::Sqlite).unwrap();
@@ -3183,6 +3235,7 @@ mod tests {
                 session: None,
                 mode,
                 keys: TableKeys::Uniform,
+                unscoped_writes: std::collections::BTreeSet::new(),
             }),
             ..Select::from("party")
         }
@@ -3241,6 +3294,7 @@ mod tests {
             session: None,
             mode: ScopeMode::Own,
             keys: TableKeys::Uniform,
+            unscoped_writes: std::collections::BTreeSet::new(),
         })
         .unwrap();
         let (sql, params) = q.compile(Dialect::Sqlite).unwrap();
@@ -3280,6 +3334,7 @@ mod tests {
             session: None,
             mode: ScopeMode::Own,
             keys: TableKeys::Uniform,
+            unscoped_writes: std::collections::BTreeSet::new(),
         })
         .unwrap();
         let (sql, params) = q.compile(Dialect::Sqlite).unwrap();
@@ -3304,6 +3359,7 @@ mod tests {
             session: None,
             mode: ScopeMode::Own,
             keys: TableKeys::Uniform,
+            unscoped_writes: std::collections::BTreeSet::new(),
         };
         // DELETE … RETURNING (subquery) — the RETURNING read must be scoped to victim.
         let mut del = Delete {
@@ -3351,6 +3407,7 @@ mod tests {
             session: None,
             mode: ScopeMode::Own,
             keys: TableKeys::Uniform,
+            unscoped_writes: std::collections::BTreeSet::new(),
         })
         .unwrap();
         let (sql, params) = q.compile(Dialect::Sqlite).unwrap();
@@ -3389,6 +3446,7 @@ mod tests {
             session: None,
             mode: ScopeMode::Own,
             keys: TableKeys::Uniform,
+            unscoped_writes: std::collections::BTreeSet::new(),
         };
         ins.force_scope(Some(&own), Some(&own)).unwrap();
         let (sql, params) = ins.compile(Dialect::Sqlite).unwrap();
@@ -3427,6 +3485,7 @@ mod tests {
                 session: None,
                 mode: ScopeMode::Own,
                 keys: TableKeys::Uniform,
+                unscoped_writes: std::collections::BTreeSet::new(),
             }),
             returning: vec![],
         };
@@ -3476,6 +3535,7 @@ mod tests {
             session: None,
             mode: ScopeMode::Own,
             keys: TableKeys::Uniform,
+            unscoped_writes: std::collections::BTreeSet::new(),
         };
         ins.force_scope(Some(&own), Some(&own)).unwrap();
         let (sql, params) = ins.compile(Dialect::Sqlite).unwrap();
@@ -3495,6 +3555,198 @@ mod tests {
             ins.compile(Dialect::Mysql),
             Err(OrmError::BadExpr(_))
         ));
+    }
+
+    // ---- #503: scoped writes to global tables (write-global + per-route allowlist) --------------
+
+    /// A `PerTable` schema with a plain `Unscoped` `countries`, a write-global `oauth_state`
+    /// (`SharedWritable`), and a plain tenant `orders`.
+    fn schema_503() -> std::collections::BTreeMap<String, ResolvedScope> {
+        use std::collections::BTreeMap;
+        BTreeMap::from([
+            (
+                "orders".to_string(),
+                ResolvedScope::Column("tenant_id".to_string()),
+            ),
+            ("countries".to_string(), ResolvedScope::Unscoped),
+            ("oauth_state".to_string(), ResolvedScope::SharedWritable),
+        ])
+    }
+
+    /// An own-scoped `Scope` over `schema_503`, listing `unscoped_writes` for the strict opt-in.
+    fn scope_503(unscoped_writes: &[&str]) -> Scope {
+        Scope {
+            column: "tenant_id".into(),
+            value: Some(t("acme")),
+            session: None,
+            mode: ScopeMode::Own,
+            keys: TableKeys::PerTable(schema_503()),
+            unscoped_writes: unscoped_writes.iter().map(ToString::to_string).collect(),
+        }
+    }
+
+    fn insert_one(table: &str, col: &str, val: SqlValue) -> Insert {
+        Insert {
+            table: table.to_string(),
+            rows: vec![RowValues {
+                cells: vec![Assignment {
+                    column: col.into(),
+                    value: Expr::val(val),
+                }],
+            }],
+            conflict: None,
+            scope: None,
+            returning: vec![],
+            from_select: None,
+        }
+    }
+
+    #[test]
+    fn write_global_table_writes_unstamped_via_the_kind() {
+        // Arm 2 (write-global): a non-target scoped route may INSERT `oauth_state` with NO tenant
+        // stamp — no `tenant_id` column is injected, no tenant value bound.
+        let scope = scope_503(&[]); // no per-route list needed: the KIND authorizes it.
+        let mut ins = insert_one("oauth_state", "state", t("csrf-123"));
+        ins.force_scope(Some(&scope), Some(&scope)).unwrap();
+        let (sql, params) = ins.compile(Dialect::Sqlite).unwrap();
+        assert_eq!(sql, "INSERT INTO oauth_state (state) VALUES (?1)");
+        assert_eq!(params, vec![t("csrf-123")]);
+        assert!(
+            !sql.contains("tenant_id") && !params.contains(&t("acme")),
+            "write-global write must NOT stamp the tenant: {sql} / {params:?}"
+        );
+    }
+
+    #[test]
+    fn m1_m4_plain_unscoped_not_listed_write_is_refused() {
+        // M1/M4: a plain `Unscoped` table (`countries`) NOT in this route's allowlist must still be
+        // refused (deny-by-default un-eroded). An empty allowlist and a non-matching allowlist both
+        // refuse — the arm keys off membership, never merely "the set exists".
+        for list in [&[][..], &["orders"][..], &["oauth_state"][..]] {
+            let scope = scope_503(list);
+            let mut ins = insert_one("countries", "code", t("US"));
+            let err = ins.force_scope(Some(&scope), Some(&scope)).unwrap_err();
+            assert!(
+                matches!(err, OrmError::UnscopedWrite(ref tbl) if tbl == "countries"),
+                "countries write must be refused (list={list:?}): {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn allowlisted_plain_unscoped_table_writes_unstamped() {
+        // Arm 3 (strict opt-in): `countries` listed in `unscoped_writes` ⇒ writable unstamped, while
+        // it stays a plain `Unscoped` kind (read-only-reference for every OTHER route).
+        let scope = scope_503(&["countries"]);
+        let mut ins = insert_one("countries", "code", t("US"));
+        ins.force_scope(Some(&scope), Some(&scope)).unwrap();
+        let (sql, params) = ins.compile(Dialect::Sqlite).unwrap();
+        assert_eq!(sql, "INSERT INTO countries (code) VALUES (?1)");
+        assert_eq!(params, vec![t("US")]);
+        assert!(!sql.contains("tenant_id"));
+    }
+
+    #[test]
+    fn m2_g1_listed_but_now_tenant_table_is_still_stamped() {
+        // G1 (the load-bearing drift guard): the allowlist entry is inert unless the table STILL
+        // resolves to `Unscoped` THIS call. Author a route listing `orders`, but `orders` is declared
+        // a TENANT table — the write MUST stamp `tenant_id = acme`, never write unstamped via the
+        // list (a listed-but-now-tenant table can NEVER be written unstamped).
+        let scope = scope_503(&["orders", "countries"]);
+        // `orders` resolves to a tenant Column (schema_503) — the list entry must be ignored.
+        assert!(matches!(
+            scope.resolve_table("orders").unwrap(),
+            ResolvedScope::Column(_)
+        ));
+        let mut ins = insert_one("orders", "id", t("o_1"));
+        ins.force_scope(Some(&scope), Some(&scope)).unwrap();
+        let (sql, params) = ins.compile(Dialect::Sqlite).unwrap();
+        assert_eq!(sql, "INSERT INTO orders (id, tenant_id) VALUES (?1, ?2)");
+        assert_eq!(params, vec![t("o_1"), t("acme")]);
+        // Prove the guard is the fresh resolve, not the list: an UPDATE stamps the WHERE too.
+        let upd = Update {
+            table: "orders".into(),
+            set: vec![Assignment {
+                column: "status".into(),
+                value: Expr::val(t("paid")),
+            }],
+            filter: cmp("id", CmpOp::Eq, t("o_1")),
+            scope: Some(scope.clone()),
+            returning: vec![],
+        };
+        let (usql, _) = upd.compile(Dialect::Sqlite).unwrap();
+        assert!(
+            usql.contains("tenant_id = ?"),
+            "a listed-but-now-tenant UPDATE must still stamp the tenant WHERE: {usql}"
+        );
+    }
+
+    #[test]
+    fn m3_g2_write_global_does_not_widen_reads() {
+        // G2: `SharedWritable` is READ-identical to `Unscoped` (no predicate); a sibling tenant table
+        // read under the same route stays own-bound. `read_pred(SharedWritable) == read_pred(Unscoped)
+        // == None`, and a joined read confines the tenant table only.
+        let scope = scope_503(&["countries"]);
+        assert_eq!(scope.read_pred("oauth_state", None).unwrap(), None);
+        assert_eq!(scope.read_pred("countries", None).unwrap(), None);
+        assert_eq!(
+            scope.read_pred("oauth_state", None).unwrap(),
+            scope.read_pred("countries", None).unwrap(),
+            "SharedWritable must be read-identical to Unscoped"
+        );
+        // A read of the sibling tenant table is still own-scoped.
+        let mut sel = Select::from("orders");
+        sel.scope = Some(scope.clone());
+        let (sql, params) = sel.compile(Dialect::Sqlite).unwrap();
+        assert_eq!(sql, "SELECT * FROM orders WHERE tenant_id = ?1");
+        assert_eq!(params, vec![t("acme")]);
+        // And a read of the write-global table injects NO tenant predicate.
+        let mut sel2 = Select::from("oauth_state");
+        sel2.scope = Some(scope.clone());
+        let (sql2, params2) = sel2.compile(Dialect::Sqlite).unwrap();
+        assert_eq!(sql2, "SELECT * FROM oauth_state");
+        assert!(params2.is_empty());
+    }
+
+    #[test]
+    fn m6_high_target_write_to_a_global_table_is_refused() {
+        // HIGH: a TARGET scope may NOT write a write-global table — the write-global arm is
+        // `!is_target()`-gated. Build a target scope whose keys map `oauth_state` to SharedWritable
+        // and `countries` to Unscoped; a write to either must be refused.
+        use std::collections::{BTreeMap, BTreeSet};
+        let target = Scope {
+            column: "tenant_id".into(),
+            value: Some(t("tenant_B")),
+            session: None,
+            mode: ScopeMode::Own,
+            keys: TableKeys::PerTableTarget {
+                keys: schema_503(),
+                public: BTreeMap::new(),
+                // A non-empty write allowlist so the target write path is *enabled* (else it'd be
+                // refused merely for being read-only, masking the arm we want to test).
+                write: BTreeSet::from(["state".to_string(), "code".to_string()]),
+                require_public: false,
+            },
+            // Structurally a target route can't carry this, but set it to prove the arm's guard is
+            // is_target(), not the (empty) set — a defense-in-depth check.
+            unscoped_writes: BTreeSet::from(["oauth_state".to_string(), "countries".to_string()]),
+        };
+        for tbl in ["oauth_state", "countries"] {
+            let mut ins = insert_one(
+                tbl,
+                if tbl == "oauth_state" {
+                    "state"
+                } else {
+                    "code"
+                },
+                t("x"),
+            );
+            let err = ins.force_scope(Some(&target), Some(&target)).unwrap_err();
+            assert!(
+                matches!(err, OrmError::UnscopedWrite(ref t) if t == tbl),
+                "a target write to global {tbl} must be refused: {err:?}"
+            );
+        }
     }
 
     #[test]
@@ -3533,6 +3785,7 @@ mod tests {
                 session: None,
                 mode,
                 keys: TableKeys::Uniform,
+                unscoped_writes: std::collections::BTreeSet::new(),
             };
             ins.force_scope(Some(&s), Some(&s)).unwrap();
             ins
@@ -3578,6 +3831,7 @@ mod tests {
                 session: None,
                 mode,
                 keys: TableKeys::Uniform,
+                unscoped_writes: std::collections::BTreeSet::new(),
             }),
             returning: vec![],
             from_select: None,
@@ -3621,6 +3875,7 @@ mod tests {
                 session: None,
                 mode: ScopeMode::Own,
                 keys: TableKeys::Uniform,
+                unscoped_writes: std::collections::BTreeSet::new(),
             }),
             ..Select::from("order_to_network")
         };
@@ -3815,6 +4070,7 @@ mod tests {
                 session: None,
                 mode: ScopeMode::Own,
                 keys: TableKeys::Uniform,
+                unscoped_writes: std::collections::BTreeSet::new(),
             }),
             returning: vec![item(Expr::col("id"))],
             from_select: None,
@@ -3887,6 +4143,7 @@ mod tests {
                 session: None,
                 mode: ScopeMode::Own,
                 keys: TableKeys::Uniform,
+                unscoped_writes: std::collections::BTreeSet::new(),
             }),
             returning: vec![],
         };
@@ -3966,6 +4223,7 @@ mod tests {
                 session: None,
                 mode: ScopeMode::Own,
                 keys: TableKeys::Uniform,
+                unscoped_writes: std::collections::BTreeSet::new(),
             }),
             returning: vec![],
         };
@@ -4031,6 +4289,7 @@ mod tests {
                 session: None,
                 mode: ScopeMode::Own,
                 keys: TableKeys::Uniform,
+                unscoped_writes: std::collections::BTreeSet::new(),
             }),
             returning: vec![],
         };
@@ -4663,6 +4922,7 @@ mod tests {
                 write: std::collections::BTreeSet::new(),
                 require_public: true,
             },
+            unscoped_writes: std::collections::BTreeSet::new(),
         })
         .unwrap();
         let (sql, _params) = q.compile(Dialect::Sqlite).unwrap();
@@ -4702,6 +4962,7 @@ mod tests {
                 write: std::collections::BTreeSet::new(),
                 require_public: true,
             },
+            unscoped_writes: std::collections::BTreeSet::new(),
         };
         let mut q = Select::from("secret_table");
         // The refusal surfaces at force_scope (join/subquery refs) or compile (base ref).
@@ -4730,6 +4991,7 @@ mod tests {
                 "products".to_string(),
                 ResolvedScope::Column("tenant_id".to_string()),
             )])),
+            unscoped_writes: std::collections::BTreeSet::new(),
         })
         .unwrap();
         let (sql, _p) = q.compile(Dialect::Sqlite).unwrap();
@@ -4764,6 +5026,7 @@ mod tests {
                     ResolvedScope::Column("tenant_id".into()),
                 ),
             ])),
+            unscoped_writes: std::collections::BTreeSet::new(),
         };
         // Base-inclusive read: (tenant = A OR tenant IS NULL).
         let mut pack = Select::from("pack");
@@ -4862,6 +5125,7 @@ mod tests {
                 write: std::collections::BTreeSet::new(),
                 require_public: false, // capability axis (ruling A)
             },
+            unscoped_writes: std::collections::BTreeSet::new(),
         };
         let mut q = Select {
             table_alias: Some("p".into()),
@@ -4929,6 +5193,7 @@ mod tests {
                     .collect::<BTreeSet<_>>(),
                 require_public: true,
             },
+            unscoped_writes: BTreeSet::new(),
         }
     }
 
@@ -4954,6 +5219,7 @@ mod tests {
                     .collect::<BTreeSet<_>>(),
                 require_public: false,
             },
+            unscoped_writes: BTreeSet::new(),
         }
     }
 
@@ -5075,6 +5341,7 @@ mod tests {
                 write: BTreeSet::from(["note".to_string()]),
                 require_public: true,
             },
+            unscoped_writes: std::collections::BTreeSet::new(),
         };
         // INSERT
         let mut ins = Insert {
@@ -5342,6 +5609,7 @@ mod tests {
                 write: BTreeSet::from(["amount".to_string()]),
                 require_public: false, // capability
             },
+            unscoped_writes: std::collections::BTreeSet::new(),
         };
         let mut upd = Update {
             table: "invoices".into(),
@@ -5486,6 +5754,7 @@ mod tests {
                     ResolvedScope::Column("tenant_id".into()),
                 ),
             ])),
+            unscoped_writes: std::collections::BTreeSet::new(),
         };
         let (sql, params) =
             compile_attach_reference(&scope, &attach_spec(), Dialect::Sqlite).unwrap();
@@ -5539,6 +5808,7 @@ mod tests {
                 write: BTreeSet::from(["note".to_string()]),
                 require_public: true,
             },
+            unscoped_writes: std::collections::BTreeSet::new(),
         };
         let (sql, params) =
             compile_attach_reference(&scope, &attach_spec(), Dialect::Sqlite).unwrap();
@@ -5607,6 +5877,7 @@ mod tests {
                 write: BTreeSet::from(["note".to_string()]),
                 require_public: true,
             },
+            unscoped_writes: std::collections::BTreeSet::new(),
         };
         // `price` isn't allowlisted; `visible` is a visibility column — both refused.
         for bad in ["price", "visible", "tenant_id"] {
@@ -5647,6 +5918,7 @@ mod tests {
                     ResolvedScope::Column("tenant_id".into()),
                 ),
             ])),
+            unscoped_writes: std::collections::BTreeSet::new(),
         };
         let spec = AttachReference {
             set: vec![Assignment {
@@ -5677,6 +5949,7 @@ mod tests {
                 ),
                 ("countries".to_string(), ResolvedScope::Unscoped),
             ])),
+            unscoped_writes: std::collections::BTreeSet::new(),
         };
         let spec = AttachReference {
             parent: "countries".into(),

@@ -621,8 +621,11 @@ impl Rewriter<'_> {
                 ))));
             }
             // A globally-readable table carries no tenant predicate — only its public subset (which
-            // must still be declared and non-empty, exactly as the ORM target path requires).
-            ResolvedScope::Unscoped => {}
+            // must still be declared and non-empty, exactly as the ORM target path requires). A
+            // write-global table (#503 `SharedWritable`) is READ-identical here (G2): a target READ
+            // of it carries no tenant predicate either. (A target WRITE never reaches the rewriter —
+            // raw-SQL target writes are refused, and the write-global write arm is `!is_target`.)
+            ResolvedScope::Unscoped | ResolvedScope::SharedWritable => {}
             // Under a target read the principal carries only the `TargetTenant` fact `B` (no session
             // fact), so the R3 disjunct collapses to the single tenant arm `tenant = B`.
             ResolvedScope::TenantOrSession { tenant, .. } => {
