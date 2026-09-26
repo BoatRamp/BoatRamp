@@ -227,6 +227,71 @@ pub fn rewrite_target_select(
 /// write, never widen it. The DB is the final arbiter, so a conservative (over-`None`) extractor is
 /// safe — it can only make a legitimate write fail, never permit a cross-tenant one. Guest input never
 /// reaches a predicate or the GUC name; only the *value* the write already carries sets the GUC.
+/// The **target table** of a raw-SQL WRITE (`INSERT INTO t` / `UPDATE t` / `DELETE FROM t`),
+/// lowercased-last-segment (`schema.t` → `t`), or `None` for a read / a non-single statement / an
+/// unparsable / exotic-source write (#503). Used to resolve the write's declared scope on the
+/// raw-SQL surface so the write-global / `unscoped_writes` exemption AGREES with the ORM
+/// `write_target` (cross-surface parity). `None` fails **closed**: an unresolvable write table is
+/// NOT treated as global, so the required-`{scope}`-marker rule still applies (deny-by-default) — a
+/// conservative extractor can only keep a legitimate write marker-required, never exempt an
+/// un-global one.
+pub fn extract_raw_write_table(statement: &str, dialect: Dialect) -> Option<String> {
+    use sqlparser::ast::{Statement, TableFactor};
+    // The guest `sql` contract is numbered `?N` placeholders on EVERY backend — the storage layer
+    // translates them to `$N` (Postgres) LATER, after this host tenancy layer runs. sqlparser's
+    // Postgres dialect rejects `?N`, so parse the requested dialect first and FALL BACK to the
+    // SQLite dialect (which tolerates `?N`) purely to recover the write's table name — the table of
+    // an INSERT/UPDATE/DELETE is dialect-agnostic, so the fallback cannot mis-identify it. Without
+    // this, a Postgres write-global write would fail to parse here (`None`) and be wrongly refused,
+    // breaking the cross-surface parity on Postgres. (`extract_raw_write_scope_value` keeps the
+    // old-dialect-only parse: `None` there merely leaves an RLS GUC unset, which fails safe.)
+    let parse = |d: Dialect| -> Option<Vec<Statement>> {
+        let sp: Box<dyn SpDialect> = match d {
+            Dialect::Sqlite => Box::new(SQLiteDialect {}),
+            Dialect::Postgres => Box::new(PostgreSqlDialect {}),
+            Dialect::Mysql => Box::new(MySqlDialect {}),
+        };
+        Parser::parse_sql(&*sp, statement).ok()
+    };
+    let stmts = parse(dialect).or_else(|| {
+        if dialect == Dialect::Sqlite {
+            None
+        } else {
+            parse(Dialect::Sqlite)
+        }
+    })?;
+    if stmts.len() != 1 {
+        return None;
+    }
+    let table_of = |name: &sqlparser::ast::ObjectName| -> Option<String> {
+        name.0.last().map(|i| i.value.clone())
+    };
+    match &stmts[0] {
+        Statement::Insert(ins) => table_of(&ins.table_name),
+        Statement::Update { table, .. } => match &table.relation {
+            TableFactor::Table { name, .. } => table_of(name),
+            _ => None,
+        },
+        Statement::Delete(del) => {
+            // A DELETE names its table(s) either in `FROM` or (MySQL multi-table) `tables`.
+            let from = match &del.from {
+                sqlparser::ast::FromTable::WithFromKeyword(t)
+                | sqlparser::ast::FromTable::WithoutKeyword(t) => t,
+            };
+            // A single-table DELETE only (multi-table / joined DELETE is not a global write — fail
+            // closed to marker-required).
+            if from.len() != 1 || !from[0].joins.is_empty() {
+                return None;
+            }
+            match &from[0].relation {
+                TableFactor::Table { name, .. } => table_of(name),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 pub fn extract_raw_write_scope_value(
     statement: &str,
     dialect: Dialect,
@@ -795,6 +860,39 @@ mod raw_write_scope_value_tests {
     }
     fn text(s: &str) -> SqlValue {
         SqlValue::Text(s.to_string())
+    }
+
+    #[test]
+    fn extract_raw_write_table_finds_the_write_target_on_every_dialect() {
+        // #503: the write-table extractor recovers the INSERT/UPDATE/DELETE target on all dialects,
+        // INCLUDING with `?N` placeholders under the Postgres dialect (which sqlparser's PG parser
+        // rejects natively — the SQLite fallback recovers the table name). Reads / multi-table /
+        // exotic sources → None (fail-closed → the write stays marker-required).
+        for d in [Dialect::Sqlite, Dialect::Postgres, Dialect::Mysql] {
+            assert_eq!(
+                extract_raw_write_table("INSERT INTO oauth_state (state) VALUES (?1)", d),
+                Some("oauth_state".into()),
+                "INSERT on {d:?}"
+            );
+            assert_eq!(
+                extract_raw_write_table("UPDATE app.orders SET status = ?1 WHERE id = ?2", d),
+                Some("orders".into()),
+                "UPDATE (schema-qualified) on {d:?}"
+            );
+            assert_eq!(
+                extract_raw_write_table("DELETE FROM sessions WHERE id = ?1", d),
+                Some("sessions".into()),
+                "DELETE on {d:?}"
+            );
+            // A read is not a write target.
+            assert_eq!(
+                extract_raw_write_table("SELECT * FROM orders WHERE id = ?1", d),
+                None,
+                "SELECT on {d:?}"
+            );
+            // Unparsable → None (fail-closed).
+            assert_eq!(extract_raw_write_table("NOT SQL AT ALL", d), None);
+        }
     }
 
     #[test]
