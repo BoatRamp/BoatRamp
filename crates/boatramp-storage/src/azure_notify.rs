@@ -2,6 +2,10 @@
 //! and consumer (PLAN-storage-backends S4; unblocks FA-5b2 Azure) — the Azure
 //! counterpart to [`s3_notify`](crate::s3_notify)/[`gcs_notify`](crate::gcs_notify).
 //!
+//! Built on the **1.x GA** `azure_storage_queue` crate (singular — the 0.21
+//! `azure_storage_queues` line was dropped), authenticated with the hand-rolled
+//! [`SharedKeyAuthorizationPolicy`](crate::azure_shared_key) (account-key / Azurite).
+//!
 //! Two halves:
 //! - **Provisioning** ([`AzureWatchProvider`]): creates/verifies/retracts the
 //!   **Storage Queue** (shared account-key auth). The **Event Grid subscription**
@@ -19,17 +23,53 @@
 //! methods run against real Azure behind the `#[ignore]`d live seam.
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 use async_trait::async_trait;
-use azure_core::StatusCode;
-use azure_core::error::ErrorKind;
-use azure_storage_queues::PopReceipt;
-use azure_storage_queues::prelude::{QueueClient, QueueServiceClient};
+use azure_core_v1::error::ErrorKind;
+use azure_core_v1::http::{ClientOptions, StatusCode, Url};
+use azure_storage_queue::models::{
+    QueueClientDeleteMessageOptions, QueueClientDeleteOptions, QueueClientGetPropertiesOptions,
+    QueueClientReceiveMessagesOptions,
+};
+use azure_storage_queue::{QueueClient, QueueServiceClient, QueueServiceClientOptions};
 use base64::Engine;
 use boatramp_core::blob_notify::{ManagedResource, prefix_slug};
 use boatramp_core::blob_provision::{ProvisionError, WatchProvider};
-use boatramp_core::{BlobChange, BlobChangeKind, ChangeStream};
+use boatramp_core::{BlobChange, BlobChangeKind, ChangeStream, StorageError};
 use futures::StreamExt;
+
+use crate::azure::AzureOptions;
+use crate::azure_shared_key::{SharedKeyAuthorizationPolicy, SharedKeyResource};
+
+/// The Storage Queue **service** client (1.x), behind [`Arc`] because the SDK client
+/// is not `Clone`. Aliased so `azure.rs` can name it without importing the SDK crate
+/// directly and so both [`AzureStorage`](crate::azure::AzureStorage) and
+/// [`AzureWatchProvider`] stay cheaply cloneable.
+pub type QueueService = Arc<QueueServiceClient>;
+
+/// Build a 1.x [`QueueServiceClient`] for `opts`, injecting the Shared Key signing
+/// policy (account-key / Azurite auth) as a per-try policy.
+pub fn build_queue_service(opts: &AzureOptions) -> Result<QueueService, StorageError> {
+    let (account, key) = opts.queue_shared_key()?;
+    let url = Url::parse(&opts.queue_service_url_pub())
+        .map_err(|e| StorageError::backend(format!("invalid Azure queue service URL: {e}")))?;
+    let policy = Arc::new(SharedKeyAuthorizationPolicy::new(
+        account,
+        key,
+        SharedKeyResource::Queue,
+    ));
+    let options = QueueServiceClientOptions {
+        client_options: ClientOptions {
+            per_try_policies: vec![policy],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let client = QueueServiceClient::new(url, None, Some(options))
+        .map_err(|e| StorageError::backend(format!("Azure QueueServiceClient: {e}")))?;
+    Ok(Arc::new(client))
+}
 
 // ===========================================================================
 // Pure helpers (natively unit-tested; no SDK, no IO)
@@ -131,7 +171,7 @@ pub(crate) fn parse_eventgrid_event(body: &str) -> Vec<BlobChange> {
 /// the module docs + [`recipe`](AzureWatchProvider::recipe)).
 #[derive(Clone)]
 pub struct AzureWatchProvider {
-    queues: QueueServiceClient,
+    queues: QueueService,
     account: String,
     container: String,
 }
@@ -140,7 +180,7 @@ impl AzureWatchProvider {
     /// Build a provider from a Storage Queue service client, the storage account
     /// name, and the container whose blob events feed the pipeline.
     pub fn new(
-        queues: QueueServiceClient,
+        queues: QueueService,
         account: impl Into<String>,
         container: impl Into<String>,
     ) -> Self {
@@ -182,10 +222,10 @@ impl WatchProvider for AzureWatchProvider {
 
     async fn provision(&self, prefix: &str) -> Result<Vec<ManagedResource>, ProvisionError> {
         let name = queue_name(prefix);
-        let queue = self.queues.queue_client(&name);
+        let queue = self.queues.queue_client(&name).map_err(az_err)?;
         // Idempotent: an existing queue with no metadata create returns success; a
         // conflicting one (409) is treated as already-present.
-        match queue.create().await {
+        match queue.create(None).await {
             Ok(_) => {}
             Err(err) if is_conflict(&err) => {}
             Err(err) => return Err(az_err(err)),
@@ -196,10 +236,16 @@ impl WatchProvider for AzureWatchProvider {
     async fn verify(&self, prefix: &str) -> Result<bool, ProvisionError> {
         // Get Queue Metadata (`GET ?comp=metadata`) is the side-effect-free existence
         // probe: 200 for an existing queue (empty or not), 404 when it is absent. It
-        // neither reads nor hides a message. (A `get_messages` peek can't stand in — its
+        // neither reads nor hides a message. (A message peek can't stand in — its
         // `numofmessages` must be 1–32, so a zero-message probe is a 400.)
-        let queue = self.queues.queue_client(queue_name(prefix));
-        match queue.get_metadata().await {
+        let queue = self
+            .queues
+            .queue_client(&queue_name(prefix))
+            .map_err(az_err)?;
+        match queue
+            .get_properties(None::<QueueClientGetPropertiesOptions>)
+            .await
+        {
             Ok(_) => Ok(true),
             Err(err) if is_not_found(&err) => Ok(false),
             Err(err) => Err(az_err(err)),
@@ -207,9 +253,11 @@ impl WatchProvider for AzureWatchProvider {
     }
 
     async fn retract(&self, resources: &[ManagedResource]) -> Result<(), ProvisionError> {
-        if let Some(queue) = resources.iter().find(|r| r.kind == "storage-queue") {
+        if let Some(resource) = resources.iter().find(|r| r.kind == "storage-queue")
+            && let Ok(queue) = self.queues.queue_client(&resource.id)
+        {
             // Best-effort: a missing queue is not an error.
-            let _ = self.queues.queue_client(&queue.id).delete().await;
+            let _ = queue.delete(None::<QueueClientDeleteOptions>).await;
         }
         Ok(())
     }
@@ -229,15 +277,29 @@ pub(crate) fn azure_watch_stream(queue: QueueClient, prefix: String) -> ChangeSt
             if let Some(change) = pending.pop_front() {
                 return Some((change, (queue, prefix, pending)));
             }
-            let response = match queue.get_messages().number_of_messages(10u8).await {
+            let options = QueueClientReceiveMessagesOptions {
+                number_of_messages: Some(10),
+                ..Default::default()
+            };
+            let response = match queue.receive_messages(Some(options)).await {
                 Ok(response) => response,
                 Err(_) => return None, // transient — reconcile respawns the watcher
             };
-            for message in response.messages {
-                let changes = parse_eventgrid_event(&message.message_text);
-                // Ack: delete by pop receipt so the message does not redeliver.
-                let receipt = PopReceipt::new(message.message_id, message.pop_receipt);
-                let _ = queue.pop_receipt_client(receipt).delete().await;
+            let messages = match response.into_model() {
+                Ok(model) => model.items.unwrap_or_default(),
+                Err(_) => return None,
+            };
+            for message in messages {
+                let text = message.message_text.unwrap_or_default();
+                let changes = parse_eventgrid_event(&text);
+                // Ack: delete by message id + pop receipt so the message does not
+                // redeliver. (The 0.21 `PopReceipt`/`pop_receipt_client` indirection is
+                // gone in 1.x — `delete_message` takes both directly.)
+                if let (Some(id), Some(receipt)) = (message.message_id, message.pop_receipt) {
+                    let _ = queue
+                        .delete_message(&id, &receipt, None::<QueueClientDeleteMessageOptions>)
+                        .await;
+                }
                 for change in changes {
                     if change.key.starts_with(&prefix) {
                         pending.push_back(change);
@@ -253,15 +315,15 @@ pub(crate) fn azure_watch_stream(queue: QueueClient, prefix: String) -> ChangeSt
 // Error mapping
 // ===========================================================================
 
-fn is_not_found(err: &azure_core::Error) -> bool {
+fn is_not_found(err: &azure_core_v1::Error) -> bool {
     matches!(err.kind(), ErrorKind::HttpResponse { status, .. } if *status == StatusCode::NotFound)
 }
 
-fn is_conflict(err: &azure_core::Error) -> bool {
+fn is_conflict(err: &azure_core_v1::Error) -> bool {
     matches!(err.kind(), ErrorKind::HttpResponse { status, .. } if *status == StatusCode::Conflict)
 }
 
-fn az_err(err: azure_core::Error) -> ProvisionError {
+fn az_err(err: azure_core_v1::Error) -> ProvisionError {
     ProvisionError::Backend(err.to_string())
 }
 
@@ -334,5 +396,20 @@ mod tests {
         assert_eq!(changes[0].key, "up/gone.bin");
         // Garbage / non-JSON yields nothing.
         assert!(parse_eventgrid_event("not json at all").is_empty());
+    }
+
+    /// The queue service client builds against Azurite (the Shared Key policy is
+    /// injected); no live call.
+    #[test]
+    fn queue_service_builds_against_azurite() {
+        let opts = AzureOptions {
+            account: String::new(),
+            container: "data".into(),
+            access_key: None,
+            emulator: true,
+        };
+        let queues = build_queue_service(&opts).unwrap();
+        // A queue client for a derived name builds.
+        let _ = queues.queue_client(&queue_name("hblob/fn/up/")).unwrap();
     }
 }
