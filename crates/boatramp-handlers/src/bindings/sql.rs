@@ -548,21 +548,24 @@ fn stmt_axis(statement: &str) -> crate::tenant::Axis {
     }
 }
 
-/// Fill the raw-SQL `{scope}` marker for a scoped-tenancy invocation (Stage 0). Returns the
-/// statement to run, appending the tenant value to `params` when the mode binds one.
+/// Confine a raw-SQL statement for a scoped-tenancy invocation (Stage 0). Returns the statement to
+/// run. Since v0.5.x the confinement is **host-injected structurally** at the AST level for EVERY
+/// axis — own/session (the P0 fix) as well as target — so the guest-cooperative `{scope}` marker is
+/// no longer required and cannot be repositioned or `OR`-escaped. A stray `{scope}` is neutralised to
+/// `1 = 1` before the rewrite so a copy-pasted marker still parses; `params` is untouched (the tenant
+/// literals are injected as escaped literals, not bound, so the guest's own positional params keep
+/// their numbering).
 ///
 /// - **No tenancy** (plain): a stray marker is neutralised to `1 = 1` (a scoped app never lands
 ///   here; this only guards against an accidental marker on an unscoped function).
-/// - **Target read** (R4/D8): the guest-cooperative marker cannot confine another tenant's data
-///   across joins/subqueries, so the WHOLE statement is instead rewritten AST-side — every table
-///   reference is confined to `tenant = B AND <public subset>` and the statement is required to be
-///   read-only (fail-closed). The guest writes plain SQL; a stray marker is neutralised first so a
-///   copy-pasted `{scope}` still parses. `dialect` selects the parser for the backend engine.
-/// - **Scoped (own/session)**: the axis grant is consulted first (a `none` grant is refused
-///   outright), then the marker is **required** — an unmarked scoped statement is refused
-///   (fail-closed) rather than run across tenants — and substituted with the host predicate. The
-///   predicate references the appended value as `?<N+1>`, so it is correct wherever the marker sits;
-///   the value is appended once even if the marker repeats.
+/// - **Target read** (R4/D8): the WHOLE statement is AST-rewritten — every table reference confined
+///   to `tenant = B AND <public subset>`, read-only enforced (fail-closed).
+/// - **Own/session** (the P0 fix): the WHOLE statement is AST-rewritten per axis — a READ confines
+///   every table reference to the caller's own/session partition; a WRITE (UPDATE/DELETE/INSERT) gets
+///   the tenant bound structurally injected (UPDATE/DELETE WHERE-AND, INSERT force-stamp), an UPDATE
+///   cannot re-tenant, and an `Unscoped` write is refused. A `none` grant is refused outright; `all`
+///   runs unconfined (its RLS backstop applied separately). Fail-closed on unparseable / no-principal
+///   / undeclared / unsupported shape — never a fall-back to the old escapable marker.
 fn apply_scope_marker(
     tenancy: Option<&crate::tenant::HostTenancy>,
     axis: crate::tenant::Axis,
@@ -571,37 +574,35 @@ fn apply_scope_marker(
     dialect: boatramp_core::sql::Dialect,
 ) -> Result<String, SqlError> {
     use crate::tenant::SCOPE_MARKER;
+    let _ = params; // the AST rewrite injects host literals, not bound params — numbering is stable.
     let Some(ht) = tenancy else {
         // Unscoped: neutralise any stray marker so the statement still parses.
         return Ok(statement.replace(SCOPE_MARKER, "1 = 1"));
     };
+    // The `{scope}` marker is now OPTIONAL and inert (confinement is host-injected structurally):
+    // neutralise it to `1 = 1` so a copy-pasted marker still parses, then AST-rewrite the whole
+    // statement so the guest can neither move nor `OR`-escape the confinement.
+    let neutralised = statement.replace(SCOPE_MARKER, "1 = 1");
     if ht.is_target() {
-        // Target read: the marker is not used — the host AST-rewrites the whole statement, confining
-        // EVERY table reference (root/join/subquery/CTE/set-op) to `tenant = B AND <public>`. The
-        // rewriter itself enforces read-only, so a target write is refused there (belt-and-suspenders
-        // with the write-axis grant, which is `None` under a target principal). Neutralise a stray
-        // marker first so a copy-pasted `{scope}` does not break the parse. B + public literals are
-        // injected by the rewriter, so `params` is left untouched.
-        let neutralised = statement.replace(SCOPE_MARKER, "1 = 1");
+        // Target read (R4/D8): confine EVERY table reference (root/join/subquery/CTE/set-op) to
+        // `tenant = B AND <public>`; the rewriter enforces read-only (a target write is refused
+        // there, belt-and-suspenders with the `None` write-axis grant).
         return ht
             .rewrite_target_read(&neutralised, dialect)
             .map_err(|e| SqlError::Other(e.reason()));
     }
-    let (pred, values) = ht
-        .sql_marker(axis, params.len())
-        .map_err(|d| SqlError::Other(d.reason().to_string()))?;
-    if ht.requires_marker(axis) && !statement.contains(SCOPE_MARKER) {
-        return Err(SqlError::Other(format!(
-            "tenancy: a scoped raw-SQL statement must contain the {SCOPE_MARKER} marker \
-             (the host injects the tenant predicate there); none found"
-        )));
+    // Own/session (the P0 fix): AST-rewrite for the axis the STATEMENT exercises — a read confines
+    // every table reference to the own/session partition; a write structurally injects the tenant
+    // bound (and force-stamp / no-re-tenant on INSERT/UPDATE). Fail-closed on any refusal.
+    match axis {
+        crate::tenant::Axis::Read => ht.rewrite_own_read(&neutralised, dialect),
+        crate::tenant::Axis::Write => ht.rewrite_own_write(&neutralised, dialect),
     }
-    // Append the marker's bound values in placeholder order (the tenant `B`, then a target read's
-    // public-subset literals). The marker references them as `?<len+1..>`, so they are correct
-    // wherever the marker sits; appended once even if the marker repeats (the predicate is stable).
-    params.extend(values);
-    Ok(statement.replace(SCOPE_MARKER, &pred))
+    .map_err(|e| SqlError::Other(e.reason()))
 }
+
+// `apply_scope_marker` returns the confined statement; the own/session confinement is now
+// host-injected structurally (the `{scope}` marker is optional/ignored — see the fn doc).
 
 /// Map guest parameter values to backend values (libsql, SQLite-family, binds a
 /// `Boolean` as `0`/`1`).
@@ -1157,27 +1158,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scoped_raw_sql_without_the_marker_is_refused() {
-        use boatramp_core::tenancy::AccessMode;
-        let log = Arc::new(Mutex::new(Vec::new()));
-        let mut session = scoped_session(log.clone(), AccessMode::Own, AccessMode::Own);
-        let mut table = ResourceTable::new();
-        let mut host = SqlHost::new(&mut table, &mut session);
-        let db = host.open(String::new()).unwrap();
-        // No `{scope}` marker on a scoped read ⇒ refused before the backend (fail-closed).
-        let err = host
-            .query(db, "SELECT * FROM orders".into(), vec![])
-            .await
-            .unwrap_err();
-        assert!(matches!(err, sql_types::Error::Other(m) if m.contains("{scope}")));
-        assert!(
-            log.lock().unwrap().is_empty(),
-            "nothing reached the backend"
-        );
-    }
-
-    #[tokio::test]
-    async fn scoped_raw_sql_marker_is_filled_with_the_host_tenant() {
+    async fn scoped_raw_sql_without_the_marker_is_now_ast_confined() {
         use boatramp_core::tenancy::AccessMode;
         let log = Arc::new(Mutex::new(Vec::new()));
         let mut session = scoped_session(log.clone(), AccessMode::Own, AccessMode::Own);
@@ -1185,7 +1166,33 @@ mod tests {
         {
             let mut host = SqlHost::new(&mut table, &mut session);
             let db = host.open(String::new()).unwrap();
-            // One guest param (?1); the injected predicate binds the appended ?2 = "ten_1".
+            // The P0 fix: a scoped read no longer NEEDS the `{scope}` marker — the whole statement is
+            // AST-confined to the caller's own tenant. It runs (no refusal) with the confinement
+            // host-injected onto the table reference (`Uniform` keys → the `tenant_id` column).
+            host.query(db, "SELECT * FROM orders".into(), vec![])
+                .await
+                .unwrap();
+        }
+        let log = log.lock().unwrap();
+        assert!(
+            log.iter()
+                .any(|l| l.contains("SELECT * FROM orders WHERE orders.tenant_id = 'ten_1'")),
+            "the read is AST-confined to the own tenant (no marker needed): {log:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_raw_sql_read_is_ast_confined_and_marker_is_inert() {
+        use boatramp_core::tenancy::AccessMode;
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut session = scoped_session(log.clone(), AccessMode::Own, AccessMode::Own);
+        let mut table = ResourceTable::new();
+        {
+            let mut host = SqlHost::new(&mut table, &mut session);
+            let db = host.open(String::new()).unwrap();
+            // A stray `{scope}` marker is now OPTIONAL and inert (neutralised to `1 = 1`); the real
+            // confinement is host-injected structurally as an escaped literal, so the guest's own
+            // `?1` param keeps its numbering (undisturbed) and the tenant is NOT a bound param.
             host.query(
                 db,
                 "SELECT * FROM orders WHERE status = ?1 AND {scope}".into(),
@@ -1195,10 +1202,13 @@ mod tests {
             .unwrap();
         }
         let log = log.lock().unwrap();
-        assert!(log.iter().any(|l| {
-            l.contains("SELECT * FROM orders WHERE status = ?1 AND tenant_id = ?2")
-                && l.contains("ten_1")
-        }));
+        assert!(
+            log.iter().any(|l| {
+                l.contains("SELECT * FROM orders WHERE (status = ?1 AND 1 = 1) AND orders.tenant_id = 'ten_1'")
+                    && !l.contains("?2")
+            }),
+            "marker inert (1=1), confinement AST-injected as a literal, guest ?1 undisturbed: {log:?}"
+        );
     }
 
     #[tokio::test]
@@ -1213,7 +1223,7 @@ mod tests {
         // A DELETE routed through query() must be judged a WRITE (write: none) and refused —
         // it must NOT run under the read grant.
         let err = host
-            .query(db, "DELETE FROM orders WHERE {scope}".into(), vec![])
+            .query(db, "DELETE FROM orders WHERE id = 1".into(), vec![])
             .await
             .unwrap_err();
         assert!(matches!(err, sql_types::Error::Other(m) if m.contains("not granted access")));
@@ -1233,15 +1243,16 @@ mod tests {
         {
             let mut host = SqlHost::new(&mut table, &mut session);
             let db = host.open(String::new()).unwrap();
-            host.execute(db, "SELECT 1 FROM t WHERE {scope}".into(), vec![])
+            host.execute(db, "SELECT 1 FROM t WHERE id = 1".into(), vec![])
                 .await
                 .unwrap();
         }
+        // A SELECT via execute() is a READ regardless of the entry method — AST-confined to own.
         assert!(
             log.lock()
                 .unwrap()
                 .iter()
-                .any(|l| l.contains("SELECT 1 FROM t WHERE tenant_id = ?1"))
+                .any(|l| l.contains("SELECT 1 FROM t WHERE (id = 1) AND t.tenant_id = 'ten_1'"))
         );
     }
 

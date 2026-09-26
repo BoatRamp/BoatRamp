@@ -70,7 +70,7 @@ use sqlparser::ast::{
 use sqlparser::dialect::{Dialect as SpDialect, MySqlDialect, PostgreSqlDialect, SQLiteDialect};
 use sqlparser::parser::Parser;
 
-use crate::orm::{CmpOp, PublicTermSql};
+use crate::orm::{CmpOp, PublicTermSql, ScopeMode};
 use crate::sql::{Dialect, SqlValue};
 use crate::tenancy::ResolvedScope;
 
@@ -270,20 +270,51 @@ pub fn rewrite_target_select(
 
 // ---- own/session read + write (the P0 marker-escape fix) -------------------
 
+/// Per-table tenant-key resolution for a raw-SQL own confinement — the applied side of
+/// [`orm::TableKeys`](crate::orm::TableKeys)'s own/session cases (the target case is
+/// [`rewrite_target_select`]). `Uniform` (no project schema) scopes EVERY table on one column,
+/// byte-identical to the pre-schema single-column raw-SQL marker; `PerTable` is the project schema's
+/// authoritative map (the identity table on its PK, `Unscoped` tables skipped, undeclared tables
+/// refused — deny-by-default).
+pub enum OwnKeys<'a> {
+    /// Every table scopes on this one tenant column (legacy `Uniform`).
+    Uniform(String),
+    /// The project schema's per-table map (authoritative + exhaustive; an absent table is refused).
+    PerTable(&'a BTreeMap<String, ResolvedScope>),
+}
+
+impl OwnKeys<'_> {
+    /// Resolve `table`'s scope: `Uniform` → `Column(col)` for every table; `PerTable` → the map entry
+    /// (deny-by-default — an absent table is [`TenancyUndeclared`](TargetRewriteError::TenancyUndeclared)).
+    fn resolve(&self, table: &str) -> Result<ResolvedScope, TargetRewriteError> {
+        match self {
+            OwnKeys::Uniform(col) => Ok(ResolvedScope::Column(col.clone())),
+            OwnKeys::PerTable(m) => m
+                .get(table)
+                .cloned()
+                .ok_or_else(|| TargetRewriteError::TenancyUndeclared(table.to_string())),
+        }
+    }
+}
+
 /// The resolved own/session facts a raw-SQL own confinement injects (the applied side of the
 /// principal, mirroring [`orm::Scope`](crate::orm::Scope)'s `value`/`session`/`keys`). Built by the
 /// host from the verified principal + the project schema — NEVER guest input. `own` is the resolved
 /// own-tenant value (`None` for a purely anonymous, session-only actor); `session` the resolved
-/// anonymous-session value (R3); `keys` the per-table tenant-key map (the identity table on its PK,
-/// `Unscoped` tables skipped, undeclared tables refused).
+/// anonymous-session value (R3); `keys` the per-table tenant-key resolution.
 pub struct OwnScope<'a> {
     /// The resolved own-tenant value, or `None` for an anonymous (session-only) actor.
     pub own: Option<&'a SqlValue>,
     /// The resolved anonymous-session value (R3), or `None`.
     pub session: Option<&'a SqlValue>,
-    /// Per-table tenant-key resolution (from the project schema; `Uniform` collapses to a single
-    /// column via a one-entry-style map the host builds — see [`crate::tenant`]).
-    pub keys: &'a BTreeMap<String, ResolvedScope>,
+    /// The field-level tenant-axis restriction (mirrors [`orm::ScopeMode`](crate::orm::ScopeMode)):
+    /// `Own` → `col = <own>`; `OwnOrNull` → `(col = <own> OR col IS NULL)`; `NullOnly` → `col IS
+    /// NULL` (baseline only). `All` is never routed here (a cross-tenant grant is unconfined). A
+    /// per-table `TenantOrSession` overrides to its R3 disjunct; `TenantOrBase` always folds the NULL
+    /// base — exactly as `orm::Scope::read_pred`.
+    pub mode: ScopeMode,
+    /// Per-table tenant-key resolution (legacy single-column `Uniform`, or the project schema's map).
+    pub keys: OwnKeys<'a>,
 }
 
 /// Rewrite a guest's **raw-SQL own/session READ** so every table reference is confined to the
@@ -378,21 +409,30 @@ fn write_target(
     scope: &OwnScope<'_>,
     table: &str,
 ) -> Result<(String, SqlValue), TargetRewriteError> {
-    let resolved = scope
-        .keys
-        .get(table)
-        .ok_or_else(|| TargetRewriteError::TenancyUndeclared(table.to_string()))?;
-    let own = || scope.own.cloned().ok_or(TargetRewriteError::NoPrincipal);
-    match resolved {
-        // A plain tenant `Column` and a base-inclusive `TenantOrBase` both stamp the resolved own
-        // tenant (never NULL — the shared base is read-only for a guest, exactly as the ORM).
+    let resolved = scope.keys.resolve(table)?;
+    // The tenant-axis stamp value for the field mode (mirrors `orm::Scope::write_target`):
+    // `Own`/`OwnOrNull` → the resolved own tenant; `NullOnly` → the shared baseline (`NULL`); `All`
+    // never reaches here. Fail-closed when an own stamp is required but no principal is present.
+    let stamp = || -> Result<SqlValue, TargetRewriteError> {
+        match scope.mode {
+            ScopeMode::NullOnly => Ok(SqlValue::Null),
+            ScopeMode::Own | ScopeMode::OwnOrNull => {
+                scope.own.cloned().ok_or(TargetRewriteError::NoPrincipal)
+            }
+            ScopeMode::All => Err(TargetRewriteError::NoPrincipal),
+        }
+    };
+    match &resolved {
+        // A plain tenant `Column` and a base-inclusive `TenantOrBase` both stamp per the field mode
+        // (own/own+null → the resolved tenant; null → the shared baseline). A guest write can never
+        // create/update a NULL-base row under an own grant — exactly as the ORM.
         ResolvedScope::Column(col) => {
             check_ident(col)?;
-            Ok((col.clone(), own()?))
+            Ok((col.clone(), stamp()?))
         }
         ResolvedScope::TenantOrBase { tenant } => {
             check_ident(tenant)?;
-            Ok((tenant.clone(), own()?))
+            Ok((tenant.clone(), stamp()?))
         }
         // Prefer the tenant axis when authenticated; else the session axis for an anon write.
         ResolvedScope::TenantOrSession { tenant, session } => {
@@ -410,16 +450,20 @@ fn write_target(
     }
 }
 
-/// The single-table write bound as an `Expr` for a `WHERE`/`ON`: `col = <value>` (a NULL stamp value
-/// is never produced on the own/session write path — own and session values are always non-NULL — so
-/// this is always an equality).
+/// The single-table write bound as an `Expr` for a `WHERE`/`ON`: `col = <value>`, or `col IS NULL`
+/// for the explicit `NullOnly` baseline grant (a NULL stamp value ⇒ `IS NULL`, exactly as the ORM's
+/// `single_scope_pred`; own/session values are never NULL, so this is unambiguous).
 fn write_bound_expr(scope: &OwnScope<'_>, table: &str) -> Result<Expr, TargetRewriteError> {
     let (col, value) = write_target(scope, table)?;
-    Ok(binop(
-        Expr::Identifier(Ident::new(col)),
-        BinaryOperator::Eq,
-        value_expr(&value)?,
-    ))
+    Ok(if matches!(value, SqlValue::Null) {
+        Expr::IsNull(Box::new(Expr::Identifier(Ident::new(col))))
+    } else {
+        binop(
+            Expr::Identifier(Ident::new(col)),
+            BinaryOperator::Eq,
+            value_expr(&value)?,
+        )
+    })
 }
 
 /// Confine any `Query` subquery embedded in a write's SET value / WHERE / RETURNING through the SAME
@@ -603,7 +647,7 @@ fn confine_own_insert(
         // otherwise append the column + a stamped cell to every row.
         SetExpr::Values(values) => {
             let col_pos = columns.iter().position(|c| same_col(&c.value, &tenant_col));
-            let stamp = value_expr(&own_val)?;
+            let stamp = stamp_value_expr(&own_val)?;
             match col_pos {
                 Some(i) => {
                     for row in &mut values.rows {
@@ -946,20 +990,33 @@ impl Confiner for OwnConfiner<'_> {
         table: &str,
         qualifier: &Ident,
     ) -> Result<Option<Expr>, TargetRewriteError> {
-        let resolved = self
-            .scope
-            .keys
-            .get(table)
-            .ok_or_else(|| TargetRewriteError::TenancyUndeclared(table.to_string()))?;
-        match resolved {
+        let resolved = self.scope.keys.resolve(table)?;
+        match &resolved {
+            // A plain tenant `Column` honors the field-level mode, exactly as `orm::Scope::tenant_pred`:
+            // `Own` → `col = <own>`; `OwnOrNull` → `(col = <own> OR col IS NULL)`; `NullOnly` → `col
+            // IS NULL` (no own value needed). `All` never reaches here (routed to the unscoped path).
             ResolvedScope::Column(col) => {
                 check_ident(col)?;
-                let own = own_value_expr(self.scope.own)?;
-                Ok(Some(binop(
-                    col_expr(qualifier, col),
-                    BinaryOperator::Eq,
-                    own,
-                )))
+                let is_null = || Expr::IsNull(Box::new(col_expr(qualifier, col)));
+                Ok(Some(match self.scope.mode {
+                    ScopeMode::NullOnly => is_null(),
+                    ScopeMode::Own => binop(
+                        col_expr(qualifier, col),
+                        BinaryOperator::Eq,
+                        own_value_expr(self.scope.own)?,
+                    ),
+                    ScopeMode::OwnOrNull => {
+                        let eq = binop(
+                            col_expr(qualifier, col),
+                            BinaryOperator::Eq,
+                            own_value_expr(self.scope.own)?,
+                        );
+                        Expr::Nested(Box::new(or(eq, is_null())))
+                    }
+                    // `All` is unconfined — never routed to the own confiner (a cross-tenant grant
+                    // skips the rewrite). Refuse fail-closed rather than emit an unbounded read.
+                    ScopeMode::All => return Err(TargetRewriteError::NoPrincipal),
+                }))
             }
             ResolvedScope::TenantOrBase { tenant } => {
                 check_ident(tenant)?;
@@ -1373,12 +1430,23 @@ fn value_expr(value: &SqlValue) -> Result<Expr, TargetRewriteError> {
     }))
 }
 
-/// Render a host-held [`SqlValue`] as a safe SQL literal **string** — the text form of
-/// [`value_expr`], for the one place an own INSERT … SELECT wrapper is built from text (a rare
-/// shape). Uses sqlparser's own `Display` so text is escaped identically (quotes doubled); a
-/// blob/JSON/NULL/non-finite float is refused (fail-closed).
+/// Render a host-held tenant **stamp** value as a literal expression: like [`value_expr`], but a
+/// `SqlValue::Null` (the explicit `NullOnly` baseline stamp) renders as the SQL `NULL` literal rather
+/// than being refused (a stamp legitimately writes the shared baseline; a *read/where* NULL is
+/// `IS NULL`, handled separately).
+fn stamp_value_expr(value: &SqlValue) -> Result<Expr, TargetRewriteError> {
+    if matches!(value, SqlValue::Null) {
+        Ok(Expr::Value(Value::Null))
+    } else {
+        value_expr(value)
+    }
+}
+
+/// Render a host-held tenant stamp as a safe SQL literal **string** — the text form of
+/// [`stamp_value_expr`], for the one place an own INSERT … SELECT wrapper is built from text (a rare
+/// shape). Uses sqlparser's own `Display` so text is escaped identically (quotes doubled).
 fn render_literal(value: &SqlValue) -> Result<String, TargetRewriteError> {
-    Ok(value_expr(value)?.to_string())
+    Ok(stamp_value_expr(value)?.to_string())
 }
 
 /// A conservative SQL-identifier check (matches the tenant-column check on the applied side):
@@ -2055,7 +2123,12 @@ mod own_confinement_tests {
         session: Option<&'a SqlValue>,
         keys: &'a BTreeMap<String, ResolvedScope>,
     ) -> OwnScope<'a> {
-        OwnScope { own, session, keys }
+        OwnScope {
+            own,
+            session,
+            mode: ScopeMode::Own,
+            keys: OwnKeys::PerTable(keys),
+        }
     }
 
     // ---- READ -------------------------------------------------------------
@@ -2138,6 +2211,57 @@ mod own_confinement_tests {
         assert_eq!(
             out,
             "SELECT * FROM packs WHERE (packs.tenant_id = 'A' OR packs.tenant_id IS NULL)"
+        );
+    }
+
+    #[test]
+    fn read_and_write_honor_own_or_null_and_null_only_modes() {
+        let k = keys();
+        let a = t("A");
+        // OwnOrNull READ → (col = A OR col IS NULL).
+        let out = rewrite_own_read(
+            "SELECT * FROM orders",
+            &OwnScope {
+                own: Some(&a),
+                session: None,
+                mode: ScopeMode::OwnOrNull,
+                keys: OwnKeys::PerTable(&k),
+            },
+            Dialect::Sqlite,
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            "SELECT * FROM orders WHERE (orders.tenant_id = 'A' OR orders.tenant_id IS NULL)"
+        );
+        // NullOnly READ → col IS NULL (no own value needed).
+        let out = rewrite_own_read(
+            "SELECT * FROM orders",
+            &OwnScope {
+                own: None,
+                session: None,
+                mode: ScopeMode::NullOnly,
+                keys: OwnKeys::PerTable(&k),
+            },
+            Dialect::Sqlite,
+        )
+        .unwrap();
+        assert_eq!(out, "SELECT * FROM orders WHERE orders.tenant_id IS NULL");
+        // NullOnly WRITE → the DELETE bound is `tenant_id IS NULL` (baseline-only write).
+        let out = rewrite_own_write(
+            "DELETE FROM orders WHERE id = 1",
+            &OwnScope {
+                own: None,
+                session: None,
+                mode: ScopeMode::NullOnly,
+                keys: OwnKeys::PerTable(&k),
+            },
+            Dialect::Sqlite,
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            "DELETE FROM orders WHERE (id = 1) AND tenant_id IS NULL"
         );
     }
 
@@ -2410,6 +2534,39 @@ mod own_confinement_tests {
                 .unwrap_err(),
             TargetRewriteError::UnsupportedInsert(_)
         ));
+    }
+
+    #[test]
+    fn uniform_keys_scope_every_table_on_one_column() {
+        // Legacy `Uniform` (no project schema): every table scopes on the single column, matching
+        // the pre-schema raw-SQL marker behavior — but now unescapable (AST-injected).
+        let a = t("A");
+        let scope = OwnScope {
+            own: Some(&a),
+            session: None,
+            mode: ScopeMode::Own,
+            keys: OwnKeys::Uniform("tenant_id".to_string()),
+        };
+        let out = rewrite_own_read(
+            "SELECT * FROM anything WHERE 1=1 OR 1=1",
+            &scope,
+            Dialect::Sqlite,
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            "SELECT * FROM anything WHERE (1 = 1 OR 1 = 1) AND anything.tenant_id = 'A'"
+        );
+        let out = rewrite_own_write(
+            "UPDATE whatever SET x=1 WHERE 1=1 OR 1=1",
+            &scope,
+            Dialect::Sqlite,
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            "UPDATE whatever SET x = 1 WHERE (1 = 1 OR 1 = 1) AND tenant_id = 'A'"
+        );
     }
 
     #[test]
