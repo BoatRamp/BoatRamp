@@ -573,11 +573,18 @@ pub struct NodeOperatorSql {
     kv: Arc<dyn KvStore>,
     envelope: Option<Arc<dyn KeyEnvelope>>,
     deploy: DeployStore,
+    /// Injectable source for the config-named `url_env`/`read_url_env`/`migration_url_env`/
+    /// `password_env` host-env lookups. Production leaves it [`SystemEnv`](boatramp_core::env::SystemEnv);
+    /// a test wires a `MapEnv` via [`with_env_source`](Self::with_env_source) so the DDL-identity /
+    /// distinctness checks are exercised without mutating (or racing on) the global process
+    /// environment (which is also `unsafe` to mutate in edition 2024).
+    env_source: Arc<dyn boatramp_core::env::EnvSource>,
 }
 
 #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
 impl NodeOperatorSql {
-    /// Build over the handler `sql` `databases` config + the credential store.
+    /// Build over the handler `sql` `databases` config + the credential store. Host-env
+    /// (`url_env` etc.) lookups read the real process environment ([`SystemEnv`](boatramp_core::env::SystemEnv)).
     pub fn new(
         databases: std::collections::BTreeMap<String, crate::config::ExternalDatabaseConfig>,
         kv: Arc<dyn KvStore>,
@@ -589,7 +596,18 @@ impl NodeOperatorSql {
             kv,
             envelope,
             deploy,
+            env_source: Arc::new(boatramp_core::env::SystemEnv),
         }
+    }
+
+    /// Replace the host-env source with an injected one (a `MapEnv`) so the
+    /// `url_env`/`migration_url_env` reads resolve deterministically without touching the process
+    /// environment. Used by tests (unit + the live-gate integration tests); production leaves the
+    /// default [`SystemEnv`](boatramp_core::env::SystemEnv).
+    #[must_use]
+    pub fn with_env_source(mut self, env_source: Arc<dyn boatramp_core::env::EnvSource>) -> Self {
+        self.env_source = env_source;
+        self
     }
 
     /// Resolve + connect the SQL backend for database `db` in `project` (managed or
@@ -682,7 +700,7 @@ impl NodeOperatorSql {
                      runtime tenant user is refused fail-closed)"
                 ))
             })?;
-        let ddl_url = std::env::var(migration_var).map_err(|_| {
+        let ddl_url = self.env_source.get(migration_var).ok_or_else(|| {
             SqlError::other(format!(
                 "env var {migration_var} (migration/DDL url for {db:?}) is unset"
             ))
@@ -696,7 +714,7 @@ impl NodeOperatorSql {
         // as the same user). The byte-equality check is kept as an additional cheap catch; a DSN
         // that won't parse falls back to it (fail-closed on the strictest available signal).
         if !cfg.url_env.is_empty() {
-            if let Ok(runtime_url) = std::env::var(&cfg.url_env) {
+            if let Some(runtime_url) = self.env_source.get(&cfg.url_env) {
                 if runtime_url == ddl_url {
                     return Err(SqlError::other(format!(
                         "database {db:?}: `migration_url_env` resolves to the SAME connection as the \
@@ -775,8 +793,10 @@ impl NodeOperatorSql {
             // credential) reads the env var as before; a managed credential is unsealed
             // under EXACTLY the key the provisioner/resolver used for this tenant.
             let password = match cfg.password_env.as_deref().filter(|v| !v.is_empty()) {
-                Some(var) => std::env::var(var)
-                    .map_err(|_| SqlError::other(format!("env var {var} (password) is unset")))?,
+                Some(var) => self
+                    .env_source
+                    .get(var)
+                    .ok_or_else(|| SqlError::other(format!("env var {var} (password) is unset")))?,
                 None => {
                     let envelope = self.envelope.clone().ok_or_else(|| {
                         SqlError::other(format!(
@@ -807,15 +827,16 @@ impl NodeOperatorSql {
             )))
         } else {
             // Bring-your-own URL (a secret named indirectly by an env var).
-            let url = std::env::var(&cfg.url_env)
-                .map_err(|_| SqlError::other(format!("env var {} (url) is unset", cfg.url_env)))?;
-            let read_url =
-                match &cfg.read_url_env {
-                    Some(var) => Some(std::env::var(var).map_err(|_| {
-                        SqlError::other(format!("env var {var} (read url) is unset"))
-                    })?),
-                    None => None,
-                };
+            let url = self
+                .env_source
+                .get(&cfg.url_env)
+                .ok_or_else(|| SqlError::other(format!("env var {} (url) is unset", cfg.url_env)))?;
+            let read_url = match &cfg.read_url_env {
+                Some(var) => Some(self.env_source.get(var).ok_or_else(|| {
+                    SqlError::other(format!("env var {var} (read url) is unset"))
+                })?),
+                None => None,
+            };
             let opts = ExternalSqlOptions::new(url)
                 .with_read_url(read_url)
                 .with_max_connections(cfg.pool_max)
@@ -2857,9 +2878,14 @@ mod tests {
     // ---------------------------------------------------------------------------------------------
 
     /// A [`NodeOperatorSql`] over a single bring-your-own-URL binding named `main` of engine `kind`,
-    /// with optional `migration_url_env`. Runtime `url_env = RUNTIME_URL_ENV`.
+    /// with optional `migration_url_env`. Runtime `url_env = RUNTIME_URL_ENV`. Host-env values are
+    /// injected via `env` (a `MapEnv`) rather than the process environment.
     #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
-    fn op_for(kind: &str, migration_url_env: Option<&str>) -> Arc<NodeOperatorSql> {
+    fn op_for(
+        kind: &str,
+        migration_url_env: Option<&str>,
+        env: boatramp_core::env::MapEnv,
+    ) -> Arc<NodeOperatorSql> {
         use crate::config::{TenantIsolation, TenantScope};
         let mut databases = BTreeMap::new();
         databases.insert(
@@ -2876,12 +2902,15 @@ mod tests {
                 ..Default::default()
             },
         );
-        Arc::new(NodeOperatorSql::new(
-            databases,
-            Arc::new(MemoryKv::new()),
-            None,
-            DeployStore::new(Arc::new(NullStorage), Arc::new(MemoryKv::new())),
-        ))
+        Arc::new(
+            NodeOperatorSql::new(
+                databases,
+                Arc::new(MemoryKv::new()),
+                None,
+                DeployStore::new(Arc::new(NullStorage), Arc::new(MemoryKv::new())),
+            )
+            .with_env_source(Arc::new(env)),
+        )
     }
 
     #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
@@ -2894,12 +2923,12 @@ mod tests {
     #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
     #[test]
     fn engine_gate_admits_postgres_and_mysql() {
-        let pg = runner_over(op_for("postgres", None));
+        let pg = runner_over(op_for("postgres", None, boatramp_core::env::MapEnv::new()));
         assert!(matches!(
             pg.engine_gate("main"),
             Ok(ExternalSqlKind::Postgres)
         ));
-        let my = runner_over(op_for("mysql", Some("X")));
+        let my = runner_over(op_for("mysql", Some("X"), boatramp_core::env::MapEnv::new()));
         assert!(matches!(my.engine_gate("main"), Ok(ExternalSqlKind::Mysql)));
         // An unknown database name is NotConfigured, not a panic.
         assert!(matches!(
@@ -2914,7 +2943,7 @@ mod tests {
     #[cfg(feature = "sql-mysql")]
     #[tokio::test]
     async fn mysql_refuses_without_a_distinct_ddl_user() {
-        let sub = runner_over(op_for("mysql", None));
+        let sub = runner_over(op_for("mysql", None, boatramp_core::env::MapEnv::new()));
         let err = sub.preflight("default", "main").await.unwrap_err();
         let msg = err.to_string();
         assert!(
@@ -2928,21 +2957,17 @@ mod tests {
     #[cfg(feature = "sql-mysql")]
     #[tokio::test]
     async fn mysql_refuses_when_ddl_url_equals_runtime_url() {
-        // Same value for both env vars → refused.
-        std::env::set_var("RUNTIME_URL_ENV", "mysql://app:pw@localhost:3306/appdb");
-        std::env::set_var(
-            "MIGRATE_URL_ENV_SAME",
-            "mysql://app:pw@localhost:3306/appdb",
-        );
-        let sub = runner_over(op_for("mysql", Some("MIGRATE_URL_ENV_SAME")));
+        // Same value for both env vars (injected via MapEnv) → refused.
+        let env = boatramp_core::env::MapEnv::new()
+            .with("RUNTIME_URL_ENV", "mysql://app:pw@localhost:3306/appdb")
+            .with("MIGRATE_URL_ENV_SAME", "mysql://app:pw@localhost:3306/appdb");
+        let sub = runner_over(op_for("mysql", Some("MIGRATE_URL_ENV_SAME"), env));
         let err = sub.preflight("default", "main").await.unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("SAME connection") || msg.contains("distinct"),
             "a DDL url identical to the runtime url must be refused: {msg}"
         );
-        std::env::remove_var("RUNTIME_URL_ENV");
-        std::env::remove_var("MIGRATE_URL_ENV_SAME");
     }
 
     /// The MySQL DDL identity's env var being unset (declared but absent) is a clear error, not a
@@ -2950,8 +2975,12 @@ mod tests {
     #[cfg(feature = "sql-mysql")]
     #[tokio::test]
     async fn mysql_ddl_url_env_unset_is_a_clear_error() {
-        std::env::remove_var("MIGRATE_URL_ENV_MISSING");
-        let sub = runner_over(op_for("mysql", Some("MIGRATE_URL_ENV_MISSING")));
+        // The var is simply absent from the injected env (never set).
+        let sub = runner_over(op_for(
+            "mysql",
+            Some("MIGRATE_URL_ENV_MISSING"),
+            boatramp_core::env::MapEnv::new(),
+        ));
         let err = sub.preflight("default", "main").await.unwrap_err();
         let msg = err.to_string();
         assert!(
@@ -2964,7 +2993,11 @@ mod tests {
     /// `migration_url_env` are the NAMED env vars, so a test can vary each independently (the shared
     /// `op_for` hardcodes `RUNTIME_URL_ENV`, which would race across parallel env-mutating tests).
     #[cfg(feature = "sql-mysql")]
-    fn mysql_runner_with_env(runtime_env: &str, migrate_env: &str) -> NodeMigrationRunner {
+    fn mysql_runner_with_env(
+        runtime_env: &str,
+        migrate_env: &str,
+        env: boatramp_core::env::MapEnv,
+    ) -> NodeMigrationRunner {
         use crate::config::{TenantIsolation, TenantScope};
         let mut databases = BTreeMap::new();
         databases.insert(
@@ -2981,12 +3014,15 @@ mod tests {
                 ..Default::default()
             },
         );
-        runner_over(Arc::new(NodeOperatorSql::new(
-            databases,
-            Arc::new(MemoryKv::new()),
-            None,
-            DeployStore::new(Arc::new(NullStorage), Arc::new(MemoryKv::new())),
-        )))
+        runner_over(Arc::new(
+            NodeOperatorSql::new(
+                databases,
+                Arc::new(MemoryKv::new()),
+                None,
+                DeployStore::new(Arc::new(NullStorage), Arc::new(MemoryKv::new())),
+            )
+            .with_env_source(Arc::new(env)),
+        ))
     }
 
     /// [Security review HIGH-1] Distinctness is by **login username**, not byte-equality: a DDL DSN
@@ -3017,17 +3053,16 @@ mod tests {
         for (i, (runtime, ddl)) in same_user_pairs.iter().enumerate() {
             let rvar = format!("HIGH1_RT_{i}");
             let mvar = format!("HIGH1_DDL_{i}");
-            std::env::set_var(&rvar, runtime);
-            std::env::set_var(&mvar, ddl);
-            let sub = mysql_runner_with_env(&rvar, &mvar);
+            let env = boatramp_core::env::MapEnv::new()
+                .with(rvar.clone(), *runtime)
+                .with(mvar.clone(), *ddl);
+            let sub = mysql_runner_with_env(&rvar, &mvar, env);
             let err = sub.preflight("default", "main").await.unwrap_err();
             let msg = err.to_string();
             assert!(
                 msg.contains("SAME MySQL user") || msg.contains("SAME connection"),
                 "same-username DSNs {runtime:?} vs {ddl:?} must be refused: {msg}"
             );
-            std::env::remove_var(&rvar);
-            std::env::remove_var(&mvar);
         }
     }
 
@@ -3039,9 +3074,10 @@ mod tests {
     #[tokio::test]
     async fn mysql_allows_a_distinct_ddl_username() {
         // A connection-refused loopback port keeps the (expected) connect failure fast + offline.
-        std::env::set_var("HIGH1_RT_OK", "mysql://app:pw@127.0.0.1:1/db");
-        std::env::set_var("HIGH1_DDL_OK", "mysql://root_migrate:pw@127.0.0.1:1/db");
-        let sub = mysql_runner_with_env("HIGH1_RT_OK", "HIGH1_DDL_OK");
+        let env = boatramp_core::env::MapEnv::new()
+            .with("HIGH1_RT_OK", "mysql://app:pw@127.0.0.1:1/db")
+            .with("HIGH1_DDL_OK", "mysql://root_migrate:pw@127.0.0.1:1/db");
+        let sub = mysql_runner_with_env("HIGH1_RT_OK", "HIGH1_DDL_OK", env);
         // preflight will try to connect lazily; with no live DB it errors, but NOT with the
         // distinctness refusal — that is the point of this test.
         let err = sub.preflight("default", "main").await.unwrap_err();
@@ -3050,8 +3086,6 @@ mod tests {
             !msg.contains("SAME MySQL user") && !msg.contains("SAME connection"),
             "a distinct DDL username must pass the distinctness barrier: {msg}"
         );
-        std::env::remove_var("HIGH1_RT_OK");
-        std::env::remove_var("HIGH1_DDL_OK");
     }
 
     /// [Security review HIGH-2] A **compute-backed managed** MySQL binding (`compute` set, empty

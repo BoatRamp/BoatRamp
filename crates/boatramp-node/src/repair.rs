@@ -97,10 +97,16 @@ pub struct NodeTenantRepair {
     deploy: DeployStore,
     kv: Arc<dyn KvStore>,
     envelope: Option<Arc<dyn KeyEnvelope>>,
+    /// Injectable source for the config-named `url_env`/`migration_url_env` host-env lookups the
+    /// MySQL/external repair paths read. Production leaves it [`SystemEnv`](boatramp_core::env::SystemEnv);
+    /// a test wires a `MapEnv` so the DDL-identity distinctness checks run without mutating (or
+    /// racing on) the global process environment.
+    env_source: Arc<dyn boatramp_core::env::EnvSource>,
 }
 
 impl NodeTenantRepair {
-    /// Build over the handler `sql` `databases` config + the shared deploy/kv/envelope.
+    /// Build over the handler `sql` `databases` config + the shared deploy/kv/envelope. Host-env
+    /// (`url_env`/`migration_url_env`) lookups read the real process environment.
     pub fn new(
         databases: std::collections::BTreeMap<String, ExternalDatabaseConfig>,
         deploy: DeployStore,
@@ -112,7 +118,18 @@ impl NodeTenantRepair {
             deploy,
             kv,
             envelope,
+            env_source: Arc::new(boatramp_core::env::SystemEnv),
         }
+    }
+
+    /// Replace the host-env source with an injected one (a `MapEnv`) so the `url_env`/
+    /// `migration_url_env` reads resolve deterministically without touching the process
+    /// environment. Used by the live-gate integration tests; production leaves the default
+    /// [`SystemEnv`](boatramp_core::env::SystemEnv).
+    #[must_use]
+    pub fn with_env_source(mut self, env_source: Arc<dyn boatramp_core::env::EnvSource>) -> Self {
+        self.env_source = env_source;
+        self
     }
 }
 
@@ -139,7 +156,16 @@ impl boatramp_core::sql::TenantRepair for NodeTenantRepair {
         })?;
         let creds = ManagedSqlCredentials::new(self.kv.clone(), envelope);
 
-        repair_tenant(&self.deploy, &creds, binding, db, project, mode).await
+        repair_tenant(
+            &self.deploy,
+            &creds,
+            binding,
+            db,
+            project,
+            mode,
+            self.env_source.as_ref(),
+        )
+        .await
     }
 }
 
@@ -226,6 +252,7 @@ pub async fn repair_tenant(
     db_binding_name: &str,
     project: &str,
     mode: RepairMode,
+    env_source: &dyn boatramp_core::env::EnvSource,
 ) -> Result<RepairReport, RepairError> {
     let backend_class = classify_backend(binding);
     let model = classify_model(binding);
@@ -250,11 +277,20 @@ pub async fn repair_tenant(
                     .await,
             )
         }
-        RepairModel::Mysql => {
-            Ok(repair_mysql(deploy, creds, binding, project, mode, &backend_class).await)
-        }
+        RepairModel::Mysql => Ok(repair_mysql(
+            deploy,
+            creds,
+            binding,
+            project,
+            mode,
+            &backend_class,
+            env_source,
+        )
+        .await),
         RepairModel::Libsql => Ok(repair_libsql(binding, project, mode, &backend_class).await),
-        RepairModel::External => Ok(repair_external(binding, project, mode, &backend_class).await),
+        RepairModel::External => {
+            Ok(repair_external(binding, project, mode, &backend_class, env_source).await)
+        }
     }
 }
 
@@ -682,6 +718,7 @@ async fn repair_mysql(
     project: &str,
     mode: RepairMode,
     backend_class: &str,
+    env_source: &dyn boatramp_core::env::EnvSource,
 ) -> RepairReport {
     let mut report = base_report(binding, project, backend_class, mode);
     let kind = ExternalSqlKind::Mysql;
@@ -689,7 +726,8 @@ async fn repair_mysql(
     let compute_backed = binding.compute.as_deref().is_some_and(|c| !c.is_empty());
 
     // Resolve the runtime backend (managed: compute + sealed credential; external: `url_env`).
-    let runtime = build_runtime_backend(deploy, creds, binding, kind, project, mode).await;
+    let runtime =
+        build_runtime_backend(deploy, creds, binding, kind, project, mode, env_source).await;
 
     if compute_backed {
         if matches!(binding.tenant_scope, TenantScope::Site) {
@@ -717,7 +755,7 @@ async fn repair_mysql(
 
     // 3. The DISTINCT DDL identity: reconcile it BEFORE the connectivity-dependent probes so the
     //    core migrate precondition is always in the report (even if the runtime is unreachable).
-    check_mysql_ddl_identity(binding, &database, compute_backed, &mut report);
+    check_mysql_ddl_identity(binding, &database, compute_backed, &mut report, env_source);
 
     // The runtime backend powers checks 1/2/4/5. If it can't be built (e.g. external url_env unset),
     // report each dependent as error/skip rather than dropping them.
@@ -952,6 +990,7 @@ async fn repair_external(
     project: &str,
     mode: RepairMode,
     backend_class: &str,
+    env_source: &dyn boatramp_core::env::EnvSource,
 ) -> RepairReport {
     let _ = project;
     let mut report = base_report(binding, project, backend_class, mode);
@@ -973,7 +1012,7 @@ async fn repair_external(
     // one this build supports; else report the topology honestly.
     let kind = ExternalSqlKind::parse(&binding.kind);
     match kind {
-        Some(kind) => match build_external_backend(binding, kind) {
+        Some(kind) => match build_external_backend(binding, kind, env_source) {
             Ok(backend) => {
                 check_pg_or_mysql_ledger_exists(&backend, kind, mode, &mut report).await;
                 match backend.run_query("SELECT 1;").await {
@@ -2374,6 +2413,7 @@ async fn build_runtime_backend(
     kind: ExternalSqlKind,
     project: &str,
     mode: RepairMode,
+    env_source: &dyn boatramp_core::env::EnvSource,
 ) -> Result<Arc<dyn SqlBackend>, BackendBuildError> {
     let compute_backed = binding.compute.as_deref().is_some_and(|c| !c.is_empty());
     if compute_backed {
@@ -2416,7 +2456,8 @@ async fn build_runtime_backend(
         )
         .await
     } else {
-        build_external_backend(binding, kind).map_err(|e| BackendBuildError::Other(e.to_string()))
+        build_external_backend(binding, kind, env_source)
+            .map_err(|e| BackendBuildError::Other(e.to_string()))
     }
 }
 
@@ -2426,6 +2467,7 @@ async fn build_runtime_backend(
 fn build_external_backend(
     binding: &ExternalDatabaseConfig,
     kind: ExternalSqlKind,
+    env_source: &dyn boatramp_core::env::EnvSource,
 ) -> Result<Arc<dyn SqlBackend>, SqlError> {
     use boatramp_storage::sql_sqlx::{connect, ExternalSqlOptions};
     if binding.url_env.is_empty() {
@@ -2433,8 +2475,9 @@ fn build_external_backend(
             "external binding has no `url_env` set".to_string(),
         ));
     }
-    let url = std::env::var(&binding.url_env)
-        .map_err(|_| SqlError::other(format!("env var {} (url) is unset", binding.url_env)))?;
+    let url = env_source
+        .get(&binding.url_env)
+        .ok_or_else(|| SqlError::other(format!("env var {} (url) is unset", binding.url_env)))?;
     let timeout = binding
         .connect_timeout_secs
         .map(std::time::Duration::from_secs);
@@ -2650,6 +2693,7 @@ fn check_mysql_ddl_identity(
     db: &str,
     compute_backed: bool,
     report: &mut RepairReport,
+    env_source: &dyn boatramp_core::env::EnvSource,
 ) {
     // [Security review HIGH-2 parity] Compute-backed managed MySQL cannot derive a distinct
     // least-privilege DDL identity — migrate refuses it, so repair reports a terminal error too.
@@ -2683,9 +2727,9 @@ fn check_mysql_ddl_identity(
         });
         return;
     };
-    let ddl_url = match std::env::var(migration_var) {
-        Ok(u) => u,
-        Err(_) => {
+    let ddl_url = match env_source.get(migration_var) {
+        Some(u) => u,
+        None => {
             report.checks.push(error_check(
                 "ddl-identity",
                 format!(
@@ -2698,7 +2742,7 @@ fn check_mysql_ddl_identity(
     };
     // Distinctness vs the runtime `url_env` (byte + username), the fail-closed invariant.
     if !binding.url_env.is_empty() {
-        if let Ok(runtime_url) = std::env::var(&binding.url_env) {
+        if let Some(runtime_url) = env_source.get(&binding.url_env) {
             if runtime_url == ddl_url {
                 report.checks.push(error_check(
                     "ddl-identity",

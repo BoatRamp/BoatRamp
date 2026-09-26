@@ -143,7 +143,9 @@ async fn migrate_function_step_end_to_end_on_a_real_engine() {
         eprintln!("skip migrate_function: BOATRAMP_TEST_PG_URL unset");
         return;
     };
-    std::env::set_var(URL_ENV, &url);
+    // The node operator reads its connection URL from `url_env`; inject it via a MapEnv (never
+    // mutate the process environment) pointed at the same PG.
+    let env = boatramp_core::env::MapEnv::new().with(URL_ENV, url);
 
     // Clean slate.
     let c = direct().await;
@@ -179,12 +181,15 @@ async fn migrate_function_step_end_to_end_on_a_real_engine() {
     // the fixture's `sql` grant makes the S1 binding-split a strong "granted-but-dropped" proof.
     runtime.set_tenancy_posture(false, false);
 
-    let op = Arc::new(NodeOperatorSql::new(
-        databases(),
-        Arc::new(MemoryKv::new()),
-        None,
-        deploy.clone(),
-    ));
+    let op = Arc::new(
+        NodeOperatorSql::new(
+            databases(),
+            Arc::new(MemoryKv::new()),
+            None,
+            deploy.clone(),
+        )
+        .with_env_source(Arc::new(env)),
+    );
     let substrate: Arc<dyn MigrationSubstrate> = Arc::new(NodeMigrationRunner::new(
         op,
         std::collections::BTreeSet::new(),
