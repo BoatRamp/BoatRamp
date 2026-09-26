@@ -21,6 +21,10 @@ pub mod cert;
 pub mod compat;
 #[cfg(feature = "authz")]
 pub mod cose;
+/// An injectable source of environment-variable values ([`env::EnvSource`]):
+/// `SystemEnv` in production, a `MapEnv` in tests, so config-named env resolvers
+/// never require mutating the global process environment.
+pub mod env;
 pub mod envelope;
 // `compute` extends the wasm-clean `boatramp_types::compute` (re-exported within)
 // with the native control-plane layer: the `ComputeBackend` trait, the scheduler,
