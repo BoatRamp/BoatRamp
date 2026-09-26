@@ -446,6 +446,8 @@ pub(super) async fn dispatch_handler(
         &handler.stats_topics,
         // Per-component tenant-secret name allowlist (task #493): empty ⇒ deny-all.
         &handler.tenant_secret_names,
+        // Per-component blob-upload container allowlist (S3 external ingress): empty ⇒ deny-all.
+        &handler.upload_containers,
         // Per-guest secret allowlist (task #492): empty ⇒ the whole site pool, else only these keys.
         &handler.secrets,
         // A site handler is the entry point of a call chain (reached over HTTP), so it
@@ -1626,6 +1628,11 @@ pub(super) async fn build_bindings(
     // (least-privilege). Only consulted when a `tenant-secrets:*` right is granted + the substrate
     // (a `[secrets]` envelope) is wired.
     tenant_secret_names: &[String],
+    // Per-component container allowlist for the guest `blob-upload` mint capability (S3 external
+    // ingress): the blob containers this component may mint an upload credential for. Empty ⇒ deny-all
+    // (least-privilege, mirroring `tenant_secret_names`). Only consulted when a `blob-upload:*` right
+    // is granted + the local S3 face's minting config is wired.
+    upload_containers: &[String],
     // Per-guest secret allowlist (task #492): the subset of the site `[handlers].secrets` pool KEYS
     // this guest is granted. Empty ⇒ inject the whole pool (default, non-breaking); non-empty ⇒ inject
     // only the named keys (least-privilege). Filtered at the `resolve_env` choke point below.
@@ -2109,6 +2116,39 @@ pub(super) async fn build_bindings(
             bindings = bindings.with_capability(project.as_str(), minter, max_ttl);
         }
     }
+    // Guest blob-upload minting (`boatramp:handlers/blob-upload`, S3 external ingress): a guest mints a
+    // short-lived, scoped S3 upload credential for one of its OWN project+site's blob containers.
+    // Granted when the site allows a `blob-upload:*` right, the handler imports it, the local S3 face's
+    // minting config is wired (`set_blob_upload_minting` at startup), AND the fleet signer is present.
+    // Project + site are host-forced by the binding from `project` (host-routed) + this handler's
+    // `site` (host-routed); the TTL + max-bytes are clamped to the operator ceilings; the container is
+    // checked against `upload_containers`. Deny-by-default: absent any of these, no binding is attached
+    // and `mint` fails closed. The two rights are INDEPENDENT (`:write` single-shot, `:multipart`).
+    #[cfg(feature = "blob-upload")]
+    if (granted("blob-upload:write") || granted("blob-upload:multipart"))
+        && let (Some(cfg), Some(signer)) =
+            (inner.blob_upload_config.get(), inner.session_signer.get())
+    {
+        let minter = std::sync::Arc::new(crate::blob_upload_minter::ServerBlobUploadMinter {
+            signer: signer.clone(),
+            secret: cfg.secret.clone(),
+            config: cfg.face.clone(),
+        });
+        bindings = bindings.with_blob_upload(
+            project.as_str(),
+            // The site is host-routed for a request handler — a single resolved site, always present
+            // on this path (an `all`/anonymous funnel has no single site; that fail-closed
+            // `no-resolved-site` case is exercised on the function/consumer path where `site` may be
+            // absent). Pass it as the host-forced site.
+            Some(site.to_string()),
+            minter,
+            cfg.max_ttl_secs,
+            cfg.max_bytes_ceiling,
+            upload_containers.to_vec(),
+            granted("blob-upload:write"),
+            granted("blob-upload:multipart"),
+        );
+    }
     // Capture stdout/stderr (+ `wasi:logging`) for every invocation — not a guest-requested
     // import, but host-side observability. Tagged by `site` (so a site's live + preview output
     // aggregates under it), rate-capped per the site's `maxLogRate`, and correlated with the
@@ -2460,6 +2500,9 @@ pub(super) struct ConsumerRebuild<'a> {
     /// The consumer's per-component tenant-secret name allowlist (task #493). Empty ⇒ deny-all.
     /// Threaded so a per-message rebuild scopes tenant secrets identically to the once-per-tick build.
     pub tenant_secret_names: &'a [String],
+    /// The consumer's per-component `blob-upload` container allowlist (S3 external ingress). Empty ⇒
+    /// deny-all. Threaded so a per-message rebuild scopes upload minting identically to the tick build.
+    pub upload_containers: &'a [String],
     /// The consumer's per-guest secret allowlist (task #492): the subset of the site pool KEYS it is
     /// granted. Empty ⇒ the whole pool. Threaded so a per-message rebuild scopes secrets identically
     /// to the once-per-tick build.
@@ -2488,6 +2531,7 @@ impl ConsumerRebuild<'_> {
             &[],
             self.stats_topics,
             self.tenant_secret_names,
+            self.upload_containers,
             self.secret_allowlist,
             0,
             None,

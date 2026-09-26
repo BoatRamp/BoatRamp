@@ -517,6 +517,104 @@ pub fn presigned_canonical_query(params: &[(String, String)]) -> String {
     encode_and_sort_query(pairs)
 }
 
+// ---- Presigning (mint side, M3) -------------------------------------------------------------
+
+/// Format Unix seconds as the SigV4 ISO8601 *basic* timestamp `YYYYMMDDTHHMMSSZ` (the inverse of
+/// [`parse_amz_date`]). Self-contained (no chrono) — a fixed, unambiguous UTC format. Used by the
+/// mint side to stamp `X-Amz-Date` on a presigned URL.
+pub fn unix_to_amz_date(now_unix: i64) -> String {
+    let (y, mo, d, h, mi, s) = unix_to_civil(now_unix);
+    format!("{y:04}{mo:02}{d:02}T{h:02}{mi:02}{s:02}Z")
+}
+
+/// Unix seconds → civil `(year, month, day, hour, min, sec)` UTC (inverse of `civil_to_unix`;
+/// Howard Hinnant's `civil_from_days`). Proleptic Gregorian.
+fn unix_to_civil(t: i64) -> (i64, i64, i64, i64, i64, i64) {
+    let days = t.div_euclid(86400);
+    let secs = t.rem_euclid(86400);
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if m <= 2 { y + 1 } else { y };
+    (year, m, d, secs / 3600, (secs % 3600) / 60, secs % 60)
+}
+
+/// Build a full **presigned PUT URL** for `endpoint_base`/`bucket`/`key` under `scope` + `secret` +
+/// `session_token`, valid for `expires_secs` from `now_unix`. This is the mint-side companion to the
+/// presigned-verify path ([`parse_presigned_query`] + [`presigned_canonical_query`] + [`verify`]) — it
+/// produces exactly the URL a browser can `fetch(url, {method:"PUT", body})` with no SigV4-in-JS.
+///
+/// The payload is signed `UNSIGNED-PAYLOAD` (a browser PUT does not pre-hash its body), and `host` is
+/// the only signed header (the minimal presigned set S3 SDKs use). `endpoint_base` is the scheme+host
+/// (+ optional port), e.g. `http://127.0.0.1:9000`; the object path is `/{bucket}/{key}` (path-style).
+/// The returned URL carries `X-Amz-Algorithm/Credential/Date/Expires/SignedHeaders/Security-Token` and
+/// the final `X-Amz-Signature`.
+pub fn presign_put_url(
+    endpoint_base: &str,
+    bucket: &str,
+    key: &str,
+    scope: &CredentialScope,
+    secret_access_key: &str,
+    session_token: &str,
+    now_unix: i64,
+    expires_secs: i64,
+) -> Result<String, SigV4Error> {
+    let host = endpoint_host(endpoint_base);
+    let amz_date = unix_to_amz_date(now_unix);
+    let uri_path = format!("/{bucket}/{key}");
+    let credential = format!("{}/{}", scope.access_key_id, scope.scope_string());
+    // The presigned query params (decoded form), everything the client will send EXCEPT the signature.
+    let params = vec![
+        ("X-Amz-Algorithm".to_string(), ALGORITHM.to_string()),
+        ("X-Amz-Credential".to_string(), credential),
+        ("X-Amz-Date".to_string(), amz_date.clone()),
+        ("X-Amz-Expires".to_string(), expires_secs.to_string()),
+        ("X-Amz-SignedHeaders".to_string(), "host".to_string()),
+        (
+            "X-Amz-Security-Token".to_string(),
+            session_token.to_string(),
+        ),
+    ];
+    let canonical_q = presigned_canonical_query(&params);
+    let headers = vec![("host".to_string(), host.clone())];
+    let req = CanonicalRequest {
+        method: "PUT",
+        uri_path: &uri_path,
+        query: &canonical_q,
+        headers: &headers,
+        payload_hash: UNSIGNED_PAYLOAD,
+    };
+    let (creq, _) = canonical_request_string(&req, &["host".to_string()])?;
+    let sts = string_to_sign(&amz_date, scope, &creq);
+    let signature = compute_signature(secret_access_key, scope, &sts);
+    // The final URL: endpoint + path + the canonical query (already encoded+sorted) + the signature.
+    Ok(format!(
+        "{}{uri_path}?{canonical_q}&X-Amz-Signature={signature}",
+        endpoint_base.trim_end_matches('/')
+    ))
+}
+
+/// The `host` header value for `endpoint_base` (scheme stripped, path stripped) — what the presigned
+/// signature is computed over. Includes a non-default port. Falls back to the whole string if it does
+/// not look like a URL.
+fn endpoint_host(endpoint_base: &str) -> String {
+    let after_scheme = endpoint_base
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(endpoint_base);
+    after_scheme
+        .split(['/', '?'])
+        .next()
+        .unwrap_or(after_scheme)
+        .to_string()
+}
+
 // ---- Clock-skew / expiry checks -------------------------------------------------------------
 
 /// Parse an ISO8601 *basic* timestamp `YYYYMMDDTHHMMSSZ` to Unix seconds. Returns
@@ -1416,6 +1514,96 @@ mod tests {
             parse_chunk_header("1;chunk-signature=").unwrap_err(),
             SigV4Error::MalformedChunk
         );
+    }
+
+    #[test]
+    fn unix_to_amz_date_round_trips_parse() {
+        // The formatter is the exact inverse of the parser over known epochs + a round-trip.
+        assert_eq!(unix_to_amz_date(0), "19700101T000000Z");
+        assert_eq!(unix_to_amz_date(86400), "19700102T000000Z");
+        assert_eq!(unix_to_amz_date(1_440_938_160), "20150830T123600Z");
+        for t in [0i64, 1, 86400, 1_440_938_160, 1_700_000_000] {
+            assert_eq!(parse_amz_date(&unix_to_amz_date(t)).unwrap(), t);
+        }
+    }
+
+    #[test]
+    fn presigned_put_url_verifies_through_the_face_path() {
+        // MINT→VERIFY round trip: presign a PUT URL, then drive it through the SAME parse+verify path
+        // the M2 face uses (parse the query → rebuild the canonical query sans signature → verify).
+        // A correct URL verifies; a tampered key does not — proving a minted presigned-put credential
+        // is actually accepted by the face's SigV4 verifier.
+        let now = 1_440_938_160; // 20150830T123600Z
+        let scope = CredentialScope {
+            access_key_id: "BRUPPRESIGN".into(),
+            date: "20150830".into(),
+            region: "boatramp".into(),
+            service: "s3".into(),
+        };
+        let secret = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let url = presign_put_url(
+            "http://127.0.0.1:9000",
+            "photos",
+            "avatars/u1.jpg",
+            &scope,
+            secret,
+            "SESSIONTOKEN",
+            now,
+            900,
+        )
+        .unwrap();
+        assert!(url.starts_with("http://127.0.0.1:9000/photos/avatars/u1.jpg?"));
+        assert!(url.contains("X-Amz-Signature="));
+        assert!(url.contains("X-Amz-Security-Token=SESSIONTOKEN"));
+
+        // Server side: split the query, decode the params, parse + verify (path-style bucket/key).
+        let (path, query) = url
+            .strip_prefix("http://127.0.0.1:9000")
+            .unwrap()
+            .split_once('?')
+            .unwrap();
+        let decoded: Vec<(String, String)> = query
+            .split('&')
+            .map(|p| {
+                let (k, v) = p.split_once('=').unwrap();
+                (percent_decode(k), percent_decode(v))
+            })
+            .collect();
+        let parsed = parse_presigned_query(&decoded).unwrap();
+        assert!(parsed.presigned);
+        assert_eq!(parsed.scope, scope);
+        let server_q = presigned_canonical_query(&decoded);
+        let headers = vec![("host".to_string(), "127.0.0.1:9000".to_string())];
+        let req = CanonicalRequest {
+            method: "PUT",
+            uri_path: path,
+            query: &server_q,
+            headers: &headers,
+            payload_hash: UNSIGNED_PAYLOAD,
+        };
+        assert!(
+            verify(&req, &parsed, &[secret.to_string()]).is_ok(),
+            "a minted presigned PUT URL must verify through the face path"
+        );
+        // Presigned expiry window holds at mint time.
+        assert!(check_presigned_expiry(&parsed, now + 100).is_ok());
+        // Tamper the key ⇒ different canonical request ⇒ reject.
+        let tampered = CanonicalRequest {
+            uri_path: "/photos/other.jpg",
+            ..req
+        };
+        assert!(verify(&tampered, &parsed, &[secret.to_string()]).is_err());
+    }
+
+    #[test]
+    fn endpoint_host_strips_scheme_and_path() {
+        assert_eq!(endpoint_host("http://127.0.0.1:9000"), "127.0.0.1:9000");
+        assert_eq!(endpoint_host("https://s3.example.com"), "s3.example.com");
+        assert_eq!(
+            endpoint_host("https://s3.example.com/x/y"),
+            "s3.example.com"
+        );
+        assert_eq!(endpoint_host("bare-host:1234"), "bare-host:1234");
     }
 
     #[test]

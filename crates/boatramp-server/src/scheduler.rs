@@ -789,6 +789,8 @@ pub(super) async fn run_scheduler_tick(
                                 &consumer.stats_topics,
                                 // The consumer's tenant-secret name allowlist (task #493): empty ⇒ deny-all.
                                 &consumer.tenant_secret_names,
+                                // The consumer's blob-upload container allowlist (S3 ingress): empty ⇒ deny-all.
+                                &consumer.upload_containers,
                                 // Per-guest secret allowlist (task #492): empty ⇒ the whole site pool.
                                 &consumer.secrets,
                                 0,
@@ -844,6 +846,7 @@ pub(super) async fn run_scheduler_tick(
                                     token_claims: consumer.token_claims.as_ref(),
                                     stats_topics: &consumer.stats_topics,
                                     tenant_secret_names: &consumer.tenant_secret_names,
+                                    upload_containers: &consumer.upload_containers,
                                     secret_allowlist: &consumer.secrets,
                                 });
                             acked += dispatch_consumer_batch(
@@ -1104,6 +1107,8 @@ async fn fire_cron(
         &handler.stats_topics,
         // A cron-triggered handler inherits the matched handler's tenant-secret allowlist (#493).
         &handler.tenant_secret_names,
+        // A cron-triggered handler inherits the matched handler's blob-upload allowlist (S3 ingress).
+        &handler.upload_containers,
         // A cron-triggered handler inherits the matched handler's per-guest secret allowlist (#492).
         &handler.secrets,
         0,
