@@ -30,6 +30,8 @@
 
 use std::sync::Arc;
 
+use boatramp_core::project::{validate_object_key, validate_resource_name};
+
 mod generated {
     wasmtime::component::bindgen!({
         path: "wit",
@@ -94,6 +96,74 @@ pub struct MintScope {
     pub constraints: UploadConstraints,
     /// The (clamped) lifetime in seconds.
     pub ttl_secs: u64,
+}
+
+/// The characters a container / key / prefix must never contain because they can restructure a
+/// hand-built cloud policy document even after JSON-escaping is applied — a `"` breaks out of an AWS
+/// session-policy string, a `'` (and `)`) breaks out of a GCS CAB CEL expression. Screened here at the
+/// mint choke point (Security HIGH-1) so a scope-widening metacharacter never reaches ANY minter's
+/// policy builder — belt-and-suspenders with the `serde_json`-structured construction the AWS/GCS
+/// minters now use.
+const POLICY_METACHARS: &[char] = &['"', '\''];
+
+/// **The mint scope screen** (Security HIGH-1 / MEDIUM-1) — the ONE choke point that screens the
+/// host-forced container + the guest-chosen key|prefix BEFORE they reach ANY minter (local AND every
+/// cloud), covering the mint path the local face's `compose_object_key` choke point never sees. Both
+/// the guest binding ([`BlobUploadBinding::mint`]) and the operator route call it, so a container/
+/// key/prefix carrying a traversal (`..`), a reserved `.boatramp*` segment, a `*`/`\`/control byte, or a
+/// policy metacharacter (`"`/`'`) is refused (as [`MintRefused::InvalidRequest`] / a `422`) before any
+/// credential is signed and before any policy string is built.
+///
+/// - The `container` is screened as a single safe path segment ([`validate_resource_name`]) — even
+///   though an operator allowlist matched it, an allowlist entry is itself an operator-authored string
+///   and could carry a traversal / quote.
+/// - A [`UploadTarget::Key`] is a full object key: screened with [`validate_object_key`]
+///   (`..`/`\`/`*`/control/NUL/empty-or-`/`-escaped segments/`.boatramp*`) plus the policy metacharacters.
+/// - A [`UploadTarget::Prefix`] may legitimately be EMPTY (whole-container, no narrowing beyond the
+///   container root) and may end in `/` (a subtree boundary). Empty ⇒ allowed. A non-empty prefix is
+///   screened with the same rejection set (a single optional trailing `/` is tolerated), allowing the
+///   internal `/` path separators a prefix carries, plus the policy metacharacters.
+pub fn screen_upload_target(container: &str, target: &UploadTarget) -> Result<(), MintRefused> {
+    let reject = |m: String| Err(MintRefused::InvalidRequest(m));
+
+    // The container is re-anchored verbatim into `hblob/{qualified-site}/{container}/`, so it MUST be a
+    // single safe segment — screen it even though the allowlist matched (the allowlist entry is an
+    // operator string, not itself trusted to be traversal/quote-free).
+    validate_resource_name("container", container)
+        .map_err(|e| MintRefused::InvalidRequest(format!("invalid container: {e}")))?;
+    if container.contains(POLICY_METACHARS) {
+        return reject("container must not contain a quote character".into());
+    }
+
+    match target {
+        UploadTarget::Key(k) => {
+            validate_object_key(k)
+                .map_err(|e| MintRefused::InvalidRequest(format!("invalid key: {e}")))?;
+            if k.contains(POLICY_METACHARS) {
+                return reject("key must not contain a quote character".into());
+            }
+        }
+        UploadTarget::Prefix(p) => {
+            // An empty prefix = the whole container root (no narrowing beyond the host-forced prefix);
+            // allowed. A non-empty prefix is screened as an object key, tolerating one trailing `/`
+            // (a subtree boundary) which `validate_object_key` would otherwise reject as an empty
+            // trailing segment.
+            if !p.is_empty() {
+                let body = p.strip_suffix('/').unwrap_or(p);
+                if body.is_empty() {
+                    // The prefix was just `/` (or repeated separators) ⇒ a leading-slash / empty
+                    // segment escape.
+                    return reject("prefix must not be '/' or an empty path segment".into());
+                }
+                validate_object_key(body)
+                    .map_err(|e| MintRefused::InvalidRequest(format!("invalid prefix: {e}")))?;
+                if p.contains(POLICY_METACHARS) {
+                    return reject("prefix must not contain a quote character".into());
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The self-describing minted credential — host-native mirror of the WIT `credentials` variant.
@@ -265,6 +335,13 @@ impl BlobUploadBinding {
         }
         // No single resolved site ⇒ fail closed (distinct from access-denied).
         let site = self.site()?;
+
+        // SCREEN the container + key|prefix BEFORE any signing / policy build (Security HIGH-1): reject
+        // a traversal, a reserved `.boatramp*` segment, a `*`/`\`/control byte, or a policy
+        // metacharacter (`"`/`'`) that could restructure a cloud policy document. This is the mint
+        // choke point that covers ALL backends (local AND cloud) — the local face's key choke point
+        // never sees the mint path.
+        screen_upload_target(container.trim(), &target)?;
 
         // CLAMP the TTL down to the operator ceiling (a guest can only narrow).
         let ttl = ttl_secs.min(self.max_ttl_secs);
@@ -786,6 +863,117 @@ mod tests {
             blob_upload_types::MintError::InvalidRequest(_)
         ));
         assert!(minter.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_key_or_prefix_with_a_policy_metacharacter_or_traversal_is_refused_at_the_binding() {
+        // Security HIGH-1: the mint choke point rejects a key/prefix carrying a `"` (AWS session-policy
+        // string breakout), a `'`/`')` (GCS CAB CEL breakout), or a `..` traversal — BEFORE any signing.
+        let minter = Arc::new(FakeMinter::default());
+        let b = binding(
+            minter.clone(),
+            Some("blog"),
+            &["photos"],
+            true,
+            true,
+            3600,
+            None,
+        );
+        let mut host = BlobUploadHost::new(Some(&b));
+
+        // A KEY with an injection `"`.
+        let mut q = put_key_request("photos", "x\",\"Resource\":\"*", 300);
+        q.perms = vec![blob_upload_types::UploadPerm::Put];
+        assert!(matches!(
+            host.mint(q).await.unwrap_err(),
+            blob_upload_types::MintError::InvalidRequest(_)
+        ));
+        // A PREFIX with a `')` (GCS CEL breakout).
+        let mut cel = put_key_request("photos", "unused", 300);
+        cel.target = blob_upload_types::UploadTarget {
+            key: None,
+            prefix: Some("a')},{\"x".into()),
+        };
+        assert!(matches!(
+            host.mint(cel).await.unwrap_err(),
+            blob_upload_types::MintError::InvalidRequest(_)
+        ));
+        // A PREFIX with a `..` traversal.
+        let mut trav = put_key_request("photos", "unused", 300);
+        trav.target = blob_upload_types::UploadTarget {
+            key: None,
+            prefix: Some("../sibling".into()),
+        };
+        assert!(matches!(
+            host.mint(trav).await.unwrap_err(),
+            blob_upload_types::MintError::InvalidRequest(_)
+        ));
+        // A KEY with a `.boatramp*` staging-namespace collision.
+        let staging = put_key_request("photos", ".boatramp-uploads/u/part-1", 300);
+        assert!(matches!(
+            host.mint(staging).await.unwrap_err(),
+            blob_upload_types::MintError::InvalidRequest(_)
+        ));
+        // Nothing hostile ever reached the minter.
+        assert!(
+            minter.calls.lock().unwrap().is_empty(),
+            "no hostile target was signed"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_clean_prefix_including_an_empty_or_trailing_slash_prefix_is_accepted() {
+        // The screen must NOT over-reject: an empty prefix (whole-container), a trailing-`/` subtree
+        // boundary, and an internal-`/` nested prefix are all legitimate.
+        let minter = Arc::new(FakeMinter::default());
+        let b = binding(
+            minter.clone(),
+            Some("blog"),
+            &["bulk"],
+            true,
+            true,
+            3600,
+            None,
+        );
+        for prefix in ["", "ingest/", "a/b/c", "photos/2026"] {
+            let mut host = BlobUploadHost::new(Some(&b));
+            let mut req = put_key_request("bulk", "unused", 300);
+            req.perms = vec![blob_upload_types::UploadPerm::Multipart];
+            req.target = blob_upload_types::UploadTarget {
+                key: None,
+                prefix: Some(prefix.into()),
+            };
+            host.mint(req)
+                .await
+                .unwrap_or_else(|e| panic!("prefix {prefix:?} should be accepted: {e:?}"));
+        }
+        assert_eq!(minter.calls.lock().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn screen_upload_target_unit_rules() {
+        // The pure screen: quotes, traversal, reserved namespace, `*`, backslash, control ⇒ refused;
+        // clean key/prefix/empty-prefix ⇒ ok.
+        assert!(screen_upload_target("photos", &UploadTarget::Key("a/b.jpg".into())).is_ok());
+        assert!(screen_upload_target("photos", &UploadTarget::Prefix(String::new())).is_ok());
+        assert!(screen_upload_target("photos", &UploadTarget::Prefix("ingest/".into())).is_ok());
+        // container escapes
+        assert!(screen_upload_target("../x", &UploadTarget::Key("k".into())).is_err());
+        assert!(screen_upload_target("a/b", &UploadTarget::Key("k".into())).is_err());
+        assert!(screen_upload_target("a\"b", &UploadTarget::Key("k".into())).is_err());
+        // key/prefix escapes
+        for bad_key in ["../x", "a\"b", "a'b", "*", "back\\slash", ".boatramp-x/y"] {
+            assert!(
+                screen_upload_target("photos", &UploadTarget::Key(bad_key.into())).is_err(),
+                "key {bad_key:?} must be refused"
+            );
+        }
+        for bad_prefix in ["../x", "a\"b/", "a')/", "/", "//", "*"] {
+            assert!(
+                screen_upload_target("photos", &UploadTarget::Prefix(bad_prefix.into())).is_err(),
+                "prefix {bad_prefix:?} must be refused"
+            );
+        }
     }
 
     #[tokio::test]

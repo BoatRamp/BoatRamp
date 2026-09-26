@@ -23,7 +23,7 @@ pub use bindings::admin::{AdminController, AdminError, DomainChallenge, Surface 
 #[cfg(feature = "blob-upload")]
 pub use bindings::blob_upload::{
     BlobUploadBinding, BlobUploadMinter, MintRefused, MintScope, MintedCredentials, PresignedPut,
-    TempCredentials, UploadConstraints, UploadPerm, UploadTarget,
+    TempCredentials, UploadConstraints, UploadPerm, UploadTarget, screen_upload_target,
 };
 #[cfg(feature = "capability")]
 pub use bindings::capability::{CapabilityBinding, CapabilityMinter};

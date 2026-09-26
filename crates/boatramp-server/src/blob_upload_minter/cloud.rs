@@ -28,8 +28,11 @@ use crate::s3_ingress::keypath::container_prefix;
 /// credential to the guest's own container tree — the structural scope-confinement invariant.
 ///
 /// - [`UploadTarget::Key`] ⇒ the single fully-qualified object key `hblob/…/{container}/{key}`.
-/// - [`UploadTarget::Prefix`] ⇒ the subtree `hblob/…/{container}/{prefix}` (no trailing slash added;
-///   callers append the wildcard/`startsWith` semantics their cloud uses).
+/// - [`UploadTarget::Prefix`] ⇒ the subtree `hblob/…/{container}/{prefix}` — a NON-EMPTY prefix is
+///   normalized to end in `/` so the `startsWith`/wildcard the cloud appends is a **path-segment
+///   boundary** (Security MEDIUM-1): without it, `photos/a` would match sibling prefixes `photos/ab`,
+///   `photos/annual` under an AWS `{prefix}*` or a GCS `startsWith`. An EMPTY prefix ⇒ the container
+///   root (`hblob/…/{container}/`), the intended whole-container scope.
 ///
 /// The `container` is a single validated segment (the binding + the S3-face choke point screen it), so
 /// this cannot itself escape the `hblob/{qualified-site}/` root.
@@ -37,7 +40,14 @@ pub fn scoped_object_path(scope: &MintScope) -> String {
     let prefix = container_prefix(&scope.project, &scope.site, &scope.container);
     match &scope.target {
         UploadTarget::Key(k) => format!("{prefix}{k}"),
-        UploadTarget::Prefix(p) => format!("{prefix}{p}"),
+        UploadTarget::Prefix(p) if p.is_empty() => prefix,
+        UploadTarget::Prefix(p) => {
+            // A subtree boundary: append the guest prefix, ensuring exactly one trailing `/` so the
+            // wildcard/`startsWith` the caller appends can only match keys strictly UNDER the prefix
+            // directory — never a sibling prefix that merely shares a leading substring.
+            let body = p.strip_suffix('/').unwrap_or(p);
+            format!("{prefix}{body}/")
+        }
     }
 }
 
@@ -65,7 +75,8 @@ pub struct ConstraintLabel {
 #[derive(Debug, Clone, Copy)]
 pub struct CloudEnforcement {
     /// Can the brokered policy cap object SIZE? (AWS session policy: no; SAS: no; signed URL: no.)
-    /// Content-addressing makes size moot for a fixed object, but a raw byte cap is not a policy knob.
+    /// Content-addressing makes size moot for a fixed object, but ONLY when the store also pins the
+    /// hash (`content_addressed_size_moot`); a raw byte cap is not a policy knob on any cloud today.
     pub can_cap_size: bool,
     /// Can the brokered policy pin the object CONTENT-TYPE? (Generally no across clouds; a presigned URL
     /// can bind a signed `Content-Type` header, which the specific minter reflects.)
@@ -74,25 +85,50 @@ pub struct CloudEnforcement {
     /// plus the store's `If-None-Match: *` precondition can; a broad prefix credential cannot pin it in
     /// the policy itself.
     pub can_enforce_create_only: bool,
+    /// Can the brokered credential actually PIN the object hash (`require_sha256` ⇒ the store rejects
+    /// bytes whose sha256 ≠ the key)? This is the HONESTY crux (Security HIGH-2): the plan claimed
+    /// content-addressing is "always enforced" cross-cloud, but NO cloud minter today emits a checksum
+    /// condition (AWS `session_policy_json` has no `Condition`; the GCS CAB has none; the Azure SAS has
+    /// none), and on cloud boatramp never sees the bytes, so it cannot verify `key == sha256`. A minter
+    /// sets this `true` ONLY where its store structurally pins the hash (e.g. an AWS single-key request
+    /// signed with an `s3:x-amz-checksum-sha256` condition); otherwise `require_sha256` is `advisory`.
+    pub can_enforce_sha256: bool,
+    /// When the credential is content-addressed AND the store pins the hash
+    /// ([`can_enforce_sha256`](Self::can_enforce_sha256)), a fixed key ⇒ fixed bytes ⇒ fixed size and a
+    /// harmless (idempotent) overwrite, so `max_bytes` + `create_only` are effectively enforced. This
+    /// is set by the minter to mirror `can_enforce_sha256` and is the ONLY thing that promotes those two
+    /// via content-addressing — an UNPINNED `require_sha256` promotes NOTHING (Security HIGH-2).
+    pub content_addressed_size_moot: bool,
 }
 
 impl CloudEnforcement {
     /// The conservative baseline for a broad (prefix/bulk) brokered credential: the policy binds the
-    /// prefix + actions, but caps nothing about the object bytes. Everything except content-addressing
+    /// prefix + actions, but caps nothing about the object bytes AND does not pin the hash. Everything
     /// is advisory. This is the safe default a minter starts from and only PROMOTES from (never demotes
-    /// something to `enforced` it can't actually cap).
+    /// something to `enforced` it can't actually cap). Because no cloud minter emits a checksum
+    /// condition today, `can_enforce_sha256` is `false` here — so `require_sha256` (and the size/
+    /// create-only it would otherwise promote) is honestly `advisory` on every cloud shape.
     pub const NONE: Self = Self {
         can_cap_size: false,
         can_cap_content_type: false,
         can_enforce_create_only: false,
+        can_enforce_sha256: false,
+        content_addressed_size_moot: false,
     };
 }
 
 /// Build the honest `(enforced, advisory)` constraint contract for a cloud-brokered credential, given
 /// what the backend [`CloudEnforcement`] can structurally cap. The mapping is the security-critical
 /// part: a constraint the store cannot cap is `advisory`, so the client (and any auditor) is told the
-/// truth. `require_sha256` is ALWAYS enforced (content-addressing is enforceable everywhere: the object
-/// key must equal `sha256(bytes)`, verified by the store's checksum condition + the read-path identity).
+/// truth.
+///
+/// **Honesty of `require_sha256` (Security HIGH-2):** content-addressing is enforced ONLY where the
+/// store actually PINS the hash ([`CloudEnforcement::can_enforce_sha256`]) — i.e. the brokered
+/// credential carries a checksum condition the store rejects a mismatch against. On cloud boatramp
+/// never sees the uploaded bytes, so it cannot verify `key == sha256`; and no cloud minter today emits
+/// a checksum condition, so on those shapes `require_sha256` is `advisory` (NOT enforced), and it
+/// promotes neither `max_bytes` nor `create_only`. The earlier "always enforced" labeling was
+/// dishonest — this is the corrected contract.
 ///
 /// Returns `(enforced, advisory)`, each a human-readable list matching the local-face vocabulary.
 pub fn constraint_contract(
@@ -110,12 +146,18 @@ pub fn constraint_contract(
         }
     };
 
+    // Content-addressing makes size/overwrite moot ONLY when the store actually pins the hash — an
+    // unpinned `require_sha256` (the default on every cloud shape today) promotes nothing.
+    let hash_pinned = constraints.require_sha256 && caps.can_enforce_sha256;
+    let size_moot_by_hash = hash_pinned && caps.content_addressed_size_moot;
+
     if let Some(mb) = constraints.max_bytes {
         place(ConstraintLabel {
             text: format!("max_bytes={mb}"),
-            // Size is enforceable only if the object is content-addressed (a fixed key ⇒ fixed bytes ⇒
-            // fixed size), OR the backend can cap size in-policy (none of AWS/GCS/Azure can today).
-            enforced: caps.can_cap_size || constraints.require_sha256,
+            // Size is enforceable only if the backend can cap size in-policy (none of AWS/GCS/Azure can
+            // today), OR the object is content-addressed AND the store pins the hash (a fixed key ⇒
+            // fixed bytes ⇒ fixed size). An UNPINNED sha256 does NOT make size enforceable.
+            enforced: caps.can_cap_size || size_moot_by_hash,
         });
     }
     if let Some(ct) = &constraints.content_type {
@@ -125,19 +167,21 @@ pub fn constraint_contract(
         });
     }
     if constraints.require_sha256 {
-        // Content-addressing is the mandatory cross-cloud STRONG enforcement — always enforced.
+        // Content-addressing is the STRONG enforcement ONLY where the store pins the hash; otherwise
+        // (every cloud minter today emits no checksum condition) it is advisory — boatramp never sees
+        // the cloud-uploaded bytes to verify `key == sha256` itself.
         place(ConstraintLabel {
             text: "require_sha256".to_string(),
-            enforced: true,
+            enforced: caps.can_enforce_sha256,
         });
     }
     if constraints.create_only {
         place(ConstraintLabel {
             text: "create_only".to_string(),
             // Enforceable when the credential is pinned to a single object AND the client sends the
-            // no-overwrite precondition; a content-addressed key makes overwrite a harmless no-op either
-            // way. A broad prefix credential cannot pin it in-policy ⇒ advisory.
-            enforced: caps.can_enforce_create_only || constraints.require_sha256,
+            // no-overwrite precondition; a hash-PINNED content-addressed key makes overwrite a harmless
+            // no-op. A broad prefix credential (or an unpinned sha256) cannot pin it ⇒ advisory.
+            enforced: caps.can_enforce_create_only || size_moot_by_hash,
         });
     }
 
@@ -180,6 +224,33 @@ mod tests {
     }
 
     #[test]
+    fn a_non_empty_prefix_is_normalized_to_a_trailing_slash_boundary() {
+        // Security MEDIUM-1: a prefix `a` must become `.../a/` so the wildcard/`startsWith` the cloud
+        // appends is a PATH-SEGMENT boundary — `photos/a` must not match sibling `photos/ab`/`photos/annual`.
+        let no_slash = scope(UploadTarget::Prefix("a".into()), Default::default());
+        assert_eq!(
+            scoped_object_path(&no_slash),
+            "hblob/acme/blog/photos/a/",
+            "a bare prefix gains a trailing-slash boundary"
+        );
+        // Idempotent: an already-`/`-terminated prefix is not doubled.
+        let with_slash = scope(UploadTarget::Prefix("a/".into()), Default::default());
+        assert_eq!(scoped_object_path(&with_slash), "hblob/acme/blog/photos/a/");
+        // A nested prefix keeps its internal separators and gains one trailing `/`.
+        let nested = scope(
+            UploadTarget::Prefix("photos/2026".into()),
+            Default::default(),
+        );
+        assert_eq!(
+            scoped_object_path(&nested),
+            "hblob/acme/blog/photos/photos/2026/"
+        );
+        // An empty prefix ⇒ the container root exactly (whole-container scope).
+        let empty = scope(UploadTarget::Prefix(String::new()), Default::default());
+        assert_eq!(scoped_object_path(&empty), "hblob/acme/blog/photos/");
+    }
+
+    #[test]
     fn size_and_content_type_are_advisory_when_the_store_cannot_cap_them() {
         let c = UploadConstraints {
             max_bytes: Some(1024),
@@ -199,7 +270,10 @@ mod tests {
     }
 
     #[test]
-    fn content_addressing_makes_size_and_create_only_enforced_everywhere() {
+    fn unpinned_sha256_is_advisory_and_promotes_nothing() {
+        // Security HIGH-2: with the baseline (no cloud minter pins the hash), `require_sha256` is
+        // ADVISORY — boatramp never sees the cloud-uploaded bytes to verify `key == sha256`, and no
+        // checksum condition is emitted. It must NOT promote max_bytes / create_only to enforced.
         let c = UploadConstraints {
             max_bytes: Some(1024),
             content_type: None,
@@ -207,13 +281,55 @@ mod tests {
             create_only: true,
         };
         let (enforced, advisory) = constraint_contract(&c, CloudEnforcement::NONE);
-        // require_sha256 is the strong cross-cloud enforcement; it also makes size + overwrite moot.
+        assert!(
+            enforced.is_empty(),
+            "an UNPINNED sha256 enforces nothing: {enforced:?}"
+        );
+        assert!(advisory.contains(&"require_sha256".to_string()));
+        assert!(advisory.contains(&"max_bytes=1024".to_string()));
+        assert!(advisory.contains(&"create_only".to_string()));
+    }
+
+    #[test]
+    fn a_store_that_pins_the_hash_enforces_content_addressing_and_makes_size_moot() {
+        // Where a minter DOES pin the hash (e.g. an AWS single-key checksum condition), it sets
+        // can_enforce_sha256 + content_addressed_size_moot ⇒ require_sha256 + the moot size/overwrite
+        // become enforced HONESTLY.
+        let c = UploadConstraints {
+            max_bytes: Some(1024),
+            content_type: None,
+            require_sha256: true,
+            create_only: true,
+        };
+        let caps = CloudEnforcement {
+            can_enforce_sha256: true,
+            content_addressed_size_moot: true,
+            ..CloudEnforcement::NONE
+        };
+        let (enforced, advisory) = constraint_contract(&c, caps);
         assert!(enforced.contains(&"require_sha256".to_string()));
         assert!(enforced.contains(&"max_bytes=1024".to_string()));
         assert!(enforced.contains(&"create_only".to_string()));
         assert!(
             advisory.is_empty(),
-            "content-addressed ⇒ nothing merely advisory: {advisory:?}"
+            "hash-pinned content-addressed ⇒ nothing merely advisory: {advisory:?}"
+        );
+    }
+
+    #[test]
+    fn no_uncapped_constraint_is_ever_labeled_enforced_on_the_baseline() {
+        // The M5 honesty gate: on the conservative baseline (a broad prefix/temp-cred shape) NOTHING is
+        // enforced — every constraint the store cannot structurally cap is advisory.
+        let c = UploadConstraints {
+            max_bytes: Some(7),
+            content_type: Some("image/png".into()),
+            require_sha256: true,
+            create_only: true,
+        };
+        let (enforced, _advisory) = constraint_contract(&c, CloudEnforcement::NONE);
+        assert!(
+            enforced.is_empty(),
+            "baseline caps nothing ⇒ nothing enforced: {enforced:?}"
         );
     }
 

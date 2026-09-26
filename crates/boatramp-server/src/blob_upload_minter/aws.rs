@@ -117,31 +117,40 @@ impl AwsBlobUploadMinter {
     /// The **inline session policy JSON** — the security-critical artifact the M5 gate asserts is
     /// prefix-resource-scoped + put/multipart-action-scoped only (invariant 9). Built ENTIRELY from the
     /// host-stamped [`MintScope`]: the `Resource` is `arn:aws:s3:::{bucket}/{hblob-scoped-path}*` (a
-    /// single key ⇒ the exact object; a prefix ⇒ the subtree wildcard), the `Action` is the minimal
-    /// [`actions`](Self::actions) set. A neutered/bucket-wide/`*` policy would be a finding.
+    /// single key ⇒ the exact object; a prefix ⇒ the subtree wildcard, which `scoped_object_path`
+    /// already boundaried with a trailing `/`), the `Action` is the minimal [`actions`](Self::actions)
+    /// set. A neutered/bucket-wide/`*` policy would be a finding.
+    ///
+    /// **Built with `serde_json`, NOT `format!`-splicing (Security HIGH-1):** the resource ARN carries a
+    /// host-forced-but-composed key/prefix; a stray `"` in it must never be able to break out of the
+    /// string and inject a second, broader `Allow`. `serde_json` escapes every value, so the document
+    /// structure is fixed by construction — belt-and-suspenders with the charset screen at the mint
+    /// choke point ([`screen_upload_target`](boatramp_handlers::screen_upload_target)).
     ///
     /// Pure + deterministic ⇒ unit-testable without any live STS call.
     pub fn session_policy_json(bucket: &str, scope: &MintScope) -> String {
         let actions = Self::actions(&scope.perms);
         // The object-resource ARN. For a KEY target the resource is the exact object (no wildcard); for
-        // a PREFIX target it is the subtree (`prefix*`). `scoped_object_path` already anchors under
+        // a PREFIX target it is the subtree (`prefix/*`). `scoped_object_path` already anchors under
         // `hblob/{qualified-site}/{container}/`, so the credential cannot address another container.
         let object_path = cloud::scoped_object_path(scope);
         let resource = match &scope.target {
             UploadTarget::Key(_) => format!("arn:aws:s3:::{bucket}/{object_path}"),
             UploadTarget::Prefix(_) => format!("arn:aws:s3:::{bucket}/{object_path}*"),
         };
-        // Hand-build the JSON so the exact byte shape is stable + greppable (the gate inspects it). The
-        // action list and the single resource string are the only variables; everything else is fixed.
-        let actions_json = actions
-            .iter()
-            .map(|a| format!("\"{a}\""))
-            .collect::<Vec<_>>()
-            .join(",");
-        format!(
-            "{{\"Version\":\"2012-10-17\",\"Statement\":[{{\"Sid\":\"BoatrampBlobIngress\",\
-             \"Effect\":\"Allow\",\"Action\":[{actions_json}],\"Resource\":\"{resource}\"}}]}}"
-        )
+        // Build the document as structured JSON so a metacharacter in `resource`/`actions` can only ever
+        // be an escaped string value — never a new key, statement, or Allow. `serde_json::to_string`
+        // cannot fail on this (all-string) value.
+        let policy = serde_json::json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Sid": "BoatrampBlobIngress",
+                "Effect": "Allow",
+                "Action": actions,
+                "Resource": resource,
+            }],
+        });
+        serde_json::to_string(&policy).expect("session policy JSON is always serializable")
     }
 
     /// Broker the temp credential via STS under the configured [`StsMode`], scoped by the inline session
@@ -379,18 +388,56 @@ mod tests {
     }
 
     #[test]
-    fn content_addressing_is_enforced_on_aws() {
+    fn unpinned_sha256_is_advisory_on_aws_temp_credentials() {
+        // Security HIGH-2: the AWS temp-credential (session-policy) shape emits NO checksum condition,
+        // so require_sha256 is ADVISORY — boatramp never sees the bytes the client PUTs to real S3, so
+        // it cannot verify `key == sha256`. It must NOT promote max_bytes.
         let c = UploadConstraints {
             require_sha256: true,
             max_bytes: Some(1024),
             ..Default::default()
         };
         let (enforced, advisory) = cloud::constraint_contract(&c, CloudEnforcement::NONE);
-        assert!(enforced.contains(&"require_sha256".to_string()));
         assert!(
-            enforced.contains(&"max_bytes=1024".to_string()),
-            "content-addressed ⇒ size moot ⇒ enforced"
+            enforced.is_empty(),
+            "AWS session policy pins no hash ⇒ nothing enforced: {enforced:?}"
         );
-        assert!(advisory.is_empty());
+        assert!(advisory.contains(&"require_sha256".to_string()));
+        assert!(advisory.contains(&"max_bytes=1024".to_string()));
+    }
+
+    #[test]
+    fn a_metacharacter_in_the_scoped_path_cannot_restructure_the_policy() {
+        // Security HIGH-1 belt-and-suspenders: even if a `"` reached the (serde_json-built) policy — it
+        // cannot, because the mint choke point screens it out first — the document must remain a single
+        // Allow statement with the metacharacter confined to the (escaped) Resource string, never a
+        // second injected statement. We drive a hostile container directly past the screen (the pure
+        // builder is standalone) to prove the construction is injection-proof.
+        let s = MintScope {
+            project: "acme".into(),
+            site: "blog".into(),
+            container: "photos".into(),
+            // A key carrying a `"` that in a naive format! would close the Resource string and let the
+            // rest inject `,"Resource":"arn:aws:s3:::*"` — a bucket-wide Allow.
+            target: UploadTarget::Key("x\",\"Resource\":\"arn:aws:s3:::*".into()),
+            perms: vec![UploadPerm::Put],
+            constraints: Default::default(),
+            ttl_secs: 900,
+        };
+        let policy = AwsBlobUploadMinter::session_policy_json("my-bucket", &s);
+        // Parse it back: it MUST be one statement, one resource, and the resource must be the SINGLE
+        // scoped object ARN with the metacharacter escaped INSIDE it — not a bucket-wide `*`.
+        let v: serde_json::Value = serde_json::from_str(&policy).expect("valid JSON");
+        let stmts = v["Statement"].as_array().expect("Statement array");
+        assert_eq!(stmts.len(), 1, "exactly one Allow statement: {policy}");
+        assert_eq!(stmts[0]["Effect"], "Allow");
+        let resource = stmts[0]["Resource"].as_str().expect("Resource string");
+        assert!(
+            resource.starts_with("arn:aws:s3:::my-bucket/hblob/acme/blog/photos/"),
+            "the metacharacter stayed inside the scoped object resource: {resource}"
+        );
+        assert_ne!(resource, "arn:aws:s3:::*", "no bucket-wide injection");
+        // The Resource is a single scalar string, not an array of two resources.
+        assert!(stmts[0]["Resource"].is_string(), "Resource is one string");
     }
 }

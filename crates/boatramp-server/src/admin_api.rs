@@ -1801,6 +1801,21 @@ pub(super) async fn blob_mint_upload(
         )
             .into_response();
     }
+    // SCREEN the container + key|prefix BEFORE any signing / policy build (Security HIGH-1), mirroring
+    // the guest binding's mint choke point: reject a traversal, a reserved `.boatramp*` segment, a
+    // `*`/`\`/control byte, or a policy metacharacter (`"`/`'`) that could restructure a cloud policy
+    // document — the operator route flows into the SAME hand-built policy strings the guest path does.
+    if let Err(e) = boatramp_handlers::screen_upload_target(req.container.trim(), &target) {
+        let reason = match e {
+            boatramp_handlers::MintRefused::InvalidRequest(m) => m,
+            other => format!("{other:?}"),
+        };
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("invalid mint target: {reason}\n"),
+        )
+            .into_response();
+    }
     if req.ttl_seconds == 0 {
         return (
             StatusCode::UNPROCESSABLE_ENTITY,
