@@ -1015,7 +1015,7 @@ mod tests {
             panic!("expected a scoped tenancy");
         };
         assert_eq!(
-            f.tenancy.as_ref().map(|t| t.unscoped_writes()),
+            f.tenancy.as_ref().map(Tenancy::unscoped_writes),
             Some(&["oauth_state".to_string()][..])
         );
     }
