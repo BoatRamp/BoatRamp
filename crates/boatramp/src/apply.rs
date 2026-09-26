@@ -965,6 +965,7 @@ mod tests {
                         "orders": (kind: tenant),
                         "tenant": (kind: tenant_keyed, key: "id"),
                         "countries": (kind: unscoped),
+                        "oauth_state": (kind: unscoped, writable: true),
                     },
                 ),
             )"#,
@@ -977,7 +978,46 @@ mod tests {
             schema.tables.get("tenant"),
             Some(&TableScope::TenantKeyed { key: "id".into() })
         );
-        assert_eq!(schema.tables.get("countries"), Some(&TableScope::Unscoped));
+        // #503: a plain `unscoped` parses as `writable: false`; the `writable: true` flag parses too.
+        assert_eq!(
+            schema.tables.get("countries"),
+            Some(&TableScope::Unscoped { writable: false })
+        );
+        assert_eq!(
+            schema.tables.get("oauth_state"),
+            Some(&TableScope::Unscoped { writable: true })
+        );
+    }
+
+    /// A per-route `unscoped_writes` allowlist round-trips through the RON manifest surface (#503).
+    #[test]
+    fn manifest_parses_per_route_unscoped_writes() {
+        use boatramp_core::tenancy::Tenancy;
+        let manifest = ApplyManifest::parse(
+            r#"(
+                project: "acme",
+                functions: [
+                    (
+                        name: "oauth-start",
+                        component: "oauth.wasm",
+                        imports: ["sql"],
+                        tenancy: (mode: "scoped", column: "tenant_id",
+                                  sources: [(kind: "token", claim: "tid")],
+                                  read: "own", write: "own",
+                                  unscoped_writes: ["oauth_state"]),
+                    ),
+                ],
+            )"#,
+        )
+        .expect("manifest with per-route unscoped_writes parses");
+        let f = &manifest.functions[0];
+        let Some(Tenancy::Scoped { .. }) = f.tenancy.as_ref() else {
+            panic!("expected a scoped tenancy");
+        };
+        assert_eq!(
+            f.tenancy.as_ref().map(|t| t.unscoped_writes()),
+            Some(&["oauth_state".to_string()][..])
+        );
     }
 
     /// A per-function `tenancy` + `token_claims` round-trips through the RON manifest surface
