@@ -30,12 +30,13 @@ pub enum Action {
     Admin,
 }
 
-/// A class of control-plane resource a [`Right`] governs. Three are **target-scoped**:
+/// A class of control-plane resource a [`Right`] governs. Four are **target-scoped**:
 /// [`Resource::Site`] (target = `"<project>/<site>"`, the 0.2.0 project-qualified
 /// form), [`Resource::Project`] (target = `"<project>"`, governing the project's
 /// **own** resources — functions, compute, workflows, and the project entity itself),
-/// and [`Resource::Secrets`] (target = `"<project>"`, the project's sealed secret
-/// store). The rest are global.
+/// [`Resource::Secrets`] (target = `"<project>"`, the project's sealed secret
+/// store), and [`Resource::BlobUpload`] (target = `"<project>/<site>/<container>"`,
+/// minting an S3-ingress upload credential for one container). The rest are global.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Resource {
@@ -50,6 +51,18 @@ pub enum Resource {
     Secrets,
     /// Content-addressed blob uploads (`PUT /api/blobs/<hash>`).
     Blobs,
+    /// **Minting a scoped S3-ingress upload credential** for a blob container
+    /// (`target` = `"<project>/<site>/<container>"`). This gates the *mint* verb
+    /// (the operator `boatramp blob mint-upload` route + the guest `blob-upload`
+    /// binding's control-plane authorization), NOT the S3 ingress PUT itself — an
+    /// upload is authorized by the short-lived temp credential it carries, never by
+    /// this control-plane right. Deliberately **separate** from [`Resource::Blobs`]
+    /// (content-addressed control-plane artifact uploads, a `deploy`-grade action a
+    /// publisher holds): minting an external-ingress credential is a distinct,
+    /// admin-gated capability, so it is granted only to `admin` (via
+    /// [`Resource::ALL`]) — never to the default `publisher`/`deployer`/`project_*`
+    /// roles, which would otherwise let a site publisher hand out ingress creds.
+    BlobUpload,
     /// API token management (`/api/tokens`).
     Tokens,
     /// TLS certificate status (`/api/certs`).
@@ -62,11 +75,12 @@ pub enum Resource {
 
 impl Resource {
     /// Every resource variant — used to expand the `admin` role to "all rights".
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::Site,
         Self::Project,
         Self::Secrets,
         Self::Blobs,
+        Self::BlobUpload,
         Self::Tokens,
         Self::Certs,
         Self::Cache,
@@ -80,6 +94,7 @@ impl Resource {
             Self::Project => "project",
             Self::Secrets => "secrets",
             Self::Blobs => "blobs",
+            Self::BlobUpload => "blob_upload",
             Self::Tokens => "tokens",
             Self::Certs => "certs",
             Self::Cache => "cache",
@@ -1723,6 +1738,87 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn admin_expands_to_blob_upload_but_default_publisher_roles_do_not() {
+        // The S3-ingress mint right is admin-gated: `admin` (via `Resource::ALL`)
+        // holds it on any container; the default site/deploy/project roles that CAN
+        // deploy content blobs must NOT be able to mint an ingress credential — that
+        // would let a publisher hand out scoped write access to the store.
+        let policy = AuthzPolicy::default_policy();
+        let container = || Some("acme/blog/uploads".to_string());
+        let mint = |t: Option<String>, a: Action| Right::new(Resource::BlobUpload, t, a);
+
+        // admin can mint on any container, at every action.
+        let admin = policy.rights_for(&[GrantedRole::global("admin")]);
+        for action in [Action::Read, Action::Write, Action::Deploy, Action::Admin] {
+            assert!(
+                admin.allows(&mint(container(), action)),
+                "admin must allow BlobUpload·{action:?}"
+            );
+        }
+
+        // None of the default site/project roles expand to BlobUpload — check every
+        // action so no arm leaks. `has_blob_deploy` records whether the role still
+        // holds the DISTINCT content-blob deploy right (proving BlobUpload is a
+        // genuinely separate resource, not a blanket blob denial).
+        for (role, grant, has_blob_deploy) in [
+            (
+                "publisher",
+                GrantedRole::scoped("publisher", "acme/blog"),
+                true,
+            ),
+            (
+                "deployer",
+                GrantedRole::scoped("deployer", "acme/blog"),
+                true,
+            ),
+            (
+                "project_admin",
+                GrantedRole::scoped("project_admin", "acme"),
+                true,
+            ),
+            (
+                "project_publisher",
+                GrantedRole::scoped("project_publisher", "acme"),
+                true,
+            ),
+            (
+                "project_viewer",
+                GrantedRole::scoped("project_viewer", "acme"),
+                false, // read-only: holds no deploy right at all
+            ),
+        ] {
+            let rights = policy.rights_for(&[grant]);
+            for action in [Action::Read, Action::Write, Action::Deploy, Action::Admin] {
+                assert!(
+                    !rights.allows(&mint(container(), action)),
+                    "{role} must NOT expand to BlobUpload·{action:?}"
+                );
+                // …with a wildcard (no-target) required right either, so the
+                // deny isn't just a target mismatch.
+                assert!(
+                    !rights.allows(&mint(None, action)),
+                    "{role} must NOT hold a wildcard BlobUpload·{action:?}"
+                );
+            }
+            assert_eq!(
+                rights.allows(&Right::new(Resource::Blobs, None, Action::Deploy)),
+                has_blob_deploy,
+                "{role} content-blob deploy right unchanged (BlobUpload is separate)"
+            );
+        }
+    }
+
+    #[test]
+    fn blob_upload_is_in_resource_all_so_admin_covers_it() {
+        assert!(
+            Resource::ALL.contains(&Resource::BlobUpload),
+            "BlobUpload must be in Resource::ALL so `admin` expands to it"
+        );
+        // Its serde term is stable + distinct (routing/authz greppability).
+        assert_eq!(Resource::BlobUpload.as_str(), "blob_upload");
     }
 
     #[test]
