@@ -52,14 +52,20 @@ fn is_false(b: &bool) -> bool {
 /// Resolve a secret **spec** to its value: `env:VAR`, `path:/file`, or a literal.
 /// An empty spec resolves to `None`. A named env var / file that is missing or
 /// empty is an error (a misconfiguration, not a silent "no secret").
-pub fn resolve_secret(spec: &str) -> Result<Option<String>> {
+///
+/// The `env:` lookup reads through an injectable [`EnvSource`] so a test supplies
+/// values via a `MapEnv` instead of mutating the global process environment.
+pub fn resolve_secret(
+    spec: &str,
+    env_source: &dyn boatramp_core::env::EnvSource,
+) -> Result<Option<String>> {
     let spec = spec.trim();
     if spec.is_empty() {
         return Ok(None);
     }
     if let Some(var) = spec.strip_prefix("env:") {
-        return match std::env::var(var) {
-            Ok(v) if !v.trim().is_empty() => Ok(Some(v.trim().to_string())),
+        return match env_source.get(var) {
+            Some(v) if !v.trim().is_empty() => Ok(Some(v.trim().to_string())),
             _ => Err(Error::Config(format!("env var {var} is unset or empty"))),
         };
     }
@@ -158,18 +164,19 @@ mod tests {
 
     #[test]
     fn secret_spec_resolves_env_path_and_literal() {
-        // SAFETY: single-threaded test; sets one process env var it also reads.
-        unsafe { std::env::set_var("BOATRAMP_MCP_TEST_SECRET", "s3cr3t") };
+        // The `env:` value is injected via a MapEnv rather than mutating the
+        // process environment (which is `unsafe` in edition 2024 and races tests).
+        let env = boatramp_core::env::MapEnv::new().with("BOATRAMP_MCP_TEST_SECRET", "s3cr3t");
         assert_eq!(
-            resolve_secret("env:BOATRAMP_MCP_TEST_SECRET").unwrap(),
+            resolve_secret("env:BOATRAMP_MCP_TEST_SECRET", &env).unwrap(),
             Some("s3cr3t".to_string())
         );
         assert_eq!(
-            resolve_secret("literal-tok").unwrap(),
+            resolve_secret("literal-tok", &env).unwrap(),
             Some("literal-tok".into())
         );
-        assert_eq!(resolve_secret("   ").unwrap(), None);
-        assert!(resolve_secret("env:BOATRAMP_MCP_DEFINITELY_UNSET").is_err());
+        assert_eq!(resolve_secret("   ", &env).unwrap(), None);
+        assert!(resolve_secret("env:BOATRAMP_MCP_DEFINITELY_UNSET", &env).is_err());
     }
 
     #[test]
