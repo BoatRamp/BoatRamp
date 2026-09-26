@@ -1429,7 +1429,8 @@ pub fn verify_s3_session(
     if kind.as_deref() != Some(KIND_S3_SESSION) {
         return Err(TokenError::Claims("not an s3-session token".into()));
     }
-    let scope = scope.ok_or_else(|| TokenError::Claims("s3-session scope is missing/malformed".into()))?;
+    let scope =
+        scope.ok_or_else(|| TokenError::Claims("s3-session scope is missing/malformed".into()))?;
     Ok(S3Session { scope, cti, exp })
 }
 
@@ -2746,7 +2747,10 @@ mod tests {
         for scope in [s3_scope_key(), s3_scope_prefix()] {
             let token = mint_s3_session(&scope, 300, NOW, &signer).await.unwrap();
             let v = verify_s3_session(&token, &public, NOW + 60).unwrap();
-            assert_eq!(v.scope, scope, "the verified scope must equal what was minted");
+            assert_eq!(
+                v.scope, scope,
+                "the verified scope must equal what was minted"
+            );
             assert_eq!(v.exp, NOW + 300);
             assert!(!v.cti.is_empty());
         }
@@ -2773,7 +2777,10 @@ mod tests {
             "an s3-session's kind must be distinct from KIND_ROLE so a role-gated path rejects it"
         );
         assert_ne!(as_role.kind, KIND_ROLE);
-        assert!(as_role.roles.is_empty(), "an s3-session carries no RBAC roles");
+        assert!(
+            as_role.roles.is_empty(),
+            "an s3-session carries no RBAC roles"
+        );
         assert!(verify_capability(&s3, &public, NOW + 1, "acme").is_err());
         assert!(verify_context(&s3, &public, NOW + 1).is_err());
         assert!(verify_session(&s3, &public, NOW + 1).is_err());
@@ -2862,53 +2869,89 @@ mod tests {
         // A garbled scope must never decode to a usable (widened) grant.
         // Both key AND prefix present ⇒ None.
         let both = CborValue::Map(vec![
-            (CborValue::Text("project".into()), CborValue::Text("p".into())),
+            (
+                CborValue::Text("project".into()),
+                CborValue::Text("p".into()),
+            ),
             (CborValue::Text("site".into()), CborValue::Text("s".into())),
-            (CborValue::Text("container".into()), CborValue::Text("c".into())),
+            (
+                CborValue::Text("container".into()),
+                CborValue::Text("c".into()),
+            ),
             (CborValue::Text("key".into()), CborValue::Text("k".into())),
-            (CborValue::Text("prefix".into()), CborValue::Text("pre/".into())),
+            (
+                CborValue::Text("prefix".into()),
+                CborValue::Text("pre/".into()),
+            ),
             (
                 CborValue::Text("perms".into()),
                 CborValue::Array(vec![CborValue::Text("put".into())]),
             ),
-            (CborValue::Text("constraints".into()), CborValue::Map(vec![])),
+            (
+                CborValue::Text("constraints".into()),
+                CborValue::Map(vec![]),
+            ),
         ]);
         assert!(S3SessionScope::from_cbor(&both).is_none());
 
         // Neither key nor prefix ⇒ None.
         let neither = CborValue::Map(vec![
-            (CborValue::Text("project".into()), CborValue::Text("p".into())),
+            (
+                CborValue::Text("project".into()),
+                CborValue::Text("p".into()),
+            ),
             (CborValue::Text("site".into()), CborValue::Text("s".into())),
-            (CborValue::Text("container".into()), CborValue::Text("c".into())),
+            (
+                CborValue::Text("container".into()),
+                CborValue::Text("c".into()),
+            ),
             (
                 CborValue::Text("perms".into()),
                 CborValue::Array(vec![CborValue::Text("put".into())]),
             ),
-            (CborValue::Text("constraints".into()), CborValue::Map(vec![])),
+            (
+                CborValue::Text("constraints".into()),
+                CborValue::Map(vec![]),
+            ),
         ]);
         assert!(S3SessionScope::from_cbor(&neither).is_none());
 
         // Empty perm set ⇒ None (an ingress cred that authorizes nothing is refused, not "allow").
         let no_perms = CborValue::Map(vec![
-            (CborValue::Text("project".into()), CborValue::Text("p".into())),
+            (
+                CborValue::Text("project".into()),
+                CborValue::Text("p".into()),
+            ),
             (CborValue::Text("site".into()), CborValue::Text("s".into())),
-            (CborValue::Text("container".into()), CborValue::Text("c".into())),
+            (
+                CborValue::Text("container".into()),
+                CborValue::Text("c".into()),
+            ),
             (CborValue::Text("key".into()), CborValue::Text("k".into())),
             (CborValue::Text("perms".into()), CborValue::Array(vec![])),
-            (CborValue::Text("constraints".into()), CborValue::Map(vec![])),
+            (
+                CborValue::Text("constraints".into()),
+                CborValue::Map(vec![]),
+            ),
         ]);
         assert!(S3SessionScope::from_cbor(&no_perms).is_none());
 
         // Missing a required field (no container) ⇒ None.
         let missing = CborValue::Map(vec![
-            (CborValue::Text("project".into()), CborValue::Text("p".into())),
+            (
+                CborValue::Text("project".into()),
+                CborValue::Text("p".into()),
+            ),
             (CborValue::Text("site".into()), CborValue::Text("s".into())),
             (CborValue::Text("key".into()), CborValue::Text("k".into())),
             (
                 CborValue::Text("perms".into()),
                 CborValue::Array(vec![CborValue::Text("put".into())]),
             ),
-            (CborValue::Text("constraints".into()), CborValue::Map(vec![])),
+            (
+                CborValue::Text("constraints".into()),
+                CborValue::Map(vec![]),
+            ),
         ]);
         assert!(S3SessionScope::from_cbor(&missing).is_none());
     }

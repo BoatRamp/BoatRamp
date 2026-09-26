@@ -54,7 +54,7 @@ pub const MAX_CLOCK_SKEW_SECS: i64 = 300;
 /// *which* check failed. The variants are for host-side logs + these unit tests only.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum SigV4Error {
-    /// The `Authorization` header / presigned query was absent or unparseable.
+    /// The `Authorization` header / presigned query was absent or unparsable.
     #[error("malformed authorization")]
     MalformedAuthorization,
     /// The algorithm was not `AWS4-HMAC-SHA256`.
@@ -280,7 +280,10 @@ fn canonical_headers(
             .or_default()
             .push(trim_ws(value));
     }
-    let mut sorted_names: Vec<String> = signed_headers.iter().map(|h| h.to_ascii_lowercase()).collect();
+    let mut sorted_names: Vec<String> = signed_headers
+        .iter()
+        .map(|h| h.to_ascii_lowercase())
+        .collect();
     sorted_names.sort();
     sorted_names.dedup();
 
@@ -345,12 +348,7 @@ pub fn string_to_sign(amz_date: &str, scope: &CredentialScope, canonical_request
 /// Derive the SigV4 signing key: `HMAC(HMAC(HMAC(HMAC("AWS4"+secret, date), region), service),
 /// "aws4_request")`. `secret_access_key` is the credential's secret (for boatramp's face, the
 /// hex-encoded HKDF output from [`super::credential`]).
-pub fn signing_key(
-    secret_access_key: &str,
-    date: &str,
-    region: &str,
-    service: &str,
-) -> hmac::Tag {
+pub fn signing_key(secret_access_key: &str, date: &str, region: &str, service: &str) -> hmac::Tag {
     let k_secret = format!("AWS4{secret_access_key}");
     let k_date = hmac_sign(k_secret.as_bytes(), date.as_bytes());
     let k_region = hmac_sign(k_date.as_ref(), region.as_bytes());
@@ -370,7 +368,12 @@ pub fn compute_signature(
     scope: &CredentialScope,
     string_to_sign: &str,
 ) -> String {
-    let key = signing_key(secret_access_key, &scope.date, &scope.region, &scope.service);
+    let key = signing_key(
+        secret_access_key,
+        &scope.date,
+        &scope.region,
+        &scope.service,
+    );
     hex::encode(hmac_sign(key.as_ref(), string_to_sign.as_bytes()).as_ref())
 }
 
@@ -437,7 +440,9 @@ pub fn parse_authorization_header(
         .filter(|s| !s.is_empty())
         .map(String::from)
         .collect();
-    let signature = signature.ok_or(SigV4Error::MalformedAuthorization)?.to_string();
+    let signature = signature
+        .ok_or(SigV4Error::MalformedAuthorization)?
+        .to_string();
     if signed_headers.is_empty() || signature.is_empty() {
         return Err(SigV4Error::MalformedAuthorization);
     }
@@ -455,11 +460,17 @@ pub fn parse_authorization_header(
 /// `X-Amz-Credential`, `X-Amz-Date`, `X-Amz-SignedHeaders`, `X-Amz-Signature`, and (optionally)
 /// `X-Amz-Expires`. The parameters are provided already percent-DECODED as `(name, value)`.
 pub fn parse_presigned_query(params: &[(String, String)]) -> Result<ParsedSignature, SigV4Error> {
-    let get = |name: &str| params.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str());
+    let get = |name: &str| {
+        params
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+    };
     if get("X-Amz-Algorithm") != Some(ALGORITHM) {
         return Err(SigV4Error::UnsupportedAlgorithm);
     }
-    let scope = CredentialScope::parse(get("X-Amz-Credential").ok_or(SigV4Error::MalformedAuthorization)?)?;
+    let scope =
+        CredentialScope::parse(get("X-Amz-Credential").ok_or(SigV4Error::MalformedAuthorization)?)?;
     let amz_date = get("X-Amz-Date").ok_or(SigV4Error::BadDate)?.to_string();
     let signed_headers: Vec<String> = get("X-Amz-SignedHeaders")
         .ok_or(SigV4Error::MalformedAuthorization)?
@@ -467,7 +478,9 @@ pub fn parse_presigned_query(params: &[(String, String)]) -> Result<ParsedSignat
         .filter(|s| !s.is_empty())
         .map(String::from)
         .collect();
-    let signature = get("X-Amz-Signature").ok_or(SigV4Error::MalformedAuthorization)?.to_string();
+    let signature = get("X-Amz-Signature")
+        .ok_or(SigV4Error::MalformedAuthorization)?
+        .to_string();
     if signed_headers.is_empty() || signature.is_empty() {
         return Err(SigV4Error::MalformedAuthorization);
     }
@@ -547,9 +560,7 @@ pub fn check_presigned_expiry(parsed: &ParsedSignature, now_unix: i64) -> Result
         return Err(SigV4Error::Expired);
     }
     // Allow a small skew before the start (a slightly-fast client) but never past date+expires+skew.
-    if now_unix < start - MAX_CLOCK_SKEW_SECS
-        || now_unix > start + expires + MAX_CLOCK_SKEW_SECS
-    {
+    if now_unix < start - MAX_CLOCK_SKEW_SECS || now_unix > start + expires + MAX_CLOCK_SKEW_SECS {
         return Err(SigV4Error::Expired);
     }
     Ok(())
@@ -585,7 +596,12 @@ impl ChunkVerifier {
         seed_signature: &str,
     ) -> Self {
         Self {
-            signing_key: signing_key(secret_access_key, &scope.date, &scope.region, &scope.service),
+            signing_key: signing_key(
+                secret_access_key,
+                &scope.date,
+                &scope.region,
+                &scope.service,
+            ),
             amz_date: amz_date.to_string(),
             scope_string: scope.scope_string(),
             prev_signature: seed_signature.to_string(),
@@ -607,7 +623,11 @@ impl ChunkVerifier {
     /// Verify ONE chunk's `chunk_signature` (hex) over `chunk_data`, in constant time, and advance the
     /// chain. Returns [`SigV4Error::SignatureMismatch`] on a bad chunk signature (fail-closed, no
     /// partial accept).
-    pub fn verify_chunk(&mut self, chunk_data: &[u8], chunk_signature: &str) -> Result<(), SigV4Error> {
+    pub fn verify_chunk(
+        &mut self,
+        chunk_data: &[u8],
+        chunk_signature: &str,
+    ) -> Result<(), SigV4Error> {
         let sts = self.chunk_sts(chunk_data);
         let expected = hex::encode(hmac_sign(self.signing_key.as_ref(), sts.as_bytes()).as_ref());
         verify_slices_are_equal(expected.as_bytes(), chunk_signature.as_bytes())
@@ -629,7 +649,8 @@ impl ChunkVerifier {
 /// frame the body without buffering it.
 pub fn parse_chunk_header(line: &str) -> Result<(usize, String), SigV4Error> {
     let (size_hex, rest) = line.split_once(';').ok_or(SigV4Error::MalformedChunk)?;
-    let size = usize::from_str_radix(size_hex.trim(), 16).map_err(|_| SigV4Error::MalformedChunk)?;
+    let size =
+        usize::from_str_radix(size_hex.trim(), 16).map_err(|_| SigV4Error::MalformedChunk)?;
     let sig = rest
         .trim()
         .strip_prefix("chunk-signature=")
@@ -681,12 +702,18 @@ mod tests {
         };
         let (creq, signed_str) = canonical_request_string(&req, &signed).unwrap();
         let expected_creq = "GET\n/\n\nhost:example.amazonaws.com\nx-amz-date:20150830T123600Z\n\nhost;x-amz-date\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
-        assert_eq!(creq, expected_creq, "canonical request must match the AWS vector");
+        assert_eq!(
+            creq, expected_creq,
+            "canonical request must match the AWS vector"
+        );
         assert_eq!(signed_str, "host;x-amz-date");
 
         let sts = string_to_sign(SUITE_AMZ_DATE, &suite_scope(), &creq);
         let expected_sts = "AWS4-HMAC-SHA256\n20150830T123600Z\n20150830/us-east-1/service/aws4_request\nbb579772317eb040ac9ed261061d46c1f17a8133879d6129b6e1c25292927e63";
-        assert_eq!(sts, expected_sts, "string-to-sign must match the AWS vector");
+        assert_eq!(
+            sts, expected_sts,
+            "string-to-sign must match the AWS vector"
+        );
 
         let sig = compute_signature(SUITE_SECRET, &suite_scope(), &sts);
         assert_eq!(
@@ -704,7 +731,10 @@ mod tests {
         let headers = vec![("host".to_string(), "example.amazonaws.com".to_string())];
         let signed = vec!["host".to_string()];
         let decoded_params = vec![
-            ("X-Amz-Algorithm".to_string(), "AWS4-HMAC-SHA256".to_string()),
+            (
+                "X-Amz-Algorithm".to_string(),
+                "AWS4-HMAC-SHA256".to_string(),
+            ),
             (
                 "X-Amz-Credential".to_string(),
                 "AKIDEXAMPLE/20150830/us-east-1/service/aws4_request".to_string(),
@@ -715,7 +745,10 @@ mod tests {
         ];
         let canonical_q = presigned_canonical_query(&decoded_params);
         let expected_q = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIDEXAMPLE%2F20150830%2Fus-east-1%2Fservice%2Faws4_request&X-Amz-Date=20150830T123600Z&X-Amz-Expires=3600&X-Amz-SignedHeaders=host";
-        assert_eq!(canonical_q, expected_q, "presigned canonical query must match the AWS vector");
+        assert_eq!(
+            canonical_q, expected_q,
+            "presigned canonical query must match the AWS vector"
+        );
 
         let req = CanonicalRequest {
             method: "GET",
@@ -726,7 +759,10 @@ mod tests {
         };
         let (creq, _) = canonical_request_string(&req, &signed).unwrap();
         let expected_creq = "GET\n/\nX-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIDEXAMPLE%2F20150830%2Fus-east-1%2Fservice%2Faws4_request&X-Amz-Date=20150830T123600Z&X-Amz-Expires=3600&X-Amz-SignedHeaders=host\nhost:example.amazonaws.com\n\nhost\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
-        assert_eq!(creq, expected_creq, "presigned canonical request must match the AWS vector");
+        assert_eq!(
+            creq, expected_creq,
+            "presigned canonical request must match the AWS vector"
+        );
 
         let sts = string_to_sign(SUITE_AMZ_DATE, &suite_scope(), &creq);
         let sig = compute_signature(SUITE_SECRET, &suite_scope(), &sts);
@@ -752,7 +788,10 @@ mod tests {
     #[test]
     fn parse_presigned_query_round_trip() {
         let params = vec![
-            ("X-Amz-Algorithm".to_string(), "AWS4-HMAC-SHA256".to_string()),
+            (
+                "X-Amz-Algorithm".to_string(),
+                "AWS4-HMAC-SHA256".to_string(),
+            ),
             (
                 "X-Amz-Credential".to_string(),
                 "AKIDEXAMPLE/20150830/us-east-1/service/aws4_request".to_string(),
@@ -861,7 +900,10 @@ mod tests {
     fn uri_and_query_encoding_matches_aws_rules() {
         // Path: `/` separators preserved, spaces + reserved encoded.
         assert_eq!(canonical_uri("/foo bar/baz"), "/foo%20bar/baz");
-        assert_eq!(canonical_uri("/documents and settings/"), "/documents%20and%20settings/");
+        assert_eq!(
+            canonical_uri("/documents and settings/"),
+            "/documents%20and%20settings/"
+        );
         // unreserved pass through verbatim.
         assert_eq!(canonical_uri("/-._~"), "/-._~");
         // Query: keys+values encoded (incl. `/`), sorted by encoded key.
@@ -894,7 +936,10 @@ mod tests {
         let signed = vec!["host".to_string()];
         // The presigned params the client would put on the wire (decoded form).
         let mut params = vec![
-            ("X-Amz-Algorithm".to_string(), "AWS4-HMAC-SHA256".to_string()),
+            (
+                "X-Amz-Algorithm".to_string(),
+                "AWS4-HMAC-SHA256".to_string(),
+            ),
             (
                 "X-Amz-Credential".to_string(),
                 "BRUPTEST/20150830/boatramp/s3/aws4_request".to_string(),
@@ -1004,8 +1049,14 @@ mod tests {
             Err(SigV4Error::SkewExceeded)
         );
         // Malformed date ⇒ BadDate (fail-closed, not a panic).
-        assert_eq!(parse_amz_date("not-a-date").unwrap_err(), SigV4Error::BadDate);
-        assert_eq!(parse_amz_date("20150830 123600Z").unwrap_err(), SigV4Error::BadDate);
+        assert_eq!(
+            parse_amz_date("not-a-date").unwrap_err(),
+            SigV4Error::BadDate
+        );
+        assert_eq!(
+            parse_amz_date("20150830 123600Z").unwrap_err(),
+            SigV4Error::BadDate
+        );
     }
 
     #[test]
@@ -1021,7 +1072,10 @@ mod tests {
     fn presigned_expiry_window() {
         let start = parse_amz_date(SUITE_AMZ_DATE).unwrap();
         let params = vec![
-            ("X-Amz-Algorithm".to_string(), "AWS4-HMAC-SHA256".to_string()),
+            (
+                "X-Amz-Algorithm".to_string(),
+                "AWS4-HMAC-SHA256".to_string(),
+            ),
             (
                 "X-Amz-Credential".to_string(),
                 "AKIDEXAMPLE/20150830/us-east-1/service/aws4_request".to_string(),
@@ -1042,7 +1096,10 @@ mod tests {
         // No expires ⇒ Expired (fail closed).
         let mut noexp = parsed.clone();
         noexp.expires = None;
-        assert_eq!(check_presigned_expiry(&noexp, start), Err(SigV4Error::Expired));
+        assert_eq!(
+            check_presigned_expiry(&noexp, start),
+            Err(SigV4Error::Expired)
+        );
     }
 
     #[test]
@@ -1144,7 +1201,10 @@ mod tests {
         // Tamper: a fresh verifier, wrong chunk signature ⇒ reject (fail-closed, chain not advanced).
         let mut v2 = ChunkVerifier::new(secret, &scope, amz_date, seed);
         assert_eq!(
-            v2.verify_chunk(&chunk1, "00000000000000000000000000000000000000000000000000000000000000ff"),
+            v2.verify_chunk(
+                &chunk1,
+                "00000000000000000000000000000000000000000000000000000000000000ff"
+            ),
             Err(SigV4Error::SignatureMismatch)
         );
         // Tamper: right signatures but WRONG order (chunk2's sig on chunk1) ⇒ reject (chain binds
@@ -1320,7 +1380,10 @@ mod tests {
             (0, "deadbeef".to_string())
         );
         // No `;` ⇒ malformed.
-        assert_eq!(parse_chunk_header("10000").unwrap_err(), SigV4Error::MalformedChunk);
+        assert_eq!(
+            parse_chunk_header("10000").unwrap_err(),
+            SigV4Error::MalformedChunk
+        );
         // No chunk-signature ⇒ malformed.
         assert_eq!(
             parse_chunk_header("10000;something=x").unwrap_err(),

@@ -200,7 +200,9 @@ pub fn validate_object_key(value: &str) -> Result<(), InvalidResourceName> {
     }
     for segment in value.split('/') {
         if segment.is_empty() {
-            return reject("must not contain an empty path segment (no leading/trailing/doubled '/')");
+            return reject(
+                "must not contain an empty path segment (no leading/trailing/doubled '/')",
+            );
         }
         if segment == "." || segment == ".." {
             return reject("must not contain a '.' or '..' path segment");
@@ -239,17 +241,20 @@ mod object_key_tests {
     #[test]
     fn rejects_traversal_and_absolute_and_empty_segments() {
         for bad in [
-            "",            // empty
-            "/leading",    // absolute / leading slash → empty first segment
-            "trailing/",   // trailing slash → empty last segment
-            "a//b",        // doubled slash → empty middle segment
-            "..",          // traversal
-            ".",           // current-dir segment
-            "a/../b",      // embedded traversal
-            "a/./b",       // embedded current-dir
-            "../escape",   // prefix escape
+            "",          // empty
+            "/leading",  // absolute / leading slash → empty first segment
+            "trailing/", // trailing slash → empty last segment
+            "a//b",      // doubled slash → empty middle segment
+            "..",        // traversal
+            ".",         // current-dir segment
+            "a/../b",    // embedded traversal
+            "a/./b",     // embedded current-dir
+            "../escape", // prefix escape
         ] {
-            assert!(validate_object_key(bad).is_err(), "{bad:?} should be rejected");
+            assert!(
+                validate_object_key(bad).is_err(),
+                "{bad:?} should be rejected"
+            );
         }
     }
 
@@ -261,7 +266,10 @@ mod object_key_tests {
             "a/.boatramp-uploads/p", // reserved segment nested
             ".BoatRamp-Container",   // case-folded trick
         ] {
-            assert!(validate_object_key(bad).is_err(), "{bad:?} should be rejected");
+            assert!(
+                validate_object_key(bad).is_err(),
+                "{bad:?} should be rejected"
+            );
         }
     }
 
