@@ -113,6 +113,29 @@ pub async fn run(args: TenancyArgs, config: &ProjectConfig) -> Result<()> {
                 "applied tenancy schema to project `{project}` ({} table(s))",
                 schema.tables.len()
             );
+            // #503: surface the WRITE-GLOBAL tables so the operator sees exactly which shared tables
+            // any scoped route may write UNSTAMPED — the irreducible operator-trust residual (the
+            // host cannot verify a declared-global table is truly tenant-less; a misdeclaration lets
+            // any granted route write across tenants).
+            let write_global: Vec<&String> = schema
+                .tables
+                .iter()
+                .filter_map(|(name, scope)| {
+                    matches!(
+                        scope,
+                        boatramp_core::tenancy::TableScope::Unscoped { writable: true }
+                    )
+                    .then_some(name)
+                })
+                .collect();
+            if !write_global.is_empty() {
+                let names: Vec<&str> = write_global.iter().map(|s| s.as_str()).collect();
+                println!(
+                    "  write-global (writable, any scoped route may write UNSTAMPED — ensure these \
+                     are genuinely tenant-less): {}",
+                    names.join(", ")
+                );
+            }
         }
         TenancyCommand::Clear => {
             cp.clear_project_tenancy().await?;

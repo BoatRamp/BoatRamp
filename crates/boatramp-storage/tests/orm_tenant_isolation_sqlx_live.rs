@@ -33,6 +33,7 @@ fn scope(mode: ScopeMode, value: &str) -> Scope {
         session: None,
         mode,
         keys: TableKeys::Uniform,
+        unscoped_writes: std::collections::BTreeSet::new(),
     }
 }
 fn item(e: Expr) -> SelectItem {
@@ -437,7 +438,7 @@ async fn run_pertable_battery(backend: Arc<dyn SqlBackend>, dialect: Dialect, en
                     key: "account_id".into(),
                 },
             ),
-            ("countries".into(), TableScope::Unscoped),
+            ("countries".into(), TableScope::Unscoped { writable: false }),
         ]),
         ..Default::default()
     };
@@ -448,6 +449,7 @@ async fn run_pertable_battery(backend: Arc<dyn SqlBackend>, dialect: Dialect, en
         session: None,
         mode: ScopeMode::Own,
         keys: keys.clone(),
+        unscoped_writes: std::collections::BTreeSet::new(),
     };
 
     // 1) `orders` (Tenant) scoped on `tenant_id` → acme-only.
@@ -684,6 +686,7 @@ async fn run_session_disjunct_battery(
         session: session.map(t),
         mode: ScopeMode::Own,
         keys: keys.clone(),
+        unscoped_writes: std::collections::BTreeSet::new(),
     };
     let read_items = |scope: &Scope| {
         let mut s = Select {
@@ -973,6 +976,191 @@ async fn run_json_jsonb_battery(backend: Arc<dyn SqlBackend>, engine: &str) {
     );
 }
 
+/// #503 **write-global / per-route allowlist** live battery — the canonical OAuth-shaped case on a
+/// real Postgres/MySQL engine, mutation-verified. A `read: "own"` route reads ONLY its own rows of a
+/// per-tenant config table (isolation intact) AND writes a genuinely-global `oauth_state` row with
+/// NO tenant column (arm 2, write-global) plus a listed plain-`Unscoped` `audit_log` (arm 3). The
+/// [`Scope`] is built exactly as the host builds it. A per-engine rendering bug (placeholder
+/// renumbering, an accidental tenant predicate on a global write) would surface here.
+async fn run_unscoped_write_battery(backend: Arc<dyn SqlBackend>, dialect: Dialect, engine: &str) {
+    use boatramp_core::tenancy::{TableScope, TenancySchema};
+    use std::collections::{BTreeMap, BTreeSet};
+
+    {
+        let mut tx = backend.begin().await.unwrap();
+        for ddl in [
+            "DROP TABLE IF EXISTS oidc_provider",
+            "DROP TABLE IF EXISTS oauth_state",
+            "DROP TABLE IF EXISTS audit_log",
+            "CREATE TABLE oidc_provider (id VARCHAR(64) PRIMARY KEY, tenant_id VARCHAR(64), issuer VARCHAR(255))",
+            // Genuinely tenant-less: no tenant column at all.
+            "CREATE TABLE oauth_state (state VARCHAR(64) PRIMARY KEY, created VARCHAR(64))",
+            "CREATE TABLE audit_log (id VARCHAR(64) PRIMARY KEY, msg VARCHAR(255))",
+        ] {
+            tx.execute(ddl, &[]).await.unwrap();
+        }
+        // Two tenants' provider config — the own-read isolation fixture.
+        tx.execute(
+            "INSERT INTO oidc_provider (id, tenant_id, issuer) VALUES \
+             ('p_a','acme','https://acme.example'),('p_g','globex','https://globex.example')",
+            &[],
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    // The schema: per-tenant `oidc_provider`, write-global `oauth_state` (arm 2), plain `audit_log`.
+    let schema = TenancySchema {
+        default_tenant_key: "tenant_id".into(),
+        tables: BTreeMap::from([
+            ("oidc_provider".into(), TableScope::Tenant),
+            (
+                "oauth_state".into(),
+                TableScope::Unscoped { writable: true },
+            ),
+            ("audit_log".into(), TableScope::Unscoped { writable: false }),
+        ]),
+        ..Default::default()
+    };
+    // The route: read:own / write:own, listing `audit_log` (the strict opt-in). Built exactly as
+    // the host's `orm_scope` builds it — `unscoped_writes` carried onto the Scope.
+    let keys = TableKeys::PerTable(schema.table_key_map());
+    let scoped = |tenant: &str| Scope {
+        column: "tenant_id".into(),
+        value: Some(t(tenant)),
+        session: None,
+        mode: ScopeMode::Own,
+        keys: keys.clone(),
+        unscoped_writes: BTreeSet::from(["audit_log".to_string()]),
+    };
+
+    // (1) OWN READ isolation intact: acme reads ONLY its own provider row.
+    {
+        let mut s = Select {
+            columns: vec![item(Expr::col("issuer"))],
+            ..Select::from("oidc_provider")
+        };
+        s.force_scope(&scoped("acme")).unwrap();
+        let (sql, params) = s.compile(dialect).unwrap();
+        let mut tx = backend.begin().await.unwrap();
+        let got = run_query(tx.as_mut(), &sql, &params).await;
+        assert_eq!(
+            got,
+            vec!["https://acme.example".to_string()],
+            "[{engine}] own read stays isolated — a write-global grant must NOT widen reads (G2)"
+        );
+        tx.commit().await.unwrap();
+    }
+
+    // (2) WRITE-GLOBAL INSERT (arm 2): a scoped route writes `oauth_state` with NO tenant column,
+    // and the row lands (no injected tenant predicate/stamp broke the INSERT).
+    {
+        let mut ins = Insert {
+            table: "oauth_state".into(),
+            rows: vec![RowValues {
+                cells: vec![
+                    Assignment {
+                        column: "state".into(),
+                        value: Expr::val(t("csrf-xyz")),
+                    },
+                    Assignment {
+                        column: "created".into(),
+                        value: Expr::val(t("now")),
+                    },
+                ],
+            }],
+            conflict: None,
+            scope: None,
+            returning: vec![],
+            from_select: None,
+        };
+        ins.force_scope(Some(&scoped("acme")), Some(&scoped("acme")))
+            .unwrap();
+        let (sql, params) = ins.compile(dialect).unwrap();
+        assert!(
+            !sql.contains("tenant_id"),
+            "[{engine}] write-global INSERT must carry no tenant column: {sql}"
+        );
+        let mut tx = backend.begin().await.unwrap();
+        tx.execute(&sql, &params).await.unwrap();
+        // The row is readable back with no tenant filter (global).
+        let got = run_query(tx.as_mut(), "SELECT state FROM oauth_state", &[]).await;
+        assert_eq!(
+            got,
+            vec!["csrf-xyz".to_string()],
+            "[{engine}] the write-global row must land"
+        );
+        tx.commit().await.unwrap();
+    }
+
+    // (3) LISTED plain-Unscoped INSERT (arm 3): `audit_log` is plain `unscoped` but listed on the
+    // route → writable unstamped.
+    {
+        let mut ins = Insert {
+            table: "audit_log".into(),
+            rows: vec![RowValues {
+                cells: vec![
+                    Assignment {
+                        column: "id".into(),
+                        value: Expr::val(t("a1")),
+                    },
+                    Assignment {
+                        column: "msg".into(),
+                        value: Expr::val(t("started")),
+                    },
+                ],
+            }],
+            conflict: None,
+            scope: None,
+            returning: vec![],
+            from_select: None,
+        };
+        ins.force_scope(Some(&scoped("acme")), Some(&scoped("acme")))
+            .unwrap();
+        let (sql, params) = ins.compile(dialect).unwrap();
+        let mut tx = backend.begin().await.unwrap();
+        tx.execute(&sql, &params).await.unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    // (4) A plain-Unscoped table NOT listed by the route stays refused (deny-by-default un-eroded) —
+    // build a scope with an EMPTY allowlist and prove `audit_log` is now refused.
+    {
+        let empty_list = Scope {
+            unscoped_writes: BTreeSet::new(),
+            ..scoped("acme")
+        };
+        let mut ins = Insert {
+            table: "audit_log".into(),
+            rows: vec![RowValues {
+                cells: vec![Assignment {
+                    column: "id".into(),
+                    value: Expr::val(t("a2")),
+                }],
+            }],
+            conflict: None,
+            scope: None,
+            returning: vec![],
+            from_select: None,
+        };
+        assert!(
+            matches!(
+                ins.force_scope(Some(&empty_list), Some(&empty_list)),
+                Err(boatramp_core::orm::OrmError::UnscopedWrite(tbl)) if tbl == "audit_log"
+            ),
+            "[{engine}] an unlisted plain-unscoped write must stay refused (deny-by-default)"
+        );
+    }
+
+    println!(
+        "SCOPED UNSCOPED-WRITE CROSS-SURFACE OK [{engine}]: read:own isolated (own row only — a \
+         write-global grant does NOT widen reads, G2); a write-global oauth_state INSERT lands \
+         UNSTAMPED (no tenant column); a listed plain-unscoped audit_log INSERT lands unstamped; an \
+         UNLISTED plain-unscoped write stays refused deny-by-default"
+    );
+}
+
 #[cfg(feature = "sql-postgres")]
 #[tokio::test]
 async fn postgres_orm_scope_isolates_on_a_real_engine() {
@@ -984,6 +1172,7 @@ async fn postgres_orm_scope_isolates_on_a_real_engine() {
     run_battery(backend.clone(), Dialect::Postgres, "postgres").await;
     run_pertable_battery(backend.clone(), Dialect::Postgres, "postgres").await;
     run_session_disjunct_battery(backend.clone(), Dialect::Postgres, "postgres").await;
+    run_unscoped_write_battery(backend.clone(), Dialect::Postgres, "postgres").await;
     run_upsert_guard_battery(backend.clone(), "postgres").await;
     run_json_jsonb_battery(backend, "postgres").await;
 }
@@ -998,5 +1187,6 @@ async fn mysql_orm_scope_isolates_on_a_real_engine() {
     let backend = connect(ExternalSqlKind::Mysql, &ExternalSqlOptions::new(url)).unwrap();
     run_battery(backend.clone(), Dialect::Mysql, "mysql").await;
     run_pertable_battery(backend.clone(), Dialect::Mysql, "mysql").await;
-    run_session_disjunct_battery(backend, Dialect::Mysql, "mysql").await;
+    run_session_disjunct_battery(backend.clone(), Dialect::Mysql, "mysql").await;
+    run_unscoped_write_battery(backend, Dialect::Mysql, "mysql").await;
 }
