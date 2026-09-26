@@ -5,6 +5,31 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.5.8] - 2026-09-26
+
+A single P0 security fix for the raw-SQL tenancy path. No public HTTP/CLI/config break; guests need no change.
+
+### Security
+
+- **Raw-SQL `own`/`session` tenant scoping is now AST-injected and can no longer be `OR`-escaped** (P0;
+  pre-existing in 0.5.7 and earlier). The raw `sql` binding confined an `own`/`session`-scoped **read or
+  write** by substituting a guest-placed `{scope}` marker (`tenant = ?`) into the guest's SQL *text* — which
+  a hostile guest could neutralize with a top-level `OR` (`WHERE 1=1 OR {scope}`) or reposition, reading or
+  writing **another tenant's rows**. Unbackstopped on libsql/SQLite, MySQL, and BYO/external Postgres
+  (managed Postgres was covered only when the operator had enabled RLS *and* the app authored `WITH CHECK`
+  policies). The typed `orm` binding was **never** affected (it injects the scope structurally), and the
+  cross-tenant *target*-read path was already AST-confined — this closes the same gap for the own/session
+  axis. The own/session read and write paths now use the same parse-and-inject confinement as the target
+  path and the ORM: the tenant predicate is `AND`-ed onto the **parenthesized** guest query at the AST level
+  on **every** table reference (root, joins, subqueries, CTEs, set-ops); an INSERT force-stamps the tenant
+  column and confines `INSERT … SELECT`/VALUES/`RETURNING` sub-reads; and constructs that cannot be soundly
+  confined (CTE-led writes, `UPDATE … FROM`, multi-table/`USING` DELETE, upserts, `REPLACE`/`INSERT OR
+  REPLACE`, a positional INSERT with no column list, `DELETE … ORDER BY/LIMIT`) are **refused fail-closed**.
+  The `{scope}` marker is now optional and inert. Backend-independent (applies on libsql/SQLite, Postgres,
+  and MySQL regardless of database RLS). **Guests continue to work unchanged**; a global-table write now goes
+  through the `orm` binding. Closed under a three-iteration Security-review loop; regression-locked by the
+  mutation-verified gate `RAWSQL OWN-CONFINEMENT AST OK` (behavioral, on real libsql + Postgres + MySQL).
+
 ## [0.5.7] - 2026-09-26
 
 Two production fixes for browser-facing federated-GraphQL sites plus two internal build-level changes: a
