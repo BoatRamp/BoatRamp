@@ -222,6 +222,9 @@ pub(crate) struct ServerProducerContextSource {
     pub(crate) claim: String,
     /// The fleet signer that seals the durable context (the same key session cookies use).
     pub(crate) signer: Arc<dyn boatramp_core::cose::Signer>,
+    /// Injectable source for the `token_cfg.jwks_env` host-env lookup (the runtime's). Production
+    /// passes `inner.env_source_arc()` (⇒ the real process env); a test injects a `MapEnv`.
+    pub(crate) env_source: Arc<dyn boatramp_core::env::EnvSource>,
 }
 
 #[cfg(feature = "handlers")]
@@ -233,9 +236,13 @@ impl boatramp_handlers::ProducerContextSource for ServerProducerContextSource {
         // source), never trusting the guest.
         #[cfg(feature = "oidc")]
         {
-            let claims = crate::graphql_data::token::verified_claims(&self.token_cfg, token)
-                .await
-                .ok_or_else(|| "presented token did not verify".to_string())?;
+            let claims = crate::graphql_data::token::verified_claims(
+                &self.token_cfg,
+                token,
+                self.env_source.as_ref(),
+            )
+            .await
+            .ok_or_else(|| "presented token did not verify".to_string())?;
             let value = claims
                 .get(&self.claim)
                 .and_then(crate::tenant_resolve::scalar_to_sql)
@@ -258,7 +265,13 @@ impl boatramp_handlers::ProducerContextSource for ServerProducerContextSource {
             // Without `oidc` there is no JWKS verifier, so a presented token can't be verified —
             // fail closed. Reference the fields so a handlers-without-oidc build doesn't flag them
             // dead (they're only read on the `oidc` verify path above).
-            let _ = (token, &self.token_cfg, &self.claim, &self.signer);
+            let _ = (
+                token,
+                &self.token_cfg,
+                &self.claim,
+                &self.signer,
+                &self.env_source,
+            );
             Err("token verification is unavailable in this build (no `oidc`)".to_string())
         }
     }
@@ -956,6 +969,7 @@ pub(super) async fn build_function_bindings(
                         session_anchor: None,
                         signed_context: None,
                         context_anchor: None,
+                        env_source: Some(inner.env_source()),
                     },
                 )
                 .await
@@ -1098,6 +1112,7 @@ pub(super) async fn build_function_bindings(
                     token_cfg,
                     claim,
                     signer,
+                    env_source: inner.env_source_arc(),
                 }),
                 cell,
             );
@@ -2469,7 +2484,7 @@ pub(super) async fn webhook_ingress(
             .into_response();
     };
     // The verifying secret is a host env-var *reference*, never stored plaintext.
-    let Ok(secret) = std::env::var(&webhook.secret_env) else {
+    let Some(secret) = inner.env_source().get(&webhook.secret_env) else {
         tracing::warn!(
             function = %name,
             env = %webhook.secret_env,
@@ -2650,7 +2665,9 @@ mod gap3_tests {
         } ] })
         .to_string();
         let env_name = format!("BR_TEST_GAP3_JWKS_{}", std::process::id());
-        std::env::set_var(&env_name, &jwks);
+        // The JWKS is injected via a MapEnv rather than the process environment.
+        let env_source: Arc<dyn boatramp_core::env::EnvSource> =
+            Arc::new(boatramp_core::env::MapEnv::new().with(env_name.clone(), jwks.clone()));
         let token_cfg = boatramp_core::config::HandlerGraphqlTokenClaims {
             issuer: ISS.to_string(),
             jwks_env: Some(env_name.clone()),
@@ -2666,6 +2683,7 @@ mod gap3_tests {
             token_cfg: token_cfg.clone(),
             claim: "tid".to_string(),
             signer: fleet.clone(),
+            env_source: env_source.clone(),
         };
 
         let exp = boatramp_core::time::now_unix() + 3600;
@@ -2714,7 +2732,6 @@ mod gap3_tests {
             "a wrong-issuer token must not seal (fail-closed)"
         );
 
-        std::env::remove_var(&env_name);
         println!(
             "PRESENT-TOKEN CHAIN OK: a guest-presented app JWT was host-verified against the \
              component's token_claims, its tenant extracted + host-sealed, and the sealed durable \

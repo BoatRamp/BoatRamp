@@ -121,19 +121,23 @@ fn jwk_algorithm(jwk: &Jwk) -> Option<Algorithm> {
 pub(crate) async fn verified_claims(
     cfg: &HandlerGraphqlTokenClaims,
     bearer: &str,
+    env_source: &dyn boatramp_core::env::EnvSource,
 ) -> Option<serde_json::Map<String, serde_json::Value>> {
-    resolve_verifier(cfg, bearer).await?.verify(bearer)
+    resolve_verifier(cfg, bearer, env_source).await?.verify(bearer)
 }
 
 /// Resolve the verifier for `cfg`: from the JWKS env var (fresh each call — rotation-safe), or
-/// from the JWKS URL (process-cached, re-fetched when the token's `kid` isn't known yet).
+/// from the JWKS URL (process-cached, re-fetched when the token's `kid` isn't known yet). The
+/// `jwks_env` name is looked up through an injectable [`EnvSource`](boatramp_core::env::EnvSource)
+/// so a test injects the JWKS without mutating the process environment.
 async fn resolve_verifier(
     cfg: &HandlerGraphqlTokenClaims,
     bearer: &str,
+    env_source: &dyn boatramp_core::env::EnvSource,
 ) -> Option<Arc<TokenVerifier>> {
     let audience = cfg.audience.as_deref();
     if let Some(env_name) = &cfg.jwks_env {
-        let jwks = std::env::var(env_name).ok()?;
+        let jwks = env_source.get(env_name)?;
         return TokenVerifier::from_jwks_json(&jwks, &cfg.issuer, audience)
             .ok()
             .map(Arc::new);

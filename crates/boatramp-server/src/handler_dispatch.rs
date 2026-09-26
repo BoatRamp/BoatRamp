@@ -644,6 +644,7 @@ async fn resolve_gateway_caller_facts(
         session_anchor: session_anchor.as_ref(),
         signed_context: None,
         context_anchor: None,
+        env_source: Some(inner.env_source()),
     };
     // `imports_db = false`: the gateway component itself runs no `orm`/`sql` (it fans out); the
     // "undeclared tenancy refused under strict posture" check applies to a handler that DIRECTLY
@@ -745,7 +746,8 @@ async fn federation_gateway(
         inner.sql.clone(),
         sql_subgraphs,
         bearer.map(str::to_string),
-    );
+    )
+    .with_env_source(inner.env_source_arc());
     // R4/D8: when the plan has any `target`-class fetch, (1) enforce the operator ceiling — every
     // target root field this query uses must be listed in the project's `target_eligible_fields`,
     // else refuse (the app's SDL alone can never make a field cross to another tenant) — and (2)
@@ -1041,7 +1043,8 @@ async fn data_connector_serve(
     // relationships, join keys) and the policy enforces exposure per field: deny-by-default,
     // so an unexposed table/column is rejected even though it's structurally present.
     let policy = crate::graphql_data::policy_from_config(cfg);
-    let claims = crate::graphql_data::request_claims(project, bearer, cfg).await;
+    let claims =
+        crate::graphql_data::request_claims(project, bearer, cfg, inner.env_source()).await;
     let dialect = crate::graphql_data::dialect::Sqlite;
     let response = if crate::graphql_data::compile::is_mutation(query) {
         // A write: gated on the site opting into mutations (deny-by-default), run on a write
@@ -1880,6 +1883,7 @@ pub(super) async fn build_bindings(
                     session_anchor: session_anchor.as_ref(),
                     signed_context,
                     context_anchor: context_anchor.as_ref(),
+                    env_source: Some(inner.env_source()),
                 };
                 crate::tenant_resolve::resolve_host_tenancy(other, imports_db, posture, inputs)
                     .await
@@ -1978,6 +1982,7 @@ pub(super) async fn build_bindings(
                     token_cfg,
                     claim,
                     signer,
+                    env_source: inner.env_source_arc(),
                 }),
                 cell,
             );

@@ -48,6 +48,12 @@ pub(crate) struct TenantSourceInputs<'a> {
     /// public half — the same key that mints/verifies session cookies). `None` ⇒ signed contexts
     /// can't be verified here, so the `SignedContext` source resolves no value (fail-closed).
     pub context_anchor: Option<&'a boatramp_core::cose::TokenPublicKey>,
+    /// Injectable source for the `token_cfg.jwks_env` host-env lookup (the JWKS the `Token` source
+    /// verifies against). Production passes the runtime's `inner.env_source()` (⇒ the real process
+    /// env); a test passes a `MapEnv` so the JWKS is injected without mutating the process
+    /// environment. `None` ⇒ the real process env ([`SystemEnv`](boatramp_core::env::SystemEnv)) —
+    /// the default for a lane that carries no token (async/background), where it is never read.
+    pub env_source: Option<&'a dyn boatramp_core::env::EnvSource>,
 }
 
 /// The posture knobs that bound tenancy (read from the runtime's resolved [`SecurityPosture`]).
@@ -348,7 +354,12 @@ async fn resolve_value(
             #[cfg(feature = "oidc")]
             {
                 let (cfg, bearer) = (inputs.token_cfg?, inputs.bearer?);
-                let claims = crate::graphql_data::token::verified_claims(cfg, bearer).await?;
+                static SYSTEM: boatramp_core::env::SystemEnv = boatramp_core::env::SystemEnv;
+                let env_source = inputs
+                    .env_source
+                    .unwrap_or(&SYSTEM as &dyn boatramp_core::env::EnvSource);
+                let claims =
+                    crate::graphql_data::token::verified_claims(cfg, bearer, env_source).await?;
                 claims.get(claim).and_then(scalar_to_sql)
             }
             #[cfg(not(feature = "oidc"))]
@@ -361,6 +372,7 @@ async fn resolve_value(
                     inputs.bearer,
                     inputs.token_cfg,
                     inputs.domain_context,
+                    inputs.env_source,
                 );
                 None
             }

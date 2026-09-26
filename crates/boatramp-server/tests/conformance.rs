@@ -2210,7 +2210,6 @@ async fn function_webhook_verifies_signature_before_dispatch() {
     const HTTP_200: &[u8] = include_bytes!("../../boatramp-handlers/tests/fixtures/http-200.wasm");
 
     let secret_env = "BOATRAMP_TEST_WEBHOOK_SECRET";
-    std::env::set_var(secret_env, "s3cr3t-key");
 
     let storage = Arc::new(MemStorage::default());
     let kv = Arc::new(MemoryKv::new());
@@ -2221,6 +2220,10 @@ async fn function_webhook_verifies_signature_before_dispatch() {
 
     let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
     let runtime = HandlerRuntime::new(engine, kv.clone(), storage, None, None);
+    // The webhook secret is injected via a MapEnv rather than the process environment.
+    runtime.set_env_source(Arc::new(
+        boatramp_core::env::MapEnv::new().with(secret_env, "s3cr3t-key"),
+    ));
     let app = router(deploy, Auth::disabled(), runtime);
 
     let body = br#"{"event":"push"}"#;
@@ -2291,7 +2294,6 @@ async fn webhook_ingress_publishes_verified_event_to_the_bus() {
 
     const HTTP_200: &[u8] = include_bytes!("../../boatramp-handlers/tests/fixtures/http-200.wasm");
     let secret_env = "BOATRAMP_TEST_INGRESS_SECRET";
-    std::env::set_var(secret_env, "ingress-key");
 
     let storage = Arc::new(MemStorage::default());
     let kv = Arc::new(MemoryKv::new());
@@ -2309,6 +2311,10 @@ async fn webhook_ingress_publishes_verified_event_to_the_bus() {
     let messaging: Arc<dyn Messaging> = Arc::new(LogMessaging::new(storage.clone(), kv.clone()));
     let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
     let runtime = HandlerRuntime::new(engine, kv.clone(), storage, None, Some(messaging.clone()));
+    // The webhook secret is injected via a MapEnv rather than the process environment.
+    runtime.set_env_source(Arc::new(
+        boatramp_core::env::MapEnv::new().with(secret_env, "ingress-key"),
+    ));
     let app = router(deploy, Auth::disabled(), runtime);
 
     let body = br#"{"id":"o-1"}"#;
@@ -5349,8 +5355,7 @@ async fn handler_secret_allowlist_scopes_the_site_pool_end_to_end() {
     // Two host env vars back the shared pool. `GREETING` is the guest-observable proxy for the
     // secret handler A must NOT receive; `SECRET_A` is the one A IS granted. Unique names so a
     // concurrently-running test can't clobber them.
-    std::env::set_var("BR_ALLOWLIST_GATE_GREETING", "leaked-secret-b");
-    std::env::set_var("BR_ALLOWLIST_GATE_A", "value-a");
+    // Injected via a MapEnv (below) rather than the process environment.
 
     let storage = Arc::new(MemStorage::default());
     let kv = Arc::new(MemoryKv::new());
@@ -5449,6 +5454,14 @@ async fn handler_secret_allowlist_scopes_the_site_pool_end_to_end() {
     // Single-tenant/dev posture so the pool's `env:` refs resolve from the host env (the
     // multi-tenant default refuses them — unrelated to this feature).
     runtime.set_allow_env_secret_refs(true);
+    // The two host env vars backing the shared pool are injected via a MapEnv rather than the
+    // process environment. `GREETING` is the guest-observable proxy for the secret A must NOT
+    // receive; `SECRET_A` is the one A IS granted.
+    runtime.set_env_source(Arc::new(
+        boatramp_core::env::MapEnv::new()
+            .with("BR_ALLOWLIST_GATE_GREETING", "leaked-secret-b")
+            .with("BR_ALLOWLIST_GATE_A", "value-a"),
+    ));
     let app = router(deploy, Auth::disabled(), runtime);
 
     let call = |app: axum::Router, site: &str| {
@@ -5484,8 +5497,6 @@ async fn handler_secret_allowlist_scopes_the_site_pool_end_to_end() {
         "handler B (no allowlist) must receive the whole site pool; got: {b}"
     );
 
-    std::env::remove_var("BR_ALLOWLIST_GATE_GREETING");
-    std::env::remove_var("BR_ALLOWLIST_GATE_A");
     println!("SECRET ALLOWLIST SCOPED OK");
 }
 
@@ -8563,7 +8574,7 @@ async fn graphql_data_connector_isolates_by_a_verified_app_token_claim() {
         "x": b64url(key.verifying_key().as_bytes()),
     } ] })
     .to_string();
-    std::env::set_var("TEST_GQL_MT_JWKS", &jwks);
+    // Injected into the runtime via a MapEnv below (never the process environment).
     let sign = |tid: &str| {
         let header = b64url(
             serde_json::json!({ "alg": "EdDSA", "typ": "JWT", "kid": "app" })
@@ -8740,6 +8751,11 @@ async fn graphql_data_connector_isolates_by_a_verified_app_token_claim() {
 
     let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
     let runtime = HandlerRuntime::new(engine, kv, storage, Some(sql), None);
+    // The app IdP's JWKS is injected via a MapEnv rather than the process environment; the GDC's
+    // `claims_from_token.jwks_env` names `TEST_GQL_MT_JWKS`, resolved through this source.
+    runtime.set_env_source(Arc::new(
+        boatramp_core::env::MapEnv::new().with("TEST_GQL_MT_JWKS", jwks.clone()),
+    ));
     let app = router(deploy.clone(), Auth::disabled(), runtime);
 
     let call = |app: axum::Router, token: Option<&str>, body: &'static str| {

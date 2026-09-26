@@ -72,22 +72,25 @@ pub(crate) async fn request_claims(
     project: &str,
     bearer: Option<&str>,
     cfg: &HandlerGraphqlDataConfig,
+    env_source: &dyn boatramp_core::env::EnvSource,
 ) -> Claims {
-    let mut map = token_claims(cfg, bearer).await;
+    let mut map = token_claims(cfg, bearer, env_source).await;
     map.insert("project".to_string(), SqlValue::Text(project.to_string()));
     Claims::new(map)
 }
 
 /// The scalar claims of a verified app token (empty if unconfigured, unverifiable, or the
-/// `oidc` feature is off — always fail-closed).
+/// `oidc` feature is off — always fail-closed). The `jwks_env` name is resolved through the
+/// injected [`EnvSource`](boatramp_core::env::EnvSource).
 #[cfg(feature = "oidc")]
 async fn token_claims(
     cfg: &HandlerGraphqlDataConfig,
     bearer: Option<&str>,
+    env_source: &dyn boatramp_core::env::EnvSource,
 ) -> BTreeMap<String, SqlValue> {
     let mut out = BTreeMap::new();
     if let (Some(token_cfg), Some(bearer)) = (&cfg.claims_from_token, bearer) {
-        if let Some(claims) = token::verified_claims(token_cfg, bearer).await {
+        if let Some(claims) = token::verified_claims(token_cfg, bearer, env_source).await {
             for (name, value) in &claims {
                 if let Some(sql) = scalar_claim(value) {
                     out.insert(name.clone(), sql);
@@ -102,6 +105,7 @@ async fn token_claims(
 async fn token_claims(
     _cfg: &HandlerGraphqlDataConfig,
     _bearer: Option<&str>,
+    _env_source: &dyn boatramp_core::env::EnvSource,
 ) -> BTreeMap<String, SqlValue> {
     BTreeMap::new()
 }
@@ -174,7 +178,8 @@ mod tests {
             "x": b64url(key.verifying_key().as_bytes()),
         } ] })
         .to_string();
-        std::env::set_var("TEST_GQL_IDP_JWKS_1", &jwks);
+        // The JWKS is injected via a MapEnv rather than the process environment.
+        let env = boatramp_core::env::MapEnv::new().with("TEST_GQL_IDP_JWKS_1", jwks.clone());
         let cfg = HandlerGraphqlDataConfig {
             enabled: true,
             claims_from_token: Some(boatramp_core::config::HandlerGraphqlTokenClaims {
@@ -191,7 +196,7 @@ mod tests {
             "k",
             serde_json::json!({ "iss": "https://idp.test", "exp": 4_102_444_800_i64, "tid": "acme", "project": "evil" }),
         );
-        let claims = request_claims("default", Some(&token), &cfg).await;
+        let claims = request_claims("default", Some(&token), &cfg, &env).await;
         // The app claim merges…
         assert_eq!(claims.get("tid"), Some(&SqlValue::Text("acme".into())));
         // …but the host-asserted project wins — a token can never spoof it.
@@ -201,7 +206,7 @@ mod tests {
         );
 
         // No token → only the host project (fail-closed: `tid` absent, so a filter on it denies).
-        let none = request_claims("default", None, &cfg).await;
+        let none = request_claims("default", None, &cfg, &env).await;
         assert_eq!(none.get("project"), Some(&SqlValue::Text("default".into())));
         assert_eq!(none.get("tid"), None);
 
@@ -212,7 +217,7 @@ mod tests {
             serde_json::json!({ "iss": "https://idp.test", "exp": 1_000_000_000, "tid": "acme" }),
         );
         assert_eq!(
-            request_claims("default", Some(&expired), &cfg)
+            request_claims("default", Some(&expired), &cfg, &env)
                 .await
                 .get("tid"),
             None
