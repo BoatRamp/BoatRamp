@@ -1349,7 +1349,7 @@ mod tests {
                 ("products".into(), TableScope::Tenant),
                 // A table with a public subset but NO tenant scope: omitted from the target map
                 // (a target read of it is refused, deny-by-default).
-                ("countries".into(), TableScope::Unscoped),
+                ("countries".into(), TableScope::Unscoped { writable: false }),
                 // A Tenant table whose public subset is EMPTY: omitted (load-time fail-closed — an
                 // empty predicate would confine only to `tenant = B`, a match-all over B's rows).
                 ("legacy".into(), TableScope::Tenant),

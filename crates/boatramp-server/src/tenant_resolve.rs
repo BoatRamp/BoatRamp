@@ -448,6 +448,7 @@ mod tests {
             read: AccessMode::Own,
             write: AccessMode::Own,
             exceed_site_ceiling: false,
+            unscoped_writes: Vec::new(),
         };
         // A request carrying BOTH a routed domain (⇒ a tenant fact) and a valid session cookie
         // (⇒ a session fact): the resolved principal holds both, axis-tagged.
@@ -521,6 +522,7 @@ mod tests {
             read: AccessMode::Own,
             write: AccessMode::Own,
             exceed_site_ceiling: false,
+            unscoped_writes: Vec::new(),
         };
         // The drained message carried a valid envelope + the fleet anchor ⇒ the producer's stamped
         // tenant resolves as the consumer's own `Tenant` fact.
@@ -585,6 +587,7 @@ mod tests {
             read: AccessMode::OwnOrNull,
             write: AccessMode::All,
             exceed_site_ceiling: false,
+            unscoped_writes: Vec::new(),
         };
         let ht = resolve_inherited_tenancy(
             Some(&decision),
@@ -674,6 +677,7 @@ mod tests {
             read: AccessMode::Own,
             write: AccessMode::Own,
             exceed_site_ceiling: false,
+            unscoped_writes: Vec::new(),
         };
         let inputs = TenantSourceInputs {
             domain_context: Some("acme-store"),
@@ -889,6 +893,7 @@ mod tests {
             read: AccessMode::All,
             write: AccessMode::All,
             exceed_site_ceiling: false,
+            unscoped_writes: Vec::new(),
         };
         let inputs = TenantSourceInputs {
             domain_context: Some("acme"),
@@ -924,6 +929,7 @@ mod tests {
             read: AccessMode::OwnOrNull,
             write: AccessMode::OwnOrNull,
             exceed_site_ceiling: false,
+            unscoped_writes: Vec::new(),
         };
         let inputs = TenantSourceInputs {
             domain_context: Some("acme"),
@@ -954,6 +960,7 @@ mod tests {
             read: AccessMode::Own,
             write: AccessMode::Own,
             exceed_site_ceiling: false,
+            unscoped_writes: Vec::new(),
         };
         // No domain context supplied ⇒ no value; the binding will deny an own op.
         let ht = resolve_host_tenancy(
@@ -1343,6 +1350,7 @@ mod tests {
             session: None,
             mode: ScopeMode::Own,
             keys: TableKeys::PerTable(schema.table_key_map()),
+            unscoped_writes: std::collections::BTreeSet::new(),
         };
         let mut q = name_q();
         q.force_scope(&own_a).unwrap();
@@ -2447,6 +2455,7 @@ mod tests {
             read,
             write,
             exceed_site_ceiling: token,
+            unscoped_writes: Vec::new(),
         };
         let ceiling = scoped(AccessMode::Own, AccessMode::Own, false); // an `own` site ceiling.
         let route_all_token = scoped(AccessMode::All, AccessMode::All, true);
