@@ -309,6 +309,39 @@ jobs:
             exit 1
           fi
 
+      # #503 CROSS-SURFACE HARD GATE (marker `SCOPED UNSCOPED-WRITE CROSS-SURFACE OK`, mirrors the
+      # v0.5.0 `DB-NAME SCREENING CROSS-SURFACE OK` convention). A `scoped` route may WRITE a
+      # genuinely-global table via two opt-ins (write-global `unscoped { writable: true }` OR a
+      # per-route `unscoped_writes` allowlist), and the SAME allow decision MUST hold on BOTH the
+      # typed `orm` and the raw `sql` write paths — else a guest that imports raw `sql` could diverge
+      # from the ORM. This gate drives BOTH surfaces (write_target + apply_scope_marker/
+      # write_axis_is_global) on both dialects and asserts the whole #503 property; the marker + pass
+      # count catch a silent skip/rename. It is then MUTATION-VERIFIED (the #499 convention): the SAME
+      # test is re-run under each `BOATRAMP_503_MUTATION`, each of which violates one security
+      # property (widen the allowlist, fire the arm before the fresh resolve, co-widen the read, drop
+      # the target guard, drop the raw exemption) and MUST FAIL — a PASS-under-mutation (a hollow
+      # gate) fails the merge.
+      - name: "#503 scoped-unscoped-write cross-surface gate"
+        run: |
+          set -eo pipefail
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-handlers \
+            --features sql scoped_unscoped_write_cross_surface_gate -- --nocapture 2>&1 | tee uw-cross-surface.log
+          grep -qE 'test result: ok\. 1 passed' uw-cross-surface.log \
+            || { echo "::error::#503 cross-surface gate did not run (silent skip or a failure)" >&2; exit 1; }
+          grep -q 'SCOPED UNSCOPED-WRITE CROSS-SURFACE OK' uw-cross-surface.log \
+            || { echo "::error::#503 cross-surface gate never reached its marker (an ORM/raw-SQL write-global parity regression)" >&2; exit 1; }
+          # Mutation guard: each mutation MUST fail the gate (proving it is sensitive, not hollow).
+          for mut in m1_widen_allowlist m2_arm_before_resolve m3_widen_read m6_target_allow m7_raw_scope_marker; do
+            if BOATRAMP_503_MUTATION="$mut" cargo-zigbuild test --target x86_64-unknown-linux-musl \
+              -p boatramp-handlers --features sql scoped_unscoped_write_cross_surface_gate \
+              -- --nocapture > "uw-mutation-$mut.log" 2>&1; then
+              echo "::error::#503 gate is HOLLOW — it passed under mutation '$mut' (a #503 security property is not actually enforced)" >&2
+              exit 1
+            else
+              echo "#503 mutation verified: '$mut' fails the cross-surface gate as expected."
+            fi
+          done
+
   # SlateDB WAL-recovery HARD GATE (v0.5.5 incident: the control-plane KV was unbootable with
   # `Data error: empty SSTable` after a crash / crash-consistent snapshot froze a zero-byte tail WAL
   # object). Proves a store with such a frozen tail WAL still OPENS — the incident fix (`slatedb` 0.16
@@ -365,14 +398,15 @@ jobs:
       - name: Live in-site tenant isolation on a real libsql engine
         run: |
           set -eo pipefail
-          # All four are `#[ignore]`d (the general workspace lane skips them — a static-musl test
+          # All five are `#[ignore]`d (the general workspace lane skips them — a static-musl test
           # binary segfaults in libsql); run them explicitly here, unignored, on the host toolchain.
-          # Four batteries: the Stage 0 single-column model, the Stage 1 per-table-key model, the
-          # Stage 3 anonymous-first (TenantOrSession) disjunct, and the Stage 4 durable signed-context
-          # lane (publish->claim->verify->scope on a real messaging store + libsql).
+          # Five batteries: the Stage 0 single-column model, the Stage 1 per-table-key model, the
+          # Stage 3 anonymous-first (TenantOrSession) disjunct, the Stage 4 durable signed-context
+          # lane (publish->claim->verify->scope on a real messaging store + libsql), and the #503
+          # write-global / per-route-allowlist model on a real non-RLS libsql engine.
           cargo test -p boatramp-storage \
             --features sql --test orm_tenant_isolation -- --ignored --nocapture 2>&1 | tee orm-tenancy.log
-          grep -qE 'test result: ok\. 4 passed' orm-tenancy.log \
+          grep -qE 'test result: ok\. 5 passed' orm-tenancy.log \
             || { echo "::error::ORM tenant isolation tests did not all pass (silent skip or failure?)" >&2; exit 1; }
           grep -q 'ORM IN-SITE TENANT ISOLATION OK' orm-tenancy.log \
             || { echo "::error::ORM tenant isolation never reached its success marker (a cross-tenant breach or a skipped test)" >&2; exit 1; }
@@ -382,6 +416,8 @@ jobs:
             || { echo "::error::ORM TenantOrSession disjunct never reached its success marker (an R3 anon/tenant isolation breach or a skipped test)" >&2; exit 1; }
           grep -q 'ORM DURABLE SIGNED-CONTEXT ISOLATION OK' orm-tenancy.log \
             || { echo "::error::ORM durable signed-context lane never reached its success marker (a Stage 4 async-lane isolation breach or a skipped test)" >&2; exit 1; }
+          grep -q 'SCOPED UNSCOPED-WRITE CROSS-SURFACE OK \[libsql\]' orm-tenancy.log \
+            || { echo "::error::#503 write-global libsql live gate never reached its marker (a non-RLS write-global/allowlist isolation regression or a skipped test)" >&2; exit 1; }
       - name: Owner-gated schema-migration libsql/SQLite parity SUBSTRATE on a real embedded file
         run: |
           set -eo pipefail
@@ -708,6 +744,14 @@ jobs:
           # so the ambiguity — and thus this regression — is only observable on a real Postgres.
           grep -q 'ORM UPSERT GUARD OK \[postgres\]' orm-sqlx.log \
             || { echo "::error::Postgres scoped-upsert guard never reached its marker (a DO-UPDATE ambiguity regression or a cross-tenant upsert clobber, or a skip)" >&2; exit 1; }
+          # #503: the write-global / per-route-allowlist model on each engine — a read:own route reads
+          # ONLY its own rows (a write-global grant does NOT widen reads, G2) AND writes a genuinely-
+          # global table UNSTAMPED; a listed plain-unscoped table too; an unlisted plain-unscoped write
+          # stays refused. A cross-tenant read leak or a mis-scoped global write fails the assertion.
+          grep -q 'SCOPED UNSCOPED-WRITE CROSS-SURFACE OK \[postgres\]' orm-sqlx.log \
+            || { echo "::error::Postgres #503 write-global gate never reached its marker (a read-widening/G2 or write-global scoping regression, or a skip)" >&2; exit 1; }
+          grep -q 'SCOPED UNSCOPED-WRITE CROSS-SURFACE OK \[mysql\]' orm-sqlx.log \
+            || { echo "::error::MySQL #503 write-global gate never reached its marker (a read-widening/G2 or write-global scoping regression, or a skip)" >&2; exit 1; }
       - name: RLS tenant session GUC backstop on a real non-superuser Postgres role (v0.4.20)
         env:
           BOATRAMP_TEST_PG_URL: postgres://boatramp:boatramp@localhost:5432/boatramp

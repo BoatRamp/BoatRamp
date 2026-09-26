@@ -5,6 +5,41 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [Unreleased]
+
+_Draft — pending Security re-review + version bump._
+
+### Added
+
+- **A `scoped` route can now WRITE a genuinely-global table without co-widening its reads** (#503). A
+  route scoped `read: "own", write: "own"` was refused when it wrote a table declared `unscoped`
+  (global reference data) — deny-by-default, because a shared-data write is a cross-tenant blast. The
+  only workaround, `write: "all"`, **co-widens reads** to every tenant and breaks isolation. There is
+  now a middle ground for a *genuinely tenant-less* table (an OAuth CSRF `oauth_state`, a cross-tenant
+  counter, a webhook idempotency-key table), via **two independent operator opt-ins** (OR):
+  1. **write-global table kind** — declare the table `{ "kind": "unscoped", "writable": true }`; any
+     non-target scoped route may then write it **unstamped** (the project-wide opt-in, for
+     genuinely-global / many-writer tables); or
+  2. **per-route allowlist** — keep the table plain `unscoped` and list it in the route's tenancy
+     `unscoped_writes: ["<table>"]` (the least-privilege / recommended default, for
+     sensitive / few-writer tables).
+
+  **Reads are unaffected** by either opt-in (a writes-only flag — a write-global table stays
+  globally-readable, never wider); a **target** route (another tenant's public subset) can never use
+  either opt-in (a target write to a global is refused). The decision holds identically on **both**
+  query surfaces (the typed `orm` builder and raw `sql` — a global write needs no `{scope}` marker),
+  and is evaluated **fresh per write** against the current schema, so a listed table re-declared as a
+  tenant table is tenant-stamped as normal (it can never be written unstamped once it stops being
+  global). Apply-time validation fails fast (422) on an `unscoped_writes` entry that is unknown or
+  resolves to a tenant kind, and warns on an entry made redundant by `writable: true`. The
+  deny-by-default posture is unchanged for every table that opts into neither mechanism (`countries`
+  stays refused; worst case == today). **Back-compat:** a pre-#503 `{ "kind": "unscoped" }` and a
+  scoped route with no `unscoped_writes` serialize byte-identically (both new fields elide when
+  false/empty). **Forward note:** a `writable: true` schema read by a pre-#503 binary fails closed to
+  deny-all (safe). See the how-to (`docs/src/how-to/tenant-isolation.md`) for the decision rule + three
+  recipes + the operator-trust residual (the host cannot verify a declared-global table is truly
+  tenant-less — a misdeclaration lets any granted route write across tenants).
+
 ## [0.5.7] - 2026-09-26
 
 Two production fixes for browser-facing federated-GraphQL sites plus two internal build-level changes: a
