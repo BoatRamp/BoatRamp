@@ -579,10 +579,14 @@ mod tests {
         let ph = super::sigv4::UNSIGNED_PAYLOAD;
         let signed = sign_put(&signer, &secret, akid, &sc, "/photos/k", ph).await;
 
-        // Tampered signature ⇒ refuse.
+        // Tampered signature ⇒ refuse. Flip the first sig hex char to a DIFFERENT one (never a no-op:
+        // `0`↔`1` guarantees the byte changes regardless of the original value — a plain "replace with
+        // 0" would be a no-op ~1/16 of the time and make this test flaky).
         let mut bad_auth = signed.authorization.clone();
         let sig_pos = bad_auth.find("Signature=").unwrap() + "Signature=".len();
-        bad_auth.replace_range(sig_pos..sig_pos + 1, "0");
+        let orig = &bad_auth[sig_pos..sig_pos + 1];
+        let flipped = if orig == "0" { "1" } else { "0" };
+        bad_auth.replace_range(sig_pos..sig_pos + 1, flipped);
         let inp = S3AuthInput {
             authorization: Some(&bad_auth),
             ..input(&signed, "PUT", "/photos/k", ph)
