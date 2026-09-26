@@ -312,14 +312,18 @@ jobs:
       # #503 CROSS-SURFACE HARD GATE (marker `SCOPED UNSCOPED-WRITE CROSS-SURFACE OK`, mirrors the
       # v0.5.0 `DB-NAME SCREENING CROSS-SURFACE OK` convention). A `scoped` route may WRITE a
       # genuinely-global table via two opt-ins (write-global `unscoped { writable: true }` OR a
-      # per-route `unscoped_writes` allowlist), and the SAME allow decision MUST hold on BOTH the
-      # typed `orm` and the raw `sql` write paths — else a guest that imports raw `sql` could diverge
-      # from the ORM. This gate drives BOTH surfaces (write_target + apply_scope_marker/
-      # write_axis_is_global) on both dialects and asserts the whole #503 property; the marker + pass
-      # count catch a silent skip/rename. It is then MUTATION-VERIFIED (the #499 convention): the SAME
-      # test is re-run under each `BOATRAMP_503_MUTATION`, each of which violates one security
-      # property (widen the allowlist, fire the arm before the fresh resolve, co-widen the read, drop
-      # the target guard, drop the raw exemption) and MUST FAIL — a PASS-under-mutation (a hollow
+      # per-route `unscoped_writes` allowlist), but ONLY via the typed `orm` path (it is
+      # injection-immune and scopes `INSERT … SELECT` sources). The RAW `sql` write path has NO
+      # write-global exemption — a raw-SQL write to a global table is marker-scoped (own-tenant
+      # predicate injected) or refused, NEVER run unscoped. Cross-surface safety is by REFUSAL (raw
+      # SQL offers no weaker route than the ORM), not by a schema-blind parse of the raw statement —
+      # the security review found that parse a live cross-tenant WRITE bypass under MySQL/MariaDB
+      # `/*! … */` version comments. This gate drives BOTH surfaces (write_target + apply_scope_marker)
+      # on all dialects and asserts the whole #503 property; the marker + pass count catch a silent
+      # skip/rename. It is then MUTATION-VERIFIED (the #499 convention): the SAME test is re-run under
+      # each `BOATRAMP_503_MUTATION`, each of which violates one security property (widen the
+      # allowlist, fire the arm before the fresh resolve, co-widen the read, drop the target guard,
+      # RE-INTRODUCE the raw write-global exemption) and MUST FAIL — a PASS-under-mutation (a hollow
       # gate) fails the merge.
       - name: "#503 scoped-unscoped-write cross-surface gate"
         run: |
@@ -331,7 +335,7 @@ jobs:
           grep -q 'SCOPED UNSCOPED-WRITE CROSS-SURFACE OK' uw-cross-surface.log \
             || { echo "::error::#503 cross-surface gate never reached its marker (an ORM/raw-SQL write-global parity regression)" >&2; exit 1; }
           # Mutation guard: each mutation MUST fail the gate (proving it is sensitive, not hollow).
-          for mut in m1_widen_allowlist m2_arm_before_resolve m3_widen_read m6_target_allow m7_raw_scope_marker; do
+          for mut in m1_widen_allowlist m2_arm_before_resolve m3_widen_read m6_target_allow m7_raw_exemption_reintroduced; do
             if BOATRAMP_503_MUTATION="$mut" cargo-zigbuild test --target x86_64-unknown-linux-musl \
               -p boatramp-handlers --features sql scoped_unscoped_write_cross_surface_gate \
               -- --nocapture > "uw-mutation-$mut.log" 2>&1; then

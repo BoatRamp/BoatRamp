@@ -230,20 +230,31 @@ unaffected either way.**
   unstamped — one declaration, no per-route bookkeeping.
 
 **Mental model:** *`writable` / `unscoped_writes` open a table's **write** with **no tenant
-stamp** — they never touch reads, and a **target** route can never use them.*
+stamp**, **through the typed [`orm`](./handler-bindings.md#the-four-data-bindings) binding
+only** — they never touch reads, and a **target** route can never use them.*
 
 Both mechanisms are OR'd: a write is allowed if the table is write-global **or** the route
 lists it. A write is stamped/refused **freshly per write** — if you later re-declare a
 listed table as a tenant table, the list entry goes inert and the write is tenant-stamped
-as normal (a listed table can never be written unstamped once it stops being global). The
-same decision holds on **both** query surfaces: the `orm` builder and raw `sql` write a
-global table identically (unstamped, no `{scope}` marker needed on the raw path).
+as normal (a listed table can never be written unstamped once it stops being global).
+
+> **Global writes go through the `orm` binding, not raw `sql`.** The unstamped global write
+> is an `orm`-only capability. On the **raw `sql`** surface there is *no* write-global
+> exemption: a raw-SQL write to a global table is treated like any other scoped write — it
+> **requires the `{scope}` marker** (an unmarked write is refused) and the injected
+> `tenant = ?` predicate scopes it to your **own** tenant. This is deliberate: a raw-SQL
+> statement is opaque text, and a comment-based redirect (e.g. a MySQL `/*! … */`
+> version-comment) could hide a cross-tenant write from the host's parser. The `orm`
+> binding names the table as a typed value (nothing to hide) and automatically scopes an
+> `INSERT … SELECT` source, so it is the safe — and only — path for an unstamped global
+> write. **If you need to write a global table, use the `orm` binding.**
 
 ### Recipe 1 — OAuth `/start` (per-tenant config read + a global CSRF write)
 
 The canonical case: read per-tenant provider config (`read: "own"`) and INSERT a genuinely
-global CSRF `state` row (the shared callback recovers the tenant from `state`, so the table
-has no tenant column). Keep `oauth_state` plain and list it on the route (least-privilege):
+global CSRF `state` row **via the `orm` binding** (the shared callback recovers the tenant
+from `state`, so the table has no tenant column). Keep `oauth_state` plain and list it on the
+route (least-privilege):
 
 ```json
 // project tenancy schema
@@ -269,8 +280,10 @@ once, no per-route list:
 { "tables": { "global_counter": { "kind": "unscoped", "writable": true } } }
 ```
 
-Any `scoped` route may now `UPDATE global_counter …` (unstamped); a route reading it still
-reads globally, and its *own* tables stay `own`-scoped.
+Any `scoped` route may now update `global_counter` unstamped **through the `orm` binding**;
+a route reading it still reads globally, and its *own* tables stay `own`-scoped. (A raw-SQL
+`UPDATE global_counter …` is still marker-scoped to the route's own tenant — global writes
+are an `orm`-binding capability.)
 
 ### Recipe 3 — a webhook consumer with a global idempotency-key table
 
@@ -296,6 +309,14 @@ decision: only ever open the write of a table with **no tenant dimension**. `boa
 tenancy apply` prints the write-global tables so you can review exactly which shared tables
 are openable. A **target** route (another tenant's public subset) can *never* write a global
 table — both opt-ins are refused on the target axis.
+
+The exemption is scoped to the `orm` binding on purpose. The raw `sql` binding is opaque
+text the host would have to *parse* to know which table a write targets, and a parser can be
+fooled (a MySQL/MariaDB `/*! … */` version-comment the engine executes but a parser skips
+can redirect the write to a different table). Rather than trust that parse for a
+security-critical allow decision, boatramp gives the raw path no write-global exemption at
+all — a raw-SQL write to a global table is marker-scoped to your own tenant or refused — and
+routes all unstamped global writes through the injection-immune `orm` binding.
 
 Apply-time validation is fail-fast: `unscoped_writes` entries are cross-checked against the
 stored schema — an unknown table, or one that resolves to a **tenant** kind, is a **422**

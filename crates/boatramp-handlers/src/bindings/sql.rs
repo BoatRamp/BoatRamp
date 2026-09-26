@@ -587,25 +587,18 @@ fn apply_scope_marker(
             .rewrite_target_read(&neutralised, dialect)
             .map_err(|e| SqlError::Other(e.reason()));
     }
-    // #503 cross-surface parity: a WRITE to a write-global / route-listed (`unscoped_writes`) table
-    // is the raw-SQL analog of the ORM `write_target`'s "allow, no tenant stamp" arms. It must AGREE
-    // with the ORM — exempt from the required-`{scope}`-marker rule and injecting no tenant predicate
-    // (like `all`) — so ORM and raw SQL cannot diverge. The write table is resolved from the parsed
-    // statement (fail-closed: an unresolvable table is NOT global, so the marker stays required) and
-    // its scope is resolved FRESH from the per-table keys inside `write_axis_is_global` (the G1 drift
-    // guard). A plain-`Unscoped`-not-listed write is NOT exempt — it stays scoped/marker-required
-    // (today's fail-closed behavior). A DELETE of a global table is likewise exempt; a tenant table
-    // stays scoped. The NON-RLS (libsql) backend has no GUC backstop, so this exemption IS the
-    // whole story there: a global write lands unstamped, a non-global write stays marker-required.
-    if matches!(axis, crate::tenant::Axis::Write)
-        && let Some(table) = boatramp_core::target_sql::extract_raw_write_table(&statement, dialect)
-        && ht.write_axis_is_global(&table)
-    {
-        // Neutralise a stray/copied marker (a global write carries no tenant predicate) and inject
-        // NOTHING — byte-identical to the `all` write path's no-tenant-stamp, but authorized by the
-        // TABLE's global scope rather than an `all` grant, so the READ axis stays strict `own`.
-        return Ok(statement.replace(SCOPE_MARKER, "1 = 1"));
-    }
+    // #503 SECURITY: the raw-SQL path has NO write-global exemption. Global writes are ORM-only.
+    // The ORM binding is injection-immune (the guest names the table as a typed value, never lexed)
+    // and already scopes `INSERT … SELECT` sources; the raw-SQL surface offers no equivalent, so a
+    // schema-blind marker rule below is the safe posture. A raw-SQL write to a global table is
+    // therefore either marker-scoped (the injected `tenant = ?` predicate binds whatever table the
+    // ENGINE actually executes — so even a version-comment-redirected write like
+    // `UPDATE /*!50000 x */ y` is scoped to the guest's own tenant, and an `INSERT … SELECT` source
+    // stays scoped) or, if the guest omits `{scope}`, refused (marker-required). Do NOT try to detect
+    // global tables here: MySQL/MariaDB `/*! … */` / `/*M! … */` version-comments are executed by the
+    // engine but ignored by a vanilla parser, so any parse-based "is this a global write?" check is an
+    // unsound cross-tenant-write bypass (CVE-class). Cross-surface safety is satisfied by REFUSAL —
+    // raw SQL offers no weaker path than the ORM — not by replicating that unsound parse.
     let (pred, values) = ht
         .sql_marker(axis, params.len())
         .map_err(|d| SqlError::Other(d.reason().to_string()))?;
@@ -1285,12 +1278,13 @@ mod tests {
         );
     }
 
-    // ---- #503: raw-SQL / ORM cross-surface parity for write-global + unscoped_writes ----------
+    // ---- #503: raw-SQL has NO write-global exemption (global writes are ORM-only) -------------
 
     /// A `PerTable` schema-backed scoped session (write:`Own`, read:`Own`) over `label` with:
-    /// `orders` = tenant, `countries` = plain `Unscoped`, `oauth_state` = write-global
-    /// (`SharedWritable`); the route lists `unscoped_writes` for the strict opt-in. `dialect` picks
-    /// the SQLite (libsql, non-RLS) vs Postgres backend so the parity is asserted on BOTH engines.
+    /// `orders`/`tenant_secrets` = tenant, `countries` = plain `Unscoped`, `oauth_state` =
+    /// write-global (`SharedWritable`); the route lists `unscoped_writes` for the strict ORM opt-in.
+    /// `dialect` picks the SQLite (libsql, non-RLS) vs Postgres vs MySQL backend so the raw-SQL
+    /// behavior is asserted on every engine.
     fn scoped_schema_session(
         log: Log,
         unscoped_writes: &[&str],
@@ -1302,6 +1296,7 @@ mod tests {
             default_tenant_key: "tenant_id".into(),
             tables: BTreeMap::from([
                 ("orders".into(), TableScope::Tenant),
+                ("tenant_secrets".into(), TableScope::Tenant),
                 ("countries".into(), TableScope::Unscoped { writable: false }),
                 (
                     "oauth_state".into(),
@@ -1332,101 +1327,161 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn m7_raw_sql_write_global_is_exempt_from_the_marker_on_both_engines() {
+    async fn raw_sql_global_write_has_no_exemption_marker_required_or_scoped() {
         use boatramp_core::sql::Dialect;
-        // M7 (CRITICAL): a raw-SQL INSERT into a write-global (`oauth_state`) table needs NO `{scope}`
-        // marker and injects NO tenant predicate/param — identical to the ORM's "allow, no stamp".
-        // Asserted on SQLite (libsql, no RLS GUC backstop — this exemption IS the whole story) AND
-        // Postgres. No `unscoped_writes` needed: the KIND authorizes it.
+        // #503 SECURITY (post-fix): the raw-SQL surface has NO write-global exemption — global writes
+        // are ORM-only. A raw-SQL write to a write-global (`oauth_state`) OR a route-listed plain
+        // `Unscoped` (`countries`) table is treated exactly like any other scoped write: the `{scope}`
+        // marker is REQUIRED. An unmarked write is refused fail-closed (never runs unstamped); a
+        // marked write is scoped to the guest's OWN tenant (the injected `tenant_id = ?` predicate).
+        // Asserted on SQLite (libsql, no RLS GUC backstop) AND Postgres. Contrast the ORM path, which
+        // DOES allow these writes unstamped (see the cross-surface gate).
         for dialect in [Dialect::Sqlite, Dialect::Postgres] {
+            // The route even LISTS both globals — proving the list has no effect on the raw surface.
+            let list = ["oauth_state", "countries"];
+
+            // (a) write-global (`oauth_state`), NO marker ⇒ REFUSED (marker-required), never runs.
             let log = Arc::new(Mutex::new(Vec::new()));
-            let mut session = scoped_schema_session(log.clone(), &[], dialect);
+            let mut session = scoped_schema_session(log.clone(), &list, dialect);
+            let mut table = ResourceTable::new();
+            {
+                let mut host = SqlHost::new(&mut table, &mut session);
+                let db = host.open(String::new()).unwrap();
+                let err = host
+                    .execute(
+                        db,
+                        "INSERT INTO oauth_state (state) VALUES (?1)".into(),
+                        vec![sql_types::Value::Text("csrf".into())],
+                    )
+                    .await
+                    .unwrap_err();
+                let sql_types::Error::Other(msg) = &err else {
+                    panic!("expected an Other refusal on {dialect:?}, got {err:?}");
+                };
+                assert!(
+                    msg.contains("{scope}"),
+                    "an unmarked write-global raw write must be refused (marker-required) on \
+                     {dialect:?}: {msg}"
+                );
+            }
+            assert!(
+                log.lock().unwrap().is_empty(),
+                "the refused write-global write must not reach the backend on {dialect:?}"
+            );
+
+            // (b) plain-`Unscoped` listed (`countries`), NO marker ⇒ REFUSED (the list does not
+            // exempt it on the raw surface).
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let mut session = scoped_schema_session(log.clone(), &list, dialect);
+            let mut table = ResourceTable::new();
+            {
+                let mut host = SqlHost::new(&mut table, &mut session);
+                let db = host.open(String::new()).unwrap();
+                let err = host
+                    .execute(
+                        db,
+                        "INSERT INTO countries (code) VALUES (?1)".into(),
+                        vec![sql_types::Value::Text("US".into())],
+                    )
+                    .await
+                    .unwrap_err();
+                let sql_types::Error::Other(msg) = &err else {
+                    panic!("expected an Other refusal on {dialect:?}, got {err:?}");
+                };
+                assert!(
+                    msg.contains("{scope}"),
+                    "listed plain global still marker-required: {msg}"
+                );
+            }
+            assert!(log.lock().unwrap().is_empty());
+
+            // (c) write-global WITH `{scope}` ⇒ scoped to the OWN tenant (`tenant_id = ?`), NOT run
+            // unstamped. This is the safe raw-SQL route: the write lands only in the guest's own rows.
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let mut session = scoped_schema_session(log.clone(), &list, dialect);
             let mut table = ResourceTable::new();
             {
                 let mut host = SqlHost::new(&mut table, &mut session);
                 let db = host.open(String::new()).unwrap();
                 host.execute(
                     db,
-                    "INSERT INTO oauth_state (state) VALUES (?1)".into(),
-                    vec![sql_types::Value::Text("csrf".into())],
+                    "UPDATE oauth_state SET x = ?1 WHERE {scope}".into(),
+                    vec![sql_types::Value::Integer(1)],
                 )
                 .await
                 .unwrap();
             }
-            let log = log.lock().unwrap();
-            let exec = log
-                .iter()
-                .find(|l| l.contains("execute INSERT INTO oauth_state"))
-                .unwrap_or_else(|| panic!("no INSERT reached the backend on {dialect:?}: {log:?}"));
-            // The write ran verbatim (only the guest's own param); NO tenant predicate/value injected.
             assert!(
-                exec.contains("INSERT INTO oauth_state (state) VALUES (?1)")
-                    && !exec.contains("tenant_id")
-                    && !exec.contains("ten_1"),
-                "write-global raw write must be unstamped on {dialect:?}: {exec}"
+                log.lock().unwrap().iter().any(|l| l
+                    .contains("UPDATE oauth_state SET x = ?1 WHERE tenant_id = ?2")
+                    && l.contains("ten_1")),
+                "a marked global raw write is scoped to the OWN tenant on {dialect:?}"
             );
         }
     }
 
     #[tokio::test]
-    async fn m7_raw_sql_listed_plain_unscoped_is_exempt_but_unlisted_is_refused() {
+    async fn raw_sql_comment_redirect_and_insert_select_do_not_run_unscoped() {
+        // #503 SECURITY REGRESSION-LOCK — the two live-verified attack statements (Security review,
+        // MySQL 8.4) that the removed raw-SQL exemption let through. Both target a globally-*readable*
+        // table (`oauth_state`) whose ORM write-global status the removed exemption keyed off, and both
+        // hide a cross-tenant write behind a construct a vanilla parser misreads:
+        //   1. `UPDATE /*!50000 tenant_secrets */ oauth_state SET x=999` — a MySQL/MariaDB version
+        //      comment the ENGINE executes (so the real target is `tenant_secrets`, a tenant table)
+        //      but sqlparser ignores (it saw `oauth_state`, a global → exempted → cross-tenant write).
+        //   2. `INSERT INTO oauth_state (a) SELECT tenant_id FROM tenant_secrets` — the exempted path
+        //      ran the SELECT source UNSCOPED → cross-tenant exfiltration into a globally-readable table.
+        // With NO exemption, BOTH are ordinary scoped writes: they MUST be either refused (no `{scope}`
+        // marker) or carry the injected own-tenant predicate. Neither may run unstamped/verbatim. Run
+        // on MySQL AND SQLite (a real engine is not available here — the fake backend records the exact
+        // SQL the host would submit, which is what the exemption bug operated on).
         use boatramp_core::sql::Dialect;
-        // M7 (CRITICAL): the per-route allowlist works on the raw-SQL surface too — a listed plain
-        // `Unscoped` table (`countries`) is writable unstamped, while the SAME table on a route that
-        // does NOT list it stays marker-required (deny-by-default, today's fail-closed behavior).
-        for dialect in [Dialect::Sqlite, Dialect::Postgres] {
-            // (a) `countries` listed ⇒ writable unstamped, no marker needed.
-            let log = Arc::new(Mutex::new(Vec::new()));
-            let mut session = scoped_schema_session(log.clone(), &["countries"], dialect);
-            let mut table = ResourceTable::new();
-            {
-                let mut host = SqlHost::new(&mut table, &mut session);
-                let db = host.open(String::new()).unwrap();
-                host.execute(
-                    db,
-                    "INSERT INTO countries (code) VALUES (?1)".into(),
-                    vec![sql_types::Value::Text("US".into())],
-                )
-                .await
-                .unwrap();
+        for dialect in [Dialect::Mysql, Dialect::Sqlite] {
+            // The route LISTS both globals + declares `oauth_state` write-global, i.e. the most
+            // permissive posture the exemption could have keyed off — proving it is now inert.
+            let list = ["oauth_state", "countries", "tenant_secrets"];
+            for stmt in [
+                "UPDATE /*!50000 tenant_secrets */ oauth_state SET x = 999",
+                "INSERT INTO oauth_state (a) SELECT tenant_id FROM tenant_secrets",
+            ] {
+                let log = Arc::new(Mutex::new(Vec::new()));
+                let mut session = scoped_schema_session(log.clone(), &list, dialect);
+                let mut table = ResourceTable::new();
+                let res = {
+                    let mut host = SqlHost::new(&mut table, &mut session);
+                    let db = host.open(String::new()).unwrap();
+                    host.execute(db, stmt.to_string(), vec![]).await
+                };
+                match res {
+                    // Refused for the missing `{scope}` marker — never reached the backend.
+                    Err(sql_types::Error::Other(msg)) => {
+                        assert!(
+                            msg.contains("{scope}"),
+                            "attack `{stmt}` on {dialect:?} must be refused for the missing marker, \
+                             not some other error: {msg}"
+                        );
+                        assert!(
+                            log.lock().unwrap().is_empty(),
+                            "a refused attack `{stmt}` must not reach the backend on {dialect:?}"
+                        );
+                    }
+                    // OR it ran — but ONLY if the own-tenant predicate was injected (marker-scoped).
+                    // The attack statements above carry no `{scope}`, so this arm should not be hit;
+                    // it is the belt-and-suspenders proof that IF a variant did run, it ran scoped.
+                    Ok(_) => {
+                        let logged = log.lock().unwrap();
+                        assert!(
+                            logged.iter().all(|l| !l.contains("execute")
+                                || (l.contains("tenant_id") && l.contains("ten_1"))),
+                            "attack `{stmt}` on {dialect:?} MUST NOT run unscoped/verbatim — any \
+                             executed SQL must carry the injected own-tenant predicate: {logged:?}"
+                        );
+                    }
+                    Err(other) => {
+                        panic!("attack `{stmt}` on {dialect:?}: unexpected error {other:?}")
+                    }
+                }
             }
-            assert!(
-                log.lock()
-                    .unwrap()
-                    .iter()
-                    .any(|l| l.contains("INSERT INTO countries (code) VALUES (?1)")
-                        && !l.contains("tenant_id")),
-                "listed plain-unscoped raw write must be unstamped on {dialect:?}"
-            );
-
-            // (b) NOT listed ⇒ the write is a scoped write to a plain global with no marker ⇒ refused
-            // fail-closed (a scoped raw write must carry the marker; a plain global has no arm to
-            // exempt it), and it never reaches the backend.
-            let log2 = Arc::new(Mutex::new(Vec::new()));
-            let mut session2 = scoped_schema_session(log2.clone(), &[], dialect);
-            let mut table2 = ResourceTable::new();
-            let mut host2 = SqlHost::new(&mut table2, &mut session2);
-            let db2 = host2.open(String::new()).unwrap();
-            let err = host2
-                .execute(
-                    db2,
-                    "INSERT INTO countries (code) VALUES (?1)".into(),
-                    vec![sql_types::Value::Text("US".into())],
-                )
-                .await
-                .unwrap_err();
-            let sql_types::Error::Other(msg) = &err else {
-                panic!("expected an Other refusal on {dialect:?}, got {err:?}");
-            };
-            assert!(
-                msg.contains("{scope}"),
-                "an unlisted plain-unscoped raw write must be refused for the missing marker on \
-                 {dialect:?}: {msg}"
-            );
-            assert!(
-                log2.lock().unwrap().is_empty(),
-                "the refused write must not reach the backend on {dialect:?}"
-            );
         }
     }
 
@@ -1466,12 +1521,19 @@ mod tests {
 
     /// **#503 mutation-verified cross-surface gate** (marker `SCOPED UNSCOPED-WRITE CROSS-SURFACE
     /// OK`). Drives BOTH surfaces — the ORM (`Insert::force_scope`+`compile` via `write_target`) and
-    /// the raw-SQL path (`SqlHost::execute` via `apply_scope_marker`+`write_axis_is_global`) — on a
-    /// schema-backed scoped route, and asserts the whole #503 behavior end to end. Each assertion is
-    /// keyed to a specific mutation the CI job can inject via `BOATRAMP_503_MUTATION`; under a
-    /// mutation the security property is violated and the test FAILS (so the gate is not hollow):
+    /// the raw-SQL path (`SqlHost::execute` via `apply_scope_marker`) — on a schema-backed scoped
+    /// route, and asserts the whole #503 behavior end to end. The **cross-surface** property (post
+    /// Security-review): the ORM is the SOLE global-write path (it allows a write-global write
+    /// unstamped, and scopes any `INSERT … SELECT` source), while the RAW-SQL path has NO write-global
+    /// exemption — a global write via raw SQL is marker-scoped (own-tenant predicate injected) or
+    /// refused (marker-required), NEVER run unscoped/verbatim. This satisfies cross-surface safety by
+    /// REFUSAL (raw SQL offers no weaker path than the injection-immune ORM), not by replicating an
+    /// unsound schema-blind parse of the raw statement (the removed exemption was a live cross-tenant
+    /// write bypass under MySQL/MariaDB `/*! … */` version comments). Each assertion is keyed to a
+    /// specific mutation the CI job can inject via `BOATRAMP_503_MUTATION`; under a mutation the
+    /// security property is violated and the test FAILS (so the gate is not hollow):
     /// - `m1_widen_allowlist` — arm 3 fires regardless of set-membership: a NOT-listed plain-`unscoped`
-    ///   write becomes allowed (both surfaces) → the "unlisted is refused" assertions fail (M1/M4).
+    ///   write becomes allowed (ORM) → the "unlisted is refused" assertions fail (M1/M4).
     /// - `m2_arm_before_resolve` — the write-global/allowlist arm fires WITHOUT the fresh `Unscoped`
     ///   resolve: a listed-but-tenant table is written UNSTAMPED → the "tenant table still stamped"
     ///   assertion fails (M2/G1).
@@ -1479,8 +1541,11 @@ mod tests {
     ///   loses its `tenant = own` predicate → the read-isolation assertion fails (M3/G2).
     /// - `m6_target_allow` — the write-global arm is NOT `is_target()`-gated: a target write to a
     ///   global is allowed → the "target write refused" assertion fails (M6/HIGH).
-    /// - `m7_raw_scope_marker` — the raw surface does NOT exempt a global write: a write-global raw
-    ///   INSERT is marker-required (refused) → the raw-parity assertion fails (M7).
+    /// - `m7_raw_exemption_reintroduced` — the CRITICAL mutation: the raw surface is given back a
+    ///   write-global exemption (models re-adding the deleted `apply_scope_marker` branch), so a raw
+    ///   INSERT into a write-global table runs UNSTAMPED. The gate asserts the raw write is
+    ///   marker-scoped/refused, so this expectation-flip fails the gate — proving the removed
+    ///   exemption is genuinely absent (M7/CRITICAL).
     ///
     /// The mutation is modeled by mutating the DECISION INPUT/expectation (the way #499 runs the
     /// pre-fix path), never the production code — the assertions are fixed and prove the real code's
@@ -1491,7 +1556,7 @@ mod tests {
             Assignment, Expr, Insert, RowValues, Scope, ScopeMode, Select, TableKeys,
         };
         use boatramp_core::sql::{Dialect, SqlValue};
-        use boatramp_core::tenancy::{AccessMode, ResolvedScope, TableScope, TenancySchema};
+        use boatramp_core::tenancy::{ResolvedScope, TableScope, TenancySchema};
         use std::collections::{BTreeMap, BTreeSet};
 
         let mutation = std::env::var("BOATRAMP_503_MUTATION").unwrap_or_default();
@@ -1632,80 +1697,98 @@ mod tests {
             "ORM (M6/HIGH): a target write to a write-global table MUST be refused (mutation={mutation:?})"
         );
 
-        // ---- Raw-SQL surface (real fake backend, both dialects) ---------------------------------
-        for dialect in [Dialect::Sqlite, Dialect::Postgres] {
+        // ---- Raw-SQL surface (real fake backend; SQLite + Postgres + MySQL) ---------------------
+        // The CROSS-SURFACE property: unlike the ORM above, the raw path has NO write-global
+        // exemption. A raw INSERT into the SAME write-global `oauth_state` table — even with the route
+        // listing every global — is marker-required: with no `{scope}` it is REFUSED (never runs
+        // unstamped); with `{scope}` it is scoped to the OWN tenant. The `m7_raw_exemption_reintroduced`
+        // mutation models re-adding the deleted exemption by flipping the expectation to the buggy
+        // "runs unstamped" outcome — since the real (fixed) code refuses, that expectation fails the
+        // gate, proving the exemption is genuinely gone.
+        for dialect in [Dialect::Sqlite, Dialect::Postgres, Dialect::Mysql] {
+            // The MOST permissive route: it lists every global AND declares `oauth_state` write-global.
             let log = Arc::new(Mutex::new(Vec::new()));
-            // Build the HostTenancy with the (possibly mutated) schema keys + allowlist.
-            let mut sch = schema.clone();
-            if m("m2_arm_before_resolve") {
-                sch.tables
-                    .insert("orders".into(), TableScope::Unscoped { writable: true });
-            }
-            let raw_list: Vec<String> = list.iter().cloned().collect();
-            let ht = crate::tenant::HostTenancy::new(
-                "tenant_id",
-                Some(SqlValue::Text("ten_1".into())),
-                AccessMode::Own,
-                AccessMode::Own,
-            )
-            .with_schema(Some(&sch))
-            .with_unscoped_writes(raw_list);
-            let mut map: HashMap<String, Arc<dyn SqlBackend>> = HashMap::new();
-            map.insert(
-                String::new(),
-                Arc::new(RlsBackend {
-                    injects: false,
-                    log: log.clone(),
-                    dialect,
-                    rls: None,
-                }),
-            );
-            let mut session = SqlSession::for_backends(map).with_tenancy(Some(ht));
+            let mut session =
+                scoped_schema_session(log.clone(), &["oauth_state", "countries"], dialect);
             let mut table = ResourceTable::new();
 
-            // write-global raw INSERT (no `{scope}` marker): the real code EXEMPTS it (arm 2/3) and
-            // runs it unstamped. Under `m7_raw_scope_marker` we model the pre-fix behavior by
-            // asserting the OLD outcome (a marker-required refusal) — since the real code is fixed
-            // and accepts the write, that expectation fails, proving the exemption is load-bearing.
-            {
+            // Unmarked write-global raw INSERT: the fixed code REFUSES it (marker-required). Under
+            // `m7_raw_exemption_reintroduced` we assert the buggy "runs unstamped" outcome instead —
+            // which the fixed code does not do, so the gate fails under that mutation.
+            let res = {
                 let mut host = SqlHost::new(&mut table, &mut session);
                 let db = host.open(String::new()).unwrap();
-                let res = host
-                    .execute(
-                        db,
-                        "INSERT INTO oauth_state (state) VALUES (?1)".to_string(),
-                        vec![sql_types::Value::Text("csrf".into())],
-                    )
-                    .await;
-                if m("m7_raw_scope_marker") {
-                    assert!(
-                        res.is_err(),
-                        "raw (M7 mutation): the pre-fix behavior would REFUSE an unmarked global \
-                         write — the exemption makes it succeed, so this expectation must fail the gate"
-                    );
-                } else {
-                    res.unwrap();
-                }
-            }
-            // The exemption's success path also asserts unstamped SQL (skipped under the M7 mutation,
-            // which never reaches the backend by design of the pre-fix model).
-            if !m("m7_raw_scope_marker") {
-                let logged = log.lock().unwrap();
+                host.execute(
+                    db,
+                    "INSERT INTO oauth_state (state) VALUES (?1)".to_string(),
+                    vec![sql_types::Value::Text("csrf".into())],
+                )
+                .await
+            };
+            if m("m7_raw_exemption_reintroduced") {
+                // Buggy expectation: the reintroduced exemption would let the unmarked global write
+                // SUCCEED and run unstamped. The fixed code refuses, so this fails the gate.
+                let ran_unstamped = res.is_ok()
+                    && log.lock().unwrap().iter().any(|l| {
+                        l.contains("INSERT INTO oauth_state (state) VALUES (?1)")
+                            && !l.contains("tenant_id")
+                    });
                 assert!(
-                    logged.iter().any(|l| l
-                        .contains("INSERT INTO oauth_state (state) VALUES (?1)")
-                        && !l.contains("tenant_id")),
-                    "raw (M7): write-global INSERT must be unstamped on {dialect:?}: {logged:?}"
+                    ran_unstamped,
+                    "raw (M7 mutation): a reintroduced exemption would run the unmarked global write \
+                     UNSTAMPED — the fixed code refuses it, so this expectation must fail the gate on \
+                     {dialect:?}"
+                );
+            } else {
+                let sql_types::Error::Other(msg) = res.expect_err(
+                    "raw (M7): an unmarked write-global raw write MUST be refused, not run",
+                ) else {
+                    panic!("raw (M7): expected an Other refusal on {dialect:?}");
+                };
+                assert!(
+                    msg.contains("{scope}"),
+                    "raw (M7): the refusal is the marker-required rule on {dialect:?}: {msg}"
+                );
+                assert!(
+                    log.lock().unwrap().is_empty(),
+                    "raw (M7): the refused global write must not reach the backend on {dialect:?}"
+                );
+            }
+
+            // A MARKED write-global raw write is scoped to the OWN tenant (never unstamped) — the safe
+            // raw route. (Skipped under the buggy mutation, whose model does not reach here.)
+            if !m("m7_raw_exemption_reintroduced") {
+                let log2 = Arc::new(Mutex::new(Vec::new()));
+                let mut session2 =
+                    scoped_schema_session(log2.clone(), &["oauth_state", "countries"], dialect);
+                let mut table2 = ResourceTable::new();
+                {
+                    let mut host = SqlHost::new(&mut table2, &mut session2);
+                    let db = host.open(String::new()).unwrap();
+                    host.execute(
+                        db,
+                        "UPDATE oauth_state SET x = ?1 WHERE {scope}".to_string(),
+                        vec![sql_types::Value::Integer(1)],
+                    )
+                    .await
+                    .unwrap();
+                }
+                assert!(
+                    log2.lock().unwrap().iter().any(|l| l
+                        .contains("UPDATE oauth_state SET x = ?1 WHERE tenant_id = ?2")
+                        && l.contains("ten_1")),
+                    "raw (M7): a marked global raw write is scoped to the OWN tenant on {dialect:?}"
                 );
             }
         }
 
         println!(
-            "SCOPED UNSCOPED-WRITE CROSS-SURFACE OK: ORM + raw-SQL agree — a write-global table \
-             writes UNSTAMPED on both surfaces, a listed plain-unscoped table too, an unlisted \
-             plain-unscoped write is refused, a listed-but-tenant table is still stamped (G1), a \
-             write-global grant does not widen reads (G2), and a target write to a global is \
-             refused (HIGH). (mutation={mutation:?})"
+            "SCOPED UNSCOPED-WRITE CROSS-SURFACE OK: the ORM is the sole global-write path (a \
+             write-global table writes UNSTAMPED via the ORM, a listed plain-unscoped table too, an \
+             unlisted one is refused, a listed-but-tenant table is still stamped (G1), reads are not \
+             widened (G2), a target write to a global is refused (HIGH)); the RAW-SQL path has NO \
+             write-global exemption — an unmarked global raw write is refused and a marked one is \
+             scoped to the own tenant, NEVER run unscoped (mutation={mutation:?})."
         );
     }
 

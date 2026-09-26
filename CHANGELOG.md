@@ -26,11 +26,17 @@ _Draft — pending Security re-review + version bump._
 
   **Reads are unaffected** by either opt-in (a writes-only flag — a write-global table stays
   globally-readable, never wider); a **target** route (another tenant's public subset) can never use
-  either opt-in (a target write to a global is refused). The decision holds identically on **both**
-  query surfaces (the typed `orm` builder and raw `sql` — a global write needs no `{scope}` marker),
-  and is evaluated **fresh per write** against the current schema, so a listed table re-declared as a
-  tenant table is tenant-stamped as normal (it can never be written unstamped once it stops being
-  global). Apply-time validation fails fast (422) on an `unscoped_writes` entry that is unknown or
+  either opt-in (a target write to a global is refused). **Global writes go through the typed `orm`
+  binding only.** The raw `sql` binding has **no** write-global exemption: a raw-SQL write to a global
+  table is treated like any other scoped write — it requires the `{scope}` marker (an unmarked write is
+  refused) and is scoped to the caller's own tenant. This is deliberate — a raw-SQL statement is opaque
+  text a parser must interpret, and a MySQL/MariaDB `/*! … */` version-comment (executed by the engine
+  but skipped by a parser) could redirect an apparently-global write to a tenant table; the `orm`
+  binding names the table as a typed value (nothing to hide) and scopes `INSERT … SELECT` sources, so it
+  is the safe and only path for an unstamped global write. The ORM decision is evaluated **fresh per
+  write** against the current schema, so a listed table re-declared as a tenant table is tenant-stamped
+  as normal (it can never be written unstamped once it stops being global). Apply-time validation fails
+  fast (422) on an `unscoped_writes` entry that is unknown or
   resolves to a tenant kind, and warns on an entry made redundant by `writable: true`. The
   deny-by-default posture is unchanged for every table that opts into neither mechanism (`countries`
   stays refused; worst case == today). **Back-compat:** a pre-#503 `{ "kind": "unscoped" }` and a
