@@ -204,11 +204,19 @@ pub fn authenticate(
         .candidate_secrets(&parsed.scope.access_key_id, &session.cti)
         .map_err(|_| "credential secret derivation failed".to_string())?;
     let canonical = build_canonical(input, &parsed, &payload_hash, presigned);
-    sigv4::verify(&canonical.as_request(), &parsed, &candidates).map_err(sig_reason)?;
+    // GATE MUTATION (M5, test-only): neuter the SigV4 verify so a tampered/forged signature is accepted.
+    // The gate sets `BOATRAMP_S3INGRESS_MUTATE_SKIP_SIGV4=1` and asserts a flipped-bit signature is then
+    // accepted (a 200 where the clean run gets 403) — proving invariant 2's verify is load-bearing.
+    if !super::gate_mutation::skip_sigv4_verify() {
+        sigv4::verify(&canonical.as_request(), &parsed, &candidates).map_err(sig_reason)?;
+    }
     // The winning secret (the one that verified) is needed to seed aws-chunked verification. `verify`
     // does not tell us which candidate matched, so re-select it constant-time-agnostically here: this
-    // is AFTER a successful verify, so there is no oracle (the request is already authenticated).
+    // is AFTER a successful verify, so there is no oracle (the request is already authenticated). Under
+    // the SigV4-skip mutation no candidate matches the forged signature, so fall back to the current-
+    // root secret (the mutation only proves the verify is load-bearing; the seed value is irrelevant).
     let winning = select_verified_secret(&canonical.as_request(), &parsed, &candidates)
+        .or_else(|| candidates.first().cloned())
         .ok_or("credential secret selection failed")?;
 
     // 7. (revocation is done by the caller, which has the async KV handle — see `check_revocation`.)
@@ -245,6 +253,13 @@ pub fn authorize_operation(
     decoded_key: &str,
     op: S3Op,
 ) -> Result<(), String> {
+    // GATE MUTATION (M5, test-only, `s3-ingress-gate-mutation` feature): neuter the scope compare so a
+    // credential for container A can PUT to B / a sibling / an escaped key. The `S3 INGRESS SCOPED+SIGV4
+    // OK` gate sets `BOATRAMP_S3INGRESS_MUTATE_SKIP_SCOPE=1` and asserts the cross-container/escape PUT
+    // then SUCCEEDS — proving invariant 1's check is load-bearing (a hollow gate would still pass).
+    if super::gate_mutation::skip_scope_check() {
+        return Ok(());
+    }
     let s = &scope.scope;
     // (a) The bucket in the URL must be exactly the container the credential was scoped to. This is a
     // COMPARE against the signed scope, not a trust of the URL — a credential for container A can

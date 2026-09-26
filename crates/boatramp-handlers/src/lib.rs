@@ -20,11 +20,16 @@ pub mod tenant;
 pub use bindings::Bindings;
 #[cfg(feature = "admin")]
 pub use bindings::admin::{AdminController, AdminError, DomainChallenge, Surface as AdminSurface};
+// M5 gate helper: read a blob back through the REAL guest `wasi:blobstore` read-path (proves S3-ingress
+// guest read-through). `#[doc(hidden)]` — for the live gate + integration tests only.
 #[cfg(feature = "blob-upload")]
 pub use bindings::blob_upload::{
     BlobUploadBinding, BlobUploadMinter, MintRefused, MintScope, MintedCredentials, PresignedPut,
     TempCredentials, UploadConstraints, UploadPerm, UploadTarget, screen_upload_target,
 };
+#[cfg(feature = "engine")]
+#[doc(hidden)]
+pub use bindings::blobstore::read_object_through_guest_binding;
 #[cfg(feature = "capability")]
 pub use bindings::capability::{CapabilityBinding, CapabilityMinter};
 #[cfg(feature = "email")]

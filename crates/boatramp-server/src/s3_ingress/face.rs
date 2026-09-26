@@ -222,10 +222,7 @@ async fn put_object(
     // Create-only precondition: a create-only credential (UGC default) refuses to overwrite an
     // existing key. Overwrite is only safe for content-addressed keys (same bytes ⇒ same key), so a
     // require_sha256 credential skips this (idempotent replay is a no-op).
-    if session.scope.constraints.create_only
-        && !session.scope.constraints.require_sha256
-        && object_exists(state, &storage_key).await
-    {
+    if create_only_blocks_overwrite(state, session, &storage_key).await {
         return S3Error::new(
             S3ErrorCode::BoatrampOverwriteDenied,
             "object already exists (create-only credential)",
@@ -376,10 +373,7 @@ async fn complete_multipart(
     };
 
     // Create-only precondition on the final key (a content-addressed credential is exempt — idempotent).
-    if session.scope.constraints.create_only
-        && !session.scope.constraints.require_sha256
-        && object_exists(state, &storage_key).await
-    {
+    if create_only_blocks_overwrite(state, session, &storage_key).await {
         return S3Error::new(
             S3ErrorCode::BoatrampOverwriteDenied,
             "object already exists (create-only credential)",
@@ -657,7 +651,13 @@ async fn stream_put(
         }
     }
 
-    if let (Some(expected), Some(h)) = (require_hash, hasher) {
+    // GATE MUTATION (M5, test-only): neuter the content-address sha256 verify so bytes whose sha256 ≠
+    // the declared key are committed anyway. The gate sets `BOATRAMP_S3INGRESS_MUTATE_SKIP_SHA256=1` and
+    // asserts a mismatched-bytes PUT then SUCCEEDS (and the wrong-key object lands) — proving invariant
+    // 4's hash verify is load-bearing (a hollow gate would pass even with the verify removed).
+    if let (Some(expected), Some(h)) = (require_hash, hasher)
+        && !crate::s3_ingress::gate_mutation::skip_sha256_verify()
+    {
         let actual = hex::encode(h.lock().unwrap().clone().finalize());
         if actual != expected {
             let _ = state.deploy.storage().delete(storage_key).await;
@@ -705,6 +705,27 @@ fn build_chunk_context(authed: &AuthedScope) -> Option<ChunkContext> {
 /// Whether an object exists at `storage_key` (the create-only precondition probe).
 async fn object_exists(state: &S3IngressState, storage_key: &str) -> bool {
     state.deploy.storage().head(storage_key).await.is_ok()
+}
+
+/// Whether a create-only (UGC-default) credential must REFUSE this write because the key already exists.
+/// A content-addressed (`require_sha256`) credential is exempt (same bytes ⇒ same key ⇒ idempotent
+/// replay). The single choke point for invariant 8's overwrite protection, used by both PutObject and
+/// CompleteMultipartUpload on the final key.
+///
+/// GATE MUTATION (M5, test-only): the `BOATRAMP_S3INGRESS_MUTATE_SKIP_CREATE_ONLY=1` seam forces this to
+/// `false`, so a create-only credential can overwrite an existing key. The gate asserts the second PUT
+/// then SUCCEEDS and the bytes change — proving the precondition is load-bearing.
+async fn create_only_blocks_overwrite(
+    state: &S3IngressState,
+    session: &S3Session,
+    storage_key: &str,
+) -> bool {
+    if crate::s3_ingress::gate_mutation::skip_create_only() {
+        return false;
+    }
+    session.scope.constraints.create_only
+        && !session.scope.constraints.require_sha256
+        && object_exists(state, storage_key).await
 }
 
 /// Read a bounded body fully into memory (for the small multipart-complete XML). Rejects an oversize
