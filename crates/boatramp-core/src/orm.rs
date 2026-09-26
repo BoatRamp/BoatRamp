@@ -1593,13 +1593,18 @@ pub enum OrmError {
     ///
     /// The message names BOTH #503 remedies verbatim (a scoped route CAN write a genuinely-global
     /// table now, two independent ways) so a developer is not dead-ended onto `write: "all"` (which
-    /// wrongly co-widens READS). Reads are unaffected by either remedy.
+    /// wrongly co-widens READS). Reads are unaffected by either remedy. Both remedies open the write
+    /// on this typed `orm` binding ONLY — an unstamped global write is an `orm`-binding capability; a
+    /// raw-SQL write to a global table is marker-scoped to the caller's own tenant or refused (there
+    /// is no raw-SQL write-global exemption, so a comment-redirected raw write cannot escape scoping).
     #[error(
         "tenancy: table {0:?} is Unscoped (global reference); a scoped guest write is refused \
-         (deny-by-default). If this table is genuinely tenant-less, allow the write one of two ways: \
-         (least-privilege) add {0:?} to this route's tenancy `unscoped_writes: [...]`, or \
-         (project-wide) declare the table `{{ \"kind\": \"unscoped\", \"writable\": true }}` in the \
-         project tenancy schema. Reads are unaffected. A TARGET-scope write to a global table stays \
+         (deny-by-default). If this table is genuinely tenant-less, allow the write one of two ways \
+         VIA THE `orm` BINDING: (least-privilege) add {0:?} to this route's tenancy \
+         `unscoped_writes: [...]`, or (project-wide) declare the table \
+         `{{ \"kind\": \"unscoped\", \"writable\": true }}` in the project tenancy schema. A raw-SQL \
+         write to a global table is instead scoped to your own tenant (use the `orm` binding for an \
+         unstamped global write). Reads are unaffected. A TARGET-scope write to a global table stays \
          refused regardless."
     )]
     UnscopedWrite(String),
