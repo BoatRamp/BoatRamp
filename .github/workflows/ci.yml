@@ -1045,6 +1045,65 @@ jobs:
           else
             echo "#499 mutation verified: the inline-compile mutation fails the healthz latency bound as expected."
           fi
+      # S3 blob-ingress (PLAN-blob-s3-ingress M5): the mutation-verified `S3 INGRESS SCOPED+SIGV4 OK`
+      # gate. Drives the local fs/in-memory S3 face with a real SigV4 client (the minter produces the
+      # cred, the face verifies it) through the REAL `face::handle` + a REAL guest `compat::blob` read,
+      # asserting all 9 PLAN §10 invariants + guest read-through: scope confinement, SigV4 verify,
+      # secret separation, replay-inert content-addressing, guest over-mint clamps, mint-route authz,
+      # multipart isolation/all-or-nothing, create-only overwrite, and (cloud lane) the AWS session-
+      # policy / GCS CAB / Azure SAS tightness + enforced-vs-advisory honesty. The `test-server-features`
+      # lane opts to `handlers` only, so this feature-gated gate would silently skip there — run it here
+      # explicitly and assert the marker + pass count, so a `#[cfg]`/rename that drops it fails the merge.
+      #
+      # ANTI-HOLLOW (the M5 crux): each of the four product-choke-point checks has a
+      # `BOATRAMP_S3INGRESS_MUTATE_SKIP_*` seam (compiled ONLY under `s3-ingress-gate-mutation`, absent
+      # from every real build) that neuters exactly that check. We run the gate ONCE clean (must PASS +
+      # print the marker), then ONCE per mutation with the exit code INVERTED — a PASS-under-mutation is
+      # a hollow gate and fails the merge. Confirmed locally: each mutation panics the gate (exit 101).
+      - name: s3-ingress scoped+sigv4 gate marker (M5)
+        run: |
+          set -eo pipefail
+          # Clean run on the SHIPPED musl target: the fs-face invariants (1-8) + guest read-through.
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-server \
+            --features s3-ingress-gate-mutation --lib \
+            s3_ingress::gate::battery::s3_ingress_scoped_and_sigv4_gate -- --nocapture 2>&1 \
+            | tee s3-ingress-gate.log
+          grep -qE 'test result: ok\. 1 passed' s3-ingress-gate.log \
+            || { echo "::error::s3-ingress gate did not run (silent skip or a failure)" >&2; exit 1; }
+          grep -q 'S3 INGRESS SCOPED+SIGV4 OK' s3-ingress-gate.log \
+            || { echo "::error::s3-ingress gate never reached its marker (a scope/SigV4/content-address/overwrite/multipart/mint regression)" >&2; exit 1; }
+          # Mutation guards: neuter each choke point in turn; each MUST fail the gate. Invert the exit
+          # code so a PASS-under-mutation (a hollow gate) fails the merge.
+          for mut in SKIP_SCOPE SKIP_SIGV4 SKIP_SHA256 SKIP_CREATE_ONLY; do
+            if env "BOATRAMP_S3INGRESS_MUTATE_${mut}=1" cargo-zigbuild test \
+              --target x86_64-unknown-linux-musl -p boatramp-server \
+              --features s3-ingress-gate-mutation --lib \
+              s3_ingress::gate::battery::s3_ingress_scoped_and_sigv4_gate \
+              > "s3-ingress-mut-${mut}.log" 2>&1; then
+              echo "::error::s3-ingress gate is HOLLOW — it PASSED with BOATRAMP_S3INGRESS_MUTATE_${mut}=1 (that security check is not load-bearing)" >&2
+              exit 1
+            else
+              echo "s3-ingress mutation verified: BOATRAMP_S3INGRESS_MUTATE_${mut}=1 fails the gate as expected."
+            fi
+          done
+      # Invariant 9 (cloud STS policy tightness + enforced/advisory honesty) is a set of PURE AWS/GCS/
+      # Azure policy-builder assertions — no live cloud. It compiles only with the cloud SDK stack, which
+      # is heavy on musl (the aws-lc-rs/ring musl crypto clash the SDK research flagged), so — mirroring
+      # the `test (slatedb WAL recovery)` host-toolchain precedent — the cloud lane runs on the host
+      # toolchain. The SAME gate test now also runs invariant 9 (the marker text reflects "9 invariants").
+      - name: s3-ingress cloud-policy tightness (invariant 9, host toolchain)
+        run: |
+          set -eo pipefail
+          cargo test -p boatramp-server \
+            --features s3-ingress-gate-mutation,blob-upload-cloud --lib \
+            s3_ingress::gate::battery::s3_ingress_scoped_and_sigv4_gate -- --nocapture 2>&1 \
+            | tee s3-ingress-gate-cloud.log
+          grep -qE 'test result: ok\. 1 passed' s3-ingress-gate-cloud.log \
+            || { echo "::error::s3-ingress cloud-policy gate did not run (silent skip or a failure)" >&2; exit 1; }
+          grep -q '9 invariants' s3-ingress-gate-cloud.log \
+            || { echo "::error::s3-ingress cloud lane did not exercise invariant 9 (the AWS/GCS/Azure policy builders)" >&2; exit 1; }
+          grep -q 'S3 INGRESS SCOPED+SIGV4 OK' s3-ingress-gate-cloud.log \
+            || { echo "::error::s3-ingress cloud gate never reached its marker (a cloud policy-tightness / enforced-vs-advisory regression)" >&2; exit 1; }
 
   deny:
     name: cargo-deny
