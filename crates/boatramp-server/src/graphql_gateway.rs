@@ -366,6 +366,11 @@ pub(crate) struct BackendRouter {
     /// these host-trusted inputs. `None`/unset ⇒ a `Target` fetch fails closed. `B` is host-derived
     /// (the routed domain tag / a verified capability / a public handle), NEVER guest input.
     target_inputs: Option<TargetInputs>,
+    /// Injectable source for a SQL subgraph's `claims_from_token.jwks_env` host-env lookup.
+    /// Defaults to [`SystemEnv`](boatramp_core::env::SystemEnv) (the real process env); the edge
+    /// sets the runtime's source via [`with_env_source`](Self::with_env_source) so a test injects
+    /// the JWKS without mutating the process environment.
+    env_source: std::sync::Arc<dyn boatramp_core::env::EnvSource>,
 }
 
 /// Host-trusted inputs the [`BackendRouter`] uses to resolve a target fetch's tenant `B` per fetch
@@ -404,7 +409,19 @@ impl BackendRouter {
             bearer,
             depth: 0,
             target_inputs: None,
+            env_source: std::sync::Arc::new(boatramp_core::env::SystemEnv),
         }
+    }
+
+    /// Wire the injectable env source (the runtime's) for a SQL subgraph's `jwks_env` lookup.
+    /// Unset ⇒ the real process env ([`SystemEnv`](boatramp_core::env::SystemEnv)).
+    #[must_use]
+    pub(crate) fn with_env_source(
+        mut self,
+        env_source: std::sync::Arc<dyn boatramp_core::env::EnvSource>,
+    ) -> Self {
+        self.env_source = env_source;
+        self
     }
 
     /// Dispatch this router's sub-fetches at call-chain `depth` (default `0`, the external
@@ -454,8 +471,13 @@ impl BackendRouter {
         };
         let policy = crate::graphql_data::policy_from_config(config);
         let claims =
-            crate::graphql_data::request_claims(&self.project, self.bearer.as_deref(), config)
-                .await;
+            crate::graphql_data::request_claims(
+                &self.project,
+                self.bearer.as_deref(),
+                config,
+                self.env_source.as_ref(),
+            )
+            .await;
         let dialect = crate::graphql_data::dialect::Sqlite;
         let invoker = Some(self.invoker.as_ref());
         // A SQL subgraph resolves both root fetches and — so it's a full federation entity
@@ -783,7 +805,8 @@ impl boatramp_handlers::SupergraphRunner for FederationRunner {
             sql_subgraphs,
             bearer,
         )
-        .at_depth(depth);
+        .at_depth(depth)
+        .with_env_source(inner.env_source_arc());
         // The guest's operation variables (a JSON object string) — forwarded to the fetches so a
         // mutation/field argument bound to `$var` resolves. An unparsable/empty value is `{}`.
         let variables: Value =

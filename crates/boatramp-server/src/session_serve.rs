@@ -193,6 +193,7 @@ async fn resolve_session_principal(
             // lane, so it carries no signed-context envelope.
             signed_context: None,
             context_anchor: None,
+            env_source: Some(inner.env_source()),
         },
     )
     .await

@@ -557,6 +557,17 @@ impl HandlerRuntimeInner {
         }
     }
 
+    /// The injectable env source as an owned `Arc` — for a component (e.g. the GraphQL
+    /// [`BackendRouter`](crate::graphql_gateway::BackendRouter)) that must STORE the source rather
+    /// than borrow it. Unset ⇒ a fresh `Arc<SystemEnv>` (the real process env).
+    #[cfg(feature = "handlers")]
+    pub(crate) fn env_source_arc(&self) -> Arc<dyn boatramp_core::env::EnvSource> {
+        match self.env_source.get() {
+            Some(source) => source.clone(),
+            None => Arc::new(boatramp_core::env::SystemEnv),
+        }
+    }
+
     /// Resolve the tenancy/capability knobs for `project` (Gap 4a): the operator's per-project
     /// override if one was declared, else the node base. The lookup key is the **host-routed**
     /// project (never guest input), so it can't be spoofed. Consulted at every in-project
