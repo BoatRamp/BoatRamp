@@ -38,6 +38,7 @@
 - [Deploy a handler](./how-to/deploy-handler.md)
 - [Compose components into one handler](./how-to/compose.md)
 - [Use kv / sql / blobstore / messaging](./how-to/handler-bindings.md)
+- [Ingest large uploads over S3 (blob-ingress)](./how-to/blob-ingress.md)
 - [Isolate tenants within a project](./how-to/tenant-isolation.md)
 - [Run owner-gated schema migrations](./how-to/in-app-migrations.md)
 - [Serve a GraphQL API](./how-to/graphql.md)
