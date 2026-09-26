@@ -38,6 +38,9 @@ pub enum CloudMinterSpec {
         account: String,
         service_url: String,
         container: String,
+        /// Whether the account has a hierarchical namespace (HNS/ADLS-Gen2). A prefix mint is refused
+        /// unless this is `true` (a directory SAS only confines on HNS; Security LOW-1). Default false.
+        hns: bool,
     },
 }
 
@@ -107,6 +110,7 @@ pub async fn build_cloud_minter(
             account,
             service_url,
             container,
+            hns,
         } => {
             use super::azure::{AzureBlobUploadMinter, AzureMinterConfig};
             let credential = azure_identity::DeveloperToolsCredential::new(None)
@@ -117,6 +121,7 @@ pub async fn build_cloud_minter(
                     account,
                     service_url,
                     container,
+                    hns,
                 },
             );
             Ok(Some(Arc::new(minter)))
