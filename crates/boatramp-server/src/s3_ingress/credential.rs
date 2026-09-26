@@ -92,8 +92,9 @@ impl S3IngressSecret {
 
     /// Build from raw bytes, validating the length (the config path).
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, CredentialError> {
-        let current: [u8; INGRESS_SECRET_LEN] =
-            bytes.try_into().map_err(|_| CredentialError::BadSecretLen)?;
+        let current: [u8; INGRESS_SECRET_LEN] = bytes
+            .try_into()
+            .map_err(|_| CredentialError::BadSecretLen)?;
         Ok(Self::new(current))
     }
 
@@ -397,7 +398,9 @@ mod tests {
 
     #[test]
     fn derived_secret_is_hex_of_expected_length() {
-        let s = S3IngressSecret::new(ROOT_A).derive_secret(AKID, CTI).unwrap();
+        let s = S3IngressSecret::new(ROOT_A)
+            .derive_secret(AKID, CTI)
+            .unwrap();
         assert_eq!(s.len(), DERIVED_SECRET_LEN * 2, "hex-encoded 32 bytes");
         assert!(hex::decode(&s).is_ok());
     }
