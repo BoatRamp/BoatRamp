@@ -1685,6 +1685,218 @@ pub(super) async fn repair_dry_run(
 }
 
 // ---------------------------------------------------------------------------
+// Operator S3 upload-credential minting (`POST /api/blob-mint-upload`) — M3
+// ---------------------------------------------------------------------------
+
+/// The body of `POST /api/blob-mint-upload` (PLAN-blob-s3-ingress §6). Project is HOST-forced from the
+/// token's project context (never in the body); the operator names the site + container + the target
+/// (exactly one of key/prefix) + perms + constraints + ttl. The TTL + max-bytes are clamped to the
+/// operator ceilings server-side (the operator can only request a shorter/smaller bound).
+#[cfg(feature = "blob-upload")]
+#[derive(Debug, Deserialize)]
+pub(super) struct MintUploadRequest {
+    /// The site the container belongs to (host-forced project + this site scope the credential).
+    pub site: String,
+    /// The blob container to mint an upload credential for.
+    pub container: String,
+    /// The single object key the credential is bound to (mutually exclusive with `prefix`).
+    #[serde(default)]
+    pub key: Option<String>,
+    /// The key prefix the credential is bound to (mutually exclusive with `key`).
+    #[serde(default)]
+    pub prefix: Option<String>,
+    /// The permitted operations (`put` / `multipart`). Empty ⇒ write-only (single-shot).
+    #[serde(default)]
+    pub perms: Vec<String>,
+    /// Requested max object size in bytes (clamped down to the operator ceiling).
+    #[serde(default)]
+    pub max_bytes: Option<u64>,
+    /// Required Content-Type (exact or a `type/*` family).
+    #[serde(default)]
+    pub content_type: Option<String>,
+    /// Require the object key to equal `sha256(bytes)` (content-addressing).
+    #[serde(default)]
+    pub require_sha256: bool,
+    /// Refuse to overwrite an existing key (create-only).
+    #[serde(default)]
+    pub create_only: bool,
+    /// Requested lifetime in seconds (clamped to the operator ceiling).
+    pub ttl_seconds: u64,
+}
+
+/// The JSON response of `POST /api/blob-mint-upload`: a self-describing credential, `kind` selecting
+/// the shape. `presigned_put` carries `url`/`method`/`required_headers`; `temp_credentials` carries
+/// the STS-style fields + the enforced/advisory contract. Unset fields for the other shape are omitted.
+#[cfg(feature = "blob-upload")]
+#[derive(Debug, Serialize)]
+pub(super) struct MintUploadResponse {
+    /// `"presigned_put"` or `"temp_credentials"`.
+    pub kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub required_headers: Vec<(String, String)>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub access_key_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub secret: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bucket: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub force_path_style: Option<bool>,
+    pub expires_at: u64,
+    pub expires_in_secs: u64,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub enforced: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub advisory: Vec<String>,
+}
+
+/// Mint a scoped, short-lived S3 upload credential for a project+site's blob container
+/// (`POST /api/blob-mint-upload`, gated `BlobUpload·Write`). Project is HOST-forced from the token
+/// context; site + container + shape come from the body. TTL + max-bytes are clamped to the operator
+/// ceilings. `501` when the local S3 face / minting is not wired on this node.
+#[cfg(feature = "blob-upload")]
+pub(super) async fn blob_mint_upload(
+    Extension(project): Extension<ProjectContext>,
+    Extension(handlers): Extension<Arc<HandlerRuntime>>,
+    Json(req): Json<MintUploadRequest>,
+) -> Response {
+    use boatramp_handlers::{
+        BlobUploadMinter, MintScope, MintedCredentials, UploadConstraints, UploadPerm, UploadTarget,
+    };
+
+    // The minter is wired only when the local S3 face + fleet signer are up.
+    let Some((minter, max_ttl, max_bytes_ceiling)) = handlers.blob_upload_minter() else {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            "S3 upload-credential minting is not enabled on this node (no local S3 face wired)\n",
+        )
+            .into_response();
+    };
+    // Validate the target: exactly one of key/prefix.
+    let target = match (req.key.as_deref(), req.prefix.as_deref()) {
+        (Some(k), None) => UploadTarget::Key(k.to_string()),
+        (None, Some(p)) => UploadTarget::Prefix(p.to_string()),
+        _ => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "specify exactly one of --key / --prefix\n",
+            )
+                .into_response();
+        }
+    };
+    if req.site.trim().is_empty() || req.container.trim().is_empty() {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "both --site and --container are required\n",
+        )
+            .into_response();
+    }
+    if req.ttl_seconds == 0 {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "--ttl must be greater than zero\n",
+        )
+            .into_response();
+    }
+    // Parse perms (empty ⇒ write-only).
+    let mut perms = Vec::new();
+    for p in &req.perms {
+        match p.as_str() {
+            "put" | "write" => perms.push(UploadPerm::Put),
+            "multipart" => perms.push(UploadPerm::Multipart),
+            other => {
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    format!("unknown perm `{other}` (expected put|multipart)\n"),
+                )
+                    .into_response();
+            }
+        }
+    }
+    if perms.is_empty() {
+        perms.push(UploadPerm::Put);
+    }
+    // Clamp the TTL + max_bytes to the operator ceilings (the operator can only narrow) — the same
+    // clamp the guest binding applies, mirrored here for the operator surface.
+    let ttl = req.ttl_seconds.min(max_ttl);
+    let clamped_max_bytes = match (req.max_bytes, max_bytes_ceiling) {
+        (Some(g), Some(c)) => Some(g.min(c)),
+        (Some(g), None) => Some(g),
+        (None, Some(c)) => Some(c),
+        (None, None) => None,
+    };
+    let scope = MintScope {
+        // Project HOST-forced from the token context; site from the body. The container is validated
+        // as a single safe segment at the S3-face key choke point (M2-review MEDIUM-2).
+        project: project.as_ref().as_str().to_string(),
+        site: req.site.trim().to_string(),
+        container: req.container.trim().to_string(),
+        target,
+        perms,
+        constraints: UploadConstraints {
+            max_bytes: clamped_max_bytes,
+            content_type: req.content_type.clone(),
+            require_sha256: req.require_sha256,
+            create_only: req.create_only,
+        },
+        ttl_secs: ttl,
+    };
+    match minter.mint(&scope).await {
+        Ok(MintedCredentials::PresignedPut(p)) => Json(MintUploadResponse {
+            kind: "presigned_put",
+            url: Some(p.url),
+            method: Some(p.method),
+            required_headers: p.required_headers,
+            access_key_id: None,
+            secret: None,
+            session_token: None,
+            endpoint: None,
+            region: None,
+            bucket: None,
+            force_path_style: None,
+            expires_at: p.expires_at,
+            expires_in_secs: p.expires_in_secs,
+            enforced: Vec::new(),
+            advisory: Vec::new(),
+        })
+        .into_response(),
+        Ok(MintedCredentials::TempCredentials(t)) => Json(MintUploadResponse {
+            kind: "temp_credentials",
+            url: None,
+            method: None,
+            required_headers: Vec::new(),
+            access_key_id: Some(t.access_key_id),
+            secret: Some(t.secret),
+            session_token: Some(t.session_token),
+            endpoint: Some(t.endpoint),
+            region: Some(t.region),
+            bucket: Some(t.bucket),
+            force_path_style: Some(t.force_path_style),
+            expires_at: t.expires_at,
+            expires_in_secs: t.expires_in_secs,
+            enforced: t.enforced,
+            advisory: t.advisory,
+        })
+        .into_response(),
+        Err(e) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("mint failed: {e}\n"),
+        )
+            .into_response(),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Run a command inside a running workload (`POST /api/compute/{name}/exec`)
 // ---------------------------------------------------------------------------
 

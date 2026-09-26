@@ -357,6 +357,14 @@ pub fn router_with_fast(
         // `POST /api/repair/{db}/dry-run` = report-only (the default posture the CLI uses).
         .route("/api/repair/{db}", post(repair_apply))
         .route("/api/repair/{db}/dry-run", post(repair_dry_run));
+    // Operator S3 upload-credential minting (`POST /api/blob-mint-upload`, PLAN-blob-s3-ingress §6):
+    // mint a short-lived, scoped S3 upload credential for a project+site's blob container. Its OWN
+    // prefix, gated at `BlobUpload·Write` (`Right::required`) — deliberately NOT under `/api/blobs`
+    // (whose `Blobs·Deploy` a ship-only publisher holds; nesting there would let a publisher mint
+    // upload credentials — an escalation, cf. the repair/migrate placement). Only with the
+    // `blob-upload` feature (the minter is wired at startup when the local S3 face is up).
+    #[cfg(feature = "blob-upload")]
+    let api = api.route("/api/blob-mint-upload", post(blob_mint_upload));
     // OIDC → token exchange: validate the IdP JWT (presented as
     // the Bearer; `Right::required` returns None so the auth middleware lets it
     // through) and mint a short-TTL token. Only with the `oidc` feature.

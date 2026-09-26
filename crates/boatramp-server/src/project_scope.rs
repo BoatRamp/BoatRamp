@@ -78,6 +78,14 @@ pub const PROJECT_SCOPED_FAMILIES: &[&str] = &[
     // deploy-grade publisher right), so a `project_publisher` cannot write a firm's secret. Without
     // this entry the route would 404.
     "tenant-secrets",
+    // Operator S3 upload-credential minting for a project's blob container
+    // (`/api/projects/<proj>/blob-mint-upload`, PLAN-blob-s3-ingress §6). Rewrites onto the global
+    // `/api/blob-mint-upload` handler, tagged with the project — so an operator on a non-default
+    // (Shared multi-tenant) project mints a scoped upload credential for ITS OWN project+site's
+    // container (the project is host-forced from this context, never the body). Authz still sees the
+    // original project-qualified path and gates it with the dedicated `Resource::BlobUpload` (Write —
+    // NOT the deploy-grade publisher/Blobs·Deploy right). Without this entry the route would 404.
+    "blob-mint-upload",
 ];
 
 /// The tenant project a request targets, injected as a request extension by

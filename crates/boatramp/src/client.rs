@@ -449,6 +449,42 @@ pub struct ControlPlane {
     project: String,
 }
 
+/// The self-describing minted S3 upload credential the server returns from `POST /api/blob-mint-upload`
+/// (`kind` selecting the shape). For `presigned_put`, `url`/`method`/`required_headers` are set; for
+/// `temp_credentials`, the STS-style fields + the enforced/advisory contract. Fields for the other
+/// shape deserialize to their default (absent).
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct MintUploadResult {
+    /// `"presigned_put"` or `"temp_credentials"`.
+    pub kind: String,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub method: Option<String>,
+    #[serde(default)]
+    pub required_headers: Vec<(String, String)>,
+    #[serde(default)]
+    pub access_key_id: Option<String>,
+    #[serde(default)]
+    pub secret: Option<String>,
+    #[serde(default)]
+    pub session_token: Option<String>,
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    #[serde(default)]
+    pub region: Option<String>,
+    #[serde(default)]
+    pub bucket: Option<String>,
+    #[serde(default)]
+    pub force_path_style: Option<bool>,
+    pub expires_at: u64,
+    pub expires_in_secs: u64,
+    #[serde(default)]
+    pub enforced: Vec<String>,
+    #[serde(default)]
+    pub advisory: Vec<String>,
+}
+
 /// Which operator queue/DLQ surface a `queue`/`dlq` op targets: a single **site's** own
 /// queues (with an optional background-`alias` scope), or the **shared project bus**
 /// (`{project}/bus/{topic}`, common to every site in the project). The two differ only in
@@ -1597,6 +1633,58 @@ impl ControlPlane {
             .await?
             .error_for_status()?;
         Ok(hash)
+    }
+
+    /// Mint a scoped, short-lived S3 upload credential for a project+site's blob container
+    /// (`POST /api/blob-mint-upload`, gated `BlobUpload·Write`). The project is host-forced from the
+    /// token/context; the operator names `site`, `container`, exactly one of `key`/`prefix`, the
+    /// perms (empty ⇒ write-only), the constraints, and `ttl_seconds` (clamped to the operator ceiling
+    /// server-side). Returns the self-describing [`MintUploadResult`] (presigned-put or
+    /// temp-credentials).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn mint_upload(
+        &self,
+        site: &str,
+        container: &str,
+        key: Option<&str>,
+        prefix: Option<&str>,
+        perms: &[String],
+        ttl_seconds: u64,
+        content_type: Option<&str>,
+        max_bytes: Option<u64>,
+        require_sha256: bool,
+    ) -> Result<MintUploadResult> {
+        let seg = project_seg(&self.project, "blob-mint-upload");
+        let Self {
+            http, base: server, ..
+        } = self;
+        let body = serde_json::json!({
+            "site": site,
+            "container": container,
+            "key": key,
+            "prefix": prefix,
+            "perms": perms,
+            "content_type": content_type,
+            "max_bytes": max_bytes,
+            "require_sha256": require_sha256,
+            "create_only": key.is_some(), // a single-key (UGC) credential defaults create-only
+            "ttl_seconds": ttl_seconds,
+        });
+        let resp = http
+            .post(format!("{server}/api/{seg}"))
+            .json(&body)
+            .send()
+            .await?;
+        let status = resp.status();
+        if status.is_success() {
+            Ok(resp.json().await?)
+        } else {
+            let body = resp.text().await.unwrap_or_default();
+            Err(ClientError::Refused(format!(
+                "mint-upload refused ({status}): {}",
+                body.trim()
+            )))
+        }
     }
 
     /// Resolve an **artifact reference** — a `--kernel` / `--rootfs` value — to a blob
