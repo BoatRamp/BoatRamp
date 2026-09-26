@@ -5,34 +5,129 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
-## [Unreleased] — S3 blob-ingress M4 (cloud brokering) — DRAFT, not yet released
+## [Unreleased] — S3-compatible external blob ingress (#497) — DRAFT, not yet released
 
-> Draft notes for the in-flight `blob-s3-ingress` branch. The version bump, the M5 live gate
-> (`S3 INGRESS SCOPED+SIGV4 OK`), the shim rev, and the recipes finalize this before release.
+> Draft notes for the in-flight `blob-s3-ingress` branch. The version header (**v0.5.9**), the final
+> musl `--all-features` clippy pass, the companion `boatramp-uchron-shim` rev (the guest WIT addition),
+> and the tag finalize this before release. The mutation-verified live gate `S3 INGRESS SCOPED+SIGV4 OK`
+> (all nine invariants, run on an fs-local backend and a cloud/S3-emulator) is wired.
 
-### Added (in-flight)
+A general platform primitive: let a client **outside** the wasm sandbox upload large binary objects
+**into** a project's blob container — authenticated, resumable, at scale — such that the guest then reads
+the object by key through the **existing** `wasi:blobstore` (`has`/`get`) with **zero guest change**.
+Every object lands at `hblob/{project-qualified-site}/{container}/{key}`, the exact prefix the guest
+already reads. The client speaks **one protocol — S3 — everywhere**; configure any S3 SDK (`aws-sdk-*`,
+`boto3`, `rclone`, `minio-js`, `opendal`) or a browser `fetch()` with short-lived, scoped temporary
+credentials and upload directly.
 
-- **Cloud credential brokering for the S3 blob-ingress mint (M4).** When a project's blob container is
-  backed by a cloud object store, the guest/operator mint now brokers a **native, scoped, short-lived
-  cloud credential** so the external client uploads DIRECTLY to the real store (bytes never transit the
-  node) — behind the SAME `blob-upload` seam the local S3 face uses (guest WIT, `upload_containers`
-  allowlist, rights, CLI, and route unchanged from M3; the host still forces project+site and clamps
-  TTL/max-bytes before the minter runs, so a cloud minter can only shape the returned credential).
+### Added
+
+- **A local S3-compatible ingress face (M1–M2).** A **dedicated listener** (`[serve].s3_ingress_addr`,
+  its own SigV4 auth boundary — never reaches the control-plane router or `serve_by_host`), **path-style**
+  addressing, **write / multipart-only** (no external GET / LIST / DELETE — an ingress surface, not
+  exfil). Implements `PutObject`, the multipart quartet (create / upload-part / complete / abort), and
+  `HEAD`, wired to any `Arc<dyn Storage>` backend so an uploaded object is immediately guest-readable at
+  `hblob/…`.
+  - **Full SigV4 verification, built against the AWS SigV4 test-suite vectors + differential-fuzzed**:
+    header-auth, presigned-query-auth, `UNSIGNED-PAYLOAD`, real-hash payloads, **and**
+    `STREAMING-AWS4-HMAC-SHA256-PAYLOAD` (aws-chunked, per-chunk signature chain + trailing checksum,
+    never buffering the whole body). Constant-time secret compare; bounded clock skew; fail-closed
+    **uniform `AccessDenied`** (no which-check oracle).
+  - **Stateless STS-style credentials, restart- and cluster-uniform**: `secret_access_key =
+    HKDF-SHA256(dedicated ingress root, domain-separated info, akid‖cti)` — a **dedicated,
+    independently-rotatable** root (`[serve].s3_ingress_secret_file`), **never** the `[secrets]` KEK and
+    **never** the COSE signing key. **Fail-closed multi-node startup guard**: the face refuses to enable
+    on a cluster without an explicit, cluster-uniform ingress secret. The session token is a
+    domain-separated `KIND_S3_SESSION` COSE_Sign1 carrying the host-stamped scope with a **mandatory
+    `exp`**; opt-in `cti` revocation on the verify path for long-TTL bulk creds.
+  - **Server-side multipart on fs/in-memory** with scope-bound `uploadId`s and staging under the reserved
+    `.boatramp-uploads/{uploadId}/` namespace (a client key can never collide with or read it), GC'd on
+    abort/expiry; **Complete is all-or-nothing** (no partial object at the final key). An object-store
+    "local" brokers the store's **native** multipart instead of re-transiting bytes.
+  - **Path-aware key normalization** at the S3-face key-composition choke point (percent-decode once;
+    reject empty/`.`/`..`/control/NUL/`*`/leading-`/`; re-anchor under the host-forced prefix) — covers
+    **cloud** backends too. **Content-addressing** (`require_sha256`): the key must equal `sha256(bytes)`,
+    verified as-streamed — idempotent, dedupes, replay-inert.
+  - Per-container **CORS allowlist** (the face answers `OPTIONS`, echoes only allowed origins, never `*`
+    on a credentialed write endpoint), **DoS caps** (parts-per-upload, concurrent open uploads, total
+    staged bytes, aggressive staging-GC TTL; reuses `UploadGuard`), and a **stable, greppable S3
+    `<Code>` vocabulary** (`BoatrampScopeEscape`, `BoatrampCredExpired`, `BoatrampSha256Mismatch`,
+    `BoatrampSizeExceeded`, `BoatrampContentTypeRejected`, `BoatrampOverwriteDenied`,
+    `BoatrampQuotaExceeded`, `BoatrampMultipartInvalid`, `BoatrampOperationNotPermitted`, …).
+
+- **Two mint surfaces (M3).**
+  - A **guest capability** `boatramp:handlers/blob-upload` — a handler or function mints a scoped upload
+    credential for one of its OWN project+site's containers. **Project AND site are host-forced** (the
+    WIT surface has **no** project/site parameter); the TTL and `max_bytes` are **clamped** to the
+    operator ceilings (a guest can only narrow). Two **independent** rights —
+    **`blob-upload:write`** (single-shot) and **`blob-upload:multipart`** (bare `blob-upload` is not a
+    grant; there is no `blob-upload:*`) — plus a per-component **`upload_containers`** allowlist
+    (**empty ⇒ deny-all**), mirroring `tenant_secret_names`. **Deny-by-default**; fail-closed
+    `no-resolved-site` on an `all`/anonymous/unscoped invocation, BEFORE any signing.
+  - A **standalone top-level function** has no single host-routed site, so it names the site it mints for
+    in its config, **`blob_upload_site`** — **host-forced, never guest-supplied** — and the host
+    **validates that site belongs to the function's (host-forced) project** at bind time (a
+    cluster-uniform KV site-pointer probe); unset / cross-project / non-existent ⇒ fail-closed (no
+    binding). No new blob namespace: the credential still lands at
+    `hblob/{project-qualified-site}/{container}/{key}`.
+  - The mint returns a **self-describing variant**: **`presigned-put`** (a single ready-to-`fetch()` URL
+    for the single-key / PUT-only / browser case — no SigV4 in JS) or **`temp-credentials`** (STS-style
+    creds for the prefix / multipart / bulk case) — the client feeds it verbatim to its SDK. An explicit
+    **`enforced` vs `advisory`** constraint contract; the clamped TTL is surfaced.
+  - An **operator CLI** `boatramp blob mint-upload --site … --container … (--key … | --prefix …) [--perms
+    put,multipart] [--ttl …] [--content-type …] [--max-bytes …] [--sha256] [--emit env|aws|rclone|json]`
+    (default: a human table + an `env` block). Gated by an operator token holding the blob-upload right;
+    the ingress itself is authorized by the temp credential, not the control-plane bearer.
+
+- **Cloud credential brokering (M4).** When a container is backed by a cloud object store, the mint
+  brokers a **native, scoped, short-lived cloud credential** so the client uploads DIRECTLY to the real
+  store (**bytes never transit the node**) — behind the SAME `blob-upload` seam (guest WIT,
+  `upload_containers`, rights, CLI, route unchanged from M3; the host still forces project+site and
+  clamps before the minter runs, so a cloud minter can only *shape* the returned credential).
   - **AWS** — `sts:AssumeRole` (default) / `sts:GetFederationToken` (IAM-user) with an inline session
     policy **resource-scoped to the exact `hblob/{qualified-site}/{container}/…` prefix** and
-    **action-scoped to `s3:PutObject` + the multipart quartet only** (no get/list/delete/bucket-level);
-    a per-object **presigned PUT** for the single-key/browser shape.
-  - **GCS** — a per-object **V4 signed PUT URL** (official `google-cloud-storage` 1.x) for the single-key
-    shape; a hand-rolled **STS Credential-Access-Boundary** token-exchange
-    (`sts.googleapis.com/v1/token`) scoped to `resource.name.startsWith(hblob-prefix)` +
-    `roles/storage.objectCreator` for a prefix credential.
-  - **Azure** — a **user-delegation SAS** (AAD, no account key; new GA 1.x SDK) — blob-scoped for a
-    single key, directory-scoped for a prefix (the SAS scope-shape asymmetry is reflected honestly).
+    **action-scoped to `s3:PutObject` + the multipart quartet only** (no get / list / delete /
+    bucket-level); a per-object **presigned PUT** for the single-key / browser shape.
+  - **GCS** — a per-object **V4 signed PUT URL** via IAM `signBlob` (keyless; needs
+    `roles/iam.serviceAccountTokenCreator`) for the single-key shape; a hand-rolled **STS
+    Credential-Access-Boundary** token-exchange (`sts.googleapis.com/v1/token`) scoped with a CEL
+    condition (`resource.name.startsWith(hblob-prefix)`) + `roles/storage.objectCreator` for a prefix
+    credential.
+  - **Azure** — a **user-delegation SAS** (AAD, no account key) — blob-scoped for a single key,
+    directory-scoped for a prefix; a prefix credential requires the account declare a hierarchical
+    namespace (`[serve.s3_ingress_cloud].azure_hns = true`, fail-closed otherwise), since a
+    directory-scoped SAS only confines on an HNS/ADLS-Gen2 account.
   - **enforced vs advisory honesty**: a cloud minter labels a constraint it cannot cap in-policy (object
-    size, and content-type on a broad prefix) **`advisory`**, never `enforced`; content-addressing
-    (`require_sha256`) is the mandatory strong cross-cloud enforcement and is always `enforced`.
-  - New feature flags `blob-upload-{aws,gcs,azure,cloud}` (off in the lean/default build) and a new
-    `[serve.s3_ingress_cloud]` operator config selecting/authenticating the cloud backend.
+    size, and content-type on a broad prefix) **`advisory`**, never `enforced`; content-addressing is the
+    mandatory strong cross-cloud enforcement and is always `enforced` where the store pins the hash.
+  - New feature flags `blob-upload-{aws,gcs,azure,cloud}` (off in the lean/default build); a new
+    `[serve.s3_ingress_cloud]` operator config (`aws_role_arn` / `aws_use_federation_token` /
+    `gcs_client_email` / `azure_account` / `azure_service_url` / `azure_hns`) selecting + authenticating
+    the cloud backend. `aws-sdk-sts` added as a direct dependency.
+
+- **Authz.** A new **`Resource::BlobUpload`** (target `"<project>/<site>/<container>"`, in
+  `Resource::ALL` so `admin` expands to it; **not** granted to default `publisher` / `deployer` /
+  `project_*` roles). The operator mint route gets its **own prefix, gated ABOVE** any `/api/blobs/` +
+  `/api/sql/` catch-all (repair/migrate-placement precedent) — no publisher escalation.
+
+- **Documentation.** A new how-to, [Ingest large uploads over S3
+  (blob-ingress)](docs/src/how-to/blob-ingress.md): the three canonical recipes (browser-UGC presigned
+  PUT; bulk-agent prefix temp-credentials + multipart; content-addressed upload), the guest mint + CLI
+  usage with client-SDK snippets, the per-cloud operator setup (AWS AssumeRole trust policy; GCS
+  `serviceAccountTokenCreator` + object-creator; Azure `Storage Blob Delegator` + the `azure_hns`
+  requirement for prefix mints), the `[serve.s3_ingress*]` config, the greppable `Boatramp*` error
+  vocabulary, and the note that the Azurite live gate needs `azurite --skipApiVersionCheck` (the 1.x
+  Azure SDK sends a newer `x-ms-version` than the emulator's default allowlist).
+
+### Changed
+
+- **The Azure blob backend was unified on the Azure 1.x GA SDK generation.** Delivering the
+  user-delegation SAS broker on the new GA SDK (`azure_storage_blob` / `azure_storage_sas` /
+  `azure_identity` 1.x) required rewriting `boatramp-storage`'s `azure.rs` onto the same generation; the
+  1.x SDK dropped native Shared Key signing, so account-key / Azurite-emulator auth is preserved by a
+  **hand-rolled Shared Key request-signing policy** (block-blob multipart parity via
+  `stage_block`/`commit_block_list` intact). The reqwest 0.12/0.13 split and a single workspace rustls
+  provider were resolved as part of the cloud-SDK bumps.
 
 ## [0.5.7] - 2026-09-26
 
