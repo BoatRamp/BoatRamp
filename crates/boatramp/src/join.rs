@@ -462,14 +462,20 @@ pub fn decide_startup(i: &StartupInputs) -> StartupAction {
 /// surface — keeps the secret out of the file via a prefix (#6):
 /// `env:VAR` reads an environment variable, `path:/file` reads a file (trimmed),
 /// and anything else is an inline literal. Empty resolves to `None`.
-pub fn resolve_join_token(spec: &str) -> Result<Option<String>, JoinError> {
+///
+/// The `env:` lookup reads through an injectable [`EnvSource`] so a test supplies
+/// values via a `MapEnv` instead of mutating the global process environment.
+pub fn resolve_join_token(
+    spec: &str,
+    env_source: &dyn boatramp_core::env::EnvSource,
+) -> Result<Option<String>, JoinError> {
     let spec = spec.trim();
     if spec.is_empty() {
         return Ok(None);
     }
     if let Some(var) = spec.strip_prefix("env:") {
-        return match std::env::var(var) {
-            Ok(v) if !v.trim().is_empty() => Ok(Some(v.trim().to_string())),
+        return match env_source.get(var) {
+            Some(v) if !v.trim().is_empty() => Ok(Some(v.trim().to_string())),
             _ => Err(JoinError::Token(format!(
                 "join_token env var {var} is unset or empty"
             ))),
@@ -667,30 +673,30 @@ mod tests {
     /// var or empty file — keeping the secret out of the config file (#6).
     #[test]
     fn join_token_resolves_env_path_and_inline() {
-        assert_eq!(resolve_join_token("").unwrap(), None);
+        let env = boatramp_core::env::MapEnv::new().with("BOATRAMP_TEST_JOIN_TOKEN", "  tok-from-env  ");
+        assert_eq!(resolve_join_token("", &env).unwrap(), None);
         assert_eq!(
-            resolve_join_token("inline-token").unwrap(),
+            resolve_join_token("inline-token", &env).unwrap(),
             Some("inline-token".to_string())
         );
 
-        // env: — a uniquely-named var so the test is isolated.
-        std::env::set_var("BOATRAMP_TEST_JOIN_TOKEN", "  tok-from-env  ");
+        // env: — injected via a MapEnv rather than mutating the process environment.
         assert_eq!(
-            resolve_join_token("env:BOATRAMP_TEST_JOIN_TOKEN").unwrap(),
+            resolve_join_token("env:BOATRAMP_TEST_JOIN_TOKEN", &env).unwrap(),
             Some("tok-from-env".to_string())
         );
-        assert!(resolve_join_token("env:BOATRAMP_TEST_JOIN_TOKEN_UNSET").is_err());
+        assert!(resolve_join_token("env:BOATRAMP_TEST_JOIN_TOKEN_UNSET", &env).is_err());
 
         // path: — write a temp file and read it back trimmed.
         let dir = std::env::temp_dir();
         let file = dir.join("boatramp-test-join-token");
         std::fs::write(&file, "tok-from-file\n").unwrap();
         assert_eq!(
-            resolve_join_token(&format!("path:{}", file.display())).unwrap(),
+            resolve_join_token(&format!("path:{}", file.display()), &env).unwrap(),
             Some("tok-from-file".to_string())
         );
         std::fs::write(&file, "   \n").unwrap();
-        assert!(resolve_join_token(&format!("path:{}", file.display())).is_err());
+        assert!(resolve_join_token(&format!("path:{}", file.display()), &env).is_err());
         let _ = std::fs::remove_file(&file);
     }
 }
