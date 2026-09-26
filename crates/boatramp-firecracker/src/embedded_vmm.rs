@@ -420,16 +420,15 @@ impl EmbeddedVmm {
         );
         let serial: Arc<SharedSerial> = Arc::new(Mutex::new(Serial::new(trigger, out)));
 
-        if let Some((net_index, _)) = &net {
-            if manager
+        if let Some((net_index, _)) = &net
+            && manager
                 .lock()
                 .expect("device manager mutex")
                 .windows()
                 .get(*net_index)
                 .is_none()
-            {
-                return Err(VmmError::Kvm(format!("no device at index {net_index}")));
-            }
+        {
+            return Err(VmmError::Kvm(format!("no device at index {net_index}")));
         }
         let rx_thread = net.map(|(net_index, rx_tap)| {
             // The RX poller shares the manager + a guest-memory clone (same backing
