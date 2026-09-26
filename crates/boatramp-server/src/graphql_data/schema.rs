@@ -139,12 +139,11 @@ pub(crate) struct Relationship {
 /// The to-one field name for an FK: a single `<name>_id` column becomes `<name>`, else the
 /// referenced table name.
 fn to_one_field_name(fk: &ForeignKey) -> String {
-    if fk.columns.len() == 1 {
-        if let Some(stripped) = fk.columns[0].strip_suffix("_id") {
-            if !stripped.is_empty() {
-                return stripped.to_string();
-            }
-        }
+    if fk.columns.len() == 1
+        && let Some(stripped) = fk.columns[0].strip_suffix("_id")
+        && !stripped.is_empty()
+    {
+        return stripped.to_string();
     }
     fk.ref_table.clone()
 }

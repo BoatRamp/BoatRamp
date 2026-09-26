@@ -16,6 +16,8 @@ pub mod logging;
 #[cfg(feature = "sql")]
 pub mod tenant;
 
+#[cfg(feature = "engine")]
+pub use bindings::Bindings;
 #[cfg(feature = "admin")]
 pub use bindings::admin::{AdminController, AdminError, DomainChallenge, Surface as AdminSurface};
 #[cfg(feature = "capability")]
@@ -29,11 +31,11 @@ pub use bindings::invoke::{
     InvokeError, InvokeRequest, InvokeResponse, InvokeStreamResponse, Invoker, MAX_INVOKE_DEPTH,
 };
 #[cfg(feature = "messaging")]
-pub use bindings::messaging::{ProducerContext, BUS_TOPIC_SELECTOR};
+pub use bindings::messaging::{BUS_TOPIC_SELECTOR, ProducerContext};
 #[cfg(feature = "messaging")]
 pub use bindings::messaging_stats::{
-    GroupStats as StatsGroupStats, StatsBinding, StatsRefused, TopicStats as StatsTopicStats,
-    TENANT_PLACEHOLDER as STATS_TENANT_PLACEHOLDER,
+    GroupStats as StatsGroupStats, StatsBinding, StatsRefused,
+    TENANT_PLACEHOLDER as STATS_TENANT_PLACEHOLDER, TopicStats as StatsTopicStats,
 };
 #[cfg(feature = "migrate")]
 pub use bindings::migrate::MigrateBinding;
@@ -43,13 +45,11 @@ pub use bindings::session::{SessionBinding, SessionController, SessionError};
 pub use bindings::tenancy::ProducerContextSource;
 #[cfg(feature = "tenant-secrets")]
 pub use bindings::tenant_secrets::{TenantSecretRefused, TenantSecretsBinding};
-#[cfg(feature = "engine")]
-pub use bindings::Bindings;
 #[cfg(feature = "session")]
 pub use engine::SessionBatch;
 #[cfg(feature = "engine")]
 pub use engine::{
-    build_engine, build_engine_pooling, empty_body, HandlerEngine, HandlerError, Lane, Limits,
+    HandlerEngine, HandlerError, Lane, Limits, build_engine, build_engine_pooling, empty_body,
 };
 #[cfg(feature = "engine")]
 pub use logging::{LogSink, LogStream};

@@ -14,11 +14,11 @@
 //! fragments and named fragment spreads and is **cycle-guarded** (the parser accepts a
 //! cyclic fragment; enumeration must terminate). Pure and deterministic.
 
+use async_graphql_parser::Positioned;
 use async_graphql_parser::types::{
     ExecutableDocument, FragmentDefinition, OperationDefinition, OperationType, Selection,
     SelectionSet,
 };
-use async_graphql_parser::Positioned;
 use async_graphql_value::Name;
 use std::collections::{HashMap, HashSet};
 

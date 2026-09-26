@@ -279,12 +279,16 @@ mod tests {
         let by_path = |p: &str| reqs.iter().find(|r| r.path == p).unwrap();
         assert!(by_path("/machine-config").body.contains("\"vcpu_count\":2"));
         assert!(by_path("/boot-source").body.contains("kernel_image_path"));
-        assert!(by_path("/drives/rootfs")
-            .body
-            .contains("\"is_root_device\":true"));
-        assert!(by_path("/network-interfaces/eth0")
-            .body
-            .contains("host_dev_name"));
+        assert!(
+            by_path("/drives/rootfs")
+                .body
+                .contains("\"is_root_device\":true")
+        );
+        assert!(
+            by_path("/network-interfaces/eth0")
+                .body
+                .contains("host_dev_name")
+        );
     }
 
     #[test]

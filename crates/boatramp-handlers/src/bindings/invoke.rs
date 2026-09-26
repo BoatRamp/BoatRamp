@@ -559,11 +559,12 @@ mod tests {
         }
         assert_eq!(collected, b"hello streamed world");
         // Any further read stays at end-of-stream.
-        assert!(host
-            .read(Resource::new_borrow(rep), 4)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            host.read(Resource::new_borrow(rep), 4)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         host.drop(owned).unwrap();
     }
 }

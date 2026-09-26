@@ -17,7 +17,7 @@ use http::{HeaderMap, Method, StatusCode, Version};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 use super::parse::{
-    chunked, next_line, response_framing, split_header, Line, ResponseFraming, MAX_HEAD,
+    Line, MAX_HEAD, ResponseFraming, chunked, next_line, response_framing, split_header,
 };
 
 /// Encode a request head: `METHOD request-target HTTP/1.1` + `headers` + the terminating

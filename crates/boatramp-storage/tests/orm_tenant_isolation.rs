@@ -1160,10 +1160,10 @@ async fn orm_tenant_or_session_disjunct_isolates_on_a_real_engine() {
 #[tokio::test]
 #[ignore = "run via the test-orm-tenancy CI job on the host toolchain (static-musl test binary segfaults in libsql's bundled SQLite)"]
 async fn orm_durable_signed_context_isolates_on_a_real_engine() {
-    use boatramp_core::cose::{mint_context, verify_context, LocalSigner, Signer, TokenAlg};
+    use boatramp_core::Storage;
+    use boatramp_core::cose::{LocalSigner, Signer, TokenAlg, mint_context, verify_context};
     use boatramp_core::kv::{KvStore, MemoryKv};
     use boatramp_core::messaging::{LogMessaging, Messaging, StartPosition};
-    use boatramp_core::Storage;
     use std::sync::Arc;
     use std::time::Duration;
 

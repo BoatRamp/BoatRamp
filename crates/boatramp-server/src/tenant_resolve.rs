@@ -201,21 +201,20 @@ pub(crate) fn resolve_target_via(
                 }
             }
             TargetSource::Capability => {
-                if let (Some(token), Some(anchor)) = (capability, capability_anchor) {
-                    if let Ok(grant) =
+                if let (Some(token), Some(anchor)) = (capability, capability_anchor)
+                    && let Ok(grant) =
                         boatramp_core::cose::verify_capability(token, anchor, now_unix, audience)
-                    {
-                        // The capability must grant EXACTLY this route's public subset (a capability
-                        // for another subset can't be redeemed here).
-                        if grant.public == route_public {
-                            return Some(ResolvedTarget {
-                                value: grant.tenant,
-                                write: route_write.to_vec(),
-                                // Hand the capability's opaque app-context back to the resolver
-                                // (Stage D) — the host never interprets it.
-                                context: grant.context,
-                            });
-                        }
+                {
+                    // The capability must grant EXACTLY this route's public subset (a capability
+                    // for another subset can't be redeemed here).
+                    if grant.public == route_public {
+                        return Some(ResolvedTarget {
+                            value: grant.tenant,
+                            write: route_write.to_vec(),
+                            // Hand the capability's opaque app-context back to the resolver
+                            // (Stage D) — the host never interprets it.
+                            context: grant.context,
+                        });
                     }
                 }
             }
@@ -430,7 +429,7 @@ mod tests {
     /// tenant fact in the principal; a forged/absent cookie resolves none.
     #[tokio::test]
     async fn a_valid_session_cookie_resolves_the_session_fact() {
-        use boatramp_core::cose::{mint_session, LocalSigner, Signer, TokenAlg};
+        use boatramp_core::cose::{LocalSigner, Signer, TokenAlg, mint_session};
         use boatramp_handlers::ScopeFact;
 
         let signer = LocalSigner::generate(TokenAlg::Es256);
@@ -503,7 +502,7 @@ mod tests {
     /// running unscoped. The guest never names the tenant; only a fleet signature verifies here.
     #[tokio::test]
     async fn a_valid_signed_context_resolves_the_own_tenant_on_the_async_lane() {
-        use boatramp_core::cose::{mint_context, LocalSigner, Signer, TokenAlg};
+        use boatramp_core::cose::{LocalSigner, Signer, TokenAlg, mint_context};
         use boatramp_core::tenancy::ScopeAxis;
 
         let signer = LocalSigner::generate(TokenAlg::Es256);
@@ -616,14 +615,16 @@ mod tests {
     #[tokio::test]
     async fn undeclared_db_importer_is_refused_only_under_the_strict_posture() {
         // Strict posture + imports db + undeclared ⇒ refused.
-        assert!(resolve_host_tenancy(
-            None,
-            true,
-            posture(true, false),
-            TenantSourceInputs::default()
-        )
-        .await
-        .is_err());
+        assert!(
+            resolve_host_tenancy(
+                None,
+                true,
+                posture(true, false),
+                TenantSourceInputs::default()
+            )
+            .await
+            .is_err()
+        );
         // Same, but doesn't import db ⇒ fine (plain).
         assert!(matches!(
             resolve_host_tenancy(
@@ -688,7 +689,7 @@ mod tests {
 
     #[tokio::test]
     async fn via_resolves_first_applicable_source() {
-        use boatramp_core::cose::{mint_capability, LocalSigner, Signer, TokenAlg};
+        use boatramp_core::cose::{LocalSigner, Signer, TokenAlg, mint_capability};
         use boatramp_core::tenancy::{
             PublicCmp, PublicLiteral, PublicPredicate, PublicSubset, PublicTerm, TargetSource,
             TenancySchema,
@@ -776,33 +777,39 @@ mod tests {
         assert_eq!(r.write, write);
 
         // Capability wrong audience / wrong subset / an app bearer ⇒ no resolution.
-        assert!(call(
-            &[TargetSource::Capability],
-            "products",
-            None,
-            Some(cap.as_str()),
-            None,
-            "other"
-        )
-        .is_none());
-        assert!(call(
-            &[TargetSource::Capability],
-            "reviews",
-            None,
-            Some(cap.as_str()),
-            None,
-            "shop"
-        )
-        .is_none());
-        assert!(call(
-            &[TargetSource::Capability],
-            "products",
-            None,
-            Some("not-a-capability"),
-            None,
-            "shop"
-        )
-        .is_none());
+        assert!(
+            call(
+                &[TargetSource::Capability],
+                "products",
+                None,
+                Some(cap.as_str()),
+                None,
+                "other"
+            )
+            .is_none()
+        );
+        assert!(
+            call(
+                &[TargetSource::Capability],
+                "reviews",
+                None,
+                Some(cap.as_str()),
+                None,
+                "shop"
+            )
+            .is_none()
+        );
+        assert!(
+            call(
+                &[TargetSource::Capability],
+                "products",
+                None,
+                Some("not-a-capability"),
+                None,
+                "shop"
+            )
+            .is_none()
+        );
 
         // Handle (G1-G4): a listed slug on a WORLD-PUBLIC subset resolves B, READ-ONLY (write empty).
         let r = call(
@@ -821,45 +828,53 @@ mod tests {
         );
 
         // G4: an UNLISTED slug does not resolve (indistinguishable from absent).
-        assert!(call(
-            &[TargetSource::Handle],
-            "products",
-            None,
-            None,
-            Some("ghost"),
-            "shop"
-        )
-        .is_none());
+        assert!(
+            call(
+                &[TargetSource::Handle],
+                "products",
+                None,
+                None,
+                Some("ghost"),
+                "shop"
+            )
+            .is_none()
+        );
         // G2/G3: a listed slug on a NON-world-public subset does not resolve.
-        assert!(call(
-            &[TargetSource::Handle],
-            "reviews",
-            None,
-            None,
-            Some("acme"),
-            "shop"
-        )
-        .is_none());
+        assert!(
+            call(
+                &[TargetSource::Handle],
+                "reviews",
+                None,
+                None,
+                Some("acme"),
+                "shop"
+            )
+            .is_none()
+        );
         // No slug named ⇒ no handle resolution.
-        assert!(call(
-            &[TargetSource::Handle],
-            "products",
-            None,
-            None,
-            None,
-            "shop"
-        )
-        .is_none());
+        assert!(
+            call(
+                &[TargetSource::Handle],
+                "products",
+                None,
+                None,
+                None,
+                "shop"
+            )
+            .is_none()
+        );
         // No via source at all ⇒ None (the route then fails closed).
-        assert!(call(
-            &[],
-            "products",
-            Some("acme-store"),
-            Some(cap.as_str()),
-            Some("acme"),
-            "shop"
-        )
-        .is_none());
+        assert!(
+            call(
+                &[],
+                "products",
+                Some("acme-store"),
+                Some(cap.as_str()),
+                Some("acme"),
+                "shop"
+            )
+            .is_none()
+        );
     }
 
     #[tokio::test]
@@ -880,19 +895,21 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(ht
-            .orm_scope(boatramp_handlers::TenantAxis::Read)
-            .unwrap()
-            .is_some());
+        assert!(
+            ht.orm_scope(boatramp_handlers::TenantAxis::Read)
+                .unwrap()
+                .is_some()
+        );
         // Ceiling open: `all` stands ⇒ no scope (unscoped, cross-tenant).
         let ht = resolve_host_tenancy(Some(&decision), true, posture(true, true), inputs)
             .await
             .unwrap()
             .unwrap();
-        assert!(ht
-            .orm_scope(boatramp_handlers::TenantAxis::Read)
-            .unwrap()
-            .is_none());
+        assert!(
+            ht.orm_scope(boatramp_handlers::TenantAxis::Read)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -1813,9 +1830,9 @@ mod tests {
     /// (static-musl libsql segfault); the `test-target-plain-wasm` CI job runs it + greps the marker.
     #[tokio::test]
     #[ignore = "run via the test-target-plain-wasm CI job on the host toolchain (static-musl libsql segfault)"]
-    async fn plain_wasm_target_attach_reference_derives_tenant_from_a_reachable_parent_on_a_real_engine(
-    ) {
-        use boatramp_core::orm::{compile_attach_reference, Assignment, AttachReference, Expr};
+    async fn plain_wasm_target_attach_reference_derives_tenant_from_a_reachable_parent_on_a_real_engine()
+     {
+        use boatramp_core::orm::{Assignment, AttachReference, Expr, compile_attach_reference};
         use boatramp_core::sql::{Dialect, SqlBackends, SqlValue};
         use boatramp_core::tenancy::{
             AccessMode, PublicCmp, PublicLiteral, PublicPredicate, PublicSubset, PublicTerm,
@@ -2206,7 +2223,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "run via the test-target-plain-wasm CI job on the host toolchain (static-musl libsql segfault)"]
     async fn plain_wasm_target_capability_context_roundtrips_sub_on_a_real_engine() {
-        use boatramp_core::cose::{mint_capability, LocalSigner, Signer, TokenAlg};
+        use boatramp_core::cose::{LocalSigner, Signer, TokenAlg, mint_capability};
         use boatramp_core::sql::{Dialect, SqlBackends, SqlValue};
         use boatramp_core::tenancy::{AccessMode, TableScope, TargetSource, TenancySchema};
         use boatramp_handlers::HostTenancy;

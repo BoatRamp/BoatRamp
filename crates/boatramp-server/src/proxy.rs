@@ -11,7 +11,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use axum::http;
-use boatramp_http::h1::{chunked, encode_request_head, BodyReader, Conn};
+use boatramp_http::h1::{BodyReader, Conn, chunked, encode_request_head};
 use bytes::Bytes;
 use futures::Stream;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -370,12 +370,11 @@ impl UpstreamClient {
             .and_then(|s| s.trim().parse::<u64>().ok());
         parts.headers.remove(header::CONTENT_LENGTH);
         parts.headers.remove(header::TRANSFER_ENCODING);
-        if !parts.headers.contains_key(header::HOST) {
-            if let Some(auth) = parts.uri.authority() {
-                if let Ok(v) = HeaderValue::from_str(auth.as_str()) {
-                    parts.headers.insert(header::HOST, v);
-                }
-            }
+        if !parts.headers.contains_key(header::HOST)
+            && let Some(auth) = parts.uri.authority()
+            && let Ok(v) = HeaderValue::from_str(auth.as_str())
+        {
+            parts.headers.insert(header::HOST, v);
         }
 
         // Decide request-body framing. A declared length forwards the stream fixed; no
@@ -594,10 +593,10 @@ impl Stream for ClientBody {
             Poll::Ready(Ok(Some(chunk))) => Poll::Ready(Some(Ok(chunk))),
             Poll::Ready(Ok(None)) => {
                 // Body fully drained — return the connection to the pool if reusable.
-                if let Some(conn) = this.conn.take() {
-                    if this.keep_alive {
-                        pool_return(&this.key, conn);
-                    }
+                if let Some(conn) = this.conn.take()
+                    && this.keep_alive
+                {
+                    pool_return(&this.key, conn);
                 }
                 Poll::Ready(None)
             }
@@ -746,10 +745,10 @@ pub(crate) async fn resolve_target(
     target: &str,
     posture: &boatramp_core::security::SecurityPosture,
 ) -> Result<ResolvedTarget, Response> {
-    if let Some(hit) = RESOLVED_TARGETS.lock().unwrap().get(target) {
-        if hit.resolved_at.elapsed() < RESOLVE_TTL {
-            return Ok(hit.clone());
-        }
+    if let Some(hit) = RESOLVED_TARGETS.lock().unwrap().get(target)
+        && hit.resolved_at.elapsed() < RESOLVE_TTL
+    {
+        return Ok(hit.clone());
     }
     let parsed = reqwest::Url::parse(target).map_err(|_| {
         tracing::warn!(target = %target, "gateway upstream target unparsable");
@@ -762,7 +761,7 @@ pub(crate) async fn resolve_target(
                 StatusCode::BAD_GATEWAY,
                 "gateway upstream scheme not http(s)\n",
             )
-                .into_response())
+                .into_response());
         }
     }
     let Some(host) = parsed.host_str().map(str::to_string) else {
@@ -1234,10 +1233,10 @@ async fn proxy_upstream(
     }
     // Host header: explicit override, else (no Host set) the upstream's own host,
     // which hyper fills from the URI authority.
-    if let Some(hh) = &upstream.host_header {
-        if let Ok(v) = HeaderValue::from_str(hh) {
-            out_headers.insert(header::HOST, v);
-        }
+    if let Some(hh) = &upstream.host_header
+        && let Ok(v) = HeaderValue::from_str(hh)
+    {
+        out_headers.insert(header::HOST, v);
     }
     // Request header set/overrides (skip any that are malformed rather than
     // failing the whole request).
@@ -1324,7 +1323,7 @@ async fn proxy_upstream_unix(
     let (mut sender, conn) = match hyper::client::conn::http1::handshake(io).await {
         Ok(pair) => pair,
         Err(_) => {
-            return (StatusCode::BAD_GATEWAY, "gateway unix handshake failed\n").into_response()
+            return (StatusCode::BAD_GATEWAY, "gateway unix handshake failed\n").into_response();
         }
     };
     // Drive the connection in the background for the lifetime of the exchange.
@@ -1481,7 +1480,7 @@ async fn proxy_upgrade(
                         StatusCode::BAD_GATEWAY,
                         "gateway unix upstream unreachable\n",
                     )
-                        .into_response()
+                        .into_response();
                 }
             };
             let host = upstream
@@ -1524,7 +1523,7 @@ async fn proxy_upgrade(
                 StatusCode::NOT_IMPLEMENTED,
                 "gateway upgrade supports http/ws, https/wss, or unix upstreams\n",
             )
-                .into_response()
+                .into_response();
         }
     };
     let Some(host) = parsed.host_str().map(str::to_string) else {
@@ -1561,7 +1560,7 @@ async fn proxy_upgrade(
     let stream = match tokio::net::TcpStream::connect(addr).await {
         Ok(s) => s,
         Err(_) => {
-            return (StatusCode::BAD_GATEWAY, "gateway upstream unreachable\n").into_response()
+            return (StatusCode::BAD_GATEWAY, "gateway upstream unreachable\n").into_response();
         }
     };
     let host_hdr = upstream.host_header.clone().unwrap_or_else(|| host.clone());
@@ -1576,13 +1575,13 @@ async fn proxy_upgrade(
                     StatusCode::BAD_GATEWAY,
                     "gateway upstream host invalid for TLS\n",
                 )
-                    .into_response()
+                    .into_response();
             }
         };
         let tls_stream = match tls_connector().connect(server_name, stream).await {
             Ok(s) => s,
             Err(_) => {
-                return (StatusCode::BAD_GATEWAY, "gateway TLS handshake failed\n").into_response()
+                return (StatusCode::BAD_GATEWAY, "gateway TLS handshake failed\n").into_response();
             }
         };
         return upgrade_over(

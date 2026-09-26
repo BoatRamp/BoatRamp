@@ -376,9 +376,9 @@ pub async fn build_compute(
     }
 
     let _ = (&storage, data_dir); // used only on Linux/macOS (container / VMM backends)
-                                  // The kernel-trust verifier is wired for the embedded VMM (x86_64 Linux) and
-                                  // the macOS VMM; silence `strict`/`daemon` on the platforms that wire neither
-                                  // (linux/aarch64, and any non-Linux non-macOS host).
+    // The kernel-trust verifier is wired for the embedded VMM (x86_64 Linux) and
+    // the macOS VMM; silence `strict`/`daemon` on the platforms that wire neither
+    // (linux/aarch64, and any non-Linux non-macOS host).
     #[cfg(not(any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos")))]
     let _ = (strict, &daemon);
 
@@ -724,7 +724,7 @@ impl boatramp_core::compute::ComputeControl for NodeComputeControl {
         match backend.stop(&target.handle).await {
             Ok(()) => {}
             Err(BackendError::Unsupported) => {
-                return Err(ControlError::Unsupported(target.backend.clone()))
+                return Err(ControlError::Unsupported(target.backend.clone()));
             }
             Err(e) => return Err(ControlError::Other(e.to_string())),
         }
@@ -1045,12 +1045,13 @@ mod tests {
             Err(VolumeError::InUse(n)) if n == "data"
         ));
         // The volume is still there (refusal didn't remove it).
-        assert!(vols
-            .list()
-            .await
-            .unwrap()
-            .iter()
-            .any(|v| v.info.name == "data"));
+        assert!(
+            vols.list()
+                .await
+                .unwrap()
+                .iter()
+                .any(|v| v.info.name == "data")
+        );
         // With force: removed.
         assert!(vols.remove("data", true).await.expect("forced remove"));
         assert!(vols.list().await.unwrap().is_empty());

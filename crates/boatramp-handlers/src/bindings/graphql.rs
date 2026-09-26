@@ -60,7 +60,7 @@ pub enum SupergraphRunError {
 #[async_trait::async_trait]
 pub trait SupergraphRunner: Send + Sync {
     async fn run(&self, request: GraphqlRequest, depth: u32)
-        -> Result<Vec<u8>, SupergraphRunError>;
+    -> Result<Vec<u8>, SupergraphRunError>;
 }
 
 /// The per-invocation `graphql` grant: the server-provided runner + this invocation's call

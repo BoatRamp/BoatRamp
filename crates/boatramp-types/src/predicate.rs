@@ -467,7 +467,7 @@ fn lex(src: &str) -> Result<Vec<Token>, ConfigError> {
             other => {
                 return Err(ConfigError::parse(format!(
                     "unexpected character {other:?} in routing `when`"
-                )))
+                )));
             }
         }
     }

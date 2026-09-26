@@ -306,7 +306,7 @@ impl wit::HostDatabase for OrmHost<'_> {
             _ => {
                 return Err(wit::Error::Syntax(
                     "attach_reference ref-value must be a literal".into(),
-                ))
+                ));
             }
         };
         let set = q
@@ -1106,9 +1106,10 @@ mod tests {
         }
         let log = log.lock().unwrap();
         // `all` injects no tenant predicate — the select is unscoped by design.
-        assert!(log
-            .iter()
-            .any(|l| l.starts_with("query|SELECT * FROM work_order|")));
+        assert!(
+            log.iter()
+                .any(|l| l.starts_with("query|SELECT * FROM work_order|"))
+        );
         assert!(!log.iter().any(|l| l.contains("tenant_id")));
     }
 
@@ -1246,9 +1247,10 @@ mod tests {
         assert!(log.iter().any(|l| l.starts_with(
             "query|SELECT id FROM work_order WHERE tenant_id = ?1 AND project_id = ?2 ORDER BY created_at DESC LIMIT 10|"
         ) && l.contains("ten_1")));
-        assert!(log.iter().any(|l| l
-            .starts_with("execute|INSERT INTO work_area (id, tenant_id) VALUES (?1, ?2)|")
-            && l.contains("ten_1")));
+        assert!(log.iter().any(|l| {
+            l.starts_with("execute|INSERT INTO work_area (id, tenant_id) VALUES (?1, ?2)|")
+                && l.contains("ten_1")
+        }));
         assert!(log.iter().any(|l| l.starts_with(
             "execute|UPDATE supplier_invoice SET payment_gate = ?1 WHERE tenant_id = ?2 AND id = ?3|"
         )));
@@ -1521,9 +1523,10 @@ mod tests {
         }
         sess.finalize(true).await;
         let log = log.lock().unwrap();
-        assert!(log
-            .iter()
-            .any(|l| l.starts_with("execute|DELETE FROM payment WHERE id = ?1|")));
+        assert!(
+            log.iter()
+                .any(|l| l.starts_with("execute|DELETE FROM payment WHERE id = ?1|"))
+        );
     }
 
     #[tokio::test]
@@ -1549,10 +1552,9 @@ mod tests {
         }
         sess.finalize(true).await;
         let log = log.lock().unwrap();
-        assert!(log
-            .iter()
-            .any(|l| l
-                .starts_with("query|DELETE FROM pending_signup WHERE slug = ?1 RETURNING slug|")));
+        assert!(log.iter().any(|l| {
+            l.starts_with("query|DELETE FROM pending_signup WHERE slug = ?1 RETURNING slug|")
+        }));
     }
 
     #[tokio::test]
@@ -1582,12 +1584,9 @@ mod tests {
             let _ = host.select(db, sel).await.unwrap();
         }
         sess.finalize(true).await;
-        assert!(log
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|l| l
-                .starts_with("query|SELECT (CASE WHEN state = ?1 THEN ?2 ELSE ?3 END) FROM t|")));
+        assert!(log.lock().unwrap().iter().any(|l| {
+            l.starts_with("query|SELECT (CASE WHEN state = ?1 THEN ?2 ELSE ?3 END) FROM t|")
+        }));
     }
 
     #[tokio::test]
@@ -1676,13 +1675,9 @@ mod tests {
             assert_eq!(host.insert(db, ins).await.unwrap(), 1);
         }
         sess.finalize(true).await;
-        assert!(
-            log.lock()
-                .unwrap()
-                .iter()
-                .any(|l| l
-                    .starts_with("execute|INSERT INTO ref (a) SELECT x FROM src WHERE id = ?1|"))
-        );
+        assert!(log.lock().unwrap().iter().any(|l| {
+            l.starts_with("execute|INSERT INTO ref (a) SELECT x FROM src WHERE id = ?1|")
+        }));
     }
 
     #[tokio::test]

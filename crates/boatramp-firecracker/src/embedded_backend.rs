@@ -31,13 +31,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use boatramp_core::Storage;
 use boatramp_core::compute::{
-    compute_instance_id, Artifact, BackendError, Capabilities, ComputeBackend, ComputeSpec,
-    Endpoint, Health, Instance, InstanceHandle, IsolationClass, LaunchRequest, RootSource, Scheme,
-    Snapshot, VolumeRef,
+    Artifact, BackendError, Capabilities, ComputeBackend, ComputeSpec, Endpoint, Health, Instance,
+    InstanceHandle, IsolationClass, LaunchRequest, RootSource, Scheme, Snapshot, VolumeRef,
+    compute_instance_id,
 };
 use boatramp_core::ipam::{IpAuthority, IpPool};
-use boatramp_core::Storage;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
@@ -48,7 +48,7 @@ use crate::embedded::mmio_cmdline_arg;
 use crate::embedded_vmm::EmbeddedVmm;
 use crate::net::{HostCommand, TapNetwork};
 use crate::tap::Tap;
-use crate::virtio_block::{VirtioBlock, SECTOR_SIZE};
+use crate::virtio_block::{SECTOR_SIZE, VirtioBlock};
 use crate::virtio_net::VirtioNet;
 
 /// The re-exec subcommand the backend invokes for each VM: `<self_exe> __vmm-run
@@ -695,7 +695,7 @@ impl ComputeBackend for EmbeddedVmmBackend {
             RootSource::Image(_) | RootSource::Tar(_) => {
                 return Err(BackendError::Materialize(
                     "embedded VMM requires a rootfs image (RootSource::Rootfs)".into(),
-                ))
+                ));
             }
         };
         let rootfs_path = self.stage_blob(rootfs_hash, "rootfs", ".ext4").await?;
@@ -726,7 +726,7 @@ impl ComputeBackend for EmbeddedVmmBackend {
             _ => {
                 return Err(BackendError::Launch(
                     "embedded VMM backend requires a VmImages artifact".into(),
-                ))
+                ));
             }
         };
 

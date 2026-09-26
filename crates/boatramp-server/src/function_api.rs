@@ -148,10 +148,10 @@ fn component_declares_subgraph(component: &[u8]) -> bool {
     let mut declared = false;
     scan_manifest_sections(component, &mut |data| {
         for line in data.split(|&b| b == b'\n') {
-            if let Ok(v) = serde_json::from_slice::<serde_json::Value>(line) {
-                if v.get("subgraph").and_then(serde_json::Value::as_bool) == Some(true) {
-                    declared = true;
-                }
+            if let Ok(v) = serde_json::from_slice::<serde_json::Value>(line)
+                && v.get("subgraph").and_then(serde_json::Value::as_bool) == Some(true)
+            {
+                declared = true;
             }
         }
     });
@@ -324,10 +324,10 @@ pub fn component_requires(component: &[u8]) -> Vec<String> {
     let mut reqs = Vec::new();
     scan_manifest_sections(component, &mut |data| {
         for line in data.split(|&b| b == b'\n') {
-            if let Ok(v) = serde_json::from_slice::<serde_json::Value>(line) {
-                if let Some(arr) = v.get("requires").and_then(serde_json::Value::as_array) {
-                    reqs.extend(arr.iter().filter_map(|r| r.as_str().map(str::to_string)));
-                }
+            if let Ok(v) = serde_json::from_slice::<serde_json::Value>(line)
+                && let Some(arr) = v.get("requires").and_then(serde_json::Value::as_array)
+            {
+                reqs.extend(arr.iter().filter_map(|r| r.as_str().map(str::to_string)));
             }
         }
     });
@@ -405,13 +405,13 @@ async fn maybe_register_subgraph(
                     "subgraph `{name}` does not answer `{{ _service {{ sdl }} }}`; deploy with \
                      `?register_subgraph=false` to skip subgraph registration\n"
                 ),
-            ))
+            ));
         }
         Err(crate::function_runtime::SubgraphSdlError::InvokeFailed(msg)) => {
             return Err((
                 StatusCode::BAD_GATEWAY,
                 format!("could not introspect subgraph `{name}`: {msg}\n"),
-            ))
+            ));
         }
     };
     // #3: with `?compose=defer`, stage the SDL for a batched compose instead of recomposing now.
@@ -513,7 +513,7 @@ pub(super) async fn deploy_function(
                 StatusCode::BAD_REQUEST,
                 format!("component blob {} not uploaded\n", body.component),
             )
-                .into_response()
+                .into_response();
         }
         Err(err) => return deploy_error_response(err),
     }

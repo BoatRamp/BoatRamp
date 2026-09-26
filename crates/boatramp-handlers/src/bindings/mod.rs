@@ -13,12 +13,12 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use boatramp_core::Storage;
 use boatramp_core::kv::KvStore;
 #[cfg(feature = "messaging")]
 use boatramp_core::messaging::Messaging;
 #[cfg(feature = "sql")]
 use boatramp_core::sql::SqlBackend;
-use boatramp_core::Storage;
 
 #[cfg(feature = "admin")]
 pub mod admin;

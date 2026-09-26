@@ -19,16 +19,16 @@ pub(super) fn negotiate_encoding<'a>(
         .get(header::ACCEPT_ENCODING)
         .and_then(|value| value.to_str().ok())?;
     for enc in ["br", "gzip"] {
-        if accepts_encoding(accept, enc) {
-            if let Some(variant) = entry.variants.get(enc) {
-                // Only serve a variant that is actually smaller than identity.
-                // A variant ≥ identity gains nothing and is a decompression-bomb
-                // smell; fall back to identity. boatramp itself
-                // never decompresses (it streams the precompressed bytes and the
-                // client decodes), so this is the whole server-side surface.
-                if variant.size < entry.size {
-                    return Some((enc, variant));
-                }
+        if accepts_encoding(accept, enc)
+            && let Some(variant) = entry.variants.get(enc)
+        {
+            // Only serve a variant that is actually smaller than identity.
+            // A variant ≥ identity gains nothing and is a decompression-bomb
+            // smell; fall back to identity. boatramp itself
+            // never decompresses (it streams the precompressed bytes and the
+            // client decodes), so this is the whole server-side surface.
+            if variant.size < entry.size {
+                return Some((enc, variant));
             }
         }
     }
@@ -85,10 +85,9 @@ pub(super) fn maybe_compress(
         .get(header::CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<u64>().ok())
+        && len < min_size
     {
-        if len < min_size {
-            return response;
-        }
+        return response;
     }
     let accept = accept_encoding.unwrap_or("");
     // Prefer gzip for on-the-fly (fast); fall back to brotli.

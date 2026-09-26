@@ -357,12 +357,12 @@ async fn resolve_signer(
 ) -> Result<std::sync::Arc<dyn boatramp_core::cose::Signer>> {
     use boatramp_core::cose::{LocalSigner, Signer};
     use std::sync::Arc;
-    if let Ok(hex) = std::env::var("BOATRAMP_AUTH_ROOT_PRIVATE_KEY") {
-        if !hex.is_empty() {
-            let signer =
-                LocalSigner::from_private_hex(&hex).map_err(|e| Error::Signer(e.to_string()))?;
-            return Ok(Arc::new(signer) as Arc<dyn Signer>);
-        }
+    if let Ok(hex) = std::env::var("BOATRAMP_AUTH_ROOT_PRIVATE_KEY")
+        && !hex.is_empty()
+    {
+        let signer =
+            LocalSigner::from_private_hex(&hex).map_err(|e| Error::Signer(e.to_string()))?;
+        return Ok(Arc::new(signer) as Arc<dyn Signer>);
     }
     let serve = crate::config::ServerConfig::load(config_path)
         .map_err(|e| Error::Signer(e.to_string()))?

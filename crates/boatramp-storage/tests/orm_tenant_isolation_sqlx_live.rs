@@ -21,7 +21,7 @@ use boatramp_core::sql::{Dialect, SqlBackend, SqlValue};
 use std::sync::Arc;
 
 #[allow(unused_imports)]
-use boatramp_storage::sql_sqlx::{connect, ExternalSqlKind, ExternalSqlOptions};
+use boatramp_storage::sql_sqlx::{ExternalSqlKind, ExternalSqlOptions, connect};
 
 fn t(s: &str) -> SqlValue {
     SqlValue::Text(s.into())

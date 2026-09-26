@@ -14,8 +14,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use boatramp_core::compute::{Artifact, ComputeBackend, ComputeSpec, LaunchRequest};
 use boatramp_core::{GetObject, ObjectMeta, PutMeta, Storage, StorageError};
-use boatramp_firecracker::embedded_backend::EmbeddedVmmBackend;
 use boatramp_firecracker::HashOnlyVerifier;
+use boatramp_firecracker::embedded_backend::EmbeddedVmmBackend;
 
 /// A blob backend that's never used — `launch` is fed a `VmImages` artifact made
 /// from local file paths, so `materialize`/`Storage::get` are bypassed.

@@ -736,7 +736,7 @@ mod secrets_api_tests {
     //! `default` and the request flows straight through.
     use std::sync::Arc;
 
-    use axum::body::{to_bytes, Body};
+    use axum::body::{Body, to_bytes};
     use axum::http::{Method, Request, StatusCode};
     use boatramp_core::deploy::DeployStore;
     use boatramp_core::kv::MemoryKv;

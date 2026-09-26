@@ -454,10 +454,9 @@ impl EmailProfileStore {
                 .get(&key)
                 .await
                 .map_err(|e| EmailProfileError::Backend(e.to_string()))?
+                && let Ok(record) = serde_json::from_slice::<EmailRecord>(&bytes)
             {
-                if let Ok(record) = serde_json::from_slice::<EmailRecord>(&bytes) {
-                    out.push(record.info(&name));
-                }
+                out.push(record.info(&name));
             }
         }
         out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -487,12 +486,10 @@ impl EmailProfileStore {
                 .get(&key)
                 .await
                 .map_err(|e| EmailProfileError::Backend(e.to_string()))?
+                && let Ok(record) = serde_json::from_slice::<EmailRecord>(&bytes)
+                && let Ok(profile) = self.unseal(record).await
             {
-                if let Ok(record) = serde_json::from_slice::<EmailRecord>(&bytes) {
-                    if let Ok(profile) = self.unseal(record).await {
-                        out.insert(name, profile);
-                    }
-                }
+                out.insert(name, profile);
             }
         }
         Ok(out)
@@ -639,7 +636,7 @@ fn validate_fields(
         _ => {
             return Err(EmailProfileError::InvalidConfig(
                 "from must be a valid email address (local@domain)".into(),
-            ))
+            ));
         }
     }
     if let Some(u) = username {
@@ -829,8 +826,8 @@ mod tests {
         let s = store();
         let p = ProjectRef::new("acme");
         // A create-patch missing `from` is refused (composite validation).
-        assert!(s
-            .patch(
+        assert!(
+            s.patch(
                 p,
                 "new",
                 &EmailProfilePatch {
@@ -839,7 +836,8 @@ mod tests {
                 },
             )
             .await
-            .is_err());
+            .is_err()
+        );
         // With host + from it creates, defaulting the port from the (default starttls) security.
         let info = s
             .patch(
@@ -865,17 +863,19 @@ mod tests {
         s.set(ProjectRef::new("acme"), "default", &profile())
             .await
             .unwrap();
-        assert!(s
-            .get(ProjectRef::new("globex"), "default")
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            s.get(ProjectRef::new("globex"), "default")
+                .await
+                .unwrap()
+                .is_none()
+        );
         assert!(s.list(ProjectRef::new("globex")).await.unwrap().is_empty());
-        assert!(s
-            .resolve_all(ProjectRef::new("globex"))
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            s.resolve_all(ProjectRef::new("globex"))
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]

@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 use lru::LruCache;
 
 use crate::graphql_federation::{CompositionError, Supergraph};
-use crate::graphql_plan::{plan, PlanError, QueryPlan};
+use crate::graphql_plan::{PlanError, QueryPlan, plan};
 use boatramp_core::config::HandlerGraphqlDataConfig;
 use boatramp_core::kv::KvStore;
 

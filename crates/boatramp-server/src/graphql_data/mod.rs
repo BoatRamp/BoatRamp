@@ -89,12 +89,12 @@ async fn token_claims(
     env_source: &dyn boatramp_core::env::EnvSource,
 ) -> BTreeMap<String, SqlValue> {
     let mut out = BTreeMap::new();
-    if let (Some(token_cfg), Some(bearer)) = (&cfg.claims_from_token, bearer) {
-        if let Some(claims) = token::verified_claims(token_cfg, bearer, env_source).await {
-            for (name, value) in &claims {
-                if let Some(sql) = scalar_claim(value) {
-                    out.insert(name.clone(), sql);
-                }
+    if let (Some(token_cfg), Some(bearer)) = (&cfg.claims_from_token, bearer)
+        && let Some(claims) = token::verified_claims(token_cfg, bearer, env_source).await
+    {
+        for (name, value) in &claims {
+            if let Some(sql) = scalar_claim(value) {
+                out.insert(name.clone(), sql);
             }
         }
     }

@@ -244,7 +244,7 @@ async fn add_via_provider(
     use boatramp_acme::{DnsRecord, RecordKind};
     use clap::ValueEnum;
 
-    use crate::acme_dns::{build_provider, DnsProviderKind};
+    use crate::acme_dns::{DnsProviderKind, build_provider};
 
     let provider_name = provider
         .ok_or_else(|| Error::Verify("missing `--provider <name>` (e.g. cloudflare)".into()))?;

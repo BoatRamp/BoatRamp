@@ -52,13 +52,13 @@ use boatramp_core::compute::{Endpoint, InstanceHandle, ObservedInstance, Replica
 use boatramp_core::deploy::DeployStore;
 use boatramp_core::envelope::{EnvelopeError, KeyEnvelope};
 use boatramp_core::kv::{KvStore, MemoryKv};
-use boatramp_core::project::{ProjectRef, DEFAULT_PROJECT};
+use boatramp_core::project::{DEFAULT_PROJECT, ProjectRef};
 use boatramp_core::sql::{RepairMode, RepairStatus, SqlBackend, SqlValue, TenantRepair};
 use boatramp_node::config::{ExternalDatabaseConfig, TenantIsolation, TenantScope};
 use boatramp_node::managed_sql::ManagedSqlCredentials;
 use boatramp_node::repair::NodeTenantRepair;
 use boatramp_node::tenant_sql::provision_tenant;
-use boatramp_storage::sql_sqlx::{connect, ExternalSqlKind, ExternalSqlOptions};
+use boatramp_storage::sql_sqlx::{ExternalSqlKind, ExternalSqlOptions, connect};
 use boatramp_storage::tenant_provision::{
     quote_ident, sanitize_ident, tenant_db_name, tenant_owner_role_name, tenant_role_name,
 };
@@ -648,7 +648,9 @@ async fn provision_repair_reconciles_pre_v0425_shared_postgres_tenant() {
         .expect("owner attrs");
     let row = attrs.rows.first().expect("owner role row present");
     assert!(
-        row.iter().take(5).all(|v| matches!(v, SqlValue::Boolean(false))),
+        row.iter()
+            .take(5)
+            .all(|v| matches!(v, SqlValue::Boolean(false))),
         "owner role must be NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS NOREPLICATION, got {row:?}"
     );
 

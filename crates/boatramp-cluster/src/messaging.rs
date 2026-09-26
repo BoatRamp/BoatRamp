@@ -34,8 +34,8 @@ use boatramp_core::messaging::{
     StreamHubs,
 };
 use boatramp_core::{PutMeta, Storage};
-use futures::stream::BoxStream;
 use futures::StreamExt;
+use futures::stream::BoxStream;
 
 use crate::raft::{AppliedState, Forwarder, NodeId, WriteOp, WriteResponse};
 
@@ -243,10 +243,10 @@ impl RaftMessaging {
                 return Err(MessagingError::DepthExceeded(topic.to_string()));
             }
         }
-        if let Some(rate) = policy.max_rate_per_sec {
-            if !self.try_take_tokens(topic, rate, n) {
-                return Err(MessagingError::RateExceeded(topic.to_string()));
-            }
+        if let Some(rate) = policy.max_rate_per_sec
+            && !self.try_take_tokens(topic, rate, n)
+        {
+            return Err(MessagingError::RateExceeded(topic.to_string()));
         }
         Ok(())
     }
@@ -293,7 +293,7 @@ impl RaftMessaging {
     /// failed proposal fails every member. Same self-bounded, no-spawn pattern as
     /// `LogMessaging::group_commit`.
     async fn group_commit(&self, ops: Vec<WriteOp>) -> Result<(), MessagingError> {
-        use futures::future::{select, Either};
+        use futures::future::{Either, select};
         let (done_tx, mut done_rx) = futures::channel::oneshot::channel();
         self.commit_queue
             .lock()
@@ -312,7 +312,7 @@ impl RaftMessaging {
             Either::Right((res, _gate)) => {
                 return res.map_err(|_| {
                     MessagingError::Backend("group-commit dropped before durable".into())
-                })?
+                })?;
             }
             // We hold the gate: drain + propose in a loop until the queue is empty, so a job pushed
             // during our propose (even after a prior empty check) is never stranded.
@@ -955,12 +955,11 @@ impl Messaging for RaftMessaging {
             if !messaging::is_direct_child(&key, &prefix) {
                 continue;
             }
-            if let Some(raw) = self.state.get(&key).await {
-                if let Ok(rec) = serde_json::from_slice::<messaging::Record>(&raw) {
-                    if rec.lease_until_ms > now {
-                        count += 1;
-                    }
-                }
+            if let Some(raw) = self.state.get(&key).await
+                && let Ok(rec) = serde_json::from_slice::<messaging::Record>(&raw)
+                && rec.lease_until_ms > now
+            {
+                count += 1;
             }
         }
         // Grouped: every registered group's currently-leased in-flight entries.
@@ -969,14 +968,14 @@ impl Messaging for RaftMessaging {
             if !messaging::is_direct_child(&key, &gprefix) {
                 continue;
             }
-            if let Some(raw) = self.state.get(&key).await {
-                if let Ok(state) = serde_json::from_slice::<messaging::GroupState>(&raw) {
-                    count += state
-                        .in_flight
-                        .iter()
-                        .filter(|f| f.lease_until_ms > now)
-                        .count();
-                }
+            if let Some(raw) = self.state.get(&key).await
+                && let Ok(state) = serde_json::from_slice::<messaging::GroupState>(&raw)
+            {
+                count += state
+                    .in_flight
+                    .iter()
+                    .filter(|f| f.lease_until_ms > now)
+                    .count();
             }
         }
         Ok(count)
@@ -1372,10 +1371,10 @@ impl Messaging for RaftMessaging {
         let mut out = Vec::new();
         for id in ids {
             // `after` is exclusive — skip everything at or before the caller's last-seen offset.
-            if let Some(after) = after {
-                if id.as_str() <= after {
-                    continue;
-                }
+            if let Some(after) = after
+                && id.as_str() <= after
+            {
+                continue;
             }
             if out.len() >= limit {
                 break;
@@ -1539,10 +1538,10 @@ impl Messaging for RaftMessaging {
             if !messaging::is_direct_child(&key, &state_prefix) {
                 continue;
             }
-            if let Some(raw) = self.state.get(&key).await {
-                if let Ok(state) = serde_json::from_slice::<messaging::GroupState>(&raw) {
-                    states.push(state);
-                }
+            if let Some(raw) = self.state.get(&key).await
+                && let Ok(state) = serde_json::from_slice::<messaging::GroupState>(&raw)
+            {
+                states.push(state);
             }
         }
         // Dead-lettered ids (any group) pin their retained log+payload against reclaim.
@@ -1632,10 +1631,10 @@ impl Messaging for RaftMessaging {
         let mut with_work: std::collections::HashSet<String> = std::collections::HashSet::new();
         // 1) Work-queue backlog: any live `mq/{topic}/{id}`.
         for key in self.state.list_prefix("mq/").await {
-            if let Some(rest) = key.strip_prefix("mq/") {
-                if let Some(slash) = rest.rfind('/') {
-                    with_work.insert(rest[..slash].to_string());
-                }
+            if let Some(rest) = key.strip_prefix("mq/")
+                && let Some(slash) = rest.rfind('/')
+            {
+                with_work.insert(rest[..slash].to_string());
             }
         }
         // 2) Grouped backlog/in-flight: a registered group behind the retained log or holding work.
@@ -1719,10 +1718,10 @@ impl Messaging for RaftMessaging {
                 continue;
             };
             let topic = rest[..slash].to_string();
-            if let Some(raw) = self.state.get(&key).await {
-                if let Ok(rec) = serde_json::from_slice::<messaging::Record>(&raw) {
-                    note(&topic, rec.lease_until_ms);
-                }
+            if let Some(raw) = self.state.get(&key).await
+                && let Ok(rec) = serde_json::from_slice::<messaging::Record>(&raw)
+            {
+                note(&topic, rec.lease_until_ms);
             }
         }
         for key in self.state.list_prefix("mqgstate/").await {
@@ -1733,11 +1732,11 @@ impl Messaging for RaftMessaging {
                 continue;
             };
             let topic = rest[..slash].to_string();
-            if let Some(raw) = self.state.get(&key).await {
-                if let Ok(state) = serde_json::from_slice::<messaging::GroupState>(&raw) {
-                    for f in &state.in_flight {
-                        note(&topic, f.lease_until_ms);
-                    }
+            if let Some(raw) = self.state.get(&key).await
+                && let Ok(state) = serde_json::from_slice::<messaging::GroupState>(&raw)
+            {
+                for f in &state.in_flight {
+                    note(&topic, f.lease_until_ms);
                 }
             }
         }
@@ -2083,11 +2082,13 @@ mod tests {
         mqs[&3].ack(&m).await.unwrap();
 
         // Gone everywhere, even after the lease would lapse.
-        assert!(mqs[&1]
-            .claim("t", Duration::ZERO, 10, 5)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            mqs[&1]
+                .claim("t", Duration::ZERO, 10, 5)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(mqs[&1].backlog("t").await.unwrap(), 0);
 
         shutdown(rafts).await;
@@ -2490,7 +2491,7 @@ mod tests {
     async fn gate_async_shard_multinode_node_loss_no_double_execution_no_stranding() {
         use boatramp_core::deploy::DeployStore;
         use boatramp_core::function::{Invocation, InvocationStatus, InvokeMode};
-        use boatramp_core::project::{ProjectRef, DEFAULT_PROJECT};
+        use boatramp_core::project::{DEFAULT_PROJECT, ProjectRef};
         use boatramp_core::time::now_unix;
 
         let (mut rafts, kvs, mqs) = cluster_kv_mq(3).await;
@@ -2555,7 +2556,7 @@ mod tests {
             executed: Arc<StdMutex<Vec<(String, String)>>>,
         ) {
             use boatramp_core::function::InvocationStatus;
-            use boatramp_core::project::{ProjectRef, DEFAULT_PROJECT};
+            use boatramp_core::project::{DEFAULT_PROJECT, ProjectRef};
             use boatramp_core::time::now_unix;
 
             for i in 0..N {
@@ -2865,11 +2866,12 @@ mod tests {
             assert_eq!(m.len(), 1, "attempt {expected}");
             assert_eq!(m[0].attempts, expected);
         }
-        assert!(mq
-            .claim(topic, Duration::ZERO, 10, 2)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            mq.claim(topic, Duration::ZERO, 10, 2)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(mq.dead_letter_count(topic).await.unwrap(), 1);
         assert_eq!(mq.backlog(topic).await.unwrap(), 0);
 
@@ -2891,11 +2893,12 @@ mod tests {
         for _ in 1..=2 {
             let _ = mq.claim(topic, Duration::ZERO, 10, 2).await.unwrap();
         }
-        assert!(mq
-            .claim(topic, Duration::ZERO, 10, 2)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            mq.claim(topic, Duration::ZERO, 10, 2)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(mq.dead_letter_count(topic).await.unwrap(), 1);
         assert_eq!(mq.purge_dead_letters(topic).await.unwrap(), 1);
         assert_eq!(mq.dead_letter_count(topic).await.unwrap(), 0);
@@ -2949,11 +2952,12 @@ mod tests {
             .unwrap()
             .clone();
         mq.set_last_error(&px, "guest-trap: boom").await.unwrap();
-        assert!(mq
-            .claim(topic, Duration::ZERO, 10, 1)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            mq.claim(topic, Duration::ZERO, 10, 1)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(mq.dead_letter_count(topic).await.unwrap(), 2);
         // list + --match finds only the annotated one; show returns its body + reason.
         let matched = mq
@@ -3260,11 +3264,12 @@ mod tests {
         // --- fan-out + independent ack/nack + start position -------------------
         let t = base;
         for g in ["billing", "audit"] {
-            assert!(mq
-                .claim_grouped(t, g, StartPosition::Latest, LEASE, 10, 5)
-                .await
-                .unwrap()
-                .is_empty());
+            assert!(
+                mq.claim_grouped(t, g, StartPosition::Latest, LEASE, 10, 5)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
         }
         mq.publish(t, b"a").await.unwrap();
         mq.publish(t, b"b").await.unwrap();
@@ -3283,21 +3288,23 @@ mod tests {
         assert_eq!(payloads(&audit), vec![b"a".to_vec(), b"b".to_vec()]);
 
         // Leased: a re-claim sees nothing until ack/nack/expiry.
-        assert!(mq
-            .claim_grouped(t, "billing", StartPosition::Latest, LEASE, 10, 5)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            mq.claim_grouped(t, "billing", StartPosition::Latest, LEASE, 10, 5)
+                .await
+                .unwrap()
+                .is_empty()
+        );
 
         // billing acks both → billing drains; audit is untouched.
         for m in &billing {
             mq.ack(m).await.unwrap();
         }
-        assert!(mq
-            .claim_grouped(t, "billing", StartPosition::Latest, LEASE, 10, 5)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            mq.claim_grouped(t, "billing", StartPosition::Latest, LEASE, 10, 5)
+                .await
+                .unwrap()
+                .is_empty()
+        );
 
         // audit nacks both → redelivered with the attempt re-charged.
         for m in &audit {
@@ -3323,11 +3330,12 @@ mod tests {
         for m in &replay {
             mq.ack(m).await.unwrap();
         }
-        assert!(mq
-            .claim_grouped(t, "live", StartPosition::Latest, LEASE, 10, 5)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            mq.claim_grouped(t, "live", StartPosition::Latest, LEASE, 10, 5)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         mq.publish(t, b"c").await.unwrap();
         let live = mq
             .claim_grouped(t, "live", StartPosition::Latest, LEASE, 10, 5)
@@ -3340,11 +3348,12 @@ mod tests {
 
         // --- grouped dead-letter (own topic, single group) ---------------------
         let dl = format!("{base}-dl");
-        assert!(mq
-            .claim_grouped(&dl, "g", StartPosition::Earliest, Duration::ZERO, 10, 2)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            mq.claim_grouped(&dl, "g", StartPosition::Earliest, Duration::ZERO, 10, 2)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         mq.publish(&dl, b"z").await.unwrap();
         for expected in 1..=2 {
             let m = mq
@@ -3355,16 +3364,18 @@ mod tests {
             assert_eq!(m[0].attempts, expected);
         }
         // Third claim exhausts attempts → dead-letter, deliver nothing, stay empty.
-        assert!(mq
-            .claim_grouped(&dl, "g", StartPosition::Earliest, Duration::ZERO, 10, 2)
-            .await
-            .unwrap()
-            .is_empty());
-        assert!(mq
-            .claim_grouped(&dl, "g", StartPosition::Earliest, Duration::ZERO, 10, 2)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            mq.claim_grouped(&dl, "g", StartPosition::Earliest, Duration::ZERO, 10, 2)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            mq.claim_grouped(&dl, "g", StartPosition::Earliest, Duration::ZERO, 10, 2)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         // The grouped dead-letter is VISIBLE, REDRIVABLE, and PURGEABLE — identically in single-node
         // and cluster (this conformance runs in both). Before the fix a fan-out dead-letter lived in
         // `mqgd/…` while the operator ops saw only `mqdead/…`, so `dead_letters` reported 0.
@@ -3398,11 +3409,12 @@ mod tests {
                 .len(),
             1
         );
-        assert!(mq
-            .claim_grouped(&dl, "g", StartPosition::Earliest, Duration::ZERO, 10, 2)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            mq.claim_grouped(&dl, "g", StartPosition::Earliest, Duration::ZERO, 10, 2)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(mq.dead_letter_count(&dl).await.unwrap(), 1);
         assert_eq!(
             mq.purge_dead_letters(&dl).await.unwrap(),
@@ -3414,11 +3426,12 @@ mod tests {
         // --- retention sweep reclaims only fully-consumed messages -------------
         let gc = format!("{base}-gc");
         for g in ["one", "two"] {
-            assert!(mq
-                .claim_grouped(&gc, g, StartPosition::Earliest, LEASE, 10, 5)
-                .await
-                .unwrap()
-                .is_empty());
+            assert!(
+                mq.claim_grouped(&gc, g, StartPosition::Earliest, LEASE, 10, 5)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
         }
         mq.publish(&gc, b"a").await.unwrap();
         mq.publish(&gc, b"b").await.unwrap();
@@ -3459,20 +3472,22 @@ mod tests {
             "sweep is idempotent"
         );
         // A caught-up group still returns empty (state intact, log reclaimed).
-        assert!(mq
-            .claim_grouped(&gc, "one", StartPosition::Earliest, LEASE, 10, 5)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            mq.claim_grouped(&gc, "one", StartPosition::Earliest, LEASE, 10, 5)
+                .await
+                .unwrap()
+                .is_empty()
+        );
 
         // --- P2 group lifecycle: list / reset / delete (both backends) ------------------
         let lc = format!("{base}/lifecycle");
         for g in ["alpha", "beta"] {
-            assert!(mq
-                .claim_grouped(&lc, g, StartPosition::Earliest, LEASE, 10, 5)
-                .await
-                .unwrap()
-                .is_empty());
+            assert!(
+                mq.claim_grouped(&lc, g, StartPosition::Earliest, LEASE, 10, 5)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
         }
         mq.publish(&lc, b"L1").await.unwrap();
         mq.publish(&lc, b"L2").await.unwrap();
@@ -3503,10 +3518,11 @@ mod tests {
             .unwrap();
         assert_eq!(re.len(), 2, "reset re-consumes the whole backlog");
         // reset of a non-existent group fails closed.
-        assert!(mq
-            .reset_group(&lc, "ghost", StartPosition::Latest)
-            .await
-            .is_err());
+        assert!(
+            mq.reset_group(&lc, "ghost", StartPosition::Latest)
+                .await
+                .is_err()
+        );
         // delete beta → gone from the listing; alpha remains.
         mq.delete_group(&lc, "beta").await.unwrap();
         let after = mq.list_groups(&lc).await.unwrap();
@@ -3532,11 +3548,12 @@ mod tests {
         // --- P2 durable replay: read retained grouped history from an offset, non-destructively -----
         let rp = format!("{base}/replay");
         // Register a group so the topic retains its fan-out log, then publish a backlog.
-        assert!(mq
-            .claim_grouped(&rp, "reader", StartPosition::Latest, LEASE, 10, 5)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            mq.claim_grouped(&rp, "reader", StartPosition::Latest, LEASE, 10, 5)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         mq.publish(&rp, b"R1").await.unwrap();
         mq.publish(&rp, b"R2").await.unwrap();
         mq.publish(&rp, b"R3").await.unwrap();
@@ -3691,11 +3708,12 @@ mod tests {
             let m = mq.claim("t", Duration::ZERO, 10, 2).await.unwrap();
             assert_eq!(m.len(), 1, "attempt {expected}");
         }
-        assert!(mq
-            .claim("t", Duration::ZERO, 10, 2)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            mq.claim("t", Duration::ZERO, 10, 2)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(mq.dead_letter_count("t").await.unwrap(), 1);
         assert_eq!(
             mq.inline_inflight_bytes.load(Relaxed),
@@ -3726,11 +3744,13 @@ mod tests {
         let t = "bus/work";
 
         // Register the group (earliest, retention on) before publishing.
-        assert!(mqs[&1]
-            .claim_grouped(t, "g", StartPosition::Earliest, LEASE, 4, 5)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            mqs[&1]
+                .claim_grouped(t, "g", StartPosition::Earliest, LEASE, 4, 5)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         const N: usize = 30;
         for i in 0..N {
             let node = (i as u64 % 3) + 1;

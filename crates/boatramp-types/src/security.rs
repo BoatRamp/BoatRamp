@@ -823,10 +823,12 @@ mod tests {
 
         // A tighter project override (disable minting the base had enabled) also holds.
         let looser = SecurityProfile::SingleTenant.preset();
-        assert!(looser
-            .base_project_tenancy()
-            .capability_max_ttl_secs
-            .is_some());
+        assert!(
+            looser
+                .base_project_tenancy()
+                .capability_max_ttl_secs
+                .is_some()
+        );
         let tighten = ProjectPostureOverride {
             allow_guest_mint_capability: Some(false),
             ..Default::default()
@@ -873,13 +875,14 @@ mod tests {
         };
         let p = cfg.resolve().unwrap();
         assert!(p.allow_env_secret_refs);
-        assert!(cfg
-            .explain()
-            .unwrap()
-            .lines()
-            .any(|l| l.contains("allow_env_secret_refs")
-                && l.contains("true")
-                && l.contains("override")));
+        assert!(
+            cfg.explain()
+                .unwrap()
+                .lines()
+                .any(|l| l.contains("allow_env_secret_refs")
+                    && l.contains("true")
+                    && l.contains("override"))
+        );
     }
 
     #[test]
@@ -898,13 +901,14 @@ mod tests {
             ..Default::default()
         };
         assert!(cfg.resolve().unwrap().allow_guest_email);
-        assert!(cfg
-            .explain()
-            .unwrap()
-            .lines()
-            .any(|l| l.contains("allow_guest_email")
-                && l.contains("true")
-                && l.contains("override")));
+        assert!(
+            cfg.explain()
+                .unwrap()
+                .lines()
+                .any(|l| l.contains("allow_guest_email")
+                    && l.contains("true")
+                    && l.contains("override"))
+        );
     }
 
     #[test]
@@ -936,13 +940,14 @@ mod tests {
         let p = cfg.resolve().unwrap();
         assert!(p.allow_guest_admin_domains);
         assert!(!p.allow_guest_admin_secrets, "other surfaces stay off");
-        assert!(cfg
-            .explain()
-            .unwrap()
-            .lines()
-            .any(|l| l.contains("allow_guest_admin_domains")
-                && l.contains("true")
-                && l.contains("override")));
+        assert!(
+            cfg.explain()
+                .unwrap()
+                .lines()
+                .any(|l| l.contains("allow_guest_admin_domains")
+                    && l.contains("true")
+                    && l.contains("override"))
+        );
     }
 
     #[test]
@@ -973,13 +978,14 @@ mod tests {
             p.require_tenancy_declaration,
             "the declaration gate stays on"
         );
-        assert!(cfg
-            .explain()
-            .unwrap()
-            .lines()
-            .any(|l| l.contains("allow_cross_tenant_db")
-                && l.contains("true")
-                && l.contains("override")));
+        assert!(
+            cfg.explain()
+                .unwrap()
+                .lines()
+                .any(|l| l.contains("allow_cross_tenant_db")
+                    && l.contains("true")
+                    && l.contains("override"))
+        );
     }
 
     #[test]
@@ -1001,11 +1007,12 @@ mod tests {
             ..Default::default()
         };
         assert!(cfg.resolve().unwrap().require_pop);
-        assert!(cfg
-            .explain()
-            .unwrap()
-            .lines()
-            .any(|l| l.contains("require_pop") && l.contains("true") && l.contains("override")));
+        assert!(
+            cfg.explain()
+                .unwrap()
+                .lines()
+                .any(|l| l.contains("require_pop") && l.contains("true") && l.contains("override"))
+        );
     }
 
     #[test]
@@ -1102,8 +1109,9 @@ mod tests {
             && l.contains("unlimited")
             && l.contains("override")));
         // A non-overridden knob is marked (profile).
-        assert!(text
-            .lines()
-            .any(|l| l.contains("oidc_require_audience") && l.contains("profile")));
+        assert!(
+            text.lines()
+                .any(|l| l.contains("oidc_require_audience") && l.contains("profile"))
+        );
     }
 }

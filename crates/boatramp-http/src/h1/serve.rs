@@ -11,13 +11,13 @@
 use std::time::Duration;
 
 use bytes::Bytes;
-use http::{header, HeaderMap, HeaderValue, Method, Version};
+use http::{HeaderMap, HeaderValue, Method, Version, header};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt as _;
+use tokio_stream::wrappers::ReceiverStream;
 
-use super::parse::{chunked, parse_request_head, BodyFraming, ParseResult};
+use super::parse::{BodyFraming, ParseResult, chunked, parse_request_head};
 use crate::{Body, BodyError, Handler, ReqBody};
 
 /// Default slowloris bound: how long we wait for a client to deliver a complete request

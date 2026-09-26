@@ -181,10 +181,8 @@ impl RateLimitStore for KvRateLimiter {
             Err(_) => return self.fail_open,
         };
         let (allowed, window) = fixed_window_decision(current, now, limit.burst_capacity() as u64);
-        if allowed {
-            if let Ok(bytes) = serde_json::to_vec(&window) {
-                let _ = self.kv.put(&key, bytes).await;
-            }
+        if allowed && let Ok(bytes) = serde_json::to_vec(&window) {
+            let _ = self.kv.put(&key, bytes).await;
         }
         allowed
     }

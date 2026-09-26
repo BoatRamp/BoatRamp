@@ -25,7 +25,7 @@
 use std::collections::{HashMap, VecDeque};
 
 use async_trait::async_trait;
-use boatramp_core::blob_notify::{prefix_slug, ManagedResource};
+use boatramp_core::blob_notify::{ManagedResource, prefix_slug};
 use boatramp_core::blob_provision::{ProvisionError, WatchProvider};
 use boatramp_core::{BlobChange, BlobChangeKind, ChangeStream};
 use futures::StreamExt;
@@ -252,10 +252,10 @@ pub(crate) fn gcs_watch_stream(subscription: Subscription, prefix: String) -> Ch
                 let change = parse_gcs_notification(&message.message.attributes);
                 // Ack regardless: an unparseable/irrelevant message must not redeliver.
                 let _ = message.ack().await;
-                if let Some(change) = change {
-                    if change.key.starts_with(&prefix) {
-                        pending.push_back(change);
-                    }
+                if let Some(change) = change
+                    && change.key.starts_with(&prefix)
+                {
+                    pending.push_back(change);
                 }
             }
         }

@@ -777,9 +777,10 @@ mod tests {
         assert_eq!(db, tenant_db_name("appdb", &ident));
         // Safe charset.
         for name in [&db, &role] {
-            assert!(name
-                .chars()
-                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'));
+            assert!(
+                name.chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+            );
         }
     }
 
@@ -948,10 +949,14 @@ mod tests {
             joined.contains("REVOKE CONNECT ON DATABASE \"appdb_acme\" FROM PUBLIC"),
             "missing PUBLIC revoke:\n{joined}"
         );
-        assert!(joined.contains("GRANT CONNECT ON DATABASE \"appdb_acme\" TO \"appdb_acme_owner\""));
+        assert!(
+            joined.contains("GRANT CONNECT ON DATABASE \"appdb_acme\" TO \"appdb_acme_owner\"")
+        );
         assert!(joined.contains("GRANT CONNECT ON DATABASE \"appdb_acme\" TO \"appdb_acme_role\""));
-        assert!(joined
-            .contains("GRANT ALL PRIVILEGES ON DATABASE \"appdb_acme\" TO \"appdb_acme_role\""));
+        assert!(
+            joined
+                .contains("GRANT ALL PRIVILEGES ON DATABASE \"appdb_acme\" TO \"appdb_acme_role\"")
+        );
         // Idempotent runtime-role create + password sync.
         assert!(joined.contains("pg_roles WHERE rolname = 'appdb_acme_role'"));
         assert!(joined.contains("CREATE ROLE \"appdb_acme_role\" LOGIN PASSWORD 'deadbeef'"));
@@ -1014,8 +1019,11 @@ mod tests {
             !joined.contains("appdb_acme_owner"),
             "MySQL should not create an owner role"
         );
-        assert!(joined
-            .contains("CREATE USER IF NOT EXISTS 'appdb_acme_role'@'%' IDENTIFIED BY 'deadbeef'"));
+        assert!(
+            joined.contains(
+                "CREATE USER IF NOT EXISTS 'appdb_acme_role'@'%' IDENTIFIED BY 'deadbeef'"
+            )
+        );
         assert!(joined.contains("ALTER USER 'appdb_acme_role'@'%' IDENTIFIED BY 'deadbeef'"));
         // Grant is scoped to this database only.
         assert!(

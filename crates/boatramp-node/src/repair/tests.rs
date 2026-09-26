@@ -209,8 +209,11 @@ async fn object_ownership_reassign_names_derived_runtime_never_probe_result() {
         "must never REASSIGN OWNED BY the superuser: {joined}"
     );
     // The superuser-owned object is re-owned by a TARGETED ALTER naming the enumerated object.
-    assert!(joined
-        .contains("ALTER TABLE IF EXISTS \"public\".\"shared_lookup\" OWNER TO \"pg_acme_owner\""));
+    assert!(
+        joined.contains(
+            "ALTER TABLE IF EXISTS \"public\".\"shared_lookup\" OWNER TO \"pg_acme_owner\""
+        )
+    );
 }
 
 /// JOB 1: `targeted_reown_ddl` emits the KIND-CORRECT re-ownership variant so a superuser-owned
@@ -716,7 +719,10 @@ fn mysql_external_ddl_identity_distinctness() {
     let env = boatramp_core::env::MapEnv::new()
         .with("REPAIR_TEST_MYSQL_RUNTIME", "mysql://app:pw@h1/appdb")
         .with("REPAIR_TEST_MYSQL_DDL_SAME", "mysql://app:pw@h1/appdb")
-        .with("REPAIR_TEST_MYSQL_DDL_DISTINCT", "mysql://ddladmin:pw@h1/appdb");
+        .with(
+            "REPAIR_TEST_MYSQL_DDL_DISTINCT",
+            "mysql://ddladmin:pw@h1/appdb",
+        );
 
     // A declared-but-unset migration var → error (not reachable).
     let mut b = external_binding("mysql");
@@ -807,11 +813,12 @@ async fn credential_sealed_dry_run_never_writes() {
     )
     .await;
     assert_eq!(report.checks[0].status, RepairStatus::Repaired);
-    assert!(kv
-        .get("managed-sql-cred/acme/pg-acme")
-        .await
-        .unwrap()
-        .is_some());
+    assert!(
+        kv.get("managed-sql-cred/acme/pg-acme")
+            .await
+            .unwrap()
+            .is_some()
+    );
 }
 
 // ---- libsql model: the file is the boundary; dry-run never creates the file ----------
@@ -947,11 +954,13 @@ async fn converge_ledger_dry_run_runs_nothing() {
     let mut report = RepairReport::default();
     converge_ledger(&as_dyn(&backend), &ddl, RepairMode::DryRun, &mut report).await;
     assert_eq!(report.checks[0].status, RepairStatus::Drift);
-    assert!(report.checks[0]
-        .ddl
-        .as_ref()
-        .unwrap()
-        .contains("CREATE TABLE IF NOT EXISTS"));
+    assert!(
+        report.checks[0]
+            .ddl
+            .as_ref()
+            .unwrap()
+            .contains("CREATE TABLE IF NOT EXISTS")
+    );
     assert!(
         backend.scripts().is_empty(),
         "dry-run ledger converge must run no DDL"

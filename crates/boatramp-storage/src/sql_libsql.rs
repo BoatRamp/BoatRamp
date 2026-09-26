@@ -726,13 +726,13 @@ impl SqlBackends for LibsqlSqlBackends {
         }
         // Destination must not already hold data — never clobber. (A zero-byte stub,
         // e.g. from a prior interrupted attempt, is tolerated and overwritten.)
-        if let Ok(meta) = std::fs::metadata(&dst_path) {
-            if meta.len() > 0 {
-                return Err(SqlError::other(format!(
-                    "destination database already exists (refusing to overwrite): {}",
-                    dst_path.display()
-                )));
-            }
+        if let Ok(meta) = std::fs::metadata(&dst_path)
+            && meta.len() > 0
+        {
+            return Err(SqlError::other(format!(
+                "destination database already exists (refusing to overwrite): {}",
+                dst_path.display()
+            )));
         }
         if let Some(parent) = dst_path.parent() {
             std::fs::create_dir_all(parent).map_err(SqlError::other)?;
@@ -962,9 +962,10 @@ mod tests {
     fn namespaces_are_dns_safe_and_distinct() {
         let ns = LibsqlSqlBackends::namespace("My Site!! 名前", "");
         // Valid DNS label characters only (sqld routes by subdomain).
-        assert!(ns
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'));
+        assert!(
+            ns.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        );
         assert!(ns.starts_with("bramp-"));
         // Default vs named differ; different sites differ.
         assert_ne!(

@@ -228,23 +228,21 @@ pub async fn build_handler_runtime(
     // when the posture is off or no envelope exists, so a granted guest's `send`
     // returns `access-denied` rather than reaching an unconfigured relay.
     #[cfg(feature = "email")]
-    if allow_guest_email {
-        if let Some(envelope) = email_envelope {
-            let store = Arc::new(boatramp_core::email_config::EmailProfileStore::new(
-                kv_for_email,
-                envelope,
-            ));
-            let backend = Arc::new(boatramp_handlers::LettreBackend::new(
-                allow_guest_private_egress,
-            ));
-            let spool = boatramp_server::NodeEmailSpool::spawn(
-                backend,
-                Some(messaging_for_email),
-                store.clone(),
-            );
-            runtime.set_email_profile_store(store);
-            runtime.set_email_spool(spool);
-        }
+    if allow_guest_email && let Some(envelope) = email_envelope {
+        let store = Arc::new(boatramp_core::email_config::EmailProfileStore::new(
+            kv_for_email,
+            envelope,
+        ));
+        let backend = Arc::new(boatramp_handlers::LettreBackend::new(
+            allow_guest_private_egress,
+        ));
+        let spool = boatramp_server::NodeEmailSpool::spawn(
+            backend,
+            Some(messaging_for_email),
+            store.clone(),
+        );
+        runtime.set_email_profile_store(store);
+        runtime.set_email_spool(spool);
     }
     Ok(runtime)
 }
@@ -265,7 +263,9 @@ async fn build_sql_backends(
     let resolve_env = |var: &Option<String>| -> Result<Option<String>> {
         match var {
             Some(var) => Ok(Some(
-                env_source.get(var).ok_or_else(|| Error::SqlEnvUnset(var.clone()))?,
+                env_source
+                    .get(var)
+                    .ok_or_else(|| Error::SqlEnvUnset(var.clone()))?,
             )),
             None => Ok(None),
         }
@@ -333,7 +333,7 @@ async fn build_sql_backends(
     {
         use boatramp_core::sql::SqlBackend;
         use boatramp_storage::sql_sqlx::{
-            connect, CompositeSqlBackends, ExternalSqlKind, ExternalSqlOptions,
+            CompositeSqlBackends, ExternalSqlKind, ExternalSqlOptions, connect,
         };
         let timeout = |db: &crate::config::ExternalDatabaseConfig| {
             db.connect_timeout_secs.map(std::time::Duration::from_secs)
@@ -406,9 +406,11 @@ async fn build_sql_backends(
                     .get(&db.url_env)
                     .ok_or_else(|| Error::SqlEnvUnset(db.url_env.clone()))?;
                 let read_url = match &db.read_url_env {
-                    Some(var) => {
-                        Some(env_source.get(var).ok_or_else(|| Error::SqlEnvUnset(var.clone()))?)
-                    }
+                    Some(var) => Some(
+                        env_source
+                            .get(var)
+                            .ok_or_else(|| Error::SqlEnvUnset(var.clone()))?,
+                    ),
                     None => None,
                 };
                 let opts = ExternalSqlOptions::new(url)

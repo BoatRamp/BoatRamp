@@ -13,7 +13,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use bytes::Bytes;
-use http::{header, HeaderMap};
+use http::{HeaderMap, header};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::oneshot;
 

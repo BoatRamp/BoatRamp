@@ -71,7 +71,7 @@ pub(super) async fn create_token(
                     StatusCode::BAD_REQUEST,
                     format!("invalid holder key: {err}\n"),
                 )
-                    .into_response()
+                    .into_response();
             }
         },
         None => None,
@@ -162,7 +162,7 @@ pub(super) async fn bootstrap_token(
                 StatusCode::CONFLICT,
                 "bootstrap secret already used — rotate it to re-bootstrap\n",
             )
-                .into_response()
+                .into_response();
         }
         Ok(false) => {}
         Err(err) => return deploy_error_response(err),

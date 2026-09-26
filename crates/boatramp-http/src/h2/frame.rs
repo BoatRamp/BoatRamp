@@ -150,7 +150,7 @@ pub fn strip_padding(payload: &[u8], padded: bool) -> Result<&[u8], H2Error> {
 /// Parse SETTINGS entries (RFC 7540 §6.5): a sequence of 6-byte (id, value) pairs.
 /// A length not a multiple of 6 is a FRAME_SIZE_ERROR connection error.
 pub fn parse_settings(payload: &[u8]) -> Result<Vec<(u16, u32)>, H2Error> {
-    if payload.len() % 6 != 0 {
+    if !payload.len().is_multiple_of(6) {
         return Err(conn(ErrorCode::FrameSizeError));
     }
     Ok(payload

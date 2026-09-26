@@ -20,7 +20,9 @@ pub enum Error {
     #[error(transparent)]
     Client(#[from] crate::client::ClientError),
     /// `--alias` was combined with `--bus` (the shared project bus is not per-deployment).
-    #[error("--alias cannot be combined with --bus: the shared project bus has no background-alias scope")]
+    #[error(
+        "--alias cannot be combined with --bus: the shared project bus has no background-alias scope"
+    )]
     AliasWithBus,
 }
 

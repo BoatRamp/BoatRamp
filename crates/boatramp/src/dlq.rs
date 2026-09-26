@@ -26,10 +26,14 @@ pub enum Error {
     #[error(transparent)]
     Client(#[from] crate::client::ClientError),
     /// A whole-DLQ mutation was refused without `--yes`.
-    #[error("refusing to {action} the ENTIRE dead-letter queue for topic {topic:?} without --yes (or narrow it with --id/--older-than/--match)")]
+    #[error(
+        "refusing to {action} the ENTIRE dead-letter queue for topic {topic:?} without --yes (or narrow it with --id/--older-than/--match)"
+    )]
     ConfirmRequired { action: String, topic: String },
     /// `--alias` was combined with `--bus` (the shared project bus is not per-deployment).
-    #[error("--alias cannot be combined with --bus: the shared project bus has no background-alias scope")]
+    #[error(
+        "--alias cannot be combined with --bus: the shared project bus has no background-alias scope"
+    )]
     AliasWithBus,
 }
 

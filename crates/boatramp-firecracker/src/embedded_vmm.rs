@@ -20,29 +20,29 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Once};
 
 use kvm_bindings::{
-    kvm_fpu, kvm_msr_entry, kvm_pit_config, kvm_regs, kvm_segment, kvm_userspace_memory_region,
-    Msrs, KVM_MAX_CPUID_ENTRIES,
+    KVM_MAX_CPUID_ENTRIES, Msrs, kvm_fpu, kvm_msr_entry, kvm_pit_config, kvm_regs, kvm_segment,
+    kvm_userspace_memory_region,
 };
 use kvm_ioctls::{Kvm, VcpuExit, VcpuFd, VmFd};
-use linux_loader::loader::{elf::Elf, KernelLoader};
-use nix::poll::{poll, PollFd, PollFlags};
-use nix::sys::pthread::{pthread_kill, pthread_self, Pthread};
-use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal};
+use linux_loader::loader::{KernelLoader, elf::Elf};
+use nix::poll::{PollFd, PollFlags, poll};
+use nix::sys::pthread::{Pthread, pthread_kill, pthread_self};
+use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, sigaction};
 use virtio_queue::{DescriptorChain, Queue, QueueT};
 use vm_memory::{Address, Bytes, GuestAddress, GuestMemory, GuestMemoryMmap, GuestMemoryRegion};
 use vm_superio::{Serial, Trigger};
-use vmm_sys_util::eventfd::{EventFd, EFD_NONBLOCK};
+use vmm_sys_util::eventfd::{EFD_NONBLOCK, EventFd};
 
 use crate::device_manager::DeviceManager;
 use crate::embedded_snapshot::{
-    apply_irqchips, apply_vcpu, capture_irqchips, capture_vcpu, VmSnapshot,
+    VmSnapshot, apply_irqchips, apply_vcpu, capture_irqchips, capture_vcpu,
 };
 use crate::tap::Tap;
 use crate::virtio_mmio::QueueConfig;
 
 use crate::embedded::{
-    boot_gdt, boot_regs, build_zero_page, e820_entries, identity_page_tables, ram_regions,
-    BOOT_GDT_OFFSET, CMDLINE_START, HIMEM_START, ZERO_PAGE_START,
+    BOOT_GDT_OFFSET, CMDLINE_START, HIMEM_START, ZERO_PAGE_START, boot_gdt, boot_regs,
+    build_zero_page, e820_entries, identity_page_tables, ram_regions,
 };
 
 /// Why bringing up the embedded VMM failed.
@@ -1145,8 +1145,8 @@ mod tests {
 
     #[test]
     fn drain_available_services_each_chain_and_advances_the_used_ring() {
-        use virtio_queue::mock::MockSplitQueue;
         use virtio_queue::Descriptor;
+        use virtio_queue::mock::MockSplitQueue;
 
         // VIRTQ_DESC_F_WRITE — a device-writable descriptor.
         const F_WRITE: u16 = 0x2;
@@ -1294,7 +1294,9 @@ mod tests {
             || std::env::var("BOATRAMP_TEST_ROOTFS").is_err()
             || !std::path::Path::new("/dev/kvm").exists()
         {
-            eprintln!("SKIP: need /dev/kvm + BOATRAMP_TEST_KERNEL=vmlinux + BOATRAMP_TEST_ROOTFS=rootfs.ext4");
+            eprintln!(
+                "SKIP: need /dev/kvm + BOATRAMP_TEST_KERNEL=vmlinux + BOATRAMP_TEST_ROOTFS=rootfs.ext4"
+            );
             return;
         }
 
@@ -1302,7 +1304,7 @@ mod tests {
         let sink_buf = serial.clone();
         std::thread::spawn(move || {
             use crate::embedded::mmio_cmdline_arg;
-            use crate::virtio_block::{VirtioBlock, SECTOR_SIZE};
+            use crate::virtio_block::{SECTOR_SIZE, VirtioBlock};
             let kernel = std::env::var("BOATRAMP_TEST_KERNEL").unwrap();
             let rootfs = std::env::var("BOATRAMP_TEST_ROOTFS").unwrap();
 
@@ -1386,7 +1388,9 @@ mod tests {
             || std::env::var("BOATRAMP_TEST_ROOTFS").is_err()
             || !std::path::Path::new("/dev/kvm").exists()
         {
-            eprintln!("SKIP: need /dev/kvm + BOATRAMP_TEST_KERNEL=vmlinux + BOATRAMP_TEST_ROOTFS=vminit+envdump.ext4");
+            eprintln!(
+                "SKIP: need /dev/kvm + BOATRAMP_TEST_KERNEL=vmlinux + BOATRAMP_TEST_ROOTFS=vminit+envdump.ext4"
+            );
             return;
         }
 
@@ -1394,7 +1398,7 @@ mod tests {
         let sink_buf = serial.clone();
         std::thread::spawn(move || {
             use crate::embedded::mmio_cmdline_arg;
-            use crate::virtio_block::{VirtioBlock, SECTOR_SIZE};
+            use crate::virtio_block::{SECTOR_SIZE, VirtioBlock};
             let kernel = std::env::var("BOATRAMP_TEST_KERNEL").unwrap();
             let rootfs = std::env::var("BOATRAMP_TEST_ROOTFS").unwrap();
 
@@ -1582,7 +1586,9 @@ mod tests {
             || std::env::var("BOATRAMP_TEST_ROOTFS").is_err()
             || !std::path::Path::new("/dev/kvm").exists()
         {
-            eprintln!("SKIP: need /dev/kvm + BOATRAMP_TEST_KERNEL=vmlinux + BOATRAMP_TEST_ROOTFS=rootfs.ext4");
+            eprintln!(
+                "SKIP: need /dev/kvm + BOATRAMP_TEST_KERNEL=vmlinux + BOATRAMP_TEST_ROOTFS=rootfs.ext4"
+            );
             return;
         }
 

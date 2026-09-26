@@ -13,8 +13,8 @@ use k8s_openapi::api::rbac::v1::{ClusterRole, ClusterRoleBinding, PolicyRule, Ro
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta};
 use kube::CustomResourceExt;
 
-use super::crd::{BoatRampCluster, Function, Site};
 use super::Result;
+use super::crd::{BoatRampCluster, Function, Site};
 
 /// The operator's default install namespace + `ServiceAccount`/role name.
 const NAME: &str = "boatramp-operator";

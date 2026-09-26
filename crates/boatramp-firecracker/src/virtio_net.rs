@@ -21,7 +21,7 @@ use virtio_queue::{DescriptorChain, Queue, QueueT};
 use vm_memory::{Bytes, GuestMemoryMmap};
 
 use crate::device_manager::VirtioDeviceOps;
-use crate::embedded_vmm::{drain_available, VmmError};
+use crate::embedded_vmm::{VmmError, drain_available};
 use crate::virtio_mmio::VirtioDevice;
 
 /// virtqueue index of the TX queue (queue 0 = RX, queue 1 = TX).

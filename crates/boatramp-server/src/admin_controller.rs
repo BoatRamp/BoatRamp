@@ -20,7 +20,7 @@ use async_trait::async_trait;
 use boatramp_core::access::RateLimit;
 use boatramp_core::config::SiteConfig;
 use boatramp_core::deploy::DeployStore;
-use boatramp_core::domain_verify::{check_ownership, DomainProbe, VerificationMethod};
+use boatramp_core::domain_verify::{DomainProbe, VerificationMethod, check_ownership};
 use boatramp_core::email_config::{EmailProfilePatch, EmailProfileStore};
 use boatramp_core::error::DeployError;
 use boatramp_core::project::ProjectRef;
@@ -28,7 +28,7 @@ use boatramp_core::secret_store::SecretStore;
 use boatramp_core::site::SiteName;
 use boatramp_handlers::{AdminController, AdminError, DomainChallenge};
 
-use crate::admin_api::{check_added_domains_verified, DomainGuard};
+use crate::admin_api::{DomainGuard, check_added_domains_verified};
 use crate::ratelimit::RateLimiter;
 
 /// Sustained per-project admin-mutation rate. Config changes are rare, so this is low; a burst

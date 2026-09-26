@@ -4,12 +4,12 @@
 //!
 //! Keeping one canonical, per-aspect-grouped corpus (rather than scattered ad-hoc tests)
 //! is what makes coverage **auditable**: [`cases`] is the completeness checklist, and
-//! [`gen`] fills the combinatorial gaps a hand-written list would miss.
+//! [`generators`] fills the combinatorial gaps a hand-written list would miss.
 
 use crate::h1::{self, BodyFraming, ParseResult};
 
 pub mod cases;
-pub mod gen;
+pub mod generators;
 
 /// A normalized parse verdict — comparable across parsers (boatramp vs hyper) and against
 /// a hand-written expectation. Only the smuggling-relevant shape is captured: the method,

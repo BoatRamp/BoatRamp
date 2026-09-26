@@ -24,8 +24,8 @@
 //! site/alias, with preview isolation).
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::time::now_unix_ms;
@@ -971,15 +971,15 @@ impl DeadLetterFilter {
     /// Does `dl` satisfy every set predicate? `now_ms` anchors the age test. Public so a backend in
     /// another crate (the cluster coordinator) applies the identical AND-composition.
     pub fn matches(&self, dl: &DeadLetter, now_ms: u64) -> bool {
-        if let Some(id) = &self.id {
-            if &dl.id != id {
-                return false;
-            }
+        if let Some(id) = &self.id
+            && &dl.id != id
+        {
+            return false;
         }
-        if let Some(group) = &self.group {
-            if &dl.group != group {
-                return false;
-            }
+        if let Some(group) = &self.group
+            && &dl.group != group
+        {
+            return false;
         }
         if let Some(older) = self.older_than_ms {
             match id_age_ms(&dl.id, now_ms) {
@@ -1635,10 +1635,10 @@ impl LogMessaging {
         // 2) Rate (best-effort, per-node token bucket). A whole batch draws `n` tokens at once, so a
         //    publish_batch is gated as one unit (simple + fail-closed): if the batch doesn't fit the
         //    remaining budget, the whole publish is rejected and nothing is enqueued.
-        if let Some(rate) = policy.max_rate_per_sec {
-            if !self.try_take_tokens(topic, rate, n) {
-                return Err(MessagingError::RateExceeded(topic.to_string()));
-            }
+        if let Some(rate) = policy.max_rate_per_sec
+            && !self.try_take_tokens(topic, rate, n)
+        {
+            return Err(MessagingError::RateExceeded(topic.to_string()));
         }
         Ok(())
     }
@@ -1698,7 +1698,7 @@ impl LogMessaging {
         msgs: usize,
         max_unflushed: usize,
     ) -> Result<(), MessagingError> {
-        use futures::future::{select, Either};
+        use futures::future::{Either, select};
         let (done_tx, mut done_rx) = futures::channel::oneshot::channel();
         self.commit_queue.lock().unwrap().push(PublishJob {
             ops,
@@ -1720,7 +1720,7 @@ impl LogMessaging {
             // The current leader durably committed our job while we waited — done.
             Either::Right((res, _gate)) => {
                 return res
-                    .map_err(|_| MessagingError::backend("group-commit dropped before durable"))?
+                    .map_err(|_| MessagingError::backend("group-commit dropped before durable"))?;
             }
             // We hold the gate: drain + commit in a loop until the queue is empty, so a job pushed
             // during our flush (even after a prior empty check) is never stranded. Our OWN job is in
@@ -1851,10 +1851,10 @@ impl LogMessaging {
         for key in keys {
             // `mqgstate/{topic}/{group}` → topic is everything between the first
             // and last `/`.
-            if let Some(rest) = key.strip_prefix("mqgstate/") {
-                if let Some(slash) = rest.rfind('/') {
-                    set.insert(rest[..slash].to_string());
-                }
+            if let Some(rest) = key.strip_prefix("mqgstate/")
+                && let Some(slash) = rest.rfind('/')
+            {
+                set.insert(rest[..slash].to_string());
             }
         }
         let has = set.contains(topic);
@@ -2317,7 +2317,7 @@ impl Messaging for LogMessaging {
             .await?;
         self.group_commit(ops, 1, max_unflushed).await?;
         self.signal_ready(); // ready-set durable (B12) — wake the drainer (due-heap handles the delay)
-                             // A delayed message isn't live yet; still notify SSE (best-effort) so a live tail sees it.
+        // A delayed message isn't live yet; still notify SSE (best-effort) so a live tail sees it.
         self.hubs.broadcast(topic, &id, payload);
         Ok(())
     }
@@ -2755,12 +2755,11 @@ impl Messaging for LogMessaging {
             if !is_direct_child(&key, &prefix) {
                 continue;
             }
-            if let Some(raw) = self.kv.get(&key).await.map_err(MessagingError::backend)? {
-                if let Ok(rec) = serde_json::from_slice::<Record>(&raw) {
-                    if rec.lease_until_ms > now {
-                        count += 1;
-                    }
-                }
+            if let Some(raw) = self.kv.get(&key).await.map_err(MessagingError::backend)?
+                && let Ok(rec) = serde_json::from_slice::<Record>(&raw)
+                && rec.lease_until_ms > now
+            {
+                count += 1;
             }
         }
         // Grouped: every registered group's currently-leased in-flight entries.
@@ -2995,7 +2994,7 @@ impl Messaging for LogMessaging {
             record.lease_until_ms = 0;
             record.last_error = None; // a fresh life — the prior failure reason no longer applies.
             record.expires_at_ms = 0; // and clear any TTL: a redrive is a deliberate operator retry
-                                      // (else a ttl-expired dead-letter would immediately re-expire).
+            // (else a ttl-expired dead-letter would immediately re-expire).
             let json = serde_json::to_vec(&record).map_err(MessagingError::backend)?;
             self.kv
                 .put(&meta_key(topic, id), json)
@@ -3163,7 +3162,7 @@ impl Messaging for LogMessaging {
             record.lease_until_ms = 0;
             record.last_error = None; // a fresh life — the prior failure reason no longer applies.
             record.expires_at_ms = 0; // clear any TTL: a redrive is a deliberate retry (else a
-                                      // ttl-expired dead-letter would immediately re-expire on claim).
+            // ttl-expired dead-letter would immediately re-expire on claim).
             let json = serde_json::to_vec(&record).map_err(MessagingError::backend)?;
             self.kv
                 .put(&meta_key(topic, &dl.id), json)
@@ -3341,10 +3340,10 @@ impl Messaging for LogMessaging {
         let mut out = Vec::new();
         for id in ids {
             // `after` is exclusive — skip everything at or before the caller's last-seen offset.
-            if let Some(after) = after {
-                if id.as_str() <= after {
-                    continue;
-                }
+            if let Some(after) = after
+                && id.as_str() <= after
+            {
+                continue;
             }
             if out.len() >= limit {
                 break;
@@ -3561,10 +3560,10 @@ impl Messaging for LogMessaging {
             .map_err(MessagingError::backend)?
         {
             // `mq/{topic}/{id}` — topic is everything between the first and last `/`.
-            if let Some(rest) = key.strip_prefix("mq/") {
-                if let Some(slash) = rest.rfind('/') {
-                    with_work.insert(rest[..slash].to_string());
-                }
+            if let Some(rest) = key.strip_prefix("mq/")
+                && let Some(slash) = rest.rfind('/')
+            {
+                with_work.insert(rest[..slash].to_string());
             }
         }
         // 2) Grouped topics with un-consumed backlog or in-flight: a registered group whose hwm is
@@ -3663,10 +3662,10 @@ impl Messaging for LogMessaging {
                 continue;
             };
             let topic = rest[..slash].to_string();
-            if let Some(raw) = self.kv.get(&key).await.map_err(MessagingError::backend)? {
-                if let Ok(rec) = serde_json::from_slice::<Record>(&raw) {
-                    note(&topic, rec.lease_until_ms);
-                }
+            if let Some(raw) = self.kv.get(&key).await.map_err(MessagingError::backend)?
+                && let Ok(rec) = serde_json::from_slice::<Record>(&raw)
+            {
+                note(&topic, rec.lease_until_ms);
             }
         }
         // Grouped in-flight leases.
@@ -3952,16 +3951,18 @@ mod tests {
         let t = "bus/orders";
         // Two groups subscribe (first claim registers them + turns on retention),
         // *then* events flow — the fabric shape (workers deployed before events).
-        assert!(mq
-            .claim_grouped(t, "billing", StartPosition::Latest, LEASE, 10, 5)
-            .await
-            .unwrap()
-            .is_empty());
-        assert!(mq
-            .claim_grouped(t, "audit", StartPosition::Latest, LEASE, 10, 5)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            mq.claim_grouped(t, "billing", StartPosition::Latest, LEASE, 10, 5)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            mq.claim_grouped(t, "audit", StartPosition::Latest, LEASE, 10, 5)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         mq.publish(t, b"a").await.unwrap();
         mq.publish(t, b"b").await.unwrap();
 
@@ -3981,11 +3982,12 @@ mod tests {
         for m in &billing {
             mq.ack(m).await.unwrap();
         }
-        assert!(mq
-            .claim_grouped(t, "billing", StartPosition::Latest, LEASE, 10, 5)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            mq.claim_grouped(t, "billing", StartPosition::Latest, LEASE, 10, 5)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         // Audit still has its two (leased) messages: nack makes them claimable now.
         for m in &audit {
             mq.nack(m).await.unwrap();
@@ -4002,11 +4004,12 @@ mod tests {
         let mq = mq();
         let t = "bus/events";
         // A registered group turns on retention, then two events are published.
-        assert!(mq
-            .claim_grouped(t, "seed", StartPosition::Latest, LEASE, 10, 5)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            mq.claim_grouped(t, "seed", StartPosition::Latest, LEASE, 10, 5)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         mq.publish(t, b"a").await.unwrap();
         mq.publish(t, b"b").await.unwrap();
 
@@ -4037,11 +4040,12 @@ mod tests {
         // range scan, not a full-log materialization).
         let mq = mq();
         let t = "bus/jobs";
-        assert!(mq
-            .claim_grouped(t, "worker", StartPosition::Earliest, LEASE, 2, 5)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            mq.claim_grouped(t, "worker", StartPosition::Earliest, LEASE, 2, 5)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         for n in 0..5u8 {
             mq.publish(t, &[b'0' + n]).await.unwrap();
         }
@@ -4062,11 +4066,12 @@ mod tests {
             .unwrap();
         assert_eq!(payloads(&third), vec![b"4".to_vec()]);
         // Caught up: the gate is closed, so a further claim scans nothing.
-        assert!(mq
-            .claim_grouped(t, "worker", StartPosition::Earliest, LEASE, 2, 5)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            mq.claim_grouped(t, "worker", StartPosition::Earliest, LEASE, 2, 5)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -4075,11 +4080,12 @@ mod tests {
         // rather than redelivering forever, and is dropped from in-flight.
         let mq = mq();
         let t = "bus/flaky";
-        assert!(mq
-            .claim_grouped(t, "g", StartPosition::Earliest, LEASE, 10, 2)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            mq.claim_grouped(t, "g", StartPosition::Earliest, LEASE, 10, 2)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         mq.publish(t, b"x").await.unwrap();
         // Zero lease ⇒ each claim finds the in-flight entry immediately expired.
         for expected in 1..=2 {
@@ -4091,16 +4097,18 @@ mod tests {
             assert_eq!(batch[0].attempts, expected);
         }
         // Third claim exhausts attempts → dead-letter, deliver nothing, and stay empty.
-        assert!(mq
-            .claim_grouped(t, "g", StartPosition::Earliest, Duration::ZERO, 10, 2)
-            .await
-            .unwrap()
-            .is_empty());
-        assert!(mq
-            .claim_grouped(t, "g", StartPosition::Earliest, Duration::ZERO, 10, 2)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            mq.claim_grouped(t, "g", StartPosition::Earliest, Duration::ZERO, 10, 2)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            mq.claim_grouped(t, "g", StartPosition::Earliest, Duration::ZERO, 10, 2)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -4113,11 +4121,12 @@ mod tests {
         let t = "bus/resume";
         {
             let mq = LogMessaging::new(storage.clone(), kv.clone());
-            assert!(mq
-                .claim_grouped(t, "g", StartPosition::Earliest, LEASE, 10, 5)
-                .await
-                .unwrap()
-                .is_empty());
+            assert!(
+                mq.claim_grouped(t, "g", StartPosition::Earliest, LEASE, 10, 5)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
             mq.publish(t, b"a").await.unwrap();
             mq.publish(t, b"b").await.unwrap();
             // Zero lease so the un-acked message is immediately re-claimable after
@@ -4152,11 +4161,12 @@ mod tests {
         let t = "bus/retain";
         // Two groups; publish two messages both retain.
         for g in ["one", "two"] {
-            assert!(mq
-                .claim_grouped(t, g, StartPosition::Earliest, LEASE, 10, 5)
-                .await
-                .unwrap()
-                .is_empty());
+            assert!(
+                mq.claim_grouped(t, g, StartPosition::Earliest, LEASE, 10, 5)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
         }
         mq.publish(t, b"a").await.unwrap();
         mq.publish(t, b"b").await.unwrap();
@@ -4191,11 +4201,12 @@ mod tests {
             );
         }
         // A caught-up group still returns empty (state intact, log gone).
-        assert!(mq
-            .claim_grouped(t, "one", StartPosition::Earliest, LEASE, 10, 5)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            mq.claim_grouped(t, "one", StartPosition::Earliest, LEASE, 10, 5)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -4212,21 +4223,23 @@ mod tests {
         assert_eq!(batch[0].attempts, 1);
 
         // Leased: a second claim sees nothing until the lease lapses or an ack.
-        assert!(mq
-            .claim("orders/created", LEASE, 10, 5)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            mq.claim("orders/created", LEASE, 10, 5)
+                .await
+                .unwrap()
+                .is_empty()
+        );
 
         for m in &batch {
             mq.ack(m).await.unwrap();
         }
         // Acked messages are gone.
-        assert!(mq
-            .claim("orders/created", LEASE, 10, 5)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            mq.claim("orders/created", LEASE, 10, 5)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -4397,7 +4410,7 @@ mod tests {
         {
             let _sub = mq.subscribe("events", None);
         } // dropped
-          // Publishing after the subscriber is gone must not error.
+        // Publishing after the subscriber is gone must not error.
         mq.publish("events", b"x").await.unwrap();
     }
 
@@ -4430,11 +4443,12 @@ mod tests {
         let mq = mq();
         let t = "bus/sync";
         // Register the group (first claim), publish one poison message.
-        assert!(mq
-            .claim_grouped(t, "worker", StartPosition::Latest, Duration::ZERO, 10, 2)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            mq.claim_grouped(t, "worker", StartPosition::Latest, Duration::ZERO, 10, 2)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         mq.publish(t, b"poison").await.unwrap();
         // max_attempts = 2: two deliveries (ZERO lease ⇒ immediate re-claim), then the 3rd
         // dead-letters instead of delivering.
@@ -4446,11 +4460,12 @@ mod tests {
             assert_eq!(m.len(), 1, "grouped attempt {expected}");
             assert_eq!(m[0].attempts, expected);
         }
-        assert!(mq
-            .claim_grouped(t, "worker", StartPosition::Latest, Duration::ZERO, 10, 2)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            mq.claim_grouped(t, "worker", StartPosition::Latest, Duration::ZERO, 10, 2)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         // VISIBLE: the grouped poison message is counted (the fix).
         assert_eq!(mq.dead_letter_count(t).await.unwrap(), 1);
 
@@ -4472,11 +4487,12 @@ mod tests {
                 .len(),
             1
         );
-        assert!(mq
-            .claim_grouped(t, "worker", StartPosition::Latest, Duration::ZERO, 10, 2)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            mq.claim_grouped(t, "worker", StartPosition::Latest, Duration::ZERO, 10, 2)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(mq.dead_letter_count(t).await.unwrap(), 1);
         assert_eq!(mq.purge_dead_letters(t).await.unwrap(), 1);
         assert_eq!(mq.dead_letter_count(t).await.unwrap(), 0);
@@ -4510,11 +4526,12 @@ mod tests {
         // Group lag: a group registered `earliest` then two messages published → lag 2; after it
         // leases them, lag 0 (they're beyond nothing / at its high-water).
         let g = "bus/lag";
-        assert!(mq
-            .claim_grouped(g, "w", StartPosition::Earliest, LEASE, 10, 5)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            mq.claim_grouped(g, "w", StartPosition::Earliest, LEASE, 10, 5)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         mq.publish(g, b"x").await.unwrap();
         mq.publish(g, b"y").await.unwrap();
         assert_eq!(
@@ -5241,11 +5258,12 @@ mod tests {
         // max_attempts=1: one delivery, next claim dead-letters.
         let m = mq.claim("t", Duration::ZERO, 10, 1).await.unwrap();
         assert!(m[0].inline);
-        assert!(mq
-            .claim("t", Duration::ZERO, 10, 1)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            mq.claim("t", Duration::ZERO, 10, 1)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(mq.dead_letter_count("t").await.unwrap(), 1);
         // Redrive → redelivers with the inlined payload intact.
         assert_eq!(mq.redrive_dead_letters("t").await.unwrap(), 1);
@@ -5264,11 +5282,12 @@ mod tests {
         let id = mq.claim("t", Duration::ZERO, 10, 1).await.unwrap()[0]
             .id
             .clone();
-        assert!(mq
-            .claim("t", Duration::ZERO, 10, 1)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            mq.claim("t", Duration::ZERO, 10, 1)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(mq.dead_letter_count("t").await.unwrap(), 1);
 
         let purged = mq.purge_dead_letters("t").await.unwrap();
@@ -5286,11 +5305,12 @@ mod tests {
         let mq = mq();
         mq.publish("t", b"x").await.unwrap();
         assert_eq!(mq.claim("t", Duration::ZERO, 10, 1).await.unwrap().len(), 1);
-        assert!(mq
-            .claim("t", Duration::ZERO, 10, 1)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            mq.claim("t", Duration::ZERO, 10, 1)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(mq.dead_letter_count("t").await.unwrap(), 1);
 
         let redriven = mq.redrive_dead_letters("t").await.unwrap();
@@ -5319,11 +5339,12 @@ mod tests {
         mq.set_last_error(&bbb, "guest-trap:\n injected\u{7} reason")
             .await
             .unwrap();
-        assert!(mq
-            .claim("t", Duration::ZERO, 10, 1)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            mq.claim("t", Duration::ZERO, 10, 1)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(mq.dead_letter_count("t").await.unwrap(), 3);
 
         // list: metadata only (no payloads); "bbb" carries the SANITIZED reason (control chars gone).
@@ -5410,11 +5431,12 @@ mod tests {
         let mq = mq();
         mq.publish("t", b"recent").await.unwrap();
         assert_eq!(mq.claim("t", Duration::ZERO, 10, 1).await.unwrap().len(), 1);
-        assert!(mq
-            .claim("t", Duration::ZERO, 10, 1)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            mq.claim("t", Duration::ZERO, 10, 1)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(mq.dead_letter_count("t").await.unwrap(), 1);
         // The message was published moments ago, so a 1-hour `older_than` matches nothing…
         let none = mq
@@ -5451,11 +5473,12 @@ mod tests {
     async fn group_and_pause_ops_are_confined_to_their_namespaced_topic() {
         let mq = mq();
         for t in ["siteA/ev", "siteB/ev"] {
-            assert!(mq
-                .claim_grouped(t, "g", StartPosition::Earliest, LEASE, 10, 5)
-                .await
-                .unwrap()
-                .is_empty());
+            assert!(
+                mq.claim_grouped(t, "g", StartPosition::Earliest, LEASE, 10, 5)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
             mq.publish(t, b"m").await.unwrap();
         }
         // Pausing siteA does NOT pause siteB.
@@ -5474,11 +5497,12 @@ mod tests {
             "another site's group is untouched by a delete"
         );
         // siteB (unpaused) still delivers; siteA (paused) delivers nothing.
-        assert!(mq
-            .claim_grouped("siteA/ev", "g", StartPosition::Earliest, LEASE, 10, 5)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            mq.claim_grouped("siteA/ev", "g", StartPosition::Earliest, LEASE, 10, 5)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(
             mq.claim_grouped("siteB/ev", "g", StartPosition::Earliest, LEASE, 10, 5)
                 .await
@@ -5807,11 +5831,12 @@ mod tests {
         let a = mq.claim("projA/orders", LEASE, 16, 5).await.unwrap();
         assert_eq!(a.len(), 1);
         mq.ack(&a[0]).await.unwrap();
-        assert!(mq
-            .claim("projA/orders", LEASE, 16, 5)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            mq.claim("projA/orders", LEASE, 16, 5)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(
             mq.ready_topics().await.unwrap(),
             vec!["projB/orders".to_string()],

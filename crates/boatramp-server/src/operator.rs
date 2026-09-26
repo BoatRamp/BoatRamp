@@ -1441,42 +1441,42 @@ pub(super) async fn prometheus_metrics(
         }
         // Function usage series (FA-4), from the persisted metering aggregates.
         // Best-effort: a store error omits the block rather than failing the scrape.
-        if let Ok(mut usage) = deploy.list_metering(ProjectRef::DEFAULT).await {
-            if !usage.is_empty() {
-                usage.sort_by(|a, b| a.function.cmp(&b.function));
-                body.push_str(
-                    "# HELP boatramp_function_invocations_total Function invocations metered.\n\
+        if let Ok(mut usage) = deploy.list_metering(ProjectRef::DEFAULT).await
+            && !usage.is_empty()
+        {
+            usage.sort_by(|a, b| a.function.cmp(&b.function));
+            body.push_str(
+                "# HELP boatramp_function_invocations_total Function invocations metered.\n\
                      # TYPE boatramp_function_invocations_total counter\n",
-                );
-                for m in &usage {
-                    let f = metrics::escape_label(&m.function);
-                    body.push_str(&format!(
-                        "boatramp_function_invocations_total{{function=\"{f}\"}} {}\n",
-                        m.invocations
-                    ));
-                }
-                body.push_str(
+            );
+            for m in &usage {
+                let f = metrics::escape_label(&m.function);
+                body.push_str(&format!(
+                    "boatramp_function_invocations_total{{function=\"{f}\"}} {}\n",
+                    m.invocations
+                ));
+            }
+            body.push_str(
                     "# HELP boatramp_function_failures_total Function invocations that failed to deliver.\n\
                      # TYPE boatramp_function_failures_total counter\n",
                 );
-                for m in &usage {
-                    let f = metrics::escape_label(&m.function);
-                    body.push_str(&format!(
-                        "boatramp_function_failures_total{{function=\"{f}\"}} {}\n",
-                        m.failures
-                    ));
-                }
-                body.push_str(
+            for m in &usage {
+                let f = metrics::escape_label(&m.function);
+                body.push_str(&format!(
+                    "boatramp_function_failures_total{{function=\"{f}\"}} {}\n",
+                    m.failures
+                ));
+            }
+            body.push_str(
                     "# HELP boatramp_function_duration_ms_total Summed function wall-clock duration, ms.\n\
                      # TYPE boatramp_function_duration_ms_total counter\n",
                 );
-                for m in &usage {
-                    let f = metrics::escape_label(&m.function);
-                    body.push_str(&format!(
-                        "boatramp_function_duration_ms_total{{function=\"{f}\"}} {}\n",
-                        m.duration_ms_total
-                    ));
-                }
+            for m in &usage {
+                let f = metrics::escape_label(&m.function);
+                body.push_str(&format!(
+                    "boatramp_function_duration_ms_total{{function=\"{f}\"}} {}\n",
+                    m.duration_ms_total
+                ));
             }
         }
     }

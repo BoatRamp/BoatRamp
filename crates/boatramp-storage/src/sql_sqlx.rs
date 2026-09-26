@@ -548,7 +548,7 @@ macro_rules! bind_params {
 
 #[cfg(feature = "sql-postgres")]
 mod postgres_backend {
-    use super::{map_err, ExternalSqlOptions};
+    use super::{ExternalSqlOptions, map_err};
     use crate::sql_placeholders::PlaceholderDialect;
     use async_trait::async_trait;
     use boatramp_core::sql::{SqlBackend, SqlError, SqlRows, SqlTransaction, SqlValue};
@@ -850,7 +850,7 @@ mod postgres_backend {
                 return Err(SqlError::Other(format!(
                     "unsupported postgres column type `{name}` (column {i}); \
                      cast it to text in your query, e.g. `SELECT col::text`"
-                )))
+                )));
             }
         };
         Ok(value)
@@ -897,7 +897,7 @@ mod postgres_backend {
 
 #[cfg(feature = "sql-mysql")]
 mod mysql_backend {
-    use super::{map_err, ExternalSqlOptions};
+    use super::{ExternalSqlOptions, map_err};
     use crate::sql_placeholders::PlaceholderDialect;
     use async_trait::async_trait;
     use boatramp_core::sql::{SqlBackend, SqlError, SqlRows, SqlTransaction, SqlValue};
@@ -1167,7 +1167,7 @@ mod mysql_backend {
                 return Err(SqlError::Other(format!(
                     "unsupported mysql column type `{name}` (column {i}); \
                      cast it to char/text in your query, e.g. `CAST(col AS CHAR)`"
-                )))
+                )));
             }
         };
         Ok(value)
@@ -1318,7 +1318,7 @@ mod tests {
     #[cfg(feature = "sql-postgres")]
     #[test]
     fn postgres_type_classes() {
-        use super::postgres_backend::{pg_class, PgClass};
+        use super::postgres_backend::{PgClass, pg_class};
         assert_eq!(pg_class("BOOL"), PgClass::Bool);
         assert_eq!(pg_class("INT4"), PgClass::I32);
         assert_eq!(pg_class("INT8"), PgClass::I64);
@@ -1336,7 +1336,7 @@ mod tests {
     #[cfg(feature = "sql-mysql")]
     #[test]
     fn mysql_type_classes() {
-        use super::mysql_backend::{mysql_class, MyClass};
+        use super::mysql_backend::{MyClass, mysql_class};
         assert_eq!(mysql_class("TINYINT"), MyClass::I8);
         assert_eq!(mysql_class("BIGINT UNSIGNED"), MyClass::U64);
         assert_eq!(mysql_class("INT"), MyClass::I32);

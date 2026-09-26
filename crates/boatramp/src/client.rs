@@ -89,12 +89,12 @@ pub fn build_client(
     server_pubkey: Option<&str>,
 ) -> ApiClient {
     let mut builder = reqwest::Client::builder();
-    if let Some(token) = token {
-        if let Ok(value) = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}")) {
-            let mut headers = reqwest::header::HeaderMap::new();
-            headers.insert(reqwest::header::AUTHORIZATION, value);
-            builder = builder.default_headers(headers);
-        }
+    if let Some(token) = token
+        && let Ok(value) = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+    {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(reqwest::header::AUTHORIZATION, value);
+        builder = builder.default_headers(headers);
     }
     if let Some(hex) = server_pubkey {
         // The pinned rustls config's type is only inferred (never named), so the
@@ -1725,7 +1725,7 @@ mod tests {
     use boatramp_core::authz::GrantedRole;
     use boatramp_core::cose::{Claims, Signer, TokenAlg};
     use boatramp_core::kv::{KvStore, MemoryKv};
-    use boatramp_server::{require_auth, Auth};
+    use boatramp_server::{Auth, require_auth};
 
     /// The server's canonical origin — the client binds it into every proof; the
     /// server compares proofs against *this*, never the request host.

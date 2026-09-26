@@ -17,8 +17,8 @@
 //! is backend-agnostic — the feed is just KV data, so it works over Cloudflare
 //! KV or a shared SlateDB equally (they are the `store` here).
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -123,12 +123,11 @@ impl Changelog {
         entry_keys.sort();
         let mut changed = Vec::new();
         for entry_key in &entry_keys {
-            if let Ok(Some(bytes)) = self.store.get(entry_key).await {
-                if let Ok(entry) = serde_json::from_slice::<Entry>(&bytes) {
-                    if entry.writer != self.writer {
-                        changed.extend(entry.keys);
-                    }
-                }
+            if let Ok(Some(bytes)) = self.store.get(entry_key).await
+                && let Ok(entry) = serde_json::from_slice::<Entry>(&bytes)
+                && entry.writer != self.writer
+            {
+                changed.extend(entry.keys);
             }
         }
         if let Some(max) = entry_keys.into_iter().max() {

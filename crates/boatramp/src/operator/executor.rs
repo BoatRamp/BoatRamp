@@ -25,13 +25,13 @@
 
 use boatramp_core::cose::TokenPublicKey;
 use k8s_openapi::api::core::v1::Secret;
-use kube::api::{Api, Patch, PatchParams};
 use kube::Client;
+use kube::api::{Api, Patch, PatchParams};
 use serde_json::json;
 
 use super::crd::BoatRampCluster;
 use super::membership::{self, ApiMember, MembershipAction};
-use super::{resources, Error, Result};
+use super::{Error, Result, resources};
 
 /// The control-plane port the pods serve on (`--tls rpk`; matches `resources::PORT`).
 const CONTROL_PLANE_PORT: u16 = 8080;

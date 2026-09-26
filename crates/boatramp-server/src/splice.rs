@@ -279,10 +279,10 @@ async fn classify(head: &[u8], ctx: &SpliceCtx) -> Option<SplicePlan> {
     // The embedded console middleware runs before the gateway fallback; defer any
     // request it would serve to the router. (Only wired with the `console` feature.)
     #[cfg(feature = "console")]
-    if let Some(eff) = &eff {
-        if crate::console::would_intercept(eff, host, path) {
-            return None;
-        }
+    if let Some(eff) = &eff
+        && crate::console::would_intercept(eff, host, path)
+    {
+        return None;
     }
 
     // Resolve host → (project, site), matching serve_by_host: an explicit domain
@@ -915,9 +915,10 @@ mod tests {
         let text = String::from_utf8(out).unwrap();
         assert!(text.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(text.contains("content-length: 3\r\n") || text.contains("Content-Length: 3\r\n"));
-        assert!(text
-            .to_ascii_lowercase()
-            .contains("content-type: text/plain"));
+        assert!(
+            text.to_ascii_lowercase()
+                .contains("content-type: text/plain")
+        );
         // Hop-by-hop headers are stripped.
         assert!(!text.to_ascii_lowercase().contains("connection:"));
         assert!(!text.to_ascii_lowercase().contains("transfer-encoding:"));
@@ -1110,7 +1111,7 @@ mod tests {
     #[tokio::test]
     async fn upstream_dying_mid_body_closes_the_client_instead_of_hanging() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        use tokio::time::{timeout, Duration};
+        use tokio::time::{Duration, timeout};
 
         // Upstream: promise 1 MiB, deliver 16 bytes, then vanish.
         let up = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1168,7 +1169,7 @@ mod tests {
     #[tokio::test]
     async fn non_eligible_request_after_spliced_get_falls_back_not_dropped() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        use tokio::time::{timeout, Duration};
+        use tokio::time::{Duration, timeout};
 
         // Keep-alive upstream returning a fixed-length body for every request.
         let up = TcpListener::bind("127.0.0.1:0").await.unwrap();

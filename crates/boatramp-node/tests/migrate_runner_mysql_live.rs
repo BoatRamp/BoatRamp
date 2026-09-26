@@ -44,8 +44,8 @@ use boatramp_core::sql::{
 };
 use boatramp_node::config::{ExternalDatabaseConfig, TenantIsolation, TenantScope};
 use boatramp_node::managed_sql::{NodeMigrationRunner, NodeOperatorSql};
-use boatramp_storage::sql_sqlx::{connect, ExternalSqlKind, ExternalSqlOptions};
 use boatramp_storage::FsStorage;
+use boatramp_storage::sql_sqlx::{ExternalSqlKind, ExternalSqlOptions, connect};
 
 const DB: &str = "app";
 const RUNTIME_URL_ENV: &str = "BOATRAMP_MIGRATE_MYSQL_RUNTIME_URL";

@@ -27,8 +27,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use boatramp_core::kv::{KvError, KvStore, WriteOp};
-use slatedb::object_store::local::LocalFileSystem;
 use slatedb::object_store::ObjectStore;
+use slatedb::object_store::local::LocalFileSystem;
 use slatedb::{Db, DbReader, DbReaderBuilder, Settings, WriteBatch};
 
 /// A SlateDB-backed key/value store — either the single **writer** or a
@@ -530,25 +530,29 @@ mod tests {
             );
 
             // Expected-absent creates; expected-absent on a present key does not swap.
-            assert!(kv
-                .compare_and_swap("inv/1", None, b"queued".to_vec())
-                .await
-                .unwrap());
+            assert!(
+                kv.compare_and_swap("inv/1", None, b"queued".to_vec())
+                    .await
+                    .unwrap()
+            );
             assert_eq!(kv.get("inv/1").await.unwrap(), Some(b"queued".to_vec()));
-            assert!(!kv
-                .compare_and_swap("inv/1", None, b"x".to_vec())
-                .await
-                .unwrap());
+            assert!(
+                !kv.compare_and_swap("inv/1", None, b"x".to_vec())
+                    .await
+                    .unwrap()
+            );
             // A stale expected does not swap; the exact prior bytes do.
-            assert!(!kv
-                .compare_and_swap("inv/1", Some(b"WRONG"), b"x".to_vec())
-                .await
-                .unwrap());
+            assert!(
+                !kv.compare_and_swap("inv/1", Some(b"WRONG"), b"x".to_vec())
+                    .await
+                    .unwrap()
+            );
             assert_eq!(kv.get("inv/1").await.unwrap(), Some(b"queued".to_vec()));
-            assert!(kv
-                .compare_and_swap("inv/1", Some(b"queued"), b"running".to_vec())
-                .await
-                .unwrap());
+            assert!(
+                kv.compare_and_swap("inv/1", Some(b"queued"), b"running".to_vec())
+                    .await
+                    .unwrap()
+            );
             assert_eq!(kv.get("inv/1").await.unwrap(), Some(b"running".to_vec()));
 
             // Race: many tasks in this single writer process try queued→<id>; exactly one wins.
@@ -649,10 +653,12 @@ mod tests {
 
             // …and refuses writes (control-plane writes go to the writer process).
             assert!(replica.put("x", b"y".to_vec()).await.is_err());
-            assert!(replica
-                .write_batch(vec![WriteOp::Delete("site/blog".into())])
-                .await
-                .is_err());
+            assert!(
+                replica
+                    .write_batch(vec![WriteOp::Delete("site/blog".into())])
+                    .await
+                    .is_err()
+            );
         })
         .await;
     }

@@ -91,7 +91,7 @@ use boatramp_core::sql::{SqlBackend, SqlValue};
 use boatramp_core::{ByteStream, GetObject, ObjectMeta, PutMeta, Storage, StorageError};
 use boatramp_node::config::{ExternalDatabaseConfig, TenantIsolation, TenantScope};
 use boatramp_node::managed_sql::ManagedSqlCredentials;
-use boatramp_node::tenant_sql::{provision_tenant, NodeTenantSqlResolver};
+use boatramp_node::tenant_sql::{NodeTenantSqlResolver, provision_tenant};
 use boatramp_storage::sql_sqlx::PerTenantSqlResolver;
 use bytes::Bytes;
 use futures::StreamExt;

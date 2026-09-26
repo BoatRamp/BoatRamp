@@ -12,7 +12,7 @@ use base64::Engine as _;
 
 use boatramp_core::cose::{self, Signer, TokenAlg, TokenError, TokenPublicKey};
 
-use super::{rest, sha256, SignerError};
+use super::{SignerError, rest, sha256};
 
 const BACKEND: &str = "gcp-kms";
 const API: &str = "https://cloudkms.googleapis.com/v1";

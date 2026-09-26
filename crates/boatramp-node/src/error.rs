@@ -52,7 +52,9 @@ pub enum Error {
     },
     /// An external database named an unrecognised engine `kind`.
     #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
-    #[error("handlers SQL binding: external database {name:?} has unknown kind {kind:?} (expected postgres | mysql)")]
+    #[error(
+        "handlers SQL binding: external database {name:?} has unknown kind {kind:?} (expected postgres | mysql)"
+    )]
     SqlExternalKind { name: String, kind: String },
     /// An external database entry omitted the required `url_env`.
     #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
@@ -86,7 +88,9 @@ pub enum Error {
         feature = "handlers",
         not(any(feature = "sql-postgres", feature = "sql-mysql"))
     ))]
-    #[error("handlers SQL binding: external database {0:?} needs an external SQL engine — rebuild with --features sql-postgres and/or sql-mysql")]
+    #[error(
+        "handlers SQL binding: external database {0:?} needs an external SQL engine — rebuild with --features sql-postgres and/or sql-mysql"
+    )]
     SqlExternalUnavailable(String),
 
     /// `--kv slatedb` selected but this build lacks SlateDB support.

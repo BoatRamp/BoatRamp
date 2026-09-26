@@ -14,8 +14,8 @@ use serde::{Deserialize, Serialize};
 use virtio_queue::{Queue, QueueT};
 use vm_memory::GuestMemoryMmap;
 
-use crate::embedded::{allocate_mmio, route_mmio, MmioDevice};
-use crate::embedded_vmm::{build_queue, VmmError};
+use crate::embedded::{MmioDevice, allocate_mmio, route_mmio};
+use crate::embedded_vmm::{VmmError, build_queue};
 use crate::virtio_mmio::{MmioState, MmioTransport, QueueConfig, VirtioDevice};
 
 /// The full host-side state of one device for a snapshot (scale-to-zero):
@@ -281,8 +281,8 @@ impl DeviceManager {
 mod tests {
     use super::*;
     use crate::virtio_mmio::{CONFIG_SPACE_OFFSET, MAGIC_VALUE};
-    use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
     use vm_memory::GuestAddress;
 
     // A fake device recording how many times each queue was serviced.

@@ -1,7 +1,7 @@
 //! Instance management behind `boatramp mcp setup add/list/remove` — thin wrappers
 //! over [`Config`] that also render a human summary for the CLI to print.
 
-use crate::config::{config_path, Config, InstanceConfig};
+use crate::config::{Config, InstanceConfig, config_path};
 use crate::error::Result;
 
 /// Register a new instance (secrets are stored as specs, never resolved here).

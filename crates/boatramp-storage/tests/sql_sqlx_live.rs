@@ -21,7 +21,7 @@
 #[allow(unused_imports)]
 use boatramp_core::sql::{SqlError, SqlValue};
 #[allow(unused_imports)]
-use boatramp_storage::sql_sqlx::{connect, ExternalSqlKind, ExternalSqlOptions};
+use boatramp_storage::sql_sqlx::{ExternalSqlKind, ExternalSqlOptions, connect};
 
 /// The external Postgres backend: create a table, round-trip every value class,
 /// classify a syntax error, and prove a `read_only` backend rejects writes.

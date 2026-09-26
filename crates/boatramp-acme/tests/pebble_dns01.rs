@@ -20,7 +20,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use boatramp_acme::acme::{obtain_certificate, CertRequest};
+use boatramp_acme::acme::{CertRequest, obtain_certificate};
 use boatramp_acme::dns::{DnsError, DnsProvider, DnsRecord};
 
 const CHALLTESTSRV_MGMT: &str = "http://127.0.0.1:8055";
@@ -173,7 +173,13 @@ async fn dns01_wildcard_issuance_against_pebble() {
 
     // Trust the throwaway CA for the real issuance client (instant-acme's
     // `with_native_roots` honours SSL_CERT_FILE).
-    std::env::set_var("SSL_CERT_FILE", &ca_path);
+    //
+    // Documented exception to the EnvSource DI rule: this is an #[ignore]d live-pebble
+    // integration test pointing an *external* ACME client at a throwaway CA — not a
+    // boatramp resolver — so the injectable-EnvSource design does not apply here. In
+    // edition 2024 `std::env::set_var` is `unsafe` (data race across threads); this test
+    // is single-threaded before any concurrent env reads, so the wrap is sound.
+    unsafe { std::env::set_var("SSL_CERT_FILE", &ca_path) };
 
     let request = CertRequest {
         directory_url: DIRECTORY_URL.to_string(),

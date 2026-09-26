@@ -1,6 +1,6 @@
 //! A plaintext (h2c, prior-knowledge) server for conformance testing:
 //!   cargo run --example h2c-server   # then: h2spec -h 127.0.0.1 -p 8080
-use boatramp_http::h2::{response, serve_connection, Handler, Request, Response};
+use boatramp_http::h2::{Handler, Request, Response, response, serve_connection};
 use tokio::net::TcpListener;
 
 struct Ok200;

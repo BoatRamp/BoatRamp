@@ -72,12 +72,14 @@ async fn azure_round_trip_and_range() {
     assert_eq!(tail, &DATA[DATA.len() - 6..]);
 
     // list sees the object under its prefix
-    assert!(storage
-        .list("zz/")
-        .await
-        .unwrap()
-        .iter()
-        .any(|meta| meta.key == key));
+    assert!(
+        storage
+            .list("zz/")
+            .await
+            .unwrap()
+            .iter()
+            .any(|meta| meta.key == key)
+    );
 
     // delete, then head is NotFound; a second delete is idempotent
     storage.delete(key).await.unwrap();

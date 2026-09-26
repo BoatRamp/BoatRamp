@@ -200,9 +200,11 @@ mod tests {
         assert!(lines.contains(&"ip addr add 10.0.0.1/24 dev br-boatramp".to_string()));
         assert!(lines.contains(&"sysctl -w net.ipv4.ip_forward=1".to_string()));
         // The masquerade rule targets the uplink.
-        assert!(lines
-            .iter()
-            .any(|l| l.contains("masquerade") && l.contains("eth0")));
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("masquerade") && l.contains("eth0"))
+        );
     }
 
     #[test]

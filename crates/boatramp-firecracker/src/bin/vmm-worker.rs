@@ -8,7 +8,7 @@
 #[cfg(all(target_os = "linux", feature = "embedded", feature = "backend"))]
 fn main() {
     use boatramp_firecracker::embedded_backend::{
-        run_jailed_worker, WorkerConfig, VMM_RUN_SUBCOMMAND,
+        VMM_RUN_SUBCOMMAND, WorkerConfig, run_jailed_worker,
     };
 
     let args: Vec<String> = std::env::args().collect();

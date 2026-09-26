@@ -572,7 +572,7 @@ export default {{
 /// uploads the edge Worker (creating the DO namespaces), then creates/rolls out
 /// the container application referencing the boatramp image.
 async fn deploy_native(args: &CloudflareArgs) -> Result<()> {
-    use boatramp_cloudflare::api::{plan_application, ApplicationAction, CfApi};
+    use boatramp_cloudflare::api::{ApplicationAction, CfApi, plan_application};
     use boatramp_cloudflare::deploy;
 
     let nodes = plan_topology(&args.regions, &args.primary, args.quorum, args.mesh_port)?;

@@ -479,17 +479,17 @@ pub(crate) fn apply_op(target: &mut ApplyTarget, op: WriteOp) -> WriteResponse {
             until_ms,
         } => {
             let key = messaging::meta_key(&topic, &id);
-            if let Some(raw) = target.data.get(&key) {
-                if let Ok(mut record) = serde_json::from_slice::<messaging::Record>(raw) {
-                    record.lease_until_ms = until_ms; // 0 = claimable now; else held until the backoff deadline
-                    if let Ok(json) = serde_json::to_vec(&record) {
-                        target.put(key, json);
-                    }
-                    // Event-driven delivery (B1): a nacked message is claimable again (now, or at
-                    // `until_ms`), so re-arm the topic's ready marker in this same apply — a prior
-                    // claim-drain may have pruned it. The due-heap covers a future `until_ms`.
-                    target.put(messaging::ready_key(&topic), Vec::new());
+            if let Some(raw) = target.data.get(&key)
+                && let Ok(mut record) = serde_json::from_slice::<messaging::Record>(raw)
+            {
+                record.lease_until_ms = until_ms; // 0 = claimable now; else held until the backoff deadline
+                if let Ok(json) = serde_json::to_vec(&record) {
+                    target.put(key, json);
                 }
+                // Event-driven delivery (B1): a nacked message is claimable again (now, or at
+                // `until_ms`), so re-arm the topic's ready marker in this same apply — a prior
+                // claim-drain may have pruned it. The due-heap covers a future `until_ms`.
+                target.put(messaging::ready_key(&topic), Vec::new());
             }
             WriteResponse::Kv
         }
@@ -497,12 +497,12 @@ pub(crate) fn apply_op(target: &mut ApplyTarget, op: WriteOp) -> WriteResponse {
             // Read-modify-write the live record's last_error (already sanitized by the caller). A
             // no-op if the message was acked/gone since the failed delivery.
             let key = messaging::meta_key(&topic, &id);
-            if let Some(raw) = target.data.get(&key) {
-                if let Ok(mut record) = serde_json::from_slice::<messaging::Record>(raw) {
-                    record.last_error = Some(reason);
-                    if let Ok(json) = serde_json::to_vec(&record) {
-                        target.put(key, json);
-                    }
+            if let Some(raw) = target.data.get(&key)
+                && let Ok(mut record) = serde_json::from_slice::<messaging::Record>(raw)
+            {
+                record.last_error = Some(reason);
+                if let Ok(json) = serde_json::to_vec(&record) {
+                    target.put(key, json);
                 }
             }
             WriteResponse::Kv
@@ -2382,7 +2382,7 @@ mod tests {
     #[serial_test::serial]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn cluster_managed_certs_issue_once_serve_everywhere() {
-        use boatramp_core::cert::{ensure_cert, CertStore, KvCertStore, StoredCert};
+        use boatramp_core::cert::{CertStore, KvCertStore, StoredCert, ensure_cert};
         use boatramp_core::kv::KvStore;
         use std::sync::atomic::{AtomicUsize, Ordering};
 

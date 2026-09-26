@@ -673,7 +673,8 @@ mod tests {
     /// var or empty file — keeping the secret out of the config file (#6).
     #[test]
     fn join_token_resolves_env_path_and_inline() {
-        let env = boatramp_core::env::MapEnv::new().with("BOATRAMP_TEST_JOIN_TOKEN", "  tok-from-env  ");
+        let env =
+            boatramp_core::env::MapEnv::new().with("BOATRAMP_TEST_JOIN_TOKEN", "  tok-from-env  ");
         assert_eq!(resolve_join_token("", &env).unwrap(), None);
         assert_eq!(
             resolve_join_token("inline-token", &env).unwrap(),

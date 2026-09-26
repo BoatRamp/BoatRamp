@@ -21,8 +21,8 @@ use crate::raft::NodeId;
 // The RPK crypto core, re-exported under the historical mesh names so the rest of
 // the cluster crate (and any external user) is unchanged.
 pub use boatramp_rpktls::{
-    client_config, parse_public_key, server_config, PresentedKey, RpkError as MeshError,
-    RpkIdentity as MeshIdentity, RpkTls as MeshTls, TrustSet,
+    PresentedKey, RpkError as MeshError, RpkIdentity as MeshIdentity, RpkTls as MeshTls, TrustSet,
+    client_config, parse_public_key, server_config,
 };
 
 /// The replicated-KV prefix under which the durable trust set lives: each
@@ -110,7 +110,7 @@ fn to_hex(bytes: &[u8]) -> String {
 /// Decode an even-length hex string; `None` on any non-hex or odd length.
 fn from_hex(s: &str) -> Option<Vec<u8>> {
     let s = s.trim();
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return None;
     }
     (0..s.len())

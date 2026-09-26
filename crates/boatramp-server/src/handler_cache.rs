@@ -16,7 +16,7 @@
 //!   `max-age` / `s-maxage`; nothing is cached heuristically.
 
 use axum::body::Body;
-use axum::http::{header, HeaderMap, Method, StatusCode};
+use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use boatramp_core::kv::KvStore;
 use sha2::{Digest, Sha256};
@@ -859,9 +859,11 @@ mod tests {
         )
         .await;
         // Past expiry (1000 + 60): a miss, and the stale key is deleted.
-        assert!(lookup_response(&kv, &key, &HeaderMap::new(), 2_000)
-            .await
-            .is_none());
+        assert!(
+            lookup_response(&kv, &key, &HeaderMap::new(), 2_000)
+                .await
+                .is_none()
+        );
         assert!(kv.get(&key).await.unwrap().is_none(), "stale entry evicted");
     }
 

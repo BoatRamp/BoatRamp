@@ -7,10 +7,10 @@
 //! is the live integration seam.
 
 use async_trait::async_trait;
+use aws_sdk_route53::Client;
 use aws_sdk_route53::types::{
     Change, ChangeAction, ChangeBatch, ResourceRecord, ResourceRecordSet, RrType,
 };
-use aws_sdk_route53::Client;
 
 use crate::dns::{DnsError, DnsProvider, DnsRecord, RecordKind};
 

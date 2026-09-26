@@ -24,7 +24,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use boatramp_core::sql::{
-    reject_reserved_session_writes, SqlBackend, SqlError, SqlTransaction, SqlValue,
+    SqlBackend, SqlError, SqlTransaction, SqlValue, reject_reserved_session_writes,
 };
 use wasmtime::component::{Resource, ResourceTable};
 
@@ -817,12 +817,14 @@ mod tests {
         assert!(log.iter().any(|l| l == "cache:begin"));
         assert!(log.iter().any(|l| l == "main:commit"));
         assert!(log.iter().any(|l| l == "cache:commit"));
-        assert!(log
-            .iter()
-            .any(|l| l.starts_with("main:execute INSERT INTO m")));
-        assert!(log
-            .iter()
-            .any(|l| l.starts_with("cache:execute INSERT INTO c")));
+        assert!(
+            log.iter()
+                .any(|l| l.starts_with("main:execute INSERT INTO m"))
+        );
+        assert!(
+            log.iter()
+                .any(|l| l.starts_with("cache:execute INSERT INTO c"))
+        );
     }
 
     #[tokio::test]
@@ -1133,11 +1135,12 @@ mod tests {
         host.execute(db, "SET boatramp.project = 'x'".into(), vec![])
             .await
             .unwrap();
-        assert!(log
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|l| l.contains("boatramp.project")));
+        assert!(
+            log.lock()
+                .unwrap()
+                .iter()
+                .any(|l| l.contains("boatramp.project"))
+        );
     }
 
     fn scoped_session(
@@ -1192,9 +1195,10 @@ mod tests {
             .unwrap();
         }
         let log = log.lock().unwrap();
-        assert!(log.iter().any(|l| l
-            .contains("SELECT * FROM orders WHERE status = ?1 AND tenant_id = ?2")
-            && l.contains("ten_1")));
+        assert!(log.iter().any(|l| {
+            l.contains("SELECT * FROM orders WHERE status = ?1 AND tenant_id = ?2")
+                && l.contains("ten_1")
+        }));
     }
 
     #[tokio::test]
@@ -1233,11 +1237,12 @@ mod tests {
                 .await
                 .unwrap();
         }
-        assert!(log
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|l| l.contains("SELECT 1 FROM t WHERE tenant_id = ?1")));
+        assert!(
+            log.lock()
+                .unwrap()
+                .iter()
+                .any(|l| l.contains("SELECT 1 FROM t WHERE tenant_id = ?1"))
+        );
     }
 
     #[tokio::test]
@@ -1253,11 +1258,12 @@ mod tests {
                 .await
                 .unwrap();
         }
-        assert!(log
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|l| l.contains("SELECT 1 WHERE 1 = 1")));
+        assert!(
+            log.lock()
+                .unwrap()
+                .iter()
+                .any(|l| l.contains("SELECT 1 WHERE 1 = 1"))
+        );
     }
 
     // ---- R4/D8: a raw-SQL target read is AST-rewritten (not marker-substituted) ---------------

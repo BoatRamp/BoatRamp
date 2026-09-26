@@ -18,7 +18,7 @@ pub mod registry;
 mod server;
 pub mod setup;
 
-pub use client::{caller_bearer, ControlPlane, HttpControlPlane, CALLER_BEARER};
+pub use client::{CALLER_BEARER, ControlPlane, HttpControlPlane, caller_bearer};
 pub use config::{Config, InstanceConfig};
 pub use error::{Error, Result};
 pub use registry::{Backend, InstanceRegistry, SingleBackend};

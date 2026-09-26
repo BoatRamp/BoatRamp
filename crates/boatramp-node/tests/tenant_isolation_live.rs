@@ -52,17 +52,17 @@ use std::time::Duration;
 use async_trait::async_trait;
 use boatramp_container::ContainerBackend;
 use boatramp_core::compute::{
-    managed_db_spec, Artifact, ComputeBackend, ComputeWorkload, LaunchRequest, ManagedDbEngine,
-    ObservedInstance, PlacementConstraints, PrivilegeDirective, ReplicaPhase,
+    Artifact, ComputeBackend, ComputeWorkload, LaunchRequest, ManagedDbEngine, ObservedInstance,
+    PlacementConstraints, PrivilegeDirective, ReplicaPhase, managed_db_spec,
 };
 use boatramp_core::deploy::DeployStore;
 use boatramp_core::envelope::{EnvelopeError, KeyEnvelope};
 use boatramp_core::kv::{KvStore, MemoryKv};
-use boatramp_core::project::{ProjectRef, DEFAULT_PROJECT};
+use boatramp_core::project::{DEFAULT_PROJECT, ProjectRef};
 use boatramp_core::{ByteStream, GetObject, ObjectMeta, PutMeta, Storage, StorageError};
 use boatramp_node::config::{ExternalDatabaseConfig, TenantIsolation, TenantScope};
 use boatramp_node::managed_sql::ManagedSqlCredentials;
-use boatramp_node::tenant_sql::{provision_tenant, tenant_key, TenantNames};
+use boatramp_node::tenant_sql::{TenantNames, provision_tenant, tenant_key};
 use boatramp_storage::tenant_provision::{
     sanitize_ident, tenant_db_name, tenant_owner_role_name, tenant_role_name,
 };

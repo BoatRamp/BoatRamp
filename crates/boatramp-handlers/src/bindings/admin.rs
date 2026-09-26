@@ -355,10 +355,11 @@ mod tests {
         // Granted domains but NOT email: a domain verb works, an email verb is access-denied.
         let b = binding(&[Surface::Domains]);
         let mut host = AdminHost::new(Some(&b));
-        assert!(host
-            .domain_add("blog".into(), "x.example".into(), "http".into())
-            .await
-            .is_ok());
+        assert!(
+            host.domain_add("blog".into(), "x.example".into(), "http".into())
+                .await
+                .is_ok()
+        );
         assert!(matches!(
             host.email_delete("default".into()).await.unwrap_err(),
             admin_types::AdminError::AccessDenied

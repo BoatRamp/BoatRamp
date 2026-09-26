@@ -9,7 +9,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use boatramp_rpktls::{client_config_server_auth, RpkIdentity, RpkTls, TrustSet};
+use boatramp_rpktls::{RpkIdentity, RpkTls, TrustSet, client_config_server_auth};
 
 /// Spawn a minimal RPK-TLS server (a `/healthz` route) and return its address +
 /// the SPKI it presents. rpktls configs carry their own crypto provider, so no

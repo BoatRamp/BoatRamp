@@ -16,8 +16,8 @@ use tokio::sync::Semaphore;
 use wasmtime::component::{Component, Linker, ResourceTable};
 use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder};
 use wasmtime_wasi::{IoView, WasiCtx, WasiCtxBuilder, WasiView};
-use wasmtime_wasi_http::bindings::http::types::{ErrorCode, Scheme};
 use wasmtime_wasi_http::bindings::ProxyPre;
+use wasmtime_wasi_http::bindings::http::types::{ErrorCode, Scheme};
 use wasmtime_wasi_http::body::{HostIncomingBody, HyperIncomingBody, HyperOutgoingBody};
 use wasmtime_wasi_http::types::HostIncomingRequest;
 use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpView};
@@ -298,10 +298,10 @@ impl WasiHttpView for HostState {
                 Ok(plan) => {
                     // A self-call carries its (nonce-stamped) recursion depth so the
                     // re-entering invocation sees it and the gate can cap the chain.
-                    if let Some(next) = plan.self_depth {
-                        if let Ok(v) = format!("{egress_nonce:x}:{next}").parse() {
-                            request.headers_mut().insert(SELF_EGRESS_DEPTH_HEADER, v);
-                        }
+                    if let Some(next) = plan.self_depth
+                        && let Ok(v) = format!("{egress_nonce:x}:{next}").parse()
+                    {
+                        request.headers_mut().insert(SELF_EGRESS_DEPTH_HEADER, v);
                     }
                     // Dev-posture extra-CA: when an operator supplied extra roots AND this is a TLS
                     // request, send through our own handler that trusts webpki ⊕ those roots.

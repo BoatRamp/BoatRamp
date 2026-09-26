@@ -321,36 +321,44 @@ mod tests {
         assert!(ok.validate().is_ok());
 
         // Empty.
-        assert!(Workflow {
-            name: "w".into(),
-            steps: vec![]
-        }
-        .validate()
-        .is_err());
+        assert!(
+            Workflow {
+                name: "w".into(),
+                steps: vec![]
+            }
+            .validate()
+            .is_err()
+        );
 
         // Duplicate id.
-        assert!(Workflow {
-            name: "w".into(),
-            steps: vec![step("a", &[]), step("a", &[])],
-        }
-        .validate()
-        .is_err());
+        assert!(
+            Workflow {
+                name: "w".into(),
+                steps: vec![step("a", &[]), step("a", &[])],
+            }
+            .validate()
+            .is_err()
+        );
 
         // Unknown dep.
-        assert!(Workflow {
-            name: "w".into(),
-            steps: vec![step("a", &["ghost"])],
-        }
-        .validate()
-        .is_err());
+        assert!(
+            Workflow {
+                name: "w".into(),
+                steps: vec![step("a", &["ghost"])],
+            }
+            .validate()
+            .is_err()
+        );
 
         // Cycle a -> b -> a.
-        assert!(Workflow {
-            name: "w".into(),
-            steps: vec![step("a", &["b"]), step("b", &["a"])],
-        }
-        .validate()
-        .is_err());
+        assert!(
+            Workflow {
+                name: "w".into(),
+                steps: vec![step("a", &["b"]), step("b", &["a"])],
+            }
+            .validate()
+            .is_err()
+        );
     }
 
     #[test]

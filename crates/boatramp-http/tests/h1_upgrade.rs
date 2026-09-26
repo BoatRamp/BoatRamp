@@ -4,7 +4,7 @@
 //! hands it the reunited socket (with any bytes sent past the handshake replayed).
 
 use boatramp_http::{
-    is_upgrade_request, on_upgrade, response, serve_connection, Handler, Request, Response,
+    Handler, Request, Response, is_upgrade_request, on_upgrade, response, serve_connection,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 

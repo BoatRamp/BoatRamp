@@ -63,11 +63,11 @@ pub mod time;
 // The shared wasm-clean layer lives in `boatramp-types`; re-export it so the
 // `boatramp_core::config`/`::route`/`::matcher`/`::domain_verify`/… paths are
 // unchanged. (`compute` is its own module above — it re-exports the types layer.)
+pub use boatramp_types::{SCHEMA_VERSION, schema_version};
 pub use boatramp_types::{
     access, authz, blob_notify, config, cron, daemon_config, dns_managed, domain_verify, function,
     gateway, geo, host, logs, matcher, predicate, route, security, site, tenancy, waf, workflow,
 };
-pub use boatramp_types::{schema_version, SCHEMA_VERSION};
 
 pub use error::{ConfigError, DeployError, KvError, StorageError};
 pub use mode::DeploymentMode;

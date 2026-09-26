@@ -236,7 +236,12 @@ mod tests {
         assert!(parse(&["secrets", "set", "api-key", "--file", "/tmp/k"]).is_ok());
         // Two sources at once are mutually exclusive → a parse error.
         assert!(parse(&["secrets", "set", "api-key", "--stdin", "--value", "x"]).is_err());
-        assert!(parse(&["secrets", "set", "api-key", "--file", "/tmp/k", "--value", "x"]).is_err());
+        assert!(
+            parse(&[
+                "secrets", "set", "api-key", "--file", "/tmp/k", "--value", "x"
+            ])
+            .is_err()
+        );
     }
 
     #[test]

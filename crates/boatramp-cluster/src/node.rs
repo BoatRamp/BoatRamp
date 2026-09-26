@@ -17,20 +17,20 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
+use boatramp_core::Storage;
 use boatramp_core::kv::KvStore;
 use boatramp_core::messaging::StreamHubs;
-use boatramp_core::Storage;
 use openraft::{BasicNode, Config, Raft};
 
 use crate::http::{
-    raft_router, stream_router, HttpForwarder, HttpNetworkFactory, HttpStreamBus, Peers,
+    HttpForwarder, HttpNetworkFactory, HttpStreamBus, Peers, raft_router, stream_router,
 };
 use crate::mesh::{MeshClients, MeshTls, TrustSet};
 use crate::messaging::RaftMessaging;
 use crate::persist::{PersistentLogStore, PersistentStateMachine};
 use crate::raft::{
-    add_voter, is_leader, remove_voter, ApplyObserver, ClientWriteRaftError, MembershipError,
-    NodeId, RaftKv, TypeConfig, WriteOp, WriteResponse,
+    ApplyObserver, ClientWriteRaftError, MembershipError, NodeId, RaftKv, TypeConfig, WriteOp,
+    WriteResponse, add_voter, is_leader, remove_voter,
 };
 
 /// Mirrors committed `mesh/trust/*` writes into this node's live [`TrustSet`], so
@@ -82,10 +82,10 @@ impl ApplyObserver for MeshAddrObserver {
         for m in muts {
             match m {
                 WriteOp::Put(key, value) => {
-                    if let Some(node) = crate::raft::parse_addr_key(key) {
-                        if let Ok(url) = String::from_utf8(value.clone()) {
-                            self.peers.insert(node, url);
-                        }
+                    if let Some(node) = crate::raft::parse_addr_key(key)
+                        && let Ok(url) = String::from_utf8(value.clone())
+                    {
+                        self.peers.insert(node, url);
                     }
                 }
                 WriteOp::Delete(key) => {
@@ -99,10 +99,10 @@ impl ApplyObserver for MeshAddrObserver {
 
     fn on_reset(&self, data: &BTreeMap<String, Vec<u8>>) {
         for (key, value) in data {
-            if let Some(node) = crate::raft::parse_addr_key(key) {
-                if let Ok(url) = String::from_utf8(value.clone()) {
-                    self.peers.insert(node, url);
-                }
+            if let Some(node) = crate::raft::parse_addr_key(key)
+                && let Ok(url) = String::from_utf8(value.clone())
+            {
+                self.peers.insert(node, url);
             }
         }
     }

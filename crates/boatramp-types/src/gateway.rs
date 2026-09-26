@@ -352,7 +352,7 @@ mod tests {
         assert_eq!(u.forward_path("/app"), "/");
         assert_eq!(u.forward_path("/app/foo/bar"), "/foo/bar");
         assert_eq!(u.forward_path("/application"), "/application"); // partial → no strip
-                                                                    // A trailing slash on the prefix is tolerated.
+        // A trailing slash on the prefix is tolerated.
         let u2 = upstream("http://h:1", Some("/app/"));
         assert_eq!(u2.forward_path("/app/x"), "/x");
         // No prefix → unchanged.

@@ -324,7 +324,7 @@ pub(super) async fn invoke_function(
     let function = match deploy.get_function(project.as_ref(), &name).await {
         Ok(Some(f)) => f,
         Ok(None) => {
-            return (StatusCode::NOT_FOUND, format!("no function {name:?}\n")).into_response()
+            return (StatusCode::NOT_FOUND, format!("no function {name:?}\n")).into_response();
         }
         Err(err) => return deploy_error_response(err),
     };
@@ -493,7 +493,7 @@ async fn enqueue_invocation(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "async invoke body exceeds the buffer cap\n",
             )
-                .into_response()
+                .into_response();
         }
     };
     let now = now_unix();
@@ -516,13 +516,12 @@ async fn enqueue_invocation(
     if let Err(err) = deploy.put_invocation(project, &inv).await {
         return deploy_error_response(err);
     }
-    if let Some(key) = &idem_key {
-        if let Err(err) = deploy
+    if let Some(key) = &idem_key
+        && let Err(err) = deploy
             .put_idempotency(project, &function.name, key, &id)
             .await
-        {
-            return deploy_error_response(err);
-        }
+    {
+        return deploy_error_response(err);
     }
     (StatusCode::ACCEPTED, Json(inv)).into_response()
 }
@@ -601,7 +600,7 @@ pub(super) async fn execute_function(
                 )
                     .into_response(),
                 0,
-            )
+            );
         }
     };
     let wasm = match read_blob_fully(deploy, component).await {
@@ -893,10 +892,11 @@ pub(super) async fn build_function_bindings(
             names.push(""); // the default database
         }
         for imp in &config.imports {
-            if let Some(name) = imp.strip_prefix("sql:") {
-                if !name.is_empty() && name != "*" {
-                    names.push(name);
-                }
+            if let Some(name) = imp.strip_prefix("sql:")
+                && !name.is_empty()
+                && name != "*"
+            {
+                names.push(name);
             }
         }
         for name in names {
@@ -1041,38 +1041,38 @@ pub(super) async fn build_function_bindings(
         .as_ref()
         .map(|h| h.facts().to_vec())
         .unwrap_or_default();
-    if granted("wasi:messaging") {
-        if let Some(messaging) = &inner.messaging {
-            // Stamp the producer's own-tenant onto every message it publishes (R1, guest-blind), so
-            // a consumer declaring `sources: [signed_context]` resolves it on the async lane. Fixed
-            // here from this invocation's resolved principal; `None` for an unscoped producer.
-            let signed_context = mint_producer_context(inner, &caller_tenant).await;
-            // Private topics namespace under the function's own scope; `bus:<topic>`
-            // publishes route to the shared, project-scoped bus.
-            bindings = bindings.with_messaging(
-                format!("{scope}/"),
-                format!("{}/", project.qualified("bus")),
-                messaging.clone(),
-                signed_context,
-            );
-        }
+    if granted("wasi:messaging")
+        && let Some(messaging) = &inner.messaging
+    {
+        // Stamp the producer's own-tenant onto every message it publishes (R1, guest-blind), so
+        // a consumer declaring `sources: [signed_context]` resolves it on the async lane. Fixed
+        // here from this invocation's resolved principal; `None` for an unscoped producer.
+        let signed_context = mint_producer_context(inner, &caller_tenant).await;
+        // Private topics namespace under the function's own scope; `bus:<topic>`
+        // publishes route to the shared, project-scoped bus.
+        bindings = bindings.with_messaging(
+            format!("{scope}/"),
+            format!("{}/", project.qualified("bus")),
+            messaging.clone(),
+            signed_context,
+        );
     }
     // The read-only `messaging-stats` capability: surface the already-computed per-topic bus gauges
     // to a granted function. Plain topics resolve under the function's own `scope` prefix; a
     // `bus:<template>` topic must be one of the function's declared `stats_topics`, and the host
     // substitutes THIS invocation's resolved tenant for the template's `{tenant}` placeholder — the
     // guest never names a tenant, so no cross-tenant oracle. Deny-by-default.
-    if granted("messaging-stats") {
-        if let Some(messaging) = &inner.messaging {
-            let resolved_tenant = resolved_tenant_string(&caller_tenant);
-            bindings = bindings.with_messaging_stats(
-                format!("{scope}/"),
-                format!("{}/", project.qualified("bus")),
-                messaging.clone(),
-                config.stats_topics.clone(),
-                resolved_tenant,
-            );
-        }
+    if granted("messaging-stats")
+        && let Some(messaging) = &inner.messaging
+    {
+        let resolved_tenant = resolved_tenant_string(&caller_tenant);
+        bindings = bindings.with_messaging_stats(
+            format!("{scope}/"),
+            format!("{}/", project.qualified("bus")),
+            messaging.clone(),
+            config.stats_topics.clone(),
+            resolved_tenant,
+        );
     }
     // The per-tenant sealed-secret capability (task #493): read/write secrets sealed to THIS
     // invocation's resolved OWN-tenant. Two INDEPENDENT rights (`tenant-secrets:read` get/list,
@@ -1081,18 +1081,18 @@ pub(super) async fn build_function_bindings(
     // `Tenant` fact — `None` ⇒ every call `no-resolved-tenant`. `tenant_secret_names` is the name
     // allowlist (empty ⇒ deny-all). Deny-by-default: no `[secrets]` envelope (no store) OR neither
     // right ⇒ no binding. The guest never names a tenant (the host injects the resolved one).
-    if granted("tenant-secrets:read") || granted("tenant-secrets:admin") {
-        if let Some(store) = inner.tenant_secret_store.get() {
-            let resolved_tenant = resolved_tenant_string(&caller_tenant);
-            bindings = bindings.with_tenant_secrets(
-                store.clone(),
-                project.as_str(),
-                resolved_tenant,
-                config.tenant_secret_names.clone(),
-                granted("tenant-secrets:read"),
-                granted("tenant-secrets:admin"),
-            );
-        }
+    if (granted("tenant-secrets:read") || granted("tenant-secrets:admin"))
+        && let Some(store) = inner.tenant_secret_store.get()
+    {
+        let resolved_tenant = resolved_tenant_string(&caller_tenant);
+        bindings = bindings.with_tenant_secrets(
+            store.clone(),
+            project.as_str(),
+            resolved_tenant,
+            config.tenant_secret_names.clone(),
+            granted("tenant-secrets:read"),
+            granted("tenant-secrets:admin"),
+        );
     }
     // Gap 3: `tenancy::present-token` — an emitter that verified a tenant credential IN-GUEST hands
     // it to the host, which RE-verifies it against this function's declared `token_claims` + `token`
@@ -1100,47 +1100,48 @@ pub(super) async fn build_function_bindings(
     // stamps it). Deny-by-default: needs the `tenancy` import, a messaging cell to stamp, a declared
     // `token` source (for the claim name) + `token_claims` (the JWKS), and a fleet signer — absent
     // any, `present-token` is `access-denied` and nothing is stamped. The guest never names a tenant.
-    if granted("tenancy") {
-        if let (Some(cell), Some(token_cfg), Some(signer), Some(claim)) = (
+    if granted("tenancy")
+        && let (Some(cell), Some(token_cfg), Some(signer), Some(claim)) = (
             bindings.producer_context_cell(),
             config.token_claims.clone(),
             inner.session_signer.get().cloned(),
             token_source_claim(config.tenancy.as_ref()),
-        ) {
-            bindings = bindings.with_present_token(
-                Arc::new(ServerProducerContextSource {
-                    token_cfg,
-                    claim,
-                    signer,
-                    env_source: inner.env_source_arc(),
-                }),
-                cell,
-            );
-        }
+        )
+    {
+        bindings = bindings.with_present_token(
+            Arc::new(ServerProducerContextSource {
+                token_cfg,
+                claim,
+                signer,
+                env_source: inner.env_source_arc(),
+            }),
+            cell,
+        );
     }
     // Function-to-function invoke (FI): granted only when the function imports
     // `invoke`, names at least one allowed target, and the runtime has an invoker
     // (set at serve startup). `depth` is this function's position in the call
     // chain; the host caps the next hop.
-    if granted("invoke") && !config.invoke_targets.is_empty() {
-        if let Some(invoker) = inner.invoker.get() {
-            bindings = bindings.with_invoke(
-                invoker.scoped(project, caller_tenant.clone()),
-                config.invoke_targets.clone(),
-                depth,
-            );
-        }
+    if granted("invoke")
+        && !config.invoke_targets.is_empty()
+        && let Some(invoker) = inner.invoker.get()
+    {
+        bindings = bindings.with_invoke(
+            invoker.scoped(project, caller_tenant.clone()),
+            config.invoke_targets.clone(),
+            depth,
+        );
     }
     // GraphQL supergraph capability: run an operation against the project's composed supergraph
     // in-process, at this function's call depth (so a subgraph function reached from a guest run
     // that itself runs an op counts against the shared cap).
-    if granted("graphql") {
-        if let Some(runner) = inner.federation_runner.get() {
-            // Propagate the caller's resolved principal so a `graphql::run` sub-fetch inherits the
-            // caller's tenancy (symmetric to `with_invoke` above) — the async lane's own-scoped
-            // supergraph writes then resolve instead of failing closed.
-            bindings = bindings.with_graphql(runner.scoped(project, caller_tenant.clone()), depth);
-        }
+    if granted("graphql")
+        && let Some(runner) = inner.federation_runner.get()
+    {
+        // Propagate the caller's resolved principal so a `graphql::run` sub-fetch inherits the
+        // caller's tenancy (symmetric to `with_invoke` above) — the async lane's own-scoped
+        // supergraph writes then resolve instead of failing closed.
+        bindings = bindings.with_graphql(runner.scoped(project, caller_tenant.clone()), depth);
     }
     // Per-project SMTP email gateway: a function may submit a finished message to
     // one of the project's SMTP profiles. Granted when it imports `email` and the
@@ -1149,21 +1150,20 @@ pub(super) async fn build_function_bindings(
     // `access-denied`). The SMTP credentials are resolved host-side and never
     // exposed to the guest.
     #[cfg(feature = "email")]
-    if granted("email") {
-        if let (Some(store), Some(spool)) =
+    if granted("email")
+        && let (Some(store), Some(spool)) =
             (inner.email_profile_store.get(), inner.email_spool.get())
-        {
-            match store.resolve_all(project).await {
-                Ok(profiles) => {
-                    bindings = bindings.with_email(
-                        project.as_str(),
-                        std::sync::Arc::new(profiles),
-                        spool.clone(),
-                    );
-                }
-                Err(err) => {
-                    tracing::warn!(scope, %err, "resolving email profiles failed; email not granted");
-                }
+    {
+        match store.resolve_all(project).await {
+            Ok(profiles) => {
+                bindings = bindings.with_email(
+                    project.as_str(),
+                    std::sync::Arc::new(profiles),
+                    spool.clone(),
+                );
+            }
+            Err(err) => {
+                tracing::warn!(scope, %err, "resolving email profiles failed; email not granted");
             }
         }
     }
@@ -1250,10 +1250,8 @@ fn prepare_invoke_request(mut request: Request) -> Request {
         .uri()
         .authority()
         .is_some_and(|a| a.host() == INVOKE_AUTHORITY);
-    if !already_internal {
-        if let Ok(uri) = format!("http://{INVOKE_AUTHORITY}/").parse() {
-            *request.uri_mut() = uri;
-        }
+    if !already_internal && let Ok(uri) = format!("http://{INVOKE_AUTHORITY}/").parse() {
+        *request.uri_mut() = uri;
     }
     request
         .headers_mut()
@@ -1605,7 +1603,7 @@ pub(super) async fn introspect_service_sdl(
         Err(_elapsed) => {
             return Err(SubgraphSdlError::InvokeFailed(
                 "timed out answering `_service { sdl }`".to_string(),
-            ))
+            ));
         }
     };
     let buffered = buffer_invoke_response(response).await;
@@ -1671,10 +1669,10 @@ pub(super) async fn capture_response(response: Response) -> (StatusCode, Option<
 #[cfg(feature = "handlers")]
 fn rebuild_response(status: StatusCode, content_type: Option<&str>, body: Vec<u8>) -> Response {
     let mut builder = axum::http::Response::builder().status(status);
-    if let Some(ct) = content_type {
-        if let Ok(value) = HeaderValue::from_str(ct) {
-            builder = builder.header(header::CONTENT_TYPE, value);
-        }
+    if let Some(ct) = content_type
+        && let Ok(value) = HeaderValue::from_str(ct)
+    {
+        builder = builder.header(header::CONTENT_TYPE, value);
     }
     builder
         .body(axum::body::Body::from(body))
@@ -1931,10 +1929,10 @@ fn build_stored_request(inv: &boatramp_core::function::Invocation) -> Request {
         .method(axum::http::Method::POST)
         .uri(format!("http://{INVOKE_AUTHORITY}/"))
         .header(header::HOST, INVOKE_AUTHORITY);
-    if let Some(ct) = &inv.request_content_type {
-        if let Ok(value) = HeaderValue::from_str(ct) {
-            builder = builder.header(header::CONTENT_TYPE, value);
-        }
+    if let Some(ct) = &inv.request_content_type
+        && let Ok(value) = HeaderValue::from_str(ct)
+    {
+        builder = builder.header(header::CONTENT_TYPE, value);
     }
     builder
         .body(axum::body::Body::from(body))
@@ -2085,7 +2083,7 @@ pub(super) async fn put_trigger_handler(
     match deploy.get_function(project.as_ref(), &name).await {
         Ok(Some(_)) => {}
         Ok(None) => {
-            return (StatusCode::NOT_FOUND, format!("no function {name:?}\n")).into_response()
+            return (StatusCode::NOT_FOUND, format!("no function {name:?}\n")).into_response();
         }
         Err(err) => return deploy_error_response(err),
     }
@@ -2181,25 +2179,18 @@ pub(super) async fn delete_trigger_handler(
     if let (Some(inner), Ok(Some(trigger))) = (
         handlers.inner.as_ref(),
         deploy.get_trigger(project.as_ref(), &name, &id).await,
-    ) {
-        if let (boatramp_core::function::TriggerKind::Blob { prefix }, Some(provider)) =
-            (&trigger.kind, inner.watch_provider.get())
+    ) && let (boatramp_core::function::TriggerKind::Blob { prefix }, Some(provider)) =
+        (&trigger.kind, inner.watch_provider.get())
+    {
+        let storage_prefix = blob_storage_prefix(project.as_ref(), &name, prefix);
+        if let Ok(Some(record)) = deploy
+            .get_managed_notification(project.as_ref(), &name, &storage_prefix)
+            .await
+            && let Err(err) =
+                boatramp_core::blob_provision::retract_watch(provider.as_ref(), &record, &deploy)
+                    .await
         {
-            let storage_prefix = blob_storage_prefix(project.as_ref(), &name, prefix);
-            if let Ok(Some(record)) = deploy
-                .get_managed_notification(project.as_ref(), &name, &storage_prefix)
-                .await
-            {
-                if let Err(err) = boatramp_core::blob_provision::retract_watch(
-                    provider.as_ref(),
-                    &record,
-                    &deploy,
-                )
-                .await
-                {
-                    tracing::warn!(function = %name, %err, "retracting blob notification failed");
-                }
-            }
+            tracing::warn!(function = %name, %err, "retracting blob notification failed");
         }
     }
     match deploy.delete_trigger(project.as_ref(), &name, &id).await {
@@ -2472,7 +2463,7 @@ pub(super) async fn webhook_ingress(
     let function = match deploy.get_function(project.as_ref(), &name).await {
         Ok(Some(f)) => f,
         Ok(None) => {
-            return (StatusCode::NOT_FOUND, format!("no function {name:?}\n")).into_response()
+            return (StatusCode::NOT_FOUND, format!("no function {name:?}\n")).into_response();
         }
         Err(err) => return deploy_error_response(err),
     };
@@ -2510,7 +2501,7 @@ pub(super) async fn webhook_ingress(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "webhook body exceeds the cap\n",
             )
-                .into_response()
+                .into_response();
         }
     };
     let Some(provided) = provided else {
@@ -2610,10 +2601,10 @@ fn build_webhook_request(content_type: Option<String>, body: Vec<u8>) -> Request
     let mut builder = axum::http::Request::builder()
         .method(axum::http::Method::POST)
         .uri("/");
-    if let Some(ct) = &content_type {
-        if let Ok(value) = HeaderValue::from_str(ct) {
-            builder = builder.header(header::CONTENT_TYPE, value);
-        }
+    if let Some(ct) = &content_type
+        && let Ok(value) = HeaderValue::from_str(ct)
+    {
+        builder = builder.header(header::CONTENT_TYPE, value);
     }
     builder
         .body(axum::body::Body::from(body))
@@ -2630,7 +2621,7 @@ fn build_webhook_request(content_type: Option<String>, body: Vec<u8>) -> Request
 #[cfg(all(test, feature = "handlers", feature = "oidc"))]
 mod gap3_tests {
     use super::*;
-    use boatramp_core::cose::{verify_context, LocalSigner, Signer};
+    use boatramp_core::cose::{LocalSigner, Signer, verify_context};
     use boatramp_handlers::ProducerContextSource as _;
     use ed25519_dalek::{Signer as _, SigningKey};
 

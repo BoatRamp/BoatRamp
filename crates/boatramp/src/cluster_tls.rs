@@ -14,7 +14,7 @@
 //! Pebble-validated single-node).
 
 use boatramp_acme::acme::IssuedCert;
-use boatramp_core::cert::{ensure_cert, CertStore, StoredCert};
+use boatramp_core::cert::{CertStore, StoredCert, ensure_cert};
 
 /// A failure refreshing the cluster's served certs through the replicated cert
 /// store.
@@ -102,8 +102,8 @@ mod tests {
     use super::*;
     use boatramp_core::cert::KvCertStore;
     use boatramp_core::kv::MemoryKv;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// A freshly-generated self-signed cert/key, so the bridge +
     /// `build_server_config` exercise real PEM that rustls accepts (no live CA,

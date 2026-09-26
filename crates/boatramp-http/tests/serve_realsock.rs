@@ -7,7 +7,7 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use boatramp_http::{response, serve_connection_with, Body, Config, Handler, Request, Response};
+use boatramp_http::{Body, Config, Handler, Request, Response, response, serve_connection_with};
 use bytes::Bytes;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};

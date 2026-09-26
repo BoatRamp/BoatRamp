@@ -30,10 +30,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
 use aws_lc_rs::signature::Ed25519KeyPair;
-use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::client::ResolvesClientCert;
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::aws_lc_rs as rustls_aws;
-use rustls::crypto::{verify_tls13_signature_with_raw_key, WebPkiSupportedAlgorithms};
+use rustls::crypto::{WebPkiSupportedAlgorithms, verify_tls13_signature_with_raw_key};
 use rustls::pki_types::{
     CertificateDer, PrivatePkcs8KeyDer, ServerName, SubjectPublicKeyInfoDer, UnixTime,
 };
@@ -742,7 +742,7 @@ pub fn verify_signature(spki: &[u8], msg: &[u8], signature: &[u8]) -> bool {
         return false;
     }
     let raw = &spki[12..44];
-    use aws_lc_rs::signature::{UnparsedPublicKey, ED25519};
+    use aws_lc_rs::signature::{ED25519, UnparsedPublicKey};
     UnparsedPublicKey::new(&ED25519, raw)
         .verify(msg, signature)
         .is_ok()
@@ -761,7 +761,7 @@ fn to_hex(bytes: &[u8]) -> String {
 /// Decode an even-length hex string; `None` on any non-hex or odd length.
 fn from_hex(s: &str) -> Option<Vec<u8>> {
     let s = s.trim();
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return None;
     }
     (0..s.len())

@@ -123,7 +123,7 @@ async fn migrate_substrate_ledger_atomicity_and_owner_ddl_on_a_real_engine() {
     };
     // Clean slate (re-runnable): drop the ledger schema + test tables via a DIRECT connection.
     {
-        use boatramp_storage::sql_sqlx::{connect, ExternalSqlKind, ExternalSqlOptions};
+        use boatramp_storage::sql_sqlx::{ExternalSqlKind, ExternalSqlOptions, connect};
         let url = std::env::var("BOATRAMP_TEST_PG_URL").unwrap();
         let c = connect(ExternalSqlKind::Postgres, &ExternalSqlOptions::new(url)).unwrap();
         for stmt in [
@@ -287,7 +287,7 @@ async fn migrate_substrate_ledger_atomicity_and_owner_ddl_on_a_real_engine() {
     assert_eq!(row.origin, "baseline", "a baselined row is marked as such");
     // ...and the table was NOT created (record runs nothing).
     {
-        use boatramp_storage::sql_sqlx::{connect, ExternalSqlKind, ExternalSqlOptions};
+        use boatramp_storage::sql_sqlx::{ExternalSqlKind, ExternalSqlOptions, connect};
         let url = std::env::var("BOATRAMP_TEST_PG_URL").unwrap();
         let c = connect(ExternalSqlKind::Postgres, &ExternalSqlOptions::new(url)).unwrap();
         let exists = c
@@ -307,7 +307,7 @@ async fn migrate_substrate_ledger_atomicity_and_owner_ddl_on_a_real_engine() {
 
     // Final cleanup (direct connection so it isn't ledgered).
     {
-        use boatramp_storage::sql_sqlx::{connect, ExternalSqlKind, ExternalSqlOptions};
+        use boatramp_storage::sql_sqlx::{ExternalSqlKind, ExternalSqlOptions, connect};
         let url = std::env::var("BOATRAMP_TEST_PG_URL").unwrap();
         let c = connect(ExternalSqlKind::Postgres, &ExternalSqlOptions::new(url)).unwrap();
         for stmt in [

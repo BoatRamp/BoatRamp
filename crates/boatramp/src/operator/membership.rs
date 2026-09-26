@@ -173,8 +173,8 @@ pub struct ApiMember {
 pub fn ordinal_from_addr(addr: &str) -> Option<u32> {
     let after_scheme = addr.split("//").last()?;
     let host = after_scheme.split(['.', ':', '/']).next()?; // `<name>-<ordinal>`
-                                                            // Require an actual `<name>-<ordinal>` split (a `-`), so a bare number or an
-                                                            // IP octet (e.g. `10.0.0.5` → `10`) isn't mistaken for an ordinal.
+    // Require an actual `<name>-<ordinal>` split (a `-`), so a bare number or an
+    // IP octet (e.g. `10.0.0.5` → `10`) isn't mistaken for an ordinal.
     let (name, ordinal) = host.rsplit_once('-')?;
     if name.is_empty() {
         return None;

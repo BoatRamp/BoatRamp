@@ -26,7 +26,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use boatramp_core::sql::{SqlBackend, SqlError, SqlTransaction, SqlValue};
 
-use crate::sql_sqlx::{connect, ExternalSqlKind, ExternalSqlOptions};
+use crate::sql_sqlx::{ExternalSqlKind, ExternalSqlOptions, connect};
 
 /// Fallback timeout for the C1 managed-DB readiness probe (`SELECT 1` on a
 /// freshly-built pool) when the binding sets no `connect_timeout`. Short by design: a
@@ -349,10 +349,10 @@ impl ComputeResolvedSqlBackend {
         // ready when it was built). The guard is not held across an await.
         {
             let cached = self.cached.lock().expect("sql-compute pool cache poisoned");
-            if let Some((cached_url, backend)) = cached.as_ref() {
-                if *cached_url == url {
-                    return Ok(Arc::clone(backend));
-                }
+            if let Some((cached_url, backend)) = cached.as_ref()
+                && *cached_url == url
+            {
+                return Ok(Arc::clone(backend));
             }
         }
         // (Re)build the pool for a new endpoint, then gate it on a real readiness probe

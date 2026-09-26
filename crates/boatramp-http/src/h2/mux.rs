@@ -25,13 +25,13 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::Notify;
 use tokio_stream::StreamExt as _;
 
+use crate::h2::CLIENT_PREFACE;
 use crate::h2::error::{ErrorCode, H2Error};
-use crate::h2::frame::{self, flag, FrameHeader, FrameType};
+use crate::h2::frame::{self, FrameHeader, FrameType, flag};
 use crate::h2::hpack::Hpack;
 use crate::h2::http::{self, Handler, Response};
 use crate::h2::settings::{self, Settings};
 use crate::h2::stream::StreamState;
-use crate::h2::CLIENT_PREFACE;
 
 const OUR_MAX_FRAME_SIZE: u32 = settings::DEFAULT_MAX_FRAME_SIZE;
 /// Cap on a single emitted DATA frame (keeps batches bounded; well above the usual
@@ -157,11 +157,13 @@ impl Shared {
     /// Enqueue a stream for the writer if it has sendable output and isn't already
     /// queued or reset.
     fn mark_ready(&mut self, id: u32) {
-        if let Some(s) = self.streams.get_mut(&id) {
-            if !s.queued && !s.reset && !s.outbox.is_empty() {
-                s.queued = true;
-                self.ready.push_back(id);
-            }
+        if let Some(s) = self.streams.get_mut(&id)
+            && !s.queued
+            && !s.reset
+            && !s.outbox.is_empty()
+        {
+            s.queued = true;
+            self.ready.push_back(id);
         }
     }
 }
@@ -478,7 +480,7 @@ where
         }
         FrameType::Headers => {
             let sid = header.stream_id;
-            if sid == 0 || sid % 2 == 0 {
+            if sid == 0 || sid.is_multiple_of(2) {
                 return Err(H2Error::conn(ErrorCode::ProtocolError));
             }
             let mut block = frame::strip_padding(&payload, header.has_flag(flag::PADDED))?;
@@ -803,11 +805,11 @@ async fn emit_response(shared: &Conn, notify: &Arc<Notify>, sid: u32, resp: Resp
                 .sum();
             {
                 let mut s = shared.lock().unwrap();
-                if let Some(st) = s.streams.get_mut(&sid) {
-                    if !st.reset {
-                        st.unsent = unsent;
-                        st.outbox = frames;
-                    }
+                if let Some(st) = s.streams.get_mut(&sid)
+                    && !st.reset
+                {
+                    st.unsent = unsent;
+                    st.outbox = frames;
                 }
                 s.mark_ready(sid);
             }
@@ -837,10 +839,10 @@ fn response_fields(
         }
         fields.push((name.as_str().as_bytes().to_vec(), value.as_bytes().to_vec()));
     }
-    if let Some(len) = content_length {
-        if !parts.headers.contains_key(::http::header::CONTENT_LENGTH) {
-            fields.push((b"content-length".to_vec(), len.to_string().into_bytes()));
-        }
+    if let Some(len) = content_length
+        && !parts.headers.contains_key(::http::header::CONTENT_LENGTH)
+    {
+        fields.push((b"content-length".to_vec(), len.to_string().into_bytes()));
     }
     fields
 }

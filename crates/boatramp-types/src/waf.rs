@@ -102,15 +102,15 @@ pub enum WafVerdict {
 /// Invalid regexes are ignored (they never match), so a typo can't wedge the
 /// site open or shut by accident.
 pub fn evaluate(config: &WafConfig, req: &WafRequest<'_>) -> WafVerdict {
-    if config.user_agent.enabled {
-        if let Some(reason) = evaluate_user_agent(&config.user_agent, req.user_agent) {
-            return WafVerdict::Block(reason);
-        }
+    if config.user_agent.enabled
+        && let Some(reason) = evaluate_user_agent(&config.user_agent, req.user_agent)
+    {
+        return WafVerdict::Block(reason);
     }
-    if config.anomaly.enabled {
-        if let Some(reason) = evaluate_anomaly(&config.anomaly, req) {
-            return WafVerdict::Block(reason);
-        }
+    if config.anomaly.enabled
+        && let Some(reason) = evaluate_anomaly(&config.anomaly, req)
+    {
+        return WafVerdict::Block(reason);
     }
     WafVerdict::Allow
 }

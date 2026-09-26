@@ -383,7 +383,7 @@ mod tests {
         s.enqueue_outbound(b"a".to_vec(), &l, 100).unwrap(); // last_active = 100
         assert!(!s.is_expired(&l, 1_000)); // 900ms idle < ttl
         assert!(s.is_expired(&l, 1_200)); // 1100ms idle > ttl
-                                          // A closed session is always expired.
+        // A closed session is always expired.
         let mut c = SessionState::new(0);
         c.close("done", 100);
         assert!(c.is_expired(&l, 101));

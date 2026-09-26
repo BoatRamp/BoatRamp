@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use axum::body::Body;
 use axum::extract::{ConnectInfo, Path, Query, Request, State};
-use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post, put};
 use axum::{Extension, Json, Router};
@@ -82,8 +82,10 @@ pub use admin_controller::ServerAdminController;
 pub(crate) use content::maybe_compress;
 pub(crate) use content::multipart_byteranges;
 pub(crate) use content::{
-    negotiate_encoding, parse_ranges, response_headers, set_content_encoding, MAX_RANGES,
+    MAX_RANGES, negotiate_encoding, parse_ranges, response_headers, set_content_encoding,
 };
+#[cfg(all(test, feature = "handlers"))]
+use control_api::{BootstrapRequest, CreateJoinTokenRequest, JoinRequest};
 pub(crate) use control_api::{
     add_root_anchor, auth_whoami, bootstrap_token, cluster_join, cluster_members, cluster_promote,
     cluster_revoke, cluster_rotate_key, create_join_token, create_token, delete_email_profile,
@@ -91,8 +93,6 @@ pub(crate) use control_api::{
     list_secrets, list_tenant_secrets, list_tokens, put_authz_policy, remove_root_anchor,
     revoke_token, set_email_profile, set_secret, set_tenant_secret, show_email_profile,
 };
-#[cfg(all(test, feature = "handlers"))]
-use control_api::{BootstrapRequest, CreateJoinTokenRequest, JoinRequest};
 #[cfg(feature = "email")]
 pub use email_spool::NodeEmailSpool;
 mod domain_verify;
@@ -132,6 +132,11 @@ pub(crate) use handler_dispatch::{
 #[cfg(all(feature = "handlers", test))]
 use handler_dispatch::{resolve_env, set_forwarded_headers};
 mod function_api;
+#[cfg(all(test, feature = "handlers"))]
+use function_api::{AliasBody, DeployFunctionQuery, FunctionUpsert, RollbackBody};
+/// Capability-surface types (`boatramp capabilities` / `/api/capabilities`). Ungated — a build
+/// without `handlers` still names the vocabulary, it just implements nothing.
+pub use function_api::{CapabilityFeature, Lifecycle};
 pub(crate) use function_api::{
     alias_function, deploy_function, get_deploy_status, list_functions, remove_function,
     rollback_function,
@@ -144,11 +149,6 @@ pub(crate) use function_api::{
 pub use function_api::{
     component_requires, host_capability_features, host_capability_features_detailed, unmet_requires,
 };
-#[cfg(all(test, feature = "handlers"))]
-use function_api::{AliasBody, DeployFunctionQuery, FunctionUpsert, RollbackBody};
-/// Capability-surface types (`boatramp capabilities` / `/api/capabilities`). Ungated — a build
-/// without `handlers` still names the vocabulary, it just implements nothing.
-pub use function_api::{CapabilityFeature, Lifecycle};
 mod gateway;
 mod host;
 pub(crate) use host::{is_local_host, parse_deploy_host, strip_port};
@@ -175,26 +175,26 @@ pub(crate) use operator::{
 mod proxy;
 pub use proxy::spawn_compute_reconcile;
 pub(crate) use proxy::{
-    await_warm, compute_endpoint_regions, compute_endpoints, dispatch_gateway, has_parked_replica,
-    proxy, COMPUTE_WAKE_TIMEOUT,
+    COMPUTE_WAKE_TIMEOUT, await_warm, compute_endpoint_regions, compute_endpoints,
+    dispatch_gateway, has_parked_replica, proxy,
 };
 mod splice;
 // The unified serving front door: TLS + plaintext accept loops that drive every
 // connection through boatramp-http's own h1+h2 stack (replaced hyper/axum_server).
 mod http_serve;
 pub use http_serve::{
-    alpn_h1_h2, serve_plaintext, serve_plaintext_listener, serve_router_conn, serve_tls,
-    serve_tls_listener, ReloadableTls, ServeInput,
+    ReloadableTls, ServeInput, alpn_h1_h2, serve_plaintext, serve_plaintext_listener,
+    serve_router_conn, serve_tls, serve_tls_listener,
 };
 // Only the `handlers`-gated websocket-upgrade path in the serve pipeline uses it.
 #[cfg(feature = "handlers")]
 pub(crate) use proxy::is_upgrade_request;
 #[cfg(all(test, feature = "handlers"))]
-use proxy::{gateway_addr_allowed, CLOUD_METADATA_IPV4};
+use proxy::{CLOUD_METADATA_IPV4, gateway_addr_allowed};
 mod project_api;
 pub(crate) use project_api::{create_project, delete_project, get_project, list_projects};
 mod project_scope;
-pub(crate) use project_scope::{project_scope, OriginalPath, ProjectContext};
+pub(crate) use project_scope::{OriginalPath, ProjectContext, project_scope};
 mod ratelimit;
 mod routes;
 pub use routes::{router, router_with, router_with_fast};
@@ -205,28 +205,28 @@ mod scheduler;
 mod serve_pipeline;
 #[cfg(feature = "handlers")]
 mod tenant_resolve;
-pub use serve_pipeline::{http_redirect_router, FastServe};
+pub use serve_pipeline::{FastServe, http_redirect_router};
 #[cfg(test)]
 mod hotpath_test;
+pub(crate) use serve_pipeline::{
+    BootstrapAttestation, serve_bootstrap_identity, serve_by_host, serve_domain_challenge,
+    serve_preview, serve_sites,
+};
 #[cfg(all(test, feature = "handlers"))]
 use serve_pipeline::{apply_vary, parse_cookie_header, parse_query_string};
-pub(crate) use serve_pipeline::{
-    serve_bootstrap_identity, serve_by_host, serve_domain_challenge, serve_preview, serve_sites,
-    BootstrapAttestation,
-};
 /// External token signer backends: KMS / HSM / Vault-hosted
 /// control-plane root keys behind the [`boatramp_core::cose::Signer`] seam.
 pub mod signer;
 mod srvmetrics;
-#[cfg(feature = "handlers")]
-pub(crate) use scheduler::{
-    acquire_site_permit, effective_limits, handler_error_response, handler_unavailable,
-    sql_starting_response, CronNow,
-};
 #[cfg(all(feature = "handlers", test))]
-use scheduler::{run_scheduler_tick, AsyncPass};
+use scheduler::{AsyncPass, run_scheduler_tick};
 #[cfg(feature = "handlers")]
 use scheduler::{CONSUMER_BATCH, CONSUMER_LEASE, CONSUMER_MAX_ATTEMPTS};
+#[cfg(feature = "handlers")]
+pub(crate) use scheduler::{
+    CronNow, acquire_site_permit, effective_limits, handler_error_response, handler_unavailable,
+    sql_starting_response,
+};
 #[cfg(feature = "handlers")]
 mod function_runtime;
 /// The server-side owner-gated schema-migration orchestrator (function/sql/extension steps over the
@@ -241,7 +241,7 @@ pub(crate) use function_runtime::{
     put_trigger_handler, webhook_ingress,
 };
 #[cfg(feature = "handlers")]
-pub use migrate::{run_migration, MigrateMode};
+pub use migrate::{MigrateMode, run_migration};
 /// SSE-out + POST-in serving of the duplex/resumable `session` capability
 /// (PLAN-session-primitive Stage 4): a `GET` opens the resumable outbound stream, a `POST` delivers
 /// an inbound frame that re-enters the guest `session-handler`.
@@ -251,11 +251,11 @@ mod session_serve;
 mod stream;
 #[cfg(feature = "handlers")]
 mod workflow;
-pub use auth::{require_auth, Auth};
+pub use auth::{Auth, require_auth};
 #[cfg(feature = "http3")]
 pub use http3::{
-    advertise_http3, http3_endpoint, quinn_server_config, serve_http3, serve_http3_endpoint,
-    Http3Error,
+    Http3Error, advertise_http3, http3_endpoint, quinn_server_config, serve_http3,
+    serve_http3_endpoint,
 };
 pub use limits::{ServerLimits, UploadGuard};
 #[cfg(feature = "oidc")]
@@ -270,7 +270,7 @@ pub(crate) use workflow::{
 };
 // The process-wide HTTP/lifecycle metrics registry. Re-exported so the CLI's
 // certificate-renewal path can record renewals against the same counters.
-pub use srvmetrics::{server_metrics, ServerMetrics};
+pub use srvmetrics::{ServerMetrics, server_metrics};
 
 /// The WebAssembly handler runtime: the shared engine plus the per-site binding
 /// backends. Cheap to clone (it is an `Arc` inside). Without the `handlers`
@@ -577,10 +577,10 @@ impl HandlerRuntimeInner {
         &self,
         project: &str,
     ) -> boatramp_core::security::ResolvedProjectTenancy {
-        if let Some(map) = self.tenancy_posture_overrides.get() {
-            if let Some(knobs) = map.get(project) {
-                return *knobs;
-            }
+        if let Some(map) = self.tenancy_posture_overrides.get()
+            && let Some(knobs) = map.get(project)
+        {
+            return *knobs;
         }
         boatramp_core::security::ResolvedProjectTenancy {
             require_tenancy_declaration: self
@@ -1233,15 +1233,15 @@ impl HandlerRuntime {
         // to the larger async ceiling — so this is a warning, not a refusal.
         let sync_ceiling = inner.engine.sync_timeout_ms();
         let async_ceiling = inner.engine.async_timeout_ms();
-        if let Some(ms) = site_handlers.max_timeout_ms {
-            if u64::from(ms) > sync_ceiling {
-                tracing::warn!(
-                    "site max_timeout_ms={ms} exceeds sync_max_timeout_ms={sync_ceiling}: \
+        if let Some(ms) = site_handlers.max_timeout_ms
+            && u64::from(ms) > sync_ceiling
+        {
+            tracing::warn!(
+                "site max_timeout_ms={ms} exceeds sync_max_timeout_ms={sync_ceiling}: \
                      synchronous HTTP handlers are capped at {sync_ceiling}ms; the extra time \
                      applies only to async calls (?mode=async / triggers), capped at \
                      async_max_timeout_ms={async_ceiling}"
-                );
-            }
+            );
         }
 
         // The operator posture governing `all` (key 3) — used only to WARN (never refuse) when an
@@ -1335,58 +1335,53 @@ impl HandlerRuntime {
                     }
                 }
             }
-            if let Some(ms) = handler.limits.as_ref().and_then(|l| l.timeout_ms) {
-                if u64::from(ms) > sync_ceiling {
-                    let route = &handler.route;
-                    tracing::warn!(
-                        "route {route:?} declares limits.timeout_ms={ms}, above \
+            if let Some(ms) = handler.limits.as_ref().and_then(|l| l.timeout_ms)
+                && u64::from(ms) > sync_ceiling
+            {
+                let route = &handler.route;
+                tracing::warn!(
+                    "route {route:?} declares limits.timeout_ms={ms}, above \
                          sync_max_timeout_ms={sync_ceiling}: synchronous HTTP calls to this route \
                          are capped at {sync_ceiling}ms; the {ms}ms only applies to async calls \
                          (?mode=async / a queue trigger / a #[consumer]), capped at \
                          async_max_timeout_ms={async_ceiling}. If you need {ms}ms synchronously, \
                          that isn't possible — move the work to the async lane"
-                    );
-                }
+                );
             }
             // A guest that self-declares a streaming handler (`#[handler(stream)]`) but whose
             // config doesn't mark the route `streaming` would run on the tight sync request lane
             // and be cut at the sync timeout — a silent footgun for a long-lived SSE/agent stream.
             // Warn (don't block) so the operator sets `streaming = true` for the dedicated lane.
-            if !handler.streaming {
-                if let Some(entry) = manifest.files.get(&handler.component) {
-                    if let Ok(bytes) = read_blob_bytes(deploy, &entry.hash).await {
-                        if crate::function_api::component_declares_streaming_route(
-                            &bytes,
-                            &handler.route,
-                        ) {
-                            let route = &handler.route;
-                            tracing::warn!(
-                                "route {route:?} is a streaming handler (#[handler(stream)]) but \
+            if !handler.streaming
+                && let Some(entry) = manifest.files.get(&handler.component)
+                && let Ok(bytes) = read_blob_bytes(deploy, &entry.hash).await
+                && crate::function_api::component_declares_streaming_route(&bytes, &handler.route)
+            {
+                let route = &handler.route;
+                tracing::warn!(
+                    "route {route:?} is a streaming handler (#[handler(stream)]) but \
                                  its config lacks streaming = true: it will run on the sync request \
                                  lane and be cut at sync_max_timeout_ms={sync_ceiling}ms. Set \
                                  streaming = true so it serves on the dedicated streaming lane (its \
                                  own concurrency budget + a much larger wall-clock)."
-                            );
-                        }
-                    }
-                }
+                );
             }
             // Fail loud at deploy if the guest's function-manifest `requires` a capability feature
             // this host build does not implement — availability lives in metadata, not the linkable
             // WIT (PLAN v2). A clear message beats an opaque runtime failure later.
-            if let Some(entry) = manifest.files.get(&handler.component) {
-                if let Ok(bytes) = read_blob_bytes(deploy, &entry.hash).await {
-                    let unmet = crate::function_api::unmet_requires(&bytes);
-                    if !unmet.is_empty() {
-                        return Err(format!(
-                            "route {:?} [{}] requires capabilities this host does not implement: \
+            if let Some(entry) = manifest.files.get(&handler.component)
+                && let Ok(bytes) = read_blob_bytes(deploy, &entry.hash).await
+            {
+                let unmet = crate::function_api::unmet_requires(&bytes);
+                if !unmet.is_empty() {
+                    return Err(format!(
+                        "route {:?} [{}] requires capabilities this host does not implement: \
                              {}. Upgrade boatramp or enable those features — see `boatramp \
                              capabilities`.",
-                            handler.route,
-                            handler.methods.join(","),
-                            unmet.join(", ")
-                        ));
-                    }
+                        handler.route,
+                        handler.methods.join(","),
+                        unmet.join(", ")
+                    ));
                 }
             }
             precheck_component(
@@ -2097,7 +2092,7 @@ pub async fn shutdown_signal() {
 /// (`ok` alone = running on the pure file baseline).
 async fn healthz(Extension(daemon): Extension<Arc<DaemonRuntime>>) -> String {
     match daemon.generation() {
-        Some(gen) => format!("ok gen={gen}"),
+        Some(generation) => format!("ok gen={generation}"),
         None => "ok".to_string(),
     }
 }
@@ -2628,11 +2623,13 @@ mod tests {
         )
         .await;
         assert_eq!(st, StatusCode::NO_CONTENT);
-        assert!(deploy
-            .get_function(ProjectRef::DEFAULT, "greeter")
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            deploy
+                .get_function(ProjectRef::DEFAULT, "greeter")
+                .await
+                .unwrap()
+                .is_none()
+        );
 
         // Deploying a component whose blob was never uploaded is a 400.
         let empty = DeployStore::new(
@@ -2816,7 +2813,7 @@ mod tests {
     /// `409`, and a node without a bootstrap secret configured is `501`.
     #[tokio::test]
     async fn bootstrap_mints_the_first_token_once() {
-        use axum::http::{header::AUTHORIZATION, HeaderMap, HeaderValue};
+        use axum::http::{HeaderMap, HeaderValue, header::AUTHORIZATION};
         let keys: Arc<dyn Signer> = Arc::new(LocalSigner::generate(TokenAlg::Es256));
         let public = keys.public_key();
         let deploy = DeployStore::new(
@@ -2868,12 +2865,14 @@ mod tests {
         let id = json["id"].as_str().unwrap();
         let verified = cose::verify(token, &public, now_unix()).unwrap();
         assert!(verified.roles.iter().any(|r| r.name == "admin"));
-        assert!(deploy
-            .list_token_meta()
-            .await
-            .unwrap()
-            .iter()
-            .any(|m| m.revocation_id == id));
+        assert!(
+            deploy
+                .list_token_meta()
+                .await
+                .unwrap()
+                .iter()
+                .any(|m| m.revocation_id == id)
+        );
 
         // Reuse of the same secret → 409 (single-use).
         let reuse = bootstrap_token(
@@ -3128,18 +3127,20 @@ mod tests {
             )]),
             ..Default::default()
         };
-        assert!(resolve_env(
-            "evil",
-            boatramp_core::project::ProjectRef::DEFAULT,
-            &deploy_env,
-            &explicit,
-            &[],
-            false,
-            None,
-            &env_source,
-        )
-        .await
-        .is_err());
+        assert!(
+            resolve_env(
+                "evil",
+                boatramp_core::project::ProjectRef::DEFAULT,
+                &deploy_env,
+                &explicit,
+                &[],
+                false,
+                None,
+                &env_source,
+            )
+            .await
+            .is_err()
+        );
 
         // A reserved-but-unimplemented scheme is also refused (no silent fall-through).
         let reserved = HandlersSiteConfig {
@@ -3248,8 +3249,7 @@ mod tests {
         // `secrets` map naming a host env var must be REFUSED under the multi-tenant
         // posture (never read), using the SAME helper the handler path uses — so the
         // fail-closed semantics are identical by construction.
-        let env_source =
-            boatramp_core::env::MapEnv::new().with("BOATRAMP_TEST_FN_LEAK", "leak-me");
+        let env_source = boatramp_core::env::MapEnv::new().with("BOATRAMP_TEST_FN_LEAK", "leak-me");
         let static_env = std::collections::BTreeMap::new();
         let secrets = std::collections::BTreeMap::from([(
             "DB_URL".to_string(),
@@ -4490,7 +4490,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "run on the host toolchain (real libsql static-musl segfault); wired in the CI graphql-propagation gate"]
     async fn graphql_run_propagates_caller_principal_to_a_scoped_subfetch() {
-        use boatramp_core::deploy::{sha256_hex, DeployStore};
+        use boatramp_core::deploy::{DeployStore, sha256_hex};
         use boatramp_core::function::{
             Function, FunctionConfig, FunctionVersion, Lifecycle, Owner,
         };
@@ -4655,7 +4655,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "run on the host toolchain (real libsql static-musl segfault); wired in the CI gateway-target gate"]
     async fn gateway_forces_target_confinement_onto_a_wasm_subgraph() {
-        use boatramp_core::deploy::{sha256_hex, DeployStore};
+        use boatramp_core::deploy::{DeployStore, sha256_hex};
         use boatramp_core::function::{
             Function, FunctionConfig, FunctionVersion, Lifecycle, Owner,
         };
@@ -4844,7 +4844,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "run on the host toolchain (real libsql static-musl segfault); wired in the CI gateway-own-propagation gate"]
     async fn gateway_propagates_caller_own_principal_to_a_wasm_subgraph() {
-        use boatramp_core::deploy::{sha256_hex, DeployStore};
+        use boatramp_core::deploy::{DeployStore, sha256_hex};
         use boatramp_core::function::{
             Function, FunctionConfig, FunctionVersion, Lifecycle, Owner,
         };
@@ -4990,7 +4990,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "run on the host toolchain (real libsql static-musl segfault); wired in the CI gateway-target gate"]
     async fn gateway_target_or_null_includes_the_shared_base() {
-        use boatramp_core::deploy::{sha256_hex, DeployStore};
+        use boatramp_core::deploy::{DeployStore, sha256_hex};
         use boatramp_core::function::{
             Function, FunctionConfig, FunctionVersion, Lifecycle, Owner,
         };
@@ -5170,8 +5170,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "run on the host toolchain (real libsql static-musl segfault); wired in the CI deploy-resilience gate"]
     async fn async_deploy_never_activates_or_serves_an_unvalidated_component() {
-        use crate::function_api::{run_async_deploy, DeployStatus};
-        use boatramp_core::deploy::{sha256_hex, DeployStore};
+        use crate::function_api::{DeployStatus, run_async_deploy};
+        use boatramp_core::deploy::{DeployStore, sha256_hex};
         use boatramp_core::function::{
             Function, FunctionConfig, FunctionVersion, Lifecycle, Owner,
         };
@@ -5490,7 +5490,7 @@ mod tests {
     /// queue would never drain at all.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn scheduler_drains_a_non_default_projects_invocation_in_its_own_tenant() {
-        use crate::scheduler::{run_scheduler_tick, AsyncPass, ConsumerFilter, CronNow};
+        use crate::scheduler::{AsyncPass, ConsumerFilter, CronNow, run_scheduler_tick};
         use boatramp_core::deploy::DeployStore;
         use boatramp_core::function::{
             Function, FunctionVersion, Invocation, InvocationStatus, InvokeMode, Lifecycle, Owner,
@@ -5582,16 +5582,20 @@ mod tests {
         let metering = deploy.get_metering(acme, "worker").await.unwrap().unwrap();
         assert_eq!(metering.invocations, 1);
         // … and nothing leaked into `default` (no record, no metering there).
-        assert!(deploy
-            .get_invocation(ProjectRef::DEFAULT, "worker", "inv1")
-            .await
-            .unwrap()
-            .is_none());
-        assert!(deploy
-            .get_metering(ProjectRef::DEFAULT, "worker")
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            deploy
+                .get_invocation(ProjectRef::DEFAULT, "worker", "inv1")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            deploy
+                .get_metering(ProjectRef::DEFAULT, "worker")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// Poll a durable invocation until it leaves the in-flight states — the drain
@@ -5606,13 +5610,13 @@ mod tests {
     ) -> boatramp_core::function::Invocation {
         use boatramp_core::function::InvocationStatus;
         for _ in 0..200 {
-            if let Some(inv) = deploy.get_invocation(project, function, id).await.unwrap() {
-                if matches!(
+            if let Some(inv) = deploy.get_invocation(project, function, id).await.unwrap()
+                && matches!(
                     inv.status,
                     InvocationStatus::Succeeded | InvocationStatus::Failed
-                ) {
-                    return inv;
-                }
+                )
+            {
+                return inv;
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
@@ -5626,7 +5630,7 @@ mod tests {
     #[cfg(feature = "handlers")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn drain_reclaims_an_expired_lease_and_skips_a_live_one() {
-        use crate::scheduler::{run_scheduler_tick, AsyncPass, ConsumerFilter, CronNow};
+        use crate::scheduler::{AsyncPass, ConsumerFilter, CronNow, run_scheduler_tick};
         use boatramp_core::deploy::DeployStore;
         use boatramp_core::function::{
             Function, FunctionVersion, Invocation, InvocationStatus, InvokeMode, Lifecycle, Owner,
@@ -6276,7 +6280,7 @@ mod tests {
     ///   * `sql_starting_response` is a 503 carrying `Retry-After`.
     #[tokio::test]
     async fn managed_dependency_not_ready_gates_with_a_retryable_503() {
-        use crate::handler_dispatch::{build_bindings, BindingsError};
+        use crate::handler_dispatch::{BindingsError, build_bindings};
         use boatramp_core::config::HandlersSiteConfig;
         use boatramp_core::project::ProjectRef;
         use boatramp_core::sql::{SqlBackend, SqlBackends, SqlError};
@@ -6454,7 +6458,7 @@ mod tests {
     async fn consumer_signed_context_dispatch_resolves_per_message_tenant_on_a_real_engine() {
         use crate::handler_dispatch::ConsumerRebuild;
         use boatramp_core::config::HandlersSiteConfig;
-        use boatramp_core::cose::{mint_context, Signer};
+        use boatramp_core::cose::{Signer, mint_context};
         use boatramp_core::orm::{Expr, Select, SelectItem};
         use boatramp_core::sql::{Dialect, SqlBackends, SqlValue};
         use boatramp_core::tenancy::{AccessMode, Tenancy, TenantSource};
@@ -6697,7 +6701,7 @@ mod tests {
 #[cfg(all(test, feature = "handlers"))]
 mod b10_async_shard_tests {
     use super::*;
-    use crate::scheduler::{run_scheduler_tick, AsyncPass, ConsumerFilter, CronNow};
+    use crate::scheduler::{AsyncPass, ConsumerFilter, CronNow, run_scheduler_tick};
     use boatramp_core::deploy::DeployStore;
     use boatramp_core::function::{
         Function, FunctionConfig, FunctionTrigger, FunctionVersion, Invocation, InvocationStatus,

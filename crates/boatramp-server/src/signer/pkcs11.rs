@@ -21,7 +21,7 @@ use cryptoki::types::AuthPin;
 
 use boatramp_core::cose::{Signer, TokenAlg, TokenError, TokenPublicKey};
 
-use super::{sha256, SignerError};
+use super::{SignerError, sha256};
 
 const BACKEND: &str = "pkcs11";
 

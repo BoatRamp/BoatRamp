@@ -11,10 +11,10 @@
 //! boatramp stays GraphQL-*aware*, not an engine: the payload published to the topic is
 //! the subscription result your producer computes; the host just fans it out (framed).
 
+use async_graphql_parser::Positioned;
 use async_graphql_parser::types::{
     DocumentOperations, OperationDefinition, OperationType, Selection,
 };
-use async_graphql_parser::Positioned;
 
 /// If `query` is a subscription operation, return the messaging topic it streams from —
 /// its single root field's name (a subscription has exactly one root field per the

@@ -5,8 +5,8 @@
 //! the guest emits them; the operator endpoint + `boatramp logs` read them back.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use boatramp_core::time::now_unix_ms;

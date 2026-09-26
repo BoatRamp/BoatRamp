@@ -8,22 +8,22 @@ use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
-use axum::body::{to_bytes, Body};
+use axum::body::{Body, to_bytes};
 use axum::extract::ConnectInfo;
-use axum::http::{header, Request, StatusCode};
+use axum::http::{Request, StatusCode, header};
 use boatramp_core::access::{AccessConfig, BasicAuth, IpRules};
 use boatramp_core::authz::GrantedRole;
 use boatramp_core::config::{
     DeployConfig, DomainConfig, HeaderRule, Hsts, Redirect, SecurityConfig, SiteConfig,
 };
 use boatramp_core::cose::{self, Claims, LocalSigner, Signer, TokenAlg};
-use boatramp_core::deploy::{sha256_hex, DeployStore, FileEntry, Manifest, Variant};
+use boatramp_core::deploy::{DeployStore, FileEntry, Manifest, Variant, sha256_hex};
 use boatramp_core::domain_verify::{DomainProbe, DomainVerification, VerifyError};
 use boatramp_core::gateway::{GatewayConfig, GatewayRoute, HeaderOps, PassiveHealth, Upstream};
 use boatramp_core::kv::MemoryKv;
 use boatramp_core::project::ProjectRef;
 use boatramp_core::{ByteStream, GetObject, ObjectMeta, PutMeta, Storage, StorageError};
-use boatramp_server::{router, router_with, Auth, HandlerRuntime, ServerLimits, ServerOptions};
+use boatramp_server::{Auth, HandlerRuntime, ServerLimits, ServerOptions, router, router_with};
 use futures::StreamExt;
 use tower::ServiceExt;
 
@@ -1464,10 +1464,12 @@ async fn access_control_basic_auth_and_ip() {
 
     let (status, headers, _) = send(&deploy, get("/_sites/test/")).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
-    assert!(headers[header::WWW_AUTHENTICATE]
-        .to_str()
-        .unwrap()
-        .contains("Members"));
+    assert!(
+        headers[header::WWW_AUTHENTICATE]
+            .to_str()
+            .unwrap()
+            .contains("Members")
+    );
 
     // With credentials -> 200.
     let creds = base64_encode("u:p");
@@ -2942,16 +2944,15 @@ async fn function_blob_trigger_fires_on_a_write() {
             .await
             .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        if let Some(hits) = kv.get("hkv/fn/counter/hits").await.unwrap() {
-            if String::from_utf8_lossy(&hits)
+        if let Some(hits) = kv.get("hkv/fn/counter/hits").await.unwrap()
+            && String::from_utf8_lossy(&hits)
                 .trim()
                 .parse::<u32>()
                 .unwrap_or(0)
                 >= 1
-            {
-                fired = true;
-                break;
-            }
+        {
+            fired = true;
+            break;
         }
     }
     assert!(fired, "blob trigger did not fire after repeated writes");
@@ -3113,11 +3114,13 @@ async fn function_blob_trigger_provisions_and_retracts_via_cloud_provider() {
         StatusCode::NO_CONTENT
     );
     assert_eq!(provider.retracted.lock().unwrap().len(), 1);
-    assert!(deploy
-        .get_managed_notification(ProjectRef::DEFAULT, "counter", "hblob/fn/counter/uploads/")
-        .await
-        .unwrap()
-        .is_none());
+    assert!(
+        deploy
+            .get_managed_notification(ProjectRef::DEFAULT, "counter", "hblob/fn/counter/uploads/")
+            .await
+            .unwrap()
+            .is_none()
+    );
 
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -3127,8 +3130,8 @@ async fn function_blob_trigger_provisions_and_retracts_via_cloud_provider() {
 #[cfg(feature = "handlers")]
 #[tokio::test]
 async fn function_blob_trigger_dry_run_returns_recipe_and_refuse_fails_closed() {
-    use boatramp_core::blob_notify::ProvisionTier;
     use boatramp_core::Storage;
+    use boatramp_core::blob_notify::ProvisionTier;
     use boatramp_handlers::{HandlerEngine, Limits};
 
     const KV_COUNTER: &[u8] =
@@ -3175,11 +3178,13 @@ async fn function_blob_trigger_dry_run_returns_recipe_and_refuse_fails_closed() 
         "dry-run should return the recipe"
     );
     assert!(provider.provisioned.lock().unwrap().is_empty());
-    assert!(deploy
-        .list_managed_notifications(ProjectRef::DEFAULT, "counter")
-        .await
-        .unwrap()
-        .is_empty());
+    assert!(
+        deploy
+            .list_managed_notifications(ProjectRef::DEFAULT, "counter")
+            .await
+            .unwrap()
+            .is_empty()
+    );
     let _ = std::fs::remove_dir_all(&root1);
 
     // refuse → 400, fail-closed.
@@ -4407,11 +4412,13 @@ async fn stream_route_fans_out_text_and_binary_events() {
         .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40000))));
     let response = app.oneshot(req).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    assert!(response
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|ct| ct.starts_with("text/event-stream")));
+    assert!(
+        response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|ct| ct.starts_with("text/event-stream"))
+    );
 
     // The subscription is registered by the time the response head is returned,
     // so a publish now reaches this connection.
@@ -6034,7 +6041,7 @@ async fn bootstrap_identity_endpoint_serves_the_attestation() {
 #[tokio::test]
 async fn oidc_exchange_mints_a_token() {
     use boatramp_server::OidcVerifier;
-    use jsonwebtoken::{encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
+    use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, encode};
     use std::collections::HashMap;
 
     // An HS256 verifier exercises the same validate→claim path RS256 uses.
@@ -6628,11 +6635,13 @@ async fn on_the_fly_compression_for_variantless_responses() {
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(headers[header::CONTENT_ENCODING], "gzip");
-    assert!(headers[header::VARY]
-        .to_str()
-        .unwrap()
-        .to_ascii_lowercase()
-        .contains("accept-encoding"));
+    assert!(
+        headers[header::VARY]
+            .to_str()
+            .unwrap()
+            .to_ascii_lowercase()
+            .contains("accept-encoding")
+    );
     // The body is gzip-framed (magic bytes) and differs from the identity bytes.
     assert_ne!(body, b"<h1>home</h1>");
     assert_eq!(&body[..2], &[0x1f, 0x8b], "gzip magic");
@@ -6807,10 +6816,12 @@ async fn cors_actual_request_echoes_allowed_origin() {
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(headers[header::ACCESS_CONTROL_ALLOW_ORIGIN], ALLOWED_ORIGIN);
-    assert!(headers
-        .get_all(header::VARY)
-        .iter()
-        .any(|v| v.as_bytes().eq_ignore_ascii_case(b"origin")));
+    assert!(
+        headers
+            .get_all(header::VARY)
+            .iter()
+            .any(|v| v.as_bytes().eq_ignore_ascii_case(b"origin"))
+    );
 }
 
 /// A `*` allowlist permits any origin, echoing the specific origin (not literal
@@ -7032,11 +7043,13 @@ async fn site_handler_invoke_target_outside_allowlist() {
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "body: {body}");
     assert!(body.contains("not in the allowlist"), "body: {body}");
     // The callee never ran.
-    assert!(deploy
-        .get_metering(ProjectRef::DEFAULT, "greeter")
-        .await
-        .unwrap()
-        .is_none());
+    assert!(
+        deploy
+            .get_metering(ProjectRef::DEFAULT, "greeter")
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 /// Deny-by-default: `invoke` is imported and allowed, but the handler names **no**
@@ -7809,10 +7822,12 @@ async fn graphql_data_connector_serves_from_the_database_with_row_isolation() {
         .unwrap();
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     let out: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert!(out["errors"][0]["message"]
-        .as_str()
-        .unwrap()
-        .contains("not enabled"));
+    assert!(
+        out["errors"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("not enabled")
+    );
 
     // An unexposed column is rejected (deny-by-default), never returned.
     let response = app
@@ -7822,10 +7837,12 @@ async fn graphql_data_connector_serves_from_the_database_with_row_isolation() {
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     let out: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert!(out["data"].is_null());
-    assert!(out["errors"][0]["message"]
-        .as_str()
-        .unwrap()
-        .contains("tenant"));
+    assert!(
+        out["errors"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("tenant")
+    );
 
     let _ = std::fs::remove_dir_all(&sql_dir);
 }
@@ -8937,16 +8954,20 @@ async fn project_route_scopes_resources_and_isolates_the_default_project() {
     );
 
     // Store-level confirmation: the config lives under acme, not default.
-    assert!(deploy
-        .get_site_config(ProjectRef::new("acme"), "blog")
-        .await
-        .unwrap()
-        .is_some());
-    assert!(deploy
-        .get_site_config(ProjectRef::DEFAULT, "blog")
-        .await
-        .unwrap()
-        .is_none());
+    assert!(
+        deploy
+            .get_site_config(ProjectRef::new("acme"), "blog")
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        deploy
+            .get_site_config(ProjectRef::DEFAULT, "blog")
+            .await
+            .unwrap()
+            .is_none()
+    );
 
     // Deleting a non-empty project is refused; deleting the site then the project works.
     let (status, _, _) = send(
@@ -9053,11 +9074,13 @@ async fn writing_to_a_nonexistent_project_is_rejected_not_ghosted() {
         "a write to an uncreated project must 404, not manufacture a ghost"
     );
     // And nothing was written under the ghost project.
-    assert!(deploy
-        .get_site_config(ProjectRef::new("ghost"), "blog")
-        .await
-        .unwrap()
-        .is_none());
+    assert!(
+        deploy
+            .get_site_config(ProjectRef::new("ghost"), "blog")
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 /// DRAFT live-gate for the read-only `messaging-stats` capability, driven against the REAL

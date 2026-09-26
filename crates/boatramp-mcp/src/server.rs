@@ -15,9 +15,9 @@ use rmcp::handler::server::tool::ToolCallContext;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::*;
 use rmcp::service::RequestContext;
-use rmcp::{tool, tool_router, RoleServer, ServerHandler};
+use rmcp::{RoleServer, ServerHandler, tool, tool_router};
 
-use crate::client::{ControlPlane, CALLER_BEARER};
+use crate::client::{CALLER_BEARER, ControlPlane};
 use crate::registry::Backend;
 
 /// Percent-encode a host for a URL path segment (mirrors the CLI: a wildcard `*`

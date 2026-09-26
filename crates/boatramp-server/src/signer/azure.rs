@@ -11,7 +11,7 @@ use base64::Engine as _;
 
 use boatramp_core::cose::{Signer, TokenAlg, TokenError, TokenPublicKey};
 
-use super::{rest, sha256, SignerError};
+use super::{SignerError, rest, sha256};
 
 const BACKEND: &str = "azure-kv";
 const API_VERSION: &str = "7.4";

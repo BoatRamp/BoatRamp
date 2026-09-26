@@ -862,7 +862,7 @@ impl Scope {
                 }
                 // A range comparison or `IS NOT NULL` has no single value to stamp.
                 PublicTermSql::Cmp { .. } | PublicTermSql::Null { .. } => {
-                    return Err(OrmError::PublicSubsetNotForceable(table.to_string()))
+                    return Err(OrmError::PublicSubsetNotForceable(table.to_string()));
                 }
             }
         }
@@ -1122,10 +1122,10 @@ impl Insert {
         // the SET-allowlisted columns from the guest and force-stamps the public-visibility columns,
         // so the inserted row lands in `B`'s public subset (the `tenant = B` stamp is applied by the
         // shared own-write path below, since `write_target` yields `B` for a target scope).
-        if let Some(w) = write {
-            if let Some(allow) = w.target_write_allowlist() {
-                self.confine_target_insert(w, allow.is_empty())?;
-            }
+        if let Some(w) = write
+            && let Some(allow) = w.target_write_allowlist()
+        {
+            self.confine_target_insert(w, allow.is_empty())?;
         }
         self.scope = write.cloned();
         // The write target's per-table stamp `(column, value)` — the actor's OWN axis (Stage 1/R3),
@@ -1554,7 +1554,9 @@ pub enum OrmError {
     /// data). Reads of an `Unscoped` table are global by design, but writes are **deny-by-default**
     /// (a shared-data write is a cross-tenant blast — the [`TableScope::Unscoped`](crate::tenancy::TableScope::Unscoped)
     /// contract), so the host refuses them rather than running the write unbounded-by-tenant.
-    #[error("tenancy: table {0:?} is Unscoped (global reference); guest writes are refused (deny-by-default)")]
+    #[error(
+        "tenancy: table {0:?} is Unscoped (global reference); guest writes are refused (deny-by-default)"
+    )]
     UnscopedWrite(String),
     /// A scoped read/write needed a resolved principal (an own-tenant value, or — for a
     /// `TenantOrSession` table — at least one of the tenant/session facts) but the request carried
@@ -1589,7 +1591,9 @@ pub enum OrmError {
     /// is not `column = <literal>` or `column IS NULL` (e.g. a range or `IS NOT NULL`) has no single
     /// value to stamp, so the host cannot guarantee the inserted row lands in the public subset —
     /// refused (deny-by-default). Such a subset is read-/update-only, never target-insertable.
-    #[error("tenancy: target INSERT cannot force table {0:?} into its public subset (a non-equality/non-null public term); refused")]
+    #[error(
+        "tenancy: target INSERT cannot force table {0:?} into its public subset (a non-equality/non-null public term); refused"
+    )]
     PublicSubsetNotForceable(String),
     /// A target write used a shape the confinement does not support: an `INSERT … SELECT`, an
     /// `ON CONFLICT` upsert on an anonymous (domain/handle/`target_or_null`) target, or a `promote`.
@@ -1597,7 +1601,9 @@ pub enum OrmError {
     /// UPDATE whose `tenant = B` guard carries no visibility subset, so an anonymous upsert could
     /// touch `B`'s non-public row). A **capability**-axis `ON CONFLICT … DO UPDATE` upsert IS
     /// supported (own↔target parity — see [`Insert::confine_target_insert`]); the rest are refused.
-    #[error("tenancy: unsupported target write shape ({0}); target writes are a plain INSERT, a confined UPDATE, or a capability-axis ON CONFLICT DO UPDATE upsert")]
+    #[error(
+        "tenancy: unsupported target write shape ({0}); target writes are a plain INSERT, a confined UPDATE, or a capability-axis ON CONFLICT DO UPDATE upsert"
+    )]
     TargetWriteUnsupported(&'static str),
     /// A capability-axis target upsert (`ON CONFLICT … DO UPDATE`) whose conflict target does NOT
     /// include the table's tenant column. Required so a conflict is always a same-tenant (`B`) row:
@@ -1605,7 +1611,9 @@ pub enum OrmError {
     /// natural key, and the `tenant = B`-guarded DO UPDATE would silently no-op — dropping `B`'s
     /// write AND leaking that `A` holds that key (a cross-tenant existence oracle). Refused
     /// fail-closed; add the tenant column to the conflict target (e.g. `(tenant_id, …)`).
-    #[error("tenancy: a target upsert's ON CONFLICT target must include the tenant column for table {0:?} (so a conflict is always the target tenant's own row)")]
+    #[error(
+        "tenancy: a target upsert's ON CONFLICT target must include the tenant column for table {0:?} (so a conflict is always the target tenant's own row)"
+    )]
     TargetUpsertKeyMissingTenant(String),
     /// A target write (INSERT/UPDATE) touched a `TenantOrSession` (anonymous-session-keyed) table. A
     /// target principal carries only the target tenant `B` (no session fact), so the host cannot write
@@ -1613,7 +1621,9 @@ pub enum OrmError {
     /// anon/session-owned row for `B` and break the anon→promotion model. Refused deny-by-default:
     /// write a `TenantOrSession` table on the caller's own/session-scoped path, never under a target
     /// scope. (PLAN-delegable-capabilities, Stage A.)
-    #[error("tenancy: target write may not touch TenantOrSession table {0:?} (no session fact under a target scope — write it on the session-scoped path)")]
+    #[error(
+        "tenancy: target write may not touch TenantOrSession table {0:?} (no session fact under a target scope — write it on the session-scoped path)"
+    )]
     TargetWriteToSessionTable(String),
 }
 
@@ -1667,7 +1677,7 @@ fn render_expr(e: &Expr, params: &mut Params, dialect: Dialect) -> Result<String
         Expr::Star => {
             return Err(OrmError::BadExpr(
                 "`*` is only valid as the count(*) argument",
-            ))
+            ));
         }
         Expr::Aggregate(agg, inner) => {
             let arg = match inner.as_ref() {
@@ -1824,7 +1834,7 @@ fn render_expr(e: &Expr, params: &mut Params, dialect: Dialect) -> Result<String
         Expr::IsOwn => {
             return Err(OrmError::BadExpr(
                 "is_own()/own_first() requires an own-tenant (own or own+null) read scope",
-            ))
+            ));
         }
     })
 }
@@ -1868,11 +1878,7 @@ fn render_pred(
     dialect: Dialect,
 ) -> Result<String, OrmError> {
     let compound = |body: String| {
-        if nested {
-            format!("({body})")
-        } else {
-            body
-        }
+        if nested { format!("({body})") } else { body }
     };
     Ok(match p {
         Predicate::And(ps) => {
@@ -2338,11 +2344,11 @@ impl Insert {
             for col in &columns {
                 // The scope forces its column to the resolved stamp; otherwise take the row's
                 // cell expr, else NULL.
-                if let Some((column, value)) = &stamp {
-                    if same_col(column, col) {
-                        ph.push(params.bind(value.clone()));
-                        continue;
-                    }
+                if let Some((column, value)) = &stamp
+                    && same_col(column, col)
+                {
+                    ph.push(params.bind(value.clone()));
+                    continue;
                 }
                 match row.cells.iter().find(|a| same_col(&a.column, col)) {
                     Some(a) => ph.push(render_expr(&a.value, &mut params, dialect)?),
@@ -2583,7 +2589,7 @@ pub fn compile_promote(scope: &Scope, table: &str, dialect: Dialect) -> Result<C
         _ => {
             return Err(OrmError::BadExpr(
                 "promote requires a TenantOrSession table (an anonymous-first table)",
-            ))
+            ));
         }
     };
     ident(&tenant_col)?;
@@ -2667,7 +2673,7 @@ pub fn compile_attach_reference(
         _ => {
             return Err(OrmError::BadExpr(
                 "attach_reference child must be a plain tenant table",
-            ))
+            ));
         }
     };
     let parent_tenant = match scope.resolve_table(&spec.parent)? {
@@ -2675,7 +2681,7 @@ pub fn compile_attach_reference(
         _ => {
             return Err(OrmError::BadExpr(
                 "attach_reference parent must be a plain tenant table",
-            ))
+            ));
         }
     };
     ident(&child_tenant)?;

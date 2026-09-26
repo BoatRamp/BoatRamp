@@ -36,4 +36,4 @@ pub mod repair;
 pub mod tenant_sql;
 #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
 pub mod tenant_tombstone;
-pub use node::{assemble, NodeInput, RunningNode};
+pub use node::{NodeInput, RunningNode, assemble};

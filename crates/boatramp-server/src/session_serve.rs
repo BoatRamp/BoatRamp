@@ -304,7 +304,7 @@ pub(super) async fn serve_session_open(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "site stream connection limit reached\n",
             )
-                .into_response()
+                .into_response();
         }
     };
     let ip_guard = match crate::stream::acquire_stream_ip_slot(inner, &scope, client_ip) {
@@ -314,7 +314,7 @@ pub(super) async fn serve_session_open(
                 StatusCode::TOO_MANY_REQUESTS,
                 "per-client stream connection limit reached\n",
             )
-                .into_response()
+                .into_response();
         }
     };
 
@@ -450,7 +450,7 @@ pub(super) async fn dispatch_session_post(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "site stream connection limit reached\n",
                 )
-                    .into_response()
+                    .into_response();
             }
         };
     let _ip_guard = match crate::stream::acquire_stream_ip_slot(inner, &permit_scope, client_ip) {
@@ -460,7 +460,7 @@ pub(super) async fn dispatch_session_post(
                 StatusCode::TOO_MANY_REQUESTS,
                 "per-client stream connection limit reached\n",
             )
-                .into_response()
+                .into_response();
         }
     };
 
