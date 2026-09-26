@@ -46,6 +46,12 @@ pub struct AzureMinterConfig {
     pub service_url: String,
     /// The real container the node's blob backend writes to.
     pub container: String,
+    /// Whether the storage account has a **hierarchical namespace** (ADLS Gen2 / HNS). A
+    /// directory-scoped SAS only actually CONFINES to a sub-path on an HNS account (Security LOW-1); on
+    /// a flat account `SasBuilder::directory` silently degrades to a container-wide grant. So a PREFIX
+    /// mint is REFUSED unless the operator declares the account HNS here. Default `false` (fail-closed).
+    /// A single-key (blob-scoped) SAS is unaffected — it pins the exact blob regardless.
+    pub hns: bool,
 }
 
 /// The Azure cloud minter: holds the AAD [`TokenCredential`] (to fetch the user-delegation key) + the
@@ -115,6 +121,18 @@ impl AzureBlobUploadMinter {
 #[async_trait]
 impl BlobUploadMinter for AzureBlobUploadMinter {
     async fn mint(&self, scope: &MintScope) -> Result<MintedCredentials, String> {
+        // Security LOW-1: a directory-scoped SAS only confines to a sub-prefix on a hierarchical-
+        // namespace account; on a flat account it silently widens to container-wide. Fail CLOSED —
+        // refuse a prefix mint unless the operator declared the account HNS. (A single-key blob-scoped
+        // SAS pins the exact blob regardless, so it is allowed either way.)
+        if matches!(scope.target, UploadTarget::Prefix(_)) && !self.config.hns {
+            return Err(
+                "Azure prefix mint refused: a directory-scoped SAS only confines on a \
+                 hierarchical-namespace (HNS/ADLS-Gen2) account; set `azure_hns = true` in \
+                 [serve.s3_ingress_cloud] to declare the account HNS, or mint a single-key credential"
+                    .to_string(),
+            );
+        }
         let now = boatramp_core::time::now_unix();
         let expires_at = now.saturating_add(scope.ttl_secs);
         let start = OffsetDateTime::from_unix_timestamp(now as i64)
@@ -219,7 +237,7 @@ mod tests {
     // gate (the delegation key is AAD-signed and cannot be minted offline without a credential). The
     // pure enforced/advisory labelling — the security crux — is unit-tested here without any Azure call.
     use super::*;
-    use boatramp_handlers::UploadConstraints;
+    use boatramp_handlers::{UploadConstraints, UploadPerm};
 
     fn constraints(
         size: Option<u64>,
@@ -233,6 +251,61 @@ mod tests {
             require_sha256: sha,
             create_only: create,
         }
+    }
+
+    /// A credential that panics if its token is ever fetched — the LOW-1 refusal returns BEFORE any
+    /// credential use, so a prefix mint on a non-HNS account must never reach `get_token`.
+    #[derive(Debug)]
+    struct NeverCalledCredential;
+
+    #[async_trait]
+    impl TokenCredential for NeverCalledCredential {
+        async fn get_token(
+            &self,
+            _scopes: &[&str],
+            _options: Option<azure_core_v1::credentials::TokenRequestOptions<'_>>,
+        ) -> azure_core_v1::Result<azure_core_v1::credentials::AccessToken> {
+            panic!(
+                "credential must not be fetched: the non-HNS prefix mint must fail closed first"
+            );
+        }
+    }
+
+    fn minter(hns: bool) -> AzureBlobUploadMinter {
+        AzureBlobUploadMinter::new(
+            Arc::new(NeverCalledCredential),
+            AzureMinterConfig {
+                account: "acct".into(),
+                service_url: "https://acct.blob.core.windows.net/".into(),
+                container: "photos".into(),
+                hns,
+            },
+        )
+    }
+
+    fn prefix_scope() -> MintScope {
+        MintScope {
+            project: "acme".into(),
+            site: "blog".into(),
+            container: "photos".into(),
+            target: UploadTarget::Prefix("ingest/".into()),
+            perms: vec![UploadPerm::Put],
+            constraints: UploadConstraints::default(),
+            ttl_secs: 900,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_prefix_mint_on_a_non_hns_account_is_refused_fail_closed() {
+        // Security LOW-1: a directory SAS silently degrades to container-wide on a flat account ⇒ a
+        // prefix mint must be refused (before any AAD call) unless the operator declares HNS. The fake
+        // credential panics if fetched, so a passing test also proves the refusal happens BEFORE any
+        // credential use.
+        let err = minter(false).mint(&prefix_scope()).await.unwrap_err();
+        assert!(
+            err.contains("hierarchical-namespace") && err.contains("azure_hns"),
+            "the refusal must name the HNS requirement + the config knob: {err}"
+        );
     }
 
     #[test]
@@ -265,14 +338,17 @@ mod tests {
     }
 
     #[test]
-    fn content_addressing_is_the_strong_fallback_on_azure() {
+    fn unpinned_sha256_is_advisory_on_an_azure_directory_sas() {
+        // Security HIGH-2: an Azure SAS (single-blob or directory) carries no checksum condition, so
+        // require_sha256 is advisory on the directory/prefix shape — the client uploads directly to
+        // Blob Storage; boatramp never sees the bytes to verify `key == sha256`. It promotes no size.
         let c = constraints(Some(2048), None, true, false);
         let (enforced, advisory) = cloud::constraint_contract(&c, CloudEnforcement::NONE);
-        assert!(enforced.contains(&"require_sha256".to_string()));
         assert!(
-            enforced.contains(&"max_bytes=2048".to_string()),
-            "content-addressed ⇒ size moot"
+            enforced.is_empty(),
+            "an Azure SAS pins no hash ⇒ nothing enforced: {enforced:?}"
         );
-        assert!(advisory.is_empty());
+        assert!(advisory.contains(&"require_sha256".to_string()));
+        assert!(advisory.contains(&"max_bytes=2048".to_string()));
     }
 }

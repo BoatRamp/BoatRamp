@@ -1002,6 +1002,7 @@ async fn wire_cloud_blob_upload(
                 account,
                 service_url,
                 container,
+                hns: cloud.azure_hns,
             }
         }
         // fs / in-memory ⇒ the local S3 face mints (no cloud brokering).

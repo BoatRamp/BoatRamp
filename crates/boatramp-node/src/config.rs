@@ -1950,6 +1950,12 @@ pub struct S3IngressCloud {
     /// **Azure**: the blob service URL (`https://{account}.blob.core.windows.net/`). Absent ⇒ derived
     /// from the account name.
     pub azure_service_url: Option<String>,
+    /// **Azure**: declare the storage account has a **hierarchical namespace** (HNS/ADLS-Gen2). A
+    /// directory-scoped SAS only actually confines to a sub-prefix on an HNS account; on a flat account
+    /// it silently degrades to container-wide (Security LOW-1). So a PREFIX mint is refused unless this
+    /// is `true`. Default `false` (fail-closed). A single-key mint is unaffected.
+    #[serde(default)]
+    pub azure_hns: bool,
 }
 
 /// The default operator ceiling on a minted S3 upload credential's TTL when
