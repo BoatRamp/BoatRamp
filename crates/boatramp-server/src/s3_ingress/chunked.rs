@@ -158,9 +158,16 @@ fn take_one_chunk(pending: &mut Vec<u8>) -> ChunkFrame {
         Err(_) => return ChunkFrame::Malformed,
     };
     // The chunk data starts after the header's CRLF and is `size` bytes, followed by a trailing CRLF.
+    // Use checked arithmetic (M2-review MEDIUM-1): `parse_chunk_header` already bounds `size` to
+    // `MAX_CHUNK_SIZE`, but the framing offsets must never wrap even so (release builds have no
+    // overflow checks) — an overflow is treated as a malformed frame, fail-closed, never a panic.
     let data_start = hdr_end + 2;
-    let data_end = data_start + size;
-    let trailer_end = data_end + 2;
+    let Some(data_end) = data_start.checked_add(size) else {
+        return ChunkFrame::Malformed;
+    };
+    let Some(trailer_end) = data_end.checked_add(2) else {
+        return ChunkFrame::Malformed;
+    };
     if pending.len() < trailer_end {
         return ChunkFrame::NeedMore;
     }
@@ -307,6 +314,45 @@ mod tests {
             res.is_err(),
             "a tampered chunk signature must abort the stream"
         );
+    }
+
+    #[tokio::test]
+    async fn hostile_huge_chunk_size_aborts_cleanly_without_panic() {
+        // M2-review MEDIUM-1: a chunk header declaring `ffffffffffffffff` (usize::MAX on 64-bit) — and
+        // one just over MAX_CHUNK_SIZE — must abort the stream with a clean error, NEVER an
+        // integer-overflow panic in the framing math (`data_start + size`, `data_end + 2`).
+        let ctx = ChunkContext {
+            secret: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            scope: CredentialScope {
+                access_key_id: "BRUPHUGE".into(),
+                date: "20150830".into(),
+                region: LOCAL_REGION.into(),
+                service: LOCAL_SERVICE.into(),
+            },
+            amz_date: "20150830T123600Z".into(),
+            seed_signature: "1111111111111111111111111111111111111111111111111111111111111111"
+                .into(),
+        };
+        for bad_size in ["ffffffffffffffff", "10000001" /* > 16 MiB */] {
+            let wire = format!("{bad_size};chunk-signature=deadbeef\r\nXX\r\n").into_bytes();
+            let body: ByteStream =
+                futures::stream::once(async move { Ok(bytes::Bytes::from(wire)) }).boxed();
+            let res = collect(dechunk_verified(body, clone_ctx(&ctx))).await;
+            assert!(
+                res.is_err(),
+                "a hostile chunk size ({bad_size}) must abort cleanly, not panic"
+            );
+        }
+    }
+
+    /// Small helper to clone a `ChunkContext` for the loop above (it holds only owned strings + scope).
+    fn clone_ctx(c: &ChunkContext) -> ChunkContext {
+        ChunkContext {
+            secret: c.secret.clone(),
+            scope: c.scope.clone(),
+            amz_date: c.amz_date.clone(),
+            seed_signature: c.seed_signature.clone(),
+        }
     }
 
     #[tokio::test]

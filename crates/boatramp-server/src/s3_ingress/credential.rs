@@ -54,6 +54,11 @@ pub enum CredentialError {
     /// A configured root secret was the wrong length.
     #[error("s3-ingress ingress secret must be exactly {INGRESS_SECRET_LEN} bytes")]
     BadSecretLen,
+    /// The configured `s3_ingress_secret_file` could not be read (missing, wrong permissions, or
+    /// otherwise unreadable) — distinct from [`BadSecretLen`](CredentialError::BadSecretLen) so a
+    /// fat-fingered path on a multi-node deploy reports "can't read the file", not "wrong length".
+    #[error("s3-ingress ingress secret file is unreadable: {0}")]
+    SecretFileUnreadable(String),
     /// The local S3 face is enabled on a multi-node deployment without an explicitly configured,
     /// cluster-uniform ingress secret. Fail closed rather than silently reuse an auto-generated
     /// per-node key (which would make credentials un-verifiable across nodes) — the operator MUST set

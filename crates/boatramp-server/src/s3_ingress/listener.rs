@@ -63,7 +63,9 @@ pub fn s3_face_enable_guard(
 /// (refusing to serve rather than enabling an un-verifiable-across-nodes face).
 ///
 /// - `secret_file = Some(path)`: read the raw 32-byte root from the file (the operator-distributed,
-///   cluster-uniform secret — mirrors `[secrets].kek_file`). A wrong-length file is an error.
+///   cluster-uniform secret — mirrors `[secrets].kek_file`). An unreadable file (missing/permission)
+///   is a distinct [`CredentialError::SecretFileUnreadable`]; a readable-but-wrong-length file is
+///   [`CredentialError::BadSecretLen`] — so an operator can tell a fat-fingered path from a bad key.
 /// - `secret_file = None`: allowed ONLY on a single node (an ephemeral per-process root is generated);
 ///   on a multi-node deployment this is [`CredentialError::MultiNodeSecretRequired`] (fail-closed).
 ///
@@ -76,7 +78,10 @@ pub fn load_ingress_secret(
     s3_face_enable_guard(deployment, secret_file.is_some())?;
     match secret_file {
         Some(path) => {
-            let bytes = std::fs::read(path).map_err(|_| CredentialError::BadSecretLen)?;
+            // Distinguish "can't read the file" (missing/permission — a fat-fingered path on a
+            // multi-node deploy) from "read a wrong-length key" (a genuine key error). M2-review INFO.
+            let bytes = std::fs::read(path)
+                .map_err(|e| CredentialError::SecretFileUnreadable(e.to_string()))?;
             S3IngressSecret::from_bytes(&bytes)
         }
         // Single-node with no explicit secret: auto-generate an ephemeral per-process root (the guard
@@ -220,6 +225,17 @@ mod tests {
         assert!(matches!(
             load_ingress_secret(Deployment::SingleNode, Some(&bad)),
             Err(CredentialError::BadSecretLen)
+        ));
+        // M2-review INFO: a MISSING/unreadable file is a distinct error (not BadSecretLen), so a
+        // fat-fingered path reports "can't read", not "wrong length".
+        let missing = dir.join(format!(
+            "br-s3-ingress-secret-missing-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&missing); // ensure it does not exist
+        assert!(matches!(
+            load_ingress_secret(Deployment::SingleNode, Some(&missing)),
+            Err(CredentialError::SecretFileUnreadable(_))
         ));
         let _ = std::fs::remove_file(&good);
         let _ = std::fs::remove_file(&bad);
