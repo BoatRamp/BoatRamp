@@ -691,7 +691,13 @@ fn mysql_managed_without_ddl_identity_is_terminal_error() {
     b.tenant = TenantIsolation::Shared; // managed, compute-backed
     b.migration_url_env = None;
     let mut report = RepairReport::default();
-    check_mysql_ddl_identity(&b, "appdb_acme", /*compute_backed=*/ true, &mut report);
+    check_mysql_ddl_identity(
+        &b,
+        "appdb_acme",
+        /*compute_backed=*/ true,
+        &mut report,
+        &boatramp_core::env::MapEnv::new(),
+    );
     assert_eq!(report.checks.len(), 1);
     assert_eq!(report.checks[0].check, "ddl-identity");
     assert_eq!(
@@ -706,22 +712,26 @@ fn mysql_managed_without_ddl_identity_is_terminal_error() {
 /// DDL DSN is a genuinely distinct login → ok. Uses per-test unique env vars so it is hermetic.
 #[test]
 fn mysql_external_ddl_identity_distinctness() {
+    // All host-env values are injected via a MapEnv rather than mutating the process environment.
+    let env = boatramp_core::env::MapEnv::new()
+        .with("REPAIR_TEST_MYSQL_RUNTIME", "mysql://app:pw@h1/appdb")
+        .with("REPAIR_TEST_MYSQL_DDL_SAME", "mysql://app:pw@h1/appdb")
+        .with("REPAIR_TEST_MYSQL_DDL_DISTINCT", "mysql://ddladmin:pw@h1/appdb");
+
     // A declared-but-unset migration var → error (not reachable).
     let mut b = external_binding("mysql");
     b.migration_url_env = Some("REPAIR_TEST_MYSQL_DDL_UNSET".into());
     let mut report = RepairReport::default();
-    check_mysql_ddl_identity(&b, "appdb", false, &mut report);
+    check_mysql_ddl_identity(&b, "appdb", false, &mut report, &env);
     assert_eq!(report.checks[0].status, RepairStatus::Error);
 
     // Same username as the runtime → distinctness error. (Only meaningful with sql-mysql, which
     // parses the DSN; a sql-postgres-only build keeps the byte check — so make them byte-equal too.)
-    std::env::set_var("REPAIR_TEST_MYSQL_RUNTIME", "mysql://app:pw@h1/appdb");
-    std::env::set_var("REPAIR_TEST_MYSQL_DDL_SAME", "mysql://app:pw@h1/appdb");
     let mut b = external_binding("mysql");
     b.url_env = "REPAIR_TEST_MYSQL_RUNTIME".into();
     b.migration_url_env = Some("REPAIR_TEST_MYSQL_DDL_SAME".into());
     let mut report = RepairReport::default();
-    check_mysql_ddl_identity(&b, "appdb", false, &mut report);
+    check_mysql_ddl_identity(&b, "appdb", false, &mut report, &env);
     assert_eq!(
         report.checks[0].status,
         RepairStatus::Error,
@@ -729,15 +739,11 @@ fn mysql_external_ddl_identity_distinctness() {
     );
 
     // A distinct DDL login → ok.
-    std::env::set_var(
-        "REPAIR_TEST_MYSQL_DDL_DISTINCT",
-        "mysql://ddladmin:pw@h1/appdb",
-    );
     let mut b = external_binding("mysql");
     b.url_env = "REPAIR_TEST_MYSQL_RUNTIME".into();
     b.migration_url_env = Some("REPAIR_TEST_MYSQL_DDL_DISTINCT".into());
     let mut report = RepairReport::default();
-    check_mysql_ddl_identity(&b, "appdb", false, &mut report);
+    check_mysql_ddl_identity(&b, "appdb", false, &mut report, &env);
     assert_eq!(
         report.checks[0].status,
         RepairStatus::Ok,
@@ -1075,6 +1081,7 @@ async fn dry_run_repair_over_unsealed_tenant_writes_no_kv_keys() {
             "main",
             "acme",
             RepairMode::DryRun,
+            &boatramp_core::env::MapEnv::new(),
         )
         .await
         .unwrap_or_else(|e| panic!("{label}: dry-run repair should produce a report: {e}"));

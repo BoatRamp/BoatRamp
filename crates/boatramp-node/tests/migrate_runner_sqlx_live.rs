@@ -59,8 +59,9 @@ fn ext_step(id: &str, name: &str) -> MigrationStep {
 
 fn runner_for() -> Option<NodeMigrationRunner> {
     let url = std::env::var("BOATRAMP_TEST_PG_URL").ok()?;
-    // The runner reads the connection URL from `url_env`; point it at the same PG.
-    std::env::set_var(URL_ENV, &url);
+    // The runner reads the connection URL from `url_env`; inject it via a MapEnv (never mutate
+    // the process environment) pointed at the same PG.
+    let env = boatramp_core::env::MapEnv::new().with(URL_ENV, url);
     let mut databases = BTreeMap::new();
     databases.insert(
         DB.to_string(),
@@ -78,17 +79,20 @@ fn runner_for() -> Option<NodeMigrationRunner> {
             ..Default::default()
         },
     );
-    let op = Arc::new(NodeOperatorSql::new(
-        databases,
-        Arc::new(MemoryKv::new()),
-        None,
-        DeployStore::new(
-            Arc::new(FsStorage::new(
-                std::env::temp_dir().join("boatramp-migrate-test"),
-            )),
+    let op = Arc::new(
+        NodeOperatorSql::new(
+            databases,
             Arc::new(MemoryKv::new()),
-        ),
-    ));
+            None,
+            DeployStore::new(
+                Arc::new(FsStorage::new(
+                    std::env::temp_dir().join("boatramp-migrate-test"),
+                )),
+                Arc::new(MemoryKv::new()),
+            ),
+        )
+        .with_env_source(Arc::new(env)),
+    );
     let mut allow = std::collections::BTreeSet::new();
     allow.insert("citext".to_string());
     Some(NodeMigrationRunner::new(op, allow))

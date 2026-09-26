@@ -98,8 +98,11 @@ fn runner_for() -> Option<NodeMigrationRunner> {
         runtime, ddl,
         "the DDL identity must be DISTINCT from the runtime user"
     );
-    std::env::set_var(RUNTIME_URL_ENV, &runtime);
-    std::env::set_var(DDL_URL_ENV, &ddl);
+    // The runner reads the runtime + DDL URLs from named `url_env`/`migration_url_env`; inject
+    // them via a MapEnv (never mutate the process environment).
+    let env = boatramp_core::env::MapEnv::new()
+        .with(RUNTIME_URL_ENV, runtime.clone())
+        .with(DDL_URL_ENV, ddl.clone());
 
     let mut databases = BTreeMap::new();
     databases.insert(
@@ -116,17 +119,20 @@ fn runner_for() -> Option<NodeMigrationRunner> {
             ..Default::default()
         },
     );
-    let op = Arc::new(NodeOperatorSql::new(
-        databases,
-        Arc::new(MemoryKv::new()),
-        None,
-        DeployStore::new(
-            Arc::new(FsStorage::new(
-                std::env::temp_dir().join("boatramp-migrate-mysql-test"),
-            )),
+    let op = Arc::new(
+        NodeOperatorSql::new(
+            databases,
             Arc::new(MemoryKv::new()),
-        ),
-    ));
+            None,
+            DeployStore::new(
+                Arc::new(FsStorage::new(
+                    std::env::temp_dir().join("boatramp-migrate-mysql-test"),
+                )),
+                Arc::new(MemoryKv::new()),
+            ),
+        )
+        .with_env_source(Arc::new(env)),
+    );
     // No trusted extensions — MySQL refuses the extension step kind outright regardless.
     Some(NodeMigrationRunner::new(
         op,

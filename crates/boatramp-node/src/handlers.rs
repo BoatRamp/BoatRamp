@@ -145,6 +145,7 @@ pub async fn build_handler_runtime(
         deploy,
         &kv,
         secrets_envelope.as_ref(),
+        &boatramp_core::env::SystemEnv,
     )
     .await?;
     // The `wasi:messaging` substrate: single-node `LogMessaging` over the same
@@ -259,11 +260,12 @@ async fn build_sql_backends(
     deploy: &DeployStore,
     kv: &Arc<dyn KvStore>,
     secrets_envelope: Option<&Arc<dyn KeyEnvelope>>,
+    env_source: &dyn boatramp_core::env::EnvSource,
 ) -> Result<Arc<dyn boatramp_core::sql::SqlBackends>> {
     let resolve_env = |var: &Option<String>| -> Result<Option<String>> {
         match var {
             Some(var) => Ok(Some(
-                std::env::var(var).map_err(|_| Error::SqlEnvUnset(var.clone()))?,
+                env_source.get(var).ok_or_else(|| Error::SqlEnvUnset(var.clone()))?,
             )),
             None => Ok(None),
         }
@@ -352,8 +354,9 @@ async fn build_sql_backends(
                 // keeps its historical single-shared-endpoint shape.
                 if let Some(var) = db.password_env.as_deref().filter(|v| !v.is_empty()) {
                     let workload = db.compute.as_deref().expect("compute checked above");
-                    let password =
-                        std::env::var(var).map_err(|_| Error::SqlEnvUnset(var.into()))?;
+                    let password = env_source
+                        .get(var)
+                        .ok_or_else(|| Error::SqlEnvUnset(var.into()))?;
                     let resolver = Arc::new(crate::managed_sql::DeployEndpointResolver::new(
                         deploy.clone(),
                         boatramp_core::project::DEFAULT_PROJECT,
@@ -399,11 +402,12 @@ async fn build_sql_backends(
                 if db.url_env.trim().is_empty() {
                     return Err(Error::SqlExternalUrlEnvMissing(name.clone()));
                 }
-                let url = std::env::var(&db.url_env)
-                    .map_err(|_| Error::SqlEnvUnset(db.url_env.clone()))?;
+                let url = env_source
+                    .get(&db.url_env)
+                    .ok_or_else(|| Error::SqlEnvUnset(db.url_env.clone()))?;
                 let read_url = match &db.read_url_env {
                     Some(var) => {
-                        Some(std::env::var(var).map_err(|_| Error::SqlEnvUnset(var.clone()))?)
+                        Some(env_source.get(var).ok_or_else(|| Error::SqlEnvUnset(var.clone()))?)
                     }
                     None => None,
                 };
@@ -543,7 +547,16 @@ mod tests {
         let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
         let cfg = managed_sql_cfg();
         // `Arc<dyn SqlBackends>` isn't `Debug`, so match rather than `unwrap_err`.
-        match build_sql_backends(Some(&cfg), tmp.path(), &deploy, &kv, None).await {
+        match build_sql_backends(
+            Some(&cfg),
+            tmp.path(),
+            &deploy,
+            &kv,
+            None,
+            &boatramp_core::env::SystemEnv,
+        )
+        .await
+        {
             Err(Error::SqlManagedNeedsSecrets(name)) => assert_eq!(name, "analytics"),
             Ok(_) => panic!("a managed DB without [secrets] must fail closed, got Ok"),
             Err(other) => panic!("expected SqlManagedNeedsSecrets, got: {other}"),
@@ -561,9 +574,16 @@ mod tests {
         // without minting any credential — every compute-backed managed binding is
         // now **per-tenant**, so a credential is sealed lazily per (tenant, server)
         // on first `open`, not eagerly at build (a tenant isn't known at build time).
-        let backends = build_sql_backends(Some(&cfg), tmp.path(), &deploy, &kv, Some(&envelope))
-            .await
-            .expect("managed sql builds without a live DB (lazy connect)");
+        let backends = build_sql_backends(
+            Some(&cfg),
+            tmp.path(),
+            &deploy,
+            &kv,
+            Some(&envelope),
+            &boatramp_core::env::SystemEnv,
+        )
+        .await
+        .expect("managed sql builds without a live DB (lazy connect)");
         assert!(
             kv.get("managed-sql-cred/default/pg")
                 .await
