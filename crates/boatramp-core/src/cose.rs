@@ -46,6 +46,10 @@ const CLAIM_PUB: &str = "br_pub";
 /// the issuing guest so it can apply its own within-tenant filter (e.g. a per-client `sub`). The host
 /// treats every key/value as an opaque string.
 const CLAIM_APP: &str = "br_app";
+/// Text claim key for the **S3-ingress upload scope** ([`KIND_S3_SESSION`]) — a CBOR map holding the
+/// host-stamped `{project, site, container, key|prefix, perms, constraints}`. The full scope lives in
+/// the SIGNED payload so a client can never widen it (the URL/headers are never consulted for scope).
+const CLAIM_S3: &str = "br_s3";
 
 /// Bounds on the opaque app-context (R6): a capability may carry at most this many entries, and its
 /// keys+values may total at most this many bytes. Enforced at mint so a guest can't inflate a token.
@@ -96,6 +100,17 @@ pub const KIND_CONTEXT: &str = "context";
 /// forged/expired/wrong-audience envelope fails closed. Distinct from `handle` (which is read-only,
 /// unauthenticated, and world-public only).
 pub const KIND_CAPABILITY: &str = "capability";
+/// Token kind: a host-issued **S3-ingress session token** (PLAN-blob-s3-ingress). It IS the
+/// `session_token` of a temporary S3 credential: a `COSE_Sign1` CWT carrying the FULL host-stamped
+/// upload scope (`br_s3` — project/site/container, the single key or prefix, the permitted S3
+/// operations, and the enforced constraints), a **mandatory** `exp`, and a `cti`. Signed by the fleet
+/// `Signer` trust root and client-opaque; the local S3 face verifies it (signature + expiry + kind)
+/// on every request and authorizes the concrete PUT/multipart call against the carried scope — the
+/// scope is NEVER taken from the URL or a client header, so cross-container/cross-project access is
+/// structurally impossible. **Domain-separated**: it can never be redeemed as a role/capability/
+/// context/session token, and none of those can be redeemed as an S3 session (the `br_kind` check is
+/// exact on both mint and verify).
+pub const KIND_S3_SESSION: &str = "s3-session";
 
 /// PoP claim: the bound HTTP method (upper-case).
 const CLAIM_HTM: &str = "htm";
@@ -1101,6 +1116,321 @@ pub fn verify_capability(
             .ok_or_else(|| TokenError::Claims("capability has no public subset".into()))?,
         context,
     })
+}
+
+// ---- S3-ingress session token (PLAN-blob-s3-ingress) ----------------------------------------
+//
+// The `session_token` of a temporary S3 credential. Domain-separated from every other token kind:
+// a role/capability/context/session token can never be redeemed here (the exact `br_kind` check), and
+// an S3 session can never be redeemed as any of those (their verifiers reject its kind).
+
+/// A single permitted S3 operation an [`S3SessionScope`] grants. Deliberately a small, explicit set
+/// (write/multipart only by default) — an ingress credential is never a read/list/delete surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum S3Perm {
+    /// Single-shot `PutObject`.
+    Put,
+    /// The multipart quartet (`CreateMultipartUpload` / `UploadPart` / `CompleteMultipartUpload` /
+    /// `AbortMultipartUpload`) — resumable/large uploads.
+    Multipart,
+}
+
+impl S3Perm {
+    /// The stable wire term (CBOR + greppable).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Put => "put",
+            Self::Multipart => "multipart",
+        }
+    }
+
+    /// Parse a wire term back; unknown ⇒ `None` (dropped on decode, never a panic).
+    fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "put" => Some(Self::Put),
+            "multipart" => Some(Self::Multipart),
+            _ => None,
+        }
+    }
+}
+
+/// What an [`S3SessionScope`] is bound to: exactly ONE object key, or a key prefix. Caller-chosen-key
+/// (UGC) creds bind a single key; bulk-agent creds bind a prefix. Both are host-composed under
+/// `hblob/{project-qualified-site}/{container}/` and screened by `validate_object_key` before the
+/// scope is minted (M2 re-screens at the face; here it is carried opaquely).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum S3Target {
+    /// A single object key the credential may write (create-only unless content-addressed).
+    Key(String),
+    /// A key prefix the credential may write under (a bulk credential).
+    Prefix(String),
+}
+
+impl S3Target {
+    /// The CBOR discriminant term.
+    fn tag(&self) -> &'static str {
+        match self {
+            Self::Key(_) => "key",
+            Self::Prefix(_) => "prefix",
+        }
+    }
+    /// The bound key/prefix string.
+    fn value(&self) -> &str {
+        match self {
+            Self::Key(k) | Self::Prefix(k) => k,
+        }
+    }
+}
+
+/// The **enforced** constraints stamped into an [`S3SessionScope`]. On the local S3 face these are
+/// hard fail-closed checks (M2); the credential's `enforced`-vs-`advisory` contract (M3) reflects that
+/// a cloud store may not honor all of them, where content-addressing is the mandatory fallback.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct S3Constraints {
+    /// Max object size in bytes (`None` ⇒ unbounded here; the per-container ceiling still applies).
+    pub max_bytes: Option<u64>,
+    /// Required `Content-Type` (exact or a `type/*` family — matched at the face); `None` ⇒ any.
+    pub content_type: Option<String>,
+    /// Require the object key to equal `sha256(bytes)` (content-addressing) — the strong,
+    /// cross-cloud, replay-inert enforcement.
+    pub require_sha256: bool,
+    /// Refuse to overwrite an existing key (create-only, `If-None-Match: *`-style). UGC creds default
+    /// to this; overwrite is safe only for content-addressed keys (same bytes ⇒ same key).
+    pub create_only: bool,
+}
+
+/// The full host-stamped upload scope an [`KIND_S3_SESSION`] token carries. Project + site are
+/// resolved by the HOST from the minting principal's own scope (never guest/client-supplied), so a
+/// credential is structurally confined to its origin tenant; container/target/perms/constraints are
+/// the (clamped) request shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct S3SessionScope {
+    /// The owning project (host-resolved).
+    pub project: String,
+    /// The owning site (host-resolved).
+    pub site: String,
+    /// The blob container (a single validated segment).
+    pub container: String,
+    /// The single key or prefix the credential may write.
+    pub target: S3Target,
+    /// The permitted S3 operations (a non-empty set; write/multipart only).
+    pub perms: Vec<S3Perm>,
+    /// The enforced upload constraints.
+    pub constraints: S3Constraints,
+}
+
+impl S3SessionScope {
+    /// Encode as a deterministic CBOR map for the signed payload. Only present constraint fields are
+    /// written (a compact, stable token). Perms are sorted+deduped so the encoding is canonical.
+    fn to_cbor(&self) -> CborValue {
+        let mut perms: Vec<S3Perm> = self.perms.clone();
+        perms.sort_unstable();
+        perms.dedup();
+        let mut constraints: Vec<(CborValue, CborValue)> = Vec::new();
+        if let Some(mb) = self.constraints.max_bytes {
+            constraints.push((
+                CborValue::Text("max_bytes".into()),
+                CborValue::Integer(mb.into()),
+            ));
+        }
+        if let Some(ct) = &self.constraints.content_type {
+            constraints.push((
+                CborValue::Text("content_type".into()),
+                CborValue::Text(ct.clone()),
+            ));
+        }
+        if self.constraints.require_sha256 {
+            constraints.push((
+                CborValue::Text("require_sha256".into()),
+                CborValue::Bool(true),
+            ));
+        }
+        if self.constraints.create_only {
+            constraints.push((CborValue::Text("create_only".into()), CborValue::Bool(true)));
+        }
+        CborValue::Map(vec![
+            (
+                CborValue::Text("project".into()),
+                CborValue::Text(self.project.clone()),
+            ),
+            (
+                CborValue::Text("site".into()),
+                CborValue::Text(self.site.clone()),
+            ),
+            (
+                CborValue::Text("container".into()),
+                CborValue::Text(self.container.clone()),
+            ),
+            (
+                CborValue::Text(self.target.tag().into()),
+                CborValue::Text(self.target.value().to_string()),
+            ),
+            (
+                CborValue::Text("perms".into()),
+                CborValue::Array(
+                    perms
+                        .iter()
+                        .map(|p| CborValue::Text(p.as_str().into()))
+                        .collect(),
+                ),
+            ),
+            (
+                CborValue::Text("constraints".into()),
+                CborValue::Map(constraints),
+            ),
+        ])
+    }
+
+    /// Decode from the CBOR produced by [`to_cbor`](Self::to_cbor). Fails closed (`None`) on a missing
+    /// required field, an empty perm set, or both/neither of `key`/`prefix` — a hostile/garbled scope
+    /// never yields a usable (and therefore never a widened) grant. Unknown keys are ignored.
+    fn from_cbor(value: &CborValue) -> Option<Self> {
+        let CborValue::Map(entries) = value else {
+            return None;
+        };
+        let mut project = None;
+        let mut site = None;
+        let mut container = None;
+        let mut key = None;
+        let mut prefix = None;
+        let mut perms: Vec<S3Perm> = Vec::new();
+        let mut constraints = S3Constraints::default();
+        for (k, v) in entries {
+            let CborValue::Text(name) = k else { continue };
+            match (name.as_str(), v) {
+                ("project", CborValue::Text(s)) => project = Some(s.clone()),
+                ("site", CborValue::Text(s)) => site = Some(s.clone()),
+                ("container", CborValue::Text(s)) => container = Some(s.clone()),
+                ("key", CborValue::Text(s)) => key = Some(s.clone()),
+                ("prefix", CborValue::Text(s)) => prefix = Some(s.clone()),
+                ("perms", CborValue::Array(items)) => {
+                    for item in items {
+                        if let CborValue::Text(p) = item
+                            && let Some(perm) = S3Perm::from_str(p)
+                        {
+                            perms.push(perm);
+                        }
+                    }
+                }
+                ("constraints", CborValue::Map(cs)) => {
+                    for (ck, cv) in cs {
+                        let CborValue::Text(cname) = ck else { continue };
+                        match (cname.as_str(), cv) {
+                            ("max_bytes", CborValue::Integer(i)) => {
+                                constraints.max_bytes = u64::try_from(*i).ok();
+                            }
+                            ("content_type", CborValue::Text(s)) => {
+                                constraints.content_type = Some(s.clone());
+                            }
+                            ("require_sha256", CborValue::Bool(b)) => {
+                                constraints.require_sha256 = *b;
+                            }
+                            ("create_only", CborValue::Bool(b)) => constraints.create_only = *b,
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        // Exactly one of key/prefix must be present (never both, never neither).
+        let target = match (key, prefix) {
+            (Some(k), None) => S3Target::Key(k),
+            (None, Some(p)) => S3Target::Prefix(p),
+            _ => return None,
+        };
+        perms.sort_unstable();
+        perms.dedup();
+        if perms.is_empty() {
+            return None;
+        }
+        Some(Self {
+            project: project?,
+            site: site?,
+            container: container?,
+            target,
+            perms,
+            constraints,
+        })
+    }
+}
+
+/// A verified S3-ingress session token: the carried [`S3SessionScope`], its revocation id (`cti`, for
+/// the opt-in revocation check), and its effective expiry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct S3Session {
+    /// The host-stamped upload scope this credential authorizes.
+    pub scope: S3SessionScope,
+    /// The revocation id (hex of `cti`) — looked up in `authz/revoked/<cti>` only for long-TTL creds
+    /// that opt into revocation (off by default; the common path is stateless).
+    pub cti: String,
+    /// The (mandatory) expiry, Unix seconds.
+    pub exp: u64,
+}
+
+/// Mint an S3-ingress **session token** ([`KIND_S3_SESSION`]): a `COSE_Sign1` CWT carrying the full
+/// host-stamped `scope` as `br_s3`, `iat = now`, a mandatory `exp = now + ttl_secs`, and a random
+/// `cti`, signed by the fleet `Signer`. Returns the base64url token — the `session_token` field of the
+/// temporary credential handed to the client. Verified with [`verify_s3_session`]; a forged/expired/
+/// wrong-kind token never verifies, and the scope can only be READ from the signed payload (never
+/// widened by the client).
+pub async fn mint_s3_session(
+    scope: &S3SessionScope,
+    ttl_secs: u64,
+    now_unix: u64,
+    signer: &dyn Signer,
+) -> Result<String, TokenError> {
+    let claims = ClaimsSetBuilder::new()
+        .issued_at(Timestamp::WholeSeconds(now_unix as i64))
+        .cwt_id(random_cti()?)
+        .expiration_time(Timestamp::WholeSeconds(
+            now_unix.saturating_add(ttl_secs) as i64
+        ))
+        .text_claim(
+            CLAIM_KIND.to_string(),
+            CborValue::Text(KIND_S3_SESSION.to_string()),
+        )
+        .text_claim(CLAIM_S3.to_string(), scope.to_cbor())
+        .build();
+    sign_claims(claims, signer).await
+}
+
+/// Verify an S3-ingress session token against the fleet public key at `now_unix`: checks the COSE
+/// signature (algorithm pinned), the **mandatory** expiry, and `br_kind == "s3-session"` (domain
+/// separation — a role/capability/context/session token presented here is rejected), then decodes the
+/// carried [`S3SessionScope`]. Any tampering — a forged/altered scope, an absent/expired `exp`, a wrong
+/// kind, a malformed scope (missing field / empty perms / both-or-neither key/prefix) — fails closed;
+/// the local S3 face then returns a uniform 403 with NO which-check-failed detail (revocation, if the
+/// caller opts in, is a separate `authz/revoked/<cti>` lookup on the returned `cti`).
+pub fn verify_s3_session(
+    token: &str,
+    public: &TokenPublicKey,
+    now_unix: u64,
+) -> Result<S3Session, TokenError> {
+    let claims = verify_envelope(token, public)?;
+    let cti = claim_cti(&claims)?;
+    // An S3 credential is short-lived by construction, so `exp` is a HARD invariant: an `exp`-less
+    // token would never expire. `check_exp` treats an absent `exp` as "no expiry" (fine for other
+    // kinds), so require its presence here regardless of who minted the token.
+    let exp = check_exp(&claims, now_unix)?
+        .ok_or_else(|| TokenError::Claims("s3-session has no expiry (exp is mandatory)".into()))?;
+    let mut kind = None;
+    let mut scope = None;
+    for (name, value) in &claims.rest {
+        let coset::cwt::ClaimName::Text(t) = name else {
+            continue;
+        };
+        match (t.as_str(), value) {
+            (CLAIM_KIND, CborValue::Text(k)) => kind = Some(k.clone()),
+            (CLAIM_S3, m @ CborValue::Map(_)) => scope = S3SessionScope::from_cbor(m),
+            _ => {}
+        }
+    }
+    if kind.as_deref() != Some(KIND_S3_SESSION) {
+        return Err(TokenError::Claims("not an s3-session token".into()));
+    }
+    let scope = scope.ok_or_else(|| TokenError::Claims("s3-session scope is missing/malformed".into()))?;
+    Ok(S3Session { scope, cti, exp })
 }
 
 /// The canonical bytes a joiner signs with its mesh private key to **prove
@@ -2373,5 +2703,231 @@ mod tests {
                 pub_hex
             );
         }
+    }
+
+    // ---- S3-ingress session token (KIND_S3_SESSION) --------------------------------------------
+
+    fn s3_scope_key() -> S3SessionScope {
+        S3SessionScope {
+            project: "acme".into(),
+            site: "blog".into(),
+            container: "uploads".into(),
+            target: S3Target::Key("avatars/u1/pic.jpg".into()),
+            perms: vec![S3Perm::Put],
+            constraints: S3Constraints {
+                max_bytes: Some(5 * 1024 * 1024),
+                content_type: Some("image/*".into()),
+                require_sha256: false,
+                create_only: true,
+            },
+        }
+    }
+
+    fn s3_scope_prefix() -> S3SessionScope {
+        S3SessionScope {
+            project: "acme".into(),
+            site: "blog".into(),
+            container: "bulk".into(),
+            target: S3Target::Prefix("ingest/2026/".into()),
+            perms: vec![S3Perm::Put, S3Perm::Multipart],
+            constraints: S3Constraints {
+                max_bytes: None,
+                content_type: None,
+                require_sha256: true,
+                create_only: false,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn s3_session_round_trips_the_full_scope() {
+        let signer = LocalSigner::generate(TokenAlg::Es256);
+        let public = signer.public_key();
+        for scope in [s3_scope_key(), s3_scope_prefix()] {
+            let token = mint_s3_session(&scope, 300, NOW, &signer).await.unwrap();
+            let v = verify_s3_session(&token, &public, NOW + 60).unwrap();
+            assert_eq!(v.scope, scope, "the verified scope must equal what was minted");
+            assert_eq!(v.exp, NOW + 300);
+            assert!(!v.cti.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn s3_session_is_domain_separated_from_every_other_kind() {
+        // An S3 session must NOT verify as any other token kind, and no other kind may verify as an
+        // S3 session — the exact `br_kind` check on both sides is the whole isolation guarantee.
+        let signer = LocalSigner::generate(TokenAlg::Es256);
+        let public = signer.public_key();
+
+        // (a) An S3-session token cannot be redeemed as a role / capability / context / session /
+        //     join token. `verify()` is kind-agnostic by contract (it returns `br_kind` for the
+        //     caller to gate), so the role-path guarantee is that it reports a kind that is NOT
+        //     `KIND_ROLE` — any role-gated caller then rejects it. The strongly-typed verifiers
+        //     reject it outright via their own exact-kind checks.
+        let s3 = mint_s3_session(&s3_scope_key(), 300, NOW, &signer)
+            .await
+            .unwrap();
+        let as_role = verify(&s3, &public, NOW + 1).unwrap();
+        assert_eq!(
+            as_role.kind, KIND_S3_SESSION,
+            "an s3-session's kind must be distinct from KIND_ROLE so a role-gated path rejects it"
+        );
+        assert_ne!(as_role.kind, KIND_ROLE);
+        assert!(as_role.roles.is_empty(), "an s3-session carries no RBAC roles");
+        assert!(verify_capability(&s3, &public, NOW + 1, "acme").is_err());
+        assert!(verify_context(&s3, &public, NOW + 1).is_err());
+        assert!(verify_session(&s3, &public, NOW + 1).is_err());
+        assert!(verify_join(&s3, &public, NOW + 1).is_err());
+
+        // (b) A role token, a session cookie, a signed-context envelope, and a capability all fail
+        //     the s3-session kind check.
+        let role = mint(&claims(), &signer).await.unwrap();
+        assert!(matches!(
+            verify_s3_session(&role, &public, NOW + 1),
+            Err(TokenError::Claims(_)),
+        ));
+        let sess = mint_session("sid-1", 300, NOW, &signer).await.unwrap();
+        assert!(matches!(
+            verify_s3_session(&sess, &public, NOW + 1),
+            Err(TokenError::Claims(_)),
+        ));
+        let ctx = mint_context("tenant-a", 300, NOW, &signer).await.unwrap();
+        assert!(matches!(
+            verify_s3_session(&ctx, &public, NOW + 1),
+            Err(TokenError::Claims(_)),
+        ));
+        let cap = mint_capability(
+            "tenant-b",
+            "acme",
+            "public",
+            &std::collections::BTreeMap::new(),
+            300,
+            NOW,
+            &signer,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            verify_s3_session(&cap, &public, NOW + 1),
+            Err(TokenError::Claims(_)),
+        ));
+    }
+
+    #[tokio::test]
+    async fn s3_session_rejects_expired_and_a_foreign_signer() {
+        let signer = LocalSigner::generate(TokenAlg::Es256);
+        let public = signer.public_key();
+        let token = mint_s3_session(&s3_scope_key(), 300, NOW, &signer)
+            .await
+            .unwrap();
+
+        // Expired (verifying past `exp`) fails closed.
+        assert!(matches!(
+            verify_s3_session(&token, &public, NOW + 301),
+            Err(TokenError::Expired),
+        ));
+
+        // A different fleet key cannot verify it (signature check).
+        let stranger = LocalSigner::generate(TokenAlg::Es256).public_key();
+        assert!(matches!(
+            verify_s3_session(&token, &stranger, NOW + 1),
+            Err(TokenError::Invalid(_)),
+        ));
+    }
+
+    #[tokio::test]
+    async fn s3_session_requires_a_mandatory_exp() {
+        // Hand-build a KIND_S3_SESSION claim set with NO expiry; verify must refuse it (an expiry is
+        // mandatory for an ingress credential, regardless of who minted the token).
+        let signer = LocalSigner::generate(TokenAlg::Es256);
+        let public = signer.public_key();
+        let claims = ClaimsSetBuilder::new()
+            .issued_at(Timestamp::WholeSeconds(NOW as i64))
+            .cwt_id(random_cti().unwrap())
+            .text_claim(
+                CLAIM_KIND.to_string(),
+                CborValue::Text(KIND_S3_SESSION.to_string()),
+            )
+            .text_claim(CLAIM_S3.to_string(), s3_scope_key().to_cbor())
+            .build();
+        let token = sign_claims(claims, &signer).await.unwrap();
+        assert!(matches!(
+            verify_s3_session(&token, &public, NOW + 1),
+            Err(TokenError::Claims(_)),
+        ));
+    }
+
+    #[test]
+    fn s3_scope_from_cbor_fails_closed_on_malformed_shapes() {
+        // A garbled scope must never decode to a usable (widened) grant.
+        // Both key AND prefix present ⇒ None.
+        let both = CborValue::Map(vec![
+            (CborValue::Text("project".into()), CborValue::Text("p".into())),
+            (CborValue::Text("site".into()), CborValue::Text("s".into())),
+            (CborValue::Text("container".into()), CborValue::Text("c".into())),
+            (CborValue::Text("key".into()), CborValue::Text("k".into())),
+            (CborValue::Text("prefix".into()), CborValue::Text("pre/".into())),
+            (
+                CborValue::Text("perms".into()),
+                CborValue::Array(vec![CborValue::Text("put".into())]),
+            ),
+            (CborValue::Text("constraints".into()), CborValue::Map(vec![])),
+        ]);
+        assert!(S3SessionScope::from_cbor(&both).is_none());
+
+        // Neither key nor prefix ⇒ None.
+        let neither = CborValue::Map(vec![
+            (CborValue::Text("project".into()), CborValue::Text("p".into())),
+            (CborValue::Text("site".into()), CborValue::Text("s".into())),
+            (CborValue::Text("container".into()), CborValue::Text("c".into())),
+            (
+                CborValue::Text("perms".into()),
+                CborValue::Array(vec![CborValue::Text("put".into())]),
+            ),
+            (CborValue::Text("constraints".into()), CborValue::Map(vec![])),
+        ]);
+        assert!(S3SessionScope::from_cbor(&neither).is_none());
+
+        // Empty perm set ⇒ None (an ingress cred that authorizes nothing is refused, not "allow").
+        let no_perms = CborValue::Map(vec![
+            (CborValue::Text("project".into()), CborValue::Text("p".into())),
+            (CborValue::Text("site".into()), CborValue::Text("s".into())),
+            (CborValue::Text("container".into()), CborValue::Text("c".into())),
+            (CborValue::Text("key".into()), CborValue::Text("k".into())),
+            (CborValue::Text("perms".into()), CborValue::Array(vec![])),
+            (CborValue::Text("constraints".into()), CborValue::Map(vec![])),
+        ]);
+        assert!(S3SessionScope::from_cbor(&no_perms).is_none());
+
+        // Missing a required field (no container) ⇒ None.
+        let missing = CborValue::Map(vec![
+            (CborValue::Text("project".into()), CborValue::Text("p".into())),
+            (CborValue::Text("site".into()), CborValue::Text("s".into())),
+            (CborValue::Text("key".into()), CborValue::Text("k".into())),
+            (
+                CborValue::Text("perms".into()),
+                CborValue::Array(vec![CborValue::Text("put".into())]),
+            ),
+            (CborValue::Text("constraints".into()), CborValue::Map(vec![])),
+        ]);
+        assert!(S3SessionScope::from_cbor(&missing).is_none());
+    }
+
+    #[tokio::test]
+    async fn s3_session_scope_is_tamper_evident() {
+        // Flipping a byte of the signed token (which contains the scope) breaks the signature — a
+        // client cannot edit the carried scope to widen its container/key/perms.
+        let signer = LocalSigner::generate(TokenAlg::Es256);
+        let public = signer.public_key();
+        let token = mint_s3_session(&s3_scope_key(), 300, NOW, &signer)
+            .await
+            .unwrap();
+        let mut raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(&token)
+            .unwrap();
+        let mid = raw.len() / 2;
+        raw[mid] ^= 0x01;
+        let tampered = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&raw);
+        assert!(verify_s3_session(&tampered, &public, NOW + 1).is_err());
     }
 }
