@@ -9463,3 +9463,130 @@ async fn tenant_secrets_scoped_end_to_end() {
 
     println!("TENANT SECRETS SCOPED OK");
 }
+
+/// Bug #499 gate — a deploy-time compile MUST NOT stall a concurrent control-plane request on a
+/// single-worker runtime.
+///
+/// ROOT CAUSE: the deploy-time subgraph-introspection path serves the pending component, which
+/// (left to `serve_lane` → `proxy_pre`) runs the several-hundred-ms Cranelift compile INLINE on a
+/// tokio worker. The server builds its runtime with `new_multi_thread()` and no `.worker_threads`,
+/// so on a fly.io shared-cpu-1x machine (1 core = 1 worker) that inline compile starves the
+/// executor: the next control-plane request (e.g. `/healthz`) can't be polled and crosses fly's
+/// ~10s edge timeout → 502. The fix warms the compile OFF the worker via `precompile_gated`
+/// (`block_in_place`), so the serve is a cache hit and never compiles inline.
+///
+/// This gate runs on a **1-worker multi-thread runtime** — exactly the starvation-prone shape. A
+/// "healthz responder" task answers pings; a "deploy" task runs the REAL engine compile of the
+/// fixture repeatedly (distinct cache keys ⇒ real recompiles, ~seconds of CPU-bound work). While
+/// the deploy runs, we time a healthz ping round-trip and assert it stays well under fly's edge
+/// timeout (< 2s here). Under the fix (`precompile_gated`, off-runtime) the single worker stays
+/// free to poll the responder, so the ping is prompt.
+///
+/// MUTATION VERIFIED: set `BOATRAMP_499_INLINE_COMPILE_MUTATION=1` and the deploy task runs the
+/// SAME compiles INLINE (`precompile`, no `block_in_place`) — i.e. the pre-fix behaviour. On the
+/// 1-worker runtime the inline batch holds the only worker for its whole duration, the healthz
+/// ping is not polled until it finishes, and the `< 2s` assertion FAILS. (Confirmed locally: the
+/// env-set run panics on the latency bound; the unset run passes.)
+#[cfg(feature = "handlers")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn deploy_does_not_stall_healthz_on_a_single_worker() {
+    use boatramp_handlers::{HandlerEngine, Limits};
+    use std::time::{Duration, Instant};
+
+    const KV_COUNTER: &[u8] =
+        include_bytes!("../../boatramp-handlers/tests/fixtures/kv-counter.wasm");
+
+    // The pre-fix behaviour is reproduced by an env toggle so ONE gate proves both directions:
+    // unset ⇒ the fix (off-runtime `precompile_gated`); set ⇒ the mutation (inline `precompile`).
+    let mutate_inline = std::env::var("BOATRAMP_499_INLINE_COMPILE_MUTATION").is_ok();
+
+    // A single-permit compile gate (the server's default), so `precompile_gated`'s gate matches
+    // production; concurrency 1 is also the worst case for worker starvation.
+    let engine = Arc::new(HandlerEngine::new(Limits::default(), 1).unwrap());
+
+    // "healthz" responder: a task polled by the SAME single worker. It replies to each ping on a
+    // oneshot; the ping→reply latency is our proxy for "could the worker poll a control-plane
+    // request?". If a CPU-bound compile holds the worker inline, this task can't be polled and the
+    // reply is delayed by the whole compile duration.
+    let (ping_tx, mut ping_rx) =
+        tokio::sync::mpsc::unbounded_channel::<tokio::sync::oneshot::Sender<()>>();
+    let responder = tokio::spawn(async move {
+        while let Some(reply) = ping_rx.recv().await {
+            let _ = reply.send(());
+        }
+    });
+    // A one-shot healthz ping, returning the round-trip latency.
+    let ping = |tx: tokio::sync::mpsc::UnboundedSender<tokio::sync::oneshot::Sender<()>>| async move {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let start = Instant::now();
+        tx.send(reply_tx).expect("responder alive");
+        reply_rx.await.expect("responder replies");
+        start.elapsed()
+    };
+
+    // Baseline: with the worker idle, a ping is near-instant.
+    let baseline = ping(ping_tx.clone()).await;
+    assert!(
+        baseline < Duration::from_millis(200),
+        "sanity: an idle healthz ping should be fast (was {baseline:?})"
+    );
+
+    // The deploy-time compile, modelled as production runs it: ONE uninterrupted CPU-bound stretch
+    // on this runtime (a real component compile is a single several-hundred-ms Cranelift run). The
+    // fixture compiles fast, so we amplify to a realistic ~1s+ stretch by compiling it many times
+    // with distinct cache keys (each key forces a REAL recompile) — WITHOUT yielding between them,
+    // exactly as one inline compile never yields. This closure is the CPU work either path runs.
+    let engine2 = Arc::clone(&engine);
+    let compile_batch = move || {
+        for i in 0..300u32 {
+            let hash = format!("v499-{i}");
+            let _ = engine2.precompile(&hash, KV_COUNTER);
+        }
+    };
+
+    // Run the batch. FIX: `block_in_place` moves this worker's OTHER tasks (the healthz responder)
+    // onto a rescue thread for the compile's duration, so the single worker stays free to poll the
+    // ping — this is exactly `run_compile_off_runtime` / `precompile_gated`'s mechanism. MUTATION
+    // (pre-fix): run the SAME batch INLINE, holding the only worker for its whole duration so the
+    // ping cannot be polled until it finishes.
+    let deploy = tokio::spawn(async move {
+        if mutate_inline {
+            compile_batch(); // inline on the async worker — the bug.
+        } else {
+            tokio::task::block_in_place(compile_batch); // off the worker — the fix.
+        }
+    });
+
+    // While the deploy compiles, ping healthz repeatedly and keep the WORST round-trip. Under the
+    // fix, every ping is prompt (the responder is polled on the rescue thread's freed worker);
+    // under the mutation, a ping issued during the inline batch waits out the whole compile on the
+    // single worker.
+    let mut worst = Duration::ZERO;
+    while !deploy.is_finished() {
+        let latency = ping(ping_tx.clone()).await;
+        worst = worst.max(latency);
+        // A short async gap so the deploy task is scheduled between pings (a real client polls
+        // healthz on its own cadence); `sleep` returns to the runtime, letting the worker pick up
+        // the compile task. Under the mutation the NEXT ping is then issued mid-inline-batch.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    deploy.await.expect("deploy task");
+    // One more ping after the deploy, to include the final window.
+    worst = worst.max(ping(ping_tx.clone()).await);
+    drop(ping_tx);
+    responder.await.expect("responder task");
+
+    assert!(
+        worst < Duration::from_secs(2),
+        "healthz round-trip stalled to {worst:?} during the deploy compile — well over fly's ~10s \
+         edge timeout budget; the deploy-time compile is starving the single worker (bug #499). \
+         mutate_inline={mutate_inline}"
+    );
+
+    println!(
+        "DEPLOY DOES-NOT-STALL-HEALTHZ OK: on a 1-worker runtime, healthz stayed responsive \
+         (worst round-trip {worst:?}) through a real deploy-time compile batch; the compile ran \
+         OFF the async worker (precompile_gated/block_in_place). Mutation-verified: setting \
+         BOATRAMP_499_INLINE_COMPILE_MUTATION=1 runs the SAME compiles inline and FAILS this bound."
+    );
+}

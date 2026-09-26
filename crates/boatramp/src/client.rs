@@ -31,6 +31,10 @@ pub enum ClientError {
     /// message — surfaced verbatim rather than as a generic HTTP status error.
     #[error("{0}")]
     Refused(String),
+    /// An async (`?wait=false`) function deploy reached a terminal `failed` state, or did not
+    /// reach a terminal state in the poll budget — carrying the server's coarse reason.
+    #[error("{0}")]
+    Deploy(String),
 }
 
 /// `client` module result: a control-plane API call; `Err` is [`ClientError`].
@@ -1018,27 +1022,111 @@ impl ControlPlane {
     }
 
     /// Deploy (create/replace) a top-level function (project-scoped): PUT the
-    /// function record body (`{ component, config, lifecycle }`). Returns the
-    /// server's stored record verbatim.
-    pub async fn deploy_function(
-        &self,
-        name: &str,
-        body: &serde_json::Value,
-    ) -> Result<serde_json::Value> {
+    /// function record body (`{ component, config, lifecycle }`).
+    ///
+    /// Bug #499: the deploy uses `?wait=false` (accept-then-validate) + `?compose=defer` so the
+    /// slow work — the CPU-bound Cranelift compile + subgraph introspect/compose — runs in the
+    /// SERVER's background off the request critical path, never blocking the control-plane request
+    /// worker (a single-worker fly.io machine would otherwise starve the executor and 502 the next
+    /// request, e.g. `/healthz`). The server returns `202 Accepted` + a `Validating` status; this
+    /// method then polls `GET .../deploys/{version}` to a terminal outcome so `apply` still reports
+    /// success/failure correctly. A caller applying subgraphs must call
+    /// [`compose_subgraphs`](Self::compose_subgraphs) once after all deploys to promote the staged
+    /// SDLs (the `?compose=defer` counterpart).
+    pub async fn deploy_function(&self, name: &str, body: &serde_json::Value) -> Result<()> {
+        let seg = self.functions_seg();
+        let version = body
+            .get("component")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        let Self {
+            http: client,
+            base: server,
+            ..
+        } = self;
+        let resp = client
+            .put(format!(
+                "{server}/api/{seg}/{name}?wait=false&compose=defer"
+            ))
+            .json(body)
+            .send()
+            .await?
+            .error_for_status()?;
+        // The server accepts the deploy (`202`) and validates in the background; poll the status
+        // handle to a terminal (`active`/`failed`). A `version` is always present (the CLI always
+        // sends `component`), so the poll targets the exact pending version.
+        let Some(version) = version else {
+            // No component hash in the body — nothing to poll against. The `202` already means the
+            // deploy was accepted; treat as done (this shape isn't produced by the CLI).
+            return Ok(());
+        };
+        // Consume the 202 body (a `Validating` status); the outcome is read by polling below.
+        let _ = resp.bytes().await;
+        self.poll_deploy_status(name, &version).await
+    }
+
+    /// Poll `GET /api/functions/{name}/deploys/{version}` (deploy-resilience #1b) until the async
+    /// deploy reaches a terminal state. `Ok(())` on `active` (validated + promoted); an error on
+    /// `failed` (carrying the server's coarse reason). A brief bounded poll — an async deploy's
+    /// slow part is a several-hundred-ms compile + a compose, so terminal is reached quickly; the
+    /// loop is capped so a wedged deploy surfaces an error rather than hanging `apply` forever.
+    async fn poll_deploy_status(&self, name: &str, version: &str) -> Result<()> {
         let seg = self.functions_seg();
         let Self {
             http: client,
             base: server,
             ..
         } = self;
-        Ok(client
-            .put(format!("{server}/api/{seg}/{name}"))
-            .json(body)
+        let url = format!("{server}/api/{seg}/{name}/deploys/{version}");
+        // Up to ~120s (240 × 500ms): generous for a cold compile + compose, bounded so a genuinely
+        // stuck deploy fails `apply` instead of hanging. `Validating` ⇒ keep polling.
+        for _ in 0..240 {
+            let status: serde_json::Value = client
+                .get(&url)
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            match status.get("status").and_then(serde_json::Value::as_str) {
+                Some("active") => return Ok(()),
+                Some("failed") => {
+                    let reason = status
+                        .get("reason")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown reason");
+                    return Err(ClientError::Deploy(format!(
+                        "function `{name}` deploy failed: {reason}"
+                    )));
+                }
+                // `validating` (or an unrecognized transient) — keep waiting.
+                _ => tokio::time::sleep(std::time::Duration::from_millis(500)).await,
+            }
+        }
+        Err(ClientError::Deploy(format!(
+            "function `{name}` deploy did not reach a terminal state in time"
+        )))
+    }
+
+    /// Promote the project's **staged** subgraphs in one composition (`POST .../graphql/compose`)
+    /// — the `?compose=defer` counterpart (deploy-resilience #3). An `apply` that deployed one or
+    /// more subgraph functions with `?compose=defer` calls this ONCE at the end: the whole set is
+    /// validated + promoted together (a composition failure promotes nothing and leaves the live
+    /// supergraph untouched). Project-scoped via `project_seg` (`graphql` for the default project,
+    /// else `projects/<proj>/graphql`). A no-op server response (nothing staged) is still success.
+    pub async fn compose_subgraphs(&self) -> Result<()> {
+        let seg = project_seg(&self.project, "graphql");
+        let Self {
+            http: client,
+            base: server,
+            ..
+        } = self;
+        client
+            .post(format!("{server}/api/{seg}/compose"))
             .send()
             .await?
-            .error_for_status()?
-            .json()
-            .await?)
+            .error_for_status()?;
+        Ok(())
     }
 
     /// Create/replace a compute workload (project-scoped): PUT the

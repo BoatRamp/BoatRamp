@@ -103,12 +103,13 @@ trait ControlPlane {
     async fn activate(&self, site: &str, id: &str) -> CpResult<()>;
     /// Stage a local file as a content-addressed blob, returning its hash.
     async fn put_file_blob(&self, path: &Path) -> CpResult<String>;
-    /// Create/replace a top-level function record.
-    async fn deploy_function(
-        &self,
-        name: &str,
-        body: &serde_json::Value,
-    ) -> CpResult<serde_json::Value>;
+    /// Create/replace a top-level function record. Drives the async (`?wait=false`) +
+    /// deferred-compose (`?compose=defer`) deploy and polls to a terminal outcome (bug #499), so
+    /// the slow server-side compile/compose never blocks the control-plane request worker.
+    async fn deploy_function(&self, name: &str, body: &serde_json::Value) -> CpResult<()>;
+    /// Promote the project's staged subgraphs in one composition — the `?compose=defer`
+    /// counterpart. Called once after all function deploys (bug #499). A no-op when nothing staged.
+    async fn compose_subgraphs(&self) -> CpResult<()>;
     /// Create/replace a compute workload spec.
     async fn put_compute(
         &self,
@@ -195,14 +196,13 @@ impl ControlPlane for client::ControlPlane {
     async fn put_file_blob(&self, path: &Path) -> CpResult<String> {
         self.put_file_blob(path).await.map_err(CpError::Client)
     }
-    async fn deploy_function(
-        &self,
-        name: &str,
-        body: &serde_json::Value,
-    ) -> CpResult<serde_json::Value> {
+    async fn deploy_function(&self, name: &str, body: &serde_json::Value) -> CpResult<()> {
         self.deploy_function(name, body)
             .await
             .map_err(CpError::Client)
+    }
+    async fn compose_subgraphs(&self) -> CpResult<()> {
+        self.compose_subgraphs().await.map_err(CpError::Client)
     }
     async fn put_compute(
         &self,
@@ -419,6 +419,11 @@ pub async fn run(args: ApplyArgs, config: &ProjectConfig) -> Result<()> {
     for function in &manifest.functions {
         apply_function(&cp, function, args.dry_run).await?;
     }
+    // Bug #499: each function deploy staged (not composed) its subgraph SDL via `?compose=defer`,
+    // keeping the slow introspect/compose off the per-deploy request critical path. Promote the
+    // whole staged set in ONE composition here (O(N) instead of O(N²) recomposes). A no-op when
+    // no function staged a subgraph. Skipped on dry-run (no deploys happened).
+    apply_deferred_compose(&cp, !manifest.functions.is_empty(), args.dry_run).await?;
     for compute in &manifest.compute {
         apply_compute(&cp, compute, args.dry_run).await?;
     }
@@ -650,6 +655,24 @@ async fn apply_function<C: ControlPlane>(
     Ok(())
 }
 
+/// Promote the staged subgraphs once, after all functions have been deployed (bug #499). Each
+/// function deploy used `?compose=defer`, so its subgraph SDL was staged (not composed) — keeping
+/// the O(N) introspect/compose off each individual deploy's request critical path. This calls
+/// `POST .../graphql/compose` ONCE to validate + promote the whole staged set. A no-op when the
+/// manifest declares no functions (nothing could have staged), and skipped entirely on a dry-run
+/// (no deploys happened). Generic over the [`ControlPlane`] seam so the mock records the call.
+async fn apply_deferred_compose<C: ControlPlane>(
+    cp: &C,
+    any_functions: bool,
+    dry_run: bool,
+) -> Result<()> {
+    if dry_run || !any_functions {
+        return Ok(());
+    }
+    cp.compose_subgraphs().await?;
+    Ok(())
+}
+
 /// Reconcile one compute workload: PUT its spec straight to the server.
 async fn apply_compute<C: ControlPlane>(
     cp: &C,
@@ -769,13 +792,13 @@ mod tests {
             self.rec(format!("put_file_blob {}", path.display()));
             Ok("deadbeef".into())
         }
-        async fn deploy_function(
-            &self,
-            name: &str,
-            _body: &serde_json::Value,
-        ) -> CpResult<serde_json::Value> {
+        async fn deploy_function(&self, name: &str, _body: &serde_json::Value) -> CpResult<()> {
             self.rec(format!("deploy_function {name}"));
-            Ok(json!({}))
+            Ok(())
+        }
+        async fn compose_subgraphs(&self) -> CpResult<()> {
+            self.rec("compose_subgraphs".to_string());
+            Ok(())
         }
         async fn put_compute(
             &self,
@@ -859,6 +882,27 @@ mod tests {
         let mock = MockCp::default();
         apply_function(&mock, &a_function(), true).await.unwrap();
         assert!(mock.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn apply_deferred_compose_promotes_once_after_functions() {
+        // Bug #499: with functions present (each deployed `?compose=defer`), the staged subgraphs
+        // are promoted by exactly ONE `compose_subgraphs` call after the deploys.
+        let mock = MockCp::default();
+        apply_deferred_compose(&mock, true, false).await.unwrap();
+        assert_eq!(mock.calls(), ["compose_subgraphs"]);
+    }
+
+    #[tokio::test]
+    async fn apply_deferred_compose_noop_without_functions_or_on_dry_run() {
+        // No functions in the manifest ⇒ nothing staged ⇒ no compose call.
+        let mock = MockCp::default();
+        apply_deferred_compose(&mock, false, false).await.unwrap();
+        assert!(mock.calls().is_empty(), "no functions ⇒ no compose");
+        // Dry-run ⇒ no deploys happened ⇒ no compose call.
+        let mock = MockCp::default();
+        apply_deferred_compose(&mock, true, true).await.unwrap();
+        assert!(mock.calls().is_empty(), "dry-run ⇒ no compose");
     }
 
     #[tokio::test]
