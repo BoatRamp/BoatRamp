@@ -483,4 +483,106 @@ mod tests {
             "the uploaded object lands guest-readable, proving mint→PUT→read"
         );
     }
+
+    /// HIGH-1 (M3 security review) — the headline browser-UGC flow end-to-end: mint a `presigned-put`
+    /// credential (single key + PUT-only ⇒ a ready `fetch()` URL), then drive that URL through the real
+    /// `face::handle` with the session token in the **query only** (`X-Amz-Security-Token`, exactly as a
+    /// browser `fetch(url, {method:"PUT", body})` sends it — never a header). The face MUST accept it
+    /// (200) and land the object guest-readable at `hblob/…`.
+    ///
+    /// This proves the fix: `presign_put_url` signs `X-Amz-Security-Token` into the canonical query, so
+    /// the face must source the token from that query param. Before the fix the face read the token ONLY
+    /// from the `x-amz-security-token` header ⇒ `None` ⇒ uniform 403 ⇒ every presigned-put credential
+    /// unredeemable. See `presigned_put_url_query_token_is_required_by_the_face` below for the anti-hollow
+    /// mutation (remove the query lookup ⇒ this class of request 403s).
+    #[tokio::test]
+    async fn minted_presigned_put_is_accepted_by_the_face_with_token_in_query_only() {
+        use crate::s3_ingress::config::S3IngressState;
+        use crate::s3_ingress::face::{self, S3Request};
+        use axum::body::Body;
+        use axum::http::StatusCode;
+        use boatramp_core::deploy::DeployStore;
+        use boatramp_core::kv::MemoryKv;
+
+        // One signer + one ingress secret shared between the minter and the face.
+        let signer: Arc<dyn Signer> = Arc::new(LocalSigner::generate(TokenAlg::Es256));
+        let secret = Arc::new(S3IngressSecret::from_bytes(&ROOT).unwrap());
+        // The minter's endpoint host MUST match the `host` the face signs/verifies over (the presigned
+        // URL signs `host`), so use a fixed host and send that same host header on the request.
+        let m = ServerBlobUploadMinter {
+            signer: signer.clone(),
+            secret: secret.clone(),
+            config: BlobUploadFaceConfig {
+                endpoint_base: "http://s3.local".into(),
+                region: crate::s3_ingress::config::LOCAL_REGION.into(),
+                service: crate::s3_ingress::config::LOCAL_SERVICE.into(),
+            },
+        };
+        // Mint a single-key PUT-only credential ⇒ a `presigned-put` (the browser-UGC shape).
+        let creds = m
+            .mint(&scope(
+                UploadTarget::Key("avatars/u1.jpg".into()),
+                vec![UploadPerm::Put],
+                UploadConstraints::default(),
+                900,
+            ))
+            .await
+            .unwrap();
+        let MintedCredentials::PresignedPut(p) = creds else {
+            panic!("expected presigned-put for a single-key PUT-only credential");
+        };
+        assert_eq!(p.method, "PUT");
+        // The token is carried in the URL query (not a header) — the whole point of a presigned URL.
+        assert!(
+            p.url.contains("X-Amz-Security-Token="),
+            "the presigned URL must carry the session token in the query: {}",
+            p.url
+        );
+
+        // Build the M2 face over an in-memory store, with the SAME signer public key + a clone of the
+        // SAME ingress secret.
+        let map = Arc::new(crate::s3_ingress::test_support::MapStorage::default());
+        let deploy = DeployStore::new(map.clone(), Arc::new(MemoryKv::new()));
+        let guard = Arc::new(crate::limits::UploadGuard::new(Default::default()));
+        let state = S3IngressState::new(
+            signer.public_key(),
+            S3IngressSecret::from_bytes(&ROOT).unwrap(),
+            deploy,
+            guard,
+        );
+
+        // Split the minted URL into path + query exactly as the listener does, then drive it through
+        // the face as a browser `fetch(url, {method:"PUT", body})` would: NO `x-amz-security-token`
+        // header, ONLY the `host` header the presigned signature was computed over. The token lives in
+        // the query.
+        let (path, query) = p
+            .url
+            .strip_prefix("http://s3.local")
+            .expect("minted URL uses the configured endpoint")
+            .split_once('?')
+            .expect("a presigned URL has a query");
+        let body = b"the avatar bytes";
+        let req = S3Request {
+            method: "PUT".into(),
+            uri_path: path.into(),
+            query: query.into(),
+            headers: vec![("host".to_string(), "s3.local".to_string())],
+            body: Body::from(body.to_vec()),
+        };
+        // Drive at the credential's mint time (the presigned expiry window holds).
+        let now = boatramp_core::time::now_unix() as i64;
+        let resp = face::handle(&state, req, now).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a minted presigned-put URL (token in query only) must be accepted by the face"
+        );
+        // Guest read-through: the object lands at the exact hblob key. Project "acme", site "blog".
+        assert_eq!(
+            map.get_bytes("hblob/acme/blog/photos/avatars/u1.jpg")
+                .unwrap(),
+            body,
+            "the presigned upload lands guest-readable, proving the browser-UGC flow works end-to-end"
+        );
+    }
 }

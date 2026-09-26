@@ -34,13 +34,23 @@ use boatramp_core::kv::KvStore;
 use super::credential::S3IngressSecret;
 use super::sigv4::{
     self, CanonicalRequest, ParsedSignature, STREAMING_PAYLOAD_TRAILER, SigV4Error,
+    UNSIGNED_PAYLOAD,
 };
 
-/// The signed-header names the face REQUIRES every request to have signed (LOW-1). Signing `host`
+/// The signed-header names a **header-auth** request REQUIRES to have signed (LOW-1). Signing `host`
 /// binds the authority; `x-amz-date` binds the timestamp (skew/replay window); `x-amz-content-sha256`
 /// binds the payload mode (a client cannot claim `UNSIGNED-PAYLOAD` while having signed a hash, or
 /// swap the streaming marker). Omitting any of these is a refusal.
 pub const REQUIRED_SIGNED_HEADERS: [&str; 3] = ["host", "x-amz-date", "x-amz-content-sha256"];
+
+/// The signed-header names a **presigned-query** request REQUIRES to have signed. A presigned URL (the
+/// browser-UGC `fetch(url, {method:"PUT", body})` flow) conveys the timestamp + validity window as the
+/// `X-Amz-Date`/`X-Amz-Expires` QUERY params (bound by [`check_presigned_expiry`](sigv4::check_presigned_expiry),
+/// and part of the signed canonical query) and its payload as `UNSIGNED-PAYLOAD` (a browser cannot
+/// pre-hash its body) — so it signs only `host` (the AWS-standard presigned signed-header set, matching
+/// what [`presign_put_url`](sigv4::presign_put_url) produces). Requiring `x-amz-date`/`x-amz-content-sha256`
+/// as SIGNED HEADERS here would reject every standard presigned URL.
+pub const REQUIRED_PRESIGNED_SIGNED_HEADERS: [&str; 1] = ["host"];
 
 /// The parsed inputs the face extracts from the live HTTP request for authentication. Plain,
 /// borrow-y data so [`authenticate`] is pure + unit-testable. The body is NOT here — signature
@@ -132,24 +142,39 @@ pub fn authenticate(
         sigv4::parse_authorization_header(auth, amz_date).map_err(sig_reason)?
     };
 
-    // 2. SignedHeaders policy (LOW-1): every request must sign host + x-amz-date + x-amz-content-sha256.
+    // 2. SignedHeaders policy (LOW-1). Header-auth must sign host + x-amz-date + x-amz-content-sha256;
+    // a presigned URL signs only `host` (its timestamp/validity + payload mode live in the signed query
+    // + the presigned-expiry check — see `REQUIRED_PRESIGNED_SIGNED_HEADERS`). Applying the header-auth
+    // set to a presigned request would reject every standard presigned URL.
     let signed_lower: Vec<String> = parsed
         .signed_headers
         .iter()
         .map(|h| h.to_ascii_lowercase())
         .collect();
-    for required in REQUIRED_SIGNED_HEADERS {
+    let required_signed: &[&str] = if presigned {
+        &REQUIRED_PRESIGNED_SIGNED_HEADERS
+    } else {
+        &REQUIRED_SIGNED_HEADERS
+    };
+    for required in required_signed {
         if !signed_lower.iter().any(|h| h == required) {
             return Err(format!("SignedHeaders omits required header {required:?}"));
         }
     }
 
-    // 3. Trailer rejection (MEDIUM-2): a trailing-checksum streaming request is fail-closed refused —
-    // M1 names the marker but does not verify the trailing checksum, so we never accept one.
-    let payload_hash = input
-        .content_sha256
-        .ok_or("missing x-amz-content-sha256 header")?
-        .to_string();
+    // 3. Payload mode + trailer rejection (MEDIUM-2). A header-auth request declares its payload mode in
+    // the `x-amz-content-sha256` header (required). A presigned URL carries no body-hash header — its
+    // payload is `UNSIGNED-PAYLOAD` (what `presign_put_url` signs), verified below over the signed query.
+    // A trailing-checksum streaming request is fail-closed refused (M1 names the marker but never
+    // verifies the trailing checksum) — a presigned URL is never a streaming/trailer request.
+    let payload_hash = if presigned {
+        UNSIGNED_PAYLOAD.to_string()
+    } else {
+        input
+            .content_sha256
+            .ok_or("missing x-amz-content-sha256 header")?
+            .to_string()
+    };
     if payload_hash == STREAMING_PAYLOAD_TRAILER
         || payload_hash.ends_with("-TRAILER")
         || input.headers.iter().any(|(k, _)| k == "x-amz-trailer")
@@ -681,5 +706,87 @@ mod tests {
             .await
             .unwrap();
         assert!(check_revocation(&kv, "cafef00d").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn presigned_url_authenticates_with_token_and_signed_data_in_the_query() {
+        // HIGH-1 (M3 security review): a presigned URL (the browser-UGC flow) carries its session token
+        // + timestamp + validity window in the QUERY, signs only `host`, and its payload is
+        // `UNSIGNED-PAYLOAD` — there is NO `x-amz-content-sha256`/`x-amz-date`/`x-amz-security-token`
+        // header. `authenticate` must accept this standard presigned form: the presigned SignedHeaders
+        // policy requires only `host`, the payload mode is inferred as UNSIGNED-PAYLOAD, and the session
+        // token is read from `X-Amz-Security-Token` in the (decoded) query params by the caller.
+        let signer = LocalSigner::generate(TokenAlg::Es256);
+        let secret = S3IngressSecret::generate().unwrap();
+        let akid = "BRUPPRESIGNED";
+        let sc = scope(
+            S3Target::Key("avatars/u1.jpg".into()),
+            vec![S3Perm::Put],
+            S3Constraints::default(),
+        );
+        let token = mint_s3_session(&sc, 900, NOW as u64, &signer)
+            .await
+            .unwrap();
+        let session = verify_s3_session(&token, &signer.public_key(), NOW as u64).unwrap();
+        let sak = secret.derive_secret(akid, &session.cti).unwrap();
+
+        // Presign a PUT URL exactly as the minter (`presign_put_url`) does, over host "s3.local".
+        let cred_scope = sigv4::CredentialScope {
+            access_key_id: akid.into(),
+            date: "20150830".into(),
+            region: super::super::config::LOCAL_REGION.into(),
+            service: super::super::config::LOCAL_SERVICE.into(),
+        };
+        let url = sigv4::presign_put_url(
+            "http://s3.local",
+            "photos",
+            "avatars/u1.jpg",
+            &cred_scope,
+            &sak,
+            &token,
+            NOW,
+            900,
+        )
+        .unwrap();
+        // Split the URL as the listener does, and decode the query into (name, value) pairs.
+        let (path, query) = url
+            .strip_prefix("http://s3.local")
+            .unwrap()
+            .split_once('?')
+            .unwrap();
+        let presigned_params = super::super::listener::decoded_query_params(query);
+        // The token is sourced from the query (never a header) — exactly what the face does.
+        let session_token = presigned_params
+            .iter()
+            .find(|(k, _)| k == "X-Amz-Security-Token")
+            .map(|(_, v)| v.as_str());
+        assert!(
+            session_token.is_some(),
+            "the presigned URL must carry the session token in the query"
+        );
+        // A browser fetch sends ONLY the host header (no x-amz-* headers).
+        let headers = vec![("host".to_string(), "s3.local".to_string())];
+        let input = S3AuthInput {
+            method: "PUT",
+            uri_path: path,
+            query,
+            headers: &headers,
+            authorization: None,
+            amz_date: None,
+            content_sha256: None,
+            session_token,
+            presigned_params: &presigned_params,
+        };
+        let authed = authenticate(&input, &signer.public_key(), &secret, NOW)
+            .expect("a standard presigned URL must authenticate");
+        assert_eq!(authed.session.scope.container, "photos");
+        assert_eq!(authed.payload_hash, sigv4::UNSIGNED_PAYLOAD);
+
+        // Anti-oracle sanity: drop the token ⇒ refuse (a presigned URL without a token is unredeemable).
+        let no_token = S3AuthInput {
+            session_token: None,
+            ..input
+        };
+        assert!(authenticate(&no_token, &signer.public_key(), &secret, NOW).is_err());
     }
 }

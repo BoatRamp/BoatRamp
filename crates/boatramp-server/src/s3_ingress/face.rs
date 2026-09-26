@@ -87,8 +87,17 @@ pub async fn handle(state: &S3IngressState, req: S3Request, now_unix: i64) -> Re
     let content_sha256 = header_val(&req.headers, "x-amz-content-sha256");
     let authorization = header_val(&req.headers, "authorization");
     let amz_date = header_val(&req.headers, "x-amz-date");
-    let session_token = header_val(&req.headers, "x-amz-security-token");
     let presigned_params = super::listener::decoded_query_params(&req.query);
+    // The session token: a presigned URL (the browser-UGC `fetch(url, {method:"PUT", body})` flow)
+    // carries it in the SIGNED canonical query as `X-Amz-Security-Token` (see `presign_put_url`), NOT
+    // as a header — a browser fetch sends only the URL. A header-auth SDK sends it as the
+    // `x-amz-security-token` header. Prefer the query param when present (a presigned request), and
+    // fall back to the header (a header-auth request). HIGH-1: without the query lookup, every
+    // presigned-put credential is unredeemable (the token is `None` ⇒ uniform 403). No
+    // signature-verification change is needed — the token is already inside the signed canonical query
+    // (`presigned_canonical_query` retains it), so we neither add nor exclude it from the signature.
+    let session_token = query_val(&presigned_params, "X-Amz-Security-Token")
+        .or_else(|| header_val(&req.headers, "x-amz-security-token"));
     let input = S3AuthInput {
         method: &req.method,
         uri_path: &req.uri_path,
@@ -739,6 +748,18 @@ fn header_val<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str
         .iter()
         .find(|(k, _)| k == name)
         .map(|(_, v)| v.as_str())
+}
+
+/// Look up a (decoded) query-parameter value by exact name. Used to source the session token from a
+/// presigned URL's `X-Amz-Security-Token` param (the browser-UGC flow sends it in the query, never a
+/// header). An empty value (a bare `?X-Amz-Security-Token`) is treated as absent so it correctly falls
+/// back to the header.
+fn query_val<'a>(params: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    params
+        .iter()
+        .find(|(k, _)| k == name)
+        .map(|(_, v)| v.as_str())
+        .filter(|v| !v.is_empty())
 }
 
 /// Insert a static header value, ignoring an invalid-value error (the inputs are our own constants /
