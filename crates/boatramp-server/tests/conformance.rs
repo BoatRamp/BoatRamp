@@ -7378,6 +7378,211 @@ async fn federation_gateway_executes_a_mutation_forwarding_its_argument() {
     );
 }
 
+/// #500 HARD GATE — the GraphQL edge (query guard, federation/data planner, and the GraphiQL
+/// explorer) is a property of the graphql ENDPOINT ROUTE, never a site-wide browser fallback. On a
+/// graphql-enabled site (`graphiql: true`) a browser GET (`Accept: text/html`) to a DIFFERENT declared
+/// route (an OIDC-style `/authorize`) must reach that route's own guest handler — NOT be shadowed by the
+/// GraphiQL IDE, which is the exact construens browser-login blocker. The `/graphql` endpoint itself still
+/// serves GraphiQL. **Mutation-verified:** reverting the `handler.route == <graphql route>` gate in
+/// `dispatch_handler` makes GET `/authorize` return the GraphiQL IDE → this gate FAILS (proven locally by
+/// reverting that filter).
+#[cfg(feature = "handlers")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn graphql_edge_is_scoped_to_the_endpoint_route_not_the_whole_site() {
+    use boatramp_core::config::{
+        DeployConfig, HandlerConfig, HandlerGraphqlConfig, HandlersSiteConfig, SiteConfig,
+    };
+    use boatramp_handlers::{HandlerEngine, Limits};
+
+    const HTTP_200: &[u8] = include_bytes!("../../boatramp-handlers/tests/fixtures/http-200.wasm");
+
+    let storage = Arc::new(MemStorage::default());
+    let kv = Arc::new(MemoryKv::new());
+    let deploy = DeployStore::new(storage.clone(), kv.clone());
+
+    // One handler component serves BOTH the graphql endpoint and a sibling guest GET route.
+    let hash = sha256_hex(HTTP_200);
+    let bytes = HTTP_200.to_vec();
+    let stream: ByteStream =
+        futures::stream::once(async move { Ok(bytes::Bytes::from(bytes)) }).boxed();
+    deploy.put_blob(&hash, stream).await.unwrap();
+    let mut files = BTreeMap::new();
+    files.insert(
+        "h.wasm".to_string(),
+        FileEntry {
+            hash: hash.clone(),
+            size: HTTP_200.len() as u64,
+            content_type: None,
+            variants: BTreeMap::new(),
+        },
+    );
+    let handler_on = |route: &str| HandlerConfig {
+        secrets: Vec::new(),
+        tenancy: None,
+        token_claims: None,
+        route: route.into(),
+        methods: Vec::new(),
+        component: "h.wasm".into(),
+        imports: Vec::new(),
+        streaming: false,
+        limits: None,
+        env: BTreeMap::new(),
+        invoke_targets: Vec::new(),
+        stats_topics: Vec::new(),
+        tenant_secret_names: Vec::new(),
+    };
+    let manifest = Manifest {
+        files,
+        config: DeployConfig {
+            // `/graphql` is the graphql endpoint; `/authorize` is a sibling guest GET route.
+            handlers: vec![handler_on("/graphql"), handler_on("/authorize")],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let id = deploy.put_manifest(&manifest).await.unwrap();
+    deploy
+        .activate(ProjectRef::DEFAULT, "gw", &id)
+        .await
+        .unwrap();
+    deploy
+        .set_site_config(
+            ProjectRef::DEFAULT,
+            "gw",
+            &SiteConfig {
+                handlers: Some(HandlersSiteConfig {
+                    enabled: true,
+                    graphql: Some(HandlerGraphqlConfig {
+                        enabled: true,
+                        graphiql: true,
+                        // `route` defaults to `/graphql`, so the edge is scoped there.
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
+    let runtime = HandlerRuntime::new(engine, kv.clone(), storage, None, None);
+    let app = router(deploy.clone(), Auth::disabled(), runtime);
+
+    // GET a site path with an explicit `Accept`, returning (status, body-as-string).
+    async fn get_accept(app: &axum::Router, path: &str, accept: &str) -> (StatusCode, String) {
+        let mut req = Request::builder()
+            .method("GET")
+            .uri(format!("/_sites/gw{path}"))
+            .header(header::ACCEPT, accept)
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40002))));
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let raw = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        (status, String::from_utf8_lossy(&raw).into_owned())
+    }
+
+    // (1) THE FIX: a real browser GET (`Accept: text/html`) to the sibling guest route is NOT
+    // shadowed by GraphiQL — the guest handler runs (http-200 → 200, a non-GraphiQL body).
+    let (status, body) = get_accept(&app, "/authorize", "text/html").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the sibling guest route must run its own handler: {body}"
+    );
+    assert!(
+        !body.contains("GraphiQL"),
+        "a browser GET to a sibling guest route must NOT be shadowed by the GraphiQL IDE: {body}"
+    );
+
+    // (2) The graphql endpoint itself STILL serves the GraphiQL IDE to a browser GET (unchanged).
+    let (status, body) = get_accept(&app, "/graphql", "text/html").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains("GraphiQL"),
+        "the /graphql endpoint should still serve the GraphiQL IDE: {body}"
+    );
+
+    // (3) `Accept: */*` to the guest route also reaches the guest (was already correct pre-fix).
+    let (status, body) = get_accept(&app, "/authorize", "*/*").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!body.contains("GraphiQL"), "{body}");
+
+    // (4) First-match hazard (Security review #1): a broader handler declared BEFORE the graphql
+    // handler (a `/**` catch-all) wins the route match, but the edge — the query
+    // depth/complexity/introspection guard, and GraphiQL — must STILL engage on `/graphql`, because
+    // it is keyed on the REQUEST PATH matching the graphql route, not on the matched handler's route
+    // string. A raw `handler.route == "/graphql"` gate would see the matched `/**` handler and
+    // silently disable the guard on the real endpoint. So GET `/graphql` here must still be GraphiQL.
+    let mut files2 = BTreeMap::new();
+    files2.insert(
+        "h.wasm".to_string(),
+        FileEntry {
+            hash: hash.clone(),
+            size: HTTP_200.len() as u64,
+            content_type: None,
+            variants: BTreeMap::new(),
+        },
+    );
+    let manifest2 = Manifest {
+        files: files2,
+        config: DeployConfig {
+            // `/**` is declared FIRST and matches every path (including `/graphql`).
+            handlers: vec![handler_on("/**"), handler_on("/graphql")],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let id2 = deploy.put_manifest(&manifest2).await.unwrap();
+    deploy
+        .activate(ProjectRef::DEFAULT, "gw2", &id2)
+        .await
+        .unwrap();
+    deploy
+        .set_site_config(
+            ProjectRef::DEFAULT,
+            "gw2",
+            &SiteConfig {
+                handlers: Some(HandlersSiteConfig {
+                    enabled: true,
+                    graphql: Some(HandlerGraphqlConfig {
+                        enabled: true,
+                        graphiql: true,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let mut req = Request::builder()
+        .method("GET")
+        .uri("/_sites/gw2/graphql")
+        .header(header::ACCEPT, "text/html")
+        .body(Body::empty())
+        .unwrap();
+    req.extensions_mut()
+        .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40003))));
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let raw = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let body = String::from_utf8_lossy(&raw);
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains("GraphiQL"),
+        "the edge (guard + GraphiQL) must engage on /graphql even when a broader handler is \
+         declared first — the guard must not be silently disabled: {body}"
+    );
+
+    println!("GRAPHQL EDGE ROUTE-SCOPED OK");
+}
+
 // ---- GraphQL edge-visibility end-to-end (#495) ------------------------------
 
 /// #495 edge-visibility HARD GATE. A federated root field marked `@edgeHidden` (here the trust-boundary

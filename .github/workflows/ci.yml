@@ -985,6 +985,21 @@ jobs:
             || { echo "::error::edge-visibility gate did not run (silent skip or a failure)" >&2; exit 1; }
           grep -q 'EDGE VISIBILITY INTERNAL OK' edge-visibility.log \
             || { echo "::error::edge-visibility gate never reached its marker (an edge-hidden op became reachable on the external edge, or an existence oracle appeared)" >&2; exit 1; }
+      # #500: the GraphQL edge (query guard, federation/data planner, and the GraphiQL explorer) is a
+      # property of the graphql ENDPOINT ROUTE, not a site-wide browser fallback. A browser GET
+      # (Accept: text/html) to a sibling declared guest route (an OIDC-style /authorize) must reach that
+      # route's own handler — NOT be shadowed by the GraphiQL IDE (the construens browser-login blocker) —
+      # while the /graphql endpoint still serves GraphiQL. A scoping regression (the site-wide edge shadows
+      # guest GET routes again) fails the merge.
+      - name: graphql edge route-scoped gate marker (#500)
+        run: |
+          set -eo pipefail
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-server \
+            --features handlers --test conformance graphql_edge_is_scoped_to_the_endpoint_route_not_the_whole_site -- --nocapture 2>&1 | tee graphql-edge-scope.log
+          grep -qE 'test result: ok\. 1 passed' graphql-edge-scope.log \
+            || { echo "::error::graphql-edge-scope gate did not run (silent skip or a failure)" >&2; exit 1; }
+          grep -q 'GRAPHQL EDGE ROUTE-SCOPED OK' graphql-edge-scope.log \
+            || { echo "::error::graphql-edge-scope gate never reached its marker (the GraphiQL / graphql edge shadows a sibling guest GET route again)" >&2; exit 1; }
       # B10 (async-lane sharding): the whole async-lane shard gate battery — CAS claim race,
       # node-loss transition (double-owner ⇒ exactly one execution, no-owner ⇒ safety-net rescues,
       # never a stranding), lease-expiry reclaim, blob-watcher single-fire, cron single-fire, and the
