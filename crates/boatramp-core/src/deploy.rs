@@ -541,6 +541,22 @@ pub async fn load_project_tenancy(
     }
 }
 
+/// Whether `site` currently exists in `project` — a direct KV probe of the tiny mutable
+/// `project/<proj>/site/<site>` pointer ([`keys::site_pointer`]) from a `&dyn KvStore` handle, for the
+/// bind hot path (a `HandlerRuntimeInner` holds `&dyn KvStore` but not a [`DeployStore`]). This is the
+/// cluster-uniform "does this site belong to this project?" check the standalone-function blob-upload
+/// mint binding uses to validate its config-declared [`blob_upload_site`](crate::function::FunctionConfig::blob_upload_site)
+/// against the host-forced project (the KV pointer is the single source of truth, so every node agrees
+/// and a fresh deploy/delete is reflected immediately). Cheaper than [`DeployStore::get_site_config`] —
+/// it reads only the pointer, never the config body. Mirrors [`load_project_tenancy`].
+pub async fn site_pointer_exists(
+    kv: &dyn KvStore,
+    project: ProjectRef<'_>,
+    site: &str,
+) -> Result<bool, DeployError> {
+    Ok(kv.get(&keys::site_pointer(project, site)).await?.is_some())
+}
+
 impl DeployStore {
     /// Build a deploy store over a blob `storage` and a metadata `kv`.
     pub fn new(storage: Arc<dyn Storage>, kv: Arc<dyn KvStore>) -> Self {
@@ -3786,6 +3802,59 @@ mod tests {
     use super::*;
     use crate::ObjectMeta;
     use crate::config::DeployConfig;
+
+    // The cluster-uniform "does this site belong to this project?" probe backing the standalone-
+    // function blob-upload mint binding: a site pointer exists after its config is written, is scoped
+    // to its OWN project (a same-named site in another project does not satisfy the probe), and is
+    // absent for a never-deployed name.
+    #[tokio::test]
+    async fn site_pointer_exists_is_project_scoped_and_reflects_deploys() {
+        use crate::config::{HandlersSiteConfig, SiteConfig};
+        use crate::kv::MemoryKv;
+
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let store = DeployStore::new(Arc::new(NullStorage), kv.clone());
+        let shop = ProjectRef::new("shop");
+        let other = ProjectRef::new("other");
+
+        let cfg = SiteConfig {
+            handlers: Some(HandlersSiteConfig {
+                enabled: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        // Nothing deployed yet ⇒ no pointer anywhere.
+        assert!(
+            !site_pointer_exists(kv.as_ref(), shop, "blog")
+                .await
+                .unwrap()
+        );
+
+        // Deploy `blog` in `shop` only.
+        store.set_site_config(shop, "blog", &cfg).await.unwrap();
+
+        // The pointer exists in `shop` …
+        assert!(
+            site_pointer_exists(kv.as_ref(), shop, "blog")
+                .await
+                .unwrap()
+        );
+        // … but NOT in a different project (project-scoped), and NOT for another site name.
+        assert!(
+            !site_pointer_exists(kv.as_ref(), other, "blog")
+                .await
+                .unwrap(),
+            "a site pointer must be scoped to its own project"
+        );
+        assert!(
+            !site_pointer_exists(kv.as_ref(), shop, "unknown")
+                .await
+                .unwrap(),
+            "a never-deployed site name has no pointer"
+        );
+    }
 
     // v0.4.23 claim-guard regression fix: a context-bearing host must not 409 its OWN cooperative
     // re-apply (ownership is `(project, site)`; the context tag is metadata), while a genuine

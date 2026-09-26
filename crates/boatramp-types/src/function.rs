@@ -136,10 +136,23 @@ pub struct FunctionConfig {
     /// Per-component container allowlist for the guest blob-upload mint capability
     /// (`boatramp:handlers/blob-upload`, S3 external ingress): the blob containers this function may
     /// mint an upload credential for. Least-privilege: **empty ⇒ deny-all**. A container not in the
-    /// list is `access-denied`; the project + site are always host-forced from the resolved invocation
-    /// scope. Only consulted when `imports` contains a `blob-upload:*` right.
+    /// list is `access-denied`; the project is always host-forced from the resolved invocation scope,
+    /// and the site is host-forced from [`blob_upload_site`](Self::blob_upload_site). Only consulted
+    /// when `imports` contains a `blob-upload:*` right.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub upload_containers: Vec<String>,
+    /// The site a **standalone top-level function** mints blob-upload credentials for
+    /// (`boatramp:handlers/blob-upload`, S3 external ingress). A site handler mints for its own
+    /// host-routed site, but a standalone function has no single resolved site — so it names one here,
+    /// in its config (**host-forced, never guest-supplied**: the WIT surface still has no project/site
+    /// parameter). At bind time the host validates the named site actually exists in the function's
+    /// (host-forced) project; the credential then lands objects at
+    /// `hblob/{project-qualified-site}/{container}/{key}` — the exact prefix the guest `compat::blob`
+    /// read path serves, so nothing new is invented. Absent, or naming a site that does not exist in
+    /// the project ⇒ **fail-closed** (`no-resolved-site`, the binding is not attached). A guest can
+    /// never override it. Only consulted when `imports` contains a `blob-upload:*` right.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blob_upload_site: Option<String>,
     /// In-site tenancy decision for this function's `sql`/`orm` access (Dimension 0). Absent ⇒
     /// *undeclared* (refused under the `multi-tenant` posture, treated as `Disabled` — plain
     /// queries — under single-tenant/dev). `Scoped` opts into host-injected row scoping. Parsed via
@@ -230,6 +243,11 @@ impl FunctionConfig {
             tenant_secret_names: h.tenant_secret_names.clone(),
             // Carry the handler's blob-upload container allowlist likewise (grant surface parity).
             upload_containers: h.upload_containers.clone(),
+            // A desugared handler-function runs on the site-handler dispatch path, where the site is
+            // host-ROUTED (not config-declared) — so it has no `blob_upload_site` of its own. The
+            // `blob_upload_site` field is exclusively the STANDALONE top-level function's way to name
+            // the site it mints for.
+            blob_upload_site: None,
             // A desugared handler-function carries its own per-handler tenancy when declared;
             // absent ⇒ inherit the site config (the dispatch path applies the site decision).
             tenancy: h.tenancy.clone(),
