@@ -25,6 +25,7 @@ fn scope(mode: ScopeMode, value: &str) -> Scope {
         session: None,
         mode,
         keys: TableKeys::Uniform,
+        unscoped_writes: std::collections::BTreeSet::new(),
     }
 }
 fn item(e: Expr) -> SelectItem {
@@ -417,7 +418,7 @@ async fn orm_per_table_key_scope_isolates_on_a_real_engine() {
                     key: "account_id".into(),
                 },
             ),
-            ("countries".into(), TableScope::Unscoped),
+            ("countries".into(), TableScope::Unscoped { writable: false }),
         ]),
         ..Default::default()
     };
@@ -429,6 +430,7 @@ async fn orm_per_table_key_scope_isolates_on_a_real_engine() {
         session: None,
         mode: ScopeMode::Own,
         keys: keys.clone(),
+        unscoped_writes: std::collections::BTreeSet::new(),
     };
 
     // Seed: two tenants' orders; a `tenant` identity table whose PK IS the tenant (no tenant_id
@@ -538,6 +540,7 @@ async fn orm_per_table_key_scope_isolates_on_a_real_engine() {
             session: None,
             mode: ScopeMode::Own,
             keys: TableKeys::Uniform,
+            unscoped_writes: std::collections::BTreeSet::new(),
         })
         .unwrap();
         let (bad_sql, bad_params) = bad.compile(Dialect::Sqlite).unwrap();
@@ -893,6 +896,7 @@ async fn orm_tenant_or_session_disjunct_isolates_on_a_real_engine() {
         session: session.map(t),
         mode: ScopeMode::Own,
         keys: keys.clone(),
+        unscoped_writes: std::collections::BTreeSet::new(),
     };
 
     {
@@ -1326,5 +1330,152 @@ async fn orm_durable_signed_context_isolates_on_a_real_engine() {
          verifies it and the recovered tenant scopes a real libsql engine to its own rows only; a \
          stranger-signed envelope fails verification and an unstamped message carries no context, \
          so both fail an own op closed (never cross-tenant)"
+    );
+}
+
+/// **Live (libsql, non-RLS)** proof of the #503 write-global / per-route allowlist model — the
+/// non-RLS companion to the sqlx-live gate. libsql has **no RLS GUC backstop**, so this exemption
+/// (a global write lands UNSTAMPED, a non-global stays scoped) is the WHOLE story on this engine.
+/// Built exactly as the host builds it. Same `#[ignore]` rationale as the siblings.
+#[tokio::test]
+#[ignore = "run via the test-orm-tenancy CI job on the host toolchain (static-musl test binary segfaults in libsql's bundled SQLite)"]
+async fn orm_unscoped_write_isolates_on_a_real_engine() {
+    use boatramp_core::tenancy::{TableScope, TenancySchema};
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let dir = std::env::temp_dir().join(format!("boatramp-orm-uw-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let backends = LibsqlSqlBackends::local(&dir);
+    let db = backends.database("default", "shop", "").await.unwrap();
+    {
+        let mut tx = db.begin().await.unwrap();
+        for ddl in [
+            "CREATE TABLE oidc_provider (id TEXT PRIMARY KEY, tenant_id TEXT, issuer TEXT)",
+            "CREATE TABLE oauth_state (state TEXT PRIMARY KEY, created TEXT)",
+            "CREATE TABLE audit_log (id TEXT PRIMARY KEY, msg TEXT)",
+        ] {
+            tx.execute(ddl, &[]).await.unwrap();
+        }
+        tx.execute(
+            "INSERT INTO oidc_provider (id, tenant_id, issuer) VALUES \
+             ('p_a','acme','https://acme.example'),('p_g','globex','https://globex.example')",
+            &[],
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    let schema = TenancySchema {
+        default_tenant_key: "tenant_id".into(),
+        tables: BTreeMap::from([
+            ("oidc_provider".into(), TableScope::Tenant),
+            (
+                "oauth_state".into(),
+                TableScope::Unscoped { writable: true },
+            ),
+            ("audit_log".into(), TableScope::Unscoped { writable: false }),
+        ]),
+        ..Default::default()
+    };
+    let keys = TableKeys::PerTable(schema.table_key_map());
+    let scoped = |tenant: &str| Scope {
+        column: "tenant_id".into(),
+        value: Some(t(tenant)),
+        session: None,
+        mode: ScopeMode::Own,
+        keys: keys.clone(),
+        unscoped_writes: BTreeSet::from(["audit_log".to_string()]),
+    };
+
+    // (1) own read isolated (write-global grant does NOT widen reads, G2).
+    {
+        let mut s = Select {
+            columns: vec![item(Expr::col("issuer"))],
+            ..Select::from("oidc_provider")
+        };
+        s.force_scope(&scoped("acme")).unwrap();
+        let (sql, params) = s.compile(Dialect::Sqlite).unwrap();
+        let mut tx = db.begin().await.unwrap();
+        let got = run_query(tx.as_mut(), &sql, &params).await;
+        assert_eq!(
+            got,
+            vec!["https://acme.example".to_string()],
+            "own read isolated"
+        );
+        tx.commit().await.unwrap();
+    }
+
+    // (2) write-global oauth_state INSERT lands unstamped (no tenant column) on real libsql.
+    {
+        let mut ins = Insert {
+            table: "oauth_state".into(),
+            rows: vec![RowValues {
+                cells: vec![
+                    Assignment {
+                        column: "state".into(),
+                        value: Expr::val(t("csrf-xyz")),
+                    },
+                    Assignment {
+                        column: "created".into(),
+                        value: Expr::val(t("now")),
+                    },
+                ],
+            }],
+            conflict: None,
+            scope: None,
+            returning: vec![],
+            from_select: None,
+        };
+        ins.force_scope(Some(&scoped("acme")), Some(&scoped("acme")))
+            .unwrap();
+        let (sql, params) = ins.compile(Dialect::Sqlite).unwrap();
+        assert!(
+            !sql.contains("tenant_id"),
+            "write-global INSERT unstamped: {sql}"
+        );
+        let mut tx = db.begin().await.unwrap();
+        tx.execute(&sql, &params).await.unwrap();
+        let got = run_query(tx.as_mut(), "SELECT state FROM oauth_state", &[]).await;
+        assert_eq!(
+            got,
+            vec!["csrf-xyz".to_string()],
+            "the write-global row landed"
+        );
+        tx.commit().await.unwrap();
+    }
+
+    // (3) an UNLISTED plain-unscoped write stays refused (empty allowlist).
+    {
+        let empty = Scope {
+            unscoped_writes: BTreeSet::new(),
+            ..scoped("acme")
+        };
+        let mut ins = Insert {
+            table: "audit_log".into(),
+            rows: vec![RowValues {
+                cells: vec![Assignment {
+                    column: "id".into(),
+                    value: Expr::val(t("a2")),
+                }],
+            }],
+            conflict: None,
+            scope: None,
+            returning: vec![],
+            from_select: None,
+        };
+        assert!(
+            matches!(
+                ins.force_scope(Some(&empty), Some(&empty)),
+                Err(boatramp_core::orm::OrmError::UnscopedWrite(tbl)) if tbl == "audit_log"
+            ),
+            "an unlisted plain-unscoped write stays refused deny-by-default"
+        );
+    }
+
+    println!(
+        "SCOPED UNSCOPED-WRITE CROSS-SURFACE OK [libsql]: read:own isolated (write-global does NOT \
+         widen reads, G2); a write-global oauth_state INSERT lands UNSTAMPED on a real non-RLS \
+         libsql engine; an UNLISTED plain-unscoped write stays refused deny-by-default"
     );
 }

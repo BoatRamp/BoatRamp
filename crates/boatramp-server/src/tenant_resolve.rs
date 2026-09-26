@@ -105,6 +105,11 @@ pub(crate) async fn resolve_host_tenancy(
             sources,
             read,
             write,
+            // #503: this route's per-route write-global allowlist — the plain-`Unscoped` table names
+            // it may write unstamped. Threaded onto the `HostTenancy` (below) so BOTH the ORM
+            // `write_target` and the raw-SQL surface consult it. The runtime resolve-gate is primary;
+            // apply-time validation (422) is defense-in-depth.
+            unscoped_writes,
             // `exceed_site_ceiling` (task #470) is deliberately NOT read here: the token relaxes only
             // the `narrows_within` shape check at bind, never the runtime resolver. `cap()` below
             // stays the SOLE authority over whether an `all` grant actually crosses tenants (key 3).
@@ -129,12 +134,11 @@ pub(crate) async fn resolve_host_tenancy(
             }
             let read = cap(*read, posture.allow_cross_tenant);
             let write = normalize_write(cap(*write, posture.allow_cross_tenant));
-            Ok(Some(HostTenancy::from_facts(
-                column.clone(),
-                facts,
-                read,
-                write,
-            )))
+            Ok(Some(
+                HostTenancy::from_facts(column.clone(), facts, read, write)
+                    // #503: carry the per-route write-global allowlist (empty for most routes).
+                    .with_unscoped_writes(unscoped_writes.iter().cloned()),
+            ))
         }
         // R4/D8: a `target` route is bound by the serving path ([`build_bindings`] in
         // handler_dispatch), which has the routed domain + the project schema to resolve `B` and
@@ -266,6 +270,8 @@ pub(crate) fn resolve_inherited_tenancy(
             column,
             read,
             write,
+            // #503: the callee's OWN per-route write-global allowlist applies on the invoke path too.
+            unscoped_writes,
             ..
         }) => {
             let read = cap(*read, posture.allow_cross_tenant);
@@ -273,12 +279,10 @@ pub(crate) fn resolve_inherited_tenancy(
             // The callee applies its OWN column + posture-capped modes to the caller's inherited
             // **principal** (axis-tagged facts), so an inherited `TargetTenant`/`Session` fact keeps
             // its axis rather than collapsing into an `own` `Tenant` value.
-            Ok(Some(HostTenancy::from_facts(
-                column.clone(),
-                inherited,
-                read,
-                write,
-            )))
+            Ok(Some(
+                HostTenancy::from_facts(column.clone(), inherited, read, write)
+                    .with_unscoped_writes(unscoped_writes.iter().cloned()),
+            ))
         }
         // A `target` route resolves `B` from its own trigger (the routed domain), not from an
         // inherited invoke principal — so a target decision reached over the invoke path is refused
@@ -444,6 +448,7 @@ mod tests {
             read: AccessMode::Own,
             write: AccessMode::Own,
             exceed_site_ceiling: false,
+            unscoped_writes: Vec::new(),
         };
         // A request carrying BOTH a routed domain (⇒ a tenant fact) and a valid session cookie
         // (⇒ a session fact): the resolved principal holds both, axis-tagged.
@@ -517,6 +522,7 @@ mod tests {
             read: AccessMode::Own,
             write: AccessMode::Own,
             exceed_site_ceiling: false,
+            unscoped_writes: Vec::new(),
         };
         // The drained message carried a valid envelope + the fleet anchor ⇒ the producer's stamped
         // tenant resolves as the consumer's own `Tenant` fact.
@@ -581,6 +587,7 @@ mod tests {
             read: AccessMode::OwnOrNull,
             write: AccessMode::All,
             exceed_site_ceiling: false,
+            unscoped_writes: Vec::new(),
         };
         let ht = resolve_inherited_tenancy(
             Some(&decision),
@@ -670,6 +677,7 @@ mod tests {
             read: AccessMode::Own,
             write: AccessMode::Own,
             exceed_site_ceiling: false,
+            unscoped_writes: Vec::new(),
         };
         let inputs = TenantSourceInputs {
             domain_context: Some("acme-store"),
@@ -885,6 +893,7 @@ mod tests {
             read: AccessMode::All,
             write: AccessMode::All,
             exceed_site_ceiling: false,
+            unscoped_writes: Vec::new(),
         };
         let inputs = TenantSourceInputs {
             domain_context: Some("acme"),
@@ -920,6 +929,7 @@ mod tests {
             read: AccessMode::OwnOrNull,
             write: AccessMode::OwnOrNull,
             exceed_site_ceiling: false,
+            unscoped_writes: Vec::new(),
         };
         let inputs = TenantSourceInputs {
             domain_context: Some("acme"),
@@ -950,6 +960,7 @@ mod tests {
             read: AccessMode::Own,
             write: AccessMode::Own,
             exceed_site_ceiling: false,
+            unscoped_writes: Vec::new(),
         };
         // No domain context supplied ⇒ no value; the binding will deny an own op.
         let ht = resolve_host_tenancy(
@@ -1339,6 +1350,7 @@ mod tests {
             session: None,
             mode: ScopeMode::Own,
             keys: TableKeys::PerTable(schema.table_key_map()),
+            unscoped_writes: std::collections::BTreeSet::new(),
         };
         let mut q = name_q();
         q.force_scope(&own_a).unwrap();
@@ -2443,6 +2455,7 @@ mod tests {
             read,
             write,
             exceed_site_ceiling: token,
+            unscoped_writes: Vec::new(),
         };
         let ceiling = scoped(AccessMode::Own, AccessMode::Own, false); // an `own` site ceiling.
         let route_all_token = scoped(AccessMode::All, AccessMode::All, true);

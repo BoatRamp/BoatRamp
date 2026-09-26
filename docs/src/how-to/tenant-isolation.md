@@ -206,6 +206,123 @@ Whichever way a handler queries, the host applies the **same** tenant predicate:
   query. When tenancy is `disabled`/undeclared, a `{scope}` you leave in is harmlessly
   replaced with `1 = 1`, so the same SQL is safe either way.
 
+## Writing a genuinely-global table from a `scoped` route
+
+A `scoped` route reads its own rows and, by default, writes only its own rows. A table
+declared `{ "kind": "unscoped" }` (global reference data like `countries`) is
+**globally readable** but **write-deny-by-default** — a shared-data write is a cross-tenant
+blast, so the host refuses it. The old workaround, `write: "all"`, is the **wrong fix**: it
+**co-widens reads** to every tenant and breaks your isolation.
+
+The right shape (since #503): keep `read: "own"` and open **only the write** of a
+*genuinely tenant-less* table — an OAuth CSRF `oauth_state`, a cross-tenant counter, a
+webhook idempotency-key table — where the row has no tenant dimension at all. **Reads are
+unaffected either way.**
+
+**The one-axis decision rule** — pick by *who writes the table*:
+
+- **Few / sensitive writers → keep the table plain `unscoped` and list it per route**
+  (`unscoped_writes`). **This is the recommended default** (least-privilege): only the
+  routes you name may write it; every other route still gets the read-only-reference
+  contract.
+- **Genuinely-global / many writers → declare the table write-global once**
+  (`{ "kind": "unscoped", "writable": true }`). Any `scoped` route may then write it
+  unstamped — one declaration, no per-route bookkeeping.
+
+**Mental model:** *`writable` / `unscoped_writes` open a table's **write** with **no tenant
+stamp**, **through the typed [`orm`](./handler-bindings.md#the-four-data-bindings) binding
+only** — they never touch reads, and a **target** route can never use them.*
+
+Both mechanisms are OR'd: a write is allowed if the table is write-global **or** the route
+lists it. A write is stamped/refused **freshly per write** — if you later re-declare a
+listed table as a tenant table, the list entry goes inert and the write is tenant-stamped
+as normal (a listed table can never be written unstamped once it stops being global).
+
+> **Global writes go through the `orm` binding, not raw `sql`.** The unstamped global write
+> is an `orm`-only capability. On the **raw `sql`** surface there is *no* write-global
+> exemption: a raw-SQL write to a global table is treated like any other scoped write — it
+> **requires the `{scope}` marker** (an unmarked write is refused) and the injected
+> `tenant = ?` predicate scopes it to your **own** tenant. This is deliberate: a raw-SQL
+> statement is opaque text, and a comment-based redirect (e.g. a MySQL `/*! … */`
+> version-comment) could hide a cross-tenant write from the host's parser. The `orm`
+> binding names the table as a typed value (nothing to hide) and automatically scopes an
+> `INSERT … SELECT` source, so it is the safe — and only — path for an unstamped global
+> write. **If you need to write a global table, use the `orm` binding.**
+
+### Recipe 1 — OAuth `/start` (per-tenant config read + a global CSRF write)
+
+The canonical case: read per-tenant provider config (`read: "own"`) and INSERT a genuinely
+global CSRF `state` row **via the `orm` binding** (the shared callback recovers the tenant
+from `state`, so the table has no tenant column). Keep `oauth_state` plain and list it on the
+route (least-privilege):
+
+```json
+// project tenancy schema
+{ "default_tenant_key": "tenant_id",
+  "tables": {
+    "oidc_provider": { "kind": "tenant" },
+    "oauth_state":   { "kind": "unscoped" } } }
+```
+```ron
+// the /start route: reads its own config, writes the one global table
+tenancy: (mode: "scoped", column: "tenant_id",
+          sources: [(kind: "token", claim: "tid")],
+          read: "own", write: "own",
+          unscoped_writes: ["oauth_state"])
+```
+
+### Recipe 2 — a global counter written by many routes
+
+A cross-tenant metrics counter every route bumps. Many writers ⇒ declare it write-global
+once, no per-route list:
+
+```json
+{ "tables": { "global_counter": { "kind": "unscoped", "writable": true } } }
+```
+
+Any `scoped` route may now update `global_counter` unstamped **through the `orm` binding**;
+a route reading it still reads globally, and its *own* tables stay `own`-scoped. (A raw-SQL
+`UPDATE global_counter …` is still marker-scoped to the route's own tenant — global writes
+are an `orm`-binding capability.)
+
+### Recipe 3 — a webhook consumer with a global idempotency-key table
+
+A bus **consumer** dedupes deliveries on a shared `idempotency_key` table. Consumers carry
+`tenancy` too, so list it on the consumer:
+
+```ron
+consumers: [( topic: "bus:webhooks",
+              component: "webhook.wasm", imports: ["sql"],
+              tenancy: (mode: "scoped", column: "tenant_id",
+                        sources: [(kind: "signed_context")],
+                        read: "own", write: "own",
+                        unscoped_writes: ["idempotency_key"]) )]
+```
+
+### The operator-trust residual
+
+The host **cannot verify** a table declared global is *truly* tenant-less — it takes the
+operator's word. A **misdeclaration** (marking a table that really does carry per-tenant
+rows as `writable: true`, or listing it in `unscoped_writes`) lets **any** granted route
+write across tenants, unstamped. So treat a write-global declaration as a security
+decision: only ever open the write of a table with **no tenant dimension**. `boatramp
+tenancy apply` prints the write-global tables so you can review exactly which shared tables
+are openable. A **target** route (another tenant's public subset) can *never* write a global
+table — both opt-ins are refused on the target axis.
+
+The exemption is scoped to the `orm` binding on purpose. The raw `sql` binding is opaque
+text the host would have to *parse* to know which table a write targets, and a parser can be
+fooled (a MySQL/MariaDB `/*! … */` version-comment the engine executes but a parser skips
+can redirect the write to a different table). Rather than trust that parse for a
+security-critical allow decision, boatramp gives the raw path no write-global exemption at
+all — a raw-SQL write to a global table is marker-scoped to your own tenant or refused — and
+routes all unstamped global writes through the injection-immune `orm` binding.
+
+Apply-time validation is fail-fast: `unscoped_writes` entries are cross-checked against the
+stored schema — an unknown table, or one that resolves to a **tenant** kind, is a **422**
+(the list can never write a tenant table unstamped anyway); a redundant entry (the table is
+already `writable: true`) is a warning.
+
 ## Invoke chains carry the tenant, host-side
 
 When a function invokes a sibling (the [`invoke`](./functions.md) capability), the

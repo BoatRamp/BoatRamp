@@ -1342,6 +1342,50 @@ impl HandlerRuntime {
             )?;
         }
 
+        // #503 apply-time validation (defense-in-depth for the runtime resolve-gate): every table a
+        // route lists in its `tenancy.unscoped_writes` must exist in the stored project tenancy
+        // schema and resolve to a plain `Unscoped` global — an unknown / tenant-kind entry is a hard
+        // refusal (the list can never write a tenant table unstamped anyway; G1). A redundant entry
+        // (the table is already `writable: true`) is a WARNING, not a refusal. Load the schema ONCE.
+        // The runtime resolve-gate remains the primary guard; this fails the deploy fast + speakingly.
+        let project_ref = boatramp_core::project::ProjectRef::new(project);
+        let schema_for_uw =
+            boatramp_core::deploy::load_project_tenancy(inner.kv.as_ref(), project_ref)
+                .await
+                .ok()
+                .flatten();
+        let check_unscoped_writes = |tenancy: Option<&boatramp_core::tenancy::Tenancy>,
+                                     label: &str|
+         -> Result<(), String> {
+            let Some(t) = tenancy else { return Ok(()) };
+            let list = t.unscoped_writes();
+            if list.is_empty() {
+                return Ok(());
+            }
+            for warn in
+                crate::handler_dispatch::admit_unscoped_writes(schema_for_uw.as_ref(), list, label)?
+            {
+                tracing::warn!("{warn}");
+            }
+            Ok(())
+        };
+        for handler in &manifest.config.handlers {
+            check_unscoped_writes(
+                handler.tenancy.as_ref(),
+                &format!(
+                    "handler route {:?} [{}]",
+                    handler.route,
+                    handler.methods.join(",")
+                ),
+            )?;
+        }
+        for consumer in &manifest.config.consumers {
+            check_unscoped_writes(
+                consumer.tenancy.as_ref(),
+                &format!("consumer {:?}", consumer.topic),
+            )?;
+        }
+
         // Sync-timeout footgun: a handler/site timeout above the sync ceiling is
         // silently clamped for connection-bearing (sync HTTP) calls, so a legit
         // long call dies as a mysterious runtime 504. Warn loudly at deploy. The
@@ -4680,6 +4724,7 @@ mod tests {
                     read: AccessMode::Own,
                     write: AccessMode::None,
                     exceed_site_ceiling: false,
+                    unscoped_writes: Vec::new(),
                 }),
                 ..Default::default()
             },
@@ -4858,6 +4903,7 @@ mod tests {
                     read: AccessMode::Own,
                     write: AccessMode::None,
                     exceed_site_ceiling: false,
+                    unscoped_writes: Vec::new(),
                 }),
                 ..Default::default()
             },
@@ -5032,6 +5078,7 @@ mod tests {
                     read: AccessMode::Own,
                     write: AccessMode::None,
                     exceed_site_ceiling: false,
+                    unscoped_writes: Vec::new(),
                 }),
                 ..Default::default()
             },
@@ -5191,6 +5238,7 @@ mod tests {
                     read: AccessMode::Own,
                     write: AccessMode::None,
                     exceed_site_ceiling: false,
+                    unscoped_writes: Vec::new(),
                 }),
                 ..Default::default()
             },
@@ -5346,6 +5394,7 @@ mod tests {
                 read: AccessMode::Own,
                 write: AccessMode::None,
                 exceed_site_ceiling: false,
+                unscoped_writes: Vec::new(),
             }),
             ..Default::default()
         };
@@ -6640,6 +6689,7 @@ mod tests {
             read: AccessMode::Own,
             write: AccessMode::Own,
             exceed_site_ceiling: false,
+            unscoped_writes: Vec::new(),
         };
         let site = HandlersSiteConfig {
             enabled: true,
