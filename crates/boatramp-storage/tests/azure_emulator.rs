@@ -89,3 +89,80 @@ async fn azure_round_trip_and_range() {
     ));
     storage.delete(key).await.unwrap();
 }
+
+/// A 0-byte upload: `put` stages one empty block and commits it. The `commit_block_list` still
+/// carries a body (the block-list XML), so its signed Content-Length must match the wire — this
+/// exercises the Shared Key content-length stamp on the empty-object path.
+#[tokio::test]
+async fn azure_zero_byte_round_trip() {
+    let Some(options) = options() else {
+        eprintln!("skipping Azure test: set BOATRAMP_TEST_AZURE_CONTAINER to run it");
+        return;
+    };
+    let storage = AzureStorage::connect(options).expect("connect");
+    let key = "zz/boatramp-zero-byte-object";
+
+    let body: ByteStream = futures::stream::once(async { Ok(bytes::Bytes::new()) }).boxed();
+    storage.put(key, body, PutMeta::default()).await.unwrap();
+
+    assert_eq!(storage.head(key).await.unwrap().size, Some(0));
+    assert!(
+        collect(storage.get(key).await.unwrap().body)
+            .await
+            .is_empty()
+    );
+
+    storage.delete(key).await.unwrap();
+    assert!(matches!(
+        storage.head(key).await,
+        Err(StorageError::NotFound(_))
+    ));
+    storage.delete(key).await.unwrap();
+}
+
+/// A multi-block upload (> the 8 MiB block size): `put` stages several blocks, then commits the
+/// block list. This is the exact `stage_block` (many) + `commit_block_list` (one) shape that the
+/// content-length stamp fix targets — the commit body is the block-list XML, so a blank signed
+/// Content-Length would 403.
+#[tokio::test]
+async fn azure_multi_block_round_trip() {
+    let Some(options) = options() else {
+        eprintln!("skipping Azure test: set BOATRAMP_TEST_AZURE_CONTAINER to run it");
+        return;
+    };
+    let storage = AzureStorage::connect(options).expect("connect");
+    let key = "zz/boatramp-multi-block-object";
+
+    // 20 MiB → three 8 MiB blocks (last partial). A deterministic, non-uniform pattern so a range
+    // read can be verified precisely.
+    let size = 20 * 1024 * 1024usize;
+    let mut data = vec![0u8; size];
+    for (i, b) in data.iter_mut().enumerate() {
+        *b = (i % 251) as u8;
+    }
+    let payload = bytes::Bytes::from(data.clone());
+    let body: ByteStream = futures::stream::once(async move { Ok(payload) }).boxed();
+    storage.put(key, body, PutMeta::default()).await.unwrap();
+
+    assert_eq!(storage.head(key).await.unwrap().size, Some(size as u64));
+    // Full round-trip is byte-exact.
+    assert_eq!(collect(storage.get(key).await.unwrap().body).await, data);
+    // A bounded range that straddles a block boundary (8 MiB) reads correctly.
+    let start = 8 * 1024 * 1024 - 3;
+    let mid = collect(
+        storage
+            .get_range(key, start as u64, Some(6))
+            .await
+            .unwrap()
+            .body,
+    )
+    .await;
+    assert_eq!(mid, &data[start..start + 6]);
+
+    storage.delete(key).await.unwrap();
+    assert!(matches!(
+        storage.head(key).await,
+        Err(StorageError::NotFound(_))
+    ));
+    storage.delete(key).await.unwrap();
+}

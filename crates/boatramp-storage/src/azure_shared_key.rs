@@ -40,6 +40,9 @@ use sha2::Sha256;
 const X_MS_DATE: HeaderName = HeaderName::from_static("x-ms-date");
 /// The `Authorization` header the signature is written into.
 const AUTHORIZATION: HeaderName = HeaderName::from_static("authorization");
+/// The `Content-Length` header — stamped from the body before signing so the signed value matches
+/// the wire value the transport computes (see the note in [`Policy::send`]).
+const CONTENT_LENGTH: HeaderName = HeaderName::from_static("content-length");
 
 /// Which Storage service the request targets. Blob and Queue produce the identical Shared Key
 /// string-to-sign; this marker documents the call-site intent and reserves a seam for any future
@@ -110,6 +113,30 @@ impl Policy for SharedKeyAuthorizationPolicy {
             let date = to_rfc7231(&OffsetDateTime::now_utc());
             request.insert_header(X_MS_DATE, date);
 
+            // Stamp `content-length` from the request body BEFORE building the string-to-sign, so
+            // the signed value matches what the transport puts on the wire. The 1.x generated SDK
+            // sets `content-length` on some body requests (e.g. `stage_block`) but NOT all: notably
+            // `commit_block_list` omits it, and the transport (`reqwest`) then computes it from the
+            // body at send time — AFTER this policy has signed. Signing a blank Content-Length slot
+            // while the server sees the real length in its string-to-sign yields a signature
+            // mismatch → 403 on every write. The 0.21 `azure_storage::finalize_request` always
+            // stamped Content-Length before its `AuthorizationPolicy` ran; mirror that here.
+            //
+            // Only stamp when absent and non-zero: a zero-length body is filtered to blank by the
+            // string-to-sign (the 2015-02-21+ rule, see `string_to_sign`), so 0.21's `"0"` stamp
+            // and our skip produce the identical signed value — and skipping avoids putting a
+            // spurious `content-length: 0` on a bodyless request. boatramp write bodies are always
+            // `Body::Bytes`, so `.len()` is `Some`.
+            if request
+                .headers()
+                .get_optional_str(&CONTENT_LENGTH)
+                .is_none()
+                && let Some(len) = request.body().len()
+                && len != 0
+            {
+                request.insert_header(CONTENT_LENGTH, len.to_string());
+            }
+
             let string_to_sign = string_to_sign(
                 request.headers(),
                 request.url(),
@@ -129,12 +156,24 @@ impl Policy for SharedKeyAuthorizationPolicy {
 /// HMAC-SHA256 the `string_to_sign` with the **base64-decoded** account key and base64-encode the
 /// signature — exactly Azure's Shared Key MAC.
 fn sign(string_to_sign: &str, key: &Secret) -> Result<String> {
+    // Reject an empty account key fail-closed. An empty string is valid base64 (decodes to zero
+    // bytes) and HMAC-SHA256 accepts a zero-length key, so without this guard an empty key would
+    // silently produce a well-formed but WRONG signature (a 403 with no hint of the real cause)
+    // instead of an honest credential error.
+    if key.secret().is_empty() {
+        return Err(azure_core_v1::Error::with_message(
+            azure_core_v1::error::ErrorKind::Credential,
+            "Azure account key is empty",
+        ));
+    }
     let key_bytes =
         base64::Engine::decode(&base64::engine::general_purpose::STANDARD, key.secret()).map_err(
-            |e| {
+            // NB: do NOT interpolate the `DecodeError` — its `Display` echoes a byte of the
+            // rejected key, which is secret material. Keep the message generic.
+            |_| {
                 azure_core_v1::Error::with_message(
                     azure_core_v1::error::ErrorKind::Credential,
-                    format!("Azure account key is not valid base64: {e}"),
+                    "Azure account key is not valid base64",
                 )
             },
         )?;
@@ -389,6 +428,108 @@ mod tests {
         assert_eq!(sts, expected);
     }
 
+    // ── `commit_block_list` shape: body present, but the 1.x SDK does NOT pre-set content-length ──
+    //
+    // Regression lock for the CRITICAL that broke every Azure blob write: the generated 1.x
+    // `commit_block_list` sends a body without stamping `content-length`, leaving the transport to
+    // compute it AFTER this policy signs. Unless the policy stamps `content-length` from the body
+    // before building the string-to-sign, the signed Content-Length slot is BLANK while the server
+    // sees the real length → signature mismatch → 403. The GET-only docs vectors above never
+    // exercised a body, so they missed this. This test drives the real `Policy::send` (the code
+    // that does the stamping) and asserts the string-to-sign the policy would have signed carries
+    // the body length in the Content-Length slot — reverting the stamp makes this assertion fail.
+    #[tokio::test]
+    async fn commit_block_list_shape_signs_body_length_not_blank() {
+        use std::sync::Mutex;
+
+        // A terminal policy that captures the request AFTER the Shared Key policy ran, so we can
+        // rebuild the exact string-to-sign the policy signed over (post-stamp) and inspect it.
+        #[derive(Debug)]
+        struct Capture {
+            content_length: Mutex<Option<String>>,
+            signed_sts: Mutex<Option<String>>,
+        }
+        #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+        #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+        impl Policy for Capture {
+            async fn send(
+                &self,
+                _ctx: &Context,
+                request: &mut Request,
+                _next: &[Arc<dyn Policy>],
+            ) -> PolicyResult {
+                *self.content_length.lock().unwrap() = request
+                    .headers()
+                    .get_optional_str(&CONTENT_LENGTH)
+                    .map(str::to_string);
+                *self.signed_sts.lock().unwrap() = Some(string_to_sign(
+                    request.headers(),
+                    request.url(),
+                    request.method(),
+                    "acct",
+                ));
+                Err(azure_core_v1::Error::with_message(
+                    azure_core_v1::error::ErrorKind::Other,
+                    "terminal test policy",
+                ))
+            }
+        }
+
+        // Mirror the SDK's `commit_block_list`: a PUT with a real body and NO pre-set
+        // `content-length` header (the exact shape that regressed).
+        let body = b"<BlockList><Latest>YnItYmxvY2s=</Latest></BlockList>";
+        let mut request = Request::new(
+            Url::parse("https://acct.blob.core.windows.net/c/blob.txt?comp=blocklist").unwrap(),
+            Method::Put,
+        );
+        request.set_body(body.to_vec());
+        assert!(
+            request
+                .headers()
+                .get_optional_str(&CONTENT_LENGTH)
+                .is_none(),
+            "precondition: the SDK left content-length unset on commit_block_list"
+        );
+
+        let policy =
+            SharedKeyAuthorizationPolicy::new("acct", AZURITE_KEY, SharedKeyResource::Blob);
+        let capture = Arc::new(Capture {
+            content_length: Mutex::new(None),
+            signed_sts: Mutex::new(None),
+        });
+        let next: Vec<Arc<dyn Policy>> = vec![capture.clone()];
+        let _ = policy.send(&Context::new(), &mut request, &next).await;
+
+        // 1. The policy stamped the header from the body length (52 bytes) before signing.
+        assert_eq!(
+            capture.content_length.lock().unwrap().as_deref(),
+            Some(body.len().to_string().as_str()),
+            "the policy must stamp content-length from the body before signing"
+        );
+
+        // 2. The signed string-to-sign carries that length in its Content-Length slot (4th line) —
+        //    NOT a blank. This is the assertion that fails if the stamp is reverted.
+        let sts = capture.signed_sts.lock().unwrap().clone().unwrap();
+        let content_length_slot = sts.split('\n').nth(3).unwrap();
+        assert_eq!(
+            content_length_slot,
+            body.len().to_string(),
+            "the signed Content-Length slot must equal the body length, not be blank; \
+             string-to-sign was:\n{sts}"
+        );
+        // Full-shape lock for good measure: PUT, Content-Length in slot 4, comp:blocklist resource.
+        assert_eq!(
+            sts,
+            format!(
+                "PUT\n\n\n{}\n\n\n\n\n\n\n\n\n\
+                 x-ms-date:{}\n\
+                 /acct/c/blob.txt\ncomp:blocklist",
+                body.len(),
+                request.headers().get_optional_str(&X_MS_DATE).unwrap(),
+            )
+        );
+    }
+
     /// A zero Content-Length is treated as absent (the 2015-02-21+ rule).
     #[test]
     fn zero_content_length_is_blank() {
@@ -468,6 +609,52 @@ mod tests {
         assert!(
             authz.starts_with("SharedKey acct:"),
             "the Authorization header is a Shared Key credential: {authz}"
+        );
+    }
+
+    /// An empty account key is rejected fail-closed (a `Credential` error), not silently signed
+    /// with a zero-length HMAC key — an empty string is valid base64 and HMAC accepts a zero-length
+    /// key, so without the guard it would produce a well-formed but WRONG signature.
+    #[test]
+    fn empty_key_is_rejected_as_a_credential_error() {
+        let err = sign(
+            "PUT\n\n\n\n\n\n\n\n\n\n\n\n/acct/c/b",
+            &Secret::new(String::new()),
+        )
+        .expect_err("an empty account key must be rejected");
+        assert!(matches!(
+            err.kind(),
+            azure_core_v1::error::ErrorKind::Credential
+        ));
+        // A non-empty key still signs.
+        assert!(
+            sign(
+                "PUT\n\n\n\n\n\n\n\n\n\n\n\n/acct/c/b",
+                &Secret::new(AZURITE_KEY.to_string())
+            )
+            .is_ok()
+        );
+    }
+
+    /// The base64-decode error path must NOT echo the rejected key material (LOW-1): the message is
+    /// generic and contains no bytes of the invalid key.
+    #[test]
+    fn invalid_base64_key_error_does_not_leak_key_bytes() {
+        // `@` is not a base64 alphabet character, so decode fails.
+        let bad_key = "not-valid-base64-@@@";
+        let err = sign(
+            "PUT\n\n\n\n\n\n\n\n\n\n\n\n/acct/c/b",
+            &Secret::new(bad_key.to_string()),
+        )
+        .expect_err("an invalid-base64 key must be rejected");
+        assert!(matches!(
+            err.kind(),
+            azure_core_v1::error::ErrorKind::Credential
+        ));
+        let msg = err.to_string();
+        assert!(
+            !msg.contains('@'),
+            "the error must not echo any byte of the rejected key: {msg}"
         );
     }
 
