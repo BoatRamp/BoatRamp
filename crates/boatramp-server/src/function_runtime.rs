@@ -811,6 +811,30 @@ pub(crate) async fn execute_migration_function(
     (response, elapsed.as_millis() as u64)
 }
 
+/// The single security choke point for a STANDALONE function's `blob-upload` minting (S3 external
+/// ingress): validate that its config-declared `blob_upload_site` belongs to its HOST-FORCED `project`.
+/// A cluster-uniform probe of the project-keyed site pointer (`project/<proj>/site/<site>`) — a site
+/// that exists only under a DIFFERENT project is a different key ⇒ `false`, so a function can never
+/// mint for a site its project does not own. Absent site / KV error ⇒ `false` (fail-closed).
+///
+/// The `S3 INGRESS SCOPED+SIGV4 OK` gate drives this fn directly and mutation-verifies it: the
+/// `skip_standalone_site_check()` seam neuters the project-validation (returns `true`), so the gate
+/// asserts a cross-project site is refused clean and (mutated) would bind — proving the check is
+/// load-bearing, not decorative. In every real build the seam is a constant `false` (it folds away).
+#[cfg(feature = "blob-upload")]
+pub(crate) async fn standalone_mint_site_ok(
+    kv: &dyn boatramp_core::kv::KvStore,
+    project: ProjectRef<'_>,
+    site: &str,
+) -> bool {
+    if crate::s3_ingress::gate_mutation::skip_standalone_site_check() {
+        return true; // MUTATION SEAM (gate only): skip the config-site → project validation.
+    }
+    boatramp_core::deploy::site_pointer_exists(kv, project, site)
+        .await
+        .unwrap_or(false)
+}
+
 /// Build a top-level function's bindings. Unlike a site handler (whose grants are
 /// the site allowlist ∩ its imports), a top-level function is admin-deployed, so
 /// its declared `imports` **are** its grants — served under its own `fn/<name>`
@@ -1120,10 +1144,9 @@ pub(super) async fn build_function_bindings(
         // Validate the config-declared site belongs to the host-forced project (host-side, cluster-
         // uniform KV probe of the site pointer). Absent / cross-project / non-existent ⇒ fail closed
         // (no binding), so `mint` returns `no-resolved-site` — never a credential for a site the
-        // guest's own project does not own.
-        && boatramp_core::deploy::site_pointer_exists(inner.kv.as_ref(), project, declared_site)
-            .await
-            .unwrap_or(false)
+        // guest's own project does not own. Single choke point `standalone_mint_site_ok` (below), which
+        // the `S3 INGRESS SCOPED+SIGV4 OK` gate drives + mutation-verifies.
+        && standalone_mint_site_ok(inner.kv.as_ref(), project, declared_site).await
         // Prefer a wired cloud minter (M4); else the local-face minter (needs the fleet signer). Both
         // are the SAME `BlobUploadMinter` seam — the binding still host-forces project+site + clamps.
         && let Some(minter) = inner

@@ -194,6 +194,7 @@ mod battery {
         invariant_3_secret_separation();
         invariant_4_replay_and_content_address().await;
         invariant_5_guest_over_mint().await;
+        invariant_5b_standalone_fn_site().await;
         invariant_6_route_authz();
         invariant_7_multipart_isolation().await;
         invariant_8_overwrite().await;
@@ -215,7 +216,8 @@ mod battery {
         println!(
             "S3 INGRESS SCOPED+SIGV4 OK: {inv9} + guest read-through held on the local fs S3 face \
              (real SigV4 client → face::handle → guest compat::blob read). Mutation-verified: \
-             BOATRAMP_S3INGRESS_MUTATE_SKIP_{{SCOPE,SIGV4,SHA256,CREATE_ONLY}}=1 each FAIL this gate."
+             BOATRAMP_S3INGRESS_MUTATE_SKIP_{{SCOPE,SIGV4,SHA256,CREATE_ONLY,STANDALONE_SITE}}=1 each \
+             FAIL this gate."
         );
     }
 
@@ -629,6 +631,63 @@ mod battery {
         assert!(
             matches!(out, Err(boatramp_handlers::MintRefused::NoResolvedSite)),
             "an unresolved site fails closed (no-resolved-site) before any signing"
+        );
+    }
+
+    // ---- 5b. Standalone-function mint site-validation -------------------------------------------
+    // A STANDALONE top-level function names its blob-upload site in config (`blob_upload_site`); the
+    // host validates that the site belongs to the function's HOST-FORCED project before binding the
+    // mint capability (`function_runtime::standalone_mint_site_ok`, the real choke point). A site that
+    // exists only in a DIFFERENT project MUST NOT validate — else a function could mint a credential for
+    // another project's site. Neuter the project-validation ⇒ the cross-project site validates ⇒ FAIL.
+    async fn invariant_5b_standalone_fn_site() {
+        use boatramp_core::config::{HandlersSiteConfig, SiteConfig};
+        use boatramp_core::project::ProjectRef;
+
+        let mutated = env_on("BOATRAMP_S3INGRESS_MUTATE_SKIP_STANDALONE_SITE");
+
+        let kv: Arc<dyn boatramp_core::kv::KvStore> = Arc::new(MemoryKv::new());
+        let deploy = DeployStore::new(Arc::new(MapStorage::default()), kv.clone());
+        let shop = ProjectRef::new("shop");
+        let other = ProjectRef::new("other");
+        let cfg = SiteConfig {
+            handlers: Some(HandlersSiteConfig {
+                enabled: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        // `blog` exists in `shop`; `evil` exists ONLY in `other` (the cross-project decoy).
+        deploy.set_site_config(shop, "blog", &cfg).await.unwrap();
+        deploy.set_site_config(other, "evil", &cfg).await.unwrap();
+
+        // A function in `shop` naming a site that exists ONLY in `other` — the cross-project probe.
+        let cross_project =
+            crate::function_runtime::standalone_mint_site_ok(kv.as_ref(), shop, "evil").await;
+        if mutated {
+            assert!(
+                cross_project,
+                "MUTATION SKIP_STANDALONE_SITE: expected the neutered project-validation to accept a \
+                 cross-project site (proving the check is load-bearing)"
+            );
+            panic!(
+                "S3 INGRESS GATE FAILED (invariant 5, standalone-fn site): with the site→project \
+                 validation neutered, a function in project 'shop' minted for site 'evil' that belongs \
+                 to project 'other' — cross-project blob minting is possible."
+            );
+        }
+        // Clean: the cross-project site is refused; the own-project site is accepted; a ghost is refused.
+        assert!(
+            !cross_project,
+            "a standalone function must NOT mint for a site outside its own project"
+        );
+        assert!(
+            crate::function_runtime::standalone_mint_site_ok(kv.as_ref(), shop, "blog").await,
+            "a standalone function CAN mint for a site that exists in its own project"
+        );
+        assert!(
+            !crate::function_runtime::standalone_mint_site_ok(kv.as_ref(), shop, "ghost").await,
+            "a non-existent site fails closed (no binding ⇒ no-resolved-site)"
         );
     }
 
