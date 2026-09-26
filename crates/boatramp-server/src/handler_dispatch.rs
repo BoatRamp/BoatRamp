@@ -2113,6 +2113,7 @@ pub(super) async fn build_bindings(
         secret_allowlist,
         allow_env_secret_refs,
         inner.secret_store.get().map(std::convert::AsRef::as_ref),
+        inner.env_source(),
     )
     .await?;
     bindings = bindings.with_env(env);
@@ -2170,6 +2171,7 @@ pub(super) async fn resolve_env(
     secret_allowlist: &[String],
     allow_env_secret_refs: bool,
     secret_store: Option<&boatramp_core::secret_store::SecretStore>,
+    env_source: &dyn boatramp_core::env::EnvSource,
 ) -> Result<Vec<(String, String)>, String> {
     let scoped = filter_site_secrets(&site_handlers.secrets, secret_allowlist);
     resolve_secret_env(
@@ -2179,6 +2181,7 @@ pub(super) async fn resolve_env(
         &scoped,
         allow_env_secret_refs,
         secret_store,
+        env_source,
     )
     .await
 }
@@ -2213,6 +2216,7 @@ pub(super) async fn resolve_secret_env(
     secrets: &std::collections::BTreeMap<String, String>,
     allow_env_secret_refs: bool,
     secret_store: Option<&boatramp_core::secret_store::SecretStore>,
+    env_source: &dyn boatramp_core::env::EnvSource,
 ) -> Result<Vec<(String, String)>, String> {
     let mut env: Vec<(String, String)> = static_env
         .iter()
@@ -2230,12 +2234,12 @@ pub(super) async fn resolve_secret_env(
                          environment); use a project-scoped secret instead"
                     ));
                 }
-                match std::env::var(host_var) {
-                    Ok(value) => {
+                match env_source.get(host_var) {
+                    Some(value) => {
                         env.retain(|(k, _)| k != guest_name);
                         env.push((guest_name.clone(), value));
                     }
-                    Err(_) => tracing::warn!(
+                    None => tracing::warn!(
                         label,
                         secret = %guest_name,
                         "secret references env var {host_var}, which is not set; not injected"
