@@ -725,12 +725,16 @@ fn confine_own_insert(
     // Up-front refusals read `ins` directly (before the field reborrows below) so the
     // `SetExpr::Select` arm can re-pass `ins` to `confine_insert_select`, and so the RETURNING clause
     // can be reborrowed (`ins.returning`) after the body match.
-    if ins.replace_into {
-        // MEDIUM: `REPLACE INTO …` parses as an INSERT with `replace_into = true`; on a PK/unique
-        // collision it performs an implicit DELETE with NO tenant predicate — it could delete a
-        // victim tenant's row. Refuse (route to the `orm` surface), matching the ON CONFLICT refusal.
+    // MEDIUM: a `REPLACE` insert performs an implicit DELETE on a PK/unique collision with NO tenant
+    // predicate — it could delete a victim tenant's row. Both spellings carry this risk: MySQL
+    // `REPLACE INTO …` (`replace_into = true`) and SQLite `INSERT OR REPLACE …`
+    // (`or = Some(Replace)`). Refuse both (route to the `orm` surface), matching the ON CONFLICT
+    // refusal rationale.
+    if ins.replace_into || matches!(ins.or, Some(sqlparser::ast::SqliteOnConflict::Replace)) {
         return Err(TargetRewriteError::UnsupportedInsert(
-            "REPLACE INTO (implicit delete has no tenant predicate; use the orm surface)".into(),
+            "REPLACE / INSERT OR REPLACE (implicit delete has no tenant predicate; use the orm \
+             surface)"
+                .into(),
         ));
     }
     if ins.on.is_some() {

@@ -617,7 +617,165 @@ async fn run_battery(backend: &dyn SqlBackend, dialect: Dialect, engine: &str) {
         );
     }
 
+    // ---- the 5 Security-review write-path findings (each mutation-killable) ---------------------
+    run_security_findings(backend, dialect, &mut c).await;
+
     c.finish();
+}
+
+/// The 5 P0 Security-review findings the write confiners previously missed, each proven BEHAVIORALLY
+/// (a mutation re-opens the leak / drops the refusal, so the gate fails under `RAWSQL_CONFINE_MUTATION`):
+/// C1 RETURNING-subquery disclosure (UPDATE + DELETE + INSERT), C2 INSERT VALUES-cell-subquery
+/// exfiltration, C3 MySQL `DELETE … ORDER BY/LIMIT`, HIGH INSERT-no-column-list + duplicate-tenant
+/// column, MEDIUM MySQL `REPLACE INTO`. Data-disclosure findings (C1/C2) assert the confined subquery
+/// cannot reveal victim B's `lineB`; the refusal findings (C3 / no-collist / dup-collist / REPLACE)
+/// are asserted through the `confine_write` mutation seam — the real fix REFUSES (Err), a mutation
+/// returns Ok (no refusal) so the `refused` check then fails the gate.
+async fn run_security_findings(backend: &dyn SqlBackend, dialect: Dialect, c: &mut Checks) {
+    // MySQL has no RETURNING; C1's RETURNING cases run on libsql/SQLite + Postgres only.
+    let has_returning = dialect != Dialect::Mysql;
+
+    // C1 — RETURNING subquery must not disclose victim B. A `RETURNING (SELECT detail FROM
+    // order_lines WHERE detail = 'lineB')` reads B's row: under the fix it is read-confined to A
+    // (empty -> no `lineB` row disclosed); a mutation leaves it unconfined -> `lineB` is disclosed.
+    if has_returning {
+        for (label, stmt) in [
+            (
+                "UPDATE",
+                "UPDATE orders SET status = 'x' WHERE id = 'oA' \
+                 RETURNING (SELECT detail FROM order_lines WHERE detail = 'lineB') AS leak",
+            ),
+            (
+                "DELETE",
+                "DELETE FROM orders WHERE id = 'oA' \
+                 RETURNING (SELECT detail FROM order_lines WHERE detail = 'lineB') AS leak",
+            ),
+            (
+                "INSERT",
+                "INSERT INTO orders (id, status) VALUES ('oC1', 'x') \
+                 RETURNING (SELECT detail FROM order_lines WHERE detail = 'lineB') AS leak",
+            ),
+        ] {
+            seed(backend).await;
+            if let Ok(sql) = confine_write(stmt, "A", ScopeMode::Own) {
+                let mut tx = backend.begin().await.unwrap();
+                let disclosed = rows(tx.as_mut(), &sql, &[]).await;
+                tx.commit().await.unwrap();
+                c.eq(
+                    9,
+                    disclosed.contains(&"lineB".to_string()),
+                    false,
+                    &format!("C1 {label} RETURNING subquery must NOT disclose victim B's lineB"),
+                );
+            }
+            // Under the real fix all three run and disclose nothing; under a mutation they leak
+            // `lineB` above. (An engine that rejects the mutated SQL simply records no leak — the
+            // OTHER findings below still kill every mutation.)
+        }
+    }
+
+    // C2 — INSERT VALUES cell subquery must not exfiltrate B into A's own row. The cell
+    // `(SELECT detail FROM order_lines WHERE detail = 'lineB')` reads B; the fix confines it to A
+    // (empty -> NULL status), a mutation stores `lineB` in A's new row.
+    seed(backend).await;
+    {
+        let stmt = "INSERT INTO orders (id, status) \
+             VALUES ('oC2', (SELECT detail FROM order_lines WHERE detail = 'lineB'))";
+        if let Ok(sql) = confine_write(stmt, "A", ScopeMode::Own) {
+            let mut tx = backend.begin().await.unwrap();
+            tx.execute(&sql, &[]).await.unwrap();
+            tx.commit().await.unwrap();
+            c.eq(
+                10,
+                order_status(backend, "oC2").await,
+                None,
+                "C2 VALUES-cell subquery must NOT exfiltrate B's lineB into A's row (confined -> NULL)",
+            );
+        }
+    }
+
+    // C3 — a MySQL `DELETE … ORDER BY … LIMIT` targeting victim B must be REFUSED (the fix), so B's
+    // row survives; a mutation passes the raw DELETE through and destroys B's oB.
+    if dialect == Dialect::Mysql {
+        seed(backend).await;
+        let stmt = "DELETE FROM orders WHERE id = 'oB' ORDER BY status LIMIT 1";
+        c.refused(
+            11,
+            &confine_write(stmt, "A", ScopeMode::Own),
+            "C3 DELETE with ORDER BY/LIMIT must be refused",
+        );
+        if let Ok(sql) = confine_write(stmt, "A", ScopeMode::Own) {
+            let mut tx = backend.begin().await.unwrap();
+            let _ = tx.execute(&sql, &[]).await;
+            tx.commit().await.unwrap();
+        }
+        c.eq(
+            11,
+            order_status(backend, "oB").await,
+            Some("openB".to_string()),
+            "C3 an ORDER BY/LIMIT DELETE must NOT reach victim B",
+        );
+    }
+
+    // HIGH — an INSERT with no explicit column list is REFUSED (the host can't locate the tenant
+    // column positionally to override the guest's forged 'B'); a mutation passes it through and
+    // creates a forged tenant-B row.
+    seed(backend).await;
+    {
+        let stmt = "INSERT INTO orders VALUES ('oHi', 'B', 'newX')";
+        c.refused(
+            12,
+            &confine_write(stmt, "A", ScopeMode::Own),
+            "HIGH INSERT without a column list must be refused",
+        );
+        if let Ok(sql) = confine_write(stmt, "A", ScopeMode::Own) {
+            let mut tx = backend.begin().await.unwrap();
+            let _ = tx.execute(&sql, &[]).await;
+            tx.commit().await.unwrap();
+        }
+        c.eq(
+            12,
+            order_tenant(backend, "oHi").await,
+            None,
+            "HIGH a positional INSERT must NOT create a forged tenant-B row",
+        );
+        // A duplicate-tenant column list is refused too (the single-position override would leave a
+        // second guest-controlled tenant cell). Asserted through the mutation seam.
+        c.refused(
+            12,
+            &confine_write(
+                "INSERT INTO orders (tenant_id, tenant_id, status) VALUES ('B', 'B', 'x')",
+                "A",
+                ScopeMode::Own,
+            ),
+            "HIGH duplicate tenant column in the INSERT list must be refused",
+        );
+    }
+
+    // MEDIUM — MySQL `REPLACE INTO` is REFUSED (its implicit collision DELETE has no tenant
+    // predicate and could destroy victim B's row); a mutation passes it through and REPLACEs B's oB.
+    {
+        let stmt = "REPLACE INTO orders (id, status) VALUES ('oB', 'x')";
+        c.refused(
+            13,
+            &confine_write(stmt, "A", ScopeMode::Own),
+            "MEDIUM REPLACE INTO must be refused",
+        );
+        if dialect == Dialect::Mysql {
+            seed(backend).await;
+            if let Ok(sql) = confine_write(stmt, "A", ScopeMode::Own) {
+                let mut tx = backend.begin().await.unwrap();
+                let _ = tx.execute(&sql, &[]).await;
+                tx.commit().await.unwrap();
+            }
+            c.eq(
+                13,
+                order_status(backend, "oB").await,
+                Some("openB".to_string()),
+                "MEDIUM REPLACE INTO must NOT destroy/overwrite victim B's row",
+            );
+        }
+    }
 }
 
 // ---- libsql / SQLite (unconditional, but `#[ignore]`d — see the ORM battery note) --------------
