@@ -1101,13 +1101,6 @@ fn spawn_http_redirect(
     });
 }
 
-/// Build + spawn the dedicated local **S3-ingress** listener (PLAN-blob-s3-ingress, Architect HIGH-4).
-/// Runs the fail-closed multi-node secret guard (an error here refuses to serve, per the credential
-/// model), builds the face state from the fleet trust anchor + storage/KV + a fresh `UploadGuard`, and
-/// spawns the listener on its OWN port — a separate SigV4 auth surface that never reaches the
-/// control-plane router or `serve_by_host`. Requires auth to be enabled (the face verifies fleet-signed
-/// session tokens against the trust anchor); with auth disabled the face is refused.
-#[allow(clippy::too_many_arguments)]
 /// Build + install the M4 **cloud** blob-upload minter from the node's blob backend + the
 /// `[serve.s3_ingress_cloud]` knobs (used INSTEAD of the local S3 face for a cloud-backed container).
 /// Also registers the operator mint ceilings so the guest binding + operator route are wired even when
