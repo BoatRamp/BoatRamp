@@ -40,6 +40,45 @@ pub enum Error {
     /// The manifest failed to parse as RON.
     #[error("invalid manifest syntax: {0}")]
     Ron(#[from] ron::error::SpannedError),
+    /// A version-less manifest failed to parse strictly against the current typed
+    /// schema. Wrapped to name v0.6.0 + the migration path so the failure reads as
+    /// the upgrade UX it is (see [`ApplyManifest::wrap_strict_parse_error`]).
+    #[error(
+        "this manifest does not match the current (v0.6.0) schema: {source}\n\n\
+         The most likely cause is a pre-v0.6.0 `compute[].spec` written as a raw JSON \
+         blob — v0.6.0 makes `compute[].spec` the typed `ComputeSpec` (breaking).\n\
+         If this is a pre-v0.6.0 manifest, add `version: 1` at the top and run \
+         `boatramp config migrate <file>` to upgrade it in place."
+    )]
+    StrictParse {
+        #[source]
+        source: ron::error::SpannedError,
+    },
+    /// A manifest declared `version: N` newer than this build understands.
+    #[error(
+        "manifest declares version {declared}, but this build only understands up to \
+         version {current} (v0.6.0). Upgrade boatramp, or lower the declared version."
+    )]
+    VersionTooNew { declared: u32, current: u32 },
+    /// A migration step failed to transform an older manifest into the current schema.
+    #[error("migrating manifest from version {from}: {reason}")]
+    Migration { from: u32, reason: String },
+    /// A site's `[handlers.graphql]` set BOTH `safelisted_ops` and
+    /// `safelisted_ops_path` — they are mutually exclusive (pick one source).
+    #[error(
+        "site {site}: `[handlers.graphql]` sets both `safelisted_ops` (inline) and \
+         `safelisted_ops_path` (file) — they are mutually exclusive; use one source of \
+         safelisted operations"
+    )]
+    SafelistConflict { site: String },
+    /// Reading a site's `safelisted_ops_path` file failed (client-side).
+    #[error("site {site}: reading safelisted_ops_path {path}: {source}")]
+    SafelistFile {
+        site: String,
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
     /// A site's `routing` failed its compile-check (a bad route/cron pattern).
     #[error("site {site}: routing: {source}")]
     Routing {
@@ -72,7 +111,7 @@ pub enum Error {
 }
 
 /// `apply` module result; `Err` is [`Error`].
-type Result<T> = std::result::Result<T, Error>;
+pub type Result<T> = std::result::Result<T, Error>;
 
 /// The control-plane operations the `apply` reconcile core performs — a seam over
 /// the concrete HTTP [`client::ControlPlane`] so the reconcile logic (create-or-
@@ -121,6 +160,9 @@ trait ControlPlane {
         &self,
         schema: &boatramp_core::tenancy::TenancySchema,
     ) -> CpResult<()>;
+    /// Register one trusted operation in the project's GraphQL safelist
+    /// (register-only; the server validates + stores it, idempotently).
+    async fn register_graphql_safelist(&self, query: &str) -> CpResult<()>;
 }
 
 /// A control-plane call outcome classified for the reconcile core: `NotFound`
@@ -219,54 +261,86 @@ impl ControlPlane for client::ControlPlane {
             .await
             .map_err(CpError::Client)
     }
+    async fn register_graphql_safelist(&self, query: &str) -> CpResult<()> {
+        self.register_graphql_safelist(query)
+            .await
+            .map_err(CpError::Client)
+    }
 }
+
+/// The manifest schema version this build writes and parses **as current**. A
+/// manifest that OMITS `version:` is parsed strictly against the current typed
+/// schema (see [`ApplyManifest::parse`]); declaring `version: N` with `N` **older**
+/// than this opts that document into the migration chain. Bumped whenever the
+/// manifest schema changes in a way an older document would fail to parse.
+///
+/// - **v1** — the pre-v0.6.0 schema: `compute[].spec` was an untyped
+///   `serde_json::Value` (a `PutComputeRequest`-shaped JSON blob).
+/// - **v2 (current)** — v0.6.0: `compute[].spec` is the typed
+///   [`boatramp_core::compute::ComputeSpec`], with sibling `replicas`/`placement`.
+pub const CURRENT_MANIFEST_VERSION: u32 = 2;
 
 /// A whole-project desired state: the sites, functions, and compute workloads to
 /// reconcile under one project.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, serde::Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ApplyManifest {
+    /// The manifest schema version this document was written against. **Absent ⇒
+    /// current** (the document is parsed strictly against the latest typed schema;
+    /// an old-shaped manifest that omits `version` fails with a message telling you
+    /// to add `version: <the schema you wrote>` and run `boatramp config migrate`).
+    /// A present value **older** than [`CURRENT_MANIFEST_VERSION`] opts the document
+    /// into the registered migration chain (vN→…→current). Declare the schema you
+    /// wrote against to get migration support; omit it and your manifest is parsed
+    /// as current. An upgraded/migrated manifest OMITS this field (current = absent),
+    /// so it is skipped when serialized (`config migrate` output carries no `version:`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<u32>,
     /// Target project. `None` ⇒ resolved from config / `--project` /
     /// `BOATRAMP_PROJECT` / the `default` project.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub project: Option<String>,
     /// Sites to publish (each an atomic content-addressed deployment).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub sites: Vec<ApplySite>,
     /// Top-level functions to deploy (create-or-replace).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub functions: Vec<ApplyFunction>,
     /// Compute workloads to create-or-replace.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub compute: Vec<ApplyCompute>,
     /// The project's tenancy schema — the per-table tenant-key map the scope injector
     /// consults (deny-by-default on undeclared tables). Reconciled **before** the sites
     /// and functions, so a handler deployed in the same apply already runs under the
     /// declared isolation boundary. `None` ⇒ leave the stored schema untouched (an
     /// omitted key never clears an existing schema — use `boatramp tenancy clear`).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tenancy: Option<boatramp_core::tenancy::TenancySchema>,
 }
 
 /// One site in the manifest: a slug plus its content dir and folded-in config.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ApplySite {
     /// Site slug within the project.
     pub name: String,
     /// Content directory to publish. Default: `build.output`, then `.`.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
     /// Optional per-site build step, run before publishing.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build: Option<BuildConfig>,
     /// Deploy-scoped routing, folded into the deployment manifest (atomic with the
     /// content, rolls back with it).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub routing: Option<DeployConfig>,
     /// Site-scoped mutable config (domains/access/…), PUT after the deploy activates.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config: Option<SiteConfig>,
 }
 
 /// One top-level function in the manifest.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ApplyFunction {
     /// Function name.
@@ -274,36 +348,36 @@ pub struct ApplyFunction {
     /// Path to the component `.wasm` (uploaded as a content-addressed blob).
     pub component: String,
     /// Execution substrate: `wasm` (default), `microvm`, or `container`.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime: Option<String>,
     /// Enable a signed webhook: the host env var holding the HMAC-SHA256 secret
     /// (never the secret itself).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub webhook_secret_env: Option<String>,
     /// Make the webhook an ingress: a verified request publishes its body onto the
     /// project bus at this topic (`bus:<topic>` for consumers) and returns 202, with
     /// no component run. Requires `webhook_secret_env`.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub webhook_publish: Option<String>,
     /// Requested host capabilities (`sql`, `wasi:keyvalue`, `invoke`, …), gated by
     /// the function import policy — parity with a site handler's `imports`.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub imports: Vec<String>,
     /// Static, non-secret environment variables passed to the function.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub env: std::collections::BTreeMap<String, String>,
     /// Secret env-var references (`ENV_VAR` → `HOST_ENV`), resolved server-side
     /// from the serve env at instantiation — the value is a reference, never
     /// stored in the manifest or the control-plane store (mirrors a site
     /// handler's `[handlers].secrets`), so the manifest stays committable.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub secrets: std::collections::BTreeMap<String, String>,
     /// Function-to-function invoke allowlist (deny-by-default; `*` wildcards). Only
     /// consulted when `imports` contains `invoke`.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub invoke_targets: Vec<String>,
     /// Optional resource limits (memory / timeout / fuel).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limits: Option<HandlerLimits>,
     /// In-site tenancy decision (Dimension 0) for this function's `sql`/`orm` — maps straight to
     /// the internal `FunctionConfig.tenancy`. Absent ⇒ *undeclared* (refused under `multi-tenant`,
@@ -312,31 +386,109 @@ pub struct ApplyFunction {
     /// async worker's `(mode: "scoped", sources: [(kind: "signed_context")], read: "own", write:
     /// "own")`. Parsed via the [`boatramp_core::tenancy::de_opt_tenancy`] bridge (RON can't parse
     /// the internally-tagged enum directly — see that fn).
-    #[serde(default, deserialize_with = "boatramp_core::tenancy::de_opt_tenancy")]
+    #[serde(
+        default,
+        deserialize_with = "boatramp_core::tenancy::de_opt_tenancy",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub tenancy: Option<boatramp_core::tenancy::Tenancy>,
     /// JWKS/issuer config verifying the app bearer when this function's tenancy names a `token`
     /// source (the function analogue of a site's `[handlers.graphql.data].claims_from_token`).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_claims: Option<boatramp_core::config::HandlerGraphqlTokenClaims>,
 }
 
 /// One compute workload in the manifest.
-#[derive(Debug, Deserialize)]
+///
+/// The workload body is **typed** (v0.6.0, breaking): its `spec` / `replicas` /
+/// `placement` fields mirror [`boatramp_core::compute::PutComputeRequest`]
+/// EXPLICITLY (not `#[serde(flatten)]`, which would defeat `deny_unknown_fields`
+/// on the manifest path). Deserializing the manifest now parses the compute spec
+/// against the real [`boatramp_core::compute::ComputeSpec`] schema, so a malformed
+/// or pre-v0.6.0 raw-JSON spec fails fast at parse time — an additive client gate
+/// on top of the server's own semantic validation.
+#[derive(Debug, Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ApplyCompute {
     /// Workload name.
     pub name: String,
-    /// The `PutComputeRequest`-shaped body, PUT straight to the server (which
-    /// validates it).
-    pub spec: serde_json::Value,
+    /// The immutable workload spec (rootfs/kernel source + sizing) — the typed
+    /// [`boatramp_core::compute::ComputeSpec`].
+    pub spec: boatramp_core::compute::ComputeSpec,
+    /// Desired replica count (default 1).
+    #[serde(default = "boatramp_core::compute::default_replicas")]
+    pub replicas: u32,
+    /// Placement constraints (regions / node labels).
+    #[serde(default, skip_serializing_if = "placement_is_default")]
+    pub placement: boatramp_core::compute::PlacementConstraints,
+}
+
+/// Whether a workload's placement is the default (no regions, no labels), so it is
+/// omitted from a serialized (migrated) manifest for clean output.
+fn placement_is_default(p: &boatramp_core::compute::PlacementConstraints) -> bool {
+    p.regions.is_empty() && p.labels.is_empty()
+}
+
+impl ApplyCompute {
+    /// The typed [`boatramp_core::compute::PutComputeRequest`] this workload
+    /// declares — the exact body the server's `put_compute` handler deserializes,
+    /// so the manifest and the wire share one schema.
+    fn to_request(&self) -> boatramp_core::compute::PutComputeRequest {
+        boatramp_core::compute::PutComputeRequest {
+            spec: self.spec.clone(),
+            replicas: self.replicas,
+            placement: self.placement.clone(),
+        }
+    }
 }
 
 impl ApplyManifest {
-    /// Parse a manifest document (RON). Each site's `routing` is compile-checked
-    /// (route patterns, cron schedules) so a bad manifest fails fast.
+    /// Parse a manifest document (RON) through the **loose-parse → migrate → typed**
+    /// pipeline (v0.6.0).
+    ///
+    /// - **No `version:` (or `version:` == [`CURRENT_MANIFEST_VERSION`])** ⇒ parse
+    ///   strictly against the current typed schema. A version-less document that does
+    ///   NOT match the current schema (e.g. a pre-v0.6.0 raw-JSON `compute.spec`)
+    ///   fails with the wrapped [`Error::StrictParse`] upgrade error — the migration UX.
+    /// - **`version: N` with `N` < current** ⇒ run the registered migration chain
+    ///   (vN→vN+1→…→current) via [`crate::apply_migrate`], then the strict typed parse.
+    /// - **`version: N` > current** ⇒ [`Error::VersionTooNew`].
+    ///
+    /// Each site's `routing` is compile-checked (route patterns, cron schedules) so a
+    /// bad manifest fails fast.
     pub fn parse(text: &str) -> Result<Self> {
-        let manifest: Self = crate::config::ron_options().from_str(text)?;
-        for site in &manifest.sites {
+        let declared = crate::apply_migrate::peek_version(text)?;
+        let manifest = match declared {
+            None => Self::parse_strict(text)?,
+            Some(v) if v == CURRENT_MANIFEST_VERSION => {
+                // An explicit current-version declaration: parse strictly, same as
+                // the version-less path. The upgraded output drops `version:`.
+                Self::parse_strict(text)?
+            }
+            Some(v) if v > CURRENT_MANIFEST_VERSION => {
+                return Err(Error::VersionTooNew {
+                    declared: v,
+                    current: CURRENT_MANIFEST_VERSION,
+                });
+            }
+            Some(v) => crate::apply_migrate::migrate_to_current(text, v)?,
+        };
+        manifest.compile_check_sites()?;
+        Ok(manifest)
+    }
+
+    /// Parse strictly against the current typed schema, wrapping a parse failure in
+    /// the v0.6.0 upgrade error (which names the migration path). Used for the
+    /// version-less / current-version path AND as the final step after a migration.
+    fn parse_strict(text: &str) -> Result<Self> {
+        crate::config::ron_options()
+            .from_str(text)
+            .map_err(|source| Error::StrictParse { source })
+    }
+
+    /// Compile-check every site's `routing` (route/cron patterns).
+    fn compile_check_sites(&self) -> Result<()> {
+        for site in &self.sites {
             if let Some(routing) = &site.routing {
                 routing.compile_check().map_err(|source| Error::Routing {
                     site: site.name.clone(),
@@ -344,7 +496,7 @@ impl ApplyManifest {
                 })?;
             }
         }
-        Ok(manifest)
+        Ok(())
     }
 
     /// Load a manifest from `path` (RON). Unlike `project.cfg`, a **missing** file
@@ -413,8 +565,17 @@ pub async fn run(args: ApplyArgs, config: &ProjectConfig) -> Result<()> {
         reconcile_tenancy(&cp, schema, args.dry_run).await?;
     }
 
+    // `safelisted_ops_path` is resolved relative to the manifest's own directory
+    // (client-side); the manifest file itself lives at `args.file`.
+    let manifest_dir = args
+        .file
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+
     for site in &manifest.sites {
-        apply_site(&cp, site, config, args.build, args.dry_run).await?;
+        apply_site(&cp, site, config, &manifest_dir, args.build, args.dry_run).await?;
     }
     for function in &manifest.functions {
         apply_function(&cp, function, args.dry_run).await?;
@@ -485,6 +646,7 @@ async fn apply_site<C: ControlPlane>(
     cp: &C,
     site: &ApplySite,
     config: &ProjectConfig,
+    manifest_dir: &Path,
     build_flag: bool,
     dry_run: bool,
 ) -> Result<()> {
@@ -537,6 +699,9 @@ async fn apply_site<C: ControlPlane>(
                 }
             }
         }
+        // Surface (and validate) the declared safelisted ops at plan time, so a
+        // misconfig (both sources set, or an unreadable file) fails the dry-run early.
+        apply_safelists(cp, site, manifest_dir, true).await?;
         return Ok(());
     }
 
@@ -587,7 +752,101 @@ async fn apply_site<C: ControlPlane>(
     cp.activate(&site.name, &created.id).await?;
     println!("  site `{}`: activated {}", site.name, created.id);
 
+    // Register the site's declaratively-safelisted GraphQL operations (register-only).
+    apply_safelists(cp, site, manifest_dir, false).await?;
+
     Ok(())
+}
+
+/// Register a site's declaratively-safelisted GraphQL operations (v0.6.0) — the
+/// `[handlers.graphql].safelisted_ops` (inline) OR `safelisted_ops_path` (a file,
+/// resolved client-side relative to `manifest_dir`). Every collected operation is
+/// registered through the existing control-plane `POST .../graphql/safelist` endpoint,
+/// which runs the server-side `guard_query`→`register` validation.
+///
+/// **REGISTER-ONLY (union).** This never deletes or prunes: re-applying only ever ADDS
+/// operations to the allowlist. Pruning a deny-by-default allowlist on apply would be a
+/// self-inflicted DoS (and a silent boundary narrowing), so removal stays the explicit
+/// `boatramp graphql safelist rm`. The two sources are mutually exclusive (a config
+/// error if both are set). On `dry_run` the ops are collected + validated (so a misconfig
+/// fails early) but nothing is registered.
+async fn apply_safelists<C: ControlPlane>(
+    cp: &C,
+    site: &ApplySite,
+    manifest_dir: &Path,
+    dry_run: bool,
+) -> Result<()> {
+    let Some(gql) = site
+        .config
+        .as_ref()
+        .and_then(|c| c.handlers.as_ref())
+        .and_then(|h| h.graphql.as_ref())
+    else {
+        return Ok(());
+    };
+
+    // Mutual exclusion: pick one source of safelisted operations.
+    if !gql.safelisted_ops.is_empty() && gql.safelisted_ops_path.is_some() {
+        return Err(Error::SafelistConflict {
+            site: site.name.clone(),
+        });
+    }
+
+    // Collect the operation texts from whichever source is declared.
+    let ops: Vec<String> = if let Some(rel) = &gql.safelisted_ops_path {
+        // Resolve the path client-side relative to the manifest dir; only op TEXT
+        // (never the path) ever leaves this host.
+        let path = manifest_dir.join(rel);
+        let text = std::fs::read_to_string(&path).map_err(|source| Error::SafelistFile {
+            site: site.name.clone(),
+            path: path.display().to_string(),
+            source,
+        })?;
+        parse_ops_file(&text)
+    } else {
+        gql.safelisted_ops.clone()
+    };
+
+    if ops.is_empty() {
+        return Ok(());
+    }
+
+    if dry_run {
+        println!(
+            "  site `{}`: would register {} safelisted operation(s) (register-only)",
+            site.name,
+            ops.len(),
+        );
+        return Ok(());
+    }
+
+    for op in &ops {
+        cp.register_graphql_safelist(op).await?;
+    }
+    println!(
+        "  site `{}`: registered {} safelisted operation(s) (register-only)",
+        site.name,
+        ops.len(),
+    );
+    Ok(())
+}
+
+/// Parse a `safelisted_ops_path` file into individual operation texts. The file is
+/// either a **JSON array of operation strings** (`["query A {…}", "mutation B {…}"]`)
+/// — the explicit multi-operation form — or, if it is not such an array, the WHOLE
+/// file content is taken as a **single** operation (matching the existing
+/// `boatramp graphql safelist add --file` semantics). Empty/whitespace-only entries
+/// are dropped.
+fn parse_ops_file(text: &str) -> Vec<String> {
+    if let Ok(arr) = serde_json::from_str::<Vec<String>>(text) {
+        return arr.into_iter().filter(|op| !op.trim().is_empty()).collect();
+    }
+    let single = text.trim();
+    if single.is_empty() {
+        Vec::new()
+    } else {
+        vec![single.to_string()]
+    }
 }
 
 /// Reconcile one top-level function: stage its component blob, then PUT the
@@ -683,7 +942,10 @@ async fn apply_compute<C: ControlPlane>(
         println!("  compute `{}`: would apply spec", compute.name);
         return Ok(());
     }
-    cp.put_compute(&compute.name, &compute.spec).await?;
+    // The typed request round-trips to the exact `PutComputeRequest` JSON the server
+    // deserializes — the manifest and the wire share one schema.
+    let body = serde_json::to_value(compute.to_request())?;
+    cp.put_compute(&compute.name, &body).await?;
     println!("  compute `{}`: applied", compute.name);
     Ok(())
 }
@@ -815,6 +1077,12 @@ mod tests {
             self.rec(format!("put_project_tenancy {}", schema.tables.len()));
             Ok(())
         }
+        async fn register_graphql_safelist(&self, query: &str) -> CpResult<()> {
+            // Record the op text so a test can assert POST-per-op (and that no DELETE
+            // is ever issued — the mock has no delete method at all).
+            self.rec(format!("register_graphql_safelist {query}"));
+            Ok(())
+        }
     }
 
     fn a_function() -> ApplyFunction {
@@ -905,12 +1173,39 @@ mod tests {
         assert!(mock.calls().is_empty(), "dry-run ⇒ no compose");
     }
 
+    /// A minimal typed image-workload spec for the compute-apply tests.
+    fn an_image_spec() -> boatramp_core::compute::ComputeSpec {
+        boatramp_core::compute::ComputeSpec {
+            version: boatramp_core::SCHEMA_VERSION,
+            root: boatramp_core::compute::RootSource::Image("nginx:latest".into()),
+            kernel: String::new(),
+            kernel_cmdline: None,
+            vcpus: 1,
+            mem_mib: 256,
+            entrypoint: vec![],
+            env: Default::default(),
+            port: 8080,
+            restart: Default::default(),
+            startup_grace_secs: boatramp_core::compute::default_startup_grace_secs(),
+            scale_to_zero: false,
+            volumes: vec![],
+            writable_root: false,
+            cap_add: vec![],
+            user: None,
+            isolation: Default::default(),
+            prefer_backend: None,
+            bindings: vec![],
+        }
+    }
+
     #[tokio::test]
     async fn apply_compute_puts_the_spec() {
         let mock = MockCp::default();
         let compute = ApplyCompute {
             name: "api".into(),
-            spec: json!({ "replicas": 2 }),
+            spec: an_image_spec(),
+            replicas: 2,
+            placement: Default::default(),
         };
         apply_compute(&mock, &compute, false).await.unwrap();
         assert_eq!(mock.calls(), ["put_compute api"]);
@@ -921,7 +1216,9 @@ mod tests {
         let mock = MockCp::default();
         let compute = ApplyCompute {
             name: "api".into(),
-            spec: json!({}),
+            spec: an_image_spec(),
+            replicas: boatramp_core::compute::default_replicas(),
+            placement: Default::default(),
         };
         apply_compute(&mock, &compute, true).await.unwrap();
         assert!(mock.calls().is_empty());
@@ -1114,7 +1411,15 @@ mod tests {
             routing: None,
             config: Some(SiteConfig::default()),
         };
-        let result = apply_site(&mock, &site, &ProjectConfig::default(), false, false).await;
+        let result = apply_site(
+            &mock,
+            &site,
+            &ProjectConfig::default(),
+            Path::new("."),
+            false,
+            false,
+        )
+        .await;
         let _ = std::fs::remove_dir_all(&dir);
         result.unwrap();
 
@@ -1156,7 +1461,13 @@ mod tests {
                     ),
                 ],
                 compute: [
-                    ( name: "api", spec: { "replicas": 2 } ),
+                    (
+                        name: "api",
+                        // v0.6.0: the compute spec is the typed `ComputeSpec`
+                        // (`root` is the snake_case newtype variant `image(…)`).
+                        spec: ( root: image("nginx:latest"), vcpus: 1, mem_mib: 256, port: 8080 ),
+                        replicas: 2,
+                    ),
                 ],
             )"#,
         )
@@ -1200,7 +1511,13 @@ mod tests {
 
         assert_eq!(manifest.compute.len(), 1);
         assert_eq!(manifest.compute[0].name, "api");
-        assert_eq!(manifest.compute[0].spec["replicas"], json!(2));
+        // The typed spec parsed: an image workload with the declared sizing.
+        assert_eq!(manifest.compute[0].replicas, 2);
+        assert_eq!(
+            manifest.compute[0].spec.root,
+            boatramp_core::compute::RootSource::Image("nginx:latest".into())
+        );
+        assert_eq!(manifest.compute[0].spec.port, 8080);
     }
 
     #[test]
@@ -1280,5 +1597,312 @@ mod tests {
             f.secrets.get("DB_URL").map(String::as_str),
             Some("PROD_DB_URL")
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Part 1 — typed compute
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn typed_compute_spec_round_trips_from_ron() {
+        // A typed `ComputeSpec` authored directly in RON parses into the real type —
+        // `root` is the snake_case newtype variant `image(…)`, which the existing
+        // IMPLICIT_SOME extension set already handles (no UNWRAP_VARIANT_NEWTYPES).
+        let manifest = ApplyManifest::parse(
+            r#"(
+                compute: [
+                    (
+                        name: "db",
+                        spec: (
+                            root: image("pgvector/pgvector:pg16"),
+                            vcpus: 2, mem_mib: 1024, port: 5432,
+                            env: { "POSTGRES_PASSWORD": "x" },
+                        ),
+                        replicas: 1,
+                    ),
+                ],
+            )"#,
+        )
+        .expect("a typed compute spec parses");
+        let c = &manifest.compute[0];
+        assert_eq!(
+            c.spec.root,
+            boatramp_core::compute::RootSource::Image("pgvector/pgvector:pg16".into())
+        );
+        assert_eq!(c.spec.vcpus, 2);
+        assert_eq!(c.replicas, 1);
+        // It round-trips to the exact PutComputeRequest the server deserializes.
+        let req = c.to_request();
+        assert_eq!(req.spec, c.spec);
+        assert_eq!(req.replicas, 1);
+    }
+
+    #[test]
+    fn raw_json_compute_spec_now_fails_with_the_wrapped_error() {
+        // The pre-v0.6.0 raw-JSON `spec` blob, in a VERSION-LESS manifest, no longer
+        // parses (it is not a typed ComputeSpec) — and the failure is the wrapped
+        // v0.6.0 upgrade error that names the migration path.
+        let err = ApplyManifest::parse(
+            r#"(
+                compute: [
+                    ( name: "api", spec: { "root": { "image": "nginx" }, "replicas": 2 } ),
+                ],
+            )"#,
+        )
+        .expect_err("a raw-JSON spec is rejected under the current schema");
+        assert!(matches!(err, Error::StrictParse { .. }), "got {err:?}");
+        let msg = err.to_string();
+        assert!(msg.contains("v0.6.0"), "names the version: {msg}");
+        assert!(
+            msg.contains("boatramp config migrate"),
+            "names the migration verb: {msg}"
+        );
+        assert!(
+            msg.contains("version: 1"),
+            "tells the user to add version: 1: {msg}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Part 2 — config versioning + migration
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn version_too_new_is_refused() {
+        let err = ApplyManifest::parse(&format!("( version: {} )", CURRENT_MANIFEST_VERSION + 1))
+            .expect_err("a future version is refused");
+        assert!(matches!(err, Error::VersionTooNew { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn explicit_current_version_parses_strictly() {
+        // Declaring the current version is allowed and parses exactly like version-less.
+        let manifest = ApplyManifest::parse(&format!(
+            "( version: {}, project: \"acme\" )",
+            CURRENT_MANIFEST_VERSION
+        ))
+        .expect("current-version manifest parses");
+        assert_eq!(manifest.project.as_deref(), Some("acme"));
+    }
+
+    #[test]
+    fn v1_raw_json_compute_manifest_migrates_to_typed() {
+        // A `version: 1` manifest with the old raw-JSON PutComputeRequest-shaped spec
+        // blob migrates: the blob is split into the typed spec/replicas fields.
+        let text = r#"(
+            version: 1,
+            project: "acme",
+            compute: [
+                (
+                    name: "api",
+                    spec: {
+                        "spec": { "root": { "image": "nginx:latest" }, "vcpus": 1, "mem_mib": 256, "port": 8080 },
+                        "replicas": 3,
+                    },
+                ),
+            ],
+        )"#;
+        let manifest = ApplyManifest::parse(text).expect("v1 manifest migrates");
+        // `version:` is dropped on migration (current = absent).
+        assert!(manifest.version.is_none());
+        assert_eq!(manifest.project.as_deref(), Some("acme"));
+        let c = &manifest.compute[0];
+        assert_eq!(
+            c.spec.root,
+            boatramp_core::compute::RootSource::Image("nginx:latest".into())
+        );
+        assert_eq!(c.spec.port, 8080);
+        assert_eq!(c.replicas, 3);
+    }
+
+    #[test]
+    fn v1_migration_produces_a_current_serializable_manifest() {
+        // The migrated manifest re-renders as RON that OMITS `version:` (current =
+        // absent) — the `config migrate` output.
+        let text = r#"(
+            version: 1,
+            compute: [
+                ( name: "api", spec: { "spec": { "root": { "image": "nginx" }, "vcpus": 1, "mem_mib": 128, "port": 80 } } ),
+            ],
+        )"#;
+        let manifest = ApplyManifest::parse(text).unwrap();
+        let rendered = crate::apply_migrate::render_manifest(&manifest).unwrap();
+        // The TOP-LEVEL manifest omits `version:` (current = absent). The nested
+        // `ComputeSpec.version: 1` schema discriminant is a different field and is
+        // expected to remain — so assert on the manifest header, not the whole string.
+        let header = rendered.lines().take(2).collect::<Vec<_>>().join("\n");
+        assert!(
+            !header.contains("version"),
+            "upgraded manifest header omits version: {header}"
+        );
+        // The re-rendered manifest parses cleanly as current (no top-level `version:`).
+        let reparsed =
+            ApplyManifest::parse(&rendered).expect("re-rendered manifest parses as current");
+        assert!(reparsed.version.is_none());
+    }
+
+    #[test]
+    fn db_shaped_v1_workload_still_migrates() {
+        // A DB-shaped image (pgvector) draws a warning (to stderr) but the migration
+        // still succeeds — it stays a plain compute workload (Stage B adds `databases:`).
+        let text = r#"(
+            version: 1,
+            compute: [
+                ( name: "vec", spec: { "spec": { "root": { "image": "pgvector/pgvector:pg16" }, "vcpus": 2, "mem_mib": 1024, "port": 5432 } } ),
+            ],
+        )"#;
+        let manifest = ApplyManifest::parse(text).expect("DB-shaped v1 workload migrates");
+        assert_eq!(
+            manifest.compute[0].spec.root,
+            boatramp_core::compute::RootSource::Image("pgvector/pgvector:pg16".into())
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Part 4 — graphql safelist (rename + register-only apply)
+    // -----------------------------------------------------------------------
+
+    /// Build an `ApplySite` whose site config declares a graphql handler, mutating it
+    /// with `f` (to set the safelist fields under test).
+    fn site_with_graphql(
+        name: &str,
+        f: impl FnOnce(&mut boatramp_core::config::HandlerGraphqlConfig),
+    ) -> ApplySite {
+        let mut gql = boatramp_core::config::HandlerGraphqlConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        f(&mut gql);
+        let site_config = SiteConfig {
+            handlers: Some(boatramp_core::config::HandlersSiteConfig {
+                enabled: true,
+                graphql: Some(gql),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        ApplySite {
+            name: name.into(),
+            path: None,
+            build: None,
+            routing: None,
+            config: Some(site_config),
+        }
+    }
+
+    #[test]
+    fn enforce_safelist_rename_parses_from_config() {
+        // The renamed field parses under its new name (the old `safelist` name is gone).
+        let manifest = ApplyManifest::parse(
+            r#"(
+                sites: [
+                    ( name: "gw", config: ( handlers: ( enabled: true, graphql: ( enabled: true, enforce_safelist: true ) ) ) ),
+                ],
+            )"#,
+        )
+        .expect("enforce_safelist parses");
+        let gql = manifest.sites[0]
+            .config
+            .as_ref()
+            .unwrap()
+            .handlers
+            .as_ref()
+            .unwrap()
+            .graphql
+            .as_ref()
+            .unwrap();
+        assert!(gql.enforce_safelist);
+    }
+
+    #[tokio::test]
+    async fn apply_safelists_registers_each_op_register_only() {
+        let mock = MockCp::default();
+        let site = site_with_graphql("gw", |g| {
+            g.safelisted_ops = vec!["query A { a }".into(), "query B { b }".into()];
+        });
+        apply_safelists(&mock, &site, Path::new("."), false)
+            .await
+            .unwrap();
+        let calls = mock.calls();
+        // Exactly one register per op, in order — and NO delete/prune (register-only).
+        assert_eq!(
+            calls,
+            [
+                "register_graphql_safelist query A { a }",
+                "register_graphql_safelist query B { b }",
+            ]
+        );
+        assert!(
+            !calls.iter().any(|c| c.to_lowercase().contains("delete")
+                || c.to_lowercase().contains("remove")
+                || c.to_lowercase().contains("prune")),
+            "register-only: never deletes/prunes"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_safelists_dry_run_registers_nothing() {
+        let mock = MockCp::default();
+        let site = site_with_graphql("gw", |g| {
+            g.safelisted_ops = vec!["query A { a }".into()];
+        });
+        apply_safelists(&mock, &site, Path::new("."), true)
+            .await
+            .unwrap();
+        assert!(mock.calls().is_empty(), "dry-run registers nothing");
+    }
+
+    #[tokio::test]
+    async fn apply_safelists_mutual_exclusion_is_an_error() {
+        let mock = MockCp::default();
+        let site = site_with_graphql("gw", |g| {
+            g.safelisted_ops = vec!["query A { a }".into()];
+            g.safelisted_ops_path = Some("ops.json".into());
+        });
+        let err = apply_safelists(&mock, &site, Path::new("."), false)
+            .await
+            .expect_err("both sources set is refused");
+        assert!(matches!(err, Error::SafelistConflict { .. }), "got {err:?}");
+        assert!(mock.calls().is_empty(), "no registration on a conflict");
+    }
+
+    #[tokio::test]
+    async fn apply_safelists_reads_ops_from_a_file_client_side() {
+        // The file is read relative to the manifest dir; each op is registered.
+        let dir = std::env::temp_dir().join(format!("boatramp-safelist-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("ops.json"),
+            br#"["query A { a }", "query B { b }"]"#,
+        )
+        .unwrap();
+
+        let mock = MockCp::default();
+        let site = site_with_graphql("gw", |g| {
+            g.safelisted_ops_path = Some("ops.json".into());
+        });
+        let res = apply_safelists(&mock, &site, &dir, false).await;
+        let _ = std::fs::remove_dir_all(&dir);
+        res.unwrap();
+        assert_eq!(
+            mock.calls(),
+            [
+                "register_graphql_safelist query A { a }",
+                "register_graphql_safelist query B { b }",
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_ops_file_handles_array_and_single_forms() {
+        // A JSON array of operation strings → each element is one op.
+        assert_eq!(
+            parse_ops_file(r#"["query A { a }", "query B { b }"]"#),
+            ["query A { a }", "query B { b }"]
+        );
+        // A non-array file → the whole content is a single op.
+        assert_eq!(parse_ops_file("query Single { s }"), ["query Single { s }"]);
+        // Empty → no ops.
+        assert!(parse_ops_file("   ").is_empty());
     }
 }

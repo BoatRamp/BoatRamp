@@ -1045,10 +1045,31 @@ pub struct HandlerGraphqlConfig {
     /// resolves + caches `hash → query` (saving bandwidth + parse cost).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub persisted_queries: bool,
-    /// Safelist mode: only pre-registered query hashes run (a query allowlist); the edge
-    /// never registers a new query. Implies (and is stronger than) `persisted_queries`.
+    /// Safelist-enforcement mode: only pre-registered query hashes run (a query
+    /// allowlist); the edge never registers a new query. Implies (and is stronger
+    /// than) `persisted_queries`. Renamed from `safelist` in v0.6.0 (breaking) to make
+    /// the *enforcement* switch distinct from the declarative `safelisted_ops` /
+    /// `safelisted_ops_path` source of operations.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub safelist: bool,
+    pub enforce_safelist: bool,
+    /// Declarative source of persisted (safelisted) operations, **inline**: the exact
+    /// operation texts to register in the project's GraphQL safelist at `apply` time.
+    /// Registered **register-only (union)** through the existing control-plane
+    /// `POST .../graphql/safelist` endpoint (server-side `guard_query` validation), so
+    /// applying **never prunes** — removal stays an explicit `graphql safelist rm`.
+    /// Mutually exclusive with [`Self::safelisted_ops_path`]. Authoring-only: skipped
+    /// when the site config is serialized to the server (the ops live in the safelist
+    /// store, not the site config).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub safelisted_ops: Vec<String>,
+    /// Declarative source of persisted (safelisted) operations, **from a file**: a path
+    /// (resolved client-side, relative to the manifest dir) to a file whose operations
+    /// are registered at `apply` time, exactly like [`Self::safelisted_ops`]. Read
+    /// **client-side only** — only the operation *text* crosses the wire, never the
+    /// path. Mutually exclusive with `safelisted_ops`. Authoring-only: skipped when the
+    /// site config is serialized to the server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub safelisted_ops_path: Option<std::path::PathBuf>,
     /// Federation gateway: this site is a supergraph gateway. A GraphQL query is planned
     /// against the project's registered subgraphs and executed by dispatching fetches to
     /// the subgraph functions (a subgraph's name is its function name), stitching the
@@ -1798,7 +1819,7 @@ mod tests {
                     enabled: true,
                     federated: true,
                     max_depth: Some(12),
-                    safelist: true,
+                    enforce_safelist: true,
                     ..Default::default()
                 }),
                 cookie_auth: Some(CookieAuthConfig {
