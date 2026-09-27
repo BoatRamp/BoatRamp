@@ -1379,6 +1379,46 @@ jobs:
               echo "blob migrate mutation verified: BOATRAMP_BLOBMIG_MUTATE_${mut}=1 fails the gate as expected."
             fi
           done
+      # Blob-backend migration, Part 2 (`FallbackStorage` composite): the read-fallback backend that
+      # bridges a zero-downtime `--blobs` switch — serve the new (primary) backend first, fall through
+      # to the old (secondary) on a definitive, allowlisted primary MISS, so there is no serving gap
+      # while `boatramp blob migrate` drains the secondary. The gate battery runs entirely with real
+      # `FsStorage` tempdir backends (plus a real `DeployStore` for the GC-refusal invariant, no cloud)
+      # and asserts the eight zero-gap invariants: G1 primary-miss reads secondary, G2 primary-hit wins
+      # (no reverse precedence), G3 write isolation (put/delete primary-only), G4-err a non-NotFound
+      # primary error propagates (never consults the secondary), G5-cp a control-plane-shaped key on the
+      # secondary is not resurrected (allowlist excludes it), G8-gc GC refuses to prune while a fallback
+      # secondary is attached, G9-key the key is forwarded byte-identical (no tenant-boundary collapse),
+      # and G10-map mapped/local_file are primary-only. Because it is fs-only it needs no cloud SDK, so
+      # it runs on the host toolchain next to the Part-1 / #505 gates.
+      #
+      # ANTI-HOLLOW: run the gate ONCE clean (must PASS + print the marker), then ONCE per mutation with
+      # the exit code INVERTED — each BOATRAMP_BLOBFB_MUTATE_* neuters exactly one invariant (skip the
+      # fallback / reverse precedence / write the secondary / fall back on error / allow a control-plane
+      # fallback / prune anyway / rewrite the key / fall back for mapped), so a PASS-under-mutation is a
+      # hollow gate and fails the merge.
+      - name: blob fallback zero-gap gate marker (blob-backend-migration Part 2)
+        run: |
+          set -eo pipefail
+          cargo test -p boatramp-node \
+            --features blob-fallback-gate-mutation --lib \
+            blob_fallback::gate::blob_fallback_zero_gap_gate -- --nocapture 2>&1 \
+            | tee blob-fallback.log
+          grep -qE 'test result: ok\. 1 passed' blob-fallback.log \
+            || { echo "::error::blob fallback gate did not run (silent skip or a failure)" >&2; exit 1; }
+          grep -q 'BLOB FALLBACK ZERO-GAP OK' blob-fallback.log \
+            || { echo "::error::blob fallback gate never reached its marker (a fallback / precedence / write-isolation / error-propagation / control-plane / GC-refusal / key-fidelity / zero-copy regression)" >&2; exit 1; }
+          for mut in NO_FALLBACK REVERSE_PRECEDENCE WRITE_SECONDARY FALLBACK_ON_ERROR ALLOW_CP_FALLBACK PRUNE_ANYWAY REWRITE_KEY MAPPED_FALLBACK; do
+            if env "BOATRAMP_BLOBFB_MUTATE_${mut}=1" cargo test -p boatramp-node \
+              --features blob-fallback-gate-mutation --lib \
+              blob_fallback::gate::blob_fallback_zero_gap_gate \
+              > "blob-fallback-mut-${mut}.log" 2>&1; then
+              echo "::error::blob fallback gate is HOLLOW — it PASSED with BOATRAMP_BLOBFB_MUTATE_${mut}=1 (that security check is not load-bearing)" >&2
+              exit 1
+            else
+              echo "blob fallback mutation verified: BOATRAMP_BLOBFB_MUTATE_${mut}=1 fails the gate as expected."
+            fi
+          done
 
   deny:
     name: cargo-deny

@@ -205,4 +205,20 @@ pub trait Storage: Send + Sync {
     async fn watch(&self, _prefix: &str) -> Result<Option<ChangeStream>, StorageError> {
         Ok(None)
     }
+
+    /// Whether a destructive prune (a GC delete of an unreferenced object) is safe on
+    /// this backend. Defaults to `true` — every ordinary backend (fs/S3/GCS/Azure) may
+    /// be pruned, because its `list` and `delete` operate over the SAME object set.
+    ///
+    /// A read-fallback composite (`FallbackStorage`, blob-backend migration Part 2)
+    /// returns `false`: its `list` is a **union** of primary + secondary, but its
+    /// `delete` is **primary-only**, so GC would count a secondary-only orphan as
+    /// reclaimed (it appears in the union `list`) while the delete silently no-ops on
+    /// the read-only secondary — and a subsequent read fallback would resurrect it.
+    /// The doctrine is drain-then-drop: `boatramp blob migrate` drains the secondary
+    /// into the primary, the operator removes `[serve].blob_fallback`, THEN GC prunes.
+    /// A caller about to prune-delete MUST consult this and refuse when it is `false`.
+    fn allows_prune(&self) -> bool {
+        true
+    }
 }

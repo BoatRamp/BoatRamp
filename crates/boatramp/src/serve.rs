@@ -754,6 +754,7 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
     let (built_blobs, sealed_s3_credential) = build_blobs_with_sealed_cred(
         &blob_args,
         s3_credential_cfg.as_ref(),
+        serve_cfg.blob_fallback.as_ref(),
         &data_dir,
         kv.clone(),
         config.secrets.as_ref(),
@@ -773,6 +774,20 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
     )))]
     let _ = &sealed_s3_credential;
     let storage = built_blobs.storage.clone();
+
+    // Blob-backend migration Part 2: a prominent startup WARNING while `[serve.blob_fallback]` is
+    // active. Fallback is a bounded TRANSITION mode, not a steady state — the one live hazard is a
+    // guest deleting its OWN object during the window (a primary-delete + a read fallback can
+    // transiently resurrect it, within-tenant only — the key scheme is preserved). Name it
+    // explicitly and point at the drain-then-drop doctrine.
+    if let Some(fb) = serve_cfg.blob_fallback.as_ref() {
+        tracing::warn!(
+            secondary = %blob_fallback_identity(fb),
+            "blob_fallback active — TRANSITION mode; drain with 'boatramp blob migrate', then remove \
+             [serve].blob_fallback and restart the node. A guest deleting its own object during this \
+             window can be transiently resurrected on read."
+        );
+    }
 
     // Layout guard (0.2.0): refuse to serve a store still on the pre-project layout
     // 1 — a half-read store would silently drop sites/functions/compute. The operator
@@ -1000,6 +1015,7 @@ fn serve_secrets_envelope(
 async fn build_blobs_with_sealed_cred(
     blob_args: &BlobArgs,
     s3_credential_cfg: Option<&boatramp_node::config::S3CredentialConfig>,
+    blob_fallback: Option<&boatramp_node::config::BlobFallbackConfig>,
     data_dir: &Path,
     kv: Arc<dyn KvStore>,
     secrets: Option<&crate::config::SecretsConfig>,
@@ -1016,7 +1032,7 @@ async fn build_blobs_with_sealed_cred(
         let envelope = serve_secrets_envelope(secrets, data_dir)?;
         let cred = boatramp_node::s3_credential::resolve_s3_credential(
             cfg,
-            kv,
+            kv.clone(),
             envelope,
             allow_env_secret_refs,
             &boatramp_core::env::SystemEnv,
@@ -1028,10 +1044,105 @@ async fn build_blobs_with_sealed_cred(
             "sourcing the base S3 credential from the [secrets] sealed store ([serve.s3_credential])"
         );
         effective.s3_credential = Some(cred.clone());
+        // The resolved credential is returned so the SAME sealed base credential wires the AWS cloud
+        // minter. Only the PRIMARY's credential is returned — the fallback SECONDARY is a read-only
+        // drain source and is NEVER handed to the minter.
         resolved = Some(cred);
     }
+
+    // Zero-downtime backend switch (blob-backend migration Part 2): when `[serve.blob_fallback]` is
+    // configured, build a read-only SECONDARY and wrap `FallbackStorage(primary, secondary)`. The
+    // secondary resolves its OWN sealed base S3 credential through the SAME `resolve_s3_credential`
+    // path (same fail-closed posture, no second parser); it is discarded from `resolved` above so it
+    // never reaches the minter.
+    #[cfg(feature = "fallback")]
+    if let Some(fb) = blob_fallback {
+        let mut secondary_args = secondary_blob_args(fb);
+        if let Some(cfg) = fb.s3_credential.as_ref() {
+            let envelope = serve_secrets_envelope(secrets, data_dir)?;
+            let cred = boatramp_node::s3_credential::resolve_s3_credential(
+                cfg,
+                kv,
+                envelope,
+                allow_env_secret_refs,
+                &boatramp_core::env::SystemEnv,
+            )
+            .await
+            .map_err(|e| Error::S3Ingress(e.to_string()))?;
+            tracing::info!(
+                access_key_id = %cred.access_key_id(),
+                "sourcing the SECONDARY (blob_fallback) base S3 credential from the [secrets] sealed store"
+            );
+            secondary_args.s3_credential = Some(cred);
+        }
+        let timeout = std::time::Duration::from_secs(
+            fb.secondary_timeout_secs
+                .unwrap_or(boatramp_node::config::DEFAULT_BLOB_FALLBACK_TIMEOUT_SECS),
+        );
+        let built = boatramp_node::blobs::build_blobs_with_fallback(
+            &effective,
+            Some((&secondary_args, timeout)),
+            data_dir,
+            notify_tier,
+            notify_account,
+        )
+        .await?;
+        return Ok((built, resolved));
+    }
+    // Silence the unused binding on a `--no-default-features` build with no blob backend (no
+    // `fallback` feature ⇒ the block above is cfg'd out).
+    #[cfg(not(feature = "fallback"))]
+    let _ = blob_fallback;
+
     let built = build_blobs(&effective, data_dir, notify_tier, notify_account).await?;
     Ok((built, resolved))
+}
+
+/// A short human identity for a `[serve.blob_fallback]` secondary — the backend plus its
+/// bucket/path/endpoint — for the startup WARNING and CLI resolved-identity echo. Never renders a
+/// credential.
+fn blob_fallback_identity(fb: &boatramp_node::config::BlobFallbackConfig) -> String {
+    use boatramp_node::backends::BlobBackend;
+    match fb.blobs.unwrap_or(BlobBackend::Fs) {
+        BlobBackend::Fs => "fs (data_dir/blobs)".to_string(),
+        BlobBackend::S3 => format!(
+            "s3 bucket={} endpoint={}",
+            fb.s3_bucket.as_deref().unwrap_or("?"),
+            fb.s3_endpoint.as_deref().unwrap_or("(default)")
+        ),
+        BlobBackend::Gcs => format!(
+            "gcs bucket={} endpoint={}",
+            fb.gcs_bucket.as_deref().unwrap_or("?"),
+            fb.gcs_endpoint.as_deref().unwrap_or("(default)")
+        ),
+        BlobBackend::Azure => format!(
+            "azure account={} container={}",
+            fb.azure_account.as_deref().unwrap_or("?"),
+            fb.azure_container.as_deref().unwrap_or("?")
+        ),
+    }
+}
+
+/// Map a `[serve.blob_fallback]` descriptor to a [`BlobArgs`] for the read-only SECONDARY backend.
+/// Mirrors the primary `BlobArgs` shape field-for-field (its `s3_credential` is resolved separately by
+/// the caller). The secondary's default backend is `fs` (matching the primary's `blobs` default).
+#[cfg(feature = "fallback")]
+fn secondary_blob_args(fb: &boatramp_node::config::BlobFallbackConfig) -> BlobArgs {
+    BlobArgs {
+        blobs: fb.blobs.unwrap_or(BlobBackend::Fs),
+        s3_bucket: fb.s3_bucket.clone(),
+        s3_endpoint: fb.s3_endpoint.clone(),
+        s3_region: fb.s3_region.clone(),
+        s3_path_style: fb.s3_path_style,
+        s3_credential: None,
+        gcs_bucket: fb.gcs_bucket.clone(),
+        gcs_endpoint: fb.gcs_endpoint.clone(),
+        gcs_anonymous: fb.gcs_anonymous,
+        azure_account: fb.azure_account.clone(),
+        azure_container: fb.azure_container.clone(),
+        azure_access_key: fb.azure_access_key.clone(),
+        azure_emulator: fb.azure_emulator,
+    }
 }
 
 /// How long changelog feed entries are kept (comfortably larger than the poll

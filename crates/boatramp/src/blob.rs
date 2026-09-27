@@ -53,6 +53,25 @@ pub enum Error {
     /// Serializing the `--json` migration report failed.
     #[error(transparent)]
     Json(#[from] serde_json::Error),
+    /// `--from` was omitted and the `--node-config` has no `[serve.blob_fallback]` to drain from.
+    #[error(
+        "no migration SOURCE: pass --from <config>, or configure [serve.blob_fallback] in \
+         {node_config} (the drain one-liner) — {node_config} has no fallback secondary to drain"
+    )]
+    NoSource {
+        /// The node config path consulted for a fallback.
+        node_config: String,
+    },
+    /// The resolved source and destination backends are the SAME identity — a migration would be a
+    /// no-op (or corrupt in place). Refused before copying.
+    #[error(
+        "refusing to migrate: source and destination resolve to the SAME backend ({identity}); \
+         pick distinct --from/--to backends"
+    )]
+    SameSourceDest {
+        /// The shared backend identity.
+        identity: String,
+    },
 }
 
 /// `blob` module result; `Err` is [`Error`].
@@ -105,11 +124,22 @@ enum BlobCommand {
 pub struct MigrateArgs {
     /// Path to the node config file (`boatramp.cfg` shape) whose `[serve]` blob block defines the
     /// SOURCE backend (+ optional `[secrets]` for a sealed `boatramp:`/`env:` S3 credential ref).
+    /// OPTIONAL: when omitted, the SOURCE is the `[serve.blob_fallback]` SECONDARY of the node config
+    /// (`--node-config`, default `boatramp.cfg`) — the zero-downtime drain one-liner. Omitting it with
+    /// no configured fallback is an error.
     #[arg(long)]
-    from: std::path::PathBuf,
+    from: Option<std::path::PathBuf>,
     /// Path to the node config file whose `[serve]` blob block defines the DESTINATION backend.
+    /// OPTIONAL: when omitted, the DESTINATION defaults to the node config's OWN blob backend (the
+    /// running node's primary), so `boatramp blob migrate --from <old>` migrates into the node you run.
     #[arg(long)]
-    to: std::path::PathBuf,
+    to: Option<std::path::PathBuf>,
+    /// Path to the running node's config (`boatramp.cfg` shape) — the source of the `--from`/`--to`
+    /// defaults: its `[serve]` blob block is the DEFAULT destination (the primary), and its
+    /// `[serve.blob_fallback]` is the DEFAULT source (the secondary). Only read when `--from` or `--to`
+    /// is omitted. Defaults to `boatramp.cfg`.
+    #[arg(long, default_value = "boatramp.cfg")]
+    node_config: std::path::PathBuf,
     /// Bounded copy concurrency (number of objects in flight at once).
     #[arg(long, default_value_t = 8)]
     concurrency: usize,
@@ -212,12 +242,31 @@ pub async fn run(args: BlobArgs, config: &ProjectConfig) -> Result<()> {
     Ok(())
 }
 
-/// Run the offline, node-local blob-backend migration (`boatramp blob migrate`). Builds the source
-/// and destination backends from two node config files (each `[serve]` blob block plus an optional
-/// `[secrets]`), then copies every object source→dest with the [`boatramp_node::blob_migrate`] engine.
+/// Run the offline, node-local blob-backend migration (`boatramp blob migrate`). Resolves the SOURCE
+/// and DESTINATION from `--from`/`--to` (each a node config file's `[serve]` blob block), defaulting an
+/// omitted `--to` to the node config's OWN primary and an omitted `--from` to the node config's
+/// `[serve.blob_fallback]` secondary (the zero-downtime drain one-liner). It echoes the resolved
+/// backend identities, REFUSES if they resolve equal, then copies every object source→dest with the
+/// [`boatramp_node::blob_migrate`] engine — and, on a verified fallback→primary drain, prints the
+/// "safe to remove [serve].blob_fallback" signal.
 async fn migrate(a: MigrateArgs) -> Result<()> {
-    let source = build_side("source", &a.from).await?;
-    let dest = build_side("destination", &a.to).await?;
+    let (source, dest) = resolve_sides(&a).await?;
+
+    // Echo the RESOLVED source + destination identity before copying (never a credential).
+    if !a.json {
+        println!("blob migrate: source = {}", source.identity);
+        println!("blob migrate:   dest = {}", dest.identity);
+    }
+    // Refuse a migration whose source and destination resolve to the SAME backend — a no-op at best,
+    // an in-place corruption at worst.
+    if source.identity == dest.identity {
+        return Err(Error::SameSourceDest {
+            identity: source.identity,
+        });
+    }
+    // Whether this is the zero-downtime drain shape (source == the configured fallback secondary,
+    // dest == the configured primary) — the case that, once verified, means the secondary is drained.
+    let is_configured_drain = source.is_configured_fallback && dest.is_configured_primary;
 
     let opts = boatramp_node::blob_migrate::MigrateOptions {
         concurrency: a.concurrency,
@@ -225,18 +274,24 @@ async fn migrate(a: MigrateArgs) -> Result<()> {
         dry_run: a.dry_run,
         prefix: a.prefix.clone(),
     };
-    let report = boatramp_node::blob_migrate::migrate(source, dest, &opts).await?;
+    let report = boatramp_node::blob_migrate::migrate(source.storage, dest.storage, &opts).await?;
+
+    // A verified fallback→primary drain: the secondary now has no object the primary lacks.
+    let drained = report.verified && is_configured_drain;
 
     if a.json {
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
+                "source": source.identity,
+                "dest": dest.identity,
                 "total_objects": report.total_objects,
                 "copied_objects": report.copied_objects,
                 "skipped_objects": report.skipped_objects,
                 "copied_bytes": report.copied_bytes,
                 "verified": report.verified,
                 "dry_run": a.dry_run,
+                "secondary_drained": drained,
             }))?
         );
     } else {
@@ -257,33 +312,74 @@ async fn migrate(a: MigrateArgs) -> Result<()> {
                 String::new()
             },
         );
+        if drained {
+            println!(
+                "SECONDARY FULLY DRAINED — safe to remove [serve].blob_fallback and restart the node."
+            );
+        }
     }
     Ok(())
 }
 
-/// Build one side (`source`/`destination`) of a migration from a node config file: parse the
-/// `[serve]` blob block into a [`BlobArgs`](boatramp_node::blobs::BlobArgs), resolve an optional
-/// node-level sealed S3 credential from `[serve.s3_credential]` (+ `[secrets]`), and construct the
-/// backend via `build_blobs` with NO watcher provisioning (a migration never watches).
-async fn build_side(
+/// A built migration side: the backend, its human identity (for the echo + the equal-refusal), and
+/// whether it came from the node config's configured fallback (source) / primary (dest) — which
+/// together mark the zero-downtime drain shape that emits the "SAFE TO DROP FALLBACK" signal.
+struct ResolvedSide {
+    storage: std::sync::Arc<dyn boatramp_core::Storage>,
+    identity: String,
+    is_configured_fallback: bool,
+    is_configured_primary: bool,
+}
+
+/// Resolve + build the source and destination sides from the CLI args, applying the defaults:
+/// - SOURCE: `--from <config>`'s primary, else the `--node-config`'s `[serve.blob_fallback]` secondary
+///   (error if neither).
+/// - DEST: `--to <config>`'s primary, else the `--node-config`'s OWN primary.
+async fn resolve_sides(a: &MigrateArgs) -> Result<(ResolvedSide, ResolvedSide)> {
+    // SOURCE.
+    let source = match a.from.as_ref() {
+        Some(from) => build_primary_side("source", from).await?,
+        None => {
+            // No `--from`: drain the configured fallback secondary of the node config.
+            let config = boatramp_node::config::ServerConfig::load(&a.node_config)?;
+            let serve = config.serve.clone().unwrap_or_default();
+            let Some(fb) = serve.blob_fallback.clone() else {
+                return Err(Error::NoSource {
+                    node_config: a.node_config.display().to_string(),
+                });
+            };
+            build_fallback_side("source", &config, &fb).await?
+        }
+    };
+
+    // DEST.
+    let dest_path = a.to.clone().unwrap_or_else(|| a.node_config.clone());
+    // The destination is a "configured primary" (for the drain signal) when it came from the node
+    // config's own `[serve]` — i.e. `--to` was omitted so it defaulted to `--node-config`.
+    let dest_is_configured_primary = a.to.is_none();
+    let mut dest = build_primary_side("destination", &dest_path).await?;
+    dest.is_configured_primary = dest_is_configured_primary;
+
+    Ok((source, dest))
+}
+
+/// Build a side from a node config file's PRIMARY `[serve]` blob block: parse it into a
+/// [`BlobArgs`](boatramp_node::blobs::BlobArgs), resolve an optional node-level sealed S3 credential
+/// from `[serve.s3_credential]` (+ `[secrets]`), and construct the backend via `build_blobs` with NO
+/// watcher provisioning (a migration never watches).
+async fn build_primary_side(
     side: &'static str,
     config_path: &std::path::Path,
-) -> Result<std::sync::Arc<dyn boatramp_core::Storage>> {
-    use std::sync::Arc;
-
+) -> Result<ResolvedSide> {
     let config = boatramp_node::config::ServerConfig::load(config_path)?;
     let serve = config.serve.clone().unwrap_or_default();
-    // The fs backend roots at `<data_dir>/blobs`, so honour the config's `[serve].data_dir`
-    // (default `./data`) — the same resolution `serve` uses — so an fs source/dest points at the
-    // real on-disk tree.
     let data_dir = serve
         .data_dir
         .clone()
         .unwrap_or_else(|| std::path::PathBuf::from("./data"));
 
     // The backend is the config's `[serve].blobs` (default `fs` when absent) — the config-level
-    // analog of `serve`'s `--blobs` flag. All per-backend options come from the SAME `[serve]`
-    // block, so the source/dest are described entirely by their own config file.
+    // analog of `serve`'s `--blobs` flag. All per-backend options come from the SAME `[serve]` block.
     let mut blob_args = boatramp_node::blobs::BlobArgs {
         blobs: serve
             .blobs
@@ -301,40 +397,124 @@ async fn build_side(
         azure_access_key: serve.azure_access_key.clone(),
         azure_emulator: serve.azure_emulator,
     };
-
-    // Resolve the node-level sealed base S3 credential (#505), if configured — the same source the
-    // serve path uses. A `boatramp:` sealed ref needs the control-plane KV, which this offline
-    // command does not open; only `env:`/bare refs (posture-permitted) resolve here. The posture is
-    // read from the same config file so `allow_env_secret_refs` matches how the node would run.
     if let Some(cred_cfg) = serve.s3_credential.clone() {
-        let posture = config
-            .security
-            .clone()
-            .unwrap_or_default()
-            .resolve()
-            .map_err(|e| Error::Envelope {
-                side,
-                reason: format!("resolving [security] posture: {e}"),
-            })?;
-        let envelope = build_secrets_envelope(side, config.secrets.as_ref(), &data_dir)?;
-        let cred = boatramp_node::s3_credential::resolve_s3_credential(
-            &cred_cfg,
-            // No control-plane KV on the offline path; an `env:`/bare ref never touches it, and a
-            // `boatramp:` ref correctly reports MissingBoatrampSecret against the empty stand-in.
-            Arc::new(boatramp_core::kv::MemoryKv::new()),
-            envelope,
-            posture.allow_env_secret_refs,
-            &boatramp_core::env::SystemEnv,
-        )
-        .await
-        .map_err(|source| Error::Credential { side, source })?;
-        blob_args.s3_credential = Some(cred);
+        blob_args.s3_credential =
+            Some(resolve_side_credential(side, &config, &cred_cfg, &data_dir).await?);
     }
-
+    let identity = backend_identity(&blob_args, &data_dir);
     let built = boatramp_node::blobs::build_blobs(&blob_args, &data_dir, None, None)
         .await
         .map_err(|source| Error::BackendBuild { side, source })?;
-    Ok(built.storage)
+    Ok(ResolvedSide {
+        storage: built.storage,
+        identity,
+        is_configured_fallback: false,
+        is_configured_primary: false,
+    })
+}
+
+/// Build a side from a `[serve.blob_fallback]` SECONDARY descriptor (the drain source). Uses the
+/// node config's `[secrets]`/`[security]` for the secondary's OWN sealed credential, exactly like the
+/// serve path resolves it.
+async fn build_fallback_side(
+    side: &'static str,
+    config: &boatramp_node::config::ServerConfig,
+    fb: &boatramp_node::config::BlobFallbackConfig,
+) -> Result<ResolvedSide> {
+    let serve = config.serve.clone().unwrap_or_default();
+    let data_dir = serve
+        .data_dir
+        .clone()
+        .unwrap_or_else(|| std::path::PathBuf::from("./data"));
+
+    let mut blob_args = boatramp_node::blobs::BlobArgs {
+        blobs: fb.blobs.unwrap_or(boatramp_node::backends::BlobBackend::Fs),
+        s3_bucket: fb.s3_bucket.clone(),
+        s3_endpoint: fb.s3_endpoint.clone(),
+        s3_region: fb.s3_region.clone(),
+        s3_path_style: fb.s3_path_style,
+        s3_credential: None,
+        gcs_bucket: fb.gcs_bucket.clone(),
+        gcs_endpoint: fb.gcs_endpoint.clone(),
+        gcs_anonymous: fb.gcs_anonymous,
+        azure_account: fb.azure_account.clone(),
+        azure_container: fb.azure_container.clone(),
+        azure_access_key: fb.azure_access_key.clone(),
+        azure_emulator: fb.azure_emulator,
+    };
+    if let Some(cred_cfg) = fb.s3_credential.clone() {
+        blob_args.s3_credential =
+            Some(resolve_side_credential(side, config, &cred_cfg, &data_dir).await?);
+    }
+    let identity = backend_identity(&blob_args, &data_dir);
+    let built = boatramp_node::blobs::build_blobs(&blob_args, &data_dir, None, None)
+        .await
+        .map_err(|source| Error::BackendBuild { side, source })?;
+    Ok(ResolvedSide {
+        storage: built.storage,
+        identity,
+        is_configured_fallback: true,
+        is_configured_primary: false,
+    })
+}
+
+/// Resolve a node-level sealed base S3 credential (#505) for a migration side — the same source the
+/// serve path uses. A `boatramp:` sealed ref needs the control-plane KV, which this offline command
+/// does not open; only `env:`/bare refs (posture-permitted) resolve here. The posture is read from the
+/// same config so `allow_env_secret_refs` matches how the node would run.
+async fn resolve_side_credential(
+    side: &'static str,
+    config: &boatramp_node::config::ServerConfig,
+    cred_cfg: &boatramp_node::config::S3CredentialConfig,
+    data_dir: &std::path::Path,
+) -> Result<boatramp_node::s3_credential::SealedS3Credential> {
+    use std::sync::Arc;
+    let posture = config
+        .security
+        .clone()
+        .unwrap_or_default()
+        .resolve()
+        .map_err(|e| Error::Envelope {
+            side,
+            reason: format!("resolving [security] posture: {e}"),
+        })?;
+    let envelope = build_secrets_envelope(side, config.secrets.as_ref(), data_dir)?;
+    boatramp_node::s3_credential::resolve_s3_credential(
+        cred_cfg,
+        Arc::new(boatramp_core::kv::MemoryKv::new()),
+        envelope,
+        posture.allow_env_secret_refs,
+        &boatramp_core::env::SystemEnv,
+    )
+    .await
+    .map_err(|source| Error::Credential { side, source })
+}
+
+/// A short human identity for a built blob backend — the backend plus its bucket/path/endpoint. Used
+/// for the resolved source/dest echo and the equal-refusal (never renders a credential). fs renders
+/// its resolved `<data_dir>/blobs` root so two fs sides at different data_dirs compare distinct.
+fn backend_identity(args: &boatramp_node::blobs::BlobArgs, data_dir: &std::path::Path) -> String {
+    use boatramp_node::backends::BlobBackend;
+    match args.blobs {
+        BlobBackend::Fs => format!("fs {}", data_dir.join("blobs").display()),
+        BlobBackend::S3 => format!(
+            "s3 bucket={} endpoint={} region={} path_style={}",
+            args.s3_bucket.as_deref().unwrap_or("?"),
+            args.s3_endpoint.as_deref().unwrap_or("(default)"),
+            args.s3_region.as_deref().unwrap_or("(default)"),
+            args.s3_path_style
+        ),
+        BlobBackend::Gcs => format!(
+            "gcs bucket={} endpoint={}",
+            args.gcs_bucket.as_deref().unwrap_or("?"),
+            args.gcs_endpoint.as_deref().unwrap_or("(default)")
+        ),
+        BlobBackend::Azure => format!(
+            "azure account={} container={}",
+            args.azure_account.as_deref().unwrap_or("?"),
+            args.azure_container.as_deref().unwrap_or("?")
+        ),
+    }
 }
 
 /// Build the `[secrets]` key envelope from a config's `[secrets]` section (mirrors the serve path's
