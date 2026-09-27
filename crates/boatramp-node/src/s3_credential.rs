@@ -109,6 +109,14 @@ mod gate_mutation {
 pub enum S3CredentialError {
     /// `access_key_id` is empty (a misconfigured source — refuse rather than mint a broken credential).
     EmptyAccessKeyId,
+    /// The resolved `secret_access_key` is empty (an `env:VAR=""` or a `boatramp:` secret sealed as
+    /// empty bytes) — **fail closed at startup** rather than mint a static provider that fails SigV4
+    /// at request-time (403). Symmetric to [`Self::EmptyAccessKeyId`].
+    EmptySecret,
+    /// A `boatramp:<name>` node-cred ref on the CLUSTER path — refused **structurally** (a scheme
+    /// check, not an incidental empty-store miss): the replicated control-plane KV that holds the
+    /// sealed store is not available at blob-build time on a cluster. Use `env:<VAR>` instead.
+    BoatrampRefOnCluster(String),
     /// The `secret_access_key` is a `boatramp:`/`env:` sealed ref but no `[secrets]` envelope is
     /// configured — **fail closed** (never a silent env fallback that would mask the misconfig).
     NoEnvelope,
@@ -133,6 +141,17 @@ impl std::fmt::Display for S3CredentialError {
             Self::EmptyAccessKeyId => write!(
                 f,
                 "[serve.s3_credential]: `access_key_id` must not be empty"
+            ),
+            Self::EmptySecret => write!(
+                f,
+                "[serve.s3_credential]: the resolved `secret_access_key` is empty — refusing to build \
+                 a credential that would fail SigV4 signing at request-time (403); seal a non-empty \
+                 secret or set the env var to a non-empty value"
+            ),
+            Self::BoatrampRefOnCluster(name) => write!(
+                f,
+                "[serve.s3_credential]: `secret_access_key` → boatramp:{name} is not supported on a \
+                 cluster (the control-plane KV isn't available at blob-build time); use `env:<VAR>`"
             ),
             Self::NoEnvelope => write!(
                 f,
@@ -270,10 +289,29 @@ pub async fn resolve_s3_credential(
             return Err(S3CredentialError::UnsupportedScheme(scheme.to_string()));
         }
     };
+    // Fail closed on an EMPTY resolved secret (an `env:VAR=""` or a `boatramp:` secret sealed as empty
+    // bytes): a static provider built from an empty secret would fail SigV4 at request-time (403)
+    // instead of at startup. Symmetric to the `access_key_id` empty check above.
+    if secret_access_key.trim().is_empty() {
+        return Err(S3CredentialError::EmptySecret);
+    }
     Ok(SealedS3Credential {
         access_key_id: access_key_id.to_string(),
         secret_access_key,
     })
+}
+
+/// Whether `secret_ref` is a `boatramp:<name>` sealed-store reference. The cluster serve path uses this
+/// for a STRUCTURAL up-front refusal ([`S3CredentialError::BoatrampRefOnCluster`]) — the replicated
+/// control-plane KV that backs the sealed store does not exist at blob-build time on a cluster, so a
+/// `boatramp:` ref must be rejected by a scheme check (not left to fail incidentally against an empty
+/// stand-in store). `env:`/bare refs return `None` here so they resolve normally and surface their own
+/// errors unwrapped.
+pub fn boatramp_ref_name(secret_ref: &str) -> Option<&str> {
+    match parse_secret_ref(secret_ref) {
+        SecretRef::Boatramp(name) => Some(name),
+        SecretRef::Env(_) | SecretRef::Unsupported(_) => None,
+    }
 }
 
 #[cfg(test)]
@@ -442,6 +480,48 @@ mod tests {
             dbg.contains("AKID-PUBLIC"),
             "the access-key id is public: {dbg}"
         );
+    }
+
+    #[tokio::test]
+    async fn empty_resolved_secret_fails_closed() {
+        // (a) an `env:VAR` whose value is the empty string — fail closed at startup, not a 403 at
+        // request-time.
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let env = MapEnv::new().with("EMPTY_S3_SECRET", "");
+        let err = resolve_s3_credential(
+            &cfg("AKID-PUBLIC", "env:EMPTY_S3_SECRET"),
+            kv.clone(),
+            None,
+            true,
+            &env,
+        )
+        .await
+        .expect_err("empty env secret must fail closed");
+        assert_eq!(err, S3CredentialError::EmptySecret);
+
+        // (b) a `boatramp:` secret sealed as empty bytes — same fail-closed outcome.
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        seed_boatramp_secret(&kv, "empty-sealed", "").await;
+        let err = resolve_s3_credential(
+            &cfg("AKID-PUBLIC", "boatramp:empty-sealed"),
+            kv,
+            Some(Arc::new(IdentityEnvelope)),
+            false,
+            &MapEnv::new(),
+        )
+        .await
+        .expect_err("empty sealed secret must fail closed");
+        assert_eq!(err, S3CredentialError::EmptySecret);
+    }
+
+    #[test]
+    fn boatramp_ref_name_is_a_scheme_check() {
+        // The structural scheme check the cluster serve path uses: only a `boatramp:` ref returns a
+        // name (⇒ refused on a cluster); `env:`/bare/unsupported return `None` (⇒ resolve normally).
+        assert_eq!(boatramp_ref_name("boatramp:tigris-key"), Some("tigris-key"));
+        assert_eq!(boatramp_ref_name("env:AWS_SECRET_ACCESS_KEY"), None);
+        assert_eq!(boatramp_ref_name("BARE_VAR"), None);
+        assert_eq!(boatramp_ref_name("vault:x"), None);
     }
 
     #[test]

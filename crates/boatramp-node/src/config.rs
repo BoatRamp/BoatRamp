@@ -3439,6 +3439,9 @@ mod tests {
         let err: Result<ServerConfig, _> = ron_options().from_str(
             r#"( serve: ( s3_credential: ( access_key_id: "x", secret_access_key: "boatramp:y", bogus: 1 ) ) )"#,
         );
-        assert!(err.is_err(), "unknown [serve.s3_credential] field must be rejected");
+        assert!(
+            err.is_err(),
+            "unknown [serve.s3_credential] field must be rejected"
+        );
     }
 }
