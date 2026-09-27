@@ -1307,6 +1307,42 @@ jobs:
           else
             echo "blob-upload tenant-template mutation verified: BOATRAMP_BLOB_TENANT_TEMPLATE_MUTATE_SKIP_HOST_FORCE=1 fails the gate as expected."
           fi
+      # #505 sealed-store S3 credential sourcing. The node-level base S3 credential ([serve.s3_credential])
+      # is unsealed from the [secrets] store (KeyEnvelope) and injected into BOTH the S3 blob object
+      # backend AND the AWS cloud minter, INSTEAD of the ambient AWS_ACCESS_KEY_ID/_SECRET env chain. The
+      # gate battery asserts: (1) a configured sealed source ⇒ the resolved/injected credential is the
+      # SEALED value, not the env value; (2) a sealed ref with NO [secrets] envelope FAILS CLOSED (never a
+      # silent env fallback); (3) the secret NEVER appears in Debug (redacted); (4) absent source ⇒ the
+      # ambient env chain (non-breaking). It pulls the aws-sdk (via the `s3` feature the gate feature
+      # implies), which is heavy/clashy on musl (the aws-lc-rs/ring musl issue the s3-ingress cloud lane
+      # already runs on the HOST toolchain for) — so this gate runs on the HOST toolchain too.
+      #
+      # ANTI-HOLLOW: run the gate ONCE clean (must PASS + print the marker), then ONCE per mutation with
+      # the exit code INVERTED — each BOATRAMP_S3SEALED_MUTATE_* neuters exactly one check (read the env
+      # instead of the sealed store / silently fall back to env with no envelope / print the secret in a
+      # plain Debug), so a PASS-under-mutation is a hollow gate and fails the merge.
+      - name: s3 sealed-cred sourcing gate marker (#505)
+        run: |
+          set -eo pipefail
+          cargo test -p boatramp-node \
+            --features s3-sealed-cred-gate-mutation --lib \
+            s3_credential::gate::s3_sealed_cred_sourcing_gate -- --nocapture 2>&1 \
+            | tee s3-sealed-cred.log
+          grep -qE 'test result: ok\. 1 passed' s3-sealed-cred.log \
+            || { echo "::error::s3 sealed-cred gate did not run (silent skip or a failure)" >&2; exit 1; }
+          grep -q 'S3 SEALED-CRED SOURCING OK' s3-sealed-cred.log \
+            || { echo "::error::s3 sealed-cred gate never reached its marker (a sealed-source / fail-closed / redaction regression)" >&2; exit 1; }
+          for mut in READ_ENV ENV_FALLBACK PLAIN_DEBUG; do
+            if env "BOATRAMP_S3SEALED_MUTATE_${mut}=1" cargo test -p boatramp-node \
+              --features s3-sealed-cred-gate-mutation --lib \
+              s3_credential::gate::s3_sealed_cred_sourcing_gate \
+              > "s3-sealed-cred-mut-${mut}.log" 2>&1; then
+              echo "::error::s3 sealed-cred gate is HOLLOW — it PASSED with BOATRAMP_S3SEALED_MUTATE_${mut}=1 (that security check is not load-bearing)" >&2
+              exit 1
+            else
+              echo "s3 sealed-cred mutation verified: BOATRAMP_S3SEALED_MUTATE_${mut}=1 fails the gate as expected."
+            fi
+          done
 
   deny:
     name: cargo-deny

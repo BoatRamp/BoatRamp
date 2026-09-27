@@ -5,6 +5,47 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.6.1] - UNRELEASED
+
+Additive, non-breaking. Sealed-store sourcing for the base S3 credential (#505).
+
+### Added
+
+- **Node-level sealed base S3 credential (`[serve.s3_credential]`, #505).** The S3 blob **object
+  backend** (`--blobs s3`) and the AWS blob-upload **cloud minter** (`[serve.s3_ingress_cloud]`) can
+  now source their base AWS credential from boatramp's `[secrets]` sealed store instead of the ambient
+  `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` env chain. ONE shared node-level source feeds BOTH (it is
+  the same bucket key). Shape:
+
+  ```ron
+  ( serve: ( s3_credential: (
+      access_key_id: "tid_public_akid",              // a public identifier — plain config
+      secret_access_key: "boatramp:tigris-secret",   // a sealed secret REFERENCE, not the secret
+  ) ) )
+  ```
+
+  The `secret_access_key` is a secret **reference** in the same scheme a guest `secrets` map uses:
+  `boatramp:<name>` (the project-scoped sealed store, resolved under the reserved default project via
+  the `[secrets]` `KeyEnvelope` — mirrors `ManagedSqlCredentials`), or `env:<VAR>` / a bare `<VAR>`
+  (the operator's own environment, honored only when the posture's `allow_env_secret_refs` is set). The
+  resolved plaintext is held in memory only and is **redacted from `Debug`/logs** (never
+  env/argv/git). Seal it once with `boatramp secrets set` (default project), then reference it here.
+
+  - **Fail-closed:** a `boatramp:`/`env:` sealed ref configured with NO `[secrets]` envelope is a
+    **startup error** — boatramp does NOT silently fall back to the ambient env chain (that would mask
+    the misconfig).
+  - **Backward compatible:** with `[serve.s3_credential]` **absent**, the ambient AWS env chain is
+    used exactly as before (unchanged).
+  - **Cluster note:** on a cluster, the blob storage is built before the replicated control plane, so a
+    `boatramp:` (KV-backed) node-cred ref is refused fail-closed with a clear message — use an
+    `env:<VAR>` ref there. (A KV-backed cluster node-cred is a documented follow-up.)
+  - The SlateDB R2/S3 control-plane KV store (`--kv-s3`) still uses the ambient AWS env chain (out of
+    scope this release).
+
+  Mutation-verified by the `S3 SEALED-CRED SOURCING OK` CI gate (a configured source uses the SEALED
+  value not the env value; a no-envelope ref fails closed; the secret is redacted from `Debug`; absent
+  ⇒ the ambient chain).
+
 ## [0.6.0] - 2026-09-27
 
 Local-development surfaces (#501) — a **breaking** release. The major-version bump signals a
