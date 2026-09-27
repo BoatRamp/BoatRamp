@@ -107,6 +107,20 @@ blob-upload-cloud = ["blob-upload-aws", "blob-upload-gcs", "blob-upload-azure"]
 # (must pass) then once per mutation (must fail).
 s3-ingress-gate-mutation = ["blob-upload"]
 
+# TEST-ONLY, NEVER SHIPPED: the mutation-verified `BLOB DRAIN DAEMON-MEDIATED OK` gate (v0.6.3) for
+# the daemon-mediated blob drain (`POST /api/blob-drain`). When ON, the `blob_drain::gate` battery
+# compiles and drives a real `DeployStore` over a `FallbackStorage(primary=fs, secondary=fs)` in
+# tempdirs (so it needs `boatramp-storage`'s `fs` + `fallback`), then prints the marker. Each
+# `BOATRAMP_BLOBDRAIN_MUTATE_*` env var neuters exactly one invariant (reverse the drain direction /
+# delete from the source / ignore a missing fallback / downgrade the route authz), so CI can prove
+# each is load-bearing by asserting the mutation FAILS the gate. The D4 authz seam is plumbed to
+# `boatramp-core`/`boatramp-types` via `blob-drain-gate-mutation`. Compiled OUT of every real build.
+blob-drain-gate-mutation = [
+  "boatramp-core/blob-drain-gate-mutation",
+  "boatramp-storage/fs",
+  "boatramp-storage/fallback",
+]
+
 # The duplex/resumable session capability (`boatramp:handlers/session`, PLAN-session-primitive):
 # a long-lived, client-addressable, bidirectional, resumable channel the host drives via
 # event-driven re-entry over the durable async lane. Implies `handlers`. Experimental.
@@ -205,6 +219,14 @@ subtle.workspace = true
 aws-lc-rs = "1.17"
 # Implementing the core `DomainProbe` trait (domain ownership verification).
 async-trait.workspace = true
+
+# The backend-agnostic blob-backend migration copy engine (`blob_migrate::migrate`, over the
+# `Storage` trait) the daemon-mediated blob drain (`POST /api/blob-drain`, v0.6.3) runs against its
+# own configured `[serve.blob_fallback]` `drain_pair`. The `blob_migrate` module is always compiled
+# (no backend feature needed) so the server stays backend-agnostic — the node supplies the concrete
+# `Arc<dyn Storage>`. (Inherits the workspace default `fs` feature, which is tiny; the server never
+# constructs a concrete backend, only drives the trait.)
+boatramp-storage = { workspace = true }
 
 # Public-DNS TXT resolver for the `domain-verify-dns` feature (DNS ownership
 # method). Optional; the HTTP-token method needs no resolver.
@@ -356,6 +378,9 @@ hyper = { workspace = true, features = ["server", "http1"] }
 tokio-tungstenite = { version = "0.24", default-features = false, features = [
   "connect",
 ] }
+# The `blob_drain::gate` battery (feature `blob-drain-gate-mutation`) drives a real DeployStore over
+# a `FallbackStorage(primary=fs, secondary=fs)` in scratch directories.
+tempfile = "3"
 
 [lints]
 workspace = true

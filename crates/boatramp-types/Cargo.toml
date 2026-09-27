@@ -13,6 +13,15 @@ authors.workspace = true
 repository.workspace = true
 description = "Shared, wasm-clean wire types + routing/config logic for boatramp (used by the server, CLI, and the edge Worker so the wire format and routing can't drift)"
 
+[features]
+# TEST-ONLY, NEVER SHIPPED: the D4 authz mutation seam for the `BLOB DRAIN DAEMON-MEDIATED OK`
+# gate (v0.6.3). When ON AND `BOATRAMP_BLOBDRAIN_MUTATE_LOWER_AUTHZ` is set, `Right::required`
+# downgrades `POST /api/blob-drain` from `System·Admin` to a project-scoped `Deploy` right — the
+# exact escalation a bad routing/table change would introduce — so the gate can prove the arm is
+# load-bearing (the mutation must FAIL the gate). Plumbed from `boatramp-server`'s gate feature via
+# `boatramp-core`. Compiled OUT of every real build.
+blob-drain-gate-mutation = []
+
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true

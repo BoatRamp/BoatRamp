@@ -221,4 +221,33 @@ pub trait Storage: Send + Sync {
     fn allows_prune(&self) -> bool {
         true
     }
+
+    /// If this backend is a read-fallback composite mid-transition, the two halves it can
+    /// drain: the read-only OLD secondary (`source`) into the NEW primary (`dest`). Returns
+    /// `None` for an ordinary single backend (nothing to drain).
+    ///
+    /// This is the daemon-mediated drain's *only* input: the client names **no** source or
+    /// destination — the running daemon drains **exactly** its own configured
+    /// `[serve.blob_fallback]` pair (see `POST /api/blob-drain`). A `FallbackStorage`
+    /// (blob-backend migration Part 2) returns `Some(DrainPair { source: secondary, dest:
+    /// primary })`; a `CachedStorage` delegates to its inner backend. Mirrors the
+    /// [`allows_prune`](Self::allows_prune) opt-in shape: a default of `None` so every ordinary
+    /// backend is unaffected, and the composite overrides it.
+    fn drain_pair(&self) -> Option<DrainPair> {
+        None
+    }
+}
+
+/// The two halves of a read-fallback composite ([`FallbackStorage`]) a daemon-mediated drain
+/// copies between: the read-only OLD `source` (the configured `[serve.blob_fallback]` secondary)
+/// into the NEW `dest` (the primary). Returned from [`Storage::drain_pair`]; the daemon copies
+/// `source` → `dest` with `boatramp_storage::blob_migrate::migrate`, so after a verified drain the
+/// secondary holds no object the primary lacks and can be removed.
+///
+/// [`FallbackStorage`]: crate::Storage
+pub struct DrainPair {
+    /// The read-only OLD secondary — the drain SOURCE (never written or deleted).
+    pub source: std::sync::Arc<dyn Storage>,
+    /// The NEW primary — the drain DESTINATION (gains every object the secondary still holds).
+    pub dest: std::sync::Arc<dyn Storage>,
 }

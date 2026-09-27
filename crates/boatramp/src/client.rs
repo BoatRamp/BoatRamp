@@ -360,6 +360,31 @@ fn sanitize(url: &str) -> String {
         .collect()
 }
 
+/// Print one daemon-mediated blob-drain progress snapshot to stderr (a `"type":"progress"` NDJSON
+/// line). Kept on stderr so stdout carries only the final report (`--json` stays parseable). Best
+/// effort — a missing field renders `?`.
+fn print_drain_progress(v: &serde_json::Value) {
+    let n = |k: &str| {
+        v.get(k)
+            .and_then(serde_json::Value::as_u64)
+            .map(|x| x.to_string())
+            .unwrap_or_else(|| "?".to_string())
+    };
+    let dry = v
+        .get("dry_run")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    eprintln!(
+        "blob drain{}: {} / {} object(s) — copied {}, skipped {}, {} byte(s)",
+        if dry { " (dry-run)" } else { "" },
+        n("done"),
+        n("total"),
+        n("copied"),
+        n("skipped"),
+        n("copied_bytes"),
+    );
+}
+
 /// The control plane's reply to a deployment negotiation (`POST …/deployments`):
 /// the new deployment id and the blob hashes it is still missing (the ones the
 /// client must upload). Shared by `sync` and `apply`.
@@ -1714,6 +1739,82 @@ impl ControlPlane {
             .await?
             .error_for_status()?;
         Ok(())
+    }
+
+    /// Trigger the daemon-mediated blob drain (`POST /api/blob-drain`, `System·Admin`, v0.6.3): the
+    /// running daemon drains its OWN configured `[serve.blob_fallback]` secondary → primary. The body
+    /// names no source/dest (the daemon uses its own pair). Consumes the streamed **NDJSON** response
+    /// (`application/x-ndjson`): each `\n`-delimited line is a JSON object — a `"type":"progress"`
+    /// snapshot (printed to stderr as it arrives so a long copy shows liveness) or the FINAL
+    /// `"type":"report"` object, which is returned. A `422` (no fallback configured) or any non-2xx is
+    /// surfaced verbatim as [`ClientError::Refused`] (mirrors [`migrate_trigger`](Self::migrate_trigger)'s
+    /// 200-vs-error branching); the caller decides the exit code from the returned report's fields.
+    pub async fn blob_drain(
+        &self,
+        dry_run: bool,
+        concurrency: Option<usize>,
+        prefix: Option<&str>,
+    ) -> Result<serde_json::Value> {
+        use futures::StreamExt;
+        let Self {
+            http, base: server, ..
+        } = self;
+        let body = serde_json::json!({
+            "dry_run": dry_run,
+            "concurrency": concurrency,
+            "prefix": prefix,
+        });
+        let resp = http
+            .post(format!("{server}/api/blob-drain"))
+            .json(&body)
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            // 422 = no [serve.blob_fallback] configured; any other non-2xx = refused/error. The body is
+            // a small JSON error object (or text) — surface it verbatim.
+            let text = resp.text().await.unwrap_or_default();
+            return Err(ClientError::Refused(format!(
+                "blob drain refused ({status}): {}",
+                text.trim()
+            )));
+        }
+
+        // Consume the NDJSON stream: accumulate raw bytes, split on `\n`, parse each complete line.
+        // Progress lines print to stderr; the LAST parsed object is the final report (returned).
+        let mut stream = resp.bytes_stream();
+        let mut buf: Vec<u8> = Vec::new();
+        let mut last_report: Option<serde_json::Value> = None;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            buf.extend_from_slice(&chunk);
+            // Drain every complete `\n`-terminated line out of the buffer.
+            while let Some(nl) = buf.iter().position(|&b| b == b'\n') {
+                let line: Vec<u8> = buf.drain(..=nl).collect();
+                let text = String::from_utf8_lossy(&line);
+                let text = text.trim();
+                if text.is_empty() {
+                    continue;
+                }
+                let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
+                    // A malformed line is non-fatal — skip it (the daemon only emits valid JSON lines).
+                    continue;
+                };
+                match value.get("type").and_then(serde_json::Value::as_str) {
+                    Some("report") => last_report = Some(value),
+                    // A progress snapshot — show liveness on stderr, keep stdout clean for the report.
+                    _ => print_drain_progress(&value),
+                }
+            }
+        }
+        // A well-behaved daemon always ends with a report line; if the stream closed without one,
+        // surface it rather than pretending success.
+        last_report.ok_or_else(|| {
+            ClientError::Refused(
+                "blob drain stream ended without a final report (connection cut? re-run to resume)"
+                    .to_string(),
+            )
+        })
     }
 
     /// Hash a local file and upload it as a blob; returns its content-address.

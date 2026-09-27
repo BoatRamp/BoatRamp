@@ -246,6 +246,20 @@ impl Storage for FallbackStorage {
     fn allows_prune(&self) -> bool {
         false
     }
+
+    /// The two halves the daemon-mediated drain (`POST /api/blob-drain`) copies between: the
+    /// read-only OLD `secondary` (source) into the NEW `primary` (dest). The client names no
+    /// backends — the daemon drains EXACTLY this configured pair, then (on a verified drain) the
+    /// operator removes `[serve].blob_fallback` and restarts. Direction is fixed here (source =
+    /// the read-only secondary, dest = the write-authoritative primary) so a client can never
+    /// reverse it. Overrides the trait default of `None` (an ordinary single backend has nothing
+    /// to drain).
+    fn drain_pair(&self) -> Option<boatramp_core::DrainPair> {
+        Some(boatramp_core::DrainPair {
+            source: self.secondary.clone(),
+            dest: self.primary.clone(),
+        })
+    }
 }
 
 #[cfg(test)]

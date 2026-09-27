@@ -559,6 +559,38 @@ impl Right {
             p if p == "/api/authz/policy" || p.starts_with("/api/authz/") => {
                 Self::new(Resource::System, None, Action::Admin)
             }
+            // The daemon-mediated blob drain (`POST /api/blob-drain`, v0.6.3): the running node
+            // drains its OWN configured `[serve.blob_fallback]` secondary → primary. This is a
+            // NODE-level maintenance op (like prune/scrub/sql-move) — it touches every tenant's
+            // objects on the node's blob store and is not scoped to a project — so it is gated at
+            // `system·admin`, never a per-project right a tenant token satisfies. The SINGULAR,
+            // HYPHENATED path is deliberate: it does NOT match the `/api/blobs/` (Blobs·Deploy)
+            // prefix matcher above (that requires a literal `/api/blobs/` — a ship-only publisher
+            // holds `Blobs·Deploy`, so a collision would be an ESCALATION), nor the exact
+            // `/api/blobs` / `/api/blob-mint-upload` arms. Gated explicitly here (above the
+            // deny-safe `_` default that resolves the same, so a routing/table regression is
+            // visible) and re-checked defense-in-depth at the handler.
+            "/api/blob-drain" => {
+                // GATE MUTATION SEAM (D4, the crux): under `blob-drain-gate-mutation` +
+                // `BOATRAMP_BLOBDRAIN_MUTATE_LOWER_AUTHZ`, downgrade this node-level op to a
+                // project-scoped `Deploy` right — the exact escalation a bad routing/table change
+                // would introduce (a ship-only Deploy token could then trigger the drain). The
+                // gate proves the check is load-bearing: a Deploy/Project·Admin token must NOT
+                // satisfy the required right, so the mutation FAILS the gate. Compiled OUT of every
+                // real build.
+                #[cfg(feature = "blob-drain-gate-mutation")]
+                if std::env::var("BOATRAMP_BLOBDRAIN_MUTATE_LOWER_AUTHZ")
+                    .map(|v| !v.is_empty() && v != "0")
+                    .unwrap_or(false)
+                {
+                    return Some(Self::new(
+                        Resource::Project,
+                        Some(default_project.clone()),
+                        Action::Deploy,
+                    ));
+                }
+                Self::new(Resource::System, None, Action::Admin)
+            }
             // Any other `/api/*` path: deny-safe (must hold system·admin).
             _ => Self::new(Resource::System, None, Action::Admin),
         };

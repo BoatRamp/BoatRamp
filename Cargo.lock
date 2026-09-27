@@ -1926,6 +1926,7 @@ dependencies = [
  "sha1 0.10.6",
  "sha2 0.10.9",
  "subtle",
+ "tempfile",
  "thiserror 2.0.18",
  "time",
  "tokio",
@@ -1972,8 +1973,11 @@ dependencies = [
  "sqlparser",
  "sqlx",
  "subtle",
+ "tempfile",
+ "thiserror 2.0.18",
  "tokio",
  "tokio-util",
+ "tracing",
 ]
 
 [[package]]

@@ -130,12 +130,9 @@ tls = []
 # gate is load-bearing by asserting every mutation FAILS it. Implies `s3` (the backend-injection assert)
 # so the whole path is exercised on the host toolchain (no live cloud).
 s3-sealed-cred-gate-mutation = ["s3"]
-# CI gate lane for Part 1 of the blob-backend migration (`BLOB MIGRATE COMPLETE OK`). When ON, the
-# `blob_migrate::gate` battery compiles + each `BOATRAMP_BLOBMIG_MUTATE_*` env var neuters exactly
-# ONE invariant (via a `#[cfg(feature = "blob-migrate-gate-mutation")]` seam), so CI can prove the
-# gate is load-bearing by asserting every mutation FAILS it. Implies `fs` (the gate runs entirely
-# fs→fs in a tempdir — no cloud — so it pulls `boatramp-storage`'s `FsStorage`).
-blob-migrate-gate-mutation = ["fs"]
+# NOTE: the Part-1 `BLOB MIGRATE COMPLETE OK` gate (feature `blob-migrate-gate-mutation`) moved to
+# `boatramp-storage` in v0.6.3, together with the `blob_migrate` copy engine it exercises. Enable it
+# as `cargo test -p boatramp-storage --features blob-migrate-gate-mutation` (see that crate + ci.yml).
 # CI gate lane for Part 2 of the blob-backend migration (`BLOB FALLBACK ZERO-GAP OK`). When ON, the
 # `blob_fallback::gate` battery compiles + each `BOATRAMP_BLOBFB_MUTATE_*` env var neuters exactly
 # ONE invariant (via a `#[cfg(feature = "blob-fallback-gate-mutation")]` seam), so CI can prove the
