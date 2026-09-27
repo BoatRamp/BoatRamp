@@ -1674,6 +1674,185 @@ pub(super) async fn repair_dry_run(
 }
 
 // ---------------------------------------------------------------------------
+// Declarative managed-database front door (`PUT /api/projects/{proj}/databases/{name}`
+// + `POST …/ensure`, GET reads) — v0.6.0, #501 Stage B.
+// ---------------------------------------------------------------------------
+
+/// Map a [`DeclareError`](boatramp_core::sql::DeclareError) to an HTTP response. The
+/// structured reason rides in the body; the status distinguishes the security refusals
+/// (`409` daemon-conflict / identity-change) from a missing declaration (`404`), an
+/// unavailable capability (`501`), and a generic bad request (`400`).
+fn declare_error_response(err: boatramp_core::sql::DeclareError) -> Response {
+    use boatramp_core::sql::DeclareError as E;
+    let status = match &err {
+        E::NotConfigured => StatusCode::NOT_IMPLEMENTED,
+        E::DaemonConflict(_) | E::IdentityChange { .. } => StatusCode::CONFLICT,
+        E::NotDeclared(_) => StatusCode::NOT_FOUND,
+        E::Other(_) => StatusCode::BAD_REQUEST,
+    };
+    (status, format!("{err}\n")).into_response()
+}
+
+/// The `501` when the node wired no [`ManagedDbDeclare`] capability (no managed SQL engine
+/// / no `[secrets]` envelope), mirroring [`repair_unavailable`].
+fn declare_unavailable() -> Response {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        "managed database declaration is not available on this node (no managed SQL engine \
+         / no [secrets] envelope configured)\n",
+    )
+        .into_response()
+}
+
+/// Defense-in-depth (the `/api/repair` escalation lesson, Security HIGH-1): re-derive the
+/// right the authoritative table requires for a `databases` DECLARE (a `PUT`) on THIS
+/// project and assert it is `Project·Admin` before touching the privileged
+/// declare/provision path. The auth middleware already enforced it; this is a second,
+/// independent check inside the handler so a future routing/table regression can't
+/// silently downgrade the gate below the migrate/repair-grade owner right. Reconstructs
+/// the canonical path from the resolved `ProjectContext` (default → the global form, else
+/// the project-scoped form). Returns `Some(403)` if — against expectation — the required
+/// right is not Admin.
+fn assert_databases_is_admin(project: &str) -> Option<Response> {
+    use boatramp_core::authz::{Action, Right};
+    let path = if project == boatramp_core::project::DEFAULT_PROJECT {
+        "/api/databases/_".to_string()
+    } else {
+        format!("/api/projects/{project}/databases/_")
+    };
+    match Right::required("PUT", &path) {
+        Some(right) if right.action == Action::Admin => None,
+        _ => Some(
+            (
+                StatusCode::FORBIDDEN,
+                "declaring a managed database requires Project·Admin\n",
+            )
+                .into_response(),
+        ),
+    }
+}
+
+/// `PUT /api/projects/{proj}/databases/{name}` — declare (persist + eagerly provision) a
+/// managed database from a manifest `databases:` entry (the typed
+/// [`ApplyDatabase`](boatramp_core::compute::ApplyDatabase) body). `Project·Admin`
+/// (it mints owner-role identities — the migrate/repair-grade gate). Enforces
+/// daemon-config-wins, identity-change refusal, and caller's-project binding server-side.
+pub(super) async fn declare_database(
+    Extension(project): Extension<ProjectContext>,
+    Extension(declare): Extension<Option<Arc<dyn boatramp_core::sql::ManagedDbDeclare>>>,
+    Path(name): Path<String>,
+    Json(db): Json<boatramp_core::compute::ApplyDatabase>,
+) -> Response {
+    if let Some(bad) = reject_invalid_db(&name) {
+        return bad;
+    }
+    if let Some(forbidden) = assert_databases_is_admin(project.as_ref().as_str()) {
+        return forbidden;
+    }
+    let Some(declare) = declare else {
+        return declare_unavailable();
+    };
+    match declare.declare(project.as_ref().as_str(), &name, &db).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => declare_error_response(e),
+    }
+}
+
+/// `POST /api/projects/{proj}/databases/{name}/ensure` — re-provision an ALREADY-declared
+/// managed database idempotently (the eager-provision hook). `Project·Admin`.
+pub(super) async fn ensure_database(
+    Extension(project): Extension<ProjectContext>,
+    Extension(declare): Extension<Option<Arc<dyn boatramp_core::sql::ManagedDbDeclare>>>,
+    Path(name): Path<String>,
+) -> Response {
+    if let Some(bad) = reject_invalid_db(&name) {
+        return bad;
+    }
+    if let Some(forbidden) = assert_databases_is_admin(project.as_ref().as_str()) {
+        return forbidden;
+    }
+    let Some(declare) = declare else {
+        return declare_unavailable();
+    };
+    match declare.ensure(project.as_ref().as_str(), &name).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => declare_error_response(e),
+    }
+}
+
+/// `GET /api/projects/{proj}/databases` — list the project's declared managed databases
+/// (read-only; `Project·Read`). Each is the stored typed
+/// [`ApplyDatabase`](boatramp_core::compute::ApplyDatabase).
+pub(super) async fn list_databases(
+    State(deploy): State<DeployStore>,
+    Extension(project): Extension<ProjectContext>,
+) -> Response {
+    match deploy.list_project_databases(project.as_ref()).await {
+        Ok(dbs) => Json(dbs).into_response(),
+        Err(err) => deploy_error_response(err),
+    }
+}
+
+/// `GET /api/projects/{proj}/databases/{name}` — the one declared managed database, or
+/// `404` if the project declared none by that name (read-only; `Project·Read`).
+pub(super) async fn get_database(
+    State(deploy): State<DeployStore>,
+    Extension(project): Extension<ProjectContext>,
+    Path(name): Path<String>,
+) -> Response {
+    if let Some(bad) = reject_invalid_db(&name) {
+        return bad;
+    }
+    match deploy.get_project_database(project.as_ref(), &name).await {
+        Ok(Some(db)) => Json(db).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            format!("no declared managed database {name:?} in this project\n"),
+        )
+            .into_response(),
+        Err(err) => deploy_error_response(err),
+    }
+}
+
+/// `GET /api/projects/{proj}/databases/{name}/status` — a read-only status view of a
+/// declared managed database: the stored declaration plus whether it is registered as a
+/// compute workload yet (a coarse "provisioned" signal for `boatramp db status`).
+/// `Project·Read`. Never returns a secret.
+pub(super) async fn database_status(
+    State(deploy): State<DeployStore>,
+    Extension(project): Extension<ProjectContext>,
+    Path(name): Path<String>,
+) -> Response {
+    if let Some(bad) = reject_invalid_db(&name) {
+        return bad;
+    }
+    let db = match deploy.get_project_database(project.as_ref(), &name).await {
+        Ok(Some(db)) => db,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                format!("no declared managed database {name:?} in this project\n"),
+            )
+                .into_response();
+        }
+        Err(err) => return deploy_error_response(err),
+    };
+    // The derived per-project server workload name (same derivation as the declare path,
+    // `bramp-db-<project>-<name>`) — the operator-visible handle for the managed server.
+    // A read-only view: it reports the DECLARATION only, never a secret. Where the
+    // workload is registered (default project for `Shared`, the caller's project for a
+    // `Single` tenant) varies by isolation, so the coarse "declared" fact is what a status
+    // view honestly asserts.
+    let workload = format!("bramp-db-{}-{}", project.as_ref().as_str(), name);
+    Json(serde_json::json!({
+        "database": db,
+        "workload": workload,
+        "declared": true,
+    }))
+    .into_response()
+}
+
+// ---------------------------------------------------------------------------
 // Operator S3 upload-credential minting (`POST /api/blob-mint-upload`) — M3
 // ---------------------------------------------------------------------------
 
