@@ -497,7 +497,7 @@ impl Right {
             // A `PUT` (declare) / `POST …/ensure` mints owner-role identities as the superuser
             // (CREATE ROLE / owner-role DDL), so — exactly like `/api/migrate/` and
             // `/api/repair/` above — the mutating verbs gate at **`Project·Admin`**, NEVER the
-            // deploy-grade publisher right the project-owned catch-alls use (a ship-only
+            // deploy-grade publisher right the project-owned catch-all arms use (a ship-only
             // publisher must not be able to provision a database). Read-only `GET` (ls/get/
             // status) needs only `Project·Read`. Its OWN prefix, gated explicitly, so a
             // publisher can never reach the declare/provision path (the escalation lesson).
