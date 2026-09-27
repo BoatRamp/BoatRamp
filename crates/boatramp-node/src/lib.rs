@@ -29,6 +29,11 @@ pub mod handlers;
 // engine. The sqlx-specific items inside the module stay gated on the sqlx features.
 #[cfg(any(feature = "sql-postgres", feature = "sql-mysql", feature = "migrate"))]
 pub mod managed_sql;
+// The project-scoped declarative managed-database front door (#501 Stage B): lowering
+// + the two-source merge point + the `ManagedDbDeclare` capability. Needs a sqlx engine
+// (it provisions a Postgres/MySQL managed DB).
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+pub mod managed_db_declare;
 pub mod node;
 #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
 pub mod repair;
