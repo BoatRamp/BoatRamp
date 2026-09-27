@@ -2006,6 +2006,17 @@ pub enum DeclareError {
     /// The `ensure` verb was called for a database that has not been declared. `404`.
     #[error("managed database {0:?} has not been declared in this project")]
     NotDeclared(String),
+    /// Declaring this database would exceed an operator-configured per-project ceiling
+    /// (#501 Stage B MEDIUM-1 — the disk-exhaustion / errno-28 guard): either the maximum
+    /// NUMBER of declared databases per project, or the maximum AGGREGATE provisioned
+    /// volume per project. Refused fail-closed BEFORE any provision. `422`.
+    #[error("managed database {db:?}: {reason} (per-project managed-database ceiling)")]
+    QuotaExceeded {
+        /// The declared database name.
+        db: String,
+        /// Which ceiling was hit + the numbers (count or aggregate-volume).
+        reason: String,
+    },
     /// The declaration or provision failed (a store write, a lowering/validation error,
     /// or the provision itself). `400`.
     #[error("{0}")]

@@ -660,17 +660,24 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
     #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
     let managed_db_declare: Option<Arc<dyn boatramp_core::sql::ManagedDbDeclare>> =
         declare_envelope.map(|envelope| {
-            let static_dbs = config
+            let sql_cfg = config
                 .handlers
                 .as_ref()
-                .and_then(|h| h.bindings.sql.as_ref())
-                .map(|sql| sql.databases.clone())
-                .unwrap_or_default();
+                .and_then(|h| h.bindings.sql.as_ref());
+            let static_dbs = sql_cfg.map(|sql| sql.databases.clone()).unwrap_or_default();
+            // Per-project declaration ceilings (#501 Stage B MEDIUM-1 — the disk-exhaustion
+            // guard): the operator's `max_declared_databases`/`max_declared_volume_mib`, or
+            // the built-in `apply_db_caps` defaults (16 DBs / 512 GiB) when unset.
+            let quota = crate::managed_db_declare::DeclareQuota::from_config(
+                sql_cfg.and_then(|sql| sql.max_declared_databases),
+                sql_cfg.and_then(|sql| sql.max_declared_volume_mib),
+            );
             Arc::new(crate::managed_db_declare::NodeManagedDbDeclare::new(
                 static_dbs,
                 deploy.clone(),
                 kv.clone(),
                 envelope,
+                quota,
             )) as Arc<_>
         });
     #[cfg(not(any(feature = "sql-postgres", feature = "sql-mysql")))]

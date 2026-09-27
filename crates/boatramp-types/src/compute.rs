@@ -468,6 +468,22 @@ pub mod apply_db_caps {
     /// Maximum `startup_grace_secs` a manifest may request (bounds how long a
     /// never-healthy replica is left running before the reconcile relaunches it).
     pub const MAX_STARTUP_GRACE_SECS: u32 = 600;
+
+    /// Default operator ceiling on the **number** of declared databases a single
+    /// project may hold (#501 Stage B MEDIUM-1 — the disk-exhaustion / errno-28 guard).
+    /// Each declared DB eagerly provisions a 10–200 GiB volume, so without a per-project
+    /// cap a `Project·Admin` could declare an unbounded number and exhaust the node's
+    /// disk. Operator-overridable via `handlers.bindings.sql.max_declared_databases`;
+    /// enforced fail-closed at `declare`.
+    pub const DEFAULT_MAX_DECLARED_DATABASES_PER_PROJECT: usize = 16;
+
+    /// Default operator ceiling on the **aggregate provisioned volume** (MiB) across all
+    /// of a project's declared databases (#501 Stage B MEDIUM-1). 512 GiB — comfortably
+    /// above the 16-DB count cap at the Small preset (16 × 10 GiB = 160 GiB) yet a hard
+    /// backstop against a handful of Large (200 GiB) declarations. Operator-overridable
+    /// via `handlers.bindings.sql.max_declared_volume_mib`; enforced fail-closed at
+    /// `declare` by summing the existing declarations' volumes + the incoming one.
+    pub const DEFAULT_MAX_DECLARED_VOLUME_MIB: u64 = 512 * 1024;
 }
 
 /// A **declared managed database** in an [`ApplyManifest`](crate) `databases:` block

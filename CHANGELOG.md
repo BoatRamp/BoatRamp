@@ -127,7 +127,8 @@ refusal, which rejects attaching a not-yet-verified hostname. That refusal is a 
   ```
 
 - **Project-scoped binding persistence + node merge.** A declared database is persisted to a new
-  control-plane store at **`project-database/{project}/{name}`** (cluster-replicated). The live
+  control-plane store at **`project/{project}/database/{name}`** (cluster-replicated, under the
+  `project/<proj>/` prefix so a `purge_project` teardown reaps it). The live
   binding resolution consults BOTH this per-project store AND the node-static
   `[handlers].bindings.sql.databases` map at ONE merge point, where **daemon-static config WINS,
   fail-closed on a same-name conflict** — a project manifest may never shadow / override / downgrade a
@@ -153,6 +154,26 @@ refusal, which rejects attaching a not-yet-verified hostname. That refusal is a 
   project's declared databases (read-only). There is deliberately **NO `db create`** — the manifest
   `databases:` block is the SOLE authoring surface (a create verb would compete as a second source of
   truth).
+
+- **Stage B Security-review hardening.**
+  - **Injective server-workload derivation (HIGH-1).** The derived per-project managed-DB server
+    workload name is now **injective over the `(project, name)` pair** — folded through the codebase's
+    existing collision-resistant identifier digest (a length-prefixed pair encoding → the 128-bit
+    SHA-256/base-36 disambiguator that keeps `sanitize_ident` injective) rather than a `bramp-db-
+    {project}-{name}` hyphen-join. Because `-` is legal in both a project and a database name, the old
+    join was ambiguous (`("acme-app","db")` and `("acme","app-db")` both → `bramp-db-acme-app-db`);
+    since a `Shared` server workload and its superuser credential are registered under the reserved
+    default project (a node-global namespace), two distinct projects could have collided onto ONE
+    server and SHARED its superuser credential. The digest keeps every distinct pair distinct.
+  - **Per-project managed-database ceilings (MEDIUM-1).** A `Project·Admin` can no longer declare an
+    unbounded number of databases (each eagerly provisioning a 10–200 GiB volume). Two
+    operator-configurable per-project ceilings — `handlers.bindings.sql.max_declared_databases` (count,
+    default 16) and `handlers.bindings.sql.max_declared_volume_mib` (aggregate volume, default 512 GiB)
+    — are enforced **fail-closed at declare** (a `422` before any provision), counting/summing the
+    project's existing declarations plus the incoming one (a same-name re-apply consumes no fresh slot).
+  - **Reserved `bramp-db-` compute prefix (LOW-2).** The `bramp-db-` compute-workload prefix is reserved
+    for derived managed-DB servers; a static `[handlers].bindings.sql.databases.*.compute` that uses it
+    is now refused fail-closed at config load.
 
 ## [0.5.9] - 2026-09-27
 
