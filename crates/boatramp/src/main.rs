@@ -36,6 +36,7 @@ mod access;
 mod acme_dns;
 mod alias;
 mod apply;
+mod apply_migrate;
 mod authcmd;
 mod blob;
 mod build;

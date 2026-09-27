@@ -43,6 +43,9 @@ pub enum Error {
     /// The server rejected the config (validate-before-commit).
     #[error("server rejected the config: {0}")]
     Rejected(String),
+    /// Migrating an `apply` manifest to the current schema failed.
+    #[error(transparent)]
+    Migrate(#[from] crate::apply::Error),
 }
 
 /// `config` module result; `Err` is [`Error`].
@@ -87,6 +90,18 @@ enum ConfigCommand {
         /// Dotted key.
         key: String,
     },
+    /// Upgrade an `apply` manifest to the current schema (v0.6.0). Runs the manifest
+    /// migration pipeline on `<file>` (which must declare an older `version: N`) and
+    /// prints the upgraded manifest, or rewrites it in place with `--write`. The
+    /// upgraded output omits `version:` (current = absent). Purely client-side — no
+    /// server is contacted.
+    Migrate {
+        /// The manifest file to upgrade.
+        file: PathBuf,
+        /// Rewrite the file in place instead of printing to stdout.
+        #[arg(long)]
+        write: bool,
+    },
 }
 
 /// The `GET /api/daemon/config` response.
@@ -98,7 +113,7 @@ struct ConfigResponse {
 
 /// Entry point for `boatramp config`.
 pub async fn run(args: ConfigArgs, config: &ProjectConfig) -> Result<()> {
-    // `list` / `describe` are static — no server needed.
+    // `list` / `describe` / `migrate` are static — no server needed.
     match &args.command {
         ConfigCommand::List => {
             print_list();
@@ -107,6 +122,9 @@ pub async fn run(args: ConfigArgs, config: &ProjectConfig) -> Result<()> {
         ConfigCommand::Describe { key } => {
             describe(key);
             return Ok(());
+        }
+        ConfigCommand::Migrate { file, write } => {
+            return migrate_manifest(file, *write);
         }
         _ => {}
     }
@@ -117,8 +135,29 @@ pub async fn run(args: ConfigArgs, config: &ProjectConfig) -> Result<()> {
         ConfigCommand::Set { key, value } => set(&http, &server, &key, &value).await,
         ConfigCommand::Rollback => rollback(&http, &server).await,
         ConfigCommand::Apply { file } => apply(&http, &server, &file).await,
-        ConfigCommand::List | ConfigCommand::Describe { .. } => unreachable!("handled above"),
+        ConfigCommand::List | ConfigCommand::Describe { .. } | ConfigCommand::Migrate { .. } => {
+            unreachable!("handled above")
+        }
     }
+}
+
+/// `boatramp config migrate <file> [--write]`: run the `apply` manifest migration
+/// pipeline on `file` and print (or, with `--write`, rewrite in place) the upgraded
+/// manifest. The upgraded output omits `version:` (current = absent). Client-side
+/// only — no server is contacted; the migration's advisory warnings go to stderr.
+fn migrate_manifest(file: &std::path::Path, write: bool) -> Result<()> {
+    let text = std::fs::read_to_string(file)?;
+    // Runs the full loose-parse → migrate → typed pipeline (a version-less or
+    // already-current manifest is a no-op that simply re-renders as current).
+    let manifest = crate::apply::ApplyManifest::parse(&text)?;
+    let upgraded = crate::apply_migrate::render_manifest(&manifest)?;
+    if write {
+        std::fs::write(file, &upgraded)?;
+        eprintln!("upgraded {} to the current (v0.6.0) schema", file.display());
+    } else {
+        print!("{upgraded}");
+    }
+    Ok(())
 }
 
 async fn fetch(http: &crate::client::ApiClient, server: &str) -> Result<ConfigResponse> {

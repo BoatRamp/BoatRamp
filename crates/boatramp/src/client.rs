@@ -1165,6 +1165,29 @@ impl ControlPlane {
         Ok(())
     }
 
+    /// Register one **trusted operation** in the project's GraphQL safelist
+    /// (`POST .../graphql/safelist`), the same endpoint `boatramp graphql safelist add`
+    /// uses. The server runs its `guard_query`→`register` validation, so a malformed op
+    /// is rejected server-side; registration is idempotent (an already-registered op
+    /// re-registers to the same hash). **Register-only** — this never deletes/prunes.
+    /// Project-scoped via `project_seg` (`graphql` for the default project, else
+    /// `projects/<proj>/graphql`).
+    pub async fn register_graphql_safelist(&self, query: &str) -> Result<()> {
+        let seg = project_seg(&self.project, "graphql");
+        let Self {
+            http: client,
+            base: server,
+            ..
+        } = self;
+        client
+            .post(format!("{server}/api/{seg}/safelist"))
+            .json(&serde_json::json!({ "query": query }))
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+
     /// Create/replace a compute workload (project-scoped): PUT the
     /// `PutComputeRequest`-shaped `body` straight to the server (it validates).
     /// Returns the server's stored record verbatim.

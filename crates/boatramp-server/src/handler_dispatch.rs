@@ -165,12 +165,12 @@ pub(super) async fn dispatch_handler(
                     if let Some(vars) = json.get("variables").filter(|v| v.is_object()) {
                         variables = vars.clone();
                     }
-                    if gql.persisted_queries || gql.safelist {
+                    if gql.persisted_queries || gql.enforce_safelist {
                         match graphql_apq::resolve_stored(
                             inner.kv.as_ref(),
                             &scope,
                             &json,
-                            gql.safelist,
+                            gql.enforce_safelist,
                         )
                         .await
                         {
