@@ -862,6 +862,90 @@ impl ControlPlane {
         }
     }
 
+    // ---- declarative managed databases (v0.6.0, #501 Stage B) --------------
+
+    /// Declare (persist + eagerly provision) a managed database from a manifest
+    /// `databases:` entry: `PUT /api/{seg}/databases/{name}` with the typed
+    /// [`ApplyDatabase`](boatramp_core::compute::ApplyDatabase) body. `Project·Admin`.
+    /// The server enforces daemon-config-wins, identity-change refusal, and
+    /// caller's-project binding; a refusal (`409`/`400`/`501`) surfaces as a
+    /// [`ClientError`] carrying the server's reason.
+    pub async fn declare_database(
+        &self,
+        name: &str,
+        db: &boatramp_core::compute::ApplyDatabase,
+    ) -> Result<()> {
+        let seg = project_seg(&self.project, "databases");
+        let Self {
+            http: client,
+            base: server,
+            ..
+        } = self;
+        client
+            .put(format!("{server}/api/{seg}/{name}"))
+            .json(db)
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+
+    /// List the project's declared managed databases (`GET /api/{seg}/databases`).
+    /// Read-only (`Project·Read`). Each is the stored typed
+    /// [`ApplyDatabase`](boatramp_core::compute::ApplyDatabase).
+    pub async fn list_databases(&self) -> Result<Vec<boatramp_core::compute::ApplyDatabase>> {
+        let seg = project_seg(&self.project, "databases");
+        let Self {
+            http: client,
+            base: server,
+            ..
+        } = self;
+        Ok(client
+            .get(format!("{server}/api/{seg}"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
+    }
+
+    /// Fetch one declared managed database (`GET /api/{seg}/databases/{name}`).
+    /// Read-only (`Project·Read`); a missing declaration is a `404` → [`ClientError`].
+    pub async fn get_database(&self, name: &str) -> Result<boatramp_core::compute::ApplyDatabase> {
+        let seg = project_seg(&self.project, "databases");
+        let Self {
+            http: client,
+            base: server,
+            ..
+        } = self;
+        Ok(client
+            .get(format!("{server}/api/{seg}/{name}"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
+    }
+
+    /// Fetch the read-only status view of a declared managed database
+    /// (`GET /api/{seg}/databases/{name}/status`) — the declaration + derived server
+    /// workload handle. Never returns a secret.
+    pub async fn database_status(&self, name: &str) -> Result<serde_json::Value> {
+        let seg = project_seg(&self.project, "databases");
+        let Self {
+            http: client,
+            base: server,
+            ..
+        } = self;
+        Ok(client
+            .get(format!("{server}/api/{seg}/{name}/status"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
+    }
+
     /// Clear the project's tenancy schema (revert to legacy `Uniform` scoping).
     pub async fn clear_project_tenancy(&self) -> Result<()> {
         let seg = project_seg(&self.project, "tenancy");

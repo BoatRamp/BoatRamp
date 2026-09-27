@@ -97,6 +97,9 @@ pub enum CliError {
     /// The `sql` command.
     #[error(transparent)]
     Sql(#[from] crate::sql::Error),
+    /// The `db` command (read-only declared-database inspection).
+    #[error(transparent)]
+    Db(#[from] crate::db::Error),
     /// The `blob` command.
     #[error(transparent)]
     Blob(#[from] crate::blob::Error),

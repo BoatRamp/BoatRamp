@@ -163,6 +163,15 @@ trait ControlPlane {
     /// Register one trusted operation in the project's GraphQL safelist
     /// (register-only; the server validates + stores it, idempotently).
     async fn register_graphql_safelist(&self, query: &str) -> CpResult<()>;
+    /// Declare (persist + eagerly provision) one managed database from the manifest
+    /// `databases:` block (`PUT /api/{seg}/databases/{name}`, `Project·Admin`). The
+    /// server enforces daemon-config-wins, identity-change refusal, and caller's-project
+    /// binding; a refusal (409/…) surfaces as [`CpError::Client`] with the reason.
+    async fn declare_database(
+        &self,
+        name: &str,
+        db: &boatramp_core::compute::ApplyDatabase,
+    ) -> CpResult<()>;
 }
 
 /// A control-plane call outcome classified for the reconcile core: `NotFound`
@@ -266,6 +275,15 @@ impl ControlPlane for client::ControlPlane {
             .await
             .map_err(CpError::Client)
     }
+    async fn declare_database(
+        &self,
+        name: &str,
+        db: &boatramp_core::compute::ApplyDatabase,
+    ) -> CpResult<()> {
+        self.declare_database(name, db)
+            .await
+            .map_err(CpError::Client)
+    }
 }
 
 /// The manifest schema version this build writes and parses **as current**. A
@@ -316,6 +334,18 @@ pub struct ApplyManifest {
     /// omitted key never clears an existing schema — use `boatramp tenancy clear`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tenancy: Option<boatramp_core::tenancy::TenancySchema>,
+    /// Declared **managed databases** (#501 Stage B) — the sole authoring surface for a
+    /// project-scoped managed DB (there is deliberately no imperative `db create`). Each
+    /// [`ApplyDatabase`] is a TYPED, SAFE projection of the internal
+    /// `ExternalDatabaseConfig` (no secret / URL / host-fs / image field — that exclusion
+    /// IS the security contract). Reconciled **before** sites/functions/compute (like
+    /// `tenancy`), so a handler shipped in the same apply binds an already-provisioned DB.
+    /// **ADDITIVE within schema v2** — an absent `databases:` still parses (no version
+    /// bump, no migration arm). `PUT`-only (create-or-replace + eager provision);
+    /// removing an entry NEVER deprovisions (data-loss guard — teardown is an explicit
+    /// imperative verb).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub databases: Vec<boatramp_core::compute::ApplyDatabase>,
 }
 
 /// One site in the manifest: a slug plus its content dir and folded-in config.
@@ -548,11 +578,13 @@ pub async fn run(args: ApplyArgs, config: &ProjectConfig) -> Result<()> {
     let cp = client::ControlPlane::new(server, http, project.clone());
 
     println!(
-        "applying {} to project `{project}`: {} site(s), {} function(s), {} compute workload(s){}",
+        "applying {} to project `{project}`: {} site(s), {} function(s), {} compute workload(s), \
+         {} database(s){}",
         args.file.display(),
         manifest.sites.len(),
         manifest.functions.len(),
         manifest.compute.len(),
+        manifest.databases.len(),
         if args.dry_run { "  (dry-run)" } else { "" },
     );
 
@@ -564,6 +596,12 @@ pub async fn run(args: ApplyArgs, config: &ProjectConfig) -> Result<()> {
     if let Some(schema) = &manifest.tenancy {
         reconcile_tenancy(&cp, schema, args.dry_run).await?;
     }
+
+    // Reconcile declared managed databases *before* sites/functions/compute (#501 Stage B),
+    // so a handler shipped in the same apply binds an already-provisioned DB. Each is
+    // `PUT`-only (create-or-replace + eager provision); removing an entry never
+    // deprovisions (the server keeps the DB/volume/credential).
+    apply_databases(&cp, &manifest.databases, args.dry_run).await?;
 
     // `safelisted_ops_path` is resolved relative to the manifest's own directory
     // (client-side); the manifest file itself lives at `args.file`.
@@ -636,6 +674,32 @@ async fn reconcile_tenancy<C: ControlPlane>(
     }
     cp.put_project_tenancy(schema).await?;
     println!("  tenancy: set schema ({} table(s))", schema.tables.len());
+    Ok(())
+}
+
+/// Reconcile the declared managed databases (#501 Stage B): `PUT` each — a create-or-replace
+/// that eagerly provisions — and NEVER prune. Runs BEFORE sites/functions/compute so a
+/// handler shipped in the same apply binds an already-provisioned DB. Upsert-only (matching
+/// the module's upsert-never-prune contract): an entry dropped from a later manifest is left
+/// untouched server-side (its DB/volume/credential are kept). The server enforces the security
+/// invariants (daemon-config-wins, identity-change refusal, caller's-project binding); a
+/// refusal surfaces as a client error here.
+async fn apply_databases<C: ControlPlane>(
+    cp: &C,
+    databases: &[boatramp_core::compute::ApplyDatabase],
+    dry_run: bool,
+) -> Result<()> {
+    for db in databases {
+        if dry_run {
+            println!(
+                "  database `{}`: would declare + provision ({:?}, {:?}, size {:?})",
+                db.name, db.kind, db.tenant, db.size
+            );
+            continue;
+        }
+        cp.declare_database(&db.name, db).await?;
+        println!("  database `{}`: declared + provisioned", db.name);
+    }
     Ok(())
 }
 
@@ -1081,6 +1145,16 @@ mod tests {
             // Record the op text so a test can assert POST-per-op (and that no DELETE
             // is ever issued — the mock has no delete method at all).
             self.rec(format!("register_graphql_safelist {query}"));
+            Ok(())
+        }
+        async fn declare_database(
+            &self,
+            name: &str,
+            db: &boatramp_core::compute::ApplyDatabase,
+        ) -> CpResult<()> {
+            // Record the declare so a test can assert PUT-per-db (and that no deprovision
+            // is ever issued — the mock has no delete/deprovision method at all).
+            self.rec(format!("declare_database {name} kind={:?}", db.kind));
             Ok(())
         }
     }
@@ -1904,5 +1978,145 @@ mod tests {
         assert_eq!(parse_ops_file("query Single { s }"), ["query Single { s }"]);
         // Empty → no ops.
         assert!(parse_ops_file("   ").is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Part 3 — declarative managed databases (#501 Stage B)
+    // -----------------------------------------------------------------------
+
+    /// A `databases:` block parses into the typed `ApplyDatabase` projection — the SAFE
+    /// fields only. It is ADDITIVE within schema v2 (no `version:` needed).
+    #[test]
+    fn databases_block_parses_the_safe_typed_projection() {
+        let manifest = ApplyManifest::parse(
+            r#"(
+                databases: [
+                    ( name: "app", kind: postgres, version: 16, size: medium,
+                      tenant: shared, tenant_scope: project, extensions: ["pgcrypto"],
+                      rls_session: true, tenant_guc: "app.tenant_id", pool_max: 8 ),
+                ],
+            )"#,
+        )
+        .expect("a databases: block parses");
+        assert_eq!(manifest.databases.len(), 1);
+        let db = &manifest.databases[0];
+        assert_eq!(db.name, "app");
+        assert_eq!(db.kind, boatramp_core::compute::ApplyDatabaseKind::Postgres);
+        assert_eq!(db.size, boatramp_core::compute::ApplyDatabaseSize::Medium);
+        assert_eq!(
+            db.tenant,
+            boatramp_core::compute::ApplyDatabaseTenant::Shared
+        );
+        assert_eq!(db.extensions, ["pgcrypto"]);
+        assert!(db.rls_session);
+        assert_eq!(db.tenant_guc.as_deref(), Some("app.tenant_id"));
+    }
+
+    /// An absent `databases:` still parses (additive — no version bump / migration).
+    #[test]
+    fn absent_databases_block_still_parses() {
+        let manifest = ApplyManifest::parse(r#"( sites: [] )"#).unwrap();
+        assert!(manifest.databases.is_empty());
+    }
+
+    /// The SECURITY CONTRACT at the manifest surface: `ApplyDatabase` `deny_unknown_fields`
+    /// REFUSES any of the excluded credential/RCE/SSRF/host-fs keys — a manifest cannot
+    /// smuggle `password_env`/`url_env`/`image`/`path`/`compute` past the parser.
+    #[test]
+    fn databases_block_refuses_the_excluded_credential_fields() {
+        for excluded in [
+            r#"( name: "x", kind: postgres, password_env: "PW" )"#,
+            r#"( name: "x", kind: postgres, url_env: "URL" )"#,
+            r#"( name: "x", kind: postgres, read_url_env: "URL" )"#,
+            r#"( name: "x", kind: postgres, migration_url_env: "URL" )"#,
+            r#"( name: "x", kind: postgres, image: "evil/oci:latest" )"#,
+            r#"( name: "x", kind: postgres, path: "/etc/passwd" )"#,
+            r#"( name: "x", kind: postgres, compute: "other-tenants-server" )"#,
+        ] {
+            let text = format!("( databases: [ {excluded} ] )");
+            assert!(
+                ApplyManifest::parse(&text).is_err(),
+                "a manifest smuggling an excluded field must fail to parse: {excluded}"
+            );
+        }
+    }
+
+    /// `apply_databases` PUTs each declared DB (create-or-replace + eager provision) and
+    /// NEVER issues a deprovision — the mock has no delete/deprovision method at all, so an
+    /// upsert-only reconcile is structural. Confirms the eager-declare wiring + the
+    /// inert-on-removal contract at the CLI seam.
+    #[tokio::test]
+    async fn apply_databases_puts_each_and_never_deprovisions() {
+        let mock = MockCp::default();
+        let dbs = vec![
+            boatramp_core::compute::ApplyDatabase {
+                name: "app".into(),
+                kind: boatramp_core::compute::ApplyDatabaseKind::Postgres,
+                version: None,
+                extensions: vec![],
+                size: Default::default(),
+                tenant: Default::default(),
+                tenant_scope: Default::default(),
+                read_only: false,
+                rls_session: false,
+                tenant_guc: None,
+                session_guc: None,
+                tenant_all_marker: None,
+                pool_max: None,
+                connect_timeout_secs: None,
+                startup_grace_secs: None,
+            },
+            boatramp_core::compute::ApplyDatabase {
+                name: "metrics".into(),
+                kind: boatramp_core::compute::ApplyDatabaseKind::Mysql,
+                version: None,
+                extensions: vec![],
+                size: Default::default(),
+                tenant: Default::default(),
+                tenant_scope: Default::default(),
+                read_only: false,
+                rls_session: false,
+                tenant_guc: None,
+                session_guc: None,
+                tenant_all_marker: None,
+                pool_max: None,
+                connect_timeout_secs: None,
+                startup_grace_secs: None,
+            },
+        ];
+        apply_databases(&mock, &dbs, false).await.unwrap();
+        assert_eq!(
+            mock.calls(),
+            [
+                "declare_database app kind=Postgres",
+                "declare_database metrics kind=Mysql",
+            ],
+            "each declared DB is PUT once; no deprovision is ever issued"
+        );
+    }
+
+    /// A `--dry-run` apply declares NOTHING (mutates no state).
+    #[tokio::test]
+    async fn apply_databases_dry_run_declares_nothing() {
+        let mock = MockCp::default();
+        let dbs = vec![boatramp_core::compute::ApplyDatabase {
+            name: "app".into(),
+            kind: boatramp_core::compute::ApplyDatabaseKind::Postgres,
+            version: None,
+            extensions: vec![],
+            size: Default::default(),
+            tenant: Default::default(),
+            tenant_scope: Default::default(),
+            read_only: false,
+            rls_session: false,
+            tenant_guc: None,
+            session_guc: None,
+            tenant_all_marker: None,
+            pool_max: None,
+            connect_timeout_secs: None,
+            startup_grace_secs: None,
+        }];
+        apply_databases(&mock, &dbs, true).await.unwrap();
+        assert!(mock.calls().is_empty(), "dry-run declares nothing");
     }
 }

@@ -161,6 +161,10 @@ fn migrate_v1_to_v2(text: &str) -> Result<ApplyManifest> {
         functions: v1.functions,
         compute,
         tenancy: v1.tenancy,
+        // The v1→current migration produces no declared databases — a DB-shaped v1
+        // compute workload is migrated as a plain compute workload (with an advisory
+        // warning), not auto-converted into the new `databases:` block.
+        databases: Vec::new(),
     })
 }
 
