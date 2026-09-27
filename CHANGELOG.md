@@ -14,8 +14,8 @@ migration (below); a version-less manifest that omits the new `compute[].spec` t
 message that points straight at the fix.
 
 > This entry covers Stage A (typed compute + config versioning + the GraphQL safelist rename and
-> declarative registration + the domains note). The managed `databases:` declaration (Stage B)
-> appends its own section when it lands.
+> declarative registration + the domains note) and Stage B (the declarative managed `databases:`
+> block + its project-scoped binding persistence/merge/authz layer — see **Managed databases**).
 
 ### Breaking
 
@@ -90,6 +90,69 @@ unverified domain: the manifest domain path keeps routing through the `check_add
 refusal, which rejects attaching a not-yet-verified hostname. That refusal is a routing-hijack guard
 (an unverified domain could otherwise steal traffic destined for another tenant's verified host) and
 **stays** — v0.6.0 adds nothing that bypasses it.
+
+### Managed databases
+
+- **Declarative managed-database block (`apply` manifest, Stage B).** The `apply` manifest gains
+  **`databases: [ ApplyDatabase, … ]`** — the project-scoped DECLARATIVE front door onto the
+  daemon-level managed-database provisioning stack (which already provisions a per-tenant Postgres/
+  MySQL, mints and seals its credential, and follows the workload across restarts). Declaring a
+  database no longer requires an operator to hand-edit `boatramp.cfg`; a project author adds an entry
+  and runs `boatramp apply`. Reconciled **before** sites/functions/compute, so a handler shipped in
+  the same apply binds an already-provisioned DB. **Additive within schema v2** (an absent
+  `databases:` still parses — no version bump, no migration).
+
+  `ApplyDatabase` is a **typed, SAFE projection** of the internal `ExternalDatabaseConfig` — it
+  carries only the fields a project author may safely declare:
+
+  - **Included (safe):** `name`, `kind` (`postgres`/`mysql`), `version` (engine major), `extensions`,
+    `size` (a `small`/`medium`/`large` PRESET → bounded vcpus/mem/volume, NOT raw VM knobs), `tenant`
+    (`single`/`shared`), `tenant_scope` (`project`/`site`), `read_only`, the RLS knobs
+    (`rls_session`/`tenant_guc`/`session_guc`/`tenant_all_marker`), and `pool_max`/
+    `connect_timeout_secs`/`startup_grace_secs` (each **capped** to an operator ceiling — a DoS /
+    disk-full guard).
+  - **Excluded — the security contract (these are NOT fields; a manifest that names one fails to
+    parse):** `image` (arbitrary-OCI RCE), `password_env`/`url_env`/`read_url_env`/`migration_url_env`
+    (BYO-secret / SSRF / arbitrary host), `path` (host-fs traversal), and `compute` (the workload is
+    DERIVED per-project, never author-named). Omitting `password_env` is what makes a declared
+    database **definitionally the boatramp-fully-manages-and-seals-the-credential path** — the
+    manifest NEVER carries or references a secret.
+
+  ```ron
+  databases: [
+    ( name: "app", kind: postgres, version: 16, size: medium,
+      tenant: shared, tenant_scope: project, extensions: ["pgcrypto"],
+      rls_session: true, tenant_guc: "app.tenant_id" ),
+  ]
+  ```
+
+- **Project-scoped binding persistence + node merge.** A declared database is persisted to a new
+  control-plane store at **`project-database/{project}/{name}`** (cluster-replicated). The live
+  binding resolution consults BOTH this per-project store AND the node-static
+  `[handlers].bindings.sql.databases` map at ONE merge point, where **daemon-static config WINS,
+  fail-closed on a same-name conflict** — a project manifest may never shadow / override / downgrade a
+  node-operator's bring-your-own binding (enforced at the merge point, so a node reloading config with
+  both present refuses, not merely the apply CLI).
+
+- **`Project·Admin`-gated.** Declaring a database mints owner-role identities (CREATE ROLE / owner-role
+  DDL as superuser), so the declare + provision route (`PUT /api/projects/{proj}/databases/{name}`,
+  `POST …/ensure`) gates at **`Project·Admin`** — the same owner-grade placement as `/api/migrate/`
+  and `/api/repair/`, ABOVE the project-deploy catch-all, so a `project_publisher`/deployer can NEVER
+  reach it. The `GET` reads (`ls`/`get`/`status`) are `Project·Read`.
+
+- **Caller's-project binding + destructive-change refusal + inert on removal.** The provisioning is
+  bound to the caller's project (the per-project server workload is derived, project-qualified — a
+  manifest can only ever provision onto its OWN project's server). A re-apply that changes an identity
+  field (`kind`/`tenant`/`tenant_scope`) of an existing declared database is **refused** (silent
+  data-loss / orphan guard). Removing a `databases:` entry NEVER drops the database, volume, or
+  credential — teardown stays an explicit imperative verb (no coupling to manifest removal). Eager
+  provision: after registering the binding, apply triggers the idempotent `provision_tenant` so the
+  DB exists when `apply` returns.
+
+- **Read-only `boatramp db` CLI.** `boatramp db ls | get <name> | status <name>` inspect the
+  project's declared databases (read-only). There is deliberately **NO `db create`** — the manifest
+  `databases:` block is the SOLE authoring surface (a create verb would compete as a second source of
+  truth).
 
 ## [0.5.9] - 2026-09-27
 
