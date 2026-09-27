@@ -1688,7 +1688,7 @@ pub struct ServerOptions {
     /// those routes return `501`. Wired by the node when a managed DB exists.
     pub tenant_repair: Option<Arc<dyn boatramp_core::sql::TenantRepair>>,
     /// Project-scoped declarative managed-database capability (#501 Stage B): persists a
-    /// manifest `databases:` entry to `project-database/{project}/{name}`, enforces the
+    /// manifest `databases:` entry to `project/{project}/database/{name}`, enforces the
     /// security invariants (daemon-config-wins at the merge point, identity-change
     /// refusal, caller's-project binding), lowers it to the managed-credential path, and
     /// eagerly provisions it. Backs the `Project·Admin`-gated

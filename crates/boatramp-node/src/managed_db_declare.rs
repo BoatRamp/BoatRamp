@@ -24,8 +24,13 @@
 //! - **Caller's-project binding.** The manifest does NOT let the author name a
 //!   `compute` workload; boatramp DERIVES a per-project workload name
 //!   ([`derived_workload`]) so a declaration can only ever provision onto its OWN
-//!   project's server (a `Shared` server is project-qualified; a `Single` container is
-//!   already registered under the caller's project by `provision_single`).
+//!   project's server. The derivation is **injective over the `(project, name)` pair**
+//!   (folded through the codebase's collision-resistant identifier digest) so two
+//!   DISTINCT projects can never derive the same `Shared` server workload — which is
+//!   registered under the reserved default project (a node-global namespace), so a
+//!   collision would land them on one container sharing one superuser credential (#501
+//!   Stage B HIGH-1). A `Single` container is already registered under the caller's
+//!   project by `provision_single`.
 //! - **No destructive change.** A re-apply that changes an identity field
 //!   (`kind`/`tenant`/`tenant_scope`) of an existing declared DB is refused
 //!   ([`DeclareError::IdentityChange`]).
@@ -52,13 +57,22 @@ use crate::config::{ExternalDatabaseConfig, TenantIsolation, TenantScope};
 ///
 /// The manifest never names a `compute` workload (that is the caller's-project-binding
 /// guard): boatramp derives one deterministically from `(project, name)` so a
-/// declaration can only ever provision onto its OWN project's server. Project-qualified
-/// because a `Shared` server is registered under the reserved default project (a
-/// node-global namespace) — two different projects declaring the same binding name must
-/// NOT collide on one shared server (or share a sealed credential). The result is a safe
-/// resource name (the input segments are already `validate_resource_name`-screened).
+/// declaration can only ever provision onto its OWN project's server. The derivation is
+/// **injective over the `(project, name)` PAIR** because a `Shared` server (and its
+/// superuser credential) is registered under the reserved default project — a node-global
+/// namespace — so two different projects declaring the same binding name must NOT collide
+/// onto one shared server (or share a sealed superuser credential). A naive hyphen-join
+/// `bramp-db-{project}-{name}` is NOT injective (`validate_resource_name` permits `-` in
+/// both segments, so `("acme-app","db")` and `("acme","app-db")` collapse to the same
+/// string — the #501 Stage B HIGH-1 finding); this delegates to the codebase's existing
+/// collision-resistant identifier digest
+/// ([`derived_managed_db_workload`](boatramp_storage::tenant_provision::derived_managed_db_workload))
+/// which folds the length-prefixed pair through the same 128-bit SHA-256/base-36
+/// disambiguator that keeps `sanitize_ident` injective. The result is a safe resource name
+/// (the `bramp-db-` prefix retained for greppability/operator-reservation), stable across
+/// runs, and ≤ 63 bytes.
 pub fn derived_workload(project: &str, name: &str) -> String {
-    format!("bramp-db-{project}-{name}")
+    boatramp_storage::tenant_provision::derived_managed_db_workload(project, name)
 }
 
 /// Lower a declared [`ApplyDatabase`] into the internal
@@ -123,7 +137,7 @@ pub fn lower(project: &str, db: &ApplyDatabase) -> ExternalDatabaseConfig {
 /// **THE MERGE POINT** — resolve the live [`ExternalDatabaseConfig`] for `(project,
 /// name)` by consulting BOTH sources: the node-static
 /// `[handlers].bindings.sql.databases` map AND the per-project declarative store
-/// (`project-database/{project}/{name}`). **Daemon-static config WINS, fail-closed on a
+/// (`project/{project}/database/{name}`). **Daemon-static config WINS, fail-closed on a
 /// same-name conflict:** if `name` is present in BOTH, the resolution is REFUSED
 /// ([`DeclareError::DaemonConflict`]) — a project manifest may NEVER shadow / override /
 /// downgrade a node operator's BYO binding.
@@ -227,7 +241,7 @@ impl ManagedDbDeclare for NodeManagedDbDeclare {
         // Defense-in-depth: the API path param + apply CLI validate `project`/`name`, but
         // this is the persistence + privileged-provision choke point, so re-run the one
         // canonical resource-identifier validator (fail-closed) on both segments — neither
-        // can carry a `/` and reshape the `project-database/{project}/{name}` key.
+        // can carry a `/` and reshape the `project/{project}/database/{name}` key.
         boatramp_core::project::validate_resource_name("project", project)
             .map_err(|e| DeclareError::Other(e.to_string()))?;
         boatramp_core::project::validate_resource_name("database", name)
@@ -359,7 +373,18 @@ mod tests {
         assert!(cfg.migration_url_env.is_none(), "no migration_url_env");
         assert!(cfg.image.is_none(), "no arbitrary image");
         assert!(cfg.path.is_none(), "no host-fs path");
-        assert_eq!(cfg.compute.as_deref(), Some("bramp-db-acme-app"));
+        // The derived compute is the injective per-project workload (a `bramp-db-…`
+        // digest of the `(project, name)` pair — not an author-named / cross-tenant one).
+        assert_eq!(
+            cfg.compute.as_deref(),
+            Some(derived_workload("acme", "app").as_str())
+        );
+        assert!(
+            cfg.compute
+                .as_deref()
+                .is_some_and(|c| c.starts_with("bramp-db-")),
+            "derived compute keeps the reserved prefix"
+        );
         assert!(cfg.validate("app").is_ok(), "the lowered binding validates");
     }
 
@@ -380,13 +405,39 @@ mod tests {
     }
 
     /// A different project deriving the same binding NAME never collides on the shared
-    /// server (the workload is project-qualified) — the caller's-project-binding guard.
+    /// server, AND — the HIGH-1 fix — the derivation is **injective over the `(project,
+    /// name)` PAIR**: the ambiguous hyphen pair that the prior `bramp-db-{project}-{name}`
+    /// join collapsed onto ONE server (+ ONE superuser credential) now yields distinct
+    /// names. A regression to a non-injective derivation FAILS this.
     #[test]
     fn derived_workload_is_project_qualified() {
+        // Same binding name, different project — never collide.
         assert_ne!(
             derived_workload("acme", "app"),
             derived_workload("globex", "app"),
         );
+        // The exact ambiguous pair from the Security-review HIGH-1 finding: a hyphen-join
+        // would map both to `bramp-db-acme-app-db`.
+        assert_ne!(
+            derived_workload("acme-app", "db"),
+            derived_workload("acme", "app-db"),
+            "ambiguous hyphen pair must NOT collide onto one shared server + superuser cred"
+        );
+        // A couple more distinct-pair cases straddling hyphen placement.
+        assert_ne!(derived_workload("a-b", "c"), derived_workload("a", "b-c"));
+        assert_ne!(
+            derived_workload("acme-app-db", ""),
+            derived_workload("", "acme-app-db"),
+        );
+        // Every derived name keeps the reserved prefix + is a bounded resource name.
+        for (p, n) in [("acme-app", "db"), ("acme", "app-db"), ("globex", "app")] {
+            let w = derived_workload(p, n);
+            assert!(
+                w.starts_with("bramp-db-"),
+                "{w:?} keeps the reserved prefix"
+            );
+            assert!(w.len() <= 63, "{w:?} must be <= 63 bytes");
+        }
     }
 
     /// The size preset maps to bounded resources (never a raw unbounded request).
@@ -592,16 +643,38 @@ mod tests {
             "GATE: changing `tenant` on an existing declared DB is refused — got {refused_change:?}"
         );
 
-        // (5) caller-project-binding — the lowered compute is project-qualified, so a
-        // DIFFERENT project can NEVER name/derive onto acme's server.
+        // (5) caller-project-binding — the lowered compute is the injective per-project
+        // derived workload (a `bramp-db-…` digest), so a DIFFERENT project can NEVER
+        // name/derive onto acme's server.
         assert_eq!(
             lower("acme", &single_project("app")).compute.as_deref(),
-            Some("bramp-db-acme-app"),
+            Some(derived_workload("acme", "app").as_str()),
+        );
+        assert!(
+            lower("acme", &single_project("app"))
+                .compute
+                .as_deref()
+                .is_some_and(|c| c.starts_with("bramp-db-")),
+            "GATE: the derived server workload keeps the reserved `bramp-db-` prefix"
         );
         assert_ne!(
             lower("globex", &single_project("app")).compute,
             lower("acme", &single_project("app")).compute,
             "GATE: a declaration provisions onto its OWN project's derived server only"
+        );
+        // …and the derivation is INJECTIVE over the `(project, name)` PAIR (HIGH-1): the
+        // ambiguous hyphen pair that a `bramp-db-{project}-{name}` join collapsed onto ONE
+        // shared server + ONE superuser credential now yields distinct workloads. A
+        // regression to a non-injective derivation would make these EQUAL and FAIL here.
+        assert_ne!(
+            derived_workload("acme-app", "db"),
+            derived_workload("acme", "app-db"),
+            "GATE: the ambiguous `(project, name)` pair must NOT collide onto one server + superuser credential"
+        );
+        assert_ne!(
+            lower("acme-app", &single_project("db")).compute,
+            lower("acme", &single_project("app-db")).compute,
+            "GATE: two distinct projects must not lower onto the same shared server"
         );
 
         // (6) inert-on-removal — the capability exposes NO deprovision. After the declare
