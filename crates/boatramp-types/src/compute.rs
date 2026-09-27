@@ -339,6 +339,34 @@ pub struct ComputeWorkload {
     pub placement: PlacementConstraints,
 }
 
+/// The default replica count for a workload (1) — a service runs one replica
+/// unless the manifest / request asks for more.
+pub fn default_replicas() -> u32 {
+    1
+}
+
+/// The body of `PUT /api/compute/:name` — an immutable [`ComputeSpec`] plus the
+/// desired replica count and [`PlacementConstraints`]. This is the SINGLE typed
+/// schema for a compute workload's desired state: both the server handler
+/// (`put_compute`) and the client manifest ([`crate::…::ApplyCompute`] mirrors
+/// these fields) deserialize into it, so there is no schema duplication and the
+/// client can fail fast on a malformed spec BEFORE the request leaves the host.
+/// The server still runs its own semantic validation (kernel defaulting, name
+/// screening) on top — the typed client parse is an additive gate, not a
+/// replacement.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PutComputeRequest {
+    /// The immutable workload spec (rootfs/kernel blob hashes + sizing).
+    pub spec: ComputeSpec,
+    /// Desired replica count (default 1).
+    #[serde(default = "default_replicas")]
+    pub replicas: u32,
+    /// Placement constraints.
+    #[serde(default)]
+    pub placement: PlacementConstraints,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
