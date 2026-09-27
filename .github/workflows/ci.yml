@@ -1267,6 +1267,46 @@ jobs:
             || { echo "::error::s3-ingress cloud lane did not exercise invariant 9 (the AWS/GCS/Azure policy builders)" >&2; exit 1; }
           grep -q 'S3 INGRESS SCOPED+SIGV4 OK' s3-ingress-gate-cloud.log \
             || { echo "::error::s3-ingress cloud gate never reached its marker (a cloud policy-tightness / enforced-vs-advisory regression)" >&2; exit 1; }
+      # #501 Stage C: the `upload_containers` host-forced `{tenant}` template. An `upload_containers`
+      # entry may carry the literal `{tenant}`; the HOST substitutes THIS invocation's resolved OWN
+      # tenant into it BEFORE the allowlist match + the scope stamp, so an unbounded per-tenant family
+      # (`assets-<tid>`) is authorizable while a cross-tenant mint (`assets-<other-tid>`) is
+      # STRUCTURALLY impossible. This gate drives the REAL guest binding + the REAL local
+      # `ServerBlobUploadMinter` and asserts the DECODED minted-credential scope: the own tenant mints
+      # `assets-<own-tid>` (scope stamps the EXPANDED own container), a sibling `assets-<other-tid>` is
+      # access-denied, an unscoped invocation fails closed `no-resolved-tenant`, and a plain exact entry
+      # still matches (non-breaking). The `blob-upload` feature is off in the `handlers`-only lane, so
+      # run it explicitly here and assert the marker + pass count so a `#[cfg]`/rename that drops it
+      # fails the merge.
+      #
+      # ANTI-HOLLOW: the host tenant-substitution is the load-bearing check. The
+      # `BOATRAMP_BLOB_TENANT_TEMPLATE_MUTATE_SKIP_HOST_FORCE` seam neuters it (the binding takes the
+      # resolved tenant from the guest-supplied cross-tenant suffix instead of the host-resolved own
+      # tenant). We run the gate ONCE clean (must PASS + print the marker), then ONCE with the mutation
+      # and the exit code INVERTED — under the mutation the cross-tenant mint succeeds so the gate MUST
+      # panic; a PASS-under-mutation is a hollow gate and fails the merge. Confirmed locally: the
+      # mutation panics the gate (exit 101).
+      - name: blob-upload tenant-template scoped gate marker (#501 Stage C)
+        run: |
+          set -eo pipefail
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-server \
+            --features blob-upload --test conformance blob_upload_tenant_template_scoped -- --nocapture 2>&1 \
+            | tee blob-tenant-template.log
+          grep -qE 'test result: ok\. 1 passed' blob-tenant-template.log \
+            || { echo "::error::blob-upload tenant-template gate did not run (silent skip or a failure)" >&2; exit 1; }
+          grep -q 'BLOB-UPLOAD TENANT-TEMPLATE SCOPED OK' blob-tenant-template.log \
+            || { echo "::error::blob-upload tenant-template gate never reached its marker (a cross-tenant mint / host-forcing / fail-closed regression)" >&2; exit 1; }
+          # Mutation guard: neuter the host tenant-substitution; the gate MUST fail. Invert the exit code
+          # so a PASS-under-mutation (a hollow gate) fails the merge.
+          if env BOATRAMP_BLOB_TENANT_TEMPLATE_MUTATE_SKIP_HOST_FORCE=1 cargo-zigbuild test \
+            --target x86_64-unknown-linux-musl -p boatramp-server \
+            --features blob-upload --test conformance blob_upload_tenant_template_scoped \
+            > blob-tenant-template-mut.log 2>&1; then
+            echo "::error::blob-upload tenant-template gate is HOLLOW — it PASSED with BOATRAMP_BLOB_TENANT_TEMPLATE_MUTATE_SKIP_HOST_FORCE=1 (the host tenant-substitution is not load-bearing)" >&2
+            exit 1
+          else
+            echo "blob-upload tenant-template mutation verified: BOATRAMP_BLOB_TENANT_TEMPLATE_MUTATE_SKIP_HOST_FORCE=1 fails the gate as expected."
+          fi
 
   deny:
     name: cargo-deny

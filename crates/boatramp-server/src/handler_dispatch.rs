@@ -2121,9 +2121,12 @@ pub(super) async fn build_bindings(
     // Granted when the site allows a `blob-upload:*` right, the handler imports it, the local S3 face's
     // minting config is wired (`set_blob_upload_minting` at startup), AND the fleet signer is present.
     // Project + site are host-forced by the binding from `project` (host-routed) + this handler's
-    // `site` (host-routed); the TTL + max-bytes are clamped to the operator ceilings; the container is
-    // checked against `upload_containers`. Deny-by-default: absent any of these, no binding is attached
-    // and `mint` fails closed. The two rights are INDEPENDENT (`:write` single-shot, `:multipart`).
+    // `site` (host-routed); the resolved OWN tenant (host-resolved, never guest-supplied) is threaded so
+    // a `{tenant}`-templated `upload_containers` entry expands only to this handler's own tenant's
+    // container (cross-tenant mint structurally impossible; mirrors `tenant-secrets`); the TTL +
+    // max-bytes are clamped to the operator ceilings; the container is checked against
+    // `upload_containers`. Deny-by-default: absent any of these, no binding is attached and `mint` fails
+    // closed. The two rights are INDEPENDENT (`:write` single-shot, `:multipart`).
     #[cfg(feature = "blob-upload")]
     if (granted("blob-upload:write") || granted("blob-upload:multipart"))
         && let Some(cfg) = inner.blob_upload_config.get()
@@ -2151,6 +2154,9 @@ pub(super) async fn build_bindings(
             // `no-resolved-site` case is exercised on the function/consumer path where `site` may be
             // absent). Pass it as the host-forced site.
             Some(site.to_string()),
+            // The resolved OWN tenant (the SAME value the SQL scope injector uses); `None` for an
+            // unscoped invocation ⇒ a `{tenant}`-only container fails closed `no-resolved-tenant`.
+            super::function_runtime::resolved_tenant_string(&handler_caller_tenant),
             minter,
             cfg.max_ttl_secs,
             cfg.max_bytes_ceiling,

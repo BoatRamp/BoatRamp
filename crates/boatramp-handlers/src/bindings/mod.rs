@@ -464,17 +464,22 @@ impl Bindings {
     /// Grant the `blob-upload` capability (S3 external ingress): `minter` signs + assembles a scoped S3
     /// upload credential (reaching the fleet signer + the ingress secret host-side); `project` +
     /// `site` are host-stamped as the credential's FORCED scope (the guest never names them — a `None`
-    /// site ⇒ every `mint` is `no-resolved-site`); `max_ttl_secs` / `max_bytes_ceiling` are the
-    /// operator ceilings the mint clamps to; `allow_containers` is the component's `upload_containers`
-    /// allowlist (empty ⇒ deny-all); `can_write`/`can_multipart` are the two INDEPENDENT rights
-    /// (`blob-upload:write` / `blob-upload:multipart`). Deny-by-default: without this grant `mint` is
-    /// `access-denied`.
+    /// site ⇒ every `mint` is `no-resolved-site`); `resolved_tenant` is THIS invocation's host-resolved
+    /// OWN tenant (never guest-supplied, `None` for an `all`/anon/target/unscoped invocation), used ONLY
+    /// to expand a `{tenant}` token in an `allow_containers` entry (a container matching only a
+    /// `{tenant}` entry with no resolved tenant fails closed with `no-resolved-tenant`); `max_ttl_secs` /
+    /// `max_bytes_ceiling` are the operator ceilings the mint clamps to; `allow_containers` is the
+    /// component's `upload_containers` allowlist (empty ⇒ deny-all; a `{tenant}`-templated entry
+    /// host-expands to the resolved own tenant); `can_write`/`can_multipart` are the two INDEPENDENT
+    /// rights (`blob-upload:write` / `blob-upload:multipart`). Deny-by-default: without this grant
+    /// `mint` is `access-denied`.
     #[cfg(feature = "blob-upload")]
     #[allow(clippy::too_many_arguments)]
     pub fn with_blob_upload(
         mut self,
         project: impl Into<String>,
         site: Option<String>,
+        resolved_tenant: Option<String>,
         minter: Arc<dyn blob_upload::BlobUploadMinter>,
         max_ttl_secs: u64,
         max_bytes_ceiling: Option<u64>,
@@ -485,6 +490,7 @@ impl Bindings {
         self.blob_upload = Some(blob_upload::BlobUploadBinding {
             project: project.into(),
             site,
+            resolved_tenant,
             minter,
             max_ttl_secs,
             max_bytes_ceiling,
