@@ -48,6 +48,9 @@ thiserror.workspace = true
 # Naming the detached reconcile `JoinHandle`s that `assemble` returns.
 tokio.workspace = true
 tracing.workspace = true
+# The blob-migration copy engine (`blob_migrate`) drives the `Storage` primitives with
+# bounded-concurrency `buffer_unordered` streams; a tiny, always-present dep.
+futures.workspace = true
 # Parse the operator's guest-egress extra-CA PEM into rustls trust anchors (dev-posture option).
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
@@ -122,6 +125,12 @@ tls = []
 # gate is load-bearing by asserting every mutation FAILS it. Implies `s3` (the backend-injection assert)
 # so the whole path is exercised on the host toolchain (no live cloud).
 s3-sealed-cred-gate-mutation = ["s3"]
+# CI gate lane for Part 1 of the blob-backend migration (`BLOB MIGRATE COMPLETE OK`). When ON, the
+# `blob_migrate::gate` battery compiles + each `BOATRAMP_BLOBMIG_MUTATE_*` env var neuters exactly
+# ONE invariant (via a `#[cfg(feature = "blob-migrate-gate-mutation")]` seam), so CI can prove the
+# gate is load-bearing by asserting every mutation FAILS it. Implies `fs` (the gate runs entirely
+# fs→fs in a tempdir — no cloud — so it pulls `boatramp-storage`'s `FsStorage`).
+blob-migrate-gate-mutation = ["fs"]
 
 [dev-dependencies]
 # The in-process fidelity test (`node::tests`) drives the assembled router with a

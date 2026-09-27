@@ -598,20 +598,56 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
     // call, once its KV/envelope exist. This keeps ONE credential source honored on both paths without
     // opening a stray store or reading the base key from the ambient env when a sealed source is set.
     let s3_credential_cfg = serve_cfg.s3_credential.clone();
+    // The blob backend + its per-backend options resolve flag/env > `[serve]` config > built-in
+    // default — the uniform `serve` precedence. `--blobs`/`BOATRAMP_BLOBS` has a clap default of
+    // `fs`, so a config-level `[serve].blobs` is honoured only when the flag/env was NOT explicitly
+    // set; the fs/anonymous/path-style/emulator toggles are ORed (a set flag can only enable an
+    // option) so the config value is honoured. `boatramp blob migrate` reads the SAME `[serve]`
+    // fields from its `--from`/`--to` config files.
+    let blobs_explicit =
+        std::env::var_os("BOATRAMP_BLOBS").is_some() || args.blobs != BlobBackend::Fs;
     let blob_args = BlobArgs {
-        blobs: args.blobs,
-        s3_bucket: args.s3_bucket.clone(),
-        s3_endpoint: args.s3_endpoint.clone(),
-        s3_region: args.s3_region.clone(),
-        s3_path_style: args.s3_path_style,
+        blobs: if blobs_explicit {
+            args.blobs
+        } else {
+            serve_cfg.blobs.unwrap_or(args.blobs)
+        },
+        s3_bucket: args
+            .s3_bucket
+            .clone()
+            .or_else(|| serve_cfg.s3_bucket.clone()),
+        s3_endpoint: args
+            .s3_endpoint
+            .clone()
+            .or_else(|| serve_cfg.s3_endpoint.clone()),
+        s3_region: args
+            .s3_region
+            .clone()
+            .or_else(|| serve_cfg.s3_region.clone()),
+        s3_path_style: args.s3_path_style || serve_cfg.s3_path_style,
         s3_credential: None,
-        gcs_bucket: args.gcs_bucket.clone(),
-        gcs_endpoint: args.gcs_endpoint.clone(),
-        gcs_anonymous: args.gcs_anonymous,
-        azure_account: args.azure_account.clone(),
-        azure_container: args.azure_container.clone(),
-        azure_access_key: args.azure_access_key.clone(),
-        azure_emulator: args.azure_emulator,
+        gcs_bucket: args
+            .gcs_bucket
+            .clone()
+            .or_else(|| serve_cfg.gcs_bucket.clone()),
+        gcs_endpoint: args
+            .gcs_endpoint
+            .clone()
+            .or_else(|| serve_cfg.gcs_endpoint.clone()),
+        gcs_anonymous: args.gcs_anonymous || serve_cfg.gcs_anonymous,
+        azure_account: args
+            .azure_account
+            .clone()
+            .or_else(|| serve_cfg.azure_account.clone()),
+        azure_container: args
+            .azure_container
+            .clone()
+            .or_else(|| serve_cfg.azure_container.clone()),
+        azure_access_key: args
+            .azure_access_key
+            .clone()
+            .or_else(|| serve_cfg.azure_access_key.clone()),
+        azure_emulator: args.azure_emulator || serve_cfg.azure_emulator,
     };
 
     // Cluster mode: triggered by a `[cluster]` config section OR the founding/
