@@ -362,6 +362,19 @@ pub fn is_named_tenant_secrets_import(import: &str) -> bool {
     matches!(import, "tenant-secrets:read" | "tenant-secrets:admin")
 }
 
+/// Whether `import` is a **blob-upload mint** grant (S3 external ingress): `blob-upload:write`
+/// (grants a single-shot presigned `PutObject`) or `blob-upload:multipart` (grants the resumable
+/// multipart quartet) on the `boatramp:handlers/blob-upload` capability. The two are INDEPENDENT
+/// rights, each separate from the deploy/publisher right and from each other — a write-granted
+/// component cannot mint a multipart credential. A bare `blob-upload` is deliberately NOT a grant (a
+/// component must name the specific right, deny-by-default / least-privilege), and there is no
+/// `blob-upload:*`. A typo (e.g. `blob-upload:read`) is not recognized here and so fails at deploy.
+/// Parse-time recognition ONLY: the ABI/`requires` gate + the runtime allowlist still enforce host
+/// support + the grant at activation.
+pub fn is_named_blob_upload_import(import: &str) -> bool {
+    matches!(import, "blob-upload:write" | "blob-upload:multipart")
+}
+
 fn check_import(import: &str) -> Result<(), ConfigError> {
     // `session` is accepted here (client-side cfg vocabulary) but is intentionally NOT in
     // `KNOWN_IMPORTS`: a session route grants the session binding intrinsically, and the host
@@ -381,6 +394,10 @@ fn check_import(import: &str) -> Result<(), ConfigError> {
     // like the above, intentionally NOT in `KNOWN_IMPORTS`: the host advertises the capability as
     // Experimental only when the `tenant-secrets` feature is compiled, so the `requires` ABI gate
     // enforces host support at activation while a deploy targeting any host build still parses offline.
+    // `blob-upload:{write,multipart}` (S3-ingress upload-credential mint) are accepted here but, like
+    // the above, intentionally NOT in `KNOWN_IMPORTS`: the host advertises the capability as
+    // Experimental only when the `blob-upload` feature is compiled, so the `requires` ABI gate enforces
+    // host support at activation while a deploy targeting any host build still parses offline.
     if KNOWN_IMPORTS.contains(&import)
         || import == "session"
         || import == "tenancy"
@@ -388,11 +405,12 @@ fn check_import(import: &str) -> Result<(), ConfigError> {
         || is_named_sql_import(import)
         || is_named_admin_import(import)
         || is_named_tenant_secrets_import(import)
+        || is_named_blob_upload_import(import)
     {
         Ok(())
     } else {
         Err(ConfigError::parse(format!(
-            "unknown handler import {import:?}; allowed: {}, `session`, `tenancy`, `messaging-stats`, a named SQL binding `sql:<name>` / `sql:*`, an admin surface `admin:{{domains,email,site,secrets}}`, or a tenant-secret right `tenant-secrets:{{read,admin}}`",
+            "unknown handler import {import:?}; allowed: {}, `session`, `tenancy`, `messaging-stats`, a named SQL binding `sql:<name>` / `sql:*`, an admin surface `admin:{{domains,email,site,secrets}}`, a tenant-secret right `tenant-secrets:{{read,admin}}`, or a blob-upload right `blob-upload:{{write,multipart}}`",
             KNOWN_IMPORTS.join(", ")
         )))
     }
@@ -1738,6 +1756,54 @@ mod tests {
         assert!(check_import("tenant-secrets:write").is_err());
         // A wholly-unknown import is still rejected.
         assert!(check_import("wasi:filesystem").is_err());
+    }
+
+    #[test]
+    fn accepts_named_blob_upload_imports_and_rejects_malformed_ones() {
+        use super::{check_import, is_named_blob_upload_import};
+        // The two INDEPENDENT blob-upload mint rights are accepted offline (mirrors the
+        // `tenant-secrets:{read,admin}` shape); a bare `blob-upload`, a wildcard, or a typo'd right
+        // is rejected (deny-by-default, least-privilege — a component names the specific right).
+        assert!(is_named_blob_upload_import("blob-upload:write"));
+        assert!(is_named_blob_upload_import("blob-upload:multipart"));
+        assert!(check_import("blob-upload:write").is_ok());
+        assert!(check_import("blob-upload:multipart").is_ok());
+        // Not a grant: bare capability, wildcard, a read right (there is no read on this surface),
+        // and any typo.
+        assert!(!is_named_blob_upload_import("blob-upload"));
+        assert!(!is_named_blob_upload_import("blob-upload:read"));
+        assert!(!is_named_blob_upload_import("blob-upload:*"));
+        assert!(check_import("blob-upload").is_err());
+        assert!(check_import("blob-upload:read").is_err());
+        assert!(check_import("blob-upload:*").is_err());
+    }
+
+    #[test]
+    fn handler_config_with_a_blob_upload_import_passes_check_import() {
+        // Part 5b: the offline validator must accept a manifest declaring the blob-upload grant — the
+        // gap that blocked construens' manifest before the runtime (which honors the grant) is even
+        // reached. `DeployConfig::from_ron` runs `check_import` for every handler import, so a config
+        // carrying `imports: ["blob-upload:write"]` now parses.
+        let text = r#"(
+            handlers: [
+                ( route: "/api/upload", methods: ["POST"],
+                  component: "handlers/upload.wasm",
+                  imports: ["blob-upload:write", "blob-upload:multipart"],
+                  upload_containers: ["assets-{tenant}"] ),
+            ],
+        )"#;
+        let config = DeployConfig::from_ron(text).expect("a blob-upload manifest now parses");
+        assert_eq!(
+            config.handlers[0].imports,
+            vec![
+                "blob-upload:write".to_string(),
+                "blob-upload:multipart".to_string()
+            ]
+        );
+        assert_eq!(
+            config.handlers[0].upload_containers,
+            vec!["assets-{tenant}".to_string()]
+        );
     }
 
     #[test]
