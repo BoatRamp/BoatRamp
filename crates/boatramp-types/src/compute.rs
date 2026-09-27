@@ -501,7 +501,7 @@ pub mod apply_db_caps {
 #[serde(deny_unknown_fields)]
 pub struct ApplyDatabase {
     /// The binding name — how a guest reaches it via `sql.open("<name>")` and the
-    /// `{name}` path segment of the `project-database/{project}/{name}` store key.
+    /// `{name}` path segment of the `project/{project}/database/{name}` store key.
     pub name: String,
     /// The engine (Postgres or MySQL). Lowered to `ExternalDatabaseConfig.kind`.
     pub kind: ApplyDatabaseKind,

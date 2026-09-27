@@ -649,7 +649,7 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
 
     // Declarative managed-database capability (#501 Stage B) — backs the `Project·Admin`-gated
     // `PUT /api/projects/{proj}/databases/{name}` + `POST …/ensure`. It persists a manifest
-    // `databases:` entry to `project-database/{project}/{name}`, enforces daemon-config-wins at
+    // `databases:` entry to `project/{project}/database/{name}`, enforces daemon-config-wins at
     // the merge point (against the node-static `sql.databases`), refuses an identity change,
     // binds provisioning to the caller's project, and eagerly provisions via `provision_tenant`.
     // Requires a sqlx engine (it provisions a Postgres/MySQL server) AND a `[secrets]` envelope

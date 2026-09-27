@@ -109,6 +109,51 @@ fn to_base36(mut n: u128) -> String {
     String::from_utf8(buf.to_vec()).expect("base-36 digits are ASCII")
 }
 
+/// The reserved prefix on every DERIVED managed-database **server workload** name.
+///
+/// Retained on [`derived_managed_db_workload`] for operator greppability and so a
+/// static `compute` workload can be screened against it (an operator must not name a
+/// static workload `bramp-db-…`). Public so the config loader can reuse the exact
+/// prefix rather than hard-code a second copy.
+pub const DERIVED_MANAGED_DB_PREFIX: &str = "bramp-db-";
+
+/// Derive the per-project managed-database **server workload** name for a declared
+/// binding from the `(project, name)` PAIR, **injectively**.
+///
+/// # Why the pair must be folded injectively
+///
+/// A `Shared` server workload (and its superuser credential) is registered under the
+/// reserved default project — a node-global namespace — so two DISTINCT projects must
+/// never derive the same workload name (they would land on ONE container and SHARE its
+/// superuser credential, running superuser DDL on each other's server). A naive
+/// hyphen-join `bramp-db-{project}-{name}` is **not** injective, because
+/// [`validate_resource_name`](boatramp_core::project::validate_resource_name) permits
+/// `-` in both segments: `("acme-app", "db")` and `("acme", "app-db")` both collapse to
+/// `bramp-db-acme-app-db`.
+///
+/// # The injective scheme
+///
+/// The pair is first serialized with an **unambiguous length-prefixed encoding**
+/// (`"<len(project)>:<project>:<name>"`) — a decimal byte-length of `project`, a `:`,
+/// the two segments each separated by `:`. Because the parser can recover `project`
+/// exactly from its declared length before consuming `name`, distinct `(project, name)`
+/// pairs always yield distinct encodings regardless of how many `-`/`:` characters the
+/// segments contain. That encoding is then folded through the codebase's existing
+/// collision-resistant identifier digest ([`hash_suffix`] — the same 128-bit,
+/// SHA-256-derived, base-36 disambiguator that keeps [`sanitize_ident`] injective), so
+/// the derived name is `bramp-db-<25-char digest of the pair>`: **stable** across runs
+/// and binary versions (fixed SHA-256), a safe resource name (`[a-z0-9]` body under the
+/// `bramp-db-` prefix), and ≤ 63 bytes (`9 + 25 = 34`).
+///
+/// Two distinct pairs collide only with ~2⁻¹²⁸ (cryptographic) probability.
+pub fn derived_managed_db_workload(project: &str, name: &str) -> String {
+    // Length-prefixed, unambiguous pair encoding: `project` is recoverable by its
+    // declared byte length before `name` is read, so the join is injective over the
+    // pair even though either segment may itself contain `-`/`:`.
+    let encoded = format!("{}:{project}:{name}", project.len());
+    format!("{DERIVED_MANAGED_DB_PREFIX}{}", hash_suffix(&encoded))
+}
+
 /// Map an arbitrary project/site name to a **safe** SQL identifier.
 ///
 /// Rules:
@@ -730,6 +775,59 @@ mod tests {
         assert_eq!(body_a, body_b, "truncated bodies should match");
         // …but the identifiers differ in the digest suffix.
         assert_ne!(ia, ib, "shared-prefix long names collided");
+    }
+
+    /// [`derived_managed_db_workload`] is **injective over the `(project, name)`
+    /// PAIR** — the HIGH-1 fix. The prior hyphen-join `bramp-db-{project}-{name}` let
+    /// the ambiguous pair `("acme-app", "db")` and `("acme", "app-db")` collapse onto
+    /// one shared server + one superuser credential; the length-prefixed encoding + the
+    /// 128-bit digest keeps every distinct pair distinct regardless of `-` placement.
+    #[test]
+    fn derived_managed_db_workload_is_injective_over_the_pair() {
+        // The exact ambiguous pair from the Security-review HIGH-1 finding.
+        assert_ne!(
+            derived_managed_db_workload("acme-app", "db"),
+            derived_managed_db_workload("acme", "app-db"),
+            "the ambiguous hyphen pair must NOT collide onto one server"
+        );
+        // A battery of distinct pairs, including ones a hyphen-join would confuse.
+        let pairs = [
+            ("acme", "app"),
+            ("acme-app", "db"),
+            ("acme", "app-db"),
+            ("acme-app-db", ""),
+            ("", "acme-app-db"),
+            ("a", "b-c"),
+            ("a-b", "c"),
+            ("globex", "app"),
+            ("acme", "app2"),
+            // colon-carrying-ish segments (the encoding delimiter) — still distinct.
+            ("a:b", "c"),
+            ("a", "b:c"),
+        ];
+        let mut seen: HashSet<String> = HashSet::new();
+        for (p, n) in pairs {
+            let out = derived_managed_db_workload(p, n);
+            assert!(
+                out.starts_with(DERIVED_MANAGED_DB_PREFIX),
+                "{out:?} must keep the reserved prefix"
+            );
+            assert!(out.len() <= MAX_IDENT_LEN, "{out:?} must be <= 63 bytes");
+            assert!(
+                seen.insert(out.clone()),
+                "collision: ({p:?}, {n:?}) -> {out:?} already produced"
+            );
+        }
+    }
+
+    /// The derivation is **stable** across calls (a fixed SHA-256 digest) — a shift
+    /// would silently move a project's server workload between binary versions.
+    #[test]
+    fn derived_managed_db_workload_is_stable() {
+        assert_eq!(
+            derived_managed_db_workload("acme", "app"),
+            derived_managed_db_workload("acme", "app"),
+        );
     }
 
     /// The digest suffix is derived from the original input and is stable across
