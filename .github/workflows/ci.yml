@@ -1133,6 +1133,36 @@ jobs:
             || { echo "::error::graphql-edge-scope gate did not run (silent skip or a failure)" >&2; exit 1; }
           grep -q 'GRAPHQL EDGE ROUTE-SCOPED OK' graphql-edge-scope.log \
             || { echo "::error::graphql-edge-scope gate never reached its marker (the GraphiQL / graphql edge shadows a sibling guest GET route again)" >&2; exit 1; }
+      # #501 Stage B: the DECLARATIVE managed-database front door. A manifest `databases:` entry is a
+      # TYPED, SAFE projection of the internal `ExternalDatabaseConfig` (no secret/URL/host-fs/image
+      # field). This gate drives the REAL `NodeManagedDbDeclare` over a memory store and asserts the
+      # security invariants: the lowered binding is ALWAYS the managed-credential path (no
+      # password_env/url/image/path); a name colliding with a node-static `[databases].<name>` is
+      # REFUSED at the merge point (daemon config wins); an identity change (kind/tenant/tenant_scope)
+      # on re-apply is refused; the derived server workload is project-qualified (caller's-project
+      # binding); and the API exposes NO deprovision (inert on removal). A regression that let a
+      # manifest win, carry a credential, provision cross-project, or drop data fails the merge.
+      - name: managed-DB declaration scoped gate marker (#501)
+        run: |
+          set -eo pipefail
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-node \
+            --features sql-postgres,handlers --lib managed_db_declaration_scoped_gate -- --nocapture 2>&1 | tee managed-db-declare.log
+          grep -qE 'test result: ok\. 1 passed' managed-db-declare.log \
+            || { echo "::error::managed-db-declare gate did not run (silent skip or a failure)" >&2; exit 1; }
+          grep -q 'MANAGED-DB DECLARATION SCOPED OK' managed-db-declare.log \
+            || { echo "::error::managed-db-declare gate never reached its marker (a daemon-conflict / credential-in-manifest / cross-project / destructive-change regression)" >&2; exit 1; }
+      # #501 Stage B (authz axis): the declare/provision route (`PUT /api/databases/{name}`, `POST
+      # …/ensure`) mints owner-role identities, so it MUST gate at Project·Admin — never the
+      # Project·Deploy grade a ship-only publisher holds. This asserts a publisher is REFUSED and an
+      # admin ALLOWED for both the global + project-scoped forms; a gate-downgrade regression (nesting
+      # under the project-deploy catch-all) lets the publisher through and fails the merge.
+      - name: managed-DB declaration authz gate marker (#501)
+        run: |
+          set -eo pipefail
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-types \
+            --lib databases_surface_is_project_admin_not_publisher -- --nocapture 2>&1 | tee managed-db-authz.log
+          grep -qE 'test result: ok\. 1 passed' managed-db-authz.log \
+            || { echo "::error::managed-db-declare authz gate did not run or FAILED (a publisher can reach the declare/provision route — an escalation)" >&2; exit 1; }
       # B10 (async-lane sharding): the whole async-lane shard gate battery — CAS claim race,
       # node-loss transition (double-owner ⇒ exactly one execution, no-owner ⇒ safety-net rescues,
       # never a stranding), lease-expiry reclaim, blob-watcher single-fire, cron single-fire, and the
