@@ -1981,6 +1981,42 @@ pub struct ServeConfig {
     /// the node) — INSTEAD of the local S3 face. Absent ⇒ the local face is used (an fs/in-memory
     /// backend, or a cloud backend that re-transits through the local face). See [`S3IngressCloud`].
     pub s3_ingress_cloud: Option<S3IngressCloud>,
+    /// **Node-level base S3 credential source** (`[serve.s3_credential]`, task #505). When set, BOTH the
+    /// S3 blob **object backend** (`--blobs s3`) and the AWS blob-upload **cloud minter**
+    /// (`[serve.s3_ingress_cloud]`) source their base AWS credential from boatramp's `[secrets]` sealed
+    /// store instead of the ambient `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` env chain. ONE shared
+    /// source (both consumers read the SAME bucket key). Absent ⇒ the ambient AWS env chain (current
+    /// behavior, non-breaking). Requires a `[secrets]` envelope when the `secret_access_key` is a sealed
+    /// `boatramp:`/`env:` ref — a configured ref with no envelope is a **startup error** (fail-closed, no
+    /// silent env fallback). See [`S3CredentialConfig`].
+    pub s3_credential: Option<S3CredentialConfig>,
+}
+
+/// `[serve.s3_credential]` — a **node-level base S3 credential source** (#505) sourcing the base AWS
+/// credential from boatramp's `[secrets]` sealed store rather than the ambient env chain. Consumed by
+/// BOTH the S3 blob object backend and the AWS blob-upload cloud minter (one shared source, since it is
+/// the same bucket key). Additive/non-breaking: absent ⇒ the ambient AWS env chain (unchanged).
+///
+/// The `access_key_id` is a public identifier (plain config). The `secret_access_key` is a **secret
+/// reference** in the same scheme the guest `secrets` map uses: `boatramp:<name>` (the project-scoped
+/// sealed store, resolved under the reserved default project — multi-tenant-safe, never the host env),
+/// `env:<VAR>` / a bare `<VAR>` (the operator's own environment — honored only when the posture's
+/// `allow_env_secret_refs` is set), unsealed at serve startup via the `[secrets]` [`KeyEnvelope`]. The
+/// resolved plaintext is held **in memory only** (never env/argv/git/logs); see the redacted
+/// `SealedS3Credential` the resolver produces.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct S3CredentialConfig {
+    /// The AWS **access key id** — a public identifier, not a secret, so it is plain config (mirrors
+    /// how an `access_key_id` is a public value in the S3-ingress credential model). Empty is refused
+    /// at resolution.
+    pub access_key_id: String,
+    /// The **secret access key**, expressed as a secret **reference** (never the raw secret in the
+    /// config text): `boatramp:<name>` (the project-scoped sealed store), `env:<VAR>` or a bare `<VAR>`
+    /// (the operator env, posture-gated by `allow_env_secret_refs`). Unsealed at startup via the
+    /// `[secrets]` envelope; the resolved value is redacted from `Debug`/logs. A `boatramp:`/`env:`
+    /// ref configured with NO `[secrets]` envelope is a fail-closed startup error.
+    pub secret_access_key: String,
 }
 
 /// `[serve.s3_ingress_cloud]` — the cloud-brokering knobs for the M4 blob-upload minter (which native
@@ -3381,5 +3417,28 @@ mod tests {
         let console = cfg.serve.unwrap().console.unwrap();
         assert!(console.enabled);
         assert!(console.host.is_none() && console.path.is_none());
+    }
+
+    #[test]
+    fn serve_s3_credential_config_parses() {
+        // #505: absent ⇒ no sealed source (the ambient AWS env chain).
+        let cfg = server(r#"( serve: ( addr: "0.0.0.0:8080" ) )"#);
+        assert!(cfg.serve.unwrap().s3_credential.is_none());
+        // An explicit `[serve.s3_credential]`: a plain `access_key_id` + a `boatramp:` sealed
+        // `secret_access_key` ref (the config text carries only the REFERENCE, never the secret).
+        let cfg = server(
+            r#"( serve: ( s3_credential: (
+                access_key_id: "tid_public_akid",
+                secret_access_key: "boatramp:tigris-secret",
+            ) ) )"#,
+        );
+        let cred = cfg.serve.unwrap().s3_credential.unwrap();
+        assert_eq!(cred.access_key_id, "tid_public_akid");
+        assert_eq!(cred.secret_access_key, "boatramp:tigris-secret");
+        // An unknown field is rejected (`deny_unknown_fields`) — a fat-fingered key fails fast.
+        let err: Result<ServerConfig, _> = ron_options().from_str(
+            r#"( serve: ( s3_credential: ( access_key_id: "x", secret_access_key: "boatramp:y", bogus: 1 ) ) )"#,
+        );
+        assert!(err.is_err(), "unknown [serve.s3_credential] field must be rejected");
     }
 }

@@ -36,6 +36,8 @@ async fn messaging_fabric_over_r2_backends() {
             endpoint: endpoint.clone(),
             region: region.clone(),
             force_path_style: true,
+            // The ambient AWS env chain (this live test uses the R2/env credentials).
+            credential: None,
         })
         .await,
     );
