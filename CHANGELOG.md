@@ -5,6 +5,29 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.6.3] - 2026-09-27
+
+Additive, non-breaking. Daemon-mediated blob drain — complete a zero-downtime blob-backend migration on
+a managed node reachable only over the control plane (no local/SSH access).
+
+### Added
+
+- **`boatramp blob drain --server <url>` + `POST /api/blob-drain` (daemon-mediated fallback drain).** The
+  v0.6.2 `boatramp blob migrate` is offline/node-local — it builds both backends in the CLI process, so on
+  a managed node with no shell access a configured `[serve].blob_fallback` could never be drained (the node
+  was stuck serving via the fallback indefinitely). This adds a **control-plane** drain: the client guides,
+  the running daemon (which already holds both backends open) executes. The daemon copies its **own**
+  configured `blob_fallback` **secondary → primary** using the shared copy engine (idempotent, resumable,
+  read-only on the source), streaming NDJSON progress and a final `SECONDARY FULLY DRAINED — safe to remove
+  [serve].blob_fallback` report. The client names **no** source/dest — the daemon drains only its own
+  configured pair — so it is a tighter authorization surface than the offline CLI. Gated at **`System·Admin`**
+  (node-operator; a project admin / publisher / deployer cannot reach it — enforced by the auth middleware
+  and re-asserted in the handler). No fallback configured ⇒ 422. `--dry-run`/`--concurrency`/`--prefix`/
+  `--json` pass through. Because the copy is resumable, a dropped connection is safe to re-run (sidesteps an
+  edge idle-timeout on a long drain). The offline `boatramp blob migrate` stays for pre-boot / volume-local
+  copies. (Internally, the copy engine moved from `boatramp-node` to `boatramp-storage` — it is pure over
+  the `Storage` trait — so both the daemon route and the offline CLI share it; a no-op for users.)
+
 ## [0.6.2] - 2026-09-27
 
 Additive, non-breaking. Blob-backend migration: an offline copy command + an optional zero-downtime
