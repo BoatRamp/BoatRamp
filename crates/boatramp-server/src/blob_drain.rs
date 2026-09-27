@@ -30,6 +30,7 @@ use boatramp_storage::blob_migrate::{self, MigrateProgress, MigrateReport};
 /// drains only its OWN configured `[serve.blob_fallback]` pair (D5: structural). The knobs mirror the
 /// offline CLI's pass-through options.
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct DrainRequest {
     /// Enumerate + classify (would-copy / would-skip) but copy nothing.
     #[serde(default)]
