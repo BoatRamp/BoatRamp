@@ -50,6 +50,7 @@ pub fn router_with_fast(
     let operator_sql_cap = options.operator_sql.clone();
     let migration_substrate_cap = options.migration_substrate.clone();
     let tenant_repair_cap = options.tenant_repair.clone();
+    let managed_db_declare_cap = options.managed_db_declare.clone();
     let tenant_deprovisioner_cap = options.tenant_deprovisioner.clone();
     let compute_exec_cap = options.compute_exec.clone();
     let compute_volumes_cap = options.compute_volumes.clone();
@@ -356,7 +357,24 @@ pub fn router_with_fast(
         // BOTH the apply and the dry-run (see `Right::required`). `POST /api/repair/{db}` = apply,
         // `POST /api/repair/{db}/dry-run` = report-only (the default posture the CLI uses).
         .route("/api/repair/{db}", post(repair_apply))
-        .route("/api/repair/{db}/dry-run", post(repair_dry_run));
+        .route("/api/repair/{db}/dry-run", post(repair_dry_run))
+        // Project-scoped declarative managed-database front door (#501 Stage B): `PUT
+        // /api/databases/{name}` persists a manifest `databases:` entry (the typed
+        // `ApplyDatabase` body) + eagerly provisions it; `POST /api/databases/{name}/ensure`
+        // re-provisions an already-declared DB idempotently. Both are `Project·Admin` (they
+        // mint owner-role identities) — gated at their OWN `/api/databases/*` prefix, ABOVE
+        // the `Some(_)`/`/api/…` project-deploy catch-all in `Right::required`, so a
+        // publisher/deployer/project_publisher can NEVER reach them (the migrate/repair
+        // placement). The `GET`/`GET/{name}` reads are `Project·Read`. The rewritten
+        // `/api/projects/{proj}/databases/…` form is served here via the `project_scope`
+        // layer. The `PUT` body is a small typed record; the ambient body limit is fine.
+        .route("/api/databases", get(list_databases))
+        .route(
+            "/api/databases/{name}",
+            get(get_database).put(declare_database),
+        )
+        .route("/api/databases/{name}/status", get(database_status))
+        .route("/api/databases/{name}/ensure", post(ensure_database));
     // Operator S3 upload-credential minting (`POST /api/blob-mint-upload`, PLAN-blob-s3-ingress §6):
     // mint a short-lived, scoped S3 upload credential for a project+site's blob container. Its OWN
     // prefix, gated at `BlobUpload·Write` (`Right::required`) — deliberately NOT under `/api/blobs`
@@ -577,6 +595,7 @@ pub fn router_with_fast(
         .layer(Extension(operator_sql_cap))
         .layer(Extension(migration_substrate_cap))
         .layer(Extension(tenant_repair_cap))
+        .layer(Extension(managed_db_declare_cap))
         .layer(Extension(tenant_deprovisioner_cap))
         .layer(Extension(compute_exec_cap))
         .layer(Extension(compute_volumes_cap))

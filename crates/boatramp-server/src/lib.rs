@@ -44,14 +44,14 @@ pub(crate) use admin_api::blob_mint_upload;
 pub(crate) use admin_api::{
     activate_deployment, cert_status, compute_dns, compute_dns_resolve, compute_exec, compute_ipam,
     compute_netdiag, compute_reconcile, compute_restart, compute_set_health, compute_status,
-    create_deployment, current_deployment, delete_compute, delete_compute_volume,
-    delete_project_tenancy, delete_site, get_compute, get_daemon_config, get_deployment,
-    get_project_tenancy, get_site_config, invalidate_cache, list_aliases, list_compute,
-    list_compute_volumes, list_deployments, list_sites, migrate_apply, migrate_baseline,
-    migrate_dry_run, migrate_status, prune_delete, prune_report, put_blob, put_compute,
-    put_daemon_config, put_project_tenancy, put_site_config, remove_alias, repair_apply,
-    repair_dry_run, rollback_daemon_config, scrub_blobs, set_alias, sql_exec, sql_move, sql_ping,
-    sql_query,
+    create_deployment, current_deployment, database_status, declare_database, delete_compute,
+    delete_compute_volume, delete_project_tenancy, delete_site, ensure_database, get_compute,
+    get_daemon_config, get_database, get_deployment, get_project_tenancy, get_site_config,
+    invalidate_cache, list_aliases, list_compute, list_compute_volumes, list_databases,
+    list_deployments, list_sites, migrate_apply, migrate_baseline, migrate_dry_run, migrate_status,
+    prune_delete, prune_report, put_blob, put_compute, put_daemon_config, put_project_tenancy,
+    put_site_config, remove_alias, repair_apply, repair_dry_run, rollback_daemon_config,
+    scrub_blobs, set_alias, sql_exec, sql_move, sql_ping, sql_query,
 };
 #[cfg(feature = "handlers")]
 pub(crate) use admin_api::{
@@ -1687,6 +1687,15 @@ pub struct ServerOptions {
     /// data-preserving. Backs the `Project·Admin`-gated `/api/repair/{db}` + `/dry-run`; `None` ⇒
     /// those routes return `501`. Wired by the node when a managed DB exists.
     pub tenant_repair: Option<Arc<dyn boatramp_core::sql::TenantRepair>>,
+    /// Project-scoped declarative managed-database capability (#501 Stage B): persists a
+    /// manifest `databases:` entry to `project-database/{project}/{name}`, enforces the
+    /// security invariants (daemon-config-wins at the merge point, identity-change
+    /// refusal, caller's-project binding), lowers it to the managed-credential path, and
+    /// eagerly provisions it. Backs the `Project·Admin`-gated
+    /// `PUT /api/projects/{proj}/databases/{name}` + `POST /api/databases/{name}/ensure`;
+    /// `None` ⇒ those routes return `501`. Wired by the node when a managed SQL engine + a
+    /// `[secrets]` envelope are both present.
+    pub managed_db_declare: Option<Arc<dyn boatramp_core::sql::ManagedDbDeclare>>,
     /// Tenant-deprovision capability: drops a deleted tenant's managed databases +
     /// roles + sealed credentials on project/site delete. `None` ⇒ delete does no
     /// managed-DB teardown. Wired by the node when a compute-backed managed database

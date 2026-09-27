@@ -346,6 +346,20 @@ impl Right {
                 Some((&"repair", _)) => {
                     Self::new(Resource::Project, Some(proj.to_string()), Action::Admin)
                 }
+                // Owner-gated DECLARATIVE managed-database front door
+                // (`/api/projects/<proj>/databases/…`, #501 Stage B): a `PUT` (declare) /
+                // `POST …/ensure` provisions owner-role identities (CREATE ROLE / owner-role
+                // DDL as superuser, exactly like migrate/repair), so the mutating verbs gate at
+                // **`Project·Admin`** — never the deploy-grade publisher the general project
+                // catch-all below would grant; read-only `GET` (ls/get/status) is
+                // `Project·Read`. Gated explicitly here, ABOVE that catch-all, so a
+                // `project_publisher`/deployer can NEVER declare a database (mirrors the
+                // migrate/repair placement — the `/api/repair` escalation lesson).
+                Some((&"databases", _)) => Self::new(
+                    Resource::Project,
+                    Some(proj.to_string()),
+                    if get { Action::Read } else { Action::Admin },
+                ),
                 // Operator S3 upload-credential minting (`POST /api/projects/<proj>/blob-mint-upload`,
                 // M3): gated with the DEDICATED `Resource::BlobUpload` scoped to THIS project (target
                 // `Some(<proj>)`, derived from the path — mirroring the repair/migrate precedent), NOT
@@ -477,6 +491,20 @@ impl Right {
                 Resource::Project,
                 Some(default_project.clone()),
                 Action::Admin,
+            ),
+            // The owner-gated DECLARATIVE managed-database front door (`/api/databases`,
+            // `/api/databases/{name}`, `/api/databases/{name}/{ensure,status}`, #501 Stage B).
+            // A `PUT` (declare) / `POST …/ensure` mints owner-role identities as the superuser
+            // (CREATE ROLE / owner-role DDL), so — exactly like `/api/migrate/` and
+            // `/api/repair/` above — the mutating verbs gate at **`Project·Admin`**, NEVER the
+            // deploy-grade publisher right the project-owned catch-alls use (a ship-only
+            // publisher must not be able to provision a database). Read-only `GET` (ls/get/
+            // status) needs only `Project·Read`. Its OWN prefix, gated explicitly, so a
+            // publisher can never reach the declare/provision path (the escalation lesson).
+            p if p == "/api/databases" || p.starts_with("/api/databases/") => Self::new(
+                Resource::Project,
+                Some(default_project.clone()),
+                if get { Action::Read } else { Action::Admin },
             ),
             // Operator S3 upload-credential minting (`POST /api/blob-mint-upload`, PLAN-blob-s3-ingress
             // §6 / M3): mint a short-lived, scoped S3 upload credential for a project+site's blob
@@ -2359,6 +2387,93 @@ mod tests {
         assert!(
             !acme_admin.allows(&globex_apply),
             "an acme grant must not reach globex's repair surface",
+        );
+    }
+
+    /// #501 Stage B — the DECLARATIVE managed-database front door (`/api/databases/…`) mints
+    /// owner-role identities (CREATE ROLE / owner-role DDL as superuser, exactly like
+    /// migrate/repair), so the mutating verbs (`PUT` declare, `POST …/ensure`) MUST gate at
+    /// `Project·Admin` — never the `Project·Deploy` grade a ship-only publisher holds (that would
+    /// be an escalation). Read-only `GET` (ls/get/status) is `Project·Read`. A `project_publisher`
+    /// is REFUSED the mutating verbs; a `project_admin` is ALLOWED — for the global (default-project)
+    /// AND the project-scoped forms alike. Cross-tenant grants do not leak.
+    ///
+    /// This is the mutation-sensitive assertion for the authz condition: a mutation that gated the
+    /// declare at `Project·Deploy` (nesting it under the general project catch-all) would let the
+    /// publisher `allows(&put)` — which this test asserts must be FALSE.
+    #[test]
+    fn databases_surface_is_project_admin_not_publisher() {
+        let policy = AuthzPolicy::default_policy();
+
+        // ---- Global (default-project) form. ----
+        let default_admin = Right::new(Resource::Project, Some("default".into()), Action::Admin);
+        let default_read = Right::new(Resource::Project, Some("default".into()), Action::Read);
+        // Mutating verbs (declare + ensure) → Admin.
+        for (method, path) in [
+            ("PUT", "/api/databases/appdb"),
+            ("POST", "/api/databases/appdb/ensure"),
+        ] {
+            assert_eq!(
+                Right::required(method, path),
+                Some(default_admin.clone()),
+                "{method} {path} must require Project·Admin (never the Deploy grade)",
+            );
+        }
+        // Read verbs (ls/get/status) → Read.
+        for path in [
+            "/api/databases",
+            "/api/databases/appdb",
+            "/api/databases/appdb/status",
+        ] {
+            assert_eq!(
+                Right::required("GET", path),
+                Some(default_read.clone()),
+                "GET {path} must require Project·Read",
+            );
+        }
+        let publisher = policy.rights_for(&[GrantedRole::scoped("project_publisher", "default")]);
+        let admin = policy.rights_for(&[GrantedRole::scoped("project_admin", "default")]);
+        let put = Right::required("PUT", "/api/databases/appdb").unwrap();
+        let ensure = Right::required("POST", "/api/databases/appdb/ensure").unwrap();
+        for req in [&put, &ensure] {
+            assert!(
+                !publisher.allows(req),
+                "a project_publisher must NOT be able to declare/provision a database",
+            );
+            assert!(
+                admin.allows(req),
+                "a project_admin must be able to declare/provision a database",
+            );
+        }
+
+        // ---- Project-scoped form (a non-default tenant). ----
+        let acme_admin_right = Right::new(Resource::Project, Some("acme".into()), Action::Admin);
+        assert_eq!(
+            Right::required("PUT", "/api/projects/acme/databases/appdb"),
+            Some(acme_admin_right.clone()),
+            "PUT on acme's databases must require Project·Admin on acme",
+        );
+        assert_eq!(
+            Right::required("POST", "/api/projects/acme/databases/appdb/ensure"),
+            Some(acme_admin_right),
+            "POST ensure on acme's databases must require Project·Admin on acme",
+        );
+        let acme_put = Right::required("PUT", "/api/projects/acme/databases/appdb").unwrap();
+        let acme_pub = policy.rights_for(&[GrantedRole::scoped("project_publisher", "acme")]);
+        let acme_admin = policy.rights_for(&[GrantedRole::scoped("project_admin", "acme")]);
+        assert!(
+            !acme_pub.allows(&acme_put),
+            "a project_publisher on acme must NOT declare acme's databases",
+        );
+        assert!(
+            acme_admin.allows(&acme_put),
+            "a project_admin on acme must declare acme's databases",
+        );
+        // Cross-tenant: an acme admin grant does NOT satisfy declaring globex's databases.
+        let globex_put = Right::required("PUT", "/api/projects/globex/databases/appdb").unwrap();
+        assert!(
+            !acme_admin.allows(&globex_put),
+            "an acme grant must not reach globex's databases surface",
         );
     }
 
