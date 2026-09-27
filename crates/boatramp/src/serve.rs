@@ -634,30 +634,38 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
         });
         // #505 (cluster path): the blob storage must be built BEFORE the Raft node (it feeds
         // `build_node` for cross-node message payloads), which is before the replicated control-plane KV
-        // exists — so a `boatramp:` (KV-backed) node-cred ref cannot be resolved here. Resolve the
-        // envelope-only forms (`env:`/bare, posture-gated) now, and REFUSE a `boatramp:` ref fail-closed
-        // with a clear message (the sealed-store node-cred on a cluster is a documented follow-up; use
-        // `env:` there). Absent source ⇒ the ambient AWS env chain (unchanged).
+        // exists — so a `boatramp:` (KV-backed) node-cred ref cannot be resolved here. Refuse a
+        // `boatramp:` ref STRUCTURALLY, by matching the ref scheme UP FRONT (not by relying on an empty
+        // stand-in store making the resolve miss — a future refactor that seeded/shared that KV would
+        // otherwise silently turn this into a live resolve against the wrong pre-replication store). The
+        // envelope-only forms (`env:`/bare, posture-gated) resolve NORMALLY so their own errors (unset
+        // var, posture-denied) surface UNWRAPPED — not buried under a misleading "use `env:`" suffix.
+        // Absent source ⇒ the ambient AWS env chain (unchanged).
         let mut cluster_blob_args = blob_args;
         if let Some(cfg) = s3_credential_cfg.as_ref() {
+            if let Some(name) =
+                boatramp_node::s3_credential::boatramp_ref_name(&cfg.secret_access_key)
+            {
+                return Err(Error::S3Ingress(
+                    boatramp_node::s3_credential::S3CredentialError::BoatrampRefOnCluster(
+                        name.to_string(),
+                    )
+                    .to_string(),
+                ));
+            }
             let envelope = serve_secrets_envelope(config.secrets.as_ref(), &data_dir)?;
             let cred = boatramp_node::s3_credential::resolve_s3_credential(
                 cfg,
-                // No replicated control-plane KV yet on this path: a `boatramp:` ref is refused below
-                // regardless, so an empty in-memory store is a correct stand-in for the `env:` forms.
+                // No replicated control-plane KV yet on this path; a `boatramp:` ref was already
+                // refused structurally above, so an empty in-memory store is a correct stand-in for
+                // the `env:` forms (which never touch the KV).
                 Arc::new(boatramp_core::kv::MemoryKv::new()),
                 envelope,
                 options.posture.allow_env_secret_refs,
                 &boatramp_core::env::SystemEnv,
             )
             .await
-            .map_err(|e| {
-                Error::S3Ingress(format!(
-                    "{e} (a `boatramp:<name>` [serve.s3_credential] node-cred is not supported on a \
-                     cluster this release — the blob backend is built before the replicated control \
-                     plane; use an `env:<VAR>` ref instead)"
-                ))
-            })?;
+            .map_err(|e| Error::S3Ingress(e.to_string()))?;
             cluster_blob_args.s3_credential = Some(cred);
         }
         let built_blobs =
@@ -718,6 +726,16 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
         notify_account,
     )
     .await?;
+    // The resolved sealed credential is consumed ONLY by the cloud blob-upload minter wiring below,
+    // which is gated on a `blob-upload-*` cloud feature; when none is compiled (e.g. a plain `cluster`
+    // build) the binding is otherwise unused. Discard it explicitly there to keep the build warning-free
+    // without dropping the fail-closed resolution above (still runs for its startup-error side effect).
+    #[cfg(not(any(
+        feature = "blob-upload-aws",
+        feature = "blob-upload-gcs",
+        feature = "blob-upload-azure"
+    )))]
+    let _ = &sealed_s3_credential;
     let storage = built_blobs.storage.clone();
 
     // Layout guard (0.2.0): refuse to serve a store still on the pre-project layout
@@ -2830,5 +2848,69 @@ mod tests {
         assert_eq!(parse_rotation_interval("5w"), None);
         assert_eq!(parse_rotation_interval("0d"), None);
         assert_eq!(parse_rotation_interval(""), None);
+    }
+
+    /// #505 (MEDIUM-1): on the cluster serve path a `boatramp:<name>` node-cred is refused
+    /// STRUCTURALLY by the up-front scheme check (`boatramp_ref_name` ⇒ `BoatrampRefOnCluster`), NOT by
+    /// an incidental empty-store miss, while a legitimate `env:` misconfig resolves normally and
+    /// surfaces its OWN error — never the misleading cluster "use `env:`" suffix. This asserts the exact
+    /// composition the cluster branch performs (the branch itself needs a full Raft bring-up).
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn cluster_path_refuses_boatramp_ref_structurally_and_surfaces_env_errors_unwrapped() {
+        use boatramp_node::config::S3CredentialConfig;
+        use boatramp_node::s3_credential::{
+            S3CredentialError, boatramp_ref_name, resolve_s3_credential,
+        };
+
+        // (1) STRUCTURAL refusal: the scheme check fires for a `boatramp:` ref, yielding the dedicated
+        // error, BEFORE any resolve touches a store. The cluster branch returns exactly this.
+        let cfg = S3CredentialConfig {
+            access_key_id: "AKID-PUBLIC".to_string(),
+            secret_access_key: "boatramp:tigris-key".to_string(),
+        };
+        let name = boatramp_ref_name(&cfg.secret_access_key)
+            .expect("a boatramp: ref is detected by the scheme check");
+        let cluster_err =
+            Error::S3Ingress(S3CredentialError::BoatrampRefOnCluster(name.to_string()).to_string())
+                .to_string();
+        assert!(
+            cluster_err.contains("not supported on a cluster"),
+            "the dedicated cluster refusal message: {cluster_err}"
+        );
+
+        // (2) An `env:` misconfig on the cluster path (unset var) resolves normally — an empty
+        // in-memory stand-in KV is correct because `env:` never touches the store — and surfaces its
+        // OWN error UNWRAPPED (mapped via `Error::S3Ingress(e.to_string())`), NOT the cluster suffix.
+        let cfg = S3CredentialConfig {
+            access_key_id: "AKID-PUBLIC".to_string(),
+            secret_access_key: "env:UNSET_S3_SECRET_FOR_TEST".to_string(),
+        };
+        assert!(
+            boatramp_ref_name(&cfg.secret_access_key).is_none(),
+            "an env: ref is NOT caught by the boatramp scheme check"
+        );
+        let err = resolve_s3_credential(
+            &cfg,
+            std::sync::Arc::new(boatramp_core::kv::MemoryKv::new()),
+            None,
+            true, // allow_env_secret_refs: the dev posture, so it gets past the posture gate to `unset`
+            &boatramp_core::env::MapEnv::new(),
+        )
+        .await
+        .expect_err("an unset env var must error");
+        assert_eq!(
+            err,
+            S3CredentialError::EnvVarUnset("UNSET_S3_SECRET_FOR_TEST".to_string())
+        );
+        let mapped = Error::S3Ingress(err.to_string()).to_string();
+        assert!(
+            mapped.contains("is not set"),
+            "the env error surfaces its own message: {mapped}"
+        );
+        assert!(
+            !mapped.contains("not supported on a cluster"),
+            "the env error must NOT carry the misleading cluster suffix: {mapped}"
+        );
     }
 }
