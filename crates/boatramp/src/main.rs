@@ -52,6 +52,7 @@ mod completions;
 mod compose;
 mod compression;
 mod compute;
+mod db;
 mod sql;
 // The config model moved to `boatramp-node` (library); re-export it under the
 // binary's `crate::config` so existing call sites are unchanged.
@@ -184,6 +185,10 @@ enum Command {
     Compute(compute::ComputeArgs),
     /// Operator SQL to a managed database: apply a migration script or run a query.
     Sql(sql::SqlArgs),
+    /// Inspect a project's declared managed databases (read-only: `db ls|get|status`).
+    /// Declaring/provisioning is done via the manifest `databases:` block (`boatramp
+    /// apply`) — there is deliberately no `db create`.
+    Db(db::DbArgs),
     /// Upload a file as a content-addressed blob (e.g. a microVM kernel).
     Blob(blob::BlobArgs),
     /// Read/change the dynamic daemon config (get/set/rollback/apply, no restart).
@@ -495,6 +500,7 @@ async fn async_main() -> Result<(), CliError> {
         Command::Gateway(args) => gateway::run(args, &config).await?,
         Command::Compute(args) => compute::run(args, &config).await?,
         Command::Sql(args) => sql::run(args, &config).await?,
+        Command::Db(args) => db::run(args, &config).await?,
         Command::Blob(args) => blob::run(args, &config).await?,
         Command::Config(args) => config_cmd::run(args, &config).await?,
         #[cfg(feature = "acme-dns")]
