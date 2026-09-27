@@ -13,6 +13,45 @@ use std::sync::Arc;
 
 use boatramp_handlers::BlobUploadMinter;
 
+/// A node-level **sealed base S3 credential** `(access_key_id, secret_access_key)` for the AWS cloud
+/// minter's STS/presign SDK config (#505). The secret half is confidential, so `Debug` is manual and
+/// **redacts** it — `CloudMinterSpec` derives `Debug`, so a struct-`Debug` in a log/panic must not leak
+/// the sealed key (mirrors `S3IngressSecret` / `azure_core::Secret`).
+#[derive(Clone)]
+pub struct BaseCredential {
+    access_key_id: String,
+    secret_access_key: String,
+}
+
+impl BaseCredential {
+    /// Build from a resolved `(access_key_id, secret_access_key)` pair.
+    pub fn new(access_key_id: String, secret_access_key: String) -> Self {
+        Self {
+            access_key_id,
+            secret_access_key,
+        }
+    }
+
+    /// The public access-key id.
+    pub fn access_key_id(&self) -> &str {
+        &self.access_key_id
+    }
+
+    /// The confidential secret access key (behind a method so a caller asks explicitly).
+    pub fn secret_access_key(&self) -> &str {
+        &self.secret_access_key
+    }
+}
+
+impl std::fmt::Debug for BaseCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BaseCredential")
+            .field("access_key_id", &self.access_key_id)
+            .field("secret_access_key", &"<redacted>")
+            .finish()
+    }
+}
+
 /// Which cloud backend the node's blobs live on, plus the per-cloud brokering knobs. The binary
 /// populates this from its resolved blob-backend args + `[serve.s3_ingress_cloud]`. Only the arm for
 /// the active backend is consulted.
@@ -27,6 +66,10 @@ pub enum CloudMinterSpec {
         /// The role ARN to assume; `None` + `use_federation_token` ⇒ `GetFederationToken`.
         role_arn: Option<String>,
         use_federation_token: bool,
+        /// The node-level **sealed base S3 credential** to sign the STS/presign SDK config with (#505),
+        /// or `None` for the ambient AWS env chain (the historical default). The SAME source the S3 blob
+        /// object backend uses — construens' one Tigris key. Redacted from `Debug` (see [`BaseCredential`]).
+        base_credential: Option<BaseCredential>,
     },
     /// A GCS backend: broker a V4 signed PUT URL / a downscoped CAB token.
     Gcs {
@@ -59,9 +102,30 @@ pub async fn build_cloud_minter(
             force_path_style,
             role_arn,
             use_federation_token,
+            base_credential,
         } => {
             use super::aws::{AwsBlobUploadMinter, AwsMinterConfig, StsMode};
-            let sdk_config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+            let mut sdk_config =
+                aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+            // #505: when the operator configured a node-level sealed base credential, override the
+            // resolved chain so the STS + S3 (presign) clients the minter builds from this `SdkConfig`
+            // sign with the sealed key — never the ambient `AWS_ACCESS_KEY_ID`/`_SECRET`. `None` ⇒ the
+            // ambient chain (unchanged).
+            if let Some(cred) = &base_credential {
+                let provider = aws_sdk_sts::config::SharedCredentialsProvider::new(
+                    aws_sdk_sts::config::Credentials::new(
+                        cred.access_key_id().to_string(),
+                        cred.secret_access_key().to_string(),
+                        None,
+                        None,
+                        "boatramp-sealed",
+                    ),
+                );
+                sdk_config = sdk_config
+                    .into_builder()
+                    .credentials_provider(provider)
+                    .build();
+            }
             let sts_mode = match (role_arn, use_federation_token) {
                 (Some(role_arn), _) => StsMode::AssumeRole { role_arn },
                 (None, true) => StsMode::GetFederationToken,
@@ -128,5 +192,52 @@ pub async fn build_cloud_minter(
         }
         #[cfg(not(feature = "blob-upload-azure"))]
         CloudMinterSpec::Azure { .. } => Ok(None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn base_credential_redacts_the_secret_in_debug() {
+        // #505 minter-injection side: the sealed base credential the AWS minter's STS/presign SDK config
+        // signs with must NEVER leak in a `CloudMinterSpec`/`BaseCredential` `Debug` (log/panic). The
+        // public access-key id is fine; the secret is redacted (mirrors the backend's `S3Options`).
+        let cred = BaseCredential::new(
+            "AKID-PUBLIC".to_string(),
+            "SUPER-SECRET-DO-NOT-LOG".to_string(),
+        );
+        assert_eq!(cred.access_key_id(), "AKID-PUBLIC");
+        assert_eq!(cred.secret_access_key(), "SUPER-SECRET-DO-NOT-LOG");
+        let dbg = format!("{cred:?}");
+        assert!(
+            !dbg.contains("SUPER-SECRET-DO-NOT-LOG"),
+            "the sealed secret must be redacted from BaseCredential Debug: {dbg}"
+        );
+        assert!(
+            dbg.contains("<redacted>"),
+            "redaction marker present: {dbg}"
+        );
+        assert!(
+            dbg.contains("AKID-PUBLIC"),
+            "the access-key id is public: {dbg}"
+        );
+        // And the enclosing CloudMinterSpec::Aws Debug must not leak it either (it derives Debug, which
+        // delegates to BaseCredential's manual redacting Debug).
+        let spec = CloudMinterSpec::Aws {
+            bucket: "b".to_string(),
+            region: "auto".to_string(),
+            endpoint: None,
+            force_path_style: false,
+            role_arn: None,
+            use_federation_token: true,
+            base_credential: Some(cred),
+        };
+        let spec_dbg = format!("{spec:?}");
+        assert!(
+            !spec_dbg.contains("SUPER-SECRET-DO-NOT-LOG"),
+            "CloudMinterSpec::Aws Debug must not leak the sealed secret: {spec_dbg}"
+        );
     }
 }
