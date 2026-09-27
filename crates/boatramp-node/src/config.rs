@@ -1999,12 +1999,12 @@ pub struct PublishConfig {
 }
 
 /// `build` section.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
 pub struct BuildConfig {
     /// Shell command to run (e.g. `npm run build`).
     pub command: String,
     /// Directory the build emits, published by `sync` (e.g. `dist`).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<String>,
 }
 
