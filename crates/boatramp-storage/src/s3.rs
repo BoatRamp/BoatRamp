@@ -30,7 +30,7 @@ pub struct S3Storage {
 }
 
 /// Connection options for [`S3Storage::connect`].
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct S3Options {
     /// Bucket to store blobs in.
     pub bucket: String,
@@ -40,6 +40,53 @@ pub struct S3Options {
     pub region: Option<String>,
     /// Use path-style addressing (required by MinIO and most S3-compatibles).
     pub force_path_style: bool,
+    /// An explicit **base credential** `(access_key_id, secret_access_key)` to use instead of the
+    /// ambient AWS env chain (#505 sealed-store sourcing). `None` ⇒ credentials come from the ambient
+    /// AWS environment (env vars / shared config / instance metadata), the historical behavior. When
+    /// `Some`, a static `Credentials` provider is installed on the SDK config so the base key is the
+    /// sealed one, never `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`. The secret half is confidential,
+    /// so `S3Options` no longer derives `Debug` (it would leak it) — see the manual redacting impl.
+    pub credential: Option<(String, String)>,
+}
+
+/// `Debug` redacts the `credential` secret half so a struct-`Debug` of `S3Options` in a log/panic
+/// cannot leak the sealed base key (#505). All other fields are non-secret and shown; the credential is
+/// reduced to whether it is set + its (public) access-key id.
+impl std::fmt::Debug for S3Options {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("S3Options")
+            .field("bucket", &self.bucket)
+            .field("endpoint", &self.endpoint)
+            .field("region", &self.region)
+            .field("force_path_style", &self.force_path_style)
+            .field(
+                "credential",
+                &self
+                    .credential
+                    .as_ref()
+                    .map(|(id, _)| {
+                        format!("Some(access_key_id={id:?}, secret_access_key=<redacted>)")
+                    })
+                    .unwrap_or_else(|| "None".to_string()),
+            )
+            .finish()
+    }
+}
+
+/// Build the static AWS [`Credentials`](aws_sdk_s3::config::Credentials) provider for an explicit sealed
+/// base credential (#505). The provider name `boatramp-sealed` is what shows in any AWS SDK diagnostic
+/// as the credential source (never the secret).
+fn sealed_credentials_provider(
+    access_key_id: &str,
+    secret_access_key: &str,
+) -> aws_sdk_s3::config::SharedCredentialsProvider {
+    aws_sdk_s3::config::SharedCredentialsProvider::new(aws_sdk_s3::config::Credentials::new(
+        access_key_id.to_string(),
+        secret_access_key.to_string(),
+        None,
+        None,
+        "boatramp-sealed",
+    ))
 }
 
 impl S3Storage {
@@ -70,7 +117,9 @@ impl S3Storage {
 
     /// Build a backend from explicit [`S3Options`], honoring a custom endpoint
     /// (MinIO and other S3-compatibles), region, and path-style addressing.
-    /// Credentials still come from the ambient AWS environment.
+    /// Credentials come from the ambient AWS environment UNLESS
+    /// [`opts.credential`](S3Options::credential) supplies an explicit sealed base
+    /// credential (#505), in which case a static provider is installed instead.
     pub async fn connect(opts: S3Options) -> Self {
         let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest());
         if let Some(region) = opts.region.clone() {
@@ -83,6 +132,15 @@ impl S3Storage {
         let mut builder = aws_sdk_s3::config::Builder::from(&shared);
         if opts.force_path_style {
             builder = builder.force_path_style(true);
+        }
+        // #505: source the base credential from the sealed store instead of the ambient env chain when
+        // configured. `SharedCredentialsProvider::new(Credentials::new(...))` overrides the resolved
+        // chain, so the key the backend signs with is the sealed one.
+        if let Some((access_key_id, secret_access_key)) = &opts.credential {
+            builder = builder.credentials_provider(sealed_credentials_provider(
+                access_key_id,
+                secret_access_key,
+            ));
         }
         Self::new(aws_sdk_s3::Client::from_conf(builder.build()), opts.bucket)
     }
@@ -103,6 +161,15 @@ impl S3Storage {
         }
         if let Some(endpoint) = opts.endpoint.clone() {
             loader = loader.endpoint_url(endpoint);
+        }
+        // #505: install the sealed base credential on the shared config BEFORE `.load()`, so BOTH the S3
+        // client and the SQS notify client (built from `&shared` below) sign with the sealed key rather
+        // than the ambient env chain. `None` ⇒ the ambient chain (unchanged).
+        if let Some((access_key_id, secret_access_key)) = &opts.credential {
+            loader = loader.credentials_provider(sealed_credentials_provider(
+                access_key_id,
+                secret_access_key,
+            ));
         }
         let shared = loader.load().await;
         let mut builder = aws_sdk_s3::config::Builder::from(&shared);

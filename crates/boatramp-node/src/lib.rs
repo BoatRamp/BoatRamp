@@ -37,6 +37,8 @@ pub mod managed_db_declare;
 pub mod node;
 #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
 pub mod repair;
+/// Node-level base S3 credential sourcing from the `[secrets]` sealed store (#505).
+pub mod s3_credential;
 #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
 pub mod tenant_sql;
 #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]

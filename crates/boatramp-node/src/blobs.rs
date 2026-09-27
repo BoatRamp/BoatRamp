@@ -18,6 +18,11 @@ use boatramp_storage::FsStorage;
 
 /// The resolved blob-backend selection — the binary populates this from its CLI
 /// `ServeArgs` (the credential/endpoint flags), keeping clap out of the library.
+///
+/// `s3_credential` (#505) is the optional node-level **sealed base S3 credential** the operator
+/// resolved from the `[secrets]` store; when present it is injected into the S3 client's SDK config
+/// instead of the ambient env chain. It is a redacted [`SealedS3Credential`], so `BlobArgs` can keep its
+/// derived `Debug` without leaking the secret.
 #[derive(Debug, Clone)]
 pub struct BlobArgs {
     pub blobs: BlobBackend,
@@ -25,6 +30,8 @@ pub struct BlobArgs {
     pub s3_endpoint: Option<String>,
     pub s3_region: Option<String>,
     pub s3_path_style: bool,
+    /// The node-level sealed base S3 credential (#505). `None` ⇒ the ambient AWS env chain (unchanged).
+    pub s3_credential: Option<crate::s3_credential::SealedS3Credential>,
     pub gcs_bucket: Option<String>,
     pub gcs_endpoint: Option<String>,
     pub gcs_anonymous: bool,
@@ -184,6 +191,9 @@ async fn build_s3(
         endpoint: args.s3_endpoint.clone(),
         region: args.s3_region.clone(),
         force_path_style: args.s3_path_style,
+        // #505: when the operator configured a node-level sealed base credential, inject it so the S3
+        // client signs with the sealed key rather than the ambient `AWS_ACCESS_KEY_ID`/`_SECRET`.
+        credential: args.s3_credential.as_ref().map(|c| c.as_pair()),
     };
     match notify_tier {
         // Blob-change notification provisioning is enabled: build the

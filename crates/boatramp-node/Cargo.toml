@@ -116,6 +116,12 @@ blob-upload = [
 s3 = ["dep:boatramp-storage", "boatramp-storage/s3"]
 slatedb = ["dep:boatramp-storage", "boatramp-storage/slatedb"]
 tls = []
+# CI gate lane for #505 sealed-store S3 credential sourcing (`S3 SEALED-CRED SOURCING OK`). When ON,
+# the `s3_credential::gate` battery compiles + each `BOATRAMP_S3SEALED_MUTATE_*` env var neuters exactly
+# ONE security check (via a `#[cfg(feature = "s3-sealed-cred-gate-mutation")]` seam), so CI can prove the
+# gate is load-bearing by asserting every mutation FAILS it. Implies `s3` (the backend-injection assert)
+# so the whole path is exercised on the host toolchain (no live cloud).
+s3-sealed-cred-gate-mutation = ["s3"]
 
 [dev-dependencies]
 # The in-process fidelity test (`node::tests`) drives the assembled router with a

@@ -26,6 +26,8 @@ fn options() -> Option<S3Options> {
         region: std::env::var("BOATRAMP_TEST_S3_REGION").ok(),
         // MinIO and most self-hosted gateways require path-style addressing.
         force_path_style: true,
+        // The ambient AWS env chain (this live test relies on the MinIO/env credentials).
+        credential: None,
     })
 }
 
