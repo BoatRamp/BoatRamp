@@ -1920,6 +1920,16 @@ pub struct ServeConfig {
     /// Use the Azurite emulator (well-known dev credentials + local endpoint). Fallback for
     /// `--azure-emulator`.
     pub azure_emulator: bool,
+    /// `[serve.blob_fallback]` — a **read-only SECONDARY blob backend** for a zero-downtime
+    /// backend switch (blob-backend migration Part 2). When set, serving reads the PRIMARY (the
+    /// `blobs`/`s3_*`/`gcs_*`/`azure_*` fields above) first and, on a definitive miss for a
+    /// boatramp-owned key, falls through to this secondary — so a `--blobs` switch (fs→cloud,
+    /// provider→provider, region→region) has no serving gap while `boatramp blob migrate` drains
+    /// the secondary into the primary. **Writes are primary-only**; the secondary is never written
+    /// or deleted. This is a **bounded transition aid**: drain, verify, then remove this block and
+    /// restart (the node logs a prominent startup WARNING while it is active, and GC prune is
+    /// refused). Absent ⇒ no fallback (unchanged). See [`BlobFallbackConfig`].
+    pub blob_fallback: Option<BlobFallbackConfig>,
     /// Token root **private** key (hex) — issuing node: verifies *and* mints
     /// tokens / OIDC exchanges.
     pub auth_root_private_key: Option<String>,
@@ -2048,6 +2058,63 @@ pub struct S3CredentialConfig {
     /// ref configured with NO `[secrets]` envelope is a fail-closed startup error.
     pub secret_access_key: String,
 }
+
+/// `[serve.blob_fallback]` — a **read-only SECONDARY blob backend** for a zero-downtime backend switch
+/// (blob-backend migration Part 2). Same backend-descriptor shape as the PRIMARY (`[serve]`'s
+/// `blobs`/`s3_*`/`gcs_*`/`azure_*` fields) so a source/dest is fully described by config, plus its OWN
+/// optional `s3_credential` (the secondary can source its base S3 credential from the sealed `[secrets]`
+/// store via its own `boatramp:`/`env:` ref, #505). Constructed exactly like the primary but with NO
+/// watcher provisioning (a read-only drain source never watches). Serving wraps
+/// `FallbackStorage::new(primary, secondary, …)` so a primary miss on a boatramp-owned key falls through
+/// to this secondary; writes/deletes are primary-only.
+///
+/// The secondary is **never** handed to the blob-upload/STS minter — external ingress mints against the
+/// PRIMARY only (the new backend the client should upload to), so this credential never reaches the
+/// minter path.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BlobFallbackConfig {
+    /// The secondary blob backend (`fs`/`s3`/`gcs`/`azure`) — the OLD backend to fall back to on a
+    /// primary miss. Absent ⇒ `fs` (the default, matching the primary's `blobs` default).
+    pub blobs: Option<crate::backends::BlobBackend>,
+    /// S3 bucket (secondary `blobs = s3`).
+    pub s3_bucket: Option<String>,
+    /// S3 endpoint URL (a MinIO/R2/Tigris endpoint) for the secondary.
+    pub s3_endpoint: Option<String>,
+    /// S3 region for the secondary.
+    pub s3_region: Option<String>,
+    /// Use S3 path-style addressing (MinIO) for the secondary.
+    #[serde(default)]
+    pub s3_path_style: bool,
+    /// The secondary's OWN node-level sealed base S3 credential source (#505) — resolved through the
+    /// SAME `resolve_s3_credential` path as the primary (same fail-closed posture, no second parser).
+    /// Absent ⇒ the ambient AWS env chain (unchanged).
+    pub s3_credential: Option<S3CredentialConfig>,
+    /// GCS bucket (secondary `blobs = gcs`).
+    pub gcs_bucket: Option<String>,
+    /// GCS storage endpoint URL (a `fake-gcs-server` emulator) for the secondary.
+    pub gcs_endpoint: Option<String>,
+    /// Skip GCS credential resolution (anonymous — the emulator) for the secondary.
+    #[serde(default)]
+    pub gcs_anonymous: bool,
+    /// Azure storage account name (secondary `blobs = azure`).
+    pub azure_account: Option<String>,
+    /// Azure container name for the secondary.
+    pub azure_container: Option<String>,
+    /// Azure storage account access key (shared-key auth) for the secondary.
+    pub azure_access_key: Option<String>,
+    /// Use the Azurite emulator for the secondary.
+    #[serde(default)]
+    pub azure_emulator: bool,
+    /// Bound (seconds) on each secondary read so a wedged secondary degrades a primary miss to
+    /// `NotFound` instead of hanging the serve path. Absent ⇒ [`DEFAULT_BLOB_FALLBACK_TIMEOUT_SECS`].
+    pub secondary_timeout_secs: Option<u64>,
+}
+
+/// Default bound (seconds) on a `[serve.blob_fallback]` secondary read when
+/// `secondary_timeout_secs` is unset: 5s — long enough for a cloud round-trip, short enough that a
+/// wedged secondary degrades a primary miss to `NotFound` promptly rather than hanging serving.
+pub const DEFAULT_BLOB_FALLBACK_TIMEOUT_SECS: u64 = 5;
 
 /// `[serve.s3_ingress_cloud]` — the cloud-brokering knobs for the M4 blob-upload minter (which native
 /// credential the mint brokers when the node's blob backend is a cloud object store). Only the fields
@@ -3472,6 +3539,43 @@ mod tests {
         assert!(
             err.is_err(),
             "unknown [serve.s3_credential] field must be rejected"
+        );
+    }
+
+    #[test]
+    fn serve_blob_fallback_config_parses() {
+        // Blob-backend migration Part 2: absent ⇒ no fallback (the read-through composite is not wired).
+        let cfg = server(r#"( serve: ( addr: "0.0.0.0:8080" ) )"#);
+        assert!(cfg.serve.unwrap().blob_fallback.is_none());
+        // A `[serve.blob_fallback]` secondary: the OLD fs backend to drain while the primary is s3,
+        // with its own sealed S3 credential ref and a custom secondary timeout.
+        let cfg = server(
+            r#"( serve: (
+                blobs: s3,
+                s3_bucket: "new-bucket",
+                blob_fallback: (
+                    blobs: fs,
+                    secondary_timeout_secs: 3,
+                    s3_credential: (
+                        access_key_id: "old_akid",
+                        secret_access_key: "boatramp:old-secret",
+                    ),
+                ),
+            ) )"#,
+        );
+        let serve = cfg.serve.unwrap();
+        let fb = serve.blob_fallback.unwrap();
+        assert_eq!(fb.blobs, Some(crate::backends::BlobBackend::Fs));
+        assert_eq!(fb.secondary_timeout_secs, Some(3));
+        let cred = fb.s3_credential.unwrap();
+        assert_eq!(cred.access_key_id, "old_akid");
+        assert_eq!(cred.secret_access_key, "boatramp:old-secret");
+        // An unknown field is rejected (`deny_unknown_fields`).
+        let err: Result<ServerConfig, _> =
+            ron_options().from_str(r#"( serve: ( blob_fallback: ( blobs: fs, bogus: 1 ) ) )"#);
+        assert!(
+            err.is_err(),
+            "unknown [serve.blob_fallback] field must be rejected"
         );
     }
 }

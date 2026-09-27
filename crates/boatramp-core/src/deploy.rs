@@ -98,7 +98,14 @@ fn backfill_replica_project(state: &mut crate::compute::ObservedInstance, projec
 
 /// Whether `key` is a sharded blob key (`ab/<64 hex>`). Used so GC never
 /// touches objects it did not write, even in a shared bucket.
-fn is_blob_key(key: &str) -> bool {
+///
+/// Also the immutable, content-addressed half of the `FallbackStorage` read-through
+/// allowlist ([`boatramp_storage::FallbackStorage`]) — a composite read-fallback falls
+/// through to its secondary ONLY for a boatramp-owned key (`is_blob_key`, or the mutable
+/// `hblob/`/`mqgp/` guest/messaging prefixes), so a stray non-boatramp key can never
+/// silently resurrect off a secondary during a transition. `pub` so that generic
+/// storage-crate predicate can reuse this ONE definition.
+pub fn is_blob_key(key: &str) -> bool {
     match key.split_once('/') {
         Some((shard, hash)) => {
             shard.len() == 2
@@ -3574,6 +3581,16 @@ impl DeployStore {
         prune: bool,
         opts: GcOptions,
     ) -> Result<GcReport, DeployError> {
+        // Fail-closed: a destructive prune against a backend that forbids pruning
+        // (a read-fallback `FallbackStorage` — union `list`, primary-only `delete`)
+        // is refused BEFORE anything is deleted. Its union `list` would count a
+        // secondary-only orphan as reclaimed while the primary-only `delete` no-ops on
+        // the read-only secondary and a subsequent read resurrects it — a phantom
+        // reclaim. A non-pruning drift/report (`prune == false`) is unaffected and
+        // proceeds. Drain-then-drop is the doctrine (see the error message).
+        if prune && !self.storage.allows_prune() {
+            return Err(DeployError::PruneUnsafeWithFallback);
+        }
         let live_ids = self.live_deployment_ids(&opts).await?;
         let now = now_unix();
 
@@ -6428,6 +6445,66 @@ mod tests {
         // ...without one, it is collectable.
         let report = store.collect_garbage(false).await.unwrap();
         assert_eq!(report.manifests_removed, 1);
+    }
+
+    /// GC prune is REFUSED on a backend whose `allows_prune()` is `false` (a read-fallback
+    /// `FallbackStorage` — its union `list` over a primary-only `delete` would report a secondary-only
+    /// orphan reclaimed while a read resurrects it). A dry-run/report (`prune == false`) still proceeds.
+    #[tokio::test]
+    async fn gc_refuses_prune_on_no_prune_backend() {
+        use crate::kv::MemoryKv;
+        /// A `Storage` that forbids pruning (models the `FallbackStorage` composite) — every op is a
+        /// benign default; the point is `allows_prune() == false`.
+        struct NoPruneStorage;
+        #[async_trait::async_trait]
+        impl Storage for NoPruneStorage {
+            async fn get(&self, _: &str) -> Result<GetObject, StorageError> {
+                Err(StorageError::NotFound(String::new()))
+            }
+            async fn get_range(
+                &self,
+                _: &str,
+                _: u64,
+                _: Option<u64>,
+            ) -> Result<GetObject, StorageError> {
+                Err(StorageError::NotFound(String::new()))
+            }
+            async fn put(
+                &self,
+                _: &str,
+                _: ByteStream,
+                _: PutMeta,
+            ) -> Result<ObjectMeta, StorageError> {
+                Err(StorageError::unsupported("no-prune"))
+            }
+            async fn head(&self, _: &str) -> Result<ObjectMeta, StorageError> {
+                Err(StorageError::NotFound(String::new()))
+            }
+            async fn delete(&self, _: &str) -> Result<(), StorageError> {
+                Ok(())
+            }
+            async fn list(&self, _: &str) -> Result<Vec<ObjectMeta>, StorageError> {
+                Ok(Vec::new())
+            }
+            fn allows_prune(&self) -> bool {
+                false
+            }
+        }
+
+        let store = DeployStore::new(Arc::new(NoPruneStorage), Arc::new(MemoryKv::new()));
+        // A destructive prune is refused BEFORE anything is touched.
+        assert!(
+            matches!(
+                store.collect_garbage(true).await,
+                Err(DeployError::PruneUnsafeWithFallback)
+            ),
+            "GC prune must be refused on a no-prune (read-fallback) backend"
+        );
+        // A non-pruning drift/report pass is unaffected.
+        assert!(
+            store.collect_garbage(false).await.is_ok(),
+            "a non-pruning GC report must still proceed on a no-prune backend"
+        );
     }
 
     #[tokio::test]

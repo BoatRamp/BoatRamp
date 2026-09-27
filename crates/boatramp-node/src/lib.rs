@@ -17,6 +17,13 @@
 
 pub mod auth;
 pub mod backends;
+/// The `BLOB FALLBACK ZERO-GAP OK` mutation-verified gate (blob-backend migration Part 2). Compiled
+/// ONLY under the `blob-fallback-gate-mutation` feature (the CI gate lane): it drives the real
+/// [`FallbackStorage`](boatramp_storage::FallbackStorage) composite over real `FsStorage` tempdir
+/// backends + a real `DeployStore` for the GC-refusal invariant, and prints the marker only on a
+/// clean run.
+#[cfg(feature = "blob-fallback-gate-mutation")]
+pub mod blob_fallback;
 /// Offline, node-local blob-backend migration (`boatramp blob migrate`) — the copy engine over
 /// the [`Storage`](boatramp_core::Storage) primitives.
 pub mod blob_migrate;

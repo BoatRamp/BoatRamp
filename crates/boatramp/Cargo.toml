@@ -64,10 +64,14 @@ default = [
   "operator",
   "mcp",
 ]
-fs = ["boatramp-storage/fs", "boatramp-node/fs"]
-s3 = ["boatramp-storage/s3", "boatramp-node/s3"]
-gcs = ["boatramp-storage/gcs", "boatramp-node/gcs"]
-azure = ["boatramp-storage/azure", "boatramp-node/azure"]
+# The read-fallback composite (blob-backend migration Part 2): `[serve.blob_fallback]` wraps
+# `FallbackStorage` over the built primary. Generic (no cloud dep of its own), so each blob-backend
+# feature turns it on and it rides along with any backend the binary can build.
+fallback = ["boatramp-node/fallback"]
+fs = ["boatramp-storage/fs", "boatramp-node/fs", "fallback"]
+s3 = ["boatramp-storage/s3", "boatramp-node/s3", "fallback"]
+gcs = ["boatramp-storage/gcs", "boatramp-node/gcs", "fallback"]
+azure = ["boatramp-storage/azure", "boatramp-node/azure", "fallback"]
 cloudflare-kv = [
   "boatramp-storage/cloudflare-kv",
   "boatramp-node/cloudflare-kv",

@@ -190,6 +190,15 @@ impl Storage for CachedStorage {
     fn local_file(&self, key: &str) -> Option<std::fs::File> {
         self.inner.local_file(key)
     }
+
+    /// Delegate to the wrapped backend. A cache is a pure read-through decorator —
+    /// it does not change what may be pruned — so a cache OVER a read-fallback
+    /// composite (`cache(fallback(primary, secondary))`, the required wiring order)
+    /// must still report `false`, or the GC refusal would be bypassed by the cache
+    /// layer.
+    fn allows_prune(&self) -> bool {
+        self.inner.allows_prune()
+    }
 }
 
 #[cfg(test)]

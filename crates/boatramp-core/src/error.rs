@@ -106,6 +106,20 @@ pub enum DeployError {
     /// confinement). Surfaced as a `400 Bad Request` — the write is refused, not stored.
     #[error("invalid config: {0}")]
     Invalid(String),
+
+    /// A destructive GC prune was requested against a blob backend that does not allow
+    /// pruning ([`crate::Storage::allows_prune`] is `false`) — a read-fallback composite
+    /// (`FallbackStorage`) is attached, whose union `list` over a primary-only `delete`
+    /// would report a secondary-only orphan reclaimed while a read resurrects it. The
+    /// prune is refused entirely (nothing deleted); a non-pruning drift/report pass is
+    /// unaffected. Drain-then-drop is the doctrine (see the message).
+    #[error(
+        "GC prune refused: a read-fallback secondary blob backend is attached \
+         ([serve].blob_fallback); its union list over a primary-only delete would report a \
+         secondary-only orphan reclaimed while a read resurrects it. Drain with \
+         `boatramp blob migrate`, remove [serve].blob_fallback, restart the node, then GC."
+    )]
+    PruneUnsafeWithFallback,
 }
 
 impl From<serde_json::Error> for DeployError {

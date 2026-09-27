@@ -70,6 +70,13 @@ sql-mysql = ["dep:sqlx", "dep:sqlparser", "dep:log", "sqlx/mysql"]
 # A bounded local read-through cache over any `Storage`:
 # clustered/CF nodes front the shared object store with a hot-blob cache.
 cache = ["dep:lru", "dep:bytes"]
+# A read-fallback composite over two `Storage` backends (blob-backend migration Part 2):
+# serve the new (primary) backend first, fall through to the old (secondary) on a
+# definitive, allowlisted primary miss, so a `--blobs` switch has no serving gap while
+# `boatramp blob migrate` drains the secondary. `tokio/time` bounds each secondary read
+# (a wedged secondary degrades a miss to NotFound, never a hang); `bytes` for the
+# `Storage::mapped` return type.
+fallback = ["dep:bytes", "tokio/time"]
 
 [dependencies]
 boatramp-core.workspace = true

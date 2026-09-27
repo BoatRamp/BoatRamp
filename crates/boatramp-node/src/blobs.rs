@@ -7,6 +7,8 @@
 
 use std::path::Path;
 use std::sync::Arc;
+#[cfg(feature = "fallback")]
+use std::time::Duration;
 
 use boatramp_core::Storage;
 
@@ -15,6 +17,24 @@ use crate::error::{Error, Result};
 
 #[cfg(feature = "fs")]
 use boatramp_storage::FsStorage;
+
+/// The boatramp read-fallback allowlist predicate (blob-backend migration Part 2): a primary miss
+/// falls through to the read-only secondary ONLY for a boatramp-OWNED key —
+/// - a content-addressed deploy blob (`{2hex}/{64hex}`, via [`boatramp_core::deploy::is_blob_key`]),
+/// - a guest object (`hblob/…`),
+/// - a messaging object (`mqgp/…`).
+///
+/// Any OTHER key (e.g. a stray `config/…` that should never live in the blob store — the mutable
+/// control-plane records are in the KV, not `Storage`) is primary-only, so it can NEVER silently
+/// resurrect off a secondary during a transition (Security Finding F4/G5-cp, defense-in-depth). The
+/// predicate is supplied to the generic [`FallbackStorage`](boatramp_storage::FallbackStorage), which
+/// hardcodes no app prefixes.
+#[cfg(feature = "fallback")]
+pub fn blob_fallback_when() -> boatramp_storage::FallbackWhen {
+    Arc::new(|k: &str| {
+        boatramp_core::deploy::is_blob_key(k) || k.starts_with("hblob/") || k.starts_with("mqgp/")
+    })
+}
 
 /// The resolved blob-backend selection — the binary populates this from its CLI
 /// `ServeArgs` (the credential/endpoint flags), keeping clap out of the library.
@@ -75,6 +95,50 @@ pub async fn build_blobs(
         BlobBackend::Gcs => build_gcs(args, notify_tier, notify_account).await,
         BlobBackend::Azure => build_azure(args, notify_tier, notify_account).await,
     }
+}
+
+/// Build the PRIMARY blob backend (with its notify provisioning) and, when `fallback` is supplied,
+/// build a read-only SECONDARY and wrap the pair in a [`FallbackStorage`](boatramp_storage::FallbackStorage)
+/// — the zero-downtime backend switch (blob-backend migration Part 2).
+///
+/// The secondary is built via the SAME [`build_blobs`] path but with **NO watcher provisioning**
+/// (`notify_tier: None`, `notify_account: None`) — a read-only drain source never watches — and its
+/// `watch_provider`/`provision_tier` are discarded. The returned [`BuiltBlobs`] keeps the PRIMARY's
+/// `watch_provider`/`provision_tier` (watching is the primary's capability). The secondary is NEVER
+/// handed to the blob-upload/STS minter (that path takes the primary `BlobArgs` only).
+///
+/// CRITICAL ordering: if a read-through cache is ever wrapped around the result, it must wrap the
+/// OUTSIDE — `cache(fallback(primary, secondary))` — so the cache's `allows_prune` delegates through
+/// the fallback's `false`. `FallbackStorage` is therefore the INNERMOST composite here; the returned
+/// `storage` is the fallback (or the bare primary when no fallback is configured).
+#[cfg(feature = "fallback")]
+pub async fn build_blobs_with_fallback(
+    args: &BlobArgs,
+    fallback: Option<(&BlobArgs, Duration)>,
+    data_dir: &Path,
+    notify_tier: Option<boatramp_core::blob_notify::ProvisionTier>,
+    notify_account: Option<String>,
+) -> Result<BuiltBlobs> {
+    // The PRIMARY carries its notify provisioning (watching stays a primary capability).
+    let primary = build_blobs(args, data_dir, notify_tier, notify_account).await?;
+    let Some((secondary_args, timeout)) = fallback else {
+        return Ok(primary);
+    };
+    // The read-only SECONDARY: same build path, NO watcher provisioning; discard its
+    // watch_provider/provision_tier (a drain source never watches).
+    let secondary = build_blobs(secondary_args, data_dir, None, None).await?;
+    let composite: Arc<dyn Storage> = Arc::new(boatramp_storage::FallbackStorage::new(
+        primary.storage,
+        secondary.storage,
+        blob_fallback_when(),
+        timeout,
+    ));
+    Ok(BuiltBlobs {
+        storage: composite,
+        // Keep the PRIMARY's watcher/tier — watching is the primary's capability.
+        watch_provider: primary.watch_provider,
+        provision_tier: primary.provision_tier,
+    })
 }
 
 // Azure storage + optional blob-change notification (Event Grid → Storage Queue,
