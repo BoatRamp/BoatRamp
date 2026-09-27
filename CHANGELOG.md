@@ -5,6 +5,92 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.6.0] - 2026-09-27
+
+Local-development surfaces (#501) — a **breaking** release. The major-version bump signals a
+deliberate config break: JSON blobs no longer belong in the `apply` manifest, and the GraphQL
+safelist switch is renamed. Existing manifests that use the old shapes need a one-line change and a
+migration (below); a version-less manifest that omits the new `compute[].spec` typing fails with a
+message that points straight at the fix.
+
+> This entry covers Stage A (typed compute + config versioning + the GraphQL safelist rename and
+> declarative registration + the domains note). The managed `databases:` declaration (Stage B)
+> appends its own section when it lands.
+
+### Breaking
+
+- **Typed compute (`apply` manifest).** `compute[].spec` is no longer an untyped `serde_json::Value`
+  JSON blob — it is now the **typed `ComputeSpec`**, with sibling `replicas` and `placement` fields
+  mirroring the server's `PutComputeRequest`. The manifest and the wire now share ONE schema: the
+  request type was promoted into `boatramp-core::compute::PutComputeRequest` (re-exported from
+  `boatramp-types`), so the server handler and the CLI deserialize the same type — no duplicated
+  schema. The client parse is an **additive fail-fast gate**; the server still runs its own semantic
+  validation. A pre-v0.6.0 manifest that wrote a raw-JSON `spec` now fails to parse with a wrapped
+  error naming v0.6.0 and the migration path.
+
+  Before (v1) → after (v0.6.0):
+
+  ```ron
+  // v1 (pre-0.6.0): the spec was a raw-JSON PutComputeRequest-shaped blob
+  compute: [
+    ( name: "api", spec: { "spec": { "root": { "image": "nginx:latest" }, "vcpus": 1, "mem_mib": 256, "port": 8080 }, "replicas": 2 } ),
+  ]
+
+  // v0.6.0: the typed ComputeSpec (root is the snake_case newtype variant `image(…)`)
+  compute: [
+    ( name: "api", spec: ( root: image("nginx:latest"), vcpus: 1, mem_mib: 256, port: 8080 ), replicas: 2 ),
+  ]
+  ```
+
+- **GraphQL safelist switch renamed.** `[handlers.graphql].safelist: bool` → **`enforce_safelist:
+  bool`** — the *enforcement* switch is now distinct from the new declarative *source* of operations
+  (`safelisted_ops` / `safelisted_ops_path`, below). Rename the field in any site config that set it.
+
+### Added
+
+- **Config versioning + a migration framework.** The `apply` manifest gains an optional top-level
+  `version: <u32>` with the semantic **absent = current**: a version-less manifest is parsed strictly
+  against the latest typed schema, and an old-shaped one that omits `version` fails with a helpful
+  error. Declaring `version: N` older than the current schema opts the document into a **loose-parse →
+  migrate → typed** pipeline: it is parsed loosely, run through a registered migration chain
+  (vN → … → current), then deserialized into the current typed manifest. The **first migration
+  (v1 → v0.6.0)** mechanically converts the raw-JSON `compute[].spec` blob into the typed `ComputeSpec`
+  shape; a database-shaped workload (e.g. a `pgvector/pgvector:pg16` image) draws a warning suggesting
+  the new managed `databases:` block (Stage B) — advisory only, the migration still succeeds. A new
+  client-side verb **`boatramp config migrate <file> [--write]`** runs the pipeline and prints (or
+  rewrites in place) the upgraded manifest, which omits `version:` (current = absent).
+
+  **Declare the schema you wrote against to get migration support; omit `version:` and your manifest
+  is parsed as current.** The strict-parse failure for a version-less pre-v0.6.0 manifest reads:
+
+  > this manifest does not match the current (v0.6.0) schema: `<parse error>`
+  >
+  > The most likely cause is a pre-v0.6.0 `compute[].spec` written as a raw JSON blob — v0.6.0 makes
+  > `compute[].spec` the typed `ComputeSpec` (breaking).
+  > If this is a pre-v0.6.0 manifest, add `version: 1` at the top and run
+  > `boatramp config migrate <file>` to upgrade it in place.
+
+- **Declarative GraphQL safelist registration.** `[handlers.graphql]` gains **`safelisted_ops:
+  Vec<String>`** (inline operation texts) and **`safelisted_ops_path: Option<PathBuf>`** (a file,
+  read client-side, resolved relative to the manifest dir) — the declarative *source* of persisted
+  operations, mutually exclusive (a parse/apply error if both are set). A new per-site apply step
+  registers each declared operation through the **existing** control-plane
+  `POST /api/projects/{proj}/graphql/safelist` endpoint (server-side `guard_query` → `register`
+  validation — never a direct KV write; `safelisted_ops_path` is read client-side, so only operation
+  *text* crosses the wire). Registration is **register-only (union)**: applying only ever ADDS
+  operations, it **never deletes or prunes** — removal stays the explicit `boatramp graphql safelist
+  rm`. (Pruning a deny-by-default allowlist on apply would be a self-inflicted DoS and a silent
+  boundary narrowing.)
+
+### Domains
+
+The existing **`boatramp domain add --unverified`** CLI is the local-dev path for attaching an
+unverified hostname. There is deliberately **no** manifest/site-config path that attaches an
+unverified domain: the manifest domain path keeps routing through the `check_added_domains_verified`
+refusal, which rejects attaching a not-yet-verified hostname. That refusal is a routing-hijack guard
+(an unverified domain could otherwise steal traffic destined for another tenant's verified host) and
+**stays** — v0.6.0 adds nothing that bypasses it.
+
 ## [0.5.9] - 2026-09-27
 
 S3-compatible external blob ingress (#497) — a large, additive, non-breaking feature. No public

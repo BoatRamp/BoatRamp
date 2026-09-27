@@ -194,7 +194,7 @@ through untouched.
 ## Persisted queries + safelist
 
 ```ron
-graphql: ( enabled: true, persisted_queries: true )   // or: safelist: true
+graphql: ( enabled: true, persisted_queries: true )   // or: enforce_safelist: true
 ```
 
 With `persisted_queries`, a client may send a query **hash**
@@ -203,9 +203,9 @@ resolves the hash to the stored query and hands the full query to your handler.
 On a first miss it returns `PersistedQueryNotFound`; the client re-sends the
 query alongside the hash and the edge registers it (after verifying the hash).
 
-`safelist` mode is stronger: only **pre-registered** hashes run and the edge
-never registers a new one — persisted queries become a **query allowlist**, a
-real security control.
+`enforce_safelist` mode is stronger: only **pre-registered** hashes run and the
+edge never registers a new one — persisted queries become a **query allowlist**, a
+real security control. (This switch was named `safelist` before v0.6.0.)
 
 ### The safelist (managing the allowlist)
 
@@ -220,6 +220,22 @@ boatramp graphql safelist add '{ me { name } }' --project acme
 
 boatramp graphql safelist list --project acme          # list registered operations
 boatramp graphql safelist rm <hash> --project acme     # remove one by hash
+```
+
+You can also declare the trusted operations **in the manifest** and register them
+at `apply` time — inline via `safelisted_ops`, or from a file via
+`safelisted_ops_path` (read client-side, resolved relative to the manifest dir; the
+two are mutually exclusive). This is **register-only (union)**: applying only ever
+ADDS operations — it never prunes — so removal stays the explicit `safelist rm`.
+
+```ron
+graphql: (
+  enabled: true,
+  enforce_safelist: true,
+  safelisted_ops: [ "{ me { name } }", "query Feed { posts { id title } }" ],
+  // or, from a file (a JSON array of operation strings, or a single-operation file):
+  // safelisted_ops_path: "graphql/persisted-ops.json",
+)
 ```
 
 ## Run the supergraph from a guest
