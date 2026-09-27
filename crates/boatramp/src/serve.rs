@@ -71,8 +71,9 @@ pub enum Error {
     #[cfg(feature = "cluster")]
     #[error("cluster startup: {0}")]
     ClusterStartup(String),
-    /// Configuring the secrets-at-rest envelope failed.
-    #[cfg(all(feature = "cluster", feature = "acme-dns"))]
+    /// Configuring the secrets-at-rest envelope failed. Ungated: the #505 node-level sealed S3
+    /// credential resolver builds the `[secrets]` envelope on the ordinary `serve` path (not just the
+    /// cluster+acme-dns cert path), so this variant must exist in every build.
     #[error("secrets envelope: {0}")]
     Envelope(String),
     /// Enabling the local S3-ingress face failed closed — e.g. a multi-node deployment with no
@@ -590,12 +591,20 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
     // the notify-enabled S3 backend + its provider share one AWS config.
     let notify_tier = serve_cfg.blob_notify_tier;
     let notify_account = serve_cfg.blob_notify_account_id.clone();
+    // `blob_args` carries no credential yet — the node-level sealed base S3 credential (#505) is
+    // resolved from the `[secrets]` store, which needs the control-plane KV + envelope. Both are
+    // built AFTER the cluster-mode fork below (single-node here; the Raft control-plane KV inside
+    // `run_cluster` for a cluster), so the blob build is deferred to each path's `build_blobs_with_sealed_cred`
+    // call, once its KV/envelope exist. This keeps ONE credential source honored on both paths without
+    // opening a stray store or reading the base key from the ambient env when a sealed source is set.
+    let s3_credential_cfg = serve_cfg.s3_credential.clone();
     let blob_args = BlobArgs {
         blobs: args.blobs,
         s3_bucket: args.s3_bucket.clone(),
         s3_endpoint: args.s3_endpoint.clone(),
         s3_region: args.s3_region.clone(),
         s3_path_style: args.s3_path_style,
+        s3_credential: None,
         gcs_bucket: args.gcs_bucket.clone(),
         gcs_endpoint: args.gcs_endpoint.clone(),
         gcs_anonymous: args.gcs_anonymous,
@@ -604,8 +613,6 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
         azure_access_key: args.azure_access_key.clone(),
         azure_emulator: args.azure_emulator,
     };
-    let built_blobs = build_blobs(&blob_args, &data_dir, notify_tier, notify_account).await?;
-    let storage = built_blobs.storage.clone();
 
     // Cluster mode: triggered by a `[cluster]` config section OR the founding/
     // joining flags (`--cluster-init` / `--cluster-join <ticket>`), so a node can
@@ -625,6 +632,36 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
                 mesh: None,
             }
         });
+        // #505 (cluster path): the blob storage must be built BEFORE the Raft node (it feeds
+        // `build_node` for cross-node message payloads), which is before the replicated control-plane KV
+        // exists — so a `boatramp:` (KV-backed) node-cred ref cannot be resolved here. Resolve the
+        // envelope-only forms (`env:`/bare, posture-gated) now, and REFUSE a `boatramp:` ref fail-closed
+        // with a clear message (the sealed-store node-cred on a cluster is a documented follow-up; use
+        // `env:` there). Absent source ⇒ the ambient AWS env chain (unchanged).
+        let mut cluster_blob_args = blob_args;
+        if let Some(cfg) = s3_credential_cfg.as_ref() {
+            let envelope = serve_secrets_envelope(config.secrets.as_ref(), &data_dir)?;
+            let cred = boatramp_node::s3_credential::resolve_s3_credential(
+                cfg,
+                // No replicated control-plane KV yet on this path: a `boatramp:` ref is refused below
+                // regardless, so an empty in-memory store is a correct stand-in for the `env:` forms.
+                Arc::new(boatramp_core::kv::MemoryKv::new()),
+                envelope,
+                options.posture.allow_env_secret_refs,
+                &boatramp_core::env::SystemEnv,
+            )
+            .await
+            .map_err(|e| {
+                Error::S3Ingress(format!(
+                    "{e} (a `boatramp:<name>` [serve.s3_credential] node-cred is not supported on a \
+                     cluster this release — the blob backend is built before the replicated control \
+                     plane; use an `env:<VAR>` ref instead)"
+                ))
+            })?;
+            cluster_blob_args.s3_credential = Some(cred);
+        }
+        let built_blobs =
+            build_blobs(&cluster_blob_args, &data_dir, notify_tier, notify_account).await?;
         return run_cluster(
             args,
             config,
@@ -665,6 +702,23 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
         cached = cached.with_publisher(changelog.clone());
     }
     let kv: Arc<dyn KvStore> = Arc::new(cached);
+
+    // #505: with the control-plane KV + `[secrets]` envelope now available, resolve the node-level
+    // sealed base S3 credential (if configured) and build the blob backend with it. Absent ⇒ the
+    // ambient AWS env chain (non-breaking). A configured sealed ref with no `[secrets]` envelope is a
+    // fail-closed startup error (never a silent env fallback).
+    let (built_blobs, sealed_s3_credential) = build_blobs_with_sealed_cred(
+        &blob_args,
+        s3_credential_cfg.as_ref(),
+        &data_dir,
+        kv.clone(),
+        config.secrets.as_ref(),
+        options.posture.allow_env_secret_refs,
+        notify_tier,
+        notify_account,
+    )
+    .await?;
+    let storage = built_blobs.storage.clone();
 
     // Layout guard (0.2.0): refuse to serve a store still on the pre-project layout
     // 1 — a half-read store would silently drop sites/functions/compute. The operator
@@ -811,6 +865,9 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
             &handlers,
             &blob_args,
             cloud,
+            // #505: the SAME sealed base credential the blob backend uses (if any) so the minter's
+            // STS/presign SDK config signs with the sealed key, not the ambient env chain.
+            sealed_s3_credential.as_ref(),
             serve_cfg
                 .s3_ingress_mint_max_ttl_secs
                 .unwrap_or(boatramp_node::config::DEFAULT_S3_INGRESS_MINT_MAX_TTL_SECS),
@@ -832,6 +889,95 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
         tracing::warn!(error = %e, "metadata store flush on shutdown failed");
     }
     serve_result
+}
+
+/// Build the `[secrets]` key envelope from `[secrets]` config (mirrors `boatramp-node`'s private
+/// `build_secrets_envelope`, kept in lockstep). `None` ⇒ no envelope (cleartext at rest / no sealed
+/// secret store). Reachable from both `run` and `run_cluster` (unlike the cluster+acme-dns-gated
+/// `build_cert_envelope`), so the #505 credential resolver can unseal on either path.
+fn serve_secrets_envelope(
+    secrets: Option<&crate::config::SecretsConfig>,
+    data_dir: &Path,
+) -> Result<Option<Arc<dyn boatramp_core::envelope::KeyEnvelope>>> {
+    use boatramp_server::envelope::{EnvelopeSpec, build_envelope};
+    let Some(cfg) = secrets else {
+        return Ok(None);
+    };
+    let spec = match cfg.envelope.as_str() {
+        "" => EnvelopeSpec::None,
+        "local" => EnvelopeSpec::Local {
+            kek_file: cfg
+                .kek_file
+                .clone()
+                .unwrap_or_else(|| data_dir.join("secrets/kek")),
+        },
+        "vault" => {
+            let v = cfg.vault.as_ref().ok_or_else(|| {
+                Error::Envelope(
+                    "secrets.envelope = \"vault\" needs a [secrets.vault] section".into(),
+                )
+            })?;
+            let token = std::env::var(&v.token_env).map_err(|_| {
+                Error::Envelope(format!("Vault token env `{}` is not set", v.token_env))
+            })?;
+            EnvelopeSpec::Vault {
+                addr: v.addr.clone(),
+                key: v.key.clone(),
+                token,
+            }
+        }
+        other => {
+            return Err(Error::Envelope(format!(
+                "unknown secrets.envelope {other:?} (want \"local\" or \"vault\")"
+            )));
+        }
+    };
+    build_envelope(spec).map_err(|e| Error::Envelope(e.to_string()))
+}
+
+/// Resolve the node-level sealed base S3 credential (#505) — if `[serve.s3_credential]` is set —
+/// against the control-plane `kv` + the `[secrets]` envelope, inject it into a copy of `blob_args`,
+/// build the blob backend, and return the resolved credential (so the SAME sealed credential also wires
+/// the AWS cloud minter). Shared by the single-node (`run`) and cluster (`run_cluster`) paths so ONE
+/// credential source is honored identically on both once each has its control-plane KV. Absent source
+/// ⇒ the ambient AWS env chain (unchanged), and `Ok((_, None))`. A configured sealed ref with no
+/// `[secrets]` envelope fails closed (a startup error), never a silent env fallback.
+#[allow(clippy::too_many_arguments)]
+async fn build_blobs_with_sealed_cred(
+    blob_args: &BlobArgs,
+    s3_credential_cfg: Option<&boatramp_node::config::S3CredentialConfig>,
+    data_dir: &Path,
+    kv: Arc<dyn KvStore>,
+    secrets: Option<&crate::config::SecretsConfig>,
+    allow_env_secret_refs: bool,
+    notify_tier: Option<boatramp_core::blob_notify::ProvisionTier>,
+    notify_account: Option<String>,
+) -> Result<(
+    boatramp_node::blobs::BuiltBlobs,
+    Option<boatramp_node::s3_credential::SealedS3Credential>,
+)> {
+    let mut effective = blob_args.clone();
+    let mut resolved = None;
+    if let Some(cfg) = s3_credential_cfg {
+        let envelope = serve_secrets_envelope(secrets, data_dir)?;
+        let cred = boatramp_node::s3_credential::resolve_s3_credential(
+            cfg,
+            kv,
+            envelope,
+            allow_env_secret_refs,
+            &boatramp_core::env::SystemEnv,
+        )
+        .await
+        .map_err(|e| Error::S3Ingress(e.to_string()))?;
+        tracing::info!(
+            access_key_id = %cred.access_key_id(),
+            "sourcing the base S3 credential from the [secrets] sealed store ([serve.s3_credential])"
+        );
+        effective.s3_credential = Some(cred.clone());
+        resolved = Some(cred);
+    }
+    let built = build_blobs(&effective, data_dir, notify_tier, notify_account).await?;
+    Ok((built, resolved))
 }
 
 /// How long changelog feed entries are kept (comfortably larger than the poll
@@ -954,10 +1100,14 @@ fn spawn_http_redirect(
     feature = "blob-upload-gcs",
     feature = "blob-upload-azure"
 ))]
+#[allow(clippy::too_many_arguments)]
 async fn wire_cloud_blob_upload(
     handlers: &boatramp_server::HandlerRuntime,
     blob_args: &BlobArgs,
     cloud: boatramp_node::config::S3IngressCloud,
+    // #505: the node-level sealed base S3 credential (if any). When set, the AWS minter's SDK config
+    // signs with the sealed key rather than the ambient env chain (the SAME source the blob backend uses).
+    sealed_s3_credential: Option<&boatramp_node::s3_credential::SealedS3Credential>,
     mint_max_ttl_secs: u64,
     mint_max_bytes: Option<u64>,
 ) -> Result<()> {
@@ -976,6 +1126,11 @@ async fn wire_cloud_blob_upload(
             force_path_style: blob_args.s3_path_style,
             role_arn: cloud.aws_role_arn.clone(),
             use_federation_token: cloud.aws_use_federation_token,
+            // The sealed base credential, or `None` for the ambient AWS env chain (unchanged).
+            base_credential: sealed_s3_credential.map(|c| {
+                let (id, secret) = c.as_pair();
+                boatramp_server::blob_upload_minter::wiring::BaseCredential::new(id, secret)
+            }),
         },
         BlobBackend::Gcs => CloudMinterSpec::Gcs {
             bucket: blob_args.gcs_bucket.clone().ok_or_else(|| {
@@ -1412,7 +1567,10 @@ async fn run_cluster(
     use boatramp_cluster::node::{ClusterParams, build_node};
 
     // The blob backend; `built_blobs` also carries the optional FA-5b2 blob-change
-    // watch provider + tier the handler runtime is wired with below.
+    // watch provider + tier the handler runtime is wired with below. In the cluster path the blob
+    // storage is needed BEFORE the Raft node (it feeds `build_node` for cross-node message payloads),
+    // which is before the replicated control-plane KV exists — so the #505 sealed credential is resolved
+    // up-front in `run` (against the node-local control-plane KV) and folded into `built_blobs` there.
     let storage = built_blobs.storage.clone();
 
     // Node-local durable Raft log/state store (distinct from the *replicated*
