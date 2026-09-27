@@ -14,8 +14,10 @@ migration (below); a version-less manifest that omits the new `compute[].spec` t
 message that points straight at the fix.
 
 > This entry covers Stage A (typed compute + config versioning + the GraphQL safelist rename and
-> declarative registration + the domains note) and Stage B (the declarative managed `databases:`
-> block + its project-scoped binding persistence/merge/authz layer — see **Managed databases**).
+> declarative registration + the domains note), Stage B (the declarative managed `databases:`
+> block + its project-scoped binding persistence/merge/authz layer — see **Managed databases**), and
+> Stage C (the `upload_containers` host-forced `{tenant}` template + the offline `check_import`
+> recognition of the blob-upload grant — see **Managed uploads**).
 
 ### Breaking
 
@@ -174,6 +176,40 @@ refusal, which rejects attaching a not-yet-verified hostname. That refusal is a 
   - **Reserved `bramp-db-` compute prefix (LOW-2).** The `bramp-db-` compute-workload prefix is reserved
     for derived managed-DB servers; a static `[handlers].bindings.sql.databases.*.compute` that uses it
     is now refused fail-closed at config load.
+
+### Managed uploads (per-tenant container template)
+
+- **`upload_containers` host-forced `{tenant}` template (Stage C).** An `upload_containers` allowlist
+  entry may now carry the literal token **`{tenant}`** (e.g. `"assets-{tenant}"`). Before minting an
+  S3 upload credential, the HOST substitutes **THIS invocation's resolved OWN tenant** (the
+  `ScopeAxis::Tenant` fact the SQL scope injector uses — never guest-supplied) into `{tenant}` BEFORE
+  the allowlist match AND the scope stamp. This authorizes an **unbounded per-tenant container family**
+  (`assets-<tid>`, one per tenant) that a static exact list could never enumerate, while keeping a
+  cross-tenant mint **structurally impossible**: the entry only ever expands to the guest's own
+  tenant, so a compromised or buggy guest that asks for `assets-<other-tid>` fails the allowlist
+  (`access-denied`) — isolation never rests on the guest computing its own suffix. The minted
+  credential's prefix is the EXPANDED concrete own container
+  (`hblob/{project-qualified-site}/assets-<own-tid>/…`), screened after expansion by
+  `screen_upload_target`/`validate_resource_name`. Mirrors the `tenant_secret_names` (#493)
+  resolved-own-tenant machinery: an `all`/anonymous/target/unscoped invocation has no tenant to expand
+  a `{tenant}` entry, so a container that matches only a `{tenant}` entry there **fails closed**
+  (host-native `no-resolved-tenant`, distinct from access-denied; surfaced to a guest as the existing
+  `no-resolved-site` WIT signal — no guest binding / shim change). **Additive, non-breaking:** an entry
+  WITHOUT `{tenant}` keeps exact-match, unchanged. Threaded into both binding-build paths (site
+  handler `build_bindings` + standalone-function `build_function_bindings`) the same way
+  `messaging-stats`/`tenant-secrets` thread the resolved tenant. Security-sensitive
+  (tenant-isolation boundary) → shipped behind a mutation-verified CI gate
+  (`BLOB-UPLOAD TENANT-TEMPLATE SCOPED OK`): neutering the host tenant-substitution lets a
+  cross-tenant mint through and FAILS the gate.
+
+- **Offline `check_import` recognizes the blob-upload grant.** The offline config validator now
+  accepts **`blob-upload:write`** and **`blob-upload:multipart`** as handler/consumer imports (via a
+  new `is_named_blob_upload_import`, mirroring `is_named_tenant_secrets_import`). Before, a manifest
+  declaring `imports: ["blob-upload:write"]` failed to parse with *"unknown handler import"* even
+  though the runtime honors the grant — so the exact-match blob-upload path could not actually be
+  deployed via a manifest. Parse-time recognition ONLY: a bare `blob-upload`, a `blob-upload:*`
+  wildcard, and any typo are still rejected, and the ABI/`requires` gate + the runtime grant allowlist
+  still enforce host support + the grant at activation.
 
 ## [0.5.9] - 2026-09-27
 

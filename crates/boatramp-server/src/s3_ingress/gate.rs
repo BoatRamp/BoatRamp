@@ -534,6 +534,7 @@ mod battery {
         let bindings = Bindings::new("blog").with_blob_upload(
             "shop",
             Some("blog".to_string()),
+            None, // no `{tenant}` entry here → resolved tenant unused
             minter.clone(),
             max_ttl,
             max_bytes_ceiling,
@@ -584,6 +585,7 @@ mod battery {
         let denied = Bindings::new("blog").with_blob_upload(
             "shop",
             Some("blog".to_string()),
+            None,
             minter.clone(),
             max_ttl,
             max_bytes_ceiling,
@@ -611,6 +613,7 @@ mod battery {
         let unscoped = Bindings::new("blog").with_blob_upload(
             "shop",
             None, // no single resolved site
+            None,
             minter.clone(),
             max_ttl,
             max_bytes_ceiling,

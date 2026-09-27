@@ -9697,6 +9697,190 @@ async fn tenant_secrets_scoped_end_to_end() {
     println!("TENANT SECRETS SCOPED OK");
 }
 
+/// Whether a mutation env var is set to a truthy value (mirrors the s3-ingress gate's `env_on`).
+#[cfg(feature = "blob-upload")]
+fn blob_tenant_mutate_on(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| !v.is_empty() && v != "0")
+        .unwrap_or(false)
+}
+
+/// CI-hard, mutation-verified gate for the `upload_containers` host-forced `{tenant}` template
+/// (#501 Stage C / Part 5a), marker `BLOB-UPLOAD TENANT-TEMPLATE SCOPED OK`.
+///
+/// Drives the REAL guest binding (`Bindings::with_blob_upload`, the exact call the server's
+/// `build_bindings` / `build_function_bindings` makes) + the REAL local `ServerBlobUploadMinter` (the
+/// fleet-signer + HKDF S3-session minter), asserting the LIVE minted credential's decoded scope — never
+/// a printed string:
+///
+/// * (1) under `upload_containers: ["assets-{tenant}"]` with resolved own tenant `firm-a`, a mint for
+///   the CONCRETE own container `assets-firm-a` SUCCEEDS and the minted S3-session token's decoded
+///   scope stamps the EXPANDED own container `assets-firm-a` (the host-forced own tenant);
+/// * (2) a mint for `assets-firm-b` (another tenant) is REFUSED with access-denied — the template only
+///   ever expands to the OWN tenant, so a guest cannot mint for a sibling even by naming the concrete
+///   cross-tenant container, and NOTHING is signed;
+/// * (3) an `all`/anon/unscoped invocation (no resolved own tenant) minting against the `{tenant}`
+///   entry fails closed with `no-resolved-tenant` (host-native, distinct from access-denied), BEFORE
+///   any signing;
+/// * (4) a plain (non-template) exact entry still matches exactly (non-breaking).
+///
+/// **Mutation-verified** (`BOATRAMP_BLOB_TENANT_TEMPLATE_MUTATE_SKIP_HOST_FORCE=1`): the neuter models
+/// "the host did not force the OWN tenant into the `{tenant}` slot" — it builds the binding with the
+/// resolved tenant set to the GUEST-supplied cross-tenant suffix (`firm-b`) instead of the host-resolved
+/// own tenant (`firm-a`). With the host-forcing neutered, the `assets-firm-b` mint SUCCEEDS (the
+/// template expands to the guest-chosen tenant) — a cross-tenant mint — so the gate PANICS. Under the
+/// clean run (no env var) the same request is refused. That two-sided property proves the
+/// host-substitution is load-bearing.
+///
+/// The server's `blob-upload` feature unconditionally enables `boatramp-handlers/blob-upload`, so
+/// gating on `blob-upload` is sufficient (the binding + minter are always present here).
+#[cfg(feature = "blob-upload")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn blob_upload_tenant_template_scoped() {
+    use boatramp_core::cose::verify_s3_session;
+    use boatramp_handlers::{
+        Bindings, MintRefused, MintedCredentials, UploadConstraints, UploadPerm, UploadTarget,
+    };
+    use boatramp_server::blob_upload_minter::{BlobUploadFaceConfig, ServerBlobUploadMinter};
+    use boatramp_server::s3_ingress::credential::S3IngressSecret;
+
+    // The neuter: when set, the host does NOT force the own tenant — the binding's resolved tenant is
+    // taken from the guest-supplied cross-tenant suffix, so a `{tenant}` entry expands to the tenant
+    // the guest named (the exact break the host-forcing prevents).
+    let mutated = blob_tenant_mutate_on("BOATRAMP_BLOB_TENANT_TEMPLATE_MUTATE_SKIP_HOST_FORCE");
+
+    let signer = Arc::new(LocalSigner::generate(TokenAlg::Es256));
+    let public = signer.public_key();
+    let minter = Arc::new(ServerBlobUploadMinter {
+        signer: signer.clone(),
+        secret: Arc::new(S3IngressSecret::from_bytes(&[0x5a; 32]).expect("32-byte ingress root")),
+        config: BlobUploadFaceConfig {
+            endpoint_base: "http://127.0.0.1:9000".into(),
+            region: "boatramp".into(),
+            service: "s3".into(),
+        },
+    });
+
+    // Build the guest binding exactly as `build_bindings` does: host-forced project + site + the
+    // resolved OWN tenant, the `upload_containers` allowlist, and the two rights. The CLEAN gate forces
+    // the own tenant `firm-a`; the mutation lets the resolved tenant be guest-chosen.
+    let own_tenant = "firm-a";
+    let bind = |resolved_tenant: Option<&str>, allow: &[&str]| {
+        Bindings::new("blog")
+            .with_blob_upload(
+                "shop",
+                Some("blog".to_string()),
+                resolved_tenant.map(str::to_owned),
+                minter.clone(),
+                3600,
+                Some(1_000_000),
+                allow.iter().map(ToString::to_string).collect(),
+                true, // can_write
+                true, // can_multipart
+            )
+            .blob_upload()
+            .cloned()
+            .expect("granted")
+    };
+
+    // A prefix/multipart mint yields temp-credentials whose session token decodes to the stamped scope,
+    // so the gate can assert the EXPANDED container directly from the minted credential.
+    let mint_prefix = |b: &boatramp_handlers::BlobUploadBinding, container: &str| {
+        let b = b.clone();
+        let container = container.to_string();
+        async move {
+            b.mint(
+                &container,
+                UploadTarget::Prefix("ingest/".into()),
+                vec![UploadPerm::Multipart],
+                UploadConstraints {
+                    require_sha256: true,
+                    ..Default::default()
+                },
+                900,
+            )
+            .await
+        }
+    };
+
+    let template = ["assets-{tenant}"];
+
+    // ---- MUTATION LANE: the host did NOT force the own tenant --------------------------------------
+    if mutated {
+        // The guest asks for `assets-firm-b`; with the host-forcing neutered the binding's resolved
+        // tenant is the guest-chosen `firm-b`, so the `{tenant}` entry expands to `assets-firm-b` and
+        // the cross-tenant mint SUCCEEDS. Under the clean lane below the SAME request is refused.
+        let neutered = bind(Some("firm-b"), &template);
+        let out = mint_prefix(&neutered, "assets-firm-b").await;
+        assert!(
+            out.is_ok(),
+            "MUTATION SKIP_HOST_FORCE: expected the neutered (guest-chosen tenant) binding to mint a \
+             cross-tenant container (proving the host-substitution is load-bearing), got {out:?}"
+        );
+        panic!(
+            "BLOB-UPLOAD TENANT-TEMPLATE GATE FAILED: with the host tenant-substitution neutered, a \
+             guest minted `assets-firm-b` (another tenant's container) under an `assets-{{tenant}}` \
+             entry — cross-tenant blob minting is possible."
+        );
+    }
+
+    // ---- CLEAN LANE --------------------------------------------------------------------------------
+
+    // (1) The own tenant mints its OWN expanded container; the minted scope stamps `assets-firm-a`.
+    let own = bind(Some(own_tenant), &template);
+    let creds = mint_prefix(&own, "assets-firm-a")
+        .await
+        .expect("a mint for the own tenant's expanded container succeeds");
+    let token = match &creds {
+        MintedCredentials::TempCredentials(t) => t.session_token.clone(),
+        other => panic!("expected temp-credentials for a prefix/multipart mint, got {other:?}"),
+    };
+    let now = boatramp_core::time::now_unix();
+    let session =
+        verify_s3_session(&token, &public, now).expect("the minted session token verifies");
+    assert_eq!(
+        session.scope.container, "assets-firm-a",
+        "the minted scope stamps the EXPANDED own-tenant container (host-forced own tenant)"
+    );
+    assert_eq!(
+        session.scope.project, "shop",
+        "project is still host-forced (guest never named it)"
+    );
+    assert_eq!(session.scope.site, "blog", "site is still host-forced");
+
+    // (2) A mint for ANOTHER tenant's concrete container is refused with access-denied; nothing signed.
+    let out = mint_prefix(&own, "assets-firm-b").await;
+    assert!(
+        matches!(out, Err(MintRefused::AccessDenied)),
+        "a cross-tenant container is access-denied (the template expands only to the own tenant): \
+         {out:?}"
+    );
+
+    // (3) No resolved own tenant (an all/anon/unscoped invocation) ⇒ fail closed no-resolved-tenant
+    // (host-native, distinct from access-denied), BEFORE any signing.
+    let anon = bind(None, &template);
+    let out = mint_prefix(&anon, "assets-firm-a").await;
+    assert!(
+        matches!(out, Err(MintRefused::NoResolvedTenant)),
+        "a `{{tenant}}` entry with no resolved own tenant fails closed no-resolved-tenant: {out:?}"
+    );
+
+    // (4) A plain (non-template) exact entry still matches exactly (non-breaking) — even alongside a
+    // sibling `{tenant}` entry — and a concrete name that is neither is denied.
+    let mixed = bind(Some(own_tenant), &["photos", "assets-{tenant}"]);
+    mint_prefix(&mixed, "photos")
+        .await
+        .expect("the plain exact entry still matches");
+    let out = mint_prefix(&mixed, "assets-firm-z").await;
+    assert!(
+        matches!(out, Err(MintRefused::AccessDenied)),
+        "a concrete container that is neither the plain entry nor the own-tenant expansion is denied: \
+         {out:?}"
+    );
+
+    println!("BLOB-UPLOAD TENANT-TEMPLATE SCOPED OK");
+}
+
 /// Bug #499 gate — a deploy-time compile MUST NOT stall a concurrent control-plane request on a
 /// single-worker runtime.
 ///

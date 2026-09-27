@@ -1169,6 +1169,10 @@ pub(super) async fn build_function_bindings(
             // The site is HOST-FORCED from the function's own config (`blob_upload_site`), validated
             // above to exist in this project — never guest-supplied. A guest can only narrow within it.
             Some(declared_site.to_string()),
+            // The resolved OWN tenant (host-resolved, never guest-supplied); `None` for an unscoped
+            // invocation ⇒ a `{tenant}`-templated container fails closed `no-resolved-tenant`. Threaded
+            // the SAME way as `messaging-stats`/`tenant-secrets` above.
+            resolved_tenant_string(&caller_tenant),
             minter,
             cfg.max_ttl_secs,
             cfg.max_bytes_ceiling,

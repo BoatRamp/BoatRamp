@@ -20,10 +20,18 @@
 //!    imports, neither implied by deploy/publish.
 //! 4. **A per-component container allowlist.** [`allow_containers`](BlobUploadBinding::allow_containers)
 //!    filters WHICH containers are mintable: empty ⇒ deny-all; a container not in it ⇒ `access-denied`
-//!    (before any signing). Least-privilege, mirroring `tenant_secret_names`.
+//!    (before any signing). Least-privilege, mirroring `tenant_secret_names`. An allowlist entry may
+//!    carry the literal token `{tenant}` (e.g. `"assets-{tenant}"`): the HOST substitutes THIS
+//!    invocation's resolved OWN tenant into `{tenant}` BEFORE the match + the scope stamp (see
+//!    [`resolved_tenant`](BlobUploadBinding::resolved_tenant)), so the entry only ever expands to the
+//!    guest's own tenant — a guest asking for `assets-<other-tid>` fails the allowlist (cross-tenant
+//!    mint is STRUCTURALLY impossible, never reliant on the guest computing its own suffix).
 //! 5. **Fail-closed on no resolved site.** An `all`/anonymous/unscoped invocation has no single site to
 //!    confine to; the binding returns `no-resolved-site` BEFORE any signing (distinct from
-//!    `access-denied`, cf. the `tenant_secrets::NoResolvedTenant` pattern).
+//!    `access-denied`, cf. the `tenant_secrets::NoResolvedTenant` pattern). A `{tenant}` allowlist entry
+//!    likewise has no tenant to expand for an `all`/anon/target/unscoped invocation, so a container that
+//!    matches ONLY a `{tenant}` entry there fails closed with `no-resolved-tenant` (again distinct from
+//!    `access-denied`, mirroring `tenant_secrets`).
 //! 6. **The host CLAMPS the TTL and max-bytes** to the operator ceilings (a guest can only narrow); the
 //!    perms default to write-only. The clamp is applied in the binding (defense in depth) and the
 //!    minter/face re-enforces authoritatively.
@@ -105,6 +113,13 @@ pub struct MintScope {
 /// policy builder — belt-and-suspenders with the `serde_json`-structured construction the AWS/GCS
 /// minters now use.
 const POLICY_METACHARS: &[char] = &['"', '\''];
+
+/// The literal token an operator `upload_containers` entry may carry (e.g. `"assets-{tenant}"`): the
+/// HOST substitutes THIS invocation's resolved OWN tenant for it BEFORE the allowlist match + the scope
+/// stamp, so the entry only ever expands to the guest's own tenant's container. A guest's requested
+/// (concrete) container never contains it (`{`/`}` are screened out of a concrete container by
+/// `validate_resource_name`); it is meaningful ONLY inside an operator config entry.
+const TENANT_TEMPLATE: &str = "{tenant}";
 
 /// **The mint scope screen** (Security HIGH-1 / MEDIUM-1) — the ONE choke point that screens the
 /// host-forced container + the guest-chosen key|prefix BEFORE they reach ANY minter (local AND every
@@ -224,6 +239,13 @@ pub struct BlobUploadBinding {
     /// THIS invocation's host-resolved site. `None` ⇒ no single resolved site → `mint` fails closed
     /// with `no-resolved-site`.
     pub(crate) site: Option<String>,
+    /// THIS invocation's host-resolved OWN tenant (the `ScopeAxis::Tenant` fact the SQL scope injector
+    /// uses — never guest-supplied). Filled by `build_bindings` from the resolved principal, `None` for
+    /// an `all`/anon/target/unscoped invocation. Used ONLY to expand a `{tenant}` token in an
+    /// [`allow_containers`](Self::allow_containers) entry: a requested container that matches ONLY a
+    /// `{tenant}` entry when this is `None` fails closed with `no-resolved-tenant`. Mirrors
+    /// `TenantSecretsBinding::resolved_tenant` (#493).
+    pub(crate) resolved_tenant: Option<String>,
     /// The shared minter (reaches the fleet signer + the S3-ingress secret host-side).
     pub(crate) minter: Arc<dyn BlobUploadMinter>,
     /// The operator ceiling on credential TTL, seconds. A `0` ceiling disables minting even with a
@@ -247,6 +269,14 @@ pub enum MintRefused {
     AccessDenied,
     /// This invocation has no single resolved site — fail closed BEFORE any signing.
     NoResolvedSite,
+    /// The requested container matches ONLY a `{tenant}`-templated allowlist entry, but THIS invocation
+    /// has no single resolved OWN tenant (an `all`/anon/target/unscoped invocation) — fail closed BEFORE
+    /// any signing, distinct from `AccessDenied` (mirrors `tenant_secrets::NoResolvedTenant`). A guest
+    /// sees this mapped to the WIT `no-resolved-site` (the same "no scope to confine to" signal — the
+    /// guest WIT `mint-error` carries no separate tenant arm, so no guest binding change / shim rev),
+    /// but the host-native distinction lets the mutation gate assert the tenant-expansion is
+    /// load-bearing.
+    NoResolvedTenant,
     /// The request was malformed (client-safe reason).
     InvalidRequest(String),
     /// The host failed to mint (no signer / no face / a signing failure) — generic detail.
@@ -257,7 +287,13 @@ impl MintRefused {
     fn into_wit(self) -> blob_upload_types::MintError {
         match self {
             Self::AccessDenied => blob_upload_types::MintError::AccessDenied,
-            Self::NoResolvedSite => blob_upload_types::MintError::NoResolvedSite,
+            // Both "no resolved site" and "no resolved tenant to expand a `{tenant}` entry" are the
+            // same class of failure to the guest — no single resolved scope to confine the credential
+            // to — so they share the one WIT arm (keeping the guest WIT / shim unchanged). The host
+            // keeps them distinct internally (observability + the mutation-verified gate).
+            Self::NoResolvedSite | Self::NoResolvedTenant => {
+                blob_upload_types::MintError::NoResolvedSite
+            }
             Self::InvalidRequest(m) => blob_upload_types::MintError::InvalidRequest(m),
             Self::Failed(m) => blob_upload_types::MintError::Failed(m),
         }
@@ -270,10 +306,56 @@ impl BlobUploadBinding {
         self.site.as_deref().ok_or(MintRefused::NoResolvedSite)
     }
 
-    /// Whether the guest may mint for `container`: it must be in the component's allowlist. Empty ⇒
-    /// deny-all. A refused container is `access-denied` (before any signing).
-    fn container_allowed(&self, container: &str) -> bool {
-        self.allow_containers.iter().any(|c| c == container)
+    /// Resolve the requested (always CONCRETE, guest-supplied) `container` against the component's
+    /// allowlist, HOST-EXPANDING any `{tenant}`-templated entry with THIS invocation's resolved OWN
+    /// tenant BEFORE the match — so an entry only ever authorizes the guest's own tenant's container.
+    ///
+    /// The guest's requested `container` never contains the `{tenant}` literal (`{`/`}` are screened
+    /// out of a concrete container by [`validate_resource_name`]); the token lives ONLY in an operator
+    /// `upload_containers` entry. For each entry:
+    ///
+    /// * **Plain entry** (no `{tenant}`): exact match, exactly as before (non-breaking).
+    /// * **`{tenant}` entry:** the host substitutes `resolved_tenant` for the token and compares the
+    ///   EXPANDED concrete name to the request. If there is NO resolved own tenant, the entry cannot be
+    ///   expanded — record that we SAW a template match attempt so a bare request that matches only a
+    ///   `{tenant}` entry fails closed with `no-resolved-tenant` (distinct from access-denied), never a
+    ///   silent access-denied that could hide an incorrectly-scoped invocation.
+    ///
+    /// Empty allowlist ⇒ deny-all. Returns the EXPANDED concrete container to stamp into the scope on a
+    /// match (so the credential's prefix is `hblob/{qualified-site}/{own-tenant-container}/…`, the
+    /// host-forced own tenant, never guest-influenced).
+    fn resolve_container(&self, container: &str) -> Result<String, MintRefused> {
+        // Did the request line up with a `{tenant}` entry we could NOT expand (no resolved tenant)? If
+        // so, and nothing else matched, that is `no-resolved-tenant` — never a plain access-denied.
+        let mut saw_unexpandable_template = false;
+        for entry in &self.allow_containers {
+            match entry.split_once(TENANT_TEMPLATE) {
+                // A `{tenant}` entry: expand with the resolved own tenant, then exact-match. `split_once`
+                // handles the token anywhere in the entry (prefix/suffix/middle), rebuilding it around
+                // the substituted tenant.
+                Some((before, after)) => match self.resolved_tenant.as_deref() {
+                    Some(tenant) => {
+                        if container == format!("{before}{tenant}{after}") {
+                            return Ok(container.to_string());
+                        }
+                    }
+                    None => saw_unexpandable_template = true,
+                },
+                // A plain entry: exact match (unchanged from the pre-template behavior).
+                None => {
+                    if entry == container {
+                        return Ok(container.to_string());
+                    }
+                }
+            }
+        }
+        if saw_unexpandable_template {
+            // The request could only ever have matched a `{tenant}` entry, but this invocation has no
+            // resolved own tenant to expand it — fail closed, distinct from access-denied.
+            Err(MintRefused::NoResolvedTenant)
+        } else {
+            Err(MintRefused::AccessDenied)
+        }
     }
 
     /// The host-native mint path (the whole thing the WIT `Host::mint` delegates to — public so a
@@ -329,19 +411,22 @@ impl BlobUploadBinding {
                 return Err(MintRefused::AccessDenied);
             }
         }
-        // Container allowlist (before any signing).
-        if !self.container_allowed(container) {
-            return Err(MintRefused::AccessDenied);
-        }
+        // Container allowlist (before any signing). A `{tenant}`-templated entry is HOST-EXPANDED with
+        // THIS invocation's resolved OWN tenant BEFORE the match, so the returned `resolved_container`
+        // is the EXPANDED concrete name (`assets-<own-tid>`) — the host-forced own tenant, never
+        // guest-influenced. A container that matches only an unexpandable `{tenant}` entry (no resolved
+        // tenant) fails closed with `no-resolved-tenant` (distinct from access-denied).
+        let resolved_container = self.resolve_container(container.trim())?;
         // No single resolved site ⇒ fail closed (distinct from access-denied).
         let site = self.site()?;
 
-        // SCREEN the container + key|prefix BEFORE any signing / policy build (Security HIGH-1): reject
-        // a traversal, a reserved `.boatramp*` segment, a `*`/`\`/control byte, or a policy
-        // metacharacter (`"`/`'`) that could restructure a cloud policy document. This is the mint
-        // choke point that covers ALL backends (local AND cloud) — the local face's key choke point
-        // never sees the mint path.
-        screen_upload_target(container.trim(), &target)?;
+        // SCREEN the EXPANDED container + key|prefix BEFORE any signing / policy build (Security HIGH-1):
+        // reject a traversal, a reserved `.boatramp*` segment, a `*`/`\`/control byte, or a policy
+        // metacharacter (`"`/`'`) that could restructure a cloud policy document. Screen the EXPANDED
+        // result (not the raw entry) so a resolved tenant id with a metacharacter can never reach a
+        // minter's prefix / policy builder. This is the mint choke point that covers ALL backends (local
+        // AND cloud) — the local face's key choke point never sees the mint path.
+        screen_upload_target(&resolved_container, &target)?;
 
         // CLAMP the TTL down to the operator ceiling (a guest can only narrow).
         let ttl = ttl_secs.min(self.max_ttl_secs);
@@ -356,7 +441,9 @@ impl BlobUploadBinding {
         let scope = MintScope {
             project: self.project.clone(),
             site: site.to_string(),
-            container: container.trim().to_string(),
+            // The EXPANDED concrete container (a `{tenant}` entry resolved to the host-forced own
+            // tenant), so the credential's prefix is `hblob/{qualified-site}/{own-tenant-container}/…`.
+            container: resolved_container,
             target,
             perms,
             constraints: UploadConstraints {
@@ -539,9 +626,33 @@ mod tests {
         max_ttl: u64,
         max_bytes_ceiling: Option<u64>,
     ) -> BlobUploadBinding {
+        binding_with_tenant(
+            minter,
+            site,
+            None,
+            allow,
+            can_write,
+            can_multipart,
+            max_ttl,
+            max_bytes_ceiling,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn binding_with_tenant(
+        minter: Arc<FakeMinter>,
+        site: Option<&str>,
+        resolved_tenant: Option<&str>,
+        allow: &[&str],
+        can_write: bool,
+        can_multipart: bool,
+        max_ttl: u64,
+        max_bytes_ceiling: Option<u64>,
+    ) -> BlobUploadBinding {
         BlobUploadBinding {
             project: "shop".into(),
             site: site.map(str::to_owned),
+            resolved_tenant: resolved_tenant.map(str::to_owned),
             minter,
             max_ttl_secs: max_ttl,
             max_bytes_ceiling,
@@ -996,6 +1107,218 @@ mod tests {
             minter.calls.lock().unwrap()[0].perms,
             vec![UploadPerm::Put],
             "an empty perm set defaults to write-only"
+        );
+    }
+
+    // ---- `{tenant}` host-forced template (Part 5a) ------------------------------------------------
+
+    #[tokio::test]
+    async fn a_tenant_template_entry_expands_to_the_own_tenant_and_stamps_the_expanded_container() {
+        // `upload_containers: ["assets-{tenant}"]`, resolved own tenant `firm-a`: a mint for the CONCRETE
+        // own container `assets-firm-a` SUCCEEDS, and the minted scope stamps the EXPANDED concrete
+        // container (never the raw `{tenant}` entry, never a guest-influenced name).
+        let minter = Arc::new(FakeMinter::default());
+        let b = binding_with_tenant(
+            minter.clone(),
+            Some("blog"),
+            Some("firm-a"),
+            &["assets-{tenant}"],
+            true,
+            false,
+            3600,
+            None,
+        );
+        let mut host = BlobUploadHost::new(Some(&b));
+        host.mint(put_key_request("assets-firm-a", "u.jpg", 300))
+            .await
+            .expect("a mint for the own tenant's expanded container succeeds");
+        let calls = minter.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].container, "assets-firm-a",
+            "the scope stamps the EXPANDED concrete own-tenant container"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tenant_template_refuses_another_tenants_container_access_denied() {
+        // THE isolation property: with the own tenant `firm-a`, a mint for `assets-firm-b` (another
+        // tenant) is REFUSED with access-denied — the template only ever expands to `assets-firm-a`, so
+        // the guest cannot mint for a sibling even by naming the concrete cross-tenant container.
+        let minter = Arc::new(FakeMinter::default());
+        let b = binding_with_tenant(
+            minter.clone(),
+            Some("blog"),
+            Some("firm-a"),
+            &["assets-{tenant}"],
+            true,
+            true,
+            3600,
+            None,
+        );
+        let mut host = BlobUploadHost::new(Some(&b));
+        assert!(
+            matches!(
+                host.mint(put_key_request("assets-firm-b", "k", 300))
+                    .await
+                    .unwrap_err(),
+                blob_upload_types::MintError::AccessDenied
+            ),
+            "a cross-tenant container is access-denied (the template expands only to the own tenant)"
+        );
+        assert!(
+            minter.calls.lock().unwrap().is_empty(),
+            "no cross-tenant credential was signed"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tenant_template_with_no_resolved_tenant_fails_closed_no_resolved_tenant() {
+        // An `all`/anon/target/unscoped invocation has no resolved own tenant to expand `{tenant}`; a
+        // container that could only match the `{tenant}` entry fails closed with NoResolvedTenant
+        // (distinct at the host, mapped to the WIT `no-resolved-site` — the guest's "no scope" signal),
+        // never a silent access-denied. Assert the host-native distinction directly on the binding.
+        let minter = Arc::new(FakeMinter::default());
+        let b = binding_with_tenant(
+            minter.clone(),
+            Some("blog"),
+            None, // no resolved own tenant
+            &["assets-{tenant}"],
+            true,
+            false,
+            3600,
+            None,
+        );
+        let err = b
+            .mint(
+                "assets-firm-a",
+                UploadTarget::Key("k".into()),
+                vec![UploadPerm::Put],
+                UploadConstraints::default(),
+                300,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err,
+            MintRefused::NoResolvedTenant,
+            "a {{tenant}} entry with no resolved own tenant fails closed no-resolved-tenant"
+        );
+        // And the guest-facing WIT maps it to no-resolved-site (no separate tenant arm / shim change).
+        let mut host = BlobUploadHost::new(Some(&b));
+        assert!(matches!(
+            host.mint(put_key_request("assets-firm-a", "k", 300))
+                .await
+                .unwrap_err(),
+            blob_upload_types::MintError::NoResolvedSite
+        ));
+        assert!(
+            minter.calls.lock().unwrap().is_empty(),
+            "nothing was signed for an unresolved tenant"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_plain_exact_entry_still_matches_exactly_when_a_tenant_is_present() {
+        // Non-breaking: a plain (non-template) entry keeps exact-match even when a resolved tenant is
+        // present and a sibling `{tenant}` entry is also listed. A plain entry does NOT expand.
+        let minter = Arc::new(FakeMinter::default());
+        let b = binding_with_tenant(
+            minter.clone(),
+            Some("blog"),
+            Some("firm-a"),
+            &["photos", "assets-{tenant}"],
+            true,
+            false,
+            3600,
+            None,
+        );
+        // The plain entry matches exactly.
+        let mut host = BlobUploadHost::new(Some(&b));
+        host.mint(put_key_request("photos", "k", 300))
+            .await
+            .expect("the plain exact entry still matches");
+        // A concrete name that is neither the plain entry nor the own-tenant expansion is denied.
+        let mut host2 = BlobUploadHost::new(Some(&b));
+        assert!(matches!(
+            host2
+                .mint(put_key_request("assets-firm-z", "k", 300))
+                .await
+                .unwrap_err(),
+            blob_upload_types::MintError::AccessDenied
+        ));
+        assert_eq!(
+            minter.calls.lock().unwrap().len(),
+            1,
+            "only the plain-entry mint reached the minter"
+        );
+    }
+
+    #[test]
+    fn resolve_container_expand_and_match_rules() {
+        // The pure expand+match: plain exact, `{tenant}` expanded to own, cross-tenant denied, no-tenant
+        // ⇒ no-resolved-tenant, token anywhere in the entry.
+        let minter = Arc::new(FakeMinter::default());
+        let with = |tenant: Option<&str>, allow: &[&str]| {
+            binding_with_tenant(
+                minter.clone(),
+                Some("blog"),
+                tenant,
+                allow,
+                true,
+                true,
+                3600,
+                None,
+            )
+        };
+        // Plain exact.
+        assert_eq!(
+            with(Some("firm-a"), &["photos"])
+                .resolve_container("photos")
+                .unwrap(),
+            "photos"
+        );
+        // `{tenant}` expands to own; stamps the concrete expansion.
+        assert_eq!(
+            with(Some("firm-a"), &["assets-{tenant}"])
+                .resolve_container("assets-firm-a")
+                .unwrap(),
+            "assets-firm-a"
+        );
+        // Cross-tenant concrete ⇒ access-denied.
+        assert_eq!(
+            with(Some("firm-a"), &["assets-{tenant}"])
+                .resolve_container("assets-firm-b")
+                .unwrap_err(),
+            MintRefused::AccessDenied
+        );
+        // No resolved tenant + a `{tenant}` entry the request lines up with ⇒ no-resolved-tenant.
+        assert_eq!(
+            with(None, &["assets-{tenant}"])
+                .resolve_container("assets-firm-a")
+                .unwrap_err(),
+            MintRefused::NoResolvedTenant
+        );
+        // A concrete request that matches NO entry (template or plain) is access-denied even with no
+        // tenant (the template was never a candidate).
+        assert_eq!(
+            with(None, &["photos"])
+                .resolve_container("assets-firm-a")
+                .unwrap_err(),
+            MintRefused::AccessDenied
+        );
+        // The token may sit anywhere in the entry (prefix/suffix/middle).
+        assert_eq!(
+            with(Some("t7"), &["{tenant}-bucket"])
+                .resolve_container("t7-bucket")
+                .unwrap(),
+            "t7-bucket"
+        );
+        assert_eq!(
+            with(Some("t7"), &["pre-{tenant}-post"])
+                .resolve_container("pre-t7-post")
+                .unwrap(),
+            "pre-t7-post"
         );
     }
 }
