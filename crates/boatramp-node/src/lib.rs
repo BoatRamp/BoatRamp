@@ -17,6 +17,9 @@
 
 pub mod auth;
 pub mod backends;
+/// Offline, node-local blob-backend migration (`boatramp blob migrate`) — the copy engine over
+/// the [`Storage`](boatramp_core::Storage) primitives.
+pub mod blob_migrate;
 pub mod blobs;
 pub mod compute;
 pub mod config;

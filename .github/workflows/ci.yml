@@ -1343,6 +1343,42 @@ jobs:
               echo "s3 sealed-cred mutation verified: BOATRAMP_S3SEALED_MUTATE_${mut}=1 fails the gate as expected."
             fi
           done
+      # Blob-backend migration, Part 1 (`boatramp blob migrate`): the offline, node-local copy engine
+      # that moves every blob object from a SOURCE backend to a DESTINATION backend so switching the
+      # node blob backend has no re-upload step. The gate battery runs entirely fs→fs in a tempdir (no
+      # cloud) and asserts the four security invariants: I1 completeness (every source object is
+      # head-present in the destination after migrate), I2 head-skip soundness (a skip only when the
+      # dest already holds the key at matching size — idempotent/resumable), I3 key fidelity (dest keys
+      # == source keys byte-exact, so no tenant/hblob-boundary collapse), and I4 source read-only (the
+      # source object set is unchanged — the engine never deletes/writes the source). Because it is
+      # fs-only it needs no cloud SDK, so it runs on the host toolchain next to the #505 gate.
+      #
+      # ANTI-HOLLOW: run the gate ONCE clean (must PASS + print the marker), then ONCE per mutation with
+      # the exit code INVERTED — each BOATRAMP_BLOBMIG_MUTATE_* neuters exactly one invariant (drop the
+      # last object / head-skip unconditionally / mangle the dest key / delete from the source), so a
+      # PASS-under-mutation is a hollow gate and fails the merge.
+      - name: blob migrate complete gate marker (blob-backend-migration Part 1)
+        run: |
+          set -eo pipefail
+          cargo test -p boatramp-node \
+            --features blob-migrate-gate-mutation --lib \
+            blob_migrate::gate::blob_migrate_complete_gate -- --nocapture 2>&1 \
+            | tee blob-migrate.log
+          grep -qE 'test result: ok\. 1 passed' blob-migrate.log \
+            || { echo "::error::blob migrate gate did not run (silent skip or a failure)" >&2; exit 1; }
+          grep -q 'BLOB MIGRATE COMPLETE OK' blob-migrate.log \
+            || { echo "::error::blob migrate gate never reached its marker (a completeness / head-skip / key-fidelity / source-read-only regression)" >&2; exit 1; }
+          for mut in DROP_LAST SKIP_ALWAYS REWRITE_KEY DELETE_SOURCE; do
+            if env "BOATRAMP_BLOBMIG_MUTATE_${mut}=1" cargo test -p boatramp-node \
+              --features blob-migrate-gate-mutation --lib \
+              blob_migrate::gate::blob_migrate_complete_gate \
+              > "blob-migrate-mut-${mut}.log" 2>&1; then
+              echo "::error::blob migrate gate is HOLLOW — it PASSED with BOATRAMP_BLOBMIG_MUTATE_${mut}=1 (that security check is not load-bearing)" >&2
+              exit 1
+            else
+              echo "blob migrate mutation verified: BOATRAMP_BLOBMIG_MUTATE_${mut}=1 fails the gate as expected."
+            fi
+          done
 
   deny:
     name: cargo-deny

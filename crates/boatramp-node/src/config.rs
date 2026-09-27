@@ -1890,6 +1890,36 @@ pub struct ServeConfig {
     pub addr: Option<SocketAddr>,
     /// Data directory for filesystem backends.
     pub data_dir: Option<PathBuf>,
+    /// Blob object-store backend (`fs`/`s3`/`gcs`/`azure`) — the config-level analog of the
+    /// `--blobs` flag. Absent ⇒ the flag/env decides (`--blobs`/`BOATRAMP_BLOBS`, default `fs`).
+    /// The flag/env still wins over this (uniform `serve` precedence). Read primarily by `boatramp
+    /// blob migrate`, which builds a source/destination backend from a config file alone; `serve`
+    /// also honours it as the config-level fallback under the flag.
+    pub blobs: Option<crate::backends::BlobBackend>,
+    /// S3 bucket (`--blobs s3`). Config-level fallback for `--s3-bucket`/`BOATRAMP_S3_BUCKET`.
+    pub s3_bucket: Option<String>,
+    /// S3 endpoint URL (e.g. a MinIO/R2/Tigris endpoint). Fallback for `--s3-endpoint`.
+    pub s3_endpoint: Option<String>,
+    /// S3 region. Fallback for `--s3-region`.
+    pub s3_region: Option<String>,
+    /// Use S3 path-style addressing (required by MinIO). Fallback for `--s3-path-style`.
+    pub s3_path_style: bool,
+    /// GCS bucket (`--blobs gcs`). Fallback for `--gcs-bucket`.
+    pub gcs_bucket: Option<String>,
+    /// GCS storage endpoint URL (e.g. a `fake-gcs-server` emulator). Fallback for `--gcs-endpoint`.
+    pub gcs_endpoint: Option<String>,
+    /// Skip GCS credential resolution (anonymous — the emulator). Fallback for `--gcs-anonymous`.
+    pub gcs_anonymous: bool,
+    /// Azure storage account name (`--blobs azure`). Fallback for `--azure-account`.
+    pub azure_account: Option<String>,
+    /// Azure container name (`--blobs azure`). Fallback for `--azure-container`.
+    pub azure_container: Option<String>,
+    /// Azure storage account access key (shared-key auth). Fallback for `--azure-access-key`.
+    /// Prefer the env/flag over persisting a key in the config file.
+    pub azure_access_key: Option<String>,
+    /// Use the Azurite emulator (well-known dev credentials + local endpoint). Fallback for
+    /// `--azure-emulator`.
+    pub azure_emulator: bool,
     /// Token root **private** key (hex) — issuing node: verifies *and* mints
     /// tokens / OIDC exchanges.
     pub auth_root_private_key: Option<String>,
