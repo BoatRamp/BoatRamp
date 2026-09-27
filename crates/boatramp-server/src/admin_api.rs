@@ -7,6 +7,8 @@
 
 use super::*;
 
+use boatramp_core::compute::PutComputeRequest;
+
 #[derive(Serialize)]
 struct CreateDeploymentResponse {
     id: String,
@@ -905,23 +907,10 @@ pub(super) async fn get_compute(
     }
 }
 
-/// Body of `PUT /api/compute/:name` — the spec plus desired replicas/placement.
-#[derive(Deserialize)]
-pub(super) struct PutComputeRequest {
-    /// The immutable workload spec (rootfs/kernel blob hashes + sizing).
-    spec: boatramp_core::compute::ComputeSpec,
-    /// Desired replica count (default 1).
-    #[serde(default = "one")]
-    replicas: u32,
-    /// Placement constraints.
-    #[serde(default)]
-    placement: boatramp_core::compute::PlacementConstraints,
-}
-
-fn one() -> u32 {
-    1
-}
-
+/// The body of `PUT /api/compute/:name` — the spec plus desired replicas/placement —
+/// is the shared [`boatramp_core::compute::PutComputeRequest`] (re-exported from
+/// `boatramp-types`), so the `apply` manifest client parses the SAME type: no
+/// duplicated schema between the server and the CLI.
 #[derive(Serialize)]
 struct PutComputeResponse {
     /// The content hash of the stored spec (`computever/<hash>`).
