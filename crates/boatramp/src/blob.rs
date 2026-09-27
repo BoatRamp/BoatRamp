@@ -50,6 +50,11 @@ pub enum Error {
     /// The offline copy engine reported an error (a storage failure or a failed verification).
     #[error(transparent)]
     Migrate(#[from] boatramp_node::blob_migrate::MigrateError),
+    /// The daemon-mediated `blob drain` did not complete — the daemon reported a verify-failure
+    /// (objects still absent from the primary) or a storage error. The streamed report already
+    /// printed the detail; this maps to a non-zero exit.
+    #[error("blob drain did not complete — see the drain report above (re-run to resume)")]
+    DrainIncomplete,
     /// Serializing the `--json` migration report failed.
     #[error(transparent)]
     Json(#[from] serde_json::Error),
@@ -117,6 +122,38 @@ enum BlobCommand {
     ///
     /// Unrelated to the top-level `boatramp migrate` (a one-time control-plane store re-key).
     Migrate(MigrateArgs),
+    /// **Drain the daemon's configured `[serve.blob_fallback]`** secondary into the primary, over the
+    /// control plane — for a MANAGED node reachable only via `BOATRAMP_SERVER` (no local disk / no
+    /// `fly ssh`), where the offline `blob migrate` can't run. Unlike `blob migrate`, this REQUIRES a
+    /// server: it triggers the RUNNING daemon (which already holds both backends of its `FallbackStorage`
+    /// composite open) to copy its OWN configured secondary → primary internally, then relays progress.
+    ///
+    /// The client names NO source/destination — the daemon drains only its own configured
+    /// fallback → primary, so a token-bearing client can't point a copy at arbitrary backends (tighter
+    /// than the offline CLI's arbitrary `--from`/`--to`). Gated by an operator token (System·Admin).
+    /// The copy is idempotent + resumable, reads the secondary read-only, and — on a verified drain —
+    /// reports that it is safe to remove `[serve].blob_fallback` and restart the node.
+    ///
+    /// For OFFLINE / pre-boot / volume-local copies between arbitrary backends, use `boatramp blob migrate`.
+    Drain(DrainArgs),
+}
+
+/// Arguments for `boatramp blob drain`.
+#[derive(Debug, clap::Args)]
+pub struct DrainArgs {
+    /// Enumerate + classify (would-copy / would-skip) on the daemon and report, but copy nothing.
+    #[arg(long)]
+    dry_run: bool,
+    /// Bounded copy concurrency on the daemon (objects in flight at once).
+    #[arg(long)]
+    concurrency: Option<usize>,
+    /// Restrict the drain to secondary keys under this prefix (default: all objects).
+    #[arg(long)]
+    prefix: Option<String>,
+    /// Emit the final report as JSON instead of a human summary (progress lines are still streamed
+    /// to stderr as they arrive).
+    #[arg(long)]
+    json: bool,
 }
 
 /// Arguments for `boatramp blob migrate`.
@@ -236,8 +273,46 @@ pub async fn run(args: BlobArgs, config: &ProjectConfig) -> Result<()> {
         }
         #[cfg(feature = "blob-upload")]
         BlobCommand::MintUpload(a) => mint_upload(&cp, a).await?,
+        // Unlike `migrate` (offline, handled above), `drain` is a control-plane client: it triggers
+        // the RUNNING daemon to drain its OWN configured fallback → primary and relays the stream.
+        BlobCommand::Drain(a) => drain(&cp, a).await?,
         // Handled node-locally above (returned before the control-plane client was built).
         BlobCommand::Migrate(_) => unreachable!("handled before the control-plane client"),
+    }
+    Ok(())
+}
+
+/// Trigger the daemon-mediated blob drain (`boatramp blob drain`, v0.6.3): POST `/api/blob-drain`, then
+/// consume the NDJSON progress stream (one JSON object per line), printing human progress to stderr as
+/// it arrives, and finally the human summary — or, with `--json`, the final report object — to stdout.
+/// Exits non-zero on a verify-failure or a refused/error status (mirrors `client.rs::migrate_trigger`'s
+/// 200-vs-422 branching, surfaced here through [`client::ControlPlane::blob_drain`]).
+async fn drain(cp: &client::ControlPlane, a: DrainArgs) -> Result<()> {
+    let final_report = cp
+        .blob_drain(a.dry_run, a.concurrency, a.prefix.as_deref())
+        .await?;
+
+    // The daemon's final report (tagged `"type":"report"`): a verify-failure carries `missing`, a
+    // storage error carries `error` — either means the drain did NOT complete (non-zero exit).
+    let verify_failed = final_report.get("missing").is_some();
+    let errored = final_report.get("error").is_some();
+
+    if a.json {
+        println!("{}", serde_json::to_string_pretty(&final_report)?);
+    } else {
+        // The daemon's `message` already carries the human summary — including, on a verified drain,
+        // the exact "SECONDARY FULLY DRAINED — safe to remove [serve].blob_fallback…" signal — so
+        // print it verbatim (no duplication).
+        let message = final_report
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("(no message)");
+        println!("blob drain: {message}");
+    }
+
+    // Non-zero exit on a verify-failure or a reported storage error (the drain did NOT complete).
+    if verify_failed || errored {
+        return Err(Error::DrainIncomplete);
     }
     Ok(())
 }
@@ -273,6 +348,9 @@ async fn migrate(a: MigrateArgs) -> Result<()> {
         verify: !a.no_verify,
         dry_run: a.dry_run,
         prefix: a.prefix.clone(),
+        // The offline CLI logs via tracing only — no streaming callback (that path is the
+        // daemon-mediated `blob drain`, which wires an mpsc sink over the control-plane response).
+        on_progress: None,
     };
     let report = boatramp_node::blob_migrate::migrate(source.storage, dest.storage, &opts).await?;
 

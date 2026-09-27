@@ -1360,7 +1360,7 @@ jobs:
       - name: blob migrate complete gate marker (blob-backend-migration Part 1)
         run: |
           set -eo pipefail
-          cargo test -p boatramp-node \
+          cargo test -p boatramp-storage \
             --features blob-migrate-gate-mutation --lib \
             blob_migrate::gate::blob_migrate_complete_gate -- --nocapture 2>&1 \
             | tee blob-migrate.log
@@ -1369,7 +1369,7 @@ jobs:
           grep -q 'BLOB MIGRATE COMPLETE OK' blob-migrate.log \
             || { echo "::error::blob migrate gate never reached its marker (a completeness / head-skip / key-fidelity / source-read-only regression)" >&2; exit 1; }
           for mut in DROP_LAST SKIP_ALWAYS REWRITE_KEY DELETE_SOURCE; do
-            if env "BOATRAMP_BLOBMIG_MUTATE_${mut}=1" cargo test -p boatramp-node \
+            if env "BOATRAMP_BLOBMIG_MUTATE_${mut}=1" cargo test -p boatramp-storage \
               --features blob-migrate-gate-mutation --lib \
               blob_migrate::gate::blob_migrate_complete_gate \
               > "blob-migrate-mut-${mut}.log" 2>&1; then
@@ -1377,6 +1377,44 @@ jobs:
               exit 1
             else
               echo "blob migrate mutation verified: BOATRAMP_BLOBMIG_MUTATE_${mut}=1 fails the gate as expected."
+            fi
+          done
+      # Daemon-mediated blob drain (`POST /api/blob-drain` + `boatramp blob drain --server <url>`,
+      # v0.6.3): the running daemon copies its OWN configured `[serve.blob_fallback]` secondary →
+      # primary over the control plane (no local/SSH), so a MANAGED node stuck in TRANSITION mode can
+      # finish the migration. The gate battery drives a REAL `DeployStore` over a
+      # `FallbackStorage(primary=fs, secondary=fs)` in tempdirs (secondary seeded with objects the
+      # primary lacks) and asserts: D1 drains secondary→primary, D2 the read-only source is unchanged,
+      # D3 no fallback ⇒ a 422 error (never a silent success), D4 (crux) the route requires System·Admin
+      # at the singular hyphen path (no `/api/blobs/` Blobs·Deploy collision; Project·Admin/Deploy do
+      # NOT satisfy it), D5 the body carries no source/dest (structural), D6 SECONDARY FULLY DRAINED
+      # only on a verified-complete drain. fs-only, no cloud SDK — runs on the host toolchain next to
+      # the Part-1 / #505 gates.
+      #
+      # ANTI-HOLLOW: run the gate ONCE clean (must PASS + print the marker), then ONCE per mutation with
+      # the exit code INVERTED — each BOATRAMP_BLOBDRAIN_MUTATE_* neuters exactly one invariant (reverse
+      # the drain direction / delete from the source / ignore a missing fallback / downgrade the route
+      # authz), so a PASS-under-mutation is a hollow gate and fails the merge.
+      - name: blob drain daemon-mediated gate marker (v0.6.3)
+        run: |
+          set -eo pipefail
+          cargo test -p boatramp-server \
+            --features blob-drain-gate-mutation --lib \
+            blob_drain::gate::blob_drain_daemon_mediated_gate -- --nocapture 2>&1 \
+            | tee blob-drain.log
+          grep -qE 'test result: ok\. 1 passed' blob-drain.log \
+            || { echo "::error::blob drain gate did not run (silent skip or a failure)" >&2; exit 1; }
+          grep -q 'BLOB DRAIN DAEMON-MEDIATED OK' blob-drain.log \
+            || { echo "::error::blob drain gate never reached its marker (a direction / source-read-only / no-fallback / route-authz / drained-signal regression)" >&2; exit 1; }
+          for mut in REVERSE_DIRECTION DELETE_SOURCE IGNORE_NO_FALLBACK LOWER_AUTHZ; do
+            if env "BOATRAMP_BLOBDRAIN_MUTATE_${mut}=1" cargo test -p boatramp-server \
+              --features blob-drain-gate-mutation --lib \
+              blob_drain::gate::blob_drain_daemon_mediated_gate \
+              > "blob-drain-mut-${mut}.log" 2>&1; then
+              echo "::error::blob drain gate is HOLLOW — it PASSED with BOATRAMP_BLOBDRAIN_MUTATE_${mut}=1 (that security check is not load-bearing)" >&2
+              exit 1
+            else
+              echo "blob drain mutation verified: BOATRAMP_BLOBDRAIN_MUTATE_${mut}=1 fails the gate as expected."
             fi
           done
       # Blob-backend migration, Part 2 (`FallbackStorage` composite): the read-fallback backend that

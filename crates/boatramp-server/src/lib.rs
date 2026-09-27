@@ -63,6 +63,11 @@ pub(crate) use admin_api::{
 #[cfg(feature = "admin")]
 mod admin_controller;
 mod auth;
+/// The daemon-mediated blob drain (`POST /api/blob-drain`, v0.6.3): the running node drains its OWN
+/// configured `[serve.blob_fallback]` secondary → primary over the control plane (no local/SSH),
+/// streaming NDJSON progress. Backs `boatramp blob drain --server <url>`.
+mod blob_drain;
+pub(crate) use blob_drain::blob_drain as blob_drain_handler;
 /// The server-side minter backing the guest `blob-upload` capability (S3 external ingress): mints the
 /// fleet-signed session token, derives the secret, and shapes the presigned-put | temp-credentials
 /// variant.

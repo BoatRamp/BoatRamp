@@ -199,6 +199,14 @@ impl Storage for CachedStorage {
     fn allows_prune(&self) -> bool {
         self.inner.allows_prune()
     }
+
+    /// Delegate to the wrapped backend: a cache OVER a read-fallback composite
+    /// (`cache(fallback(primary, secondary))`, the required wiring order) must still expose the
+    /// drain pair so the daemon-mediated drain reaches the underlying secondary → primary — the
+    /// caching layer never introduces or hides a drain of its own.
+    fn drain_pair(&self) -> Option<boatramp_core::DrainPair> {
+        self.inner.drain_pair()
+    }
 }
 
 #[cfg(test)]

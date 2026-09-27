@@ -68,6 +68,13 @@ pub mod cache;
 #[cfg(feature = "fallback")]
 pub mod fallback;
 
+/// The backend-agnostic **blob-backend migration** copy engine (`list`/`head`/`get`/`put`
+/// over the [`Storage`](boatramp_core::Storage) trait). Drives both the offline node-local
+/// `boatramp blob migrate` (re-exported as `boatramp_node::blob_migrate`) and the
+/// daemon-mediated `POST /api/blob-drain` control-plane drain (v0.6.3), which streams
+/// [`blob_migrate::MigrateProgress`] via [`blob_migrate::MigrateOptions::on_progress`].
+pub mod blob_migrate;
+
 #[cfg(feature = "fs")]
 pub use fs::FsStorage;
 

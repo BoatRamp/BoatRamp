@@ -1,6 +1,16 @@
-//! Offline, node-local **blob-backend migration** — the copy engine behind
-//! `boatramp blob migrate --from <config> --to <config>` (Part 1 of the
-//! blob-backend-migration feature).
+//! **Blob-backend migration** — the backend-agnostic copy engine that moves every
+//! object from a SOURCE [`Storage`] to a DESTINATION [`Storage`], skipping any already
+//! present at matching size and (by default) verifying completeness afterward.
+//!
+//! It lives in `boatramp-storage` (over the `Storage` trait + `futures` only, no app deps)
+//! so it can be driven from BOTH:
+//! - the **offline, node-local** CLI (`boatramp blob migrate --from <config> --to <config>`,
+//!   Part 1 of the blob-backend-migration feature — re-exported as `boatramp_node::blob_migrate`),
+//!   which builds both backends in-process from two node config files and copies between them; and
+//! - the **daemon-mediated** control-plane drain (v0.6.3, `POST /api/blob-drain` +
+//!   `boatramp blob drain --server <url>`), where the running server copies its OWN configured
+//!   `[serve.blob_fallback]` secondary → primary — reachable on a managed node with no local/SSH
+//!   access. That path wires [`MigrateOptions::on_progress`] to stream progress to the client.
 //!
 //! Switching the node blob backend (`--blobs fs|s3|gcs|azure`, or provider→provider,
 //! or region→region) points serving at an EMPTY store, so every site on the node 404s
@@ -8,10 +18,12 @@
 //! source backend to a destination backend so the switch has no re-upload step.
 //!
 //! It operates over the existing [`Storage`] trait primitives — `list`/`head`/`get`/`put`
-//! — so it works uniformly across every backend (fs, S3, GCS, Azure). The CLI builds the
-//! two backends from two node config files via [`build_blobs`](crate::blobs::build_blobs)
-//! and calls [`migrate`]; the engine itself is backend-agnostic (it takes two
-//! `Arc<dyn Storage>`), which is exactly what lets the mutation gate drive it fs→fs.
+//! — so it works uniformly across every backend (fs, S3, GCS, Azure). The offline CLI builds
+//! the two backends from two node config files via `boatramp_node::blobs::build_blobs`
+//! and calls [`migrate`]; the daemon hands it the two halves of its own
+//! [`FallbackStorage`](crate::FallbackStorage) `drain_pair`. The engine itself is
+//! backend-agnostic (it takes two `Arc<dyn Storage>`), which is exactly what lets the mutation
+//! gate drive it fs→fs.
 //!
 //! ## Guarantees
 //! - **Read-only on the source.** The engine NEVER deletes (or writes) the source. The
@@ -47,8 +59,35 @@ pub(crate) mod gate_mutation {
     }
 }
 
+/// A snapshot of migration progress, delivered to a [`ProgressSink`] at the same cadence as
+/// the internal periodic tracing line (see [`Progress::maybe_log`]). It carries the running
+/// totals so a caller (the daemon's NDJSON stream) can relay live per-object progress.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MigrateProgress {
+    /// Objects processed so far (copied + skipped).
+    pub done: u64,
+    /// Total source objects enumerated under the prefix.
+    pub total: u64,
+    /// Objects copied source→dest so far (or WOULD be, on a dry-run).
+    pub copied: u64,
+    /// Objects skipped (already present at matching size) so far.
+    pub skipped: u64,
+    /// Bytes copied so far (0 on a dry-run).
+    pub copied_bytes: u64,
+    /// Whether this is a dry-run (nothing is actually written).
+    pub dry_run: bool,
+}
+
+/// A caller-supplied progress callback, invoked at the periodic-log cadence with a
+/// [`MigrateProgress`] snapshot (in ADDITION to the internal `tracing` line). `None`
+/// (the offline CLI) = the current behavior (tracing only, no callback).
+///
+/// It must be cheap + non-blocking (the copy loop calls it while holding the progress
+/// lock); the daemon's sink just does a non-blocking `mpsc::try_send`.
+pub type ProgressSink = Arc<dyn Fn(MigrateProgress) + Send + Sync>;
+
 /// Options controlling a [`migrate`] run.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct MigrateOptions {
     /// Bounded worker concurrency for the copy loop (≥ 1; clamped up to 1).
     pub concurrency: usize,
@@ -59,6 +98,22 @@ pub struct MigrateOptions {
     pub dry_run: bool,
     /// Restrict the enumeration to keys under this prefix (default `""` = all).
     pub prefix: String,
+    /// Optional streaming progress callback, invoked at the same cadence as the internal
+    /// periodic tracing line (in addition to it). `None` = tracing only (the offline CLI).
+    pub on_progress: Option<ProgressSink>,
+}
+
+impl std::fmt::Debug for MigrateOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `on_progress` is a boxed closure with no `Debug`; render its presence only.
+        f.debug_struct("MigrateOptions")
+            .field("concurrency", &self.concurrency)
+            .field("verify", &self.verify)
+            .field("dry_run", &self.dry_run)
+            .field("prefix", &self.prefix)
+            .field("on_progress", &self.on_progress.is_some())
+            .finish()
+    }
 }
 
 impl Default for MigrateOptions {
@@ -68,6 +123,7 @@ impl Default for MigrateOptions {
             verify: true,
             dry_run: false,
             prefix: String::new(),
+            on_progress: None,
         }
     }
 }
@@ -177,7 +233,10 @@ pub async fn migrate(
     let skipped_objects = Arc::new(AtomicU64::new(0));
     let copied_bytes = Arc::new(AtomicU64::new(0));
     let done_objects = Arc::new(AtomicU64::new(0));
-    let progress = Arc::new(std::sync::Mutex::new(Progress::new(total_objects)));
+    let progress = Arc::new(std::sync::Mutex::new(Progress::new(
+        total_objects,
+        opts.on_progress.clone(),
+    )));
 
     // 2. Bounded-concurrency copy. `buffer_unordered(N)` runs at most `N` per-object futures
     //    at once, and yields each `Result` so a storage error short-circuits the whole run.
@@ -403,21 +462,25 @@ async fn verify(
     Ok(missing)
 }
 
-/// Periodic progress logger — a line roughly every [`PROGRESS_INTERVAL`] or every
-/// [`PROGRESS_EVERY_N`] objects, whichever comes first.
+/// Periodic progress reporter — a `tracing` line (and, when supplied, a [`ProgressSink`]
+/// callback) roughly every [`PROGRESS_INTERVAL`] or every [`PROGRESS_EVERY_N`] objects,
+/// whichever comes first.
 struct Progress {
     total: u64,
     last: Instant,
+    /// The optional streaming callback (the daemon's NDJSON mpsc sink); `None` for the CLI.
+    sink: Option<ProgressSink>,
 }
 
 const PROGRESS_INTERVAL: Duration = Duration::from_secs(2);
 const PROGRESS_EVERY_N: u64 = 500;
 
 impl Progress {
-    fn new(total: u64) -> Self {
+    fn new(total: u64, sink: Option<ProgressSink>) -> Self {
         Self {
             total,
             last: Instant::now(),
+            sink,
         }
     }
 
@@ -437,6 +500,17 @@ impl Progress {
                 dry_run,
                 "blob migrate: progress"
             );
+            // The streaming sink fires at the SAME cadence, in ADDITION to the tracing line.
+            if let Some(sink) = &self.sink {
+                sink(MigrateProgress {
+                    done,
+                    total: self.total,
+                    copied,
+                    skipped,
+                    copied_bytes: bytes,
+                    dry_run,
+                });
+            }
         }
     }
 }
@@ -453,7 +527,7 @@ impl Progress {
 #[cfg(all(test, feature = "blob-migrate-gate-mutation"))]
 mod gate {
     use super::*;
-    use boatramp_storage::FsStorage;
+    use crate::FsStorage;
 
     /// A representative slice of the ONE node blob keyspace: an immutable content-addressed deploy
     /// blob (`{2hex}/{64hex}`), a mutable control-plane manifest record, and a mutable guest object

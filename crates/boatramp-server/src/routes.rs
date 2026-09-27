@@ -265,6 +265,13 @@ pub fn router_with_fast(
         // `system·admin` in `authz::Right::required`. Local single-node only; a
         // remote/sqld backend is refused with a typed error.
         .route("/api/sql-move", post(sql_move))
+        // Daemon-mediated blob drain (v0.6.3): the running node drains its OWN configured
+        // `[serve.blob_fallback]` secondary → primary over the control plane (no local/SSH), streaming
+        // NDJSON progress. A NODE-level maintenance op like prune/scrub/sql-move, so gated at
+        // `system·admin` in `authz::Right::required` (the SINGULAR hyphen path can't collide with the
+        // `/api/blobs/` Blobs·Deploy matcher) AND re-checked defense-in-depth in the handler. The body
+        // names no source/dest — the daemon drains only its own configured pair.
+        .route("/api/blob-drain", post(blob_drain_handler))
         .route("/api/certs", get(cert_status))
         .route("/api/cache/invalidate", post(invalidate_cache))
         .route(

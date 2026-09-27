@@ -25,8 +25,21 @@ pub mod backends;
 #[cfg(feature = "blob-fallback-gate-mutation")]
 pub mod blob_fallback;
 /// Offline, node-local blob-backend migration (`boatramp blob migrate`) — the copy engine over
-/// the [`Storage`](boatramp_core::Storage) primitives.
-pub mod blob_migrate;
+/// the [`Storage`](boatramp_core::Storage) primitives. Relocated into `boatramp-storage` in
+/// v0.6.3 (so the daemon-mediated `POST /api/blob-drain` can drive it too); re-exported here so
+/// the offline CLI + `build_blobs` callers keep compiling unchanged (`boatramp_node::blob_migrate`).
+/// Gated on the exact set of node features that activate the optional `boatramp-storage` dep (every
+/// blob backend implies `fallback`; `cloudflare-kv`/`slatedb`/`handlers` pull it directly), so the
+/// re-export exists precisely when `boatramp_storage` is linkable — which is exactly when the offline
+/// `blob migrate` / `blob drain` client path (which needs a real backend) is reachable. A truly lean
+/// node (no storage) compiles fine with the re-export absent (nothing references it there).
+#[cfg(any(
+    feature = "fallback",
+    feature = "cloudflare-kv",
+    feature = "slatedb",
+    feature = "handlers"
+))]
+pub use boatramp_storage::blob_migrate;
 pub mod blobs;
 pub mod compute;
 pub mod config;

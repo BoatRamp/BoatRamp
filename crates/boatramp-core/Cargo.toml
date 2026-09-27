@@ -29,6 +29,11 @@ authz = [
   "dep:rand_core",
   "dep:cedar-policy",
 ]
+# TEST-ONLY, NEVER SHIPPED: pass-through of the D4 authz mutation seam to `boatramp-types` for the
+# `BLOB DRAIN DAEMON-MEDIATED OK` gate (v0.6.3). `boatramp-server`'s `blob-drain-gate-mutation`
+# enables this, which enables `boatramp-types/blob-drain-gate-mutation` — where the `Right::required`
+# `POST /api/blob-drain` arm carries the LOWER_AUTHZ seam. Compiled OUT of every real build.
+blob-drain-gate-mutation = ["boatramp-types/blob-drain-gate-mutation"]
 
 [dependencies]
 # The shared, wasm-clean type + routing/config layer (re-exported below so

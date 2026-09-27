@@ -77,6 +77,13 @@ cache = ["dep:lru", "dep:bytes"]
 # (a wedged secondary degrades a miss to NotFound, never a hang); `bytes` for the
 # `Storage::mapped` return type.
 fallback = ["dep:bytes", "tokio/time"]
+# CI gate lane for Part 1 of the blob-backend migration (`BLOB MIGRATE COMPLETE OK`). When ON, the
+# `blob_migrate::gate` battery compiles + each `BOATRAMP_BLOBMIG_MUTATE_*` env var neuters exactly
+# ONE invariant (via a `#[cfg(feature = "blob-migrate-gate-mutation")]` seam), so CI can prove the
+# gate is load-bearing by asserting every mutation FAILS it. Implies `fs` (the gate runs entirely
+# fs→fs in a tempdir — no cloud — so it pulls this crate's `FsStorage`). Moved here from
+# `boatramp-node` in v0.6.3 when the copy engine relocated into `boatramp-storage`.
+blob-migrate-gate-mutation = ["fs"]
 
 [dependencies]
 boatramp-core.workspace = true
@@ -85,6 +92,10 @@ async-trait.workspace = true
 tokio = { workspace = true }
 tokio-util.workspace = true
 notify.workspace = true
+# The `MigrateError` type in the always-compiled `blob_migrate` copy engine.
+thiserror.workspace = true
+# Periodic progress logging in the `blob_migrate` copy engine (the `maybe_log` cadence).
+tracing.workspace = true
 
 bytes = { workspace = true, optional = true }
 aws-config = { workspace = true, optional = true }
@@ -130,6 +141,9 @@ bytes.workspace = true
 # as a secondary guard (one instance at a time; distinct temp dirs, so it gates
 # concurrency, not correctness).
 serial_test = "3"
+# The `blob_migrate::gate` battery (feature `blob-migrate-gate-mutation`) runs the copy engine
+# fs→fs in a scratch directory.
+tempfile = "3"
 
 [lints]
 workspace = true
