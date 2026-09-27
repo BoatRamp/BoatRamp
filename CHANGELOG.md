@@ -5,6 +5,42 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.6.2] - 2026-09-27
+
+Additive, non-breaking. Blob-backend migration: an offline copy command + an optional zero-downtime
+read-fallback backend, so switching the node blob backend (fs→cloud, provider→provider, region→region)
+no longer strands every site behind a re-apply.
+
+### Added
+
+- **`boatramp blob migrate --from <config> --to <config>` (offline copy).** A node-local command that
+  builds a source and destination blob backend from two node config specs (reusing `build_blobs` +
+  the `[secrets]` sealed-credential path) and copies every object `get`→`put`, skipping any already
+  `head`-present with a matching size. Content-addressed + immutable ⇒ the copy is idempotent and
+  resumable (a re-run after an interruption is a near-no-op). Read-only on the source (never deletes) —
+  the source stays authoritative until the operator flips `[serve].blobs`. Bounded `--concurrency`,
+  `--dry-run` (probes reachability; copies nothing), `--prefix`, `--json`, and a final per-key
+  **verify** (heads every source key in the destination; lists any missing; non-zero exit on any miss
+  or copy error). `--to` defaults to the running node's own configured backend; a bare `blob migrate`
+  with a `[serve].blob_fallback` configured drains the fallback → primary. The resolved source/dest
+  identity is echoed and an equal source==dest is refused. (Unrelated to the top-level `boatramp
+  migrate` secrets-store re-key — the help text cross-disambiguates.)
+
+- **`[serve].blob_fallback` — a zero-downtime read-fallback secondary blob backend.** A read-fallback
+  composite serves the primary (new) backend first and, on a definitive miss of a fallback-eligible
+  key, reads through to a strictly read-only secondary (old) backend — so a backend switch has no
+  serving gap. Rollout: deploy `primary=new, blob_fallback=old` → `boatramp blob migrate` drains
+  old→new → remove `[serve].blob_fallback` and restart. The secondary supports its own sealed
+  `s3_credential` (#505). Security-hardened (3-role panel + a mutation-verified gate):
+  fall-through happens **only** on a definitive `NotFound` — any transient primary error propagates
+  (never serves stale/secondary bytes on a blip); the fall-through is **prefix-allowlisted** to
+  content-addressed blobs, `hblob/`, and `mqgp/` (a control-plane-shaped key never resurrects off the
+  secondary); `put`/`delete` are primary-only; keys are forwarded byte-identical (tenant isolation,
+  enforced above the storage layer, is preserved); and blob GC **refuses to prune** while a fallback
+  secondary is attached (a union `list` over a primary-only `delete` would otherwise report a
+  secondary-only orphan reclaimed while a read resurrects it — drain, drop the fallback, then GC). The
+  node logs a prominent transition-mode warning while a fallback is active.
+
 ## [0.6.1] - 2026-09-27
 
 Additive, non-breaking. Sealed-store sourcing for the base S3 credential (#505).
