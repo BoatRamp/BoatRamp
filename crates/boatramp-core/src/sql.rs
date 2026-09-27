@@ -1942,6 +1942,76 @@ pub trait TenantRepair: Send + Sync {
     ) -> Result<RepairReport, RepairError>;
 }
 
+/// Declare + eagerly provision a **project-scoped managed database** from a manifest
+/// `databases:` entry (v0.6.0, #501 Stage B). The project-scoped DECLARATIVE front
+/// door onto the daemon-level managed-DB provisioning stack: it persists the typed
+/// [`ApplyDatabase`](crate::compute::ApplyDatabase) binding at
+/// `project/<proj>/database/<name>` (control-plane, replicated), enforces the
+/// security invariants (daemon-config-wins on a same-name conflict WITH the node-static
+/// `[handlers].bindings.sql.databases`, refuse an identity change, caller's-project
+/// binding), lowers it to an internal `ExternalDatabaseConfig` (managed-credential
+/// path — no `password_env`, stock image, host-derived compute), and eagerly triggers
+/// the idempotent `provision_tenant` so the DB exists when `apply` returns.
+///
+/// Backs the `Project·Admin`-gated `PUT /api/projects/{proj}/databases/{name}`; `None`
+/// on the router ⇒ that route returns `501`. Wired by the node when a managed DB engine
+/// (a sqlx backend) + a `[secrets]` envelope are both present.
+#[async_trait]
+pub trait ManagedDbDeclare: Send + Sync {
+    /// Declare (persist + eagerly provision) managed database `name` in `project` from
+    /// the typed manifest projection `db`. Idempotent: re-declaring an unchanged binding
+    /// is a no-op provision. Enforces daemon-config-wins, identity-change refusal, and
+    /// caller's-project binding — see [`DeclareError`].
+    async fn declare(
+        &self,
+        project: &str,
+        name: &str,
+        db: &crate::compute::ApplyDatabase,
+    ) -> Result<(), DeclareError>;
+
+    /// Provision (idempotently) an ALREADY-declared managed database `name` in `project`
+    /// WITHOUT re-persisting the binding — the `POST /api/databases/{name}/ensure` verb.
+    /// Fails with [`DeclareError::NotDeclared`] if nothing is declared by that name.
+    async fn ensure(&self, project: &str, name: &str) -> Result<(), DeclareError>;
+}
+
+/// Why a [`ManagedDbDeclare`] call was refused (each maps to an HTTP status at the API).
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum DeclareError {
+    /// No managed SQL engine is configured on this node (no sqlx backend) — a manifest
+    /// `databases:` entry can't be provisioned here. `501`.
+    #[error("managed database declaration is not available on this node (no managed SQL engine)")]
+    NotConfigured,
+    /// The name collides with a node-operator's static `[handlers].bindings.sql.databases`
+    /// entry. DAEMON-CONFIG-WINS: a project manifest may NEVER shadow/override a
+    /// node-operator's BYO binding. Fail-closed. `409`.
+    #[error(
+        "managed database {0:?} is defined by the node operator's static config; a project \
+         manifest may not shadow or override it (daemon config wins)"
+    )]
+    DaemonConflict(String),
+    /// A re-apply tried to change an IDENTITY field (`kind`/`tenant`/`tenant_scope`) of an
+    /// existing declared database — refused fail-closed (silent data-loss/orphan guard).
+    /// Names the field. `409`.
+    #[error(
+        "managed database {db:?}: {field} cannot be changed on re-apply (would orphan or lose \
+         data); tear it down explicitly and re-declare"
+    )]
+    IdentityChange {
+        /// The declared database name.
+        db: String,
+        /// The identity field that changed (`kind`/`tenant`/`tenant_scope`).
+        field: &'static str,
+    },
+    /// The `ensure` verb was called for a database that has not been declared. `404`.
+    #[error("managed database {0:?} has not been declared in this project")]
+    NotDeclared(String),
+    /// The declaration or provision failed (a store write, a lowering/validation error,
+    /// or the provision itself). `400`.
+    #[error("{0}")]
+    Other(String),
+}
+
 /// Why a [`TenantRepair::repair`] run could not produce a report at all (distinct from a per-check
 /// `Error` verdict, which IS reported). Mirrors [`MigrationError`]'s status split: `NotConfigured`
 /// ⇒ `501`, `Unavailable` ⇒ a retryable `503`, `Other` ⇒ `400`.
