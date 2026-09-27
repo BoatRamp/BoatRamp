@@ -367,6 +367,219 @@ pub struct PutComputeRequest {
     pub placement: PlacementConstraints,
 }
 
+// ---------------------------------------------------------------------------
+// Declarative managed-database surface (v0.6.0, #501 Stage B).
+// ---------------------------------------------------------------------------
+
+/// The engine a declared managed database runs — the SAFE, typed subset of the
+/// node-static `ExternalDatabaseConfig.kind` string. A manifest may only declare an
+/// engine boatramp fully manages (provisions + seals the credential for): Postgres
+/// or MySQL. `libsql` is deliberately absent — the embedded engine is the per-site
+/// default and needs no declaration, and its `path` source is host-fs (excluded).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ApplyDatabaseKind {
+    /// PostgreSQL (lowered to `ExternalDatabaseConfig.kind = "postgres"`).
+    Postgres,
+    /// MySQL (lowered to `ExternalDatabaseConfig.kind = "mysql"`).
+    Mysql,
+}
+
+impl ApplyDatabaseKind {
+    /// The node-static `ExternalDatabaseConfig.kind` string this lowers to.
+    pub fn as_config_kind(self) -> &'static str {
+        match self {
+            Self::Postgres => "postgres",
+            Self::Mysql => "mysql",
+        }
+    }
+}
+
+/// How a declared managed database is physically isolated per tenant — the typed
+/// projection of `ExternalDatabaseConfig.tenant` (`TenantIsolation`). `Single` = a
+/// dedicated server (container) per tenant; `Shared` = one server hosting a
+/// per-tenant database + login role (grant-isolated).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ApplyDatabaseTenant {
+    /// A dedicated database server (its own container) per tenant. The default.
+    #[default]
+    Single,
+    /// One shared server hosting a per-tenant database + role (grant-isolated).
+    Shared,
+}
+
+/// The grain of a tenant for a declared managed database — the typed projection of
+/// `ExternalDatabaseConfig.tenant_scope` (`TenantScope`). `Project` (default) or
+/// `Site`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ApplyDatabaseScope {
+    /// A tenant is a **project** (the default).
+    #[default]
+    Project,
+    /// A tenant is a **site** (finer than project).
+    Site,
+}
+
+/// A coarse sizing **preset** for a declared managed database — NOT raw VM knobs.
+/// The manifest author picks a t-shirt size; boatramp maps it to concrete
+/// vcpus/mem/volume at lowering time (see [`ApplyDatabaseSize::resources`]), so the
+/// declarative surface never exposes an unbounded resource request (the errno-28
+/// disk-full / DoS guard). Default `Small`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ApplyDatabaseSize {
+    /// 1 vCPU / 512 MiB / 10 GiB volume — the default, matching the stock
+    /// `managed_db_spec` sizing.
+    #[default]
+    Small,
+    /// 2 vCPU / 2 GiB / 50 GiB volume.
+    Medium,
+    /// 4 vCPU / 8 GiB / 200 GiB volume.
+    Large,
+}
+
+impl ApplyDatabaseSize {
+    /// The `(vcpus, mem_mib, volume_size_mib)` this preset maps to. The single
+    /// authority for the preset → resources mapping, so the CLI (rendering) and the
+    /// server (lowering) agree. Deliberately bounded: `Large` is the ceiling a
+    /// manifest can request — there is no raw-knob escape hatch.
+    pub fn resources(self) -> (u32, u32, u32) {
+        match self {
+            // (vcpus, mem_mib, volume_size_mib)
+            Self::Small => (1, 512, 10 * 1024),
+            Self::Medium => (2, 2 * 1024, 50 * 1024),
+            Self::Large => (4, 8 * 1024, 200 * 1024),
+        }
+    }
+}
+
+/// The operator ceilings a declared database's optional tuning knobs are CAPPED to
+/// (a DoS / resource guard — the manifest author can lower a knob, never raise it
+/// past the ceiling). Applied at lowering time in `boatramp-node`; centralized here
+/// so the cap is one authority.
+pub mod apply_db_caps {
+    /// Maximum `pool_max` a manifest may request (connections). A too-large pool
+    /// exhausts the server's connection slots.
+    pub const MAX_POOL: u32 = 64;
+    /// Maximum `connect_timeout_secs` a manifest may request.
+    pub const MAX_CONNECT_TIMEOUT_SECS: u64 = 60;
+    /// Maximum `startup_grace_secs` a manifest may request (bounds how long a
+    /// never-healthy replica is left running before the reconcile relaunches it).
+    pub const MAX_STARTUP_GRACE_SECS: u32 = 600;
+}
+
+/// A **declared managed database** in an [`ApplyManifest`](crate) `databases:` block
+/// (v0.6.0, #501 Stage B). This is a TYPED PROJECTION of the node-static
+/// `ExternalDatabaseConfig` restricted to the fields that are SAFE for a project
+/// author to declare — the security contract.
+///
+/// # The security contract (what is DELIBERATELY absent)
+///
+/// A declared database is DEFINITIONALLY the "boatramp fully manages + seals the
+/// credential" path: it carries **no** secret / env-var / URL / host-fs / image
+/// field, so a manifest can neither reference a secret nor pick an arbitrary OCI
+/// image. The EXCLUDED fields (NOT part of this struct — that exclusion IS the
+/// contract):
+///
+/// - `image` — arbitrary-OCI RCE (no allowlist); boatramp always picks the stock
+///   engine image at lowering.
+/// - `password_env` — omitting it is what selects the managed-credential path
+///   (`ExternalDatabaseConfig::is_managed_credential`); a declared DB can NEVER bring
+///   its own password.
+/// - `url_env` / `read_url_env` / `migration_url_env` — BYO-secret / SSRF /
+///   arbitrary-host reach.
+/// - `path` — host-fs traversal.
+/// - `compute` — the manifest does NOT let the author name an arbitrary compute
+///   workload; boatramp DERIVES the per-project managed DB server workload name at
+///   lowering, so a manifest can only ever provision onto its own project's server.
+///
+/// The struct uses `deny_unknown_fields` so a manifest that tries to smuggle one of
+/// the excluded keys fails to parse rather than being silently ignored.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApplyDatabase {
+    /// The binding name — how a guest reaches it via `sql.open("<name>")` and the
+    /// `{name}` path segment of the `project-database/{project}/{name}` store key.
+    pub name: String,
+    /// The engine (Postgres or MySQL). Lowered to `ExternalDatabaseConfig.kind`.
+    pub kind: ApplyDatabaseKind,
+    /// The engine major version (e.g. `16` for Postgres). Advisory metadata carried
+    /// on the stored binding; a version CHANGE on re-apply routes through the
+    /// owner-gated migrate/repair path (never a silent re-init). `None` ⇒ the engine
+    /// default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<u32>,
+    /// Trusted extensions to make available (Postgres). Advisory metadata; enabling
+    /// one still routes through the owner-gated migration `Extension` step +
+    /// operator allowlist — this does NOT bypass that gate.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extensions: Vec<String>,
+    /// Coarse sizing preset (`small`/`medium`/`large`). Maps to bounded
+    /// vcpus/mem/volume at lowering — NOT raw VM knobs.
+    #[serde(default)]
+    pub size: ApplyDatabaseSize,
+    /// Isolation mechanism (`single` = dedicated container per tenant; `shared` =
+    /// one server, per-tenant db + role). Lowered to `ExternalDatabaseConfig.tenant`.
+    /// A CHANGE on re-apply is REFUSED (silent data-loss/orphan guard).
+    #[serde(default)]
+    pub tenant: ApplyDatabaseTenant,
+    /// Tenant grain (`project`/`site`). Lowered to
+    /// `ExternalDatabaseConfig.tenant_scope`. A CHANGE on re-apply is REFUSED.
+    #[serde(default)]
+    pub tenant_scope: ApplyDatabaseScope,
+    /// Open every transaction `READ ONLY`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub read_only: bool,
+    /// Opt-in native-RLS session injection (`rls_session`). See
+    /// `ExternalDatabaseConfig.rls_session`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub rls_session: bool,
+    /// The Postgres session GUC for the host-resolved tenant (RLS backstop). Only
+    /// honored with `rls_session` on + Postgres.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant_guc: Option<String>,
+    /// The session GUC for the anonymous session axis (RLS backstop).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_guc: Option<String>,
+    /// The reserved sentinel written to `tenant_guc` on an `all`-scoped read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant_all_marker: Option<String>,
+    /// Maximum pooled connections. CAPPED to [`apply_db_caps::MAX_POOL`] at lowering.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool_max: Option<u32>,
+    /// Connection/acquire timeout in seconds. CAPPED to
+    /// [`apply_db_caps::MAX_CONNECT_TIMEOUT_SECS`] at lowering.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connect_timeout_secs: Option<u64>,
+    /// Startup grace in seconds for the managed server's first `initdb`. CAPPED to
+    /// [`apply_db_caps::MAX_STARTUP_GRACE_SECS`] at lowering.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup_grace_secs: Option<u32>,
+}
+
+impl ApplyDatabase {
+    /// The identity fields a re-apply may NEVER change (silent data-loss / orphan
+    /// guard): `kind`, `tenant`, `tenant_scope`. (There is no author-supplied
+    /// `compute` to compare — boatramp derives it, so it cannot drift.) Returns the
+    /// first differing field name, or `None` if the two declarations agree on all
+    /// identity fields. `version`/`extensions`/`size`/rls-knobs are intentionally NOT
+    /// compared — those route through migrate/repair or are documented re-tuning.
+    pub fn identity_change(&self, prior: &Self) -> Option<&'static str> {
+        if self.kind != prior.kind {
+            return Some("kind");
+        }
+        if self.tenant != prior.tenant {
+            return Some("tenant");
+        }
+        if self.tenant_scope != prior.tenant_scope {
+            return Some("tenant_scope");
+        }
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

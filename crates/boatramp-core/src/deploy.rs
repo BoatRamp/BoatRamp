@@ -318,6 +318,27 @@ pub(crate) mod keys {
         format!("project/{project}/config/{key}")
     }
 
+    /// A project-scoped **declarative managed-database binding**:
+    /// `project/<proj>/database/<name>` → the typed `ApplyDatabase` (v0.6.0, #501
+    /// Stage B). The project-scoped DECLARATIVE front door onto the daemon-level
+    /// managed-DB provisioning stack: a manifest `databases:` entry is persisted here
+    /// (control-plane, cluster-replicated), then merged with the node-static
+    /// `[handlers].bindings.sql.databases` at the live merge point (daemon-static
+    /// config WINS on a same-name conflict — enforced there, not here). Unlike the
+    /// credential (`managed-sql-cred/…`) and the data volume, this record is JUST the
+    /// declaration; removing it never drops the DB/volume/credential (teardown is an
+    /// explicit imperative verb). Under `project/<proj>/…`, so `purge_project`'s
+    /// residual sweep clears the declaration when the whole project is torn down.
+    pub fn project_database(project: ProjectRef<'_>, name: &str) -> String {
+        format!("project/{project}/database/{name}")
+    }
+
+    /// The prefix listing a project's declared managed databases
+    /// (`project/<proj>/database/`); the `strip_prefix` tail is a single `<name>`.
+    pub fn project_database_prefix(project: ProjectRef<'_>) -> String {
+        format!("project/{project}/database/")
+    }
+
     /// The prefix under which a project's GraphQL **safelist** (persisted trusted
     /// operations, `hapq/<proj>/<hash>`) lives. Note it is **not** under the
     /// `project/<proj>/…` resource prefix — the residual sweep in
@@ -906,6 +927,60 @@ impl DeployStore {
             .delete(&keys::project_config(project, "tenancy"))
             .await?;
         Ok(())
+    }
+
+    /// The typed declarative managed-DB binding stored for `(project, name)`, or
+    /// `None` if the project has declared no database by that name (v0.6.0, #501
+    /// Stage B). Stored as a small JSON singleton at `project/<proj>/database/<name>`,
+    /// exactly like [`get_project_tenancy`](Self::get_project_tenancy).
+    pub async fn get_project_database(
+        &self,
+        project: ProjectRef<'_>,
+        name: &str,
+    ) -> Result<Option<crate::compute::ApplyDatabase>, DeployError> {
+        match self.kv.get(&keys::project_database(project, name)).await? {
+            Some(bytes) => Ok(Some(
+                serde_json::from_slice(&bytes).map_err(|e| DeployError::Serde(e.to_string()))?,
+            )),
+            None => Ok(None),
+        }
+    }
+
+    /// Store a project's declarative managed-DB binding (create-or-replace) at
+    /// `project/<proj>/database/<name>`. The write is the DECLARATION only — it never
+    /// touches the credential/volume/DB. Daemon-config-wins conflict + destructive-
+    /// change refusal are enforced by the caller BEFORE this write (the merge point +
+    /// the declare capability), never here.
+    pub async fn set_project_database(
+        &self,
+        project: ProjectRef<'_>,
+        db: &crate::compute::ApplyDatabase,
+    ) -> Result<(), DeployError> {
+        let bytes = serde_json::to_vec(db).map_err(|e| DeployError::Serde(e.to_string()))?;
+        self.kv
+            .put(&keys::project_database(project, &db.name), bytes)
+            .await?;
+        Ok(())
+    }
+
+    /// List a project's declared managed databases (for `boatramp db ls`). Each is the
+    /// stored typed [`ApplyDatabase`](crate::compute::ApplyDatabase). A record that
+    /// fails to deserialize is skipped (forward-compat), never fatal to the listing.
+    pub async fn list_project_databases(
+        &self,
+        project: ProjectRef<'_>,
+    ) -> Result<Vec<crate::compute::ApplyDatabase>, DeployError> {
+        let prefix = keys::project_database_prefix(project);
+        let mut out = Vec::new();
+        for key in self.kv.list_prefix(&prefix).await? {
+            if let Some(bytes) = self.kv.get(&key).await?
+                && let Ok(db) = serde_json::from_slice::<crate::compute::ApplyDatabase>(&bytes)
+            {
+                out.push(db);
+            }
+        }
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(out)
     }
 
     /// Like [`get_site_config`](Self::get_site_config) but returns a shared,
