@@ -45,10 +45,20 @@ left untouched. There is deliberately no `--prune`.
     ],
 
     compute: [
-        ( name: "api", spec: { "spec": { "root": { "image": "ghcr.io/acme/api:1" } }, "replicas": 2 } ),
+        // v0.6.0: the compute spec is the typed `ComputeSpec` (`root` is the
+        // snake_case newtype variant `image(…)`), with sibling `replicas`/`placement`.
+        ( name: "api", spec: ( root: image("ghcr.io/acme/api:1"), vcpus: 1, mem_mib: 512, port: 8080 ), replicas: 2 ),
     ],
 )
 ```
+
+> **Upgrading a pre-v0.6.0 manifest.** In v0.6.0 `compute[].spec` became the typed
+> `ComputeSpec` (it was a raw JSON blob before). A version-less manifest that still
+> uses the old shape fails to parse with a message pointing here. To upgrade: add
+> `version: 1` at the top of the old manifest and run `boatramp config migrate <file>`
+> (add `--write` to rewrite it in place). The upgraded manifest omits `version:`
+> (absent = current); declare `version: <the schema you wrote>` only if you want
+> migration support for a future upgrade.
 
 Each `sites[]` entry is a slug plus:
 
