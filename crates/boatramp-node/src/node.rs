@@ -462,6 +462,11 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
     // one on hard-drop.
     #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
     let reaper_envelope = secrets_envelope.clone();
+    // …and a clone for the declarative managed-database capability (#501 Stage B): it
+    // provisions the declared DB + seals its credential server-side, so it needs a real
+    // envelope; wired only when one is present (fail-closed like every managed-DB path).
+    #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+    let declare_envelope = secrets_envelope.clone();
     #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
     let managed_db_resolver: Option<Arc<dyn boatramp_core::compute::ManagedDbEnvResolver>> = match (
         config
@@ -642,6 +647,35 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
     #[cfg(not(any(feature = "sql-postgres", feature = "sql-mysql")))]
     let tenant_repair: Option<Arc<dyn boatramp_core::sql::TenantRepair>> = None;
 
+    // Declarative managed-database capability (#501 Stage B) — backs the `Project·Admin`-gated
+    // `PUT /api/projects/{proj}/databases/{name}` + `POST …/ensure`. It persists a manifest
+    // `databases:` entry to `project-database/{project}/{name}`, enforces daemon-config-wins at
+    // the merge point (against the node-static `sql.databases`), refuses an identity change,
+    // binds provisioning to the caller's project, and eagerly provisions via `provision_tenant`.
+    // Requires a sqlx engine (it provisions a Postgres/MySQL server) AND a `[secrets]` envelope
+    // (a managed DB seals its credential). UNLIKE repair/operator_sql it is NOT gated on
+    // `!sql.databases.is_empty()` — a node with NO node-static databases can still accept a
+    // project declaration (the whole point of the declarative front door). The node-static map
+    // (possibly empty) is threaded so the daemon-wins conflict check has both sources.
+    #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+    let managed_db_declare: Option<Arc<dyn boatramp_core::sql::ManagedDbDeclare>> =
+        declare_envelope.map(|envelope| {
+            let static_dbs = config
+                .handlers
+                .as_ref()
+                .and_then(|h| h.bindings.sql.as_ref())
+                .map(|sql| sql.databases.clone())
+                .unwrap_or_default();
+            Arc::new(crate::managed_db_declare::NodeManagedDbDeclare::new(
+                static_dbs,
+                deploy.clone(),
+                kv.clone(),
+                envelope,
+            )) as Arc<_>
+        });
+    #[cfg(not(any(feature = "sql-postgres", feature = "sql-mysql")))]
+    let managed_db_declare: Option<Arc<dyn boatramp_core::sql::ManagedDbDeclare>> = None;
+
     // Operator compute-exec capability (run a command inside a running workload) —
     // backs `POST /api/compute/{name}/exec`, gated by the `allow_compute_exec`
     // posture. Clone the backend registry before the reconcile loop consumes it.
@@ -718,6 +752,7 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
     options.operator_sql = operator_sql;
     options.migration_substrate = migration_substrate;
     options.tenant_repair = tenant_repair;
+    options.managed_db_declare = managed_db_declare;
     options.tenant_deprovisioner = tenant_deprovisioner;
     options.compute_exec = compute_exec;
     options.compute_volumes = compute_volumes;
