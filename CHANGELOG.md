@@ -37,8 +37,12 @@ Additive, non-breaking. Sealed-store sourcing for the base S3 credential (#505).
   - **Backward compatible:** with `[serve.s3_credential]` **absent**, the ambient AWS env chain is
     used exactly as before (unchanged).
   - **Cluster note:** on a cluster, the blob storage is built before the replicated control plane, so a
-    `boatramp:` (KV-backed) node-cred ref is refused fail-closed with a clear message — use an
-    `env:<VAR>` ref there. (A KV-backed cluster node-cred is a documented follow-up.)
+    `boatramp:` (KV-backed) node-cred ref is refused fail-closed with a clear message (a *structural*
+    scheme check, not an incidental store miss) — use an `env:<VAR>` ref there. Additionally, the AWS
+    cloud minter is wired on the **single-node** path only (not `run_cluster`), so **sealed-cred +
+    cloud-minter is single-node this release**: a cluster uses `env:<VAR>` for the blob backend base
+    credential and gets **no cloud minter**. (A KV-backed cluster node-cred — and the cluster cloud
+    minter — are documented follow-ups.)
   - The SlateDB R2/S3 control-plane KV store (`--kv-s3`) still uses the ambient AWS env chain (out of
     scope this release).
 
