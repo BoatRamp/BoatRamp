@@ -1680,13 +1680,15 @@ pub(super) async fn repair_dry_run(
 
 /// Map a [`DeclareError`](boatramp_core::sql::DeclareError) to an HTTP response. The
 /// structured reason rides in the body; the status distinguishes the security refusals
-/// (`409` daemon-conflict / identity-change) from a missing declaration (`404`), an
-/// unavailable capability (`501`), and a generic bad request (`400`).
+/// (`409` daemon-conflict / identity-change) from a per-project quota refusal (`422`), a
+/// missing declaration (`404`), an unavailable capability (`501`), and a generic bad
+/// request (`400`).
 fn declare_error_response(err: boatramp_core::sql::DeclareError) -> Response {
     use boatramp_core::sql::DeclareError as E;
     let status = match &err {
         E::NotConfigured => StatusCode::NOT_IMPLEMENTED,
         E::DaemonConflict(_) | E::IdentityChange { .. } => StatusCode::CONFLICT,
+        E::QuotaExceeded { .. } => StatusCode::UNPROCESSABLE_ENTITY,
         E::NotDeclared(_) => StatusCode::NOT_FOUND,
         E::Other(_) => StatusCode::BAD_REQUEST,
     };

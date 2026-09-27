@@ -182,23 +182,127 @@ pub struct NodeManagedDbDeclare {
     deploy: DeployStore,
     kv: Arc<dyn KvStore>,
     envelope: Arc<dyn KeyEnvelope>,
+    /// Per-project ceilings (#501 Stage B MEDIUM-1 — the disk-exhaustion guard).
+    quota: DeclareQuota,
+}
+
+/// The operator-configurable per-project ceilings a `declare` is enforced fail-closed
+/// against (#501 Stage B MEDIUM-1). Resolved from the node's
+/// `handlers.bindings.sql.{max_declared_databases,max_declared_volume_mib}` config, or
+/// the built-in [`apply_db_caps`] defaults when the operator sets none.
+#[derive(Debug, Clone, Copy)]
+pub struct DeclareQuota {
+    /// Max NUMBER of declared databases a single project may hold.
+    pub max_databases: usize,
+    /// Max AGGREGATE `volume_size_mib` (MiB) across a project's declared databases.
+    pub max_volume_mib: u64,
+}
+
+impl Default for DeclareQuota {
+    fn default() -> Self {
+        Self {
+            max_databases: apply_db_caps::DEFAULT_MAX_DECLARED_DATABASES_PER_PROJECT,
+            max_volume_mib: apply_db_caps::DEFAULT_MAX_DECLARED_VOLUME_MIB,
+        }
+    }
+}
+
+impl DeclareQuota {
+    /// Resolve the ceilings from the operator's config knobs, folding `None` to the
+    /// built-in default (never a silent 0 — a 0 means "disable declarations", which the
+    /// operator must set explicitly).
+    pub fn from_config(max_databases: Option<usize>, max_volume_mib: Option<u64>) -> Self {
+        let d = Self::default();
+        Self {
+            max_databases: max_databases.unwrap_or(d.max_databases),
+            max_volume_mib: max_volume_mib.unwrap_or(d.max_volume_mib),
+        }
+    }
 }
 
 impl NodeManagedDbDeclare {
-    /// Build over the node-static `databases` map, the deploy store, KV, and the secrets
-    /// envelope (required — a managed DB seals its credential).
+    /// Build over the node-static `databases` map, the deploy store, KV, the secrets
+    /// envelope (required — a managed DB seals its credential), and the per-project
+    /// declaration ceilings ([`DeclareQuota`], #501 Stage B MEDIUM-1).
     pub fn new(
         static_dbs: BTreeMap<String, ExternalDatabaseConfig>,
         deploy: DeployStore,
         kv: Arc<dyn KvStore>,
         envelope: Arc<dyn KeyEnvelope>,
+        quota: DeclareQuota,
     ) -> Self {
         Self {
             static_dbs,
             deploy,
             kv,
             envelope,
+            quota,
         }
+    }
+
+    /// Enforce the per-project declaration ceilings fail-closed (#501 Stage B MEDIUM-1),
+    /// BEFORE any store write or provision. Counts the project's EXISTING declarations +
+    /// the incoming one against the count ceiling, and sums their provisioned volumes +
+    /// the incoming one against the aggregate-volume ceiling. Re-declaring an EXISTING
+    /// name (an update, not a new DB) does not consume a fresh count slot and swaps its
+    /// volume for the incoming one, so an idempotent re-apply is never blocked by its own
+    /// prior record.
+    async fn enforce_quota(
+        &self,
+        project: &str,
+        name: &str,
+        incoming: &ApplyDatabase,
+    ) -> Result<(), DeclareError> {
+        let existing = self
+            .deploy
+            .list_project_databases(ProjectRef::new(project))
+            .await
+            .map_err(|e| DeclareError::Other(e.to_string()))?;
+
+        // The incoming volume (MiB) from the size preset — the same value `lower` stamps.
+        let (_, _, incoming_vol) = incoming.size.resources();
+        let incoming_vol = u64::from(incoming_vol);
+
+        // Count + aggregate the OTHER declarations (everything but a same-name record,
+        // which the incoming declare replaces). A same-name re-apply neither adds a slot
+        // nor double-counts its own volume.
+        let mut others = 0usize;
+        let mut others_vol: u64 = 0;
+        for db in &existing {
+            if db.name == name {
+                continue;
+            }
+            others += 1;
+            let (_, _, v) = db.size.resources();
+            others_vol = others_vol.saturating_add(u64::from(v));
+        }
+
+        // Count ceiling: the OTHERS plus this one must fit.
+        let projected_count = others + 1;
+        if projected_count > self.quota.max_databases {
+            return Err(DeclareError::QuotaExceeded {
+                db: name.to_string(),
+                reason: format!(
+                    "declaring it would bring project {project:?} to {projected_count} managed \
+                     databases, over the ceiling of {}",
+                    self.quota.max_databases
+                ),
+            });
+        }
+
+        // Aggregate-volume ceiling: OTHERS' volumes plus this one's must fit.
+        let projected_vol = others_vol.saturating_add(incoming_vol);
+        if projected_vol > self.quota.max_volume_mib {
+            return Err(DeclareError::QuotaExceeded {
+                db: name.to_string(),
+                reason: format!(
+                    "declaring it would bring project {project:?} to {projected_vol} MiB of \
+                     provisioned managed-database volume, over the ceiling of {} MiB",
+                    self.quota.max_volume_mib
+                ),
+            });
+        }
+        Ok(())
     }
 
     /// Provision an ALREADY-lowered binding for `(project, name)`. A `Project`-scoped
@@ -275,6 +379,12 @@ impl ManagedDbDeclare for NodeManagedDbDeclare {
                 field,
             });
         }
+
+        // Per-project ceiling (#501 Stage B MEDIUM-1 — the disk-exhaustion / errno-28
+        // guard): fail-closed BEFORE any store write or eager volume provision if this
+        // declaration would push the project past its declared-DB count or aggregate
+        // provisioned-volume ceiling. A same-name re-apply doesn't consume a fresh slot.
+        self.enforce_quota(project, name, db).await?;
 
         // Lower to the managed-credential path (caller's-project-bound derived compute).
         let binding = lower(project, db);
@@ -554,6 +664,18 @@ mod tests {
         DeployStore,
         std::sync::Arc<dyn KvStore>,
     ) {
+        // A generous default quota so the existing gate assertions are unaffected.
+        declare_cap_quota(static_dbs, DeclareQuota::default())
+    }
+
+    fn declare_cap_quota(
+        static_dbs: BTreeMap<String, ExternalDatabaseConfig>,
+        quota: DeclareQuota,
+    ) -> (
+        NodeManagedDbDeclare,
+        DeployStore,
+        std::sync::Arc<dyn KvStore>,
+    ) {
         let kv: std::sync::Arc<dyn KvStore> = std::sync::Arc::new(MemoryKv::new());
         let deploy = DeployStore::new(std::sync::Arc::new(NullStorage), kv.clone());
         let cap = NodeManagedDbDeclare::new(
@@ -561,6 +683,7 @@ mod tests {
             deploy.clone(),
             kv.clone(),
             std::sync::Arc::new(XorEnvelope),
+            quota,
         );
         (cap, deploy, kv)
     }
@@ -698,5 +821,111 @@ mod tests {
         );
 
         println!("MANAGED-DB DECLARATION SCOPED OK");
+    }
+
+    /// MEDIUM-1: the per-project **count** ceiling is enforced fail-closed at `declare`,
+    /// BEFORE any store write / provision. With a ceiling of 2, the third distinct DB is
+    /// refused with `QuotaExceeded` and is NOT persisted.
+    #[tokio::test]
+    async fn per_project_count_ceiling_is_fail_closed() {
+        let quota = DeclareQuota {
+            max_databases: 2,
+            max_volume_mib: u64::MAX, // isolate the count axis
+        };
+        let (cap, deploy, _kv) = declare_cap_quota(BTreeMap::new(), quota);
+        cap.declare("acme", "a", &single_project("a"))
+            .await
+            .unwrap();
+        cap.declare("acme", "b", &single_project("b"))
+            .await
+            .unwrap();
+        // The third distinct DB is over the ceiling.
+        let refused = cap.declare("acme", "c", &single_project("c")).await;
+        assert!(
+            matches!(refused, Err(DeclareError::QuotaExceeded { ref db, .. }) if db == "c"),
+            "declaring past the count ceiling must be refused fail-closed — got {refused:?}"
+        );
+        // …and NOTHING was persisted for it (fail-closed BEFORE the write).
+        assert!(
+            deploy
+                .get_project_database(ProjectRef::new("acme"), "c")
+                .await
+                .unwrap()
+                .is_none(),
+            "the over-ceiling declaration must not be persisted"
+        );
+        // A same-name RE-APPLY of an existing DB does not consume a fresh slot.
+        cap.declare("acme", "a", &single_project("a"))
+            .await
+            .expect("re-declaring an existing DB is within the ceiling (no new slot)");
+        // A DIFFERENT project has its own independent ceiling (the count is per-project,
+        // not node-global) — `acme` is already at its cap of 2, yet `globex` can declare.
+        cap.declare("globex", "x", &single_project("x"))
+            .await
+            .expect("a different project has its own count budget");
+    }
+
+    /// MEDIUM-1: the per-project **aggregate-volume** ceiling is enforced fail-closed.
+    /// With a 25 GiB aggregate ceiling, two Small (10 GiB) DBs fit (20 GiB) but a third
+    /// would reach 30 GiB and is refused; a Medium (50 GiB) alone is refused.
+    #[tokio::test]
+    async fn per_project_volume_ceiling_is_fail_closed() {
+        let quota = DeclareQuota {
+            max_databases: usize::MAX, // isolate the volume axis
+            max_volume_mib: 25 * 1024, // 25 GiB
+        };
+        let (cap, deploy, _kv) = declare_cap_quota(BTreeMap::new(), quota);
+        // Two Small DBs (10 GiB each) fit under 25 GiB.
+        cap.declare("acme", "a", &single_project("a"))
+            .await
+            .unwrap();
+        cap.declare("acme", "b", &single_project("b"))
+            .await
+            .unwrap();
+        // A third Small would reach 30 GiB — over the aggregate ceiling.
+        let refused = cap.declare("acme", "c", &single_project("c")).await;
+        assert!(
+            matches!(refused, Err(DeclareError::QuotaExceeded { ref db, .. }) if db == "c"),
+            "declaring past the aggregate-volume ceiling must be refused — got {refused:?}"
+        );
+        assert!(
+            deploy
+                .get_project_database(ProjectRef::new("acme"), "c")
+                .await
+                .unwrap()
+                .is_none(),
+            "the over-ceiling declaration must not be persisted"
+        );
+        // A single Medium (50 GiB) alone exceeds the 25 GiB ceiling on a FRESH project.
+        let (cap2, _deploy2, _) = declare_cap_quota(BTreeMap::new(), quota);
+        let mut medium = single_project("big");
+        medium.size = ApplyDatabaseSize::Medium;
+        let refused_medium = cap2.declare("zeta", "big", &medium).await;
+        assert!(
+            matches!(refused_medium, Err(DeclareError::QuotaExceeded { .. })),
+            "a single over-ceiling volume must be refused — got {refused_medium:?}"
+        );
+    }
+
+    /// The config → ceilings resolution: `None` folds to the built-in `apply_db_caps`
+    /// defaults; a `Some` overrides; a `0` is honored (disable declarations).
+    #[test]
+    fn declare_quota_from_config_folds_defaults() {
+        let d = DeclareQuota::from_config(None, None);
+        assert_eq!(
+            d.max_databases,
+            apply_db_caps::DEFAULT_MAX_DECLARED_DATABASES_PER_PROJECT
+        );
+        assert_eq!(
+            d.max_volume_mib,
+            apply_db_caps::DEFAULT_MAX_DECLARED_VOLUME_MIB
+        );
+        let o = DeclareQuota::from_config(Some(4), Some(1234));
+        assert_eq!(o.max_databases, 4);
+        assert_eq!(o.max_volume_mib, 1234);
+        // 0 is honored (an operator explicitly disabling declarations), not folded.
+        let z = DeclareQuota::from_config(Some(0), Some(0));
+        assert_eq!(z.max_databases, 0);
+        assert_eq!(z.max_volume_mib, 0);
     }
 }

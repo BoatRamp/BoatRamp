@@ -184,6 +184,17 @@ impl Default for VaultSecretsConfig {
     }
 }
 
+/// The RESERVED compute-workload name prefix (#501 Stage B LOW-2). boatramp DERIVES the
+/// per-project managed-database server workloads with this prefix
+/// (`boatramp_storage::tenant_provision::DERIVED_MANAGED_DB_PREFIX`), so an operator must
+/// NOT name a static `[handlers].bindings.sql.databases.*.compute` workload with it — a
+/// collision could shadow / alias a derived managed server. Screened fail-closed at
+/// config load ([`ServerConfig::validate_sql_db_names`]). Kept as a literal here (not the
+/// `boatramp-storage` const) so the screen holds on a build without the sql engine
+/// features; the two must stay in sync (a single source of truth would couple config
+/// loading to the optional storage dep).
+const RESERVED_MANAGED_DB_COMPUTE_PREFIX: &str = "bramp-db-";
+
 impl ServerConfig {
     /// Parse a `boatramp.cfg` document (RON). Db-binding names declared in the file
     /// are validated here (the same fail-closed check `load` re-runs after the env
@@ -676,6 +687,11 @@ impl ServerConfig {
     /// `--db`, so it must be a non-empty, path-segment-safe identifier — the same rule
     /// project/site/function names already pass. The empty-string legacy default key
     /// gets a targeted cure pointing at the reserved `default` name.
+    ///
+    /// Also screens each binding's `compute` field against the
+    /// [`RESERVED_MANAGED_DB_COMPUTE_PREFIX`] (#501 Stage B LOW-2): the `bramp-db-`
+    /// prefix is reserved for the derived per-project managed-DB server workloads, so an
+    /// operator may not point a static BYO binding at a `bramp-db-…` workload.
     fn validate_sql_db_names(&self) -> Result<(), ConfigError> {
         let Some(databases) = self
             .handlers
@@ -685,7 +701,7 @@ impl ServerConfig {
         else {
             return Ok(());
         };
-        for name in databases.keys() {
+        for (name, db) in databases {
             if let Err(err) = boatramp_core::project::validate_resource_name("database", name) {
                 // The empty-string case is the pre-v0.5.0 default binding key: point
                 // at the cure (name it `default`, or set nothing and let the reserved
@@ -701,6 +717,22 @@ impl ServerConfig {
                     name: err.value,
                     reason: err.reason,
                     cure,
+                });
+            }
+            // #501 Stage B LOW-2: the `bramp-db-` compute-workload prefix is RESERVED for
+            // the derived per-project managed-DB server workloads
+            // (`boatramp_storage::tenant_provision::DERIVED_MANAGED_DB_PREFIX`). An operator
+            // must not point a static BYO binding at a `compute` workload with that prefix —
+            // it could shadow / alias a derived managed server. Screen it fail-closed at
+            // config load (cheap: a `starts_with` on an already-parsed field).
+            if let Some(compute) = db.compute.as_deref()
+                && compute.starts_with(RESERVED_MANAGED_DB_COMPUTE_PREFIX)
+            {
+                return Err(ConfigError::InvalidDbName {
+                    name: compute.to_string(),
+                    reason: "the `bramp-db-` compute-workload prefix is reserved for \
+                             boatramp-derived managed-database servers",
+                    cure: " — rename the `compute` workload to not start with `bramp-db-`",
                 });
             }
         }
@@ -1416,6 +1448,22 @@ pub struct SqlBindingConfig {
     /// default). Keep it tight (e.g. `["pgcrypto", "uuid-ossp", "citext"]`); an entry like
     /// `dblink`/`postgres_fdw` deliberately widens cross-database reach, so add those only knowingly.
     pub migrate_trusted_extensions: Option<Vec<String>>,
+    /// **Per-project declared-database COUNT ceiling** (#501 Stage B MEDIUM-1 — the
+    /// disk-exhaustion / errno-28 guard). The maximum number of `databases:` entries a
+    /// single project may declare; a declare that would exceed it is refused fail-closed
+    /// (a 422-class error). Each declared DB eagerly provisions a 10–200 GiB volume, so
+    /// without this a `Project·Admin` could declare an unbounded number and exhaust the
+    /// node's disk. `None` ⇒ the built-in default
+    /// (`apply_db_caps::DEFAULT_MAX_DECLARED_DATABASES_PER_PROJECT`, 16); `0` ⇒ declaring
+    /// any managed database is disabled on this node.
+    pub max_declared_databases: Option<usize>,
+    /// **Per-project aggregate declared-VOLUME ceiling**, in MiB (#501 Stage B
+    /// MEDIUM-1). The maximum SUM of `volume_size_mib` across all of a project's declared
+    /// databases; a declare whose incoming volume would push the project's total past
+    /// this is refused fail-closed. `None` ⇒ the built-in default
+    /// (`apply_db_caps::DEFAULT_MAX_DECLARED_VOLUME_MIB`, 512 GiB); `0` ⇒ disable managed
+    /// declarations on this node (the aggregate can never fit a non-zero volume).
+    pub max_declared_volume_mib: Option<u64>,
 }
 
 /// One external SQL database for the handler `sql` binding. Its **source** is one
@@ -1469,6 +1517,13 @@ pub struct ExternalDatabaseConfig {
     /// to source this database from, instead of `url_env`. boatramp resolves the
     /// workload's live endpoint and builds the connection. Mutually exclusive with
     /// `url_env`.
+    ///
+    /// **Reserved prefix (#501 Stage B LOW-2):** do NOT name a static workload with the
+    /// `bramp-db-` prefix — it is reserved for the per-project managed-database servers
+    /// boatramp derives for declarative `databases:` entries
+    /// (`boatramp_storage::tenant_provision::DERIVED_MANAGED_DB_PREFIX`). A `bramp-db-…`
+    /// value here is refused fail-closed at config load
+    /// ([`ConfigError::InvalidDbName`](crate::config::ConfigError::InvalidDbName)).
     pub compute: Option<String>,
     /// The database name inside the compute-backed server (non-secret).
     pub database: Option<String>,
@@ -2452,6 +2507,42 @@ mod tests {
             }
             other => panic!("expected ConfigError::InvalidDbName, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn reserved_bramp_db_compute_prefix_is_rejected() {
+        // #501 Stage B LOW-2: a static BYO binding may not point `compute` at a
+        // `bramp-db-…` workload (reserved for derived managed-DB servers) — refused
+        // fail-closed at config load.
+        let err = ServerConfig::parse(
+            r#"(
+                handlers: ( bindings: ( sql: (
+                    databases: {
+                        "byo": ( kind: "postgres", compute: "bramp-db-acme-app", database: "d", user: "u" ),
+                    },
+                ) ) ),
+            )"#,
+        )
+        .expect_err("a `bramp-db-` compute workload is refused");
+        match err {
+            ConfigError::InvalidDbName { name, reason, cure } => {
+                assert_eq!(name, "bramp-db-acme-app");
+                assert!(reason.contains("reserved"), "reason names the reservation");
+                assert!(cure.contains("bramp-db-"), "the cure names the prefix");
+            }
+            other => panic!("expected ConfigError::InvalidDbName, got {other:?}"),
+        }
+        // A NON-reserved compute workload for a BYO binding still loads fine.
+        ServerConfig::parse(
+            r#"(
+                handlers: ( bindings: ( sql: (
+                    databases: {
+                        "byo": ( kind: "postgres", compute: "my-pg", database: "d", user: "u" ),
+                    },
+                ) ) ),
+            )"#,
+        )
+        .expect("a non-reserved compute workload loads");
     }
 
     #[test]
