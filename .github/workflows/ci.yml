@@ -1478,6 +1478,25 @@ jobs:
           cargo test -p boatramp-storage --features blob-purge-gate \
                      -p boatramp-server \
                      blob_purge -- --nocapture
+      # JSON config input (v0.6.5). Same ROBUST-SUCCESSOR mechanism as the blob-purge gate above:
+      # a `#[test]` battery whose SOLE CI contract is the ordinary `cargo test` EXIT CODE — NO grepped
+      # uppercase marker, NO `for mut in …; do env BOATRAMP_*_MUTATE_${mut}=1 …` bash loop. The
+      # `config_json_gate_*` tests (in `boatramp::apply` + `boatramp_node::config`) prove: RON/JSON
+      # deserialize to the SAME typed value incl. an externally-tagged enum variant (`RootSource::Image`
+      # / `BlobBackend::S3`); `deny_unknown_fields` parity; the `resolve_format` detection table
+      # (override-wins both ways, `.json`⇒Json else Ron, no content-sniff); no validation bypass (a JSON
+      # bad db-name ⇒ the SAME `InvalidDbName`, a JSON bad route ⇒ the SAME `Routing` compile-check
+      # failure); JSON current-schema-only (`version:<old>`⇒`JsonLegacyVersion`, `>current`⇒`VersionTooNew`,
+      # absent/current⇒Ok); and the IN-PROCESS ANTI-HOLLOW proof — a document valid as JSON but NOT as RON
+      # parses under `Json` and FAILS under `Ron`, so a `parse_with_format` that ignored `fmt` would fail
+      # the battery (the format selection is load-bearing, no env var, no marker). The older marker gates
+      # stay unchanged — they are NOT retrofitted.
+      - name: config JSON-input robust gate (v0.6.5 — equivalence + detection + no-bypass + anti-hollow, exit-code contract)
+        run: |
+          set -eo pipefail
+          # Both halves filtered by the shared `config_json` name prefix; exit code is the whole gate.
+          cargo test -p boatramp-node --lib config_json -- --nocapture
+          cargo test -p boatramp --bin boatramp config_json -- --nocapture
 
   deny:
     name: cargo-deny
