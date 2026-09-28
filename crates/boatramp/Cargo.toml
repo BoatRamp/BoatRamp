@@ -216,7 +216,11 @@ blob-upload = [
 # default; on in a cloud-batteries build.
 blob-upload-aws = ["blob-upload", "s3", "boatramp-server/blob-upload-aws"]
 blob-upload-gcs = ["blob-upload", "gcs", "boatramp-server/blob-upload-gcs"]
-blob-upload-azure = ["blob-upload", "azure", "boatramp-server/blob-upload-azure"]
+blob-upload-azure = [
+  "blob-upload",
+  "azure",
+  "boatramp-server/blob-upload-azure",
+]
 blob-upload-cloud = ["blob-upload-aws", "blob-upload-gcs", "blob-upload-azure"]
 session = ["handlers", "boatramp-server/session"]
 # Self-hosted **cluster mode** (`boatramp serve --mode cluster`): embedded Raft
@@ -379,6 +383,12 @@ serde_yaml = { workspace = true, optional = true }
 rcgen = "0.13"
 # A trivial router for the `--tls rpk` client-pinning integration test.
 axum.workspace = true
+# The WAL clean-shutdown gate tests (A2-cluster / A3) implement a mock `KvStore`,
+# which is an `#[async_trait]` trait, so they need the macro in EVERY test build —
+# including the lean `fs,slatedb` lane where the optional runtime `async-trait`
+# dependency above is off. A dev-dependency is feature-independent, so it's present
+# for the test harness regardless of which features the build enables.
+async-trait.workspace = true
 
 # ---------------------------------------------------------------------------
 # OS-native package metadata. Version / license / description /
