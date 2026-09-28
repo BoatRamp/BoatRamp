@@ -546,7 +546,7 @@ impl ApplyManifest {
             }
             // An OLD version. For RON, run the registered migration chain. For JSON,
             // there is deliberately no chain — refuse with the clear current-schema-only
-            // error so an old-version JSON is never mis-parsed or mis-migrated.
+            // error so an old-version JSON is never wrongly parsed or migrated.
             Some(v) => match fmt {
                 crate::config::ConfigFormat::Ron => {
                     crate::apply_migrate::migrate_to_current(text, v)?
@@ -2297,7 +2297,7 @@ mod tests {
     }
 
     /// Current-schema-only (JSON): an OLD `version: N` (`N < current`) yields the clear
-    /// [`Error::JsonLegacyVersion`] — never a silent mis-parse or a JSON migration.
+    /// [`Error::JsonLegacyVersion`] — never a silent wrong-schema parse or a JSON migration.
     #[test]
     fn config_json_gate_json_old_version_is_current_schema_only() {
         let json = r#"{ "version": 1, "project": "x" }"#;
