@@ -39,6 +39,14 @@ Top-level sections, all optional:
 | `pop_origin` | string | — | The fleet's canonical public origin (e.g. `https://cp.example.com`) a per-request proof-of-possession must bind (`aud`). Required for holder-bound (`cnf`/PoP) tokens; compared against the proof, never a `Host`/`X-Forwarded-*` header. Env `BOATRAMP_POP_ORIGIN`. See [PoP-bind a token](../how-to/pop-tokens.md). |
 | `blob_notify_tier` | `dry-run` \| `provision` \| `verify-only` \| `refuse` | — | Cloud blob-change notification provisioning tier for `blob` triggers on a cloud object store (S3→SQS / GCS→Pub/Sub / Azure→Event Grid). Absent ⇒ no provisioning (blob triggers work only on a self-watching backend like `fs`). See [Cloud blob triggers](../how-to/functions.md#cloud-blob-triggers-auto-provisioning). |
 | `blob_notify_account_id` | string | — | Scopes the provisioned notification pipeline: the **AWS account id** (S3 queue policy) or **GCP project id** (GCS topic + notificationConfig). Unused by Azure (the queue shares the account's shared-key auth). |
+| `s3_credential` | table | — | Node-level base S3 credential sourced from the sealed `[secrets]` store (shared by the S3 blob backend and the AWS ingress minter). See [`serve.s3_credential`](#serves3_credential). |
+| `blob_fallback` | table | — | A read-only secondary blob backend for a zero-downtime backend switch. See [`serve.blob_fallback`](#serveblob_fallback). |
+| `s3_ingress_addr` | socket address | — | Bind for the dedicated S3-upload ingress listener; see [S3 upload ingress](#serves3-upload-ingress). |
+| `s3_ingress_secret_file` | path | — | On-node HKDF root for the local S3 ingress face; see [S3 upload ingress](#serves3-upload-ingress). |
+| `s3_ingress_public_url` | string | — | Public base URL a minted upload credential embeds; see [S3 upload ingress](#serves3-upload-ingress). |
+| `s3_ingress_mint_max_ttl_secs` | int | `3600` | Operator ceiling on a minted upload credential's TTL; see [S3 upload ingress](#serves3-upload-ingress). |
+| `s3_ingress_mint_max_bytes` | int | — | Operator ceiling on a minted credential's object-size cap; see [S3 upload ingress](#serves3-upload-ingress). |
+| `s3_ingress_cloud` | table | — | Cloud-brokering identity for the ingress minter (upload direct to a cloud store). See [`serve.s3_ingress_cloud`](#serves3_ingress_cloud). |
 
 > **Warning:** with no `auth_root_*` key configured, control-plane auth is
 > disabled. Under the default `multi-tenant` posture, `serve` refuses to start
@@ -70,6 +78,144 @@ serve: ( signer: Vault(
 ```
 
 See [Hold the signing key in a KMS/HSM/Vault](../how-to/external-signer.md).
+
+### `serve.s3_credential` (v0.6.1)
+
+A **node-level base S3 credential** sourced from the sealed [`secrets`](#secrets)
+store instead of the ambient `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` env
+chain. One source feeds **both** consumers — the S3 blob object backend
+(`--blobs s3`) and the AWS blob-upload cloud minter
+([`serve.s3_ingress_cloud`](#serves3_ingress_cloud)) — because it is the same
+bucket key. Absent ⇒ the ambient AWS env chain (unchanged, non-breaking).
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `access_key_id` | string | The AWS **access key id** — a public identifier, so it is plain config. Empty is refused at startup. |
+| `secret_access_key` | string | The secret access key as a **reference**, never the raw secret in-file: `boatramp:<name>` (the project-scoped sealed store, resolved under the default project via the `[secrets]` envelope), or `env:<VAR>` / a bare `<VAR>` (the operator's own environment, honored **only** when the posture's `allow_env_secret_refs` is set). Unsealed at startup; the resolved value is redacted from `Debug`/logs. |
+
+```ron
+serve: ( s3_credential: (
+    access_key_id: "tid_public_akid",              // a public identifier — plain config
+    secret_access_key: "boatramp:tigris-secret",   // a sealed secret REFERENCE, not the secret
+) )
+```
+
+Seal the secret once with `boatramp secrets set` (default project), then
+reference it here.
+
+- **Fail-closed:** a `boatramp:` / `env:` ref configured with **no** `[secrets]`
+  envelope is a **startup error** — boatramp does not silently fall back to the
+  ambient env chain (which would mask the misconfig).
+- **Cluster caveat:** blob storage is built before the replicated control plane,
+  so a `boatramp:` (KV-backed) ref is refused fail-closed on a **cluster** node
+  (the sealed store is single-node) — use an `env:<VAR>` ref there. The AWS cloud
+  minter is likewise single-node this release.
+
+See [Encrypt secrets at rest](../how-to/secrets-at-rest.md).
+
+### `serve.blob_fallback` (v0.6.2)
+
+A **read-only secondary blob backend** enabling a zero-downtime blob-backend
+switch (fs→cloud, provider→provider, region→region). While it is attached,
+serving reads the **primary** (the `[serve]` `blobs` / `s3_*` / `gcs_*` /
+`azure_*` fields) first and, only on a **definitive miss** for a boatramp-owned
+key, falls through to this secondary — so there is no serving gap while the old
+backend drains into the new one. A **transient** primary error propagates (never
+serves stale/secondary bytes on a blip); the fall-through is
+**prefix-allowlisted** to content-addressed blobs, `hblob/`, and `mqgp/` (a
+control-plane-shaped key never resurrects off the secondary); keys are forwarded
+byte-identical so tenant isolation is preserved. `put` and `delete` are
+**primary-only** — the secondary is strictly read-only, never written.
+
+This block takes the **same backend-descriptor shape as the primary** — a `blobs`
+selector plus the matching per-backend option fields — plus its own optional
+`s3_credential` and a read timeout.
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `blobs` | `fs` \| `s3` \| `gcs` \| `azure` | `fs` | The secondary backend — the OLD backend to fall back to. |
+| `s3_bucket` | string | — | S3 bucket (secondary `blobs = s3`). |
+| `s3_endpoint` | string | — | S3 endpoint URL (a MinIO/R2/Tigris endpoint) for the secondary. |
+| `s3_region` | string | — | S3 region for the secondary. |
+| `s3_path_style` | bool | `false` | Path-style addressing (MinIO) for the secondary. |
+| `s3_credential` | table | — | The secondary's own sealed base S3 credential ([`serve.s3_credential`](#serves3_credential) shape). Absent ⇒ the ambient AWS env chain. |
+| `gcs_bucket` | string | — | GCS bucket (secondary `blobs = gcs`). |
+| `gcs_endpoint` | string | — | GCS endpoint URL (a `fake-gcs-server` emulator) for the secondary. |
+| `gcs_anonymous` | bool | `false` | Skip GCS credential resolution (anonymous — the emulator) for the secondary. |
+| `azure_account` | string | — | Azure storage account name (secondary `blobs = azure`). |
+| `azure_container` | string | — | Azure container name for the secondary. |
+| `azure_access_key` | string | — | Azure storage account access key (shared-key auth) for the secondary. |
+| `azure_emulator` | bool | `false` | Use the Azurite emulator for the secondary. |
+| `secondary_timeout_secs` | int | `5` | Bound (seconds) on each secondary read, so a wedged secondary degrades a primary miss to `NotFound` rather than hanging the serve path. |
+
+```ron
+serve: (
+    blobs: s3,                                  // the NEW (primary) backend
+    s3_bucket: "acme-blobs-new",
+    s3_region: "auto",
+    blob_fallback: (                            // the OLD backend to read through
+        blobs: fs,
+        secondary_timeout_secs: 5,
+    ),
+)
+```
+
+This is a **bounded transition aid**. Rollout: deploy `primary = new,
+blob_fallback = old`, drain the old backend into the new one with
+`boatramp blob migrate` (a bare `blob migrate` with a `blob_fallback` configured
+drains the fallback → primary), then **remove this block and restart**. While a
+fallback is attached the node logs a prominent transition-mode **WARNING** at
+startup and blob GC **refuses to prune** (a prune returns `409`) — a union
+`list` over a primary-only `delete` would otherwise reclaim a secondary-only
+object that a read could resurrect. See
+[Switch the blob backend with zero downtime](../how-to/blob-backend-migration.md).
+
+### `serve.s3-upload-ingress` (v0.5.9)
+
+The **external S3 upload ingress** — the daemon-config side of letting a client
+outside the wasm sandbox upload directly into a project's blob container over the
+S3 protocol, which the guest then reads unchanged through `wasi:blobstore`. These
+are the `[serve]`-level knobs; the guest capability, operator CLI, and per-recipe
+UX are covered in [Ingest large uploads over S3](../how-to/blob-ingress.md).
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `s3_ingress_addr` | socket address | — | Bind for the **dedicated** SigV4 ingress listener — a separate listener from `serve.addr` with its own auth surface (it never reaches `serve_by_host` or the `/api` router). Absent ⇒ the local S3 face is not served (opt-in; a deployment that only brokers cloud credentials never needs it). |
+| `s3_ingress_secret_file` | path | — | Path to the raw 32-byte **HKDF root** the local face derives each credential's `secret_access_key` from — **distinct** from the `[secrets]` KEK and the COSE signing key (hard domain separation). Holds a path, never key material. **The same file must be present on every node in a cluster.** Absent on a single node ⇒ an ephemeral per-process root; absent on a **multi-node** deployment ⇒ the face is refused (fail-closed). |
+| `s3_ingress_public_url` | string | derived | The publicly-reachable base URL a **minted** upload credential embeds (the presigned-PUT prefix, or the SDK endpoint for temp-credentials). Absent ⇒ derived from `s3_ingress_addr` as `http://<addr>` (fine for a same-host dev loop; set the TLS-terminated public URL in production). |
+| `s3_ingress_mint_max_ttl_secs` | int | `3600` | Operator **ceiling** (seconds) on a minted credential's TTL — a guest/operator can only request a shorter lifetime (the mint clamps to this). `0` disables minting entirely (the binding is never attached). |
+| `s3_ingress_mint_max_bytes` | int | — | Operator ceiling (bytes) on a minted credential's `max_bytes` — a guest can only request a smaller cap. Absent ⇒ no host-side clamp (the per-container face ceiling still applies). |
+
+```ron
+serve: (
+    addr: "0.0.0.0:8080",                       // control plane / site edge
+    s3_ingress_addr: "0.0.0.0:9000",            // the dedicated S3 face
+    s3_ingress_secret_file: "/etc/boatramp/s3-ingress.key",
+    s3_ingress_public_url: "https://uploads.example.com",
+    s3_ingress_mint_max_ttl_secs: 3600,         // TTL ceiling (default 1h)
+    s3_ingress_mint_max_bytes: 104857600,       // per-cred object cap (100 MiB)
+)
+```
+
+When the node's blob backend is a **cloud** object store, add
+[`serve.s3_ingress_cloud`](#serves3_ingress_cloud) so the mint brokers a native,
+scoped, short-lived cloud credential and the client uploads **directly** to the
+real store (bytes never transit the node) instead of the local face.
+
+### `serve.s3_ingress_cloud` (v0.5.9)
+
+Cloud-brokering identity for the upload minter. Only the fields for the **active**
+blob backend are consulted; absent ⇒ the local S3 face mints. See
+[Ingest large uploads over S3 — per-cloud setup](../how-to/blob-ingress.md#per-cloud-operator-setup).
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `aws_role_arn` | string | — | **AWS:** the IAM role ARN the base credential assumes (`sts:AssumeRole`, the default) to broker the scoped session-policy credential. |
+| `aws_use_federation_token` | bool | `false` | **AWS:** use `sts:GetFederationToken` instead of `AssumeRole` (an IAM-user base credential, not itself a session). |
+| `gcs_client_email` | string | ADC | **GCS:** the service-account client email whose V4 signed URLs / IAM-signed uploads the minter produces. Absent ⇒ resolved from ADC. |
+| `azure_account` | string | blob-arg | **Azure:** the storage account name (SAS signature + blob URL). Absent ⇒ taken from the `azure_account` blob-backend arg. |
+| `azure_service_url` | string | derived | **Azure:** the blob service URL (`https://{account}.blob.core.windows.net/`). Absent ⇒ derived from the account name. |
+| `azure_hns` | bool | `false` | **Azure:** declare the account has a **hierarchical namespace** (HNS/ADLS-Gen2). A directory-scoped SAS only confines to a sub-prefix on an HNS account, so a **prefix** mint is refused unless this is `true` (fail-closed). A single-key mint is unaffected. |
 
 ## `security`
 
