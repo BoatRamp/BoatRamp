@@ -5,6 +5,53 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.7.2] - 2026-09-28
+
+Additive, non-breaking. **P0 control-plane durability fix.** Host-side only (no
+WIT/shim/guest-ABI change).
+
+Fixes a control-plane SlateDB KV that became unbootable after a clean restart —
+`Data error: InvalidVersion { supported_versions: [1, 2], actual_version: 0 }` on
+WAL read. The KV was never actually corrupt on disk in a way slatedb couldn't
+model; the store was simply never **closed** cleanly on shutdown.
+
+### Fixed
+
+- **Clean shutdown now `close()`s the control-plane store instead of `flush()`ing it
+  (Part A, always-on).** Graceful shutdown previously called `Db::flush()`, which
+  pushes the in-memory WAL buffer to a WAL object but does **not** freeze memtables to
+  L0 or advance the durable frontier, and slatedb has no `Drop` for `Db` — so the WAL
+  writer was abandoned at process exit and a crash-consistent volume snapshot could
+  freeze a torn/partial (version-0) tail WAL object that the next cold open refused to
+  read. Shutdown now fully **quiesces every KV writer** — the scheduler and its detached
+  children (delivery drainer, per-site blob watchers, in-flight crons), the reconcile
+  loops, and (cluster) the Raft apply/log writer via `raft.shutdown()` **before** the
+  store close — then calls `Db::close()`, which freezes memtables to L0 and advances the
+  durable frontier so the next cold open replays an **empty** WAL range. The
+  quiesce+close tail is bounded by a 3 s deadline (under fly.io's 5 s SIGTERM grace); a
+  timed-out close is no worse than the old flush (fail-safe). Applies on **every** serve
+  path — plaintext and all TLS variants (custom cert, ACME, ACME DNS-01, RPK, and
+  cluster-managed ACME DNS-01). Operators should ensure `kill_timeout` covers the HTTP
+  drain plus the close budget.
+
+### Added
+
+- **Opt-in WAL-tail repair to recover a store that is already stuck (Part B).** The
+  default cold open still fails **loud** on a torn tail (now naming the repair in the
+  error, and closing a pre-existing coverage gap: the >10-byte version-0 partial tail,
+  not just the 0-byte tail tolerated since v0.5.5). Recovery is opt-in via
+  `boatramp kv repair [--data-dir <dir> | --kv-s3 …] [--apply]` (dry-run by default,
+  prints the plan), the `serve --repair-wal` flag, or the `BOATRAMP_KV_REPAIR=1`
+  environment variable (redeploy-able — no shell access to the node needed). Repair is
+  **provably non-destructive of acknowledged data**: it quarantines only a WAL object
+  that is physically torn **and** strictly trailing **and** strictly beyond the durable
+  frontier read from the manifest; a torn object mid-range, or an unreadable manifest,
+  makes it **refuse and fail loud** rather than risk gapping acked-but-not-yet-L0 data.
+  Quarantined objects are **copied** (byte-identical) to `wal-quarantine/<stamp>/` with a
+  `MANIFEST.json` before the originals are removed, and the store is re-verified before
+  it opens. On a hard crash the repair may lose the most recent acked-into-WAL-not-yet-L0
+  writes; Part A makes the graceful-shutdown case lossless.
+
 ## [0.7.1] - 2026-09-28
 
 Additive, non-breaking. Host-side only (no WIT/shim/guest-ABI change).
