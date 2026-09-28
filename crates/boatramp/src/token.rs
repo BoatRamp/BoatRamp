@@ -364,7 +364,7 @@ async fn resolve_signer(
             LocalSigner::from_private_hex(&hex).map_err(|e| Error::Signer(e.to_string()))?;
         return Ok(Arc::new(signer) as Arc<dyn Signer>);
     }
-    let serve = crate::config::ServerConfig::load(config_path)
+    let serve = crate::config::ServerConfig::load(config_path, None)
         .map_err(|e| Error::Signer(e.to_string()))?
         .serve
         .unwrap_or_default();

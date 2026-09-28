@@ -54,12 +54,38 @@ pub enum Error {
         #[source]
         source: ron::error::SpannedError,
     },
+    /// A **JSON** manifest (v0.6.5) failed to parse strictly against the current typed
+    /// schema. The [`StrictParse`](Self::StrictParse)-class analogue for JSON input —
+    /// the RON variant wraps a `ron::error::SpannedError`, so JSON carries its own
+    /// `serde_json::Error`, but the upgrade UX reads the same (`deny_unknown_fields`
+    /// makes a typo'd key a hard error, not a silent drop).
+    #[error(
+        "this JSON manifest does not match the current (v0.6.0) schema: {source}\n\n\
+         JSON config input is current-schema only. If it was generated from Nickel, \
+         regenerate it against the current schema (re-run `nickel export`); check for a \
+         typo'd/unknown field (rejected by `deny_unknown_fields`) or a raw pre-v0.6.0 \
+         `compute[].spec` shape."
+    )]
+    JsonStrictParse {
+        #[source]
+        source: serde_json::Error,
+    },
     /// A manifest declared `version: N` newer than this build understands.
     #[error(
         "manifest declares version {declared}, but this build only understands up to \
          version {current} (v0.6.0). Upgrade boatramp, or lower the declared version."
     )]
     VersionTooNew { declared: u32, current: u32 },
+    /// A **JSON** manifest declared `version: N` OLDER than the current schema. JSON
+    /// config input was never accepted before v0.6.5, so there are no legacy JSON
+    /// manifests to migrate — JSON is current-schema only. (The RON migration chain is
+    /// unchanged; an old RON manifest still upgrades via `boatramp config migrate`.)
+    #[error(
+        "JSON config input is current-schema only (declares version {declared}); \
+         regenerate current-schema JSON (e.g. re-run `nickel export`), or migrate the \
+         RON source with `boatramp config migrate`"
+    )]
+    JsonLegacyVersion { declared: u32 },
     /// A migration step failed to transform an older manifest into the current schema.
     #[error("migrating manifest from version {from}: {reason}")]
     Migration { from: u32, reason: String },
@@ -487,13 +513,30 @@ impl ApplyManifest {
     /// Each site's `routing` is compile-checked (route patterns, cron schedules) so a
     /// bad manifest fails fast.
     pub fn parse(text: &str) -> Result<Self> {
-        let declared = crate::apply_migrate::peek_version(text)?;
+        Self::parse_with_format(text, crate::config::ConfigFormat::Ron)
+    }
+
+    /// Parse a manifest document in `fmt` (RON or JSON) through the version-aware
+    /// pipeline.
+    ///
+    /// **RON** follows the historical **loose-parse → migrate → typed** path unchanged:
+    /// absent/current ⇒ strict parse; older `version:` ⇒ the migration chain;
+    /// too-new ⇒ [`Error::VersionTooNew`].
+    ///
+    /// **JSON is current-schema only** (v0.6.5): JSON config input was never accepted
+    /// before, so there are no legacy JSON manifests and thus no JSON migration chain.
+    /// - `version:` absent or `== CURRENT_MANIFEST_VERSION` ⇒ strict JSON parse;
+    /// - `version: N` (`N < current`) ⇒ [`Error::JsonLegacyVersion`] (a clear
+    ///   regenerate-or-migrate-the-RON-source error — never silently mis-parsed/migrated);
+    /// - `version: N` (`N > current`) ⇒ [`Error::VersionTooNew`] (same as RON).
+    pub fn parse_with_format(text: &str, fmt: crate::config::ConfigFormat) -> Result<Self> {
+        let declared = crate::apply_migrate::peek_version(text, fmt)?;
         let manifest = match declared {
-            None => Self::parse_strict(text)?,
+            None => Self::parse_strict(text, fmt)?,
             Some(v) if v == CURRENT_MANIFEST_VERSION => {
                 // An explicit current-version declaration: parse strictly, same as
                 // the version-less path. The upgraded output drops `version:`.
-                Self::parse_strict(text)?
+                Self::parse_strict(text, fmt)?
             }
             Some(v) if v > CURRENT_MANIFEST_VERSION => {
                 return Err(Error::VersionTooNew {
@@ -501,19 +544,36 @@ impl ApplyManifest {
                     current: CURRENT_MANIFEST_VERSION,
                 });
             }
-            Some(v) => crate::apply_migrate::migrate_to_current(text, v)?,
+            // An OLD version. For RON, run the registered migration chain. For JSON,
+            // there is deliberately no chain — refuse with the clear current-schema-only
+            // error so an old-version JSON is never mis-parsed or mis-migrated.
+            Some(v) => match fmt {
+                crate::config::ConfigFormat::Ron => {
+                    crate::apply_migrate::migrate_to_current(text, v)?
+                }
+                crate::config::ConfigFormat::Json => {
+                    return Err(Error::JsonLegacyVersion { declared: v });
+                }
+            },
         };
         manifest.compile_check_sites()?;
         Ok(manifest)
     }
 
-    /// Parse strictly against the current typed schema, wrapping a parse failure in
-    /// the v0.6.0 upgrade error (which names the migration path). Used for the
-    /// version-less / current-version path AND as the final step after a migration.
-    fn parse_strict(text: &str) -> Result<Self> {
-        crate::config::ron_options()
-            .from_str(text)
-            .map_err(|source| Error::StrictParse { source })
+    /// Parse strictly against the current typed schema in `fmt`, wrapping a RON parse
+    /// failure in the v0.6.0 upgrade error (which names the migration path), and a JSON
+    /// parse failure in the same [`Error::StrictParse`]-class wrapping so the upgrade UX
+    /// still reads well. Used for the version-less / current-version path AND (RON) as the
+    /// final step after a migration.
+    fn parse_strict(text: &str, fmt: crate::config::ConfigFormat) -> Result<Self> {
+        match fmt {
+            crate::config::ConfigFormat::Ron => crate::config::ron_options()
+                .from_str(text)
+                .map_err(|source| Error::StrictParse { source }),
+            crate::config::ConfigFormat::Json => {
+                serde_json::from_str(text).map_err(|source| Error::JsonStrictParse { source })
+            }
+        }
     }
 
     /// Compile-check every site's `routing` (route/cron patterns).
@@ -529,11 +589,14 @@ impl ApplyManifest {
         Ok(())
     }
 
-    /// Load a manifest from `path` (RON). Unlike `project.cfg`, a **missing** file
-    /// is an error — there is nothing to apply.
-    pub fn load(path: &Path) -> Result<Self> {
+    /// Load a manifest from `path`, decoding as RON or JSON per
+    /// [`resolve_format`](crate::config::resolve_format) (`override_` wins; else `.json`
+    /// ⇒ JSON, everything else ⇒ RON). Unlike `project.cfg`, a **missing** file is an
+    /// error — there is nothing to apply.
+    pub fn load(path: &Path, override_: Option<crate::config::ConfigFormat>) -> Result<Self> {
+        let fmt = crate::config::resolve_format(path, override_);
         match std::fs::read_to_string(path) {
-            Ok(text) => Self::parse(&text),
+            Ok(text) => Self::parse_with_format(&text, fmt),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 Err(Error::Missing(path.display().to_string()))
             }
@@ -545,9 +608,16 @@ impl ApplyManifest {
 /// Arguments for `boatramp apply`.
 #[derive(Debug, clap::Args)]
 pub struct ApplyArgs {
-    /// Path to the project manifest (RON).
+    /// Path to the project manifest (RON or JSON — auto-detected by extension).
     #[arg(short = 'f', long, default_value = "apply.cfg")]
     file: PathBuf,
+
+    /// Manifest file format: RON or JSON, auto-detected by extension (`.json` ⇒
+    /// JSON, everything else ⇒ RON). Set explicitly for Nickel/JSON piped to a
+    /// non-`.json` path (`nickel export | boatramp apply -f - --format json` is the
+    /// intended interop path).
+    #[arg(long, value_enum)]
+    format: Option<crate::config::ConfigFormat>,
 
     /// boatramp server base URL (overrides `[publish].server`).
     #[arg(long, env = "BOATRAMP_SERVER")]
@@ -564,7 +634,7 @@ pub struct ApplyArgs {
 
 /// Entry point for `boatramp apply`.
 pub async fn run(args: ApplyArgs, config: &ProjectConfig) -> Result<()> {
-    let manifest = ApplyManifest::load(&args.file)?;
+    let manifest = ApplyManifest::load(&args.file, args.format)?;
 
     // Resolve the target project: an explicit `project:` in the manifest wins over
     // the config-resolved value (`[publish].project` / `--project` / default).
@@ -1608,7 +1678,10 @@ mod tests {
         let path =
             std::env::temp_dir().join(format!("boatramp-apply-missing-{}.cfg", std::process::id()));
         let _ = std::fs::remove_file(&path);
-        assert!(matches!(ApplyManifest::load(&path), Err(Error::Missing(_))));
+        assert!(matches!(
+            ApplyManifest::load(&path, None),
+            Err(Error::Missing(_))
+        ));
     }
 
     #[test]
@@ -2118,5 +2191,175 @@ mod tests {
         }];
         apply_databases(&mock, &dbs, true).await.unwrap();
         assert!(mock.calls().is_empty(), "dry-run declares nothing");
+    }
+
+    // =======================================================================
+    // JSON config input gate (v0.6.5) — apply-manifest half.
+    //
+    // The ROBUST-successor gate (continuing the v0.6.4 blob-purge style): a
+    // `#[test]` battery whose sole CI contract is the ordinary `cargo test` exit
+    // code — NO grepped uppercase marker, NO bash env-var mutation loop. Every test
+    // here is prefixed `config_json_gate_` so the CI lane can filter with
+    // `cargo test … config_json`. The `boatramp-node` half (detection table,
+    // serve/project equivalence, no-bypass db-name, deny_unknown_fields) lives in
+    // `boatramp_node::config`'s test module under the same prefix.
+    // =======================================================================
+
+    /// Equivalence: the SAME manifest authored in RON and in equivalent JSON
+    /// deserializes to the SAME typed value — including the externally-tagged
+    /// enum-variant field `RootSource::Image` (RON `image("…")` ≡ JSON
+    /// `{"image":"…"}`), proving variant-name fidelity survives the JSON decoder.
+    #[test]
+    fn config_json_gate_manifest_ron_and_json_are_equivalent() {
+        let ron = r#"(
+            project: "team-x",
+            compute: [
+                (
+                    name: "db",
+                    spec: (
+                        root: image("pgvector/pgvector:pg16"),
+                        vcpus: 2, mem_mib: 1024, port: 5432,
+                        restart: always,
+                    ),
+                    replicas: 1,
+                ),
+            ],
+        )"#;
+        let json = r#"{
+            "project": "team-x",
+            "compute": [
+                {
+                    "name": "db",
+                    "spec": {
+                        "root": { "image": "pgvector/pgvector:pg16" },
+                        "vcpus": 2, "mem_mib": 1024, "port": 5432,
+                        "restart": "always"
+                    },
+                    "replicas": 1
+                }
+            ]
+        }"#;
+        let from_ron =
+            ApplyManifest::parse_with_format(ron, crate::config::ConfigFormat::Ron).unwrap();
+        let from_json =
+            ApplyManifest::parse_with_format(json, crate::config::ConfigFormat::Json).unwrap();
+        // The typed values are identical (the enum variant + every scalar).
+        assert_eq!(from_json.project.as_deref(), Some("team-x"));
+        assert_eq!(
+            from_json.compute[0].spec.root,
+            boatramp_core::compute::RootSource::Image("pgvector/pgvector:pg16".into())
+        );
+        assert!(matches!(
+            from_json.compute[0].spec.restart,
+            boatramp_core::compute::RestartPolicy::Always
+        ));
+        // Prove the two decoders agree field-for-field: they PUT the identical request.
+        assert_eq!(
+            from_ron.compute[0].to_request().spec,
+            from_json.compute[0].to_request().spec
+        );
+        assert_eq!(from_ron.project, from_json.project);
+    }
+
+    /// `deny_unknown_fields` parity: a JSON manifest with an extra/typo'd field is a
+    /// hard parse error, not a silent drop — the same strictness RON gets.
+    #[test]
+    fn config_json_gate_manifest_json_denies_unknown_fields() {
+        let json = r#"{ "project": "x", "bogus_field": true }"#;
+        let err = ApplyManifest::parse_with_format(json, crate::config::ConfigFormat::Json)
+            .expect_err("an unknown JSON field must be rejected (deny_unknown_fields)");
+        assert!(
+            matches!(err, Error::JsonStrictParse { .. }),
+            "unknown-field JSON is a strict-parse failure, got {err:?}"
+        );
+    }
+
+    /// No-bypass: a JSON manifest with a bad route still fails `compile_check` — JSON
+    /// is only an alternative decoder into the SAME typed struct + the SAME downstream
+    /// checks. A `**`-in-the-middle globstar is rejected by `DeployConfig::compile_check`.
+    #[test]
+    fn config_json_gate_manifest_json_bad_route_fails_compile_check() {
+        let json = r#"{
+            "sites": [
+                {
+                    "name": "web",
+                    "path": ".",
+                    "routing": { "redirects": [ { "from": "/a/**/b/**", "to": "/x" } ] }
+                }
+            ]
+        }"#;
+        let err = ApplyManifest::parse_with_format(json, crate::config::ConfigFormat::Json)
+            .expect_err("a bad route in a JSON manifest must fail the compile-check");
+        assert!(
+            matches!(err, Error::Routing { .. }),
+            "bad-route JSON fails the routing compile-check, got {err:?}"
+        );
+    }
+
+    /// Current-schema-only (JSON): an OLD `version: N` (`N < current`) yields the clear
+    /// [`Error::JsonLegacyVersion`] — never a silent mis-parse or a JSON migration.
+    #[test]
+    fn config_json_gate_json_old_version_is_current_schema_only() {
+        let json = r#"{ "version": 1, "project": "x" }"#;
+        let err = ApplyManifest::parse_with_format(json, crate::config::ConfigFormat::Json)
+            .expect_err("an old-version JSON manifest is current-schema only");
+        assert!(
+            matches!(err, Error::JsonLegacyVersion { declared: 1 }),
+            "old-version JSON is refused with the clear current-schema-only error, got {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("current-schema only") && msg.contains("boatramp config migrate"),
+            "the error names the cure: {msg}"
+        );
+    }
+
+    /// Current-schema-only (JSON): a `version: > current` yields the SAME
+    /// [`Error::VersionTooNew`] as RON (a newer schema this build can't understand).
+    #[test]
+    fn config_json_gate_json_too_new_version_is_version_too_new() {
+        let json = format!(
+            r#"{{ "version": {}, "project": "x" }}"#,
+            CURRENT_MANIFEST_VERSION + 1
+        );
+        let err = ApplyManifest::parse_with_format(&json, crate::config::ConfigFormat::Json)
+            .expect_err("a future-version JSON manifest is refused");
+        assert!(
+            matches!(err, Error::VersionTooNew { .. }),
+            "too-new JSON is VersionTooNew, got {err:?}"
+        );
+    }
+
+    /// Current-schema-only (JSON): an absent OR current `version:` parses strictly.
+    #[test]
+    fn config_json_gate_json_absent_and_current_version_parse_ok() {
+        // Absent version.
+        ApplyManifest::parse_with_format(
+            r#"{ "project": "x" }"#,
+            crate::config::ConfigFormat::Json,
+        )
+        .expect("a version-less JSON manifest parses (current schema)");
+        // Explicit current version.
+        let cur = format!(r#"{{ "version": {CURRENT_MANIFEST_VERSION}, "project": "x" }}"#);
+        ApplyManifest::parse_with_format(&cur, crate::config::ConfigFormat::Json)
+            .expect("a current-version JSON manifest parses");
+    }
+
+    /// Anti-hollow (typed, in-process): a document that is valid JSON but NOT valid
+    /// RON MUST parse under `Json` and FAIL under `Ron`. If `parse_with_format` ever
+    /// ignored `fmt` and always decoded RON, the JSON leg here would fail — so this
+    /// proves the format selection is load-bearing, with no env var and no marker.
+    #[test]
+    fn config_json_gate_format_selection_is_load_bearing() {
+        // A bare JSON object `{ … }` is valid JSON for the `ApplyManifest` struct, but
+        // is NOT valid RON for it (RON structs use `( … )`, not a brace map).
+        let doc = r#"{ "project": "only-valid-as-json" }"#;
+        let as_json =
+            ApplyManifest::parse_with_format(doc, crate::config::ConfigFormat::Json).unwrap();
+        assert_eq!(as_json.project.as_deref(), Some("only-valid-as-json"));
+        assert!(
+            ApplyManifest::parse_with_format(doc, crate::config::ConfigFormat::Ron).is_err(),
+            "the same document must FAIL under Ron — else the fmt selection is hollow"
+        );
     }
 }

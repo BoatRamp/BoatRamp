@@ -28,8 +28,14 @@ use crate::apply::{
 
 /// Peek only the top-level `version:` field of a manifest, ignoring everything else,
 /// so the pipeline can branch before committing to a schema. `None` ⇒ absent (⇒
-/// current). A syntactically broken document surfaces as [`Error::Ron`].
-pub fn peek_version(text: &str) -> Result<Option<u32>> {
+/// current). A syntactically broken document surfaces as [`Error::Ron`] (RON) or
+/// [`Error::Json`] (JSON).
+///
+/// Format-aware (v0.6.5): the peek is decoded with the same deserializer the strict
+/// parse will use, so a `version:` in a JSON manifest is read via `serde_json` (a RON
+/// peek would reject the `{ … }` document as a syntax error and never reach the
+/// current-schema-only branch in [`crate::apply::ApplyManifest::parse_with_format`]).
+pub fn peek_version(text: &str, fmt: crate::config::ConfigFormat) -> Result<Option<u32>> {
     /// A permissive projection that reads only `version` (all other fields ignored —
     /// no `deny_unknown_fields`).
     #[derive(Deserialize, Default)]
@@ -37,7 +43,10 @@ pub fn peek_version(text: &str) -> Result<Option<u32>> {
         #[serde(default)]
         version: Option<u32>,
     }
-    let peek: VersionPeek = crate::config::ron_options().from_str(text)?;
+    let peek: VersionPeek = match fmt {
+        crate::config::ConfigFormat::Ron => crate::config::ron_options().from_str(text)?,
+        crate::config::ConfigFormat::Json => serde_json::from_str(text)?,
+    };
     Ok(peek.version)
 }
 

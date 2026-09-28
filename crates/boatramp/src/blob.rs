@@ -543,7 +543,7 @@ async fn resolve_sides(a: &MigrateArgs) -> Result<(ResolvedSide, ResolvedSide)> 
         Some(from) => build_primary_side("source", from).await?,
         None => {
             // No `--from`: drain the configured fallback secondary of the node config.
-            let config = boatramp_node::config::ServerConfig::load(&a.node_config)?;
+            let config = boatramp_node::config::ServerConfig::load(&a.node_config, None)?;
             let serve = config.serve.clone().unwrap_or_default();
             let Some(fb) = serve.blob_fallback.clone() else {
                 return Err(Error::NoSource {
@@ -573,7 +573,7 @@ async fn build_primary_side(
     side: &'static str,
     config_path: &std::path::Path,
 ) -> Result<ResolvedSide> {
-    let config = boatramp_node::config::ServerConfig::load(config_path)?;
+    let config = boatramp_node::config::ServerConfig::load(config_path, None)?;
     let serve = config.serve.clone().unwrap_or_default();
     let data_dir = serve
         .data_dir

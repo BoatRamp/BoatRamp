@@ -396,10 +396,12 @@ async fn async_main() -> Result<(), CliError> {
     // shapes, so the right one is loaded per command rather than globally.
     if matches!(cli.command, Command::Serve(_)) {
         let path = cli.config.unwrap_or_else(|| PathBuf::from("boatramp.cfg"));
-        let config = config::ServerConfig::load(&path)?;
         let Command::Serve(args) = cli.command else {
             unreachable!("guarded by matches! above")
         };
+        // The serve `--format` overrides the extension-based auto-detection for the
+        // daemon config; env overrides still layer on top after the parse.
+        let config = config::ServerConfig::load(&path, args.format)?;
         serve::run(args, &config).await?;
         return Ok(());
     }
@@ -408,7 +410,8 @@ async fn async_main() -> Result<(), CliError> {
     // `serve`, since the posture lives there — not in the project config.
     if matches!(cli.command, Command::Security(_)) {
         let path = cli.config.unwrap_or_else(|| PathBuf::from("boatramp.cfg"));
-        let config = config::ServerConfig::load(&path)?;
+        // No `--format` on `security`; auto-detect by extension (`.json` ⇒ JSON).
+        let config = config::ServerConfig::load(&path, None)?;
         let Command::Security(args) = cli.command else {
             unreachable!("guarded by matches! above")
         };
@@ -420,7 +423,8 @@ async fn async_main() -> Result<(), CliError> {
     // the server daemon config (`boatramp.cfg`) — not the project config.
     if matches!(cli.command, Command::Migrate(_)) {
         let path = cli.config.unwrap_or_else(|| PathBuf::from("boatramp.cfg"));
-        let config = config::ServerConfig::load(&path)?;
+        // No `--format` on `migrate`; auto-detect by extension (`.json` ⇒ JSON).
+        let config = config::ServerConfig::load(&path, None)?;
         let Command::Migrate(args) = cli.command else {
             unreachable!("guarded by matches! above")
         };
@@ -452,7 +456,9 @@ async fn async_main() -> Result<(), CliError> {
     }
 
     let path = cli.config.unwrap_or_else(|| PathBuf::from("project.cfg"));
-    let mut config = config::ProjectConfig::load(&path)?;
+    // The project config (`project.cfg`) auto-detects RON vs JSON by extension;
+    // there is no top-level `--format` (it is scoped to `apply` / `serve`).
+    let mut config = config::ProjectConfig::load(&path, None)?;
     // The global `--project` / `BOATRAMP_PROJECT` flag wins over `[publish].project`
     // in the config file; unset leaves the config value (or the `default` project).
     if let Some(project) = cli.project.clone() {

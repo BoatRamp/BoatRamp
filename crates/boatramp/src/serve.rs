@@ -235,6 +235,12 @@ enum TlsMode {
 /// Arguments for `boatramp serve`.
 #[derive(Debug, clap::Args)]
 pub struct ServeArgs {
+    /// Config file format for `--config` (`boatramp.cfg`): RON or JSON,
+    /// auto-detected by extension (`.json` ⇒ JSON, everything else ⇒ RON). Set
+    /// explicitly when piping Nickel/JSON to a non-`.json` config path.
+    #[arg(long, value_enum)]
+    pub format: Option<crate::config::ConfigFormat>,
+
     /// Address to bind the HTTP server to (flag/env > `serve.addr` >
     /// `127.0.0.1:8080`).
     #[arg(long, env = "BOATRAMP_ADDR")]

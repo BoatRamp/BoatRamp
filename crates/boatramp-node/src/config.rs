@@ -26,6 +26,45 @@ pub fn ron_options() -> ron::Options {
     ron::Options::default().with_default_extension(ron::extensions::Extensions::IMPLICIT_SOME)
 }
 
+/// The wire format an operator-authored config file is decoded as (v0.6.5).
+///
+/// Config files are historically RON. JSON was added as a second **input** format
+/// purely for interop — so a config can be generated from Nickel (`nickel export` →
+/// JSON) and fed to boatramp unchanged. It is an alternative *decoder* into the
+/// **same** typed structs (they all derive serde `Deserialize` with externally-tagged
+/// enums + `deny_unknown_fields`), so JSON preserves every variant name and the same
+/// strictness — no type changes, and the same downstream validation runs either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
+pub enum ConfigFormat {
+    /// RON (the historical, default format). Selected for every non-`.json`
+    /// extension (`.cfg` / `.ron` / none).
+    #[default]
+    Ron,
+    /// JSON — for configs generated from Nickel (`nickel export`) or any JSON
+    /// pipeline. Selected for a `.json` (case-insensitive) extension.
+    Json,
+}
+
+/// Resolve the [`ConfigFormat`] for a config path.
+///
+/// The rule is explicit and predictable (config is the operator trust boundary, so
+/// there is **no content-sniffing** — a sniff could silently RON-parse a JSON file
+/// into a wrong-but-valid config, and vice versa):
+///
+/// 1. an explicit `override_` (the CLI `--format ron|json`) always wins; else
+/// 2. auto by extension — a `.json` (case-insensitive) extension ⇒ [`ConfigFormat::Json`];
+///    everything else (`.cfg` / `.ron` / no extension) ⇒ [`ConfigFormat::Ron`].
+pub fn resolve_format(path: &Path, override_: Option<ConfigFormat>) -> ConfigFormat {
+    if let Some(fmt) = override_ {
+        return fmt;
+    }
+    match path.extension().and_then(|e| e.to_str()) {
+        Some(ext) if ext.eq_ignore_ascii_case("json") => ConfigFormat::Json,
+        _ => ConfigFormat::Ron,
+    }
+}
+
 /// A failure loading or parsing a local config file (`project.cfg` / `boatramp.cfg`).
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -39,6 +78,11 @@ pub enum ConfigError {
     /// The RON document failed to parse.
     #[error("invalid config syntax: {0}")]
     Ron(#[from] ron::error::SpannedError),
+    /// The JSON document failed to parse (JSON config input — e.g. from
+    /// `nickel export`). Same strictness as RON: `deny_unknown_fields` on the
+    /// structs makes a typo'd/unknown key a hard error here, not a silent drop.
+    #[error("invalid JSON config: {0}")]
+    Json(#[from] serde_json::Error),
     /// The `routing` section failed its compile-check.
     #[error("routing: {0}")]
     Routing(#[from] boatramp_core::ConfigError),
@@ -92,22 +136,37 @@ pub struct ProjectConfig {
 }
 
 impl ProjectConfig {
-    /// Parse a `project.cfg` document (RON). The `routing` section is
-    /// compile-checked (route patterns, cron schedules, imports) so a bad config
-    /// fails fast.
+    /// Parse a `project.cfg` document as **RON** (the default). Kept for the existing
+    /// callers/tests; [`Self::parse_with_format`] is the format-aware entry point.
     pub fn parse(text: &str) -> Result<Self, ConfigError> {
-        let config: Self = ron_options().from_str(text)?;
+        Self::parse_with_format(text, ConfigFormat::Ron)
+    }
+
+    /// Parse a `project.cfg` document in `fmt` (RON or JSON). The deserializer is
+    /// selected by format (RON ⇒ [`ron_options`], JSON ⇒ `serde_json`) into the SAME
+    /// typed struct; the `routing` section is then compile-checked (route patterns,
+    /// cron schedules, imports) regardless of format so a bad config fails fast.
+    pub fn parse_with_format(text: &str, fmt: ConfigFormat) -> Result<Self, ConfigError> {
+        let config: Self = match fmt {
+            ConfigFormat::Ron => ron_options().from_str(text)?,
+            ConfigFormat::Json => serde_json::from_str(text)?,
+        };
         config.routing.compile_check()?;
         Ok(config)
     }
 
-    /// Load from `path` (RON). A missing file yields the default config.
-    pub fn load(path: &Path) -> Result<Self, ConfigError> {
+    /// Load from `path`, decoding as RON or JSON per [`resolve_format`] (`override_`
+    /// wins; else `.json` ⇒ JSON, everything else ⇒ RON). A missing file yields the
+    /// default config (unlike an apply manifest).
+    pub fn load(path: &Path, override_: Option<ConfigFormat>) -> Result<Self, ConfigError> {
+        let fmt = resolve_format(path, override_);
         match std::fs::read_to_string(path) {
-            Ok(contents) => Self::parse(&contents).map_err(|err| ConfigError::File {
-                path: path.display().to_string(),
-                source: Box::new(err),
-            }),
+            Ok(contents) => {
+                Self::parse_with_format(&contents, fmt).map_err(|err| ConfigError::File {
+                    path: path.display().to_string(),
+                    source: Box::new(err),
+                })
+            }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(err) => Err(err.into()),
         }
@@ -196,26 +255,45 @@ impl Default for VaultSecretsConfig {
 const RESERVED_MANAGED_DB_COMPUTE_PREFIX: &str = "bramp-db-";
 
 impl ServerConfig {
-    /// Parse a `boatramp.cfg` document (RON). Db-binding names declared in the file
-    /// are validated here (the same fail-closed check `load` re-runs after the env
-    /// merge), so a file-only config path — e.g. `boatramp cloudflare` rendering, or
-    /// the operator-resources loader — is guarded even without going through `load`.
+    /// Parse a `boatramp.cfg` document as **RON** (the default). Kept for the existing
+    /// callers/tests; [`Self::parse_with_format`] is the format-aware entry point.
     pub fn parse(text: &str) -> Result<Self, ConfigError> {
-        let config: Self = ron_options().from_str(text)?;
+        Self::parse_with_format(text, ConfigFormat::Ron)
+    }
+
+    /// Parse a `boatramp.cfg` document in `fmt` (RON or JSON). The deserializer is
+    /// selected by format (RON ⇒ [`ron_options`], JSON ⇒ `serde_json`) into the SAME
+    /// typed struct. Db-binding names declared in the file are validated here (the same
+    /// fail-closed check `load` re-runs after the env merge) **regardless of format**, so
+    /// a file-only config path — e.g. `boatramp cloudflare` rendering, or the
+    /// operator-resources loader — is guarded even without going through `load`.
+    pub fn parse_with_format(text: &str, fmt: ConfigFormat) -> Result<Self, ConfigError> {
+        let config: Self = match fmt {
+            ConfigFormat::Ron => ron_options().from_str(text)?,
+            ConfigFormat::Json => serde_json::from_str(text)?,
+        };
         config.validate_sql_db_names()?;
         Ok(config)
     }
 
-    /// Load from `path` (RON), then layer `BOATRAMP_*` environment overrides on
-    /// top. A missing file yields the default config, so `serve` can be configured
-    /// entirely from the environment (12-factor deployments where dropping a
-    /// `boatramp.cfg` is awkward — fly.io / Cloudflare / containers).
-    pub fn load(path: &Path) -> Result<Self, ConfigError> {
+    /// Load from `path`, decoding as RON or JSON per [`resolve_format`] (`override_`
+    /// wins; else `.json` ⇒ JSON, everything else ⇒ RON), then layer `BOATRAMP_*`
+    /// environment overrides on top. A missing file yields the default config, so
+    /// `serve` can be configured entirely from the environment (12-factor deployments
+    /// where dropping a `boatramp.cfg` is awkward — fly.io / Cloudflare / containers).
+    ///
+    /// The env-override merge runs AFTER the parse for either format — JSON is only an
+    /// alternative decoder into the same typed struct; it does not change the
+    /// file < env precedence.
+    pub fn load(path: &Path, override_: Option<ConfigFormat>) -> Result<Self, ConfigError> {
+        let fmt = resolve_format(path, override_);
         let mut config = match std::fs::read_to_string(path) {
-            Ok(contents) => Self::parse(&contents).map_err(|err| ConfigError::File {
-                path: path.display().to_string(),
-                source: Box::new(err),
-            })?,
+            Ok(contents) => {
+                Self::parse_with_format(&contents, fmt).map_err(|err| ConfigError::File {
+                    path: path.display().to_string(),
+                    source: Box::new(err),
+                })?
+            }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Self::default(),
             Err(err) => return Err(err.into()),
         };
@@ -3576,6 +3654,145 @@ mod tests {
         assert!(
             err.is_err(),
             "unknown [serve.blob_fallback] field must be rejected"
+        );
+    }
+
+    // =======================================================================
+    // JSON config input gate (v0.6.5) — serve/project config + detection half.
+    //
+    // ROBUST-successor gate (continuing the v0.6.4 blob-purge style): a `#[test]`
+    // battery whose sole CI contract is the ordinary `cargo test` exit code — NO
+    // grepped uppercase marker, NO bash env-var mutation loop. Every test is prefixed
+    // `config_json_gate_` so the CI lane filters with `cargo test … config_json`. The
+    // apply-manifest half (version current-schema-only, bad-route compile-check) lives
+    // in `boatramp::apply`'s test module under the same prefix.
+    // =======================================================================
+
+    /// Detection: `resolve_format` follows the explicit-override-wins, else
+    /// `.json`⇒Json / everything-else⇒Ron rule (no content-sniffing).
+    #[test]
+    fn config_json_gate_resolve_format_table() {
+        use std::path::Path;
+        // Auto by extension.
+        assert_eq!(
+            resolve_format(Path::new("boatramp.json"), None),
+            ConfigFormat::Json
+        );
+        assert_eq!(
+            resolve_format(Path::new("apply.cfg"), None),
+            ConfigFormat::Ron
+        );
+        assert_eq!(
+            resolve_format(Path::new("apply.ron"), None),
+            ConfigFormat::Ron
+        );
+        // No extension ⇒ Ron.
+        assert_eq!(resolve_format(Path::new("apply"), None), ConfigFormat::Ron);
+        // Case-insensitive `.json`.
+        assert_eq!(
+            resolve_format(Path::new("x.JSON"), None),
+            ConfigFormat::Json
+        );
+        // Explicit override wins BOTH ways.
+        assert_eq!(
+            resolve_format(Path::new("x.json"), Some(ConfigFormat::Ron)),
+            ConfigFormat::Ron
+        );
+        assert_eq!(
+            resolve_format(Path::new("x.cfg"), Some(ConfigFormat::Json)),
+            ConfigFormat::Json
+        );
+    }
+
+    /// Equivalence: a representative serve config authored in RON and in equivalent
+    /// JSON parses to the SAME field values — including the externally-tagged
+    /// enum-variant field `[serve].blobs` (`BlobBackend::S3`; RON `s3` ≡ JSON `"s3"`),
+    /// proving variant-name fidelity through the JSON decoder.
+    #[test]
+    fn config_json_gate_serve_ron_and_json_are_equivalent() {
+        let ron = r#"( serve: ( addr: "0.0.0.0:8080", blobs: s3, s3_bucket: "b" ) )"#;
+        let json = r#"{ "serve": { "addr": "0.0.0.0:8080", "blobs": "s3", "s3_bucket": "b" } }"#;
+        let from_ron = ServerConfig::parse_with_format(ron, ConfigFormat::Ron).unwrap();
+        let from_json = ServerConfig::parse_with_format(json, ConfigFormat::Json).unwrap();
+        let s_ron = from_ron.serve.unwrap();
+        let s_json = from_json.serve.unwrap();
+        assert_eq!(s_ron.blobs, Some(crate::backends::BlobBackend::S3));
+        assert_eq!(s_json.blobs, Some(crate::backends::BlobBackend::S3));
+        assert_eq!(s_ron.blobs, s_json.blobs, "the enum variant survives JSON");
+        assert_eq!(s_ron.addr, s_json.addr);
+        assert_eq!(s_ron.s3_bucket, s_json.s3_bucket);
+        assert_eq!(s_json.s3_bucket.as_deref(), Some("b"));
+    }
+
+    /// Equivalence (project): a `project.cfg` authored in RON and in equivalent JSON
+    /// parses to the same publish target.
+    #[test]
+    fn config_json_gate_project_ron_and_json_are_equivalent() {
+        let ron = r#"( publish: ( project: "team-x" ) )"#;
+        let json = r#"{ "publish": { "project": "team-x" } }"#;
+        let from_ron = ProjectConfig::parse_with_format(ron, ConfigFormat::Ron).unwrap();
+        let from_json = ProjectConfig::parse_with_format(json, ConfigFormat::Json).unwrap();
+        assert_eq!(from_ron.publish.project.as_deref(), Some("team-x"));
+        assert_eq!(from_ron.publish.project, from_json.publish.project);
+    }
+
+    /// `deny_unknown_fields` parity: a JSON serve config with an extra/typo'd field is
+    /// a hard parse error, not a silent drop (the `[serve.blob_fallback]`
+    /// `deny_unknown_fields` struct is the RON parity partner tested above).
+    #[test]
+    fn config_json_gate_serve_json_denies_unknown_fields() {
+        let json = r#"{ "serve": { "blob_fallback": { "blobs": "fs", "bogus": 1 } } }"#;
+        assert!(
+            ServerConfig::parse_with_format(json, ConfigFormat::Json).is_err(),
+            "an unknown JSON field must be rejected (deny_unknown_fields), same as RON"
+        );
+    }
+
+    /// No-bypass: post-parse validation runs regardless of format. A JSON serve config
+    /// with an invalid `handlers.bindings.sql.databases` db-name (a `/`-bearing,
+    /// non-URL-path-safe name) is rejected identically to RON — the SAME
+    /// `ConfigError::InvalidDbName`, from the SAME `validate_sql_db_names` choke point.
+    #[test]
+    fn config_json_gate_json_bad_db_name_is_rejected_like_ron() {
+        // The invalid binding name `a/b` (a path separator) fails the canonical
+        // resource-name validator that `validate_sql_db_names` runs after the parse.
+        let json = r#"{ "handlers": { "bindings": { "sql": {
+            "databases": { "a/b": { "kind": "postgres", "url_env": "DB_URL" } }
+        } } } }"#;
+        let ron = r#"( handlers: ( bindings: ( sql: (
+            databases: { "a/b": ( kind: "postgres", url_env: "DB_URL" ) }
+        ) ) ) )"#;
+        let json_err = ServerConfig::parse_with_format(json, ConfigFormat::Json)
+            .expect_err("a bad db-name in a JSON config must be rejected");
+        let ron_err = ServerConfig::parse_with_format(ron, ConfigFormat::Ron)
+            .expect_err("a bad db-name in a RON config must be rejected");
+        assert!(
+            matches!(json_err, ConfigError::InvalidDbName { .. }),
+            "JSON bad db-name is InvalidDbName, got {json_err:?}"
+        );
+        assert!(
+            matches!(ron_err, ConfigError::InvalidDbName { .. }),
+            "RON bad db-name is InvalidDbName, got {ron_err:?}"
+        );
+    }
+
+    /// Anti-hollow (typed, in-process): a document valid as JSON but NOT as RON MUST
+    /// parse under `Json` and FAIL under `Ron`. If `parse_with_format` ignored `fmt`
+    /// and always decoded RON, the JSON leg would fail — so the format selection is
+    /// proven load-bearing, with no env var and no marker.
+    #[test]
+    fn config_json_gate_serve_format_selection_is_load_bearing() {
+        // A bare JSON object is valid JSON for `ServerConfig`, not valid RON for it
+        // (RON structs use `( … )`, not a brace map).
+        let doc = r#"{ "serve": { "s3_bucket": "only-json" } }"#;
+        let as_json = ServerConfig::parse_with_format(doc, ConfigFormat::Json).unwrap();
+        assert_eq!(
+            as_json.serve.unwrap().s3_bucket.as_deref(),
+            Some("only-json")
+        );
+        assert!(
+            ServerConfig::parse_with_format(doc, ConfigFormat::Ron).is_err(),
+            "the same document must FAIL under Ron — else the fmt selection is hollow"
         );
     }
 }
