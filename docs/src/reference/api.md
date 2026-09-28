@@ -60,6 +60,85 @@ counterparts are identical but scoped to `:project`.
 | --- | --- | --- |
 | `PUT` | `/api/blobs/:hash` | Upload a content-addressed blob (raw body; the server verifies the hash). |
 
+### Blob-backend migration (node-level)
+
+Complete a zero-downtime blob-backend switch on a managed node reachable only over the
+control plane (no `fly ssh` / local shell). These operate on the node's **own** configured
+blob store — never a client-named backend — so they are gated at `system` · `admin` (the
+destructive drain/purge) or `system` · `read` (the status probe), like `prune` / `scrub` /
+`sql-move`. The singular hyphenated paths (`blob-drain`, `blob-status`, `blob-purge`)
+deliberately do **not** collide with the `/api/blobs/…` (`Blobs` · `Deploy`) content-upload
+matcher, so a ship-only publisher can never reach them.
+
+#### `POST /api/blob-drain`
+
+Since 0.6.3. Drain the node's own configured `[serve].blob_fallback` read-fallback
+**secondary → primary** (`Storage::drain_pair` on the live composite), so the fallback can be
+removed. The client guides; the running daemon (which already holds both backends open)
+executes. `system` · `admin`.
+
+The body names **no** source or destination — the daemon drains only its own configured pair:
+
+```json
+{ "dry_run": false, "concurrency": 8, "prefix": "" }
+```
+
+All fields are optional (`deny_unknown_fields`); `dry_run` defaults to `false`, `concurrency`
+to the engine default (8), an absent/empty `prefix` drains every object.
+
+The response is an **NDJSON** stream (`application/x-ndjson`) — one JSON object per line — kept
+alive over a chunked connection so an edge idle-timeout can't cut a long copy (the copy is
+idempotent and resumable, so a dropped connection is safe to re-run). Progress lines are tagged
+`"type":"progress"`; the final line is tagged `"type":"report"`:
+
+```
+{"type":"progress","done":2,"total":3,"copied":2,"skipped":0,"copied_bytes":4096,"dry_run":false}
+{"type":"report","total_objects":3,"copied_objects":3,"skipped_objects":0,"copied_bytes":6144,"verified":true,"dry_run":false,"secondary_drained":true,"message":"SECONDARY FULLY DRAINED — safe to remove [serve].blob_fallback and restart the node."}
+```
+
+`secondary_drained` is `true` **only** on a verified-complete, non-dry-run drain. A verify
+failure reports `secondary_drained:false` plus the missing keys. With no `[serve].blob_fallback`
+configured, the request is a **422** (`{ "error": "no blob_fallback configured; nothing to drain" }`).
+
+#### `GET /api/blob-status`
+
+Since 0.6.4. Query the node's structured transition-mode state — whether a read-fallback
+secondary is currently attached (the node is mid-migration) — instead of grepping the startup
+log warning. `system` · `read`.
+
+```json
+{ "blob_fallback_active": true }
+```
+
+#### `POST /api/blob-purge`
+
+Since 0.6.4. Reclaim a **provably-safe-only** object set on the node's blob store. Dry-run by
+default (report only, delete nothing); `apply: true` deletes. `system` · `admin`.
+
+```json
+{ "mode": "unreferenced", "apply": false, "prefix": "" }
+```
+
+`deny_unknown_fields`. `mode` is required and is one of:
+
+- `"unreferenced"` — on-demand garbage collection: delete content-addressed blobs no live
+  deploy manifest references (nothing serving can break). Refused with **409** while a
+  read-fallback secondary is attached (drain and drop `[serve].blob_fallback` first). `prefix`
+  is ignored in this mode.
+- `"drained_source"` — the migration decommission: delete the read-fallback secondary's objects
+  that are **byte-confirmed present in the primary** (fail-closed — an unconfirmed object is
+  kept). `prefix` restricts the scope. With no `[serve].blob_fallback` configured, the request is
+  a **422**.
+
+The response is **NDJSON** (progress lines then a final `"type":"report"` line), the same shape
+as the drain:
+
+```
+{"type":"report","mode":"drained_source","apply":true,"considered":3,"purged":1,"would_purge":0,"skipped_unconfirmed":2,"purged_bytes":17,"message":"drained-source purge complete: reclaimed 1 confirmed-duplicated object(s) (17 byte(s)); kept 2 unconfirmed"}
+```
+
+See [Migrate the blob backend](../how-to/blob-backend-migration.md).
+
 ## Domains
 
 | Method | Path | Purpose |
@@ -208,6 +287,85 @@ needs only `project` · `read`. Top-level paths target the `default` project;
 | `GET` | `/api/migrate/:db/status` | Read the applied-migration ledger (id, ordinal, hash, kind, applied-at, origin). `project` · `read`. |
 
 See [Run owner-gated schema migrations](../how-to/in-app-migrations.md).
+
+## Provisioning drift-repair (owner-gated)
+
+Converge a managed database's provisioning against spec — create/seal the non-superuser owner
+role, re-own the database + its objects + the migration ledger, re-grant runtime privileges —
+idempotently and data-preservingly (`boatramp project repair`). Deliberately **not** under
+`/api/sql/` (whose catch-all resolves to `project` · `deploy`, which a ship-only publisher holds
+— nesting there would be an escalation); its own `/api/repair/*` prefix gates **both** verbs at
+`project` · `admin`. Dry-run is the report-only posture the CLI uses by default. Top-level paths
+target the `default` project; `/api/projects/:project/repair/…` scopes to another project. Since
+0.5.2 (all SQL backends).
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `POST` | `/api/repair/:db/apply` | Apply the reconcile — converge provisioning against spec. `project` · `admin`. |
+| `POST` | `/api/repair/:db/dry-run` | Drift-detect + report the plan, changing nothing (the default CLI posture). `project` · `admin`. |
+
+## Managed databases (declarative)
+
+The project-scoped declarative front door onto the daemon-level managed-database provisioning
+stack (a per-tenant Postgres/MySQL whose credential boatramp mints and seals). These back
+`boatramp db ls | get | status` and the `apply`-manifest `databases:` block; there is no
+`db create` — the manifest is the sole authoring surface. Declaring a database mints owner-role
+identities (`CREATE ROLE` / owner-role DDL as superuser), so the write verbs gate at
+`project` · `admin` — the same owner-grade placement as `/api/migrate/` and `/api/repair/`, above
+the project-deploy catch-all, so a `project_publisher` / deployer can never reach them; the reads
+are `project` · `read`. Top-level paths target the `default` project;
+`/api/projects/:project/databases/…` scopes to another project. Since 0.6.0.
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/api/databases` | List the project's declared databases (each an `ApplyDatabase`). `project` · `read`. |
+| `GET` | `/api/databases/:name` | Get one declared database, or `404`. `project` · `read`. |
+| `PUT` | `/api/databases/:name` | Declare (persist + eagerly provision) a database from an `ApplyDatabase` body. `204` on success. `project` · `admin`. |
+| `POST` | `/api/databases/:name/ensure` | Re-provision an already-declared database idempotently. `204`. `project` · `admin`. |
+| `GET` | `/api/databases/:name/status` | The stored declaration + a coarse provisioned signal. `project` · `read`. |
+
+The `PUT` body is a typed `ApplyDatabase` (`deny_unknown_fields`) — a **safe projection** that
+carries only the fields a project author may declare. Naming an excluded field (`image`,
+`password_env` / `url_env` / `read_url_env` / `migration_url_env`, `path`, `compute`) fails to
+parse — those are the security contract (arbitrary-image RCE, BYO-secret/SSRF, host-fs traversal,
+author-named workload). The credential is never carried or referenced; boatramp fully manages and
+seals it.
+
+```json
+{
+  "name": "app",
+  "kind": "postgres",
+  "version": 16,
+  "size": "medium",
+  "tenant": "shared",
+  "tenant_scope": "project",
+  "extensions": ["pgcrypto"],
+  "rls_session": true,
+  "tenant_guc": "app.tenant_id"
+}
+```
+
+Only `name` and `kind` (`postgres` / `mysql`) are required. `size` is a `small` / `medium` /
+`large` preset (default `small`, → bounded vcpus/mem/volume, not raw VM knobs); `tenant` is
+`single` (default) / `shared`; `tenant_scope` is `project` (default) / `site`. The remaining
+optional fields — `version`, `extensions`, `read_only`, the RLS knobs (`rls_session`, `tenant_guc`,
+`session_guc`, `tenant_all_marker`), and the capped `pool_max` / `connect_timeout_secs` /
+`startup_grace_secs` — are omitted from a response when unset.
+
+`GET /api/databases` returns a JSON array of `ApplyDatabase`; `GET /api/databases/:name` returns
+one. `GET /api/databases/:name/status` wraps the declaration with a workload handle and a coarse
+provisioned fact (never a secret):
+
+```json
+{
+  "database": { "name": "app", "kind": "postgres", "size": "medium", "tenant": "shared", "tenant_scope": "project" },
+  "workload": "bramp-db-<project>-app",
+  "declared": true
+}
+```
+
+The declarative `databases:` manifest block that drives these routes is covered under
+[Declare a managed database](../how-to/managed-databases.md); see also [Apply a manifest](../how-to/apply.md).
 
 ## Secrets & email profiles
 
