@@ -5,6 +5,45 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.7.0] - 2026-09-28
+
+BREAKING. Resource names (project / site / database / function / compute / workflow) are now
+validated against a strict ASCII slug allowlist at every operator, control-plane, and URL-path
+boundary. Names accepted by the previous path-traversal denylist but that are not valid slugs —
+e.g. `${PROJECT}`, names with `$ { } ( ) ; | & % # " '`, a leading/trailing `-`/`_`, an interior
+`.`, or a Unicode homoglyph — are now REJECTED at create AND at config load / request routing.
+
+BEFORE UPGRADING: run `boatramp project doctor` on your current release. It lists every
+non-conforming name, what it affects, and the exact fix — delete an inert name with
+`boatramp project rm <name>`, or migrate a live one. `boatramp apply` and `boatramp serve` on
+v0.7.0 refuse a config carrying a non-conforming name and point back at `project doctor`.
+
+Allowlist (project/site/database/function/compute/workflow): start and end with an ASCII letter
+or digit; interior may add `_` and `-`; 1–63 bytes. Data-plane tenant identities and their
+`{tenant}`-expanded blob containers keep the looser key-safety rule (a signed `tid` may be an
+email or dotted domain), so email/dotted tenants are unaffected.
+
+### Security
+
+- **Closed the resource-name injection class (root cause of an accepted `${PROJECT}` project).**
+  The old validator was a path-traversal denylist that permitted template/shell metacharacters
+  (`${…}`, `{}`, `;`, `|`, backtick, quotes, `$`, `(`,`)`), a latent injection for any future sink
+  formatting a name into a shell / `.env` / DNS / SQL string. It also under-guarded two ingresses:
+  a **token role target** (`publisher:${PROJECT}`) was never validated at mint AND had no
+  authz-match backstop, and the project-scope path segment was only empty-checked. And the
+  container DNS `search`-line sink (`/etc/resolv.conf`) was a newline-injection whose only guard
+  was the very denylist being replaced.
+- **Fixes.** ASCII byte-loop allowlist (homoglyph-safe); token target validated at all mint feeders
+  (create/bootstrap/OIDC/offline) AND a fail-closed screen at authz-match time (a non-conforming
+  target — incl. on an already-minted or offline token — matches nothing / denies), segment-aware
+  for `project`/`project/site`/`project/*`; project-scope path segment validated (generic 400,
+  pre-auth, no existence oracle); resolv.conf drops the `search` line for a non-conforming project.
+- **New:** `boatramp project doctor` (scan for non-conforming names, `--json`, non-zero exit),
+  and `boatramp project rm` accepts a non-conforming name as an admin-gated, source-only teardown
+  key so a stray inert name can be removed. A general project-rename is intentionally out of scope
+  (a project name is embedded in signed tokens, hashed DB workloads, and a non-transactional KV
+  subtree — a rename is a separate, gated migration).
+
 ## [0.6.5] - 2026-09-28
 
 Additive, non-breaking. JSON as an alternative config input format (for interop —
