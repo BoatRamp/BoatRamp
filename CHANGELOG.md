@@ -5,6 +5,26 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.6.4] - 2026-09-28
+
+Additive, non-breaking. A general, provably-safe blob purge + queryable migration status.
+
+### Added
+
+- **`boatramp blob purge` + `POST /api/blob-purge` (general, provably-safe blob reclaim).** A
+  daemon-mediated, `System·Admin`, **dry-run-by-default** (`--apply` to execute) purge with structured
+  output. Two fail-closed modes — it never deletes referenced or non-duplicated data:
+  - `--unreferenced` — prune content-addressed blobs that **no live manifest references** (on-demand
+    garbage collection over the control plane, the everyday storage reclaim). Refused (409) while a
+    `[serve].blob_fallback` is attached — drop the fallback first.
+  - `--drained-source` — after a migration, delete the fallback secondary's objects that are
+    **byte-confirmed present in the primary** (the single safety decision is a pure predicate: deletable
+    iff the primary holds that exact key at a matching size). An unconfirmed object is kept, never
+    deleted. Lets a managed node reclaim the decommissioned old backend over the control plane, no SSH.
+- **`boatramp blob status` + `GET /api/blob-status` (System·Read).** Queryable, structured migration
+  posture — `{ "blob_fallback_active": bool }` — so automation/monitoring reads whether the node is in
+  transition mode instead of grepping the startup log warning.
+
 ## [0.6.3] - 2026-09-27
 
 Additive, non-breaking. Daemon-mediated blob drain — complete a zero-downtime blob-backend migration on
