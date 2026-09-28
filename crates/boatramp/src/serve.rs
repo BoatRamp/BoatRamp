@@ -969,8 +969,9 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
         TlsMode::AcmeDns => serve_acme_dns(&args, addr, deploy, auth, handlers, options).await,
         TlsMode::Rpk => serve_rpk(&args, addr, deploy, auth, handlers, options, &data_dir).await,
     };
-    // Graceful shutdown (Part A): the serve future has returned (and `serve_with` has already
-    // quiesced the scheduler + its detached children). Now abort+await the reconcile loops and
+    // Graceful shutdown (Part A): the serve future has returned (and has already quiesced the
+    // scheduler + its detached children — `serve_with` on the plaintext path, every TLS serve
+    // variant on its own tail). Now abort+await the reconcile loops and
     // cleanly CLOSE the control-plane store — not a bare `flush()` (which only pushed the WAL
     // buffer out, leaving a live store whose next crash could freeze a torn tail), but a real
     // `close()` that freezes memtables to L0 and advances the durable frontier, so the next cold
@@ -2284,8 +2285,9 @@ async fn run_cluster(
         TlsMode::AcmeDns => serve_acme_dns(&args, addr, deploy, auth, handlers, options).await,
     };
 
-    // Graceful shutdown (Part A, cluster): the serve future has returned (and `serve_with` has
-    // already quiesced the scheduler + its detached children). Abort+await the reconcile loops,
+    // Graceful shutdown (Part A, cluster): the serve future has returned (and has already quiesced
+    // the scheduler + its detached children — `serve_with` on the plaintext path, every TLS serve
+    // variant on its own tail). Abort+await the reconcile loops,
     // THEN shut down Raft, THEN cleanly CLOSE the node-local durable Raft store. The Raft shutdown
     // MUST precede the store close: a write/apply after the store is marked closed would lose a
     // committed log/state entry or desync the log vs the state machine (the cluster's correctness
@@ -2435,7 +2437,7 @@ async fn serve_cluster_acme_dns(
 
     tracing::info!(%addr, domains = ?domains, "cluster: serving HTTPS (cluster-managed ACME DNS-01)");
     #[cfg(feature = "handlers")]
-    let _scheduler = handlers.spawn_scheduler(deploy.clone());
+    let scheduler = handlers.spawn_scheduler(deploy.clone());
     let (app, fast) = boatramp_server::router_with_fast(deploy, auth, handlers, options);
     // Serve h3 over the QUIC endpoint + advertise it on the HTTPS responses (on the
     // bypass too, so a hot-path response advertises h3 identically to the router).
@@ -2454,7 +2456,18 @@ async fn serve_cluster_acme_dns(
     } else {
         (app, fast)
     };
-    boatramp_server::serve_tls(addr, tls, (app, fast), boatramp_server::shutdown_signal()).await?;
+    let serve_result =
+        boatramp_server::serve_tls(addr, tls, (app, fast), boatramp_server::shutdown_signal())
+            .await;
+    // Fully quiesce the background scheduler (delivery drainer + blob watchers + in-flight crons)
+    // once the serve future returns, BEFORE the caller's `quiesce_and_close` closes the store — so
+    // no scheduler task can land a KV write into a fresh WAL segment after `close()` (Part A). This
+    // mirrors `serve_with`, which quiesces its own scheduler on the plaintext (`--tls off`) path.
+    #[cfg(feature = "handlers")]
+    if let Some(handle) = scheduler {
+        handle.quiesce().await;
+    }
+    serve_result?;
     Ok(())
 }
 
@@ -2614,9 +2627,10 @@ async fn serve_acme_dns(
     tracing::info!(%addr, domains = ?domains, "serving HTTPS (ACME DNS-01)");
     // Background scheduler (consumers/crons) — must run under TLS too, not only
     // `--tls off`; in cluster mode its cron tick is gated on `is_leader`. The
-    // handle detaches for the server's lifetime.
+    // handle is fully quiesced on graceful shutdown (below) so no scheduler task can
+    // issue a KV write after the store is closed (Part A).
     #[cfg(feature = "handlers")]
-    let _scheduler = handlers.spawn_scheduler(deploy.clone());
+    let scheduler = handlers.spawn_scheduler(deploy.clone());
     let (app, fast) = boatramp_server::router_with_fast(deploy, auth, handlers, options);
     #[cfg(feature = "http3")]
     let (app, fast) = if let Some(endpoint) = h3_endpoint {
@@ -2633,7 +2647,18 @@ async fn serve_acme_dns(
     } else {
         (app, fast)
     };
-    boatramp_server::serve_tls(addr, tls, (app, fast), boatramp_server::shutdown_signal()).await?;
+    let serve_result =
+        boatramp_server::serve_tls(addr, tls, (app, fast), boatramp_server::shutdown_signal())
+            .await;
+    // Fully quiesce the background scheduler (delivery drainer + blob watchers + in-flight crons)
+    // once the serve future returns, BEFORE the caller's `quiesce_and_close` closes the store — so
+    // no scheduler task can land a KV write into a fresh WAL segment after `close()` (Part A). This
+    // mirrors `serve_with`, which quiesces its own scheduler on the plaintext (`--tls off`) path.
+    #[cfg(feature = "handlers")]
+    if let Some(handle) = scheduler {
+        handle.quiesce().await;
+    }
+    serve_result?;
     Ok(())
 }
 
@@ -2739,9 +2764,10 @@ async fn serve_custom(
     tracing::info!(%addr, "serving HTTPS (custom certificate)");
     // Background scheduler (consumers/crons) — must run under TLS too, not only
     // `--tls off`; in cluster mode its cron tick is gated on `is_leader`. The
-    // handle detaches for the server's lifetime.
+    // handle is fully quiesced on graceful shutdown (below) so no scheduler task can
+    // issue a KV write after the store is closed (Part A).
     #[cfg(feature = "handlers")]
-    let _scheduler = handlers.spawn_scheduler(deploy.clone());
+    let scheduler = handlers.spawn_scheduler(deploy.clone());
     let (app, fast) = boatramp_server::router_with_fast(deploy, auth, handlers, options);
 
     // Optionally serve HTTP/3 on the same UDP port, feeding the same router, and
@@ -2765,13 +2791,22 @@ async fn serve_custom(
         (app, fast)
     };
 
-    boatramp_server::serve_tls(
+    let serve_result = boatramp_server::serve_tls(
         addr,
         config.into(),
         (app, fast),
         boatramp_server::shutdown_signal(),
     )
-    .await?;
+    .await;
+    // Fully quiesce the background scheduler (delivery drainer + blob watchers + in-flight crons)
+    // once the serve future returns, BEFORE the caller's `quiesce_and_close` closes the store — so
+    // no scheduler task can land a KV write into a fresh WAL segment after `close()` (Part A). This
+    // mirrors `serve_with`, which quiesces its own scheduler on the plaintext (`--tls off`) path.
+    #[cfg(feature = "handlers")]
+    if let Some(handle) = scheduler {
+        handle.quiesce().await;
+    }
+    serve_result?;
     Ok(())
 }
 
@@ -2845,15 +2880,24 @@ async fn serve_rpk(
     );
 
     #[cfg(feature = "handlers")]
-    let _scheduler = handlers.spawn_scheduler(deploy.clone());
+    let scheduler = handlers.spawn_scheduler(deploy.clone());
     let (app, fast) = boatramp_server::router_with_fast(deploy, auth, handlers, options);
-    boatramp_server::serve_tls(
+    let serve_result = boatramp_server::serve_tls(
         addr,
         config.into(),
         (app, fast),
         boatramp_server::shutdown_signal(),
     )
-    .await?;
+    .await;
+    // Fully quiesce the background scheduler (delivery drainer + blob watchers + in-flight crons)
+    // once the serve future returns, BEFORE the caller's `quiesce_and_close` closes the store — so
+    // no scheduler task can land a KV write into a fresh WAL segment after `close()` (Part A). This
+    // mirrors `serve_with`, which quiesces its own scheduler on the plaintext (`--tls off`) path.
+    #[cfg(feature = "handlers")]
+    if let Some(handle) = scheduler {
+        handle.quiesce().await;
+    }
+    serve_result?;
     Ok(())
 }
 
@@ -2931,17 +2975,27 @@ async fn serve_acme(
     tracing::info!(%addr, domains = ?args.acme_domain, "serving HTTPS (ACME)");
     // Background scheduler (consumers/crons) — must run under TLS too, not only
     // `--tls off`; in cluster mode its cron tick is gated on `is_leader`. The
-    // handle detaches for the server's lifetime.
+    // handle is fully quiesced on graceful shutdown (below) so no scheduler task can
+    // issue a KV write after the store is closed (Part A).
     #[cfg(feature = "handlers")]
-    let _scheduler = handlers.spawn_scheduler(deploy.clone());
+    let scheduler = handlers.spawn_scheduler(deploy.clone());
     let (app, fast) = boatramp_server::router_with_fast(deploy, auth, handlers, options);
-    boatramp_server::serve_tls(
+    let serve_result = boatramp_server::serve_tls(
         addr,
         rustls_config.into(),
         (app, fast),
         boatramp_server::shutdown_signal(),
     )
-    .await?;
+    .await;
+    // Fully quiesce the background scheduler (delivery drainer + blob watchers + in-flight crons)
+    // once the serve future returns, BEFORE the caller's `quiesce_and_close` closes the store — so
+    // no scheduler task can land a KV write into a fresh WAL segment after `close()` (Part A). This
+    // mirrors `serve_with`, which quiesces its own scheduler on the plaintext (`--tls off`) path.
+    #[cfg(feature = "handlers")]
+    if let Some(handle) = scheduler {
+        handle.quiesce().await;
+    }
+    serve_result?;
     Ok(())
 }
 
