@@ -116,9 +116,13 @@ const POLICY_METACHARS: &[char] = &['"', '\''];
 
 /// The literal token an operator `upload_containers` entry may carry (e.g. `"assets-{tenant}"`): the
 /// HOST substitutes THIS invocation's resolved OWN tenant for it BEFORE the allowlist match + the scope
-/// stamp, so the entry only ever expands to the guest's own tenant's container. A guest's requested
-/// (concrete) container never contains it (`{`/`}` are screened out of a concrete container by
-/// `validate_resource_name`); it is meaningful ONLY inside an operator config entry.
+/// stamp, so the entry only ever expands to the guest's own tenant's container. It is meaningful ONLY
+/// inside an operator config entry: a guest cannot reach a `{tenant}`-templated entry by passing the
+/// literal `{tenant}` — `resolve_container` matches by EXACT string equality against the entry expanded
+/// with the host-resolved own tid (never guest-supplied), and `split_once` intercepts any
+/// `{tenant}`-bearing entry as a template — so the safety rests on the exact-match + host-forced tid,
+/// not on the container alphabet (`validate_key_segment` is key-safety, not the strict slug, so it does
+/// NOT screen out `{`/`}`).
 const TENANT_TEMPLATE: &str = "{tenant}";
 
 /// **The mint scope screen** (Security HIGH-1 / MEDIUM-1) — the ONE choke point that screens the
@@ -313,9 +317,11 @@ impl BlobUploadBinding {
     /// allowlist, HOST-EXPANDING any `{tenant}`-templated entry with THIS invocation's resolved OWN
     /// tenant BEFORE the match — so an entry only ever authorizes the guest's own tenant's container.
     ///
-    /// The guest's requested `container` never contains the `{tenant}` literal (`{`/`}` are screened
-    /// out of a concrete container by [`validate_resource_name`]); the token lives ONLY in an operator
-    /// `upload_containers` entry. For each entry:
+    /// A guest cannot exploit the `{tenant}` literal: matching is EXACT string equality against the
+    /// entry expanded with the host-resolved own tid (never guest-supplied), and `split_once` intercepts
+    /// any `{tenant}`-bearing entry as a template — so a guest passing literal `{tenant}` can only match
+    /// if its own signed tid were literally `{tenant}` (impossible). Safety rests on that, not on the
+    /// container alphabet (`validate_key_segment` is key-safety, not the strict slug). For each entry:
     ///
     /// * **Plain entry** (no `{tenant}`): exact match, exactly as before (non-breaking).
     /// * **`{tenant}` entry:** the host substitutes `resolved_tenant` for the token and compares the
