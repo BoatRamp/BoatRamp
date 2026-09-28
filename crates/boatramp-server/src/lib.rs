@@ -4524,8 +4524,8 @@ mod tests {
     /// **Gate — bind-verify fail-closed (CRUX), anti-hollow.** A message whose sealed `signed_context`
     /// tenant does NOT equal its concrete topic's `{tenant}` segment is QUARANTINED (dead-lettered,
     /// NOT delivered); an ABSENT sealed context on a templated topic ALSO quarantines. The MUTATION
-    /// seam (`BOATRAMP_TENANT_SEAL_MUTATE_SKIP_VERIFY`) skips the check ⇒ the mismatched message
-    /// DELIVERS ⇒ the assertion FAILS. Driving `dispatch_consumer_batch` directly with an
+    /// seam (a test-only thread-local, `with_tenant_seal_check_skipped` — no env var, no production path)
+    /// skips the check ⇒ the mismatched message DELIVERS ⇒ the assertion FAILS. Driving `dispatch_consumer_batch` directly with an
     /// `expected_tenant` isolates the crux (the exact call the scheduler makes per concrete topic).
     // Current-thread flavor (default): the mutation seam is a THREAD-LOCAL, so the whole test must
     // run on one thread for the neuter to be observed by the dispatch it wraps (a multi-thread runtime

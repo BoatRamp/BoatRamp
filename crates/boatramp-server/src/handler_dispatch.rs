@@ -2674,8 +2674,9 @@ fn resolve_sealed_tenant(
 /// would race across the parallel test harness — the flake this avoids). When set, a message whose
 /// sealed tenant does NOT match its concrete `{tenant}` topic segment is DELIVERED instead of
 /// quarantined; the gate asserts the clean lane quarantines and the mutated lane delivers — a
-/// two-sided property proving the check is load-bearing (mirrors the `blob-upload`
-/// `BOATRAMP_BLOB_TENANT_TEMPLATE_MUTATE_SKIP_HOST_FORCE` convention, race-free).
+/// two-sided property proving the check is load-bearing. Unlike the older env-var mutation seams
+/// elsewhere in the tree, this is a TEST-ONLY THREAD-LOCAL — there is NO env var and NO runtime
+/// path, so it is both race-free across the parallel harness and impossible to trip in production.
 #[cfg(all(feature = "handlers", not(test)))]
 fn tenant_seal_mutate_skip() -> bool {
     false
@@ -2804,11 +2805,15 @@ pub(super) async fn dispatch_consumer_batch(
         // non-templated topic passes `None` here — no bound tenant, no check (unchanged).
         if let Some(bound) = expected_tenant {
             let sealed = resolve_sealed_tenant(msg.signed_context.as_deref(), context_anchor);
-            // The mutation seam (anti-hollow gate): when the mutation env var is set the check is
-            // SKIPPED, so a mismatched message DELIVERS instead of quarantining — the gate asserts the
-            // clean build quarantines and the mutated build delivers, proving the check is load-bearing.
+            // The mutation seam (anti-hollow gate): a TEST-ONLY thread-local (see
+            // `tenant_seal_mutate_skip`) that, when set, SKIPS the check so a mismatched message
+            // DELIVERS instead of quarantining — the gate asserts the clean lane quarantines and the
+            // mutated lane delivers, proving the check is load-bearing. No env var, no production path.
             let skip_check = tenant_seal_mutate_skip();
-            let matches = sealed.as_deref() == Some(bound);
+            // Defense-in-depth: an empty bound can NEVER match (a `{tenant}` segment is provably
+            // non-empty today — the matcher rejects empty captures — so this only guards a future
+            // matcher refactor from letting `Some("") == Some("")` deliver cross-tenant).
+            let matches = !bound.is_empty() && sealed.as_deref() == Some(bound);
             if !skip_check && !matches {
                 // Fail-closed quarantine. `dead_letter` is TERMINAL (no redelivery). If the backend
                 // can't dead-letter (unsupported), STILL refuse to deliver (a plain nack redelivers
