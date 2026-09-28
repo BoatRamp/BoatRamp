@@ -286,11 +286,13 @@ pub(crate) mod keys {
     /// envelope-sealed value plus small clear metadata. The `tenant-secret/` infix is a
     /// DISTINCT keyspace from the project-scoped `secret/` (a `boatramp:` env ref) above,
     /// so the runtime tenant store and the project env store can never collide even for the
-    /// same `<name>`. Both the `<tenant>` and `<name>` segments are
-    /// [`validate_resource_name`](crate::project::validate_resource_name)/`validate_name`-screened
-    /// (fail-closed) by [`TenantSecretStore`](crate::secret_store::TenantSecretStore) BEFORE they
-    /// reach here, so neither can carry a `/` and reshape the key to a sibling tenant's — the guest
-    /// read and the control-plane write compose the SAME byte-identical segments.
+    /// same `<name>`. The `<tenant>` segment is
+    /// [`validate_key_segment`](crate::project::validate_key_segment)-screened and the `<name>`
+    /// segment `validate_name`-screened (both fail-closed) by
+    /// [`TenantSecretStore`](crate::secret_store::TenantSecretStore) BEFORE they reach here, so
+    /// neither can carry a `/` and reshape the key to a sibling tenant's — the guest read and the
+    /// control-plane write compose the SAME byte-identical segments. (The tenant uses key-safety,
+    /// not the strict slug, so an email/dotted signed `tid` is preserved.)
     pub fn tenant_secret(project: ProjectRef<'_>, tenant: &str, name: &str) -> String {
         format!("project/{project}/tenant-secret/{tenant}/{name}")
     }
