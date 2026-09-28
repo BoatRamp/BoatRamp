@@ -5,6 +5,36 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.7.1] - 2026-09-28
+
+Additive, non-breaking. Host-side only (no WIT/shim/guest-ABI change).
+
+### Added
+
+- **`{tenant}` template in queue-consumer subscription topics (per-tenant fan-in).** A consumer whose
+  subscription `topic` carries the `{tenant}` segment (e.g. `bus:sync/{tenant}/import`) now services **all**
+  the concrete per-tenant topics (`bus:sync/<tenant>/import`) from one static declaration. Previously the
+  work-queue dispatch matched the subscription topic as an **exact string**, so a `{tenant}` (or `+`)
+  segment matched nothing and the consumer — though active — silently never claimed (no error, no
+  dead-letter, no group). Now the scheduler enumerates the concrete ready topics that match the template
+  and dispatches **per concrete topic**, so per-tenant **group cursor, DLQ, lag, and `queue pause`/drain**
+  are preserved (each tenant independent). `{tenant}` matches exactly one segment (never crosses `/`); a
+  non-template topic keeps its exact-match fast path unchanged. Publishing is unchanged (producers still
+  emit concrete topics). Reuses boatramp's existing host-resolved `{tenant}` convention (as in
+  `stats_topics` / `upload_containers`) — not a new wildcard syntax.
+- **Bind-and-verify against the sealed tenant (security win over a blind wildcard).** For a `{tenant}`
+  match, the host verifies the concrete topic's `{tenant}` segment **equals** the message's
+  cryptographically-sealed `signed_context` tenant (same `verify_context` the tenancy source uses — a
+  signature + expiry + kind check, not a parse). A mismatch — or an absent/unverifiable seal — is
+  **quarantined fail-closed** (dead-lettered into that concrete topic's DLQ, never delivered, never
+  plain-retried). A message sealed for tenant A can never run off `sync/B/import`. The topic segment only
+  *selects* which sealed value must match; the seal remains the sole tenancy authority.
+
+- **Orphaned-work signal (surface a silently-stuck backlog).** A topic that accrues claimable work with
+  **no** consumer subscription covering it (exact or `{tenant}`-match) now raises a `warn` log, an
+  `orphaned_ready_topic{topic}` metric, and an `orphaned` count in `stats` — so a declared-but-unroutable
+  consumer (or a typo'd topic) can no longer fail silently.
+
 ## [0.7.0] - 2026-09-28
 
 BREAKING. Resource names (project / site / database / function / compute / workflow) are now
