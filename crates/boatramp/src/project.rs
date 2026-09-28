@@ -253,12 +253,12 @@ fn plan_is_inert(plan: &serde_json::Value) -> bool {
     let empty_arr = |k: &str| {
         plan.get(k)
             .and_then(|v| v.as_array())
-            .is_none_or(|a| a.is_empty())
+            .is_none_or(Vec::is_empty)
     };
     let compute_empty = plan
         .get("compute")
         .and_then(|v| v.as_array())
-        .is_none_or(|a| a.is_empty());
+        .is_none_or(Vec::is_empty);
     let safelist_empty = plan
         .get("safelist")
         .and_then(serde_json::Value::as_u64)
