@@ -272,6 +272,19 @@ pub fn router_with_fast(
         // `/api/blobs/` Blobs·Deploy matcher) AND re-checked defense-in-depth in the handler. The body
         // names no source/dest — the daemon drains only its own configured pair.
         .route("/api/blob-drain", post(blob_drain_handler))
+        // General blob purge (v0.6.4): reclaim a PROVABLY-SAFE object set — `unreferenced` GC (blobs
+        // no live manifest points at; refused 409 while a read-fallback secondary is attached) or the
+        // `drained_source` decommission (delete a migration-source key ONLY once it is byte-confirmed
+        // in the primary; 422 with no fallback). Dry-run by default; a NODE-level destructive op like
+        // prune/scrub/drain, so gated at `system·admin` in `authz::Right::required` (the SINGULAR
+        // hyphen path can't collide with the `/api/blobs/` Blobs·Deploy matcher) AND re-checked
+        // defense-in-depth in the handler.
+        .route("/api/blob-purge", post(blob_purge_handler))
+        // Structured blob transition-mode state (v0.6.4): whether a read-fallback secondary is
+        // attached (the node is mid-migration). A READ-only node status, gated `system·read` in
+        // `authz::Right::required` (the same grade as `/api/sites`/`/api/metrics`); the hyphen path
+        // again avoids the `/api/blobs/` matcher.
+        .route("/api/blob-status", get(blob_status_handler))
         .route("/api/certs", get(cert_status))
         .route("/api/cache/invalidate", post(invalidate_cache))
         .route(

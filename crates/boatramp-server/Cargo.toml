@@ -362,8 +362,9 @@ rand_core = { version = "0.6", features = ["getrandom"] }
 # (already in the tree via `boatramp-core[authz]`). Deterministic key, no keygen rng.
 ed25519-dalek = { version = "2" }
 # The SQL backend (libsql), for the handler `sql` e2e conformance test (gated
-# on the `handlers` feature).
-boatramp-storage = { workspace = true, features = ["sql"] }
+# on the `handlers` feature); `fs` + `fallback` for the v0.6.4 `blob_purge` route tests
+# (a real `FallbackStorage(primary=fs, secondary=fs)` behind a real `DeployStore`).
+boatramp-storage = { workspace = true, features = ["sql", "fs", "fallback"] }
 tower = { version = "0.5", features = ["util"] }
 hex.workspace = true
 sha2.workspace = true

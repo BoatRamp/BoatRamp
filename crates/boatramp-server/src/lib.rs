@@ -68,6 +68,12 @@ mod auth;
 /// streaming NDJSON progress. Backs `boatramp blob drain --server <url>`.
 mod blob_drain;
 pub(crate) use blob_drain::blob_drain as blob_drain_handler;
+/// The general blob purge (`POST /api/blob-purge`, System·Admin, v0.6.4) + structured blob
+/// transition status (`GET /api/blob-status`, System·Read): a PROVABLY-SAFE-only reclaim
+/// (unreferenced GC front door, or the drained-secondary decommission) and a way to query the
+/// mid-migration state structurally instead of grepping a startup WARNING.
+mod blob_purge;
+pub(crate) use blob_purge::{blob_purge as blob_purge_handler, blob_status as blob_status_handler};
 /// The server-side minter backing the guest `blob-upload` capability (S3 external ingress): mints the
 /// fleet-signed session token, derives the secret, and shapes the presigned-put | temp-credentials
 /// variant.

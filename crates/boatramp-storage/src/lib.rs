@@ -75,6 +75,15 @@ pub mod fallback;
 /// [`blob_migrate::MigrateProgress`] via [`blob_migrate::MigrateOptions::on_progress`].
 pub mod blob_migrate;
 
+/// The backend-agnostic **drained-source purge** engine (v0.6.4): reclaim the OLD read-only
+/// secondary of a blob-backend migration by deleting each source key ONLY once it is provably
+/// duplicated (present at matching size) in the NEW primary — the decommission half of the
+/// migration. Backs the `DrainedSource` mode of `POST /api/blob-purge` (the `Unreferenced` mode
+/// runs [`DeployStore::collect_garbage`](boatramp_core::deploy)). Its safety decision is a single
+/// pure predicate ([`blob_purge::drained_source_deletable`]) so the gate rests on the test-runner
+/// exit code, not a println marker.
+pub mod blob_purge;
+
 #[cfg(feature = "fs")]
 pub use fs::FsStorage;
 

@@ -55,6 +55,10 @@ pub enum Error {
     /// printed the detail; this maps to a non-zero exit.
     #[error("blob drain did not complete — see the drain report above (re-run to resume)")]
     DrainIncomplete,
+    /// The blob purge reported a storage error (the streamed report already printed the detail);
+    /// maps to a non-zero exit.
+    #[error("blob purge did not complete — see the purge report above (re-run to resume)")]
+    PurgeIncomplete,
     /// Serializing the `--json` migration report failed.
     #[error(transparent)]
     Json(#[from] serde_json::Error),
@@ -136,6 +140,61 @@ enum BlobCommand {
     ///
     /// For OFFLINE / pre-boot / volume-local copies between arbitrary backends, use `boatramp blob migrate`.
     Drain(DrainArgs),
+    /// **Purge a PROVABLY-SAFE blob set** over the control plane (v0.6.4). Dry-run by default (report
+    /// only); pass `--apply` to actually delete. Exactly ONE mode is required:
+    ///
+    /// `--unreferenced` — on-demand garbage collection: reclaim content-addressed blobs that no live
+    /// deploy manifest references (nothing serving can break). This is the everyday reclaim front
+    /// door. It is REFUSED (409) while a read-fallback secondary is attached (`[serve.blob_fallback]`),
+    /// because GC would phantom-reclaim a secondary-only orphan — drain + drop the fallback first.
+    ///
+    /// `--drained-source` — the migration DECOMMISSION: after `blob drain` (or `blob migrate`) has
+    /// copied the OLD secondary into the primary, delete each source key ONLY once it is byte-confirmed
+    /// (present at matching size) in the primary. Fail-closed: an unconfirmed key SURVIVES. Requires a
+    /// configured `[serve.blob_fallback]` (else 422); runs while the fallback is still attached, then
+    /// you drop it.
+    Purge(PurgeArgs),
+    /// Print the node's structured blob transition-mode state (v0.6.4): whether a read-fallback
+    /// secondary is currently attached (the node is mid-migration). The direct, structured answer to
+    /// "is this node still in TRANSITION mode?" — no log-grepping. Read-only (System·Read).
+    Status(StatusArgs),
+}
+
+/// Arguments for `boatramp blob purge`. Exactly one of `--unreferenced` / `--drained-source` is
+/// required (a clap `ArgGroup`); dry-run unless `--apply`.
+#[derive(Debug, clap::Args)]
+#[command(group(
+    clap::ArgGroup::new("purge_mode")
+        .required(true)
+        .args(["unreferenced", "drained_source"]),
+))]
+pub struct PurgeArgs {
+    /// Reclaim content-addressed blobs no live manifest references (on-demand GC). Refused (409)
+    /// while a read-fallback secondary is attached.
+    #[arg(long)]
+    unreferenced: bool,
+    /// Reclaim the drained OLD secondary: delete each source key only once byte-confirmed in the
+    /// primary (fail-closed). Requires a configured `[serve.blob_fallback]`.
+    #[arg(long)]
+    drained_source: bool,
+    /// Actually delete (default: dry-run — report what WOULD be reclaimed, delete nothing).
+    #[arg(long)]
+    apply: bool,
+    /// Restrict a `--drained-source` purge to source keys under this prefix (default: all objects).
+    /// Ignored by `--unreferenced` (which GCs the whole content-addressed keyspace).
+    #[arg(long)]
+    prefix: Option<String>,
+    /// Emit the final report as JSON instead of a human summary (progress lines stay on stderr).
+    #[arg(long)]
+    json: bool,
+}
+
+/// Arguments for `boatramp blob status`.
+#[derive(Debug, clap::Args)]
+pub struct StatusArgs {
+    /// Emit the status as JSON instead of a human line.
+    #[arg(long)]
+    json: bool,
 }
 
 /// Arguments for `boatramp blob drain`.
@@ -276,6 +335,9 @@ pub async fn run(args: BlobArgs, config: &ProjectConfig) -> Result<()> {
         // Unlike `migrate` (offline, handled above), `drain` is a control-plane client: it triggers
         // the RUNNING daemon to drain its OWN configured fallback → primary and relays the stream.
         BlobCommand::Drain(a) => drain(&cp, a).await?,
+        // General provably-safe purge + structured transition status (v0.6.4), both control-plane clients.
+        BlobCommand::Purge(a) => purge(&cp, a).await?,
+        BlobCommand::Status(a) => status(&cp, a).await?,
         // Handled node-locally above (returned before the control-plane client was built).
         BlobCommand::Migrate(_) => unreachable!("handled before the control-plane client"),
     }
@@ -313,6 +375,68 @@ async fn drain(cp: &client::ControlPlane, a: DrainArgs) -> Result<()> {
     // Non-zero exit on a verify-failure or a reported storage error (the drain did NOT complete).
     if verify_failed || errored {
         return Err(Error::DrainIncomplete);
+    }
+    Ok(())
+}
+
+/// Run a general provably-safe blob purge (`boatramp blob purge`, v0.6.4): POST `/api/blob-purge` in
+/// the selected mode, consume the NDJSON stream (progress to stderr, the final report to stdout — or
+/// `--json`), and exit non-zero on a refusal/storage error. Dry-run unless `--apply`.
+async fn purge(cp: &client::ControlPlane, a: PurgeArgs) -> Result<()> {
+    // The clap `ArgGroup` already guarantees exactly one mode is set (required + mutually exclusive),
+    // but map it explicitly so the wire value is unambiguous.
+    let mode = if a.unreferenced {
+        "unreferenced"
+    } else {
+        // The group is `required`, so `drained_source` is set when `unreferenced` is not.
+        "drained_source"
+    };
+
+    let final_report = cp.blob_purge(mode, a.apply, a.prefix.as_deref()).await?;
+
+    // A storage error in the final report means the purge did NOT complete (non-zero exit). A 409
+    // (unreferenced refused while a fallback is attached) or a 422 (no fallback for drained-source)
+    // surfaced earlier as `ClientError::Refused` from `blob_purge`.
+    let errored = final_report.get("error").is_some();
+
+    if a.json {
+        println!("{}", serde_json::to_string_pretty(&final_report)?);
+    } else {
+        let message = final_report
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("(no message)");
+        println!("blob purge: {message}");
+    }
+
+    if errored {
+        return Err(Error::PurgeIncomplete);
+    }
+    Ok(())
+}
+
+/// Print the node's structured blob transition-mode state (`boatramp blob status`, v0.6.4): GET
+/// `/api/blob-status` and report whether a read-fallback secondary is attached (mid-migration).
+async fn status(cp: &client::ControlPlane, a: StatusArgs) -> Result<()> {
+    let state = cp.blob_status().await?;
+    if a.json {
+        println!("{}", serde_json::to_string_pretty(&state)?);
+    } else {
+        let active = state
+            .get("blob_fallback_active")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        if active {
+            println!(
+                "blob status: a read-fallback secondary is ATTACHED ([serve.blob_fallback]) — the \
+                 node is mid-migration (TRANSITION mode). Drain it (blob drain / blob purge \
+                 --drained-source), drop [serve.blob_fallback], and restart to finish."
+            );
+        } else {
+            println!(
+                "blob status: no read-fallback secondary attached — the node is not mid-migration."
+            );
+        }
     }
     Ok(())
 }

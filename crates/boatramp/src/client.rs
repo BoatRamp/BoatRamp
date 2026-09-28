@@ -385,6 +385,74 @@ fn print_drain_progress(v: &serde_json::Value) {
     );
 }
 
+/// Print one drained-source blob-purge progress snapshot to stderr (a `"type":"progress"` NDJSON
+/// line). Same stderr-only discipline as [`print_drain_progress`] so `--json` stdout stays parseable.
+fn print_purge_progress(v: &serde_json::Value) {
+    let n = |k: &str| {
+        v.get(k)
+            .and_then(serde_json::Value::as_u64)
+            .map(|x| x.to_string())
+            .unwrap_or_else(|| "?".to_string())
+    };
+    let dry = v
+        .get("dry_run")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    eprintln!(
+        "blob purge{}: {} / {} object(s) — purged {}, kept-unconfirmed {}, {} byte(s)",
+        if dry { " (dry-run)" } else { "" },
+        n("done"),
+        n("total"),
+        n("purged"),
+        n("skipped_unconfirmed"),
+        n("purged_bytes"),
+    );
+}
+
+/// Consume an **NDJSON** control-plane stream (the daemon-mediated blob drain + purge share this):
+/// accumulate raw bytes, split on `\n`, parse each complete line, print each `"type":"progress"`
+/// snapshot to stderr via `on_progress` (keeping stdout clean for the report), and return the LAST
+/// `"type":"report"` object. `op` names the operation for the "no final report" error. A well-behaved
+/// daemon always ends with a report line; a stream that closed without one is surfaced as an error
+/// rather than a false success.
+async fn consume_ndjson_report(
+    resp: reqwest::Response,
+    op: &str,
+    on_progress: fn(&serde_json::Value),
+) -> Result<serde_json::Value> {
+    use futures::StreamExt;
+    let mut stream = resp.bytes_stream();
+    let mut buf: Vec<u8> = Vec::new();
+    let mut last_report: Option<serde_json::Value> = None;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        buf.extend_from_slice(&chunk);
+        // Drain every complete `\n`-terminated line out of the buffer.
+        while let Some(nl) = buf.iter().position(|&b| b == b'\n') {
+            let line: Vec<u8> = buf.drain(..=nl).collect();
+            let text = String::from_utf8_lossy(&line);
+            let text = text.trim();
+            if text.is_empty() {
+                continue;
+            }
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
+                // A malformed line is non-fatal — skip it (the daemon only emits valid JSON lines).
+                continue;
+            };
+            match value.get("type").and_then(serde_json::Value::as_str) {
+                Some("report") => last_report = Some(value),
+                // A progress snapshot — show liveness on stderr, keep stdout clean for the report.
+                _ => on_progress(&value),
+            }
+        }
+    }
+    last_report.ok_or_else(|| {
+        ClientError::Refused(format!(
+            "{op} stream ended without a final report (connection cut? re-run to resume)"
+        ))
+    })
+}
+
 /// The control plane's reply to a deployment negotiation (`POST …/deployments`):
 /// the new deployment id and the blob hashes it is still missing (the ones the
 /// client must upload). Shared by `sync` and `apply`.
@@ -1755,7 +1823,6 @@ impl ControlPlane {
         concurrency: Option<usize>,
         prefix: Option<&str>,
     ) -> Result<serde_json::Value> {
-        use futures::StreamExt;
         let Self {
             http, base: server, ..
         } = self;
@@ -1780,41 +1847,66 @@ impl ControlPlane {
             )));
         }
 
-        // Consume the NDJSON stream: accumulate raw bytes, split on `\n`, parse each complete line.
-        // Progress lines print to stderr; the LAST parsed object is the final report (returned).
-        let mut stream = resp.bytes_stream();
-        let mut buf: Vec<u8> = Vec::new();
-        let mut last_report: Option<serde_json::Value> = None;
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
-            buf.extend_from_slice(&chunk);
-            // Drain every complete `\n`-terminated line out of the buffer.
-            while let Some(nl) = buf.iter().position(|&b| b == b'\n') {
-                let line: Vec<u8> = buf.drain(..=nl).collect();
-                let text = String::from_utf8_lossy(&line);
-                let text = text.trim();
-                if text.is_empty() {
-                    continue;
-                }
-                let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
-                    // A malformed line is non-fatal — skip it (the daemon only emits valid JSON lines).
-                    continue;
-                };
-                match value.get("type").and_then(serde_json::Value::as_str) {
-                    Some("report") => last_report = Some(value),
-                    // A progress snapshot — show liveness on stderr, keep stdout clean for the report.
-                    _ => print_drain_progress(&value),
-                }
-            }
+        // Consume the NDJSON stream (progress → stderr, final report → returned). Shared with
+        // `blob_purge` via `consume_ndjson_report`.
+        consume_ndjson_report(resp, "blob drain", print_drain_progress).await
+    }
+
+    /// Run a general provably-safe blob purge (`POST /api/blob-purge`, `System·Admin`, v0.6.4): the
+    /// running daemon reclaims a PROVABLY-SAFE object set — `unreferenced` (GC of blobs no live
+    /// manifest points at) or `drained_source` (delete a migration-source key only once byte-confirmed
+    /// in the primary). Dry-run unless `apply`; `prefix` scopes a `drained_source` purge. Consumes the
+    /// streamed **NDJSON** response (reusing the drain's [`consume_ndjson_report`] consumer): progress
+    /// lines print to stderr, the FINAL `"type":"report"` object is returned. A **409** (an
+    /// `unreferenced` purge refused while a read-fallback secondary is attached), a **422** (no
+    /// fallback for `drained_source`), or any other non-2xx is surfaced verbatim as
+    /// [`ClientError::Refused`]; the caller decides the exit code from the returned report's fields.
+    pub async fn blob_purge(
+        &self,
+        mode: &str,
+        apply: bool,
+        prefix: Option<&str>,
+    ) -> Result<serde_json::Value> {
+        let Self {
+            http, base: server, ..
+        } = self;
+        let body = serde_json::json!({
+            "mode": mode,
+            "apply": apply,
+            "prefix": prefix,
+        });
+        let resp = http
+            .post(format!("{server}/api/blob-purge"))
+            .json(&body)
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            // 409 = unreferenced refused (a fallback is attached); 422 = no fallback for
+            // drained-source; any other non-2xx = refused/error. The body is a small JSON error
+            // object (or text) — surface it verbatim.
+            let text = resp.text().await.unwrap_or_default();
+            return Err(ClientError::Refused(format!(
+                "blob purge refused ({status}): {}",
+                text.trim()
+            )));
         }
-        // A well-behaved daemon always ends with a report line; if the stream closed without one,
-        // surface it rather than pretending success.
-        last_report.ok_or_else(|| {
-            ClientError::Refused(
-                "blob drain stream ended without a final report (connection cut? re-run to resume)"
-                    .to_string(),
-            )
-        })
+        consume_ndjson_report(resp, "blob purge", print_purge_progress).await
+    }
+
+    /// Fetch the node's structured blob transition-mode state (`GET /api/blob-status`, `System·Read`,
+    /// v0.6.4): `{ "blob_fallback_active": <bool> }` — whether a read-fallback secondary is attached
+    /// (the node is mid-migration). Returns the parsed JSON object.
+    pub async fn blob_status(&self) -> Result<serde_json::Value> {
+        let Self {
+            http, base: server, ..
+        } = self;
+        let resp = http
+            .get(format!("{server}/api/blob-status"))
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(resp.json::<serde_json::Value>().await?)
     }
 
     /// Hash a local file and upload it as a blob; returns its content-address.
