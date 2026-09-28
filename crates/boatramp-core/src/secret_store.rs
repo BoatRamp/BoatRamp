@@ -456,15 +456,19 @@ impl TenantSecretStore {
     }
 }
 
-/// Validate a `tenant` used as a KV key segment in the [`TenantSecretStore`]. Runs the v0.5.0
-/// canonical [`validate_resource_name`](crate::project::validate_resource_name) (rejects
-/// empty/`/`/`\`/`..`/`.`/`*`/whitespace/control/>63B), so the host-resolved tenant (guest read)
-/// and the `{tenant}` URL-path segment (control-plane write) canonicalize IDENTICALLY and neither
-/// can carry a separator that reshapes the key to a sibling tenant's. Fail-closed — a numeric
-/// tenant id round-trips, a `/`-bearing one is refused before any store access. Mapped to the
-/// client-safe [`SecretError::InvalidTenant`].
+/// Validate a `tenant` used as a KV key segment in the [`TenantSecretStore`]. Runs the
+/// **key-safety** rule [`validate_key_segment`](crate::project::validate_key_segment)
+/// (rejects empty/`/`/`\`/`..`/`.`/`*`/whitespace/control/>63B) — NOT the strict single-label
+/// slug of [`validate_resource_name`]. The `tenant` here is a **data-plane** value: the
+/// host-resolved `ScopeAxis::Tenant` from a signed `tid` claim, routinely an email
+/// (`user@acme.com`) or a dotted domain (`acme.corp`). It must be key-safe (no separator can
+/// reshape the key to a sibling tenant's), but must NOT be forced through the operator-
+/// identifier slug — that would silently break sealed-secret access for every email/dotted
+/// tenant. The guest-read tenant and the `{tenant}` URL-path segment canonicalize identically
+/// under this rule. Fail-closed — a `/`-bearing one is refused before any store access. Mapped
+/// to the client-safe [`SecretError::InvalidTenant`].
 fn validate_tenant(tenant: &str) -> Result<(), SecretError> {
-    crate::project::validate_resource_name("tenant", tenant)
+    crate::project::validate_key_segment("tenant", tenant)
         .map_err(|e| SecretError::InvalidTenant(e.to_string()))
 }
 
