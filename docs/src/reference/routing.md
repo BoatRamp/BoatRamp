@@ -205,6 +205,7 @@ Matched after redirects, before static lookup. See
 | `limits` | HandlerLimits | — | Optional resource caps, intersected with the site caps at activation. |
 | `env` | map\<string, string\> | `{}` | Static environment variables. **Never secrets** — a credential-shaped value is rejected at validate; use `[handlers].secrets` in `boatramp.cfg` for those. |
 | `invoke_targets` | list\<string\> | `[]` | Function names this handler may call via the `invoke` import — see [invoke_targets](#invoke_targets). |
+| `upload_containers` | list\<string\> | `[]` | Blob containers this handler may mint an S3 upload credential for via a [`blob-upload`](#imports) import — see [upload_containers](#upload_containers). Deny-by-default (empty ⇒ mint nothing). |
 | `tenancy` | Tenancy? | `None` (inherit site) | Per-handler in-site [tenancy decision](./siteconfig.md#handlerstenancy) for this route, overriding the site-level ceiling. Absent ⇒ inherit the site decision. When present it must **narrow within** the site ceiling — a widening is refused fail-closed at bind. Same canonical RON shape as the site's, e.g. `(mode: "scoped", column: "tenant_id", sources: [(kind: "token", claim: "tid")], read: "own", write: "own")`. A `scoped` tenancy may add `exceed_site_ceiling: true` to deliberately **exceed** the ceiling (an authorized [inline exception](../how-to/tenant-isolation.md#an-unscoped-all-route-under-an-own-site-authorized-exception)) — takes effect only when the site sets [`allow_ceiling_exceptions`](./siteconfig.md#handlersallow_ceiling_exceptions) and (for `all`) the operator posture permits cross-tenant; otherwise the deploy is refused with a message naming the route. |
 | `token_claims` | HandlerGraphqlTokenClaims? | `None` (inherit) | Per-handler JWKS/issuer config verifying the app bearer for a `token` tenant source, overriding the site's `[handlers.graphql.data].claims_from_token`. Only consulted when this handler's (or the inherited) `tenancy` names a `token` source. Fields: `issuer`, `jwks_env`/`jwks_url`, optional `audience`. |
 
@@ -219,6 +220,7 @@ rejected at validate.
 | `graphql` | Run a GraphQL operation against the project's supergraph (`graphql::run`), propagating the caller's resolved principal to sub-fetches. |
 | `email` | Send mail through a per-project SMTP profile (`boatramp:handlers/email`). Gated by the `allow_guest_email` posture knob — off under `multi-tenant`. |
 | `capability` | Mint fleet-signed target-capability tokens (`boatramp:handlers/capability`). Gated by the `allow_guest_mint_capability` posture knob — off under `multi-tenant`. |
+| `blob-upload:write` / `blob-upload:multipart` | Mint a scoped S3 upload credential (`boatramp:handlers/blob-upload`) so a client uploads a blob directly, outside the sandbox. Gated by the per-handler [`upload_containers`](#upload_containers) allowlist (empty ⇒ deny-all); the project + site are host-forced from the resolved invocation scope. `:write` mints a single-object presigned PUT / temp credential; `:multipart` additionally permits multipart uploads. A bare `blob-upload` or `blob-upload:*` wildcard is rejected. See [S3-compatible blob ingress](../how-to/blob-ingress.md). |
 | `wasi:http` | Outbound HTTP. |
 | `wasi:keyvalue` | Per-site KV store. |
 | `wasi:blobstore` | Per-site blob store. |
@@ -246,6 +248,32 @@ list means the handler cannot invoke anything even with the import.
 handlers: [ (route: "/api", component: "api.wasm", imports: ["invoke"], invoke_targets: ["resize", "img-*"]) ],
 ```
 
+### `upload_containers`
+
+The deny-by-default allowlist of blob containers this handler may mint an S3
+upload credential for through a [`blob-upload:write` / `blob-upload:multipart`](#imports)
+import (empty ⇒ deny-all — a handler that declares the import but names no
+container can mint nothing). Only consulted when `imports` contains a
+`blob-upload:*` right the site also permits.
+
+An entry may carry the literal token **`{tenant}`** (e.g. `"assets-{tenant}"`).
+Before minting, the **host** substitutes **this invocation's own resolved tenant**
+(the same `ScopeAxis::Tenant` fact the SQL scope injector uses — never
+guest-supplied) into `{tenant}`, **before** the allowlist match and the scope
+stamp. This authorizes an unbounded **per-tenant container family**
+(`assets-<tid>`, one per tenant) that a static exact list could never enumerate,
+while keeping a cross-tenant mint **structurally impossible**: the entry only ever
+expands to the guest's own tenant, so a guest asking for `assets-<other-tid>` fails
+the allowlist. An `all` / anonymous / target / unscoped invocation has no resolved
+tenant, so a `{tenant}` entry there **fails closed** (`no-resolved-tenant`). An
+entry without `{tenant}` keeps plain exact-match (additive, non-breaking).
+
+```ron
+handlers: [ (route: "/upload", component: "up.wasm", imports: ["blob-upload:write"], upload_containers: ["assets-{tenant}"]) ],
+```
+
+See [S3-compatible blob ingress](../how-to/blob-ingress.md).
+
 ### `limits` (HandlerLimits)
 
 | Field | Type | Description |
@@ -271,6 +299,7 @@ A component invoked once per message on a topic. See
 | `topic` | string | Topic to subscribe to. A `bus:<topic>` prefix subscribes to the shared, project-scoped bus (so producers and consumers in different components meet on one topic); a plain topic is site-private. |
 | `component` | string | Path to the component `.wasm`. |
 | `imports` | list\<string\> | Requested capabilities. |
+| `upload_containers` | list\<string\> | Blob containers this consumer may mint an S3 upload credential for via a [`blob-upload`](#imports) import — same deny-by-default allowlist and host-forced [`{tenant}` template](#upload_containers) as a handler's. |
 | `group` | string | Consumer group. Empty (default) = the competing-consumer **work-queue** (one consumer handles each message); a non-empty name = a durable **fan-out** subscriber that receives *every* message on its own cursor, independent of other groups. |
 | `start` | `latest` \| `earliest` | Where a non-empty `group` starts on first subscription: `latest` (default — only new events) or `earliest` (replay the retained backlog). Ignored for the work-queue. |
 | `tenancy` | Tenancy? | In-site [tenancy decision](./siteconfig.md#handlerstenancy) for this consumer's `sql`/`orm` when a drained message is processed — the async-lane analog of a function's tenancy. Typically resolves from the `signed_context` source the producer stamped, e.g. `(mode: "scoped", column: "tenant_id", sources: [(kind: "signed_context")], read: "own", write: "own")`. Absent ⇒ *undeclared* (refused under `multi-tenant`, `disabled` under single-tenant/dev). |

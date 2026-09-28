@@ -119,6 +119,11 @@ site's KV store. See [Cache handler responses](../how-to/caching.md#cache-handle
 GraphQL edge features. Off unless present + `enabled`. See
 [Serve a GraphQL API](../how-to/graphql.md).
 
+> **Renamed in v0.6.0 (breaking).** The old `safelist: bool` toggle is now
+> **`enforce_safelist: bool`** — the *enforcement* switch, made distinct from the
+> new declarative *source* of operations (`safelisted_ops` / `safelisted_ops_path`).
+> Rename the field in any site config that set the old `safelist:`.
+
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `enabled` | bool | `false` | Master switch for the GraphQL edge. |
@@ -126,9 +131,9 @@ GraphQL edge features. Off unless present + `enabled`. See
 | `max_complexity` | u32? | server default | Largest allowed total field count (schema-free cost proxy). |
 | `introspection` | bool? | posture default | Allow schema-introspection queries (off under the multi-tenant posture). |
 | `persisted_queries` | bool | `false` | Resolve a query hash to the stored query (bandwidth + parse saving). |
-| `enforce_safelist` | bool | `false` | Only pre-registered query hashes run (a query allowlist); implies and is stronger than `persisted_queries`. (Renamed from `safelist` in v0.6.0.) |
-| `safelisted_ops` | [String] | `[]` | Declarative source of persisted operations, **inline**: operation texts registered in the project's safelist at `apply` time (register-only union — applying never prunes). Mutually exclusive with `safelisted_ops_path`. |
-| `safelisted_ops_path` | path? | `None` | Declarative source of persisted operations, **from a file** (resolved client-side, relative to the manifest dir; only operation text crosses the wire). Mutually exclusive with `safelisted_ops`. |
+| `enforce_safelist` | bool | `false` | **Enforcement** switch: only pre-registered operations run (a deny-by-default query allowlist); the edge never registers a new query. Implies and is stronger than `persisted_queries`. **Renamed from `safelist` in v0.6.0** (breaking). |
+| `safelisted_ops` | [String] | `[]` | Declarative **source** of persisted operations, **inline**: operation texts registered in the project's safelist at `apply` time via the control-plane safelist endpoint (server-side `guard_query` validation — never a direct KV write). **Register-only (union)** — applying only ever ADDS; removal stays the explicit `boatramp graphql safelist rm`. Mutually exclusive with `safelisted_ops_path`. Authoring-only (not stored in the site config). |
+| `safelisted_ops_path` | path? | `None` | Declarative **source** of persisted operations, **from a file** (resolved client-side, relative to the manifest dir; only operation *text* crosses the wire, never the path). Same register-only union semantics as `safelisted_ops`. Mutually exclusive with it. |
 | `federated` | bool | `false` | This site is a supergraph **gateway**: plan a query against the project's registered subgraphs and dispatch fetches to them. |
 | `graphiql` | bool | `false` | Serve the in-browser GraphiQL explorer to a browser `GET`. |
 | `data` | HandlerGraphqlDataConfig? | `None` | Declarative [data connector](../how-to/graphql.md#graphql-from-your-database-no-resolver-code): generate the API from a managed database (queries compiled to SQL). Deny-by-default exposure; a `claims_from_token` block can bind a claim from a verified application bearer for multi-tenant row isolation. |

@@ -62,8 +62,9 @@ flags unique to each command:
 | [`auth`](#boatramp-auth) | Generate/inspect the root key; edit the RBAC policy. |
 | [`gateway`](#boatramp-gateway) | Publish a private service through the reverse-proxy gateway. |
 | [`compute`](#boatramp-compute) | Manage microVM compute workloads. |
-| [`blob`](#boatramp-blob) | Upload a file as a content-addressed blob. |
-| [`config`](#boatramp-config) | Read/change the dynamic daemon config (no restart). |
+| [`db`](#boatramp-db) | Inspect the project's declarative managed databases (read-only). |
+| [`blob`](#boatramp-blob) | Upload artifacts, and migrate/drain/purge the node blob backend. |
+| [`config`](#boatramp-config) | Read/change the dynamic daemon config (no restart); migrate an `apply` manifest. |
 | [`mcp`](#boatramp-mcp) | Run the Model Context Protocol server (drive boatramp from an AI agent). |
 | [`dns`](#boatramp-dns) | Configure DNS and issue wildcard preview certs (`acme-dns` feature). |
 | [`logs`](#boatramp-logs) | Tail a site's captured guest stdout/stderr. |
@@ -84,6 +85,11 @@ Exit status is `0` on success and non-zero on failure; see
 Run the server: selects backends, TLS, auth, and (with the `cluster` feature)
 cluster mode. The `cluster:` and `compute:` sections are configured in
 [`boatramp.cfg`](./boatramp-cfg.md), not on the command line.
+
+The config file (`--config <path>`, default `boatramp.cfg`) is RON or JSON —
+auto-detected by extension; pass `--format <ron|json>` to override (e.g. a
+Nickel-generated config on a non-`.json` path). See
+[Author configs in RON or JSON](../how-to/config-formats.md).
 
 ### Address, storage, cache
 
@@ -186,7 +192,8 @@ and imperative (CLI/API) management coexist. See
 
 | Flag | Default | Description |
 | --- | --- | --- |
-| `-f`, `--file <path>` | `apply.cfg` | The project manifest (RON). |
+| `-f`, `--file <path>` | `apply.cfg` | The project manifest (RON or JSON — auto-detected by extension). |
+| `--format <ron\|json>` | auto | Manifest format. Auto-detected from the extension (`.json` ⇒ JSON, else RON); set explicitly when piping Nickel/JSON to a non-`.json` path. See [Author configs in RON or JSON](../how-to/config-formats.md). |
 | `--server <url>` | — | Server base URL (overrides `[publish].server`; env `BOATRAMP_SERVER`). |
 | `--dry-run` | — | Print the plan (what would be built/deployed/activated) and mutate nothing. |
 | `--build` | — | Run each site's configured build command before publishing it. |
@@ -211,6 +218,16 @@ store unless started with [`--auto-migrate`](#boatramp-serve). See
 | `--finalize` | — | Delete the old-layout keys left by an earlier `--stage`, completing the migration. |
 
 A plain `boatramp migrate` (no `--stage`) copies and finalizes in one shot.
+
+> **Three unrelated `migrate` verbs.** Don't confuse them:
+> - **`boatramp migrate`** (this top-level command) — the one-time pre-0.2.0
+>   control-plane store re-key to the project-scoped layout.
+> - **[`boatramp blob migrate`](#boatramp-blob)** — an offline, node-local copy of the
+>   whole blob backend from one storage config to another (fs→cloud, region→region).
+> - **[`boatramp config migrate`](#boatramp-config)** — a client-side upgrade of an
+>   `apply` manifest to the current schema `version`.
+>
+> They share only the word "migrate"; each help text cross-disambiguates.
 
 ## `boatramp sync`
 
@@ -409,7 +426,7 @@ holds only sealed bytes — the API never returns a value.
 
 Manage a project's SMTP delivery profiles (a guest's `email` capability selects
 one by name). Needs the `email` feature. Passwords stay sealed — never returned.
-See [Send email from a function](../how-to/email.md).
+See [Send email from a function](../how-to/send-email.md).
 
 | Sub-action | Description |
 | --- | --- |
@@ -580,15 +597,125 @@ fetches the blob and boots it. Supply a Firecracker-compatible `vmlinux` (build
 one, or use a released microVM kernel) and provision it once, shared across
 workloads. See [Run a container or microVM](../how-to/compute.md).
 
-## `boatramp blob`
+## `boatramp db`
 
-Upload a file as a content-addressed blob — the general way to provision an
-artifact (a microVM kernel, a prebuilt rootfs) that another command references by
-hash.
+**Read-only** inspection of a project's **managed databases**. A managed database is
+declared in the `databases:` block of an [`apply`](#boatramp-apply) manifest — boatramp
+then provisions it, mints and seals its credential, and follows the workload across
+restarts. There is deliberately **no `db create`**: the manifest is the sole authoring
+surface (a create verb would compete as a second source of truth), so this group only
+*reads* what `apply` declared. The declaration and provisioning gate at `Project·Admin`;
+these read verbs are `Project·Read`. Takes the common `--server` flag.
 
 | Sub-action | Description |
 | --- | --- |
-| `put <file>` | Upload a file as a blob; prints its hash (the key to pass to `compute set --kernel/--rootfs`). |
+| `ls` | List the project's declared managed databases (`NAME`, `KIND`, `TENANT`, `SCOPE`, `SIZE`). |
+| `get <name>` | Show one declared database's declaration. |
+| `status <name>` | Show one declared database's provisioning/health status (declaration + the derived server-workload handle). |
+
+`--json` (a global flag on the group) emits the raw record instead of the human table.
+To declare or change a database, edit the manifest's `databases:` block — see
+[Declare a managed database](../how-to/managed-databases.md),
+[Declare a project with `apply`](../how-to/apply.md), and the
+[project.cfg schema](./project-cfg.md).
+
+## `boatramp blob`
+
+Upload artifacts and manage the node's blob **storage backend**. `blob put` is the
+day-to-day artifact uploader; the `migrate` / `drain` / `purge` / `status` verbs move a
+node from one blob backend to another (fs→cloud, provider→provider, region→region)
+without a re-apply, then reclaim the old store.
+
+| Sub-action | Description |
+| --- | --- |
+| `put <file>` | Upload a file as a content-addressed blob; prints its hash (the key to pass to `compute set --kernel/--rootfs`). |
+| [`migrate`](#blob-migrate) | **Offline, node-local** copy of every object from one blob backend to another. |
+| [`drain`](#blob-drain) | **Daemon-mediated** drain of a managed node's configured read-fallback secondary → primary. |
+| [`purge`](#blob-purge) | Reclaim unreferenced blobs, or a drained secondary's objects (dry-run by default). |
+| [`status`](#blob-status) | Print the node's blob migration posture (`{ blob_fallback_active }`). |
+
+> **The three blob-storage `migrate`/`drain` verbs.** `blob migrate` is **offline** — it
+> builds *both* backends in the CLI process from two node config files and never contacts a
+> server, so it needs local access to the backends' credentials (for a pre-boot copy, or a
+> node you can shell into). `blob drain` is its **daemon-mediated** counterpart for a
+> managed node reachable only over the control plane: the running daemon (which already
+> holds both backends open) drains its *own* configured secondary. `blob purge
+> --drained-source` then removes the decommissioned old store. See
+> [Switch the blob backend with zero downtime](../how-to/blob-backend-migration.md). (`boatramp blob migrate` is
+> unrelated to the top-level [`boatramp migrate`](#boatramp-migrate) store re-key.)
+
+### `blob migrate`
+
+Copy every object from a **source** blob backend to a **destination** backend, offline. It
+is a **node-local** operation: it builds both backends in-process from node config files
+(`boatramp.cfg` shape — each side's `[serve]` blob block + optional `[secrets]` for a
+sealed S3 credential), so it takes no `--server` and needs local credential access, not a
+control-plane token. The copy `get`→`put`s each object, **skipping** any key already
+`head`-present in the destination at a matching size — so it is **idempotent and
+resumable** (a re-run after an interruption is a near-no-op) and **read-only on the source**
+(it never deletes, and the source stays authoritative until you flip `[serve].blobs`). The
+resolved source/dest identities are echoed and an equal source==dest is refused.
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--from <config>` | fallback secondary | Node config file whose `[serve]` blob block defines the **source**. Omitted ⇒ the `--node-config`'s `[serve.blob_fallback]` secondary (the drain one-liner); error if none. |
+| `--to <config>` | `--node-config`'s primary | Node config file whose `[serve]` blob block defines the **destination**. Omitted ⇒ the node config's own primary backend. |
+| `--node-config <path>` | `boatramp.cfg` | Running node's config — the source of the `--from`/`--to` defaults. Read only when `--from` or `--to` is omitted. |
+| `--concurrency <n>` | `8` | Bounded number of objects copied in flight at once. |
+| `--no-verify` | verify on | Skip the post-copy verify pass. By default, every source object is head-confirmed present in the destination; any miss is a **non-zero exit**. |
+| `--dry-run` | — | Enumerate + classify (would-copy / would-skip) and report; copy nothing. |
+| `--prefix <p>` | all | Restrict the copy to source keys under this prefix. |
+| `--json` | — | Emit the run summary as JSON instead of a human line. |
+
+A verified `fallback secondary → primary` drain additionally prints
+`SECONDARY FULLY DRAINED — safe to remove [serve].blob_fallback and restart the node.`
+
+### `blob drain`
+
+Drain the running daemon's configured `[serve.blob_fallback]` **secondary → primary** over
+the control plane — for a **managed node** reachable only via `--server` (no local disk / no
+`fly ssh`), where the offline [`blob migrate`](#blob-migrate) cannot run. The client names
+**no** source or destination: the daemon (which already holds both backends of its fallback
+composite open) drains only its *own* configured pair, a tighter authorization surface than
+the offline CLI's arbitrary `--from`/`--to`. Requires `--server`; gated at **`System·Admin`**
+(a project admin / publisher / deployer cannot reach it). No fallback configured ⇒ `422`.
+
+Progress streams as it arrives; on a verified drain it prints
+`SECONDARY FULLY DRAINED — safe to remove [serve].blob_fallback`. The copy is
+**resumable**, so a dropped connection (e.g. an edge idle-timeout on a long drain) is safe to
+re-run.
+
+| Flag | Description |
+| --- | --- |
+| `--dry-run` | Enumerate + classify on the daemon and report; copy nothing. |
+| `--concurrency <n>` | Bounded copy concurrency on the daemon. |
+| `--prefix <p>` | Restrict the drain to secondary keys under this prefix. |
+| `--json` | Emit the final report as JSON (progress lines stay on stderr). |
+
+### `blob purge`
+
+Reclaim a **provably-safe** blob set over the control plane. **Dry-run by default** (reports
+what *would* be reclaimed and deletes nothing) — pass `--apply` to execute. Gated at
+**`System·Admin`**. Exactly **one** mode is required:
+
+| Flag | Description |
+| --- | --- |
+| `--unreferenced` | On-demand garbage collection: prune content-addressed blobs that **no live deploy manifest references** (the everyday storage reclaim). **Refused (`409`)** while a read-fallback secondary is attached (`[serve.blob_fallback]`) — drain and drop the fallback first, else GC could phantom-reclaim a secondary-only orphan. |
+| `--drained-source` | The migration **decommission**: after a `drain`/`migrate`, delete each old-secondary object **only once it is byte-confirmed** (present at a matching size) in the primary. **Fail-closed** — an unconfirmed object survives, never deleted. Requires a configured `[serve.blob_fallback]` (else `422`). |
+| `--apply` | Actually delete (default: dry-run — report only). |
+| `--prefix <p>` | Restrict a `--drained-source` purge to source keys under this prefix (ignored by `--unreferenced`). |
+| `--json` | Emit the final report as JSON (progress lines stay on stderr). |
+
+### `blob status`
+
+Print the node's structured blob **migration posture** — whether a read-fallback secondary
+is currently attached (the node is mid-migration) — as `{ "blob_fallback_active": <bool> }`.
+The direct answer to "is this node still in transition mode?", instead of grepping the
+startup log warning. Read-only (`System·Read`).
+
+| Flag | Description |
+| --- | --- |
+| `--json` | Emit the posture as JSON instead of a human line. |
 
 ## `boatramp config`
 
@@ -605,10 +732,34 @@ fleet-wide without a restart. See the
 | `apply -f <file>` | Replace the whole dynamic config from a JSON file. |
 | `list` | List the dynamic (runtime-settable) keys. |
 | `describe <key>` | A key's change class (`dynamic` vs `restart`). |
+| `migrate <file> [--write]` | Upgrade an [`apply`](#boatramp-apply) manifest to the current schema. **Client-side only** — no server is contacted. |
 
 `config set` on a `restart`-class key (a trust anchor, posture, or listener
 setting) fails with a pointer to `boatramp.cfg` rather than silently doing
 nothing.
+
+### `config migrate`
+
+`config migrate <file>` upgrades an [`apply`](#boatramp-apply) manifest to the current
+schema and prints the result (or, with `--write`, rewrites the file in place). It is
+**purely client-side** — it reads and rewrites the file locally and never contacts a server.
+
+The `version:` semantics drive it:
+
+- **Absent `version:`** — the manifest is parsed **strictly against the current schema**. An
+  old-shaped manifest that omits `version:` fails with an error pointing here.
+- **`version: N` older than current** — the manifest opts into the loose-parse → migrate →
+  typed pipeline: it is migrated forward through the registered chain (`vN → … → current`).
+- The migrated output **omits `version:`** (current = absent). Declare `version: <what you
+  wrote against>` only to keep migration support for a future schema change.
+
+```sh
+# Upgrade a pre-v0.6.0 manifest in place (add `version: 1` at its top first).
+boatramp config migrate apply.cfg --write
+```
+
+See [Declare a project with `apply`](../how-to/apply.md) for the manifest schema and the
+version-migration workflow.
 
 ## `boatramp mcp`
 
