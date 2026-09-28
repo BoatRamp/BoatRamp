@@ -123,6 +123,13 @@ struct Scope {
     project: String,
     /// The rewritten path, when the URL is a project-scoped per-resource path.
     rewrite: Option<String>,
+    /// A6 (v0.7.0): the extracted `<proj>` segment is present but not a valid slug —
+    /// the request is malformed and must be refused with a generic **400** BEFORE any
+    /// `ProjectContext` is injected or the path is rewritten. Fail-closed and
+    /// defense-in-depth (the resource handlers already re-screen the name); the 400 is
+    /// generic ("malformed path") and pre-auth, so it is not a tenant-existence oracle
+    /// (a 404 here would leak whether a well-formed tenant exists).
+    malformed: bool,
 }
 
 /// Classify a request `path`: extract the tenant project and, for a whitelisted
@@ -136,6 +143,7 @@ fn scope_of(path: &str) -> Scope {
         return Scope {
             project: DEFAULT_PROJECT.to_string(),
             rewrite: None,
+            malformed: false,
         };
     };
     // A malformed empty project segment (`/api/projects//…` or `/api/projects/`) has
@@ -145,14 +153,33 @@ fn scope_of(path: &str) -> Scope {
         return Scope {
             project: DEFAULT_PROJECT.to_string(),
             rewrite: None,
+            malformed: false,
         };
     }
     // Bare `/api/projects/<proj>` (the project entity route): carry the tenant, do
-    // not rewrite (its own route handles it).
+    // not rewrite (its own route handles it). Checked BEFORE the A6 malformed screen so
+    // the escape-hatch (`project rm`/`doctor` of a legacy non-conforming name) can still
+    // reach the entity `GET`/`DELETE` handlers with the opaque source name — those
+    // handlers use it only as a KV/blob teardown key and never re-emit it into a new
+    // sink (no context injection here, no rewrite). A6 fires only for the sub-resource
+    // paths below, which WOULD inject a `ProjectContext` / rewrite onto a global handler.
     if sub.is_empty() {
         return Scope {
             project: proj.to_string(),
             rewrite: None,
+            malformed: false,
+        };
+    }
+    // A6: a present-but-non-conforming `<proj>` on a SUB-RESOURCE path is a malformed
+    // path. Screen it with the one canonical slug rule (`validate_resource_name`) BEFORE
+    // injecting the context / rewriting, and signal the middleware to 400. This is a
+    // defense-in-depth layer on top of the per-handler name screens — keep it, don't
+    // collapse the guard.
+    if boatramp_core::project::validate_resource_name("project", proj).is_err() {
+        return Scope {
+            project: DEFAULT_PROJECT.to_string(),
+            rewrite: None,
+            malformed: true,
         };
     }
     // `/api/projects/<proj>/<family>/…`: rewrite to `/api/<family>/…` **iff** the
@@ -164,6 +191,7 @@ fn scope_of(path: &str) -> Scope {
     Scope {
         project: proj.to_string(),
         rewrite,
+        malformed: false,
     }
 }
 
@@ -173,6 +201,11 @@ fn scope_of(path: &str) -> Scope {
 /// [`OriginalPath`] for the auth layer). A no-op for every non-project path.
 pub async fn project_scope(mut request: Request, next: Next) -> Response {
     let scope = scope_of(request.uri().path());
+    // A6: a non-conforming `<proj>` path segment is refused with a generic 400 before
+    // any context injection / rewrite — pre-auth, so no tenant-existence oracle.
+    if scope.malformed {
+        return (StatusCode::BAD_REQUEST, "malformed path\n").into_response();
+    }
     request
         .extensions_mut()
         .insert(ProjectContext(scope.project));
@@ -311,6 +344,42 @@ mod tests {
         let s = scope_of("/api/projects/acme/repair/appdb/dry-run");
         assert_eq!(s.project, "acme");
         assert_eq!(s.rewrite.as_deref(), Some("/api/repair/appdb/dry-run"));
+    }
+
+    /// A6 (v0.7.0): a present-but-non-conforming `<proj>` segment marks the scope
+    /// malformed → the middleware 400s BEFORE injecting a context or rewriting. A
+    /// conforming project does not. Mutation witness: drop the `validate_resource_name`
+    /// screen in `scope_of` and `malformed` is never set → this test fails.
+    #[test]
+    fn nonconforming_project_segment_is_malformed_no_rewrite_no_ctx() {
+        for bad in [
+            "/api/projects/${PROJECT}/sites/blog/config",
+            "/api/projects/a.b/sites/blog/config",
+            "/api/projects/-acme/functions/f",
+            "/api/projects/%7Btenant%7D/sites/x", // arrives decoded → `{tenant}`? see note
+            "/api/projects/acme%2Fevil/sites/x",
+        ] {
+            // Note: axum decodes the path before it reaches the middleware; `scope_of`
+            // is tested on the literal string it would receive. The two entries above
+            // that use `%` are here to document that a raw `%`-bearing segment (if not
+            // decoded) is itself non-conforming (`%` is not a slug byte).
+            let s = scope_of(bad);
+            assert!(s.malformed, "{bad:?} should be malformed");
+            assert!(s.rewrite.is_none(), "{bad:?} must not be rewritten");
+            assert_eq!(
+                s.project, "default",
+                "{bad:?} must not carry a ghost tenant"
+            );
+        }
+        // A conforming project is NOT malformed and rewrites normally.
+        let ok = scope_of("/api/projects/acme/sites/blog/config");
+        assert!(!ok.malformed);
+        assert_eq!(ok.project, "acme");
+        assert_eq!(ok.rewrite.as_deref(), Some("/api/sites/blog/config"));
+        // The empty segment stays the (fail-closed) default, not "malformed".
+        let empty = scope_of("/api/projects//sites/x");
+        assert!(!empty.malformed);
+        assert_eq!(empty.project, "default");
     }
 
     #[test]

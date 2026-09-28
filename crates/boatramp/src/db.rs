@@ -71,8 +71,12 @@ enum DbCommand {
 /// (`kind = "database"`) before it is threaded into the request URL — the same rule the
 /// server enforces — so a malformed name fails fast rather than an opaque server error.
 fn validate_name(name: &str) -> Result<()> {
-    boatramp_core::project::validate_resource_name("database", name)
-        .map_err(|e| Error::InvalidName(e.to_string()))
+    boatramp_core::project::validate_resource_name("database", name).map_err(|e| {
+        Error::InvalidName(format!(
+            "{e}; {}",
+            boatramp_core::project::INVALID_NAME_CURE
+        ))
+    })
 }
 
 /// Entry point for `boatramp db`.

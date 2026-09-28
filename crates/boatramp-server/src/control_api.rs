@@ -32,6 +32,24 @@ struct CreateTokenResponse {
     id: String,
 }
 
+/// Reject a set of parsed roles if any target-scoped role carries a non-conforming
+/// target (audit A8). A role scope is `<role>:<target>`, where `<target>` is a
+/// `<project>` / `<project>/<site>` / `<project>/*`; each real segment must be a valid
+/// slug. Global roles (no target) are always fine. Returns the offending target on the
+/// first failure so the mint feeder can 400 with a precise reason — closing the
+/// `publisher:${PROJECT}` ingress at issue time (the authz-match backstop closes it for
+/// already-minted / offline tokens). Shared by [`create_token`] and [`bootstrap_token`].
+fn validate_role_targets(
+    roles: &[GrantedRole],
+) -> Result<(), boatramp_core::project::InvalidResourceName> {
+    for role in roles {
+        if let Some(target) = &role.target {
+            boatramp_core::project::validate_role_target(target)?;
+        }
+    }
+    Ok(())
+}
+
 /// Mint a token carrying the requested roles and record its metadata. Needs the
 /// token signer (the issuer); a verify-only node returns `501`. The token is
 /// returned once and never stored — only its metadata is.
@@ -54,6 +72,11 @@ pub(super) async fn create_token(
         .collect();
     if roles.is_empty() {
         return (StatusCode::BAD_REQUEST, "at least one role is required\n").into_response();
+    }
+    // A8: refuse a non-conforming role target at issue time (400), so a
+    // `publisher:${PROJECT}` token is never minted in the first place.
+    if let Err(err) = validate_role_targets(&roles) {
+        return (StatusCode::BAD_REQUEST, format!("{err}\n")).into_response();
     }
     let now = now_unix();
     let claims = Claims {
@@ -176,6 +199,11 @@ pub(super) async fn bootstrap_token(
             .map(|s| GrantedRole::parse(s))
             .collect()
     };
+    // A8: refuse a non-conforming role target at issue time (400), even on the
+    // bootstrap path — the first token must not smuggle a `publisher:${PROJECT}`.
+    if let Err(err) = validate_role_targets(&roles) {
+        return (StatusCode::BAD_REQUEST, format!("{err}\n")).into_response();
+    }
     let now = now_unix();
     let ttl = request.ttl_secs.or(Some(3600));
     let claims = Claims {

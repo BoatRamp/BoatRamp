@@ -42,7 +42,11 @@ pub(super) async fn create_project(
 ) -> Response {
     let name = req.name.trim();
     if let Err(err) = boatramp_core::project::validate_resource_name("project", name) {
-        return (StatusCode::UNPROCESSABLE_ENTITY, format!("{err}\n")).into_response();
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("{err}; {}\n", boatramp_core::project::INVALID_NAME_CURE),
+        )
+            .into_response();
     }
     // `default` is reserved (the home of pre-project resources); it always exists
     // and can never be (re-)created or deleted.

@@ -89,6 +89,23 @@ pub enum Error {
     /// A migration step failed to transform an older manifest into the current schema.
     #[error("migrating manifest from version {from}: {reason}")]
     Migration { from: u32, reason: String },
+    /// The manifest carries a resource name the v0.7.0 slug allowlist rejects (the
+    /// project, a site, a function, a compute workload, or a database). Refused
+    /// client-side BEFORE any reconcile — mirrors the migration-gate refusal style and
+    /// points at `project doctor` so the operator discovers + fixes every bad name at
+    /// once rather than hitting a per-resource 422 mid-apply.
+    #[error(
+        "manifest {kind} name {name:?} is not accepted (v0.7.0 tightened name \
+         validation): {reason}.\n\n\
+         Run `boatramp project doctor` to list every non-conforming name and its fix, \
+         then rename to a valid slug (start/end with a letter or digit; interior may add \
+         '_' / '-'; 1-63 bytes) and re-apply."
+    )]
+    InvalidName {
+        kind: &'static str,
+        name: String,
+        reason: &'static str,
+    },
     /// A site's `[handlers.graphql]` set BOTH `safelisted_ops` and
     /// `safelisted_ops_path` — they are mutually exclusive (pick one source).
     #[error(
@@ -633,6 +650,35 @@ pub struct ApplyArgs {
 }
 
 /// Entry point for `boatramp apply`.
+/// v0.7.0 client-side preflight: every resource name a manifest declares (the target
+/// project, plus each site / function / compute / database) must be a valid slug. The
+/// first non-conforming name is an [`Error::InvalidName`] (which names `project doctor`
+/// + the slug rule). Read-only; runs before any network call.
+fn check_manifest_names(project: &str, manifest: &ApplyManifest) -> Result<()> {
+    use boatramp_core::project::validate_resource_name;
+    let check = |kind: &'static str, name: &str| -> Result<()> {
+        validate_resource_name(kind, name).map_err(|err| Error::InvalidName {
+            kind,
+            name: name.to_string(),
+            reason: err.reason,
+        })
+    };
+    check("project", project)?;
+    for s in &manifest.sites {
+        check("site", &s.name)?;
+    }
+    for f in &manifest.functions {
+        check("function", &f.name)?;
+    }
+    for c in &manifest.compute {
+        check("compute", &c.name)?;
+    }
+    for d in &manifest.databases {
+        check("database", &d.name)?;
+    }
+    Ok(())
+}
+
 pub async fn run(args: ApplyArgs, config: &ProjectConfig) -> Result<()> {
     let manifest = ApplyManifest::load(&args.file, args.format)?;
 
@@ -643,6 +689,11 @@ pub async fn run(args: ApplyArgs, config: &ProjectConfig) -> Result<()> {
         .clone()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| client::resolve_project(config));
+
+    // v0.7.0: refuse a config carrying a non-conforming resource name up front (before
+    // any reconcile), pointing at `project doctor`. Defense-in-depth over the server's
+    // per-resource 422; catches the whole manifest at once. `default` is always valid.
+    check_manifest_names(&project, &manifest)?;
 
     let (server, http) = client::connect(args.server.clone(), config)?;
     let cp = client::ControlPlane::new(server, http, project.clone());

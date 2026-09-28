@@ -69,12 +69,6 @@ pub struct InvalidResourceName {
     pub reason: &'static str,
 }
 
-/// Maximum length, in bytes, of a project/site/function/compute/workflow name.
-/// Matches the tightest SQL identifier limit (Postgres `NAMEDATALEN - 1 = 63`)
-/// so a name can be folded into a per-tenant database identifier without forcing
-/// pathological truncation. Longer than any realistic human-chosen name.
-pub const MAX_RESOURCE_NAME_LEN: usize = 63;
-
 /// Validate a project/site/function/compute/workflow/**database** name at the
 /// create/write (and every URL-path) boundary, so a name can never escape its
 /// `project/<proj>/…` key prefix, collide with the store's fixed sub-key grammar,
@@ -108,13 +102,26 @@ pub const MAX_RESOURCE_NAME_LEN: usize = 63;
 ///
 /// Do not add a third divergent rule set; extend one of these or this function.
 ///
-/// Rejects: the empty string, names longer than [`MAX_RESOURCE_NAME_LEN`] bytes,
-/// `.` / `..`, and any name containing a path separator (`/` or `\`), a `*` (the
-/// authz wildcard sentinel — a resource named `*` would alias a project/site
-/// wildcard), whitespace, or an ASCII control character. This is a *targeted*
-/// denylist of the characters that carry a security or integrity consequence,
-/// plus a length bound, not a full slug allowlist, so it does not reject
-/// pre-existing otherwise-ordinary names.
+/// **ASCII strict single-label slug (v0.7.0 breaking).** Accepts a name IFF it
+/// matches `^[A-Za-z0-9]([A-Za-z0-9_-]*[A-Za-z0-9])?$` and is 1–[`MAX_RESOURCE_NAME_LEN`]
+/// bytes: the first AND last byte must be ASCII alphanumeric, interior bytes may
+/// additionally be `_` or `-`, and a single-character name must be alphanumeric.
+///
+/// This is an **allowlist**, not the pre-v0.7.0 path-traversal denylist. The old
+/// denylist rejected only the characters that carried an immediate consequence
+/// (`.`/`..`, `/`, `\`, `*`, whitespace, control), so `${PROJECT}`, `{tenant}`,
+/// `a;b`, `` `x` ``, `a|b`, `a%b`, `a#b`, `a"b`, `a'b`, `a$b`, `a(b)` all *passed* —
+/// every one a latent injection waiting for the next sink that formats a name into a
+/// shell / `.env` / DNS / SQL string. The allowlist removes the whole class: only
+/// the slug alphabet survives, and it is enforced with a **byte loop**
+/// (`value.bytes()` + [`u8::is_ascii_alphanumeric`]) so a Unicode homoglyph
+/// (`аcme` Cyrillic, `acme１` fullwidth, `café`) cannot pass by satisfying
+/// `char::is_alphanumeric`. Mirror of `cedar.rs::is_safe_ident`. The `.`/`..` guard
+/// and the `≤63B` cap are now subsumed by the rule (a `.` byte is not in the
+/// alphabet), but the length check runs first for a precise error.
+///
+/// The leading-`-`/`_` ban is also a flag-injection defense: a name is never emitted
+/// as a bare argument that a downstream tool could parse as an option.
 ///
 /// The length bound is defense-in-depth for per-tenant database provisioning: it
 /// stops a caller from forcing pathological truncation when a name is folded into
@@ -129,25 +136,76 @@ pub fn validate_resource_name(kind: &'static str, value: &str) -> Result<(), Inv
             reason,
         })
     };
+    // Precise reasons for the two most common shapes (empty / over-long) before the
+    // general alphabet reason, so an operator reads the specific problem. Both are
+    // subsumed by `is_valid_resource_slug` (it also rejects them), so the accept/reject
+    // decision is unchanged — only the message is sharper.
     if value.is_empty() {
         return reject("must not be empty");
     }
     if value.len() > MAX_RESOURCE_NAME_LEN {
         return reject("must not exceed 63 bytes");
     }
-    if value == "." || value == ".." {
-        return reject("must not be '.' or '..'");
+    // The one canonical rule (byte loop, homoglyph-safe) lives in the lowest crate so
+    // the authz-match backstop shares it verbatim; see [`is_valid_resource_slug`].
+    if is_valid_resource_slug(value) {
+        Ok(())
+    } else {
+        reject(INVALID_NAME_REASON)
     }
-    for c in value.chars() {
-        match c {
-            '/' | '\\' => return reject("must not contain a path separator ('/' or '\\')"),
-            '*' => return reject("must not contain '*'"),
-            c if c.is_whitespace() => return reject("must not contain whitespace"),
-            c if c.is_control() => return reject("must not contain control characters"),
-            _ => {}
+}
+
+/// Validate a **token role target** (audit A8) at every mint feeder — the segment-aware
+/// counterpart to [`validate_resource_name`], because a target is a `/`-bearing scope
+/// string, not a single name segment.
+///
+/// A role scope is `<role>:<target>` ([`GrantedRole::parse`](crate::authz::GrantedRole::parse)),
+/// and the `<target>` is one of:
+/// - `<project>` — a bare project target;
+/// - `<project>/<site>` — a per-site target;
+/// - `<project>/*` — a project wildcard.
+///
+/// This splits on `/` (exactly one permitted, optionally the trailing wildcard) and
+/// runs [`validate_resource_name`] on each real segment (`project`, and `site` for a
+/// two-segment target). The whole string is NEVER passed to `validate_resource_name`
+/// (it rejects `/`). A wildcard `*` segment is the sole non-slug token accepted, and
+/// only in the trailing `<project>/*` position — it is the authz project-wildcard
+/// sentinel, never a resource name.
+///
+/// Called at all FOUR mint feeders (`create_token`, `bootstrap_token`, OIDC
+/// `auth_exchange`, offline `mint_offline`) so a `publisher:${PROJECT}` role can never
+/// be issued. It is complemented by the fail-closed authz-match backstop
+/// (`authz::target_matches` via [`is_conforming_role_target`]) which denies any target
+/// that reaches match time non-conforming (a pre-v0.7.0 or offline token).
+///
+/// A **global** role (no `:`/target) never reaches here — the caller only validates a
+/// [`GrantedRole`] whose `target` is `Some`.
+pub fn validate_role_target(target: &str) -> Result<(), InvalidResourceName> {
+    let reject = |value: &str, reason| {
+        Err(InvalidResourceName {
+            kind: "role target",
+            value: value.to_string(),
+            reason,
+        })
+    };
+    match target.split_once('/') {
+        // `<project>/*` — the project wildcard: validate the project segment only.
+        Some((project, "*")) => validate_resource_name("project", project),
+        // `<project>/<site>` — reject a second `/` (three-segment target), then both.
+        Some((project, site)) => {
+            if site.contains('/') {
+                return reject(
+                    target,
+                    "must be `<project>`, `<project>/<site>`, or `<project>/*` \
+                     (at most one '/')",
+                );
+            }
+            validate_resource_name("project", project)?;
+            validate_resource_name("site", site)
         }
+        // A bare `<project>` target.
+        None => validate_resource_name("project", target),
     }
-    Ok(())
 }
 
 /// The maximum length (bytes) of an external object key accepted by the S3
@@ -304,7 +362,8 @@ mod tests {
 
     #[test]
     fn resource_name_validation_rejects_the_dangerous_shapes() {
-        for ok in ["blog", "my-site", "resize_v2", "a.b", "Blog9"] {
+        // Valid slugs: alphanumeric ends, interior `_`/`-`, single alphanumerics.
+        for ok in ["blog", "my-site", "resize_v2", "Blog9", "a", "9", "a1_b-2c"] {
             assert!(
                 validate_resource_name("site", ok).is_ok(),
                 "{ok} should pass"
@@ -312,11 +371,12 @@ mod tests {
         }
         // Validation runs on the already-percent-decoded value the handler
         // receives, so the `%2F` → `/` path-param case arrives here as a literal
-        // `/` and is caught by the separator rule.
+        // `/` and is caught by the allowlist.
         for bad in [
             "",
             ".",
             "..",
+            "a.b", // v0.7.0: the dot is no longer in the alphabet
             "a/b",
             "a\\b",
             "blog/../evil",
@@ -325,6 +385,30 @@ mod tests {
             "a b",
             "tab\tname",
             "ctl\u{0}name",
+            // v0.7.0 allowlist closes the whole injection class the old denylist let through:
+            "${PROJECT}",
+            "{tenant}",
+            "a;b",
+            "`x`",
+            "a|b",
+            "a%b",
+            "a#b",
+            "a\"b",
+            "a'b",
+            "a$b",
+            "a(b)",
+            // Leading/trailing/non-alphanumeric-edge shapes:
+            "-x",
+            "x-",
+            "_x",
+            "x_",
+            "-",
+            "_",
+            // Unicode homoglyphs — the byte loop rejects them; a `char`-based
+            // `is_alphanumeric` loop would ACCEPT these (the G1 mutation).
+            "аcme",   // leading Cyrillic 'а' (U+0430)
+            "acme１", // trailing fullwidth '１' (U+FF11)
+            "café",   // trailing 'é' (U+00E9)
         ] {
             assert!(
                 validate_resource_name("site", bad).is_err(),
@@ -358,6 +442,31 @@ mod tests {
         assert_eq!(err.value, "a/b");
     }
 
+    /// G1 (charset / homoglyph): the byte-loop MUST reject a Unicode homoglyph that a
+    /// `char::is_alphanumeric` loop would accept. If the validator is mutated to
+    /// `value.chars().all(char::is_alphanumeric)` (or first/last checked with
+    /// `char::is_alphanumeric`), every name below is accepted and this test fails —
+    /// the anti-hollow mutation witness for the byte-loop requirement.
+    #[test]
+    fn resource_name_rejects_unicode_homoglyphs() {
+        for homoglyph in [
+            "аcme",     // U+0430 Cyrillic 'а' followed by ASCII "cme"
+            "acme１",   // ASCII "acme" followed by U+FF11 fullwidth '１'
+            "café",     // trailing U+00E9 'é'
+            "\u{212a}", // Kelvin sign (looks like 'K')
+            "ⅰdent",    // U+2170 small roman numeral one (looks like 'i')
+        ] {
+            assert!(
+                validate_resource_name("project", homoglyph).is_err(),
+                "{homoglyph:?} (Unicode homoglyph) must be rejected by the byte loop"
+            );
+        }
+        // And the pure-ASCII slug that the homoglyphs impersonate IS accepted, so the
+        // test is not vacuously rejecting everything.
+        assert!(validate_resource_name("project", "acme").is_ok());
+        assert!(validate_resource_name("project", "ident").is_ok());
+    }
+
     #[test]
     fn resource_name_length_bound() {
         // Exactly at the bound passes; one over is rejected.
@@ -375,32 +484,45 @@ mod tests {
         );
     }
 
-    // ---- cross-surface consistency guard (v0.5.0 uniform db-name screening) -----
+    // ---- cross-surface consistency guard (v0.7.0 strict slug allowlist) --------
     //
-    // The anti-regression guard the uniform-parameter-screening request demands: for a
-    // generated corpus of identifiers, assert that `validate_resource_name` accepts a
-    // value IFF it is a **safe URL path segment**, AND that every accepted value
-    // round-trips through the CLI path construction + the API-route path grammar
-    // without producing a malformed path (no empty / `//` segment, no truncation). It
-    // is a REAL detector: an INDEPENDENT path-segment oracle (below) is compared
-    // against the validator, so if the validator ever drifts to accept a value that is
-    // not a safe segment — or a path-construction change reintroduces a `//` — the
-    // test fails.
+    // The anti-regression guard: for a generated corpus of identifiers, assert that
+    // `validate_resource_name` accepts a value IFF it is a **valid slug** (the v0.7.0
+    // rule), AND that every accepted value round-trips through the CLI path
+    // construction + the API-route path grammar without producing a malformed path
+    // (no empty / `//` segment, no truncation). A valid slug is a strict subset of a
+    // safe URL path segment, so this remains a REAL detector: an INDEPENDENT slug
+    // oracle (below) is compared against the validator, so if the validator ever
+    // drifts to accept a value that is not a valid slug — or a path-construction
+    // change reintroduces a `//` — the test fails.
 
-    /// An INDEPENDENT re-statement of the "safe URL path segment" spec, deliberately
-    /// NOT sharing code with [`validate_resource_name`] so the two can disagree (which
-    /// is exactly what this test detects). A value is a safe path segment when it is
-    /// non-empty, is not `.`/`..`, and contains no `/`, `\`, whitespace, or control
-    /// character. (`*` is a validator-only concern — the authz wildcard sentinel — so
-    /// the oracle folds it in to keep the equivalence exact.)
-    fn is_safe_path_segment(v: &str) -> bool {
-        !v.is_empty()
-            && v != "."
-            && v != ".."
-            && v.len() <= MAX_RESOURCE_NAME_LEN
-            && !v
-                .chars()
-                .any(|c| c == '/' || c == '\\' || c == '*' || c.is_whitespace() || c.is_control())
+    /// An INDEPENDENT re-statement of the v0.7.0 slug spec, deliberately NOT sharing
+    /// code with [`validate_resource_name`] so the two can disagree (which is exactly
+    /// what this test detects). A value is a valid slug when it is 1–63 bytes, its
+    /// first and last `char` is an ASCII alphanumeric, and every interior `char` is an
+    /// ASCII alphanumeric or `_`/`-`. Written over `char`s (not bytes) on purpose: a
+    /// homoglyph like `café` has an ASCII-alphanumeric-looking `char` shape only for
+    /// its ASCII prefix — its `é` `char` is NOT `is_ascii_alphanumeric`, so the oracle
+    /// rejects it exactly as the byte-loop validator does, keeping the equivalence
+    /// exact while still restating the rule independently.
+    fn is_valid_slug(v: &str) -> bool {
+        if v.is_empty() || v.len() > MAX_RESOURCE_NAME_LEN {
+            return false;
+        }
+        let chars: Vec<char> = v.chars().collect();
+        // Any non-ASCII char (a multi-byte homoglyph) fails `is_ascii_alphanumeric`.
+        for (i, &c) in chars.iter().enumerate() {
+            let first_or_last = i == 0 || i == chars.len() - 1;
+            let ok = if first_or_last {
+                c.is_ascii_alphanumeric()
+            } else {
+                c.is_ascii_alphanumeric() || c == '_' || c == '-'
+            };
+            if !ok {
+                return false;
+            }
+        }
+        true
     }
 
     /// Build a control-plane path the way the CLI (`boatramp sql` / `project migrate`)
@@ -415,17 +537,20 @@ mod tests {
     }
 
     #[test]
-    fn validator_matches_the_safe_path_segment_oracle() {
-        // A broad generated corpus: safe names, the dangerous shapes, boundary
-        // lengths, and every ASCII byte spliced into a name (so no accepted value can
-        // carry a control/space/separator the oracle would reject).
+    fn validator_matches_the_slug_oracle() {
+        // A broad generated corpus: valid slugs, the dangerous shapes, the whole
+        // injection class the old denylist let through, boundary lengths, Unicode
+        // homoglyphs, and every ASCII byte spliced into a name (so no accepted value
+        // can carry a byte the slug oracle would reject).
         let mut corpus: Vec<String> = vec![
             "default".into(),
             "analytics".into(),
             "events_log".into(),
             "pg-primary".into(),
-            "a.b".into(),
+            "a.b".into(), // v0.7.0: now rejected (dot not in the alphabet)
             "Blog9".into(),
+            "a".into(),
+            "9".into(),
             String::new(),
             ".".into(),
             "..".into(),
@@ -437,6 +562,19 @@ mod tests {
             "a b".into(),
             "tab\tname".into(),
             "ctl\u{0}name".into(),
+            "${PROJECT}".into(),
+            "{tenant}".into(),
+            "a;b".into(),
+            "`x`".into(),
+            "a|b".into(),
+            "-x".into(),
+            "x-".into(),
+            "_x".into(),
+            "x_".into(),
+            // Unicode homoglyphs — must be rejected (the G1 byte-loop invariant).
+            "аcme".into(),
+            "acme１".into(),
+            "café".into(),
             "a".repeat(MAX_RESOURCE_NAME_LEN),
             "a".repeat(MAX_RESOURCE_NAME_LEN + 1),
         ];
@@ -446,11 +584,11 @@ mod tests {
 
         for v in &corpus {
             let accepted = validate_resource_name("database", v).is_ok();
-            let safe = is_safe_path_segment(v);
+            let slug = is_valid_slug(v);
             assert_eq!(
-                accepted, safe,
+                accepted, slug,
                 "validator/oracle disagree on {v:?}: validator accepted={accepted}, \
-                 safe-path-segment={safe}"
+                 valid-slug={slug}"
             );
 
             if accepted {
@@ -483,7 +621,7 @@ mod tests {
         // to a `//`), and the validator rejects it. If someone "fixed" the validator
         // to accept `""`, the oracle equivalence test above would fail — but assert it
         // directly too, as the single most important case.
-        assert!(!is_safe_path_segment(""), "empty is not a safe segment");
+        assert!(!is_valid_slug(""), "empty is not a valid slug");
         assert!(
             validate_resource_name("database", "").is_err(),
             "empty db name must be rejected"

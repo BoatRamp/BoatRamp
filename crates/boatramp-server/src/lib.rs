@@ -2523,7 +2523,12 @@ fn deploy_error_response(err: DeployError) -> Response {
 fn reject_invalid_name(kind: &'static str, value: &str) -> Option<Response> {
     boatramp_core::project::validate_resource_name(kind, value)
         .err()
-        .map(|err| (StatusCode::UNPROCESSABLE_ENTITY, format!("{err}\n")).into_response())
+        .map(|err| {
+            // Operator-facing surface: carry the v0.7.0 slug cure pointing at
+            // `project doctor` so a breaking-change rejection tells the fix.
+            let body = format!("{err}; {}\n", boatramp_core::project::INVALID_NAME_CURE);
+            (StatusCode::UNPROCESSABLE_ENTITY, body).into_response()
+        })
 }
 
 #[cfg(test)]

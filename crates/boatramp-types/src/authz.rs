@@ -754,9 +754,21 @@ fn is_compute_maintenance_path(path: &str) -> bool {
 /// a resource literally named `*`. This keeps the pure oracle faithful to the
 /// Cedar authorizer, which likewise matches `"*"` as a literal set member — and a
 /// resource named `*` cannot be created (`validate_resource_name` rejects it).
+///
+/// **Fail-closed A8 backstop (v0.7.0).** Before any positive match, a *present* grant
+/// target that is not a conforming role target (`<seg>` / `<seg>/<seg>` / `<seg>/*`
+/// with every segment a valid slug — [`is_conforming_role_target`]) matches NOTHING.
+/// The four mint feeders reject a non-conforming target at issue time, but a token
+/// minted before v0.7.0 — or offline — carries an unvalidated target; this screen
+/// makes such a target inert at authorization time without a token-format migration.
+/// A `required` target is host-derived and always conforming, so it is not re-screened
+/// here (a required `*` is a legitimate literal-`*` resource lookup, which no real
+/// resource can be — it simply won't match a real grant).
 fn target_matches(granted: Option<&str>, required: Option<&str>) -> bool {
     match granted {
         None => true,
+        // A non-conforming grant target is inert — it can never cover a required right.
+        Some(g) if !crate::project::is_conforming_role_target(g) => false,
         Some(g) => match g.strip_suffix("/*") {
             Some(project) => required.is_some_and(|r| project_of(r) == project),
             None => required == Some(g),
@@ -1209,6 +1221,75 @@ mod tests {
         }
         // …but not a different resource.
         assert!(!admin_site.satisfies(&Right::new(Resource::Tokens, None, Action::Read)));
+    }
+
+    /// G3 (A8 fail-closed authz-match backstop): a right whose grant target is not a
+    /// conforming role target (a token minted before v0.7.0, or offline, carrying
+    /// `publisher:${PROJECT}` / `acme/../evil` / a literal `*`) must match NOTHING —
+    /// even a required right that names the identical string. This is the load-bearing
+    /// screen for already-issued tokens without a token-format migration.
+    ///
+    /// Mutation witness: delete the `is_conforming_role_target` guard in
+    /// `target_matches` and this test fails — the `${PROJECT}` grant would then satisfy
+    /// a required `Some("${PROJECT}")` (self-match) and authorize.
+    #[test]
+    fn nonconforming_grant_target_matches_nothing() {
+        for bad in ["${PROJECT}", "acme/../evil", "*", "a b", "acme/a/b", "café"] {
+            let granted = Right::new(Resource::Site, Some(bad.to_string()), Action::Write);
+            // Even a required right naming the exact same string does not match.
+            let required_same = Right::new(Resource::Site, Some(bad.to_string()), Action::Write);
+            assert!(
+                !granted.satisfies(&required_same),
+                "a non-conforming grant target {bad:?} must match nothing, even itself"
+            );
+            // And it does not cover an ordinary site either.
+            let required_site = Right::new(Resource::Site, Some("blog".to_string()), Action::Write);
+            assert!(
+                !granted.satisfies(&required_site),
+                "a non-conforming grant target {bad:?} must not cover an ordinary target"
+            );
+        }
+        // A conforming grant still works (the backstop is not a blanket deny).
+        let ok = Right::new(Resource::Site, Some("acme/blog".to_string()), Action::Write);
+        assert!(ok.satisfies(&Right::new(
+            Resource::Site,
+            Some("acme/blog".to_string()),
+            Action::Write
+        )));
+        let wild = Right::new(Resource::Site, Some("acme/*".to_string()), Action::Write);
+        assert!(wild.satisfies(&Right::new(
+            Resource::Site,
+            Some("acme/blog".to_string()),
+            Action::Write
+        )));
+    }
+
+    /// The `is_conforming_role_target` grammar itself (the segment-aware predicate the
+    /// backstop and the feeders share): valid singles/pairs/wildcards accept; anything
+    /// with a bad segment, a homoglyph, an extra `/`, or the injection class rejects.
+    #[test]
+    fn conforming_role_target_grammar() {
+        use crate::project::is_conforming_role_target;
+        for ok in ["acme", "acme/blog", "acme/*", "a", "a1_b-2/c-3_d"] {
+            assert!(is_conforming_role_target(ok), "{ok:?} should conform");
+        }
+        for bad in [
+            "",
+            "*",
+            "/blog",
+            "acme/",
+            "acme//blog",
+            "acme/a/b",
+            "acme/../evil",
+            "${PROJECT}",
+            "{tenant}/blog",
+            "-acme",
+            "acme/-blog",
+            "аcme/blog", // Cyrillic homoglyph in the project segment
+            "acme/*/x",
+        ] {
+            assert!(!is_conforming_role_target(bad), "{bad:?} must NOT conform");
+        }
     }
 
     #[test]

@@ -496,6 +496,49 @@ jobs:
           done
           echo "RAWSQL OWN-CONFINEMENT MUTATION-VERIFIED OK"
 
+  # RESOURCE-NAME ALLOWLIST HARD GATE (v0.7.0 breaking cutover). The strict-slug allowlist
+  # (`validate_resource_name`) + the two ingress closures (A8 token-role target, A6 project-scope
+  # path) + the resolv.conf sink + the escape-hatch containment. Robust exit-code mechanism (the
+  # v0.6.4/v0.6.5 style): named `#[test]`s where the TEST EXIT CODE is the contract — NO greppable
+  # marker, NO bash env-loop. Each invariant G1–G7 is anti-hollow (its doc comment names the
+  # mutation that flips it to a failure). The gate binary carries G1 (charset incl. the homoglyph
+  # `аcme`/`acme１`/`café`), G2 (all four mint feeders 4xx a `publisher:${PROJECT}` target — via the
+  # real HTTP feeders + the offline predicate), G3 (the offline-token authz-match deny backstop),
+  # G4 (A6 generic 400), G5 (the resolv.conf newline invariant predicate), and G7 (the libsql
+  # subset drift re-run). G6 (escape-hatch `derived_managed_db_workload(old,n) != (new,n)`) lives in
+  # boatramp-storage behind its SQL feature; the resolv.conf `render` mutation witness lives in
+  # boatramp-container. This lane runs all three so a non-conforming build fails by exit code.
+  test-name-allowlist:
+    name: test (resource-name allowlist gate)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: test-name-allowlist-host
+      # G1–G5 + G7 in the dedicated gate binary; `--features oidc` also runs the OIDC feeder (G2c).
+      - name: Name-allowlist gate (G1–G7)
+        run: cargo test -p boatramp-server --features oidc --test name_allowlist_gate
+      # G6 escape-hatch containment (authoritative copy behind the SQL feature).
+      - name: G6 escape-hatch workload inequality
+        run: cargo test -p boatramp-storage --features sql-postgres tenant_provision::tests::escape_hatch_workload_differs_by_project
+      # The resolv.conf `render` mutation witness (a second injected nameserver line).
+      - name: G5 resolv.conf render sink
+        run: cargo test -p boatramp-container resolvconf::tests::newline_in_project_cannot_inject_a_second_nameserver_line
+      # The offline mint feeder refusal (end-to-end, in the CLI binary).
+      - name: Offline mint feeder refuses a non-conforming target
+        run: cargo test -p boatramp --bins token::tests::offline_mint_refuses_nonconforming_role_target
+      # The charset/authz/scope unit invariants in their home crates.
+      - name: Charset + authz-backstop + A6 unit invariants
+        run: |
+          set -eo pipefail
+          cargo test -p boatramp-core --lib project::tests::resource_name_rejects_unicode_homoglyphs
+          cargo test -p boatramp-core --lib project::tests::validator_matches_the_slug_oracle
+          cargo test -p boatramp-core --features authz --lib cedar::tests::cedar_matches_oracle_default_policy
+          cargo test -p boatramp-types --lib authz::tests::nonconforming_grant_target_matches_nothing
+          cargo test -p boatramp-server project_scope::tests::nonconforming_project_segment_is_malformed_no_rewrite_no_ctx
+
   # Stage 5a GraphQL Data Connector TARGET-tenant read isolation HARD GATE. A `@tenant(scope:
   # target)` read must confine to another tenant `B`'s declared PUBLIC subset on a REAL libsql
   # engine (compile -> SQL -> execute -> shape), returning only B's published+non-deleted rows and
