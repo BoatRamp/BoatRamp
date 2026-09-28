@@ -591,6 +591,24 @@ impl Right {
                 }
                 Self::new(Resource::System, None, Action::Admin)
             }
+            // The general blob purge (`POST /api/blob-purge`, v0.6.4): a PROVABLY-SAFE-only reclaim —
+            // `unreferenced` GC (blobs no live manifest references) or the `drained_source`
+            // decommission (delete a migration-source key only once byte-confirmed in the primary).
+            // Like the blob DRAIN (and prune/scrub/sql-move), it is a NODE-level DESTRUCTIVE op that
+            // touches every tenant's objects on the node's blob store and is not scoped to a project,
+            // so it is gated at `system·admin`, never a per-project right a tenant token satisfies.
+            // The SINGULAR, HYPHENATED path is deliberate: it does NOT match the `/api/blobs/`
+            // (Blobs·Deploy) prefix matcher above (that requires a literal `/api/blobs/` — a
+            // ship-only publisher holds `Blobs·Deploy`, so a collision would be an ESCALATION), nor
+            // the exact `/api/blobs` / `/api/blob-mint-upload` / `/api/blob-drain` arms. Gated
+            // explicitly here (above the deny-safe `_` default that resolves the same, so a
+            // routing/table regression is visible) and re-checked defense-in-depth at the handler.
+            "/api/blob-purge" => Self::new(Resource::System, None, Action::Admin),
+            // The structured blob transition-mode state (`GET /api/blob-status`, v0.6.4): whether a
+            // read-fallback secondary is attached (the node is mid-migration). A READ-only node
+            // status — the same grade as `/api/sites` / `/api/metrics` — so `system·read` (never a
+            // per-project right). Same hyphen-path collision-avoidance as the sibling `blob-*` arms.
+            "/api/blob-status" => Self::new(Resource::System, None, Action::Read),
             // Any other `/api/*` path: deny-safe (must hold system·admin).
             _ => Self::new(Resource::System, None, Action::Admin),
         };

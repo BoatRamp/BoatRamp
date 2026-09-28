@@ -1457,6 +1457,27 @@ jobs:
               echo "blob fallback mutation verified: BOATRAMP_BLOBFB_MUTATE_${mut}=1 fails the gate as expected."
             fi
           done
+      # General blob purge + structured status (v0.6.4). This gate is the deliberate ROBUST SUCCESSOR
+      # to the marker-style gates above (blob-migrate / blob-drain / blob-fallback), which each rely on
+      # a `#[cfg(feature = "…-gate-mutation")]` env-var seam + a println MARKER string + this bash
+      # grep-the-marker / `for mut in …; do env BOATRAMP_*_MUTATE_${mut}=1 …` loop. Here there is NO
+      # marker to grep and NO env-var mutation loop: the purge safety decision is the PURE predicate
+      # `boatramp_storage::blob_purge::drained_source_deletable`, exhaustively unit-tested; the real-path
+      # integration tests run the actual engine over a seeded `FallbackStorage(primary=fs, secondary=fs)`;
+      # and a TYPED IN-PROCESS mutation matrix (`PurgeMutation::{None, DeleteUnconfirmed, SkipVerify}`,
+      # injected via `purge_drained_source_with`) proves the check is load-bearing — a clean `None` run
+      # keeps every unconfirmed source key while each mutation deletes one, which the SAME fail-closed
+      # assertions detect (`mutation_delete_unconfirmed_is_caught` / `mutation_skip_verify_is_caught`
+      # FAIL if the mutation is not caught). The ordinary test-runner EXIT CODE is the whole contract.
+      # The older marker gates stay unchanged — they are NOT retrofitted.
+      - name: blob purge robust gate (v0.6.4 — pure predicate + integration + in-process mutation matrix)
+        run: |
+          set -eo pipefail
+          # `blob-purge-gate` (storage) compiles the `PurgeMutation` matrix outside cfg(test) and pulls
+          # `fs`+`fallback` for the fixtures; the server half runs its own `blob_purge` route tests.
+          cargo test -p boatramp-storage --features blob-purge-gate \
+                     -p boatramp-server \
+                     blob_purge -- --nocapture
 
   deny:
     name: cargo-deny

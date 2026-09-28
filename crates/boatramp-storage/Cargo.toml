@@ -84,6 +84,15 @@ fallback = ["dep:bytes", "tokio/time"]
 # fs→fs in a tempdir — no cloud — so it pulls this crate's `FsStorage`). Moved here from
 # `boatramp-node` in v0.6.3 when the copy engine relocated into `boatramp-storage`.
 blob-migrate-gate-mutation = ["fs"]
+# The ROBUST purge gate (v0.6.4) — the deliberate successor to the marker-style gates above. When ON,
+# the test-only `PurgeMutation` fault-injection enum + the `purge_drained_source_with` mutation
+# parameter compile OUTSIDE `cfg(test)` too, so the in-process mutation matrix is available to any
+# `blob_purge`-selecting test run. UNLIKE `blob-{migrate,drain}-gate-mutation`, this feature carries
+# NO env-var seam and NO println marker: the safety decision is the pure `drained_source_deletable`
+# predicate, and the gate's contract is the ordinary test-runner EXIT CODE (`cargo test blob_purge`).
+# Implies `fs` + `fallback` (the fixtures build a `FallbackStorage(primary=fs, secondary=fs)`); note
+# both are also in `default`, so a plain `cargo test -p boatramp-storage blob_purge` already runs it.
+blob-purge-gate = ["fs", "fallback"]
 
 [dependencies]
 boatramp-core.workspace = true
