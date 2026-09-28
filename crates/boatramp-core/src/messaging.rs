@@ -37,6 +37,84 @@ use serde::{Deserialize, Serialize};
 use crate::kv::{KvStore, WriteOp};
 use crate::{PutMeta, Storage};
 
+/// The host-resolved `{tenant}` placeholder — the SINGLE topic-subscription template segment (v0.7.1
+/// per-tenant fan-in). Mirrors `blob_upload.rs`'s `TENANT_TEMPLATE` so the consumer-topic template
+/// reuses the exact same convention the stats-topic / upload-container / tenant-secret paths use.
+/// It is the ONLY placeholder — there is no generic `+` wildcard.
+pub const TENANT_TEMPLATE: &str = "{tenant}";
+
+/// The outcome of matching a consumer's subscription `pattern` against one concrete ready/indexed
+/// `topic` ([`tenant_tmpl_matches`]).
+///
+/// A caller MUST distinguish these two arms because they carry different security obligations:
+/// * [`TenantMatch::Exact`] — the pattern carried NO `{tenant}` segment and equalled the concrete
+///   topic verbatim (today's exact-string behavior). There is NO bound tenant, so the per-message
+///   sealed-context bind-verify is SKIPPED (nothing to compare against) — unchanged.
+/// * [`TenantMatch::Tenant`] — the pattern carried a `{tenant}` segment which captured this concrete
+///   topic's tenant value. The bound value MUST be verified against each drained message's sealed
+///   `signed_context` tenant (the security crux): a mismatch is quarantined (dead-lettered),
+///   never delivered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TenantMatch {
+    /// A non-templated exact match — no `{tenant}` segment, no bound tenant (skip the bind-verify).
+    Exact,
+    /// A templated match — the concrete topic's captured `{tenant}` segment (the bound tenant that
+    /// each drained message's sealed context MUST equal).
+    Tenant(String),
+}
+
+/// Match a consumer's subscription `pattern` against one `concrete` ready/indexed topic, segment-wise
+/// on `/` (v0.7.1 per-tenant fan-in). Returns:
+///
+/// * `Some(TenantMatch::Exact)` — `pattern` carried NO [`TENANT_TEMPLATE`] segment and is byte-equal
+///   to `concrete` (today's exact-string dispatch, unchanged). A pattern with no `{tenant}` matches
+///   ONLY its literal self.
+/// * `Some(TenantMatch::Tenant(t))` — `pattern` carried one or more `{tenant}` segments; every one
+///   matched exactly one non-empty concrete segment, every OTHER segment was byte-equal, and the
+///   segment counts were equal. `t` is the captured tenant value (all `{tenant}` segments must
+///   capture the SAME value — a producer stamps one tenant per topic, so `sync/{tenant}/{tenant}`
+///   binds a single tenant; a topic whose two positions disagree does not match, fail-closed).
+/// * `None` — no match (a differing literal segment, a segment-count mismatch, or an empty concrete
+///   segment against a `{tenant}` slot).
+///
+/// A `{tenant}` is a SINGLE segment: it matches exactly one non-`/` concrete segment and never
+/// crosses `/`, so `sync/{tenant}/import` does NOT match `sync/a/b/import` (4 segments vs 3).
+pub fn tenant_tmpl_matches(pattern: &str, concrete: &str) -> Option<TenantMatch> {
+    // Fast path: a pattern with no template segment matches ONLY its literal self (exact string,
+    // the unchanged behavior). Checking the whole string avoids splitting the common case.
+    if !pattern.contains(TENANT_TEMPLATE) {
+        return (pattern == concrete).then_some(TenantMatch::Exact);
+    }
+    let pat_segs: Vec<&str> = pattern.split('/').collect();
+    let con_segs: Vec<&str> = concrete.split('/').collect();
+    // Equal segment counts required — a `{tenant}` slot binds exactly one segment (single-segment
+    // semantics: it never absorbs a `/`).
+    if pat_segs.len() != con_segs.len() {
+        return None;
+    }
+    let mut bound: Option<String> = None;
+    for (p, c) in pat_segs.iter().zip(con_segs.iter()) {
+        if *p == TENANT_TEMPLATE {
+            // The captured concrete segment must be a real, non-empty tenant value.
+            if c.is_empty() {
+                return None;
+            }
+            match &bound {
+                // Every `{tenant}` slot must capture the SAME value (one tenant per message/topic).
+                Some(prev) if prev != c => return None,
+                Some(_) => {}
+                None => bound = Some((*c).to_string()),
+            }
+        } else if p != c {
+            // A literal segment must equal its concrete counterpart.
+            return None;
+        }
+    }
+    // The pattern contained `{tenant}` (checked above), so `bound` is always `Some` here — every
+    // `{tenant}` slot captured a value. Map to the templated arm.
+    bound.map(TenantMatch::Tenant)
+}
+
 /// A message claimed for delivery to a consumer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClaimedMessage {
@@ -532,6 +610,41 @@ pub trait Messaging: Send + Sync {
     /// holds. The default is a no-op (`0`) for a backend without a ready-set.
     async fn rebuild_ready_set(&self) -> Result<usize, MessagingError> {
         Ok(0)
+    }
+
+    /// Every **concrete** topic the backend currently indexes — the full set the periodic ready-set
+    /// rebuild derives from (v0.7.1): topics with a live work-queue record (`mq/{topic}/{id}`) UNION
+    /// registered grouped topics (`mqgstate/{topic}/{group}`). Unlike [`ready_topics`](Self::ready_topics)
+    /// (the fast-path drainer hint, which may be stale/absent), this is the authoritative concrete
+    /// topic set — used by the scheduler's `ConsumerFilter::All` maintenance/fallback pass to enumerate
+    /// the concrete targets a `{tenant}`-templated consumer subscription fans in over (a template
+    /// segment never appears in a ready topic, so `ready_topics` alone can't drive an `All`-pass
+    /// template consumer). The default is empty (a backend that does not index topics has none to
+    /// enumerate; such a backend also has no ready-set, so its consumers are driven by the exact
+    /// full-poll path unchanged).
+    async fn indexed_topics(&self) -> Result<Vec<String>, MessagingError> {
+        Ok(Vec::new())
+    }
+
+    /// **Quarantine** a claimed message into ITS topic's dead-letter queue, fail-closed, with a host
+    /// reason (v0.7.1 tenant-seal-mismatch). Unlike [`nack`](Self::nack) (which redelivers, charging
+    /// an attempt) this is TERMINAL: the message is moved straight to the DLQ regardless of its
+    /// attempt count and is NOT redelivered — the correct disposition for a PERMANENT anomaly (a
+    /// message whose sealed `signed_context` tenant does not equal the concrete topic's bound
+    /// `{tenant}` segment can never legitimately run off that topic, so retrying it is pointless and
+    /// keeping it live would strand it). The message stays inspectable/redrivable via the operator DLQ
+    /// surface exactly like an attempt-exhausted dead-letter, keyed per-concrete-topic (per-tenant DLQ
+    /// preserved). Mirrors the internal claim-path dead-letter move; the reason is captured as the
+    /// record's `last_error` (sanitized). The default is [`MessagingError::Unsupported`] (a backend
+    /// with no DLQ can't quarantine — fail-closed, the caller then refuses to deliver).
+    async fn dead_letter(
+        &self,
+        _msg: &ClaimedMessage,
+        _reason: &str,
+    ) -> Result<(), MessagingError> {
+        Err(MessagingError::Unsupported(
+            "this messaging backend has no dead-letter store (quarantine)".into(),
+        ))
     }
 
     /// The per-topic **next-visible** deadlines for the redelivery due-heap (B6): every topic that has
@@ -2892,6 +3005,65 @@ impl Messaging for LogMessaging {
         Ok(())
     }
 
+    async fn dead_letter(&self, msg: &ClaimedMessage, reason: &str) -> Result<(), MessagingError> {
+        // Terminal quarantine (v0.7.1): move THIS claimed message straight to its topic's DLQ,
+        // regardless of attempts, and stop delivering — the disposition for a permanent anomaly (a
+        // tenant-seal / concrete-topic mismatch that can never legitimately run off this topic). The
+        // preserved record carries the host reason as `last_error` so it surfaces in `dlq ls/show`.
+        // Mirrors the internal claim-path dead-letter move, forced.
+        let last_error = Some(sanitize_reason(reason));
+        // Grouped fan-out: dead-letter under the group's DLQ (`mqgd/{topic}/{group}/{id}`), pinning
+        // the retained payload, then drop the group's in-flight entry — symmetric to the exhausted
+        // grouped dead-letter in `claim_grouped`. Serialized with `claim` (mutates group state).
+        if !msg.group.is_empty() {
+            let _guard = self.claim_lock.lock().await;
+            let signed_context = self.read_ctx(&msg.topic, &msg.id).await;
+            let record = Record {
+                version: crate::SCHEMA_VERSION,
+                attempts: msg.attempts,
+                lease_until_ms: 0,
+                signed_context,
+                inline: None,
+                last_error,
+                expires_at_ms: 0,
+                priority: 0,
+            };
+            let json = serde_json::to_vec(&record).map_err(MessagingError::backend)?;
+            self.kv
+                .put(&gdead_key(&msg.topic, &msg.group, &msg.id), json)
+                .await
+                .map_err(MessagingError::backend)?;
+            if let Some(mut state) = self.get_group_state(&msg.topic, &msg.group).await? {
+                let before = state.in_flight.len();
+                state.in_flight.retain(|f| f.id != msg.id);
+                if state.in_flight.len() != before {
+                    self.put_group_state(&msg.topic, &msg.group, &state).await?;
+                }
+            }
+            return Ok(());
+        }
+        // Work-queue: move the live index record to `mqdead/{topic}/{id}` (annotated with the reason),
+        // preserving the payload, in ONE durable batch (never the relaxed path) — mirroring the
+        // exhausted-attempts move. If the record is already gone (acked/redriven), nothing to do.
+        let key = meta_key(&msg.topic, &msg.id);
+        let Some(raw) = self.kv.get(&key).await.map_err(MessagingError::backend)? else {
+            return Ok(());
+        };
+        let mut record: Record =
+            serde_json::from_slice(&raw).map_err(|e| MessagingError::Decode(e.to_string()))?;
+        record.last_error = last_error;
+        record.lease_until_ms = 0;
+        let json = serde_json::to_vec(&record).map_err(MessagingError::backend)?;
+        self.kv
+            .write_batch(vec![
+                WriteOp::Put(dead_key(&msg.topic, &msg.id), json),
+                WriteOp::Delete(key),
+            ])
+            .await
+            .map_err(MessagingError::backend)?;
+        Ok(())
+    }
+
     async fn purge_dead_letters(&self, topic: &str) -> Result<usize, MessagingError> {
         let mut purged = 0;
         // Work-queue dead-letters: drop the preserved payload then the record (payload-then-index,
@@ -3633,6 +3805,46 @@ impl Messaging for LogMessaging {
         Ok(with_work.len())
     }
 
+    async fn indexed_topics(&self) -> Result<Vec<String>, MessagingError> {
+        // Every concrete topic the index currently knows (v0.7.1): topics with a live work-queue
+        // record (`mq/{topic}/{id}`) UNION registered grouped topics (`mqgstate/{topic}/{group}`) —
+        // the same authoritative concrete set `rebuild_ready_set` derives from. Used by the scheduler
+        // `ConsumerFilter::All` maintenance/fallback pass to enumerate the concrete targets a
+        // `{tenant}`-templated consumer fans in over (a template segment never appears in a topic key,
+        // so `ready_topics` alone can't drive an `All`-pass template consumer). Membership only — no
+        // work/backlog test (the caller claims per concrete topic; an empty claim is cheap and safe).
+        let mut topics: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for key in self
+            .kv
+            .list_prefix("mq/")
+            .await
+            .map_err(MessagingError::backend)?
+        {
+            // `mq/{topic}/{id}` — topic is everything between the first `mq/` and the last `/`.
+            if let Some(rest) = key.strip_prefix("mq/")
+                && let Some(slash) = rest.rfind('/')
+                && slash > 0
+            {
+                topics.insert(rest[..slash].to_string());
+            }
+        }
+        for key in self
+            .kv
+            .list_prefix("mqgstate/")
+            .await
+            .map_err(MessagingError::backend)?
+        {
+            // `mqgstate/{topic}/{group}` — topic is everything between `mqgstate/` and the last `/`.
+            if let Some(rest) = key.strip_prefix("mqgstate/")
+                && let Some(slash) = rest.rfind('/')
+                && slash > 0
+            {
+                topics.insert(rest[..slash].to_string());
+            }
+        }
+        Ok(topics.into_iter().collect())
+    }
+
     async fn due_topics(&self) -> Result<Vec<(String, u64)>, MessagingError> {
         // Per-topic earliest next-visible lease deadline, for the drainer's redelivery due-heap (B6).
         // A pure rebuild-from-durable-state source (the heap is a cache): the earliest `lease_until_ms`
@@ -3720,6 +3932,74 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Mutex;
 
+    // ---- `{tenant}` topic matcher (v0.7.1 per-tenant fan-in) --------------------------------------
+
+    /// A non-templated pattern matches ONLY its literal self, with NO bound tenant (`Exact`) — today's
+    /// exact-string dispatch, unchanged.
+    #[test]
+    fn tenant_tmpl_matches_exact_is_literal_and_binds_no_tenant() {
+        assert_eq!(
+            tenant_tmpl_matches("p/bus/orders/created", "p/bus/orders/created"),
+            Some(TenantMatch::Exact)
+        );
+        // A differing literal does not match.
+        assert_eq!(
+            tenant_tmpl_matches("p/bus/orders/created", "p/bus/orders/shipped"),
+            None
+        );
+        // A non-templated pattern never matches a longer/shorter concrete.
+        assert_eq!(tenant_tmpl_matches("a/b", "a/b/c"), None);
+    }
+
+    /// A `{tenant}` segment captures exactly one concrete segment (the bound tenant); the other
+    /// segments must be byte-equal.
+    #[test]
+    fn tenant_tmpl_matches_template_captures_the_tenant_segment() {
+        assert_eq!(
+            tenant_tmpl_matches("p/bus/sync/{tenant}/import", "p/bus/sync/acme/import"),
+            Some(TenantMatch::Tenant("acme".to_string()))
+        );
+        assert_eq!(
+            tenant_tmpl_matches("p/bus/sync/{tenant}/import", "p/bus/sync/globex/import"),
+            Some(TenantMatch::Tenant("globex".to_string()))
+        );
+        // A literal segment that differs from its concrete counterpart does not match.
+        assert_eq!(
+            tenant_tmpl_matches("p/bus/sync/{tenant}/import", "p/bus/sync/acme/export"),
+            None
+        );
+    }
+
+    /// `{tenant}` is a SINGLE segment — it never crosses `/`, so a template with N segments never
+    /// matches a concrete with a different segment count (the gate's single-segment invariant).
+    #[test]
+    fn tenant_tmpl_matches_is_single_segment_never_crosses_slash() {
+        // `sync/{tenant}/import` (3 segs) does NOT match `sync/a/b/import` (4 segs).
+        assert_eq!(
+            tenant_tmpl_matches("sync/{tenant}/import", "sync/a/b/import"),
+            None
+        );
+        // An empty concrete segment against a `{tenant}` slot never matches (no real tenant value).
+        assert_eq!(
+            tenant_tmpl_matches("sync/{tenant}/import", "sync//import"),
+            None
+        );
+    }
+
+    /// Two `{tenant}` slots must capture the SAME value (one tenant per message/topic); a concrete
+    /// whose two positions disagree does not match (fail-closed).
+    #[test]
+    fn tenant_tmpl_matches_repeated_slots_must_agree() {
+        assert_eq!(
+            tenant_tmpl_matches("t/{tenant}/x/{tenant}", "t/acme/x/acme"),
+            Some(TenantMatch::Tenant("acme".to_string()))
+        );
+        assert_eq!(
+            tenant_tmpl_matches("t/{tenant}/x/{tenant}", "t/acme/x/globex"),
+            None
+        );
+    }
+
     /// Minimal in-memory blob store for the messaging tests.
     #[derive(Default)]
     struct MemStorage {
@@ -3806,6 +4086,53 @@ mod tests {
 
     fn mq() -> LogMessaging {
         LogMessaging::new(Arc::new(MemStorage::default()), Arc::new(MemoryKv::new()))
+    }
+
+    /// `dead_letter` (v0.7.1 quarantine) moves a CLAIMED work-queue message straight to the DLQ,
+    /// regardless of its attempt count, with the reason captured as `last_error`, and does NOT
+    /// redeliver it (terminal). The one-attempt claim proves it is quarantined on the FIRST delivery,
+    /// not after exhausting retries.
+    #[tokio::test]
+    async fn dead_letter_quarantines_a_claimed_message_terminally() {
+        let mq = mq();
+        mq.publish("q", b"poison").await.unwrap();
+        // One claim (attempts=1, well under the max) — quarantine it directly.
+        let batch = mq.claim("q", LEASE, 10, 5).await.unwrap();
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].attempts, 1);
+        mq.dead_letter(&batch[0], "tenant-seal-mismatch")
+            .await
+            .unwrap();
+        // It is in the DLQ, and never redelivers (the live index record is gone).
+        assert_eq!(mq.dead_letter_count("q").await.unwrap(), 1);
+        assert!(
+            mq.claim("q", Duration::ZERO, 10, 5)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        // The reason survived onto the dead-letter record.
+        let dl = mq
+            .list_dead_letters("q", &DeadLetterFilter::default())
+            .await
+            .unwrap();
+        assert_eq!(dl.len(), 1);
+        assert_eq!(dl[0].last_error.as_deref(), Some("tenant-seal-mismatch"));
+    }
+
+    /// `indexed_topics` enumerates every concrete topic the index knows — work-queue topics UNION
+    /// registered grouped topics — the authoritative concrete set the scheduler `All` pass fans a
+    /// `{tenant}` consumer over. A never-published topic is absent.
+    #[tokio::test]
+    async fn indexed_topics_enumerates_concrete_topics() {
+        let mq = mq();
+        mq.publish("sync/acme/import", b"a").await.unwrap();
+        mq.publish("sync/globex/import", b"b").await.unwrap();
+        let got: std::collections::HashSet<String> =
+            mq.indexed_topics().await.unwrap().into_iter().collect();
+        assert!(got.contains("sync/acme/import"));
+        assert!(got.contains("sync/globex/import"));
+        assert!(!got.contains("sync/never/import"));
     }
 
     /// A `KvStore` whose durable-commit boundary (`put`/`write_batch`) always fails — drives the

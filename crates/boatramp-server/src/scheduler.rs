@@ -674,6 +674,13 @@ pub(super) async fn run_scheduler_tick(
     // pass (`All` or `Skip`), not the drainer's `Topics(..)` pass. `All` keeps every existing
     // caller/test byte-identical (it is a maintenance pass that also drives all consumers).
     let maintenance = !matches!(consumers, ConsumerFilter::Topics(_));
+    // v0.7.1 orphaned-work signal (Item 7): accumulate every ACTIVE consumer's namespaced
+    // subscription (exact OR `{tenant}` template) seen this maintenance pass, so after the walk we
+    // can set-difference the backend's concrete indexed topics against these matchers and flag a
+    // topic with claimable work that NO consumer covers. Only collected on a maintenance pass (`All`/
+    // `Skip`); a per-ready-topic drain (`Topics`) does not touch it (the maintenance loop owns this
+    // signal). Cheap: one string per active consumer.
+    let mut active_subscriptions: Vec<String> = Vec::new();
     // Fan out over every project: a same-named site/function/workflow in two
     // projects is scheduled independently (its background jobs run under its own
     // tenant, never `default`). For a single default-only store this is one pass.
@@ -748,14 +755,60 @@ pub(super) async fn run_scheduler_tick(
                             }
                             None => (format!("{scope}/{}", consumer.topic), format!("{scope}/")),
                         };
-                        // Should this pass DISPATCH this consumer (claim + run)? `All` yes; `Skip` no
-                        // (the drainer owns it); `Topics` only if this consumer's topic is ready.
-                        let dispatch = match consumers {
-                            ConsumerFilter::All => true,
-                            ConsumerFilter::Skip => false,
-                            ConsumerFilter::Topics(set) => set.contains(&consumer_topic),
+                        // Orphaned-work signal (Item 7): record this active consumer's namespaced
+                        // subscription (exact OR `{tenant}` template) on a maintenance pass, so the
+                        // post-walk set-difference knows this topic/template IS covered.
+                        if maintenance {
+                            active_subscriptions.push(consumer_topic.clone());
+                        }
+                        // Which CONCRETE topics should this pass DISPATCH for this consumer (v0.7.1)?
+                        // A non-templated `consumer_topic` (no `{tenant}` segment) degenerates to at
+                        // most one exact target (today's behavior, unchanged); a `{tenant}`-templated
+                        // subscription fans in over every matching concrete ready/indexed topic — once
+                        // per concrete (preserving per-tenant group/DLQ). Each target carries its
+                        // `TenantMatch`, so the dispatch can bind+verify the concrete `{tenant}` segment
+                        // against the drained message's sealed context (the security crux).
+                        //
+                        // * `All`   — enumerate the backend's concrete indexed topics and match each
+                        //   (the fallback poll for a non-ready-set backend + every existing caller/test).
+                        // * `Skip`  — none (the ready-set drainer owns delivery).
+                        // * `Topics(set)` — filter the ready set (the drainer already narrowed to due
+                        //   topics; a template segment never appears there, so match each concrete).
+                        use boatramp_core::messaging::{TenantMatch, tenant_tmpl_matches};
+                        let targets: Vec<(String, TenantMatch)> = match consumers {
+                            ConsumerFilter::Skip => Vec::new(),
+                            ConsumerFilter::Topics(set) => set
+                                .iter()
+                                .filter_map(|t| {
+                                    tenant_tmpl_matches(&consumer_topic, t).map(|m| (t.clone(), m))
+                                })
+                                .collect(),
+                            ConsumerFilter::All => {
+                                // Non-templated: keep the exact single fast path (no enumeration) —
+                                // byte-identical to the pre-v0.7.1 `All`-pass dispatch of the literal
+                                // topic. Templated: enumerate concrete indexed topics + match each.
+                                if !consumer_topic
+                                    .contains(boatramp_core::messaging::TENANT_TEMPLATE)
+                                {
+                                    vec![(consumer_topic.clone(), TenantMatch::Exact)]
+                                } else {
+                                    match messaging.indexed_topics().await {
+                                        Ok(all) => all
+                                            .into_iter()
+                                            .filter_map(|t| {
+                                                tenant_tmpl_matches(&consumer_topic, &t)
+                                                    .map(|m| (t, m))
+                                            })
+                                            .collect(),
+                                        Err(err) => {
+                                            tracing::warn!(site, topic = %consumer.topic, %err, "enumerating concrete topics for a templated consumer failed");
+                                            Vec::new()
+                                        }
+                                    }
+                                }
+                            }
                         };
-                        if dispatch {
+                        if !targets.is_empty() {
                             let Some(entry) = manifest.files.get(&consumer.component) else {
                                 tracing::warn!(site, component = %consumer.component, "consumer component missing");
                                 continue;
@@ -849,32 +902,55 @@ pub(super) async fn run_scheduler_tick(
                                     upload_containers: &consumer.upload_containers,
                                     secret_allowlist: &consumer.secrets,
                                 });
-                            acked += dispatch_consumer_batch(
-                                &inner.engine,
-                                messaging.as_ref(),
-                                &inner.metrics,
-                                &site,
-                                &consumer_topic,
-                                &consumer_prefix,
-                                &consumer.group,
-                                consumer.start,
-                                &entry.hash,
-                                wasm,
-                                &bindings,
-                                rebuild.as_ref(),
-                                site_limits(site_handlers),
-                                // Per-consumer overrides (≈ JetStream AckWait/MaxDeliver/batch), each
-                                // falling back to the server default when unset (back-compat).
-                                consumer
-                                    .lease_ms
-                                    .map(Duration::from_millis)
-                                    .unwrap_or(CONSUMER_LEASE),
-                                consumer.max_attempts.unwrap_or(CONSUMER_MAX_ATTEMPTS),
-                                consumer.max_batch.unwrap_or(CONSUMER_BATCH),
-                                consumer.max_ack_pending,
-                                consumer.backoff_ms.unwrap_or(0),
-                            )
-                            .await;
+                            // Dispatch ONCE per matching concrete topic (v0.7.1 fan-in). For a
+                            // non-templated consumer this loops exactly once over the exact topic
+                            // (`TenantMatch::Exact`, `expected_tenant = None` ⇒ no bind-verify —
+                            // unchanged). For a `{tenant}` template each concrete match carries its
+                            // captured tenant as `expected_tenant`, so a per-message sealed-context
+                            // mismatch is quarantined (bind-verify). `claim_grouped(concrete, group)`
+                            // keys the group cursor + DLQ + lag per concrete topic, so per-tenant
+                            // operability is preserved for free (Item 4).
+                            // The fleet anchor (the signer's public half) the durable signed-context
+                            // envelope is verified against — resolved once per consumer for the
+                            // bind-verify. Absent (no signer wired) ⇒ a templated topic can verify no
+                            // envelope, so every message on it quarantines (fail-closed).
+                            let context_anchor = inner.session_signer.get().map(|s| s.public_key());
+                            for (concrete, matched) in &targets {
+                                let expected_tenant = match matched {
+                                    TenantMatch::Exact => None,
+                                    TenantMatch::Tenant(t) => Some(t.as_str()),
+                                };
+                                acked += dispatch_consumer_batch(
+                                    &inner.engine,
+                                    messaging.as_ref(),
+                                    &inner.metrics,
+                                    &site,
+                                    concrete,
+                                    &consumer_prefix,
+                                    &consumer.group,
+                                    consumer.start,
+                                    &entry.hash,
+                                    wasm,
+                                    &bindings,
+                                    rebuild.as_ref(),
+                                    // The concrete topic's bound `{tenant}` segment (templated), or
+                                    // `None` (non-templated ⇒ no check). SECURITY CRUX (Item 3).
+                                    expected_tenant,
+                                    context_anchor.as_ref(),
+                                    site_limits(site_handlers),
+                                    // Per-consumer overrides (≈ JetStream AckWait/MaxDeliver/batch),
+                                    // each falling back to the server default when unset (back-compat).
+                                    consumer
+                                        .lease_ms
+                                        .map(Duration::from_millis)
+                                        .unwrap_or(CONSUMER_LEASE),
+                                    consumer.max_attempts.unwrap_or(CONSUMER_MAX_ATTEMPTS),
+                                    consumer.max_batch.unwrap_or(CONSUMER_BATCH),
+                                    consumer.max_ack_pending,
+                                    consumer.backoff_ms.unwrap_or(0),
+                                )
+                                .await;
+                            }
                         }
                         // A grouped (fan-out) topic keeps a retained log; reclaim fully-consumed
                         // messages once a minute per topic, off the hot claim path, on the leader only
@@ -886,30 +962,60 @@ pub(super) async fn run_scheduler_tick(
                         if sweep_this_pass
                             && !consumer.group.is_empty()
                             && inner.cron_leader_gate.get().is_none_or(|gate| gate())
-                            && sweep_state
-                                .get(&consumer_topic)
-                                .is_none_or(|stamp| *stamp != now.minute_stamp)
                         {
-                            sweep_state.insert(consumer_topic.clone(), now.minute_stamp);
-                            match messaging
-                                .retention_sweep(
-                                    &consumer_topic,
-                                    consumer
-                                        .retention_ms
-                                        .unwrap_or(boatramp_core::messaging::GROUP_RETENTION_MS),
-                                )
-                                .await
+                            // v0.7.1: a `{tenant}`-templated grouped consumer must sweep EACH matching
+                            // concrete topic (sweeping the literal template is a no-op — no group state
+                            // is keyed under the template string). A non-templated consumer sweeps its
+                            // one literal topic (unchanged). The maintenance pass's `targets` above is
+                            // empty on the `Skip` pass (the drainer owns delivery), so enumerate the
+                            // concrete sweep set here independently of `targets`.
+                            let sweep_topics: Vec<String> = if !consumer_topic
+                                .contains(boatramp_core::messaging::TENANT_TEMPLATE)
                             {
-                                Ok(n) if n > 0 => tracing::debug!(
-                                    topic = %consumer_topic,
-                                    reclaimed = n,
-                                    "consumer-group retention sweep"
-                                ),
-                                Ok(_) => {}
-                                Err(err) => tracing::warn!(
-                                    topic = %consumer_topic, %err,
-                                    "consumer-group retention sweep failed"
-                                ),
+                                vec![consumer_topic.clone()]
+                            } else {
+                                match messaging.indexed_topics().await {
+                                    Ok(all) => all
+                                        .into_iter()
+                                        .filter(|t| {
+                                            boatramp_core::messaging::tenant_tmpl_matches(
+                                                &consumer_topic,
+                                                t,
+                                            )
+                                            .is_some()
+                                        })
+                                        .collect(),
+                                    Err(err) => {
+                                        tracing::warn!(site, topic = %consumer.topic, %err, "enumerating concrete topics for a templated retention sweep failed");
+                                        Vec::new()
+                                    }
+                                }
+                            };
+                            let retention_ms = consumer
+                                .retention_ms
+                                .unwrap_or(boatramp_core::messaging::GROUP_RETENTION_MS);
+                            for sweep_topic in sweep_topics {
+                                // Per-concrete once-a-minute throttle (each concrete topic has its own
+                                // group cursor, so it sweeps independently).
+                                if sweep_state
+                                    .get(&sweep_topic)
+                                    .is_some_and(|stamp| *stamp == now.minute_stamp)
+                                {
+                                    continue;
+                                }
+                                sweep_state.insert(sweep_topic.clone(), now.minute_stamp);
+                                match messaging.retention_sweep(&sweep_topic, retention_ms).await {
+                                    Ok(n) if n > 0 => tracing::debug!(
+                                        topic = %sweep_topic,
+                                        reclaimed = n,
+                                        "consumer-group retention sweep"
+                                    ),
+                                    Ok(_) => {}
+                                    Err(err) => tracing::warn!(
+                                        topic = %sweep_topic, %err,
+                                        "consumer-group retention sweep failed"
+                                    ),
+                                }
                             }
                         }
                     }
@@ -1058,6 +1164,56 @@ pub(super) async fn run_scheduler_tick(
                     drain_workflow_runs(inner, deploy, project, &workflow).await;
                 }
             }
+        }
+    }
+    // v0.7.1 orphaned-work signal (Item 7): on a maintenance pass, set-difference the backend's
+    // concrete indexed topics against the active consumer subscriptions collected above — a concrete
+    // topic with claimable work that NO consumer covers (exact OR `{tenant}`-match) is ORPHANED
+    // (a declared-but-un-routable consumer, or a producer with no consumer). Emit a `warn` + record
+    // it into the metrics registry (`orphaned_ready_topic{topic}` gauge + the operator `stats`
+    // block), so the silent stuck-backlog defect surfaces in minutes. Leader-gated (single node =
+    // always) so a cluster raises it once, not per-node. Cheap: one `indexed_topics` scan + a
+    // per-orphan `backlog` count (only for the — normally empty — uncovered set).
+    let is_leader = inner.cron_leader_gate.get().is_none_or(|gate| gate());
+    if maintenance
+        && is_leader
+        && let Some(messaging) = inner.messaging.clone()
+    {
+        match messaging.indexed_topics().await {
+            Ok(indexed) => {
+                let mut orphaned = std::collections::BTreeMap::new();
+                for topic in indexed {
+                    // Covered if ANY active subscription matches this concrete topic (an exact
+                    // literal or a `{tenant}` template) — reuse the SAME matcher the dispatch uses,
+                    // so the orphaned signal and the delivery path agree exactly.
+                    let covered = active_subscriptions.iter().any(|sub| {
+                        boatramp_core::messaging::tenant_tmpl_matches(sub, &topic).is_some()
+                    });
+                    if covered {
+                        continue;
+                    }
+                    // Uncovered: count its claimable backlog (an uncovered topic is never claimed,
+                    // so its whole backlog is never-attempted `attempts=0` work). A topic with zero
+                    // backlog is not orphaned work — skip it (idle/drained).
+                    let backlog = messaging.backlog(&topic).await.unwrap_or(0);
+                    if backlog > 0 {
+                        tracing::warn!(
+                            topic = %topic,
+                            claimable = backlog,
+                            "orphaned ready topic: claimable work with NO active consumer \
+                             subscription covering it (a declared-but-un-routable consumer, or a \
+                             producer with no consumer) — messages will never be delivered"
+                        );
+                        orphaned.insert(topic, backlog as u64);
+                    }
+                }
+                inner.metrics.set_orphaned_topics(orphaned);
+            }
+            // A backend without `indexed_topics` (poll-only) can't enumerate — clear the signal
+            // (no false positives) rather than erroring the tick.
+            Err(_) => inner
+                .metrics
+                .set_orphaned_topics(std::collections::BTreeMap::new()),
         }
     }
     Ok((acked, cron_handles))
