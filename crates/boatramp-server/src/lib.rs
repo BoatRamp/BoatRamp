@@ -2223,10 +2223,14 @@ pub async fn serve_with(
         DRAIN_DEADLINE,
     )
     .await;
-    // Stop the scheduler once the server has drained.
+    // Fully QUIESCE the scheduler once the server has drained — not a bare abort of the outer
+    // loop, but abort+await of its detached children (delivery drainer, blob watchers, in-flight
+    // crons) so none can issue a KV write after the caller closes the store (Part A). Awaiting
+    // here means `serve_with` does not return until the scheduler tree has stopped writing, so the
+    // caller's subsequent `kv.close()` is race-free. Bounded upstream by the caller's close timeout.
     #[cfg(feature = "handlers")]
     if let Some(handle) = scheduler {
-        handle.abort();
+        handle.quiesce().await;
     }
     gateway_prober.abort();
     result
@@ -4935,6 +4939,140 @@ mod tests {
             "gate 5: a fresh (empty) due-heap still redelivers the leased-then-expired message"
         );
         handle.abort();
+    }
+
+    /// **A2** — quiesce-before-close: after [`SchedulerHandle::quiesce`], NO scheduler task
+    /// (delivery drainer, blob watchers, in-flight crons) issues another KV write, so a subsequent
+    /// store `close()` is race-free. A `GuardedKv` records any write that lands AFTER `close()` as a
+    /// violation; the gate asserts zero such writes and an `Ok` close.
+    ///
+    /// Anti-hollow mutation: change `serve_with`'s `handle.quiesce().await` back to a bare
+    /// `handle.abort()` (the old contract, which does NOT await the detached drainer/watchers). The
+    /// drainer then keeps running past the close and lands a write on the closed store → the
+    /// `writes_after_close` counter goes non-zero and this gate fails. (Here we call `quiesce()`
+    /// directly, so the equivalent mutation is dropping the child abort+await in the scheduler's
+    /// cancel tail — same failure.)
+    #[cfg(feature = "handlers")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a2_quiesce_before_close_no_write_races_the_close() {
+        use boatramp_core::kv::KvError;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        /// Wraps a `KvStore`; once `close()` is called, every further write increments
+        /// `writes_after_close` (and is rejected, modelling SlateDB's post-mark `Closed` error).
+        struct GuardedKv {
+            inner: Arc<dyn KvStore>,
+            closed: AtomicBool,
+            writes_after_close: Arc<AtomicUsize>,
+        }
+        #[async_trait::async_trait]
+        impl KvStore for GuardedKv {
+            async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, KvError> {
+                self.inner.get(key).await
+            }
+            async fn put(&self, key: &str, value: Vec<u8>) -> Result<(), KvError> {
+                if self.closed.load(Ordering::SeqCst) {
+                    self.writes_after_close.fetch_add(1, Ordering::SeqCst);
+                    return Err(KvError::backend("store is Closed"));
+                }
+                self.inner.put(key, value).await
+            }
+            async fn delete(&self, key: &str) -> Result<(), KvError> {
+                if self.closed.load(Ordering::SeqCst) {
+                    self.writes_after_close.fetch_add(1, Ordering::SeqCst);
+                    return Err(KvError::backend("store is Closed"));
+                }
+                self.inner.delete(key).await
+            }
+            async fn list_prefix(&self, prefix: &str) -> Result<Vec<String>, KvError> {
+                self.inner.list_prefix(prefix).await
+            }
+            async fn list_from(
+                &self,
+                prefix: &str,
+                after: &str,
+                limit: usize,
+            ) -> Result<Vec<String>, KvError> {
+                self.inner.list_from(prefix, after, limit).await
+            }
+            fn atomic_write_batch(&self) -> bool {
+                self.inner.atomic_write_batch()
+            }
+            fn supports_cas(&self) -> bool {
+                self.inner.supports_cas()
+            }
+            async fn compare_and_swap(
+                &self,
+                key: &str,
+                expected: Option<&[u8]>,
+                new: Vec<u8>,
+            ) -> Result<bool, KvError> {
+                if self.closed.load(Ordering::SeqCst) {
+                    self.writes_after_close.fetch_add(1, Ordering::SeqCst);
+                    return Err(KvError::backend("store is Closed"));
+                }
+                self.inner.compare_and_swap(key, expected, new).await
+            }
+            async fn write_batch(
+                &self,
+                ops: Vec<boatramp_core::kv::WriteOp>,
+            ) -> Result<(), KvError> {
+                if self.closed.load(Ordering::SeqCst) {
+                    self.writes_after_close.fetch_add(1, Ordering::SeqCst);
+                    return Err(KvError::backend("store is Closed"));
+                }
+                self.inner.write_batch(ops).await
+            }
+            async fn close(&self) -> Result<(), KvError> {
+                // Mark closed FIRST (like SlateDB's `Db::close`), so any writer still live after the
+                // quiesce is observed as a post-close write.
+                self.closed.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let storage = Arc::new(MemStorage::default());
+        let backing: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let writes_after_close = Arc::new(AtomicUsize::new(0));
+        let guarded: Arc<dyn KvStore> = Arc::new(GuardedKv {
+            inner: backing.clone(),
+            closed: AtomicBool::new(false),
+            writes_after_close: writes_after_close.clone(),
+        });
+        let messaging: Arc<dyn Messaging> =
+            Arc::new(LogMessaging::new(storage.clone(), guarded.clone()));
+        let (rt, deploy) =
+            setup_delivery_consumer(storage, guarded.clone(), messaging.clone()).await;
+        rt.set_delivery_config(DeliveryConfig {
+            safetynet_interval: Duration::from_millis(50),
+            rebuild_interval: Duration::from_millis(100),
+        });
+        let handle = rt.spawn_scheduler(deploy).unwrap();
+        // Drive real delivery so the drainer is actively claiming + writing the store.
+        for _ in 0..5 {
+            messaging
+                .publish("blog/orders/created", b"x")
+                .await
+                .unwrap();
+        }
+        assert!(
+            await_delivered(&guarded, b"5", Duration::from_secs(6)).await,
+            "A2 setup: the drainer must be actively delivering (writing the store) before we quiesce"
+        );
+
+        // The Part-A ordering: quiesce the scheduler tree (abort+await drainer + watchers + crons),
+        // THEN close the store.
+        handle.quiesce().await;
+        guarded.close().await.unwrap();
+        // Give any (incorrectly) still-live child a fair window to attempt a post-close write.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        assert_eq!(
+            writes_after_close.load(Ordering::SeqCst),
+            0,
+            "A2: NO scheduler write may land after close — quiesce() must have fully stopped the \
+             drainer/watchers/crons BEFORE the store was closed"
+        );
     }
 
     /// A `Messaging` wrapper that delegates to an inner [`LogMessaging`] but reports NO wake handle,

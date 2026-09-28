@@ -31,6 +31,8 @@ use slatedb::object_store::ObjectStore;
 use slatedb::object_store::local::LocalFileSystem;
 use slatedb::{Db, DbReader, DbReaderBuilder, Settings, WriteBatch};
 
+pub use crate::wal_repair::{RepairMode, RepairReport, WalRepairError};
+
 /// A SlateDB-backed key/value store — either the single **writer** or a
 /// read-only **reader replica**. SlateDB is
 /// single-writer (manifest fencing); the shared-store topology is therefore one
@@ -56,6 +58,50 @@ enum Backend {
 
 fn backend<E: std::fmt::Display>(err: E) -> KvError {
     KvError::backend(err.to_string())
+}
+
+/// Map a SlateDB open/build error into a [`KvError`], and — when it looks like a **torn WAL
+/// tail** (the P0 failure mode: a partial trailing WAL object with a bad version word, or the
+/// empty-SSTable symptom) — extend the message to name the OPT-IN repair. The default cold open
+/// stays FAIL-LOUD (SAFETY: quarantining acked-into-WAL data is an operator decision, never
+/// automatic), so this only makes the loud failure *actionable*, it does not repair anything.
+fn map_open_error(err: slatedb::Error) -> KvError {
+    let raw = err.to_string();
+    // The torn-tail signatures slatedb surfaces on replay of a partial WAL object: the >10-byte
+    // partial (`InvalidVersion { actual_version: 0 }`) and the empty-SSTable symptom. Matched on
+    // the message (slatedb does not expose a stable typed variant for these across versions).
+    let looks_torn = raw.contains("InvalidVersion")
+        || raw.contains("actual_version")
+        || raw.contains("empty SSTable")
+        || raw.contains("EmptySSTable");
+    if looks_torn {
+        KvError::backend(format!(
+            "control-plane SlateDB store failed to open: the WAL tail is torn ({raw}). \
+             This is the crash/snapshot partial-tail case. To recover, run \
+             `boatramp kv repair` (a DRY-RUN prints the plan) then `boatramp kv repair --apply`, \
+             OR redeploy with the env `BOATRAMP_KV_REPAIR=1` (equivalently `boatramp serve \
+             --repair-wal`) to repair-then-open in place. A hard-crash repair may lose the \
+             most-recent acked-into-WAL-but-not-yet-L0 writes; a graceful shutdown is lossless."
+        ))
+    } else {
+        KvError::backend(raw)
+    }
+}
+
+/// A one-line human summary of a [`RepairReport`] for the dry-run surface.
+fn describe_report(report: &RepairReport) -> String {
+    let classes: Vec<String> = report
+        .candidates
+        .iter()
+        .map(|c| format!("{:020}[{} bytes, {:?}]", c.id, c.size, c.class))
+        .collect();
+    format!(
+        "durable frontier (replay_after_wal_id) = {}; WAL candidates beyond it (highest first): \
+         [{}]; would quarantine {:?} (trailing torn tail). Re-run with `--apply` to perform it.",
+        report.frontier,
+        classes.join(", "),
+        report.quarantined,
+    )
 }
 
 /// SlateDB [`Settings`] with `flush_interval` overridden, everything else left
@@ -85,7 +131,21 @@ pub struct S3StoreConfig {
 /// Build an `object_store` S3 backend from [`S3StoreConfig`] + ambient AWS
 /// credentials. SlateDB fences its manifest with conditional puts, so the store
 /// is built with ETag-based conditional put (which R2 supports).
-fn build_s3_object_store(cfg: &S3StoreConfig) -> Result<Arc<dyn ObjectStore>, KvError> {
+/// Build the `LocalFileSystem` object store rooted at `dir` exactly as the local control-plane
+/// opener does (`open_local_settings`). Exposed so the `boatramp kv repair` CLI can build the
+/// SAME store the opener would, and run the repair against it (root `"kv"`).
+pub fn local_object_store(dir: &Path) -> Result<LocalFileSystem, KvError> {
+    LocalFileSystem::new_with_prefix(dir).map_err(backend)
+}
+
+/// Build the S3/R2 object store from an [`S3StoreConfig`] (ambient AWS creds), exactly as the
+/// S3 control-plane opener does. Exposed so the `boatramp kv repair` CLI can build the SAME
+/// store the opener would and run the repair against it (root = the configured prefix).
+pub fn s3_object_store(cfg: &S3StoreConfig) -> Result<Arc<dyn ObjectStore>, KvError> {
+    build_s3_object_store(cfg)
+}
+
+pub(crate) fn build_s3_object_store(cfg: &S3StoreConfig) -> Result<Arc<dyn ObjectStore>, KvError> {
     use object_store::aws::{AmazonS3Builder, S3ConditionalPut};
     let mut builder = AmazonS3Builder::from_env()
         .with_bucket_name(&cfg.bucket)
@@ -134,16 +194,94 @@ impl SlateKv {
         Self::open_with_flush(build_s3_object_store(cfg)?, path, flush_interval).await
     }
 
+    /// Like [`SlateKv::open_with_flush`] but, when `repair` is set, first runs the opt-in
+    /// [WAL tail repair](crate::wal_repair::repair_wal_tail) over the SAME `store` + `path`
+    /// BEFORE opening — so a store whose cold open would otherwise fail on a torn trailing
+    /// WAL tail (a hard-crash / snapshot partial) is repaired in place, then opened. `None`
+    /// is the default cold open (unchanged; still fails LOUD on a torn tail). The repair
+    /// enforces its own data-loss guard (trailing-only + beyond-frontier + refuse-on-mid-gap
+    /// + refuse-on-unreadable-manifest) and refuses rather than dropping acked data.
+    pub async fn open_with_flush_repair(
+        store: Arc<dyn ObjectStore>,
+        path: &str,
+        flush_interval: Duration,
+        repair: Option<RepairMode>,
+    ) -> Result<Self, KvError> {
+        Self::open_with_repair(store, path, settings_with_flush(flush_interval), repair).await
+    }
+
+    /// Like [`SlateKv::open_s3_with_flush`] but with the opt-in WAL repair (see
+    /// [`SlateKv::open_with_flush_repair`]).
+    pub async fn open_s3_with_flush_repair(
+        cfg: &S3StoreConfig,
+        path: &str,
+        flush_interval: Duration,
+        repair: Option<RepairMode>,
+    ) -> Result<Self, KvError> {
+        Self::open_with_flush_repair(build_s3_object_store(cfg)?, path, flush_interval, repair)
+            .await
+    }
+
     async fn open_with(
         store: Arc<dyn ObjectStore>,
         path: &str,
         settings: Settings,
     ) -> Result<Self, KvError> {
-        let db = Db::builder(path.to_string(), store)
+        Self::open_with_repair(store, path, settings, None).await
+    }
+
+    /// The single open choke point. When `repair` is `Some`, the WAL tail repair runs FIRST
+    /// (against the same `store` + `path`), before `Db::builder().build()`. On a plain cold
+    /// open (`None`) a torn-tail build error is mapped to a LOUD, actionable message that
+    /// names the opt-in repair — the default MUST still fail loud (SAFETY: an operator, not
+    /// an automatic open, decides to quarantine acked-into-WAL data).
+    async fn open_with_repair(
+        store: Arc<dyn ObjectStore>,
+        path: &str,
+        settings: Settings,
+        repair: Option<RepairMode>,
+    ) -> Result<Self, KvError> {
+        if let Some(mode) = repair {
+            let report = crate::wal_repair::repair_wal_tail(&store, path, mode)
+                .await
+                .map_err(|e| KvError::backend(e.to_string()))?;
+            match mode {
+                RepairMode::DryRun => {
+                    // A dry-run must NOT open the store — it only reports the plan. Surface the
+                    // plan as an error so a `--dry-run` caller never silently proceeds to serve.
+                    return Err(KvError::backend(format!(
+                        "WAL repair dry-run (no mutation performed): {}",
+                        describe_report(&report)
+                    )));
+                }
+                RepairMode::Apply => {
+                    if report.applied {
+                        tracing::warn!(
+                            frontier = report.frontier,
+                            quarantined = ?report.quarantined,
+                            dir = report.quarantine_dir.as_deref().unwrap_or(""),
+                            "control-plane WAL tail repaired: quarantined a torn trailing tail \
+                             beyond the durable frontier. NOTE: a hard-crash repair may have lost \
+                             the most-recent acked-into-WAL-but-not-yet-L0 writes (the graceful \
+                             shutdown path is lossless)."
+                        );
+                    } else {
+                        tracing::info!(
+                            frontier = report.frontier,
+                            "control-plane WAL repair: no torn trailing tail found; opening normally"
+                        );
+                    }
+                }
+            }
+        }
+        let db = match Db::builder(path.to_string(), store)
             .with_settings(settings)
             .build()
             .await
-            .map_err(backend)?;
+        {
+            Ok(db) => db,
+            Err(err) => return Err(map_open_error(err)),
+        };
         Ok(Self {
             backend: Backend::Writer(Arc::new(db)),
             cas_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -188,12 +326,26 @@ impl SlateKv {
         Self::open_local_settings(dir, settings_with_flush(flush_interval)).await
     }
 
+    /// Open a local control-plane store with the opt-in WAL repair (see
+    /// [`SlateKv::open_with_flush_repair`]). Builds the SAME `LocalFileSystem` object store +
+    /// `"kv"` root the plain [`open_local_with_flush`](Self::open_local_with_flush) uses, so the
+    /// repair sees exactly the objects the open would replay.
+    pub async fn open_local_with_flush_repair(
+        dir: impl AsRef<Path>,
+        flush_interval: Duration,
+        repair: Option<RepairMode>,
+    ) -> Result<Self, KvError> {
+        std::fs::create_dir_all(&dir)?;
+        let fs = local_object_store(dir.as_ref())?;
+        Self::open_with_flush_repair(Arc::new(fs), "kv", flush_interval, repair).await
+    }
+
     async fn open_local_settings(
         dir: impl AsRef<Path>,
         settings: Settings,
     ) -> Result<Self, KvError> {
         std::fs::create_dir_all(&dir)?;
-        let fs = LocalFileSystem::new_with_prefix(dir.as_ref()).map_err(backend)?;
+        let fs = local_object_store(dir.as_ref())?;
         Self::open_with(Arc::new(fs), "kv", settings).await
     }
 
@@ -226,6 +378,22 @@ impl KvStore for SlateKv {
             Backend::Writer(db) => db.flush().await.map_err(backend),
             Backend::Reader(_) => Ok(()),
         }
+    }
+
+    async fn close(&self) -> Result<(), KvError> {
+        // The real SlateDB `close()`: freeze memtables to L0, advance the durable frontier
+        // (`replay_after_wal_id`), and shut down the writer/flusher/compactor tasks — so a
+        // subsequent cold open has an empty WAL replay range (no torn tail). Unlike `flush()`
+        // (WAL only), this is what makes the graceful shutdown lossless. The caller MUST have
+        // quiesced every writer first: `Db::close()` marks the store closed then flushes, so a
+        // late write errors `Closed` or forces a new WAL segment. No-op on a read replica.
+        //
+        // Delegates to the inherent [`SlateKv::close`] so both entry points share one impl.
+        // Named `SlateKv::close` (NOT `Self::close`) deliberately: inside this trait `close` impl,
+        // `Self::close` would resolve to THIS trait method — an infinite recursion — whereas
+        // `SlateKv::close` names the inherent method. `allow(clippy::use_self)` keeps that explicit.
+        #[allow(clippy::use_self)]
+        SlateKv::close(self).await
     }
 
     async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, KvError> {
@@ -790,6 +958,455 @@ mod tests {
             eprintln!("EMPTY WAL TAIL RECOVERED OK");
         })
         .await;
+    }
+
+    // ===================================================================================
+    // WAL-repair gate battery (Part A close-not-flush + Part B store-backed gates).
+    //
+    // These open a REAL SlateDB store over `LocalFileSystem` and close/reopen it, so — like
+    // `empty_tail_wal_object_is_tolerated_and_data_survives` above — they are `#[ignore]`d for
+    // the static-musl harness (close→reopen stalls there) and run UNIGNORED on the host toolchain
+    // via the CI `test (slatedb WAL recovery)` job. Each is WALL-CLOCK bound by
+    // `with_fresh_slatedb_dir`'s timeout (per the #499/#500 lesson), not iteration-count.
+    // ===================================================================================
+
+    /// Discover the highest WAL SST id currently on disk under `dir/kv/wal/`.
+    fn max_wal_id(dir: &std::path::Path) -> u64 {
+        let wal_dir = dir.join("kv").join("wal");
+        std::fs::read_dir(&wal_dir)
+            .expect("wal/ dir should exist after writes")
+            .filter_map(Result::ok)
+            .filter_map(|e| {
+                e.path()
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .and_then(|s| s.parse::<u64>().ok())
+            })
+            .max()
+            .expect("expected WAL objects on disk (compactor/GC are off in test_settings)")
+    }
+
+    /// Inject a **>10-byte torn** WAL object (version word 0 — the production `InvalidVersion`
+    /// signature) at `dir/kv/wal/{id:020}.sst`. Distinct from the existing `empty_tail` test,
+    /// which injects a 0-byte object (the ALREADY-tolerated fence case): this is the >10-byte
+    /// partial that HARD-FAILS a default cold open (the coverage gap B1 closes).
+    fn inject_torn_tail(dir: &std::path::Path, id: u64) {
+        let wal_dir = dir.join("kv").join("wal");
+        // 64 bytes of filler ending in an 8-byte offset + a 2-byte BE version word of 0.
+        let mut body = vec![0xABu8; 64];
+        let n = body.len();
+        body[n - 2..n].copy_from_slice(&0u16.to_be_bytes());
+        std::fs::write(wal_dir.join(format!("{id:020}.sst")), &body).unwrap();
+    }
+
+    /// Build the same `LocalFileSystem`-over-`kv` store the opener uses, as an
+    /// `Arc<dyn ObjectStore>` the repair takes.
+    fn fs_store(dir: &std::path::Path) -> Arc<dyn ObjectStore> {
+        Arc::new(local_object_store(dir).unwrap())
+    }
+
+    /// **A1** — close-not-flush advances the durable frontier: after a graceful `close()`, the
+    /// reopen's WAL replay range is EMPTY (all acked data is in L0, not the WAL), and every key
+    /// survives. The mutation this guards: reverting `close()` to `flush()` on shutdown leaves the
+    /// frontier un-advanced, so the WAL objects for the writes stay beyond the frontier — this
+    /// asserts ZERO candidates beyond the frontier after close, which a flush-only shutdown fails.
+    #[serial_test::serial]
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "on-disk close→reopen; the CI `test (slatedb WAL recovery)` job runs it unignored"]
+    async fn a1_close_advances_frontier_empty_wal_replay() {
+        with_fresh_slatedb_dir("a1-close-frontier", |dir| async move {
+            {
+                let kv = SlateKv::open_local_settings(
+                    &dir,
+                    test_settings(Some(Duration::from_millis(5))),
+                )
+                .await
+                .unwrap();
+                kv.write_batch(vec![
+                    WriteOp::Put("project/acme".into(), b"seed".to_vec()),
+                    WriteOp::Put("secret/acme/idp".into(), b"sealed".to_vec()),
+                    WriteOp::Put("current/console".into(), b"deploy-9".to_vec()),
+                ])
+                .await
+                .unwrap();
+                // The graceful shutdown primitive under test: `close()` (freeze memtables → L0,
+                // advance the durable frontier), NOT the old bare `flush()`.
+                KvStore::close(&kv).await.unwrap();
+            }
+
+            // After close, NO WAL object should sit beyond the durable frontier — a dry-run repair
+            // reports the frontier + candidates; the candidate list beyond it must be empty.
+            let store = fs_store(&dir);
+            let report = crate::wal_repair::repair_wal_tail(&store, "kv", RepairMode::DryRun)
+                .await
+                .unwrap();
+            assert!(
+                report.candidates.is_empty(),
+                "A1: after close() the durable frontier (replay_after_wal_id={}) must cover every \
+                 WAL object — a flush-only shutdown would leave the write WAL objects beyond it; \
+                 got candidates {:?}",
+                report.frontier,
+                report.candidates,
+            );
+
+            // And the reopen still sees every key (close was lossless).
+            let kv = SlateKv::open_local_settings(&dir, test_settings(None))
+                .await
+                .unwrap();
+            assert_eq!(
+                kv.get("project/acme").await.unwrap(),
+                Some(b"seed".to_vec())
+            );
+            assert_eq!(
+                kv.get("secret/acme/idp").await.unwrap(),
+                Some(b"sealed".to_vec())
+            );
+            assert_eq!(
+                kv.get("current/console").await.unwrap(),
+                Some(b"deploy-9".to_vec())
+            );
+            KvStore::close(&kv).await.unwrap();
+            eprintln!("A1 CLOSE-ADVANCES-FRONTIER OK");
+        })
+        .await;
+    }
+
+    /// **B1** — the DEFAULT cold open stays LOUD on the >10-byte version-0 torn tail (the
+    /// coverage gap: the existing empty-tail test only injects a 0-byte tail), and the error names
+    /// the repair. Mutation guarded: silently tolerating the torn tail on the default open would
+    /// make this `Ok(...)`, failing the `is_err()` assertion.
+    #[serial_test::serial]
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "on-disk close→reopen; the CI `test (slatedb WAL recovery)` job runs it unignored"]
+    async fn b1_default_open_is_loud_on_torn_version0_tail() {
+        with_fresh_slatedb_dir("b1-loud", |dir| async move {
+            {
+                let kv = SlateKv::open_local_settings(
+                    &dir,
+                    test_settings(Some(Duration::from_millis(5))),
+                )
+                .await
+                .unwrap();
+                kv.put("project/acme", b"seed".to_vec()).await.unwrap();
+                kv.flush().await.unwrap(); // WAL durable, frontier NOT advanced (no close)
+            }
+            // Inject a >10-byte version-0 torn object at max_id+1 — beyond the frontier, so it
+            // lands in the reopen's WAL replay range and fails the default open.
+            inject_torn_tail(&dir, max_wal_id(&dir) + 1);
+
+            // DEFAULT open (no repair) must FAIL LOUD and name the repair.
+            let msg = match SlateKv::open_local_with_flush(&dir, Duration::from_millis(5)).await {
+                Ok(_) => panic!("B1: default cold open MUST fail loud on a torn version-0 tail"),
+                Err(err) => err.to_string(),
+            };
+            assert!(
+                msg.contains("boatramp kv repair") && msg.contains("BOATRAMP_KV_REPAIR"),
+                "B1: the loud error must name the opt-in repair; got: {msg}"
+            );
+            eprintln!("B1 DEFAULT-LOUD-ON-TORN-TAIL OK");
+        })
+        .await;
+    }
+
+    /// **B2** — the repair recovers the store AND every committed key (projects / sites / **sealed
+    /// secrets** / current pointers) survives. This is the load-bearing gate.
+    ///
+    /// Anti-hollow mutation: the guard is that the reopen after `--apply` returns the exact bytes
+    /// for EVERY key, incl. the sealed secret. If the repair over-quarantined (dropped a readable
+    /// WAL object holding an acked write) the reopen would miss a key and the assert fails; if it
+    /// under-quarantined (left the torn tail) the reopen would fail to open at all.
+    #[serial_test::serial]
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "on-disk close→reopen; the CI `test (slatedb WAL recovery)` job runs it unignored"]
+    async fn b2_repair_recovers_and_all_keys_survive() {
+        with_fresh_slatedb_dir("b2-recover", |dir| async move {
+            {
+                let kv = SlateKv::open_local_settings(&dir, test_settings(Some(Duration::from_millis(5))))
+                    .await
+                    .unwrap();
+                kv.write_batch(vec![
+                    WriteOp::Put("project/acme".into(), b"seed".to_vec()),
+                    WriteOp::Put("site/blog".into(), b"hash-1".to_vec()),
+                    WriteOp::Put("secret/acme/idp".into(), b"sealed-oauth".to_vec()),
+                    WriteOp::Put("current/console".into(), b"deploy-11".to_vec()),
+                ])
+                .await
+                .unwrap();
+                kv.flush().await.unwrap(); // real WAL objects, durable; frontier NOT advanced
+            }
+            // A torn version-0 tail beyond the readable WAL objects (the trailing tear).
+            inject_torn_tail(&dir, max_wal_id(&dir) + 1);
+
+            // Repair-then-open (the `serve --repair-wal` path).
+            let kv = SlateKv::open_local_with_flush_repair(
+                &dir,
+                Duration::from_millis(5),
+                Some(RepairMode::Apply),
+            )
+            .await
+            .expect("B2: repair-then-open must succeed after quarantining the torn trailing tail");
+
+            // EVERY committed key must survive — especially the sealed secret.
+            assert_eq!(kv.get("project/acme").await.unwrap(), Some(b"seed".to_vec()));
+            assert_eq!(kv.get("site/blog").await.unwrap(), Some(b"hash-1".to_vec()));
+            assert_eq!(
+                kv.get("secret/acme/idp").await.unwrap(),
+                Some(b"sealed-oauth".to_vec()),
+                "B2: the sealed secret MUST survive the repair (the repair only touched the torn tail)"
+            );
+            assert_eq!(kv.get("current/console").await.unwrap(), Some(b"deploy-11".to_vec()));
+            KvStore::close(&kv).await.unwrap();
+            eprintln!("B2 REPAIR-RECOVERS-ALL-KEYS OK");
+        })
+        .await;
+    }
+
+    /// **B4 (beyond-frontier half)** — the repair NEVER quarantines a WAL object at or below the
+    /// durable frontier. After a clean `close()` (frontier advanced past every WAL object), even
+    /// injecting a torn object AT an at-or-below-frontier id leaves the dry-run with nothing to do
+    /// beyond the frontier — the beyond-frontier filter excludes it. (The unreadable-manifest half
+    /// of B4 is `wal_repair::tests::repair_refuses_when_the_manifest_is_unreadable`.)
+    #[serial_test::serial]
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "on-disk close→reopen; the CI `test (slatedb WAL recovery)` job runs it unignored"]
+    async fn b4_repair_never_touches_at_or_below_frontier() {
+        with_fresh_slatedb_dir("b4-frontier", |dir| async move {
+            {
+                let kv = SlateKv::open_local_settings(
+                    &dir,
+                    test_settings(Some(Duration::from_millis(5))),
+                )
+                .await
+                .unwrap();
+                kv.write_batch(vec![
+                    WriteOp::Put("project/acme".into(), b"seed".to_vec()),
+                    WriteOp::Put("secret/acme/idp".into(), b"sealed".to_vec()),
+                ])
+                .await
+                .unwrap();
+                KvStore::close(&kv).await.unwrap(); // advances the frontier past every WAL object
+            }
+            let store = fs_store(&dir);
+            let report = crate::wal_repair::repair_wal_tail(&store, "kv", RepairMode::DryRun)
+                .await
+                .unwrap();
+            // The frontier now covers every WAL object, so the candidate set (strictly beyond it)
+            // is empty and nothing is quarantined — the repair cannot touch acked-into-L0 data.
+            assert!(
+                report.candidates.is_empty() && report.quarantined.is_empty(),
+                "B4: nothing at or below the durable frontier ({}) may be considered/quarantined; \
+                 got candidates {:?}, quarantined {:?}",
+                report.frontier,
+                report.candidates,
+                report.quarantined,
+            );
+            eprintln!("B4 BEYOND-FRONTIER-ONLY OK");
+        })
+        .await;
+    }
+
+    /// **B5** — quarantined bytes are preserved: the offending object is byte-identical under
+    /// `wal-quarantine/{stamp}/` and ABSENT from `wal/` after `--apply`.
+    #[serial_test::serial]
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "on-disk close→reopen; the CI `test (slatedb WAL recovery)` job runs it unignored"]
+    async fn b5_quarantined_bytes_preserved_and_removed_from_wal() {
+        with_fresh_slatedb_dir("b5-bytes", |dir| async move {
+            {
+                let kv = SlateKv::open_local_settings(
+                    &dir,
+                    test_settings(Some(Duration::from_millis(5))),
+                )
+                .await
+                .unwrap();
+                kv.put("project/acme", b"seed".to_vec()).await.unwrap();
+                kv.flush().await.unwrap();
+            }
+            let torn_id = max_wal_id(&dir) + 1;
+            inject_torn_tail(&dir, torn_id);
+            let torn_path = dir
+                .join("kv")
+                .join("wal")
+                .join(format!("{torn_id:020}.sst"));
+            let original_bytes = std::fs::read(&torn_path).unwrap();
+
+            let store = fs_store(&dir);
+            let report = crate::wal_repair::repair_wal_tail(&store, "kv", RepairMode::Apply)
+                .await
+                .unwrap();
+            assert!(report.applied && report.quarantined == vec![torn_id]);
+
+            // The original is gone from wal/.
+            assert!(
+                !torn_path.exists(),
+                "B5: the quarantined object must be removed from wal/"
+            );
+            // A byte-identical copy exists under wal-quarantine/<stamp>/.
+            let qdir = dir.join("kv").join("wal-quarantine");
+            let mut found = None;
+            for stamp_entry in std::fs::read_dir(&qdir).unwrap().filter_map(Result::ok) {
+                let candidate = stamp_entry.path().join(format!("{torn_id:020}.sst"));
+                if candidate.exists() {
+                    found = Some(candidate);
+                }
+            }
+            let quarantined_path = found.expect("B5: a quarantine copy must exist");
+            assert_eq!(
+                std::fs::read(&quarantined_path).unwrap(),
+                original_bytes,
+                "B5: the quarantined object must be byte-identical to the original"
+            );
+            eprintln!("B5 QUARANTINED-BYTES-PRESERVED OK");
+        })
+        .await;
+    }
+
+    /// **B6** — dry-run purity: a `DryRun` mutates NOTHING (the torn object stays in `wal/`, no
+    /// `wal-quarantine/` dir is created). Mutation guarded: a repair that copied/deleted under
+    /// `DryRun` would leave the object gone from `wal/` and this asserts it is still there.
+    #[serial_test::serial]
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "on-disk close→reopen; the CI `test (slatedb WAL recovery)` job runs it unignored"]
+    async fn b6_dry_run_mutates_nothing() {
+        with_fresh_slatedb_dir("b6-dryrun", |dir| async move {
+            {
+                let kv = SlateKv::open_local_settings(
+                    &dir,
+                    test_settings(Some(Duration::from_millis(5))),
+                )
+                .await
+                .unwrap();
+                kv.put("project/acme", b"seed".to_vec()).await.unwrap();
+                kv.flush().await.unwrap();
+            }
+            let torn_id = max_wal_id(&dir) + 1;
+            inject_torn_tail(&dir, torn_id);
+            let torn_path = dir
+                .join("kv")
+                .join("wal")
+                .join(format!("{torn_id:020}.sst"));
+
+            let store = fs_store(&dir);
+            let report = crate::wal_repair::repair_wal_tail(&store, "kv", RepairMode::DryRun)
+                .await
+                .unwrap();
+            // The plan identifies the tail…
+            assert_eq!(
+                report.quarantined,
+                vec![torn_id],
+                "B6: the dry-run still plans the tail"
+            );
+            assert!(!report.applied, "B6: a dry-run must report applied=false");
+            // …but mutates NOTHING.
+            assert!(
+                torn_path.exists(),
+                "B6: the torn object must still be in wal/ after a dry-run"
+            );
+            assert!(
+                !dir.join("kv").join("wal-quarantine").exists(),
+                "B6: a dry-run must not create the wal-quarantine/ dir"
+            );
+            eprintln!("B6 DRY-RUN-PURITY OK");
+        })
+        .await;
+    }
+
+    /// **B3 (store-backed)** — the trailing-only refusal over a REAL store: a torn object with a
+    /// READABLE WAL object at a higher id (a mid-range gap) makes the repair REFUSE + fail loud,
+    /// mutating nothing. This complements the pure-logic `plan_refuses_torn_below_readable_mid_range_gap`
+    /// with an end-to-end store fixture. Anti-hollow mutation (in `plan_trailing_tail`): relaxing to
+    /// "quarantine any torn" turns this refusal into a silent quarantine of the mid object → the acked
+    /// data in the higher readable object is dropped, and this `MidRangeGap` assertion fails.
+    #[serial_test::serial]
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "on-disk close→reopen; the CI `test (slatedb WAL recovery)` job runs it unignored"]
+    async fn b3_refuses_mid_range_gap_over_real_store() {
+        with_fresh_slatedb_dir("b3-midgap", |dir| async move {
+            {
+                let kv = SlateKv::open_local_settings(
+                    &dir,
+                    test_settings(Some(Duration::from_millis(5))),
+                )
+                .await
+                .unwrap();
+                kv.put("project/acme", b"seed".to_vec()).await.unwrap();
+                kv.flush().await.unwrap();
+            }
+            // Inject a torn object at max+1, THEN a readable-looking object at max+2 (a higher id).
+            // The torn object is now MID-range (a readable object sits above it) → REFUSE.
+            let top = max_wal_id(&dir);
+            inject_torn_tail(&dir, top + 1);
+            // A well-formed (version-1) object at the higher id — the "later acked data" that must
+            // not be gapped.
+            let wal_dir = dir.join("kv").join("wal");
+            let mut readable = vec![0xCDu8; 64];
+            let n = readable.len();
+            readable[n - 2..n].copy_from_slice(&1u16.to_be_bytes());
+            std::fs::write(wal_dir.join(format!("{:020}.sst", top + 2)), &readable).unwrap();
+
+            let store = fs_store(&dir);
+            let err = crate::wal_repair::repair_wal_tail(&store, "kv", RepairMode::Apply)
+                .await
+                .expect_err("B3: a torn object below a readable one must REFUSE (mid-range gap)");
+            assert!(
+                matches!(err, crate::wal_repair::WalRepairError::MidRangeGap { .. }),
+                "B3: got {err:?}"
+            );
+            // And it mutated nothing (the torn object is still in wal/, no quarantine dir).
+            assert!(
+                wal_dir.join(format!("{:020}.sst", top + 1)).exists(),
+                "B3: a refused repair must not delete the torn object"
+            );
+            assert!(
+                !dir.join("kv").join("wal-quarantine").exists(),
+                "B3: a refused repair must not create a quarantine dir"
+            );
+            eprintln!("B3 MID-RANGE-GAP-REFUSAL OK");
+        })
+        .await;
+    }
+
+    /// **B7** — `await_durable` characterization guardrail: a durable `put` (the control-plane
+    /// path awaits `await_durable()`) is genuinely durable — it survives a reopen with NO explicit
+    /// `flush()` and NO `close()` between the write and the reopen. The whole repair's safety rests
+    /// on this "await_durable = the write is in the WAL/durable" contract; a future slatedb bump
+    /// that changed durable-seq semantics (making an awaited put non-durable, or advancing the
+    /// frontier differently) trips this guardrail. Uses a SHARED `InMemory` store across both opens
+    /// (so the reopen reads exactly what the first handle persisted) — deterministic, no timeout.
+    #[serial_test::serial]
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "on-disk close→reopen; the CI `test (slatedb WAL recovery)` job runs it unignored"]
+    async fn b7_await_durable_write_survives_reopen_without_flush_or_close() {
+        use slatedb::object_store::memory::InMemory;
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        {
+            let kv = SlateKv::open_with(
+                store.clone(),
+                "kv",
+                test_settings(Some(Duration::from_millis(5))),
+            )
+            .await
+            .unwrap();
+            // A durable `put` — the KvStore impl awaits `await_durable()` before returning. We then
+            // DROP the handle with NO flush() and NO close(): only the await_durable contract makes
+            // the write survive.
+            kv.put("current/console", b"deploy-durable".to_vec())
+                .await
+                .unwrap();
+            drop(kv);
+        }
+        // Reopen a fresh handle over the SAME store: the awaited write must be present.
+        let reopened = SlateKv::open_with(store.clone(), "kv", test_settings(None))
+            .await
+            .expect("B7: reopen of a store with a durable-but-unclosed write must succeed");
+        assert_eq!(
+            reopened.get("current/console").await.unwrap(),
+            Some(b"deploy-durable".to_vec()),
+            "B7: an `await_durable` put MUST survive a reopen with no flush/close — if this fails, \
+             a slatedb bump changed the durable-seq semantics the WAL repair relies on"
+        );
+        KvStore::close(&reopened).await.unwrap();
+        eprintln!("B7 AWAIT-DURABLE-CHARACTERIZATION OK");
     }
 
     /// **Live** (ignored): open a control-plane SlateKv over Cloudflare R2, write,

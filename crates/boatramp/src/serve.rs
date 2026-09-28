@@ -292,6 +292,15 @@ pub struct ServeArgs {
     #[arg(long, env = "BOATRAMP_KV_S3_PREFIX", default_value = "_kv")]
     kv_s3_prefix: String,
 
+    /// Opt-in: repair a torn TRAILING WAL tail on the control-plane SlateDB store BEFORE
+    /// opening it (the P0 crash/snapshot recovery). OR-ed with the `BOATRAMP_KV_REPAIR=1`
+    /// env, so a stuck node can be recovered by a redeploy with no ssh. The repair only ever
+    /// quarantines a physically-torn object that is strictly trailing AND beyond the durable
+    /// frontier; it REFUSES (fails loud) on a mid-range gap or an unreadable manifest, and
+    /// never runs on the default cold open. Applies to the SlateDB backend only.
+    #[arg(long, env = "BOATRAMP_KV_REPAIR")]
+    repair_wal: bool,
+
     /// GCS bucket (required for `--blobs gcs`).
     #[arg(long, env = "BOATRAMP_GCS_BUCKET")]
     gcs_bucket: Option<String>,
@@ -739,7 +748,8 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
         prefix: args.kv_s3_prefix.clone(),
     });
     let kv_backend =
-        boatramp_node::backends::build_kv(args.kv, &data_dir, slate_s3.as_ref()).await?;
+        boatramp_node::backends::build_kv(args.kv, &data_dir, slate_s3.as_ref(), args.repair_wal)
+            .await?;
     // Shared-mode coherence: when several processes share
     // one KV, publish each write to a changelog over the *uncached* backend and
     // poll it to invalidate peer-changed keys.
@@ -870,7 +880,7 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
         handlers,
         auth,
         options,
-        reconcile: _reconcile,
+        reconcile,
     } = boatramp_node::assemble(boatramp_node::NodeInput {
         config,
         data_dir: data_dir.as_path(),
@@ -959,10 +969,13 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
         TlsMode::AcmeDns => serve_acme_dns(&args, addr, deploy, auth, handlers, options).await,
         TlsMode::Rpk => serve_rpk(&args, addr, deploy, auth, handlers, options, &data_dir).await,
     };
-    // Graceful shutdown: force a final flush of the metadata store (SHUT-1).
-    if let Err(e) = kv_handle.flush().await {
-        tracing::warn!(error = %e, "metadata store flush on shutdown failed");
-    }
+    // Graceful shutdown (Part A): the serve future has returned (and `serve_with` has already
+    // quiesced the scheduler + its detached children). Now abort+await the reconcile loops and
+    // cleanly CLOSE the control-plane store — not a bare `flush()` (which only pushed the WAL
+    // buffer out, leaving a live store whose next crash could freeze a torn tail), but a real
+    // `close()` that freezes memtables to L0 and advances the durable frontier, so the next cold
+    // open has an empty WAL replay range. Bounded by `CLOSE_DEADLINE` (fail-safe on timeout).
+    quiesce_and_close(kv_handle, reconcile, None).await;
     serve_result
 }
 
@@ -1154,6 +1167,61 @@ fn secondary_blob_args(fb: &boatramp_node::config::BlobFallbackConfig) -> BlobAr
 /// How long changelog feed entries are kept (comfortably larger than the poll
 /// interval so a poller can't miss entries between polls).
 const CHANGELOG_RETENTION_SECS: u64 = 60;
+
+/// The graceful-shutdown budget for quiescing every KV writer and then `close()`ing the
+/// control-plane store (Part A). Kept under fly.io's 5s SIGTERM grace so a timed-out close still
+/// exits before a SIGKILL — a timed-out close is fail-safe (no worse than the old bare `flush()`).
+const CLOSE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Quiesce the node's background KV writers, then cleanly `close()` the control-plane store —
+/// the Part-A graceful-shutdown tail, shared by the single-node (`run`) and cluster
+/// (`run_cluster`) paths.
+///
+/// Ordering is load-bearing: every task that can write the store must be stopped BEFORE the close,
+/// because `close()` marks the store closed and then flushes — a write racing the mark errors
+/// `Closed` or forces a new (torn-able) WAL segment. So we:
+///   1. abort+**await** all reconcile loops (compute/domain-verify/tombstone/DNS) — an abort alone
+///      only requests cancellation; awaiting guarantees the task issued its last write,
+///   2. (cluster only, via `raft_shutdown`) shut the Raft apply/log writer down — a write/apply
+///      after the store mark would lose a committed entry or desync the log vs the state machine,
+///   3. `close()` the store — freeze memtables to L0, advance the durable frontier, so a
+///      subsequent cold open has an empty WAL replay range (no torn tail).
+///
+/// The whole tail is wrapped in a [`CLOSE_DEADLINE`] timeout: a stalled close is abandoned and the
+/// process still exits within fly's grace. (The scheduler + its detached children are quiesced
+/// separately, inside `serve_with`, before this runs — see [`boatramp_server::SchedulerHandle`].)
+async fn quiesce_and_close(
+    kv_handle: Arc<dyn KvStore>,
+    reconcile: Vec<tokio::task::JoinHandle<()>>,
+    raft_shutdown: Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>>,
+) {
+    let tail = async move {
+        // (1) Stop every reconcile loop: abort THEN await, so none writes after this point.
+        for handle in reconcile {
+            handle.abort();
+            let _ = handle.await;
+        }
+        // (2) Cluster: shut down Raft BEFORE the store close (see the doc above).
+        if let Some(raft_shutdown) = raft_shutdown {
+            raft_shutdown.await;
+        }
+        // (3) Close the store cleanly (flush memtables → L0, advance the durable frontier).
+        if let Err(e) = kv_handle.close().await {
+            tracing::warn!(error = %e, "control-plane store close on shutdown failed");
+        } else {
+            tracing::info!("control-plane store closed cleanly on shutdown");
+        }
+    };
+    if tokio::time::timeout(CLOSE_DEADLINE, tail).await.is_err() {
+        // A timed-out close is fail-safe: it is no worse than the pre-v0.7.2 bare `flush()` (which
+        // did not advance the frontier either), and the process exits within fly's SIGTERM grace.
+        tracing::warn!(
+            deadline_s = CLOSE_DEADLINE.as_secs(),
+            "graceful KV quiesce+close exceeded the deadline; abandoning it (fail-safe — no worse \
+             than a flush) and exiting"
+        );
+    }
+}
 
 /// Drive the shared-mode cache-coherence poller: every
 /// second, pop the keys peers changed; periodically trim the feed; and every few
@@ -1747,10 +1815,18 @@ async fn run_cluster(
     // (which creates it). A weak "has booted before" signal — NOT the resume gate:
     // the dir is created just by opening the KV, before a first join completes.
     let store_dir_existed = store_dir.exists();
+    // Opt-in repair-then-open (`--repair-wal` / `BOATRAMP_KV_REPAIR=1`): recover a torn trailing
+    // WAL tail on the node-local durable Raft store before opening. `None` is the default cold
+    // open, which still fails LOUD on a torn tail (naming the repair). Applies here to the local
+    // SlateDB Raft log/state store — the cluster's durability boundary.
+    let repair = args
+        .repair_wal
+        .then_some(boatramp_storage::kv_slatedb::RepairMode::Apply);
     let durable_kv: Arc<dyn KvStore> = Arc::new(
-        boatramp_storage::SlateKv::open_local_with_flush(
+        boatramp_storage::SlateKv::open_local_with_flush_repair(
             store_dir,
             boatramp_node::backends::CONTROL_PLANE_FLUSH,
+            repair,
         )
         .await?,
     );
@@ -2116,7 +2192,7 @@ async fn run_cluster(
         handlers,
         auth,
         options,
-        reconcile: _reconcile,
+        reconcile,
     } = boatramp_node::assemble(boatramp_node::NodeInput {
         config,
         data_dir: data_dir.as_path(),
@@ -2208,13 +2284,23 @@ async fn run_cluster(
         TlsMode::AcmeDns => serve_acme_dns(&args, addr, deploy, auth, handlers, options).await,
     };
 
-    // Graceful shutdown: force a final flush of the durable Raft store so no
-    // committed log/state write is lost to the flush timer (SHUT-1).
-    if let Err(e) = durable_kv_handle.flush().await {
-        tracing::warn!(error = %e, "cluster: durable Raft store flush on shutdown failed");
-    } else {
-        tracing::info!("cluster: durable Raft store flushed on shutdown");
-    }
+    // Graceful shutdown (Part A, cluster): the serve future has returned (and `serve_with` has
+    // already quiesced the scheduler + its detached children). Abort+await the reconcile loops,
+    // THEN shut down Raft, THEN cleanly CLOSE the node-local durable Raft store. The Raft shutdown
+    // MUST precede the store close: a write/apply after the store is marked closed would lose a
+    // committed log/state entry or desync the log vs the state machine (the cluster's correctness
+    // boundary). `close()` (not the old bare `flush()`) then advances the durable frontier so the
+    // next cold open replays an empty WAL range. Bounded by `CLOSE_DEADLINE` (fail-safe on timeout).
+    let raft = node.raft.clone();
+    let raft_shutdown: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> =
+        Box::pin(async move {
+            if let Err(e) = raft.shutdown().await {
+                tracing::warn!(error = %e, "cluster: raft shutdown on graceful stop failed");
+            } else {
+                tracing::info!("cluster: raft shut down on graceful stop");
+            }
+        });
+    quiesce_and_close(durable_kv_handle, reconcile, Some(raft_shutdown)).await;
     serve_result
 }
 
@@ -2924,6 +3010,109 @@ mod tests {
     // in a lean build (the single-node auth tests moved to `boatramp_node::auth`).
     #[cfg(feature = "cluster")]
     use super::*;
+
+    /// **A3** — bounded close: a stalled `close()` is abandoned at [`CLOSE_DEADLINE`] so the
+    /// process still exits within fly's SIGTERM grace. A `KvStore` whose `close()` hangs forever
+    /// must not wedge `quiesce_and_close`; it returns within ~`CLOSE_DEADLINE`, not never.
+    ///
+    /// Mutation guarded: dropping the `tokio::time::timeout` wrapper in `quiesce_and_close` makes
+    /// this test hang past its own bound and the harness kills it — i.e. the gate goes red.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a3_stalled_close_is_abandoned_at_deadline() {
+        use boatramp_core::kv::{KvError, KvStore};
+        use std::sync::Arc;
+
+        // A store whose `close()` never returns (models a wedged object-store flush).
+        struct HangingKv;
+        #[async_trait::async_trait]
+        impl KvStore for HangingKv {
+            async fn get(&self, _k: &str) -> std::result::Result<Option<Vec<u8>>, KvError> {
+                Ok(None)
+            }
+            async fn put(&self, _k: &str, _v: Vec<u8>) -> std::result::Result<(), KvError> {
+                Ok(())
+            }
+            async fn delete(&self, _k: &str) -> std::result::Result<(), KvError> {
+                Ok(())
+            }
+            async fn list_prefix(&self, _p: &str) -> std::result::Result<Vec<String>, KvError> {
+                Ok(Vec::new())
+            }
+            async fn close(&self) -> std::result::Result<(), KvError> {
+                // Hang forever — the deadline in `quiesce_and_close` must abandon it.
+                std::future::pending::<()>().await;
+                unreachable!("close() must be abandoned at the deadline")
+            }
+        }
+
+        // With the virtual clock paused, `quiesce_and_close` should still resolve — the timeout
+        // fires at `CLOSE_DEADLINE`. `tokio::time::timeout` on the OUTER bound proves the tail
+        // itself did not hang: it must complete strictly before we would give up.
+        let kv: Arc<dyn KvStore> = Arc::new(HangingKv);
+        let outcome = tokio::time::timeout(
+            super::CLOSE_DEADLINE + std::time::Duration::from_secs(2),
+            super::quiesce_and_close(kv, Vec::new(), None),
+        )
+        .await;
+        assert!(
+            outcome.is_ok(),
+            "A3: a stalled close must be abandoned at CLOSE_DEADLINE, not hang"
+        );
+    }
+
+    /// **A2-cluster** — the Raft shutdown runs BEFORE the store close (the highest-risk ordering:
+    /// a write/apply after the store mark would lose a committed entry or desync the log vs the
+    /// state machine). An ordering-recording KV close + a raft-shutdown future push their order
+    /// into a shared log; the gate asserts raft-shutdown precedes the store close.
+    ///
+    /// Anti-hollow mutation: swap the order in `quiesce_and_close` (close the store before awaiting
+    /// `raft_shutdown`). Then the recorded order is `["close", "raft"]` and this assertion fails.
+    #[tokio::test]
+    async fn a2_cluster_raft_shuts_down_before_store_close() {
+        use boatramp_core::kv::{KvError, KvStore};
+        use std::sync::{Arc, Mutex};
+
+        let order = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+
+        // A KV whose `close()` records "close" in the shared order log.
+        struct OrderKv(Arc<Mutex<Vec<&'static str>>>);
+        #[async_trait::async_trait]
+        impl KvStore for OrderKv {
+            async fn get(&self, _k: &str) -> std::result::Result<Option<Vec<u8>>, KvError> {
+                Ok(None)
+            }
+            async fn put(&self, _k: &str, _v: Vec<u8>) -> std::result::Result<(), KvError> {
+                Ok(())
+            }
+            async fn delete(&self, _k: &str) -> std::result::Result<(), KvError> {
+                Ok(())
+            }
+            async fn list_prefix(&self, _p: &str) -> std::result::Result<Vec<String>, KvError> {
+                Ok(Vec::new())
+            }
+            async fn close(&self) -> std::result::Result<(), KvError> {
+                self.0.lock().unwrap().push("close");
+                Ok(())
+            }
+        }
+
+        let kv: Arc<dyn KvStore> = Arc::new(OrderKv(order.clone()));
+        // The raft-shutdown future records "raft" when awaited (as the cluster path threads it).
+        let raft_order = order.clone();
+        let raft_shutdown: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> =
+            Box::pin(async move {
+                raft_order.lock().unwrap().push("raft");
+            });
+
+        super::quiesce_and_close(kv, Vec::new(), Some(raft_shutdown)).await;
+
+        assert_eq!(
+            *order.lock().unwrap(),
+            vec!["raft", "close"],
+            "A2-cluster: raft.shutdown() MUST precede the store close (else a committed entry is \
+             lost or the log desyncs the state machine)"
+        );
+    }
 
     /// The mesh write authorizer accepts only a token from the control-plane
     /// root granting `cluster-write` — no token, a wrong-role token, garbage, or a

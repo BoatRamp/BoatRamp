@@ -81,6 +81,21 @@ pub trait KvStore: Send + Sync {
         Ok(())
     }
 
+    /// Durably persist buffered writes AND mark the store closed, releasing its background
+    /// writers — the strongest graceful-shutdown primitive. The default delegates to
+    /// [`flush`](Self::flush) (an uncached / write-through store has nothing further to close),
+    /// so a caller can always `close()` on shutdown and get at-least the flush semantics.
+    ///
+    /// A buffered LSM backend (SlateDB) overrides this to run its real `close()`, which — unlike
+    /// `flush()` (WAL only) — freezes memtables to L0 and **advances the durable frontier**, so a
+    /// subsequent cold open has an empty WAL replay range and cannot see a torn tail. The caller
+    /// MUST have quiesced every writer BEFORE calling `close()`: a buffered backend marks the store
+    /// closed FIRST and then flushes, so a write racing the mark errors or forces a new (torn-able)
+    /// WAL segment. A no-op on a read replica.
+    async fn close(&self) -> Result<(), KvError> {
+        self.flush().await
+    }
+
     /// Whether [`write_batch`](Self::write_batch) is **atomic** — all-or-nothing across the group, so
     /// a crash can never leave a partially-applied batch. The default is `false`: the default
     /// `write_batch` applies each op sequentially (each atomic per KEY, but not across the group), so
@@ -417,6 +432,13 @@ impl KvStore for CachedKv {
         // Forward to the backing store (the LRU holds only reads); without this a
         // graceful-shutdown flush would stop at the cache (SHUT-1).
         self.inner.flush().await
+    }
+
+    async fn close(&self) -> Result<(), KvError> {
+        // Forward to the backing store: the LRU holds only reads, so closing is entirely the
+        // inner store's job (freeze memtables → L0, advance the durable frontier). Without this
+        // a graceful-shutdown close would stop at the cache and never quiesce SlateDB.
+        self.inner.close().await
     }
 
     async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, KvError> {
