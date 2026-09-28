@@ -1583,6 +1583,25 @@ impl HandlerRuntime {
                 true,
             )
             .await?;
+            // Secondary deploy-time validation (v0.7.1, Item 6): WARN — never hard-fail — if a
+            // consumer subscription can structurally match no delivery form. Topics are producer-
+            // driven (the concrete set is runtime state), so the only structural defect visible at
+            // activation is a topic that no concrete topic could EVER match: an empty segment (a
+            // `//` or a leading/trailing `/`, or a bare `bus:`). A `{tenant}` segment is a valid
+            // routable template (matches any concrete tenant), so it is NOT flagged. This is the
+            // signal that would have caught the original silent stuck backlog at deploy time.
+            let raw = consumer
+                .topic
+                .strip_prefix(boatramp_handlers::BUS_TOPIC_SELECTOR)
+                .unwrap_or(&consumer.topic);
+            if raw.is_empty() || raw.split('/').any(str::is_empty) {
+                tracing::warn!(
+                    project,
+                    topic = %consumer.topic,
+                    "consumer subscription topic has an empty segment — it can structurally match \
+                     no concrete delivery topic, so this consumer will never claim (a likely typo)"
+                );
+            }
         }
         Ok(())
     }
@@ -3889,6 +3908,9 @@ mod tests {
             EVENT_CONSUMER,
             &bindings,
             None,
+            // Non-templated exact-match consumer: no bound tenant, no bind-verify (unchanged).
+            None,
+            None,
             Limits::default(),
             Duration::from_secs(30),
             5,
@@ -3936,6 +3958,9 @@ mod tests {
                 &bindings,
                 // No signed_context consumer in this test — reuse the built-once binding.
                 None,
+                // Non-templated exact-match consumer: no bound tenant, no bind-verify (unchanged).
+                None,
+                None,
                 Limits::default(),
                 Duration::from_secs(30),
                 5,
@@ -3970,6 +3995,9 @@ mod tests {
                 EVENT_CONSUMER,
                 &bindings,
                 // No signed_context consumer in this test — reuse the built-once binding.
+                None,
+                // Non-templated exact-match consumer: no bound tenant, no bind-verify (unchanged).
+                None,
                 None,
                 Limits::default(),
                 Duration::ZERO,
@@ -4021,6 +4049,9 @@ mod tests {
                 &bindings,
                 // No signed_context consumer in this test — reuse the built-once binding.
                 None,
+                // Non-templated exact-match consumer: no bound tenant, no bind-verify (unchanged).
+                None,
+                None,
                 Limits::default(),
                 Duration::from_secs(30),
                 5,
@@ -4048,6 +4079,9 @@ mod tests {
                 EVENT_CONSUMER,
                 &bindings,
                 // No signed_context consumer in this test — reuse the built-once binding.
+                None,
+                // Non-templated exact-match consumer: no bound tenant, no bind-verify (unchanged).
+                None,
                 None,
                 Limits::default(),
                 Duration::from_secs(30),
@@ -4196,6 +4230,449 @@ mod tests {
                 .await
                 .unwrap(),
             None
+        );
+    }
+
+    // ---- `{tenant}`-template queue-consumer fan-in CI-hard gates (v0.7.1) --------------------------
+    //
+    // These drive the REAL scheduler dispatch path (`run_scheduler_tick` → the enumerate-per-concrete
+    // + `dispatch_consumer_batch`) over a real `LogMessaging` + `event-consumer.wasm`, and the REAL
+    // bind-verify quarantine, asserting the whole per-tenant fan-in property. The gate is the set of
+    // named `#[test]`s here + the matcher/primitive tests in `boatramp-core::messaging`: the exit code
+    // is the gate (no grepped marker, no bash env-loop). The bind-verify gate is anti-hollow (a
+    // mutation env var that skips the tenant-match check makes a mismatched message DELIVER instead of
+    // quarantine → the gate FAILS), proving the check is load-bearing.
+
+    /// Deploy the `event-consumer.wasm` guest as a consumer subscribed to `topic` (a `bus:…` template
+    /// or a plain topic), over the given backends + optional consumer `group`, with a fleet signer
+    /// wired (so the bind-verify anchor is present). Returns the runtime (unspawned) + deploy store.
+    #[cfg(feature = "handlers")]
+    async fn setup_consumer_topic(
+        storage: Arc<MemStorage>,
+        kv: Arc<dyn KvStore>,
+        messaging: Arc<dyn Messaging>,
+        topic: &str,
+        group: &str,
+        signer: Arc<dyn Signer>,
+    ) -> (HandlerRuntime, boatramp_core::deploy::DeployStore) {
+        use boatramp_core::config::{ConsumerConfig, DeployConfig, HandlersSiteConfig, SiteConfig};
+        use boatramp_core::deploy::{DeployStore, FileEntry, Manifest};
+        use boatramp_core::tenancy::{AccessMode, Tenancy, TenantSource};
+        use boatramp_handlers::{HandlerEngine, Limits};
+        use futures::StreamExt;
+
+        let deploy = DeployStore::new(storage.clone(), kv.clone());
+        let hash = boatramp_core::deploy::sha256_hex(EVENT_CONSUMER);
+        let stream: ByteStream =
+            futures::stream::once(async move { Ok(bytes::Bytes::from_static(EVENT_CONSUMER)) })
+                .boxed();
+        deploy.put_blob(&hash, stream).await.unwrap();
+        let mut files = std::collections::BTreeMap::new();
+        files.insert(
+            "consumer.wasm".to_string(),
+            FileEntry {
+                hash: hash.clone(),
+                size: EVENT_CONSUMER.len() as u64,
+                content_type: None,
+                variants: std::collections::BTreeMap::new(),
+            },
+        );
+        let manifest = Manifest {
+            files,
+            config: DeployConfig {
+                consumers: vec![ConsumerConfig {
+                    // A `signed_context` scoped tenancy — the realistic per-tenant fan-in shape (the
+                    // guest imports no sql/orm, so this only exercises the resolve path, not scoping).
+                    tenancy: Some(Tenancy::Scoped {
+                        column: "tenant_id".into(),
+                        sources: vec![TenantSource::SignedContext],
+                        read: AccessMode::Own,
+                        write: AccessMode::Own,
+                        exceed_site_ceiling: false,
+                        unscoped_writes: Vec::new(),
+                    }),
+                    token_claims: None,
+                    secrets: Vec::new(),
+                    backoff_ms: None,
+                    retention_ms: None,
+                    topic: topic.into(),
+                    component: "consumer.wasm".into(),
+                    imports: vec!["wasi:keyvalue".into()],
+                    group: group.into(),
+                    // Replay the retained backlog so a published-then-registered grouped consumer
+                    // still sees messages (the tests publish before the first tick registers the
+                    // group; ignored for the default work-queue).
+                    start: boatramp_core::messaging::StartPosition::Earliest,
+                    lease_ms: None,
+                    max_attempts: None,
+                    max_batch: None,
+                    max_ack_pending: None,
+                    stats_topics: Vec::new(),
+                    tenant_secret_names: Vec::new(),
+                    upload_containers: Vec::new(),
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let id = deploy.put_manifest(&manifest).await.unwrap();
+        deploy
+            .activate(ProjectRef::DEFAULT, "blog", &id)
+            .await
+            .unwrap();
+        deploy
+            .set_site_config(
+                ProjectRef::DEFAULT,
+                "blog",
+                &SiteConfig {
+                    handlers: Some(HandlersSiteConfig {
+                        enabled: true,
+                        allow_imports: vec!["wasi:keyvalue".into()],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
+        let rt = HandlerRuntime::new(engine, kv, storage, None, Some(messaging));
+        rt.set_session_signer(signer);
+        (rt, deploy)
+    }
+
+    /// Mint a durable signed-context envelope sealing `tenant`, for a message published under a
+    /// `{tenant}` topic (mirrors the host `mint_producer_context` at publish time).
+    #[cfg(feature = "handlers")]
+    async fn seal_ctx(signer: &Arc<dyn Signer>, tenant: &str) -> String {
+        boatramp_core::cose::mint_context(
+            tenant,
+            3600,
+            boatramp_core::time::now_unix(),
+            signer.as_ref(),
+        )
+        .await
+        .unwrap()
+    }
+
+    /// Run a bounded number of `All` maintenance ticks (the scheduler's fallback poll — the path that
+    /// enumerates concrete topics for a `{tenant}` consumer + does the bind-verify + sweep + orphaned
+    /// signal). Returns the total acked.
+    #[cfg(feature = "handlers")]
+    async fn run_ticks(
+        inner: &Arc<HandlerRuntimeInner>,
+        deploy: &boatramp_core::deploy::DeployStore,
+        ticks: usize,
+    ) -> usize {
+        let mut cache = std::collections::HashMap::new();
+        let mut crons = std::collections::HashMap::new();
+        let mut sweep = std::collections::HashMap::new();
+        let now = CronNow {
+            minute: 0,
+            hour: 0,
+            dom: 1,
+            month: 1,
+            dow: 0,
+            minute_stamp: 0,
+        };
+        let mut acked = 0;
+        for _ in 0..ticks {
+            acked += run_scheduler_tick(
+                inner,
+                deploy,
+                &mut cache,
+                &mut crons,
+                &mut sweep,
+                now,
+                ConsumerFilter::All,
+                AsyncPass::Legacy,
+            )
+            .await
+            .unwrap()
+            .0;
+        }
+        acked
+    }
+
+    /// **Gate — fan-in.** ONE `bus:sync/{tenant}/import` consumer services TWO concrete tenant topics
+    /// (`bus/sync/acme/import`, `bus/sync/globex/import`): both deliver to the one consumer, each
+    /// observed via the guest's per-concrete-topic delivery counter, and each with its OWN independent
+    /// group cursor + DLQ (a poison on one tenant dead-letters into THAT tenant's DLQ, the other is
+    /// untouched). The concrete topics are enumerated by the scheduler's `All` pass and dispatched
+    /// once per concrete — the exact behavior a template segment could never reach before v0.7.1.
+    #[cfg(feature = "handlers")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tenant_template_fans_in_over_concrete_topics_each_own_dlq() {
+        let storage = Arc::new(MemStorage::default());
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let messaging: Arc<dyn Messaging> =
+            Arc::new(LogMessaging::new(storage.clone(), kv.clone()));
+        let signer: Arc<dyn Signer> = Arc::new(LocalSigner::generate(TokenAlg::Es256));
+        // A work-queue consumer (empty group): each CONCRETE topic keys its own work-queue + DLQ
+        // (`mq/{concrete}` / `mqdead/{concrete}`), so per-tenant isolation holds per concrete topic —
+        // and a published-then-drained work-queue message needs no group registration (the grouped
+        // fan-out cursor is exercised separately by `consumer_groups_fan_out_through_the_dispatcher`).
+        let (rt, deploy) = setup_consumer_topic(
+            storage,
+            kv.clone(),
+            messaging.clone(),
+            "bus:sync/{tenant}/import",
+            "",
+            signer.clone(),
+        )
+        .await;
+        let inner = rt.inner.clone().unwrap();
+
+        // Publish a good batch to each tenant's concrete topic, each sealed for its OWN tenant.
+        let acme = seal_ctx(&signer, "acme").await;
+        let globex = seal_ctx(&signer, "globex").await;
+        messaging
+            .publish_ctx("bus/sync/acme/import", b"ok", Some(&acme))
+            .await
+            .unwrap();
+        messaging
+            .publish_ctx("bus/sync/globex/import", b"ok", Some(&globex))
+            .await
+            .unwrap();
+        run_ticks(&inner, &deploy, 8).await;
+
+        // BOTH tenants delivered — each observed via the guest's per-concrete-topic counter
+        // (`hkv/blog/delivered/sync/<tenant>/import`), proving the ONE templated consumer fanned in.
+        assert_eq!(
+            kv.get("hkv/blog/delivered/sync/acme/import").await.unwrap(),
+            Some(b"1".to_vec()),
+            "acme's good message delivered to the templated consumer"
+        );
+        assert_eq!(
+            kv.get("hkv/blog/delivered/sync/globex/import")
+                .await
+                .unwrap(),
+            Some(b"1".to_vec()),
+            "globex's good message delivered to the SAME templated consumer (fan-in)"
+        );
+
+        // Independent per-concrete DLQ: publish a poison to acme's concrete topic, claim it, and
+        // dead-letter it (the terminal quarantine primitive). It lands ONLY in acme's DLQ; globex's
+        // DLQ stays empty — each concrete topic keys its own work-queue + DLQ (Item 4, preserved for
+        // free by `claim_grouped(concrete, …)`/`mqdead/{concrete}`).
+        messaging
+            .publish_ctx("bus/sync/acme/import", b"poison", Some(&acme))
+            .await
+            .unwrap();
+        let claimed = messaging
+            .claim("bus/sync/acme/import", Duration::from_secs(30), 10, 5)
+            .await
+            .unwrap();
+        let poison = claimed
+            .iter()
+            .find(|m| m.payload == b"poison")
+            .expect("acme's poison claimable on its own concrete work-queue");
+        messaging.dead_letter(poison, "test-poison").await.unwrap();
+        assert!(
+            messaging
+                .dead_letter_count("bus/sync/acme/import")
+                .await
+                .unwrap()
+                >= 1,
+            "acme's poison dead-lettered into acme's OWN DLQ"
+        );
+        assert_eq!(
+            messaging
+                .dead_letter_count("bus/sync/globex/import")
+                .await
+                .unwrap(),
+            0,
+            "globex's DLQ is independent — untouched by acme's poison"
+        );
+    }
+
+    /// **Gate — non-template unchanged.** A concrete-topic consumer (`bus:orders/created`, no
+    /// `{tenant}`) still exact-matches its one literal topic and delivers — the degenerate single case
+    /// (`TenantMatch::Exact`, no bind-verify), byte-for-byte the pre-v0.7.1 behavior.
+    #[cfg(feature = "handlers")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn non_template_consumer_still_exact_matches() {
+        let storage = Arc::new(MemStorage::default());
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let messaging: Arc<dyn Messaging> =
+            Arc::new(LogMessaging::new(storage.clone(), kv.clone()));
+        let signer: Arc<dyn Signer> = Arc::new(LocalSigner::generate(TokenAlg::Es256));
+        let (rt, deploy) = setup_consumer_topic(
+            storage,
+            kv.clone(),
+            messaging.clone(),
+            "bus:orders/created",
+            String::new().as_str(),
+            signer.clone(),
+        )
+        .await;
+        let inner = rt.inner.clone().unwrap();
+        // A non-templated consumer has NO bound tenant ⇒ no bind-verify: a message with NO sealed
+        // context still delivers (unchanged).
+        messaging
+            .publish("bus/orders/created", b"ok")
+            .await
+            .unwrap();
+        run_ticks(&inner, &deploy, 4).await;
+        assert_eq!(
+            kv.get("hkv/blog/delivered/orders/created").await.unwrap(),
+            Some(b"1".to_vec()),
+            "the non-templated consumer exact-matches its literal topic (unchanged)"
+        );
+    }
+
+    /// **Gate — bind-verify fail-closed (CRUX), anti-hollow.** A message whose sealed `signed_context`
+    /// tenant does NOT equal its concrete topic's `{tenant}` segment is QUARANTINED (dead-lettered,
+    /// NOT delivered); an ABSENT sealed context on a templated topic ALSO quarantines. The MUTATION
+    /// seam (`BOATRAMP_TENANT_SEAL_MUTATE_SKIP_VERIFY`) skips the check ⇒ the mismatched message
+    /// DELIVERS ⇒ the assertion FAILS. Driving `dispatch_consumer_batch` directly with an
+    /// `expected_tenant` isolates the crux (the exact call the scheduler makes per concrete topic).
+    // Current-thread flavor (default): the mutation seam is a THREAD-LOCAL, so the whole test must
+    // run on one thread for the neuter to be observed by the dispatch it wraps (a multi-thread runtime
+    // could migrate the future across workers). It is a pure in-memory dispatch — no need for extra
+    // workers.
+    #[cfg(feature = "handlers")]
+    #[tokio::test]
+    async fn bind_verify_quarantines_a_tenant_seal_mismatch() {
+        use boatramp_handlers::{Bindings, HandlerEngine, Limits};
+
+        let storage = Arc::new(MemStorage::default());
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let mq = LogMessaging::new(storage, kv.clone());
+        let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
+        let hash = boatramp_core::deploy::sha256_hex(EVENT_CONSUMER);
+        let bindings = Bindings::new("blog").with_keyvalue("blog", kv.clone());
+        let signer: Arc<dyn Signer> = Arc::new(LocalSigner::generate(TokenAlg::Es256));
+        let anchor = signer.public_key();
+
+        // The concrete topic is `bus/sync/acme/import` → bound tenant `acme`. Reach it via the scope
+        // prefix `bus/` so the guest sees `sync/acme/import`.
+        let concrete = "bus/sync/acme/import";
+        let prefix = "bus/";
+
+        // (1) A message sealed for a DIFFERENT tenant (`globex`) — MISMATCH ⇒ quarantine.
+        let wrong = seal_ctx(&signer, "globex").await;
+        mq.publish_ctx(concrete, b"ok", Some(&wrong)).await.unwrap();
+        // (2) A message with NO sealed context on a templated topic ⇒ quarantine.
+        mq.publish_ctx(concrete, b"ok", None).await.unwrap();
+
+        let dispatch = |bindings: Bindings, anchor: boatramp_core::cose::TokenPublicKey| {
+            let engine = &engine;
+            let hash = &hash;
+            let mq = &mq;
+            async move {
+                dispatch_consumer_batch(
+                    engine,
+                    mq,
+                    &metrics::Metrics::default(),
+                    "blog",
+                    concrete,
+                    prefix,
+                    "",
+                    boatramp_core::messaging::StartPosition::Latest,
+                    hash,
+                    EVENT_CONSUMER,
+                    &bindings,
+                    None,
+                    // The concrete topic's bound `{tenant}` segment = `acme`.
+                    Some("acme"),
+                    Some(&anchor),
+                    Limits::default(),
+                    Duration::from_secs(30),
+                    5,
+                    10,
+                    None,
+                    0,
+                )
+                .await
+            }
+        };
+
+        // CLEAN lane: both messages quarantine — NEITHER delivered, BOTH dead-lettered.
+        let acked = dispatch(bindings.clone(), anchor.clone()).await;
+        assert_eq!(
+            acked, 0,
+            "a tenant-seal mismatch / absent seal must NOT be delivered"
+        );
+        assert_eq!(
+            kv.get("hkv/blog/delivered/sync/acme/import").await.unwrap(),
+            None,
+            "the mismatched/absent-seal message was NOT delivered to the guest"
+        );
+        assert_eq!(
+            mq.dead_letter_count(concrete).await.unwrap(),
+            2,
+            "both the mismatch AND the absent-seal message were quarantined into the DLQ"
+        );
+
+        // MUTATION lane (anti-hollow): with the tenant-match check SKIPPED (thread-local neuter,
+        // scoped to this call — never leaks to a sibling test thread), a NEW mismatched message
+        // DELIVERS (the check is neutered). This two-sided property proves the check is load-bearing —
+        // if this lane did NOT deliver, the clean lane's quarantine would be vacuous.
+        let wrong2 = seal_ctx(&signer, "globex").await;
+        mq.publish_ctx(concrete, b"ok", Some(&wrong2))
+            .await
+            .unwrap();
+        let acked_mut =
+            crate::handler_dispatch::with_tenant_seal_check_skipped(|| dispatch(bindings, anchor))
+                .await;
+        assert_eq!(
+            acked_mut, 1,
+            "MUTATION SKIP_VERIFY: the mismatched message MUST deliver when the check is neutered \
+             (proving the bind-verify is load-bearing)"
+        );
+        assert_eq!(
+            kv.get("hkv/blog/delivered/sync/acme/import").await.unwrap(),
+            Some(b"1".to_vec()),
+            "MUTATION SKIP_VERIFY: the mismatched message was delivered (check neutered)"
+        );
+    }
+
+    /// **Gate — orphaned signal.** A concrete topic with claimable work that NO active consumer
+    /// covers raises the orphaned metric/stat; a topic WITH a matching `{tenant}` consumer does NOT.
+    #[cfg(feature = "handlers")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn orphaned_signal_fires_only_for_an_uncovered_topic() {
+        let storage = Arc::new(MemStorage::default());
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let messaging: Arc<dyn Messaging> =
+            Arc::new(LogMessaging::new(storage.clone(), kv.clone()));
+        let signer: Arc<dyn Signer> = Arc::new(LocalSigner::generate(TokenAlg::Es256));
+        // One `bus:sync/{tenant}/import` consumer covers the `sync/<tenant>/import` family.
+        let (rt, deploy) = setup_consumer_topic(
+            storage,
+            kv.clone(),
+            messaging.clone(),
+            "bus:sync/{tenant}/import",
+            "loader",
+            signer.clone(),
+        )
+        .await;
+        let inner = rt.inner.clone().unwrap();
+
+        // A COVERED topic with work (matched by the `{tenant}` consumer).
+        let acme = seal_ctx(&signer, "acme").await;
+        messaging
+            .publish_ctx("bus/sync/acme/import", b"ok", Some(&acme))
+            .await
+            .unwrap();
+        // An UNCOVERED topic with work (no consumer subscription matches it).
+        messaging
+            .publish("bus/nobody/listening", b"stuck")
+            .await
+            .unwrap();
+
+        // One maintenance pass computes the orphaned set (leader-gated single node = always).
+        run_ticks(&inner, &deploy, 1).await;
+        let orphaned = inner.metrics.orphaned_topics();
+
+        assert!(
+            orphaned.contains_key("bus/nobody/listening"),
+            "an uncovered topic with claimable work raises the orphaned signal: {orphaned:?}"
+        );
+        assert!(
+            !orphaned.contains_key("bus/sync/acme/import"),
+            "a topic WITH a matching {{tenant}} consumer does NOT raise the signal: {orphaned:?}"
         );
     }
 

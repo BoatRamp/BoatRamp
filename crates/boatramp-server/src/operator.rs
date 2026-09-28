@@ -87,6 +87,13 @@ struct OperatorStats {
     /// top-level, project-scoped entity, so the same block appears whichever site's stats are queried.
     #[serde(skip_serializing_if = "Option::is_none")]
     async_shards: Option<crate::AsyncShardStats>,
+    /// Orphaned ready topics (v0.7.1): concrete topics with claimable work that NO active consumer
+    /// subscription covers (exact OR `{tenant}`-match), keyed topic -> claimable count — the single
+    /// signal for a declared-but-un-routable consumer / a producer with no consumer. Node-scoped
+    /// (like `async_shards`): the scheduler's maintenance pass computes it fleet-wide, so it appears
+    /// whichever site's stats are queried. Empty (omitted) in the healthy steady state.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    orphaned: std::collections::BTreeMap<String, u64>,
 }
 
 /// Authenticated per-site operator stats (`site:<site>` scope via the API auth
@@ -136,6 +143,8 @@ pub(super) async fn operator_handler_stats(
         stream_connections: inner.stream_connections_for_site(&site),
         delivery,
         async_shards,
+        // Orphaned-work signal (v0.7.1): the scheduler's maintenance pass populates this fleet-wide.
+        orphaned: inner.metrics.orphaned_topics(),
     })
     .into_response()
 }
@@ -1439,6 +1448,10 @@ pub(super) async fn prometheus_metrics(
             }
             body.push_str(&metrics::render_consumer_gauges(&rows));
         }
+        // Orphaned-work gauges (v0.7.1): concrete topics with claimable work no active consumer
+        // covers, computed by the scheduler's maintenance pass. Empty (no series) in the healthy
+        // steady state.
+        body.push_str(&inner.metrics.render_orphaned_gauges());
         // Function usage series (FA-4), from the persisted metering aggregates.
         // Best-effort: a store error omits the block rather than failing the scrape.
         if let Ok(mut usage) = deploy.list_metering(ProjectRef::DEFAULT).await

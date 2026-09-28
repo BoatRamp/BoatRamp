@@ -122,9 +122,52 @@ pub struct Metrics {
     // (site, trigger, route) -> counters. A `BTreeMap` so snapshots/exports are
     // deterministically ordered.
     inner: Mutex<BTreeMap<(String, &'static str, String), Counters>>,
+    // Orphaned ready/indexed topics (v0.7.1): concrete topics with claimable work that NO active
+    // consumer subscription covers (exact OR `{tenant}`-match), keyed topic -> claimable-message
+    // count. Replaced wholesale each scheduler maintenance pass (a topic that gains a consumer, or
+    // drains, simply drops out on the next pass). A `BTreeMap` so the export is deterministically
+    // ordered. This is the single signal that surfaces the "declared-but-un-routable consumer /
+    // producer-with-no-consumer" silent stuck-backlog defect.
+    orphaned: Mutex<BTreeMap<String, u64>>,
 }
 
 impl Metrics {
+    /// Replace the set of **orphaned ready topics** (v0.7.1): concrete topics with claimable work
+    /// that no active consumer subscription covers. The scheduler recomputes this cheaply each
+    /// maintenance pass (a set-difference over the already-enumerated indexed topics vs the active
+    /// consumers' matchers) and replaces the whole map, so a topic that gains a consumer or drains
+    /// drops out on the next pass. Read by [`render_orphaned_gauges`](Self::render_orphaned_gauges)
+    /// (Prometheus `orphaned_ready_topic{topic}`) and [`orphaned_topics`](Self::orphaned_topics)
+    /// (the operator `stats` block).
+    pub fn set_orphaned_topics(&self, topics: BTreeMap<String, u64>) {
+        *self.orphaned.lock().unwrap() = topics;
+    }
+
+    /// A snapshot of the current orphaned ready topics (topic -> claimable count) for the operator
+    /// `stats` view.
+    pub fn orphaned_topics(&self) -> BTreeMap<String, u64> {
+        self.orphaned.lock().unwrap().clone()
+    }
+
+    /// Render the orphaned-ready-topic gauges in Prometheus text format (v0.7.1): one
+    /// `orphaned_ready_topic{topic="…"}` series per orphaned topic carrying its claimable-message
+    /// count. Empty (no series) when nothing is orphaned — the healthy steady state.
+    pub fn render_orphaned_gauges(&self) -> String {
+        let map = self.orphaned.lock().unwrap();
+        let mut out = String::new();
+        out.push_str(
+            "# HELP boatramp_orphaned_ready_topic Claimable messages on a topic no active consumer covers.\n\
+             # TYPE boatramp_orphaned_ready_topic gauge\n",
+        );
+        for (topic, count) in map.iter() {
+            out.push_str(&format!(
+                "boatramp_orphaned_ready_topic{{topic=\"{}\"}} {}\n",
+                escape(topic),
+                count,
+            ));
+        }
+        out
+    }
     /// Record a finished invocation **and** emit the structured log line.
     pub fn observe(
         &self,

@@ -2650,6 +2650,62 @@ impl ConsumerRebuild<'_> {
     }
 }
 
+/// Resolve a drained message's SEALED originator tenant from its durable `signed_context` envelope
+/// (v0.7.1 tenant-template bind-verify). Verifies the envelope (signature + expiry + `br_kind ==
+/// "context"`) against the fleet `anchor` — the SAME [`verify_context`](boatramp_core::cose::verify_context)
+/// the `signed_context` tenancy source uses — and returns the bound tenant. `None` for a message with
+/// no envelope, no fleet anchor, or a forged/altered/expired envelope: the caller then fails closed
+/// (a templated delivery with no verifiable seal is quarantined, never delivered). The guest never
+/// names the tenant — only a host signature over the producer's principal resolves here.
+#[cfg(feature = "handlers")]
+fn resolve_sealed_tenant(
+    signed_context: Option<&str>,
+    anchor: Option<&boatramp_core::cose::TokenPublicKey>,
+) -> Option<String> {
+    let (env, anchor) = (signed_context?, anchor?);
+    boatramp_core::cose::verify_context(env, anchor, boatramp_core::time::now_unix()).ok()
+}
+
+/// The tenant-seal bind-verify **mutation seam** (anti-hollow gate). In a non-test build this is a
+/// hard `false` — the check is ALWAYS enforced in the shipped binary (there is no runtime toggle, so
+/// a production process can never be tricked into skipping it). In a `cfg(test)` build a THREAD-LOCAL
+/// flag ([`with_tenant_seal_check_skipped`]) lets the gate neuter the check ON ITS OWN THREAD ONLY,
+/// so a concurrent consumer-dispatch test in the same process is unaffected (a process-global env var
+/// would race across the parallel test harness — the flake this avoids). When set, a message whose
+/// sealed tenant does NOT match its concrete `{tenant}` topic segment is DELIVERED instead of
+/// quarantined; the gate asserts the clean lane quarantines and the mutated lane delivers — a
+/// two-sided property proving the check is load-bearing (mirrors the `blob-upload`
+/// `BOATRAMP_BLOB_TENANT_TEMPLATE_MUTATE_SKIP_HOST_FORCE` convention, race-free).
+#[cfg(all(feature = "handlers", not(test)))]
+fn tenant_seal_mutate_skip() -> bool {
+    false
+}
+
+#[cfg(all(feature = "handlers", test))]
+thread_local! {
+    static TENANT_SEAL_MUTATE_SKIP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(all(feature = "handlers", test))]
+fn tenant_seal_mutate_skip() -> bool {
+    TENANT_SEAL_MUTATE_SKIP.with(std::cell::Cell::get)
+}
+
+/// Test-only: run `f` with the tenant-seal bind-verify check NEUTERED on THIS thread (the anti-hollow
+/// mutation lane). Restores the prior value after, so the neuter is scoped to `f` and never leaks to
+/// a sibling test thread.
+#[cfg(all(feature = "handlers", test))]
+pub(super) async fn with_tenant_seal_check_skipped<F, Fut, T>(f: F) -> T
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = T>,
+{
+    TENANT_SEAL_MUTATE_SKIP.with(|c| c.set(true));
+    let out = f().await;
+    TENANT_SEAL_MUTATE_SKIP.with(|c| c.set(false));
+    out
+}
+
 #[cfg(feature = "handlers")]
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn dispatch_consumer_batch(
@@ -2670,6 +2726,22 @@ pub(super) async fn dispatch_consumer_batch(
     // from that message's sealed envelope (the `bindings` above is then unused). `None` ⇒ reuse the
     // built-once `bindings` (non-signed-context consumer).
     rebuild: Option<&ConsumerRebuild<'_>>,
+    // SECURITY CRUX (v0.7.1 tenant-template bind-verify, Item 3): `Some(t)` when THIS concrete topic
+    // was reached via a `{tenant}` template match — `t` is the concrete topic's bound `{tenant}`
+    // segment. Every drained message's sealed `signed_context` tenant MUST equal `t`; a message whose
+    // sealed tenant differs (or is absent/unverifiable) is QUARANTINED — dead-lettered into THIS
+    // concrete topic's DLQ with reason `tenant-seal-mismatch`, never delivered, never plain-retried
+    // (a permanent anomaly). `None` ⇒ a non-templated exact match: no bound tenant, no check
+    // (unchanged). The sealed tenant is resolved from the message envelope via `context_anchor`,
+    // independent of whether the consumer declares the `signed_context` tenancy source.
+    expected_tenant: Option<&str>,
+    // The fleet signer's public half — the anchor the durable `signed_context` envelope is verified
+    // against (the SAME key `mint_context`/`verify_context` use). Threaded so the bind-verify resolves
+    // a message's sealed tenant EVEN when the consumer does not declare the `signed_context` tenancy
+    // source (so `rebuild` is `None`). Absent (no fleet signer wired) ⇒ a templated topic cannot
+    // verify any envelope, so EVERY message on it fails closed (quarantine) — a templated subscription
+    // is meaningless without the anchor. Ignored when `expected_tenant` is `None` (non-templated).
+    context_anchor: Option<&boatramp_core::cose::TokenPublicKey>,
     limits: boatramp_handlers::Limits,
     lease: Duration,
     max_attempts: u32,
@@ -2717,6 +2789,65 @@ pub(super) async fn dispatch_consumer_batch(
         .producer_context_cell()
         .and_then(|cell| cell.lock().ok().and_then(|guard| guard.clone()));
     for msg in claimed {
+        // SECURITY CRUX (v0.7.1 tenant-template bind-verify, Item 3). This concrete topic was reached
+        // via a `{tenant}` template match ⇒ `expected_tenant = Some(bound)`, `bound` being the topic's
+        // concrete `{tenant}` segment. Verify the message's SEALED originator tenant (resolved from its
+        // durable `signed_context` envelope against the fleet anchor — signature + expiry + kind, the
+        // SAME `verify_context` the `signed_context` tenancy source uses) EQUALS `bound`. A mismatch —
+        // or an absent/unverifiable envelope — is a PERMANENT anomaly (a message sealed for tenant A can
+        // never legitimately run off `sync/B/import`), so QUARANTINE it fail-closed: dead-letter into
+        // THIS concrete topic's DLQ (per-tenant DLQ preserved), never deliver, never plain-retry.
+        //
+        // The seal (`signed_context`), NOT the topic segment, is the authority: the topic segment only
+        // SELECTS which bound value the seal must match, so a templated delivery does not weaken the
+        // per-message seal (the topic is operational; the seal is the security boundary). A
+        // non-templated topic passes `None` here — no bound tenant, no check (unchanged).
+        if let Some(bound) = expected_tenant {
+            let sealed = resolve_sealed_tenant(msg.signed_context.as_deref(), context_anchor);
+            // The mutation seam (anti-hollow gate): when the mutation env var is set the check is
+            // SKIPPED, so a mismatched message DELIVERS instead of quarantining — the gate asserts the
+            // clean build quarantines and the mutated build delivers, proving the check is load-bearing.
+            let skip_check = tenant_seal_mutate_skip();
+            let matches = sealed.as_deref() == Some(bound);
+            if !skip_check && !matches {
+                // Fail-closed quarantine. `dead_letter` is TERMINAL (no redelivery). If the backend
+                // can't dead-letter (unsupported), STILL refuse to deliver (a plain nack redelivers
+                // the same anomaly forever, but never delivers it cross-tenant — fail-closed).
+                let reason = "tenant-seal-mismatch";
+                match messaging.dead_letter(&msg, reason).await {
+                    Ok(()) => {}
+                    Err(err) => {
+                        tracing::warn!(
+                            id = msg.id,
+                            topic = namespaced_topic,
+                            %err,
+                            "tenant-seal mismatch could not be quarantined (backend has no DLQ); \
+                             refusing delivery"
+                        );
+                        // Do NOT deliver. Leave the message leased (it re-claims on lease expiry and
+                        // quarantines again once a DLQ-capable backend is present) — never delivered
+                        // to the wrong tenant.
+                    }
+                }
+                metrics.observe(
+                    site,
+                    metrics::Trigger::Consumer,
+                    msg.topic.strip_prefix(scope_prefix).unwrap_or(&msg.topic),
+                    component_hash,
+                    metrics::Outcome::Error,
+                    std::time::Duration::ZERO,
+                );
+                tracing::warn!(
+                    id = msg.id,
+                    topic = namespaced_topic,
+                    expected_tenant = bound,
+                    sealed_tenant = sealed.as_deref().unwrap_or("<none>"),
+                    "quarantined a message whose sealed tenant does not match its concrete \
+                     `{{tenant}}` topic segment (tenant-seal-mismatch)"
+                );
+                continue;
+            }
+        }
         // Per-message bindings. A `signed_context` consumer (R1 async lane) is rebuilt from THIS
         // message's host-sealed envelope, so the originator's tenant resolves onto its orm/sql scope
         // AND the `graphql::run` caller principal — symmetric to the `FnTenant::Durable` drain path,

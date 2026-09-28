@@ -539,6 +539,46 @@ jobs:
           cargo test -p boatramp-types --lib authz::tests::nonconforming_grant_target_matches_nothing
           cargo test -p boatramp-server project_scope::tests::nonconforming_project_segment_is_malformed_no_rewrite_no_ctx
 
+  # `{tenant}`-TEMPLATE QUEUE-CONSUMER FAN-IN HARD GATE (v0.7.1). A consumer subscribed to a
+  # `bus:sync/{tenant}/import` template must fan IN over every matching concrete per-tenant topic
+  # (per-tenant DLQ preserved), non-templated consumers must keep exact-matching unchanged, a
+  # message whose SEALED `signed_context` tenant does not equal its concrete topic's `{tenant}`
+  # segment must be QUARANTINED (dead-lettered, not delivered), and an uncovered topic with work
+  # must raise the orphaned signal. Robust exit-code mechanism (the v0.6.4/v0.6.5 style): named
+  # `#[test]`s where the TEST EXIT CODE is the contract — NO greppable marker, NO bash env-loop.
+  # The bind-verify gate is anti-hollow (a thread-local mutation seam neuters the tenant-match check
+  # → the mismatched message then DELIVERS → the CLEAN lane of the same test FAILS), proving the
+  # check is load-bearing. Runs on the SHIPPED musl target (the fan-in dispatch + the matcher +
+  # the quarantine + `indexed_topics` primitives).
+  test-wildcard-consumer:
+    name: test (wildcard queue-consumer fan-in gate)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/setup-musl
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: test-wildcard-consumer-musl
+      # The four server-side gates: fan-in (per-concrete delivery + independent DLQ), non-template
+      # unchanged, bind-verify quarantine (anti-hollow), orphaned signal.
+      - name: Fan-in + bind-verify + orphaned gates (server)
+        run: |
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-server --features handlers --lib -- \
+            tests::tenant_template_fans_in_over_concrete_topics_each_own_dlq \
+            tests::non_template_consumer_still_exact_matches \
+            tests::bind_verify_quarantines_a_tenant_seal_mismatch \
+            tests::orphaned_signal_fires_only_for_an_uncovered_topic
+      # The `{tenant}` matcher + the quarantine + `indexed_topics` primitives in boatramp-core.
+      - name: Matcher + quarantine + indexed-topics primitives (core)
+        run: |
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-core --lib -- \
+            messaging::tests::tenant_tmpl_matches_exact_is_literal_and_binds_no_tenant \
+            messaging::tests::tenant_tmpl_matches_template_captures_the_tenant_segment \
+            messaging::tests::tenant_tmpl_matches_is_single_segment_never_crosses_slash \
+            messaging::tests::tenant_tmpl_matches_repeated_slots_must_agree \
+            messaging::tests::dead_letter_quarantines_a_claimed_message_terminally \
+            messaging::tests::indexed_topics_enumerates_concrete_topics
+
   # Stage 5a GraphQL Data Connector TARGET-tenant read isolation HARD GATE. A `@tenant(scope:
   # target)` read must confine to another tenant `B`'s declared PUBLIC subset on a REAL libsql
   # engine (compile -> SQL -> execute -> shape), returning only B's published+non-deleted rows and
