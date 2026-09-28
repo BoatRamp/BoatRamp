@@ -38,7 +38,7 @@
 
 use std::sync::Arc;
 
-use boatramp_core::project::{validate_object_key, validate_resource_name};
+use boatramp_core::project::{validate_key_segment, validate_object_key};
 
 mod generated {
     wasmtime::component::bindgen!({
@@ -142,9 +142,12 @@ pub fn screen_upload_target(container: &str, target: &UploadTarget) -> Result<()
     let reject = |m: String| Err(MintRefused::InvalidRequest(m));
 
     // The container is re-anchored verbatim into `hblob/{qualified-site}/{container}/`, so it MUST be a
-    // single safe segment — screen it even though the allowlist matched (the allowlist entry is an
-    // operator string, not itself trusted to be traversal/quote-free).
-    validate_resource_name("container", container)
+    // single safe KEY segment — screen it even though the allowlist matched (the allowlist entry is an
+    // operator string, not itself trusted to be traversal/quote-free). Use the KEY-SAFETY rule, not the
+    // strict slug: an operator `{tenant}` template expands to a container carrying the caller's tenant
+    // identity (e.g. `assets-user@acme.com`), so `.`/`@` must survive — traversal/separators must not.
+    // The quote check below is an additional, separate guard on top of key safety.
+    validate_key_segment("container", container)
         .map_err(|e| MintRefused::InvalidRequest(format!("invalid container: {e}")))?;
     if container.contains(POLICY_METACHARS) {
         return reject("container must not contain a quote character".into());

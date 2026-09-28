@@ -155,6 +155,50 @@ pub fn validate_resource_name(kind: &'static str, value: &str) -> Result<(), Inv
     }
 }
 
+/// Validate a **data-plane-derived** name used as a KV/blob **key segment** — a `tenant`
+/// (the host-resolved `ScopeAxis::Tenant` value from a signed `tid` claim, which is
+/// routinely an email `user@acme.com` or a dotted domain `acme.corp`) or a `container`
+/// (which an operator `{tenant}` template legitimately expands to a tenant value, e.g.
+/// `assets-user@acme.com`).
+///
+/// Enforces **key safety only** — the segment cannot reshape the key or traverse
+/// (`/`, `\`, `.`/`..`, `*`, whitespace, control are rejected; ≤63 bytes) — WITHOUT the
+/// single-label slug alphabet, because these values are NOT operator-chosen identifiers:
+/// they carry `.`/`@`/etc. from an externally-signed tenant identity. This is deliberately
+/// the pre-v0.7.0 denylist rule, preserved for exactly the two kinds that are data-plane
+/// values rather than resource identifiers. Do NOT route operator identifiers
+/// (project/site/database/…) through this — they use [`validate_resource_name`]'s strict
+/// slug. A homoglyph is not an impersonation vector here: the tenant is the token's own
+/// signed claim, not an operator-registered name.
+pub fn validate_key_segment(kind: &'static str, value: &str) -> Result<(), InvalidResourceName> {
+    let reject = |reason| {
+        Err(InvalidResourceName {
+            kind,
+            value: value.to_string(),
+            reason,
+        })
+    };
+    if value.is_empty() {
+        return reject("must not be empty");
+    }
+    if value.len() > MAX_RESOURCE_NAME_LEN {
+        return reject("must not exceed 63 bytes");
+    }
+    if value == "." || value == ".." {
+        return reject("must not be '.' or '..'");
+    }
+    for c in value.chars() {
+        match c {
+            '/' | '\\' => return reject("must not contain a path separator ('/' or '\\')"),
+            '*' => return reject("must not contain '*'"),
+            c if c.is_whitespace() => return reject("must not contain whitespace"),
+            c if c.is_control() => return reject("must not contain control characters"),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 /// Validate a **token role target** (audit A8) at every mint feeder — the segment-aware
 /// counterpart to [`validate_resource_name`], because a target is a `/`-bearing scope
 /// string, not a single name segment.
@@ -413,6 +457,59 @@ mod tests {
             assert!(
                 validate_resource_name("site", bad).is_err(),
                 "{bad:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn key_segment_is_key_safe_but_not_slug_strict() {
+        // Data-plane-derived names (tenant from a signed `tid` claim; a `{tenant}`-expanded
+        // container) are KEY-SAFE, not slug-strict — `.`/`@`/dots survive so email/dotted
+        // tenants keep working; only traversal/separators/control are refused.
+        for ok in [
+            "acme",
+            "acme.corp",
+            "u@acme.com",
+            "assets-user@acme.com",
+            "tid-123",
+            "a.b.c",
+            "9",
+        ] {
+            assert!(
+                validate_key_segment("tenant", ok).is_ok(),
+                "{ok:?} should pass the key-segment rule"
+            );
+        }
+        for bad in [
+            "",
+            ".",
+            "..",
+            "a/b",
+            "a\\b",
+            "../evil",
+            "*",
+            "a b",
+            "tab\tname",
+            "ctl\u{0}name",
+        ] {
+            assert!(
+                validate_key_segment("tenant", bad).is_err(),
+                "{bad:?} should be rejected as key-unsafe"
+            );
+        }
+        // The anti-regression LOCK for MEDIUM-1 + its container sibling: the two tiers
+        // genuinely differ — an email/dotted value is REJECTED as an operator identifier
+        // (strict slug) but ACCEPTED as a data-plane key segment. Routing a data-plane
+        // tenant through the slug (the bug) would break sealed-secret + blob-upload access
+        // for every email/dotted tenant.
+        for v in ["u@acme.com", "acme.corp"] {
+            assert!(
+                validate_resource_name("project", v).is_err(),
+                "{v:?} slug-rejected"
+            );
+            assert!(
+                validate_key_segment("tenant", v).is_ok(),
+                "{v:?} key-accepted"
             );
         }
     }

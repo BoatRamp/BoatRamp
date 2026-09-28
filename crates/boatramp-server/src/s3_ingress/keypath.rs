@@ -22,7 +22,7 @@
 //! never from the URL authority or a client header — so cross-container / cross-project is
 //! structurally impossible.
 
-use boatramp_core::project::{ProjectRef, validate_object_key, validate_resource_name};
+use boatramp_core::project::{ProjectRef, validate_key_segment, validate_object_key};
 
 /// The reserved staging-namespace segment for in-flight multipart uploads. It lives under the
 /// case-folded `.boatramp*` namespace that [`validate_object_key`] reserves — so a client object key
@@ -133,7 +133,9 @@ pub fn compose_object_key(
     // token whose container were `"../victim"` or `"a/b"` would otherwise escape the container tree —
     // the object *key* is screened but the *container* is not. This is the S3-face choke point the
     // folded Scope-confinement condition assigns the check to, so cloud backends are covered.
-    validate_resource_name("container", container)
+    // KEY-SAFETY rule (not the strict slug): a `{tenant}`-expanded container carries the tenant
+    // identity (e.g. `assets-user@acme.com`), so `.`/`@` survive; only traversal/separators are refused.
+    validate_key_segment("container", container)
         .map_err(|e| KeyError::ContainerEscape(e.to_string()))?;
     let decoded = percent_decode_once(raw_wire_key);
     validate_object_key(&decoded).map_err(|e| KeyError::ScopeEscape(e.to_string()))?;
