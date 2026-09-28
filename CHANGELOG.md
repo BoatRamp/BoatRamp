@@ -5,6 +5,37 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.6.5] - 2026-09-28
+
+Additive, non-breaking. JSON as an alternative config input format (for interop —
+generate configs from Nickel), plus a documentation catch-up.
+
+### Added
+
+- **JSON accepted for config input (`--format <ron|json>`).** Operator-authored config files (the
+  `apply` manifest, the `serve`/node config, and the project config) may now be JSON as well as RON.
+  Format is auto-detected by extension (`.json` ⇒ JSON, else RON) and can be forced with `--format` on
+  `boatramp apply` and `boatramp serve`. JSON deserializes into the exact same typed schema —
+  externally-tagged enums preserve variant names and `deny_unknown_fields` still rejects typos — and all
+  post-parse validation (db-name screening, routing compile-check, the env-override merge) runs
+  identically. There is no content-sniffing: a file is decoded strictly per its resolved format.
+  **Headline use case:** author configs in **Nickel** and `nickel export --format json > apply.json`,
+  then `boatramp apply -f apply.json`. JSON input is **current-schema only** (no legacy JSON exists) —
+  an old `version:` in JSON errors clearly (regenerate current-schema JSON, or migrate the RON source
+  with `boatramp config migrate`); the RON version-migration path is unchanged. See the new
+  "Author configs in RON or JSON" how-to.
+
+### Documentation
+
+- **Prose-docs catch-up for v0.6.0–v0.6.5.** The mdbook was last comprehensively updated for v0.6.0
+  Stage A; this fills the gap for everything since. CLI reference: `blob migrate`/`drain`/`purge`/
+  `status`, `db ls|get|status`, `config migrate`, `apply`/`serve` `--format`. `boatramp.cfg` reference:
+  `[serve.s3_credential]`, `[serve.blob_fallback]`, `[serve.s3_ingress*]`. apply-manifest reference: the
+  `databases:` block, typed `compute` (`ComputeSpec`), `version:`+migration, the `safelist` →
+  `enforce_safelist` rename + `safelisted_ops`, and the `upload_containers` `{tenant}` template. API
+  reference: the `/api/blob-{drain,status,purge}`, managed-database, and repair routes. New how-tos:
+  blob-backend migration, managed databases, and config formats.
+
 ## [0.6.4] - 2026-09-28
 
 Additive, non-breaking. A general, provably-safe blob purge + queryable migration status.
