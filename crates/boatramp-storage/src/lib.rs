@@ -45,6 +45,18 @@ pub mod azure_shared_key;
 #[cfg(feature = "slatedb")]
 pub mod kv_slatedb;
 
+/// The `object_store` crate slatedb builds against, re-exported so downstream crates (the
+/// `boatramp kv repair` CLI) can name the `ObjectStore` trait / `Arc<dyn ObjectStore>` without a
+/// direct `object_store` / `slatedb` dependency of their own (and without a version-mismatch risk).
+#[cfg(feature = "slatedb")]
+pub use slatedb::object_store;
+
+/// Opt-in WAL tail repair for the SlateDB control-plane store (P0, v0.7.2): quarantine a
+/// torn TRAILING WAL tail beyond the durable frontier so a crash-frozen store opens, with a
+/// data-loss guard that refuses on a mid-range gap or an unreadable manifest.
+#[cfg(feature = "slatedb")]
+pub mod wal_repair;
+
 #[cfg(feature = "cloudflare-kv")]
 pub mod kv_cloudflare;
 

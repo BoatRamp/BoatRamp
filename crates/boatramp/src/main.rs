@@ -53,6 +53,10 @@ mod compose;
 mod compression;
 mod compute;
 mod db;
+// `boatramp kv repair`: offline WAL-tail repair for the SlateDB control-plane store.
+// Gated on `slatedb` (it operates on the SlateDB store).
+#[cfg(feature = "slatedb")]
+mod kv;
 mod sql;
 // The config model moved to `boatramp-node` (library); re-export it under the
 // binary's `crate::config` so existing call sites are unchanged.
@@ -189,6 +193,10 @@ enum Command {
     /// Declaring/provisioning is done via the manifest `databases:` block (`boatramp
     /// apply`) — there is deliberately no `db create`.
     Db(db::DbArgs),
+    /// Maintain the control-plane SlateDB store (`kv repair` — recover a torn WAL tail after a
+    /// crash/snapshot; dry-run by default, `--apply` to perform it).
+    #[cfg(feature = "slatedb")]
+    Kv(kv::KvArgs),
     /// Upload a file as a content-addressed blob (e.g. a microVM kernel).
     Blob(blob::BlobArgs),
     /// Read/change the dynamic daemon config (get/set/rollback/apply, no restart).
@@ -455,6 +463,18 @@ async fn async_main() -> Result<(), CliError> {
         return Ok(());
     }
 
+    // `kv repair` operates directly on the on-disk / R2 SlateDB store via `--data-dir` /
+    // `--kv-s3` flags — it needs NEITHER the project nor the server config, so handle it before
+    // loading `project.cfg` (a store whose repair is needed may predate any valid config).
+    #[cfg(feature = "slatedb")]
+    if matches!(cli.command, Command::Kv(_)) {
+        let Command::Kv(args) = cli.command else {
+            unreachable!("guarded by matches! above")
+        };
+        kv::run(args).await?;
+        return Ok(());
+    }
+
     let path = cli.config.unwrap_or_else(|| PathBuf::from("project.cfg"));
     // The project config (`project.cfg`) auto-detects RON vs JSON by extension;
     // there is no top-level `--format` (it is scoped to `apply` / `serve`).
@@ -475,6 +495,8 @@ async fn async_main() -> Result<(), CliError> {
         Command::Operator(_) => unreachable!("handled above"),
         #[cfg(feature = "mcp")]
         Command::Mcp(_) => unreachable!("handled above"),
+        #[cfg(feature = "slatedb")]
+        Command::Kv(_) => unreachable!("handled above"),
         Command::Completions { .. } | Command::Man => unreachable!("handled above"),
         Command::Sync(args) => sync::run(args, &config).await?,
         Command::Apply(args) => apply::run(args, &config).await?,

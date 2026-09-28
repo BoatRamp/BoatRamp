@@ -111,16 +111,63 @@ pub(super) struct CronEntry {
     pub(super) running: Arc<std::sync::atomic::AtomicBool>,
 }
 
+/// A handle to the background scheduler that can **fully quiesce** it on shutdown — not just
+/// abort the outer loop, but stop it spawning new work and abort+await its DETACHED children
+/// (the delivery drainer, the per-site blob watchers) so NONE of them can issue a KV write after
+/// the store is closed. This is the Part-A prerequisite for a lossless quiesce-then-`close()`:
+/// aborting a tokio task then AWAITING it is the only way to be sure it issues no further write.
+///
+/// The old contract (a bare [`abort`](tokio::task::JoinHandle::abort) on the outer handle) left
+/// the drainer + blob watchers running detached — they kept writing right up to (and past) the
+/// store close, which is exactly what produced a fresh WAL segment on shutdown.
+#[cfg(feature = "handlers")]
+pub struct SchedulerHandle {
+    /// The outer scheduler task. On [`quiesce`](Self::quiesce) it observes the cancel signal,
+    /// aborts+awaits its children, then returns — so awaiting it means the whole scheduler tree
+    /// has stopped writing.
+    handle: tokio::task::JoinHandle<()>,
+    /// Signals the scheduler loop to stop: flips to `true` on [`quiesce`](Self::quiesce).
+    cancel: tokio::sync::watch::Sender<bool>,
+}
+
+#[cfg(feature = "handlers")]
+impl SchedulerHandle {
+    /// Signal the scheduler to stop and **await** its full quiescence — the outer loop breaks,
+    /// aborts+awaits the drainer + every blob watcher + any in-flight cron fire, then returns.
+    /// After this resolves NO scheduler task can issue another KV write, so the caller may safely
+    /// `close()` the store. Bounded by the caller's `close` timeout (a slow child is abandoned by
+    /// the outer timeout, fail-safe).
+    pub async fn quiesce(self) {
+        // Ask the loop to stop; a send error just means the task already exited (fine).
+        let _ = self.cancel.send(true);
+        // Await the outer task: it runs the child abort+await on the cancel path before returning.
+        // A JoinError (the task panicked/was cancelled) is not actionable at shutdown — log-free.
+        let _ = self.handle.await;
+    }
+
+    /// Abort the scheduler without awaiting quiescence (the legacy best-effort stop). Used only
+    /// where the caller cannot await (a non-async drop path); prefer [`quiesce`](Self::quiesce).
+    pub fn abort(&self) {
+        let _ = self.cancel.send(true);
+        self.handle.abort();
+    }
+}
+
 impl HandlerRuntime {
     /// Spawn the **background scheduler**: a loop that drives each *active*
     /// deployment's consumers and crons. "Active" = a site's
     /// current (production) deployment plus any site-configured background
     /// aliases; previews are never enumerated, so a preview deployment runs
     /// request handlers but **no background work**. Returns `None` when handlers
-    /// are disabled (or no runtime). The caller aborts the handle on shutdown.
+    /// are disabled (or no runtime). The caller calls
+    /// [`SchedulerHandle::quiesce`] on shutdown to fully stop it (drainer + blob
+    /// watchers + in-flight crons) BEFORE closing the KV store.
     #[cfg(feature = "handlers")]
-    pub fn spawn_scheduler(&self, deploy: DeployStore) -> Option<tokio::task::JoinHandle<()>> {
+    pub fn spawn_scheduler(&self, deploy: DeployStore) -> Option<SchedulerHandle> {
         let inner = self.inner.clone()?;
+        // The shutdown cancel signal: the loop selects on this and stops on `true`, then aborts+
+        // awaits its detached children so none can write after the store closes (Part A).
+        let (cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
         // Event-driven delivery: is a durable ready-set available? If the messaging backend supports
         // it (an atomic `write_batch` — B2), delivery is driven by the ready-set DRAINER and the
         // maintenance tick skips the per-consumer poll. Otherwise (no messaging, or a non-atomic
@@ -131,7 +178,7 @@ impl HandlerRuntime {
             .as_ref()
             .is_some_and(|m| m.supports_ready_set());
 
-        Some(tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             // --- the delivery drainer (event-driven), spawned only when the ready-set is available.
             // It reacts to the durable ready-set (∪ the due-heap) instead of polling every topic. On a
             // non-ready-set backend this is not spawned and the maintenance tick below does the full
@@ -141,6 +188,10 @@ impl HandlerRuntime {
                 let deploy = deploy.clone();
                 tokio::spawn(async move { run_delivery_drainer(inner, deploy).await })
             });
+            // In-flight cron fires spawned by the maintenance tick. Held so shutdown can await them
+            // (a cron fire can enqueue an async invocation — a KV write). Pruned of finished handles
+            // each tick so it stays bounded on a long-running node.
+            let mut cron_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
             // --- the maintenance tick (crons, async lane, workflows, retention sweep, session reap,
             // blob watchers) on the coarse periodic timer. When the drainer owns delivery it passes
@@ -180,9 +231,22 @@ impl HandlerRuntime {
             let safetynet_interval = inner.delivery_config().safetynet_interval;
             let mut last_safetynet = tokio::time::Instant::now();
             loop {
-                interval.tick().await;
+                // Wait for the next tick OR the shutdown cancel. On cancel we break to the quiesce
+                // tail below — stop spawning new work and abort+await the detached children so none
+                // can write after the store is closed (Part A).
+                tokio::select! {
+                    biased;
+                    _ = cancel_rx.changed() => {
+                        if *cancel_rx.borrow_and_update() {
+                            break;
+                        }
+                    }
+                    _ = interval.tick() => {}
+                }
+                // Prune finished cron fires so the held set stays bounded on a long-running node.
+                cron_handles.retain(|h| !h.is_finished());
                 // (1) The fast pass: sharded owner-only work (or the legacy leader-gate).
-                if let Err(err) = run_scheduler_tick(
+                match run_scheduler_tick(
                     &inner,
                     &deploy,
                     &mut wasm_cache,
@@ -194,7 +258,8 @@ impl HandlerRuntime {
                 )
                 .await
                 {
-                    tracing::warn!(%err, "scheduler tick failed");
+                    Ok((_, fired)) => cron_handles.extend(fired),
+                    Err(err) => tracing::warn!(%err, "scheduler tick failed"),
                 }
                 reconcile_blob_watchers(&inner, &deploy, &mut blob_watchers, fast_pass).await;
                 // (2) The unsharded safety-net pass (B7): every `safetynet_interval`, on a live shard,
@@ -204,7 +269,7 @@ impl HandlerRuntime {
                 // firing dedup). Never runs on single node / a non-CAS backend (nothing to back up).
                 if shard_active && last_safetynet.elapsed() >= safetynet_interval {
                     last_safetynet = tokio::time::Instant::now();
-                    if let Err(err) = run_scheduler_tick(
+                    match run_scheduler_tick(
                         &inner,
                         &deploy,
                         &mut wasm_cache,
@@ -218,15 +283,36 @@ impl HandlerRuntime {
                     )
                     .await
                     {
-                        tracing::warn!(%err, "async safety-net pass failed");
+                        Ok((_, fired)) => cron_handles.extend(fired),
+                        Err(err) => tracing::warn!(%err, "async safety-net pass failed"),
                     }
                 }
-                // If the drainer task ever exits (it shouldn't — it loops forever), the maintenance
-                // loop keeps running; delivery would then rely on the drainer being respawned by a
-                // restart. Abort it with us on shutdown (the caller aborts this outer handle).
-                let _ = &drainer;
             }
-        }))
+
+            // --- Shutdown quiescence (Part A): the loop broke on the cancel signal. Stop the
+            // detached children so NONE can issue a KV write after the store is closed. Abort THEN
+            // await each — an abort alone only *requests* cancellation; awaiting is what guarantees
+            // the task has stopped at its next await point and will run no further code.
+            if let Some(drainer) = drainer {
+                drainer.abort();
+                let _ = drainer.await;
+            }
+            for (_, watcher) in blob_watchers.drain() {
+                watcher.abort();
+                let _ = watcher.await;
+            }
+            // In-flight cron fires: await the ones already running (bounded — the loop stopped
+            // spawning new ones). A fire that has not finished is aborted+awaited so it cannot land
+            // a late enqueue write. The outer `close` timeout bounds a wedged fire (fail-safe).
+            for fire in cron_handles.drain(..) {
+                fire.abort();
+                let _ = fire.await;
+            }
+        });
+        Some(SchedulerHandle {
+            handle,
+            cancel: cancel_tx,
+        })
     }
 }
 

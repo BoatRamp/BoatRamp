@@ -100,6 +100,10 @@ pub enum CliError {
     /// The `db` command (read-only declared-database inspection).
     #[error(transparent)]
     Db(#[from] crate::db::Error),
+    /// The `kv` command (control-plane SlateDB store maintenance — `kv repair`).
+    #[cfg(feature = "slatedb")]
+    #[error(transparent)]
+    Kv(#[from] crate::kv::Error),
     /// The `blob` command.
     #[error(transparent)]
     Blob(#[from] crate::blob::Error),

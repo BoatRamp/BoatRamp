@@ -381,6 +381,62 @@ jobs:
           grep -q 'EMPTY WAL TAIL RECOVERED OK' slatedb-wal.log \
             || { echo "::error::empty-tail WAL recovery never reached its marker (the empty SSTable incident regressed)" >&2; exit 1; }
 
+      # WAL clean-shutdown + opt-in repair gate battery (v0.7.2, P0). The store-backed gates
+      # (A1 close-advances-frontier, B1 default-loud-on-torn-v0-tail, B2 repair-recovers-all-keys,
+      # B3 mid-range-gap refusal, B4 beyond-frontier-only, B5 quarantined-bytes-preserved,
+      # B6 dry-run-purity, B7 await_durable characterization) open a REAL SlateDB store and
+      # close/reopen it, so — like the empty-tail test above — they are `#[ignore]`d for the
+      # static-musl harness and run UNIGNORED here on the host. The pure-logic gates
+      # (trailing-only / mid-gap / unreadable-manifest / classify) run in the same lib run. A
+      # silent skip or any failure fails the merge (the exit code is the gate).
+      - name: WAL repair + close gate battery (boatramp-storage, host toolchain)
+        run: |
+          set -eo pipefail
+          cargo test -p boatramp-storage --features slatedb --lib \
+            -- --include-ignored --nocapture \
+            wal_repair:: \
+            a1_close_advances_frontier_empty_wal_replay \
+            b1_default_open_is_loud_on_torn_version0_tail \
+            b2_repair_recovers_and_all_keys_survive \
+            b3_refuses_mid_range_gap_over_real_store \
+            b4_repair_never_touches_at_or_below_frontier \
+            b5_quarantined_bytes_preserved_and_removed_from_wal \
+            b6_dry_run_mutates_nothing \
+            b7_await_durable_write_survives_reopen_without_flush_or_close \
+            2>&1 | tee wal-repair.log
+          # Each store-backed gate prints a unique marker; assert every one reached it (no silent skip).
+          for marker in \
+            'A1 CLOSE-ADVANCES-FRONTIER OK' \
+            'B1 DEFAULT-LOUD-ON-TORN-TAIL OK' \
+            'B2 REPAIR-RECOVERS-ALL-KEYS OK' \
+            'B3 MID-RANGE-GAP-REFUSAL OK' \
+            'B4 BEYOND-FRONTIER-ONLY OK' \
+            'B5 QUARANTINED-BYTES-PRESERVED OK' \
+            'B6 DRY-RUN-PURITY OK' \
+            'B7 AWAIT-DURABLE-CHARACTERIZATION OK'; do
+            grep -qF "$marker" wal-repair.log \
+              || { echo "::error::WAL repair gate never reached its marker: $marker" >&2; exit 1; }
+          done
+          grep -qE 'test result: ok\.' wal-repair.log \
+            || { echo "::error::WAL repair gate battery did not pass" >&2; exit 1; }
+
+      # Part A quiesce-before-close gates that live outside boatramp-storage:
+      #   A2         — the scheduler quiesce (drainer/watchers/crons stop before close) in boatramp-server,
+      #   A2-cluster — raft.shutdown() precedes the store close, and A3 — the bounded close deadline,
+      #   both in the boatramp binary's serve tests.
+      - name: WAL close-ordering gates (scheduler quiesce + raft ordering + bounded close)
+        run: |
+          set -eo pipefail
+          cargo test -p boatramp-server --features handlers --lib \
+            a2_quiesce_before_close_no_write_races_the_close 2>&1 | tee wal-a2.log
+          grep -qE 'test result: ok\. 1 passed' wal-a2.log \
+            || { echo "::error::A2 scheduler-quiesce-before-close gate did not pass" >&2; exit 1; }
+          cargo test -p boatramp --bin boatramp -- \
+            a2_cluster_raft_shuts_down_before_store_close \
+            a3_stalled_close_is_abandoned_at_deadline 2>&1 | tee wal-a3.log
+          grep -qE 'test result: ok\. 2 passed' wal-a3.log \
+            || { echo "::error::A2-cluster / A3 close-ordering+deadline gates did not pass" >&2; exit 1; }
+
   # Stage 0 in-site tenant isolation HARD GATE. The ORM/`sql` tenant scope must isolate tenants
   # on a REAL SQL engine (embedded libsql), not merely in the compiler's string output. The test
   # is `sql`-feature-gated, so the workspace lane (which enables only `boatramp/fs,slatedb`) would
