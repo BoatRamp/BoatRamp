@@ -51,6 +51,92 @@ pub const DEFAULT_DB_NAME: &str = "default";
 pub const EMPTY_DB_NAME_CURE: &str =
     "the default database is now named `default` — use `--db default`";
 
+/// The one-line cure appended to a **non-conforming resource name** rejection at every
+/// operator / CLI / config-load surface (never on a guest path). v0.7.0 tightened the
+/// resource-name rule from a path-traversal denylist to a strict slug allowlist
+/// ([`is_valid_resource_slug`]), so a name that used to load (e.g. `${PROJECT}`) is now
+/// refused; this points the operator straight at the discovery + fix flow instead of
+/// leaving them to guess. Kept next to [`EMPTY_DB_NAME_CURE`] so the two never drift.
+pub const INVALID_NAME_CURE: &str = "this identifier is no longer accepted (v0.7.0 tightened name validation); run \
+     'boatramp project doctor' to list non-conforming names and their fix";
+
+/// Maximum length, in bytes, of a project/site/function/compute/workflow name.
+/// Matches the tightest SQL identifier limit (Postgres `NAMEDATALEN - 1 = 63`)
+/// so a name can be folded into a per-tenant database identifier without forcing
+/// pathological truncation. Longer than any realistic human-chosen name.
+///
+/// Defined here (the lowest crate) so the slug rule ([`is_valid_resource_slug`]) can
+/// reference it and both `boatramp-core`'s `validate_resource_name` and
+/// `boatramp-types`'s authz-match backstop share the one bound. Re-exported from
+/// `boatramp_core::project` (via `pub use boatramp_types::project::*`).
+pub const MAX_RESOURCE_NAME_LEN: usize = 63;
+
+/// The positive-rule reason for any name that is not a valid slug — a single
+/// human-readable statement of the whole allowlist. Shared by
+/// `boatramp_core::project::validate_resource_name` and the operator-facing surfaces.
+pub const INVALID_NAME_REASON: &str = "must be a valid slug: start and end with a letter or digit; interior may add '_', '-'; 1-63 bytes";
+
+/// The v0.7.0 **ASCII strict single-label slug** predicate: `true` IFF `value`
+/// matches `^[A-Za-z0-9]([A-Za-z0-9_-]*[A-Za-z0-9])?$` and is 1–[`MAX_RESOURCE_NAME_LEN`]
+/// bytes.
+///
+/// This is the one canonical resource-identifier rule, defined in the lowest crate so
+/// every layer shares it with no drift:
+/// - `boatramp_core::project::validate_resource_name` wraps it with the `kind`/`reason`
+///   error struct at every operator / control-plane / URL-path ingress;
+/// - the authz-match backstop (`authz::target_matches`) uses it directly to fail closed
+///   on a non-conforming token target that predates this change or was minted offline.
+///
+/// **Enforced with a byte loop** (`value.bytes()` + [`u8::is_ascii_alphanumeric`]),
+/// NOT `char::is_alphanumeric` — a Unicode homoglyph (`аcme` Cyrillic, `acme１`
+/// fullwidth, `café`) has non-ASCII bytes (each `>= 0x80`), so it fails the
+/// byte-alphanumeric test and can never impersonate an ASCII slug. First AND last byte
+/// must be ASCII-alphanumeric; interior bytes may additionally be `_`/`-`; a
+/// single-char name must be alphanumeric. Mirror of `cedar.rs::is_safe_ident`.
+pub fn is_valid_resource_slug(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.is_empty() || bytes.len() > MAX_RESOURCE_NAME_LEN {
+        return false;
+    }
+    for (i, &b) in bytes.iter().enumerate() {
+        let first_or_last = i == 0 || i == bytes.len() - 1;
+        let ok = if first_or_last {
+            b.is_ascii_alphanumeric()
+        } else {
+            b.is_ascii_alphanumeric() || b == b'_' || b == b'-'
+        };
+        if !ok {
+            return false;
+        }
+    }
+    true
+}
+
+/// Whether a **token role target** conforms to the v0.7.0 grammar and every segment is
+/// a valid slug: a bare `<project>`, a `<project>/<site>`, or a project wildcard
+/// `<project>/*`. Exactly one `/` is permitted (and only as the segment separator or
+/// the wildcard delimiter); every non-wildcard segment must satisfy
+/// [`is_valid_resource_slug`].
+///
+/// This is the **fail-closed authz-match backstop** predicate (audit A8): a token role
+/// scope is `<role>:<target>`, and the `<target>` string contains a `/` for site /
+/// wildcard scopes, so it must NOT be run through [`is_valid_resource_slug`] whole
+/// (that rejects `/`). The four mint feeders reject a non-conforming target at issue
+/// time, but a token minted before v0.7.0 — or offline — carries an unvalidated target;
+/// `authz::target_matches` calls this so such a target matches NOTHING.
+pub fn is_conforming_role_target(target: &str) -> bool {
+    match target.split_once('/') {
+        // A project wildcard `<project>/*`: the project segment must be a valid slug.
+        Some((project, "*")) => is_valid_resource_slug(project),
+        // A `<project>/<site>`: both segments valid slugs, and no further `/`.
+        Some((project, site)) => {
+            !site.contains('/') && is_valid_resource_slug(project) && is_valid_resource_slug(site)
+        }
+        // A bare `<project>`: a valid slug.
+        None => is_valid_resource_slug(target),
+    }
+}
+
 /// KV prefix for the mutable pointer `projectmeta/<name>` → active spec hash.
 pub const POINTER_PREFIX: &str = "projectmeta/";
 /// KV prefix for the immutable, content-addressed project spec body.

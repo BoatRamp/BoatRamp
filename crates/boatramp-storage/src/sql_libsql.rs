@@ -853,26 +853,18 @@ fn validate_db_name(kind: &str, value: &str) -> Result<(), SqlError> {
     if value.is_empty() {
         return Ok(());
     }
-    // Stay a strict SUBSET of the canonical `validate_resource_name` (v0.5.0 uniform screening):
-    // honour the same length bound so this storage boundary never accepts an overlong name the
-    // operator/URL-path validator rejects (pinned by `libsql_db_name_rule_is_a_subset_of_the_canonical_validator`).
-    if value.len() > boatramp_core::project::MAX_RESOURCE_NAME_LEN {
-        return Err(SqlError::other(format!(
-            "invalid {kind} name {value:?}: exceeds {} bytes",
-            boatramp_core::project::MAX_RESOURCE_NAME_LEN
-        )));
-    }
-    let safe = !value.starts_with('.')
-        && value
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
-    if safe {
+    // Stay a strict SUBSET of the canonical `validate_resource_name` (v0.7.0 tightened it
+    // from a denylist to a strict slug allowlist). Delegate to the shared slug predicate
+    // so this storage boundary can NEVER accept a name the operator/URL-path validator
+    // rejects (pinned by `libsql_db_name_rule_is_a_subset_of_the_canonical_validator`).
+    // Previously this admitted `.` (`site.example`); v0.7.0 forbids the dot, so a dotted
+    // name is refused here too rather than stranding a moved DB at an un-addressable path.
+    if boatramp_core::project::is_valid_resource_slug(value) {
         Ok(())
     } else {
         Err(SqlError::other(format!(
-            "invalid {kind} name {value:?}: must contain only ASCII letters, digits, \
-             '.', '_' or '-' and may not start with '.' (rejects path separators, \
-             '..' and NUL)"
+            "invalid {kind} name {value:?}: {}",
+            boatramp_core::project::INVALID_NAME_REASON
         )))
     }
 }
@@ -995,17 +987,19 @@ mod tests {
 
     #[test]
     fn validate_db_name_accepts_safe_and_rejects_unsafe() {
-        // Accepted: the default (empty) name and ordinary identifiers.
-        for ok in ["", "blog", "my-db_1", "site.example", "A1_b-2"] {
+        // Accepted: the default (empty) name and ordinary slug identifiers.
+        for ok in ["", "blog", "my-db_1", "A1_b-2"] {
             validate_db_name("database", ok)
                 .unwrap_or_else(|e| panic!("{ok:?} should be accepted, got {e}"));
         }
-        // Rejected: traversal, path separators, hidden/dot names, NUL and any
-        // out-of-charset byte — each as `SqlError::Other`.
+        // Rejected: traversal, path separators, hidden/dot names, NUL, any out-of-charset
+        // byte, and — v0.7.0 — any DOTTED name (`site.example`), so this stays a strict
+        // subset of the tightened canonical slug validator. Each is `SqlError::Other`.
         for bad in [
             "..",
             ".",
             ".hidden",
+            "site.example", // v0.7.0: the dot is no longer in the slug alphabet
             "/",
             "a/b",
             "..\\..",

@@ -28,14 +28,13 @@ const ACCEPTED: &[&str] = &[
     "analytics",
     "events_log",
     "pg-primary",
-    "a.b",
     "Blog9",
 ];
 
 /// Names the validator must reject — the ones that would produce a malformed path
-/// segment (empty/`//`) or smuggle a separator. The legacy empty default-DB key is the
-/// headline case.
-const REJECTED: &[&str] = &["", "a/b", "..", "a b", "proj*"];
+/// segment (empty/`//`), smuggle a separator, or (v0.7.0) fall outside the strict slug
+/// allowlist (e.g. a dotted `a.b`). The legacy empty default-DB key is the headline case.
+const REJECTED: &[&str] = &["", "a/b", "..", "a b", "proj*", "a.b"];
 
 /// Build the control-plane path the CLI composes for `boatramp sql exec`
 /// (`crates/boatramp/src/sql.rs`: `{server}/api/{seg}/{db}/exec`, default-project

@@ -594,6 +594,29 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
 
+    // ---- escape-hatch containment (v0.7.0 name-allowlist gate G6) ---------
+
+    /// G6: the derived managed-DB workload is a function of the `(project, name)` PAIR,
+    /// so a legacy project name and a new project name derive DIFFERENT workloads —
+    /// proving the escape-hatch `project rm <legacy>` uses the source only as a teardown
+    /// key and can never silently "rename" (strand) data under a new project's workload.
+    /// Mutation: make `derived_managed_db_workload` ignore the project ⇒ the two derive
+    /// equal ⇒ this test FAILS.
+    #[test]
+    fn escape_hatch_workload_differs_by_project() {
+        let n = "appdb";
+        assert_ne!(
+            derived_managed_db_workload("legacy-proj", n),
+            derived_managed_db_workload("acme", n),
+            "the derived workload must differ by project — no silent-strand rename"
+        );
+        // Deterministic (idempotent teardown key): same pair ⇒ same workload.
+        assert_eq!(
+            derived_managed_db_workload("legacy-proj", n),
+            derived_managed_db_workload("legacy-proj", n)
+        );
+    }
+
     // ---- sanitize_ident --------------------------------------------------
 
     /// The safe charset + `t_` prefix rules hold, and outputs never exceed the

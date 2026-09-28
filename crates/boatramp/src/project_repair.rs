@@ -63,7 +63,10 @@ fn validate_db(db: &str) -> Result<()> {
                 boatramp_core::project::EMPTY_DB_NAME_CURE
             ))
         } else {
-            Error::InvalidDb(err.to_string())
+            Error::InvalidDb(format!(
+                "{err}; {}",
+                boatramp_core::project::INVALID_NAME_CURE
+            ))
         }
     })
 }

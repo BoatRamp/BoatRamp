@@ -783,13 +783,16 @@ impl ServerConfig {
             if let Err(err) = boatramp_core::project::validate_resource_name("database", name) {
                 // The empty-string case is the pre-v0.5.0 default binding key: point
                 // at the cure (name it `default`, or set nothing and let the reserved
-                // `DEFAULT` token map to `default` automatically).
+                // `DEFAULT` token map to `default` automatically). Any other
+                // non-conforming name gets the v0.7.0 slug cure pointing at
+                // `project doctor`. This is a boot-LOUD refusal — an operator learns of
+                // a bad name at `serve` boot, not at the first request.
                 let cure = if name.is_empty() {
                     " — name your default binding `default` (or set \
                      BOATRAMP_HANDLERS_SQL_DB_DEFAULT_*, which now maps to `default` \
                      automatically); see the v0.5.0 CHANGELOG"
                 } else {
-                    ""
+                    boatramp_core::project::INVALID_NAME_CURE
                 };
                 return Err(ConfigError::InvalidDbName {
                     name: err.value,
@@ -2698,8 +2701,9 @@ mod tests {
 
     #[test]
     fn path_separator_db_binding_name_is_rejected() {
-        // A non-path-segment name (contains `/`) is refused with no default-cure (the
-        // fix is to rename it, not adopt `default`).
+        // A non-slug name (contains `/`) is refused with the v0.7.0 slug reason and the
+        // slug cure (pointing at `project doctor`) — NOT the empty-default cure (the fix
+        // is to rename it to a valid slug, not adopt `default`). Boot-LOUD.
         let err = ServerConfig::parse(
             r#"(
                 handlers: ( bindings: ( sql: (
@@ -2713,8 +2717,14 @@ mod tests {
         match err {
             ConfigError::InvalidDbName { name, reason, cure } => {
                 assert_eq!(name, "a/b");
-                assert!(reason.contains("path separator"));
-                assert!(cure.is_empty(), "no default-cure for a non-default name");
+                // The v0.7.0 slug reason (a positive statement of the allowlist).
+                assert!(
+                    reason.contains("valid slug"),
+                    "reason states the slug rule, got {reason:?}"
+                );
+                // The slug cure points at `project doctor`, not the empty-default cure.
+                assert_eq!(cure, boatramp_core::project::INVALID_NAME_CURE);
+                assert!(!cure.contains("CHANGELOG"), "not the empty-default cure");
             }
             other => panic!("expected ConfigError::InvalidDbName, got {other:?}"),
         }

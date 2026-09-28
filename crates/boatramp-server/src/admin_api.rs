@@ -1013,11 +1013,12 @@ fn reject_invalid_db(db: &str) -> Option<Response> {
         .map(|err| {
             // The empty name is the common v0.5.0 upgrade snag (the legacy default was
             // keyed by `""`), so its 422 body carries a one-line cure pointing at the
-            // new `default` name; any other invalid name keeps the plain canonical reason.
+            // new `default` name; any other invalid name carries the v0.7.0 slug cure
+            // pointing at `project doctor`.
             let body = if db.is_empty() {
                 format!("{err}; {}\n", boatramp_core::project::EMPTY_DB_NAME_CURE)
             } else {
-                format!("{err}\n")
+                format!("{err}; {}\n", boatramp_core::project::INVALID_NAME_CURE)
             };
             (StatusCode::UNPROCESSABLE_ENTITY, body).into_response()
         })
@@ -2718,6 +2719,21 @@ pub(super) async fn auth_exchange(
         )
             .into_response();
     }
+    // A8: a claim-mapped role must not carry a non-conforming target. Fail closed on
+    // the whole exchange (403) rather than silently dropping the role — a wrongly-mapped
+    // `publisher:${PROJECT}` claim is a configuration error the operator must see, and
+    // dropping it could quietly mint a lesser (or empty) token.
+    for role in &roles {
+        if let Some(target) = &role.target
+            && boatramp_core::project::validate_role_target(target).is_err()
+        {
+            return (
+                StatusCode::FORBIDDEN,
+                "OIDC token maps a role with a non-conforming target (v0.7.0 name rules)\n",
+            )
+                .into_response();
+        }
+    }
     let claims = Claims {
         roles,
         kind: cose::KIND_ROLE.to_string(),
@@ -3579,6 +3595,11 @@ mod tests {
         assert!(
             !body.contains(boatramp_core::project::EMPTY_DB_NAME_CURE),
             "a non-empty invalid name must not carry the empty-name cure, got: {body}"
+        );
+        // …it carries the v0.7.0 slug cure instead (pointing at `project doctor`).
+        assert!(
+            body.contains(boatramp_core::project::INVALID_NAME_CURE),
+            "a non-empty invalid name must carry the v0.7.0 slug cure, got: {body}"
         );
     }
 

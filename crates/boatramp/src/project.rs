@@ -71,8 +71,22 @@ enum ProjectCommand {
         /// The project slug.
         name: String,
     },
+    /// Scan for resource identifiers that the v0.7.0 strict slug allowlist no longer
+    /// accepts (`Project·Read`, read-only). Lists each non-conforming name, why it
+    /// fails, what it AFFECTS, and a copy-pasteable SUGGESTED FIX. Exits non-zero if any
+    /// are found — a CI preflight for the breaking cutover.
+    Doctor {
+        /// Emit the findings as JSON instead of a human table.
+        #[arg(long)]
+        json: bool,
+    },
     /// Delete a project. Refused while it owns resources (unless `--force`) or if it
     /// is the reserved `default`.
+    ///
+    /// Escape-hatch: a NON-CONFORMING legacy name (rejected by the v0.7.0 slug rule)
+    /// may be passed here as an opaque teardown key — the only surface that accepts one,
+    /// so a skip-upgrader can delete a bad name on v0.7.0. It is used ONLY as a
+    /// KV/blob lookup key and is never re-emitted into a new sink.
     Rm {
         /// The project slug.
         name: String,
@@ -212,6 +226,181 @@ fn summarize_plan(name: &str, plan: &serde_json::Value) -> String {
     }
 }
 
+/// One non-conforming resource identifier `project doctor` found.
+#[derive(Debug, serde::Serialize)]
+struct Finding {
+    /// The offending identifier (the raw stored name).
+    name: String,
+    /// The resource kind (`project` / `site` / `function` / `compute` / `secret` /
+    /// `subgraph`).
+    kind: String,
+    /// The owning project (equal to `name` for a `project`-kind finding).
+    project: String,
+    /// Why it fails the v0.7.0 slug rule (the canonical validator's reason).
+    reason: String,
+    /// A one-line human summary of what the owning project AFFECTS (from
+    /// [`summarize_plan`]).
+    affected: String,
+    /// A copy-pasteable suggested fix. For an INERT project the fix is a delete
+    /// (`boatramp project rm <name>`); otherwise the operator must migrate off it
+    /// first (the general rename is deferred).
+    suggested_fix: String,
+}
+
+/// Whether the teardown `plan` shows the project owns nothing (inert) — the emptiness
+/// oracle the SUGGESTED FIX keys off. Reads the same families [`summarize_plan`] does.
+fn plan_is_inert(plan: &serde_json::Value) -> bool {
+    let empty_arr = |k: &str| {
+        plan.get(k)
+            .and_then(|v| v.as_array())
+            .is_none_or(|a| a.is_empty())
+    };
+    let compute_empty = plan
+        .get("compute")
+        .and_then(|v| v.as_array())
+        .is_none_or(|a| a.is_empty());
+    let safelist_empty = plan
+        .get("safelist")
+        .and_then(serde_json::Value::as_u64)
+        .is_none_or(|n| n == 0);
+    let others_empty = plan
+        .get("other_families")
+        .and_then(|v| v.as_object())
+        .is_none_or(|m| m.values().all(|v| v.as_u64().unwrap_or(0) == 0));
+    empty_arr("sites")
+        && empty_arr("functions")
+        && compute_empty
+        && empty_arr("secrets")
+        && empty_arr("subgraphs")
+        && safelist_empty
+        && others_empty
+}
+
+/// Collect the resource names a teardown `plan` reports the project owns, paired with
+/// their kind — the identifiers `doctor` re-screens against the v0.7.0 slug rule.
+fn owned_names(plan: &serde_json::Value) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    let arr = |k: &str| -> Vec<String> {
+        plan.get(k)
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    for kind in ["sites", "functions", "secrets", "subgraphs"] {
+        // Singularize for the report.
+        let singular = kind.trim_end_matches('s');
+        for n in arr(kind) {
+            out.push((n, singular.to_string()));
+        }
+    }
+    if let Some(compute) = plan.get("compute").and_then(|v| v.as_array()) {
+        for c in compute {
+            if let Some(n) = c.get("name").and_then(|v| v.as_str()) {
+                out.push((n.to_string(), "compute".to_string()));
+            }
+        }
+    }
+    out
+}
+
+/// `boatramp project doctor`: scan every project (and the names it owns) for
+/// identifiers the v0.7.0 slug allowlist rejects. Read-only. Prints a table (or JSON
+/// under `--json`) and exits non-zero when any non-conforming name is found.
+async fn doctor(cp: &client::ControlPlane, json: bool) -> Result<()> {
+    let projects = cp.list_projects().await?;
+    let mut findings: Vec<Finding> = Vec::new();
+
+    for p in &projects {
+        let Some(pname) = p.get("name").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        // Fetch the teardown plan once (dry-run, mutates nothing) — the AFFECTED summary
+        // AND the inert-vs-live emptiness oracle both read it. The plan endpoint accepts
+        // the opaque (possibly non-conforming) name as a source-only key.
+        let plan = cp
+            .project_teardown_plan(pname)
+            .await
+            .unwrap_or_else(|_| serde_json::json!({ "project": pname }));
+        let affected = summarize_plan(pname, &plan);
+        let inert = plan_is_inert(&plan);
+        let fix = |name: &str, is_project: bool| -> String {
+            if is_project && inert {
+                format!("boatramp project rm {name}")
+            } else if is_project {
+                format!(
+                    "project `{name}` still owns resources — migrate them to a valid-slug \
+                     project, then `boatramp project rm {name}` (a general rename is not \
+                     yet available)"
+                )
+            } else {
+                format!(
+                    "recreate this resource under a valid-slug name in project `{name}`, \
+                     then remove the non-conforming one"
+                )
+            }
+        };
+
+        // The project name itself.
+        if let Err(err) = boatramp_core::project::validate_resource_name("project", pname) {
+            findings.push(Finding {
+                name: pname.to_string(),
+                kind: "project".to_string(),
+                project: pname.to_string(),
+                reason: err.reason.to_string(),
+                affected: affected.clone(),
+                suggested_fix: fix(pname, true),
+            });
+        }
+        // Every name it owns.
+        for (owned, kind) in owned_names(&plan) {
+            if let Err(err) = boatramp_core::project::validate_resource_name("resource", &owned) {
+                findings.push(Finding {
+                    name: owned,
+                    kind,
+                    project: pname.to_string(),
+                    reason: err.reason.to_string(),
+                    affected: affected.clone(),
+                    suggested_fix: fix(pname, false),
+                });
+            }
+        }
+    }
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&findings)?);
+    } else if findings.is_empty() {
+        println!("no non-conforming identifiers found — every name is a valid v0.7.0 slug");
+    } else {
+        println!(
+            "{} non-conforming identifier{} (v0.7.0 slug allowlist):\n",
+            findings.len(),
+            if findings.len() == 1 { "" } else { "s" }
+        );
+        for f in &findings {
+            println!("  {} `{}` (project `{}`)", f.kind, f.name, f.project);
+            println!("      why:       {}", f.reason);
+            println!("      affected:  {}", f.affected);
+            println!("      fix:       {}", f.suggested_fix);
+            println!();
+        }
+    }
+
+    if findings.is_empty() {
+        Ok(())
+    } else {
+        // Non-zero exit for CI preflight (mirrors the migration-gate refusal style).
+        Err(Error::Aborted(format!(
+            "{} non-conforming identifier(s) found — {}",
+            findings.len(),
+            boatramp_core::project::INVALID_NAME_CURE
+        )))
+    }
+}
+
 /// Entry point for `boatramp project`.
 pub async fn run(args: ProjectArgs, config: &ProjectConfig) -> Result<()> {
     let (server, http) = client::connect(args.server, config)?;
@@ -263,6 +452,9 @@ pub async fn run(args: ProjectArgs, config: &ProjectConfig) -> Result<()> {
         ProjectCommand::Show { name } => {
             let project = cp.get_project(&name).await?;
             println!("{}", serde_json::to_string_pretty(&project)?);
+        }
+        ProjectCommand::Doctor { json } => {
+            return doctor(&cp, json).await;
         }
         ProjectCommand::Rm {
             name,

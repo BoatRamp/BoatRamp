@@ -39,6 +39,11 @@ pub enum Error {
     /// Building / loading the offline-mint signer failed.
     #[error("signer: {0}")]
     Signer(String),
+    /// A requested role carried a non-conforming target (audit A8): the offline
+    /// signer refuses to mint it, exactly as the server feeders reject it at issue
+    /// time — a `publisher:${PROJECT}` token must never be produced.
+    #[error("refusing to mint: {0}")]
+    InvalidRoleTarget(String),
 }
 
 /// `token` module result; `Err` is [`Error`].
@@ -325,12 +330,23 @@ async fn mint_offline(
     signer_config: &std::path::Path,
 ) -> Result<()> {
     use boatramp_core::cose::{self, Claims};
+    let parsed: Vec<boatramp_core::authz::GrantedRole> = roles
+        .iter()
+        .map(|s| boatramp_core::authz::GrantedRole::parse(s))
+        .collect();
+    // A8: refuse a non-conforming role target BEFORE resolving the signer or signing,
+    // so an offline mint can never produce a `publisher:${PROJECT}` token. Mirrors the
+    // four server feeders; the authz-match backstop still covers any older/offline
+    // token that predates this check.
+    for role in &parsed {
+        if let Some(target) = &role.target {
+            boatramp_core::project::validate_role_target(target)
+                .map_err(|err| Error::InvalidRoleTarget(err.to_string()))?;
+        }
+    }
     let signer = resolve_signer(signer_config).await?;
     let claims = Claims {
-        roles: roles
-            .iter()
-            .map(|s| boatramp_core::authz::GrantedRole::parse(s))
-            .collect(),
+        roles: parsed,
         kind: cose::KIND_ROLE.to_string(),
         ttl_secs,
         now_unix: now_unix(),
@@ -449,4 +465,38 @@ async fn attenuate(
         .map_err(|e| Error::Delegation(e.to_string()))?;
     println!("{narrowed}");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A8 (offline mint feeder): `mint_offline` refuses a non-conforming role target
+    /// BEFORE resolving the signer or signing — a `publisher:${PROJECT}` token can never
+    /// be produced offline. The check runs first, so a bogus signer path is never
+    /// touched (the error is `InvalidRoleTarget`, not `MissingSigner`/`Signer`).
+    /// Mutation: drop the target screen in `mint_offline` ⇒ it proceeds to
+    /// `resolve_signer` and returns a different error ⇒ this test FAILS.
+    #[tokio::test]
+    async fn offline_mint_refuses_nonconforming_role_target() {
+        let nowhere = std::path::Path::new("/nonexistent/boatramp.cfg");
+        for bad in ["publisher:${PROJECT}", "publisher:acme/../evil"] {
+            let err = mint_offline(&[bad.to_string()], None, None, nowhere)
+                .await
+                .expect_err("a non-conforming role target must be refused");
+            assert!(
+                matches!(err, Error::InvalidRoleTarget(_)),
+                "expected InvalidRoleTarget for {bad:?}, got {err:?}"
+            );
+        }
+        // A GLOBAL role (no target) is never rejected by the target screen — it proceeds
+        // past validation. Whatever the outcome (Ok if a signer happens to be resolvable
+        // in the env, else a signer error), it must NOT be an `InvalidRoleTarget`. This
+        // proves the screen is target-scoped, not a blanket deny.
+        let outcome = mint_offline(&["admin".to_string()], None, None, nowhere).await;
+        assert!(
+            !matches!(outcome, Err(Error::InvalidRoleTarget(_))),
+            "a global role must not be rejected by the target screen, got {outcome:?}"
+        );
+    }
 }

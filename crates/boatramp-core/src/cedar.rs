@@ -218,6 +218,12 @@ fn principal_entity(
             .iter()
             .filter(|r| &r.name == role)
             .filter_map(|r| r.target.as_ref())
+            // Fail-closed A8 backstop, mirrored on the Cedar side so the two engines
+            // stay faithful: a non-conforming grant target (a pre-v0.7.0 or offline
+            // `${PROJECT}`/`*`/… target) never enters the `<role>_sites` set, so no
+            // `…_sites.contains(resource.name)` guard can match it — exactly as
+            // `target_matches` denies it in the pure oracle.
+            .filter(|t| boatramp_types::project::is_conforming_role_target(t))
             .map(|t| RestrictedExpression::new_string(t.clone()));
         attrs.insert(
             format!("{role}_sites"),
@@ -332,6 +338,12 @@ mod tests {
             // literally by both engines (a resource named `*` can't be created).
             Some("*".to_string()),
             Some("acme/*".to_string()),
+            // Non-conforming *required* targets that name the exact string a
+            // pre-v0.7.0/offline grant might carry — so the A8 backstop deny is
+            // exercised as a match-time pair in the differential gate, and both
+            // engines must agree (deny).
+            Some("${PROJECT}".to_string()),
+            Some("acme/../evil".to_string()),
         ];
         for roles in rolesets {
             let expected_set: RightSet = policy.rights_for(roles);
@@ -405,11 +417,17 @@ mod tests {
                 GrantedRole::scoped("project_admin", "acme"),
                 GrantedRole::scoped("project_viewer", "other"),
             ],
-            // A grant target of the literal string `*` is NOT a global wildcard:
-            // both engines must treat it as matching only a resource named `*`
-            // (the pure oracle previously over-granted here — the gate now covers it).
+            // A grant target of the literal string `*` is non-conforming (not a valid
+            // slug), so the v0.7.0 fail-closed A8 backstop makes it match NOTHING in
+            // BOTH engines: the pure oracle drops it in `target_matches`, and the Cedar
+            // side never puts it in the `<role>_sites` set. The gate proves the two
+            // agree on this deny (a resource can't be named `*` anyway).
             vec![GrantedRole::scoped("publisher", "*")],
             vec![GrantedRole::scoped("project_admin", "*")],
+            // A pre-v0.7.0 / offline non-conforming target must also deny in both
+            // engines (the load-bearing backstop for already-minted tokens).
+            vec![GrantedRole::scoped("publisher", "${PROJECT}")],
+            vec![GrantedRole::scoped("project_admin", "acme/../evil")],
         ]
     }
 

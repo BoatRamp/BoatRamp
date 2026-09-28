@@ -27,9 +27,23 @@ use std::path::Path;
 ///
 /// `domain` is the effective internal suffix (`compute.dns_domain`, default
 /// `boatramp.internal`). The trailing newline keeps a POSIX-clean file.
+///
+/// **Fail-closed sink validation (v0.7.0, re-rated HIGH).** The `project` is
+/// interpolated verbatim into a `search {project}.{domain}` directive; a `\n` (or any
+/// non-slug byte) in the name would inject an extra `resolv.conf` line — e.g. a second
+/// `nameserver`, a DNS-MITM. Ingress is now tightened (a project name is a validated
+/// slug), but this validate-on-read is the denylist-leak lesson applied: a name read
+/// from KV is not trusted at the sink. A non-conforming `project` ⇒ the `search` line
+/// is **omitted entirely** (the guest keeps working via FQDNs / the still-present
+/// gateway `nameserver`) rather than emitting an attacker-controlled directive.
 pub fn render(gateway: Ipv4Addr, project: &str, domain: &str) -> String {
     let domain = domain.trim_matches('.');
-    format!("nameserver {gateway}\nsearch {project}.{domain}\noptions ndots:1\n")
+    if boatramp_types::project::is_valid_resource_slug(project) {
+        format!("nameserver {gateway}\nsearch {project}.{domain}\noptions ndots:1\n")
+    } else {
+        // Drop the poisoned `search` line; keep a valid, injection-free file.
+        format!("nameserver {gateway}\noptions ndots:1\n")
+    }
 }
 
 /// Write `resolv.conf` into `rootfs` at `/etc/resolv.conf`, creating `/etc` if it
@@ -102,5 +116,38 @@ mod tests {
     fn custom_domain_is_used_in_the_search_line() {
         let body = render(Ipv4Addr::new(10, 0, 0, 1), "acme", "svc.internal");
         assert!(body.contains("search acme.svc.internal\n"));
+    }
+
+    /// G5 (resolv.conf sink): a `\n`-bearing (or otherwise non-slug) project MUST NOT
+    /// produce a second directive line — the `search` line is dropped and exactly one
+    /// `nameserver` line remains. Mutation witness: remove the `is_valid_resource_slug`
+    /// guard in `render` and the injected `nameserver 6.6.6.6` appears as a second
+    /// nameserver line → this test fails.
+    #[test]
+    fn newline_in_project_cannot_inject_a_second_nameserver_line() {
+        let poisoned = "p\nnameserver 6.6.6.6";
+        let body = render(Ipv4Addr::new(10, 0, 0, 1), poisoned, "boatramp.internal");
+        // Exactly one `nameserver` directive, and it is the gateway.
+        let nameserver_lines = body
+            .lines()
+            .filter(|l| l.starts_with("nameserver "))
+            .count();
+        assert_eq!(
+            nameserver_lines, 1,
+            "a poisoned project injected extra directive lines: {body:?}"
+        );
+        assert!(
+            body.contains("nameserver 10.0.0.1"),
+            "the gateway nameserver must survive: {body:?}"
+        );
+        assert!(
+            !body.contains("6.6.6.6"),
+            "the injected resolver must never appear: {body:?}"
+        );
+        // The poisoned project drops the `search` line entirely.
+        assert!(
+            !body.contains("search "),
+            "a non-conforming project must not emit a search directive: {body:?}"
+        );
     }
 }
