@@ -609,6 +609,17 @@ impl Right {
             // status — the same grade as `/api/sites` / `/api/metrics` — so `system·read` (never a
             // per-project right). Same hyphen-path collision-avoidance as the sibling `blob-*` arms.
             "/api/blob-status" => Self::new(Resource::System, None, Action::Read),
+            // The running node's boatramp version (`GET /api/version`): the exact package version of
+            // the binary serving this request. Deliberately an OPERATOR-only read — the same grade as
+            // `/api/metrics` / `/api/blob-status`, so `system·read` (never a per-project right a tenant
+            // token satisfies, and — crucially — NEVER `None`: unlike `/healthz`/`/readyz`, the version
+            // is NOT on the unauthenticated public router, so a client cannot fingerprint the release
+            // without an operator token). Returning `Some(System, Read)` here (rather than leaning on
+            // the deny-safe `_` default, which would over-gate it to `system·admin`) is the whole
+            // point — an explicit READ arm keeps it reachable by a read-only operator token yet closed
+            // to the public. A regression that makes this `None` (public) or a `Project` right (tenant
+            // -reachable) is exactly what the `version_endpoint_is_operator_read_gated` gate catches.
+            "/api/version" => Self::new(Resource::System, None, Action::Read),
             // Any other `/api/*` path: deny-safe (must hold system·admin).
             _ => Self::new(Resource::System, None, Action::Admin),
         };
@@ -2751,6 +2762,41 @@ mod tests {
         assert!(
             !acme_read.allows(&globex_fn_logs),
             "acme token must not read globex fn logs"
+        );
+    }
+
+    /// GATE (v0.7.4) — `GET /api/version` is an OPERATOR-only read, never a public/tenant surface.
+    /// The whole security value of the version endpoint is that a client cannot fingerprint the
+    /// release without an operator token. This asserts the load-bearing arm and is mutation-verified:
+    /// a regression that makes `/api/version` unauthenticated (`None`, like `/healthz`), or a
+    /// per-project/tenant right, or anything other than the `system·read` tier, turns it red.
+    #[test]
+    fn version_endpoint_is_operator_read_gated() {
+        let req = Right::required("GET", "/api/version");
+        // NOT unauthenticated — unlike `/healthz`/`/readyz`, the auth layer MUST demand a token.
+        assert!(
+            req.is_some(),
+            "GET /api/version must require a token (never the unauthenticated `None` path) — else it \
+             is a public release fingerprint",
+        );
+        let req = req.unwrap();
+        // Exactly the operator system·read tier — the SAME grade as `/api/metrics` / `/api/blob-status`,
+        // never a per-project right a tenant token could satisfy.
+        assert_eq!(
+            req,
+            Right::new(Resource::System, None, Action::Read),
+            "GET /api/version must be gated at system·read (operator-only, not tenant-scoped)",
+        );
+        assert_eq!(
+            Right::required("GET", "/api/version"),
+            Right::required("GET", "/api/metrics"),
+            "the version read must be the same grade as /api/metrics",
+        );
+        // A read tier: a system·read token reaches it, but it is NOT the mutating system·admin tier.
+        assert_ne!(
+            req,
+            Right::new(Resource::System, None, Action::Admin),
+            "the version READ must not require the mutating system·admin tier",
         );
     }
 }
