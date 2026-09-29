@@ -214,7 +214,12 @@ impl Storage for AzureStorage {
         let meta = self.head(key).await?;
         // Azure `HttpRange` is `[start, start+len)`; an open-ended range reads to EOF.
         let range = match len {
-            Some(n) if n > 0 => HttpRange::from(offset..offset + n),
+            // A bounded partial read whose exclusive end (`offset + n`) is representable and not the
+            // `u64::MAX` whole-object sentinel; anything else (to-end / overflow / sentinel) degrades
+            // to an open-ended read (offset→EOF), never a wrapped/panicking `offset + n`.
+            Some(n) if n > 0 && n != u64::MAX && offset.checked_add(n).is_some() => {
+                HttpRange::from(offset..offset + n)
+            }
             _ => HttpRange::from(offset..),
         };
         let body = self.download(key, Some(range)).await?;

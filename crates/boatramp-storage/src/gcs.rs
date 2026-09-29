@@ -165,7 +165,12 @@ impl Storage for GcsStorage {
     ) -> Result<GetObject, StorageError> {
         let meta = self.head(key).await?;
         let range = match len {
-            Some(n) if n > 0 => Range(Some(offset), Some(offset + n - 1)),
+            // A bounded partial read whose inclusive end (`offset + n - 1`) is representable and not
+            // the `u64::MAX` whole-object sentinel; anything else (to-end / overflow / sentinel)
+            // degrades to an open-ended read (offset→EOF), never a wrapped/panicking `offset + n - 1`.
+            Some(n) if n > 0 && n != u64::MAX && offset.checked_add(n).is_some() => {
+                Range(Some(offset), Some(offset + n - 1))
+            }
             _ => Range(Some(offset), None),
         };
         let body = self.download(key, range).await?;
