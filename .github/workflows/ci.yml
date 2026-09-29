@@ -494,6 +494,13 @@ jobs:
             blob_err_masks_a_backend_fault_but_preserves_notfound 2>&1 | tee blobread.log
           grep -qE 'test result: ok\. 1 passed' blobread.log \
             || { echo "::error::blob-read fault-masking gate did not pass" >&2; exit 1; }
+          # blob-read (v0.7.5): a whole-object read (`get-data(0, u64::MAX)`) must NOT forge an
+          # out-of-range explicit end (`bytes=0-<huge>`) that strict S3 backends (Tigris/R2/MinIO)
+          # 416 — it's a plain GET / open-ended range. The exact bug that 404'd every Tigris read.
+          cargo test -p boatramp-storage --features s3 --lib \
+            range_header_never_forges_an_out_of_range_end_for_a_whole_object_read 2>&1 | tee blobrange.log
+          grep -qE 'test result: ok\. 1 passed' blobrange.log \
+            || { echo "::error::blob-read range-header (416/Tigris) gate did not pass" >&2; exit 1; }
 
   # Stage 0 in-site tenant isolation HARD GATE. The ORM/`sql` tenant scope must isolate tenants
   # on a REAL SQL engine (embedded libsql), not merely in the compiler's string output. The test

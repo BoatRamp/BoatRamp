@@ -307,10 +307,14 @@ impl blobstore::container::HostContainer for BlobHost<'_> {
     ) -> Result<Resource<IncomingValue>, String> {
         let container = self.table.get(&this).map_err(estr)?;
         let (storage, key) = (container.storage.clone(), container.object_key(&name));
-        // Offsets are inclusive; request `end - start + 1` bytes from `start`.
-        let len = end.saturating_sub(start).saturating_add(1);
+        // Offsets are inclusive. `end == u64::MAX` is the "whole object, host clamps to size"
+        // sentinel the shim's `blob::get` passes (`get-data(_, 0, u64::MAX)`) — map it to a to-end
+        // read (`None`) so NO backend receives a forged out-of-range `len`/end (which strict
+        // S3-compatible backends like Tigris reject with 416; the S3 backend's `range_header` also
+        // guards this, but keep it uniform across every backend). Otherwise the exact inclusive range.
+        let len = (end != u64::MAX).then(|| end.saturating_sub(start).saturating_add(1));
         let object = storage
-            .get_range(&key, start, Some(len))
+            .get_range(&key, start, len)
             .await
             .map_err(|e| blob_err("get", &key, e))?;
         let bytes = collect(object.body, self.max_bytes()).await?;

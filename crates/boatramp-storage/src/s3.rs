@@ -252,6 +252,34 @@ impl S3Storage {
     }
 }
 
+/// The `Range` header for a `get_range(offset, len)` request, or `None` for a whole-object read that
+/// must carry NO `Range` (a plain `GetObject`).
+///
+/// The wasi:blobstore guest reads a whole object with inclusive offsets `get-data(0, u64::MAX)` —
+/// "the host clamps the range to its size". The host must NOT forge an explicit out-of-range end
+/// (`bytes=0-18446744073709551614`): AWS S3 tolerates it (returns the object, 206), but strict
+/// S3-compatible backends — **Tigris** (`server: Tigris OS`), R2, MinIO — reject it with `416
+/// InvalidRange`, silently breaking every full-object read. So:
+/// - a **bounded** partial read (`Some(n)`, `n>0`, `offset+n` in range, not the whole-object sentinel)
+///   ⇒ the exact `bytes={offset}-{offset+n-1}`;
+/// - a **whole-object** read from the start (to-end / `len` None|0, or the `u64::MAX`-ish sentinel /
+///   an overflowing end, with `offset == 0`) ⇒ `None` (a plain `GetObject`, guaranteed 200 everywhere);
+/// - a **to-end read from a non-zero offset** ⇒ the RFC-7233 open-ended `bytes={offset}-`.
+fn range_header(offset: u64, len: Option<u64>) -> Option<String> {
+    match len {
+        // A bounded partial read whose end (`offset + n - 1`) is representable AND is not the
+        // "whole object" sentinel a guest passes via `get-data(_, u64::MAX)` (blobstore's inclusive
+        // offsets make that arrive here as `len == u64::MAX`).
+        Some(n) if n > 0 && n != u64::MAX && offset.checked_add(n).is_some() => {
+            Some(format!("bytes={}-{}", offset, offset + n - 1))
+        }
+        // Whole object from the start ⇒ no Range (plain GET) — never a forged, backend-rejected end.
+        _ if offset == 0 => None,
+        // From a non-zero offset to the end ⇒ the standard open-ended range.
+        _ => Some(format!("bytes={offset}-")),
+    }
+}
+
 #[async_trait]
 impl Storage for S3Storage {
     async fn get(&self, key: &str) -> Result<GetObject, StorageError> {
@@ -293,9 +321,13 @@ impl Storage for S3Storage {
         offset: u64,
         len: Option<u64>,
     ) -> Result<GetObject, StorageError> {
-        let range = match len {
-            Some(n) if n > 0 => format!("bytes={}-{}", offset, offset + n - 1),
-            _ => format!("bytes={offset}-"),
+        // A whole-object read (offset 0, "to the end") carries NO `Range` header — the guest asks for
+        // the whole object via `get-data(0, u64::MAX)` (wasi:blobstore inclusive offsets, documented as
+        // "the host clamps the range to its size"). Forging an explicit end (`bytes=0-<huge>`) is what
+        // AWS S3 tolerates but strict S3-compatible backends (Tigris/R2/MinIO) reject with 416
+        // InvalidRange — so honor the clamp contract here. See `range_header`.
+        let Some(range) = range_header(offset, len) else {
+            return self.get(key).await;
         };
         let resp =
             self.client
@@ -517,4 +549,45 @@ where
     SdkError<E, R>: std::error::Error,
 {
     StorageError::backend(DisplayErrorContext(&err).to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::range_header;
+
+    /// GATE (v0.7.5, blob-read-404 = 416 InvalidRange on Tigris) — a whole-object read MUST NOT forge
+    /// an out-of-range explicit end. Mutation-verified: revert `range_header` to the old
+    /// `Some(n) if n>0 => bytes={offset}-{offset+n-1}` and the sentinel case yields
+    /// `bytes=0-18446744073709551614` (the exact header Tigris 416'd) instead of `None`, turning the
+    /// first assertion red.
+    #[test]
+    fn range_header_never_forges_an_out_of_range_end_for_a_whole_object_read() {
+        // The shim's `blob::get` whole-object read: `get-data(0, u64::MAX)` → `len == u64::MAX`.
+        // MUST be a plain GET (no Range), not `bytes=0-<huge>`.
+        assert_eq!(
+            range_header(0, Some(u64::MAX)),
+            None,
+            "whole-object sentinel must be a plain GET, never a forged out-of-range end"
+        );
+        // To-end forms from the start are also a plain GET.
+        assert_eq!(range_header(0, None), None);
+        assert_eq!(range_header(0, Some(0)), None);
+        // A to-end read from a non-zero offset is the RFC open-ended range.
+        assert_eq!(range_header(64, None), Some("bytes=64-".to_string()));
+        assert_eq!(
+            range_header(64, Some(u64::MAX)),
+            Some("bytes=64-".to_string())
+        );
+        // A genuine bounded partial read keeps its exact inclusive range.
+        assert_eq!(range_header(0, Some(72)), Some("bytes=0-71".to_string()));
+        assert_eq!(
+            range_header(100, Some(50)),
+            Some("bytes=100-149".to_string())
+        );
+        // An overflowing end degrades to open-ended, never a wrapped/garbage number.
+        assert_eq!(
+            range_header(10, Some(u64::MAX - 5)),
+            Some("bytes=10-".to_string())
+        );
+    }
 }
