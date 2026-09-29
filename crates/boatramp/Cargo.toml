@@ -59,6 +59,11 @@ default = [
   "migrate",
   "capability",
   "blob-upload",
+  # The M4 cloud minters (AWS STS/presign, GCS signed-URL+CAB, Azure SAS). Batteries-included so the
+  # released image can broker a native scoped credential for a cloud-backed blob container (e.g. the
+  # presigned-PUT ingress against a Tigris/R2 S3 backend). The minter is runtime-opt-in (config +
+  # grant), so compiling it in enables minting for no one by itself.
+  "blob-upload-cloud",
   "session",
   "cluster",
   "operator",
