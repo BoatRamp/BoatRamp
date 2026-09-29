@@ -1223,7 +1223,7 @@ async fn orm_durable_signed_context_isolates_on_a_real_engine() {
     };
 
     // The host-minted envelope carrying acme's own-tenant (the guest never names it).
-    let envelope = mint_context("acme", 3600, now, &fleet).await.unwrap();
+    let envelope = mint_context("acme", None, 3600, now, &fleet).await.unwrap();
 
     // 1) DEFAULT WORK-QUEUE: publish stamps the context; claim carries it back verbatim.
     mq.publish_ctx("jobs-ok", b"job", Some(&envelope))
@@ -1294,7 +1294,7 @@ async fn orm_durable_signed_context_isolates_on_a_real_engine() {
     );
 
     // 3) FORGED: a stranger-signed envelope fails verification ⇒ the consumer recovers NO tenant.
-    let forged = mint_context("globex", 3600, now, &stranger).await.unwrap();
+    let forged = mint_context("globex", None, 3600, now, &stranger).await.unwrap();
     mq.publish_ctx("jobs-forged", b"job", Some(&forged))
         .await
         .unwrap();

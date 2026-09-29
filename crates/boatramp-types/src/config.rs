@@ -1196,6 +1196,14 @@ pub struct HandlerGraphqlTokenClaims {
     /// An optional expected audience (`aud`); unset skips audience validation.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audience: Option<String>,
+    /// Which verified-JWT claim carries the caller's role/persona, sealed onto the async lane so a
+    /// `signed_context` consumer's `graphql::run` sub-fetch can authorize a `role(…)`-gated field as
+    /// the presenting caller (PLAN-async-persona). A single scalar (or a one-element array) is sealed
+    /// into the durable `signed_context` envelope's `br_persona` claim; absent ⇒ no persona sealed
+    /// (unchanged for every existing producer). Host-verified from the presented bearer — never
+    /// guest-named.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_persona_claim: Option<String>,
 }
 
 /// One exposed table's policy (see [`HandlerGraphqlDataConfig::tables`]).

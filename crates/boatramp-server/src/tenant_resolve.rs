@@ -512,7 +512,7 @@ mod tests {
 
         let signer = LocalSigner::generate(TokenAlg::Es256);
         let anchor = signer.public_key();
-        let envelope = mint_context("acme", 3600, boatramp_core::time::now_unix(), &signer)
+        let envelope = mint_context("acme", None, 3600, boatramp_core::time::now_unix(), &signer)
             .await
             .unwrap();
 
@@ -544,7 +544,7 @@ mod tests {
 
         // A forged envelope (signed by a stranger) resolves NO tenant fact — fail closed.
         let stranger = LocalSigner::generate(TokenAlg::Es256);
-        let forged = mint_context("evil", 3600, boatramp_core::time::now_unix(), &stranger)
+        let forged = mint_context("evil", None, 3600, boatramp_core::time::now_unix(), &stranger)
             .await
             .unwrap();
         let inputs = TenantSourceInputs {
