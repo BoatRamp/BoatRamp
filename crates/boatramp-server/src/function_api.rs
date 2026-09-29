@@ -284,6 +284,20 @@ pub fn host_capability_features_detailed() -> Vec<CapabilityFeature> {
             lifecycle: Experimental,
         });
     }
+    // The async-lane PERSONA propagation capability (`current-principal()` on the `tenancy` interface,
+    // PLAN-async-persona): a consumer's `graphql::run` sub-fetch reads the host-verified sealed
+    // `{tenant, persona}` so a `role(…)`-gated field authorizes off the async lane. Gated separately
+    // from `tenancy` so a `present_token`-only guest is NOT forced onto this host — the shim imports
+    // `current-principal` only under its `tenancy-persona` feature and then declares
+    // `requires = ["tenancy-persona"]`, which THIS advertisement satisfies (a deploy against a host
+    // predating it is refused cleanly rather than the guest failing to instantiate). Experimental
+    // until the shape settles.
+    if cfg!(feature = "handlers") {
+        f.push(CapabilityFeature {
+            name: "tenancy-persona",
+            lifecycle: Experimental,
+        });
+    }
     // The read-only `messaging-stats` capability: surface the already-computed per-topic bus gauges
     // (dead-letter/backlog/in-flight + per-group depth) to a granted guest, tenant-scoped by a
     // host-filled `{tenant}` template. Available whenever handlers are compiled (which pulls in the
