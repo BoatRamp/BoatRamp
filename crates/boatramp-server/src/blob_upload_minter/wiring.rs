@@ -66,6 +66,10 @@ pub enum CloudMinterSpec {
         /// The role ARN to assume; `None` + `use_federation_token` ⇒ `GetFederationToken`.
         role_arn: Option<String>,
         use_federation_token: bool,
+        /// The S3-compatible backend has no STS (Tigris/R2/MinIO): mint single-object presigned PUTs only
+        /// (`StsMode::None`), refusing prefix/multipart mints that need STS. Mutually exclusive with
+        /// `role_arn`/`use_federation_token` (both set ⇒ a loud wiring error, never a silent pick).
+        presigned_only: bool,
         /// The node-level **sealed base S3 credential** to sign the STS/presign SDK config with (#505),
         /// or `None` for the ambient AWS env chain (the historical default). The SAME source the S3 blob
         /// object backend uses — construens' one Tigris key. Redacted from `Debug` (see [`BaseCredential`]).
@@ -102,9 +106,39 @@ pub async fn build_cloud_minter(
             force_path_style,
             role_arn,
             use_federation_token,
+            presigned_only,
             base_credential,
         } => {
             use super::aws::{AwsBlobUploadMinter, AwsMinterConfig, StsMode};
+            // Decide the STS mode from plain config BEFORE resolving the AWS SDK config, so a
+            // misconfiguration fails fast (and cheaply, without an ambient-config round-trip).
+            //
+            // Mutual exclusivity is checked FIRST: `presigned_only` is the "this backend has no STS"
+            // switch, so combining it with an STS knob (`role_arn`/`use_federation_token`) is a
+            // contradiction — fail loud rather than silently letting the STS knob win.
+            if presigned_only && (role_arn.is_some() || use_federation_token) {
+                return Err(
+                    "aws_presigned_only is mutually exclusive with aws_role_arn / \
+                     aws_use_federation_token"
+                        .to_string(),
+                );
+            }
+            let sts_mode = match (role_arn, use_federation_token) {
+                (Some(role_arn), _) => StsMode::AssumeRole { role_arn },
+                (None, true) => StsMode::GetFederationToken,
+                // No role, no federation-token, but the operator declared the backend STS-less ⇒ the
+                // presigned-only mode: single-object presigned PUTs, no STS client.
+                (None, false) if presigned_only => StsMode::None,
+                (None, false) => {
+                    return Err(
+                        "AWS blob-upload cloud brokering needs either `aws_role_arn` (AssumeRole) or \
+                         `aws_use_federation_token = true` (GetFederationToken); or set \
+                         `aws_presigned_only = true` for an STS-less S3-compatible backend, which mints \
+                         single-object presigned PUTs only"
+                            .to_string(),
+                    );
+                }
+            };
             let mut sdk_config =
                 aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
             // #505: when the operator configured a node-level sealed base credential, override the
@@ -126,17 +160,6 @@ pub async fn build_cloud_minter(
                     .credentials_provider(provider)
                     .build();
             }
-            let sts_mode = match (role_arn, use_federation_token) {
-                (Some(role_arn), _) => StsMode::AssumeRole { role_arn },
-                (None, true) => StsMode::GetFederationToken,
-                (None, false) => {
-                    return Err(
-                        "AWS blob-upload cloud brokering needs either `aws_role_arn` (AssumeRole) or \
-                         `aws_use_federation_token = true` (GetFederationToken)"
-                            .to_string(),
-                    );
-                }
-            };
             let minter = AwsBlobUploadMinter::new(
                 &sdk_config,
                 AwsMinterConfig {
@@ -232,6 +255,7 @@ mod tests {
             force_path_style: false,
             role_arn: None,
             use_federation_token: true,
+            presigned_only: false,
             base_credential: Some(cred),
         };
         let spec_dbg = format!("{spec:?}");
@@ -239,5 +263,75 @@ mod tests {
             !spec_dbg.contains("SUPER-SECRET-DO-NOT-LOG"),
             "CloudMinterSpec::Aws Debug must not leak the sealed secret: {spec_dbg}"
         );
+    }
+
+    /// `aws_presigned_only` is the "this backend has no STS" switch, so combining it with an STS knob is
+    /// a contradiction the wiring must REFUSE loudly (never silently let the STS knob win). The check
+    /// runs before any AWS SDK resolution, so this returns immediately without an ambient-config call.
+    #[cfg(feature = "blob-upload-aws")]
+    #[tokio::test]
+    async fn presigned_only_is_mutually_exclusive_with_the_sts_knobs() {
+        // presigned_only + a role ARN ⇒ refused.
+        let with_role = CloudMinterSpec::Aws {
+            bucket: "b".to_string(),
+            region: "auto".to_string(),
+            endpoint: None,
+            force_path_style: true,
+            role_arn: Some("arn:aws:iam::123456789012:role/x".to_string()),
+            use_federation_token: false,
+            presigned_only: true,
+            base_credential: None,
+        };
+        // `build_cloud_minter` returns `Result<Option<Arc<dyn BlobUploadMinter>>, _>`; the Ok type is not
+        // `Debug` (a trait object), so match rather than `expect_err`.
+        match build_cloud_minter(with_role).await {
+            Err(err) => assert!(
+                err.contains("mutually exclusive"),
+                "expected a mutual-exclusivity error, got: {err}"
+            ),
+            Ok(_) => panic!("presigned_only + role_arn must be refused"),
+        }
+        // presigned_only + federation-token ⇒ also refused.
+        let with_fed = CloudMinterSpec::Aws {
+            bucket: "b".to_string(),
+            region: "auto".to_string(),
+            endpoint: None,
+            force_path_style: true,
+            role_arn: None,
+            use_federation_token: true,
+            presigned_only: true,
+            base_credential: None,
+        };
+        match build_cloud_minter(with_fed).await {
+            Err(err) => assert!(
+                err.contains("mutually exclusive"),
+                "expected a mutual-exclusivity error, got: {err}"
+            ),
+            Ok(_) => panic!("presigned_only + federation-token must be refused"),
+        }
+    }
+
+    /// With NO STS knob and NOT presigned-only, the AWS arm still refuses (an S3 backend must pick a
+    /// brokering mode) — and the error now points the operator at the STS-less presigned-only escape.
+    #[cfg(feature = "blob-upload-aws")]
+    #[tokio::test]
+    async fn no_sts_mode_and_not_presigned_only_is_refused_with_the_presigned_hint() {
+        let neither = CloudMinterSpec::Aws {
+            bucket: "b".to_string(),
+            region: "auto".to_string(),
+            endpoint: None,
+            force_path_style: true,
+            role_arn: None,
+            use_federation_token: false,
+            presigned_only: false,
+            base_credential: None,
+        };
+        match build_cloud_minter(neither).await {
+            Err(err) => assert!(
+                err.contains("aws_presigned_only = true"),
+                "the refusal should hint at the presigned-only escape: {err}"
+            ),
+            Ok(_) => panic!("no brokering mode must be refused"),
+        }
     }
 }
