@@ -5,6 +5,39 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.7.3] - 2026-09-29
+
+Additive, non-breaking. Host-side + a coordinated guest-shim compat rev (new
+`current-principal` import on the `tenancy` interface, gated behind the shim's
+`tenancy-persona` feature and a deploy-time `requires` — old guests unaffected).
+
+### Added
+
+- **Async-lane persona/RBAC propagation.** A message consumer's `graphql::run` sub-fetch can now
+  authorize a `role(…)`-gated federated field, completing the async-lane principal propagation the
+  tenant axis already had (v0.4.6/v0.4.17). At `present_token` the host additionally seals the
+  producer bearer's **persona/role** — the value of a new operator-configured
+  `[handlers…] token_persona_claim` (a single scalar, extracted from the already-host-verified JWT) —
+  into the `signed_context` COSE envelope alongside the tenant (`br_persona`, one signature, so it is
+  bound to the same verified tenant and shares the envelope's TTL). On the consumer lane the host
+  exposes the verified `{tenant, persona}` to the guest via a new `current-principal()` host import;
+  the shim maps it (through a new fail-closed `Authorizer::authenticate_sealed`) to a principal, so a
+  `role(…)` field authorizes identically to the same principal on the sync/HTTP lane. **Host-sealed,
+  guest-blind, fail-closed, no widening:** the persona comes only from the host-verified bearer (the
+  guest names neither the claim nor the value); a forged/absent/expired/wrong-tenant seal yields no
+  persona and the field fails closed; the sealed persona is exactly the presented bearer's persona
+  (an intersection, never a superset). A new `tenancy-persona` capability feature gates it, so a
+  `present_token`-only guest is not forced onto this host. Mutation-verified gate battery.
+
+- **Legible terminal-outcome taxonomy for the async lane.** A dead-lettered consumer message now
+  carries a distinct, operator-legible reason instead of an opaque `trap`: `consumer-error` (a clean
+  guest `Err` — now WITH the guest's returned text, length-bounded + control-char-sanitized — distinct
+  from a real wasm panic `trap`), and, for a templated (`{tenant}`) consumer, `context-seal-expired`
+  (the durable seal aged past its TTL before it was consumed — re-ingest from source),
+  `context-seal-missing`, and `context-seal-invalid` (distinct from the existing
+  `tenant-seal-mismatch`). Each is a distinct DLQ `last_error` + metric label, so `dlq ls/show`
+  diagnoses a denied downstream op in one read.
+
 ## [0.7.2] - 2026-09-28
 
 Additive, non-breaking. **P0 control-plane durability fix.** Host-side only (no
