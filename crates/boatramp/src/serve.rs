@@ -1359,6 +1359,8 @@ async fn wire_cloud_blob_upload(
             force_path_style: blob_args.s3_path_style,
             role_arn: cloud.aws_role_arn.clone(),
             use_federation_token: cloud.aws_use_federation_token,
+            // The STS-less presigned-only mode (Tigris/R2/MinIO): mint single-object presigned PUTs only.
+            presigned_only: cloud.aws_presigned_only,
             // The sealed base credential, or `None` for the ambient AWS env chain (unchanged).
             base_credential: sealed_s3_credential.map(|c| {
                 let (id, secret) = c.as_pair();

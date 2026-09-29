@@ -50,6 +50,11 @@ pub enum StsMode {
     },
     /// `sts:GetFederationToken` with an inline policy — for an IAM-user base credential.
     GetFederationToken,
+    /// **No STS.** The S3-compatible backend has no STS service (Tigris/R2/MinIO), so the ONLY mintable
+    /// shape is a single-object **presigned PUT** (signed locally from the base credential — no STS call).
+    /// A prefix/multipart/temp-credentials mint (which needs STS) is refused. No STS client is built for
+    /// this mode (see [`AwsBlobUploadMinter::new`]), so it imposes no STS dependency on the backend.
+    None,
 }
 
 /// The static config an AWS cloud minter needs: the real bucket, its region, the STS mode, and the TTL
@@ -69,10 +74,12 @@ pub struct AwsMinterConfig {
     pub sts_mode: StsMode,
 }
 
-/// The AWS cloud minter: holds the STS + S3 clients (built from the node's ambient AWS config, the SAME
-/// base credential the storage backend uses) and the static minter config.
+/// The AWS cloud minter: holds the (optional) STS client + the S3 client (built from the node's ambient
+/// AWS config, the SAME base credential the storage backend uses) and the static minter config.
 pub struct AwsBlobUploadMinter {
-    sts: aws_sdk_sts::Client,
+    /// The STS client for the temp-credential (prefix/multipart) shape. `None` for a presigned-only
+    /// ([`StsMode::None`]) backend, which never brokers via STS — so no STS client is built or required.
+    sts: Option<aws_sdk_sts::Client>,
     s3: aws_sdk_s3::Client,
     config: AwsMinterConfig,
 }
@@ -81,13 +88,31 @@ impl AwsBlobUploadMinter {
     /// Build a minter from an existing `aws_config::SdkConfig` (the ambient/base AWS config the node
     /// resolved for its S3 storage backend) + the static minter config. The STS + S3 clients share the
     /// base credential; the session policy narrows every brokered credential.
+    ///
+    /// The STS client is built **lazily**: only [`StsMode::AssumeRole`]/[`StsMode::GetFederationToken`]
+    /// build one. A presigned-only backend ([`StsMode::None`], e.g. Tigris/R2/MinIO, which have no STS)
+    /// gets `sts: None` — its mint signs a single-object presigned PUT from the base credential alone, so
+    /// construction neither builds nor requires an STS client.
     pub fn new(sdk_config: &aws_config::SdkConfig, config: AwsMinterConfig) -> Self {
-        let sts = aws_sdk_sts::Client::new(sdk_config);
-        // The S3 client for presigning honours the same endpoint/path-style as the storage backend so a
-        // presigned URL targets the same host the client would otherwise configure.
+        let sts = match config.sts_mode {
+            StsMode::None => None,
+            StsMode::AssumeRole { .. } | StsMode::GetFederationToken => {
+                Some(aws_sdk_sts::Client::new(sdk_config))
+            }
+        };
+        // The S3 client for presigning honours the same endpoint/region/path-style as the storage backend
+        // so a presigned URL targets the same host — and signs in the same SigV4 region — the client would
+        // otherwise configure.
         let mut s3_builder = aws_sdk_s3::config::Builder::from(sdk_config);
         if let Some(endpoint) = &config.endpoint {
             s3_builder = s3_builder.endpoint_url(endpoint.clone());
+        }
+        // Thread the operator's configured region (`--s3-region`) into the presign client's signing
+        // scope. The storage backend sets region from `S3Options` (`s3.rs`), but the ambient `SdkConfig`
+        // resolved here may carry none for an S3-compatible endpoint, so SigV4 presigning would otherwise
+        // lack a region. An empty region ⇒ leave whatever the ambient config resolved (unchanged).
+        if !config.region.is_empty() {
+            s3_builder = s3_builder.region(aws_sdk_s3::config::Region::new(config.region.clone()));
         }
         if config.force_path_style {
             s3_builder = s3_builder.force_path_style(true);
@@ -159,14 +184,20 @@ impl AwsBlobUploadMinter {
         &self,
         scope: &MintScope,
     ) -> Result<(String, String, String, u64), String> {
+        // The temp-credential shape needs an STS client; a presigned-only ([`StsMode::None`]) backend has
+        // none. `mint`'s temp-credential branch already refuses `StsMode::None`, so this is a defensive
+        // belt-and-suspenders (returns an error, never panics).
+        let sts = self.sts.as_ref().ok_or_else(|| {
+            "internal: STS brokering requested but no STS client is configured (presigned-only backend)"
+                .to_string()
+        })?;
         let policy = Self::session_policy_json(&self.config.bucket, scope);
         // STS duration is in whole seconds; clamp into STS's own valid range (min 900s, max 43_200s
         // for AssumeRole). The binding already clamped the TTL to the operator ceiling; STS floors it.
         let duration = i32::try_from(scope.ttl_secs.clamp(900, 43_200)).unwrap_or(3_600);
         let creds = match &self.config.sts_mode {
             StsMode::AssumeRole { role_arn } => {
-                let out = self
-                    .sts
+                let out = sts
                     .assume_role()
                     .role_arn(role_arn)
                     .role_session_name("boatramp-blob-ingress")
@@ -179,8 +210,7 @@ impl AwsBlobUploadMinter {
                     .ok_or_else(|| "sts:AssumeRole returned no credentials".to_string())?
             }
             StsMode::GetFederationToken => {
-                let out = self
-                    .sts
+                let out = sts
                     .get_federation_token()
                     .name("boatramp-blob-ingress")
                     .policy(policy)
@@ -191,6 +221,14 @@ impl AwsBlobUploadMinter {
                     .map_err(|e| format!("sts:GetFederationToken failed: {e}"))?;
                 out.credentials
                     .ok_or_else(|| "sts:GetFederationToken returned no credentials".to_string())?
+            }
+            // Unreachable: `sts` above is `Some` only for the two STS modes, and `mint` refuses
+            // `StsMode::None` before calling this. Handled defensively (no panic).
+            StsMode::None => {
+                return Err(
+                    "internal: STS brokering reached with StsMode::None (presigned-only backend)"
+                        .to_string(),
+                );
             }
         };
         let expires_at = u64::try_from(creds.expiration().as_secs_f64() as i64)
@@ -252,6 +290,19 @@ impl BlobUploadMinter for AwsBlobUploadMinter {
                 expires_in_secs: scope.ttl_secs,
             }))
         } else {
+            // The prefix / multipart / temp-credentials shape needs STS. A presigned-only S3-compatible
+            // backend ([`StsMode::None`]; Tigris/R2/MinIO) has none, so refuse it here — a single-object
+            // presigned PUT is the only shape this backend can mint.
+            match self.config.sts_mode {
+                StsMode::None => {
+                    return Err(
+                        "presigned-only S3 backend: a prefix/multipart/temp-credentials mint requires \
+                         STS (set aws_role_arn or aws_use_federation_token); this backend has none"
+                            .to_string(),
+                    );
+                }
+                StsMode::AssumeRole { .. } | StsMode::GetFederationToken => {}
+            }
             let (access_key_id, secret, session_token, sts_expires_at) =
                 self.broker_temp_credentials(scope).await?;
             // A session policy caps neither object size nor content-type; content-addressing is the
@@ -293,6 +344,119 @@ mod tests {
             constraints: c,
             ttl_secs: 1800,
         }
+    }
+
+    /// A hermetic `SdkConfig` with static credentials — enough for the SigV4 presign signer to run
+    /// entirely locally (no network, no ambient AWS env). Used to build a real `AwsBlobUploadMinter` and
+    /// exercise the `StsMode::None` presigned-only path.
+    fn test_sdk_config() -> aws_config::SdkConfig {
+        aws_config::SdkConfig::builder()
+            .behavior_version(aws_config::BehaviorVersion::latest())
+            .region(aws_sdk_s3::config::Region::new("auto"))
+            .credentials_provider(aws_sdk_s3::config::SharedCredentialsProvider::new(
+                aws_sdk_s3::config::Credentials::new(
+                    "AKIDTEST",
+                    "SECRETTEST",
+                    None,
+                    None,
+                    "static-test",
+                ),
+            ))
+            .build()
+    }
+
+    fn presigned_only_minter() -> AwsBlobUploadMinter {
+        AwsBlobUploadMinter::new(
+            &test_sdk_config(),
+            AwsMinterConfig {
+                bucket: "media".to_string(),
+                region: "auto".to_string(),
+                endpoint: Some("https://fly.storage.tigris.dev".to_string()),
+                force_path_style: true,
+                sts_mode: StsMode::None,
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn presigned_only_mints_a_single_object_presigned_put() {
+        // The construens Tigris case: a single-key, PUT-only scope on an STS-less backend mints a
+        // per-object presigned PUT — signed from the base credential, no STS. The constrained
+        // content-type is signed in (returned as a required header the client must send).
+        let minter = presigned_only_minter();
+        let s = scope(
+            UploadTarget::Key("abc123.jpg".into()),
+            vec![UploadPerm::Put],
+            UploadConstraints {
+                content_type: Some("image/jpeg".into()),
+                require_sha256: true,
+                create_only: true,
+                ..Default::default()
+            },
+        );
+        let minted = minter
+            .mint(&s)
+            .await
+            .expect("presigned PUT mints with no STS");
+        match minted {
+            MintedCredentials::PresignedPut(p) => {
+                assert_eq!(p.method, "PUT");
+                assert!(
+                    p.url.contains("hblob/acme/blog/photos/abc123.jpg"),
+                    "the presigned URL targets the exact hblob key: {}",
+                    p.url
+                );
+                assert!(
+                    p.required_headers
+                        .iter()
+                        .any(|(k, v)| k == "content-type" && v == "image/jpeg"),
+                    "the constrained content-type is a required header: {:?}",
+                    p.required_headers
+                );
+            }
+            _ => panic!("expected a presigned PUT for a single-key PUT-only scope"),
+        }
+    }
+
+    #[tokio::test]
+    async fn presigned_only_refuses_a_prefix_mint() {
+        // A prefix target needs a temp credential (STS), which an STS-less backend cannot broker ⇒ refuse
+        // (loudly, pointing at the STS knobs). No STS client exists on this minter, so the refusal is
+        // structural, not a failed STS call.
+        let minter = presigned_only_minter();
+        let s = scope(
+            UploadTarget::Prefix("ingest/".into()),
+            vec![UploadPerm::Put],
+            Default::default(),
+        );
+        let err = minter
+            .mint(&s)
+            .await
+            .expect_err("a prefix mint requires STS");
+        assert!(
+            err.contains("requires STS"),
+            "the refusal names the STS requirement: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn presigned_only_refuses_a_multipart_mint() {
+        // A single key but with the multipart right also needs STS (the multipart quartet), so it too is
+        // refused on a presigned-only backend — only a single-shot PUT is mintable here.
+        let minter = presigned_only_minter();
+        let s = scope(
+            UploadTarget::Key("big.bin".into()),
+            vec![UploadPerm::Put, UploadPerm::Multipart],
+            Default::default(),
+        );
+        let err = minter
+            .mint(&s)
+            .await
+            .expect_err("a multipart mint requires STS");
+        assert!(
+            err.contains("requires STS"),
+            "the refusal names the STS requirement: {err}"
+        );
     }
 
     #[test]

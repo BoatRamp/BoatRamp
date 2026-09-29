@@ -2210,6 +2210,13 @@ pub struct S3IngressCloud {
     /// the base credential to be a real IAM user, not itself a session.
     #[serde(default)]
     pub aws_use_federation_token: bool,
+    /// **AWS**: the S3-compatible backend has NO STS (Tigris/R2/MinIO): mint single-object presigned PUTs
+    /// only. Prefix/multipart mints are refused (they require STS). Mutually exclusive with
+    /// `aws_role_arn`/`aws_use_federation_token` (a misconfiguration that set both fails loud at wiring,
+    /// never silently picks one). The presigned PUT is signed from the node's base S3 credential — the
+    /// SAME source the S3 blob backend uses — so no new credential is needed. Default `false`.
+    #[serde(default)]
+    pub aws_presigned_only: bool,
     /// **GCS**: the service-account client email whose V4 signed URLs / IAM-signed uploads the minter
     /// produces (used in the signing scope). Absent ⇒ resolved from ADC.
     pub gcs_client_email: Option<String>,
