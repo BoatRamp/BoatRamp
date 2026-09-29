@@ -2059,7 +2059,11 @@ pub(super) async fn build_bindings(
         // resolved in-site tenant + host-verified sealed principal so the sibling inherits both
         // (host-carried, not guest-set) — PLAN-async-persona.
         bindings = bindings.with_invoke(
-            invoker.scoped(project, handler_caller_tenant.clone(), sealed_principal.clone()),
+            invoker.scoped(
+                project,
+                handler_caller_tenant.clone(),
+                sealed_principal.clone(),
+            ),
             invoke_targets.to_vec(),
             depth,
         );
@@ -2076,7 +2080,11 @@ pub(super) async fn build_bindings(
         // `graphql::run` sub-fetch inherits its tenancy + persona (symmetric to `with_invoke` above),
         // rather than failing closed on an `own` op or a `role(…)` field (PLAN-async-persona).
         bindings = bindings.with_graphql(
-            runner.scoped(project, handler_caller_tenant.clone(), sealed_principal.clone()),
+            runner.scoped(
+                project,
+                handler_caller_tenant.clone(),
+                sealed_principal.clone(),
+            ),
             depth,
         );
     }
@@ -2706,7 +2714,8 @@ fn resolve_sealed_tenant(
 /// -line, printable summary — empty if nothing printable remains (caller falls back to the bare label).
 #[cfg(feature = "handlers")]
 fn sanitize_dlq_detail(detail: &str) -> String {
-    let mut out = String::with_capacity(detail.len().min(boatramp_handlers::MAX_CONSUMER_ERROR_LEN));
+    let mut out =
+        String::with_capacity(detail.len().min(boatramp_handlers::MAX_CONSUMER_ERROR_LEN));
     let mut prev_space = false;
     for c in detail.chars() {
         // Drop C0/C1 controls (newline, tab, CR, NUL, ESC, …) — the injection/corruption surface.
@@ -2854,7 +2863,9 @@ mod persona_seal_gate {
     async fn classify_seal_distinguishes_every_terminal_reason() {
         let signer = LocalSigner::generate(TokenAlg::Es256);
         let anchor = signer.public_key();
-        let good = mint_context("acme", None, 300, now(), &signer).await.unwrap();
+        let good = mint_context("acme", None, 300, now(), &signer)
+            .await
+            .unwrap();
         assert!(matches!(
             classify_seal(Some(&good), Some(&anchor)),
             SealOutcome::Verified
@@ -2879,7 +2890,10 @@ mod persona_seal_gate {
         // operator gets the honest "re-ingest from source" reason instead of a "forged" red herring.
         let expired = mint_context("acme", None, 1, 1000, &signer).await.unwrap();
         assert!(
-            matches!(classify_seal(Some(&expired), Some(&anchor)), SealOutcome::Expired),
+            matches!(
+                classify_seal(Some(&expired), Some(&anchor)),
+                SealOutcome::Expired
+            ),
             "a well-signed past-TTL seal must classify as Expired, not Invalid"
         );
     }
@@ -3063,30 +3077,32 @@ pub(super) async fn dispatch_consumer_batch(
                 // revived → re-ingest from source; a missing/invalid one points at a producer that
                 // didn't `present_token`). The reason is persisted as the DLQ `last_error` by
                 // `dead_letter`, so `dlq ls/show` shows it in one read.
-                let (reason, operator_msg): (&str, &str) =
-                    match classify_seal(msg.signed_context.as_deref(), context_anchor) {
-                        // A verified seal that simply names a different tenant than this concrete
-                        // topic — the original v0.7.1 cross-tenant anomaly.
-                        SealOutcome::Verified => (
-                            "tenant-seal-mismatch",
-                            "sealed tenant does not match this concrete `{tenant}` topic segment",
-                        ),
-                        SealOutcome::Expired => (
-                            "context-seal-expired",
-                            "the message's signed context expired before it was consumed; the seal \
+                let (reason, operator_msg): (&str, &str) = match classify_seal(
+                    msg.signed_context.as_deref(),
+                    context_anchor,
+                ) {
+                    // A verified seal that simply names a different tenant than this concrete
+                    // topic — the original v0.7.1 cross-tenant anomaly.
+                    SealOutcome::Verified => (
+                        "tenant-seal-mismatch",
+                        "sealed tenant does not match this concrete `{tenant}` topic segment",
+                    ),
+                    SealOutcome::Expired => (
+                        "context-seal-expired",
+                        "the message's signed context expired before it was consumed; the seal \
                              cannot be revived — re-ingest from source",
-                        ),
-                        SealOutcome::Missing => (
-                            "context-seal-missing",
-                            "the message carried no signed context on a templated (`{tenant}`) topic; \
+                    ),
+                    SealOutcome::Missing => (
+                        "context-seal-missing",
+                        "the message carried no signed context on a templated (`{tenant}`) topic; \
                              the producer did not present a token",
-                        ),
-                        SealOutcome::Invalid => (
-                            "context-seal-invalid",
-                            "the message's signed context failed verification (forged / wrong-kind / \
+                    ),
+                    SealOutcome::Invalid => (
+                        "context-seal-invalid",
+                        "the message's signed context failed verification (forged / wrong-kind / \
                              no fleet anchor); the seal is not trusted",
-                        ),
-                    };
+                    ),
+                };
                 match messaging.dead_letter(&msg, reason).await {
                     Ok(()) => {}
                     Err(err) => {

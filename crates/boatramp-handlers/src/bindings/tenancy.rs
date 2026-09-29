@@ -129,10 +129,11 @@ impl tenancy_iface::Host for TenancyHost<'_> {
     /// The value is exactly what the host verified (guest-blind); the guest can neither name nor
     /// supply it. Synchronous — a pure read of the per-invocation binding.
     fn current_principal(&mut self) -> Option<tenancy_iface::SealedPrincipal> {
-        self.sealed_principal.map(|p| tenancy_iface::SealedPrincipal {
-            tenant: p.tenant.clone(),
-            persona: p.persona.clone(),
-        })
+        self.sealed_principal
+            .map(|p| tenancy_iface::SealedPrincipal {
+                tenant: p.tenant.clone(),
+                persona: p.persona.clone(),
+            })
     }
 }
 
@@ -205,7 +206,9 @@ mod tests {
             persona: Some("Integration".into()),
         };
         let mut host = TenancyHost::new(None, Some(&sealed));
-        let got = host.current_principal().expect("a verified seal is present");
+        let got = host
+            .current_principal()
+            .expect("a verified seal is present");
         assert_eq!(got.tenant, "acme");
         assert_eq!(got.persona.as_deref(), Some("Integration"));
 
@@ -216,7 +219,9 @@ mod tests {
             persona: None,
         };
         let mut host = TenancyHost::new(None, Some(&tenant_only));
-        let got = host.current_principal().expect("a verified seal is present");
+        let got = host
+            .current_principal()
+            .expect("a verified seal is present");
         assert_eq!(got.tenant, "acme");
         assert_eq!(got.persona, None);
     }

@@ -2027,7 +2027,9 @@ mod tests {
         let signer = LocalSigner::generate(TokenAlg::Es256);
         let pubkey = signer.public_key();
         // Mint at t=1000, ttl 300 ⇒ exp 1300. Round-trip returns the carried tenant within the window.
-        let ctx = mint_context("acme", None, 300, 1000, &signer).await.unwrap();
+        let ctx = mint_context("acme", None, 300, 1000, &signer)
+            .await
+            .unwrap();
         assert_eq!(verify_context(&ctx, &pubkey, 1000).unwrap(), "acme");
         assert_eq!(verify_context(&ctx, &pubkey, 1200).unwrap(), "acme");
         // Expired ⇒ refused (a stale replayed envelope drops out; the async op fails closed).
@@ -2046,7 +2048,9 @@ mod tests {
         let signer = LocalSigner::generate(TokenAlg::Es256);
         let pubkey = signer.public_key();
         // No persona configured ⇒ the envelope seals none (unchanged for every existing producer).
-        let plain = mint_context("acme", None, 300, 1000, &signer).await.unwrap();
+        let plain = mint_context("acme", None, 300, 1000, &signer)
+            .await
+            .unwrap();
         let v = verify_context_full(&plain, &pubkey, 1000).unwrap();
         assert_eq!(v.tenant, "acme");
         assert_eq!(v.persona, None, "no persona sealed when none configured");

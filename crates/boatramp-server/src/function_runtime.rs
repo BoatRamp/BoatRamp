@@ -2945,9 +2945,13 @@ mod gap3_tests {
         );
         // No `token_persona_claim` configured ⇒ NO persona sealed (unchanged for every producer).
         assert_eq!(
-            verify_context_full(&sealed, &fleet.public_key(), boatramp_core::time::now_unix())
-                .unwrap()
-                .persona,
+            verify_context_full(
+                &sealed,
+                &fleet.public_key(),
+                boatramp_core::time::now_unix()
+            )
+            .unwrap()
+            .persona,
             None,
             "no persona is sealed when token_persona_claim is unconfigured"
         );
@@ -2970,8 +2974,12 @@ mod gap3_tests {
             serde_json::json!({ "iss": ISS, "exp": exp, "tid": "tenant_B", "role": "Integration" }),
         );
         let sealed = persona_source.seal_presented(&with_role).await.unwrap();
-        let v = verify_context_full(&sealed, &fleet.public_key(), boatramp_core::time::now_unix())
-            .unwrap();
+        let v = verify_context_full(
+            &sealed,
+            &fleet.public_key(),
+            boatramp_core::time::now_unix(),
+        )
+        .unwrap();
         assert_eq!(v.tenant, "tenant_B");
         assert_eq!(
             v.persona.as_deref(),
@@ -2986,10 +2994,14 @@ mod gap3_tests {
         );
         let sealed = persona_source.seal_presented(&arr_role).await.unwrap();
         assert_eq!(
-            verify_context_full(&sealed, &fleet.public_key(), boatramp_core::time::now_unix())
-                .unwrap()
-                .persona
-                .as_deref(),
+            verify_context_full(
+                &sealed,
+                &fleet.public_key(),
+                boatramp_core::time::now_unix()
+            )
+            .unwrap()
+            .persona
+            .as_deref(),
             Some("Staff")
         );
         // Configured-but-absent (no `role` claim) ⇒ seal NO persona (fail-closed), still seals tenant.
@@ -2999,8 +3011,12 @@ mod gap3_tests {
             serde_json::json!({ "iss": ISS, "exp": exp, "tid": "tenant_B" }),
         );
         let sealed = persona_source.seal_presented(&no_role).await.unwrap();
-        let v = verify_context_full(&sealed, &fleet.public_key(), boatramp_core::time::now_unix())
-            .unwrap();
+        let v = verify_context_full(
+            &sealed,
+            &fleet.public_key(),
+            boatramp_core::time::now_unix(),
+        )
+        .unwrap();
         assert_eq!(v.tenant, "tenant_B");
         assert_eq!(
             v.persona, None,
@@ -3015,9 +3031,13 @@ mod gap3_tests {
         );
         let sealed = persona_source.seal_presented(&multi_role).await.unwrap();
         assert_eq!(
-            verify_context_full(&sealed, &fleet.public_key(), boatramp_core::time::now_unix())
-                .unwrap()
-                .persona,
+            verify_context_full(
+                &sealed,
+                &fleet.public_key(),
+                boatramp_core::time::now_unix()
+            )
+            .unwrap()
+            .persona,
             None,
             "a multi-valued role claim is not a single scalar and seals no persona"
         );
@@ -3093,7 +3113,10 @@ mod gap3_tests {
         };
         // A JSON string ⇒ that string.
         assert_eq!(
-            persona_from_claims(&claims(serde_json::json!({ "role": "Integration" })), "role"),
+            persona_from_claims(
+                &claims(serde_json::json!({ "role": "Integration" })),
+                "role"
+            ),
             Some("Integration".to_string())
         );
         // A one-element string array ⇒ the sole element.
