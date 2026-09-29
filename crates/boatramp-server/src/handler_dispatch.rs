@@ -2698,6 +2698,41 @@ fn resolve_sealed_tenant(
     boatramp_core::cose::verify_context(env, anchor, boatramp_core::time::now_unix()).ok()
 }
 
+/// Sanitize an UNTRUSTED guest-returned error string before it lands in the DLQ `last_error` (which
+/// an operator reads via `dlq ls/show` and which may be echoed into a structured log). Strips ASCII
+/// control chars (incl. newlines/tabs — no log-injection / DLQ-record corruption), collapses runs of
+/// whitespace, and re-caps length as defense-in-depth (the engine already bounds it at
+/// [`MAX_CONSUMER_ERROR_LEN`](boatramp_handlers::MAX_CONSUMER_ERROR_LEN)). Returns a trimmed, single
+/// -line, printable summary — empty if nothing printable remains (caller falls back to the bare label).
+#[cfg(feature = "handlers")]
+fn sanitize_dlq_detail(detail: &str) -> String {
+    let mut out = String::with_capacity(detail.len().min(boatramp_handlers::MAX_CONSUMER_ERROR_LEN));
+    let mut prev_space = false;
+    for c in detail.chars() {
+        // Drop C0/C1 controls (newline, tab, CR, NUL, ESC, …) — the injection/corruption surface.
+        if c.is_control() {
+            if !prev_space && !out.is_empty() {
+                out.push(' ');
+                prev_space = true;
+            }
+            continue;
+        }
+        if c == ' ' {
+            if prev_space || out.is_empty() {
+                continue;
+            }
+            prev_space = true;
+        } else {
+            prev_space = false;
+        }
+        out.push(c);
+        if out.len() >= boatramp_handlers::MAX_CONSUMER_ERROR_LEN {
+            break;
+        }
+    }
+    out.trim_end().to_string()
+}
+
 /// The terminal-outcome classification of a durable message's `signed_context` seal for a consumer
 /// that REQUIRES one (PLAN-async-persona legible-terminal-outcome taxonomy). Each maps to a distinct,
 /// operator-legible dead-letter reason + metric label. Honestly recoverable-or-not: an expired seal
@@ -3047,13 +3082,31 @@ pub(super) async fn dispatch_consumer_batch(
                     %err,
                     "consumer failed; redelivering (dead-letters after max attempts)"
                 );
-                // Record the host-classified failure reason (P1/SEC6: never the guest's error text)
-                // so it survives into the dead-letter for `dlq ls/show` + `--match`. ONLY on the
-                // final attempt (whose failure dead-letters the message next claim): last_error means
-                // "why it dead-lettered", not a transient retry — and this keeps the hot redelivery
-                // path a single write (nack). Best-effort — annotating must never block redelivery.
+                // Record the failure reason so it survives into the dead-letter for `dlq ls/show` +
+                // `--match`, ONLY on the final attempt (whose failure dead-letters the message next
+                // claim): last_error means "why it dead-lettered", not a transient retry — and this
+                // keeps the hot redelivery path a single write (nack). Best-effort — annotating must
+                // never block redelivery. The reason is the host-classified label (`trap`, `timeout`,
+                // …) EXCEPT for a clean guest `Err`, where we ALSO surface the guest's returned text
+                // (PLAN-async-persona: a denied downstream op must read as `consumer-error: <why>`, not
+                // an opaque label — the multi-day-diagnosis fix). The guest text is UNTRUSTED: already
+                // length-bounded at the engine (`MAX_CONSUMER_ERROR_LEN`) and sanitized here (control
+                // chars stripped) so it cannot injection-corrupt the DLQ / a downstream log line. This
+                // deliberately narrows the prior "never the guest's error text" rule to ONLY the
+                // clean-error case, keeping the host label authoritative as the greppable prefix.
                 if msg.attempts >= max_attempts {
-                    let _ = messaging.set_last_error(&msg, outcome.as_str()).await;
+                    let reason = match &result {
+                        Err(boatramp_handlers::HandlerError::ConsumerError(detail)) => {
+                            let d = sanitize_dlq_detail(detail);
+                            if d.is_empty() {
+                                outcome.as_str().to_string()
+                            } else {
+                                format!("{}: {d}", outcome.as_str())
+                            }
+                        }
+                        _ => outcome.as_str().to_string(),
+                    };
+                    let _ = messaging.set_last_error(&msg, &reason).await;
                 }
                 let _ = messaging
                     .nack_after(&msg, backoff_ms.saturating_mul(u64::from(msg.attempts)))
