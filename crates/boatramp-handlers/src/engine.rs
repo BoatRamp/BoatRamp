@@ -176,6 +176,11 @@ pub enum Lane {
 /// `timeout_ms / EPOCH_TICK_MS` ticks.
 const EPOCH_TICK_MS: u64 = 10;
 
+/// Upper bound (chars) on the guest-returned error text carried by
+/// [`HandlerError::ConsumerError`]. The guest controls this string, so it is bounded here before it
+/// is stored (and the DLQ layer sanitizes control chars before an operator sees it).
+pub const MAX_CONSUMER_ERROR_LEN: usize = 512;
+
 /// Outcome of a failed invocation.
 #[derive(Debug, thiserror::Error)]
 pub enum HandlerError {
@@ -982,8 +987,14 @@ impl HandlerEngine {
             // A CLEAN guest `Err` (the consumer's `handle` returned an error value) — distinct from a
             // wasm trap. Carry the guest's error string so the dead-letter is legible as a downstream
             // denial (`consumer-error`), not the opaque `trap` a real panic yields. The string is
-            // untrusted guest text; the DLQ layer sanitizes it before an operator sees it.
-            Ok(Err(err)) => Err(HandlerError::ConsumerError(format!("{err:?}"))),
+            // untrusted guest text; bound it HERE (the guest controls its length) and the DLQ layer
+            // sanitizes it (control chars stripped) before an operator sees it.
+            Ok(Err(err)) => Err(HandlerError::ConsumerError(
+                format!("{err:?}")
+                    .chars()
+                    .take(MAX_CONSUMER_ERROR_LEN)
+                    .collect(),
+            )),
             Err(trap) => Err(classify(&trap)),
         }
     }
