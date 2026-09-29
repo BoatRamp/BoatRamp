@@ -135,6 +135,27 @@ fn estr<E: std::fmt::Display>(err: E) -> String {
     err.to_string()
 }
 
+/// Map a `StorageError` from an object-store operation into the string the guest receives, and LOG a
+/// genuine backend/transport fault host-side. A guest-actionable, self-describing outcome keeps its own
+/// message — `NotFound` ("object not found: <key>", which the guest maps to 404), `InvalidKey`,
+/// `Unsupported` — but a `Backend`/`Io` FAULT (a `403 AccessDenied` from an under-scoped credential, a
+/// transport error) is logged with the real cause (op + key) for the operator and collapsed to a fixed,
+/// coarse `"blob backend unavailable"` for the guest (which maps it to a 5xx, not a 404). The raw
+/// object-store/SDK error can carry signing/endpoint/access-key metadata, so it reaches ONLY the
+/// operator log, never a guest. Silent-404-on-403 — a `Backend` fault flattened into the SAME `Err` a
+/// real 404 yields — was the trap that hid an under-scoped S3 credential (the blob-read-404 incident):
+/// a write-only key 404'd every read with nothing in the logs.
+fn blob_err(op: &str, key: &str, err: StorageError) -> String {
+    match err {
+        StorageError::Backend(_) | StorageError::Io(_) => {
+            tracing::warn!(op, key, error = %err, "blob object-store backend fault");
+            "blob backend unavailable".to_string()
+        }
+        // Self-describing + guest-actionable (no backend/credential metadata): pass the message through.
+        other => other.to_string(),
+    }
+}
+
 /// A single-chunk byte stream for [`Storage::put`].
 fn once_stream(bytes: Bytes) -> ByteStream {
     futures::stream::once(async move { Ok::<_, StorageError>(bytes) }).boxed()
@@ -182,7 +203,7 @@ async fn marker_exists(storage: &dyn Storage, prefix: &str) -> Result<bool, Stri
     match storage.head(&format!("{prefix}{MARKER}")).await {
         Ok(_) => Ok(true),
         Err(StorageError::NotFound(_)) => Ok(false),
-        Err(err) => Err(estr(err)),
+        Err(err) => Err(blob_err("head", prefix, err)),
     }
 }
 
@@ -291,7 +312,7 @@ impl blobstore::container::HostContainer for BlobHost<'_> {
         let object = storage
             .get_range(&key, start, Some(len))
             .await
-            .map_err(estr)?;
+            .map_err(|e| blob_err("get", &key, e))?;
         let bytes = collect(object.body, self.max_bytes()).await?;
         self.table.push(IncomingValue { bytes }).map_err(estr)
     }
@@ -308,7 +329,7 @@ impl blobstore::container::HostContainer for BlobHost<'_> {
         storage
             .put(&key, once_stream(bytes), PutMeta::default())
             .await
-            .map_err(estr)?;
+            .map_err(|e| blob_err("put", &key, e))?;
         Ok(())
     }
 
@@ -321,7 +342,7 @@ impl blobstore::container::HostContainer for BlobHost<'_> {
         let names = storage
             .list(&prefix)
             .await
-            .map_err(estr)?
+            .map_err(|e| blob_err("list", &prefix, e))?
             .into_iter()
             .filter_map(|meta| {
                 let name = meta.key.strip_prefix(&prefix).unwrap_or(&meta.key);
@@ -341,7 +362,10 @@ impl blobstore::container::HostContainer for BlobHost<'_> {
     ) -> Result<(), String> {
         let container = self.table.get(&this).map_err(estr)?;
         let (storage, key) = (container.storage.clone(), container.object_key(&name));
-        storage.delete(&key).await.map_err(estr)
+        storage
+            .delete(&key)
+            .await
+            .map_err(|e| blob_err("delete", &key, e))
     }
 
     async fn delete_objects(
@@ -353,7 +377,10 @@ impl blobstore::container::HostContainer for BlobHost<'_> {
         let storage = container.storage.clone();
         let keys: Vec<String> = names.iter().map(|n| container.object_key(n)).collect();
         for key in keys {
-            storage.delete(&key).await.map_err(estr)?;
+            storage
+                .delete(&key)
+                .await
+                .map_err(|e| blob_err("delete", &key, e))?;
         }
         Ok(())
     }
@@ -368,7 +395,7 @@ impl blobstore::container::HostContainer for BlobHost<'_> {
         match storage.head(&key).await {
             Ok(_) => Ok(true),
             Err(StorageError::NotFound(_)) => Ok(false),
-            Err(err) => Err(estr(err)),
+            Err(err) => Err(blob_err("head", &key, err)),
         }
     }
 
@@ -542,7 +569,7 @@ async fn read_created_at(storage: &dyn Storage, marker: &str) -> Result<u64, Str
             Ok(String::from_utf8_lossy(&bytes).parse().unwrap_or(0))
         }
         Err(StorageError::NotFound(_)) => Ok(0),
-        Err(err) => Err(estr(err)),
+        Err(err) => Err(blob_err("get", marker, err)),
     }
 }
 
@@ -966,5 +993,39 @@ mod tests {
         let mut table = ResourceTable::new();
         let mut host = BlobHost::new(&mut table, None);
         assert!(host.create_container("c".into()).await.is_err());
+    }
+
+    /// GATE (v0.7.4, blob-read-404 diagnosability) — a backend/permission fault must NOT be masked as
+    /// a genuine NotFound, and its raw SDK text must NOT reach the guest. Mutation-verified: reverting
+    /// `blob_err` to the old `err.to_string()` mask makes the coarse-category assertion (and the
+    /// no-leak assertion) fail; coarsening NotFound too makes the 404-preservation assertion fail.
+    #[test]
+    fn blob_err_masks_a_backend_fault_but_preserves_notfound() {
+        // A genuine NotFound keeps its message so a guest can still map it to a 404.
+        let key = "hblob/acme/site/deadbeef";
+        let nf = blob_err("get", key, StorageError::NotFound(key.to_string()));
+        assert!(
+            nf.contains("object not found"),
+            "NotFound must stay distinguishable (guest → 404), got: {nf}"
+        );
+        // A backend fault (a 403 AccessDenied carrying signing/endpoint/key metadata) collapses to a
+        // FIXED coarse category — the guest gets a fault signal (→ 5xx), never the raw SDK string.
+        let raw = "AccessDenied: SigV4 for key AKIAEXAMPLE at s3.example.com";
+        let be = blob_err("get", key, StorageError::Backend(raw.to_string()));
+        assert_eq!(
+            be, "blob backend unavailable",
+            "a backend fault must be a fixed coarse category, not the raw error"
+        );
+        assert!(
+            !be.contains("AccessDenied") && !be.contains("AKIA") && !be.contains("s3.example"),
+            "the raw object-store/SDK error must NEVER reach the guest: {be}"
+        );
+        // A transport (Io) fault is likewise coarse, not a NotFound.
+        let io = blob_err("get", key, StorageError::Io(std::io::Error::other("boom")));
+        assert_eq!(io, "blob backend unavailable");
+        assert!(
+            !io.contains("boom"),
+            "transport detail stays host-side: {io}"
+        );
     }
 }

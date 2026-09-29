@@ -872,6 +872,10 @@ mod tests {
         // The read-only messaging-stats capability is advertised whenever handlers are compiled
         // (this test only runs under `handlers`), as an Experimental feature.
         assert!(host.contains(&"messaging-stats"));
+        // The blob-upload (presigned-ingress) capability is cargo-gated: advertised iff this build
+        // enabled it, so `boatramp capabilities` lists it and the `requires` ABI gate is meaningful.
+        // (Its absence in the released image was the construens presigned-blob-upload gap — GATE.)
+        assert_eq!(host.contains(&"blob-upload"), cfg!(feature = "blob-upload"));
         // The detailed registry pairs each name with a lifecycle, and its names are exactly the
         // flat list (one source of truth — the flat list derives from the detailed one).
         let detailed = host_capability_features_detailed();
