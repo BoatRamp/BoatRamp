@@ -2799,6 +2799,110 @@ pub(super) fn resolve_sealed_principal(
         })
 }
 
+/// **Async-lane persona gate battery** (PLAN-async-persona) — mutation-verified, host toolchain.
+/// Proves the host mechanism is fail-closed: a valid seal yields the host-verified `{tenant,
+/// persona}`; an absent / anchor-less / expired / forged / garbage seal yields NONE (so a consumer's
+/// `current-principal()` returns `none` and a `role(…)` field fails closed); the terminal-outcome
+/// taxonomy distinguishes each reason (an expired seal is NOT lumped with a forged one — the
+/// operator's "re-ingest from source" signal); and the untrusted guest DLQ detail is
+/// injection-sanitized + bounded. Each assertion is anti-hollow: a fail-closed→open mutation, a
+/// collapsed reason, or a dropped sanitizer step turns it red.
+#[cfg(all(test, feature = "handlers"))]
+mod persona_seal_gate {
+    use super::*;
+    use boatramp_core::cose::{LocalSigner, TokenAlg, mint_context};
+
+    fn now() -> u64 {
+        boatramp_core::time::now_unix()
+    }
+
+    #[tokio::test]
+    async fn resolve_sealed_principal_is_fail_closed_on_every_bad_seal() {
+        let signer = LocalSigner::generate(TokenAlg::Es256);
+        let anchor = signer.public_key();
+        // A valid, current seal → the host-verified {tenant, persona}.
+        let sealed = mint_context("acme", Some("Integration"), 300, now(), &signer)
+            .await
+            .unwrap();
+        let p = resolve_sealed_principal(Some(&sealed), Some(&anchor))
+            .expect("a valid seal resolves the principal");
+        assert_eq!(p.tenant, "acme");
+        assert_eq!(p.persona.as_deref(), Some("Integration"));
+        // Fail-closed #1 — ABSENT envelope (a producer that never presented a token).
+        assert!(resolve_sealed_principal(None, Some(&anchor)).is_none());
+        // Fail-closed #2 — NO fleet anchor wired ⇒ nothing can verify.
+        assert!(resolve_sealed_principal(Some(&sealed), None).is_none());
+        // Fail-closed #3 — EXPIRED (minted in 1970 with a 1s TTL vs the real wall clock).
+        let expired = mint_context("acme", Some("Integration"), 1, 1000, &signer)
+            .await
+            .unwrap();
+        assert!(
+            resolve_sealed_principal(Some(&expired), Some(&anchor)).is_none(),
+            "an expired seal must not resolve a persona"
+        );
+        // Fail-closed #4 — FORGED (a stranger's key never verifies the fleet signature).
+        let stranger = LocalSigner::generate(TokenAlg::Es256);
+        assert!(
+            resolve_sealed_principal(Some(&sealed), Some(&stranger.public_key())).is_none(),
+            "a seal not signed by the fleet anchor must not resolve"
+        );
+        // Fail-closed #5 — GARBAGE token.
+        assert!(resolve_sealed_principal(Some("not-a-cose-token"), Some(&anchor)).is_none());
+    }
+
+    #[tokio::test]
+    async fn classify_seal_distinguishes_every_terminal_reason() {
+        let signer = LocalSigner::generate(TokenAlg::Es256);
+        let anchor = signer.public_key();
+        let good = mint_context("acme", None, 300, now(), &signer).await.unwrap();
+        assert!(matches!(
+            classify_seal(Some(&good), Some(&anchor)),
+            SealOutcome::Verified
+        ));
+        // Missing — no envelope on a templated consumer (the producer didn't present a token).
+        assert!(matches!(
+            classify_seal(None, Some(&anchor)),
+            SealOutcome::Missing
+        ));
+        // Invalid — no anchor wired.
+        assert!(matches!(
+            classify_seal(Some(&good), None),
+            SealOutcome::Invalid
+        ));
+        // Invalid — forged (a stranger's signature).
+        let stranger = LocalSigner::generate(TokenAlg::Es256);
+        assert!(matches!(
+            classify_seal(Some(&good), Some(&stranger.public_key())),
+            SealOutcome::Invalid
+        ));
+        // Expired — the anti-hollow crux: a well-signed but stale seal is Expired, NOT Invalid, so the
+        // operator gets the honest "re-ingest from source" reason instead of a "forged" red herring.
+        let expired = mint_context("acme", None, 1, 1000, &signer).await.unwrap();
+        assert!(
+            matches!(classify_seal(Some(&expired), Some(&anchor)), SealOutcome::Expired),
+            "a well-signed past-TTL seal must classify as Expired, not Invalid"
+        );
+    }
+
+    #[test]
+    fn sanitize_dlq_detail_strips_injection_and_bounds() {
+        // Control chars (newline / CR / tab / NUL / ESC) are stripped — no DLQ-record or log-line
+        // injection from untrusted guest text.
+        let dirty = "denied: role\nInjected: FAKE\r\tvalue\u{0}\u{1b}[31m";
+        let clean = sanitize_dlq_detail(dirty);
+        assert!(!clean.contains('\n') && !clean.contains('\r') && !clean.contains('\t'));
+        assert!(!clean.contains('\u{0}') && !clean.contains('\u{1b}'));
+        // Content survives (collapsed to a single printable line).
+        assert!(clean.contains("denied: role"));
+        assert!(clean.contains("Injected: FAKE"));
+        // Bounded (defense-in-depth) at the engine cap.
+        let huge = "a ".repeat(boatramp_handlers::MAX_CONSUMER_ERROR_LEN);
+        assert!(sanitize_dlq_detail(&huge).len() <= boatramp_handlers::MAX_CONSUMER_ERROR_LEN);
+        // All-control input → empty (the caller then falls back to the bare host label).
+        assert!(sanitize_dlq_detail("\n\r\t\u{0}").is_empty());
+    }
+}
+
 /// The tenant-seal bind-verify **mutation seam** (anti-hollow gate). In a non-test build this is a
 /// hard `false` — the check is ALWAYS enforced in the shipped binary (there is no runtime toggle, so
 /// a production process can never be tricked into skipping it). In a `cfg(test)` build a THREAD-LOCAL
@@ -3095,8 +3199,8 @@ pub(super) async fn dispatch_consumer_batch(
                 // deliberately narrows the prior "never the guest's error text" rule to ONLY the
                 // clean-error case, keeping the host label authoritative as the greppable prefix.
                 if msg.attempts >= max_attempts {
-                    let reason = match &result {
-                        Err(boatramp_handlers::HandlerError::ConsumerError(detail)) => {
+                    let reason = match &err {
+                        boatramp_handlers::HandlerError::ConsumerError(detail) => {
                             let d = sanitize_dlq_detail(detail);
                             if d.is_empty() {
                                 outcome.as_str().to_string()

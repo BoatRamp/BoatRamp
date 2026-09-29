@@ -59,7 +59,8 @@ pub use bindings::tenant_secrets::{TenantSecretRefused, TenantSecretsBinding};
 pub use engine::SessionBatch;
 #[cfg(feature = "engine")]
 pub use engine::{
-    HandlerEngine, HandlerError, Lane, Limits, build_engine, build_engine_pooling, empty_body,
+    HandlerEngine, HandlerError, Lane, Limits, MAX_CONSUMER_ERROR_LEN, build_engine,
+    build_engine_pooling, empty_body,
 };
 #[cfg(feature = "engine")]
 pub use logging::{LogSink, LogStream};
