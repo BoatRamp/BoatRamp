@@ -169,6 +169,15 @@ mod imp {
             ("boatramp:handlers", "tenant-secrets" | "tenant-secrets-types") => {
                 Some("tenant-secrets")
             }
+            // The S3-compatible external blob-upload capability (PLAN-blob-s3-ingress). A component
+            // imports the single `blob-upload` interface (and `use`s `blob-upload-types`) and declares one
+            // or both INDEPENDENT rights (`blob-upload:write` / `blob-upload:multipart`); it maps to the
+            // `blob-upload` token here, and either declared `blob-upload:<right>` satisfies the import via
+            // the `token:`-prefix match above (`"blob-upload:write".strip_prefix("blob-upload")` ⇒
+            // `Some(":write")`, which `starts_with(':')`). Without this arm the interface mapped to `None`
+            // → "disallowed interface", so `capabilities --check`/`sync` refused any component using it —
+            // the construens presigned-ingress gap.
+            ("boatramp:handlers", "blob-upload" | "blob-upload-types") => Some("blob-upload"),
             _ => None,
         }
     }
@@ -589,6 +598,36 @@ mod imp {
             assert!(
                 check_interface_policy(&ts, &exports, &["email".into()], Role::Handler).is_err(),
                 "the `email` token must NOT satisfy tenant-secrets"
+            );
+        }
+
+        #[test]
+        fn policy_gates_blob_upload_by_either_declared_right() {
+            // PLAN-blob-s3-ingress + the construens presigned-ingress gap: a component importing the
+            // single `blob-upload` interface (and `use`ing `blob-upload-types`) must deploy via `sync`
+            // when it declares EITHER independent right (`blob-upload:write` or `blob-upload:multipart`)
+            // — both satisfy the `blob-upload` token via the `token:`-prefix match. Before the
+            // `capability_token` arm existed the interface mapped to `None` (disallowed), so `sync`/
+            // `capabilities --check` refused any component using it (the observed 502-root gap).
+            let exports = [lbl("wasi:http", "incoming-handler")];
+            let bu = [
+                lbl("boatramp:handlers", "blob-upload"),
+                lbl("boatramp:handlers", "blob-upload-types"),
+            ];
+            for right in ["blob-upload:write", "blob-upload:multipart"] {
+                assert!(
+                    check_interface_policy(&bu, &exports, &[right.into()], Role::Handler).is_ok(),
+                    "declaring `{right}` must satisfy the blob-upload import"
+                );
+            }
+            // Undeclared → refused, message names the `blob-upload` token.
+            let err = check_interface_policy(&bu, &exports, &[], Role::Handler).unwrap_err();
+            assert!(err.contains("`blob-upload`"), "{err}");
+            // A different capability's token does not satisfy the import.
+            assert!(
+                check_interface_policy(&bu, &exports, &["wasi:blobstore".into()], Role::Handler)
+                    .is_err(),
+                "the `wasi:blobstore` token must NOT satisfy blob-upload"
             );
         }
 
