@@ -309,6 +309,20 @@ pub fn host_capability_features_detailed() -> Vec<CapabilityFeature> {
             lifecycle: Experimental,
         });
     }
+    // The `blob-upload` capability (S3-compatible external blob ingress, PLAN-blob-s3-ingress): a guest
+    // mints a short-lived, scoped S3 upload credential (single-shot presigned PUT / resumable multipart)
+    // for one of its OWN project+site's blob containers — bytes upload DIRECTLY to the backing store,
+    // never transiting the sandbox. Cargo-gated on `blob-upload` (which pulls the binding + minters it
+    // rides); experimental until the shape settles. A guest declares `requires = ["blob-upload"]` (and the
+    // write/multipart right in `imports`); a deploy against a host without it is refused cleanly.
+    // Registering it here is what makes it appear in `boatramp capabilities` and pass `capabilities
+    // --check` — its ABSENCE was the construens presigned-ingress gap.
+    if cfg!(feature = "blob-upload") {
+        f.push(CapabilityFeature {
+            name: "blob-upload",
+            lifecycle: Experimental,
+        });
+    }
     if cfg!(feature = "orm-subquery") {
         // Correlated roll-ups ship off-by-default (the riskiest query surface) — experimental
         // until the shape settles.
