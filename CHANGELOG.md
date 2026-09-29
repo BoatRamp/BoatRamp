@@ -5,6 +5,25 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.7.5] - 2026-09-29
+
+Additive, non-breaking. Host-only blob-read fix.
+
+### Fixed
+
+- **Whole-object blob reads no longer 404 on strict S3-compatible backends (Tigris/R2/MinIO).** A guest
+  reads a whole object via `wasi:blobstore` `get-data(0, u64::MAX)` ("the host clamps the range to its
+  size"), but the S3 backend forged an out-of-range `Range: bytes=0-18446744073709551614`. AWS S3
+  tolerates that (returns the object); **Tigris/R2/MinIO reject it with `416 InvalidRange`**, so every
+  full-object read failed and the storefront served no images. The backend now honours the clamp
+  contract: a whole-object read from offset 0 carries **no `Range` header** (a plain `GetObject`,
+  a guaranteed 200 on every backend), a to-end read from a non-zero offset uses the RFC-7233 open-ended
+  `bytes={offset}-`, and a bounded partial read keeps its exact `bytes={start}-{end}`. The
+  `get-data(_, u64::MAX)` whole-object sentinel is mapped to a to-end read before it reaches any
+  backend, and the gcs/azure range paths were hardened against the same out-of-range/overflow class.
+  (This is the true cause of the earlier "blob read 404" — surfaced by v0.7.4's new host-side blob
+  logging; it was a range bug, not a credential-scope issue.)
+
 ## [0.7.4] - 2026-09-29
 
 Additive, non-breaking. Three fixes in the S3-blob / operator-surface area (two from construens bug
