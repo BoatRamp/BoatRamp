@@ -437,6 +437,27 @@ jobs:
           grep -qE 'test result: ok\. 2 passed' wal-a3.log \
             || { echo "::error::A2-cluster / A3 close-ordering+deadline gates did not pass" >&2; exit 1; }
 
+      # Async-lane persona propagation gate battery (v0.7.3, PLAN-async-persona). Mutation-verified
+      # named tests (robust exit-code contract — no marker/grep-loop): the persona seal round-trips +
+      # is bound to the SAME envelope as the tenant + TTL/forge/over-cap fail-closed (cose); the host
+      # resolver is fail-closed on every absent/expired/forged/anchorless/garbage seal, the terminal
+      # -outcome taxonomy distinguishes an EXPIRED seal from a forged one (the operator's "re-ingest"
+      # signal), and the UNTRUSTED guest DLQ text is injection-sanitized + bounded (handler_dispatch);
+      # and persona extraction takes only a SINGLE scalar (no multi-role widening). A fail-closed→open
+      # flip, a reason-collapse, or a dropped sanitizer step turns one of these red.
+      - name: async-lane persona propagation gates (host toolchain)
+        run: |
+          set -eo pipefail
+          cargo test -p boatramp-core --features authz --lib \
+            signed_context_persona_round_trips_and_is_bound_to_the_same_envelope 2>&1 | tee persona-cose.log
+          grep -qE 'test result: ok\. 1 passed' persona-cose.log \
+            || { echo "::error::persona seal round-trip / envelope-bound / fail-closed gate did not pass" >&2; exit 1; }
+          cargo test -p boatramp-server --features handlers,oidc --lib -- \
+            persona_seal_gate:: \
+            persona_from_claims_takes_only_a_single_scalar_role 2>&1 | tee persona-host.log
+          grep -qE 'test result: ok\. 4 passed' persona-host.log \
+            || { echo "::error::async-lane persona host gates (fail-closed resolver / taxonomy / sanitizer / single-scalar) did not pass" >&2; exit 1; }
+
   # Stage 0 in-site tenant isolation HARD GATE. The ORM/`sql` tenant scope must isolate tenants
   # on a REAL SQL engine (embedded libsql), not merely in the compiler's string output. The test
   # is `sql`-feature-gated, so the workspace lane (which enables only `boatramp/fs,slatedb`) would
