@@ -458,6 +458,43 @@ jobs:
           grep -qE 'test result: ok\. 4 passed' persona-host.log \
             || { echo "::error::async-lane persona host gates (fail-closed resolver / taxonomy / sanitizer / single-scalar) did not pass" >&2; exit 1; }
 
+      # v0.7.4 bundle gates (host toolchain, exit-code contract — no marker/grep-loop): the version
+      # endpoint is operator-gated (never public); the blob-upload capability is advertised + grantable
+      # and its presigned-only no-STS mint works while prefix/multipart is refused; and a blob-read
+      # backend fault is no longer masked as a silent 404. Each is mutation-verified in its own test.
+      - name: v0.7.4 version + blob-upload + blob-read-404 gates
+        run: |
+          set -eo pipefail
+          # Version endpoint: operator-only (system·read), never the unauthenticated public path.
+          cargo test -p boatramp-types --lib version_endpoint_is_operator_read_gated 2>&1 | tee v-authz.log
+          grep -qE 'test result: ok\. 1 passed' v-authz.log \
+            || { echo "::error::version endpoint operator-gating gate did not pass" >&2; exit 1; }
+          # The `version` subcommand coexists with clap's `--version` flag (tree is structurally valid).
+          cargo test -p boatramp --bin boatramp cli_tree_is_valid 2>&1 | tee v-cli.log
+          grep -qE 'test result: ok\. 1 passed' v-cli.log \
+            || { echo "::error::CLI tree / version-subcommand gate did not pass" >&2; exit 1; }
+          # blob-upload capability advertised iff compiled (the construens capabilities-omission gap).
+          cargo test -p boatramp-server --features handlers,blob-upload --lib \
+            host_capability_features_registry_and_requires_filter 2>&1 | tee bu-reg.log
+          grep -qE 'test result: ok\. 1 passed' bu-reg.log \
+            || { echo "::error::blob-upload capability-registry gate did not pass" >&2; exit 1; }
+          # A declared blob-upload:write/:multipart satisfies the capability token; undeclared refused.
+          cargo test -p boatramp --bin boatramp policy_gates_blob_upload_by_either_declared_right 2>&1 | tee bu-tok.log
+          grep -qE 'test result: ok\. 1 passed' bu-tok.log \
+            || { echo "::error::blob-upload capability-token gate did not pass" >&2; exit 1; }
+          # Presigned-only no-STS mint: single-object presigned PUT works with NO STS; prefix/multipart
+          # refused; presigned_only mutually exclusive with the STS knobs; unset config still errs loud.
+          cargo test -p boatramp-server --features blob-upload-aws --lib -- \
+            presigned_only no_sts_mode 2>&1 | tee bu-nosts.log
+          grep -qE 'test result: ok\. 5 passed' bu-nosts.log \
+            || { echo "::error::blob-upload presigned no-STS mode gates did not pass" >&2; exit 1; }
+          # blob-read: a backend/permission fault is logged + coarse-categorized, NOT a silent 404, and
+          # the raw SDK error never reaches the guest (the construens blob-read-404 masking trap).
+          cargo test -p boatramp-handlers --features engine --lib \
+            blob_err_masks_a_backend_fault_but_preserves_notfound 2>&1 | tee blobread.log
+          grep -qE 'test result: ok\. 1 passed' blobread.log \
+            || { echo "::error::blob-read fault-masking gate did not pass" >&2; exit 1; }
+
   # Stage 0 in-site tenant isolation HARD GATE. The ORM/`sql` tenant scope must isolate tenants
   # on a REAL SQL engine (embedded libsql), not merely in the compiler's string output. The test
   # is `sql`-feature-gated, so the workspace lane (which enables only `boatramp/fs,slatedb`) would
