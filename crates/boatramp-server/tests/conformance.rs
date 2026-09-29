@@ -8958,6 +8958,7 @@ async fn graphql_data_connector_isolates_by_a_verified_app_token_claim() {
             jwks_env: Some("TEST_GQL_MT_JWKS".into()),
             jwks_url: None,
             audience: None,
+            token_persona_claim: None,
         }),
         tables: BTreeMap::from([
             (

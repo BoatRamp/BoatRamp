@@ -38,6 +38,14 @@ const CLAIM_PUBKEY: &str = "br_pubkey";
 const CLAIM_SID: &str = "br_sid";
 /// Text claim key for a durable signed-context envelope's carried own-tenant value (R1).
 const CLAIM_CTX: &str = "br_ctx";
+/// Text claim key for a durable signed-context envelope's carried caller **persona/role** (the async
+/// -lane RBAC propagation, PLAN-async-persona). A SINGLE bounded text value (never an array/set) —
+/// the host-verified value of the producer bearer's operator-configured `token_persona_claim`, sealed
+/// into the SAME `COSE_Sign1` as `br_ctx` so it is bound to the same signature/expiry/tenant. Read
+/// back by [`verify_context_full`]; a hostile/corrupt/oversized/non-text value is dropped (persona
+/// `None`), never a panic. Absent when no persona was configured (unchanged for every existing
+/// producer).
+const CLAIM_PERSONA: &str = "br_persona";
 /// The public-subset name a target-capability envelope grants (5c) — binds the capability to a
 /// specific declared `PublicSubset`, so a capability minted for one subset can't reach another.
 const CLAIM_PUB: &str = "br_pub";
@@ -55,6 +63,13 @@ const CLAIM_S3: &str = "br_s3";
 /// keys+values may total at most this many bytes. Enforced at mint so a guest can't inflate a token.
 const MAX_APP_CONTEXT_ENTRIES: usize = 16;
 const MAX_APP_CONTEXT_BYTES: usize = 4096;
+
+/// Tight bound on the sealed `br_persona` value (bytes). A persona is a single RBAC role name (an
+/// enum on the trusting app's side, e.g. `Integration`/`Staff`), so a small cap suffices; a value
+/// longer than this on a verified envelope is treated as corrupt/hostile and dropped (persona
+/// `None`), never truncated (a truncated role could match a different role). Enforced at BOTH mint
+/// (refuse) and verify (drop) — defense in depth, mirroring the app-context bounds.
+const MAX_PERSONA_LEN: usize = 128;
 
 /// Token kind: an RBAC role-bearing control-plane token (the `/api/*` bearer).
 pub const KIND_ROLE: &str = "role";
@@ -910,18 +925,41 @@ pub fn verify_session(
     sid.ok_or_else(|| TokenError::Claims("session cookie has no sid".into()))
 }
 
+/// The fully-verified contents of a durable signed-context envelope (R1 + async-lane persona,
+/// PLAN-async-persona): the host-sealed own-tenant AND (optionally) the host-verified caller persona,
+/// both bound to the SAME `COSE_Sign1` signature/expiry. Returned by [`verify_context_full`]; the
+/// tenant-only [`verify_context`] projects out just [`VerifiedContext::tenant`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedContext {
+    /// The producer's host-sealed own-tenant (`br_ctx`) — the value every existing caller reads.
+    pub tenant: String,
+    /// The producer bearer's host-verified persona/role (`br_persona`), sealed only when the operator
+    /// configured `token_persona_claim` at seal time. `None` when no persona was sealed OR when the
+    /// carried value was corrupt/oversized/non-text (dropped fail-closed — the async-lane `role(…)`
+    /// guard then refuses, unchanged from before this feature). A single scalar, never a set.
+    pub persona: Option<String>,
+}
+
 /// Mint a **durable signed-context** envelope (R1): a `COSE_Sign1` CWT with `br_kind = "context"`,
 /// the producer's resolved own-tenant value bound as `br_ctx`, `iat = now`, `exp = now + ttl_secs`,
 /// signed by the fleet `Signer`. The host stamps this onto a durable message / cron / async invoke
 /// so the async lane resolves a verified "own" tenant. Verified with [`verify_context`]; a
 /// forged/unsigned tenant never verifies (the guest never names the tenant — the host does).
+///
+/// When `persona` is `Some`, a single bounded `br_persona` text claim (the host-verified caller
+/// role from the producer bearer's operator-configured `token_persona_claim`) is sealed into the
+/// SAME claim set — bound to the same signature/expiry/tenant — for the async-lane `role(…)`
+/// propagation (PLAN-async-persona). A value longer than [`MAX_PERSONA_LEN`] is refused at mint
+/// (`TokenError::Claims`) rather than truncated. `None` seals no persona (unchanged for every
+/// existing producer). Read back via [`verify_context_full`].
 pub async fn mint_context(
     tenant: &str,
+    persona: Option<&str>,
     ttl_secs: u64,
     now_unix: u64,
     signer: &dyn Signer,
 ) -> Result<String, TokenError> {
-    let claims = ClaimsSetBuilder::new()
+    let mut builder = ClaimsSetBuilder::new()
         .issued_at(Timestamp::WholeSeconds(now_unix as i64))
         .cwt_id(random_cti()?)
         .expiration_time(Timestamp::WholeSeconds(
@@ -931,29 +969,47 @@ pub async fn mint_context(
             CLAIM_KIND.to_string(),
             CborValue::Text(KIND_CONTEXT.to_string()),
         )
-        .text_claim(CLAIM_CTX.to_string(), CborValue::Text(tenant.to_string()))
-        .build();
-    sign_claims(claims, signer).await
+        .text_claim(CLAIM_CTX.to_string(), CborValue::Text(tenant.to_string()));
+    // A single, bounded persona value only. Refuse (never truncate) an over-length value — a
+    // truncated role name could collide with a different role on the trusting side (Security C5).
+    if let Some(persona) = persona {
+        if persona.len() > MAX_PERSONA_LEN {
+            return Err(TokenError::Claims(format!(
+                "context persona exceeds {MAX_PERSONA_LEN} bytes"
+            )));
+        }
+        builder = builder.text_claim(
+            CLAIM_PERSONA.to_string(),
+            CborValue::Text(persona.to_string()),
+        );
+    }
+    sign_claims(builder.build(), signer).await
 }
 
-/// Verify a durable signed-context envelope against the fleet public key at `now_unix`: checks the
-/// COSE signature, the expiry, and `br_kind == "context"`, then returns the carried own-tenant
-/// value. Any tampering (a forged tenant, an altered/expired envelope, a wrong kind) fails closed —
-/// the async consumer then resolves no `SignedContext` fact and an "own" op fails closed.
-pub fn verify_context(
+/// Shared inner verify for a durable signed-context envelope: checks the COSE signature, the expiry,
+/// and `br_kind == "context"`, then returns the carried tenant + (optionally) the bounded persona.
+/// Both [`verify_context`] (tenant-only) and [`verify_context_full`] project from this so the
+/// verify/expiry/kind checks are identical. The persona is read defensively — a single bounded text
+/// claim, else dropped (never a panic on a hostile/corrupt token), mirroring `cbor_to_app_context`.
+fn verify_context_inner(
     token: &str,
     public: &TokenPublicKey,
     now_unix: u64,
-) -> Result<String, TokenError> {
+) -> Result<VerifiedContext, TokenError> {
     let claims = verify_envelope(token, public)?;
     check_exp(&claims, now_unix)?;
     let mut kind = None;
     let mut ctx = None;
+    let mut persona = None;
     for (name, value) in &claims.rest {
         if let (coset::cwt::ClaimName::Text(t), CborValue::Text(v)) = (name, value) {
             match t.as_str() {
                 CLAIM_KIND => kind = Some(v.clone()),
                 CLAIM_CTX => ctx = Some(v.clone()),
+                // Bounded, non-panicking: accept the persona ONLY if it is a single text value within
+                // the cap. A non-text or oversized value is silently dropped (persona `None`) — a
+                // corrupt/hostile envelope must never truncate a role or panic (Security C5).
+                CLAIM_PERSONA if v.len() <= MAX_PERSONA_LEN => persona = Some(v.clone()),
                 _ => {}
             }
         }
@@ -961,7 +1017,35 @@ pub fn verify_context(
     if kind.as_deref() != Some(KIND_CONTEXT) {
         return Err(TokenError::Claims("not a signed-context envelope".into()));
     }
-    ctx.ok_or_else(|| TokenError::Claims("signed context has no tenant".into()))
+    let tenant = ctx.ok_or_else(|| TokenError::Claims("signed context has no tenant".into()))?;
+    Ok(VerifiedContext { tenant, persona })
+}
+
+/// Verify a durable signed-context envelope against the fleet public key at `now_unix`: checks the
+/// COSE signature, the expiry, and `br_kind == "context"`, then returns the carried own-tenant
+/// value. Any tampering (a forged tenant, an altered/expired envelope, a wrong kind) fails closed —
+/// the async consumer then resolves no `SignedContext` fact and an "own" op fails closed. The
+/// (8+) tenant-only callers keep this signature; a consumer needing the persona uses
+/// [`verify_context_full`].
+pub fn verify_context(
+    token: &str,
+    public: &TokenPublicKey,
+    now_unix: u64,
+) -> Result<String, TokenError> {
+    verify_context_inner(token, public, now_unix).map(|v| v.tenant)
+}
+
+/// Verify a durable signed-context envelope and return BOTH the sealed own-tenant and the
+/// host-verified caller persona (PLAN-async-persona). Same signature/expiry/kind checks as
+/// [`verify_context`] — the persona rides in the SAME envelope, so it is bound to the same verified
+/// tenant (no separate expiry, no cross-tenant persona). `persona` is `None` when none was sealed
+/// or the carried value was corrupt/oversized/non-text (dropped fail-closed).
+pub fn verify_context_full(
+    token: &str,
+    public: &TokenPublicKey,
+    now_unix: u64,
+) -> Result<VerifiedContext, TokenError> {
+    verify_context_inner(token, public, now_unix)
 }
 
 /// The grant a verified [`KIND_CAPABILITY`] envelope carries: the target tenant `B` and the public
@@ -1943,7 +2027,7 @@ mod tests {
         let signer = LocalSigner::generate(TokenAlg::Es256);
         let pubkey = signer.public_key();
         // Mint at t=1000, ttl 300 ⇒ exp 1300. Round-trip returns the carried tenant within the window.
-        let ctx = mint_context("acme", 300, 1000, &signer).await.unwrap();
+        let ctx = mint_context("acme", None, 300, 1000, &signer).await.unwrap();
         assert_eq!(verify_context(&ctx, &pubkey, 1000).unwrap(), "acme");
         assert_eq!(verify_context(&ctx, &pubkey, 1200).unwrap(), "acme");
         // Expired ⇒ refused (a stale replayed envelope drops out; the async op fails closed).
@@ -1955,6 +2039,49 @@ mod tests {
         let cookie = mint_session("sid-1", 300, 1000, &signer).await.unwrap();
         assert!(verify_context(&cookie, &pubkey, 1000).is_err());
         assert!(verify_session(&ctx, &pubkey, 1000).is_err());
+    }
+
+    #[tokio::test]
+    async fn signed_context_persona_round_trips_and_is_bound_to_the_same_envelope() {
+        let signer = LocalSigner::generate(TokenAlg::Es256);
+        let pubkey = signer.public_key();
+        // No persona configured ⇒ the envelope seals none (unchanged for every existing producer).
+        let plain = mint_context("acme", None, 300, 1000, &signer).await.unwrap();
+        let v = verify_context_full(&plain, &pubkey, 1000).unwrap();
+        assert_eq!(v.tenant, "acme");
+        assert_eq!(v.persona, None, "no persona sealed when none configured");
+        // With a persona: both the tenant and the persona round-trip, bound to the SAME envelope.
+        let sealed = mint_context("acme", Some("Integration"), 300, 1000, &signer)
+            .await
+            .unwrap();
+        let v = verify_context_full(&sealed, &pubkey, 1000).unwrap();
+        assert_eq!(v.tenant, "acme");
+        assert_eq!(v.persona.as_deref(), Some("Integration"));
+        // The tenant-only `verify_context` projects out just the tenant (the 8+ existing callers).
+        assert_eq!(verify_context(&sealed, &pubkey, 1000).unwrap(), "acme");
+        // The persona shares the envelope's TTL: past exp ⇒ the whole envelope fails closed (the
+        // async-lane `role(…)` then refuses — same as the tenant today).
+        assert!(verify_context_full(&sealed, &pubkey, 2000).is_err());
+        // A forged persona fails the signature (a stranger's key never verifies).
+        let stranger = LocalSigner::generate(TokenAlg::Es256);
+        assert!(verify_context_full(&sealed, &stranger.public_key(), 1000).is_err());
+        // Bound (non-panicking): an over-length persona is REFUSED at mint (never truncated — a
+        // truncated role could collide with a different role).
+        let too_long = "x".repeat(MAX_PERSONA_LEN + 1);
+        assert!(
+            mint_context("acme", Some(&too_long), 300, 1000, &signer)
+                .await
+                .is_err()
+        );
+        // At the cap it seals fine.
+        let at_cap = "y".repeat(MAX_PERSONA_LEN);
+        let ok = mint_context("acme", Some(&at_cap), 300, 1000, &signer)
+            .await
+            .unwrap();
+        assert_eq!(
+            verify_context_full(&ok, &pubkey, 1000).unwrap().persona,
+            Some(at_cap)
+        );
     }
 
     #[tokio::test]
@@ -1988,7 +2115,9 @@ mod tests {
         assert!(verify_capability(&cap, &stranger.public_key(), 1000, "shop").is_err());
         // Cross-kind confusion: a signed context is NOT a capability, and a capability is NOT a
         // context (so a capability can never be redeemed as an own-tenant fact and vice-versa).
-        let ctx = mint_context("tenant_B", 300, 1000, &signer).await.unwrap();
+        let ctx = mint_context("tenant_B", None, 300, 1000, &signer)
+            .await
+            .unwrap();
         assert!(verify_capability(&ctx, &pubkey, 1000, "shop").is_err());
         assert!(verify_context(&cap, &pubkey, 1000).is_err());
     }
@@ -2798,7 +2927,9 @@ mod tests {
             verify_s3_session(&sess, &public, NOW + 1),
             Err(TokenError::Claims(_)),
         ));
-        let ctx = mint_context("tenant-a", 300, NOW, &signer).await.unwrap();
+        let ctx = mint_context("tenant-a", None, 300, NOW, &signer)
+            .await
+            .unwrap();
         assert!(matches!(
             verify_s3_session(&ctx, &public, NOW + 1),
             Err(TokenError::Claims(_)),
