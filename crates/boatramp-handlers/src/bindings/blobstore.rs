@@ -167,7 +167,7 @@ fn once_stream(bytes: Bytes) -> ByteStream {
 async fn collect(mut body: ByteStream, max: u64) -> Result<Vec<u8>, String> {
     let mut buf = Vec::new();
     while let Some(chunk) = body.next().await {
-        buf.extend_from_slice(&chunk.map_err(estr)?);
+        buf.extend_from_slice(&chunk.map_err(|e| blob_err("read-stream", "", e))?);
         if max != 0 && buf.len() as u64 > max {
             return Err(format!("object exceeds the {max}-byte host blob limit"));
         }
@@ -410,7 +410,10 @@ impl blobstore::container::HostContainer for BlobHost<'_> {
             container.object_key(&name),
             container.name.clone(),
         );
-        let meta = storage.head(&key).await.map_err(estr)?;
+        let meta = storage
+            .head(&key)
+            .await
+            .map_err(|e| blob_err("head", &key, e))?;
         Ok(blobstore::types::ObjectMetadata {
             name,
             container: cname,
@@ -424,11 +427,18 @@ impl blobstore::container::HostContainer for BlobHost<'_> {
         let container = self.table.get(&this).map_err(estr)?;
         let (storage, prefix) = (container.storage.clone(), container.prefix.clone());
         // Delete every object but keep the marker, so the container still exists.
-        for meta in storage.list(&prefix).await.map_err(estr)? {
+        for meta in storage
+            .list(&prefix)
+            .await
+            .map_err(|e| blob_err("list", &prefix, e))?
+        {
             if meta.key.strip_prefix(&prefix) == Some(MARKER) {
                 continue;
             }
-            storage.delete(&meta.key).await.map_err(estr)?;
+            storage
+                .delete(&meta.key)
+                .await
+                .map_err(|e| blob_err("delete", &meta.key, e))?;
         }
         Ok(())
     }
@@ -483,7 +493,7 @@ impl blobstore::blobstore::Host for BlobHost<'_> {
                 PutMeta::default(),
             )
             .await
-            .map_err(estr)?;
+            .map_err(|e| blob_err("put", &format!("{prefix}{MARKER}"), e))?;
         self.table
             .push(Container {
                 storage,
@@ -511,8 +521,15 @@ impl blobstore::blobstore::Host for BlobHost<'_> {
     async fn delete_container(&mut self, name: String) -> Result<(), String> {
         let prefix = self.container_prefix(&name)?;
         let storage = self.storage()?;
-        for meta in storage.list(&prefix).await.map_err(estr)? {
-            storage.delete(&meta.key).await.map_err(estr)?;
+        for meta in storage
+            .list(&prefix)
+            .await
+            .map_err(|e| blob_err("list", &prefix, e))?
+        {
+            storage
+                .delete(&meta.key)
+                .await
+                .map_err(|e| blob_err("delete", &meta.key, e))?;
         }
         Ok(())
     }
@@ -534,7 +551,10 @@ impl blobstore::blobstore::Host for BlobHost<'_> {
         if !marker_exists(&*storage, &dest_prefix).await? {
             return Err(format!("no such container: {}", dest.container));
         }
-        let object = storage.get(&src_key).await.map_err(estr)?;
+        let object = storage
+            .get(&src_key)
+            .await
+            .map_err(|e| blob_err("get", &src_key, e))?;
         let bytes = collect(object.body, self.max_bytes()).await?;
         storage
             .put(
@@ -543,7 +563,7 @@ impl blobstore::blobstore::Host for BlobHost<'_> {
                 PutMeta::default(),
             )
             .await
-            .map_err(estr)?;
+            .map_err(|e| blob_err("put", &format!("{dest_prefix}{}", dest.object), e))?;
         Ok(())
     }
 
@@ -555,7 +575,10 @@ impl blobstore::blobstore::Host for BlobHost<'_> {
         self.copy_object(src.clone(), dest).await?;
         let storage = self.storage()?;
         let src_key = format!("{}{}", self.container_prefix(&src.container)?, src.object);
-        storage.delete(&src_key).await.map_err(estr)
+        storage
+            .delete(&src_key)
+            .await
+            .map_err(|e| blob_err("delete", &src_key, e))
     }
 }
 
