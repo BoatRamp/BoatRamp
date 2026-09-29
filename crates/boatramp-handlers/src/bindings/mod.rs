@@ -126,6 +126,15 @@ pub struct Bindings {
     /// the producer-context cell. `None` = not granted (`present-token` ⇒ `access-denied`).
     #[cfg(feature = "messaging")]
     tenancy_present: Option<tenancy::TenancyBinding>,
+    /// The host-verified **sealed principal** for THIS invocation (PLAN-async-persona): the
+    /// `{tenant, persona}` the host verified from the durable `signed_context` envelope, exposed to
+    /// the guest via the read-only `sealed-principal()` import. Set ONLY on the consumer / durable
+    /// async lane (where a verified seal exists) and propagated onto a `graphql::run` sub-fetch
+    /// alongside the caller tenant. `None` = the sync/HTTP lane or a seal-less/invalid message ⇒
+    /// `sealed-principal()` returns `none`. NEVER guest-supplied. Independent of the `present-token`
+    /// grant above (this is a pure read of the host-verified seal).
+    #[cfg(feature = "messaging")]
+    sealed_principal: Option<tenancy::SealedPrincipal>,
     /// The read-only `messaging-stats` grant: read per-topic bus gauges (dead-letter, backlog,
     /// in-flight, per-group depth). Bus topics are addressed through a host-filled `{tenant}` template,
     /// so the guest never names a tenant. `None` = not granted (every stats call ⇒ `access-denied`).
@@ -543,6 +552,23 @@ impl Bindings {
     #[cfg(feature = "messaging")]
     pub(crate) fn tenancy_present(&self) -> Option<&tenancy::TenancyBinding> {
         self.tenancy_present.as_ref()
+    }
+
+    /// Set the host-verified sealed principal for this invocation (PLAN-async-persona) — the
+    /// `{tenant, persona}` the host verified from a durable `signed_context` envelope. Called ONLY on
+    /// the consumer / durable async lane (and carried onto a `graphql::run` sub-fetch); the guest
+    /// `sealed-principal()` import returns it verbatim. Never set from guest input.
+    #[cfg(feature = "messaging")]
+    pub fn with_sealed_principal(mut self, principal: tenancy::SealedPrincipal) -> Self {
+        self.sealed_principal = Some(principal);
+        self
+    }
+
+    /// The host-verified sealed principal for this invocation, if any (the read backing the
+    /// `sealed-principal()` import). `None` on the sync/HTTP lane or a seal-less message.
+    #[cfg(feature = "messaging")]
+    pub(crate) fn sealed_principal(&self) -> Option<&tenancy::SealedPrincipal> {
+        self.sealed_principal.as_ref()
     }
 
     /// Grant the read-only `messaging-stats` capability: read per-topic bus gauges from `messaging`.

@@ -185,6 +185,14 @@ pub enum HandlerError {
     /// The guest trapped (panic, unreachable, bad host call).
     #[error("handler trapped: {0}")]
     Trap(String),
+    /// A **consumer returned a clean `Err`** (not a trap): the guest's `handle` completed and
+    /// returned an error value — a downstream denial/validation failure, NOT a crash. Distinguished
+    /// from [`Trap`](Self::Trap) so a dead-letter reads `consumer-error`, not the opaque `trap` a real
+    /// panic yields (PLAN-async-persona legible-terminal-outcome taxonomy). The carried string is the
+    /// guest's returned error text — treated as UNTRUSTED (bounded, never structured-log-interpolated
+    /// by the host; the DLQ layer sanitizes it before it reaches an operator).
+    #[error("consumer returned an error")]
+    ConsumerError(String),
     /// The guest exceeded its wall-clock budget.
     #[error("handler timed out")]
     Timeout,
@@ -971,9 +979,11 @@ impl HandlerEngine {
             .await;
         match result {
             Ok(Ok(())) => Ok(()),
-            Ok(Err(err)) => Err(HandlerError::Trap(format!(
-                "consumer returned error: {err:?}"
-            ))),
+            // A CLEAN guest `Err` (the consumer's `handle` returned an error value) — distinct from a
+            // wasm trap. Carry the guest's error string so the dead-letter is legible as a downstream
+            // denial (`consumer-error`), not the opaque `trap` a real panic yields. The string is
+            // untrusted guest text; the DLQ layer sanitizes it before an operator sees it.
+            Ok(Err(err)) => Err(HandlerError::ConsumerError(format!("{err:?}"))),
             Err(trap) => Err(classify(&trap)),
         }
     }
@@ -1100,7 +1110,10 @@ impl HandlerEngine {
         })?;
         #[cfg(feature = "messaging")]
         bindings::tenancy::add_to_linker(&mut linker, |state: &mut HostState| {
-            bindings::tenancy::TenancyHost::new(state.bindings.tenancy_present())
+            bindings::tenancy::TenancyHost::new(
+                state.bindings.tenancy_present(),
+                state.bindings.sealed_principal(),
+            )
         })?;
         #[cfg(feature = "messaging")]
         bindings::messaging_stats::add_to_linker(&mut linker, |state: &mut HostState| {
