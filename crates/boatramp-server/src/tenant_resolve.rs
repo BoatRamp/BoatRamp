@@ -544,9 +544,15 @@ mod tests {
 
         // A forged envelope (signed by a stranger) resolves NO tenant fact — fail closed.
         let stranger = LocalSigner::generate(TokenAlg::Es256);
-        let forged = mint_context("evil", None, 3600, boatramp_core::time::now_unix(), &stranger)
-            .await
-            .unwrap();
+        let forged = mint_context(
+            "evil",
+            None,
+            3600,
+            boatramp_core::time::now_unix(),
+            &stranger,
+        )
+        .await
+        .unwrap();
         let inputs = TenantSourceInputs {
             signed_context: Some(&forged),
             context_anchor: Some(&anchor),

@@ -1294,7 +1294,9 @@ async fn orm_durable_signed_context_isolates_on_a_real_engine() {
     );
 
     // 3) FORGED: a stranger-signed envelope fails verification ⇒ the consumer recovers NO tenant.
-    let forged = mint_context("globex", None, 3600, now, &stranger).await.unwrap();
+    let forged = mint_context("globex", None, 3600, now, &stranger)
+        .await
+        .unwrap();
     mq.publish_ctx("jobs-forged", b"job", Some(&forged))
         .await
         .unwrap();

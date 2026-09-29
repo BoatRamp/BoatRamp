@@ -5921,12 +5921,11 @@ mod tests {
         rt.set_invoker(deploy.clone());
         let inner = rt.inner.as_ref().unwrap();
         let router = crate::graphql_gateway::BackendRouter::new(
-            inner
-                .invoker
-                .get()
-                .unwrap()
-                .clone()
-                .scoped(ProjectRef::new("default"), Vec::new(), None),
+            inner.invoker.get().unwrap().clone().scoped(
+                ProjectRef::new("default"),
+                Vec::new(),
+                None,
+            ),
             "default".to_string(),
             inner.sql.clone(),
             std::collections::BTreeMap::new(),
@@ -7453,9 +7452,15 @@ mod tests {
 
         // (4) EXPIRED: a valid fleet signature whose envelope has already expired → NO principal →
         // fail closed (a stale producer stamp can never keep scoping the consumer past its TTL).
-        let expired = mint_context("acme", None, 3600, now.saturating_sub(7200), signer.as_ref())
-            .await
-            .unwrap();
+        let expired = mint_context(
+            "acme",
+            None,
+            3600,
+            now.saturating_sub(7200),
+            signer.as_ref(),
+        )
+        .await
+        .unwrap();
         let expired_b = rebuild.bindings_for(Some(&expired)).await.unwrap();
         let ht = expired_b
             .resolved_tenancy()
