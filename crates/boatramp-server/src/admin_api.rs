@@ -663,10 +663,11 @@ pub(super) async fn put_graphql_function_subgraph(
             .into_response();
     };
     // Introspect anonymously, scoped to the project (an invoke never crosses tenants); no in-site
-    // tenant to propagate for an anonymous SDL fetch.
+    // tenant and no sealed principal to propagate for an anonymous SDL fetch (PLAN-async-persona).
     let scoped = invoker.scoped(
         boatramp_core::project::ProjectRef::new(&project.0),
         Vec::new(),
+        None,
     );
     let sdl = match introspect_function_sdl(scoped.as_ref(), &name).await {
         Ok(sdl) => sdl,

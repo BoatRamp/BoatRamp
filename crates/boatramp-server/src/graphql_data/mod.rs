@@ -187,6 +187,7 @@ mod tests {
                 jwks_env: Some("TEST_GQL_IDP_JWKS_1".into()),
                 jwks_url: None,
                 audience: None,
+                token_persona_claim: None,
             }),
             ..Default::default()
         };

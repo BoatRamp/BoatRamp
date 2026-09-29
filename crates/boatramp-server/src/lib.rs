@@ -4351,6 +4351,7 @@ mod tests {
     async fn seal_ctx(signer: &Arc<dyn Signer>, tenant: &str) -> String {
         boatramp_core::cose::mint_context(
             tenant,
+            None,
             3600,
             boatramp_core::time::now_unix(),
             signer.as_ref(),
@@ -5239,7 +5240,7 @@ mod tests {
             .federation_runner
             .get()
             .unwrap()
-            .scoped(ProjectRef::new("default"), Vec::new());
+            .scoped(ProjectRef::new("default"), Vec::new(), None);
 
         let req = |query: &str| GraphqlRequest {
             query: Some(query.to_string()),
@@ -5418,6 +5419,7 @@ mod tests {
                 axis: ScopeAxis::Tenant,
                 value: SqlValue::Text("tenant_B".into()),
             }],
+            None,
         );
         let body_b = String::from_utf8_lossy(&runner_b.run(req(), 0).await.unwrap()).into_owned();
         assert!(
@@ -5427,7 +5429,7 @@ mod tests {
 
         // (2) Control: run with NO principal → the subgraph's own read fails closed → no rows leak
         // (the pre-v0.4.6 behavior for the empty-caller_tenant path).
-        let runner_empty = fed.scoped(ProjectRef::new("default"), Vec::new());
+        let runner_empty = fed.scoped(ProjectRef::new("default"), Vec::new(), None);
         let body_none =
             String::from_utf8_lossy(&runner_empty.run(req(), 0).await.unwrap()).into_owned();
         assert!(
@@ -5588,7 +5590,7 @@ mod tests {
 
         let make_router = |domain: Option<&str>| {
             crate::graphql_gateway::BackendRouter::new(
-                invoker.scoped(ProjectRef::new("default"), Vec::new()),
+                invoker.scoped(ProjectRef::new("default"), Vec::new(), None),
                 "default".to_string(),
                 inner.sql.clone(),
                 std::collections::BTreeMap::new(),
@@ -5744,7 +5746,7 @@ mod tests {
         // scoped to the caller's OWN principal (v0.4.11 — previously `Vec::new()`).
         let make_router = |facts: Vec<ScopeFact>| {
             crate::graphql_gateway::BackendRouter::new(
-                invoker.scoped(ProjectRef::new("default"), facts),
+                invoker.scoped(ProjectRef::new("default"), facts, None),
                 "default".to_string(),
                 inner.sql.clone(),
                 std::collections::BTreeMap::new(),
@@ -5924,7 +5926,7 @@ mod tests {
                 .get()
                 .unwrap()
                 .clone()
-                .scoped(ProjectRef::new("default"), Vec::new()),
+                .scoped(ProjectRef::new("default"), Vec::new(), None),
             "default".to_string(),
             inner.sql.clone(),
             std::collections::BTreeMap::new(),
@@ -6095,6 +6097,7 @@ mod tests {
                         axis: ScopeAxis::Tenant,
                         value: SqlValue::Text("tenant_B".into()),
                     }],
+                    None,
                 );
                 let req = GraphqlRequest {
                     query: Some(query.to_string()),
@@ -7386,7 +7389,7 @@ mod tests {
         let now = boatramp_core::time::now_unix();
 
         // (1) SEALED: a valid fleet-signed envelope for `acme` → the consumer resolves `acme`.
-        let env = mint_context("acme", 3600, now, signer.as_ref())
+        let env = mint_context("acme", None, 3600, now, signer.as_ref())
             .await
             .unwrap();
         let sealed = rebuild.bindings_for(Some(&env)).await.unwrap();
@@ -7432,7 +7435,7 @@ mod tests {
         );
 
         // (3) FORGED: a stranger-signed envelope fails verification → NO principal → fail closed.
-        let forged = mint_context("globex", 3600, now, stranger.as_ref())
+        let forged = mint_context("globex", None, 3600, now, stranger.as_ref())
             .await
             .unwrap();
         let forged_b = rebuild.bindings_for(Some(&forged)).await.unwrap();
@@ -7450,7 +7453,7 @@ mod tests {
 
         // (4) EXPIRED: a valid fleet signature whose envelope has already expired → NO principal →
         // fail closed (a stale producer stamp can never keep scoping the consumer past its TTL).
-        let expired = mint_context("acme", 3600, now.saturating_sub(7200), signer.as_ref())
+        let expired = mint_context("acme", None, 3600, now.saturating_sub(7200), signer.as_ref())
             .await
             .unwrap();
         let expired_b = rebuild.bindings_for(Some(&expired)).await.unwrap();
@@ -7467,7 +7470,7 @@ mod tests {
         // DIFFERENT sealed message B (globex), and confirm each resolves to ITS OWN tenant and scopes
         // the engine to only that tenant's row — the resolve carries no state between messages, so a
         // batch mixing tenants can never cross-attribute (acme's binding is never reused for globex).
-        let env_b = mint_context("globex", 3600, now, signer.as_ref())
+        let env_b = mint_context("globex", None, 3600, now, signer.as_ref())
             .await
             .unwrap();
         let a = rebuild.bindings_for(Some(&env)).await.unwrap();

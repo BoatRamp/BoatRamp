@@ -586,7 +586,10 @@ pub(super) async fn dispatch_session_post(
         site,
         &fn_config,
         0,
-        &crate::function_runtime::FnTenant::Inherited(caller_tenant),
+        // A session re-entry inherits the caller's tenant facts; it carries no `signed_context`-derived
+        // sealed principal here, so persona is not propagated onto the session lane (PLAN-async-persona
+        // scopes the sealed principal to the consumer → `graphql::run` chain).
+        &crate::function_runtime::FnTenant::Inherited(caller_tenant, None),
         bearer.as_deref(),
         domain_context.as_deref(),
         // A session re-entry is never a migration step.
