@@ -588,6 +588,27 @@ pub(super) async fn auth_whoami(Extension(auth): Extension<Auth>, headers: Heade
     }
 }
 
+/// The running node's boatramp version (`GET /api/version`, `System·Read`).
+#[derive(Serialize)]
+struct NodeVersion {
+    /// The exact package version of the binary serving this request (`CARGO_PKG_VERSION`, the
+    /// workspace version all crates share — so it IS the boatramp release, e.g. `"0.7.3"`).
+    version: &'static str,
+}
+
+/// The running node's boatramp version (`GET /api/version`). Gated at `system·read` by the auth
+/// layer (`authz::Right::required` maps `/api/version` → `System·Read`), so it answers an operator's
+/// "which build is actually deployed?" without exposing a release fingerprint to the public — there
+/// is deliberately no unauthenticated version surface (no `Server:` header, no public `/version`).
+/// A compile-time constant read: no state, no I/O. Shaped as an object so it can grow (e.g. build
+/// metadata) without breaking a client. The `boatramp version --server` CLI consumes this.
+pub(super) async fn node_version() -> Response {
+    Json(NodeVersion {
+        version: env!("CARGO_PKG_VERSION"),
+    })
+    .into_response()
+}
+
 /// Return the active RBAC policy (`authz/policy`), or the built-in default when
 /// none is stored — so a `get` always shows the effective policy.
 pub(super) async fn get_authz_policy(State(deploy): State<DeployStore>) -> Response {

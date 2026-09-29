@@ -464,6 +464,14 @@ pub struct CreateDeploymentResponse {
     pub missing: Vec<String>,
 }
 
+/// The running node's boatramp version, from `GET /api/version` (for `boatramp version --server`).
+/// Shaped as an object (not a bare string) so the server can add fields without breaking the client.
+#[derive(Debug, Deserialize)]
+pub struct VersionInfo {
+    /// The exact package version of the remote binary (e.g. `"0.7.3"`).
+    pub version: String,
+}
+
 /// An AND-composed dead-letter filter for the `dlq` commands (mirrors the server's wire filter).
 /// Serializes `match_last_error` as `match`. All-`None` = the whole DLQ.
 #[derive(Debug, Default, Serialize)]
@@ -784,6 +792,25 @@ impl ControlPlane {
         } = self;
         Ok(client
             .get(format!("{server}/api/{seg}/{db}/status"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
+    }
+
+    /// Read the running node's boatramp version (`GET /api/version`; `System·Read`) — the exact
+    /// package version of the binary actually serving, for `boatramp version --server`. Not
+    /// project-scoped (a node-level read, like `/api/metrics`), so no `{seg}`. A `401`/`403`
+    /// (missing/insufficient token) surfaces via `error_for_status` as a transport error.
+    pub async fn node_version(&self) -> Result<VersionInfo> {
+        let Self {
+            http: client,
+            base: server,
+            ..
+        } = self;
+        Ok(client
+            .get(format!("{server}/api/version"))
             .send()
             .await?
             .error_for_status()?

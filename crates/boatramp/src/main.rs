@@ -99,6 +99,7 @@ mod serve;
 mod sync;
 mod tenancy;
 mod token;
+mod version;
 
 use error::CliError;
 
@@ -143,6 +144,9 @@ enum Command {
     /// Print the capability surface this host implements (the `boatramp:handlers`
     /// package version + the imports a deploy may declare).
     Capabilities(capabilities::CapabilitiesArgs),
+    /// Report the boatramp version — this binary's (default), or a running daemon's
+    /// (`--server <url>` / `--remote`, an operator-only `system·read` query).
+    Version(version::VersionArgs),
     /// List a site's deployment history.
     Deployments(manage::DeploymentsArgs),
     /// Inspect the functions a site runs (its handlers/consumers/crons as functions).
@@ -505,6 +509,7 @@ async fn async_main() -> Result<(), CliError> {
         Command::Compose(args) => compose::run(args)?,
         Command::Validate(args) => build::validate(args)?,
         Command::Capabilities(args) => capabilities::run(args),
+        Command::Version(args) => version::run(args, &config).await?,
         Command::Deployments(args) => manage::list(args, &config).await?,
         Command::Function(args) => function::run(args, &config).await?,
         Command::Workflow(args) => workflow::run(args, &config).await?,
@@ -544,4 +549,21 @@ async fn async_main() -> Result<(), CliError> {
         Command::Cloudflare(args) => cloudflare::run(args, &config).await?,
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::CommandFactory;
+
+    use super::Cli;
+
+    /// The whole CLI tree is structurally valid — in particular the new `version` SUBCOMMAND
+    /// coexists with clap's built-in `--version` FLAG (`#[command(version)]`): both are valid, and
+    /// `boatramp version` runs the subcommand while `boatramp --version` prints the flag. `debug_assert`
+    /// is clap's own tree validator (it panics on a conflict/ambiguity), so this fails loudly if the
+    /// subcommand ever collides with the flag or an arg is misdeclared.
+    #[test]
+    fn cli_tree_is_valid() {
+        Cli::command().debug_assert();
+    }
 }

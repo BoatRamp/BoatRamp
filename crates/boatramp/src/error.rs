@@ -107,6 +107,9 @@ pub enum CliError {
     /// The `blob` command.
     #[error(transparent)]
     Blob(#[from] crate::blob::Error),
+    /// The `version` command (remote `--server` query).
+    #[error(transparent)]
+    Version(#[from] crate::version::Error),
     /// The `config` command.
     #[error(transparent)]
     ConfigCmd(#[from] crate::config_cmd::Error),

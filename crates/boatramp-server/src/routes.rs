@@ -285,6 +285,11 @@ pub fn router_with_fast(
         // `authz::Right::required` (the same grade as `/api/sites`/`/api/metrics`); the hyphen path
         // again avoids the `/api/blobs/` matcher.
         .route("/api/blob-status", get(blob_status_handler))
+        // The running node's boatramp version (v0.7.4): the exact package version of the binary
+        // serving this request. On the AUTHED `/api` router (NOT the public `/healthz`/`/readyz`
+        // router), gated `system·read` in `authz::Right::required` — an operator-only read, so a
+        // client can't fingerprint the release without an operator token.
+        .route("/api/version", get(node_version))
         .route("/api/certs", get(cert_status))
         .route("/api/cache/invalidate", post(invalidate_cache))
         .route(
