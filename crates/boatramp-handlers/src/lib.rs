@@ -52,7 +52,7 @@ pub use bindings::migrate::MigrateBinding;
 #[cfg(feature = "session")]
 pub use bindings::session::{SessionBinding, SessionController, SessionError};
 #[cfg(feature = "messaging")]
-pub use bindings::tenancy::ProducerContextSource;
+pub use bindings::tenancy::{ProducerContextSource, SealedPrincipal};
 #[cfg(feature = "tenant-secrets")]
 pub use bindings::tenant_secrets::{TenantSecretRefused, TenantSecretsBinding};
 #[cfg(feature = "session")]

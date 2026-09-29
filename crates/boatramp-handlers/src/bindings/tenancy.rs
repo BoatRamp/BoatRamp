@@ -53,15 +53,42 @@ pub struct TenancyBinding {
     pub(crate) context: ProducerContext,
 }
 
-/// Per-invocation view over the (optional) `tenancy` grant.
+/// The host-verified sealed principal for one invocation (PLAN-async-persona): the producer's
+/// own-tenant plus (optionally) the host-verified caller persona/role, exactly as the host verified
+/// them from the durable `signed_context` envelope (`br_ctx` + `br_persona`). Set on `Bindings` ONLY
+/// on the consumer / durable async lane — where this invocation's context came from a verified seal —
+/// and propagated onto a `graphql::run` sub-fetch alongside the caller tenant. NEVER guest-supplied;
+/// the WIT `sealed-principal()` import returns it verbatim (or `none` on the sync/seal-less lane).
+/// Shared across WIT + trait per the UX naming condition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SealedPrincipal {
+    /// The producer's host-sealed own-tenant.
+    pub tenant: String,
+    /// The caller's host-verified persona/role, or `None` when none was sealed / usable.
+    pub persona: Option<String>,
+}
+
+/// Per-invocation view over the (optional) `tenancy` grant AND the (optional) host-verified sealed
+/// principal for this invocation. The two are independent: `present-token` needs the grant; the
+/// read-only `sealed-principal()` needs only the host-verified seal (no grant), returning `none`
+/// whenever there is no verified seal (the sync/HTTP lane).
 pub struct TenancyHost<'a> {
     binding: Option<&'a TenancyBinding>,
+    sealed_principal: Option<&'a SealedPrincipal>,
 }
 
 impl<'a> TenancyHost<'a> {
-    /// Build a view; `None` means the capability was not granted.
-    pub fn new(binding: Option<&'a TenancyBinding>) -> Self {
-        Self { binding }
+    /// Build a view; `binding = None` ⇒ the `present-token` capability was not granted;
+    /// `sealed_principal = None` ⇒ this invocation carries no host-verified seal (`sealed-principal()`
+    /// returns `none`).
+    pub fn new(
+        binding: Option<&'a TenancyBinding>,
+        sealed_principal: Option<&'a SealedPrincipal>,
+    ) -> Self {
+        Self {
+            binding,
+            sealed_principal,
+        }
     }
 }
 
@@ -92,6 +119,20 @@ impl tenancy_iface::Host for TenancyHost<'_> {
             }
             Err(err) => Err(E::InvalidToken(err)),
         }
+    }
+
+    /// Return the host-verified sealed principal for THIS invocation, or `none` (the WIT func is
+    /// `current-principal`; the returned type is the `sealed-principal` record). It is present ONLY
+    /// when the invocation's context came from a verified `signed_context` seal (the consumer /
+    /// durable async lane) — set host-side from `verify_context_full`. On the sync/HTTP lane, or when
+    /// the seal is absent/expired/invalid, the host set no sealed principal and this returns `none`.
+    /// The value is exactly what the host verified (guest-blind); the guest can neither name nor
+    /// supply it. Synchronous — a pure read of the per-invocation binding.
+    fn current_principal(&mut self) -> Option<tenancy_iface::SealedPrincipal> {
+        self.sealed_principal.map(|p| tenancy_iface::SealedPrincipal {
+            tenant: p.tenant.clone(),
+            persona: p.persona.clone(),
+        })
     }
 }
 
@@ -136,7 +177,7 @@ mod tests {
             source: Arc::new(FakeSource { ok: true }),
             context: ctx.clone(),
         };
-        let mut host = TenancyHost::new(Some(&binding));
+        let mut host = TenancyHost::new(Some(&binding), None);
         host.present_token("jwt".into()).await.unwrap();
         // The host-sealed envelope is now in the cell the messaging binding reads at publish.
         assert_eq!(ctx.lock().unwrap().clone(), Some("sealed:jwt".to_string()));
@@ -144,11 +185,40 @@ mod tests {
 
     #[tokio::test]
     async fn present_token_is_access_denied_when_ungranted() {
-        let mut host = TenancyHost::new(None);
+        let mut host = TenancyHost::new(None, None);
         assert!(matches!(
             host.present_token("jwt".into()).await,
             Err(TenancyError::AccessDenied)
         ));
+    }
+
+    #[test]
+    fn sealed_principal_is_none_without_a_verified_seal_and_verbatim_with_one() {
+        // No seal (the sync/HTTP lane, or a seal-less/invalid consumer message) ⇒ `none`.
+        let mut host = TenancyHost::new(None, None);
+        assert!(host.current_principal().is_none());
+
+        // A host-verified seal ⇒ the exact `{tenant, persona}` the host verified, verbatim. It needs
+        // NO `present-token` grant (the binding is `None` here) — it's a pure read of the seal.
+        let sealed = SealedPrincipal {
+            tenant: "acme".into(),
+            persona: Some("Integration".into()),
+        };
+        let mut host = TenancyHost::new(None, Some(&sealed));
+        let got = host.current_principal().expect("a verified seal is present");
+        assert_eq!(got.tenant, "acme");
+        assert_eq!(got.persona.as_deref(), Some("Integration"));
+
+        // A seal with a tenant but no persona (no `token_persona_claim` configured) ⇒ persona `none`,
+        // so a `role(…)`-gated field fails closed on the trusting side.
+        let tenant_only = SealedPrincipal {
+            tenant: "acme".into(),
+            persona: None,
+        };
+        let mut host = TenancyHost::new(None, Some(&tenant_only));
+        let got = host.current_principal().expect("a verified seal is present");
+        assert_eq!(got.tenant, "acme");
+        assert_eq!(got.persona, None);
     }
 
     #[tokio::test]
@@ -158,7 +228,7 @@ mod tests {
             source: Arc::new(FakeSource { ok: false }),
             context: ctx.clone(),
         };
-        let mut host = TenancyHost::new(Some(&binding));
+        let mut host = TenancyHost::new(Some(&binding), None);
         // A token the host can't verify ⇒ invalid-token, and the cell is left untouched.
         assert!(matches!(
             host.present_token("jwt".into()).await,

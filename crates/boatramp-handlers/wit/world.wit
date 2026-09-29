@@ -1037,6 +1037,31 @@ interface tenancy {
   /// within an invocation (the last successful call wins). Returns before any publish so the guest
   /// can present, then emit.
   present-token: func(token: string) -> result<_, tenancy-error>;
+
+  /// The host-verified principal sealed onto the async lane for THIS invocation (PLAN-async-persona):
+  /// the producer's own-tenant plus the host-verified caller persona/role, exactly as the host
+  /// verified them from the durable `signed_context` envelope (`br_ctx` + `br_persona`, one COSE
+  /// signature). NEVER a guest-supplied value.
+  record sealed-principal {
+    /// The producer's host-sealed own-tenant (the same value the `signed_context` tenancy source
+    /// resolves).
+    tenant: string,
+    /// The caller's host-verified persona/role, present only when the operator configured a
+    /// `token_persona_claim` and the producer presented a bearer carrying it. `none` ⇒ no persona
+    /// sealed, so a `role(…)`-gated field fails closed (unchanged from before this feature).
+    persona: option<string>,
+  }
+
+  /// Return the host-verified sealed principal for the CURRENT invocation, or `none` (named
+  /// `current-principal` because a WIT interface cannot reuse the `sealed-principal` record name for a
+  /// func; the returned TYPE is `sealed-principal`). Returns a value ONLY on the consumer / durable
+  /// async lane, where this invocation's context came from a verified `signed_context` seal — and even
+  /// then only what the host verified from that seal. On the sync/HTTP lane, or when the seal is
+  /// absent/expired/invalid, returns `none` (the bearer path is unchanged). The persona rides the SAME
+  /// verified envelope as the tenant, so it is bound to the same verified tenant (no cross-tenant
+  /// persona) and shares the envelope's TTL. Guest-blind: the value is host-verified, never named or
+  /// supplied by the guest.
+  current-principal: func() -> option<sealed-principal>;
 }
 
 /// The tenancy world (imported into handlers / functions that fan tenant-scoped work onto the async
