@@ -807,8 +807,11 @@ jobs:
           # batch-isolation of the shared producer-context cell (the security-review Finding-1 fix).
           cargo test -p boatramp-server --features handlers,capability,oidc --lib \
             gap3_tests:: -- --nocapture 2>&1 | tee presenttoken.log
-          grep -qE 'test result: ok\. 2 passed' presenttoken.log \
-            || { echo "::error::present-token gate did not pass 2 tests (silent skip or failure?)" >&2; exit 1; }
+          # 3 tests: the present-token verify/seal/resolve chain, the per-message batch-isolation of
+          # the shared producer-context cell, and (v0.7.3) the persona extractor's single-scalar rule
+          # (`persona_from_claims`), which lives in this same seal-path module.
+          grep -qE 'test result: ok\. 3 passed' presenttoken.log \
+            || { echo "::error::present-token gate did not pass 3 tests (silent skip or failure?)" >&2; exit 1; }
           grep -q 'PRESENT-TOKEN CHAIN OK' presenttoken.log \
             || { echo "::error::present-token verify/seal/resolve chain never reached its success marker (a verification bypass, a guest naming an arbitrary tenant, or a skipped test)" >&2; exit 1; }
       - name: Live consumer signed-context dispatch isolation on a real libsql engine (v0.4.17)
