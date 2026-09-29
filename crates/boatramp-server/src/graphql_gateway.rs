@@ -672,6 +672,12 @@ pub(crate) struct FederationRunner {
     /// principal (an `own` sub-fetch then fails closed, the pre-v0.4.6 behavior). Host-carried +
     /// axis-preserving (a `Target`/`Session` fact keeps its axis), so it never widens a scope.
     caller_tenant: Vec<boatramp_handlers::ScopeFact>,
+    /// The caller's host-verified **sealed principal** (PLAN-async-persona), propagated onto every
+    /// federated sub-fetch alongside `caller_tenant` — so a subgraph resolver reached via
+    /// `graphql::run` from a `signed_context`-resolved consumer sees the SAME `{tenant, persona}` its
+    /// `sealed-principal()` import returns, and can authorize a `role(…)`-gated field as the presenting
+    /// caller. `None` ⇒ no sealed principal to inherit (the sync lane). Host-carried, guest-blind.
+    sealed_principal: Option<boatramp_handlers::SealedPrincipal>,
 }
 
 impl FederationRunner {
@@ -681,22 +687,26 @@ impl FederationRunner {
             runtime,
             project: boatramp_core::project::DEFAULT_PROJECT.to_string(),
             caller_tenant: Vec::new(),
+            sealed_principal: None,
         }
     }
 
     /// A runner scoped to `project` (all registry/plan/execute lookups are project-qualified) and
-    /// carrying the caller's resolved `caller_tenant` principal — mirrors the invoker's per-tenant
-    /// scoping ([`FunctionInvoker::scoped`](crate::function_runtime)), so a `graphql::run` sub-fetch
-    /// inherits the caller's tenancy exactly like an `emit::invoke` callee does.
+    /// carrying the caller's resolved `caller_tenant` principal + host-verified `sealed_principal` —
+    /// mirrors the invoker's per-tenant scoping ([`FunctionInvoker::scoped`](crate::function_runtime)),
+    /// so a `graphql::run` sub-fetch inherits the caller's tenancy AND sealed principal exactly like an
+    /// `emit::invoke` callee does (PLAN-async-persona).
     pub(crate) fn scoped(
         &self,
         project: boatramp_core::project::ProjectRef<'_>,
         caller_tenant: Vec<boatramp_handlers::ScopeFact>,
+        sealed_principal: Option<boatramp_handlers::SealedPrincipal>,
     ) -> std::sync::Arc<dyn boatramp_handlers::SupergraphRunner> {
         std::sync::Arc::new(Self {
             runtime: self.runtime.clone(),
             project: project.as_str().to_string(),
             caller_tenant,
+            sealed_principal,
         })
     }
 }
@@ -798,6 +808,11 @@ impl boatramp_handlers::SupergraphRunner for FederationRunner {
             invoker.scoped(
                 boatramp_core::project::ProjectRef::new(project),
                 self.caller_tenant.clone(),
+                // Carry the caller's host-verified sealed principal onto the sub-fetch (PLAN-async
+                // -persona) so the subgraph's `sealed-principal()` returns the SAME `{tenant, persona}`
+                // — the async-lane `role(…)` authorizes as the presenting caller. `None` on the sync
+                // lane (the bearer path is unchanged).
+                self.sealed_principal.clone(),
             ),
             project.to_string(),
             inner.sql.clone(),

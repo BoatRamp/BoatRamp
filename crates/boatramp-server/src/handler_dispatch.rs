@@ -763,7 +763,13 @@ async fn federation_gateway(
         // set (`Vec::new()`) fail-closed every federated `own` read. A SQL subgraph ignores it (its
         // GDC `row_filter` binds the forwarded bearer); a `target` fetch resolves `B` per-fetch. An
         // anonymous caller resolves no facts, so an `own` fetch still refuses (anon is not widened).
-        invoker.scoped(boatramp_core::project::ProjectRef::new(project), caller_own),
+        // The external `/graphql` edge is the SYNC lane (a bearer request, no `signed_context` seal),
+        // so no sealed principal rides — `sealed-principal()` returns `none` here (PLAN-async-persona).
+        invoker.scoped(
+            boatramp_core::project::ProjectRef::new(project),
+            caller_own,
+            None,
+        ),
         project.to_string(),
         inner.sql.clone(),
         sql_subgraphs,
@@ -1095,6 +1101,9 @@ async fn data_connector_serve(
             inv.scoped(
                 boatramp_core::project::ProjectRef::new(project),
                 caller_own.clone(),
+                // The GDC edge is the sync request lane (no `signed_context` seal); no sealed principal
+                // rides a delegated-field resolution here (PLAN-async-persona).
+                None,
             )
         });
         crate::graphql_data::runner::execute(
@@ -1923,6 +1932,23 @@ pub(super) async fn build_bindings(
         // inherits it (each fact keeps its axis).
         tenancy.map(|h| h.facts().to_vec()).unwrap_or_default()
     };
+    // The host-verified sealed principal for THIS invocation (PLAN-async-persona): resolved from the
+    // durable `signed_context` envelope (verified against the fleet anchor — the SAME verify/expiry/
+    // kind checks the tenancy source uses), so a consumer's `sealed-principal()` returns the host
+    // -verified `{tenant, persona}`. `None` on the sync/request lane (no envelope) ⇒ `sealed-principal()`
+    // returns `none`. Threaded onto the `graphql::run`/`invoke` sub-fetch below alongside the tenant.
+    let sealed_principal = {
+        let anchor = signed_context.and_then(|_| {
+            inner
+                .session_signer
+                .get()
+                .map(|s| boatramp_core::cose::Signer::public_key(s.as_ref()))
+        });
+        resolve_sealed_principal(signed_context, anchor.as_ref())
+    };
+    if let Some(principal) = sealed_principal.clone() {
+        bindings = bindings.with_sealed_principal(principal);
+    }
     if granted("wasi:messaging") {
         // Plain topics are namespaced under the binding `scope` (the site, or the
         // preview scope), so a guest publishes only into its own namespace and
@@ -2010,6 +2036,8 @@ pub(super) async fn build_bindings(
                     claim,
                     signer,
                     env_source: inner.env_source_arc(),
+                    // The handler's site identifies the component for the persona seal-time signal.
+                    component_hash: site.to_string(),
                 }),
                 cell,
             );
@@ -2028,9 +2056,10 @@ pub(super) async fn build_bindings(
         && let Some(invoker) = inner.invoker.get()
     {
         // A site handler invokes siblings within its own tenant project, propagating its
-        // resolved in-site tenant so the sibling inherits it (host-carried, not guest-set).
+        // resolved in-site tenant + host-verified sealed principal so the sibling inherits both
+        // (host-carried, not guest-set) — PLAN-async-persona.
         bindings = bindings.with_invoke(
-            invoker.scoped(project, handler_caller_tenant.clone()),
+            invoker.scoped(project, handler_caller_tenant.clone(), sealed_principal.clone()),
             invoke_targets.to_vec(),
             depth,
         );
@@ -2043,10 +2072,13 @@ pub(super) async fn build_bindings(
     if granted("graphql")
         && let Some(runner) = inner.federation_runner.get()
     {
-        // Propagate the handler's resolved principal so a `graphql::run` sub-fetch inherits its
-        // tenancy (symmetric to `with_invoke` above), rather than failing closed on an `own` op.
-        bindings =
-            bindings.with_graphql(runner.scoped(project, handler_caller_tenant.clone()), depth);
+        // Propagate the handler's resolved principal AND host-verified sealed principal so a
+        // `graphql::run` sub-fetch inherits its tenancy + persona (symmetric to `with_invoke` above),
+        // rather than failing closed on an `own` op or a `role(…)` field (PLAN-async-persona).
+        bindings = bindings.with_graphql(
+            runner.scoped(project, handler_caller_tenant.clone(), sealed_principal.clone()),
+            depth,
+        );
     }
     // Per-project SMTP email gateway: a handler may submit a finished message to one
     // of the project's SMTP profiles. Granted when the site allows `email`, the
@@ -2666,6 +2698,72 @@ fn resolve_sealed_tenant(
     boatramp_core::cose::verify_context(env, anchor, boatramp_core::time::now_unix()).ok()
 }
 
+/// The terminal-outcome classification of a durable message's `signed_context` seal for a consumer
+/// that REQUIRES one (PLAN-async-persona legible-terminal-outcome taxonomy). Each maps to a distinct,
+/// operator-legible dead-letter reason + metric label. Honestly recoverable-or-not: an expired seal
+/// can't be revived (re-ingest from source); a missing/invalid seal points at a producer that did not
+/// `present_token`.
+#[cfg(feature = "handlers")]
+enum SealOutcome {
+    /// The seal verified (signature + expiry + kind) — deliver as normal.
+    Verified,
+    /// A well-formed, correctly-signed seal that aged past the `signed_context` TTL before it was
+    /// consumed. Terminal + loud: `context-seal-expired`.
+    Expired,
+    /// No `signed_context` envelope on a consumer that requires one. Terminal: `context-seal-missing`.
+    Missing,
+    /// A present envelope that fails verification (bad signature / wrong kind / malformed / no fleet
+    /// anchor wired). Terminal: `context-seal-invalid`.
+    Invalid,
+}
+
+/// Classify a `signed_context`-requiring consumer's message seal (PLAN-async-persona). Uses the SAME
+/// verify/expiry/kind checks as the tenancy source + the bind-verify, distinguishing an EXPIRED seal
+/// (recoverable only by re-ingesting from source) from an ABSENT one (a producer never presented) and
+/// an INVALID one (forged/wrong-kind/no-anchor). Read only for a consumer that declares
+/// `sources: [signed_context]` (the caller gates on that); a non-requiring consumer never reaches here.
+#[cfg(feature = "handlers")]
+fn classify_seal(
+    signed_context: Option<&str>,
+    anchor: Option<&boatramp_core::cose::TokenPublicKey>,
+) -> SealOutcome {
+    let Some(env) = signed_context else {
+        return SealOutcome::Missing;
+    };
+    // No fleet anchor wired ⇒ nothing can verify a present envelope ⇒ invalid (fail-closed).
+    let Some(anchor) = anchor else {
+        return SealOutcome::Invalid;
+    };
+    match boatramp_core::cose::verify_context_full(env, anchor, boatramp_core::time::now_unix()) {
+        Ok(_) => SealOutcome::Verified,
+        Err(boatramp_core::cose::TokenError::Expired) => SealOutcome::Expired,
+        // Any other failure (bad signature, wrong kind, malformed, missing claim) is invalid.
+        Err(_) => SealOutcome::Invalid,
+    }
+}
+
+/// Resolve a drained message's host-verified **sealed principal** (`{tenant, persona}`) from its
+/// durable `signed_context` envelope (PLAN-async-persona). Uses the SAME verify/expiry/kind checks as
+/// [`resolve_sealed_tenant`] (via [`verify_context_full`](boatramp_core::cose::verify_context_full)),
+/// so the persona rides the SAME verified envelope as the tenant — bound to the same tenant, sharing
+/// its TTL. `None` for a message with no envelope, no fleet anchor, or a forged/altered/expired
+/// envelope: the consumer's `sealed-principal()` then returns `none` and a `role(…)`-gated sub-fetch
+/// fails closed. The guest never names the persona — only a host signature over the producer's
+/// verified bearer claim resolves here.
+#[cfg(feature = "handlers")]
+pub(super) fn resolve_sealed_principal(
+    signed_context: Option<&str>,
+    anchor: Option<&boatramp_core::cose::TokenPublicKey>,
+) -> Option<boatramp_handlers::SealedPrincipal> {
+    let (env, anchor) = (signed_context?, anchor?);
+    boatramp_core::cose::verify_context_full(env, anchor, boatramp_core::time::now_unix())
+        .ok()
+        .map(|v| boatramp_handlers::SealedPrincipal {
+            tenant: v.tenant,
+            persona: v.persona,
+        })
+}
+
 /// The tenant-seal bind-verify **mutation seam** (anti-hollow gate). In a non-test build this is a
 /// hard `false` — the check is ALWAYS enforced in the shipped binary (there is no runtime toggle, so
 /// a production process can never be tricked into skipping it). In a `cfg(test)` build a THREAD-LOCAL
@@ -2818,7 +2916,38 @@ pub(super) async fn dispatch_consumer_batch(
                 // Fail-closed quarantine. `dead_letter` is TERMINAL (no redelivery). If the backend
                 // can't dead-letter (unsupported), STILL refuse to deliver (a plain nack redelivers
                 // the same anomaly forever, but never delivers it cross-tenant — fail-closed).
-                let reason = "tenant-seal-mismatch";
+                //
+                // Legible terminal-outcome taxonomy (PLAN-async-persona): distinguish WHY the seal
+                // isn't a verified match — a message with a well-signed seal for a DIFFERENT tenant is
+                // `tenant-seal-mismatch` (the v0.7.1 meaning, unchanged), but an EXPIRED / ABSENT /
+                // INVALID seal each gets its own operator-legible reason (an expired seal can't be
+                // revived → re-ingest from source; a missing/invalid one points at a producer that
+                // didn't `present_token`). The reason is persisted as the DLQ `last_error` by
+                // `dead_letter`, so `dlq ls/show` shows it in one read.
+                let (reason, operator_msg): (&str, &str) =
+                    match classify_seal(msg.signed_context.as_deref(), context_anchor) {
+                        // A verified seal that simply names a different tenant than this concrete
+                        // topic — the original v0.7.1 cross-tenant anomaly.
+                        SealOutcome::Verified => (
+                            "tenant-seal-mismatch",
+                            "sealed tenant does not match this concrete `{tenant}` topic segment",
+                        ),
+                        SealOutcome::Expired => (
+                            "context-seal-expired",
+                            "the message's signed context expired before it was consumed; the seal \
+                             cannot be revived — re-ingest from source",
+                        ),
+                        SealOutcome::Missing => (
+                            "context-seal-missing",
+                            "the message carried no signed context on a templated (`{tenant}`) topic; \
+                             the producer did not present a token",
+                        ),
+                        SealOutcome::Invalid => (
+                            "context-seal-invalid",
+                            "the message's signed context failed verification (forged / wrong-kind / \
+                             no fleet anchor); the seal is not trusted",
+                        ),
+                    };
                 match messaging.dead_letter(&msg, reason).await {
                     Ok(()) => {}
                     Err(err) => {
@@ -2826,7 +2955,8 @@ pub(super) async fn dispatch_consumer_batch(
                             id = msg.id,
                             topic = namespaced_topic,
                             %err,
-                            "tenant-seal mismatch could not be quarantined (backend has no DLQ); \
+                            reason,
+                            "seal quarantine could not be recorded (backend has no DLQ); \
                              refusing delivery"
                         );
                         // Do NOT deliver. Leave the message leased (it re-claims on lease expiry and
@@ -2847,8 +2977,8 @@ pub(super) async fn dispatch_consumer_batch(
                     topic = namespaced_topic,
                     expected_tenant = bound,
                     sealed_tenant = sealed.as_deref().unwrap_or("<none>"),
-                    "quarantined a message whose sealed tenant does not match its concrete \
-                     `{{tenant}}` topic segment (tenant-seal-mismatch)"
+                    reason,
+                    "quarantined a message on a `{{tenant}}` topic ({operator_msg})"
                 );
                 continue;
             }

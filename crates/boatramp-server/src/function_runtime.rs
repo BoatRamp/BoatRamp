@@ -19,7 +19,17 @@ pub(super) enum FnTenant {
     /// Inherit the caller's host-resolved **principal** (the axis-tagged fact set) down an
     /// in-project invoke chain — so an inherited `Session`/`TargetTenant` fact keeps its axis, not
     /// just the `Tenant` value. Empty ⇒ no inherited principal. In-process only; never serialized.
-    Inherited(Vec<boatramp_handlers::ScopeFact>),
+    ///
+    /// The second field carries the caller's host-verified **sealed principal** (PLAN-async-persona):
+    /// when a consumer's `graphql::run` fans out to a subgraph sub-fetch, the subgraph inherits the
+    /// same `{tenant, persona}` the host verified from the `signed_context` seal, so the subgraph's
+    /// `sealed-principal()` returns the same value the consumer sees. `None` ⇒ no sealed principal to
+    /// inherit (the sync lane, or a caller that carries no verified seal). Host-carried, never
+    /// guest-supplied.
+    Inherited(
+        Vec<boatramp_handlers::ScopeFact>,
+        Option<boatramp_handlers::SealedPrincipal>,
+    ),
     /// The **durable async lane** (Stage 4): a queue/bus drain carrying an optional host-minted
     /// [signed-context envelope](boatramp_core::cose::mint_context) stamped at publish from the
     /// producer's own-tenant. A consumer declaring `sources: [signed_context]` resolves that tenant
@@ -118,6 +128,10 @@ pub(super) async fn mint_producer_context(
         .and_then(|f| ctx_stamp(&f.value))?;
     boatramp_core::cose::mint_context(
         &tenant,
+        // The producer-context stamp from a host-resolved principal carries no persona (there is no
+        // presented bearer to source a role claim from); persona seals only on the `present-token`
+        // path where an operator configured `token_persona_claim` (PLAN-async-persona).
+        None,
         DURABLE_CONTEXT_TTL_SECS,
         now_unix(),
         signer.as_ref(),
@@ -228,7 +242,43 @@ pub(crate) struct ServerProducerContextSource {
     /// Injectable source for the `token_cfg.jwks_env` host-env lookup (the runtime's). Production
     /// passes `inner.env_source_arc()` (⇒ the real process env); a test injects a `MapEnv`.
     pub(crate) env_source: Arc<dyn boatramp_core::env::EnvSource>,
+    /// The presenting component's content hash — used ONLY for the observability signal at persona
+    /// seal time (PLAN-async-persona UX C1: "sealed persona for component <hash>"). Never affects the
+    /// seal itself.
+    pub(crate) component_hash: String,
 }
+
+/// Extract a caller **persona/role** from an already-verified JWT claim set (PLAN-async-persona). The
+/// value must be a SINGLE scalar: a JSON string, OR a one-element array whose sole element is a string
+/// (some IdPs emit single-valued `roles` as a one-element array). A zero- or multi-element array is
+/// treated as ABSENT (a persona is one role, matched exactly — construens' `role` is one enum; a set
+/// would be ambiguous and could widen). NOT `scalar_to_sql` (that returns `None` on an array, and we
+/// must unwrap a one-element array; it also accepts non-strings we do not want for a role). `None` ⇒
+/// no usable persona ⇒ the caller seals no persona (fail-closed).
+#[cfg(all(feature = "handlers", feature = "oidc"))]
+pub(crate) fn persona_from_claims(
+    claims: &serde_json::Map<String, serde_json::Value>,
+    claim_name: &str,
+) -> Option<String> {
+    match claims.get(claim_name)? {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Array(items) => match items.as_slice() {
+            // Exactly one element, and it is a string: the single scalar. Otherwise absent (a role is
+            // one value — 0 or >1 is not a single scalar and must not be collapsed/widened).
+            [serde_json::Value::String(s)] => Some(s.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Process-global "warn once" guard for the configured-but-absent persona-claim signal (UX C1): the
+/// loud operator WARN fires once (so a misconfigured `token_persona_claim` is visible without flooding
+/// the log on a hot async lane); every occurrence still emits a `debug` carrying the stable counter
+/// name `persona_claim_configured_but_absent` so a metrics pipeline scraping the tracing target counts
+/// them accurately.
+#[cfg(all(feature = "handlers", feature = "oidc"))]
+static PERSONA_ABSENT_WARNED: std::sync::Once = std::sync::Once::new();
 
 #[cfg(feature = "handlers")]
 #[async_trait::async_trait]
@@ -254,8 +304,50 @@ impl boatramp_handlers::ProducerContextSource for ServerProducerContextSource {
                 })?;
             let tenant =
                 ctx_stamp(&value).ok_or_else(|| "tenant claim is not a scalar".to_string())?;
+            // Persona (PLAN-async-persona): when the operator configured a `token_persona_claim`,
+            // extract that claim's SINGLE scalar from the ALREADY-VERIFIED claims — host-verified,
+            // never guest-named. Configured-but-absent/unusable ⇒ seal NO persona (fail-closed) + a
+            // once-WARN and a per-occurrence counter (UX C1); a `role(…)` field then refuses on the
+            // async lane exactly as before this feature. Sealed ⇒ a debug/counter at seal time.
+            let persona = match self.token_cfg.token_persona_claim.as_deref() {
+                Some(persona_claim) => {
+                    match persona_from_claims(&claims, persona_claim) {
+                        Some(p) => {
+                            // Positive seal-time signal (UX C1): a stable counter + the component's
+                            // hash (never the persona VALUE — it is not PII but keep the log lean).
+                            tracing::debug!(
+                                target: "boatramp::handler",
+                                counter = "persona_sealed",
+                                component = %self.component_hash,
+                                "sealed persona for component"
+                            );
+                            Some(p)
+                        }
+                        None => {
+                            PERSONA_ABSENT_WARNED.call_once(|| {
+                                tracing::warn!(
+                                    persona_claim,
+                                    "token_persona_claim is configured but the verified JWT carries \
+                                     no usable single-scalar value for it; sealing no persona \
+                                     (role(…) fails closed on the async lane). Further occurrences \
+                                     are logged at debug."
+                                );
+                            });
+                            tracing::debug!(
+                                target: "boatramp::handler",
+                                counter = "persona_claim_configured_but_absent",
+                                persona_claim,
+                                "persona claim configured but absent/unusable; sealing no persona"
+                            );
+                            None
+                        }
+                    }
+                }
+                None => None,
+            };
             boatramp_core::cose::mint_context(
                 &tenant,
+                persona.as_deref(),
                 DURABLE_CONTEXT_TTL_SECS,
                 now_unix(),
                 self.signer.as_ref(),
@@ -274,6 +366,7 @@ impl boatramp_handlers::ProducerContextSource for ServerProducerContextSource {
                 &self.claim,
                 &self.signer,
                 &self.env_source,
+                &self.component_hash,
             );
             Err("token verification is unavailable in this build (no `oidc`)".to_string())
         }
@@ -1003,7 +1096,7 @@ pub(super) async fn build_function_bindings(
                 .map_err(|e| BindingsError::Refused(e.to_string()))?,
                 false,
             ),
-            FnTenant::Inherited(value) => (
+            FnTenant::Inherited(value, _sealed) => (
                 crate::tenant_resolve::resolve_inherited_tenancy(
                     config.tenancy.as_ref(),
                     imports_db,
@@ -1068,6 +1161,29 @@ pub(super) async fn build_function_bindings(
         .as_ref()
         .map(|h| h.facts().to_vec())
         .unwrap_or_default();
+    // The host-verified sealed principal for THIS invocation (PLAN-async-persona): only on a lane that
+    // carries a verified seal — the durable async lane (verify the envelope now), or an inherited
+    // invoke/graphql sub-fetch (the caller already verified it upstream; carry it verbatim). On the
+    // sync/request/background lane there is no seal ⇒ `None` ⇒ `sealed-principal()` returns `none`.
+    // (The `handlers` feature always pulls `boatramp-handlers/messaging`, so `SealedPrincipal` is in
+    // scope here unconditionally.)
+    let sealed_principal: Option<boatramp_handlers::SealedPrincipal> = match tenant {
+        FnTenant::Durable(signed_context) => {
+            let anchor = inner
+                .session_signer
+                .get()
+                .map(|s| boatramp_core::cose::Signer::public_key(s.as_ref()));
+            super::handler_dispatch::resolve_sealed_principal(
+                signed_context.as_deref(),
+                anchor.as_ref(),
+            )
+        }
+        FnTenant::Inherited(_, sealed) => sealed.clone(),
+        _ => None,
+    };
+    if let Some(principal) = sealed_principal.clone() {
+        bindings = bindings.with_sealed_principal(principal);
+    }
     if granted("wasi:messaging")
         && let Some(messaging) = &inner.messaging
     {
@@ -1201,6 +1317,8 @@ pub(super) async fn build_function_bindings(
                 claim,
                 signer,
                 env_source: inner.env_source_arc(),
+                // The function's scope identifies the component for the persona seal-time signal.
+                component_hash: scope.to_string(),
             }),
             cell,
         );
@@ -1214,7 +1332,7 @@ pub(super) async fn build_function_bindings(
         && let Some(invoker) = inner.invoker.get()
     {
         bindings = bindings.with_invoke(
-            invoker.scoped(project, caller_tenant.clone()),
+            invoker.scoped(project, caller_tenant.clone(), sealed_principal.clone()),
             config.invoke_targets.clone(),
             depth,
         );
@@ -1225,10 +1343,14 @@ pub(super) async fn build_function_bindings(
     if granted("graphql")
         && let Some(runner) = inner.federation_runner.get()
     {
-        // Propagate the caller's resolved principal so a `graphql::run` sub-fetch inherits the
-        // caller's tenancy (symmetric to `with_invoke` above) — the async lane's own-scoped
-        // supergraph writes then resolve instead of failing closed.
-        bindings = bindings.with_graphql(runner.scoped(project, caller_tenant.clone()), depth);
+        // Propagate the caller's resolved principal AND host-verified sealed principal so a
+        // `graphql::run` sub-fetch inherits the caller's tenancy + persona (symmetric to `with_invoke`
+        // above) — the async lane's own-scoped supergraph writes + `role(…)` fields then resolve
+        // instead of failing closed (PLAN-async-persona).
+        bindings = bindings.with_graphql(
+            runner.scoped(project, caller_tenant.clone(), sealed_principal.clone()),
+            depth,
+        );
     }
     // Per-project SMTP email gateway: a function may submit a finished message to
     // one of the project's SMTP profiles. Granted when it imports `email` and the
@@ -1367,6 +1489,12 @@ pub(crate) struct FunctionInvoker {
     /// guest's invoke request. Empty when the caller has no resolved tenancy (plain / anonymous).
     /// Set per binding by [`scoped`](Self::scoped).
     caller_tenant: Vec<boatramp_handlers::ScopeFact>,
+    /// The caller's host-verified **sealed principal** (PLAN-async-persona), carried alongside
+    /// `caller_tenant` so an invoked sibling / subgraph sub-fetch inherits the same `{tenant, persona}`
+    /// the host verified from the `signed_context` seal — its `sealed-principal()` then returns the
+    /// same value the caller sees. `None` when the caller carries no verified seal (the sync lane).
+    /// Host-propagated, never from the guest's invoke request.
+    sealed_principal: Option<boatramp_handlers::SealedPrincipal>,
 }
 
 #[cfg(feature = "handlers")]
@@ -1377,23 +1505,28 @@ impl FunctionInvoker {
             runtime,
             project: ProjectRef::DEFAULT.as_str().to_string(),
             caller_tenant: Vec::new(),
+            sealed_principal: None,
         }
     }
 
     /// Derive a project-scoped invoker: the same store + runtime, but resolving the caller's
     /// siblings within `project`, carrying the caller's host-resolved `caller_tenant` so an invoked
-    /// sibling inherits it (Stage 0). Built per binding (a site handler or a top-level function) so
-    /// the `invoke` capability never crosses tenants.
+    /// sibling inherits it (Stage 0), PLUS the caller's host-verified `sealed_principal` so an
+    /// invoked sibling / subgraph sub-fetch inherits the same `{tenant, persona}` (PLAN-async-persona).
+    /// Built per binding (a site handler or a top-level function) so the `invoke` capability never
+    /// crosses tenants.
     pub(crate) fn scoped(
         &self,
         project: ProjectRef<'_>,
         caller_tenant: Vec<boatramp_handlers::ScopeFact>,
+        sealed_principal: Option<boatramp_handlers::SealedPrincipal>,
     ) -> Arc<dyn boatramp_handlers::Invoker> {
         Arc::new(Self {
             deploy: self.deploy.clone(),
             runtime: self.runtime.clone(),
             project: project.as_str().to_string(),
             caller_tenant,
+            sealed_principal,
         })
     }
 }
@@ -1444,9 +1577,11 @@ impl boatramp_handlers::Invoker for FunctionInvoker {
             axum_request,
             depth,
             boatramp_handlers::Lane::Sync,
-            // In-project invoke: the sibling inherits the caller's host-resolved tenant (never the
-            // guest's invoke request), applying its own declared grant.
-            FnTenant::Inherited(self.caller_tenant.clone()),
+            // In-project invoke: the sibling inherits the caller's host-resolved tenant AND the
+            // caller's host-verified sealed principal (never the guest's invoke request), applying its
+            // own declared grant. Carrying the sealed principal is what lets a subgraph sub-fetch a
+            // consumer's `graphql::run` triggers see the same `{tenant, persona}` (PLAN-async-persona).
+            FnTenant::Inherited(self.caller_tenant.clone(), self.sealed_principal.clone()),
         )
         .await;
         let invoke_response = buffer_invoke_response(response).await;
@@ -1558,7 +1693,8 @@ impl boatramp_handlers::Invoker for FunctionInvoker {
             axum_request,
             depth,
             boatramp_handlers::Lane::Sync,
-            FnTenant::Inherited(self.caller_tenant.clone()),
+            // The sibling inherits the caller's principal AND its host-verified sealed principal.
+            FnTenant::Inherited(self.caller_tenant.clone(), self.sealed_principal.clone()),
         )
         .await;
         let stream_response = stream_invoke_response(response);
@@ -2727,7 +2863,7 @@ fn build_webhook_request(content_type: Option<String>, body: Vec<u8>) -> Request
 #[cfg(all(test, feature = "handlers", feature = "oidc"))]
 mod gap3_tests {
     use super::*;
-    use boatramp_core::cose::{LocalSigner, Signer, verify_context};
+    use boatramp_core::cose::{LocalSigner, Signer, verify_context, verify_context_full};
     use boatramp_handlers::ProducerContextSource as _;
     use ed25519_dalek::{Signer as _, SigningKey};
 
@@ -2770,6 +2906,7 @@ mod gap3_tests {
             jwks_env: Some(env_name.clone()),
             jwks_url: None,
             audience: None,
+            token_persona_claim: None,
         };
 
         // The fleet signer that seals + verifies the durable context (deterministic test key).
@@ -2781,6 +2918,7 @@ mod gap3_tests {
             claim: "tid".to_string(),
             signer: fleet.clone(),
             env_source: env_source.clone(),
+            component_hash: "test-component".to_string(),
         };
 
         let exp = boatramp_core::time::now_unix() + 3600;
@@ -2804,6 +2942,84 @@ mod gap3_tests {
         assert_eq!(
             resolved, "tenant_B",
             "the host-sealed context resolves back to the tenant the presented token carried"
+        );
+        // No `token_persona_claim` configured ⇒ NO persona sealed (unchanged for every producer).
+        assert_eq!(
+            verify_context_full(&sealed, &fleet.public_key(), boatramp_core::time::now_unix())
+                .unwrap()
+                .persona,
+            None,
+            "no persona is sealed when token_persona_claim is unconfigured"
+        );
+
+        // (1b) PERSONA (PLAN-async-persona): with `token_persona_claim` configured, a bearer carrying
+        // that claim seals the host-verified persona alongside the tenant, bound to the SAME envelope.
+        let mut persona_cfg = token_cfg.clone();
+        persona_cfg.token_persona_claim = Some("role".to_string());
+        let persona_source = ServerProducerContextSource {
+            token_cfg: persona_cfg,
+            claim: "tid".to_string(),
+            signer: fleet.clone(),
+            env_source: env_source.clone(),
+            component_hash: "test-component".to_string(),
+        };
+        // A string role → sealed verbatim as the single scalar.
+        let with_role = ed25519_token(
+            &app_key,
+            "app-1",
+            serde_json::json!({ "iss": ISS, "exp": exp, "tid": "tenant_B", "role": "Integration" }),
+        );
+        let sealed = persona_source.seal_presented(&with_role).await.unwrap();
+        let v = verify_context_full(&sealed, &fleet.public_key(), boatramp_core::time::now_unix())
+            .unwrap();
+        assert_eq!(v.tenant, "tenant_B");
+        assert_eq!(
+            v.persona.as_deref(),
+            Some("Integration"),
+            "the host-verified persona is sealed alongside the tenant"
+        );
+        // A one-element array role → the single element (some IdPs emit single roles as an array).
+        let arr_role = ed25519_token(
+            &app_key,
+            "app-1",
+            serde_json::json!({ "iss": ISS, "exp": exp, "tid": "tenant_B", "role": ["Staff"] }),
+        );
+        let sealed = persona_source.seal_presented(&arr_role).await.unwrap();
+        assert_eq!(
+            verify_context_full(&sealed, &fleet.public_key(), boatramp_core::time::now_unix())
+                .unwrap()
+                .persona
+                .as_deref(),
+            Some("Staff")
+        );
+        // Configured-but-absent (no `role` claim) ⇒ seal NO persona (fail-closed), still seals tenant.
+        let no_role = ed25519_token(
+            &app_key,
+            "app-1",
+            serde_json::json!({ "iss": ISS, "exp": exp, "tid": "tenant_B" }),
+        );
+        let sealed = persona_source.seal_presented(&no_role).await.unwrap();
+        let v = verify_context_full(&sealed, &fleet.public_key(), boatramp_core::time::now_unix())
+            .unwrap();
+        assert_eq!(v.tenant, "tenant_B");
+        assert_eq!(
+            v.persona, None,
+            "a configured-but-absent persona claim seals NO persona (fail-closed)"
+        );
+        // A MULTI-element array is NOT a single scalar ⇒ absent (no widening to a set).
+        let multi_role = ed25519_token(
+            &app_key,
+            "app-1",
+            serde_json::json!({ "iss": ISS, "exp": exp, "tid": "tenant_B",
+                                "role": ["Integration", "Staff"] }),
+        );
+        let sealed = persona_source.seal_presented(&multi_role).await.unwrap();
+        assert_eq!(
+            verify_context_full(&sealed, &fleet.public_key(), boatramp_core::time::now_unix())
+                .unwrap()
+                .persona,
+            None,
+            "a multi-valued role claim is not a single scalar and seals no persona"
         );
 
         // (2) A token forged with a DIFFERENT key (same kid) → the host does not verify it → seals
@@ -2860,6 +3076,62 @@ mod gap3_tests {
             cell.lock().unwrap().clone(),
             None,
             "message 2 must not inherit message 1's presented tenant (no cross-message leak)"
+        );
+    }
+
+    /// The persona extractor (PLAN-async-persona / Backend C3): a SINGLE scalar only — a string, or a
+    /// one-element array of one string. Everything else (absent / empty array / multi-element array /
+    /// non-string / object / number) is ABSENT (no widening, no ambiguous multi-role). This is
+    /// distinct from `scalar_to_sql`, which returns `None` on any array and accepts non-strings.
+    #[test]
+    fn persona_from_claims_takes_only_a_single_scalar_role() {
+        let claims = |v: serde_json::Value| -> serde_json::Map<String, serde_json::Value> {
+            match v {
+                serde_json::Value::Object(m) => m,
+                _ => unreachable!(),
+            }
+        };
+        // A JSON string ⇒ that string.
+        assert_eq!(
+            persona_from_claims(&claims(serde_json::json!({ "role": "Integration" })), "role"),
+            Some("Integration".to_string())
+        );
+        // A one-element string array ⇒ the sole element.
+        assert_eq!(
+            persona_from_claims(&claims(serde_json::json!({ "role": ["Staff"] })), "role"),
+            Some("Staff".to_string())
+        );
+        // Absent claim ⇒ None.
+        assert_eq!(
+            persona_from_claims(&claims(serde_json::json!({ "other": "x" })), "role"),
+            None
+        );
+        // Empty array ⇒ None (not a single scalar).
+        assert_eq!(
+            persona_from_claims(&claims(serde_json::json!({ "role": [] })), "role"),
+            None
+        );
+        // Multi-element array ⇒ None (a role is one value; no widening to a set).
+        assert_eq!(
+            persona_from_claims(
+                &claims(serde_json::json!({ "role": ["Integration", "Staff"] })),
+                "role"
+            ),
+            None
+        );
+        // A one-element NON-string array ⇒ None (a role is a string).
+        assert_eq!(
+            persona_from_claims(&claims(serde_json::json!({ "role": [42] })), "role"),
+            None
+        );
+        // A number / object / bool ⇒ None (not a string scalar).
+        assert_eq!(
+            persona_from_claims(&claims(serde_json::json!({ "role": 7 })), "role"),
+            None
+        );
+        assert_eq!(
+            persona_from_claims(&claims(serde_json::json!({ "role": { "n": "x" } })), "role"),
+            None
         );
     }
 }

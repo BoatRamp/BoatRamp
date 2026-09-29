@@ -45,6 +45,10 @@ pub enum Outcome {
     OutOfFuel,
     Overloaded,
     Trap,
+    /// A consumer returned a clean `Err` (a downstream denial/validation failure) — NOT a wasm trap.
+    /// Distinct from [`Trap`](Self::Trap) so the DLQ reason reads `consumer-error`, legible as a guest
+    /// -returned error rather than a crash (PLAN-async-persona legible-terminal-outcome taxonomy).
+    ConsumerError,
     Error,
 }
 
@@ -58,6 +62,7 @@ impl Outcome {
             Err(HandlerError::OutOfFuel) => Self::OutOfFuel,
             Err(HandlerError::Overloaded) => Self::Overloaded,
             Err(HandlerError::Trap(_)) => Self::Trap,
+            Err(HandlerError::ConsumerError(_)) => Self::ConsumerError,
             Err(HandlerError::Compile(_))
             | Err(HandlerError::NoResponse)
             | Err(HandlerError::Internal(_)) => Self::Error,
@@ -73,6 +78,7 @@ impl Outcome {
             Self::OutOfFuel => "out-of-fuel",
             Self::Overloaded => "overloaded",
             Self::Trap => "trap",
+            Self::ConsumerError => "consumer-error",
             Self::Error => "error",
         }
     }
@@ -87,6 +93,8 @@ pub struct Counters {
     pub out_of_fuel: u64,
     pub overloaded: u64,
     pub trap: u64,
+    /// Clean consumer-returned errors (distinct from `trap`) — PLAN-async-persona taxonomy.
+    pub consumer_error: u64,
     pub error: u64,
     /// Sum of wall-clock durations (for computing a mean in the UI).
     pub total_duration_ms: u64,
@@ -102,6 +110,7 @@ impl Counters {
             Outcome::OutOfFuel => self.out_of_fuel += 1,
             Outcome::Overloaded => self.overloaded += 1,
             Outcome::Trap => self.trap += 1,
+            Outcome::ConsumerError => self.consumer_error += 1,
             Outcome::Error => self.error += 1,
         }
     }
@@ -224,6 +233,7 @@ impl Metrics {
                 ("out-of-fuel", c.out_of_fuel),
                 ("overloaded", c.overloaded),
                 ("trap", c.trap),
+                ("consumer-error", c.consumer_error),
                 ("error", c.error),
             ] {
                 out.push_str(&format!(
