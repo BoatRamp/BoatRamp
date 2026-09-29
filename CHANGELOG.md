@@ -5,6 +5,45 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.7.4] - 2026-09-29
+
+Additive, non-breaking. Three fixes in the S3-blob / operator-surface area (two from construens bug
+reports). The presigned blob-upload path pulls the cloud minters into the default build (new SDK
+dependencies), but nothing is enabled without operator config + a guest grant.
+
+### Added
+
+- **`boatramp version` — an operator-gated version read.** New `GET /api/version` (returns
+  `{version}`, gated `system·read` — operator-only, the same tier as `/api/metrics`; there is
+  deliberately no unauthenticated version surface) and a `boatramp version` CLI subcommand that reports
+  this binary's version locally (default, no server/token) or a running daemon's via `--server <url>` /
+  `--remote` (an operator query using the control-plane token). Coexists with clap's `--version` flag.
+
+- **Presigned blob-upload against an STS-less S3 backend (Tigris/R2/MinIO).** The `blob-upload`
+  presigned-ingress capability (v0.5.9) is now **registered** in the host capability surface — it lists
+  in `boatramp capabilities` and `capabilities --check` accepts a component that imports it — and the
+  cloud minters ship in the default build (`blob-upload-cloud` in `default`; still runtime-opt-in via
+  `[serve.s3_ingress_cloud]` + a guest grant, so compiling them in enables minting for no one). A new
+  `aws_presigned_only = true` mode mints a **single-object presigned PUT with no STS** (reusing the
+  sealed `[serve.s3_credential]`), for S3-compatible backends that have no STS; a prefix/multipart/
+  temp-credentials mint against such a backend is cleanly refused, and `aws_presigned_only` is mutually
+  exclusive (fail-loud) with `aws_role_arn`/`aws_use_federation_token`. All existing upload screens
+  (content-addressing, `create_only`/`require_sha256`, `{tenant}` allowlist, metachar/traversal, TTL/
+  max-bytes, host-forced project+site) are unchanged.
+
+### Fixed
+
+- **Blob reads no longer mask a backend/permission fault as a silent 404.** A `403 AccessDenied` (e.g.
+  an S3 credential lacking `s3:GetObject`) previously collapsed into the same bare error a genuine
+  `NoSuchKey` yields, with nothing logged — so an under-scoped credential 404'd every read invisibly.
+  Every guest-reachable object-store operation (get/head/put/list/delete + the read-stream drain) now
+  logs the real object-store error host-side (the actual `403`/`404`/transport fault, keyed by object)
+  and returns the guest a **coarse, stable category** — a genuine not-found stays a not-found (→ 404),
+  but a backend/transport fault becomes a fixed "blob backend unavailable" (→ 5xx). The raw
+  object-store/SDK error string (which can carry endpoint/bucket/caller/access-key metadata) is written
+  only to the operator log, never handed to a guest. The required S3 permission set (`PutObject`,
+  `GetObject`, `ListBucket`, `DeleteObject`, `AbortMultipartUpload`) is documented for the S3 backend.
+
 ## [0.7.3] - 2026-09-29
 
 Additive, non-breaking. Host-side + a coordinated guest-shim compat rev (new
