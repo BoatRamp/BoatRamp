@@ -625,16 +625,17 @@ jobs:
       - name: Live in-site tenant isolation on a real libsql engine
         run: |
           set -eo pipefail
-          # All five are `#[ignore]`d (the general workspace lane skips them — a static-musl test
+          # All seven are `#[ignore]`d (the general workspace lane skips them — a static-musl test
           # binary segfaults in libsql); run them explicitly here, unignored, on the host toolchain.
-          # Five batteries: the Stage 0 single-column model, the Stage 1 per-table-key model, the
+          # Seven batteries: the Stage 0 single-column model, the Stage 1 per-table-key model, the
           # Stage 3 anonymous-first (TenantOrSession) disjunct, the Stage 4 durable signed-context
-          # lane (publish->claim->verify->scope on a real messaging store + libsql), and the #503
-          # write-global / per-route-allowlist model on a real non-RLS libsql engine.
+          # lane (publish->claim->verify->scope on a real messaging store + libsql), the #503
+          # write-global / per-route-allowlist model on a real non-RLS libsql engine, and (v0.10.0)
+          # the grouped-aggregate cross-tenant PRE-AGGREGATION gate + its LEFT-JOIN semantics companion.
           cargo test -p boatramp-storage \
             --features sql --test orm_tenant_isolation -- --ignored --nocapture 2>&1 | tee orm-tenancy.log
-          grep -qE 'test result: ok\. 5 passed' orm-tenancy.log \
-            || { echo "::error::ORM tenant isolation tests did not all pass (silent skip or failure?)" >&2; exit 1; }
+          grep -qE 'test result: ok\. 7 passed' orm-tenancy.log \
+            || { echo "::error::ORM tenant isolation tests did not all pass (silent skip or failure? count drifted from 7?)" >&2; exit 1; }
           grep -q 'ORM IN-SITE TENANT ISOLATION OK' orm-tenancy.log \
             || { echo "::error::ORM tenant isolation never reached its success marker (a cross-tenant breach or a skipped test)" >&2; exit 1; }
           grep -q 'ORM PER-TABLE-KEY TENANCY OK' orm-tenancy.log \
@@ -645,6 +646,23 @@ jobs:
             || { echo "::error::ORM durable signed-context lane never reached its success marker (a Stage 4 async-lane isolation breach or a skipped test)" >&2; exit 1; }
           grep -q 'SCOPED UNSCOPED-WRITE CROSS-SURFACE OK \[libsql\]' orm-tenancy.log \
             || { echo "::error::#503 write-global libsql live gate never reached its marker (a non-RLS write-global/allowlist isolation regression or a skipped test)" >&2; exit 1; }
+          grep -q 'ORM GROUP-BY CROSS-TENANT PRE-AGGREGATION OK' orm-tenancy.log \
+            || { echo "::error::ORM grouped-aggregate gate never reached its marker (a GROUP BY aggregating across tenants, or a skipped test)" >&2; exit 1; }
+          grep -q 'ORM LEFT-JOIN AGGREGATE SEMANTICS OK' orm-tenancy.log \
+            || { echo "::error::ORM LEFT-JOIN aggregate semantics never reached its marker (a skipped test)" >&2; exit 1; }
+          # v0.10.0 grouped-aggregate gate is MUTATION-VERIFIED: dropping the pre-aggregation force_scope
+          # (BOATRAMP_ORMGROUPBY_MUTATION=skip_scope) leaks another tenant's rows into the grouped
+          # aggregates, so the gate's equality-to-single-tenant baseline MUST fail. A pass-under-mutation
+          # (a hollow gate) fails the merge.
+          if BOATRAMP_ORMGROUPBY_MUTATION=skip_scope cargo test -p boatramp-storage --features sql \
+            --test orm_tenant_isolation -- --ignored \
+            orm_group_by_aggregate_is_tenant_confined_pre_aggregation_on_a_real_engine \
+            > orm-groupby-mutation.log 2>&1; then
+            echo "::error::ORM grouped-aggregate gate is HOLLOW — it passed under skip_scope (a GROUP BY can aggregate across tenants)" >&2
+            exit 1
+          else
+            echo "orm group-by mutation verified: skip_scope leaks tenant B's rows into the aggregates → the gate fails as expected."
+          fi
       - name: Owner-gated schema-migration libsql/SQLite parity SUBSTRATE on a real embedded file
         run: |
           set -eo pipefail
