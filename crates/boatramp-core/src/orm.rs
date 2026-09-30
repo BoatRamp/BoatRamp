@@ -45,17 +45,30 @@ pub enum Agg {
     Avg,
     Min,
     Max,
+    /// `count(DISTINCT <arg>)` — the distinct-row count of a column. `*` is not a valid argument
+    /// (DISTINCT * is meaningless), so rendering it over [`Expr::Star`]/[`RelArg::Star`] fails
+    /// closed just as a bare `count(*)`'s Star guard is Count-only.
+    CountDistinct,
 }
 
 impl Agg {
+    /// The rendered SQL function name. `CountDistinct` is still `count(...)`; the `DISTINCT`
+    /// qualifier on its argument is applied separately via [`Agg::distinct_arg`].
     fn keyword(self) -> &'static str {
         match self {
-            Self::Count => "count",
+            Self::Count | Self::CountDistinct => "count",
             Self::Sum => "sum",
             Self::Avg => "avg",
             Self::Min => "min",
             Self::Max => "max",
         }
+    }
+
+    /// Whether the aggregate's argument renders as `DISTINCT <arg>` (only `count(DISTINCT col)`).
+    /// Applied uniformly at both aggregate render sites (`Expr::Aggregate` and the correlated
+    /// `Expr::RelatedAggregate` roll-up) so extending [`Agg`] can't silently drop the qualifier.
+    fn distinct_arg(self) -> bool {
+        matches!(self, Self::CountDistinct)
     }
 }
 
@@ -1735,7 +1748,8 @@ fn render_expr(e: &Expr, params: &mut Params, dialect: Dialect) -> Result<String
                 Expr::Star => return Err(OrmError::BadExpr("`*` is only valid as count(*)")),
                 other => render_expr(other, params, dialect)?,
             };
-            format!("{}({arg})", agg.keyword())
+            let distinct = if agg.distinct_arg() { "DISTINCT " } else { "" };
+            format!("{}({distinct}{arg})", agg.keyword())
         }
         Expr::Binary(op, l, r) => {
             format!(
@@ -1819,8 +1833,9 @@ fn render_expr(e: &Expr, params: &mut Params, dialect: Dialect) -> Result<String
             // The correlated filter reuses the ordinary predicate compiler (bound params); the
             // WHERE clause delimits it, so it renders unparenthesised (`nested = false`).
             let where_sql = render_pred(filter, params, false, dialect)?;
+            let distinct = if agg.distinct_arg() { "DISTINCT " } else { "" };
             format!(
-                "(SELECT {}({arg_sql}) FROM {table_sql} WHERE {where_sql})",
+                "(SELECT {}({distinct}{arg_sql}) FROM {table_sql} WHERE {where_sql})",
                 agg.keyword()
             )
         }
