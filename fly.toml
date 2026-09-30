@@ -18,14 +18,26 @@
 app = "boatramp"
 primary_region = "ams"
 
-# Graceful-stop budget (v0.9.0 KV-recovery, C12). A `fly deploy` roll sends SIGINT, waits
-# `kill_timeout`, then SIGKILLs. boatramp drains + `close()`s the control-plane SlateDB store on
-# SIGINT (freeze memtables → L0, advance the durable frontier) so the next boot has no torn WAL tail;
-# that close must fit inside this window or a SIGKILL mid-close leaves a torn tail (the recurring
-# incident). fly's default is 5s. Raise it to ≥ the measured drain+close time. With continuous
-# checkpointing (`[serve.kv] checkpoint_interval`, default 10s) the close is cheap, so this rarely
-# bites — but the headroom is the belt to the checkpoint's suspenders. The in-process close budget
-# is `[serve.kv] close_deadline` (default 20s); keep `kill_timeout` ≥ it so fly does not SIGKILL first.
+# Graceful-stop budget (v0.9.0 KV-recovery, C12; v0.11.0 fsync + auto-recovery). A `fly deploy` roll
+# sends SIGINT, waits `kill_timeout`, then SIGKILLs. boatramp drains + `close()`s the control-plane
+# SlateDB store on SIGINT (freeze memtables → L0, advance the durable frontier) so the next boot has no
+# torn WAL tail; that close must fit inside this window or a SIGKILL mid-close leaves a torn tail (the
+# recurring incident). fly's default is 5s.
+#
+# SIZING FORMULA:
+#   kill_timeout   >=  close_deadline + ~5s scheduler/reconcile-drain margin
+#   close_deadline (`[serve.kv] close_deadline`, default 20s)  >=  measured worst-case quiesce+close  =
+#                     reconcile-loop drain  +  (dirty memtable bytes ÷ object-store write throughput)
+#                     for the final memtable→L0 freeze + manifest PUT.
+# With continuous checkpointing (`[serve.kv] checkpoint_interval`, default 10s) the dirty set at
+# shutdown is at most one interval, so the close is cheap and this rarely bites — the headroom is the
+# belt to the checkpoint's suspenders. Keep `kill_timeout` >= `close_deadline` so fly never SIGKILLs
+# first (BOATRAMP_KV_CLOSE_DEADLINE below = 25, kill_timeout = 30 → 5s margin).
+#
+# v0.11.0: the local SlateDB store now opens with fsync ON, so even a SIGKILL mid-close is
+# NON-CORRUPTING (the manifest/WAL final name only appears once its data is durable), and an empty/torn
+# latest manifest AUTO-RECOVERS on the next boot by rolling back to the last-good generation (lossless-
+# for-acked). This budget is now DEFENSE-IN-DEPTH, not the sole guard — but keep the headroom.
 kill_timeout = 30
 
 [env]
