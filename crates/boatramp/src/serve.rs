@@ -1473,7 +1473,7 @@ async fn write_kv_close_breadcrumb(
     data_dir: &Path,
     slate_s3: Option<&boatramp_node::backends::SlateKvS3>,
 ) {
-    use boatramp_storage::object_store::ObjectStore;
+    use boatramp_storage::object_store::ObjectStoreExt;
     if let Some((store, root)) = kv_close_store(data_dir, slate_s3) {
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1498,7 +1498,7 @@ async fn clear_kv_close_breadcrumb(
     data_dir: &Path,
     slate_s3: Option<&boatramp_node::backends::SlateKvS3>,
 ) {
-    use boatramp_storage::object_store::ObjectStore;
+    use boatramp_storage::object_store::ObjectStoreExt;
     if let Some((store, root)) = kv_close_store(data_dir, slate_s3) {
         let _ = store.delete(&kv_close_breadcrumb_path(&root)).await;
     }
@@ -1511,7 +1511,7 @@ async fn take_kv_close_breadcrumb(
     data_dir: &Path,
     slate_s3: Option<&boatramp_node::backends::SlateKvS3>,
 ) -> bool {
-    use boatramp_storage::object_store::ObjectStore;
+    use boatramp_storage::object_store::ObjectStoreExt;
     let Some((store, root)) = kv_close_store(data_dir, slate_s3) else {
         return false;
     };
