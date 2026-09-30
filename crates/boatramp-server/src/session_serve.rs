@@ -169,8 +169,13 @@ async fn resolve_session_principal(
     bearer: Option<&str>,
     domain_context: Option<&str>,
 ) -> Result<Vec<boatramp_handlers::ScopeFact>, String> {
-    let imports_db = session.imports.iter().any(|i| i == "sql")
-        || session.imports.iter().any(|i| i.starts_with("sql:"));
+    // Security HIGH-1: `wasi:blobstore` is a tenant-scoped data capability like sql/orm, so a
+    // blob-importing session on a multi-tenant posture must also declare a tenancy decision
+    // (Dimension 0). (The authoritative grant/refusal is `build_function_bindings`, which this
+    // mirrors so the principal resolution and the binding gate agree.)
+    let imports_tenant_scoped_data = session.imports.iter().any(|i| i == "sql")
+        || session.imports.iter().any(|i| i.starts_with("sql:"))
+        || session.imports.iter().any(|i| i == "wasi:blobstore");
     let posture = crate::tenant_resolve::TenantPosture {
         require_declaration: inner
             .require_tenancy_declaration
@@ -181,7 +186,7 @@ async fn resolve_session_principal(
     };
     let resolved = crate::tenant_resolve::resolve_host_tenancy(
         session.tenancy.as_ref(),
-        imports_db,
+        imports_tenant_scoped_data,
         posture,
         crate::tenant_resolve::TenantSourceInputs {
             bearer,

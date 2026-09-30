@@ -157,14 +157,19 @@ fn ctx_stamp(value: &boatramp_core::sql::SqlValue) -> Option<String> {
 /// The PLAIN resolved own-tenant value of a principal, as a string — the literal tenant segment an
 /// app uses (NOT the COSE-signed durable envelope [`mint_producer_context`] mints). Used to fill the
 /// `{tenant}` placeholder in a `messaging-stats` bus-topic template with the SAME tenant the SQL scope
-/// injector resolved. `None` for an unscoped/anonymous invocation or a non-scalar tenant value — a
-/// `{tenant}` template is then refused (the stats binding fails closed). The guest never supplies it.
+/// injector resolved. `None` for an unscoped/anonymous invocation, a non-scalar tenant value, or an
+/// EMPTY tenant value — a `{tenant}` template is then refused (the binding fails closed). The guest
+/// never supplies it.
 #[cfg(feature = "handlers")]
 pub(super) fn resolved_tenant_string(principal: &[boatramp_handlers::ScopeFact]) -> Option<String> {
     principal
         .iter()
         .find(|f| f.axis == boatramp_core::tenancy::ScopeAxis::Tenant)
         .and_then(|f| ctx_stamp(&f.value))
+        // Security LOW-1: an EMPTY tenant string is not a usable tenant — expanding a `{tenant}`
+        // template with it yields an empty segment (e.g. `assets-`) that would collide across every
+        // empty-tenant caller. Fail closed (None) so a `{tenant}` entry is refused, never collapsed.
+        .filter(|s| !s.is_empty())
 }
 
 #[cfg(all(test, feature = "handlers"))]
@@ -201,6 +206,22 @@ mod resolved_tenant_axis_tests {
             resolved_tenant_string(&[]),
             None,
             "anonymous/unscoped resolves to no tenant"
+        );
+    }
+
+    /// Security LOW-1: an EMPTY own-tenant Text fact must resolve to `None`, never `Some("")` — else a
+    /// `{tenant}` allowlist entry (`assets-{tenant}`) would expand to an empty segment (`assets-`) that
+    /// collides across every empty-tenant caller. Fail closed instead.
+    #[test]
+    fn empty_own_tenant_resolves_to_none() {
+        let empty = [ScopeFact {
+            axis: ScopeAxis::Tenant,
+            value: SqlValue::Text(String::new()),
+        }];
+        assert_eq!(
+            resolved_tenant_string(&empty),
+            None,
+            "an empty tenant string must fail closed, not expand a {{tenant}} template to `assets-`"
         );
     }
 }
@@ -1064,6 +1085,11 @@ pub(super) async fn build_function_bindings(
     // `invoke` binding below so a sibling this function calls inherits the same tenant.
     let host_tenancy = {
         let imports_db = granted("sql") || config.imports.iter().any(|i| i.starts_with("sql:"));
+        // Security HIGH-1: `wasi:blobstore` carries per-tenant blob assets, so it is a tenant-scoped
+        // DATA capability exactly like sql/orm — a blob-only importer (no sql/orm) on a multi-tenant
+        // posture must ALSO declare a tenancy decision (Dimension 0), else it would run permissive and
+        // could open another tenant's container. Broaden the declaration-requirement flag accordingly.
+        let imports_tenant_scoped_data = imports_db || granted("wasi:blobstore");
         // Gap 4a: per-project tenancy posture (operator override for this project, else node base).
         let project_knobs = inner.project_tenancy_knobs(project.as_str());
         let posture = crate::tenant_resolve::TenantPosture {
@@ -1086,7 +1112,7 @@ pub(super) async fn build_function_bindings(
             FnTenant::Request => (
                 crate::tenant_resolve::resolve_host_tenancy(
                     config.tenancy.as_ref(),
-                    imports_db,
+                    imports_tenant_scoped_data,
                     posture,
                     crate::tenant_resolve::TenantSourceInputs {
                         bearer,
@@ -1106,7 +1132,7 @@ pub(super) async fn build_function_bindings(
             FnTenant::Inherited(value, _sealed) => (
                 crate::tenant_resolve::resolve_inherited_tenancy(
                     config.tenancy.as_ref(),
-                    imports_db,
+                    imports_tenant_scoped_data,
                     posture,
                     value.clone(),
                 )
@@ -1119,7 +1145,7 @@ pub(super) async fn build_function_bindings(
             FnTenant::Durable(signed_context) => (
                 crate::tenant_resolve::resolve_host_tenancy(
                     config.tenancy.as_ref(),
-                    imports_db,
+                    imports_tenant_scoped_data,
                     posture,
                     crate::tenant_resolve::TenantSourceInputs {
                         signed_context: signed_context.as_deref(),
@@ -1134,7 +1160,7 @@ pub(super) async fn build_function_bindings(
             FnTenant::Background => (
                 crate::tenant_resolve::resolve_host_tenancy(
                     config.tenancy.as_ref(),
-                    imports_db,
+                    imports_tenant_scoped_data,
                     posture,
                     crate::tenant_resolve::TenantSourceInputs::default(),
                 )
@@ -1177,8 +1203,15 @@ pub(super) async fn build_function_bindings(
     // `resolved_tenant_string(&caller_tenant)` (the OWN-`Tenant` axis only; `None` for a
     // target/anon/unscoped invocation ⇒ `{tenant}` entries fail closed).
     if granted("wasi:blobstore") {
+        use boatramp_core::tenancy::Tenancy;
         let max_blob = inner.max_blob_bytes.get().copied().unwrap_or(0);
-        let multi_tenant = config.tenancy.is_some() || host_tenancy.is_some();
+        // Security MEDIUM-1: only a SCOPING tenancy (`Scoped`/`Target`) makes the function multi-tenant.
+        // An explicit `Tenancy::Disabled` is deliberate single-tenant (Some but not multi-tenant), so
+        // the deny-default must not fire for it. `host_tenancy.is_some()` is already correct (Disabled
+        // resolves to `None`) and still covers a forced/inherited target invocation.
+        let multi_tenant =
+            matches!(config.tenancy, Some(Tenancy::Scoped { .. } | Tenancy::Target { .. }))
+                || host_tenancy.is_some();
         // UX (C4): a multi-tenant function that grants `wasi:blobstore` without declaring an
         // allowlist will DENY every container op — surface it loudly at bind, naming the remedy.
         if multi_tenant && config.blobstore_containers.is_empty() {
@@ -3451,6 +3484,163 @@ mod blob_upload_function_tests {
         assert!(
             ghost_bindings.blob_upload().is_none(),
             "a non-existent site must not attach the binding (fail-closed)"
+        );
+    }
+}
+
+/// Security HIGH-1 / MEDIUM-1: the plain `wasi:blobstore` capability carries per-tenant blob assets,
+/// so it is a **Dimension-0 tenant-scoped data capability** exactly like sql/orm. These drive the REAL
+/// [`build_function_bindings`] path (the same one a guest sees) and assert:
+///   - HIGH-1: a blob-only importer (no sql/orm) with NO tenancy on a strict multi-tenant posture is
+///     REFUSED — closing the hole where a blob-only GC sweep slipped through as permissive and could
+///     `open("assets-<other-tid>")`;
+///   - HIGH-1 positive: a `Scoped` declaration + a `{tenant}` allowlist binds successfully;
+///   - MEDIUM-1: an explicit `Tenancy::Disabled` is a legal single-tenant declaration — attached (not
+///     refused) and permissive (not denied).
+/// The confinement behavior itself (own `assets-<tid>` opens, `assets-<other>` refused) is unit-tested
+/// in `boatramp-handlers::bindings::blobstore` — `BlobBinding`'s fields are crate-private there, so the
+/// dispatch-level tests assert the Dimension-0 gate + binding attachment, not the prefix decision.
+#[cfg(all(test, feature = "handlers"))]
+mod blobstore_dimension0_tests {
+    use super::*;
+    use crate::tests::MemStorage;
+    use boatramp_core::config::{HandlersSiteConfig, SiteConfig};
+    use boatramp_core::deploy::DeployStore;
+    use boatramp_core::function::FunctionConfig;
+    use boatramp_core::kv::{KvStore, MemoryKv};
+    use boatramp_core::sql::SqlValue;
+    use boatramp_core::tenancy::{AccessMode, ScopeAxis, Tenancy, TenantSource};
+    use boatramp_handlers::{HandlerEngine, Limits, ScopeFact};
+
+    /// A runtime with one deployed site under the STRICT multi-tenant posture (the default).
+    async fn runtime_with_site(project: &str, site: &str) -> HandlerRuntime {
+        let storage = Arc::new(MemStorage::default());
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let deploy = DeployStore::new(storage.clone(), kv.clone());
+        deploy
+            .set_site_config(
+                ProjectRef::new(project),
+                site,
+                &SiteConfig {
+                    handlers: Some(HandlersSiteConfig {
+                        enabled: true,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
+        let rt = HandlerRuntime::new(engine, kv, storage, None, None);
+        rt.set_tenancy_posture(true, false); // require_declaration = true (strict)
+        rt
+    }
+
+    /// A function that imports ONLY the plain `wasi:blobstore` (no sql/orm), with the given tenancy +
+    /// `blobstore_containers` allowlist.
+    fn blob_config(tenancy: Option<Tenancy>, allowlist: &[&str]) -> FunctionConfig {
+        FunctionConfig {
+            imports: vec!["wasi:blobstore".into()],
+            tenancy,
+            blobstore_containers: allowlist.iter().map(|s| (*s).to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    fn scoped() -> Tenancy {
+        Tenancy::Scoped {
+            column: "tenant_id".into(),
+            sources: vec![TenantSource::Domain],
+            read: AccessMode::Own,
+            write: AccessMode::Own,
+            exceed_site_ceiling: false,
+            unscoped_writes: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn blob_only_undeclared_tenancy_is_refused_under_strict_posture() {
+        let rt = runtime_with_site("shop", "blog").await;
+        let inner = rt.inner.as_ref().unwrap();
+        let config = blob_config(None, &[]);
+        // `Bindings` is not `Debug`, so match rather than `expect_err`.
+        let msg = match build_function_bindings(
+            inner,
+            ProjectRef::new("shop"),
+            "shop/fn/gc",
+            "fn/gc",
+            &config,
+            0,
+            &FnTenant::Background,
+            None,
+            None,
+            None,
+        )
+        .await
+        {
+            Ok(_) => panic!(
+                "a blob-only importer with no tenancy must be refused under the strict posture"
+            ),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            msg.contains("wasi:blobstore") && msg.contains("no tenancy"),
+            "the refusal must name blobstore + the missing tenancy decision: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn blob_scoped_with_allowlist_attaches_the_binding() {
+        let rt = runtime_with_site("shop", "blog").await;
+        let inner = rt.inner.as_ref().unwrap();
+        let config = blob_config(Some(scoped()), &["assets-{tenant}"]);
+        let own = vec![ScopeFact {
+            axis: ScopeAxis::Tenant,
+            value: SqlValue::Text("firm-a".into()),
+        }];
+        let bindings = build_function_bindings(
+            inner,
+            ProjectRef::new("shop"),
+            "shop/fn/api",
+            "fn/api",
+            &config,
+            0,
+            &FnTenant::Inherited(own, None),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("a scoped blob importer with an allowlist binds");
+        assert!(
+            bindings.blobstore().is_some(),
+            "the blobstore binding must be attached for a declared, scoped importer"
+        );
+    }
+
+    #[tokio::test]
+    async fn blob_disabled_tenancy_binds_permissive_not_denied() {
+        let rt = runtime_with_site("shop", "blog").await;
+        let inner = rt.inner.as_ref().unwrap();
+        let config = blob_config(Some(Tenancy::Disabled), &[]);
+        let bindings = build_function_bindings(
+            inner,
+            ProjectRef::new("shop"),
+            "shop/fn/tool",
+            "fn/tool",
+            &config,
+            0,
+            &FnTenant::Background,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("an explicitly-Disabled blob importer is declared, so it must not be refused");
+        assert!(
+            bindings.blobstore().is_some(),
+            "a Disabled (single-tenant) blob importer keeps its binding (permissive), not denied"
         );
     }
 }

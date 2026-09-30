@@ -239,7 +239,11 @@ impl BlobHost<'_> {
             let mut matched = false;
             for entry in &binding.containers {
                 match entry.split_once(TENANT_TEMPLATE) {
-                    Some((before, after)) => match binding.tenant.as_deref() {
+                    // Security LOW-1: an EMPTY resolved tenant is treated as no resolved tenant (fail
+                    // closed), never expanded to an empty segment (`assets-`). Bind sites already filter
+                    // empties via `resolved_tenant_string`; this keeps the binding self-protecting.
+                    Some((before, after)) => match binding.tenant.as_deref().filter(|s| !s.is_empty())
+                    {
                         Some(tenant) => {
                             if name == format!("{before}{tenant}{after}") {
                                 matched = true;
@@ -1292,7 +1296,9 @@ mod tests {
     }
 
     /// A single-tenant / dev site (no tenancy declared) with no allowlist stays permissive — today's
-    /// behavior, non-breaking.
+    /// behavior, non-breaking. This is ALSO the `multi_tenant = false` path that an explicit
+    /// `Tenancy::Disabled` derives upstream (Security MEDIUM-1): a Disabled blob guest must be
+    /// permissive here, never caught by the multi-tenant deny-default.
     #[tokio::test]
     async fn single_tenant_without_allowlist_is_permissive() {
         let storage = Arc::new(MemStorage::default());

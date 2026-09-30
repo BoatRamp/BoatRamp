@@ -259,8 +259,10 @@ impl Bindings {
             .unwrap_or_default()
     }
 
-    /// The granted blob binding, if any.
-    pub(crate) fn blobstore(&self) -> Option<&blobstore::BlobBinding> {
+    /// The granted blob binding, if any. Public (mirroring [`blob_upload`](Self::blob_upload)) so a
+    /// host-side test can assert whether the plain `wasi:blobstore` binding was attached for a given
+    /// tenancy/import shape — the `BlobBinding` fields themselves stay crate-private.
+    pub fn blobstore(&self) -> Option<&blobstore::BlobBinding> {
         self.blobstore.as_ref()
     }
 

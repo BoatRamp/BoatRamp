@@ -1728,6 +1728,12 @@ pub(super) async fn build_bindings(
     // resolved value is carried into the `invoke` binding below so a sibling inherits it.
     let handler_caller_tenant = {
         let imports_db = !granted_sql_databases(imports, &site_handlers.allow_imports).is_empty();
+        // Security HIGH-1: `wasi:blobstore` carries per-tenant blob assets ⇒ it is a tenant-scoped
+        // DATA capability like sql/orm, so a blob-importing handler on a multi-tenant posture must
+        // ALSO declare a tenancy decision (Dimension 0) — else it would run permissive and could
+        // open another tenant's container. `granted` already encodes "imported AND site-allowed", so
+        // this bites exactly when the blob binding is actually grantable.
+        let imports_tenant_scoped_data = imports_db || granted("wasi:blobstore");
         // Gap 4a: the tenancy posture for THIS project — the operator's per-project override if any,
         // else the node base. `project` is host-routed (never guest input), so it can't be spoofed.
         let project_knobs = inner.project_tenancy_knobs(project.as_str());
@@ -1929,10 +1935,15 @@ pub(super) async fn build_bindings(
                     context_anchor: context_anchor.as_ref(),
                     env_source: Some(inner.env_source()),
                 };
-                crate::tenant_resolve::resolve_host_tenancy(other, imports_db, posture, inputs)
-                    .await
-                    .map_err(|e| BindingsError::Refused(e.to_string()))?
-                    .map(|h| h.with_schema(schema.as_ref()))
+                crate::tenant_resolve::resolve_host_tenancy(
+                    other,
+                    imports_tenant_scoped_data,
+                    posture,
+                    inputs,
+                )
+                .await
+                .map_err(|e| BindingsError::Refused(e.to_string()))?
+                .map(|h| h.with_schema(schema.as_ref()))
             }
         };
         bindings = bindings.with_tenancy(tenancy.clone());
@@ -1950,9 +1961,17 @@ pub(super) async fn build_bindings(
     // `resolved_tenant_string(&handler_caller_tenant)` (the OWN-`Tenant` axis only; `None` for a
     // target/anon/unscoped invocation ⇒ `{tenant}` entries fail closed).
     if granted("wasi:blobstore") {
+        use boatramp_core::tenancy::Tenancy;
         let max_blob = inner.max_blob_bytes.get().copied().unwrap_or(0);
-        let multi_tenant = handler_tenancy.is_some()
-            || site_handlers.tenancy.is_some()
+        // Security MEDIUM-1: only a SCOPING tenancy (`Scoped`/`Target`) makes the site multi-tenant.
+        // An explicit `Tenancy::Disabled` is deliberate single-tenant — `Some(..)` but NOT multi-tenant
+        // (so the deny-default must not fire for a Disabled blob guest). `!handler_caller_tenant`
+        // -`.is_empty()` stays false under Disabled (it resolves to no facts).
+        let scoping = |t: Option<&Tenancy>| {
+            matches!(t, Some(Tenancy::Scoped { .. } | Tenancy::Target { .. }))
+        };
+        let multi_tenant = scoping(handler_tenancy)
+            || scoping(site_handlers.tenancy.as_ref())
             || !handler_caller_tenant.is_empty();
         // UX (C4): a multi-tenant site that grants `wasi:blobstore` without declaring an allowlist
         // will DENY every container op — surface it loudly at bind so operators find affected

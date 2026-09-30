@@ -341,15 +341,20 @@ impl BlobUploadBinding {
             match entry.split_once(TENANT_TEMPLATE) {
                 // A `{tenant}` entry: expand with the resolved own tenant, then exact-match. `split_once`
                 // handles the token anywhere in the entry (prefix/suffix/middle), rebuilding it around
-                // the substituted tenant.
-                Some((before, after)) => match self.resolved_tenant.as_deref() {
-                    Some(tenant) => {
-                        if container == format!("{before}{tenant}{after}") {
-                            return Ok(container.to_string());
+                // the substituted tenant. Security LOW-1: an EMPTY tenant is treated as no resolved
+                // tenant (fail closed), never expanded to an empty segment (`assets-`). The bind sites
+                // already filter empties via `resolved_tenant_string`; this keeps the binding
+                // self-protecting regardless of how `resolved_tenant` was populated.
+                Some((before, after)) => {
+                    match self.resolved_tenant.as_deref().filter(|s| !s.is_empty()) {
+                        Some(tenant) => {
+                            if container == format!("{before}{tenant}{after}") {
+                                return Ok(container.to_string());
+                            }
                         }
+                        None => saw_unexpandable_template = true,
                     }
-                    None => saw_unexpandable_template = true,
-                },
+                }
                 // A plain entry: exact match (unchanged from the pre-template behavior).
                 None => {
                     if entry == container {
