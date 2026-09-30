@@ -628,6 +628,8 @@ fn to_core_agg(a: wit::Agg) -> core::Agg {
         wit::Agg::Avg => core::Agg::Avg,
         wit::Agg::Min => core::Agg::Min,
         wit::Agg::Max => core::Agg::Max,
+        // Append-only enum extension (see `agg` in world.wit): `count(DISTINCT col)`.
+        wit::Agg::CountDistinct => core::Agg::CountDistinct,
     }
 }
 

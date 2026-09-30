@@ -116,7 +116,11 @@ world sql-host {
 interface orm {
   use sql-types.{value, row, query-result, error};
 
-  enum agg { count, sum, avg, min, max }
+  // `count-distinct` is APPEND-ONLY and MUST stay last: WIT enum variants encode by ordinal, so
+  // appending preserves the wire positions of the existing variants (backward-compatible — an old
+  // host never receives it; a guest that emits it declares the requirement in its function-manifest
+  // `requires`, checked at deploy). Same rationale as the expr-node append-only note below.
+  enum agg { count, sum, avg, min, max, count-distinct }
   enum bin-op { add, sub, mul, div, modulo }
   // (`lower`/`upper` are spelled `*-case` to avoid colliding with wasmtime's ComponentType
   // `Lower` associated item in the generated bindings.)
