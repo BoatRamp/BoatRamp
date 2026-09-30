@@ -366,7 +366,14 @@ async fn run_recover_adopt_volume(
         )));
     }
 
-    // 1. VALIDATE the attached volume BEFORE adopting: zero torn AND it really opens clean.
+    // 1. VALIDATE the attached volume BEFORE adopting — WITHOUT mutating it (Security L3): the
+    //    operator's snapshot must stay byte-pristine. So the source is only ever READ here: a
+    //    read-only whole-store torn scan (`repair_wal_tail` DryRun = list + get_range only, never a
+    //    write). We deliberately do NOT open the source as a writer (a `Db` open takes the writer
+    //    fence + writes a manifest) NOR as a `DbReader` (which `write_checkpoint`s a reader
+    //    checkpoint into the manifest on open) — both would mutate the pristine snapshot. The
+    //    DEFINITIVE real-open bootability verify runs later on the COPY (never the source), so a
+    //    truncated edge the footer probe misses is still caught (and rolled back) at `--apply`.
     let vol_obj: Arc<dyn ObjectStore> = Arc::new(
         boatramp_storage::kv_slatedb::local_object_store(&volume_dir)
             .map_err(|e| Error::Store(e.to_string()))?,
@@ -382,29 +389,13 @@ async fn run_recover_adopt_volume(
             vol_dry.out_of_scope_torn.len()
         )));
     }
-    // A real open (Strict) is the definitive clean check (a footer probe cannot see everything).
-    {
-        let vk = boatramp_storage::SlateKv::open_local_with_flush_policy(
-            &volume_dir,
-            boatramp_node::backends::CONTROL_PLANE_FLUSH,
-            boatramp_storage::kv_slatedb::KvOpenPolicy::Strict,
-        )
-        .await
-        .map_err(|e| {
-            Error::Store(format!(
-                "REFUSING to adopt: the attached volume at `{}` did not open cleanly: {e}",
-                volume.display()
-            ))
-        })?;
-        boatramp_core::kv::KvStore::close(&vk)
-            .await
-            .map_err(|e| Error::Store(e.to_string()))?;
-    }
 
     // 2. Discard-delta: adopting the snapshot DISCARDS the crashed store's post-snapshot writes.
     println!(
-        "adopt-volume: the attached store at `{}` opens CLEAN (zero torn).\n  \
-         Adopting REPLACES the crashed store at `{}` with the snapshot.\n  \
+        "adopt-volume: the attached store at `{}` passes the whole-store torn scan (ZERO torn) — \
+         validated READ-ONLY, the snapshot is left byte-pristine.\n  \
+         Adopting REPLACES the crashed store at `{}` with a COPY of the snapshot (a definitive \
+         real-open bootability verify then runs on the copy, never the source).\n  \
          DISCARD-DELTA: every write in the crashed store made AFTER the snapshot's point-in-time is \
          LOST (a snapshot is a point-in-time copy; boatramp cannot merge the crashed WAL into it).\n  \
          The crashed copy is RETAINED (renamed aside) until the adopt is verified serving.",
@@ -413,7 +404,8 @@ async fn run_recover_adopt_volume(
     );
     if !apply {
         println!(
-            "\nDRY-RUN: re-run with `--apply` to adopt (verify-open → swap, retaining the crashed copy)."
+            "\nDRY-RUN: re-run with `--apply` to adopt (copy → verify-open the COPY → swap, retaining \
+             the crashed copy). The source snapshot is never mutated."
         );
         return Ok(());
     }
