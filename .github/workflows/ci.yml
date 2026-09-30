@@ -349,6 +349,71 @@ jobs:
             fi
           done
 
+      # v0.8.0 BLOB TENANT-CONFINEMENT HARD GATE (marker `BLOB TENANT-CONFINEMENT OK`). The plain
+      # `wasi:blobstore` binding was site-scoped, NOT tenant-scoped — a guest granted it could
+      # open("assets-<other-tid>") and get/list/put/DELETE/clear another tenant's objects in a
+      # multi-tenant site (a LIVE cross-tenant read+destroy hole). The host now confines every
+      # container op to the invocation's resolved OWN tenant at the single choke point
+      # `BlobHost::container_prefix` (a `{tenant}`-templated `blobstore_containers` allowlist,
+      # exact-matched after host-expanding the own tenant; multi-tenant deny-default; single-tenant
+      # permissive; object names validated). This gate drives that choke point end to end; the marker
+      # + pass count catch a silent skip/rename. MUTATION-VERIFIED (the #503 convention): the SAME
+      # test re-run under each `BOATRAMP_BLOBCONFINE_MUTATION` flips ONE expectation to the insecure
+      # outcome (a cross-tenant op allowed, a `{tenant}` entry expanded with no resolved tenant, the
+      # deny-default dropped, a Disabled binding denied, an operator `shared` container refused, a
+      # `../escape` object name accepted) and MUST FAIL — a PASS-under-mutation (a hollow gate) fails
+      # the merge.
+      - name: "v0.8.0 blob tenant-confinement gate"
+        run: |
+          set -eo pipefail
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-handlers \
+            --features engine blob_tenant_confinement_gate -- --nocapture 2>&1 | tee blob-confine.log
+          grep -qE 'test result: ok\. 1 passed' blob-confine.log \
+            || { echo "::error::blob tenant-confinement gate did not run (silent skip or a failure)" >&2; exit 1; }
+          grep -q 'BLOB TENANT-CONFINEMENT OK' blob-confine.log \
+            || { echo "::error::blob tenant-confinement gate never reached its marker (a cross-tenant blob confinement regression)" >&2; exit 1; }
+          # Mutation guard: each mutation MUST fail the gate (proving it is sensitive, not hollow).
+          for mut in cross_tenant_open no_tenant_expands multitenant_open disabled_denied shared_denied traversal_allowed; do
+            if BOATRAMP_BLOBCONFINE_MUTATION="$mut" cargo-zigbuild test --target x86_64-unknown-linux-musl \
+              -p boatramp-handlers --features engine blob_tenant_confinement_gate \
+              -- --nocapture > "blob-confine-mutation-$mut.log" 2>&1; then
+              echo "::error::blob tenant-confinement gate is HOLLOW — it passed under mutation '$mut' (a cross-tenant blob confinement property is not actually enforced)" >&2
+              exit 1
+            else
+              echo "blob-confine mutation verified: '$mut' fails the gate as expected."
+            fi
+          done
+
+      # v0.8.0 BLOB DIMENSION-0 HARD GATE (marker `BLOB DIMENSION-0 GATE OK`). `wasi:blobstore` carries
+      # per-tenant blob assets, so it is a tenant-scoped DATA capability like sql/orm: on a multi-tenant
+      # (strict `require_declaration`) posture a blob importer MUST declare a `tenancy` decision, else it
+      # would bind permissive and slip past the confinement gate above (the HIGH-1 finding — a blob-only
+      # GC sweep with no `tenancy` block stayed cross-tenant-open). This gate drives the REAL
+      # `build_function_bindings` path: an undeclared blob-only importer is REFUSED under the strict
+      # posture, a declared `Scoped`+allowlist importer binds, and an explicit `Disabled` importer binds
+      # permissive (MEDIUM-1). MUTATION-VERIFIED: each `BOATRAMP_BLOBDIM0_MUTATION` flips one expectation
+      # (undeclared binds / Disabled refused / scoped refused) and MUST FAIL.
+      - name: "v0.8.0 blob Dimension-0 gate"
+        run: |
+          set -eo pipefail
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-server \
+            --features handlers,oidc,mcp,compression,domain-verify-dns blob_dimension0_gate \
+            -- --nocapture 2>&1 | tee blob-dim0.log
+          grep -qE 'test result: ok\. 1 passed' blob-dim0.log \
+            || { echo "::error::blob Dimension-0 gate did not run (silent skip or a failure)" >&2; exit 1; }
+          grep -q 'BLOB DIMENSION-0 GATE OK' blob-dim0.log \
+            || { echo "::error::blob Dimension-0 gate never reached its marker (a blob tenancy-declaration regression)" >&2; exit 1; }
+          for mut in undeclared_binds disabled_refused scoped_refused; do
+            if BOATRAMP_BLOBDIM0_MUTATION="$mut" cargo-zigbuild test --target x86_64-unknown-linux-musl \
+              -p boatramp-server --features handlers,oidc,mcp,compression,domain-verify-dns \
+              blob_dimension0_gate -- --nocapture > "blob-dim0-mutation-$mut.log" 2>&1; then
+              echo "::error::blob Dimension-0 gate is HOLLOW — it passed under mutation '$mut' (the blob Dimension-0 tenancy-declaration requirement is not actually enforced)" >&2
+              exit 1
+            else
+              echo "blob-dim0 mutation verified: '$mut' fails the gate as expected."
+            fi
+          done
+
   # SlateDB WAL-recovery HARD GATE (v0.5.5 incident: the control-plane KV was unbootable with
   # `Data error: empty SSTable` after a crash / crash-consistent snapshot froze a zero-byte tail WAL
   # object). Proves a store with such a frozen tail WAL still OPENS — the incident fix (`slatedb` 0.16
