@@ -32,6 +32,63 @@ pub enum WriteOp {
     Delete(String),
 }
 
+/// The cold-open recovery policy for the control-plane KV store (v0.9.0 KV-recovery, C3/C7/C8/C11).
+/// Defined here (not in `boatramp-storage`) so it is available regardless of the `slatedb` feature —
+/// `boatramp-node`'s (non-feature-gated) `build_kv` takes it, and the SlateDB opener consumes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KvOpenPolicy {
+    /// **Fail LOUD** on ANY torn/unbootable store — the pre-v0.9.0 behavior. The opt-out
+    /// (`--strict-kv` / `BOATRAMP_KV_STRICT=1`), and the enforced default for a cluster node-local
+    /// durable store (C8 — auto-quarantining a Raft log tail could drop a committed entry / desync
+    /// the log↔state-machine; a cluster fails-loud-then-rejoins from peers).
+    Strict,
+    /// **Self-heal** a provably-safe trailing torn WAL tail (dry-run scan → quarantine → open); fail
+    /// LOUD on any UNSAFE shape (out-of-scope torn compacted/L0 SST, mid-range gap/hole, unreadable
+    /// manifest). The default for a single-node control-plane store (C8). A non-empty self-heal
+    /// writes a durable degraded breadcrumb (C6).
+    SelfHeal,
+}
+
+/// A durable **degraded-state breadcrumb** (v0.9.0 KV-recovery, C6) written when a self-heal-on-open
+/// quarantined a NON-empty torn WAL tail — i.e. the control-plane store came back only after dropping
+/// a (bounded) trailing tail that MIGHT have held acked-into-WAL-but-not-yet-L0 writes. It is written
+/// as a plain JSON object at `{store-root}/DEGRADED.json` (an object-store file alongside `wal/` /
+/// `compacted/` / `manifest/`, so it is readable WITHOUT the LSM store being bootable), surfaced on
+/// `GET /api/kv-status` + `boatramp kv status`, and cleared by `boatramp kv status --ack`. A zero-loss
+/// self-heal (empty quarantine) writes NO marker (the quiet common path is a single INFO line).
+///
+/// Defined here (not in `boatramp-storage`) because `serde_json` is unconditional in `boatramp-core`
+/// but only feature-optional in `boatramp-storage`; the storage opener builds this + calls
+/// [`to_json_bytes`](Self::to_json_bytes) and writes the bytes through the object store, and the
+/// readers ([`boatramp kv status`], `GET /api/kv-status`) parse them with
+/// [`from_json_bytes`](Self::from_json_bytes).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DegradedMarker {
+    /// Unix seconds when the self-heal ran (matches the `wal-quarantine/{stamp}` dir stamp).
+    pub stamp: u64,
+    /// The WAL ids of the torn trailing tail that was quarantined (dropped from the live store).
+    pub quarantined_ids: Vec<u64>,
+    /// A human-readable statement of the bounded loss window — the WAL id range beyond the durable
+    /// frontier that was quarantined. HONEST (C13): these bytes are preserved for FORENSICS ONLY;
+    /// there is no supported recovery of acked KV pairs from a torn version-0 SST.
+    pub loss_window: String,
+    /// Where the torn bytes were copied before removal (`{root}/wal-quarantine/{stamp}`), for forensics.
+    pub quarantine_dir: String,
+}
+
+impl DegradedMarker {
+    /// Serialize to pretty JSON bytes for the `{root}/DEGRADED.json` object.
+    pub fn to_json_bytes(&self) -> Vec<u8> {
+        // `unwrap` is safe: the struct is plain owned data with no non-serializable fields.
+        serde_json::to_vec_pretty(self).unwrap_or_default()
+    }
+
+    /// Parse from the `{root}/DEGRADED.json` object bytes; `None` if the bytes are absent/unparseable.
+    pub fn from_json_bytes(bytes: &[u8]) -> Option<Self> {
+        serde_json::from_slice(bytes).ok()
+    }
+}
+
 /// A minimal key/value store for small values, with atomic per-key writes.
 #[async_trait]
 pub trait KvStore: Send + Sync {

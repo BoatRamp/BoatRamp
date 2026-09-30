@@ -292,14 +292,20 @@ pub struct ServeArgs {
     #[arg(long, env = "BOATRAMP_KV_S3_PREFIX", default_value = "_kv")]
     kv_s3_prefix: String,
 
-    /// Opt-in: repair a torn TRAILING WAL tail on the control-plane SlateDB store BEFORE
-    /// opening it (the P0 crash/snapshot recovery). OR-ed with the `BOATRAMP_KV_REPAIR=1`
-    /// env, so a stuck node can be recovered by a redeploy with no ssh. The repair only ever
-    /// quarantines a physically-torn object that is strictly trailing AND beyond the durable
-    /// frontier; it REFUSES (fails loud) on a mid-range gap or an unreadable manifest, and
-    /// never runs on the default cold open. Applies to the SlateDB backend only.
+    /// LEGACY (v0.9.0: now redundant). Before v0.9.0 this opted a single-node cold open into
+    /// repairing a torn TRAILING WAL tail. Self-heal-on-open is now the DEFAULT for the single-node
+    /// control-plane store, so this flag is honored as a NO-OP with a one-line log. (On a cluster
+    /// node it still opts the node-local Raft store into the tail repair — the cluster stays strict.)
     #[arg(long, env = "BOATRAMP_KV_REPAIR")]
     repair_wal: bool,
+
+    /// Restore the pre-v0.9.0 FAIL-LOUD-on-any-torn-store behavior for the single-node control-plane
+    /// SlateDB store (paranoid mode): a torn tail is NOT auto-quarantined — the node fails loud
+    /// naming `kv recover` and (via C5) binds a recovery-mode listener rather than serving. Inverts
+    /// the v0.9.0 default (self-heal a provably-safe trailing tail; loud only on an unsafe shape).
+    /// A cluster node-local store is ALWAYS strict regardless of this flag (C8).
+    #[arg(long, env = "BOATRAMP_KV_STRICT")]
+    strict_kv: bool,
 
     /// GCS bucket (required for `--blobs gcs`).
     #[arg(long, env = "BOATRAMP_GCS_BUCKET")]
@@ -747,9 +753,49 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
         path_style: args.s3_path_style,
         prefix: args.kv_s3_prefix.clone(),
     });
+    // Cold-open recovery policy (v0.9.0 KV-recovery, C8/C11). This `run` is the SINGLE-NODE path
+    // (the `:672` dispatch already forked cluster → `run_cluster`), so the DEFAULT is self-heal a
+    // provably-safe trailing torn WAL tail; `--strict-kv` / `BOATRAMP_KV_STRICT=1` restores the
+    // pre-v0.9.0 fail-loud. (The cluster node-local Raft store opens in `run_cluster` and stays
+    // strict — C8 — with its own opt-in `--repair-wal`.)
+    let kv_policy = if args.strict_kv {
+        boatramp_core::kv::KvOpenPolicy::Strict
+    } else {
+        boatramp_core::kv::KvOpenPolicy::SelfHeal
+    };
+    // C11 — log the active mode EVERY boot, so a torn-tail outcome is always attributable.
+    match kv_policy {
+        boatramp_core::kv::KvOpenPolicy::SelfHeal => tracing::info!(
+            "control-plane KV open policy: SELF-HEAL (default) — a provably-safe trailing torn WAL \
+             tail is auto-quarantined on open; an unsafe shape fails loud. `--strict-kv` opts out."
+        ),
+        boatramp_core::kv::KvOpenPolicy::Strict => tracing::info!(
+            "control-plane KV open policy: STRICT (`--strict-kv`/BOATRAMP_KV_STRICT) — a torn store \
+             fails loud into recovery mode; no auto-quarantine."
+        ),
+    }
+    // C11 — a stale `--repair-wal` / `BOATRAMP_KV_REPAIR=1` is now redundant (self-heal is the
+    // default); honor it as a NO-OP with a one-line log, never silently change its meaning.
+    if args.repair_wal && !args.strict_kv {
+        tracing::info!(
+            "note: `--repair-wal` / `BOATRAMP_KV_REPAIR=1` is now the DEFAULT self-heal on the \
+             single-node control plane — the flag/env is redundant (honored as a no-op)."
+        );
+    }
     let kv_backend =
-        boatramp_node::backends::build_kv(args.kv, &data_dir, slate_s3.as_ref(), args.repair_wal)
-            .await?;
+        match boatramp_node::backends::build_kv(args.kv, &data_dir, slate_s3.as_ref(), kv_policy)
+            .await
+        {
+            Ok(backend) => backend,
+            // C5 — a FATAL control-plane KV open (strict mode, or an unsafe shape self-heal refused)
+            // must NOT propagate to `exit(1)` and a fly crash-loop. For the SlateDB backend, bind a
+            // recovery-mode listener (503 for sites, 200 for probes, diagnosis on `/api/kv-status`).
+            Err(e) if matches!(args.kv, boatramp_node::backends::KvBackend::Slatedb) => {
+                return enter_kv_recovery_mode(addr, &data_dir, slate_s3.as_ref(), &e.to_string())
+                    .await;
+            }
+            Err(e) => return Err(e.into()),
+        };
     // Shared-mode coherence: when several processes share
     // one KV, publish each write to a changelog over the *uncached* backend and
     // poll it to invalidate peer-changed keys.
@@ -851,6 +897,13 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
         boatramp_server::config_baseline(&options),
     ));
     options.daemon_runtime = Some(daemon_runtime.clone());
+    // Boot snapshot of the KV degraded state for `GET /api/kv-status` (v0.9.0 KV-recovery, C6): if a
+    // self-heal-on-open quarantined a torn tail this boot, the store wrote a DEGRADED.json breadcrumb
+    // — surface it on the running (store-UP) server too, not only via `boatramp kv status`.
+    #[cfg(feature = "slatedb")]
+    {
+        options.kv_degraded = read_kv_degraded_best_effort(&data_dir, slate_s3.as_ref()).await;
+    }
     spawn_sighup_reload(kv.clone(), Some(daemon_runtime.clone()));
     if let Some(changelog) = changelog {
         spawn_cache_poller(changelog, kv.clone(), Some(daemon_runtime.clone()));
@@ -1303,6 +1356,83 @@ fn spawn_kv_checkpoint(kv: Arc<dyn KvStore>, interval: Option<std::time::Duratio
             }
         }
     });
+}
+
+/// Best-effort read of the control-plane store's `DEGRADED.json` breadcrumb (v0.9.0 KV-recovery, C6)
+/// WITHOUT opening the LSM store — used by the recovery-mode listener when the store will not open.
+/// Builds the SAME object store + root the opener uses; ANY failure (store build, read) yields `None`
+/// so the recovery listener still comes up with at least the open error.
+#[cfg(feature = "slatedb")]
+async fn read_kv_degraded_best_effort(
+    data_dir: &Path,
+    slate_s3: Option<&boatramp_node::backends::SlateKvS3>,
+) -> Option<boatramp_core::kv::DegradedMarker> {
+    use boatramp_storage::object_store::ObjectStore;
+    let (store, root): (Arc<dyn ObjectStore>, String) = match slate_s3 {
+        Some(s3) => (
+            boatramp_storage::kv_slatedb::s3_object_store(&boatramp_storage::S3StoreConfig {
+                bucket: s3.bucket.clone(),
+                endpoint: s3.endpoint.clone(),
+                region: s3.region.clone(),
+                path_style: s3.path_style,
+            })
+            .ok()?,
+            s3.prefix.clone(),
+        ),
+        None => (
+            Arc::new(
+                boatramp_storage::kv_slatedb::local_object_store(&data_dir.join("kv-slate"))
+                    .ok()?,
+            ),
+            "kv".to_string(),
+        ),
+    };
+    boatramp_storage::kv_slatedb::read_degraded_marker(&store, &root)
+        .await
+        .ok()
+        .flatten()
+}
+
+/// Enter the RECOVERY-MODE listener (v0.9.0 KV-recovery, C5) after a FATAL control-plane KV open —
+/// instead of `exit(1)` into a fly crash-loop. Reads the `DEGRADED.json` breadcrumb (best-effort,
+/// no store open), builds the `GET /api/kv-status` JSON diagnostic (open error + any breadcrumb +
+/// the recovery steps), and binds the recovery listener on `addr` (503 for sites, 200 for probes).
+async fn enter_kv_recovery_mode(
+    addr: SocketAddr,
+    data_dir: &Path,
+    slate_s3: Option<&boatramp_node::backends::SlateKvS3>,
+    open_err: &str,
+) -> Result<()> {
+    tracing::error!(
+        error = %open_err,
+        "control-plane KV FAILED TO OPEN — entering recovery mode (binding a 503 listener, NOT \
+         exiting into a crash-loop). Diagnose via `GET /api/kv-status` or `boatramp kv recover`."
+    );
+    #[cfg(feature = "slatedb")]
+    let marker = read_kv_degraded_best_effort(data_dir, slate_s3).await;
+    #[cfg(not(feature = "slatedb"))]
+    let marker: Option<boatramp_core::kv::DegradedMarker> = {
+        let _ = (data_dir, slate_s3);
+        None
+    };
+    let kv_status_json = serde_json::to_string_pretty(&serde_json::json!({
+        "state": if marker.is_some() { "degraded_after_self_heal" } else { "unbootable" },
+        "error": open_err,
+        "degraded": marker,
+        "recovery": "Run `boatramp kv recover` (dry-run) to diagnose the whole store; \
+                     `boatramp kv recover --apply` to repair a safe trailing tail in place, or \
+                     `boatramp kv recover --adopt-volume <mounted-path>` to adopt a clean fly \
+                     volume snapshot. `boatramp kv repair` is the offline tail-only quarantine. \
+                     `boatramp kv status` shows this; `--ack` clears the breadcrumb once reviewed.",
+    }))
+    .unwrap_or_else(|_| "{}".to_string());
+    let diagnostic = boatramp_server::RecoveryDiagnostic {
+        error: open_err.to_string(),
+        kv_status_json,
+    };
+    boatramp_server::serve_recovery_mode(addr, diagnostic)
+        .await
+        .map_err(Error::Serve)
 }
 
 /// Drive the shared-mode cache-coherence poller: every

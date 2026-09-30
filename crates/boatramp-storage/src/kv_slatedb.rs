@@ -27,13 +27,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use boatramp_core::kv::{KvError, KvStore, WriteOp};
+use boatramp_core::kv::{DegradedMarker, KvError, KvStore, WriteOp};
 use slatedb::config::{FlushOptions, FlushType};
-use slatedb::object_store::ObjectStore;
 use slatedb::object_store::local::LocalFileSystem;
+use slatedb::object_store::path::Path as ObjPath;
+use slatedb::object_store::{ObjectStore, ObjectStoreExt};
 use slatedb::{Db, DbReader, DbReaderBuilder, Settings, WriteBatch};
 
 pub use crate::wal_repair::{RepairMode, RepairReport, WalRepairError};
+// The cold-open recovery policy lives in `boatramp-core` (available without the `slatedb` feature,
+// which `boatramp-node::build_kv` needs); re-exported here for the storage-facing openers.
+pub use boatramp_core::kv::KvOpenPolicy;
 
 /// A SlateDB-backed key/value store — either the single **writer** or a
 /// read-only **reader replica**. SlateDB is
@@ -74,26 +78,28 @@ fn backend<E: std::fmt::Display>(err: E) -> KvError {
 /// empty-SSTable symptom) — extend the message to name the OPT-IN repair. The default cold open
 /// stays FAIL-LOUD (SAFETY: quarantining acked-into-WAL data is an operator decision, never
 /// automatic), so this only makes the loud failure *actionable*, it does not repair anything.
-fn map_open_error(err: slatedb::Error) -> KvError {
-    let raw = err.to_string();
+/// Whether a SlateDB open/build error Display looks like a **torn / unbootable STORE** — a corruption
+/// the self-heal-on-open (or `kv recover`) targets — as opposed to a concurrent-writer / lifecycle
+/// error (a fence or a closed store), which recover must NOT be pointed at. Shared by
+/// [`map_open_error`] (message shape) and the self-heal decision in [`SlateKv::open_self_heal`]
+/// (whether a failed plain open is even a candidate for self-heal). See C4.
+fn open_error_looks_torn(raw: &str) -> bool {
+    // Concurrent-writer fence / closed store: NOT a torn store — exclude first.
+    if raw.contains("detected newer DB client")
+        || raw.contains("Fenced")
+        || raw.contains("db is closed")
+    {
+        return false;
+    }
     // The torn-SST signatures slatedb surfaces on replay of a partial object: the >10-byte partial
     // (`InvalidVersion { actual_version: 0 }`) and the empty-SSTable symptom. Matched on the message
     // (slatedb exposes no stable typed variant for these across versions). slatedb's ACTUAL `Display`
     // for the version error is `"unsupported {format} format version. supported_versions=…,
     // actual_version=…"` — it does NOT contain the Debug name `"InvalidVersion"`, and only
-    // incidentally contains `"actual_version"`; match the Display form (`unsupported` + `format
-    // version`) explicitly so the loud, actionable message fires regardless of Debug-vs-Display.
-    //
-    // C4 — BROADEN beyond the version-0 signature to EVERY unbootable-store shape: a truncated edge
-    // surfaces as `ChecksumMismatch` ("checksum mismatch") or `WalTruncated` ("wal truncated at wal
-    // file …"), a torn block as "wal data error" / "invalid sst error" / "empty block", and a
-    // missing object as the wrapped object-store not-found. The footer probe cannot see all of
-    // these, so the store can still fail its cold open with one of them — and the operator needs the
-    // same actionable recover pointer, not a bare slatedb error. `map_open_error` is only ever
-    // called on an open FAILURE, so appending the recover hint is correct for the whole set below.
-    // We deliberately EXCLUDE `Fenced` ("detected newer DB client") and "db is closed" — those are
-    // a concurrent-writer / lifecycle problem, not a torn store, and `kv recover` is the wrong tool.
-    let looks_torn = raw.contains("InvalidVersion")
+    // incidentally contains `"actual_version"`. C4 BROADENS to EVERY unbootable-store shape: a
+    // truncated edge → `ChecksumMismatch` / `WalTruncated`, a torn block → "wal data error" /
+    // "invalid sst" / "empty block", a missing object → the wrapped object-store not-found.
+    raw.contains("InvalidVersion")
         || raw.contains("actual_version")
         || (raw.contains("unsupported") && raw.contains("format version"))
         || raw.contains("empty SSTable")
@@ -106,7 +112,19 @@ fn map_open_error(err: slatedb::Error) -> KvError {
         || raw.contains("invalid sst")
         || raw.contains("empty block")
         || raw.contains("empty manifest")
-        || raw.contains("invalid DB state");
+        || raw.contains("invalid DB state")
+}
+
+/// Map a SlateDB open/build error into a [`KvError`], and — when it looks like a **torn/unbootable
+/// store** — extend the message to name the recovery paths. The default cold open (strict) stays
+/// FAIL-LOUD; this only makes the loud failure *actionable*. Under the v0.9.0 self-heal-on-open
+/// default a torn TRAILING tail is auto-quarantined instead, so this loud message is reached only in
+/// strict mode or for an unsafe shape.
+fn map_open_error(err: slatedb::Error) -> KvError {
+    let raw = err.to_string();
+    // `map_open_error` is only ever called on an open FAILURE, so the recover pointer is correct for
+    // the whole torn set. `Fenced`/closed (a lifecycle problem) is carved out by `open_error_looks_torn`.
+    let looks_torn = open_error_looks_torn(&raw);
     let is_lifecycle = raw.contains("detected newer DB client")
         || raw.contains("Fenced")
         || raw.contains("db is closed");
@@ -185,6 +203,84 @@ fn settings_with_flush(flush_interval: Duration) -> Settings {
     Settings {
         flush_interval: Some(flush_interval),
         ..Settings::default()
+    }
+}
+
+/// The durable degraded-state breadcrumb object path (v0.9.0 KV-recovery, C6): `{root}/DEGRADED.json`,
+/// an object-store file alongside `wal/` / `compacted/` / `manifest/` so it is readable WITHOUT the
+/// LSM store being bootable (the recovery-mode `GET /api/kv-status` + `boatramp kv status` read it).
+fn degraded_marker_path(root: &str) -> ObjPath {
+    ObjPath::from(format!("{root}/DEGRADED.json"))
+}
+
+/// Write the [`DegradedMarker`] breadcrumb after a non-empty self-heal (C6). Best-effort: the store
+/// is already open and serving, so a marker-write failure is LOGGED, not fatal (it only costs the
+/// operator the breadcrumb, never availability). Returns the stamp for the log line.
+pub async fn write_degraded_marker(
+    store: &Arc<dyn ObjectStore>,
+    root: &str,
+    report: &RepairReport,
+) -> String {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let loss_window = match (
+        report.quarantined.iter().min(),
+        report.quarantined.iter().max(),
+    ) {
+        (Some(&lo), Some(&hi)) => format!(
+            "WAL ids {lo:020}..={hi:020} beyond the durable frontier {:020} were quarantined; these \
+             bytes are preserved for FORENSICS ONLY (no supported recovery of acked pairs)",
+            report.frontier
+        ),
+        _ => format!("frontier {:020}; no ids quarantined", report.frontier),
+    };
+    let marker = DegradedMarker {
+        stamp,
+        quarantined_ids: report.quarantined.clone(),
+        loss_window,
+        quarantine_dir: report.quarantine_dir.clone().unwrap_or_default(),
+    };
+    let path = degraded_marker_path(root);
+    if let Err(e) = store.put(&path, marker.to_json_bytes().into()).await {
+        tracing::warn!(error = %e, path = %path, "failed to write the KV DEGRADED.json breadcrumb (self-heal still succeeded)");
+    }
+    format!("{stamp:020}")
+}
+
+/// Read the [`DegradedMarker`] breadcrumb, if any, for `GET /api/kv-status` + `boatramp kv status`.
+/// `Ok(None)` when no marker is present (a clean store, or a zero-loss self-heal). Reads through the
+/// object store, so it works even when the LSM store itself will not open.
+pub async fn read_degraded_marker(
+    store: &Arc<dyn ObjectStore>,
+    root: &str,
+) -> Result<Option<DegradedMarker>, KvError> {
+    let path = degraded_marker_path(root);
+    match store.get(&path).await {
+        Ok(get) => {
+            let bytes = get.bytes().await.map_err(backend)?;
+            Ok(DegradedMarker::from_json_bytes(&bytes))
+        }
+        // Absent ⇒ no degraded state. Any object-store NotFound maps here.
+        Err(object_store::Error::NotFound { .. }) => Ok(None),
+        Err(e) => Err(backend(e)),
+    }
+}
+
+/// Clear the [`DegradedMarker`] breadcrumb (`boatramp kv status --ack`). Returns whether a marker was
+/// present (so `--ack` can report "acknowledged" vs "nothing to acknowledge"). Deleting an absent
+/// marker is not an error (idempotent).
+pub async fn clear_degraded_marker(
+    store: &Arc<dyn ObjectStore>,
+    root: &str,
+) -> Result<bool, KvError> {
+    let existed = read_degraded_marker(store, root).await?.is_some();
+    let path = degraded_marker_path(root);
+    match store.delete(&path).await {
+        Ok(()) => Ok(existed),
+        Err(object_store::Error::NotFound { .. }) => Ok(false),
+        Err(e) => Err(backend(e)),
     }
 }
 
@@ -357,11 +453,181 @@ impl SlateKv {
             Ok(db) => db,
             Err(err) => return Err(map_open_error(err)),
         };
-        Ok(Self {
+        Ok(Self::from_writer(db))
+    }
+
+    /// Wrap an opened SlateDB writer `Db` as a control-plane [`SlateKv`] (fresh CAS lock + a clean
+    /// checkpoint dirty flag). The single writer-handle constructor, shared by every open path.
+    fn from_writer(db: Db) -> Self {
+        Self {
             backend: Backend::Writer(Arc::new(db)),
             cas_lock: Arc::new(tokio::sync::Mutex::new(())),
             dirty: Arc::new(AtomicBool::new(false)),
-        })
+        }
+    }
+
+    /// Open a local control-plane store under `dir` with the given [`KvOpenPolicy`] (v0.9.0
+    /// KV-recovery, C3/C7/C8/C11). Builds the SAME `LocalFileSystem`-over-`"kv"` store the plain
+    /// opener uses, so the self-heal sees exactly the objects the open would replay.
+    pub async fn open_local_with_flush_policy(
+        dir: impl AsRef<Path>,
+        flush_interval: Duration,
+        policy: KvOpenPolicy,
+    ) -> Result<Self, KvError> {
+        std::fs::create_dir_all(&dir)?;
+        let fs = local_object_store(dir.as_ref())?;
+        Self::open_with_policy(
+            Arc::new(fs),
+            "kv",
+            settings_with_flush(flush_interval),
+            policy,
+        )
+        .await
+    }
+
+    /// Open an S3/R2 control-plane store with the given [`KvOpenPolicy`] (see
+    /// [`open_local_with_flush_policy`](Self::open_local_with_flush_policy)).
+    pub async fn open_s3_with_flush_policy(
+        cfg: &S3StoreConfig,
+        path: &str,
+        flush_interval: Duration,
+        policy: KvOpenPolicy,
+    ) -> Result<Self, KvError> {
+        Self::open_with_policy(
+            build_s3_object_store(cfg)?,
+            path,
+            settings_with_flush(flush_interval),
+            policy,
+        )
+        .await
+    }
+
+    /// Open with a [`KvOpenPolicy`]: [`Strict`](KvOpenPolicy::Strict) is the plain cold open (a torn
+    /// store fails LOUD, unchanged); [`SelfHeal`](KvOpenPolicy::SelfHeal) auto-recovers a
+    /// provably-safe trailing torn WAL tail and fails LOUD on any unsafe shape (C3/C7).
+    async fn open_with_policy(
+        store: Arc<dyn ObjectStore>,
+        path: &str,
+        settings: Settings,
+        policy: KvOpenPolicy,
+    ) -> Result<Self, KvError> {
+        match policy {
+            KvOpenPolicy::Strict => Self::open_with_repair(store, path, settings, None).await,
+            KvOpenPolicy::SelfHeal => Self::open_self_heal(store, path, settings).await,
+        }
+    }
+
+    /// The self-heal-on-open path (v0.9.0 KV-recovery, C3/C7). Runs pre-open in the fenced,
+    /// single-writer context (no concurrent writer), so the frontier the self-heal reads is exactly
+    /// the one the open replays.
+    ///
+    /// 1. FAST PATH: try a plain open. A clean store (the overwhelming common case) opens with ZERO
+    ///    repair-scan overhead. A non-torn failure (a concurrent-writer fence, a closed store) fails
+    ///    LOUD unchanged — self-heal is NEVER attempted for those (`open_error_looks_torn`).
+    /// 2. C3 — DRY-RUN FIRST: on a torn/unbootable open, scan the WHOLE store WITHOUT mutating. Any
+    ///    refusal (mid-range gap/hole, unreadable manifest) propagates LOUD; any out-of-scope torn
+    ///    object (a torn compacted/L0 SST, a torn non-trailing WAL object) is an UNSAFE shape ⇒ fail
+    ///    LOUD, mutate NOTHING (fixes the ordering bug where a naive apply would quarantine the WAL
+    ///    tail then still die on a torn compacted SST). Only a SOLE safe-trailing-torn-tail proceeds.
+    /// 3. APPLY: quarantine the safe tail (copy → manifest → delete → REAL-open verify, C4). A
+    ///    verification failure fails LOUD (never claim success). Then write the durable
+    ///    `{root}/DEGRADED.json` breadcrumb (C6) + a structured WARN, and open the serving writer.
+    /// 4. A refusal at ANY step is FATAL (C7): return `Err` — NEVER boot-anyway. The caller turns a
+    ///    fatal open into a recovery-mode listener (C5), not an `exit(1)` crash-loop.
+    async fn open_self_heal(
+        store: Arc<dyn ObjectStore>,
+        path: &str,
+        settings: Settings,
+    ) -> Result<Self, KvError> {
+        // 1. Fast path — a clean store opens directly.
+        match Db::builder(path.to_string(), store.clone())
+            .with_settings(settings.clone())
+            .build()
+            .await
+        {
+            Ok(db) => {
+                tracing::info!(
+                    "control-plane KV opened cleanly (self-heal armed; nothing to repair)"
+                );
+                return Ok(Self::from_writer(db));
+            }
+            Err(err) => {
+                let raw = err.to_string();
+                if !open_error_looks_torn(&raw) {
+                    // A concurrent-writer fence / closed store / other non-torn failure: fail LOUD,
+                    // NEVER self-heal (recover is the wrong tool — see `map_open_error`).
+                    return Err(map_open_error(err));
+                }
+                tracing::warn!(
+                    error = %raw,
+                    "control-plane KV cold open failed with a torn/unbootable signature; running \
+                     self-heal (dry-run first, C3)"
+                );
+            }
+        }
+
+        // 2. C3 — dry-run the WHOLE store first; a refusal (mid-range gap/hole, unreadable manifest)
+        //    propagates LOUD, mutating nothing.
+        let dry = crate::wal_repair::repair_wal_tail(&store, path, RepairMode::DryRun)
+            .await
+            .map_err(|e| KvError::backend(e.to_string()))?;
+        if !dry.out_of_scope_torn.is_empty() {
+            // UNSAFE shape — a torn compacted/L0 SST (or torn non-trailing WAL object) the self-heal
+            // must NOT touch. Fail LOUD naming it; mutate NOTHING (C3/C7).
+            let objects: Vec<String> = dry
+                .out_of_scope_torn
+                .iter()
+                .map(|t| format!("{} ({:?})", t.path, t.kind))
+                .collect();
+            return Err(KvError::backend(format!(
+                "control-plane KV self-heal REFUSED: the store at `{path}` holds a torn SST OUTSIDE \
+                 the safe trailing-WAL-tail scope that auto-heal must NOT remove (a compacted/L0 SST \
+                 is manifest-referenced; removing it would drop acked data). Torn out-of-scope \
+                 object(s): [{}]. This is beyond auto-heal AND beyond `kv repair` (tail-only). \
+                 Recover with `boatramp kv recover --adopt-volume <mounted-path>` (attach a clean \
+                 volume snapshot). Nothing was mutated.",
+                objects.join(", ")
+            )));
+        }
+        if dry.quarantined.is_empty() {
+            // Torn open but NOTHING safe to quarantine (a truncated edge the probe cannot localize,
+            // or a corruption inside a readable-looking object). Cannot self-heal ⇒ fail LOUD.
+            return Err(KvError::backend(format!(
+                "control-plane KV self-heal could not localize a safe trailing torn WAL tail at \
+                 `{path}` (the store is torn but no auto-healable tail was found — e.g. a truncated \
+                 edge or a torn readable object). Recover with `boatramp kv recover`. Nothing was \
+                 mutated."
+            )));
+        }
+
+        // 3. APPLY — quarantine the sole safe trailing torn tail (+ C4 real-open verify inside).
+        let report = crate::wal_repair::repair_wal_tail(&store, path, RepairMode::Apply)
+            .await
+            .map_err(|e| KvError::backend(e.to_string()))?;
+        // C6 — a non-empty self-heal writes the durable degraded breadcrumb + a structured WARN.
+        if !report.quarantined.is_empty() {
+            let stamp = write_degraded_marker(&store, path, &report).await;
+            tracing::warn!(
+                target: "kv_self_healed",
+                frontier = report.frontier,
+                quarantined_ids = ?report.quarantined,
+                quarantine_dir = report.quarantine_dir.as_deref().unwrap_or(""),
+                degraded_marker = %stamp,
+                "control-plane KV SELF-HEALED on open: quarantined a torn trailing WAL tail beyond \
+                 the durable frontier and opened. A hard-crash tail MAY have held acked-into-WAL- \
+                 but-not-yet-L0 writes; those bytes are preserved for FORENSICS ONLY (no supported \
+                 recovery of acked pairs from a torn version-0 SST). Ack with `boatramp kv status \
+                 --ack` once reviewed."
+            );
+        }
+
+        // 4. Open the serving writer over the now-clean store (the Apply's verify used a throwaway).
+        let db = Db::builder(path.to_string(), store)
+            .with_settings(settings)
+            .build()
+            .await
+            .map_err(map_open_error)?;
+        Ok(Self::from_writer(db))
     }
 
     /// Open a **read-only replica** over an `object_store` backend that some
@@ -971,6 +1237,164 @@ mod tests {
             "an idle checkpoint is a dirty-gated no-op (frontier unchanged)"
         );
         kv.close().await.unwrap();
+    }
+
+    // ===================================================================================
+    // Self-heal-on-open gates (v0.9.0 KV-recovery, C3/C7). InMemory (non-stalling): seed a real
+    // store, inject a torn shape, then open via `open_with_policy` and assert the flip's behavior.
+    // ===================================================================================
+
+    /// Seed a real store over `store`: one durable write + a clean close (frontier past the write).
+    /// Returns the durable frontier so a test can inject strictly beyond it.
+    async fn seed_and_frontier(store: &Arc<dyn ObjectStore>, root: &str) -> u64 {
+        {
+            let kv = SlateKv::open_with(
+                store.clone(),
+                root,
+                test_settings(Some(Duration::from_millis(5))),
+            )
+            .await
+            .unwrap();
+            kv.put("secret/acme/idp", b"sealed-oauth".to_vec())
+                .await
+                .unwrap();
+            kv.close().await.unwrap();
+        }
+        crate::wal_repair::repair_wal_tail(store, root, RepairMode::DryRun)
+            .await
+            .unwrap()
+            .frontier
+    }
+
+    /// Put a crafted >10-byte version-0 torn WAL object at `{root}/wal/{id:020}.sst`.
+    async fn put_torn_wal(store: &Arc<dyn ObjectStore>, root: &str, id: u64) {
+        let mut body = vec![0xABu8; 64];
+        let n = body.len();
+        body[n - 2..n].copy_from_slice(&0u16.to_be_bytes());
+        store
+            .put(
+                &ObjPath::from(format!("{root}/wal/{id:020}.sst")),
+                body.into(),
+            )
+            .await
+            .unwrap();
+    }
+
+    /// **C3/C7 GATE** — SelfHeal recovers a sole safe trailing torn WAL tail: it quarantines +
+    /// OPENS, every committed key (incl. the sealed secret) survives, and a durable DEGRADED.json
+    /// breadcrumb is written naming the quarantined id.
+    #[serial_test::serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn self_heal_opens_after_quarantining_a_safe_torn_tail() {
+        use slatedb::object_store::memory::InMemory;
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let frontier = seed_and_frontier(&store, "kv").await;
+        let torn_id = frontier + 1;
+        put_torn_wal(&store, "kv", torn_id).await;
+
+        let kv = SlateKv::open_with_policy(
+            store.clone(),
+            "kv",
+            test_settings(Some(Duration::from_millis(5))),
+            KvOpenPolicy::SelfHeal,
+        )
+        .await
+        .expect("SelfHeal must recover a sole safe trailing torn tail and OPEN");
+        assert_eq!(
+            kv.get("secret/acme/idp").await.unwrap(),
+            Some(b"sealed-oauth".to_vec()),
+            "the sealed secret (below the frontier) MUST survive the self-heal"
+        );
+        // C6: a non-empty self-heal wrote the durable breadcrumb naming the quarantined id.
+        let marker = read_degraded_marker(&store, "kv")
+            .await
+            .unwrap()
+            .expect("a non-empty self-heal must write DEGRADED.json");
+        assert_eq!(marker.quarantined_ids, vec![torn_id]);
+        assert!(!marker.loss_window.is_empty());
+        kv.close().await.unwrap();
+    }
+
+    /// **C11 GATE** — Strict does NOT self-heal the same safe tail: it fails LOUD (the opt-out
+    /// restores today's behavior) and mutates nothing (no DEGRADED.json).
+    #[serial_test::serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn strict_policy_fails_loud_on_a_safe_torn_tail() {
+        use slatedb::object_store::memory::InMemory;
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let frontier = seed_and_frontier(&store, "kv").await;
+        put_torn_wal(&store, "kv", frontier + 1).await;
+
+        let opened = SlateKv::open_with_policy(
+            store.clone(),
+            "kv",
+            test_settings(Some(Duration::from_millis(5))),
+            KvOpenPolicy::Strict,
+        )
+        .await;
+        let Err(err) = opened else {
+            panic!("Strict must FAIL LOUD on a torn tail (never self-heal)");
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("kv recover") || msg.contains("kv repair"),
+            "the strict loud error must name a recovery path: {msg}"
+        );
+        assert!(
+            read_degraded_marker(&store, "kv").await.unwrap().is_none(),
+            "Strict must mutate nothing (no DEGRADED.json)"
+        );
+    }
+
+    /// **C3/C7 GATE** — an UNSAFE shape (a torn COMPACTED/L0 SST, manifest-referenced) makes SelfHeal
+    /// FAIL LOUD (naming the object) and mutate NOTHING under the DEFAULT — never quarantine the WAL
+    /// tail then die, never remove the compacted SST. This is the ordering-bug fix + the data-loss guard.
+    #[serial_test::serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn self_heal_refuses_and_preserves_on_an_unsafe_compacted_tear() {
+        use slatedb::object_store::memory::InMemory;
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let frontier = seed_and_frontier(&store, "kv").await;
+        put_torn_wal(&store, "kv", frontier + 1).await; // a safe trailing tail…
+        // …AND an out-of-scope torn compacted/L0 SST (version 0) — the unsafe shape.
+        let mut body = vec![0xCDu8; 128];
+        let n = body.len();
+        body[n - 2..n].copy_from_slice(&0u16.to_be_bytes());
+        let torn_compacted = ObjPath::from("kv/compacted/01J79C21YKR31J2BS1EFXJZ7MZ.sst");
+        store.put(&torn_compacted, body.into()).await.unwrap();
+
+        let opened = SlateKv::open_with_policy(
+            store.clone(),
+            "kv",
+            test_settings(Some(Duration::from_millis(5))),
+            KvOpenPolicy::SelfHeal,
+        )
+        .await;
+        let Err(err) = opened else {
+            panic!("SelfHeal must FAIL LOUD on an out-of-scope torn compacted SST");
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("REFUSED") && msg.contains(&torn_compacted.to_string()),
+            "the refusal must name the torn compacted SST: {msg}"
+        );
+        // Data-loss guard: the compacted SST was NEVER removed, and the safe WAL tail was NOT
+        // quarantined either (C3 dry-run-first: an unsafe shape mutates NOTHING).
+        assert!(
+            store.head(&torn_compacted).await.is_ok(),
+            "the torn compacted SST must NOT be mutated"
+        );
+        assert!(
+            store
+                .head(&ObjPath::from(format!("kv/wal/{:020}.sst", frontier + 1)))
+                .await
+                .is_ok(),
+            "C3: an unsafe shape must NOT quarantine the safe WAL tail either (dry-run-first, mutate nothing)"
+        );
+        assert!(
+            read_degraded_marker(&store, "kv").await.unwrap().is_none(),
+            "a refused self-heal writes no DEGRADED.json"
+        );
     }
 
     #[serial_test::serial]

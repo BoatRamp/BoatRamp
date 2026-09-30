@@ -10,7 +10,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use boatramp_core::kv::{KvStore, MemoryKv};
+use boatramp_core::kv::{KvOpenPolicy, KvStore, MemoryKv};
 
 use crate::error::Result;
 
@@ -72,18 +72,18 @@ pub struct SlateKvS3 {
 /// set (and the backend is SlateDB), the store runs on R2/S3 (durable across a
 /// scale-to-zero container stop) rather than the local `data_dir`.
 ///
-/// `repair_wal` (opt-in) runs the [WAL tail repair](boatramp_storage::wal_repair) over the
-/// SlateDB store BEFORE opening — the P0 crash/snapshot recovery. It applies ONLY to the
-/// SlateDB backend (a no-op for Memory/Cloudflare) and is threaded from `serve --repair-wal` /
-/// `BOATRAMP_KV_REPAIR=1`.
+/// `policy` (v0.9.0 KV-recovery, C3/C7/C8/C11) is the cold-open recovery policy for the SlateDB
+/// backend (a no-op for Memory/Cloudflare). This is the SINGLE-NODE control-plane open site, so its
+/// default is [`KvOpenPolicy::SelfHeal`]; the caller passes [`KvOpenPolicy::Strict`] for
+/// `--strict-kv`. (The cluster node-local Raft store opens elsewhere and stays strict — C8.)
 pub async fn build_kv(
     kv: KvBackend,
     data_dir: &Path,
     slate_s3: Option<&SlateKvS3>,
-    repair_wal: bool,
+    policy: KvOpenPolicy,
 ) -> Result<Arc<dyn KvStore>> {
     match kv {
-        KvBackend::Slatedb => build_slatedb_kv(data_dir, slate_s3, repair_wal).await,
+        KvBackend::Slatedb => build_slatedb_kv(data_dir, slate_s3, policy).await,
         KvBackend::Memory => Ok(Arc::new(MemoryKv::new())),
         KvBackend::Cloudflare => build_cloudflare_kv(),
     }
@@ -93,14 +93,11 @@ pub async fn build_kv(
 async fn build_slatedb_kv(
     data_dir: &Path,
     slate_s3: Option<&SlateKvS3>,
-    repair_wal: bool,
+    policy: KvOpenPolicy,
 ) -> Result<Arc<dyn KvStore>> {
-    // Opt-in: repair-then-open (the operator asked to recover a torn trailing WAL tail in
-    // place). `None` is the default cold open, which still fails LOUD on a torn tail.
-    let repair = repair_wal.then_some(boatramp_storage::kv_slatedb::RepairMode::Apply);
     match slate_s3 {
         Some(s3) => Ok(Arc::new(
-            boatramp_storage::SlateKv::open_s3_with_flush_repair(
+            boatramp_storage::SlateKv::open_s3_with_flush_policy(
                 &boatramp_storage::S3StoreConfig {
                     bucket: s3.bucket.clone(),
                     endpoint: s3.endpoint.clone(),
@@ -109,15 +106,15 @@ async fn build_slatedb_kv(
                 },
                 &s3.prefix,
                 CONTROL_PLANE_FLUSH,
-                repair,
+                policy,
             )
             .await?,
         )),
         None => Ok(Arc::new(
-            boatramp_storage::SlateKv::open_local_with_flush_repair(
+            boatramp_storage::SlateKv::open_local_with_flush_policy(
                 data_dir.join("kv-slate"),
                 CONTROL_PLANE_FLUSH,
-                repair,
+                policy,
             )
             .await?,
         )),
@@ -128,7 +125,7 @@ async fn build_slatedb_kv(
 async fn build_slatedb_kv(
     _data_dir: &Path,
     _slate_s3: Option<&SlateKvS3>,
-    _repair_wal: bool,
+    _policy: KvOpenPolicy,
 ) -> Result<Arc<dyn KvStore>> {
     Err(crate::error::Error::NoSlatedbSupport)
 }

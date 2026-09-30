@@ -14,7 +14,9 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use boatramp_storage::kv_slatedb::{RepairMode, RepairReport};
+use boatramp_storage::kv_slatedb::{
+    RepairMode, RepairReport, clear_degraded_marker, read_degraded_marker,
+};
 use boatramp_storage::object_store::ObjectStore;
 use boatramp_storage::wal_repair::{WalRepairError, repair_wal_tail};
 use clap::{Args, Subcommand};
@@ -31,17 +33,27 @@ enum KvCommand {
     /// Repair a torn TRAILING WAL tail on the control-plane SlateDB store so it opens again
     /// (crash / snapshot partial-tail recovery). DRY-RUN by default (prints the plan); pass
     /// `--apply` to quarantine the torn tail. Refuses on a mid-range gap or unreadable manifest.
+    /// This is the OFFLINE tail-only quarantine; `boatramp kv recover` is the daemon-mediated
+    /// superset (in-place robust repair, else adopt a clean volume).
     Repair(RepairArgs),
+    /// Show the control-plane KV degraded state (v0.9.0 KV-recovery, C6): whether a self-heal-on-open
+    /// quarantined a torn WAL tail (from the durable `{root}/DEGRADED.json` breadcrumb). `--ack`
+    /// clears the breadcrumb once the loss window has been reviewed. Reads the breadcrumb WITHOUT
+    /// opening the store, so it works even when the store will not boot.
+    Status(StatusArgs),
 }
 
+/// The store-addressing flags shared by every `boatramp kv` subcommand — they build EXACTLY the
+/// object store + root the opener uses (R2/S3 rooted at the prefix, or the local fs rooted at `kv`),
+/// so an offline command sees the same objects the serving open would.
 #[derive(Debug, Args)]
-struct RepairArgs {
+struct StoreAddr {
     /// The server data directory (as passed to `boatramp serve --data-dir`). The local SlateDB
     /// control-plane store lives under `<data-dir>/kv-slate` (root `kv`). Defaults to `./data`.
     #[arg(long, default_value = "./data")]
     data_dir: PathBuf,
 
-    /// Repair the R2/S3-backed store instead of the local disk store (matches `serve --kv-s3`).
+    /// Target the R2/S3-backed store instead of the local disk store (matches `serve --kv-s3`).
     /// Uses the ambient AWS credentials; addressing comes from the `--s3-*` flags below.
     #[arg(long, env = "BOATRAMP_KV_S3")]
     kv_s3: bool,
@@ -65,6 +77,34 @@ struct RepairArgs {
     /// Key prefix (root) of the `--kv-s3` store within the bucket (matches `serve --kv-s3-prefix`).
     #[arg(long, env = "BOATRAMP_KV_S3_PREFIX", default_value = "_kv")]
     kv_s3_prefix: String,
+}
+
+impl StoreAddr {
+    /// Build the `(object store, root)` the opener uses.
+    fn build(&self) -> Result<(Arc<dyn ObjectStore>, String), Error> {
+        if self.kv_s3 {
+            let cfg = boatramp_storage::S3StoreConfig {
+                bucket: self.s3_bucket.clone().unwrap_or_default(),
+                endpoint: self.s3_endpoint.clone(),
+                region: self.s3_region.clone(),
+                path_style: self.s3_path_style,
+            };
+            let store = boatramp_storage::kv_slatedb::s3_object_store(&cfg)
+                .map_err(|e| Error::Store(e.to_string()))?;
+            Ok((store, self.kv_s3_prefix.clone()))
+        } else {
+            let dir = self.data_dir.join("kv-slate");
+            let fs = boatramp_storage::kv_slatedb::local_object_store(&dir)
+                .map_err(|e| Error::Store(e.to_string()))?;
+            Ok((Arc::new(fs), "kv".to_string()))
+        }
+    }
+}
+
+#[derive(Debug, Args)]
+struct RepairArgs {
+    #[command(flatten)]
+    addr: StoreAddr,
 
     /// Perform the quarantine. Without this the command is a DRY-RUN: it prints the plan and
     /// mutates NOTHING.
@@ -72,11 +112,22 @@ struct RepairArgs {
     apply: bool,
 }
 
+#[derive(Debug, Args)]
+struct StatusArgs {
+    #[command(flatten)]
+    addr: StoreAddr,
+
+    /// Acknowledge + CLEAR the DEGRADED breadcrumb (after reviewing the loss window). Idempotent —
+    /// clearing an absent breadcrumb is a no-op.
+    #[arg(long)]
+    ack: bool,
+}
+
 /// Errors surfaced by `boatramp kv`.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// Building the object store to repair (bad `--kv-s3` addressing / local dir).
-    #[error("kv repair: could not build the store: {0}")]
+    /// Building the object store to operate on (bad `--kv-s3` addressing / local dir).
+    #[error("kv: could not build the store: {0}")]
     Store(String),
     /// The repair itself refused or failed (loud — the caller must not proceed to serve).
     #[error(transparent)]
@@ -87,29 +138,12 @@ pub enum Error {
 pub async fn run(args: KvArgs) -> Result<(), Error> {
     match args.command {
         KvCommand::Repair(repair) => run_repair(repair).await,
+        KvCommand::Status(status) => run_status(status).await,
     }
 }
 
 async fn run_repair(args: RepairArgs) -> Result<(), Error> {
-    // Build EXACTLY the store + root the opener would, so the repair sees the same objects the
-    // open would replay: R2/S3 rooted at the configured prefix, or the local fs rooted at `kv`.
-    let (store, root): (Arc<dyn ObjectStore>, String) = if args.kv_s3 {
-        let cfg = boatramp_storage::S3StoreConfig {
-            bucket: args.s3_bucket.clone().unwrap_or_default(),
-            endpoint: args.s3_endpoint.clone(),
-            region: args.s3_region.clone(),
-            path_style: args.s3_path_style,
-        };
-        let store = boatramp_storage::kv_slatedb::s3_object_store(&cfg)
-            .map_err(|e| Error::Store(e.to_string()))?;
-        (store, args.kv_s3_prefix.clone())
-    } else {
-        let dir = args.data_dir.join("kv-slate");
-        let fs = boatramp_storage::kv_slatedb::local_object_store(&dir)
-            .map_err(|e| Error::Store(e.to_string()))?;
-        (Arc::new(fs), "kv".to_string())
-    };
-
+    let (store, root) = args.addr.build()?;
     let mode = if args.apply {
         RepairMode::Apply
     } else {
@@ -117,6 +151,44 @@ async fn run_repair(args: RepairArgs) -> Result<(), Error> {
     };
     let report = repair_wal_tail(&store, &root, mode).await?;
     print_report(&report, args.apply);
+    Ok(())
+}
+
+async fn run_status(args: StatusArgs) -> Result<(), Error> {
+    let (store, root) = args.addr.build()?;
+    if args.ack {
+        let existed = clear_degraded_marker(&store, &root)
+            .await
+            .map_err(|e| Error::Store(e.to_string()))?;
+        if existed {
+            println!("kv status: CLEARED the DEGRADED breadcrumb (acknowledged).");
+        } else {
+            println!("kv status: no DEGRADED breadcrumb to acknowledge.");
+        }
+        return Ok(());
+    }
+    match read_degraded_marker(&store, &root)
+        .await
+        .map_err(|e| Error::Store(e.to_string()))?
+    {
+        Some(m) => {
+            println!("kv status: DEGRADED (a self-heal-on-open quarantined a torn WAL tail)");
+            println!("  self-healed at (unix): {}", m.stamp);
+            println!("  quarantined WAL ids:   {:?}", m.quarantined_ids);
+            println!("  loss window:           {}", m.loss_window);
+            println!("  quarantine dir:        {}", m.quarantine_dir);
+            println!(
+                "  NOTE: the quarantined torn tail preserves raw bytes for FORENSICS ONLY — there \
+                 is no supported recovery of acked KV pairs from a torn version-0 SST."
+            );
+            println!("  Acknowledge with `boatramp kv status --ack` once reviewed.");
+        }
+        None => println!(
+            "kv status: OK — no DEGRADED breadcrumb (the store opened cleanly, a self-heal was \
+             zero-loss, or a prior degraded state was acked). If the store will not open, run \
+             `boatramp kv recover` (dry-run) to diagnose."
+        ),
+    }
     Ok(())
 }
 

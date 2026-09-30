@@ -107,10 +107,10 @@ use control_api::{BootstrapRequest, CreateJoinTokenRequest, JoinRequest};
 pub(crate) use control_api::{
     add_root_anchor, auth_whoami, bootstrap_token, cluster_join, cluster_members, cluster_promote,
     cluster_revoke, cluster_rotate_key, create_join_token, create_token, delete_email_profile,
-    delete_secret, delete_tenant_secret, get_authz_policy, list_email_profiles, list_root_anchors,
-    list_secrets, list_tenant_secrets, list_tokens, node_version, put_authz_policy,
-    remove_root_anchor, revoke_token, set_email_profile, set_secret, set_tenant_secret,
-    show_email_profile,
+    delete_secret, delete_tenant_secret, get_authz_policy, kv_status, list_email_profiles,
+    list_root_anchors, list_secrets, list_tenant_secrets, list_tokens, node_version,
+    put_authz_policy, remove_root_anchor, revoke_token, set_email_profile, set_secret,
+    set_tenant_secret, show_email_profile,
 };
 #[cfg(feature = "email")]
 pub use email_spool::NodeEmailSpool;
@@ -1702,6 +1702,13 @@ pub struct ServerOptions {
     /// [`config_baseline`] + [`DaemonRuntime::new`]) so it can wake it on
     /// SIGHUP / changelog; `None` (tests, embedders) ⇒ the router builds its own.
     pub daemon_runtime: Option<Arc<DaemonRuntime>>,
+    /// Control-plane KV degraded state (v0.9.0 KV-recovery, C6): a BOOT-TIME snapshot of the store's
+    /// `DEGRADED.json` breadcrumb, read once after the store opened. `Some` ⇒ a self-heal-on-open
+    /// quarantined a torn WAL tail this boot; served (read-only) on `GET /api/kv-status` (System·Read)
+    /// so a monitor sees the degraded node while it is UP. `None` ⇒ clean (or the store-down case is
+    /// handled by the recovery-mode listener's own `/api/kv-status`). A boot snapshot: it does not
+    /// change while serving, and a later `kv status --ack` clears the file (reflected on next boot).
+    pub kv_degraded: Option<boatramp_core::kv::DegradedMarker>,
     /// Operator SQL capability for managed databases (migrations / queries via the
     /// sealed credential, resolved server-side). Backs `POST /api/sql/{db}/{exec,query}`;
     /// `None` ⇒ those routes return `501`. Wired by the node when a managed DB exists.
@@ -1781,6 +1788,12 @@ pub struct ServerOptions {
 /// forged `X-Forwarded-Proto` from a direct client.
 #[derive(Clone, Copy)]
 struct ServedOverTls(bool);
+
+/// The control-plane KV degraded-state boot snapshot (v0.9.0 KV-recovery, C6), carried as an
+/// extension so the `GET /api/kv-status` handler can serve it without touching the store. `None` ⇒
+/// the store opened clean (or a self-heal was zero-loss).
+#[derive(Clone, Default)]
+struct KvDegraded(Option<boatramp_core::kv::DegradedMarker>);
 
 /// Whether the host fallback may resolve an unmatched `Host` to a site without an
 /// explicit domain registration (first-label `<site>.host`, or the sole served
@@ -2235,6 +2248,81 @@ pub async fn serve_with(
     }
     gateway_prober.abort();
     result
+}
+
+/// A read-only diagnostic served by the RECOVERY-MODE listener (v0.9.0 KV-recovery, C5) when the
+/// control-plane KV failed to open. Non-sensitive by construction (no secrets): it carries the loud
+/// open error alongside the `GET /api/kv-status` JSON body (built by the caller from the store's
+/// `DEGRADED.json` breadcrumb, the error, and the recovery steps), so the diagnostic is meaningful
+/// even though the recovery listener has NO auth stack (the authz policy lives in the down store).
+#[derive(Clone)]
+pub struct RecoveryDiagnostic {
+    /// The fatal KV-open error (already the loud, actionable `map_open_error` message).
+    pub error: String,
+    /// The pretty JSON body for `GET /api/kv-status`.
+    pub kv_status_json: String,
+}
+
+/// Bind `addr` and serve a RECOVERY-MODE listener (v0.9.0 KV-recovery, C5) instead of letting a
+/// fatal control-plane KV open propagate to `exit(1)` and a fly crash-loop. It keeps the machine
+/// reachable so a daemon-mediated `boatramp kv recover` (and a human) can see WHY the node is down:
+///
+/// - `/healthz` + `/readyz` → **200** — KEEP the fly/k8s liveness+readiness green so the node is NOT
+///   flap-restarted (the recurring crash-loop is the exact failure this feature removes). The
+///   degraded/failure detail lives on `kv-status`, not the probe (C6). Sites returning 503 is the
+///   honest per-request signal; a restart-inducing probe failure is not.
+/// - `GET /api/kv-status` → **503** + the JSON diagnostic. Unauthenticated by necessity (safe — no
+///   secrets, only the open error + recovery guidance).
+/// - everything else (site routes, other `/api/*`) → **503** + a short plaintext diagnostic — never
+///   a 000 connection-refused.
+///
+/// Serves until SIGTERM/Ctrl-C (a redeploy with a fix, or an operator recover, ends it).
+pub async fn serve_recovery_mode(
+    addr: SocketAddr,
+    diagnostic: RecoveryDiagnostic,
+) -> Result<(), ServeError> {
+    let fallback_body = format!(
+        "boatramp is in KV RECOVERY MODE: the control-plane store failed to open, so no site can be \
+         served. See `GET /api/kv-status` for the diagnosis, or run `boatramp kv recover`.\n\n{}\n",
+        diagnostic.error
+    );
+    let kv_status_json = diagnostic.kv_status_json;
+    let router: Router = Router::new()
+        .route(
+            "/healthz",
+            get(|| async { (StatusCode::OK, "ok recovering\n") }),
+        )
+        .route("/readyz", get(|| async { (StatusCode::OK, "ready\n") }))
+        .route(
+            "/api/kv-status",
+            get(move || {
+                let json = kv_status_json.clone();
+                async move {
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        [(header::CONTENT_TYPE, "application/json")],
+                        json,
+                    )
+                }
+            }),
+        )
+        .fallback(move || {
+            let body = fallback_body.clone();
+            async move { (StatusCode::SERVICE_UNAVAILABLE, body) }
+        });
+    let tcp = tokio::net::TcpListener::bind(addr).await?;
+    tracing::error!(
+        %addr,
+        "boatramp KV RECOVERY MODE listening: control-plane KV failed to open — serving 503 for \
+         sites, 200 for health probes, diagnosis on `GET /api/kv-status`. Run `boatramp kv recover`."
+    );
+    axum::serve(tcp, router)
+        .with_graceful_shutdown(async {
+            shutdown_signal().await;
+        })
+        .await
+        .map_err(ServeError::from)?;
+    Ok(())
 }
 
 /// Run the graceful-serve future `server`, but if the drain runs longer than
