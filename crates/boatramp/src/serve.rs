@@ -2522,7 +2522,8 @@ async fn run_cluster(
     // MUST precede the store close: a write/apply after the store is marked closed would lose a
     // committed log/state entry or desync the log vs the state machine (the cluster's correctness
     // boundary). `close()` (not the old bare `flush()`) then advances the durable frontier so the
-    // next cold open replays an empty WAL range. Bounded by `CLOSE_DEADLINE` (fail-safe on timeout).
+    // next cold open replays an empty WAL range. Bounded by the configurable `[serve.kv]
+    // close_deadline` (C12; default generous 20s) — distinct WARN + fail-safe on timeout.
     let raft = node.raft.clone();
     let raft_shutdown: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> =
         Box::pin(async move {

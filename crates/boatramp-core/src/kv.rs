@@ -653,16 +653,19 @@ impl KvStore for CachedKv {
 
 /// A [`KvStore`] wrapper that advances the durable frontier after EVERY successful write — the
 /// **can't-miss** frontier-sync for the pure-crown-jewel stores whose writes are ALL irreplaceable
-/// (sealed secrets, sealed DB/SMTP credentials, TLS private keys). A dropped write in one of these
-/// stores is a lost secret with no client-side copy, so rather than rely on per-call-site
-/// discipline (which could miss a site) we wrap the store ONCE at construction: every `put` /
-/// `delete` / `write_batch` and every successful `compare_and_swap` is immediately followed by a
-/// [`checkpoint`](KvStore::checkpoint), so an acked write is past the durable replay boundary
-/// before the caller sees success — and cannot be dropped by the self-heal-on-open trailing-tail
-/// quarantine (v0.9.0 KV-recovery, C2). Reads and every store advertisement forward transparently.
+/// (sealed secrets, sealed DB/SMTP credentials). A dropped write in one of these stores is a lost
+/// secret with no client-side copy, so rather than rely on per-call-site discipline (which could
+/// miss a site) we wrap the store ONCE at construction: every `put` / `delete` / `write_batch` and
+/// every successful `compare_and_swap` is immediately followed by a [`checkpoint`](KvStore::checkpoint),
+/// so an acked write is past the durable replay boundary before the caller sees success — and cannot
+/// be dropped by the self-heal-on-open trailing-tail quarantine (v0.9.0 KV-recovery, C2). Reads and
+/// every store advertisement forward transparently.
 ///
 /// Used ONLY for the pure-crown-jewel stores (`SecretStore`, `TenantSecretStore`,
-/// `EmailProfileStore`, `ManagedSqlCredentials`, `KvCertStore`). The mixed control-plane
+/// `EmailProfileStore`, `ManagedSqlCredentials`). NOT the cert store: `KvCertStore` is built only on
+/// the cluster ACME-DNS path over `RaftKv` (Raft-consensus durable, where this wrapper's checkpoint
+/// is a no-op anyway), and the single-node ACME path caches certs in a filesystem DirCache, not the
+/// control-plane KV — so cert keys never route through `CheckpointKv`. The mixed control-plane
 /// `DeployStore` does NOT use this — it selects the frontier-sync PER METHOD (crown-jewel writes
 /// call the `*_checkpointed` variants; derived/recomputable writes such as `current/*` pointers,
 /// activation history, invocation records and metering stay async), because checkpointing its
