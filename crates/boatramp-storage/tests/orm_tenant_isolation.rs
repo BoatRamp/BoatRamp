@@ -9,7 +9,7 @@
 #![cfg(feature = "sql")]
 
 use boatramp_core::orm::{
-    Assignment, CmpOp, Delete, Direction, Expr, Insert, OrderBy, Predicate, RowValues, Scope,
+    Agg, Assignment, CmpOp, Delete, Direction, Expr, Insert, OrderBy, Predicate, RowValues, Scope,
     ScopeMode, Select, SelectItem, TableKeys, Update,
 };
 use boatramp_core::sql::{Dialect, SqlBackends, SqlTransaction, SqlValue};
@@ -1479,5 +1479,338 @@ async fn orm_unscoped_write_isolates_on_a_real_engine() {
         "SCOPED UNSCOPED-WRITE CROSS-SURFACE OK [libsql]: read:own isolated (write-global does NOT \
          widen reads, G2); a write-global oauth_state INSERT lands UNSTAMPED on a real non-RLS \
          libsql engine; an UNLISTED plain-unscoped write stays refused deny-by-default"
+    );
+}
+
+// ===========================================================================================
+// v0.9.0 (orm-groupby): cross-tenant pre-aggregation gate + LEFT-JOIN aggregate semantics.
+//
+// GROUP BY / HAVING / aggregates (now incl. `count_distinct`) are already fully implemented on the
+// typed `orm` path, and the host force_scope injects the tenant predicate into the WHERE
+// UNCONDITIONALLY and PRE-aggregation — so it confines the rows BEFORE they are grouped/aggregated,
+// shape-independently. The gate below proves that security property BEHAVIORALLY on a real engine:
+// a grouped aggregate run as tenant A over a shared two-tenant DB equals the same aggregate over an
+// A-only DB, so tenant B never contributes to any group / count / sum / min / max / avg /
+// distinct-count and no B-only group key appears. It is MUTATION-VERIFIED: `skip_scope` drops the
+// pre-aggregation confinement and the equality then fails RED (a CI loop asserts the non-zero exit).
+// ===========================================================================================
+
+/// The cross-tenant pre-aggregation MUTATION seam (`BOATRAMP_ORMGROUPBY_MUTATION`). `skip_scope`
+/// models DROPPING the tenant confinement before aggregation — the exact regression this gate
+/// guards: the grouped aggregate is built WITHOUT `force_scope`, so the victim tenant's rows leak
+/// into the attacker tenant's groups/counts/sums/distinct-counts and the equality-to-the-A-only
+/// baseline MUST then fail. Unset / any other value = the real confined build (the gate PASSES).
+/// Mirrors the `RAWSQL_CONFINE_MUTATION` seam in `rawsql_own_confinement.rs`.
+fn orm_groupby_skip_scope_mutation() -> bool {
+    std::env::var("BOATRAMP_ORMGROUPBY_MUTATION").as_deref() == Ok("skip_scope")
+}
+
+/// Run a compiled grouped query and return its rows verbatim (every column, in the query's order).
+/// Aggregates come back as `Integer`/`Real`, so the whole result is compared structurally.
+async fn run_agg_rows(
+    tx: &mut dyn SqlTransaction,
+    sql: &str,
+    params: &[SqlValue],
+) -> Vec<Vec<SqlValue>> {
+    tx.query(sql, params)
+        .await
+        .expect("grouped query runs")
+        .rows
+}
+
+/// A numeric aggregate cell as `i64`, tolerant of the engine returning `Integer` or `Real`
+/// (SQLite's `sum`/`count` return integers, but the binding is not asserted to).
+fn as_i64(v: &SqlValue) -> i64 {
+    match v {
+        SqlValue::Integer(i) => *i,
+        SqlValue::Real(r) => *r as i64,
+        other => panic!("expected a numeric aggregate cell, got {other:?}"),
+    }
+}
+
+/// The single grouped aggregate the gate and its baseline both run — every aggregate shape at once,
+/// including the new `count_distinct`, faceted by a group key:
+///   `SELECT dimension_key, count(*), sum(n), min(n), max(n), avg(n), count(DISTINCT label)
+///      FROM metrics GROUP BY dimension_key ORDER BY dimension_key`
+fn grouped_metrics_select() -> Select {
+    Select {
+        columns: vec![
+            item(Expr::col("dimension_key")),
+            item(Expr::Aggregate(Agg::Count, Box::new(Expr::Star))),
+            item(Expr::Aggregate(Agg::Sum, Box::new(Expr::col("n")))),
+            item(Expr::Aggregate(Agg::Min, Box::new(Expr::col("n")))),
+            item(Expr::Aggregate(Agg::Max, Box::new(Expr::col("n")))),
+            item(Expr::Aggregate(Agg::Avg, Box::new(Expr::col("n")))),
+            item(Expr::Aggregate(
+                Agg::CountDistinct,
+                Box::new(Expr::col("label")),
+            )),
+        ],
+        group_by: vec![Expr::col("dimension_key")],
+        order: vec![OrderBy {
+            expr: Expr::col("dimension_key"),
+            dir: Direction::Asc,
+        }],
+        ..Select::from("metrics")
+    }
+}
+
+/// **Live**, mutation-verified proof that a grouped aggregate is tenant-confined PRE-aggregation on a
+/// real libsql engine — the `ORM GROUP-BY CROSS-TENANT PRE-AGGREGATION OK` gate. Same `#[ignore]`
+/// rationale as the siblings (static-musl libsql segfault); the `test-orm-tenancy` CI job runs it
+/// unignored on the host toolchain and greps the marker, and loops the `skip_scope` mutation
+/// asserting the test then exits non-zero.
+#[tokio::test]
+#[ignore = "run via the test-orm-tenancy CI job on the host toolchain (static-musl test binary segfaults in libsql's bundled SQLite)"]
+async fn orm_group_by_aggregate_is_tenant_confined_pre_aggregation_on_a_real_engine() {
+    // Two real engines: `shared` holds BOTH tenants' rows; `only_a` holds ONLY tenant A's rows (the
+    // ground-truth baseline). A grouped aggregate run AS TENANT A over `shared` (force_scope own=acme)
+    // must be byte-identical to the same aggregate over `only_a`.
+    let dir_shared = std::env::temp_dir().join(format!(
+        "boatramp-orm-groupby-shared-{}",
+        std::process::id()
+    ));
+    let dir_only_a =
+        std::env::temp_dir().join(format!("boatramp-orm-groupby-onlya-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir_shared);
+    let _ = std::fs::remove_dir_all(&dir_only_a);
+    let shared = LibsqlSqlBackends::local(&dir_shared)
+        .database("default", "metrics_db", "")
+        .await
+        .unwrap();
+    let only_a = LibsqlSqlBackends::local(&dir_only_a)
+        .database("default", "metrics_db", "")
+        .await
+        .unwrap();
+
+    // acme's rows — the ground truth. k1 has 3 rows / 2 distinct labels; k2 has 1 row.
+    let acme_rows: &[(&str, &str, &str, i64)] = &[
+        ("a1", "k1", "L1", 10),
+        ("a2", "k1", "L2", 20),
+        ("a3", "k1", "L1", 5), // duplicate label L1 → k1 count(*)=3 but count(DISTINCT label)=2
+        ("a4", "k2", "L3", 100),
+    ];
+    // globex's rows — MUST never contribute. They overlap A's key k1 (different `n` + a NEW label L9)
+    // and add a B-ONLY key k3, so ANY leak changes k1's aggregates AND introduces a k3 group.
+    let globex_rows: &[(&str, &str, &str, i64)] = &[
+        ("g1", "k1", "L9", 1000),
+        ("g2", "k1", "L2", 7),
+        ("g3", "k3", "L5", 50),
+    ];
+
+    let create = "CREATE TABLE metrics (id TEXT PRIMARY KEY, tenant_id TEXT, dimension_key TEXT, label TEXT, n INTEGER)";
+    let insert =
+        "INSERT INTO metrics (id, tenant_id, dimension_key, label, n) VALUES (?1, ?2, ?3, ?4, ?5)";
+    // Seed `shared` with both tenants.
+    {
+        let mut tx = shared.begin().await.unwrap();
+        tx.execute(create, &[]).await.unwrap();
+        for (id, k, label, n) in acme_rows {
+            tx.execute(
+                insert,
+                &[t(id), t("acme"), t(k), t(label), SqlValue::Integer(*n)],
+            )
+            .await
+            .unwrap();
+        }
+        for (id, k, label, n) in globex_rows {
+            tx.execute(
+                insert,
+                &[t(id), t("globex"), t(k), t(label), SqlValue::Integer(*n)],
+            )
+            .await
+            .unwrap();
+        }
+        tx.commit().await.unwrap();
+    }
+    // Seed `only_a` with acme's rows ONLY — the baseline.
+    {
+        let mut tx = only_a.begin().await.unwrap();
+        tx.execute(create, &[]).await.unwrap();
+        for (id, k, label, n) in acme_rows {
+            tx.execute(
+                insert,
+                &[t(id), t("acme"), t(k), t(label), SqlValue::Integer(*n)],
+            )
+            .await
+            .unwrap();
+        }
+        tx.commit().await.unwrap();
+    }
+
+    // Baseline: the grouped aggregate over the A-only DB (no scope needed — single-tenant ground truth).
+    let baseline = {
+        let (sql, params) = grouped_metrics_select().compile(Dialect::Sqlite).unwrap();
+        let mut tx = only_a.begin().await.unwrap();
+        let rows = run_agg_rows(tx.as_mut(), &sql, &params).await;
+        tx.commit().await.unwrap();
+        rows
+    };
+
+    // The gate: the SAME aggregate over the SHARED DB, AS TENANT A. force_scope injects the tenant
+    // predicate PRE-aggregation — UNLESS `skip_scope` drops it (modelling the regression).
+    let under_test = {
+        let mut s = grouped_metrics_select();
+        if !orm_groupby_skip_scope_mutation() {
+            s.force_scope(&scope(ScopeMode::Own, "acme")).unwrap();
+        }
+        let (sql, params) = s.compile(Dialect::Sqlite).unwrap();
+        let mut tx = shared.begin().await.unwrap();
+        let rows = run_agg_rows(tx.as_mut(), &sql, &params).await;
+        tx.commit().await.unwrap();
+        rows
+    };
+
+    // Guard against a vacuously-empty baseline passing the equality: acme has exactly k1 and k2, with
+    // the aggregates we seeded (k1 → count 3 / sum 35 / min 5 / max 20 / distinct-labels 2).
+    assert_eq!(
+        baseline.len(),
+        2,
+        "acme has exactly two group keys (k1, k2)"
+    );
+    assert_eq!(baseline[0][0], t("k1"));
+    assert_eq!(as_i64(&baseline[0][1]), 3, "k1 count(*)");
+    assert_eq!(as_i64(&baseline[0][2]), 35, "k1 sum(n) = 10+20+5");
+    assert_eq!(as_i64(&baseline[0][3]), 5, "k1 min(n)");
+    assert_eq!(as_i64(&baseline[0][4]), 20, "k1 max(n)");
+    assert_eq!(
+        as_i64(&baseline[0][6]),
+        2,
+        "k1 count(DISTINCT label) = {{L1,L2}}"
+    );
+
+    // The load-bearing property: tenant A's grouped aggregates over the shared DB are IDENTICAL to the
+    // A-only baseline — no cross-tenant contribution to any group/count/sum/min/max/avg/distinct-count.
+    // Under `skip_scope`, globex's rows leak: k1 inflates and a B-only k3 group appears → this FAILS.
+    assert_eq!(
+        under_test, baseline,
+        "grouped aggregates as tenant A must equal the A-only baseline (no cross-tenant aggregation)"
+    );
+    // And no B-only group key may ever surface (redundant with the equality; names the invariant).
+    assert!(
+        !under_test
+            .iter()
+            .any(|r| matches!(r.first(), Some(SqlValue::Text(k)) if k == "k3")),
+        "a globex-only group key (k3) must never appear in tenant A's grouped result"
+    );
+
+    println!(
+        "ORM GROUP-BY CROSS-TENANT PRE-AGGREGATION OK: tenant A's grouped count/sum/min/max/avg/\
+         count-distinct over the shared engine equals the A-only baseline (globex contributes to no \
+         group, and its k3-only key never appears); force_scope confines PRE-aggregation"
+    );
+}
+
+/// **Live** clarification of the LEFT-JOIN aggregate SEMANTICS (a companion, not a security hole):
+/// on an own-scoped LEFT JOIN, the other-tenant child is confined in the JOIN's `ON` (not the WHERE),
+/// so it becomes `NULL` rather than collapsing the join — and NULL child columns are dropped from
+/// `count(child.col)`/`sum(child.col)` (standard SQL), while `count(*)` still counts the driving row.
+/// So `count(*)` and `count(child.col)` differ by exactly the unmatched rows, and the other tenant's
+/// value never contributes. Same `#[ignore]` rationale as the siblings.
+#[tokio::test]
+#[ignore = "run via the test-orm-tenancy CI job on the host toolchain (static-musl test binary segfaults in libsql's bundled SQLite)"]
+async fn orm_left_join_count_has_null_semantics_and_no_cross_tenant_leak_on_a_real_engine() {
+    let dir =
+        std::env::temp_dir().join(format!("boatramp-orm-groupby-join-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let db = LibsqlSqlBackends::local(&dir)
+        .database("default", "joins_db", "")
+        .await
+        .unwrap();
+    {
+        let mut tx = db.begin().await.unwrap();
+        tx.execute(
+            "CREATE TABLE parent (id TEXT PRIMARY KEY, tenant_id TEXT)",
+            &[],
+        )
+        .await
+        .unwrap();
+        tx.execute(
+            "CREATE TABLE child (id TEXT PRIMARY KEY, tenant_id TEXT, parent_id TEXT, amount INTEGER)",
+            &[],
+        )
+        .await
+        .unwrap();
+        // acme parents p1, p2; a globex parent gp1 (must be invisible as a driving row).
+        tx.execute(
+            "INSERT INTO parent (id, tenant_id) VALUES ('p1','acme'),('p2','acme'),('gp1','globex')",
+            &[],
+        )
+        .await
+        .unwrap();
+        // acme child c1 for p1 (amount 10); a globex child cB ALSO pointing at p1 (amount 9999 — the
+        // leak bait); p2 has NO child (→ a NULL LEFT-join row).
+        tx.execute(
+            "INSERT INTO child (id, tenant_id, parent_id, amount) VALUES ('c1','acme','p1',10),('cB','globex','p1',9999)",
+            &[],
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    // SELECT count(*), count(c.amount), sum(c.amount)
+    //   FROM parent p LEFT JOIN child c ON c.parent_id = p.id      [own=acme]
+    let mut sel = Select {
+        table: "parent".into(),
+        table_alias: Some("p".into()),
+        columns: vec![
+            item(Expr::Aggregate(Agg::Count, Box::new(Expr::Star))),
+            item(Expr::Aggregate(Agg::Count, Box::new(Expr::col("c.amount")))),
+            item(Expr::Aggregate(Agg::Sum, Box::new(Expr::col("c.amount")))),
+        ],
+        joins: vec![boatramp_core::orm::Join {
+            kind: boatramp_core::orm::JoinKind::Left,
+            table: "child".into(),
+            alias: Some("c".into()),
+            on: Predicate::Cmp {
+                left: Expr::col("c.parent_id"),
+                op: CmpOp::Eq,
+                right: Expr::col("p.id"),
+            },
+        }],
+        ..Select::from("parent")
+    };
+    sel.force_scope(&scope(ScopeMode::Own, "acme")).unwrap();
+    let (sql, params) = sel.compile(Dialect::Sqlite).unwrap();
+    // The child's tenant confinement lands in the LEFT JOIN's ON (so the driving row is kept and an
+    // other-tenant child is NULLed, not collapsed).
+    assert!(
+        sql.contains("LEFT JOIN child AS c ON"),
+        "confinement must ride the ON of the LEFT join: {sql}"
+    );
+
+    let mut tx = db.begin().await.unwrap();
+    let rows = run_agg_rows(tx.as_mut(), &sql, &params).await;
+    tx.commit().await.unwrap();
+
+    assert_eq!(rows.len(), 1, "a bare aggregate returns one row");
+    let r = &rows[0];
+    // count(*) counts the LEFT-join output rows: p1⋈c1 and p2⋈NULL = 2 (globex child excluded by the
+    // ON tenant gate; globex parent gp1 excluded from driving rows by the WHERE tenant gate).
+    assert_eq!(as_i64(&r[0]), 2, "count(*) over the confined LEFT join");
+    // count(c.amount) drops the NULL (p2's unmatched child) → 1, and never counts globex's row.
+    assert_eq!(
+        as_i64(&r[1]),
+        1,
+        "count(child.amount) drops unmatched/NULL rows"
+    );
+    // sum(c.amount) = acme's 10 ONLY — globex's 9999 never contributes (no cross-tenant leak).
+    assert_eq!(
+        as_i64(&r[2]),
+        10,
+        "sum(child.amount) = acme-only, never globex's 9999"
+    );
+    // count(*) and count(child.col) DIFFER (2 vs 1) exactly because of the LEFT-join NULL row.
+    assert_ne!(
+        as_i64(&r[0]),
+        as_i64(&r[1]),
+        "count(*) vs count(child.col) differ by the unmatched NULL row"
+    );
+
+    println!(
+        "ORM LEFT-JOIN AGGREGATE SEMANTICS OK: on an own-scoped LEFT JOIN, count(*)=2 keeps both \
+         driving rows while count(child.col)=1 drops the unmatched NULL, and sum(child.col)=10 never \
+         sees globex's 9999 (other-tenant child NULLed in the ON, not leaked)"
     );
 }
