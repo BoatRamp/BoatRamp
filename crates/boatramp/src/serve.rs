@@ -1296,7 +1296,7 @@ async fn quiesce_and_close(
 /// (C1) and the graceful-close budget (C12) — from config, with an env override so a fly deploy can
 /// tune them without a config file: `BOATRAMP_KV_CHECKPOINT_INTERVAL` / `BOATRAMP_KV_CLOSE_DEADLINE`
 /// (both seconds). An unparsable env value is ignored (the config/default wins) with a WARN — never a
-/// silent mis-parse. Shared by `run` (single-node) and `run_cluster`.
+/// silent misparse. Shared by `run` (single-node) and `run_cluster`.
 fn resolve_kv_durability(
     kv_cfg: Option<&boatramp_node::config::KvConfig>,
 ) -> (Option<std::time::Duration>, std::time::Duration) {
