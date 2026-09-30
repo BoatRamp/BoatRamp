@@ -67,20 +67,28 @@ fn backend<E: std::fmt::Display>(err: E) -> KvError {
 /// automatic), so this only makes the loud failure *actionable*, it does not repair anything.
 fn map_open_error(err: slatedb::Error) -> KvError {
     let raw = err.to_string();
-    // The torn-tail signatures slatedb surfaces on replay of a partial WAL object: the >10-byte
-    // partial (`InvalidVersion { actual_version: 0 }`) and the empty-SSTable symptom. Matched on
-    // the message (slatedb does not expose a stable typed variant for these across versions).
+    // The torn-SST signatures slatedb surfaces on replay of a partial object: the >10-byte partial
+    // (`InvalidVersion { actual_version: 0 }`) and the empty-SSTable symptom. Matched on the message
+    // (slatedb exposes no stable typed variant for these across versions). slatedb's ACTUAL `Display`
+    // for the version error is `"unsupported {format} format version. supported_versions=…,
+    // actual_version=…"` — it does NOT contain the Debug name `"InvalidVersion"`, and only
+    // incidentally contains `"actual_version"`; match the Display form (`unsupported` + `format
+    // version`) explicitly so the loud, actionable message fires regardless of Debug-vs-Display.
     let looks_torn = raw.contains("InvalidVersion")
         || raw.contains("actual_version")
+        || (raw.contains("unsupported") && raw.contains("format version"))
         || raw.contains("empty SSTable")
         || raw.contains("EmptySSTable");
     if looks_torn {
         KvError::backend(format!(
-            "control-plane SlateDB store failed to open: the WAL tail is torn ({raw}). \
+            "control-plane SlateDB store failed to open: an SST is torn ({raw}). \
              This is the crash/snapshot partial-tail case. To recover, run \
-             `boatramp kv repair` (a DRY-RUN prints the plan) then `boatramp kv repair --apply`, \
-             OR redeploy with the env `BOATRAMP_KV_REPAIR=1` (equivalently `boatramp serve \
-             --repair-wal`) to repair-then-open in place. A hard-crash repair may lose the \
+             `boatramp kv repair` (a DRY-RUN now diagnoses the WHOLE store — the WAL tail AND the \
+             compacted/L0 SSTs — prints the plan, and NAMES any torn object it cannot auto-repair), \
+             then `boatramp kv repair --apply`, OR redeploy with the env `BOATRAMP_KV_REPAIR=1` \
+             (equivalently `boatramp serve --repair-wal`) to repair-then-open in place. Repair \
+             quarantines only a torn TRAILING WAL tail; a torn compacted/L0 SST is reported (not \
+             auto-removed — it needs manifest-aware recovery). A hard-crash repair may lose the \
              most-recent acked-into-WAL-but-not-yet-L0 writes; a graceful shutdown is lossless."
         ))
     } else {
@@ -95,12 +103,31 @@ fn describe_report(report: &RepairReport) -> String {
         .iter()
         .map(|c| format!("{:020}[{} bytes, {:?}]", c.id, c.size, c.class))
         .collect();
+    // Surface the out-of-scope torn objects (torn compacted/L0 SSTs + torn non-trailing WAL
+    // objects) so the compacted-SST case is unmistakable: these are DETECTION-ONLY (never
+    // auto-removed) and REQUIRE MANIFEST-AWARE RECOVERY — repair will NOT open the store while any
+    // remain. Named explicitly so a dry-run doesn't read as "nothing to do" when it isn't.
+    let out_of_scope = if report.out_of_scope_torn.is_empty() {
+        String::new()
+    } else {
+        let paths: Vec<String> = report
+            .out_of_scope_torn
+            .iter()
+            .map(|t| format!("{} ({:?}, {} bytes)", t.path, t.kind, t.size))
+            .collect();
+        format!(
+            " OUT-OF-SCOPE torn SST(s) this tool will NOT auto-remove (requires manifest-aware \
+             recovery; escalate): [{}].",
+            paths.join(", ")
+        )
+    };
     format!(
         "durable frontier (replay_after_wal_id) = {}; WAL candidates beyond it (highest first): \
-         [{}]; would quarantine {:?} (trailing torn tail). Re-run with `--apply` to perform it.",
+         [{}]; would quarantine {:?} (trailing torn tail).{} Re-run with `--apply` to perform it.",
         report.frontier,
         classes.join(", "),
         report.quarantined,
+        out_of_scope,
     )
 }
 
