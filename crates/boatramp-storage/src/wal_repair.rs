@@ -34,6 +34,33 @@
 //! writes — a bounded, honest loss-window that the caller's success message states.
 //! Part A (graceful quiesce-then-close) makes the *graceful* case lossless.
 //!
+//! ## Whole-store awareness (v0.8.x — never silently no-op)
+//!
+//! SlateDB stores more than WAL objects: compacted / L0 SSTs live under
+//! `{root}/compacted/` (slatedb `paths.rs` `COMPACTED_PATH`) and the manifest under
+//! `{root}/manifest/`. A torn version-0 SST can therefore land in `compacted/` too (a
+//! partial L0 flush / snapshot / R2 partial multipart), and that object is INVISIBLE to a
+//! WAL-only scan — so an earlier repair could find no WAL candidate and return a no-op
+//! "nothing to repair" while the store still refused to open. That silent no-op was the
+//! "repair didn't work" incident.
+//!
+//! This repair now scans the WHOLE store (`wal/` **and** `compacted/`) with the same
+//! format-agnostic footer probe and REPORTS every torn object it finds. Crucially:
+//!
+//! **A compacted/L0 SST (and the manifest) is DETECTION-ONLY — this tool NEVER quarantines,
+//! copies, renames, or deletes it.** A compacted SST is referenced by the manifest; removing
+//! one without a manifest rollback would drop acked data. So anything outside the safe
+//! WAL-tail scope (a torn compacted SST, or a torn WAL object that is not part of the safe
+//! trailing tail) is surfaced in [`RepairReport::out_of_scope_torn`] and, on
+//! [`RepairMode::Apply`], makes the repair **fail loud** with
+//! [`WalRepairError::UnrepairableTornObject`] naming the exact path(s) — rather than report
+//! success while the store still holds a torn SST that will fail open. Manifest-aware recovery
+//! for a torn compacted SST is an escalation, not something this tool performs.
+//!
+//! The **invariant**: an [`RepairMode::Apply`] `Ok` result means the store is now free of ALL
+//! torn SSTs (the safe trailing WAL tail was quarantined, and nothing else torn remains);
+//! otherwise it returns an `Err` naming exactly what still remains.
+//!
 //! ## Mechanic
 //!
 //! [`RepairMode::DryRun`] mutates NOTHING — it only computes and returns the plan.
@@ -91,6 +118,35 @@ pub struct WalCandidate {
     pub class: WalClass,
 }
 
+/// Which out-of-scope area a torn object detected by the whole-store scan lives in — the reason
+/// the safe WAL-tail quarantine cannot (and must not) touch it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TornKind {
+    /// A torn SST under `{root}/compacted/` (a compacted / L0 SST). **DETECTION-ONLY**: it is
+    /// referenced by the manifest, so removing it without a manifest rollback would drop acked
+    /// data — this tool never quarantines/copies/renames/deletes it. Needs manifest-aware recovery.
+    CompactedSst,
+    /// A WAL object that is torn but NOT part of the safe trailing tail — e.g. a torn WAL object
+    /// at or below the durable frontier (below slatedb's replay boundary; SAFETY step 2 forbids
+    /// touching anything at/below the frontier), reported for completeness rather than quarantined.
+    WalNonTrailing,
+}
+
+/// A torn SST object detected OUTSIDE the safe WAL-tail quarantine scope. **DETECTION-ONLY**: the
+/// repair never mutates any object described here (see [`TornKind`]); it is surfaced so a dry-run
+/// shows the complete picture and an apply fails loud instead of silently succeeding.
+#[derive(Debug, Clone)]
+pub struct TornObject {
+    /// The full object path (e.g. `kv/compacted/01J79C21YKR31J2BS1EFXJZ7MR.sst`).
+    pub path: String,
+    /// The object size in bytes (as reported by the store `list`).
+    pub size: u64,
+    /// The footer-probe classification (always [`WalClass::Torn`] for this list).
+    pub class: WalClass,
+    /// Which out-of-scope area / reason it falls under.
+    pub kind: TornKind,
+}
+
 /// The outcome of a repair pass (dry-run or applied).
 #[derive(Debug, Clone)]
 pub struct RepairReport {
@@ -105,12 +161,22 @@ pub struct RepairReport {
     pub quarantine_dir: Option<String>,
     /// Whether the pass actually mutated the store (`false` for a dry-run or a no-op).
     pub applied: bool,
+    /// Torn SST objects found OUTSIDE the safe WAL-tail quarantine scope (from the WHOLE-store
+    /// scan): every torn compacted / L0 SST under `{root}/compacted/`, plus any torn WAL object
+    /// not in the quarantine plan (torn at/below the frontier). **DETECTION-ONLY** — the repair
+    /// NEVER quarantines/copies/renames/deletes anything listed here (a compacted SST is
+    /// referenced by the manifest; removing it without a manifest rollback would drop acked data).
+    /// A non-empty list means the store still holds a torn SST this tool will not auto-repair: a
+    /// dry-run reports it, and an [`RepairMode::Apply`] fails loud with
+    /// [`WalRepairError::UnrepairableTornObject`] (after any safe WAL-tail quarantine).
+    pub out_of_scope_torn: Vec<TornObject>,
 }
 
 impl RepairReport {
-    /// A pass that found nothing to repair (no torn trailing tail beyond the frontier).
+    /// A pass that found nothing to repair (no torn trailing tail beyond the frontier AND no
+    /// out-of-scope torn object anywhere in the store). Both must be empty for the store to open.
     pub fn is_noop(&self) -> bool {
-        self.quarantined.is_empty()
+        self.quarantined.is_empty() && self.out_of_scope_torn.is_empty()
     }
 }
 
@@ -172,6 +238,29 @@ pub enum WalRepairError {
     VerificationFailed {
         /// The store root.
         root: String,
+    },
+
+    /// The store holds torn SST object(s) OUTSIDE the safe WAL-tail scope that this tool will
+    /// NOT auto-remove — a torn compacted / L0 SST (referenced by the manifest, so removing it
+    /// without a manifest rollback would drop acked data), or a torn non-trailing WAL object.
+    /// On an apply this is returned AFTER any safe WAL-tail quarantine, so the repair never
+    /// reports success while the store still holds a torn SST that will fail its cold open —
+    /// the core "stop silently not-working" guarantee. Recovery needs manifest-aware handling /
+    /// escalation, not this tool.
+    #[error(
+        "control-plane WAL repair: the store at `{root}` still holds torn SST object(s) OUTSIDE \
+         the safe WAL-tail scope that this tool will NOT auto-remove — a compacted/L0 SST is \
+         referenced by the manifest, so removing it without a manifest rollback would drop acked \
+         data. {detail} Torn out-of-scope object(s): {}",
+        .objects.join(", ")
+    )]
+    UnrepairableTornObject {
+        /// The store root.
+        root: String,
+        /// The exact path(s) of the torn out-of-scope object(s) still present.
+        objects: Vec<String>,
+        /// Whether the safe WAL-tail quarantine was applied first, and the escalation note.
+        detail: String,
     },
 
     /// An underlying object-store operation failed (list/get/copy/delete/put).
@@ -273,6 +362,114 @@ async fn scan_candidates(
     // Highest id first — the trailing-tear walk goes from the top down.
     candidates.sort_by_key(|c| std::cmp::Reverse(c.id));
     Ok(candidates)
+}
+
+/// Scan the WHOLE store for torn SST objects that fall OUTSIDE the safe WAL-tail quarantine
+/// scope, so the repair can REPORT them (dry-run) and FAIL LOUD (apply) instead of silently
+/// no-op'ing while the store still won't open. Two sources, neither ever mutated:
+///
+/// 1. **`{root}/compacted/` SSTs** — compacted / L0 SSTs (`SsTableId::Compacted(ulid)`, so a ULID
+///    filename, NOT a `{:020}.sst` WAL id — we list the prefix and classify every `.sst` by path,
+///    not via `parse_wal_id`). The footer probe is format-agnostic (last 10 bytes only), so it
+///    classifies a compacted SST unchanged. Any [`WalClass::Torn`] one is a
+///    [`TornKind::CompactedSst`] — **DETECTION-ONLY** (referenced by the manifest; never removed).
+/// 2. **`{root}/wal/` objects at or below the frontier** — a torn WAL object at/below the durable
+///    frontier is below slatedb's replay boundary (so it doesn't block THIS open) and SAFETY step 2
+///    forbids touching anything at/below the frontier, so it is reported as [`TornKind::WalNonTrailing`]
+///    rather than quarantined. (Torn WAL objects strictly beyond the frontier are the quarantine
+///    plan's domain — a trailing run is quarantined, a mid-range gap is a hard `MidRangeGap` refusal.)
+///
+/// Returns the torn objects sorted by path for a stable report. Never copies/renames/deletes.
+async fn scan_out_of_scope_torn(
+    store: &Arc<dyn ObjectStore>,
+    root: &str,
+    frontier: u64,
+) -> Result<Vec<TornObject>, WalRepairError> {
+    use futures::StreamExt;
+    let mut out = Vec::new();
+
+    // 1. Compacted / L0 SSTs under `{root}/compacted/`.
+    let compacted_prefix = ObjPath::from(format!("{root}/compacted"));
+    let mut stream = store.list(Some(&compacted_prefix));
+    while let Some(item) = stream.next().await {
+        let meta = item.map_err(|e| WalRepairError::Store(e.to_string()))?;
+        // Classify only `.sst` objects (skip any incidental non-SST under the prefix, defensively).
+        let Some(name) = meta.location.filename() else {
+            continue;
+        };
+        if !name.ends_with(".sst") {
+            continue;
+        }
+        if classify(store, &meta.location, meta.size).await? == WalClass::Torn {
+            out.push(TornObject {
+                path: meta.location.to_string(),
+                size: meta.size,
+                class: WalClass::Torn,
+                kind: TornKind::CompactedSst,
+            });
+        }
+    }
+
+    // 2. Torn WAL objects at or below the durable frontier (non-trailing; the plan owns > frontier).
+    let wal_prefix = ObjPath::from(format!("{root}/wal"));
+    let mut stream = store.list(Some(&wal_prefix));
+    while let Some(item) = stream.next().await {
+        let meta = item.map_err(|e| WalRepairError::Store(e.to_string()))?;
+        let Some(id) = parse_wal_id(&meta.location) else {
+            continue;
+        };
+        if id > frontier {
+            continue; // strictly beyond the frontier — the quarantine plan's domain, not here
+        }
+        if classify(store, &meta.location, meta.size).await? == WalClass::Torn {
+            out.push(TornObject {
+                path: meta.location.to_string(),
+                size: meta.size,
+                class: WalClass::Torn,
+                kind: TornKind::WalNonTrailing,
+            });
+        }
+    }
+
+    out.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(out)
+}
+
+/// Decide the fail-loud refusal for out-of-scope torn objects on an APPLY. Pure (no I/O), so the
+/// refusal shape/message is unit-testable without a live slatedb manifest: given the whole-store
+/// out-of-scope torn list and the WAL-tail ids that were (or would be) quarantined, return
+/// `Some(UnrepairableTornObject)` naming every out-of-scope path when the list is non-empty, else
+/// `None`. The message states whether the safe WAL-tail quarantine ran first (progress), so the
+/// operator sees exactly what was done and what remains.
+fn out_of_scope_refusal(
+    root: &str,
+    out_of_scope_torn: &[TornObject],
+    quarantined: &[u64],
+) -> Option<WalRepairError> {
+    if out_of_scope_torn.is_empty() {
+        return None;
+    }
+    let objects: Vec<String> = out_of_scope_torn.iter().map(|t| t.path.clone()).collect();
+    let quarantine_note = if quarantined.is_empty() {
+        "No safe trailing WAL tail was present to quarantine (this apply mutated nothing)."
+            .to_string()
+    } else {
+        let ids: Vec<String> = quarantined.iter().map(|id| format!("{id:020}")).collect();
+        format!(
+            "The safe trailing WAL tail [{}] WAS quarantined first, but the store still holds the \
+             torn object(s) below.",
+            ids.join(", ")
+        )
+    };
+    let detail = format!(
+        "{quarantine_note} This needs manifest-aware recovery / escalation — a compacted SST must \
+         be dropped via a manifest rollback, never by removing the object out from under the manifest."
+    );
+    Some(WalRepairError::UnrepairableTornObject {
+        root: root.to_string(),
+        objects,
+        detail,
+    })
 }
 
 /// Decide the trailing torn tail to quarantine from the descending candidate list, enforcing
@@ -406,11 +603,18 @@ fn quarantine_stamp() -> String {
 }
 
 /// Repair a torn trailing WAL tail on the SlateDB store rooted at `root` over `store`, per the
-/// module's safety contract. Returns the plan/outcome as a [`RepairReport`]; refuses (fails
-/// loud) on an unreadable manifest, a mid-range gap, or a post-apply verification miss.
+/// module's safety contract, and DIAGNOSE the whole store (`wal/` + `compacted/`). Returns the
+/// plan/outcome as a [`RepairReport`]; refuses (fails loud) on an unreadable manifest, a mid-range
+/// gap, a post-apply verification miss, or (on apply) an out-of-scope torn SST it must not remove.
 ///
-/// - [`RepairMode::DryRun`] computes the plan and mutates NOTHING.
-/// - [`RepairMode::Apply`] copies → writes the quarantine manifest → deletes → re-verifies.
+/// - [`RepairMode::DryRun`] computes the plan, populates [`RepairReport::out_of_scope_torn`] with
+///   every torn compacted SST (and torn non-trailing WAL object), and mutates NOTHING — so the
+///   operator sees the complete picture (what WOULD be quarantined AND what is torn-but-out-of-scope).
+/// - [`RepairMode::Apply`] quarantines the safe trailing WAL tail first (copy → manifest → delete →
+///   re-verify), THEN — if any out-of-scope torn object remains — FAILS LOUD with
+///   [`WalRepairError::UnrepairableTornObject`] naming the exact path(s). An `Ok` therefore means
+///   the store is now free of ALL torn SSTs; anything torn this tool won't touch is an `Err`.
+///   Compacted / L0 SSTs are DETECTION-ONLY and are never quarantined/copied/renamed/deleted.
 ///
 /// `store` + `root` MUST be exactly the store/root the opener uses (so the repair sees the same
 /// objects the open will replay).
@@ -428,8 +632,12 @@ pub async fn repair_wal_tail(
     // 3+4. Decide the trailing torn tail, refusing on a mid-range gap.
     let ids = plan_trailing_tail(&candidates, root)?;
 
-    if ids.is_empty() || mode == RepairMode::DryRun {
-        // Nothing to do, or a dry-run: return the plan without mutating anything.
+    // 5. WHOLE-STORE scan: torn compacted/L0 SSTs (never mutated) + torn non-trailing WAL objects.
+    //    Computed for both modes — a dry-run reports it, an apply fails loud on it after quarantine.
+    let out_of_scope_torn = scan_out_of_scope_torn(store, root, frontier).await?;
+
+    if mode == RepairMode::DryRun {
+        // Dry-run: return the FULL plan (WAL-tail quarantine plan + out-of-scope torn) — mutate NOTHING.
         return Ok(RepairReport {
             frontier,
             candidates,
@@ -437,27 +645,42 @@ pub async fn repair_wal_tail(
             quarantine_dir: (!ids.is_empty())
                 .then(|| format!("{root}/wal-quarantine/<stamp>/ (dry-run: not created)")),
             applied: false,
+            out_of_scope_torn,
         });
     }
 
-    // 5. Apply: copy → manifest → delete (each candidate re-asserted strictly beyond frontier).
-    let stamp = quarantine_stamp();
-    apply_quarantine(store, root, frontier, &candidates, &ids, &stamp).await?;
+    // 6. Apply the safe WAL-tail quarantine FIRST (make progress). An empty plan mutates nothing;
+    //    a non-empty one copies → writes the quarantine manifest → deletes → re-verifies the tail.
+    let quarantine_dir = if ids.is_empty() {
+        None
+    } else {
+        let stamp = quarantine_stamp();
+        apply_quarantine(store, root, frontier, &candidates, &ids, &stamp).await?;
+        // Re-verify: scan again and confirm zero torn candidates remain beyond the frontier.
+        let after = scan_candidates(store, root, frontier).await?;
+        if after.iter().any(|c| c.class == WalClass::Torn) {
+            return Err(WalRepairError::VerificationFailed {
+                root: root.to_string(),
+            });
+        }
+        Some(format!("{root}/wal-quarantine/{stamp}"))
+    };
 
-    // 6. Re-verify: scan again and confirm zero torn candidates remain beyond the frontier.
-    let after = scan_candidates(store, root, frontier).await?;
-    if after.iter().any(|c| c.class == WalClass::Torn) {
-        return Err(WalRepairError::VerificationFailed {
-            root: root.to_string(),
-        });
+    // 7. FAIL LOUD if the store still holds a torn SST OUTSIDE the safe WAL-tail scope (a torn
+    //    compacted/L0 SST this tool must not remove, or a torn non-trailing WAL object). This is
+    //    the "never silently no-op / never claim success while torn" guarantee. Ordering: the safe
+    //    WAL tail (if any) was already quarantined above; the compacted SSTs are DETECTION-ONLY.
+    if let Some(err) = out_of_scope_refusal(root, &out_of_scope_torn, &ids) {
+        return Err(err);
     }
 
     Ok(RepairReport {
         frontier,
         candidates,
         quarantined: ids,
-        quarantine_dir: Some(format!("{root}/wal-quarantine/{stamp}")),
-        applied: true,
+        applied: quarantine_dir.is_some(),
+        quarantine_dir,
+        out_of_scope_torn,
     })
 }
 
@@ -470,10 +693,18 @@ mod tests {
     //! store and reopen it (B2, B5 over a live store) live in `kv_slatedb::tests` and are gated
     //! to the host toolchain (the static-musl harness stalls on close→reopen).
     //!
+    //! The whole-store-awareness gates (torn compacted/L0 SST DETECTED + never mutated; apply
+    //! REFUSES with `UnrepairableTornObject`) DO build a real slatedb manifest, but over a
+    //! **shared `InMemory`** store — the same deterministic, non-stalling path
+    //! `kv_slatedb::tests::flush_persists_then_reopens` uses (only the on-disk `LocalFileSystem`
+    //! path stalls under musl, so these need no `#[ignore]`), with the background compactor + GC
+    //! disabled so `close()` has nothing to drain.
+    //!
     //! Each gate is mutation-verified: the doc on B3/B4 names the exact relaxation that breaks it.
 
     use super::*;
     use slatedb::object_store::memory::InMemory;
+    use slatedb::{Db, Settings};
 
     /// A well-formed SST-footer object of `size` bytes: `size-2` filler + a 2-byte BE version
     /// word `version`. The repair probe reads ONLY the last 10 bytes (offset + version), so a
@@ -658,6 +889,265 @@ mod tests {
         assert!(
             matches!(err, WalRepairError::UnreadableManifest { .. }),
             "no manifest ⇒ REFUSE (never quarantine without a durable frontier), got {err:?}"
+        );
+    }
+
+    // ===== Whole-store awareness: compacted/L0 SSTs are DETECTED, never mutated =====
+
+    /// A well-formed ULID-shaped compacted-SST object path `{root}/compacted/<ulid>.sst` (slatedb
+    /// stores L0 / compacted SSTs as `SsTableId::Compacted(ulid)`, NOT the `{:020}.sst` WAL id).
+    fn compacted_object_path(root: &str, ulid: &str) -> ObjPath {
+        ObjPath::from(format!("{root}/compacted/{ulid}.sst"))
+    }
+
+    /// Seed a REAL slatedb store over `store` at `root`: one durable write, then a clean `close()`
+    /// (freezes the memtable → an L0 SST under `compacted/`, advances the durable frontier, writes
+    /// the manifest). Compactor + GC OFF so `close()` has nothing to drain — the deterministic,
+    /// non-stalling InMemory path (mirrors `kv_slatedb::tests::test_settings`). After this the store
+    /// has a readable manifest (so `repair_wal_tail` gets past the frontier check) and a readable
+    /// compacted SST — a clean baseline into which a test injects a torn object.
+    async fn seed_real_store(store: &Arc<dyn ObjectStore>, root: &str) {
+        // slatedb `Settings` is a foreign `#[non_exhaustive]` struct, so field reassignment after
+        // `default()` is the only way to build it (no struct-literal `..Default::default()`) — same
+        // shape as `kv_slatedb::tests::test_settings`.
+        #[allow(clippy::field_reassign_with_default)]
+        let settings = {
+            let mut settings = Settings::default();
+            settings.flush_interval = Some(std::time::Duration::from_millis(5));
+            settings.compactor_options = None;
+            settings.garbage_collector_options = None;
+            settings
+        };
+        let db = Db::builder(root.to_string(), store.clone())
+            .with_settings(settings)
+            .build()
+            .await
+            .unwrap();
+        db.put(b"seed-key", b"seed-val").await.unwrap();
+        db.close().await.unwrap(); // memtable → L0 (compacted/), frontier advanced, manifest written
+    }
+
+    /// The whole-store scan DETECTS a torn compacted/L0 SST (pure — no manifest needed) and marks it
+    /// [`TornKind::CompactedSst`], and the scan itself mutates NOTHING (the object survives). This is
+    /// the DETECTION half of the data-loss-safe invariant, decoupled from the frontier/manifest.
+    #[tokio::test]
+    async fn scan_detects_torn_compacted_sst_and_never_mutates_it() {
+        let store = mem_store();
+        let root = "kv";
+        // A readable compacted SST (version 1) and a torn one (version 0, >10 bytes) side by side.
+        let readable = compacted_object_path(root, "01J79C21YKR31J2BS1EFXJZ7MR");
+        let torn = compacted_object_path(root, "01J79C21YKR31J2BS1EFXJZ7MS");
+        store
+            .put(&readable, footer_object(128, 1).into())
+            .await
+            .unwrap();
+        store
+            .put(&torn, footer_object(128, 0).into())
+            .await
+            .unwrap();
+
+        // frontier is irrelevant to the compacted scan; pass 0.
+        let found = scan_out_of_scope_torn(&store, root, 0).await.unwrap();
+        assert_eq!(
+            found.len(),
+            1,
+            "only the torn compacted SST is reported: {found:?}"
+        );
+        assert_eq!(found[0].path, torn.to_string());
+        assert_eq!(found[0].kind, TornKind::CompactedSst);
+        assert_eq!(found[0].class, WalClass::Torn);
+        // DETECTION-ONLY: the scan copies/renames/deletes NOTHING — both objects still exist.
+        assert!(
+            store.head(&torn).await.is_ok(),
+            "the torn compacted SST must not be removed"
+        );
+        assert!(
+            store.head(&readable).await.is_ok(),
+            "the readable compacted SST is untouched"
+        );
+    }
+
+    /// The pure refusal decision: a non-empty out-of-scope list yields an `UnrepairableTornObject`
+    /// naming every path; an empty list yields `None`. The message notes whether a safe WAL tail was
+    /// quarantined first. Pure (no I/O), so the refusal shape is gated without a live manifest.
+    #[test]
+    fn out_of_scope_refusal_names_paths_and_notes_the_quarantine() {
+        let torn = vec![
+            TornObject {
+                path: "kv/compacted/01J79C21YKR31J2BS1EFXJZ7MS.sst".to_string(),
+                size: 128,
+                class: WalClass::Torn,
+                kind: TornKind::CompactedSst,
+            },
+            TornObject {
+                path: "kv/wal/00000000000000000003.sst".to_string(),
+                size: 64,
+                class: WalClass::Torn,
+                kind: TornKind::WalNonTrailing,
+            },
+        ];
+        // Empty ⇒ no refusal.
+        assert!(out_of_scope_refusal("kv", &[], &[]).is_none());
+        // Non-empty ⇒ UnrepairableTornObject naming BOTH paths.
+        let err = out_of_scope_refusal("kv", &torn, &[9]).expect("a refusal");
+        match err {
+            WalRepairError::UnrepairableTornObject {
+                objects,
+                detail,
+                root,
+            } => {
+                assert_eq!(root, "kv");
+                assert!(
+                    objects.contains(&torn[0].path),
+                    "names the compacted SST: {objects:?}"
+                );
+                assert!(
+                    objects.contains(&torn[1].path),
+                    "names the non-trailing WAL: {objects:?}"
+                );
+                assert!(
+                    detail.contains("WAS quarantined"),
+                    "the note records the WAL tail [9] was quarantined first: {detail}"
+                );
+            }
+            other => panic!("expected UnrepairableTornObject, got {other:?}"),
+        }
+        // With no safe tail quarantined, the note says nothing was mutated.
+        let err = out_of_scope_refusal("kv", &torn, &[]).expect("a refusal");
+        assert!(
+            format!("{err}").contains("mutated nothing"),
+            "with no WAL tail, the message states nothing was mutated: {err}"
+        );
+    }
+
+    /// GATE — a torn COMPACTED SST is DETECTED (dry-run) and an APPLY REFUSES (`UnrepairableTornObject`)
+    /// naming it, and NEVER quarantines/deletes it (it still exists after the apply). This is the core
+    /// data-loss-safety invariant: a compacted SST referenced by the manifest is DETECTION-ONLY.
+    #[serial_test::serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn apply_refuses_and_never_mutates_a_torn_compacted_sst() {
+        let store = mem_store();
+        let root = "kv";
+        seed_real_store(&store, root).await; // real manifest + frontier + a readable L0 SST
+        // Inject a torn (version-0, >10-byte) COMPACTED/L0 SST — the production torn-compacted case.
+        let torn = compacted_object_path(root, "01J79C21YKR31J2BS1EFXJZ7MS");
+        store
+            .put(&torn, footer_object(128, 0).into())
+            .await
+            .unwrap();
+
+        // DRY-RUN detects it in out_of_scope_torn (mutating nothing).
+        let dry = repair_wal_tail(&store, root, RepairMode::DryRun)
+            .await
+            .unwrap();
+        assert!(
+            dry.out_of_scope_torn
+                .iter()
+                .any(|t| t.kind == TornKind::CompactedSst
+                    && t.path == torn.to_string()
+                    && t.class == WalClass::Torn),
+            "dry-run must DETECT the torn compacted SST: {:?}",
+            dry.out_of_scope_torn
+        );
+
+        // APPLY REFUSES, naming the compacted path.
+        let err = repair_wal_tail(&store, root, RepairMode::Apply)
+            .await
+            .unwrap_err();
+        match err {
+            WalRepairError::UnrepairableTornObject { objects, .. } => assert!(
+                objects.iter().any(|p| p == &torn.to_string()),
+                "the refusal must name the torn compacted SST: {objects:?}"
+            ),
+            other => panic!("expected UnrepairableTornObject, got {other:?}"),
+        }
+        // DETECTION-ONLY: the compacted SST was NEVER quarantined/copied/deleted — it still exists.
+        assert!(
+            store.head(&torn).await.is_ok(),
+            "the torn compacted SST must NOT be mutated by repair (manifest-referenced; data-loss guard)"
+        );
+    }
+
+    /// GATE — a torn TRAILING WAL tail with NO compacted tear still quarantines and the apply SUCCEEDS
+    /// (the existing WAL-tail behavior is unchanged by whole-store awareness).
+    #[serial_test::serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn apply_quarantines_a_torn_wal_tail_when_no_compacted_tear() {
+        let store = mem_store();
+        let root = "kv";
+        seed_real_store(&store, root).await;
+        // Inject a torn WAL object strictly beyond the durable frontier (a trailing tear).
+        let frontier = repair_wal_tail(&store, root, RepairMode::DryRun)
+            .await
+            .unwrap()
+            .frontier;
+        let torn_id = frontier + 1;
+        put_wal(&store, root, torn_id, footer_object(64, 0)).await;
+
+        let report = repair_wal_tail(&store, root, RepairMode::Apply)
+            .await
+            .unwrap();
+        assert!(
+            report.applied,
+            "the WAL-tail quarantine must have been applied: {report:?}"
+        );
+        assert_eq!(
+            report.quarantined,
+            vec![torn_id],
+            "the trailing torn tail is quarantined"
+        );
+        assert!(
+            report.out_of_scope_torn.is_empty(),
+            "no compacted tear ⇒ no out-of-scope torn objects: {:?}",
+            report.out_of_scope_torn
+        );
+        // The torn WAL object is gone from wal/ (quarantined), so the store can open.
+        assert!(
+            store.head(&wal_object_path(root, torn_id)).await.is_err(),
+            "the quarantined WAL object must be removed from wal/"
+        );
+    }
+
+    /// GATE — BOTH a safe WAL tail AND a torn compacted SST: the apply quarantines the WAL tail FIRST
+    /// (progress), then REFUSES with `UnrepairableTornObject` naming the compacted path — and the
+    /// compacted SST still exists (never mutated). Proves the quarantine-then-fail-loud ordering.
+    #[serial_test::serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn apply_quarantines_wal_tail_then_refuses_on_torn_compacted() {
+        let store = mem_store();
+        let root = "kv";
+        seed_real_store(&store, root).await;
+        let frontier = repair_wal_tail(&store, root, RepairMode::DryRun)
+            .await
+            .unwrap()
+            .frontier;
+        let torn_id = frontier + 1;
+        put_wal(&store, root, torn_id, footer_object(64, 0)).await; // safe trailing WAL tear
+        let torn_compacted = compacted_object_path(root, "01J79C21YKR31J2BS1EFXJZ7MT");
+        store
+            .put(&torn_compacted, footer_object(128, 0).into())
+            .await
+            .unwrap(); // out-of-scope tear
+
+        let err = repair_wal_tail(&store, root, RepairMode::Apply)
+            .await
+            .unwrap_err();
+        match err {
+            WalRepairError::UnrepairableTornObject { objects, .. } => assert!(
+                objects.iter().any(|p| p == &torn_compacted.to_string()),
+                "the refusal must name the torn compacted SST: {objects:?}"
+            ),
+            other => panic!("expected UnrepairableTornObject, got {other:?}"),
+        }
+        // The safe WAL tail WAS quarantined first (progress made before the fail-loud).
+        assert!(
+            store.head(&wal_object_path(root, torn_id)).await.is_err(),
+            "the safe trailing WAL tail must have been quarantined before the refusal"
+        );
+        // But the compacted SST was NEVER touched (DETECTION-ONLY, data-loss guard).
+        assert!(
+            store.head(&torn_compacted).await.is_ok(),
+            "the torn compacted SST must never be quarantined/deleted by repair"
         );
     }
 }
