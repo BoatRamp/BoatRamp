@@ -67,16 +67,24 @@
 //! [`RepairMode::Apply`] **copies** (never renames) each offending trailing-torn
 //! object to `{root}/wal-quarantine/{stamp}/{:020}.sst`, writes a
 //! `MANIFEST.json` describing the action, THEN deletes the original, and finally
-//! re-verifies that zero torn candidates remain before returning. The caller then
-//! proceeds to open the (now-clean) store.
+//! verifies the store by an **actual open attempt** (a throwaway
+//! [`slatedb::Db`] build with repair disabled — see [`verify_opens`]) before
+//! returning. A footer re-scan alone cannot see every corruption (a truncated
+//! edge whose last two bytes read as a valid version word, a torn block below the
+//! footer); the definitive post-repair check is that the store genuinely opens.
+//! Success ⇒ genuinely fixed; a failed open ⇒ fail loud
+//! ([`WalRepairError::OpenVerificationFailed`]), never a false success. The
+//! caller then proceeds to open the (now-verified) store.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use slatedb::admin::Admin;
 // `ObjectStore` for `list`; `ObjectStoreExt` for the `get_range`/`put`/`copy`/`delete`
 // convenience methods (an extension trait in object_store 0.14).
 use slatedb::object_store::path::Path as ObjPath;
 use slatedb::object_store::{ObjectStore, ObjectStoreExt};
+use slatedb::{Db, Settings};
 
 /// The SST footer is the last 10 bytes: 8-byte metadata offset + 2-byte version word.
 /// Mirrors slatedb `format/sst.rs` `NUM_FOOTER_BYTES` (an object at or below this size
@@ -229,15 +237,45 @@ pub enum WalRepairError {
         frontier: u64,
     },
 
-    /// After applying the quarantine, a torn candidate still remained (a concurrent
-    /// writer, or a store-consistency failure). Refuse to claim success.
+    /// A WAL id is MISSING from the surviving objects BELOW a readable (data-bearing) object — a
+    /// hole in the replay range that quarantining the trailing tail did not (and cannot) fix. WAL
+    /// replay cannot bridge a hole: the readable object above the gap holds acked data that cannot
+    /// be reached without the missing id's entries, so opening would be lossy/inconsistent, and the
+    /// repair fails loud (SAFETY: an unfixed hole beyond the frontier is real data loss the repair
+    /// must never paper over). Distinct from [`MidRangeGap`](Self::MidRangeGap) (a torn object below
+    /// a readable one): in a `WalIdHole` the id is entirely ABSENT, not present-but-torn.
     #[error(
-        "control-plane WAL repair failed: after quarantine, torn WAL object(s) still remain \
-         beyond the frontier at `{root}` — refusing to report success"
+        "control-plane WAL repair refused: WAL id {missing_id:020} is MISSING but a readable WAL \
+         object ({above_readable_id:020}) sits above the gap at `{root}` — a trailing-tail \
+         quarantine cannot fix a mid-range hole (replay cannot bridge a gap). Refusing (an absent \
+         WAL id below acked data is unfixed data loss). Run `boatramp kv recover` to diagnose"
     )]
-    VerificationFailed {
+    WalIdHole {
         /// The store root.
         root: String,
+        /// The first absent WAL id in the surviving replay range.
+        missing_id: u64,
+        /// The highest readable (data-bearing) surviving object that sits above the gap.
+        above_readable_id: u64,
+    },
+
+    /// After the safe WAL-tail quarantine, a REAL open attempt of the store STILL failed. The
+    /// footer probe cannot detect every corruption (a truncated edge whose last bytes read as a
+    /// valid version word, a torn block below the footer offset), so the definitive post-repair
+    /// verification is an actual [`slatedb::Db`] open (repair disabled). A failure here means the
+    /// store is NOT genuinely repaired — refuse to claim success (SAFETY: never return `Ok` for a
+    /// store the server's own cold open would then die on).
+    #[error(
+        "control-plane WAL repair: the safe trailing WAL tail was handled, but a REAL open of the \
+         store at `{root}` STILL failed ({detail}) — the tear is beyond a trailing-tail quarantine \
+         (e.g. a truncated edge or a torn block the footer probe cannot see). Refusing to report \
+         success. Run `boatramp kv recover` to diagnose / adopt a clean volume snapshot"
+    )]
+    OpenVerificationFailed {
+        /// The store root.
+        root: String,
+        /// The underlying open failure.
+        detail: String,
     },
 
     /// The store holds torn SST object(s) OUTSIDE the safe WAL-tail scope that this tool will
@@ -318,6 +356,19 @@ async fn classify(
         .map_err(|e| WalRepairError::Store(e.to_string()))?;
     if footer.len() != NUM_FOOTER_BYTES as usize {
         // A short read of the tail range is itself a sign of a torn object.
+        return Ok(WalClass::Torn);
+    }
+    // Metadata-offset sanity (C4 — the truncated-edge blind spot). Footer bytes[0..8] are the
+    // big-endian u64 offset of the SST metadata block, which MUST lie strictly before the footer
+    // itself (i.e. within `[0, size - NUM_FOOTER_BYTES]`). An offset past that boundary is garbage:
+    // a torn / truncated object even when the 2-byte version word below happens to read as a
+    // supported value (the exact case a version-only probe misclassifies as `Readable`, only for
+    // the real open to then die with `ChecksumMismatch`). `size > NUM_FOOTER_BYTES` here (the fence
+    // branch returned above), so `size - NUM_FOOTER_BYTES` cannot underflow.
+    let meta_offset = u64::from_be_bytes([
+        footer[0], footer[1], footer[2], footer[3], footer[4], footer[5], footer[6], footer[7],
+    ]);
+    if meta_offset > size - NUM_FOOTER_BYTES {
         return Ok(WalClass::Torn);
     }
     // Version word = the last 2 bytes (footer bytes 8..10), big-endian — the same slice
@@ -513,6 +564,93 @@ fn plan_trailing_tail(candidates: &[WalCandidate], root: &str) -> Result<Vec<u64
     Ok(quarantine)
 }
 
+/// **WAL-id contiguity guard (C4).** After the trailing-torn tail is planned for quarantine, the
+/// objects that SURVIVE (everything beyond the frontier that is not quarantined) must form a
+/// contiguous replay range with no absent id below the highest readable (data-bearing) survivor.
+///
+/// The danger this catches — distinct from [`plan_trailing_tail`]'s [`WalRepairError::MidRangeGap`]
+/// (a torn object present below a readable one) — is a WAL id that is ENTIRELY ABSENT below acked
+/// data: e.g. frontier=5, readable at 6 and 8, torn trailing at 9. Quarantining 9 leaves survivors
+/// {6, 8} — id 7 is missing, so the acked data in object 8 sits above an unbridgeable hole. WAL
+/// replay cannot skip a hole, so this is unfixed data loss ⇒ fail loud rather than open.
+///
+/// Fence objects (≤10 bytes) occupy an id and count as PRESENT (slatedb tolerates them on replay),
+/// so a benign fence does not read as a hole. Only ids from `frontier + 1` up to the highest
+/// readable survivor are required to be present; absent ids ABOVE the highest data survivor are
+/// harmless (nothing acked sits above them). Runs in BOTH modes so a dry-run also reports the hole.
+fn check_survivor_contiguity(
+    candidates: &[WalCandidate],
+    quarantined: &[u64],
+    frontier: u64,
+    root: &str,
+) -> Result<(), WalRepairError> {
+    // The highest readable (data-bearing) survivor — a hole matters only below real acked data.
+    let Some(max_readable) = candidates
+        .iter()
+        .filter(|c| c.class == WalClass::Readable && !quarantined.contains(&c.id))
+        .map(|c| c.id)
+        .max()
+    else {
+        // No surviving data object beyond the frontier ⇒ nothing acked can be stranded by a gap.
+        return Ok(());
+    };
+    // Every id from frontier+1 up to that data survivor must be present among the survivors.
+    let present: std::collections::BTreeSet<u64> = candidates
+        .iter()
+        .map(|c| c.id)
+        .filter(|id| !quarantined.contains(id))
+        .collect();
+    for id in (frontier + 1)..=max_readable {
+        if !present.contains(&id) {
+            return Err(WalRepairError::WalIdHole {
+                root: root.to_string(),
+                missing_id: id,
+                above_readable_id: max_readable,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// **Real-open verification (C4).** Attempt an ACTUAL [`slatedb::Db`] open of the store at `root`
+/// over `store`, with repair DISABLED — the definitive check that the store the repair just
+/// produced genuinely boots (a footer re-scan shares the classifier's blind spot; only a real
+/// replay proves the WAL/L0/manifest are consistent). Builds a throwaway writer with the
+/// background compactor + GC disabled (nothing to drain, so the close is fast and cannot stall),
+/// then closes it. `Ok(())` ⇒ the store opened and closed cleanly; `Err` ⇒ it is NOT repaired.
+///
+/// Runs in the fenced, single-writer repair context (no concurrent writer), so briefly claiming
+/// the writer here and releasing it before the caller's real open is safe. The close advances the
+/// durable frontier (memtable → L0), leaving the store checkpointed for the caller's cold open.
+async fn verify_opens(store: &Arc<dyn ObjectStore>, root: &str) -> Result<(), WalRepairError> {
+    #[allow(clippy::field_reassign_with_default)]
+    let settings = {
+        // `Settings` is a foreign `#[non_exhaustive]` struct — field reassignment after
+        // `default()` is the only way to build it (mirrors `kv_slatedb`'s `test_settings`).
+        let mut settings = Settings::default();
+        settings.flush_interval = Some(Duration::from_millis(5));
+        settings.compactor_options = None;
+        settings.garbage_collector_options = None;
+        settings
+    };
+    let db = Db::builder(root.to_string(), store.clone())
+        .with_settings(settings)
+        .build()
+        .await
+        .map_err(|e| WalRepairError::OpenVerificationFailed {
+            root: root.to_string(),
+            detail: e.to_string(),
+        })?;
+    // Close the throwaway writer (freeze memtable → L0, advance the frontier, release the fence).
+    db.close()
+        .await
+        .map_err(|e| WalRepairError::OpenVerificationFailed {
+            root: root.to_string(),
+            detail: format!("store opened but failed to close cleanly: {e}"),
+        })?;
+    Ok(())
+}
+
 /// The zero-padded `{:020}.sst` WAL object path under `{root}/wal/` for `id`.
 fn wal_object_path(root: &str, id: u64) -> ObjPath {
     ObjPath::from(format!("{root}/wal/{id:020}.sst"))
@@ -605,16 +743,20 @@ fn quarantine_stamp() -> String {
 /// Repair a torn trailing WAL tail on the SlateDB store rooted at `root` over `store`, per the
 /// module's safety contract, and DIAGNOSE the whole store (`wal/` + `compacted/`). Returns the
 /// plan/outcome as a [`RepairReport`]; refuses (fails loud) on an unreadable manifest, a mid-range
-/// gap, a post-apply verification miss, or (on apply) an out-of-scope torn SST it must not remove.
+/// gap, a mid-range WAL-id hole, an out-of-scope torn SST it must not remove, or a store that
+/// STILL fails a real open after the quarantine.
 ///
 /// - [`RepairMode::DryRun`] computes the plan, populates [`RepairReport::out_of_scope_torn`] with
 ///   every torn compacted SST (and torn non-trailing WAL object), and mutates NOTHING — so the
 ///   operator sees the complete picture (what WOULD be quarantined AND what is torn-but-out-of-scope).
-/// - [`RepairMode::Apply`] quarantines the safe trailing WAL tail first (copy → manifest → delete →
-///   re-verify), THEN — if any out-of-scope torn object remains — FAILS LOUD with
-///   [`WalRepairError::UnrepairableTornObject`] naming the exact path(s). An `Ok` therefore means
-///   the store is now free of ALL torn SSTs; anything torn this tool won't touch is an `Err`.
-///   Compacted / L0 SSTs are DETECTION-ONLY and are never quarantined/copied/renamed/deleted.
+///   The mid-range-gap and WAL-id-hole refusals also fire in dry-run (they are properties of the
+///   plan, not the mutation).
+/// - [`RepairMode::Apply`] quarantines the safe trailing WAL tail first (copy → manifest → delete),
+///   THEN — if any out-of-scope torn object remains — FAILS LOUD with
+///   [`WalRepairError::UnrepairableTornObject`] naming the exact path(s), and finally verifies the
+///   store by an ACTUAL open ([`verify_opens`], C4). An `Ok` therefore means the store is free of
+///   ALL torn SSTs AND genuinely boots; anything torn this tool won't touch, or a store that still
+///   won't open, is an `Err`. Compacted / L0 SSTs are DETECTION-ONLY (never quarantined/deleted).
 ///
 /// `store` + `root` MUST be exactly the store/root the opener uses (so the repair sees the same
 /// objects the open will replay).
@@ -629,8 +771,12 @@ pub async fn repair_wal_tail(
     // 2. List + classify every WAL object strictly beyond the frontier, highest id first.
     let candidates = scan_candidates(store, root, frontier).await?;
 
-    // 3+4. Decide the trailing torn tail, refusing on a mid-range gap.
+    // 3+4. Decide the trailing torn tail, refusing on a mid-range gap (torn below readable).
     let ids = plan_trailing_tail(&candidates, root)?;
+
+    // 4b. Contiguity guard (C4): the survivors must have no ABSENT WAL id below the highest readable
+    //     survivor — a hole is unfixed data loss replay cannot bridge. Runs in both modes.
+    check_survivor_contiguity(&candidates, &ids, frontier, root)?;
 
     // 5. WHOLE-STORE scan: torn compacted/L0 SSTs (never mutated) + torn non-trailing WAL objects.
     //    Computed for both modes — a dry-run reports it, an apply fails loud on it after quarantine.
@@ -650,19 +796,12 @@ pub async fn repair_wal_tail(
     }
 
     // 6. Apply the safe WAL-tail quarantine FIRST (make progress). An empty plan mutates nothing;
-    //    a non-empty one copies → writes the quarantine manifest → deletes → re-verifies the tail.
+    //    a non-empty one copies → writes the quarantine manifest → deletes the originals.
     let quarantine_dir = if ids.is_empty() {
         None
     } else {
         let stamp = quarantine_stamp();
         apply_quarantine(store, root, frontier, &candidates, &ids, &stamp).await?;
-        // Re-verify: scan again and confirm zero torn candidates remain beyond the frontier.
-        let after = scan_candidates(store, root, frontier).await?;
-        if after.iter().any(|c| c.class == WalClass::Torn) {
-            return Err(WalRepairError::VerificationFailed {
-                root: root.to_string(),
-            });
-        }
         Some(format!("{root}/wal-quarantine/{stamp}"))
     };
 
@@ -670,9 +809,17 @@ pub async fn repair_wal_tail(
     //    compacted/L0 SST this tool must not remove, or a torn non-trailing WAL object). This is
     //    the "never silently no-op / never claim success while torn" guarantee. Ordering: the safe
     //    WAL tail (if any) was already quarantined above; the compacted SSTs are DETECTION-ONLY.
+    //    This runs BEFORE the real-open verify so the specific `UnrepairableTornObject` message
+    //    (naming the manifest-referenced object) wins over a generic open failure.
     if let Some(err) = out_of_scope_refusal(root, &out_of_scope_torn, &ids) {
         return Err(err);
     }
+
+    // 8. REAL-OPEN VERIFICATION (C4) — the definitive post-repair check. A footer re-scan shares
+    //    the classifier's blind spot; only an actual `Db` open proves the store the caller is about
+    //    to serve genuinely boots. A failure here (e.g. a truncated edge or a torn block the probe
+    //    could not see) fails loud — NEVER claim success for a store the cold open would die on.
+    verify_opens(store, root).await?;
 
     Ok(RepairReport {
         frontier,
@@ -706,9 +853,10 @@ mod tests {
     use slatedb::object_store::memory::InMemory;
     use slatedb::{Db, Settings};
 
-    /// A well-formed SST-footer object of `size` bytes: `size-2` filler + a 2-byte BE version
-    /// word `version`. The repair probe reads ONLY the last 10 bytes (offset + version), so a
-    /// crafted object is byte-faithful to what `classify` inspects without a real SST body.
+    /// A well-formed SST-footer object of `size` bytes: filler + a 10-byte footer whose bytes[0..8]
+    /// are a SANE metadata offset (`<= size - 10`, so it passes the C4 offset-sanity probe) and
+    /// bytes[8..10] are a 2-byte BE version word. The repair probe reads ONLY the last 10 bytes, so
+    /// a crafted object is byte-faithful to what `classify` inspects without a real SST body.
     /// `version ∈ {1,2}` ⇒ Readable; anything else (notably 0, the production torn signature) ⇒ Torn.
     fn footer_object(size: usize, version: u16) -> bytes::Bytes {
         assert!(
@@ -716,8 +864,27 @@ mod tests {
             "must fit a 10-byte footer"
         );
         let mut buf = vec![0xABu8; size];
-        // Footer = last 10 bytes: bytes[..8] = metadata offset (arbitrary here), bytes[8..10] = version BE.
         let n = buf.len();
+        // Footer bytes[0..8] = a valid metadata offset (<= size-10) so a version-1/2 object reads
+        // Readable; bytes[8..10] = version BE. A half-of-the-body offset is always in range.
+        let meta_offset = (size as u64 - NUM_FOOTER_BYTES) / 2;
+        buf[n - 10..n - 2].copy_from_slice(&meta_offset.to_be_bytes());
+        buf[n - 2..n].copy_from_slice(&version.to_be_bytes());
+        bytes::Bytes::from(buf)
+    }
+
+    /// A crafted footer object with a GOOD version word but a metadata offset PAST the footer start
+    /// (`> size - 10`) — the truncated-edge blind spot the C4 offset-sanity probe catches. A
+    /// version-only classifier would misread this as `Readable`, only for the real open to die.
+    fn footer_object_bad_offset(size: usize, version: u16) -> bytes::Bytes {
+        assert!(
+            size >= NUM_FOOTER_BYTES as usize,
+            "must fit a 10-byte footer"
+        );
+        let mut buf = vec![0xABu8; size];
+        let n = buf.len();
+        let bad_offset = size as u64; // strictly > size - NUM_FOOTER_BYTES
+        buf[n - 10..n - 2].copy_from_slice(&bad_offset.to_be_bytes());
         buf[n - 2..n].copy_from_slice(&version.to_be_bytes());
         bytes::Bytes::from(buf)
     }
@@ -754,6 +921,91 @@ mod tests {
         // The fence branch is purely size-driven (≤10 bytes), matching slatedb's tolerated case.
         let fence = wal_object_path(root, 7);
         assert_eq!(classify(&store, &fence, 0).await.unwrap(), WalClass::Fence);
+    }
+
+    // --- C4: metadata-offset sanity — a GOOD version word but an out-of-range offset ⇒ Torn. ---
+    //
+    // MUTATION this gate catches: drop the `meta_offset > size - NUM_FOOTER_BYTES` check in
+    // `classify`. Then a truncated edge whose last 2 bytes happen to read as version 1/2 would be
+    // misclassified `Readable`, left in place by `plan_trailing_tail`, and only caught (if at all)
+    // by the real open — this test asserts the probe itself flags it Torn on the offset alone.
+    #[tokio::test]
+    async fn classify_flags_bad_metadata_offset_as_torn_even_with_valid_version() {
+        let store = mem_store();
+        let root = "kv";
+        // A valid version word (1) but an offset past the footer start — a truncated/torn object.
+        put_wal(&store, root, 5, footer_object_bad_offset(64, 1)).await;
+        let torn = wal_object_path(root, 5);
+        assert_eq!(
+            classify(&store, &torn, 64).await.unwrap(),
+            WalClass::Torn,
+            "an out-of-range metadata offset ⇒ Torn regardless of a valid version word (C4)"
+        );
+    }
+
+    // --- C4: WAL-id contiguity guard — an ABSENT id below a readable survivor ⇒ WalIdHole. ---
+    //
+    // MUTATION this gate catches: remove `check_survivor_contiguity`. Then a store missing a WAL id
+    // below acked data would be reported as repairable (the trailing-tail plan looks fine), and the
+    // real open would die on the hole; this asserts the pre-open loud refusal instead.
+    #[test]
+    fn contiguity_guard_refuses_an_absent_id_below_a_readable_survivor() {
+        // frontier=5; survivors after planning: readable at 6 and 8, id 7 ABSENT. (The trailing
+        // torn tail, if any, is already excluded via `quarantined`.) Highest readable survivor = 8,
+        // so ids 6 and 7 must be present — 7 is missing ⇒ hole ⇒ refuse.
+        let candidates = vec![
+            WalCandidate {
+                id: 8,
+                size: 64,
+                class: WalClass::Readable,
+            },
+            WalCandidate {
+                id: 6,
+                size: 64,
+                class: WalClass::Readable,
+            },
+        ];
+        let err = check_survivor_contiguity(&candidates, &[], 5, "kv").unwrap_err();
+        match err {
+            WalRepairError::WalIdHole {
+                missing_id,
+                above_readable_id,
+                ..
+            } => {
+                assert_eq!(missing_id, 7, "the first absent id in the replay range");
+                assert_eq!(above_readable_id, 8, "the readable survivor above the hole");
+            }
+            other => panic!("expected a WalIdHole refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn contiguity_guard_allows_a_contiguous_survivor_run_and_a_trailing_fence_gap() {
+        // frontier=5; readable at 6,7,8 (contiguous from frontier+1) plus an ABSENT id 10 ABOVE the
+        // highest data survivor (8) — harmless (nothing acked sits above it). Must pass.
+        let candidates = vec![
+            WalCandidate {
+                id: 8,
+                size: 64,
+                class: WalClass::Readable,
+            },
+            WalCandidate {
+                id: 7,
+                size: 64,
+                class: WalClass::Readable,
+            },
+            WalCandidate {
+                id: 6,
+                size: 64,
+                class: WalClass::Readable,
+            },
+        ];
+        assert!(
+            check_survivor_contiguity(&candidates, &[], 5, "kv").is_ok(),
+            "a contiguous run from frontier+1 with no hole below the top data object is fine"
+        );
+        // And with no surviving data object at all (only the tail, all quarantined) it is a no-op.
+        assert!(check_survivor_contiguity(&[], &[], 5, "kv").is_ok());
     }
 
     // --- B3: trailing-only + mid-range-gap REFUSAL (the load-bearing data-loss guard). ---
@@ -1101,10 +1353,49 @@ mod tests {
             "no compacted tear ⇒ no out-of-scope torn objects: {:?}",
             report.out_of_scope_torn
         );
-        // The torn WAL object is gone from wal/ (quarantined), so the store can open.
+        // The torn bytes were preserved under wal-quarantine/ before the delete (forensic-safe),
+        // and — because `repair_wal_tail(Apply)` now ends with a REAL open verification (C4) that
+        // SUCCEEDED (the `.unwrap()` above) — the store is genuinely bootable again. (We do NOT
+        // assert `wal/{torn_id}` is absent: the verify open claims the next WAL slot, which is that
+        // same id, so slatedb re-creates a fresh — non-torn — object there; the point is the store
+        // OPENS, which the successful verify proves.)
+        let qdir = report.quarantine_dir.expect("a quarantine dir");
+        let qcopy = ObjPath::from(format!("{qdir}/{torn_id:020}.sst"));
         assert!(
-            store.head(&wal_object_path(root, torn_id)).await.is_err(),
-            "the quarantined WAL object must be removed from wal/"
+            store.head(&qcopy).await.is_ok(),
+            "the torn bytes must be preserved under wal-quarantine/ (forensic-safe copy)"
+        );
+        // And an independent real open confirms the repaired store is bootable.
+        assert!(
+            verify_opens(&store, root).await.is_ok(),
+            "the repaired store must open cleanly after the repair"
+        );
+    }
+
+    /// GATE (C4) — the real-open verification is the DEFINITIVE post-repair check: a torn WAL object
+    /// left in the replay range (simulating a classifier miss the footer probe could not catch)
+    /// makes `verify_opens` FAIL LOUD with `OpenVerificationFailed`, never a false success. This is
+    /// what backs the invariant that `repair_wal_tail(Apply)` returning `Ok` means the store genuinely
+    /// boots — the footer re-scan it replaces shares the classifier's blind spot; a real open does not.
+    #[serial_test::serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn verify_opens_fails_loud_on_a_torn_wal_object_in_the_replay_range() {
+        let store = mem_store();
+        let root = "kv";
+        seed_real_store(&store, root).await;
+        let frontier = repair_wal_tail(&store, root, RepairMode::DryRun)
+            .await
+            .unwrap()
+            .frontier;
+        // A torn version-0 WAL object in the replay range that a (hypothetically relaxed) quarantine
+        // left behind — the real open replays it and dies. `verify_opens` must surface that failure.
+        put_wal(&store, root, frontier + 1, footer_object(64, 0)).await;
+        let err = verify_opens(&store, root)
+            .await
+            .expect_err("a torn WAL object in the replay range must fail the real open");
+        assert!(
+            matches!(err, WalRepairError::OpenVerificationFailed { .. }),
+            "the real open must fail loud (never claim success): got {err:?}"
         );
     }
 
