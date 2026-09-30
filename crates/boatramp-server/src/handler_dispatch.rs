@@ -448,6 +448,8 @@ pub(super) async fn dispatch_handler(
         &handler.tenant_secret_names,
         // Per-component blob-upload container allowlist (S3 external ingress): empty ⇒ deny-all.
         &handler.upload_containers,
+        // Per-component plain-`wasi:blobstore` container allowlist (host-enforced tenant confinement).
+        &handler.blobstore_containers,
         // Per-guest secret allowlist (task #492): empty ⇒ the whole site pool, else only these keys.
         &handler.secrets,
         // A site handler is the entry point of a call chain (reached over HTTP), so it
@@ -1642,6 +1644,12 @@ pub(super) async fn build_bindings(
     // (least-privilege, mirroring `tenant_secret_names`). Only consulted when a `blob-upload:*` right
     // is granted + the local S3 face's minting config is wired.
     upload_containers: &[String],
+    // Per-component container allowlist for the PLAIN `wasi:blobstore` capability (host-enforced
+    // tenant confinement — SEPARATE from `upload_containers`, no inheritance). `{tenant}`-templated,
+    // matched against the container the guest opens; non-empty ⇒ ALWAYS enforced. Empty on a
+    // multi-tenant site ⇒ deny-all (fail-closed); empty single-tenant ⇒ permissive. Only consulted
+    // when `wasi:blobstore` is granted.
+    blobstore_containers: &[String],
     // Per-guest secret allowlist (task #492): the subset of the site `[handlers].secrets` pool KEYS
     // this guest is granted. Empty ⇒ inject the whole pool (default, non-breaking); non-empty ⇒ inject
     // only the named keys (least-privilege). Filtered at the `resolve_env` choke point below.
@@ -1680,10 +1688,10 @@ pub(super) async fn build_bindings(
     if granted("wasi:keyvalue") {
         bindings = bindings.with_keyvalue(scope, inner.kv.clone());
     }
-    if granted("wasi:blobstore") {
-        let max_blob = inner.max_blob_bytes.get().copied().unwrap_or(0);
-        bindings = bindings.with_blobstore(scope, inner.storage.clone(), max_blob);
-    }
+    // NOTE: `wasi:blobstore` is granted AFTER the `handler_caller_tenant` block below, because its
+    // host-side tenant confinement needs THIS invocation's resolved OWN tenant + the multi-tenant
+    // fact to expand a `{tenant}` allowlist entry / apply the deny-default. Mirrors where the
+    // `blob-upload` mint binding is built (also post-resolution).
     if let Some(provider) = &inner.sql {
         // The SQL provider validates + qualifies `project`/`site` internally (it rejects a
         // `/`-bearing composite `site`), so pass the *raw* project + bare site here — never the
@@ -1932,6 +1940,29 @@ pub(super) async fn build_bindings(
         // inherits it (each fact keeps its axis).
         tenancy.map(|h| h.facts().to_vec()).unwrap_or_default()
     };
+    // `wasi:blobstore` (REORDERED to here, post tenant-resolution): the host-side tenant confinement
+    // (`blobstore.rs::container_prefix`) needs THIS invocation's resolved OWN tenant to expand a
+    // `{tenant}` allowlist entry, and the multi-tenant fact to apply the deny-default. `multi_tenant`
+    // is derived from the SAME tenancy that scopes `sql`/`orm`: the route/site DECLARES a tenancy
+    // (`handler_tenancy` or `site_handlers.tenancy` — together the `effective_tenancy` used above; a
+    // `Tenancy::Target` route is one of these) OR a confining `HostTenancy` was resolved
+    // (`handler_caller_tenant` non-empty). The resolved own tenant is
+    // `resolved_tenant_string(&handler_caller_tenant)` (the OWN-`Tenant` axis only; `None` for a
+    // target/anon/unscoped invocation ⇒ `{tenant}` entries fail closed).
+    if granted("wasi:blobstore") {
+        let max_blob = inner.max_blob_bytes.get().copied().unwrap_or(0);
+        let multi_tenant = handler_tenancy.is_some()
+            || site_handlers.tenancy.is_some()
+            || !handler_caller_tenant.is_empty();
+        bindings = bindings.with_blobstore(
+            scope,
+            inner.storage.clone(),
+            max_blob,
+            super::function_runtime::resolved_tenant_string(&handler_caller_tenant),
+            blobstore_containers.to_vec(),
+            multi_tenant,
+        );
+    }
     // The host-verified sealed principal for THIS invocation (PLAN-async-persona): resolved from the
     // durable `signed_context` envelope (verified against the fleet anchor — the SAME verify/expiry/
     // kind checks the tenancy source uses), so a consumer's `sealed-principal()` returns the host
@@ -2642,6 +2673,9 @@ pub(super) struct ConsumerRebuild<'a> {
     /// The consumer's per-component `blob-upload` container allowlist (S3 external ingress). Empty ⇒
     /// deny-all. Threaded so a per-message rebuild scopes upload minting identically to the tick build.
     pub upload_containers: &'a [String],
+    /// The consumer's per-component plain-`wasi:blobstore` container allowlist (host-enforced tenant
+    /// confinement). Threaded so a per-message rebuild confines blob access identically to the tick build.
+    pub blobstore_containers: &'a [String],
     /// The consumer's per-guest secret allowlist (task #492): the subset of the site pool KEYS it is
     /// granted. Empty ⇒ the whole pool. Threaded so a per-message rebuild scopes secrets identically
     /// to the once-per-tick build.
@@ -2671,6 +2705,7 @@ impl ConsumerRebuild<'_> {
             self.stats_topics,
             self.tenant_secret_names,
             self.upload_containers,
+            self.blobstore_containers,
             self.secret_allowlist,
             0,
             None,

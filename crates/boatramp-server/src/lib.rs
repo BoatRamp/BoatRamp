@@ -4149,6 +4149,7 @@ mod tests {
                     stats_topics: Vec::new(),
                     tenant_secret_names: Vec::new(),
                     upload_containers: Vec::new(),
+                    blobstore_containers: Vec::new(),
                     topic: "orders/created".into(),
                     component: "consumer.wasm".into(),
                     imports: vec!["wasi:keyvalue".into()],
@@ -4315,6 +4316,7 @@ mod tests {
                     stats_topics: Vec::new(),
                     tenant_secret_names: Vec::new(),
                     upload_containers: Vec::new(),
+                    blobstore_containers: Vec::new(),
                 }],
                 ..Default::default()
             },
@@ -4742,6 +4744,7 @@ mod tests {
                     stats_topics: Vec::new(),
                     tenant_secret_names: Vec::new(),
                     upload_containers: Vec::new(),
+                    blobstore_containers: Vec::new(),
                 }],
                 ..Default::default()
             },
@@ -6719,6 +6722,7 @@ mod tests {
                     stats_topics: Vec::new(),
                     tenant_secret_names: Vec::new(),
                     upload_containers: Vec::new(),
+                    blobstore_containers: Vec::new(),
                 }],
                 crons: vec![CronConfig {
                     schedule: "* * * * *".into(),
@@ -6889,6 +6893,7 @@ mod tests {
                     stats_topics: Vec::new(),
                     tenant_secret_names: Vec::new(),
                     upload_containers: Vec::new(),
+                    blobstore_containers: Vec::new(),
                 }],
                 crons: vec![CronConfig {
                     schedule: "* * * * *".into(),
@@ -7048,6 +7053,8 @@ mod tests {
                     &[],
                     // Blob-upload container allowlist (S3 ingress): empty ⇒ deny-all.
                     &[],
+                    // Plain-`wasi:blobstore` container allowlist (tenant confinement): empty ⇒ permissive here.
+                    &[],
                     // Per-guest secret allowlist (task #492): empty ⇒ the whole site pool.
                     &[],
                     0,
@@ -7185,6 +7192,8 @@ mod tests {
                 // Tenant-secret name allowlist (task #493): empty ⇒ deny-all.
                 &[],
                 // Blob-upload container allowlist (S3 ingress): empty ⇒ deny-all.
+                &[],
+                // Plain-`wasi:blobstore` container allowlist (tenant confinement): empty ⇒ permissive here.
                 &[],
                 // Per-guest secret allowlist (task #492): empty ⇒ the whole site pool.
                 &[],
@@ -7353,6 +7362,7 @@ mod tests {
             stats_topics: &[],
             tenant_secret_names: &[],
             upload_containers: &[],
+            blobstore_containers: &[],
             secret_allowlist: &[],
         };
 

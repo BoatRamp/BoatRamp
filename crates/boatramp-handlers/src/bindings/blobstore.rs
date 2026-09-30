@@ -68,6 +68,13 @@ const MARKER: &str = ".boatramp-container";
 /// Cap on a single buffered outgoing value (also the handler memory ceiling).
 const OUTGOING_CAP: usize = 64 * 1024 * 1024;
 
+/// The literal token a `blobstore_containers` entry may carry (e.g. `"assets-{tenant}"`): the HOST
+/// substitutes THIS invocation's resolved OWN tenant for it before the allowlist match, so an entry
+/// only ever admits the guest's own tenant's container. Mirrors `blob_upload::TENANT_TEMPLATE` (kept
+/// as a local copy because the `blob_upload` module is `#[cfg(feature = "blob-upload")]`-gated while
+/// this plain `wasi:blobstore` binding is always compiled — no cross-feature dependency).
+const TENANT_TEMPLATE: &str = "{tenant}";
+
 /// A granted blob capability: the site's storage and the container prefix every
 /// access is confined to (`hblob/{site}/`).
 #[derive(Clone)]
@@ -80,6 +87,23 @@ pub struct BlobBinding {
     /// could exhaust host memory with a large object. Set from the
     /// security posture's `max_handler_blob_bytes`.
     pub(crate) max_bytes: u64,
+    /// THIS invocation's host-resolved OWN tenant (the `ScopeAxis::Tenant` value the SQL/ORM scope
+    /// injector uses — NEVER guest-supplied), used ONLY to expand a `{tenant}` token in a
+    /// [`containers`](Self::containers) entry. `None` for an `all`/anon/target/unscoped invocation ⇒
+    /// a `{tenant}` entry cannot be expanded and fails closed. Mirrors
+    /// `BlobUploadBinding::resolved_tenant`.
+    pub(crate) tenant: Option<String>,
+    /// The component's `blobstore_containers` allowlist (a `{tenant}`-templated set of container
+    /// names). **Non-empty ⇒ ALWAYS enforced** at [`container_prefix`](BlobHost::container_prefix):
+    /// the guest may open ONLY a container that exactly matches an expanded entry. **Empty** ⇒ the
+    /// [`multi_tenant`](Self::multi_tenant) posture decides (deny on a multi-tenant site, permissive
+    /// on a single-tenant/dev site).
+    pub(crate) containers: Vec<String>,
+    /// Whether this invocation's site is multi-tenant — derived from the tenancy fact that scopes
+    /// `sql`/`orm` (the site/route DECLARES a tenancy, or a confining `HostTenancy` was resolved). A
+    /// multi-tenant site with an EMPTY `containers` allowlist denies every `wasi:blobstore` container
+    /// op (fail-closed); a single-tenant/dev site stays permissive.
+    pub(crate) multi_tenant: bool,
 }
 
 /// An opened container handle: the storage, the container's key prefix
@@ -623,6 +647,11 @@ pub async fn read_object_through_guest_binding(
         storage,
         prefix: format!("hblob/{site}/"),
         max_bytes: 0,
+        // The gate helper reads back a raw-landed object through an already-open container handle;
+        // it does not exercise the open-time allowlist, so leave it unconstrained/single-tenant.
+        tenant: None,
+        containers: Vec::new(),
+        multi_tenant: false,
     };
     let mut table = ResourceTable::new();
     let mut host = BlobHost::new(&mut table, Some(&binding));
@@ -784,6 +813,11 @@ mod tests {
             storage,
             prefix: prefix.to_string(),
             max_bytes: 0, // unlimited for the general tests
+            // The general roundtrip/isolation tests exercise a single-tenant permissive binding (no
+            // allowlist, not multi-tenant) — the confinement paths get their own dedicated tests.
+            tenant: None,
+            containers: Vec::new(),
+            multi_tenant: false,
         }
     }
 

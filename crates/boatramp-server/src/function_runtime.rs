@@ -967,7 +967,14 @@ pub(super) async fn build_function_bindings(
         }
         if granted("wasi:blobstore") {
             let max_blob = inner.max_blob_bytes.get().copied().unwrap_or(0);
-            bindings = bindings.with_blobstore(scope, inner.storage.clone(), max_blob);
+            // EXEMPT (deliberate): a migration step is a `Project·Admin` control-plane invocation
+            // (constructible ONLY on the orchestrator path — see `MigrationContext`), tenant-agnostic
+            // by design (it holds NO tenant `sql`/`orm` binding), and uses blob only to STAGE an
+            // external-source sync — not to serve an untrusted per-tenant guest request. It carries no
+            // resolved own tenant to confine to, so it runs permissive (`tenant: None`, no allowlist,
+            // not multi-tenant), consistent with its known-minimal-but-admin-trusted binding set.
+            bindings =
+                bindings.with_blobstore(scope, inner.storage.clone(), max_blob, None, Vec::new(), false);
         }
         #[cfg(feature = "migrate")]
         {
@@ -992,10 +999,10 @@ pub(super) async fn build_function_bindings(
     if granted("wasi:keyvalue") {
         bindings = bindings.with_keyvalue(scope, inner.kv.clone());
     }
-    if granted("wasi:blobstore") {
-        let max_blob = inner.max_blob_bytes.get().copied().unwrap_or(0);
-        bindings = bindings.with_blobstore(scope, inner.storage.clone(), max_blob);
-    }
+    // NOTE: `wasi:blobstore` is granted AFTER tenant resolution below (see `caller_tenant`), because
+    // its host-side tenant confinement needs THIS invocation's resolved OWN tenant + the
+    // multi-tenant fact to expand a `{tenant}` allowlist entry / apply the deny-default. It mirrors
+    // where the `blob-upload` mint binding is built (also post-resolution).
     if let Some(provider) = &inner.sql {
         // A top-level function is admin-deployed, so its declared `imports` **are** its grants
         // (no site allowlist ceiling). The bare `sql` grants the default (`""`) database;
@@ -1161,6 +1168,26 @@ pub(super) async fn build_function_bindings(
         .as_ref()
         .map(|h| h.facts().to_vec())
         .unwrap_or_default();
+    // `wasi:blobstore` (REORDERED to here, post tenant-resolution): the host-side tenant confinement
+    // (`blobstore.rs::container_prefix`) needs THIS invocation's resolved OWN tenant to expand a
+    // `{tenant}` allowlist entry, and the multi-tenant fact to apply the deny-default. `multi_tenant`
+    // is derived from the SAME tenancy that scopes `sql`/`orm`: the function DECLARES a tenancy
+    // (`config.tenancy`) OR a confining `HostTenancy` was resolved (`host_tenancy`, which also covers
+    // a forced/inherited target invocation whose own tenant is `None`). The resolved own tenant is
+    // `resolved_tenant_string(&caller_tenant)` (the OWN-`Tenant` axis only; `None` for a
+    // target/anon/unscoped invocation ⇒ `{tenant}` entries fail closed).
+    if granted("wasi:blobstore") {
+        let max_blob = inner.max_blob_bytes.get().copied().unwrap_or(0);
+        let multi_tenant = config.tenancy.is_some() || host_tenancy.is_some();
+        bindings = bindings.with_blobstore(
+            scope,
+            inner.storage.clone(),
+            max_blob,
+            resolved_tenant_string(&caller_tenant),
+            config.blobstore_containers.clone(),
+            multi_tenant,
+        );
+    }
     // The host-verified sealed principal for THIS invocation (PLAN-async-persona): only on a lane that
     // carries a verified seal — the durable async lane (verify the envelope now), or an inherited
     // invoke/graphql sub-fetch (the caller already verified it upstream; carry it verbatim). On the
