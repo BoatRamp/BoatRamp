@@ -994,8 +994,14 @@ pub(super) async fn build_function_bindings(
             // external-source sync — not to serve an untrusted per-tenant guest request. It carries no
             // resolved own tenant to confine to, so it runs permissive (`tenant: None`, no allowlist,
             // not multi-tenant), consistent with its known-minimal-but-admin-trusted binding set.
-            bindings =
-                bindings.with_blobstore(scope, inner.storage.clone(), max_blob, None, Vec::new(), false);
+            bindings = bindings.with_blobstore(
+                scope,
+                inner.storage.clone(),
+                max_blob,
+                None,
+                Vec::new(),
+                false,
+            );
         }
         #[cfg(feature = "migrate")]
         {
@@ -1209,9 +1215,10 @@ pub(super) async fn build_function_bindings(
         // An explicit `Tenancy::Disabled` is deliberate single-tenant (Some but not multi-tenant), so
         // the deny-default must not fire for it. `host_tenancy.is_some()` is already correct (Disabled
         // resolves to `None`) and still covers a forced/inherited target invocation.
-        let multi_tenant =
-            matches!(config.tenancy, Some(Tenancy::Scoped { .. } | Tenancy::Target { .. }))
-                || host_tenancy.is_some();
+        let multi_tenant = matches!(
+            config.tenancy,
+            Some(Tenancy::Scoped { .. } | Tenancy::Target { .. })
+        ) || host_tenancy.is_some();
         // UX (C4): a multi-tenant function that grants `wasi:blobstore` without declaring an
         // allowlist will DENY every container op — surface it loudly at bind, naming the remedy.
         if multi_tenant && config.blobstore_containers.is_empty() {
@@ -3641,6 +3648,130 @@ mod blobstore_dimension0_tests {
         assert!(
             bindings.blobstore().is_some(),
             "a Disabled (single-tenant) blob importer keeps its binding (permissive), not denied"
+        );
+    }
+
+    /// **v0.8.0 mutation-verified blob Dimension-0 gate** (marker `BLOB DIMENSION-0 GATE OK`). Drives
+    /// the REAL [`build_function_bindings`] path and asserts the HIGH-1/MEDIUM-1 bind-time invariants:
+    /// `wasi:blobstore` is a tenant-scoped data capability, so under the strict multi-tenant posture an
+    /// UNDECLARED blob-only importer is refused (HIGH-1, the release-blocker), a declared `Scoped`
+    /// importer with an allowlist binds, and an explicit `Disabled` importer binds permissive
+    /// (MEDIUM-1). Anti-hollow (the #503 convention): a clean run passes + prints the marker; the CI
+    /// job re-runs under each `BOATRAMP_BLOBDIM0_MUTATION`, which FLIPS one expectation to the insecure
+    /// outcome so the real code makes the gate FAIL. No production mutation seam.
+    /// - `undeclared_binds` — expect a blob-only undeclared importer under the strict posture to BIND
+    ///   → the real Dimension-0 refusal fails it (proves HIGH-1 is closed).
+    /// - `disabled_refused` — expect an explicit `Disabled` importer to be REFUSED → the real code
+    ///   binds it → fails it (proves `Disabled` is a legal single-tenant declaration, MEDIUM-1).
+    /// - `scoped_refused` — expect a declared `Scoped`+allowlist importer to be REFUSED → the real
+    ///   code binds it → fails it (proves the positive path is real, not vacuous).
+    #[tokio::test]
+    async fn blob_dimension0_gate() {
+        let mutation = std::env::var("BOATRAMP_BLOBDIM0_MUTATION").unwrap_or_default();
+        let m = |name: &str| mutation == name;
+        let rt = runtime_with_site("shop", "blog").await;
+        let inner = rt.inner.as_ref().unwrap();
+
+        // HIGH-1: a blob-only importer with NO tenancy under the strict posture ⇒ refused.
+        {
+            let config = blob_config(None, &[]);
+            let res = build_function_bindings(
+                inner,
+                ProjectRef::new("shop"),
+                "shop/fn/gc",
+                "fn/gc",
+                &config,
+                0,
+                &FnTenant::Background,
+                None,
+                None,
+                None,
+            )
+            .await;
+            if m("undeclared_binds") {
+                assert!(
+                    res.is_ok(),
+                    "MUTATION undeclared_binds: a blob-only undeclared importer was expected to bind, \
+                     but the real Dimension-0 gate refused it (HIGH-1 closed)"
+                );
+            } else {
+                assert!(
+                    res.is_err(),
+                    "a blob-only importer with no tenancy MUST be refused under the strict posture"
+                );
+            }
+        }
+
+        // MEDIUM-1: an explicit `Disabled` importer binds permissive (not refused).
+        {
+            let config = blob_config(Some(Tenancy::Disabled), &[]);
+            let res = build_function_bindings(
+                inner,
+                ProjectRef::new("shop"),
+                "shop/fn/tool",
+                "fn/tool",
+                &config,
+                0,
+                &FnTenant::Background,
+                None,
+                None,
+                None,
+            )
+            .await;
+            if m("disabled_refused") {
+                assert!(
+                    res.is_err(),
+                    "MUTATION disabled_refused: a Disabled importer was expected to be refused, but \
+                     the real code (correctly) binds it permissive"
+                );
+            } else {
+                let b = res.expect("an explicit Disabled blob importer must bind (single-tenant)");
+                assert!(
+                    b.blobstore().is_some(),
+                    "a Disabled blob importer keeps its binding (permissive), not denied"
+                );
+            }
+        }
+
+        // Positive path: a declared `Scoped` importer with a `{tenant}` allowlist binds.
+        {
+            let config = blob_config(Some(scoped()), &["assets-{tenant}"]);
+            let own = vec![ScopeFact {
+                axis: ScopeAxis::Tenant,
+                value: SqlValue::Text("firm-a".into()),
+            }];
+            let res = build_function_bindings(
+                inner,
+                ProjectRef::new("shop"),
+                "shop/fn/api",
+                "fn/api",
+                &config,
+                0,
+                &FnTenant::Inherited(own, None),
+                None,
+                None,
+                None,
+            )
+            .await;
+            if m("scoped_refused") {
+                assert!(
+                    res.is_err(),
+                    "MUTATION scoped_refused: a declared scoped+allowlist importer was expected to be \
+                     refused, but the real code binds it"
+                );
+            } else {
+                let b = res.expect("a declared scoped blob importer with an allowlist must bind");
+                assert!(
+                    b.blobstore().is_some(),
+                    "the blobstore binding must be attached for a declared, scoped importer"
+                );
+            }
+        }
+
+        println!(
+            "BLOB DIMENSION-0 GATE OK: wasi:blobstore is a Dimension-0 tenant-scoped capability \
+             (undeclared refused under strict posture; Disabled binds permissive; scoped+allowlist \
+             binds)"
         );
     }
 }

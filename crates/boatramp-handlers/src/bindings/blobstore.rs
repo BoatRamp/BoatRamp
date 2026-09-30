@@ -242,19 +242,20 @@ impl BlobHost<'_> {
                     // Security LOW-1: an EMPTY resolved tenant is treated as no resolved tenant (fail
                     // closed), never expanded to an empty segment (`assets-`). Bind sites already filter
                     // empties via `resolved_tenant_string`; this keeps the binding self-protecting.
-                    Some((before, after)) => match binding.tenant.as_deref().filter(|s| !s.is_empty())
-                    {
-                        Some(tenant) => {
-                            if name == format!("{before}{tenant}{after}") {
-                                matched = true;
-                                break;
+                    Some((before, after)) => {
+                        match binding.tenant.as_deref().filter(|s| !s.is_empty()) {
+                            Some(tenant) => {
+                                if name == format!("{before}{tenant}{after}") {
+                                    matched = true;
+                                    break;
+                                }
                             }
+                            // A `{tenant}` entry we cannot expand (no resolved own tenant): record it so a
+                            // request that lines up ONLY with such an entry fails closed distinctly (C5),
+                            // never a silent access-denied that could hide a mis-scoped invocation.
+                            None => saw_unexpandable_template = true,
                         }
-                        // A `{tenant}` entry we cannot expand (no resolved own tenant): record it so a
-                        // request that lines up ONLY with such an entry fails closed distinctly (C5),
-                        // never a silent access-denied that could hide a mis-scoped invocation.
-                        None => saw_unexpandable_template = true,
-                    },
+                    }
                     None => {
                         if entry == name {
                             matched = true;
@@ -679,7 +680,11 @@ impl blobstore::blobstore::Host for BlobHost<'_> {
             .map_err(|e| blob_err("get", &src_key, e))?;
         let bytes = collect(object.body, self.max_bytes()).await?;
         storage
-            .put(&dest_key, once_stream(Bytes::from(bytes)), PutMeta::default())
+            .put(
+                &dest_key,
+                once_stream(Bytes::from(bytes)),
+                PutMeta::default(),
+            )
             .await
             .map_err(|e| blob_err("put", &dest_key, e))?;
         Ok(())
@@ -1252,7 +1257,13 @@ mod tests {
     #[tokio::test]
     async fn tenant_template_without_resolved_tenant_fails_closed() {
         let storage = Arc::new(MemStorage::default());
-        let bind = confined(storage.clone(), "hblob/shop/", None, &["assets-{tenant}"], true);
+        let bind = confined(
+            storage.clone(),
+            "hblob/shop/",
+            None,
+            &["assets-{tenant}"],
+            true,
+        );
         let mut table = ResourceTable::new();
         let mut host = BlobHost::new(&mut table, Some(&bind));
 
@@ -1341,5 +1352,226 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.contains("invalid object name"), "{err}");
+    }
+
+    /// **v0.8.0 mutation-verified blob tenant-confinement gate** (marker `BLOB TENANT-CONFINEMENT
+    /// OK`). Drives the REAL `BlobHost::container_prefix` choke point and asserts every confinement
+    /// invariant end to end — the load-bearing one being that a cross-tenant container op (the
+    /// pre-fix cross-tenant read/DESTROY hole) is REFUSED. Anti-hollow (the #503 convention): each
+    /// assertion's SECURE expectation is the default and a clean run passes + prints the marker; the
+    /// CI job re-runs the gate under each `BOATRAMP_BLOBCONFINE_MUTATION`, which FLIPS exactly one
+    /// expectation to the INSECURE outcome, so the real (secure) code then violates that flipped
+    /// expectation and the gate FAILS — proving the assertion is load-bearing, never hollow.
+    /// Production code carries NO mutation seam; the mutation lives only in this test's expectations.
+    /// - `cross_tenant_open` — expect a cross-tenant `assets-<other>` op (create/get/delete/exists/
+    ///   copy-dest/move-dest) to SUCCEED (models the pre-fix site-scoped hole) → the real allowlist
+    ///   refusal fails it.
+    /// - `no_tenant_expands` — expect a `{tenant}` entry with no resolved own tenant to open → the
+    ///   real NoResolvedTenant fail-closed fails it.
+    /// - `multitenant_open` — expect a multi-tenant binding with NO allowlist to allow any container
+    ///   → the real deny-default fails it.
+    /// - `disabled_denied` — expect a single-tenant (Disabled/dev) binding with no allowlist to be
+    ///   DENIED → the real permissive path fails it (MEDIUM-1: Disabled must stay permissive).
+    /// - `shared_denied` — expect a plain (non-`{tenant}`) allowlisted `shared` container to be
+    ///   refused → the real operator-opt-in allow fails it.
+    /// - `traversal_allowed` — expect a `../escape` object name to be accepted → the real
+    ///   `validate_object_key` refusal fails it.
+    #[tokio::test]
+    async fn blob_tenant_confinement_gate() {
+        let mutation = std::env::var("BOATRAMP_BLOBCONFINE_MUTATION").unwrap_or_default();
+        let m = |name: &str| mutation == name;
+
+        // (1) `{tenant}`-confined, multi-tenant: own opens; cross-tenant is refused on EVERY op.
+        {
+            let storage = Arc::new(MemStorage::default());
+            let bind = confined(
+                storage.clone(),
+                "hblob/shop/",
+                Some("firm-a"),
+                &["assets-{tenant}"],
+                true,
+            );
+            let mut table = ResourceTable::new();
+            let mut host = BlobHost::new(&mut table, Some(&bind));
+            // The legitimate own-tenant path must ALWAYS hold (no mutation may break it).
+            assert!(
+                host.create_container("assets-firm-a".into()).await.is_ok(),
+                "own-tenant container must open"
+            );
+            let expect_ok = m("cross_tenant_open");
+            let cross: Vec<Result<(), String>> = vec![
+                host.create_container("assets-firm-b".into())
+                    .await
+                    .map(|_| ()),
+                host.get_container("assets-firm-b".into()).await.map(|_| ()),
+                host.delete_container("assets-firm-b".into()).await,
+                host.container_exists("assets-firm-b".into())
+                    .await
+                    .map(|_| ()),
+                // copy/move with a cross-tenant DEST endpoint (own src, other-tenant dest):
+                host.copy_object(
+                    ObjectId {
+                        container: "assets-firm-a".into(),
+                        object: "k".into(),
+                    },
+                    ObjectId {
+                        container: "assets-firm-b".into(),
+                        object: "k".into(),
+                    },
+                )
+                .await,
+                host.move_object(
+                    ObjectId {
+                        container: "assets-firm-a".into(),
+                        object: "k".into(),
+                    },
+                    ObjectId {
+                        container: "assets-firm-b".into(),
+                        object: "k".into(),
+                    },
+                )
+                .await,
+            ];
+            for res in cross {
+                if expect_ok {
+                    assert!(
+                        res.is_ok(),
+                        "MUTATION cross_tenant_open: a cross-tenant blob op was expected to succeed, \
+                         but the real allowlist refused it — the cross-tenant read/destroy refusal is \
+                         load-bearing"
+                    );
+                } else {
+                    assert!(res.is_err(), "a cross-tenant container op MUST be refused");
+                }
+            }
+        }
+
+        // (2) A `{tenant}` entry with no resolved own tenant fails closed.
+        {
+            let storage = Arc::new(MemStorage::default());
+            let bind = confined(storage, "hblob/shop/", None, &["assets-{tenant}"], true);
+            let mut table = ResourceTable::new();
+            let mut host = BlobHost::new(&mut table, Some(&bind));
+            let res = host.create_container("assets-firm-a".into()).await;
+            if m("no_tenant_expands") {
+                assert!(
+                    res.is_ok(),
+                    "MUTATION no_tenant_expands: a {{tenant}} entry with no resolved tenant was \
+                     expected to expand/open, but the real code fails closed"
+                );
+            } else {
+                assert!(
+                    res.is_err(),
+                    "a {{tenant}} entry with no resolved own tenant MUST fail closed"
+                );
+            }
+        }
+
+        // (3) Multi-tenant + no allowlist ⇒ deny-by-default.
+        {
+            let storage = Arc::new(MemStorage::default());
+            let bind = confined(storage, "hblob/shop/", Some("firm-a"), &[], true);
+            let mut table = ResourceTable::new();
+            let mut host = BlobHost::new(&mut table, Some(&bind));
+            let res = host.create_container("anything".into()).await;
+            if m("multitenant_open") {
+                assert!(
+                    res.is_ok(),
+                    "MUTATION multitenant_open: a multi-tenant binding with no allowlist was expected \
+                     to allow, but the real deny-default refused it"
+                );
+            } else {
+                assert!(
+                    res.is_err(),
+                    "a multi-tenant binding with no allowlist MUST deny by default"
+                );
+            }
+        }
+
+        // (4) Single-tenant / dev (also the `Tenancy::Disabled` shape, MEDIUM-1) + no allowlist ⇒
+        // permissive; a mutation that treats it as multi-tenant would deny.
+        {
+            let storage = Arc::new(MemStorage::default());
+            let bind = confined(storage, "hblob/shop/", None, &[], false);
+            let mut table = ResourceTable::new();
+            let mut host = BlobHost::new(&mut table, Some(&bind));
+            let res = host.create_container("anything".into()).await;
+            if m("disabled_denied") {
+                assert!(
+                    res.is_err(),
+                    "MUTATION disabled_denied: a single-tenant/Disabled binding was expected to be \
+                     denied, but the real code (correctly) stays permissive"
+                );
+            } else {
+                assert!(
+                    res.is_ok(),
+                    "a single-tenant/Disabled binding with no allowlist MUST stay permissive"
+                );
+            }
+        }
+
+        // (5) A plain (non-`{tenant}`) allowlisted container is an operator-opt-in shared container;
+        // a container outside the allowlist is still refused.
+        {
+            let storage = Arc::new(MemStorage::default());
+            let bind = confined(
+                storage,
+                "hblob/shop/",
+                Some("firm-a"),
+                &["assets-{tenant}", "shared"],
+                true,
+            );
+            let mut table = ResourceTable::new();
+            let mut host = BlobHost::new(&mut table, Some(&bind));
+            assert!(
+                host.create_container("other".into()).await.is_err(),
+                "a container outside the allowlist MUST be refused"
+            );
+            let res = host.create_container("shared".into()).await;
+            if m("shared_denied") {
+                assert!(
+                    res.is_err(),
+                    "MUTATION shared_denied: an operator-opted-in `shared` container was expected to \
+                     be refused, but the real code (correctly) allows it"
+                );
+            } else {
+                assert!(
+                    res.is_ok(),
+                    "a plain allowlisted `shared` container MUST be allowed (operator opt-in)"
+                );
+            }
+        }
+
+        // (6) Object-name validation refuses a traversal name even on the permissive path.
+        {
+            let storage = Arc::new(MemStorage::default());
+            let bind = confined(storage, "hblob/shop/", None, &[], false);
+            let mut table = ResourceTable::new();
+            let mut host = BlobHost::new(&mut table, Some(&bind));
+            let c = host.create_container("c".into()).await.unwrap();
+            let crep = c.rep();
+            let ov = outgoing(host.table, b"x");
+            let res = host
+                .write_data(Resource::new_own(crep), "../escape".into(), ov)
+                .await;
+            if m("traversal_allowed") {
+                assert!(
+                    res.is_ok(),
+                    "MUTATION traversal_allowed: a `../escape` object name was expected to be \
+                     accepted, but the real validate_object_key refused it"
+                );
+            } else {
+                assert!(
+                    res.is_err(),
+                    "a `../escape` object name MUST be refused by validate_object_key"
+                );
+            }
+        }
+
+        println!(
+            "BLOB TENANT-CONFINEMENT OK: container_prefix confines every container op to the \
+             invocation's resolved own tenant (cross-tenant refused; {{tenant}} fail-closed; \
+             multi-tenant deny-default; single-tenant permissive; object-name traversal refused)"
+        );
     }
 }
