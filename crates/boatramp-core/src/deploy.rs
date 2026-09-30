@@ -2587,8 +2587,11 @@ impl DeployStore {
     /// Minting needs the root private key, so it happens in the
     /// caller (the API route / CLI), which then records the metadata here.
     pub async fn put_token_meta(&self, meta: &crate::authz::TokenMeta) -> Result<(), DeployError> {
+        // Crown-jewel (C2, Security L1): the revoke-by-list path (`revoke_token`) finds a token
+        // THROUGH its token_meta record, so a lost token_meta hides a live token from revocation —
+        // frontier-sync it, symmetric with the revoked-marker write.
         self.kv
-            .put(
+            .put_durable_checkpointed(
                 &crate::authz::token_meta_key(&meta.revocation_id),
                 serde_json::to_vec(meta)?,
             )
@@ -2794,7 +2797,13 @@ impl DeployStore {
                 hash.clone().into_bytes(),
             ),
         ];
-        self.kv.write_batch(ops).await?;
+        // Crown-jewel-SYNC (C2, Security H1): the daemon config is an IMPERATIVE, acked,
+        // SECURITY-LOAD-BEARING posture (console enable/host, `protect_previews`,
+        // `oidc_require_audience`, `ratelimit_fail_open`, private-upstream/bind allowances) that
+        // NOTHING re-applies after a crash — a torn-tail self-heal that dropped it would silently
+        // revert posture (re-expose the console, drop preview protection). Advance the frontier
+        // synchronously so an acked posture change survives a crash.
+        self.kv.write_batch_checkpointed(ops).await?;
         Ok(hash)
     }
 
@@ -2817,7 +2826,9 @@ impl DeployStore {
                 prev.clone().into_bytes(),
             ),
         ];
-        self.kv.write_batch(ops).await?;
+        // Crown-jewel-SYNC (C2, Security H1): a rollback is also an imperative security-posture flip
+        // (see `set_daemon_config`) — frontier-sync it so the reverted posture survives a crash.
+        self.kv.write_batch_checkpointed(ops).await?;
         Ok(Some(prev))
     }
 
