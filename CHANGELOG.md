@@ -5,6 +5,57 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.8.0] - 2026-09-30
+
+**BREAKING — multi-tenant blob confinement.** Closes a live cross-tenant blob read+destroy hole: the
+plain `wasi:blobstore` binding was scoped to the site (`hblob/{site}/`) but NOT to the tenant, so on a
+multi-tenant single-site deployment a component granted `wasi:blobstore` could `open("assets-<other-
+tid>")` and get/list/put/**delete**/clear another tenant's objects. The host now confines every
+container operation to the invocation's host-resolved OWN tenant — the one data path that previously did
+not host-force the tenant (`sql`/`orm` and the blob-UPLOAD mint path already did).
+
+### Added
+
+- **`blobstore_containers` — a per-component `{tenant}`-templated allowlist** of the containers a
+  `wasi:blobstore` importer may open, on `HandlerConfig`/`ConsumerConfig`/`FunctionConfig` (paired with,
+  and separate from, `upload_containers`; no inheritance). Each entry is host-expanded with the resolved
+  own tenant and exact-matched (e.g. `["assets-{tenant}"]` confines a guest to its own
+  `assets-<own-tid>`; a plain entry like `["shared"]` is an operator opt-in site-shared container). The
+  key layout is unchanged — no data migration.
+
+### Changed (BREAKING)
+
+- **A multi-tenant site/function that grants `wasi:blobstore` must declare `blobstore_containers`.**
+  With the capability granted but no allowlist declared, every container op is denied (fail-closed); the
+  error names the one-line remedy. A single-tenant / dev deployment (no tenancy declared) stays
+  permissive.
+- **`wasi:blobstore` is now a Dimension-0 tenant-scoped data capability, like `sql`/`orm`.** On the
+  strict multi-tenant posture (`require_tenancy_declaration`), a component that imports `wasi:blobstore`
+  must declare a `tenancy` decision (`scoped` — confined; or `disabled` — explicit single-tenant), the
+  same requirement a `sql`/`orm` importer already has. An undeclared blob importer on such a project is
+  refused at bind (closing the escape where a blob-only GC sweep with no `tenancy` block ran permissive).
+- **Guest container and object names are now validated on the plain blob path** (key-safe container
+  segment; `validate_object_key` on object names — `..`/leading-or-doubled `/`/`\`/`*`/control bytes and
+  the reserved `.boatramp*` namespace refused), including on the single-tenant permissive path. A guest
+  that relied on an unusual container/object name (a space, `>63` bytes, a `..` segment) is now refused.
+
+### Security
+
+- Cross-tenant blob **read and destruction** is refused fail-closed on every container op
+  (create/get/has/list/delete-object/clear/delete-container and copy/move — both endpoints), at the
+  single `BlobHost::container_prefix` choke point. Refusals are distinct, greppable authorization errors
+  (never collapsed into "no such container" and never routed through the backend-fault mask), and
+  `container_exists`/`has` return an error, not a silent `Ok(false)`, on a forbidden target (no existence
+  oracle). Reviewed to a clean Security SHIP; guarded by two CI-hard mutation-verified gates (`BLOB
+  TENANT-CONFINEMENT OK`, `BLOB DIMENSION-0 GATE OK`).
+
+### Migration
+
+- A multi-tenant component that opens `assets-<tid>` containers: add `blobstore_containers:
+  ["assets-{tenant}"]` and a `tenancy` decision (`scoped { … }`) to its manifest. A genuinely
+  single-tenant component: declare `tenancy = disabled` (stays permissive). Host-side only — no shim/WIT
+  change; existing guest binaries are unaffected other than the confinement above.
+
 ## [0.7.5] - 2026-09-29
 
 Additive, non-breaking. Host-only blob-read fix.
