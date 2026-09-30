@@ -221,8 +221,8 @@ impl BlobHost<'_> {
     /// gate confines all of them — and every handle op transitively, since a `Container` handle can
     /// only be minted by a gated open. Mirrors `blob_upload::resolve_container`.
     ///
-    /// Three DISTINCT, greppable refusal categories (never collapsed into "no such container"):
-    /// - an allowlist miss, - a `{tenant}` entry with no resolved own tenant, - the multi-tenant
+    /// Three DISTINCT, greppable refusal categories (never collapsed into "no such container"): an
+    /// allowlist miss; a `{tenant}` entry with no resolved own tenant; and the multi-tenant
     /// deny-default. These are an AUTHORIZATION category, returned directly — NOT through
     /// [`blob_err`] (which masks a backend fault as "blob backend unavailable").
     fn container_prefix(&self, name: &str) -> Result<String, String> {
@@ -252,7 +252,7 @@ impl BlobHost<'_> {
                             }
                             // A `{tenant}` entry we cannot expand (no resolved own tenant): record it so a
                             // request that lines up ONLY with such an entry fails closed distinctly (C5),
-                            // never a silent access-denied that could hide a mis-scoped invocation.
+                            // never a silent access-denied that could hide a wrongly-scoped invocation.
                             None => saw_unexpandable_template = true,
                         }
                     }
