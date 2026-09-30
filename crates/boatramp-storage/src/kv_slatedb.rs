@@ -74,25 +74,64 @@ fn map_open_error(err: slatedb::Error) -> KvError {
     // actual_version=…"` — it does NOT contain the Debug name `"InvalidVersion"`, and only
     // incidentally contains `"actual_version"`; match the Display form (`unsupported` + `format
     // version`) explicitly so the loud, actionable message fires regardless of Debug-vs-Display.
+    //
+    // C4 — BROADEN beyond the version-0 signature to EVERY unbootable-store shape: a truncated edge
+    // surfaces as `ChecksumMismatch` ("checksum mismatch") or `WalTruncated` ("wal truncated at wal
+    // file …"), a torn block as "wal data error" / "invalid sst error" / "empty block", and a
+    // missing object as the wrapped object-store not-found. The footer probe cannot see all of
+    // these, so the store can still fail its cold open with one of them — and the operator needs the
+    // same actionable recover pointer, not a bare slatedb error. `map_open_error` is only ever
+    // called on an open FAILURE, so appending the recover hint is correct for the whole set below.
+    // We deliberately EXCLUDE `Fenced` ("detected newer DB client") and "db is closed" — those are
+    // a concurrent-writer / lifecycle problem, not a torn store, and `kv recover` is the wrong tool.
     let looks_torn = raw.contains("InvalidVersion")
         || raw.contains("actual_version")
         || (raw.contains("unsupported") && raw.contains("format version"))
         || raw.contains("empty SSTable")
-        || raw.contains("EmptySSTable");
+        || raw.contains("EmptySSTable")
+        || raw.contains("checksum mismatch")
+        || raw.contains("ChecksumMismatch")
+        || raw.contains("wal truncated")
+        || raw.contains("WalTruncated")
+        || raw.contains("wal data error")
+        || raw.contains("invalid sst")
+        || raw.contains("empty block")
+        || raw.contains("empty manifest")
+        || raw.contains("invalid DB state");
+    let is_lifecycle = raw.contains("detected newer DB client")
+        || raw.contains("Fenced")
+        || raw.contains("db is closed");
     if looks_torn {
         KvError::backend(format!(
-            "control-plane SlateDB store failed to open: an SST is torn ({raw}). \
-             This is the crash/snapshot partial-tail case. To recover, run \
-             `boatramp kv repair` (a DRY-RUN now diagnoses the WHOLE store — the WAL tail AND the \
-             compacted/L0 SSTs — prints the plan, and NAMES any torn object it cannot auto-repair), \
-             then `boatramp kv repair --apply`, OR redeploy with the env `BOATRAMP_KV_REPAIR=1` \
-             (equivalently `boatramp serve --repair-wal`) to repair-then-open in place. Repair \
+            "control-plane SlateDB store failed to open: the store is torn/corrupt ({raw}). \
+             This is the crash/snapshot partial-tail (or truncated-edge) case. To recover, run \
+             `boatramp kv recover` (dry-run) — the daemon-mediated/boot-time SUPERSET that \
+             diagnoses the WHOLE store (the WAL tail AND the compacted/L0 SSTs), repairs a safe \
+             trailing tail in place, and can adopt a clean volume snapshot for an unsafe shape — \
+             or, for an offline tail-only quarantine, `boatramp kv repair` (a DRY-RUN diagnoses \
+             and NAMES any torn object it cannot auto-repair; then `--apply`). You may also \
+             redeploy with the env `BOATRAMP_KV_REPAIR=1` (equivalently `boatramp serve \
+             --repair-wal`) — now the DEFAULT self-heal, so the env is redundant. Repair \
              quarantines only a torn TRAILING WAL tail; a torn compacted/L0 SST is reported (not \
-             auto-removed — it needs manifest-aware recovery). A hard-crash repair may lose the \
-             most-recent acked-into-WAL-but-not-yet-L0 writes; a graceful shutdown is lossless."
+             auto-removed — it needs `kv recover --adopt-volume`). A hard-crash repair may lose \
+             the most-recent acked-into-WAL-but-not-yet-L0 writes; a graceful shutdown is lossless."
+        ))
+    } else if is_lifecycle {
+        // A concurrent-writer fence or a closed store — do NOT point at recover (wrong tool).
+        KvError::backend(format!(
+            "control-plane SlateDB store failed to open ({raw}). This looks like a concurrent \
+             writer / lifecycle error (another process holds the single-writer fence, or the store \
+             was closed), NOT a torn store — resolve the writer conflict rather than running \
+             `kv recover`."
         ))
     } else {
-        KvError::backend(raw)
+        // Any OTHER open failure is still unbootable — append the recover pointer (C4), hedged.
+        KvError::backend(format!(
+            "control-plane SlateDB store failed to open ({raw}). If this is a crash/snapshot \
+             corruption, run `boatramp kv recover` (dry-run) to diagnose the whole store; an \
+             offline tail-only quarantine is `boatramp kv repair`. `BOATRAMP_KV_REPAIR=1` / \
+             `serve --repair-wal` (now the default self-heal) repairs a safe trailing tail on open."
+        ))
     }
 }
 
@@ -1364,10 +1403,13 @@ mod tests {
             let top = max_wal_id(&dir);
             inject_torn_tail(&dir, top + 1);
             // A well-formed (version-1) object at the higher id — the "later acked data" that must
-            // not be gapped.
+            // not be gapped. Footer bytes[0..8] = a valid metadata offset (<= size-10) so it passes
+            // the C4 offset-sanity probe and reads Readable; bytes[8..10] = version 1 BE.
             let wal_dir = dir.join("kv").join("wal");
             let mut readable = vec![0xCDu8; 64];
             let n = readable.len();
+            let meta_offset = (64u64 - 10) / 2;
+            readable[n - 10..n - 2].copy_from_slice(&meta_offset.to_be_bytes());
             readable[n - 2..n].copy_from_slice(&1u16.to_be_bytes());
             std::fs::write(wal_dir.join(format!("{:020}.sst", top + 2)), &readable).unwrap();
 
