@@ -623,6 +623,16 @@ impl DeployStore {
         Ok(())
     }
 
+    /// Advance the control-plane store's durable frontier NOW without stopping the writer (v0.9.0
+    /// KV-recovery, #3): freeze WAL→L0 so the on-disk state is a consistent, bootable snapshot point.
+    /// Backs the on-demand `POST /api/kv-checkpoint` (the LIVE counterpart to the offline
+    /// `boatramp kv checkpoint` + the automatic `[serve.kv] checkpoint_interval` cadence). A no-op on
+    /// a backend with no separate durable frontier (in-memory / consensus-replicated).
+    pub async fn checkpoint(&self) -> Result<(), DeployError> {
+        self.kv.checkpoint().await?;
+        Ok(())
+    }
+
     /// Store a manifest (idempotent) and return its deployment id.
     pub async fn put_manifest(&self, manifest: &Manifest) -> Result<String, DeployError> {
         self.put_manifest_with(manifest, DeployMetaInput::default())

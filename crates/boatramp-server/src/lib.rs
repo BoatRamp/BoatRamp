@@ -107,10 +107,10 @@ use control_api::{BootstrapRequest, CreateJoinTokenRequest, JoinRequest};
 pub(crate) use control_api::{
     add_root_anchor, auth_whoami, bootstrap_token, cluster_join, cluster_members, cluster_promote,
     cluster_revoke, cluster_rotate_key, create_join_token, create_token, delete_email_profile,
-    delete_secret, delete_tenant_secret, get_authz_policy, kv_status, list_email_profiles,
-    list_root_anchors, list_secrets, list_tenant_secrets, list_tokens, node_version,
-    put_authz_policy, remove_root_anchor, revoke_token, set_email_profile, set_secret,
-    set_tenant_secret, show_email_profile,
+    delete_secret, delete_tenant_secret, get_authz_policy, kv_checkpoint, kv_status,
+    list_email_profiles, list_root_anchors, list_secrets, list_tenant_secrets, list_tokens,
+    node_version, put_authz_policy, remove_root_anchor, revoke_token, set_email_profile,
+    set_secret, set_tenant_secret, show_email_profile,
 };
 #[cfg(feature = "email")]
 pub use email_spool::NodeEmailSpool;
