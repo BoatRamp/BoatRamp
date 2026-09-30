@@ -2029,13 +2029,22 @@ async fn run_cluster(
     // (which creates it). A weak "has booted before" signal — NOT the resume gate:
     // the dir is created just by opening the KV, before a first join completes.
     let store_dir_existed = store_dir.exists();
-    // Opt-in repair-then-open (`--repair-wal` / `BOATRAMP_KV_REPAIR=1`): recover a torn trailing
-    // WAL tail on the node-local durable Raft store before opening. `None` is the default cold
-    // open, which still fails LOUD on a torn tail (naming the repair). Applies here to the local
-    // SlateDB Raft log/state store — the cluster's durability boundary.
-    let repair = args
-        .repair_wal
-        .then_some(boatramp_storage::kv_slatedb::RepairMode::Apply);
+    // Security M1: a cluster node NEVER self-quarantines its Raft-log tail. Auto-quarantining a
+    // torn trailing Raft WAL object can regress the store below the committed index → a double-vote
+    // or a log↔state-machine desync. So on the CLUSTER path we FORCE `repair = None` (strict cold
+    // open — fail loud on a torn tail) regardless of `--repair-wal` / `BOATRAMP_KV_REPAIR=1`, and
+    // WARN if the operator set that env/flag: the correct cluster recovery is to fail loud and
+    // REJOIN from peers (which re-replicate the authoritative log), not to drop a local tail.
+    if args.repair_wal {
+        tracing::warn!(
+            "cluster: IGNORING `--repair-wal` / `BOATRAMP_KV_REPAIR=1` on the node-local Raft \
+             durable store — refusing to auto-quarantine a Raft log tail (it could regress below \
+             the committed index → double-vote / log↔state-machine desync). A cluster node recovers \
+             by failing loud then REJOINING peers (which re-replicate the log), not by dropping a \
+             local tail. Opening STRICT."
+        );
+    }
+    let repair: Option<boatramp_storage::kv_slatedb::RepairMode> = None;
     let durable_kv: Arc<dyn KvStore> = Arc::new(
         boatramp_storage::SlateKv::open_local_with_flush_repair(
             store_dir,
