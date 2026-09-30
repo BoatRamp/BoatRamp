@@ -499,7 +499,7 @@ jobs:
       - name: "v0.9.0 KV self-heal + recovery gate battery (host toolchain)"
         run: |
           set -eo pipefail
-          cargo test -p boatramp-storage --features slatedb --lib \
+          cargo test -p boatramp-storage --features slatedb --lib -- \
             kv_slatedb::tests::checkpoint_advances_the_durable_frontier_without_close \
             kv_slatedb::tests::crown_jewel_write_survives_torn_tail_self_heal_linchpin \
             kv_slatedb::tests::self_heal_opens_after_quarantining_a_safe_torn_tail \
@@ -510,7 +510,7 @@ jobs:
             || { echo "::error::v0.9.0 KV self-heal gate battery did not run all 5 (silent skip or a failure)" >&2; exit 1; }
           # LINCHPIN anti-hollow: the checkpoint on the crown-jewel write path is load-bearing.
           if BOATRAMP_LINCHPIN_MUTATION=no_frontier_sync cargo test -p boatramp-storage \
-            --features slatedb --lib \
+            --features slatedb --lib -- \
             kv_slatedb::tests::crown_jewel_write_survives_torn_tail_self_heal_linchpin \
             > linchpin-mutation.log 2>&1; then
             echo "::error::LINCHPIN gate is HOLLOW — it passed under no_frontier_sync; a crown-jewel write left frontier-async would silently drop an acked secret (sealed secret / RBAC / posture) on a self-heal-default boot" >&2
