@@ -618,9 +618,38 @@ pub(super) async fn kv_status(
     Extension(KvDegraded(marker)): Extension<super::KvDegraded>,
 ) -> Response {
     match marker {
+        // v0.11.0 F2 manifest-rollback shape (UX C1/C2): lead with the lossless verdict and carry the
+        // rollback fields + `frontier_source`/`last_durable_seq` (identical local-fs/S3).
+        Some(m) if m.rolled_back_to_generation.is_some() => {
+            let wal_tail_dropped = !m.quarantined_ids.is_empty();
+            Json(serde_json::json!({
+                "state": if wal_tail_dropped { "recovered" } else { "recovered_lossless" },
+                "recovered_at": m.stamp,
+                "frontier_source": m.frontier_source,
+                "last_durable_seq": m.frontier,
+                "rolled_back_to_generation": m.rolled_back_to_generation,
+                "quarantined_manifest_ids": m.quarantined_manifest_ids,
+                "quarantine_dir": m.quarantine_dir,
+                // Reclaimable orphans are SPACE only, never loss (surfaced as a distinct field).
+                "orphaned_nonacked_objects": m.orphaned_nonacked_objects,
+                // Only present when the crash ALSO tore a WAL tail beyond the frontier (forensic-only).
+                "quarantined_wal_ids": m.quarantined_ids,
+                "loss_window": m.loss_window,
+                "note": if wal_tail_dropped {
+                    "RECOVERED by last-good-generation rollback; an ADDITIONAL torn WAL tail beyond the \
+                     frontier was quarantined (FORENSIC-ONLY). Acknowledge with `boatramp kv status --ack`."
+                } else {
+                    "RECOVERED (lossless) by last-good-generation rollback — zero acked loss. Acknowledge \
+                     with `boatramp kv status --ack` once reviewed."
+                },
+            }))
+            .into_response()
+        }
         Some(m) => Json(serde_json::json!({
             "state": "degraded",
             "self_healed_at": m.stamp,
+            "frontier_source": m.frontier_source,
+            "last_durable_seq": m.frontier,
             "quarantined_ids": m.quarantined_ids,
             "loss_window": m.loss_window,
             "quarantine_dir": m.quarantine_dir,
@@ -628,7 +657,13 @@ pub(super) async fn kv_status(
                      pairs). Acknowledge with `boatramp kv status --ack` once reviewed.",
         }))
         .into_response(),
-        None => Json(serde_json::json!({ "state": "ok" })).into_response(),
+        // A clean store opened from the latest manifest by definition; no boot snapshot ⇒ no seq known.
+        None => Json(serde_json::json!({
+            "state": "ok",
+            "frontier_source": "manifest_latest",
+            "last_durable_seq": serde_json::Value::Null,
+        }))
+        .into_response(),
     }
 }
 

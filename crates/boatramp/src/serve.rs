@@ -782,6 +782,22 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
              single-node control plane — the flag/env is redundant (honored as a no-op)."
         );
     }
+    // Close-in-progress breadcrumb (v0.11.0 UX C8b): if the PREVIOUS graceful close was cut short (a
+    // `{root}/CLOSING.json` survived, i.e. fly SIGKILLed mid-close), WARN and point at `kill_timeout`.
+    // Runs BEFORE build_kv so it is surfaced even on the recovery-mode path (a cut-short close is the
+    // usual cause of the torn state). Read-and-clear (one-shot); best-effort.
+    #[cfg(feature = "slatedb")]
+    if args.kv == boatramp_node::backends::KvBackend::Slatedb
+        && take_kv_close_breadcrumb(&data_dir, slate_s3.as_ref()).await
+    {
+        tracing::warn!(
+            "control-plane KV: the PREVIOUS graceful close was CUT SHORT (a close-in-progress \
+             breadcrumb survived) — fly likely SIGKILLed mid-close before the frontier was advanced. \
+             The next cold open may self-heal a torn tail (lossless-for-acked by v0.11.0 fsync + \
+             auto-recovery). Raise fly `kill_timeout` and `[serve.kv] close_deadline` to cover the \
+             measured drain+close time."
+        );
+    }
     let kv_backend =
         match boatramp_node::backends::build_kv(args.kv, &data_dir, slate_s3.as_ref(), kv_policy)
             .await
@@ -1036,7 +1052,19 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
     // `close()` that freezes memtables to L0 and advances the durable frontier, so the next cold
     // open has an empty WAL replay range. Bounded by the configurable `[serve.kv] close_deadline`
     // (C12; default generous 20s) — distinct WARN + fail-safe on timeout.
-    quiesce_and_close(kv_handle, reconcile, None, kv_close_deadline).await;
+    // UX C8b: drop a close-in-progress breadcrumb before the close; a clean close clears it, a
+    // cut-short one (fly SIGKILL) leaves it for the next boot's WARN.
+    #[cfg(feature = "slatedb")]
+    if args.kv == boatramp_node::backends::KvBackend::Slatedb {
+        write_kv_close_breadcrumb(&data_dir, slate_s3.as_ref()).await;
+    }
+    let close_clean = quiesce_and_close(kv_handle, reconcile, None, kv_close_deadline).await;
+    #[cfg(feature = "slatedb")]
+    if close_clean && args.kv == boatramp_node::backends::KvBackend::Slatedb {
+        clear_kv_close_breadcrumb(&data_dir, slate_s3.as_ref()).await;
+    }
+    #[cfg(not(feature = "slatedb"))]
+    let _ = close_clean;
     serve_result
 }
 
@@ -1257,7 +1285,7 @@ async fn quiesce_and_close(
     reconcile: Vec<tokio::task::JoinHandle<()>>,
     raft_shutdown: Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>>,
     close_deadline: std::time::Duration,
-) {
+) -> bool {
     let tail = async move {
         // (1) Stop every reconcile loop: abort THEN await, so none writes after this point.
         for handle in reconcile {
@@ -1271,24 +1299,34 @@ async fn quiesce_and_close(
         // (3) Close the store cleanly (flush memtables → L0, advance the durable frontier).
         if let Err(e) = kv_handle.close().await {
             tracing::warn!(error = %e, "control-plane store close on shutdown failed");
+            false
         } else {
             // The success breadcrumb (C12): a graceful stop that logs this line advanced the frontier,
             // so a torn tail on the NEXT open cannot be blamed on this shutdown.
-            tracing::info!("control-plane store closed cleanly on shutdown");
+            tracing::info!(
+                "control-plane store closed cleanly on shutdown (durable frontier advanced)"
+            );
+            true
         }
     };
-    if tokio::time::timeout(close_deadline, tail).await.is_err() {
-        // The budget was hit: the close did NOT complete, so the durable frontier may be un-advanced
-        // and the next cold open may see (and self-heal) a torn tail. Distinct WARN so the operator
-        // can attribute a torn tail to a slow close and raise the budget + fly `kill_timeout`.
-        tracing::warn!(
-            close_deadline_s = close_deadline.as_secs(),
-            "graceful KV quiesce+close EXCEEDED the configured `[serve.kv] close_deadline` budget; \
-             abandoning the close so shutdown still proceeds — the durable frontier may be \
-             UN-ADVANCED, so the next cold open may self-heal a torn tail (lossless-for-acked by \
-             C1/C2). Raise `[serve.kv] close_deadline` and fly `kill_timeout` to cover the measured \
-             drain+close time."
-        );
+    match tokio::time::timeout(close_deadline, tail).await {
+        Ok(clean) => clean,
+        Err(_) => {
+            // The budget was hit: the close did NOT complete, so the durable frontier may be
+            // un-advanced and the next cold open may see (and self-heal) a torn tail. Distinct WARN so
+            // the operator can attribute a torn tail to a slow close and raise the budget + fly
+            // `kill_timeout`. The close-in-progress breadcrumb is deliberately LEFT so the next boot
+            // also WARNs (UX C8b).
+            tracing::warn!(
+                close_deadline_s = close_deadline.as_secs(),
+                "graceful KV quiesce+close EXCEEDED the configured `[serve.kv] close_deadline` budget; \
+                 abandoning the close so shutdown still proceeds — the durable frontier may be \
+                 UN-ADVANCED, so the next cold open may self-heal a torn tail (lossless-for-acked by \
+                 C1/C2). Raise `[serve.kv] close_deadline` and fly `kill_timeout` to cover the measured \
+                 drain+close time."
+            );
+            false
+        }
     }
 }
 
@@ -1393,6 +1431,98 @@ async fn read_kv_degraded_best_effort(
         .flatten()
 }
 
+/// Build the `(object store, root)` the control-plane KV opener uses (local `kv-slate` root `"kv"`, or
+/// the configured S3 prefix) — shared by the close-in-progress breadcrumb helpers below.
+#[cfg(feature = "slatedb")]
+fn kv_close_store(
+    data_dir: &Path,
+    slate_s3: Option<&boatramp_node::backends::SlateKvS3>,
+) -> Option<(Arc<dyn boatramp_storage::object_store::ObjectStore>, String)> {
+    match slate_s3 {
+        Some(s3) => Some((
+            boatramp_storage::kv_slatedb::s3_object_store(&boatramp_storage::S3StoreConfig {
+                bucket: s3.bucket.clone(),
+                endpoint: s3.endpoint.clone(),
+                region: s3.region.clone(),
+                path_style: s3.path_style,
+            })
+            .ok()?,
+            s3.prefix.clone(),
+        )),
+        None => Some((
+            Arc::new(
+                boatramp_storage::kv_slatedb::local_object_store(&data_dir.join("kv-slate"))
+                    .ok()?,
+            ),
+            "kv".to_string(),
+        )),
+    }
+}
+
+/// The close-in-progress breadcrumb object path (v0.11.0 UX C8b): `{root}/CLOSING.json`.
+#[cfg(feature = "slatedb")]
+fn kv_close_breadcrumb_path(root: &str) -> boatramp_storage::object_store::path::Path {
+    boatramp_storage::object_store::path::Path::from(format!("{root}/CLOSING.json"))
+}
+
+/// Write the close-in-progress breadcrumb (UX C8b): a tiny `{root}/CLOSING.json` (stamp only, NO
+/// secrets — MF6) written when a graceful close STARTS. It is deleted on a clean close; a survivor on
+/// the NEXT boot means the previous close was cut short (fly SIGKILL mid-close). Best-effort.
+#[cfg(feature = "slatedb")]
+async fn write_kv_close_breadcrumb(
+    data_dir: &Path,
+    slate_s3: Option<&boatramp_node::backends::SlateKvS3>,
+) {
+    use boatramp_storage::object_store::ObjectStore;
+    if let Some((store, root)) = kv_close_store(data_dir, slate_s3) {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let body = format!(
+            "{{\n  \"note\": \"a graceful control-plane KV close is in progress; deleted on clean \
+             completion\",\n  \"started_unix\": {stamp}\n}}\n"
+        );
+        if let Err(e) = store
+            .put(&kv_close_breadcrumb_path(&root), body.into_bytes().into())
+            .await
+        {
+            tracing::debug!(error = %e, "could not write the KV close-in-progress breadcrumb (non-fatal)");
+        }
+    }
+}
+
+/// Delete the close-in-progress breadcrumb after a clean close (UX C8b). Best-effort.
+#[cfg(feature = "slatedb")]
+async fn clear_kv_close_breadcrumb(
+    data_dir: &Path,
+    slate_s3: Option<&boatramp_node::backends::SlateKvS3>,
+) {
+    use boatramp_storage::object_store::ObjectStore;
+    if let Some((store, root)) = kv_close_store(data_dir, slate_s3) {
+        let _ = store.delete(&kv_close_breadcrumb_path(&root)).await;
+    }
+}
+
+/// Read AND clear the close-in-progress breadcrumb at boot (UX C8b): `true` when a PRIOR close was cut
+/// short (the breadcrumb survived) — the caller WARNs and points at `kill_timeout`. Best-effort.
+#[cfg(feature = "slatedb")]
+async fn take_kv_close_breadcrumb(
+    data_dir: &Path,
+    slate_s3: Option<&boatramp_node::backends::SlateKvS3>,
+) -> bool {
+    use boatramp_storage::object_store::ObjectStore;
+    let Some((store, root)) = kv_close_store(data_dir, slate_s3) else {
+        return false;
+    };
+    let path = kv_close_breadcrumb_path(&root);
+    let present = store.head(&path).await.is_ok();
+    if present {
+        let _ = store.delete(&path).await;
+    }
+    present
+}
+
 /// Enter the RECOVERY-MODE listener (v0.9.0 KV-recovery, C5) after a FATAL control-plane KV open —
 /// instead of `exit(1)` into a fly crash-loop. Reads the `DEGRADED.json` breadcrumb (best-effort,
 /// no store open), builds the `GET /api/kv-status` JSON diagnostic (open error + any breadcrumb +
@@ -1415,15 +1545,37 @@ async fn enter_kv_recovery_mode(
         let _ = (data_dir, slate_s3);
         None
     };
+    // Legibility (UX C1): surface `frontier_source` + `last_durable_seq` on the recovery-mode listener
+    // too, identical local-fs/S3 — derived from any DEGRADED.json breadcrumb (a prior partial recovery;
+    // usually None here, since an F2 refusal writes no marker). `null`/`"unknown"` when no breadcrumb.
+    let (frontier_source, last_durable_seq) = match &marker {
+        Some(m) if !m.frontier_source.is_empty() => (
+            serde_json::Value::from(m.frontier_source.clone()),
+            serde_json::Value::from(m.frontier),
+        ),
+        Some(m) => (
+            serde_json::Value::from("wal_replay"),
+            serde_json::Value::from(m.frontier),
+        ),
+        None => (serde_json::Value::from("unknown"), serde_json::Value::Null),
+    };
     let kv_status_json = serde_json::to_string_pretty(&serde_json::json!({
         "state": if marker.is_some() { "degraded_after_self_heal" } else { "unbootable" },
         "error": open_err,
+        "frontier_source": frontier_source,
+        "last_durable_seq": last_durable_seq,
         "degraded": marker,
-        "recovery": "Run `boatramp kv recover` (dry-run) to diagnose the whole store; \
-                     `boatramp kv recover --apply` to repair a safe trailing tail in place, or \
-                     `boatramp kv recover --adopt-volume <mounted-path>` to adopt a clean fly \
-                     volume snapshot. `boatramp kv repair` is the offline tail-only quarantine. \
-                     `boatramp kv status` shows this; `--ack` clears the breadcrumb once reviewed.",
+        // Shape-aware guidance (UX C4): the empty/torn-manifest shape now recovers IN PLACE with
+        // `kv recover --apply` (last-good-generation rollback, lossless); `--adopt-volume` is reserved
+        // for the torn-out-of-scope-SST shape (a clean volume snapshot).
+        "recovery": "Run `boatramp kv recover` (dry-run) to diagnose — it now WORKS on the \
+                     empty/torn-manifest shape and prints the last-good-generation fallback plan. \
+                     `boatramp kv recover --apply` rolls back to the last-good manifest generation \
+                     (or quarantines a safe trailing WAL tail) IN PLACE, non-destructively. Reserve \
+                     `boatramp kv recover --adopt-volume <mounted-path>` for a torn compacted/L0 SST \
+                     (adopt a clean fly volume snapshot). `boatramp kv repair` is the offline \
+                     tail-only quarantine. `boatramp kv status` shows this; `--ack` clears the \
+                     breadcrumb once reviewed.",
     }))
     .unwrap_or_else(|_| "{}".to_string());
     let diagnostic = boatramp_server::RecoveryDiagnostic {
