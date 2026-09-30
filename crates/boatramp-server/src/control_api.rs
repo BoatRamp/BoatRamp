@@ -609,6 +609,29 @@ pub(super) async fn node_version() -> Response {
     .into_response()
 }
 
+/// The control-plane KV degraded state (`GET /api/kv-status`, v0.9.0 KV-recovery, C6). Gated at
+/// `system·read` by the auth layer. Serves the BOOT-TIME `DEGRADED.json` snapshot (see
+/// [`KvDegraded`](super::KvDegraded)): `{state:"ok"}` when clean, or `{state:"degraded", …}` with the
+/// quarantined ids + loss window when a self-heal-on-open dropped a torn WAL tail this boot. Exposes
+/// NO secrets. (When the store is DOWN, the recovery-mode listener serves its OWN `/api/kv-status`.)
+pub(super) async fn kv_status(
+    Extension(KvDegraded(marker)): Extension<super::KvDegraded>,
+) -> Response {
+    match marker {
+        Some(m) => Json(serde_json::json!({
+            "state": "degraded",
+            "self_healed_at": m.stamp,
+            "quarantined_ids": m.quarantined_ids,
+            "loss_window": m.loss_window,
+            "quarantine_dir": m.quarantine_dir,
+            "note": "The quarantined torn tail is FORENSIC-ONLY (no supported recovery of acked \
+                     pairs). Acknowledge with `boatramp kv status --ack` once reviewed.",
+        }))
+        .into_response(),
+        None => Json(serde_json::json!({ "state": "ok" })).into_response(),
+    }
+}
+
 /// Return the active RBAC policy (`authz/policy`), or the built-in default when
 /// none is stored — so a `get` always shows the effective policy.
 pub(super) async fn get_authz_policy(State(deploy): State<DeployStore>) -> Response {

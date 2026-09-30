@@ -67,12 +67,18 @@ pub async fn run(args: MigrateArgs, config: &ServerConfig) -> Result<(), Error> 
         .unwrap_or_else(|| PathBuf::from("./data"));
 
     // The pre-0.2.0 → project-scoped re-key is a local-store migration (a fresh
-    // remote-state deploy has no layout-1 store), so open the local SlateDB. Never
-    // auto-repair here (`false`): this is a re-key migration, not a crash recovery —
-    // a torn tail must fail loud and be repaired via `boatramp kv repair` / `serve --repair-wal`.
-    let kv = build_control_plane_kv(args.kv, &data_dir, None, false)
-        .await
-        .map_err(|e| Box::new(crate::serve::Error::from(e)))?;
+    // remote-state deploy has no layout-1 store), so open the local SlateDB. Open STRICT here
+    // (v0.9.0 KV-recovery): a migration is a re-key, not a crash recovery — a torn tail must fail
+    // loud so the operator recovers the store FIRST (`boatramp kv recover`), never auto-quarantine
+    // mid-migration.
+    let kv = build_control_plane_kv(
+        args.kv,
+        &data_dir,
+        None,
+        boatramp_core::kv::KvOpenPolicy::Strict,
+    )
+    .await
+    .map_err(|e| Box::new(crate::serve::Error::from(e)))?;
 
     println!(
         "control-plane store ({:?} at {}): {}",

@@ -96,6 +96,8 @@ pub fn router_with_fast(
     let issuer = Issuer(options.issuer.clone());
     let bootstrap = BootstrapGate::new(options.bootstrap_secret.as_deref());
     let bootstrap_attestation = options.bootstrap_attestation.clone();
+    // Boot snapshot of the KV degraded state for `GET /api/kv-status` (v0.9.0 KV-recovery, C6).
+    let kv_degraded = KvDegraded(options.kv_degraded.clone());
     // The mesh join admitter, for `POST /api/cluster/join`.
     let mesh_control = MeshControlHandle(options.mesh_control.clone());
     #[cfg(feature = "oidc")]
@@ -290,6 +292,11 @@ pub fn router_with_fast(
         // router), gated `system·read` in `authz::Right::required` — an operator-only read, so a
         // client can't fingerprint the release without an operator token.
         .route("/api/version", get(node_version))
+        // The control-plane KV degraded state (v0.9.0 KV-recovery, C6): whether a self-heal-on-open
+        // quarantined a torn WAL tail this boot. On the AUTHED router, gated `system·read` — no
+        // secrets, just the quarantined ids + loss window. (The recovery-mode listener serves its
+        // OWN unauth `/api/kv-status` when the store is DOWN; this is the store-UP degraded surface.)
+        .route("/api/kv-status", get(kv_status))
         .route("/api/certs", get(cert_status))
         .route("/api/cache/invalidate", post(invalidate_cache))
         .route(
@@ -628,6 +635,7 @@ pub fn router_with_fast(
         .layer(Extension(secret_store_cap))
         .layer(Extension(tenant_secret_store_cap))
         .layer(Extension(email_store_cap))
+        .layer(Extension(kv_degraded))
         .layer(Extension(upload_guard));
     #[cfg(feature = "oidc")]
     let api = api.layer(Extension(oidc_state));

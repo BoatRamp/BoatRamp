@@ -609,6 +609,12 @@ impl Right {
             // status — the same grade as `/api/sites` / `/api/metrics` — so `system·read` (never a
             // per-project right). Same hyphen-path collision-avoidance as the sibling `blob-*` arms.
             "/api/blob-status" => Self::new(Resource::System, None, Action::Read),
+            // The control-plane KV degraded state (`GET /api/kv-status`, v0.9.0 KV-recovery, C6):
+            // whether a self-heal-on-open quarantined a torn WAL tail. A READ-only node status
+            // (the same grade as `/api/blob-status` / `/api/metrics`) exposing NO secrets — only the
+            // quarantined ids + loss window — so `system·read`, NEVER a per-project right. Explicit
+            // (not the deny-safe `_` default, which would over-gate a read to `system·admin`).
+            "/api/kv-status" => Self::new(Resource::System, None, Action::Read),
             // The running node's boatramp version (`GET /api/version`): the exact package version of
             // the binary serving this request. Deliberately an OPERATOR-only read — the same grade as
             // `/api/metrics` / `/api/blob-status`, so `system·read` (never a per-project right a tenant
@@ -2797,6 +2803,29 @@ mod tests {
             req,
             Right::new(Resource::System, None, Action::Admin),
             "the version READ must not require the mutating system·admin tier",
+        );
+    }
+
+    /// `GET /api/kv-status` (v0.9.0 KV-recovery, C6) is operator `system·read` — the SAME grade as
+    /// `/api/version` / `/api/blob-status`, never `None` (public) and never `system·admin`. A
+    /// regression to the deny-safe `_` default (system·admin) would lock a read-only operator out;
+    /// a regression to `None` would leak the degraded state publicly.
+    #[test]
+    fn kv_status_endpoint_is_operator_read_gated() {
+        let req = Right::required("GET", "/api/kv-status");
+        assert!(
+            req.is_some(),
+            "GET /api/kv-status must require a token (never the unauthenticated `None` path)"
+        );
+        assert_eq!(
+            req.unwrap(),
+            Right::new(Resource::System, None, Action::Read),
+            "GET /api/kv-status must be gated at system·read (operator-only, not tenant-scoped)"
+        );
+        assert_eq!(
+            Right::required("GET", "/api/kv-status"),
+            Right::required("GET", "/api/blob-status"),
+            "the kv-status read must be the same grade as /api/blob-status",
         );
     }
 }
