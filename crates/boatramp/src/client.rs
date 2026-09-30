@@ -818,6 +818,33 @@ impl ControlPlane {
             .await?)
     }
 
+    /// LIVE control-plane KV checkpoint (`POST /api/kv-checkpoint`, `System·Admin`, v0.11.0 UX C6):
+    /// advance the durable frontier NOW (freeze WAL→L0) on the RUNNING daemon WITHOUT stopping the
+    /// writer, so an operator can snapshot a guaranteed-bootable volume of the live node. Returns the
+    /// server's confirmation line; a non-2xx (`403` insufficient right, `500` checkpoint error) is
+    /// surfaced verbatim as [`ClientError::Refused`].
+    pub async fn kv_checkpoint(&self) -> Result<String> {
+        let Self {
+            http: client,
+            base: server,
+            ..
+        } = self;
+        let resp = client
+            .post(format!("{server}/api/kv-checkpoint"))
+            .send()
+            .await?;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if status.is_success() {
+            Ok(body)
+        } else {
+            Err(ClientError::Refused(format!(
+                "kv checkpoint refused ({status}): {}",
+                body.trim_end()
+            )))
+        }
+    }
+
     /// Trigger a schema-migration `verb` (`apply` / `dry-run` / `baseline`) over an
     /// already-uploaded step-set bundle (`POST /api/{seg}/migrate/{db}/{verb}`;
     /// `Project·Admin`). A step failure comes back as `422` whose body is still a valid

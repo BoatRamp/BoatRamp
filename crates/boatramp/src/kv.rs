@@ -25,7 +25,10 @@ use boatramp_storage::kv_slatedb::{
     RepairMode, RepairReport, clear_degraded_marker, read_degraded_marker,
 };
 use boatramp_storage::object_store::ObjectStore;
-use boatramp_storage::wal_repair::{WalRepairError, repair_wal_tail};
+use boatramp_storage::wal_repair::{
+    ManifestRecovery, ManifestRecoveryReport, WalRepairError, recover_last_good_manifest,
+    repair_wal_tail,
+};
 use clap::{Args, Subcommand};
 
 /// `boatramp kv` command group.
@@ -50,10 +53,14 @@ enum KvCommand {
     Status(StatusArgs),
     /// Flush the control-plane store to a consistent, GUARANTEED-BOOTABLE on-disk state (drain
     /// WAL→L0, advance the durable frontier), so an operator can snapshot the volume safely. OFFLINE
-    /// (the daemon must be stopped — SlateDB is single-writer). A live daemon checkpoints
-    /// continuously on the `[serve.kv] checkpoint_interval` cadence, and on demand via
-    /// `POST /api/kv-checkpoint`. Fails loud if the store is torn (run `kv recover` first).
-    Checkpoint(StoreAddr),
+    /// by default (the daemon must be stopped — SlateDB is single-writer). Pass `--live` to checkpoint
+    /// a RUNNING daemon over `POST /api/kv-checkpoint` (System·Admin) WITHOUT stopping it — the client
+    /// verb for the on-demand live checkpoint (the automatic form is the `[serve.kv]
+    /// checkpoint_interval` cadence). The offline form fails loud if the store is torn (run `kv
+    /// recover` first). NOTE (fsync): a snapshot is bootable only after a checkpoint drained WAL→L0;
+    /// v0.11.0 fsync makes even a mid-close hard stop non-corrupting, but a checkpoint before the
+    /// snapshot is still the reliable point-in-time.
+    Checkpoint(CheckpointArgs),
     /// Recover an unbootable control-plane store (v0.9.0 KV-recovery, C9/C10) — the SUPERSET of
     /// `kv repair`. DRY-RUN by default (diagnose the WHOLE store + print the plan). `--apply`
     /// repairs a recoverable shape IN PLACE (quarantine a safe trailing torn tail, retaining the
@@ -198,6 +205,24 @@ struct RecoverArgs {
     adopt_volume: Option<PathBuf>,
 }
 
+/// Arguments for `boatramp kv checkpoint`.
+#[derive(Debug, Args)]
+struct CheckpointArgs {
+    #[command(flatten)]
+    addr: StoreAddr,
+
+    /// Checkpoint a RUNNING daemon over `POST /api/kv-checkpoint` (System·Admin) instead of the offline
+    /// open+close. The live form advances the durable frontier WITHOUT stopping the writer, so a
+    /// snapshot of the running node is guaranteed-bootable. Requires `--server`/`--remote` (or a
+    /// configured `[deploy].server`).
+    #[arg(long)]
+    live: bool,
+
+    /// The running daemon URL for `--live` (else the configured `[deploy].server`/`BOATRAMP_SERVER`).
+    #[arg(long, value_name = "URL")]
+    server: Option<String>,
+}
+
 /// Errors surfaced by `boatramp kv`.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -207,6 +232,9 @@ pub enum Error {
     /// The repair itself refused or failed (loud — the caller must not proceed to serve).
     #[error(transparent)]
     Repair(#[from] WalRepairError),
+    /// A `--live` control-plane request failed (no server, auth, or a server-side refusal).
+    #[error(transparent)]
+    Client(#[from] crate::client::ClientError),
 }
 
 /// Dispatch `boatramp kv <subcommand>`.
@@ -214,7 +242,7 @@ pub async fn run(args: KvArgs) -> Result<(), Error> {
     match args.command {
         KvCommand::Repair(repair) => run_repair(repair).await,
         KvCommand::Status(status) => run_status(status).await,
-        KvCommand::Checkpoint(addr) => run_checkpoint(addr).await,
+        KvCommand::Checkpoint(checkpoint) => run_checkpoint(checkpoint).await,
         KvCommand::Recover(recover) => run_recover(recover).await,
     }
 }
@@ -248,9 +276,53 @@ async fn run_status(args: StatusArgs) -> Result<(), Error> {
         .await
         .map_err(|e| Error::Store(e.to_string()))?
     {
+        Some(m) if m.rolled_back_to_generation.is_some() => {
+            // v0.11.0 F2 manifest-rollback shape (UX C2): LEAD with the lossless verdict and SUPPRESS
+            // the version-0-SST "no recovery of acked pairs" NOTE unless a real WAL-tail drop occurred.
+            let generation = m.rolled_back_to_generation.unwrap_or_default();
+            let wal_tail_dropped = !m.quarantined_ids.is_empty();
+            if wal_tail_dropped {
+                println!(
+                    "kv status: RECOVERED — auto-rolled-back to manifest gen {generation}; a torn WAL \
+                     tail beyond the frontier was ALSO quarantined (a bounded, forensic-only loss)."
+                );
+            } else {
+                println!(
+                    "kv status: RECOVERED (lossless) — auto-rolled-back to manifest gen {generation}; \
+                     zero acked loss (N-1 + WAL replay = a normal open)."
+                );
+            }
+            println!("  recovered at (unix):        {}", m.stamp);
+            println!("  frontier_source:            {}", m.frontier_source);
+            println!("  last_durable_seq:           {}", m.frontier);
+            println!("  rolled back to generation:  {generation}");
+            println!(
+                "  quarantined manifest ids:   {:?}",
+                m.quarantined_manifest_ids
+            );
+            println!("  manifest-quarantine dir:    {}", m.quarantine_dir);
+            if !m.orphaned_nonacked_objects.is_empty() {
+                println!(
+                    "  reclaimable orphaned SST(s): {:?} (SPACE only, NOT loss — the reopened store's \
+                     GC reclaims them)",
+                    m.orphaned_nonacked_objects
+                );
+            }
+            if wal_tail_dropped {
+                println!("  quarantined WAL ids:        {:?}", m.quarantined_ids);
+                println!("  loss window:                {}", m.loss_window);
+                println!(
+                    "  NOTE: the ADDITIONALLY quarantined torn WAL tail preserves raw bytes for \
+                     FORENSICS ONLY — no supported recovery of acked pairs from a torn version-0 SST."
+                );
+            }
+            println!("  Acknowledge with `boatramp kv status --ack` once reviewed.");
+        }
         Some(m) => {
             println!("kv status: DEGRADED (a self-heal-on-open quarantined a torn WAL tail)");
             println!("  self-healed at (unix): {}", m.stamp);
+            println!("  frontier_source:       {}", m.frontier_source);
+            println!("  last_durable_seq:      {}", m.frontier);
             println!("  quarantined WAL ids:   {:?}", m.quarantined_ids);
             println!("  loss window:           {}", m.loss_window);
             println!("  quarantine dir:        {}", m.quarantine_dir);
@@ -269,7 +341,39 @@ async fn run_status(args: StatusArgs) -> Result<(), Error> {
     Ok(())
 }
 
-async fn run_checkpoint(addr: StoreAddr) -> Result<(), Error> {
+async fn run_checkpoint(args: CheckpointArgs) -> Result<(), Error> {
+    if args.live {
+        return run_checkpoint_live(&args).await;
+    }
+    run_checkpoint_offline(args.addr).await
+}
+
+/// `kv checkpoint --live` (UX C6) — the client verb over `POST /api/kv-checkpoint` (System·Admin):
+/// advance the RUNNING daemon's durable frontier WITHOUT stopping it, then the operator can snapshot a
+/// bootable volume of the live node. The URL comes from `--server`, else `[deploy].server` /
+/// `BOATRAMP_SERVER`; the control-plane token comes from the config / `BOATRAMP_TOKEN`.
+async fn run_checkpoint_live(args: &CheckpointArgs) -> Result<(), Error> {
+    use crate::client;
+    // `kv` runs before the project config is loaded (a store needing repair may predate a valid
+    // config), so load `project.cfg` here best-effort — a missing file is the default, and an explicit
+    // `--server` + `BOATRAMP_TOKEN` still work without a config file.
+    let config = crate::config::ProjectConfig::load(std::path::Path::new("project.cfg"), None)
+        .unwrap_or_default();
+    let server = client::resolve_server(args.server.clone(), &config)?;
+    let cp = client::ControlPlane::new(
+        server.clone(),
+        client::http_client(client::token(&config).as_deref()),
+        client::resolve_project(&config),
+    );
+    let msg = cp.kv_checkpoint().await?;
+    print!("kv checkpoint --live (server {server}): {msg}");
+    if !msg.ends_with('\n') {
+        println!();
+    }
+    Ok(())
+}
+
+async fn run_checkpoint_offline(addr: StoreAddr) -> Result<(), Error> {
     // Open STRICT (a torn store must be RECOVERED first, never checkpointed) then CLOSE: the close
     // drains the memtable → L0 and advances the durable frontier (slatedb `CloseOptions` default
     // `FlushType::MemTable` — the same primitive as the periodic checkpoint), leaving a consistent,
@@ -292,34 +396,166 @@ async fn run_recover(args: RecoverArgs) -> Result<(), Error> {
     if let Some(volume) = args.adopt_volume.clone() {
         return run_recover_adopt_volume(&args.addr, &volume, args.apply).await;
     }
-    // In-place path: the SUPERSET of `kv repair` — the same #5-hardened whole-store repair core,
-    // with the shape-split escalation to `--adopt-volume` (C10).
+    // MF3 (v0.11.0) — the in-place recovery must REFUSE on a cluster node-local Raft store, mirroring
+    // the `serve --repair-wal` cluster refusal (serve.rs). `kv recover` addresses `<data-dir>/kv-slate`,
+    // never `<data-dir>/raft`; a co-located cluster deployment (a `raft/`/`mesh/` store beside the
+    // target) marks this as a cluster node, and a cluster node recovers by failing loud then REJOINING
+    // peers (which re-replicate the authoritative log), NOT by auto-quarantining/manifest-recovering its
+    // node-local store (which could regress below the committed index → double-vote / log↔SM desync).
+    if !args.addr.kv_s3 && is_cluster_node_data_dir(&args.addr.data_dir) {
+        return Err(Error::Store(format!(
+            "REFUSING in-place recovery: `{}` looks like a CLUSTER node data dir (a `raft/`/`mesh/` \
+             store is present). A cluster node NEVER self-recovers its node-local Raft store — that \
+             could regress below the committed index (double-vote / log↔state-machine desync). Recover \
+             by wiping this node's store and REJOINING peers (which re-replicate the authoritative \
+             log): stop the node, remove its data dir, and restart with `--cluster-join <ticket>`.",
+            args.addr.data_dir.display()
+        )));
+    }
     let (store, root) = args.addr.build()?;
     let mode = if args.apply {
         RepairMode::Apply
     } else {
         RepairMode::DryRun
     };
-    match repair_wal_tail(&store, &root, mode).await {
-        Ok(report) => {
-            print_report(&report, args.apply);
-            if !args.apply && !report.quarantined.is_empty() {
-                println!(
-                    "\nRe-run `boatramp kv recover --apply` to quarantine the safe trailing tail in \
-                     place (the crashed torn bytes are retained under `wal-quarantine/` for forensics)."
-                );
+    // Shape detection (UX C4/C5): the empty/torn LATEST manifest shape (v0.11.0 F2) vs the WAL-tail
+    // shape. `recover_last_good_manifest` returns `LatestReadable` (a no-op) when the manifest is
+    // readable, so we fall through to the ordinary WAL-tail `kv repair` superset; `RolledBack` when the
+    // latest manifest is empty/torn and it (would, dry-run) roll back to the last-good generation.
+    match recover_last_good_manifest(&store, &root, mode).await {
+        Ok(ManifestRecovery::LatestReadable { .. }) => {
+            // The latest manifest is readable — the ordinary in-place WAL-tail path (unchanged): the
+            // SUPERSET of `kv repair`, with the shape-split escalation to `--adopt-volume` (C10).
+            match repair_wal_tail(&store, &root, mode).await {
+                Ok(report) => {
+                    print_report(&report, args.apply);
+                    if !args.apply && !report.quarantined.is_empty() {
+                        println!(
+                            "\nRe-run `boatramp kv recover --apply` to quarantine the safe trailing \
+                             tail in place (the crashed torn bytes are retained under `wal-quarantine/` \
+                             for forensics)."
+                        );
+                    }
+                    if !report.out_of_scope_torn.is_empty() {
+                        print_adopt_volume_guidance();
+                    }
+                    Ok(())
+                }
+                Err(e) => {
+                    // C10 shape-split: name the exact refusal, then point at the snapshot-restore path.
+                    eprintln!("kv recover: in-place repair cannot proceed — {e}");
+                    print_adopt_volume_guidance();
+                    Err(e.into())
+                }
             }
-            if !report.out_of_scope_torn.is_empty() {
-                print_adopt_volume_guidance();
+        }
+        Ok(ManifestRecovery::RolledBack(report)) => {
+            // The empty/torn LATEST manifest shape (UX C5): the dry-run WORKS (prints the fallback
+            // plan) and `--apply` rolls back to the last-good generation in place, non-destructively
+            // (the torn manifest bytes are retained under `manifest-quarantine/` until verify).
+            print_manifest_recovery(&report, args.apply);
+            if !args.apply {
+                println!(
+                    "\nRe-run `boatramp kv recover --apply` to roll back to the last-good manifest \
+                     generation in place (lossless-for-acked; the torn manifest bytes are retained \
+                     under `manifest-quarantine/` for forensics)."
+                );
             }
             Ok(())
         }
         Err(e) => {
-            // C10 shape-split: name the exact refusal, then point at the snapshot-restore path.
-            eprintln!("kv recover: in-place repair cannot proceed — {e}");
+            // A manifest shape F2 REFUSED (no decodable generation, a WAL GC hole, below the GC
+            // boundary). Name the refusal, then point at the clean-snapshot escalation (UX C4).
+            eprintln!("kv recover: manifest recovery cannot proceed — {e}");
             print_adopt_volume_guidance();
             Err(e.into())
         }
+    }
+}
+
+/// Whether `data_dir` belongs to a CLUSTER node — a `raft/` node-local durable store or a `mesh/`
+/// identity dir sits beside the control-plane target (see `serve::run_cluster`). Used by
+/// [`run_recover`] to refuse an in-place recovery on a cluster node (MF3): a cluster recovers by
+/// rejoining peers, never by self-recovering its node-local Raft store.
+fn is_cluster_node_data_dir(data_dir: &std::path::Path) -> bool {
+    data_dir.join("raft").is_dir() || data_dir.join("mesh").is_dir()
+}
+
+/// Print the last-good-generation manifest-recovery plan / outcome (v0.11.0 F2).
+fn print_manifest_recovery(report: &ManifestRecoveryReport, applied: bool) {
+    println!(
+        "control-plane MANIFEST recovery {}",
+        if applied {
+            "(APPLY)"
+        } else {
+            "(DRY-RUN — no mutation)"
+        }
+    );
+    println!(
+        "  the LATEST manifest is empty/torn — rolling back to the last-good manifest generation."
+    );
+    println!(
+        "  fall back to manifest generation: {}",
+        report.rolled_back_to_generation
+    );
+    println!(
+        "  durable frontier (replay_after_wal_id) at that generation: {}",
+        report.frontier
+    );
+    if report.quarantined_manifest_ids.is_empty() {
+        println!("  torn manifest generation(s) to quarantine: (none)");
+    } else {
+        let ids: Vec<String> = report
+            .quarantined_manifest_ids
+            .iter()
+            .map(|id| format!("{id:020}"))
+            .collect();
+        println!(
+            "  torn manifest generation(s) to quarantine (retained under manifest-quarantine/): [{}]",
+            ids.join(", ")
+        );
+    }
+    // The embedded WAL-tail sub-plan at F: for the pure last-good-generation rollback this is empty
+    // (discard = none, lossless-for-acked); a crash that ALSO tore a WAL tail beyond F shows it here.
+    if report.wal_repair.quarantined.is_empty() {
+        println!(
+            "  WAL tail beyond the frontier to discard: none (discard = none — lossless-for-acked)."
+        );
+    } else {
+        let ids: Vec<String> = report
+            .wal_repair
+            .quarantined
+            .iter()
+            .map(|id| format!("{id:020}"))
+            .collect();
+        println!(
+            "  ADDITIONALLY a torn WAL tail beyond the frontier would be quarantined [{}] — those \
+             bytes are FORENSIC-ONLY (no supported recovery of acked pairs from a torn version-0 SST).",
+            ids.join(", ")
+        );
+    }
+    if !report.orphaned_nonacked_objects.is_empty() {
+        println!(
+            "  reclaimable orphaned L0 SST(s) (SPACE only, NOT loss): {:?}",
+            report.orphaned_nonacked_objects
+        );
+    }
+    if applied {
+        println!(
+            "  RECOVERED (lossless): rolled back to generation {} and replayed the WAL forward — the \
+             store now opens with zero acked loss (N-1 + WAL replay = a normal open). The torn manifest \
+             bytes are retained under `{}` for forensics.",
+            report.rolled_back_to_generation,
+            report
+                .manifest_quarantine_dir
+                .as_deref()
+                .unwrap_or("<none>")
+        );
+    } else {
+        println!(
+            "  WOULD roll back to generation {} (lossless-for-acked; discard = none).",
+            report.rolled_back_to_generation
+        );
     }
 }
 
