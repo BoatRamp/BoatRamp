@@ -485,6 +485,40 @@ jobs:
           grep -qE 'test result: ok\.' wal-repair.log \
             || { echo "::error::WAL repair gate battery did not pass" >&2; exit 1; }
 
+      # v0.9.0 KV-recovery SELF-HEAL gate battery (the durability-DEFAULT flip). These store-backed
+      # gates use an InMemory object store (non-stalling — no on-disk close/reopen SIGSEGV), so they
+      # run UNIGNORED here (and in the default merge lane). They prove: checkpoint() advances the
+      # durable frontier without close (C1); the self-heal DEFAULT opens+quarantines a sole safe
+      # trailing torn tail and the sealed secret survives (C3/C7); `--strict-kv` still fails loud
+      # (C11); an UNSAFE shape (torn compacted SST) fails loud + mutates NOTHING (C3 dry-run-first).
+      # The LINCHPIN proves the flip cannot drop an ACKED crown-jewel write; it is then
+      # MUTATION-VERIFIED — under `BOATRAMP_LINCHPIN_MUTATION=no_frontier_sync` the crown-jewel write
+      # SKIPS the checkpoint (a frontier-async write, the C2 miss), the acked secret lands in the torn
+      # tail self-heal quarantines, and the survival gate MUST FAIL. A pass-under-mutation (a hollow
+      # linchpin) fails the merge.
+      - name: "v0.9.0 KV self-heal + recovery gate battery (host toolchain)"
+        run: |
+          set -eo pipefail
+          cargo test -p boatramp-storage --features slatedb --lib \
+            kv_slatedb::tests::checkpoint_advances_the_durable_frontier_without_close \
+            kv_slatedb::tests::crown_jewel_write_survives_torn_tail_self_heal_linchpin \
+            kv_slatedb::tests::self_heal_opens_after_quarantining_a_safe_torn_tail \
+            kv_slatedb::tests::self_heal_refuses_and_preserves_on_an_unsafe_compacted_tear \
+            kv_slatedb::tests::strict_policy_fails_loud_on_a_safe_torn_tail \
+            2>&1 | tee kv-recovery.log
+          grep -qE 'test result: ok\. 5 passed' kv-recovery.log \
+            || { echo "::error::v0.9.0 KV self-heal gate battery did not run all 5 (silent skip or a failure)" >&2; exit 1; }
+          # LINCHPIN anti-hollow: the checkpoint on the crown-jewel write path is load-bearing.
+          if BOATRAMP_LINCHPIN_MUTATION=no_frontier_sync cargo test -p boatramp-storage \
+            --features slatedb --lib \
+            kv_slatedb::tests::crown_jewel_write_survives_torn_tail_self_heal_linchpin \
+            > linchpin-mutation.log 2>&1; then
+            echo "::error::LINCHPIN gate is HOLLOW — it passed under no_frontier_sync; a crown-jewel write left frontier-async would silently drop an acked secret (sealed secret / RBAC / posture) on a self-heal-default boot" >&2
+            exit 1
+          else
+            echo "linchpin mutation verified: no_frontier_sync drops the acked secret as expected — the crown-jewel checkpoint is load-bearing."
+          fi
+
       # Part A quiesce-before-close gates that live outside boatramp-storage:
       #   A2         — the scheduler quiesce (drainer/watchers/crons stop before close) in boatramp-server,
       #   A2-cluster — raft.shutdown() precedes the store close, and A3 — the bounded close deadline,
