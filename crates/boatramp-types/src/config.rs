@@ -594,6 +594,23 @@ pub struct HandlerConfig {
     /// right and the site allows it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub upload_containers: Vec<String>,
+    /// Per-component container allowlist for the **plain `wasi:blobstore`** capability
+    /// (host-enforced tenant confinement). SEPARATE from [`upload_containers`](Self::upload_containers)
+    /// (which gates the `blob-upload` MINT capability) — there is **no inheritance or fallback**
+    /// between the two. Each entry is `{tenant}`-templated: an entry containing `{tenant}` is expanded
+    /// with THIS invocation's host-resolved OWN tenant (never guest-supplied) before an exact match
+    /// against the container the guest opens (`get-container`/`create-container`/…), so a
+    /// `["assets-{tenant}"]` handler can only ever reach `assets-<own-tid>`. A plain entry (no
+    /// `{tenant}`, e.g. `"shared"`) is a site-shared container the operator opts into.
+    ///
+    /// Behavior when **empty** depends on whether the site is multi-tenant (i.e. declares a tenancy,
+    /// the same fact that scopes `sql`/`orm`): a **multi-tenant** site that grants `wasi:blobstore`
+    /// but names no `blobstore_containers` **denies** every container op (fail-closed — add the
+    /// one-line `blobstore_containers: ["assets-{tenant}"]`); a **single-tenant/dev** site with no
+    /// tenancy stays permissive (today's behavior). Only consulted when `imports` contains
+    /// `wasi:blobstore` and the site allows it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blobstore_containers: Vec<String>,
     /// Per-handler in-site tenancy decision (Dimension 0), overriding the site-level
     /// [`HandlersSiteConfig::tenancy`] for this route. Absent ⇒ inherit the site decision. When
     /// present it must **narrow within** the site ceiling ([`crate::tenancy::Tenancy::narrows_within`])
@@ -749,6 +766,13 @@ pub struct ConsumerConfig {
     /// host-forced from the resolved invocation scope.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub upload_containers: Vec<String>,
+    /// Per-component container allowlist for the **plain `wasi:blobstore`** capability (host-enforced
+    /// tenant confinement; same contract as [`HandlerConfig::blobstore_containers`]): the blob
+    /// containers this consumer may open, `{tenant}`-templated against its host-resolved OWN tenant.
+    /// SEPARATE from [`upload_containers`](Self::upload_containers) — no inheritance/fallback. Empty
+    /// on a multi-tenant consumer ⇒ deny-all (fail-closed); empty single-tenant ⇒ permissive.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blobstore_containers: Vec<String>,
 }
 
 /// serde `skip_serializing_if` helper: a `Latest` start is the default and elided.
@@ -1640,6 +1664,7 @@ mod tests {
                 stats_topics: Vec::new(),
                 tenant_secret_names: Vec::new(),
                 upload_containers: Vec::new(),
+                blobstore_containers: Vec::new(),
             }],
             ..Default::default()
         };

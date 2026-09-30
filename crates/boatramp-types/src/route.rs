@@ -773,6 +773,7 @@ mod tests {
             stats_topics: Vec::new(),
             tenant_secret_names: Vec::new(),
             upload_containers: Vec::new(),
+            blobstore_containers: Vec::new(),
         };
         let handlers = vec![
             handler("/api/orders/*", &["GET", "POST"]),

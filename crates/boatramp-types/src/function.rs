@@ -141,6 +141,14 @@ pub struct FunctionConfig {
     /// when `imports` contains a `blob-upload:*` right.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub upload_containers: Vec<String>,
+    /// Per-component container allowlist for the **plain `wasi:blobstore`** capability (host-enforced
+    /// tenant confinement; same contract as [`crate::config::HandlerConfig::blobstore_containers`]):
+    /// the blob containers this function may open, `{tenant}`-templated against its host-resolved OWN
+    /// tenant. SEPARATE from [`upload_containers`](Self::upload_containers) — no inheritance/fallback.
+    /// Empty on a multi-tenant function ⇒ deny-all (fail-closed); empty single-tenant ⇒ permissive.
+    /// Only consulted when `imports` contains `wasi:blobstore`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blobstore_containers: Vec<String>,
     /// The site a **standalone top-level function** mints blob-upload credentials for
     /// (`boatramp:handlers/blob-upload`, S3 external ingress). A site handler mints for its own
     /// host-routed site, but a standalone function has no single resolved site — so it names one here,
@@ -243,6 +251,8 @@ impl FunctionConfig {
             tenant_secret_names: h.tenant_secret_names.clone(),
             // Carry the handler's blob-upload container allowlist likewise (grant surface parity).
             upload_containers: h.upload_containers.clone(),
+            // Carry the handler's plain-`wasi:blobstore` container allowlist likewise (grant parity).
+            blobstore_containers: h.blobstore_containers.clone(),
             // A desugared handler-function runs on the site-handler dispatch path, where the site is
             // host-ROUTED (not config-declared) — so it has no `blob_upload_site` of its own. The
             // `blob_upload_site` field is exclusively the STANDALONE top-level function's way to name
@@ -267,6 +277,8 @@ impl FunctionConfig {
             tenant_secret_names: c.tenant_secret_names.clone(),
             // Carry the consumer's blob-upload container allowlist likewise.
             upload_containers: c.upload_containers.clone(),
+            // Carry the consumer's plain-`wasi:blobstore` container allowlist likewise.
+            blobstore_containers: c.blobstore_containers.clone(),
             ..Default::default()
         }
     }
@@ -1023,6 +1035,7 @@ mod tests {
             stats_topics: Vec::new(),
             tenant_secret_names: Vec::new(),
             upload_containers: Vec::new(),
+            blobstore_containers: Vec::new(),
         }
     }
 
@@ -1062,6 +1075,7 @@ mod tests {
                 stats_topics: Vec::new(),
                 tenant_secret_names: Vec::new(),
                 upload_containers: Vec::new(),
+                blobstore_containers: Vec::new(),
             }],
             crons: vec![CronConfig {
                 schedule: "0 * * * *".into(),
