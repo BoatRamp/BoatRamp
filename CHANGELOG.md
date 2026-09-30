@@ -5,6 +5,37 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.10.0] - 2026-09-30
+
+Additive — a grouped-aggregate completion for the typed `orm` builder (construens
+`boatramp-orm-groupby-request`). `GROUP BY` / `HAVING` and the `count`/`sum`/`avg`/`min`/`max`
+aggregates were already supported end-to-end (typed builder → WIT → host, tenant-confined); this fills
+the last gap and proves the confinement.
+
+### Added
+
+- **`count_distinct` aggregate** (`count(DISTINCT col)`) — the one grouped aggregate not previously
+  representable. New `Agg::CountDistinct` in the typed builder + an append-only `count-distinct` variant
+  on the WIT `agg` enum (ordinal-preserving; an old host rejects it rather than misdecoding) + the shim
+  `count_distinct()` constructor (coordinated shim rev). `count_distinct(*)` fails closed. Confined
+  identically at both the direct-aggregate and correlated (`RelatedAggregate`) render sites.
+
+### Security / correctness
+
+- **Grouped aggregation is proven tenant-confined pre-aggregation.** The host-forced `own`/`target`
+  tenant predicate is injected structurally into `WHERE` before `GROUP BY`/`HAVING`/`ORDER BY`, so a
+  grouped `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`/`COUNT(DISTINCT)` run as one tenant can never include another
+  tenant's rows in any group or aggregate. A `GROUP BY` that could cross tenants is a bug; this closes
+  the previously-untested assurance gap with a CI-hard, mutation-verified gate (a grouped aggregate
+  under the host scope must equal a single-tenant baseline; dropping the pre-aggregation scope makes it
+  red) plus a LEFT-JOIN aggregate-semantics test. Security review: SHIP.
+
+### Notes
+
+- No host behavior change for existing grouped queries; guests already on a shim with the grouped
+  builder (`group_by`/`having`/`count_star`/`count`/`sum`/`avg`/`min`/`max`) need no change. Update the
+  shim only to use `count_distinct`.
+
 ## [0.9.0] - 2026-09-30
 
 **Control-plane KV recovery: an ordinary restart no longer leaves the server unbootable.** A torn/partial
