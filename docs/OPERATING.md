@@ -166,6 +166,23 @@ boatramp domain ls                                   # attached + pending
   is cheap, so the budget rarely bites; and even a SIGKILL-mid-close is
   lossless-for-acked because every crown-jewel write (sealed secrets, RBAC, domain
   bindings, identity creates) advances the frontier before it acks.
+- **KV durability & recovery (v0.11.0).** The local control-plane SlateDB store is
+  opened with **fsync ON**, so the manifest/WAL final name only becomes visible once
+  its data is durable — a hard VM stop / crash-consistent snapshot mid-write can no
+  longer leave a torn-at-final-name object (the recurring "empty manifest" / torn-WAL
+  outage class). If a pre-v0.11.0 store *did* land with an empty/torn **latest
+  manifest**, the next cold open **auto-recovers**: it rolls back to the last-good
+  manifest generation and replays the WAL forward — **lossless-for-acked** (N-1 + WAL
+  replay = a normal open). A refusal (no decodable generation, a WAL GC hole) fails
+  loud into the recovery-mode 503 listener rather than losing data. Inspect with
+  `GET /api/kv-status` (`frontier_source` ∈ {`manifest_latest`, `manifest_gen_rollback`,
+  `wal_replay`} + `last_durable_seq`) or `boatramp kv status`; recover an already-stuck
+  store in place with `boatramp kv recover` (dry-run) then `--apply`. Snapshot a
+  running node's guaranteed-bootable volume with `boatramp kv checkpoint --live`
+  (advances the durable frontier over `POST /api/kv-checkpoint` without stopping the
+  writer). The cluster node-local Raft store stays **strict** (no auto-recovery — a
+  cluster node recovers by rejoining peers). A snapshot is **DR hygiene**, not a roll
+  prerequisite.
 
 ## Secrets at rest
 
