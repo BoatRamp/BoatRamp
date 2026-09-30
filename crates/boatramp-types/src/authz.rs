@@ -604,6 +604,12 @@ impl Right {
             // explicitly here (above the deny-safe `_` default that resolves the same, so a
             // routing/table regression is visible) and re-checked defense-in-depth at the handler.
             "/api/blob-purge" => Self::new(Resource::System, None, Action::Admin),
+            // The on-demand LIVE control-plane KV checkpoint (`POST /api/kv-checkpoint`, v0.9.0
+            // KV-recovery, #3): a node-level MUTATING op (freeze WAL→L0, advance the durable
+            // frontier) not scoped to a project, so `system·admin` — never a per-project right.
+            // Explicit (above the deny-safe `_` default that resolves the same, so a routing/table
+            // regression is visible) and re-checked defense-in-depth at the handler.
+            "/api/kv-checkpoint" => Self::new(Resource::System, None, Action::Admin),
             // The structured blob transition-mode state (`GET /api/blob-status`, v0.6.4): whether a
             // read-fallback secondary is attached (the node is mid-migration). A READ-only node
             // status — the same grade as `/api/sites` / `/api/metrics` — so `system·read` (never a

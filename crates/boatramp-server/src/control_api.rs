@@ -632,6 +632,53 @@ pub(super) async fn kv_status(
     }
 }
 
+/// Defense-in-depth (mirrors [`blob_drain`](super::blob_drain)): re-derive that `POST
+/// /api/kv-checkpoint` is gated `System·Admin` inside the handler, so a routing/table regression
+/// cannot silently downgrade a node-level mutating checkpoint to a project-scoped right.
+fn assert_kv_checkpoint_is_system_admin() -> Option<Response> {
+    use boatramp_core::authz::{Action, Resource, Right};
+    match Right::required("POST", "/api/kv-checkpoint") {
+        Some(right)
+            if right.resource == Resource::System
+                && right.target.is_none()
+                && right.action == Action::Admin =>
+        {
+            None
+        }
+        _ => Some(
+            (
+                StatusCode::FORBIDDEN,
+                "kv checkpoint requires System·Admin\n",
+            )
+                .into_response(),
+        ),
+    }
+}
+
+/// On-demand LIVE checkpoint (`POST /api/kv-checkpoint`, `System·Admin`, v0.9.0 KV-recovery, #3):
+/// advance the control-plane store's durable frontier NOW (freeze WAL→L0) WITHOUT stopping the
+/// writer, so an operator can then snapshot a guaranteed-bootable volume of the running node. The
+/// LIVE counterpart to the offline `boatramp kv checkpoint` + the automatic `[serve.kv]
+/// checkpoint_interval` cadence. Idempotent + cheap when nothing has changed since the last checkpoint.
+pub(super) async fn kv_checkpoint(State(deploy): State<DeployStore>) -> Response {
+    if let Some(forbidden) = assert_kv_checkpoint_is_system_admin() {
+        return forbidden;
+    }
+    match deploy.checkpoint().await {
+        Ok(()) => (
+            StatusCode::OK,
+            "kv checkpoint: durable frontier advanced (WAL→L0); the store is a consistent, bootable \
+             snapshot point — snapshot the volume now.\n",
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("kv checkpoint failed: {err}\n"),
+        )
+            .into_response(),
+    }
+}
+
 /// Return the active RBAC policy (`authz/policy`), or the built-in default when
 /// none is stored — so a `get` always shows the effective policy.
 pub(super) async fn get_authz_policy(State(deploy): State<DeployStore>) -> Response {

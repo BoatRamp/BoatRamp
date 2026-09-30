@@ -297,6 +297,10 @@ pub fn router_with_fast(
         // secrets, just the quarantined ids + loss window. (The recovery-mode listener serves its
         // OWN unauth `/api/kv-status` when the store is DOWN; this is the store-UP degraded surface.)
         .route("/api/kv-status", get(kv_status))
+        // On-demand LIVE control-plane KV checkpoint (v0.9.0 KV-recovery, #3): freeze WAL→L0 without
+        // stopping the writer, so an operator can snapshot a bootable volume of the running node.
+        // `System·Admin` (mutating, node-level), re-checked defense-in-depth in the handler.
+        .route("/api/kv-checkpoint", post(kv_checkpoint))
         .route("/api/certs", get(cert_status))
         .route("/api/cache/invalidate", post(invalidate_cache))
         .route(
