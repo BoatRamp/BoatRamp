@@ -1942,11 +1942,19 @@ mod tests {
                 .unwrap();
             assert!(report.applied && report.quarantined == vec![torn_id]);
 
-            // The original is gone from wal/.
-            assert!(
-                !torn_path.exists(),
-                "B5: the quarantined object must be removed from wal/"
-            );
+            // The TORN object's bytes are gone from wal/. The v0.9.0 post-quarantine verify
+            // (`verify_opens`, C4) opens the store as a real writer to prove it boots; slatedb may
+            // re-use the just-freed WAL id for a FRESH, VALID object, so the invariant is that the
+            // torn BYTES are no longer at the path (preserved only in wal-quarantine/), not that the
+            // path is absent. A same-bytes file still present would mean the delete never happened
+            // (the real bug this guards).
+            if let Ok(now) = std::fs::read(&torn_path) {
+                assert_ne!(
+                    now, original_bytes,
+                    "B5: the torn object's bytes must be gone from wal/ (a fresh valid object at the \
+                     reused id is fine; the torn bytes live only under wal-quarantine/)"
+                );
+            }
             // A byte-identical copy exists under wal-quarantine/<stamp>/.
             let qdir = dir.join("kv").join("wal-quarantine");
             let mut found = None;
