@@ -156,7 +156,16 @@ boatramp domain ls                                   # attached + pending
 - `boatramp scrub` — re-hash every stored blob; exits non-zero on any
   corruption/unreadable blob, so it fits a cron or healthcheck.
 - `/healthz` (liveness) and `/readyz` (readiness; probes the KV). SIGTERM/Ctrl-C
-  drains in-flight requests under a deadline.
+  drains in-flight requests, then quiesces writers and cleanly `close()`s the
+  control-plane KV (freeze memtables → L0, advancing the durable frontier) so the
+  next boot has no torn WAL tail. That close is bounded by `[serve.kv]
+  close_deadline` (default 20s; `BOATRAMP_KV_CLOSE_DEADLINE`). On fly, set
+  `kill_timeout` ≥ your measured drain+close time (≥ `close_deadline`) so a deploy
+  roll never SIGKILLs mid-close. With continuous checkpointing (`[serve.kv]
+  checkpoint_interval`, default 10s — advances the frontier on a cadence) the close
+  is cheap, so the budget rarely bites; and even a SIGKILL-mid-close is
+  lossless-for-acked because every crown-jewel write (sealed secrets, RBAC, domain
+  bindings, identity creates) advances the frontier before it acks.
 
 ## Secrets at rest
 

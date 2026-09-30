@@ -922,8 +922,10 @@ impl DeployStore {
     ) -> Result<(), DeployError> {
         schema.validate().map_err(DeployError::Invalid)?;
         let bytes = serde_json::to_vec(schema).map_err(|e| DeployError::Serde(e.to_string()))?;
+        // Crown-jewel (C2): the tenancy schema is security-load-bearing (the scope injector uses it);
+        // losing it reverts to permissive scoping — advance the frontier synchronously before ack.
         self.kv
-            .put(&keys::project_config(project, "tenancy"), bytes)
+            .put_durable_checkpointed(&keys::project_config(project, "tenancy"), bytes)
             .await?;
         Ok(())
     }
@@ -932,8 +934,10 @@ impl DeployStore {
     /// legacy single-column `Uniform` scoping (no per-table key map). Idempotent — clearing
     /// an absent schema is a no-op that still returns `Ok`.
     pub async fn clear_project_tenancy(&self, project: ProjectRef<'_>) -> Result<(), DeployError> {
+        // Crown-jewel (C2): a tenancy posture CHANGE must be durable-past-frontier so it cannot
+        // silently revert to the prior (possibly more-permissive) schema after a crash.
         self.kv
-            .delete(&keys::project_config(project, "tenancy"))
+            .delete_checkpointed(&keys::project_config(project, "tenancy"))
             .await?;
         Ok(())
     }
@@ -966,8 +970,10 @@ impl DeployStore {
         db: &crate::compute::ApplyDatabase,
     ) -> Result<(), DeployError> {
         let bytes = serde_json::to_vec(db).map_err(|e| DeployError::Serde(e.to_string()))?;
+        // Crown-jewel (C2): a managed-DB identity/binding create — pairs with the sealed credential
+        // (in `secrets_kv`); advance the frontier synchronously so the binding cannot be dropped.
         self.kv
-            .put(&keys::project_database(project, &db.name), bytes)
+            .put_durable_checkpointed(&keys::project_database(project, &db.name), bytes)
             .await?;
         Ok(())
     }
@@ -1214,7 +1220,11 @@ impl DeployStore {
                 ops.push(WriteOp::Put(keys::wildcard(suffix), bytes));
             }
         }
-        self.kv.write_batch(ops).await?;
+        // Crown-jewel (C2): this batch carries the per-host tenant→domain binding
+        // (`sitecontexts/*`, NOT in the content-addressed blob) — an imperatively-written security
+        // binding — alongside the site pointer + domain routing indexes. Advance the frontier
+        // synchronously so an acked domain attach / context binding survives a crash.
+        self.kv.write_batch_checkpointed(ops).await?;
         // The domain index changed — drop cached `Host` resolutions built against the
         // old generation so the new/removed mappings take effect on the next request.
         self.bump_domain_epoch();
@@ -1385,8 +1395,9 @@ impl DeployStore {
         f: &crate::function::Function,
     ) -> Result<(), DeployError> {
         let bytes = serde_json::to_vec(f).map_err(|e| DeployError::Serde(e.to_string()))?;
+        // Crown-jewel (C2): the function IDENTITY record — advance the frontier synchronously.
         self.kv
-            .put(
+            .put_durable_checkpointed(
                 &crate::function::keys::meta(project.as_str(), &f.name),
                 bytes,
             )
@@ -1455,8 +1466,11 @@ impl DeployStore {
             self.kv.delete(&key).await?;
         }
         self.kv.delete(&meta).await?;
+        // Crown-jewel (C2): destroying a function IDENTITY must be durable so it cannot resurrect
+        // after a crash. One checkpoint on the LAST delete freezes the whole teardown (every prior
+        // delete in this method is already in the memtable) — advancing the frontier past all of it.
         self.kv
-            .delete(&crate::function::keys::metering(project.as_str(), name))
+            .delete_checkpointed(&crate::function::keys::metering(project.as_str(), name))
             .await?;
         Ok(existed)
     }
@@ -2187,7 +2201,10 @@ impl DeployStore {
                 DomainOwner::new(project.as_str(), site.as_str()).to_bytes(),
             ));
         }
-        self.kv.write_batch(ops).await?;
+        // Crown-jewel (C2): the domain-ownership VERIFICATION/proof record — not recomputable
+        // without re-running the DNS-01/HTTP-01 challenge — advance the frontier synchronously.
+        // (The paired `httpchallenge/*` index in this batch is derived; one checkpoint covers both.)
+        self.kv.write_batch_checkpointed(ops).await?;
         Ok(())
     }
 
@@ -2363,7 +2380,9 @@ impl DeployStore {
                 &v.host, &v.token,
             )));
         }
-        self.kv.write_batch(ops).await?;
+        // Crown-jewel (C2): dropping the domain-ownership proof on detach is a security-relevant
+        // state change — advance the frontier synchronously so it cannot silently reappear.
+        self.kv.write_batch_checkpointed(ops).await?;
         Ok(true)
     }
 
@@ -2455,12 +2474,16 @@ impl DeployStore {
             return Ok(false);
         }
         // Persist the context removal FIRST, so the re-projection below (which reads the store back
-        // through `get_site_config`) sees it gone and cannot union it back in.
+        // through `get_site_config`) sees it gone and cannot union it back in. Crown-jewel (C2): the
+        // per-host tenant→domain binding is a security binding — frontier-sync it in BOTH branches
+        // (the re-projection below may checkpoint again; idempotent + dirty-gated, so that is free).
         if ctx.is_empty() {
-            self.kv.delete(&keys::site_contexts(project, site)).await?;
+            self.kv
+                .delete_checkpointed(&keys::site_contexts(project, site))
+                .await?;
         } else {
             self.kv
-                .put(
+                .put_durable_checkpointed(
                     &keys::site_contexts(project, site),
                     serde_json::to_vec(&ctx)?,
                 )
@@ -2592,8 +2615,11 @@ impl DeployStore {
             .filter(|id| id.starts_with(id_or_prefix))
             .collect();
         if let [id] = matches.as_slice() {
+            // Crown-jewel (C2): a revocation marker MUST be durable — losing it silently un-revokes
+            // a token. Frontier-sync the marker; the paired token-meta delete (derived) rides the
+            // same memtable and is captured by this checkpoint.
             self.kv
-                .put(&crate::authz::revoked_key(id), Vec::new())
+                .put_durable_checkpointed(&crate::authz::revoked_key(id), Vec::new())
                 .await?;
             self.kv.delete(&crate::authz::token_meta_key(id)).await?;
             Ok(true)
@@ -2616,8 +2642,10 @@ impl DeployStore {
 
     /// Mark a bootstrap secret (by SHA-256 hex) consumed — single-use.
     pub async fn mark_bootstrap_consumed(&self, secret_hash: &str) -> Result<(), DeployError> {
+        // Crown-jewel (C2): losing the single-use marker re-enables a spent bootstrap secret
+        // (security) — advance the frontier synchronously before ack.
         self.kv
-            .put(&crate::authz::bootstrap_key(secret_hash), Vec::new())
+            .put_durable_checkpointed(&crate::authz::bootstrap_key(secret_hash), Vec::new())
             .await?;
         Ok(())
     }
@@ -2638,8 +2666,10 @@ impl DeployStore {
         &self,
         policy: &crate::authz::AuthzPolicy,
     ) -> Result<(), DeployError> {
+        // Crown-jewel (C2): the entire RBAC policy (role→right grants) — advance the frontier
+        // synchronously so a grant/revoke cannot be dropped by the self-heal trailing-tail quarantine.
         self.kv
-            .put(crate::authz::POLICY_KEY, serde_json::to_vec(policy)?)
+            .put_durable_checkpointed(crate::authz::POLICY_KEY, serde_json::to_vec(policy)?)
             .await?;
         Ok(())
     }
@@ -2649,16 +2679,18 @@ impl DeployStore {
     /// make-before-break rotation. Replicated to every node through the control
     /// plane, so no per-node edit is needed.
     pub async fn add_root_anchor(&self, pubkey: &str) -> Result<(), DeployError> {
+        // Crown-jewel (C2): a trusted token-signing root anchor (identity anchor) — frontier-sync it.
         self.kv
-            .put(&crate::authz::root_anchor_key(pubkey), Vec::new())
+            .put_durable_checkpointed(&crate::authz::root_anchor_key(pubkey), Vec::new())
             .await?;
         Ok(())
     }
 
     /// Retire a previously-added root anchor (the old key, after propagation).
     pub async fn remove_root_anchor(&self, pubkey: &str) -> Result<(), DeployError> {
+        // Crown-jewel (C2): retiring a trusted root anchor is a security state change — frontier-sync.
         self.kv
-            .delete(&crate::authz::root_anchor_key(pubkey))
+            .delete_checkpointed(&crate::authz::root_anchor_key(pubkey))
             .await?;
         Ok(())
     }
@@ -2788,8 +2820,11 @@ impl DeployStore {
         spec: &crate::compute::ComputeSpec,
     ) -> Result<String, DeployError> {
         let id = spec.id();
+        // Crown-jewel (C2): the content-addressed compute-workload spec (a declared workload's
+        // identity body). A workload is declared rarely, so frontier-sync it — the paired pointer
+        // (`set_compute_workload`) then never dangles past a crash.
         self.kv
-            .put(&crate::compute::spec_key(&id), serde_json::to_vec(spec)?)
+            .put_durable_checkpointed(&crate::compute::spec_key(&id), serde_json::to_vec(spec)?)
             .await?;
         Ok(id)
     }
@@ -2813,8 +2848,10 @@ impl DeployStore {
         project: ProjectRef<'_>,
         workload: &crate::compute::ComputeWorkload,
     ) -> Result<(), DeployError> {
+        // Crown-jewel (C2): the compute workload's declared desired-state identity — low-frequency,
+        // so frontier-sync it (parallel to a function identity) rather than treat it as a hot pointer.
         self.kv
-            .put(
+            .put_durable_checkpointed(
                 &crate::compute::workload_key(project.as_str(), &workload.name),
                 serde_json::to_vec(workload)?,
             )
@@ -2882,7 +2919,8 @@ impl DeployStore {
         let key = crate::compute::workload_key(project.as_str(), name);
         let existed = self.kv.get(&key).await?.is_some();
         if existed {
-            self.kv.delete(&key).await?;
+            // Crown-jewel (C2): destroying a declared workload identity must be durable-past-frontier.
+            self.kv.delete_checkpointed(&key).await?;
         }
         Ok(existed)
     }
@@ -3009,8 +3047,10 @@ impl DeployStore {
                 history.truncate(MAX_HISTORY);
             }
         }
+        // Crown-jewel (C2): first-creating the PROJECT identity (the tenant boundary) — advance the
+        // frontier synchronously so an acked project create survives a crash.
         self.kv
-            .write_batch(vec![
+            .write_batch_checkpointed(vec![
                 WriteOp::Put(crate::project::spec_key(&hash), body),
                 WriteOp::Put(pointer, hash.clone().into_bytes()),
                 WriteOp::Put(
@@ -3052,8 +3092,9 @@ impl DeployStore {
         let default = Self::default_project_record();
         let hash = default.id();
         let body = serde_json::to_vec(&default).map_err(|e| DeployError::Serde(e.to_string()))?;
+        // Crown-jewel (C2): materializing the reserved `default` project identity — frontier-sync.
         self.kv
-            .write_batch(vec![
+            .write_batch_checkpointed(vec![
                 WriteOp::Put(crate::project::spec_key(&hash), body),
                 WriteOp::Put(pointer, hash.into_bytes()),
             ])
@@ -3161,8 +3202,9 @@ impl DeployStore {
                 Self::summarize_owned_resources(&prefix, &remaining)
             )));
         }
+        // Crown-jewel (C2): destroying a PROJECT identity must be durable-past-frontier.
         self.kv
-            .write_batch(vec![
+            .write_batch_checkpointed(vec![
                 WriteOp::Delete(crate::project::pointer_key(name)),
                 WriteOp::Delete(crate::project::history_key(name)),
             ])
@@ -3405,7 +3447,9 @@ impl DeployStore {
 
         let purged = ops.len();
         if !ops.is_empty() {
-            self.kv.write_batch(ops).await?;
+            // Crown-jewel (C2): a cascade project teardown (mass destructive over the whole tenant
+            // subtree, incl. sealed secrets + reverse-index) must be durable-past-frontier.
+            self.kv.write_batch_checkpointed(ops).await?;
         }
         // Any freed hosts must stop resolving — invalidate the resolve cache.
         self.bump_domain_epoch();
@@ -3830,7 +3874,9 @@ impl DeployStore {
         {
             batch.push(WriteOp::Delete(key));
         }
-        self.kv.write_batch(batch).await?;
+        // Crown-jewel (C2): deleting a SITE identity (its pointer/history/contexts/domain bindings +
+        // ownership proofs) must be durable-past-frontier so it cannot resurrect after a crash.
+        self.kv.write_batch_checkpointed(batch).await?;
         // Freed hosts must stop resolving to this site — invalidate the resolve cache.
         self.bump_domain_epoch();
         Ok(())
