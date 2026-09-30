@@ -3504,6 +3504,7 @@ mod blob_upload_function_tests {
 ///   - HIGH-1 positive: a `Scoped` declaration + a `{tenant}` allowlist binds successfully;
 ///   - MEDIUM-1: an explicit `Tenancy::Disabled` is a legal single-tenant declaration — attached (not
 ///     refused) and permissive (not denied).
+///
 /// The confinement behavior itself (own `assets-<tid>` opens, `assets-<other>` refused) is unit-tested
 /// in `boatramp-handlers::bindings::blobstore` — `BlobBinding`'s fields are crate-private there, so the
 /// dispatch-level tests assert the Dimension-0 gate + binding attachment, not the prefix decision.
