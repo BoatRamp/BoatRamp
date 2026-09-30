@@ -1316,6 +1316,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn group_by_having_and_count_distinct_rebuild_from_the_arena_and_are_host_scoped() {
+        // SELECT label, count(DISTINCT sku) AS variants FROM line_item
+        //   GROUP BY label HAVING count(*) > ?        [guest-built via the flat expr/pred arena]
+        //
+        // Proves two things at once:
+        //   (1) the `group-by` / `having` / `count-distinct` arena lowers to the core builder intact
+        //       (no round-trip existed for group-by/having, and none for the new count-distinct), and
+        //   (2) per the `all_mode`/`read_own` precedents, the guest-supplied `scope` is DROPPED and the
+        //       HOST `force_scope` is conjoined into the WHERE — i.e. the tenant predicate lands
+        //       PRE-aggregation, so no other tenant's rows can enter any group / count / distinct-count.
+        use boatramp_core::tenancy::AccessMode;
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut sess = scoped_session(&log, AccessMode::Own, AccessMode::Own);
+        let mut table = ResourceTable::new();
+        {
+            let mut host = OrmHost::new(&mut table, &mut sess);
+            let db = host.open(String::new()).unwrap();
+
+            let sel = wit::SelectQuery {
+                exprs: vec![
+                    col("label"),        // 0
+                    col("sku"),          // 1
+                    wit::ExprNode::Star, // 2
+                    wit::ExprNode::Aggregate(wit::AggNode {
+                        agg: wit::Agg::CountDistinct,
+                        arg: 1,
+                    }), // 3: count(DISTINCT sku)
+                    wit::ExprNode::Aggregate(wit::AggNode {
+                        agg: wit::Agg::Count,
+                        arg: 2,
+                    }), // 4: count(*)
+                    lit(wit::Value::Integer(1)), // 5
+                ],
+                preds: vec![cmp(4, wit::CmpOp::Gt, 5)], // 0: count(*) > ?
+                columns: vec![
+                    item(0),
+                    wit::SelectItem {
+                        expr: 3,
+                        alias: Some("variants".into()),
+                    },
+                ],
+                group_by: vec![0],
+                having: Some(0),
+                // A guest-forged scope that MUST be ignored (Stage 0 drops it; the host forces its own).
+                scope: Some(scope("tenant_id", text("ATTACKER"))),
+                ..empty_select("line_item")
+            };
+            host.select(db, sel).await.unwrap();
+        }
+
+        let log = log.lock().unwrap();
+        assert!(
+            log.iter().any(|l| l.starts_with(
+                "query|SELECT label, count(DISTINCT sku) AS variants FROM line_item \
+                 WHERE tenant_id = ?1 GROUP BY label HAVING count(*) > ?2|"
+            )),
+            "grouped count-distinct must lower intact and be host-scoped pre-aggregation, got: {log:?}"
+        );
+        // The guest's forged tenant never reaches the backend; the host's own tenant does.
+        assert!(
+            !log.iter().any(|l| l.contains("ATTACKER")),
+            "guest-supplied scope must be dropped, got: {log:?}"
+        );
+        assert!(
+            log.iter().any(|l| l.contains("ten_1")),
+            "host tenant must be bound, got: {log:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn a_forward_arena_index_is_rejected() {
         // A pred whose child references itself/forward (>= its own index) must be refused.
         let log = Arc::new(Mutex::new(Vec::new()));

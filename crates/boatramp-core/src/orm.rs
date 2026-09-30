@@ -3948,6 +3948,89 @@ mod tests {
     }
 
     #[test]
+    fn count_distinct_renders_in_a_grouped_aggregate() {
+        // `count(DISTINCT col)` — the one aggregate the typed path was missing — renders with the
+        // DISTINCT qualifier on its argument (the other aggregates render `agg(arg)`).
+        let q = Select {
+            columns: vec![
+                item(Expr::col("label")),
+                SelectItem {
+                    expr: Expr::Aggregate(Agg::CountDistinct, Box::new(Expr::col("sku"))),
+                    alias: Some("variants".into()),
+                },
+            ],
+            group_by: vec![Expr::col("label")],
+            ..Select::from("line_item")
+        };
+        let (sql, params) = q.compile(Dialect::Sqlite).unwrap();
+        assert_eq!(
+            sql,
+            "SELECT label, count(DISTINCT sku) AS variants FROM line_item GROUP BY label"
+        );
+        assert!(params.is_empty());
+
+        // DISTINCT * is meaningless — `count_distinct(Star)` fails closed (the `*` Star guard is
+        // Count-only, so CountDistinct hits the "`*` is only valid as count(*)" refusal).
+        let bad = Select {
+            columns: vec![item(Expr::Aggregate(
+                Agg::CountDistinct,
+                Box::new(Expr::Star),
+            ))],
+            ..Select::from("line_item")
+        };
+        assert!(matches!(
+            bad.compile(Dialect::Sqlite),
+            Err(OrmError::BadExpr(_))
+        ));
+    }
+
+    #[test]
+    fn order_by_aggregate_expr_and_alias_compile() {
+        // ORDER BY an aggregate EXPRESSION (`count(*) DESC`) compiles directly.
+        let by_expr = Select {
+            columns: vec![
+                item(Expr::col("network_id")),
+                item(Expr::Aggregate(Agg::Count, Box::new(Expr::Star))),
+            ],
+            group_by: vec![Expr::col("network_id")],
+            order: vec![OrderBy {
+                expr: Expr::Aggregate(Agg::Count, Box::new(Expr::Star)),
+                dir: Direction::Desc,
+            }],
+            ..Select::from("order_to_network")
+        };
+        let (sql, params) = by_expr.compile(Dialect::Sqlite).unwrap();
+        assert_eq!(
+            sql,
+            "SELECT network_id, count(*) FROM order_to_network GROUP BY network_id ORDER BY count(*) DESC"
+        );
+        assert!(params.is_empty());
+
+        // ORDER BY the aggregate's ALIAS (`n DESC`) also compiles (the alias is an ordinary column
+        // ref in the order term).
+        let by_alias = Select {
+            columns: vec![
+                item(Expr::col("network_id")),
+                SelectItem {
+                    expr: Expr::Aggregate(Agg::Count, Box::new(Expr::Star)),
+                    alias: Some("n".into()),
+                },
+            ],
+            group_by: vec![Expr::col("network_id")],
+            order: vec![OrderBy {
+                expr: Expr::col("n"),
+                dir: Direction::Desc,
+            }],
+            ..Select::from("order_to_network")
+        };
+        let (sql, _) = by_alias.compile(Dialect::Sqlite).unwrap();
+        assert_eq!(
+            sql,
+            "SELECT network_id, count(*) AS n FROM order_to_network GROUP BY network_id ORDER BY n DESC"
+        );
+    }
+
+    #[test]
     fn join_with_alias_and_column_ref_condition() {
         let q = Select {
             columns: vec![item(Expr::Aggregate(Agg::Count, Box::new(Expr::Star)))],
