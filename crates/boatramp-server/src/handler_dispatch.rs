@@ -1954,6 +1954,17 @@ pub(super) async fn build_bindings(
         let multi_tenant = handler_tenancy.is_some()
             || site_handlers.tenancy.is_some()
             || !handler_caller_tenant.is_empty();
+        // UX (C4): a multi-tenant site that grants `wasi:blobstore` without declaring an allowlist
+        // will DENY every container op — surface it loudly at bind so operators find affected
+        // handlers, naming the one-line remedy.
+        if multi_tenant && blobstore_containers.is_empty() {
+            tracing::warn!(
+                project = %project.as_str(),
+                site,
+                "multi-tenant site grants wasi:blobstore but declares no blobstore_containers — \
+                 every container op will be denied; add blobstore_containers: [\"assets-{{tenant}}\"]"
+            );
+        }
         bindings = bindings.with_blobstore(
             scope,
             inner.storage.clone(),
