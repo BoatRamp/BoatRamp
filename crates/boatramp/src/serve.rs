@@ -855,6 +855,12 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
     if let Some(changelog) = changelog {
         spawn_cache_poller(changelog, kv.clone(), Some(daemon_runtime.clone()));
     }
+    // Periodic control-plane KV checkpoint + graceful-close budget (v0.9.0 KV-recovery, C1/C12).
+    // The cadence advances the durable frontier so the self-heal-on-open trailing-tail loss window
+    // stays bounded (default-ON, dirty-gated no-op when idle); the close budget bounds the graceful
+    // shutdown. Both come from `[serve.kv]` (+ env override) — see `resolve_kv_durability`.
+    let (kv_checkpoint_interval, kv_close_deadline) = resolve_kv_durability(serve_cfg.kv.as_ref());
+    spawn_kv_checkpoint(kv.clone(), kv_checkpoint_interval);
     let auth = boatramp_node::auth::configure_auth(
         serve_cfg.signer.as_ref(),
         args.auth_root_private_key
@@ -975,8 +981,9 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
     // cleanly CLOSE the control-plane store — not a bare `flush()` (which only pushed the WAL
     // buffer out, leaving a live store whose next crash could freeze a torn tail), but a real
     // `close()` that freezes memtables to L0 and advances the durable frontier, so the next cold
-    // open has an empty WAL replay range. Bounded by `CLOSE_DEADLINE` (fail-safe on timeout).
-    quiesce_and_close(kv_handle, reconcile, None).await;
+    // open has an empty WAL replay range. Bounded by the configurable `[serve.kv] close_deadline`
+    // (C12; default generous 20s) — distinct WARN + fail-safe on timeout.
+    quiesce_and_close(kv_handle, reconcile, None, kv_close_deadline).await;
     serve_result
 }
 
@@ -1169,11 +1176,6 @@ fn secondary_blob_args(fb: &boatramp_node::config::BlobFallbackConfig) -> BlobAr
 /// interval so a poller can't miss entries between polls).
 const CHANGELOG_RETENTION_SECS: u64 = 60;
 
-/// The graceful-shutdown budget for quiescing every KV writer and then `close()`ing the
-/// control-plane store (Part A). Kept under fly.io's 5s SIGTERM grace so a timed-out close still
-/// exits before a SIGKILL — a timed-out close is fail-safe (no worse than the old bare `flush()`).
-const CLOSE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(3);
-
 /// Quiesce the node's background KV writers, then cleanly `close()` the control-plane store —
 /// the Part-A graceful-shutdown tail, shared by the single-node (`run`) and cluster
 /// (`run_cluster`) paths.
@@ -1188,13 +1190,20 @@ const CLOSE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(3);
 ///   3. `close()` the store — freeze memtables to L0, advance the durable frontier, so a
 ///      subsequent cold open has an empty WAL replay range (no torn tail).
 ///
-/// The whole tail is wrapped in a [`CLOSE_DEADLINE`] timeout: a stalled close is abandoned and the
-/// process still exits within fly's grace. (The scheduler + its detached children are quiesced
-/// separately, inside `serve_with`, before this runs — see [`boatramp_server::SchedulerHandle`].)
+/// The whole tail is wrapped in a `close_deadline` timeout (v0.9.0 KV-recovery, C12: the configurable
+/// `[serve.kv] close_deadline`, default [`DEFAULT_KV_CLOSE_DEADLINE_SECS`]=20s — REPLACING the old
+/// hardcoded 3s, which self-exited BEFORE fly's SIGKILL grace and left the frontier UN-advanced =
+/// the exact torn tail this feature prevents). A stalled close is still abandoned (a genuinely-wedged
+/// close must not hang shutdown forever), but only after the generous budget, and the abandonment is
+/// logged DISTINCTLY (WARN naming the deadline) so a torn tail after a graceful stop is attributable
+/// to a slow close. With continuous checkpointing (C1/C2) the close is cheap, so the budget rarely
+/// bites. (The scheduler + its detached children are quiesced separately, inside `serve_with`, before
+/// this runs — see [`boatramp_server::SchedulerHandle`].)
 async fn quiesce_and_close(
     kv_handle: Arc<dyn KvStore>,
     reconcile: Vec<tokio::task::JoinHandle<()>>,
     raft_shutdown: Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>>,
+    close_deadline: std::time::Duration,
 ) {
     let tail = async move {
         // (1) Stop every reconcile loop: abort THEN await, so none writes after this point.
@@ -1210,18 +1219,90 @@ async fn quiesce_and_close(
         if let Err(e) = kv_handle.close().await {
             tracing::warn!(error = %e, "control-plane store close on shutdown failed");
         } else {
+            // The success breadcrumb (C12): a graceful stop that logs this line advanced the frontier,
+            // so a torn tail on the NEXT open cannot be blamed on this shutdown.
             tracing::info!("control-plane store closed cleanly on shutdown");
         }
     };
-    if tokio::time::timeout(CLOSE_DEADLINE, tail).await.is_err() {
-        // A timed-out close is fail-safe: it is no worse than the pre-v0.7.2 bare `flush()` (which
-        // did not advance the frontier either), and the process exits within fly's SIGTERM grace.
+    if tokio::time::timeout(close_deadline, tail).await.is_err() {
+        // The budget was hit: the close did NOT complete, so the durable frontier may be un-advanced
+        // and the next cold open may see (and self-heal) a torn tail. Distinct WARN so the operator
+        // can attribute a torn tail to a slow close and raise the budget + fly `kill_timeout`.
         tracing::warn!(
-            deadline_s = CLOSE_DEADLINE.as_secs(),
-            "graceful KV quiesce+close exceeded the deadline; abandoning it (fail-safe — no worse \
-             than a flush) and exiting"
+            close_deadline_s = close_deadline.as_secs(),
+            "graceful KV quiesce+close EXCEEDED the configured `[serve.kv] close_deadline` budget; \
+             abandoning the close so shutdown still proceeds — the durable frontier may be \
+             UN-ADVANCED, so the next cold open may self-heal a torn tail (lossless-for-acked by \
+             C1/C2). Raise `[serve.kv] close_deadline` and fly `kill_timeout` to cover the measured \
+             drain+close time."
         );
     }
+}
+
+/// Resolve the `[serve.kv]` durability knobs (v0.9.0 KV-recovery) — the periodic-checkpoint cadence
+/// (C1) and the graceful-close budget (C12) — from config, with an env override so a fly deploy can
+/// tune them without a config file: `BOATRAMP_KV_CHECKPOINT_INTERVAL` / `BOATRAMP_KV_CLOSE_DEADLINE`
+/// (both seconds). An unparsable env value is ignored (the config/default wins) with a WARN — never a
+/// silent mis-parse. Shared by `run` (single-node) and `run_cluster`.
+fn resolve_kv_durability(
+    kv_cfg: Option<&boatramp_node::config::KvConfig>,
+) -> (Option<std::time::Duration>, std::time::Duration) {
+    fn env_secs(var: &str) -> Option<u64> {
+        match std::env::var(var) {
+            Ok(raw) => match raw.trim().parse::<u64>() {
+                Ok(secs) => Some(secs),
+                Err(_) => {
+                    tracing::warn!(%var, value = %raw, "ignoring unparsable env override (want seconds)");
+                    None
+                }
+            },
+            Err(_) => None,
+        }
+    }
+    let cfg = kv_cfg.cloned().unwrap_or_default();
+    let checkpoint = match env_secs("BOATRAMP_KV_CHECKPOINT_INTERVAL") {
+        Some(0) => None, // env explicitly disables the cadence
+        Some(secs) => Some(std::time::Duration::from_secs(secs)),
+        None => cfg.checkpoint_interval(),
+    };
+    let close = match env_secs("BOATRAMP_KV_CLOSE_DEADLINE") {
+        Some(secs) if secs > 0 => std::time::Duration::from_secs(secs),
+        _ => cfg.close_deadline(),
+    };
+    (checkpoint, close)
+}
+
+/// Spawn the periodic control-plane KV checkpoint task (v0.9.0 KV-recovery, C1). Every `interval` it
+/// calls [`KvStore::checkpoint`](boatramp_core::kv::KvStore::checkpoint) — a dirty-gated WAL→L0
+/// MemTable freeze that advances the durable frontier — bounding the self-heal-on-open trailing-tail
+/// loss window to at most one interval for any write not already frontier-synced by a crown-jewel
+/// path. `None` ⇒ the cadence is disabled (`[serve.kv] checkpoint_interval = 0`); the crown-jewel
+/// per-write frontier-sync (C2) still runs, so an acked sealed secret is still lossless-for-acked.
+/// The task is detached (lives for the process); an idle checkpoint is a cheap no-op, and a failure
+/// is logged and retried on the next tick (never fatal to serving).
+fn spawn_kv_checkpoint(kv: Arc<dyn KvStore>, interval: Option<std::time::Duration>) {
+    let Some(interval) = interval else {
+        tracing::info!(
+            "control-plane KV periodic checkpoint DISABLED (`[serve.kv] checkpoint_interval = 0`); \
+             crown-jewel per-write frontier-sync still active"
+        );
+        return;
+    };
+    tracing::info!(
+        interval_s = interval.as_secs(),
+        "control-plane KV periodic checkpoint enabled (advances the durable frontier on a cadence)"
+    );
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        ticker.tick().await; // consume the immediate first tick (checkpoint on the cadence, not at boot)
+        loop {
+            ticker.tick().await;
+            if let Err(e) = kv.checkpoint().await {
+                tracing::warn!(error = %e, "periodic control-plane KV checkpoint failed; retrying next tick");
+            }
+        }
+    });
 }
 
 /// Drive the shared-mode cache-coherence poller: every
@@ -1845,6 +1926,14 @@ async fn run_cluster(
     // store is moved into the Raft stores below, so this clone is how we reach
     // its `flush` after serving stops.
     let durable_kv_handle = durable_kv.clone();
+    // Periodic checkpoint + graceful-close budget (v0.9.0 KV-recovery, C1/C12) for the node-local
+    // durable Raft store: the cadence bounds its WAL replay tail (openraft's own flushing keeps
+    // committed entries durable; this is defense-in-depth), and the close budget bounds the graceful
+    // shutdown. (C8: the cluster self-heal-on-open stays STRICT — that is wired at the open site, not
+    // here; the cadence/close budget are orthogonal loss-window bounds that always help.)
+    let (kv_checkpoint_interval, kv_close_deadline) =
+        resolve_kv_durability(config.serve.as_ref().and_then(|s| s.kv.as_ref()));
+    spawn_kv_checkpoint(durable_kv_handle.clone(), kv_checkpoint_interval);
 
     use boatramp_cluster::mesh::{self, MeshIdentity, MeshTls, TrustSet};
 
@@ -2304,7 +2393,13 @@ async fn run_cluster(
                 tracing::info!("cluster: raft shut down on graceful stop");
             }
         });
-    quiesce_and_close(durable_kv_handle, reconcile, Some(raft_shutdown)).await;
+    quiesce_and_close(
+        durable_kv_handle,
+        reconcile,
+        Some(raft_shutdown),
+        kv_close_deadline,
+    )
+    .await;
     serve_result
 }
 
@@ -3067,9 +3162,10 @@ mod tests {
     #[cfg(feature = "cluster")]
     use super::*;
 
-    /// **A3** — bounded close: a stalled `close()` is abandoned at [`CLOSE_DEADLINE`] so the
-    /// process still exits within fly's SIGTERM grace. A `KvStore` whose `close()` hangs forever
-    /// must not wedge `quiesce_and_close`; it returns within ~`CLOSE_DEADLINE`, not never.
+    /// **A3** — bounded close: a stalled `close()` is abandoned at the CONFIGURED `close_deadline`
+    /// (v0.9.0 KV-recovery, C12 — no longer the old hardcoded 3s) so the process still makes progress
+    /// on shutdown. A `KvStore` whose `close()` hangs forever must not wedge `quiesce_and_close`; it
+    /// returns within ~the configured budget, not never.
     ///
     /// Mutation guarded: dropping the `tokio::time::timeout` wrapper in `quiesce_and_close` makes
     /// this test hang past its own bound and the harness kills it — i.e. the gate goes red.
@@ -3101,18 +3197,19 @@ mod tests {
             }
         }
 
-        // With the virtual clock paused, `quiesce_and_close` should still resolve — the timeout
-        // fires at `CLOSE_DEADLINE`. `tokio::time::timeout` on the OUTER bound proves the tail
-        // itself did not hang: it must complete strictly before we would give up.
+        // With the virtual clock paused, `quiesce_and_close` should still resolve — the timeout fires
+        // at the CONFIGURED budget we pass in (here a short test budget). `tokio::time::timeout` on the
+        // OUTER bound proves the tail itself did not hang: it must complete strictly before we give up.
         let kv: Arc<dyn KvStore> = Arc::new(HangingKv);
+        let configured_budget = std::time::Duration::from_secs(7);
         let outcome = tokio::time::timeout(
-            super::CLOSE_DEADLINE + std::time::Duration::from_secs(2),
-            super::quiesce_and_close(kv, Vec::new(), None),
+            configured_budget + std::time::Duration::from_secs(2),
+            super::quiesce_and_close(kv, Vec::new(), None, configured_budget),
         )
         .await;
         assert!(
             outcome.is_ok(),
-            "A3: a stalled close must be abandoned at CLOSE_DEADLINE, not hang"
+            "A3: a stalled close must be abandoned at the CONFIGURED close_deadline, not hang"
         );
     }
 
@@ -3160,7 +3257,13 @@ mod tests {
                 raft_order.lock().unwrap().push("raft");
             });
 
-        super::quiesce_and_close(kv, Vec::new(), Some(raft_shutdown)).await;
+        super::quiesce_and_close(
+            kv,
+            Vec::new(),
+            Some(raft_shutdown),
+            std::time::Duration::from_secs(20),
+        )
+        .await;
 
         assert_eq!(
             *order.lock().unwrap(),

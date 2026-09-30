@@ -299,7 +299,12 @@ pub async fn read_state(kv: &dyn KvStore) -> Result<SchemaState, MigrateError> {
 
 async fn persist_state(kv: &dyn KvStore, state: &SchemaState) -> Result<(), MigrateError> {
     let bytes = serde_json::to_vec(state).map_err(|e| MigrateError::Serde(e.to_string()))?;
-    kv.put(SCHEMA_KEY, bytes).await?;
+    // Crown-jewel (v0.9.0 KV-recovery, C2): a migration step re-keys sealed secrets / authz / token
+    // records in place, then advances this SCHEMA_KEY cursor. Frontier-sync the cursor write so the
+    // whole just-completed step (its re-keyed crown-jewel data, already in the memtable) is past the
+    // durable replay boundary before the next step — a boot-time crash mid-migration can then be
+    // resumed from a durable cursor and the self-heal-on-open can never drop a re-keyed secret.
+    kv.put_durable_checkpointed(SCHEMA_KEY, bytes).await?;
     Ok(())
 }
 

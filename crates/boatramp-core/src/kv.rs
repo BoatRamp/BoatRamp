@@ -96,6 +96,56 @@ pub trait KvStore: Send + Sync {
         self.flush().await
     }
 
+    /// **Advance the durable frontier NOW** — freeze the in-memory memtable to L0 so every write
+    /// acked so far is past the durable replay boundary, WITHOUT closing the store. The default is
+    /// a **no-op**: an in-memory / write-through backend has no separate durable frontier, and a
+    /// consensus-replicated backend (the cluster `RaftKv`) durably commits every write to a quorum,
+    /// so neither has a WAL tail to advance. Only a buffered LSM backend (SlateDB) overrides this to
+    /// run `flush_with_options(FlushType::MemTable)`; wrappers ([`CachedKv`], [`CheckpointKv`])
+    /// forward it to their inner store.
+    ///
+    /// This is the primitive that makes the self-heal-on-open default lossless-for-acked (v0.9.0
+    /// KV-recovery, C1/C2): a **crown-jewel** control-plane write (sealed secret, RBAC grant/revoke,
+    /// domain-ownership record, project/site/function/database identity create) advances the
+    /// frontier synchronously via [`put_durable_checkpointed`](Self::put_durable_checkpointed) /
+    /// [`write_batch_checkpointed`](Self::write_batch_checkpointed) /
+    /// [`delete_checkpointed`](Self::delete_checkpointed) (or by being routed through a
+    /// [`CheckpointKv`]) BEFORE it acks, so the write survives even a hard crash whose torn WAL tail
+    /// the self-heal quarantines. A periodic cadence task also calls this to bound the loss window
+    /// for everything else. A durability-buffered backend SHOULD make it idempotent + cheap when
+    /// nothing has changed since the last checkpoint (dirty-gated), so an idle store never churns.
+    async fn checkpoint(&self) -> Result<(), KvError> {
+        Ok(())
+    }
+
+    /// A durable [`put`](Self::put) that ALSO advances the durable frontier before returning — the
+    /// **crown-jewel write** variant. Equivalent to `put(..).await?; checkpoint().await`, but named
+    /// so the frontier-sync is unmissable at the call site (and greppable for the Security review).
+    /// Control-plane crown-jewel writes (see [`checkpoint`](Self::checkpoint)) use this so an acked
+    /// write cannot be dropped by the self-heal-on-open trailing-tail quarantine. On a no-op-
+    /// checkpoint backend this is exactly a durable `put`, so it is always safe to prefer.
+    async fn put_durable_checkpointed(&self, key: &str, value: Vec<u8>) -> Result<(), KvError> {
+        self.put(key, value).await?;
+        self.checkpoint().await
+    }
+
+    /// A [`delete`](Self::delete) that ALSO advances the durable frontier before returning — the
+    /// crown-jewel variant (a crown-jewel DELETE, e.g. revoke/deprovision, must be durable so it
+    /// does not resurrect after a crash). See [`put_durable_checkpointed`](Self::put_durable_checkpointed).
+    async fn delete_checkpointed(&self, key: &str) -> Result<(), KvError> {
+        self.delete(key).await?;
+        self.checkpoint().await
+    }
+
+    /// A durable [`write_batch`](Self::write_batch) that ALSO advances the durable frontier before
+    /// returning — the crown-jewel grouped-write variant. The whole batch commits atomically, then
+    /// one checkpoint advances the frontier past it. See
+    /// [`put_durable_checkpointed`](Self::put_durable_checkpointed).
+    async fn write_batch_checkpointed(&self, ops: Vec<WriteOp>) -> Result<(), KvError> {
+        self.write_batch(ops).await?;
+        self.checkpoint().await
+    }
+
     /// Whether [`write_batch`](Self::write_batch) is **atomic** — all-or-nothing across the group, so
     /// a crash can never leave a partially-applied batch. The default is `false`: the default
     /// `write_batch` applies each op sequentially (each atomic per KEY, but not across the group), so
@@ -441,6 +491,14 @@ impl KvStore for CachedKv {
         self.inner.close().await
     }
 
+    async fn checkpoint(&self) -> Result<(), KvError> {
+        // Forward to the backing store: the LRU holds only reads, so the durable frontier is
+        // entirely the inner store's concern. Without this forward, a crown-jewel write's
+        // frontier-sync (and the periodic cadence) would stop at the cache and never freeze the
+        // SlateDB memtable — silently defeating the self-heal-lossless-for-acked invariant.
+        self.inner.checkpoint().await
+    }
+
     async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, KvError> {
         {
             let mut cache = self.cache.lock().unwrap();
@@ -533,6 +591,121 @@ impl KvStore for CachedKv {
         for key in keys {
             cache.pop(key);
         }
+    }
+}
+
+/// A [`KvStore`] wrapper that advances the durable frontier after EVERY successful write — the
+/// **can't-miss** frontier-sync for the pure-crown-jewel stores whose writes are ALL irreplaceable
+/// (sealed secrets, sealed DB/SMTP credentials, TLS private keys). A dropped write in one of these
+/// stores is a lost secret with no client-side copy, so rather than rely on per-call-site
+/// discipline (which could miss a site) we wrap the store ONCE at construction: every `put` /
+/// `delete` / `write_batch` and every successful `compare_and_swap` is immediately followed by a
+/// [`checkpoint`](KvStore::checkpoint), so an acked write is past the durable replay boundary
+/// before the caller sees success — and cannot be dropped by the self-heal-on-open trailing-tail
+/// quarantine (v0.9.0 KV-recovery, C2). Reads and every store advertisement forward transparently.
+///
+/// Used ONLY for the pure-crown-jewel stores (`SecretStore`, `TenantSecretStore`,
+/// `EmailProfileStore`, `ManagedSqlCredentials`, `KvCertStore`). The mixed control-plane
+/// `DeployStore` does NOT use this — it selects the frontier-sync PER METHOD (crown-jewel writes
+/// call the `*_checkpointed` variants; derived/recomputable writes such as `current/*` pointers,
+/// activation history, invocation records and metering stay async), because checkpointing its
+/// high-frequency derived writes would churn the manifest. On a no-op-checkpoint backend
+/// (`MemoryKv`, `CloudflareKv`, `RaftKv`) the added `checkpoint()` is free, so this wrapper is inert
+/// there — the cluster's crown-jewel durability comes from Raft consensus, not a memtable freeze.
+pub struct CheckpointKv {
+    inner: Arc<dyn KvStore>,
+}
+
+impl CheckpointKv {
+    /// Wrap `inner` so every successful write advances the durable frontier before returning.
+    pub fn new(inner: Arc<dyn KvStore>) -> Self {
+        Self { inner }
+    }
+}
+
+#[async_trait]
+impl KvStore for CheckpointKv {
+    async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, KvError> {
+        self.inner.get(key).await
+    }
+
+    async fn put(&self, key: &str, value: Vec<u8>) -> Result<(), KvError> {
+        self.inner.put(key, value).await?;
+        self.inner.checkpoint().await
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), KvError> {
+        self.inner.delete(key).await?;
+        self.inner.checkpoint().await
+    }
+
+    async fn list_prefix(&self, prefix: &str) -> Result<Vec<String>, KvError> {
+        self.inner.list_prefix(prefix).await
+    }
+
+    async fn list_from(
+        &self,
+        prefix: &str,
+        after: &str,
+        limit: usize,
+    ) -> Result<Vec<String>, KvError> {
+        self.inner.list_from(prefix, after, limit).await
+    }
+
+    async fn flush(&self) -> Result<(), KvError> {
+        self.inner.flush().await
+    }
+
+    async fn close(&self) -> Result<(), KvError> {
+        self.inner.close().await
+    }
+
+    async fn checkpoint(&self) -> Result<(), KvError> {
+        self.inner.checkpoint().await
+    }
+
+    fn atomic_write_batch(&self) -> bool {
+        self.inner.atomic_write_batch()
+    }
+
+    fn supports_cas(&self) -> bool {
+        self.inner.supports_cas()
+    }
+
+    async fn compare_and_swap(
+        &self,
+        key: &str,
+        expected: Option<&[u8]>,
+        new: Vec<u8>,
+    ) -> Result<bool, KvError> {
+        let swapped = self.inner.compare_and_swap(key, expected, new).await?;
+        // Only advance the frontier when the swap actually wrote (a lost CAS mutated nothing).
+        if swapped {
+            self.inner.checkpoint().await?;
+        }
+        Ok(swapped)
+    }
+
+    async fn write_batch(&self, ops: Vec<WriteOp>) -> Result<(), KvError> {
+        self.inner.write_batch(ops).await?;
+        self.inner.checkpoint().await
+    }
+
+    async fn write_batch_relaxed(&self, ops: Vec<WriteOp>) -> Result<(), KvError> {
+        // A crown-jewel store must never relax durability: commit DURABLY and checkpoint. (No
+        // crown-jewel store calls the relaxed path today; this fail-safe keeps that true if one
+        // ever did — the bus publish fast-path is the only sanctioned relaxed caller, and it never
+        // runs through a `CheckpointKv`.)
+        self.inner.write_batch(ops).await?;
+        self.inner.checkpoint().await
+    }
+
+    fn invalidate_cache(&self) {
+        self.inner.invalidate_cache();
+    }
+
+    fn invalidate_keys(&self, keys: &[String]) {
+        self.inner.invalidate_keys(keys);
     }
 }
 
@@ -758,6 +931,102 @@ mod tests {
     async fn cachedkv_cas_race_has_exactly_one_winner() {
         cas_race_has_exactly_one_winner(Arc::new(CachedKv::new(Arc::new(MemoryKv::new()), 16)))
             .await;
+    }
+
+    /// A test store that forwards to a `MemoryKv` and COUNTS `checkpoint()` calls — the probe for
+    /// the [`CheckpointKv`] crown-jewel guarantee.
+    #[derive(Default)]
+    struct CountingCheckpoint {
+        inner: MemoryKv,
+        checkpoints: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl KvStore for CountingCheckpoint {
+        async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, KvError> {
+            self.inner.get(key).await
+        }
+        async fn put(&self, key: &str, value: Vec<u8>) -> Result<(), KvError> {
+            self.inner.put(key, value).await
+        }
+        async fn delete(&self, key: &str) -> Result<(), KvError> {
+            self.inner.delete(key).await
+        }
+        async fn list_prefix(&self, prefix: &str) -> Result<Vec<String>, KvError> {
+            self.inner.list_prefix(prefix).await
+        }
+        async fn compare_and_swap(
+            &self,
+            key: &str,
+            expected: Option<&[u8]>,
+            new: Vec<u8>,
+        ) -> Result<bool, KvError> {
+            self.inner.compare_and_swap(key, expected, new).await
+        }
+        async fn write_batch(&self, ops: Vec<WriteOp>) -> Result<(), KvError> {
+            self.inner.write_batch(ops).await
+        }
+        fn supports_cas(&self) -> bool {
+            true
+        }
+        async fn checkpoint(&self) -> Result<(), KvError> {
+            self.checkpoints
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// GATE (C2) — every successful write through a [`CheckpointKv`] advances the frontier exactly
+    /// once, and a LOST compare-and-swap does NOT (it mutated nothing, so there is nothing to
+    /// checkpoint). This is the can't-miss frontier-sync the sealed-secret stores rely on.
+    #[tokio::test]
+    async fn checkpoint_kv_syncs_the_frontier_on_every_write() {
+        let checkpoints = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let inner = Arc::new(CountingCheckpoint {
+            inner: MemoryKv::new(),
+            checkpoints: checkpoints.clone(),
+        });
+        let kv = CheckpointKv::new(inner);
+        let count = || checkpoints.load(std::sync::atomic::Ordering::SeqCst);
+
+        kv.put("secret/acme/idp", b"sealed".to_vec()).await.unwrap();
+        assert_eq!(count(), 1, "a put checkpoints once");
+        kv.write_batch(vec![WriteOp::Put(
+            "secret/acme/db".into(),
+            b"sealed2".to_vec(),
+        )])
+        .await
+        .unwrap();
+        assert_eq!(count(), 2, "a write_batch checkpoints once");
+        kv.delete("secret/acme/idp").await.unwrap();
+        assert_eq!(count(), 3, "a delete checkpoints once");
+        // A WINNING CAS checkpoints; a LOSING CAS does not (it wrote nothing).
+        assert!(
+            kv.compare_and_swap("cas/k", None, b"v1".to_vec())
+                .await
+                .unwrap()
+        );
+        assert_eq!(count(), 4, "a winning CAS checkpoints");
+        assert!(
+            !kv.compare_and_swap("cas/k", None, b"v2".to_vec())
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            count(),
+            4,
+            "a lost CAS must NOT checkpoint (nothing was written)"
+        );
+        // Reads never checkpoint.
+        let _ = kv.get("secret/acme/db").await.unwrap();
+        assert_eq!(count(), 4, "a read never checkpoints");
+    }
+
+    /// The wrapper is otherwise semantically identical to its backing store on every op.
+    #[tokio::test]
+    async fn checkpoint_kv_satisfies_the_conformance_suite() {
+        let kv = CheckpointKv::new(Arc::new(MemoryKv::new()));
+        kv_conformance(&kv).await;
     }
 
     #[tokio::test]

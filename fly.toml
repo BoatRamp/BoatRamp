@@ -18,9 +18,22 @@
 app = "boatramp"
 primary_region = "ams"
 
+# Graceful-stop budget (v0.9.0 KV-recovery, C12). A `fly deploy` roll sends SIGINT, waits
+# `kill_timeout`, then SIGKILLs. boatramp drains + `close()`s the control-plane SlateDB store on
+# SIGINT (freeze memtables → L0, advance the durable frontier) so the next boot has no torn WAL tail;
+# that close must fit inside this window or a SIGKILL mid-close leaves a torn tail (the recurring
+# incident). fly's default is 5s. Raise it to ≥ the measured drain+close time. With continuous
+# checkpointing (`[serve.kv] checkpoint_interval`, default 10s) the close is cheap, so this rarely
+# bites — but the headroom is the belt to the checkpoint's suspenders. The in-process close budget
+# is `[serve.kv] close_deadline` (default 20s); keep `kill_timeout` ≥ it so fly does not SIGKILL first.
+kill_timeout = 30
+
 [env]
 BOATRAMP_ADDR = "0.0.0.0:8080"
 BOATRAMP_DATA_DIR = "/data"
+# Bound the graceful drain+close (seconds). Default is 20s (`[serve.kv] close_deadline`); kept below
+# `kill_timeout` above so the store closes cleanly before fly's SIGKILL. See C12.
+BOATRAMP_KV_CLOSE_DEADLINE = "25"
 # Fallback for a Host matching no registered domain; the real domains
 # (docs.boatramp.dev / boatramp.dev) route to their sites explicitly.
 BOATRAMP_DEFAULT_SITE = "www"

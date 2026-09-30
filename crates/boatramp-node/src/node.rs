@@ -186,6 +186,15 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
     // the same store the reconcile writes.
     let compute_storage = storage.clone();
     let deploy = DeployStore::new(storage, kv.clone());
+    // **Crown-jewel frontier-sync (v0.9.0 KV-recovery, C2).** The sealed-secret / sealed-credential
+    // stores below hold IRREPLACEABLE data (a dropped write = a lost secret with no client copy), so
+    // rather than rely on per-call-site discipline we route them ALL through a `CheckpointKv`: every
+    // write advances the durable frontier before it acks, so a crash's self-heal-on-open trailing-
+    // tail quarantine can never drop one. Wrapping ONCE here is the can't-miss guarantee. (On the
+    // cluster `RaftKv` / `MemoryKv` the added checkpoint is a no-op, so this is inert there.) The
+    // mixed `DeployStore` above keeps the RAW `kv` and selects the frontier-sync per method instead
+    // (its `current/*` pointers, history, invocation records and metering stay async).
+    let secrets_kv: Arc<dyn KvStore> = Arc::new(boatramp_core::kv::CheckpointKv::new(kv.clone()));
     // The `[secrets]` envelope (local KEK / Vault) that seals a managed SQL
     // credential at rest. `None` ⇒ no wrapping (a managed DB then fails closed).
     let secrets_envelope = build_secrets_envelope(config.secrets.as_ref(), data_dir)?;
@@ -197,7 +206,7 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
     // endpoints then fail closed with a clear 501, never a panic.
     let secret_store = secrets_envelope.clone().map(|envelope| {
         Arc::new(boatramp_core::secret_store::SecretStore::new(
-            kv.clone(),
+            secrets_kv.clone(),
             envelope,
         ))
     });
@@ -208,7 +217,7 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
     // closed with a clear 501 and the guest binding is not built.
     let tenant_secret_store = secrets_envelope.clone().map(|envelope| {
         Arc::new(boatramp_core::secret_store::TenantSecretStore::new(
-            kv.clone(),
+            secrets_kv.clone(),
             envelope,
         ))
     });
@@ -220,7 +229,7 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
     // the admin email endpoints fail closed with a clear 501.
     let email_profile_store = secrets_envelope.clone().map(|envelope| {
         Arc::new(boatramp_core::email_config::EmailProfileStore::new(
-            kv.clone(),
+            secrets_kv.clone(),
             envelope,
         ))
     });
@@ -476,7 +485,11 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
         secrets_envelope,
     ) {
         (Some(sql), Some(envelope)) if !sql.databases.is_empty() => {
-            let creds = crate::managed_sql::ManagedSqlCredentials::new(kv.clone(), envelope);
+            // Crown-jewel (C2): sealed managed-DB credentials go through the frontier-syncing
+            // `secrets_kv`, so a freshly-minted DB credential is past the durable frontier before
+            // the workload sees it — never droppable by the self-heal-on-open trailing-tail quarantine.
+            let creds =
+                crate::managed_sql::ManagedSqlCredentials::new(secrets_kv.clone(), envelope);
             let privilege = config
                 .compute
                 .as_ref()

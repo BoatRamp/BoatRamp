@@ -23,10 +23,12 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use boatramp_core::kv::{KvError, KvStore, WriteOp};
+use slatedb::config::{FlushOptions, FlushType};
 use slatedb::object_store::ObjectStore;
 use slatedb::object_store::local::LocalFileSystem;
 use slatedb::{Db, DbReader, DbReaderBuilder, Settings, WriteBatch};
@@ -48,6 +50,13 @@ pub struct SlateKv {
     /// the get→compare→write makes the CAS linearizable within the writer — the property the
     /// async-lane shard claim needs. Cheap (contended only by the drain's claims, off the hot path).
     cas_lock: Arc<tokio::sync::Mutex<()>>,
+    /// **Checkpoint dirty flag** (v0.9.0 KV-recovery, C1): set by every write, cleared by
+    /// [`checkpoint`](KvStore::checkpoint). The periodic cadence task's `checkpoint()` skips the
+    /// memtable-freeze (and the manifest PUT it entails) when this is `false`, so an IDLE store does
+    /// not churn a new empty L0 SST on every tick. A crown-jewel write sets it, then its own
+    /// `checkpoint()` observes it and freezes — so the frontier advances past the write before it
+    /// acks. Shared across clones (all clones front the same `Db`).
+    dirty: Arc<AtomicBool>,
 }
 
 #[derive(Clone)]
@@ -351,6 +360,7 @@ impl SlateKv {
         Ok(Self {
             backend: Backend::Writer(Arc::new(db)),
             cas_lock: Arc::new(tokio::sync::Mutex::new(())),
+            dirty: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -367,6 +377,7 @@ impl SlateKv {
         Ok(Self {
             backend: Backend::Reader(Arc::new(reader)),
             cas_lock: Arc::new(tokio::sync::Mutex::new(())),
+            dirty: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -432,6 +443,13 @@ impl SlateKv {
             )),
         }
     }
+
+    /// Record that a write happened since the last checkpoint, so the next
+    /// [`checkpoint`](KvStore::checkpoint) actually freezes the memtable (and an idle store's
+    /// cadence checkpoint stays a cheap no-op). Called by every write path.
+    fn mark_dirty(&self) {
+        self.dirty.store(true, Ordering::Release);
+    }
 }
 
 #[async_trait]
@@ -462,6 +480,40 @@ impl KvStore for SlateKv {
         SlateKv::close(self).await
     }
 
+    async fn checkpoint(&self) -> Result<(), KvError> {
+        // Advance the durable frontier WITHOUT closing: freeze the active memtable → L0 so every
+        // acked write so far is past `replay_after_wal_id` (verified in slatedb 0.16 `db.rs:1816`
+        // `flush_with_options` + `config.rs:474` `FlushType::MemTable`: it "freezes the active
+        // memtable and writes all immutable memtable entries to the object store", advancing the
+        // frontier exactly as `close()` does, minus the shutdown). This is the C1/C2 primitive that
+        // makes the self-heal-on-open default lossless-for-acked.
+        //
+        // DIRTY-GATED (C1): skip the freeze — and the manifest PUT + empty L0 SST it would emit —
+        // when nothing has been written since the last checkpoint, so an idle store's periodic
+        // cadence tick is free. `swap(false)` claims the dirty state atomically; on a flush error we
+        // RE-ARM the flag so the next checkpoint retries (never silently drop a pending freeze). A
+        // crown-jewel write set the flag just before calling this, so the freeze here captures it.
+        match &self.backend {
+            Backend::Writer(db) => {
+                // Claim the dirty state atomically; only then freeze. On a flush error, RE-ARM the
+                // flag so the next checkpoint retries (never silently drop a pending freeze).
+                if self.dirty.swap(false, Ordering::AcqRel)
+                    && let Err(err) = db
+                        .flush_with_options(FlushOptions {
+                            flush_type: FlushType::MemTable,
+                        })
+                        .await
+                {
+                    self.dirty.store(true, Ordering::Release);
+                    return Err(backend(err));
+                }
+                Ok(())
+            }
+            // A read replica has no memtable/frontier of its own (it polls the writer's manifest).
+            Backend::Reader(_) => Ok(()),
+        }
+    }
+
     async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, KvError> {
         let value = match &self.backend {
             Backend::Writer(db) => db.get(key.as_bytes()).await.map_err(backend)?,
@@ -483,6 +535,7 @@ impl KvStore for SlateKv {
             .await_durable()
             .await
             .map_err(backend)?;
+        self.mark_dirty();
         Ok(())
     }
 
@@ -494,6 +547,7 @@ impl KvStore for SlateKv {
             .await_durable()
             .await
             .map_err(backend)?;
+        self.mark_dirty();
         Ok(())
     }
 
@@ -587,6 +641,7 @@ impl KvStore for SlateKv {
             .await_durable()
             .await
             .map_err(backend)?;
+        self.mark_dirty();
         Ok(true)
     }
 
@@ -607,6 +662,7 @@ impl KvStore for SlateKv {
             .await_durable()
             .await
             .map_err(backend)?;
+        self.mark_dirty();
         Ok(())
     }
 
@@ -632,6 +688,10 @@ impl KvStore for SlateKv {
         // 0.13's `WriteOptions { await_durable: false }`). The entries flush on the store's
         // `flush_interval` or when a later durable `write_batch` forces the WAL buffer out.
         self.writer()?.write(batch).await.map_err(backend)?;
+        // Mark dirty so the periodic cadence checkpoint (or a later durable write's checkpoint)
+        // freezes these buffered entries to L0 too — bounding the relaxed path's loss window as a
+        // side benefit. The ack timing the bus wants is unchanged (this does NOT force a flush now).
+        self.mark_dirty();
         Ok(())
     }
 }
@@ -852,6 +912,65 @@ mod tests {
             .unwrap();
         assert_eq!(reopened.get("k").await.unwrap(), Some(b"v".to_vec()));
         reopened.close().await.unwrap();
+    }
+
+    /// **C1 GATE** — a mid-life `checkpoint()` (a MemTable freeze, NO close) advances the durable
+    /// frontier (`replay_after_wal_id`) past the prior acked writes: the write moves from the WAL
+    /// into L0, so a subsequent crash's WAL replay range no longer holds it. This is the primitive
+    /// the crown-jewel per-write frontier-sync and the periodic cadence are built on. Runs over a
+    /// shared `InMemory` store (deterministic, non-stalling — no close/reopen), reading the frontier
+    /// via the read-only `Admin` path `repair_wal_tail` uses.
+    ///
+    /// Mutation this guards: make `checkpoint()` a no-op (drop the `flush_with_options(MemTable)`).
+    /// Then the frontier never advances on a checkpoint and this `f1 > f0` assertion fails RED —
+    /// which is exactly why the self-heal-on-open default would then be able to drop an acked write.
+    #[serial_test::serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn checkpoint_advances_the_durable_frontier_without_close() {
+        use slatedb::object_store::memory::InMemory;
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let kv = SlateKv::open_with(
+            store.clone(),
+            "kv",
+            test_settings(Some(Duration::from_millis(5))),
+        )
+        .await
+        .unwrap();
+        // A durable crown-jewel-shaped write (sealed secret). Durable ≠ frontier-advanced: it lives
+        // in the WAL until a memtable freeze.
+        kv.put("secret/acme/idp", b"sealed".to_vec()).await.unwrap();
+        let f0 = crate::wal_repair::repair_wal_tail(&store, "kv", RepairMode::DryRun)
+            .await
+            .unwrap()
+            .frontier;
+
+        // Checkpoint: freeze the memtable → L0, advancing the frontier — WITHOUT closing the store.
+        kv.checkpoint().await.unwrap();
+        let f1 = crate::wal_repair::repair_wal_tail(&store, "kv", RepairMode::DryRun)
+            .await
+            .unwrap()
+            .frontier;
+        assert!(
+            f1 > f0,
+            "checkpoint() must advance the durable frontier (was {f0}, now {f1}) — the crown-jewel \
+             frontier-sync invariant"
+        );
+        // The write is still readable, and a SECOND checkpoint on the now-idle store is a cheap
+        // dirty-gated no-op (the frontier does not move again).
+        assert_eq!(
+            kv.get("secret/acme/idp").await.unwrap(),
+            Some(b"sealed".to_vec())
+        );
+        kv.checkpoint().await.unwrap();
+        let f2 = crate::wal_repair::repair_wal_tail(&store, "kv", RepairMode::DryRun)
+            .await
+            .unwrap()
+            .frontier;
+        assert_eq!(
+            f2, f1,
+            "an idle checkpoint is a dirty-gated no-op (frontier unchanged)"
+        );
+        kv.close().await.unwrap();
     }
 
     #[serial_test::serial]

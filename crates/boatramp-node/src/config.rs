@@ -2111,6 +2111,11 @@ pub struct ServeConfig {
     /// `boatramp:`/`env:` ref — a configured ref with no envelope is a **startup error** (fail-closed, no
     /// silent env fallback). See [`S3CredentialConfig`].
     pub s3_credential: Option<S3CredentialConfig>,
+    /// `[serve.kv]` — control-plane SlateDB KV durability cadence + shutdown budget (v0.9.0
+    /// KV-recovery). Absent ⇒ the defaults (periodic checkpoint ON at
+    /// [`DEFAULT_KV_CHECKPOINT_INTERVAL_SECS`], close budget [`DEFAULT_KV_CLOSE_DEADLINE_SECS`]).
+    /// See [`KvConfig`].
+    pub kv: Option<KvConfig>,
 }
 
 /// `[serve.s3_credential]` — a **node-level base S3 credential source** (#505) sourcing the base AWS
@@ -2196,6 +2201,59 @@ pub struct BlobFallbackConfig {
 /// `secondary_timeout_secs` is unset: 5s — long enough for a cloud round-trip, short enough that a
 /// wedged secondary degrades a primary miss to `NotFound` promptly rather than hanging serving.
 pub const DEFAULT_BLOB_FALLBACK_TIMEOUT_SECS: u64 = 5;
+
+/// Default control-plane KV **periodic checkpoint** cadence (seconds) when `[serve.kv]
+/// checkpoint_interval` is unset (v0.9.0 KV-recovery, C1). The cadence advances the durable frontier
+/// (WAL→L0 MemTable freeze) so the self-heal-on-open trailing-tail loss window is bounded to at most
+/// this interval for anything NOT already frontier-synced by a crown-jewel write. 10s balances a tiny
+/// loss window against manifest-PUT churn; an idle store's checkpoint is a dirty-gated no-op regardless.
+pub const DEFAULT_KV_CHECKPOINT_INTERVAL_SECS: u64 = 10;
+
+/// Default **graceful-close budget** (seconds) when `[serve.kv] close_deadline` is unset (v0.9.0
+/// KV-recovery, C12). The shutdown drain+close is abandoned only after this budget — GENEROUS (not the
+/// old hardcoded 3s, which self-exited BEFORE fly's SIGKILL grace and left the frontier un-advanced =
+/// the exact torn tail we prevent). With continuous checkpointing (C1/C2) the close is cheap, so this
+/// budget rarely bites; operators should still raise fly `kill_timeout` to ≥ their measured drain+close.
+pub const DEFAULT_KV_CLOSE_DEADLINE_SECS: u64 = 20;
+
+/// `[serve.kv]` — control-plane SlateDB KV durability knobs (v0.9.0 KV-recovery). Both are
+/// backstops/tuning: the crown-jewel per-write frontier-sync (C2) is unconditional and independent of
+/// these. Absent block ⇒ both defaults apply (checkpoint cadence ON, generous close budget).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct KvConfig {
+    /// Periodic checkpoint cadence, seconds. Unset ⇒ [`DEFAULT_KV_CHECKPOINT_INTERVAL_SECS`] (ON).
+    /// `0` DISABLES the cadence (the crown-jewel per-write frontier-sync still runs; only the
+    /// backstop that bounds the loss window for derived/relaxed writes is off).
+    pub checkpoint_interval: Option<u64>,
+    /// Graceful drain+close budget, seconds. Unset ⇒ [`DEFAULT_KV_CLOSE_DEADLINE_SECS`]. `0` is
+    /// rejected up to the default (a zero budget would abandon every close, guaranteeing a torn tail).
+    pub close_deadline: Option<u64>,
+}
+
+impl KvConfig {
+    /// The resolved periodic-checkpoint interval: `None` ⇒ cadence DISABLED (explicit `0`); else the
+    /// configured seconds, or [`DEFAULT_KV_CHECKPOINT_INTERVAL_SECS`] when unset.
+    pub fn checkpoint_interval(&self) -> Option<std::time::Duration> {
+        match self.checkpoint_interval {
+            Some(0) => None,
+            Some(secs) => Some(std::time::Duration::from_secs(secs)),
+            None => Some(std::time::Duration::from_secs(
+                DEFAULT_KV_CHECKPOINT_INTERVAL_SECS,
+            )),
+        }
+    }
+
+    /// The resolved graceful-close budget. A configured `0` (or unset) falls back to
+    /// [`DEFAULT_KV_CLOSE_DEADLINE_SECS`] — the budget must be positive so a genuinely-wedged close
+    /// still cannot hang shutdown forever, while never being the too-tight 3s that caused the incident.
+    pub fn close_deadline(&self) -> std::time::Duration {
+        match self.close_deadline {
+            Some(secs) if secs > 0 => std::time::Duration::from_secs(secs),
+            _ => std::time::Duration::from_secs(DEFAULT_KV_CLOSE_DEADLINE_SECS),
+        }
+    }
+}
 
 /// `[serve.s3_ingress_cloud]` — the cloud-brokering knobs for the M4 blob-upload minter (which native
 /// credential the mint brokers when the node's blob backend is a cloud object store). Only the fields
@@ -3672,6 +3730,52 @@ mod tests {
             err.is_err(),
             "unknown [serve.blob_fallback] field must be rejected"
         );
+    }
+
+    #[test]
+    fn serve_kv_config_parses_and_defaults() {
+        // Absent `[serve.kv]` ⇒ the defaults: periodic checkpoint ON at the default cadence, and the
+        // generous default close budget (NOT the old 3s).
+        let cfg = server(r#"( serve: ( addr: "0.0.0.0:8080" ) )"#);
+        assert!(cfg.serve.unwrap().kv.is_none());
+        let default_kv = super::KvConfig::default();
+        assert_eq!(
+            default_kv.checkpoint_interval(),
+            Some(std::time::Duration::from_secs(
+                super::DEFAULT_KV_CHECKPOINT_INTERVAL_SECS
+            )),
+            "an absent/unset checkpoint_interval defaults to the ON cadence"
+        );
+        assert_eq!(
+            default_kv.close_deadline(),
+            std::time::Duration::from_secs(super::DEFAULT_KV_CLOSE_DEADLINE_SECS),
+            "an absent/unset close_deadline defaults to the generous budget"
+        );
+
+        // An explicit block: a tuned cadence + a tuned close budget.
+        let cfg = server(r#"( serve: ( kv: ( checkpoint_interval: 5, close_deadline: 30 ) ) )"#);
+        let kv = cfg.serve.unwrap().kv.unwrap();
+        assert_eq!(
+            kv.checkpoint_interval(),
+            Some(std::time::Duration::from_secs(5))
+        );
+        assert_eq!(kv.close_deadline(), std::time::Duration::from_secs(30));
+
+        // checkpoint_interval = 0 DISABLES the cadence; a 0 close_deadline falls back to the default
+        // (a zero close budget would abandon every close, guaranteeing a torn tail — never allowed).
+        let cfg = server(r#"( serve: ( kv: ( checkpoint_interval: 0, close_deadline: 0 ) ) )"#);
+        let kv = cfg.serve.unwrap().kv.unwrap();
+        assert_eq!(kv.checkpoint_interval(), None, "0 disables the cadence");
+        assert_eq!(
+            kv.close_deadline(),
+            std::time::Duration::from_secs(super::DEFAULT_KV_CLOSE_DEADLINE_SECS),
+            "a 0 close_deadline is clamped up to the default, never zero"
+        );
+
+        // An unknown field is rejected (`deny_unknown_fields`).
+        let err: Result<ServerConfig, _> =
+            ron_options().from_str(r#"( serve: ( kv: ( checkpoint_interval: 5, bogus: 1 ) ) )"#);
+        assert!(err.is_err(), "unknown [serve.kv] field must be rejected");
     }
 
     // =======================================================================
