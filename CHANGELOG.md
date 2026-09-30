@@ -5,6 +5,76 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.9.0] - 2026-09-30
+
+**Control-plane KV recovery: an ordinary restart no longer leaves the server unbootable.** A torn/partial
+trailing WAL tail — the expected on-disk state after any non-graceful stop — used to `exit(1)` on cold
+open → crash-loop → total outage, recoverable only by a manual flag or a snapshot restore. v0.9.0 makes
+the common case self-heal and the rare case a reachable one-command recovery, **without ever silently
+dropping acked crown-jewel state** (sealed secrets, RBAC, domain proofs, tenancy posture).
+
+### Changed (BEHAVIOR — durability default flipped)
+
+- **Self-heal a safe torn WAL tail on open, by default.** On a cold open that fails with a torn-tail
+  signature, boatramp now runs a dry-run whole-store scan; a **sole safe trailing torn WAL tail strictly
+  beyond the durable frontier** is quarantined (copied aside, never deleted) and the store opens, with a
+  logged, bounded loss window. An **unsafe shape** — a torn compacted/L0 SST, a mid-range gap, a WAL-id
+  hole, or an unreadable manifest — still **fails loud and mutates nothing** (those can hold durable
+  data). `--strict-kv` / `BOATRAMP_KV_STRICT=1` restores the previous always-fail-loud behavior. The
+  active mode is logged every boot; a stale `--repair-wal` / `BOATRAMP_KV_REPAIR=1` is now a no-op.
+- **Crown-jewel writes advance the durable frontier before they ack.** Sealed-secret / SMTP / DB-cred
+  set+rotate, RBAC & root-anchor & token-revocation, domain-ownership proofs, per-host `sitecontexts`
+  bindings, tenancy posture, daemon-config, and project/site/function/database identity writes now freeze
+  to L0 (`checkpoint()`) before returning success — so a self-heal can never drop an *acked* crown-jewel
+  record. Derived/recomputable state (`current/*` pointers, content-addressed manifests, async-lane
+  records, metering, …) stays frontier-async by design.
+- **The graceful-close budget is configurable and the hardcoded 3 s abort is gone.** `quiesce_and_close`
+  was capped at a hardcoded 3 s — *below* fly's grace and *below* a real store's compactor/GC drain — so
+  a graceful roll could be abandoned mid-close, leaving the frontier un-advanced (the torn-tail state).
+  It is now `[serve.kv] close_deadline` (env `BOATRAMP_KV_CLOSE_DEADLINE`, default **20 s**, `0` clamps up
+  to the default); a budget-hit is a distinct WARN. Raise fly `kill_timeout` to cover it (see `fly.toml`).
+- **Cluster/Raft nodes default strict and refuse to self-quarantine their log tail** — a cluster recovers
+  by failing loud then rejoining peers, never by dropping a local Raft-log tail (which could regress below
+  the committed index). Self-heal-on-open is single-node only.
+
+### Added
+
+- **`[serve.kv] checkpoint_interval`** (env `BOATRAMP_KV_CHECKPOINT_INTERVAL`, default-ON 10 s,
+  dirty-gated) — a periodic WAL→L0 checkpoint so the trailing tail (and any self-heal loss window) stays
+  tiny; `0` disables. Also runs on graceful shutdown.
+- **`boatramp kv checkpoint`** — flush to a consistent on-disk state (a KV-consistent snapshot can then be
+  taken from it). **`boatramp kv recover [--apply] [--adopt-volume <path>]`** — a daemon-independent
+  superset of `kv repair`: dry-run diagnoses; `--apply` repairs a safe tail in place, else adopts an
+  operator-attached volume after validating it opens clean + zero-torn and printing the discard-delta,
+  retaining the crashed copy until the recovered store verifies. **`boatramp kv status [--ack]`** — reads
+  the persistent degraded breadcrumb (see below).
+- **Recovery-mode listener** — a fatal/unrecoverable KV open no longer `exit(1)`s into a crash-loop; the
+  node binds the port and serves **503** for sites (never 000) plus an unauthenticated diagnostic
+  `GET /api/kv-status` (ids/stamps/counts only — no secret material), directing the operator to
+  `kv recover`. **`GET /api/kv-status`** (`System·Read`) and **`POST /api/kv-checkpoint`** (`System·Admin`)
+  on the running server.
+- **Persistent degraded state** — a self-heal that dropped a non-empty tail writes a `DEGRADED.json`
+  breadcrumb (quarantined ids, loss window, quarantine dir) surfaced on `kv-status` and cleared with
+  `kv status --ack`; a zero-loss self-heal is a single INFO line.
+
+### Security / correctness
+
+- Self-heal never mutates on an unsafe shape (dry-run-first), never quarantines at/below the frontier,
+  and never touches a compacted SST or manifest. Post-repair verification is a **real store open**, not a
+  footer re-scan (defeats a truncated edge misread as valid). The `kv recover --adopt-volume` path never
+  destroys the only good copy and never adopts a still-torn volume. Reviewed to a Security SHIP; guarded
+  by a CI-hard mutation-verified **linchpin** gate (an acked crown-jewel write survives a torn-tail
+  self-heal; a frontier-async write does not).
+- A quarantined torn WAL object preserves raw bytes for forensic scavenging only — acked KV pairs in a
+  torn version-0 SST are **not** recoverable; the loss is logged, never silent.
+
+### Migration
+
+- No config change is required to benefit. Recommended: raise fly `kill_timeout` to cover the measured
+  drain+close time (see `fly.toml` guidance), and take volume snapshots after `boatramp kv checkpoint`
+  (or rely on the default periodic checkpoint) for a first-try-bootable restore. Host/daemon only — no
+  shim/WIT change; existing guests are unaffected.
+
 ## [0.8.0] - 2026-09-30
 
 **BREAKING — multi-tenant blob confinement.** Closes a live cross-tenant blob read+destroy hole: the
