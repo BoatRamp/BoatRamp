@@ -115,6 +115,17 @@ fn open_error_looks_torn(raw: &str) -> bool {
         || raw.contains("invalid DB state")
 }
 
+/// Whether a SlateDB open error Display is a **lifecycle** problem — a concurrent-writer fence or a
+/// closed store — as opposed to a torn/unbootable store. A lifecycle error is NEVER a recovery
+/// candidate (recover is the wrong tool). Extracted so [`SlateKv::open_self_heal`] can carve it out
+/// BEFORE attempting the F2 manifest recovery (which must not run on a fence/closed store), matching
+/// the carve-out in [`map_open_error`].
+fn open_error_is_lifecycle(raw: &str) -> bool {
+    raw.contains("detected newer DB client")
+        || raw.contains("Fenced")
+        || raw.contains("db is closed")
+}
+
 /// Map a SlateDB open/build error into a [`KvError`], and — when it looks like a **torn/unbootable
 /// store** — extend the message to name the recovery paths. The default cold open (strict) stays
 /// FAIL-LOUD; this only makes the loud failure *actionable*. Under the v0.9.0 self-heal-on-open
@@ -241,10 +252,65 @@ pub async fn write_degraded_marker(
         quarantined_ids: report.quarantined.clone(),
         loss_window,
         quarantine_dir: report.quarantine_dir.clone().unwrap_or_default(),
+        // v0.11.0 legibility: a WAL-tail self-heal recovered via WAL replay at the durable frontier.
+        frontier: report.frontier,
+        frontier_source: "wal_replay".to_string(),
+        rolled_back_to_generation: None,
+        quarantined_manifest_ids: Vec::new(),
+        orphaned_nonacked_objects: Vec::new(),
     };
     let path = degraded_marker_path(root);
     if let Err(e) = store.put(&path, marker.to_json_bytes().into()).await {
         tracing::warn!(error = %e, path = %path, "failed to write the KV DEGRADED.json breadcrumb (self-heal still succeeded)");
+    }
+    format!("{stamp:020}")
+}
+
+/// Write the [`DegradedMarker`] breadcrumb for an F2 **last-good-generation manifest rollback**
+/// (v0.11.0). Distinct shape from [`write_degraded_marker`]: `rolled_back_to_generation` + the
+/// quarantined manifest ids, `frontier_source = "manifest_gen_rollback"`, and `loss_window = "none"`
+/// for the pure-N-1 case (the rollback is lossless-for-acked — N-1 + WAL replay = a normal open). If
+/// the crash ALSO tore a WAL tail beyond F, the embedded WAL-tail sub-report's quarantine is reflected
+/// in the loss window. Carries NO secrets (MF6): only generation ids, WAL ids, the stamp, and the
+/// frontier. Best-effort like its sibling (the store is already open + verified).
+pub async fn write_manifest_recovery_marker(
+    store: &Arc<dyn ObjectStore>,
+    root: &str,
+    report: &crate::wal_repair::ManifestRecoveryReport,
+) -> String {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // The pure-N-1 rollback is lossless. If the WAL-tail sub-heal ALSO quarantined a torn tail beyond
+    // F (a crash that tore BOTH the manifest and a later in-flight WAL object), name that bounded
+    // FORENSIC-ONLY window; otherwise "none".
+    let loss_window = match (
+        report.wal_repair.quarantined.iter().min(),
+        report.wal_repair.quarantined.iter().max(),
+    ) {
+        (Some(&lo), Some(&hi)) => format!(
+            "rolled back to manifest generation {} (frontier {:020}); ADDITIONALLY a torn WAL tail \
+             (ids {lo:020}..={hi:020}) beyond the frontier was quarantined — those bytes are FORENSIC \
+             ONLY (no supported recovery of acked pairs from a torn version-0 SST)",
+            report.rolled_back_to_generation, report.frontier,
+        ),
+        _ => "none".to_string(),
+    };
+    let marker = DegradedMarker {
+        stamp,
+        quarantined_ids: report.wal_repair.quarantined.clone(),
+        loss_window,
+        quarantine_dir: report.manifest_quarantine_dir.clone().unwrap_or_default(),
+        frontier: report.frontier,
+        frontier_source: "manifest_gen_rollback".to_string(),
+        rolled_back_to_generation: Some(report.rolled_back_to_generation),
+        quarantined_manifest_ids: report.quarantined_manifest_ids.clone(),
+        orphaned_nonacked_objects: report.orphaned_nonacked_objects.clone(),
+    };
+    let path = degraded_marker_path(root);
+    if let Err(e) = store.put(&path, marker.to_json_bytes().into()).await {
+        tracing::warn!(error = %e, path = %path, "failed to write the KV manifest-rollback DEGRADED.json breadcrumb (recovery still succeeded)");
     }
     format!("{stamp:020}")
 }
@@ -306,7 +372,24 @@ pub struct S3StoreConfig {
 /// opener does (`open_local_settings`). Exposed so the `boatramp kv repair` CLI can build the
 /// SAME store the opener would, and run the repair against it (root `"kv"`).
 pub fn local_object_store(dir: &Path) -> Result<LocalFileSystem, KvError> {
-    LocalFileSystem::new_with_prefix(dir).map_err(backend)
+    // F1 (v0.11.0, the correctness precondition for the auto manifest-recovery): fsync every local
+    // write. object_store 0.14.2 defaults `fsync=false`, so slatedb's manifest/WAL PUT (temp-file →
+    // hard-link to the final name → remove temp) can make the FINAL name visible BEFORE the file's
+    // data blocks / parent-dir entry are forced to stable storage. A hard VM stop (a fly machine
+    // restart hard-stops the VM), a crash-consistent volume snapshot mid-PUT, or power loss then
+    // leaves a 0-byte object at its final name — the "empty manifest" (and the torn-WAL-tail) outage
+    // class. `with_fsync(true)` makes object_store fsync the file BEFORE the hard-link and the parent
+    // dir AFTER, so the final name only appears once its data is durable — closing the
+    // torn-at-final-name window for SIGKILL AND snapshot/hard-stop.
+    //
+    // This is the SINGLE local construction path: the control-plane store, every per-site store, the
+    // repair/verify/migrate opens, and the cluster node-local Raft durable store all route through
+    // here (via `open_local_*` / `open_local_reader` / `local_object_store` in `boatramp kv`), so
+    // fsync covers EVERY local writer path (MF1). S3/R2 opens (`build_s3_object_store`) get NO fsync
+    // — a remote object-store PUT is durable-on-ack.
+    Ok(LocalFileSystem::new_with_prefix(dir)
+        .map_err(backend)?
+        .with_fsync(true))
 }
 
 /// Build the S3/R2 object store from an [`S3StoreConfig`] (ambient AWS creds), exactly as the
@@ -553,16 +636,69 @@ impl SlateKv {
             }
             Err(err) => {
                 let raw = err.to_string();
-                if !open_error_looks_torn(&raw) {
-                    // A concurrent-writer fence / closed store / other non-torn failure: fail LOUD,
-                    // NEVER self-heal (recover is the wrong tool — see `map_open_error`).
+                if open_error_is_lifecycle(&raw) {
+                    // A concurrent-writer fence / closed store: fail LOUD, NEVER self-heal or recover
+                    // (recover is the wrong tool — see `map_open_error`).
                     return Err(map_open_error(err));
                 }
-                tracing::warn!(
-                    error = %raw,
-                    "control-plane KV cold open failed with a torn/unbootable signature; running \
-                     self-heal (dry-run first, C3)"
-                );
+
+                // F2 (v0.11.0) — the empty/torn LATEST manifest shape. Attempt the last-good-generation
+                // cold-open recovery BEFORE the WAL-tail self-heal (which needs a readable manifest for
+                // its frontier). We try it unconditionally on a non-lifecycle failure (not gated on the
+                // exact error string) so the empty-manifest shape is caught regardless of how slatedb
+                // words the decode failure. It returns `LatestReadable` (a no-op, one manifest read)
+                // when the latest manifest is actually readable — then we fall through to the WAL-tail
+                // path; `RolledBack` when it recovered; `Err` (fatal) when it REFUSED loud.
+                match crate::wal_repair::recover_last_good_manifest(&store, path, RepairMode::Apply)
+                    .await
+                {
+                    Ok(crate::wal_repair::ManifestRecovery::LatestReadable { .. }) => {
+                        // Latest manifest readable ⇒ a WAL-tail (or compacted) shape, not a torn
+                        // manifest. Only proceed to the WAL-tail self-heal if the open error looked
+                        // torn; any other non-lifecycle failure is unknown ⇒ fail LOUD (unchanged).
+                        if !open_error_looks_torn(&raw) {
+                            return Err(map_open_error(err));
+                        }
+                        tracing::warn!(
+                            error = %raw,
+                            "control-plane KV cold open failed with a torn/unbootable signature (latest \
+                             manifest readable); running WAL-tail self-heal (dry-run first, C3)"
+                        );
+                    }
+                    Ok(crate::wal_repair::ManifestRecovery::RolledBack(report)) => {
+                        // C2/UX C2 — a lossless last-good-generation rollback. Write the durable
+                        // manifest-rollback breadcrumb + a structured WARN, then open the serving writer
+                        // over the now-G-latest, WAL-healed store (a FRESH handle — Arch C6).
+                        let stamp = write_manifest_recovery_marker(&store, path, &report).await;
+                        tracing::warn!(
+                            target: "kv_self_healed",
+                            rolled_back_to_generation = report.rolled_back_to_generation,
+                            frontier = report.frontier,
+                            quarantined_manifest_ids = ?report.quarantined_manifest_ids,
+                            wal_tail_quarantined = ?report.wal_repair.quarantined,
+                            manifest_quarantine_dir =
+                                report.manifest_quarantine_dir.as_deref().unwrap_or(""),
+                            degraded_marker = %stamp,
+                            "control-plane KV RECOVERED on open (lossless): the latest manifest was \
+                             empty/torn; auto-rolled-back to the last-good manifest generation and \
+                             replayed the WAL forward — zero acked loss (N-1 + WAL replay = a normal \
+                             open). The torn manifest generation(s) were quarantined for forensics. \
+                             Review with `boatramp kv status`; `--ack` clears the breadcrumb."
+                        );
+                        let db = Db::builder(path.to_string(), store)
+                            .with_settings(settings)
+                            .build()
+                            .await
+                            .map_err(map_open_error)?;
+                        return Ok(Self::from_writer(db));
+                    }
+                    Err(e) => {
+                        // The manifest shape was detected but F2 REFUSED (no decodable generation, a WAL
+                        // GC hole, or below the GC boundary). FATAL (C7) — the caller binds the
+                        // recovery-mode listener; NEVER a lossy WAL-from-0.
+                        return Err(KvError::backend(e.to_string()));
+                    }
+                }
             }
         }
 
@@ -650,7 +786,11 @@ impl SlateKv {
     /// Open a read-only replica over a local directory (mainly for tests; real
     /// replicas share an object store with the writer).
     pub async fn open_local_reader(dir: impl AsRef<Path>) -> Result<Self, KvError> {
-        let fs = LocalFileSystem::new_with_prefix(dir.as_ref()).map_err(backend)?;
+        // F1 (MF1): route through `local_object_store` rather than a bare
+        // `LocalFileSystem::new_with_prefix`, so there is no fsync bypass a future edit could silently
+        // skip. A read replica never writes, so the fsync flag is inert here — but keeping the single
+        // construction path is the invariant (Arch C8: the one former bypass, now closed).
+        let fs = local_object_store(dir.as_ref())?;
         Self::open_reader(Arc::new(fs), "kv").await
     }
 
@@ -1019,6 +1159,27 @@ mod tests {
         panic!("slatedb test `{name}` stalled on every attempt");
     }
 
+    /// **F1 GATE (v0.11.0)** — the control-plane local store is constructed with fsync ON. object_store
+    /// 0.14.2 defaults `fsync=false`; without `.with_fsync(true)` in [`local_object_store`] the final
+    /// manifest/WAL name can become visible before its data blocks are durable → the empty-manifest /
+    /// torn-WAL-tail outage on a hard stop or snapshot. `LocalFileSystem` derives `Debug` over its
+    /// `fsync: bool` field, so the constructed store's `Debug` names the flag — a behavioral introspection
+    /// (object_store exposes no fsync getter). Mutation this guards: dropping `.with_fsync(true)` from
+    /// `local_object_store` flips this to `fsync: false` and the assert fails RED.
+    #[test]
+    fn control_plane_local_store_is_constructed_with_fsync() {
+        let dir = std::env::temp_dir().join(format!("boatramp-fsync-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fs = local_object_store(&dir).expect("construct the local control-plane store");
+        let dbg = format!("{fs:?}");
+        assert!(
+            dbg.contains("fsync: true"),
+            "the control-plane LocalFileSystem MUST be built with fsync ON (F1); got: {dbg}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[serial_test::serial]
     #[tokio::test(flavor = "multi_thread")]
     async fn slatedb_round_trips() {
@@ -1375,6 +1536,150 @@ mod tests {
              frontier-synced to L0 before ack, so the quarantined torn tail never held it"
         );
         opened.close().await.unwrap();
+    }
+
+    /// The highest `{root}/manifest/{:020}.manifest` generation id present (for the F2 manifest-tear
+    /// fixtures).
+    async fn highest_manifest_id(store: &Arc<dyn ObjectStore>, root: &str) -> u64 {
+        use futures::StreamExt;
+        let prefix = ObjPath::from(format!("{root}/manifest"));
+        let mut stream = store.list(Some(&prefix));
+        let mut max = 0u64;
+        while let Some(item) = stream.next().await {
+            if let Some(id) = item
+                .ok()
+                .and_then(|m| m.location.filename().map(str::to_string))
+                .and_then(|n| {
+                    n.strip_suffix(".manifest")
+                        .and_then(|s| s.parse::<u64>().ok())
+                })
+            {
+                max = max.max(id);
+            }
+        }
+        max
+    }
+
+    /// Tear the LATEST manifest by injecting a 0-byte `manifest/{highest+1}.manifest` — the production
+    /// empty-manifest outage signature.
+    async fn tear_latest_manifest(store: &Arc<dyn ObjectStore>, root: &str) -> u64 {
+        let torn_id = highest_manifest_id(store, root).await + 1;
+        store
+            .put(
+                &ObjPath::from(format!("{root}/manifest/{torn_id:020}.manifest")),
+                Vec::<u8>::new().into(),
+            )
+            .await
+            .unwrap();
+        torn_id
+    }
+
+    /// **F2 SUPPORT GATE (v0.11.0)** — the self-heal-on-open DEFAULT auto-recovers an empty/torn LATEST
+    /// manifest by rolling back to the last-good generation, and the acked crown-jewel SURVIVES
+    /// byte-equal. (The mutation-verified MF5 linchpin — crown-jewel survival + non-resurrection, both
+    /// directions — is wired by the release owner; this is the in-tree behavioral support proof.)
+    /// InMemory, non-`#[ignore]`d.
+    #[serial_test::serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn self_heal_recovers_a_torn_latest_manifest_by_rollback() {
+        use slatedb::object_store::memory::InMemory;
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        // A real store with an acked crown-jewel frozen to L0 under a good generation, then a clean close.
+        {
+            let kv = SlateKv::open_with(
+                store.clone(),
+                "kv",
+                test_settings(Some(Duration::from_millis(5))),
+            )
+            .await
+            .unwrap();
+            kv.put("secret/acme/idp", b"sealed-crown-jewel".to_vec())
+                .await
+                .unwrap();
+            kv.checkpoint().await.unwrap();
+            kv.close().await.unwrap();
+        }
+        let good = highest_manifest_id(&store, "kv").await;
+        let torn_id = tear_latest_manifest(&store, "kv").await;
+
+        // The self-heal DEFAULT opens the store by rolling back to the last-good generation.
+        let opened = SlateKv::open_with_policy(
+            store.clone(),
+            "kv",
+            test_settings(Some(Duration::from_millis(5))),
+            KvOpenPolicy::SelfHeal,
+        )
+        .await
+        .expect(
+            "SelfHeal must recover an empty/torn latest manifest by last-good-generation rollback",
+        );
+        assert_eq!(
+            opened.get("secret/acme/idp").await.unwrap(),
+            Some(b"sealed-crown-jewel".to_vec()),
+            "F2: the acked crown-jewel MUST survive the manifest rollback byte-equal"
+        );
+
+        // A durable manifest-rollback breadcrumb was written (the manifest-rollback shape).
+        let marker = read_degraded_marker(&store, "kv")
+            .await
+            .unwrap()
+            .expect("a manifest rollback writes DEGRADED.json");
+        assert_eq!(marker.frontier_source, "manifest_gen_rollback");
+        assert_eq!(marker.rolled_back_to_generation, Some(good));
+        assert_eq!(marker.quarantined_manifest_ids, vec![torn_id]);
+        assert_eq!(
+            marker.loss_window, "none",
+            "a pure last-good-generation rollback is lossless-for-acked"
+        );
+        opened.close().await.unwrap();
+    }
+
+    /// **MF3 GATE** — STRICT does NOT auto-recover a torn latest manifest (the cluster/opt-out posture):
+    /// it fails LOUD and mutates nothing (no rollback, no DEGRADED.json). This is the policy split that
+    /// keeps the cluster node-local Raft store (always Strict) from ever manifest-recovering.
+    #[serial_test::serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn strict_does_not_manifest_recover_a_torn_latest_manifest() {
+        use slatedb::object_store::memory::InMemory;
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        {
+            let kv = SlateKv::open_with(
+                store.clone(),
+                "kv",
+                test_settings(Some(Duration::from_millis(5))),
+            )
+            .await
+            .unwrap();
+            kv.put("secret/acme/idp", b"sealed".to_vec()).await.unwrap();
+            kv.close().await.unwrap();
+        }
+        let torn_id = tear_latest_manifest(&store, "kv").await;
+
+        let opened = SlateKv::open_with_policy(
+            store.clone(),
+            "kv",
+            test_settings(Some(Duration::from_millis(5))),
+            KvOpenPolicy::Strict,
+        )
+        .await;
+        assert!(
+            opened.is_err(),
+            "STRICT must fail loud on a torn latest manifest (no auto-recovery)"
+        );
+        // Mutated nothing: the torn manifest is still present, and no DEGRADED.json was written.
+        assert!(
+            store
+                .head(&ObjPath::from(format!(
+                    "kv/manifest/{torn_id:020}.manifest"
+                )))
+                .await
+                .is_ok(),
+            "STRICT must not quarantine the torn manifest"
+        );
+        assert!(
+            read_degraded_marker(&store, "kv").await.unwrap().is_none(),
+            "STRICT writes no DEGRADED.json"
+        );
     }
 
     /// **C3/C7 GATE** — SelfHeal recovers a sole safe trailing torn WAL tail: it quarantines +

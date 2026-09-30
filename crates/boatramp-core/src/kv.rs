@@ -70,10 +70,36 @@ pub struct DegradedMarker {
     pub quarantined_ids: Vec<u64>,
     /// A human-readable statement of the bounded loss window — the WAL id range beyond the durable
     /// frontier that was quarantined. HONEST (C13): these bytes are preserved for FORENSICS ONLY;
-    /// there is no supported recovery of acked KV pairs from a torn version-0 SST.
+    /// there is no supported recovery of acked KV pairs from a torn version-0 SST. For a pure
+    /// last-good-generation manifest rollback (v0.11.0 F2) this is `"none"` — the rollback is
+    /// lossless-for-acked (N-1 + WAL replay = a normal open).
     pub loss_window: String,
-    /// Where the torn bytes were copied before removal (`{root}/wal-quarantine/{stamp}`), for forensics.
+    /// Where the torn bytes were copied before removal (`{root}/wal-quarantine/{stamp}` for a WAL-tail
+    /// self-heal, or `{root}/manifest-quarantine/{stamp}` for a manifest rollback), for forensics.
     pub quarantine_dir: String,
+    /// **v0.11.0 legibility (UX C1).** The durable frontier / `last_durable_seq` the store recovered to
+    /// (`replay_after_wal_id`). `#[serde(default)]` so a pre-v0.11.0 marker still parses.
+    #[serde(default)]
+    pub frontier: u64,
+    /// **v0.11.0 legibility (UX C1).** Where the recovered frontier came from:
+    /// `"manifest_latest"` (clean), `"manifest_gen_rollback"` (F2 rolled back to an older generation),
+    /// or `"wal_replay"` (a WAL-tail self-heal). `#[serde(default)]` for backward compatibility (an old
+    /// marker deserializes to `""`; a WAL-tail self-heal now stamps `"wal_replay"` explicitly).
+    #[serde(default)]
+    pub frontier_source: String,
+    /// **v0.11.0 F2 manifest-rollback shape (UX C2).** `Some(G)` when a last-good-generation cold-open
+    /// recovery rolled back to manifest generation G; `None` for a WAL-tail self-heal. Its presence is
+    /// what lets `kv status` LEAD "RECOVERED (lossless)" and suppress the forensic-only note.
+    #[serde(default)]
+    pub rolled_back_to_generation: Option<u64>,
+    /// **v0.11.0 F2 (UX C2).** The torn manifest generation ids quarantined so G became the latest.
+    #[serde(default)]
+    pub quarantined_manifest_ids: Vec<u64>,
+    /// **v0.11.0 F2 (UX C11).** Reclaimable orphaned L0 SST object(s) referenced only by a discarded
+    /// torn generation — a space leak the reopened store's GC reclaims, surfaced as a DISTINCT
+    /// informational field so it is NEVER conflated with acked loss.
+    #[serde(default)]
+    pub orphaned_nonacked_objects: Vec<String>,
 }
 
 impl DegradedMarker {
