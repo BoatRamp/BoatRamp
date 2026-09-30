@@ -73,26 +73,28 @@ pub(crate) struct TenancyUndeclared;
 impl std::fmt::Display for TenancyUndeclared {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(
-            "tenancy: this function imports sql/orm but declares no tenancy decision; the \
-             multi-tenant posture requires an explicit `tenancy` (disabled or scoped)",
+            "tenancy: this function imports sql/orm or wasi:blobstore but declares no tenancy \
+             decision; the multi-tenant posture requires an explicit `tenancy` (disabled or scoped)",
         )
     }
 }
 impl std::error::Error for TenancyUndeclared {}
 
 /// Resolve the effective [`Tenancy`] `decision` into a [`HostTenancy`] (or `None` = plain
-/// queries). `imports_db` is whether the guest imports `sql`/`orm` at all (only then does the
-/// Dimension-0 requirement bite). Async because the token source verifies a JWT.
+/// queries). `imports_tenant_scoped_data` is whether the guest imports a tenant-scoped DATA
+/// capability — `sql`/`orm` OR `wasi:blobstore` (which carries per-tenant blob assets, Security
+/// HIGH-1) — only then does the Dimension-0 declaration requirement bite. Async because the token
+/// source verifies a JWT.
 pub(crate) async fn resolve_host_tenancy(
     decision: Option<&Tenancy>,
-    imports_db: bool,
+    imports_tenant_scoped_data: bool,
     posture: TenantPosture,
     inputs: TenantSourceInputs<'_>,
 ) -> Result<Option<HostTenancy>, TenancyUndeclared> {
     match decision {
-        // Undeclared: refuse a db-importing guest under the strict posture; otherwise run plain.
+        // Undeclared: refuse a tenant-scoped-data-importing guest under the strict posture; else plain.
         None => {
-            if imports_db && posture.require_declaration {
+            if imports_tenant_scoped_data && posture.require_declaration {
                 Err(TenancyUndeclared)
             } else {
                 Ok(None)
@@ -253,13 +255,13 @@ pub(crate) fn resolve_target_via(
 /// [`resolve_host_tenancy`]; the only difference is the value comes from the caller, not a source.
 pub(crate) fn resolve_inherited_tenancy(
     decision: Option<&Tenancy>,
-    imports_db: bool,
+    imports_tenant_scoped_data: bool,
     posture: TenantPosture,
     inherited: Vec<boatramp_handlers::ScopeFact>,
 ) -> Result<Option<HostTenancy>, TenancyUndeclared> {
     match decision {
         None => {
-            if imports_db && posture.require_declaration {
+            if imports_tenant_scoped_data && posture.require_declaration {
                 Err(TenancyUndeclared)
             } else {
                 Ok(None)
