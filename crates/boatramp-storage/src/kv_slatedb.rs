@@ -1280,6 +1280,103 @@ mod tests {
             .unwrap();
     }
 
+    /// The highest `{root}/wal/{id:020}.sst` id currently present (the object the most-recent,
+    /// not-yet-L0-frozen write lives in). Used by the linchpin to tear the secret's OWN WAL object
+    /// in the mutation (no-checkpoint) case, modelling a crash that interrupts that very write.
+    async fn highest_wal_id(store: &Arc<dyn ObjectStore>, root: &str) -> u64 {
+        use futures::StreamExt;
+        let prefix = ObjPath::from(format!("{root}/wal"));
+        let mut stream = store.list(Some(&prefix));
+        let mut max = 0u64;
+        while let Some(item) = stream.next().await {
+            if let Some(id) = item
+                .ok()
+                .and_then(|m| m.location.filename().map(str::to_string))
+                .and_then(|n| n.strip_suffix(".sst").and_then(|s| s.parse::<u64>().ok()))
+            {
+                max = max.max(id);
+            }
+        }
+        max
+    }
+
+    /// **LINCHPIN GATE (C1+C2)** — the single proof the self-heal-on-open DEFAULT cannot drop an
+    /// ACKED crown-jewel write. A sealed-secret write goes through the frontier-syncing (checkpointed)
+    /// path, so it is frozen to L0 *past the durable frontier before ack*; a subsequent hard crash
+    /// leaves a torn trailing WAL object, self-heal quarantines it, and the secret — already in L0 —
+    /// SURVIVES. The assertion is FIXED (the secret survives).
+    ///
+    /// Anti-hollow (env-driven, NO production seam): under
+    /// `BOATRAMP_LINCHPIN_MUTATION=no_frontier_sync` the crown-jewel write SKIPS the checkpoint —
+    /// modelling a crown-jewel write left frontier-async (the C2 miss Security caught in daemon-config)
+    /// — so the secret stays in the WAL object the crash tears, self-heal quarantines THAT object, and
+    /// the secret is LOST (or the open refuses): the fixed survival assertion then FAILS RED. That red
+    /// is the proof the checkpoint on the crown-jewel write path is load-bearing. The injection tears
+    /// the secret's own WAL object only in the mutation case because that is where the un-checkpointed
+    /// secret actually lives; with the checkpoint it has moved to L0 and the crash tears a fresh object.
+    #[serial_test::serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn crown_jewel_write_survives_torn_tail_self_heal_linchpin() {
+        use slatedb::object_store::memory::InMemory;
+        let skip_checkpoint =
+            std::env::var("BOATRAMP_LINCHPIN_MUTATION").unwrap_or_default() == "no_frontier_sync";
+
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let kv = SlateKv::open_with(
+            store.clone(),
+            "kv",
+            test_settings(Some(Duration::from_millis(5))),
+        )
+        .await
+        .unwrap();
+
+        // The acked crown-jewel write. In prod this is the CheckpointKv-wrapped / `*_checkpointed`
+        // path: put (await_durable) THEN checkpoint (freeze the memtable → L0, advancing the frontier
+        // PAST this write). The mutation skips the checkpoint (the frontier-async C2 miss).
+        kv.put("secret/acme/idp", b"sealed-crown-jewel".to_vec())
+            .await
+            .unwrap();
+        if !skip_checkpoint {
+            kv.checkpoint().await.unwrap();
+        }
+
+        // Model a hard crash: a torn in-flight WAL object, and NO clean close.
+        let frontier = crate::wal_repair::repair_wal_tail(&store, "kv", RepairMode::DryRun)
+            .await
+            .unwrap()
+            .frontier;
+        if skip_checkpoint {
+            // No checkpoint ⇒ the secret is still in its WAL object, beyond the un-advanced frontier.
+            // Tearing THAT object = the crash interrupted the secret's own write ⇒ self-heal drops it.
+            put_torn_wal(&store, "kv", highest_wal_id(&store, "kv").await).await;
+        } else {
+            // Checkpoint advanced the frontier past the secret (now in L0). The crash tears a FRESH
+            // in-flight object beyond the frontier; self-heal quarantines it, the L0 secret survives.
+            put_torn_wal(&store, "kv", frontier + 1).await;
+        }
+        drop(kv); // a hard crash, NOT a graceful close
+
+        // Self-heal reopen (the DEFAULT). FIXED assertion: the acked secret survives.
+        let opened = SlateKv::open_with_policy(
+            store.clone(),
+            "kv",
+            test_settings(Some(Duration::from_millis(5))),
+            KvOpenPolicy::SelfHeal,
+        )
+        .await
+        .expect(
+            "LINCHPIN: self-heal must OPEN past a torn tail (a refusal here under the mutation is \
+             also RED for the survival guarantee)",
+        );
+        assert_eq!(
+            opened.get("secret/acme/idp").await.unwrap(),
+            Some(b"sealed-crown-jewel".to_vec()),
+            "LINCHPIN: an ACKED crown-jewel write MUST survive a torn-tail self-heal — it is \
+             frontier-synced to L0 before ack, so the quarantined torn tail never held it"
+        );
+        opened.close().await.unwrap();
+    }
+
     /// **C3/C7 GATE** — SelfHeal recovers a sole safe trailing torn WAL tail: it quarantines +
     /// OPENS, every committed key (incl. the sealed secret) survives, and a durable DEGRADED.json
     /// breadcrumb is written naming the quarantined id.
