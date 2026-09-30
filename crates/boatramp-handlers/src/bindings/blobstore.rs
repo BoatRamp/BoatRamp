@@ -15,6 +15,7 @@
 use boatramp_core::time::now_unix;
 use std::sync::Arc;
 
+use boatramp_core::project::{validate_key_segment, validate_object_key};
 use boatramp_core::{ByteStream, PutMeta, Storage, StorageError};
 use bytes::Bytes;
 use futures::StreamExt;
@@ -115,13 +116,25 @@ pub struct Container {
 }
 
 impl Container {
-    fn object_key(&self, object: &str) -> String {
-        format!("{}{object}", self.prefix)
+    fn object_key(&self, object: &str) -> Result<String, String> {
+        checked_object_key(&self.prefix, object)
     }
 
     fn marker_key(&self) -> String {
         format!("{}{MARKER}", self.prefix)
     }
+}
+
+/// Compose an object key under `prefix`, first validating the guest-supplied object NAME as a
+/// traversal-safe key ([`validate_object_key`]: rejects `..`/leading-or-doubled `/`/`\`/`*`/control
+/// bytes and the reserved `.boatramp*` namespace). This is DEFENSE-IN-DEPTH — `..` is already inert
+/// (the `fs` backend's `resolve` rejects it; cloud backends treat it literally) — centralized here so
+/// every object op (`object_key` callers) plus the inline copy/move compositions screen the name
+/// identically, mirroring `blob_upload::screen_upload_target`. The refusal is a distinct request
+/// error, NOT routed through `blob_err` (which is for backend faults).
+fn checked_object_key(prefix: &str, object: &str) -> Result<String, String> {
+    validate_object_key(object).map_err(|e| format!("invalid object name: {e}"))?;
+    Ok(format!("{prefix}{object}"))
 }
 
 /// An in-progress listing snapshot (object names captured at `list-objects`).
@@ -200,9 +213,80 @@ async fn collect(mut body: ByteStream, max: u64) -> Result<Vec<u8>, String> {
 }
 
 impl BlobHost<'_> {
-    /// `hblob/{site}/{container}/` for `name`, or an error if no grant.
+    /// `hblob/{site}/{container}/` for `name`, or an error if no grant / the container is not
+    /// permitted for THIS invocation's resolved tenant.
+    ///
+    /// **The single tenant-confinement choke point (C2).** Every container op resolves its prefix
+    /// through here (create/get/delete-container/container-exists/copy src+dest/move), so this one
+    /// gate confines all of them — and every handle op transitively, since a `Container` handle can
+    /// only be minted by a gated open. Mirrors `blob_upload::resolve_container`.
+    ///
+    /// Three DISTINCT, greppable refusal categories (never collapsed into "no such container"):
+    /// - an allowlist miss, - a `{tenant}` entry with no resolved own tenant, - the multi-tenant
+    /// deny-default. These are an AUTHORIZATION category, returned directly — NOT through
+    /// [`blob_err`] (which masks a backend fault as "blob backend unavailable").
     fn container_prefix(&self, name: &str) -> Result<String, String> {
         let binding = self.binding.ok_or_else(|| "access denied".to_string())?;
+
+        if !binding.containers.is_empty() {
+            // A declared allowlist is ALWAYS enforced regardless of the multi-tenant posture (C3).
+            // For each entry: a `{tenant}` entry is host-expanded with the resolved OWN tenant then
+            // exact-matched; a plain entry is exact-matched literally. `split_once` intercepts a
+            // `{tenant}`-bearing entry anywhere in the string (a guest cannot reach it by passing the
+            // literal `{tenant}` — the match is exact equality against the host-expanded form, and
+            // the tenant is never guest-supplied).
+            let mut saw_unexpandable_template = false;
+            let mut matched = false;
+            for entry in &binding.containers {
+                match entry.split_once(TENANT_TEMPLATE) {
+                    Some((before, after)) => match binding.tenant.as_deref() {
+                        Some(tenant) => {
+                            if name == format!("{before}{tenant}{after}") {
+                                matched = true;
+                                break;
+                            }
+                        }
+                        // A `{tenant}` entry we cannot expand (no resolved own tenant): record it so a
+                        // request that lines up ONLY with such an entry fails closed distinctly (C5),
+                        // never a silent access-denied that could hide a mis-scoped invocation.
+                        None => saw_unexpandable_template = true,
+                    },
+                    None => {
+                        if entry == name {
+                            matched = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if !matched {
+                return Err(if saw_unexpandable_template {
+                    format!(
+                        "blobstore_containers: no resolved tenant to expand a {TENANT_TEMPLATE} \
+                         entry for container '{name}'"
+                    )
+                } else {
+                    format!(
+                        "container '{name}' is not permitted by this component's \
+                         blobstore_containers allowlist"
+                    )
+                });
+            }
+        } else if binding.multi_tenant {
+            // No allowlist on a multi-tenant site ⇒ deny-by-default (fail-closed). The message names
+            // the one-line remedy. BREAKING for a multi-tenant guest that granted `wasi:blobstore`
+            // without declaring an allowlist.
+            return Err(format!(
+                "this multi-tenant site grants wasi:blobstore but declares no blobstore_containers; \
+                 add blobstore_containers: [\"assets-{TENANT_TEMPLATE}\"]"
+            ));
+        }
+        // else: single-tenant / dev with no allowlist ⇒ permissive (unchanged behavior).
+
+        // Defense-in-depth: the resolved container must be a safe KEY segment — a `{tenant}`-expanded
+        // tid carries `.`/`@`, so KEY-safety (`validate_key_segment`), not the strict slug. `..` is
+        // already inert (fs `resolve` rejects; cloud literal); belt, not the load-bearing fix.
+        validate_key_segment("container", name).map_err(|e| format!("invalid container: {e}"))?;
         Ok(format!("{}{name}/", binding.prefix))
     }
 
@@ -330,7 +414,7 @@ impl blobstore::container::HostContainer for BlobHost<'_> {
         end: u64,
     ) -> Result<Resource<IncomingValue>, String> {
         let container = self.table.get(&this).map_err(estr)?;
-        let (storage, key) = (container.storage.clone(), container.object_key(&name));
+        let (storage, key) = (container.storage.clone(), container.object_key(&name)?);
         // Offsets are inclusive. `end == u64::MAX` is the "whole object, host clamps to size"
         // sentinel the shim's `blob::get` passes (`get-data(_, 0, u64::MAX)`) — map it to a to-end
         // read (`None`) so NO backend receives a forged out-of-range `len`/end (which strict
@@ -353,7 +437,7 @@ impl blobstore::container::HostContainer for BlobHost<'_> {
     ) -> Result<(), String> {
         let bytes = self.table.get(&data).map_err(estr)?.pipe.contents();
         let container = self.table.get(&this).map_err(estr)?;
-        let (storage, key) = (container.storage.clone(), container.object_key(&name));
+        let (storage, key) = (container.storage.clone(), container.object_key(&name)?);
         storage
             .put(&key, once_stream(bytes), PutMeta::default())
             .await
@@ -389,7 +473,7 @@ impl blobstore::container::HostContainer for BlobHost<'_> {
         name: String,
     ) -> Result<(), String> {
         let container = self.table.get(&this).map_err(estr)?;
-        let (storage, key) = (container.storage.clone(), container.object_key(&name));
+        let (storage, key) = (container.storage.clone(), container.object_key(&name)?);
         storage
             .delete(&key)
             .await
@@ -403,7 +487,10 @@ impl blobstore::container::HostContainer for BlobHost<'_> {
     ) -> Result<(), String> {
         let container = self.table.get(&this).map_err(estr)?;
         let storage = container.storage.clone();
-        let keys: Vec<String> = names.iter().map(|n| container.object_key(n)).collect();
+        let keys: Vec<String> = names
+            .iter()
+            .map(|n| container.object_key(n))
+            .collect::<Result<_, _>>()?;
         for key in keys {
             storage
                 .delete(&key)
@@ -419,7 +506,7 @@ impl blobstore::container::HostContainer for BlobHost<'_> {
         name: String,
     ) -> Result<bool, String> {
         let container = self.table.get(&this).map_err(estr)?;
-        let (storage, key) = (container.storage.clone(), container.object_key(&name));
+        let (storage, key) = (container.storage.clone(), container.object_key(&name)?);
         match storage.head(&key).await {
             Ok(_) => Ok(true),
             Err(StorageError::NotFound(_)) => Ok(false),
@@ -435,7 +522,7 @@ impl blobstore::container::HostContainer for BlobHost<'_> {
         let container = self.table.get(&this).map_err(estr)?;
         let (storage, key, cname) = (
             container.storage.clone(),
-            container.object_key(&name),
+            container.object_key(&name)?,
             container.name.clone(),
         );
         let meta = storage
@@ -574,8 +661,11 @@ impl blobstore::blobstore::Host for BlobHost<'_> {
         dest: blobstore::types::ObjectId,
     ) -> Result<(), String> {
         let storage = self.storage()?;
-        let src_key = format!("{}{}", self.container_prefix(&src.container)?, src.object);
+        // Both endpoints are confined: `container_prefix` gates each container against the tenant
+        // allowlist, and `checked_object_key` screens each object name.
+        let src_key = checked_object_key(&self.container_prefix(&src.container)?, &src.object)?;
         let dest_prefix = self.container_prefix(&dest.container)?;
+        let dest_key = checked_object_key(&dest_prefix, &dest.object)?;
         if !marker_exists(&*storage, &dest_prefix).await? {
             return Err(format!("no such container: {}", dest.container));
         }
@@ -585,13 +675,9 @@ impl blobstore::blobstore::Host for BlobHost<'_> {
             .map_err(|e| blob_err("get", &src_key, e))?;
         let bytes = collect(object.body, self.max_bytes()).await?;
         storage
-            .put(
-                &format!("{dest_prefix}{}", dest.object),
-                once_stream(Bytes::from(bytes)),
-                PutMeta::default(),
-            )
+            .put(&dest_key, once_stream(Bytes::from(bytes)), PutMeta::default())
             .await
-            .map_err(|e| blob_err("put", &format!("{dest_prefix}{}", dest.object), e))?;
+            .map_err(|e| blob_err("put", &dest_key, e))?;
         Ok(())
     }
 
@@ -602,7 +688,9 @@ impl blobstore::blobstore::Host for BlobHost<'_> {
     ) -> Result<(), String> {
         self.copy_object(src.clone(), dest).await?;
         let storage = self.storage()?;
-        let src_key = format!("{}{}", self.container_prefix(&src.container)?, src.object);
+        // The src container + object were already confined by the `copy_object` above; re-compose the
+        // key the same confined way for the delete leg of the move.
+        let src_key = checked_object_key(&self.container_prefix(&src.container)?, &src.object)?;
         storage
             .delete(&src_key)
             .await
@@ -1088,5 +1176,164 @@ mod tests {
             !io.contains("boom"),
             "transport detail stays host-side: {io}"
         );
+    }
+
+    /// A tenant-confined binding: `prefix` + host-resolved own `tenant` + `blobstore_containers`
+    /// allowlist + the multi-tenant fact.
+    fn confined(
+        storage: Arc<dyn Storage>,
+        prefix: &str,
+        tenant: Option<&str>,
+        containers: &[&str],
+        multi_tenant: bool,
+    ) -> BlobBinding {
+        BlobBinding {
+            storage,
+            prefix: prefix.to_string(),
+            max_bytes: 0,
+            tenant: tenant.map(str::to_string),
+            containers: containers.iter().map(|s| (*s).to_string()).collect(),
+            multi_tenant,
+        }
+    }
+
+    /// A declared `["assets-{tenant}"]` allowlist confines the guest to its OWN tenant's container:
+    /// `assets-<own>` opens, `assets-<other>` is refused with the DISTINCT allowlist-miss message —
+    /// on every container op (create/get/exists/delete), and `container_exists` returns `Err` (never
+    /// a silent `Ok(false)` existence oracle).
+    #[tokio::test]
+    async fn allowlist_confines_to_own_tenant_container() {
+        let storage = Arc::new(MemStorage::default());
+        let bind = confined(
+            storage.clone(),
+            "hblob/shop/",
+            Some("firm-a"),
+            &["assets-{tenant}"],
+            true,
+        );
+        let mut table = ResourceTable::new();
+        let mut host = BlobHost::new(&mut table, Some(&bind));
+
+        // Own tenant's container: allowed and stored under the expected key.
+        assert!(host.create_container("assets-firm-a".into()).await.is_ok());
+        assert!(
+            storage
+                .map
+                .lock()
+                .unwrap()
+                .contains_key("hblob/shop/assets-firm-a/.boatramp-container")
+        );
+
+        // Another tenant's container: refused with the distinct allowlist-miss category, on every op.
+        let err = host
+            .create_container("assets-firm-b".into())
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("not permitted by this component's blobstore_containers allowlist"),
+            "{err}"
+        );
+        assert!(host.get_container("assets-firm-b".into()).await.is_err());
+        assert!(host.delete_container("assets-firm-b".into()).await.is_err());
+        // No existence oracle: a forbidden container is `Err`, not `Ok(false)`.
+        let exists = host.container_exists("assets-firm-b".into()).await;
+        assert!(
+            exists.is_err() && exists.unwrap_err().contains("not permitted"),
+            "container_exists on a forbidden container must Err, not Ok(false)"
+        );
+    }
+
+    /// A `{tenant}` entry with NO resolved own tenant (an `all`/anon/target/unscoped invocation) fails
+    /// closed with the DISTINCT no-resolved-tenant category — never a silent allow.
+    #[tokio::test]
+    async fn tenant_template_without_resolved_tenant_fails_closed() {
+        let storage = Arc::new(MemStorage::default());
+        let bind = confined(storage.clone(), "hblob/shop/", None, &["assets-{tenant}"], true);
+        let mut table = ResourceTable::new();
+        let mut host = BlobHost::new(&mut table, Some(&bind));
+
+        let err = host
+            .create_container("assets-firm-a".into())
+            .await
+            .unwrap_err();
+        assert!(err.contains("no resolved tenant"), "{err}");
+    }
+
+    /// A plain (non-`{tenant}`) allowlist entry names a site-shared container the operator opts into;
+    /// a container outside the allowlist is still refused.
+    #[tokio::test]
+    async fn plain_allowlisted_container_is_shared() {
+        let storage = Arc::new(MemStorage::default());
+        let bind = confined(
+            storage.clone(),
+            "hblob/shop/",
+            Some("firm-a"),
+            &["assets-{tenant}", "shared"],
+            true,
+        );
+        let mut table = ResourceTable::new();
+        let mut host = BlobHost::new(&mut table, Some(&bind));
+
+        assert!(host.create_container("shared".into()).await.is_ok());
+        assert!(host.create_container("other".into()).await.is_err());
+    }
+
+    /// A multi-tenant site that declares NO allowlist denies every container op (fail-closed), with
+    /// the DISTINCT deny-default message naming the remedy.
+    #[tokio::test]
+    async fn multi_tenant_without_allowlist_denies() {
+        let storage = Arc::new(MemStorage::default());
+        let bind = confined(storage.clone(), "hblob/shop/", Some("firm-a"), &[], true);
+        let mut table = ResourceTable::new();
+        let mut host = BlobHost::new(&mut table, Some(&bind));
+
+        let err = host.create_container("anything".into()).await.unwrap_err();
+        assert!(err.contains("declares no blobstore_containers"), "{err}");
+    }
+
+    /// A single-tenant / dev site (no tenancy declared) with no allowlist stays permissive — today's
+    /// behavior, non-breaking.
+    #[tokio::test]
+    async fn single_tenant_without_allowlist_is_permissive() {
+        let storage = Arc::new(MemStorage::default());
+        let bind = confined(storage.clone(), "hblob/shop/", None, &[], false);
+        let mut table = ResourceTable::new();
+        let mut host = BlobHost::new(&mut table, Some(&bind));
+
+        assert!(host.create_container("anything".into()).await.is_ok());
+    }
+
+    /// Defense-in-depth: a traversal / reserved object name is refused (a distinct request error, not
+    /// routed through `blob_err`), covering both the `object_key` ops and the inline copy/move keys.
+    #[tokio::test]
+    async fn object_name_validation_rejects_traversal_and_reserved() {
+        let storage = Arc::new(MemStorage::default());
+        let bind = confined(storage.clone(), "hblob/shop/", None, &[], false);
+        let mut table = ResourceTable::new();
+        let mut host = BlobHost::new(&mut table, Some(&bind));
+
+        let c = host.create_container("c".into()).await.unwrap();
+        let crep = c.rep();
+        let ov = outgoing(host.table, b"x");
+        let err = host
+            .write_data(Resource::new_own(crep), "../escape".into(), ov)
+            .await
+            .unwrap_err();
+        assert!(err.contains("invalid object name"), "{err}");
+        // A copy whose destination key is a reserved marker collision is refused at the dest endpoint.
+        let err = host
+            .copy_object(
+                ObjectId {
+                    container: "c".into(),
+                    object: "ok".into(),
+                },
+                ObjectId {
+                    container: "c".into(),
+                    object: ".boatramp-container".into(),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(err.contains("invalid object name"), "{err}");
     }
 }

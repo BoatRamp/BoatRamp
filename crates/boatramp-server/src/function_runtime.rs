@@ -1179,6 +1179,16 @@ pub(super) async fn build_function_bindings(
     if granted("wasi:blobstore") {
         let max_blob = inner.max_blob_bytes.get().copied().unwrap_or(0);
         let multi_tenant = config.tenancy.is_some() || host_tenancy.is_some();
+        // UX (C4): a multi-tenant function that grants `wasi:blobstore` without declaring an
+        // allowlist will DENY every container op — surface it loudly at bind, naming the remedy.
+        if multi_tenant && config.blobstore_containers.is_empty() {
+            tracing::warn!(
+                project = %project.as_str(),
+                scope,
+                "multi-tenant function grants wasi:blobstore but declares no blobstore_containers — \
+                 every container op will be denied; add blobstore_containers: [\"assets-{{tenant}}\"]"
+            );
+        }
         bindings = bindings.with_blobstore(
             scope,
             inner.storage.clone(),
