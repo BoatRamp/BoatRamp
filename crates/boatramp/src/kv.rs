@@ -142,8 +142,31 @@ fn print_report(report: &RepairReport, applied_mode: bool) {
             println!("    {:020}.sst  {:>10} bytes  {:?}", c.id, c.size, c.class);
         }
     }
+    // Out-of-scope torn SSTs (torn compacted/L0 SSTs + torn non-trailing WAL objects). These are
+    // DETECTION-ONLY: the repair NEVER quarantines/removes them (a compacted SST is referenced by
+    // the manifest — removing it without a manifest rollback would drop acked data). Print them
+    // LOUDLY before the "should open normally" line so the compacted-SST case is unmistakable and
+    // an apply's `UnrepairableTornObject` failure is explained.
+    if !report.out_of_scope_torn.is_empty() {
+        println!(
+            "  OUT-OF-SCOPE torn SST(s) this tool will NOT auto-remove \
+             (requires manifest-aware recovery; escalate):"
+        );
+        for t in &report.out_of_scope_torn {
+            println!(
+                "    {}  {:>10} bytes  {:?}  [{:?}]",
+                t.path, t.size, t.class, t.kind
+            );
+        }
+        println!(
+            "  A torn compacted/L0 SST cannot be quarantined safely (it is referenced by the \
+             manifest); dropping it needs a manifest rollback. `--apply` will quarantine any safe \
+             trailing WAL tail, then FAIL LOUD naming the object(s) above — the store will not open \
+             until they are resolved out of band."
+        );
+    }
     if report.is_noop() {
-        println!("  no torn trailing tail found — the store should open normally.");
+        println!("  no torn SST found (WAL tail or compacted) — the store should open normally.");
         return;
     }
     let ids: Vec<String> = report
