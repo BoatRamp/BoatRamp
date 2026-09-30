@@ -175,11 +175,30 @@ impl Bindings {
     /// container namespaced under `hblob/{site}/` (per-site isolation).
     /// `max_bytes` caps a single host-side read/range/copy (`0` = unlimited),
     /// bounding host memory a handler can allocate via the binding.
-    pub fn with_blobstore(mut self, site: &str, storage: Arc<dyn Storage>, max_bytes: u64) -> Self {
+    ///
+    /// Tenant confinement (host-side): `tenant` is THIS invocation's host-resolved OWN tenant (never
+    /// guest-supplied; `None` for an `all`/anon/target/unscoped invocation), `containers` is the
+    /// component's `blobstore_containers` allowlist (`{tenant}`-templated; non-empty ⇒ ALWAYS
+    /// enforced), and `multi_tenant` says whether the site is multi-tenant (derived from the same
+    /// tenancy fact that scopes `sql`/`orm`). An empty allowlist denies every container op on a
+    /// multi-tenant site (fail-closed) and stays permissive on a single-tenant/dev site. Mirrors the
+    /// `blob-upload` mint path's `resolve_container`.
+    pub fn with_blobstore(
+        mut self,
+        site: &str,
+        storage: Arc<dyn Storage>,
+        max_bytes: u64,
+        tenant: Option<String>,
+        containers: Vec<String>,
+        multi_tenant: bool,
+    ) -> Self {
         self.blobstore = Some(blobstore::BlobBinding {
             storage,
             prefix: format!("hblob/{site}/"),
             max_bytes,
+            tenant,
+            containers,
+            multi_tenant,
         });
         self
     }
