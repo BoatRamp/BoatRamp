@@ -5,6 +5,54 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.11.0] - 2026-10-01
+
+Control-plane KV survives an unclean process exit. A machine stop (a fly image roll) that killed the
+daemon before SlateDB finalized its manifest could leave the on-disk manifest empty, so the next
+cold-open found no durable frontier and refused to boot — taking every site on the node to a 503. This
+release makes that boot path recover automatically and losslessly, and adds a repair verb for a store
+that is already stuck. Host/daemon only; no guest-facing (WIT) change.
+
+### Fixed
+
+- **fsync on every local KV write (the durability precondition).** The `LocalFileSystem` object store
+  backing a file-system KV now opens with `with_fsync(true)`, so a manifest/WAL object is durable before
+  its name becomes visible. Without it a torn manifest was page-cache-visible to the running process and
+  WAL-GC could advance past a not-yet-durable generation — the exact window that made an unclean exit
+  leave the store unbootable. S3/R2 backends are unaffected (durable on ack).
+- **Auto cold-open recovery from the last good manifest generation.** On an empty/torn *latest* manifest
+  with an intact WAL, the self-heal open path rolls back to the highest decodable manifest generation and
+  replays the WAL from its frontier, then opens clean — instead of refusing. Crown-jewel writes (sealed
+  secrets, RBAC, token revocations, domain proofs, tenancy/posture) are WAL-durable before the
+  frontier-advancing manifest, so the rollback neither drops an acked write nor resurrects a deleted or
+  revoked one. The recovery is **lossless-for-acked or fail-loud — never a silent lossy rollback**: if the
+  WAL replay range has a hole, the open refuses rather than lose data.
+
+### Added
+
+- **`boatramp kv recover` now repairs an empty/absent manifest.** The dry-run prints the plan (the
+  fallback generation, the reconstructed frontier, the quarantined manifest suffix, the discard window)
+  and mutates nothing; `--apply` performs the last-good-generation recovery non-destructively (the torn
+  manifest suffix is quarantined under `manifest-quarantine/`, not deleted outright). Refuses on a cluster
+  node-local store (wipe-and-rejoin).
+- **`boatramp kv checkpoint --live`** forces a durable manifest while the server runs, returning only
+  after the frontier is persisted — a pre-roll quiesce for a deploy runbook.
+- **`GET /api/kv-status` reports `frontier_source` and `last_durable_seq`** (on both the live store and
+  the recovery-mode listener); a lossless manifest rollback is surfaced as `RECOVERED (lossless)`.
+
+### Security / correctness
+
+- Manifest recovery runs only under the default self-heal policy on a single node; `--strict-kv` and a
+  cluster node-local (Raft) store fail loud on a torn manifest with zero mutation. A mutation-verified CI
+  gate battery proves the recovery is lossless-for-acked in both directions (a crown-jewel write survives;
+  an acked tombstone is not resurrected) and pins the upstream SlateDB WAL-GC retention invariant the
+  empty-range guard depends on.
+
+### Operations
+
+- A sample `fly.toml` sets `kill_timeout = 30` with the sizing formula, and `deploy/prod/README.md` gains
+  a post-0.11.0 roll runbook (a snapshot restore is now DR hygiene, not a precondition for a routine roll).
+
 ## [0.10.0] - 2026-09-30
 
 Additive — a grouped-aggregate completion for the typed `orm` builder (construens
