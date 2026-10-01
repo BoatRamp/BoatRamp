@@ -320,6 +320,36 @@ pub enum WalRepairError {
         listed: usize,
     },
 
+    /// **v0.11.1** — one or more manifest generations DECODE, but NONE of them OPENS CLEAN: every
+    /// decodable generation references a removed/torn compacted SST (the mid-compaction unclean-exit
+    /// `Invalid error: invalid compaction` shape) or otherwise fails a real open+scan. There is no
+    /// last-good generation to adopt WITHOUT dropping acked data, so recovery REFUSES rather than
+    /// adopt an unopenable generation (that was the v0.11.0 bug: self-heal rolled back to the newest
+    /// generation that merely *decoded*, which then failed `Db::open` with `invalid compaction`, and
+    /// `kv recover` reported "should open normally" because it decoded). The heavier fallback —
+    /// rebuilding the LSM from the WAL + surviving SSTs while discarding the bad compaction record
+    /// (construens ask #2) — is DEFERRED and NOT performed here; recover from a clean volume snapshot
+    /// or the object-store backup instead.
+    #[error(
+        "control-plane manifest recovery refused: {examined} manifest generation(s) at `{root}` \
+         DECODE, but NONE opens clean — the newest decodable generation ({newest_generation}) fails \
+         a real open with the `invalid compaction` / missing-referenced-SST shape (an earlier \
+         mid-compaction unclean exit), and every older decodable generation is likewise unopenable. \
+         Refusing to adopt an unopenable generation (it would still fail `Db::open` and could drop \
+         acked data). Recover from a clean volume snapshot \
+         (`boatramp kv recover --adopt-volume <mounted-path>`) or restore the object store from a \
+         backup; rebuilding the LSM from the WAL + surviving SSTs (discarding the bad compaction \
+         record) is not yet automated"
+    )]
+    NoOpenableManifest {
+        /// The store root.
+        root: String,
+        /// How many decodable manifest generations were examined (and all found unopenable).
+        examined: usize,
+        /// The newest decodable generation (the one v0.11.0 would have wrongly adopted).
+        newest_generation: u64,
+    },
+
     /// **MF2 (v0.11.0)** — rolling back to the last-good generation G (durable frontier F) would need a
     /// WAL replay range `(F, …]` that is NOT intact: a WAL id is ABSENT below the highest surviving WAL
     /// object. WAL-GC advanced off a non-durable generation (the fsync silent-loss window this release
@@ -680,12 +710,28 @@ fn check_survivor_contiguity(
     Ok(())
 }
 
-/// **Real-open verification (C4).** Attempt an ACTUAL [`slatedb::Db`] open of the store at `root`
-/// over `store`, with repair DISABLED — the definitive check that the store the repair just
-/// produced genuinely boots (a footer re-scan shares the classifier's blind spot; only a real
-/// replay proves the WAL/L0/manifest are consistent). Builds a throwaway writer with the
-/// background compactor + GC disabled (nothing to drain, so the close is fast and cannot stall),
-/// then closes it. `Ok(())` ⇒ the store opened and closed cleanly; `Err` ⇒ it is NOT repaired.
+/// **Real-open + full-scan verification (C4, extended v0.11.1).** Attempt an ACTUAL [`slatedb::Db`]
+/// open of the store at `root` over `store`, with repair DISABLED, THEN drive a FULL range scan of
+/// every key before closing — the definitive check that the store the repair just produced genuinely
+/// boots AND can SERVE its data.
+///
+/// ## Why a scan, not just open+close (v0.11.1 — the invalid-compaction / missing-SST gap)
+///
+/// `Db::builder().build()` + `close()` proves WAL replay + manifest load + a checkpoint, but it does
+/// **not** read the manifest's referenced L0 / sorted-run SSTs — those are loaded LAZILY on a query.
+/// A manifest generation whose db_state references a **removed or torn compacted SST** (an earlier
+/// mid-compaction unclean exit — the production `Invalid error: invalid compaction` shape) therefore
+/// `build()`s and `close()`s cleanly, only for the real serving `get`/`scan` to die later. A bare
+/// open+close would green-light such a generation. A full range scan forces slatedb to read every
+/// referenced SST block, so a missing/torn referenced SST surfaces HERE as an
+/// [`WalRepairError::OpenVerificationFailed`] rather than at first serve — this is what makes the
+/// last-good-generation walk ([`recover_last_good_manifest`]) adopt a generation that OPENS CLEAN
+/// (serve-able), not merely one that decodes. (Confirmed empirically: deleting a manifest-referenced
+/// L0 SST leaves open+close `Ok`, but the scan errors `object store ... not found`.)
+///
+/// Builds a throwaway writer with the background compactor + GC disabled (nothing to drain, so the
+/// close is fast and cannot stall), scans, then closes it. `Ok(())` ⇒ the store opened, every
+/// referenced SST read, and it closed cleanly; `Err` ⇒ it is NOT serve-able.
 ///
 /// Runs in the fenced, single-writer repair context (no concurrent writer), so briefly claiming
 /// the writer here and releasing it before the caller's real open is safe. The close advances the
@@ -709,6 +755,40 @@ async fn verify_opens(store: &Arc<dyn ObjectStore>, root: &str) -> Result<(), Wa
             root: root.to_string(),
             detail: e.to_string(),
         })?;
+    // FULL SCAN — force a read of every referenced L0 / sorted-run SST (a missing/torn compacted SST
+    // is otherwise invisible to a lazy open; see the doc above). On any scan error, close the throwaway
+    // writer (best-effort) and fail loud so a won't-serve generation is never reported openable.
+    let scan_result: Result<(), WalRepairError> = async {
+        let mut iter = db
+            .scan(..)
+            .await
+            .map_err(|e| WalRepairError::OpenVerificationFailed {
+                root: root.to_string(),
+                detail: format!("store opened but a verification scan could not start: {e}"),
+            })?;
+        loop {
+            match iter.next().await {
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(e) => {
+                    return Err(WalRepairError::OpenVerificationFailed {
+                        root: root.to_string(),
+                        detail: format!(
+                            "store opened but a verification scan failed (a referenced SST is \
+                             missing/torn — invalid-compaction shape): {e}"
+                        ),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+    .await;
+    if let Err(e) = scan_result {
+        // Best-effort close of the throwaway writer before surfacing the scan failure.
+        let _ = db.close().await;
+        return Err(e);
+    }
     // Close the throwaway writer (freeze memtable → L0, advance the frontier, release the fence).
     db.close()
         .await
@@ -930,26 +1010,49 @@ async fn repair_wal_tail_at_frontier(
 // double-counted). WAL-from-0 (no manifest at all) is LOSSY ⇒ last resort only, loud/opt-in, never auto.
 // ===================================================================================================
 
-/// The outcome of an F2 last-good-generation recovery attempt.
+/// The outcome of an F2/v0.11.1 last-good-generation recovery attempt.
 #[derive(Debug, Clone)]
 pub enum ManifestRecovery {
-    /// The LATEST manifest is READABLE — this is NOT the empty/torn-manifest shape, and NOTHING was
-    /// done. The caller should use the ordinary WAL-tail path ([`repair_wal_tail`]). Carries the
-    /// latest frontier so the caller can surface it.
+    /// The LATEST manifest is READABLE **and opens clean** (decodes AND every referenced SST is
+    /// present/intact) — this is NOT the empty/torn-manifest nor the invalid-compaction shape, and
+    /// NOTHING was done. The caller should use the ordinary WAL-tail path ([`repair_wal_tail`]).
+    /// Carries the latest frontier so the caller can surface it. **v0.11.1:** the gate is now
+    /// OPEN-ability (serve-able), not mere decode-ability — a latest that decodes but references a
+    /// removed/torn compacted SST (the `invalid compaction` shape) does NOT short-circuit here; it
+    /// falls through to the generation walk and returns [`RolledBack`](Self::RolledBack).
     LatestReadable {
-        /// `replay_after_wal_id` of the (readable) latest manifest.
+        /// `replay_after_wal_id` of the (readable, openable) latest manifest.
         frontier: u64,
     },
-    /// The latest manifest was empty/torn/absent; recovery rolled back to the highest decodable
-    /// generation G (on [`RepairMode::Apply`]) — or, on [`RepairMode::DryRun`], computed the plan it
-    /// WOULD apply. See [`ManifestRecoveryReport`].
-    RolledBack(ManifestRecoveryReport),
+    /// The latest manifest was empty/torn/absent OR decodes-but-won't-open (invalid compaction); the
+    /// recovery walk adopted the newest generation G that OPENS CLEAN (on [`RepairMode::Apply`]) — or,
+    /// on [`RepairMode::DryRun`], computed the plan it WOULD apply. See [`ManifestRecoveryReport`].
+    /// Boxed so this (large) variant does not bloat the common [`LatestReadable`](Self::LatestReadable)
+    /// no-op variant (clippy `large_enum_variant`).
+    RolledBack(Box<ManifestRecoveryReport>),
 }
 
-/// The plan/outcome of a last-good-generation rollback (F2).
+/// One rung of the generation-walk ladder (v0.11.1): a manifest generation present on the store and
+/// what the recovery walk determined about it. Surfaced in [`ManifestRecoveryReport::candidate_ladder`]
+/// so `boatramp kv recover` can print the exact ladder (which generations were skipped as unopenable,
+/// and which one is adopted) instead of a bare "should open normally".
+#[derive(Debug, Clone)]
+pub struct ManifestCandidate {
+    /// The manifest generation id.
+    pub generation: u64,
+    /// `replay_after_wal_id` of this generation, when it decoded (`None` for an undecodable/torn one).
+    pub frontier: Option<u64>,
+    /// A one-line human status: `adopted (opens clean)`, `skipped: <reason>` (decodes but won't open),
+    /// or `undecodable (torn/empty manifest)`.
+    pub status: String,
+}
+
+/// The plan/outcome of a last-good-generation rollback (F2 / v0.11.1 invalid-compaction walk).
 #[derive(Debug, Clone)]
 pub struct ManifestRecoveryReport {
-    /// The highest decodable manifest generation G the store was (or would be) rolled back to.
+    /// The newest manifest generation G that OPENS CLEAN (v0.11.1: decodes AND is serve-able — every
+    /// referenced SST present/intact), which the store was (or would be) rolled back to. Earlier
+    /// (v0.11.0) this was merely the newest generation that DECODED, which is the bug this release fixes.
     pub rolled_back_to_generation: u64,
     /// G's durable frontier `F = replay_after_wal_id(G)` — the replay boundary (replay starts at F+1).
     pub frontier: u64,
@@ -966,6 +1069,12 @@ pub struct ManifestRecoveryReport {
     /// GC reclaims. Surfaced as a DISTINCT field so it is never conflated with acked loss. (Best-effort;
     /// populated only when cheaply derivable — see the note in [`recover_last_good_manifest`].)
     pub orphaned_nonacked_objects: Vec<String>,
+    /// **v0.11.1** — the full generation-walk ladder (highest generation first): every manifest
+    /// generation present on the store with its openability verdict (adopted / skipped-unopenable /
+    /// undecodable). Lets `boatramp kv recover` print the candidate ladder + the generation it expects
+    /// to adopt, so a decodes-but-won't-open latest is classified RECOVERABLE (never "should open
+    /// normally"). The adopted generation equals [`Self::rolled_back_to_generation`].
+    pub candidate_ladder: Vec<ManifestCandidate>,
     /// Whether the pass mutated the store (`false` for a dry-run).
     pub applied: bool,
 }
@@ -1188,34 +1297,158 @@ async fn assert_no_torn_manifest_remains(
     Ok(())
 }
 
-/// **F2 — last-good-generation cold-open recovery.** When the LATEST manifest is empty/torn/absent,
-/// walk the manifest generations highest → lowest, pick the highest that DECODES = G (frontier
-/// F = `replay_after_wal_id(G)`), quarantine the torn suffix (id > G) so G becomes the latest, then run
-/// the existing WAL-tail self-heal at F and (on Apply) a real-open verify with a FRESH handle. Returns
-/// [`ManifestRecovery::LatestReadable`] (no-op) when the latest manifest is actually readable — so the
-/// caller can fall through to the ordinary [`repair_wal_tail`] WAL-tail path.
-///
-/// Control flow (Apply): read_frontier(latest) fails → list generations desc → pick G (fail loud
-/// [`NoDecodableManifest`] if none decode) → MF2 guards (GC boundary + no leading/interior WAL GC hole,
-/// fail loud [`BelowGcBoundary`] / [`ManifestRollbackGcHole`]) → quarantine the torn manifest suffix
-/// OUTSIDE `manifest/` (copy → record → delete) → assert none remain → WAL-tail self-heal at F +
-/// fresh-handle `verify_opens`. A refusal at ANY step fails loud (mutating nothing beyond a
-/// crash-safe quarantine), never a lossy WAL-from-0.
-///
-/// `orphaned_nonacked_objects` is a best-effort informational field: after G becomes the latest, the L0
-/// SST(s) that only torn N referenced are unreferenced. Identifying them precisely needs G's SST list
-/// mapped to object paths; slatedb's reopened store GC reclaims them regardless, so this is left empty
-/// (documented) rather than risk mislabelling a live SST as orphaned. Space reclamation, never loss.
-pub async fn recover_last_good_manifest(
+/// List `{root}/compacted/` once, returning each `.sst` object's filename → size. The non-mutating
+/// structural openability check ([`generation_structurally_openable`]) tests a manifest generation's
+/// referenced compacted SSTs against this set (existence) and re-probes present ones for a torn footer.
+async fn list_compacted_sizes(
     store: &Arc<dyn ObjectStore>,
     root: &str,
-    mode: RepairMode,
-) -> Result<ManifestRecovery, WalRepairError> {
-    // 0. Shape gate: if the LATEST manifest is readable, this is NOT the empty/torn-manifest shape.
-    if let Ok(frontier) = read_frontier(store, root).await {
-        return Ok(ManifestRecovery::LatestReadable { frontier });
+) -> Result<std::collections::BTreeMap<String, u64>, WalRepairError> {
+    use futures::StreamExt;
+    let prefix = ObjPath::from(format!("{root}/compacted"));
+    let mut stream = store.list(Some(&prefix));
+    let mut out = std::collections::BTreeMap::new();
+    while let Some(item) = stream.next().await {
+        let meta = item.map_err(|e| WalRepairError::Store(e.to_string()))?;
+        if let Some(name) = meta.location.filename()
+            && name.ends_with(".sst")
+        {
+            out.insert(name.to_string(), meta.size);
+        }
+    }
+    Ok(out)
+}
+
+/// **Non-mutating structural openability prediction (v0.11.1).** Given a DECODED manifest generation,
+/// predict whether a real open + full scan ([`verify_opens`]) would succeed — WITHOUT opening the store
+/// (a writer open fences and writes a manifest; it cannot be used in a dry-run). The prediction mirrors
+/// the exact failure the invalid-compaction shape causes: a referenced compacted SST that is REMOVED
+/// (an earlier mid-compaction unclean exit, the production `invalid compaction`) or TORN. It enumerates
+/// the generation's referenced L0 + sorted-run SSTs (every one a `SsTableId::Compacted(ulid)` →
+/// `{root}/compacted/{ulid}.sst`) and checks each is present (via `compacted`) and not torn (re-probing
+/// the footer with [`classify`]).
+///
+/// Returns `Ok(None)` = predicted serve-able; `Ok(Some(reason))` = predicted UNOPENABLE (names the first
+/// missing/torn SST); `Err` for a shape this predictor does not model — a store with **external DBs** or
+/// a **segment extractor** (non-standard SST paths). Control-plane KV uses neither (no external_dbs, no
+/// segments — verified at seed), so the `Err` path is a defensive fail-loud, never hit in production.
+///
+/// This is the DRY-RUN authority; [`verify_opens`] (a real open + scan) is the APPLY authority and the
+/// final word (so a failure mode this structural check cannot see still fails loud on apply, never a
+/// false success).
+async fn generation_structurally_openable(
+    store: &Arc<dyn ObjectStore>,
+    root: &str,
+    vm: &slatedb::VersionedManifest,
+    compacted: &std::collections::BTreeMap<String, u64>,
+) -> Result<Option<String>, WalRepairError> {
+    use slatedb::object_store_tag::SstType;
+
+    // Defensive: this predictor derives `{root}/compacted/{ulid}.sst` paths, which only hold for a
+    // plain (non-external, non-segmented) store. Control-plane KV is always plain; anything else is a
+    // shape we refuse to predict rather than mispredict.
+    if !vm.external_dbs().is_empty() || !vm.segments().is_empty() {
+        return Err(WalRepairError::Store(format!(
+            "structural openability prediction unsupported at `{root}`: the manifest references \
+             external DBs ({}) or segment extractor(s) ({}) with non-standard SST paths",
+            vm.external_dbs().len(),
+            vm.segments().len()
+        )));
     }
 
+    // Collect every referenced compacted SST filename `{ulid}.sst` (L0 views + each sorted run's
+    // views). L0 and sorted-run SSTs are ALWAYS `Compacted` (WAL SSTs never appear here); the `SstType`
+    // guard makes `unwrap_compacted_id()` panic-proof regardless. The ULID's `Display` is used directly
+    // (the `ulid` type lives in slatedb's private module and need not be named here).
+    let mut referenced_filenames: Vec<String> = Vec::new();
+    for view in vm.l0() {
+        if SstType::from(&view.sst.id) == SstType::Compacted {
+            referenced_filenames.push(format!("{}.sst", view.sst.id.unwrap_compacted_id()));
+        }
+    }
+    for sr in vm.compacted() {
+        for view in sr.sst_views() {
+            if SstType::from(&view.sst.id) == SstType::Compacted {
+                referenced_filenames.push(format!("{}.sst", view.sst.id.unwrap_compacted_id()));
+            }
+        }
+    }
+
+    for filename in referenced_filenames {
+        match compacted.get(&filename) {
+            None => {
+                return Ok(Some(format!(
+                    "references a REMOVED compacted SST `{root}/compacted/{filename}` (invalid \
+                     compaction — an earlier mid-compaction unclean exit left the manifest pointing \
+                     at an object that no longer exists)"
+                )));
+            }
+            Some(&size) => {
+                // Present — re-probe the footer: a torn (version-0 / truncated) compacted SST decodes
+                // in the manifest but fails the real open+scan just as a missing one does.
+                let path = ObjPath::from(format!("{root}/compacted/{filename}"));
+                if classify(store, &path, size).await? == WalClass::Torn {
+                    return Ok(Some(format!(
+                        "references a TORN compacted SST `{root}/compacted/{filename}` (a bad footer \
+                         version — invalid-compaction/partial-write shape)"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// **Mutation seam (CI host-lane).** Returns `false` in the shipped code: the generation walk adopts
+/// the newest generation that OPENS CLEAN (decodes AND is structurally serve-able). The CI mutation loop
+/// flips this to `true` to reproduce the **v0.11.0 bug** — adopt the newest generation that merely
+/// DECODES, SKIPPING the openability check — under which
+/// `recover_adopts_newest_openable_generation_and_crown_jewel_survives` goes RED (the adopted
+/// invalid-compaction generation then fails the real open + scan verify). A function (not a `const`) so
+/// the shipped `false` is a runtime value, not a clippy constant-condition lint.
+#[inline]
+fn stop_at_first_decodable() -> bool {
+    false
+}
+
+/// The adopted generation + the quarantine plan computed by the NON-MUTATING generation walk.
+struct GenerationWalkPlan {
+    /// The newest generation that OPENS CLEAN (decodes AND structurally serve-able).
+    adopted_generation: u64,
+    /// The adopted generation's durable frontier `F = replay_after_wal_id`.
+    adopted_frontier: u64,
+    /// Every PRESENT `manifest/{:020}.manifest` id strictly above the adopted generation — the suffix
+    /// to quarantine so the adopted generation becomes the latest (undecodable torn ids AND decodable-
+    /// but-unopenable ids the walk skipped).
+    quarantine_ids: Vec<u64>,
+    /// The full candidate ladder (highest generation first) for the report / `kv recover` print.
+    candidate_ladder: Vec<ManifestCandidate>,
+}
+
+/// **The generation walk (v0.11.1), NON-MUTATING.** Walk the manifest generations highest → lowest and
+/// find the newest that OPENS CLEAN — decodes AND is structurally serve-able (every referenced SST
+/// present/intact), re-running the MF2 GC-boundary + WAL-contiguity guards at EACH candidate's frontier.
+/// This is the authority for both the DRY-RUN plan AND the generation the APPLY path targets before it
+/// mutates anything (so a store with no openable generation fails loud WITHOUT gutting `manifest/`).
+///
+/// Why structural (not a real open) here: a real writer open FENCES and writes a manifest, so it cannot
+/// run in a dry-run and would mutate even a healthy store; and `verify_opens` opens the LATEST, so
+/// testing an older candidate by real open would require quarantining the suffix above it first (a
+/// mutation). The structural check ([`generation_structurally_openable`]) predicts the exact
+/// invalid-compaction / missing-SST failure non-mutatingly; [`verify_opens`] is the apply-time final word.
+///
+/// Walking DOWN adopts a LOWER frontier = a LONGER WAL replay range, which stays lossless ONLY if
+/// contiguous — so MF2 is re-checked at each candidate. An MF2 failure (hole / below GC boundary) at a
+/// candidate fails LOUD and stops: a lower candidate has an even longer range (a superset), so its range
+/// contains the same hole — continuing cannot help and adopting it would silently drop acked data.
+///
+/// Returns the adopted plan, or fails loud: [`WalRepairError::NoDecodableManifest`] (nothing decodes),
+/// [`WalRepairError::NoOpenableManifest`] (some decode but none opens clean — never adopt an unopenable
+/// generation), [`WalRepairError::ManifestRollbackGcHole`] / [`WalRepairError::BelowGcBoundary`] (MF2).
+async fn plan_generation_walk(
+    store: &Arc<dyn ObjectStore>,
+    root: &str,
+) -> Result<GenerationWalkPlan, WalRepairError> {
     // 1. Enumerate manifest generation ids present on the store (descending).
     let manifest_ids = list_manifest_ids(store, root).await?;
     if manifest_ids.is_empty() {
@@ -1225,46 +1458,167 @@ pub async fn recover_last_good_manifest(
         });
     }
 
-    // 2. Walk highest → lowest; the first that DECODES is the last-good generation G (frontier F). Every
-    //    id above G is non-decodable (else we'd have adopted it), so the torn suffix to quarantine is
-    //    exactly the PRESENT manifest FILES with id > G (derived from the listing, not the walk's
-    //    `Err`/`Ok(None)` split — a 0-byte torn manifest is a PRESENT file that must be removed for G to
-    //    become the clean latest, even if `read_manifest` reports it `Ok(None)`).
+    // Read-only inputs gathered once for the whole walk.
     let admin = Admin::builder(root.to_string(), store.clone()).build();
-    let mut good: Option<(u64, u64)> = None; // (generation G, frontier F)
+    let compacted = list_compacted_sizes(store, root).await?;
+    let wal_ids = list_wal_ids(store, root).await?;
+    let boundary = read_manifest_gc_boundary(store, root).await;
+
+    let mut ladder: Vec<ManifestCandidate> = Vec::new();
+    let mut examined_decodable = 0usize;
+    let mut newest_decodable: Option<u64> = None;
+
     for &id in &manifest_ids {
-        if let Ok(Some(vm)) = admin.read_manifest(Some(id)).await {
-            good = Some((id, vm.replay_after_wal_id()));
-            break;
+        // Decode the generation. Undecodable / reported-absent ⇒ a torn-suffix rung; keep walking down.
+        let vm = match admin.read_manifest(Some(id)).await {
+            Ok(Some(vm)) => vm,
+            Ok(None) | Err(_) => {
+                ladder.push(ManifestCandidate {
+                    generation: id,
+                    frontier: None,
+                    status: "undecodable (torn/empty manifest)".to_string(),
+                });
+                continue;
+            }
+        };
+        let frontier = vm.replay_after_wal_id();
+        examined_decodable += 1;
+        newest_decodable.get_or_insert(id);
+
+        // MF2 (a) — never adopt a generation below the manifest GC boundary. A lower candidate is even
+        // further below, so this is terminal for the walk (fail loud).
+        if id < boundary {
+            return Err(WalRepairError::BelowGcBoundary {
+                root: root.to_string(),
+                generation: id,
+                boundary,
+            });
         }
-        // Undecodable (`Err`) or reported-absent (`Ok(None)`) — keep walking down.
+        // MF2 (b) — the WAL replay range (F, …] must have NO leading/interior GC hole. A lower
+        // candidate's range is a superset, so a hole here is a hole for every lower candidate too —
+        // fail loud (continuing cannot reach a safe lower generation).
+        check_manifest_rollback_wal_contiguity(&wal_ids, frontier, root)?;
+
+        // Openability: the first decodable generation that is structurally serve-able is adopted.
+        // (Mutation seam: `stop_at_first_decodable()` → treat the first decodable generation as openable,
+        // reproducing the v0.11.0 bug for the mutation-verified gate.)
+        let openability = if stop_at_first_decodable() {
+            None
+        } else {
+            generation_structurally_openable(store, root, &vm, &compacted).await?
+        };
+        match openability {
+            None => {
+                ladder.push(ManifestCandidate {
+                    generation: id,
+                    frontier: Some(frontier),
+                    status: "adopted (opens clean)".to_string(),
+                });
+                let quarantine_ids: Vec<u64> =
+                    manifest_ids.iter().copied().filter(|&m| m > id).collect();
+                return Ok(GenerationWalkPlan {
+                    adopted_generation: id,
+                    adopted_frontier: frontier,
+                    quarantine_ids,
+                    candidate_ladder: ladder,
+                });
+            }
+            Some(reason) => {
+                ladder.push(ManifestCandidate {
+                    generation: id,
+                    frontier: Some(frontier),
+                    status: format!("skipped: {reason}"),
+                });
+                // Decodes but won't open — keep walking down to an older, serve-able generation.
+            }
+        }
     }
-    let Some((generation, frontier)) = good else {
-        return Err(WalRepairError::NoDecodableManifest {
+
+    // No generation opened clean.
+    if examined_decodable == 0 {
+        Err(WalRepairError::NoDecodableManifest {
             root: root.to_string(),
             listed: manifest_ids.len(),
-        });
-    };
-    // The torn suffix = every present manifest file strictly above the adopted generation G.
-    let torn_suffix: Vec<u64> = manifest_ids
-        .iter()
-        .copied()
-        .filter(|&id| id > generation)
-        .collect();
-
-    // 3. MF2 GUARDS — never adopt a generation that would drop acked data.
-    //    (a) never adopt a generation below the manifest GC boundary.
-    let boundary = read_manifest_gc_boundary(store, root).await;
-    if generation < boundary {
-        return Err(WalRepairError::BelowGcBoundary {
+        })
+    } else {
+        Err(WalRepairError::NoOpenableManifest {
             root: root.to_string(),
-            generation,
-            boundary,
-        });
+            examined: examined_decodable,
+            newest_generation: newest_decodable.expect("examined_decodable > 0 implies a newest"),
+        })
     }
-    //    (b) the WAL replay range (F, …] must have NO leading/interior GC hole.
-    let wal_ids = list_wal_ids(store, root).await?;
-    check_manifest_rollback_wal_contiguity(&wal_ids, frontier, root)?;
+}
+
+/// **F2 / v0.11.1 — last-good-generation cold-open recovery (adopt the newest generation that OPENS
+/// CLEAN).** When the LATEST manifest is empty/torn/absent OR decodes-but-won't-open (the invalid-
+/// compaction / missing-referenced-SST shape), walk the manifest generations highest → lowest and adopt
+/// the newest that OPENS CLEAN — decodes AND is serve-able (every referenced SST present/intact) — then
+/// quarantine the suffix above it (torn AND decodable-but-unopenable generations) so it becomes the
+/// latest, run the WAL-tail self-heal at its frontier F, and (on Apply) a real open **+ full scan**
+/// verify ([`verify_opens`]) with a FRESH handle. Returns [`ManifestRecovery::LatestReadable`] (no-op)
+/// when the latest manifest both decodes AND is serve-able — so the caller falls through to the ordinary
+/// [`repair_wal_tail`] WAL-tail path.
+///
+/// ## v0.11.0 → v0.11.1: OPEN-ability, not decode-ability
+/// v0.11.0 adopted the newest generation that merely DECODED. A generation can decode yet fail
+/// `Db::open` — the production store rolled back to a generation that then died with `Invalid error:
+/// invalid compaction` (an earlier mid-compaction unclean exit left the manifest referencing a removed
+/// compacted SST), and `kv recover` reported "should open normally" because it decoded. The health
+/// criterion is now OPEN-ability: the shape-gate and the walk use [`generation_structurally_openable`]
+/// (dry-run) / [`verify_opens`] (apply, a real open + full scan) so a decodes-but-won't-open generation
+/// is SKIPPED, never adopted. If NO decodable generation opens clean, recovery fails loud with
+/// [`WalRepairError::NoOpenableManifest`] (pointing to a snapshot / backup; the heavier LSM-rebuild-from-
+/// WAL fallback is deferred) — NEVER adopt an unopenable generation.
+///
+/// ## Control flow
+/// Shape-gate: the latest decodes AND is structurally serve-able ⇒ `LatestReadable`. Otherwise plan the
+/// walk ([`plan_generation_walk`], non-mutating: fail loud [`NoDecodableManifest`] / [`NoOpenableManifest`]
+/// / MF2 [`BelowGcBoundary`] / [`ManifestRollbackGcHole`]). DryRun returns the plan (mutating nothing).
+/// Apply quarantines the suffix above the adopted generation OUTSIDE `manifest/` (copy → record →
+/// delete) → asserts none remain → WAL-tail self-heal at F + fresh-handle `verify_opens`. A refusal at
+/// ANY step fails loud (mutating nothing beyond a crash-safe quarantine), never a lossy WAL-from-0.
+///
+/// `orphaned_nonacked_objects` is a best-effort informational field: after G becomes the latest, the L0
+/// SST(s) that only a discarded generation referenced are unreferenced. Identifying them precisely needs
+/// G's SST list mapped to object paths; slatedb's reopened store GC reclaims them regardless, so this is
+/// left empty (documented) rather than risk mislabelling a live SST as orphaned. Space reclamation,
+/// never loss.
+pub async fn recover_last_good_manifest(
+    store: &Arc<dyn ObjectStore>,
+    root: &str,
+    mode: RepairMode,
+) -> Result<ManifestRecovery, WalRepairError> {
+    // 0. Shape gate (v0.11.1): the latest manifest is "healthy" only if it DECODES *and* OPENS CLEAN.
+    //    A decodes-but-won't-open latest (invalid compaction / missing-referenced-SST) must NOT
+    //    short-circuit to `LatestReadable` — it falls through to the generation walk below.
+    let admin = Admin::builder(root.to_string(), store.clone()).build();
+    if let Ok(Some(latest_vm)) = admin.read_manifest(None).await {
+        // The latest decodes. Is it structurally serve-able (every referenced SST present/intact)?
+        let compacted = list_compacted_sizes(store, root).await?;
+        if generation_structurally_openable(store, root, &latest_vm, &compacted)
+            .await?
+            .is_none()
+        {
+            // Decodes AND opens clean ⇒ NOT the manifest/invalid-compaction shape. Any open failure the
+            // caller saw is a WAL-tail (or out-of-scope torn) issue — defer to the WAL-tail path.
+            return Ok(ManifestRecovery::LatestReadable {
+                frontier: latest_vm.replay_after_wal_id(),
+            });
+        }
+        // Decodes but references a removed/torn SST — fall through to the walk (the invalid-compaction
+        // shape v0.11.0 missed). (We don't early-return `RolledBack` here: the walk re-derives the plan
+        // uniformly whether the latest is torn-unreadable OR decodable-but-unopenable.)
+    }
+
+    // 1+2. Plan the generation walk (non-mutating): the newest generation that OPENS CLEAN, with MF2
+    //       re-checked at each candidate's frontier. Fails loud rather than adopt an unopenable one.
+    let plan = plan_generation_walk(store, root).await?;
+    let GenerationWalkPlan {
+        adopted_generation: generation,
+        adopted_frontier: frontier,
+        quarantine_ids: torn_suffix,
+        candidate_ladder,
+    } = plan;
 
     // Informational only (UX C11 / MF6): reclaimable orphans, never loss. Left empty (see the doc).
     let orphaned_nonacked_objects: Vec<String> = Vec::new();
@@ -1272,23 +1626,28 @@ pub async fn recover_last_good_manifest(
     match mode {
         RepairMode::DryRun => {
             // Compute the WAL-tail plan at F WITHOUT reading the (still-torn) latest manifest, and
-            // mutate NOTHING (the torn manifest suffix is retained).
+            // mutate NOTHING (the quarantine suffix is retained).
             let wal_repair =
                 repair_wal_tail_at_frontier(store, root, frontier, RepairMode::DryRun).await?;
             let manifest_quarantine_dir = (!torn_suffix.is_empty())
                 .then(|| format!("{root}/manifest-quarantine/<stamp>/ (dry-run: not created)"));
-            Ok(ManifestRecovery::RolledBack(ManifestRecoveryReport {
-                rolled_back_to_generation: generation,
-                frontier,
-                quarantined_manifest_ids: torn_suffix,
-                manifest_quarantine_dir,
-                wal_repair,
-                orphaned_nonacked_objects,
-                applied: false,
-            }))
+            Ok(ManifestRecovery::RolledBack(Box::new(
+                ManifestRecoveryReport {
+                    rolled_back_to_generation: generation,
+                    frontier,
+                    quarantined_manifest_ids: torn_suffix,
+                    manifest_quarantine_dir,
+                    wal_repair,
+                    orphaned_nonacked_objects,
+                    candidate_ladder,
+                    applied: false,
+                },
+            )))
         }
         RepairMode::Apply => {
-            // (a) quarantine the torn manifest suffix so G becomes the latest (copy → record → delete).
+            // (a) quarantine the suffix above the adopted generation so it becomes the latest
+            //     (copy → record → delete). The suffix includes torn generations AND the decodable-but-
+            //     unopenable generations the walk skipped.
             let manifest_quarantine_dir = if torn_suffix.is_empty() {
                 None
             } else {
@@ -1296,21 +1655,27 @@ pub async fn recover_last_good_manifest(
                 quarantine_manifest_suffix(store, root, generation, &torn_suffix, &stamp).await?;
                 Some(format!("{root}/manifest-quarantine/{stamp}"))
             };
-            // (b) ASSERT no torn manifest > G remains before verify (Arch C2 / MF4).
+            // (b) ASSERT no manifest > G remains before verify (Arch C2 / MF4).
             assert_no_torn_manifest_remains(store, root, generation).await?;
             // (c) WAL-tail self-heal at F over the now-G-latest store: quarantine a torn WAL tail
-            //     beyond F (if any), then `verify_opens` with a FRESH slatedb handle (Arch C6).
+            //     beyond F (if any), then `verify_opens` (real open + full scan, the APPLY authority)
+            //     with a FRESH slatedb handle (Arch C6). If the adopted generation still fails the real
+            //     open+scan (a failure mode the structural predictor could not see), this fails loud —
+            //     never a false success.
             let wal_repair =
                 repair_wal_tail_at_frontier(store, root, frontier, RepairMode::Apply).await?;
-            Ok(ManifestRecovery::RolledBack(ManifestRecoveryReport {
-                rolled_back_to_generation: generation,
-                frontier,
-                quarantined_manifest_ids: torn_suffix,
-                manifest_quarantine_dir,
-                wal_repair,
-                orphaned_nonacked_objects,
-                applied: true,
-            }))
+            Ok(ManifestRecovery::RolledBack(Box::new(
+                ManifestRecoveryReport {
+                    rolled_back_to_generation: generation,
+                    frontier,
+                    quarantined_manifest_ids: torn_suffix,
+                    manifest_quarantine_dir,
+                    wal_repair,
+                    orphaned_nonacked_objects,
+                    candidate_ladder,
+                    applied: true,
+                },
+            )))
         }
     }
 }
@@ -2349,6 +2714,273 @@ mod tests {
             ManifestRecovery::LatestReadable { .. } => {}
             other => panic!("a readable latest manifest must be a no-op, got {other:?}"),
         }
+    }
+
+    // ===================================================================================
+    // v0.11.1 — the INVALID-COMPACTION walk: adopt the newest generation that OPENS CLEAN,
+    // not merely one that DECODES. Over a shared `InMemory` store (deterministic, non-stalling).
+    // ===================================================================================
+
+    /// Seed the invalid-compaction fixture: a crown-jewel write checkpointed into L0 under an OLDER
+    /// generation (the one that must be adopted), then a JUNK write checkpointed into a SECOND L0 SST
+    /// under the LATEST generation — then DELETE that second L0 SST. The latest generation now DECODES
+    /// but references a REMOVED compacted SST (the production `invalid compaction` / mid-compaction
+    /// unclean-exit shape), while the older crown generation references only the surviving crown SST.
+    ///
+    /// Returns `(highest_decodable_gen, deleted_junk_sst_filename)`. Compactor + GC OFF so no real
+    /// compaction runs and no WAL is GC'd (the junk WAL survives, so the rollback replays it losslessly).
+    async fn seed_invalid_compaction_fixture(
+        store: &Arc<dyn ObjectStore>,
+        root: &str,
+    ) -> (u64, String) {
+        use slatedb::config::{FlushOptions, FlushType};
+        #[allow(clippy::field_reassign_with_default)]
+        let settings = {
+            let mut s = Settings::default();
+            s.flush_interval = Some(Duration::from_millis(5));
+            s.compactor_options = None;
+            s.garbage_collector_options = None;
+            s
+        };
+        let db = Db::builder(root.to_string(), store.clone())
+            .with_settings(settings)
+            .build()
+            .await
+            .unwrap();
+        // Crown jewel → L0 #1 (the crown generation).
+        db.put(b"secret/acme/idp", b"sealed-crown-jewel")
+            .await
+            .unwrap()
+            .await_durable()
+            .await
+            .unwrap();
+        db.flush_with_options(FlushOptions {
+            flush_type: FlushType::MemTable,
+        })
+        .await
+        .unwrap();
+        let s1: std::collections::BTreeSet<String> = list_compacted_sizes(store, root)
+            .await
+            .unwrap()
+            .into_keys()
+            .collect();
+        // Junk → L0 #2 (the latest generation references BOTH L0 SSTs).
+        db.put(b"zzz/junk", b"junk-value")
+            .await
+            .unwrap()
+            .await_durable()
+            .await
+            .unwrap();
+        db.flush_with_options(FlushOptions {
+            flush_type: FlushType::MemTable,
+        })
+        .await
+        .unwrap();
+        db.close().await.unwrap();
+        let s2: std::collections::BTreeSet<String> = list_compacted_sizes(store, root)
+            .await
+            .unwrap()
+            .into_keys()
+            .collect();
+        // The SECOND-flush L0 SST = exactly the one present now but not after the first flush.
+        let junk: Vec<String> = s2.difference(&s1).cloned().collect();
+        assert_eq!(
+            junk.len(),
+            1,
+            "fixture must add exactly one L0 SST on the second flush: s1={s1:?} s2={s2:?}"
+        );
+        let junk_sst = junk.into_iter().next().unwrap();
+        // DELETE it → the latest generation now references a REMOVED compacted SST (invalid compaction).
+        store
+            .delete(&ObjPath::from(format!("{root}/compacted/{junk_sst}")))
+            .await
+            .unwrap();
+        let highest = highest_manifest_id(store, root).await;
+        (highest, junk_sst)
+    }
+
+    /// **v0.11.1 GATE (mutation-verified) — adopt the newest generation that OPENS CLEAN.** The latest
+    /// manifest DECODES but references a REMOVED compacted SST (invalid compaction). DRY-RUN classifies
+    /// it RECOVERABLE and plans the walk; APPLY adopts an OLDER generation that opens clean and the
+    /// crown-jewel survives byte-equal (reopen via a FRESH Db).
+    ///
+    /// MUTATION `stop_at_first_decodable()` (the v0.11.0 behavior — adopt the newest DECODABLE
+    /// generation, skipping the openability check): the adopted latest generation references the removed
+    /// SST, so the real open + full-scan verify ([`verify_opens`]) FAILS → `recover_last_good_manifest`
+    /// returns `Err` → the `.unwrap()` below panics → RED. The fix (adopt the newest that OPENS CLEAN)
+    /// walks past the unopenable generation(s) to the crown generation → GREEN.
+    #[serial_test::serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn recover_adopts_newest_openable_generation_and_crown_jewel_survives() {
+        let store = mem_store();
+        let root = "kv";
+        let (highest_decodable, junk_sst) = seed_invalid_compaction_fixture(&store, root).await;
+
+        // The latest manifest DECODES (so v0.11.0 reported "should open normally")...
+        assert!(
+            read_frontier(&store, root).await.is_ok(),
+            "the latest manifest must DECODE (the invalid-compaction trigger: decodes but won't open)"
+        );
+
+        // DRY-RUN: classifies RECOVERABLE, plans the walk to an OLDER generation, mutates NOTHING.
+        let dry = match recover_last_good_manifest(&store, root, RepairMode::DryRun)
+            .await
+            .unwrap()
+        {
+            ManifestRecovery::RolledBack(r) => r,
+            other => panic!("a decodes-but-won't-open latest must be RolledBack, got {other:?}"),
+        };
+        assert!(!dry.applied, "dry-run must not mutate");
+        assert!(
+            dry.rolled_back_to_generation < highest_decodable,
+            "the walk must adopt an OLDER generation ({}) than the highest decodable latest ({highest_decodable})",
+            dry.rolled_back_to_generation
+        );
+        assert!(
+            dry.candidate_ladder
+                .iter()
+                .any(|c| c.status.starts_with("skipped:") && c.status.contains(&junk_sst)),
+            "the ladder must SKIP the decodes-but-won't-open latest naming the removed SST: {:?}",
+            dry.candidate_ladder
+        );
+        assert!(
+            dry.candidate_ladder
+                .iter()
+                .any(|c| c.generation == dry.rolled_back_to_generation
+                    && c.status == "adopted (opens clean)"),
+            "the ladder must mark the adopted generation: {:?}",
+            dry.candidate_ladder
+        );
+        // Dry-run mutated nothing: the decodable-but-unopenable latest manifest is still present.
+        assert!(
+            store
+                .head(&manifest_object_path(root, highest_decodable))
+                .await
+                .is_ok(),
+            "dry-run must retain the latest (unopenable) manifest generation"
+        );
+
+        // APPLY: adopts the older openable generation; `verify_opens` (open + full scan) proves it serves.
+        let report = match recover_last_good_manifest(&store, root, RepairMode::Apply)
+            .await
+            .unwrap()
+        {
+            ManifestRecovery::RolledBack(r) => r,
+            other => panic!("expected RolledBack, got {other:?}"),
+        };
+        assert!(report.applied);
+        assert!(
+            report.rolled_back_to_generation < highest_decodable,
+            "APPLY must adopt an OLDER openable generation"
+        );
+        assert_eq!(
+            report.rolled_back_to_generation, dry.rolled_back_to_generation,
+            "APPLY must adopt the SAME generation the dry-run predicted"
+        );
+
+        // The recovered store OPENS and the crown-jewel survives BYTE-EQUAL (anti-hollow: a rollback to
+        // the wrong generation, or adopting the unopenable latest, would miss the key or fail to open).
+        assert_eq!(
+            read_key_via_fresh_db(&store, root, b"secret/acme/idp").await,
+            Some(b"sealed-crown-jewel".to_vec()),
+            "the acked crown-jewel MUST survive the invalid-compaction generation walk byte-equal"
+        );
+        // Lossless: the junk write (checkpointed into the DELETED SST) is recovered from the surviving
+        // WAL by the lower-frontier replay — nothing acked is dropped.
+        assert_eq!(
+            read_key_via_fresh_db(&store, root, b"zzz/junk").await,
+            Some(b"junk-value".to_vec()),
+            "the acked junk write MUST be replayed from the WAL (lossless-for-acked rollback)"
+        );
+    }
+
+    /// **v0.11.1** — the non-mutating structural openability predictor flags a REMOVED and a TORN
+    /// referenced compacted SST (the dry-run authority), and passes a clean generation. Mutation-free
+    /// unit coverage of the predictor the walk and shape-gate rely on.
+    #[serial_test::serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn generation_structurally_openable_flags_missing_and_torn_referenced_sst() {
+        let store = mem_store();
+        let root = "kv";
+        seed_real_store_with_secret(&store, root).await; // crown in L0, clean
+        let admin = Admin::builder(root.to_string(), store.clone()).build();
+        let vm = admin.read_manifest(None).await.unwrap().unwrap();
+
+        // Clean store ⇒ predicted openable.
+        let compacted = list_compacted_sizes(&store, root).await.unwrap();
+        assert!(
+            generation_structurally_openable(&store, root, &vm, &compacted)
+                .await
+                .unwrap()
+                .is_none(),
+            "a clean generation (all referenced SSTs present/intact) is predicted openable"
+        );
+
+        // Pick a referenced L0 SST filename from the compacted dir.
+        let sst = compacted
+            .keys()
+            .next()
+            .cloned()
+            .expect("the seeded store has at least one L0 SST");
+
+        // TORN the referenced SST (version-0 footer) ⇒ predicted UNOPENABLE naming it.
+        store
+            .put(
+                &ObjPath::from(format!("{root}/compacted/{sst}")),
+                footer_object(128, 0).into(),
+            )
+            .await
+            .unwrap();
+        let compacted_torn = list_compacted_sizes(&store, root).await.unwrap();
+        let torn_reason = generation_structurally_openable(&store, root, &vm, &compacted_torn)
+            .await
+            .unwrap();
+        assert!(
+            torn_reason
+                .as_deref()
+                .is_some_and(|r| r.contains(&sst) && r.contains("TORN")),
+            "a torn referenced SST ⇒ predicted unopenable naming it: {torn_reason:?}"
+        );
+
+        // REMOVE the referenced SST ⇒ predicted UNOPENABLE (REMOVED).
+        store
+            .delete(&ObjPath::from(format!("{root}/compacted/{sst}")))
+            .await
+            .unwrap();
+        let compacted_gone = list_compacted_sizes(&store, root).await.unwrap();
+        let gone_reason = generation_structurally_openable(&store, root, &vm, &compacted_gone)
+            .await
+            .unwrap();
+        assert!(
+            gone_reason
+                .as_deref()
+                .is_some_and(|r| r.contains(&sst) && r.contains("REMOVED")),
+            "a removed referenced SST ⇒ predicted unopenable (REMOVED) naming it: {gone_reason:?}"
+        );
+    }
+
+    /// **v0.11.1** — the terminal [`WalRepairError::NoOpenableManifest`] names the invalid-compaction
+    /// shape and points at the snapshot/rebuild fallback (never a silent adopt-anyway). Message-shape
+    /// unit test (the e2e terminal is impractical: the empty initial generation replays the whole WAL
+    /// and is itself openable whenever the WAL is contiguous, so a real store rarely exhausts the walk).
+    #[test]
+    fn no_openable_manifest_error_names_the_invalid_compaction_shape() {
+        let err = WalRepairError::NoOpenableManifest {
+            root: "kv".to_string(),
+            examined: 3,
+            newest_generation: 2869,
+        };
+        let msg = format!("{err}");
+        assert!(msg.contains("NONE opens clean"), "msg: {msg}");
+        assert!(msg.contains("invalid compaction"), "msg: {msg}");
+        assert!(
+            msg.contains("2869"),
+            "names the newest decodable generation: {msg}"
+        );
+        assert!(
+            msg.contains("volume snapshot") || msg.contains("backup"),
+            "points at the snapshot/backup fallback: {msg}"
+        );
     }
 
     /// **F1b INVARIANT PIN (MF2 / Security — the single blind spot the mutation suite was missing).**

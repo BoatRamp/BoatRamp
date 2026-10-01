@@ -450,22 +450,25 @@ async fn run_recover(args: RecoverArgs) -> Result<(), Error> {
             }
         }
         Ok(ManifestRecovery::RolledBack(report)) => {
-            // The empty/torn LATEST manifest shape (UX C5): the dry-run WORKS (prints the fallback
-            // plan) and `--apply` rolls back to the last-good generation in place, non-destructively
-            // (the torn manifest bytes are retained under `manifest-quarantine/` until verify).
+            // The empty/torn LATEST manifest shape (UX C5) OR the v0.11.1 invalid-compaction shape (the
+            // latest DECODES but won't open — a referenced compacted SST was removed/torn): the dry-run
+            // WORKS (prints the walk ladder + the generation it will adopt) and `--apply` adopts the
+            // newest generation that OPENS CLEAN in place, non-destructively (the quarantined manifest
+            // generations are retained under `manifest-quarantine/` until verify).
             print_manifest_recovery(&report, args.apply);
             if !args.apply {
                 println!(
-                    "\nRe-run `boatramp kv recover --apply` to roll back to the last-good manifest \
-                     generation in place (lossless-for-acked; the torn manifest bytes are retained \
-                     under `manifest-quarantine/` for forensics)."
+                    "\nRe-run `boatramp kv recover --apply` to adopt the newest manifest generation \
+                     that opens clean in place (lossless-for-acked; the quarantined manifest \
+                     generations are retained under `manifest-quarantine/` for forensics)."
                 );
             }
             Ok(())
         }
         Err(e) => {
-            // A manifest shape F2 REFUSED (no decodable generation, a WAL GC hole, below the GC
-            // boundary). Name the refusal, then point at the clean-snapshot escalation (UX C4).
+            // A manifest shape recovery REFUSED (no decodable generation, NO generation opens clean
+            // [v0.11.1 NoOpenableManifest], a WAL GC hole, or below the GC boundary). Name the refusal,
+            // then point at the clean-snapshot escalation (UX C4).
             eprintln!("kv recover: manifest recovery cannot proceed — {e}");
             print_adopt_volume_guidance();
             Err(e.into())
@@ -481,7 +484,7 @@ fn is_cluster_node_data_dir(data_dir: &std::path::Path) -> bool {
     data_dir.join("raft").is_dir() || data_dir.join("mesh").is_dir()
 }
 
-/// Print the last-good-generation manifest-recovery plan / outcome (v0.11.0 F2).
+/// Print the last-good-generation manifest-recovery plan / outcome (v0.11.0 F2 + v0.11.1 walk).
 fn print_manifest_recovery(report: &ManifestRecoveryReport, applied: bool) {
     println!(
         "control-plane MANIFEST recovery {}",
@@ -491,11 +494,40 @@ fn print_manifest_recovery(report: &ManifestRecoveryReport, applied: bool) {
             "(DRY-RUN — no mutation)"
         }
     );
+    // v0.11.1: classify the shape. If any decodable generation above the adopted one was SKIPPED as
+    // unopenable, the latest DECODES but won't OPEN (the invalid-compaction / missing-referenced-SST
+    // shape) — NEVER "should open normally". Otherwise it is the classic empty/torn-latest shape.
+    let skipped_unopenable = report
+        .candidate_ladder
+        .iter()
+        .any(|c| c.status.starts_with("skipped:"));
+    if skipped_unopenable {
+        println!(
+            "  the LATEST manifest DECODES but will NOT open (invalid compaction / a referenced \
+             compacted SST was removed or torn — a mid-compaction unclean exit). This is a \
+             RECOVERABLE shape: walking back to the newest manifest generation that OPENS CLEAN."
+        );
+    } else {
+        println!(
+            "  the LATEST manifest is empty/torn — rolling back to the last-good manifest generation."
+        );
+    }
+    // The candidate ladder (highest generation first): exactly which generations were skipped as
+    // unopenable and which one is adopted — so a won't-open latest is never reported "should open
+    // normally".
+    println!("  generation walk ladder (newest first):");
+    for c in &report.candidate_ladder {
+        let frontier = c
+            .frontier
+            .map(|f| format!("frontier {f}"))
+            .unwrap_or_else(|| "frontier n/a".to_string());
+        println!(
+            "    generation {:<12} {:<22} {}",
+            c.generation, frontier, c.status
+        );
+    }
     println!(
-        "  the LATEST manifest is empty/torn — rolling back to the last-good manifest generation."
-    );
-    println!(
-        "  fall back to manifest generation: {}",
+        "  adopt manifest generation (newest that OPENS CLEAN): {}",
         report.rolled_back_to_generation
     );
     println!(
@@ -542,9 +574,10 @@ fn print_manifest_recovery(report: &ManifestRecoveryReport, applied: bool) {
     }
     if applied {
         println!(
-            "  RECOVERED (lossless): rolled back to generation {} and replayed the WAL forward — the \
-             store now opens with zero acked loss (N-1 + WAL replay = a normal open). The torn manifest \
-             bytes are retained under `{}` for forensics.",
+            "  RECOVERED (lossless-for-acked): adopted generation {} (the newest that OPENS CLEAN) and \
+             replayed the WAL forward — the store now opens with zero acked loss (adopted generation + \
+             WAL replay, MF2-contiguity-verified). The quarantined manifest generation(s) are retained \
+             under `{}` for forensics.",
             report.rolled_back_to_generation,
             report
                 .manifest_quarantine_dir
@@ -553,7 +586,8 @@ fn print_manifest_recovery(report: &ManifestRecoveryReport, applied: bool) {
         );
     } else {
         println!(
-            "  WOULD roll back to generation {} (lossless-for-acked; discard = none).",
+            "  WOULD adopt generation {} (the newest that OPENS CLEAN; lossless-for-acked, \
+             MF2-contiguity-verified).",
             report.rolled_back_to_generation
         );
     }
