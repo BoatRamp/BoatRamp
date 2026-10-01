@@ -76,6 +76,8 @@ pub async fn run(args: MigrateArgs, config: &ServerConfig) -> Result<(), Error> 
         &data_dir,
         None,
         boatramp_core::kv::KvOpenPolicy::Strict,
+        // `migrate` is a SlateDB-store re-key, not a SQL target — no `[serve.kv.sql]` config.
+        None,
     )
     .await
     .map_err(|e| Box::new(crate::serve::Error::from(e)))?;

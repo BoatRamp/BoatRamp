@@ -101,8 +101,20 @@ pub enum Error {
     #[cfg(not(feature = "cloudflare-kv"))]
     #[error("this build has no Cloudflare KV support; rebuild with `--features cloudflare-kv`")]
     NoCloudflareKvSupport,
-    /// Opening the KV store (SlateDB / Cloudflare) failed.
-    #[cfg(any(feature = "slatedb", feature = "cloudflare-kv"))]
+    /// `--kv sql` selected but this build lacks the SQL KV backend.
+    #[cfg(not(feature = "sql"))]
+    #[error(
+        "this build has no SQL KV support; rebuild with `--features sql` (or any build that enables it, e.g. `handlers`)"
+    )]
+    NoSqlSupport,
+    /// The `--kv sql` backend was selected but its `[serve.kv.sql]` config (or `BOATRAMP_KV_SQL_*`
+    /// env) is missing/invalid: no config at all, a missing `path` for `kind = sqlite`, a
+    /// not-yet-wired engine (`postgres`/`mysql`), or an unknown `kind`.
+    #[cfg(feature = "sql")]
+    #[error("SQL KV backend: {0}")]
+    SqlKvConfig(String),
+    /// Opening the KV store (SlateDB / Cloudflare / SQL) failed.
+    #[cfg(any(feature = "slatedb", feature = "cloudflare-kv", feature = "sql"))]
     #[error(transparent)]
     Kv(#[from] boatramp_core::kv::KvError),
 

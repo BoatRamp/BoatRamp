@@ -140,7 +140,9 @@ memmap2 = { version = "0.9", optional = true }
 # The Stage-4 durable signed-context battery (`tests/orm_tenant_isolation.rs`) uses the COSE
 # signer/envelope helpers in `boatramp_core::cose`, which are `authz`-gated — enable that feature
 # for the test build only (the storage crate itself needs no COSE).
-boatramp-core = { workspace = true, features = ["authz"] }
+# `kv-conformance` exposes `boatramp_core::kv::conformance` so the `SqlKv` test suite runs the
+# IDENTICAL shared `KvStore` conformance assertions (test build only; never shipped).
+boatramp-core = { workspace = true, features = ["authz", "kv-conformance"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 bytes.workspace = true
 # The `kv_slatedb` tests open a SlateDB instance and close/reopen it. `close()`
