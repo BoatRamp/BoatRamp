@@ -519,13 +519,17 @@ jobs:
             echo "linchpin mutation verified: no_frontier_sync drops the acked secret as expected — the crown-jewel checkpoint is load-bearing."
           fi
 
-      # v0.11.0 KV MANIFEST-RECOVERY GATE BATTERY (host toolchain).
-      # F1 fsync (the correctness precondition) + F2 auto last-good-generation cold-open recovery for an
-      # empty/torn LATEST manifest + the MF2 GC-hole guard (fail-loud, never a silent lossy rollback) +
-      # MF5 crown-jewel survival AND non-resurrection + the slatedb WAL-GC-retention invariant-pin (RED
-      # the day slatedb stops retaining the frontier WAL object, which is what makes MF2's empty-range
-      # branch safe). All InMemory/host-lane, so they run UNIGNORED here. See boatramp-kv-graceful-shutdown.
-      - name: "v0.11.0 KV manifest-recovery gate battery (host toolchain)"
+      # v0.11.x KV MANIFEST + COMPACTIONS RECOVERY GATE BATTERY (host toolchain).
+      # v0.11.0: F1 fsync (the correctness precondition) + F2 auto last-good-generation rollback for an
+      #   empty/torn LATEST manifest + the MF2 GC-hole guard (fail-loud, never a silent lossy rollback) +
+      #   MF5 crown-jewel survival AND non-resurrection + the slatedb WAL-GC-retention invariant-pin (RED
+      #   the day slatedb stops retaining the frontier WAL object, which is what makes MF2's empty-range
+      #   branch safe).
+      # v0.11.1: the openability WALK (adopt the newest generation that OPENS, skipping a decodes-but-
+      #   won't-open one — selection by open-ability, not decode-ability) + the corrupt-`.compactions`
+      #   RESET (quarantine `compactions/*` + the GC boundary so a compactor-ON reopen rebuilds it).
+      # All InMemory/host-lane, so they run UNIGNORED here. See boatramp-kv-graceful-shutdown.
+      - name: "v0.11.x KV manifest + compactions recovery gate battery (host toolchain)"
         run: |
           set -eo pipefail
           cargo test -p boatramp-storage --features slatedb --lib -- \
@@ -544,22 +548,46 @@ jobs:
             self_heal_recovers_a_torn_latest_manifest_by_rollback \
             slatedb_wal_gc_retains_the_frontier_object_INVARIANT \
             strict_does_not_manifest_recover_a_torn_latest_manifest \
-            2>&1 | tee kv-manifest-recovery.log
-          grep -qE 'test result: ok\. 15 passed' kv-manifest-recovery.log \
-            || { echo "::error::v0.11.0 KV manifest-recovery battery did not run all 15 (silent skip or a failure)" >&2; exit 1; }
-          # MF5 LINCHPIN anti-hollow (both directions): the F2 last-good-generation rollback is load-bearing.
-          # Under skip_lastgood the torn-manifest store opens Strict (no F2 recovery) → a crown-jewel write
-          # is lost (survival) and an acked tombstone cannot be preserved (non-resurrection) → both MUST go RED.
-          if BOATRAMP_KVMANIFEST_MUTATION=skip_lastgood cargo test -p boatramp-storage \
-            --features slatedb --lib -- \
+            recover_adopts_newest_openable_generation_and_crown_jewel_survives \
+            self_heal_walk_skips_a_decodable_but_unopenable_generation \
+            generation_structurally_openable_flags_missing_and_torn_referenced_sst \
+            no_openable_manifest_error_names_the_invalid_compaction_shape \
+            recover_resets_a_corrupt_compactions_object_and_crown_jewel_survives \
+            self_heal_resets_a_corrupt_compactions_object \
+            compactions_reset_is_a_noop_when_not_corrupt \
+            2>&1 | tee kv-recovery.log
+          grep -qE 'test result: ok\. 22 passed' kv-recovery.log \
+            || { echo "::error::v0.11.x KV recovery battery did not run all 22 (silent skip or a failure)" >&2; exit 1; }
+          # ANTI-HOLLOW: each mutation (a cfg(test)-only env seam, compiled to a no-op in shipped binaries)
+          # must make its target gate(s) go RED — proving the recovery step it disables is load-bearing
+          # (without it: acked data lost, or the store stays unbootable). A gate that PASSES under its
+          # mutation is hollow → fail the build.
+          check_red() {
+            local mut="$1"; shift
+            if BOATRAMP_KVMANIFEST_MUTATION="$mut" cargo test -p boatramp-storage --features slatedb --lib -- "$@" > "mut-$mut.log" 2>&1; then
+              echo "::error::anti-hollow gate is HOLLOW — it PASSED under BOATRAMP_KVMANIFEST_MUTATION=$mut; the recovery step that mutation disables is not actually exercised by the gate" >&2
+              exit 1
+            fi
+            echo "mutation verified RED: $mut — the disabled recovery step is load-bearing."
+          }
+          # v0.11.0 MF5: no last-good rollback ⇒ crown-jewel lost / tombstone unpreserved on a torn manifest.
+          check_red skip_lastgood \
             self_heal_recovers_a_torn_latest_manifest_by_rollback \
-            mf5_acked_tombstone_is_not_resurrected_after_manifest_rollback \
-            > kvmanifest-mutation.log 2>&1; then
-            echo "::error::MF5 LINCHPIN gate is HOLLOW — it passed under skip_lastgood; without the F2 last-good-generation rollback a crown-jewel write (sealed secret / RBAC / token revocation) would be silently dropped or a tombstone resurrected on a torn-manifest boot" >&2
-            exit 1
-          else
-            echo "MF5 linchpin mutation verified: skip_lastgood drops the crown-jewel / cannot preserve the tombstone as expected — the F2 last-good-generation recovery is load-bearing."
-          fi
+            mf5_acked_tombstone_is_not_resurrected_after_manifest_rollback
+          # v0.11.1 openability walk: stopping at the first DECODABLE (not openable) generation ⇒ adopt an
+          # unopenable one ⇒ the store does not open / the crown-jewel is lost.
+          check_red stop_at_first_decodable \
+            recover_adopts_newest_openable_generation_and_crown_jewel_survives \
+            self_heal_walk_skips_a_decodable_but_unopenable_generation
+          # v0.11.1 compactions-reset: skipping the reset ⇒ the corrupt `.compactions` remains ⇒ reopen fails.
+          check_red skip_compactions_reset \
+            recover_resets_a_corrupt_compactions_object_and_crown_jewel_survives \
+            self_heal_resets_a_corrupt_compactions_object
+          # v0.11.1 compactions-reset: quarantining the files but KEEPING the GC boundary ⇒ the fresh id-1
+          # create is rejected (ObjectVersionExists) ⇒ reopen still fails.
+          check_red keep_compactions_boundary \
+            recover_resets_a_corrupt_compactions_object_and_crown_jewel_survives \
+            self_heal_resets_a_corrupt_compactions_object
 
       # Part A quiesce-before-close gates that live outside boatramp-storage:
       #   A2         — the scheduler quiesce (drainer/watchers/crons stop before close) in boatramp-server,
