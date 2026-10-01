@@ -399,6 +399,25 @@ pub enum WalRepairError {
         boundary: u64,
     },
 
+    /// **v0.11.1** — after the corrupt-`.compactions` reset (quarantine the `.compactions` objects +
+    /// remove the compactions GC boundary), the compactor-state verify STILL failed: either
+    /// `Admin::read_compactions` did not come back clean (a corrupt `.compactions` object still decodes
+    /// with `InvalidCompaction`) or the compactions GC boundary is still present (it would reject the
+    /// fresh id-1 `.compactions` the compactor-ON reopen creates, with `ObjectVersionExists`). Refuse to
+    /// claim success — the store would still fail its compactor-ON open.
+    #[error(
+        "control-plane compactions reset: after quarantining the corrupt `.compactions` object(s) at \
+         `{root}`, the compactor-state verify STILL failed ({detail}) — refusing to report success (a \
+         compactor-ON reopen would still fail). Run `boatramp kv recover` to diagnose / adopt a clean \
+         volume snapshot"
+    )]
+    CompactionsResetVerifyFailed {
+        /// The store root.
+        root: String,
+        /// Why the post-reset verify failed (corrupt object still decodes, or the boundary remains).
+        detail: String,
+    },
+
     /// An underlying object-store operation failed (list/get/copy/delete/put).
     #[error("control-plane WAL repair: object-store operation failed: {0}")]
     Store(String),
@@ -1415,7 +1434,8 @@ fn stop_at_first_decodable() -> bool {
     // + `self_heal_walk_skips_a_decodable_but_unopenable_generation` go RED. Shipped: always false.
     #[cfg(test)]
     {
-        if std::env::var("BOATRAMP_KVMANIFEST_MUTATION").as_deref() == Ok("stop_at_first_decodable") {
+        if std::env::var("BOATRAMP_KVMANIFEST_MUTATION").as_deref() == Ok("stop_at_first_decodable")
+        {
             return true;
         }
     }
@@ -1689,6 +1709,305 @@ pub async fn recover_last_good_manifest(
             )))
         }
     }
+}
+
+// ===================================================================================================
+// v0.11.1 — corrupt-`.compactions` reset recovery.
+//
+// The production `Invalid error: invalid compaction` at `Db::open` is NOT a manifest/SST problem: the
+// manifest decodes and its referenced SSTs are present (so [`recover_last_good_manifest`] returns
+// `LatestReadable`). It is a corrupt slatedb `.compactions` object — the compactor-bookkeeping sequence
+// at `{root}/compactions/{:020}.compactions` (pending/in-progress/recent compactions + the compactor
+// epoch), decoded ONLY on a compactor-ON open (`CompactorStateWriter::new` → `StoredCompactions::try_load`
+// → `decode_compactions`, which raises `InvalidCompaction`). This bookkeeping holds NO acked-data
+// liveness — the durable authority is the manifest + WAL + SST files, and slatedb's GC derives the live
+// set from the MANIFEST only, never `.compactions`. So resetting `.compactions` cannot lose committed
+// data: a compactor-ON open with `.compactions` ABSENT fresh-starts ("creating new compactions file
+// [compactor_epoch=0]"), re-epochs to the manifest's epoch, and re-plans compactions from the manifest's
+// current SST set (manifest-first writes + additive outputs; GC reclaims any orphan output SSTs). It is
+// INDEPENDENT of the manifest generation, so no manifest-generation rollback can fix it.
+//
+// Non-obvious: the compactions GC boundary at `{root}/gc/compactions.boundary` (an ASCII u64, distinct
+// from `{root}/gc/manifest.boundary`) must ALSO be removed. slatedb's sequenced-object CAS rejects any
+// id `<= boundary` with `ObjectVersionExists` (slatedb-txn-obj `check_boundary`); after we delete all
+// `.compactions` versions the compactor-ON reopen creates a FRESH id-1 object, which a stale boundary
+// `>= 1` would reject — so the reset would silently fail at reopen. Removing the boundary floors it to 0
+// (a missing boundary reads as 0), so the fresh create succeeds. It does NOT touch `manifest.boundary`.
+// ===================================================================================================
+
+/// The outcome of a corrupt-`.compactions` reset attempt.
+#[derive(Debug, Clone)]
+pub enum CompactionsRecovery {
+    /// The `.compactions` bookkeeping is NOT corrupt (it decodes, or is absent) — NOTHING to do. The
+    /// caller proceeds with its normal open / other recovery paths.
+    NotCorrupt,
+    /// The `.compactions` object was corrupt; the reset quarantined + removed it (+ the GC boundary) on
+    /// [`RepairMode::Apply`], or computed the plan it WOULD apply on [`RepairMode::DryRun`].
+    Reset(CompactionsResetReport),
+}
+
+/// The plan/outcome of a corrupt-`.compactions` reset (v0.11.1).
+#[derive(Debug, Clone)]
+pub struct CompactionsResetReport {
+    /// The `{root}/compactions/{:020}.compactions` ids that were (or, in dry-run, would be) quarantined
+    /// and removed so a compactor-ON reopen fresh-starts the compactor bookkeeping.
+    pub quarantined_compactions_ids: Vec<u64>,
+    /// The `{root}/compactions-quarantine/{stamp}/` dir the objects were (or would be) copied to.
+    pub quarantine_dir: Option<String>,
+    /// Whether the compactions GC boundary (`{root}/gc/compactions.boundary`) was present and removed
+    /// (or, in dry-run, would be) — required so the fresh id-1 create is not rejected.
+    pub boundary_removed: bool,
+    /// Whether the pass mutated the store (`false` for a dry-run).
+    pub applied: bool,
+}
+
+/// Mutation seam (CI host-lane, test-only): when `BOATRAMP_KVMANIFEST_MUTATION=skip_compactions_reset`
+/// the reset does NOT quarantine/remove the corrupt `.compactions` object(s) — modeling "the reset was
+/// not applied". The post-reset verify then still sees the corrupt object → fails loud → the gate goes
+/// RED. Non-test builds compile to `false`.
+#[cfg(test)]
+fn skip_compactions_reset() -> bool {
+    std::env::var("BOATRAMP_KVMANIFEST_MUTATION")
+        .map(|v| v == "skip_compactions_reset")
+        .unwrap_or(false)
+}
+#[cfg(not(test))]
+#[inline]
+fn skip_compactions_reset() -> bool {
+    false
+}
+
+/// Mutation seam (CI host-lane, test-only): when `BOATRAMP_KVMANIFEST_MUTATION=keep_compactions_boundary`
+/// the reset quarantines/removes the `.compactions` object(s) but LEAVES the compactions GC boundary in
+/// place — modeling the non-obvious bug where a stale boundary rejects the fresh id-1 create. The
+/// post-reset verify then sees the boundary still present → fails loud → the gate goes RED. Non-test
+/// builds compile to `false`.
+#[cfg(test)]
+fn keep_compactions_boundary() -> bool {
+    std::env::var("BOATRAMP_KVMANIFEST_MUTATION")
+        .map(|v| v == "keep_compactions_boundary")
+        .unwrap_or(false)
+}
+#[cfg(not(test))]
+#[inline]
+fn keep_compactions_boundary() -> bool {
+    false
+}
+
+/// The `{root}/compactions/{:020}.compactions` object path for id (slatedb-txn-obj layout:
+/// subdir `compactions`, suffix `compactions`).
+fn compactions_object_path(root: &str, id: u64) -> ObjPath {
+    ObjPath::from(format!("{root}/compactions/{id:020}.compactions"))
+}
+
+/// Parse a `{:020}.compactions` filename into its numeric id.
+fn parse_compactions_id(location: &ObjPath) -> Option<u64> {
+    location
+        .filename()?
+        .strip_suffix(".compactions")?
+        .parse::<u64>()
+        .ok()
+}
+
+/// The compactions GC boundary object path (`{root}/gc/compactions.boundary`) — DISTINCT from
+/// `{root}/gc/manifest.boundary`. A missing boundary reads as 0 (slatedb-txn-obj default).
+fn compactions_gc_boundary_path(root: &str) -> ObjPath {
+    ObjPath::from(format!("{root}/gc/compactions.boundary"))
+}
+
+/// List every `{root}/compactions/{:020}.compactions` id present on the store, ascending.
+async fn list_compactions_ids(
+    store: &Arc<dyn ObjectStore>,
+    root: &str,
+) -> Result<Vec<u64>, WalRepairError> {
+    use futures::StreamExt;
+    let prefix = ObjPath::from(format!("{root}/compactions"));
+    let mut stream = store.list(Some(&prefix));
+    let mut ids = Vec::new();
+    while let Some(item) = stream.next().await {
+        let meta = item.map_err(|e| WalRepairError::Store(e.to_string()))?;
+        if let Some(id) = parse_compactions_id(&meta.location) {
+            ids.push(id);
+        }
+    }
+    ids.sort_unstable();
+    Ok(ids)
+}
+
+/// Whether a `slatedb::Error` Display from [`Admin::read_compactions`] is a DECODE failure of the
+/// `.compactions` object — the corrupt-bookkeeping signature we reset — as opposed to a transient
+/// object-store error (which must NOT trigger a destructive reset). Matches the `decode_compactions`
+/// errors: `InvalidCompaction` (`"Invalid error: invalid compaction"`) and the compactions
+/// `InvalidVersion` (`"unsupported compactions format version…"`).
+fn compactions_decode_error_is_corrupt(raw: &str) -> bool {
+    raw.contains("invalid compaction")
+        || raw.contains("InvalidCompaction")
+        || (raw.contains("unsupported") && raw.contains("compactions") && raw.contains("version"))
+}
+
+/// Probe whether the store's `.compactions` bookkeeping is CORRUPT — the compactor-ON open failure
+/// `Invalid error: invalid compaction` — WITHOUT a compactor-ON `Db` open (no lifecycle to drain, no
+/// close-drain stall). Uses [`Admin::read_compactions`] (decodes the latest `.compactions` object):
+/// `Err` with a decode signature ([`compactions_decode_error_is_corrupt`]) ⇒ corrupt; `Ok(_)` (decodes,
+/// or absent) ⇒ not corrupt; a non-decode `Err` (a transient store error) ⇒ NOT corrupt (conservative —
+/// never reset on a transient error). This reflects compactor-ON semantics: it decodes exactly the object
+/// the compactor's `StoredCompactions::try_load` decodes at build.
+async fn detect_corrupt_compactions(
+    store: &Arc<dyn ObjectStore>,
+    root: &str,
+) -> Result<bool, WalRepairError> {
+    let admin = Admin::builder(root.to_string(), store.clone()).build();
+    match admin.read_compactions(None).await {
+        Ok(_) => Ok(false),
+        Err(e) => Ok(compactions_decode_error_is_corrupt(&e.to_string())),
+    }
+}
+
+/// Build the `compactions-quarantine/{stamp}/MANIFEST.json` record body (the quarantined ids + whether
+/// the boundary was removed). No secrets — only ids + the stamp.
+fn build_compactions_quarantine_record(ids: &[u64], boundary_removed: bool, stamp: &str) -> String {
+    let objects: Vec<String> = ids
+        .iter()
+        .map(|&id| format!("    {{ \"id\": {id}, \"file\": \"{id:020}.compactions\" }}"))
+        .collect();
+    format!(
+        "{{\n  \"reason\": \"corrupt slatedb .compactions bookkeeping object (decode failed with \
+         InvalidCompaction on a compactor-ON open); reset by boatramp v0.11.1 compactions-reset \
+         recovery. .compactions holds no acked-data liveness, so this is lossless-for-acked.\",\n  \
+         \"stamp\": \"{stamp}\",\n  \"compactions_gc_boundary_removed\": {boundary_removed},\n  \
+         \"quarantined_compactions\": [\n{}\n  ]\n}}\n",
+        objects.join(",\n"),
+    )
+}
+
+/// **v0.11.1 — corrupt-`.compactions` reset recovery.** When the manifest + SSTs are intact but a
+/// compactor-ON open fails `InvalidCompaction`, the `.compactions` bookkeeping is corrupt. Reset it:
+/// quarantine (copy → record → delete) every `{root}/compactions/{:020}.compactions`, remove the
+/// compactions GC boundary (`{root}/gc/compactions.boundary`), then VERIFY compactor-state cleanliness
+/// WITHOUT a compactor-ON `Db` open (no close-drain stall): `Admin::read_compactions(None)` must come
+/// back clean (`Ok(None)` — the corrupt object is gone, so a compactor-ON open fresh-starts) AND the
+/// boundary must be gone (else the fresh id-1 create is rejected). Returns [`CompactionsRecovery::NotCorrupt`]
+/// (no-op) when `.compactions` is fine — so the caller proceeds normally.
+///
+/// - [`RepairMode::DryRun`] computes the plan and mutates NOTHING.
+/// - [`RepairMode::Apply`] performs the reset + verify. Fails loud ([`WalRepairError::CompactionsResetVerifyFailed`])
+///   if the post-reset verify is not clean — never a false success.
+///
+/// SelfHeal-only; the caller (strict / cluster node-local) must gate this to fail loud with zero mutation.
+/// Lossless-for-acked: `.compactions` holds only compactor bookkeeping (verified against slatedb 0.16.0).
+pub async fn recover_corrupt_compactions(
+    store: &Arc<dyn ObjectStore>,
+    root: &str,
+    mode: RepairMode,
+) -> Result<CompactionsRecovery, WalRepairError> {
+    // Detection: compactor-state decode, no compactor lifecycle. Not corrupt ⇒ nothing to do.
+    if !detect_corrupt_compactions(store, root).await? {
+        return Ok(CompactionsRecovery::NotCorrupt);
+    }
+
+    let ids = list_compactions_ids(store, root).await?;
+    let boundary_present = store
+        .head(&compactions_gc_boundary_path(root))
+        .await
+        .is_ok();
+
+    if mode == RepairMode::DryRun {
+        return Ok(CompactionsRecovery::Reset(CompactionsResetReport {
+            quarantined_compactions_ids: ids,
+            quarantine_dir: Some(format!(
+                "{root}/compactions-quarantine/<stamp>/ (dry-run: not created)"
+            )),
+            boundary_removed: boundary_present,
+            applied: false,
+        }));
+    }
+
+    // Apply. The `skip_compactions_reset` mutation models "reset not applied" (quarantine nothing);
+    // the `keep_compactions_boundary` mutation models leaving the stale boundary in place. Each makes
+    // the verify below fail loud → the gate goes RED.
+    let stamp = quarantine_stamp();
+    let mut quarantine_dir = None;
+    let mut boundary_removed = false;
+    if !skip_compactions_reset() {
+        // Copy each `.compactions` object to the quarantine dir (bytes safe), THEN delete the original.
+        for &id in &ids {
+            let src = compactions_object_path(root, id);
+            let dst = ObjPath::from(format!(
+                "{root}/compactions-quarantine/{stamp}/{id:020}.compactions"
+            ));
+            store
+                .copy(&src, &dst)
+                .await
+                .map_err(|e| WalRepairError::Store(e.to_string()))?;
+        }
+        // Record BEFORE the deletes are observed complete (a reader always finds the record for a copy).
+        let boundary_will_remove = boundary_present && !keep_compactions_boundary();
+        let record = build_compactions_quarantine_record(&ids, boundary_will_remove, &stamp);
+        let record_path = ObjPath::from(format!(
+            "{root}/compactions-quarantine/{stamp}/MANIFEST.json"
+        ));
+        store
+            .put(&record_path, record.into_bytes().into())
+            .await
+            .map_err(|e| WalRepairError::Store(e.to_string()))?;
+        // Delete the originals (copies + record are durable).
+        for &id in &ids {
+            store
+                .delete(&compactions_object_path(root, id))
+                .await
+                .map_err(|e| WalRepairError::Store(e.to_string()))?;
+        }
+        quarantine_dir = Some(format!("{root}/compactions-quarantine/{stamp}"));
+        // Remove the compactions GC boundary so the fresh id-1 create is not rejected (non-obvious;
+        // see the module note). NotFound is fine (absent boundary already reads as 0).
+        if !keep_compactions_boundary() {
+            match store.delete(&compactions_gc_boundary_path(root)).await {
+                Ok(()) => boundary_removed = true,
+                Err(object_store::Error::NotFound { .. }) => boundary_removed = false,
+                Err(e) => return Err(WalRepairError::Store(e.to_string())),
+            }
+        }
+    }
+
+    // VERIFY (compactor-state, stall-free, compactor-ON-faithful):
+    //  (1) `read_compactions(None)` must be clean — `Ok(None)` after a full reset (the corrupt object is
+    //      gone, so a compactor-ON `StoredCompactions::try_load` sees None → fresh-start). A still-corrupt
+    //      object decodes `InvalidCompaction` here → fail loud.
+    //  (2) the compactions GC boundary must be gone — else the compactor-ON reopen's fresh id-1 create is
+    //      rejected `ObjectVersionExists`.
+    match detect_corrupt_compactions(store, root).await {
+        Ok(false) => {}
+        Ok(true) => {
+            return Err(WalRepairError::CompactionsResetVerifyFailed {
+                root: root.to_string(),
+                detail:
+                    "a corrupt `.compactions` object still decodes with InvalidCompaction after \
+                         the reset (the quarantine did not remove it)"
+                        .to_string(),
+            });
+        }
+        Err(e) => return Err(e),
+    }
+    if store
+        .head(&compactions_gc_boundary_path(root))
+        .await
+        .is_ok()
+    {
+        return Err(WalRepairError::CompactionsResetVerifyFailed {
+            root: root.to_string(),
+            detail: "the compactions GC boundary `gc/compactions.boundary` is still present — a \
+                     compactor-ON reopen's fresh id-1 `.compactions` create would be rejected \
+                     (ObjectVersionExists)"
+                .to_string(),
+        });
+    }
+
+    Ok(CompactionsRecovery::Reset(CompactionsResetReport {
+        quarantined_compactions_ids: ids,
+        quarantine_dir,
+        boundary_removed,
+        applied: true,
+    }))
 }
 
 #[cfg(test)]
@@ -2992,6 +3311,192 @@ mod tests {
             msg.contains("volume snapshot") || msg.contains("backup"),
             "points at the snapshot/backup fallback: {msg}"
         );
+    }
+
+    // ===================================================================================
+    // v0.11.1 — corrupt-`.compactions` RESET (the real production invalid-compaction fix).
+    // ===================================================================================
+
+    /// Open a compactor-ON `Db` (the production profile — `Settings::default()` enables the compactor +
+    /// GC, which is what decodes `.compactions` at build and creates a fresh one when absent), read
+    /// `key`, close. Short flush interval; no compactor options overridden. For a small InMemory store
+    /// this open+close is fast and does not stall (the close-drain stall is the on-disk/musl path).
+    async fn read_key_via_compactor_on_db(
+        store: &Arc<dyn ObjectStore>,
+        root: &str,
+        key: &[u8],
+    ) -> Option<Vec<u8>> {
+        #[allow(clippy::field_reassign_with_default)]
+        let settings = {
+            let mut s = Settings::default();
+            s.flush_interval = Some(Duration::from_millis(5));
+            s
+        };
+        let db = Db::builder(root.to_string(), store.clone())
+            .with_settings(settings)
+            .build()
+            .await
+            .expect("the reset store must open compactor-ON (fresh-start .compactions)");
+        let val = db.get(key).await.unwrap().map(|b| b.to_vec());
+        db.close().await.unwrap();
+        val
+    }
+
+    /// Inject a CORRUPT `.compactions` object (1 byte ⇒ `decode_compactions` len<2 ⇒ `InvalidCompaction`)
+    /// at id 1 plus a STALE compactions GC boundary (`>= 1`, so leaving it rejects the fresh id-1 create),
+    /// over an otherwise-intact store. Returns the corrupt id.
+    async fn inject_corrupt_compactions(store: &Arc<dyn ObjectStore>, root: &str) -> u64 {
+        let corrupt_id = 1u64;
+        store
+            .put(
+                &compactions_object_path(root, corrupt_id),
+                bytes::Bytes::from_static(&[0x00]).into(),
+            )
+            .await
+            .unwrap();
+        store
+            .put(
+                &compactions_gc_boundary_path(root),
+                bytes::Bytes::from_static(b"1").into(),
+            )
+            .await
+            .unwrap();
+        corrupt_id
+    }
+
+    /// **v0.11.1 GATE (mutation-verified) — reset a corrupt `.compactions` bookkeeping object.** The
+    /// manifest + SSTs are intact (so the manifest-rollback walk is a no-op / `LatestReadable`) but a
+    /// compactor-ON open would fail `InvalidCompaction`. Detection fires (not misclassified as healthy),
+    /// the reset quarantines `.compactions` + removes the compactions GC boundary, and a compactor-ON
+    /// reopen SERVES, the crown-jewel survives byte-equal, and `.compactions` decodes again.
+    ///
+    /// MUTATIONS (cfg(test) env `BOATRAMP_KVMANIFEST_MUTATION`, the CI host-lane loop sets them):
+    /// `skip_compactions_reset` (don't quarantine) ⇒ the post-reset verify still sees the corrupt object
+    /// ⇒ `recover_corrupt_compactions(Apply)` returns `Err` ⇒ the `.unwrap()` below is RED;
+    /// `keep_compactions_boundary` (quarantine the files but leave the boundary) ⇒ the verify sees the
+    /// stale boundary (which would reject the fresh id-1 create) ⇒ `Err` ⇒ RED.
+    #[serial_test::serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn recover_resets_a_corrupt_compactions_object_and_crown_jewel_survives() {
+        let store = mem_store();
+        let root = "kv";
+        seed_real_store_with_secret(&store, root).await; // crown in L0; manifest + SST intact; no .compactions
+        let corrupt_id = inject_corrupt_compactions(&store, root).await;
+
+        // DETECTION: the `.compactions` is corrupt (compactor-state decode, no compactor lifecycle)...
+        assert!(
+            detect_corrupt_compactions(&store, root).await.unwrap(),
+            "must detect the corrupt `.compactions` object"
+        );
+        // ...but the manifest + SSTs are intact ⇒ the manifest walk is a NO-OP (LatestReadable), NOT a
+        // misclassified rollback (the whole point: this is NOT a manifest/SST shape).
+        match recover_last_good_manifest(&store, root, RepairMode::DryRun)
+            .await
+            .unwrap()
+        {
+            ManifestRecovery::LatestReadable { .. } => {}
+            other => {
+                panic!("a corrupt `.compactions` must NOT trigger a manifest rollback: {other:?}")
+            }
+        }
+
+        // DRY-RUN: plans the reset, mutates NOTHING.
+        match recover_corrupt_compactions(&store, root, RepairMode::DryRun)
+            .await
+            .unwrap()
+        {
+            CompactionsRecovery::Reset(r) => {
+                assert_eq!(r.quarantined_compactions_ids, vec![corrupt_id]);
+                assert!(r.boundary_removed, "the stale boundary is in the plan");
+                assert!(!r.applied);
+            }
+            other => panic!("expected Reset, got {other:?}"),
+        }
+        assert!(
+            store
+                .head(&compactions_object_path(root, corrupt_id))
+                .await
+                .is_ok(),
+            "dry-run must retain the corrupt `.compactions`"
+        );
+
+        // APPLY: reset + verify. (Under the mutations this `.unwrap()` is RED.)
+        let report = match recover_corrupt_compactions(&store, root, RepairMode::Apply)
+            .await
+            .unwrap()
+        {
+            CompactionsRecovery::Reset(r) => r,
+            other => panic!("expected Reset, got {other:?}"),
+        };
+        assert!(report.applied);
+        assert!(report.boundary_removed);
+        // The corrupt object is gone; a forensic copy survives; the boundary is gone.
+        assert!(
+            store
+                .head(&compactions_object_path(root, corrupt_id))
+                .await
+                .is_err(),
+            "the corrupt `.compactions` must be removed"
+        );
+        let qdir = report.quarantine_dir.expect("a quarantine dir");
+        assert!(
+            store
+                .head(&ObjPath::from(format!(
+                    "{qdir}/{corrupt_id:020}.compactions"
+                )))
+                .await
+                .is_ok(),
+            "the corrupt bytes must be preserved under compactions-quarantine/ (forensic-safe copy)"
+        );
+        assert!(
+            store
+                .head(&compactions_gc_boundary_path(root))
+                .await
+                .is_err(),
+            "the compactions GC boundary must be removed (else the fresh id-1 create is rejected)"
+        );
+
+        // Compactor-state verify: `.compactions` is now absent ⇒ a compactor-ON open fresh-starts.
+        let admin = Admin::builder(root.to_string(), store.clone()).build();
+        assert!(
+            admin.read_compactions(None).await.unwrap().is_none(),
+            "`.compactions` is absent after the reset (compactor-ON open will fresh-start)"
+        );
+
+        // REOPEN compactor-ON: SERVES, crown survives byte-equal (anti-hollow), `.compactions` decodes
+        // again (fresh-created by the compactor-ON open, which the stale boundary would otherwise block).
+        assert_eq!(
+            read_key_via_compactor_on_db(&store, root, b"secret/acme/idp").await,
+            Some(b"sealed-crown-jewel".to_vec()),
+            "the crown-jewel MUST survive the `.compactions` reset byte-equal (compactor-ON reopen)"
+        );
+        assert!(
+            admin.read_compactions(None).await.unwrap().is_some(),
+            "`.compactions` decodes again after a compactor-ON reopen (fresh-created at id 1)"
+        );
+    }
+
+    /// **v0.11.1** — `detect_corrupt_compactions` distinguishes the three states: a corrupt `.compactions`
+    /// (⇒ true), an ABSENT one (a never-compacted store ⇒ false, never a spurious reset), and `recover_
+    /// corrupt_compactions` is a NO-OP (`NotCorrupt`) when there is nothing corrupt. Guards against a
+    /// destructive reset of a healthy/absent compactions store.
+    #[serial_test::serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compactions_reset_is_a_noop_when_not_corrupt() {
+        let store = mem_store();
+        let root = "kv";
+        seed_real_store_with_secret(&store, root).await; // no `.compactions` at all (compactor off)
+        assert!(
+            !detect_corrupt_compactions(&store, root).await.unwrap(),
+            "an ABSENT `.compactions` is NOT corrupt (never reset a never-compacted store)"
+        );
+        match recover_corrupt_compactions(&store, root, RepairMode::Apply)
+            .await
+            .unwrap()
+        {
+            CompactionsRecovery::NotCorrupt => {}
+            other => panic!("an absent `.compactions` must be a no-op, got {other:?}"),
+        }
     }
 
     /// **F1b INVARIANT PIN (MF2 / Security — the single blind spot the mutation suite was missing).**
