@@ -27,13 +27,24 @@ fn version_key(project: &str) -> String {
 /// The current composition version for `project` (`0` if never written). Cheap enough to read
 /// once per request to key the supergraph/plan caches.
 pub(crate) async fn composition_version(kv: &dyn KvStore, project: &str) -> u64 {
-    match kv.get(&version_key(project)).await {
-        Ok(Some(bytes)) if bytes.len() == 8 => {
+    composition_version_checked(kv, project).await.unwrap_or(0)
+}
+
+/// Like [`composition_version`] but PROPAGATES a store read error instead of masking it as version
+/// `0` — so the MF-3 fenced edge read can FAIL CLOSED (deny) when the shared control-plane store is
+/// unreachable, rather than fall open to a stale/`0` version and serve a now-hidden field. An absent
+/// key (never composed) is a clean `Ok(0)`.
+pub(crate) async fn composition_version_checked(
+    kv: &dyn KvStore,
+    project: &str,
+) -> Result<u64, boatramp_core::kv::KvError> {
+    match kv.get(&version_key(project)).await? {
+        Some(bytes) if bytes.len() == 8 => {
             let mut arr = [0u8; 8];
             arr.copy_from_slice(&bytes);
-            u64::from_be_bytes(arr)
+            Ok(u64::from_be_bytes(arr))
         }
-        _ => 0,
+        _ => Ok(0),
     }
 }
 

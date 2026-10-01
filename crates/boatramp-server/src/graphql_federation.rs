@@ -83,6 +83,11 @@ pub(crate) enum CompositionError {
     /// ignored (fail-closed, mirroring [`Self::InvalidTenantDirective`]). Move the marker to the
     /// root field, or gate the nested field with the resolver's own authz.
     MisplacedEdgeHidden { type_name: String, field: String },
+    /// **MF-3 fail-closed** — in multi-writer `shared` mode the control-plane store was UNREACHABLE
+    /// while the stale-authz fence required a read-through of the GraphQL registry (its currency
+    /// could not be confirmed within the fence bound `T`). The edge DENIES (does not serve a possibly
+    /// now-hidden field from a stale cache) rather than compose against unconfirmed registry state.
+    RegistryUnreachable { message: String },
 }
 
 impl std::fmt::Display for CompositionError {
@@ -114,6 +119,10 @@ impl std::fmt::Display for CompositionError {
                 "field `{type_name}.{field}` carries @edgeHidden but is not a root Query/Mutation \
                  field — @edgeHidden may only mark a root operation (move it to the root field, or \
                  gate this field with the resolver's own authz)"
+            ),
+            Self::RegistryUnreachable { message } => write!(
+                f,
+                "GraphQL registry currency could not be confirmed (shared-mode fence): {message}"
             ),
         }
     }
