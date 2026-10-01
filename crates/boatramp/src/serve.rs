@@ -886,6 +886,16 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
             authz_fence_bound(),
         ))
     });
+    // MF-3 (extended): the GraphQL registry keyspace gets its OWN fence instance — same primitive,
+    // same bound, same seam — because confirming one keyspace's currency cannot soundly vouch for
+    // another (a shared instance warmed by frequent policy reads would let registry staleness grow
+    // unbounded). A stale registry read would keep serving an `@edgeHidden` field on a peer that
+    // missed the invalidation — the same stale-confidentiality hole as a stale policy.
+    let graphql_fence = multi_writer.then(|| {
+        Arc::new(boatramp_core::cache_coherence::AuthzFence::new(
+            authz_fence_bound(),
+        ))
+    });
     // Front the metadata store with an LRU so hot reads stay in memory.
     let mut cached = CachedKv::new(kv_backend.clone(), args.cache_entries);
     if let Some(changelog) = &changelog {
@@ -1047,12 +1057,13 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
     ));
     spawn_sighup_reload(kv.clone(), Some(daemon_runtime.clone()));
     if let Some(changelog) = changelog {
-        spawn_cache_poller(
-            changelog,
-            kv.clone(),
-            Some(daemon_runtime.clone()),
-            authz_fence.clone(),
-        );
+        // Both authz-keyspace fences (policy + GraphQL registry) are tripped by an unreachable poll.
+        let fences: Vec<Arc<boatramp_core::cache_coherence::AuthzFence>> =
+            [authz_fence.clone(), graphql_fence.clone()]
+                .into_iter()
+                .flatten()
+                .collect();
+        spawn_cache_poller(changelog, kv.clone(), Some(daemon_runtime.clone()), fences);
     }
     // Periodic control-plane KV checkpoint + graceful-close budget (v0.9.0 KV-recovery, C1/C12).
     // The cadence advances the durable frontier so the self-heal-on-open trailing-tail loss window
@@ -1116,6 +1127,15 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
         worker_exe: None,
     })
     .await?;
+
+    // MF-3 (extended) — wire the GraphQL registry fence + uncached backing into the handler runtime
+    // so the edge/resolve registry-version read reads THROUGH the backing when it cannot confirm
+    // currency, and denies if the store is unreachable (closing the stale-`@edgeHidden` hole).
+    // Multi-writer only; single-writer leaves the registry path unchanged.
+    #[cfg(feature = "handlers")]
+    if let Some(fence) = graphql_fence.clone() {
+        handlers.set_registry_fence(kv_backend.clone(), fence);
+    }
 
     tracing::info!(
         blobs = ?args.blobs, kv = ?args.kv, tls = ?args.tls,
@@ -2092,7 +2112,7 @@ fn spawn_cache_poller(
     changelog: Arc<Changelog>,
     cache: Arc<dyn KvStore>,
     daemon: Option<Arc<boatramp_server::DaemonRuntime>>,
-    authz_fence: Option<Arc<boatramp_core::cache_coherence::AuthzFence>>,
+    authz_fences: Vec<Arc<boatramp_core::cache_coherence::AuthzFence>>,
 ) {
     use std::time::Duration;
     tokio::spawn(async move {
@@ -2121,10 +2141,10 @@ fn spawn_cache_poller(
                 }
                 Ok(_) => {}
                 Err(err) => {
-                    if let Some(fence) = &authz_fence {
+                    for fence in &authz_fences {
                         fence.trip();
                     }
-                    tracing::warn!(%err, "shared-mode cache poll failed; tripped the authz fence");
+                    tracing::warn!(%err, "shared-mode cache poll failed; tripped the authz fences");
                 }
             }
             since_trim += poll;

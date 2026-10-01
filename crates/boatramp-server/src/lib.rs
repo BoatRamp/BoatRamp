@@ -951,6 +951,23 @@ impl HandlerRuntime {
         }
     }
 
+    /// Wire the MF-3 GraphQL-registry stale-authz fence (multi-writer `shared` mode): the uncached
+    /// control-plane `backing` store + this keyspace's [`AuthzFence`](boatramp_core::cache_coherence::AuthzFence).
+    /// The edge/resolve registry-version read then reads THROUGH `backing` when the fence cannot
+    /// confirm currency, and denies if the store is unreachable — closing the stale-`@edgeHidden`
+    /// confidentiality hole. Call ONCE at serve bootstrap, and ONLY for a multi-writer backend; a
+    /// single-writer / single-node node never calls it and its registry path is unchanged.
+    #[cfg(feature = "handlers")]
+    pub fn set_registry_fence(
+        &self,
+        backing: Arc<dyn boatramp_core::kv::KvStore>,
+        fence: Arc<boatramp_core::cache_coherence::AuthzFence>,
+    ) {
+        if let Some(inner) = self.inner.as_ref() {
+            inner.graphql_cache.set_registry_fence(backing, fence);
+        }
+    }
+
     /// Cap the size of a Wasm component blob accepted at activation (`0` =
     /// unlimited), from the security posture. Set once at startup.
     #[cfg(feature = "handlers")]

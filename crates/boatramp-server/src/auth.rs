@@ -37,7 +37,11 @@ use authz::ROOT_ANCHOR_PREFIX;
 /// is load-bearing). ALWAYS `false` in a shipped build: the env check compiles in ONLY under
 /// `cfg(test)` (this crate's own gates) or the `shared-mode-gate-mutation` feature (a downstream
 /// test lane). Shares the one `BOATRAMP_KVSQL_MUTATION` env var, mirroring the WS1–4 seams.
-fn authz_fence_removed() -> bool {
+///
+/// `pub(crate)` so the GraphQL registry fence ([`crate::graphql_cache`]) reuses the SAME seam — the
+/// `remove_authz_fence` mutation drives BOTH the authz-policy read and the registry read back onto
+/// the stale cache, so the policy gate AND the registry gate go RED under the one seam.
+pub(crate) fn authz_fence_removed() -> bool {
     #[cfg(any(test, feature = "shared-mode-gate-mutation"))]
     {
         std::env::var("BOATRAMP_KVSQL_MUTATION").as_deref() == Ok("remove_authz_fence")
