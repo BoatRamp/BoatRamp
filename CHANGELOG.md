@@ -5,6 +5,35 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.11.1] - 2026-10-01
+
+Completes the control-plane KV cold-open recovery for two shapes v0.11.0's manifest rollback could not
+handle on its own. Host/daemon only; no guest-facing (WIT) change.
+
+### Fixed
+
+- **Recover a corrupt `.compactions` (compactor-state) object.** A store whose manifest + SSTs are intact
+  but whose slatedb `.compactions` object is torn fails `Db::open` with `invalid compaction` on a
+  compactor-on open — a generation-independent fault a manifest rollback cannot fix. The self-heal open
+  path (and `boatramp kv recover`) now detect this via `Admin::read_compactions`, quarantine
+  `compactions/*` and the `gc/compactions.boundary` marker, and reopen so the compactor rebuilds a fresh
+  compaction state from the manifest's current SST set. Lossless: `.compactions` holds only compactor
+  bookkeeping — no acked data (that lives in the manifest + WAL + SST files).
+- **Select the recovery generation by open-ability, not decode-ability.** The last-good-generation walk
+  now adopts the newest manifest generation that actually *opens* (full open + range scan), skipping a
+  generation that decodes but references a missing/torn SST, instead of stopping at the first that merely
+  decodes. Fails loud (`NoOpenableManifest`) if none opens, never adopting an unopenable generation.
+
+### Notes
+
+- Both recoveries are SelfHeal-only; `--strict-kv` and a cluster node-local store fail loud with zero
+  mutation. All quarantines retain the original objects (copy → record → delete). A mutation-verified CI
+  battery proves each recovery step is load-bearing (the gate goes red if the reset, the boundary delete,
+  or the openability walk is disabled).
+- Emergency lever (documented, not a fix): a store with a corrupt `.compactions` also opens with the
+  compactor disabled, but that stalls writes once L0 SSTs accumulate unless the L0 caps are raised — use
+  the `.compactions` reset above instead.
+
 ## [0.11.0] - 2026-10-01
 
 Control-plane KV survives an unclean process exit. A machine stop (a fly image roll) that killed the
