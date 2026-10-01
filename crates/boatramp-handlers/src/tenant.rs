@@ -121,6 +121,15 @@ pub struct HostTenancy {
     /// raw path offering no weaker route than the injection-immune ORM. Empty for a route that lists
     /// none / a target principal.
     unscoped_writes: std::collections::BTreeSet<String>,
+    /// **Unresolved-request pass-through** (v0.12.x — the opt-in soft `domain` source). When `true`
+    /// this route opts into relaxing the pre-handler deny for a principal-less scoped op into a
+    /// **null-principal handler invocation**: [`orm_scope`](Self::orm_scope)`(Read)` /
+    /// [`rewrite_own_read`](Self::rewrite_own_read) then yield a scope that confines a scoped READ to
+    /// the EMPTY set (zero rows) instead of refusing, while every WRITE axis stays denied (the flag is
+    /// never threaded onto the write scope). `false` (the default) preserves today's fail-closed deny.
+    /// Threaded from the route's [`Tenancy::Scoped::on_unresolved`](boatramp_core::tenancy::Tenancy)
+    /// via [`with_unresolved_pass`](Self::with_unresolved_pass). Inert when a principal IS resolved.
+    pass_unresolved: bool,
 }
 
 impl HostTenancy {
@@ -163,6 +172,7 @@ impl HostTenancy {
             keys: boatramp_core::orm::TableKeys::Uniform,
             target_context: std::collections::BTreeMap::new(),
             unscoped_writes: std::collections::BTreeSet::new(),
+            pass_unresolved: false,
         }
     }
 
@@ -179,6 +189,20 @@ impl HostTenancy {
         unscoped_writes: impl IntoIterator<Item = String>,
     ) -> Self {
         self.unscoped_writes = unscoped_writes.into_iter().collect();
+        self
+    }
+
+    /// Opt this route into the **unresolved-request pass-through** (v0.12.x — the soft `domain`
+    /// source): when `pass` is `true`, a scoped op that resolves NO principal invokes the handler with
+    /// a null principal rather than denying pre-handler — a scoped READ then confines to the EMPTY set
+    /// (zero rows) and a scoped WRITE stays denied (the flag is threaded only onto the READ scope). A
+    /// builder so the common (`false`, today's behavior) path and every test caller need not name it.
+    /// Threaded from the route's [`Tenancy::Scoped::on_unresolved`](boatramp_core::tenancy::Tenancy) at
+    /// bind. A no-op sink for a target principal (a target route never carries it). Inert whenever a
+    /// principal IS resolved — the normal scope is built and the flag is never consulted.
+    #[must_use]
+    pub fn with_unresolved_pass(mut self, pass: bool) -> Self {
+        self.pass_unresolved = pass;
         self
     }
 
@@ -258,6 +282,9 @@ impl HostTenancy {
             // A target route carries no per-route write-global allowlist (#503 is a `Scoped`-variant
             // field); a target write to a global stays refused regardless.
             unscoped_writes: std::collections::BTreeSet::new(),
+            // The unresolved-request pass-through is a `Scoped`-variant opt-in; a target principal
+            // never carries it (a target route always resolves `B` or fails closed at bind).
+            pass_unresolved: false,
         }
     }
 
@@ -422,14 +449,23 @@ impl HostTenancy {
         } else {
             self.session_value().cloned()
         };
+        // v0.12.x unresolved-request pass-through: a scoped READ on a route that opted in confines a
+        // null principal to the EMPTY set (zero rows) at the injector instead of denying pre-handler.
+        // READ-AXIS ONLY and never under a target scope (a target principal always has `B` or fails at
+        // bind) — so a WRITE with no principal still fails closed below, the relaxation being of the
+        // read *deny* only. Threaded onto the `Scope` as `pass_unresolved`.
+        let pass_unresolved = self.pass_unresolved && matches!(axis, Axis::Read) && !is_target;
         // `own`/`own+null` need SOME principal. Fail closed early only when the mode needs a value
         // AND neither the bound (tenant/target) nor a session fact is present (a fully anonymous
-        // request). The finer, per-table decision is the injector's: a plain tenant table with only
-        // a session fact still denies there ([`OrmError::TenancyNoPrincipal`]), while a
-        // `TenantOrSession` table uses the session arm. `NullOnly` needs no value (it emits `IS NULL`).
+        // request) — UNLESS this read opted into the pass-through, which carries a null principal
+        // through to the injector's `1 = 0` empty-set confinement instead. The finer, per-table
+        // decision is the injector's: a plain tenant table with only a session fact still denies there
+        // ([`OrmError::TenancyNoPrincipal`]), while a `TenantOrSession` table uses the session arm.
+        // `NullOnly` needs no value (it emits `IS NULL`).
         if matches!(mode, ScopeMode::Own | ScopeMode::OwnOrNull)
             && bound.is_none()
             && session.is_none()
+            && !pass_unresolved
         {
             return Err(TenantDenied::NoSource);
         }
@@ -446,6 +482,9 @@ impl HostTenancy {
             // #503: carry this route's per-route write-global allowlist onto the scope so the ORM
             // `write_target` can admit a listed plain-`Unscoped` write unstamped (arm 3).
             unscoped_writes: self.unscoped_writes.clone(),
+            // v0.12.x: a null-principal READ on an opted-in route → empty set (`1 = 0`), not a deny.
+            // Never set on the WRITE scope (writes stay denied with no principal).
+            pass_unresolved,
         }))
     }
 
@@ -555,6 +594,10 @@ impl HostTenancy {
             session: self.session_value(),
             mode,
             keys,
+            // v0.12.x: a READ on an opted-in route confines a null principal to the empty set (`1 = 0`)
+            // on every table reference instead of refusing. READ path only (the write path below never
+            // sets this, so a null-principal raw-SQL write stays denied).
+            pass_unresolved: self.pass_unresolved,
         };
         rewrite_own_read(statement, &scope, dialect).map_err(OwnConfineError::Rewrite)
     }
@@ -588,6 +631,9 @@ impl HostTenancy {
             session: self.session_value(),
             mode,
             keys,
+            // The WRITE path NEVER opts into the unresolved pass-through: a null-principal write always
+            // fails closed (deny-by-default for writes is never relaxed). Explicit `false` is the guard.
+            pass_unresolved: false,
         };
         rewrite_own_write(statement, &scope, dialect).map_err(OwnConfineError::Rewrite)
     }
@@ -859,6 +905,52 @@ mod tests {
         assert_eq!(ht.orm_scope(Axis::Read), Err(TenantDenied::NoSource));
         // A None-grant axis denies outright.
         assert_eq!(ht.orm_scope(Axis::Write), Err(TenantDenied::NoAccess));
+    }
+
+    #[test]
+    fn unresolved_pass_yields_a_null_read_scope_but_never_relaxes_the_write() {
+        // v0.12.x soft `domain` source: `with_unresolved_pass(true)` + a null principal + `own` read →
+        // `orm_scope(Read)` yields a scope (the handler is INVOKED, not pre-handler-denied) carrying
+        // the pass flag + a null value, so the injector confines to zero rows (proven live in the
+        // storage gate). WITHOUT the opt-in the same read fails closed (`NoSource`).
+        let pass = HostTenancy::new("tenant_id", None, AccessMode::Own, AccessMode::Own)
+            .with_unresolved_pass(true);
+        let read = pass.orm_scope(Axis::Read).unwrap().unwrap();
+        assert_eq!(read.value, None);
+        assert!(
+            read.pass_unresolved,
+            "read scope carries the zero-rows pass flag"
+        );
+        // A null-principal WRITE is denied outright (the pass-through never opens a write) — so there is
+        // no write scope to leak the flag into.
+        assert_eq!(
+            pass.orm_scope(Axis::Write),
+            Err(TenantDenied::NoSource),
+            "a null-principal write is denied even on a pass route"
+        );
+        // Without the opt-in, the null-principal read fails closed (today's behavior, unchanged).
+        let deny = HostTenancy::new("tenant_id", None, AccessMode::Own, AccessMode::Own);
+        assert_eq!(deny.orm_scope(Axis::Read), Err(TenantDenied::NoSource));
+        // A RESOLVED principal is unaffected: the flag is inert when a value is present, and a RESOLVED
+        // write scope NEVER carries the flag (read-axis only).
+        let resolved = HostTenancy::new(
+            "tenant_id",
+            Some(t("acme")),
+            AccessMode::Own,
+            AccessMode::Own,
+        )
+        .with_unresolved_pass(true);
+        let read = resolved.orm_scope(Axis::Read).unwrap().unwrap();
+        assert_eq!(read.value, Some(t("acme")));
+        assert!(
+            read.pass_unresolved,
+            "the flag is carried but inert when a value is present (never consulted)"
+        );
+        let write = resolved.orm_scope(Axis::Write).unwrap().unwrap();
+        assert!(
+            !write.pass_unresolved,
+            "the pass flag is read-axis only; a write scope never carries it"
+        );
     }
 
     #[test]

@@ -4443,6 +4443,7 @@ mod tests {
                         write: AccessMode::Own,
                         exceed_site_ceiling: false,
                         unscoped_writes: Vec::new(),
+                        on_unresolved: boatramp_core::tenancy::OnUnresolved::Deny,
                     }),
                     token_claims: None,
                     secrets: Vec::new(),
@@ -5517,6 +5518,7 @@ mod tests {
                     write: AccessMode::None,
                     exceed_site_ceiling: false,
                     unscoped_writes: Vec::new(),
+                    on_unresolved: boatramp_core::tenancy::OnUnresolved::Deny,
                 }),
                 ..Default::default()
             },
@@ -5697,6 +5699,7 @@ mod tests {
                     write: AccessMode::None,
                     exceed_site_ceiling: false,
                     unscoped_writes: Vec::new(),
+                    on_unresolved: boatramp_core::tenancy::OnUnresolved::Deny,
                 }),
                 ..Default::default()
             },
@@ -5872,6 +5875,7 @@ mod tests {
                     write: AccessMode::None,
                     exceed_site_ceiling: false,
                     unscoped_writes: Vec::new(),
+                    on_unresolved: boatramp_core::tenancy::OnUnresolved::Deny,
                 }),
                 ..Default::default()
             },
@@ -6032,6 +6036,7 @@ mod tests {
                     write: AccessMode::None,
                     exceed_site_ceiling: false,
                     unscoped_writes: Vec::new(),
+                    on_unresolved: boatramp_core::tenancy::OnUnresolved::Deny,
                 }),
                 ..Default::default()
             },
@@ -6187,6 +6192,7 @@ mod tests {
                 write: AccessMode::None,
                 exceed_site_ceiling: false,
                 unscoped_writes: Vec::new(),
+                on_unresolved: boatramp_core::tenancy::OnUnresolved::Deny,
             }),
             ..Default::default()
         };
@@ -7489,6 +7495,7 @@ mod tests {
             write: AccessMode::Own,
             exceed_site_ceiling: false,
             unscoped_writes: Vec::new(),
+            on_unresolved: boatramp_core::tenancy::OnUnresolved::Deny,
         };
         let site = HandlersSiteConfig {
             enabled: true,

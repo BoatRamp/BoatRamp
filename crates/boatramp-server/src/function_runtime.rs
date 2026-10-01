@@ -3564,6 +3564,7 @@ mod blobstore_dimension0_tests {
             write: AccessMode::Own,
             exceed_site_ceiling: false,
             unscoped_writes: Vec::new(),
+            on_unresolved: boatramp_core::tenancy::OnUnresolved::Deny,
         }
     }
 

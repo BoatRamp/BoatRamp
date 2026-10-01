@@ -112,6 +112,11 @@ pub(crate) async fn resolve_host_tenancy(
             // `write_target` and the raw-SQL surface consult it. The runtime resolve-gate is primary;
             // apply-time validation (422) is defense-in-depth.
             unscoped_writes,
+            // v0.12.x soft `domain` source: what this route does when it resolves NO principal — `Deny`
+            // (today) or `Pass` (null-principal handler invocation; reads → zero rows, writes → denied).
+            // Threaded onto the `HostTenancy` below so the confiner relaxes the READ deny into the
+            // `1 = 0` empty-set confinement; it never relaxes a write.
+            on_unresolved,
             // `exceed_site_ceiling` (task #470) is deliberately NOT read here: the token relaxes only
             // the `narrows_within` shape check at bind, never the runtime resolver. `cap()` below
             // stays the SOLE authority over whether an `all` grant actually crosses tenants (key 3).
@@ -139,7 +144,10 @@ pub(crate) async fn resolve_host_tenancy(
             Ok(Some(
                 HostTenancy::from_facts(column.clone(), facts, read, write)
                     // #503: carry the per-route write-global allowlist (empty for most routes).
-                    .with_unscoped_writes(unscoped_writes.iter().cloned()),
+                    .with_unscoped_writes(unscoped_writes.iter().cloned())
+                    // v0.12.x: opt into the null-principal READ pass-through (zero rows) when declared;
+                    // `Deny` (the default) leaves the fail-closed deny unchanged.
+                    .with_unresolved_pass(on_unresolved.is_pass()),
             ))
         }
         // R4/D8: a `target` route is bound by the serving path ([`build_bindings`] in
@@ -274,6 +282,9 @@ pub(crate) fn resolve_inherited_tenancy(
             write,
             // #503: the callee's OWN per-route write-global allowlist applies on the invoke path too.
             unscoped_writes,
+            // v0.12.x: the callee's OWN unresolved-request policy applies on the invoke path too — an
+            // inherited empty principal yields zero rows (not a deny) iff the callee declared `Pass`.
+            on_unresolved,
             ..
         }) => {
             let read = cap(*read, posture.allow_cross_tenant);
@@ -283,7 +294,8 @@ pub(crate) fn resolve_inherited_tenancy(
             // its axis rather than collapsing into an `own` `Tenant` value.
             Ok(Some(
                 HostTenancy::from_facts(column.clone(), inherited, read, write)
-                    .with_unscoped_writes(unscoped_writes.iter().cloned()),
+                    .with_unscoped_writes(unscoped_writes.iter().cloned())
+                    .with_unresolved_pass(on_unresolved.is_pass()),
             ))
         }
         // A `target` route resolves `B` from its own trigger (the routed domain), not from an
@@ -423,6 +435,7 @@ pub(crate) fn scalar_to_sql(v: &serde_json::Value) -> Option<boatramp_core::sql:
 mod tests {
     use super::*;
     use boatramp_core::sql::SqlValue;
+    use boatramp_core::tenancy::OnUnresolved;
 
     fn posture(require: bool, cross: bool) -> TenantPosture {
         TenantPosture {
@@ -451,6 +464,7 @@ mod tests {
             write: AccessMode::Own,
             exceed_site_ceiling: false,
             unscoped_writes: Vec::new(),
+            on_unresolved: OnUnresolved::Deny,
         };
         // A request carrying BOTH a routed domain (⇒ a tenant fact) and a valid session cookie
         // (⇒ a session fact): the resolved principal holds both, axis-tagged.
@@ -525,6 +539,7 @@ mod tests {
             write: AccessMode::Own,
             exceed_site_ceiling: false,
             unscoped_writes: Vec::new(),
+            on_unresolved: OnUnresolved::Deny,
         };
         // The drained message carried a valid envelope + the fleet anchor ⇒ the producer's stamped
         // tenant resolves as the consumer's own `Tenant` fact.
@@ -596,6 +611,7 @@ mod tests {
             write: AccessMode::All,
             exceed_site_ceiling: false,
             unscoped_writes: Vec::new(),
+            on_unresolved: OnUnresolved::Deny,
         };
         let ht = resolve_inherited_tenancy(
             Some(&decision),
@@ -686,6 +702,7 @@ mod tests {
             write: AccessMode::Own,
             exceed_site_ceiling: false,
             unscoped_writes: Vec::new(),
+            on_unresolved: OnUnresolved::Deny,
         };
         let inputs = TenantSourceInputs {
             domain_context: Some("acme-store"),
@@ -902,6 +919,7 @@ mod tests {
             write: AccessMode::All,
             exceed_site_ceiling: false,
             unscoped_writes: Vec::new(),
+            on_unresolved: OnUnresolved::Deny,
         };
         let inputs = TenantSourceInputs {
             domain_context: Some("acme"),
@@ -938,6 +956,7 @@ mod tests {
             write: AccessMode::OwnOrNull,
             exceed_site_ceiling: false,
             unscoped_writes: Vec::new(),
+            on_unresolved: OnUnresolved::Deny,
         };
         let inputs = TenantSourceInputs {
             domain_context: Some("acme"),
@@ -969,6 +988,7 @@ mod tests {
             write: AccessMode::Own,
             exceed_site_ceiling: false,
             unscoped_writes: Vec::new(),
+            on_unresolved: OnUnresolved::Deny,
         };
         // No domain context supplied ⇒ no value; the binding will deny an own op.
         let ht = resolve_host_tenancy(
@@ -981,6 +1001,96 @@ mod tests {
         .unwrap()
         .unwrap();
         assert!(ht.orm_scope(boatramp_handlers::TenantAxis::Read).is_err());
+    }
+
+    #[tokio::test]
+    async fn on_unresolved_pass_binds_a_null_scoped_read_but_still_denies_writes_and_unaffected_when_resolved()
+     {
+        use boatramp_handlers::TenantAxis;
+        // A `domain`-source storefront route: read:own / write:none, opted into `on_unresolved: pass`.
+        let pass_route = Tenancy::Scoped {
+            column: "tenant_id".into(),
+            sources: vec![TenantSource::Domain],
+            read: AccessMode::Own,
+            write: AccessMode::None,
+            exceed_site_ceiling: false,
+            unscoped_writes: Vec::new(),
+            on_unresolved: OnUnresolved::Pass,
+        };
+        // UNRESOLVED host (no domain context): the route is NOT pre-handler-denied — `orm_scope(Read)`
+        // yields a scope (the handler would be invoked) carrying a NULL principal + the pass flag, so
+        // the injector confines to zero rows rather than refusing. The WRITE axis stays denied.
+        let ht = resolve_host_tenancy(
+            Some(&pass_route),
+            true,
+            posture(true, false),
+            TenantSourceInputs::default(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let read = ht
+            .orm_scope(TenantAxis::Read)
+            .expect("pass + unresolved must NOT pre-handler-deny the read")
+            .expect("a scope (not `all`) is produced");
+        assert_eq!(read.value, None, "null principal");
+        assert!(
+            read.pass_unresolved,
+            "the read scope carries the zero-rows pass flag"
+        );
+        // The write axis is denied (write:none ⇒ NoAccess) — the pass-through never opens a write.
+        assert!(
+            ht.orm_scope(TenantAxis::Write).is_err(),
+            "writes stay denied"
+        );
+
+        // The SAME route WITHOUT the opt-in (default Deny) still fails the read closed (today's behavior).
+        let deny_route = Tenancy::Scoped {
+            column: "tenant_id".into(),
+            sources: vec![TenantSource::Domain],
+            read: AccessMode::Own,
+            write: AccessMode::Own, // an own write, so the read denial isn't masked by a `none` write
+            exceed_site_ceiling: false,
+            unscoped_writes: Vec::new(),
+            on_unresolved: OnUnresolved::Deny,
+        };
+        let ht_deny = resolve_host_tenancy(
+            Some(&deny_route),
+            true,
+            posture(true, false),
+            TenantSourceInputs::default(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            matches!(
+                ht_deny.orm_scope(TenantAxis::Read),
+                Err(boatramp_handlers::TenantDenied::NoSource)
+            ),
+            "default (no opt-in) null-principal read must DENY"
+        );
+
+        // A RESOLVED host is UNAFFECTED: the pass route with a routed domain context stamps that
+        // tenant and the flag is inert (a real value is bound, read:own enforced downstream).
+        let ht_resolved = resolve_host_tenancy(
+            Some(&pass_route),
+            true,
+            posture(true, false),
+            TenantSourceInputs {
+                domain_context: Some("tenant_A"),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let read = ht_resolved.orm_scope(TenantAxis::Read).unwrap().unwrap();
+        assert_eq!(
+            read.value,
+            Some(SqlValue::Text("tenant_A".into())),
+            "a resolved host stamps its own tenant (pass flag inert when a principal is present)"
+        );
     }
 
     /// **Live** proof (R4/D8) that a **plain-wasm** target route confines BOTH its `orm` and its
@@ -1359,6 +1469,7 @@ mod tests {
             mode: ScopeMode::Own,
             keys: TableKeys::PerTable(schema.table_key_map()),
             unscoped_writes: std::collections::BTreeSet::new(),
+            pass_unresolved: false,
         };
         let mut q = name_q();
         q.force_scope(&own_a).unwrap();
@@ -2464,6 +2575,7 @@ mod tests {
             write,
             exceed_site_ceiling: token,
             unscoped_writes: Vec::new(),
+            on_unresolved: OnUnresolved::Deny,
         };
         let ceiling = scoped(AccessMode::Own, AccessMode::Own, false); // an `own` site ceiling.
         let route_all_token = scoped(AccessMode::All, AccessMode::All, true);

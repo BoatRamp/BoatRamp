@@ -1623,6 +1623,7 @@ mod tests {
             mode: ScopeMode::Own, // the WRITE-axis scope
             keys: TableKeys::PerTable(orm_keys.clone()),
             unscoped_writes: list.clone(),
+            pass_unresolved: false,
         };
         let orm_read_scope = Scope {
             mode: read_mode,
@@ -1705,6 +1706,7 @@ mod tests {
                 }
             },
             unscoped_writes: BTreeSet::new(),
+            pass_unresolved: false,
         };
         let mut tw = insert("oauth_state", "state");
         let target_refused = matches!(

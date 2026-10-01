@@ -34,6 +34,7 @@ fn scope(mode: ScopeMode, value: &str) -> Scope {
         mode,
         keys: TableKeys::Uniform,
         unscoped_writes: std::collections::BTreeSet::new(),
+        pass_unresolved: false,
     }
 }
 fn item(e: Expr) -> SelectItem {
@@ -450,6 +451,7 @@ async fn run_pertable_battery(backend: Arc<dyn SqlBackend>, dialect: Dialect, en
         mode: ScopeMode::Own,
         keys: keys.clone(),
         unscoped_writes: std::collections::BTreeSet::new(),
+        pass_unresolved: false,
     };
 
     // 1) `orders` (Tenant) scoped on `tenant_id` → acme-only.
@@ -687,6 +689,7 @@ async fn run_session_disjunct_battery(
         mode: ScopeMode::Own,
         keys: keys.clone(),
         unscoped_writes: std::collections::BTreeSet::new(),
+        pass_unresolved: false,
     };
     let read_items = |scope: &Scope| {
         let mut s = Select {
@@ -1033,6 +1036,7 @@ async fn run_unscoped_write_battery(backend: Arc<dyn SqlBackend>, dialect: Diale
         mode: ScopeMode::Own,
         keys: keys.clone(),
         unscoped_writes: BTreeSet::from(["audit_log".to_string()]),
+        pass_unresolved: false,
     };
 
     // (1) OWN READ isolation intact: acme reads ONLY its own provider row.
@@ -1129,6 +1133,7 @@ async fn run_unscoped_write_battery(backend: Arc<dyn SqlBackend>, dialect: Diale
     {
         let empty_list = Scope {
             unscoped_writes: BTreeSet::new(),
+            pass_unresolved: false,
             ..scoped("acme")
         };
         let mut ins = Insert {
