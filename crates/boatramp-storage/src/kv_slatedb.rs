@@ -113,6 +113,12 @@ fn open_error_looks_torn(raw: &str) -> bool {
         || raw.contains("empty block")
         || raw.contains("empty manifest")
         || raw.contains("invalid DB state")
+        // v0.11.1 — the mid-compaction unclean-exit shape: the latest manifest decodes but `Db::open`
+        // dies with `Invalid error: invalid compaction` (a referenced compacted SST was removed by a
+        // crash/GC). This routes a normal-open invalid-compaction failure into the last-good-generation
+        // walk (`recover_last_good_manifest`), which adopts the newest generation that OPENS CLEAN.
+        || raw.contains("invalid compaction")
+        || raw.contains("InvalidCompaction")
 }
 
 /// Whether a SlateDB open error Display is a **lifecycle** problem — a concurrent-writer fence or a
@@ -1649,6 +1655,124 @@ mod tests {
         assert_eq!(
             marker.loss_window, "none",
             "a pure last-good-generation rollback is lossless-for-acked"
+        );
+        opened.close().await.unwrap();
+    }
+
+    /// List the `{root}/compacted/` SST filenames currently present (the set a checkpoint's L0 flush
+    /// adds to) — used to identify the exact L0 SST a given write was frozen into.
+    async fn list_compacted_names(
+        store: &Arc<dyn ObjectStore>,
+        root: &str,
+    ) -> std::collections::BTreeSet<String> {
+        use futures::StreamExt;
+        let prefix = ObjPath::from(format!("{root}/compacted"));
+        let mut stream = store.list(Some(&prefix));
+        let mut out = std::collections::BTreeSet::new();
+        while let Some(item) = stream.next().await {
+            if let Some(name) = item
+                .ok()
+                .and_then(|m| m.location.filename().map(str::to_string))
+                && name.ends_with(".sst")
+            {
+                out.insert(name);
+            }
+        }
+        out
+    }
+
+    /// **v0.11.1 AUTO-PATH GATE (mutation-verified) — the self-heal walk adopts the newest generation
+    /// that OPENS CLEAN.** The store has a crown-jewel generation (crown in L0), a newer generation that
+    /// DECODES but references a REMOVED compacted SST (the invalid-compaction / mid-compaction shape),
+    /// and a torn LATEST manifest (so the cold open genuinely fails → `open_self_heal` routes into the
+    /// last-good-generation walk). The self-heal must SKIP the decodable-but-unopenable generation and
+    /// adopt the older crown generation, and the acked crown-jewel (and the WAL-replayed junk write)
+    /// survive byte-equal.
+    ///
+    /// This is the auto-path proof of watch-item #3: a cold open that fails with a torn/unbootable
+    /// signature reaches the generation walk, and the walk no longer stops at a generation that merely
+    /// DECODES. MUTATION `stop_at_first_decodable()` (v0.11.0 behavior): the walk adopts the
+    /// decodable-but-unopenable generation, whose real open + full-scan verify fails → `open_self_heal`
+    /// returns `Err` → the `.expect(...)` below is RED. (The existing `skip_lastgood` policy mutation
+    /// also reds this gate, as it does every self-heal gate.)
+    #[serial_test::serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn self_heal_walk_skips_a_decodable_but_unopenable_generation() {
+        use slatedb::object_store::memory::InMemory;
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        // Crown → L0 under an older generation; junk → a SECOND L0 under a newer generation.
+        let junk_sst;
+        {
+            let kv = SlateKv::open_with(
+                store.clone(),
+                "kv",
+                test_settings(Some(Duration::from_millis(5))),
+            )
+            .await
+            .unwrap();
+            kv.put("secret/acme/idp", b"sealed-crown-jewel".to_vec())
+                .await
+                .unwrap();
+            kv.checkpoint().await.unwrap();
+            let s1 = list_compacted_names(&store, "kv").await;
+            kv.put("zzz/junk", b"junk-value".to_vec()).await.unwrap();
+            kv.checkpoint().await.unwrap();
+            kv.close().await.unwrap();
+            let s2 = list_compacted_names(&store, "kv").await;
+            let added: Vec<String> = s2.difference(&s1).cloned().collect();
+            assert_eq!(
+                added.len(),
+                1,
+                "the second checkpoint must add exactly one L0 SST: s1={s1:?} s2={s2:?}"
+            );
+            junk_sst = added.into_iter().next().unwrap();
+        }
+        // DELETE the junk L0 SST → the newer generation(s) DECODE but reference a REMOVED compacted SST.
+        store
+            .delete(&ObjPath::from(format!("kv/compacted/{junk_sst}")))
+            .await
+            .unwrap();
+        let highest_before_tear = highest_manifest_id(&store, "kv").await;
+        // TEAR the latest manifest so the cold open genuinely fails and routes into recovery (a missing
+        // L0 SST alone is lazy — the open would otherwise succeed and only fail on the first serve).
+        tear_latest_manifest(&store, "kv").await;
+
+        // Self-heal: the cold open fails → walk → SKIP the decodable-but-unopenable generation → adopt
+        // the older crown generation that opens clean. (Under `stop_at_first_decodable()` the walk adopts
+        // the unopenable generation, whose open+scan verify fails → this `.expect` is RED.)
+        let opened = SlateKv::open_with_policy(
+            store.clone(),
+            "kv",
+            test_settings(Some(Duration::from_millis(5))),
+            manifest_rollback_open_policy(),
+        )
+        .await
+        .expect(
+            "SelfHeal must SKIP a decodable-but-unopenable generation and adopt the newest that opens clean",
+        );
+        // The acked crown-jewel survives byte-equal, and the junk write is replayed from the WAL
+        // (lossless-for-acked: the deleted SST's data lived in a surviving WAL object below the frontier).
+        assert_eq!(
+            opened.get("secret/acme/idp").await.unwrap(),
+            Some(b"sealed-crown-jewel".to_vec()),
+            "the acked crown-jewel MUST survive the invalid-compaction generation walk byte-equal"
+        );
+        assert_eq!(
+            opened.get("zzz/junk").await.unwrap(),
+            Some(b"junk-value".to_vec()),
+            "the junk write MUST be replayed from the WAL (lossless-for-acked)"
+        );
+
+        // A manifest-rollback breadcrumb records the adoption of an OLDER generation than the latest.
+        let marker = read_degraded_marker(&store, "kv")
+            .await
+            .unwrap()
+            .expect("the manifest-generation walk writes DEGRADED.json");
+        assert_eq!(marker.frontier_source, "manifest_gen_rollback");
+        assert!(
+            marker.rolled_back_to_generation.unwrap() < highest_before_tear,
+            "the walk must adopt an OLDER generation ({:?}) than the pre-tear latest ({highest_before_tear})",
+            marker.rolled_back_to_generation
         );
         opened.close().await.unwrap();
     }
