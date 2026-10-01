@@ -121,6 +121,19 @@ blob-drain-gate-mutation = [
   "boatramp-storage/fallback",
 ]
 
+# TEST-ONLY, NEVER SHIPPED: arm the MF-3/MF-4 shared-mode authz mutation seams
+# (`auth::authz_fence_removed` / `auth::authz_fail_open_reverted`), so a CI mutation loop can set
+# `BOATRAMP_KVSQL_MUTATION=remove_authz_fence` / `=revert_authz_fail_open` and drive the stale-authz
+# fence / fail-closed branch off — turning the MF-3/MF-4 gates RED (proving each is load-bearing).
+# Mirrors WS4's `shared-mode-gate-mutation`; forwards to `boatramp-core`. Compiled OUT of every real
+# build (the seams also live under this crate's own `cfg(test)`, so the in-crate gates arm them).
+shared-mode-gate-mutation = ["boatramp-core/shared-mode-gate-mutation"]
+
+# TEST-ONLY lane: the MF-3/MF-4 live-Postgres authz twins open a real multi-writer `SqlKv`
+# (`boatramp-storage/sql-postgres`) so node B's fence read-through / fail-closed shed is exercised
+# against a REAL shared primary. Env-gated on `BOATRAMP_TEST_PG_URL`; skips cleanly when unset.
+sql-postgres = ["boatramp-storage/sql-postgres"]
+
 # The duplex/resumable session capability (`boatramp:handlers/session`, PLAN-session-primitive):
 # a long-lived, client-addressable, bidirectional, resumable channel the host drives via
 # event-driven re-entry over the durable async lane. Implies `handlers`. Experimental.
@@ -382,6 +395,10 @@ tokio-tungstenite = { version = "0.24", default-features = false, features = [
 # The `blob_drain::gate` battery (feature `blob-drain-gate-mutation`) drives a real DeployStore over
 # a `FallbackStorage(primary=fs, secondary=fs)` in scratch directories.
 tempfile = "3"
+# Serialize the MF-3/MF-4 authz gates: they set/clear the process-global `BOATRAMP_KVSQL_MUTATION`
+# env var, so they must not run concurrently with each other (or the clean-path gates). Mirrors the
+# WS4 `boatramp-core` shared-mode gate serialization.
+serial_test = "3"
 
 [lints]
 workspace = true

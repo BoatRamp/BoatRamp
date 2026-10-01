@@ -58,6 +58,20 @@
 //!
 //! This is what makes the [`CheckpointKv`](boatramp_core::kv::CheckpointKv) wrapper already correct
 //! over `SqlKv`: a durable `put`/CAS-win plus the trait's no-op `checkpoint()`.
+//!
+//! ## Secret custody (MF-6)
+//! Sealing is PRE-PUT and backend-independent: a crown-jewel value is wrapped by the envelope
+//! ([`KeyEnvelope`](boatramp_core::envelope::KeyEnvelope)) BEFORE it reaches `SqlKv`, so what lands
+//! in `kv.value` is already ciphertext — stored as `BYTEA`/`BLOB`, no more exposed than in SlateDB.
+//! The **envelope KEK is NEVER persisted into the shared KV/DB**: it is held separately (the
+//! `[secrets]` envelope), so a reader of the SQL control-plane database sees only sealed bytes.
+//! The `kv_changes` append log — and any NOTIFY payload derived from it — carries **key + version
+//! ONLY, never value bytes** (there is no `value` column on `kv_changes`); the
+//! `sqlkv_change_log_carries_no_secret_values` gate asserts this and goes RED under the
+//! `leak_change_value` mutation. **Operator note for a shared SQL control-plane DB:** SQL
+//! statement/parameter logging MUST be OFF (a bound sealed value would otherwise land in the DB log),
+//! and the connection to the DB MUST use TLS (the sealed bytes + the plaintext control-plane
+//! config/RBAC travel the wire) — see [`SqlKv::open_postgres`].
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -270,6 +284,13 @@ impl SqlKv {
     /// Enforces the C6/MF-5 **durable-commit contract** at open: reads `synchronous_commit` and FAILS
     /// LOUD unless it is `on` (a non-durable setting could drop a committed revoke on crash). Then
     /// creates the `kv` + `kv_changes` tables idempotently (host-owned DDL, C9).
+    ///
+    /// **Custody (MF-6):** this database now sits inside the secret-custody boundary, but holds only
+    /// SEALED ciphertext for secrets (sealing is pre-put) and plaintext control-plane config/RBAC —
+    /// the envelope KEK is NEVER written here. The operator MUST (a) disable SQL statement/parameter
+    /// logging on this database/role (a bound sealed value would otherwise be written to the DB log),
+    /// and (b) require TLS on `url` (the sealed bytes + plaintext RBAC travel the wire). `kv_changes`
+    /// carries key + version only — never value bytes — so a change feed / NOTIFY leaks no secret.
     pub async fn open_postgres(
         url: impl Into<String>,
         pool_max: Option<u32>,
@@ -491,6 +512,16 @@ async fn pg_apply_put(
     tx.execute(stmts.append_change, &[key_blob, SqlValue::Integer(ts)])
         .await
         .map_err(sql_err)?;
+    // MF-6 custody — the change log carries KEY + VERSION ONLY, never value bytes. The leak seam
+    // (test-only; never shipped) stamps the value into `kv_changes` so the no-values gate goes RED.
+    if change_log_leaks_value() {
+        tx.execute(
+            stmts.delete_change,
+            &[SqlValue::Blob(value.to_vec()), SqlValue::Integer(ts)],
+        )
+        .await
+        .map_err(sql_err)?;
+    }
     Ok(())
 }
 
@@ -770,7 +801,7 @@ async fn sqlite_put(
     let res = async {
         conn.execute(
             stmts.upsert,
-            libsql::params_from_iter([blob(key), LibsqlValue::Blob(value)]),
+            libsql::params_from_iter([blob(key), LibsqlValue::Blob(value.clone())]),
         )
         .await
         .map_err(kv_err)?;
@@ -780,6 +811,16 @@ async fn sqlite_put(
         )
         .await
         .map_err(kv_err)?;
+        // MF-6 custody — key + version ONLY in the change log; the leak seam (test-only) stamps the
+        // value so the no-values gate goes RED.
+        if change_log_leaks_value() {
+            conn.execute(
+                stmts.delete_change,
+                libsql::params_from_iter([LibsqlValue::Blob(value), LibsqlValue::Integer(ts)]),
+            )
+            .await
+            .map_err(kv_err)?;
+        }
         Ok(())
     }
     .await;
@@ -1071,6 +1112,22 @@ fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
+/// Whether the MF-6 change-log VALUE-LEAK mutation seam is armed — the write path then ALSO stamps
+/// the (sealed) value bytes into `kv_changes`, so `sqlkv_change_log_carries_no_secret_values` finds
+/// them and goes RED (proving the custody invariant — the change log carries KEY + VERSION ONLY,
+/// never value bytes — is load-bearing, not incidental). ALWAYS `false` in a shipped build: the env
+/// check compiles in ONLY under `cfg(test)`. Shares the one `BOATRAMP_KVSQL_MUTATION` env var.
+fn change_log_leaks_value() -> bool {
+    #[cfg(test)]
+    {
+        std::env::var("BOATRAMP_KVSQL_MUTATION").as_deref() == Ok("leak_change_value")
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
 /// Unix-seconds timestamp for a change-log row (best-effort; a clock before the epoch records `0`).
 fn now_ts() -> i64 {
     SystemTime::now()
@@ -1265,6 +1322,50 @@ mod sqlite_tests {
             "put v1, put v2, delete tombstone 0"
         );
     }
+
+    /// MF-6 CUSTODY GATE — the change log carries the KEY + VERSION ONLY, NEVER the (sealed) value
+    /// bytes. A secret write records its key and post-write version in `kv_changes`; no `kv_changes`
+    /// cell may contain the value bytes (the sealed ciphertext lives only in `kv.value`). RED under
+    /// `BOATRAMP_KVSQL_MUTATION=leak_change_value` (the write then stamps the value into the log).
+    #[tokio::test]
+    async fn sqlkv_change_log_carries_no_secret_values() {
+        let (_dir, path) = temp_db("mf6-custody");
+        let kv = SqlKv::open_sqlite_local(&path).await.unwrap();
+        // A distinctive "sealed secret" value (incl. binary bytes) that must not appear in the log.
+        let sealed = b"SEALED-CIPHERTEXT-\x00\x9f\x92\x96-secret".to_vec();
+        kv.put("secret/default/api-key", sealed.clone())
+            .await
+            .unwrap();
+
+        let conn = kv.sqlite_test_conn().await.unwrap();
+        let mut rows = conn
+            .query("SELECT key, version FROM kv_changes", ())
+            .await
+            .unwrap();
+        let mut saw_key = false;
+        while let Some(row) = rows.next().await.unwrap() {
+            let key_bytes = value_bytes(row.get_value(0).unwrap()).unwrap();
+            assert_ne!(
+                key_bytes, sealed,
+                "kv_changes must NEVER carry the (sealed) value bytes — key + version only (MF-6)"
+            );
+            if key_bytes == b"secret/default/api-key" {
+                saw_key = true;
+                if let LibsqlValue::Integer(v) = row.get_value(1).unwrap() {
+                    assert_eq!(v, 1, "the change log records the key + post-write version");
+                }
+            }
+        }
+        assert!(
+            saw_key,
+            "the change log records the changed key (key + version)"
+        );
+        // The sealed value lives in `kv`, not in the change log / NOTIFY feed.
+        assert_eq!(
+            kv.get("secret/default/api-key").await.unwrap(),
+            Some(sealed)
+        );
+    }
 }
 
 /// LIVE Postgres gates (build-order step 2 / MF-2). Env-gated on `BOATRAMP_TEST_PG_URL` — they skip
@@ -1312,6 +1413,42 @@ mod pg_tests {
         };
         boatramp_core::kv::conformance::kv_conformance(&kv).await;
         println!("SQLKV PG CONFORMANCE OK [postgres]");
+    }
+
+    /// MF-6 CUSTODY GATE (over a REAL Postgres) — `kv_changes` carries KEY + VERSION ONLY, never the
+    /// (sealed) value bytes. RED under `BOATRAMP_KVSQL_MUTATION=leak_change_value`.
+    #[tokio::test]
+    #[serial]
+    async fn sqlkv_pg_change_log_carries_no_secret_values() {
+        let Some(kv) = fresh_pg().await else {
+            return;
+        };
+        let sealed = b"SEALED-CIPHERTEXT-\x00\x9f\x92\x96-pg-secret".to_vec();
+        kv.put("secret/default/pg-key", sealed.clone())
+            .await
+            .unwrap();
+        let Backing::Postgres(b) = &kv.backing else {
+            unreachable!("fresh_pg opened Postgres")
+        };
+        let mut tx = b.begin_read_only().await.unwrap();
+        let rows = tx
+            .query("SELECT key, version FROM kv_changes", &[])
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        let mut saw_key = false;
+        for row in rows.rows {
+            let key_bytes = pg_bytes(row.into_iter().next().unwrap()).unwrap();
+            assert_ne!(
+                key_bytes, sealed,
+                "kv_changes must NEVER carry the (sealed) value bytes — key + version only (MF-6)"
+            );
+            if key_bytes == b"secret/default/pg-key" {
+                saw_key = true;
+            }
+        }
+        assert!(saw_key, "the change log records the changed key");
+        println!("SQLKV PG MF-6 CUSTODY OK [postgres]: kv_changes carries key + version only.");
     }
 
     /// GATE — the PG `SqlKv` declares `MultiWriter` and `supports_cas` (the self-coordinating

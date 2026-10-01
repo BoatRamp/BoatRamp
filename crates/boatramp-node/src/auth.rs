@@ -22,8 +22,16 @@ pub async fn configure_auth(
     public_key: Option<String>,
     options: &mut boatramp_server::ServerOptions,
     kv: Arc<dyn KvStore>,
+    shared_authz: Option<SharedAuthz>,
 ) -> Result<boatramp_server::Auth> {
     use boatramp_core::cose::{LocalSigner, Signer, TokenPublicKey};
+    // Apply the multi-writer `shared`-mode authz guard (MF-3 fence + MF-4 fail-closed) when present.
+    // A no-op on a disabled auth, and NEVER passed for a single-writer backend (whose authz path is
+    // unchanged) — the node bootstrap builds `shared_authz` only for a multi-writer KV backend.
+    let with_shared = |auth: boatramp_server::Auth| match &shared_authz {
+        Some(s) => auth.with_shared_authz(s.backing.clone(), s.fence.clone()),
+        None => auth,
+    };
     // An external signer (KMS/HSM/Vault) issues *and* provides the trust anchor:
     // it resolves its own public key at connect.
     if let Some(cfg) = signer {
@@ -32,21 +40,33 @@ pub async fn configure_auth(
             .map_err(|e| Error::AuthPrivKey(e.to_string()))?;
         let public = issuer.public_key();
         options.issuer = Some(issuer);
-        return Ok(boatramp_server::Auth::with_key(public, kv));
+        return Ok(with_shared(boatramp_server::Auth::with_key(public, kv)));
     }
     if let Some(hex) = private_key {
         let signer =
             LocalSigner::from_private_hex(&hex).map_err(|e| Error::AuthPrivKey(e.to_string()))?;
         let public = signer.public_key();
         options.issuer = Some(Arc::new(signer) as Arc<dyn Signer>);
-        return Ok(boatramp_server::Auth::with_key(public, kv));
+        return Ok(with_shared(boatramp_server::Auth::with_key(public, kv)));
     }
     if let Some(hex) = public_key {
         let public =
             TokenPublicKey::from_hex(&hex).map_err(|e| Error::AuthPubKey(e.to_string()))?;
-        return Ok(boatramp_server::Auth::with_key(public, kv));
+        return Ok(with_shared(boatramp_server::Auth::with_key(public, kv)));
     }
     Ok(boatramp_server::Auth::disabled())
+}
+
+/// The multi-writer `shared`-mode authz guard the node bootstrap hands [`configure_auth`] (MF-3
+/// stale-authz fence + MF-4 fail-closed). Built ONLY when the control-plane KV backend declares
+/// [`WriterModel::MultiWriter`](boatramp_core::kv::WriterModel); a single-writer backend passes
+/// `None` and keeps the unchanged authz path.
+pub struct SharedAuthz {
+    /// The UNCACHED control-plane store (the `CachedKv`'s inner backend) the fence reads the authz
+    /// keyspace THROUGH when it cannot trust the cache.
+    pub backing: Arc<dyn KvStore>,
+    /// The MF-3 currency fence, shared (by `Arc`) with the cache poller.
+    pub fence: Arc<boatramp_core::cache_coherence::AuthzFence>,
 }
 
 /// Fail-closed bind guard: refuse to expose an unauthenticated control plane on a

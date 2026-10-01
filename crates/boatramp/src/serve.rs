@@ -876,6 +876,16 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
     let shared_coherence = flag_shared || multi_writer;
     let changelog = shared_coherence
         .then(|| Arc::new(Changelog::new(kv_backend.clone(), CHANGELOG_RETENTION_SECS)));
+    // MF-3 stale-authz fence: the cross-node correctness FLOOR for the authz/crown-jewel keyspace in
+    // multi-writer `shared` mode (replaces the 300s backstop for authz state). Built ONLY for a
+    // multi-writer backend; single-writer / Raft never constructs one and its authz path is
+    // unchanged. Shared (by `Arc`) between the authorizer (confirms it on a read-through) and the
+    // cache poller (trips it when it cannot reach the store).
+    let authz_fence = multi_writer.then(|| {
+        Arc::new(boatramp_core::cache_coherence::AuthzFence::new(
+            authz_fence_bound(),
+        ))
+    });
     // Front the metadata store with an LRU so hot reads stay in memory.
     let mut cached = CachedKv::new(kv_backend.clone(), args.cache_entries);
     if let Some(changelog) = &changelog {
@@ -1037,7 +1047,12 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
     ));
     spawn_sighup_reload(kv.clone(), Some(daemon_runtime.clone()));
     if let Some(changelog) = changelog {
-        spawn_cache_poller(changelog, kv.clone(), Some(daemon_runtime.clone()));
+        spawn_cache_poller(
+            changelog,
+            kv.clone(),
+            Some(daemon_runtime.clone()),
+            authz_fence.clone(),
+        );
     }
     // Periodic control-plane KV checkpoint + graceful-close budget (v0.9.0 KV-recovery, C1/C12).
     // The cadence advances the durable frontier so the self-heal-on-open trailing-tail loss window
@@ -1045,6 +1060,15 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
     // shutdown. Both come from `[serve.kv]` (+ env override) — see `resolve_kv_durability`.
     let (kv_checkpoint_interval, kv_close_deadline) = resolve_kv_durability(serve_cfg.kv.as_ref());
     spawn_kv_checkpoint(kv.clone(), kv_checkpoint_interval);
+    // MF-3/MF-4 — in multi-writer `shared` mode the authorizer gets the fence + the UNCACHED backing
+    // store so it can read the authz keyspace THROUGH the cache (fence) and FAIL CLOSED (shed) when
+    // the shared DB is unreachable. Single-writer passes `None` → the authz path is unchanged.
+    let shared_authz = authz_fence
+        .as_ref()
+        .map(|fence| boatramp_node::auth::SharedAuthz {
+            backing: kv_backend.clone(),
+            fence: fence.clone(),
+        });
     let auth = boatramp_node::auth::configure_auth(
         serve_cfg.signer.as_ref(),
         args.auth_root_private_key
@@ -1055,6 +1079,7 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
             .or(serve_cfg.auth_root_public_key.clone()),
         &mut options,
         kv.clone(),
+        shared_authz,
     )
     .await?;
     configure_oidc(&args, &mut options).await?;
@@ -2067,6 +2092,7 @@ fn spawn_cache_poller(
     changelog: Arc<Changelog>,
     cache: Arc<dyn KvStore>,
     daemon: Option<Arc<boatramp_server::DaemonRuntime>>,
+    authz_fence: Option<Arc<boatramp_core::cache_coherence::AuthzFence>>,
 ) {
     use std::time::Duration;
     tokio::spawn(async move {
@@ -2077,14 +2103,28 @@ fn spawn_cache_poller(
         let mut since_flush = Duration::ZERO;
         loop {
             tokio::time::sleep(poll).await;
-            let changed = changelog.poll(&mut cursor).await;
-            if !changed.is_empty() {
-                cache.invalidate_keys(&changed);
-                // A peer wrote dynamic daemon config → wake an immediate reload.
-                if let Some(daemon) = &daemon
-                    && changed.iter().any(|k| k.starts_with("daemon/"))
-                {
-                    daemon.notify_reload();
+            // MF-3: a CHECKED poll distinguishes a successful (possibly empty) poll from an
+            // unreachable store. On an error the node can no longer confirm currency, so TRIP the
+            // authz fence at once (shed sooner) rather than silently treat "no entries" as current.
+            // A successful poll does NOT confirm the authz fence: the `_inval` feed is best-effort /
+            // suppressible, so only a direct authz read-through (in the authorizer) may vouch for the
+            // authz keyspace — keeping the fence independent of NOTIFY.
+            match changelog.poll_checked(&mut cursor).await {
+                Ok(changed) if !changed.is_empty() => {
+                    cache.invalidate_keys(&changed);
+                    // A peer wrote dynamic daemon config → wake an immediate reload.
+                    if let Some(daemon) = &daemon
+                        && changed.iter().any(|k| k.starts_with("daemon/"))
+                    {
+                        daemon.notify_reload();
+                    }
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    if let Some(fence) = &authz_fence {
+                        fence.trip();
+                    }
+                    tracing::warn!(%err, "shared-mode cache poll failed; tripped the authz fence");
                 }
             }
             since_trim += poll;
@@ -2100,6 +2140,18 @@ fn spawn_cache_poller(
             }
         }
     });
+}
+
+/// The MF-3 fence bound `T` — how long a shared-mode node may serve the cached authz keyspace before
+/// re-confirming it against the store. Small (a few seconds); overridable via
+/// `BOATRAMP_KV_AUTHZ_FENCE_SECS` (clamped to 1..=60s), default 3s.
+fn authz_fence_bound() -> std::time::Duration {
+    let secs = std::env::var("BOATRAMP_KV_AUTHZ_FENCE_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(3)
+        .clamp(1, 60);
+    std::time::Duration::from_secs(secs)
 }
 
 /// Spawn a `SIGHUP` handler that drops the control-plane KV cache, so the next
@@ -3019,6 +3071,9 @@ async fn run_cluster(
             .or(cluster_serve_cfg.auth_root_public_key),
         &mut options,
         kv.clone(),
+        // Raft cluster = single-writer over a node-local store (replication keeps every node
+        // current); no shared-mode authz guard — the authz path is unchanged.
+        None,
     )
     .await?;
     configure_oidc(&args, &mut options).await?;
