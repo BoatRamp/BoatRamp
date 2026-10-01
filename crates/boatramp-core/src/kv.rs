@@ -32,6 +32,28 @@ pub enum WriteOp {
     Delete(String),
 }
 
+/// One `{key, value, version}` record of a portable KV dump (kv-sql WS7). It is what
+/// [`KvStore::dump_scan`] yields and what the backend-agnostic
+/// [`kv_dump`](crate::kv_dump) copier frames into (and reads back from) the versioned dump format —
+/// a LOGICAL snapshot of the store's CONTENT (never the physical LSM/manifest/`.compactions`), so a
+/// restore rebuilds a FRESH clean store immune to the torn-manifest / corrupt-`.compactions`
+/// physical-corruption classes.
+///
+/// `version` is the backend's own per-key write counter where it has one (the SQL `kv.version`
+/// column); backends with no per-key version (SlateDB, `memory`, Cloudflare KV) report `1` — a fresh
+/// logical generation. The field is carried in the dump for fidelity/forensics; a restore into a
+/// fresh store regenerates versions through the destination's own writes (fresh ⇒ `1`), which is the
+/// whole point of a logical rebuild.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KvDumpEntry {
+    /// The key (the `&str` key, exactly as stored).
+    pub key: String,
+    /// The value bytes (an empty value is distinct from an absent key, which a dump never carries).
+    pub value: Vec<u8>,
+    /// The backend's per-key version where it tracks one, else `1`.
+    pub version: i64,
+}
+
 /// The cold-open recovery policy for the control-plane KV store (v0.9.0 KV-recovery, C3/C7/C8/C11).
 /// Defined here (not in `boatramp-storage`) so it is available regardless of the `slatedb` feature —
 /// `boatramp-node`'s (non-feature-gated) `build_kv` takes it, and the SlateDB opener consumes it.
@@ -182,6 +204,31 @@ pub trait KvStore: Send + Sync {
         keys.sort();
         keys.truncate(limit);
         Ok(keys)
+    }
+
+    /// Scan EVERY `{key, value, version}` in the store, in key order — the primitive the portable
+    /// KV dump (kv-sql WS7, [`kv_dump`](crate::kv_dump)) exports from. The default rebuilds each
+    /// entry from [`list_prefix`](Self::list_prefix)`("")` + [`get`](Self::get), reporting
+    /// `version = 1` (a backend with no per-key version — SlateDB, `memory`, Cloudflare KV — has
+    /// nothing else to report, and a logical dump's version is informational). A backend that tracks
+    /// a per-key version (the SQL `kv.version` column) overrides this with a single ordered scan that
+    /// reads the real version; the caching/checkpoint wrappers forward to their inner store so the
+    /// dump reads the AUTHORITATIVE values (never a stale LRU). It returns EVERY key — the copier
+    /// applies the reserved-feed filter ([`kv_dump::is_reserved_dump_key`](crate::kv_dump::is_reserved_dump_key)),
+    /// so this stays a plain "scan all" primitive.
+    async fn dump_scan(&self) -> Result<Vec<KvDumpEntry>, KvError> {
+        let keys = self.list_prefix("").await?;
+        let mut out = Vec::with_capacity(keys.len());
+        for key in keys {
+            if let Some(value) = self.get(&key).await? {
+                out.push(KvDumpEntry {
+                    key,
+                    value,
+                    version: 1,
+                });
+            }
+        }
+        Ok(out)
     }
 
     /// Durably persist any buffered writes, keeping the store usable. The default
@@ -660,6 +707,12 @@ impl KvStore for CachedKv {
         self.inner.list_prefix(prefix).await
     }
 
+    async fn dump_scan(&self) -> Result<Vec<KvDumpEntry>, KvError> {
+        // Forward to the backing store so a dump reads the AUTHORITATIVE values (and real versions,
+        // for a SQL inner store), never the LRU — the cache is a read-through mirror, not a source.
+        self.inner.dump_scan().await
+    }
+
     fn atomic_write_batch(&self) -> bool {
         // The cache is a pure read-through mirror; the backing store's batch is the atomic/durable
         // one (`commit_then_mirror` commits it FIRST). So the cache is as atomic as its inner store.
@@ -778,6 +831,10 @@ impl KvStore for CheckpointKv {
         limit: usize,
     ) -> Result<Vec<String>, KvError> {
         self.inner.list_from(prefix, after, limit).await
+    }
+
+    async fn dump_scan(&self) -> Result<Vec<KvDumpEntry>, KvError> {
+        self.inner.dump_scan().await
     }
 
     async fn flush(&self) -> Result<(), KvError> {

@@ -303,6 +303,14 @@ pub fn router_with_fast(
         // stopping the writer, so an operator can snapshot a bootable volume of the running node.
         // `System·Admin` (mutating, node-level), re-checked defense-in-depth in the handler.
         .route("/api/kv-checkpoint", post(kv_checkpoint))
+        // Portable control-plane KV dump/restore (kv-sql WS7): `GET /api/kv-export` streams a
+        // LOGICAL dump (content, not the physical LSM) and `POST /api/kv-import` restores one. It is
+        // the WHOLE control plane (sealed secrets, config, RBAC), so BOTH are gated `System·Admin`
+        // EXPLICITLY in `authz::Right::required` (node-global — NOT inherited from a per-project
+        // `/api/<family>/*` mapping; the hyphen path can't collide with a project matcher), and
+        // re-checked defense-in-depth in each handler.
+        .route("/api/kv-export", get(kv_export))
+        .route("/api/kv-import", post(kv_import))
         .route("/api/certs", get(cert_status))
         .route("/api/cache/invalidate", post(invalidate_cache))
         .route(
