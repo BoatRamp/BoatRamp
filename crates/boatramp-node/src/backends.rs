@@ -99,10 +99,11 @@ pub async fn build_kv(
     }
 }
 
-/// Build the SQL control-plane KV from its `[serve.kv.sql]` config. THIS WORKSTREAM wires the
-/// embedded single-node **SQLite / libsql-local** path (`kind = sqlite`, by on-disk `path`) only;
-/// `postgres`/`mysql` (multi-writer) and a remote-sqld `url_env` are later workstreams and are
-/// refused with a clear, actionable message rather than silently mis-opened.
+/// Build the SQL control-plane KV from its `[serve.kv.sql]` config. Wires the embedded single-node
+/// **SQLite / libsql-local** path (`kind = sqlite`, by on-disk `path`, single-writer) and the
+/// **Postgres** primary (`kind = postgres`, by `url_env`-named URL, multi-writer). `mysql` and a
+/// remote-sqld `libsql` `url_env` are later workstreams and are refused with a clear, actionable
+/// message rather than silently mis-opened.
 #[cfg(feature = "sql")]
 async fn build_sql_kv(sql: Option<&crate::config::SqlKvConfig>) -> Result<Arc<dyn KvStore>> {
     use crate::error::Error;
@@ -130,16 +131,54 @@ async fn build_sql_kv(sql: Option<&crate::config::SqlKvConfig>) -> Result<Arc<dy
                 boatramp_storage::SqlKv::open_sqlite_local(path).await?,
             ))
         }
-        engine @ ("postgres" | "postgresql" | "pg" | "mysql" | "mariadb") => {
-            Err(Error::SqlKvConfig(format!(
-                "the `{engine}` SQL KV backend is wired in a later workstream; `--kv sql` currently \
-                 supports `sqlite` (libsql-local, single node) only"
-            )))
-        }
+        engine @ ("postgres" | "postgresql" | "pg") => build_pg_kv(cfg, engine).await,
+        engine @ ("mysql" | "mariadb") => Err(Error::SqlKvConfig(format!(
+            "the `{engine}` SQL KV backend is wired in a later workstream; `--kv sql` currently \
+             supports `sqlite` (libsql-local, single node) and `postgres` (multi-writer)"
+        ))),
         other => Err(Error::SqlKvConfig(format!(
             "unknown `[serve.kv.sql] kind` {other:?}: expected sqlite | postgres | mysql"
         ))),
     }
+}
+
+/// Open the Postgres control-plane KV from `cfg`, resolving the connection URL from the env var
+/// `cfg.url_env` NAMES (UX-C2 — never a raw URL in config) and passing `cfg.pool_max` to the pool.
+/// Requires the `sql-postgres` engine; a build without it refuses with an actionable rebuild hint.
+#[cfg(all(feature = "sql", feature = "sql-postgres"))]
+async fn build_pg_kv(cfg: &crate::config::SqlKvConfig, engine: &str) -> Result<Arc<dyn KvStore>> {
+    use crate::error::Error;
+    let url_env = cfg
+        .url_env
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            Error::SqlKvConfig(format!(
+                "`[serve.kv.sql] kind = {engine}` needs `url_env` (the NAME of the env var holding \
+                 the connection URL — never a raw URL in config) — set it or `BOATRAMP_KV_SQL_URL_ENV`"
+            ))
+        })?;
+    let url = std::env::var(url_env)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| {
+            Error::SqlKvConfig(format!(
+                "`[serve.kv.sql] url_env = {url_env:?}` names an unset or empty env var; set \
+                 {url_env} to the Postgres connection URL"
+            ))
+        })?;
+    Ok(Arc::new(
+        boatramp_storage::SqlKv::open_postgres(url, cfg.pool_max).await?,
+    ))
+}
+
+#[cfg(all(feature = "sql", not(feature = "sql-postgres")))]
+async fn build_pg_kv(_cfg: &crate::config::SqlKvConfig, engine: &str) -> Result<Arc<dyn KvStore>> {
+    Err(crate::error::Error::SqlKvConfig(format!(
+        "the `{engine}` SQL KV backend needs the Postgres engine — rebuild with `--features sql-postgres`"
+    )))
 }
 
 #[cfg(not(feature = "sql"))]
