@@ -5,6 +5,36 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.12.1] - 2026-10-02
+
+Additive — an opt-in soft domain-tenancy source for public wildcard hosts (construens
+`boatramp-optional-domain-source`). Host/daemon only; no guest-facing (WIT) change; the default preserves
+today's behavior exactly.
+
+### Added
+
+- **`on_unresolved: pass` on the `scoped` route tenancy** (default `deny`, unchanged). When a route opts
+  in and resolves no principal — e.g. an unknown wildcard subdomain with no domain context — the handler
+  runs under a **null principal** instead of the scoped op being refused, so a public `*.base` portal can
+  return a tenant-agnostic response (a 302 to the apex, a 404, a neutral landing) for an unclaimed host
+  rather than a 500.
+
+### Security / correctness
+
+- The pass-through relaxes **only** the pre-query deny, never the row scoping: a null-principal scoped
+  READ fails closed to **zero rows** via the same structural AST confinement — an unsatisfiable `1 = 0`
+  predicate conjoined on every table reference (root, joins including the `ON` of a LEFT JOIN, subqueries,
+  union arms, aggregates) across both the typed `orm` and raw-SQL paths — with the Postgres RLS session
+  GUC left unset as defense-in-depth. `TenantOrBase`/`OwnOrNull`/`TenantOrSession` yield `1 = 0` under a
+  null principal (never a base/shared row). Writes under a null principal stay denied; a resolved host is
+  unchanged (`read: own` enforced). Reviewed clean by Security; a mutation-verified CI gate proves the
+  null-principal read returns zero rows and goes red if the confinement is removed.
+
+### Note
+
+- Under a null principal an ungrouped `COUNT(*)` returns one row of `0` (correct zero-rows semantics, not
+  an empty result set) — handlers should expect zeroed aggregates.
+
 ## [0.12.0] - 2026-10-01
 
 A SQL-backed control-plane KV backend family (SQLite/libsql, Postgres, MySQL) alongside the SlateDB
