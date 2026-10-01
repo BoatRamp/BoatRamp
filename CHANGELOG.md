@@ -5,6 +5,64 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.12.0] - 2026-10-01
+
+A SQL-backed control-plane KV backend family (SQLite/libsql, Postgres, MySQL) alongside the SlateDB
+object-store family, with a second, database-coordinated HA model — so a deployment's coordination is an
+intrinsic property of the backend it chooses, not a separate knob. Default stays `slatedb`; the Raft
+cluster path is unchanged. Host/daemon only; no guest-facing (WIT) change.
+
+### Added
+
+- **`kv-sql` backend family** — `[serve.kv] backend = sql` with `sql = { kind = sqlite|postgres|mysql,
+  url_env, path, pool_max }` (the connection URL is named indirectly by an env var, never written in
+  config, mirroring the `databases:` idiom). Each backend DECLARES its writer model; coordination is
+  DERIVED: single-writer backends (slatedb, sqlite, memory) use Raft for multi-node; multi-writer
+  backends (postgres, mysql) self-coordinate — N stateless nodes share one database, no Raft.
+- **Embedded SQLite/libsql KV** — a simple single-node/dev backend (WAL + `synchronous=FULL`) that avoids
+  the SlateDB manifest/compaction machinery entirely.
+- **Multi-writer shared mode (Postgres/MySQL)** — N equal stateless nodes over one database: a
+  linearizable value-CAS serializes control-plane writes, a non-Raft CAS-lease elects the single actor
+  for the leader-gated reconcilers, and a positive control-plane identity (a `cp-id` + member roster,
+  shown in the boot banner and `kv-status`) makes cross-node commingle / split-brain visible every boot.
+- **`boatramp kv export` / `import`** and **`kv migrate`** over one portable, backend-agnostic dump
+  format (`BRKVDUMP`) — logical backups that restore to a *fresh* store (immune to the physical-corruption
+  classes that make volume snapshots fragile), and SlateDB⇄SQL migration. `GET /api/kv-export` /
+  `POST /api/kv-import` are op-gated `System·Admin`; a dump carries sealed ciphertext (no plaintext
+  secrets) and never the envelope key.
+- **`kv-status` is backend-aware** — reports the backend, the derived coordination (none/raft/shared),
+  connection health, and (shared) cache-coherence staleness; the SlateDB recovery fields nest under
+  `durability` and `state` stays at the root for back-compat.
+
+### Security / correctness
+
+- Control-plane crown-jewel writes (secret rotate/delete, tenant secrets + their name cap, the RBAC
+  policy edit) are now compare-and-swap / If-Match with conflict-on-race — no blind read-modify-write —
+  so N concurrent writers cannot lose a rotation, resurrect a deleted secret, lose a revoke/grant, or
+  bypass the cap. (This also fixes a latent cross-process double-execution risk in the pre-existing
+  shared-SlateDB-on-S3 topology, whose `supports_cas` was only in-process.)
+- A NOTIFY-independent max-age fence over the authz keyspace (`authz/policy`, `authz/revoked/*`, and the
+  GraphQL registry) forces a read-through (or sheds) rather than serving a revoked grant / hidden field
+  from a stale cache after a missed invalidation; authz reads and control-plane writes fail *closed* on a
+  database error in shared mode (single-writer/Raft behavior unchanged).
+- Durable commit is enforced at open (Postgres `synchronous_commit=on`; MySQL
+  `innodb_flush_log_at_trx_commit=1` + `sync_binlog=1`); the change log and notifications carry
+  key+version only, never value bytes. The backend was built behind a 3-role design panel and a Security
+  implementation re-review, with a mutation-verified CI gate battery (Postgres + MySQL service
+  containers) in which each security property goes red under a seam that disables it.
+
+### Config
+
+- `[serve.kv]`'s SlateDB-only `checkpoint_interval`/`close_deadline` moved under a `[serve.kv.slatedb]`
+  sub-block (they don't apply to `backend = sql`). Configuring a multi-writer SQL backend alongside a
+  `[cluster]` Raft section is refused at startup (the two coordinators are mutually exclusive).
+
+### Follow-ups (noted, not in this release)
+
+- An online consistent-snapshot `kv export` mode (today's export is offline/quiesced; the SQL path is a
+  single MVCC-consistent read), an optional whole-dump `--encrypt` at-rest seal, and open-time enforcement
+  (vs documentation) of TLS + disabled statement logging for a shared SQL control-plane database.
+
 ## [0.11.1] - 2026-10-01
 
 Completes the control-plane KV cold-open recovery for two shapes v0.11.0's manifest rollback could not
