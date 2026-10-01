@@ -21,6 +21,8 @@ pub mod cert;
 pub mod compat;
 #[cfg(feature = "authz")]
 pub mod cose;
+/// Crown-jewel CAS conversion (MF-1): the test-only mutation seam + mutation-verified gate helpers.
+pub mod crownjewel;
 /// An injectable source of environment-variable values ([`env::EnvSource`]):
 /// `SystemEnv` in production, a `MapEnv` in tests, so config-named env resolvers
 /// never require mutating the global process environment.

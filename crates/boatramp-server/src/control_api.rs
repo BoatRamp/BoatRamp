@@ -714,27 +714,63 @@ pub(super) async fn kv_checkpoint(State(deploy): State<DeployStore>) -> Response
     }
 }
 
+/// Set the `ETag` header on a response to the quoted policy version, so a `GET` hands the operator
+/// the version their next `PUT` echoes back as `If-Match` (optimistic concurrency).
+fn set_policy_etag(resp: &mut Response, version: &boatramp_core::deploy::PolicyVersion) {
+    if let Ok(val) = axum::http::HeaderValue::from_str(&format!("\"{}\"", version.as_str())) {
+        resp.headers_mut().insert(axum::http::header::ETAG, val);
+    }
+}
+
 /// Return the active RBAC policy (`authz/policy`), or the built-in default when
-/// none is stored — so a `get` always shows the effective policy.
+/// none is stored — so a `get` always shows the effective policy. The `ETag` header carries the
+/// optimistic-concurrency version the operator echoes as `If-Match` on the next `PUT`.
 pub(super) async fn get_authz_policy(State(deploy): State<DeployStore>) -> Response {
-    match deploy.get_authz_policy().await {
-        Ok(Some(policy)) => Json(policy).into_response(),
-        Ok(None) => Json(boatramp_core::authz::AuthzPolicy::default_policy()).into_response(),
+    match deploy.get_authz_policy_versioned().await {
+        Ok((stored, version)) => {
+            let policy = stored.unwrap_or_else(boatramp_core::authz::AuthzPolicy::default_policy);
+            let mut resp = Json(policy).into_response();
+            set_policy_etag(&mut resp, &version);
+            resp
+        }
         Err(err) => deploy_error_response(err),
     }
 }
 
-/// Replace the RBAC policy. Rejected (`400`) unless it compiles to a valid Cedar
-/// policy set, so a bad policy can never be stored and brick the edge.
+/// Replace the RBAC policy with optimistic concurrency. Rejected (`400`) unless it compiles to a
+/// valid Cedar policy set, so a bad policy can never be stored and brick the edge. When the request
+/// carries an `If-Match` (the version from a prior `GET`'s `ETag`), the write wins only if the
+/// stored policy still matches — a stale version → `409 Conflict` (the operator re-reads + retries),
+/// closing the lost-grant/lost-revoke race when two operators edit on different nodes. With no
+/// `If-Match` (or `If-Match: *`) the write CAS'es on the current value (still no blind clobber).
 pub(super) async fn put_authz_policy(
     State(deploy): State<DeployStore>,
+    headers: axum::http::HeaderMap,
     Json(policy): Json<boatramp_core::authz::AuthzPolicy>,
 ) -> Response {
     if let Err(err) = boatramp_core::cedar::CompiledCedar::compile(&policy) {
         return (StatusCode::BAD_REQUEST, format!("invalid policy: {err}\n")).into_response();
     }
-    match deploy.set_authz_policy(&policy).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+    let if_match = headers
+        .get(axum::http::header::IF_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim);
+    let result = match if_match {
+        Some(raw) if raw != "*" => {
+            let expected = boatramp_core::deploy::PolicyVersion::from_header(raw);
+            deploy.set_authz_policy_if_match(&expected, &policy).await
+        }
+        _ => match deploy.get_authz_policy_versioned().await {
+            Ok((_current, version)) => deploy.set_authz_policy_if_match(&version, &policy).await,
+            Err(err) => Err(err),
+        },
+    };
+    match result {
+        Ok(version) => {
+            let mut resp = StatusCode::NO_CONTENT.into_response();
+            set_policy_etag(&mut resp, &version);
+            resp
+        }
         Err(err) => deploy_error_response(err),
     }
 }
@@ -815,7 +851,11 @@ fn no_secret_store_response() -> Response {
 /// detail could carry key shapes or a KMS endpoint) is logged server-side and returned
 /// as a generic `500`.
 fn secret_error_response(err: boatramp_core::secret_store::SecretError) -> Response {
-    if err.is_client_error() {
+    if err.is_conflict() {
+        // An optimistic-concurrency conflict (a concurrent rotation/delete won the CAS). The
+        // message is request-level and safe to surface; the caller re-reads and retries.
+        (StatusCode::CONFLICT, format!("{err}\n")).into_response()
+    } else if err.is_client_error() {
         (StatusCode::BAD_REQUEST, format!("{err}\n")).into_response()
     } else {
         tracing::warn!(%err, "secret store backend error");

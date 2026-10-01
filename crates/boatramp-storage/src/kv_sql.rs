@@ -1393,4 +1393,214 @@ mod pg_tests {
              primary each had EXACTLY ONE winner (single-statement, winner-by-rows-affected)."
         );
     }
+
+    // ---- MF-1 crown-jewel CAS conversion gates (over a REAL multi-writer Postgres) --------------
+    //
+    // The IDENTICAL gates run over `MemoryKv` in `boatramp-core`; here they run over the real
+    // multi-writer `SqlKv` — the cross-node linearizable property the Security panel gated on. Each
+    // is mutation-verified: built with `--features sql-postgres,crownjewel-cas-gate-mutation` and
+    // `BOATRAMP_KVSQL_MUTATION=drop_crownjewel_cas`, the converted crown-jewel write reverts to the
+    // blind pre-MF-1 path and the gate goes RED (the CI mutation loop asserts that). Env-gated on
+    // `BOATRAMP_TEST_PG_URL`; skips CLEANLY when unset.
+    use boatramp_core::crownjewel::gate::{
+        GateEnvelope, assert_no_lost_update, distinct_policy, gate_project,
+    };
+    use boatramp_core::deploy::{policy_read_versioned, policy_set_if_match};
+    use boatramp_core::error::DeployError;
+    use boatramp_core::secret_store::{
+        MAX_TENANT_SECRET_NAMES, SecretError, SecretStore, TenantSecretStore,
+    };
+
+    /// MF-1 GATE — N concurrent `SecretStore::set` on one key over a real Postgres have exactly one
+    /// winner per read-prev, so the winning revisions are unique + monotonic and no rotation is lost
+    /// (the loser gets `Conflict`, never a silent clobber). RED under the mutation (blind put →
+    /// duplicate revisions).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial]
+    async fn crownjewel_concurrent_secret_rotation_no_lost_update() {
+        let Some(kv) = fresh_pg().await else {
+            return;
+        };
+        let store = Arc::new(SecretStore::new(
+            Arc::new(kv) as Arc<dyn KvStore>,
+            Arc::new(GateEnvelope),
+        ));
+        let p = gate_project();
+        let base = store.set(p, "k", b"seed").await.unwrap().revision;
+
+        let mut set = tokio::task::JoinSet::new();
+        for i in 0..32u32 {
+            let store = store.clone();
+            set.spawn(async move { store.set(p, "k", format!("v{i}").as_bytes()).await });
+        }
+        let mut wins = Vec::new();
+        while let Some(res) = set.join_next().await {
+            match res.unwrap() {
+                Ok(meta) => wins.push(meta.revision),
+                Err(SecretError::Conflict(_)) => {}
+                Err(e) => panic!("unexpected secret error: {e}"),
+            }
+        }
+        let final_rev = store
+            .list(p)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|m| m.name == "k")
+            .unwrap()
+            .revision;
+        assert_no_lost_update(base, wins, final_rev);
+        println!(
+            "SQLKV PG CROWNJEWEL ROTATION OK [postgres]: 32-way concurrent secret rotation over a \
+             real primary — unique+monotonic revisions, no lost update."
+        );
+    }
+
+    /// MF-1 GATE — a `delete` racing a rotation over a real Postgres never resurrects the deleted
+    /// secret (a stale `set`'s value-CAS fails once the record is tombstoned). RED under the
+    /// mutation (blind delete + blind put → a stale rotation lands after the delete).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial]
+    async fn crownjewel_rotate_vs_delete_no_resurrection() {
+        let Some(kv) = fresh_pg().await else {
+            return;
+        };
+        let store = Arc::new(SecretStore::new(
+            Arc::new(kv) as Arc<dyn KvStore>,
+            Arc::new(GateEnvelope),
+        ));
+        let p = gate_project();
+        let mut resurrections = 0usize;
+        for round in 0..100u32 {
+            let name = format!("k{round}");
+            assert_eq!(store.set(p, &name, b"OLD").await.unwrap().revision, 1);
+
+            let s1 = store.clone();
+            let n1 = name.clone();
+            let setter = tokio::spawn(async move { s1.set(p, &n1, b"NEW").await });
+            let s2 = store.clone();
+            let n2 = name.clone();
+            let deleter = tokio::spawn(async move { s2.delete(p, &n2).await });
+            let _ = setter.await.unwrap();
+            let del_res = deleter.await.unwrap();
+
+            // Resurrection = the delete committed, yet a STALE rotation (one that read OLD, hence
+            // revision 2) is now live. Under value-CAS this is impossible; a fresh re-create is
+            // revision 1. Under the blind mutation a stale put lands after the delete → revision 2.
+            if matches!(del_res, Ok(true)) {
+                let live_stale = store
+                    .list(p)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .find(|m| m.name == name)
+                    .is_some_and(|m| m.revision == 2);
+                if live_stale {
+                    resurrections += 1;
+                }
+            }
+        }
+        assert_eq!(
+            resurrections, 0,
+            "a committed delete must not be undone by a stale concurrent rotation (resurrection)"
+        );
+        println!(
+            "SQLKV PG CROWNJEWEL RESURRECTION OK [postgres]: 100 rounds of rotate-vs-delete over a \
+             real primary — no deleted secret resurrected."
+        );
+    }
+
+    /// MF-1 GATE — N concurrent new-name `TenantSecretStore::set` at `count = max-1` over a real
+    /// Postgres admit exactly ONE (the CAS'd per-tenant index), so the cap holds. RED under the
+    /// mutation (list-then-write TOCTOU → all admitted, cap bypassed).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial]
+    async fn crownjewel_tenant_name_cap_holds_under_concurrency() {
+        let Some(kv) = fresh_pg().await else {
+            return;
+        };
+        let store = Arc::new(TenantSecretStore::new(
+            Arc::new(kv) as Arc<dyn KvStore>,
+            Arc::new(GateEnvelope),
+        ));
+        let p = gate_project();
+        let tenant = "firm-1";
+        for i in 0..(MAX_TENANT_SECRET_NAMES - 1) {
+            store.set(p, tenant, &format!("n{i}"), b"v").await.unwrap();
+        }
+
+        // 32 racers over a ≥16-conn pool: a first wave reads `count = max-1` concurrently, so the
+        // old list-then-write TOCTOU (the mutation) admits the whole wave — RED. The CAS'd index
+        // admits exactly one regardless of the racer count.
+        let mut set = tokio::task::JoinSet::new();
+        for i in 0..32u32 {
+            let store = store.clone();
+            set.spawn(async move { store.set(p, tenant, &format!("new-{i}"), b"v").await });
+        }
+        let (mut ok, mut rejected) = (0usize, 0usize);
+        while let Some(res) = set.join_next().await {
+            match res.unwrap() {
+                Ok(_) => ok += 1,
+                Err(SecretError::TooManyNames { .. }) | Err(SecretError::Conflict(_)) => {
+                    rejected += 1;
+                }
+                Err(e) => panic!("unexpected secret error: {e}"),
+            }
+        }
+        assert_eq!(
+            ok, 1,
+            "exactly one new name admitted at the cap boundary (got ok={ok}, rejected={rejected})"
+        );
+        let live = store.list(p, tenant).await.unwrap().len();
+        assert_eq!(
+            live, MAX_TENANT_SECRET_NAMES,
+            "the per-tenant name cap must hold under concurrency (not be bypassed)"
+        );
+        println!(
+            "SQLKV PG CROWNJEWEL TENANT CAP OK [postgres]: 32 concurrent new-name sets at \
+             count=max-1 over a real primary — cap held at {MAX_TENANT_SECRET_NAMES}."
+        );
+    }
+
+    /// MF-1 GATE — two concurrent policy edits (version/If-Match) over a real Postgres: exactly one
+    /// wins, the other `Conflict`s (409), no lost write. RED under the mutation (blind whole-doc put
+    /// drops the version guard → both win, one edit silently lost).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial]
+    async fn crownjewel_concurrent_policy_edit_no_lost_write() {
+        let Some(kv) = fresh_pg().await else {
+            return;
+        };
+        let kv = Arc::new(kv) as Arc<dyn KvStore>;
+        for round in 0..12u32 {
+            let (_cur, ver) = policy_read_versioned(kv.as_ref()).await.unwrap();
+            let k1 = kv.clone();
+            let v1 = ver.clone();
+            let a = distinct_policy(&format!("a{round}"));
+            let ta = tokio::spawn(async move { policy_set_if_match(k1.as_ref(), &v1, &a).await });
+            let k2 = kv.clone();
+            let v2 = ver.clone();
+            let b = distinct_policy(&format!("b{round}"));
+            let tb = tokio::spawn(async move { policy_set_if_match(k2.as_ref(), &v2, &b).await });
+            let ra = ta.await.unwrap();
+            let rb = tb.await.unwrap();
+            let oks = [&ra, &rb].iter().filter(|r| r.is_ok()).count();
+            let conflicts = [&ra, &rb]
+                .iter()
+                .filter(|r| matches!(r, Err(DeployError::Conflict(_))))
+                .count();
+            assert_eq!(
+                oks, 1,
+                "round {round}: exactly one concurrent policy edit may win"
+            );
+            assert_eq!(
+                conflicts, 1,
+                "round {round}: the losing edit must Conflict (409) — no silent lost write"
+            );
+        }
+        println!(
+            "SQLKV PG CROWNJEWEL POLICY EDIT OK [postgres]: 12 rounds of concurrent If-Match edits \
+             over a real primary — one wins, one 409s, no lost write."
+        );
+    }
 }

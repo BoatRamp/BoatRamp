@@ -93,6 +93,13 @@ blob-migrate-gate-mutation = ["fs"]
 # Implies `fs` + `fallback` (the fixtures build a `FallbackStorage(primary=fs, secondary=fs)`); note
 # both are also in `default`, so a plain `cargo test -p boatramp-storage blob_purge` already runs it.
 blob-purge-gate = ["fs", "fallback"]
+# TEST-ONLY, NEVER SHIPPED: arm the MF-1 crown-jewel CAS mutation seam in `boatramp-core` from this
+# crate's live-Postgres crown-jewel gate lane. With this ON and
+# `BOATRAMP_KVSQL_MUTATION=drop_crownjewel_cas`, the converted crown-jewel writes (secret set/delete,
+# tenant cap, policy If-Match) revert to the blind pre-MF-1 path, so every `crownjewel_*` live gate
+# goes RED — proving the CAS/If-Match is load-bearing. Mirrors the MF-2 `drop_cas_predicate` seam;
+# pass-through to `boatramp-core/crownjewel-cas-gate-mutation`. Compiled OUT of every real build.
+crownjewel-cas-gate-mutation = ["boatramp-core/crownjewel-cas-gate-mutation"]
 
 [dependencies]
 boatramp-core.workspace = true

@@ -37,6 +37,88 @@ pub const MAX_SECRET_VALUE_LEN: usize = 64 * 1024;
 /// per-provider OAuth `client_secret` set is a handful; 256 is far above any real need.
 pub const MAX_TENANT_SECRET_NAMES: usize = 256;
 
+/// Sentinel bytes marking a secret record logically **deleted** (a tombstone). `delete` is a
+/// value-[`compare_and_swap`](crate::kv::KvStore::compare_and_swap) to this sentinel, NEVER a blind
+/// row-delete: a stale concurrent `set` whose CAS expects the pre-delete bytes then fails rather
+/// than resurrecting the secret (the MF-1 set-vs-delete resurrection race). The sentinel is not
+/// valid [`SecretRecord`] JSON, so [`decode_record`] maps it to `None` (a deleted secret reads as
+/// absent) and `list` skips it.
+const TOMBSTONE: &[u8] = b"\x00boatramp:secret-tombstone:v1\x00";
+
+/// Bounded CAS re-read budget for the per-tenant name index (reservation under contention).
+const INDEX_CAS_RETRIES: usize = 64;
+
+fn is_tombstone(bytes: &[u8]) -> bool {
+    bytes == TOMBSTONE
+}
+
+/// Decode the RAW stored bytes at a secret key into a live [`SecretRecord`], treating ABSENT and a
+/// TOMBSTONE identically as `None` (no live record). A value that is neither a tombstone nor valid
+/// `SecretRecord` JSON is a genuine corruption and surfaces as a backend error.
+fn decode_record(raw: Option<&[u8]>, key: &str) -> Result<Option<SecretRecord>, SecretError> {
+    match raw {
+        None => Ok(None),
+        Some(b) if is_tombstone(b) => Ok(None),
+        Some(b) => serde_json::from_slice::<SecretRecord>(b)
+            .map(Some)
+            .map_err(|e| SecretError::Backend(format!("corrupt secret record at {key}: {e}"))),
+    }
+}
+
+/// Decode the RAW stored bytes of a per-tenant name index, treating ABSENT as an empty index. A
+/// present-but-unparseable index is a genuine corruption and surfaces as a backend error.
+fn decode_index(raw: Option<&[u8]>) -> Result<TenantNameIndex, SecretError> {
+    match raw {
+        None => Ok(TenantNameIndex::default()),
+        Some(b) => serde_json::from_slice::<TenantNameIndex>(b)
+            .map_err(|e| SecretError::Backend(format!("corrupt tenant secret-name index: {e}"))),
+    }
+}
+
+/// Conditionally delete a secret record by a value-CAS to a [`TOMBSTONE`] (shared by both stores).
+/// Returns `Ok(true)` when a live record was transitioned to a tombstone, `Ok(false)` when it was
+/// already absent/tombstoned (idempotent), and [`SecretError::Conflict`] when a concurrent writer
+/// rotated the record between the observe and the CAS (so a blind delete would have clobbered the
+/// rotation). Never a blind `delete`, so it cannot erase a concurrent rotation or let a stale set
+/// resurrect the value.
+async fn conditional_delete(kv: &dyn KvStore, key: &str) -> Result<bool, SecretError> {
+    let raw = kv
+        .get(key)
+        .await
+        .map_err(|e| SecretError::Backend(e.to_string()))?;
+    match raw.as_deref() {
+        None => Ok(false),
+        Some(b) if is_tombstone(b) => Ok(false),
+        Some(b) => {
+            if kv
+                .compare_and_swap(key, Some(b), TOMBSTONE.to_vec())
+                .await
+                .map_err(|e| SecretError::Backend(e.to_string()))?
+            {
+                Ok(true)
+            } else {
+                // The record changed between the read and the CAS. Re-read to classify: a
+                // concurrent delete (now absent/tombstone) is an idempotent no-op; a concurrent
+                // rotation (a different live record) is a Conflict — refuse to clobber it.
+                match kv
+                    .get(key)
+                    .await
+                    .map_err(|e| SecretError::Backend(e.to_string()))?
+                    .as_deref()
+                {
+                    None => Ok(false),
+                    Some(b2) if is_tombstone(b2) => Ok(false),
+                    Some(_) => Err(SecretError::Conflict(
+                        "the secret was modified concurrently (a rotation raced this delete); \
+                         re-read and retry"
+                            .to_string(),
+                    )),
+                }
+            }
+        }
+    }
+}
+
 /// A secret-store failure, classified so the API returns the right status and never
 /// leaks backend internals. [`InvalidName`](Self::InvalidName) and
 /// [`ValueTooLarge`](Self::ValueTooLarge) are **client** errors — the message is about
@@ -59,6 +141,11 @@ pub enum SecretError {
     /// would introduce a NEW one (a rotation of an existing name is always allowed). A **client**
     /// error (the message is about the request → `400`), bounding the Raft-amplified write set.
     TooManyNames { max: usize },
+    /// A concurrent writer rotated or deleted this secret between the read and the
+    /// compare-and-swap, so this write was NOT applied (no silent clobber / no lost rotation). The
+    /// caller re-reads and retries. The message is request-level and safe to surface. Mapped to
+    /// `409 Conflict` over the admin API.
+    Conflict(String),
     /// A KV or envelope (seal/unseal) failure — detail is not client-safe.
     Backend(String),
 }
@@ -77,6 +164,7 @@ impl std::fmt::Display for SecretError {
                     "this tenant already holds the maximum of {max} secret names"
                 )
             }
+            Self::Conflict(m) => write!(f, "{m}"),
             Self::Backend(m) => write!(f, "{m}"),
         }
     }
@@ -96,6 +184,15 @@ impl SecretError {
                 | Self::ValueTooLarge { .. }
                 | Self::TooManyNames { .. }
         )
+    }
+
+    /// Whether this is an optimistic-concurrency [`Conflict`](Self::Conflict) — a concurrent
+    /// crown-jewel write won the race, so this one was refused rather than silently clobbering it.
+    /// The admin API maps it to `409 Conflict` (re-read + retry), distinct from a `400` request
+    /// error and a `500` backend error.
+    #[must_use]
+    pub fn is_conflict(&self) -> bool {
+        matches!(self, Self::Conflict(_))
     }
 }
 
@@ -136,6 +233,18 @@ pub struct SecretMeta {
     pub revision: u32,
 }
 
+/// The per-`(project, tenant)` secret-NAME index stored at
+/// [`keys::tenant_secret_index`](crate::deploy::keys::tenant_secret_index): the live secret names a
+/// tenant holds, maintained by a value-CAS so the per-tenant name-count CAP is enforced ATOMICALLY
+/// (a compare-and-swap admission) instead of the old `list_prefix`-then-check-then-write TOCTOU, in
+/// which two racing new-name sets each read `count = max-1` and both wrote, bypassing the cap.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct TenantNameIndex {
+    /// Sorted, deduped live secret names for this `(project, tenant)`. Bounded by
+    /// [`MAX_TENANT_SECRET_NAMES`].
+    names: Vec<String>,
+}
+
 /// A project-scoped sealed secret store over a KV + a key envelope.
 #[derive(Clone)]
 pub struct SecretStore {
@@ -168,7 +277,43 @@ impl SecretStore {
         }
         let key = crate::deploy::keys::secret(project, name);
         let now = crate::time::now_unix();
-        let prev = self.load_record(&key).await?;
+
+        // MF-1 mutation (gate only): revert to the pre-MF-1 blind read-modify-write (no CAS), so
+        // concurrent rotations silently clobber each other — the gate then goes RED.
+        if crate::crownjewel::cas_mutation_active() {
+            let prev = self.load_record(&key).await?;
+            let created_at = prev.as_ref().map_or(now, |r| r.created_at);
+            let revision = prev.as_ref().map_or(0, |r| r.revision) + 1;
+            let sealed = self
+                .envelope
+                .wrap(plaintext)
+                .await
+                .map_err(|e| SecretError::Backend(e.to_string()))?;
+            let record = SecretRecord {
+                version: 1,
+                created_at,
+                updated_at: now,
+                revision,
+                sealed,
+            };
+            let bytes =
+                serde_json::to_vec(&record).map_err(|e| SecretError::Backend(e.to_string()))?;
+            self.kv
+                .put(&key, bytes)
+                .await
+                .map_err(|e| SecretError::Backend(e.to_string()))?;
+            return Ok(record.meta(name));
+        }
+
+        // Read the EXACT prior bytes and compare-and-swap on them: a concurrent rotation/delete
+        // between the read and the write changes the bytes, so this CAS loses and returns
+        // `Conflict` (the caller re-reads + re-rotates) — never a silent clobber / lost rotation.
+        let prev_raw = self
+            .kv
+            .get(&key)
+            .await
+            .map_err(|e| SecretError::Backend(e.to_string()))?;
+        let prev = decode_record(prev_raw.as_deref(), &key)?;
         let created_at = prev.as_ref().map_or(now, |r| r.created_at);
         let revision = prev.as_ref().map_or(0, |r| r.revision) + 1;
         // Seal before writing; a wrap failure leaves any prior value untouched.
@@ -185,10 +330,16 @@ impl SecretStore {
             sealed,
         };
         let bytes = serde_json::to_vec(&record).map_err(|e| SecretError::Backend(e.to_string()))?;
-        self.kv
-            .put(&key, bytes)
+        let swapped = self
+            .kv
+            .compare_and_swap(&key, prev_raw.as_deref(), bytes)
             .await
             .map_err(|e| SecretError::Backend(e.to_string()))?;
+        if !swapped {
+            return Err(SecretError::Conflict(
+                "the secret was rotated or deleted concurrently; re-read and retry".to_string(),
+            ));
+        }
         Ok(record.meta(name))
     }
 
@@ -238,37 +389,41 @@ impl SecretStore {
         Ok(out)
     }
 
-    /// Delete a secret. Returns whether it existed.
+    /// Delete a secret. Returns whether it existed. A conditional (value-CAS to a tombstone)
+    /// delete, so a concurrent rotation racing the delete is never clobbered and a stale `set`
+    /// cannot resurrect the deleted value (MF-1); a concurrent rotation yields
+    /// [`SecretError::Conflict`].
     pub async fn delete(&self, project: ProjectRef<'_>, name: &str) -> Result<bool, SecretError> {
         validate_name(name)?;
         let key = crate::deploy::keys::secret(project, name);
-        let existed = self
-            .kv
-            .get(&key)
-            .await
-            .map_err(|e| SecretError::Backend(e.to_string()))?
-            .is_some();
-        if existed {
-            self.kv
-                .delete(&key)
+
+        // MF-1 mutation (gate only): the pre-MF-1 blind read-then-delete — no conditional CAS.
+        if crate::crownjewel::cas_mutation_active() {
+            let existed = self
+                .kv
+                .get(&key)
                 .await
-                .map_err(|e| SecretError::Backend(e.to_string()))?;
+                .map_err(|e| SecretError::Backend(e.to_string()))?
+                .is_some();
+            if existed {
+                self.kv
+                    .delete(&key)
+                    .await
+                    .map_err(|e| SecretError::Backend(e.to_string()))?;
+            }
+            return Ok(existed);
         }
-        Ok(existed)
+
+        conditional_delete(self.kv.as_ref(), &key).await
     }
 
     async fn load_record(&self, key: &str) -> Result<Option<SecretRecord>, SecretError> {
-        match self
+        let raw = self
             .kv
             .get(key)
             .await
-            .map_err(|e| SecretError::Backend(e.to_string()))?
-        {
-            Some(bytes) => serde_json::from_slice::<SecretRecord>(&bytes)
-                .map(Some)
-                .map_err(|e| SecretError::Backend(format!("corrupt secret record at {key}: {e}"))),
-            None => Ok(None),
-        }
+            .map_err(|e| SecretError::Backend(e.to_string()))?;
+        decode_record(raw.as_deref(), key)
     }
 }
 
@@ -321,24 +476,68 @@ impl TenantSecretStore {
         }
         let key = crate::deploy::keys::tenant_secret(project, tenant, name);
         let now = crate::time::now_unix();
-        let prev = self.load_record(&key).await?;
-        // A NEW name (no prior record) is bounded by the per-tenant name-count cap; a rotation of an
-        // existing name never counts against it. Enumerating the tenant's OWN prefix only — the cap
-        // check can never see (or leak) another tenant's names.
-        if prev.is_none() {
-            let prefix = crate::deploy::keys::tenant_secret_prefix(project, tenant);
-            let existing = self
-                .kv
-                .list_prefix(&prefix)
-                .await
-                .map_err(|e| SecretError::Backend(e.to_string()))?
-                .len();
-            if existing >= MAX_TENANT_SECRET_NAMES {
-                return Err(SecretError::TooManyNames {
-                    max: MAX_TENANT_SECRET_NAMES,
-                });
+
+        // MF-1 mutation (gate only): the pre-MF-1 blind path — the `list_prefix`-then-check cap
+        // TOCTOU + a blind put. Under concurrency two new-name sets both read `count = max-1` and
+        // both write, bypassing the cap — so the gate goes RED.
+        if crate::crownjewel::cas_mutation_active() {
+            let prev = self.load_record(&key).await?;
+            if prev.is_none() {
+                let prefix = crate::deploy::keys::tenant_secret_prefix(project, tenant);
+                let existing = self
+                    .kv
+                    .list_prefix(&prefix)
+                    .await
+                    .map_err(|e| SecretError::Backend(e.to_string()))?
+                    .len();
+                if existing >= MAX_TENANT_SECRET_NAMES {
+                    return Err(SecretError::TooManyNames {
+                        max: MAX_TENANT_SECRET_NAMES,
+                    });
+                }
             }
+            let created_at = prev.as_ref().map_or(now, |r| r.created_at);
+            let revision = prev.as_ref().map_or(0, |r| r.revision) + 1;
+            let sealed = self
+                .envelope
+                .wrap(plaintext)
+                .await
+                .map_err(|e| SecretError::Backend(e.to_string()))?;
+            let record = SecretRecord {
+                version: 1,
+                created_at,
+                updated_at: now,
+                revision,
+                sealed,
+            };
+            let bytes =
+                serde_json::to_vec(&record).map_err(|e| SecretError::Backend(e.to_string()))?;
+            self.kv
+                .put(&key, bytes)
+                .await
+                .map_err(|e| SecretError::Backend(e.to_string()))?;
+            return Ok(record.meta(name));
         }
+
+        let prev_raw = self
+            .kv
+            .get(&key)
+            .await
+            .map_err(|e| SecretError::Backend(e.to_string()))?;
+        let prev = decode_record(prev_raw.as_deref(), &key)?;
+        let is_new_name = prev.is_none();
+        // A NEW name is admitted against the per-tenant name-count cap ATOMICALLY, via a value-CAS
+        // on the per-tenant index record — closing the old list-then-write TOCTOU (two racing
+        // new-name sets can no longer both pass a stale count). A rotation of an existing name never
+        // counts. The index is keyed on the tenant, so the cap check can never see another tenant's
+        // names. `reserved` is true only when THIS call added the name (not a concurrent same-name
+        // set), so a lost record-CAS below releases only a slot it actually took.
+        let reserved = if is_new_name {
+            self.reserve_name(project, tenant, name).await?
+        } else {
+            false
+        };
+
         let created_at = prev.as_ref().map_or(now, |r| r.created_at);
         let revision = prev.as_ref().map_or(0, |r| r.revision) + 1;
         let sealed = self
@@ -354,11 +553,100 @@ impl TenantSecretStore {
             sealed,
         };
         let bytes = serde_json::to_vec(&record).map_err(|e| SecretError::Backend(e.to_string()))?;
-        self.kv
-            .put(&key, bytes)
+        let swapped = self
+            .kv
+            .compare_and_swap(&key, prev_raw.as_deref(), bytes)
             .await
             .map_err(|e| SecretError::Backend(e.to_string()))?;
+        if !swapped {
+            // A concurrent create/rotate/delete of this name won the record race. Release the cap
+            // slot if this call reserved it (keeps the count exact).
+            if reserved {
+                let _ = self.release_name(project, tenant, name).await;
+            }
+            return Err(SecretError::Conflict(
+                "the tenant secret was rotated or deleted concurrently; re-read and retry"
+                    .to_string(),
+            ));
+        }
         Ok(record.meta(name))
+    }
+
+    /// Atomically admit `name` against the per-tenant name-count cap by a value-CAS on the index
+    /// record: returns `Ok(true)` when THIS call added the name, `Ok(false)` when it was already
+    /// present (a concurrent same-name set admitted it first — a rotation, not a new name), and
+    /// [`SecretError::TooManyNames`] when the cap is already full. Bounded retry under contention.
+    async fn reserve_name(
+        &self,
+        project: ProjectRef<'_>,
+        tenant: &str,
+        name: &str,
+    ) -> Result<bool, SecretError> {
+        let idx_key = crate::deploy::keys::tenant_secret_index(project, tenant);
+        for _ in 0..INDEX_CAS_RETRIES {
+            let raw = self
+                .kv
+                .get(&idx_key)
+                .await
+                .map_err(|e| SecretError::Backend(e.to_string()))?;
+            let mut idx = decode_index(raw.as_deref())?;
+            if idx.names.iter().any(|n| n == name) {
+                return Ok(false); // already admitted — a rotation, not a new name
+            }
+            if idx.names.len() >= MAX_TENANT_SECRET_NAMES {
+                return Err(SecretError::TooManyNames {
+                    max: MAX_TENANT_SECRET_NAMES,
+                });
+            }
+            idx.names.push(name.to_string());
+            idx.names.sort();
+            let new_bytes =
+                serde_json::to_vec(&idx).map_err(|e| SecretError::Backend(e.to_string()))?;
+            if self
+                .kv
+                .compare_and_swap(&idx_key, raw.as_deref(), new_bytes)
+                .await
+                .map_err(|e| SecretError::Backend(e.to_string()))?
+            {
+                return Ok(true);
+            }
+            // The index changed under us — re-read and retry.
+        }
+        Err(SecretError::Conflict(
+            "the tenant secret-name index is contended; retry".to_string(),
+        ))
+    }
+
+    /// Best-effort release of a per-tenant name slot (CAS-removing `name` from the index). A stale
+    /// index entry only ever over-counts the cap (fail-safe — never a bypass), so an exhausted
+    /// retry budget is swallowed rather than failing the caller.
+    async fn release_name(&self, project: ProjectRef<'_>, tenant: &str, name: &str) {
+        let idx_key = crate::deploy::keys::tenant_secret_index(project, tenant);
+        for _ in 0..INDEX_CAS_RETRIES {
+            let Ok(raw) = self.kv.get(&idx_key).await else {
+                return;
+            };
+            let Ok(mut idx) = decode_index(raw.as_deref()) else {
+                return;
+            };
+            let before = idx.names.len();
+            idx.names.retain(|n| n != name);
+            if idx.names.len() == before {
+                return; // not present
+            }
+            let Ok(new_bytes) = serde_json::to_vec(&idx) else {
+                return;
+            };
+            match self
+                .kv
+                .compare_and_swap(&idx_key, raw.as_deref(), new_bytes)
+                .await
+            {
+                Ok(true) => return,
+                Ok(false) => continue, // contended — retry
+                Err(_) => return,
+            }
+        }
     }
 
     /// Fetch and unseal `(project, tenant, name)`. `None` if absent (an unconfigured secret is NOT
@@ -416,7 +704,9 @@ impl TenantSecretStore {
         Ok(out)
     }
 
-    /// Delete `(project, tenant, name)`. Returns whether it existed. Validates both segments first.
+    /// Delete `(project, tenant, name)`. Returns whether it existed. A conditional (value-CAS to a
+    /// tombstone) delete that also frees the per-tenant cap slot — so a concurrent rotation is
+    /// never clobbered and a stale `set` cannot resurrect the value (MF-1).
     pub async fn delete(
         &self,
         project: ProjectRef<'_>,
@@ -426,33 +716,39 @@ impl TenantSecretStore {
         validate_tenant(tenant)?;
         validate_name(name)?;
         let key = crate::deploy::keys::tenant_secret(project, tenant, name);
-        let existed = self
-            .kv
-            .get(&key)
-            .await
-            .map_err(|e| SecretError::Backend(e.to_string()))?
-            .is_some();
-        if existed {
-            self.kv
-                .delete(&key)
+
+        // MF-1 mutation (gate only): the pre-MF-1 blind read-then-delete.
+        if crate::crownjewel::cas_mutation_active() {
+            let existed = self
+                .kv
+                .get(&key)
                 .await
-                .map_err(|e| SecretError::Backend(e.to_string()))?;
+                .map_err(|e| SecretError::Backend(e.to_string()))?
+                .is_some();
+            if existed {
+                self.kv
+                    .delete(&key)
+                    .await
+                    .map_err(|e| SecretError::Backend(e.to_string()))?;
+            }
+            return Ok(existed);
         }
-        Ok(existed)
+
+        let removed = conditional_delete(self.kv.as_ref(), &key).await?;
+        if removed {
+            // Free the per-tenant cap slot (best-effort; a stale index entry is fail-safe).
+            self.release_name(project, tenant, name).await;
+        }
+        Ok(removed)
     }
 
     async fn load_record(&self, key: &str) -> Result<Option<SecretRecord>, SecretError> {
-        match self
+        let raw = self
             .kv
             .get(key)
             .await
-            .map_err(|e| SecretError::Backend(e.to_string()))?
-        {
-            Some(bytes) => serde_json::from_slice::<SecretRecord>(&bytes)
-                .map(Some)
-                .map_err(|e| SecretError::Backend(format!("corrupt secret record at {key}: {e}"))),
-            None => Ok(None),
-        }
+            .map_err(|e| SecretError::Backend(e.to_string()))?;
+        decode_record(raw.as_deref(), key)
     }
 }
 
