@@ -520,7 +520,7 @@ mod tests {
         let leaders: Vec<&str> = leases
             .iter()
             .filter(|l| l.is_leader())
-            .map(|l| l.node_id())
+            .map(LeaderLease::node_id)
             .collect();
         assert_eq!(
             leaders.len(),
