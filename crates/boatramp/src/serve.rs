@@ -1004,6 +1004,9 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
     // be cached — a stale cached lease/roster would be wrong). SINGLE-WRITER keeps the always-true
     // leader gate + coordination "none" EXACTLY as before.
     let node_id = boatramp_core::shared_mode::random_node_id();
+    // INVARIANT: every leader-gated singleton reachable in shared mode must be idempotent /
+    // CAS-deduped — the CAS-lease permits a brief two-leader window; do not add a non-idempotent
+    // singleton here (e.g. ACME order creation stays cluster/Raft-only).
     let (is_leader_gate, leader_lease): (
         boatramp_server::CronLeaderGate,
         Option<Arc<boatramp_core::shared_mode::LeaderLease>>,
