@@ -100,6 +100,13 @@ pub struct DegradedMarker {
     /// informational field so it is NEVER conflated with acked loss.
     #[serde(default)]
     pub orphaned_nonacked_objects: Vec<String>,
+    /// **v0.11.1 compactions-reset shape.** The `{root}/compactions/{:020}.compactions` ids quarantined
+    /// when a corrupt `.compactions` bookkeeping object was reset (`frontier_source = "compactions_reset"`).
+    /// The `.compactions` object holds ONLY compactor bookkeeping (pending/recent compactions + the
+    /// compactor epoch) — NO acked-data liveness — so resetting it is lossless-for-acked; `loss_window`
+    /// is `"none"`. `#[serde(default)]` so an older marker still parses.
+    #[serde(default)]
+    pub quarantined_compactions_ids: Vec<u64>,
 }
 
 impl DegradedMarker {

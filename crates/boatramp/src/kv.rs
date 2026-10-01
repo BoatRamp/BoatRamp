@@ -26,8 +26,8 @@ use boatramp_storage::kv_slatedb::{
 };
 use boatramp_storage::object_store::ObjectStore;
 use boatramp_storage::wal_repair::{
-    ManifestRecovery, ManifestRecoveryReport, WalRepairError, recover_last_good_manifest,
-    repair_wal_tail,
+    CompactionsRecovery, CompactionsResetReport, ManifestRecovery, ManifestRecoveryReport,
+    WalRepairError, recover_corrupt_compactions, recover_last_good_manifest, repair_wal_tail,
 };
 use clap::{Args, Subcommand};
 
@@ -424,8 +424,30 @@ async fn run_recover(args: RecoverArgs) -> Result<(), Error> {
     // latest manifest is empty/torn and it (would, dry-run) roll back to the last-good generation.
     match recover_last_good_manifest(&store, &root, mode).await {
         Ok(ManifestRecovery::LatestReadable { .. }) => {
-            // The latest manifest is readable — the ordinary in-place WAL-tail path (unchanged): the
-            // SUPERSET of `kv repair`, with the shape-split escalation to `--adopt-volume` (C10).
+            // The latest manifest + SSTs are readable. First check the v0.11.1 corrupt-`.compactions`
+            // shape (compactor-ON `Invalid error: invalid compaction` while the manifest is intact):
+            // reset the `.compactions` bookkeeping (quarantine it + remove the compactions GC boundary).
+            match recover_corrupt_compactions(&store, &root, mode).await {
+                Ok(CompactionsRecovery::Reset(report)) => {
+                    print_compactions_recovery(&report, args.apply);
+                    if !args.apply {
+                        println!(
+                            "\nRe-run `boatramp kv recover --apply` to reset the corrupt `.compactions` \
+                             bookkeeping in place (lossless-for-acked — `.compactions` holds no committed \
+                             data; the objects are retained under `compactions-quarantine/` for forensics)."
+                        );
+                    }
+                    return Ok(());
+                }
+                Ok(CompactionsRecovery::NotCorrupt) => {}
+                Err(e) => {
+                    eprintln!("kv recover: compactions reset cannot proceed — {e}");
+                    print_adopt_volume_guidance();
+                    return Err(e.into());
+                }
+            }
+            // The ordinary in-place WAL-tail path (unchanged): the SUPERSET of `kv repair`, with the
+            // shape-split escalation to `--adopt-volume` (C10).
             match repair_wal_tail(&store, &root, mode).await {
                 Ok(report) => {
                     print_report(&report, args.apply);
@@ -590,6 +612,56 @@ fn print_manifest_recovery(report: &ManifestRecoveryReport, applied: bool) {
              MF2-contiguity-verified).",
             report.rolled_back_to_generation
         );
+    }
+}
+
+/// Print the v0.11.1 corrupt-`.compactions` reset plan / outcome.
+fn print_compactions_recovery(report: &CompactionsResetReport, applied: bool) {
+    println!(
+        "control-plane COMPACTIONS reset {}",
+        if applied {
+            "(APPLY)"
+        } else {
+            "(DRY-RUN — no mutation)"
+        }
+    );
+    println!(
+        "  the manifest + SSTs are intact, but the `.compactions` bookkeeping object is CORRUPT \
+         (compactor-ON open fails `Invalid error: invalid compaction`). `.compactions` holds NO \
+         committed data — only compactor bookkeeping — so a reset is lossless-for-acked: the compactor \
+         fresh-starts from the manifest's current SST set."
+    );
+    if report.quarantined_compactions_ids.is_empty() {
+        println!("  .compactions object(s) to quarantine: (none listed)");
+    } else {
+        let ids: Vec<String> = report
+            .quarantined_compactions_ids
+            .iter()
+            .map(|id| format!("{id:020}"))
+            .collect();
+        println!(
+            "  .compactions object(s) to quarantine (retained under compactions-quarantine/): [{}]",
+            ids.join(", ")
+        );
+    }
+    println!(
+        "  compactions GC boundary (`gc/compactions.boundary`) {}: required so the fresh id-1 \
+         `.compactions` the compactor-ON reopen creates is not rejected (ObjectVersionExists).",
+        if report.boundary_removed {
+            "will be removed"
+        } else {
+            "absent (nothing to remove)"
+        }
+    );
+    if applied {
+        println!(
+            "  RESET (lossless-for-acked): quarantined the corrupt `.compactions` + removed the \
+             compactions GC boundary; a compactor-ON reopen now fresh-starts the compactor from the \
+             manifest. The objects are retained under `{}` for forensics.",
+            report.quarantine_dir.as_deref().unwrap_or("<none>")
+        );
+    } else {
+        println!("  WOULD reset the corrupt `.compactions` bookkeeping (lossless-for-acked).");
     }
 }
 

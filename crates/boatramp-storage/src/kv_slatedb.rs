@@ -264,6 +264,7 @@ pub async fn write_degraded_marker(
         rolled_back_to_generation: None,
         quarantined_manifest_ids: Vec::new(),
         orphaned_nonacked_objects: Vec::new(),
+        quarantined_compactions_ids: Vec::new(),
     };
     let path = degraded_marker_path(root);
     if let Err(e) = store.put(&path, marker.to_json_bytes().into()).await {
@@ -313,10 +314,44 @@ pub async fn write_manifest_recovery_marker(
         rolled_back_to_generation: Some(report.rolled_back_to_generation),
         quarantined_manifest_ids: report.quarantined_manifest_ids.clone(),
         orphaned_nonacked_objects: report.orphaned_nonacked_objects.clone(),
+        quarantined_compactions_ids: Vec::new(),
     };
     let path = degraded_marker_path(root);
     if let Err(e) = store.put(&path, marker.to_json_bytes().into()).await {
         tracing::warn!(error = %e, path = %path, "failed to write the KV manifest-rollback DEGRADED.json breadcrumb (recovery still succeeded)");
+    }
+    format!("{stamp:020}")
+}
+
+/// Write the [`DegradedMarker`] breadcrumb for a v0.11.1 **corrupt-`.compactions` reset**. Distinct
+/// shape: `frontier_source = "compactions_reset"`, the quarantined `.compactions` ids, and
+/// `loss_window = "none"` — the reset is lossless-for-acked (`.compactions` holds only compactor
+/// bookkeeping, NO committed data). Carries NO secrets (only ids + the stamp). Best-effort like its
+/// siblings (the store is already reset + verified).
+pub async fn write_compactions_reset_marker(
+    store: &Arc<dyn ObjectStore>,
+    root: &str,
+    report: &crate::wal_repair::CompactionsResetReport,
+) -> String {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let marker = DegradedMarker {
+        stamp,
+        quarantined_ids: Vec::new(),
+        loss_window: "none".to_string(),
+        quarantine_dir: report.quarantine_dir.clone().unwrap_or_default(),
+        frontier: 0,
+        frontier_source: "compactions_reset".to_string(),
+        rolled_back_to_generation: None,
+        quarantined_manifest_ids: Vec::new(),
+        orphaned_nonacked_objects: Vec::new(),
+        quarantined_compactions_ids: report.quarantined_compactions_ids.clone(),
+    };
+    let path = degraded_marker_path(root);
+    if let Err(e) = store.put(&path, marker.to_json_bytes().into()).await {
+        tracing::warn!(error = %e, path = %path, "failed to write the KV compactions-reset DEGRADED.json breadcrumb (recovery still succeeded)");
     }
     format!("{stamp:020}")
 }
@@ -659,17 +694,62 @@ impl SlateKv {
                     .await
                 {
                     Ok(crate::wal_repair::ManifestRecovery::LatestReadable { .. }) => {
-                        // Latest manifest readable ⇒ a WAL-tail (or compacted) shape, not a torn
-                        // manifest. Only proceed to the WAL-tail self-heal if the open error looked
-                        // torn; any other non-lifecycle failure is unknown ⇒ fail LOUD (unchanged).
-                        if !open_error_looks_torn(&raw) {
-                            return Err(map_open_error(err));
+                        // Latest manifest + SSTs readable ⇒ NOT a torn-manifest shape. First check the
+                        // v0.11.1 corrupt-`.compactions` shape: a compactor-ON open that failed
+                        // `Invalid error: invalid compaction` while the manifest/SSTs are intact means the
+                        // `.compactions` bookkeeping object is corrupt (compactor-ON only; no acked-data
+                        // liveness). Reset it (quarantine `.compactions` + remove the compactions GC
+                        // boundary) and reopen — distinct from the manifest-rollback walk.
+                        match crate::wal_repair::recover_corrupt_compactions(
+                            &store,
+                            path,
+                            RepairMode::Apply,
+                        )
+                        .await
+                        {
+                            Ok(crate::wal_repair::CompactionsRecovery::Reset(report)) => {
+                                let stamp =
+                                    write_compactions_reset_marker(&store, path, &report).await;
+                                tracing::warn!(
+                                    target: "kv_self_healed",
+                                    quarantined_compactions_ids = ?report.quarantined_compactions_ids,
+                                    boundary_removed = report.boundary_removed,
+                                    quarantine_dir = report.quarantine_dir.as_deref().unwrap_or(""),
+                                    degraded_marker = %stamp,
+                                    "control-plane KV RECOVERED on open (lossless): the `.compactions` \
+                                     bookkeeping object was corrupt (invalid compaction); reset it \
+                                     (quarantined the `.compactions` object(s) + removed the compactions \
+                                     GC boundary) so the compactor fresh-starts from the manifest — zero \
+                                     acked loss (`.compactions` carries no committed data). Review with \
+                                     `boatramp kv status`; `--ack` clears the breadcrumb."
+                                );
+                                let db = Db::builder(path.to_string(), store)
+                                    .with_settings(settings)
+                                    .build()
+                                    .await
+                                    .map_err(map_open_error)?;
+                                return Ok(Self::from_writer(db));
+                            }
+                            Ok(crate::wal_repair::CompactionsRecovery::NotCorrupt) => {
+                                // Not the compactions shape either. Only proceed to the WAL-tail self-heal
+                                // if the open error looked torn; any other non-lifecycle failure is
+                                // unknown ⇒ fail LOUD (unchanged).
+                                if !open_error_looks_torn(&raw) {
+                                    return Err(map_open_error(err));
+                                }
+                                tracing::warn!(
+                                    error = %raw,
+                                    "control-plane KV cold open failed with a torn/unbootable signature \
+                                     (latest manifest + SSTs readable, `.compactions` not corrupt); \
+                                     running WAL-tail self-heal (dry-run first, C3)"
+                                );
+                            }
+                            Err(e) => {
+                                // The `.compactions` reset was attempted but REFUSED (post-reset verify
+                                // failed). FATAL (C7) — the caller binds the recovery-mode listener.
+                                return Err(KvError::backend(e.to_string()));
+                            }
                         }
-                        tracing::warn!(
-                            error = %raw,
-                            "control-plane KV cold open failed with a torn/unbootable signature (latest \
-                             manifest readable); running WAL-tail self-heal (dry-run first, C3)"
-                        );
                     }
                     Ok(crate::wal_repair::ManifestRecovery::RolledBack(report)) => {
                         // C2/UX C2 — a lossless last-good-generation rollback. Write the durable
@@ -1130,6 +1210,19 @@ mod tests {
         }
         settings.compactor_options = None;
         settings.garbage_collector_options = None;
+        settings
+    }
+
+    /// Like [`test_settings`] but with the compactor + GC LEFT ON (the production profile). Needed by the
+    /// v0.11.1 corrupt-`.compactions` gate: `.compactions` is decoded ONLY on a compactor-ON open, so the
+    /// fast-path cold open must be compactor-ON to fail `InvalidCompaction` and route into recovery. For a
+    /// small InMemory store the compactor-ON open+close is fast and does not stall (the stall is the
+    /// on-disk/musl path).
+    fn test_settings_compactor_on(flush_interval: Option<Duration>) -> Settings {
+        let mut settings = Settings::default();
+        if let Some(interval) = flush_interval {
+            settings.flush_interval = Some(interval);
+        }
         settings
     }
 
@@ -1775,6 +1868,101 @@ mod tests {
             marker.rolled_back_to_generation
         );
         opened.close().await.unwrap();
+    }
+
+    /// **v0.11.1 AUTO-PATH GATE (mutation-verified) — the self-heal resets a corrupt `.compactions`
+    /// object.** The manifest + SSTs are intact but the `.compactions` bookkeeping is corrupt, so a
+    /// compactor-ON cold open fails `Invalid error: invalid compaction`. `open_self_heal` must route that
+    /// into the `.compactions`-reset recovery (DISTINCT from the manifest walk), reopen, and SERVE with
+    /// the crown-jewel byte-equal. MUTATIONS (env `BOATRAMP_KVMANIFEST_MUTATION`): `skip_compactions_reset`
+    /// and `keep_compactions_boundary` each make the reset's verify fail → the SelfHeal open returns `Err`
+    /// → the `.expect(...)` is RED; `skip_lastgood` forces Strict → also RED.
+    #[serial_test::serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn self_heal_resets_a_corrupt_compactions_object() {
+        use slatedb::object_store::memory::InMemory;
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        // Seed the crown into L0 (compactor OFF for a deterministic seed), clean close.
+        {
+            let kv = SlateKv::open_with(
+                store.clone(),
+                "kv",
+                test_settings(Some(Duration::from_millis(5))),
+            )
+            .await
+            .unwrap();
+            kv.put("secret/acme/idp", b"sealed-crown-jewel".to_vec())
+                .await
+                .unwrap();
+            kv.checkpoint().await.unwrap();
+            kv.close().await.unwrap();
+        }
+        // Inject a CORRUPT `.compactions` object (1 byte ⇒ InvalidCompaction) + a STALE compactions GC
+        // boundary (so leaving it would reject the fresh id-1 create).
+        store
+            .put(
+                &ObjPath::from("kv/compactions/00000000000000000001.compactions"),
+                bytes::Bytes::from_static(&[0x00]).into(),
+            )
+            .await
+            .unwrap();
+        store
+            .put(
+                &ObjPath::from("kv/gc/compactions.boundary"),
+                bytes::Bytes::from_static(b"1").into(),
+            )
+            .await
+            .unwrap();
+
+        // Compactor-ON SelfHeal: the fast-path open fails `InvalidCompaction` → routed into the
+        // `.compactions`-reset recovery → reopen SERVES. (Under the mutations this `.expect` is RED.)
+        let opened = SlateKv::open_with_policy(
+            store.clone(),
+            "kv",
+            test_settings_compactor_on(Some(Duration::from_millis(5))),
+            manifest_rollback_open_policy(),
+        )
+        .await
+        .expect("SelfHeal must reset a corrupt `.compactions` object and open");
+        assert_eq!(
+            opened.get("secret/acme/idp").await.unwrap(),
+            Some(b"sealed-crown-jewel".to_vec()),
+            "the crown-jewel MUST survive the `.compactions` reset byte-equal"
+        );
+
+        // A compactions-reset breadcrumb was written (the distinct shape).
+        let marker = read_degraded_marker(&store, "kv")
+            .await
+            .unwrap()
+            .expect("a `.compactions` reset writes DEGRADED.json");
+        assert_eq!(marker.frontier_source, "compactions_reset");
+        assert_eq!(marker.quarantined_compactions_ids, vec![1]);
+        assert_eq!(
+            marker.loss_window, "none",
+            "a `.compactions` reset is lossless-for-acked"
+        );
+        opened.close().await.unwrap();
+
+        // The corrupt bytes were preserved under compactions-quarantine/ before removal (forensics).
+        // (We do NOT assert the id-1 path is absent: the compactor-ON reopen fresh-creates a VALID
+        // `.compactions` at the reused id 1 — the point is it DECODES again, not that the path is gone.)
+        assert!(
+            !marker.quarantine_dir.is_empty(),
+            "the compactions-reset marker records the quarantine dir"
+        );
+        let qcopy = ObjPath::from(format!(
+            "{}/00000000000000000001.compactions",
+            marker.quarantine_dir
+        ));
+        assert!(
+            store.head(&qcopy).await.is_ok(),
+            "the corrupt `.compactions` bytes must be preserved under compactions-quarantine/ (forensic copy)"
+        );
+        let admin = slatedb::admin::Admin::builder("kv".to_string(), store.clone()).build();
+        assert!(
+            admin.read_compactions(None).await.unwrap().is_some(),
+            "`.compactions` must DECODE again after the compactor-ON reopen fresh-created it"
+        );
     }
 
     /// **MF3 GATE** — STRICT does NOT auto-recover a torn latest manifest (the cluster/opt-out posture):
