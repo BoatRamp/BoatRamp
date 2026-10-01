@@ -983,7 +983,7 @@ fn own_value_expr(own: Option<&SqlValue>) -> Result<Expr, TargetRewriteError> {
 /// The **unsatisfiable** `1 = 0` predicate — the raw-SQL analog of `orm`'s `Predicate::Or([])`. Used
 /// for a scoped READ with no resolved principal under the opt-in unresolved-request pass-through: it
 /// confines the table reference to the EMPTY set (zero rows) rather than refusing the statement.
-/// Portable across sqlite/postgres/mysql. ANDed onto each confined table reference, so even an
+/// Portable across sqlite/postgres/mysql. conjoined onto each confined table reference, so even an
 /// `OR`-escape guest `WHERE` (parenthesised by the rewriter) cannot widen it.
 fn never_expr() -> Expr {
     binop(
@@ -2377,7 +2377,7 @@ mod own_confinement_tests {
         // `session: None`) on a plain tenant table:
         //  - WITHOUT the opt-in ⇒ refused `NoPrincipal` (today's behavior, fail-closed).
         //  - WITH the opt-in ⇒ the table reference is confined to `1 = 0` (zero rows), never all-rows,
-        //    never the `NULL` base — and an `OR`-escape guest `WHERE` is parenthesised then ANDed, so
+        //    never the `NULL` base — and an `OR`-escape guest `WHERE` is parenthesised then conjoined, so
         //    it cannot widen the empty set. The confinement is airtight on EVERY table reference
         //    (self-join below), exactly like the resolved-principal path.
         let k = keys();
