@@ -47,6 +47,14 @@ pub enum Error {
     /// did not match the key the server presented.
     #[error("bootstrap attestation: {0}")]
     Attestation(String),
+    /// The policy was modified concurrently (another `auth policy set` won the optimistic-
+    /// concurrency race) — the server returned `409`. Re-run `auth policy get`, re-apply the edit,
+    /// and `set` again.
+    #[error(
+        "policy update conflict: the policy was changed concurrently (409). Re-run \
+         `boatramp auth policy get`, re-apply your edit, and `set` again."
+    )]
+    PolicyConflict,
 }
 
 /// `authcmd` module result; `Err` is [`Error`].
@@ -277,13 +285,12 @@ async fn run_policy(
     let http = client::http_client(client::token(config).as_deref());
     match command {
         PolicyCommand::Get => {
-            let policy: AuthzPolicy = http
+            let resp = http
                 .get(format!("{server}/api/authz/policy"))
                 .send()
                 .await?
-                .error_for_status()?
-                .json()
-                .await?;
+                .error_for_status()?;
+            let policy: AuthzPolicy = resp.json().await?;
             println!("{}", serde_json::to_string_pretty(&policy)?);
         }
         PolicyCommand::Set { file } => {
@@ -298,11 +305,28 @@ async fn run_policy(
                     path: file.display().to_string(),
                     source: e,
                 })?;
-            http.put(format!("{server}/api/authz/policy"))
-                .json(&policy)
+            // Optimistic concurrency: GET the current version (its `ETag`) and echo it as
+            // `If-Match` on the PUT, so a policy changed concurrently (another operator / node)
+            // is a `409` rather than a silent lost-write overwrite.
+            let get = http
+                .get(format!("{server}/api/authz/policy"))
                 .send()
                 .await?
                 .error_for_status()?;
+            let etag = get
+                .headers()
+                .get(reqwest::header::ETAG)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
+            let mut req = http.put(format!("{server}/api/authz/policy")).json(&policy);
+            if let Some(etag) = &etag {
+                req = req.header("if-match", etag);
+            }
+            let resp = req.send().await?;
+            if resp.status() == reqwest::StatusCode::CONFLICT {
+                return Err(Error::PolicyConflict);
+            }
+            resp.error_for_status()?;
             println!("policy updated");
         }
     }

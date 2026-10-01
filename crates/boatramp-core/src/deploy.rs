@@ -214,6 +214,108 @@ const SMALL_BLOB_CACHE_MAX: u64 = 256 * 1024;
 /// Total byte ceiling for the small-blob body cache.
 const BLOB_BODY_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
 
+/// An opaque optimistic-concurrency version (an ETag) for the stored RBAC policy, derived from the
+/// EXACT stored bytes — `sha256` hex for a stored policy, or the sentinel [`ABSENT`](Self::ABSENT)
+/// when none is stored (the built-in default is in effect). The HTTP surface returns it as `ETag`
+/// on `GET /api/authz/policy` and requires it as `If-Match` on `PUT`; a stale version → `409`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyVersion(String);
+
+impl PolicyVersion {
+    /// The version when no policy is stored (the built-in default is active).
+    pub const ABSENT: &'static str = "none";
+
+    /// The version of the EXACT stored bytes (`None` ⇒ no policy stored).
+    fn of(raw: Option<&[u8]>) -> Self {
+        match raw {
+            None => Self(Self::ABSENT.to_string()),
+            Some(bytes) => Self(hex::encode(Sha256::digest(bytes))),
+        }
+    }
+
+    /// The version as a bare token (no quotes), for an `ETag`/`If-Match` header value.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Parse an `If-Match`/`ETag` header value — strips the optional weak `W/` prefix and the
+    /// surrounding quotes, so both `"abc"` and `abc` resolve to the same version.
+    #[must_use]
+    pub fn from_header(value: &str) -> Self {
+        let value = value.trim();
+        let value = value.strip_prefix("W/").unwrap_or(value);
+        Self(value.trim_matches('"').to_string())
+    }
+}
+
+impl std::fmt::Display for PolicyVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Read the stored RBAC policy and its [`PolicyVersion`] from `kv` (the optimistic-concurrency read
+/// path shared by [`DeployStore::get_authz_policy_versioned`] and the MF-1 gates).
+pub async fn policy_read_versioned(
+    kv: &dyn KvStore,
+) -> Result<(Option<crate::authz::AuthzPolicy>, PolicyVersion), DeployError> {
+    let raw = kv.get(crate::authz::POLICY_KEY).await?;
+    let version = PolicyVersion::of(raw.as_deref());
+    let policy = match &raw {
+        Some(bytes) => Some(serde_json::from_slice(bytes)?),
+        None => None,
+    };
+    Ok((policy, version))
+}
+
+/// Store the RBAC policy on `kv` IFF the stored policy still matches `expected` — a value-CAS on the
+/// prior policy bytes (optimistic concurrency / `If-Match`). A stale `expected`, or a concurrent
+/// edit landing in the read→CAS window, returns [`DeployError::Conflict`]. Shared by
+/// [`DeployStore::set_authz_policy_if_match`] and the MF-1 gates.
+pub async fn policy_set_if_match(
+    kv: &dyn KvStore,
+    expected: &PolicyVersion,
+    policy: &crate::authz::AuthzPolicy,
+) -> Result<PolicyVersion, DeployError> {
+    let new_bytes = serde_json::to_vec(policy)?;
+
+    // MF-1 mutation (gate only): drop the version guard AND the CAS — a blind whole-doc put, the
+    // pre-MF-1 behavior. Two concurrent edits then both "win" and one is silently lost.
+    if crate::crownjewel::cas_mutation_active() {
+        kv.put_durable_checkpointed(crate::authz::POLICY_KEY, new_bytes.clone())
+            .await?;
+        return Ok(PolicyVersion::of(Some(&new_bytes)));
+    }
+
+    let current_raw = kv.get(crate::authz::POLICY_KEY).await?;
+    let current_version = PolicyVersion::of(current_raw.as_deref());
+    if current_version != *expected {
+        return Err(DeployError::Conflict(format!(
+            "authz/policy was modified concurrently (current version {current_version}); GET the \
+             current policy and retry the PUT with its If-Match"
+        )));
+    }
+    // Crown-jewel (C2): a successful CAS through `CheckpointKv` advances the durable frontier
+    // before returning, so the grant/revoke cannot be dropped by a self-heal trailing-tail
+    // quarantine — the same durability the old `put_durable_checkpointed` gave.
+    let swapped = kv
+        .compare_and_swap(
+            crate::authz::POLICY_KEY,
+            current_raw.as_deref(),
+            new_bytes.clone(),
+        )
+        .await?;
+    if !swapped {
+        let now = PolicyVersion::of(kv.get(crate::authz::POLICY_KEY).await?.as_deref());
+        return Err(DeployError::Conflict(format!(
+            "authz/policy was modified concurrently (current version {now}); GET the current \
+             policy and retry the PUT with its If-Match"
+        )));
+    }
+    Ok(PolicyVersion::of(Some(&new_bytes)))
+}
+
 pub(crate) mod keys {
     //! The KV keyspace, collected in one place (mirrors [`boatramp_types::function::keys`]),
     //! so the persisted layout is legible at a glance instead of scattered through
@@ -303,6 +405,16 @@ pub(crate) mod keys {
     /// The `strip_prefix` tail is a single `<name>` segment.
     pub fn tenant_secret_prefix(project: ProjectRef<'_>, tenant: &str) -> String {
         format!("project/{project}/tenant-secret/{tenant}/")
+    }
+
+    /// The per-`(project, tenant)` secret-NAME index
+    /// (`project/<proj>/tenant-secret-index/<tenant>`): a CAS'd record holding this tenant's live
+    /// secret names, so the per-tenant name-count cap is enforced ATOMICALLY (a compare-and-swap
+    /// admission) rather than the old list-then-write TOCTOU. A DISTINCT infix
+    /// (`tenant-secret-index/`, not `tenant-secret/<tenant>/`), so the index never appears in a
+    /// `list`'s tenant-prefix scan.
+    pub fn tenant_secret_index(project: ProjectRef<'_>, tenant: &str) -> String {
+        format!("project/{project}/tenant-secret-index/{tenant}")
     }
 
     /// A project-scoped SMTP email profile: `project/<proj>/email/<name>` → the
@@ -2672,18 +2784,39 @@ impl DeployStore {
         }
     }
 
-    /// Store the RBAC `AuthzPolicy`. The caller validates it first (the server
-    /// route compiles it before storing); a write rides the existing cache
-    /// invalidation so every node picks it up.
+    /// Read the stored RBAC policy together with its optimistic-concurrency [`PolicyVersion`]
+    /// (ETag) — the HTTP `GET /api/authz/policy` surface returns the version as an `ETag`, and a
+    /// subsequent `PUT` supplies it as `If-Match`. `None` when the built-in default is in effect.
+    pub async fn get_authz_policy_versioned(
+        &self,
+    ) -> Result<(Option<crate::authz::AuthzPolicy>, PolicyVersion), DeployError> {
+        policy_read_versioned(self.kv.as_ref()).await
+    }
+
+    /// Store the RBAC `AuthzPolicy` IFF the stored policy still matches `expected` (optimistic
+    /// concurrency / `If-Match`) — a value-CAS on the prior policy bytes. A stale `expected`, or a
+    /// concurrent edit landing in the read→CAS window, returns [`DeployError::Conflict`] (surfaced
+    /// as `409`) so the caller re-reads and retries — closing the lost-grant/lost-revoke race when
+    /// two operators edit the policy on different nodes. The caller validates the policy first (the
+    /// route compiles it before storing). Returns the new version.
+    pub async fn set_authz_policy_if_match(
+        &self,
+        expected: &PolicyVersion,
+        policy: &crate::authz::AuthzPolicy,
+    ) -> Result<PolicyVersion, DeployError> {
+        policy_set_if_match(self.kv.as_ref(), expected, policy).await
+    }
+
+    /// Store the RBAC `AuthzPolicy` (compatibility path for a caller without an `If-Match`): read
+    /// the current version, then CAS on it — so a concurrent edit in the read→CAS window is a
+    /// [`DeployError::Conflict`] rather than a silent clobber. The caller validates it first; the
+    /// write rides the existing cache invalidation so every node picks it up.
     pub async fn set_authz_policy(
         &self,
         policy: &crate::authz::AuthzPolicy,
     ) -> Result<(), DeployError> {
-        // Crown-jewel (C2): the entire RBAC policy (role→right grants) — advance the frontier
-        // synchronously so a grant/revoke cannot be dropped by the self-heal trailing-tail quarantine.
-        self.kv
-            .put_durable_checkpointed(crate::authz::POLICY_KEY, serde_json::to_vec(policy)?)
-            .await?;
+        let (_current, version) = self.get_authz_policy_versioned().await?;
+        self.set_authz_policy_if_match(&version, policy).await?;
         Ok(())
     }
 

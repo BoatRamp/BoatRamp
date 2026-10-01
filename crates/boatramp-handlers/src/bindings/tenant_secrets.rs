@@ -213,6 +213,9 @@ fn refuse(err: SecretError) -> TenantSecretRefused {
         SecretError::TooManyNames { max } => TenantSecretRefused::Other(format!(
             "this tenant already holds the maximum of {max} secret names"
         )),
+        // A concurrent rotation/delete won the CAS — the guest retries. The message is request-
+        // level (no key shapes / value bytes), so it is safe to surface.
+        e @ SecretError::Conflict(_) => TenantSecretRefused::Other(e.to_string()),
         SecretError::Backend(detail) => {
             tracing::warn!(%detail, "tenant-secrets backend error");
             TenantSecretRefused::Other("tenant-secrets backend error".to_string())
