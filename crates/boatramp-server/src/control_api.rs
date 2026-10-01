@@ -838,6 +838,148 @@ pub(super) async fn kv_checkpoint(State(deploy): State<DeployStore>) -> Response
     }
 }
 
+/// Defense-in-depth (mirrors [`assert_kv_checkpoint_is_system_admin`]): re-derive that `path` is
+/// gated `System·Admin` inside the handler, so a routing/table regression cannot silently downgrade a
+/// node-global control-plane dump/restore to a project-scoped right. `what` names the op in the 403.
+fn assert_kv_dump_is_system_admin(method: &str, path: &str, what: &str) -> Option<Response> {
+    use boatramp_core::authz::{Action, Resource, Right};
+    match Right::required(method, path) {
+        Some(right)
+            if right.resource == Resource::System
+                && right.target.is_none()
+                && right.action == Action::Admin =>
+        {
+            None
+        }
+        _ => Some(
+            (
+                StatusCode::FORBIDDEN,
+                format!("{what} requires System·Admin\n"),
+            )
+                .into_response(),
+        ),
+    }
+}
+
+/// Stream the control-plane KV as a PORTABLE dump (`GET /api/kv-export`, `System·Admin`, kv-sql WS7).
+/// A LOGICAL dump of the CONTENT (`{key, value, version}` records minus the reserved `_cp/*` /
+/// `_inval/*` coordination feeds), NOT the physical LSM/manifest — so a restore rebuilds a FRESH
+/// clean store, immune to the torn-manifest / corrupt-`.compactions` classes. It is the WHOLE control
+/// plane: SEALED secret ciphertext (sealing is pre-put — NO plaintext), plaintext config/RBAC, and
+/// NEVER the envelope KEK (held separately; a restore needs it). Hence `System·Admin`, re-checked
+/// defense-in-depth. OFFLINE/quiesced is the recommended posture (a live single-writer source races
+/// concurrent writes); the SQL scan is itself a single MVCC-consistent read.
+pub(super) async fn kv_export(State(deploy): State<DeployStore>) -> Response {
+    if let Some(forbidden) = assert_kv_dump_is_system_admin("GET", "/api/kv-export", "kv export") {
+        return forbidden;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    match boatramp_core::kv_dump::export_to_bytes(deploy.kv().as_ref(), now).await {
+        Ok(bytes) => (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, "application/octet-stream"),
+                (
+                    header::CONTENT_DISPOSITION,
+                    "attachment; filename=\"boatramp-kv-dump\"",
+                ),
+            ],
+            bytes,
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("kv export failed: {err}\n"),
+        )
+            .into_response(),
+    }
+}
+
+/// `POST /api/kv-import` query flags: `apply` executes (default = DRY-RUN plan), `force` overlays a
+/// non-empty destination (default = REFUSE the commingle).
+#[derive(Debug, Default, Deserialize)]
+pub(super) struct KvImportQuery {
+    #[serde(default)]
+    apply: bool,
+    #[serde(default)]
+    force: bool,
+}
+
+/// Import a portable dump into the control-plane KV (`POST /api/kv-import`, `System·Admin`, kv-sql
+/// WS7). DRY-RUN by default (returns the plan JSON); `?apply=true` executes then VERIFIES (re-reads
+/// every key, compares bytes + count). REFUSES a non-empty destination — or one with an existing
+/// control-plane identity — with **409** unless `?force=true` (never silently COMMINGLE two control
+/// planes). A corrupt dump is **400**; a verify failure is **500**. The reserved `_cp/*` / `_inval/*`
+/// feeds are never imported (they regenerate). `System·Admin`, re-checked defense-in-depth.
+pub(super) async fn kv_import(
+    State(deploy): State<DeployStore>,
+    axum::extract::Query(q): axum::extract::Query<KvImportQuery>,
+    body: axum::body::Bytes,
+) -> Response {
+    if let Some(forbidden) = assert_kv_dump_is_system_admin("POST", "/api/kv-import", "kv import") {
+        return forbidden;
+    }
+    let decoded = match boatramp_core::kv_dump::decode_dump(&body) {
+        Ok(d) => d,
+        Err(err) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("kv import: bad dump: {err}\n"),
+            )
+                .into_response();
+        }
+    };
+    let kv = deploy.kv().as_ref();
+    if !q.apply {
+        return match boatramp_core::kv_dump::plan_import(kv, &decoded.entries, q.force).await {
+            Ok(plan) => Json(serde_json::json!({
+                "mode": "dry_run",
+                "format_version": decoded.header.format_version,
+                "created_at": decoded.header.created_at,
+                "source_entries": plan.source_entries,
+                "source_reserved_skipped": plan.source_reserved_skipped,
+                "would_write": plan.would_write,
+                "destination": {
+                    "user_keys": plan.dest.user_keys,
+                    "reserved_keys": plan.dest.reserved_keys,
+                    "has_control_plane_id": plan.dest.has_control_plane_id,
+                    "pristine": plan.dest.is_pristine(),
+                },
+                "would_refuse_commingle": plan.would_refuse_commingle,
+            }))
+            .into_response(),
+            Err(err) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("kv import plan failed: {err}\n"),
+            )
+                .into_response(),
+        };
+    }
+    match boatramp_core::kv_dump::apply_import(kv, &decoded.entries, q.force).await {
+        Ok(report) => Json(serde_json::json!({
+            "mode": "applied",
+            "written": report.written,
+            "verified": report.verified,
+        }))
+        .into_response(),
+        Err(boatramp_core::kv_dump::ImportError::Commingle(_)) => (
+            StatusCode::CONFLICT,
+            "kv import: refusing to import into a NON-EMPTY destination (or one with an existing \
+             control-plane identity) — this would COMMINGLE two control planes. Re-send with \
+             `?force=true` only to deliberately overlay it.\n",
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("kv import failed: {err}\n"),
+        )
+            .into_response(),
+    }
+}
+
 /// Set the `ETag` header on a response to the quoted policy version, so a `GET` hands the operator
 /// the version their next `PUT` echoes back as `If-Match` (optimistic concurrency).
 fn set_policy_etag(resp: &mut Response, version: &boatramp_core::deploy::PolicyVersion) {

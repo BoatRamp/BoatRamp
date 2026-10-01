@@ -610,6 +610,16 @@ impl Right {
             // Explicit (above the deny-safe `_` default that resolves the same, so a routing/table
             // regression is visible) and re-checked defense-in-depth at the handler.
             "/api/kv-checkpoint" => Self::new(Resource::System, None, Action::Admin),
+            // The portable control-plane KV dump/restore (`GET /api/kv-export` / `POST
+            // /api/kv-import`, kv-sql WS7): a node-GLOBAL op over the WHOLE control plane — sealed
+            // secrets, config, RBAC. Both are gated `System·Admin` EXPLICITLY (never a per-project
+            // right): an export streams the whole control plane, and an import can REPLACE/overlay
+            // it. Gated here above the deny-safe `_` default that resolves the same (so a
+            // routing/table regression is visible), and re-checked defense-in-depth at each handler.
+            // The SINGULAR, HYPHENATED paths deliberately do NOT match any `/api/<family>/*`
+            // project-scoped matcher, so a project-scoped token can never satisfy them.
+            "/api/kv-export" => Self::new(Resource::System, None, Action::Admin),
+            "/api/kv-import" => Self::new(Resource::System, None, Action::Admin),
             // The structured blob transition-mode state (`GET /api/blob-status`, v0.6.4): whether a
             // read-fallback secondary is attached (the node is mid-migration). A READ-only node
             // status — the same grade as `/api/sites` / `/api/metrics` — so `system·read` (never a
@@ -2833,5 +2843,53 @@ mod tests {
             Right::required("GET", "/api/blob-status"),
             "the kv-status read must be the same grade as /api/blob-status",
         );
+    }
+
+    /// kv-sql WS7 — `GET /api/kv-export` and `POST /api/kv-import` are gated `System·Admin`
+    /// EXPLICITLY (node-global: the WHOLE control plane incl. sealed secrets). A NON-admin right —
+    /// `System·Read`, or ANY project-scoped right — must NOT satisfy them; a regression that made
+    /// either `None` (public) or a `Project` right (tenant-reachable) is what this gate catches.
+    #[test]
+    fn kv_export_import_require_system_admin() {
+        let admin = Right::new(Resource::System, None, Action::Admin);
+        for (method, path) in [("GET", "/api/kv-export"), ("POST", "/api/kv-import")] {
+            let req = Right::required(method, path)
+                .unwrap_or_else(|| panic!("{method} {path} must require a token (never public)"));
+            assert_eq!(
+                req, admin,
+                "{method} {path} must be gated System·Admin (node-global control-plane dump)"
+            );
+            // A read-only operator right must NOT satisfy it.
+            assert!(
+                !Right::new(Resource::System, None, Action::Read).satisfies(&req),
+                "System·Read must NOT satisfy the {path} System·Admin gate"
+            );
+            // A project-scoped admin right must NOT satisfy it (it is node-global, not per-project).
+            assert!(
+                !Right::new(Resource::Project, Some("acme".to_string()), Action::Admin)
+                    .satisfies(&req),
+                "a project-scoped right must NOT satisfy the node-global {path} gate"
+            );
+            // And over the real default policy: NO ordinary tenant role (publisher/deployer/
+            // project_admin) is refused-not — none satisfies the dump gate; only `admin` reaches it.
+            let policy = AuthzPolicy::default_policy();
+            for grant in [
+                GrantedRole::scoped("publisher", "default/site"),
+                GrantedRole::scoped("deployer", "default/site"),
+                GrantedRole::scoped("project_admin", "default"),
+            ] {
+                let role = grant.name.clone();
+                assert!(
+                    !policy.rights_for(&[grant]).allows(&req),
+                    "a non-admin principal (role {role}) must be REFUSED {path}"
+                );
+            }
+            assert!(
+                policy
+                    .rights_for(&[GrantedRole::global("admin")])
+                    .allows(&req),
+                "System·Admin (operator) must reach {path}"
+            );
+        }
     }
 }

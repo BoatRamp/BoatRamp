@@ -77,7 +77,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use boatramp_core::kv::{KvError, KvStore, WriteOp, WriterModel};
+use boatramp_core::kv::{KvDumpEntry, KvError, KvStore, WriteOp, WriterModel};
 use boatramp_core::sql::Dialect;
 
 #[cfg(feature = "sql")]
@@ -132,6 +132,9 @@ struct KvStatements {
     cas_present: &'static str,
     /// Absent-key CAS — `INSERT … ON CONFLICT(key) DO NOTHING` (`?1` key, `?2` new).
     cas_absent: &'static str,
+    /// Ordered full `(key, value, version)` scan for a portable dump (kv-sql WS7,
+    /// [`KvStore::dump_scan`]) — reads the REAL per-key version in one statement.
+    dump_scan: &'static str,
 }
 
 /// SQLite / libsql statement set. `ts` is an `INTEGER` (unix seconds); keys/values are `BLOB`.
@@ -164,6 +167,7 @@ const SQLITE_STATEMENTS: KvStatements = KvStatements {
     cas_present: "UPDATE kv SET value = ?2, version = version + 1 WHERE key = ?1 AND value = ?3",
     cas_absent: "INSERT INTO kv (key, value, version) VALUES (?1, ?2, 1) \
                  ON CONFLICT(key) DO NOTHING",
+    dump_scan: "SELECT key, value, version FROM kv ORDER BY key",
 };
 
 /// Postgres statement set. Identical SQL text to SQLite (the `?N` → `$N` rewrite and value
@@ -199,6 +203,7 @@ const POSTGRES_STATEMENTS: KvStatements = KvStatements {
     cas_present: "UPDATE kv SET value = ?2, version = version + 1 WHERE key = ?1 AND value = ?3",
     cas_absent: "INSERT INTO kv (key, value, version) VALUES (?1, ?2, 1) \
                  ON CONFLICT(key) DO NOTHING",
+    dump_scan: "SELECT key, value, version FROM kv ORDER BY key",
 };
 
 /// MySQL / MariaDB statement set (feature `sql-mysql`; build-order step 6 / MF-2 MySQL shape). It
@@ -251,6 +256,7 @@ const MYSQL_STATEMENTS: KvStatements = KvStatements {
     list_from_all: "SELECT `key` FROM kv WHERE `key` > ?1 ORDER BY `key` LIMIT ?2",
     cas_present: "UPDATE kv SET `value` = ?2, version = version + 1 WHERE `key` = ?1 AND `value` = ?3",
     cas_absent: "INSERT IGNORE INTO kv (`key`, `value`, version) VALUES (?1, ?2, 1)",
+    dump_scan: "SELECT `key`, `value`, version FROM kv ORDER BY `key`",
 };
 
 /// Resolve the statement set for `dialect`. Each arm is gated on the engine feature that CONSTRUCTS
@@ -518,6 +524,20 @@ impl KvStore for SqlKv {
             Backing::Mysql(b) => {
                 sqlx_list_from(b.as_ref(), &self.stmts, prefix, after, limit).await
             }
+        }
+    }
+
+    async fn dump_scan(&self) -> Result<Vec<KvDumpEntry>, KvError> {
+        // One ordered scan reading the REAL per-key `version` (vs the trait default's version=1) —
+        // runs inside a single read-only transaction, so on Postgres it is an MVCC-consistent
+        // point-in-time of the scan itself. The copier filters the reserved feeds afterwards.
+        match &self.backing {
+            #[cfg(feature = "sql")]
+            Backing::Sqlite(db) => sqlite_dump_scan(db, &self.stmts).await,
+            #[cfg(feature = "sql-postgres")]
+            Backing::Postgres(b) => sqlx_dump_scan(b.as_ref(), &self.stmts).await,
+            #[cfg(feature = "sql-mysql")]
+            Backing::Mysql(b) => sqlx_dump_scan(b.as_ref(), &self.stmts).await,
         }
     }
 
@@ -962,6 +982,49 @@ async fn sqlx_collect_keys(
     Ok(out)
 }
 
+/// Ordered full `(key, value, version)` scan for a portable dump (kv-sql WS7), over the external SQL
+/// backends — one read-only transaction (MVCC-consistent point-in-time on Postgres), decoding each
+/// row back to a [`KvDumpEntry`] with its REAL per-key version.
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+async fn sqlx_dump_scan(
+    backend: &dyn SqlBackend,
+    stmts: &KvStatements,
+) -> Result<Vec<KvDumpEntry>, KvError> {
+    let mut tx = backend.begin_read_only().await.map_err(sql_err)?;
+    let rows = tx.query(stmts.dump_scan, &[]).await.map_err(sql_err)?;
+    tx.commit().await.map_err(sql_err)?;
+    let mut out = Vec::with_capacity(rows.rows.len());
+    for row in rows.rows {
+        let mut cells = row.into_iter();
+        let key_bytes = sqlx_bytes(
+            cells
+                .next()
+                .ok_or_else(|| KvError::backend("kv dump row missing key"))?,
+        )?;
+        let value = sqlx_bytes(
+            cells
+                .next()
+                .ok_or_else(|| KvError::backend("kv dump row missing value"))?,
+        )?;
+        let version = match cells.next() {
+            Some(SqlValue::Integer(n)) => n,
+            Some(other) => {
+                return Err(KvError::backend(format!(
+                    "kv dump row has a non-integer version: {other:?}"
+                )));
+            }
+            None => return Err(KvError::backend("kv dump row missing version")),
+        };
+        out.push(KvDumpEntry {
+            key: String::from_utf8(key_bytes)
+                .map_err(|e| KvError::backend(format!("kv key is not valid UTF-8: {e}")))?,
+            value,
+            version,
+        });
+    }
+    Ok(out)
+}
+
 /// Decode a `value`/`key` cell back to bytes. A BYTEA column decodes to [`SqlValue::Blob`] (empty
 /// value ⇒ empty blob, distinct from an absent key); a `Text`/`Null` arm is defensive. Any other
 /// value class is a schema bug → error.
@@ -1293,6 +1356,37 @@ async fn collect_keys(
     Ok(out)
 }
 
+/// Ordered full `(key, value, version)` scan for a portable dump (kv-sql WS7), over the embedded
+/// SQLite backing — decodes each row to a [`KvDumpEntry`] with its REAL per-key version.
+#[cfg(feature = "sql")]
+async fn sqlite_dump_scan(
+    db: &Database,
+    stmts: &KvStatements,
+) -> Result<Vec<KvDumpEntry>, KvError> {
+    let conn = sqlite_connect(db).await?;
+    let mut rows = conn.query(stmts.dump_scan, ()).await.map_err(kv_err)?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().await.map_err(kv_err)? {
+        let key_bytes = value_bytes(row.get_value(0).map_err(kv_err)?)?;
+        let value = value_bytes(row.get_value(1).map_err(kv_err)?)?;
+        let version = match row.get_value(2).map_err(kv_err)? {
+            LibsqlValue::Integer(n) => n,
+            other => {
+                return Err(KvError::backend(format!(
+                    "kv dump row has a non-integer version: {other:?}"
+                )));
+            }
+        };
+        out.push(KvDumpEntry {
+            key: String::from_utf8(key_bytes)
+                .map_err(|e| KvError::backend(format!("kv key is not valid UTF-8: {e}")))?,
+            value,
+            version,
+        });
+    }
+    Ok(out)
+}
+
 /// A KV key as the BLOB it is stored as — the `&str`'s UTF-8 bytes, so ordering/comparison is
 /// bytewise (matching Rust `str` byte order) and never subject to SQLite text affinity.
 #[cfg(feature = "sql")]
@@ -1596,6 +1690,76 @@ mod sqlite_tests {
             Some(sealed)
         );
     }
+
+    /// kv-sql WS7 — `dump_scan` reads the REAL per-key version (not the trait default's `1`): a key
+    /// put three times reports version 3; a once-put key reports 1.
+    #[tokio::test]
+    async fn sqlkv_dump_scan_reads_real_versions() {
+        let (_dir, path) = temp_db("dump-versions");
+        let kv = SqlKv::open_sqlite_local(&path).await.unwrap();
+        kv.put("a", b"1".to_vec()).await.unwrap();
+        kv.put("a", b"2".to_vec()).await.unwrap();
+        kv.put("a", b"3".to_vec()).await.unwrap(); // version 3
+        kv.put("b", b"x".to_vec()).await.unwrap(); // version 1
+        let entries = KvStore::dump_scan(&kv).await.unwrap();
+        let a = entries.iter().find(|e| e.key == "a").unwrap();
+        let b = entries.iter().find(|e| e.key == "b").unwrap();
+        assert_eq!((a.version, a.value.clone()), (3, b"3".to_vec()));
+        assert_eq!((b.version, b.value.clone()), (1, b"x".to_vec()));
+    }
+
+    /// kv-sql WS7 GATE `kv_dump_roundtrip_preserves_all_keys` over a REAL SQLite `SqlKv`: seed
+    /// crown-jewel + config keys (+ reserved feeds), export to the portable dump, import into a FRESH
+    /// SQLite store, and assert byte-equal content + identical key SET; the `_cp/*` / `_inval/*`
+    /// reserved feeds are SKIPPED.
+    #[tokio::test]
+    async fn sqlkv_dump_roundtrip_preserves_all_keys() {
+        use boatramp_core::kv_dump::{apply_import, decode_dump, export_to_bytes};
+        let (_srcdir, srcpath) = temp_db("dump-src");
+        let src = SqlKv::open_sqlite_local(&srcpath).await.unwrap();
+        src.put("project/default/secret/api-key", b"SEALED".to_vec())
+            .await
+            .unwrap();
+        src.put("authz/policy", b"{\"roles\":{}}".to_vec())
+            .await
+            .unwrap();
+        src.put("site/default/web/current", b"deadbeef".to_vec())
+            .await
+            .unwrap();
+        src.put("k/empty", Vec::new()).await.unwrap();
+        src.put("_cp/control_plane_id", b"cp-xyz".to_vec())
+            .await
+            .unwrap();
+        src.put("_inval/9-n1-1", b"authz/policy".to_vec())
+            .await
+            .unwrap();
+
+        let bytes = export_to_bytes(&src, 100).await.unwrap();
+        let decoded = decode_dump(&bytes).unwrap();
+        // Reserved feeds excluded from the dump.
+        let mut dumped: Vec<&str> = decoded.entries.iter().map(|e| e.key.as_str()).collect();
+        dumped.sort_unstable();
+        assert_eq!(
+            dumped,
+            vec![
+                "authz/policy",
+                "k/empty",
+                "project/default/secret/api-key",
+                "site/default/web/current",
+            ]
+        );
+
+        let (_dstdir, dstpath) = temp_db("dump-dst");
+        let dst = SqlKv::open_sqlite_local(&dstpath).await.unwrap();
+        let report = apply_import(&dst, &decoded.entries, false).await.unwrap();
+        assert_eq!((report.written, report.verified), (4, 4));
+        for e in &decoded.entries {
+            assert_eq!(dst.get(&e.key).await.unwrap(), Some(e.value.clone()));
+        }
+        // The reserved feeds did NOT cross into the fresh store.
+        assert_eq!(dst.get("_cp/control_plane_id").await.unwrap(), None);
+        assert_eq!(dst.get("_inval/9-n1-1").await.unwrap(), None);
+    }
 }
 
 /// LIVE Postgres gates (build-order step 2 / MF-2). Env-gated on `BOATRAMP_TEST_PG_URL` — they skip
@@ -1645,6 +1809,99 @@ mod pg_tests {
         };
         boatramp_core::kv::conformance::kv_conformance(&kv).await;
         println!("SQLKV PG CONFORMANCE OK [postgres]");
+    }
+
+    /// kv-sql WS7 GATE — the portable dump round-trips ACROSS backends over the live harness:
+    /// **SQLite → file → Postgres → file → SQLite**. Seed a SQLite `SqlKv` with crown-jewel + config
+    /// keys (+ reserved feeds), export to the portable dump, import into a FRESH Postgres primary, and
+    /// assert byte-equal content + identical key SET with the `_cp/*` / `_inval/*` feeds SKIPPED; then
+    /// export the Postgres store and import it back into a fresh SQLite store, confirming the content
+    /// survives a full cross-engine round-trip. Env-gated on `BOATRAMP_TEST_PG_URL`; skips CLEAN when
+    /// unset.
+    #[tokio::test]
+    #[serial]
+    async fn sqlkv_cross_backend_dump_roundtrip_sqlite_pg() {
+        use boatramp_core::kv_dump::{apply_import, decode_dump, export_to_bytes};
+        let Some(pg) = fresh_pg().await else {
+            return;
+        };
+
+        // (1) Seed a SQLite source with crown-jewel + config keys + reserved feeds.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src = SqlKv::open_sqlite_local(dir.path().join("src.db"))
+            .await
+            .unwrap();
+        src.put(
+            "project/default/secret/api-key",
+            b"SEALED-\x00\x9f".to_vec(),
+        )
+        .await
+        .unwrap();
+        src.put("authz/policy", b"{\"roles\":{}}".to_vec())
+            .await
+            .unwrap();
+        src.put("site/default/web/current", b"deadbeef".to_vec())
+            .await
+            .unwrap();
+        src.put("k/empty", Vec::new()).await.unwrap();
+        src.put("_cp/control_plane_id", b"cp-sqlite".to_vec())
+            .await
+            .unwrap();
+        src.put("_inval/9-n1-1", b"authz/policy".to_vec())
+            .await
+            .unwrap();
+
+        let expected: std::collections::BTreeMap<String, Vec<u8>> = [
+            (
+                "project/default/secret/api-key",
+                b"SEALED-\x00\x9f".to_vec(),
+            ),
+            ("authz/policy", b"{\"roles\":{}}".to_vec()),
+            ("site/default/web/current", b"deadbeef".to_vec()),
+            ("k/empty", Vec::new()),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+
+        // (2) SQLite → file → Postgres (fresh ⇒ pristine, no --force).
+        let dump = export_to_bytes(&src, 1).await.unwrap();
+        let decoded = decode_dump(&dump).unwrap();
+        let report = apply_import(&pg, &decoded.entries, false).await.unwrap();
+        assert_eq!(report.written, expected.len());
+        assert_eq!(report.verified, expected.len());
+        for (k, v) in &expected {
+            assert_eq!(pg.get(k).await.unwrap().as_ref(), Some(v), "pg has {k}");
+        }
+        assert_eq!(
+            pg.get("_cp/control_plane_id").await.unwrap(),
+            None,
+            "cp-id not migrated across backends"
+        );
+        assert_eq!(pg.get("_inval/9-n1-1").await.unwrap(), None);
+
+        // (3) Postgres → file → a FRESH SQLite store (full cross-engine round-trip).
+        let pg_dump = export_to_bytes(&pg, 2).await.unwrap();
+        let pg_decoded = decode_dump(&pg_dump).unwrap();
+        let dst = SqlKv::open_sqlite_local(dir.path().join("dst.db"))
+            .await
+            .unwrap();
+        let report2 = apply_import(&dst, &pg_decoded.entries, false)
+            .await
+            .unwrap();
+        assert_eq!(report2.verified, expected.len());
+        for (k, v) in &expected {
+            assert_eq!(
+                dst.get(k).await.unwrap().as_ref(),
+                Some(v),
+                "sqlite has {k}"
+            );
+        }
+        println!(
+            "SQLKV CROSS-BACKEND DUMP OK [postgres]: SQLite→file→Postgres→file→SQLite preserved all \
+             {} keys byte-for-byte; reserved _cp/*/_inval/* skipped.",
+            expected.len()
+        );
     }
 
     /// MF-6 CUSTODY GATE (over a REAL Postgres) — `kv_changes` carries KEY + VERSION ONLY, never the

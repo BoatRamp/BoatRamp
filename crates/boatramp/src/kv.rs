@@ -69,6 +69,197 @@ enum KvCommand {
     /// opens clean + zero-torn BEFORE adopting, prints the discard-delta, and (with `--apply`)
     /// adopts it via verify-open-then-swap, RETAINING the crashed copy until the adopt is verified.
     Recover(RecoverArgs),
+    /// Export the control-plane KV to a PORTABLE, backend-agnostic dump FILE (kv-sql WS7). A LOGICAL
+    /// dump captures CONTENT (`{key, value, version}` records), NOT the physical LSM/manifest/
+    /// `.compactions` — so a restore (`kv import`) rebuilds a FRESH clean store, structurally immune
+    /// to the torn-manifest / corrupt-`.compactions` physical-corruption classes that make volume
+    /// snapshots useless. Works over ANY backend. The dump carries SEALED ciphertext for secrets
+    /// (sealing is pre-put — NO plaintext) + plaintext control-plane config/RBAC, and NEVER the
+    /// envelope KEK (a restore needs the separately-held key). OFFLINE/quiesced by default (the
+    /// daemon should be stopped — a live single-writer source races concurrent writes). SENSITIVE —
+    /// op-gated over the API (`GET /api/kv-export`, System·Admin); protect the file at rest.
+    Export(ExportArgs),
+    /// Import a portable dump FILE (from `kv export`) into a control-plane KV (kv-sql WS7). DRY-RUN by
+    /// default (prints the plan: source key count, destination state, what would be copied);
+    /// `--apply` executes, then VERIFIES (re-reads every key, compares bytes + count). REFUSES a
+    /// non-empty destination — or one with an existing control-plane identity — unless `--force`
+    /// (never silently COMMINGLE two control planes). The reserved `_cp/*` / `_inval/*` feeds are
+    /// never imported (they regenerate). OFFLINE/quiesced by default.
+    Import(ImportArgs),
+    /// Migrate a control-plane KV store→store over the portable dump (kv-sql WS7) — the SlateDB⇄SQL
+    /// adoption path (and back). DRY-RUN by default (prints the plan); `--apply` copies + VERIFIES
+    /// (bytes + count). REFUSES a non-empty `--to` destination unless `--force`. Reserved `_cp/*` /
+    /// `_inval/*` feeds are skipped (regenerated). OFFLINE/quiesced by default.
+    Migrate(MigrateArgs),
+}
+
+/// A source/destination KV ENDPOINT descriptor for `export`/`import`/`migrate` — `scheme:rest`:
+/// - `memory` — an ephemeral in-memory store (tests / piping).
+/// - `slatedb:<data-dir>` — the local SlateDB control-plane store under `<data-dir>/kv-slate`
+///   (default `./data` when `rest` is empty).
+/// - `sqlite:<path>` — an embedded SQLite/libsql file.
+/// - `postgres:<ENV_VAR>` / `mysql:<ENV_VAR>` — an external primary; `ENV_VAR` NAMES the env var
+///   holding the connection URL (UX-C2 — never a raw URL on the command line/in config).
+async fn open_endpoint(
+    desc: &str,
+) -> Result<std::sync::Arc<dyn boatramp_core::kv::KvStore>, Error> {
+    use boatramp_core::kv::KvOpenPolicy;
+    use boatramp_node::backends::{KvBackend, build_kv};
+    use boatramp_node::config::SqlKvConfig;
+    use std::path::Path;
+
+    let (scheme, rest) = desc.split_once(':').unwrap_or((desc, ""));
+    let sql = |kind: &str, url_env: Option<String>, path: Option<String>| SqlKvConfig {
+        kind: kind.to_string(),
+        url_env,
+        path,
+        pool_max: None,
+    };
+    let built = match scheme {
+        "memory" => {
+            build_kv(
+                KvBackend::Memory,
+                Path::new("."),
+                None,
+                KvOpenPolicy::SelfHeal,
+                None,
+            )
+            .await
+        }
+        "slatedb" => {
+            let data_dir = if rest.is_empty() { "./data" } else { rest };
+            build_kv(
+                KvBackend::Slatedb,
+                Path::new(data_dir),
+                None,
+                KvOpenPolicy::SelfHeal,
+                None,
+            )
+            .await
+        }
+        "sqlite" | "sqlite3" | "libsql" => {
+            if rest.is_empty() {
+                return Err(Error::Endpoint(
+                    "`sqlite:` needs a file path (e.g. `sqlite:/data/kv.db`)".to_string(),
+                ));
+            }
+            let cfg = sql("sqlite", None, Some(rest.to_string()));
+            build_kv(
+                KvBackend::Sql,
+                Path::new("."),
+                None,
+                KvOpenPolicy::SelfHeal,
+                Some(&cfg),
+            )
+            .await
+        }
+        "postgres" | "postgresql" | "pg" => {
+            if rest.is_empty() {
+                return Err(Error::Endpoint(
+                    "`postgres:` needs the NAME of the env var holding the URL (e.g. \
+                     `postgres:BOATRAMP_KV_SQL_URL`)"
+                        .to_string(),
+                ));
+            }
+            let cfg = sql("postgres", Some(rest.to_string()), None);
+            build_kv(
+                KvBackend::Sql,
+                Path::new("."),
+                None,
+                KvOpenPolicy::SelfHeal,
+                Some(&cfg),
+            )
+            .await
+        }
+        "mysql" | "mariadb" => {
+            if rest.is_empty() {
+                return Err(Error::Endpoint(
+                    "`mysql:` needs the NAME of the env var holding the URL (e.g. \
+                     `mysql:BOATRAMP_KV_SQL_URL`)"
+                        .to_string(),
+                ));
+            }
+            let cfg = sql("mysql", Some(rest.to_string()), None);
+            build_kv(
+                KvBackend::Sql,
+                Path::new("."),
+                None,
+                KvOpenPolicy::SelfHeal,
+                Some(&cfg),
+            )
+            .await
+        }
+        other => {
+            return Err(Error::Endpoint(format!(
+                "unknown KV endpoint {other:?}: expected memory | slatedb:<data-dir> | \
+                 sqlite:<path> | postgres:<ENV_VAR> | mysql:<ENV_VAR>"
+            )));
+        }
+    };
+    built.map_err(|e| Error::Endpoint(e.to_string()))
+}
+
+/// Current unix-seconds timestamp for a dump header (best-effort; a pre-epoch clock stamps 0).
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+#[derive(Debug, Args)]
+struct ExportArgs {
+    /// The KV endpoint to export (see the subcommand help for the descriptor forms). Defaults to the
+    /// local SlateDB store under `./data/kv-slate`.
+    #[arg(long, default_value = "slatedb:./data")]
+    store: String,
+
+    /// Write the portable dump to this file (the sensitive dump — protect it at rest).
+    #[arg(long, value_name = "FILE")]
+    out: std::path::PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct ImportArgs {
+    /// The portable dump file to import (produced by `kv export` / `GET /api/kv-export`).
+    #[arg(value_name = "FILE")]
+    file: std::path::PathBuf,
+
+    /// The destination KV endpoint (see the subcommand help). Defaults to the local SlateDB store.
+    #[arg(long, default_value = "slatedb:./data")]
+    store: String,
+
+    /// Perform the import. Without this the command is a DRY-RUN: it prints the plan and mutates
+    /// NOTHING.
+    #[arg(long)]
+    apply: bool,
+
+    /// Overlay the dump onto a NON-EMPTY destination (or one with an existing control-plane
+    /// identity). Without it, a non-empty destination is REFUSED to avoid commingling two control
+    /// planes.
+    #[arg(long)]
+    force: bool,
+}
+
+#[derive(Debug, Args)]
+struct MigrateArgs {
+    /// The SOURCE KV endpoint (see the subcommand help for the descriptor forms).
+    #[arg(long, value_name = "DESCRIPTOR")]
+    from: String,
+
+    /// The DESTINATION KV endpoint.
+    #[arg(long, value_name = "DESCRIPTOR")]
+    to: String,
+
+    /// Perform the migration. Without this the command is a DRY-RUN: it prints the plan and mutates
+    /// NOTHING.
+    #[arg(long)]
+    apply: bool,
+
+    /// Overlay onto a NON-EMPTY `--to` destination (or one with an existing control-plane identity).
+    /// Without it, a non-empty destination is REFUSED (commingle hazard).
+    #[arg(long)]
+    force: bool,
 }
 
 /// The store-addressing flags shared by every `boatramp kv` subcommand — they build EXACTLY the
@@ -274,6 +465,18 @@ pub enum Error {
     /// A `--live` control-plane request failed (no server, auth, or a server-side refusal).
     #[error(transparent)]
     Client(#[from] crate::client::ClientError),
+    /// A bad / unbuildable `export`/`import`/`migrate` KV endpoint descriptor.
+    #[error("kv: {0}")]
+    Endpoint(String),
+    /// Reading/writing the dump file (`export --out` / `import <file>`).
+    #[error("kv: dump file i/o error: {0}")]
+    Io(#[from] std::io::Error),
+    /// A corrupt / foreign / truncated dump file on `import`.
+    #[error(transparent)]
+    Dump(#[from] boatramp_core::kv_dump::DumpError),
+    /// An `import`/`migrate` apply failure (commingle refusal, write, or the byte/count verify).
+    #[error(transparent)]
+    Import(#[from] boatramp_core::kv_dump::ImportError),
 }
 
 /// Dispatch `boatramp kv <subcommand>`.
@@ -283,7 +486,154 @@ pub async fn run(args: KvArgs) -> Result<(), Error> {
         KvCommand::Status(status) => run_status(status).await,
         KvCommand::Checkpoint(checkpoint) => run_checkpoint(checkpoint).await,
         KvCommand::Recover(recover) => run_recover(recover).await,
+        KvCommand::Export(export) => run_export(export).await,
+        KvCommand::Import(import) => run_import(import).await,
+        KvCommand::Migrate(migrate) => run_migrate(migrate).await,
     }
+}
+
+/// `boatramp kv export` — scan the store into the portable dump and write it to `--out` (kv-sql WS7).
+async fn run_export(args: ExportArgs) -> Result<(), Error> {
+    let store = open_endpoint(&args.store).await?;
+    let bytes = boatramp_core::kv_dump::export_to_bytes(store.as_ref(), now_secs())
+        .await
+        .map_err(|e| Error::Store(e.to_string()))?;
+    let decoded = boatramp_core::kv_dump::decode_dump(&bytes)?;
+    std::fs::write(&args.out, &bytes)?;
+    println!(
+        "kv export: wrote {} record(s) ({} bytes) from `{}` to `{}`.",
+        decoded.entries.len(),
+        bytes.len(),
+        args.store,
+        args.out.display()
+    );
+    println!(
+        "  A LOGICAL dump (CONTENT, not the physical LSM/manifest) — `kv import` rebuilds a FRESH \
+         clean store, immune to the torn-manifest / corrupt-`.compactions` classes. The dump carries \
+         SEALED secret ciphertext (no plaintext) + plaintext control-plane config/RBAC, and NO KEK \
+         (a restore needs the separately-held envelope key). Treat it as SENSITIVE — protect it at \
+         rest."
+    );
+    Ok(())
+}
+
+/// `boatramp kv import <file>` — DRY-RUN plan by default; `--apply` imports + verifies (kv-sql WS7).
+async fn run_import(args: ImportArgs) -> Result<(), Error> {
+    let store = open_endpoint(&args.store).await?;
+    let bytes = std::fs::read(&args.file)?;
+    let decoded = boatramp_core::kv_dump::decode_dump(&bytes)?;
+
+    if !args.apply {
+        let plan =
+            boatramp_core::kv_dump::plan_import(store.as_ref(), &decoded.entries, args.force)
+                .await
+                .map_err(|e| Error::Store(e.to_string()))?;
+        print_import_plan(&args.store, &decoded.header, &plan);
+        println!(
+            "\nDRY-RUN: re-run with `--apply` to import{}.",
+            if plan.would_refuse_commingle {
+                " (and `--force` to overlay the non-empty destination)"
+            } else {
+                ""
+            }
+        );
+        return Ok(());
+    }
+
+    let report =
+        boatramp_core::kv_dump::apply_import(store.as_ref(), &decoded.entries, args.force).await?;
+    println!(
+        "kv import: APPLIED {} record(s) into `{}` and VERIFIED {} byte-for-byte (re-read + count).",
+        report.written, args.store, report.verified
+    );
+    Ok(())
+}
+
+/// `boatramp kv migrate --from <desc> --to <desc>` — store→store; DRY-RUN by default (kv-sql WS7).
+async fn run_migrate(args: MigrateArgs) -> Result<(), Error> {
+    let src = open_endpoint(&args.from).await?;
+    let dst = open_endpoint(&args.to).await?;
+    let entries = boatramp_core::kv_dump::scan_dumpable(src.as_ref())
+        .await
+        .map_err(|e| Error::Store(e.to_string()))?;
+
+    if !args.apply {
+        let plan = boatramp_core::kv_dump::plan_import(dst.as_ref(), &entries, args.force)
+            .await
+            .map_err(|e| Error::Store(e.to_string()))?;
+        println!(
+            "kv migrate (DRY-RUN — no mutation): `{}` → `{}`",
+            args.from, args.to
+        );
+        println!("  source dumpable records:    {}", plan.source_entries);
+        print_dest_state(&plan.dest);
+        println!("  would copy:                 {}", plan.would_write);
+        if plan.would_refuse_commingle {
+            println!(
+                "  REFUSAL: the destination is NON-EMPTY — `--apply` would be refused to avoid \
+                 commingling two control planes. Re-run with `--apply --force` only to overlay it."
+            );
+        }
+        println!("\nDRY-RUN: re-run with `--apply` to migrate (then it VERIFIES bytes + count).");
+        return Ok(());
+    }
+
+    let report = boatramp_core::kv_dump::migrate(src.as_ref(), dst.as_ref(), args.force).await?;
+    println!(
+        "kv migrate: APPLIED {} record(s) `{}` → `{}` and VERIFIED {} byte-for-byte.",
+        report.written, args.from, args.to, report.verified
+    );
+    Ok(())
+}
+
+/// Print the `kv import` dry-run plan (source count, dest state, would-copy, commingle verdict).
+fn print_import_plan(
+    store: &str,
+    header: &boatramp_core::kv_dump::DumpHeader,
+    plan: &boatramp_core::kv_dump::ImportPlan,
+) {
+    println!("kv import (DRY-RUN — no mutation) into `{store}`");
+    println!(
+        "  dump format v{} created at (unix): {}",
+        header.format_version, header.created_at
+    );
+    println!("  source dumpable records:    {}", plan.source_entries);
+    if plan.source_reserved_skipped > 0 {
+        println!(
+            "  reserved records skipped:   {} (`_cp/*` / `_inval/*` regenerate; never imported)",
+            plan.source_reserved_skipped
+        );
+    }
+    print_dest_state(&plan.dest);
+    println!("  would copy:                 {}", plan.would_write);
+    if plan.would_refuse_commingle {
+        println!(
+            "  REFUSAL: the destination is NON-EMPTY — `--apply` would be refused to avoid \
+             commingling two control planes. Pass `--force` only to deliberately overlay it."
+        );
+    }
+}
+
+/// Print the destination emptiness/identity portion of an import/migrate plan.
+fn print_dest_state(dest: &boatramp_core::kv_dump::DestState) {
+    println!(
+        "  destination state:          {} user key(s), {} reserved, control-plane-id {}",
+        dest.user_keys,
+        dest.reserved_keys,
+        if dest.has_control_plane_id {
+            "PRESENT (commingle hazard)"
+        } else {
+            "absent"
+        }
+    );
+    println!(
+        "  destination:                {}",
+        if dest.is_pristine() {
+            "PRISTINE (safe to import without --force)"
+        } else {
+            "NON-EMPTY (needs --force)"
+        }
+    );
 }
 
 async fn run_repair(args: RepairArgs) -> Result<(), Error> {

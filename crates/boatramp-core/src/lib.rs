@@ -43,6 +43,9 @@ pub mod ipam;
 #[cfg(feature = "authz")]
 pub mod kernel_trust;
 pub mod kv;
+/// Portable, versioned, backend-agnostic KV dump format + a generic `KvStore`↔`KvStore` copier
+/// (kv-sql WS7) — the one representation behind `kv export` / `import` / `migrate`.
+pub mod kv_dump;
 pub mod messaging;
 /// Online, resumable migration of a pre-0.2.0 store to the project-scoped layout.
 pub mod migrate;
