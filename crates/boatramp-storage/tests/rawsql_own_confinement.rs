@@ -59,6 +59,7 @@ fn orm_scope(mode: ScopeMode, own: &str) -> Scope {
         // #503: no per-route write-global allowlist in the P0 own-confinement battery (it exercises
         // tenant/unscoped read+write scoping, not the write-global feature).
         unscoped_writes: std::collections::BTreeSet::new(),
+        pass_unresolved: false,
     }
 }
 
@@ -121,6 +122,7 @@ fn rewrite_read(sql: &str, own: &str, mode: ScopeMode) -> Result<String, String>
         session: None,
         mode,
         keys: OwnKeys::PerTable(&k),
+        pass_unresolved: false,
     };
     rewrite_own_read(&neutralised, &scope, dialect_of()).map_err(|e| e.reason())
 }
@@ -136,6 +138,7 @@ fn rewrite_write(sql: &str, own: &str, mode: ScopeMode) -> Result<String, String
         session: None,
         mode,
         keys: OwnKeys::PerTable(&k),
+        pass_unresolved: false,
     };
     rewrite_own_write(&neutralised, &scope, dialect_of()).map_err(|e| e.reason())
 }
@@ -580,6 +583,7 @@ async fn run_battery(backend: &dyn SqlBackend, dialect: Dialect, engine: &str) {
                 session: None,
                 mode: ScopeMode::Own,
                 keys: OwnKeys::PerTable(&k),
+                pass_unresolved: false,
             };
             c.refused(
                 8,

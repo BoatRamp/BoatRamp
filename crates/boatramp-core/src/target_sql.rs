@@ -315,6 +315,16 @@ pub struct OwnScope<'a> {
     pub mode: ScopeMode,
     /// Per-table tenant-key resolution (legacy single-column `Uniform`, or the project schema's map).
     pub keys: OwnKeys<'a>,
+    /// **Unresolved-request pass-through** (v0.12.x — the opt-in soft `domain` source), the raw-SQL
+    /// READ analog of [`orm::Scope::pass_unresolved`](crate::orm::Scope). When `true` AND the actor
+    /// holds no own/session fact a table needs, the READ confiner injects an **unsatisfiable** `1 = 0`
+    /// on that table reference instead of refusing with
+    /// [`NoPrincipal`](TargetRewriteError::NoPrincipal) — so a null-principal raw-SQL read fails-closed
+    /// to **zero rows** on every table reference (never cross-tenant, never the base/`NULL` rows). Set
+    /// **only on the READ scope** ([`rewrite_own_read`]); the WRITE path ([`rewrite_own_write`]) leaves
+    /// it `false`, so a null-principal raw-SQL write stays denied. `false` (the default) preserves
+    /// today's refuse-on-no-principal behavior. Inert when the actor DOES hold the fact.
+    pub pass_unresolved: bool,
 }
 
 /// Rewrite a guest's **raw-SQL own/session READ** so every table reference is confined to the
@@ -970,6 +980,19 @@ fn own_value_expr(own: Option<&SqlValue>) -> Result<Expr, TargetRewriteError> {
     }
 }
 
+/// The **unsatisfiable** `1 = 0` predicate — the raw-SQL analog of `orm`'s `Predicate::Or([])`. Used
+/// for a scoped READ with no resolved principal under the opt-in unresolved-request pass-through: it
+/// confines the table reference to the EMPTY set (zero rows) rather than refusing the statement.
+/// Portable across sqlite/postgres/mysql. ANDed onto each confined table reference, so even an
+/// `OR`-escape guest `WHERE` (parenthesised by the rewriter) cannot widen it.
+fn never_expr() -> Expr {
+    binop(
+        Expr::Value(Value::Number("1".to_string(), false)),
+        BinaryOperator::Eq,
+        Expr::Value(Value::Number("0".to_string(), false)),
+    )
+}
+
 /// Best-effort extraction of the single tenant value a **raw-SQL `all` write** declares, so the host
 /// can set the RLS tenant GUC to it (v0.4.20 — the raw-path analog of
 /// [`Insert::uniform_scope_value`](crate::orm::Insert::uniform_scope_value) /
@@ -1173,6 +1196,14 @@ impl Confiner for OwnConfiner<'_> {
             ResolvedScope::Column(col) => {
                 check_ident(col)?;
                 let is_null = || Expr::IsNull(Box::new(col_expr(qualifier, col)));
+                // A mode that needs an own value but the request resolved none: under the opt-in
+                // unresolved-request pass-through confine to the EMPTY set (`1 = 0`) — NOT the base/
+                // `NULL` rows, NOT cross-tenant; otherwise refuse (today's behavior).
+                if matches!(self.scope.mode, ScopeMode::Own | ScopeMode::OwnOrNull)
+                    && self.scope.own.is_none()
+                {
+                    return self.no_principal_pred();
+                }
                 Ok(Some(match self.scope.mode {
                     ScopeMode::NullOnly => is_null(),
                     ScopeMode::Own => binop(
@@ -1195,6 +1226,11 @@ impl Confiner for OwnConfiner<'_> {
             }
             ResolvedScope::TenantOrBase { tenant } => {
                 check_ident(tenant)?;
+                // No resolved principal ⇒ empty set under pass-through (never the shared `NULL` base),
+                // else refuse — exactly the `orm::Scope::tenant_pred` no-principal decision.
+                if self.scope.own.is_none() {
+                    return self.no_principal_pred();
+                }
                 let own = own_value_expr(self.scope.own)?;
                 let eq = binop(col_expr(qualifier, tenant), BinaryOperator::Eq, own);
                 Ok(Some(Expr::Nested(Box::new(or(
@@ -1225,7 +1261,8 @@ impl Confiner for OwnConfiner<'_> {
                 }
                 let mut it = arms.into_iter();
                 let Some(first) = it.next() else {
-                    return Err(TargetRewriteError::NoPrincipal);
+                    // Neither an own nor a session fact ⇒ empty set under pass-through, else refuse.
+                    return self.no_principal_pred();
                 };
                 Ok(Some(match it.next() {
                     Some(second) => Expr::Nested(Box::new(or(first, second))),
@@ -1238,6 +1275,23 @@ impl Confiner for OwnConfiner<'_> {
             // the write-global allowance is enforced only on the ORM write path (a raw-SQL write to
             // either is refused in `write_target`).
             ResolvedScope::Unscoped | ResolvedScope::SharedWritable => Ok(None),
+        }
+    }
+}
+
+impl OwnConfiner<'_> {
+    /// The READ predicate for a table when the request carries **no resolved principal** (the raw-SQL
+    /// analog of [`orm::Scope::no_principal_read_pred`](crate::orm::Scope)): the unsatisfiable `1 = 0`
+    /// (zero rows) under the opt-in unresolved-request pass-through
+    /// ([`OwnScope::pass_unresolved`]), otherwise the deny-by-default
+    /// [`NoPrincipal`](TargetRewriteError::NoPrincipal) refusal. NEVER "no predicate" (which would be
+    /// all-rows) — it is the empty set or a refusal. Only ever reached on the READ walk; the write
+    /// confiner leaves `pass_unresolved` `false`, so a null-principal raw-SQL write still refuses.
+    fn no_principal_pred(&self) -> Result<Option<Expr>, TargetRewriteError> {
+        if self.scope.pass_unresolved {
+            Ok(Some(never_expr()))
+        } else {
+            Err(TargetRewriteError::NoPrincipal)
         }
     }
 }
@@ -2311,10 +2365,67 @@ mod own_confinement_tests {
             session,
             mode: ScopeMode::Own,
             keys: OwnKeys::PerTable(keys),
+            pass_unresolved: false,
         }
     }
 
     // ---- READ -------------------------------------------------------------
+
+    #[test]
+    fn read_with_no_principal_passes_to_zero_rows_only_when_opted_in() {
+        // v0.12.x soft `domain` source, raw-SQL READ path. No resolved principal (`own: None`,
+        // `session: None`) on a plain tenant table:
+        //  - WITHOUT the opt-in ⇒ refused `NoPrincipal` (today's behavior, fail-closed).
+        //  - WITH the opt-in ⇒ the table reference is confined to `1 = 0` (zero rows), never all-rows,
+        //    never the `NULL` base — and an `OR`-escape guest `WHERE` is parenthesised then ANDed, so
+        //    it cannot widen the empty set. The confinement is airtight on EVERY table reference
+        //    (self-join below), exactly like the resolved-principal path.
+        let k = keys();
+        let scope = |pass: bool| OwnScope {
+            own: None,
+            session: None,
+            mode: ScopeMode::Own,
+            keys: OwnKeys::PerTable(&k),
+            pass_unresolved: pass,
+        };
+        // Deny-by-default (no opt-in).
+        assert_eq!(
+            rewrite_own_read("SELECT * FROM orders", &scope(false), Dialect::Sqlite).unwrap_err(),
+            TargetRewriteError::NoPrincipal
+        );
+        // Opt-in: a plain read → `1 = 0`.
+        let out = rewrite_own_read("SELECT * FROM orders", &scope(true), Dialect::Sqlite).unwrap();
+        assert_eq!(out, "SELECT * FROM orders WHERE 1 = 0");
+        // Opt-in + an OR-escape: `(1=1 OR 1=1) AND 1 = 0` — still zero rows.
+        let out = rewrite_own_read(
+            "SELECT * FROM orders WHERE 1=1 OR 1=1",
+            &scope(true),
+            Dialect::Sqlite,
+        )
+        .unwrap();
+        assert_eq!(out, "SELECT * FROM orders WHERE (1 = 1 OR 1 = 1) AND 1 = 0");
+        // Opt-in + a self-join: BOTH references are confined to `1 = 0` (every table ref, not one).
+        let out = rewrite_own_read(
+            "SELECT * FROM orders o JOIN orders p ON p.id = o.id",
+            &scope(true),
+            Dialect::Sqlite,
+        )
+        .unwrap();
+        assert_eq!(out.matches("1 = 0").count(), 2, "both refs confined: {out}");
+        // A raw-SQL WRITE with no principal is NEVER relaxed — even if the flag were (wrongly) set on
+        // the write scope, the write confiner refuses fail-closed (the host only sets it on reads).
+        let mut write = scope(true);
+        write.mode = ScopeMode::Own;
+        assert_eq!(
+            rewrite_own_write(
+                "UPDATE orders SET status = 'x' WHERE id = 1",
+                &write,
+                Dialect::Sqlite,
+            )
+            .unwrap_err(),
+            TargetRewriteError::NoPrincipal
+        );
+    }
 
     #[test]
     fn read_or_escape_is_neutralized() {
@@ -2409,6 +2520,7 @@ mod own_confinement_tests {
                 session: None,
                 mode: ScopeMode::OwnOrNull,
                 keys: OwnKeys::PerTable(&k),
+                pass_unresolved: false,
             },
             Dialect::Sqlite,
         )
@@ -2425,6 +2537,7 @@ mod own_confinement_tests {
                 session: None,
                 mode: ScopeMode::NullOnly,
                 keys: OwnKeys::PerTable(&k),
+                pass_unresolved: false,
             },
             Dialect::Sqlite,
         )
@@ -2438,6 +2551,7 @@ mod own_confinement_tests {
                 session: None,
                 mode: ScopeMode::NullOnly,
                 keys: OwnKeys::PerTable(&k),
+                pass_unresolved: false,
             },
             Dialect::Sqlite,
         )
@@ -2729,6 +2843,7 @@ mod own_confinement_tests {
             session: None,
             mode: ScopeMode::Own,
             keys: OwnKeys::Uniform("tenant_id".to_string()),
+            pass_unresolved: false,
         };
         let out = rewrite_own_read(
             "SELECT * FROM anything WHERE 1=1 OR 1=1",

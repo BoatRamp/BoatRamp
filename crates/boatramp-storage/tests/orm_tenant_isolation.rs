@@ -26,6 +26,7 @@ fn scope(mode: ScopeMode, value: &str) -> Scope {
         mode,
         keys: TableKeys::Uniform,
         unscoped_writes: std::collections::BTreeSet::new(),
+        pass_unresolved: false,
     }
 }
 fn item(e: Expr) -> SelectItem {
@@ -431,6 +432,7 @@ async fn orm_per_table_key_scope_isolates_on_a_real_engine() {
         mode: ScopeMode::Own,
         keys: keys.clone(),
         unscoped_writes: std::collections::BTreeSet::new(),
+        pass_unresolved: false,
     };
 
     // Seed: two tenants' orders; a `tenant` identity table whose PK IS the tenant (no tenant_id
@@ -541,6 +543,7 @@ async fn orm_per_table_key_scope_isolates_on_a_real_engine() {
             mode: ScopeMode::Own,
             keys: TableKeys::Uniform,
             unscoped_writes: std::collections::BTreeSet::new(),
+            pass_unresolved: false,
         })
         .unwrap();
         let (bad_sql, bad_params) = bad.compile(Dialect::Sqlite).unwrap();
@@ -897,6 +900,7 @@ async fn orm_tenant_or_session_disjunct_isolates_on_a_real_engine() {
         mode: ScopeMode::Own,
         keys: keys.clone(),
         unscoped_writes: std::collections::BTreeSet::new(),
+        pass_unresolved: false,
     };
 
     {
@@ -1388,6 +1392,7 @@ async fn orm_unscoped_write_isolates_on_a_real_engine() {
         mode: ScopeMode::Own,
         keys: keys.clone(),
         unscoped_writes: BTreeSet::from(["audit_log".to_string()]),
+        pass_unresolved: false,
     };
 
     // (1) own read isolated (write-global grant does NOT widen reads, G2).
@@ -1451,6 +1456,7 @@ async fn orm_unscoped_write_isolates_on_a_real_engine() {
     {
         let empty = Scope {
             unscoped_writes: BTreeSet::new(),
+            pass_unresolved: false,
             ..scoped("acme")
         };
         let mut ins = Insert {
@@ -1812,5 +1818,270 @@ async fn orm_left_join_count_has_null_semantics_and_no_cross_tenant_leak_on_a_re
         "ORM LEFT-JOIN AGGREGATE SEMANTICS OK: on an own-scoped LEFT JOIN, count(*)=2 keeps both \
          driving rows while count(child.col)=1 drops the unmatched NULL, and sum(child.col)=10 never \
          sees globex's 9999 (other-tenant child NULLed in the ON, not leaked)"
+    );
+}
+
+// ===========================================================================================
+// v0.12.x OPT-IN SOFT `domain` SOURCE — UNRESOLVED-REQUEST PASS-THROUGH (`on_unresolved: pass`).
+// A `domain`-source scoped route on a wildcard host that matches NO per-host context resolves NO
+// principal. Today that fails closed (deny). The opt-in `on_unresolved: pass` relaxes ONLY the
+// pre-handler DENY into a NULL-PRINCIPAL handler invocation whose scoped READS fail-closed to ZERO
+// ROWS (and whose scoped WRITES stay denied). The gate below proves BEHAVIORALLY on a real libsql
+// engine that the relaxation does NOT relax row scoping: a null-principal read sees NEITHER tenant's
+// rows, a resolved host sees only its OWN, the default still denies, and a write still denies. It is
+// MUTATION-VERIFIED: `skip_confine` models the regression where the pass path runs the scoped read
+// WITHOUT the zero-row confinement (treats a null principal as all-rows) — then the null-principal
+// read leaks both tenants' rows and the ZERO-ROWS assertion fails RED. Both surfaces (the typed `orm`
+// force_scope AND the raw-`sql` AST `rewrite_own_read`) are proven, because the portal imports `sql`.
+// ===========================================================================================
+
+/// The unresolved-pass MUTATION seam (`BOATRAMP_DOMAINPASS_MUTATION`). `skip_confine` models the
+/// exact regression this gate guards: the `on_unresolved: pass` path runs the null-principal scoped
+/// read WITHOUT the structural zero-row confinement (as if a null principal were `all`), so the
+/// victim tenants' rows leak and the ZERO-ROWS equality MUST then fail. Unset / any other value =
+/// the real confined build (the gate PASSES). Mirrors `orm_groupby_skip_scope_mutation`.
+fn domainpass_skip_confine_mutation() -> bool {
+    std::env::var("BOATRAMP_DOMAINPASS_MUTATION").as_deref() == Ok("skip_confine")
+}
+
+/// **Live**, mutation-verified proof (v0.12.x) that the opt-in `on_unresolved: pass` relaxes ONLY the
+/// pre-handler deny into a null-principal invocation whose scoped reads fail-closed to ZERO ROWS on a
+/// real libsql engine — the `DOMAIN-SOURCE UNRESOLVED PASS-THROUGH OK` gate. Same `#[ignore]`
+/// rationale as the siblings (static-musl libsql segfault); the `test-orm-tenancy` CI job runs it
+/// unignored on the host toolchain, greps the marker, and loops the `skip_confine` mutation asserting
+/// the test then exits non-zero.
+#[tokio::test]
+#[ignore = "run via the test-orm-tenancy CI job on the host toolchain (static-musl test binary segfaults in libsql's bundled SQLite)"]
+async fn domain_source_unresolved_pass_through_is_null_scoped_to_zero_rows_on_a_real_engine() {
+    use boatramp_core::target_sql::{OwnKeys, OwnScope, rewrite_own_read, rewrite_own_write};
+    use boatramp_core::tenancy::ResolvedScope;
+
+    let dir = std::env::temp_dir().join(format!("boatramp-domainpass-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let db = LibsqlSqlBackends::local(&dir)
+        .database("default", "portal", "")
+        .await
+        .unwrap();
+    // A storefront page table scoped on `tenant_id`, holding BOTH tenants' rows. An unprovisioned
+    // host must see NEITHER row (not A's, not B's); a resolved host (→ A) must see ONLY A's.
+    {
+        let mut tx = db.begin().await.unwrap();
+        tx.execute(
+            "CREATE TABLE page (id TEXT PRIMARY KEY, tenant_id TEXT, name TEXT)",
+            &[],
+        )
+        .await
+        .unwrap();
+        for (id, tenant, name) in [("a1", "tenant_A", "A page"), ("b1", "tenant_B", "B page")] {
+            tx.execute(
+                "INSERT INTO page (id, tenant_id, name) VALUES (?1, ?2, ?3)",
+                &[t(id), t(tenant), t(name)],
+            )
+            .await
+            .unwrap();
+        }
+        tx.commit().await.unwrap();
+    }
+
+    // The per-table key map the host threads onto every scope for this project schema (`page` is a
+    // plain tenant table on `tenant_id`). Both surfaces read it.
+    let keys_map: std::collections::BTreeMap<String, ResolvedScope> =
+        std::collections::BTreeMap::from([(
+            "page".to_string(),
+            ResolvedScope::Column("tenant_id".to_string()),
+        )]);
+    // The READ scope the host's `orm_scope(Read)` yields for an `on_unresolved: pass` route on an
+    // UNRESOLVED host: a NULL principal (`value: None`) carrying the pass flag.
+    let null_pass_read = || Scope {
+        column: "tenant_id".into(),
+        value: None,
+        session: None,
+        mode: ScopeMode::Own,
+        keys: TableKeys::PerTable(keys_map.clone()),
+        unscoped_writes: std::collections::BTreeSet::new(),
+        pass_unresolved: true,
+    };
+    let page_select = || Select {
+        columns: vec![item(Expr::col("name"))],
+        ..Select::from("page")
+    };
+
+    // ---- (a) pass + UNRESOLVED host → handler invoked, scoped read returns ZERO ROWS ----
+    // "Invoked, not pre-handler-denied" at this layer = the scope BUILDS and the read COMPILES to
+    // runnable SQL (no `TenancyNoPrincipal` refusal) — cf. (b) where the compile fails closed.
+    // (a.1) the typed `orm` surface.
+    let orm_rows = {
+        let mut q = page_select();
+        if !domainpass_skip_confine_mutation() {
+            // The real path: confine the null principal to the empty set (`1 = 0`).
+            q.force_scope(&null_pass_read())
+                .expect("null-principal pass read compiles (handler invoked, not denied)");
+        }
+        // else (mutation `skip_confine`): run the read UNCONFINED — the regression where the pass
+        // path treats a null principal as all-rows. The ZERO-ROWS assertion below then fails RED.
+        let (sql, params) = q.compile(Dialect::Sqlite).unwrap();
+        if !domainpass_skip_confine_mutation() {
+            assert!(
+                sql.contains("1 = 0"),
+                "the real null-principal orm read must confine to the empty set (`1 = 0`): {sql}"
+            );
+        }
+        let mut tx = db.begin().await.unwrap();
+        let rows = run_query(tx.as_mut(), &sql, &params).await;
+        tx.commit().await.unwrap();
+        rows
+    };
+    assert!(
+        orm_rows.is_empty(),
+        "orm null-principal pass read MUST return ZERO rows (never A's or B's); saw {orm_rows:?}"
+    );
+
+    // (a.2) the raw-`sql` surface (the portal imports `sql`): the host AST-rewrites every table ref.
+    let raw_scope = |pass: bool| OwnScope {
+        own: None,
+        session: None,
+        mode: ScopeMode::Own,
+        keys: OwnKeys::PerTable(&keys_map),
+        pass_unresolved: pass,
+    };
+    for (label, guest_sql) in [
+        ("plain", "SELECT name FROM page"),
+        // An OR-escape the guest cannot widen: `(1=1 OR 1=1) AND 1 = 0` is still empty.
+        ("or-escape", "SELECT name FROM page WHERE 1=1 OR 1=1"),
+        // A self-join: BOTH references must be confined, not one.
+        (
+            "self-join",
+            "SELECT p.name FROM page p JOIN page q ON q.id = p.id",
+        ),
+    ] {
+        let rewritten = if domainpass_skip_confine_mutation() {
+            // The regression: run the guest SQL un-rewritten (unconfined → all rows).
+            guest_sql.to_string()
+        } else {
+            rewrite_own_read(guest_sql, &raw_scope(true), Dialect::Sqlite).unwrap_or_else(|e| {
+                panic!(
+                    "{label}: null-principal pass raw read must rewrite (handler invoked), got {}",
+                    e.reason()
+                )
+            })
+        };
+        if !domainpass_skip_confine_mutation() {
+            assert!(
+                rewritten.contains("1 = 0"),
+                "raw null-principal read [{label}] must confine to the empty set: {rewritten}"
+            );
+        }
+        let mut tx = db.begin().await.unwrap();
+        let rows = run_query(tx.as_mut(), &rewritten, &[]).await;
+        tx.commit().await.unwrap();
+        assert!(
+            rows.is_empty(),
+            "raw null-principal pass read [{label}] MUST return ZERO rows; saw {rows:?}"
+        );
+    }
+
+    // ---- (b) DEFAULT (no `on_unresolved`) + unresolved host → still DENIES (unchanged) ----
+    // The deny build is byte-identical except `pass_unresolved: false`. Both surfaces fail CLOSED
+    // (a pre-handler/compile refusal, not an empty result) — exactly today's behavior.
+    {
+        let mut q = page_select();
+        q.force_scope(&Scope {
+            pass_unresolved: false,
+            ..null_pass_read()
+        })
+        .unwrap();
+        assert_eq!(
+            q.compile(Dialect::Sqlite).unwrap_err(),
+            boatramp_core::orm::OrmError::TenancyNoPrincipal,
+            "default (no opt-in) null-principal orm read must DENY, not return rows"
+        );
+        assert_eq!(
+            rewrite_own_read("SELECT name FROM page", &raw_scope(false), Dialect::Sqlite)
+                .unwrap_err(),
+            boatramp_core::target_sql::TargetRewriteError::NoPrincipal,
+            "default (no opt-in) null-principal raw read must DENY"
+        );
+    }
+
+    // ---- (c) a RESOLVED host (context → tenant A) → sees ONLY A's own rows, not B's ----
+    {
+        let mut q = page_select();
+        q.force_scope(&Scope {
+            value: Some(t("tenant_A")),
+            pass_unresolved: false, // a resolved request never carries the flag
+            ..null_pass_read()
+        })
+        .unwrap();
+        let (sql, params) = q.compile(Dialect::Sqlite).unwrap();
+        let mut tx = db.begin().await.unwrap();
+        let rows = run_query(tx.as_mut(), &sql, &params).await;
+        tx.commit().await.unwrap();
+        assert_eq!(
+            rows,
+            vec!["A page".to_string()],
+            "a resolved host (→ A) must see ONLY A's own rows (read:own), never B's: {sql}"
+        );
+    }
+
+    // ---- (d) a WRITE under the null principal is DENIED (the pass-through never relaxes a write) ----
+    {
+        // The host's `orm_scope(Write)` NEVER carries the pass flag; a null-principal write refuses.
+        let mut upd = Update {
+            table: "page".into(),
+            set: vec![Assignment {
+                column: "name".into(),
+                value: Expr::Value(t("hijacked")),
+            }],
+            filter: Predicate::And(Vec::new()),
+            scope: None,
+            returning: Vec::new(),
+        };
+        upd.force_scope(&Scope {
+            pass_unresolved: false, // writes never pass
+            ..null_pass_read()
+        })
+        .unwrap();
+        assert_eq!(
+            upd.compile(Dialect::Sqlite).unwrap_err(),
+            boatramp_core::orm::OrmError::TenancyNoPrincipal,
+            "a null-principal WRITE must be denied"
+        );
+        // Defense-in-depth: EVEN IF the pass flag were (wrongly) set on a write scope, the write still
+        // refuses — the relaxation is of the read deny only.
+        let mut upd2 = Update {
+            table: "page".into(),
+            set: vec![Assignment {
+                column: "name".into(),
+                value: Expr::Value(t("hijacked")),
+            }],
+            filter: Predicate::And(Vec::new()),
+            scope: None,
+            returning: Vec::new(),
+        };
+        upd2.force_scope(&null_pass_read()).unwrap(); // pass_unresolved: true
+        assert_eq!(
+            upd2.compile(Dialect::Sqlite).unwrap_err(),
+            boatramp_core::orm::OrmError::TenancyNoPrincipal,
+            "even a pass-flagged write scope must deny a null-principal write"
+        );
+        // Raw-SQL write with no principal is refused regardless of the flag.
+        assert_eq!(
+            rewrite_own_write(
+                "UPDATE page SET name = 'hijacked' WHERE id = 'b1'",
+                &raw_scope(true),
+                Dialect::Sqlite,
+            )
+            .unwrap_err(),
+            boatramp_core::target_sql::TargetRewriteError::NoPrincipal,
+            "a null-principal raw WRITE must be denied even with the flag set"
+        );
+    }
+
+    println!(
+        "DOMAIN-SOURCE UNRESOLVED PASS-THROUGH OK: `on_unresolved: pass` on an UNRESOLVED host runs \
+         the handler under a NULL principal whose scoped reads (orm AND raw-sql, incl. OR-escape and \
+         self-join) return ZERO rows (never tenant A's or B's) on a real libsql engine; the DEFAULT \
+         still denies, a RESOLVED host sees ONLY its own rows (read:own), and every write is denied — \
+         the pass-through relaxes ONLY the pre-handler deny, never the row scoping"
     );
 }

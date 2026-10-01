@@ -509,6 +509,20 @@ pub struct Scope {
     /// resolved fresh from the schema per write (the G1 drift guard). Empty for a route that lists
     /// none (the common case — byte-identical to pre-#503 behavior).
     pub unscoped_writes: std::collections::BTreeSet<String>,
+    /// **Unresolved-request pass-through** (v0.12.x — the opt-in soft `domain` source). When `true`
+    /// AND the operation needs an own-tenant value but the request resolved **none** (`value` is
+    /// `None` under an `Own`/`OwnOrNull` read, or no own/session fact for a `TenantOrSession` read),
+    /// the READ confiner injects an **unsatisfiable** tenant predicate (`Predicate::Or([])` ⇒ `1 = 0`)
+    /// on every table reference instead of refusing with [`OrmError::TenancyNoPrincipal`] — so a
+    /// null-principal scoped read fails-closed to **ZERO ROWS** (never cross-tenant, never the base/
+    /// `NULL` rows), exactly the row-level guarantee the pre-handler deny gave, now surfaced as an
+    /// empty result the handler can act on (redirect / 404). It is set **only on the READ scope** (the
+    /// host passes the read axis); the WRITE path never sets it, so a scoped write with no principal
+    /// stays denied ([`write_target`](Self::write_target) still refuses) — the relaxation is of the
+    /// read *deny* only. `false` (the default) preserves today's refuse-on-no-principal behavior. Inert
+    /// whenever a principal IS resolved (`value`/`session` present) — then the normal predicate is built
+    /// and this flag is never consulted.
+    pub pass_unresolved: bool,
 }
 
 impl Scope {
@@ -632,7 +646,12 @@ impl Scope {
             ScopeMode::All => None,
             ScopeMode::NullOnly => Some(is_null),
             ScopeMode::Own => {
-                let v = self.value.clone().ok_or(OrmError::TenancyNoPrincipal)?;
+                let Some(v) = self.value.clone() else {
+                    // No resolved principal. Under the opt-in unresolved-request pass-through confine
+                    // to the EMPTY set (`1 = 0`) — NOT the base/`NULL` rows (so `base_inclusive` is
+                    // deliberately ignored here), NOT cross-tenant; otherwise refuse (today's behavior).
+                    return Ok(Some(self.no_principal_read_pred()?));
+                };
                 Some(if base_inclusive {
                     Predicate::Or(vec![eq(v), is_null])
                 } else {
@@ -640,7 +659,11 @@ impl Scope {
                 })
             }
             ScopeMode::OwnOrNull => {
-                let v = self.value.clone().ok_or(OrmError::TenancyNoPrincipal)?;
+                let Some(v) = self.value.clone() else {
+                    // No resolved principal ⇒ empty set under pass-through (never the `NULL` base),
+                    // else refuse. The whole OR-null form needs the own value too.
+                    return Ok(Some(self.no_principal_read_pred()?));
+                };
                 Some(Predicate::Or(vec![eq(v), is_null]))
             }
         })
@@ -675,9 +698,28 @@ impl Scope {
             arms.push(eq(session_col, s));
         }
         match arms.len() {
-            0 => Err(OrmError::TenancyNoPrincipal),
+            // Neither an own nor a session fact: under the opt-in unresolved-request pass-through
+            // confine to the EMPTY set (`1 = 0`); otherwise refuse (today's behavior).
+            0 => Ok(Some(self.no_principal_read_pred()?)),
             1 => Ok(arms.pop()),
             _ => Ok(Some(Predicate::Or(arms))),
+        }
+    }
+
+    /// The READ predicate for a scoped table when the request carries **no resolved principal**
+    /// (`PLAN` D3 / the v0.12.x soft `domain` source): the **unsatisfiable** `Predicate::Or([])`
+    /// (renders `1 = 0`) when this scope opts into the unresolved-request pass-through
+    /// ([`pass_unresolved`](Self::pass_unresolved)), so the read fails-closed to **zero rows** on every
+    /// table reference (never cross-tenant, never the base/`NULL` rows); otherwise the deny-by-default
+    /// refusal [`OrmError::TenancyNoPrincipal`] (today's behavior). This is the single choke point for
+    /// the no-principal READ decision — the security invariant is that it is NEVER "no predicate" (which
+    /// would be all-rows): it is either the empty set or a refusal. The WRITE path has no analog (a
+    /// write with no principal always refuses; see [`write_target`](Self::write_target)).
+    fn no_principal_read_pred(&self) -> Result<Predicate, OrmError> {
+        if self.pass_unresolved {
+            Ok(Predicate::Or(Vec::new()))
+        } else {
+            Err(OrmError::TenancyNoPrincipal)
         }
     }
 
@@ -3006,6 +3048,7 @@ mod tests {
                 mode: ScopeMode::Own,
                 keys: TableKeys::Uniform,
                 unscoped_writes: std::collections::BTreeSet::new(),
+                pass_unresolved: false,
             }),
             ..Select::from("party")
         };
@@ -3015,6 +3058,76 @@ mod tests {
             "SELECT * FROM party WHERE tenant_id = ?1 AND kind = ?2"
         );
         assert_eq!(params, vec![t("ten_1"), t("supplier")]);
+    }
+
+    #[test]
+    fn null_principal_pass_confines_a_read_to_zero_rows_but_still_denies_without_the_flag() {
+        // v0.12.x soft `domain` source. A scoped READ with NO resolved principal (`value: None`):
+        //  - WITHOUT the opt-in (`pass_unresolved: false`) ⇒ refused `TenancyNoPrincipal` (today).
+        //  - WITH the opt-in ⇒ confined to the EMPTY set (`1 = 0`), never cross-tenant, never all-rows,
+        //    so the handler runs and the read returns zero rows. The guest filter can't widen it:
+        //    `1 = 0 AND (...)` stays unsatisfiable, so a `WHERE 1=1 OR ...` escape cannot leak.
+        let mk = |pass: bool, filter: Option<Predicate>| Select {
+            filter,
+            scope: Some(Scope {
+                column: "tenant_id".into(),
+                value: None, // no resolved principal
+                session: None,
+                mode: ScopeMode::Own,
+                keys: TableKeys::Uniform,
+                unscoped_writes: std::collections::BTreeSet::new(),
+                pass_unresolved: pass,
+            }),
+            ..Select::from("tenant")
+        };
+        // Deny-by-default (no opt-in): the compile fails closed.
+        assert_eq!(
+            mk(false, None).compile(Dialect::Sqlite).unwrap_err(),
+            OrmError::TenancyNoPrincipal
+        );
+        // Opt-in: a bare read confines to `1 = 0` (zero rows), with NO bound params.
+        let (sql, params) = mk(true, None).compile(Dialect::Sqlite).unwrap();
+        assert_eq!(sql, "SELECT * FROM tenant WHERE 1 = 0");
+        assert!(params.is_empty(), "the empty-set predicate binds no params");
+        // Opt-in + an OR-escape guest filter: the unsatisfiable scope is conjoined FIRST, so the
+        // whole WHERE is `1 = 0 AND (...)` — still zero rows (the escape cannot widen it).
+        let or_escape = Predicate::Or(vec![
+            cmp("published", CmpOp::Eq, SqlValue::Boolean(true)),
+            cmp("published", CmpOp::Eq, SqlValue::Boolean(false)),
+        ]);
+        let (sql, _) = mk(true, Some(or_escape)).compile(Dialect::Sqlite).unwrap();
+        assert_eq!(
+            sql,
+            "SELECT * FROM tenant WHERE 1 = 0 AND (published = ?1 OR published = ?2)"
+        );
+        // The WRITE path NEVER honors the flag: a null-principal write is refused even with the opt-in
+        // set on the scope (defense-in-depth — the host only ever sets the flag on the read scope).
+        let mut upd = Update {
+            table: "tenant".into(),
+            set: vec![Assignment {
+                column: "name".into(),
+                value: Expr::Value(t("x")),
+            }],
+            filter: Predicate::And(Vec::new()), // no guest filter (match-all identity)
+            scope: None,
+            returning: Vec::new(),
+        };
+        let write_scope = Scope {
+            column: "tenant_id".into(),
+            value: None,
+            session: None,
+            mode: ScopeMode::Own,
+            keys: TableKeys::Uniform,
+            unscoped_writes: std::collections::BTreeSet::new(),
+            pass_unresolved: true, // even if (wrongly) set, writes must still deny
+        };
+        upd.force_scope(&write_scope).unwrap();
+        // The write bound is computed at compile (`single_scope_pred` → `write_target`), which refuses
+        // a null-principal write regardless of the flag — writes are NEVER relaxed to the empty set.
+        assert_eq!(
+            upd.compile(Dialect::Sqlite).unwrap_err(),
+            OrmError::TenancyNoPrincipal
+        );
     }
 
     #[test]
@@ -3050,6 +3163,7 @@ mod tests {
                     ),
                 ])),
                 unscoped_writes: std::collections::BTreeSet::new(),
+                pass_unresolved: false,
             }),
             ..Select::from("storefront_config")
         };
@@ -3092,6 +3206,7 @@ mod tests {
                 ("countries".to_string(), ResolvedScope::Unscoped),
             ])),
             unscoped_writes: std::collections::BTreeSet::new(),
+            pass_unresolved: false,
         })
         .unwrap();
         let (sql2, params2) = q2.compile(Dialect::Sqlite).unwrap();
@@ -3117,6 +3232,7 @@ mod tests {
                 ResolvedScope::Column("tenant_id".to_string()),
             )])),
             unscoped_writes: std::collections::BTreeSet::new(),
+            pass_unresolved: false,
         })
         .unwrap();
         assert!(matches!(
@@ -3146,6 +3262,7 @@ mod tests {
             mode: ScopeMode::OwnOrNull,
             keys: TableKeys::Uniform,
             unscoped_writes: std::collections::BTreeSet::new(),
+            pass_unresolved: false,
         })
         .unwrap();
         let (sql, params) = q.compile(Dialect::Sqlite).unwrap();
@@ -3182,6 +3299,7 @@ mod tests {
             mode: ScopeMode::All,
             keys: TableKeys::Uniform,
             unscoped_writes: std::collections::BTreeSet::new(),
+            pass_unresolved: false,
         })
         .unwrap();
         let (sql, params) = q.compile(Dialect::Sqlite).unwrap();
@@ -3232,6 +3350,7 @@ mod tests {
             mode: ScopeMode::OwnOrNull,
             keys: TableKeys::Uniform,
             unscoped_writes: std::collections::BTreeSet::new(),
+            pass_unresolved: false,
         })
         .unwrap();
         let (sql, _) = q.compile(Dialect::Sqlite).unwrap();
@@ -3256,6 +3375,7 @@ mod tests {
                 mode,
                 keys: TableKeys::Uniform,
                 unscoped_writes: std::collections::BTreeSet::new(),
+                pass_unresolved: false,
             }),
             ..Select::from("party")
         }
@@ -3315,6 +3435,7 @@ mod tests {
             mode: ScopeMode::Own,
             keys: TableKeys::Uniform,
             unscoped_writes: std::collections::BTreeSet::new(),
+            pass_unresolved: false,
         })
         .unwrap();
         let (sql, params) = q.compile(Dialect::Sqlite).unwrap();
@@ -3355,6 +3476,7 @@ mod tests {
             mode: ScopeMode::Own,
             keys: TableKeys::Uniform,
             unscoped_writes: std::collections::BTreeSet::new(),
+            pass_unresolved: false,
         })
         .unwrap();
         let (sql, params) = q.compile(Dialect::Sqlite).unwrap();
@@ -3380,6 +3502,7 @@ mod tests {
             mode: ScopeMode::Own,
             keys: TableKeys::Uniform,
             unscoped_writes: std::collections::BTreeSet::new(),
+            pass_unresolved: false,
         };
         // DELETE … RETURNING (subquery) — the RETURNING read must be scoped to victim.
         let mut del = Delete {
@@ -3428,6 +3551,7 @@ mod tests {
             mode: ScopeMode::Own,
             keys: TableKeys::Uniform,
             unscoped_writes: std::collections::BTreeSet::new(),
+            pass_unresolved: false,
         })
         .unwrap();
         let (sql, params) = q.compile(Dialect::Sqlite).unwrap();
@@ -3467,6 +3591,7 @@ mod tests {
             mode: ScopeMode::Own,
             keys: TableKeys::Uniform,
             unscoped_writes: std::collections::BTreeSet::new(),
+            pass_unresolved: false,
         };
         ins.force_scope(Some(&own), Some(&own)).unwrap();
         let (sql, params) = ins.compile(Dialect::Sqlite).unwrap();
@@ -3506,6 +3631,7 @@ mod tests {
                 mode: ScopeMode::Own,
                 keys: TableKeys::Uniform,
                 unscoped_writes: std::collections::BTreeSet::new(),
+                pass_unresolved: false,
             }),
             returning: vec![],
         };
@@ -3556,6 +3682,7 @@ mod tests {
             mode: ScopeMode::Own,
             keys: TableKeys::Uniform,
             unscoped_writes: std::collections::BTreeSet::new(),
+            pass_unresolved: false,
         };
         ins.force_scope(Some(&own), Some(&own)).unwrap();
         let (sql, params) = ins.compile(Dialect::Sqlite).unwrap();
@@ -3602,6 +3729,7 @@ mod tests {
             mode: ScopeMode::Own,
             keys: TableKeys::PerTable(schema_503()),
             unscoped_writes: unscoped_writes.iter().map(ToString::to_string).collect(),
+            pass_unresolved: false,
         }
     }
 
@@ -3750,6 +3878,7 @@ mod tests {
             // Structurally a target route can't carry this, but set it to prove the arm's guard is
             // is_target(), not the (empty) set — a defense-in-depth check.
             unscoped_writes: BTreeSet::from(["oauth_state".to_string(), "countries".to_string()]),
+            pass_unresolved: false,
         };
         for tbl in ["oauth_state", "countries"] {
             let mut ins = insert_one(
@@ -3806,6 +3935,7 @@ mod tests {
                 mode,
                 keys: TableKeys::Uniform,
                 unscoped_writes: std::collections::BTreeSet::new(),
+                pass_unresolved: false,
             };
             ins.force_scope(Some(&s), Some(&s)).unwrap();
             ins
@@ -3852,6 +3982,7 @@ mod tests {
                 mode,
                 keys: TableKeys::Uniform,
                 unscoped_writes: std::collections::BTreeSet::new(),
+                pass_unresolved: false,
             }),
             returning: vec![],
             from_select: None,
@@ -3896,6 +4027,7 @@ mod tests {
                 mode: ScopeMode::Own,
                 keys: TableKeys::Uniform,
                 unscoped_writes: std::collections::BTreeSet::new(),
+                pass_unresolved: false,
             }),
             ..Select::from("order_to_network")
         };
@@ -4174,6 +4306,7 @@ mod tests {
                 mode: ScopeMode::Own,
                 keys: TableKeys::Uniform,
                 unscoped_writes: std::collections::BTreeSet::new(),
+                pass_unresolved: false,
             }),
             returning: vec![item(Expr::col("id"))],
             from_select: None,
@@ -4247,6 +4380,7 @@ mod tests {
                 mode: ScopeMode::Own,
                 keys: TableKeys::Uniform,
                 unscoped_writes: std::collections::BTreeSet::new(),
+                pass_unresolved: false,
             }),
             returning: vec![],
         };
@@ -4327,6 +4461,7 @@ mod tests {
                 mode: ScopeMode::Own,
                 keys: TableKeys::Uniform,
                 unscoped_writes: std::collections::BTreeSet::new(),
+                pass_unresolved: false,
             }),
             returning: vec![],
         };
@@ -4393,6 +4528,7 @@ mod tests {
                 mode: ScopeMode::Own,
                 keys: TableKeys::Uniform,
                 unscoped_writes: std::collections::BTreeSet::new(),
+                pass_unresolved: false,
             }),
             returning: vec![],
         };
@@ -5026,6 +5162,7 @@ mod tests {
                 require_public: true,
             },
             unscoped_writes: std::collections::BTreeSet::new(),
+            pass_unresolved: false,
         })
         .unwrap();
         let (sql, _params) = q.compile(Dialect::Sqlite).unwrap();
@@ -5066,6 +5203,7 @@ mod tests {
                 require_public: true,
             },
             unscoped_writes: std::collections::BTreeSet::new(),
+            pass_unresolved: false,
         };
         let mut q = Select::from("secret_table");
         // The refusal surfaces at force_scope (join/subquery refs) or compile (base ref).
@@ -5095,6 +5233,7 @@ mod tests {
                 ResolvedScope::Column("tenant_id".to_string()),
             )])),
             unscoped_writes: std::collections::BTreeSet::new(),
+            pass_unresolved: false,
         })
         .unwrap();
         let (sql, _p) = q.compile(Dialect::Sqlite).unwrap();
@@ -5130,6 +5269,7 @@ mod tests {
                 ),
             ])),
             unscoped_writes: std::collections::BTreeSet::new(),
+            pass_unresolved: false,
         };
         // Base-inclusive read: (tenant = A OR tenant IS NULL).
         let mut pack = Select::from("pack");
@@ -5229,6 +5369,7 @@ mod tests {
                 require_public: false, // capability axis (ruling A)
             },
             unscoped_writes: std::collections::BTreeSet::new(),
+            pass_unresolved: false,
         };
         let mut q = Select {
             table_alias: Some("p".into()),
@@ -5297,6 +5438,7 @@ mod tests {
                 require_public: true,
             },
             unscoped_writes: BTreeSet::new(),
+            pass_unresolved: false,
         }
     }
 
@@ -5323,6 +5465,7 @@ mod tests {
                 require_public: false,
             },
             unscoped_writes: BTreeSet::new(),
+            pass_unresolved: false,
         }
     }
 
@@ -5445,6 +5588,7 @@ mod tests {
                 require_public: true,
             },
             unscoped_writes: std::collections::BTreeSet::new(),
+            pass_unresolved: false,
         };
         // INSERT
         let mut ins = Insert {
@@ -5713,6 +5857,7 @@ mod tests {
                 require_public: false, // capability
             },
             unscoped_writes: std::collections::BTreeSet::new(),
+            pass_unresolved: false,
         };
         let mut upd = Update {
             table: "invoices".into(),
@@ -5858,6 +6003,7 @@ mod tests {
                 ),
             ])),
             unscoped_writes: std::collections::BTreeSet::new(),
+            pass_unresolved: false,
         };
         let (sql, params) =
             compile_attach_reference(&scope, &attach_spec(), Dialect::Sqlite).unwrap();
@@ -5912,6 +6058,7 @@ mod tests {
                 require_public: true,
             },
             unscoped_writes: std::collections::BTreeSet::new(),
+            pass_unresolved: false,
         };
         let (sql, params) =
             compile_attach_reference(&scope, &attach_spec(), Dialect::Sqlite).unwrap();
@@ -5981,6 +6128,7 @@ mod tests {
                 require_public: true,
             },
             unscoped_writes: std::collections::BTreeSet::new(),
+            pass_unresolved: false,
         };
         // `price` isn't allowlisted; `visible` is a visibility column — both refused.
         for bad in ["price", "visible", "tenant_id"] {
@@ -6022,6 +6170,7 @@ mod tests {
                 ),
             ])),
             unscoped_writes: std::collections::BTreeSet::new(),
+            pass_unresolved: false,
         };
         let spec = AttachReference {
             set: vec![Assignment {
@@ -6053,6 +6202,7 @@ mod tests {
                 ("countries".to_string(), ResolvedScope::Unscoped),
             ])),
             unscoped_writes: std::collections::BTreeSet::new(),
+            pass_unresolved: false,
         };
         let spec = AttachReference {
             parent: "countries".into(),

@@ -291,6 +291,48 @@ fn default_own() -> AccessMode {
     AccessMode::Own
 }
 
+/// What a [`Tenancy::Scoped`] route does when it resolves **no** principal (no own-tenant value and
+/// no session fact) from any of its [`sources`](Tenancy::Scoped) — the deny-vs-pass choice for an
+/// unresolved request (the archetype: a `domain`-source storefront served on a wildcard host where
+/// the request host matches **no** per-host context). It governs ONLY the pre-handler fate of a
+/// principal-less scoped op; it NEVER relaxes row scoping.
+///
+/// - [`Deny`](Self::Deny) (the default — **today's behavior**): a scoped read/write with no resolved
+///   principal is refused fail-closed (the ORM/raw-SQL confiner's no-principal refusal), so the
+///   handler's first scoped op errors. A route that omits `on_unresolved` is byte-identical to a
+///   pre-v0.12.x config.
+/// - [`Pass`](Self::Pass): the pre-handler deny is relaxed into a **null-principal handler
+///   invocation** — the handler runs with NO resolved tenant (null `app.tenant_id`; NOT `all`, NOT a
+///   fallback/base tenant). The row-level guarantee is **unchanged and absolute**: under a null
+///   principal every scoped READ fails-closed to **ZERO ROWS** (the confiner injects an unsatisfiable
+///   tenant predicate — `1 = 0` — on every table reference, and the Postgres RLS session GUC is left
+///   unset so RLS fail-closes identically), and every scoped WRITE stays **denied** (deny-by-default
+///   for writes is never relaxed by this flag). So `Pass` relaxes ONLY the deny into an empty-scoped
+///   handler invocation: the sole useful thing the handler can then do is a tenant-agnostic response
+///   (a redirect / 404 / neutral landing). A **resolved** host is entirely unaffected either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum OnUnresolved {
+    /// Refuse a principal-less scoped op fail-closed (today's behavior). The default.
+    #[default]
+    Deny,
+    /// Invoke the handler with a null principal; scoped reads fail-closed to zero rows, scoped writes
+    /// stay denied. An opt-in relaxation of the pre-handler deny ONLY.
+    Pass,
+}
+
+impl OnUnresolved {
+    /// Whether this is the default [`Deny`](Self::Deny) — the `skip_serializing_if` predicate that
+    /// keeps a route which does not opt in serializing byte-identically to a pre-v0.12.x config.
+    pub fn is_deny(&self) -> bool {
+        matches!(self, Self::Deny)
+    }
+    /// Whether this route opts into the null-principal pass-through on an unresolved request.
+    pub fn is_pass(&self) -> bool {
+        matches!(self, Self::Pass)
+    }
+}
+
 /// Deserialize an `Option<Tenancy>` config field from **either RON or JSON**, via a `ron::Value`
 /// bridge.
 ///
@@ -391,6 +433,21 @@ pub enum Tenancy {
         /// to plain `Unscoped`) — a defense-in-depth 422, NOT a replacement for the runtime gate.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         unscoped_writes: Vec<String>,
+        /// **Unresolved-request policy** (v0.12.x — the opt-in soft/graceful `domain` source). What
+        /// this route does when it resolves **no** principal (no own-tenant value, no session fact)
+        /// from any of its [`sources`](Self::Scoped) — the deny-vs-pass choice for an unknown/
+        /// unprovisioned request (the archetype: a wildcard-host storefront hitting an unprovisioned
+        /// subdomain, whose `domain` source matches no per-host context). [`Deny`](OnUnresolved::Deny)
+        /// (the default) refuses the principal-less scoped op fail-closed — **today's behavior**;
+        /// [`Pass`](OnUnresolved::Pass) invokes the handler with a NULL principal, where every scoped
+        /// READ fails-closed to ZERO ROWS and every scoped WRITE stays denied (the relaxation is of the
+        /// pre-handler *deny* ONLY — never of row scoping). A SECURITY-relevant sub-field, so it is a
+        /// deliberate, deny-by-default opt-in: a config that omits it is byte-identical to a pre-v0.12.x
+        /// config (the field elides on serialize when [`Deny`](OnUnresolved::Deny)). Being a
+        /// `Scoped`-variant sub-field it is structurally unrepresentable on [`Disabled`](Self::Disabled)
+        /// / [`Target`](Self::Target); a resolved request is entirely unaffected by it.
+        #[serde(default, skip_serializing_if = "OnUnresolved::is_deny")]
+        on_unresolved: OnUnresolved,
     },
     /// **Target** (R4/D8): this route/handler reads (and, with a `write` grant, writes) a SECOND
     /// tenant `B`'s PUBLIC subset (never the caller's own). The non-federated (plain-wasm) analog of
@@ -452,6 +509,20 @@ impl Tenancy {
                 unscoped_writes, ..
             } => unscoped_writes,
             Self::Disabled | Self::Target { .. } => &[],
+        }
+    }
+
+    /// This route's **unresolved-request policy** (v0.12.x — the opt-in soft `domain` source): whether
+    /// a principal-less scoped op [`Deny`](OnUnresolved::Deny)s (today's behavior) or
+    /// [`Pass`](OnUnresolved::Pass)es to a null-principal handler invocation (reads → zero rows, writes
+    /// → denied). [`Deny`](OnUnresolved::Deny) for a [`Disabled`](Self::Disabled) /
+    /// [`Target`](Self::Target) decision (the policy is structurally unrepresentable there, and those
+    /// axes have no own-principal deny for it to relax). The host threads this onto the per-invocation
+    /// host tenancy so the confiner knows whether a missing principal yields the empty set or a refusal.
+    pub fn on_unresolved(&self) -> OnUnresolved {
+        match self {
+            Self::Scoped { on_unresolved, .. } => *on_unresolved,
+            Self::Disabled | Self::Target { .. } => OnUnresolved::Deny,
         }
     }
 
@@ -1014,6 +1085,7 @@ mod tests {
                 exceed_site_ceiling: false,
                 // #503: absent ⇒ empty allowlist (byte-identical to a pre-#503 config).
                 unscoped_writes: Vec::new(),
+                on_unresolved: OnUnresolved::Deny,
             }
         );
         // #503 back-compat: an empty `unscoped_writes` ELIDES on serialize, so a pre-#503 scoped
@@ -1071,6 +1143,82 @@ mod tests {
     }
 
     #[test]
+    fn on_unresolved_defaults_to_deny_elides_and_round_trips_pass() {
+        // v0.12.x back-compat: a scoped config with NO `on_unresolved` defaults to `Deny` (today's
+        // behavior) and the field ELIDES on serialize, so a pre-v0.12.x config round-trips byte-for-byte.
+        let default: Tenancy = serde_json::from_str(
+            r#"{"mode":"scoped","column":"tenant_id","sources":[{"kind":"domain"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(default.on_unresolved(), OnUnresolved::Deny);
+        let out = serde_json::to_string(&default).unwrap();
+        assert!(
+            !out.contains("on_unresolved"),
+            "a Deny (default) on_unresolved must elide on serialize (got {out})"
+        );
+
+        // An explicit `on_unresolved: "pass"` parses (JSON) and round-trips (the field is present only
+        // when non-default).
+        let pass: Tenancy = serde_json::from_str(
+            r#"{"mode":"scoped","column":"tenant_id","sources":[{"kind":"domain"}],"read":"own","write":"none","on_unresolved":"pass"}"#,
+        )
+        .unwrap();
+        assert_eq!(pass.on_unresolved(), OnUnresolved::Pass);
+        let out = serde_json::to_string(&pass).unwrap();
+        assert!(
+            out.contains(r#""on_unresolved":"pass""#),
+            "pass must serialize (got {out})"
+        );
+        assert_eq!(
+            pass,
+            serde_json::from_str::<Tenancy>(&serde_json::to_string(&pass).unwrap()).unwrap(),
+            "on_unresolved: pass must round-trip through JSON"
+        );
+
+        // An explicit `"deny"` parses and is equal to the default (and still elides on re-serialize).
+        let explicit_deny: Tenancy = serde_json::from_str(
+            r#"{"mode":"scoped","column":"tenant_id","sources":[{"kind":"domain"}],"on_unresolved":"deny"}"#,
+        )
+        .unwrap();
+        assert_eq!(explicit_deny.on_unresolved(), OnUnresolved::Deny);
+        assert_eq!(explicit_deny, default);
+
+        // The RON spelling the manifest uses (via the `de_opt_tenancy` bridge) parses identically —
+        // mirrors `de_opt_tenancy_bridges_ron_and_json` below.
+        use serde::Deserialize;
+        #[derive(Debug, Deserialize)]
+        struct W {
+            #[serde(default, deserialize_with = "de_opt_tenancy")]
+            tenancy: Option<Tenancy>,
+        }
+        let ron_opts = ron::Options::default()
+            .with_default_extension(ron::extensions::Extensions::IMPLICIT_SOME);
+        let ron_pass: W = ron_opts
+            .from_str(
+                r#"(tenancy: (mode: "scoped", column: "tenant_id", sources: [(kind: "domain")],
+                    read: "own", write: "none", on_unresolved: "pass"))"#,
+            )
+            .expect("on_unresolved: pass parses from RON via the bridge");
+        assert_eq!(
+            ron_pass.tenancy.unwrap().on_unresolved(),
+            OnUnresolved::Pass
+        );
+        let ron_default: W = ron_opts
+            .from_str(
+                r#"(tenancy: (mode: "scoped", column: "tenant_id", sources: [(kind: "domain")]))"#,
+            )
+            .expect("a RON config with no on_unresolved parses (defaults to Deny)");
+        assert_eq!(
+            ron_default.tenancy.unwrap().on_unresolved(),
+            OnUnresolved::Deny
+        );
+
+        // The policy is `Deny` (structurally unrepresentable → the safe default) for the non-Scoped
+        // decisions.
+        assert_eq!(Tenancy::Disabled.on_unresolved(), OnUnresolved::Deny);
+    }
+
+    #[test]
     fn disabled_is_an_explicit_decision() {
         let t: Tenancy = serde_json::from_str(r#"{"mode":"disabled"}"#).unwrap();
         assert_eq!(t, Tenancy::Disabled);
@@ -1115,6 +1263,7 @@ mod tests {
             write: AccessMode::Own,
             exceed_site_ceiling: false,
             unscoped_writes: Vec::new(),
+            on_unresolved: OnUnresolved::Deny,
         };
         let s = serde_json::to_string(&t).unwrap();
         assert_eq!(t, serde_json::from_str::<Tenancy>(&s).unwrap());
@@ -1260,6 +1409,7 @@ mod tests {
             write,
             exceed_site_ceiling: false,
             unscoped_writes: Vec::new(),
+            on_unresolved: OnUnresolved::Deny,
         }
     }
 
@@ -1279,6 +1429,7 @@ mod tests {
                 write,
                 exceed_site_ceiling: true,
                 unscoped_writes: Vec::new(),
+                on_unresolved: OnUnresolved::Deny,
             },
             _ => unreachable!(),
         }
@@ -1303,6 +1454,7 @@ mod tests {
                 write: Own,
                 exceed_site_ceiling: false,
                 unscoped_writes: Vec::new(),
+                on_unresolved: OnUnresolved::Deny,
             }
             .narrows_within(&scoped(All, All))
         );
@@ -1343,6 +1495,7 @@ mod tests {
                 write,
                 exceed_site_ceiling,
                 unscoped_writes: Vec::new(),
+                on_unresolved: OnUnresolved::Deny,
             },
             _ => unreachable!(),
         };
@@ -1400,6 +1553,7 @@ mod tests {
             write: AccessMode::Own,
             exceed_site_ceiling: false,
             unscoped_writes: Vec::new(),
+            on_unresolved: OnUnresolved::Deny,
         };
         assert!(ctx.declares_signed_context());
         let mixed = Tenancy::Scoped {
@@ -1414,6 +1568,7 @@ mod tests {
             write: AccessMode::Own,
             exceed_site_ceiling: false,
             unscoped_writes: Vec::new(),
+            on_unresolved: OnUnresolved::Deny,
         };
         assert!(mixed.declares_signed_context());
         let no_ctx = Tenancy::Scoped {
@@ -1423,6 +1578,7 @@ mod tests {
             write: AccessMode::Null,
             exceed_site_ceiling: false,
             unscoped_writes: Vec::new(),
+            on_unresolved: OnUnresolved::Deny,
         };
         assert!(!no_ctx.declares_signed_context());
         assert!(!Tenancy::Disabled.declares_signed_context());

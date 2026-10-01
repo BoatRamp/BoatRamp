@@ -695,17 +695,18 @@ jobs:
       - name: Live in-site tenant isolation on a real libsql engine
         run: |
           set -eo pipefail
-          # All seven are `#[ignore]`d (the general workspace lane skips them — a static-musl test
+          # All eight are `#[ignore]`d (the general workspace lane skips them — a static-musl test
           # binary segfaults in libsql); run them explicitly here, unignored, on the host toolchain.
-          # Seven batteries: the Stage 0 single-column model, the Stage 1 per-table-key model, the
+          # Eight batteries: the Stage 0 single-column model, the Stage 1 per-table-key model, the
           # Stage 3 anonymous-first (TenantOrSession) disjunct, the Stage 4 durable signed-context
           # lane (publish->claim->verify->scope on a real messaging store + libsql), the #503
-          # write-global / per-route-allowlist model on a real non-RLS libsql engine, and (v0.10.0)
-          # the grouped-aggregate cross-tenant PRE-AGGREGATION gate + its LEFT-JOIN semantics companion.
+          # write-global / per-route-allowlist model on a real non-RLS libsql engine, (v0.10.0)
+          # the grouped-aggregate cross-tenant PRE-AGGREGATION gate + its LEFT-JOIN semantics companion,
+          # and (v0.12.x) the opt-in `on_unresolved: pass` null-principal pass-through (zero-rows) gate.
           cargo test -p boatramp-storage \
             --features sql --test orm_tenant_isolation -- --ignored --nocapture 2>&1 | tee orm-tenancy.log
-          grep -qE 'test result: ok\. 7 passed' orm-tenancy.log \
-            || { echo "::error::ORM tenant isolation tests did not all pass (silent skip or failure? count drifted from 7?)" >&2; exit 1; }
+          grep -qE 'test result: ok\. 8 passed' orm-tenancy.log \
+            || { echo "::error::ORM tenant isolation tests did not all pass (silent skip or failure? count drifted from 8?)" >&2; exit 1; }
           grep -q 'ORM IN-SITE TENANT ISOLATION OK' orm-tenancy.log \
             || { echo "::error::ORM tenant isolation never reached its success marker (a cross-tenant breach or a skipped test)" >&2; exit 1; }
           grep -q 'ORM PER-TABLE-KEY TENANCY OK' orm-tenancy.log \
@@ -720,6 +721,8 @@ jobs:
             || { echo "::error::ORM grouped-aggregate gate never reached its marker (a GROUP BY aggregating across tenants, or a skipped test)" >&2; exit 1; }
           grep -q 'ORM LEFT-JOIN AGGREGATE SEMANTICS OK' orm-tenancy.log \
             || { echo "::error::ORM LEFT-JOIN aggregate semantics never reached its marker (a skipped test)" >&2; exit 1; }
+          grep -q 'DOMAIN-SOURCE UNRESOLVED PASS-THROUGH OK' orm-tenancy.log \
+            || { echo "::error::v0.12.x on_unresolved:pass gate never reached its marker (a null-principal scoped read leaked rows, a resolved host regressed, a write was allowed, or a skipped test)" >&2; exit 1; }
           # v0.10.0 grouped-aggregate gate is MUTATION-VERIFIED: dropping the pre-aggregation force_scope
           # (BOATRAMP_ORMGROUPBY_MUTATION=skip_scope) leaks another tenant's rows into the grouped
           # aggregates, so the gate's equality-to-single-tenant baseline MUST fail. A pass-under-mutation
@@ -732,6 +735,20 @@ jobs:
             exit 1
           else
             echo "orm group-by mutation verified: skip_scope leaks tenant B's rows into the aggregates → the gate fails as expected."
+          fi
+          # v0.12.x on_unresolved:pass gate is MUTATION-VERIFIED: `skip_confine` makes the null-principal
+          # pass path run the scoped read WITHOUT the zero-row confinement (treats a null principal as
+          # all-rows), so the unresolved-host read leaks BOTH tenants' rows and the ZERO-ROWS assertion
+          # MUST fail. A pass-under-mutation (a hollow gate) fails the merge — proving the pass-through
+          # relaxes ONLY the pre-handler deny, never the row scoping.
+          if BOATRAMP_DOMAINPASS_MUTATION=skip_confine cargo test -p boatramp-storage --features sql \
+            --test orm_tenant_isolation -- --ignored \
+            domain_source_unresolved_pass_through_is_null_scoped_to_zero_rows_on_a_real_engine \
+            > domainpass-mutation.log 2>&1; then
+            echo "::error::on_unresolved:pass gate is HOLLOW — it passed under skip_confine (a null-principal pass read can see other tenants' rows)" >&2
+            exit 1
+          else
+            echo "domain-pass mutation verified: skip_confine leaks both tenants' rows into the null-principal read → the gate fails as expected."
           fi
       - name: Owner-gated schema-migration libsql/SQLite parity SUBSTRATE on a real embedded file
         run: |
