@@ -85,7 +85,7 @@ use libsql::{Builder, Connection, Database, Value as LibsqlValue};
 #[cfg(feature = "sql")]
 use std::path::Path;
 
-#[cfg(feature = "sql-postgres")]
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
 use boatramp_core::sql::{SqlBackend, SqlTransaction, SqlValue};
 
 /// How long a contended writer waits for the single-writer lock before erroring (local SQLite).
@@ -94,11 +94,11 @@ use boatramp_core::sql::{SqlBackend, SqlTransaction, SqlValue};
 #[cfg(feature = "sql")]
 const BUSY_TIMEOUT_MS: u32 = 5_000;
 
-/// The default Postgres pool size (MF-2: a shared-mode CAS wants ≥16 connections so a burst of
-/// concurrent control-plane writers genuinely contends rather than queueing on the pool). The
-/// operator overrides it via `[serve.kv.sql] pool_max`.
-#[cfg(feature = "sql-postgres")]
-const DEFAULT_PG_POOL_MAX: u32 = 16;
+/// The default external-SQL (Postgres/MySQL) pool size (MF-2: a shared-mode CAS wants ≥16
+/// connections so a burst of concurrent control-plane writers genuinely contends on the DB rather
+/// than queueing on the pool). The operator overrides it via `[serve.kv.sql] pool_max`.
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+const DEFAULT_SQLX_POOL_MAX: u32 = 16;
 
 /// The fixed set of host-authored statements for one SQL dialect. Every field is `&'static` so the
 /// whole set is `Copy` and resolved once at open ([`statements_for`]); the placeholders are the
@@ -201,16 +201,77 @@ const POSTGRES_STATEMENTS: KvStatements = KvStatements {
                  ON CONFLICT(key) DO NOTHING",
 };
 
+/// MySQL / MariaDB statement set (feature `sql-mysql`; build-order step 6 / MF-2 MySQL shape). It
+/// differs from the Postgres text in three ways MySQL forces:
+///
+/// 1. **Key column shape (the InnoDB index-length decision).** `key` is a **`VARBINARY(768)` PRIMARY
+///    KEY** holding the WHOLE key (not a prefix). 768 bytes sits inside InnoDB's 3072-byte index-key
+///    limit (MySQL 8 / MariaDB 10.4+ `DYNAMIC` row format, the default) and is far above any real
+///    control-plane key (short namespaced ASCII — `secret/{project}/{name}`, `_cp/leader`,
+///    policy/messaging keys). A key longer than 768 bytes **fails loud** under the default strict
+///    `sql_mode` (`Data too long for column 'key'`), never a silent truncation — so this is NOT a
+///    prefix-indexed `BLOB` PK (which would let two keys sharing a 768-byte prefix COLLIDE on the PK
+///    and corrupt a CAS/get); the full key is the index, so comparison is exact. `value` is
+///    `LONGBLOB` (no index, up to 4 GiB). `VARBINARY`/`LONGBLOB` both use the binary collation, so
+///    `=`, `<`, and `ORDER BY` are bytewise — matching the SQLite BLOB / Postgres BYTEA ordering the
+///    shared conformance suite asserts.
+/// 2. **Reserved word quoting.** `key` is a reserved word in MySQL, so every reference is
+///    backtick-quoted (`` `key` ``); `value` is quoted for symmetry.
+/// 3. **Upsert / absent-key CAS syntax.** MySQL has no `ON CONFLICT`: the plain put upserts with
+///    `ON DUPLICATE KEY UPDATE` (`VALUES(col)` — the MySQL-and-MariaDB-portable form), and the
+///    absent-key CAS is **`INSERT IGNORE`** (winner iff `rows_affected == 1`; a duplicate key is
+///    ignored → 0 rows). The present-key CAS is the SAME `UPDATE … WHERE … AND value = ?3` as
+///    Postgres — explicitly **NOT** `ON DUPLICATE KEY UPDATE` (which takes no `WHERE`, so it could
+///    not express the value guard). `seq` is `BIGINT AUTO_INCREMENT` (MySQL's `BIGSERIAL`).
+#[cfg(feature = "sql-mysql")]
+const MYSQL_STATEMENTS: KvStatements = KvStatements {
+    ddl: &[
+        "CREATE TABLE IF NOT EXISTS kv (\
+         `key` VARBINARY(768) PRIMARY KEY, \
+         `value` LONGBLOB NOT NULL, \
+         version BIGINT NOT NULL\
+         )",
+        "CREATE TABLE IF NOT EXISTS kv_changes (\
+         seq BIGINT PRIMARY KEY AUTO_INCREMENT, \
+         `key` VARBINARY(768) NOT NULL, \
+         version BIGINT NOT NULL, \
+         ts BIGINT NOT NULL\
+         )",
+    ],
+    get: "SELECT `value` FROM kv WHERE `key` = ?1",
+    upsert: "INSERT INTO kv (`key`, `value`, version) VALUES (?1, ?2, 1) \
+             ON DUPLICATE KEY UPDATE `value` = VALUES(`value`), version = version + 1",
+    append_change: "INSERT INTO kv_changes (`key`, version, ts) \
+                    SELECT `key`, version, ?2 FROM kv WHERE `key` = ?1",
+    delete: "DELETE FROM kv WHERE `key` = ?1",
+    delete_change: "INSERT INTO kv_changes (`key`, version, ts) VALUES (?1, 0, ?2)",
+    list_prefix_bounded: "SELECT `key` FROM kv WHERE `key` >= ?1 AND `key` < ?2 ORDER BY `key`",
+    list_prefix_all: "SELECT `key` FROM kv WHERE `key` >= ?1 ORDER BY `key`",
+    list_from_bounded: "SELECT `key` FROM kv WHERE `key` > ?1 AND `key` < ?2 ORDER BY `key` LIMIT ?3",
+    list_from_all: "SELECT `key` FROM kv WHERE `key` > ?1 ORDER BY `key` LIMIT ?2",
+    cas_present: "UPDATE kv SET `value` = ?2, version = version + 1 WHERE `key` = ?1 AND `value` = ?3",
+    cas_absent: "INSERT IGNORE INTO kv (`key`, `value`, version) VALUES (?1, ?2, 1)",
+};
+
 /// Resolve the statement set for `dialect`. Each arm is gated on the engine feature that CONSTRUCTS
-/// that dialect (SQLite → `sql`, Postgres → `sql-postgres`), so an un-built dialect has no statement
-/// set and is unreachable — the only constructors ([`SqlKv::open_sqlite_local`] /
-/// [`SqlKv::open_postgres`]) pin a dialect that is always compiled in their own build.
+/// that dialect (SQLite → `sql`, Postgres → `sql-postgres`, MySQL → `sql-mysql`), so an un-built
+/// dialect has no statement set and is unreachable — the only constructors
+/// ([`SqlKv::open_sqlite_local`] / [`SqlKv::open_postgres`] / [`SqlKv::open_mysql`]) pin a dialect
+/// that is always compiled in their own build. The catch-all is the safety net for a build with
+/// fewer-than-all dialect features (with all three on, the match is exhaustive, so it is allowed to
+/// be unreachable).
+#[cfg_attr(
+    all(feature = "sql", feature = "sql-postgres", feature = "sql-mysql"),
+    allow(unreachable_patterns)
+)]
 fn statements_for(dialect: Dialect) -> KvStatements {
     match dialect {
         #[cfg(feature = "sql")]
         Dialect::Sqlite => SQLITE_STATEMENTS,
         #[cfg(feature = "sql-postgres")]
         Dialect::Postgres => POSTGRES_STATEMENTS,
+        #[cfg(feature = "sql-mysql")]
+        Dialect::Mysql => MYSQL_STATEMENTS,
         other => unreachable!(
             "SqlKv has no statement set for {other:?} in this build (its engine feature is off); \
              the constructors only pin a dialect compiled in their own build"
@@ -228,6 +289,11 @@ enum Backing {
     /// a transaction through the `SqlBackend`, which rewrites `?N` → `$N` and marshals values.
     #[cfg(feature = "sql-postgres")]
     Postgres(Arc<dyn SqlBackend>),
+    /// An external MySQL / MariaDB primary over the same sqlx pool layer (multi-writer). Shares the
+    /// Postgres op helpers (both drive the dialect-agnostic `SqlBackend`); only the statement set
+    /// and the durability check differ. The `SqlBackend` rewrites `?N` → positional `?`.
+    #[cfg(feature = "sql-mysql")]
+    Mysql(Arc<dyn SqlBackend>),
 }
 
 /// A SQL-backed [`KvStore`]. Backed by an embedded SQLite file ([`open_sqlite_local`](Self::open_sqlite_local),
@@ -277,7 +343,7 @@ impl SqlKv {
     /// sqlx pool layer ([`connect`](crate::sql_sqlx::connect) /
     /// [`ExternalSqlOptions`](crate::sql_sqlx::ExternalSqlOptions)). The pool is lazy (the first
     /// statement below forces the first connection); `pool_max` caps it (default
-    /// [`DEFAULT_PG_POOL_MAX`] = 16 — MF-2 wants ≥16 so concurrent control-plane writers contend on
+    /// [`DEFAULT_SQLX_POOL_MAX`] = 16 — MF-2 wants ≥16 so concurrent control-plane writers contend on
     /// the DB, not the pool). `url` is the connection URL resolved from its `url_env` by the caller —
     /// never a raw URL in config (UX-C2).
     ///
@@ -296,7 +362,9 @@ impl SqlKv {
         pool_max: Option<u32>,
     ) -> Result<Self, KvError> {
         use crate::sql_sqlx::{ExternalSqlKind, ExternalSqlOptions, connect};
-        let max = pool_max.filter(|n| *n >= 1).unwrap_or(DEFAULT_PG_POOL_MAX);
+        let max = pool_max
+            .filter(|n| *n >= 1)
+            .unwrap_or(DEFAULT_SQLX_POOL_MAX);
         let opts = ExternalSqlOptions::new(url).with_max_connections(Some(max));
         let backend = connect(ExternalSqlKind::Postgres, &opts).map_err(sql_err)?;
         // C6 / MF-5: a committed txn must be durable before a put/CAS returns. This also forces the
@@ -314,6 +382,51 @@ impl SqlKv {
     }
 }
 
+#[cfg(feature = "sql-mysql")]
+impl SqlKv {
+    /// Open an external **MySQL / MariaDB primary** as the multi-writer control-plane KV, over the
+    /// SAME sqlx pool layer ([`connect`](crate::sql_sqlx::connect) /
+    /// [`ExternalSqlOptions`](crate::sql_sqlx::ExternalSqlOptions)) the Postgres path uses. The pool
+    /// is lazy (the durability check below forces the first connection); `pool_max` caps it (default
+    /// [`DEFAULT_SQLX_POOL_MAX`] = 16 — MF-2 wants ≥16 so concurrent control-plane writers contend on
+    /// the DB, not the pool). `url` is resolved from its `url_env` by the caller (UX-C2).
+    ///
+    /// Enforces the C6/MF-5 **durable-commit contract** at open: reads
+    /// `innodb_flush_log_at_trx_commit` AND `sync_binlog` and FAILS LOUD unless BOTH are `1` (the
+    /// InnoDB defaults of `2` / `0` can lose a committed transaction — e.g. a token revoke — on an OS
+    /// crash or power loss). This is the MySQL analogue of the Postgres `synchronous_commit = on`
+    /// check. Then creates the `kv` + `kv_changes` tables idempotently (host-owned DDL, C9).
+    ///
+    /// **Custody (MF-6):** identical to the Postgres path — this database holds only SEALED
+    /// ciphertext for secrets (sealing is pre-put) plus plaintext control-plane config/RBAC; the
+    /// envelope KEK is NEVER written here, and `kv_changes` carries key + version only (no value
+    /// bytes). The operator MUST disable SQL statement/parameter logging on this database/role and
+    /// require TLS on `url`.
+    pub async fn open_mysql(
+        url: impl Into<String>,
+        pool_max: Option<u32>,
+    ) -> Result<Self, KvError> {
+        use crate::sql_sqlx::{ExternalSqlKind, ExternalSqlOptions, connect};
+        let max = pool_max
+            .filter(|n| *n >= 1)
+            .unwrap_or(DEFAULT_SQLX_POOL_MAX);
+        let opts = ExternalSqlOptions::new(url).with_max_connections(Some(max));
+        let backend = connect(ExternalSqlKind::Mysql, &opts).map_err(sql_err)?;
+        // C6 / MF-5: a committed txn must be durable before a put/CAS returns. This also forces the
+        // first (lazy) connection, so a connect failure surfaces here.
+        assert_mysql_durability(backend.as_ref()).await?;
+        let stmts = statements_for(Dialect::Mysql);
+        for ddl in stmts.ddl {
+            backend.run_script(ddl).await.map_err(sql_err)?;
+        }
+        Ok(Self {
+            backing: Backing::Mysql(backend),
+            dialect: Dialect::Mysql,
+            stmts,
+        })
+    }
+}
+
 #[async_trait]
 impl KvStore for SqlKv {
     async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, KvError> {
@@ -321,7 +434,9 @@ impl KvStore for SqlKv {
             #[cfg(feature = "sql")]
             Backing::Sqlite(db) => sqlite_get(db, &self.stmts, key).await,
             #[cfg(feature = "sql-postgres")]
-            Backing::Postgres(b) => pg_get(b.as_ref(), &self.stmts, key).await,
+            Backing::Postgres(b) => sqlx_get(b.as_ref(), &self.stmts, key).await,
+            #[cfg(feature = "sql-mysql")]
+            Backing::Mysql(b) => sqlx_get(b.as_ref(), &self.stmts, key).await,
         }
     }
 
@@ -331,7 +446,16 @@ impl KvStore for SqlKv {
             Backing::Sqlite(db) => sqlite_put(db, &self.stmts, key, value).await,
             #[cfg(feature = "sql-postgres")]
             Backing::Postgres(b) => {
-                pg_write_batch(
+                sqlx_write_batch(
+                    b.as_ref(),
+                    &self.stmts,
+                    vec![WriteOp::Put(key.to_string(), value)],
+                )
+                .await
+            }
+            #[cfg(feature = "sql-mysql")]
+            Backing::Mysql(b) => {
+                sqlx_write_batch(
                     b.as_ref(),
                     &self.stmts,
                     vec![WriteOp::Put(key.to_string(), value)],
@@ -347,7 +471,16 @@ impl KvStore for SqlKv {
             Backing::Sqlite(db) => sqlite_delete(db, &self.stmts, key).await,
             #[cfg(feature = "sql-postgres")]
             Backing::Postgres(b) => {
-                pg_write_batch(
+                sqlx_write_batch(
+                    b.as_ref(),
+                    &self.stmts,
+                    vec![WriteOp::Delete(key.to_string())],
+                )
+                .await
+            }
+            #[cfg(feature = "sql-mysql")]
+            Backing::Mysql(b) => {
+                sqlx_write_batch(
                     b.as_ref(),
                     &self.stmts,
                     vec![WriteOp::Delete(key.to_string())],
@@ -362,7 +495,9 @@ impl KvStore for SqlKv {
             #[cfg(feature = "sql")]
             Backing::Sqlite(db) => sqlite_list_prefix(db, &self.stmts, prefix).await,
             #[cfg(feature = "sql-postgres")]
-            Backing::Postgres(b) => pg_list_prefix(b.as_ref(), &self.stmts, prefix).await,
+            Backing::Postgres(b) => sqlx_list_prefix(b.as_ref(), &self.stmts, prefix).await,
+            #[cfg(feature = "sql-mysql")]
+            Backing::Mysql(b) => sqlx_list_prefix(b.as_ref(), &self.stmts, prefix).await,
         }
     }
 
@@ -377,7 +512,11 @@ impl KvStore for SqlKv {
             Backing::Sqlite(db) => sqlite_list_from(db, &self.stmts, prefix, after, limit).await,
             #[cfg(feature = "sql-postgres")]
             Backing::Postgres(b) => {
-                pg_list_from(b.as_ref(), &self.stmts, prefix, after, limit).await
+                sqlx_list_from(b.as_ref(), &self.stmts, prefix, after, limit).await
+            }
+            #[cfg(feature = "sql-mysql")]
+            Backing::Mysql(b) => {
+                sqlx_list_from(b.as_ref(), &self.stmts, prefix, after, limit).await
             }
         }
     }
@@ -394,7 +533,9 @@ impl KvStore for SqlKv {
             #[cfg(feature = "sql")]
             Backing::Sqlite(db) => sqlite_write_batch(db, &self.stmts, ops).await,
             #[cfg(feature = "sql-postgres")]
-            Backing::Postgres(b) => pg_write_batch(b.as_ref(), &self.stmts, ops).await,
+            Backing::Postgres(b) => sqlx_write_batch(b.as_ref(), &self.stmts, ops).await,
+            #[cfg(feature = "sql-mysql")]
+            Backing::Mysql(b) => sqlx_write_batch(b.as_ref(), &self.stmts, ops).await,
         }
     }
 
@@ -417,7 +558,13 @@ impl KvStore for SqlKv {
             #[cfg(feature = "sql")]
             Backing::Sqlite(db) => sqlite_cas(db, &self.stmts, key, expected, new).await,
             #[cfg(feature = "sql-postgres")]
-            Backing::Postgres(b) => pg_cas(b.as_ref(), &self.stmts, key, expected, new).await,
+            Backing::Postgres(b) => {
+                sqlx_cas(b.as_ref(), &self.stmts, self.dialect, key, expected, new).await
+            }
+            #[cfg(feature = "sql-mysql")]
+            Backing::Mysql(b) => {
+                sqlx_cas(b.as_ref(), &self.stmts, self.dialect, key, expected, new).await
+            }
         }
     }
 
@@ -433,7 +580,9 @@ impl KvStore for SqlKv {
 }
 
 // ---------------------------------------------------------------------------
-// Postgres (feature `sql-postgres`) — over the existing sqlx `SqlBackend` layer.
+// External SQL (Postgres `sql-postgres` / MySQL `sql-mysql`) — over the existing sqlx `SqlBackend`
+// layer. Both multi-writer backings share these op helpers (the `SqlBackend` is dialect-agnostic;
+// only the per-dialect `KvStatements` and the open-time durability check differ).
 // ---------------------------------------------------------------------------
 
 /// Read `synchronous_commit` on the primary and FAIL LOUD unless it is `on` (C6 / MF-5). A SELECT of
@@ -468,8 +617,79 @@ async fn assert_synchronous_commit_on(backend: &dyn SqlBackend) -> Result<(), Kv
     Ok(())
 }
 
-#[cfg(feature = "sql-postgres")]
-async fn pg_get(
+/// Read the two InnoDB durability globals and FAIL LOUD unless BOTH are `1` (C6 / MF-5) — the MySQL
+/// analogue of the Postgres `synchronous_commit = on` check. `innodb_flush_log_at_trx_commit = 1`
+/// fsyncs the redo log at every COMMIT; `sync_binlog = 1` fsyncs the binary log per commit. The
+/// InnoDB/MySQL defaults of `2` and `0` can lose a committed transaction (a token revoke, a secret
+/// rotation) on an OS crash or power loss — the exact lost-write the crown-jewel CAS defends against,
+/// undone one layer down. Reads each via `SHOW GLOBAL VARIABLES LIKE '<const>'` (no special
+/// privilege, and placeholder-clean so it passes the `?N` normalizer — `@@global.x` would be rejected
+/// as an `@name` placeholder). Forces the first (lazy) pool connection, so a connect failure surfaces
+/// here at open.
+#[cfg(feature = "sql-mysql")]
+async fn assert_mysql_durability(backend: &dyn SqlBackend) -> Result<(), KvError> {
+    let flush = read_mysql_global_i64(backend, "innodb_flush_log_at_trx_commit").await?;
+    let sync_binlog = read_mysql_global_i64(backend, "sync_binlog").await?;
+    mysql_durability_ok(flush, sync_binlog).map_err(KvError::backend)
+}
+
+/// The pure durability decision (unit-tested without a DB): both globals must be exactly `1`,
+/// otherwise an actionable fail-loud message naming the offending setting(s) and the cure.
+#[cfg(feature = "sql-mysql")]
+fn mysql_durability_ok(flush: i64, sync_binlog: i64) -> Result<(), String> {
+    if flush == 1 && sync_binlog == 1 {
+        return Ok(());
+    }
+    Err(format!(
+        "MySQL is not configured for durable commits: \
+         `innodb_flush_log_at_trx_commit` = {flush} (need 1) and `sync_binlog` = {sync_binlog} \
+         (need 1). The defaults (2 / 0) can lose a committed control-plane write (e.g. a token \
+         revoke or secret rotation) on an OS crash or power loss. Set BOTH \
+         `innodb_flush_log_at_trx_commit = 1` and `sync_binlog = 1` on the KV server before using \
+         MySQL as the boatramp control-plane KV."
+    ))
+}
+
+/// Read one MySQL GLOBAL system variable as an `i64` via `SHOW GLOBAL VARIABLES LIKE '<var>'` (which
+/// returns a single `(Variable_name, Value)` row — read the `Value` column). `var` is ALWAYS a
+/// host-fixed constant (never guest input), so interpolating it into the `LIKE` literal is safe.
+#[cfg(feature = "sql-mysql")]
+async fn read_mysql_global_i64(backend: &dyn SqlBackend, var: &str) -> Result<i64, KvError> {
+    let sql = format!("SHOW GLOBAL VARIABLES LIKE '{var}'");
+    let mut tx = backend.begin_read_only().await.map_err(sql_err)?;
+    let rows = tx.query(&sql, &[]).await.map_err(sql_err)?;
+    tx.commit().await.map_err(sql_err)?;
+    // `SHOW VARIABLES` → row `(Variable_name, Value)`; the value is column index 1.
+    let cell = rows
+        .rows
+        .into_iter()
+        .next()
+        .and_then(|r| r.into_iter().nth(1))
+        .ok_or_else(|| {
+            KvError::backend(format!(
+                "could not read MySQL global `{var}` (no row returned)"
+            ))
+        })?;
+    sql_cell_i64(cell)
+        .ok_or_else(|| KvError::backend(format!("MySQL global `{var}` is not an integer")))
+}
+
+/// Coerce a SQL cell to `i64` for a system-variable read: a native integer, or a text/blob value
+/// parsed as decimal (the `Value` column of `SHOW VARIABLES` comes back as a string).
+#[cfg(feature = "sql-mysql")]
+fn sql_cell_i64(value: SqlValue) -> Option<i64> {
+    match value {
+        SqlValue::Integer(n) => Some(n),
+        SqlValue::Text(s) => s.trim().parse().ok(),
+        SqlValue::Blob(b) => std::str::from_utf8(&b)
+            .ok()
+            .and_then(|s| s.trim().parse().ok()),
+        _ => None,
+    }
+}
+
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+async fn sqlx_get(
     backend: &dyn SqlBackend,
     stmts: &KvStatements,
     key: &str,
@@ -486,7 +706,7 @@ async fn pg_get(
                 .into_iter()
                 .next()
                 .ok_or_else(|| KvError::backend("kv get row had no columns"))?;
-            Ok(Some(pg_bytes(cell)?))
+            Ok(Some(sqlx_bytes(cell)?))
         }
         None => Ok(None),
     }
@@ -494,8 +714,8 @@ async fn pg_get(
 
 /// Apply one put inside an already-open transaction: upsert (version bump) + append the post-write
 /// version to the change log.
-#[cfg(feature = "sql-postgres")]
-async fn pg_apply_put(
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+async fn sqlx_apply_put(
     tx: &mut dyn SqlTransaction,
     stmts: &KvStatements,
     key: &str,
@@ -528,8 +748,8 @@ async fn pg_apply_put(
 /// Apply one delete inside an already-open transaction: remove the row and, only if a row was
 /// actually removed, append a `version = 0` tombstone (deleting a missing key is a no-op per the
 /// trait contract, so it leaves the change log untouched).
-#[cfg(feature = "sql-postgres")]
-async fn pg_apply_delete(
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+async fn sqlx_apply_delete(
     tx: &mut dyn SqlTransaction,
     stmts: &KvStatements,
     key: &str,
@@ -550,8 +770,8 @@ async fn pg_apply_delete(
 
 /// Apply all `ops` in ONE transaction (all-or-nothing — `atomic_write_batch` is `true`): on any error
 /// roll back and surface it; otherwise commit. `put`/`delete` route here as single-op batches.
-#[cfg(feature = "sql-postgres")]
-async fn pg_write_batch(
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+async fn sqlx_write_batch(
     backend: &dyn SqlBackend,
     stmts: &KvStatements,
     ops: Vec<WriteOp>,
@@ -560,8 +780,8 @@ async fn pg_write_batch(
     let mut tx = backend.begin().await.map_err(sql_err)?;
     for op in &ops {
         let res = match op {
-            WriteOp::Put(key, value) => pg_apply_put(tx.as_mut(), stmts, key, value, ts).await,
-            WriteOp::Delete(key) => pg_apply_delete(tx.as_mut(), stmts, key, ts).await,
+            WriteOp::Put(key, value) => sqlx_apply_put(tx.as_mut(), stmts, key, value, ts).await,
+            WriteOp::Delete(key) => sqlx_apply_delete(tx.as_mut(), stmts, key, ts).await,
         };
         if let Err(e) = res {
             let _ = tx.rollback().await;
@@ -576,7 +796,7 @@ async fn pg_write_batch(
 /// below drops its value predicate (present-key UPDATE becomes unconditional; absent-key insert
 /// becomes an unconditional upsert), making EVERY racer a winner — the gate's concurrency assertion
 /// then MUST go RED (two+ winners), proving the predicate is load-bearing.
-#[cfg(feature = "sql-postgres")]
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
 fn cas_mutation_drops_predicate() -> bool {
     #[cfg(test)]
     {
@@ -590,10 +810,11 @@ fn cas_mutation_drops_predicate() -> bool {
 
 /// Decide the CAS winner with ONE value-predicate statement (winner iff `rows_affected == 1`), then
 /// append a change-log row ONLY for the winner — all inside `tx`. Never a follow-up `SELECT`.
-#[cfg(feature = "sql-postgres")]
-async fn pg_apply_cas(
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+async fn sqlx_apply_cas(
     tx: &mut dyn SqlTransaction,
     stmts: &KvStatements,
+    dialect: Dialect,
     key: &str,
     expected: Option<&[u8]>,
     new: Vec<u8>,
@@ -607,11 +828,15 @@ async fn pg_apply_cas(
             // present-key: winner iff the row's current value still equals `expected`.
             let (sql, params): (&str, Vec<SqlValue>) = if mutate {
                 // MUTATION: drop `AND value=?3` → the UPDATE always matches the key, so every racer
-                // reports rows_affected == 1 and "wins" (bind only ?1, ?2 so the normalizer accepts it).
-                (
-                    "UPDATE kv SET value = ?2, version = version + 1 WHERE key = ?1",
-                    vec![key_blob.clone(), new_blob],
-                )
+                // reports rows_affected == 1 and "wins" (bind only ?1, ?2 so the normalizer accepts
+                // it). The identifier quoting is dialect-correct so the mutation produces the real
+                // multiple-winners failure (not an incidental syntax error): MySQL reserves `key`.
+                let sql = if dialect == Dialect::Mysql {
+                    "UPDATE kv SET `value` = ?2, version = version + 1 WHERE `key` = ?1"
+                } else {
+                    "UPDATE kv SET value = ?2, version = version + 1 WHERE key = ?1"
+                };
+                (sql, vec![key_blob.clone(), new_blob])
             } else {
                 (
                     stmts.cas_present,
@@ -627,10 +852,12 @@ async fn pg_apply_cas(
         None => {
             // absent-key: winner iff THIS statement inserted the row.
             let sql = if mutate {
-                // MUTATION: turn `DO NOTHING` into an unconditional upsert → every racer affects a
-                // row and "wins".
-                "INSERT INTO kv (key, value, version) VALUES (?1, ?2, 1) \
-                 ON CONFLICT(key) DO UPDATE SET value = excluded.value, version = kv.version + 1"
+                // MUTATION: replace the absent-ONLY guard (`ON CONFLICT DO NOTHING` / `INSERT
+                // IGNORE`) with the UNCONDITIONAL upsert (the plain-put statement) — `stmts.upsert`,
+                // so it stays dialect-correct (Postgres `ON CONFLICT DO UPDATE`, MySQL `ON DUPLICATE
+                // KEY UPDATE`). On Postgres every racer then affects a row and "wins"; the present-key
+                // arm above forces the gate RED on either engine regardless.
+                stmts.upsert
             } else {
                 stmts.cas_absent
             };
@@ -648,17 +875,18 @@ async fn pg_apply_cas(
     Ok(won)
 }
 
-#[cfg(feature = "sql-postgres")]
-async fn pg_cas(
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+async fn sqlx_cas(
     backend: &dyn SqlBackend,
     stmts: &KvStatements,
+    dialect: Dialect,
     key: &str,
     expected: Option<&[u8]>,
     new: Vec<u8>,
 ) -> Result<bool, KvError> {
     let ts = now_ts();
     let mut tx = backend.begin().await.map_err(sql_err)?;
-    let won = match pg_apply_cas(tx.as_mut(), stmts, key, expected, new, ts).await {
+    let won = match sqlx_apply_cas(tx.as_mut(), stmts, dialect, key, expected, new, ts).await {
         Ok(won) => won,
         Err(e) => {
             let _ = tx.rollback().await;
@@ -669,8 +897,8 @@ async fn pg_cas(
     Ok(won)
 }
 
-#[cfg(feature = "sql-postgres")]
-async fn pg_list_prefix(
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+async fn sqlx_list_prefix(
     backend: &dyn SqlBackend,
     stmts: &KvStatements,
     prefix: &str,
@@ -683,11 +911,11 @@ async fn pg_list_prefix(
         ),
         None => (stmts.list_prefix_all, vec![SqlValue::Blob(lower)]),
     };
-    pg_collect_keys(backend, sql, &params).await
+    sqlx_collect_keys(backend, sql, &params).await
 }
 
-#[cfg(feature = "sql-postgres")]
-async fn pg_list_from(
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+async fn sqlx_list_from(
     backend: &dyn SqlBackend,
     stmts: &KvStatements,
     prefix: &str,
@@ -705,13 +933,13 @@ async fn pg_list_from(
         ),
         None => (stmts.list_from_all, vec![SqlValue::Blob(start), lim]),
     };
-    pg_collect_keys(backend, sql, &params).await
+    sqlx_collect_keys(backend, sql, &params).await
 }
 
 /// Run a read-only `SELECT key …` and collect its first column (keys), decoded from BYTEA back to the
 /// `String` keys.
-#[cfg(feature = "sql-postgres")]
-async fn pg_collect_keys(
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+async fn sqlx_collect_keys(
     backend: &dyn SqlBackend,
     sql: &str,
     params: &[SqlValue],
@@ -725,7 +953,7 @@ async fn pg_collect_keys(
             .into_iter()
             .next()
             .ok_or_else(|| KvError::backend("kv list row had no columns"))?;
-        let bytes = pg_bytes(cell)?;
+        let bytes = sqlx_bytes(cell)?;
         out.push(
             String::from_utf8(bytes)
                 .map_err(|e| KvError::backend(format!("kv key is not valid UTF-8: {e}")))?,
@@ -737,8 +965,8 @@ async fn pg_collect_keys(
 /// Decode a `value`/`key` cell back to bytes. A BYTEA column decodes to [`SqlValue::Blob`] (empty
 /// value ⇒ empty blob, distinct from an absent key); a `Text`/`Null` arm is defensive. Any other
 /// value class is a schema bug → error.
-#[cfg(feature = "sql-postgres")]
-fn pg_bytes(value: SqlValue) -> Result<Vec<u8>, KvError> {
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+fn sqlx_bytes(value: SqlValue) -> Result<Vec<u8>, KvError> {
     match value {
         SqlValue::Blob(bytes) => Ok(bytes),
         SqlValue::Text(text) => Ok(text.into_bytes()),
@@ -750,7 +978,7 @@ fn pg_bytes(value: SqlValue) -> Result<Vec<u8>, KvError> {
 }
 
 /// Map a `boatramp_core::sql` error into the crate-facing [`KvError`].
-#[cfg(feature = "sql-postgres")]
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
 fn sql_err(err: boatramp_core::sql::SqlError) -> KvError {
     KvError::backend(err.to_string())
 }
@@ -1169,6 +1397,8 @@ mod sqlite_tests {
                 Backing::Postgres(_) => {
                     Err(KvError::backend("sqlite_test_conn on a Postgres SqlKv"))
                 }
+                #[cfg(feature = "sql-mysql")]
+                Backing::Mysql(_) => Err(KvError::backend("sqlite_test_conn on a MySQL SqlKv")),
             }
         }
     }
@@ -1399,6 +1629,8 @@ mod pg_tests {
                 .expect("reset kv tables"),
             #[cfg(feature = "sql")]
             Backing::Sqlite(_) => unreachable!("fresh_pg opened Postgres"),
+            #[cfg(feature = "sql-mysql")]
+            Backing::Mysql(_) => unreachable!("fresh_pg opened Postgres"),
         }
         Some(kv)
     }
@@ -1438,7 +1670,7 @@ mod pg_tests {
         tx.commit().await.unwrap();
         let mut saw_key = false;
         for row in rows.rows {
-            let key_bytes = pg_bytes(row.into_iter().next().unwrap()).unwrap();
+            let key_bytes = sqlx_bytes(row.into_iter().next().unwrap()).unwrap();
             assert_ne!(
                 key_bytes, sealed,
                 "kv_changes must NEVER carry the (sealed) value bytes — key + version only (MF-6)"
@@ -1859,5 +2091,326 @@ mod pg_tests {
         for key in store.list_prefix("_cp/").await.unwrap() {
             store.delete(&key).await.unwrap();
         }
+    }
+}
+
+/// LIVE MySQL / MariaDB gates (build-order step 6 / MF-2 MySQL shape + MF-5 durability). Env-gated on
+/// `BOATRAMP_TEST_MYSQL_URL` (e.g. `mysql://boatramp:boatramp@localhost:3306/boatramp`) — they skip
+/// CLEANLY with an eprintln when it is unset (CI provides a `mysql:8` service with it, as the
+/// orm-tenancy-sqlx job does). These are UNIT tests, so the `#[cfg(test)]` CAS mutation seam
+/// ([`cas_mutation_drops_predicate`]) and the MF-6 leak seam ([`change_log_leaks_value`]) are live:
+/// under `BOATRAMP_KVSQL_MUTATION=drop_cas_predicate` the value predicate is dropped and
+/// [`sqlkv_mysql_cas_race_has_exactly_one_winner`] MUST go RED; under `=leak_change_value` the custody
+/// gate goes RED. The shared `kv`/`kv_changes` tables are reset per test and the tests run `#[serial]`.
+///
+/// The WS4 shared-mode gates (election + control-plane identity) are RE-RUN here over the real
+/// multi-writer MySQL `SqlKv` — the dialect-agnostic machinery is pure [`KvStore`] CAS, so it works
+/// over MySQL UNCHANGED (no `GET_LOCK` needed; the WS4 seam note in `boatramp_core::shared_mode` is
+/// resolved by this). They stay mutation-verified via `--features sql-mysql,shared-mode-gate-mutation`
+/// + `BOATRAMP_KVSQL_MUTATION=disable_leader_lock` / `=skip_cp_id_stamp`.
+#[cfg(all(test, feature = "sql-mysql"))]
+mod mysql_tests {
+    use super::*;
+    use serial_test::serial;
+
+    /// Open the MySQL `SqlKv` with a ≥16-conn pool and reset the shared tables — or `None` (skip)
+    /// when `BOATRAMP_TEST_MYSQL_URL` is unset.
+    async fn fresh_mysql() -> Option<SqlKv> {
+        let Ok(url) = std::env::var("BOATRAMP_TEST_MYSQL_URL") else {
+            eprintln!("skip sqlkv mysql gate: BOATRAMP_TEST_MYSQL_URL unset");
+            return None;
+        };
+        let kv = SqlKv::open_mysql(url, Some(16))
+            .await
+            .expect("open MySQL SqlKv");
+        reset_tables(&kv).await;
+        Some(kv)
+    }
+
+    /// Reset the `kv` + `kv_changes` tables over the MySQL store (a clean slate: the conformance suite
+    /// asserts exact list contents, the race gate counts winners on one key, and the split-brain half
+    /// needs an empty `_cp/*`).
+    async fn reset_tables(kv: &SqlKv) {
+        match &kv.backing {
+            Backing::Mysql(b) => b
+                .run_script("DELETE FROM kv_changes; DELETE FROM kv")
+                .await
+                .expect("reset kv tables"),
+            #[cfg(feature = "sql")]
+            Backing::Sqlite(_) => unreachable!("fresh_mysql opened MySQL"),
+            #[cfg(feature = "sql-postgres")]
+            Backing::Postgres(_) => unreachable!("fresh_mysql opened MySQL"),
+        }
+    }
+
+    /// Clear the `_cp/*` coordination rows over an `Arc<dyn KvStore>` (the split-brain half opens a
+    /// fresh control plane by simulating a separate empty database).
+    async fn reset_cp(store: &Arc<dyn KvStore>) {
+        for key in store.list_prefix("_cp/").await.unwrap() {
+            store.delete(&key).await.unwrap();
+        }
+    }
+
+    /// GATE — the pure MF-5 durability decision rejects the non-durable InnoDB settings (no DB
+    /// needed): both globals must be exactly `1`; the lossy defaults (`2` / `0`) and any single lossy
+    /// value fail loud. This is the fail-loud LOGIC gate; the live toggle (`SET GLOBAL …`) is
+    /// privilege-gated and verified in CI / against a privileged instance.
+    #[test]
+    fn mysql_durability_check_rejects_nondurable_settings() {
+        assert!(mysql_durability_ok(1, 1).is_ok(), "1/1 is durable");
+        let flush2 = mysql_durability_ok(2, 1).unwrap_err();
+        assert!(
+            flush2.contains("innodb_flush_log_at_trx_commit` = 2"),
+            "names the lossy flush setting: {flush2}"
+        );
+        let sync0 = mysql_durability_ok(1, 0).unwrap_err();
+        assert!(
+            sync0.contains("sync_binlog` = 0"),
+            "names the lossy binlog setting: {sync0}"
+        );
+        assert!(
+            mysql_durability_ok(2, 0).is_err(),
+            "the lossy defaults (2/0) are rejected"
+        );
+    }
+
+    /// GATE — the MySQL `SqlKv` satisfies the IDENTICAL shared `KvStore` conformance suite every
+    /// backend runs (value CAS, empty/binary values, bytewise prefix/range scans, delete-of-missing)
+    /// over a real MySQL primary.
+    #[tokio::test]
+    #[serial]
+    async fn sqlkv_mysql_conformance() {
+        let Some(kv) = fresh_mysql().await else {
+            return;
+        };
+        boatramp_core::kv::conformance::kv_conformance(&kv).await;
+        println!("SQLKV MYSQL CONFORMANCE OK [mysql]");
+    }
+
+    /// GATE — the MySQL `SqlKv` declares `MultiWriter` + `supports_cas` (the self-coordinating
+    /// multi-writer declaration the shared topology derives from).
+    #[tokio::test]
+    #[serial]
+    async fn sqlkv_mysql_declares_multi_writer() {
+        let Some(kv) = fresh_mysql().await else {
+            return;
+        };
+        assert_eq!(kv.writer_model(), WriterModel::MultiWriter);
+        assert!(kv.supports_cas());
+    }
+
+    /// MF-6 CUSTODY GATE (over a REAL MySQL) — `kv_changes` carries KEY + VERSION ONLY, never the
+    /// (sealed) value bytes. RED under `BOATRAMP_KVSQL_MUTATION=leak_change_value`.
+    #[tokio::test]
+    #[serial]
+    async fn sqlkv_mysql_change_log_carries_no_secret_values() {
+        let Some(kv) = fresh_mysql().await else {
+            return;
+        };
+        let sealed = b"SEALED-CIPHERTEXT-\x00\x9f\x92\x96-mysql-secret".to_vec();
+        kv.put("secret/default/mysql-key", sealed.clone())
+            .await
+            .unwrap();
+        // `allow(irrefutable_let_patterns)`: when this build compiled ONLY the MySQL backing the
+        // pattern is irrefutable; with several backings it is refutable and the `else` catches the
+        // others. The allow keeps it warning-free in BOTH shapes (a `match` would instead trip
+        // `infallible_destructuring_match` in the single-backing build).
+        #[allow(irrefutable_let_patterns)]
+        let Backing::Mysql(b) = &kv.backing else {
+            unreachable!("fresh_mysql opened MySQL")
+        };
+        let mut tx = b.begin_read_only().await.unwrap();
+        let rows = tx
+            .query("SELECT `key`, version FROM kv_changes", &[])
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        let mut saw_key = false;
+        for row in rows.rows {
+            let key_bytes = sqlx_bytes(row.into_iter().next().unwrap()).unwrap();
+            assert_ne!(
+                key_bytes, sealed,
+                "kv_changes must NEVER carry the (sealed) value bytes — key + version only (MF-6)"
+            );
+            if key_bytes == b"secret/default/mysql-key" {
+                saw_key = true;
+            }
+        }
+        assert!(saw_key, "the change log records the changed key");
+        println!("SQLKV MYSQL MF-6 CUSTODY OK [mysql]: kv_changes carries key + version only.");
+    }
+
+    /// THE MF-2 MySQL GATE (the NO-SHIP one) — over a REAL MySQL primary with a ≥16-conn pool, 32
+    /// concurrent tasks on a multi-thread runtime race a value-predicate CAS and EXACTLY ONE wins, for
+    /// BOTH a present-key race and an absent-key/insert race. The present-key `UPDATE … WHERE … AND
+    /// value = ?3` is cross-connection linearizable w.r.t. the primary (InnoDB does a current-read of
+    /// the latest committed row after blocking on the row lock, so the losers re-evaluate the value
+    /// predicate against the winner's value and match 0 rows — REPEATABLE READ, the MySQL default, is
+    /// sufficient); the absent-key `INSERT IGNORE` lets exactly one racer insert (the rest are
+    /// ignored → 0 rows). Winner by rows-affected, never a follow-up SELECT.
+    ///
+    /// Mutation-verified: with `BOATRAMP_KVSQL_MUTATION=drop_cas_predicate` the present-key UPDATE
+    /// becomes unconditional (every racer's UPDATE matches the key and bumps the version → every racer
+    /// reports rows_affected == 1 and "wins"), so the `exactly one` assertion fails — proving the
+    /// value predicate is load-bearing. (The CI mutation loop sets that env and asserts this gate RED.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial]
+    async fn sqlkv_mysql_cas_race_has_exactly_one_winner() {
+        let Some(kv) = fresh_mysql().await else {
+            return;
+        };
+        let kv = Arc::new(kv);
+        assert!(kv.supports_cas());
+
+        // (1) present-key race: 32 racers swap the SAME prior value; exactly one matches.
+        kv.put("race/k", b"start".to_vec()).await.unwrap();
+        let mut set = tokio::task::JoinSet::new();
+        for i in 0..32u32 {
+            let kv = kv.clone();
+            set.spawn(async move {
+                kv.compare_and_swap("race/k", Some(b"start"), i.to_le_bytes().to_vec())
+                    .await
+                    .unwrap()
+            });
+        }
+        let mut wins = 0;
+        while let Some(res) = set.join_next().await {
+            if res.unwrap() {
+                wins += 1;
+            }
+        }
+        assert_eq!(
+            wins, 1,
+            "exactly one present-key CAS wins (over real MySQL)"
+        );
+
+        // (2) absent-key race: the key is absent; 32 racers insert-if-absent; exactly one inserts.
+        let mut set = tokio::task::JoinSet::new();
+        for i in 0..32u32 {
+            let kv = kv.clone();
+            set.spawn(async move {
+                kv.compare_and_swap("race/insert", None, i.to_le_bytes().to_vec())
+                    .await
+                    .unwrap()
+            });
+        }
+        let mut wins = 0;
+        while let Some(res) = set.join_next().await {
+            if res.unwrap() {
+                wins += 1;
+            }
+        }
+        assert_eq!(
+            wins, 1,
+            "exactly one absent-key insert wins (over real MySQL)"
+        );
+
+        println!(
+            "SQLKV MYSQL CAS RACE OK [mysql]: 32-way present-key + absent-key value-CAS over a real \
+             primary each had EXACTLY ONE winner (single-statement, winner-by-rows-affected)."
+        );
+    }
+
+    // ---- WS4 shared-mode gates RE-RUN over the real multi-writer MySQL `SqlKv` -------------------
+    //
+    // These prove the dialect-agnostic coordination machinery (leader CAS-lease, control-plane
+    // identity) works over MySQL UNCHANGED — it is pure `KvStore` CAS, so the single-leader guarantee
+    // reduces to the same cross-connection linearizable CAS the MF-2 MySQL gate proves. NO `GET_LOCK`
+    // is used (the WS4 seam is resolved). Mutation-verified via
+    // `--features sql-mysql,shared-mode-gate-mutation` + the matching env.
+    use boatramp_core::shared_mode::{
+        ControlPlaneIdentity, DEFAULT_MEMBER_WINDOW, LeaderLease, random_node_id,
+    };
+    use std::time::Duration;
+
+    /// WS4 GATE (C1) over MySQL — N leases over ONE real MySQL primary (≥16-conn pool) contend and
+    /// EXACTLY ONE is leader; when the holder's lease expires, a survivor takes over. RED under
+    /// `disable_leader_lock`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial]
+    async fn mysql_shared_election_single_leader_under_concurrency() {
+        let Some(kv) = fresh_mysql().await else {
+            return;
+        };
+        let store = Arc::new(kv) as Arc<dyn KvStore>;
+        let ttl = Duration::from_secs(10);
+
+        let mut set = tokio::task::JoinSet::new();
+        for _ in 0..16u32 {
+            let store = store.clone();
+            set.spawn(async move {
+                let lease = LeaderLease::new(store, random_node_id(), ttl);
+                let won = lease.tick().await.unwrap();
+                (won, lease.is_leader())
+            });
+        }
+        let mut leaders = 0;
+        while let Some(res) = set.join_next().await {
+            let (won, is_leader) = res.unwrap();
+            assert_eq!(won, is_leader, "tick result and is_leader fence agree");
+            if won {
+                leaders += 1;
+            }
+        }
+        assert_eq!(
+            leaders, 1,
+            "exactly one node acquires the lease over a real MySQL primary"
+        );
+
+        boatramp_core::shared_mode::seed_expired_lease(&store, "dead-node")
+            .await
+            .unwrap();
+        let survivor = LeaderLease::new(store.clone(), random_node_id(), ttl);
+        assert!(
+            survivor.tick().await.unwrap(),
+            "a survivor takes over an expired lease within the bound"
+        );
+        assert!(survivor.is_leader());
+        println!(
+            "SQLKV MYSQL SHARED ELECTION OK [mysql]: 16-way lease contention over a real primary had \
+             EXACTLY ONE leader; a survivor took over an expired lease (dialect-agnostic, no GET_LOCK)."
+        );
+    }
+
+    /// WS4 GATE (UX-C1) over MySQL — two opens against the SAME real MySQL share one cp-id and see TWO
+    /// members (commingle detectable); a fresh (reset) database stamps a DIFFERENT cp-id (split-brain
+    /// detectable). RED under `skip_cp_id_stamp`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial]
+    async fn mysql_shared_control_plane_identity_detects_commingle_and_split_brain() {
+        let Some(kv) = fresh_mysql().await else {
+            return;
+        };
+        let store = Arc::new(kv) as Arc<dyn KvStore>;
+
+        let a = ControlPlaneIdentity::new(store.clone(), random_node_id(), DEFAULT_MEMBER_WINDOW);
+        let b = ControlPlaneIdentity::new(store.clone(), random_node_id(), DEFAULT_MEMBER_WINDOW);
+        let ra = a.join().await.unwrap();
+        let rb = b.join().await.unwrap();
+        assert!(
+            !ra.control_plane_id.is_empty(),
+            "the first open stamps a cp-id"
+        );
+        assert!(ra.created_new, "the first open created the control plane");
+        assert!(!rb.created_new, "the second open JOINED it");
+        assert_eq!(
+            ra.control_plane_id, rb.control_plane_id,
+            "both nodes on the same real db share the cp-id (commingle detectable)"
+        );
+        assert_eq!(rb.members_seen, 2, "both members seen on the shared db");
+
+        let first_id = ra.control_plane_id.clone();
+        reset_cp(&store).await;
+        let c = ControlPlaneIdentity::new(store.clone(), random_node_id(), DEFAULT_MEMBER_WINDOW);
+        let rc = c.join().await.unwrap();
+        assert!(rc.created_new, "the fresh db stamps its own cp-id");
+        assert_ne!(
+            first_id, rc.control_plane_id,
+            "a separate database has a DIFFERENT cp-id (split-brain detectable)"
+        );
+        println!(
+            "SQLKV MYSQL CP IDENTITY OK [mysql]: same db ⇒ shared cp-id + 2 members (commingle); \
+             separate db ⇒ distinct cp-id (split-brain)."
+        );
     }
 }
