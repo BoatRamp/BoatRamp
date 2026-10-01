@@ -1682,6 +1682,65 @@ mod tests {
         );
     }
 
+    /// **F3 — MF5 non-resurrection (the symmetric tombstone direction).** An acked tombstone (a
+    /// crown-jewel `delete_checkpointed` — a secret DELETE / token revoke that advances the frontier) is
+    /// NOT resurrected by the manifest-rollback recovery: after the self-heal rollback the deleted key
+    /// stays ABSENT, while a co-resident live key survives (the rollback is not a wipe). The survival
+    /// direction is `self_heal_recovers_a_torn_latest_manifest_by_rollback`; this is its mirror, so MF5
+    /// is proven in BOTH directions in-tree.
+    #[serial_test::serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mf5_acked_tombstone_is_not_resurrected_after_manifest_rollback() {
+        use slatedb::object_store::memory::InMemory;
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        {
+            let kv = SlateKv::open_with(
+                store.clone(),
+                "kv",
+                test_settings(Some(Duration::from_millis(5))),
+            )
+            .await
+            .unwrap();
+            kv.put("project/acme", b"live".to_vec()).await.unwrap();
+            kv.put("secret/acme/idp", b"sealed".to_vec()).await.unwrap();
+            kv.checkpoint().await.unwrap(); // both frozen to L0 under a good generation
+            // The acked tombstone via the crown-jewel delete path (durable delete + frontier-sync
+            // checkpoint), advancing the frontier UNDER what will become the torn generation.
+            KvStore::delete_checkpointed(&kv, "secret/acme/idp")
+                .await
+                .unwrap();
+            drop(kv); // acked, NO clean close (a hard crash follows)
+        }
+        // The crash tears the latest manifest; recovery must roll back to the generation that HOLDS the
+        // tombstone (the highest decodable), never a generation before the delete.
+        let _torn = tear_latest_manifest(&store, "kv").await;
+
+        let kv = SlateKv::open_with_policy(
+            store.clone(),
+            "kv",
+            test_settings(Some(Duration::from_millis(5))),
+            KvOpenPolicy::SelfHeal,
+        )
+        .await
+        .expect("self-heal must recover a torn latest manifest by rollback");
+        assert_eq!(
+            kv.get("secret/acme/idp").await.unwrap(),
+            None,
+            "MF5: an acked tombstone MUST NOT be resurrected by the manifest rollback (stays deleted)"
+        );
+        assert_eq!(
+            kv.get("project/acme").await.unwrap(),
+            Some(b"live".to_vec()),
+            "the co-resident live key survives — the rollback is not a wipe"
+        );
+        let marker = read_degraded_marker(&store, "kv")
+            .await
+            .unwrap()
+            .expect("a manifest rollback writes DEGRADED.json");
+        assert_eq!(marker.frontier_source, "manifest_gen_rollback");
+        kv.close().await.unwrap();
+    }
+
     /// **C3/C7 GATE** — SelfHeal recovers a sole safe trailing torn WAL tail: it quarantines +
     /// OPENS, every committed key (incl. the sealed secret) survives, and a durable DEGRADED.json
     /// breadcrumb is written naming the quarantined id.

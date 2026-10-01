@@ -327,8 +327,12 @@ pub enum WalRepairError {
     /// replay range) and the acked writes in the hole are unrecoverable, so the rollback would SILENTLY
     /// drop acked state → REFUSE. Complements [`WalIdHole`](Self::WalIdHole) (a hole below a readable
     /// survivor within a single-generation repair); this is the leading/interior gap a manifest
-    /// ROLLBACK to an older, lower frontier exposes — the blind spot `check_survivor_contiguity` leaves
-    /// (it returns Ok when the whole tail is gone; `verify_opens` proves BOOT, not RETENTION).
+    /// ROLLBACK to an older, lower frontier exposes. It fires precisely when a surviving WAL id sits
+    /// beyond the rollback frontier with a hole below it; the complementary "whole replay range gone"
+    /// case is prevented upstream by slatedb's WAL-GC *retaining the frontier object*
+    /// (`Bound::Included(replay_after_wal_id)`), which turns a genuinely-advanced-then-GC'd store into
+    /// exactly this detectable leading-hole shape — see [`check_manifest_rollback_wal_contiguity`] and
+    /// its F1b invariant-pin test (`verify_opens` proves BOOT, not RETENTION).
     #[error(
         "control-plane manifest recovery refused: rolling back to a generation with durable frontier \
          {rolled_back_frontier} would replay WAL from {}..={highest_wal_id}, but WAL id \
@@ -1047,10 +1051,28 @@ async fn read_manifest_gc_boundary(store: &Arc<dyn ObjectStore>, root: &str) -> 
 /// than open a store missing acked crown-jewel state.
 ///
 /// This COMPLEMENTS [`check_survivor_contiguity`] (which the subsequent WAL-tail self-heal also runs):
-/// that guard returns `Ok` when the WHOLE tail is gone (no readable survivor) — exactly the blind spot
-/// here, where rolling back to an OLDER, LOWER frontier F needs a replay range a later GC pass may have
-/// erased. A torn TRAILING WAL object is still PRESENT (an object at that id) and is handled by the
-/// WAL-tail self-heal; this guard is about ABSENT ids (an unbridgeable hole), never torn-but-present.
+/// that guard returns `Ok` when the WHOLE tail is gone (no readable survivor), where rolling back to an
+/// OLDER, LOWER frontier F needs a replay range a later GC pass may have erased. A torn TRAILING WAL
+/// object is still PRESENT (an object at that id) and is handled by the WAL-tail self-heal; this guard
+/// is about ABSENT ids (an unbridgeable hole), never torn-but-present.
+///
+/// **Load-bearing external invariant (F1a — read before trusting the empty-range branch).** This guard
+/// does NOT itself detect a true "whole replay range gone": it returns `Ok` when `highest <= frontier`
+/// (no WAL object beyond F). That branch is safe ONLY because slatedb's WAL-GC *retains the WAL object
+/// AT the frontier*: the latest manifest's referenced range is `WalFileRange(Bound::Included(
+/// replay_after_wal_id), Bound::Unbounded)` (slatedb `garbage_collector/wal_gc.rs` `referenced_wal_ranges`,
+/// "Keep the current compaction boundary and everything after it"). So the WAL object at the DURABLE
+/// frontier is never GC'd. Consequence for a rollback: if the store had ever advanced to a frontier
+/// F_N > F_G (under the torn generation we discard), WAL-GC running off that generation retained the
+/// boundary object at F_N — which, after we roll back to G (frontier F_G), is a surviving WAL id > F_G,
+/// so `highest > frontier` and the loop below runs and catches the leading hole in `(F_G, F_N)`. In
+/// other words, the retention invariant is what guarantees a genuinely-advanced-then-GC'd store can
+/// never reach the `highest <= frontier` escape with acked data missing — the guard's own code does not
+/// catch that case; slatedb's GC-retention does. [`slatedb_wal_gc_retains_the_frontier_object_INVARIANT`]
+/// (F1b) pins this invariant so a future slatedb change (e.g. `Bound::Included`→`Excluded`) that would
+/// silently reopen the crown-jewel-loss window fails RED here. (A deferred belt-and-suspenders —
+/// Security F1c — is an orphaned-L0 cross-check in the empty-range branch; the F1b test-pin is the
+/// primary safeguard, so it is intentionally NOT built.)
 fn check_manifest_rollback_wal_contiguity(
     wal_ids_present: &std::collections::BTreeSet<u64>,
     frontier: u64,
@@ -1060,7 +1082,10 @@ fn check_manifest_rollback_wal_contiguity(
         return Ok(()); // no WAL objects at all → nothing to replay, nothing to lose
     };
     if highest <= frontier {
-        return Ok(()); // every WAL object is already covered by G's frontier (all in L0)
+        // Empty replay range. SAFE only via the external WAL-GC retention invariant documented above
+        // (the retained boundary object at a genuinely-advanced frontier would make highest > frontier);
+        // F1b pins it. The deferred orphaned-L0 cross-check (F1c) is intentionally not built here.
+        return Ok(());
     }
     // Some WAL objects sit beyond F → the entire (F, highest] range must be intact (no absent id).
     for id in (frontier + 1)..=highest {
@@ -2032,6 +2057,42 @@ mod tests {
         assert!(check_manifest_rollback_wal_contiguity(&below, 5, "kv").is_ok());
     }
 
+    /// **F2a — isolate MF2's UNIQUE contribution.** The SAME shape — frontier F=5, the only object
+    /// beyond F a NON-readable (Torn) one at id 8, with 6,7 ABSENT — is MISSED by
+    /// [`check_survivor_contiguity`] (it keys on the highest READABLE survivor; there is none, so it
+    /// returns Ok — the whole-tail-gone blind spot) but CAUGHT by
+    /// [`check_manifest_rollback_wal_contiguity`] (it keys on ALL present ids). Proves MF2 is the SOLE
+    /// guard for a leading GC hole whose only anchor above it is non-readable — exactly the shape a
+    /// torn-generation GC pass leaves for a manifest rollback.
+    #[test]
+    fn mf2_catches_a_hole_under_a_non_readable_anchor_that_survivor_contiguity_misses() {
+        // check_survivor_contiguity: no readable survivor above the hole ⇒ Ok (misses it).
+        let candidates = vec![WalCandidate {
+            id: 8,
+            size: 64,
+            class: WalClass::Torn,
+        }];
+        assert!(
+            check_survivor_contiguity(&candidates, &[], 5, "kv").is_ok(),
+            "check_survivor_contiguity misses a hole whose only anchor above it is non-readable \
+             (no readable survivor ⇒ whole-tail-gone branch ⇒ Ok) — the blind spot MF2 covers"
+        );
+        // check_manifest_rollback_wal_contiguity: all present ids ⇒ 6 absent below the surviving 8 ⇒ hole.
+        let wal: std::collections::BTreeSet<u64> = [8u64].into_iter().collect();
+        let err = check_manifest_rollback_wal_contiguity(&wal, 5, "kv").unwrap_err();
+        assert!(
+            matches!(
+                err,
+                WalRepairError::ManifestRollbackGcHole {
+                    missing_wal_id: 6,
+                    highest_wal_id: 8,
+                    ..
+                }
+            ),
+            "MF2 must catch the leading hole under a non-readable anchor, got {err:?}"
+        );
+    }
+
     // --- End-to-end over a real InMemory slatedb store. ---
 
     /// **F2 GATE** — a torn LATEST manifest + a valid last-good generation G: DRY-RUN plans the rollback
@@ -2164,6 +2225,115 @@ mod tests {
         );
     }
 
+    /// **F2a (e2e, MF2 isolated)** — a WAL GC hole whose ONLY anchor above it is a NON-readable (torn)
+    /// WAL object. The WAL-tail self-heal's `check_survivor_contiguity` would MISS it (no readable
+    /// survivor ⇒ whole-tail-gone ⇒ Ok, and `plan_trailing_tail` would just quarantine the torn tail —
+    /// silently lossy), so ONLY `check_manifest_rollback_wal_contiguity` catches it ⇒
+    /// `ManifestRollbackGcHole`. This isolates MF2's unique contribution end-to-end.
+    #[serial_test::serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn recover_refuses_a_gc_hole_under_a_torn_anchor_mf2_isolated() {
+        let store = mem_store();
+        let root = "kv";
+        seed_real_store_with_secret(&store, root).await;
+        let good = highest_manifest_id(&store, root).await;
+        let frontier = read_frontier(&store, root).await.unwrap();
+        inject_torn_manifest(&store, root, good + 1).await;
+        // A TORN (non-readable) WAL object above the frontier, with the F+1 slot ABSENT: no readable
+        // survivor sits above the hole, so only the all-ids MF2 guard can catch it.
+        put_wal(&store, root, frontier + 3, footer_object(64, 0)).await; // version 0 ⇒ Torn
+        store
+            .delete(&wal_object_path(root, frontier + 1))
+            .await
+            .ok();
+        let err = recover_last_good_manifest(&store, root, RepairMode::DryRun)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, WalRepairError::ManifestRollbackGcHole { .. }),
+            "MF2 must catch a leading GC hole under a non-readable anchor (survivor-contiguity misses \
+             it), got {err:?}"
+        );
+    }
+
+    /// **F2b — direct lossless POST-G WAL-replay gate.** An acked write in the replay range `(F, highest]`
+    /// that was NOT frozen into G's L0 (it lives only in a WAL object beyond G's frontier) is REPLAYED
+    /// and recovered byte-equal by the rollback. Distinct from the L0-under-G survival gate: here a
+    /// base key is checkpointed into G's L0 (advancing the frontier to F), then the crown-jewel is an
+    /// acked WAL-only write at an id > F — so its recovery proves the rollback's WAL replay, not the
+    /// pre-G L0 state.
+    #[serial_test::serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn recover_replays_an_acked_wal_write_beyond_g_frontier_byte_equal() {
+        use slatedb::config::{FlushOptions, FlushType};
+        let store = mem_store();
+        let root = "kv";
+        // Seed: a base key checkpointed into L0 (advancing the durable frontier to F), then the
+        // crown-jewel as an acked WAL-only write BEYOND F (durable in WAL, NOT frozen to L0).
+        {
+            #[allow(clippy::field_reassign_with_default)]
+            let settings = {
+                let mut s = Settings::default();
+                s.flush_interval = Some(Duration::from_millis(5));
+                s.compactor_options = None;
+                s.garbage_collector_options = None;
+                s
+            };
+            let db = Db::builder(root.to_string(), store.clone())
+                .with_settings(settings)
+                .build()
+                .await
+                .unwrap();
+            db.put(b"project/acme", b"base")
+                .await
+                .unwrap()
+                .await_durable()
+                .await
+                .unwrap();
+            // Checkpoint: freeze `base` → L0, advance the durable frontier to F (G's frontier).
+            db.flush_with_options(FlushOptions {
+                flush_type: FlushType::MemTable,
+            })
+            .await
+            .unwrap();
+            // The crown-jewel: an acked WAL write BEYOND F, NOT checkpointed (lives only in the WAL).
+            db.put(b"secret/acme/idp", b"sealed-wal-only")
+                .await
+                .unwrap()
+                .await_durable()
+                .await
+                .unwrap();
+            drop(db); // a hard crash, NOT a clean close — the crown-jewel stays in the WAL beyond F
+        }
+        let good = highest_manifest_id(&store, root).await;
+        let frontier = read_frontier(&store, root).await.unwrap();
+        inject_torn_manifest(&store, root, good + 1).await;
+
+        // Recover: roll back to G (frontier F) and replay the WAL forward.
+        let report = match recover_last_good_manifest(&store, root, RepairMode::Apply)
+            .await
+            .unwrap()
+        {
+            ManifestRecovery::RolledBack(r) => r,
+            other => panic!("expected RolledBack, got {other:?}"),
+        };
+        assert_eq!(report.rolled_back_to_generation, good);
+        assert_eq!(report.frontier, frontier);
+        // The base key (in G's L0) AND the crown-jewel (WAL-only, beyond F) both survive byte-equal —
+        // the crown-jewel's survival proves the rollback REPLAYED the WAL range (F, highest], not just
+        // G's L0 state.
+        assert_eq!(
+            read_key_via_fresh_db(&store, root, b"project/acme").await,
+            Some(b"base".to_vec()),
+            "the checkpointed base key (G's L0) survives"
+        );
+        assert_eq!(
+            read_key_via_fresh_db(&store, root, b"secret/acme/idp").await,
+            Some(b"sealed-wal-only".to_vec()),
+            "F2b: an acked WAL write BEYOND G's frontier MUST be replayed + recovered byte-equal"
+        );
+    }
+
     /// **F2 GATE** — a READABLE latest manifest is NOT the manifest shape: recovery is a no-op
     /// ([`ManifestRecovery::LatestReadable`]) so the caller falls through to the WAL-tail path.
     #[serial_test::serial]
@@ -2179,5 +2349,104 @@ mod tests {
             ManifestRecovery::LatestReadable { .. } => {}
             other => panic!("a readable latest manifest must be a no-op, got {other:?}"),
         }
+    }
+
+    /// **F1b INVARIANT PIN (MF2 / Security — the single blind spot the mutation suite was missing).**
+    /// slatedb's WAL-GC RETAINS the WAL object AT the durable frontier
+    /// (`WalFileRange(Bound::Included(replay_after_wal_id), Unbounded)`, slatedb
+    /// `garbage_collector/wal_gc.rs`). MF2's empty-range safety
+    /// ([`check_manifest_rollback_wal_contiguity`] returning `Ok` when `highest <= frontier`) is
+    /// LOAD-BEARING on this: a genuinely-advanced-then-GC'd store keeps the boundary object, so a
+    /// rollback to an older generation sees `highest > frontier` and catches the leading hole instead of
+    /// silently reaching the empty-range escape with acked data gone. If a future slatedb stops
+    /// retaining the frontier object (e.g. `Bound::Included`→`Excluded`), this gate goes RED — which is
+    /// exactly the signal that would otherwise silently reopen the crown-jewel-loss window.
+    ///
+    /// Confirms a REAL WAL-GC pass (min_age 0 ⇒ fresh below-frontier objects ARE deleted), not a no-op.
+    #[serial_test::serial]
+    #[tokio::test(flavor = "multi_thread")]
+    #[allow(non_snake_case)]
+    async fn slatedb_wal_gc_retains_the_frontier_object_INVARIANT() {
+        use slatedb::config::{
+            FlushOptions, FlushType, GarbageCollectorDirectoryOptions, GarbageCollectorOptions,
+        };
+        let store = mem_store();
+        let root = "kv";
+        // Seed a WAL history and advance the durable frontier: several checkpointed writes, each made
+        // durable in the WAL then frozen to L0 (advancing `replay_after_wal_id`), so WAL objects exist
+        // BOTH below and at the final frontier.
+        {
+            #[allow(clippy::field_reassign_with_default)]
+            let settings = {
+                let mut s = Settings::default();
+                s.flush_interval = Some(Duration::from_millis(5));
+                s.compactor_options = None;
+                s.garbage_collector_options = None;
+                s
+            };
+            let db = Db::builder(root.to_string(), store.clone())
+                .with_settings(settings)
+                .build()
+                .await
+                .unwrap();
+            for i in 0..6u32 {
+                db.put(format!("k{i}").as_bytes(), format!("v{i}").as_bytes())
+                    .await
+                    .unwrap()
+                    .await_durable()
+                    .await
+                    .unwrap();
+                db.flush_with_options(FlushOptions {
+                    flush_type: FlushType::MemTable,
+                })
+                .await
+                .unwrap();
+            }
+            db.close().await.unwrap();
+        }
+
+        let frontier = read_frontier(&store, root).await.unwrap();
+        let before = list_wal_ids(&store, root).await.unwrap();
+        assert!(
+            before.iter().any(|&id| id < frontier),
+            "F1b fixture must leave at least one WAL object BELOW the frontier {frontier} so the GC pass \
+             has something to delete (proving a non-no-op); got {before:?}"
+        );
+        assert!(
+            before.contains(&frontier),
+            "F1b fixture must have a WAL object AT the frontier {frontier} (the boundary object the \
+             retention invariant protects); got {before:?}"
+        );
+
+        // Run a REAL one-shot WAL-GC pass with min_age 0 so the fresh below-frontier objects ARE
+        // eligible for deletion (default min_age is 5 min — that would be a no-op).
+        let admin = Admin::builder(root.to_string(), store.clone()).build();
+        let gc_opts = GarbageCollectorOptions {
+            wal_options: Some(GarbageCollectorDirectoryOptions {
+                interval: None,
+                min_age: Duration::ZERO,
+                dry_run: false,
+            }),
+            ..Default::default()
+        };
+        admin
+            .run_gc_once(gc_opts)
+            .await
+            .expect("one-shot WAL GC must run");
+
+        let after = list_wal_ids(&store, root).await.unwrap();
+        // NON-NO-OP: the GC pass actually deleted below-frontier WAL objects.
+        assert!(
+            after.len() < before.len(),
+            "F1b: the WAL-GC pass must have DELETED below-frontier objects (not a no-op): before \
+             {before:?}, after {after:?} (frontier {frontier})"
+        );
+        // THE INVARIANT: the WAL object AT the durable frontier is RETAINED.
+        assert!(
+            after.contains(&frontier),
+            "F1b INVARIANT VIOLATED: WAL-GC deleted the frontier object {frontier} — slatedb no longer \
+             retains `Bound::Included(replay_after_wal_id)`. MF2's empty-range safety is broken and the \
+             crown-jewel-loss window is reopened. after={after:?}"
+        );
     }
 }
