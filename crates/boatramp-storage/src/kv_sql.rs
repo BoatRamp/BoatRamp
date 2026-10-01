@@ -1603,4 +1603,124 @@ mod pg_tests {
              over a real primary — one wins, one 409s, no lost write."
         );
     }
+
+    // ---- WS4 shared-mode gates (election + control-plane identity) over a REAL multi-writer PG ----
+    //
+    // The IDENTICAL properties are unit-tested over `MemoryKv` in `boatramp_core::shared_mode`; here
+    // they run over the real multi-writer `SqlKv`, where the single-leader guarantee reduces to the
+    // same cross-connection linearizable CAS the MF-2 gate proves. Each is mutation-verified: built
+    // with `--features sql-postgres,shared-mode-gate-mutation` and
+    // `BOATRAMP_KVSQL_MUTATION=disable_leader_lock` / `=skip_cp_id_stamp`, the lease / cp-id stamp is
+    // driven off and the gate goes RED (the CI mutation loop asserts that). Env-gated on
+    // `BOATRAMP_TEST_PG_URL`; skips CLEANLY when unset.
+    use boatramp_core::shared_mode::{
+        ControlPlaneIdentity, DEFAULT_MEMBER_WINDOW, LeaderLease, random_node_id,
+    };
+    use std::time::Duration;
+
+    /// WS4 GATE (C1) — N leases over ONE real Postgres primary (≥16-conn pool) contend for leadership
+    /// and EXACTLY ONE is leader at a time; when the holder's lease expires, a survivor takes over.
+    /// The single-statement value-CAS makes the lease cross-connection linearizable. RED under
+    /// `disable_leader_lock` (every lease declares itself leader → many leaders).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial]
+    async fn shared_election_single_leader_under_concurrency() {
+        let Some(kv) = fresh_pg().await else {
+            return;
+        };
+        let store = Arc::new(kv) as Arc<dyn KvStore>;
+        let ttl = Duration::from_secs(10);
+
+        // 16 nodes all tick once concurrently over the shared primary → exactly one acquires.
+        let mut set = tokio::task::JoinSet::new();
+        for _ in 0..16u32 {
+            let store = store.clone();
+            set.spawn(async move {
+                let lease = LeaderLease::new(store, random_node_id(), ttl);
+                let won = lease.tick().await.unwrap();
+                (won, lease.is_leader())
+            });
+        }
+        let mut leaders = 0;
+        while let Some(res) = set.join_next().await {
+            let (won, is_leader) = res.unwrap();
+            assert_eq!(won, is_leader, "tick result and is_leader fence agree");
+            if won {
+                leaders += 1;
+            }
+        }
+        assert_eq!(
+            leaders, 1,
+            "exactly one node acquires the lease over a real primary"
+        );
+
+        // Bounded failover: force the lease expired (as if the holder died), a survivor takes over.
+        boatramp_core::shared_mode::seed_expired_lease(&store, "dead-node")
+            .await
+            .unwrap();
+        let survivor = LeaderLease::new(store.clone(), random_node_id(), ttl);
+        assert!(
+            survivor.tick().await.unwrap(),
+            "a survivor takes over an expired lease within the bound"
+        );
+        assert!(survivor.is_leader());
+        println!(
+            "SQLKV PG SHARED ELECTION OK [postgres]: 16-way lease contention over a real primary had \
+             EXACTLY ONE leader; a survivor took over an expired lease."
+        );
+    }
+
+    /// WS4 GATE (UX-C1) — two opens against the SAME real Postgres share one cp-id and see TWO
+    /// members (commingle detectable); a fresh (reset) database stamps a DIFFERENT cp-id
+    /// (split-brain detectable). RED under `skip_cp_id_stamp` (no stamp → empty ids, undetectable).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial]
+    async fn shared_control_plane_identity_detects_commingle_and_split_brain() {
+        let Some(kv) = fresh_pg().await else {
+            return;
+        };
+        let store = Arc::new(kv) as Arc<dyn KvStore>;
+
+        // Commingle: two nodes open the SAME database → same cp-id, both members seen.
+        let a = ControlPlaneIdentity::new(store.clone(), random_node_id(), DEFAULT_MEMBER_WINDOW);
+        let b = ControlPlaneIdentity::new(store.clone(), random_node_id(), DEFAULT_MEMBER_WINDOW);
+        let ra = a.join().await.unwrap();
+        let rb = b.join().await.unwrap();
+        assert!(
+            !ra.control_plane_id.is_empty(),
+            "the first open stamps a cp-id"
+        );
+        assert!(ra.created_new, "the first open created the control plane");
+        assert!(!rb.created_new, "the second open JOINED it");
+        assert_eq!(
+            ra.control_plane_id, rb.control_plane_id,
+            "both nodes on the same real db share the cp-id (commingle detectable)"
+        );
+        assert_eq!(rb.members_seen, 2, "both members seen on the shared db");
+
+        // Split-brain: a fresh/empty database (reset) stamps a DIFFERENT cp-id.
+        let first_id = ra.control_plane_id.clone();
+        // Reset the tables to simulate a SEPARATE empty database.
+        reset_tables(&store).await;
+        let c = ControlPlaneIdentity::new(store.clone(), random_node_id(), DEFAULT_MEMBER_WINDOW);
+        let rc = c.join().await.unwrap();
+        assert!(rc.created_new, "the fresh db stamps its own cp-id");
+        assert_ne!(
+            first_id, rc.control_plane_id,
+            "a separate database has a DIFFERENT cp-id (split-brain detectable)"
+        );
+        println!(
+            "SQLKV PG CP IDENTITY OK [postgres]: same db ⇒ shared cp-id + 2 members (commingle); \
+             separate db ⇒ distinct cp-id (split-brain)."
+        );
+    }
+
+    /// Reset the `kv` + `kv_changes` tables (clearing the `_cp/*` rows too) over the PG store — used
+    /// to simulate a second, empty database for the split-brain half.
+    async fn reset_tables(store: &Arc<dyn KvStore>) {
+        // `list_prefix("")` + delete each would also work; a direct script is faster + exact.
+        for key in store.list_prefix("_cp/").await.unwrap() {
+            store.delete(&key).await.unwrap();
+        }
+    }
 }

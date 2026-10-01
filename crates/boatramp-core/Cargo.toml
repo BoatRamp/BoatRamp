@@ -46,6 +46,13 @@ blob-drain-gate-mutation = ["boatramp-types/blob-drain-gate-mutation"]
 # pre-MF-1 path — turning every MF-1 gate RED. Mirrors `blob-drain-gate-mutation`. Compiled OUT of
 # every real build (the seam also compiles under this crate's own `cfg(test)`).
 crownjewel-cas-gate-mutation = []
+# TEST-ONLY, NEVER SHIPPED: arm the kv-sql WS4 shared-mode mutation seams
+# ([`shared_mode::election_lock_disabled`] / [`shared_mode::cp_id_stamp_skipped`]) in a NON-test
+# build, so a downstream test lane (`boatramp-storage`'s live-Postgres shared-mode gates) can set
+# `BOATRAMP_KVSQL_MUTATION=disable_leader_lock` / `=skip_cp_id_stamp` and drive the election / cp-id
+# stamp off — turning the single-leader + commingle/split-brain gates RED. Mirrors
+# `crownjewel-cas-gate-mutation`. Compiled OUT of every real build (also lives under `cfg(test)`).
+shared-mode-gate-mutation = []
 
 [dependencies]
 # The shared, wasm-clean type + routing/config layer (re-exported below so
@@ -95,6 +102,9 @@ getrandom = { workspace = true, features = ["js"] }
 
 [dev-dependencies]
 tokio = { workspace = true }
+# Serialize the shared-mode mutation-seam gates: they set/clear the `BOATRAMP_KVSQL_MUTATION` env var
+# (process-global), so they must not run concurrently with each other.
+serial_test = "3"
 
 [lints]
 workspace = true

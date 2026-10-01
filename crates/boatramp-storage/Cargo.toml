@@ -100,6 +100,14 @@ blob-purge-gate = ["fs", "fallback"]
 # goes RED — proving the CAS/If-Match is load-bearing. Mirrors the MF-2 `drop_cas_predicate` seam;
 # pass-through to `boatramp-core/crownjewel-cas-gate-mutation`. Compiled OUT of every real build.
 crownjewel-cas-gate-mutation = ["boatramp-core/crownjewel-cas-gate-mutation"]
+# TEST-ONLY, NEVER SHIPPED: arm the kv-sql WS4 shared-mode mutation seams in `boatramp-core` from this
+# crate's live-Postgres shared-mode gate lane. With this ON and
+# `BOATRAMP_KVSQL_MUTATION=disable_leader_lock` / `=skip_cp_id_stamp`, the leader lease / cp-id stamp
+# is driven off, so `shared_election_single_leader_under_concurrency` /
+# `shared_control_plane_identity_detects_commingle_and_split_brain` go RED — proving the lease / stamp
+# is load-bearing. Mirrors `crownjewel-cas-gate-mutation`; pass-through to
+# `boatramp-core/shared-mode-gate-mutation`. Compiled OUT of every real build.
+shared-mode-gate-mutation = ["boatramp-core/shared-mode-gate-mutation"]
 
 [dependencies]
 boatramp-core.workspace = true

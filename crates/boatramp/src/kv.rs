@@ -76,6 +76,19 @@ enum KvCommand {
 /// so an offline command sees the same objects the serving open would.
 #[derive(Debug, Args)]
 struct StoreAddr {
+    /// Which control-plane KV backend this node runs (matches `serve --kv` / `BOATRAMP_KV`). These
+    /// `boatramp kv` verbs are SlateDB maintenance/recovery tools (manifest / WAL / `.compactions`);
+    /// they do NOT apply to a `sql` backend (the SQL engine's own crash recovery handles that), nor
+    /// to `memory` / `cloudflare`. A non-SlateDB backend gets a clear "not applicable" message rather
+    /// than building a bogus SlateDB object store against a path that isn't one.
+    #[arg(
+        long = "kv",
+        value_enum,
+        env = "BOATRAMP_KV",
+        default_value_t = boatramp_node::backends::KvBackend::Slatedb
+    )]
+    backend: boatramp_node::backends::KvBackend,
+
     /// The server data directory (as passed to `boatramp serve --data-dir`). The local SlateDB
     /// control-plane store lives under `<data-dir>/kv-slate` (root `kv`). Defaults to `./data`.
     #[arg(long, default_value = "./data")]
@@ -139,6 +152,32 @@ impl StoreAddr {
             )
             .await
             .map_err(|e| Error::Store(e.to_string()))
+        }
+    }
+
+    /// `Some(message)` when the configured backend is NOT SlateDB — these verbs are SlateDB-specific
+    /// (C7). The caller PRINTS the message and returns `Ok` (a clean "not applicable", not an error),
+    /// rather than building a bogus object store. The message is backend-specific + actionable.
+    fn not_applicable(&self, verb: &str) -> Option<String> {
+        use boatramp_node::backends::KvBackend;
+        match self.backend {
+            KvBackend::Slatedb => None,
+            KvBackend::Sql => Some(format!(
+                "`boatramp kv {verb}` does NOT apply to the `sql` control-plane KV backend.\n\
+                 It is a SlateDB-specific maintenance/recovery tool (manifest / WAL / `.compactions`); \
+                 a SQL backend has none of those — PostgreSQL/SQLite crash recovery is the engine's \
+                 own (WAL + fsync), and durability is the transaction COMMIT. Use your database's \
+                 native tooling for backup/restore/repair. The running node's SQL KV health is \
+                 reported at `GET /api/kv-status` (and logged in the startup banner)."
+            )),
+            KvBackend::Memory => Some(format!(
+                "`boatramp kv {verb}` does NOT apply to the `memory` backend — it is ephemeral \
+                 (lost on restart), so there is nothing durable to {verb}."
+            )),
+            KvBackend::Cloudflare => Some(format!(
+                "`boatramp kv {verb}` does NOT apply to the `cloudflare` backend — Cloudflare KV is a \
+                 managed remote store with no local manifest/WAL to {verb}."
+            )),
         }
     }
 
@@ -248,6 +287,10 @@ pub async fn run(args: KvArgs) -> Result<(), Error> {
 }
 
 async fn run_repair(args: RepairArgs) -> Result<(), Error> {
+    if let Some(msg) = args.addr.not_applicable("repair") {
+        println!("{msg}");
+        return Ok(());
+    }
     let (store, root) = args.addr.build()?;
     let mode = if args.apply {
         RepairMode::Apply
@@ -260,6 +303,10 @@ async fn run_repair(args: RepairArgs) -> Result<(), Error> {
 }
 
 async fn run_status(args: StatusArgs) -> Result<(), Error> {
+    if let Some(msg) = args.addr.not_applicable("status") {
+        println!("{msg}");
+        return Ok(());
+    }
     let (store, root) = args.addr.build()?;
     if args.ack {
         let existed = clear_degraded_marker(&store, &root)
@@ -342,6 +389,10 @@ async fn run_status(args: StatusArgs) -> Result<(), Error> {
 }
 
 async fn run_checkpoint(args: CheckpointArgs) -> Result<(), Error> {
+    if let Some(msg) = args.addr.not_applicable("checkpoint") {
+        println!("{msg}");
+        return Ok(());
+    }
     if args.live {
         return run_checkpoint_live(&args).await;
     }
@@ -393,6 +444,10 @@ async fn run_checkpoint_offline(addr: StoreAddr) -> Result<(), Error> {
 }
 
 async fn run_recover(args: RecoverArgs) -> Result<(), Error> {
+    if let Some(msg) = args.addr.not_applicable("recover") {
+        println!("{msg}");
+        return Ok(());
+    }
     if let Some(volume) = args.adopt_volume.clone() {
         return run_recover_adopt_volume(&args.addr, &volume, args.apply).await;
     }
@@ -929,6 +984,7 @@ mod tests {
 
     fn local_addr(data_dir: PathBuf) -> StoreAddr {
         StoreAddr {
+            backend: boatramp_node::backends::KvBackend::Slatedb,
             data_dir,
             kv_s3: false,
             s3_bucket: None,
@@ -937,6 +993,33 @@ mod tests {
             s3_path_style: false,
             kv_s3_prefix: "_kv".to_string(),
         }
+    }
+
+    /// C7 — the `boatramp kv` verbs are SlateDB-specific: a `sql`/`memory`/`cloudflare` backend gets a
+    /// clear "not applicable" message (so a non-SlateDB operator is never pointed at a bogus store),
+    /// while SlateDB proceeds. The SQL message names the engine's own recovery + the `kv-status` seam.
+    #[test]
+    fn kv_verbs_not_applicable_to_non_slatedb_backends() {
+        use boatramp_node::backends::KvBackend;
+        let mut addr = local_addr(PathBuf::from("./data"));
+        addr.backend = KvBackend::Slatedb;
+        assert!(addr.not_applicable("status").is_none(), "SlateDB proceeds");
+        addr.backend = KvBackend::Sql;
+        let msg = addr.not_applicable("recover").expect("sql is N/A");
+        assert!(msg.contains("does NOT apply to the `sql`"));
+        assert!(msg.contains("/api/kv-status"));
+        addr.backend = KvBackend::Memory;
+        assert!(
+            addr.not_applicable("checkpoint")
+                .unwrap()
+                .contains("ephemeral")
+        );
+        addr.backend = KvBackend::Cloudflare;
+        assert!(
+            addr.not_applicable("repair")
+                .unwrap()
+                .contains("Cloudflare KV")
+        );
     }
 
     /// `kv recover --adopt-volume` REFUSES a mounted path with no `kv-slate` store (never mutates the

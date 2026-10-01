@@ -616,7 +616,22 @@ pub(super) async fn node_version() -> Response {
 /// NO secrets. (When the store is DOWN, the recovery-mode listener serves its OWN `/api/kv-status`.)
 pub(super) async fn kv_status(
     Extension(KvDegraded(marker)): Extension<super::KvDegraded>,
+    Extension(super::KvCoord(coord)): Extension<super::KvCoord>,
 ) -> Response {
+    match coord {
+        // Pre-WS4 shape (cluster path / embedders that don't set the backend info): UNCHANGED, so
+        // existing SlateDB behavior + its consumers are untouched.
+        None => legacy_kv_status(marker),
+        // WS4 backend-aware shape (Architect C7): top-level `state` stays (back-compat) + `backend` +
+        // derived `coordination`, with the SlateDB recovery vocabulary nested under `durability`.
+        Some(info) => backend_aware_kv_status(marker, info),
+    }
+}
+
+/// The pre-WS4 SlateDB-flavored `kv-status` body (frontier/manifest at the root). Kept byte-identical
+/// for the cluster path + any router built without [`KvStatusInfo`], so nothing that consumed the old
+/// shape regresses.
+fn legacy_kv_status(marker: Option<boatramp_core::kv::DegradedMarker>) -> Response {
     match marker {
         // v0.11.0 F2 manifest-rollback shape (UX C1/C2): lead with the lossless verdict and carry the
         // rollback fields + `frontier_source`/`last_durable_seq` (identical local-fs/S3).
@@ -664,6 +679,115 @@ pub(super) async fn kv_status(
             "last_durable_seq": serde_json::Value::Null,
         }))
         .into_response(),
+    }
+}
+
+/// The WS4 backend-aware `kv-status` body (Architect C7): `state` stays at the root for back-compat;
+/// `backend` and the DERIVED `coordination` describe the real backend (so SQL no longer inherits the
+/// SlateDB `manifest_latest` vocabulary); the SlateDB recovery fields — when present — are nested
+/// under `durability`, and a non-SlateDB backend reports its own durability model there.
+fn backend_aware_kv_status(
+    marker: Option<boatramp_core::kv::DegradedMarker>,
+    info: super::KvStatusInfo,
+) -> Response {
+    let is_slatedb = info.backend_family == "slatedb";
+    // `state` + the `durability` sub-object. SlateDB carries its recovery vocabulary; every other
+    // backend's durability is the engine's own synchronous COMMIT (no manifest/frontier).
+    let (state, durability) = if is_slatedb {
+        slatedb_state_and_durability(&marker)
+    } else {
+        (
+            "ok".to_string(),
+            serde_json::json!({
+                "model": "synchronous_commit",
+                "note": "Crash recovery is the SQL engine's own (WAL + fsync); durability is the \
+                         transaction COMMIT. There is no manifest/frontier/`.compactions` class here \
+                         — the self-heal/recover/checkpoint surface does not apply to this backend.",
+            }),
+        )
+    };
+    Json(serde_json::json!({
+        // Back-compat: the top-level `state` stays (a monitor keying on it keeps working).
+        "state": state,
+        "backend": {
+            "family": info.backend_family,
+            "dialect": info.backend_dialect,
+            "writer_model": info.writer_model,
+            "location": info.location,
+            "connection": info.connection,
+        },
+        "coordination": {
+            "mode": info.coordination_mode,
+            "derived_from": info.coordination_derived_from,
+            "control_plane_id": info.control_plane_id,
+            "this_node": info.this_node,
+            "members_seen": info.members_seen,
+            // No Raft on the run()/shared path; the field is present (null) so a consumer can tell
+            // "coordination exists but it is not Raft" from "unknown".
+            "raft": serde_json::Value::Null,
+        },
+        "durability": durability,
+    }))
+    .into_response()
+}
+
+/// Derive the root `state` + the `durability` sub-object from a SlateDB degraded-state boot marker —
+/// the SAME verdicts as [`legacy_kv_status`], with the frontier/manifest fields moved under
+/// `durability` (the fields are unchanged, only re-homed).
+fn slatedb_state_and_durability(
+    marker: &Option<boatramp_core::kv::DegradedMarker>,
+) -> (String, serde_json::Value) {
+    match marker {
+        Some(m) if m.rolled_back_to_generation.is_some() => {
+            let wal_tail_dropped = !m.quarantined_ids.is_empty();
+            let state = if wal_tail_dropped {
+                "recovered"
+            } else {
+                "recovered_lossless"
+            };
+            (
+                state.to_string(),
+                serde_json::json!({
+                    "recovered_at": m.stamp,
+                    "frontier_source": m.frontier_source,
+                    "last_durable_seq": m.frontier,
+                    "rolled_back_to_generation": m.rolled_back_to_generation,
+                    "quarantined_manifest_ids": m.quarantined_manifest_ids,
+                    "quarantine_dir": m.quarantine_dir,
+                    "orphaned_nonacked_objects": m.orphaned_nonacked_objects,
+                    "quarantined_wal_ids": m.quarantined_ids,
+                    "loss_window": m.loss_window,
+                    "note": if wal_tail_dropped {
+                        "RECOVERED by last-good-generation rollback; an ADDITIONAL torn WAL tail beyond \
+                         the frontier was quarantined (FORENSIC-ONLY). Acknowledge with `boatramp kv \
+                         status --ack`."
+                    } else {
+                        "RECOVERED (lossless) by last-good-generation rollback — zero acked loss. \
+                         Acknowledge with `boatramp kv status --ack` once reviewed."
+                    },
+                }),
+            )
+        }
+        Some(m) => (
+            "degraded".to_string(),
+            serde_json::json!({
+                "self_healed_at": m.stamp,
+                "frontier_source": m.frontier_source,
+                "last_durable_seq": m.frontier,
+                "quarantined_ids": m.quarantined_ids,
+                "loss_window": m.loss_window,
+                "quarantine_dir": m.quarantine_dir,
+                "note": "The quarantined torn tail is FORENSIC-ONLY (no supported recovery of acked \
+                         pairs). Acknowledge with `boatramp kv status --ack` once reviewed.",
+            }),
+        ),
+        None => (
+            "ok".to_string(),
+            serde_json::json!({
+                "frontier_source": "manifest_latest",
+                "last_durable_seq": serde_json::Value::Null,
+            }),
+        ),
     }
 }
 

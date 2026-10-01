@@ -98,6 +98,8 @@ pub fn router_with_fast(
     let bootstrap_attestation = options.bootstrap_attestation.clone();
     // Boot snapshot of the KV degraded state for `GET /api/kv-status` (v0.9.0 KV-recovery, C6).
     let kv_degraded = KvDegraded(options.kv_degraded.clone());
+    // Backend + derived-coordination description for `GET /api/kv-status` (kv-sql WS4, C7).
+    let kv_coord = KvCoord(options.kv_coordination.clone());
     // The mesh join admitter, for `POST /api/cluster/join`.
     let mesh_control = MeshControlHandle(options.mesh_control.clone());
     #[cfg(feature = "oidc")]
@@ -640,6 +642,7 @@ pub fn router_with_fast(
         .layer(Extension(tenant_secret_store_cap))
         .layer(Extension(email_store_cap))
         .layer(Extension(kv_degraded))
+        .layer(Extension(kv_coord))
         .layer(Extension(upload_guard));
     #[cfg(feature = "oidc")]
     let api = api.layer(Extension(oidc_state));
