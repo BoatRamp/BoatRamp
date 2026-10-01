@@ -1781,6 +1781,42 @@ pub struct ServerOptions {
     /// not served. The static SPA is served unauthenticated at this host+path.
     #[cfg(feature = "console")]
     pub console: Option<console::ConsoleMount>,
+    /// Backend + DERIVED-coordination description for `GET /api/kv-status` (kv-sql WS4, Architect
+    /// C7). Set by the node bootstrap so the status handler reports the real backend/coordination
+    /// instead of the hardcoded SlateDB `manifest_latest` vocabulary (which lies for SQL). `None` ⇒
+    /// the handler serves the pre-WS4 SlateDB-flavored shape (the cluster path and embedders that
+    /// don't set it), so existing behavior is unchanged.
+    pub kv_coordination: Option<KvStatusInfo>,
+}
+
+/// Backend + derived-coordination description for `GET /api/kv-status` (kv-sql WS4, Architect C7).
+/// Built by the node bootstrap from the resolved backend and (shared mode) the control-plane
+/// identity, and carried into the status handler so the reported backend / coordination / durability
+/// is HONEST per backend. Every string is already credential-redacted by the builder.
+#[derive(Clone, Debug)]
+pub struct KvStatusInfo {
+    /// Backend family: `slatedb` | `sql` | `memory` | `cloudflare`.
+    pub backend_family: String,
+    /// SQL dialect when `backend_family == "sql"` (`sqlite` | `postgres` | `mysql`), else `None`.
+    pub backend_dialect: Option<String>,
+    /// The backend's declared writer model: `single_writer` | `multi_writer`.
+    pub writer_model: String,
+    /// Where the store lives, CREDENTIAL-REDACTED (e.g. `<data-dir>/kv-slate`, `sqlite:/data/kv.db`,
+    /// `postgres (url from env BOATRAMP_PG_URL)`) — never a URL with inline credentials.
+    pub location: String,
+    /// Connection health as known at boot (`ok`). The store opened (a dead store never reaches here —
+    /// it routes to the recovery-mode listener's own status), so this is `ok` once serving.
+    pub connection: String,
+    /// The DERIVED coordination model: `none` | `raft` | `shared` (never a user knob).
+    pub coordination_mode: String,
+    /// A one-line explanation of how the coordination model was derived (for operator legibility).
+    pub coordination_derived_from: String,
+    /// Shared mode: the positive control-plane id this node joined (short form), else `None`.
+    pub control_plane_id: Option<String>,
+    /// Shared mode: this node's member id, else `None`.
+    pub this_node: Option<String>,
+    /// Shared mode: distinct members seen on this database within the liveness window, else `None`.
+    pub members_seen: Option<usize>,
 }
 
 /// The listener's own connection scheme (`true` = `https`), carried as an
@@ -1794,6 +1830,12 @@ struct ServedOverTls(bool);
 /// the store opened clean (or a self-heal was zero-loss).
 #[derive(Clone, Default)]
 struct KvDegraded(Option<boatramp_core::kv::DegradedMarker>);
+
+/// The backend + derived-coordination description (kv-sql WS4, Architect C7), carried as an extension
+/// so the `GET /api/kv-status` handler reports the real backend/coordination. `None` ⇒ the handler
+/// serves the pre-WS4 SlateDB-flavored shape (unchanged).
+#[derive(Clone, Default)]
+struct KvCoord(Option<KvStatusInfo>);
 
 /// Whether the host fallback may resolve an unmatched `Host` to a site without an
 /// explicit domain registration (first-label `<site>.host`, or the sole served

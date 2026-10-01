@@ -185,6 +185,10 @@ pub enum Error {
     /// Running the store migration failed.
     #[error("store migration failed: {0}")]
     Migrate(String),
+    /// A self-contradictory coordination configuration, refused BEFORE anything started (kv-sql WS4,
+    /// UX-C4): a multi-writer SQL control-plane KV backend configured alongside a Raft cluster.
+    #[error("{0}")]
+    ContradictoryCoordination(String),
 }
 
 impl From<boatramp_core::migrate::MigrateError> for Error {
@@ -570,7 +574,18 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
             .or(serve_cfg.bootstrap_secret.clone()),
         ..Default::default()
     };
-    let cluster_rate_limit = args.cluster_rate_limit || serve_cfg.cluster_rate_limit;
+    // Resolve the `[serve.kv.sql]` connection config early (a pure config+env read, no I/O) so the
+    // DERIVED coordination model is known BEFORE the cluster dispatch / any store open (kv-sql WS4).
+    let sql_kv_cfg = resolve_sql_kv_config(serve_cfg.kv.as_ref().and_then(|k| k.sql.as_ref()));
+    // The backend's DECLARED writer model (UX-C4 / C1 / C7): a multi-writer backend (Postgres/MySQL)
+    // self-coordinates — N stateless nodes share one DB, no Raft — which auto-implies shared-mode
+    // cache coherence + cluster-wide rate limiting, and REFUSES a Raft cluster alongside it.
+    let multi_writer = declared_kv_writer_model(args.kv, sql_kv_cfg.as_ref())
+        == boatramp_core::kv::WriterModel::MultiWriter;
+    // Cluster-wide rate limiting: an explicit flag/config, OR auto-on under a multi-writer backend
+    // (the N-node shared topology — per-node buckets would under-count). (UX-C4 derive-not-flag.)
+    let cluster_rate_limit =
+        args.cluster_rate_limit || serve_cfg.cluster_rate_limit || multi_writer;
     let addr = args
         .addr
         .or(serve_cfg.addr)
@@ -670,6 +685,18 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
             .or_else(|| serve_cfg.azure_access_key.clone()),
         azure_emulator: args.azure_emulator || serve_cfg.azure_emulator,
     };
+
+    // UX-C4 self-contradiction refusal: a MULTI-WRITER SQL backend (self-coordinating) configured
+    // ALONGSIDE a Raft cluster is meaningless (`run_cluster` never uses the configured KV backend).
+    // Refuse LOUD here — BEFORE any store opens or mesh binds — naming both sides + the cure.
+    if let Some(msg) = multi_writer_cluster_refusal(
+        multi_writer,
+        config.cluster.is_some(),
+        args.cluster_init,
+        args.cluster_join.is_some(),
+    ) {
+        return Err(Error::ContradictoryCoordination(msg));
+    }
 
     // Cluster mode: triggered by a `[cluster]` config section OR the founding/
     // joining flags (`--cluster-init` / `--cluster-join <ticket>`), so a node can
@@ -798,10 +825,8 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
              measured drain+close time."
         );
     }
-    // `--kv sql` connection config: the `[serve.kv.sql]` block overlaid with `BOATRAMP_KV_SQL_*`
-    // env (env wins), so a fly deploy can configure it with no config file. Ignored by the other
-    // backends; consulted only when `args.kv == KvBackend::Sql`.
-    let sql_kv_cfg = resolve_sql_kv_config(serve_cfg.kv.as_ref().and_then(|k| k.sql.as_ref()));
+    // `--kv sql` connection config (`sql_kv_cfg`) was resolved early (near the top of `run`) so the
+    // writer-model / coordination could be derived before the cluster dispatch; reuse it here.
     let kv_backend = match boatramp_node::backends::build_kv(
         args.kv,
         &data_dir,
@@ -812,19 +837,43 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
     .await
     {
         Ok(backend) => backend,
-        // C5 — a FATAL control-plane KV open (strict mode, or an unsafe shape self-heal refused)
-        // must NOT propagate to `exit(1)` and a fly crash-loop. For the SlateDB backend, bind a
-        // recovery-mode listener (503 for sites, 200 for probes, diagnosis on `/api/kv-status`).
-        Err(e) if matches!(args.kv, boatramp_node::backends::KvBackend::Slatedb) => {
-            return enter_kv_recovery_mode(addr, &data_dir, slate_s3.as_ref(), &e.to_string())
-                .await;
-        }
-        Err(e) => return Err(e.into()),
+        // A FATAL control-plane KV open must NOT bare-`exit(1)` into a PaaS crash-loop. The route is
+        // backend-specific (C5 for SlateDB, C4 for SQL), encoded in `kv_open_failure_route` so the
+        // policy is pure + unit-testable.
+        Err(e) => match kv_open_failure_route(args.kv) {
+            // C5 — SlateDB: bind the recovery-mode listener (503 for sites, 200 for probes,
+            // diagnosis on `/api/kv-status`) with the SlateDB-specific `DEGRADED.json` diagnostic.
+            KvOpenFailureRoute::SlatedbRecovery => {
+                return enter_kv_recovery_mode(addr, &data_dir, slate_s3.as_ref(), &e.to_string())
+                    .await;
+            }
+            // C4 — SQL (or a shared-DB unreachable at open): route to the SAME generic
+            // recovery/readiness listener with a backend-appropriate diagnostic, not an exit.
+            KvOpenFailureRoute::SqlRecovery => {
+                return enter_sql_recovery_mode(addr, sql_kv_cfg.as_ref(), &e.to_string()).await;
+            }
+            // Memory never fails to open; Cloudflare KV has no local store to recover — propagate.
+            KvOpenFailureRoute::Propagate => return Err(e.into()),
+        },
     };
-    // Shared-mode coherence: when several processes share
-    // one KV, publish each write to a changelog over the *uncached* backend and
-    // poll it to invalidate peer-changed keys.
-    let shared_coherence = args.shared_cache_coherence || serve_cfg.shared_cache_coherence;
+    // Shared-mode coherence: when several processes share one KV, publish each write to a changelog
+    // over the *uncached* backend and poll it to invalidate peer-changed keys. AUTO-ON under a
+    // multi-writer backend (UX-C4 derive-not-flag); the standalone `--shared-cache-coherence` flag is
+    // DEPRECATED (honored, with a one-line note, for the legacy shared-SlateDB/Cloudflare topology).
+    let flag_shared = args.shared_cache_coherence || serve_cfg.shared_cache_coherence;
+    if flag_shared && multi_writer {
+        tracing::info!(
+            "note: `--shared-cache-coherence` / `[serve].shared_cache_coherence` is DEPRECATED and \
+             now REDUNDANT — a multi-writer backend auto-enables shared-mode cache coherence."
+        );
+    } else if flag_shared {
+        tracing::info!(
+            "note: `--shared-cache-coherence` is DEPRECATED — it is now DERIVED from the backend's \
+             writer model (auto-on for a multi-writer SQL backend). Honored here for the legacy \
+             shared-SlateDB / Cloudflare-KV topology."
+        );
+    }
+    let shared_coherence = flag_shared || multi_writer;
     let changelog = shared_coherence
         .then(|| Arc::new(Changelog::new(kv_backend.clone(), CHANGELOG_RETENTION_SECS)));
     // Front the metadata store with an LRU so hot reads stay in memory.
@@ -929,6 +978,63 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
     {
         options.kv_degraded = read_kv_degraded_best_effort(&data_dir, slate_s3.as_ref()).await;
     }
+    // Shared-mode coordination (kv-sql WS4): a non-Raft single-leader election (C1) + positive
+    // control-plane identity/liveness (UX-C1), plus the backend-aware `kv-status` descriptor (C7).
+    // Both coordination primitives run over the UNCACHED `kv_backend` (coordination state must never
+    // be cached — a stale cached lease/roster would be wrong). SINGLE-WRITER keeps the always-true
+    // leader gate + coordination "none" EXACTLY as before.
+    let node_id = boatramp_core::shared_mode::random_node_id();
+    let (is_leader_gate, leader_lease): (
+        boatramp_server::CronLeaderGate,
+        Option<Arc<boatramp_core::shared_mode::LeaderLease>>,
+    ) = if multi_writer {
+        let lease = Arc::new(boatramp_core::shared_mode::LeaderLease::new(
+            kv_backend.clone(),
+            node_id.clone(),
+            boatramp_core::shared_mode::DEFAULT_LEASE_TTL,
+        ));
+        let gate = lease.gate();
+        spawn_leader_lease(lease.clone());
+        (gate, Some(lease))
+    } else {
+        (Arc::new(|| true), None)
+    };
+    // UX-C1: on a shared SQL KV, stamp/read the control-plane id + heartbeat this node into the
+    // member roster, then report in the startup banner. Best-effort — a probe failure never crashes
+    // the node (the store already opened; this is observability, not a correctness gate).
+    let cp_report = if multi_writer {
+        let identity = Arc::new(boatramp_core::shared_mode::ControlPlaneIdentity::new(
+            kv_backend.clone(),
+            node_id.clone(),
+            boatramp_core::shared_mode::DEFAULT_MEMBER_WINDOW,
+        ));
+        match identity.join().await {
+            Ok(report) => {
+                tracing::info!("{}", report.banner());
+                spawn_member_heartbeat(identity.clone());
+                Some(report)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "shared control-plane identity probe failed on open (continuing; commingle / \
+                     split-brain is NOT reported this boot)"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    options.kv_coordination = Some(build_kv_status_info(
+        args.kv,
+        sql_kv_cfg.as_ref(),
+        multi_writer,
+        &data_dir,
+        slate_s3.as_ref(),
+        &node_id,
+        cp_report.as_ref(),
+    ));
     spawn_sighup_reload(kv.clone(), Some(daemon_runtime.clone()));
     if let Some(changelog) = changelog {
         spawn_cache_poller(changelog, kv.clone(), Some(daemon_runtime.clone()));
@@ -975,9 +1081,11 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
         serve_addr: Some(addr),
         watch_provider: built_blobs.watch_provider.clone(),
         provision_tier: built_blobs.provision_tier,
-        // Single-node: default messaging, an always-true leader gate (one node), id 0.
+        // Single-node: default messaging, id 0. The leader gate is always-true for a single-writer
+        // backend (one node), or the shared CAS-lease election (C1) for a multi-writer backend — so
+        // exactly ONE of N stateless nodes runs the five leader-gated singletons.
         messaging: None,
-        is_leader: Arc::new(|| true),
+        is_leader: is_leader_gate,
         node_id: 0,
         // `boatramp serve` re-execs itself for compute workers (the child is boatramp).
         worker_exe: None,
@@ -1066,6 +1174,11 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
     #[cfg(feature = "slatedb")]
     if args.kv == boatramp_node::backends::KvBackend::Slatedb {
         write_kv_close_breadcrumb(&data_dir, slate_s3.as_ref()).await;
+    }
+    // Shared-mode (C1): resign the leader lease on graceful shutdown so a successor takes over at
+    // once instead of waiting a full TTL. Best-effort; a lost race / DB blip just lets it expire.
+    if let Some(lease) = &leader_lease {
+        lease.resign().await;
     }
     let close_clean = quiesce_and_close(kv_handle, reconcile, None, kv_close_deadline).await;
     #[cfg(feature = "slatedb")]
@@ -1639,6 +1752,311 @@ async fn enter_kv_recovery_mode(
     boatramp_server::serve_recovery_mode(addr, diagnostic)
         .await
         .map_err(Error::Serve)
+}
+
+/// Classify the DECLARED writer model of the resolved KV backend WITHOUT opening it (kv-sql WS4) —
+/// so the self-contradiction refusal (UX-C4) and the shared-coherence/rate-limit derivation can run
+/// BEFORE the cluster dispatch / any store open. SlateDB/memory/cloudflare and `sql`+sqlite are
+/// single-writer; `sql`+postgres/mysql are multi-writer (the engine self-coordinates). Mirrors
+/// `build_sql_kv`'s alias set + `SqlKv::writer_model`'s declaration. Fail-safe: an unknown `sql`
+/// kind classifies as SINGLE-writer (no spurious auto-shared / refusal — `build_kv` surfaces the
+/// real "unknown kind" error).
+fn declared_kv_writer_model(
+    kv: KvBackend,
+    sql: Option<&boatramp_node::config::SqlKvConfig>,
+) -> boatramp_core::kv::WriterModel {
+    use boatramp_core::kv::WriterModel;
+    match kv {
+        KvBackend::Sql => match sql.map(|c| c.kind.trim().to_ascii_lowercase()).as_deref() {
+            Some("postgres" | "postgresql" | "pg" | "mysql" | "mariadb") => {
+                WriterModel::MultiWriter
+            }
+            // "", "sqlite", "sqlite3", "libsql", or an unknown kind → single-writer (fail-safe).
+            _ => WriterModel::SingleWriter,
+        },
+        KvBackend::Slatedb | KvBackend::Memory | KvBackend::Cloudflare => WriterModel::SingleWriter,
+    }
+}
+
+/// The UX-C4 self-contradiction refusal message (pure + testable): a MULTI-WRITER SQL backend
+/// (self-coordinating) configured ALONGSIDE a Raft cluster is meaningless — the DB IS the
+/// coordinator, and `run_cluster` never even uses the configured KV backend. Returns the actionable
+/// message to fail with (naming BOTH sides + the cure + "nothing started"), or `None` when there is
+/// no contradiction: single-writer + cluster uses Raft as before, and multi-writer WITHOUT a cluster
+/// scales as N stateless nodes.
+fn multi_writer_cluster_refusal(
+    multi_writer: bool,
+    has_cluster_config: bool,
+    cluster_init: bool,
+    cluster_join: bool,
+) -> Option<String> {
+    if !multi_writer || !(has_cluster_config || cluster_init || cluster_join) {
+        return None;
+    }
+    let mut sources = Vec::new();
+    if has_cluster_config {
+        sources.push("a `[cluster]` config section");
+    }
+    if cluster_init {
+        sources.push("`--cluster-init` / `BOATRAMP_CLUSTER_INIT`");
+    }
+    if cluster_join {
+        sources.push("`--cluster-join` / `BOATRAMP_CLUSTER_JOIN`");
+    }
+    Some(format!(
+        "contradictory coordination configuration — NOTHING was started.\n\
+         • the control-plane KV backend is a MULTI-WRITER SQL backend (`--kv sql` with a \
+           Postgres/MySQL engine): it SELF-COORDINATES — N equal, stateless nodes share one database \
+           and the engine serializes writes, so there is NO Raft.\n\
+         • but a Raft cluster is ALSO configured ({}).\n\
+         These are mutually exclusive by construction: the cluster path never uses the configured KV \
+         backend, so \"multi-writer SQL + Raft\" cannot mean anything.\n\
+         Cure — pick ONE coordination model:\n\
+           · DROP the cluster configuration (remove `[cluster]`, `--cluster-init`, `--cluster-join`) \
+             to scale with Postgres — deploy N instances against the SAME database URL, no mesh.\n\
+           · OR switch the KV backend to `slatedb` (or `--kv sql` with a `sqlite` engine) to keep \
+             Raft coordination.",
+        sources.join(" + "),
+    ))
+}
+
+/// How a FATAL control-plane KV open failure is routed (kv-sql WS4, C4/C5) — never `exit(1)` into a
+/// PaaS crash-loop for a backend that can serve a recovery/readiness listener.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KvOpenFailureRoute {
+    /// SlateDB: the recovery-mode listener with the SlateDB `DEGRADED.json` diagnostic (C5).
+    SlatedbRecovery,
+    /// SQL: the generic recovery/readiness listener with a SQL diagnostic (C4).
+    SqlRecovery,
+    /// Memory (never fails) / Cloudflare (no local store to recover): propagate the error.
+    Propagate,
+}
+
+/// Classify how a `build_kv` open failure routes (pure + testable, C4/C5). SlateDB and SQL both enter
+/// a 503 recovery/readiness listener instead of exiting; memory/cloudflare propagate.
+fn kv_open_failure_route(kv: KvBackend) -> KvOpenFailureRoute {
+    match kv {
+        KvBackend::Slatedb => KvOpenFailureRoute::SlatedbRecovery,
+        KvBackend::Sql => KvOpenFailureRoute::SqlRecovery,
+        KvBackend::Memory | KvBackend::Cloudflare => KvOpenFailureRoute::Propagate,
+    }
+}
+
+/// C4 — enter the generic recovery/readiness listener after a FATAL SQL control-plane KV open (or a
+/// shared-DB unreachable at open), instead of bare-`exit(1)` into a PaaS crash-loop. The SlateDB
+/// diagnostic BUILDER is SlateDB-specific; the LISTENER ([`serve_recovery_mode`]) is generic, so SQL
+/// gets a backend-appropriate `/api/kv-status` diagnostic and the same 503-for-sites / 200-for-probes
+/// behavior. (SQL crash recovery is the engine's own — there is no self-heal/`kv recover` here; the
+/// fix is to restore DB reachability and redeploy/restart.)
+async fn enter_sql_recovery_mode(
+    addr: SocketAddr,
+    sql: Option<&boatramp_node::config::SqlKvConfig>,
+    open_err: &str,
+) -> Result<()> {
+    tracing::error!(
+        error = %open_err,
+        "SQL control-plane KV FAILED TO OPEN — entering recovery mode (binding a 503 listener, NOT \
+         exiting into a crash-loop). The shared database is unreachable or rejected the open; fix \
+         connectivity / credentials / `synchronous_commit=on`, then redeploy/restart. Diagnose via \
+         `GET /api/kv-status`."
+    );
+    let kind = sql
+        .map(|c| c.kind.trim())
+        .filter(|k| !k.is_empty())
+        .unwrap_or("sqlite")
+        .to_ascii_lowercase();
+    // Credential-redacted location: only the env var NAME (never the URL), or the on-disk path.
+    let location = sql_kv_location(sql);
+    let kv_status_json = serde_json::to_string_pretty(&serde_json::json!({
+        "state": "unreachable",
+        "error": open_err,
+        "backend": {
+            "family": "sql",
+            "dialect": kind,
+            "location": location,
+            "connection": "failed",
+        },
+        "coordination": {
+            // Derived but not yet joined — the store never opened.
+            "mode": "shared",
+            "control_plane_id": serde_json::Value::Null,
+            "raft": serde_json::Value::Null,
+        },
+        "recovery": "The SQL control-plane database could not be opened. SQL crash recovery is the \
+                     engine's own (WAL/fsync) — there is no `boatramp kv recover` for this backend. \
+                     Confirm the database is reachable, the credentials/URL are correct, and (for \
+                     Postgres) `synchronous_commit = on`, then redeploy/restart. The node is serving \
+                     503 + Retry-After for sites (200 for health probes) and will NOT crash-loop.",
+    }))
+    .unwrap_or_else(|_| "{}".to_string());
+    let diagnostic = boatramp_server::RecoveryDiagnostic {
+        error: open_err.to_string(),
+        kv_status_json,
+    };
+    boatramp_server::serve_recovery_mode(addr, diagnostic)
+        .await
+        .map_err(Error::Serve)
+}
+
+/// A credential-redacted one-line location for a `[serve.kv.sql]` backend — the on-disk path for an
+/// embedded SQLite db, or the NAME of the env var that holds the URL for an external engine (never
+/// the URL itself, which may carry a password). Used by `kv-status` + the SQL recovery diagnostic.
+fn sql_kv_location(sql: Option<&boatramp_node::config::SqlKvConfig>) -> String {
+    let Some(cfg) = sql else {
+        return "sql (unconfigured)".to_string();
+    };
+    let kind = cfg.kind.trim();
+    let kind = if kind.is_empty() { "sqlite" } else { kind };
+    match kind.to_ascii_lowercase().as_str() {
+        "sqlite" | "sqlite3" | "libsql" => match cfg.path.as_deref().filter(|p| !p.is_empty()) {
+            Some(path) => format!("sqlite:{path}"),
+            None => "sqlite (path unset)".to_string(),
+        },
+        other => match cfg.url_env.as_deref().filter(|s| !s.trim().is_empty()) {
+            Some(env) => format!("{other} (url from env {env})"),
+            None => format!("{other} (url_env unset)"),
+        },
+    }
+}
+
+/// Build the backend-aware `kv-status` descriptor (Architect C7) the node bootstrap feeds into
+/// `ServerOptions`, so `GET /api/kv-status` reports the REAL backend + DERIVED coordination instead
+/// of the hardcoded SlateDB `manifest_latest` vocabulary. Every string is credential-redacted.
+#[allow(clippy::too_many_arguments)]
+fn build_kv_status_info(
+    kv: KvBackend,
+    sql: Option<&boatramp_node::config::SqlKvConfig>,
+    multi_writer: bool,
+    data_dir: &Path,
+    slate_s3: Option<&boatramp_node::backends::SlateKvS3>,
+    node_id: &str,
+    cp_report: Option<&boatramp_core::shared_mode::ControlPlaneJoinReport>,
+) -> boatramp_server::KvStatusInfo {
+    let (family, dialect, location) = match kv {
+        KvBackend::Slatedb => (
+            "slatedb",
+            None,
+            match slate_s3 {
+                Some(s3) => format!("s3://{}/{} (object store)", s3.bucket, s3.prefix),
+                None => format!("{}", data_dir.join("kv-slate").display()),
+            },
+        ),
+        KvBackend::Memory => ("memory", None, "in-memory (ephemeral)".to_string()),
+        KvBackend::Cloudflare => ("cloudflare", None, "cloudflare-kv (REST)".to_string()),
+        KvBackend::Sql => {
+            let kind = sql
+                .map(|c| c.kind.trim())
+                .filter(|k| !k.is_empty())
+                .unwrap_or("sqlite")
+                .to_ascii_lowercase();
+            // Normalize the dialect name for the status surface.
+            let dialect = match kind.as_str() {
+                "sqlite" | "sqlite3" | "libsql" => "sqlite",
+                "postgres" | "postgresql" | "pg" => "postgres",
+                "mysql" | "mariadb" => "mysql",
+                _ => "sqlite",
+            };
+            ("sql", Some(dialect.to_string()), sql_kv_location(sql))
+        }
+    };
+    // Coordination is DERIVED from the writer model × node count (never a knob). This is the
+    // `run()`/shared path: a multi-writer backend ⇒ `shared`; everything else here ⇒ `none` (the
+    // Raft cluster has its OWN `run_cluster` path, which leaves this descriptor unset).
+    let (mode, derived_from) = if multi_writer {
+        (
+            "shared",
+            format!(
+                "multi-writer backend ({}) — N equal stateless nodes share one database; the engine \
+                 serializes writes + a single-leader lease gates the singletons (no Raft)",
+                dialect.as_deref().unwrap_or("sql"),
+            ),
+        )
+    } else {
+        (
+            "none",
+            "single-writer backend, single node — no external coordinator".to_string(),
+        )
+    };
+    boatramp_server::KvStatusInfo {
+        backend_family: family.to_string(),
+        backend_dialect: dialect,
+        writer_model: if multi_writer {
+            "multi_writer".to_string()
+        } else {
+            "single_writer".to_string()
+        },
+        location,
+        connection: "ok".to_string(),
+        coordination_mode: mode.to_string(),
+        coordination_derived_from: derived_from,
+        control_plane_id: cp_report
+            .map(boatramp_core::shared_mode::ControlPlaneJoinReport::short_id),
+        this_node: multi_writer.then(|| node_id.to_string()),
+        members_seen: cp_report.map(|r| r.members_seen),
+    }
+}
+
+/// Spawn the shared-mode leader-lease renew loop (kv-sql WS4, C1). Ticks ONCE immediately (so a node
+/// can acquire an empty/expired lease at boot without waiting a full interval), then on the
+/// `renew_interval` cadence. Logs leadership TRANSITIONS both directions (acquired / lost) so a
+/// failover is legible. Detached for the process lifetime; a tick error is logged + retried next
+/// tick (never fatal to serving).
+fn spawn_leader_lease(lease: Arc<boatramp_core::shared_mode::LeaderLease>) {
+    tracing::info!(
+        node = %lease.node_id(),
+        "shared-mode single-leader election active (non-Raft CAS-lease over the shared SQL KV) — \
+         exactly one node runs the leader-gated singletons"
+    );
+    tokio::spawn(async move {
+        let interval = lease.renew_interval();
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut was_leader = false;
+        loop {
+            // The FIRST `tick()` of a `tokio::time::interval` returns immediately, so the first
+            // acquire attempt happens at boot (not after one interval).
+            ticker.tick().await;
+            match lease.tick().await {
+                Ok(is_leader) => {
+                    if is_leader && !was_leader {
+                        tracing::info!(node = %lease.node_id(), "shared-mode: ACQUIRED leadership");
+                    } else if !is_leader && was_leader {
+                        tracing::warn!(
+                            node = %lease.node_id(),
+                            "shared-mode: LOST leadership (lease taken over or could not renew)"
+                        );
+                    }
+                    was_leader = is_leader;
+                }
+                Err(e) => tracing::warn!(
+                    node = %lease.node_id(), error = %e,
+                    "shared-mode leader-lease tick failed; retrying next interval"
+                ),
+            }
+        }
+    });
+}
+
+/// Spawn the shared-mode member-liveness heartbeat (kv-sql WS4, UX-C1): refresh this node's
+/// `_cp/members/{node_id}` row on a cadence so a crashed node ages out of the roster and the live
+/// member count stays accurate. Detached; a failure is logged + retried next tick.
+fn spawn_member_heartbeat(identity: Arc<boatramp_core::shared_mode::ControlPlaneIdentity>) {
+    tokio::spawn(async move {
+        // Heartbeat comfortably faster than the member window so a live node never ages out.
+        let interval = boatramp_core::shared_mode::DEFAULT_MEMBER_WINDOW / 3;
+        let mut ticker = tokio::time::interval(interval.max(std::time::Duration::from_secs(1)));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ticker.tick().await; // consume the immediate tick (join() already heartbeat at boot)
+        loop {
+            ticker.tick().await;
+            if let Err(e) = identity.heartbeat().await {
+                tracing::warn!(
+                    node = %identity.node_id(), error = %e,
+                    "shared-mode member heartbeat failed; retrying next interval"
+                );
+            }
+        }
+    });
 }
 
 /// Drive the shared-mode cache-coherence poller: every
@@ -3503,10 +3921,161 @@ async fn serve_rpk(
 
 #[cfg(test)]
 mod tests {
-    // Every test remaining in this module is `cluster`-gated; the import is unused
+    // Every OTHER test remaining in this module is `cluster`-gated; the import is unused
     // in a lean build (the single-node auth tests moved to `boatramp_node::auth`).
     #[cfg(feature = "cluster")]
     use super::*;
+
+    // kv-sql WS4 classifier gates — NOT cluster-gated (pure config logic; run in every tier).
+    use super::{
+        KvOpenFailureRoute, declared_kv_writer_model, kv_open_failure_route,
+        multi_writer_cluster_refusal,
+    };
+    use boatramp_core::kv::WriterModel;
+    use boatramp_node::backends::KvBackend;
+    use boatramp_node::config::SqlKvConfig;
+
+    fn sql_cfg(kind: &str) -> SqlKvConfig {
+        SqlKvConfig {
+            kind: kind.to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// C7/UX-C4 — the DECLARED writer model is derived WITHOUT opening the store: Postgres/MySQL are
+    /// multi-writer; sqlite/empty/unknown + every non-SQL backend are single-writer (fail-safe).
+    #[test]
+    fn declared_writer_model_classifies_backends() {
+        assert_eq!(
+            declared_kv_writer_model(KvBackend::Sql, Some(&sql_cfg("postgres"))),
+            WriterModel::MultiWriter
+        );
+        assert_eq!(
+            declared_kv_writer_model(KvBackend::Sql, Some(&sql_cfg("pg"))),
+            WriterModel::MultiWriter
+        );
+        assert_eq!(
+            declared_kv_writer_model(KvBackend::Sql, Some(&sql_cfg("mysql"))),
+            WriterModel::MultiWriter
+        );
+        assert_eq!(
+            declared_kv_writer_model(KvBackend::Sql, Some(&sql_cfg("sqlite"))),
+            WriterModel::SingleWriter
+        );
+        assert_eq!(
+            declared_kv_writer_model(KvBackend::Sql, Some(&sql_cfg(""))),
+            WriterModel::SingleWriter,
+            "empty kind defaults to sqlite (single-writer)"
+        );
+        assert_eq!(
+            declared_kv_writer_model(KvBackend::Sql, Some(&sql_cfg("weird"))),
+            WriterModel::SingleWriter,
+            "unknown kind is fail-safe single-writer (build_kv surfaces the real error)"
+        );
+        for b in [KvBackend::Slatedb, KvBackend::Memory, KvBackend::Cloudflare] {
+            assert_eq!(declared_kv_writer_model(b, None), WriterModel::SingleWriter);
+        }
+    }
+
+    /// UX-C4 — a multi-writer backend WITH any Raft-cluster signal is REFUSED, and the message names
+    /// both sides + the cure + "nothing started"; every non-contradictory combination is allowed.
+    #[test]
+    fn multi_writer_with_cluster_is_refused() {
+        // Refused: multi-writer + each cluster signal.
+        for (cfg, init, join) in [
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+        ] {
+            let msg = multi_writer_cluster_refusal(true, cfg, init, join)
+                .expect("multi-writer + a cluster signal must refuse");
+            assert!(msg.contains("NOTHING was started"));
+            assert!(msg.to_lowercase().contains("multi-writer"));
+            assert!(msg.contains("Raft"));
+            assert!(msg.contains("Cure"));
+        }
+        // Allowed: multi-writer WITHOUT a cluster (scale as N stateless nodes).
+        assert!(multi_writer_cluster_refusal(true, false, false, false).is_none());
+        // Allowed: single-writer WITH a cluster (uses Raft, as before).
+        assert!(multi_writer_cluster_refusal(false, true, true, true).is_none());
+    }
+
+    /// C7 — the backend-aware `kv-status` descriptor is honest per backend: a multi-writer Postgres
+    /// reports family `sql` / dialect `postgres` / `multi_writer` / coordination `shared` with the
+    /// cp-id + member count; SlateDB reports `slatedb` / `single_writer` / `none` and NO cp-id. The
+    /// SQL location is credential-redacted (the env var NAME, never the URL).
+    #[test]
+    fn kv_status_descriptor_is_backend_honest() {
+        use super::build_kv_status_info;
+        use boatramp_core::shared_mode::ControlPlaneJoinReport;
+        use std::path::Path;
+
+        let mut pg = sql_cfg("postgres");
+        pg.url_env = Some("BOATRAMP_PG_URL".to_string());
+        let report = ControlPlaneJoinReport {
+            control_plane_id: "7f3adeadbeef".to_string(),
+            created_new: false,
+            this_node: "node-x".to_string(),
+            members_seen: 3,
+        };
+        let info = build_kv_status_info(
+            KvBackend::Sql,
+            Some(&pg),
+            true,
+            Path::new("./data"),
+            None,
+            "node-x",
+            Some(&report),
+        );
+        assert_eq!(info.backend_family, "sql");
+        assert_eq!(info.backend_dialect.as_deref(), Some("postgres"));
+        assert_eq!(info.writer_model, "multi_writer");
+        assert_eq!(info.coordination_mode, "shared");
+        assert_eq!(info.control_plane_id.as_deref(), Some("cp-7f3adead"));
+        assert_eq!(info.members_seen, Some(3));
+        assert!(
+            info.location.contains("BOATRAMP_PG_URL") && !info.location.contains("://"),
+            "location names the env var, never the URL: {}",
+            info.location
+        );
+
+        let slate = build_kv_status_info(
+            KvBackend::Slatedb,
+            None,
+            false,
+            Path::new("./data"),
+            None,
+            "node-x",
+            None,
+        );
+        assert_eq!(slate.backend_family, "slatedb");
+        assert_eq!(slate.writer_model, "single_writer");
+        assert_eq!(slate.coordination_mode, "none");
+        assert!(slate.control_plane_id.is_none());
+    }
+
+    /// C4 — a SQL open failure routes to the recovery listener (NOT `exit`/propagate); SlateDB keeps
+    /// its own recovery route; memory/cloudflare propagate (memory never fails; CF has no local store).
+    #[test]
+    fn sql_open_failure_routes_to_recovery_not_exit() {
+        assert_eq!(
+            kv_open_failure_route(KvBackend::Sql),
+            KvOpenFailureRoute::SqlRecovery,
+            "a SQL open failure must enter the recovery listener, never exit(1)"
+        );
+        assert_eq!(
+            kv_open_failure_route(KvBackend::Slatedb),
+            KvOpenFailureRoute::SlatedbRecovery
+        );
+        assert_eq!(
+            kv_open_failure_route(KvBackend::Memory),
+            KvOpenFailureRoute::Propagate
+        );
+        assert_eq!(
+            kv_open_failure_route(KvBackend::Cloudflare),
+            KvOpenFailureRoute::Propagate
+        );
+    }
 
     /// **A3** — bounded close: a stalled `close()` is abandoned at the CONFIGURED `close_deadline`
     /// (v0.9.0 KV-recovery, C12 — no longer the old hardcoded 3s) so the process still makes progress

@@ -53,6 +53,9 @@ pub mod project;
 pub mod secret_store;
 /// The duplex/resumable session delivery-semantics model (Stage 1 of `PLAN-session-primitive`).
 pub mod session;
+/// Shared-mode coordination (kv-sql WS4): the non-Raft leader lease (C1) + positive control-plane
+/// identity / liveness roster (UX-C1) a multi-writer backend uses for N stateless nodes without Raft.
+pub mod shared_mode;
 pub mod sql;
 /// Host-side parse-and-rewrite confinement of a guest's **raw-SQL target read** (R4/D8): the
 /// AST-level analog of the `orm` path's `PerTableTarget` per-table confinement, injecting
