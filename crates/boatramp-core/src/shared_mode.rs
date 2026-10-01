@@ -27,7 +27,11 @@
 //! needs none of that: it is pure `KvStore` ops, and its single-leader guarantee REDUCES to the same
 //! linearizable-CAS invariant the campaign already mutation-gates
 //! (`cas_race_has_exactly_one_winner`). MySQL's `GET_LOCK` is the analogous native primitive and has
-//! the same pool-fit problem; it is left as a clearly-marked seam for the MySQL workstream (WS6).
+//! the same pool-fit problem. **WS6 resolved this seam by confirmation, not code:** because the
+//! lease is pure `KvStore` CAS, it runs over the MySQL `SqlKv` UNCHANGED — the live
+//! `mysql_shared_election_single_leader_under_concurrency` gate proves exactly-one-leader +
+//! bounded failover over a real MySQL primary, so NO `GET_LOCK` (and no off-pool connection) is
+//! needed on any multi-writer engine.
 //!
 //! ## Single-leader + bounded-failover guarantee (the make-or-break)
 //! The lease record is a single CAS'd value `{holder, epoch, renewed_at_ms}` at [`LEADER_KEY`]. A
