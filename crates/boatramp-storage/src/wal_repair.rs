@@ -1408,6 +1408,17 @@ async fn generation_structurally_openable(
 /// the shipped `false` is a runtime value, not a clippy constant-condition lint.
 #[inline]
 fn stop_at_first_decodable() -> bool {
+    // Mutation seam, compiled out of shipped binaries (cfg(test) only — never a production env
+    // backdoor): under `cargo test` with BOATRAMP_KVMANIFEST_MUTATION=stop_at_first_decodable the walk
+    // reverts to v0.11.0's "adopt the newest DECODABLE generation" (skipping the openability check), so
+    // the CI mutation loop can confirm `recover_adopts_newest_openable_generation_and_crown_jewel_survives`
+    // + `self_heal_walk_skips_a_decodable_but_unopenable_generation` go RED. Shipped: always false.
+    #[cfg(test)]
+    {
+        if std::env::var("BOATRAMP_KVMANIFEST_MUTATION").as_deref() == Ok("stop_at_first_decodable") {
+            return true;
+        }
+    }
     false
 }
 
