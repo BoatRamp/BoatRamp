@@ -1,68 +1,97 @@
 //! [`SqlKv`] — a [`KvStore`](boatramp_core::kv::KvStore) over the existing SQL connection layer,
 //! the SQL-backed control-plane metadata store alongside the object-store (SlateDB) family.
 //!
-//! **This workstream (build-order step 1) wires the SQLite / libsql-LOCAL single-writer path only**
-//! — the lowest-risk standalone win that also deletes the SlateDB torn-manifest / `.compactions`
-//! durability class for a single box. Postgres and MySQL are later workstreams (step 2 / step 6):
-//! the SQL here is **dialect-parameterized** (every statement is produced by
-//! [`statements_for`], keyed on [`Dialect`]) and the writer-model declaration already branches on
-//! the dialect, so adding the Postgres/MySQL pools slots in without reshaping this module — but
-//! only the SQLite dialect is CONSTRUCTED and exercised today (`statements_for` panics for the
-//! others, and the only constructor, [`SqlKv::open_sqlite_local`], pins [`Dialect::Sqlite`]).
+//! Two backings share one dialect-parameterized shape — every statement is produced by
+//! [`statements_for`], keyed on [`Dialect`], and the ops dispatch on an internal [`Backing`]:
+//! - **SQLite / libsql-LOCAL** (build-order step 1, feature `sql`) — the embedded **single-writer**
+//!   store: the lowest-risk standalone win that also deletes the SlateDB torn-manifest /
+//!   `.compactions` durability class for a single box.
+//! - **Postgres** (build-order step 2, feature `sql-postgres`) — the **multi-writer** store: N equal
+//!   stateless nodes point at one shared primary; the engine serializes concurrent writers itself, so
+//!   the value-predicate CAS below is cross-connection linearizable w.r.t. the primary and
+//!   [`writer_model`](KvStore::writer_model) is [`MultiWriter`](WriterModel::MultiWriter).
+//!
+//! MySQL (`UPDATE … WHERE value=` / `INSERT IGNORE`) and shared-mode coordination (ChangePublisher,
+//! the stale-authz fence, the non-Raft singleton election) are later workstreams; the dialect +
+//! [`statements_for`] seam and the [`Backing`] split keep them ready to slot in without reshaping the
+//! ops. `statements_for` has no arm for an un-built dialect, so one is never reachable.
 //!
 //! ## Schema (host-owned, created idempotently on open — Architect C9)
-//! Two tables, created with the same `CREATE TABLE IF NOT EXISTS` host pattern the migration
-//! substrate's `ensure_ledger` uses (NOT the guest `project migrate` tool):
-//! - `kv(key BLOB PRIMARY KEY, value BLOB NOT NULL, version BIGINT NOT NULL)` — the store itself.
-//!   Keys are the `&str` key's UTF-8 bytes stored as a BLOB so comparison/ordering is bytewise
-//!   (matching Rust `str` byte order), and values are the raw bytes (an empty value is a
-//!   zero-length BLOB, distinct from an absent key). `version` bumps on every write — the basis a
-//!   later workstream's crown-jewel CAS and the change log build on.
-//! - `kv_changes(seq INTEGER PRIMARY KEY AUTOINCREMENT, key BLOB, version BIGINT, ts INTEGER)` —
-//!   the append-only change log. The SQLite single-writer path does not need cross-node change
-//!   propagation yet, but every write appends a row here (a put/CAS-win records the post-write
-//!   version; a delete records a tombstone — `version = 0`, since live versions start at `1`) so
-//!   the multi-writer ChangePublisher of a later workstream has the ledger it polls.
+//! Two tables, created with the same idempotent `CREATE TABLE IF NOT EXISTS` host pattern the
+//! migration substrate's `ensure_ledger` uses (NOT the guest `project migrate` tool):
+//! - `kv(key BLOB/BYTEA PRIMARY KEY, value BLOB/BYTEA NOT NULL, version BIGINT NOT NULL)` — the store
+//!   itself. Keys are the `&str` key's UTF-8 bytes stored as a byte string so comparison/ordering is
+//!   bytewise (matching Rust `str` byte order — SQLite BLOB and Postgres BYTEA both order by raw
+//!   bytes), and values are the raw bytes (an empty value is a zero-length byte string, distinct from
+//!   an absent key). `version` bumps on every write.
+//! - `kv_changes(seq INTEGER/BIGSERIAL PRIMARY KEY, key …, version BIGINT, ts …)` — the append-only
+//!   change log. The single-writer SQLite path needs no cross-node propagation yet, but every write
+//!   appends a row here (a put/CAS-win records the post-write version; a delete records a tombstone —
+//!   `version = 0`, since live versions start at `1`) so the multi-writer ChangePublisher of a later
+//!   workstream has the ledger it polls.
 //!
 //! ## CAS — value-predicate, single-statement, winner-by-rows-affected (MF-2 shape)
 //! [`KvStore::compare_and_swap`](boatramp_core::kv::KvStore::compare_and_swap) is VALUE-based
 //! (`expected: Option<&[u8]>`, whole-record bytes). The decision is ALWAYS one statement whose
 //! rows-affected names the winner — never a follow-up `SELECT`:
-//! - present-key: `UPDATE kv SET value=?, version=version+1 WHERE key=? AND value=?` → winner iff
+//! - present-key: `UPDATE kv SET value=?2, version=version+1 WHERE key=?1 AND value=?3` → winner iff
 //!   `rows_affected == 1`.
 //! - absent-key (`expected = None`): `INSERT INTO kv (…) VALUES (…) ON CONFLICT(key) DO NOTHING` →
 //!   winner iff `rows_affected == 1`.
 //!
-//! A single SQLite database serializes its writers, so this is a linearizable CAS w.r.t. that one
-//! store — [`SqlKv::supports_cas`] is `true`, honestly, for the SQLite single-writer backend.
+//! On Postgres under the default READ COMMITTED isolation this is linearizable w.r.t. the primary: a
+//! second present-key writer blocks on the row lock, re-reads the committed row under EvalPlanQual,
+//! re-applies the `value=` predicate, and matches 0 rows; a second absent-key writer sees the
+//! committed row and `DO NOTHING` affects 0 rows. A single SQLite database serializes its writers, so
+//! it is linearizable w.r.t. that one store. [`SqlKv::supports_cas`] is `true` for both — honestly,
+//! because every CAS (and, in later workstreams, every authz/crown-jewel read) targets the primary,
+//! never a lagging replica. The change-log append runs ONLY for the winner, in the same transaction.
 //!
-//! ## Synchronous-commit durability (Architect C6)
-//! Every mutating op returns ONLY after its transaction has COMMITted durably: the database is
-//! opened in **WAL** mode with **`PRAGMA synchronous = FULL`**, so each `COMMIT` fsyncs the WAL
-//! before the call returns — no async-buffered ack. (WAL is persisted in the file header; the
-//! per-connection `synchronous` is re-asserted on every connection the write path opens.) This is
-//! what makes the [`CheckpointKv`](boatramp_core::kv::CheckpointKv) wrapper already correct over
-//! `SqlKv`: a durable `put` plus the trait's no-op `checkpoint()`.
+//! ## Synchronous-commit durability (Architect C6 / MF-5)
+//! Every mutating op returns ONLY after its transaction has COMMITted durably:
+//! - SQLite: opened in **WAL** mode with **`PRAGMA synchronous = FULL`**, so each `COMMIT` fsyncs the
+//!   WAL before the call returns (the per-connection `synchronous` is re-asserted on every write
+//!   connection).
+//! - Postgres: a committed txn is durable iff `synchronous_commit = on`; a non-durable setting could
+//!   drop a committed revoke on crash, so [`SqlKv::open_postgres`] reads `current_setting(
+//!   'synchronous_commit')` at open and **FAILS LOUD** unless it is `on`.
+//!
+//! This is what makes the [`CheckpointKv`](boatramp_core::kv::CheckpointKv) wrapper already correct
+//! over `SqlKv`: a durable `put`/CAS-win plus the trait's no-op `checkpoint()`.
 
-use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use boatramp_core::kv::{KvError, KvStore, WriteOp, WriterModel};
 use boatramp_core::sql::Dialect;
+
+#[cfg(feature = "sql")]
 use libsql::{Builder, Connection, Database, Value as LibsqlValue};
+#[cfg(feature = "sql")]
+use std::path::Path;
+
+#[cfg(feature = "sql-postgres")]
+use boatramp_core::sql::{SqlBackend, SqlTransaction, SqlValue};
 
 /// How long a contended writer waits for the single-writer lock before erroring (local SQLite).
 /// Keep it under the control-plane per-op timeout so a genuinely stuck lock surfaces as an error
 /// rather than hanging; a racing CAS/write simply waits its turn here (the single-writer serialize).
+#[cfg(feature = "sql")]
 const BUSY_TIMEOUT_MS: u32 = 5_000;
+
+/// The default Postgres pool size (MF-2: a shared-mode CAS wants ≥16 connections so a burst of
+/// concurrent control-plane writers genuinely contends rather than queueing on the pool). The
+/// operator overrides it via `[serve.kv.sql] pool_max`.
+#[cfg(feature = "sql-postgres")]
+const DEFAULT_PG_POOL_MAX: u32 = 16;
 
 /// The fixed set of host-authored statements for one SQL dialect. Every field is `&'static` so the
 /// whole set is `Copy` and resolved once at open ([`statements_for`]); the placeholders are the
-/// canonical `?N` form (libsql speaks it natively — the external Postgres/MySQL path of a later
-/// workstream rewrites `?N` via `sql_placeholders`). All statements are host-built with bound
-/// parameters only (never guest text), so no placeholder validation is needed here.
+/// canonical `?N` form — libsql speaks it natively, and the external Postgres path rewrites `?N` →
+/// `$N` through the existing `sql_placeholders` normalizer inside the sqlx `SqlBackend`. All
+/// statements are host-built with bound parameters only (never guest text), so no placeholder
+/// validation is needed here.
 #[derive(Debug, Clone, Copy)]
 struct KvStatements {
     /// Idempotent `CREATE TABLE IF NOT EXISTS` DDL for `kv` + `kv_changes` (run in order on open).
@@ -91,7 +120,8 @@ struct KvStatements {
     cas_absent: &'static str,
 }
 
-/// SQLite / libsql statement set — the only dialect this workstream constructs.
+/// SQLite / libsql statement set. `ts` is an `INTEGER` (unix seconds); keys/values are `BLOB`.
+#[cfg(feature = "sql")]
 const SQLITE_STATEMENTS: KvStatements = KvStatements {
     ddl: &[
         "CREATE TABLE IF NOT EXISTS kv (\
@@ -122,29 +152,81 @@ const SQLITE_STATEMENTS: KvStatements = KvStatements {
                  ON CONFLICT(key) DO NOTHING",
 };
 
-/// Resolve the statement set for `dialect`. Only [`Dialect::Sqlite`] is wired in this workstream;
-/// the Postgres/MySQL arms (BYTEA/BIGSERIAL types, `$N`/`?` placeholders, and the MySQL
-/// `UPDATE … WHERE value=` / `INSERT IGNORE` CAS shapes) are built with their pools in build-order
-/// steps 2 and 6. The only constructor pins [`Dialect::Sqlite`], so the other arms are never reached.
+/// Postgres statement set. Identical SQL text to SQLite (the `?N` → `$N` rewrite and value
+/// marshalling happen in the sqlx `SqlBackend` layer, and `ON CONFLICT … DO UPDATE/NOTHING` +
+/// `excluded` are shared between the two engines) — ONLY the DDL types differ: `BYTEA` keys/values,
+/// `BIGSERIAL` for the change-log sequence, `BIGINT` for `ts`.
+#[cfg(feature = "sql-postgres")]
+const POSTGRES_STATEMENTS: KvStatements = KvStatements {
+    ddl: &[
+        "CREATE TABLE IF NOT EXISTS kv (\
+         key BYTEA PRIMARY KEY, \
+         value BYTEA NOT NULL, \
+         version BIGINT NOT NULL\
+         )",
+        "CREATE TABLE IF NOT EXISTS kv_changes (\
+         seq BIGSERIAL PRIMARY KEY, \
+         key BYTEA NOT NULL, \
+         version BIGINT NOT NULL, \
+         ts BIGINT NOT NULL\
+         )",
+    ],
+    get: "SELECT value FROM kv WHERE key = ?1",
+    upsert: "INSERT INTO kv (key, value, version) VALUES (?1, ?2, 1) \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value, version = kv.version + 1",
+    append_change: "INSERT INTO kv_changes (key, version, ts) \
+                    SELECT key, version, ?2 FROM kv WHERE key = ?1",
+    delete: "DELETE FROM kv WHERE key = ?1",
+    delete_change: "INSERT INTO kv_changes (key, version, ts) VALUES (?1, 0, ?2)",
+    list_prefix_bounded: "SELECT key FROM kv WHERE key >= ?1 AND key < ?2 ORDER BY key",
+    list_prefix_all: "SELECT key FROM kv WHERE key >= ?1 ORDER BY key",
+    list_from_bounded: "SELECT key FROM kv WHERE key > ?1 AND key < ?2 ORDER BY key LIMIT ?3",
+    list_from_all: "SELECT key FROM kv WHERE key > ?1 ORDER BY key LIMIT ?2",
+    cas_present: "UPDATE kv SET value = ?2, version = version + 1 WHERE key = ?1 AND value = ?3",
+    cas_absent: "INSERT INTO kv (key, value, version) VALUES (?1, ?2, 1) \
+                 ON CONFLICT(key) DO NOTHING",
+};
+
+/// Resolve the statement set for `dialect`. Each arm is gated on the engine feature that CONSTRUCTS
+/// that dialect (SQLite → `sql`, Postgres → `sql-postgres`), so an un-built dialect has no statement
+/// set and is unreachable — the only constructors ([`SqlKv::open_sqlite_local`] /
+/// [`SqlKv::open_postgres`]) pin a dialect that is always compiled in their own build.
 fn statements_for(dialect: Dialect) -> KvStatements {
     match dialect {
+        #[cfg(feature = "sql")]
         Dialect::Sqlite => SQLITE_STATEMENTS,
-        Dialect::Postgres | Dialect::Mysql => unreachable!(
-            "the Postgres/MySQL SqlKv execution path is wired in a later workstream (step 2/6); \
-             this workstream constructs only the SQLite dialect"
+        #[cfg(feature = "sql-postgres")]
+        Dialect::Postgres => POSTGRES_STATEMENTS,
+        other => unreachable!(
+            "SqlKv has no statement set for {other:?} in this build (its engine feature is off); \
+             the constructors only pin a dialect compiled in their own build"
         ),
     }
 }
 
-/// A SQL-backed [`KvStore`]. This workstream backs it with an embedded **SQLite / libsql local
-/// file** (single-writer); the `dialect` + [`statements_for`] seam keeps the SQL generation ready
-/// for the Postgres/MySQL pools of a later workstream without reshaping the ops.
+/// The engine backing a [`SqlKv`]. One variant per compiled engine; the trait ops match on it.
+enum Backing {
+    /// An embedded SQLite / libsql local database (single-writer). Each op opens a fresh connection
+    /// off this shared `Database` handle.
+    #[cfg(feature = "sql")]
+    Sqlite(Arc<Database>),
+    /// An external Postgres primary over the existing sqlx pool layer (multi-writer). Each op drives
+    /// a transaction through the `SqlBackend`, which rewrites `?N` → `$N` and marshals values.
+    #[cfg(feature = "sql-postgres")]
+    Postgres(Arc<dyn SqlBackend>),
+}
+
+/// A SQL-backed [`KvStore`]. Backed by an embedded SQLite file ([`open_sqlite_local`](Self::open_sqlite_local),
+/// single-writer) or an external Postgres primary ([`open_postgres`](Self::open_postgres),
+/// multi-writer); the `dialect` + [`statements_for`] seam keeps the SQL generation ready for the
+/// MySQL pool of a later workstream without reshaping the ops.
 pub struct SqlKv {
-    db: Arc<Database>,
+    backing: Backing,
     dialect: Dialect,
     stmts: KvStatements,
 }
 
+#[cfg(feature = "sql")]
 impl SqlKv {
     /// Open (creating if absent) a local SQLite database file at `path` as the control-plane KV,
     /// in **WAL** mode with **`synchronous = FULL`** (synchronous-commit, C6), and create the
@@ -168,114 +250,99 @@ impl SqlKv {
             conn.execute(ddl, ()).await.map_err(kv_err)?;
         }
         Ok(Self {
-            db: Arc::new(db),
+            backing: Backing::Sqlite(Arc::new(db)),
             dialect: Dialect::Sqlite,
             stmts,
         })
     }
+}
 
-    /// A connection tuned for the control-plane KV: a contended writer WAITS for the single-writer
-    /// lock (`busy_timeout`) rather than erroring, and `synchronous = FULL` makes its commits fsync
-    /// before returning (C6). Each op opens a fresh connection off the shared `Database` (as the
-    /// libsql `SqlBackend` does), so concurrent ops each get their own transaction.
-    async fn connect(&self) -> Result<Connection, KvError> {
-        let conn = self.db.connect().map_err(kv_err)?;
-        run_pragma(&conn, &format!("PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")).await?;
-        run_pragma(&conn, "PRAGMA synchronous=FULL").await?;
-        Ok(conn)
-    }
-
-    /// The pragmas the WRITE path actually opens its connections with — `(journal_mode,
-    /// synchronous)` — read back on a freshly-tuned connection. Proves the synchronous-commit
-    /// contract (C6) at the seam the writes use: WAL + `synchronous = FULL` (`2`).
-    #[cfg(test)]
-    pub(crate) async fn debug_pragmas(&self) -> Result<(String, i64), KvError> {
-        let conn = self.connect().await?;
-        let journal = match query_one(&conn, "PRAGMA journal_mode").await? {
-            Some(LibsqlValue::Text(s)) => s,
-            other => format!("{other:?}"),
-        };
-        let synchronous = match query_one(&conn, "PRAGMA synchronous").await? {
-            Some(LibsqlValue::Integer(n)) => n,
-            _ => -1,
-        };
-        Ok((journal, synchronous))
+#[cfg(feature = "sql-postgres")]
+impl SqlKv {
+    /// Open an external **Postgres primary** as the multi-writer control-plane KV, over the EXISTING
+    /// sqlx pool layer ([`connect`](crate::sql_sqlx::connect) /
+    /// [`ExternalSqlOptions`](crate::sql_sqlx::ExternalSqlOptions)). The pool is lazy (the first
+    /// statement below forces the first connection); `pool_max` caps it (default
+    /// [`DEFAULT_PG_POOL_MAX`] = 16 — MF-2 wants ≥16 so concurrent control-plane writers contend on
+    /// the DB, not the pool). `url` is the connection URL resolved from its `url_env` by the caller —
+    /// never a raw URL in config (UX-C2).
+    ///
+    /// Enforces the C6/MF-5 **durable-commit contract** at open: reads `synchronous_commit` and FAILS
+    /// LOUD unless it is `on` (a non-durable setting could drop a committed revoke on crash). Then
+    /// creates the `kv` + `kv_changes` tables idempotently (host-owned DDL, C9).
+    pub async fn open_postgres(
+        url: impl Into<String>,
+        pool_max: Option<u32>,
+    ) -> Result<Self, KvError> {
+        use crate::sql_sqlx::{ExternalSqlKind, ExternalSqlOptions, connect};
+        let max = pool_max.filter(|n| *n >= 1).unwrap_or(DEFAULT_PG_POOL_MAX);
+        let opts = ExternalSqlOptions::new(url).with_max_connections(Some(max));
+        let backend = connect(ExternalSqlKind::Postgres, &opts).map_err(sql_err)?;
+        // C6 / MF-5: a committed txn must be durable before a put/CAS returns. This also forces the
+        // first (lazy) connection, so a connect failure surfaces here.
+        assert_synchronous_commit_on(backend.as_ref()).await?;
+        let stmts = statements_for(Dialect::Postgres);
+        for ddl in stmts.ddl {
+            backend.run_script(ddl).await.map_err(sql_err)?;
+        }
+        Ok(Self {
+            backing: Backing::Postgres(backend),
+            dialect: Dialect::Postgres,
+            stmts,
+        })
     }
 }
 
 #[async_trait]
 impl KvStore for SqlKv {
     async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, KvError> {
-        let conn = self.connect().await?;
-        let mut rows = conn
-            .query(self.stmts.get, libsql::params_from_iter([blob(key)]))
-            .await
-            .map_err(kv_err)?;
-        match rows.next().await.map_err(kv_err)? {
-            Some(row) => Ok(Some(value_bytes(row.get_value(0).map_err(kv_err)?)?)),
-            None => Ok(None),
+        match &self.backing {
+            #[cfg(feature = "sql")]
+            Backing::Sqlite(db) => sqlite_get(db, &self.stmts, key).await,
+            #[cfg(feature = "sql-postgres")]
+            Backing::Postgres(b) => pg_get(b.as_ref(), &self.stmts, key).await,
         }
     }
 
     async fn put(&self, key: &str, value: Vec<u8>) -> Result<(), KvError> {
-        let conn = self.connect().await?;
-        begin(&conn).await?;
-        let ts = now_ts();
-        let res = async {
-            conn.execute(
-                self.stmts.upsert,
-                libsql::params_from_iter([blob(key), LibsqlValue::Blob(value)]),
-            )
-            .await
-            .map_err(kv_err)?;
-            conn.execute(
-                self.stmts.append_change,
-                libsql::params_from_iter([blob(key), LibsqlValue::Integer(ts)]),
-            )
-            .await
-            .map_err(kv_err)?;
-            Ok(())
+        match &self.backing {
+            #[cfg(feature = "sql")]
+            Backing::Sqlite(db) => sqlite_put(db, &self.stmts, key, value).await,
+            #[cfg(feature = "sql-postgres")]
+            Backing::Postgres(b) => {
+                pg_write_batch(
+                    b.as_ref(),
+                    &self.stmts,
+                    vec![WriteOp::Put(key.to_string(), value)],
+                )
+                .await
+            }
         }
-        .await;
-        finish(&conn, res).await
     }
 
     async fn delete(&self, key: &str) -> Result<(), KvError> {
-        let conn = self.connect().await?;
-        begin(&conn).await?;
-        let ts = now_ts();
-        let res = async {
-            let affected = conn
-                .execute(self.stmts.delete, libsql::params_from_iter([blob(key)]))
-                .await
-                .map_err(kv_err)?;
-            // Only record a tombstone when a row was actually removed (deleting a missing key is a
-            // no-op per the trait contract, so it leaves the change log untouched).
-            if affected > 0 {
-                conn.execute(
-                    self.stmts.delete_change,
-                    libsql::params_from_iter([blob(key), LibsqlValue::Integer(ts)]),
+        match &self.backing {
+            #[cfg(feature = "sql")]
+            Backing::Sqlite(db) => sqlite_delete(db, &self.stmts, key).await,
+            #[cfg(feature = "sql-postgres")]
+            Backing::Postgres(b) => {
+                pg_write_batch(
+                    b.as_ref(),
+                    &self.stmts,
+                    vec![WriteOp::Delete(key.to_string())],
                 )
                 .await
-                .map_err(kv_err)?;
             }
-            Ok(())
         }
-        .await;
-        finish(&conn, res).await
     }
 
     async fn list_prefix(&self, prefix: &str) -> Result<Vec<String>, KvError> {
-        let conn = self.connect().await?;
-        let lower = prefix.as_bytes().to_vec();
-        let (sql, params) = match prefix_successor(&lower) {
-            Some(upper) => (
-                self.stmts.list_prefix_bounded,
-                vec![LibsqlValue::Blob(lower), LibsqlValue::Blob(upper)],
-            ),
-            None => (self.stmts.list_prefix_all, vec![LibsqlValue::Blob(lower)]),
-        };
-        collect_keys(&conn, sql, params).await
+        match &self.backing {
+            #[cfg(feature = "sql")]
+            Backing::Sqlite(db) => sqlite_list_prefix(db, &self.stmts, prefix).await,
+            #[cfg(feature = "sql-postgres")]
+            Backing::Postgres(b) => pg_list_prefix(b.as_ref(), &self.stmts, prefix).await,
+        }
     }
 
     async fn list_from(
@@ -284,76 +351,38 @@ impl KvStore for SqlKv {
         after: &str,
         limit: usize,
     ) -> Result<Vec<String>, KvError> {
-        let conn = self.connect().await?;
-        let prefix_bytes = prefix.as_bytes().to_vec();
-        let mut start = prefix_bytes.clone();
-        start.extend_from_slice(after.as_bytes());
-        let lim = LibsqlValue::Integer(limit as i64);
-        let (sql, params) = match prefix_successor(&prefix_bytes) {
-            Some(upper) => (
-                self.stmts.list_from_bounded,
-                vec![LibsqlValue::Blob(start), LibsqlValue::Blob(upper), lim],
-            ),
-            None => (
-                self.stmts.list_from_all,
-                vec![LibsqlValue::Blob(start), lim],
-            ),
-        };
-        collect_keys(&conn, sql, params).await
+        match &self.backing {
+            #[cfg(feature = "sql")]
+            Backing::Sqlite(db) => sqlite_list_from(db, &self.stmts, prefix, after, limit).await,
+            #[cfg(feature = "sql-postgres")]
+            Backing::Postgres(b) => {
+                pg_list_from(b.as_ref(), &self.stmts, prefix, after, limit).await
+            }
+        }
     }
 
     fn atomic_write_batch(&self) -> bool {
-        // The whole batch commits inside one `BEGIN IMMEDIATE … COMMIT` (below), so a crash can
-        // never leave it partially applied — the ready-set fast path (B2) is safe over it.
+        // The whole batch commits inside one transaction (SQLite `BEGIN IMMEDIATE … COMMIT`; Postgres
+        // `BEGIN … COMMIT`), so a crash can never leave it partially applied — the ready-set fast
+        // path (B2) is safe over it on either backend.
         true
     }
 
     async fn write_batch(&self, ops: Vec<WriteOp>) -> Result<(), KvError> {
-        let conn = self.connect().await?;
-        begin(&conn).await?;
-        let ts = now_ts();
-        let res = async {
-            for op in &ops {
-                match op {
-                    WriteOp::Put(key, value) => {
-                        conn.execute(
-                            self.stmts.upsert,
-                            libsql::params_from_iter([blob(key), LibsqlValue::Blob(value.clone())]),
-                        )
-                        .await
-                        .map_err(kv_err)?;
-                        conn.execute(
-                            self.stmts.append_change,
-                            libsql::params_from_iter([blob(key), LibsqlValue::Integer(ts)]),
-                        )
-                        .await
-                        .map_err(kv_err)?;
-                    }
-                    WriteOp::Delete(key) => {
-                        let affected = conn
-                            .execute(self.stmts.delete, libsql::params_from_iter([blob(key)]))
-                            .await
-                            .map_err(kv_err)?;
-                        if affected > 0 {
-                            conn.execute(
-                                self.stmts.delete_change,
-                                libsql::params_from_iter([blob(key), LibsqlValue::Integer(ts)]),
-                            )
-                            .await
-                            .map_err(kv_err)?;
-                        }
-                    }
-                }
-            }
-            Ok(())
+        match &self.backing {
+            #[cfg(feature = "sql")]
+            Backing::Sqlite(db) => sqlite_write_batch(db, &self.stmts, ops).await,
+            #[cfg(feature = "sql-postgres")]
+            Backing::Postgres(b) => pg_write_batch(b.as_ref(), &self.stmts, ops).await,
         }
-        .await;
-        finish(&conn, res).await
     }
 
     fn supports_cas(&self) -> bool {
-        // A single SQLite database serializes its writers, so the single-statement value-predicate
-        // CAS below is linearizable w.r.t. this store: two racing swappers can never both win.
+        // The single-statement value-predicate CAS below is linearizable w.r.t. the one store each
+        // backing targets: a single SQLite database serializes its writers, and a Postgres PRIMARY
+        // serializes them cross-connection via the row lock (READ COMMITTED EvalPlanQual). Every CAS
+        // — and, in later workstreams, every authz/crown-jewel read — targets the primary, never a
+        // lagging replica. So two racing swappers can never both win.
         true
     }
 
@@ -363,56 +392,18 @@ impl KvStore for SqlKv {
         expected: Option<&[u8]>,
         new: Vec<u8>,
     ) -> Result<bool, KvError> {
-        let conn = self.connect().await?;
-        begin(&conn).await?;
-        let ts = now_ts();
-        let res = async {
-            // ONE statement decides the winner by rows-affected — never a read-then-write.
-            let won = match expected {
-                Some(expected) => {
-                    let affected = conn
-                        .execute(
-                            self.stmts.cas_present,
-                            libsql::params_from_iter([
-                                blob(key),
-                                LibsqlValue::Blob(new),
-                                LibsqlValue::Blob(expected.to_vec()),
-                            ]),
-                        )
-                        .await
-                        .map_err(kv_err)?;
-                    affected == 1
-                }
-                None => {
-                    let affected = conn
-                        .execute(
-                            self.stmts.cas_absent,
-                            libsql::params_from_iter([blob(key), LibsqlValue::Blob(new)]),
-                        )
-                        .await
-                        .map_err(kv_err)?;
-                    affected == 1
-                }
-            };
-            // Only the winner mutated the store, so only the winner appends a change-log row.
-            if won {
-                conn.execute(
-                    self.stmts.append_change,
-                    libsql::params_from_iter([blob(key), LibsqlValue::Integer(ts)]),
-                )
-                .await
-                .map_err(kv_err)?;
-            }
-            Ok(won)
+        match &self.backing {
+            #[cfg(feature = "sql")]
+            Backing::Sqlite(db) => sqlite_cas(db, &self.stmts, key, expected, new).await,
+            #[cfg(feature = "sql-postgres")]
+            Backing::Postgres(b) => pg_cas(b.as_ref(), &self.stmts, key, expected, new).await,
         }
-        .await;
-        finish(&conn, res).await
     }
 
     fn writer_model(&self) -> WriterModel {
-        // The writer-model DECLARATION (the whole point of the mechanism): SQLite/libsql-local is a
-        // single-writer store; the self-serializing Postgres/MySQL dialects (a later workstream)
-        // declare MultiWriter. Correct for every dialect even though only SQLite is built today.
+        // The writer-model DECLARATION the node bootstrap derives coordination from: SQLite/libsql-
+        // local is a single-writer store; the self-serializing Postgres (and the later MySQL) dialect
+        // declares MultiWriter (the engine IS the coordinator — N stateless nodes, no Raft).
         match self.dialect {
             Dialect::Sqlite => WriterModel::SingleWriter,
             Dialect::Postgres | Dialect::Mysql => WriterModel::MultiWriter,
@@ -420,9 +411,554 @@ impl KvStore for SqlKv {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Postgres (feature `sql-postgres`) — over the existing sqlx `SqlBackend` layer.
+// ---------------------------------------------------------------------------
+
+/// Read `synchronous_commit` on the primary and FAIL LOUD unless it is `on` (C6 / MF-5). A SELECT of
+/// `current_setting(...)` (not a `SHOW`, so it binds through the prepared protocol cleanly) returns
+/// the effective session value; the KV database/role default must be `on` so a committed revoke
+/// survives a crash.
+#[cfg(feature = "sql-postgres")]
+async fn assert_synchronous_commit_on(backend: &dyn SqlBackend) -> Result<(), KvError> {
+    let mut tx = backend.begin_read_only().await.map_err(sql_err)?;
+    let rows = tx
+        .query("SELECT current_setting('synchronous_commit')", &[])
+        .await
+        .map_err(sql_err)?;
+    tx.commit().await.map_err(sql_err)?;
+    let setting = rows
+        .rows
+        .into_iter()
+        .next()
+        .and_then(|r| r.into_iter().next())
+        .and_then(|v| match v {
+            SqlValue::Text(s) => Some(s),
+            _ => None,
+        })
+        .unwrap_or_default();
+    if !setting.eq_ignore_ascii_case("on") {
+        return Err(KvError::backend(format!(
+            "Postgres `synchronous_commit` is {setting:?}, not `on`: a committed control-plane write \
+             (e.g. a token revoke) could be lost on crash. Set `synchronous_commit = on` on the KV \
+             database/role before using Postgres as the boatramp control-plane KV."
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "sql-postgres")]
+async fn pg_get(
+    backend: &dyn SqlBackend,
+    stmts: &KvStatements,
+    key: &str,
+) -> Result<Option<Vec<u8>>, KvError> {
+    let mut tx = backend.begin_read_only().await.map_err(sql_err)?;
+    let rows = tx
+        .query(stmts.get, &[SqlValue::Blob(key.as_bytes().to_vec())])
+        .await
+        .map_err(sql_err)?;
+    tx.commit().await.map_err(sql_err)?;
+    match rows.rows.into_iter().next() {
+        Some(row) => {
+            let cell = row
+                .into_iter()
+                .next()
+                .ok_or_else(|| KvError::backend("kv get row had no columns"))?;
+            Ok(Some(pg_bytes(cell)?))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Apply one put inside an already-open transaction: upsert (version bump) + append the post-write
+/// version to the change log.
+#[cfg(feature = "sql-postgres")]
+async fn pg_apply_put(
+    tx: &mut dyn SqlTransaction,
+    stmts: &KvStatements,
+    key: &str,
+    value: &[u8],
+    ts: i64,
+) -> Result<(), KvError> {
+    let key_blob = SqlValue::Blob(key.as_bytes().to_vec());
+    tx.execute(
+        stmts.upsert,
+        &[key_blob.clone(), SqlValue::Blob(value.to_vec())],
+    )
+    .await
+    .map_err(sql_err)?;
+    tx.execute(stmts.append_change, &[key_blob, SqlValue::Integer(ts)])
+        .await
+        .map_err(sql_err)?;
+    Ok(())
+}
+
+/// Apply one delete inside an already-open transaction: remove the row and, only if a row was
+/// actually removed, append a `version = 0` tombstone (deleting a missing key is a no-op per the
+/// trait contract, so it leaves the change log untouched).
+#[cfg(feature = "sql-postgres")]
+async fn pg_apply_delete(
+    tx: &mut dyn SqlTransaction,
+    stmts: &KvStatements,
+    key: &str,
+    ts: i64,
+) -> Result<(), KvError> {
+    let key_blob = SqlValue::Blob(key.as_bytes().to_vec());
+    let affected = tx
+        .execute(stmts.delete, std::slice::from_ref(&key_blob))
+        .await
+        .map_err(sql_err)?;
+    if affected > 0 {
+        tx.execute(stmts.delete_change, &[key_blob, SqlValue::Integer(ts)])
+            .await
+            .map_err(sql_err)?;
+    }
+    Ok(())
+}
+
+/// Apply all `ops` in ONE transaction (all-or-nothing — `atomic_write_batch` is `true`): on any error
+/// roll back and surface it; otherwise commit. `put`/`delete` route here as single-op batches.
+#[cfg(feature = "sql-postgres")]
+async fn pg_write_batch(
+    backend: &dyn SqlBackend,
+    stmts: &KvStatements,
+    ops: Vec<WriteOp>,
+) -> Result<(), KvError> {
+    let ts = now_ts();
+    let mut tx = backend.begin().await.map_err(sql_err)?;
+    for op in &ops {
+        let res = match op {
+            WriteOp::Put(key, value) => pg_apply_put(tx.as_mut(), stmts, key, value, ts).await,
+            WriteOp::Delete(key) => pg_apply_delete(tx.as_mut(), stmts, key, ts).await,
+        };
+        if let Err(e) = res {
+            let _ = tx.rollback().await;
+            return Err(e);
+        }
+    }
+    tx.commit().await.map_err(sql_err)
+}
+
+/// Whether the `#[cfg(test)]` CAS mutation seam is armed (MF-2 gate). Returns `false` in a non-test
+/// build, so the mutation can never ship. Under `BOATRAMP_KVSQL_MUTATION=drop_cas_predicate` the CAS
+/// below drops its value predicate (present-key UPDATE becomes unconditional; absent-key insert
+/// becomes an unconditional upsert), making EVERY racer a winner — the gate's concurrency assertion
+/// then MUST go RED (two+ winners), proving the predicate is load-bearing.
+#[cfg(feature = "sql-postgres")]
+fn cas_mutation_drops_predicate() -> bool {
+    #[cfg(test)]
+    {
+        std::env::var("BOATRAMP_KVSQL_MUTATION").as_deref() == Ok("drop_cas_predicate")
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
+/// Decide the CAS winner with ONE value-predicate statement (winner iff `rows_affected == 1`), then
+/// append a change-log row ONLY for the winner — all inside `tx`. Never a follow-up `SELECT`.
+#[cfg(feature = "sql-postgres")]
+async fn pg_apply_cas(
+    tx: &mut dyn SqlTransaction,
+    stmts: &KvStatements,
+    key: &str,
+    expected: Option<&[u8]>,
+    new: Vec<u8>,
+    ts: i64,
+) -> Result<bool, KvError> {
+    let key_blob = SqlValue::Blob(key.as_bytes().to_vec());
+    let new_blob = SqlValue::Blob(new);
+    let mutate = cas_mutation_drops_predicate();
+    let won = match expected {
+        Some(expected) => {
+            // present-key: winner iff the row's current value still equals `expected`.
+            let (sql, params): (&str, Vec<SqlValue>) = if mutate {
+                // MUTATION: drop `AND value=?3` → the UPDATE always matches the key, so every racer
+                // reports rows_affected == 1 and "wins" (bind only ?1, ?2 so the normalizer accepts it).
+                (
+                    "UPDATE kv SET value = ?2, version = version + 1 WHERE key = ?1",
+                    vec![key_blob.clone(), new_blob],
+                )
+            } else {
+                (
+                    stmts.cas_present,
+                    vec![
+                        key_blob.clone(),
+                        new_blob,
+                        SqlValue::Blob(expected.to_vec()),
+                    ],
+                )
+            };
+            tx.execute(sql, &params).await.map_err(sql_err)? == 1
+        }
+        None => {
+            // absent-key: winner iff THIS statement inserted the row.
+            let sql = if mutate {
+                // MUTATION: turn `DO NOTHING` into an unconditional upsert → every racer affects a
+                // row and "wins".
+                "INSERT INTO kv (key, value, version) VALUES (?1, ?2, 1) \
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value, version = kv.version + 1"
+            } else {
+                stmts.cas_absent
+            };
+            tx.execute(sql, &[key_blob.clone(), new_blob])
+                .await
+                .map_err(sql_err)?
+                == 1
+        }
+    };
+    if won {
+        tx.execute(stmts.append_change, &[key_blob, SqlValue::Integer(ts)])
+            .await
+            .map_err(sql_err)?;
+    }
+    Ok(won)
+}
+
+#[cfg(feature = "sql-postgres")]
+async fn pg_cas(
+    backend: &dyn SqlBackend,
+    stmts: &KvStatements,
+    key: &str,
+    expected: Option<&[u8]>,
+    new: Vec<u8>,
+) -> Result<bool, KvError> {
+    let ts = now_ts();
+    let mut tx = backend.begin().await.map_err(sql_err)?;
+    let won = match pg_apply_cas(tx.as_mut(), stmts, key, expected, new, ts).await {
+        Ok(won) => won,
+        Err(e) => {
+            let _ = tx.rollback().await;
+            return Err(e);
+        }
+    };
+    tx.commit().await.map_err(sql_err)?;
+    Ok(won)
+}
+
+#[cfg(feature = "sql-postgres")]
+async fn pg_list_prefix(
+    backend: &dyn SqlBackend,
+    stmts: &KvStatements,
+    prefix: &str,
+) -> Result<Vec<String>, KvError> {
+    let lower = prefix.as_bytes().to_vec();
+    let (sql, params) = match prefix_successor(&lower) {
+        Some(upper) => (
+            stmts.list_prefix_bounded,
+            vec![SqlValue::Blob(lower), SqlValue::Blob(upper)],
+        ),
+        None => (stmts.list_prefix_all, vec![SqlValue::Blob(lower)]),
+    };
+    pg_collect_keys(backend, sql, &params).await
+}
+
+#[cfg(feature = "sql-postgres")]
+async fn pg_list_from(
+    backend: &dyn SqlBackend,
+    stmts: &KvStatements,
+    prefix: &str,
+    after: &str,
+    limit: usize,
+) -> Result<Vec<String>, KvError> {
+    let prefix_bytes = prefix.as_bytes().to_vec();
+    let mut start = prefix_bytes.clone();
+    start.extend_from_slice(after.as_bytes());
+    let lim = SqlValue::Integer(limit as i64);
+    let (sql, params) = match prefix_successor(&prefix_bytes) {
+        Some(upper) => (
+            stmts.list_from_bounded,
+            vec![SqlValue::Blob(start), SqlValue::Blob(upper), lim],
+        ),
+        None => (stmts.list_from_all, vec![SqlValue::Blob(start), lim]),
+    };
+    pg_collect_keys(backend, sql, &params).await
+}
+
+/// Run a read-only `SELECT key …` and collect its first column (keys), decoded from BYTEA back to the
+/// `String` keys.
+#[cfg(feature = "sql-postgres")]
+async fn pg_collect_keys(
+    backend: &dyn SqlBackend,
+    sql: &str,
+    params: &[SqlValue],
+) -> Result<Vec<String>, KvError> {
+    let mut tx = backend.begin_read_only().await.map_err(sql_err)?;
+    let rows = tx.query(sql, params).await.map_err(sql_err)?;
+    tx.commit().await.map_err(sql_err)?;
+    let mut out = Vec::with_capacity(rows.rows.len());
+    for row in rows.rows {
+        let cell = row
+            .into_iter()
+            .next()
+            .ok_or_else(|| KvError::backend("kv list row had no columns"))?;
+        let bytes = pg_bytes(cell)?;
+        out.push(
+            String::from_utf8(bytes)
+                .map_err(|e| KvError::backend(format!("kv key is not valid UTF-8: {e}")))?,
+        );
+    }
+    Ok(out)
+}
+
+/// Decode a `value`/`key` cell back to bytes. A BYTEA column decodes to [`SqlValue::Blob`] (empty
+/// value ⇒ empty blob, distinct from an absent key); a `Text`/`Null` arm is defensive. Any other
+/// value class is a schema bug → error.
+#[cfg(feature = "sql-postgres")]
+fn pg_bytes(value: SqlValue) -> Result<Vec<u8>, KvError> {
+    match value {
+        SqlValue::Blob(bytes) => Ok(bytes),
+        SqlValue::Text(text) => Ok(text.into_bytes()),
+        SqlValue::Null => Ok(Vec::new()),
+        other => Err(KvError::backend(format!(
+            "unexpected kv column type (want BYTEA): {other:?}"
+        ))),
+    }
+}
+
+/// Map a `boatramp_core::sql` error into the crate-facing [`KvError`].
+#[cfg(feature = "sql-postgres")]
+fn sql_err(err: boatramp_core::sql::SqlError) -> KvError {
+    KvError::backend(err.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// SQLite / libsql (feature `sql`) — embedded single-writer.
+// ---------------------------------------------------------------------------
+
+/// A connection tuned for the control-plane KV: a contended writer WAITS for the single-writer lock
+/// (`busy_timeout`) rather than erroring, and `synchronous = FULL` makes its commits fsync before
+/// returning (C6). Each op opens a fresh connection off the shared `Database` (as the libsql
+/// `SqlBackend` does), so concurrent ops each get their own transaction.
+#[cfg(feature = "sql")]
+async fn sqlite_connect(db: &Database) -> Result<Connection, KvError> {
+    let conn = db.connect().map_err(kv_err)?;
+    run_pragma(&conn, &format!("PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")).await?;
+    run_pragma(&conn, "PRAGMA synchronous=FULL").await?;
+    Ok(conn)
+}
+
+#[cfg(feature = "sql")]
+async fn sqlite_get(
+    db: &Database,
+    stmts: &KvStatements,
+    key: &str,
+) -> Result<Option<Vec<u8>>, KvError> {
+    let conn = sqlite_connect(db).await?;
+    let mut rows = conn
+        .query(stmts.get, libsql::params_from_iter([blob(key)]))
+        .await
+        .map_err(kv_err)?;
+    match rows.next().await.map_err(kv_err)? {
+        Some(row) => Ok(Some(value_bytes(row.get_value(0).map_err(kv_err)?)?)),
+        None => Ok(None),
+    }
+}
+
+#[cfg(feature = "sql")]
+async fn sqlite_put(
+    db: &Database,
+    stmts: &KvStatements,
+    key: &str,
+    value: Vec<u8>,
+) -> Result<(), KvError> {
+    let conn = sqlite_connect(db).await?;
+    begin(&conn).await?;
+    let ts = now_ts();
+    let res = async {
+        conn.execute(
+            stmts.upsert,
+            libsql::params_from_iter([blob(key), LibsqlValue::Blob(value)]),
+        )
+        .await
+        .map_err(kv_err)?;
+        conn.execute(
+            stmts.append_change,
+            libsql::params_from_iter([blob(key), LibsqlValue::Integer(ts)]),
+        )
+        .await
+        .map_err(kv_err)?;
+        Ok(())
+    }
+    .await;
+    finish(&conn, res).await
+}
+
+#[cfg(feature = "sql")]
+async fn sqlite_delete(db: &Database, stmts: &KvStatements, key: &str) -> Result<(), KvError> {
+    let conn = sqlite_connect(db).await?;
+    begin(&conn).await?;
+    let ts = now_ts();
+    let res = async {
+        let affected = conn
+            .execute(stmts.delete, libsql::params_from_iter([blob(key)]))
+            .await
+            .map_err(kv_err)?;
+        // Only record a tombstone when a row was actually removed (deleting a missing key is a
+        // no-op per the trait contract, so it leaves the change log untouched).
+        if affected > 0 {
+            conn.execute(
+                stmts.delete_change,
+                libsql::params_from_iter([blob(key), LibsqlValue::Integer(ts)]),
+            )
+            .await
+            .map_err(kv_err)?;
+        }
+        Ok(())
+    }
+    .await;
+    finish(&conn, res).await
+}
+
+#[cfg(feature = "sql")]
+async fn sqlite_list_prefix(
+    db: &Database,
+    stmts: &KvStatements,
+    prefix: &str,
+) -> Result<Vec<String>, KvError> {
+    let conn = sqlite_connect(db).await?;
+    let lower = prefix.as_bytes().to_vec();
+    let (sql, params) = match prefix_successor(&lower) {
+        Some(upper) => (
+            stmts.list_prefix_bounded,
+            vec![LibsqlValue::Blob(lower), LibsqlValue::Blob(upper)],
+        ),
+        None => (stmts.list_prefix_all, vec![LibsqlValue::Blob(lower)]),
+    };
+    collect_keys(&conn, sql, params).await
+}
+
+#[cfg(feature = "sql")]
+async fn sqlite_list_from(
+    db: &Database,
+    stmts: &KvStatements,
+    prefix: &str,
+    after: &str,
+    limit: usize,
+) -> Result<Vec<String>, KvError> {
+    let conn = sqlite_connect(db).await?;
+    let prefix_bytes = prefix.as_bytes().to_vec();
+    let mut start = prefix_bytes.clone();
+    start.extend_from_slice(after.as_bytes());
+    let lim = LibsqlValue::Integer(limit as i64);
+    let (sql, params) = match prefix_successor(&prefix_bytes) {
+        Some(upper) => (
+            stmts.list_from_bounded,
+            vec![LibsqlValue::Blob(start), LibsqlValue::Blob(upper), lim],
+        ),
+        None => (stmts.list_from_all, vec![LibsqlValue::Blob(start), lim]),
+    };
+    collect_keys(&conn, sql, params).await
+}
+
+#[cfg(feature = "sql")]
+async fn sqlite_write_batch(
+    db: &Database,
+    stmts: &KvStatements,
+    ops: Vec<WriteOp>,
+) -> Result<(), KvError> {
+    let conn = sqlite_connect(db).await?;
+    begin(&conn).await?;
+    let ts = now_ts();
+    let res = async {
+        for op in &ops {
+            match op {
+                WriteOp::Put(key, value) => {
+                    conn.execute(
+                        stmts.upsert,
+                        libsql::params_from_iter([blob(key), LibsqlValue::Blob(value.clone())]),
+                    )
+                    .await
+                    .map_err(kv_err)?;
+                    conn.execute(
+                        stmts.append_change,
+                        libsql::params_from_iter([blob(key), LibsqlValue::Integer(ts)]),
+                    )
+                    .await
+                    .map_err(kv_err)?;
+                }
+                WriteOp::Delete(key) => {
+                    let affected = conn
+                        .execute(stmts.delete, libsql::params_from_iter([blob(key)]))
+                        .await
+                        .map_err(kv_err)?;
+                    if affected > 0 {
+                        conn.execute(
+                            stmts.delete_change,
+                            libsql::params_from_iter([blob(key), LibsqlValue::Integer(ts)]),
+                        )
+                        .await
+                        .map_err(kv_err)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+    .await;
+    finish(&conn, res).await
+}
+
+#[cfg(feature = "sql")]
+async fn sqlite_cas(
+    db: &Database,
+    stmts: &KvStatements,
+    key: &str,
+    expected: Option<&[u8]>,
+    new: Vec<u8>,
+) -> Result<bool, KvError> {
+    let conn = sqlite_connect(db).await?;
+    begin(&conn).await?;
+    let ts = now_ts();
+    let res = async {
+        // ONE statement decides the winner by rows-affected — never a read-then-write.
+        let won = match expected {
+            Some(expected) => {
+                let affected = conn
+                    .execute(
+                        stmts.cas_present,
+                        libsql::params_from_iter([
+                            blob(key),
+                            LibsqlValue::Blob(new),
+                            LibsqlValue::Blob(expected.to_vec()),
+                        ]),
+                    )
+                    .await
+                    .map_err(kv_err)?;
+                affected == 1
+            }
+            None => {
+                let affected = conn
+                    .execute(
+                        stmts.cas_absent,
+                        libsql::params_from_iter([blob(key), LibsqlValue::Blob(new)]),
+                    )
+                    .await
+                    .map_err(kv_err)?;
+                affected == 1
+            }
+        };
+        // Only the winner mutated the store, so only the winner appends a change-log row.
+        if won {
+            conn.execute(
+                stmts.append_change,
+                libsql::params_from_iter([blob(key), LibsqlValue::Integer(ts)]),
+            )
+            .await
+            .map_err(kv_err)?;
+        }
+        Ok(won)
+    }
+    .await;
+    finish(&conn, res).await
+}
+
 /// Open a write transaction that takes the write lock at `BEGIN` (`IMMEDIATE`), so concurrent
 /// writers queue on the `busy_timeout` and serialize cleanly — no deferred-transaction upgrade
 /// deadlock.
+#[cfg(feature = "sql")]
 async fn begin(conn: &Connection) -> Result<(), KvError> {
     conn.execute("BEGIN IMMEDIATE", ())
         .await
@@ -432,6 +968,7 @@ async fn begin(conn: &Connection) -> Result<(), KvError> {
 
 /// Commit the transaction on success, or roll it back on error (a failed rollback is harmless —
 /// dropping the connection rolls back too). Returns the inner result unchanged on success.
+#[cfg(feature = "sql")]
 async fn finish<T>(conn: &Connection, res: Result<T, KvError>) -> Result<T, KvError> {
     match res {
         Ok(value) => {
@@ -448,6 +985,7 @@ async fn finish<T>(conn: &Connection, res: Result<T, KvError>) -> Result<T, KvEr
 /// Run a `PRAGMA` (or other settings statement) and drain it: libsql's `execute` rejects
 /// row-returning statements and a value-setting `PRAGMA` returns the new value as a row, so run it
 /// via `query` and drain (mirrors the libsql `SqlBackend`).
+#[cfg(feature = "sql")]
 async fn run_pragma(conn: &Connection, sql: &str) -> Result<(), KvError> {
     let mut rows = conn.query(sql, ()).await.map_err(kv_err)?;
     while rows.next().await.map_err(kv_err)?.is_some() {}
@@ -455,7 +993,7 @@ async fn run_pragma(conn: &Connection, sql: &str) -> Result<(), KvError> {
 }
 
 /// Run a one-row-one-column query and return that cell (for the pragma read-back in tests).
-#[cfg(test)]
+#[cfg(all(test, feature = "sql"))]
 async fn query_one(conn: &Connection, sql: &str) -> Result<Option<LibsqlValue>, KvError> {
     let mut rows = conn.query(sql, ()).await.map_err(kv_err)?;
     match rows.next().await.map_err(kv_err)? {
@@ -465,6 +1003,7 @@ async fn query_one(conn: &Connection, sql: &str) -> Result<Option<LibsqlValue>, 
 }
 
 /// Run `sql` and collect its first column (keys), decoded from BLOB back to the `String` keys.
+#[cfg(feature = "sql")]
 async fn collect_keys(
     conn: &Connection,
     sql: &str,
@@ -487,6 +1026,7 @@ async fn collect_keys(
 
 /// A KV key as the BLOB it is stored as — the `&str`'s UTF-8 bytes, so ordering/comparison is
 /// bytewise (matching Rust `str` byte order) and never subject to SQLite text affinity.
+#[cfg(feature = "sql")]
 fn blob(key: &str) -> LibsqlValue {
     LibsqlValue::Blob(key.as_bytes().to_vec())
 }
@@ -494,6 +1034,7 @@ fn blob(key: &str) -> LibsqlValue {
 /// Decode a `value`/`key` column back to bytes. Stored as a BLOB (empty value ⇒ empty BLOB); a
 /// defensive `Text` arm covers an engine that hands an empty BLOB back as empty text, and `Null`
 /// (barred by `NOT NULL`) maps to empty for safety. A numeric cell is a schema bug → error.
+#[cfg(feature = "sql")]
 fn value_bytes(value: LibsqlValue) -> Result<Vec<u8>, KvError> {
     match value {
         LibsqlValue::Blob(bytes) => Ok(bytes),
@@ -504,6 +1045,16 @@ fn value_bytes(value: LibsqlValue) -> Result<Vec<u8>, KvError> {
         ))),
     }
 }
+
+/// Map any libsql / backend error into the crate-facing [`KvError`].
+#[cfg(feature = "sql")]
+fn kv_err<E: std::fmt::Display>(err: E) -> KvError {
+    KvError::backend(err.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Shared pure helpers.
+// ---------------------------------------------------------------------------
 
 /// The smallest byte string strictly greater than every string with `prefix` — the exclusive upper
 /// bound of a prefix range scan. Increment the last byte below `0xFF`, dropping trailing `0xFF`s;
@@ -528,15 +1079,42 @@ fn now_ts() -> i64 {
         .unwrap_or(0)
 }
 
-/// Map any libsql / backend error into the crate-facing [`KvError`].
-fn kv_err<E: std::fmt::Display>(err: E) -> KvError {
-    KvError::backend(err.to_string())
-}
+// ---------------------------------------------------------------------------
+// Tests.
+// ---------------------------------------------------------------------------
 
-#[cfg(test)]
-mod tests {
+#[cfg(all(test, feature = "sql"))]
+mod sqlite_tests {
     use super::*;
-    use std::sync::Arc;
+
+    impl SqlKv {
+        /// The pragmas the WRITE path actually opens its connections with — `(journal_mode,
+        /// synchronous)` — read back on a freshly-tuned connection. Proves the synchronous-commit
+        /// contract (C6) at the seam the writes use: WAL + `synchronous = FULL` (`2`).
+        async fn debug_pragmas(&self) -> Result<(String, i64), KvError> {
+            let conn = self.sqlite_test_conn().await?;
+            let journal = match query_one(&conn, "PRAGMA journal_mode").await? {
+                Some(LibsqlValue::Text(s)) => s,
+                other => format!("{other:?}"),
+            };
+            let synchronous = match query_one(&conn, "PRAGMA synchronous").await? {
+                Some(LibsqlValue::Integer(n)) => n,
+                _ => -1,
+            };
+            Ok((journal, synchronous))
+        }
+
+        /// A tuned SQLite connection off the backing (test-only; the change-log / pragma reads use it).
+        async fn sqlite_test_conn(&self) -> Result<Connection, KvError> {
+            match &self.backing {
+                Backing::Sqlite(db) => sqlite_connect(db).await,
+                #[cfg(feature = "sql-postgres")]
+                Backing::Postgres(_) => {
+                    Err(KvError::backend("sqlite_test_conn on a Postgres SqlKv"))
+                }
+            }
+        }
+    }
 
     fn temp_db(name: &str) -> (tempfile::TempDir, std::path::PathBuf) {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -667,7 +1245,7 @@ mod tests {
         kv.put("a", b"2".to_vec()).await.unwrap(); // version bump
         kv.delete("a").await.unwrap(); // tombstone (version 0)
 
-        let conn = kv.connect().await.unwrap();
+        let conn = kv.sqlite_test_conn().await.unwrap();
         let mut rows = conn
             .query(
                 "SELECT version FROM kv_changes WHERE key = ?1 ORDER BY seq",
@@ -685,6 +1263,134 @@ mod tests {
             versions,
             vec![1, 2, 0],
             "put v1, put v2, delete tombstone 0"
+        );
+    }
+}
+
+/// LIVE Postgres gates (build-order step 2 / MF-2). Env-gated on `BOATRAMP_TEST_PG_URL` — they skip
+/// CLEANLY with an eprintln when it is unset (CI provides a `postgres:16-alpine` service with it).
+/// These are UNIT tests (in the crate's own `cfg(test)` build) so the `#[cfg(test)]` CAS mutation
+/// seam ([`cas_mutation_drops_predicate`]) is live: under `BOATRAMP_KVSQL_MUTATION=drop_cas_predicate`
+/// the value predicate is dropped and [`sqlkv_pg_cas_race_has_exactly_one_winner`] MUST go RED. The
+/// shared `kv`/`kv_changes` tables are reset per test and the tests run `#[serial]` so they don't
+/// collide.
+#[cfg(all(test, feature = "sql-postgres"))]
+mod pg_tests {
+    use super::*;
+    use serial_test::serial;
+
+    /// Open the PG `SqlKv` with a ≥16-conn pool and reset the shared tables — or `None` (skip) when
+    /// `BOATRAMP_TEST_PG_URL` is unset.
+    async fn fresh_pg() -> Option<SqlKv> {
+        let Ok(url) = std::env::var("BOATRAMP_TEST_PG_URL") else {
+            eprintln!("skip sqlkv pg gate: BOATRAMP_TEST_PG_URL unset");
+            return None;
+        };
+        let kv = SqlKv::open_postgres(url, Some(16))
+            .await
+            .expect("open Postgres SqlKv");
+        // Clean slate: the conformance suite asserts exact list contents, and the race gate counts
+        // winners on a single key.
+        match &kv.backing {
+            Backing::Postgres(b) => b
+                .run_script("DELETE FROM kv_changes; DELETE FROM kv")
+                .await
+                .expect("reset kv tables"),
+            #[cfg(feature = "sql")]
+            Backing::Sqlite(_) => unreachable!("fresh_pg opened Postgres"),
+        }
+        Some(kv)
+    }
+
+    /// GATE — the PG `SqlKv` satisfies the IDENTICAL shared `KvStore` conformance suite every backend
+    /// runs (value CAS, empty/binary values, prefix/range scans, delete-of-missing).
+    #[tokio::test]
+    #[serial]
+    async fn sqlkv_pg_conformance() {
+        let Some(kv) = fresh_pg().await else {
+            return;
+        };
+        boatramp_core::kv::conformance::kv_conformance(&kv).await;
+        println!("SQLKV PG CONFORMANCE OK [postgres]");
+    }
+
+    /// GATE — the PG `SqlKv` declares `MultiWriter` and `supports_cas` (the self-coordinating
+    /// multi-writer declaration the shared topology derives from).
+    #[tokio::test]
+    #[serial]
+    async fn sqlkv_pg_declares_multi_writer() {
+        let Some(kv) = fresh_pg().await else {
+            return;
+        };
+        assert_eq!(kv.writer_model(), WriterModel::MultiWriter);
+        assert!(kv.supports_cas());
+    }
+
+    /// THE MF-2 GATE (the NO-SHIP one) — over a REAL Postgres primary with a ≥16-conn pool, 32
+    /// concurrent tasks on a multi-thread runtime race a value-predicate CAS and EXACTLY ONE wins,
+    /// for BOTH a present-key race and an absent-key/insert race. The single-statement
+    /// winner-by-rows-affected CAS is cross-connection linearizable w.r.t. the primary (READ
+    /// COMMITTED row-lock + EvalPlanQual on present-key; `ON CONFLICT DO NOTHING` on absent-key).
+    ///
+    /// Mutation-verified: with `BOATRAMP_KVSQL_MUTATION=drop_cas_predicate` the value predicate is
+    /// dropped (present-key UPDATE becomes unconditional; absent-key insert becomes an unconditional
+    /// upsert), so EVERY racer wins and the `exactly one` assertion fails — proving the predicate is
+    /// load-bearing, not decoration. (The CI mutation loop sets that env and asserts this gate RED.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial]
+    async fn sqlkv_pg_cas_race_has_exactly_one_winner() {
+        let Some(kv) = fresh_pg().await else {
+            return;
+        };
+        let kv = Arc::new(kv);
+        assert!(kv.supports_cas());
+
+        // (1) present-key race: 32 racers swap the SAME prior value; exactly one matches.
+        kv.put("race/k", b"start".to_vec()).await.unwrap();
+        let mut set = tokio::task::JoinSet::new();
+        for i in 0..32u32 {
+            let kv = kv.clone();
+            set.spawn(async move {
+                kv.compare_and_swap("race/k", Some(b"start"), i.to_le_bytes().to_vec())
+                    .await
+                    .unwrap()
+            });
+        }
+        let mut wins = 0;
+        while let Some(res) = set.join_next().await {
+            if res.unwrap() {
+                wins += 1;
+            }
+        }
+        assert_eq!(
+            wins, 1,
+            "exactly one present-key CAS wins (over real Postgres)"
+        );
+
+        // (2) absent-key race: the key is absent; 32 racers insert-if-absent; exactly one inserts.
+        let mut set = tokio::task::JoinSet::new();
+        for i in 0..32u32 {
+            let kv = kv.clone();
+            set.spawn(async move {
+                kv.compare_and_swap("race/insert", None, i.to_le_bytes().to_vec())
+                    .await
+                    .unwrap()
+            });
+        }
+        let mut wins = 0;
+        while let Some(res) = set.join_next().await {
+            if res.unwrap() {
+                wins += 1;
+            }
+        }
+        assert_eq!(
+            wins, 1,
+            "exactly one absent-key insert wins (over real Postgres)"
+        );
+
+        println!(
+            "SQLKV PG CAS RACE OK [postgres]: 32-way present-key + absent-key value-CAS over a real \
+             primary each had EXACTLY ONE winner (single-statement, winner-by-rows-affected)."
         );
     }
 }
