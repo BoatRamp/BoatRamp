@@ -104,7 +104,7 @@ pub async fn build_kv(
 /// **Postgres** primary (`kind = postgres`, multi-writer) and the **MySQL / MariaDB** primary
 /// (`kind = mysql`/`mariadb`, multi-writer) — both by `url_env`-named URL. A remote-sqld `libsql`
 /// `url_env` is a later workstream; an unknown kind is refused with a clear, actionable message
-/// rather than silently mis-opened.
+/// rather than silently opened against the wrong backend.
 #[cfg(feature = "sql")]
 async fn build_sql_kv(sql: Option<&crate::config::SqlKvConfig>) -> Result<Arc<dyn KvStore>> {
     use crate::error::Error;

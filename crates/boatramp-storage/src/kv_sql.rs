@@ -1769,7 +1769,11 @@ mod sqlite_tests {
 /// the value predicate is dropped and [`sqlkv_pg_cas_race_has_exactly_one_winner`] MUST go RED. The
 /// shared `kv`/`kv_changes` tables are reset per test and the tests run `#[serial]` so they don't
 /// collide.
-#[cfg(all(test, feature = "sql-postgres"))]
+// Requires BOTH `sql` (for `open_sqlite_local`, used by the cross-backend dump round-trip, and so the
+// `Backing` enum has >1 variant — otherwise `let Backing::Postgres(..) else` is irrefutable) and
+// `sql-postgres`. The campaign's CI job runs these under `sql,sql-postgres`; a `sql-postgres`-only build
+// (e.g. the resource-name/tenant-provision gate) must NOT compile them.
+#[cfg(all(test, feature = "sql", feature = "sql-postgres"))]
 mod pg_tests {
     use super::*;
     use serial_test::serial;

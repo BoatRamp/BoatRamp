@@ -52,7 +52,7 @@ use crate::shared_mode::{CP_ID_KEY, CP_PREFIX};
 pub const MAGIC: &[u8; 8] = b"BRKVDUMP";
 
 /// The dump FORMAT version. Bumped only on an incompatible framing change; a reader refuses an
-/// unknown version rather than mis-parsing it.
+/// unknown version rather than misreading it.
 pub const FORMAT_VERSION: u32 = 1;
 
 /// Record tag: a `{key, value, version}` entry follows.
