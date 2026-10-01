@@ -1391,6 +1391,298 @@ jobs:
           grep -q 'postgres_treats_executable_comment_syntax_as_inert ... ok' migrate-guard-unit.log \
             || { echo "::error::Postgres executable-comment inertness test did not pass (a PG guard regression)" >&2; exit 1; }
 
+  # ============================================================================================
+  # kv-sql backend family (v0.12.0): the SQL-backed control-plane KvStore + multi-writer `shared`
+  # coordination (SQLite/libsql single-writer; Postgres/MySQL multi-writer, self-coordinating).
+  # This is a SECURITY-CORE build (PLAN-kv-sql-backend, 3-role panel): the multi-writer half rests
+  # on crown-jewel value-CAS (MF-1/MF-2), a stale-authz fence + fail-closed (MF-3/MF-4), a non-Raft
+  # single-leader election + positive control-plane identity (C1/UX-C1), and MF-6 custody. Every one
+  # of those invariants gets a gate here, and — the anti-hollow contract — every gate is run under a
+  # cfg(test)/feature-gated mutation seam (`BOATRAMP_KVSQL_MUTATION`, compiled OUT of shipped builds)
+  # that MUST turn the gate RED; a gate that still PASSES under its mutation is hollow and fails the
+  # job. Postgres + MySQL come up as service containers (modelled on `test-orm-tenancy-sqlx`); the
+  # live gates print per-engine `… OK [postgres]`/`[mysql]` markers that the greps require, so a
+  # silent skip (service down / URL unset ⇒ the live tests early-return `ok`) cannot pass unnoticed.
+  # Host toolchain (real TCP + the sqlx drivers). See PLAN-kv-sql-backend.md.
+  test-kv-sql-backend:
+    name: test (kv-sql backend + shared-mode security gates)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: boatramp
+          POSTGRES_PASSWORD: boatramp
+          POSTGRES_DB: boatramp
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U boatramp"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+      mysql:
+        image: mysql:8
+        env:
+          MYSQL_USER: boatramp
+          MYSQL_PASSWORD: boatramp
+          MYSQL_DATABASE: boatramp
+          MYSQL_ROOT_PASSWORD: boatramp
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -uboatramp -pboatramp --silent"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: test-kv-sql-backend-host
+
+      # --- No-DB battery: MemoryKv / SQLite / types. These need no service (SQLite is embedded,
+      # the rest are deterministic in-memory), but they are the single-writer + backend-agnostic
+      # half of the same campaign, so they gate here with the live half. Exact pass-counts catch a
+      # cfg/rename that silently drops a gate.
+      - name: "kv-sql no-DB gates (MemoryKv / SQLite / types)"
+        run: |
+          set -eo pipefail
+          # boatramp-core — crown-jewel CAS (MemoryKv), non-Raft election + cp-identity, and the
+          # portable dump/export/import safety invariants. (10 gates.)
+          cargo test -p boatramp-core --lib -- --test-threads=1 \
+            crownjewel_concurrent_secret_rotation_no_lost_update \
+            crownjewel_rotate_vs_delete_no_resurrection \
+            crownjewel_tenant_name_cap_holds_under_concurrency \
+            crownjewel_concurrent_policy_edit_no_lost_write \
+            shared_election_single_leader_under_concurrency \
+            shared_control_plane_identity_detects_commingle_and_split_brain \
+            kv_dump_roundtrip_preserves_all_keys \
+            kv_export_contains_no_plaintext_secret_or_kek \
+            kv_import_refuses_nonempty_destination_without_force \
+            kv_import_dryrun_mutates_nothing 2>&1 | tee kvsql-nodb-core.log
+          grep -qE 'test result: ok\. 10 passed' kvsql-nodb-core.log \
+            || { echo "::error::kv-sql no-DB core battery did not run all 10 (a cfg/rename silent-drop or a failure)" >&2; exit 1; }
+          # boatramp-storage — the embedded SQLite SqlKv over the shared conformance suite + value-CAS
+          # + durability + change-log/custody + dump. (`--features sql`, 10 `sqlkv_*` gates.)
+          cargo test -p boatramp-storage --features sql --lib -- --test-threads=1 sqlkv_ 2>&1 | tee kvsql-nodb-sqlite.log
+          grep -qE 'test result: ok\. 10 passed' kvsql-nodb-sqlite.log \
+            || { echo "::error::kv-sql no-DB SQLite battery did not run all 10 (a cfg/rename silent-drop or a failure)" >&2; exit 1; }
+          # boatramp-server — the MF-3/MF-4 fence + fail-closed + local-mode no-shed over MemoryKv /
+          # FailingKv (backend-agnostic; `--features handlers` so graphql_cache compiles). (6 gates.)
+          cargo test -p boatramp-server --features handlers --lib -- --test-threads=1 \
+            shared_stale_authz_fence_denies_on_missed_invalidation \
+            shared_revoked_token_denied_across_nodes_without_notify \
+            shared_fail_closed_on_db_unreachable \
+            local_mode_authz_read_error_does_not_shed \
+            shared_stale_graphql_registry_hidden_field_not_served_without_notify \
+            shared_graphql_registry_fails_closed_on_db_unreachable 2>&1 | tee kvsql-nodb-server.log
+          grep -qE 'test result: ok\. 6 passed' kvsql-nodb-server.log \
+            || { echo "::error::kv-sql no-DB server battery did not run all 6 (a cfg/rename silent-drop or a failure)" >&2; exit 1; }
+          # boatramp-types — the kv export/import op is op-gated System·Admin.
+          cargo test -p boatramp-types --lib -- --test-threads=1 kv_export_import_require_system_admin 2>&1 | tee kvsql-nodb-types.log
+          grep -qE 'test result: ok\. 1 passed' kvsql-nodb-types.log \
+            || { echo "::error::kv-sql export/import System·Admin gate did not run (a cfg/rename silent-drop or a failure)" >&2; exit 1; }
+
+      # --- Postgres live: the multi-writer SqlKv + crown-jewel CAS + non-Raft election + cp-identity
+      # + MF-6 custody over a REAL Postgres primary, under real multi-connection concurrency. Markers
+      # required (a silent skip early-returns `ok` with no marker ⇒ caught). (12 gates.)
+      - name: "kv-sql Postgres live gate battery"
+        env:
+          BOATRAMP_TEST_PG_URL: postgres://boatramp:boatramp@localhost:5432/boatramp
+        run: |
+          set -eo pipefail
+          cargo test -p boatramp-storage \
+            --features sql,sql-postgres,shared-mode-gate-mutation,crownjewel-cas-gate-mutation \
+            --lib -- --nocapture --test-threads=1 \
+            sqlkv_pg_cas_race_has_exactly_one_winner \
+            sqlkv_pg_conformance \
+            sqlkv_pg_declares_multi_writer \
+            sqlkv_pg_change_log_carries_no_secret_values \
+            crownjewel_concurrent_secret_rotation_no_lost_update \
+            crownjewel_rotate_vs_delete_no_resurrection \
+            crownjewel_tenant_name_cap_holds_under_concurrency \
+            crownjewel_concurrent_policy_edit_no_lost_write \
+            shared_election_single_leader_under_concurrency \
+            shared_control_plane_identity_detects_commingle_and_split_brain \
+            sqlkv_cross_backend_dump_roundtrip_sqlite_pg \
+            sqlkv_dump_scan_reads_real_versions 2>&1 | tee kvsql-pg.log
+          grep -qE 'test result: ok\. 12 passed' kvsql-pg.log \
+            || { echo "::error::kv-sql Postgres live battery did not run all 12 (a silent skip — BOATRAMP_TEST_PG_URL unset / service down — or a failure)" >&2; exit 1; }
+          for marker in \
+            'SQLKV PG CONFORMANCE OK [postgres]' \
+            'SQLKV PG CAS RACE OK [postgres]' \
+            'SQLKV PG MF-6 CUSTODY OK [postgres]' \
+            'SQLKV PG CROWNJEWEL ROTATION OK [postgres]' \
+            'SQLKV PG CROWNJEWEL RESURRECTION OK [postgres]' \
+            'SQLKV PG CROWNJEWEL TENANT CAP OK [postgres]' \
+            'SQLKV PG CROWNJEWEL POLICY EDIT OK [postgres]' \
+            'SQLKV PG SHARED ELECTION OK [postgres]' \
+            'SQLKV PG CP IDENTITY OK [postgres]' \
+            'SQLKV CROSS-BACKEND DUMP OK [postgres]'; do
+            grep -qF "$marker" kvsql-pg.log \
+              || { echo "::error::kv-sql Postgres gate never reached its marker (cross-tenant/CAS/custody regression or a silent skip): $marker" >&2; exit 1; }
+          done
+
+      # ANTI-HOLLOW (Postgres storage): each mutation (a cfg(test)/feature seam, a no-op in shipped
+      # builds) MUST turn its target gate(s) RED. A gate that still PASSES under its mutation is
+      # hollow — the security property it claims to test is not actually enforced ⇒ fail the job.
+      - name: "kv-sql Postgres mutation loops (each MUST go RED)"
+        env:
+          BOATRAMP_TEST_PG_URL: postgres://boatramp:boatramp@localhost:5432/boatramp
+        run: |
+          set -eo pipefail
+          FEAT="sql,sql-postgres,shared-mode-gate-mutation,crownjewel-cas-gate-mutation"
+          check_red() {
+            local mut="$1"; shift
+            if BOATRAMP_KVSQL_MUTATION="$mut" cargo test -p boatramp-storage --features "$FEAT" \
+                 --lib -- --test-threads=1 "$@" > "mut-pg-$mut.log" 2>&1; then
+              echo "::error::anti-hollow gate is HOLLOW — it PASSED under BOATRAMP_KVSQL_MUTATION=$mut; the security property that mutation breaks is not actually enforced by the gate(s): $*" >&2
+              exit 1
+            fi
+            echo "mutation verified RED: $mut — the security property is load-bearing."
+          }
+          # MF-2: drop the value-predicate ⇒ the 32-way CAS race has >1 winner (lost update).
+          check_red drop_cas_predicate sqlkv_pg_cas_race_has_exactly_one_winner
+          # MF-1: revert the crown-jewel writes to blind read-modify-write ⇒ lost rotation / resurrect
+          # -on-delete / lost grant / cap bypass (all four crown-jewel gates).
+          check_red drop_crownjewel_cas \
+            crownjewel_concurrent_secret_rotation_no_lost_update \
+            crownjewel_rotate_vs_delete_no_resurrection \
+            crownjewel_tenant_name_cap_holds_under_concurrency \
+            crownjewel_concurrent_policy_edit_no_lost_write
+          # C1: disable the CAS-lease ⇒ >1 node believes it is leader (two leader-gated singletons).
+          check_red disable_leader_lock shared_election_single_leader_under_concurrency
+          # UX-C1: skip the cp-id stamp ⇒ commingle/split-brain goes undetected.
+          check_red skip_cp_id_stamp shared_control_plane_identity_detects_commingle_and_split_brain
+          # MF-6: leak the value into the change log ⇒ the custody gate sees secret bytes in kv_changes.
+          check_red leak_change_value sqlkv_pg_change_log_carries_no_secret_values
+
+      # --- Postgres live, SERVER: the MF-3 stale-authz fence (policy + GraphQL registry) + revoke
+      # propagation over a REAL shared Postgres primary with NOTIFY suppressed (node B denies via the
+      # fence read-through). Markers required. (3 gates.)
+      - name: "kv-sql server stale-authz fence on live Postgres"
+        env:
+          BOATRAMP_TEST_PG_URL: postgres://boatramp:boatramp@localhost:5432/boatramp
+        run: |
+          set -eo pipefail
+          cargo test -p boatramp-server --features handlers,sql-postgres,shared-mode-gate-mutation \
+            --lib -- --nocapture --test-threads=1 \
+            pg_shared_stale_authz_fence_denies_on_missed_invalidation \
+            pg_shared_revoked_token_denied_across_nodes_without_notify \
+            pg_shared_stale_graphql_registry_hidden_field_not_served_without_notify 2>&1 | tee kvsql-pg-server.log
+          grep -qE 'test result: ok\. 3 passed' kvsql-pg-server.log \
+            || { echo "::error::kv-sql server live-PG fence battery did not run all 3 (a silent skip — BOATRAMP_TEST_PG_URL unset / service down — or a failure)" >&2; exit 1; }
+          for marker in \
+            'SERVER PG STALE-AUTHZ FENCE OK [postgres]' \
+            'SERVER PG REVOKED-ACROSS-NODES OK [postgres]' \
+            'SERVER PG GRAPHQL-REGISTRY FENCE OK [postgres]'; do
+            grep -qF "$marker" kvsql-pg-server.log \
+              || { echo "::error::kv-sql server fence gate never reached its marker (a stale-authz leak or a silent skip): $marker" >&2; exit 1; }
+          done
+
+      # ANTI-HOLLOW (server, live PG + MemoryKv): the stale-authz fence and the fail-closed-on-error
+      # posture are the MF-3/MF-4 linchpins. `remove_authz_fence` targets both the MemoryKv twins and
+      # the live-PG twins (the filters substring-match both); `revert_authz_fail_open` targets the
+      # deterministic FailingKv gate. Each MUST go RED.
+      - name: "kv-sql server MF-3/MF-4 mutation loops (each MUST go RED)"
+        env:
+          BOATRAMP_TEST_PG_URL: postgres://boatramp:boatramp@localhost:5432/boatramp
+        run: |
+          set -eo pipefail
+          FEAT="handlers,sql-postgres,shared-mode-gate-mutation"
+          check_red() {
+            local mut="$1"; shift
+            if BOATRAMP_KVSQL_MUTATION="$mut" cargo test -p boatramp-server --features "$FEAT" \
+                 --lib -- --test-threads=1 "$@" > "mut-srv-$mut.log" 2>&1; then
+              echo "::error::anti-hollow gate is HOLLOW — it PASSED under BOATRAMP_KVSQL_MUTATION=$mut; the authz property that mutation breaks is not actually enforced: $*" >&2
+              exit 1
+            fi
+            echo "mutation verified RED: $mut — the authz property is load-bearing."
+          }
+          # MF-3: remove the fence ⇒ node B keeps serving the stale permissive policy / hidden-field
+          # registry (both MemoryKv and live-PG twins + the GraphQL-registry twins go RED).
+          check_red remove_authz_fence \
+            shared_stale_authz_fence_denies_on_missed_invalidation \
+            shared_stale_graphql_registry_hidden_field_not_served_without_notify
+          # MF-4: revert to fail-OPEN ⇒ a DB-read error is treated as "not revoked / default policy"
+          # instead of shedding (503/deny).
+          check_red revert_authz_fail_open shared_fail_closed_on_db_unreachable
+
+      # --- MySQL live: the multi-writer SqlKv (value-CAS via `UPDATE … WHERE value=` / absent-key
+      # INSERT, winner-by-rows-affected), the dialect-agnostic election (no GET_LOCK), cp-identity,
+      # and MF-6 custody over a REAL MySQL primary. Markers required. (6 gates.)
+      - name: "kv-sql MySQL live gate battery"
+        env:
+          BOATRAMP_TEST_MYSQL_URL: mysql://boatramp:boatramp@localhost:3306/boatramp
+        run: |
+          set -eo pipefail
+          cargo test -p boatramp-storage \
+            --features sql,sql-mysql,shared-mode-gate-mutation,crownjewel-cas-gate-mutation \
+            --lib -- --nocapture --test-threads=1 \
+            sqlkv_mysql_cas_race_has_exactly_one_winner \
+            sqlkv_mysql_conformance \
+            sqlkv_mysql_declares_multi_writer \
+            sqlkv_mysql_change_log_carries_no_secret_values \
+            mysql_shared_election_single_leader_under_concurrency \
+            mysql_shared_control_plane_identity_detects_commingle_and_split_brain 2>&1 | tee kvsql-mysql.log
+          grep -qE 'test result: ok\. 6 passed' kvsql-mysql.log \
+            || { echo "::error::kv-sql MySQL live battery did not run all 6 (a silent skip — BOATRAMP_TEST_MYSQL_URL unset / service down — or a failure)" >&2; exit 1; }
+          for marker in \
+            'SQLKV MYSQL CONFORMANCE OK [mysql]' \
+            'SQLKV MYSQL CAS RACE OK [mysql]' \
+            'SQLKV MYSQL MF-6 CUSTODY OK [mysql]' \
+            'SQLKV MYSQL SHARED ELECTION OK [mysql]' \
+            'SQLKV MYSQL CP IDENTITY OK [mysql]'; do
+            grep -qF "$marker" kvsql-mysql.log \
+              || { echo "::error::kv-sql MySQL gate never reached its marker (a CAS/custody/election regression or a silent skip): $marker" >&2; exit 1; }
+          done
+
+      # ANTI-HOLLOW (MySQL storage): the MySQL dialect's own CAS / election / custody paths are
+      # load-bearing (a per-dialect bug can hide on one engine and not another), so the mutations run
+      # against the real MySQL primary too. Each MUST go RED.
+      - name: "kv-sql MySQL mutation loops (each MUST go RED)"
+        env:
+          BOATRAMP_TEST_MYSQL_URL: mysql://boatramp:boatramp@localhost:3306/boatramp
+        run: |
+          set -eo pipefail
+          FEAT="sql,sql-mysql,shared-mode-gate-mutation,crownjewel-cas-gate-mutation"
+          check_red() {
+            local mut="$1"; shift
+            if BOATRAMP_KVSQL_MUTATION="$mut" cargo test -p boatramp-storage --features "$FEAT" \
+                 --lib -- --test-threads=1 "$@" > "mut-mysql-$mut.log" 2>&1; then
+              echo "::error::anti-hollow gate is HOLLOW — it PASSED under BOATRAMP_KVSQL_MUTATION=$mut on MySQL; the per-dialect property that mutation breaks is not actually enforced: $*" >&2
+              exit 1
+            fi
+            echo "mutation verified RED: $mut (mysql) — the per-dialect property is load-bearing."
+          }
+          check_red drop_cas_predicate sqlkv_mysql_cas_race_has_exactly_one_winner
+          check_red disable_leader_lock mysql_shared_election_single_leader_under_concurrency
+          check_red leak_change_value sqlkv_mysql_change_log_carries_no_secret_values
+
+  # R2 (Security hardening) — the `*-gate-mutation` features are TEST-ONLY anti-hollow seams and must
+  # NEVER be in the shipped binary. A plain `cargo tree -e features` CANNOT see them (they are empty
+  # leaf features that activate no dependency edge), so this resolves the ENABLED feature set of the
+  # DEFAULT (shipped) build with `cargo metadata` and fails if any package's resolved feature list
+  # carries a `*-gate-mutation`. Standalone (no DB services) so a flaky container can never mask it.
+  # Cheap: `cargo metadata` resolves, it does not compile.
+  guard-gate-mutation-not-shipped:
+    name: guard (no *-gate-mutation in the shipped build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Assert no *-gate-mutation feature in the default (shipped) feature closure
+        run: |
+          set -eo pipefail
+          bad=$(cargo metadata --format-version 1 2>/dev/null \
+            | jq -r '.resolve.nodes[]
+                     | select(any(.features[]?; test("gate-mutation")))
+                     | .id + " [" + ([.features[] | select(test("gate-mutation"))] | join(",")) + "]"')
+          if [ -n "$bad" ]; then
+            echo "::error::a TEST-ONLY *-gate-mutation feature is ENABLED in the default/shipped feature closure — it must never ship:" >&2
+            echo "$bad" >&2
+            exit 1
+          fi
+          echo "R2 OK: no *-gate-mutation feature in the default (shipped) feature resolve."
+
   # The embedded-Raft cluster tests (consensus, leader-loss failover, mesh admit,
   # cron single-firing) live behind the `raft`/`http` features and so ran ONLY in
   # nightly `--all-features` — the same merge-gate blind spot as the GraphQL surface.
