@@ -1574,6 +1574,23 @@ mod tests {
         torn_id
     }
 
+    /// **MF5 anti-hollow mutation seam** (test-side only, mirrors v0.9.0's `BOATRAMP_LINCHPIN_MUTATION`):
+    /// the policy the two crown-jewel manifest-rollback gates open the torn store with. Clean path (env
+    /// unset) ⇒ `SelfHeal` (the shipped default) ⇒ F2 rolls back to the last-good generation and the
+    /// gate PASSES. Under `BOATRAMP_KVMANIFEST_MUTATION=skip_lastgood` ⇒ `Strict` — modeling "the F2
+    /// last-good-generation recovery was NOT applied": Strict fails LOUD on a torn manifest, so the
+    /// gate's `.expect(...)` is unreachable and the test FAILS RED. That red is the proof F2 is
+    /// load-bearing (without it a crown-jewel write is lost / a tombstone cannot be preserved — the
+    /// store simply does not open). A pure branch on the policy value; NO production code, NO weakened
+    /// assertion. The release owner wires this env into the CI host-lane mutation loop.
+    fn manifest_rollback_open_policy() -> KvOpenPolicy {
+        if std::env::var("BOATRAMP_KVMANIFEST_MUTATION").unwrap_or_default() == "skip_lastgood" {
+            KvOpenPolicy::Strict
+        } else {
+            KvOpenPolicy::SelfHeal
+        }
+    }
+
     /// **F2 SUPPORT GATE (v0.11.0)** — the self-heal-on-open DEFAULT auto-recovers an empty/torn LATEST
     /// manifest by rolling back to the last-good generation, and the acked crown-jewel SURVIVES
     /// byte-equal. (The mutation-verified MF5 linchpin — crown-jewel survival + non-resurrection, both
@@ -1602,12 +1619,14 @@ mod tests {
         let good = highest_manifest_id(&store, "kv").await;
         let torn_id = tear_latest_manifest(&store, "kv").await;
 
-        // The self-heal DEFAULT opens the store by rolling back to the last-good generation.
+        // The self-heal DEFAULT opens the store by rolling back to the last-good generation. (Under the
+        // `skip_lastgood` mutation this is `Strict`, which fails loud → this `.expect` is RED, proving F2
+        // is load-bearing for crown-jewel SURVIVAL.)
         let opened = SlateKv::open_with_policy(
             store.clone(),
             "kv",
             test_settings(Some(Duration::from_millis(5))),
-            KvOpenPolicy::SelfHeal,
+            manifest_rollback_open_policy(),
         )
         .await
         .expect(
@@ -1715,11 +1734,14 @@ mod tests {
         // tombstone (the highest decodable), never a generation before the delete.
         let _torn = tear_latest_manifest(&store, "kv").await;
 
+        // (Under the `skip_lastgood` mutation this is `Strict`, which fails loud → this `.expect` is RED,
+        // proving F2 is load-bearing for tombstone NON-RESURRECTION: without the rollback the store does
+        // not open at all, so the tombstone could not be preserved.)
         let kv = SlateKv::open_with_policy(
             store.clone(),
             "kv",
             test_settings(Some(Duration::from_millis(5))),
-            KvOpenPolicy::SelfHeal,
+            manifest_rollback_open_policy(),
         )
         .await
         .expect("self-heal must recover a torn latest manifest by rollback");
