@@ -122,6 +122,29 @@ impl DegradedMarker {
     }
 }
 
+/// How many concurrent writers a [`KvStore`] backend's **own** semantics admit — a
+/// capability DECLARATION, exactly like [`supports_cas`](KvStore::supports_cas) /
+/// [`atomic_write_batch`](KvStore::atomic_write_batch), NOT a runtime coordinator. It is a
+/// **plain enum** and carries no publisher/handle (a [`ChangePublisher`] wraps the store `Arc`
+/// and is built externally by the node bootstrap, so embedding one here would be a
+/// chicken-and-egg): the runtime coordination model is DERIVED from this × the node count by the
+/// bootstrap, never selected as a user knob.
+///
+/// - [`SingleWriter`](Self::SingleWriter) — one writer at a time; going multi-node needs an
+///   EXTERNAL coordinator (the existing Raft cluster). SlateDB (object-store), `memory`,
+///   Cloudflare KV, and `sql`+SQLite/libsql-local all declare this. It is the trait **default**
+///   ([`KvStore::writer_model`]), so every existing backend keeps it with no change.
+/// - [`MultiWriter`](Self::MultiWriter) — the backend's engine serializes concurrent writers
+///   itself (the DB *is* the coordinator), so N equal stateless nodes can share one store with no
+///   Raft. Declared by `sql`+Postgres/MySQL (wired in a later workstream); not used yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriterModel {
+    /// One logical writer at a time (external coordination for multi-node). The default.
+    SingleWriter,
+    /// The backend self-serializes concurrent writers (no external coordinator needed).
+    MultiWriter,
+}
+
 /// A minimal key/value store for small values, with atomic per-key writes.
 #[async_trait]
 pub trait KvStore: Send + Sync {
@@ -288,6 +311,18 @@ pub trait KvStore: Send + Sync {
     /// the default `false`.
     fn supports_cas(&self) -> bool {
         false
+    }
+
+    /// The backend's **writer model** ([`WriterModel`]) — how many concurrent writers its own
+    /// semantics admit, DECLARED like [`supports_cas`](Self::supports_cas). The node bootstrap reads
+    /// this and the node count to DERIVE the runtime coordination model (none / Raft over a
+    /// node-local store / a shared stateless fleet); it is never a user knob. The default is
+    /// [`WriterModel::SingleWriter`], so every existing backend (SlateDB, `memory`, Cloudflare KV,
+    /// and the wrappers) keeps that model with no change. A self-serializing backend (`sql`+Postgres/
+    /// MySQL) overrides it to [`WriterModel::MultiWriter`]; `sql`+SQLite/libsql-local stays the
+    /// single-writer default.
+    fn writer_model(&self) -> WriterModel {
+        WriterModel::SingleWriter
     }
 
     /// **Compare-and-set** `key`: write `new` IFF the current value equals `expected` (`None` =
@@ -802,77 +837,22 @@ impl KvStore for CheckpointKv {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// Shared **[`KvStore`] conformance** helpers, so every backend's test suite runs the IDENTICAL
+/// assertions (the anti-drift property, B7) rather than a hand-copied variant. Compiled only for
+/// tests (`cfg(test)` in this crate) or when a downstream crate's test build enables the
+/// `kv-conformance` feature (e.g. `boatramp-storage`'s `SqlKv` suite) — never in a shipped library.
+/// `#[doc(hidden)]`: a test-support surface, not public API.
+#[cfg(any(test, feature = "kv-conformance"))]
+#[doc(hidden)]
+pub mod conformance {
+    use super::{KvStore, WriteOp};
 
-    #[tokio::test]
-    async fn cached_kv_round_trips_and_caches() {
-        let backing = Arc::new(MemoryKv::new());
-        let kv = CachedKv::new(backing.clone(), 8);
-
-        assert_eq!(kv.get("a").await.unwrap(), None);
-        kv.put("a", b"1".to_vec()).await.unwrap();
-        assert_eq!(kv.get("a").await.unwrap(), Some(b"1".to_vec()));
-
-        // A direct change to the backing store is masked by the cache.
-        backing.put("a", b"2".to_vec()).await.unwrap();
-        assert_eq!(kv.get("a").await.unwrap(), Some(b"1".to_vec()));
-
-        kv.delete("a").await.unwrap();
-        assert_eq!(kv.get("a").await.unwrap(), None);
-    }
-
-    #[tokio::test]
-    async fn invalidate_cache_drops_stale_entries() {
-        let backing = Arc::new(MemoryKv::new());
-        backing.put("k", b"v1".to_vec()).await.unwrap();
-        let kv = CachedKv::new(backing.clone(), 8);
-        assert_eq!(kv.get("k").await.unwrap(), Some(b"v1".to_vec())); // caches v1
-
-        // Another writer (e.g. a cluster peer via the shared store) updates it.
-        backing.put("k", b"v2".to_vec()).await.unwrap();
-        assert_eq!(
-            kv.get("k").await.unwrap(),
-            Some(b"v1".to_vec()),
-            "still cached"
-        );
-
-        // SIGHUP-style invalidation → the next read pulls the fresh value.
-        kv.invalidate_cache();
-        assert_eq!(kv.get("k").await.unwrap(), Some(b"v2".to_vec()));
-    }
-
-    #[tokio::test]
-    async fn write_batch_applies_puts_and_deletes() {
-        let backing = Arc::new(MemoryKv::new());
-        backing.put("old", b"gone".to_vec()).await.unwrap();
-        let kv = CachedKv::new(backing.clone(), 8);
-        // Warm the cache so we can confirm the batch updates it.
-        assert_eq!(kv.get("old").await.unwrap(), Some(b"gone".to_vec()));
-
-        kv.write_batch(vec![
-            WriteOp::Put("a".into(), b"1".to_vec()),
-            WriteOp::Put("b".into(), b"2".to_vec()),
-            WriteOp::Delete("old".into()),
-        ])
-        .await
-        .unwrap();
-
-        assert_eq!(kv.get("a").await.unwrap(), Some(b"1".to_vec()));
-        assert_eq!(kv.get("b").await.unwrap(), Some(b"2".to_vec()));
-        assert_eq!(kv.get("old").await.unwrap(), None);
-        // The backing store reflects the same writes.
-        assert_eq!(backing.get("a").await.unwrap(), Some(b"1".to_vec()));
-        assert_eq!(backing.get("old").await.unwrap(), None);
-    }
-
-    /// A shared **conformance suite** every `KvStore` must satisfy identically. Running the
+    /// A shared **conformance suite** every [`KvStore`] must satisfy identically. Running the
     /// same assertions against multiple backends is what keeps them from drifting (B7): a
-    /// caching or storage layer that got `list_prefix`, overwrite, delete-of-missing, or empty
-    /// values subtly wrong fails here rather than in production. New in-process backends
-    /// (SlateDB, …) should call this too.
-    async fn kv_conformance(store: &dyn KvStore) {
+    /// caching or storage layer that got `list_prefix`, overwrite, delete-of-missing, empty
+    /// values, or the value-based `compare_and_swap` subtly wrong fails here rather than in
+    /// production. Every in-process backend (SlateDB, `SqlKv`, …) runs it.
+    pub async fn kv_conformance(store: &dyn KvStore) {
         // Missing key → None; delete of a missing key is a no-op (idempotent).
         assert_eq!(store.get("missing").await.unwrap(), None);
         store.delete("missing").await.unwrap();
@@ -985,11 +965,78 @@ mod tests {
         );
         assert_eq!(store.get("cas/k").await.unwrap(), Some(b"v4".to_vec()));
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cached_kv_round_trips_and_caches() {
+        let backing = Arc::new(MemoryKv::new());
+        let kv = CachedKv::new(backing.clone(), 8);
+
+        assert_eq!(kv.get("a").await.unwrap(), None);
+        kv.put("a", b"1".to_vec()).await.unwrap();
+        assert_eq!(kv.get("a").await.unwrap(), Some(b"1".to_vec()));
+
+        // A direct change to the backing store is masked by the cache.
+        backing.put("a", b"2".to_vec()).await.unwrap();
+        assert_eq!(kv.get("a").await.unwrap(), Some(b"1".to_vec()));
+
+        kv.delete("a").await.unwrap();
+        assert_eq!(kv.get("a").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn invalidate_cache_drops_stale_entries() {
+        let backing = Arc::new(MemoryKv::new());
+        backing.put("k", b"v1".to_vec()).await.unwrap();
+        let kv = CachedKv::new(backing.clone(), 8);
+        assert_eq!(kv.get("k").await.unwrap(), Some(b"v1".to_vec())); // caches v1
+
+        // Another writer (e.g. a cluster peer via the shared store) updates it.
+        backing.put("k", b"v2".to_vec()).await.unwrap();
+        assert_eq!(
+            kv.get("k").await.unwrap(),
+            Some(b"v1".to_vec()),
+            "still cached"
+        );
+
+        // SIGHUP-style invalidation → the next read pulls the fresh value.
+        kv.invalidate_cache();
+        assert_eq!(kv.get("k").await.unwrap(), Some(b"v2".to_vec()));
+    }
+
+    #[tokio::test]
+    async fn write_batch_applies_puts_and_deletes() {
+        let backing = Arc::new(MemoryKv::new());
+        backing.put("old", b"gone".to_vec()).await.unwrap();
+        let kv = CachedKv::new(backing.clone(), 8);
+        // Warm the cache so we can confirm the batch updates it.
+        assert_eq!(kv.get("old").await.unwrap(), Some(b"gone".to_vec()));
+
+        kv.write_batch(vec![
+            WriteOp::Put("a".into(), b"1".to_vec()),
+            WriteOp::Put("b".into(), b"2".to_vec()),
+            WriteOp::Delete("old".into()),
+        ])
+        .await
+        .unwrap();
+
+        assert_eq!(kv.get("a").await.unwrap(), Some(b"1".to_vec()));
+        assert_eq!(kv.get("b").await.unwrap(), Some(b"2".to_vec()));
+        assert_eq!(kv.get("old").await.unwrap(), None);
+        // The backing store reflects the same writes.
+        assert_eq!(backing.get("a").await.unwrap(), Some(b"1".to_vec()));
+        assert_eq!(backing.get("old").await.unwrap(), None);
+    }
 
     /// The atomic-CAS race property (B10): with a linearizable `compare_and_swap`, exactly one of
     /// many racing swappers of the same key from the same observed value wins — the primitive the
-    /// async-lane shard claim is built on. Runs only against a backend that advertises
-    /// [`KvStore::supports_cas`]; a best-effort backend is exercised by the single-writer suite above.
+    /// async-lane shard claim is built on. A local test helper (it needs a real multi-task runtime,
+    /// and `tokio` is only a dev-dependency here), mirrored by each backend's own suite — e.g.
+    /// `boatramp-storage`'s `SqlKv` runs the same property over a real SQLite store.
     async fn cas_race_has_exactly_one_winner(store: Arc<dyn KvStore>) {
         if !store.supports_cas() {
             return;
@@ -1119,18 +1166,18 @@ mod tests {
     #[tokio::test]
     async fn checkpoint_kv_satisfies_the_conformance_suite() {
         let kv = CheckpointKv::new(Arc::new(MemoryKv::new()));
-        kv_conformance(&kv).await;
+        conformance::kv_conformance(&kv).await;
     }
 
     #[tokio::test]
     async fn memorykv_satisfies_the_conformance_suite() {
-        kv_conformance(&MemoryKv::new()).await;
+        conformance::kv_conformance(&MemoryKv::new()).await;
     }
 
     #[tokio::test]
     async fn cachedkv_satisfies_the_conformance_suite() {
         // The caching layer must be semantically identical to its backing store on every op.
         let kv = CachedKv::new(Arc::new(MemoryKv::new()), 16);
-        kv_conformance(&kv).await;
+        conformance::kv_conformance(&kv).await;
     }
 }

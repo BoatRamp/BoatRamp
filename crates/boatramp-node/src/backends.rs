@@ -44,6 +44,11 @@ pub enum KvBackend {
     Memory,
     /// Cloudflare KV over REST (requires `--features cloudflare-kv`).
     Cloudflare,
+    /// SQL-backed KV. SQLite/libsql-LOCAL single-writer today (a simple, robust single-node/dev
+    /// store with no SlateDB torn-manifest class); Postgres/MySQL (multi-writer) land later.
+    /// Connection via `[serve.kv.sql]` / `BOATRAMP_KV_SQL_*`. Requires `--features sql` (implied by
+    /// `handlers`, so on in the default build).
+    Sql,
 }
 
 /// Flush interval for the control-plane SlateDB store: tiny, so a control-plane
@@ -76,17 +81,70 @@ pub struct SlateKvS3 {
 /// backend (a no-op for Memory/Cloudflare). This is the SINGLE-NODE control-plane open site, so its
 /// default is [`KvOpenPolicy::SelfHeal`]; the caller passes [`KvOpenPolicy::Strict`] for
 /// `--strict-kv`. (The cluster node-local Raft store opens elsewhere and stays strict — C8.)
+///
+/// `sql` is the `[serve.kv.sql]` connection config (env-resolved by the caller), consulted only for
+/// [`KvBackend::Sql`] and ignored otherwise.
 pub async fn build_kv(
     kv: KvBackend,
     data_dir: &Path,
     slate_s3: Option<&SlateKvS3>,
     policy: KvOpenPolicy,
+    sql: Option<&crate::config::SqlKvConfig>,
 ) -> Result<Arc<dyn KvStore>> {
     match kv {
         KvBackend::Slatedb => build_slatedb_kv(data_dir, slate_s3, policy).await,
         KvBackend::Memory => Ok(Arc::new(MemoryKv::new())),
         KvBackend::Cloudflare => build_cloudflare_kv(),
+        KvBackend::Sql => build_sql_kv(sql).await,
     }
+}
+
+/// Build the SQL control-plane KV from its `[serve.kv.sql]` config. THIS WORKSTREAM wires the
+/// embedded single-node **SQLite / libsql-local** path (`kind = sqlite`, by on-disk `path`) only;
+/// `postgres`/`mysql` (multi-writer) and a remote-sqld `url_env` are later workstreams and are
+/// refused with a clear, actionable message rather than silently mis-opened.
+#[cfg(feature = "sql")]
+async fn build_sql_kv(sql: Option<&crate::config::SqlKvConfig>) -> Result<Arc<dyn KvStore>> {
+    use crate::error::Error;
+    let cfg = sql.ok_or_else(|| {
+        Error::SqlKvConfig(
+            "`--kv sql` needs a `[serve.kv.sql]` config block (or the `BOATRAMP_KV_SQL_*` env)"
+                .to_string(),
+        )
+    })?;
+    // `kind` uses the same alias set as the `databases:` block; empty defaults to sqlite.
+    match cfg.kind.trim().to_ascii_lowercase().as_str() {
+        "" | "sqlite" | "sqlite3" | "libsql" => {
+            let path = cfg
+                .path
+                .as_deref()
+                .filter(|p| !p.is_empty())
+                .ok_or_else(|| {
+                    Error::SqlKvConfig(
+                    "`[serve.kv.sql] kind = sqlite` needs `path` (an on-disk file) — set it or \
+                     `BOATRAMP_KV_SQL_PATH`"
+                        .to_string(),
+                )
+                })?;
+            Ok(Arc::new(
+                boatramp_storage::SqlKv::open_sqlite_local(path).await?,
+            ))
+        }
+        engine @ ("postgres" | "postgresql" | "pg" | "mysql" | "mariadb") => {
+            Err(Error::SqlKvConfig(format!(
+                "the `{engine}` SQL KV backend is wired in a later workstream; `--kv sql` currently \
+                 supports `sqlite` (libsql-local, single node) only"
+            )))
+        }
+        other => Err(Error::SqlKvConfig(format!(
+            "unknown `[serve.kv.sql] kind` {other:?}: expected sqlite | postgres | mysql"
+        ))),
+    }
+}
+
+#[cfg(not(feature = "sql"))]
+async fn build_sql_kv(_sql: Option<&crate::config::SqlKvConfig>) -> Result<Arc<dyn KvStore>> {
+    Err(crate::error::Error::NoSqlSupport)
 }
 
 #[cfg(feature = "slatedb")]

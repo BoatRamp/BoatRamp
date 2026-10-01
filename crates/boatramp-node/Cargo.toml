@@ -81,13 +81,19 @@ console = ["boatramp-server/console"]
 fallback = ["dep:boatramp-storage", "boatramp-storage/fallback"]
 fs = ["dep:boatramp-storage", "boatramp-storage/fs", "fallback"]
 gcs = ["dep:boatramp-storage", "boatramp-storage/gcs", "fallback"]
-# The wasm handler runtime assembly: the engine + the libsql `sql` binding backend.
+# The SQL-backed control-plane KV (`--kv sql`): SQLite/libsql-LOCAL single-writer (this workstream),
+# dialect-parameterized for the Postgres/MySQL pools later. Enables the `boatramp-storage/sql`
+# engine; `handlers` implies it (that assembly already pulls the libsql engine for the `sql`
+# binding), so `#[cfg(feature = "sql")]` here is true EXACTLY when the engine is compiled — the
+# honest gate for whether `build_kv` can construct the SQL KV.
+sql = ["dep:boatramp-storage", "boatramp-storage/sql"]
+# The wasm handler runtime assembly: the engine + the libsql `sql` binding backend (via `sql`).
 handlers = [
   "dep:boatramp-handlers",
   "dep:boatramp-storage",
   "boatramp-handlers/engine",
   "boatramp-server/handlers",
-  "boatramp-storage/sql",
+  "sql",
 ]
 # External bring-your-own SQL for the handler `sql` binding (each implies handlers).
 sql-postgres = ["handlers", "boatramp-storage/sql-postgres"]

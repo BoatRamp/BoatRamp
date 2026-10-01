@@ -99,6 +99,12 @@ sql-mysql = [
 # Durable embedded KV (the default `--kv slatedb`): transactional LSM over an
 # object_store backend.
 slatedb = ["boatramp-storage/slatedb", "boatramp-node/slatedb"]
+# SQL-backed control-plane KV (`--kv sql`): SQLite/libsql-LOCAL single-writer (this workstream),
+# dialect-parameterized for Postgres/MySQL later. Enables the libsql engine + the node dispatch.
+# `handlers` already pulls the engine (for the `sql` binding), so this is on in the default build;
+# this standalone feature lets a lean build (e.g. `fs,slatedb,sql`) select the SQL KV without the
+# full handler runtime.
+sql = ["boatramp-storage/sql", "boatramp-node/sql"]
 # HTTPS: `--tls custom` (operator cert) and `--tls acme` (automatic certs).
 tls = [
   "dep:rustls-acme",

@@ -798,20 +798,29 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
              measured drain+close time."
         );
     }
-    let kv_backend =
-        match boatramp_node::backends::build_kv(args.kv, &data_dir, slate_s3.as_ref(), kv_policy)
-            .await
-        {
-            Ok(backend) => backend,
-            // C5 — a FATAL control-plane KV open (strict mode, or an unsafe shape self-heal refused)
-            // must NOT propagate to `exit(1)` and a fly crash-loop. For the SlateDB backend, bind a
-            // recovery-mode listener (503 for sites, 200 for probes, diagnosis on `/api/kv-status`).
-            Err(e) if matches!(args.kv, boatramp_node::backends::KvBackend::Slatedb) => {
-                return enter_kv_recovery_mode(addr, &data_dir, slate_s3.as_ref(), &e.to_string())
-                    .await;
-            }
-            Err(e) => return Err(e.into()),
-        };
+    // `--kv sql` connection config: the `[serve.kv.sql]` block overlaid with `BOATRAMP_KV_SQL_*`
+    // env (env wins), so a fly deploy can configure it with no config file. Ignored by the other
+    // backends; consulted only when `args.kv == KvBackend::Sql`.
+    let sql_kv_cfg = resolve_sql_kv_config(serve_cfg.kv.as_ref().and_then(|k| k.sql.as_ref()));
+    let kv_backend = match boatramp_node::backends::build_kv(
+        args.kv,
+        &data_dir,
+        slate_s3.as_ref(),
+        kv_policy,
+        sql_kv_cfg.as_ref(),
+    )
+    .await
+    {
+        Ok(backend) => backend,
+        // C5 — a FATAL control-plane KV open (strict mode, or an unsafe shape self-heal refused)
+        // must NOT propagate to `exit(1)` and a fly crash-loop. For the SlateDB backend, bind a
+        // recovery-mode listener (503 for sites, 200 for probes, diagnosis on `/api/kv-status`).
+        Err(e) if matches!(args.kv, boatramp_node::backends::KvBackend::Slatedb) => {
+            return enter_kv_recovery_mode(addr, &data_dir, slate_s3.as_ref(), &e.to_string())
+                .await;
+        }
+        Err(e) => return Err(e.into()),
+    };
     // Shared-mode coherence: when several processes share
     // one KV, publish each write to a changelog over the *uncached* backend and
     // poll it to invalidate peer-changed keys.
@@ -1361,6 +1370,51 @@ fn resolve_kv_durability(
         _ => cfg.close_deadline(),
     };
     (checkpoint, close)
+}
+
+/// Resolve the `[serve.kv.sql]` SQL-KV backend connection (UX-C2), overlaying the
+/// `BOATRAMP_KV_SQL_*` env (env wins) so a fly deploy can configure `--kv sql` with no config file:
+/// `BOATRAMP_KV_SQL_KIND`, `BOATRAMP_KV_SQL_PATH`, `BOATRAMP_KV_SQL_URL_ENV`,
+/// `BOATRAMP_KV_SQL_POOL_MAX`. Returns `None` when neither the config block nor any env var is set
+/// (the non-SQL backends ignore it; the SQL backend then errors with actionable guidance). The URL
+/// itself is NEVER taken from config/env directly — only the NAME of the env var holding it
+/// (`url_env`), mirroring `ExternalDatabaseConfig`.
+fn resolve_sql_kv_config(
+    base: Option<&boatramp_node::config::SqlKvConfig>,
+) -> Option<boatramp_node::config::SqlKvConfig> {
+    let env = |key: &str| std::env::var(key).ok().filter(|v| !v.trim().is_empty());
+    let kind = env("BOATRAMP_KV_SQL_KIND");
+    let path = env("BOATRAMP_KV_SQL_PATH");
+    let url_env = env("BOATRAMP_KV_SQL_URL_ENV");
+    let pool_max = env("BOATRAMP_KV_SQL_POOL_MAX").and_then(|v| match v.trim().parse::<u32>() {
+        Ok(n) => Some(n),
+        Err(_) => {
+            tracing::warn!(
+                var = "BOATRAMP_KV_SQL_POOL_MAX",
+                value = %v,
+                "ignoring unparsable env override (want a positive integer)"
+            );
+            None
+        }
+    });
+    if base.is_none() && kind.is_none() && path.is_none() && url_env.is_none() && pool_max.is_none()
+    {
+        return None;
+    }
+    let mut cfg = base.cloned().unwrap_or_default();
+    if let Some(kind) = kind {
+        cfg.kind = kind;
+    }
+    if let Some(path) = path {
+        cfg.path = Some(path);
+    }
+    if let Some(url_env) = url_env {
+        cfg.url_env = Some(url_env);
+    }
+    if let Some(pool_max) = pool_max {
+        cfg.pool_max = Some(pool_max);
+    }
+    Some(cfg)
 }
 
 /// Spawn the periodic control-plane KV checkpoint task (v0.9.0 KV-recovery, C1). Every `interval` it

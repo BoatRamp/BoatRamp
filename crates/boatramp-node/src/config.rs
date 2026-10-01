@@ -2216,12 +2216,56 @@ pub const DEFAULT_KV_CHECKPOINT_INTERVAL_SECS: u64 = 10;
 /// budget rarely bites; operators should still raise fly `kill_timeout` to ≥ their measured drain+close.
 pub const DEFAULT_KV_CLOSE_DEADLINE_SECS: u64 = 20;
 
-/// `[serve.kv]` — control-plane SlateDB KV durability knobs (v0.9.0 KV-recovery). Both are
-/// backstops/tuning: the crown-jewel per-write frontier-sync (C2) is unconditional and independent of
-/// these. Absent block ⇒ both defaults apply (checkpoint cadence ON, generous close budget).
+/// `[serve.kv]` — control-plane KV configuration. The backend itself is selected by `--kv` /
+/// `BOATRAMP_KV` (`slatedb` default, `sql`, `memory`, `cloudflare`); this block holds the
+/// backend-specific settings, nested so a knob can never silently mislead under the wrong backend
+/// (UX-C3): the SlateDB durability knobs live under [`slatedb`](Self::slatedb), and the SQL
+/// connection under [`sql`](Self::sql). Absent block ⇒ the SlateDB defaults apply.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct KvConfig {
+    /// `[serve.kv.slatedb]` — SlateDB-specific durability knobs (checkpoint cadence + close budget).
+    /// Nested under `slatedb` (UX-C3) so they don't appear to apply under `--kv sql` / `--kv memory`.
+    /// Absent ⇒ both defaults (checkpoint cadence ON, generous close budget).
+    pub slatedb: Option<SlatedbKvConfig>,
+    /// `[serve.kv.sql]` — the SQL KV backend's connection (`--kv sql`). Absent under `--kv sql` ⇒ the
+    /// backend is configured entirely by the `BOATRAMP_KV_SQL_*` env (resolved at serve wiring).
+    pub sql: Option<SqlKvConfig>,
+}
+
+impl KvConfig {
+    /// The resolved periodic-checkpoint interval (SlateDB): `None` ⇒ cadence DISABLED (explicit `0`);
+    /// else the configured seconds, or [`DEFAULT_KV_CHECKPOINT_INTERVAL_SECS`] when unset/absent.
+    pub fn checkpoint_interval(&self) -> Option<std::time::Duration> {
+        match self.slatedb.as_ref().and_then(|s| s.checkpoint_interval) {
+            Some(0) => None,
+            Some(secs) => Some(std::time::Duration::from_secs(secs)),
+            None => Some(std::time::Duration::from_secs(
+                DEFAULT_KV_CHECKPOINT_INTERVAL_SECS,
+            )),
+        }
+    }
+
+    /// The resolved graceful-close budget (SlateDB). A configured `0` (or unset/absent) falls back to
+    /// [`DEFAULT_KV_CLOSE_DEADLINE_SECS`] — the budget must be positive so a genuinely-wedged close
+    /// still cannot hang shutdown forever, while never being the too-tight 3s that caused the incident.
+    pub fn close_deadline(&self) -> std::time::Duration {
+        match self.slatedb.as_ref().and_then(|s| s.close_deadline) {
+            Some(secs) if secs > 0 => std::time::Duration::from_secs(secs),
+            _ => std::time::Duration::from_secs(DEFAULT_KV_CLOSE_DEADLINE_SECS),
+        }
+    }
+}
+
+/// `[serve.kv.slatedb]` — control-plane SlateDB KV durability knobs (v0.9.0 KV-recovery). Both are
+/// backstops/tuning: the crown-jewel per-write frontier-sync (C2) is unconditional and independent of
+/// these. Absent ⇒ both defaults apply (checkpoint cadence ON, generous close budget). (v0.12.0 UX-C3:
+/// MOVED here from the `[serve.kv]` top level so they do not appear to apply under a non-SlateDB
+/// backend; with `deny_unknown_fields` a pre-v0.12.0 top-level knob now fails loud rather than
+/// silently misleading.)
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SlatedbKvConfig {
     /// Periodic checkpoint cadence, seconds. Unset ⇒ [`DEFAULT_KV_CHECKPOINT_INTERVAL_SECS`] (ON).
     /// `0` DISABLES the cadence (the crown-jewel per-write frontier-sync still runs; only the
     /// backstop that bounds the loss window for derived/relaxed writes is off).
@@ -2231,28 +2275,29 @@ pub struct KvConfig {
     pub close_deadline: Option<u64>,
 }
 
-impl KvConfig {
-    /// The resolved periodic-checkpoint interval: `None` ⇒ cadence DISABLED (explicit `0`); else the
-    /// configured seconds, or [`DEFAULT_KV_CHECKPOINT_INTERVAL_SECS`] when unset.
-    pub fn checkpoint_interval(&self) -> Option<std::time::Duration> {
-        match self.checkpoint_interval {
-            Some(0) => None,
-            Some(secs) => Some(std::time::Duration::from_secs(secs)),
-            None => Some(std::time::Duration::from_secs(
-                DEFAULT_KV_CHECKPOINT_INTERVAL_SECS,
-            )),
-        }
-    }
-
-    /// The resolved graceful-close budget. A configured `0` (or unset) falls back to
-    /// [`DEFAULT_KV_CLOSE_DEADLINE_SECS`] — the budget must be positive so a genuinely-wedged close
-    /// still cannot hang shutdown forever, while never being the too-tight 3s that caused the incident.
-    pub fn close_deadline(&self) -> std::time::Duration {
-        match self.close_deadline {
-            Some(secs) if secs > 0 => std::time::Duration::from_secs(secs),
-            _ => std::time::Duration::from_secs(DEFAULT_KV_CLOSE_DEADLINE_SECS),
-        }
-    }
+/// `[serve.kv.sql]` — the **SQL control-plane KV** backend connection (`--kv sql`). The connection
+/// URL is NEVER written in the config (UX-C2): a bring-your-own / remote engine names the env var
+/// holding it via [`url_env`](Self::url_env) (mirroring `ExternalDatabaseConfig`), while an embedded
+/// single-node SQLite database names an on-disk file via [`path`](Self::path). Every field is also
+/// settable by `BOATRAMP_KV_SQL_*` env (resolved at serve wiring). **This workstream (build-order
+/// step 1) wires `sqlite` (libsql-local) only**; `postgres`/`mysql` are later workstreams.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SqlKvConfig {
+    /// Engine: `sqlite` (aliases `sqlite3`/`libsql`) — the embedded single-node file; `postgres`
+    /// (aliases `postgresql`/`pg`) or `mysql` (alias `mariadb`) — the multi-writer engines (later
+    /// workstreams), the same alias set as the `databases:` block. Empty ⇒ `sqlite`.
+    pub kind: String,
+    /// Name of the env var holding the connection URL (e.g. `postgres://…`, or a remote sqld URL) —
+    /// NEVER a raw URL in the config. Unused for an embedded single-node `sqlite` database (which
+    /// uses [`path`](Self::path)).
+    pub url_env: Option<String>,
+    /// On-disk file path for an embedded single-node `sqlite` KV (e.g. `/data/kv.db`). The parent
+    /// directory is created if absent. Ignored for `postgres`/`mysql` and for a remote-sqld URL.
+    pub path: Option<String>,
+    /// Maximum pooled connections for a `postgres`/`mysql` KV (later workstreams). Ignored for the
+    /// embedded `sqlite` path (one `Database` handle, connections opened per op).
+    pub pool_max: Option<u32>,
 }
 
 /// `[serve.s3_ingress_cloud]` — the cloud-brokering knobs for the M4 blob-upload minter (which native
@@ -3752,8 +3797,11 @@ mod tests {
             "an absent/unset close_deadline defaults to the generous budget"
         );
 
-        // An explicit block: a tuned cadence + a tuned close budget.
-        let cfg = server(r#"( serve: ( kv: ( checkpoint_interval: 5, close_deadline: 30 ) ) )"#);
+        // An explicit block: a tuned cadence + a tuned close budget, now nested under `slatedb`
+        // (UX-C3) so they never appear to apply under a non-SlateDB backend.
+        let cfg = server(
+            r#"( serve: ( kv: ( slatedb: ( checkpoint_interval: 5, close_deadline: 30 ) ) ) )"#,
+        );
         let kv = cfg.serve.unwrap().kv.unwrap();
         assert_eq!(
             kv.checkpoint_interval(),
@@ -3763,7 +3811,9 @@ mod tests {
 
         // checkpoint_interval = 0 DISABLES the cadence; a 0 close_deadline falls back to the default
         // (a zero close budget would abandon every close, guaranteeing a torn tail — never allowed).
-        let cfg = server(r#"( serve: ( kv: ( checkpoint_interval: 0, close_deadline: 0 ) ) )"#);
+        let cfg = server(
+            r#"( serve: ( kv: ( slatedb: ( checkpoint_interval: 0, close_deadline: 0 ) ) ) )"#,
+        );
         let kv = cfg.serve.unwrap().kv.unwrap();
         assert_eq!(kv.checkpoint_interval(), None, "0 disables the cadence");
         assert_eq!(
@@ -3772,10 +3822,28 @@ mod tests {
             "a 0 close_deadline is clamped up to the default, never zero"
         );
 
-        // An unknown field is rejected (`deny_unknown_fields`).
+        // The SQL KV backend connection parses under `sql` (UX-C2: `url_env`, never a raw URL).
+        let cfg = server(r#"( serve: ( kv: ( sql: ( kind: "sqlite", path: "/data/kv.db" ) ) ) )"#);
+        let sql = cfg.serve.unwrap().kv.unwrap().sql.unwrap();
+        assert_eq!(sql.kind, "sqlite");
+        assert_eq!(sql.path.as_deref(), Some("/data/kv.db"));
+
+        // UX-C3: a pre-v0.12.0 TOP-LEVEL durability knob now fails loud (it moved under `slatedb`),
+        // never silently mislead — `deny_unknown_fields` rejects it at the `[serve.kv]` level.
         let err: Result<ServerConfig, _> =
-            ron_options().from_str(r#"( serve: ( kv: ( checkpoint_interval: 5, bogus: 1 ) ) )"#);
-        assert!(err.is_err(), "unknown [serve.kv] field must be rejected");
+            ron_options().from_str(r#"( serve: ( kv: ( checkpoint_interval: 5 ) ) )"#);
+        assert!(
+            err.is_err(),
+            "a top-level checkpoint_interval must be rejected (moved under [serve.kv.slatedb])"
+        );
+
+        // An unknown field inside the `slatedb` sub-block is rejected (`deny_unknown_fields`).
+        let err: Result<ServerConfig, _> = ron_options()
+            .from_str(r#"( serve: ( kv: ( slatedb: ( checkpoint_interval: 5, bogus: 1 ) ) ) )"#);
+        assert!(
+            err.is_err(),
+            "unknown [serve.kv.slatedb] field must be rejected"
+        );
     }
 
     // =======================================================================

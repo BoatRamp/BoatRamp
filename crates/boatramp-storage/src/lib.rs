@@ -62,6 +62,10 @@ pub mod kv_cloudflare;
 
 #[cfg(feature = "sql")]
 pub mod sql_libsql;
+// The SQL-backed control-plane KV ([`KvStore`](boatramp_core::kv::KvStore)) — SQLite/libsql-local
+// single-writer in this workstream, dialect-parameterized for the Postgres/MySQL pools later.
+#[cfg(feature = "sql")]
+pub mod kv_sql;
 #[cfg(any(feature = "sql", feature = "sql-postgres", feature = "sql-mysql"))]
 mod sql_placeholders;
 
@@ -122,6 +126,9 @@ pub use kv_slatedb::{S3StoreConfig, SlateKv};
 
 #[cfg(feature = "cloudflare-kv")]
 pub use kv_cloudflare::CloudflareKv;
+
+#[cfg(feature = "sql")]
+pub use kv_sql::SqlKv;
 
 #[cfg(feature = "sql")]
 pub use sql_libsql::{LibsqlSql, LibsqlSqlBackends};
