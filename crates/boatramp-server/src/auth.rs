@@ -20,15 +20,56 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 
 use boatramp_core::authz::{self, AuthzPolicy, Right};
+use boatramp_core::cache_coherence::AuthzFence;
 use boatramp_core::cedar::CompiledCedar;
 use boatramp_core::cose::{self, POP_MAX_BODY_HASH_BYTES, PopClaims, TokenError, TokenPublicKey};
-use boatramp_core::kv::KvStore;
+use boatramp_core::kv::{KvError, KvStore};
 
 /// The header carrying a per-request proof-of-possession (base64url `COSE_Sign1`),
 /// signed by the token's holder (`cnf`) key. Lower-case per HTTP/2 conventions.
 const POP_HEADER: HeaderName = HeaderName::from_static("boatramp-pop");
 
 use authz::ROOT_ANCHOR_PREFIX;
+
+/// Whether the MF-3 fence mutation seam is armed — the shared-mode authz read then IGNORES the
+/// fence and always serves from the local cache, so a missed invalidation keeps being honored and
+/// `shared_stale_authz_fence_denies_on_missed_invalidation` goes RED (proving the fence read-through
+/// is load-bearing). ALWAYS `false` in a shipped build: the env check compiles in ONLY under
+/// `cfg(test)` (this crate's own gates) or the `shared-mode-gate-mutation` feature (a downstream
+/// test lane). Shares the one `BOATRAMP_KVSQL_MUTATION` env var, mirroring the WS1–4 seams.
+fn authz_fence_removed() -> bool {
+    #[cfg(any(test, feature = "shared-mode-gate-mutation"))]
+    {
+        std::env::var("BOATRAMP_KVSQL_MUTATION").as_deref() == Ok("remove_authz_fence")
+    }
+    #[cfg(not(any(test, feature = "shared-mode-gate-mutation")))]
+    {
+        false
+    }
+}
+
+/// Whether the MF-4 fail-closed mutation seam is armed — a shared-mode authz read ERROR then reverts
+/// to the pre-MF-4 FAIL-OPEN behavior (an unreachable store reads as "not revoked" / falls to the
+/// looser default policy), so `shared_fail_closed_on_db_unreachable` goes RED (proving the
+/// fail-closed branch is load-bearing). Same gating as [`authz_fence_removed`].
+fn authz_fail_open_reverted() -> bool {
+    #[cfg(any(test, feature = "shared-mode-gate-mutation"))]
+    {
+        std::env::var("BOATRAMP_KVSQL_MUTATION").as_deref() == Ok("revert_authz_fail_open")
+    }
+    #[cfg(not(any(test, feature = "shared-mode-gate-mutation")))]
+    {
+        false
+    }
+}
+
+/// Whether `method` is a control-plane WRITE (mutating). Mirrors the `is_write` classification in
+/// [`require_auth`] — in shared mode a write's authz decision ALWAYS reads through to the live store
+/// (never trusts the cache), so a tightened policy / revoked grant is confirmed before the write and
+/// a partition sheds the write (503) rather than letting a stale-authorized mutation proceed.
+fn is_write_method(method: &str) -> bool {
+    !matches!(method, "GET" | "HEAD" | "OPTIONS" | "TRACE")
+}
 
 /// The classification of a bearer presented to a session-channel gate
 /// ([`Auth::classify_channel_bearer`]).
@@ -63,6 +104,27 @@ struct AuthInner {
     require_pop: bool,
     /// Node-local replay guard for PoP proof `jti`s (window-bounded).
     replay: PopReplayCache,
+    /// **Shared-mode (multi-writer) authz guard** (MF-3 stale-authz fence + MF-4 fail-closed).
+    /// `None` in single-writer / Raft mode — the authz reads use `kv` directly and a read error is
+    /// best-effort (today's behavior, UNCHANGED). `Some` in multi-writer `shared` mode — the fence
+    /// routes authz reads cache-vs-read-through, control-plane WRITES always read through, and a
+    /// store-unreachable read error FAILS CLOSED (deny / shed 503). See [`SharedAuthz`].
+    shared: Option<SharedAuthz>,
+}
+
+/// The shared-mode authz guard carried by [`AuthInner`] in multi-writer mode (MF-3 + MF-4). Built by
+/// the node bootstrap ONLY when the control-plane KV backend declares
+/// [`WriterModel::MultiWriter`](boatramp_core::kv::WriterModel); single-writer deployments never
+/// construct one, so their authz path is byte-for-byte unchanged.
+#[derive(Clone)]
+struct SharedAuthz {
+    /// The UNCACHED backing control-plane store — the authoritative source the fence reads the authz
+    /// keyspace THROUGH when it cannot trust the cache (`AuthInner::kv` is the `CachedKv` fast path;
+    /// this is its inner store). A read error here is a genuine partition signal → fail closed.
+    backing: Arc<dyn KvStore>,
+    /// The MF-3 currency fence, shared (by `Arc`) with the cache poller: the poller trips it when a
+    /// poll cannot reach the store; the authorizer confirms it after a successful read-through.
+    fence: Arc<AuthzFence>,
 }
 
 /// A node-local, window-bounded replay guard for PoP proof `jti`s. Bounds
@@ -117,7 +179,30 @@ impl Auth {
                 pop_origin: None,
                 require_pop: false,
                 replay: PopReplayCache::new(),
+                shared: None,
             })),
+        }
+    }
+
+    /// Enable the **multi-writer `shared`-mode authz guard** (MF-3 stale-authz fence + MF-4
+    /// fail-closed). `backing` is the UNCACHED control-plane store (the `CachedKv`'s inner store)
+    /// the fence reads the authz keyspace through when it cannot trust the cache; `fence` is the
+    /// [`AuthzFence`] shared with the cache poller. A no-op when auth is disabled. Call it ONLY for a
+    /// multi-writer backend; a single-writer / Raft node must NOT (its authz path stays unchanged).
+    /// Builder-style and order-independent — [`with_pop`](Self::with_pop) preserves it.
+    pub fn with_shared_authz(self, backing: Arc<dyn KvStore>, fence: Arc<AuthzFence>) -> Self {
+        match self.inner {
+            Some(inner) => Self {
+                inner: Some(Arc::new(AuthInner {
+                    public: inner.public.clone(),
+                    kv: inner.kv.clone(),
+                    pop_origin: inner.pop_origin.clone(),
+                    require_pop: inner.require_pop,
+                    replay: inner.replay.clone(),
+                    shared: Some(SharedAuthz { backing, fence }),
+                })),
+            },
+            None => Self { inner: None },
         }
     }
 
@@ -135,6 +220,7 @@ impl Auth {
                     pop_origin,
                     require_pop,
                     replay: PopReplayCache::new(),
+                    shared: inner.shared.clone(),
                 })),
             },
             None => Self { inner: None },
@@ -162,7 +248,7 @@ impl Auth {
         let Ok(verified) = inner.verify_credential_any(bearer, now_unix()).await else {
             return false;
         };
-        !inner.is_revoked(&verified.cti).await
+        !inner.is_revoked_or_unreadable(&verified.cti).await
     }
 
     /// Classify a bearer for a session-channel gate (the HTTP `/mcp` endpoint): a
@@ -178,7 +264,7 @@ impl Auth {
         let Ok(verified) = inner.verify_credential_any(bearer, now_unix()).await else {
             return ChannelBearer::Invalid;
         };
-        if inner.is_revoked(&verified.cti).await {
+        if inner.is_revoked_or_unreadable(&verified.cti).await {
             return ChannelBearer::Invalid;
         }
         if verified.leaf_cnf.is_some() {
@@ -219,7 +305,7 @@ impl Auth {
     pub async fn verify_bearer_roles(&self, bearer: &str) -> Option<Vec<authz::GrantedRole>> {
         let inner = self.inner.as_ref()?;
         let verified = inner.verify_credential_any(bearer, now_unix()).await.ok()?;
-        if inner.is_revoked(&verified.cti).await {
+        if inner.is_revoked_or_unreadable(&verified.cti).await {
             return None;
         }
         Some(verified.roles)
@@ -247,12 +333,28 @@ impl Auth {
             return Ok(());
         };
         let now = now_unix();
+        // A control-plane WRITE confirms its authz against the live store (never a stale cache) in
+        // shared mode, and a partitioned node sheds the write (503) — there is no leader to absorb it.
+        let is_write = is_write_method(method);
         let verified = inner
             .verify_credential_any(bearer, now)
             .await
             .map_err(Reject::from_token_err)?;
-        if inner.is_revoked(&verified.cti).await {
-            return Err(Reject::forbidden("token revoked\n"));
+        // MF-4 — revocation fails CLOSED in shared mode: `Ok(true)` is revoked; `Ok(false)` is a
+        // clean absence (honor the token); `Err` is a store-unreachable partition → SHED (deny /
+        // 503), never silently treat an unreadable marker as "not revoked" (the pre-MF-4 hole).
+        match inner.revocation(&verified.cti, is_write).await {
+            Ok(true) => return Err(Reject::forbidden("token revoked\n")),
+            Ok(false) => {}
+            Err(_) if inner.fail_closed() && !authz_fail_open_reverted() => {
+                return Err(Reject::shed());
+            }
+            Err(err) => {
+                // Single-writer / local mode (a genuine local-store fault, not a routine partition),
+                // OR the `revert_authz_fail_open` mutation: preserve the pre-MF-4 fail-OPEN behavior
+                // (treat as not revoked) — this is what keeps a single-node deployment UNCHANGED.
+                tracing::warn!(%err, "could not read token revocation marker; treating as not revoked");
+            }
         }
         // Proof-of-possession (DPoP): a holder-bound (`cnf`) credential MUST carry a
         // valid per-request proof — always, regardless of the posture knob (RFC 9449:
@@ -277,7 +379,14 @@ impl Auth {
                 "token not authorized for this resource\n",
             ));
         }
-        let (policy, compiled) = inner.policy().await;
+        // MF-3/MF-4 — the policy read is fenced + fails CLOSED in shared mode: a cached policy older
+        // than the fence bound `T` (or any write) reads THROUGH to the live store; a store-unreachable
+        // `Err` SHEDS (deny / 503) rather than falling to the looser built-in default (privilege
+        // escalation). `Ok` still brick-guards a malformed/uncompilable stored policy to the default.
+        let (policy, compiled) = match inner.policy(is_write).await {
+            Ok(pc) => pc,
+            Err(_) => return Err(Reject::shed()),
+        };
         // Normalize legacy grants (a pre-0.2.0 `publisher:blog` reads as the `default`
         // project) so a site name minted before the project re-keying still authorizes
         // its now project-qualified route.
@@ -293,9 +402,58 @@ impl Auth {
 }
 
 impl AuthInner {
-    /// Whether the token's revocation id (`cti`) is marked revoked in the KV.
-    async fn is_revoked(&self, cti: &str) -> bool {
-        matches!(self.kv.get(&authz::revoked_key(cti)).await, Ok(Some(_)))
+    /// The store an authz-keyspace read uses, and whether it is a fence-forced READ-THROUGH
+    /// (shared-mode only). Single-writer: always `kv` — today's behavior. Shared mode: the UNCACHED
+    /// `backing` when this is a control-plane WRITE (a mutating authz decision never trusts the
+    /// cache) OR the MF-3 fence is not current (cache trust lapsed past `T`, or the poller tripped it
+    /// on an unreachable store); otherwise the local cache (the NOTIFY fast path).
+    fn authz_read_store(&self, is_write: bool) -> (&Arc<dyn KvStore>, bool) {
+        match &self.shared {
+            None => (&self.kv, false),
+            Some(s) => {
+                if authz_fence_removed() {
+                    // MUTATION (remove_authz_fence): ignore the fence → always serve the local cache,
+                    // so a missed invalidation keeps being honored (the fence gate goes RED).
+                    (&self.kv, false)
+                } else if is_write || !s.fence.is_current() {
+                    (&s.backing, true)
+                } else {
+                    (&self.kv, false)
+                }
+            }
+        }
+    }
+
+    /// Whether this node is in shared (multi-writer) mode, where an authz read error is a routine
+    /// partition that must FAIL CLOSED (MF-4). Single-writer / Raft returns `false` (UNCHANGED): a
+    /// local read error there is a genuine, rare fault, not a routine partition, and Raft replication
+    /// keeps every node's applied state current — so the pre-MF-4 best-effort semantics are retained.
+    fn fail_closed(&self) -> bool {
+        self.shared.is_some()
+    }
+
+    /// Whether the token's revocation id (`cti`) is marked revoked. `Ok(true)` = revoked; `Ok(false)`
+    /// = a clean absence (`CachedKv` never caches an absent key, so a freshly-written revoke is seen
+    /// at once — revocation is fresh by construction); `Err` = the store was UNREACHABLE, so the
+    /// caller fails CLOSED in shared mode (MF-4).
+    async fn revocation(&self, cti: &str, is_write: bool) -> Result<bool, KvError> {
+        let (store, _) = self.authz_read_store(is_write);
+        store
+            .get(&authz::revoked_key(cti))
+            .await
+            .map(|v| v.is_some())
+    }
+
+    /// Revocation check for the non-`authorize` bearer gates (`verify_bearer`, the MCP channel
+    /// classifier, `whoami`), which have no 503 channel. Returns `true` (reject the bearer) when the
+    /// token is revoked OR — in shared mode — the marker is UNREACHABLE (fail closed, MF-4), and
+    /// `false` otherwise. Single-writer preserves the pre-MF-4 behavior (an error reads as not
+    /// revoked); the `revert_authz_fail_open` mutation forces that fail-OPEN path even in shared mode.
+    async fn is_revoked_or_unreadable(&self, cti: &str) -> bool {
+        match self.revocation(cti, false).await {
+            Ok(revoked) => revoked,
+            Err(_) => self.fail_closed() && !authz_fail_open_reverted(),
+        }
     }
 
     /// Verify a credential against the primary anchor, then — only on failure —
@@ -325,7 +483,11 @@ impl AuthInner {
     /// The replicated rotation anchors — extra root public keys added by
     /// `auth rotate-root` (`auth/root/{es256:hex}`), trusted alongside the primary.
     async fn rotation_anchors(&self) -> Vec<TokenPublicKey> {
-        self.kv
+        // Route through the fence (shared mode) so a lapsed cache reads the anchor set through to the
+        // live store. On a read error the set is empty → a token signed only by a rotation anchor
+        // fails verification → DENIED, which is the fail-closed-safe direction (never falsely admits).
+        let (store, _) = self.authz_read_store(false);
+        store
             .list_prefix(ROOT_ANCHOR_PREFIX)
             .await
             .unwrap_or_default()
@@ -394,39 +556,60 @@ impl AuthInner {
     /// the caller can [`normalize_grants`](AuthzPolicy::normalize_grants) (legacy
     /// bare-site grants → the `default` project) with the same policy the authorizer
     /// compiled from.
-    async fn policy(&self) -> (AuthzPolicy, CompiledCedar) {
-        let stored = match self.kv.get(authz::POLICY_KEY).await {
+    async fn policy(&self, is_write: bool) -> Result<(AuthzPolicy, CompiledCedar), KvError> {
+        let (store, via_read_through) = self.authz_read_store(is_write);
+        let stored = match store.get(authz::POLICY_KEY).await {
             Ok(Some(bytes)) => match serde_json::from_slice::<AuthzPolicy>(&bytes) {
                 Ok(p) => Some(p),
                 Err(err) => {
+                    // Brick-guard (KEPT): a corrupt STORED policy must never wedge the control plane
+                    // — it is logged and the default used. Only the UNREACHABLE case fails closed.
                     tracing::warn!(%err, "authz/policy is malformed; using the default policy");
                     None
                 }
             },
             Ok(None) => None,
             Err(err) => {
+                // MF-4 — a store-unreachable read FAILS CLOSED in shared mode: return the error so
+                // `authorize` sheds (503) instead of falling to the LOOSER built-in default (which
+                // would be a privilege escalation during a partition). Single-writer / local mode —
+                // or the `revert_authz_fail_open` mutation — keeps the pre-MF-4 default-on-error path.
+                if self.fail_closed() && !authz_fail_open_reverted() {
+                    return Err(err);
+                }
                 tracing::warn!(%err, "could not read authz/policy; using the default policy");
                 None
             }
         };
+        // MF-3 — a SUCCESSFUL read-through of the authz keyspace against the live store re-confirms
+        // the fence for the bound `T` (so subsequent reads may ride the cache fast path again).
+        if via_read_through && let Some(s) = &self.shared {
+            s.fence.confirm();
+        }
         let policy = stored.unwrap_or_else(AuthzPolicy::default_policy);
         match CompiledCedar::compile(&policy) {
-            Ok(c) => (policy, c),
+            Ok(c) => Ok((policy, c)),
             Err(err) => {
                 tracing::warn!(%err, "authz/policy failed to compile; using the default policy");
                 let default = AuthzPolicy::default_policy();
                 let compiled =
                     CompiledCedar::compile(&default).expect("the default policy always compiles");
-                (default, compiled)
+                Ok((default, compiled))
             }
         }
     }
 }
 
-/// A rejected request: the HTTP status + a short body.
+/// How long a shed (503) control-plane request should wait before retrying, in seconds. Mirrors the
+/// managed-dependency readiness gate's `Retry-After` (`scheduler.rs` `sql_starting_response`).
+const SHED_RETRY_AFTER_SECS: u32 = 2;
+
+/// A rejected request: the HTTP status, a short body, and an optional `Retry-After` (for a shed 503).
 struct Reject {
     status: StatusCode,
     body: &'static str,
+    /// `Some(secs)` → attach a `Retry-After` header (a retryable shed); `None` → a plain rejection.
+    retry_after: Option<u32>,
 }
 
 impl Reject {
@@ -434,12 +617,26 @@ impl Reject {
         Self {
             status: StatusCode::UNAUTHORIZED,
             body,
+            retry_after: None,
         }
     }
     fn forbidden(body: &'static str) -> Self {
         Self {
             status: StatusCode::FORBIDDEN,
             body,
+            retry_after: None,
+        }
+    }
+    /// MF-3/MF-4 **shed**: the shared control-plane store is unreachable, so the node can neither
+    /// confirm authz currency nor absorb a write (there is no leader). Return a retryable `503` with
+    /// `Retry-After` — a client re-polls rather than being silently stale-authorized or 500'd. This
+    /// is the fail-closed outcome for a revoked-token check, a tightened-policy decision, AND a new
+    /// control-plane write during a partition.
+    fn shed() -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            body: "control plane store unreachable; retry shortly\n",
+            retry_after: Some(SHED_RETRY_AFTER_SECS),
         }
     }
     /// Map a token verification failure to a response. An *expired* token is a 401
@@ -449,6 +646,20 @@ impl Reject {
         match err {
             TokenError::Expired => Self::unauthorized("token expired\n"),
             _ => Self::unauthorized("invalid token\n"),
+        }
+    }
+
+    /// Build the HTTP response, attaching `Retry-After` for a shed.
+    fn into_response(self) -> Response {
+        match self.retry_after {
+            Some(secs) => {
+                let mut headers = axum::http::HeaderMap::new();
+                if let Ok(v) = axum::http::HeaderValue::from_str(&secs.to_string()) {
+                    headers.insert(header::RETRY_AFTER, v);
+                }
+                (self.status, headers, self.body).into_response()
+            }
+            None => (self.status, self.body).into_response(),
         }
     }
 }
@@ -492,7 +703,7 @@ pub async fn require_auth(State(auth): State<Auth>, request: Request, next: Next
         .await
     {
         Ok(()) => next.run(request).await,
-        Err(reject) => (reject.status, reject.body).into_response(),
+        Err(reject) => reject.into_response(),
     }
 }
 
@@ -905,4 +1116,453 @@ mod tests {
         let (_, hash) = buffer_body_for_pop(empty).await.unwrap();
         assert_eq!(hash, None);
     }
+
+    // ===== MF-3 (stale-authz fence) + MF-4 (fail-closed) shared-mode authz gates =================
+    //
+    // These model the multi-writer topology backend-agnostically (node B's local cache vs the
+    // authoritative shared store), exactly as the WS1–4 core gates model it over `MemoryKv`. Each
+    // clean gate asserts the SECURE behavior with the mutation seam UNARMED; a paired `mutation_*`
+    // test ARMS the seam (`BOATRAMP_KVSQL_MUTATION`) and asserts the INSECURE behavior — so the CI
+    // mutation loop runs the clean gate with the env set and sees it go RED. The live-Postgres twins
+    // (same properties over a real multi-writer `SqlKv`) are in `pg_shared_authz_gates`.
+
+    use boatramp_core::cache_coherence::AuthzFence;
+    use std::time::Duration;
+
+    /// A `KvStore` whose every op ERRORS — a faithful stand-in for "the shared control-plane DB is
+    /// unreachable" (a severed pool). The MF-4 fail-closed gate reads through it.
+    struct FailingKv;
+    #[async_trait::async_trait]
+    impl KvStore for FailingKv {
+        async fn get(&self, _k: &str) -> Result<Option<Vec<u8>>, KvError> {
+            Err(KvError::backend("db unreachable (test)"))
+        }
+        async fn put(&self, _k: &str, _v: Vec<u8>) -> Result<(), KvError> {
+            Err(KvError::backend("db unreachable (test)"))
+        }
+        async fn delete(&self, _k: &str) -> Result<(), KvError> {
+            Err(KvError::backend("db unreachable (test)"))
+        }
+        async fn list_prefix(&self, _p: &str) -> Result<Vec<String>, KvError> {
+            Err(KvError::backend("db unreachable (test)"))
+        }
+    }
+
+    /// A `KvStore` that ERRORS only for the authz POLICY key and is empty-but-reachable otherwise —
+    /// models "revocation reads fine, the policy read can't reach the DB", so the fail-closed gate
+    /// can exercise the policy path distinctly from revocation.
+    struct PolicyUnreachableKv;
+    #[async_trait::async_trait]
+    impl KvStore for PolicyUnreachableKv {
+        async fn get(&self, k: &str) -> Result<Option<Vec<u8>>, KvError> {
+            if k == authz::POLICY_KEY {
+                Err(KvError::backend("policy db unreachable (test)"))
+            } else {
+                Ok(None) // not revoked; no anchors
+            }
+        }
+        async fn put(&self, _k: &str, _v: Vec<u8>) -> Result<(), KvError> {
+            Ok(())
+        }
+        async fn delete(&self, _k: &str) -> Result<(), KvError> {
+            Ok(())
+        }
+        async fn list_prefix(&self, _p: &str) -> Result<Vec<String>, KvError> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// A plain (non-`cnf`) admin token — needs no PoP proof, so the gates exercise the authz decision.
+    async fn admin_token(root: &LocalSigner) -> String {
+        cose::mint(&admin_claims(now_unix()), root).await.unwrap()
+    }
+
+    /// The `cti` (revocation id) of a token, for seeding a revoke marker.
+    fn token_cti(root: &LocalSigner, token: &str) -> String {
+        cose::verify_credential(token, &root.public_key(), now_unix())
+            .unwrap()
+            .cti
+    }
+
+    /// Build a shared-mode `Auth` over a local cache + an uncached backing + a fence (MF-3/MF-4).
+    fn shared_auth(
+        root: &LocalSigner,
+        cached: Arc<dyn KvStore>,
+        backing: Arc<dyn KvStore>,
+        fence: Arc<AuthzFence>,
+    ) -> Auth {
+        Auth::with_key(root.public_key(), cached)
+            .with_pop(Some(ORIGIN.to_string()), false)
+            .with_shared_authz(backing, fence)
+    }
+
+    /// A VALID but empty policy (compiles, grants nobody) — the "tightened" policy that denies an
+    /// `admin` token the right the permissive default grants it.
+    fn tightened_policy_bytes() -> Vec<u8> {
+        let mut tight = AuthzPolicy::default_policy();
+        tight.roles.clear();
+        serde_json::to_vec(&tight).unwrap()
+    }
+
+    fn default_policy_bytes() -> Vec<u8> {
+        serde_json::to_vec(&AuthzPolicy::default_policy()).unwrap()
+    }
+
+    /// GATE (MF-3) — a tightened/revoked grant on node A with the NOTIFY publish SUPPRESSED is
+    /// DENIED on node B within the fence bound `T` (via read-through), not after the 300s backstop.
+    /// B's cache holds the old permissive policy; the authoritative store has the tightened one; the
+    /// fence (unable to confirm currency) forces the read-through that enforces the tightening.
+    /// RED under `remove_authz_fence` (B keeps serving the stale permissive policy → allows).
+    #[tokio::test]
+    #[serial_test::serial(shared_authz_env)]
+    async fn shared_stale_authz_fence_denies_on_missed_invalidation() {
+        let root = holder();
+        let token = admin_token(&root).await;
+
+        let cached: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        cached
+            .put(authz::POLICY_KEY, default_policy_bytes())
+            .await
+            .unwrap(); // B's stale cache: admin still allowed
+        let backing: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        backing
+            .put(authz::POLICY_KEY, tightened_policy_bytes())
+            .await
+            .unwrap(); // A tightened it; publish suppressed
+
+        let fence = Arc::new(AuthzFence::new(Duration::from_secs(30)));
+        fence.trip(); // B cannot confirm currency within T → must read through
+        let auth = shared_auth(&root, cached, backing, fence);
+
+        let rej = auth
+            .authorize(&token, "GET", PATH, None, None)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            rej.status,
+            StatusCode::FORBIDDEN,
+            "the fence read-through enforces the tightened policy — B denies within T"
+        );
+    }
+
+    /// The `remove_authz_fence` MUTATION makes MF-3 RED: B ignores the fence, serves the stale
+    /// permissive policy from cache, and ALLOWS the request the tightened policy would deny.
+    #[tokio::test]
+    #[serial_test::serial(shared_authz_env)]
+    async fn mutation_remove_authz_fence_serves_stale() {
+        // SAFETY: single-threaded within this #[serial] test; cleared before returning.
+        unsafe { std::env::set_var("BOATRAMP_KVSQL_MUTATION", "remove_authz_fence") };
+        let root = holder();
+        let token = admin_token(&root).await;
+        let cached: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        cached
+            .put(authz::POLICY_KEY, default_policy_bytes())
+            .await
+            .unwrap();
+        let backing: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        backing
+            .put(authz::POLICY_KEY, tightened_policy_bytes())
+            .await
+            .unwrap();
+        let fence = Arc::new(AuthzFence::new(Duration::from_secs(30)));
+        fence.trip();
+        let auth = shared_auth(&root, cached, backing, fence);
+        let allowed = auth
+            .authorize(&token, "GET", PATH, None, None)
+            .await
+            .is_ok();
+        unsafe { std::env::remove_var("BOATRAMP_KVSQL_MUTATION") };
+        assert!(
+            allowed,
+            "mutation: the fence is ignored, the stale permissive policy is served → the gate is RED"
+        );
+    }
+
+    /// GATE (MF-3, symmetric) — a token REVOKED on node A with the NOTIFY publish SUPPRESSED is
+    /// denied on node B without NOTIFY: B's cache has a stale "not revoked" negative, the shared
+    /// store has the revoke marker, and the fence forces the read-through that sees it.
+    /// RED under `remove_authz_fence` (B serves the stale negative → honors the revoked token).
+    #[tokio::test]
+    #[serial_test::serial(shared_authz_env)]
+    async fn shared_revoked_token_denied_across_nodes_without_notify() {
+        let root = holder();
+        let token = admin_token(&root).await;
+        let cti = token_cti(&root, &token);
+
+        let cached: Arc<dyn KvStore> = Arc::new(MemoryKv::new()); // stale: no marker
+        let backing: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        backing
+            .put(&authz::revoked_key(&cti), Vec::new())
+            .await
+            .unwrap(); // A revoked it; publish suppressed
+
+        let fence = Arc::new(AuthzFence::new(Duration::from_secs(30)));
+        fence.trip();
+        let auth = shared_auth(&root, cached, backing, fence);
+        let rej = auth
+            .authorize(&token, "GET", PATH, None, None)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            rej.status,
+            StatusCode::FORBIDDEN,
+            "the revoke is seen via the fence read-through, without NOTIFY"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(shared_authz_env)]
+    async fn mutation_remove_authz_fence_honors_revoked_token() {
+        unsafe { std::env::set_var("BOATRAMP_KVSQL_MUTATION", "remove_authz_fence") };
+        let root = holder();
+        let token = admin_token(&root).await;
+        let cti = token_cti(&root, &token);
+        let cached: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let backing: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        backing
+            .put(&authz::revoked_key(&cti), Vec::new())
+            .await
+            .unwrap();
+        let fence = Arc::new(AuthzFence::new(Duration::from_secs(30)));
+        fence.trip();
+        let auth = shared_auth(&root, cached, backing, fence);
+        let allowed = auth
+            .authorize(&token, "GET", PATH, None, None)
+            .await
+            .is_ok();
+        unsafe { std::env::remove_var("BOATRAMP_KVSQL_MUTATION") };
+        assert!(
+            allowed,
+            "mutation: the stale 'not revoked' negative is served → the revoked token is honored (RED)"
+        );
+    }
+
+    /// GATE (MF-4) — with the shared DB unreachable, a shared-mode node FAILS CLOSED: (a) a revoked
+    /// check sheds (REJECTED, not honored), (b) a policy decision sheds (DENIED, not default-allow),
+    /// (c) a new control-plane WRITE sheds 503 + `Retry-After`. RED under `revert_authz_fail_open`.
+    #[tokio::test]
+    #[serial_test::serial(shared_authz_env)]
+    async fn shared_fail_closed_on_db_unreachable() {
+        let root = holder();
+        let token = admin_token(&root).await;
+        let fence = Arc::new(AuthzFence::new(Duration::from_secs(30)));
+        fence.trip();
+
+        // (a) the revoked-token check against an unreachable store → shed (not honored).
+        let failing: Arc<dyn KvStore> = Arc::new(FailingKv);
+        let auth = shared_auth(&root, failing.clone(), failing.clone(), fence.clone());
+        let rej = auth
+            .authorize(&token, "GET", PATH, None, None)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            rej.status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "(a) revoked-check unreachable ⇒ SHED, never silently honor"
+        );
+
+        // (b) a policy decision when only the policy read is unreachable → shed (not default-allow).
+        let polfail: Arc<dyn KvStore> = Arc::new(PolicyUnreachableKv);
+        let auth_b = shared_auth(&root, polfail.clone(), polfail, fence.clone());
+        let rej_b = auth_b
+            .authorize(&token, "GET", PATH, None, None)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            rej_b.status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "(b) policy unreachable ⇒ SHED, never fall to the looser default"
+        );
+
+        // (c) a new control-plane WRITE during the partition → 503 + Retry-After.
+        let rej_w = auth
+            .authorize(&token, "PUT", "/api/authz/policy", None, None)
+            .await
+            .unwrap_err();
+        assert_eq!(rej_w.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            rej_w.retry_after,
+            Some(SHED_RETRY_AFTER_SECS),
+            "(c) a shed write carries Retry-After (mirrors the managed-dep readiness gate)"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(shared_authz_env)]
+    async fn mutation_revert_authz_fail_open_honors_unreachable() {
+        unsafe { std::env::set_var("BOATRAMP_KVSQL_MUTATION", "revert_authz_fail_open") };
+        let root = holder();
+        let token = admin_token(&root).await;
+        let fence = Arc::new(AuthzFence::new(Duration::from_secs(30)));
+        fence.trip();
+        let failing: Arc<dyn KvStore> = Arc::new(FailingKv);
+        let auth = shared_auth(&root, failing.clone(), failing, fence);
+        let allowed = auth
+            .authorize(&token, "GET", PATH, None, None)
+            .await
+            .is_ok();
+        unsafe { std::env::remove_var("BOATRAMP_KVSQL_MUTATION") };
+        assert!(
+            allowed,
+            "mutation: an unreachable store reads as not-revoked + default policy → honored (RED)"
+        );
+    }
+
+    /// SINGLE-WRITER PRESERVED — with NO shared guard, a local read error keeps the pre-MF-4
+    /// semantics: NOT a 503 shed. Revocation reads as not-revoked and policy falls to the default,
+    /// so a valid admin token is still authorized (today's single-node behavior, unchanged).
+    #[tokio::test]
+    async fn local_mode_authz_read_error_does_not_shed() {
+        let root = holder();
+        let token = admin_token(&root).await;
+        let failing: Arc<dyn KvStore> = Arc::new(FailingKv);
+        let auth =
+            Auth::with_key(root.public_key(), failing).with_pop(Some(ORIGIN.to_string()), false);
+        assert!(
+            auth.authorize(&token, "GET", PATH, None, None)
+                .await
+                .is_ok(),
+            "single-writer must NOT 503 on a local read error (unchanged semantics)"
+        );
+    }
+}
+
+/// MF-3/MF-4 live-Postgres twins — the SAME fence + fail-closed properties over a REAL multi-writer
+/// `SqlKv`, so node B's read-through / shed is exercised against a real shared primary. Env-gated on
+/// `BOATRAMP_TEST_PG_URL`; skips CLEANLY when unset. Mirrors the WS2/WS4 live harness; `#[serial]`
+/// because the shared `kv` tables are reset per test. Compiled only with `--features sql-postgres`.
+#[cfg(all(test, feature = "sql-postgres"))]
+mod pg_shared_authz_gates {
+    use super::*;
+    use boatramp_core::cache_coherence::AuthzFence;
+    use boatramp_core::cose::{Claims, LocalSigner, Signer, TokenAlg};
+    use boatramp_core::kv::MemoryKv;
+    use boatramp_storage::SqlKv;
+    use serial_test::serial;
+    use std::time::Duration;
+
+    const ORIGIN: &str = "https://cp.example.com";
+    const PATH: &str = "/api/sites";
+
+    async fn fresh_pg() -> Option<Arc<dyn KvStore>> {
+        let Ok(url) = std::env::var("BOATRAMP_TEST_PG_URL") else {
+            eprintln!("skip pg shared-authz gate: BOATRAMP_TEST_PG_URL unset");
+            return None;
+        };
+        let kv = SqlKv::open_postgres(url, Some(8))
+            .await
+            .expect("open Postgres SqlKv");
+        // Clean slate: clear the control-plane keyspace used by these gates.
+        for key in kv.list_prefix("authz/").await.unwrap() {
+            kv.delete(&key).await.unwrap();
+        }
+        Some(Arc::new(kv) as Arc<dyn KvStore>)
+    }
+
+    fn root() -> LocalSigner {
+        LocalSigner::generate(TokenAlg::Es256)
+    }
+
+    async fn admin_token(root: &LocalSigner) -> String {
+        let now = boatramp_core::time::now_unix();
+        let claims = Claims {
+            roles: vec![authz::GrantedRole::global("admin")],
+            kind: "role".into(),
+            ttl_secs: Some(3600),
+            now_unix: now,
+        };
+        cose::mint(&claims, root).await.unwrap()
+    }
+
+    fn shared_auth(
+        root: &LocalSigner,
+        cached: Arc<dyn KvStore>,
+        backing: Arc<dyn KvStore>,
+        fence: Arc<AuthzFence>,
+    ) -> Auth {
+        Auth::with_key(root.public_key(), cached)
+            .with_pop(Some(ORIGIN.to_string()), false)
+            .with_shared_authz(backing, fence)
+    }
+
+    fn tightened_policy_bytes() -> Vec<u8> {
+        let mut tight = AuthzPolicy::default_policy();
+        tight.roles.clear();
+        serde_json::to_vec(&tight).unwrap()
+    }
+
+    /// LIVE MF-3 — node A tightens the policy on a REAL shared Postgres (NOTIFY suppressed); node B,
+    /// whose cache holds the old permissive policy, DENIES via the fence read-through to the primary.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial(shared_authz_env)]
+    async fn pg_shared_stale_authz_fence_denies_on_missed_invalidation() {
+        let Some(shared) = fresh_pg().await else {
+            return;
+        };
+        let root = root();
+        let token = admin_token(&root).await;
+
+        // A writes the tightened policy to the real shared primary.
+        shared
+            .put(authz::POLICY_KEY, tightened_policy_bytes())
+            .await
+            .unwrap();
+        // B's local cache still holds the permissive default (publish suppressed → never invalidated).
+        let cached: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        cached
+            .put(
+                authz::POLICY_KEY,
+                serde_json::to_vec(&AuthzPolicy::default_policy()).unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let fence = Arc::new(AuthzFence::new(Duration::from_secs(30)));
+        fence.trip();
+        let auth = shared_auth(&root, cached, shared, fence);
+        let rej = auth
+            .authorize(&token, "GET", PATH, None, None)
+            .await
+            .unwrap_err();
+        assert_eq!(rej.status, StatusCode::FORBIDDEN);
+        println!(
+            "SERVER PG STALE-AUTHZ FENCE OK [postgres]: node B denied a tightened policy via \
+             read-through to the real shared primary (no NOTIFY)."
+        );
+    }
+
+    /// LIVE MF-3 (symmetric) — a token revoked on the real shared primary (NOTIFY suppressed) is
+    /// denied on node B via the fence read-through, despite B's stale "not revoked" cache.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial(shared_authz_env)]
+    async fn pg_shared_revoked_token_denied_across_nodes_without_notify() {
+        let Some(shared) = fresh_pg().await else {
+            return;
+        };
+        let root = root();
+        let token = admin_token(&root).await;
+        let cti =
+            cose::verify_credential(&token, &root.public_key(), boatramp_core::time::now_unix())
+                .unwrap()
+                .cti;
+        shared
+            .put(&authz::revoked_key(&cti), Vec::new())
+            .await
+            .unwrap();
+        let cached: Arc<dyn KvStore> = Arc::new(MemoryKv::new()); // stale: no marker
+        let fence = Arc::new(AuthzFence::new(Duration::from_secs(30)));
+        fence.trip();
+        let auth = shared_auth(&root, cached, shared, fence);
+        let rej = auth
+            .authorize(&token, "GET", PATH, None, None)
+            .await
+            .unwrap_err();
+        assert_eq!(rej.status, StatusCode::FORBIDDEN);
+        println!("SERVER PG REVOKED-ACROSS-NODES OK [postgres]");
+    }
+
+    // MF-4 fail-closed is backend-agnostic — "a read returns `Err` ⇒ shed 503" — so its gate runs
+    // over the deterministic `FailingKv` in the parent `tests` module (a severed pool returns `Err`
+    // exactly as `FailingKv` does). These live twins cover the real-PG dimension that matters most:
+    // node B's fence read-through / revoke visibility against a REAL shared primary.
 }

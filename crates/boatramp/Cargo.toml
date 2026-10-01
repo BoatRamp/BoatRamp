@@ -105,6 +105,13 @@ slatedb = ["boatramp-storage/slatedb", "boatramp-node/slatedb"]
 # this standalone feature lets a lean build (e.g. `fs,slatedb,sql`) select the SQL KV without the
 # full handler runtime.
 sql = ["boatramp-storage/sql", "boatramp-node/sql"]
+# TEST-ONLY, NEVER SHIPPED: forward the MF-3/MF-4 shared-mode authz mutation seams (and the WS4
+# election/cp-id seams) so a workspace-wide `cargo test … --features shared-mode-gate-mutation`
+# resolves. Compiled OUT of every real build.
+shared-mode-gate-mutation = [
+  "boatramp-server/shared-mode-gate-mutation",
+  "boatramp-core/shared-mode-gate-mutation",
+]
 # HTTPS: `--tls custom` (operator cert) and `--tls acme` (automatic certs).
 tls = [
   "dep:rustls-acme",
