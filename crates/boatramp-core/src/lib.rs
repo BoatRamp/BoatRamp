@@ -51,6 +51,7 @@ pub mod messaging;
 pub mod migrate;
 pub mod mode;
 /// A typed query AST + injection-safe `?N` SQL compiler backing the `orm` handler binding.
+pub mod claim_extract;
 pub mod orm;
 pub mod project;
 pub mod secret_store;

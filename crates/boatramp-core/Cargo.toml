@@ -69,6 +69,11 @@ ipnet.workspace = true
 sha2.workspace = true
 hex.workspace = true
 lru.workspace = true
+# Claim-transform tenant-key derivation (`claim_extract`): a linear-time (RE2, no
+# backtracking) matcher for the `token` source's template/regex, with HIR shape
+# analysis at apply (`regex-syntax`). Host-side only.
+regex.workspace = true
+regex-syntax.workspace = true
 getrandom.workspace = true
 # Structured logging facade (wasm-clean): the shared compute IP authority
 # (`ipam::IpAuthority`) warns on pool exhaustion / high-water so an operator sees an

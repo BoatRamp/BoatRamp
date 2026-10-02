@@ -236,7 +236,7 @@ pub(crate) fn token_source_claim(
     match decision {
         Some(boatramp_core::tenancy::Tenancy::Scoped { sources, .. }) => {
             sources.iter().find_map(|s| match s {
-                boatramp_core::tenancy::TenantSource::Token { claim } => Some(claim.clone()),
+                boatramp_core::tenancy::TenantSource::Token { claim, .. } => Some(claim.clone()),
                 _ => None,
             })
         }

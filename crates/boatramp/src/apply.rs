@@ -1562,7 +1562,9 @@ mod tests {
                 assert_eq!(
                     sources,
                     &vec![TenantSource::Token {
-                        claim: "tid".into()
+                        claim: "tid".into(),
+                        extract: None,
+                        namespace: None,
                     }]
                 );
                 assert_eq!(*read, AccessMode::All);
