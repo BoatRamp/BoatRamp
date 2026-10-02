@@ -5,6 +5,52 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.12.2] - 2026-10-02
+
+Additive — a bounded, declarative **claim transform** on the `token` tenant source, so a multi-IdP app
+can *derive* its tenant key from a verified JWT claim instead of injecting the claim verbatim (construens
+`boatramp-feature-token-claim-transform`). Host/daemon only; no guest-facing (WIT) change; the default
+preserves today's behavior exactly (no `extract`/`namespace` ⇒ verbatim, byte-identical).
+
+### Added
+
+- **`extract` + `namespace` on a `token` tenant source.** `extract` pulls the tenant key out of a verified
+  claim — a `{tenant}`/`{_}` path **template** (recommended), or a single-named-capture `(?<tenant>…)`
+  **regex** escape hatch — and `namespace` prepends a per-issuer tag joined with a host-owned `:` delimiter
+  (e.g. a Salesforce `sub` identity URL `https://login.salesforce.com/id/<org>/<user>` → `sfdc:<org>`).
+  The common multi-IdP mapping now needs no IdP-side custom claim.
+- **`boatramp tenancy test-extract`** — a local, server-less dry-run through the host's real derivation:
+  prints the resolved tenant key, or the exact deny stage (the same taxonomy the host logs). Debugs a
+  silently-failing pattern in seconds.
+
+### Security / correctness
+
+- Runs **only** on the already-verified claim (post-JWKS/`iss`/`exp`); **deny-by-default** — a missing or
+  non-string claim, a non-matching or empty extraction, or a derived key that fails the key-safety screen
+  resolves **no** tenant (the scoped op fails closed; it never falls back to unscoped or to the verbatim
+  claim). The guest-facing outcome is uniform (no oracle); the host logs a precise reason + a
+  `transform_denied` counter.
+- The namespace is **collision-free by construction**: the reserved `:` delimiter can appear in neither the
+  namespace (a strict operator slug) nor the extracted segment (an ASCII key-safe alphabet that excludes
+  it), so `namespace:segment` splits uniquely — two issuers can never derive the same key. A route may not
+  mix a namespaced source with an un-namespaced one on the same column; this is enforced at apply **and**
+  as a runtime backstop in the host's source resolution (fail closed even if admission is bypassed).
+- The derived value is screened at resolution (load-bearing on the raw-SQL escaped-literal path; inert-but-
+  screened on the bound ORM path). The extraction uses the linear-time `regex` engine (no backtracking),
+  compiled once and cached, with the capture ASCII-screened (a Unicode homoglyph denies, never keys a
+  tenant). The async `present-token` lane seals the **derived** key, so a `signed_context` consumer agrees.
+  Reviewed by Security (SHIP-WITH-FIXES → fixes landed); a mutation-verified CI gate on a real libsql engine
+  proves the derived key is screened, denies on no-match, and keeps the namespace injective — and goes red
+  under each of four mutations that disable one screen.
+
+### Note
+
+- The transform covers the `token` source (handler / plain-wasm routes and the async lane); it does **not**
+  change the GraphQL data connector's verbatim `row_filter`. Do not scope the same tenant column through
+  both a transformed `token` source and a GDC `row_filter`, or the two surfaces will key one principal
+  differently. Point `claim` at an issuer-authoritative field (not a user-editable attribute), and bind each
+  `namespace` to one verified issuer.
+
 ## [0.12.1] - 2026-10-02
 
 Additive — an opt-in soft domain-tenancy source for public wildcard hosts (construens
