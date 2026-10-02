@@ -244,6 +244,28 @@ pub(crate) fn token_source_claim(
     }
 }
 
+/// The `extract`/`namespace` transform (if any) the component's first `token` source declares.
+/// Threaded onto the async-lane producer stamp so a guest-presented token derives the **same**
+/// tenant key the request path would (symmetry; the derived value is what seals, never the raw
+/// claim — Security I5). Picks the SAME first `TenantSource::Token` as [`token_source_claim`].
+#[cfg(feature = "handlers")]
+pub(crate) fn token_source_transform(
+    decision: Option<&boatramp_core::tenancy::Tenancy>,
+) -> (Option<boatramp_core::tenancy::ClaimExtract>, Option<String>) {
+    match decision {
+        Some(boatramp_core::tenancy::Tenancy::Scoped { sources, .. }) => sources
+            .iter()
+            .find_map(|s| match s {
+                boatramp_core::tenancy::TenantSource::Token {
+                    extract, namespace, ..
+                } => Some((extract.clone(), namespace.clone())),
+                _ => None,
+            })
+            .unwrap_or((None, None)),
+        _ => (None, None),
+    }
+}
+
 /// The server's [`ProducerContextSource`](boatramp_handlers::ProducerContextSource) (Gap 3): the
 /// verify-and-seal seam behind the guest `tenancy::present-token`. The guest presents a credential
 /// it verified in-guest; the HOST re-verifies it against the component's operator-declared
@@ -258,6 +280,11 @@ pub(crate) struct ServerProducerContextSource {
     pub(crate) token_cfg: boatramp_core::config::HandlerGraphqlTokenClaims,
     /// The claim carrying the tenant id (from the component's `TenantSource::Token { claim }`).
     pub(crate) claim: String,
+    /// The `extract` transform (if any) from that `token` source — applied to the presented token's
+    /// claim so the async lane derives the SAME key the request path does (symmetry).
+    pub(crate) extract: Option<boatramp_core::tenancy::ClaimExtract>,
+    /// The per-issuer `namespace` (if any) from that source (see [`ServerProducerContextSource::extract`]).
+    pub(crate) namespace: Option<String>,
     /// The fleet signer that seals the durable context (the same key session cookies use).
     pub(crate) signer: Arc<dyn boatramp_core::cose::Signer>,
     /// Injectable source for the `token_cfg.jwks_env` host-env lookup (the runtime's). Production
@@ -317,14 +344,38 @@ impl boatramp_handlers::ProducerContextSource for ServerProducerContextSource {
             )
             .await
             .ok_or_else(|| "presented token did not verify".to_string())?;
-            let value = claims
-                .get(&self.claim)
-                .and_then(crate::tenant_resolve::scalar_to_sql)
-                .ok_or_else(|| {
+            // Derive the tenant exactly as the request path does. With no transform declared this is
+            // today's verbatim behavior; with one, the SAME key the sync edge would resolve is sealed
+            // (never the raw claim), so a consumer declaring `signed_context` resolves the derived
+            // key. Any deny fails closed — a guest can never cause an unscoped or wrong-key stamp.
+            let tenant: String = if self.extract.is_none() && self.namespace.is_none() {
+                let value = claims
+                    .get(&self.claim)
+                    .and_then(crate::tenant_resolve::scalar_to_sql)
+                    .ok_or_else(|| {
+                        format!("presented token carries no `{}` tenant claim", self.claim)
+                    })?;
+                ctx_stamp(&value).ok_or_else(|| "tenant claim is not a scalar".to_string())?
+            } else {
+                use boatramp_core::claim_extract::{DeriveOutcome, derive_tenant};
+                let value = claims.get(&self.claim).ok_or_else(|| {
                     format!("presented token carries no `{}` tenant claim", self.claim)
                 })?;
-            let tenant =
-                ctx_stamp(&value).ok_or_else(|| "tenant claim is not a scalar".to_string())?;
+                match derive_tenant(self.extract.as_ref(), self.namespace.as_deref(), value) {
+                    DeriveOutcome::Resolved(key) => key,
+                    DeriveOutcome::ClaimNonString => {
+                        return Err("tenant claim is present but not a string".to_string());
+                    }
+                    DeriveOutcome::NoMatch { .. } => {
+                        return Err(
+                            "tenant claim did not match the configured extraction".to_string()
+                        );
+                    }
+                    DeriveOutcome::KeyRejected(reason) => {
+                        return Err(format!("derived tenant key rejected: {reason}"));
+                    }
+                }
+            };
             // Persona (PLAN-async-persona): when the operator configured a `token_persona_claim`,
             // extract that claim's SINGLE scalar from the ALREADY-VERIFIED claims — host-verified,
             // never guest-named. Configured-but-absent/unusable ⇒ seal NO persona (fail-closed) + a
@@ -1388,10 +1439,13 @@ pub(super) async fn build_function_bindings(
             token_source_claim(config.tenancy.as_ref()),
         )
     {
+        let (extract, namespace) = token_source_transform(config.tenancy.as_ref());
         bindings = bindings.with_present_token(
             Arc::new(ServerProducerContextSource {
                 token_cfg,
                 claim,
+                extract,
+                namespace,
                 signer,
                 env_source: inner.env_source_arc(),
                 // The function's scope identifies the component for the persona seal-time signal.
@@ -2993,6 +3047,8 @@ mod gap3_tests {
         let source = ServerProducerContextSource {
             token_cfg: token_cfg.clone(),
             claim: "tid".to_string(),
+            extract: None,
+            namespace: None,
             signer: fleet.clone(),
             env_source: env_source.clone(),
             component_hash: "test-component".to_string(),
@@ -3040,6 +3096,8 @@ mod gap3_tests {
         let persona_source = ServerProducerContextSource {
             token_cfg: persona_cfg,
             claim: "tid".to_string(),
+            extract: None,
+            namespace: None,
             signer: fleet.clone(),
             env_source: env_source.clone(),
             component_hash: "test-component".to_string(),
