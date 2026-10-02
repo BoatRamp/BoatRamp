@@ -5,6 +5,32 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.12.3] - 2026-10-02
+
+Additive — close the `handlers.bindings.sql` env-mapping gap so a file-less (fly `[env]`-only) fleet can
+set the migration trusted-extension allowlist (and the declared-DB ceilings) without a `boatramp.cfg` edit
+and a server roll (construens `boatramp-migrate-trusted-extensions-env-request`). Host/node only; no
+guest-facing (WIT) change; no change to any allowlist or migration semantics.
+
+### Added
+
+- **`BOATRAMP_HANDLERS_SQL_MIGRATE_TRUSTED_EXTENSIONS`** (comma-separated, e.g. `pg_trgm,pgcrypto`) — the
+  owner-gated migration trusted-extension allowlist, previously the one `handlers.bindings.sql` scalar with
+  no env lever. Plus **`BOATRAMP_HANDLERS_SQL_MAX_DECLARED_DATABASES`** and
+  **`BOATRAMP_HANDLERS_SQL_MAX_DECLARED_VOLUME_MIB`** (the two other env-unsettable scalars, same gap
+  class). Field-level **env-over-file** precedence, exactly like the sibling scalars: a file value is
+  overridden only when the var is set; unset ⇒ the file value (which stays empty = the safe deny-all
+  default for the allowlist).
+
+### Security / correctness
+
+- Purely an additional **input path** to existing fields. The migrator's allowlist enforcement is
+  unchanged: an `Extension` migration step may enable only a listed extension (an unlisted name is refused
+  fail-closed), and a raw `sql` step still may not `CREATE EXTENSION` at all. Env and file are the same
+  operator-trust level, so this adds no trust boundary. A `every_sql_binding_scalar_has_an_env_mapping`
+  guard (a compile-time destructure of `SqlBindingConfig` + a registry assertion, the v0.4.18 forgot-a-knob
+  shape) fails the build if any future scalar field lacks its `BOATRAMP_HANDLERS_SQL_*` lever.
+
 ## [0.12.2] - 2026-10-02
 
 Additive — a bounded, declarative **claim transform** on the `token` tenant source, so a multi-IdP app
