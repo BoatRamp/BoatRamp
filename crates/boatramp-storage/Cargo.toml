@@ -108,6 +108,13 @@ crownjewel-cas-gate-mutation = ["boatramp-core/crownjewel-cas-gate-mutation"]
 # is load-bearing. Mirrors `crownjewel-cas-gate-mutation`; pass-through to
 # `boatramp-core/shared-mode-gate-mutation`. Compiled OUT of every real build.
 shared-mode-gate-mutation = ["boatramp-core/shared-mode-gate-mutation"]
+# TEST-ONLY, NEVER SHIPPED: arm the claim-transform tenant-key-derivation mutation seam in
+# `boatramp-core` from this crate's libsql claim-transform gate lane. With this ON and
+# `BOATRAMP_CLAIMTRANSFORM_MUTATION=skip_derived_screen|extract_fallback|skip_namespace_check`, one
+# derived-key screen is disabled, so `claim_transform_*` gates in `orm_tenant_isolation` go RED —
+# proving the screen is load-bearing. Pass-through to `boatramp-core/claim-transform-gate-mutation`.
+# Compiled OUT of every real build.
+claim-transform-gate-mutation = ["boatramp-core/claim-transform-gate-mutation"]
 
 [dependencies]
 boatramp-core.workspace = true
@@ -159,6 +166,9 @@ memmap2 = { version = "0.9", optional = true }
 # IDENTICAL shared `KvStore` conformance assertions (test build only; never shipped).
 boatramp-core = { workspace = true, features = ["authz", "kv-conformance"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+# The claim-transform gate builds `serde_json::Value` claims for `derive_tenant` (serde_json is only
+# an OPTIONAL dep of the crate itself; the tests always need it).
+serde_json.workspace = true
 bytes.workspace = true
 # The `kv_slatedb` tests open a SlateDB instance and close/reopen it. `close()`
 # awaits the background compactor + GC task shutdowns, which could stall on a

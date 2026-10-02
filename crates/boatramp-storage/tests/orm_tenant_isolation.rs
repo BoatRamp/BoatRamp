@@ -2085,3 +2085,126 @@ async fn domain_source_unresolved_pass_through_is_null_scoped_to_zero_rows_on_a_
          the pass-through relaxes ONLY the pre-handler deny, never the row scoping"
     );
 }
+
+/// **Live**, mutation-verified proof (v0.12.x) that the `token`-source claim transform derives a
+/// tenant key that is (G1) SCREENED for key-safety, (G2) DENIED on a non-matching/empty extraction
+/// rather than falling back to the verbatim claim (and thereby keying onto a VICTIM tenant's rows),
+/// and (G3) kept INJECTIVE (`namespace:span` with a reserved, span-excluded delimiter) — all on a
+/// real libsql engine. The `CLAIM TRANSFORM DERIVED-KEY SAFE OK` gate. Same `#[ignore]` rationale as
+/// the siblings (static-musl libsql segfault); the `test-orm-tenancy` CI job runs it unignored on the
+/// host toolchain, greps the marker, and loops each `BOATRAMP_CLAIMTRANSFORM_MUTATION` asserting the
+/// test then exits non-zero. Every assertion exercises the REAL `derive_tenant` (the mutation seam is
+/// armed in `boatramp-core` by the `claim-transform-gate-mutation` feature).
+#[tokio::test]
+#[ignore = "run via the test-orm-tenancy CI job on the host toolchain (static-musl test binary segfaults in libsql's bundled SQLite)"]
+async fn claim_transform_derived_key_is_screened_denies_and_injective_on_a_real_engine() {
+    use boatramp_core::claim_extract::{DeriveOutcome, derive_tenant};
+    use boatramp_core::tenancy::{ClaimExtract, ExtractSyntax, ResolvedScope};
+    use serde_json::json;
+
+    // (G1) A greedy regex hatch capturing across `/` yields a `/`-bearing span → the span-alphabet /
+    // key-safety screen must REJECT it (never a resolved, path-traversing key).
+    let slash_hatch = ClaimExtract {
+        syntax: ExtractSyntax::Regex,
+        pattern: r"/id/(?<tenant>.+)/".to_string(),
+    };
+    let g1 = derive_tenant(
+        Some(&slash_hatch),
+        Some("sfdc"),
+        &json!("https://login.salesforce.com/id/00D/evil/0055"),
+    );
+    // SECURE: KeyRejected. MUTATION `skip_derived_screen`: Resolved("sfdc:00D/evil") ⇒ this fails RED.
+    assert!(
+        matches!(g1, DeriveOutcome::KeyRejected(_)),
+        "G1: a `/`-bearing derived key must be rejected, got {g1:?}"
+    );
+
+    // (G3) A namespace carrying the reserved delimiter must be REJECTED at resolution, so the
+    // `namespace:span` split stays unique (no cross-namespace collision).
+    let g3 = derive_tenant(None, Some("ev:il"), &json!("00DSELF"));
+    // SECURE: KeyRejected. MUTATION `skip_namespace_check`: Resolved("ev:il:00DSELF") ⇒ fails RED.
+    assert!(
+        matches!(g3, DeriveOutcome::KeyRejected(_)),
+        "G3: a namespace containing the reserved `:` must be rejected, got {g3:?}"
+    );
+
+    // (G2, ROW-SET) A non-matching claim must DENY — never fall back to the verbatim claim and key
+    // onto a victim tenant's rows.
+    let dir = std::env::temp_dir().join(format!("boatramp-claimxform-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let db = LibsqlSqlBackends::local(&dir)
+        .database("default", "app", "")
+        .await
+        .unwrap();
+    {
+        let mut tx = db.begin().await.unwrap();
+        tx.execute(
+            "CREATE TABLE docs (id TEXT PRIMARY KEY, tenant_id TEXT, body TEXT)",
+            &[],
+        )
+        .await
+        .unwrap();
+        for (id, tenant, body) in [
+            ("v1", "sfdc:00DVICTIM", "VICTIM SECRET"),
+            ("s1", "sfdc:00DSELF", "self row"),
+        ] {
+            tx.execute(
+                "INSERT INTO docs (id, tenant_id, body) VALUES (?1, ?2, ?3)",
+                &[t(id), t(tenant), t(body)],
+            )
+            .await
+            .unwrap();
+        }
+        tx.commit().await.unwrap();
+    }
+    let keys_map: std::collections::BTreeMap<String, ResolvedScope> =
+        std::collections::BTreeMap::from([(
+            "docs".to_string(),
+            ResolvedScope::Column("tenant_id".to_string()),
+        )]);
+    let template = ClaimExtract {
+        syntax: ExtractSyntax::Template,
+        pattern: "https://login.salesforce.com/id/{tenant}/{_}".to_string(),
+    };
+    // The attacker's verified claim is the bare victim org id — NOT a Salesforce identity URL, so the
+    // URL template does NOT match ⇒ the derived principal must be NONE (deny).
+    let outcome = derive_tenant(Some(&template), Some("sfdc"), &json!("00DVICTIM"));
+    let attacker_key: Option<String> = match outcome {
+        DeriveOutcome::Resolved(k) => Some(k), // MUTATION `extract_fallback` ⇒ Some("sfdc:00DVICTIM")
+        _ => None,                             // SECURE ⇒ no principal
+    };
+    // Scope the read to whatever principal the attacker resolved; a None principal reads nothing.
+    let bodies: Vec<String> = match &attacker_key {
+        Some(k) => {
+            let mut q = Select {
+                columns: vec![item(Expr::col("body"))],
+                ..Select::from("docs")
+            };
+            q.force_scope(&Scope {
+                column: "tenant_id".into(),
+                value: Some(SqlValue::Text(k.clone())),
+                session: None,
+                mode: ScopeMode::Own,
+                keys: TableKeys::PerTable(keys_map.clone()),
+                unscoped_writes: std::collections::BTreeSet::new(),
+                pass_unresolved: false,
+            })
+            .expect("a resolved-principal scoped read compiles");
+            let (sql, params) = q.compile(Dialect::Sqlite).unwrap();
+            let mut tx = db.begin().await.unwrap();
+            let rows = run_query(tx.as_mut(), &sql, &params).await;
+            tx.commit().await.unwrap();
+            rows
+        }
+        None => Vec::new(), // no principal → the scoped op fails closed → zero rows
+    };
+    // SECURE: the attacker resolved no principal ⇒ read nothing (certainly not the victim's row).
+    // MUTATION `extract_fallback`: attacker_key = "sfdc:00DVICTIM" ⇒ reads "VICTIM SECRET" ⇒ fails RED.
+    assert!(
+        !bodies.iter().any(|b| b == "VICTIM SECRET"),
+        "G2: a non-matching claim must DENY (no verbatim fallback) — it must never read the victim \
+         tenant's rows; saw {bodies:?}"
+    );
+
+    println!("CLAIM TRANSFORM DERIVED-KEY SAFE OK");
+}
