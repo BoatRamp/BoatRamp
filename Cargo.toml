@@ -148,6 +148,11 @@ walkdir = "2"
 toml = "0.8"
 ron = "0.10"
 regex = "1"
+# Static analysis of an operator-authored claim-extraction regex at apply time
+# (exactly-one-named-capture + non-nullable), via the HIR — the full engine
+# compiles the match; this parses the shape. Pure Rust, wasm-clean (regex pulls
+# it transitively already).
+regex-syntax = "0.8"
 getrandom = "0.2"
 # Password hashing for visitor HTTP Basic auth (argon2id). Pure Rust → compiles
 # to wasm32 (unlike a C-backed hash), and the modern recommended password hash.

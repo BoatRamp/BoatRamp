@@ -25,9 +25,38 @@ use serde::{Deserialize, Serialize};
 pub enum TenantSource {
     /// The verified JWT claim named `claim` (default `tid`), via the same JWKS/issuer machinery
     /// the GraphQL data connector uses. Authenticated console/portal paths.
+    ///
+    /// By default the claim's value is injected **verbatim** as the tenant key. An optional,
+    /// bounded, declarative transform (v0.12.x) can instead *derive* the key from the verified
+    /// claim — a single-segment [`extract`](Self::Token::extract) (a `{tenant}` path template, or a
+    /// single-named-capture regex escape hatch) plus an optional per-issuer
+    /// [`namespace`](Self::Token::namespace). The transform runs **only** on the already-verified
+    /// claim (post-JWKS/`iss`/`exp`), is **deny-by-default** (a missing/non-string claim, a
+    /// non-matching or empty extraction, or a derived key that fails the key-safety screen resolves
+    /// **no** tenant — the scoped op fails closed, exactly like an unresolved token today), and is
+    /// **byte-identically back-compatible** (no `extract`/`namespace` ⇒ today's verbatim behavior).
+    /// It is **not** a scripting engine: the extraction is a bounded pattern evaluated host-side
+    /// (see `boatramp_core::claim_extract`), validated at apply, never request-controlled.
     Token {
         #[serde(default = "default_tid_claim")]
         claim: String,
+        /// Optional bounded extraction of the tenant key segment from the (string-valued) claim —
+        /// a `{tenant}` path template or a single-named-capture regex. Absent ⇒ the whole claim
+        /// value is the segment (verbatim, or namespaced if [`namespace`](Self::Token::namespace) is
+        /// set). The extracted segment must match the ASCII key-safe alphabet **excluding** the
+        /// reserved namespace delimiter (`:`); an empty or non-matching extraction denies. Elided
+        /// when unset (byte-identical pre-v0.12.x round-trip).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        extract: Option<ClaimExtract>,
+        /// Optional **per-issuer namespace** tag. When set, the derived key is
+        /// `namespace` + the host-owned reserved delimiter (`:`) + the extracted segment (e.g.
+        /// `sfdc:00D…`), so keys from different IdPs can never collide **by construction**: the
+        /// delimiter is reserved (the operator never writes it) and, proven at apply, it cannot
+        /// appear in the extracted segment, so the (namespace, segment) split is unique. Absent ⇒
+        /// no prefix (the segment is the key). Validated at apply (non-empty, key-safe, must not
+        /// itself contain the delimiter). Elided when unset (byte-identical pre-v0.12.x round-trip).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        namespace: Option<String>,
     },
     /// Derived from the already-verified request domain via its per-domain context tag
     /// ([`crate::project::DomainOwner`]'s context). Storefront / public-render paths — no
@@ -50,6 +79,39 @@ pub enum TenantSource {
 
 fn default_tid_claim() -> String {
     "tid".to_string()
+}
+
+/// Which surface a [`ClaimExtract::pattern`] is written in. A **fieldless** enum (like
+/// [`AccessMode`]/[`TargetSource`]) so [`ClaimExtract`] stays a flat struct that round-trips
+/// cleanly through the RON↔JSON `ron::Value` bridge ([`de_opt_tenancy`]) — a struct-*variant*
+/// enum nested inside [`TenantSource::Token`] would be deeper nesting than the bridge exercises.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExtractSyntax {
+    /// A path-style template: `{tenant}` captures exactly one delimiter-bounded segment, `{_}`
+    /// (or `{}`) matches-and-ignores one segment, everything else is literal. Lowered host-side to
+    /// an anchored, ASCII, single-named-capture regex. The **recommended** surface — the greedy /
+    /// unanchored / multi-group regex footguns are structurally unwritable in it.
+    Template,
+    /// The escape hatch: a regex carrying **exactly one** named capture `(?<tenant>…)` (no numeric
+    /// group), for a tenant embedded in a non-path-delimited string. Validated at apply (compiles,
+    /// one always-participating non-nullable named capture); the captured segment is screened
+    /// against the ASCII key-safe alphabet at resolution (a Unicode homoglyph in a capture denies,
+    /// never keys a tenant).
+    Regex,
+}
+
+/// A bounded, declarative extraction of the tenant key segment from a **verified** string claim
+/// (the `extract` on a [`TenantSource::Token`]). NOT a scripting engine: one pattern, one capture,
+/// evaluated host-side by [`crate::claim_extract`], compiled-once/cached, deny-by-default. The
+/// `syntax` chooses the surface; `pattern` is that surface's string. See [`ExtractSyntax`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClaimExtract {
+    /// Which surface [`pattern`](Self::pattern) is written in.
+    pub syntax: ExtractSyntax,
+    /// The template (`{tenant}`/`{_}` + literals) or the regex (one `(?<tenant>…)`), per `syntax`.
+    pub pattern: String,
 }
 
 /// The default source list when a `Scoped` block omits it: truly anonymous (`[None]`) — an "own"
@@ -1135,7 +1197,9 @@ mod tests {
             sources,
             &vec![
                 TenantSource::Token {
-                    claim: "tid".into()
+                    claim: "tid".into(),
+                    extract: None,
+                    namespace: None,
                 },
                 TenantSource::Domain
             ]
@@ -1237,7 +1301,9 @@ mod tests {
         assert_eq!(
             sources,
             vec![TenantSource::Token {
-                claim: "tid".into()
+                claim: "tid".into(),
+                extract: None,
+                namespace: None,
             }]
         );
         assert_eq!(read, AccessMode::OwnOrNull);
@@ -1404,6 +1470,8 @@ mod tests {
             column: "tenant_id".into(),
             sources: vec![TenantSource::Token {
                 claim: "tid".into(),
+                extract: None,
+                namespace: None,
             }],
             read,
             write,
@@ -1561,6 +1629,8 @@ mod tests {
             sources: vec![
                 TenantSource::Token {
                     claim: "tid".into(),
+                    extract: None,
+                    namespace: None,
                 },
                 TenantSource::SignedContext,
             ],
@@ -1624,7 +1694,9 @@ mod tests {
                     sources,
                     vec![
                         TenantSource::Token {
-                            claim: "tid".into()
+                            claim: "tid".into(),
+                            extract: None,
+                            namespace: None,
                         },
                         TenantSource::SignedContext
                     ]

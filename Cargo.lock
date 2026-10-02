@@ -1703,6 +1703,8 @@ dependencies = [
  "lru 0.16.4",
  "p256",
  "rand_core 0.6.4",
+ "regex",
+ "regex-syntax",
  "serde",
  "serde_json",
  "serial_test",
