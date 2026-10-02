@@ -56,6 +56,68 @@ For the **`token`** source, configure the JWKS/issuer that verifies the app bear
 verifies signature / `iss` / `exp` (algorithm pinned to the JWKS key) and a missing or bad
 token denies. This is the same verifier the [GraphQL data connector](./graphql.md) uses.
 
+### Deriving the tenant key from a claim (the claim transform)
+
+By default the `token` source injects the chosen claim's value **verbatim** as the tenant key.
+Real IdP tokens rarely carry the tenant in the exact form you want: Salesforce, for example, puts
+the org id **inside** the `sub` identity URL (`https://login.salesforce.com/id/<orgId>/<userId>`),
+and when you federate several IdPs you want a per-issuer namespace (`sfdc:<orgId>`, `auth0:<sub>`)
+so keys never collide. The `token` source can optionally **derive** the key from the verified claim:
+
+```ron
+# template-primary (recommended) — pull one path segment out of the SF `sub` URL, namespace it
+sources: [(kind: "token", claim: "sub",
+           extract: (syntax: "template", pattern: "https://login.salesforce.com/id/{tenant}/{_}"),
+           namespace: "sfdc")]            # ⇒ tenant key "sfdc:00D5f0000000abcEAA"
+
+# regex escape hatch — one named capture, for a tenant embedded in a non-path string
+sources: [(kind: "token", claim: "sub",
+           extract: (syntax: "regex", pattern: "/id/(?<tenant>[0-9A-Za-z]+)/"),
+           namespace: "sfdc")]
+```
+
+- **Template** (recommended): `{tenant}` captures exactly one delimiter-bounded segment; `{_}`
+  matches-and-ignores one segment; everything else is literal; the whole value is matched. The
+  greedy / unanchored / multi-group mistakes you can make in a regex are simply unwritable here.
+- **Regex** (escape hatch): exactly one **named** capture `(?<tenant>…)` — no numeric group.
+- **`namespace`**: a short operator slug; the host joins it to the extracted segment with a
+  reserved `:` delimiter (you never write the `:`). Because the delimiter can appear in neither the
+  namespace nor the extracted segment, `namespace:segment` is collision-free **by construction** —
+  two issuers can never derive the same key.
+
+It **runs only on the verified claim** (post-JWKS/`iss`/`exp`), is **deny-by-default** (a missing or
+non-string claim, a non-matching or empty extraction, or a derived key that fails the key-safety
+screen resolves **no** tenant — the scoped op fails closed, never falls back to unscoped or to the
+verbatim claim), and is **backward compatible** (no `extract`/`namespace` ⇒ today's verbatim
+behavior). Everything statically checkable is rejected at `boatramp apply` (an uncompilable regex, a
+nullable or multi-group capture, a malformed template, a non-slug namespace, or a route that mixes a
+namespaced source with an un-namespaced one). It is **not** a scripting engine — one bounded pattern,
+evaluated host-side.
+
+**Debug it offline** with the dry-run, which runs the host's real derivation:
+
+```console
+$ boatramp tenancy test-extract --value 'https://login.salesforce.com/id/00D5f0000000abcEAA/0055' \
+    --template 'https://login.salesforce.com/id/{tenant}/{_}' --namespace sfdc
+resolved tenant key: sfdc:00D5f0000000abcEAA
+```
+
+A non-matching value prints the exact deny stage (the same taxonomy the host logs as
+`outcome=extract_no_match` / `derived_key_rejected`, with a `transform_denied` counter) — so a
+`claim` aimed at the wrong field, or a wrong pattern, is a 30-second check, not a stream of
+silently-denied requests.
+
+> **Trust note.** The transform moves the tenant key from "a single claim value" to "an extraction
+> over a claim" — so point `claim` at an **issuer-authoritative** field (Salesforce's `sub`), never a
+> user-editable attribute, and bind each `namespace` to one verified issuer. Review each transform as
+> a security change.
+>
+> **Scope.** The transform applies to the `token` source (handler / plain-wasm routes and the async
+> `present-token` lane — a presented token seals the *derived* key, so the `signed_context` consumer
+> agrees). It does **not** change the [GraphQL data connector](./graphql.md)'s `row_filter`, which
+> binds the claim verbatim; do not scope the same tenant column through both a transformed `token`
+> source and a GDC `row_filter`, or the two surfaces will key the same principal differently.
+
 ## Dimension 2: the access mode, per read/write axis
 
 `scoped` tenancy carries a separate **access mode** for the `read` and `write` axes.
