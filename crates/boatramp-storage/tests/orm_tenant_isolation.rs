@@ -2206,5 +2206,67 @@ async fn claim_transform_derived_key_is_screened_denies_and_injective_on_a_real_
          tenant's rows; saw {bodies:?}"
     );
 
+    // (G5, ROW-SET) The cross-source MIX rule must be RUNTIME-enforced (the host's
+    // `resolve_from_sources` refuses a namespaced + un-namespaced source list). A verbatim token
+    // source bypasses `derive_tenant`, so a forged verbatim claim equal to the victim's namespaced key
+    // would read the victim UNLESS the mix is refused.
+    use boatramp_core::claim_extract::sources_mix_is_forbidden;
+    use boatramp_core::tenancy::TenantSource;
+    let mixed = vec![
+        TenantSource::Token {
+            claim: "sub".into(),
+            extract: Some(template.clone()),
+            namespace: Some("sfdc".into()),
+        },
+        TenantSource::Token {
+            claim: "tid".into(),
+            extract: None,
+            namespace: None,
+        },
+    ];
+    assert!(
+        sources_mix_is_forbidden(&mixed),
+        "G5: a namespaced + un-namespaced source mix must be forbidden (the runtime backstop refuses it)"
+    );
+    // Model the backstop's effect on a real read: secure → no principal; the `skip_source_mix`
+    // mutation models removing the backstop, so the verbatim token source resolves the attacker's
+    // forged claim `sfdc:00DVICTIM` → the victim's rows.
+    let skip_mix =
+        std::env::var("BOATRAMP_CLAIMTRANSFORM_MUTATION").as_deref() == Ok("skip_source_mix");
+    let mix_principal: Option<String> = if skip_mix || !sources_mix_is_forbidden(&mixed) {
+        Some("sfdc:00DVICTIM".to_string())
+    } else {
+        None
+    };
+    let mix_bodies: Vec<String> = match &mix_principal {
+        Some(k) => {
+            let mut q = Select {
+                columns: vec![item(Expr::col("body"))],
+                ..Select::from("docs")
+            };
+            q.force_scope(&Scope {
+                column: "tenant_id".into(),
+                value: Some(SqlValue::Text(k.clone())),
+                session: None,
+                mode: ScopeMode::Own,
+                keys: TableKeys::PerTable(keys_map.clone()),
+                unscoped_writes: std::collections::BTreeSet::new(),
+                pass_unresolved: false,
+            })
+            .expect("a resolved-principal scoped read compiles");
+            let (sql, params) = q.compile(Dialect::Sqlite).unwrap();
+            let mut tx = db.begin().await.unwrap();
+            let rows = run_query(tx.as_mut(), &sql, &params).await;
+            tx.commit().await.unwrap();
+            rows
+        }
+        None => Vec::new(),
+    };
+    assert!(
+        !mix_bodies.iter().any(|b| b == "VICTIM SECRET"),
+        "G5: a namespaced+verbatim source mix must not let a forged verbatim claim read the victim; \
+         saw {mix_bodies:?}"
+    );
+
     println!("CLAIM TRANSFORM DERIVED-KEY SAFE OK");
 }

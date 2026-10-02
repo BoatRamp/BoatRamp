@@ -760,8 +760,10 @@ jobs:
           # gate RED: `skip_derived_screen` resolves a `/`-bearing (path-traversing) key; `extract_fallback`
           # makes a non-matching claim fall back to the verbatim claim and read the VICTIM tenant's rows;
           # `skip_namespace_check` resolves a `:`-bearing namespace (collapsing the injective namespace:span
-          # split). A pass-under-mutation (a hollow gate) fails the merge.
-          for mut in skip_derived_screen extract_fallback skip_namespace_check; do
+          # split); `skip_source_mix` models removing the runtime backstop that refuses a namespaced +
+          # un-namespaced source list, so a forged verbatim claim reads the victim's rows. A
+          # pass-under-mutation (a hollow gate) fails the merge.
+          for mut in skip_derived_screen extract_fallback skip_namespace_check skip_source_mix; do
             if BOATRAMP_CLAIMTRANSFORM_MUTATION="$mut" cargo test -p boatramp-storage \
               --features "sql claim-transform-gate-mutation" \
               --test orm_tenant_isolation -- --ignored \
