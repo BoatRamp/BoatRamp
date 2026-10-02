@@ -542,6 +542,20 @@ impl ServerConfig {
             if let Some(v) = source.parse("BOATRAMP_HANDLERS_SQL_DEPROVISION_GRACE_SECS")? {
                 sql.deprovision_grace_secs = Some(v);
             }
+            // The owner-gated migration trusted-extension allowlist — a comma-separated list
+            // (e.g. `pg_trgm,pgcrypto`). Env-over-file, like the scalars above; unset ⇒ keep the
+            // file value (which stays `None`/empty = the safe deny-all default). This is only an
+            // input path to the field; the migrator's `Extension`-step gate / fail-closed refusal /
+            // `sql`-step `CREATE EXTENSION` ban are unchanged.
+            if let Some(v) = source.parse_list("BOATRAMP_HANDLERS_SQL_MIGRATE_TRUSTED_EXTENSIONS") {
+                sql.migrate_trusted_extensions = Some(v);
+            }
+            if let Some(v) = source.parse("BOATRAMP_HANDLERS_SQL_MAX_DECLARED_DATABASES")? {
+                sql.max_declared_databases = Some(v);
+            }
+            if let Some(v) = source.parse("BOATRAMP_HANDLERS_SQL_MAX_DECLARED_VOLUME_MIB")? {
+                sql.max_declared_volume_mib = Some(v);
+            }
         }
 
         // --- handler sql external databases (`handlers.bindings.sql.databases`) ---
@@ -885,6 +899,9 @@ const SQL_ENV_VARS: &[&str] = &[
     "BOATRAMP_HANDLERS_SQL_PREVIEW_MODE",
     "BOATRAMP_HANDLERS_SQL_PREVIEW_INIT",
     "BOATRAMP_HANDLERS_SQL_DEPROVISION_GRACE_SECS",
+    "BOATRAMP_HANDLERS_SQL_MIGRATE_TRUSTED_EXTENSIONS",
+    "BOATRAMP_HANDLERS_SQL_MAX_DECLARED_DATABASES",
+    "BOATRAMP_HANDLERS_SQL_MAX_DECLARED_VOLUME_MIB",
 ];
 
 /// The fixed prefix of a keyed `handlers.bindings.sql.databases` variable —
@@ -1528,6 +1545,11 @@ pub struct SqlBindingConfig {
     /// migrations. Empty / `None` ⇒ no extension may be enabled through a migration (the safest
     /// default). Keep it tight (e.g. `["pgcrypto", "uuid-ossp", "citext"]`); an entry like
     /// `dblink`/`postgres_fdw` deliberately widens cross-database reach, so add those only knowingly.
+    ///
+    /// Env-settable (12-factor parity) via **`BOATRAMP_HANDLERS_SQL_MIGRATE_TRUSTED_EXTENSIONS`** —
+    /// a comma-separated list (`pg_trgm,pgcrypto`), env-over-file, unset ⇒ the file value. Only an
+    /// input path; the allowlist semantics (the `Extension`-step gate, the fail-closed refusal of an
+    /// unlisted name, the `sql`-step `CREATE EXTENSION` ban) are unchanged.
     pub migrate_trusted_extensions: Option<Vec<String>>,
     /// **Per-project declared-database COUNT ceiling** (#501 Stage B MEDIUM-1 — the
     /// disk-exhaustion / errno-28 guard). The maximum number of `databases:` entries a
@@ -1536,14 +1558,16 @@ pub struct SqlBindingConfig {
     /// without this a `Project·Admin` could declare an unbounded number and exhaust the
     /// node's disk. `None` ⇒ the built-in default
     /// (`apply_db_caps::DEFAULT_MAX_DECLARED_DATABASES_PER_PROJECT`, 16); `0` ⇒ declaring
-    /// any managed database is disabled on this node.
+    /// any managed database is disabled on this node. Env-settable via
+    /// **`BOATRAMP_HANDLERS_SQL_MAX_DECLARED_DATABASES`** (env-over-file).
     pub max_declared_databases: Option<usize>,
     /// **Per-project aggregate declared-VOLUME ceiling**, in MiB (#501 Stage B
     /// MEDIUM-1). The maximum SUM of `volume_size_mib` across all of a project's declared
     /// databases; a declare whose incoming volume would push the project's total past
     /// this is refused fail-closed. `None` ⇒ the built-in default
     /// (`apply_db_caps::DEFAULT_MAX_DECLARED_VOLUME_MIB`, 512 GiB); `0` ⇒ disable managed
-    /// declarations on this node (the aggregate can never fit a non-zero volume).
+    /// declarations on this node (the aggregate can never fit a non-zero volume). Env-settable via
+    /// **`BOATRAMP_HANDLERS_SQL_MAX_DECLARED_VOLUME_MIB`** (env-over-file).
     pub max_declared_volume_mib: Option<u64>,
 }
 
@@ -3423,6 +3447,117 @@ mod tests {
         assert_eq!(sql.admin_url.as_deref(), Some("http://sqld:9090"));
         assert_eq!(sql.token_env.as_deref(), Some("BOATRAMP_SQL_TOKEN"));
         assert_eq!(sql.admin_token_env, None);
+    }
+
+    #[test]
+    fn sql_binding_env_only_sets_trusted_extensions_and_declared_caps() {
+        // The crux of the ask: with NO `boatramp.cfg`, env vars alone materialise + populate the
+        // sql binding's migration trusted-extension allowlist (a parse_list, comma-separated +
+        // trimmed) and the declared-DB ceilings — so a fly `[env]`-only fleet can allowlist
+        // `pg_trgm` without a `[[files]] boatramp.cfg` edit + a server roll.
+        let mut cfg = ServerConfig::default();
+        assert!(cfg.handlers.is_none());
+        cfg.apply_env_overrides(&env(&[
+            (
+                "BOATRAMP_HANDLERS_SQL_MIGRATE_TRUSTED_EXTENSIONS",
+                "pg_trgm, pgcrypto",
+            ),
+            ("BOATRAMP_HANDLERS_SQL_MAX_DECLARED_DATABASES", "32"),
+            ("BOATRAMP_HANDLERS_SQL_MAX_DECLARED_VOLUME_MIB", "1048576"),
+        ]))
+        .expect("valid env overrides apply");
+        let sql = cfg
+            .handlers
+            .expect("handlers materialised from env")
+            .bindings
+            .sql
+            .expect("sql binding materialised from the trusted-extensions var alone");
+        assert_eq!(
+            sql.migrate_trusted_extensions.as_deref(),
+            Some(&["pg_trgm".to_string(), "pgcrypto".to_string()][..]),
+            "the allowlist is the comma-split, trimmed env list (source = env)"
+        );
+        assert_eq!(sql.max_declared_databases, Some(32));
+        assert_eq!(sql.max_declared_volume_mib, Some(1_048_576));
+    }
+
+    #[test]
+    fn sql_binding_env_over_file_for_trusted_extensions() {
+        // Field-level env-over-file precedence: a file allowlist is overridden ONLY for the var that
+        // is set; an unset var keeps the file value (never clobbered to empty).
+        let mut cfg = server(
+            r#"(
+                handlers: ( bindings: ( sql: (
+                    migrate_trusted_extensions: ["citext"],
+                    max_declared_databases: 8,
+                ) ) ),
+            )"#,
+        );
+        cfg.apply_env_overrides(&env(&[(
+            "BOATRAMP_HANDLERS_SQL_MIGRATE_TRUSTED_EXTENSIONS",
+            "pg_trgm",
+        )]))
+        .expect("env overrides apply");
+        let sql = cfg.handlers.unwrap().bindings.sql.unwrap();
+        assert_eq!(
+            sql.migrate_trusted_extensions.as_deref(),
+            Some(&["pg_trgm".to_string()][..]),
+            "env wins over the file allowlist for the var that is set"
+        );
+        assert_eq!(
+            sql.max_declared_databases,
+            Some(8),
+            "a var left unset keeps the file value (not clobbered)"
+        );
+    }
+
+    #[test]
+    fn every_sql_binding_scalar_has_an_env_mapping() {
+        // Forgot-a-knob guard (the v0.4.18 shape, for `handlers.bindings.sql`): every env-mappable
+        // SCALAR field on SqlBindingConfig must have a `BOATRAMP_HANDLERS_SQL_*` entry in
+        // SQL_ENV_VARS, so a file-less (fly `[env]`-only) fleet can set it without a `boatramp.cfg`
+        // + server roll — the EXACT gap that left `migrate_trusted_extensions` env-unsettable. The
+        // destructure is the compile-time half: a NEW field added to SqlBindingConfig breaks this
+        // test until it is classified below (a scalar → add a var here + a registry entry + an
+        // overlay arm; or the `databases` map, which is discovered by the
+        // `BOATRAMP_HANDLERS_SQL_DB_<NAME>_*` prefix scan, not a scalar var). The loop is the runtime
+        // half: each classified scalar is actually registered.
+        let SqlBindingConfig {
+            dir: _,
+            url: _,
+            admin_url: _,
+            replica_url: _,
+            token_env: _,
+            admin_token_env: _,
+            preview_mode: _,
+            preview_init: _,
+            // NOT a scalar env var: the keyed external-database map, discovered by prefix scan.
+            databases: _,
+            deprovision_grace_secs: _,
+            migrate_trusted_extensions: _,
+            max_declared_databases: _,
+            max_declared_volume_mib: _,
+        } = SqlBindingConfig::default();
+        for var in [
+            "BOATRAMP_HANDLERS_SQL_DIR",
+            "BOATRAMP_HANDLERS_SQL_URL",
+            "BOATRAMP_HANDLERS_SQL_ADMIN_URL",
+            "BOATRAMP_HANDLERS_SQL_REPLICA_URL",
+            "BOATRAMP_HANDLERS_SQL_TOKEN_ENV",
+            "BOATRAMP_HANDLERS_SQL_ADMIN_TOKEN_ENV",
+            "BOATRAMP_HANDLERS_SQL_PREVIEW_MODE",
+            "BOATRAMP_HANDLERS_SQL_PREVIEW_INIT",
+            "BOATRAMP_HANDLERS_SQL_DEPROVISION_GRACE_SECS",
+            "BOATRAMP_HANDLERS_SQL_MIGRATE_TRUSTED_EXTENSIONS",
+            "BOATRAMP_HANDLERS_SQL_MAX_DECLARED_DATABASES",
+            "BOATRAMP_HANDLERS_SQL_MAX_DECLARED_VOLUME_MIB",
+        ] {
+            assert!(
+                SQL_ENV_VARS.contains(&var),
+                "{var} missing from SQL_ENV_VARS — a sql-binding scalar lost its env lever \
+                 (the forgot-a-knob gap); add it to the registry + an overlay arm"
+            );
+        }
     }
 
     #[test]
