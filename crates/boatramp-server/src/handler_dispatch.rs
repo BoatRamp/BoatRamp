@@ -2091,10 +2091,16 @@ pub(super) async fn build_bindings(
             inner.session_signer.get().cloned(),
             super::function_runtime::token_source_claim(effective_tenancy),
         ) {
+            // Apply the SAME claim transform (if any) the request path uses, so a presented token
+            // on a site handler seals the DERIVED key (async-lane symmetry).
+            let (extract, namespace) =
+                super::function_runtime::token_source_transform(effective_tenancy);
             bindings = bindings.with_present_token(
                 std::sync::Arc::new(super::function_runtime::ServerProducerContextSource {
                     token_cfg,
                     claim,
+                    extract,
+                    namespace,
                     signer,
                     env_source: inner.env_source_arc(),
                     // The handler's site identifies the component for the persona seal-time signal.

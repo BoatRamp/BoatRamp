@@ -337,9 +337,25 @@ pub fn derive_tenant(
 }
 
 /// Compose the namespace (if any) with the screened span and run the final key-safety screen.
+///
+/// The namespace is screened for the reserved delimiter **here, at resolution**, not only at apply:
+/// `validate_key_segment` permits `:`, so the injective `namespace:span` split would be defeated by
+/// a namespace containing `:` that reached runtime unvalidated (a direct API deploy, a bypassed
+/// admission). Screening it here makes the cross-namespace-collision invariant (G3) hold on the
+/// runtime path alone — admission's [`validate_namespace`] is then a fail-fast UX layer, never the
+/// sole guarantee. Combined with [`span_char_ok`] excluding `:` from the span, a derived key carries
+/// exactly one `:` (the separator), so `(namespace, span)` is recoverable and two namespaces cannot
+/// collide.
 fn finish(namespace: Option<&str>, span: &str) -> DeriveOutcome {
     let key = match namespace {
-        Some(ns) => format!("{ns}{NAMESPACE_DELIMITER}{span}"),
+        Some(ns) => {
+            if ns.is_empty() || ns.contains(NAMESPACE_DELIMITER) {
+                return DeriveOutcome::KeyRejected(format!(
+                    "namespace must be non-empty and must not contain the reserved delimiter `{NAMESPACE_DELIMITER}`"
+                ));
+            }
+            format!("{ns}{NAMESPACE_DELIMITER}{span}")
+        }
         None => span.to_string(),
     };
     match crate::project::validate_key_segment("tenant", &key) {
@@ -379,6 +395,62 @@ pub fn validate_namespace(namespace: &str) -> Result<(), ConfigError> {
         return Err(ConfigError::pattern(
             namespace,
             format!("a namespace must not contain the reserved delimiter `{NAMESPACE_DELIMITER}`"),
+        ));
+    }
+    Ok(())
+}
+
+/// Apply-time validation of a `Scoped` route's whole `sources` list (a fail-fast 422; the runtime
+/// screens enforce the security invariants regardless). Validates each token source's transform
+/// (`extract` compiles to one non-nullable named capture; `namespace` is a delimiter-free slug) and
+/// the **cross-source namespace rule**: a namespaced key space must be *fully* namespaced with
+/// *distinct* namespaces — so an un-namespaced value (a plain token, a domain tag, a signed context)
+/// can never share the flat key space with a `namespace:span` key an attacker could aim at. If any
+/// token source declares a `namespace`, mixing it with an un-namespaced tenant-producing source is
+/// refused (the conservative v1 stance — relax later if a safe mixed pattern is needed).
+pub fn validate_sources(sources: &[crate::tenancy::TenantSource]) -> Result<(), ConfigError> {
+    use crate::tenancy::TenantSource;
+    let mut seen_namespaces: Vec<&str> = Vec::new();
+    let mut any_namespaced = false;
+    let mut any_unnamespaced_tenant_source = false;
+    for s in sources {
+        match s {
+            TenantSource::Token {
+                extract, namespace, ..
+            } => {
+                if let Some(ext) = extract {
+                    validate_extract(ext)?;
+                }
+                match namespace {
+                    Some(ns) => {
+                        validate_namespace(ns)?;
+                        if seen_namespaces.contains(&ns.as_str()) {
+                            return Err(ConfigError::pattern(
+                                ns,
+                                format!(
+                                    "duplicate tenant namespace `{ns}` across token sources — each namespaced source must use a distinct namespace"
+                                ),
+                            ));
+                        }
+                        seen_namespaces.push(ns);
+                        any_namespaced = true;
+                    }
+                    // A token with no namespace emits an un-namespaced key into the column.
+                    None => any_unnamespaced_tenant_source = true,
+                }
+            }
+            // Domain / signed-context emit an un-namespaced value into the same column.
+            TenantSource::Domain | TenantSource::SignedContext => {
+                any_unnamespaced_tenant_source = true;
+            }
+            TenantSource::None => {}
+        }
+    }
+    if any_namespaced && any_unnamespaced_tenant_source {
+        return Err(ConfigError::pattern(
+            "sources",
+            "a token source declares a `namespace`, so every tenant-producing source on this route must also be namespaced — do not mix a namespaced token with a plain (un-namespaced) token, a domain source, or a signed-context source on the same tenant column (they would share one flat key space)"
+                .to_string(),
         ));
     }
     Ok(())
@@ -483,6 +555,36 @@ mod tests {
     fn admission_accepts_a_sound_regex_and_template() {
         assert!(validate_extract(&rx(r"/id/(?<tenant>[0-9A-Za-z]+)/")).is_ok());
         assert!(validate_extract(&tmpl("https://login.salesforce.com/id/{tenant}/{_}")).is_ok());
+    }
+
+    #[test]
+    fn validate_sources_enforces_the_namespace_mix_rule() {
+        use crate::tenancy::TenantSource;
+        let tok = |ns: Option<&str>| TenantSource::Token {
+            claim: "sub".into(),
+            extract: None,
+            namespace: ns.map(String::from),
+        };
+        // Fully namespaced + distinct: OK (the multi-IdP case).
+        assert!(validate_sources(&[tok(Some("sfdc")), tok(Some("auth0"))]).is_ok());
+        // Duplicate namespace across sources: rejected.
+        assert!(validate_sources(&[tok(Some("sfdc")), tok(Some("sfdc"))]).is_err());
+        // Namespaced token mixed with a domain / plain token / signed-context: rejected.
+        assert!(validate_sources(&[tok(Some("sfdc")), TenantSource::Domain]).is_err());
+        assert!(validate_sources(&[tok(Some("sfdc")), tok(None)]).is_err());
+        assert!(validate_sources(&[tok(Some("sfdc")), TenantSource::SignedContext]).is_err());
+        // No namespacing at all (today's behavior) — any mix is fine.
+        assert!(validate_sources(&[tok(None), TenantSource::Domain]).is_ok());
+    }
+
+    #[test]
+    fn runtime_rejects_a_namespace_carrying_the_delimiter() {
+        // Admission would reject `ev:il`, but if it reached runtime (direct API / bypass) the
+        // resolution-time screen still denies it, so `namespace:span` stays injective.
+        assert!(matches!(
+            derive_tenant(None, Some("ev:il"), &json!("acme")),
+            DeriveOutcome::KeyRejected(_)
+        ));
     }
 
     #[test]
