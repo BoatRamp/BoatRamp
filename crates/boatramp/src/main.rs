@@ -176,7 +176,8 @@ enum Command {
     /// Manage a project's internal, sealed secret store (`secrets set|ls|rm|rotate`).
     Secrets(secrets::SecretsArgs),
     /// Manage a project's tenancy schema — the per-table tenant-key map that scopes
-    /// guest queries (`tenancy show|apply <file>|clear`).
+    /// guest queries (`tenancy show|apply <file>|clear`), and dry-run a `token`-source
+    /// claim transform locally (`tenancy test-extract`).
     Tenancy(tenancy::TenancyArgs),
     /// Manage a project's SMTP delivery profiles (`email set|ls|show|rm`).
     #[cfg(feature = "email")]
