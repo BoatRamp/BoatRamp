@@ -235,7 +235,9 @@ pub async fn run(args: TenancyArgs, config: &ProjectConfig) -> Result<()> {
             println!("cleared tenancy schema for project `{project}` (legacy Uniform scoping)");
         }
         // Handled by the early-return local dry-run above (no control plane).
-        TenancyCommand::TestExtract { .. } => unreachable!("test-extract is handled before connect"),
+        TenancyCommand::TestExtract { .. } => {
+            unreachable!("test-extract is handled before connect")
+        }
     }
     Ok(())
 }

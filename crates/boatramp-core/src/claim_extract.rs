@@ -89,7 +89,11 @@ impl CompiledExtract {
 
 fn extract_cache() -> &'static Mutex<LruCache<String, CompiledExtract>> {
     static CACHE: OnceLock<Mutex<LruCache<String, CompiledExtract>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(LruCache::new(NonZeroUsize::new(EXTRACT_CACHE_CAP).expect("cap > 0"))))
+    CACHE.get_or_init(|| {
+        Mutex::new(LruCache::new(
+            NonZeroUsize::new(EXTRACT_CACHE_CAP).expect("cap > 0"),
+        ))
+    })
 }
 
 /// Compile an [`ClaimExtract`], memoizing the result. A valid pattern compiles at most once per
@@ -108,7 +112,10 @@ pub fn compile(extract: &ClaimExtract) -> Result<CompiledExtract, ConfigError> {
         return Ok(cached.clone());
     }
     let compiled = compile_uncached(extract)?;
-    extract_cache().lock().unwrap().put(cache_key, compiled.clone());
+    extract_cache()
+        .lock()
+        .unwrap()
+        .put(cache_key, compiled.clone());
     Ok(compiled)
 }
 
@@ -126,7 +133,9 @@ fn compile_uncached(extract: &ClaimExtract) -> Result<CompiledExtract, ConfigErr
         .size_limit(REGEX_SIZE_LIMIT)
         .dfa_size_limit(REGEX_DFA_SIZE_LIMIT)
         .build()
-        .map_err(|e| ConfigError::pattern(&extract.pattern, format!("regex failed to compile: {e}")))?;
+        .map_err(|e| {
+            ConfigError::pattern(&extract.pattern, format!("regex failed to compile: {e}"))
+        })?;
     Ok(CompiledExtract { regex })
 }
 
@@ -142,10 +151,12 @@ fn lower_template(template: &str) -> Result<String, ConfigError> {
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'{' {
-            let close = template[i..]
-                .find('}')
-                .map(|off| i + off)
-                .ok_or_else(|| ConfigError::pattern(template, "unclosed `{` placeholder (a literal `{` needs the regex surface)"))?;
+            let close = template[i..].find('}').map(|off| i + off).ok_or_else(|| {
+                ConfigError::pattern(
+                    template,
+                    "unclosed `{` placeholder (a literal `{` needs the regex surface)",
+                )
+            })?;
             let name = &template[i + 1..close];
             match name {
                 "tenant" => {
@@ -157,7 +168,9 @@ fn lower_template(template: &str) -> Result<String, ConfigError> {
                 other => {
                     return Err(ConfigError::pattern(
                         template,
-                        format!("unknown placeholder `{{{other}}}` (use `{{tenant}}` for the key, `{{_}}` to ignore a segment)"),
+                        format!(
+                            "unknown placeholder `{{{other}}}` (use `{{tenant}}` for the key, `{{_}}` to ignore a segment)"
+                        ),
                     ));
                 }
             }
@@ -171,7 +184,10 @@ fn lower_template(template: &str) -> Result<String, ConfigError> {
     out.push_str(r"\z");
     match tenant_count {
         1 => Ok(out),
-        0 => Err(ConfigError::pattern(template, "template has no `{tenant}` placeholder")),
+        0 => Err(ConfigError::pattern(
+            template,
+            "template has no `{tenant}` placeholder",
+        )),
         n => Err(ConfigError::pattern(
             template,
             format!("template has {n} `{{tenant}}` placeholders, expected exactly 1"),
@@ -304,7 +320,11 @@ pub fn derive_tenant(
             // fail-closed no-match rather than trusting an unvalidated pattern.
             let compiled = match compile(ext) {
                 Ok(c) => c,
-                Err(_) => return DeriveOutcome::NoMatch { empty_capture: false },
+                Err(_) => {
+                    return DeriveOutcome::NoMatch {
+                        empty_capture: false,
+                    };
+                }
             };
             match compiled.extract(claim) {
                 Some(span) => screen_and_finish(namespace, span),
@@ -333,7 +353,9 @@ pub fn derive_tenant(
 /// boundary — admission ([`validate_sources`]) is fail-fast only.
 fn screen_and_finish(namespace: Option<&str>, span: &str) -> DeriveOutcome {
     if span.is_empty() {
-        return DeriveOutcome::NoMatch { empty_capture: true };
+        return DeriveOutcome::NoMatch {
+            empty_capture: true,
+        };
     }
     // MUTATION SEAM (G1): the span-alphabet screen (rejects `/ \ *`, the reserved `:`, whitespace,
     // control). `skip_derived_screen` removes it AND the final key-safety screen in `finish`, so a
@@ -512,10 +534,16 @@ mod tests {
     use serde_json::json;
 
     fn tmpl(p: &str) -> ClaimExtract {
-        ClaimExtract { syntax: ExtractSyntax::Template, pattern: p.to_string() }
+        ClaimExtract {
+            syntax: ExtractSyntax::Template,
+            pattern: p.to_string(),
+        }
     }
     fn rx(p: &str) -> ClaimExtract {
-        ClaimExtract { syntax: ExtractSyntax::Regex, pattern: p.to_string() }
+        ClaimExtract {
+            syntax: ExtractSyntax::Regex,
+            pattern: p.to_string(),
+        }
     }
 
     #[test]
@@ -549,16 +577,31 @@ mod tests {
     #[test]
     fn non_string_claim_denies() {
         let ext = tmpl("{tenant}");
-        assert_eq!(derive_tenant(Some(&ext), None, &json!(12345)), DeriveOutcome::ClaimNonString);
-        assert_eq!(derive_tenant(None, Some("sfdc"), &json!(["a"])), DeriveOutcome::ClaimNonString);
+        assert_eq!(
+            derive_tenant(Some(&ext), None, &json!(12345)),
+            DeriveOutcome::ClaimNonString
+        );
+        assert_eq!(
+            derive_tenant(None, Some("sfdc"), &json!(["a"])),
+            DeriveOutcome::ClaimNonString
+        );
     }
 
     #[test]
     fn no_match_denies() {
         let ext = tmpl("https://login.salesforce.com/id/{tenant}/{_}");
         // A token from a different issuer shape — does not match the anchored template.
-        let out = derive_tenant(Some(&ext), Some("sfdc"), &json!("https://other.example/u/42"));
-        assert_eq!(out, DeriveOutcome::NoMatch { empty_capture: false });
+        let out = derive_tenant(
+            Some(&ext),
+            Some("sfdc"),
+            &json!("https://other.example/u/42"),
+        );
+        assert_eq!(
+            out,
+            DeriveOutcome::NoMatch {
+                empty_capture: false
+            }
+        );
     }
 
     #[test]

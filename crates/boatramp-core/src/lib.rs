@@ -31,6 +31,8 @@ pub mod envelope;
 // `compute` extends the wasm-clean `boatramp_types::compute` (re-exported within)
 // with the native control-plane layer: the `ComputeBackend` trait, the scheduler,
 // and the reconcile logic.
+/// A typed query AST + injection-safe `?N` SQL compiler backing the `orm` handler binding.
+pub mod claim_extract;
 pub mod compute;
 pub mod deploy;
 /// Per-project SMTP email-profile store (sealed password) backing the `email`
@@ -50,8 +52,6 @@ pub mod messaging;
 /// Online, resumable migration of a pre-0.2.0 store to the project-scoped layout.
 pub mod migrate;
 pub mod mode;
-/// A typed query AST + injection-safe `?N` SQL compiler backing the `orm` handler binding.
-pub mod claim_extract;
 pub mod orm;
 pub mod project;
 pub mod secret_store;
