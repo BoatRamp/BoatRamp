@@ -336,6 +336,23 @@ async fn resolve_from_sources(
     sources: &[TenantSource],
     inputs: &TenantSourceInputs<'_>,
 ) -> Option<boatramp_core::sql::SqlValue> {
+    // Runtime backstop (Security Finding A): a route that namespaces one token source but also carries
+    // an un-namespaced tenant-producing source (a plain token, a domain, a signed context) shares one
+    // flat key space — an attacker-influenceable un-namespaced value could equal a `namespace:span`
+    // key. Refuse to resolve ANY principal for such a mixed route (fail closed), so the mix is unsafe
+    // even if apply-time admission was bypassed (a direct control-plane API deploy, or a serving
+    // surface whose apply path does not validate the source list). This covers every surface uniformly
+    // (function, site, per-route) because they all resolve here.
+    if boatramp_core::claim_extract::sources_mix_is_forbidden(sources) {
+        tracing::warn!(
+            tenant_source = "token",
+            outcome = "forbidden_source_mix",
+            counter = "transform_denied",
+            "tenant claim transform: a namespaced token source is mixed with an un-namespaced \
+             tenant source on this route; refusing to resolve a principal (fail closed)"
+        );
+        return None;
+    }
     for source in sources {
         if let Some(value) = resolve_value(source, inputs).await {
             return Some(value);
@@ -396,6 +413,7 @@ async fn resolve_value(
                     tracing::warn!(
                         tenant_source = "token",
                         outcome = "claim_absent",
+                        counter = "transform_denied",
                         claim = %claim,
                         "tenant claim transform: named claim is absent from the verified token"
                     );
@@ -407,6 +425,7 @@ async fn resolve_value(
                         tracing::warn!(
                             tenant_source = "token",
                             outcome = "claim_not_string",
+                            counter = "transform_denied",
                             claim = %claim,
                             "tenant claim transform: claim is present but not a JSON string"
                         );
@@ -416,6 +435,7 @@ async fn resolve_value(
                         tracing::warn!(
                             tenant_source = "token",
                             outcome = "extract_no_match",
+                            counter = "transform_denied",
                             claim = %claim,
                             empty_capture,
                             "tenant claim transform: extraction did not match the claim value"
@@ -426,6 +446,7 @@ async fn resolve_value(
                         tracing::warn!(
                             tenant_source = "token",
                             outcome = "derived_key_rejected",
+                            counter = "transform_denied",
                             claim = %claim,
                             reason = %reason,
                             "tenant claim transform: derived key failed the key-safety screen"

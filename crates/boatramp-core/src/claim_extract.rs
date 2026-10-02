@@ -444,42 +444,29 @@ pub fn validate_namespace(namespace: &str) -> Result<(), ConfigError> {
 pub fn validate_sources(sources: &[crate::tenancy::TenantSource]) -> Result<(), ConfigError> {
     use crate::tenancy::TenantSource;
     let mut seen_namespaces: Vec<&str> = Vec::new();
-    let mut any_namespaced = false;
-    let mut any_unnamespaced_tenant_source = false;
     for s in sources {
-        match s {
-            TenantSource::Token {
-                extract, namespace, ..
-            } => {
-                if let Some(ext) = extract {
-                    validate_extract(ext)?;
-                }
-                match namespace {
-                    Some(ns) => {
-                        validate_namespace(ns)?;
-                        if seen_namespaces.contains(&ns.as_str()) {
-                            return Err(ConfigError::pattern(
-                                ns,
-                                format!(
-                                    "duplicate tenant namespace `{ns}` across token sources — each namespaced source must use a distinct namespace"
-                                ),
-                            ));
-                        }
-                        seen_namespaces.push(ns);
-                        any_namespaced = true;
-                    }
-                    // A token with no namespace emits an un-namespaced key into the column.
-                    None => any_unnamespaced_tenant_source = true,
-                }
+        if let TenantSource::Token {
+            extract, namespace, ..
+        } = s
+        {
+            if let Some(ext) = extract {
+                validate_extract(ext)?;
             }
-            // Domain / signed-context emit an un-namespaced value into the same column.
-            TenantSource::Domain | TenantSource::SignedContext => {
-                any_unnamespaced_tenant_source = true;
+            if let Some(ns) = namespace {
+                validate_namespace(ns)?;
+                if seen_namespaces.contains(&ns.as_str()) {
+                    return Err(ConfigError::pattern(
+                        ns,
+                        format!(
+                            "duplicate tenant namespace `{ns}` across token sources — each namespaced source must use a distinct namespace"
+                        ),
+                    ));
+                }
+                seen_namespaces.push(ns);
             }
-            TenantSource::None => {}
         }
     }
-    if any_namespaced && any_unnamespaced_tenant_source {
+    if sources_mix_is_forbidden(sources) {
         return Err(ConfigError::pattern(
             "sources",
             "a token source declares a `namespace`, so every tenant-producing source on this route must also be namespaced — do not mix a namespaced token with a plain (un-namespaced) token, a domain source, or a signed-context source on the same tenant column (they would share one flat key space)"
@@ -487,6 +474,35 @@ pub fn validate_sources(sources: &[crate::tenancy::TenantSource]) -> Result<(), 
         ));
     }
     Ok(())
+}
+
+/// Whether a `Scoped` route's `sources` list mixes a **namespaced** token source with an
+/// **un-namespaced** tenant-producing source (a plain token, a `domain`, or a `signed_context`).
+/// Such a mix shares one flat key space, so an un-namespaced value (which an attacker may influence
+/// via a verbatim claim) could coincide with a `namespace:span` key — a cross-tenant read. This is
+/// the ONE collision invariant not enforced by the per-value runtime screens, so it is checked BOTH
+/// at apply ([`validate_sources`], a loud error) AND as a **runtime backstop** in the host's
+/// `resolve_from_sources` (which refuses to resolve ANY principal for such a route — fail closed —
+/// so the mix is unsafe even if apply-time admission was bypassed, e.g. a direct control-plane API
+/// deploy, or a serving surface whose apply path does not validate it).
+pub fn sources_mix_is_forbidden(sources: &[crate::tenancy::TenantSource]) -> bool {
+    use crate::tenancy::TenantSource;
+    let mut any_namespaced = false;
+    let mut any_unnamespaced = false;
+    for s in sources {
+        match s {
+            TenantSource::Token {
+                namespace: Some(_), ..
+            } => any_namespaced = true,
+            TenantSource::Token {
+                namespace: None, ..
+            }
+            | TenantSource::Domain
+            | TenantSource::SignedContext => any_unnamespaced = true,
+            TenantSource::None => {}
+        }
+    }
+    any_namespaced && any_unnamespaced
 }
 
 #[cfg(test)]
