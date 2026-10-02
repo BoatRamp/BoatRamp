@@ -53,6 +53,14 @@ crownjewel-cas-gate-mutation = []
 # stamp off — turning the single-leader + commingle/split-brain gates RED. Mirrors
 # `crownjewel-cas-gate-mutation`. Compiled OUT of every real build (also lives under `cfg(test)`).
 shared-mode-gate-mutation = []
+# TEST-ONLY, NEVER SHIPPED: arm the claim-transform tenant-key-derivation mutation seam
+# ([`claim_extract::gate_mutation`]) in a NON-test build, so a downstream test lane
+# (`boatramp-storage`'s libsql claim-transform gates) can set `BOATRAMP_CLAIMTRANSFORM_MUTATION` to
+# disable ONE derived-key screen: `skip_derived_screen` (span alphabet + key-safety), `extract_fallback`
+# (no-match → verbatim claim), or `skip_namespace_check` (the injective-namespace guard) — turning the
+# corresponding G1/G2/G3 gate RED. Mirrors `crownjewel-cas-gate-mutation`. Compiled OUT of every real
+# build (the seam also compiles under this crate's own `cfg(test)`).
+claim-transform-gate-mutation = []
 
 [dependencies]
 # The shared, wasm-clean type + routing/config layer (re-exported below so

@@ -298,7 +298,7 @@ pub fn derive_tenant(
         _ => return DeriveOutcome::ClaimNonString,
     };
 
-    let span: &str = match extract {
+    match extract {
         Some(ext) => {
             // A compile error here means the config was never validated at apply — treat as a
             // fail-closed no-match rather than trusting an unvalidated pattern.
@@ -307,33 +307,44 @@ pub fn derive_tenant(
                 Err(_) => return DeriveOutcome::NoMatch { empty_capture: false },
             };
             match compiled.extract(claim) {
-                Some(s) => {
-                    // Borrow-checker: `compiled` owns the captures' lifetime, so re-run against the
-                    // owned claim string is avoided by screening/copying here.
-                    if !s.chars().all(span_char_ok) {
-                        return DeriveOutcome::KeyRejected(format!(
-                            "extracted segment contains a character outside the key-safe alphabet or the reserved `{NAMESPACE_DELIMITER}`"
-                        ));
+                Some(span) => screen_and_finish(namespace, span),
+                None => {
+                    // MUTATION SEAM (G2): a no-match / empty capture MUST deny. `extract_fallback`
+                    // models the insecure "fall back to the whole claim value" bug — which would
+                    // namespace the verbatim claim and could land a victim's key (or merge every
+                    // empty-extraction user onto the bare namespace) — turning the G2 gate RED.
+                    if gate_mutation().as_deref() == Some("extract_fallback") {
+                        return screen_and_finish(namespace, claim);
                     }
-                    return finish(namespace, s);
+                    DeriveOutcome::NoMatch {
+                        empty_capture: span_was_empty(&compiled, claim),
+                    }
                 }
-                None => return DeriveOutcome::NoMatch { empty_capture: span_was_empty(&compiled, claim) },
             }
         }
         // No extraction: the whole (string) claim value is the span (the "bare" / "prefixed-bare"
         // case). Still screened to the span alphabet so a namespaced key stays injective.
-        None => claim,
-    };
+        None => screen_and_finish(namespace, claim),
+    }
+}
 
+/// Screen a candidate `span` (empty denies; must be ASCII key-safe, excluding the reserved
+/// delimiter) and compose the key via [`finish`]. These screens are the load-bearing security
+/// boundary — admission ([`validate_sources`]) is fail-fast only.
+fn screen_and_finish(namespace: Option<&str>, span: &str) -> DeriveOutcome {
     if span.is_empty() {
         return DeriveOutcome::NoMatch { empty_capture: true };
     }
-    if !span.chars().all(span_char_ok) {
+    // MUTATION SEAM (G1): the span-alphabet screen (rejects `/ \ *`, the reserved `:`, whitespace,
+    // control). `skip_derived_screen` removes it AND the final key-safety screen in `finish`, so a
+    // `/`- or `:`-bearing span resolves — turning the G1 gate RED.
+    let skip_screen = gate_mutation().as_deref() == Some("skip_derived_screen");
+    if !skip_screen && !span.chars().all(span_char_ok) {
         return DeriveOutcome::KeyRejected(format!(
-            "claim value contains a character outside the key-safe alphabet or the reserved `{NAMESPACE_DELIMITER}`"
+            "extracted segment contains a character outside the key-safe alphabet or the reserved `{NAMESPACE_DELIMITER}`"
         ));
     }
-    finish(namespace, span)
+    finish(namespace, span, skip_screen)
 }
 
 /// Compose the namespace (if any) with the screened span and run the final key-safety screen.
@@ -346,10 +357,14 @@ pub fn derive_tenant(
 /// sole guarantee. Combined with [`span_char_ok`] excluding `:` from the span, a derived key carries
 /// exactly one `:` (the separator), so `(namespace, span)` is recoverable and two namespaces cannot
 /// collide.
-fn finish(namespace: Option<&str>, span: &str) -> DeriveOutcome {
+fn finish(namespace: Option<&str>, span: &str, skip_screen: bool) -> DeriveOutcome {
     let key = match namespace {
         Some(ns) => {
-            if ns.is_empty() || ns.contains(NAMESPACE_DELIMITER) {
+            // MUTATION SEAM (G3): the namespace delimiter/empty guard keeps `namespace:span`
+            // injective. `skip_namespace_check` removes it so a `:`-bearing namespace composes —
+            // turning the G3 gate RED (the split is no longer unique).
+            let skip_ns = gate_mutation().as_deref() == Some("skip_namespace_check");
+            if !skip_ns && (ns.is_empty() || ns.contains(NAMESPACE_DELIMITER)) {
                 return DeriveOutcome::KeyRejected(format!(
                     "namespace must be non-empty and must not contain the reserved delimiter `{NAMESPACE_DELIMITER}`"
                 ));
@@ -358,10 +373,28 @@ fn finish(namespace: Option<&str>, span: &str) -> DeriveOutcome {
         }
         None => span.to_string(),
     };
+    // G1 mutation also removes the final key-safety screen (the whole "derived screen").
+    if skip_screen {
+        return DeriveOutcome::Resolved(key);
+    }
     match crate::project::validate_key_segment("tenant", &key) {
         Ok(()) => DeriveOutcome::Resolved(key),
         Err(e) => DeriveOutcome::KeyRejected(e.to_string()),
     }
+}
+
+/// The active claim-transform mutation (anti-hollow gates), or `None`. Present ONLY under
+/// `cfg(test)` (core's own unit gates) or the `claim-transform-gate-mutation` feature (which the
+/// `boatramp-storage` libsql gate lane enables); a shipped build has neither, so every screen above
+/// is unconditional and this is a dead `None`.
+#[cfg(any(test, feature = "claim-transform-gate-mutation"))]
+fn gate_mutation() -> Option<String> {
+    std::env::var("BOATRAMP_CLAIMTRANSFORM_MUTATION").ok()
+}
+#[cfg(not(any(test, feature = "claim-transform-gate-mutation")))]
+#[inline]
+fn gate_mutation() -> Option<String> {
+    None
 }
 
 /// Distinguish "the pattern matched but the capture was empty" from "the pattern did not match",
