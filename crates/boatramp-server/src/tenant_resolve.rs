@@ -365,7 +365,11 @@ async fn resolve_value(
     inputs: &TenantSourceInputs<'_>,
 ) -> Option<boatramp_core::sql::SqlValue> {
     match source {
-        TenantSource::Token { claim } => {
+        TenantSource::Token {
+            claim,
+            extract,
+            namespace,
+        } => {
             // The verifier lives behind `oidc` (it pulls `jsonwebtoken`). Without that feature the
             // token source can't verify, so it sources no value (fail-closed) — mirroring the GDC.
             #[cfg(feature = "oidc")]
@@ -377,7 +381,58 @@ async fn resolve_value(
                     .unwrap_or(&SYSTEM as &dyn boatramp_core::env::EnvSource);
                 let claims =
                     crate::graphql_data::token::verified_claims(cfg, bearer, env_source).await?;
-                claims.get(claim).and_then(scalar_to_sql)
+
+                // No transform declared ⇒ today's verbatim behavior, byte-identical.
+                if extract.is_none() && namespace.is_none() {
+                    return claims.get(claim).and_then(scalar_to_sql);
+                }
+
+                // Transform active: derive the key from the *verified* claim, deny-by-default. The
+                // guest-facing outcome is uniform (no principal → the scoped op fails closed); the
+                // host logs the precise reason so a misconfiguration is a grep, not a mystery. The
+                // claim NAME (a config field) is safe to log; the claim VALUE is not logged.
+                use boatramp_core::claim_extract::{DeriveOutcome, derive_tenant};
+                let Some(value) = claims.get(claim) else {
+                    tracing::warn!(
+                        tenant_source = "token",
+                        outcome = "claim_absent",
+                        claim = %claim,
+                        "tenant claim transform: named claim is absent from the verified token"
+                    );
+                    return None;
+                };
+                match derive_tenant(extract.as_ref(), namespace.as_deref(), value) {
+                    DeriveOutcome::Resolved(key) => Some(boatramp_core::sql::SqlValue::Text(key)),
+                    DeriveOutcome::ClaimNonString => {
+                        tracing::warn!(
+                            tenant_source = "token",
+                            outcome = "claim_not_string",
+                            claim = %claim,
+                            "tenant claim transform: claim is present but not a JSON string"
+                        );
+                        None
+                    }
+                    DeriveOutcome::NoMatch { empty_capture } => {
+                        tracing::warn!(
+                            tenant_source = "token",
+                            outcome = "extract_no_match",
+                            claim = %claim,
+                            empty_capture,
+                            "tenant claim transform: extraction did not match the claim value"
+                        );
+                        None
+                    }
+                    DeriveOutcome::KeyRejected(reason) => {
+                        tracing::warn!(
+                            tenant_source = "token",
+                            outcome = "derived_key_rejected",
+                            claim = %claim,
+                            reason = %reason,
+                            "tenant claim transform: derived key failed the key-safety screen"
+                        );
+                        None
+                    }
+                }
             }
             #[cfg(not(feature = "oidc"))]
             {
@@ -386,6 +441,8 @@ async fn resolve_value(
                 // sources don't use them).
                 let _ = (
                     claim,
+                    extract,
+                    namespace,
                     inputs.bearer,
                     inputs.token_cfg,
                     inputs.domain_context,
