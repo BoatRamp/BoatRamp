@@ -83,10 +83,103 @@ enum TenancyCommand {
     /// Clear the project's tenancy schema, reverting to legacy `Uniform` single-column
     /// scoping (`Project·Admin`). Idempotent.
     Clear,
+    /// Dry-run a `token`-source claim transform against a sample claim value, **locally**
+    /// (no server), through the SAME `derive_tenant` the host runs. Prints the derived
+    /// tenant key, or the exact stage that denied it (the same deny taxonomy the host
+    /// logs) — so a regex/template misconfiguration is a 30-second check instead of
+    /// staring at silently fail-closed requests.
+    TestExtract {
+        /// The claim's sample VALUE (e.g. a Salesforce `sub` identity URL).
+        #[arg(long)]
+        value: String,
+        /// A `{tenant}`/`{_}` path template (the recommended surface).
+        #[arg(long, conflicts_with = "regex")]
+        template: Option<String>,
+        /// A single-named-capture regex `(?<tenant>…)` (the escape hatch).
+        #[arg(long)]
+        regex: Option<String>,
+        /// The optional per-issuer namespace (produces `<namespace>:<extracted>`).
+        #[arg(long)]
+        namespace: Option<String>,
+    },
+}
+
+/// Local dry-run of the `token`-source claim transform (the `test-extract` subcommand). No server;
+/// runs the host's real [`derive_tenant`] and apply-time validators so the verdict matches production.
+fn test_extract(
+    value: &str,
+    template: Option<&str>,
+    regex: Option<&str>,
+    namespace: Option<&str>,
+) -> Result<()> {
+    use boatramp_core::claim_extract::{
+        DeriveOutcome, derive_tenant, validate_extract, validate_namespace,
+    };
+    use boatramp_core::tenancy::{ClaimExtract, ExtractSyntax};
+
+    let extract = match (template, regex) {
+        (Some(t), _) => Some(ClaimExtract {
+            syntax: ExtractSyntax::Template,
+            pattern: t.to_string(),
+        }),
+        (None, Some(r)) => Some(ClaimExtract {
+            syntax: ExtractSyntax::Regex,
+            pattern: r.to_string(),
+        }),
+        (None, None) => None,
+    };
+    // Report config that apply would reject, before attempting the match.
+    if let Some(ext) = &extract
+        && let Err(e) = validate_extract(ext)
+    {
+        println!("extract INVALID — apply would reject: {e}");
+        return Ok(());
+    }
+    if let Some(ns) = namespace
+        && let Err(e) = validate_namespace(ns)
+    {
+        println!("namespace INVALID — apply would reject: {e}");
+        return Ok(());
+    }
+    // No transform ⇒ the verbatim path (the host injects the claim value unchanged, unscreened).
+    if extract.is_none() && namespace.is_none() {
+        println!("no transform configured — tenant = {value:?} (verbatim)");
+        return Ok(());
+    }
+    let claim = serde_json::Value::String(value.to_string());
+    match derive_tenant(extract.as_ref(), namespace, &claim) {
+        DeriveOutcome::Resolved(key) => println!("resolved tenant key: {key}"),
+        DeriveOutcome::ClaimNonString => println!("DENY: claim is not a string"),
+        DeriveOutcome::NoMatch { empty_capture } => println!(
+            "DENY: extraction did not match the value{}",
+            if empty_capture {
+                " (matched, but captured the empty string)"
+            } else {
+                ""
+            }
+        ),
+        DeriveOutcome::KeyRejected(reason) => println!("DENY: derived key rejected — {reason}"),
+    }
+    Ok(())
 }
 
 /// Entry point for `boatramp tenancy`.
 pub async fn run(args: TenancyArgs, config: &ProjectConfig) -> Result<()> {
+    // `test-extract` is a LOCAL dry-run — handle it before touching the control plane.
+    if let TenancyCommand::TestExtract {
+        value,
+        template,
+        regex,
+        namespace,
+    } = &args.command
+    {
+        return test_extract(
+            value,
+            template.as_deref(),
+            regex.as_deref(),
+            namespace.as_deref(),
+        );
+    }
     let (server, http) = client::connect(args.server.clone(), config)?;
     let project = client::resolve_project(config);
     let cp = client::ControlPlane::new(server, http, project.clone());
@@ -141,6 +234,8 @@ pub async fn run(args: TenancyArgs, config: &ProjectConfig) -> Result<()> {
             cp.clear_project_tenancy().await?;
             println!("cleared tenancy schema for project `{project}` (legacy Uniform scoping)");
         }
+        // Handled by the early-return local dry-run above (no control plane).
+        TenancyCommand::TestExtract { .. } => unreachable!("test-extract is handled before connect"),
     }
     Ok(())
 }
@@ -175,6 +270,49 @@ mod tests {
         assert!(parse(&["tenancy", "clear"]).is_ok());
         // `apply` needs a file argument.
         assert!(parse(&["tenancy", "apply"]).is_err());
+        // `test-extract` needs a --value; --template and --regex are mutually exclusive.
+        assert!(
+            parse(&[
+                "tenancy",
+                "test-extract",
+                "--value",
+                "https://login.salesforce.com/id/00D/005",
+                "--template",
+                "https://login.salesforce.com/id/{tenant}/{_}",
+                "--namespace",
+                "sfdc",
+            ])
+            .is_ok()
+        );
+        assert!(parse(&["tenancy", "test-extract"]).is_err()); // --value required
+        assert!(
+            parse(&[
+                "tenancy",
+                "test-extract",
+                "--value",
+                "x",
+                "--template",
+                "{tenant}",
+                "--regex",
+                "(?<tenant>.+)",
+            ])
+            .is_err() // template + regex conflict
+        );
+    }
+
+    #[test]
+    fn test_extract_runs_the_real_derivation_offline() {
+        // The dry-run resolves the SF org id and namespaces it (no server).
+        super::test_extract(
+            "https://login.salesforce.com/id/00D5f0000000abcEAA/0055f00000ABC",
+            Some("https://login.salesforce.com/id/{tenant}/{_}"),
+            None,
+            Some("sfdc"),
+        )
+        .expect("dry-run succeeds");
+        // A non-matching value denies (prints DENY), still Ok.
+        super::test_extract("not-a-url", Some("https://x/{tenant}"), None, Some("sfdc"))
+            .expect("dry-run of a non-match still returns Ok (prints a DENY diagnosis)");
     }
 
     #[test]
