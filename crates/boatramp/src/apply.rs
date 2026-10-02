@@ -129,6 +129,14 @@ pub enum Error {
         #[source]
         source: boatramp_core::ConfigError,
     },
+    /// A function's `token`-source claim transform (extract/namespace) or the cross-source
+    /// namespace rule failed its apply-time check.
+    #[error("function {function}: tenancy sources: {source}")]
+    TenancySources {
+        function: String,
+        #[source]
+        source: boatramp_core::ConfigError,
+    },
     /// A control-plane request failed (the `connect`/resolve path).
     #[error(transparent)]
     Client(#[from] crate::client::ClientError),
@@ -574,6 +582,7 @@ impl ApplyManifest {
             },
         };
         manifest.compile_check_sites()?;
+        manifest.check_tenancy_sources()?;
         Ok(manifest)
     }
 
@@ -600,6 +609,25 @@ impl ApplyManifest {
                 routing.compile_check().map_err(|source| Error::Routing {
                     site: site.name.clone(),
                     source,
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate every function's `token`-source claim transform at apply — compile the
+    /// `extract` pattern (exactly one always-participating, non-nullable named capture),
+    /// screen the `namespace`, and enforce the cross-source namespace rule — so a
+    /// misconfiguration is a loud error here, not a silent per-request deny at serve time.
+    /// (The security invariants are enforced again at resolution; this is the fail-fast UX.)
+    fn check_tenancy_sources(&self) -> Result<()> {
+        for f in &self.functions {
+            if let Some(boatramp_core::tenancy::Tenancy::Scoped { sources, .. }) = &f.tenancy {
+                boatramp_core::claim_extract::validate_sources(sources).map_err(|source| {
+                    Error::TenancySources {
+                        function: f.name.clone(),
+                        source,
+                    }
                 })?;
             }
         }
