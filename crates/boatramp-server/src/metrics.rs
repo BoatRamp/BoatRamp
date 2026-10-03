@@ -43,6 +43,10 @@ pub enum Outcome {
     Ok,
     Timeout,
     OutOfFuel,
+    /// The guest exhausted its linear-memory budget (a denied `memory.grow` then a trap). Distinct
+    /// from [`Trap`](Self::Trap) so the DLQ / stats read `out-of-memory` — an operator can tell memory
+    /// exhaustion from a generic crash (construens async-lane-memory-budget request #4).
+    OutOfMemory,
     Overloaded,
     Trap,
     /// A consumer returned a clean `Err` (a downstream denial/validation failure) — NOT a wasm trap.
@@ -60,6 +64,7 @@ impl Outcome {
             Ok(_) => Self::Ok,
             Err(HandlerError::Timeout) => Self::Timeout,
             Err(HandlerError::OutOfFuel) => Self::OutOfFuel,
+            Err(HandlerError::OutOfMemory) => Self::OutOfMemory,
             Err(HandlerError::Overloaded) => Self::Overloaded,
             Err(HandlerError::Trap(_)) => Self::Trap,
             Err(HandlerError::ConsumerError(_)) => Self::ConsumerError,
@@ -76,6 +81,7 @@ impl Outcome {
             Self::Ok => "ok",
             Self::Timeout => "timeout",
             Self::OutOfFuel => "out-of-fuel",
+            Self::OutOfMemory => "out-of-memory",
             Self::Overloaded => "overloaded",
             Self::Trap => "trap",
             Self::ConsumerError => "consumer-error",
@@ -91,6 +97,8 @@ pub struct Counters {
     pub ok: u64,
     pub timeout: u64,
     pub out_of_fuel: u64,
+    /// Guest linear-memory-budget exhaustion (distinct from `trap`) — construens async-lane #4.
+    pub out_of_memory: u64,
     pub overloaded: u64,
     pub trap: u64,
     /// Clean consumer-returned errors (distinct from `trap`) — PLAN-async-persona taxonomy.
@@ -108,6 +116,7 @@ impl Counters {
             Outcome::Ok => self.ok += 1,
             Outcome::Timeout => self.timeout += 1,
             Outcome::OutOfFuel => self.out_of_fuel += 1,
+            Outcome::OutOfMemory => self.out_of_memory += 1,
             Outcome::Overloaded => self.overloaded += 1,
             Outcome::Trap => self.trap += 1,
             Outcome::ConsumerError => self.consumer_error += 1,
@@ -231,6 +240,7 @@ impl Metrics {
                 ("ok", c.ok),
                 ("timeout", c.timeout),
                 ("out-of-fuel", c.out_of_fuel),
+                ("out-of-memory", c.out_of_memory),
                 ("overloaded", c.overloaded),
                 ("trap", c.trap),
                 ("consumer-error", c.consumer_error),

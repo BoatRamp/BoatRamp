@@ -1515,6 +1515,12 @@ pub(super) fn handler_error_response(err: &boatramp_handlers::HandlerError) -> R
             StatusCode::GATEWAY_TIMEOUT,
             "handler exhausted its CPU budget\n",
         ),
+        // A deterministic per-invocation fault (the guest asked for more linear memory than its
+        // ceiling), so a retry would fail identically — a 500-class crash, not transient capacity.
+        HandlerError::OutOfMemory => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "handler exhausted its memory budget\n",
+        ),
         HandlerError::Overloaded => (
             StatusCode::SERVICE_UNAVAILABLE,
             "handler engine at capacity\n",
