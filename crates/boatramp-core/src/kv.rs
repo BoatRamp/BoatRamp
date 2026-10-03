@@ -206,6 +206,25 @@ pub trait KvStore: Send + Sync {
         Ok(keys)
     }
 
+    /// All `(key, value)` pairs under `prefix`, in ONE scan. The default composes
+    /// [`list_prefix`](Self::list_prefix) + a [`get`](Self::get) per key — the historical N+1, kept
+    /// so no backend is forced to change. A backend with a native values-returning scan (the SQL
+    /// `SELECT key,value … WHERE key LIKE prefix%`, SlateDB's range iterator, the in-memory map)
+    /// overrides it with a single round-trip; the caching/checkpoint wrappers forward to the inner
+    /// store for authoritative values. Used by hot count/aggregate paths that would otherwise fetch
+    /// keys then values separately (e.g. the shared-mode live-member count — review finding M1),
+    /// multiplying the round-trips (especially over a networked SQL backend).
+    async fn scan_prefix(&self, prefix: &str) -> Result<Vec<(String, Vec<u8>)>, KvError> {
+        let keys = self.list_prefix(prefix).await?;
+        let mut out = Vec::with_capacity(keys.len());
+        for key in keys {
+            if let Some(value) = self.get(&key).await? {
+                out.push((key, value));
+            }
+        }
+        Ok(out)
+    }
+
     /// Scan EVERY `{key, value, version}` in the store, in key order — the primitive the portable
     /// KV dump (kv-sql WS7, [`kv_dump`](crate::kv_dump)) exports from. The default rebuilds each
     /// entry from [`list_prefix`](Self::list_prefix)`("")` + [`get`](Self::get), reporting
@@ -498,6 +517,18 @@ impl KvStore for MemoryKv {
             .collect())
     }
 
+    async fn scan_prefix(&self, prefix: &str) -> Result<Vec<(String, Vec<u8>)>, KvError> {
+        // One pass over the sorted map range — key+value together, no per-key re-lock (M1).
+        Ok(self
+            .inner
+            .lock()
+            .unwrap()
+            .range(prefix.to_string()..)
+            .take_while(|(key, _)| key.starts_with(prefix))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect())
+    }
+
     async fn list_from(
         &self,
         prefix: &str,
@@ -713,6 +744,12 @@ impl KvStore for CachedKv {
         self.inner.dump_scan().await
     }
 
+    async fn scan_prefix(&self, prefix: &str) -> Result<Vec<(String, Vec<u8>)>, KvError> {
+        // Forward to the inner store: authoritative values (never a stale LRU) + the inner's native
+        // single-scan override (M1). Mirrors `dump_scan`/`list_prefix`.
+        self.inner.scan_prefix(prefix).await
+    }
+
     fn atomic_write_batch(&self) -> bool {
         // The cache is a pure read-through mirror; the backing store's batch is the atomic/durable
         // one (`commit_then_mirror` commits it FIRST). So the cache is as atomic as its inner store.
@@ -835,6 +872,10 @@ impl KvStore for CheckpointKv {
 
     async fn dump_scan(&self) -> Result<Vec<KvDumpEntry>, KvError> {
         self.inner.dump_scan().await
+    }
+
+    async fn scan_prefix(&self, prefix: &str) -> Result<Vec<(String, Vec<u8>)>, KvError> {
+        self.inner.scan_prefix(prefix).await
     }
 
     async fn flush(&self) -> Result<(), KvError> {
