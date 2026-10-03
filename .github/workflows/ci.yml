@@ -444,6 +444,35 @@ jobs:
           grep -qE 'test result: ok\. 1 passed' oom-classify.log \
             || { echo "::error::OOM classification gate did not run (silent skip or a failure)" >&2; exit 1; }
 
+      # MULTI-ISSUER TRUST gate (token_claims `issuer_trust` + per-`iss` JWKS discovery, the trust-axis
+      # dual of the claim transform). The token's `iss` is checked against the operator policy
+      # (explicit `allow` ∪ an anchored host-suffix) BEFORE any fetch — fail-closed, no network on an
+      # untrusted iss; the anchored suffix is a parsed-host LABEL-BOUNDARY match (never a raw
+      # `ends_with`); an OIDC `jwks_uri` host is pinned to the verified `iss` host; and the discovery
+      # fetch is SSRF-guarded (https-only, public-IP, address-pinned). Marker `MULTI-ISSUER TRUST OK`.
+      # MUTATION-VERIFIED: each `BOATRAMP_ISSUERTRUST_MUTATION` (via the `issuer-trust-gate-mutation`
+      # feature, compiled OUT of shipped builds) disables ONE invariant and MUST turn the gate RED.
+      - name: "multi-issuer trust gate (issuer policy + jwks host-pin + SSRF)"
+        run: |
+          set -eo pipefail
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-server \
+            --features handlers,oidc --lib issuer_trust_policy_discovery_and_ssrf_gates \
+            -- --nocapture 2>&1 | tee issuer-trust.log
+          grep -qE 'test result: ok\. 1 passed' issuer-trust.log \
+            || { echo "::error::multi-issuer trust gate did not run (silent skip or a failure)" >&2; exit 1; }
+          grep -q 'MULTI-ISSUER TRUST OK' issuer-trust.log \
+            || { echo "::error::multi-issuer trust gate never reached its marker (an issuer-trust regression or a skipped test)" >&2; exit 1; }
+          for mut in skip_iss_policy loosen_suffix_anchor skip_jwks_host_pin skip_ssrf_guard; do
+            if BOATRAMP_ISSUERTRUST_MUTATION="$mut" cargo-zigbuild test --target x86_64-unknown-linux-musl \
+              -p boatramp-server --features handlers,oidc,issuer-trust-gate-mutation \
+              --lib issuer_trust_policy_discovery_and_ssrf_gates > "issuer-trust-mutation-$mut.log" 2>&1; then
+              echo "::error::multi-issuer trust gate is HOLLOW — it passed under BOATRAMP_ISSUERTRUST_MUTATION=$mut (an issuer-trust invariant is not actually enforced)" >&2
+              exit 1
+            else
+              echo "issuer-trust mutation verified: $mut turns the gate RED → the invariant is load-bearing."
+            fi
+          done
+
   # SlateDB WAL-recovery HARD GATE (v0.5.5 incident: the control-plane KV was unbootable with
   # `Data error: empty SSTable` after a crash / crash-consistent snapshot froze a zero-byte tail WAL
   # object). Proves a store with such a frozen tail WAL still OPENS — the incident fix (`slatedb` 0.16
