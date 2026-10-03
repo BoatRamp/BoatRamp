@@ -824,6 +824,41 @@ jobs:
             || { echo "::error::H2 KV cancellation-heal gate did not run (silent skip/failure, or the count drifted from 2)" >&2; exit 1; }
           grep -q 'mutation_skip_conn_heal_bricks_the_next_write ... ok' kv-cancel-heal.log \
             || { echo "::error::H2 cancellation mutation gate did not run — the heal is unproven (a rename or a hollow heal)" >&2; exit 1; }
+      - name: "v0.12.5 tenant_or_base BASE-WRITE gate (write:null + target refusal)"
+        run: |
+          set -eo pipefail
+          # A `write:"null"` grant writes ONLY the `tenant_id IS NULL` base partition of a
+          # `tenant_or_base` table (shipped since v0.4.16 as `AccessMode::Null`→`ScopeMode::NullOnly`);
+          # v0.12.5 adds the TARGET-route refusal (a target carries only `B`, so a base write under it
+          # would stamp the shared baseline — a cross-boundary blast). LIVE end-to-end proof on a real
+          # libsql file (host toolchain; static-musl segfaults, as the ORM tenancy gate above):
+          cargo test -p boatramp-storage --features sql --test catalog_persistence \
+            -- --ignored --nocapture 2>&1 | tee catalog-base-write.log
+          grep -qE 'test result: ok\. 1 passed' catalog-base-write.log \
+            || { echo "::error::catalog base-write live gate did not run (silent skip or a failure)" >&2; exit 1; }
+          grep -q 'CATALOG BASE-WRITE OK' catalog-base-write.log \
+            || { echo "::error::catalog base-write gate never reached its marker (a base-write isolation regression or a skipped test)" >&2; exit 1; }
+          # The MUTATION-VERIFIED unit gate on `write_target` (fast, no DB): the clean run asserts the
+          # NULL stamp + the target refusal; then each `BOATRAMP_BASEWRITE_MUTATION` (via the
+          # `basewrite-gate-mutation` feature, compiled OUT of shipped builds) disables ONE invariant
+          # and MUST turn it RED — `leak_stamp` (a base write stamps a tenant value, not NULL) and
+          # `skip_target_guard` (drops the target refusal). A pass-under-mutation (a hollow gate) fails.
+          cargo test -p boatramp-core base_write_target_stamps_null_and_refuses_target \
+            -- --nocapture 2>&1 | tee basewrite-unit.log
+          grep -qE 'test result: ok\. 1 passed' basewrite-unit.log \
+            || { echo "::error::base-write write_target unit gate did not run (silent skip or a failure)" >&2; exit 1; }
+          grep -q 'BASE-WRITE WRITE-TARGET OK' basewrite-unit.log \
+            || { echo "::error::base-write unit gate never reached its marker" >&2; exit 1; }
+          for mut in leak_stamp skip_target_guard; do
+            if BOATRAMP_BASEWRITE_MUTATION="$mut" cargo test -p boatramp-core \
+              --features basewrite-gate-mutation base_write_target_stamps_null_and_refuses_target \
+              > "basewrite-mutation-$mut.log" 2>&1; then
+              echo "::error::base-write gate is HOLLOW — it passed under BOATRAMP_BASEWRITE_MUTATION=$mut (the NULL stamp or the target refusal is not actually enforced)" >&2
+              exit 1
+            else
+              echo "base-write mutation verified: '$mut' turns write_target RED → the invariant is load-bearing."
+            fi
+          done
       - name: Owner-gated schema-migration libsql/SQLite parity SUBSTRATE on a real embedded file
         run: |
           set -eo pipefail
