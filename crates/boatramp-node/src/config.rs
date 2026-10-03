@@ -1420,6 +1420,26 @@ pub struct HandlersConfig {
     /// timeout bounds only wall-clock; without a fuel bound a CPU-bound guest can
     /// spin for the whole window. Absent ⇒ unmetered (same as the sync default).
     pub async_max_fuel: Option<u64>,
+    /// Per-component WASM linear-memory **ceiling** for the *async* lane, in MiB —
+    /// the durable `wasi:messaging` / workflow-step lane where heavy, retryable jobs
+    /// (image decode+resize, PDF, document processing) belong. This RAISES the lane
+    /// ceiling above the 64 MiB default; a component's own `limits.memory_mb` (or the
+    /// site `max_memory_mb`) then clamps it back **down** from here — so an operator
+    /// sets the lane high enough for the heaviest consumer and each component
+    /// right-sizes itself. Absent ⇒ 64 MiB (unchanged for every existing component;
+    /// no component can raise its own memory above this operator-set ceiling). With
+    /// `[handlers] pooling` on, the shared pool is sized off the largest lane ceiling;
+    /// see the virtual-reservation note on `pooling`.
+    pub async_max_memory_mb: Option<usize>,
+    /// Per-component WASM linear-memory ceiling for the *sync* (request) lane, MiB.
+    /// Absent ⇒ 64 MiB. Same semantics as [`async_max_memory_mb`](Self::async_max_memory_mb)
+    /// (raises the lane ceiling; a component clamps down). Raising the sync lane means
+    /// many concurrent request instances can each reach this ceiling, so weigh it
+    /// against the request pool's size.
+    pub sync_max_memory_mb: Option<usize>,
+    /// Per-component WASM linear-memory ceiling for the *streaming* lane, MiB.
+    /// Absent ⇒ 64 MiB. Same semantics as [`async_max_memory_mb`](Self::async_max_memory_mb).
+    pub streaming_max_memory_mb: Option<usize>,
     /// **Relaxed messaging-publish durability** — the max number of published
     /// messages that may be acknowledged from the in-memory buffer BEFORE a durable
     /// checkpoint is forced. **Absent / `0` ⇒ strong durability (the default):**
