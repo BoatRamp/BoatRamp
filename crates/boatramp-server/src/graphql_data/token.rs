@@ -15,12 +15,14 @@
 //!   header's `alg`, so algorithm-confusion (`alg:none`, RS256↔HS256) can't downgrade it.
 //! - The host-asserted `project` claim is never sourced here, so a token can't spoof it.
 
+use base64::Engine;
 use jsonwebtoken::jwk::{AlgorithmParameters, EllipticCurve, Jwk, JwkSet};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use boatramp_core::config::HandlerGraphqlTokenClaims;
+use boatramp_core::config::{HandlerGraphqlTokenClaims, IssuerTrust, JwksDiscovery};
 
 /// A verifier for one app IdP: its signing keys (by `kid`) + the expected `iss`/`aud`.
 pub(crate) struct TokenVerifier {
@@ -138,6 +140,13 @@ async fn resolve_verifier(
     env_source: &dyn boatramp_core::env::EnvSource,
 ) -> Option<Arc<TokenVerifier>> {
     let audience = cfg.audience.as_deref();
+    // MULTI-ISSUER TRUST (`issuer_trust` + `jwks`): verify the token's `iss` against the operator
+    // policy BEFORE any fetch, then discover the JWKS per verified `iss` (SSRF-guarded, host-pinned).
+    // Takes precedence; the single-issuer fields below are the mutually-exclusive legacy form
+    // (apply-time enforced), so this branch is reached only when the operator chose the new form.
+    if let (Some(trust), Some(jwks)) = (cfg.issuer_trust.as_ref(), cfg.jwks.as_ref()) {
+        return resolve_multi_issuer(trust, jwks, audience, bearer).await;
+    }
     if let Some(env_name) = &cfg.jwks_env {
         let jwks = env_source.get(env_name)?;
         return TokenVerifier::from_jwks_json(&jwks, &cfg.issuer, audience)
@@ -145,9 +154,39 @@ async fn resolve_verifier(
             .map(Arc::new);
     }
     if let Some(url) = &cfg.jwks_url {
-        return resolve_url_verifier(url, &cfg.issuer, audience, bearer).await;
+        // Single-issuer `jwks_url` is operator-fixed (may legitimately point at an internal IdP), so
+        // it keeps its unguarded fetch — `guarded: false`. The SSRF guard applies ONLY to the
+        // per-`iss`-derived multi-issuer discovery.
+        return resolve_url_verifier(url, &cfg.issuer, audience, bearer, false).await;
     }
     None
+}
+
+/// The multi-issuer resolve path: UNVERIFIED `iss` read → policy (fail-closed, no fetch on an
+/// untrusted `iss`) → host-pinned JWKS URL → SSRF-guarded fetch → verifier pinned to that same
+/// `iss` (so the final signature check binds the token's `iss` to the discovered keys).
+async fn resolve_multi_issuer(
+    trust: &IssuerTrust,
+    jwks: &JwksDiscovery,
+    audience: Option<&str>,
+    bearer: &str,
+) -> Option<Arc<TokenVerifier>> {
+    // The payload `iss`, read WITHOUT signature verification — used ONLY to test the policy and
+    // derive the fetch URL. The same `iss` is re-pinned into `set_issuer`/`from_jwks_json` below, so
+    // a forged `iss` naming a trusted org the attacker doesn't control fetches that org's REAL keys
+    // and then fails the signature check.
+    let iss = unverified_iss(bearer)?;
+    if !issuer_trusted(&iss, trust) {
+        tracing::warn!(
+            outcome = "iss_not_trusted",
+            allow = ?trust.allow,
+            suffix = ?trust.suffix,
+            "multi-issuer token rejected: iss not in the trust policy (no JWKS fetch attempted)"
+        );
+        return None;
+    }
+    let url = derive_jwks_url(&iss, jwks).await?;
+    resolve_url_verifier(&url, &iss, audience, bearer, true).await
 }
 
 /// The process-wide JWKS-URL verifier cache (public keys, keyed by URL).
@@ -161,6 +200,7 @@ async fn resolve_url_verifier(
     issuer: &str,
     audience: Option<&str>,
     bearer: &str,
+    guarded: bool,
 ) -> Option<Arc<TokenVerifier>> {
     let token_kid = TokenVerifier::token_kid(bearer);
     // Fast path: a cached verifier that already knows this token's key.
@@ -169,9 +209,213 @@ async fn resolve_url_verifier(
     {
         return Some(cached);
     }
-    // Cold, or the IdP rotated in a new `kid`: re-fetch (operator-configured URL, so not a
-    // request-controlled fetch).
-    let jwks = reqwest::Client::new()
+    // Cold, or the IdP rotated in a new `kid`: re-fetch. The single-issuer path uses an operator-
+    // fixed URL (unguarded); the multi-issuer path derives the URL from a verified `iss`, so it goes
+    // through the SSRF guard (`guarded`).
+    let jwks = if guarded {
+        match ssrf_guarded_get(url).await {
+            Some(body) => body,
+            None => {
+                tracing::warn!(
+                    outcome = "jwks_discovery_failed",
+                    url = %url,
+                    "multi-issuer JWKS fetch failed or was blocked by the SSRF guard"
+                );
+                return None;
+            }
+        }
+    } else {
+        reqwest::Client::new()
+            .get(url)
+            .send()
+            .await
+            .ok()?
+            .error_for_status()
+            .ok()?
+            .text()
+            .await
+            .ok()?
+    };
+    let verifier = match TokenVerifier::from_jwks_json(&jwks, issuer, audience) {
+        Ok(v) => Arc::new(v),
+        Err(_) => {
+            if guarded {
+                tracing::warn!(
+                    outcome = "jwks_no_usable_key",
+                    url = %url,
+                    "multi-issuer JWKS held no usable signing key"
+                );
+            }
+            return None;
+        }
+    };
+    if let Ok(mut cache) = jwks_cache().lock() {
+        cache.insert(url.to_string(), verifier.clone());
+    }
+    Some(verifier)
+}
+
+/// The active issuer-trust mutation (anti-hollow gate), or `None`. Present ONLY under `cfg(test)`
+/// or the `issuer-trust-gate-mutation` feature; a shipped build has neither, so the policy, the
+/// anchored-suffix match, the jwks-uri host-pin, and the SSRF guard below are all unconditional and
+/// this is a dead `None`. Not a backdoor — it only exposes a test env var.
+#[cfg(any(test, feature = "issuer-trust-gate-mutation"))]
+fn issuertrust_mutation() -> Option<String> {
+    std::env::var("BOATRAMP_ISSUERTRUST_MUTATION").ok()
+}
+#[cfg(not(any(test, feature = "issuer-trust-gate-mutation")))]
+#[inline]
+fn issuertrust_mutation() -> Option<String> {
+    None
+}
+
+/// Read the `iss` from the token payload WITHOUT verifying the signature (base64url-decode the
+/// claims segment). Used only to test the trust policy and derive the fetch URL; the signature is
+/// still checked afterward with `iss` pinned to this value.
+fn unverified_iss(bearer: &str) -> Option<String> {
+    let payload = bearer.split('.').nth(1)?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .ok()?;
+    let claims: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    claims.get("iss")?.as_str().map(str::to_string)
+}
+
+/// Parse an issuer URL and return its canonical host, or `None` if it is not a plain `https://`
+/// URL with a bare host (reject non-https, any userinfo, and an explicit non-default port). This is
+/// the authoritative host extraction the anchored-suffix policy matches on — never a raw-string op.
+fn issuer_host(iss: &str) -> Option<String> {
+    let u = reqwest::Url::parse(iss).ok()?;
+    if u.scheme() != "https" {
+        return None;
+    }
+    if !u.username().is_empty() || u.password().is_some() {
+        return None; // reject `user@host` userinfo tricks
+    }
+    if u.port().is_some() {
+        return None; // reject an explicit non-default port
+    }
+    let host = u.host_str()?;
+    Some(host.trim_end_matches('.').to_ascii_lowercase())
+}
+
+/// Whether `iss` is trusted by the policy: an exact string in `allow`, OR its parsed host under the
+/// anchored `suffix` at a label boundary. Checked BEFORE any network fetch (fail-closed).
+fn issuer_trusted(iss: &str, trust: &IssuerTrust) -> bool {
+    // MUTATION SEAM (gate `skip_iss_policy`): short-circuit to "trusted" — an `iss` outside the
+    // policy then resolves a tenant, turning the gate RED.
+    if issuertrust_mutation().as_deref() == Some("skip_iss_policy") {
+        return true;
+    }
+    if trust.allow.iter().any(|a| a == iss) {
+        return true;
+    }
+    if let (Some(sfx), Some(host)) = (trust.suffix.as_deref(), issuer_host(iss)) {
+        let bare = sfx
+            .trim_start_matches('.')
+            .trim_end_matches('.')
+            .to_ascii_lowercase();
+        // MUTATION SEAM (gate `loosen_suffix_anchor`): a naive substring `ends_with` with NO label
+        // boundary — `evil-my.salesforce.com` then passes `.my.salesforce.com`, turning the gate RED.
+        let matched = if issuertrust_mutation().as_deref() == Some("loosen_suffix_anchor") {
+            host.ends_with(&bare)
+        } else {
+            boatramp_core::config::host_matches_suffix(&host, &bare)
+        };
+        if matched {
+            return true;
+        }
+    }
+    false
+}
+
+/// Derive the JWKS URL for a VERIFIED-trusted `iss`, host-pinned to the `iss` host. `template` is
+/// host-pinned by construction (`{iss}/id/keys`); `discover: "oidc"` fetches the issuer's
+/// `.well-known/openid-configuration` and pins its `jwks_uri` host to the `iss` host.
+async fn derive_jwks_url(iss: &str, jwks: &JwksDiscovery) -> Option<String> {
+    if let Some(template) = &jwks.template {
+        return Some(template.replace("{iss}", iss.trim_end_matches('/')));
+    }
+    // OIDC discovery (`discover: "oidc"`).
+    let discovery_url = format!(
+        "{}/.well-known/openid-configuration",
+        iss.trim_end_matches('/')
+    );
+    let Some(doc) = ssrf_guarded_get(&discovery_url).await else {
+        tracing::warn!(
+            outcome = "jwks_discovery_failed",
+            url = %discovery_url,
+            "OIDC discovery fetch failed or was blocked by the SSRF guard"
+        );
+        return None;
+    };
+    let parsed: serde_json::Value = serde_json::from_str(&doc).ok()?;
+    let jwks_uri = parsed.get("jwks_uri")?.as_str()?.to_string();
+    if !jwks_uri_host_pinned(&jwks_uri, iss) {
+        tracing::warn!(
+            outcome = "jwks_discovery_failed",
+            iss_host = ?issuer_host(iss),
+            jwks_uri = %jwks_uri,
+            "OIDC jwks_uri host is not pinned to the iss host — refusing the off-issuer fetch"
+        );
+        return None;
+    }
+    Some(jwks_uri)
+}
+
+/// Whether a discovery doc's `jwks_uri` host is pinned to the verified `iss` host (a trusted-but-
+/// malicious org controls its own discovery doc, so the advertised `jwks_uri` must not point off the
+/// issuer). Both are parsed with [`issuer_host`], so non-https / userinfo / off-host all fail-closed.
+fn jwks_uri_host_pinned(jwks_uri: &str, iss: &str) -> bool {
+    // MUTATION SEAM (gate `skip_jwks_host_pin`): drop the pin — an off-issuer `jwks_uri` then passes,
+    // turning the gate RED.
+    if issuertrust_mutation().as_deref() == Some("skip_jwks_host_pin") {
+        return true;
+    }
+    match (issuer_host(jwks_uri), issuer_host(iss)) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// The SSRF guard DECISION (no fetch): parse the URL, require `https`, reject userinfo, resolve
+/// every address and require it globally routable ([`is_global_ip`](boatramp_core::access::is_global_ip)),
+/// and return one resolved address to PIN (so a DNS rebind can't swap in a private target between
+/// resolve and connect). `None` ⇒ refused. Split out from the fetch so it is deterministically
+/// testable (an IP-literal URL needs no network). Mirrors [`crate::proxy`]'s target guard.
+async fn ssrf_resolve_pin(url: &str) -> Option<(String, SocketAddr)> {
+    let parsed = reqwest::Url::parse(url).ok()?;
+    if parsed.scheme() != "https" {
+        return None;
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return None;
+    }
+    let host = parsed.host_str()?.to_string();
+    let port = parsed.port_or_known_default().unwrap_or(443);
+    let skip = issuertrust_mutation().as_deref() == Some("skip_ssrf_guard");
+    let mut pinned: Option<SocketAddr> = None;
+    for addr in tokio::net::lookup_host((host.as_str(), port)).await.ok()? {
+        // MUTATION SEAM (gate `skip_ssrf_guard`): drop the public-IP requirement — a URL resolving
+        // to a private/loopback address then pins (would be fetched), turning the gate RED.
+        if !skip && !boatramp_core::access::is_global_ip(addr.ip()) {
+            return None;
+        }
+        pinned.get_or_insert(addr);
+    }
+    pinned.map(|addr| (host, addr))
+}
+
+/// An HTTPS GET fenced by [`ssrf_resolve_pin`]: the resolved public address is pinned on the client,
+/// and `https_only` is enforced. Returns the body, or `None` if blocked/failed.
+async fn ssrf_guarded_get(url: &str) -> Option<String> {
+    let (host, addr) = ssrf_resolve_pin(url).await?;
+    let client = reqwest::Client::builder()
+        .https_only(true)
+        .resolve(&host, addr)
+        .build()
+        .ok()?;
+    client
         .get(url)
         .send()
         .await
@@ -180,12 +424,7 @@ async fn resolve_url_verifier(
         .ok()?
         .text()
         .await
-        .ok()?;
-    let verifier = Arc::new(TokenVerifier::from_jwks_json(&jwks, issuer, audience).ok()?);
-    if let Ok(mut cache) = jwks_cache().lock() {
-        cache.insert(url.to_string(), verifier.clone());
-    }
-    Some(verifier)
+        .ok()
 }
 
 #[cfg(test)]
@@ -349,5 +588,101 @@ mod tests {
             serde_json::json!({ "iss": ISS, "exp": far_future(), "tid": "acme" }),
         );
         assert!(v.verify(&forged).is_none());
+    }
+
+    // ---- Multi-issuer trust: the anti-hollow gate (mutation-verified) ----
+
+    fn trust() -> IssuerTrust {
+        IssuerTrust {
+            allow: vec!["https://acme.my.salesforce.com".to_string()],
+            suffix: Some(".my.salesforce.com".to_string()),
+        }
+    }
+
+    /// GATE (multi-issuer trust) — the four load-bearing invariants of the trust/discovery path,
+    /// asserted as SECURE in the clean run. Each `BOATRAMP_ISSUERTRUST_MUTATION` (armed by the CI
+    /// loop with `--features issuer-trust-gate-mutation`) disables ONE invariant and MUST turn this
+    /// RED: `skip_iss_policy` (an untrusted iss becomes trusted), `loosen_suffix_anchor`
+    /// (`evil-my.salesforce.com` passes the suffix), `skip_jwks_host_pin` (an off-issuer jwks_uri
+    /// passes the pin), `skip_ssrf_guard` (a loopback target resolves/pins). Marker
+    /// `MULTI-ISSUER TRUST OK`. The test never sets the env itself (the loop does), so it is race-free.
+    #[tokio::test]
+    async fn issuer_trust_policy_discovery_and_ssrf_gates() {
+        let t = trust();
+
+        // (1) iss policy: allow (exact) ∪ suffix (label boundary) — and NOTHING else.
+        assert!(
+            issuer_trusted("https://acme.my.salesforce.com", &t),
+            "an exact `allow` issuer is trusted"
+        );
+        assert!(
+            issuer_trusted("https://foo.my.salesforce.com", &t),
+            "a sub-label under the anchored suffix is trusted"
+        );
+        assert!(
+            !issuer_trusted("https://evil.com", &t),
+            "an issuer outside allow and the suffix is NOT trusted (skip_iss_policy → RED)"
+        );
+        // (2) the anchored suffix refutes the classic bypasses.
+        for bad in [
+            "https://evil-my.salesforce.com", // no label boundary (loosen_suffix_anchor → RED)
+            "https://a.my.salesforce.com@evil.com", // userinfo trick → host is evil.com
+            "https://evil.com/.my.salesforce.com", // suffix in the path → host is evil.com
+            "http://foo.my.salesforce.com",   // non-https
+            "https://foo.my.salesforce.com:8443", // explicit non-default port
+            "https://foo.evil.com",           // unrelated host
+        ] {
+            assert!(!issuer_trusted(bad, &t), "bypass must be refused: {bad}");
+        }
+
+        // (3) jwks_uri host-pin: same host as iss passes, off-host fails.
+        assert!(
+            jwks_uri_host_pinned(
+                "https://acme.my.salesforce.com/id/keys",
+                "https://acme.my.salesforce.com"
+            ),
+            "an on-issuer jwks_uri is pinned"
+        );
+        assert!(
+            !jwks_uri_host_pinned("https://evil.com/keys", "https://acme.my.salesforce.com"),
+            "an off-issuer jwks_uri is refused (skip_jwks_host_pin → RED)"
+        );
+
+        // (4) SSRF guard decision (no network — IP-literal/loopback resolve locally): a private or
+        // loopback or non-https or userinfo target is refused; a public IP-literal pins.
+        assert!(
+            ssrf_resolve_pin("https://127.0.0.1/x").await.is_none(),
+            "a loopback target is refused (skip_ssrf_guard → RED)"
+        );
+        assert!(
+            ssrf_resolve_pin("https://10.0.0.1/x").await.is_none(),
+            "a private target is refused"
+        );
+        assert!(
+            ssrf_resolve_pin("http://1.1.1.1/x").await.is_none(),
+            "a non-https target is refused"
+        );
+        assert!(
+            ssrf_resolve_pin("https://1.1.1.1/x").await.is_some(),
+            "a public target resolves + pins"
+        );
+
+        println!("MULTI-ISSUER TRUST OK");
+    }
+
+    /// The unverified-`iss` read (payload only), used to gate the policy before signature.
+    #[test]
+    fn unverified_iss_reads_the_payload_issuer() {
+        // iss=https://acme.my.salesforce.com, unsigned (alg=none-style) — we only read the payload.
+        let token = hs256_token(
+            b"irrelevant-secret-not-checked-here",
+            "k1",
+            serde_json::json!({ "iss": "https://acme.my.salesforce.com", "sub": "x" }),
+        );
+        assert_eq!(
+            unverified_iss(&token).as_deref(),
+            Some("https://acme.my.salesforce.com")
+        );
+        assert_eq!(unverified_iss("not-a-jwt").as_deref(), None);
     }
 }

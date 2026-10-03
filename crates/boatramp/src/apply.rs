@@ -137,6 +137,15 @@ pub enum Error {
         #[source]
         source: boatramp_core::ConfigError,
     },
+    /// A `token_claims` (function or site GDC) failed its apply-time check — the single-issuer and
+    /// multi-issuer (`issuer_trust`/`jwks`) forms are mutually exclusive, and the multi-issuer form
+    /// needs a non-empty, well-formed policy + exactly one `jwks` discovery rule.
+    #[error("{scope}: token_claims: {source}")]
+    TokenClaims {
+        scope: String,
+        #[source]
+        source: boatramp_core::ConfigError,
+    },
     /// A control-plane request failed (the `connect`/resolve path).
     #[error(transparent)]
     Client(#[from] crate::client::ClientError),
@@ -583,6 +592,7 @@ impl ApplyManifest {
         };
         manifest.compile_check_sites()?;
         manifest.check_tenancy_sources()?;
+        manifest.check_token_claims()?;
         Ok(manifest)
     }
 
@@ -600,6 +610,37 @@ impl ApplyManifest {
                 serde_json::from_str(text).map_err(|source| Error::JsonStrictParse { source })
             }
         }
+    }
+
+    /// Validate every `token_claims` (a function's, and a site's GDC `claims_from_token`) at apply:
+    /// the single-issuer and multi-issuer (`issuer_trust`/`jwks`) forms are mutually exclusive, and
+    /// the multi-issuer form needs a non-empty, well-formed policy + exactly one `jwks` rule. A loud
+    /// error here, not a silent per-request deny at serve time.
+    fn check_token_claims(&self) -> Result<()> {
+        for f in &self.functions {
+            if let Some(tc) = &f.token_claims {
+                tc.validate().map_err(|source| Error::TokenClaims {
+                    scope: format!("function {}", f.name),
+                    source,
+                })?;
+            }
+        }
+        for site in &self.sites {
+            if let Some(tc) = site
+                .config
+                .as_ref()
+                .and_then(|c| c.handlers.as_ref())
+                .and_then(|h| h.graphql.as_ref())
+                .and_then(|g| g.data.as_ref())
+                .and_then(|d| d.claims_from_token.as_ref())
+            {
+                tc.validate().map_err(|source| Error::TokenClaims {
+                    scope: format!("site {}", site.name),
+                    source,
+                })?;
+            }
+        }
+        Ok(())
     }
 
     /// Compile-check every site's `routing` (route/cron patterns).

@@ -3038,6 +3038,8 @@ mod gap3_tests {
             jwks_url: None,
             audience: None,
             token_persona_claim: None,
+            issuer_trust: None,
+            jwks: None,
         };
 
         // The fleet signer that seals + verifies the durable context (deterministic test key).

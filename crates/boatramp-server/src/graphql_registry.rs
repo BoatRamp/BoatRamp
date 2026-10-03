@@ -73,6 +73,12 @@ fn backend_prefix(project: &str) -> String {
 /// How a registered subgraph's fetches are resolved: a wasm **function** (the default), or
 /// the **SQL** data connector reading a managed database. Persisted as JSON under
 /// `graphql/{project}/subgraph-backend/{name}`.
+// The `Sql` variant inherently carries the full `HandlerGraphqlDataConfig` (which the v0.12.6
+// multi-issuer-trust fields grew); the registry holds only a handful of these (one per subgraph,
+// deserialized from KV — not a hot path or a large collection), so the per-instance padding the
+// lint warns about is immaterial, and boxing the config would add pointless indirection to a
+// config-registry enum. Suppress rather than box.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub(crate) enum SubgraphBackendSpec {
