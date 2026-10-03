@@ -5,6 +5,33 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.12.7] - 2026-10-03
+
+Bug fix (correctness + project isolation): a `#[consumer]`'s / cron's `wasi:blobstore` binding scope
+and plain-topic namespace were the BARE site name, while the HTTP-handler and function lanes use the
+PROJECT-QUALIFIED scope. On a non-default project this meant a consumer addressed an empty,
+cross-project-colliding `hblob/{site}/…` — it could not read the blobs its own handlers wrote, and its
+plain-topic delivery mismatched the (qualified) producer. Host-only; no WIT/shim change.
+
+### Fixed
+
+- **Consumer/cron binding scope is now project-qualified**, identical to the handler and function
+  lanes (`project.qualified(...)`) — so a consumer's `wasi:blobstore` (`hblob/{scope}/…`) and its
+  plain-topic namespace resolve to the SAME namespace this project's handlers use, and are isolated
+  across projects that share a site name. Covers the current deployment, each background alias, and the
+  cron path (one chokepoint). `qualified` is a no-op for the default project ⇒ byte-identical there.
+  Within-container `{tenant}` confinement is untouched (only the `{scope}` qualifier changes). The
+  plain-topic change is a repair (non-default delivery was already broken producer-qualified vs
+  consumer-bare); `bus:` topics were already project-qualified and are unaffected. Incidentally also
+  separates the per-consumer concurrency-gate key across same-named sites in different projects.
+
+### Security / correctness
+
+- Mutation-verified anti-hollow gate (merge-gate-wired): `consumer_scope_is_project_qualified_and_isolated`
+  asserts the consumer scope equals the handler's qualified scope + the default-project no-op +
+  cross-project distinctness; RED under `BOATRAMP_CONSUMERSCOPE_MUTATION=bare_scope`. Independent
+  Security review: SHIP (clean, regression-free isolation fix).
+
 ## [0.12.6] - 2026-10-03
 
 Multi-issuer trust on `token_claims`: a route may now verify a token against a trusted-issuer POLICY
