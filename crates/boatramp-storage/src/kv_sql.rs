@@ -1627,6 +1627,7 @@ fn now_ts() -> i64 {
 #[cfg(all(test, feature = "sql"))]
 mod sqlite_tests {
     use super::*;
+    use serial_test::serial;
 
     impl SqlKv {
         /// The pragmas the WRITE path actually opens its connections with — `(journal_mode,
@@ -1767,6 +1768,7 @@ mod sqlite_tests {
     /// self-heal). Paired with the `skip_conn_heal` mutation below, which proves the heal is
     /// load-bearing.
     #[tokio::test]
+    #[serial]
     async fn sqlkv_recovers_from_a_cancelled_write_leaving_an_open_txn() {
         let (_dir, path) = temp_db("cancel-heal");
         let kv = SqlKv::open_sqlite_local(&path).await.unwrap();
@@ -1783,6 +1785,7 @@ mod sqlite_tests {
     /// The `skip_conn_heal` MUTATION makes the gate RED: with the heal removed, the zombie
     /// transaction survives and the next write fails to `BEGIN` ("within a transaction").
     #[tokio::test]
+    #[serial]
     async fn mutation_skip_conn_heal_bricks_the_next_write() {
         let (_dir, path) = temp_db("cancel-heal-mut");
         let kv = SqlKv::open_sqlite_local(&path).await.unwrap();
