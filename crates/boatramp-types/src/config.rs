@@ -1271,6 +1271,12 @@ pub struct IssuerTrust {
     /// orgs without enumerating them. Matched at a label boundary over the *parsed* `https://` host
     /// (never a raw-string suffix): `.x.com` matches `a.x.com` / `a.b.x.com`, never `evilx.com`,
     /// `https://a.x.com@evil.com`, or a non-`https` scheme.
+    ///
+    /// **Operator warning:** scope the suffix to a registrar-controlled vendor domain you trust
+    /// (e.g. `.my.salesforce.com`), NOT a *public suffix* where anyone can register a sub-label
+    /// (`.co.uk`, `.github.io`, `.herokuapp.com`, …). The ≥2-label apply check rejects a bare TLD but
+    /// cannot know the public-suffix list — a too-broad suffix would trust any tenant's self-hosted
+    /// IdP under it. Prefer the explicit `allow` list when in doubt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub suffix: Option<String>,
 }
@@ -1347,10 +1353,14 @@ impl HandlerGraphqlTokenClaims {
                     "token_claims.jwks.discover must be \"oidc\" (got {other:?})"
                 )));
             }
-            (None, Some(t)) if t.contains("{iss}") => {}
+            // Require `{iss}` at the AUTHORITY position (the template must START with it), so the
+            // resolved URL's host is always the verified `iss` host — rejects e.g.
+            // `https://evil/?iss={iss}`, where `{iss}` sits in a query and the host is attacker-chosen.
+            (None, Some(t)) if t.starts_with("{iss}") => {}
             (None, Some(t)) => {
                 return Err(ConfigError::parse(format!(
-                    "token_claims.jwks.template must contain the `{{iss}}` placeholder (got {t:?})"
+                    "token_claims.jwks.template must START with the `{{iss}}` placeholder (so the \
+                     JWKS host is the issuer host), e.g. \"{{iss}}/id/keys\" (got {t:?})"
                 )));
             }
             (None, None) => {
