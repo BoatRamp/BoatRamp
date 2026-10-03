@@ -85,13 +85,21 @@ impl CompiledExtract {
 /// Process-wide compiled-pattern cache. A `RwLock<HashMap>` (not a `Mutex<LruCache>`): the hot auth
 /// path is a **concurrent read** (compiled patterns are Arc-cheap clones), and the exclusive write
 /// lock is taken only on the first compile of a given pattern (review finding C2 — the LRU's
-/// `&mut`-get serialized every token-transform resolution node-wide). No eviction is needed: patterns
-/// come from deploy config and are bounded in practice (one per token source), the same assumption
-/// `matcher.rs`'s route-pattern cache makes.
+/// `&mut`-get serialized every token-transform resolution node-wide). Growth is bounded by
+/// [`EXTRACT_CACHE_CAP`] via a generation-clear on the write path: the key space is operator-config
+/// patterns (one per token source), so the cap is effectively never reached in normal operation — it
+/// only caps pathological config churn over the process lifetime. This keeps the same bound
+/// `matcher.rs`'s route-pattern cache enforces, but as a flat map so a cache hit needs only a shared
+/// read lock (not the per-read `&mut` an LRU's recency update forces).
 fn extract_cache() -> &'static RwLock<HashMap<String, CompiledExtract>> {
     static CACHE: OnceLock<RwLock<HashMap<String, CompiledExtract>>> = OnceLock::new();
     CACHE.get_or_init(|| RwLock::new(HashMap::new()))
 }
+
+/// Upper bound on distinct cached compiled patterns, mirroring `matcher.rs`'s `PATTERN_CACHE_CAP`.
+/// The key space is deploy-config patterns (one per token source), so this is a safety ceiling on
+/// process-lifetime config churn, not a working-set limit — it is effectively never reached.
+const EXTRACT_CACHE_CAP: usize = 2048;
 
 /// Compile an [`ClaimExtract`], memoizing the result. A valid pattern compiles at most once per
 /// process (the auth hot path recompiles nothing, and takes only a concurrent READ lock on the cache
@@ -110,13 +118,18 @@ pub fn compile(extract: &ClaimExtract) -> Result<CompiledExtract, ConfigError> {
     if let Some(cached) = extract_cache().read().unwrap().get(&cache_key) {
         return Ok(cached.clone());
     }
-    // First compile of this pattern: build it, then take the write lock to insert.
+    // First compile of this pattern: build it, then take the write lock to insert. Bound worst-case
+    // growth with a generation-clear — if the cap is reached and this key is new, drop the cache and
+    // start fresh (correct; just a re-compile on the next miss). The key space is config-bounded, so
+    // this is a safety valve for pathological churn, effectively never hit in normal operation.
     let compiled = compile_uncached(extract)?;
-    extract_cache()
-        .write()
-        .unwrap()
-        .entry(cache_key)
-        .or_insert_with(|| compiled.clone());
+    {
+        let mut cache = extract_cache().write().unwrap();
+        if cache.len() >= EXTRACT_CACHE_CAP && !cache.contains_key(&cache_key) {
+            cache.clear();
+        }
+        cache.entry(cache_key).or_insert_with(|| compiled.clone());
+    }
     Ok(compiled)
 }
 
