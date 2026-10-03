@@ -780,8 +780,13 @@ pub enum ResolvedScope {
     },
     /// A base-inclusive table ([`TableScope::TenantOrBase`]): a READ confines to
     /// `(tenant = <resolved> OR tenant IS NULL)` (the NULL rows are shared base, folded in on both
-    /// the own and target axes regardless of the field mode); a WRITE stamps `tenant = <resolved>`
-    /// exactly like [`Column`](ResolvedScope::Column) (never a NULL-base row).
+    /// the own and target axes regardless of the field mode). A WRITE follows the write-axis mode,
+    /// exactly like [`Column`](ResolvedScope::Column): `own`/`own_or_null` stamp `tenant = <resolved>`
+    /// (the caller's own partition — the common case), while the explicit, deny-by-default
+    /// `write: "null"` grant (`NullOnly`) stamps `tenant = NULL` to write the shared baseline
+    /// (structurally confined to `tenant_id IS NULL`, so it can touch no tenant's own row). A TARGET
+    /// scope is refused the base-write branch (it would stamp the shared baseline under the target
+    /// tenant `B`).
     TenantOrBase {
         /// The tenant column (`default_tenant_key`); its `NULL` rows are the shared base.
         tenant: String,

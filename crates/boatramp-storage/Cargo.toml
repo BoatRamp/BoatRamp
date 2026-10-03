@@ -115,6 +115,12 @@ shared-mode-gate-mutation = ["boatramp-core/shared-mode-gate-mutation"]
 # proving the screen is load-bearing. Pass-through to `boatramp-core/claim-transform-gate-mutation`.
 # Compiled OUT of every real build.
 claim-transform-gate-mutation = ["boatramp-core/claim-transform-gate-mutation"]
+# The `catalog_persistence` base-write gate lane. With this ON and
+# `BOATRAMP_BASEWRITE_MUTATION=leak_stamp|skip_target_guard`, one base-write invariant in
+# `Scope::write_target` is disabled, so the `catalog_persistence` gate goes RED — proving the NULL
+# stamp + the target-route refusal are load-bearing. Pass-through to
+# `boatramp-core/basewrite-gate-mutation`. Compiled OUT of every real build.
+basewrite-gate-mutation = ["boatramp-core/basewrite-gate-mutation"]
 
 [dependencies]
 boatramp-core.workspace = true
