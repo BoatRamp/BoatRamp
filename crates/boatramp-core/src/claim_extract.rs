@@ -26,10 +26,9 @@
 //! Everything statically decidable is checked at apply ([`validate_extract`], [`validate_namespace`])
 //! so a misconfiguration is a loud 422, never a silent runtime deny.
 
-use std::num::NonZeroUsize;
-use std::sync::{Mutex, OnceLock};
+use std::collections::HashMap;
+use std::sync::{OnceLock, RwLock};
 
-use lru::LruCache;
 use regex::{Regex, RegexBuilder};
 use serde_json::Value;
 
@@ -53,10 +52,6 @@ const MAX_CLAIM_LEN: usize = 8 * 1024;
 const REGEX_SIZE_LIMIT: usize = 64 * 1024;
 /// Compiled-regex lazy-DFA cache ceiling (bytes).
 const REGEX_DFA_SIZE_LIMIT: usize = 64 * 1024;
-
-/// Bound on the process-wide compiled-extract cache (patterns come from deploy configs — bounded in
-/// practice; the LRU just caps churn). Mirrors [`crate::matcher`]'s pattern cache.
-const EXTRACT_CACHE_CAP: usize = 1024;
 
 /// Whether `c` is admissible in an extracted tenant span: the ASCII key-safe alphabet **excluding**
 /// the [`NAMESPACE_DELIMITER`] (`:`) and every character [`crate::project::validate_key_segment`]
@@ -87,17 +82,20 @@ impl CompiledExtract {
     }
 }
 
-fn extract_cache() -> &'static Mutex<LruCache<String, CompiledExtract>> {
-    static CACHE: OnceLock<Mutex<LruCache<String, CompiledExtract>>> = OnceLock::new();
-    CACHE.get_or_init(|| {
-        Mutex::new(LruCache::new(
-            NonZeroUsize::new(EXTRACT_CACHE_CAP).expect("cap > 0"),
-        ))
-    })
+/// Process-wide compiled-pattern cache. A `RwLock<HashMap>` (not a `Mutex<LruCache>`): the hot auth
+/// path is a **concurrent read** (compiled patterns are Arc-cheap clones), and the exclusive write
+/// lock is taken only on the first compile of a given pattern (review finding C2 — the LRU's
+/// `&mut`-get serialized every token-transform resolution node-wide). No eviction is needed: patterns
+/// come from deploy config and are bounded in practice (one per token source), the same assumption
+/// `matcher.rs`'s route-pattern cache makes.
+fn extract_cache() -> &'static RwLock<HashMap<String, CompiledExtract>> {
+    static CACHE: OnceLock<RwLock<HashMap<String, CompiledExtract>>> = OnceLock::new();
+    CACHE.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
 /// Compile an [`ClaimExtract`], memoizing the result. A valid pattern compiles at most once per
-/// process (the auth hot path recompiles nothing); an invalid one errors and is not cached.
+/// process (the auth hot path recompiles nothing, and takes only a concurrent READ lock on the cache
+/// hit); an invalid one errors and is not cached.
 pub fn compile(extract: &ClaimExtract) -> Result<CompiledExtract, ConfigError> {
     // The syntax tag keys the cache so a template and a regex with the same text never alias.
     let cache_key = format!(
@@ -108,14 +106,17 @@ pub fn compile(extract: &ClaimExtract) -> Result<CompiledExtract, ConfigError> {
         },
         extract.pattern
     );
-    if let Some(cached) = extract_cache().lock().unwrap().get(&cache_key) {
+    // Hot path: a concurrent read lock; a cache hit clones the Arc-backed matcher and returns.
+    if let Some(cached) = extract_cache().read().unwrap().get(&cache_key) {
         return Ok(cached.clone());
     }
+    // First compile of this pattern: build it, then take the write lock to insert.
     let compiled = compile_uncached(extract)?;
     extract_cache()
-        .lock()
+        .write()
         .unwrap()
-        .put(cache_key, compiled.clone());
+        .entry(cache_key)
+        .or_insert_with(|| compiled.clone());
     Ok(compiled)
 }
 
