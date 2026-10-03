@@ -5,6 +5,60 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.12.4] - 2026-10-03
+
+Async-lane hardening (two construens requests) plus a workspace-wide Rust-idiomaticity/perf review.
+The async lane — where durable, retryable, no-client-connected work runs — gains a raisable per-lane
+memory ceiling and a per-consumer concurrency budget, so a memory-heavy worker (image decode/resize)
+and a bursty one (thumbnail backfill) can each be sized without starving the others. A follow-up
+review then swept the round's code for redundant per-operation work on hot paths and fixed what it
+found. Host/node only; no guest-facing (WIT) change, so no shim rev.
+
+### Added
+
+- **Raisable per-lane WASM linear-memory ceiling** (construens
+  `boatramp-async-lane-memory-budget-request`). New `[handlers]` `async_max_memory_mb` /
+  `sync_max_memory_mb` / `streaming_max_memory_mb` raise a lane's per-component memory ceiling above
+  the 64 MiB default. A component right-sizes itself *down* with its own `limits.memory_mb` / site
+  `max_memory_mb`; a component with neither inherits the (raised) lane ceiling. A per-component value
+  above the ceiling still clamps to it — fail-closed, operator-gated; no component can self-raise.
+  Default host unchanged (64 MiB everywhere). With `pooling`, the allocator sizes its virtual
+  reservation off the max-of-lanes ceiling × summed lane concurrency and fails loudly if it can't be
+  reserved (never a silent first-invocation OOM); without pooling there is no up-front reservation.
+- **Per-consumer async concurrency override** (construens
+  `boatramp-per-consumer-concurrency-request`). A `wasi:messaging` consumer may declare
+  `max_concurrency` to cap its own in-flight messages at `min(cap, async_max_concurrency)`, so one
+  consumer's burst can't occupy the whole async lane and starve the others. Unset ⇒ shares the lane
+  as before. Pure admission control — ordering, at-least-once, and retry/DLQ semantics unchanged.
+- **`out-of-memory` terminal outcome.** A guest that exhausts its linear-memory ceiling is now
+  classified `OutOfMemory` (distinct from an opaque `trap`), so the async-lane DLQ reason and the
+  `/metrics` `boatramp_handler_invocations_total{outcome="out-of-memory"}` counter tell memory
+  exhaustion from a logic crash.
+
+### Performance
+
+- Control-plane **SQL KV reads run in autocommit** (no per-read `BEGIN`/`COMMIT` round-trip) on
+  Postgres/MySQL; writes keep full transactions.
+- **`KvStore::scan_prefix`** returns keys+values in one scan; the shared-mode live-member count uses
+  it instead of a list-then-get-per-key N+1 (one round-trip, not one per member).
+- **SQLite SQL-KV caches one PRAGMA-tuned connection** instead of reconnecting + re-running PRAGMAs
+  per op; a cancelled write's transaction is healed on the next acquire so the shared connection can
+  never be left mid-transaction.
+- **Claim-transform compile cache** moved to `RwLock<HashMap>` (concurrent reads on the auth hot
+  path, exclusive lock only on first compile) with a generation-clear bound.
+
+### Security / correctness
+
+- The two new lane clamps are mutation-verified anti-hollow gates: a per-invocation memory override
+  may only LOWER a lane ceiling, and a per-consumer cap is floored to the lane budget — each goes RED
+  under a mutation that removes the clamp.
+- The SQLite connection-cache change closes a cancellation hazard (a dropped write future could have
+  left the shared connection mid-transaction and bricked later control-plane writes) — healed on
+  acquire, with a mutation gate proving the heal is load-bearing.
+- No tenancy/isolation change: the autocommit reads touch only host-owned control-plane keys and keep
+  full parameter binding (no injection); the `scan_prefix` SQL override is a bound half-open key range,
+  not a `LIKE` form.
+
 ## [0.12.3] - 2026-10-02
 
 Additive — close the `handlers.bindings.sql` env-mapping gap so a file-less (fly `[env]`-only) fleet can
