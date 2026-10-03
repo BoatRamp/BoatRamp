@@ -1903,6 +1903,26 @@ mod tests {
             );
         }
 
+        /// A component with NO memory cap — the scheduler passes `usize::MAX` — inherits the lane
+        /// ceiling (the whole point of raising `*_max_memory_mb`: an uncapped component on the lane
+        /// gets the headroom without restating it). `min(MAX, ceiling) == ceiling`.
+        #[tokio::test]
+        async fn uncapped_memory_request_inherits_the_lane_ceiling() {
+            let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            unsafe { std::env::remove_var("BOATRAMP_ASYNCLANE_MUTATION") };
+            let engine = engine_with_async(384, 8);
+            let requested = Limits {
+                memory_bytes: usize::MAX,
+                ..Limits::default()
+            };
+            let eff = engine.effective_limits(Lane::Async, requested);
+            assert_eq!(
+                eff.memory_bytes,
+                384 * 1024 * 1024,
+                "an uncapped component must inherit the raised 384 MiB async lane ceiling"
+            );
+        }
+
         /// G-mem (mutation): with `skip_mem_clamp` armed the oversized request escapes the ceiling.
         #[tokio::test]
         async fn mutation_mem_override_escapes_the_ceiling() {
