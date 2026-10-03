@@ -119,7 +119,7 @@ impl DeployConfig {
         self.proxy_allow.iter().any(|entry| {
             let entry = entry.trim().to_ascii_lowercase();
             match entry.strip_prefix('.') {
-                Some(suffix) => host == suffix || host.ends_with(&format!(".{suffix}")),
+                Some(suffix) => host_matches_suffix(&host, suffix),
                 None => host == entry,
             }
         })
@@ -1239,6 +1239,179 @@ pub struct HandlerGraphqlTokenClaims {
     /// guest-named.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_persona_claim: Option<String>,
+    /// **Multi-issuer trust** (the trust-axis dual of the claim transform): instead of the single
+    /// `issuer`, verify the token's `iss` against this policy — an explicit allow-list and/or an
+    /// anchored host-suffix — then discover the JWKS per verified `iss` (see [`jwks`](Self::jwks)).
+    /// Deny-by-default, host-evaluated, operator-authored (the guest never names an issuer). Set
+    /// together with `jwks`; **mutually exclusive** with the single-issuer `issuer` +
+    /// `jwks_url`/`jwks_env` form (mixing the two is a `boatramp apply` error). Absent ⇒ the
+    /// single-issuer path, byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issuer_trust: Option<IssuerTrust>,
+    /// Where to discover the JWKS per verified `iss` when using [`issuer_trust`](Self::issuer_trust).
+    /// The URL is derived from the *verified* `iss` by the operator-chosen rule, never from a token
+    /// field or any request input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jwks: Option<JwksDiscovery>,
+}
+
+/// A **trusted-issuer policy** for [`HandlerGraphqlTokenClaims::issuer_trust`]: an explicit
+/// allow-list ∪ an anchored host-suffix. A token's `iss` (an `https://` URL) is trusted iff it is
+/// an exact string in `allow`, OR its parsed host falls under `suffix` at a label boundary. At least
+/// one of `allow`/`suffix` must be set (apply-time checked).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct IssuerTrust {
+    /// Exact issuer strings (full `https://…`), e.g. `["https://acme.my.salesforce.com"]`. Matched
+    /// by exact equality against the token's `iss` (and re-pinned into the signature check), so a
+    /// userinfo/path trick in the token can never equal a listed entry.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow: Vec<String>,
+    /// An **anchored** host-suffix (leading dot), e.g. `.my.salesforce.com`, trusting a family of
+    /// orgs without enumerating them. Matched at a label boundary over the *parsed* `https://` host
+    /// (never a raw-string suffix): `.x.com` matches `a.x.com` / `a.b.x.com`, never `evilx.com`,
+    /// `https://a.x.com@evil.com`, or a non-`https` scheme.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suffix: Option<String>,
+}
+
+/// How the JWKS is discovered per verified `iss` ([`HandlerGraphqlTokenClaims::jwks`]). Exactly one
+/// of `discover`/`template` is set (apply-time checked). The resolved URL's host is always pinned to
+/// the verified `iss` host before any fetch.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct JwksDiscovery {
+    /// `"oidc"` → OIDC discovery: fetch `<iss>/.well-known/openid-configuration` and use its
+    /// `jwks_uri` (whose host MUST match the `iss` host — a trusted-but-malicious org controls its
+    /// own discovery doc). The general case.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discover: Option<String>,
+    /// A `{iss}`-templated JWKS URL, e.g. `"{iss}/id/keys"` (Salesforce). Host-pinned by
+    /// construction (no discovery doc) — the preferred form.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template: Option<String>,
+}
+
+/// Anchored host-suffix match at a **label boundary**: `host` equals `bare_suffix` (the apex) or is
+/// a sub-label of it. `bare_suffix` has NO leading dot; both args must already be parsed hosts,
+/// lowercased and trailing-dot-stripped. Shared by `proxy_allow` and the issuer-trust suffix policy
+/// so the one boundary rule lives in one audited place — never a raw `ends_with` on an unparsed
+/// string (which `evilx.com` would satisfy for `x.com`).
+#[must_use]
+pub fn host_matches_suffix(host: &str, bare_suffix: &str) -> bool {
+    host == bare_suffix || host.ends_with(&format!(".{bare_suffix}"))
+}
+
+impl HandlerGraphqlTokenClaims {
+    /// Apply-time validation (a `boatramp apply` error on failure). The single-issuer form
+    /// (`issuer`/`jwks_url`/`jwks_env`) and the multi-issuer form (`issuer_trust`/`jwks`) are
+    /// mutually exclusive; the multi-issuer form needs a non-empty policy, well-formed `allow`
+    /// entries and `suffix`, and exactly one well-formed `jwks` rule. These are STRING-level sanity
+    /// checks — the authoritative, URL-parsed host extraction + label-boundary match happens at
+    /// verify time in the server (which has a real URL parser); this just fails obvious misconfig
+    /// fast.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        let multi = self.issuer_trust.is_some() || self.jwks.is_some();
+        let single = !self.issuer.is_empty() || self.jwks_url.is_some() || self.jwks_env.is_some();
+        if multi && single {
+            return Err(ConfigError::parse(
+                "token_claims: the single-issuer form (issuer/jwks_url/jwks_env) and the \
+                 multi-issuer form (issuer_trust/jwks) are mutually exclusive — set one",
+            ));
+        }
+        if !multi {
+            return Ok(());
+        }
+        let trust = self.issuer_trust.as_ref().ok_or_else(|| {
+            ConfigError::parse("token_claims: `jwks` (multi-issuer) requires `issuer_trust`")
+        })?;
+        let jwks = self
+            .jwks
+            .as_ref()
+            .ok_or_else(|| ConfigError::parse("token_claims: `issuer_trust` requires `jwks`"))?;
+        if trust.allow.is_empty() && trust.suffix.is_none() {
+            return Err(ConfigError::parse(
+                "token_claims.issuer_trust: set `allow` and/or `suffix` (deny-by-default)",
+            ));
+        }
+        for a in &trust.allow {
+            validate_issuer_entry(a)?;
+        }
+        if let Some(sfx) = &trust.suffix {
+            validate_issuer_suffix(sfx)?;
+        }
+        match (jwks.discover.as_deref(), jwks.template.as_deref()) {
+            (Some("oidc"), None) => {}
+            (Some(other), None) => {
+                return Err(ConfigError::parse(format!(
+                    "token_claims.jwks.discover must be \"oidc\" (got {other:?})"
+                )));
+            }
+            (None, Some(t)) if t.contains("{iss}") => {}
+            (None, Some(t)) => {
+                return Err(ConfigError::parse(format!(
+                    "token_claims.jwks.template must contain the `{{iss}}` placeholder (got {t:?})"
+                )));
+            }
+            (None, None) => {
+                return Err(ConfigError::parse(
+                    "token_claims.jwks: set exactly one of `discover: \"oidc\"` or `template`",
+                ));
+            }
+            (Some(_), Some(_)) => {
+                return Err(ConfigError::parse(
+                    "token_claims.jwks: set exactly one of `discover` or `template`, not both",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// String-level check that an `allow` / issuer entry is a plausible `https://` issuer with no
+/// embedded userinfo (the authoritative parse is server-side).
+fn validate_issuer_entry(entry: &str) -> Result<(), ConfigError> {
+    let rest = entry.strip_prefix("https://").ok_or_else(|| {
+        ConfigError::parse(format!(
+            "token_claims.issuer_trust.allow: {entry:?} must be an https:// issuer"
+        ))
+    })?;
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    if authority.is_empty() {
+        return Err(ConfigError::parse(format!(
+            "token_claims.issuer_trust.allow: {entry:?} has no host"
+        )));
+    }
+    if authority.contains('@') {
+        return Err(ConfigError::parse(format!(
+            "token_claims.issuer_trust.allow: {entry:?} must not contain userinfo (`@`)"
+        )));
+    }
+    Ok(())
+}
+
+/// String-level check that a `suffix` is an anchored, multi-label host suffix (`.my.salesforce.com`):
+/// a leading dot, no scheme/path/userinfo/port, and at least two labels (never a bare TLD `.com`).
+fn validate_issuer_suffix(suffix: &str) -> Result<(), ConfigError> {
+    let bare = suffix.strip_prefix('.').ok_or_else(|| {
+        ConfigError::parse(format!(
+            "token_claims.issuer_trust.suffix: {suffix:?} must start with a dot (anchored, e.g. \
+             \".my.salesforce.com\")"
+        ))
+    })?;
+    if bare.contains("://") || bare.contains(['/', '@', ':', '?', '#']) || bare.ends_with('.') {
+        return Err(ConfigError::parse(format!(
+            "token_claims.issuer_trust.suffix: {suffix:?} must be a bare host suffix (no scheme, \
+             path, userinfo, or port)"
+        )));
+    }
+    if bare.split('.').filter(|l| !l.is_empty()).count() < 2 {
+        return Err(ConfigError::parse(format!(
+            "token_claims.issuer_trust.suffix: {suffix:?} is too broad — need at least two labels \
+             (never a bare TLD)"
+        )));
+    }
+    Ok(())
 }
 
 /// One exposed table's policy (see [`HandlerGraphqlDataConfig::tables`]).

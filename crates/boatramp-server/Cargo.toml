@@ -128,6 +128,12 @@ blob-drain-gate-mutation = [
 # Mirrors WS4's `shared-mode-gate-mutation`; forwards to `boatramp-core`. Compiled OUT of every real
 # build (the seams also live under this crate's own `cfg(test)`, so the in-crate gates arm them).
 shared-mode-gate-mutation = ["boatramp-core/shared-mode-gate-mutation"]
+# The multi-issuer-trust anti-hollow gate lane: arms the `BOATRAMP_ISSUERTRUST_MUTATION` seams in
+# graphql_data/token.rs — `skip_iss_policy` (accept an untrusted iss), `loosen_suffix_anchor` (naive
+# ends_with, no label boundary), `skip_jwks_host_pin` (fetch an off-issuer jwks_uri), `skip_ssrf_guard`
+# (fetch a private/loopback addr) — each turning the issuer-trust gate RED. Needs `oidc` (the verify
+# path). Compiled OUT of every real build (the seams also live under this crate's own `cfg(test)`).
+issuer-trust-gate-mutation = ["oidc"]
 
 # TEST-ONLY lane: the MF-3/MF-4 live-Postgres authz twins open a real multi-writer `SqlKv`
 # (`boatramp-storage/sql-postgres`) so node B's fence read-through / fail-closed shed is exercised

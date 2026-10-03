@@ -188,6 +188,8 @@ mod tests {
                 jwks_url: None,
                 audience: None,
                 token_persona_claim: None,
+                issuer_trust: None,
+                jwks: None,
             }),
             ..Default::default()
         };
