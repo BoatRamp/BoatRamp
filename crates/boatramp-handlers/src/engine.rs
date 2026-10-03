@@ -4,6 +4,7 @@
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
@@ -204,6 +205,13 @@ pub enum HandlerError {
     /// The guest exhausted its CPU **fuel** budget.
     #[error("handler exhausted its CPU fuel budget")]
     OutOfFuel,
+    /// The guest exhausted its **linear-memory** budget: a `memory.grow` was denied by the
+    /// (lane ∧ component) ceiling and the guest then trapped. Distinguished from the opaque
+    /// [`Trap`](Self::Trap) so the async-lane DLQ reads `out-of-memory` — an operator who raised (or
+    /// could raise) a lane's `*_max_memory_mb` sees memory exhaustion as a distinct terminal outcome
+    /// rather than a generic crash (construens async-lane-memory-budget request #4).
+    #[error("handler exhausted its linear-memory budget")]
+    OutOfMemory,
     /// The engine is at its concurrency limit.
     #[error("handler engine at capacity")]
     Overloaded,
@@ -228,11 +236,70 @@ impl From<wasmtime::Error> for HandlerError {
 /// Per-store host state: the WASI + WASI-HTTP contexts, the resource table, the
 /// memory limiter, and the per-site capability bindings (kv/blob/sql) this
 /// invocation was granted.
+/// Wraps [`StoreLimits`] to *observe* a denied linear-memory growth, so a guest that traps after
+/// exhausting its (lane ∧ component) memory budget is classified as [`HandlerError::OutOfMemory`]
+/// rather than an opaque `trap`. It changes NO policy: every decision is forwarded to the inner
+/// `StoreLimits` (so the ceiling `effective_limits` computed still binds identically) and the
+/// `Ok(false)` deny is merely recorded in `oom`. `trap_on_grow_failure` stays off upstream, so
+/// `memory.grow` still returns -1 to a guest that handles allocation failure gracefully — the flag
+/// only changes how a *subsequent* trap is labelled, never whether the grow is allowed.
+struct MemLimiter {
+    inner: StoreLimits,
+    oom: Arc<AtomicBool>,
+}
+
+impl wasmtime::ResourceLimiter for MemLimiter {
+    fn memory_growing(
+        &mut self,
+        current: usize,
+        desired: usize,
+        maximum: Option<usize>,
+    ) -> wasmtime::Result<bool> {
+        let allow = self.inner.memory_growing(current, desired, maximum)?;
+        if !allow {
+            // The guest asked for more linear memory than its ceiling. wasmtime returns -1 to the
+            // `memory.grow`; a guest allocator typically then traps. Record it so `classify` can tag
+            // that trap as `out-of-memory`.
+            self.oom.store(true, Ordering::Relaxed);
+        }
+        Ok(allow)
+    }
+
+    fn memory_grow_failed(&mut self, error: wasmtime::Error) -> wasmtime::Result<()> {
+        self.inner.memory_grow_failed(error)
+    }
+
+    fn table_growing(
+        &mut self,
+        current: usize,
+        desired: usize,
+        maximum: Option<usize>,
+    ) -> wasmtime::Result<bool> {
+        self.inner.table_growing(current, desired, maximum)
+    }
+
+    fn table_grow_failed(&mut self, error: wasmtime::Error) -> wasmtime::Result<()> {
+        self.inner.table_grow_failed(error)
+    }
+
+    fn instances(&self) -> usize {
+        self.inner.instances()
+    }
+
+    fn tables(&self) -> usize {
+        self.inner.tables()
+    }
+
+    fn memories(&self) -> usize {
+        self.inner.memories()
+    }
+}
+
 struct HostState {
     table: ResourceTable,
     wasi: WasiCtx,
     http: WasiHttpCtx,
-    limits: StoreLimits,
+    limits: MemLimiter,
     bindings: Bindings,
     /// Ceiling on this invocation's outbound `wasi:http` connect + first-byte
     /// wait (from the engine), independent of the invocation's own timeout.
@@ -254,6 +321,20 @@ struct HostState {
     /// The invocation's SQL transaction state (begun lazily on first query).
     #[cfg(feature = "sql")]
     sql: bindings::sql::SqlSession,
+}
+
+impl HostState {
+    /// Whether this invocation hit its linear-memory ceiling (a denied `memory.grow`). Read at the
+    /// trap-classification sites so an OOM-induced trap is labelled `out-of-memory`.
+    fn oom(&self) -> bool {
+        self.limits.oom.load(Ordering::Relaxed)
+    }
+
+    /// A clone of the OOM flag, for the sync serve path where the `Store` is moved into the guest's
+    /// drive task and so cannot be read back directly after the trap.
+    fn oom_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.limits.oom)
+    }
 }
 
 impl IoView for HostState {
@@ -1122,7 +1203,7 @@ impl HandlerEngine {
         let consumer = consumer_pre
             .instantiate_async(&mut store)
             .await
-            .map_err(|e| classify(&e))?;
+            .map_err(|e| classify(&e, store.data().oom()))?;
         let message = consumer_world::boatramp::handlers::messaging_types::Message {
             topic: topic.to_string(),
             data: data.to_vec(),
@@ -1152,7 +1233,7 @@ impl HandlerEngine {
                     .take(MAX_CONSUMER_ERROR_LEN)
                     .collect(),
             )),
-            Err(trap) => Err(classify(&trap)),
+            Err(trap) => Err(classify(&trap, store.data().oom())),
         }
     }
 
@@ -1206,7 +1287,7 @@ impl HandlerEngine {
         let session = session_pre
             .instantiate_async(&mut store)
             .await
-            .map_err(|e| classify(&e))?;
+            .map_err(|e| classify(&e, store.data().oom()))?;
         let input = session_world::boatramp::handlers::session_types::SessionInput {
             id: batch.id,
             resumed: batch.resumed,
@@ -1228,7 +1309,7 @@ impl HandlerEngine {
             Ok(Err(err)) => Err(HandlerError::Trap(format!(
                 "session handler returned error: {err:?}"
             ))),
-            Err(trap) => Err(classify(&trap)),
+            Err(trap) => Err(classify(&trap, store.data().oom())),
         }
     }
 
@@ -1394,9 +1475,15 @@ impl HandlerEngine {
             wasi_builder.env(key, value);
         }
         let wasi = wasi_builder.build();
-        let store_limits = StoreLimitsBuilder::new()
-            .memory_size(limits.memory_bytes)
-            .build();
+        // The memory ceiling is the already-clamped (lane ∧ component) `effective_limits` value; the
+        // `MemLimiter` only *observes* a denied grow (for `out-of-memory` classification) without
+        // changing the decision.
+        let store_limits = MemLimiter {
+            inner: StoreLimitsBuilder::new()
+                .memory_size(limits.memory_bytes)
+                .build(),
+            oom: Arc::new(AtomicBool::new(false)),
+        };
         #[cfg(feature = "sql")]
         let sql = bindings::sql::SqlSession::for_backends(bindings.sql())
             .with_tenancy(bindings.tenancy());
@@ -1576,7 +1663,11 @@ impl HandlerEngine {
         let proxy = proxy_pre
             .instantiate_async(&mut store)
             .await
-            .map_err(|e| classify(&e))?;
+            .map_err(|e| classify(&e, store.data().oom()))?;
+
+        // The `Store` moves into the drive task below, so grab a clone of the OOM flag now to read
+        // back after a trap (the moved store is otherwise unreachable from here).
+        let oom_flag = store.data().oom_flag();
 
         // Drive the guest on its own task: it may stream the body after setting
         // the response outparam, so the task must outlive the head response.
@@ -1600,7 +1691,7 @@ impl HandlerEngine {
             // Sender dropped before a response — the guest trapped/returned first.
             Err(_) => match task.await {
                 Ok(Ok(())) => Err(HandlerError::NoResponse),
-                Ok(Err(trap)) => Err(classify(&trap)),
+                Ok(Err(trap)) => Err(classify(&trap, oom_flag.load(Ordering::Relaxed))),
                 Err(join) => Err(HandlerError::Internal(join.to_string())),
             },
         }
@@ -1683,13 +1774,16 @@ where
     ChannelBody { rx }.boxed()
 }
 
-/// Classify a wasmtime execution error: an epoch interrupt is a wall-clock
-/// timeout, an out-of-fuel trap is the CPU budget exhausted, anything else is a
-/// generic guest trap.
-fn classify(err: &wasmtime::Error) -> HandlerError {
+/// Classify a wasmtime execution error: an epoch interrupt is a wall-clock timeout, an out-of-fuel
+/// trap is the CPU budget exhausted, a trap that follows a denied linear-memory growth (`oom`) is
+/// memory exhaustion, and anything else is a generic guest trap. The explicit interrupt/fuel trap
+/// kinds take precedence over the inferred `oom` flag — a timeout is a timeout even if the guest also
+/// brushed its memory ceiling earlier in the run.
+fn classify(err: &wasmtime::Error, oom: bool) -> HandlerError {
     match err.downcast_ref::<wasmtime::Trap>() {
         Some(wasmtime::Trap::Interrupt) => HandlerError::Timeout,
         Some(wasmtime::Trap::OutOfFuel) => HandlerError::OutOfFuel,
+        _ if oom => HandlerError::OutOfMemory,
         _ => HandlerError::Trap(err.to_string()),
     }
 }
@@ -1711,6 +1805,25 @@ mod tests {
     #[test]
     fn engine_builds() {
         build_engine().expect("engine builds");
+    }
+
+    #[test]
+    fn classify_maps_oom_flag_but_explicit_trap_kinds_win() {
+        // A denied linear-memory growth (the `oom` flag) turns a generic trap into `OutOfMemory`…
+        let generic = wasmtime::Error::from(wasmtime::Trap::UnreachableCodeReached);
+        assert!(matches!(
+            classify(&generic, true),
+            HandlerError::OutOfMemory
+        ));
+        // …but without the flag the same trap stays a plain `Trap`.
+        assert!(matches!(classify(&generic, false), HandlerError::Trap(_)));
+        // The explicit interrupt/fuel trap kinds take precedence over the inferred flag: a run that
+        // both brushed its memory ceiling and then timed out (or ran out of fuel) is reported as the
+        // timeout / fuel outcome, not OOM.
+        let interrupt = wasmtime::Error::from(wasmtime::Trap::Interrupt);
+        assert!(matches!(classify(&interrupt, true), HandlerError::Timeout));
+        let fuel = wasmtime::Error::from(wasmtime::Trap::OutOfFuel);
+        assert!(matches!(classify(&fuel, true), HandlerError::OutOfFuel));
     }
 
     #[tokio::test]

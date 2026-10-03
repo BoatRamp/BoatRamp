@@ -300,6 +300,26 @@ async fn looping_handler_runs_out_of_fuel() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn handler_over_its_memory_ceiling_is_out_of_memory() {
+    // A memory ceiling of one page (64 KiB), below the guest's 17-page (~1 MiB) initial linear
+    // memory: the instance's memory allocation is denied by the limiter, so the guest cannot start
+    // and the host classifies the failure as `OutOfMemory` — a distinct terminal outcome (DLQ /
+    // stats `out-of-memory`) rather than an opaque `Trap` (construens async-lane-memory-budget #4).
+    // This exercises the real path end-to-end: `MemLimiter::memory_growing` observes the `Ok(false)`
+    // deny, sets the flag, and `classify` maps the resulting error to `OutOfMemory`.
+    let limits = Limits {
+        memory_bytes: 64 * 1024,
+        ..Limits::default()
+    };
+    let engine = HandlerEngine::new(limits, 16).expect("engine");
+    let err = engine
+        .serve("http-200", HTTP_200, request_path("/"), no_caps())
+        .await
+        .expect_err("a 64 KiB ceiling cannot fit the guest's 17-page initial memory");
+    assert!(matches!(err, HandlerError::OutOfMemory), "{err}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn sync_lane_clamps_a_declared_timeout_to_the_engine_ceiling() {
     // The engine sync ceiling is 100ms; a handler that *declares* a far larger
     // budget is clamped down to it (an override may only lower, never raise) —
