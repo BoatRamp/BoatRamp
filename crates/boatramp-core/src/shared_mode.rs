@@ -420,17 +420,20 @@ impl ControlPlaneIdentity {
     /// heartbeats first). A stale/crashed node's row ages out, so this is the LIVE peer count.
     async fn count_live_members(&self) -> Result<usize, KvError> {
         let cutoff = now_unix_ms().saturating_sub(self.window_ms);
-        let keys = self.store.list_prefix(MEMBERS_PREFIX).await?;
-        let mut live = 0usize;
-        for key in keys {
-            if let Some(bytes) = self.store.get(&key).await?
-                && let Ok(text) = std::str::from_utf8(&bytes)
-                && let Ok(ms) = text.trim().parse::<u64>()
-                && ms >= cutoff
-            {
-                live += 1;
-            }
-        }
+        // One scan (key+value) instead of list_prefix + a get per member (review finding M1): on a
+        // networked SQL backend that was 1 + M round-trips; `scan_prefix` makes it 1.
+        let live = self
+            .store
+            .scan_prefix(MEMBERS_PREFIX)
+            .await?
+            .into_iter()
+            .filter(|(_, bytes)| {
+                std::str::from_utf8(bytes)
+                    .ok()
+                    .and_then(|t| t.trim().parse::<u64>().ok())
+                    .is_some_and(|ms| ms >= cutoff)
+            })
+            .count();
         Ok(live)
     }
 }

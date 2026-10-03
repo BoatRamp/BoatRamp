@@ -124,6 +124,11 @@ struct KvStatements {
     list_prefix_bounded: &'static str,
     /// Prefix scan with no upper bound — empty/all-`0xFF` prefix (`?1` lower).
     list_prefix_all: &'static str,
+    /// Prefix scan returning `(key, value)` bounded by `[prefix, prefix_successor)` (`?1`,`?2`) —
+    /// the values-returning variant of `list_prefix_bounded` ([`KvStore::scan_prefix`], M1).
+    scan_prefix_bounded: &'static str,
+    /// `(key, value)` prefix scan with no upper bound (`?1` lower).
+    scan_prefix_all: &'static str,
     /// Resumable range scan `(start, prefix_successor)`, capped (`?1` start, `?2` upper, `?3` limit).
     list_from_bounded: &'static str,
     /// Resumable range scan with no upper bound (`?1` start, `?2` limit).
@@ -162,6 +167,8 @@ const SQLITE_STATEMENTS: KvStatements = KvStatements {
     delete_change: "INSERT INTO kv_changes (key, version, ts) VALUES (?1, 0, ?2)",
     list_prefix_bounded: "SELECT key FROM kv WHERE key >= ?1 AND key < ?2 ORDER BY key",
     list_prefix_all: "SELECT key FROM kv WHERE key >= ?1 ORDER BY key",
+    scan_prefix_bounded: "SELECT key, value FROM kv WHERE key >= ?1 AND key < ?2 ORDER BY key",
+    scan_prefix_all: "SELECT key, value FROM kv WHERE key >= ?1 ORDER BY key",
     list_from_bounded: "SELECT key FROM kv WHERE key > ?1 AND key < ?2 ORDER BY key LIMIT ?3",
     list_from_all: "SELECT key FROM kv WHERE key > ?1 ORDER BY key LIMIT ?2",
     cas_present: "UPDATE kv SET value = ?2, version = version + 1 WHERE key = ?1 AND value = ?3",
@@ -198,6 +205,8 @@ const POSTGRES_STATEMENTS: KvStatements = KvStatements {
     delete_change: "INSERT INTO kv_changes (key, version, ts) VALUES (?1, 0, ?2)",
     list_prefix_bounded: "SELECT key FROM kv WHERE key >= ?1 AND key < ?2 ORDER BY key",
     list_prefix_all: "SELECT key FROM kv WHERE key >= ?1 ORDER BY key",
+    scan_prefix_bounded: "SELECT key, value FROM kv WHERE key >= ?1 AND key < ?2 ORDER BY key",
+    scan_prefix_all: "SELECT key, value FROM kv WHERE key >= ?1 ORDER BY key",
     list_from_bounded: "SELECT key FROM kv WHERE key > ?1 AND key < ?2 ORDER BY key LIMIT ?3",
     list_from_all: "SELECT key FROM kv WHERE key > ?1 ORDER BY key LIMIT ?2",
     cas_present: "UPDATE kv SET value = ?2, version = version + 1 WHERE key = ?1 AND value = ?3",
@@ -252,6 +261,8 @@ const MYSQL_STATEMENTS: KvStatements = KvStatements {
     delete_change: "INSERT INTO kv_changes (`key`, version, ts) VALUES (?1, 0, ?2)",
     list_prefix_bounded: "SELECT `key` FROM kv WHERE `key` >= ?1 AND `key` < ?2 ORDER BY `key`",
     list_prefix_all: "SELECT `key` FROM kv WHERE `key` >= ?1 ORDER BY `key`",
+    scan_prefix_bounded: "SELECT `key`, `value` FROM kv WHERE `key` >= ?1 AND `key` < ?2 ORDER BY `key`",
+    scan_prefix_all: "SELECT `key`, `value` FROM kv WHERE `key` >= ?1 ORDER BY `key`",
     list_from_bounded: "SELECT `key` FROM kv WHERE `key` > ?1 AND `key` < ?2 ORDER BY `key` LIMIT ?3",
     list_from_all: "SELECT `key` FROM kv WHERE `key` > ?1 ORDER BY `key` LIMIT ?2",
     cas_present: "UPDATE kv SET `value` = ?2, version = version + 1 WHERE `key` = ?1 AND `value` = ?3",
@@ -504,6 +515,19 @@ impl KvStore for SqlKv {
             Backing::Postgres(b) => sqlx_list_prefix(b.as_ref(), &self.stmts, prefix).await,
             #[cfg(feature = "sql-mysql")]
             Backing::Mysql(b) => sqlx_list_prefix(b.as_ref(), &self.stmts, prefix).await,
+        }
+    }
+
+    async fn scan_prefix(&self, prefix: &str) -> Result<Vec<(String, Vec<u8>)>, KvError> {
+        // One (key, value) scan instead of list_prefix + a get per key (M1) — a single round-trip on
+        // the networked backends, where the default's per-key gets would each cost one.
+        match &self.backing {
+            #[cfg(feature = "sql")]
+            Backing::Sqlite(db) => sqlite_scan_prefix(db, &self.stmts, prefix).await,
+            #[cfg(feature = "sql-postgres")]
+            Backing::Postgres(b) => sqlx_scan_prefix(b.as_ref(), &self.stmts, prefix).await,
+            #[cfg(feature = "sql-mysql")]
+            Backing::Mysql(b) => sqlx_scan_prefix(b.as_ref(), &self.stmts, prefix).await,
         }
     }
 
@@ -933,6 +957,48 @@ async fn sqlx_list_prefix(
     sqlx_collect_keys(backend, sql, &params).await
 }
 
+/// `(key, value)` prefix scan in ONE autocommit statement (M1) — the values-returning sibling of
+/// `sqlx_list_prefix`, so a caller that needs values doesn't do `list_prefix` + a `get` per key.
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+async fn sqlx_scan_prefix(
+    backend: &dyn SqlBackend,
+    stmts: &KvStatements,
+    prefix: &str,
+) -> Result<Vec<(String, Vec<u8>)>, KvError> {
+    let lower = prefix.as_bytes().to_vec();
+    let (sql, params) = match prefix_successor(&lower) {
+        Some(upper) => (
+            stmts.scan_prefix_bounded,
+            vec![SqlValue::Blob(lower), SqlValue::Blob(upper)],
+        ),
+        None => (stmts.scan_prefix_all, vec![SqlValue::Blob(lower)]),
+    };
+    let rows = backend
+        .query_autocommit(sql, &params)
+        .await
+        .map_err(sql_err)?;
+    let mut out = Vec::with_capacity(rows.rows.len());
+    for row in rows.rows {
+        let mut cells = row.into_iter();
+        let key_bytes = sqlx_bytes(
+            cells
+                .next()
+                .ok_or_else(|| KvError::backend("kv scan row missing key"))?,
+        )?;
+        let value = sqlx_bytes(
+            cells
+                .next()
+                .ok_or_else(|| KvError::backend("kv scan row missing value"))?,
+        )?;
+        out.push((
+            String::from_utf8(key_bytes)
+                .map_err(|e| KvError::backend(format!("kv key is not valid UTF-8: {e}")))?,
+            value,
+        ));
+    }
+    Ok(out)
+}
+
 #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
 async fn sqlx_list_from(
     backend: &dyn SqlBackend,
@@ -1163,6 +1229,40 @@ async fn sqlite_list_prefix(
         None => (stmts.list_prefix_all, vec![LibsqlValue::Blob(lower)]),
     };
     collect_keys(&conn, sql, params).await
+}
+
+/// `(key, value)` prefix scan in one statement (M1) — the values-returning sibling of
+/// `sqlite_list_prefix`.
+#[cfg(feature = "sql")]
+async fn sqlite_scan_prefix(
+    db: &Database,
+    stmts: &KvStatements,
+    prefix: &str,
+) -> Result<Vec<(String, Vec<u8>)>, KvError> {
+    let conn = sqlite_connect(db).await?;
+    let lower = prefix.as_bytes().to_vec();
+    let (sql, params) = match prefix_successor(&lower) {
+        Some(upper) => (
+            stmts.scan_prefix_bounded,
+            vec![LibsqlValue::Blob(lower), LibsqlValue::Blob(upper)],
+        ),
+        None => (stmts.scan_prefix_all, vec![LibsqlValue::Blob(lower)]),
+    };
+    let mut rows = conn
+        .query(sql, libsql::params_from_iter(params))
+        .await
+        .map_err(kv_err)?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().await.map_err(kv_err)? {
+        let key_bytes = value_bytes(row.get_value(0).map_err(kv_err)?)?;
+        let value = value_bytes(row.get_value(1).map_err(kv_err)?)?;
+        out.push((
+            String::from_utf8(key_bytes)
+                .map_err(|e| KvError::backend(format!("kv key is not valid UTF-8: {e}")))?,
+            value,
+        ));
+    }
+    Ok(out)
 }
 
 #[cfg(feature = "sql")]
