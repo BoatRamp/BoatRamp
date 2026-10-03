@@ -733,6 +733,17 @@ pub struct ConsumerConfig {
     /// already at the cap. `None` ⇒ unbounded (only `max_batch` per-tick bounds it). (P2 flow control.)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_ack_pending: Option<usize>,
+    /// Per-consumer **max concurrency** — the most invocations of THIS consumer that may run at once
+    /// across the node, independent of (and clamped by) the shared async-lane budget
+    /// (`[handlers] async_max_concurrency`). `None` ⇒ the consumer shares the single lane budget with
+    /// every other consumer, exactly as today (no regression). Set it to stop one consumer's burst
+    /// (e.g. a 2000-image thumbnail backfill) from monopolizing the lane and starving latency-
+    /// sensitive consumers (concept-gen, polish): the effective cap is
+    /// `min(max_concurrency, async_max_concurrency)` — a value above the lane clamps down, a `0` is
+    /// treated as unset. Purely an admission-control split: ordering, at-least-once, and retry
+    /// semantics are unchanged. (P2 resource isolation.)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrency: Option<usize>,
     /// Per-consumer **redelivery backoff** in ms (≈ JetStream *BackOff*). On a failed delivery
     /// (an explicit nack before `max_attempts`), the message is held invisible for
     /// `backoff_ms × attempts` before it can be redelivered — a linear escalation that spaces out

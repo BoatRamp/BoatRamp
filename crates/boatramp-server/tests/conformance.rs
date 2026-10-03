@@ -3685,6 +3685,7 @@ async fn activation_refuses_a_non_consumer_component() {
         files,
         config: DeployConfig {
             consumers: vec![ConsumerConfig {
+                max_concurrency: None,
                 secrets: Vec::new(),
                 tenancy: None,
                 token_claims: None,
@@ -4825,6 +4826,7 @@ async fn operator_endpoint_reports_invocation_and_consumer_stats() {
                 blobstore_containers: Vec::new(),
             }],
             consumers: vec![ConsumerConfig {
+                max_concurrency: None,
                 secrets: Vec::new(),
                 tenancy: None,
                 token_claims: None,

@@ -555,6 +555,51 @@ async fn egress_target_allowed(
     Ok(EgressPlan { self_depth: None })
 }
 
+/// Per-consumer concurrency gates (P2 resource isolation): a lazily-created [`Semaphore`] per
+/// consumer identity, so one consumer's burst (e.g. a thumbnail backfill) can't occupy the shared
+/// async lane and starve other consumers.
+///
+/// A dedicated type with a **single** lock site ([`permit`](Self::permit)) so the one discipline —
+/// *the `std` mutex guard is cloned-out and DROPPED before the `.await`, never held across it* —
+/// lives in exactly one audited place rather than being an inline footgun at the call site. Keyed by
+/// the consumer's stable identity (site∥topic∥group); each entry remembers its effective cap, so a
+/// changed cap (on the next `apply`) rebuilds the semaphore instead of honoring a stale one. The map
+/// holds one small entry per declared consumer (bounded, not per-message).
+#[cfg(feature = "messaging")]
+#[derive(Default)]
+struct ConsumerGates(Mutex<std::collections::HashMap<String, (usize, Arc<Semaphore>)>>);
+
+#[cfg(feature = "messaging")]
+impl ConsumerGates {
+    /// Acquire a permit for consumer `key`, bounding it to `min(cap, lane_ceiling)` (floored at 1)
+    /// simultaneous holders node-wide — the per-consumer value can never exceed the operator lane
+    /// budget. The returned owned permit is held for one invocation.
+    async fn permit(
+        &self,
+        key: &str,
+        cap: usize,
+        lane_ceiling: usize,
+    ) -> tokio::sync::OwnedSemaphorePermit {
+        let eff = cap.min(lane_ceiling).max(1);
+        // Lock ONLY to look up / (re)create the Arc'd semaphore; the guard is dropped at the end of
+        // this block, BEFORE the `.await` below — a `std` mutex must never be held across an await.
+        let sem = {
+            let mut map = self.0.lock().unwrap();
+            match map.get(key) {
+                Some((c, s)) if *c == eff => Arc::clone(s),
+                _ => {
+                    let s = Arc::new(Semaphore::new(eff));
+                    map.insert(key.to_string(), (eff, Arc::clone(&s)));
+                    s
+                }
+            }
+        };
+        sem.acquire_owned()
+            .await
+            .expect("per-consumer semaphore is never closed")
+    }
+}
+
 /// The handler engine: a wasmtime [`Engine`], a blob-hash-keyed cache of
 /// compiled+pre-instantiated components, the limit policy, and a concurrency
 /// gate. A background task ticks the engine epoch for timeouts.
@@ -588,6 +633,10 @@ pub struct HandlerEngine {
     /// A **separate** concurrency gate for the streaming lane, so a burst of
     /// long-lived streams can't exhaust the sync request pool or the async drain.
     streaming_semaphore: Semaphore,
+    /// Per-consumer concurrency gates (P2 resource isolation) — see [`ConsumerGates`]. A consumer
+    /// with no `max_concurrency` never enters it and shares the async lane budget exactly as before.
+    #[cfg(feature = "messaging")]
+    consumer_gates: ConsumerGates,
     /// Concurrency cap on **compilation** (deploy-resilience #2): bounds how many cranelift
     /// compiles run at once, so a bulk precompile (e.g. an apply uploading many components, each
     /// warming the cache via [`precompile_gated`](Self::precompile_gated)) can't spike RSS on a
@@ -739,6 +788,8 @@ impl HandlerEngine {
             cache,
             #[cfg(feature = "messaging")]
             consumer_cache: Mutex::new(LruCache::new(capacity)),
+            #[cfg(feature = "messaging")]
+            consumer_gates: ConsumerGates::default(),
             #[cfg(feature = "session")]
             session_cache: Mutex::new(LruCache::new(capacity)),
             semaphore: Semaphore::new(limits.max_concurrency.max(1)),
@@ -794,6 +845,28 @@ impl HandlerEngine {
         self.streaming_semaphore = Semaphore::new(streaming_limits.max_concurrency.max(1));
         self.streaming_limits = streaming_limits;
         self
+    }
+
+    /// Acquire a **per-consumer** concurrency permit (P2 resource isolation), held for one
+    /// invocation. `key` is the consumer's stable identity (site∥topic∥group); `cap` its declared
+    /// `max_concurrency`. The effective cap is `min(cap, async-lane)` — clamped DOWN to the lane
+    /// ceiling, floored at 1 — so a per-consumer value can never EXCEED the operator's lane budget.
+    /// The semaphore is created on first use and rebuilt if that effective cap changed (a manifest
+    /// edit). The returned owned permit is held across the engine serve, so at most `eff` invocations
+    /// of this consumer run at once node-wide while every other consumer keeps its own headroom.
+    /// Call this only when a consumer declares `max_concurrency`; an unset consumer shares the lane
+    /// budget as before (never enters the map).
+    #[cfg(feature = "messaging")]
+    pub async fn consumer_permit(
+        &self,
+        key: &str,
+        cap: usize,
+    ) -> tokio::sync::OwnedSemaphorePermit {
+        // The lane ceiling (`async_max_concurrency`) is the clamp — a per-consumer cap can only
+        // narrow, never widen. The lock discipline lives entirely in `ConsumerGates::permit`.
+        self.consumer_gates
+            .permit(key, cap, self.async_limits.max_concurrency)
+            .await
     }
 
     /// The sync-lane wall-clock ceiling (ms): connection-bearing requests (site

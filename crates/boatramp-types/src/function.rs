@@ -1058,6 +1058,7 @@ mod tests {
                 handler("/api/report", "report.wasm", &[], &[]),
             ],
             consumers: vec![ConsumerConfig {
+                max_concurrency: None,
                 tenancy: None,
                 token_claims: None,
                 topic: "orders".into(),
