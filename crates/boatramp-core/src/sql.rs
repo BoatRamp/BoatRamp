@@ -284,6 +284,21 @@ pub trait SqlBackend: Send + Sync {
         result
     }
 
+    /// Run ONE parameterized, row-returning statement in **autocommit** — no explicit
+    /// `BEGIN`/`COMMIT`. A single statement already sees a consistent snapshot under READ
+    /// COMMITTED, so wrapping a point read in a transaction only adds two network
+    /// round-trips (BEGIN + COMMIT) for nothing. Hot control-plane reads (authz / secrets /
+    /// KV `get` / prefix scans) use this. The default falls back to a read-only transaction
+    /// so every backend keeps working; the pooled Postgres/MySQL backends override it to
+    /// fetch directly on the (read) pool. A replica-routed backend still honours its read
+    /// endpoint in the override.
+    async fn query_autocommit(&self, sql: &str, params: &[SqlValue]) -> Result<SqlRows, SqlError> {
+        let mut tx = self.begin_read_only().await?;
+        let result = tx.query(sql, params).await;
+        let _ = tx.rollback().await;
+        result
+    }
+
     /// Whether this backend injects a **reserved** boatramp session context
     /// (`rls_session` — the `boatramp.project` / `boatramp.site` GUC on Postgres, or
     /// the `@boatramp_project` / `@boatramp_site` MySQL session var) that an app's

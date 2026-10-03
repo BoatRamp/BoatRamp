@@ -714,12 +714,11 @@ async fn sqlx_get(
     stmts: &KvStatements,
     key: &str,
 ) -> Result<Option<Vec<u8>>, KvError> {
-    let mut tx = backend.begin_read_only().await.map_err(sql_err)?;
-    let rows = tx
-        .query(stmts.get, &[SqlValue::Blob(key.as_bytes().to_vec())])
+    // Autocommit single-statement read (H1): a point `get` is 1 round-trip, not BEGIN+SELECT+COMMIT.
+    let rows = backend
+        .query_autocommit(stmts.get, &[SqlValue::Blob(key.as_bytes().to_vec())])
         .await
         .map_err(sql_err)?;
-    tx.commit().await.map_err(sql_err)?;
     match rows.rows.into_iter().next() {
         Some(row) => {
             let cell = row
@@ -964,9 +963,11 @@ async fn sqlx_collect_keys(
     sql: &str,
     params: &[SqlValue],
 ) -> Result<Vec<String>, KvError> {
-    let mut tx = backend.begin_read_only().await.map_err(sql_err)?;
-    let rows = tx.query(sql, params).await.map_err(sql_err)?;
-    tx.commit().await.map_err(sql_err)?;
+    // Autocommit single-statement read (H1): prefix/range listing is 1 round-trip, not wrapped in a txn.
+    let rows = backend
+        .query_autocommit(sql, params)
+        .await
+        .map_err(sql_err)?;
     let mut out = Vec::with_capacity(rows.rows.len());
     for row in rows.rows {
         let cell = row
@@ -983,16 +984,18 @@ async fn sqlx_collect_keys(
 }
 
 /// Ordered full `(key, value, version)` scan for a portable dump (kv-sql WS7), over the external SQL
-/// backends — one read-only transaction (MVCC-consistent point-in-time on Postgres), decoding each
-/// row back to a [`KvDumpEntry`] with its REAL per-key version.
+/// backends — one autocommit statement (still an MVCC-consistent point-in-time: a single SELECT sees
+/// one snapshot, so dropping the surrounding txn costs no consistency, only the round-trips, H1),
+/// decoding each row back to a [`KvDumpEntry`] with its REAL per-key version.
 #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
 async fn sqlx_dump_scan(
     backend: &dyn SqlBackend,
     stmts: &KvStatements,
 ) -> Result<Vec<KvDumpEntry>, KvError> {
-    let mut tx = backend.begin_read_only().await.map_err(sql_err)?;
-    let rows = tx.query(stmts.dump_scan, &[]).await.map_err(sql_err)?;
-    tx.commit().await.map_err(sql_err)?;
+    let rows = backend
+        .query_autocommit(stmts.dump_scan, &[])
+        .await
+        .map_err(sql_err)?;
     let mut out = Vec::with_capacity(rows.rows.len());
     for row in rows.rows {
         let mut cells = row.into_iter();
