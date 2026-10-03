@@ -1890,7 +1890,9 @@ mod tests {
         /// DOWN to the ceiling — a guest can never claim more linear memory than `async_max_memory_mb`.
         #[tokio::test]
         async fn mem_override_clamps_to_the_lane_ceiling() {
-            let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let _g = ENV_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             unsafe { std::env::remove_var("BOATRAMP_ASYNCLANE_MUTATION") };
             let engine = engine_with_async(128, 8);
             let requested = Limits {
@@ -1910,7 +1912,9 @@ mod tests {
         /// gets the headroom without restating it). `min(MAX, ceiling) == ceiling`.
         #[tokio::test]
         async fn uncapped_memory_request_inherits_the_lane_ceiling() {
-            let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let _g = ENV_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             unsafe { std::env::remove_var("BOATRAMP_ASYNCLANE_MUTATION") };
             let engine = engine_with_async(384, 8);
             let requested = Limits {
@@ -1928,7 +1932,9 @@ mod tests {
         /// G-mem (mutation): with `skip_mem_clamp` armed the oversized request escapes the ceiling.
         #[tokio::test]
         async fn mutation_mem_override_escapes_the_ceiling() {
-            let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let _g = ENV_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let engine = engine_with_async(128, 8);
             let requested = Limits {
                 memory_bytes: 512 * 1024 * 1024,
@@ -1948,7 +1954,9 @@ mod tests {
         /// a consumer can never run more concurrent handlers than `async_max_concurrency`.
         #[tokio::test]
         async fn consumer_cap_floors_to_the_lane_budget() {
-            let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let _g = ENV_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             unsafe { std::env::remove_var("BOATRAMP_ASYNCLANE_MUTATION") };
             let engine = engine_with_async(64, 4);
             let gate = engine.consumer_gate("site\u{1}topic\u{1}group", 100);
@@ -1963,7 +1971,9 @@ mod tests {
         /// full requested 100, exceeding the lane budget.
         #[tokio::test]
         async fn mutation_consumer_cap_escapes_the_lane_budget() {
-            let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let _g = ENV_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let engine = engine_with_async(64, 4);
             unsafe { std::env::set_var("BOATRAMP_ASYNCLANE_MUTATION", "skip_consumer_clamp") };
             let gate = engine.consumer_gate("site\u{1}topic\u{1}group", 100);
