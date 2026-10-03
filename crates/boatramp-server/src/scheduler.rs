@@ -64,14 +64,17 @@ pub(super) enum AsyncPass {
 fn site_limits(
     site_handlers: &boatramp_core::config::HandlersSiteConfig,
 ) -> boatramp_handlers::Limits {
-    let mut limits = boatramp_handlers::Limits::default();
     // Unset memory ⇒ inherit the lane ceiling (sentinel `usize::MAX`; the engine clamps down). This
     // is how a consumer on a lane with a raised `async_max_memory_mb` gets the headroom — a
-    // `max_memory_mb` on the site only ever clamps the consumer DOWN from the ceiling.
-    limits.memory_bytes = site_handlers
-        .max_memory_mb
-        .map(|mb| (mb as usize).saturating_mul(1024 * 1024))
-        .unwrap_or(usize::MAX);
+    // `max_memory_mb` on the site only ever clamps the consumer DOWN from the ceiling. In the struct
+    // initializer (not a post-`default()` reassignment) to satisfy `field_reassign_with_default`.
+    let mut limits = boatramp_handlers::Limits {
+        memory_bytes: site_handlers
+            .max_memory_mb
+            .map(|mb| (mb as usize).saturating_mul(1024 * 1024))
+            .unwrap_or(usize::MAX),
+        ..boatramp_handlers::Limits::default()
+    };
     if let Some(ms) = site_handlers.max_timeout_ms {
         limits.timeout_ms = ms as u64;
     }
