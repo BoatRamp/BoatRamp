@@ -1159,7 +1159,7 @@ async fn sqlite_get(
     stmts: &KvStatements,
     key: &str,
 ) -> Result<Option<Vec<u8>>, KvError> {
-    let conn = conn.lock().await;
+    let conn = lock_clean(conn).await;
     let mut rows = conn
         .query(stmts.get, libsql::params_from_iter([blob(key)]))
         .await
@@ -1177,7 +1177,7 @@ async fn sqlite_put(
     key: &str,
     value: Vec<u8>,
 ) -> Result<(), KvError> {
-    let conn = conn.lock().await;
+    let conn = lock_clean(conn).await;
     begin(&conn).await?;
     let ts = now_ts();
     let res = async {
@@ -1211,7 +1211,7 @@ async fn sqlite_put(
 
 #[cfg(feature = "sql")]
 async fn sqlite_delete(conn: &AsyncMutex<Connection>, stmts: &KvStatements, key: &str) -> Result<(), KvError> {
-    let conn = conn.lock().await;
+    let conn = lock_clean(conn).await;
     begin(&conn).await?;
     let ts = now_ts();
     let res = async {
@@ -1241,7 +1241,7 @@ async fn sqlite_list_prefix(
     stmts: &KvStatements,
     prefix: &str,
 ) -> Result<Vec<String>, KvError> {
-    let conn = conn.lock().await;
+    let conn = lock_clean(conn).await;
     let lower = prefix.as_bytes().to_vec();
     let (sql, params) = match prefix_successor(&lower) {
         Some(upper) => (
@@ -1261,7 +1261,7 @@ async fn sqlite_scan_prefix(
     stmts: &KvStatements,
     prefix: &str,
 ) -> Result<Vec<(String, Vec<u8>)>, KvError> {
-    let conn = conn.lock().await;
+    let conn = lock_clean(conn).await;
     let lower = prefix.as_bytes().to_vec();
     let (sql, params) = match prefix_successor(&lower) {
         Some(upper) => (
@@ -1295,7 +1295,7 @@ async fn sqlite_list_from(
     after: &str,
     limit: usize,
 ) -> Result<Vec<String>, KvError> {
-    let conn = conn.lock().await;
+    let conn = lock_clean(conn).await;
     let prefix_bytes = prefix.as_bytes().to_vec();
     let mut start = prefix_bytes.clone();
     start.extend_from_slice(after.as_bytes());
@@ -1316,7 +1316,7 @@ async fn sqlite_write_batch(
     stmts: &KvStatements,
     ops: Vec<WriteOp>,
 ) -> Result<(), KvError> {
-    let conn = conn.lock().await;
+    let conn = lock_clean(conn).await;
     begin(&conn).await?;
     let ts = now_ts();
     let res = async {
@@ -1366,7 +1366,7 @@ async fn sqlite_cas(
     expected: Option<&[u8]>,
     new: Vec<u8>,
 ) -> Result<bool, KvError> {
-    let conn = conn.lock().await;
+    let conn = lock_clean(conn).await;
     begin(&conn).await?;
     let ts = now_ts();
     let res = async {
@@ -1410,6 +1410,43 @@ async fn sqlite_cas(
     }
     .await;
     finish(&conn, res).await
+}
+
+/// Whether the cancellation-heal is disabled (H2 anti-hollow gate). `false` in a non-test build, so
+/// the mutation can never ship. Under `BOATRAMP_KVSQL_MUTATION=skip_conn_heal`, [`lock_clean`] skips
+/// the zombie-transaction rollback, so a write left mid-`BEGIN` by a cancelled op bricks the next
+/// writer — the gate then MUST go RED, proving the heal is load-bearing.
+#[cfg(feature = "sql")]
+fn conn_heal_disabled() -> bool {
+    #[cfg(test)]
+    {
+        std::env::var("BOATRAMP_KVSQL_MUTATION").as_deref() == Ok("skip_conn_heal")
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
+/// Lock the one cached SQLite connection ([`Backing::Sqlite`]) and hand out a CLEAN guard. The old
+/// per-op connection self-healed on drop — dropping a libsql `Connection` rolls back its open
+/// transaction — but the H2 shared connection does not. So a write whose future is DROPPED (client
+/// disconnect, a `tokio::select!` loser, shutdown) between `BEGIN IMMEDIATE` and [`finish`] would
+/// leave the shared connection mid-transaction: the next writer's `BEGIN` fails ("cannot start a
+/// transaction within a transaction") and returns via `?` before its own `finish`, so the zombie
+/// transaction is never rolled back and every later control-plane KV write bricks until restart —
+/// while reads silently run inside the cancelled op's uncommitted writes. Detect that here
+/// (`!is_autocommit()`, an in-memory check — the clean path pays nothing) and roll the zombie
+/// transaction back before any op runs, restoring the per-op design's cancellation safety.
+#[cfg(feature = "sql")]
+async fn lock_clean(conn: &AsyncMutex<Connection>) -> tokio::sync::MutexGuard<'_, Connection> {
+    let guard = conn.lock().await;
+    if !guard.is_autocommit() && !conn_heal_disabled() {
+        // A prior op was cancelled mid-transaction; discard its partial, uncommitted work so this op
+        // begins from a clean, autocommit connection.
+        let _ = guard.execute("ROLLBACK", ()).await;
+    }
+    guard
 }
 
 /// Open a write transaction that takes the write lock at `BEGIN` (`IMMEDIATE`), so concurrent
@@ -1488,7 +1525,7 @@ async fn sqlite_dump_scan(
     conn: &AsyncMutex<Connection>,
     stmts: &KvStatements,
 ) -> Result<Vec<KvDumpEntry>, KvError> {
-    let conn = conn.lock().await;
+    let conn = lock_clean(conn).await;
     let mut rows = conn.query(stmts.dump_scan, ()).await.map_err(kv_err)?;
     let mut out = Vec::new();
     while let Some(row) = rows.next().await.map_err(kv_err)? {
@@ -1620,6 +1657,27 @@ mod sqlite_tests {
                 Backing::Mysql(_) => Err(KvError::backend("sqlite_test_conn on a MySQL SqlKv")),
             }
         }
+
+        /// Simulate a write op CANCELLED after `BEGIN IMMEDIATE` but before `finish`: dirty the
+        /// SHARED cached connection (leave a transaction open) and drop the guard without
+        /// committing or rolling back — exactly the state a dropped write future leaves behind.
+        async fn test_leak_open_txn(&self) {
+            match &self.backing {
+                Backing::Sqlite { conn, .. } => {
+                    let guard = conn.lock().await;
+                    guard.execute("BEGIN IMMEDIATE", ()).await.expect("begin");
+                    assert!(
+                        !guard.is_autocommit(),
+                        "the shared connection is now mid-transaction"
+                    );
+                    // drop `guard` WITHOUT commit/rollback — mimics a dropped (cancelled) write.
+                }
+                #[cfg(feature = "sql-postgres")]
+                Backing::Postgres(_) => unreachable!("sqlite-only test helper"),
+                #[cfg(feature = "sql-mysql")]
+                Backing::Mysql(_) => unreachable!("sqlite-only test helper"),
+            }
+        }
     }
 
     fn temp_db(name: &str) -> (tempfile::TempDir, std::path::PathBuf) {
@@ -1701,6 +1759,41 @@ mod sqlite_tests {
             }
         }
         assert_eq!(wins, 1, "exactly one racing CAS wins");
+    }
+
+    /// GATE (H2 cancellation-safety) — a write op cancelled after `BEGIN IMMEDIATE` leaves the one
+    /// shared cached connection mid-transaction; the NEXT write must still succeed because
+    /// `lock_clean` rolls the zombie transaction back on acquire (restoring the per-op design's
+    /// self-heal). Paired with the `skip_conn_heal` mutation below, which proves the heal is
+    /// load-bearing.
+    #[tokio::test]
+    async fn sqlkv_recovers_from_a_cancelled_write_leaving_an_open_txn() {
+        let (_dir, path) = temp_db("cancel-heal");
+        let kv = SqlKv::open_sqlite_local(&path).await.unwrap();
+        unsafe { std::env::remove_var("BOATRAMP_KVSQL_MUTATION") };
+        // A prior op's future was dropped between BEGIN IMMEDIATE and finish(), leaving a txn open.
+        kv.test_leak_open_txn().await;
+        // The heal on the next lock_clean rolls it back, so this write (and its read-back) succeed.
+        kv.put("k", b"v".to_vec())
+            .await
+            .expect("a write recovers after a cancelled write left a transaction open");
+        assert_eq!(kv.get("k").await.unwrap(), Some(b"v".to_vec()));
+    }
+
+    /// The `skip_conn_heal` MUTATION makes the gate RED: with the heal removed, the zombie
+    /// transaction survives and the next write fails to `BEGIN` ("within a transaction").
+    #[tokio::test]
+    async fn mutation_skip_conn_heal_bricks_the_next_write() {
+        let (_dir, path) = temp_db("cancel-heal-mut");
+        let kv = SqlKv::open_sqlite_local(&path).await.unwrap();
+        kv.test_leak_open_txn().await;
+        unsafe { std::env::set_var("BOATRAMP_KVSQL_MUTATION", "skip_conn_heal") };
+        let result = kv.put("k", b"v".to_vec()).await;
+        unsafe { std::env::remove_var("BOATRAMP_KVSQL_MUTATION") };
+        assert!(
+            result.is_err(),
+            "with the heal removed, a zombie transaction bricks the next write (gate RED)"
+        );
     }
 
     /// GATE — synchronous-commit durability (C6): a value written by a returned `put` is present

@@ -209,11 +209,12 @@ pub trait KvStore: Send + Sync {
     /// All `(key, value)` pairs under `prefix`, in ONE scan. The default composes
     /// [`list_prefix`](Self::list_prefix) + a [`get`](Self::get) per key — the historical N+1, kept
     /// so no backend is forced to change. A backend with a native values-returning scan (the SQL
-    /// `SELECT key,value … WHERE key LIKE prefix%`, SlateDB's range iterator, the in-memory map)
-    /// overrides it with a single round-trip; the caching/checkpoint wrappers forward to the inner
-    /// store for authoritative values. Used by hot count/aggregate paths that would otherwise fetch
-    /// keys then values separately (e.g. the shared-mode live-member count — review finding M1),
-    /// multiplying the round-trips (especially over a networked SQL backend).
+    /// `SELECT key,value … WHERE key >= :prefix AND key < :prefix_successor` — a half-open BLOB
+    /// range, never a `LIKE`/`||'%'` form a prefix byte could subvert; SlateDB's range iterator; the
+    /// in-memory map's range) overrides it with a single round-trip; the caching/checkpoint wrappers
+    /// forward to the inner store for authoritative values. Used by hot count/aggregate paths that
+    /// would otherwise fetch keys then values separately (e.g. the shared-mode live-member count —
+    /// review finding M1), multiplying the round-trips (especially over a networked SQL backend).
     async fn scan_prefix(&self, prefix: &str) -> Result<Vec<(String, Vec<u8>)>, KvError> {
         let keys = self.list_prefix(prefix).await?;
         let mut out = Vec::with_capacity(keys.len());
