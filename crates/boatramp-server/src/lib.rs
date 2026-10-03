@@ -4069,6 +4069,7 @@ mod tests {
             10,
             Some(2),
             0,
+            None,
         )
         .await;
         assert_eq!(
@@ -4119,6 +4120,7 @@ mod tests {
                 10,
                 None,
                 0,
+                None,
             )
             .await;
             if acked == 0 {
@@ -4157,6 +4159,7 @@ mod tests {
                 10,
                 None,
                 0,
+                None,
             )
             .await;
         }
@@ -4210,6 +4213,7 @@ mod tests {
                 10,
                 None,
                 0,
+                None,
             )
             .await;
             assert_eq!(n, 0, "no events yet for group {g}");
@@ -4241,6 +4245,7 @@ mod tests {
                 10,
                 None,
                 0,
+                None,
             )
             .await;
             assert_eq!(n, 1, "group {g} should receive the message");
@@ -4288,6 +4293,7 @@ mod tests {
             files,
             config: DeployConfig {
                 consumers: vec![ConsumerConfig {
+                    max_concurrency: None,
                     tenancy: None,
                     token_claims: None,
                     secrets: Vec::new(),
@@ -4434,6 +4440,7 @@ mod tests {
             files,
             config: DeployConfig {
                 consumers: vec![ConsumerConfig {
+                    max_concurrency: None,
                     // A `signed_context` scoped tenancy — the realistic per-tenant fan-in shape (the
                     // guest imports no sql/orm, so this only exercises the resolve path, not scoping).
                     tenancy: Some(Tenancy::Scoped {
@@ -4739,6 +4746,7 @@ mod tests {
                     10,
                     None,
                     0,
+                    None,
                 )
                 .await
             }
@@ -4874,6 +4882,7 @@ mod tests {
             files,
             config: DeployConfig {
                 consumers: vec![ConsumerConfig {
+                    max_concurrency: None,
                     tenancy: None,
                     token_claims: None,
                     secrets: Vec::new(),

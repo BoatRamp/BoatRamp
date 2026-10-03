@@ -1037,6 +1037,9 @@ pub(super) async fn run_scheduler_tick(
                                     consumer.max_batch.unwrap_or(CONSUMER_BATCH),
                                     consumer.max_ack_pending,
                                     consumer.backoff_ms.unwrap_or(0),
+                                    // P2 resource isolation: cap THIS consumer's node-wide
+                                    // concurrency (clamped to the async lane); unset ⇒ shares the lane.
+                                    consumer.max_concurrency,
                                 )
                                 .await;
                             }

@@ -3073,6 +3073,11 @@ pub(super) async fn dispatch_consumer_batch(
     // Per-consumer redelivery backoff base (ms); the redelivery of a failed message is held
     // `backoff_ms × attempts` before it's claimable again. 0 ⇒ immediate (historical behavior).
     backoff_ms: u64,
+    // Per-consumer concurrency cap (P2 resource isolation): `Some(n>0)` bounds this consumer to
+    // `min(n, async-lane)` simultaneous invocations node-wide (acquired around each `dispatch_message`
+    // via the engine's per-consumer semaphore), so one consumer's burst can't occupy the shared async
+    // lane and starve others. `None`/0 ⇒ shares the lane budget as before (no regression).
+    consumer_max_concurrency: Option<usize>,
 ) -> usize {
     // Flow control (P2 MaxAckPending): cap the claim so total leased-but-unacked never exceeds the
     // ceiling, across ticks. `in_flight_count` is the topic's outstanding (a slight over-count for a
@@ -3242,6 +3247,18 @@ pub(super) async fn dispatch_consumer_batch(
         };
         let guest_topic = msg.topic.strip_prefix(scope_prefix).unwrap_or(&msg.topic);
         let start = std::time::Instant::now();
+        // P2 resource isolation: when this consumer declares `max_concurrency`, hold a per-consumer
+        // permit (keyed by its stable identity site∥topic∥group) across the invocation, so at most
+        // `min(max_concurrency, async-lane)` of THIS consumer run at once node-wide and a burst can't
+        // monopolize the shared async lane. Unset/0 ⇒ no gate, shares the lane budget as before.
+        let _consumer_permit = match consumer_max_concurrency {
+            Some(cap) if cap > 0 => Some(
+                engine
+                    .consumer_permit(&format!("{site}\u{1}{namespaced_topic}\u{1}{group}"), cap)
+                    .await,
+            ),
+            _ => None,
+        };
         let result = engine
             .dispatch_message(
                 component_hash,
