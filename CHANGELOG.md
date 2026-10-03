@@ -5,6 +5,39 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.12.5] - 2026-10-03
+
+A `tenant_or_base` table's base partition (`tenant_id IS NULL`, shared-read by every tenant) is
+writable at runtime by a route granted `write: "null"` — this has shipped since v0.4.16
+(`AccessMode::Null` → `ScopeMode::NullOnly`), but was easily mistaken for a gap because the
+`write_target` doc comments described only the own-mode behavior. This release regression-locks the
+capability and closes one defense-in-depth gap on the target-write path. Host/core only; no WIT change,
+no shim rev.
+
+### Fixed / hardened
+
+- **A TARGET route may no longer write a `tenant_or_base` base row.** A target scope carries only the
+  target tenant `B`; its only legitimate write to a base-inclusive table is an own-mode stamp of `B`
+  (B's own partition). A `NullOnly` (stamps NULL) or `All` (no stamp → the tenant column defaults to
+  NULL) target write would land the SHARED baseline under `B` — a cross-boundary write — and is now
+  refused (`OrmError::TargetBaseWrite`), at the same level the `SharedWritable` / `TenantOrSession`
+  target refusals already enforce. This is defense-in-depth parity: the production tenancy builder
+  already caps a target write axis to own/none, so the path was not reachable from a shipped build; the
+  guard makes `write_target` fail-closed independently of that upstream invariant.
+- Corrected the misleading Own-mode-only doc comments on the `tenant_or_base` write stamp
+  (`orm::Scope::write_target`, `ResolvedScope::TenantOrBase`) that read as if a base write were
+  impossible.
+
+### Security / correctness
+
+- Mutation-verified anti-hollow gates, wired into the merge gate: a fast `write_target` unit gate (the
+  NULL stamp + the target refusal; RED under `BOATRAMP_BASEWRITE_MUTATION=leak_stamp` /
+  `skip_target_guard`) and a live `catalog_persistence` itest on a real libsql engine (a base write
+  stamps NULL and touches no tenant's candidate — even one sharing a match key; an own-write can't touch
+  the base; a target base write is refused). The `tenant_id IS NULL` confinement is injected
+  structurally (AST-level), never a SQL-text marker. No change to the base⊕own read fold or to any
+  tenant partition's isolation.
+
 ## [0.12.4] - 2026-10-03
 
 Async-lane hardening (two construens requests) plus a workspace-wide Rust-idiomaticity/perf review.
