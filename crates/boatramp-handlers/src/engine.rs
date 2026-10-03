@@ -96,8 +96,10 @@ pub fn build_engine_pooling(limits: &Limits) -> Result<Engine, HandlerError> {
     use wasmtime::{InstanceAllocationStrategy, PoolingAllocationConfig};
     let mut config = base_config()?;
     // Headroom over the concurrency cap: a single component instantiates several
-    // core instances + memories (WASI + the capability worlds).
-    let concurrency = limits.max_concurrency.max(1) as u32;
+    // core instances + memories (WASI + the capability worlds). `with_pooling_lanes` feeds the
+    // SUMMED lane concurrency here (a `usize`), so SATURATE the u32 cast rather than silently
+    // truncating an absurd operator value into a smaller-than-estimated pool.
+    let concurrency = u32::try_from(limits.max_concurrency.max(1)).unwrap_or(u32::MAX);
     let mut pool = PoolingAllocationConfig::default();
     pool.max_memory_size(limits.memory_bytes.max(1));
     pool.total_memories(concurrency.saturating_mul(8).max(16));
