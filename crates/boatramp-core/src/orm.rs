@@ -807,16 +807,22 @@ impl Scope {
             //     NULL; an UPDATE/upsert bounds its WHERE to `IS NULL`, so it can neither create nor
             //     overwrite any tenant's own row);
             //   - `All` → no stamp (posture-gated upstream).
-            // The one refusal: a TARGET scope (carrying only the target tenant `B`) may NOT take the
-            // base-write branch — stamping `NULL` under `B` writes the shared baseline, not `B`'s data,
-            // a cross-boundary blast (mirrors the `SharedWritable`/`TenantOrSession` target refusals).
-            // A target write under an Own-mode grant still stamps `B` (its own partition) — unchanged.
+            // The one refusal: a TARGET scope (carrying only the target tenant `B`) may write a
+            // base-inclusive table ONLY as an `Own`/`OwnOrNull` stamp of `B` (B's own partition). Any
+            // other mode writes the SHARED baseline under `B`, not `B`'s data — a cross-boundary blast:
+            // `NullOnly` stamps `NULL` directly, and `All` takes no stamp so the tenant column falls to
+            // its `NULL` default — both land a base row. Refuse both, builder-independently (not only
+            // the `NullOnly` case), at the same belt-and-suspenders level the sibling `SharedWritable`
+            // and `TenantOrSession` arms enforce. A target `Own`-mode write still stamps `B` —
+            // unchanged. (The production builder `HostTenancy::target` already caps a target write axis
+            // to None/Own, so this is defense-in-depth parity — the predicate no longer relies on that
+            // upstream invariant.)
             ResolvedScope::TenantOrBase { tenant } => {
                 // MUTATION SEAM (gate `skip_target_guard`): removing this refusal lets a TARGET route's
-                // base write stamp `NULL` under the target tenant, so the gate's "target base write is
-                // refused" assertion goes RED. Compiled out of shipped builds.
+                // base write stamp `NULL` (or default-NULL) under the target tenant, so the gate's
+                // "target base write is refused" assertion goes RED. Compiled out of shipped builds.
                 if self.is_target()
-                    && matches!(self.mode, ScopeMode::NullOnly)
+                    && !matches!(self.mode, ScopeMode::Own | ScopeMode::OwnOrNull)
                     && basewrite_mutation().as_deref() != Some("skip_target_guard")
                 {
                     return Err(OrmError::TargetBaseWrite(table.to_string()));
@@ -6314,12 +6320,15 @@ mod tests {
             Some(("tenant_id".to_string(), t("admin_tenant"))),
             "an own-mode write still stamps the resolved tenant"
         );
-        // A TARGET base write (write-set non-empty, so it is granted and reaches the arm) is refused.
-        let target = Scope {
+        // A TARGET base write (write-set non-empty, so it is granted and reaches the arm) is refused —
+        // for BOTH base-landing modes: `NullOnly` (stamps NULL) and `All` (no stamp → default NULL).
+        // An `Own`/`OwnOrNull` target write (stamping B, B's own partition) is NOT refused (the
+        // legitimate target-write-to-B flow) and is covered by the other batteries.
+        let target = |mode: ScopeMode| Scope {
             column: "tenant_id".into(),
             value: Some(t("B")),
             session: None,
-            mode: ScopeMode::NullOnly,
+            mode,
             keys: TableKeys::PerTableTarget {
                 keys: std::collections::BTreeMap::from([(
                     "reference_entity".to_string(),
@@ -6334,14 +6343,16 @@ mod tests {
             unscoped_writes: std::collections::BTreeSet::new(),
             pass_unresolved: false,
         };
-        assert!(
-            matches!(
-                target.write_target("reference_entity"),
-                Err(OrmError::TargetBaseWrite(ref tbl)) if tbl == "reference_entity"
-            ),
-            "a TARGET route may not write the NULL base: {:?}",
-            target.write_target("reference_entity")
-        );
+        for mode in [ScopeMode::NullOnly, ScopeMode::All] {
+            assert!(
+                matches!(
+                    target(mode).write_target("reference_entity"),
+                    Err(OrmError::TargetBaseWrite(ref tbl)) if tbl == "reference_entity"
+                ),
+                "a TARGET route may not write the base (mode {mode:?}): {:?}",
+                target(mode).write_target("reference_entity")
+            );
+        }
         println!("BASE-WRITE WRITE-TARGET OK");
     }
 }
