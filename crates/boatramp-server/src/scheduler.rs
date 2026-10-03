@@ -58,6 +58,43 @@ pub(super) enum AsyncPass {
     UnshardedSafetyNet,
 }
 
+/// The dispatch scope for a consumer / cron on `(project, base)` where `base` is the site (or
+/// `{site}/{alias}`). PROJECT-QUALIFIED, identical to the handler path (`project_ref.qualified`) and
+/// the function path, so a consumer/cron's `wasi:blobstore` (`hblob/{scope}/…`) and its plain-topic
+/// namespace resolve to the SAME namespace this project's handlers use, isolated across projects that
+/// share a site name. `qualified` is a no-op for the default project (byte-identical to the pre-fix
+/// bare scope), so only non-default projects change — closing the bug where a non-default project's
+/// consumer addressed an empty, cross-project-colliding `hblob/{site}/…`.
+#[cfg(feature = "handlers")]
+fn consumer_dispatch_scope(project: ProjectRef<'_>, base: &str) -> String {
+    // MUTATION SEAM (gate `bare_scope`): drop the project qualification, reproducing the bug (the
+    // consumer scope diverges from the handler's). Compiled out of shipped builds; the gate then goes
+    // RED because the consumer scope no longer equals the handler's `qualified` scope.
+    if consumerscope_mutation().as_deref() == Some("bare_scope") {
+        return base.to_string();
+    }
+    project.qualified(base)
+}
+
+/// The active consumer-scope mutation (anti-hollow gate), or `None`. Present ONLY under `cfg(test)`
+/// or the `consumer-scope-gate-mutation` feature; a shipped build has neither, so
+/// [`consumer_dispatch_scope`] always project-qualifies and this is a dead `None`.
+#[cfg(all(
+    feature = "handlers",
+    any(test, feature = "consumer-scope-gate-mutation")
+))]
+fn consumerscope_mutation() -> Option<String> {
+    std::env::var("BOATRAMP_CONSUMERSCOPE_MUTATION").ok()
+}
+#[cfg(all(
+    feature = "handlers",
+    not(any(test, feature = "consumer-scope-gate-mutation"))
+))]
+#[inline]
+fn consumerscope_mutation() -> Option<String> {
+    None
+}
+
 /// Per-invocation limits from the site's caps only (consumers have no
 /// per-component limit config), clamped to the engine ceiling downstream.
 #[cfg(feature = "handlers")]
@@ -815,13 +852,23 @@ pub(super) async fn run_scheduler_tick(
             };
             // Active deployments: the current one (production, namespace `{site}`)
             // plus each background alias (namespace `{site}/{alias}`). Never previews.
+            // The binding scope is PROJECT-QUALIFIED (`consumer_dispatch_scope`), exactly like the
+            // handler path (`handler_dispatch.rs` `project_ref.qualified(&base)`) and the function
+            // path (`project_ref.qualified("fn/…")`) — so a consumer/cron's `wasi:blobstore`
+            // (`hblob/{scope}/…`) and its plain-topic namespace resolve to the SAME namespace this
+            // project's handlers use, and are isolated across projects that share a site name. A BARE
+            // scope (the pre-fix bug) pointed a non-default project's consumer at an empty,
+            // cross-project-colliding `hblob/{site}/…`.
             let mut active: Vec<(String, String)> = Vec::new();
             if let Some(id) = deploy.current_id(project, &site).await? {
-                active.push((id, site.clone()));
+                active.push((id, consumer_dispatch_scope(project, &site)));
             }
             for alias in &site_handlers.background_aliases {
                 if let Some(id) = deploy.get_alias(project, &site, alias).await? {
-                    active.push((id, format!("{site}/{alias}")));
+                    active.push((
+                        id,
+                        consumer_dispatch_scope(project, &format!("{site}/{alias}")),
+                    ));
                 }
             }
             for (deploy_id, scope) in active {
@@ -1549,4 +1596,49 @@ pub(super) fn handler_error_response(err: &boatramp_handlers::HandlerError) -> R
         | HandlerError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "handler error\n"),
     };
     (status, body).into_response()
+}
+
+#[cfg(all(test, feature = "handlers"))]
+mod consumer_scope_gate {
+    use super::consumer_dispatch_scope;
+    use boatramp_core::project::ProjectRef;
+
+    /// GATE (boatramp-consumer-blob-scope-bug) — a consumer/cron dispatch scope is PROJECT-QUALIFIED,
+    /// identical to the handler path, so its `wasi:blobstore` (`hblob/{scope}/…`) and plain-topic
+    /// namespace resolve to the SAME namespace this project's handlers use, isolated across projects.
+    /// Mutation-verified: `BOATRAMP_CONSUMERSCOPE_MUTATION=bare_scope` drops the qualification (the
+    /// pre-fix bug) → the "equals the handler's qualified scope" assertion goes RED. Marker
+    /// `CONSUMER BLOB SCOPE OK`.
+    #[test]
+    fn consumer_scope_is_project_qualified_and_isolated() {
+        let p = ProjectRef::new("construens-preview");
+        // The invariant: a consumer's scope EQUALS what the handler path computes for the same
+        // (project, site) — `project_ref.qualified(site)`. This is the exact bug: they must match.
+        assert_eq!(
+            consumer_dispatch_scope(p, "console"),
+            p.qualified("console"),
+            "consumer scope must equal the handler's project-qualified scope"
+        );
+        assert_eq!(
+            consumer_dispatch_scope(p, "console"),
+            "construens-preview/console"
+        );
+        // Background alias is qualified too.
+        assert_eq!(
+            consumer_dispatch_scope(p, "console/thumbs"),
+            "construens-preview/console/thumbs"
+        );
+        // Default project: byte-identical to the bare site (no regression on the pre-project layout).
+        assert_eq!(
+            consumer_dispatch_scope(ProjectRef::DEFAULT, "console"),
+            "console"
+        );
+        // Cross-project isolation: two projects' `console` consumers get DISTINCT scopes, so one can
+        // never address the other's `hblob/.../console/...` namespace.
+        assert_ne!(
+            consumer_dispatch_scope(ProjectRef::new("alpha"), "console"),
+            consumer_dispatch_scope(ProjectRef::new("beta"), "console"),
+        );
+        println!("CONSUMER BLOB SCOPE OK");
+    }
 }
