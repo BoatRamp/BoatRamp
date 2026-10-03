@@ -1552,10 +1552,11 @@ jobs:
           grep -qE 'test result: ok\. 10 passed' kvsql-nodb-core.log \
             || { echo "::error::kv-sql no-DB core battery did not run all 10 (a cfg/rename silent-drop or a failure)" >&2; exit 1; }
           # boatramp-storage — the embedded SQLite SqlKv over the shared conformance suite + value-CAS
-          # + durability + change-log/custody + dump. (`--features sql`, 10 `sqlkv_*` gates.)
+          # + durability + change-log/custody + dump + the v0.12.4 cancellation-heal recovery.
+          # (`--features sql`, 11 `sqlkv_*` gates.)
           cargo test -p boatramp-storage --features sql --lib -- --test-threads=1 sqlkv_ 2>&1 | tee kvsql-nodb-sqlite.log
-          grep -qE 'test result: ok\. 10 passed' kvsql-nodb-sqlite.log \
-            || { echo "::error::kv-sql no-DB SQLite battery did not run all 10 (a cfg/rename silent-drop or a failure)" >&2; exit 1; }
+          grep -qE 'test result: ok\. 11 passed' kvsql-nodb-sqlite.log \
+            || { echo "::error::kv-sql no-DB SQLite battery did not run all 11 (a cfg/rename silent-drop or a failure)" >&2; exit 1; }
           # boatramp-server — the MF-3/MF-4 fence + fail-closed + local-mode no-shed over MemoryKv /
           # FailingKv (backend-agnostic; `--features handlers` so graphql_cache compiles). (6 gates.)
           cargo test -p boatramp-server --features handlers --lib -- --test-threads=1 \
