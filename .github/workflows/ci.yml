@@ -414,6 +414,36 @@ jobs:
             fi
           done
 
+      # v0.12.4 ASYNC-LANE RESOURCE GATES (raisable per-lane memory ceiling + per-consumer async
+      # concurrency + the out-of-memory terminal outcome). Two operator-budget clamps: a per-invocation
+      # memory override may only LOWER a lane's ceiling (never raise it past `*_max_memory_mb`), and a
+      # per-consumer `max_concurrency` is floored to the async lane budget (`min(cap, async)`). The
+      # gates are PAIRED clean+mutation tests that carry the anti-hollow proof IN-PROCESS: each clean
+      # test asserts the SECURE clamped value (so a hollowed clamp fails it — e.g. a 512 MiB request
+      # clamping to the 128 MiB ceiling, a cap of 100 flooring to a lane of 4, an uncapped request
+      # inheriting the raised ceiling) and each `mutation_*` test arms `BOATRAMP_ASYNCLANE_MUTATION`
+      # itself and asserts the clamp is GONE (the escape) — a self-contained RED-under-mutation proof
+      # that needs no external env loop (unlike the gates above, whose clean tests don't self-arm).
+      # This step proves they RUN in the merge gate (exact pass count + the two mutation test names),
+      # per the "ignore-gated tests ≠ evidence" discipline; the end-to-end OOM serve test additionally
+      # runs in nightly's `--all-features` suite.
+      - name: "v0.12.4 async-lane memory + per-consumer concurrency gates"
+        run: |
+          set -eo pipefail
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-handlers \
+            --features engine,messaging engine::tests::lane_clamp_gates -- --test-threads=1 --nocapture 2>&1 | tee async-lane.log
+          grep -qE 'test result: ok\. 5 passed' async-lane.log \
+            || { echo "::error::async-lane clamp gates did not run (silent skip/failure, or the count drifted from 5)" >&2; exit 1; }
+          for t in mutation_mem_override_escapes_the_ceiling mutation_consumer_cap_escapes_the_lane_budget; do
+            grep -q "lane_clamp_gates::$t ... ok" async-lane.log \
+              || { echo "::error::async-lane mutation gate '$t' did not run — the clamp seam is unproven (a rename or a hollow clamp)" >&2; exit 1; }
+          done
+          # OOM classification precedence (a denied grow → OutOfMemory; explicit interrupt/fuel win).
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-handlers \
+            --features engine,messaging engine::tests::classify_maps_oom_flag_but_explicit_trap_kinds_win 2>&1 | tee oom-classify.log
+          grep -qE 'test result: ok\. 1 passed' oom-classify.log \
+            || { echo "::error::OOM classification gate did not run (silent skip or a failure)" >&2; exit 1; }
+
   # SlateDB WAL-recovery HARD GATE (v0.5.5 incident: the control-plane KV was unbootable with
   # `Data error: empty SSTable` after a crash / crash-consistent snapshot froze a zero-byte tail WAL
   # object). Proves a store with such a frozen tail WAL still OPENS — the incident fix (`slatedb` 0.16
@@ -775,6 +805,25 @@ jobs:
               echo "claim-transform mutation verified: $mut turns the derived-key gate RED → the screen is load-bearing."
             fi
           done
+      - name: "v0.12.4 H2 SQLite KV cancellation-heal gate"
+        run: |
+          set -eo pipefail
+          # H2 cached one shared SQLite/libsql connection; a write whose future is dropped between
+          # BEGIN IMMEDIATE and finish() would leave the connection mid-transaction and brick every
+          # later control-plane KV write (an attacker-triggerable DoS on a crown-jewel store). The fix
+          # heals a zombie transaction on acquire (`lock_clean`). Runs on the HOST toolchain (a
+          # static-musl libsql test binary segfaults — same quirk as the ORM tenancy gate above). The
+          # gate is a PAIRED clean+mutation test: the clean test leaks an open txn then asserts the next
+          # write recovers; `mutation_skip_conn_heal_bricks_the_next_write` arms
+          # BOATRAMP_KVSQL_MUTATION=skip_conn_heal and asserts the next write FAILS (RED) — proving the
+          # heal is load-bearing, in-process. Single-threaded because both touch the shared mutation env.
+          cargo test -p boatramp-storage --features sql --lib -- --test-threads=1 --nocapture \
+            kv_sql::sqlite_tests::sqlkv_recovers_from_a_cancelled_write_leaving_an_open_txn \
+            kv_sql::sqlite_tests::mutation_skip_conn_heal_bricks_the_next_write 2>&1 | tee kv-cancel-heal.log
+          grep -qE 'test result: ok\. 2 passed' kv-cancel-heal.log \
+            || { echo "::error::H2 KV cancellation-heal gate did not run (silent skip/failure, or the count drifted from 2)" >&2; exit 1; }
+          grep -q 'mutation_skip_conn_heal_bricks_the_next_write ... ok' kv-cancel-heal.log \
+            || { echo "::error::H2 cancellation mutation gate did not run — the heal is unproven (a rename or a hollow heal)" >&2; exit 1; }
       - name: Owner-gated schema-migration libsql/SQLite parity SUBSTRATE on a real embedded file
         run: |
           set -eo pipefail
