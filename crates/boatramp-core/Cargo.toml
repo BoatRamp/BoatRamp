@@ -61,6 +61,13 @@ shared-mode-gate-mutation = []
 # corresponding G1/G2/G3 gate RED. Mirrors `crownjewel-cas-gate-mutation`. Compiled OUT of every real
 # build (the seam also compiles under this crate's own `cfg(test)`).
 claim-transform-gate-mutation = []
+# Anti-hollow gate lane for the `tenant_or_base` base-write capability: lets a test / the
+# `boatramp-storage` catalog_persistence gate set `BOATRAMP_BASEWRITE_MUTATION` to disable ONE
+# invariant in `Scope::write_target` — `leak_stamp` (a base write stamps a tenant value instead of the
+# NULL baseline → leaks into a tenant partition) or `skip_target_guard` (drops the target-route
+# refusal) — turning the gate RED. Mirrors `claim-transform-gate-mutation`. Compiled OUT of every real
+# build (the seam also compiles under this crate's own `cfg(test)`).
+basewrite-gate-mutation = []
 
 [dependencies]
 # The shared, wasm-clean type + routing/config layer (re-exported below so

@@ -779,6 +779,17 @@ impl Scope {
         let tenant_stamp = || -> Result<Option<SqlValue>, OrmError> {
             Ok(match self.mode {
                 ScopeMode::All => None,
+                // MUTATION SEAM (gate `leak_stamp`): a base write must stamp the NULL baseline; forcing
+                // a non-NULL value here LEAKS the shared-base write into a tenant partition, so the
+                // gate's "base row lands `tenant_id IS NULL`, touches no tenant row" assertion goes RED.
+                // Compiled out of shipped builds (dead `None` otherwise).
+                ScopeMode::NullOnly if basewrite_mutation().as_deref() == Some("leak_stamp") => {
+                    Some(
+                        self.value
+                            .clone()
+                            .unwrap_or(SqlValue::Text("__leak__".into())),
+                    )
+                }
                 ScopeMode::NullOnly => Some(SqlValue::Null),
                 ScopeMode::Own | ScopeMode::OwnOrNull => {
                     Some(self.value.clone().ok_or(OrmError::TenancyNoPrincipal)?)
@@ -787,11 +798,31 @@ impl Scope {
         };
         match self.resolve_table(table)? {
             ResolvedScope::Column(col) => Ok(tenant_stamp()?.map(|v| (col, v))),
-            // A base-inclusive table WRITES exactly like a plain tenant `Column` table: stamp the
-            // resolved tenant (never `NULL`). The base⊕own fold is read-only — a guest write can
-            // neither create nor update a `NULL`-base row (base rows are operator-seeded via a
-            // privileged `NullOnly`/`All` path, unreachable from a guest's `Own`-mode write).
-            ResolvedScope::TenantOrBase { tenant } => Ok(tenant_stamp()?.map(|v| (tenant, v))),
+            // A base-inclusive table's write stamp follows the WRITE-axis mode, exactly like a plain
+            // `Column` table (both route through `tenant_stamp()`):
+            //   - `Own`/`OwnOrNull` → the resolved tenant (writes the caller's own partition);
+            //   - `NullOnly` (the `write:"null"` grant) → `NULL`, writing the SHARED baseline (the base
+            //     half of the base⊕own fold) — an explicit, deny-by-default operator grant, ceiling-
+            //     bounded, structurally confined to `tenant_id IS NULL` (an INSERT leaves the column
+            //     NULL; an UPDATE/upsert bounds its WHERE to `IS NULL`, so it can neither create nor
+            //     overwrite any tenant's own row);
+            //   - `All` → no stamp (posture-gated upstream).
+            // The one refusal: a TARGET scope (carrying only the target tenant `B`) may NOT take the
+            // base-write branch — stamping `NULL` under `B` writes the shared baseline, not `B`'s data,
+            // a cross-boundary blast (mirrors the `SharedWritable`/`TenantOrSession` target refusals).
+            // A target write under an Own-mode grant still stamps `B` (its own partition) — unchanged.
+            ResolvedScope::TenantOrBase { tenant } => {
+                // MUTATION SEAM (gate `skip_target_guard`): removing this refusal lets a TARGET route's
+                // base write stamp `NULL` under the target tenant, so the gate's "target base write is
+                // refused" assertion goes RED. Compiled out of shipped builds.
+                if self.is_target()
+                    && matches!(self.mode, ScopeMode::NullOnly)
+                    && basewrite_mutation().as_deref() != Some("skip_target_guard")
+                {
+                    return Err(OrmError::TargetBaseWrite(table.to_string()));
+                }
+                Ok(tenant_stamp()?.map(|v| (tenant, v)))
+            }
             // #503 arm 2 — the **write-global** table (`unscoped { writable: true }`): a non-target
             // scoped route may write it with NO tenant stamp (the genuinely-tenant-less shared-data
             // write). HIGH condition: `!is_target()` — a TARGET write to a write-global table is
@@ -1730,6 +1761,31 @@ pub enum OrmError {
         "tenancy: target write may not touch TenantOrSession table {0:?} (no session fact under a target scope — write it on the session-scoped path)"
     )]
     TargetWriteToSessionTable(String),
+    /// A TARGET write carrying a base-write (`write:"null"` / `NullOnly`) grant touched a
+    /// `tenant_or_base` table. A target principal carries only the target tenant `B`, but a base write
+    /// stamps `tenant = NULL` — the SHARED baseline every tenant reads, not `B`'s data. Writing the
+    /// base under a target scope is a cross-boundary blast (the write-global `SharedWritable` target
+    /// write is refused for the same reason), so refuse it deny-by-default: write the base on a
+    /// non-target route that holds the grant. A target write under an Own-mode grant still stamps `B`
+    /// (writes `B`'s own partition) and is unaffected.
+    #[error(
+        "tenancy: target write may not write the NULL base of tenant_or_base table {0:?} (a base/`write:\"null\"` write stamps the shared baseline, not the target tenant — write it on a non-target route)"
+    )]
+    TargetBaseWrite(String),
+}
+
+/// The active base-write mutation (anti-hollow gate), or `None`. Present ONLY under `cfg(test)` (core's
+/// own unit tests) or the `basewrite-gate-mutation` feature (which the `boatramp-storage`
+/// `catalog_persistence` gate lane enables); a shipped build has neither, so the base-write NULL stamp
+/// and the target-route refusal in [`Scope::write_target`] are unconditional and this is a dead `None`.
+#[cfg(any(test, feature = "basewrite-gate-mutation"))]
+fn basewrite_mutation() -> Option<String> {
+    std::env::var("BOATRAMP_BASEWRITE_MUTATION").ok()
+}
+#[cfg(not(any(test, feature = "basewrite-gate-mutation")))]
+#[inline]
+fn basewrite_mutation() -> Option<String> {
+    None
 }
 
 /// The compiled statement: `?N` SQL plus its bound parameters, in placeholder order.
@@ -6209,5 +6265,83 @@ mod tests {
             ..attach_spec()
         };
         assert!(compile_attach_reference(&scope, &spec, Dialect::Sqlite).is_err());
+    }
+
+    /// GATE (base-write, mutation-verified) — `write_target` on a `tenant_or_base` table across the
+    /// three cases the v0.12.5 hardening pins: a NON-target `write:"null"` (`NullOnly`) grant stamps
+    /// the NULL baseline; an own-mode write still stamps the resolved tenant; a TARGET `NullOnly`
+    /// grant is REFUSED (`TargetBaseWrite` — a target carries only `B`, so a base write under it would
+    /// stamp the shared baseline, a cross-boundary blast). `BOATRAMP_BASEWRITE_MUTATION=leak_stamp`
+    /// makes the base stamp non-NULL (the NULL assertion goes RED); `=skip_target_guard` drops the
+    /// target refusal (the Err assertion goes RED). Marker `BASE-WRITE WRITE-TARGET OK`.
+    #[test]
+    fn base_write_target_stamps_null_and_refuses_target() {
+        let tob = || {
+            TableKeys::PerTable(std::collections::BTreeMap::from([(
+                "reference_entity".to_string(),
+                ResolvedScope::TenantOrBase {
+                    tenant: "tenant_id".into(),
+                },
+            )]))
+        };
+        // A non-target base write (`write:"null"`) stamps the NULL baseline.
+        let base = Scope {
+            column: "tenant_id".into(),
+            value: Some(t("admin_tenant")),
+            session: None,
+            mode: ScopeMode::NullOnly,
+            keys: tob(),
+            unscoped_writes: std::collections::BTreeSet::new(),
+            pass_unresolved: false,
+        };
+        assert_eq!(
+            base.write_target("reference_entity").unwrap(),
+            Some(("tenant_id".to_string(), SqlValue::Null)),
+            "a non-target write:\"null\" base write must stamp tenant_id = NULL"
+        );
+        // An own-mode write on the same table still stamps the resolved tenant (unchanged).
+        let own = Scope {
+            column: "tenant_id".into(),
+            value: Some(t("admin_tenant")),
+            session: None,
+            mode: ScopeMode::Own,
+            keys: tob(),
+            unscoped_writes: std::collections::BTreeSet::new(),
+            pass_unresolved: false,
+        };
+        assert_eq!(
+            own.write_target("reference_entity").unwrap(),
+            Some(("tenant_id".to_string(), t("admin_tenant"))),
+            "an own-mode write still stamps the resolved tenant"
+        );
+        // A TARGET base write (write-set non-empty, so it is granted and reaches the arm) is refused.
+        let target = Scope {
+            column: "tenant_id".into(),
+            value: Some(t("B")),
+            session: None,
+            mode: ScopeMode::NullOnly,
+            keys: TableKeys::PerTableTarget {
+                keys: std::collections::BTreeMap::from([(
+                    "reference_entity".to_string(),
+                    ResolvedScope::TenantOrBase {
+                        tenant: "tenant_id".into(),
+                    },
+                )]),
+                public: std::collections::BTreeMap::new(),
+                write: std::collections::BTreeSet::from(["name".to_string()]),
+                require_public: false,
+            },
+            unscoped_writes: std::collections::BTreeSet::new(),
+            pass_unresolved: false,
+        };
+        assert!(
+            matches!(
+                target.write_target("reference_entity"),
+                Err(OrmError::TargetBaseWrite(ref tbl)) if tbl == "reference_entity"
+            ),
+            "a TARGET route may not write the NULL base: {:?}",
+            target.write_target("reference_entity")
+        );
+        println!("BASE-WRITE WRITE-TARGET OK");
     }
 }
