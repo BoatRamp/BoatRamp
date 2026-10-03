@@ -3116,6 +3116,16 @@ pub(super) async fn dispatch_consumer_batch(
     let bind_time_context = bindings
         .producer_context_cell()
         .and_then(|cell| cell.lock().ok().and_then(|guard| guard.clone()));
+    // P2 resource isolation: resolve the per-consumer concurrency gate ONCE per batch (the key +
+    // semaphore are loop-invariant — `site`/`namespaced_topic`/`group` are batch-level). Each message
+    // then only `.acquire_owned()`s a permit off this Arc, so the engine's gate map is locked once per
+    // batch, not once per message. `None` ⇒ the consumer declared no `max_concurrency` (shares the lane).
+    let consumer_gate = match consumer_max_concurrency {
+        Some(cap) if cap > 0 => {
+            Some(engine.consumer_gate(&format!("{site}\u{1}{namespaced_topic}\u{1}{group}"), cap))
+        }
+        _ => None,
+    };
     for msg in claimed {
         // SECURITY CRUX (v0.7.1 tenant-template bind-verify, Item 3). This concrete topic was reached
         // via a `{tenant}` template match ⇒ `expected_tenant = Some(bound)`, `bound` being the topic's
@@ -3247,17 +3257,18 @@ pub(super) async fn dispatch_consumer_batch(
         };
         let guest_topic = msg.topic.strip_prefix(scope_prefix).unwrap_or(&msg.topic);
         let start = std::time::Instant::now();
-        // P2 resource isolation: when this consumer declares `max_concurrency`, hold a per-consumer
-        // permit (keyed by its stable identity site∥topic∥group) across the invocation, so at most
-        // `min(max_concurrency, async-lane)` of THIS consumer run at once node-wide and a burst can't
-        // monopolize the shared async lane. Unset/0 ⇒ no gate, shares the lane budget as before.
-        let _consumer_permit = match consumer_max_concurrency {
-            Some(cap) if cap > 0 => Some(
-                engine
-                    .consumer_permit(&format!("{site}\u{1}{namespaced_topic}\u{1}{group}"), cap)
-                    .await,
+        // P2 resource isolation: hold a per-consumer permit across this invocation (off the
+        // once-per-batch `consumer_gate` resolved above), so at most `min(max_concurrency, async-lane)`
+        // of THIS consumer run at once node-wide and a burst can't monopolize the shared async lane.
+        // Cloning the `Arc` + `acquire_owned` is the only per-message cost (no key alloc, no map lock).
+        let _consumer_permit = match &consumer_gate {
+            Some(sem) => Some(
+                sem.clone()
+                    .acquire_owned()
+                    .await
+                    .expect("per-consumer semaphore is never closed"),
             ),
-            _ => None,
+            None => None,
         };
         let result = engine
             .dispatch_message(
