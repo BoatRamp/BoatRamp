@@ -686,6 +686,30 @@ mod postgres_backend {
             begin_on(pool, true).await
         }
 
+        async fn query_autocommit(
+            &self,
+            sql: &str,
+            params: &[SqlValue],
+        ) -> Result<SqlRows, SqlError> {
+            // Autocommit single-statement read directly on the (read) pool — no BEGIN/COMMIT
+            // round-trips (H1). Same placeholder rewrite + binding as `PgTransaction::query`.
+            let pool = self.read_pool.as_ref().unwrap_or(&self.pool);
+            let stmt = crate::sql_placeholders::normalize(
+                sql,
+                PlaceholderDialect::Postgres,
+                params.len(),
+            )?;
+            let bound = stmt.reorder(params);
+            let q = bind_params!(
+                sqlx::query(stmt.sql.as_ref()),
+                bound.as_ref(),
+                PgUntypedNull,
+                PgJsonb,
+            );
+            let rows = q.fetch_all(pool).await.map_err(map_err)?;
+            rows_to_sql(&rows)
+        }
+
         async fn run_script(&self, sql: &str) -> Result<(), SqlError> {
             // Simple-query protocol on one pooled connection: runs the whole
             // multi-statement script (CREATE EXTENSION + chained DDL) that the
@@ -984,6 +1008,27 @@ mod mysql_backend {
         async fn begin_read_only(&self) -> Result<Box<dyn SqlTransaction>, SqlError> {
             let pool = self.read_pool.as_ref().unwrap_or(&self.pool);
             begin_on(pool, true).await
+        }
+
+        async fn query_autocommit(
+            &self,
+            sql: &str,
+            params: &[SqlValue],
+        ) -> Result<SqlRows, SqlError> {
+            // Autocommit single-statement read directly on the (read) pool — no
+            // START TRANSACTION/COMMIT round-trips (H1). Mirrors `MySqlTransaction::query`.
+            let pool = self.read_pool.as_ref().unwrap_or(&self.pool);
+            let stmt =
+                crate::sql_placeholders::normalize(sql, PlaceholderDialect::MySql, params.len())?;
+            let bound = stmt.reorder(params);
+            let q = bind_params!(
+                sqlx::query(stmt.sql.as_ref()),
+                bound.as_ref(),
+                Option::<String>::None,
+                json_as_text,
+            );
+            let rows = q.fetch_all(pool).await.map_err(map_err)?;
+            rows_to_sql(&rows)
         }
 
         async fn run_script(&self, sql: &str) -> Result<(), SqlError> {
