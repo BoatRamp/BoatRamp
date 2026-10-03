@@ -473,6 +473,32 @@ jobs:
             fi
           done
 
+      # CONSUMER/CRON BLOB-SCOPE gate (boatramp-consumer-blob-scope-bug): a consumer/cron's binding
+      # scope must be PROJECT-QUALIFIED, identical to the handler path, so its `wasi:blobstore`
+      # (`hblob/{scope}/…`) and plain-topic namespace resolve to the SAME namespace this project's
+      # handlers use, isolated across projects that share a site name (the bug: a non-default project's
+      # consumer used the BARE site scope → an empty, cross-project-colliding `hblob/{site}/…`). Marker
+      # `CONSUMER BLOB SCOPE OK`. MUTATION-VERIFIED: `bare_scope` (via `consumer-scope-gate-mutation`)
+      # drops the qualification → the "equals the handler's qualified scope" assertion goes RED.
+      - name: "consumer/cron blob-scope gate (project-qualified, cross-project isolated)"
+        run: |
+          set -eo pipefail
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-server \
+            --features handlers --lib consumer_scope_is_project_qualified_and_isolated \
+            -- --nocapture 2>&1 | tee consumer-scope.log
+          grep -qE 'test result: ok\. 1 passed' consumer-scope.log \
+            || { echo "::error::consumer blob-scope gate did not run (silent skip or a failure)" >&2; exit 1; }
+          grep -q 'CONSUMER BLOB SCOPE OK' consumer-scope.log \
+            || { echo "::error::consumer blob-scope gate never reached its marker (a scope-qualification regression or a skipped test)" >&2; exit 1; }
+          if BOATRAMP_CONSUMERSCOPE_MUTATION=bare_scope cargo-zigbuild test --target x86_64-unknown-linux-musl \
+            -p boatramp-server --features handlers,consumer-scope-gate-mutation \
+            --lib consumer_scope_is_project_qualified_and_isolated > consumer-scope-mutation.log 2>&1; then
+            echo "::error::consumer blob-scope gate is HOLLOW — it passed under bare_scope (the consumer scope is not actually project-qualified)" >&2
+            exit 1
+          else
+            echo "consumer-scope mutation verified: bare_scope turns the gate RED → the qualification is load-bearing."
+          fi
+
       # MULTI-ISSUER TRUST — LIVE end-to-end gate (clean pass + live gate are BOTH preconditions). The
       # unit gate above proves the four predicates in isolation; this drives the REAL discovery → host-
       # pin → redirect-refusal → fetch → verify path against a localhost mock (via the TEST_LOOPBACK
