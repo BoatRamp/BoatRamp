@@ -93,10 +93,19 @@ pub async fn build_handler_runtime(
     // an LLM generation) can declare and actually get minutes of runtime without
     // ever starving live site traffic.
     let defaults = boatramp_handlers::Limits::default();
+    // MiB → bytes; a lane's memory ceiling defaults to the 64 MiB `Limits::default`
+    // and is RAISED (never lowered below it) by the operator's `*_max_memory_mb` knob.
+    // The existing `effective_limits` min()-clamp then lets a component's own
+    // `memory_mb` clamp it back DOWN from the raised lane ceiling.
+    let mib = |mb: usize| mb.saturating_mul(1024 * 1024);
     let sync_limits = boatramp_handlers::Limits {
         timeout_ms: handlers_cfg
             .and_then(|h| h.sync_max_timeout_ms)
             .unwrap_or(defaults.timeout_ms),
+        memory_bytes: handlers_cfg
+            .and_then(|h| h.sync_max_memory_mb)
+            .map(mib)
+            .unwrap_or(defaults.memory_bytes),
         ..defaults
     };
     let async_limits = boatramp_handlers::Limits {
@@ -107,6 +116,12 @@ pub async fn build_handler_runtime(
             .and_then(|h| h.async_max_concurrency)
             .unwrap_or(DEFAULT_ASYNC_CONCURRENCY),
         fuel: handlers_cfg.and_then(|h| h.async_max_fuel),
+        // Explicit (not inherited from `sync_limits`): the async memory ceiling is its
+        // own knob, so a raised sync ceiling never silently raises async and vice versa.
+        memory_bytes: handlers_cfg
+            .and_then(|h| h.async_max_memory_mb)
+            .map(mib)
+            .unwrap_or(defaults.memory_bytes),
         ..sync_limits
     };
     // The **streaming** ceiling bounds a `#[handler(stream)]` response (SSE, chunked, agent
@@ -121,20 +136,33 @@ pub async fn build_handler_runtime(
             .and_then(|h| h.streaming_max_concurrency)
             .unwrap_or(DEFAULT_STREAMING_CONCURRENCY),
         fuel: handlers_cfg.and_then(|h| h.streaming_max_fuel),
+        memory_bytes: handlers_cfg
+            .and_then(|h| h.streaming_max_memory_mb)
+            .map(mib)
+            .unwrap_or(defaults.memory_bytes),
         ..sync_limits
     };
     let outbound_timeout = handlers_cfg
         .and_then(|h| h.outbound_timeout_ms)
         .map(std::time::Duration::from_millis);
     // Opt-in pooling allocator: faster instantiation, large up-front virtual
-    // reservation — benchmark before enabling.
+    // reservation — benchmark before enabling. With a raised lane memory ceiling the
+    // single shared pool must be sized off the LARGEST lane (so an instance on any
+    // lane fits its slot); `with_pooling_lanes` does that + logs/fails loud on an
+    // implausible reservation. The non-pooling path sizes memory per-invocation
+    // (`StoreLimits`), so a raised ceiling there needs no reservation.
     let engine = if handlers_cfg.is_some_and(|h| h.pooling) {
-        boatramp_handlers::HandlerEngine::with_pooling(sync_limits, 64)?
+        boatramp_handlers::HandlerEngine::with_pooling_lanes(
+            sync_limits,
+            async_limits,
+            streaming_limits,
+            64,
+        )?
     } else {
         boatramp_handlers::HandlerEngine::new(sync_limits, 64)?
+            .with_async_limits(async_limits)
+            .with_streaming_limits(streaming_limits)
     }
-    .with_async_limits(async_limits)
-    .with_streaming_limits(streaming_limits)
     .with_outbound_timeout(outbound_timeout)
     .with_private_egress(allow_guest_private_egress)
     .with_self_egress(self_egress_addrs)

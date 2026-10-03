@@ -644,6 +644,78 @@ impl HandlerEngine {
         Self::from_engine(build_engine_pooling(&limits)?, limits, cache_size)
     }
 
+    /// Like [`with_pooling`](Self::with_pooling) but for the full three-lane model:
+    /// the single shared pool is sized off the **largest** lane (the max memory
+    /// ceiling + the max concurrency across lanes), so an instance dispatched on ANY
+    /// lane fits a pool slot — while each lane keeps its own ceiling and the
+    /// per-invocation [`StoreLimits`] still clamps every instance down to its
+    /// effective (lane ∧ component) memory. This is how a raised `async` memory
+    /// ceiling works under pooling without a separate engine per lane.
+    ///
+    /// The pooling allocator reserves ≈ `max_lane_memory × total_memories` of VIRTUAL
+    /// address space up front; this logs that estimate and warns loudly when it is
+    /// large, so an operator who raised a lane ceiling sees the cost (and a failure to
+    /// reserve surfaces as a clear build error rather than a silent first-invocation
+    /// OOM).
+    pub fn with_pooling_lanes(
+        sync: Limits,
+        async_: Limits,
+        streaming: Limits,
+        cache_size: usize,
+    ) -> Result<Self, HandlerError> {
+        let pool_memory = sync
+            .memory_bytes
+            .max(async_.memory_bytes)
+            .max(streaming.memory_bytes);
+        let pool_concurrency = sync
+            .max_concurrency
+            .max(async_.max_concurrency)
+            .max(streaming.max_concurrency);
+        // Mirror `build_engine_pooling`'s slot math (`concurrency*8`, min 16) to estimate
+        // the up-front virtual reservation so it is visible / loud before it bites.
+        let total_memories = (pool_concurrency.saturating_mul(8)).max(16);
+        let reservation = (pool_memory as u128).saturating_mul(total_memories as u128);
+        let reservation_gib = reservation / (1024 * 1024 * 1024);
+        tracing::info!(
+            target: "boatramp::handler",
+            pool_memory_mib = pool_memory / (1024 * 1024),
+            total_memories,
+            reservation_gib,
+            "pooling allocator: sizing the shared pool off the largest lane ceiling"
+        );
+        // Soft guard: a very large VIRTUAL reservation is viable on a 64-bit host with
+        // overcommit, but an implausible one usually indicates a ceiling set far too high. Warn loudly
+        // (don't refuse a config that may be valid on this host); a real reservation
+        // failure still fails the build below with context.
+        if reservation_gib >= 128 {
+            tracing::warn!(
+                target: "boatramp::handler",
+                reservation_gib,
+                pool_memory_mib = pool_memory / (1024 * 1024),
+                total_memories,
+                "pooling allocator will reserve a very large block of virtual address space; \
+                 if the node cannot start, lower a `*_max_memory_mb` / `*_max_concurrency` knob \
+                 or disable `[handlers] pooling`"
+            );
+        }
+        let pool_limits = Limits {
+            memory_bytes: pool_memory,
+            max_concurrency: pool_concurrency,
+            ..sync
+        };
+        let engine = build_engine_pooling(&pool_limits).map_err(|e| {
+            HandlerError::Internal(format!(
+                "pooling allocator could not reserve ~{reservation_gib} GiB of virtual address \
+                 space for the raised memory ceiling ({} MiB × {total_memories} slots): {e}. \
+                 Lower a `*_max_memory_mb`/`*_max_concurrency` knob, or disable `[handlers] pooling`.",
+                pool_memory / (1024 * 1024)
+            ))
+        })?;
+        Ok(Self::from_engine(engine, sync, cache_size)?
+            .with_async_limits(async_)
+            .with_streaming_limits(streaming))
+    }
+
     /// Assemble the engine around an already-built wasmtime [`Engine`] (shared by
     /// [`new`](Self::new) and [`with_pooling`](Self::with_pooling)).
     fn from_engine(
