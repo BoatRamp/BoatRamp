@@ -555,6 +555,21 @@ async fn egress_target_allowed(
     Ok(EgressPlan { self_depth: None })
 }
 
+/// The active async-lane mutation (anti-hollow gates), or `None`. Present ONLY under `cfg(test)`
+/// (this crate's own unit gates) or the `async-lane-gate-mutation` feature; a shipped build has
+/// neither, so both lane clamps below — the per-invocation memory down-clamp in
+/// [`HandlerEngine::effective_limits`] and the per-consumer `min(cap, lane_ceiling)` in
+/// [`ConsumerGates::gate`] — are unconditional and this is a dead `None`.
+#[cfg(any(test, feature = "async-lane-gate-mutation"))]
+fn lane_gate_mutation() -> Option<String> {
+    std::env::var("BOATRAMP_ASYNCLANE_MUTATION").ok()
+}
+#[cfg(not(any(test, feature = "async-lane-gate-mutation")))]
+#[inline]
+fn lane_gate_mutation() -> Option<String> {
+    None
+}
+
 /// Per-consumer concurrency gates (P2 resource isolation): a lazily-created [`Semaphore`] per
 /// consumer identity, so one consumer's burst (e.g. a thumbnail backfill) can't occupy the shared
 /// async lane and starve other consumers.
@@ -579,7 +594,14 @@ impl ConsumerGates {
     /// lock and the await strictly separate is also why there is no "guard across await" to reason
     /// about — this fn never awaits.
     fn gate(&self, key: &str, cap: usize, lane_ceiling: usize) -> Arc<Semaphore> {
-        let eff = cap.min(lane_ceiling).max(1);
+        // MUTATION SEAM (G-conc): the per-consumer cap is floored by the lane budget so a declared
+        // `max_concurrency` can never raise a consumer above the operator's `async_max_concurrency`.
+        // Dropping the `.min(lane_ceiling)` lets `cap` exceed the lane → the gate goes RED.
+        let eff = if lane_gate_mutation().as_deref() == Some("skip_consumer_clamp") {
+            cap.max(1)
+        } else {
+            cap.min(lane_ceiling).max(1)
+        };
         let mut map = self.0.lock().unwrap();
         match map.get(key) {
             Some((c, s)) if *c == eff => Arc::clone(s),
@@ -1334,8 +1356,17 @@ impl HandlerEngine {
     /// (per-site) override may only *lower* the limits, never raise them.
     fn effective_limits(&self, lane: Lane, requested: Limits) -> Limits {
         let ceiling = self.lane_ceiling(lane);
+        // MUTATION SEAM (G-mem): a per-invocation (per-site) `memory_mb` override may only *lower* the
+        // lane memory ceiling, never raise it — so a guest can't claim more linear memory than the
+        // operator's `*_max_memory_mb` budget. Dropping the `.min(ceiling)` lets the request exceed the
+        // ceiling → the gate goes RED.
+        let memory_bytes = if lane_gate_mutation().as_deref() == Some("skip_mem_clamp") {
+            requested.memory_bytes
+        } else {
+            requested.memory_bytes.min(ceiling.memory_bytes)
+        };
         Limits {
-            memory_bytes: requested.memory_bytes.min(ceiling.memory_bytes),
+            memory_bytes,
             timeout_ms: requested.timeout_ms.min(ceiling.timeout_ms),
             max_concurrency: requested.max_concurrency.min(ceiling.max_concurrency),
             // A `None` (unmetered) on either side is the larger bound, so the
@@ -1712,6 +1743,102 @@ mod tests {
             incoming.collect().await.is_err(),
             "a body over the cap must error rather than deliver truncated data"
         );
+    }
+
+    /// Anti-hollow gates for the two async-lane security clamps: the raisable per-lane memory
+    /// ceiling (G-mem — a per-invocation override may only *lower* it) and the per-consumer
+    /// concurrency floor (G-conc — a declared `max_concurrency` may only *narrow* the lane budget).
+    /// Each clamp has a clean gate (seam UNARMED → the SECURE behavior holds) paired with a `mutation_`
+    /// gate that arms `BOATRAMP_ASYNCLANE_MUTATION` and asserts the clamp is gone (RED under mutation).
+    /// The four share a serial lock because they toggle a process-global env var; the mutation only
+    /// diverges from the clean path when a request EXCEEDS a ceiling (which only these gates
+    /// construct), so a concurrent reader elsewhere is behaviorally unaffected.
+    #[cfg(feature = "messaging")]
+    mod lane_clamp_gates {
+        use super::*;
+        use std::sync::Mutex;
+
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+        fn engine_with_async(mem_mb: usize, max_conc: usize) -> HandlerEngine {
+            let async_ = Limits {
+                memory_bytes: mem_mb * 1024 * 1024,
+                max_concurrency: max_conc,
+                ..Limits::default()
+            };
+            HandlerEngine::new(Limits::default(), 4)
+                .expect("engine builds")
+                .with_async_limits(async_)
+        }
+
+        /// G-mem (clean): a per-invocation `memory_mb` override ABOVE the async lane ceiling clamps
+        /// DOWN to the ceiling — a guest can never claim more linear memory than `async_max_memory_mb`.
+        #[tokio::test]
+        async fn mem_override_clamps_to_the_lane_ceiling() {
+            let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            unsafe { std::env::remove_var("BOATRAMP_ASYNCLANE_MUTATION") };
+            let engine = engine_with_async(128, 8);
+            let requested = Limits {
+                memory_bytes: 512 * 1024 * 1024,
+                ..Limits::default()
+            };
+            let eff = engine.effective_limits(Lane::Async, requested);
+            assert_eq!(
+                eff.memory_bytes,
+                128 * 1024 * 1024,
+                "a 512 MiB request must clamp to the 128 MiB async lane ceiling"
+            );
+        }
+
+        /// G-mem (mutation): with `skip_mem_clamp` armed the oversized request escapes the ceiling.
+        #[tokio::test]
+        async fn mutation_mem_override_escapes_the_ceiling() {
+            let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let engine = engine_with_async(128, 8);
+            let requested = Limits {
+                memory_bytes: 512 * 1024 * 1024,
+                ..Limits::default()
+            };
+            unsafe { std::env::set_var("BOATRAMP_ASYNCLANE_MUTATION", "skip_mem_clamp") };
+            let eff = engine.effective_limits(Lane::Async, requested);
+            unsafe { std::env::remove_var("BOATRAMP_ASYNCLANE_MUTATION") };
+            assert_eq!(
+                eff.memory_bytes,
+                512 * 1024 * 1024,
+                "with the clamp removed the oversized request escapes the ceiling (gate RED)"
+            );
+        }
+
+        /// G-conc (clean): a per-consumer cap ABOVE the async lane budget floors to the lane budget —
+        /// a consumer can never run more concurrent handlers than `async_max_concurrency`.
+        #[tokio::test]
+        async fn consumer_cap_floors_to_the_lane_budget() {
+            let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            unsafe { std::env::remove_var("BOATRAMP_ASYNCLANE_MUTATION") };
+            let engine = engine_with_async(64, 4);
+            let gate = engine.consumer_gate("site\u{1}topic\u{1}group", 100);
+            assert_eq!(
+                gate.available_permits(),
+                4,
+                "a consumer cap of 100 must floor to the async lane budget of 4"
+            );
+        }
+
+        /// G-conc (mutation): with `skip_consumer_clamp` armed the consumer semaphore is sized to the
+        /// full requested 100, exceeding the lane budget.
+        #[tokio::test]
+        async fn mutation_consumer_cap_escapes_the_lane_budget() {
+            let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let engine = engine_with_async(64, 4);
+            unsafe { std::env::set_var("BOATRAMP_ASYNCLANE_MUTATION", "skip_consumer_clamp") };
+            let gate = engine.consumer_gate("site\u{1}topic\u{1}group", 100);
+            unsafe { std::env::remove_var("BOATRAMP_ASYNCLANE_MUTATION") };
+            assert_eq!(
+                gate.available_permits(),
+                100,
+                "with the floor removed the consumer cap escapes the lane budget (gate RED)"
+            );
+        }
     }
 
     async fn egress(uri: &str, tls: bool) -> Result<(), ErrorCode> {

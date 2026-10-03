@@ -17,6 +17,11 @@ description = "WebAssembly handler engine for boatramp (wasmtime component runti
 # The wasmtime engine is heavy; it is off by default so `cargo build
 # --workspace` stays lean. The server enables it via its `handlers` feature.
 default = []
+# Anti-hollow gate lane: arms the `BOATRAMP_ASYNCLANE_MUTATION` seams in `engine.rs`
+# (per-invocation memory down-clamp, per-consumer concurrency floor) so a CI gate can prove each
+# clamp goes RED when removed. NEVER enabled in a shipped build — it only exposes a test env var,
+# it is not a backdoor. Needs `messaging` for the per-consumer gate and `engine` for the limits.
+async-lane-gate-mutation = ["engine", "messaging"]
 engine = [
   "dep:wasmtime",
   "dep:wasmtime-wasi",
