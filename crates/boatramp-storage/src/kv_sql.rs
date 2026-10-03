@@ -559,7 +559,9 @@ impl KvStore for SqlKv {
     ) -> Result<Vec<String>, KvError> {
         match &self.backing {
             #[cfg(feature = "sql")]
-            Backing::Sqlite { conn, .. } => sqlite_list_from(conn, &self.stmts, prefix, after, limit).await,
+            Backing::Sqlite { conn, .. } => {
+                sqlite_list_from(conn, &self.stmts, prefix, after, limit).await
+            }
             #[cfg(feature = "sql-postgres")]
             Backing::Postgres(b) => {
                 sqlx_list_from(b.as_ref(), &self.stmts, prefix, after, limit).await
@@ -1210,7 +1212,11 @@ async fn sqlite_put(
 }
 
 #[cfg(feature = "sql")]
-async fn sqlite_delete(conn: &AsyncMutex<Connection>, stmts: &KvStatements, key: &str) -> Result<(), KvError> {
+async fn sqlite_delete(
+    conn: &AsyncMutex<Connection>,
+    stmts: &KvStatements,
+    key: &str,
+) -> Result<(), KvError> {
     let conn = lock_clean(conn).await;
     begin(&conn).await?;
     let ts = now_ts();
