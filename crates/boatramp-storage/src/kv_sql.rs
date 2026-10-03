@@ -84,6 +84,8 @@ use boatramp_core::sql::Dialect;
 use libsql::{Builder, Connection, Database, Value as LibsqlValue};
 #[cfg(feature = "sql")]
 use std::path::Path;
+#[cfg(feature = "sql")]
+use tokio::sync::Mutex as AsyncMutex;
 
 #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
 use boatramp_core::sql::{SqlBackend, SqlTransaction, SqlValue};
@@ -298,10 +300,22 @@ fn statements_for(dialect: Dialect) -> KvStatements {
 
 /// The engine backing a [`SqlKv`]. One variant per compiled engine; the trait ops match on it.
 enum Backing {
-    /// An embedded SQLite / libsql local database (single-writer). Each op opens a fresh connection
-    /// off this shared `Database` handle.
+    /// An embedded SQLite / libsql local database (single-writer). `db` is the shared handle (used to
+    /// open an independent connection for the test-only durability/pragma checks); `conn` is ONE
+    /// cached, PRAGMA-tuned connection that every op reuses. libsql is single-writer, so serializing
+    /// ops through one connection (via the async mutex, held only for the op's duration) costs no
+    /// real concurrency here and removes the per-op `connect()` + `busy_timeout`/`synchronous=FULL`
+    /// re-execution (review finding H2). `synchronous = FULL` is set once on this cached connection,
+    /// so the C6 synchronous-commit durability contract is unchanged — every write still fsyncs.
     #[cfg(feature = "sql")]
-    Sqlite(Arc<Database>),
+    Sqlite {
+        /// Read only by the `cfg(test)` durability/custody gates (`sqlite_test_conn`), which open an
+        /// INDEPENDENT connection off this handle to prove a committed write is visible cross-
+        /// connection. The ops never touch it (they use `conn`), so it is dead in a shipped build.
+        #[cfg_attr(not(test), allow(dead_code))]
+        db: Arc<Database>,
+        conn: Arc<AsyncMutex<Connection>>,
+    },
     /// An external Postgres primary over the existing sqlx pool layer (multi-writer). Each op drives
     /// a transaction through the `SqlBackend`, which rewrites `?N` → `$N` and marshals values.
     #[cfg(feature = "sql-postgres")]
@@ -338,16 +352,22 @@ impl SqlKv {
         }
         let db = Builder::new_local(path).build().await.map_err(kv_err)?;
         let conn = db.connect().map_err(kv_err)?;
-        // WAL persists in the database header (set once); `synchronous = FULL` is per-connection —
-        // re-asserted on every write connection below — so EVERY commit (incl. the DDL here) fsyncs.
+        // WAL persists in the database header (set once). `synchronous = FULL` and `busy_timeout` are
+        // per-connection; set here on the ONE cached op connection (H2 — reused by every op instead
+        // of reconnecting + re-PRAGMA-ing per op), so EVERY commit (incl. the DDL here) fsyncs under
+        // the C6 synchronous-commit contract and a concurrent external writer still backs off.
         run_pragma(&conn, "PRAGMA journal_mode=WAL").await?;
         run_pragma(&conn, "PRAGMA synchronous=FULL").await?;
+        run_pragma(&conn, &format!("PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")).await?;
         let stmts = statements_for(Dialect::Sqlite);
         for ddl in stmts.ddl {
             conn.execute(ddl, ()).await.map_err(kv_err)?;
         }
         Ok(Self {
-            backing: Backing::Sqlite(Arc::new(db)),
+            backing: Backing::Sqlite {
+                db: Arc::new(db),
+                conn: Arc::new(AsyncMutex::new(conn)),
+            },
             dialect: Dialect::Sqlite,
             stmts,
         })
@@ -449,7 +469,7 @@ impl KvStore for SqlKv {
     async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, KvError> {
         match &self.backing {
             #[cfg(feature = "sql")]
-            Backing::Sqlite(db) => sqlite_get(db, &self.stmts, key).await,
+            Backing::Sqlite { conn, .. } => sqlite_get(conn, &self.stmts, key).await,
             #[cfg(feature = "sql-postgres")]
             Backing::Postgres(b) => sqlx_get(b.as_ref(), &self.stmts, key).await,
             #[cfg(feature = "sql-mysql")]
@@ -460,7 +480,7 @@ impl KvStore for SqlKv {
     async fn put(&self, key: &str, value: Vec<u8>) -> Result<(), KvError> {
         match &self.backing {
             #[cfg(feature = "sql")]
-            Backing::Sqlite(db) => sqlite_put(db, &self.stmts, key, value).await,
+            Backing::Sqlite { conn, .. } => sqlite_put(conn, &self.stmts, key, value).await,
             #[cfg(feature = "sql-postgres")]
             Backing::Postgres(b) => {
                 sqlx_write_batch(
@@ -485,7 +505,7 @@ impl KvStore for SqlKv {
     async fn delete(&self, key: &str) -> Result<(), KvError> {
         match &self.backing {
             #[cfg(feature = "sql")]
-            Backing::Sqlite(db) => sqlite_delete(db, &self.stmts, key).await,
+            Backing::Sqlite { conn, .. } => sqlite_delete(conn, &self.stmts, key).await,
             #[cfg(feature = "sql-postgres")]
             Backing::Postgres(b) => {
                 sqlx_write_batch(
@@ -510,7 +530,7 @@ impl KvStore for SqlKv {
     async fn list_prefix(&self, prefix: &str) -> Result<Vec<String>, KvError> {
         match &self.backing {
             #[cfg(feature = "sql")]
-            Backing::Sqlite(db) => sqlite_list_prefix(db, &self.stmts, prefix).await,
+            Backing::Sqlite { conn, .. } => sqlite_list_prefix(conn, &self.stmts, prefix).await,
             #[cfg(feature = "sql-postgres")]
             Backing::Postgres(b) => sqlx_list_prefix(b.as_ref(), &self.stmts, prefix).await,
             #[cfg(feature = "sql-mysql")]
@@ -523,7 +543,7 @@ impl KvStore for SqlKv {
         // the networked backends, where the default's per-key gets would each cost one.
         match &self.backing {
             #[cfg(feature = "sql")]
-            Backing::Sqlite(db) => sqlite_scan_prefix(db, &self.stmts, prefix).await,
+            Backing::Sqlite { conn, .. } => sqlite_scan_prefix(conn, &self.stmts, prefix).await,
             #[cfg(feature = "sql-postgres")]
             Backing::Postgres(b) => sqlx_scan_prefix(b.as_ref(), &self.stmts, prefix).await,
             #[cfg(feature = "sql-mysql")]
@@ -539,7 +559,7 @@ impl KvStore for SqlKv {
     ) -> Result<Vec<String>, KvError> {
         match &self.backing {
             #[cfg(feature = "sql")]
-            Backing::Sqlite(db) => sqlite_list_from(db, &self.stmts, prefix, after, limit).await,
+            Backing::Sqlite { conn, .. } => sqlite_list_from(conn, &self.stmts, prefix, after, limit).await,
             #[cfg(feature = "sql-postgres")]
             Backing::Postgres(b) => {
                 sqlx_list_from(b.as_ref(), &self.stmts, prefix, after, limit).await
@@ -557,7 +577,7 @@ impl KvStore for SqlKv {
         // point-in-time of the scan itself. The copier filters the reserved feeds afterwards.
         match &self.backing {
             #[cfg(feature = "sql")]
-            Backing::Sqlite(db) => sqlite_dump_scan(db, &self.stmts).await,
+            Backing::Sqlite { conn, .. } => sqlite_dump_scan(conn, &self.stmts).await,
             #[cfg(feature = "sql-postgres")]
             Backing::Postgres(b) => sqlx_dump_scan(b.as_ref(), &self.stmts).await,
             #[cfg(feature = "sql-mysql")]
@@ -575,7 +595,7 @@ impl KvStore for SqlKv {
     async fn write_batch(&self, ops: Vec<WriteOp>) -> Result<(), KvError> {
         match &self.backing {
             #[cfg(feature = "sql")]
-            Backing::Sqlite(db) => sqlite_write_batch(db, &self.stmts, ops).await,
+            Backing::Sqlite { conn, .. } => sqlite_write_batch(conn, &self.stmts, ops).await,
             #[cfg(feature = "sql-postgres")]
             Backing::Postgres(b) => sqlx_write_batch(b.as_ref(), &self.stmts, ops).await,
             #[cfg(feature = "sql-mysql")]
@@ -600,7 +620,7 @@ impl KvStore for SqlKv {
     ) -> Result<bool, KvError> {
         match &self.backing {
             #[cfg(feature = "sql")]
-            Backing::Sqlite(db) => sqlite_cas(db, &self.stmts, key, expected, new).await,
+            Backing::Sqlite { conn, .. } => sqlite_cas(conn, &self.stmts, key, expected, new).await,
             #[cfg(feature = "sql-postgres")]
             Backing::Postgres(b) => {
                 sqlx_cas(b.as_ref(), &self.stmts, self.dialect, key, expected, new).await
@@ -1121,9 +1141,11 @@ fn sql_err(err: boatramp_core::sql::SqlError) -> KvError {
 
 /// A connection tuned for the control-plane KV: a contended writer WAITS for the single-writer lock
 /// (`busy_timeout`) rather than erroring, and `synchronous = FULL` makes its commits fsync before
-/// returning (C6). Each op opens a fresh connection off the shared `Database` (as the libsql
-/// `SqlBackend` does), so concurrent ops each get their own transaction.
+/// returning (C6). Since H2 the live ops reuse ONE cached connection (see [`Backing::Sqlite`]); this
+/// opens an INDEPENDENT connection and is now used only by the `cfg(test)` durability/custody gates
+/// (`sqlite_test_conn`) to prove cross-connection visibility — hence dead in a shipped build.
 #[cfg(feature = "sql")]
+#[cfg_attr(not(test), allow(dead_code))]
 async fn sqlite_connect(db: &Database) -> Result<Connection, KvError> {
     let conn = db.connect().map_err(kv_err)?;
     run_pragma(&conn, &format!("PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")).await?;
@@ -1133,11 +1155,11 @@ async fn sqlite_connect(db: &Database) -> Result<Connection, KvError> {
 
 #[cfg(feature = "sql")]
 async fn sqlite_get(
-    db: &Database,
+    conn: &AsyncMutex<Connection>,
     stmts: &KvStatements,
     key: &str,
 ) -> Result<Option<Vec<u8>>, KvError> {
-    let conn = sqlite_connect(db).await?;
+    let conn = conn.lock().await;
     let mut rows = conn
         .query(stmts.get, libsql::params_from_iter([blob(key)]))
         .await
@@ -1150,12 +1172,12 @@ async fn sqlite_get(
 
 #[cfg(feature = "sql")]
 async fn sqlite_put(
-    db: &Database,
+    conn: &AsyncMutex<Connection>,
     stmts: &KvStatements,
     key: &str,
     value: Vec<u8>,
 ) -> Result<(), KvError> {
-    let conn = sqlite_connect(db).await?;
+    let conn = conn.lock().await;
     begin(&conn).await?;
     let ts = now_ts();
     let res = async {
@@ -1188,8 +1210,8 @@ async fn sqlite_put(
 }
 
 #[cfg(feature = "sql")]
-async fn sqlite_delete(db: &Database, stmts: &KvStatements, key: &str) -> Result<(), KvError> {
-    let conn = sqlite_connect(db).await?;
+async fn sqlite_delete(conn: &AsyncMutex<Connection>, stmts: &KvStatements, key: &str) -> Result<(), KvError> {
+    let conn = conn.lock().await;
     begin(&conn).await?;
     let ts = now_ts();
     let res = async {
@@ -1215,11 +1237,11 @@ async fn sqlite_delete(db: &Database, stmts: &KvStatements, key: &str) -> Result
 
 #[cfg(feature = "sql")]
 async fn sqlite_list_prefix(
-    db: &Database,
+    conn: &AsyncMutex<Connection>,
     stmts: &KvStatements,
     prefix: &str,
 ) -> Result<Vec<String>, KvError> {
-    let conn = sqlite_connect(db).await?;
+    let conn = conn.lock().await;
     let lower = prefix.as_bytes().to_vec();
     let (sql, params) = match prefix_successor(&lower) {
         Some(upper) => (
@@ -1235,11 +1257,11 @@ async fn sqlite_list_prefix(
 /// `sqlite_list_prefix`.
 #[cfg(feature = "sql")]
 async fn sqlite_scan_prefix(
-    db: &Database,
+    conn: &AsyncMutex<Connection>,
     stmts: &KvStatements,
     prefix: &str,
 ) -> Result<Vec<(String, Vec<u8>)>, KvError> {
-    let conn = sqlite_connect(db).await?;
+    let conn = conn.lock().await;
     let lower = prefix.as_bytes().to_vec();
     let (sql, params) = match prefix_successor(&lower) {
         Some(upper) => (
@@ -1267,13 +1289,13 @@ async fn sqlite_scan_prefix(
 
 #[cfg(feature = "sql")]
 async fn sqlite_list_from(
-    db: &Database,
+    conn: &AsyncMutex<Connection>,
     stmts: &KvStatements,
     prefix: &str,
     after: &str,
     limit: usize,
 ) -> Result<Vec<String>, KvError> {
-    let conn = sqlite_connect(db).await?;
+    let conn = conn.lock().await;
     let prefix_bytes = prefix.as_bytes().to_vec();
     let mut start = prefix_bytes.clone();
     start.extend_from_slice(after.as_bytes());
@@ -1290,11 +1312,11 @@ async fn sqlite_list_from(
 
 #[cfg(feature = "sql")]
 async fn sqlite_write_batch(
-    db: &Database,
+    conn: &AsyncMutex<Connection>,
     stmts: &KvStatements,
     ops: Vec<WriteOp>,
 ) -> Result<(), KvError> {
-    let conn = sqlite_connect(db).await?;
+    let conn = conn.lock().await;
     begin(&conn).await?;
     let ts = now_ts();
     let res = async {
@@ -1338,13 +1360,13 @@ async fn sqlite_write_batch(
 
 #[cfg(feature = "sql")]
 async fn sqlite_cas(
-    db: &Database,
+    conn: &AsyncMutex<Connection>,
     stmts: &KvStatements,
     key: &str,
     expected: Option<&[u8]>,
     new: Vec<u8>,
 ) -> Result<bool, KvError> {
-    let conn = sqlite_connect(db).await?;
+    let conn = conn.lock().await;
     begin(&conn).await?;
     let ts = now_ts();
     let res = async {
@@ -1463,10 +1485,10 @@ async fn collect_keys(
 /// SQLite backing — decodes each row to a [`KvDumpEntry`] with its REAL per-key version.
 #[cfg(feature = "sql")]
 async fn sqlite_dump_scan(
-    db: &Database,
+    conn: &AsyncMutex<Connection>,
     stmts: &KvStatements,
 ) -> Result<Vec<KvDumpEntry>, KvError> {
-    let conn = sqlite_connect(db).await?;
+    let conn = conn.lock().await;
     let mut rows = conn.query(stmts.dump_scan, ()).await.map_err(kv_err)?;
     let mut out = Vec::new();
     while let Some(row) = rows.next().await.map_err(kv_err)? {
@@ -1589,7 +1611,7 @@ mod sqlite_tests {
         /// A tuned SQLite connection off the backing (test-only; the change-log / pragma reads use it).
         async fn sqlite_test_conn(&self) -> Result<Connection, KvError> {
             match &self.backing {
-                Backing::Sqlite(db) => sqlite_connect(db).await,
+                Backing::Sqlite { db, .. } => sqlite_connect(db).await,
                 #[cfg(feature = "sql-postgres")]
                 Backing::Postgres(_) => {
                     Err(KvError::backend("sqlite_test_conn on a Postgres SqlKv"))
@@ -1899,7 +1921,7 @@ mod pg_tests {
                 .await
                 .expect("reset kv tables"),
             #[cfg(feature = "sql")]
-            Backing::Sqlite(_) => unreachable!("fresh_pg opened Postgres"),
+            Backing::Sqlite { .. } => unreachable!("fresh_pg opened Postgres"),
             #[cfg(feature = "sql-mysql")]
             Backing::Mysql(_) => unreachable!("fresh_pg opened Postgres"),
         }
@@ -2501,7 +2523,7 @@ mod mysql_tests {
                 .await
                 .expect("reset kv tables"),
             #[cfg(feature = "sql")]
-            Backing::Sqlite(_) => unreachable!("fresh_mysql opened MySQL"),
+            Backing::Sqlite { .. } => unreachable!("fresh_mysql opened MySQL"),
             #[cfg(feature = "sql-postgres")]
             Backing::Postgres(_) => unreachable!("fresh_mysql opened MySQL"),
         }
