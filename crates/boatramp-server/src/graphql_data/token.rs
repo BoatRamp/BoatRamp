@@ -255,6 +255,18 @@ async fn resolve_url_verifier(
     Some(verifier)
 }
 
+// Defense-in-depth: the anti-hollow seam is for `cargo test` only. Fail the build loudly if the gate
+// feature is ever enabled in a non-test RELEASE profile (scoped to THIS seam, not the others).
+#[cfg(all(
+    feature = "issuer-trust-gate-mutation",
+    not(test),
+    not(debug_assertions)
+))]
+compile_error!(
+    "issuer-trust-gate-mutation is a test-only anti-hollow seam and must never be compiled into a \
+     release build — remove it from the feature set"
+);
+
 /// The active issuer-trust mutation (anti-hollow gate), or `None`. Present ONLY under `cfg(test)`
 /// or the `issuer-trust-gate-mutation` feature; a shipped build has neither, so the policy, the
 /// anchored-suffix match, the jwks-uri host-pin, and the SSRF guard below are all unconditional and
@@ -267,6 +279,23 @@ fn issuertrust_mutation() -> Option<String> {
 #[inline]
 fn issuertrust_mutation() -> Option<String> {
     None
+}
+
+/// Test-only FIXTURE flag (NOT a mutation): when armed by the live gate, the real discovery/fetch
+/// path accepts a loopback `http` mock (so the end-to-end policy → host-pin → redirect-refusal →
+/// fetch → verify flow can run against a localhost server) while every invariant UNDER TEST stays
+/// active. `false` in every shipped build (the static exists only under `cfg(test)`).
+#[cfg(test)]
+pub(crate) static TEST_LOOPBACK: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+fn test_loopback_allowed() -> bool {
+    TEST_LOOPBACK.load(std::sync::atomic::Ordering::Relaxed)
+}
+#[cfg(not(test))]
+#[inline]
+fn test_loopback_allowed() -> bool {
+    false
 }
 
 /// Read the `iss` from the token payload WITHOUT verifying the signature (base64url-decode the
@@ -286,14 +315,15 @@ fn unverified_iss(bearer: &str) -> Option<String> {
 /// the authoritative host extraction the anchored-suffix policy matches on — never a raw-string op.
 fn issuer_host(iss: &str) -> Option<String> {
     let u = reqwest::Url::parse(iss).ok()?;
-    if u.scheme() != "https" {
+    let loopback = test_loopback_allowed();
+    if u.scheme() != "https" && !(loopback && u.scheme() == "http") {
         return None;
     }
     if !u.username().is_empty() || u.password().is_some() {
         return None; // reject `user@host` userinfo tricks
     }
-    if u.port().is_some() {
-        return None; // reject an explicit non-default port
+    if u.port().is_some() && !loopback {
+        return None; // reject an explicit non-default port (the loopback mock uses one)
     }
     let host = u.host_str()?;
     Some(host.trim_end_matches('.').to_ascii_lowercase())
@@ -385,8 +415,11 @@ fn jwks_uri_host_pinned(jwks_uri: &str, iss: &str) -> bool {
 /// testable (an IP-literal URL needs no network). Mirrors [`crate::proxy`]'s target guard.
 async fn ssrf_resolve_pin(url: &str) -> Option<(String, SocketAddr)> {
     let parsed = reqwest::Url::parse(url).ok()?;
-    if parsed.scheme() != "https" {
-        return None;
+    let loopback = test_loopback_allowed();
+    match parsed.scheme() {
+        "https" => {}
+        "http" if loopback => {} // the live-gate loopback mock (test fixture only)
+        _ => return None,
     }
     if !parsed.username().is_empty() || parsed.password().is_some() {
         return None;
@@ -397,8 +430,9 @@ async fn ssrf_resolve_pin(url: &str) -> Option<(String, SocketAddr)> {
     let mut pinned: Option<SocketAddr> = None;
     for addr in tokio::net::lookup_host((host.as_str(), port)).await.ok()? {
         // MUTATION SEAM (gate `skip_ssrf_guard`): drop the public-IP requirement — a URL resolving
-        // to a private/loopback address then pins (would be fetched), turning the gate RED.
-        if !skip && !boatramp_core::access::is_global_ip(addr.ip()) {
+        // to a private/loopback address then pins (would be fetched), turning the gate RED. The
+        // `loopback` fixture (test-only) likewise permits loopback so the live mock is reachable.
+        if !skip && !loopback && !boatramp_core::access::is_global_ip(addr.ip()) {
             return None;
         }
         pinned.get_or_insert(addr);
@@ -407,24 +441,28 @@ async fn ssrf_resolve_pin(url: &str) -> Option<(String, SocketAddr)> {
 }
 
 /// An HTTPS GET fenced by [`ssrf_resolve_pin`]: the resolved public address is pinned on the client,
-/// and `https_only` is enforced. Returns the body, or `None` if blocked/failed.
+/// `https_only` is enforced, and **redirects are NOT followed** — `.resolve()` pins only the ORIGINAL
+/// host, so a 3xx `Location:` to another host would be resolved via the system resolver, un-pinned and
+/// un-`is_global_ip`-checked, escaping the guard into the internal network (a trusted-but-malicious
+/// issuer controls its own HTTP server). Any 3xx is treated as a fetch failure. OIDC discovery / JWKS
+/// endpoints never need a redirect. Returns the body, or `None` if blocked/failed.
 async fn ssrf_guarded_get(url: &str) -> Option<String> {
     let (host, addr) = ssrf_resolve_pin(url).await?;
-    let client = reqwest::Client::builder()
-        .https_only(true)
-        .resolve(&host, addr)
-        .build()
-        .ok()?;
-    client
-        .get(url)
-        .send()
-        .await
-        .ok()?
-        .error_for_status()
-        .ok()?
-        .text()
-        .await
-        .ok()
+    let mut builder = reqwest::Client::builder().resolve(&host, addr);
+    if !test_loopback_allowed() {
+        builder = builder.https_only(true);
+    }
+    // MUTATION SEAM (gate `follow_redirects`): build WITHOUT the no-redirect policy, so a cross-host
+    // 3xx is followed off the pinned host — turning the live redirect gate RED.
+    if issuertrust_mutation().as_deref() != Some("follow_redirects") {
+        builder = builder.redirect(reqwest::redirect::Policy::none());
+    }
+    let client = builder.build().ok()?;
+    let resp = client.get(url).send().await.ok()?;
+    if resp.status().is_redirection() {
+        return None; // never follow off the pinned host (SSRF escape)
+    }
+    resp.error_for_status().ok()?.text().await.ok()
 }
 
 #[cfg(test)]
@@ -433,6 +471,7 @@ mod tests {
     use base64::Engine;
     use ed25519_dalek::{Signer, SigningKey};
     use jsonwebtoken::{EncodingKey, Header, encode};
+    use serial_test::serial;
 
     const ISS: &str = "https://idp.test";
     fn far_future() -> i64 {
@@ -607,6 +646,7 @@ mod tests {
     /// passes the pin), `skip_ssrf_guard` (a loopback target resolves/pins). Marker
     /// `MULTI-ISSUER TRUST OK`. The test never sets the env itself (the loop does), so it is race-free.
     #[tokio::test]
+    #[serial] // shares the process-global TEST_LOOPBACK with the live gate
     async fn issuer_trust_policy_discovery_and_ssrf_gates() {
         let t = trust();
 
@@ -684,5 +724,167 @@ mod tests {
             Some("https://acme.my.salesforce.com")
         );
         assert_eq!(unverified_iss("not-a-jwt").as_deref(), None);
+    }
+
+    // ---- Multi-issuer trust: the LIVE end-to-end gate (real discovery → fetch → verify) ----
+
+    /// A no-op env source (the multi-issuer path never reads `jwks_env`).
+    struct NoEnv;
+    impl boatramp_core::env::EnvSource for NoEnv {
+        fn get(&self, _: &str) -> Option<String> {
+            None
+        }
+    }
+
+    /// A minimal loopback HTTP mock for the live gate (bound to `127.0.0.1`): serves OIDC discovery +
+    /// an Ed25519 JWKS, an off-host discovery (jwks_uri on a DIFFERENT host — used only as a pin-
+    /// mismatch string, never connected), and a same-host 302 redirect. Returns the port + a hit
+    /// counter (to prove an untrusted iss triggers NO fetch).
+    async fn spawn_oidc_mock(
+        jwks: String,
+    ) -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_srv = hits.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let jwks = jwks.clone();
+                let hits = hits_srv.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 2048];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let path = req
+                        .lines()
+                        .next()
+                        .and_then(|l| l.split_whitespace().nth(1))
+                        .unwrap_or("/")
+                        .to_string();
+                    hits.fetch_add(1, Ordering::Relaxed);
+                    let resp = if path.ends_with("/.well-known/openid-configuration") {
+                        let jwks_uri = if path.starts_with("/offhost/") {
+                            format!("http://127.0.0.2:{port}/keys") // off-host → pin refuses (pre-fetch)
+                        } else if path.starts_with("/redir/") {
+                            format!("http://127.0.0.1:{port}/redir-keys")
+                        } else {
+                            format!("http://127.0.0.1:{port}/keys")
+                        };
+                        let body = format!("{{\"jwks_uri\":\"{jwks_uri}\"}}");
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                    } else if path.ends_with("/redir-keys") {
+                        // A 302 we must NOT follow (same host here, so `follow_redirects` is locally
+                        // observable; the fix refuses ALL 3xx, so a cross-host Location is a fortiori
+                        // refused).
+                        format!(
+                            "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{port}/keys\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        )
+                    } else if path.ends_with("/keys") {
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{jwks}",
+                            jwks.len()
+                        )
+                    } else {
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .to_string()
+                    };
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.flush().await;
+                });
+            }
+        });
+        (port, hits)
+    }
+
+    /// LIVE end-to-end gate: drives the REAL discovery → host-pin → redirect-refusal → fetch → verify
+    /// path against a loopback mock (via the `TEST_LOOPBACK` fixture, which permits only the http
+    /// loopback mock while every invariant under test stays active). Asserts (a) a trusted iss
+    /// discovers + verifies, (b) an untrusted iss resolves ZERO claims with NO fetch, (c) an off-host
+    /// `jwks_uri` is refused, (d) a redirecting JWKS endpoint is refused (never followed — the #1
+    /// SSRF fix). Marker `MULTI-ISSUER TRUST LIVE OK`. MUTATION-VERIFIED in CI: `follow_redirects`
+    /// turns (d) RED. `#[ignore]` + run via the CI gate (spawns a localhost server).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    #[ignore = "run via the server-feature-union CI gate (spawns a localhost HTTP mock)"]
+    async fn multi_issuer_live_discovery_verify_and_redirect_refusal() {
+        use std::sync::atomic::Ordering;
+        let key = SigningKey::from_bytes(&[7u8; 32]);
+        let jwks = serde_json::json!({ "keys": [ {
+            "kty": "OKP", "crv": "Ed25519", "kid": "app-1",
+            "x": b64url(key.verifying_key().as_bytes()),
+        } ] })
+        .to_string();
+        let (port, hits) = spawn_oidc_mock(jwks).await;
+        let base = format!("http://127.0.0.1:{port}");
+
+        // The multi-issuer config for an iss at `<base><suffix_path>` (exact `allow`, `oidc` discover).
+        let cfg = |iss_path: &str| HandlerGraphqlTokenClaims {
+            issuer_trust: Some(IssuerTrust {
+                allow: vec![format!("{base}{iss_path}")],
+                suffix: None,
+            }),
+            jwks: Some(JwksDiscovery {
+                discover: Some("oidc".to_string()),
+                template: None,
+            }),
+            ..Default::default()
+        };
+        let token = |iss: &str| {
+            ed25519_token(
+                &key,
+                "app-1",
+                serde_json::json!({ "iss": iss, "exp": far_future(), "tid": "acme" }),
+            )
+        };
+
+        TEST_LOOPBACK.store(true, Ordering::Relaxed);
+
+        // (a) happy path: a trusted iss discovers its JWKS and verifies the token.
+        let ok = verified_claims(&cfg(""), &token(&base), &NoEnv).await;
+        assert_eq!(
+            ok.as_ref().and_then(|c| c.get("tid")),
+            Some(&serde_json::json!("acme")),
+            "(a) a trusted iss discovers + verifies"
+        );
+
+        // (b) an untrusted iss resolves ZERO claims and triggers NO fetch.
+        let before = hits.load(Ordering::Relaxed);
+        let untrusted = format!("http://127.0.0.9:{port}"); // not in `allow`
+        assert!(
+            verified_claims(&cfg(""), &token(&untrusted), &NoEnv)
+                .await
+                .is_none(),
+            "(b) an untrusted iss resolves no claims"
+        );
+        assert_eq!(
+            hits.load(Ordering::Relaxed),
+            before,
+            "(b) an untrusted iss triggered NO network fetch"
+        );
+
+        // (c) an off-host jwks_uri (different host than iss) is refused (pin fails pre-fetch).
+        assert!(
+            verified_claims(&cfg("/offhost"), &token(&format!("{base}/offhost")), &NoEnv)
+                .await
+                .is_none(),
+            "(c) an off-host jwks_uri is refused"
+        );
+
+        // (d) a redirecting JWKS endpoint is refused — never followed off the pinned host (#1 fix).
+        assert!(
+            verified_claims(&cfg("/redir"), &token(&format!("{base}/redir")), &NoEnv)
+                .await
+                .is_none(),
+            "(d) a 302 from the JWKS endpoint is refused (not followed)"
+        );
+
+        TEST_LOOPBACK.store(false, Ordering::Relaxed);
+        println!("MULTI-ISSUER TRUST LIVE OK");
     }
 }

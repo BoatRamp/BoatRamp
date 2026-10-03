@@ -473,6 +473,34 @@ jobs:
             fi
           done
 
+      # MULTI-ISSUER TRUST — LIVE end-to-end gate (clean pass + live gate are BOTH preconditions). The
+      # unit gate above proves the four predicates in isolation; this drives the REAL discovery → host-
+      # pin → redirect-refusal → fetch → verify path against a localhost mock (via the TEST_LOOPBACK
+      # fixture): a trusted iss verifies, an untrusted iss resolves zero claims with NO fetch, an
+      # off-host jwks_uri is refused, and a redirecting JWKS endpoint is refused (the SSRF redirect
+      # fix). Marker `MULTI-ISSUER TRUST LIVE OK`. MUTATION-VERIFIED: `follow_redirects` (build the
+      # client WITHOUT the no-redirect policy) makes the redirect case followed → the gate MUST go RED.
+      - name: "multi-issuer trust LIVE gate (discovery + verify + redirect refusal)"
+        run: |
+          set -eo pipefail
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-server \
+            --features handlers,oidc --lib multi_issuer_live_discovery_verify_and_redirect_refusal \
+            -- --ignored --nocapture 2>&1 | tee issuer-trust-live.log
+          grep -qE 'test result: ok\. 1 passed' issuer-trust-live.log \
+            || { echo "::error::multi-issuer LIVE gate did not run (silent skip or a failure)" >&2; exit 1; }
+          grep -q 'MULTI-ISSUER TRUST LIVE OK' issuer-trust-live.log \
+            || { echo "::error::multi-issuer LIVE gate never reached its marker (a regression or a skipped test)" >&2; exit 1; }
+          if BOATRAMP_ISSUERTRUST_MUTATION=follow_redirects cargo-zigbuild test \
+            --target x86_64-unknown-linux-musl -p boatramp-server \
+            --features handlers,oidc,issuer-trust-gate-mutation \
+            --lib multi_issuer_live_discovery_verify_and_redirect_refusal -- --ignored \
+            > issuer-trust-live-follow.log 2>&1; then
+            echo "::error::multi-issuer LIVE gate is HOLLOW — it passed under follow_redirects (a JWKS-endpoint redirect is followed off the pinned host — the SSRF escape is not actually closed)" >&2
+            exit 1
+          else
+            echo "issuer-trust LIVE mutation verified: follow_redirects turns the gate RED → the redirect refusal is load-bearing."
+          fi
+
   # SlateDB WAL-recovery HARD GATE (v0.5.5 incident: the control-plane KV was unbootable with
   # `Data error: empty SSTable` after a crash / crash-consistent snapshot froze a zero-byte tail WAL
   # object). Proves a store with such a frozen tail WAL still OPENS — the incident fix (`slatedb` 0.16
