@@ -22,6 +22,32 @@ routing: (
 ),
 ```
 
+### Cap a consumer's concurrency
+
+All consumers share one **async-lane** concurrency budget (`async_max_concurrency`).
+A burst in one consumer (say a thumbnail backfill of thousands of images) can
+occupy the whole lane and starve the others. Give a consumer its own
+`max_concurrency` to cap how many of its messages run at once, independent of the
+rest of the lane:
+
+```ron
+routing: (
+    consumers: [
+        // At most 2 thumbnail decodes in flight; other consumers keep their headroom.
+        ( topic: "bus:thumbnail.requested", component: "thumb.wasm",
+          imports: ["wasi:blobstore", "wasi:messaging"],
+          max_concurrency: 2 ),
+    ],
+),
+```
+
+The value is clamped to the lane ceiling (`min(max_concurrency, async_max_concurrency)`
+— it can only narrow a consumer, never raise it above the operator budget). Unset
+⇒ the consumer shares the lane as before (no change). This is pure admission
+control: ordering, at-least-once delivery, and retry/dead-letter semantics are
+unchanged. Pair it with `async_max_memory_mb` for a memory-heavy worker — cap the
+concurrency so N concurrent runs fit the memory budget.
+
 ## Share a topic across components: the project bus
 
 A plain consumer `topic` is site-private — only that site's own handlers publish to

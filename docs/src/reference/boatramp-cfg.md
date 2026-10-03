@@ -325,6 +325,9 @@ Wasm handler runtime. Parsed always, consumed only with the `handlers` feature.
 | `async_max_timeout_ms` | int | `900000` | Safety-max for a **durable async** invocation — the drain running `?mode=async` calls, workflow steps, cron/queue/blob triggers, and messaging consumers. No client is connected and the work is retried + dead-lettered, so this can be far larger (default 15 min). Runs on its own concurrency budget, so a long job never starves live traffic. |
 | `async_max_concurrency` | int | `8` | Max concurrent in-flight async-lane invocations — a pool separate from (and smaller than) the request pool, so a burst of long background jobs can't exhaust the slots live site traffic needs. |
 | `async_max_fuel` | int | — | Optional CPU **fuel** ceiling for an async-lane invocation. A large async timeout bounds only wall-clock; pair it with a fuel bound to keep a CPU-bound guest from spinning the whole window. Omit ⇒ unmetered. |
+| `async_max_memory_mb` | int | `64` | **Linear-memory ceiling for a durable async invocation**, in MiB. The async lane is where heavy, retryable, no-client-connected work belongs (image decode/resize, PDF/thumbnail, document processing), so this is the knob to raise for memory-hungry workers. Raise it only as high as the heaviest async component needs — see the memory-ceiling note below. |
+| `sync_max_memory_mb` | int | `64` | Linear-memory ceiling for a **connection-bearing** invocation, in MiB. Kept tight by default (a client + proxy + the shared request pool block while it runs); raise it only if a synchronous handler genuinely needs more. |
+| `streaming_max_memory_mb` | int | `64` | Linear-memory ceiling for a **long-lived streaming** invocation (SSE / chunked / token streaming), in MiB. |
 | `messaging_max_unflushed_msgs` | int | `0` | **Relaxed messaging-publish durability** (opt-in). `0` (default) = **strong**: `publish()` returns only after the message is crash-durable — *stronger* than NATS JetStream's default sync publish. `N > 0` fast-acks publishes from the in-memory buffer (≈tens of µs vs ≈one flush interval), forcing a durable checkpoint every `N` messages, so **at most `N` acknowledged-but-unflushed messages are lost on a process crash / OOM / SIGKILL / power loss**. Affects ONLY the bus publish path (control-plane, auth, and consumer ack/redelivery durability are unaffected); single-node only. The loss window is bounded by **both** `N` **and** the store's `flush_interval` (the background WAL-flush timer, ~5 ms) — so the effective steady-state bound is `min(N messages, one flush_interval)`, and on a low `flush_interval` a large `N` rarely binds. A node with `N > 0` logs a startup warning. See [Publish durability](../how-to/background-work.md#publish-durability-strong-by-default). |
 | `outbound_timeout_ms` | int | — | Optional ceiling on a guest's **outbound** `wasi:http` call (connect + first-byte), independent of the invocation timeout, so a hung upstream is bounded on its own terms. The streaming (between-bytes) timeout is left at the default so a slow token stream isn't cut. Omit ⇒ wasmtime default. |
 | `bindings.sql` | table | — | The `sql` host binding. Omit for single-node (a per-site embedded libsql file); set `url` for a shared `sqld`. |
@@ -333,6 +336,33 @@ Wasm handler runtime. Parsed always, consumed only with the `handlers` feature.
 `admin_token_env`, `preview_mode` (`empty` \| `branch` \| `shared`),
 `preview_init`, `databases`. See
 [Use handler bindings](../how-to/handler-bindings.md).
+
+### Memory ceilings per lane
+
+Every lane defaults to a **64 MiB** per-component linear-memory ceiling. The
+`*_max_memory_mb` knobs raise that ceiling for a lane; the ceiling is the maximum
+any component on the lane may use, not a per-component allocation. A component
+right-sizes itself **down** from the ceiling with its own `limits.memory_mb`
+(per-function) or the site's `max_memory_mb`; a component with neither inherits
+the lane ceiling. So the model is: set the lane ceiling high enough for the
+heaviest component, and let each component cap itself lower where it should. A
+per-component value above the lane ceiling is clamped to it — a component can
+**never** raise its own memory above the operator-set lane ceiling (fail-closed,
+operator-gated). Leaving every knob unset keeps the historical 64 MiB everywhere.
+
+Cost: without `pooling` there is **no** up-front reservation — each invocation
+sizes its store to its effective ceiling on demand. With `pooling = true` the
+allocator reserves roughly `max-lane-memory × total-slots` of **virtual** address
+space up front (slots = the sum of the three lanes' concurrency), so a raised
+ceiling enlarges that reservation; the node logs the estimate at startup and
+fails loudly if the reservation can't be made, rather than OOM-ing on the first
+invocation. Prefer raising only `async_max_memory_mb` (the durable lane) for heavy
+jobs, so the tighter sync/streaming lanes don't inflate the reservation.
+
+A component that exceeds its effective ceiling at runtime no longer dead-letters
+as an opaque `trap`: the terminal outcome and the `/metrics`
+`boatramp_handler_invocations_total{outcome="out-of-memory"}` counter read
+**`out-of-memory`**, so memory exhaustion is distinguishable from a logic crash.
 
 ### External SQL databases
 
