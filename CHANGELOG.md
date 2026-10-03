@@ -5,6 +5,43 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.12.6] - 2026-10-03
+
+Multi-issuer trust on `token_claims`: a route may now verify a token against a trusted-issuer POLICY
+(an explicit allow-list and/or an anchored `https` host-suffix pattern) and discover each verified
+issuer's JWKS per-`iss` (OIDC `.well-known`, or a `{iss}` template), instead of one fixed issuer+URL.
+It is the trust-axis dual of the v0.12.2 claim transform (which made the tenant-key axis "any org");
+this makes trust "any org" under one operator-authored policy. Additive, deny-by-default,
+host-evaluated; with the new fields absent the single-issuer path is byte-identical. Host-only, no WIT
+change.
+
+### Added
+
+- **`token_claims.issuer_trust: ( allow, suffix )`** — trust an explicit set of issuers and/or an
+  anchored `https` host-suffix family (e.g. `.my.salesforce.com`), matched at a label boundary over the
+  parsed URL host (never a raw-string suffix; rejects userinfo/port/non-https/bare-TLD). Plus
+  **`token_claims.jwks: ( discover: "oidc" )`** or **`( template: "{iss}/id/keys" )`** — resolve each
+  verified issuer's JWKS from an issuer-derived, operator-fixed URL. `iss` is checked against the policy
+  BEFORE any network fetch (fail-closed); the signature is then pinned to that issuer's JWKS (and to the
+  JWK's own algorithm, never the token header `alg`), and the shipped claim-transform tenant-key
+  derivation runs unchanged. Shared by route `token_claims`, the GDC `claims_from_token`, and the
+  tenancy `Token` source. Mixing the single-issuer and multi-issuer forms is an apply-time error.
+- **`boatramp token test-issuer --iss <iss>`** — offline: print whether an issuer is trusted by a policy
+  and the JWKS URL it would resolve to.
+
+### Security / correctness
+
+- JWKS discovery is gated behind the `iss`-policy check and a host SSRF guard (https-only, resolve +
+  require a public IP, pin the resolved address against DNS-rebind, and **never follow redirects** — any
+  3xx is a fetch failure); for OIDC discovery the discovered `jwks_uri` host is pinned to the verified
+  `iss` host. The pre-existing single-issuer `jwks_url` path (operator-fixed) is unchanged.
+- Mutation-verified anti-hollow gates, wired into the merge gate: a fast `write_target`-style unit gate
+  plus a live mock-OIDC/JWKS end-to-end itest, each RED under a `BOATRAMP_ISSUERTRUST_MUTATION` arm
+  (`skip_iss_policy`, `loosen_suffix_anchor`, `skip_jwks_host_pin`, `skip_ssrf_guard`, `follow_redirects`).
+  The deny taxonomy (`iss_not_trusted | jwks_discovery_failed | jwks_no_usable_key`) never logs the
+  token or claim value. Independent Security review looped to CLEAN (one MEDIUM — a redirect-following
+  SSRF escape — found and fixed during review).
+
 ## [0.12.5] - 2026-10-03
 
 A `tenant_or_base` table's base partition (`tenant_id IS NULL`, shared-read by every tenant) is
