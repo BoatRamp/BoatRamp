@@ -65,9 +65,13 @@ fn site_limits(
     site_handlers: &boatramp_core::config::HandlersSiteConfig,
 ) -> boatramp_handlers::Limits {
     let mut limits = boatramp_handlers::Limits::default();
-    if let Some(mb) = site_handlers.max_memory_mb {
-        limits.memory_bytes = (mb as usize).saturating_mul(1024 * 1024);
-    }
+    // Unset memory ⇒ inherit the lane ceiling (sentinel `usize::MAX`; the engine clamps down). This
+    // is how a consumer on a lane with a raised `async_max_memory_mb` gets the headroom — a
+    // `max_memory_mb` on the site only ever clamps the consumer DOWN from the ceiling.
+    limits.memory_bytes = site_handlers
+        .max_memory_mb
+        .map(|mb| (mb as usize).saturating_mul(1024 * 1024))
+        .unwrap_or(usize::MAX);
     if let Some(ms) = site_handlers.max_timeout_ms {
         limits.timeout_ms = ms as u64;
     }
@@ -1446,8 +1450,10 @@ pub(super) fn sql_starting_response(retry_after_secs: u32) -> Response {
 }
 
 /// The per-invocation limits for a handler: the site's caps and any per-handler
-/// caps (the lower of the two for each dimension). Left at the engine default
-/// where neither is set; the engine then clamps to its own ceiling.
+/// caps (the lower of the two for each dimension). Memory, when neither cap is
+/// set, inherits the lane ceiling (so raising `*_max_memory_mb` lifts every
+/// component on that lane); the other dimensions are left at the engine default.
+/// The engine then clamps everything to its own lane ceiling.
 #[cfg(feature = "handlers")]
 pub(super) fn effective_limits(
     site_handlers: &boatramp_core::config::HandlersSiteConfig,
@@ -1455,16 +1461,19 @@ pub(super) fn effective_limits(
 ) -> boatramp_handlers::Limits {
     let mut limits = boatramp_handlers::Limits::default();
     let handler_limits = handler.limits.as_ref();
-    if let Some(mb) = [
+    // Memory: the lower of the site/handler caps. With NEITHER set, inherit the lane ceiling via the
+    // `usize::MAX` sentinel — the engine's `min(requested, ceiling)` then yields the ceiling, so a
+    // component on a lane whose `*_max_memory_mb` was raised gets that headroom without having to
+    // restate it per component. A set cap only ever clamps DOWN from the ceiling (never raises it).
+    limits.memory_bytes = [
         site_handlers.max_memory_mb,
         handler_limits.and_then(|l| l.memory_mb),
     ]
     .into_iter()
     .flatten()
     .min()
-    {
-        limits.memory_bytes = (mb as usize).saturating_mul(1024 * 1024);
-    }
+    .map(|mb| (mb as usize).saturating_mul(1024 * 1024))
+    .unwrap_or(usize::MAX);
     if let Some(ms) = [
         site_handlers.max_timeout_ms,
         handler_limits.and_then(|l| l.timeout_ms),
