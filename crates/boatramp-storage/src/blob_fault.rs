@@ -59,11 +59,32 @@ pub(crate) fn classify(status: Option<u16>, code: Option<&str>) -> BlobFaultKind
     }
 }
 
+/// The operator log level for a read fault, by `kind` and `op`. The host's default filter is
+/// `boatramp=info`, so INFO reaches an operator and DEBUG does not — the levels are chosen against
+/// that line:
+/// - a **content-read miss** (`get`/`get_range` 404) is the incident shape — an unexpected absence on
+///   an object a sibling lane reads — so it is INFO, surfaced with its request-id so an operator can
+///   correlate it against the successful lane;
+/// - a **HEAD 404** is a routine existence-probe miss (`head` is used across the codebase as
+///   `is_ok()`), kept at DEBUG so those do not flood the log;
+/// - every **abnormal fault** (403/416/throttle/5xx/transport), on any op, is the surprising,
+///   actionable case → WARN.
+///
+/// Pure (no I/O) so the operator-visibility contract is unit-tested directly, without a subscriber.
+fn fault_log_level(kind: BlobFaultKind, op: &str) -> tracing::Level {
+    match kind {
+        BlobFaultKind::NotFound if op == "head" => tracing::Level::DEBUG,
+        BlobFaultKind::NotFound => tracing::Level::INFO,
+        _ => tracing::Level::WARN,
+    }
+}
+
 /// Classify, LOG one structured line, and return the `StorageError` for a failed blob read. `ms` is
-/// the measured op latency. A genuine `NotFound` logs at DEBUG (it is an expected, caller-visible
-/// outcome via [`StorageError::NotFound`]) and returns the unchanged `NotFound` variant; every other
-/// fault logs at WARN (the surprising, actionable cases the incident needed surfaced) and returns the
-/// structured [`StorageError::BackendRead`]. `reason` is short operator-level backend text.
+/// the measured op latency. A genuine `NotFound` returns the unchanged [`StorageError::NotFound`]
+/// variant; every other fault returns the structured [`StorageError::BackendRead`]. The one log line
+/// carries key/op/status/code/request-id/latency at the level [`fault_log_level`] picks for the
+/// `(kind, op)` pair (the `get`/`get_range` content miss — the incident — is operator-visible at
+/// INFO). `reason` is short operator-level backend text.
 pub(crate) fn read_fault(
     op: &str,
     key: &str,
@@ -78,23 +99,36 @@ pub(crate) fn read_fault(
     let status_f = status.unwrap_or(0);
     let code_f = code.unwrap_or("-");
     let reqid_f = request_id.unwrap_or("-");
+    let msg = if matches!(kind, BlobFaultKind::NotFound) {
+        "blob read: object not found"
+    } else {
+        "blob read backend fault"
+    };
+    // ONE structured line per failed read, at the level chosen for (kind, op). `tracing::event!`
+    // needs a CONST level, so dispatch to the static macro for the level `fault_log_level` picked;
+    // the local macro keeps the field set single-source across the three arms.
+    macro_rules! emit {
+        ($level:ident) => {
+            tracing::$level!(
+                op,
+                key,
+                status = status_f,
+                code = code_f,
+                request_id = reqid_f,
+                ms,
+                kind = ?kind,
+                "{msg}"
+            )
+        };
+    }
+    match fault_log_level(kind, op) {
+        tracing::Level::DEBUG => emit!(debug),
+        tracing::Level::INFO => emit!(info),
+        _ => emit!(warn),
+    }
     if matches!(kind, BlobFaultKind::NotFound) {
-        tracing::debug!(
-            op,
-            key,
-            status = status_f,
-            code = code_f,
-            request_id = reqid_f,
-            ms,
-            "blob read: object not found"
-        );
         return StorageError::NotFound(key.to_string());
     }
-    tracing::warn!(
-        op, key, status = status_f, code = code_f, request_id = reqid_f, ms,
-        kind = ?kind,
-        "blob read backend fault"
-    );
     StorageError::BackendRead {
         reason,
         status,
@@ -161,6 +195,39 @@ mod tests {
             }
         }
         println!("BLOB READ FAULT CLASS OK");
+    }
+
+    /// OBSERVABILITY — the read fault's operator log level is chosen so the incident shape (a
+    /// `get`/`get_range` content miss) is visible at the `boatramp=info` default, while routine HEAD
+    /// existence-probe misses stay quiet and every abnormal fault is actionable. Locks the contract
+    /// construens' Ask 1 verification turns on (a failed consumer `get` 404 must reach the operator).
+    #[test]
+    fn read_fault_level_surfaces_the_content_miss_but_not_head_probes() {
+        use tracing::Level;
+        // The incident: a get/get_range 404 is operator-visible (INFO ≥ the `info` default).
+        assert_eq!(fault_log_level(BlobFaultKind::NotFound, "get"), Level::INFO);
+        assert_eq!(
+            fault_log_level(BlobFaultKind::NotFound, "get_range"),
+            Level::INFO
+        );
+        // A HEAD miss is a routine existence probe — kept below the default (DEBUG).
+        assert_eq!(
+            fault_log_level(BlobFaultKind::NotFound, "head"),
+            Level::DEBUG
+        );
+        // Every abnormal fault is actionable at WARN regardless of op.
+        for op in ["get", "get_range", "head"] {
+            for kind in [
+                BlobFaultKind::AccessDenied,
+                BlobFaultKind::InvalidRange,
+                BlobFaultKind::Throttle,
+                BlobFaultKind::ServerError,
+                BlobFaultKind::Transport,
+                BlobFaultKind::Other,
+            ] {
+                assert_eq!(fault_log_level(kind, op), Level::WARN);
+            }
+        }
     }
 
     /// CUSTODY — the structured error carries ONLY status/code/request-id + a short reason; it never
