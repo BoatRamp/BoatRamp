@@ -5,6 +5,47 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.12.8] - 2026-10-04
+
+Observability (blob-read error granularity): a failed blob READ (`get`/`get_range`/`head`) used to
+collapse into one opaque `StorageError::Backend` string with NO HTTP status / error code / request-id
+in the logs — so a 403 (an under-scoped credential), a 416, a throttle/5xx, or a transport fault were
+indistinguishable from a genuine 404. That ambiguity cost construens a multi-hour misdiagnosis of a
+real blob-read incident. Each S3/Tigris/R2 read fault is now classified and logged with its concrete
+outcome. Host-only; no WIT/shim change. (This is Ask 1 of the construens request; Ask 2 — an
+async-vs-sync read discrepancy — was the v0.12.7 consumer-scope bug and is already fixed: both lanes
+share one backend/credential/bucket, and the only divergence, the scope, is now project-qualified.)
+
+### Added
+
+- **Granular blob-read fault classification + structured logging.** A new shared classifier
+  (`boatramp-storage::blob_fault`) maps a read fault to a distinct kind — `NotFound` / `AccessDenied`
+  (403) / `InvalidRange` (416) / `Throttle` (429/503) / `ServerError` (5xx) / `Transport` (no
+  response) / `Other` — and emits ONE structured line per failed read carrying `op`, `key`, HTTP
+  `status`, backend `code`, `request_id`, and the measured `latency_ms`. A genuine 404 stays a
+  `NotFound` (logged at DEBUG, an expected caller-visible outcome); every other fault logs at WARN and
+  returns the new structured `StorageError::BackendRead { reason, status, code, request_id }`, so an
+  operator can tell a real miss from a credential/throttle/server/transport fault at a glance. Wired on
+  the S3 backend (the construens/Tigris path and the incident); GCS/Azure reuse the same classifier as
+  a ready follow-up.
+
+### Security / custody
+
+- The new detail is **operator-only**. The structured log and the error value carry solely
+  `op`/`key`/`status`/`code`/`request_id`/`latency` plus a short backend reason — never the object
+  bytes (the body stream is read only after a successful `get`) and never a credential (the SDK error
+  display redacts secrets). Both consumer-facing audiences collapse to a coarse reason: the wasm-guest
+  `wasi:blobstore` binding maps `BackendRead` to `"blob backend unavailable"`, and the public
+  serve/dispatch HTTP path (`deploy_error_response`) now collapses `Storage(BackendRead|Backend|Io)`
+  to `"backend unavailable"` instead of echoing the error `Display` into the response body — so the
+  backend status/code/request-id (and the pre-existing SDK-context) never reach a client.
+- Mutation-verified anti-hollow gate (merge-gate-wired): `classifier_distinguishes_every_read_outcome`
+  asserts each outcome maps to a DISTINCT kind (a 403 is never a 404); RED under
+  `BOATRAMP_BLOBFAULT_MUTATION=flatten_403` (which collapses `AccessDenied`→`NotFound`, reproducing the
+  exact incident). Plus two custody tests (the error/log carry no value or credential; the public HTTP
+  body hides backend internals). Independent Security review: SHIP (CLEAN after folding in the one
+  LOW info-disclosure fix — the public-body collapse above).
+
 ## [0.12.7] - 2026-10-03
 
 Bug fix (correctness + project isolation): a `#[consumer]`'s / cron's `wasi:blobstore` binding scope
