@@ -18,6 +18,11 @@
 #[cfg(feature = "fs")]
 pub mod fs;
 
+// Shared blob-READ fault classification + structured per-op logging (the `{s3,gcs,azure}` backends
+// distinguish 404 / 403 / 416 / throttle / 5xx / transport instead of one opaque `Backend` string).
+#[cfg(any(feature = "s3", feature = "gcs", feature = "azure"))]
+mod blob_fault;
+
 #[cfg(feature = "s3")]
 pub mod s3;
 

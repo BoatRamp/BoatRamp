@@ -444,6 +444,31 @@ jobs:
           grep -qE 'test result: ok\. 1 passed' oom-classify.log \
             || { echo "::error::OOM classification gate did not run (silent skip or a failure)" >&2; exit 1; }
 
+      # BLOB-READ FAULT-CLASS gate (boatramp-blob-read-error-granularity): a failed blob read
+      # (`get`/`get_range`/`head`) must classify its concrete outcome — 404 / 403 AccessDenied / 416 /
+      # throttle (503/429) / 5xx / transport — into DISTINCT kinds, so a 403 under-scoped credential or
+      # a throttle is never conflated with a genuine 404 (the incident), and the structured
+      # status/code/request-id reach the operator log. Marker `BLOB READ FAULT CLASS OK`.
+      # MUTATION-VERIFIED: `BOATRAMP_BLOBFAULT_MUTATION=flatten_403` (via `blob-fault-gate-mutation`)
+      # collapses AccessDenied→NotFound, turning the 403≠404 assertion RED.
+      - name: "blob-read fault-class gate (403/throttle/5xx never conflated with 404)"
+        run: |
+          set -eo pipefail
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-storage \
+            --features s3 blob_fault -- --nocapture 2>&1 | tee blob-fault.log
+          grep -qE 'test result: ok\. 2 passed' blob-fault.log \
+            || { echo "::error::blob-read fault-class gate did not run (silent skip/failure, or the count drifted from 2)" >&2; exit 1; }
+          grep -q 'BLOB READ FAULT CLASS OK' blob-fault.log \
+            || { echo "::error::blob-read fault-class gate never reached its marker (a classifier regression or a skipped test)" >&2; exit 1; }
+          if BOATRAMP_BLOBFAULT_MUTATION=flatten_403 cargo-zigbuild test --target x86_64-unknown-linux-musl \
+            -p boatramp-storage --features s3,blob-fault-gate-mutation \
+            blob_fault::tests::classifier_distinguishes_every_read_outcome > blob-fault-mutation.log 2>&1; then
+            echo "::error::blob-read fault-class gate is HOLLOW — it passed under flatten_403 (a 403 is conflated with a 404)" >&2
+            exit 1
+          else
+            echo "blob-fault mutation verified: flatten_403 turns the gate RED → the 403≠404 distinction is load-bearing."
+          fi
+
       # MULTI-ISSUER TRUST gate (token_claims `issuer_trust` + per-`iss` JWKS discovery, the trust-axis
       # dual of the claim transform). The token's `iss` is checked against the operator policy
       # (explicit `allow` ∪ an anchored host-suffix) BEFORE any fetch — fail-closed, no network on an
