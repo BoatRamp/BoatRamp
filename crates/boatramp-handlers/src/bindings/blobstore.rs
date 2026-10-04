@@ -188,6 +188,10 @@ fn blob_err(op: &str, key: &str, err: StorageError) -> String {
             tracing::warn!(op, key, error = %err, "blob object-store backend fault");
             "blob backend unavailable".to_string()
         }
+        // A structured read fault (`get`/`get_range`/`head`): the backend ALREADY emitted the rich
+        // WARN (status + code + request-id + latency), so don't re-log — and give the guest the SAME
+        // coarse, non-leaking reason, NEVER the status/code/request-id metadata the Display carries.
+        StorageError::BackendRead { .. } => "blob backend unavailable".to_string(),
         // Self-describing + guest-actionable (no backend/credential metadata): pass the message through.
         other => other.to_string(),
     }

@@ -26,6 +26,23 @@ pub enum StorageError {
     /// A backend-specific error.
     #[error("backend error: {0}")]
     Backend(String),
+
+    /// A backend READ fault (get/get_range/head) carrying the concrete outcome: the HTTP `status`,
+    /// the backend error `code` (e.g. `AccessDenied`, `SlowDown`, `InvalidRange`), and the
+    /// `request_id` — so an operator can tell a real 404 from a 403/throttle/5xx/transport fault, and
+    /// a host caller could branch (retry a throttle, alert on a 403). The backend already emitted the
+    /// structured WARN (with latency); the guest-facing layer collapses this to a coarse, non-leaking
+    /// reason — the `status`/`code`/`request_id` never reach the guest. `reason` is operator-level
+    /// backend text (no object bytes, no credential).
+    #[error(
+        "backend read fault ({reason}; status={status:?} code={code:?} request_id={request_id:?})"
+    )]
+    BackendRead {
+        reason: String,
+        status: Option<u16>,
+        code: Option<String>,
+        request_id: Option<String>,
+    },
 }
 
 impl StorageError {

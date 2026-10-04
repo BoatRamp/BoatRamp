@@ -121,6 +121,12 @@ claim-transform-gate-mutation = ["boatramp-core/claim-transform-gate-mutation"]
 # stamp + the target-route refusal are load-bearing. Pass-through to
 # `boatramp-core/basewrite-gate-mutation`. Compiled OUT of every real build.
 basewrite-gate-mutation = ["boatramp-core/basewrite-gate-mutation"]
+# The blob-read fault-classifier gate lane. With this ON and
+# `BOATRAMP_BLOBFAULT_MUTATION=flatten_403`, `blob_fault::classify` collapses AccessDenied→NotFound
+# (the exact blob-read-404 incident), so the classifier-distinctness gate goes RED — proving the
+# 403/404 (and the other classes') distinction is load-bearing. Compiled OUT of every real build (the
+# seam also lives under this crate's own `cfg(test)`).
+blob-fault-gate-mutation = []
 
 [dependencies]
 boatramp-core.workspace = true

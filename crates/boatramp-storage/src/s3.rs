@@ -10,9 +10,13 @@ use boatramp_core::{ByteStream, GetObject, ObjectMeta, PutMeta, Storage, Storage
 use bytes::{Bytes, BytesMut};
 use futures::{StreamExt, TryStreamExt};
 
-use aws_sdk_s3::error::{DisplayErrorContext, SdkError};
+use aws_sdk_s3::error::{DisplayErrorContext, ProvideErrorMetadata, SdkError};
+use aws_sdk_s3::operation::RequestId;
 use aws_sdk_s3::primitives::ByteStream as AwsByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
+use std::time::Instant;
+
+use crate::blob_fault;
 
 /// Size of each multipart-upload part. S3 requires every part except the last
 /// to be at least 5 MiB; 8 MiB keeps part counts low while bounding the buffer.
@@ -283,22 +287,15 @@ fn range_header(offset: u64, len: Option<u64>) -> Option<String> {
 #[async_trait]
 impl Storage for S3Storage {
     async fn get(&self, key: &str) -> Result<GetObject, StorageError> {
-        let resp =
-            self.client
-                .get_object()
-                .bucket(&self.bucket)
-                .key(key)
-                .send()
-                .await
-                .map_err(|err| {
-                    if err.as_service_error().is_some_and(
-                        aws_sdk_s3::operation::get_object::GetObjectError::is_no_such_key,
-                    ) {
-                        StorageError::NotFound(key.to_string())
-                    } else {
-                        sdk_err(err)
-                    }
-                })?;
+        let started = Instant::now();
+        let resp = self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+            .map_err(|err| s3_read_fault("get", key, started, err))?;
 
         let meta = ObjectMeta {
             key: key.to_string(),
@@ -329,23 +326,16 @@ impl Storage for S3Storage {
         let Some(range) = range_header(offset, len) else {
             return self.get(key).await;
         };
-        let resp =
-            self.client
-                .get_object()
-                .bucket(&self.bucket)
-                .key(key)
-                .range(range)
-                .send()
-                .await
-                .map_err(|err| {
-                    if err.as_service_error().is_some_and(
-                        aws_sdk_s3::operation::get_object::GetObjectError::is_no_such_key,
-                    ) {
-                        StorageError::NotFound(key.to_string())
-                    } else {
-                        sdk_err(err)
-                    }
-                })?;
+        let started = Instant::now();
+        let resp = self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .range(range)
+            .send()
+            .await
+            .map_err(|err| s3_read_fault("get_range", key, started, err))?;
 
         let meta = ObjectMeta {
             key: key.to_string(),
@@ -421,22 +411,15 @@ impl Storage for S3Storage {
     }
 
     async fn head(&self, key: &str) -> Result<ObjectMeta, StorageError> {
-        let resp =
-            self.client
-                .head_object()
-                .bucket(&self.bucket)
-                .key(key)
-                .send()
-                .await
-                .map_err(|err| {
-                    if err.as_service_error().is_some_and(
-                        aws_sdk_s3::operation::head_object::HeadObjectError::is_not_found,
-                    ) {
-                        StorageError::NotFound(key.to_string())
-                    } else {
-                        sdk_err(err)
-                    }
-                })?;
+        let started = Instant::now();
+        let resp = self
+            .client
+            .head_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+            .map_err(|err| s3_read_fault("head", key, started, err))?;
 
         Ok(ObjectMeta {
             key: key.to_string(),
@@ -549,6 +532,35 @@ where
     SdkError<E, R>: std::error::Error,
 {
     StorageError::backend(DisplayErrorContext(&err).to_string())
+}
+
+/// Classify + LOG a failed blob READ (`get`/`get_range`/`head`) with the concrete S3 outcome — HTTP
+/// status, error code, and `x-amz-request-id` — plus op/key/latency, instead of one opaque string.
+/// A genuine 404 → `StorageError::NotFound` (unchanged, DEBUG-logged); 403/416/throttle/5xx/transport
+/// → the structured `StorageError::BackendRead` (WARN). The guest-facing layer still collapses the
+/// non-404 cases to a coarse reason — `reason` here is operator-level (the SDK redacts credentials;
+/// object bytes never enter the error path).
+fn s3_read_fault<E>(op: &str, key: &str, started: Instant, err: SdkError<E>) -> StorageError
+where
+    E: ProvideErrorMetadata,
+    SdkError<E>: std::error::Error,
+{
+    let status = err.raw_response().map(|r| r.status().as_u16());
+    let code = err
+        .as_service_error()
+        .and_then(ProvideErrorMetadata::code)
+        .map(str::to_string);
+    let request_id = err.request_id().map(str::to_string);
+    let reason = DisplayErrorContext(&err).to_string();
+    blob_fault::read_fault(
+        op,
+        key,
+        started.elapsed().as_millis(),
+        status,
+        code.as_deref(),
+        request_id.as_deref(),
+        reason,
+    )
 }
 
 #[cfg(test)]

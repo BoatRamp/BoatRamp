@@ -2668,6 +2668,14 @@ fn redirect(status: u16, location: &str) -> Response {
 }
 
 /// Map a [`DeployError`] to an HTTP response.
+///
+/// The full error — including any backend SDK context (S3/Tigris/R2 status, error code,
+/// request-id, endpoint/bucket/key) carried by [`StorageError::BackendRead`] /
+/// [`StorageError::Backend`] / [`StorageError::Io`] — always goes to the operator WARN log.
+/// The PUBLIC response body echoes the error's own message only for the deterministic,
+/// caller-facing variants; a blob/KV backend or I/O fault collapses to a coarse,
+/// non-leaking body so the serve/dispatch path never leaks backend internals to a client
+/// (the same coarse-body posture the wasm-guest `blob_err` already enforces).
 fn deploy_error_response(err: DeployError) -> Response {
     let status = match &err {
         DeployError::NotFound(_) | DeployError::Storage(StorageError::NotFound(_)) => {
@@ -2684,7 +2692,17 @@ fn deploy_error_response(err: DeployError) -> Response {
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
     tracing::warn!(error = %err, "request failed");
-    (status, format!("{err}\n")).into_response()
+    // A blob/KV backend or I/O fault carries backend status/code/request-id and may name
+    // the endpoint/bucket/key (it is already in the WARN above); collapse the PUBLIC body
+    // so no backend internals reach a client. Every other variant is deterministic and
+    // caller-facing, so its own message stands.
+    let body = match &err {
+        DeployError::Storage(
+            StorageError::BackendRead { .. } | StorageError::Backend(_) | StorageError::Io(_),
+        ) => "backend unavailable\n".to_string(),
+        _ => format!("{err}\n"),
+    };
+    (status, body).into_response()
 }
 
 /// Reject a resource name (site/function/compute/workflow) that is unsafe at the
@@ -2778,6 +2796,65 @@ mod tests {
         // Empty vary is a no-op.
         let plain = apply_vary((StatusCode::OK, "y").into_response(), &[]);
         assert!(plain.headers().get(header::VARY).is_none());
+    }
+
+    /// CUSTODY — a blob/KV backend read fault must NOT leak backend internals (HTTP
+    /// status, error code, request-id, SDK context / endpoint / bucket / key) into the
+    /// PUBLIC serve/dispatch response body; it collapses to a coarse reason (the operator
+    /// still gets the full detail in the WARN log). The surgical collapse must not touch
+    /// the deterministic, caller-facing variants (e.g. `NotFound` keeps its message + 404).
+    #[tokio::test]
+    async fn deploy_error_response_hides_backend_internals_from_the_public_body() {
+        // The new granular read fault, carrying would-be-leaky backend metadata.
+        let resp = deploy_error_response(DeployError::Storage(StorageError::BackendRead {
+            reason: "s3 endpoint https://fly.storage.tigris.dev bucket SECRETBUCKET key SECRETKEY"
+                .to_string(),
+            status: Some(403),
+            code: Some("AccessDenied".to_string()),
+            request_id: Some("REQ-LEAK-123".to_string()),
+        }));
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert_eq!(body, "backend unavailable\n");
+        for leak in [
+            "403",
+            "AccessDenied",
+            "REQ-LEAK-123",
+            "SECRETBUCKET",
+            "SECRETKEY",
+            "tigris",
+        ] {
+            assert!(
+                !body.contains(leak),
+                "public body leaked `{leak}`: {body:?}"
+            );
+        }
+
+        // The legacy opaque backend error (pre-existing SDK-context leak) is collapsed too.
+        let resp = deploy_error_response(DeployError::Storage(StorageError::Backend(
+            "DispatchFailure: https://internal.endpoint SECRETCTX".to_string(),
+        )));
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(body.to_vec()).unwrap(),
+            "backend unavailable\n"
+        );
+
+        // Surgical: a genuine not-found still surfaces its caller-facing message + 404.
+        let resp = deploy_error_response(DeployError::Storage(StorageError::NotFound(
+            "abc".to_string(),
+        )));
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8(body.to_vec()).unwrap().contains("abc"));
     }
 
     /// The `/api/cluster/join-token` handler mints a verifiable **bearer** token,
