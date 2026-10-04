@@ -22,10 +22,14 @@ share one backend/credential/bucket, and the only divergence, the scope, is now 
   (`boatramp-storage::blob_fault`) maps a read fault to a distinct kind — `NotFound` / `AccessDenied`
   (403) / `InvalidRange` (416) / `Throttle` (429/503) / `ServerError` (5xx) / `Transport` (no
   response) / `Other` — and emits ONE structured line per failed read carrying `op`, `key`, HTTP
-  `status`, backend `code`, `request_id`, and the measured `latency_ms`. A genuine 404 stays a
-  `NotFound` (logged at DEBUG, an expected caller-visible outcome); every other fault logs at WARN and
-  returns the new structured `StorageError::BackendRead { reason, status, code, request_id }`, so an
-  operator can tell a real miss from a credential/throttle/server/transport fault at a glance. Wired on
+  `status`, backend `code`, `request_id`, and the measured `latency_ms`. The level is chosen against
+  the `boatramp=info` default so the incident shape is visible without flooding: a `get`/`get_range`
+  404 (an unexpected content miss, the incident) logs at **INFO** with its request-id — so a failed
+  consumer read is operator-visible and can be correlated against a sibling lane's success — while a
+  `head` 404 (a routine existence probe) stays at DEBUG, and every abnormal fault (403/416/throttle/
+  5xx/transport) logs at **WARN** and returns the new structured
+  `StorageError::BackendRead { reason, status, code, request_id }`, so an operator can tell a real miss
+  from a credential/throttle/server/transport fault at a glance. Wired on
   the S3 backend (the construens/Tigris path and the incident); GCS/Azure reuse the same classifier as
   a ready follow-up.
 

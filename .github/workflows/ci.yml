@@ -456,8 +456,8 @@ jobs:
           set -eo pipefail
           cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-storage \
             --features s3 blob_fault -- --nocapture 2>&1 | tee blob-fault.log
-          grep -qE 'test result: ok\. 2 passed' blob-fault.log \
-            || { echo "::error::blob-read fault-class gate did not run (silent skip/failure, or the count drifted from 2)" >&2; exit 1; }
+          grep -qE 'test result: ok\. 3 passed' blob-fault.log \
+            || { echo "::error::blob-read fault-class gate did not run (silent skip/failure, or the count drifted from 3)" >&2; exit 1; }
           grep -q 'BLOB READ FAULT CLASS OK' blob-fault.log \
             || { echo "::error::blob-read fault-class gate never reached its marker (a classifier regression or a skipped test)" >&2; exit 1; }
           if BOATRAMP_BLOBFAULT_MUTATION=flatten_403 cargo-zigbuild test --target x86_64-unknown-linux-musl \
