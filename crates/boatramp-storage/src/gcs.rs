@@ -10,7 +10,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use async_trait::async_trait;
-use boatramp_core::{ByteStream, GetObject, ObjectMeta, PutMeta, Storage, StorageError};
+use boatramp_core::{ByteStream, GetObject, ListPage, ObjectMeta, PutMeta, Storage, StorageError};
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
 
@@ -250,6 +250,40 @@ impl Storage for GcsStorage {
             }
         }
         Ok(out)
+    }
+
+    async fn list_page(
+        &self,
+        prefix: &str,
+        after: Option<&str>,
+        limit: u32,
+    ) -> Result<ListPage, StorageError> {
+        // ONE `list_objects` request: GCS's own `next_page_token` is the opaque cursor (unlike `list`,
+        // which loops to exhaustion), so the whole keyspace is never buffered.
+        let resp = self
+            .client
+            .list_objects(&ListObjectsRequest {
+                bucket: self.bucket.clone(),
+                prefix: Some(prefix.to_string()),
+                page_token: after.map(str::to_string),
+                max_results: Some(limit.clamp(1, 1000) as i32),
+                ..Default::default()
+            })
+            .await
+            .map_err(|err| StorageError::backend(err.to_string()))?;
+        let metas = resp
+            .items
+            .unwrap_or_default()
+            .into_iter()
+            .map(|object| object_meta(&object.name, &object))
+            .collect();
+        Ok(ListPage {
+            metas,
+            // Guard an empty token (treat `Some("")` as exhausted), matching S3's `is_truncated` gate
+            // and Azure's `.filter(!is_empty)` — otherwise the shim's drain loop would resume "from
+            // the start" and re-list forever.
+            cursor: resp.next_page_token.filter(|t| !t.is_empty()),
+        })
     }
 
     /// GCS can watch once the Pub/Sub notification consumer is wired (the pipeline

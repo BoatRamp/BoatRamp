@@ -13,7 +13,7 @@
 //! client's `per_try_policies` (see [`AzureStorage::connect`]).
 
 use async_trait::async_trait;
-use boatramp_core::{ByteStream, GetObject, ObjectMeta, PutMeta, Storage, StorageError};
+use boatramp_core::{ByteStream, GetObject, ListPage, ObjectMeta, PutMeta, Storage, StorageError};
 use bytes::{Bytes, BytesMut};
 use futures::{StreamExt, TryStreamExt};
 
@@ -343,6 +343,54 @@ impl Storage for AzureStorage {
             }
         }
         Ok(out)
+    }
+
+    async fn list_page(
+        &self,
+        prefix: &str,
+        after: Option<&str>,
+        limit: u32,
+    ) -> Result<ListPage, StorageError> {
+        let options = BlobContainerClientListBlobsOptions {
+            prefix: Some(prefix.to_string()),
+            marker: after.map(str::to_string),
+            maxresults: Some(limit.clamp(1, 1000) as i32),
+            ..Default::default()
+        };
+        // Pull a SINGLE page (unlike `list`, which drains every page): Azure's `next_marker` is the
+        // opaque cursor, so the whole keyspace is never buffered.
+        let mut pages = self
+            .container
+            .list_blobs(Some(options))
+            .map_err(|err| StorageError::backend(err.to_string()))?
+            .into_pages();
+        let Some(page) = pages
+            .try_next()
+            .await
+            .map_err(|err| StorageError::backend(err.to_string()))?
+        else {
+            return Ok(ListPage::default());
+        };
+        let model = page
+            .into_model()
+            .map_err(|err| StorageError::backend(err.to_string()))?;
+        let metas = model
+            .blob_items
+            .into_iter()
+            .filter_map(|item| {
+                let name = item.name?;
+                let props = item.properties.unwrap_or_default();
+                Some(ObjectMeta {
+                    key: name,
+                    size: props.content_length,
+                    content_type: props.content_type,
+                    etag: props.etag.map(|e| e.to_string()),
+                })
+            })
+            .collect();
+        // Azure sends an empty `<NextMarker/>` on the final page → treat `Some("")` as exhausted.
+        let cursor = model.next_marker.filter(|m| !m.is_empty());
+        Ok(ListPage { metas, cursor })
     }
 
     /// Azure can watch once the Storage Queue notification consumer is wired (the

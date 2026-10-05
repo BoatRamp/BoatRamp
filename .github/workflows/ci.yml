@@ -469,6 +469,34 @@ jobs:
             echo "blob-fault mutation verified: flatten_403 turns the gate RED → the 403≠404 distinction is load-bearing."
           fi
 
+      # BLOB-LIST PREFIX-CONFINEMENT gate (construens blob-list-prefix): the new guest `blob-list`
+      # (server-side prefix filter + bounded/resumable page) must stay inside the guest's container.
+      # The guest `prefix` is JOINED under the host container prefix (`hblob/{site}/{container}/`) and
+      # the returned keys are STRIPPED back to it — so a crafted/escaping prefix (or a forged cursor)
+      # can only ever list WITHIN the guest's own container; the marker is hidden; nested keys are
+      # kept. Marker `BLOB LIST PREFIX-CONFINEMENT OK`. MUTATION-VERIFIED: each
+      # `BOATRAMP_BLOBLIST_MUTATION` (via `blob-list-gate-mutation`, compiled OUT of shipped builds)
+      # neuters ONE half of the confinement and MUST turn the gate RED.
+      - name: "blob-list prefix-confinement gate (guest prefix can't escape its container)"
+        run: |
+          set -eo pipefail
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-handlers \
+            --features engine blob_list_prefix_confinement_gate -- --nocapture 2>&1 | tee blob-list.log
+          grep -qE 'test result: ok\. 1 passed' blob-list.log \
+            || { echo "::error::blob-list prefix-confinement gate did not run (silent skip/failure, or the count drifted from 1)" >&2; exit 1; }
+          grep -q 'BLOB LIST PREFIX-CONFINEMENT OK' blob-list.log \
+            || { echo "::error::blob-list prefix-confinement gate never reached its marker (a confinement regression or a skipped test)" >&2; exit 1; }
+          for mut in escape_prefix no_strip show_marker; do
+            if BOATRAMP_BLOBLIST_MUTATION="$mut" cargo-zigbuild test --target x86_64-unknown-linux-musl \
+              -p boatramp-handlers --features engine,blob-list-gate-mutation \
+              blob_list_prefix_confinement_gate > "blob-list-$mut.log" 2>&1; then
+              echo "::error::blob-list prefix-confinement gate is HOLLOW — it passed under '$mut' (a guest prefix escapes its container, or a raw internal key / the marker leaks)" >&2
+              exit 1
+            else
+              echo "blob-list mutation verified: '$mut' turns the gate RED → the container confinement is load-bearing."
+            fi
+          done
+
       # MULTI-ISSUER TRUST gate (token_claims `issuer_trust` + per-`iss` JWKS discovery, the trust-axis
       # dual of the claim transform). The token's `iss` is checked against the operator policy
       # (explicit `allow` ∪ an anchored host-suffix) BEFORE any fetch — fail-closed, no network on an

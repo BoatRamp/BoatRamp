@@ -323,6 +323,20 @@ pub fn host_capability_features_detailed() -> Vec<CapabilityFeature> {
             lifecycle: Experimental,
         });
     }
+    // The `blob-list` capability (construens blob-list-prefix): a server-side prefix filter + a
+    // bounded, resumable page over a blob container (the scaling complement to `wasi:blobstore`
+    // `list-objects`, which drains the whole container). Rides the SAME `wasi:blobstore` grant +
+    // per-container confinement, so it is available whenever the handler engine is compiled (like
+    // `messaging-stats`/`tenancy`); experimental until the shape settles. A guest declares
+    // `requires = ["blob-list"]` so a deploy against a pre-v0.12.9 host is refused cleanly (instead of
+    // failing to instantiate at runtime). Registering it here is what makes it pass that admission and
+    // appear in `boatramp capabilities`.
+    if cfg!(feature = "handlers") {
+        f.push(CapabilityFeature {
+            name: "blob-list",
+            lifecycle: Experimental,
+        });
+    }
     if cfg!(feature = "orm-subquery") {
         // Correlated roll-ups ship off-by-default (the riskiest query surface) — experimental
         // until the shape settles.
@@ -872,6 +886,10 @@ mod tests {
         // The read-only messaging-stats capability is advertised whenever handlers are compiled
         // (this test only runs under `handlers`), as an Experimental feature.
         assert!(host.contains(&"messaging-stats"));
+        // The blob-list (prefix/paginated listing) capability is advertised whenever handlers are
+        // compiled, so a guest's `requires = ["blob-list"]` is admitted on a v0.12.9+ host (and
+        // refused on an older one, instead of failing to instantiate at runtime).
+        assert!(host.contains(&"blob-list"));
         // The blob-upload (presigned-ingress) capability is cargo-gated: advertised iff this build
         // enabled it, so `boatramp capabilities` lists it and the `requires` ABI gate is meaningful.
         // (Its absence in the released image was the construens presigned-blob-upload gap — GATE.)

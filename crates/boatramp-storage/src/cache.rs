@@ -179,6 +179,17 @@ impl Storage for CachedStorage {
         self.inner.list(prefix).await
     }
 
+    async fn list_page(
+        &self,
+        prefix: &str,
+        after: Option<&str>,
+        limit: u32,
+    ) -> Result<boatramp_core::ListPage, StorageError> {
+        // Delegate so the inner backend's NATIVE single-page pagination is preserved (the default
+        // trait body would drain the whole keyspace through the cache — the exact cost this avoids).
+        self.inner.list_page(prefix, after, limit).await
+    }
+
     /// Delegate the zero-copy accessors to the wrapped backend — the cache buffers
     /// only small bodies, and large blobs (the ones these serve) are exactly what a
     /// local backend should memory-map / `sendfile`. Not delegating them would

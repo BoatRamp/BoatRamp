@@ -994,6 +994,45 @@ world blob-upload-host {
   import blob-upload;
 }
 
+/// The `blob-list` capability (construens blob-list-prefix): a SERVER-SIDE prefix filter and a
+/// bounded, resumable page over a blob container — the scaling complement to the standard
+/// `wasi:blobstore` `container.list-objects()`, which can only drain the WHOLE container to
+/// completion (so first-class blob GC and prefix-scoped maintenance 504 a handler once a container
+/// grows past tens of thousands of objects). This is a BOATRAMP-owned interface precisely so the
+/// vendored `wasi:blobstore` package stays byte-for-byte standard; `list-objects()` is unchanged.
+///
+/// No new grant: it rides the SAME `wasi:blobstore` grant + the SAME per-container confinement
+/// (`hblob/{site}/{container}/{tenant?}/`) as every other blob op. The guest's `prefix` is a
+/// SUB-prefix the host JOINS under that confined container prefix and strips back off the returned
+/// names, so it can only ever narrow WITHIN the guest's own container — a crafted or escaping prefix
+/// cannot widen the view. The `cursor` is OPAQUE (a backend continuation token); the host re-applies
+/// the container prefix on every resume, so even a forged cursor stays confined.
+interface blob-list {
+  /// One bounded page of a listing: the matching object names (container-relative, e.g.
+  /// `der/<sha>/0.jpg`) and an OPAQUE `cursor` to resume after. A `none` cursor ⇒ exhausted.
+  record page {
+    names: list<string>,
+    cursor: option<string>,
+  }
+
+  /// List one bounded page of up to `limit` object names in `container` under the optional `prefix`
+  /// (container-relative; `none` ⇒ the whole container), resuming strictly after the opaque `after`
+  /// cursor from a prior page (`none` ⇒ from the start). The names are container-relative and, unlike
+  /// `list-objects`, DO include nested keys (that is the point — reach `der/<sha>/…`); the internal
+  /// existence marker is never returned. A handler loops this to exhaustion for a prefix sweep, or
+  /// stops after a page and continues on the next invocation for bounded per-call work.
+  list-page: func(container: string, prefix: option<string>, after: option<string>, limit: u32)
+    -> result<page, string>;
+}
+
+/// The blob-list world (imported into request handlers / functions / consumers, same as blobstore).
+/// A guest WIT addition ⇒ a shim rev + off-by-default `@unstable(feature = blob-list)` on the guest
+/// side + a `requires` admission entry (a pre-feature host rejects the deploy, never fails to
+/// instantiate at runtime).
+world blob-list-host {
+  import blob-list;
+}
+
 /// The `target-context` capability (PLAN-delegable-capabilities Stage D): a resolver reads back the
 /// opaque app-context a verified TARGET **capability** carried (its `br_app` claim — e.g. a per-client
 /// `sub`), so it can apply its OWN within-tenant filter (`client_id = sub`). The host-forced target

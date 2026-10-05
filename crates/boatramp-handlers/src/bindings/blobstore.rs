@@ -62,9 +62,34 @@ mod generated {
 
 use generated::wasi::blobstore;
 
+/// The boatramp-owned `blob-list` interface (server-side prefix filter + a bounded, resumable page).
+/// A SEPARATE bindgen! world from the vendored `wasi:blobstore` one above (one world per bindgen!),
+/// so the standard blobstore surface stays byte-for-byte untouched. Its `Host` is impl'd on the SAME
+/// [`BlobHost`], reusing the one `container_prefix` confinement choke point.
+mod generated_list {
+    wasmtime::component::bindgen!({
+        path: "wit",
+        world: "boatramp:handlers/blob-list-host",
+        // `list-page` touches the (async) Storage backend.
+        async: true,
+    });
+}
+
+use generated_list::boatramp::handlers::blob_list;
+
 /// Marker object that records a container's existence (and creation time). Kept
 /// out of `list-objects` results.
 const MARKER: &str = ".boatramp-container";
+
+/// The reserved host-internal object namespace. NO guest object can start with this (the write side
+/// `validate_object_key` rejects `.boatramp*`); it holds the container [`MARKER`] and host-internal
+/// staging such as `.boatramp-uploads/<id>/part-N` (S3-ingress multipart). A prefix listing fences
+/// the WHOLE namespace (`is_reserved_name`), not just the exact marker — see [`confine_list_names`].
+const RESERVED_PREFIX: &str = ".boatramp";
+
+/// Upper bound on a single `blob-list` page (clamped from the guest's `limit`): keeps one call's
+/// host work and the backend request bounded. Matches S3's `list_objects_v2` `max-keys` ceiling.
+const MAX_LIST_PAGE: u32 = 1000;
 
 /// Cap on a single buffered outgoing value (also the handler memory ceiling).
 const OUTGOING_CAP: usize = 64 * 1024 * 1024;
@@ -135,6 +160,109 @@ impl Container {
 fn checked_object_key(prefix: &str, object: &str) -> Result<String, String> {
     validate_object_key(object).map_err(|e| format!("invalid object name: {e}"))?;
     Ok(format!("{prefix}{object}"))
+}
+
+/// Screen a guest-supplied LIST prefix for the `blob-list` capability. Unlike an object key a prefix
+/// MAY contain `/` (it narrows into nested keys, e.g. `der/<sha>/`) and MAY be empty (the whole
+/// container), so [`validate_object_key`] does not fit. The load-bearing confinement is structural —
+/// [`join_list_prefix`] joins it UNDER the container prefix and [`confine_list_names`] strips that
+/// prefix back off — so an escaping prefix simply matches nothing; this screen is defense-in-depth and
+/// a clean guest error. Rejects a leading `/` (absolute-looking), a `..` path segment, the reserved
+/// `.boatramp` namespace, backslashes, globs, and control bytes.
+fn screen_list_prefix(prefix: &str) -> Result<(), String> {
+    if prefix.is_empty() {
+        return Ok(());
+    }
+    if prefix.starts_with('/') {
+        return Err("invalid list prefix: must be container-relative (no leading '/')".to_string());
+    }
+    if prefix.contains('\0')
+        || prefix.contains('\\')
+        || prefix.contains('*')
+        || prefix.chars().any(char::is_control)
+    {
+        return Err(
+            "invalid list prefix: contains a control, backslash, or glob character".to_string(),
+        );
+    }
+    if prefix.split('/').any(|seg| seg == "..") {
+        return Err("invalid list prefix: '..' path segment".to_string());
+    }
+    if prefix.starts_with(".boatramp") {
+        return Err("invalid list prefix: reserved namespace".to_string());
+    }
+    Ok(())
+}
+
+/// Join a screened guest list `prefix` UNDER the host-computed `container_prefix`
+/// (`hblob/{site}/{container}/`), so the storage prefix ALWAYS starts with the container prefix and
+/// the listing can only ever narrow WITHIN the guest's own container. This is one half of the
+/// structural confinement (the other is [`confine_list_names`]); the pure split lets the
+/// anti-hollow gate mutate it directly.
+fn join_list_prefix(container_prefix: &str, guest_prefix: &str) -> String {
+    // MUTATION SEAM (gate `escape_prefix`): use the guest prefix RAW, so the listing escapes the
+    // container (another site's keyspace). Compiled out of shipped builds; the confinement gate then
+    // goes RED. See [`list_mutation`].
+    if list_mutation().as_deref() == Some("escape_prefix") {
+        return guest_prefix.to_string();
+    }
+    format!("{container_prefix}{guest_prefix}")
+}
+
+/// Whether a container-relative `name` is in the reserved `.boatramp*` namespace — ANY path segment
+/// starts (case-insensitively) with [`RESERVED_PREFIX`]. That is the container marker
+/// (`.boatramp-container`) or host-internal staging (`.boatramp-uploads/<id>/part-N`), NEVER a guest
+/// object (the write side rejects `.boatramp*` in every segment), so a prefix listing must not surface
+/// it. Matching the write-side's every-segment fence (rather than leading-segment only) keeps this
+/// self-contained — it does not rely on the "no writer nests a reserved segment" invariant holding.
+fn is_reserved_name(name: &str) -> bool {
+    name.split('/').any(|seg| {
+        seg.get(..RESERVED_PREFIX.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(RESERVED_PREFIX))
+    })
+}
+
+/// Relativize + confine a raw backend listing page to the guest's container view: STRIP
+/// `container_prefix` off each key (yielding a container-relative name, e.g. `der/<sha>/0.jpg`) and
+/// DROP the reserved `.boatramp*` namespace. A key NOT under `container_prefix` is dropped entirely —
+/// the structural guarantee that a raw internal key (or another container's key) can never reach the
+/// guest. Unlike `list-objects`, nested keys ARE kept (that is the whole point — reach `der/<sha>/…`),
+/// which is exactly why the reserved-namespace fence is the WHOLE `.boatramp*` subtree here, not just
+/// the exact top-level marker. Pure, so the confinement is unit-tested and mutation-gated.
+fn confine_list_names(
+    container_prefix: &str,
+    metas: Vec<boatramp_core::ObjectMeta>,
+) -> Vec<String> {
+    // MUTATION SEAMS (compiled out of shipped builds): `no_strip` returns the raw internal key (leaks
+    // `hblob/{site}/{container}/` AND fails to drop a foreign key); `show_marker` leaks the reserved
+    // `.boatramp*` namespace (the marker + host-internal staging).
+    let strip = list_mutation().as_deref() != Some("no_strip");
+    let hide_reserved = list_mutation().as_deref() != Some("show_marker");
+    metas
+        .into_iter()
+        .filter_map(|meta| {
+            let name = if strip {
+                meta.key.strip_prefix(container_prefix)?.to_string()
+            } else {
+                meta.key
+            };
+            (!(hide_reserved && is_reserved_name(&name))).then_some(name)
+        })
+        .collect()
+}
+
+/// The active `blob-list` confinement mutation (anti-hollow gate), or `None`. Present ONLY under
+/// `cfg(test)` or the `blob-list-gate-mutation` feature; a shipped build has neither, so
+/// [`join_list_prefix`]/[`confine_list_names`] are unconditional and this is a dead `None`. Mirrors
+/// `boatramp_storage::blob_fault`'s mutation seam.
+#[cfg(any(test, feature = "blob-list-gate-mutation"))]
+fn list_mutation() -> Option<String> {
+    std::env::var("BOATRAMP_BLOBLIST_MUTATION").ok()
+}
+#[cfg(not(any(test, feature = "blob-list-gate-mutation")))]
+#[inline]
+fn list_mutation() -> Option<String> {
+    None
 }
 
 /// An in-progress listing snapshot (object names captured at `list-objects`).
@@ -790,8 +918,42 @@ pub async fn read_object_through_guest_binding(
     host.incoming_value_consume_sync(iv)
 }
 
-/// Add the `wasi:blobstore` interfaces to `linker`, resolving the per-invocation
-/// [`BlobHost`] view via `host`.
+impl blob_list::Host for BlobHost<'_> {
+    /// One bounded page of container-relative object names under `prefix`, resuming after the opaque
+    /// `after` cursor. Confined by the SAME `container_prefix` choke point as every blob op: the guest
+    /// `prefix` is screened then JOINED under the container prefix, and the returned keys are STRIPPED
+    /// back to container-relative — so a crafted or escaping prefix, or a forged `after` cursor, can
+    /// only ever list WITHIN the guest's own container. The marker is hidden; nested keys are kept.
+    async fn list_page(
+        &mut self,
+        container: String,
+        prefix: Option<String>,
+        after: Option<String>,
+        limit: u32,
+    ) -> Result<blob_list::Page, String> {
+        // Single tenant-confinement choke point: hblob/{site}/{container}/ (allowlist-gated).
+        let container_prefix = self.container_prefix(&container)?;
+        let storage = self.storage()?;
+        let guest_prefix = prefix.as_deref().unwrap_or("");
+        screen_list_prefix(guest_prefix)?;
+        let joined = join_list_prefix(&container_prefix, guest_prefix);
+        let limit = limit.clamp(1, MAX_LIST_PAGE);
+        let page = storage
+            .list_page(&joined, after.as_deref(), limit)
+            .await
+            .map_err(|e| blob_err("list-page", &joined, e))?;
+        let names = confine_list_names(&container_prefix, page.metas);
+        Ok(blob_list::Page {
+            names,
+            cursor: page.cursor,
+        })
+    }
+}
+
+/// Add the `wasi:blobstore` interfaces (plus the boatramp `blob-list` extension) to `linker`,
+/// resolving the per-invocation [`BlobHost`] view via `host`. `blob-list` rides the SAME `host`
+/// closure and the SAME grant/confinement as the standard blobstore surface, so it is uniform across
+/// the request and consumer lanes by construction.
 pub fn add_to_linker<T: Send + 'static>(
     linker: &mut wasmtime::component::Linker<T>,
     host: impl Fn(&mut T) -> BlobHost<'_> + Send + Sync + Copy + 'static,
@@ -799,6 +961,7 @@ pub fn add_to_linker<T: Send + 'static>(
     blobstore::types::add_to_linker_get_host(linker, host)?;
     blobstore::container::add_to_linker_get_host(linker, host)?;
     blobstore::blobstore::add_to_linker_get_host(linker, host)?;
+    blob_list::add_to_linker_get_host(linker, host)?;
     Ok(())
 }
 
@@ -1017,6 +1180,138 @@ mod tests {
         names.sort();
         assert_eq!(names, vec!["a.txt".to_string(), "b.txt".to_string()]);
         assert!(end);
+    }
+
+    /// `list-page` (the boatramp `blob-list` capability): a server-side prefix filter + a bounded,
+    /// resumable page. UNLIKE `list-objects` it reaches NESTED keys (the GC use case), returns
+    /// container-relative names, hides the marker, paginates via the opaque cursor to exhaustion, and
+    /// never crosses the container boundary. Exercises the end-to-end host path (confinement choke +
+    /// join + the default `Storage::list_page` body + the strip).
+    #[tokio::test]
+    async fn list_page_prefix_scoped_paginates_and_stays_in_container() {
+        use super::blob_list::Host as _;
+        let storage = Arc::new(MemStorage::default());
+        let bind = binding(storage.clone(), "hblob/site-a/");
+        let mut table = ResourceTable::new();
+        let mut host = BlobHost::new(&mut table, Some(&bind));
+
+        // Container "assets" with nested derivative keys + a top-level key.
+        let c = host.create_container("assets".into()).await.unwrap();
+        let crep = c.rep();
+        for name in [
+            "der/shaA/0.jpg",
+            "der/shaA/1.jpg",
+            "der/shaB/0.jpg",
+            "top.txt",
+        ] {
+            let ov = outgoing(host.table, b"x");
+            host.write_data(Resource::new_own(crep), name.into(), ov)
+                .await
+                .unwrap();
+        }
+        // A SECOND container whose keys must NEVER surface via the first's list.
+        let o = host.create_container("other".into()).await.unwrap();
+        let orep = o.rep();
+        let ov = outgoing(host.table, b"x");
+        host.write_data(Resource::new_own(orep), "der/shaA/0.jpg".into(), ov)
+            .await
+            .unwrap();
+
+        // Prefix filter: only shaA's two derivatives, container-relative, nested-inclusive.
+        let page = host
+            .list_page("assets".into(), Some("der/shaA/".into()), None, 100)
+            .await
+            .unwrap();
+        let mut names = page.names.clone();
+        names.sort();
+        assert_eq!(
+            names,
+            vec!["der/shaA/0.jpg".to_string(), "der/shaA/1.jpg".to_string()]
+        );
+        assert!(
+            page.cursor.is_none(),
+            "a small result is exhausted in one page"
+        );
+        assert!(
+            !page
+                .names
+                .iter()
+                .any(|n| n.contains("hblob/") || n.contains("other")),
+            "no internal prefix / other container leaks"
+        );
+
+        // Bounded page + resume: limit 1 over the whole container walks all 4 real keys across pages,
+        // the marker is hidden, no duplicates/omissions.
+        let mut seen = Vec::new();
+        let mut after: Option<String> = None;
+        for _ in 0..64 {
+            let p = host
+                .list_page("assets".into(), None, after.clone(), 1)
+                .await
+                .unwrap();
+            assert!(p.names.len() <= 1, "limit honored");
+            seen.extend(p.names);
+            match p.cursor {
+                Some(cur) => after = Some(cur),
+                None => break,
+            }
+        }
+        seen.sort();
+        assert_eq!(
+            seen,
+            vec![
+                "der/shaA/0.jpg".to_string(),
+                "der/shaA/1.jpg".to_string(),
+                "der/shaB/0.jpg".to_string(),
+                "top.txt".to_string(),
+            ]
+        );
+        assert!(
+            !seen.iter().any(|n| n == MARKER),
+            "the marker is never listed"
+        );
+    }
+
+    /// ANTI-HOLLOW GATE — the `blob-list` confinement (JOIN the guest prefix UNDER the container
+    /// prefix; STRIP it back off every returned key; DROP the marker; DROP any foreign key) is
+    /// load-bearing. Mutation-verified: each `BOATRAMP_BLOBLIST_MUTATION` turns the relevant assertion
+    /// RED (`escape_prefix` → the join escapes the container; `no_strip` → a raw internal/foreign key
+    /// leaks; `show_marker` → the marker leaks). Marker `BLOB LIST PREFIX-CONFINEMENT OK`.
+    #[test]
+    fn blob_list_prefix_confinement_gate() {
+        let cp = "hblob/site-a/assets/";
+        // JOIN: a guest prefix is always confined UNDER the container prefix.
+        assert_eq!(
+            join_list_prefix(cp, "der/abc/"),
+            "hblob/site-a/assets/der/abc/"
+        );
+        assert!(
+            join_list_prefix(cp, "der/abc/").starts_with(cp),
+            "a guest list prefix must never escape the container prefix"
+        );
+        // CONFINE: container-relative, nested-inclusive, the WHOLE reserved `.boatramp*` namespace
+        // hidden (the marker AND host-internal multipart staging), a foreign key dropped.
+        let metas = vec![
+            meta("hblob/site-a/assets/der/abc/0.jpg", 1),
+            meta("hblob/site-a/assets/.boatramp-container", 0),
+            // Host-internal S3-ingress multipart staging under the guest's OWN container — nested, so
+            // only the whole-namespace fence (not an exact-marker check) keeps it hidden.
+            meta("hblob/site-a/assets/.boatramp-uploads/u-7/part-00000003", 1),
+            meta("hblob/site-b/assets/secret.jpg", 1), // another site — must never surface
+        ];
+        let names = confine_list_names(cp, metas);
+        assert_eq!(
+            names,
+            vec!["der/abc/0.jpg".to_string()],
+            "names must be container-relative, nested-inclusive, reserved-namespace-hidden, foreign-dropped"
+        );
+        assert!(
+            !names
+                .iter()
+                .any(|n| n.contains("hblob/") || n.contains(".boatramp")),
+            "a raw internal key prefix or the reserved .boatramp* namespace must never reach the guest"
+        );
+        println!("BLOB LIST PREFIX-CONFINEMENT OK");
     }
 
     #[tokio::test]

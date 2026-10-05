@@ -107,6 +107,37 @@ pub struct PutMeta {
     pub content_type: Option<String>,
 }
 
+/// One bounded page of a prefix listing ([`Storage::list_page`]): the object metadata for
+/// this page, plus an OPAQUE `cursor` to resume after. A `None` cursor means the listing is
+/// exhausted. The cursor is backend-defined (an S3 `NextContinuationToken`, a GCS
+/// `next_page_token`, an Azure marker, or — for the default drain-and-slice body — the last
+/// key of this page); it is meaningful ONLY to the same backend, which re-applies the
+/// container prefix on resume, so a caller must treat it as opaque and never parse it.
+#[derive(Debug, Clone, Default)]
+pub struct ListPage {
+    /// The object metadata for this page.
+    pub metas: Vec<ObjectMeta>,
+    /// Opaque resume cursor; `None` once the listing is exhausted.
+    pub cursor: Option<String>,
+}
+
+/// Encode a container-relative key `suffix` into the OPAQUE default-body list cursor (hex), so a
+/// resumable [`Storage::list_page`] cursor from the default body never exposes a readable key/name
+/// (incl. the reserved `.boatramp*` namespace) or the backend's internal key scheme — matching the
+/// opaque continuation tokens the cloud backends return. Paired with [`decode_list_cursor`].
+fn encode_list_cursor(suffix: &str) -> String {
+    hex::encode(suffix.as_bytes())
+}
+
+/// Decode a default-body list cursor produced by [`encode_list_cursor`] back to the key suffix. A
+/// malformed cursor (not hex, or not UTF-8 — e.g. guest-tampered) yields `None`, so the listing simply
+/// restarts from the beginning (benign; still confined to the query `prefix`).
+fn decode_list_cursor(cursor: &str) -> Option<String> {
+    hex::decode(cursor)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+}
+
 /// The result of a streaming read: object metadata plus its byte stream.
 pub struct GetObject {
     /// Metadata for the object being read.
@@ -173,6 +204,56 @@ pub trait Storage: Send + Sync {
 
     /// List object metadata under `prefix`.
     async fn list(&self, prefix: &str) -> Result<Vec<ObjectMeta>, StorageError>;
+
+    /// List ONE bounded page of object metadata under `prefix`, resuming strictly after the
+    /// opaque `cursor` (`after`), at most `limit` entries, returning the page plus the next
+    /// cursor (`None` ⇒ exhausted). Unlike [`list`](Self::list), this never buffers the whole
+    /// keyspace — it is the primitive behind the guest's prefix-scoped, resumable blob list, so
+    /// a maintenance pass (e.g. GC) stays within a handler's wall-clock on a container with tens
+    /// of thousands of objects.
+    ///
+    /// The default drains [`list`](Self::list), sorts by key, and slices one page after the
+    /// `after` cursor. Real cloud backends (S3/GCS/Azure) override it with native single-request
+    /// pagination, where the cursor is the backend's own continuation token. In BOTH cases the cursor
+    /// is OPAQUE to the caller and meaningful only to the same backend: for this default it is a hex
+    /// token of the last key's suffix under `prefix`, so it carries neither the backend's internal key
+    /// scheme (e.g. an `hblob/{site}/…` container path) NOR any readable key/name — matching the opaque
+    /// continuation tokens the cloud backends return. Resume decodes it and re-joins `prefix + suffix`;
+    /// a malformed (guest-tampered) cursor decodes to nothing and simply restarts, still confined to
+    /// `prefix`. `limit == 0` is treated as 1.
+    async fn list_page(
+        &self,
+        prefix: &str,
+        after: Option<&str>,
+        limit: u32,
+    ) -> Result<ListPage, StorageError> {
+        let mut metas = self.list(prefix).await?;
+        metas.sort_by(|a, b| a.key.cmp(&b.key));
+        let start = match after.and_then(decode_list_cursor) {
+            // The decoded cursor is the prior page's last-key suffix under `prefix` (exclusive):
+            // re-join to the full key and resume strictly past it. All listed keys begin with
+            // `prefix`, so the order is identical on full keys or suffixes. A cursor that does not
+            // decode ⇒ restart from the beginning (benign; still confined to `prefix`).
+            Some(suffix) => {
+                let resume = format!("{prefix}{suffix}");
+                metas.partition_point(|m| m.key.as_str() <= resume.as_str())
+            }
+            None => 0,
+        };
+        let take = limit.max(1) as usize;
+        let end = start.saturating_add(take).min(metas.len());
+        let page = metas.get(start..end).unwrap_or(&[]).to_vec();
+        let cursor = (end < metas.len())
+            .then(|| {
+                page.last()
+                    .map(|m| encode_list_cursor(m.key.strip_prefix(prefix).unwrap_or(&m.key)))
+            })
+            .flatten();
+        Ok(ListPage {
+            metas: page,
+            cursor,
+        })
+    }
 
     /// If this backend stores objects as local files, memory-map `key` and return
     /// its bytes for zero-copy serving. The blob keyspace is content-addressed and
@@ -259,4 +340,115 @@ pub struct DrainPair {
     pub source: std::sync::Arc<dyn Storage>,
     /// The NEW primary — the drain DESTINATION (gains every object the secondary still holds).
     pub dest: std::sync::Arc<dyn Storage>,
+}
+
+#[cfg(test)]
+mod list_page_tests {
+    use super::*;
+
+    /// A minimal in-memory [`Storage`] whose `list` returns canned keys — just enough to exercise the
+    /// DEFAULT [`Storage::list_page`] body (sort + slice + opaque cursor). Non-list ops are unused.
+    struct CannedList(Vec<String>);
+
+    #[async_trait::async_trait]
+    impl Storage for CannedList {
+        async fn get(&self, _key: &str) -> Result<GetObject, StorageError> {
+            unimplemented!()
+        }
+        async fn get_range(
+            &self,
+            _key: &str,
+            _offset: u64,
+            _len: Option<u64>,
+        ) -> Result<GetObject, StorageError> {
+            unimplemented!()
+        }
+        async fn put(
+            &self,
+            _key: &str,
+            _body: ByteStream,
+            _meta: PutMeta,
+        ) -> Result<ObjectMeta, StorageError> {
+            unimplemented!()
+        }
+        async fn head(&self, _key: &str) -> Result<ObjectMeta, StorageError> {
+            unimplemented!()
+        }
+        async fn delete(&self, _key: &str) -> Result<(), StorageError> {
+            unimplemented!()
+        }
+        async fn list(&self, prefix: &str) -> Result<Vec<ObjectMeta>, StorageError> {
+            Ok(self
+                .0
+                .iter()
+                .filter(|k| k.starts_with(prefix))
+                .map(|k| ObjectMeta {
+                    key: k.clone(),
+                    ..Default::default()
+                })
+                .collect())
+        }
+    }
+
+    /// The opaque list cursor round-trips, and never carries a readable key/name or the internal key
+    /// scheme — so even a reserved `.boatramp*` suffix or an `hblob/{site}/…` path is unreadable in it.
+    #[test]
+    fn list_cursor_is_opaque_and_round_trips() {
+        for suffix in ["der/shaA/0.jpg", ".boatramp-uploads/u-7/part-3", ""] {
+            let tok = encode_list_cursor(suffix);
+            assert_eq!(decode_list_cursor(&tok).as_deref(), Some(suffix));
+            // Opaque: hex, so no readable key material leaks through the cursor.
+            assert!(
+                !tok.contains(".boatramp") && !tok.contains('/') && !tok.contains("hblob"),
+                "cursor must be opaque, got {tok:?}"
+            );
+        }
+        // A malformed (guest-tampered) cursor decodes to nothing → the listing restarts, still confined.
+        assert_eq!(decode_list_cursor("not-hex!!"), None);
+    }
+
+    /// The default `list_page` body paginates a prefix exactly — every key once, in order, no dup/skip
+    /// across pages — and its cursor is opaque (even when a page boundary lands on a reserved key).
+    #[tokio::test]
+    async fn default_list_page_paginates_exactly_with_opaque_cursor() {
+        // Keys under one container prefix, incl. the reserved marker + host-internal staging. `.` sorts
+        // before letters, so the reserved keys are the first page boundaries under a limit=1 walk.
+        let p = "hblob/site-a/assets/";
+        let store = CannedList(vec![
+            format!("{p}.boatramp-container"),
+            format!("{p}.boatramp-uploads/u-7/part-3"),
+            format!("{p}der/shaA/0.jpg"),
+            format!("{p}der/shaA/1.jpg"),
+            format!("{p}top.txt"),
+        ]);
+
+        let mut seen = Vec::new();
+        let mut after: Option<String> = None;
+        for _ in 0..64 {
+            let page = store.list_page(p, after.as_deref(), 1).await.unwrap();
+            assert!(page.metas.len() <= 1, "limit honored");
+            if let Some(cur) = &page.cursor {
+                assert!(
+                    !cur.contains(".boatramp") && !cur.contains("hblob") && !cur.contains('/'),
+                    "cursor must be opaque even on a reserved-key boundary, got {cur:?}"
+                );
+            }
+            seen.extend(page.metas.into_iter().map(|m| m.key));
+            match page.cursor {
+                Some(cur) => after = Some(cur),
+                None => break,
+            }
+        }
+        // Every key, exactly once, in sorted order — no dup, no skip across the paged walk.
+        assert_eq!(
+            seen,
+            vec![
+                format!("{p}.boatramp-container"),
+                format!("{p}.boatramp-uploads/u-7/part-3"),
+                format!("{p}der/shaA/0.jpg"),
+                format!("{p}der/shaA/1.jpg"),
+                format!("{p}top.txt"),
+            ]
+        );
+    }
 }
