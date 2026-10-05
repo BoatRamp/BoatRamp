@@ -5,6 +5,51 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.12.9] - 2026-10-05
+
+Scaling (prefix-scoped, paginated guest blob list): the guest `wasi:blobstore`
+`container.list-objects()` can only list the WHOLE container, eagerly, to completion — no prefix
+filter, no resumable cursor. Past ~tens of thousands of objects a single `list()` 504s a sync-lane
+handler, so first-class blob GC and prefix-scoped maintenance cannot run at scale (construens: a blob
+GC that snapshots a 21k+ object container times out before any delete). This adds a server-side prefix
+filter and a bounded, resumable page. Guest-facing WIT addition ⇒ the `boatramp-uchron-shim` revs in
+lockstep (0.0.4 → 0.0.5). construens `boatramp-blob-list-prefix`.
+
+### Added
+
+- **`blob-list` capability** — a new BOATRAMP-owned WIT interface (`boatramp:handlers/blob-list`; the
+  vendored `wasi:blobstore` is untouched) with one host op `list-page(container, prefix?, after?,
+  limit) -> page { names, cursor? }`. The shim builds both guest shapes from it:
+  `blob::Container::list_prefix(prefix)` (drain all keys under a prefix — e.g. one source's
+  `der/<sha>/…`) and `blob::Container::list_page(prefix?, after?, limit)` (one bounded page + an opaque
+  cursor the caller carries across invocations). The existing `list()` is unchanged. Unlike
+  `list-objects`, `list-page` reaches NESTED keys (the whole point — GC must see `der/<sha>/…`).
+- **`Storage::list_page`** (boatramp-core) — one bounded page under a prefix, resuming after an opaque
+  cursor. S3/GCS/Azure override it with native single-request pagination (the backend's own
+  continuation token — the whole keyspace is never buffered, which is the scaling fix); a default
+  drain-and-slice body (opaque hex cursor) keeps every other backend correct; the cache delegates.
+- The capability is advertised for `requires`-admission whenever handlers are compiled, so a guest's
+  `requires = ["blob-list"]` is admitted on a v0.12.9+ host and refused cleanly on an older one
+  (instead of failing to instantiate at runtime). The shim import is off-by-default
+  (`@unstable(feature = blob-list)`).
+
+### Security / confinement
+
+- `list-page` rides the SAME `wasi:blobstore` grant and the SAME single `container_prefix` confinement
+  choke (`hblob/{site}/{container}/`, allowlist + `{tenant}`-gated) as every other blob op — no new
+  grant. The guest `prefix` is screened then JOINED under the container prefix and the returned keys
+  are STRIPPED back to container-relative, so a crafted/escaping prefix or a forged `after` cursor can
+  only ever list WITHIN the guest's own container (the host re-applies the prefix every call; the
+  backend's own prefix filter is the boundary regardless of the token). The reserved `.boatramp*`
+  namespace (the container marker + host-internal multipart staging) is fenced from BOTH the names and
+  the cursor. Backend faults stay coarse (`blob backend unavailable`); the cursor is opaque.
+- Mutation-verified anti-hollow gate (merge-gate-wired): `blob_list_prefix_confinement_gate` goes RED
+  under each `BOATRAMP_BLOBLIST_MUTATION` — `escape_prefix` (the join ignores the container prefix),
+  `no_strip` (a raw internal/foreign key leaks), `show_marker` (the reserved namespace leaks). Marker
+  `BLOB LIST PREFIX-CONFINEMENT OK`. Independent Security review: SHIP (CLEAN; no cross-tenant /
+  cross-container escape; the three folded fixes are the reserved-namespace fence, the opaque
+  default-body cursor, and the GCS empty-token guard).
+
 ## [0.12.8] - 2026-10-04
 
 Observability (blob-read error granularity): a failed blob READ (`get`/`get_range`/`head`) used to
