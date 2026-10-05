@@ -22,6 +22,11 @@ default = []
 # clamp goes RED when removed. NEVER enabled in a shipped build — it only exposes a test env var,
 # it is not a backdoor. Needs `messaging` for the per-consumer gate and `engine` for the limits.
 async-lane-gate-mutation = ["engine", "messaging"]
+# Anti-hollow gate lane for the `blob-list` prefix confinement: arms the `BOATRAMP_BLOBLIST_MUTATION`
+# seam in `bindings/blobstore.rs` (`join_list_prefix`/`confine_list_names`) so a CI gate can prove the
+# container-prefix join + the strip-back + the marker-hide each go RED when neutered. The seam also
+# lives under `cfg(test)`; this feature arms it for an out-of-test gate run. NEVER in a shipped build.
+blob-list-gate-mutation = []
 engine = [
   "dep:wasmtime",
   "dep:wasmtime-wasi",

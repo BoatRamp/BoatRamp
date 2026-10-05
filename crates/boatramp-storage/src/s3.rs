@@ -6,7 +6,7 @@
 //! collected.
 
 use async_trait::async_trait;
-use boatramp_core::{ByteStream, GetObject, ObjectMeta, PutMeta, Storage, StorageError};
+use boatramp_core::{ByteStream, GetObject, ListPage, ObjectMeta, PutMeta, Storage, StorageError};
 use bytes::{Bytes, BytesMut};
 use futures::{StreamExt, TryStreamExt};
 
@@ -479,6 +479,45 @@ impl Storage for S3Storage {
         }
 
         Ok(out)
+    }
+
+    async fn list_page(
+        &self,
+        prefix: &str,
+        after: Option<&str>,
+        limit: u32,
+    ) -> Result<ListPage, StorageError> {
+        // ONE `list_objects_v2` request (unlike `list`, which loops to exhaustion): S3's own
+        // `NextContinuationToken` is the opaque cursor, so the whole keyspace is never buffered —
+        // this is what keeps a prefix sweep / GC within a handler's wall-clock at 21k+ objects.
+        let resp = self
+            .client
+            .list_objects_v2()
+            .bucket(&self.bucket)
+            .prefix(prefix)
+            .max_keys(limit.clamp(1, 1000) as i32)
+            .set_continuation_token(after.map(str::to_string))
+            .send()
+            .await
+            .map_err(sdk_err)?;
+
+        let metas = resp
+            .contents()
+            .iter()
+            .filter_map(|object| {
+                object.key().map(|key| ObjectMeta {
+                    key: key.to_string(),
+                    size: object.size().and_then(|len| u64::try_from(len).ok()),
+                    content_type: None,
+                    etag: object.e_tag().map(str::to_string),
+                })
+            })
+            .collect();
+        // A token is meaningful only when the result was truncated; otherwise the listing is exhausted.
+        let cursor = (resp.is_truncated() == Some(true))
+            .then(|| resp.next_continuation_token().map(str::to_string))
+            .flatten();
+        Ok(ListPage { metas, cursor })
     }
 
     /// S3 can watch once the SQS notification consumer is wired (the pipeline
