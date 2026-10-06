@@ -1081,11 +1081,9 @@ interface tenancy {
   /// can present, then emit.
   present-token: func(token: string) -> result<_, tenancy-error>;
 
-  /// The host-verified principal sealed onto the async lane for THIS invocation (PLAN-async-persona):
-  /// the producer's own-tenant plus the host-verified caller persona/role, exactly as the host
-  /// verified them from the durable `signed_context` envelope (`br_ctx` + `br_persona`, one COSE
-  /// signature). NEVER a guest-supplied value.
-  record sealed-principal {
+  /// A `tenant`-class sealed principal: the producer's host-sealed own-tenant plus the host-verified
+  /// caller persona/role (`br_ctx` + `br_persona`, one COSE signature).
+  record tenant-principal {
     /// The producer's host-sealed own-tenant (the same value the `signed_context` tenancy source
     /// resolves).
     tenant: string,
@@ -1093,6 +1091,27 @@ interface tenancy {
     /// `token_persona_claim` and the producer presented a bearer carrying it. `none` ⇒ no persona
     /// sealed, so a `role(…)`-gated field fails closed (unchanged from before this feature).
     persona: option<string>,
+  }
+
+  /// A `system`-class sealed principal (construens cron-system-principal): a platform/super-admin
+  /// identity with NO tenant. It carries only the (optional) host-verified persona — there is
+  /// structurally no tenant to read.
+  record system-principal {
+    /// The host-verified persona/role, as for a tenant principal; `none` if none was sealed.
+    persona: option<string>,
+  }
+
+  /// The host-verified principal sealed onto the async lane for THIS invocation (PLAN-async-persona,
+  /// construens cron-system-principal): EITHER a `tenant` principal (an own-tenant value) OR a
+  /// `system` principal (no tenant — a platform/super-admin). A VARIANT (not a record with an
+  /// optional tenant) so a system principal is unrepresentable as a tenant: a guest MUST match both
+  /// arms, and there is no tenant string to `.unwrap()` in the system arm. NEVER a guest-supplied
+  /// value — the host verifies it from the durable `signed_context` seal.
+  variant sealed-principal {
+    /// An ordinary tenant principal.
+    tenant(tenant-principal),
+    /// A no-tenant platform/super-admin principal.
+    system(system-principal),
   }
 
   /// Return the host-verified sealed principal for the CURRENT invocation, or `none` (named

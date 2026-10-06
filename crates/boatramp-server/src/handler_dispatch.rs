@@ -2873,13 +2873,20 @@ pub(super) fn resolve_sealed_principal(
     let (env, anchor) = (signed_context?, anchor?);
     let v = boatramp_core::cose::verify_context_full(env, anchor, boatramp_core::time::now_unix())
         .ok()?;
-    // A `System` seal carries no tenant; `SealedPrincipal` cannot yet express the system class (the
-    // WIT variant lands in the C4 commit), and nothing MINTS a system seal until the later producer
-    // commits — so a system seal resolves to `None` here for now (unreachable in practice this
-    // commit). A `Tenant` seal is the existing path.
-    v.tenant.map(|tenant| boatramp_handlers::SealedPrincipal {
-        tenant,
-        persona: v.persona,
+    // Lower the verified seal's CLASS to the matching `SealedPrincipal` arm — a `System` seal (no
+    // tenant) becomes `System`, a `Tenant` seal keeps its tenant. The seal's own positive marker is
+    // the only thing that produces `System` (C2), so this never fabricates a system principal.
+    Some(match v.kind {
+        boatramp_core::tenancy::PrincipalKind::System => {
+            boatramp_handlers::SealedPrincipal::System { persona: v.persona }
+        }
+        boatramp_core::tenancy::PrincipalKind::Tenant => {
+            // A Tenant seal always carries `br_ctx` (verify rejects otherwise), so `tenant` is `Some`.
+            boatramp_handlers::SealedPrincipal::Tenant {
+                tenant: v.tenant?,
+                persona: v.persona,
+            }
+        }
     })
 }
 
@@ -2910,8 +2917,8 @@ mod persona_seal_gate {
             .unwrap();
         let p = resolve_sealed_principal(Some(&sealed), Some(&anchor))
             .expect("a valid seal resolves the principal");
-        assert_eq!(p.tenant, "acme");
-        assert_eq!(p.persona.as_deref(), Some("Integration"));
+        assert_eq!(p.tenant(), Some("acme"));
+        assert_eq!(p.persona(), Some("Integration"));
         // Fail-closed #1 — ABSENT envelope (a producer that never presented a token).
         assert!(resolve_sealed_principal(None, Some(&anchor)).is_none());
         // Fail-closed #2 — NO fleet anchor wired ⇒ nothing can verify.
