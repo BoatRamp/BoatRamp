@@ -3117,7 +3117,7 @@ mod gap3_tests {
             boatramp_core::time::now_unix(),
         )
         .unwrap();
-        assert_eq!(v.tenant, "tenant_B");
+        assert_eq!(v.tenant.as_deref(), Some("tenant_B"));
         assert_eq!(
             v.persona.as_deref(),
             Some("Integration"),
@@ -3154,7 +3154,7 @@ mod gap3_tests {
             boatramp_core::time::now_unix(),
         )
         .unwrap();
-        assert_eq!(v.tenant, "tenant_B");
+        assert_eq!(v.tenant.as_deref(), Some("tenant_B"));
         assert_eq!(
             v.persona, None,
             "a configured-but-absent persona claim seals NO persona (fail-closed)"
