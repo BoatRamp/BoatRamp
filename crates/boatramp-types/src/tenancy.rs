@@ -349,6 +349,41 @@ impl AccessMode {
     }
 }
 
+/// The **class** of a resolved principal (construens `cron-system-principal`). An identity is either a
+/// **tenant** (the ordinary case — a tenant id scopes its rows) or a **system** principal (a
+/// platform/super-admin identity that has **no tenant at all**; "tenant" is out of context for it).
+///
+/// A `System` principal is **provenance-bound**: it may be produced ONLY from a *verified* system
+/// source — a fleet-signed context seal carrying a positive `br_scope_kind=system` claim, an
+/// operator-declared node-config cron, a deploy captured as holding the exact global `System·Admin`
+/// right, or a `token` source whose operator-declared `system_when` matched against an *exactly-named,
+/// administratively-controlled* issuer. It is **never** inferred from the mere ABSENCE of a tenant: an
+/// anonymous/null principal (no facts) and a system principal are byte-identical in their SQL row
+/// effect (base/`IS NULL` only), so the class is the ONLY thing that distinguishes "the platform
+/// super-admin" from "nobody" — carried as a typed marker, never as a tenant string or an `SqlValue`.
+///
+/// The class is a pure IDENTITY signal: it drives the `app.principal_kind` RLS session GUC (so an
+/// app's row-level policy can grant the shared/base write to the system principal) and the guest
+/// `current-principal` shape. boatramp NEVER branches its OWN injected tenant predicate on this — the
+/// row-set is always `AccessMode`-driven (a `System` principal coerces to `Null`/base-only), keeping a
+/// single source of truth for the scope decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PrincipalKind {
+    /// An ordinary tenant identity (a tenant id scopes its rows). The default.
+    #[default]
+    Tenant,
+    /// A platform/super-admin identity with NO tenant — produced only from a verified system source.
+    System,
+}
+
+impl PrincipalKind {
+    /// Whether this is the system (no-tenant) class.
+    pub fn is_system(self) -> bool {
+        matches!(self, Self::System)
+    }
+}
+
 fn default_own() -> AccessMode {
     AccessMode::Own
 }
