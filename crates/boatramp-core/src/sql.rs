@@ -169,15 +169,29 @@ pub struct RlsGuc {
     /// write) stays strict. `None` ⇒ `all` reads leave the GUC untouched (v0.4.20 behavior:
     /// fail-closed). The guest can never set it — the whole [`Self::tenant`] namespace is reserved.
     pub all_marker: Option<String>,
+    /// The GUC carrying the resolved principal **class** (e.g. `app.principal_kind`), if the operator
+    /// configured one (construens `cron-system-principal`). Set to `"system"` for a
+    /// [`PrincipalKind::System`](crate::tenancy::PrincipalKind) principal and `"tenant"` otherwise, so
+    /// an app's RLS can grant the shared/base write to the system principal (`current_setting(name,
+    /// true) = 'system'`) — the PRIMARY authorization signal for the no-tenant base-write, NOT mere
+    /// defense-in-depth. `None` ⇒ the feature is unused and no class GUC is set. Its OWN name is
+    /// reserved (below) so a guest can never `set_config` it and self-promote — the leading segment of
+    /// `Self::tenant` does NOT cover it, so it must be reserved independently (panel Security S5).
+    pub kind: Option<String>,
 }
 
 impl RlsGuc {
     /// The configured GUC names, lowercased — the EXTRA reserved keys a guest may not set (on top of
     /// the always-reserved `boatramp.*` / `@boatramp_*`), so a guest can't forge the RLS backstop.
+    /// Includes the class GUC ([`Self::kind`]) so a guest cannot `set_config` `app.principal_kind` and
+    /// promote itself to the system principal for its own base-write (panel Security S5).
     pub fn reserved_names(&self) -> Vec<String> {
         let mut v = vec![self.tenant.to_ascii_lowercase()];
         if let Some(s) = &self.session {
             v.push(s.to_ascii_lowercase());
+        }
+        if let Some(k) = &self.kind {
+            v.push(k.to_ascii_lowercase());
         }
         v
     }
@@ -2272,6 +2286,31 @@ mod reserved_session_writes_tests {
         assert!(!rejected("SELECT set_config('app.tenant_id','x',true)"));
         // The always-reserved boatramp namespace is still blocked regardless of extras.
         assert!(rejected_with_app("SET boatramp.project = 'x'"));
+    }
+
+    /// construens `cron-system-principal` (panel Security S5): the derived class GUC
+    /// (`app.principal_kind`) MUST be in `RlsGuc::reserved_names`, so a guest can never `set_config` it
+    /// and self-promote to the system principal for its own base-write.
+    #[test]
+    fn principal_kind_guc_is_reserved() {
+        let guc = super::RlsGuc {
+            tenant: "app.tenant_id".into(),
+            session: Some("app.session_id".into()),
+            all_marker: None,
+            kind: Some("app.principal_kind".into()),
+        };
+        let reserved = guc.reserved_names();
+        assert!(
+            reserved.contains(&"app.principal_kind".to_string()),
+            "the class GUC must be reserved: {reserved:?}"
+        );
+        assert!(reserved.contains(&"app.tenant_id".to_string()));
+        assert!(reserved.contains(&"app.session_id".to_string()));
+        // And the write-screen rejects a guest forging it (its `app` leading segment is reserved).
+        assert!(rejected_with_app(
+            "SELECT set_config('app.principal_kind','system',true)"
+        ));
+        assert!(rejected_with_app("SET app.principal_kind = 'system'"));
     }
 
     // ---- hostile statements that spoof the injected tenant MUST be rejected ----
