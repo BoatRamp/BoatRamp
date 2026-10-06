@@ -61,11 +61,40 @@ pub struct TenancyBinding {
 /// the WIT `sealed-principal()` import returns it verbatim (or `none` on the sync/seal-less lane).
 /// Shared across WIT + trait per the UX naming condition.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SealedPrincipal {
-    /// The producer's host-sealed own-tenant.
-    pub tenant: String,
-    /// The caller's host-verified persona/role, or `None` when none was sealed / usable.
-    pub persona: Option<String>,
+pub enum SealedPrincipal {
+    /// An ordinary TENANT principal: the producer's host-sealed own-tenant + optional persona.
+    Tenant {
+        /// The producer's host-sealed own-tenant.
+        tenant: String,
+        /// The caller's host-verified persona/role, or `None` when none was sealed / usable.
+        persona: Option<String>,
+    },
+    /// A SYSTEM principal (construens cron-system-principal): a platform/super-admin with NO tenant —
+    /// there is structurally no tenant to read, so a consumer that needs one must handle this arm.
+    System {
+        /// The caller's host-verified persona/role, or `None`.
+        persona: Option<String>,
+    },
+}
+
+impl SealedPrincipal {
+    /// The sealed own-tenant, or `None` for a system principal (which has none).
+    pub fn tenant(&self) -> Option<&str> {
+        match self {
+            Self::Tenant { tenant, .. } => Some(tenant),
+            Self::System { .. } => None,
+        }
+    }
+    /// The host-verified persona/role (either class), or `None`.
+    pub fn persona(&self) -> Option<&str> {
+        match self {
+            Self::Tenant { persona, .. } | Self::System { persona } => persona.as_deref(),
+        }
+    }
+    /// Whether this is the system (no-tenant) class.
+    pub fn is_system(&self) -> bool {
+        matches!(self, Self::System { .. })
+    }
 }
 
 /// Per-invocation view over the (optional) `tenancy` grant AND the (optional) host-verified sealed
@@ -129,11 +158,19 @@ impl tenancy_iface::Host for TenancyHost<'_> {
     /// The value is exactly what the host verified (guest-blind); the guest can neither name nor
     /// supply it. Synchronous — a pure read of the per-invocation binding.
     fn current_principal(&mut self) -> Option<tenancy_iface::SealedPrincipal> {
-        self.sealed_principal
-            .map(|p| tenancy_iface::SealedPrincipal {
-                tenant: p.tenant.clone(),
-                persona: p.persona.clone(),
-            })
+        self.sealed_principal.map(|p| match p {
+            SealedPrincipal::Tenant { tenant, persona } => {
+                tenancy_iface::SealedPrincipal::Tenant(tenancy_iface::TenantPrincipal {
+                    tenant: tenant.clone(),
+                    persona: persona.clone(),
+                })
+            }
+            SealedPrincipal::System { persona } => {
+                tenancy_iface::SealedPrincipal::System(tenancy_iface::SystemPrincipal {
+                    persona: persona.clone(),
+                })
+            }
+        })
     }
 }
 
@@ -199,31 +236,48 @@ mod tests {
         let mut host = TenancyHost::new(None, None);
         assert!(host.current_principal().is_none());
 
-        // A host-verified seal ⇒ the exact `{tenant, persona}` the host verified, verbatim. It needs
-        // NO `present-token` grant (the binding is `None` here) — it's a pure read of the seal.
-        let sealed = SealedPrincipal {
+        // A host-verified TENANT seal ⇒ the exact `{tenant, persona}` the host verified, verbatim. It
+        // needs NO `present-token` grant (the binding is `None` here) — a pure read of the seal.
+        let sealed = SealedPrincipal::Tenant {
             tenant: "acme".into(),
             persona: Some("Integration".into()),
         };
         let mut host = TenancyHost::new(None, Some(&sealed));
-        let got = host
-            .current_principal()
-            .expect("a verified seal is present");
-        assert_eq!(got.tenant, "acme");
-        assert_eq!(got.persona.as_deref(), Some("Integration"));
+        match host.current_principal().expect("a verified seal is present") {
+            tenancy_iface::SealedPrincipal::Tenant(t) => {
+                assert_eq!(t.tenant, "acme");
+                assert_eq!(t.persona.as_deref(), Some("Integration"));
+            }
+            other => panic!("expected a tenant principal, got {other:?}"),
+        }
 
         // A seal with a tenant but no persona (no `token_persona_claim` configured) ⇒ persona `none`,
         // so a `role(…)`-gated field fails closed on the trusting side.
-        let tenant_only = SealedPrincipal {
+        let tenant_only = SealedPrincipal::Tenant {
             tenant: "acme".into(),
             persona: None,
         };
         let mut host = TenancyHost::new(None, Some(&tenant_only));
-        let got = host
-            .current_principal()
-            .expect("a verified seal is present");
-        assert_eq!(got.tenant, "acme");
-        assert_eq!(got.persona, None);
+        match host.current_principal().expect("a verified seal is present") {
+            tenancy_iface::SealedPrincipal::Tenant(t) => {
+                assert_eq!(t.tenant, "acme");
+                assert_eq!(t.persona, None);
+            }
+            other => panic!("expected a tenant principal, got {other:?}"),
+        }
+
+        // A SYSTEM seal ⇒ the `system` arm, carrying only the persona and NO tenant (construens
+        // cron-system-principal). There is structurally no tenant to read.
+        let system = SealedPrincipal::System {
+            persona: Some("super_admin".into()),
+        };
+        let mut host = TenancyHost::new(None, Some(&system));
+        match host.current_principal().expect("a verified seal is present") {
+            tenancy_iface::SealedPrincipal::System(s) => {
+                assert_eq!(s.persona.as_deref(), Some("super_admin"));
+            }
+            other => panic!("expected a system principal, got {other:?}"),
+        }
     }
 
     #[tokio::test]
