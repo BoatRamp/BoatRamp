@@ -1,9 +1,14 @@
-# Minimum test count for the per-push `test-server-features` CI lane
-# (`cargo test -p boatramp-server --features handlers,oidc,mcp,compression,domain-verify-dns`).
-#
-# The tripwire: the lane fails if the live `--list` count drops BELOW this number. A
-# feature-gate typo (or a `#[cfg]` mistake) that silently drops a whole test module is
-# exactly how 59 handlers-gated tests once ran nowhere — a shrinking count is a Mode-D
-# regression, and this catches it at the merge gate. Adding tests only ever raises the
-# floor; bump this number deliberately when you do (never lower it to make CI pass).
+# Minimum test counts for the per-push merge-gate test lanes with a floor tripwire. Each lane fails
+# if its live `--list` count drops BELOW its number. A feature-gate typo (or a `#[cfg]` mistake) that
+# silently drops a whole test module is exactly how 59 handlers-gated tests once ran nowhere — a
+# shrinking count is a Mode-D regression, caught at the merge gate. Adding tests only ever raises a
+# floor; bump the number deliberately when you do (never lower it to make CI pass).
+
+# `test-server-features` lane:
+# `cargo test -p boatramp-server --features handlers,oidc,mcp,compression,domain-verify-dns`.
 SERVER_FEATURES_MIN=329
+
+# `test-handlers` lane: `cargo test -p boatramp-handlers --all-features` (the wasm handler engine's
+# unit + `tests/serve.rs` integration surface — closes the nightly-only blind spot that let two stale
+# serve consumer-error asserts sit red unnoticed).
+HANDLERS_MIN=218
