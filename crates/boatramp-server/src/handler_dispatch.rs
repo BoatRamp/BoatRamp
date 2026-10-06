@@ -2871,12 +2871,16 @@ pub(super) fn resolve_sealed_principal(
     anchor: Option<&boatramp_core::cose::TokenPublicKey>,
 ) -> Option<boatramp_handlers::SealedPrincipal> {
     let (env, anchor) = (signed_context?, anchor?);
-    boatramp_core::cose::verify_context_full(env, anchor, boatramp_core::time::now_unix())
-        .ok()
-        .map(|v| boatramp_handlers::SealedPrincipal {
-            tenant: v.tenant,
-            persona: v.persona,
-        })
+    let v = boatramp_core::cose::verify_context_full(env, anchor, boatramp_core::time::now_unix())
+        .ok()?;
+    // A `System` seal carries no tenant; `SealedPrincipal` cannot yet express the system class (the
+    // WIT variant lands in the C4 commit), and nothing MINTS a system seal until the later producer
+    // commits — so a system seal resolves to `None` here for now (unreachable in practice this
+    // commit). A `Tenant` seal is the existing path.
+    v.tenant.map(|tenant| boatramp_handlers::SealedPrincipal {
+        tenant,
+        persona: v.persona,
+    })
 }
 
 /// **Async-lane persona gate battery** (PLAN-async-persona) — mutation-verified, host toolchain.

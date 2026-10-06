@@ -46,6 +46,15 @@ const CLAIM_CTX: &str = "br_ctx";
 /// `None`), never a panic. Absent when no persona was configured (unchanged for every existing
 /// producer).
 const CLAIM_PERSONA: &str = "br_persona";
+/// Text claim key for a signed-context envelope's **principal class** (construens
+/// `cron-system-principal`). Present (value [`SCOPE_KIND_SYSTEM`]) ONLY on a SYSTEM seal — a
+/// no-tenant platform/super-admin principal. A tenant seal omits it entirely (so existing seals are
+/// byte-unchanged). It is a POSITIVE, signed marker: a system principal is recognised ONLY by this
+/// claim's presence, NEVER by the mere absence of `br_ctx` (that still rejects, preserving the
+/// malformity check). Sealed into the SAME `COSE_Sign1` as the other claims, so the class is
+/// signature-bound and unforgeable; a system seal carries NO `br_ctx` (the two are mutually exclusive —
+/// a seal with both is rejected as a contradiction).
+const CLAIM_SCOPE_KIND: &str = "br_scope_kind";
 /// The public-subset name a target-capability envelope grants (5c) — binds the capability to a
 /// specific declared `PublicSubset`, so a capability minted for one subset can't reach another.
 const CLAIM_PUB: &str = "br_pub";
@@ -105,6 +114,10 @@ pub const KIND_SESSION: &str = "session";
 /// the consumer/drain resolves it. Guest-blind: the guest never names the tenant — the host stamps
 /// it from the producer's principal, and a forged/absent envelope fails closed.
 pub const KIND_CONTEXT: &str = "context";
+/// The one accepted value of [`CLAIM_SCOPE_KIND`]: a SYSTEM (no-tenant) principal. Any other value of
+/// the scope-kind claim is rejected (fail-closed — an unknown/typo'd kind never degrades to a tenant
+/// seal). A tenant seal omits the claim altogether.
+const SCOPE_KIND_SYSTEM: &str = "system";
 /// Token kind: a host-signed **target capability** envelope (R4/D8 5c, PLAN-tenancy-principal) — the
 /// AUTHENTICATED target source. Names a SECOND tenant `B` (`br_ctx`) and the public subset it grants
 /// (`br_pub`), scoped to an `aud`ience (the project permitted to redeem it) with `iat`/`exp`/`cti`,
@@ -931,8 +944,16 @@ pub fn verify_session(
 /// tenant-only [`verify_context`] projects out just [`VerifiedContext::tenant`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedContext {
-    /// The producer's host-sealed own-tenant (`br_ctx`) — the value every existing caller reads.
-    pub tenant: String,
+    /// The principal CLASS this seal carries (construens `cron-system-principal`): `Tenant` for an
+    /// ordinary own-tenant seal (`br_ctx` present, no scope-kind claim), `System` for a no-tenant
+    /// platform/super-admin seal (a positive `br_scope_kind=system` claim, no `br_ctx`). The class is
+    /// signature-bound and recognised ONLY by the positive marker — never by a missing tenant.
+    pub kind: crate::tenancy::PrincipalKind,
+    /// The producer's host-sealed own-tenant (`br_ctx`). `Some` for a `Tenant` seal (the value every
+    /// existing caller reads); **`None` for a `System` seal** (a system principal has no tenant). The
+    /// tenant-only [`verify_context`] maps a `System` seal (tenant `None`) to an `Err`, so its 13
+    /// callers' `.ok()` yields `None` and a `{tenant}`-templated bind-verify quarantines fail-closed.
+    pub tenant: Option<String>,
     /// The producer bearer's host-verified persona/role (`br_persona`), sealed only when the operator
     /// configured `token_persona_claim` at seal time. `None` when no persona was sealed OR when the
     /// carried value was corrupt/oversized/non-text (dropped fail-closed — the async-lane `role(…)`
@@ -986,6 +1007,49 @@ pub async fn mint_context(
     sign_claims(builder.build(), signer).await
 }
 
+/// Mint a **SYSTEM** signed-context envelope (construens `cron-system-principal`): a `COSE_Sign1` CWT
+/// with `br_kind = "context"` and a positive `br_scope_kind = "system"` claim, and — deliberately —
+/// **no `br_ctx`** (a system principal has no tenant). Signed by the fleet `Signer`. The async lane
+/// resolves this to a [`PrincipalKind::System`](crate::tenancy::PrincipalKind) principal (base/`IS
+/// NULL`-only, `app.principal_kind='system'`), NOT a tenant. `persona` rides the SAME envelope exactly
+/// as [`mint_context`]. The class is recognised ONLY by the signed `br_scope_kind` claim — so a
+/// stripped/forged envelope cannot be promoted to system by merely lacking a tenant. Used ONLY where a
+/// VERIFIED system source is established (a node-config cron, a `System·Admin` deploy capture, a
+/// `system_when` token match on an exactly-named issuer); it is never reachable from guest input.
+pub async fn mint_system_context(
+    persona: Option<&str>,
+    ttl_secs: u64,
+    now_unix: u64,
+    signer: &dyn Signer,
+) -> Result<String, TokenError> {
+    let mut builder = ClaimsSetBuilder::new()
+        .issued_at(Timestamp::WholeSeconds(now_unix as i64))
+        .cwt_id(random_cti()?)
+        .expiration_time(Timestamp::WholeSeconds(
+            now_unix.saturating_add(ttl_secs) as i64
+        ))
+        .text_claim(
+            CLAIM_KIND.to_string(),
+            CborValue::Text(KIND_CONTEXT.to_string()),
+        )
+        .text_claim(
+            CLAIM_SCOPE_KIND.to_string(),
+            CborValue::Text(SCOPE_KIND_SYSTEM.to_string()),
+        );
+    if let Some(persona) = persona {
+        if persona.len() > MAX_PERSONA_LEN {
+            return Err(TokenError::Claims(format!(
+                "context persona exceeds {MAX_PERSONA_LEN} bytes"
+            )));
+        }
+        builder = builder.text_claim(
+            CLAIM_PERSONA.to_string(),
+            CborValue::Text(persona.to_string()),
+        );
+    }
+    sign_claims(builder.build(), signer).await
+}
+
 /// Shared inner verify for a durable signed-context envelope: checks the COSE signature, the expiry,
 /// and `br_kind == "context"`, then returns the carried tenant + (optionally) the bounded persona.
 /// Both [`verify_context`] (tenant-only) and [`verify_context_full`] project from this so the
@@ -1000,12 +1064,14 @@ fn verify_context_inner(
     check_exp(&claims, now_unix)?;
     let mut kind = None;
     let mut ctx = None;
+    let mut scope_kind = None;
     let mut persona = None;
     for (name, value) in &claims.rest {
         if let (coset::cwt::ClaimName::Text(t), CborValue::Text(v)) = (name, value) {
             match t.as_str() {
                 CLAIM_KIND => kind = Some(v.clone()),
                 CLAIM_CTX => ctx = Some(v.clone()),
+                CLAIM_SCOPE_KIND => scope_kind = Some(v.clone()),
                 // Bounded, non-panicking: accept the persona ONLY if it is a single text value within
                 // the cap. A non-text or oversized value is silently dropped (persona `None`) — a
                 // corrupt/hostile envelope must never truncate a role or panic (Security C5).
@@ -1017,8 +1083,39 @@ fn verify_context_inner(
     if kind.as_deref() != Some(KIND_CONTEXT) {
         return Err(TokenError::Claims("not a signed-context envelope".into()));
     }
-    let tenant = ctx.ok_or_else(|| TokenError::Claims("signed context has no tenant".into()))?;
-    Ok(VerifiedContext { tenant, persona })
+    // POSITIVE-marker class precedence (Security S4 / Backend #2), fail-closed at every fork:
+    //   br_scope_kind=system  ⇒ System, and `br_ctx` MUST be absent (a seal with both is a
+    //                            contradiction → reject; a system principal has no tenant).
+    //   br_scope_kind=<other> ⇒ reject (unknown kind — never degrade to a tenant seal).
+    //   no scope-kind + br_ctx ⇒ Tenant (the ordinary seal; unchanged).
+    //   no scope-kind + no ctx ⇒ reject (preserves the pre-feature malformity check — a system
+    //                            principal is NEVER inferred from a missing tenant).
+    match scope_kind.as_deref() {
+        Some(SCOPE_KIND_SYSTEM) => {
+            if ctx.is_some() {
+                return Err(TokenError::Claims(
+                    "system signed-context must carry no tenant (br_ctx present)".into(),
+                ));
+            }
+            Ok(VerifiedContext {
+                kind: crate::tenancy::PrincipalKind::System,
+                tenant: None,
+                persona,
+            })
+        }
+        Some(other) => Err(TokenError::Claims(format!(
+            "signed context has an unknown scope kind: {other}"
+        ))),
+        None => {
+            let tenant =
+                ctx.ok_or_else(|| TokenError::Claims("signed context has no tenant".into()))?;
+            Ok(VerifiedContext {
+                kind: crate::tenancy::PrincipalKind::Tenant,
+                tenant: Some(tenant),
+                persona,
+            })
+        }
+    }
 }
 
 /// Verify a durable signed-context envelope against the fleet public key at `now_unix`: checks the
@@ -1032,7 +1129,12 @@ pub fn verify_context(
     public: &TokenPublicKey,
     now_unix: u64,
 ) -> Result<String, TokenError> {
-    verify_context_inner(token, public, now_unix).map(|v| v.tenant)
+    // A SYSTEM seal has no tenant ⇒ `Err` here, so the 13 tenant-only callers' `.ok()` yields `None`
+    // (no `SignedContext` tenant fact; a `{tenant}`-templated bind-verify quarantines fail-closed). A
+    // system principal is usable only via the class-aware [`verify_context_full`].
+    verify_context_inner(token, public, now_unix)?
+        .tenant
+        .ok_or_else(|| TokenError::Claims("signed context is a system principal (no tenant)".into()))
 }
 
 /// Verify a durable signed-context envelope and return BOTH the sealed own-tenant and the
@@ -2052,14 +2154,14 @@ mod tests {
             .await
             .unwrap();
         let v = verify_context_full(&plain, &pubkey, 1000).unwrap();
-        assert_eq!(v.tenant, "acme");
+        assert_eq!(v.tenant.as_deref(), Some("acme"));
         assert_eq!(v.persona, None, "no persona sealed when none configured");
         // With a persona: both the tenant and the persona round-trip, bound to the SAME envelope.
         let sealed = mint_context("acme", Some("Integration"), 300, 1000, &signer)
             .await
             .unwrap();
         let v = verify_context_full(&sealed, &pubkey, 1000).unwrap();
-        assert_eq!(v.tenant, "acme");
+        assert_eq!(v.tenant.as_deref(), Some("acme"));
         assert_eq!(v.persona.as_deref(), Some("Integration"));
         // The tenant-only `verify_context` projects out just the tenant (the 8+ existing callers).
         assert_eq!(verify_context(&sealed, &pubkey, 1000).unwrap(), "acme");
@@ -2085,6 +2187,75 @@ mod tests {
         assert_eq!(
             verify_context_full(&ok, &pubkey, 1000).unwrap().persona,
             Some(at_cap)
+        );
+    }
+
+    /// construens `cron-system-principal` — a SYSTEM signed-context is classed `System`, carries NO
+    /// tenant, and is recognised ONLY by a POSITIVE signed `br_scope_kind=system` marker (never by a
+    /// missing tenant). The reject forks are the load-bearing security property.
+    #[tokio::test]
+    async fn system_signed_context_is_positive_marker_only_and_tenant_free() {
+        use crate::tenancy::PrincipalKind;
+        let signer = LocalSigner::generate(TokenAlg::Es256);
+        let pubkey = signer.public_key();
+
+        // A SYSTEM seal: classed System, NO tenant, persona rides the same envelope.
+        let sys = mint_system_context(Some("super_admin"), 300, 1000, &signer)
+            .await
+            .unwrap();
+        let v = verify_context_full(&sys, &pubkey, 1000).unwrap();
+        assert_eq!(v.kind, PrincipalKind::System);
+        assert_eq!(v.tenant, None, "a system principal has no tenant");
+        assert_eq!(v.persona.as_deref(), Some("super_admin"));
+        // The tenant-only verify maps a system seal to Err ⇒ its callers' `.ok()` yields None.
+        assert!(verify_context(&sys, &pubkey, 1000).is_err());
+        // Same signature/expiry discipline as a tenant seal (forged key / expired ⇒ fail closed).
+        let stranger = LocalSigner::generate(TokenAlg::Es256);
+        assert!(verify_context_full(&sys, &stranger.public_key(), 1000).is_err());
+        assert!(verify_context_full(&sys, &pubkey, 2000).is_err());
+
+        // A TENANT seal stays Tenant with the tenant present (the ordinary path, unchanged).
+        let ten = mint_context("acme", None, 300, 1000, &signer).await.unwrap();
+        let v = verify_context_full(&ten, &pubkey, 1000).unwrap();
+        assert_eq!(v.kind, PrincipalKind::Tenant);
+        assert_eq!(v.tenant.as_deref(), Some("acme"));
+
+        // POSITIVE-marker precedence — a system principal is NEVER inferred from a missing tenant.
+        // Mint context seals with arbitrary (ctx, scope_kind) claims to exercise every reject fork.
+        async fn mint_raw(ctx: Option<&str>, scope_kind: Option<&str>, signer: &dyn Signer) -> String {
+            let mut b = ClaimsSetBuilder::new()
+                .issued_at(Timestamp::WholeSeconds(1000))
+                .cwt_id(random_cti().unwrap())
+                .expiration_time(Timestamp::WholeSeconds(1300))
+                .text_claim(
+                    CLAIM_KIND.to_string(),
+                    CborValue::Text(KIND_CONTEXT.to_string()),
+                );
+            if let Some(c) = ctx {
+                b = b.text_claim(CLAIM_CTX.to_string(), CborValue::Text(c.to_string()));
+            }
+            if let Some(sk) = scope_kind {
+                b = b.text_claim(CLAIM_SCOPE_KIND.to_string(), CborValue::Text(sk.to_string()));
+            }
+            sign_claims(b.build(), signer).await.unwrap()
+        }
+        // both a tenant AND system kind ⇒ contradiction ⇒ REJECT.
+        let both = mint_raw(Some("acme"), Some("system"), &signer).await;
+        assert!(
+            verify_context_full(&both, &pubkey, 1000).is_err(),
+            "a seal with both a tenant and the system marker must be rejected"
+        );
+        // neither a tenant NOR a system marker ⇒ REJECT (pre-feature malformity check preserved).
+        let neither = mint_raw(None, None, &signer).await;
+        assert!(
+            verify_context_full(&neither, &pubkey, 1000).is_err(),
+            "a seal with no tenant and no system marker must be rejected (never inferred as system)"
+        );
+        // an UNKNOWN scope kind ⇒ REJECT (fail-closed, never degrade to a tenant seal).
+        let unknown = mint_raw(Some("acme"), Some("wizard"), &signer).await;
+        assert!(
+            verify_context_full(&unknown, &pubkey, 1000).is_err(),
+            "an unknown scope kind must be rejected"
         );
     }
 

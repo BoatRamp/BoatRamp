@@ -322,6 +322,9 @@ impl HostTenancy {
             // The unresolved-request pass-through is a `Scoped`-variant opt-in; a target principal
             // never carries it (a target route always resolves `B` or fails closed at bind).
             pass_unresolved: false,
+            // A target principal is a `TargetTenant` read of ANOTHER tenant's public subset — a tenant
+            // class, never the system class.
+            principal_kind: PrincipalKind::Tenant,
         }
     }
 
