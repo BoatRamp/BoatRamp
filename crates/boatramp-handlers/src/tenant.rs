@@ -12,7 +12,7 @@
 
 use boatramp_core::orm::{Scope, ScopeMode, TableKeys};
 use boatramp_core::sql::SqlValue;
-use boatramp_core::tenancy::{AccessMode, ScopeAxis, TenancySchema};
+use boatramp_core::tenancy::{AccessMode, PrincipalKind, ScopeAxis, TenancySchema};
 
 /// One host-resolved, host-verified tenant fact, tagged with the [`ScopeAxis`] it belongs to
 /// (`PLAN-tenancy-principal` D1). The principal is a small *set* of these, borne statelessly. In
@@ -130,6 +130,17 @@ pub struct HostTenancy {
     /// Threaded from the route's [`Tenancy::Scoped::on_unresolved`](boatramp_core::tenancy::Tenancy)
     /// via [`with_unresolved_pass`](Self::with_unresolved_pass). Inert when a principal IS resolved.
     pass_unresolved: bool,
+    /// The resolved principal's CLASS (construens `cron-system-principal`). `Tenant` for every ordinary
+    /// principal (the default — byte-identical to pre-feature behavior). `System` ONLY when a *verified*
+    /// system source produced it (a positive `br_scope_kind=system` seal, a node-config cron, an exact
+    /// `System·Admin` deploy capture, or a `system_when` token match on an exactly-named issuer) — set
+    /// at the one resolve choke, never from guest/request input. A `System` principal carries EMPTY
+    /// `facts` and `read = write = Null` (the [coercion](Self::coerce_system) applied at the choke), so
+    /// its row effect is base/`IS NULL`-only and its tenant GUC stays unset; the class itself only
+    /// drives the `app.principal_kind` RLS GUC and the guest `current-principal` shape — boatramp never
+    /// branches its injected tenant predicate on it. CRITICAL: an empty-fact `Tenant` principal
+    /// (anonymous/null) and a `System` principal differ ONLY in this marker (see [`PrincipalKind`]).
+    principal_kind: PrincipalKind,
 }
 
 impl HostTenancy {
@@ -173,7 +184,33 @@ impl HostTenancy {
             target_context: std::collections::BTreeMap::new(),
             unscoped_writes: std::collections::BTreeSet::new(),
             pass_unresolved: false,
+            principal_kind: PrincipalKind::Tenant,
         }
+    }
+
+    /// The resolved principal's class (`Tenant` unless a verified system source promoted it).
+    pub fn principal_kind(&self) -> PrincipalKind {
+        self.principal_kind
+    }
+
+    /// Whether this is a system (no-tenant) principal.
+    pub fn is_system(&self) -> bool {
+        self.principal_kind.is_system()
+    }
+
+    /// Promote this tenancy to the **system** class and apply the system COERCION: a system principal
+    /// has NO tenant, so its fact set is emptied and both access axes are forced to
+    /// [`AccessMode::Null`] (base/`IS NULL`-only). This is stated as an explicit coercion — the class
+    /// is NOT orthogonal to the access mode: an `OwnOrNull` read under a system principal would
+    /// otherwise demand an own-tenant value and deny, so the coercion is what makes reads fall to the
+    /// base partition (tenant GUC left unset). Called ONLY at the resolve choke, from a verified system
+    /// source; the class then drives the `app.principal_kind` GUC and the guest `current-principal`.
+    pub fn coerce_system(mut self) -> Self {
+        self.principal_kind = PrincipalKind::System;
+        self.facts.clear();
+        self.read = AccessMode::Null;
+        self.write = AccessMode::Null;
+        self
     }
 
     /// Attach this route's #503 per-route write-global allowlist (its
