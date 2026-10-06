@@ -1311,6 +1311,14 @@ impl NodeTenantSqlResolver {
             // The NAMES are per-binding config; the handler binding sets the per-request/per-write
             // VALUE. Only when a tenant GUC name is configured (else today's project/site-only).
             if let Some(tenant) = self.binding.tenant_guc.clone().filter(|s| !s.is_empty()) {
+                // The principal-class GUC (construens `cron-system-principal`) is DERIVED from the
+                // tenant GUC's own namespace (`app.tenant_id` ⇒ `app.principal_kind`) — no extra
+                // operator config, and it is inherently in the tenant GUC's reserved leading segment
+                // (plus `reserved_names` lists it), so a guest can never forge it. A Postgres custom
+                // GUC is always `namespace.name`, so the split succeeds; absent a `.`, no class GUC.
+                let kind = tenant
+                    .rsplit_once('.')
+                    .map(|(ns, _)| format!("{ns}.principal_kind"));
                 backend = backend.with_rls_guc(Some(boatramp_core::sql::RlsGuc {
                     tenant,
                     session: self.binding.session_guc.clone().filter(|s| !s.is_empty()),
@@ -1322,6 +1330,7 @@ impl NodeTenantSqlResolver {
                         .tenant_all_marker
                         .clone()
                         .filter(|s| !s.trim().is_empty()),
+                    kind,
                 }));
             }
         }

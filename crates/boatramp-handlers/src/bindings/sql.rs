@@ -162,6 +162,18 @@ impl SqlSession {
         if let (Some(sname), Some(sv)) = (&guc.session, tenancy.rls_session_value()) {
             sets.push(boatramp_core::sql::render_set_local_guc(sname, sv));
         }
+        // The principal-CLASS GUC (construens `cron-system-principal`): `"system"` for a system
+        // principal (no tenant — the tenant GUC above is left unset, so reads fall to `IS NULL` only),
+        // `"tenant"` otherwise. Always set when configured, so an app RLS grants the shared/base write
+        // ONLY when `current_setting(app.principal_kind, true) = 'system'`. The name is reserved
+        // (`RlsGuc::reserved_names`), so a guest cannot `set_config` it and self-promote.
+        if let Some(kname) = &guc.kind {
+            let kind_val = if tenancy.is_system() { "system" } else { "tenant" };
+            sets.push(boatramp_core::sql::render_set_local_guc(
+                kname,
+                &SqlValue::Text(kind_val.to_string()),
+            ));
+        }
         sets
     }
 
@@ -973,6 +985,7 @@ mod tests {
                     tenant: "app.tenant_id".into(),
                     session: None,
                     all_marker: Some(marker.to_string()),
+                    kind: Some("app.principal_kind".into()),
                 }),
             }),
         );
