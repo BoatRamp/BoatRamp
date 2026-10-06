@@ -580,6 +580,49 @@ jobs:
             echo "issuer-trust LIVE mutation verified: follow_redirects turns the gate RED → the redirect refusal is load-bearing."
           fi
 
+  # BOATRAMP-HANDLERS test lane — closes the nightly-only blind spot. The wasm handler engine's unit
+  # tests PLUS its `tests/serve.rs` integration surface (the request / consumer / invoke / graphql
+  # dispatch paths, incl. the legible terminal-outcome taxonomy) ran ONLY in the nightly
+  # `test (all features)` tier — the `test-server-features` lane above is `-p boatramp-server`, never
+  # `-p boatramp-handlers`. That blind spot let two stale `serve.rs` consumer-error asserts
+  # (`Trap` where the taxonomy now yields `ConsumerError`) sit RED in nightly for days unnoticed. This
+  # lane runs the SAME boatramp-handlers surface the nightly runs, AT THE MERGE GATE. One crate +
+  # wasmtime, so affordable; the `*-gate-mutation` features `--all-features` pulls in are inert without
+  # their `BOATRAMP_*_MUTATION` env vars (the dedicated mutation gates arm those separately).
+  test-handlers:
+    name: test (handlers engine — unit + serve integration)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # Compile + run on the SHIPPED musl target (matches the other merge-gate test lanes).
+      - uses: ./.github/actions/setup-musl
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: test-handlers-musl
+
+      - name: Test (boatramp-handlers, all features)
+        run: cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-handlers --all-features
+
+      # Tripwire: fail if the handlers test count drops below the committed floor. A `#[cfg]`/feature
+      # gate mistake that silently drops a whole module (exactly how the serve consumer tests went
+      # unnoticed in nightly) shrinks the count — a shrink fails the gate rather than passing quietly.
+      # Reuses the musl build above; `-- --list` only enumerates test names. Adding tests raises the
+      # floor (bump .github/test-count-baseline); never lower it to make CI pass.
+      - name: Test-count tripwire (no silent drop)
+        run: |
+          set -eo pipefail
+          # shellcheck disable=SC1091
+          . .github/test-count-baseline
+          live=$(cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-handlers \
+            --all-features -- --list 2>/dev/null | grep -cE ': test$')
+          echo "handlers tests: live=$live floor=$HANDLERS_MIN"
+          if [ "$live" -lt "$HANDLERS_MIN" ]; then
+            echo "::error::handlers test count $live dropped below the floor $HANDLERS_MIN — a feature-gate mistake may have silently dropped tests. If the drop is intentional, lower .github/test-count-baseline deliberately."
+            exit 1
+          fi
+
   # SlateDB WAL-recovery HARD GATE (v0.5.5 incident: the control-plane KV was unbootable with
   # `Data error: empty SSTable` after a crash / crash-consistent snapshot froze a zero-byte tail WAL
   # object). Proves a store with such a frozen tail WAL still OPENS — the incident fix (`slatedb` 0.16
