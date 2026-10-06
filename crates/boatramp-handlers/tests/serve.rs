@@ -578,7 +578,10 @@ async fn consumer_dispatch_handles_and_counts() {
         )
         .await
         .expect_err("fail payload errors");
-    assert!(matches!(err, HandlerError::Trap(_)), "{err}");
+    // A `fail` payload makes the guest `handle` return a clean `Err` (a controlled failure, NOT a
+    // panic), so the dispatcher classifies it `ConsumerError` — the legible terminal-outcome the DLQ
+    // reads as `consumer-error`, distinct from the opaque `Trap` a real crash yields.
+    assert!(matches!(err, HandlerError::ConsumerError(_)), "{err}");
     // The failed message was not counted.
     assert_eq!(
         kv.get("hkv/blog/delivered/orders/created").await.unwrap(),
@@ -619,5 +622,7 @@ async fn consumer_without_keyvalue_grant_errors() {
         )
         .await
         .expect_err("ungranted kv -> consumer error");
-    assert!(matches!(err, HandlerError::Trap(_)), "{err}");
+    // Ungranted kv surfaces to the guest as a WIT error result; its `handle` returns a clean `Err`
+    // (a denial, not a crash), so the dispatcher classifies it `ConsumerError`, not `Trap`.
+    assert!(matches!(err, HandlerError::ConsumerError(_)), "{err}");
 }

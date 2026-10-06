@@ -76,11 +76,7 @@ blob-upload-aws = [
   "dep:aws-sdk-sts",
   "dep:aws-sdk-s3",
 ]
-blob-upload-gcs = [
-  "blob-upload",
-  "dep:gcs-signer",
-  "dep:gcs-signer-auth",
-]
+blob-upload-gcs = ["blob-upload", "dep:gcs-signer", "dep:gcs-signer-auth"]
 blob-upload-azure = [
   "blob-upload",
   "dep:azure_core_v1",
