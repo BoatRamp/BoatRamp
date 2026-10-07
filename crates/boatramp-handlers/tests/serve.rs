@@ -112,7 +112,9 @@ async fn instance_stats_measures_warm_cold_and_eviction_on_real_components() {
     // big enough. The per-request instantiate cost is the term distinct from a cold compile.
     let engine = HandlerEngine::new(Limits::default(), 16).expect("engine");
     for _ in 0..50 {
-        let r = engine.serve("http-200", HTTP_200, request(), no_caps()).await;
+        let r = engine
+            .serve("http-200", HTTP_200, request(), no_caps())
+            .await;
         assert!(r.is_ok(), "http-200 serves");
     }
     let snap = engine.instance_stats();
@@ -135,9 +137,15 @@ async fn instance_stats_measures_warm_cold_and_eviction_on_real_components() {
     );
     assert_eq!(r.cold_misses, 1, "one compile, then the cache stays warm");
     assert_eq!(r.warm_hits, 49, "the other 49 served from the warm cache");
-    assert_eq!(r.evictions, 0, "a 16-slot cache holds one component with zero eviction");
+    assert_eq!(
+        r.evictions, 0,
+        "a 16-slot cache holds one component with zero eviction"
+    );
     assert_eq!(r.warm_now, 1);
-    assert_eq!(r.instantiations, 50, "every served request instantiated once");
+    assert_eq!(
+        r.instantiations, 50,
+        "every served request instantiated once"
+    );
 
     // (B) EVICTION under a TIGHT cache (1 slot), two distinct components alternated → churn: every
     // serve is a cold miss, each new insert evicts the prior — the pathology construens HYPOTHESIZED
@@ -146,7 +154,9 @@ async fn instance_stats_measures_warm_cold_and_eviction_on_real_components() {
     // compile + instantiate are recorded first, so the lifecycle counts are exact.
     let tiny = HandlerEngine::new(Limits::default(), 1).expect("engine");
     let _ = tiny.serve("http-200", HTTP_200, request(), no_caps()).await; // miss #1 (no evict)
-    let _ = tiny.serve("kv-counter", KV_COUNTER, request(), no_caps()).await; // miss #2, evicts http-200
+    let _ = tiny
+        .serve("kv-counter", KV_COUNTER, request(), no_caps())
+        .await; // miss #2, evicts http-200
     let _ = tiny.serve("http-200", HTTP_200, request(), no_caps()).await; // miss #3, evicts kv-counter
     let tsnap = tiny.instance_stats();
     let t = &tsnap.request;
@@ -154,10 +164,55 @@ async fn instance_stats_measures_warm_cold_and_eviction_on_real_components() {
         "[EVICT] alternating x3 @cache1: warm_hits={} cold_misses={} evictions={} warm_now={}/{}",
         t.warm_hits, t.cold_misses, t.evictions, t.warm_now, t.warm_capacity
     );
-    assert_eq!(t.cold_misses, 3, "every serve missed — a 1-slot cache holds only one");
+    assert_eq!(
+        t.cold_misses, 3,
+        "every serve missed — a 1-slot cache holds only one"
+    );
     assert_eq!(t.warm_hits, 0, "nothing was ever reused");
-    assert!(t.evictions >= 2, "the 2nd + 3rd inserts each evicted the prior component");
+    assert!(
+        t.evictions >= 2,
+        "the 2nd + 3rd inserts each evicted the prior component"
+    );
     assert_eq!(t.warm_now, 1, "one component resident after the churn");
+}
+
+/// PERF (construens memory-instance): a WARM component serves WITHOUT its bytes — so the request path
+/// can skip re-reading (and, on a remote blob backend, re-fetching over the network) a component it
+/// would only discard on a warm hit. Proves `request_component_warm` + that `serve` ignores the
+/// `wasm` argument on a cache hit; and that a cold miss with empty bytes fails CLEARLY (the
+/// eviction-window guard), not with garbage.
+#[tokio::test(flavor = "multi_thread")]
+async fn warm_component_serves_without_its_bytes() {
+    let engine = engine();
+    // Cold: compiles + caches.
+    engine
+        .serve("http-200", HTTP_200, request(), no_caps())
+        .await
+        .expect("cold serve compiles");
+    assert!(
+        engine.request_component_warm("http-200"),
+        "the component is now resident"
+    );
+
+    // Warm: serve with EMPTY bytes — the engine must hit the cache and never look at them. This is
+    // the fix: a warm request reads no component blob (zero backend hit).
+    let response = engine
+        .serve("http-200", &[], request(), no_caps())
+        .await
+        .expect("a warm component serves with no bytes supplied");
+    assert_eq!(response.status(), 200);
+
+    // A cold miss with empty bytes (a stale warm-check on an over-capacity node) fails with a clear,
+    // retryable compile error — never a panic or a wrong result.
+    assert!(!engine.request_component_warm("never-seen"));
+    let err = engine
+        .serve("never-seen", &[], request(), no_caps())
+        .await
+        .expect_err("empty bytes on a cold miss must error");
+    assert!(
+        matches!(err, HandlerError::Compile(_)),
+        "a cold miss with no bytes is a clear compile error, got {err:?}"
+    );
 }
 
 /// A test [`Invoker`](boatramp_handlers::Invoker) that answers every target with

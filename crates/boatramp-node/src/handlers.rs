@@ -154,10 +154,21 @@ pub async fn build_handler_runtime(
     // Per-lane warm compile-cache capacity (operator-configurable; default 64). A node serving more
     // than this many distinct components evicts the LRU-coldest, which recompiles on its next request;
     // `/api/instance-stats` reports `warm_capacity`/`evictions` so the value is measured, not guessed.
-    let instance_cache_size = handlers_cfg
+    // Clamped to `[1, 16384]`: the `lru` cache preallocates to capacity, so a fat-fingered giant value
+    // would OOM at boot — 16384 is far beyond any realistic component count, so the clamp only catches
+    // a typo (logged so the operator sees it), never a legitimate setting.
+    const MAX_INSTANCE_CACHE: usize = 16_384;
+    let requested_cache = handlers_cfg
         .and_then(|h| h.instance_cache_size)
-        .unwrap_or(64)
-        .max(1);
+        .unwrap_or(64);
+    let instance_cache_size = requested_cache.clamp(1, MAX_INSTANCE_CACHE);
+    if instance_cache_size != requested_cache {
+        tracing::warn!(
+            requested = requested_cache,
+            applied = instance_cache_size,
+            "[handlers] instance_cache_size clamped to [1, 16384]"
+        );
+    }
     let engine = if handlers_cfg.is_some_and(|h| h.pooling) {
         boatramp_handlers::HandlerEngine::with_pooling_lanes(
             sync_limits,
