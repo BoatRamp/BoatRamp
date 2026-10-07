@@ -184,12 +184,12 @@ mod operator;
 pub(crate) use operator::prometheus_metrics;
 #[cfg(feature = "handlers")]
 pub(crate) use operator::{
-    operator_bus_dlq, operator_bus_dlq_list, operator_bus_queue_group, operator_bus_queue_groups,
-    operator_bus_queue_pause, operator_bus_queue_peek, operator_bus_queue_policy,
-    operator_bus_queue_replay, operator_dlq, operator_dlq_list, operator_function_logs,
-    operator_function_logs_stream, operator_handler_stats, operator_logs, operator_logs_stream,
-    operator_queue_group, operator_queue_groups, operator_queue_pause, operator_queue_peek,
-    operator_queue_policy, operator_queue_replay,
+    node_instance_stats, operator_bus_dlq, operator_bus_dlq_list, operator_bus_queue_group,
+    operator_bus_queue_groups, operator_bus_queue_pause, operator_bus_queue_peek,
+    operator_bus_queue_policy, operator_bus_queue_replay, operator_dlq, operator_dlq_list,
+    operator_function_logs, operator_function_logs_stream, operator_handler_stats, operator_logs,
+    operator_logs_stream, operator_queue_group, operator_queue_groups, operator_queue_pause,
+    operator_queue_peek, operator_queue_policy, operator_queue_replay,
 };
 mod proxy;
 pub use proxy::spawn_compute_reconcile;
@@ -1241,6 +1241,14 @@ impl HandlerRuntime {
     /// `owning_node` plus the safety-net-only counter. `None` on a no-runtime build. A single-node /
     /// non-CAS backend reports every function (it owns all) with an empty node label (degenerate there).
     #[cfg(feature = "handlers")]
+    /// A read-only snapshot of the node's wasm instance-lifecycle + memory stats (construens
+    /// memory-instance-observability): per-lane warm/cold/evict counters + durations, the live warm
+    /// set, in-flight vs ceiling, and process RSS vs the per-instance limit. `None` when no handler
+    /// runtime is configured (the static server). Node-global — the engine is shared across sites.
+    pub fn instance_stats(&self) -> Option<boatramp_handlers::InstanceStatsSnapshot> {
+        self.inner.as_ref().map(|i| i.engine.instance_stats())
+    }
+
     pub async fn async_shard_stats(&self, deploy: &DeployStore) -> Option<AsyncShardStats> {
         use std::sync::atomic::Ordering;
         let inner = self.inner.as_ref()?;

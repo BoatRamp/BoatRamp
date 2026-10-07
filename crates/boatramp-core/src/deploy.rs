@@ -3677,7 +3677,7 @@ impl DeployStore {
         // (one batch), so a reader never sees a new deployment paired with a stale principal class.
         // The record is BOUND to the activated deployment id (`system:<id>`) — not a bare `system` —
         // so a reader checking the class for a SPECIFIC id (the scheduler, firing the pointer it read
-        // a moment earlier) never mis-applies a System capture that a concurrent activation wrote for a
+        // a moment earlier) never misapplies a System capture that a concurrent activation wrote for a
         // DIFFERENT id (closes the one-tick pointer-vs-class TOCTOU, Security review N1). System ⇒
         // write `system:<id>`; anything else ⇒ DELETE the record (fail closed), so this activation
         // never inherits a prior System capture.
@@ -3690,7 +3690,7 @@ impl DeployStore {
             Some(crate::tenancy::PrincipalKind::System) => {
                 // MUTATION SEAM (gate `content_keyed`): write a BARE `system` marker, dropping the
                 // per-deployment-id binding — reproducing the pre-N1 state where the class is
-                // mis-applicable across deployments (the cross-id/TOCTOU escalation). Compiled out of
+                // applicable to the WRONG deployment (the cross-id/TOCTOU escalation). Compiled out of
                 // shipped builds; the gate then goes RED (an id-bound query matches a different id).
                 let val = if Self::sysprincipal_mutation().as_deref() == Some("content_keyed") {
                     b"system".to_vec()
@@ -3724,7 +3724,7 @@ impl DeployStore {
     /// or a record bound to a DIFFERENT id — the TOCTOU guard) — so a `run_as: deployer` cron fails
     /// closed unless THIS site was made live by a System·Admin. The caller passes the `id` it is about
     /// to serve (read from the `current` pointer): a concurrent activation that moved the class to
-    /// another id never matches, so the class is never mis-applied across deployments. Read from
+    /// another id never matches, so the class is never misapplied across deployments. Read from
     /// [`current_principal`](keys::current_principal), never the global content meta.
     pub async fn current_activator_is_system(
         &self,
@@ -3734,7 +3734,7 @@ impl DeployStore {
     ) -> Result<bool, DeployError> {
         // MUTATION SEAM (gate `content_keyed`): check the BARE `system` marker, ignoring the id — the
         // other half of dropping the id binding, so a System capture for ANY deployment satisfies a
-        // query for THIS id (the cross-id mis-application). Default: match `system:<id>` exactly.
+        // query for THIS id (the cross-id misapplication). Default: match `system:<id>` exactly.
         let expected = if Self::sysprincipal_mutation().as_deref() == Some("content_keyed") {
             b"system".to_vec()
         } else {
@@ -4772,7 +4772,7 @@ mod tests {
         );
         // N1 (TOCTOU guard): the class is bound to the EXACT id. A query for a DIFFERENT id — e.g. the
         // id a concurrent activation is moving away from — reads non-system, so the class is never
-        // mis-applied across deployments.
+        // misapplied across deployments.
         assert!(
             !store
                 .current_activator_is_system(op, "site", &id2)
