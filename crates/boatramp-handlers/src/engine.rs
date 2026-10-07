@@ -1137,9 +1137,31 @@ impl HandlerEngine {
     }
 
     /// Compile a component (cached by `hash`) into a reusable [`ProxyPre`].
+    /// Whether a REQUEST-lane component (`hash`) is already compiled + resident in the warm cache —
+    /// so the serve path can SKIP re-reading (and, on a remote blob backend, re-FETCHING over the
+    /// network) the component bytes it would only discard on a warm hit. A non-promoting peek
+    /// (`contains`, no LRU touch): a `true` means [`serve_with_limits`] will hit the cache and never
+    /// look at the `wasm` argument, so the caller may pass an empty slice. (A component evicted in the
+    /// window between this check and the serve — only possible once the node holds MORE than
+    /// `instance_cache_size` distinct components — degrades to a clear, transient compile error on that
+    /// one request, not a wrong result; size the cache ≥ your component count to preclude it.)
+    pub fn request_component_warm(&self, hash: &str) -> bool {
+        self.cache.lock().unwrap().contains(hash)
+    }
+
     fn proxy_pre(&self, hash: &str, wasm: &[u8]) -> Result<ProxyPre<HostState>, HandlerError> {
         if let Some(pre) = self.cache.lock().unwrap().get(hash) {
             return Ok(pre.clone());
+        }
+        // A cold miss needs the bytes. If the caller skipped the read on a stale warm-check (the
+        // component was evicted in the window), fail this one request with a clear, retryable message
+        // rather than feeding empty bytes into the compiler.
+        if wasm.is_empty() {
+            return Err(HandlerError::Compile(
+                "component not resident and no bytes supplied (evicted between the warm-check and \
+                 serve; retry — or raise [handlers] instance_cache_size so it stays warm)"
+                    .into(),
+            ));
         }
         let pre = self.compile(wasm)?;
         self.cache
