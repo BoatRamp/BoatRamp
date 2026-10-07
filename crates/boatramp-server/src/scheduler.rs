@@ -866,8 +866,12 @@ pub(super) async fn run_scheduler_tick(
             // alias cron never inherits the production activation's class).
             let mut active: Vec<(String, String, bool)> = Vec::new();
             if let Some(id) = deploy.current_id(project, &site).await? {
-                let activator_is_system =
-                    deploy.current_activator_is_system(project, &site).await?;
+                // The class is checked for THIS exact id (bound in the record as `system:<id>`), so a
+                // concurrent activation that moved the pointer/class to another id reads as non-system
+                // (fail closed) — closing the one-tick pointer-vs-class TOCTOU (Security review N1).
+                let activator_is_system = deploy
+                    .current_activator_is_system(project, &site, &id)
+                    .await?;
                 active.push((
                     id,
                     consumer_dispatch_scope(project, &site),
