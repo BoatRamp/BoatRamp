@@ -1082,6 +1082,7 @@ mod tests {
                 schedule: "0 * * * *".into(),
                 route: "/api/report".into(),
                 overlap: Overlap::Skip,
+                run_as: crate::config::CronRunAs::Unauthenticated,
             }],
             streams: vec![StreamConfig {
                 route: "/live".into(),
