@@ -151,15 +151,22 @@ pub async fn build_handler_runtime(
     // lane fits its slot); `with_pooling_lanes` does that + logs/fails loud on an
     // implausible reservation. The non-pooling path sizes memory per-invocation
     // (`StoreLimits`), so a raised ceiling there needs no reservation.
+    // Per-lane warm compile-cache capacity (operator-configurable; default 64). A node serving more
+    // than this many distinct components evicts the LRU-coldest, which recompiles on its next request;
+    // `/api/instance-stats` reports `warm_capacity`/`evictions` so the value is measured, not guessed.
+    let instance_cache_size = handlers_cfg
+        .and_then(|h| h.instance_cache_size)
+        .unwrap_or(64)
+        .max(1);
     let engine = if handlers_cfg.is_some_and(|h| h.pooling) {
         boatramp_handlers::HandlerEngine::with_pooling_lanes(
             sync_limits,
             async_limits,
             streaming_limits,
-            64,
+            instance_cache_size,
         )?
     } else {
-        boatramp_handlers::HandlerEngine::new(sync_limits, 64)?
+        boatramp_handlers::HandlerEngine::new(sync_limits, instance_cache_size)?
             .with_async_limits(async_limits)
             .with_streaming_limits(streaming_limits)
     }

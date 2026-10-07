@@ -447,6 +447,10 @@ pub fn router_with_fast(
             "/api/sites/{site}/_boatramp/handlers",
             get(operator_handler_stats),
         )
+        // Node-global wasm instance-lifecycle + memory observability (construens
+        // memory-instance-observability). NOT per-site — the engine is shared node-wide; authz gates
+        // it `System·Read`.
+        .route("/api/instance-stats", get(node_instance_stats))
         .route("/api/sites/{site}/_boatramp/logs", get(operator_logs))
         .route(
             "/api/sites/{site}/_boatramp/logs/stream",

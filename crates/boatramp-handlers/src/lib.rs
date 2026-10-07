@@ -10,6 +10,9 @@
 mod bindings;
 #[cfg(feature = "engine")]
 mod engine;
+/// Host-side observability for the wasm component instance lifecycle (warm/cold/evict + durations).
+#[cfg(feature = "engine")]
+pub mod instance_stats;
 #[cfg(feature = "engine")]
 pub mod logging;
 /// Host-resolved in-site tenancy applied to the `sql` + `orm` bindings (Stage 0).
@@ -61,6 +64,10 @@ pub use engine::SessionBatch;
 pub use engine::{
     HandlerEngine, HandlerError, Lane, Limits, MAX_CONSUMER_ERROR_LEN, build_engine,
     build_engine_pooling, empty_body,
+};
+#[cfg(feature = "engine")]
+pub use instance_stats::{
+    InstanceStats, InstanceStatsSnapshot, LaneStats, ProcessMemory, StatLane,
 };
 #[cfg(feature = "engine")]
 pub use logging::{LogSink, LogStream};

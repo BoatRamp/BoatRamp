@@ -141,12 +141,32 @@ pub struct StatsArgs {
     /// Site whose handler stats to show (overrides [deploy].site).
     #[arg(long, env = "BOATRAMP_SITE", global = true)]
     site: Option<String>,
+
+    /// Show the NODE-global wasm instance-lifecycle + memory stats instead of a site's handler stats:
+    /// per-lane warm-hit / cold-miss / eviction / instantiation counts + compile & instantiate
+    /// durations, the resident (warm) component set vs capacity, in-flight vs ceiling, and process RSS
+    /// vs the per-instance limit. Read-only; needs a `System·Read` (operator/admin) token. No `--site`
+    /// is required (the engine is shared node-wide).
+    #[arg(long)]
+    instances: bool,
 }
 
-/// Entry point for `boatramp stats`: the site's operator handler stats —
-/// per-`(trigger, route)` invocation counters, consumer backlog/dead-letters,
-/// and live stream connections.
+/// Entry point for `boatramp stats`: a site's operator handler stats —
+/// per-`(trigger, route)` invocation counters, consumer backlog/dead-letters, and live stream
+/// connections — OR, with `--instances`, the node-global wasm instance-lifecycle + memory stats.
 pub async fn stats(args: StatsArgs, config: &ProjectConfig) -> Result<()> {
+    // The instance stats are node-global, so they need only a server + token, not a resolved site.
+    if args.instances {
+        let server = client::resolve_server(args.server, config)?;
+        let cp = client::ControlPlane::new(
+            server,
+            client::http_client(client::token(config).as_deref()),
+            client::resolve_project(config),
+        );
+        let stats = cp.fetch_instance_stats().await?;
+        println!("{}", serde_json::to_string_pretty(&stats)?);
+        return Ok(());
+    }
     let (server, site) = client::resolve_target(args.server, args.site, config)?;
     let cp = client::ControlPlane::new(
         server,

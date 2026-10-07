@@ -101,6 +101,65 @@ async fn cached_compile_serves_twice() {
     }
 }
 
+/// MEASUREMENT (construens memory-instance-observability): drive REAL components through the engine
+/// and read the LIVE instance stats, so the warm-hit / cold-compile / eviction / instantiate numbers
+/// are MEASURED on a real wasi:http component, not inferred. Run with `--nocapture` to see the data;
+/// the assertions pin the lifecycle contract (so it is also a CI-exercised correctness test).
+#[tokio::test(flavor = "multi_thread")]
+async fn instance_stats_measures_warm_cold_and_eviction_on_real_components() {
+    // (A) STEADY STATE: a comfortably-sized cache (16), one component served 50×. Exactly ONE cold
+    // compile; the other 49 are warm hits; NO eviction — the shape construens should see if the box is
+    // big enough. The per-request instantiate cost is the term distinct from a cold compile.
+    let engine = HandlerEngine::new(Limits::default(), 16).expect("engine");
+    for _ in 0..50 {
+        let r = engine.serve("http-200", HTTP_200, request(), no_caps()).await;
+        assert!(r.is_ok(), "http-200 serves");
+    }
+    let snap = engine.instance_stats();
+    let r = &snap.request;
+    println!(
+        "[WARM] http-200 x50 @cache16: warm_hits={} cold_misses={} evictions={} \
+         instantiate_us(avg={} max={}) compile_ms(avg={} max={}) warm_now={}/{} rss_bytes={:?} \
+         per_instance_limit={}",
+        r.warm_hits,
+        r.cold_misses,
+        r.evictions,
+        r.instantiate_us_avg,
+        r.instantiate_us_max,
+        r.compile_ms_avg,
+        r.compile_ms_max,
+        r.warm_now,
+        r.warm_capacity,
+        snap.memory.rss_bytes,
+        snap.memory.per_instance_limit_bytes
+    );
+    assert_eq!(r.cold_misses, 1, "one compile, then the cache stays warm");
+    assert_eq!(r.warm_hits, 49, "the other 49 served from the warm cache");
+    assert_eq!(r.evictions, 0, "a 16-slot cache holds one component with zero eviction");
+    assert_eq!(r.warm_now, 1);
+    assert_eq!(r.instantiations, 50, "every served request instantiated once");
+
+    // (B) EVICTION under a TIGHT cache (1 slot), two distinct components alternated → churn: every
+    // serve is a cold miss, each new insert evicts the prior — the pathology construens HYPOTHESIZED
+    // (but which, at its ~15 components vs the default 64-slot cache, should NOT be occurring; this
+    // proves the signal fires when it IS). The 2nd/3rd serves may error at the kv grant check, but the
+    // compile + instantiate are recorded first, so the lifecycle counts are exact.
+    let tiny = HandlerEngine::new(Limits::default(), 1).expect("engine");
+    let _ = tiny.serve("http-200", HTTP_200, request(), no_caps()).await; // miss #1 (no evict)
+    let _ = tiny.serve("kv-counter", KV_COUNTER, request(), no_caps()).await; // miss #2, evicts http-200
+    let _ = tiny.serve("http-200", HTTP_200, request(), no_caps()).await; // miss #3, evicts kv-counter
+    let tsnap = tiny.instance_stats();
+    let t = &tsnap.request;
+    println!(
+        "[EVICT] alternating x3 @cache1: warm_hits={} cold_misses={} evictions={} warm_now={}/{}",
+        t.warm_hits, t.cold_misses, t.evictions, t.warm_now, t.warm_capacity
+    );
+    assert_eq!(t.cold_misses, 3, "every serve missed — a 1-slot cache holds only one");
+    assert_eq!(t.warm_hits, 0, "nothing was ever reused");
+    assert!(t.evictions >= 2, "the 2nd + 3rd inserts each evicted the prior component");
+    assert_eq!(t.warm_now, 1, "one component resident after the churn");
+}
+
 /// A test [`Invoker`](boatramp_handlers::Invoker) that answers every target with
 /// a canned 200 + body, so the invoke *host binding* (grant check, allowlist,
 /// depth, wire conversion) is exercised by a real guest without a second guest.
