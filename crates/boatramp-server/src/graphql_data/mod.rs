@@ -190,6 +190,7 @@ mod tests {
                 token_persona_claim: None,
                 issuer_trust: None,
                 jwks: None,
+                system_when: None,
             }),
             ..Default::default()
         };

@@ -1134,7 +1134,9 @@ pub fn verify_context(
     // system principal is usable only via the class-aware [`verify_context_full`].
     verify_context_inner(token, public, now_unix)?
         .tenant
-        .ok_or_else(|| TokenError::Claims("signed context is a system principal (no tenant)".into()))
+        .ok_or_else(|| {
+            TokenError::Claims("signed context is a system principal (no tenant)".into())
+        })
 }
 
 /// Verify a durable signed-context envelope and return BOTH the sealed own-tenant and the
@@ -2215,14 +2217,20 @@ mod tests {
         assert!(verify_context_full(&sys, &pubkey, 2000).is_err());
 
         // A TENANT seal stays Tenant with the tenant present (the ordinary path, unchanged).
-        let ten = mint_context("acme", None, 300, 1000, &signer).await.unwrap();
+        let ten = mint_context("acme", None, 300, 1000, &signer)
+            .await
+            .unwrap();
         let v = verify_context_full(&ten, &pubkey, 1000).unwrap();
         assert_eq!(v.kind, PrincipalKind::Tenant);
         assert_eq!(v.tenant.as_deref(), Some("acme"));
 
         // POSITIVE-marker precedence — a system principal is NEVER inferred from a missing tenant.
         // Mint context seals with arbitrary (ctx, scope_kind) claims to exercise every reject fork.
-        async fn mint_raw(ctx: Option<&str>, scope_kind: Option<&str>, signer: &dyn Signer) -> String {
+        async fn mint_raw(
+            ctx: Option<&str>,
+            scope_kind: Option<&str>,
+            signer: &dyn Signer,
+        ) -> String {
             let mut b = ClaimsSetBuilder::new()
                 .issued_at(Timestamp::WholeSeconds(1000))
                 .cwt_id(random_cti().unwrap())
@@ -2235,7 +2243,10 @@ mod tests {
                 b = b.text_claim(CLAIM_CTX.to_string(), CborValue::Text(c.to_string()));
             }
             if let Some(sk) = scope_kind {
-                b = b.text_claim(CLAIM_SCOPE_KIND.to_string(), CborValue::Text(sk.to_string()));
+                b = b.text_claim(
+                    CLAIM_SCOPE_KIND.to_string(),
+                    CborValue::Text(sk.to_string()),
+                );
             }
             sign_claims(b.build(), signer).await.unwrap()
         }

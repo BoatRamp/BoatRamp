@@ -122,33 +122,58 @@ pub(crate) async fn resolve_host_tenancy(
             // stays the SOLE authority over whether an `all` grant actually crosses tenants (key 3).
             ..
         }) => {
-            // The own-tenant fact (from the trigger's first applicable source) + the anonymous
-            // session fact (R3, from a verified cookie) — each axis resolved independently, tagged,
-            // and carried as the principal's fact set. Either may be absent (a purely anonymous
-            // request has only a session fact; a plain token request has only a tenant fact).
-            let mut facts = Vec::new();
-            if let Some(value) = resolve_from_sources(sources, &inputs).await {
-                facts.push(boatramp_handlers::ScopeFact {
-                    axis: boatramp_core::tenancy::ScopeAxis::Tenant,
-                    value,
-                });
-            }
-            if let Some(value) = resolve_session_fact(&inputs) {
-                facts.push(boatramp_handlers::ScopeFact {
-                    axis: boatramp_core::tenancy::ScopeAxis::Session,
-                    value,
-                });
-            }
-            let read = cap(*read, posture.allow_cross_tenant);
-            let write = normalize_write(cap(*write, posture.allow_cross_tenant));
-            Ok(Some(
-                HostTenancy::from_facts(column.clone(), facts, read, write)
-                    // #503: carry the per-route write-global allowlist (empty for most routes).
+            // Resolve the own-tenant axis first. It may be the typed `System` class (PLAN-system-
+            // principal), which SHORT-CIRCUITS: a system principal has no tenant and no session fact,
+            // so `coerce_system` empties the facts and forces both axes to `Null` (base/`IS NULL`),
+            // independent of the route's declared `read`/`write` — a route whose own grant is `own`
+            // still yields the base-partition-only system principal, and the tenant GUC stays unset.
+            match resolve_from_sources(sources, &inputs).await {
+                Some(ResolvedPrincipal::System) => Ok(Some(
+                    HostTenancy::from_facts(
+                        column.clone(),
+                        Vec::new(),
+                        AccessMode::Null,
+                        AccessMode::Null,
+                    )
+                    // #503 write-global allowlist still applies (a system principal may legitimately
+                    // write base rows of a write-global table); pass-through is a no-op (a system
+                    // principal always resolves, so the null-principal READ relaxation never fires).
                     .with_unscoped_writes(unscoped_writes.iter().cloned())
-                    // v0.12.x: opt into the null-principal READ pass-through (zero rows) when declared;
-                    // `Deny` (the default) leaves the fail-closed deny unchanged.
-                    .with_unresolved_pass(on_unresolved.is_pass()),
-            ))
+                    .with_unresolved_pass(on_unresolved.is_pass())
+                    // The class marker — the WHOLE point: drives `app.principal_kind='system'` + the
+                    // guest `current-principal` system shape. Applied last (it also re-clamps modes).
+                    .coerce_system(),
+                )),
+                // A concrete tenant value (or none) + the anonymous session fact (R3, from a verified
+                // cookie) — each axis resolved independently, tagged, carried as the principal's fact
+                // set. Either may be absent (a purely anonymous request has only a session fact; a
+                // plain token request has only a tenant fact).
+                resolved => {
+                    let mut facts = Vec::new();
+                    if let Some(ResolvedPrincipal::Tenant(value)) = resolved {
+                        facts.push(boatramp_handlers::ScopeFact {
+                            axis: boatramp_core::tenancy::ScopeAxis::Tenant,
+                            value,
+                        });
+                    }
+                    if let Some(value) = resolve_session_fact(&inputs) {
+                        facts.push(boatramp_handlers::ScopeFact {
+                            axis: boatramp_core::tenancy::ScopeAxis::Session,
+                            value,
+                        });
+                    }
+                    let read = cap(*read, posture.allow_cross_tenant);
+                    let write = normalize_write(cap(*write, posture.allow_cross_tenant));
+                    Ok(Some(
+                        HostTenancy::from_facts(column.clone(), facts, read, write)
+                            // #503: carry the per-route write-global allowlist (empty for most routes).
+                            .with_unscoped_writes(unscoped_writes.iter().cloned())
+                            // v0.12.x: opt into the null-principal READ pass-through (zero rows) when
+                            // declared; `Deny` (the default) leaves the fail-closed deny unchanged.
+                            .with_unresolved_pass(on_unresolved.is_pass()),
+                    ))
+                }
+            }
         }
         // R4/D8: a `target` route is bound by the serving path ([`build_bindings`] in
         // handler_dispatch), which has the routed domain + the project schema to resolve `B` and
@@ -332,10 +357,23 @@ fn normalize_write(mode: AccessMode) -> AccessMode {
 /// token-auth'd request, a storefront domain, and an async job by declaring `[token, domain,
 /// signed_context]`. `None` if none apply (anonymous / not-yet-wired source) — the binding then
 /// fails an "own" op closed rather than running unscoped.
+/// The resolved principal for one invocation's own-tenant axis: either a concrete host-verified
+/// tenant **value**, or the typed **System** class (PLAN-system-principal). The class is carried as a
+/// distinct variant — NEVER a sentinel `SqlValue` — so a system principal can never collide with, or
+/// be forged by, a tenant key. `None` from the resolver means "no principal resolved" (the scoped op
+/// then fails closed), exactly as before.
+pub(crate) enum ResolvedPrincipal {
+    /// A concrete, host-verified own-tenant value (a token claim, a routed domain, a signed context).
+    Tenant(boatramp_core::sql::SqlValue),
+    /// The node-wide **system** principal (no tenant), conferred ONLY by a verified system source
+    /// (P1: a `system_when` operator opt-in on an exactly-named first-party issuer).
+    System,
+}
+
 async fn resolve_from_sources(
     sources: &[TenantSource],
     inputs: &TenantSourceInputs<'_>,
-) -> Option<boatramp_core::sql::SqlValue> {
+) -> Option<ResolvedPrincipal> {
     // Runtime backstop (Security Finding A): a route that namespaces one token source but also carries
     // an un-namespaced tenant-producing source (a plain token, a domain, a signed context) shares one
     // flat key space — an attacker-influenceable un-namespaced value could equal a `namespace:span`
@@ -353,9 +391,27 @@ async fn resolve_from_sources(
         );
         return None;
     }
+    // System-principal mix backstop (PLAN-system-principal S0): a `system_when` token source confers a
+    // typed CLASS, not a tenant key. It must be the SOLE source — mixing it with any other
+    // tenant-producing source (a `domain`, a second token, a `signed_context`, even a trailing `none`)
+    // would let a non-system request silently resolve a tenant under a source list whose purpose is to
+    // gate system, blurring the class boundary. Refuse to resolve ANY principal for such a mix (fail
+    // closed), covering a control-plane deploy that bypassed the apply-time check.
+    if inputs.token_cfg.is_some_and(|c| c.system_when.is_some())
+        && !matches!(sources, [TenantSource::Token { .. }])
+    {
+        tracing::warn!(
+            tenant_source = "token",
+            outcome = "system_when_source_mix",
+            counter = "transform_denied",
+            "system_when is set but the source list is not a single `token` source; refusing to \
+             resolve a principal (fail closed)"
+        );
+        return None;
+    }
     for source in sources {
-        if let Some(value) = resolve_value(source, inputs).await {
-            return Some(value);
+        if let Some(p) = resolve_value(source, inputs).await {
+            return Some(p);
         }
     }
     None
@@ -375,12 +431,28 @@ fn resolve_session_fact(inputs: &TenantSourceInputs<'_>) -> Option<boatramp_core
     Some(boatramp_core::sql::SqlValue::Text(sid))
 }
 
-/// Resolve the tenant value from a single verified source. `None` for anonymous / not-yet-wired
-/// sources — the caller ([`resolve_from_sources`]) then tries the next, else fails closed.
+/// Re-check (at resolution) that a `system_when.issuer` is an EXACT trusted issuer — the single
+/// `issuer`, or a member of `issuer_trust.allow`. NEVER a `suffix`-matched or discovered issuer. This
+/// is the S0 runtime backstop dual of the apply-time check ([`HandlerGraphqlTokenClaims::validate`]),
+/// so a control-plane deploy that bypassed apply still cannot confer the node-wide system class via a
+/// family-trusted issuer.
+#[cfg(feature = "oidc")]
+fn system_when_issuer_is_exact_trusted(cfg: &HandlerGraphqlTokenClaims, issuer: &str) -> bool {
+    if !cfg.issuer.is_empty() && cfg.issuer == issuer {
+        return true;
+    }
+    cfg.issuer_trust
+        .as_ref()
+        .is_some_and(|t| t.allow.iter().any(|a| a == issuer))
+}
+
+/// Resolve the principal from a single verified source — a tenant value or the typed `System` class.
+/// `None` for anonymous / not-yet-wired sources (the caller [`resolve_from_sources`] then tries the
+/// next, else fails closed).
 async fn resolve_value(
     source: &TenantSource,
     inputs: &TenantSourceInputs<'_>,
-) -> Option<boatramp_core::sql::SqlValue> {
+) -> Option<ResolvedPrincipal> {
     match source {
         TenantSource::Token {
             claim,
@@ -399,9 +471,46 @@ async fn resolve_value(
                 let claims =
                     crate::graphql_data::token::verified_claims(cfg, bearer, env_source).await?;
 
+                // P1 — system-principal mapping (PLAN-system-principal), operator opt-in,
+                // deny-by-default. A verified token whose `iss` is EXACTLY the operator-named system
+                // issuer AND whose gating claim equals the configured value resolves the typed
+                // `System` class (no tenant) — retiring construens' `tid="platform"` sentinel.
+                if let Some(sw) = &cfg.system_when {
+                    // Runtime S0 backstop: the system issuer must be EXACT-trusted (single `issuer`
+                    // or an `issuer_trust.allow` member), never `suffix`-matched/discovered. A tainted
+                    // (non-exact) system_when fails the WHOLE source closed — it never silently
+                    // degrades to a tenant, because the source's intent is compromised.
+                    if !system_when_issuer_is_exact_trusted(cfg, &sw.issuer) {
+                        tracing::warn!(
+                            tenant_source = "token",
+                            outcome = "system_when_issuer_not_exact",
+                            counter = "transform_denied",
+                            "system_when.issuer is not an exact trusted issuer (misconfig bypassed \
+                             apply); refusing any principal (fail closed)"
+                        );
+                        return None;
+                    }
+                    // The verified `iss` (re-pinned into the signature check by the verifier) must
+                    // EXACTLY equal the named system issuer — so one trusted issuer among several in
+                    // `allow` does NOT confer system; only the operator's chosen one does. The gating
+                    // claim must be a string equal to the configured value.
+                    let iss_ok =
+                        claims.get("iss").and_then(|v| v.as_str()) == Some(sw.issuer.as_str());
+                    let claim_ok =
+                        claims.get(&sw.claim).and_then(|v| v.as_str()) == Some(sw.equals.as_str());
+                    if iss_ok && claim_ok {
+                        return Some(ResolvedPrincipal::System);
+                    }
+                    // A non-system token on a dual-use source (regular user, or a token missing the
+                    // gating claim) falls through to the normal tenant extraction below.
+                }
+
                 // No transform declared ⇒ today's verbatim behavior, byte-identical.
                 if extract.is_none() && namespace.is_none() {
-                    return claims.get(claim).and_then(scalar_to_sql);
+                    return claims
+                        .get(claim)
+                        .and_then(scalar_to_sql)
+                        .map(ResolvedPrincipal::Tenant);
                 }
 
                 // Transform active: derive the key from the *verified* claim, deny-by-default. The
@@ -420,7 +529,9 @@ async fn resolve_value(
                     return None;
                 };
                 match derive_tenant(extract.as_ref(), namespace.as_deref(), value) {
-                    DeriveOutcome::Resolved(key) => Some(boatramp_core::sql::SqlValue::Text(key)),
+                    DeriveOutcome::Resolved(key) => Some(ResolvedPrincipal::Tenant(
+                        boatramp_core::sql::SqlValue::Text(key),
+                    )),
                     DeriveOutcome::ClaimNonString => {
                         tracing::warn!(
                             tenant_source = "token",
@@ -475,18 +586,23 @@ async fn resolve_value(
         TenantSource::Domain => inputs
             .domain_context
             .filter(|c| !c.is_empty())
-            .map(|c| boatramp_core::sql::SqlValue::Text(c.to_string())),
+            .map(|c| ResolvedPrincipal::Tenant(boatramp_core::sql::SqlValue::Text(c.to_string()))),
         // The async lane's durable signed-context (R1): verify the host-minted envelope carried on
         // the drained message against the fleet anchor and return the producer's stamped tenant. A
         // forged/altered/expired envelope (or no envelope / no anchor) resolves no value — the
         // consumer's "own" op then fails closed rather than running unscoped. The guest never names
-        // the tenant; only a host signature over the producer's principal verifies here.
+        // the tenant; only a host signature over the producer's principal verifies here. (A *system*
+        // signed-context — a cron/consumer seal with no `br_ctx` — is rejected by `verify_context`
+        // today, so it resolves no tenant here; the async-lane system class is threaded in C7 via the
+        // full verifier.)
         TenantSource::SignedContext => {
             let (env, anchor) = (inputs.signed_context?, inputs.context_anchor?);
             let tenant =
                 boatramp_core::cose::verify_context(env, anchor, boatramp_core::time::now_unix())
                     .ok()?;
-            Some(boatramp_core::sql::SqlValue::Text(tenant))
+            Some(ResolvedPrincipal::Tenant(
+                boatramp_core::sql::SqlValue::Text(tenant),
+            ))
         }
         // Truly anonymous — no "own" tenant.
         TenantSource::None => None,
@@ -520,6 +636,235 @@ mod tests {
             require_declaration: require,
             allow_cross_tenant: cross,
         }
+    }
+
+    // ---- P1: login-token → system principal (PLAN-system-principal), end-to-end resolution ----
+
+    #[cfg(feature = "oidc")]
+    const P1_ISS: &str = "https://admin.acme.example";
+
+    #[cfg(feature = "oidc")]
+    fn p1_b64url(bytes: &[u8]) -> String {
+        use base64::Engine;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+    }
+
+    /// Sign a JWT by hand with Ed25519; the production verifier checks it via the JWKS.
+    #[cfg(feature = "oidc")]
+    fn p1_token(key: &ed25519_dalek::SigningKey, kid: &str, claims: serde_json::Value) -> String {
+        use ed25519_dalek::Signer;
+        let header = p1_b64url(
+            serde_json::json!({ "alg": "EdDSA", "typ": "JWT", "kid": kid })
+                .to_string()
+                .as_bytes(),
+        );
+        let payload = p1_b64url(claims.to_string().as_bytes());
+        let signing_input = format!("{header}.{payload}");
+        let sig = key.sign(signing_input.as_bytes());
+        format!("{signing_input}.{}", p1_b64url(&sig.to_bytes()))
+    }
+
+    #[cfg(feature = "oidc")]
+    fn p1_jwks(key: &ed25519_dalek::SigningKey, kid: &str) -> String {
+        serde_json::json!({ "keys": [ {
+            "kty": "OKP", "crv": "Ed25519", "kid": kid,
+            "x": p1_b64url(key.verifying_key().as_bytes()),
+        } ] })
+        .to_string()
+    }
+
+    /// A dual-use console handler: one `token` source whose `token_claims.system_when` maps a verified
+    /// `role=super_admin` token FROM THE EXACT admin issuer to the system principal; every other
+    /// verified token resolves its own `tid` tenant.
+    #[cfg(feature = "oidc")]
+    fn p1_decision(sources: Vec<TenantSource>) -> Tenancy {
+        Tenancy::Scoped {
+            column: "tenant_id".into(),
+            sources,
+            read: AccessMode::Own,
+            write: AccessMode::Own,
+            exceed_site_ceiling: false,
+            unscoped_writes: Vec::new(),
+            on_unresolved: OnUnresolved::Deny,
+        }
+    }
+
+    #[cfg(feature = "oidc")]
+    fn p1_token_source() -> TenantSource {
+        TenantSource::Token {
+            claim: "tid".into(),
+            extract: None,
+            namespace: None,
+        }
+    }
+
+    #[cfg(feature = "oidc")]
+    fn p1_cfg(system_issuer: &str) -> HandlerGraphqlTokenClaims {
+        HandlerGraphqlTokenClaims {
+            issuer: P1_ISS.into(),
+            jwks_env: Some("ADMIN_JWKS".into()),
+            system_when: Some(boatramp_core::config::SystemWhen {
+                issuer: system_issuer.into(),
+                claim: "role".into(),
+                equals: "super_admin".into(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// A verified `role=super_admin` token from the EXACTLY-named admin issuer resolves the typed
+    /// SYSTEM class: no tenant fact, no own-value, and (the G2 no-leak property) NO tenant RLS GUC.
+    #[cfg(feature = "oidc")]
+    #[tokio::test]
+    async fn p1_system_token_from_exact_issuer_resolves_the_system_class() {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[11u8; 32]);
+        let env = boatramp_core::env::MapEnv::new().with("ADMIN_JWKS", p1_jwks(&key, "a1"));
+        let cfg = p1_cfg(P1_ISS);
+        let token = p1_token(
+            &key,
+            "a1",
+            serde_json::json!({ "iss": P1_ISS, "exp": 9_999_999_999i64, "role": "super_admin", "tid": "ignored" }),
+        );
+        let decision = p1_decision(vec![p1_token_source()]);
+        let inputs = TenantSourceInputs {
+            bearer: Some(&token),
+            token_cfg: Some(&cfg),
+            env_source: Some(&env),
+            ..Default::default()
+        };
+        let ht = resolve_host_tenancy(Some(&decision), true, posture(true, false), inputs)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            ht.is_system(),
+            "an exact-issuer super_admin token confers the system class"
+        );
+        assert!(
+            ht.facts().is_empty(),
+            "a system principal carries NO tenant/session fact"
+        );
+        assert!(
+            ht.value().is_none(),
+            "a system principal has no own-tenant value (tid ignored)"
+        );
+        assert!(
+            ht.rls_tenant_value().is_none(),
+            "G2: a system principal sets NO tenant GUC — it can never read a tenant's rows"
+        );
+    }
+
+    /// The SAME dual-use handler: a regular user's token (no `role=super_admin`) still resolves its
+    /// OWN `tid` tenant — the system mapping only fires for the gating claim, never by mere presence.
+    #[cfg(feature = "oidc")]
+    #[tokio::test]
+    async fn p1_non_system_token_on_dual_use_source_still_resolves_its_tenant() {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[11u8; 32]);
+        let env = boatramp_core::env::MapEnv::new().with("ADMIN_JWKS", p1_jwks(&key, "a1"));
+        let cfg = p1_cfg(P1_ISS);
+        let token = p1_token(
+            &key,
+            "a1",
+            serde_json::json!({ "iss": P1_ISS, "exp": 9_999_999_999i64, "role": "member", "tid": "acme" }),
+        );
+        let inputs = TenantSourceInputs {
+            bearer: Some(&token),
+            token_cfg: Some(&cfg),
+            env_source: Some(&env),
+            ..Default::default()
+        };
+        let ht = resolve_host_tenancy(
+            Some(&p1_decision(vec![p1_token_source()])),
+            true,
+            posture(true, false),
+            inputs,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(!ht.is_system(), "a non-super_admin token is NOT system");
+        assert_eq!(
+            ht.value(),
+            Some(&SqlValue::Text("acme".into())),
+            "the regular user resolves its own tenant"
+        );
+    }
+
+    /// Runtime S0 backstop: a `system_when` whose issuer is NOT an exact trusted issuer (here only a
+    /// `suffix` covers it) must fail the WHOLE source closed — even a correctly-signed super_admin
+    /// token from that issuer resolves NO principal (never system, never a tenant).
+    #[cfg(feature = "oidc")]
+    #[tokio::test]
+    async fn p1_system_when_with_a_non_exact_issuer_fails_closed() {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[11u8; 32]);
+        let env = boatramp_core::env::MapEnv::new().with("ADMIN_JWKS", p1_jwks(&key, "a1"));
+        // Single-issuer `issuer` is P1_ISS, but system_when names a DIFFERENT issuer (not exact-trusted).
+        let cfg = p1_cfg("https://evil.my.salesforce.com");
+        let token = p1_token(
+            &key,
+            "a1",
+            serde_json::json!({ "iss": P1_ISS, "exp": 9_999_999_999i64, "role": "super_admin", "tid": "acme" }),
+        );
+        let inputs = TenantSourceInputs {
+            bearer: Some(&token),
+            token_cfg: Some(&cfg),
+            env_source: Some(&env),
+            ..Default::default()
+        };
+        let ht = resolve_host_tenancy(
+            Some(&p1_decision(vec![p1_token_source()])),
+            true,
+            posture(true, false),
+            inputs,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            !ht.is_system(),
+            "a non-exact system issuer never confers system"
+        );
+        assert!(
+            ht.value().is_none() && ht.facts().is_empty(),
+            "the tainted source resolves NO principal — never degrading to a tenant (fail closed)"
+        );
+    }
+
+    /// Mix backstop: a `system_when` token source mixed with ANY other tenant-producing source
+    /// resolves no principal (fail closed), covering a control-plane deploy that bypassed apply.
+    #[cfg(feature = "oidc")]
+    #[tokio::test]
+    async fn p1_system_when_mixed_with_another_source_fails_closed() {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[11u8; 32]);
+        let env = boatramp_core::env::MapEnv::new().with("ADMIN_JWKS", p1_jwks(&key, "a1"));
+        let cfg = p1_cfg(P1_ISS);
+        let token = p1_token(
+            &key,
+            "a1",
+            serde_json::json!({ "iss": P1_ISS, "exp": 9_999_999_999i64, "role": "super_admin" }),
+        );
+        // sources = [token(system_when), domain] — forbidden mix.
+        let inputs = TenantSourceInputs {
+            bearer: Some(&token),
+            token_cfg: Some(&cfg),
+            env_source: Some(&env),
+            domain_context: Some("acme"),
+            ..Default::default()
+        };
+        let ht = resolve_host_tenancy(
+            Some(&p1_decision(vec![p1_token_source(), TenantSource::Domain])),
+            true,
+            posture(true, false),
+            inputs,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(!ht.is_system(), "a mixed source never confers system");
+        assert!(
+            ht.value().is_none() && ht.facts().is_empty(),
+            "a system_when source mixed with another source resolves NO principal (fail closed)"
+        );
     }
 
     /// A valid host-issued session cookie resolves the `Session` axis fact (R3), carried alongside a

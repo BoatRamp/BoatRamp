@@ -670,6 +670,27 @@ impl ApplyManifest {
                         source,
                     }
                 })?;
+                // PLAN-system-principal S0 mix rule (defense-in-depth; a runtime backstop in
+                // `resolve_from_sources` is primary): a `system_when` token source confers a typed
+                // CLASS, not a tenant key, so it must be the SOLE source — mixing it with any other
+                // tenant-producing source blurs the class boundary. Fail fast at apply.
+                if f.token_claims
+                    .as_ref()
+                    .is_some_and(|tc| tc.system_when.is_some())
+                    && !matches!(
+                        sources.as_slice(),
+                        [boatramp_core::tenancy::TenantSource::Token { .. }]
+                    )
+                {
+                    return Err(Error::TokenClaims {
+                        scope: format!("function {}", f.name),
+                        source: boatramp_core::ConfigError::parse(
+                            "system_when is set, so the function's `tenancy.sources` must be exactly \
+                             a single `token` source (a system principal has no tenant, so it can't \
+                             be mixed with a domain/signed_context/second source)",
+                        ),
+                    });
+                }
             }
         }
         Ok(())
@@ -1656,6 +1677,42 @@ mod tests {
             manifest.functions[2].tenancy.as_ref().unwrap(),
             Tenancy::Disabled
         ));
+    }
+
+    /// PLAN-system-principal S0 mix rule (apply-time, defense-in-depth): a function whose
+    /// `token_claims.system_when` is set must declare EXACTLY a single `token` source. A single token
+    /// source passes; mixing in any other source is a loud apply error.
+    #[test]
+    fn system_when_requires_a_single_token_source_at_apply() {
+        let ron = |sources: &str| {
+            format!(
+                r#"(
+                    project: "acme",
+                    functions: [(
+                        name: "console",
+                        component: "console.wasm",
+                        imports: ["sql"],
+                        tenancy: (mode: "scoped", column: "tenant_id",
+                                  sources: {sources}, read: "own", write: "own"),
+                        token_claims: (issuer: "https://admin.example",
+                                       jwks_url: "https://admin.example/jwks.json",
+                                       system_when: (issuer: "https://admin.example",
+                                                     equals: "super_admin")),
+                    )],
+                )"#
+            )
+        };
+        // A single token source is accepted (parse runs `check_tenancy_sources` internally).
+        ApplyManifest::parse(&ron(r#"[(kind: "token", claim: "tid")]"#))
+            .expect("a single token source with system_when is valid");
+        // Mixing in a domain source is refused at parse (validation runs there).
+        let err =
+            ApplyManifest::parse(&ron(r#"[(kind: "token", claim: "tid"), (kind: "domain")]"#))
+                .expect_err("system_when mixed with a domain source must be refused");
+        assert!(
+            matches!(err, Error::TokenClaims { .. }),
+            "the mix is reported as a token_claims error, got {err:?}"
+        );
     }
 
     #[tokio::test]

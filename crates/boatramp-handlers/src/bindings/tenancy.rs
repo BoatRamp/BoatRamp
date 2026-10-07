@@ -243,7 +243,10 @@ mod tests {
             persona: Some("Integration".into()),
         };
         let mut host = TenancyHost::new(None, Some(&sealed));
-        match host.current_principal().expect("a verified seal is present") {
+        match host
+            .current_principal()
+            .expect("a verified seal is present")
+        {
             tenancy_iface::SealedPrincipal::Tenant(t) => {
                 assert_eq!(t.tenant, "acme");
                 assert_eq!(t.persona.as_deref(), Some("Integration"));
@@ -258,7 +261,10 @@ mod tests {
             persona: None,
         };
         let mut host = TenancyHost::new(None, Some(&tenant_only));
-        match host.current_principal().expect("a verified seal is present") {
+        match host
+            .current_principal()
+            .expect("a verified seal is present")
+        {
             tenancy_iface::SealedPrincipal::Tenant(t) => {
                 assert_eq!(t.tenant, "acme");
                 assert_eq!(t.persona, None);
@@ -272,7 +278,10 @@ mod tests {
             persona: Some("super_admin".into()),
         };
         let mut host = TenancyHost::new(None, Some(&system));
-        match host.current_principal().expect("a verified seal is present") {
+        match host
+            .current_principal()
+            .expect("a verified seal is present")
+        {
             tenancy_iface::SealedPrincipal::System(s) => {
                 assert_eq!(s.persona.as_deref(), Some("super_admin"));
             }

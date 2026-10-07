@@ -8991,6 +8991,7 @@ async fn graphql_data_connector_isolates_by_a_verified_app_token_claim() {
             token_persona_claim: None,
             issuer_trust: None,
             jwks: None,
+            system_when: None,
         }),
         tables: BTreeMap::from([
             (
