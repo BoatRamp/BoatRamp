@@ -40,6 +40,9 @@ engine = [
   "dep:futures",
   "dep:tracing",
   "dep:getrandom",
+  # The read-only instance-lifecycle stats snapshot (`instance_stats`) serializes to the admin stats
+  # surface, so the engine lane pulls serde (already in the graph via the server/types layer).
+  "dep:serde",
   # Guest outbound `wasi:http` TLS: the stock wasmtime-wasi-http send handler
   # hardcodes the webpki roots with no hook, so the dev-posture extra-CA option
   # (see engine.rs `guest_egress_client_config`) reimplements the TLS send with an

@@ -442,6 +442,12 @@ impl Right {
         let default_project = crate::project::DEFAULT_PROJECT.to_string();
         let right = match path {
             "/api/sites" => Self::new(Resource::System, None, Action::Read),
+            // Node-level instance-lifecycle + memory observability (construens
+            // memory-instance-observability): read-only telemetry over the node's shared wasm engine
+            // (warm/cold/evict + RSS). A NODE-global read, gated `System·Read` EXPLICITLY (never a
+            // per-project mapping) — it reveals resident component hashes + memory across every project
+            // on the node, so a project-scoped role must not reach it.
+            "/api/instance-stats" => Self::new(Resource::System, None, Action::Read),
             // Listing projects is a node-level read; creating one is a node-admin act
             // (only `/api/projects` exactly — a specific project is handled above).
             "/api/projects" => {
@@ -2053,6 +2059,32 @@ mod tests {
         );
         // Its serde term is stable + distinct (routing/authz greppability).
         assert_eq!(Resource::BlobUpload.as_str(), "blob_upload");
+    }
+
+    #[test]
+    fn instance_stats_endpoint_is_node_global_system_read() {
+        // construens memory-instance-observability: `/api/instance-stats` is a NODE-global read (the
+        // engine is shared across every project), gated `System·Read` — NOT a per-project right, so a
+        // project-scoped role (even that project's admin) must NOT reach it. The `operator`/node-read
+        // role does. Guards the node-global-authz discipline (a per-project mapping would leak every
+        // project's resident component hashes + memory to a single-project caller).
+        let required = Right::required("GET", "/api/instance-stats").expect("route is gated");
+        assert_eq!(required, Right::new(Resource::System, None, Action::Read));
+        // A project-scoped admin is refused.
+        let proj_admin = AuthzPolicy::default_policy()
+            .rights_for(&[GrantedRole::scoped("project_admin", "acme")]);
+        assert!(
+            !proj_admin.allows(&required),
+            "a project-scoped admin must not reach the node-global instance stats"
+        );
+        // A node operator (System·Read) is allowed; a global admin covers it too.
+        let operator = AuthzPolicy::default_policy().rights_for(&[GrantedRole::global("operator")]);
+        assert!(
+            operator.allows(&required),
+            "an operator (System·Read) may read node stats"
+        );
+        let admin = AuthzPolicy::default_policy().rights_for(&[GrantedRole::global("admin")]);
+        assert!(admin.allows(&required), "a node admin may read node stats");
     }
 
     #[test]

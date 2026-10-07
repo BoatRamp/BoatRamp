@@ -697,11 +697,28 @@ impl ConsumerGates {
     }
 }
 
+/// Insert a freshly-compiled component into a lane's LRU cache, returning `1` if the insert EVICTED
+/// a resident component (the cache was at capacity and the key was new), else `0` — the per-lane
+/// eviction signal for the instance-lifecycle stats (construens memory-instance-observability). A
+/// warm component dropped here pays a cold recompile on its next request; the REASON is the LRU
+/// capacity cap (reported as `warm_capacity`). Version-agnostic over the `lru` API (len-vs-cap, not
+/// a return-value contract).
+fn cache_insert_evicted<V>(cache: &Mutex<LruCache<String, V>>, key: &str, value: V) -> u64 {
+    let mut c = cache.lock().unwrap();
+    let at_capacity = c.len() >= c.cap().get();
+    let replaced = c.put(key.to_string(), value).is_some();
+    u64::from(at_capacity && !replaced)
+}
+
 /// The handler engine: a wasmtime [`Engine`], a blob-hash-keyed cache of
 /// compiled+pre-instantiated components, the limit policy, and a concurrency
 /// gate. A background task ticks the engine epoch for timeouts.
 pub struct HandlerEngine {
     engine: Engine,
+    /// Host-side instance-lifecycle counters (warm-hit / cold-miss / eviction / instantiation +
+    /// durations), incremented on the serve path and snapshotted read-only for the admin stats
+    /// surface (construens memory-instance-observability). `Arc` so the server can hold a handle.
+    stats: Arc<crate::instance_stats::InstanceStats>,
     cache: Mutex<LruCache<String, ProxyPre<HostState>>>,
     /// Separate compile cache for consumer (`wasi:messaging`) components — a
     /// different world (`handle` export) than the request `ProxyPre`.
@@ -888,6 +905,7 @@ impl HandlerEngine {
         });
         Ok(Self {
             engine,
+            stats: Arc::new(crate::instance_stats::InstanceStats::default()),
             cache,
             #[cfg(feature = "messaging")]
             consumer_cache: Mutex::new(LruCache::new(capacity)),
@@ -1136,16 +1154,98 @@ impl HandlerEngine {
         self.consumer_pre(hash, wasm).map(|_| ())
     }
 
+    /// Read-only snapshot of the instance-lifecycle + memory stats (construens
+    /// memory-instance-observability): each lane's live warm set / capacity / in-flight, the lifetime
+    /// warm-hit / cold-miss / eviction / instantiation counters + durations, and process RSS vs the
+    /// configured per-instance ceiling. A pure read (the serving surface admin-gates it); the warm set
+    /// + in-flight are read live under the lane locks, the counters are lock-free atomics.
+    pub fn instance_stats(&self) -> crate::instance_stats::InstanceStatsSnapshot {
+        use crate::instance_stats::{LaneLive, ProcessMemory, process_rss_bytes};
+        fn lane_live<V>(
+            cache: &Mutex<LruCache<String, V>>,
+            ceiling: usize,
+            available: usize,
+        ) -> LaneLive {
+            let c = cache.lock().unwrap();
+            let ceiling = ceiling.max(1);
+            LaneLive {
+                warm_now: c.len() as u64,
+                warm_capacity: c.cap().get() as u64,
+                warm_components: c.iter().map(|(k, _)| k.clone()).collect(),
+                in_flight: ceiling.saturating_sub(available) as u64,
+                lane_ceiling: ceiling as u64,
+            }
+        }
+        let request = lane_live(
+            &self.cache,
+            self.limits.max_concurrency,
+            self.semaphore.available_permits(),
+        );
+        #[cfg(feature = "messaging")]
+        let consumer = lane_live(
+            &self.consumer_cache,
+            self.async_limits.max_concurrency,
+            self.async_semaphore.available_permits(),
+        );
+        #[cfg(not(feature = "messaging"))]
+        let consumer = LaneLive {
+            warm_now: 0,
+            warm_capacity: 0,
+            warm_components: Vec::new(),
+            in_flight: 0,
+            lane_ceiling: 0,
+        };
+        #[cfg(feature = "session")]
+        let session = lane_live(
+            &self.session_cache,
+            self.streaming_limits.max_concurrency,
+            self.streaming_semaphore.available_permits(),
+        );
+        #[cfg(not(feature = "session"))]
+        let session = LaneLive {
+            warm_now: 0,
+            warm_capacity: 0,
+            warm_components: Vec::new(),
+            in_flight: 0,
+            lane_ceiling: 0,
+        };
+        self.stats.snapshot(
+            request,
+            consumer,
+            session,
+            ProcessMemory {
+                rss_bytes: process_rss_bytes(),
+                per_instance_limit_bytes: self.limits.memory_bytes as u64,
+            },
+        )
+    }
+
     /// Compile a component (cached by `hash`) into a reusable [`ProxyPre`].
     fn proxy_pre(&self, hash: &str, wasm: &[u8]) -> Result<ProxyPre<HostState>, HandlerError> {
         if let Some(pre) = self.cache.lock().unwrap().get(hash) {
+            self.stats.request.record_warm_hit();
             return Ok(pre.clone());
         }
+        // Cold miss: compile (the dominant cold-start cost) + insert, noting a capacity eviction.
+        let compiled_at = std::time::Instant::now();
         let pre = self.compile(wasm)?;
-        self.cache
-            .lock()
-            .unwrap()
-            .put(hash.to_string(), pre.clone());
+        let compile = compiled_at.elapsed();
+        self.stats
+            .request
+            .record_cold_miss(compile.as_nanos() as u64);
+        // Operator-visible at the default `boatramp=info`: a warm-cache MISS paid a cranelift compile,
+        // the term a warm hit avoids — the signal construens needs to tell a cold start from execution.
+        // Rare when healthy (once per deploy); frequent only when eviction is churning the cache (the
+        // very problem to surface). Level-by-op, mirroring the blob-read-404 lesson.
+        tracing::info!(
+            component = %hash,
+            lane = "request",
+            compile_ms = compile.as_millis() as u64,
+            "wasm component cold-compiled (warm-cache miss)"
+        );
+        self.stats
+            .request
+            .record_evictions(cache_insert_evicted(&self.cache, hash, pre.clone()));
         Ok(pre)
     }
 
@@ -1158,8 +1258,10 @@ impl HandlerEngine {
         wasm: &[u8],
     ) -> Result<consumer_world::ConsumerPre<HostState>, HandlerError> {
         if let Some(pre) = self.consumer_cache.lock().unwrap().get(hash) {
+            self.stats.consumer.record_warm_hit();
             return Ok(pre.clone());
         }
+        let compiled_at = std::time::Instant::now();
         let component = Component::from_binary(&self.engine, wasm)
             .map_err(|err| HandlerError::Compile(err.to_string()))?;
         let instance_pre = self
@@ -1169,10 +1271,21 @@ impl HandlerEngine {
         let pre = consumer_world::ConsumerPre::new(instance_pre).map_err(|_| {
             HandlerError::Compile("component is not a wasi:messaging consumer".into())
         })?;
-        self.consumer_cache
-            .lock()
-            .unwrap()
-            .put(hash.to_string(), pre.clone());
+        let compile = compiled_at.elapsed();
+        self.stats
+            .consumer
+            .record_cold_miss(compile.as_nanos() as u64);
+        tracing::info!(
+            component = %hash,
+            lane = "consumer",
+            compile_ms = compile.as_millis() as u64,
+            "wasm component cold-compiled (warm-cache miss)"
+        );
+        self.stats.consumer.record_evictions(cache_insert_evicted(
+            &self.consumer_cache,
+            hash,
+            pre.clone(),
+        ));
         Ok(pre)
     }
 
@@ -1202,10 +1315,14 @@ impl HandlerEngine {
             .map_err(|_| HandlerError::Overloaded)?;
         let consumer_pre = self.consumer_pre(hash, wasm)?;
         let mut store = self.new_store(bindings, self.effective_limits(Lane::Async, limits));
+        let instantiated_at = std::time::Instant::now();
         let consumer = consumer_pre
             .instantiate_async(&mut store)
             .await
             .map_err(|e| classify(&e, store.data().oom()))?;
+        self.stats
+            .consumer
+            .record_instantiation(instantiated_at.elapsed().as_nanos() as u64);
         let message = consumer_world::boatramp::handlers::messaging_types::Message {
             topic: topic.to_string(),
             data: data.to_vec(),
@@ -1247,8 +1364,10 @@ impl HandlerEngine {
         wasm: &[u8],
     ) -> Result<session_world::SessionHostPre<HostState>, HandlerError> {
         if let Some(pre) = self.session_cache.lock().unwrap().get(hash) {
+            self.stats.session.record_warm_hit();
             return Ok(pre.clone());
         }
+        let compiled_at = std::time::Instant::now();
         let component = Component::from_binary(&self.engine, wasm)
             .map_err(|err| HandlerError::Compile(err.to_string()))?;
         let instance_pre = self
@@ -1257,10 +1376,21 @@ impl HandlerEngine {
             .map_err(|err| HandlerError::Compile(err.to_string()))?;
         let pre = session_world::SessionHostPre::new(instance_pre)
             .map_err(|_| HandlerError::Compile("component is not a session handler".into()))?;
-        self.session_cache
-            .lock()
-            .unwrap()
-            .put(hash.to_string(), pre.clone());
+        let compile = compiled_at.elapsed();
+        self.stats
+            .session
+            .record_cold_miss(compile.as_nanos() as u64);
+        tracing::info!(
+            component = %hash,
+            lane = "session",
+            compile_ms = compile.as_millis() as u64,
+            "wasm component cold-compiled (warm-cache miss)"
+        );
+        self.stats.session.record_evictions(cache_insert_evicted(
+            &self.session_cache,
+            hash,
+            pre.clone(),
+        ));
         Ok(pre)
     }
 
@@ -1286,10 +1416,14 @@ impl HandlerEngine {
             .map_err(|_| HandlerError::Overloaded)?;
         let session_pre = self.session_pre(hash, wasm)?;
         let mut store = self.new_store(bindings, self.effective_limits(Lane::Async, limits));
+        let instantiated_at = std::time::Instant::now();
         let session = session_pre
             .instantiate_async(&mut store)
             .await
             .map_err(|e| classify(&e, store.data().oom()))?;
+        self.stats
+            .session
+            .record_instantiation(instantiated_at.elapsed().as_nanos() as u64);
         let input = session_world::boatramp::handlers::session_types::SessionInput {
             id: batch.id,
             resumed: batch.resumed,
@@ -1662,10 +1796,14 @@ impl HandlerEngine {
                 .push(request)
                 .map_err(|e| HandlerError::Internal(e.to_string()))?
         };
+        let instantiated_at = std::time::Instant::now();
         let proxy = proxy_pre
             .instantiate_async(&mut store)
             .await
             .map_err(|e| classify(&e, store.data().oom()))?;
+        self.stats
+            .request
+            .record_instantiation(instantiated_at.elapsed().as_nanos() as u64);
 
         // The `Store` moves into the drive task below, so grab a clone of the OOM flag now to read
         // back after a trap (the moved store is otherwise unreachable from here).
