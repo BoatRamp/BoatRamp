@@ -101,6 +101,45 @@ async fn cached_compile_serves_twice() {
     }
 }
 
+/// PERF (construens memory-instance): a WARM component serves WITHOUT its bytes — so the request path
+/// can skip re-reading (and, on a remote blob backend, re-fetching over the network) a component it
+/// would only discard on a warm hit. Proves `request_component_warm` + that `serve` ignores the
+/// `wasm` argument on a cache hit; and that a cold miss with empty bytes fails CLEARLY (the
+/// eviction-window guard), not with garbage.
+#[tokio::test(flavor = "multi_thread")]
+async fn warm_component_serves_without_its_bytes() {
+    let engine = engine();
+    // Cold: compiles + caches.
+    engine
+        .serve("http-200", HTTP_200, request(), no_caps())
+        .await
+        .expect("cold serve compiles");
+    assert!(
+        engine.request_component_warm("http-200"),
+        "the component is now resident"
+    );
+
+    // Warm: serve with EMPTY bytes — the engine must hit the cache and never look at them. This is
+    // the fix: a warm request reads no component blob (zero backend hit).
+    let response = engine
+        .serve("http-200", &[], request(), no_caps())
+        .await
+        .expect("a warm component serves with no bytes supplied");
+    assert_eq!(response.status(), 200);
+
+    // A cold miss with empty bytes (a stale warm-check on an over-capacity node) fails with a clear,
+    // retryable compile error — never a panic or a wrong result.
+    assert!(!engine.request_component_warm("never-seen"));
+    let err = engine
+        .serve("never-seen", &[], request(), no_caps())
+        .await
+        .expect_err("empty bytes on a cold miss must error");
+    assert!(
+        matches!(err, HandlerError::Compile(_)),
+        "a cold miss with no bytes is a clear compile error, got {err:?}"
+    );
+}
+
 /// A test [`Invoker`](boatramp_handlers::Invoker) that answers every target with
 /// a canned 200 + body, so the invoke *host binding* (grant check, allowlist,
 /// depth, wire conversion) is exercised by a real guest without a second guest.

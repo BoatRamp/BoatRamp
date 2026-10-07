@@ -398,9 +398,18 @@ pub(super) async fn dispatch_handler(
         tracing::warn!(site, component = %handler.component, "handler component missing from deployment");
         return handler_unavailable();
     };
-    let wasm = match read_blob_fully(deploy, &entry.hash).await {
-        Ok(bytes) => bytes,
-        Err(response) => return response,
+    // PERF (construens memory-instance): on a WARM hit the engine serves from its compiled
+    // `ProxyPre` cache and never looks at the component bytes — so re-reading them here, which on a
+    // remote blob backend (S3/Tigris) is a full network GET of a multi-hundred-KB component just to
+    // discard it, is pure per-request latency (the ~0.5 s "not compute" steady cost). Read the blob
+    // ONLY on a cold miss; a warm component serves from memory with no backend hit.
+    let wasm = if inner.engine.request_component_warm(&entry.hash) {
+        Vec::new()
+    } else {
+        match read_blob_fully(deploy, &entry.hash).await {
+            Ok(bytes) => bytes,
+            Err(response) => return response,
+        }
     };
 
     // The correlation id assigned by the access-log layer, so captured guest logs carry the
