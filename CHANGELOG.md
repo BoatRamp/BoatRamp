@@ -5,6 +5,40 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.13.0] - 2026-10-07
+
+First-class **`system` principal** — a no-tenant platform/super-admin identity class
+(`PrincipalKind { Tenant, System }`), so a cron can run with real authority and an
+admin need not fake a sentinel tenant. A `System` principal has NO tenant: its SQL
+effect is base/`IS NULL`-only (reads fall to `tenant_id IS NULL`, the tenant RLS GUC
+is left unset) plus an `app.principal_kind = 'system'` session GUC so a managed-DB RLS
+policy (and a reserved-GUC screen, so a guest cannot forge it) can tell the system
+principal from an anonymous null principal. It is **provenance-bound** — produced ONLY
+from a verified system source, recognised ONLY by a positive signed marker, never
+inferred from a missing tenant. Three producers:
+
+- **Login token (P1):** an operator may opt a verified first-party token into the
+  system principal via `token_claims.system_when` — but ONLY when the verified `iss`
+  is EXACTLY the single `issuer` or an `issuer_trust.allow` member (never a
+  `suffix`-matched or discovered issuer); enforced at apply and re-checked at runtime,
+  and such a source may not be mixed with any tenant-producing source.
+- **Self-service cron (P2):** a cron declaring `run_as: deployer` fires as the system
+  principal iff the verified actor who ACTIVATED the serving deployment held the
+  node-global `System·Admin` right. The class is captured per-(project, site) on the
+  activation record (id-bound), never on the global content-addressed deploy metadata,
+  so it cannot be inherited across sites or by re-activating shared content; a
+  non-System·Admin (or background-alias) activation fails the cron closed.
+- **Emit propagation (P3):** a system producer's `emit` seals a system `signed_context`
+  (positive `br_scope_kind = system`, no tenant), which a `signed_context` consumer
+  resolves back to the system class instead of dead-lettering on a missing tenant.
+
+No guest-facing WIT change: the `sealed-principal` record is unchanged, and a no-tenant
+seal reads as `none` for the guest (the class is enforced host-side), so already-deployed
+`tenancy-persona` guests keep linking. Provenance is covered by four CI-hard,
+mutation-verified anti-hollow gates (activation / seal marker / exact-issuer /
+deploy-class). Shipped after an independent security-review loop that caught and closed
+a cross-tenant escalation in the initial content-keyed capture.
+
 ## [0.12.9] - 2026-10-05
 
 Scaling (prefix-scoped, paginated guest blob list): the guest `wasi:blobstore`
