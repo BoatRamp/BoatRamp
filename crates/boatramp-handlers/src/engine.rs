@@ -1982,6 +1982,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn instance_stats_fresh_engine_reports_empty_warm_set_and_live_capacity() {
+        // A freshly-built engine has nothing warm: zero lifetime counters, an empty warm set, and the
+        // LRU capacity + lane ceiling read LIVE from the engine (the wiring the counter unit tests
+        // can't cover). Also the per-instance memory limit for headroom context.
+        let engine = HandlerEngine::new(Limits::default(), 8).expect("engine builds");
+        let snap = engine.instance_stats();
+        assert_eq!(snap.request.warm_now, 0);
+        assert_eq!(snap.request.warm_capacity, 8, "the LRU capacity is read live");
+        assert!(snap.request.warm_components.is_empty());
+        assert_eq!(snap.request.in_flight, 0, "nothing in flight on a fresh engine");
+        assert_eq!(
+            snap.request.lane_ceiling,
+            Limits::default().max_concurrency as u64
+        );
+        assert_eq!(snap.request.warm_hits, 0);
+        assert_eq!(snap.request.cold_misses, 0);
+        assert_eq!(snap.request.evictions, 0);
+        assert_eq!(snap.request.instantiations, 0);
+        assert_eq!(
+            snap.memory.per_instance_limit_bytes,
+            Limits::default().memory_bytes as u64
+        );
+    }
+
+    #[tokio::test]
     async fn streaming_body_errors_when_it_exceeds_the_cap() {
         use http_body_util::StreamBody;
         // Two 100-byte frames against a 150-byte cap: the running total trips the
