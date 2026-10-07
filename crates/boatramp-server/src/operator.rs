@@ -149,6 +149,23 @@ pub(super) async fn operator_handler_stats(
     .into_response()
 }
 
+/// Node-global wasm **instance-lifecycle + memory** stats (construens memory-instance-observability):
+/// per-lane warm-hit / cold-miss / eviction / instantiation counters + compile & instantiate
+/// durations, the live warm set + capacity, in-flight vs ceiling, and process RSS vs the per-instance
+/// limit — so an operator can see, from DATA, whether components stay warm (and why not) and whether a
+/// slow request paid a cold compile. Read-only; the authz table gates `/api/instance-stats`
+/// `System·Read` (a NODE-global read — the engine is shared across every site/project, so this is
+/// deliberately not a per-site endpoint). `handlers: false` when no runtime is configured.
+#[cfg(feature = "handlers")]
+pub(super) async fn node_instance_stats(
+    Extension(handlers): Extension<Arc<HandlerRuntime>>,
+) -> Response {
+    match handlers.instance_stats() {
+        Some(stats) => Json(stats).into_response(),
+        None => Json(serde_json::json!({ "handlers": false })).into_response(),
+    }
+}
+
 /// The versioned DLQ view schema (UX5): bumped only on a breaking shape change, so a client can
 /// detect an incompatible server.
 #[cfg(feature = "handlers")]

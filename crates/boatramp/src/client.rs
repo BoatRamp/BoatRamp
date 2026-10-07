@@ -1579,6 +1579,25 @@ impl ControlPlane {
             .await?)
     }
 
+    /// Fetch the NODE-global wasm instance-lifecycle + memory stats (raw JSON: per-lane warm-hit /
+    /// cold-miss / eviction / instantiation counters + durations, the live warm set, in-flight vs
+    /// ceiling, and process RSS vs the per-instance limit). `GET /api/instance-stats` — a node-global
+    /// path (not project-scoped), gated `System·Read`.
+    pub async fn fetch_instance_stats(&self) -> Result<serde_json::Value> {
+        let Self {
+            http: client,
+            base: server,
+            ..
+        } = self;
+        Ok(client
+            .get(format!("{server}/api/instance-stats"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
+    }
+
     /// Run a dead-letter mutation (`purge` / `redrive` / `discard`) on a consumer `topic`
     /// (scope-relative; `alias` for a background-alias consumer), optionally filter-selective and/or
     /// `dry_run`. Returns the number affected plus (for a dry-run) the matching preview
