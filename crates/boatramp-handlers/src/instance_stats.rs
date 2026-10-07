@@ -203,8 +203,9 @@ pub fn process_rss_bytes() -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
         // Read `VmRSS: N kB` from `/proc/self/status` — already in kB, so no page-size assumption
-        // (the old `/proc/self/statm` pages × 4096 mis-scaled 4–16× on 16K/64K-page hosts, e.g. some
-        // ARM64 — exactly the memory-headroom view this must get right). `None` on any parse miss.
+        // (the old `/proc/self/statm` pages × 4096 under-reported RSS 4–16× on 16K/64K-page hosts,
+        // e.g. some ARM64 — exactly the memory-headroom view this must get right). `None` on any
+        // parse failure.
         let status = std::fs::read_to_string("/proc/self/status").ok()?;
         let kib: u64 = status
             .lines()
@@ -233,19 +234,11 @@ fn bump_max(slot: &AtomicU64, v: u64) {
 }
 
 fn avg_us(total_ns: u64, count: u64) -> u64 {
-    if count == 0 {
-        0
-    } else {
-        (total_ns / count) / 1_000
-    }
+    total_ns.checked_div(count).map_or(0, |v| v / 1_000)
 }
 
 fn avg_ms(total_ns: u64, count: u64) -> u64 {
-    if count == 0 {
-        0
-    } else {
-        (total_ns / count) / 1_000_000
-    }
+    total_ns.checked_div(count).map_or(0, |v| v / 1_000_000)
 }
 
 #[cfg(test)]
