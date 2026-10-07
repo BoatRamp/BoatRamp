@@ -1009,6 +1009,8 @@ pub(super) async fn run_scheduler_tick(
                                 consumer.tenancy.as_ref(),
                                 consumer.token_claims.as_ref(),
                                 None,
+                                // A consumer resolves any system class from the drained seal, not here.
+                                false,
                             )
                             .await
                             {
@@ -1394,6 +1396,41 @@ async fn fire_cron(
             return;
         }
     };
+    // PLAN-system-principal P2: a `run_as: deployer` cron fires as the deployer captured at deploy
+    // time. The capture lives on the active manifest's `DeployMeta` (keyed by the SAME manifest
+    // content id), server-derived and never client-supplied. ONLY a System·Admin deployer (⇒
+    // `PrincipalKind::System`) yields a usable principal — a deploy identity carries no in-site
+    // tenant, so a non-system (or uncaptured) deployer's deployer-cron is REFUSED here (fail closed),
+    // never faked. A system match coerces the handler to the system class + seals a system
+    // `signed_context` on `emit` (so the downstream `signed_context` consumer resolves system).
+    let run_as_system = match cron.run_as {
+        boatramp_core::config::CronRunAs::Unauthenticated => false,
+        boatramp_core::config::CronRunAs::Deployer => {
+            let id = match manifest.id() {
+                Ok(id) => id,
+                Err(err) => {
+                    tracing::warn!(site, route = %cron.route, %err, "cron run_as:deployer refused — cannot identify the active manifest");
+                    return;
+                }
+            };
+            match deploy.get_meta(&id).await {
+                Ok(Some(meta))
+                    if meta.deploy_principal
+                        == Some(boatramp_core::tenancy::PrincipalKind::System) =>
+                {
+                    true
+                }
+                _ => {
+                    tracing::warn!(
+                        site,
+                        route = %cron.route,
+                        "cron run_as:deployer refused — the active deployment's captured deployer is not the system class (fail closed); a deploy identity has no tenant to run as"
+                    );
+                    return;
+                }
+            }
+        }
+    };
     let bindings = match build_bindings(
         inner,
         project,
@@ -1430,6 +1467,8 @@ async fn fire_cron(
         handler.token_claims.as_ref(),
         // A cron trigger is not a messaging drain — no signed-context envelope.
         None,
+        // PLAN-system-principal P2: fire as system iff this cron's deployer was a System·Admin.
+        run_as_system,
     )
     .await
     {

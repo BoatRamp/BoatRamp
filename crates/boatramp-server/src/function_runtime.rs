@@ -120,8 +120,24 @@ const DURABLE_CONTEXT_TTL_SECS: u64 = 48 * 3600;
 pub(super) async fn mint_producer_context(
     inner: &HandlerRuntimeInner,
     principal: &[boatramp_handlers::ScopeFact],
+    kind: boatramp_core::tenancy::PrincipalKind,
 ) -> Option<String> {
     let signer = inner.session_signer.get()?;
+    // PLAN-system-principal P3 — a SYSTEM producer (a `run_as: deployer` cron whose deployer was a
+    // System·Admin, or an already-system invocation chain) seals a SYSTEM context: a positive signed
+    // `br_scope_kind=system` marker, NO tenant. A consumer declaring `sources: [signed_context]` then
+    // resolves the system class (base/`IS NULL`) instead of dead-lettering on a missing tenant —
+    // exactly construens' broken worker. The class rides the SIGNED marker, never a missing tenant.
+    if kind.is_system() {
+        return boatramp_core::cose::mint_system_context(
+            None,
+            DURABLE_CONTEXT_TTL_SECS,
+            now_unix(),
+            signer.as_ref(),
+        )
+        .await
+        .ok();
+    }
     let tenant = principal
         .iter()
         .find(|f| f.axis == boatramp_core::tenancy::ScopeAxis::Tenant)
@@ -1251,6 +1267,13 @@ pub(super) async fn build_function_bindings(
         .as_ref()
         .map(|h| h.facts().to_vec())
         .unwrap_or_default();
+    // The resolved principal's CLASS (PLAN-system-principal P3), so a SYSTEM invocation's `emit` seals
+    // a system context (no tenant) rather than failing to stamp one. Default `Tenant` when there is no
+    // resolved tenancy (an unscoped producer), unchanged.
+    let caller_kind = host_tenancy
+        .as_ref()
+        .map(boatramp_handlers::HostTenancy::principal_kind)
+        .unwrap_or_default();
     // `wasi:blobstore` (REORDERED to here, post tenant-resolution): the host-side tenant confinement
     // (`blobstore.rs::container_prefix`) needs THIS invocation's resolved OWN tenant to expand a
     // `{tenant}` allowlist entry, and the multi-tenant fact to apply the deny-default. `multi_tenant`
@@ -1318,7 +1341,7 @@ pub(super) async fn build_function_bindings(
         // Stamp the producer's own-tenant onto every message it publishes (R1, guest-blind), so
         // a consumer declaring `sources: [signed_context]` resolves it on the async lane. Fixed
         // here from this invocation's resolved principal; `None` for an unscoped producer.
-        let signed_context = mint_producer_context(inner, &caller_tenant).await;
+        let signed_context = mint_producer_context(inner, &caller_tenant, caller_kind).await;
         // Private topics namespace under the function's own scope; `bus:<topic>`
         // publishes route to the shared, project-scoped bus.
         bindings = bindings.with_messaging(

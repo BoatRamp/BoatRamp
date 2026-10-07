@@ -15,7 +15,7 @@
 //!   if its config asks to.
 
 use boatramp_core::config::HandlerGraphqlTokenClaims;
-use boatramp_core::tenancy::{AccessMode, Tenancy, TenantSource};
+use boatramp_core::tenancy::{AccessMode, PrincipalKind, Tenancy, TenantSource};
 use boatramp_handlers::HostTenancy;
 
 /// Everything needed to resolve the tenant value for one invocation. Each caller fills what its
@@ -591,18 +591,27 @@ async fn resolve_value(
         // the drained message against the fleet anchor and return the producer's stamped tenant. A
         // forged/altered/expired envelope (or no envelope / no anchor) resolves no value — the
         // consumer's "own" op then fails closed rather than running unscoped. The guest never names
-        // the tenant; only a host signature over the producer's principal verifies here. (A *system*
-        // signed-context — a cron/consumer seal with no `br_ctx` — is rejected by `verify_context`
-        // today, so it resolves no tenant here; the async-lane system class is threaded in C7 via the
-        // full verifier.)
+        // the tenant; only a host signature over the producer's principal verifies here. A *system*
+        // signed-context (a cron / `System·Admin`-deploy producer seal carrying a positive signed
+        // `br_scope_kind=system` and NO `br_ctx`) resolves to the typed `System` class — so a consumer
+        // declaring `sources: [signed_context]` draining a system producer's message acts as the system
+        // principal (base/`IS NULL`), NOT a dead-letter on a missing tenant (PLAN-system-principal P3).
+        // The class is read from the SIGNED marker via the full verifier — never inferred from a missing
+        // tenant (a stripped/forged envelope fails the signature check, so it resolves nothing).
         TenantSource::SignedContext => {
             let (env, anchor) = (inputs.signed_context?, inputs.context_anchor?);
-            let tenant =
-                boatramp_core::cose::verify_context(env, anchor, boatramp_core::time::now_unix())
-                    .ok()?;
-            Some(ResolvedPrincipal::Tenant(
-                boatramp_core::sql::SqlValue::Text(tenant),
-            ))
+            let v = boatramp_core::cose::verify_context_full(
+                env,
+                anchor,
+                boatramp_core::time::now_unix(),
+            )
+            .ok()?;
+            match v.kind {
+                PrincipalKind::System => Some(ResolvedPrincipal::System),
+                PrincipalKind::Tenant => v
+                    .tenant
+                    .map(|t| ResolvedPrincipal::Tenant(boatramp_core::sql::SqlValue::Text(t))),
+            }
         }
         // Truly anonymous — no "own" tenant.
         TenantSource::None => None,
@@ -1019,6 +1028,73 @@ mod tests {
         assert!(
             !ht.facts().iter().any(|f| f.axis == ScopeAxis::Tenant),
             "no envelope ⇒ no own tenant (the async lane fails an own op closed)"
+        );
+    }
+
+    /// PLAN-system-principal P3: a consumer declaring `sources: [signed_context]` draining a SYSTEM
+    /// producer seal (a `run_as: deployer` cron / `System·Admin`-deploy seal — positive signed
+    /// `br_scope_kind=system`, no tenant) resolves the typed SYSTEM class (base/`IS NULL`, no tenant
+    /// GUC), NOT a dead-letter on a missing tenant. The class rides the SIGNED marker — a forged
+    /// envelope fails the signature check and resolves nothing.
+    #[tokio::test]
+    async fn a_system_signed_context_resolves_the_system_class_on_the_async_lane() {
+        use boatramp_core::cose::{LocalSigner, Signer, TokenAlg, mint_system_context};
+
+        let signer = LocalSigner::generate(TokenAlg::Es256);
+        let anchor = signer.public_key();
+        let envelope = mint_system_context(None, 3600, boatramp_core::time::now_unix(), &signer)
+            .await
+            .unwrap();
+
+        let decision = Tenancy::Scoped {
+            column: "tenant_id".into(),
+            sources: vec![TenantSource::SignedContext],
+            read: AccessMode::Own,
+            write: AccessMode::Own,
+            exceed_site_ceiling: false,
+            unscoped_writes: Vec::new(),
+            on_unresolved: OnUnresolved::Deny,
+        };
+        let inputs = TenantSourceInputs {
+            signed_context: Some(&envelope),
+            context_anchor: Some(&anchor),
+            ..Default::default()
+        };
+        let ht = resolve_host_tenancy(Some(&decision), true, posture(true, false), inputs)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            ht.is_system(),
+            "a system producer seal resolves the consumer as the system class"
+        );
+        assert!(
+            ht.facts().is_empty(),
+            "a system principal carries no tenant fact"
+        );
+        assert!(
+            ht.rls_tenant_value().is_none(),
+            "G2: a system consumer sets NO tenant GUC — it cannot read a tenant's rows"
+        );
+
+        // A system seal signed by a stranger (not the fleet anchor) resolves NOTHING — the class is
+        // never granted by a forged marker.
+        let stranger = LocalSigner::generate(TokenAlg::Es256);
+        let forged = mint_system_context(None, 3600, boatramp_core::time::now_unix(), &stranger)
+            .await
+            .unwrap();
+        let inputs = TenantSourceInputs {
+            signed_context: Some(&forged),
+            context_anchor: Some(&anchor),
+            ..Default::default()
+        };
+        let ht = resolve_host_tenancy(Some(&decision), true, posture(true, false), inputs)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !ht.is_system() && ht.facts().is_empty(),
+            "a forged system seal confers neither the system class nor a tenant (fail closed)"
         );
     }
 
