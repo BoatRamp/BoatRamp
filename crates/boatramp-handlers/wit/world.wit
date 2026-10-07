@@ -1081,9 +1081,19 @@ interface tenancy {
   /// can present, then emit.
   present-token: func(token: string) -> result<_, tenancy-error>;
 
-  /// A `tenant`-class sealed principal: the producer's host-sealed own-tenant plus the host-verified
-  /// caller persona/role (`br_ctx` + `br_persona`, one COSE signature).
-  record tenant-principal {
+  /// The host-verified sealed principal for THIS invocation (PLAN-async-persona): the producer's
+  /// host-sealed own-tenant plus the host-verified caller persona/role (`br_ctx` + `br_persona`, one
+  /// COSE signature). NEVER a guest-supplied value — the host verifies it from the durable
+  /// `signed_context` seal.
+  ///
+  /// COMPAT NOTE (PLAN-system-principal): this stays a RECORD with a `tenant: string`, unchanged from
+  /// v0.7.3, so an already-deployed `tenancy-persona` guest keeps linking (a record→variant swap is a
+  /// wire-incompatible Component-Model change). A SYSTEM seal (a no-tenant principal) is NOT
+  /// representable here, so the host returns `none` for it — the guest then falls to the fail-closed
+  /// `authenticate_sealed` default (a `role(…)` field denies). The system CLASS is enforced host-side
+  /// (SQL base-row scoping + the `app.principal_kind` RLS GUC); guest observability of the class, if
+  /// ever needed, is a separate additive capability.
+  record sealed-principal {
     /// The producer's host-sealed own-tenant (the same value the `signed_context` tenancy source
     /// resolves).
     tenant: string,
@@ -1093,36 +1103,12 @@ interface tenancy {
     persona: option<string>,
   }
 
-  /// A `system`-class sealed principal (construens cron-system-principal): a platform/super-admin
-  /// identity with NO tenant. It carries only the (optional) host-verified persona — there is
-  /// structurally no tenant to read.
-  record system-principal {
-    /// The host-verified persona/role, as for a tenant principal; `none` if none was sealed.
-    persona: option<string>,
-  }
-
-  /// The host-verified principal sealed onto the async lane for THIS invocation (PLAN-async-persona,
-  /// construens cron-system-principal): EITHER a `tenant` principal (an own-tenant value) OR a
-  /// `system` principal (no tenant — a platform/super-admin). A VARIANT (not a record with an
-  /// optional tenant) so a system principal is unrepresentable as a tenant: a guest MUST match both
-  /// arms, and there is no tenant string to `.unwrap()` in the system arm. NEVER a guest-supplied
-  /// value — the host verifies it from the durable `signed_context` seal.
-  variant sealed-principal {
-    /// An ordinary tenant principal.
-    tenant(tenant-principal),
-    /// A no-tenant platform/super-admin principal.
-    system(system-principal),
-  }
-
-  /// Return the host-verified sealed principal for the CURRENT invocation, or `none` (named
-  /// `current-principal` because a WIT interface cannot reuse the `sealed-principal` record name for a
-  /// func; the returned TYPE is `sealed-principal`). Returns a value ONLY on the consumer / durable
-  /// async lane, where this invocation's context came from a verified `signed_context` seal — and even
-  /// then only what the host verified from that seal. On the sync/HTTP lane, or when the seal is
-  /// absent/expired/invalid, returns `none` (the bearer path is unchanged). The persona rides the SAME
-  /// verified envelope as the tenant, so it is bound to the same verified tenant (no cross-tenant
-  /// persona) and shares the envelope's TTL. Guest-blind: the value is host-verified, never named or
-  /// supplied by the guest.
+  /// Return the host-verified sealed principal for the CURRENT invocation, or `none`. Returns a value
+  /// ONLY on the consumer / durable async lane, where this invocation's context came from a verified
+  /// `signed_context` seal — and even then only what the host verified from that seal. On the
+  /// sync/HTTP lane, when the seal is absent/expired/invalid, OR when the seal is a no-tenant SYSTEM
+  /// principal (not representable as this record — see the COMPAT NOTE), returns `none`. The persona
+  /// rides the SAME verified envelope as the tenant. Guest-blind: host-verified, never guest-supplied.
   current-principal: func() -> option<sealed-principal>;
 }
 

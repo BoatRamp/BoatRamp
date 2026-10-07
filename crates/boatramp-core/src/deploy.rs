@@ -350,6 +350,16 @@ pub(crate) mod keys {
         format!("project/{project}/current/{site}")
     }
 
+    /// The **class of the verified actor who ACTIVATED** this site's current production deployment
+    /// (PLAN-system-principal P2): `project/<proj>/current-principal/<site>`. Per-(project, site) and
+    /// written ONLY by [`DeployStore::activate`] from the activator's server-derived class, so a
+    /// `run_as: deployer` cron's system authority is bound to WHO made THIS site live — never to the
+    /// (global, content-addressed) [`DeployMeta`]. Present (⇒ `System`) only when a System·Admin
+    /// activated; absent otherwise (fail closed). Atomic with [`current`](Self::current).
+    pub fn current_principal(project: ProjectRef<'_>, site: &str) -> String {
+        format!("project/{project}/current-principal/{site}")
+    }
+
     /// The prefix listing a project's active-deployment pointers.
     pub fn current_prefix(project: ProjectRef<'_>) -> String {
         format!("project/{project}/current/")
@@ -747,7 +757,7 @@ impl DeployStore {
 
     /// Store a manifest (idempotent) and return its deployment id.
     pub async fn put_manifest(&self, manifest: &Manifest) -> Result<String, DeployError> {
-        self.put_manifest_with(manifest, DeployMetaInput::default(), None)
+        self.put_manifest_with(manifest, DeployMetaInput::default())
             .await
     }
 
@@ -762,7 +772,6 @@ impl DeployStore {
         &self,
         manifest: &Manifest,
         input: DeployMetaInput,
-        deploy_principal: Option<crate::tenancy::PrincipalKind>,
     ) -> Result<String, DeployError> {
         let id = manifest.id()?;
 
@@ -801,12 +810,6 @@ impl DeployStore {
             } else {
                 input.tags
             },
-            // Server-derived deployer class (PLAN-system-principal P2): OVERWRITTEN on every deploy,
-            // NEVER merged with the prior record. The meta is keyed by the manifest CONTENT id, so
-            // merging would let a NON-system deployer re-deploy byte-identical content (same
-            // `run_as: deployer` cron) and inherit a prior System capture — a privilege escalation.
-            // Overwriting makes a non-system re-deploy fail the cron closed. `None` ⇒ not captured.
-            deploy_principal,
         };
         self.kv
             .write_batch(vec![
@@ -3617,7 +3620,10 @@ impl DeployStore {
         Ok(purged)
     }
 
-    /// Atomically point `site` at deployment `id`.
+    /// Atomically point `site` at deployment `id`. Captures NO system class (the activator is
+    /// unknown), so the site's [`current_principal`](keys::current_principal) is CLEARED — a
+    /// `run_as: deployer` cron on this site then fails closed. The control-plane handler uses
+    /// [`activate_with_principal`](Self::activate_with_principal) to carry the verified activator.
     ///
     /// Refuses to activate a deployment whose blobs are not all present.
     pub async fn activate(
@@ -3625,6 +3631,24 @@ impl DeployStore {
         project: ProjectRef<'_>,
         site: &str,
         id: &str,
+    ) -> Result<(), DeployError> {
+        self.activate_with_principal(project, site, id, None).await
+    }
+
+    /// Like [`activate`](Self::activate), but also records the **class of the verified actor** who
+    /// performed THIS activation (PLAN-system-principal P2) at
+    /// [`current_principal`](keys::current_principal), atomically with the `current` pointer. This —
+    /// NOT the global, content-addressed [`DeployMeta`] — is the sole authority a `run_as: deployer`
+    /// cron consults, so system execution is bound to WHO made THIS (project, site) live. `activator`
+    /// of `Some(System)` records `system`; `Some(Tenant)` or `None` CLEARS the record (fail closed),
+    /// so a non-system (or unknown) activator can never leave a stale System capture that a later
+    /// activation of a System-captured content id would otherwise inherit.
+    pub async fn activate_with_principal(
+        &self,
+        project: ProjectRef<'_>,
+        site: &str,
+        id: &str,
+        activator: Option<crate::tenancy::PrincipalKind>,
     ) -> Result<(), DeployError> {
         let manifest = self
             .get_manifest(id)
@@ -3635,10 +3659,22 @@ impl DeployStore {
             return Err(DeployError::Incomplete(missing));
         }
 
-        // The atomic switch: a single KV write, so readers see the old or new
-        // deployment in full, never a partial state.
+        // The atomic switch: BOTH the `current` pointer AND the activator-class record flip together
+        // (one batch), so a reader never sees a new deployment paired with a stale principal class.
+        // System ⇒ write `system`; anything else ⇒ DELETE the record (fail closed), so this
+        // activation never inherits a prior System capture.
+        let principal_key = keys::current_principal(project, site);
+        let principal_op = match activator {
+            Some(crate::tenancy::PrincipalKind::System) => {
+                WriteOp::Put(principal_key, b"system".to_vec())
+            }
+            _ => WriteOp::Delete(principal_key),
+        };
         self.kv
-            .put(&keys::current(project, site), id.as_bytes().to_vec())
+            .write_batch(vec![
+                WriteOp::Put(keys::current(project, site), id.as_bytes().to_vec()),
+                principal_op,
+            ])
             .await?;
 
         // Record the activation. Best-effort: `current` above is the source of
@@ -3646,6 +3682,24 @@ impl DeployStore {
         // already took effect.
         let _ = self.record_history(project, site, id).await;
         Ok(())
+    }
+
+    /// The class of the verified actor who activated `site`'s current production deployment, if that
+    /// actor was the **system** class (PLAN-system-principal P2). `Some(System)` ONLY when a
+    /// System·Admin performed the activation; `None` otherwise (a Tenant/unknown activator, or no
+    /// activation) — so a `run_as: deployer` cron fails closed unless THIS site was made live by a
+    /// System·Admin. Read from [`current_principal`](keys::current_principal), never the global meta.
+    pub async fn current_activator_is_system(
+        &self,
+        project: ProjectRef<'_>,
+        site: &str,
+    ) -> Result<bool, DeployError> {
+        Ok(self
+            .kv
+            .get(&keys::current_principal(project, site))
+            .await?
+            .as_deref()
+            == Some(b"system"))
     }
 
     /// Prepend `id` to `site`'s activation history, de-duplicating by id and
@@ -4006,6 +4060,9 @@ impl DeployStore {
         let mut batch = vec![
             WriteOp::Delete(keys::site_pointer(project, site)),
             WriteOp::Delete(keys::current(project, site)),
+            // Sweep the activator-class record (PLAN-system-principal P2) with the pointer, so a
+            // re-created site never inherits a deleted site's System capture.
+            WriteOp::Delete(keys::current_principal(project, site)),
             WriteOp::Delete(keys::history(project, site)),
             // The per-host tenant context store (v0.4.23) lives outside the config blob, so it must
             // be swept here too or a re-created site could inherit a deleted tenant's bindings.
@@ -4634,6 +4691,79 @@ mod tests {
             );
         }
         m
+    }
+
+    /// PLAN-system-principal P2 — the deployer-class authority is bound to the per-(project, site)
+    /// ACTIVATION by the verified actor, NOT the global content-addressed `DeployMeta`. This is the
+    /// faithful gate for the cross-tenant escalation a content-keyed capture allowed (a Tenant
+    /// activating a System-captured content id onto their own site). Proves: only a System activator
+    /// confers system; a Tenant / unknown / cross-site / re-activation-of-the-same-id activator does
+    /// NOT; and the record is per-(project, site), never shared by content.
+    #[tokio::test]
+    async fn activation_principal_is_per_site_and_fail_closed() {
+        use crate::kv::MemoryKv;
+        use crate::tenancy::PrincipalKind;
+
+        let store = DeployStore::new(Arc::new(NullStorage), Arc::new(MemoryKv::new()));
+        // One shared, content-addressed manifest id (no blobs ⇒ activatable anywhere).
+        let id = store.put_manifest(&empty_manifest(false)).await.unwrap();
+        let op = ProjectRef::new("operator");
+        let attacker = ProjectRef::new("attacker");
+
+        // A System·Admin activates it on the operator's site ⇒ that site is system.
+        store
+            .activate_with_principal(op, "site", &id, Some(PrincipalKind::System))
+            .await
+            .unwrap();
+        assert!(
+            store.current_activator_is_system(op, "site").await.unwrap(),
+            "a System activator confers system on ITS site"
+        );
+
+        // THE EXPLOIT, now closed: the attacker activates the SAME (System-captured) content id onto
+        // their OWN site as a Tenant. Their site must NOT be system — the class is per-site activation,
+        // not a property of the shared content.
+        store
+            .activate_with_principal(attacker, "site", &id, Some(PrincipalKind::Tenant))
+            .await
+            .unwrap();
+        assert!(
+            !store
+                .current_activator_is_system(attacker, "site")
+                .await
+                .unwrap(),
+            "a Tenant activating System-captured content gets NO system (cross-tenant escalation closed)"
+        );
+        // The operator's site is unaffected — no shared global key.
+        assert!(
+            store.current_activator_is_system(op, "site").await.unwrap(),
+            "the operator's per-site capture is independent of another project's activation"
+        );
+
+        // A Tenant / unknown activator CLEARS a prior System capture on the SAME site (no stale
+        // escalation): re-activating the same id as a non-system actor downgrades it.
+        store
+            .activate_with_principal(op, "site", &id, Some(PrincipalKind::Tenant))
+            .await
+            .unwrap();
+        assert!(
+            !store.current_activator_is_system(op, "site").await.unwrap(),
+            "a Tenant re-activation of the same id OVERWRITES the prior System capture (fail closed)"
+        );
+
+        // The plain `activate` (unknown actor) and an un-activated site are both non-system.
+        store.activate(op, "site", &id).await.unwrap();
+        assert!(
+            !store.current_activator_is_system(op, "site").await.unwrap(),
+            "the classless `activate` clears the capture (fail closed)"
+        );
+        assert!(
+            !store
+                .current_activator_is_system(op, "never-activated")
+                .await
+                .unwrap(),
+            "an un-activated site is never system"
+        );
     }
 
     #[tokio::test]
@@ -6512,7 +6642,6 @@ mod tests {
                     message: Some("first".into()),
                     ..Default::default()
                 },
-                None,
             )
             .await
             .unwrap();
@@ -6524,41 +6653,13 @@ mod tests {
 
         // Re-store with empty input preserves created_at and prior provenance.
         store
-            .put_manifest_with(&manifest, DeployMetaInput::default(), None)
+            .put_manifest_with(&manifest, DeployMetaInput::default())
             .await
             .unwrap();
         let meta = store.get_meta(&id).await.unwrap().unwrap();
         assert_eq!(meta.created_at, created);
         assert_eq!(meta.source.as_deref(), Some("abc123"));
         assert_eq!(meta.message.as_deref(), Some("first"));
-        assert_eq!(meta.deploy_principal, None, "no class captured yet");
-
-        // PLAN-system-principal P2: the deployer class is OVERWRITTEN (never merged) on re-deploy —
-        // the escalation guard. A System capture appears, and a later re-deploy that captures no class
-        // (or a non-system one) clears it, so a non-system re-deploy of identical content can never
-        // inherit a prior System capture.
-        store
-            .put_manifest_with(
-                &manifest,
-                DeployMetaInput::default(),
-                Some(crate::tenancy::PrincipalKind::System),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            store.get_meta(&id).await.unwrap().unwrap().deploy_principal,
-            Some(crate::tenancy::PrincipalKind::System),
-            "a system deployer's class is captured (overwriting the prior None)"
-        );
-        store
-            .put_manifest_with(&manifest, DeployMetaInput::default(), None)
-            .await
-            .unwrap();
-        assert_eq!(
-            store.get_meta(&id).await.unwrap().unwrap().deploy_principal,
-            None,
-            "a re-deploy with no captured class OVERWRITES (never merges) the prior System capture"
-        );
     }
 
     #[tokio::test]

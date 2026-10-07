@@ -859,19 +859,31 @@ pub(super) async fn run_scheduler_tick(
             // project's handlers use, and are isolated across projects that share a site name. A BARE
             // scope (the pre-fix bug) pointed a non-default project's consumer at an empty,
             // cross-project-colliding `hblob/{site}/…`.
-            let mut active: Vec<(String, String)> = Vec::new();
+            // The third tuple element (PLAN-system-principal P2): whether the VERIFIED actor who
+            // ACTIVATED this active deployment was a System·Admin — the per-(project, site) activation
+            // authority a `run_as: deployer` cron consults. Production reads the activation record;
+            // a background ALIAS has no such per-alias capture, so it is `false` (fail closed — an
+            // alias cron never inherits the production activation's class).
+            let mut active: Vec<(String, String, bool)> = Vec::new();
             if let Some(id) = deploy.current_id(project, &site).await? {
-                active.push((id, consumer_dispatch_scope(project, &site)));
+                let activator_is_system =
+                    deploy.current_activator_is_system(project, &site).await?;
+                active.push((
+                    id,
+                    consumer_dispatch_scope(project, &site),
+                    activator_is_system,
+                ));
             }
             for alias in &site_handlers.background_aliases {
                 if let Some(id) = deploy.get_alias(project, &site, alias).await? {
                     active.push((
                         id,
                         consumer_dispatch_scope(project, &format!("{site}/{alias}")),
+                        false,
                     ));
                 }
             }
-            for (deploy_id, scope) in active {
+            for (deploy_id, scope, activator_is_system) in active {
                 let Some(manifest) = deploy.get_manifest(&deploy_id).await? else {
                     continue;
                 };
@@ -1244,6 +1256,7 @@ pub(super) async fn run_scheduler_tick(
                             &scope,
                             &site_handlers,
                             &cron,
+                            activator_is_system,
                         )
                         .await;
                         running.store(false, Ordering::Release);
@@ -1381,6 +1394,11 @@ async fn fire_cron(
     scope: &str,
     site_handlers: &boatramp_core::config::HandlersSiteConfig,
     cron: &boatramp_core::config::CronConfig,
+    // PLAN-system-principal P2: whether the VERIFIED actor who ACTIVATED the deployment serving THIS
+    // (project, scope) was a System·Admin — resolved by the caller from the per-(project, site)
+    // activation record (NOT the global, content-addressed `DeployMeta`), and `false` for a background
+    // alias (fail closed). The sole input that can let a `run_as: deployer` cron fire as system.
+    activator_is_system: bool,
 ) {
     let Some(handler) = route::match_handler(&manifest.config.handlers, "GET", &cron.route) else {
         tracing::warn!(site, route = %cron.route, "cron route matches no GET handler");
@@ -1396,39 +1414,24 @@ async fn fire_cron(
             return;
         }
     };
-    // PLAN-system-principal P2: a `run_as: deployer` cron fires as the deployer captured at deploy
-    // time. The capture lives on the active manifest's `DeployMeta` (keyed by the SAME manifest
-    // content id), server-derived and never client-supplied. ONLY a System·Admin deployer (⇒
-    // `PrincipalKind::System`) yields a usable principal — a deploy identity carries no in-site
-    // tenant, so a non-system (or uncaptured) deployer's deployer-cron is REFUSED here (fail closed),
-    // never faked. A system match coerces the handler to the system class + seals a system
-    // `signed_context` on `emit` (so the downstream `signed_context` consumer resolves system).
+    // PLAN-system-principal P2: a `run_as: deployer` cron fires as the system principal ONLY when the
+    // VERIFIED actor who ACTIVATED this (project, site) was a System·Admin (`activator_is_system`,
+    // bound per-site by `activate_with_principal` — never the global content meta). A deploy identity
+    // carries no in-site tenant, so a non-system (or unknown / alias) activator's deployer-cron is
+    // REFUSED (fail closed), never faked. A system fire coerces the handler to the system class + seals
+    // a system `signed_context` on `emit` (so the downstream `signed_context` consumer resolves system).
     let run_as_system = match cron.run_as {
         boatramp_core::config::CronRunAs::Unauthenticated => false,
         boatramp_core::config::CronRunAs::Deployer => {
-            let id = match manifest.id() {
-                Ok(id) => id,
-                Err(err) => {
-                    tracing::warn!(site, route = %cron.route, %err, "cron run_as:deployer refused — cannot identify the active manifest");
-                    return;
-                }
-            };
-            match deploy.get_meta(&id).await {
-                Ok(Some(meta))
-                    if meta.deploy_principal
-                        == Some(boatramp_core::tenancy::PrincipalKind::System) =>
-                {
-                    true
-                }
-                _ => {
-                    tracing::warn!(
-                        site,
-                        route = %cron.route,
-                        "cron run_as:deployer refused — the active deployment's captured deployer is not the system class (fail closed); a deploy identity has no tenant to run as"
-                    );
-                    return;
-                }
+            if !activator_is_system {
+                tracing::warn!(
+                    site,
+                    route = %cron.route,
+                    "cron run_as:deployer refused — this site's current deployment was not activated by a System·Admin (fail closed); a deploy identity has no tenant to run as"
+                );
+                return;
             }
+            true
         }
     };
     let bindings = match build_bindings(

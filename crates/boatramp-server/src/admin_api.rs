@@ -55,17 +55,12 @@ pub(super) async fn create_deployment(
     State(deploy): State<DeployStore>,
     Path(_site): Path<String>,
     Query(meta): Query<DeployMetaQuery>,
-    // PLAN-system-principal P2: the SERVER-DERIVED deployer class stashed by `require_auth`. Optional
-    // because auth may be disabled (dev) — then no class is captured. A non-body extractor, so it
-    // precedes the body-consuming `Json`. The client cannot supply this.
-    deploy_class: Option<Extension<crate::auth::VerifiedDeployClass>>,
     Json(manifest): Json<Manifest>,
 ) -> Response {
-    let deploy_principal = deploy_class.map(|Extension(c)| c.0);
+    // PLAN-system-principal P2: deployer-class capture happens at ACTIVATION (per (project, site)),
+    // NOT here — registering content carries no per-site authority. See `activate_deployment`.
     let result = async {
-        let id = deploy
-            .put_manifest_with(&manifest, meta.into(), deploy_principal)
-            .await?;
+        let id = deploy.put_manifest_with(&manifest, meta.into()).await?;
         let missing = deploy.missing_blobs(&manifest).await?;
         Ok::<_, DeployError>((id, missing))
     }
@@ -179,6 +174,11 @@ pub(super) async fn activate_deployment(
     State(deploy): State<DeployStore>,
     Extension(handlers): Extension<Arc<HandlerRuntime>>,
     Extension(project): axum::extract::Extension<ProjectContext>,
+    // PLAN-system-principal P2: the SERVER-DERIVED class of the actor performing THIS activation
+    // (stashed by `require_auth`; absent when auth is disabled). This — bound to the (project, site)
+    // being made live — is the sole authority a `run_as: deployer` cron consults. The client cannot
+    // supply it. A non-body extractor, so it precedes `Path`.
+    deploy_class: Option<Extension<crate::auth::VerifiedDeployClass>>,
     Path((site, id)): Path<(String, String)>,
 ) -> Response {
     if let Some(resp) = reject_invalid_name("site", &site) {
@@ -204,7 +204,11 @@ pub(super) async fn activate_deployment(
         Ok(None) => {}
         Err(err) => return deploy_error_response(err),
     }
-    match deploy.activate(project.as_ref(), &site, &id).await {
+    let activator = deploy_class.map(|Extension(c)| c.0);
+    match deploy
+        .activate_with_principal(project.as_ref(), &site, &id, activator)
+        .await
+    {
         Ok(()) => {
             srvmetrics::server_metrics().record_activation();
             StatusCode::NO_CONTENT.into_response()
