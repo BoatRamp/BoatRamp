@@ -47,20 +47,6 @@ pub struct DeployMeta {
     /// console. Ordered (`BTreeMap`) so the serialized form is stable.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub tags: BTreeMap<String, String>,
-    /// The **class of the verified deployer** (PLAN-system-principal P2), captured SERVER-SIDE from
-    /// the deployer's authorized rights at deploy time — NEVER client-supplied (it is not part of
-    /// [`DeployMetaInput`]). A deployer holding the node-global `System·Admin` right ⇒
-    /// [`PrincipalKind::System`]; any other authorized deployer ⇒ [`PrincipalKind::Tenant`]. A cron
-    /// declaring [`run_as: deployer`](crate::config::CronRunAs::Deployer) fires as the system
-    /// principal iff this is `Some(System)`; otherwise it is refused at fire time (fail closed).
-    ///
-    /// **Overwritten, not merged, on every (re-)deploy** — unlike the provenance fields above, which
-    /// merge. Because the meta is keyed by the manifest CONTENT id, merging would let a NON-system
-    /// deployer re-deploy byte-identical content (same `run_as: deployer` cron) and inherit a prior
-    /// System capture — a privilege escalation. Overwriting with the current deployer's class makes a
-    /// non-system re-deploy fail the cron closed. `None` ⇒ not captured (auth disabled / dev).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub deploy_principal: Option<crate::tenancy::PrincipalKind>,
 }
 
 /// Client-supplied provenance for a deployment (the mutable subset of
@@ -178,14 +164,9 @@ mod tests {
                 ("env".to_string(), "prod".to_string()),
                 ("ticket".to_string(), "ABC-123".to_string()),
             ]),
-            deploy_principal: Some(crate::tenancy::PrincipalKind::System),
         };
         let json = serde_json::to_string(&meta).unwrap();
         assert_eq!(serde_json::from_str::<DeployMeta>(&json).unwrap(), meta);
-        assert!(
-            json.contains("\"deploy_principal\":\"system\""),
-            "the captured system deployer class round-trips: {json}"
-        );
     }
 
     #[test]
@@ -201,7 +182,6 @@ mod tests {
             message: None,
             tag: None,
             tags: BTreeMap::new(),
-            deploy_principal: None,
         };
         let json = serde_json::to_string(&meta).unwrap();
         assert!(
@@ -211,10 +191,6 @@ mod tests {
         assert!(
             !json.contains("\"tags\""),
             "empty tags must not serialize: {json}"
-        );
-        assert!(
-            !json.contains("deploy_principal"),
-            "an uncaptured deploy_principal must not serialize: {json}"
         );
     }
 

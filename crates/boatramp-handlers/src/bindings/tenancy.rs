@@ -158,19 +158,17 @@ impl tenancy_iface::Host for TenancyHost<'_> {
     /// The value is exactly what the host verified (guest-blind); the guest can neither name nor
     /// supply it. Synchronous — a pure read of the per-invocation binding.
     fn current_principal(&mut self) -> Option<tenancy_iface::SealedPrincipal> {
-        self.sealed_principal.map(|p| match p {
-            SealedPrincipal::Tenant { tenant, persona } => {
-                tenancy_iface::SealedPrincipal::Tenant(tenancy_iface::TenantPrincipal {
-                    tenant: tenant.clone(),
-                    persona: persona.clone(),
-                })
-            }
-            SealedPrincipal::System { persona } => {
-                tenancy_iface::SealedPrincipal::System(tenancy_iface::SystemPrincipal {
-                    persona: persona.clone(),
-                })
-            }
-        })
+        match self.sealed_principal? {
+            SealedPrincipal::Tenant { tenant, persona } => Some(tenancy_iface::SealedPrincipal {
+                tenant: tenant.clone(),
+                persona: persona.clone(),
+            }),
+            // A no-tenant SYSTEM seal is not representable by the back-compat `sealed-principal` record
+            // (which carries a `tenant: string`) — see the WIT COMPAT NOTE. The guest observes `none`
+            // and falls to its fail-closed `authenticate_sealed` default; the system CLASS is enforced
+            // host-side (base-row SQL + the `app.principal_kind` GUC), never via this read.
+            SealedPrincipal::System { .. } => None,
+        }
     }
 }
 
@@ -243,16 +241,11 @@ mod tests {
             persona: Some("Integration".into()),
         };
         let mut host = TenancyHost::new(None, Some(&sealed));
-        match host
+        let p = host
             .current_principal()
-            .expect("a verified seal is present")
-        {
-            tenancy_iface::SealedPrincipal::Tenant(t) => {
-                assert_eq!(t.tenant, "acme");
-                assert_eq!(t.persona.as_deref(), Some("Integration"));
-            }
-            other => panic!("expected a tenant principal, got {other:?}"),
-        }
+            .expect("a verified tenant seal is present");
+        assert_eq!(p.tenant, "acme");
+        assert_eq!(p.persona.as_deref(), Some("Integration"));
 
         // A seal with a tenant but no persona (no `token_persona_claim` configured) ⇒ persona `none`,
         // so a `role(…)`-gated field fails closed on the trusting side.
@@ -261,32 +254,23 @@ mod tests {
             persona: None,
         };
         let mut host = TenancyHost::new(None, Some(&tenant_only));
-        match host
+        let p = host
             .current_principal()
-            .expect("a verified seal is present")
-        {
-            tenancy_iface::SealedPrincipal::Tenant(t) => {
-                assert_eq!(t.tenant, "acme");
-                assert_eq!(t.persona, None);
-            }
-            other => panic!("expected a tenant principal, got {other:?}"),
-        }
+            .expect("a verified tenant seal is present");
+        assert_eq!(p.tenant, "acme");
+        assert_eq!(p.persona, None);
 
-        // A SYSTEM seal ⇒ the `system` arm, carrying only the persona and NO tenant (construens
-        // cron-system-principal). There is structurally no tenant to read.
+        // A SYSTEM seal (no-tenant, construens cron-system-principal) is NOT representable by the
+        // back-compat `sealed-principal` record, so the guest observes `none` and falls to the
+        // fail-closed `authenticate_sealed` default. The system CLASS is enforced host-side.
         let system = SealedPrincipal::System {
             persona: Some("super_admin".into()),
         };
         let mut host = TenancyHost::new(None, Some(&system));
-        match host
-            .current_principal()
-            .expect("a verified seal is present")
-        {
-            tenancy_iface::SealedPrincipal::System(s) => {
-                assert_eq!(s.persona.as_deref(), Some("super_admin"));
-            }
-            other => panic!("expected a system principal, got {other:?}"),
-        }
+        assert!(
+            host.current_principal().is_none(),
+            "a system seal is not guest-observable via the tenant record — returns none (fail closed)"
+        );
     }
 
     #[tokio::test]
