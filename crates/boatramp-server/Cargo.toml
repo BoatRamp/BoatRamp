@@ -136,6 +136,17 @@ issuer-trust-gate-mutation = ["oidc"]
 # handler's project-qualified scope + cross-project isolation — goes RED. Needs `handlers` (the seam
 # is handlers-gated). Compiled OUT of every real build (also lives under this crate's own `cfg(test)`).
 consumer-scope-gate-mutation = ["handlers"]
+# Anti-hollow lane for the first-class `system` principal (PLAN-system-principal). Server-side seams
+# keyed on `BOATRAMP_SYSPRINCIPAL_MUTATION`: `skip_exact_issuer` (tenant_resolve.rs: the `system_when`
+# issuer backstop always passes → a `suffix`-trusted issuer mints the node-wide system principal) and
+# `deploy_class_any_is_system` (auth.rs: the deploy-class derivation returns System for any authorized
+# deployer → a project-scoped admin's cron fires as system). Forwards to `boatramp-core` for the
+# DeployStore + COSE seams. Needs `handlers`+`oidc` (the seam paths). Compiled OUT of every real build.
+system-principal-gate-mutation = [
+  "handlers",
+  "oidc",
+  "boatramp-core/system-principal-gate-mutation",
+]
 
 # TEST-ONLY lane: the MF-3/MF-4 live-Postgres authz twins open a real multi-writer `SqlKv`
 # (`boatramp-storage/sql-postgres`) so node B's fence read-through / fail-closed shed is exercised

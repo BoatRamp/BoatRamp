@@ -580,6 +580,102 @@ jobs:
             echo "issuer-trust LIVE mutation verified: follow_redirects turns the gate RED → the redirect refusal is load-bearing."
           fi
 
+      # SYSTEM-PRINCIPAL provenance gates (PLAN-system-principal): the first-class no-tenant `system`
+      # principal is produced ONLY from a verified system source. Four anti-hollow gates, each armed via
+      # `BOATRAMP_SYSPRINCIPAL_MUTATION` (through `system-principal-gate-mutation`, compiled OUT of
+      # shipped builds). Each mutation disables ONE provenance invariant and MUST turn its gate RED.
+
+      # (1) Activation-provenance (the F1 cross-tenant-escalation fix): the deployer class a
+      # `run_as: deployer` cron fires as is bound to the per-(project,site) ACTIVATION by the verified
+      # activator, id-bound — never the global content-addressed meta. Marker `SYSTEM PRINCIPAL
+      # ACTIVATION OK`. Mutations: `content_keyed` (drop the id binding → cross-deployment
+      # mis-application), `skip_clear` (a non-system activation leaves a stale System record).
+      - name: "system-principal activation gate (per-(project,site), id-bound)"
+        run: |
+          set -eo pipefail
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-core \
+            --lib activation_principal_is_per_site_and_fail_closed -- --nocapture 2>&1 | tee sysp-activation.log
+          grep -qE 'test result: ok\. 1 passed' sysp-activation.log \
+            || { echo "::error::system-principal activation gate did not run (silent skip or a failure)" >&2; exit 1; }
+          grep -q 'SYSTEM PRINCIPAL ACTIVATION OK' sysp-activation.log \
+            || { echo "::error::system-principal activation gate never reached its marker (a per-site-provenance regression or a skipped test)" >&2; exit 1; }
+          for mut in content_keyed skip_clear; do
+            if BOATRAMP_SYSPRINCIPAL_MUTATION="$mut" cargo-zigbuild test --target x86_64-unknown-linux-musl \
+              -p boatramp-core --features system-principal-gate-mutation \
+              --lib activation_principal_is_per_site_and_fail_closed > "sysp-activation-$mut.log" 2>&1; then
+              echo "::error::system-principal activation gate is HOLLOW — it passed under BOATRAMP_SYSPRINCIPAL_MUTATION=$mut (the deployer class is not actually bound per-(project,site)/id)" >&2
+              exit 1
+            else
+              echo "activation mutation verified: $mut turns the gate RED → the per-site/id binding is load-bearing."
+            fi
+          done
+
+      # (2) Seal positive-marker provenance: a durable signed-context is classed `system` ONLY by its
+      # positive signed `br_scope_kind=system` claim, NEVER inferred from a missing tenant. Needs
+      # `authz` (the COSE signer). Marker `SYSTEM PRINCIPAL SEAL OK`. Mutation
+      # `infer_system_from_missing_tenant` (a markerless/tenantless seal is promoted to System).
+      - name: "system-principal seal gate (positive marker, never inferred)"
+        run: |
+          set -eo pipefail
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-core --features authz \
+            --lib system_signed_context_is_positive_marker_only_and_tenant_free -- --nocapture 2>&1 | tee sysp-seal.log
+          grep -qE 'test result: ok\. 1 passed' sysp-seal.log \
+            || { echo "::error::system-principal seal gate did not run (silent skip or a failure)" >&2; exit 1; }
+          grep -q 'SYSTEM PRINCIPAL SEAL OK' sysp-seal.log \
+            || { echo "::error::system-principal seal gate never reached its marker (a seal-provenance regression or a skipped test)" >&2; exit 1; }
+          if BOATRAMP_SYSPRINCIPAL_MUTATION=infer_system_from_missing_tenant cargo-zigbuild test \
+            --target x86_64-unknown-linux-musl -p boatramp-core --features authz,system-principal-gate-mutation \
+            --lib system_signed_context_is_positive_marker_only_and_tenant_free > sysp-seal-mutation.log 2>&1; then
+            echo "::error::system-principal seal gate is HOLLOW — it passed under infer_system_from_missing_tenant (a markerless/tenantless seal is classed system — provenance by absence)" >&2
+            exit 1
+          else
+            echo "seal mutation verified: infer_system_from_missing_tenant turns the gate RED → the positive-marker precedence is load-bearing."
+          fi
+
+      # (3) P1 exact-issuer: `token_claims.system_when` confers system ONLY for an EXACTLY-named issuer
+      # (the single `issuer` or an `issuer_trust.allow` member), NEVER a `suffix`-matched/discovered one.
+      # Needs `handlers,oidc`. Marker `SYSTEM PRINCIPAL EXACT-ISSUER OK`. Mutation `skip_exact_issuer`
+      # (the backstop always passes → a suffix-trusted issuer mints the node-wide system principal).
+      - name: "system-principal P1 exact-issuer gate"
+        run: |
+          set -eo pipefail
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-server --features handlers,oidc \
+            --lib p1_system_when_with_a_non_exact_issuer_fails_closed -- --nocapture 2>&1 | tee sysp-p1.log
+          grep -qE 'test result: ok\. 1 passed' sysp-p1.log \
+            || { echo "::error::system-principal P1 exact-issuer gate did not run (silent skip or a failure)" >&2; exit 1; }
+          grep -q 'SYSTEM PRINCIPAL EXACT-ISSUER OK' sysp-p1.log \
+            || { echo "::error::system-principal P1 exact-issuer gate never reached its marker" >&2; exit 1; }
+          if BOATRAMP_SYSPRINCIPAL_MUTATION=skip_exact_issuer cargo-zigbuild test \
+            --target x86_64-unknown-linux-musl -p boatramp-server --features handlers,oidc,system-principal-gate-mutation \
+            --lib p1_system_when_with_a_non_exact_issuer_fails_closed > sysp-p1-mutation.log 2>&1; then
+            echo "::error::system-principal P1 gate is HOLLOW — it passed under skip_exact_issuer (a non-exact system issuer mints the system principal)" >&2
+            exit 1
+          else
+            echo "P1 mutation verified: skip_exact_issuer turns the gate RED → the exact-issuer backstop is load-bearing."
+          fi
+
+      # (4) Deploy-class derivation: the captured deployer class is System ONLY for a holder of the
+      # exact node-global `System·Admin` right; any other authorized deployer is Tenant. Needs
+      # `handlers,oidc`. Marker `SYSTEM PRINCIPAL DEPLOY-CLASS OK`. Mutation `deploy_class_any_is_system`
+      # (every authorized deployer classed System → a project-scoped admin's cron fires as system).
+      - name: "system-principal deploy-class gate (exact System·Admin)"
+        run: |
+          set -eo pipefail
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-server --features handlers,oidc \
+            --lib deploy_class_is_system_only_for_a_global_system_admin -- --nocapture 2>&1 | tee sysp-deploy.log
+          grep -qE 'test result: ok\. 1 passed' sysp-deploy.log \
+            || { echo "::error::system-principal deploy-class gate did not run (silent skip or a failure)" >&2; exit 1; }
+          grep -q 'SYSTEM PRINCIPAL DEPLOY-CLASS OK' sysp-deploy.log \
+            || { echo "::error::system-principal deploy-class gate never reached its marker" >&2; exit 1; }
+          if BOATRAMP_SYSPRINCIPAL_MUTATION=deploy_class_any_is_system cargo-zigbuild test \
+            --target x86_64-unknown-linux-musl -p boatramp-server --features handlers,oidc,system-principal-gate-mutation \
+            --lib deploy_class_is_system_only_for_a_global_system_admin > sysp-deploy-mutation.log 2>&1; then
+            echo "::error::system-principal deploy-class gate is HOLLOW — it passed under deploy_class_any_is_system (a non-System·Admin deployer is classed system)" >&2
+            exit 1
+          else
+            echo "deploy-class mutation verified: deploy_class_any_is_system turns the gate RED → the exact System·Admin predicate is load-bearing."
+          fi
+
   # BOATRAMP-HANDLERS test lane — closes the nightly-only blind spot. The wasm handler engine's unit
   # tests PLUS its `tests/serve.rs` integration surface (the request / consumer / invoke / graphql
   # dispatch paths, incl. the legible terminal-outcome taxonomy) ran ONLY in the nightly

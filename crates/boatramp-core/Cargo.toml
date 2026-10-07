@@ -68,6 +68,15 @@ claim-transform-gate-mutation = []
 # refusal) — turning the gate RED. Mirrors `claim-transform-gate-mutation`. Compiled OUT of every real
 # build (the seam also compiles under this crate's own `cfg(test)`).
 basewrite-gate-mutation = []
+# Anti-hollow gate lane for the first-class `system` principal (PLAN-system-principal). Lets a test
+# set `BOATRAMP_SYSPRINCIPAL_MUTATION` to disable ONE provenance invariant: in `DeployStore`,
+# `content_keyed` (drop the per-deployment-id binding on the activation-class record → the class is
+# mis-applicable across deployments, the cross-tenant escalation) or `skip_clear` (a non-system
+# activation leaves a stale System record → a prior capture survives); in the COSE verifier,
+# `infer_system_from_missing_tenant` (a markerless/tenantless seal is promoted to System → provenance
+# by absence, not the positive marker). Each turns a provenance gate RED. Compiled OUT of every real
+# build (the seams also compile under this crate's own `cfg(test)`).
+system-principal-gate-mutation = []
 
 [dependencies]
 # The shared, wasm-clean type + routing/config layer (re-exported below so

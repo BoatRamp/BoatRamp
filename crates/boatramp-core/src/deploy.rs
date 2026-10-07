@@ -3635,6 +3635,20 @@ impl DeployStore {
         self.activate_with_principal(project, site, id, None).await
     }
 
+    /// The active system-principal anti-hollow mutation (`BOATRAMP_SYSPRINCIPAL_MUTATION`), or `None`.
+    /// Present ONLY under `cfg(test)` or the `system-principal-gate-mutation` feature; a shipped build
+    /// has neither, so the activation-class record is ALWAYS id-bound + cleared-on-non-system and this
+    /// is a dead `None`.
+    #[cfg(any(test, feature = "system-principal-gate-mutation"))]
+    fn sysprincipal_mutation() -> Option<String> {
+        std::env::var("BOATRAMP_SYSPRINCIPAL_MUTATION").ok()
+    }
+    #[cfg(not(any(test, feature = "system-principal-gate-mutation")))]
+    #[inline]
+    fn sysprincipal_mutation() -> Option<String> {
+        None
+    }
+
     /// Like [`activate`](Self::activate), but also records the **class of the verified actor** who
     /// performed THIS activation (PLAN-system-principal P2) at
     /// [`current_principal`](keys::current_principal), atomically with the `current` pointer. This —
@@ -3668,18 +3682,34 @@ impl DeployStore {
         // write `system:<id>`; anything else ⇒ DELETE the record (fail closed), so this activation
         // never inherits a prior System capture.
         let principal_key = keys::current_principal(project, site);
-        let principal_op = match activator {
+        let mut batch = vec![WriteOp::Put(
+            keys::current(project, site),
+            id.as_bytes().to_vec(),
+        )];
+        match activator {
             Some(crate::tenancy::PrincipalKind::System) => {
-                WriteOp::Put(principal_key, format!("system:{id}").into_bytes())
+                // MUTATION SEAM (gate `content_keyed`): write a BARE `system` marker, dropping the
+                // per-deployment-id binding — reproducing the pre-N1 state where the class is
+                // mis-applicable across deployments (the cross-id/TOCTOU escalation). Compiled out of
+                // shipped builds; the gate then goes RED (an id-bound query matches a different id).
+                let val = if Self::sysprincipal_mutation().as_deref() == Some("content_keyed") {
+                    b"system".to_vec()
+                } else {
+                    format!("system:{id}").into_bytes()
+                };
+                batch.push(WriteOp::Put(principal_key, val));
             }
-            _ => WriteOp::Delete(principal_key),
-        };
-        self.kv
-            .write_batch(vec![
-                WriteOp::Put(keys::current(project, site), id.as_bytes().to_vec()),
-                principal_op,
-            ])
-            .await?;
+            _ => {
+                // MUTATION SEAM (gate `skip_clear`): a non-system activation OMITS the delete, leaving
+                // a prior System capture stale — the escalation where a Tenant re-activation inherits
+                // System. Compiled out of shipped builds; the gate then goes RED. Default: DELETE
+                // (fail closed) so this activation never inherits a prior System capture.
+                if Self::sysprincipal_mutation().as_deref() != Some("skip_clear") {
+                    batch.push(WriteOp::Delete(principal_key));
+                }
+            }
+        }
+        self.kv.write_batch(batch).await?;
 
         // Record the activation. Best-effort: `current` above is the source of
         // truth, so a history-write failure must not fail an activation that
@@ -3702,12 +3732,20 @@ impl DeployStore {
         site: &str,
         id: &str,
     ) -> Result<bool, DeployError> {
+        // MUTATION SEAM (gate `content_keyed`): check the BARE `system` marker, ignoring the id — the
+        // other half of dropping the id binding, so a System capture for ANY deployment satisfies a
+        // query for THIS id (the cross-id mis-application). Default: match `system:<id>` exactly.
+        let expected = if Self::sysprincipal_mutation().as_deref() == Some("content_keyed") {
+            b"system".to_vec()
+        } else {
+            format!("system:{id}").into_bytes()
+        };
         Ok(self
             .kv
             .get(&keys::current_principal(project, site))
             .await?
             .as_deref()
-            == Some(format!("system:{id}").as_bytes()))
+            == Some(expected.as_slice()))
     }
 
     /// Prepend `id` to `site`'s activation history, de-duplicating by id and
@@ -4796,6 +4834,10 @@ mod tests {
                 .unwrap(),
             "an un-activated site is never system"
         );
+        // CI anti-hollow marker (grepped by the mutation gate): reached ONLY when every assertion
+        // above held. Each `BOATRAMP_SYSPRINCIPAL_MUTATION` (`content_keyed` / `skip_clear`) turns one
+        // of them RED, so this line is never printed under a mutation.
+        println!("SYSTEM PRINCIPAL ACTIVATION OK");
     }
 
     #[tokio::test]

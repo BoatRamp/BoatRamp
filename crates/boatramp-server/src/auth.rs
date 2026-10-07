@@ -407,6 +407,13 @@ impl Auth {
         // `Action::Admin`) is the SYSTEM class; anything else is a `Tenant`-class deployer. This is a
         // pure read of already-verified authority — no second credential, no new trust. The caller
         // stashes it as a request extension so the deploy handler can capture it onto `DeployMeta`.
+        // MUTATION SEAM (gate `deploy_class_any_is_system`): classify EVERY authorized deployer as
+        // System, dropping the exact `System·Admin` predicate — so a project-scoped admin's
+        // `run_as: deployer` cron would fire as system. Compiled out of shipped builds; the gate then
+        // goes RED (a non-System·Admin deployer must classify as Tenant).
+        if sysprincipal_mutation().as_deref() == Some("deploy_class_any_is_system") {
+            return Ok(PrincipalKind::System);
+        }
         let system_admin = Right::new(Resource::System, None, Action::Admin);
         let kind = if compiled.authorize(&roles, &system_admin) {
             PrincipalKind::System
@@ -415,6 +422,20 @@ impl Auth {
         };
         Ok(kind)
     }
+}
+
+/// The active system-principal anti-hollow mutation (`BOATRAMP_SYSPRINCIPAL_MUTATION`), or `None`.
+/// Present ONLY under `cfg(test)` or the `system-principal-gate-mutation` feature; a shipped build has
+/// neither, so the deploy-class derivation keys ONLY on the exact `System·Admin` right and this is a
+/// dead `None`.
+#[cfg(any(test, feature = "system-principal-gate-mutation"))]
+fn sysprincipal_mutation() -> Option<String> {
+    std::env::var("BOATRAMP_SYSPRINCIPAL_MUTATION").ok()
+}
+#[cfg(not(any(test, feature = "system-principal-gate-mutation")))]
+#[inline]
+fn sysprincipal_mutation() -> Option<String> {
+    None
 }
 
 impl AuthInner {
@@ -921,6 +942,10 @@ mod tests {
             Some(PrincipalKind::Tenant),
             "an operator (System·Read, not System·Admin) is NOT the system class"
         );
+        // CI anti-hollow marker (grepped by the mutation gate): reached ONLY when the operator
+        // classified as Tenant. `BOATRAMP_SYSPRINCIPAL_MUTATION=deploy_class_any_is_system` classifies
+        // every authorized deployer as System → the operator assertion goes RED before this line.
+        println!("SYSTEM PRINCIPAL DEPLOY-CLASS OK");
     }
 
     #[tokio::test]
