@@ -33,3 +33,20 @@ pub fn short_id(id: &str) -> String {
         format!("{}…", &id[..12])
     }
 }
+
+/// A short, human byte size in binary units ("820 KiB", "1.5 MiB", "3.2 GiB").
+/// Sub-kibibyte values stay exact in bytes.
+pub fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}

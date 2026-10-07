@@ -14,6 +14,7 @@ mod hooks;
 mod logstream;
 mod maintenance;
 mod models;
+mod monitoring;
 mod observability;
 mod oidc;
 mod tokens;
@@ -22,14 +23,15 @@ mod widgets;
 
 pub use api::{ApiClient, ApiError, ApiResult};
 
-use auth::{use_session, AuthProvider, LoginView};
+use auth::{AuthProvider, LoginView, use_session};
 use config_editor::ConfigEditor;
 use dashboard::Dashboard;
 use deploy_ops::DeployOps;
-use hooks::{use_api, Fetch};
+use hooks::{Fetch, use_api};
 use maintenance::Maintenance;
 use models::{FunctionSummary, WhoAmI};
-use observability::{FunctionLogs, Metrics, SiteObservability};
+use monitoring::{Monitoring, NodeVersionBadge};
+use observability::{FunctionLogs, SiteObservability};
 use tokens::Tokens;
 use wasm_bindgen_futures::spawn_local;
 use widgets::{ErrorBanner, Spinner};
@@ -89,9 +91,9 @@ enum Route {
     /// API tokens + cache invalidation (admin-scoped).
     #[at("/tokens")]
     Tokens,
-    /// The Prometheus metrics dump (admin-scoped).
-    #[at("/metrics")]
-    Metrics,
+    /// Node-global monitoring: version, instance stats, blob/KV health, metrics.
+    #[at("/monitoring")]
+    Monitoring,
     /// Any unknown path redirects to the overview.
     #[not_found]
     #[at("/404")]
@@ -104,9 +106,9 @@ fn nav_group(route: &Route) -> u8 {
     match route {
         Route::Sites | Route::Site { .. } => 0,
         Route::Functions | Route::Function { .. } => 1,
-        Route::Maintenance => 2,
-        Route::Tokens => 3,
-        Route::Metrics => 4,
+        Route::Monitoring => 2,
+        Route::Maintenance => 3,
+        Route::Tokens => 4,
         Route::NotFound => 5,
     }
 }
@@ -118,9 +120,9 @@ fn switch(route: Route) -> Html {
         Route::Site { name } => html! { <SitePage name={name} /> },
         Route::Functions => html! { <FunctionsPage /> },
         Route::Function { name } => html! { <FunctionPage name={name} /> },
+        Route::Monitoring => html! { <Monitoring /> },
         Route::Maintenance => html! { <Maintenance /> },
         Route::Tokens => html! { <Tokens /> },
-        Route::Metrics => html! { <Metrics /> },
         Route::NotFound => html! { <Redirect<Route> to={Route::Sites} /> },
     }
 }
@@ -178,12 +180,13 @@ fn shell() -> Html {
                         <nav class="flex items-center gap-1">
                             <NavItem to={Route::Sites} label="Sites" />
                             <NavItem to={Route::Functions} label="Functions" />
+                            <NavItem to={Route::Monitoring} label="Monitoring" />
                             <NavItem to={Route::Maintenance} label="Maintenance" />
                             <NavItem to={Route::Tokens} label="Tokens" />
-                            <NavItem to={Route::Metrics} label="Metrics" />
                         </nav>
                     </div>
                     <div class="flex items-center gap-3">
+                        <NodeVersionBadge />
                         <Identity />
                         <button onclick={on_sign_out}
                                 class="rounded-md border border-slate-300 px-3 py-1.5 text-sm \

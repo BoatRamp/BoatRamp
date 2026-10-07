@@ -5,6 +5,29 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.15.0] - 2026-10-07
+
+Web **console alignment (stage 1 of a staged series)** — bringing the embedded management console
+(`--features console`) back in step with the control-plane API it had drifted behind. This stage
+adds node-global monitoring.
+
+- **New "Monitoring" page** (admin, read-only, `System·Read` node-global) surfacing operator signals
+  that previously had no home in the console:
+  - **Wasm instances** (`GET /api/instance-stats`): per-lane (request / consumer / session) warm /
+    cold-miss / eviction / instantiation counts, instantiate + cold-compile durations, the resident
+    warm set vs capacity, in-flight vs ceiling, and process RSS vs the per-instance limit — the
+    v0.14.0 observability, now visible in the UI. (Shown as "not available" when the server is built
+    without the `handlers` feature.)
+  - **Blob storage** (`GET /api/blob-status`): whether a read-fallback secondary is attached
+    (a blob migration in progress).
+  - **Control-plane KV** (`GET /api/kv-status`): health state (ok / degraded / recovered) + detail.
+  - the Prometheus **metrics** dump, folded in from the old standalone tab.
+- **Node-version badge** in the header (`GET /api/version`) — which build is actually running.
+- The console crate + its lockfile are **re-aligned to the workspace version** (they had drifted at
+  0.4.24); no functional change elsewhere.
+
+Console-only; no server code, WIT, or shim change (the SPA is baked into the server binary at build).
+
 ## [0.14.0] - 2026-10-07
 
 Node wasm **instance-lifecycle + memory observability**, plus the serve-path latency fix it
