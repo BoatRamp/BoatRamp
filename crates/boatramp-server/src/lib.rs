@@ -1249,6 +1249,7 @@ impl HandlerRuntime {
         self.inner.as_ref().map(|i| i.engine.instance_stats())
     }
 
+    #[cfg(feature = "handlers")]
     pub async fn async_shard_stats(&self, deploy: &DeployStore) -> Option<AsyncShardStats> {
         use std::sync::atomic::Ordering;
         let inner = self.inner.as_ref()?;

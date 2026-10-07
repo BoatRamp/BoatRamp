@@ -1395,6 +1395,14 @@ pub struct HandlersConfig {
     /// instantiation at the cost of a large up-front virtual-memory reservation.
     /// Off by default — opt in and benchmark for your workload.
     pub pooling: bool,
+    /// Capacity of the per-lane **warm compile cache** — how many distinct compiled+linked components
+    /// (keyed by content hash) stay resident per lane (request / consumer / session). A component
+    /// evicted here (LRU, once the node serves more than this many distinct components on a lane) pays
+    /// a cold cranelift recompile on its next request. Absent ⇒ 64 (the historical default). Raise it
+    /// on a node that serves more than ~64 components so none is evicted; the `/api/instance-stats`
+    /// surface reports `warm_capacity` + `evictions` so the right value is measured, not guessed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_cache_size: Option<usize>,
     /// Engine-wide **safety max** on a *connection-bearing* invocation (a site
     /// handler or a synchronous function/webhook invoke), milliseconds. A route
     /// or function may declare a *lower* timeout, never a higher one. Kept tight
