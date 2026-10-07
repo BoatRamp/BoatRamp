@@ -747,7 +747,7 @@ impl DeployStore {
 
     /// Store a manifest (idempotent) and return its deployment id.
     pub async fn put_manifest(&self, manifest: &Manifest) -> Result<String, DeployError> {
-        self.put_manifest_with(manifest, DeployMetaInput::default())
+        self.put_manifest_with(manifest, DeployMetaInput::default(), None)
             .await
     }
 
@@ -762,6 +762,7 @@ impl DeployStore {
         &self,
         manifest: &Manifest,
         input: DeployMetaInput,
+        deploy_principal: Option<crate::tenancy::PrincipalKind>,
     ) -> Result<String, DeployError> {
         let id = manifest.id()?;
 
@@ -800,6 +801,12 @@ impl DeployStore {
             } else {
                 input.tags
             },
+            // Server-derived deployer class (PLAN-system-principal P2): OVERWRITTEN on every deploy,
+            // NEVER merged with the prior record. The meta is keyed by the manifest CONTENT id, so
+            // merging would let a NON-system deployer re-deploy byte-identical content (same
+            // `run_as: deployer` cron) and inherit a prior System capture — a privilege escalation.
+            // Overwriting makes a non-system re-deploy fail the cron closed. `None` ⇒ not captured.
+            deploy_principal,
         };
         self.kv
             .write_batch(vec![
@@ -6505,6 +6512,7 @@ mod tests {
                     message: Some("first".into()),
                     ..Default::default()
                 },
+                None,
             )
             .await
             .unwrap();
@@ -6516,13 +6524,41 @@ mod tests {
 
         // Re-store with empty input preserves created_at and prior provenance.
         store
-            .put_manifest_with(&manifest, DeployMetaInput::default())
+            .put_manifest_with(&manifest, DeployMetaInput::default(), None)
             .await
             .unwrap();
         let meta = store.get_meta(&id).await.unwrap().unwrap();
         assert_eq!(meta.created_at, created);
         assert_eq!(meta.source.as_deref(), Some("abc123"));
         assert_eq!(meta.message.as_deref(), Some("first"));
+        assert_eq!(meta.deploy_principal, None, "no class captured yet");
+
+        // PLAN-system-principal P2: the deployer class is OVERWRITTEN (never merged) on re-deploy —
+        // the escalation guard. A System capture appears, and a later re-deploy that captures no class
+        // (or a non-system one) clears it, so a non-system re-deploy of identical content can never
+        // inherit a prior System capture.
+        store
+            .put_manifest_with(
+                &manifest,
+                DeployMetaInput::default(),
+                Some(crate::tenancy::PrincipalKind::System),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get_meta(&id).await.unwrap().unwrap().deploy_principal,
+            Some(crate::tenancy::PrincipalKind::System),
+            "a system deployer's class is captured (overwriting the prior None)"
+        );
+        store
+            .put_manifest_with(&manifest, DeployMetaInput::default(), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get_meta(&id).await.unwrap().unwrap().deploy_principal,
+            None,
+            "a re-deploy with no captured class OVERWRITES (never merges) the prior System capture"
+        );
     }
 
     #[tokio::test]

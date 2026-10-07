@@ -802,6 +802,17 @@ pub struct CronConfig {
     /// Overlap policy when a previous run is still in flight.
     #[serde(default)]
     pub overlap: Overlap,
+    /// Which principal this cron fires as (PLAN-system-principal P2). Default
+    /// [`CronRunAs::Unauthenticated`] — today's behavior, an anonymous trigger with no principal.
+    /// [`CronRunAs::Deployer`] fires as the principal captured from the VERIFIED deployer at deploy
+    /// time (stored server-side on [`crate::deploy::DeployMeta::deploy_principal`], never
+    /// client-supplied): a deployer who held the node-global `System·Admin` right ⇒ the system
+    /// principal (base-row writes + a system `signed_context` on `emit`), which is how a self-service
+    /// cron producer stamps a resolvable context for its downstream consumer. A `deployer` cron whose
+    /// captured principal is NOT system is **refused at fire time** (fail closed) — a deploy identity
+    /// carries no in-site tenant, so there is no tenant for it to run as.
+    #[serde(default, skip_serializing_if = "CronRunAs::is_default")]
+    pub run_as: CronRunAs,
 }
 
 /// Cron overlap policy.
@@ -812,6 +823,27 @@ pub enum Overlap {
     Skip,
     /// Allow concurrent invocations.
     Allow,
+}
+
+/// Which principal a [`CronConfig`] fires as (PLAN-system-principal P2).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CronRunAs {
+    /// Anonymous trigger, no principal (today's behavior; an `own`-scoped handler fails closed).
+    #[default]
+    Unauthenticated,
+    /// Fire as the VERIFIED deployer's captured principal — honored only when that principal is the
+    /// system class (a `System·Admin` deployer); refused at fire time otherwise.
+    Deployer,
+}
+
+impl CronRunAs {
+    /// Whether this is the default ([`Unauthenticated`](Self::Unauthenticated)) — for
+    /// `skip_serializing_if`, so a pre-P2 config round-trips byte-identically.
+    #[must_use]
+    pub fn is_default(&self) -> bool {
+        matches!(self, Self::Unauthenticated)
+    }
 }
 
 /// A host-level SSE (or WebSocket) endpoint fanning out messaging topics.

@@ -19,11 +19,12 @@ use axum::http::{HeaderName, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 
-use boatramp_core::authz::{self, AuthzPolicy, Right};
+use boatramp_core::authz::{self, Action, AuthzPolicy, Resource, Right};
 use boatramp_core::cache_coherence::AuthzFence;
 use boatramp_core::cedar::CompiledCedar;
 use boatramp_core::cose::{self, POP_MAX_BODY_HASH_BYTES, PopClaims, TokenError, TokenPublicKey};
 use boatramp_core::kv::{KvError, KvStore};
+use boatramp_core::tenancy::PrincipalKind;
 
 /// The header carrying a per-request proof-of-possession (base64url `COSE_Sign1`),
 /// signed by the token's holder (`cnf`) key. Lower-case per HTTP/2 conventions.
@@ -326,7 +327,7 @@ impl Auth {
         path: &str,
         pop_proof: Option<&str>,
         body_hash: Option<String>,
-    ) -> Result<(), Reject> {
+    ) -> Result<PrincipalKind, Reject> {
         let inner = self
             .inner
             .as_ref()
@@ -334,7 +335,7 @@ impl Auth {
         // Endpoints not gated by a right (the OIDC→token exchange) authenticate
         // by other means; the router still requires *some* bearer to reach here.
         let Some(required) = Right::required(method, path) else {
-            return Ok(());
+            return Ok(PrincipalKind::Tenant);
         };
         let now = now_unix();
         // A control-plane WRITE confirms its authz against the live store (never a stale cache) in
@@ -395,13 +396,24 @@ impl Auth {
         // project) so a site name minted before the project re-keying still authorizes
         // its now project-qualified route.
         let roles = policy.normalize_grants(&verified.roles);
-        if compiled.authorize(&roles, &required) {
-            Ok(())
-        } else {
-            Err(Reject::forbidden(
+        if !compiled.authorize(&roles, &required) {
+            return Err(Reject::forbidden(
                 "token not authorized for this resource\n",
-            ))
+            ));
         }
+        // PLAN-system-principal P2 — derive the deployer's CLASS from the SAME verified, normalized
+        // grants and the SAME compiled policy that just authorized the request: a token that
+        // satisfies the node-global `System·Admin` right (`Resource::System`, no project scope,
+        // `Action::Admin`) is the SYSTEM class; anything else is a `Tenant`-class deployer. This is a
+        // pure read of already-verified authority — no second credential, no new trust. The caller
+        // stashes it as a request extension so the deploy handler can capture it onto `DeployMeta`.
+        let system_admin = Right::new(Resource::System, None, Action::Admin);
+        let kind = if compiled.authorize(&roles, &system_admin) {
+            PrincipalKind::System
+        } else {
+            PrincipalKind::Tenant
+        };
+        Ok(kind)
     }
 }
 
@@ -706,10 +718,24 @@ pub async fn require_auth(State(auth): State<Auth>, request: Request, next: Next
         .authorize(&bearer, &method, &path, pop_proof.as_deref(), body_hash)
         .await
     {
-        Ok(()) => next.run(request).await,
+        Ok(kind) => {
+            // PLAN-system-principal P2: stash the SERVER-DERIVED deployer class as a request extension
+            // for the deploy handler to capture onto `DeployMeta`. A client can neither set nor read
+            // it (it is computed here from the verified rights, after authorization passed).
+            let mut request = request;
+            request.extensions_mut().insert(VerifiedDeployClass(kind));
+            next.run(request).await
+        }
         Err(reject) => reject.into_response(),
     }
 }
+
+/// The verified deployer's principal class (PLAN-system-principal P2), derived in [`require_auth`]
+/// from the authorized token's rights and carried as a request extension so a deploy handler can
+/// record it on [`boatramp_core::deploy::DeployMeta`]. SERVER-DERIVED and server-only — never
+/// client-settable. Absent when auth is disabled (dev), so a deploy then captures no class.
+#[derive(Debug, Clone, Copy)]
+pub struct VerifiedDeployClass(pub PrincipalKind);
 
 /// Buffer a write request's body (when its declared length fits the PoP hash
 /// bound) so the auth layer can bind its hash, reconstructing the request from the
@@ -854,6 +880,46 @@ mod tests {
         assert!(
             auth.verify_bearer(&primary_token).await,
             "primary still valid"
+        );
+    }
+
+    #[tokio::test]
+    async fn deploy_class_is_system_only_for_a_global_system_admin() {
+        // PLAN-system-principal P2: `authorize` returns the deployer CLASS, derived from the SAME
+        // verified, normalized grants. A global `admin` (⇒ the node-global System·Admin right) is the
+        // System class; a project-scoped admin authorizes its own project but is NOT system.
+        let root = holder();
+        let auth = auth_with(&root, false);
+        let now = now_unix();
+
+        let admin = cose::mint(&admin_claims(now), &root).await.unwrap();
+        assert_eq!(
+            auth.authorize(&admin, "GET", PATH, None, None).await.ok(),
+            Some(PrincipalKind::System),
+            "a global System·Admin deployer is captured as the system class"
+        );
+
+        // An `operator` holds node-level System·Read (so it authorizes this gated GET) but NOT the
+        // node-global System·Admin — a non-system deployer. A scoped `admin` would NOT work here: the
+        // default policy's `admin` role carries an unguarded (AnyTarget) System·Admin permit, so the
+        // grant's scope attribute does not restrict it — holding `admin` at all IS system.
+        let operator = cose::mint(
+            &Claims {
+                roles: vec![GrantedRole::global("operator")],
+                kind: "role".into(),
+                ttl_secs: Some(3600),
+                now_unix: now,
+            },
+            &root,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            auth.authorize(&operator, "GET", PATH, None, None)
+                .await
+                .ok(),
+            Some(PrincipalKind::Tenant),
+            "an operator (System·Read, not System·Admin) is NOT the system class"
         );
     }
 

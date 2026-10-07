@@ -55,10 +55,17 @@ pub(super) async fn create_deployment(
     State(deploy): State<DeployStore>,
     Path(_site): Path<String>,
     Query(meta): Query<DeployMetaQuery>,
+    // PLAN-system-principal P2: the SERVER-DERIVED deployer class stashed by `require_auth`. Optional
+    // because auth may be disabled (dev) — then no class is captured. A non-body extractor, so it
+    // precedes the body-consuming `Json`. The client cannot supply this.
+    deploy_class: Option<Extension<crate::auth::VerifiedDeployClass>>,
     Json(manifest): Json<Manifest>,
 ) -> Response {
+    let deploy_principal = deploy_class.map(|Extension(c)| c.0);
     let result = async {
-        let id = deploy.put_manifest_with(&manifest, meta.into()).await?;
+        let id = deploy
+            .put_manifest_with(&manifest, meta.into(), deploy_principal)
+            .await?;
         let missing = deploy.missing_blobs(&manifest).await?;
         Ok::<_, DeployError>((id, missing))
     }

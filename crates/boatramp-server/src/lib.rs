@@ -6967,6 +6967,7 @@ mod tests {
                     schedule: "* * * * *".into(),
                     route: "/".into(),
                     overlap: Overlap::Skip,
+                    run_as: boatramp_core::config::CronRunAs::Unauthenticated,
                 }],
                 ..Default::default()
             },
@@ -7138,6 +7139,7 @@ mod tests {
                     schedule: "* * * * *".into(),
                     route: "/".into(),
                     overlap: Overlap::Skip,
+                    run_as: boatramp_core::config::CronRunAs::Unauthenticated,
                 }],
                 ..Default::default()
             },
