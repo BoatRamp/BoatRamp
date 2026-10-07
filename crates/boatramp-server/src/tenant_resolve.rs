@@ -438,12 +438,37 @@ fn resolve_session_fact(inputs: &TenantSourceInputs<'_>) -> Option<boatramp_core
 /// family-trusted issuer.
 #[cfg(feature = "oidc")]
 fn system_when_issuer_is_exact_trusted(cfg: &HandlerGraphqlTokenClaims, issuer: &str) -> bool {
+    // MUTATION SEAM (gate `skip_exact_issuer`): the S0 backstop always passes, so a `suffix`-trusted
+    // (not exactly-listed) issuer can mint the node-wide system principal. Compiled out of shipped
+    // builds; the gate then goes RED (a non-exact system issuer must fail the whole source closed).
+    if sysprincipal_mutation().as_deref() == Some("skip_exact_issuer") {
+        return true;
+    }
     if !cfg.issuer.is_empty() && cfg.issuer == issuer {
         return true;
     }
     cfg.issuer_trust
         .as_ref()
         .is_some_and(|t| t.allow.iter().any(|a| a == issuer))
+}
+
+/// The active system-principal anti-hollow mutation (`BOATRAMP_SYSPRINCIPAL_MUTATION`), or `None`.
+/// Present ONLY under `cfg(test)` or the `system-principal-gate-mutation` feature; a shipped build has
+/// neither, so the S0 exact-issuer backstop is unconditional and this is a dead `None`.
+#[cfg(all(
+    feature = "oidc",
+    any(test, feature = "system-principal-gate-mutation")
+))]
+fn sysprincipal_mutation() -> Option<String> {
+    std::env::var("BOATRAMP_SYSPRINCIPAL_MUTATION").ok()
+}
+#[cfg(all(
+    feature = "oidc",
+    not(any(test, feature = "system-principal-gate-mutation"))
+))]
+#[inline]
+fn sysprincipal_mutation() -> Option<String> {
+    None
 }
 
 /// Resolve the principal from a single verified source — a tenant value or the typed `System` class.
@@ -837,6 +862,10 @@ mod tests {
             ht.value().is_none() && ht.facts().is_empty(),
             "the tainted source resolves NO principal — never degrading to a tenant (fail closed)"
         );
+        // CI anti-hollow marker (grepped by the mutation gate): reached ONLY when a non-exact system
+        // issuer was refused. `BOATRAMP_SYSPRINCIPAL_MUTATION=skip_exact_issuer` makes the backstop pass
+        // → this token confers system → `!ht.is_system()` goes RED before this line.
+        println!("SYSTEM PRINCIPAL EXACT-ISSUER OK");
     }
 
     /// Mix backstop: a `system_when` token source mixed with ANY other tenant-producing source

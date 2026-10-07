@@ -1055,6 +1055,20 @@ pub async fn mint_system_context(
 /// Both [`verify_context`] (tenant-only) and [`verify_context_full`] project from this so the
 /// verify/expiry/kind checks are identical. The persona is read defensively — a single bounded text
 /// claim, else dropped (never a panic on a hostile/corrupt token), mirroring `cbor_to_app_context`.
+/// The active system-principal anti-hollow mutation (`BOATRAMP_SYSPRINCIPAL_MUTATION`), or `None`.
+/// Present ONLY under `cfg(test)` or the `system-principal-gate-mutation` feature; a shipped build has
+/// neither, so [`verify_context_inner`] recognizes System ONLY by the positive signed marker and this
+/// is a dead `None`.
+#[cfg(any(test, feature = "system-principal-gate-mutation"))]
+fn sysseal_mutation() -> Option<String> {
+    std::env::var("BOATRAMP_SYSPRINCIPAL_MUTATION").ok()
+}
+#[cfg(not(any(test, feature = "system-principal-gate-mutation")))]
+#[inline]
+fn sysseal_mutation() -> Option<String> {
+    None
+}
+
 fn verify_context_inner(
     token: &str,
     public: &TokenPublicKey,
@@ -1107,6 +1121,19 @@ fn verify_context_inner(
             "signed context has an unknown scope kind: {other}"
         ))),
         None => {
+            // MUTATION SEAM (gate `infer_system_from_missing_tenant`): promote a seal with NO positive
+            // marker and NO tenant to System — provenance by ABSENCE, the exact landmine this
+            // precedence forbids. Compiled out of shipped builds; the gate then goes RED (a
+            // markerless/tenantless seal must be REJECTED, never classed System).
+            if ctx.is_none()
+                && sysseal_mutation().as_deref() == Some("infer_system_from_missing_tenant")
+            {
+                return Ok(VerifiedContext {
+                    kind: crate::tenancy::PrincipalKind::System,
+                    tenant: None,
+                    persona,
+                });
+            }
             let tenant =
                 ctx.ok_or_else(|| TokenError::Claims("signed context has no tenant".into()))?;
             Ok(VerifiedContext {
@@ -2268,6 +2295,10 @@ mod tests {
             verify_context_full(&unknown, &pubkey, 1000).is_err(),
             "an unknown scope kind must be rejected"
         );
+        // CI anti-hollow marker (grepped by the mutation gate): reached ONLY when every reject fork
+        // above held. `BOATRAMP_SYSPRINCIPAL_MUTATION=infer_system_from_missing_tenant` promotes the
+        // markerless/tenantless seal to System, turning the `neither` assertion RED before this line.
+        println!("SYSTEM PRINCIPAL SEAL OK");
     }
 
     #[tokio::test]
