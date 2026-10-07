@@ -464,6 +464,8 @@ pub(super) async fn dispatch_handler(
         handler.token_claims.as_ref(),
         // Synchronous request lane — no durable signed-context envelope.
         None,
+        // The request/handler lane never fires as system (that is only a cron `run_as: deployer`).
+        false,
     )
     .await
     {
@@ -1680,6 +1682,11 @@ pub(super) async fn build_bindings(
     // (host-verified against the fleet anchor, guest-blind). `None` on every synchronous request/
     // handler path (that lane carries no envelope) — passed per-message by the consumer dispatch.
     signed_context: Option<&str>,
+    // PLAN-system-principal P2/P3: fire this invocation as the SYSTEM principal — coerce the resolved
+    // (non-target) tenancy to the system class and seal a system `signed_context` on `emit`. Set `true`
+    // ONLY by `fire_cron` for a `run_as: deployer` cron whose captured deployer was a System·Admin
+    // (the sole provenance-verified system source on this path); `false` on every other call.
+    run_as_system: bool,
 ) -> Result<boatramp_handlers::Bindings, BindingsError> {
     let granted = |name: &str| {
         imports.iter().any(|i| i == name) && site_handlers.allow_imports.iter().any(|a| a == name)
@@ -1726,7 +1733,7 @@ pub(super) async fn build_bindings(
     // A sql/orm importer that declares no tenancy is refused under the strict posture (Dimension
     // 0); an `all` grant is capped to `own` unless the posture opens cross-tenant access. The
     // resolved value is carried into the `invoke` binding below so a sibling inherits it.
-    let handler_caller_tenant = {
+    let (handler_caller_tenant, handler_caller_kind) = {
         let imports_db = !granted_sql_databases(imports, &site_handlers.allow_imports).is_empty();
         // Security HIGH-1: `wasi:blobstore` carries per-tenant blob assets ⇒ it is a tenant-scoped
         // DATA capability like sql/orm, so a blob-importing handler on a multi-tenant posture must
@@ -1946,10 +1953,36 @@ pub(super) async fn build_bindings(
                 .map(|h| h.with_schema(schema.as_ref()))
             }
         };
+        // PLAN-system-principal P2/P3: a `run_as: deployer` cron whose captured deployer was a
+        // System·Admin fires as the SYSTEM principal. Coerce the resolved (non-target) tenancy to the
+        // system class — base/`IS NULL`, `app.principal_kind='system'`, no tenant GUC — so the cron
+        // handler's own SQL base-writes; a handler that declared NO tenancy keeps `None` (plain SQL).
+        // A target route is left untouched (its confinement is its own safe behavior). The emit CLASS
+        // below is forced to System regardless, so the handler's `emit` seals a system `signed_context`
+        // for a downstream `signed_context` consumer (construens' worker). `run_as_system` is only ever
+        // `true` on a cron fire whose deployer capture was System (set in `fire_cron`).
+        let tenancy = if run_as_system {
+            tenancy.map(|h| if h.is_target() { h } else { h.coerce_system() })
+        } else {
+            tenancy
+        };
         bindings = bindings.with_tenancy(tenancy.clone());
+        // The resolved principal's CLASS (PLAN-system-principal P3): a SYSTEM handler seals a system
+        // `signed_context` on `emit`. Default `Tenant` for an unscoped handler, unchanged.
+        let kind = if run_as_system {
+            boatramp_core::tenancy::PrincipalKind::System
+        } else {
+            tenancy
+                .as_ref()
+                .map(boatramp_handlers::HostTenancy::principal_kind)
+                .unwrap_or_default()
+        };
         // Carry the resolved principal (axis-tagged facts) so a sibling this handler invokes
         // inherits it (each fact keeps its axis).
-        tenancy.map(|h| h.facts().to_vec()).unwrap_or_default()
+        (
+            tenancy.map(|h| h.facts().to_vec()).unwrap_or_default(),
+            kind,
+        )
     };
     // `wasi:blobstore` (REORDERED to here, post tenant-resolution): the host-side tenant confinement
     // (`blobstore.rs::container_prefix`) needs THIS invocation's resolved OWN tenant to expand a
@@ -2019,8 +2052,12 @@ pub(super) async fn build_bindings(
             // Stamp this handler's resolved own-tenant onto every message it publishes (R1,
             // guest-blind), so a consumer declaring `sources: [signed_context]` resolves it on the
             // async lane. `None` for an unscoped handler ⇒ the message carries no context.
-            let signed_context =
-                super::function_runtime::mint_producer_context(inner, &handler_caller_tenant).await;
+            let signed_context = super::function_runtime::mint_producer_context(
+                inner,
+                &handler_caller_tenant,
+                handler_caller_kind,
+            )
+            .await;
             bindings = bindings.with_messaging(
                 format!("{scope}/"),
                 format!("{}/", project.qualified("bus")),
@@ -2752,6 +2789,9 @@ impl ConsumerRebuild<'_> {
             self.tenancy,
             self.token_claims,
             signed_context,
+            // A consumer resolves the system class from the drained seal (`signed_context`), never a
+            // cron flag — so it is never a `run_as_system` fire itself.
+            false,
         )
         .await
         // The async lane has no HTTP response to 503 — a consumer nacks on any bindings failure

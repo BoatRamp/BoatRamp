@@ -7307,6 +7307,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    false,
                 )
                 .await
                 .expect("no secrets → resolves")
@@ -7447,6 +7448,7 @@ mod tests {
                 None,
                 None,
                 None,
+                false,
             )
             .await;
             (r, fake.calls.load(Ordering::SeqCst))
