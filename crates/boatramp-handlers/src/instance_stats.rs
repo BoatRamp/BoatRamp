@@ -202,10 +202,18 @@ pub struct InstanceStatsSnapshot {
 pub fn process_rss_bytes() -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
-        let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
-        let resident_pages: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
-        let page_size = 4096u64; // Linux default; good enough for an operator headroom view.
-        Some(resident_pages * page_size)
+        // Read `VmRSS: N kB` from `/proc/self/status` — already in kB, so no page-size assumption
+        // (the old `/proc/self/statm` pages × 4096 mis-scaled 4–16× on 16K/64K-page hosts, e.g. some
+        // ARM64 — exactly the memory-headroom view this must get right). `None` on any parse miss.
+        let status = std::fs::read_to_string("/proc/self/status").ok()?;
+        let kib: u64 = status
+            .lines()
+            .find_map(|l| l.strip_prefix("VmRSS:"))?
+            .split_whitespace()
+            .next()?
+            .parse()
+            .ok()?;
+        Some(kib * 1024)
     }
     #[cfg(not(target_os = "linux"))]
     {
