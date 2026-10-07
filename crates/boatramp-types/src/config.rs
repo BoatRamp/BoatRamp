@@ -1253,6 +1253,48 @@ pub struct HandlerGraphqlTokenClaims {
     /// field or any request input.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub jwks: Option<JwksDiscovery>,
+    /// **Operator opt-in: a verified first-party token maps to the SYSTEM principal** (no tenant),
+    /// not a tenant (PLAN-system-principal P1). Deny-by-default — set this ONLY to let a named,
+    /// first-party admin IdP mint the node-wide system principal (base-row `IS NULL` writes +
+    /// `app.principal_kind='system'`), retiring the `tid="platform"` sentinel. When a token verifies
+    /// AND its `iss` is EXACTLY [`SystemWhen::issuer`] AND its [`SystemWhen::claim`] equals
+    /// [`SystemWhen::equals`], the resolved principal is **System** (a typed class — never a tenant
+    /// value). Every *other* token on the same source still resolves a tenant exactly as before; an
+    /// absent/invalid/wrong-issuer/wrong-claim token confers **no** system (it is denied, or resolves
+    /// a tenant, unchanged). Mere absence of a tenant NEVER confers system.
+    ///
+    /// **S0 (load-bearing):** [`SystemWhen::issuer`] must be an EXACT, operator-named issuer — the
+    /// single [`issuer`](Self::issuer), or a member of [`IssuerTrust::allow`]. It can NEVER be
+    /// satisfied by [`IssuerTrust::suffix`] (a *family* of orgs) or by discovery: a suffix-trusted or
+    /// discovered issuer may confer a tenant, never the node-wide system class. Enforced at apply
+    /// ([`validate`](Self::validate)) and re-checked by a runtime backstop before system is conferred.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_when: Option<SystemWhen>,
+}
+
+fn default_role_claim() -> String {
+    "role".to_string()
+}
+
+/// Operator policy mapping a verified first-party token to the **SYSTEM principal**
+/// ([`HandlerGraphqlTokenClaims::system_when`]). Deny-by-default and provenance-bound: it fires only
+/// for a token that fully verifies against an EXACT, operator-named issuer and carries the named
+/// claim value. It confers a typed class, never a tenant key.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SystemWhen {
+    /// The EXACT issuer (`iss`, full `https://…`) permitted to mint the system principal. Apply-time
+    /// it MUST equal the single [`issuer`](HandlerGraphqlTokenClaims::issuer) or be one of
+    /// [`IssuerTrust::allow`]; it may NEVER be a value matched only by [`IssuerTrust::suffix`] or
+    /// reached by discovery (S0). Compared by exact equality to the *verified* `iss` at resolution.
+    pub issuer: String,
+    /// The verified claim whose value gates system (default `role`). Read only from the fully
+    /// verified token.
+    #[serde(default = "default_role_claim")]
+    pub claim: String,
+    /// The exact string value [`claim`](Self::claim) must equal to confer system. A non-string or
+    /// unequal claim confers no system (the token then resolves a tenant, or is denied, unchanged).
+    pub equals: String,
 }
 
 /// A **trusted-issuer policy** for [`HandlerGraphqlTokenClaims::issuer_trust`]: an explicit
@@ -1324,6 +1366,44 @@ impl HandlerGraphqlTokenClaims {
                 "token_claims: the single-issuer form (issuer/jwks_url/jwks_env) and the \
                  multi-issuer form (issuer_trust/jwks) are mutually exclusive — set one",
             ));
+        }
+        // S0 (PLAN-system-principal): `system_when` may confer the node-wide system class ONLY for an
+        // EXACT, operator-named issuer — the single `issuer`, or a member of `issuer_trust.allow`.
+        // NEVER one matched only by `issuer_trust.suffix` (a *family* of orgs) or reached by discovery.
+        // Validated for BOTH forms here, ahead of either early return; a runtime backstop re-checks the
+        // exact match before conferring system, so a control-plane deploy that bypassed apply is covered.
+        if let Some(sw) = &self.system_when {
+            if sw.issuer.is_empty() {
+                return Err(ConfigError::parse(
+                    "token_claims.system_when.issuer: set the EXACT first-party issuer permitted to \
+                     mint the system principal",
+                ));
+            }
+            if sw.claim.is_empty() {
+                return Err(ConfigError::parse(
+                    "token_claims.system_when.claim: must be a non-empty claim name",
+                ));
+            }
+            if sw.equals.is_empty() {
+                return Err(ConfigError::parse(
+                    "token_claims.system_when.equals: set the exact claim value that confers system",
+                ));
+            }
+            let exact_ok = if multi {
+                self.issuer_trust
+                    .as_ref()
+                    .is_some_and(|t| t.allow.iter().any(|a| a == &sw.issuer))
+            } else {
+                !self.issuer.is_empty() && self.issuer == sw.issuer
+            };
+            if !exact_ok {
+                return Err(ConfigError::parse(format!(
+                    "token_claims.system_when.issuer {:?} must be an EXACT trusted issuer — the \
+                     single `issuer`, or a member of `issuer_trust.allow`. A `suffix`-matched or \
+                     discovered issuer may NEVER mint the node-wide system principal (S0)",
+                    sw.issuer
+                )));
+            }
         }
         if !multi {
             return Ok(());
@@ -2215,5 +2295,90 @@ mod tests {
         assert_eq!(SiteConfig::default().version, 1);
         // A version-less stored SiteConfig still reads as v1.
         assert_eq!(SiteConfig::from_json(b"{}").unwrap().version, 1);
+    }
+
+    #[test]
+    fn system_when_requires_an_exact_trusted_issuer_s0() {
+        // PLAN-system-principal S0: `system_when` may confer the node-wide system class ONLY for an
+        // EXACT, operator-named issuer. Prove every acceptance/refusal fork of the apply-time guard.
+        let sw = |iss: &str| SystemWhen {
+            issuer: iss.into(),
+            claim: "role".into(),
+            equals: "super_admin".into(),
+        };
+
+        // Single-issuer form: system_when.issuer must equal the single `issuer` exactly.
+        let mut single = HandlerGraphqlTokenClaims {
+            issuer: "https://admin.acme.example".into(),
+            jwks_env: Some("ADMIN_JWKS".into()),
+            system_when: Some(sw("https://admin.acme.example")),
+            ..Default::default()
+        };
+        single
+            .validate()
+            .expect("exact single issuer confers system");
+        // A different issuer than the single one is refused.
+        single.system_when = Some(sw("https://other.example"));
+        assert!(
+            single.validate().is_err(),
+            "non-matching single issuer must be refused"
+        );
+
+        // Multi-issuer form: only a member of `issuer_trust.allow` — NEVER a `suffix`-matched issuer.
+        let multi = |iss: &str| HandlerGraphqlTokenClaims {
+            issuer_trust: Some(IssuerTrust {
+                allow: vec!["https://admin.acme.example".into()],
+                suffix: Some(".my.salesforce.com".into()),
+            }),
+            jwks: Some(JwksDiscovery {
+                template: Some("{iss}/id/keys".into()),
+                ..Default::default()
+            }),
+            system_when: Some(sw(iss)),
+            ..Default::default()
+        };
+        multi("https://admin.acme.example")
+            .validate()
+            .expect("an issuer in `allow` confers system");
+        // S0 the load-bearing refusal: a suffix-covered issuer is trusted for a TENANT but can never
+        // mint system, even though it would pass the suffix policy at verify time.
+        assert!(
+            multi("https://evilorg.my.salesforce.com")
+                .validate()
+                .is_err(),
+            "a suffix-matched issuer must NEVER be allowed to mint the system principal (S0)"
+        );
+        // Empty issuer / empty equals are refused.
+        let mut bad = multi("https://admin.acme.example");
+        bad.system_when = Some(SystemWhen {
+            issuer: String::new(),
+            claim: "role".into(),
+            equals: "x".into(),
+        });
+        assert!(bad.validate().is_err(), "empty system_when.issuer refused");
+        bad.system_when = Some(SystemWhen {
+            issuer: "https://admin.acme.example".into(),
+            claim: "role".into(),
+            equals: String::new(),
+        });
+        assert!(bad.validate().is_err(), "empty system_when.equals refused");
+    }
+
+    #[test]
+    fn system_when_round_trips_and_defaults_the_claim_to_role() {
+        // The `claim` defaults to `role`; absent system_when round-trips to None (byte-identical).
+        let bare: HandlerGraphqlTokenClaims =
+            serde_json::from_str(r#"{"issuer":"https://a.example"}"#).unwrap();
+        assert!(bare.system_when.is_none());
+        let with: HandlerGraphqlTokenClaims = serde_json::from_str(
+            r#"{"issuer":"https://a.example","system_when":{"issuer":"https://a.example","equals":"super_admin"}}"#,
+        )
+        .unwrap();
+        let sw = with.system_when.as_ref().unwrap();
+        assert_eq!(sw.claim, "role", "claim defaults to `role`");
+        assert_eq!(sw.equals, "super_admin");
+        let reparsed: HandlerGraphqlTokenClaims =
+            serde_json::from_str(&serde_json::to_string(&with).unwrap()).unwrap();
+        assert_eq!(reparsed.system_when, with.system_when);
     }
 }

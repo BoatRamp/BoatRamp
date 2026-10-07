@@ -168,7 +168,11 @@ impl SqlSession {
         // ONLY when `current_setting(app.principal_kind, true) = 'system'`. The name is reserved
         // (`RlsGuc::reserved_names`), so a guest cannot `set_config` it and self-promote.
         if let Some(kname) = &guc.kind {
-            let kind_val = if tenancy.is_system() { "system" } else { "tenant" };
+            let kind_val = if tenancy.is_system() {
+                "system"
+            } else {
+                "tenant"
+            };
             sets.push(boatramp_core::sql::render_set_local_guc(
                 kname,
                 &SqlValue::Text(kind_val.to_string()),

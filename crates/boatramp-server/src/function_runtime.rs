@@ -3040,6 +3040,7 @@ mod gap3_tests {
             token_persona_claim: None,
             issuer_trust: None,
             jwks: None,
+            system_when: None,
         };
 
         // The fleet signer that seals + verifies the durable context (deterministic test key).
