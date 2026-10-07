@@ -5,6 +5,31 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.14.0] - 2026-10-07
+
+Node wasm **instance-lifecycle + memory observability**, plus the serve-path latency fix it
+surfaced — so an operator can tell a cold start from queueing from execution, from DATA.
+
+- **Warm-path latency fix:** the HTTP handler path re-read the entire component `.wasm` blob
+  from storage on EVERY request and passed it to the engine — which, on a warm cache hit, serves
+  the already-compiled module and discards the bytes. On a remote blob backend (S3/Tigris) that was
+  a per-request network round-trip of a discarded payload. The request path now reads the component
+  ONLY on a cold compile miss (`HandlerEngine::request_component_warm`), serving a warm component
+  from memory with zero backend hit (a trivial endpoint drops from ~0.5 s to ~1 ms). Safe by
+  content-addressing: a changed component has a new (SHA-256-verified) hash ⇒ cache miss ⇒ it is
+  fetched; a matching hash is provably identical bytes.
+- **`GET /api/instance-stats`** (admin, `System·Read`, read-only, node-global): per-lane warm-hit /
+  cold-miss / eviction / instantiation counts + compile & instantiate durations, the resident
+  (warm) component set vs capacity, in-flight vs ceiling, and process RSS vs the per-instance limit.
+  Also `boatramp stats --instances` and a `boatramp=info` log on every cold compile.
+- **`[handlers] instance_cache_size`** — the per-lane warm compile-cache capacity is now operator-
+  configurable (default 64, clamped to ≤16384) instead of hardcoded; size it ≥ your component count
+  (the stats' `warm_capacity`/`evictions` make that measurable) so nothing is evicted.
+
+Host-side only — no WIT/shim change. Shipped after an independent security review (SHIP; the
+endpoint's node-global `System·Read` gating + the warm-skip's content-addressing correctness were
+the focus).
+
 ## [0.13.0] - 2026-10-07
 
 First-class **`system` principal** — a no-tenant platform/super-admin identity class
