@@ -3661,12 +3661,16 @@ impl DeployStore {
 
         // The atomic switch: BOTH the `current` pointer AND the activator-class record flip together
         // (one batch), so a reader never sees a new deployment paired with a stale principal class.
-        // System ⇒ write `system`; anything else ⇒ DELETE the record (fail closed), so this
-        // activation never inherits a prior System capture.
+        // The record is BOUND to the activated deployment id (`system:<id>`) — not a bare `system` —
+        // so a reader checking the class for a SPECIFIC id (the scheduler, firing the pointer it read
+        // a moment earlier) never mis-applies a System capture that a concurrent activation wrote for a
+        // DIFFERENT id (closes the one-tick pointer-vs-class TOCTOU, Security review N1). System ⇒
+        // write `system:<id>`; anything else ⇒ DELETE the record (fail closed), so this activation
+        // never inherits a prior System capture.
         let principal_key = keys::current_principal(project, site);
         let principal_op = match activator {
             Some(crate::tenancy::PrincipalKind::System) => {
-                WriteOp::Put(principal_key, b"system".to_vec())
+                WriteOp::Put(principal_key, format!("system:{id}").into_bytes())
             }
             _ => WriteOp::Delete(principal_key),
         };
@@ -3684,22 +3688,26 @@ impl DeployStore {
         Ok(())
     }
 
-    /// The class of the verified actor who activated `site`'s current production deployment, if that
-    /// actor was the **system** class (PLAN-system-principal P2). `Some(System)` ONLY when a
-    /// System·Admin performed the activation; `None` otherwise (a Tenant/unknown activator, or no
-    /// activation) — so a `run_as: deployer` cron fails closed unless THIS site was made live by a
-    /// System·Admin. Read from [`current_principal`](keys::current_principal), never the global meta.
+    /// Whether the verified actor who activated `site`'s current production deployment **to the exact
+    /// deployment `id`** was the **system** class (PLAN-system-principal P2). `true` ONLY when a
+    /// System·Admin activated THIS `id`; `false` otherwise (a Tenant/unknown activator, no activation,
+    /// or a record bound to a DIFFERENT id — the TOCTOU guard) — so a `run_as: deployer` cron fails
+    /// closed unless THIS site was made live by a System·Admin. The caller passes the `id` it is about
+    /// to serve (read from the `current` pointer): a concurrent activation that moved the class to
+    /// another id never matches, so the class is never mis-applied across deployments. Read from
+    /// [`current_principal`](keys::current_principal), never the global content meta.
     pub async fn current_activator_is_system(
         &self,
         project: ProjectRef<'_>,
         site: &str,
+        id: &str,
     ) -> Result<bool, DeployError> {
         Ok(self
             .kv
             .get(&keys::current_principal(project, site))
             .await?
             .as_deref()
-            == Some(b"system"))
+            == Some(format!("system:{id}").as_bytes()))
     }
 
     /// Prepend `id` to `site`'s activation history, de-duplicating by id and
@@ -4705,19 +4713,34 @@ mod tests {
         use crate::tenancy::PrincipalKind;
 
         let store = DeployStore::new(Arc::new(NullStorage), Arc::new(MemoryKv::new()));
-        // One shared, content-addressed manifest id (no blobs ⇒ activatable anywhere).
+        // Two distinct content-addressed manifest ids (no blobs ⇒ activatable anywhere).
         let id = store.put_manifest(&empty_manifest(false)).await.unwrap();
+        let id2 = store.put_manifest(&empty_manifest(true)).await.unwrap();
+        assert_ne!(id, id2);
         let op = ProjectRef::new("operator");
         let attacker = ProjectRef::new("attacker");
 
-        // A System·Admin activates it on the operator's site ⇒ that site is system.
+        // A System·Admin activates it on the operator's site ⇒ that site is system FOR THAT id.
         store
             .activate_with_principal(op, "site", &id, Some(PrincipalKind::System))
             .await
             .unwrap();
         assert!(
-            store.current_activator_is_system(op, "site").await.unwrap(),
-            "a System activator confers system on ITS site"
+            store
+                .current_activator_is_system(op, "site", &id)
+                .await
+                .unwrap(),
+            "a System activator confers system on ITS site (for the activated id)"
+        );
+        // N1 (TOCTOU guard): the class is bound to the EXACT id. A query for a DIFFERENT id — e.g. the
+        // id a concurrent activation is moving away from — reads non-system, so the class is never
+        // mis-applied across deployments.
+        assert!(
+            !store
+                .current_activator_is_system(op, "site", &id2)
+                .await
+                .unwrap(),
+            "the System capture is bound to its deployment id — a different id is never system"
         );
 
         // THE EXPLOIT, now closed: the attacker activates the SAME (System-captured) content id onto
@@ -4729,14 +4752,17 @@ mod tests {
             .unwrap();
         assert!(
             !store
-                .current_activator_is_system(attacker, "site")
+                .current_activator_is_system(attacker, "site", &id)
                 .await
                 .unwrap(),
             "a Tenant activating System-captured content gets NO system (cross-tenant escalation closed)"
         );
         // The operator's site is unaffected — no shared global key.
         assert!(
-            store.current_activator_is_system(op, "site").await.unwrap(),
+            store
+                .current_activator_is_system(op, "site", &id)
+                .await
+                .unwrap(),
             "the operator's per-site capture is independent of another project's activation"
         );
 
@@ -4747,19 +4773,25 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            !store.current_activator_is_system(op, "site").await.unwrap(),
+            !store
+                .current_activator_is_system(op, "site", &id)
+                .await
+                .unwrap(),
             "a Tenant re-activation of the same id OVERWRITES the prior System capture (fail closed)"
         );
 
         // The plain `activate` (unknown actor) and an un-activated site are both non-system.
         store.activate(op, "site", &id).await.unwrap();
         assert!(
-            !store.current_activator_is_system(op, "site").await.unwrap(),
+            !store
+                .current_activator_is_system(op, "site", &id)
+                .await
+                .unwrap(),
             "the classless `activate` clears the capture (fail closed)"
         );
         assert!(
             !store
-                .current_activator_is_system(op, "never-activated")
+                .current_activator_is_system(op, "never-activated", &id)
                 .await
                 .unwrap(),
             "an un-activated site is never system"

@@ -804,13 +804,14 @@ pub struct CronConfig {
     pub overlap: Overlap,
     /// Which principal this cron fires as (PLAN-system-principal P2). Default
     /// [`CronRunAs::Unauthenticated`] — today's behavior, an anonymous trigger with no principal.
-    /// [`CronRunAs::Deployer`] fires as the principal captured from the VERIFIED deployer at deploy
-    /// time (stored server-side on [`crate::deploy::DeployMeta::deploy_principal`], never
-    /// client-supplied): a deployer who held the node-global `System·Admin` right ⇒ the system
+    /// [`CronRunAs::Deployer`] fires as the class captured from the VERIFIED ACTIVATOR at ACTIVATION
+    /// time (stored server-side, per-(project, site), in the `current-principal/<site>` record bound to
+    /// the activated deployment id — NOT the global content-addressed deploy metadata, and never
+    /// client-supplied): an activator who held the node-global `System·Admin` right ⇒ the system
     /// principal (base-row writes + a system `signed_context` on `emit`), which is how a self-service
     /// cron producer stamps a resolvable context for its downstream consumer. A `deployer` cron whose
-    /// captured principal is NOT system is **refused at fire time** (fail closed) — a deploy identity
-    /// carries no in-site tenant, so there is no tenant for it to run as.
+    /// site's current deployment was NOT activated by a System·Admin is **refused at fire time** (fail
+    /// closed) — a deploy identity carries no in-site tenant, so there is no tenant for it to run as.
     #[serde(default, skip_serializing_if = "CronRunAs::is_default")]
     pub run_as: CronRunAs,
 }
