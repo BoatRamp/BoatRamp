@@ -79,6 +79,9 @@ web-sys = { version = "0.3", features = [
   "HtmlAnchorElement",
   "File",
   "FileList",
+  # Copy-to-clipboard for the "shown once" secrets (minted token / join token).
+  "Navigator",
+  "Clipboard",
 ] }
 gloo-dialogs = "0.2"
 

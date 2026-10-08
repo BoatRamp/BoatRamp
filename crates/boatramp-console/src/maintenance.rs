@@ -15,7 +15,7 @@ use crate::node_ops::{
     AuthzPolicyView, BlobDrain, BlobPurge, Cluster, DaemonConfigView, KvCheckpoint, KvExport,
     KvImport, RootAnchors,
 };
-use crate::widgets::{ErrorBanner, Pill, Spinner, Tone};
+use crate::widgets::{BtnVariant, Button, ErrorBanner, Pill, Section, Spinner, Tone};
 
 /// The node-ops surface: certificates, blob ops, control-plane KV, cluster, and
 /// trust/RBAC — grouped so the destructive actions read as what they touch.
@@ -23,6 +23,12 @@ use crate::widgets::{ErrorBanner, Pill, Spinner, Tone};
 pub fn maintenance() -> Html {
     html! {
         <div class="space-y-10">
+            <div>
+                <h2 class="text-lg font-semibold text-slate-900">{ "Maintenance" }</h2>
+                <p class="mt-0.5 text-sm text-slate-500">
+                    { "Node-scoped operations — not affected by the active project." }
+                </p>
+            </div>
             { group("Certificates", html! { <Certs /> }) }
             { group("Blobs", html! { <><Prune /><Scrub /><BlobDrain /><BlobPurge /></> }) }
             { group("Control-plane KV", html! { <><KvCheckpoint /><KvExport /><KvImport /></> }) }
@@ -32,11 +38,14 @@ pub fn maintenance() -> Html {
     }
 }
 
-/// A titled group of maintenance sections.
+/// A titled group of maintenance sections — an `<h3>` label above the section
+/// cards (one page-level `<h2>` lives on [`maintenance`] above).
 fn group(title: &str, children: Html) -> Html {
     html! {
         <section>
-            <h2 class="mb-4 text-lg font-semibold text-slate-900">{ title.to_string() }</h2>
+            <h3 class="mb-3 text-xs font-semibold uppercase tracking-wide text-slate-500">
+                { title.to_string() }
+            </h3>
             <div class="space-y-6">{ children }</div>
         </section>
     }
@@ -58,27 +67,24 @@ fn certs() -> Html {
             <p class="text-sm text-slate-500">{ "No managed certificates." }</p>
         },
         Fetch::Ready(certs) => html! {
-            <table class="w-full text-sm">
-                <thead>
-                    <tr class="border-b border-slate-200 text-left text-slate-500">
-                        <th class="py-2 font-medium">{ "Domain" }</th>
-                        <th class="py-2 font-medium">{ "Expires" }</th>
-                        <th class="py-2 font-medium text-right">{ "Status" }</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    { for certs.iter().map(cert_row) }
-                </tbody>
-            </table>
+            <div class="overflow-x-auto">
+                <table class="w-full min-w-[32rem] text-sm">
+                    <thead>
+                        <tr class="border-b border-slate-200 text-left text-slate-500">
+                            <th scope="col" class="py-2 font-medium">{ "Domain" }</th>
+                            <th scope="col" class="py-2 font-medium">{ "Expires" }</th>
+                            <th scope="col" class="py-2 font-medium text-right">{ "Status" }</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        { for certs.iter().map(cert_row) }
+                    </tbody>
+                </table>
+            </div>
         },
     };
 
-    html! {
-        <section class="rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
-            <h3 class="mb-4 text-base font-semibold text-slate-900">{ "Certificates" }</h3>
-            { body }
-        </section>
-    }
+    html! { <Section title="Certificates">{ body }</Section> }
 }
 
 fn cert_row(cert: &CertStatus) -> Html {
@@ -115,11 +121,13 @@ fn prune() -> Html {
     let session = use_session();
     let report = use_api(|client| async move { client.get_json::<GcReport>("/api/prune").await });
     let result = use_state(|| Option::<Result<GcReport, String>>::None);
+    let deleting = use_state(|| false);
 
     let run_delete = {
         let session = session.clone();
         let report_reload = report.reload.clone();
         let result = result.clone();
+        let deleting = deleting.clone();
         Callback::from(move |_: MouseEvent| {
             if !confirm(
                 "Permanently delete orphan manifests and unreferenced blobs? \
@@ -131,8 +139,12 @@ fn prune() -> Html {
             let session = session.clone();
             let report_reload = report_reload.clone();
             let result = result.clone();
+            let deleting = deleting.clone();
+            deleting.set(true);
             spawn_local(async move {
-                match client.post_empty::<GcReport>("/api/prune").await {
+                let outcome = client.post_empty::<GcReport>("/api/prune").await;
+                deleting.set(false);
+                match outcome {
                     Ok(report) => {
                         result.set(Some(Ok(report)));
                         report_reload.emit(());
@@ -152,16 +164,12 @@ fn prune() -> Html {
         Fetch::Ready(report) => gc_report_view(report, "Reclaimable (dry run)"),
     };
 
+    let action = html! {
+        <Button variant={BtnVariant::Danger} busy={*deleting} busy_label="Deleting…"
+                label="Delete now" onclick={run_delete} />
+    };
     html! {
-        <section class="rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
-            <div class="mb-4 flex items-center justify-between">
-                <h3 class="text-base font-semibold text-slate-900">{ "Prune" }</h3>
-                <button onclick={run_delete}
-                        class="rounded-md bg-rose-600 px-3 py-1.5 text-sm font-medium text-white \
-                               hover:bg-rose-700">
-                    { "Delete now" }
-                </button>
-            </div>
+        <Section title="Prune" action={action}>
             { dry_run }
             if let Some(result) = &*result {
                 <div class="mt-4 border-t border-slate-100 pt-4">
@@ -175,7 +183,7 @@ fn prune() -> Html {
                     }
                 </div>
             }
-        </section>
+        </Section>
     }
 }
 
@@ -223,16 +231,12 @@ fn scrub() -> Html {
         })
     };
 
+    let action = html! {
+        <Button variant={BtnVariant::Secondary} busy={*running} busy_label="Scrubbing…"
+                label="Run scrub" onclick={run} />
+    };
     html! {
-        <section class="rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
-            <div class="mb-4 flex items-center justify-between">
-                <h3 class="text-base font-semibold text-slate-900">{ "Integrity scrub" }</h3>
-                <button onclick={run} disabled={*running}
-                        class="rounded-md border border-slate-300 px-3 py-1.5 text-sm font-medium \
-                               text-slate-700 hover:bg-slate-50 disabled:opacity-50">
-                    { if *running { "Scrubbing…" } else { "Run scrub" } }
-                </button>
-            </div>
+        <Section title="Integrity scrub" action={action}>
             if let Some(result) = &*result {
                 {
                     match result {
@@ -247,7 +251,7 @@ fn scrub() -> Html {
                     { "Verify every stored blob still hashes to its key." }
                 </p>
             }
-        </section>
+        </Section>
     }
 }
 
@@ -277,7 +281,7 @@ fn scrub_report_view(report: &ScrubReport) -> Html {
                     <p class="text-xs font-medium text-slate-500">{ "Hash mismatches" }</p>
                     <ul class="mt-1 space-y-1">
                         { for report.mismatched.iter().map(|m| html! {
-                            <li class="font-mono text-xs text-rose-600">{ &m.key }</li>
+                            <li class="font-mono text-xs text-rose-700">{ &m.key }</li>
                         }) }
                     </ul>
                 </div>
@@ -287,7 +291,7 @@ fn scrub_report_view(report: &ScrubReport) -> Html {
                     <p class="text-xs font-medium text-slate-500">{ "Read errors" }</p>
                     <ul class="mt-1 space-y-1">
                         { for report.errors.iter().map(|e| html! {
-                            <li class="font-mono text-xs text-rose-600">
+                            <li class="font-mono text-xs text-rose-700">
                                 { format!("{}: {}", e.key, e.error) }
                             </li>
                         }) }

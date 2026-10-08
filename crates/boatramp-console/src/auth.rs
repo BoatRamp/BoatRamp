@@ -258,7 +258,7 @@ pub fn login_view(props: &LoginViewProps) -> Html {
                                   shadow-sm focus:border-sky-500 focus:outline-none focus:ring-1 \
                                   focus:ring-sky-500" />
                     if let Some(msg) = &*error {
-                        <p class="mt-2 text-sm text-rose-600">{ msg }</p>
+                        <p class="mt-2 text-sm text-rose-700">{ msg }</p>
                     }
                     <button type="submit"
                             class="mt-4 w-full rounded-md bg-sky-600 px-3 py-2 text-sm font-medium \
@@ -269,7 +269,7 @@ pub fn login_view(props: &LoginViewProps) -> Html {
                 </form>
 
                 <div class="my-6 flex items-center gap-3 text-xs uppercase tracking-wide \
-                            text-slate-400">
+                            text-slate-500">
                     <span class="h-px flex-1 bg-slate-200"></span>
                     { "or" }
                     <span class="h-px flex-1 bg-slate-200"></span>
@@ -313,7 +313,7 @@ pub fn login_view(props: &LoginViewProps) -> Html {
                     <label for="oidc-scope"
                            class="mt-3 block text-sm font-medium text-slate-700">
                         { "Scope " }
-                        <span class="font-normal text-slate-400">{ "(optional)" }</span>
+                        <span class="font-normal text-slate-500">{ "(optional)" }</span>
                     </label>
                     <input ref={scope_ref} id="oidc-scope" type="text" autocomplete="off"
                            value={oidc_cfg.scope.clone()}
@@ -323,7 +323,7 @@ pub fn login_view(props: &LoginViewProps) -> Html {
                                   focus:ring-sky-500" />
 
                     if let Some(msg) = &*oidc_error {
-                        <p class="mt-2 text-sm text-rose-600">{ msg }</p>
+                        <p class="mt-2 text-sm text-rose-700">{ msg }</p>
                     }
                     <button type="submit" disabled={*oidc_busy}
                             class="mt-4 w-full rounded-md border border-slate-300 bg-white px-3 \

@@ -9,7 +9,7 @@ use boatramp_types::deploy::DeploymentList;
 use yew::prelude::*;
 
 use crate::format::{relative_age, short_id};
-use crate::hooks::{use_api, Fetch};
+use crate::hooks::{Fetch, use_api};
 use crate::widgets::{ErrorBanner, Pill, Spinner, Tone};
 
 /// The dashboard: the list of sites, each with a status card.
@@ -98,9 +98,11 @@ pub fn site_card(props: &SiteCardProps) -> Html {
     };
 
     html! {
-        <div onclick={on_click}
-             class="cursor-pointer rounded-xl border border-slate-200 bg-white p-5 shadow-sm \
-                    transition hover:border-sky-300 hover:shadow">
+        <button type="button" onclick={on_click}
+                class="w-full cursor-pointer rounded-xl border border-slate-200 bg-white p-5 \
+                       text-left shadow-sm transition hover:border-sky-300 hover:shadow \
+                       focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500 \
+                       focus-visible:ring-offset-2">
             <div class="flex items-center justify-between">
                 <h3 class="truncate font-semibold text-slate-900">{ &props.site }</h3>
                 { current_badge(&deployments.state) }
@@ -119,7 +121,7 @@ pub fn site_card(props: &SiteCardProps) -> Html {
                     <dd class="mt-1">{ domains_summary(&config.state) }</dd>
                 </div>
             </dl>
-        </div>
+        </button>
     }
 }
 
@@ -137,9 +139,9 @@ fn current_badge(state: &Fetch<DeploymentList>) -> Html {
 /// The current deployment id + age (or status text).
 fn current_summary(state: &Fetch<DeploymentList>) -> Html {
     match state {
-        Fetch::Loading => html! { <span class="text-slate-400">{ "…" }</span> },
+        Fetch::Loading => html! { <span class="text-slate-500">{ "…" }</span> },
         Fetch::Failed(err) => {
-            html! { <span class="text-rose-500" title={err.to_string()}>{ "error" }</span> }
+            html! { <span class="text-rose-700" title={err.to_string()}>{ "error" }</span> }
         }
         Fetch::Ready(list) => match &list.current {
             Some(id) => {
@@ -152,7 +154,7 @@ fn current_summary(state: &Fetch<DeploymentList>) -> Html {
                     .unwrap_or_else(|| "—".to_string());
                 html! { <span title={id.clone()}>{ format!("{} · {}", short_id(id), age) }</span> }
             }
-            None => html! { <span class="text-slate-400">{ "—" }</span> },
+            None => html! { <span class="text-slate-500">{ "—" }</span> },
         },
     }
 }
@@ -161,17 +163,17 @@ fn current_summary(state: &Fetch<DeploymentList>) -> Html {
 fn deployment_count(state: &Fetch<DeploymentList>) -> Html {
     match state {
         Fetch::Ready(list) => html! { { list.deployments.len() } },
-        Fetch::Failed(_) => html! { <span class="text-rose-500">{ "—" }</span> },
-        Fetch::Loading => html! { <span class="text-slate-400">{ "…" }</span> },
+        Fetch::Failed(_) => html! { <span class="text-rose-700">{ "—" }</span> },
+        Fetch::Loading => html! { <span class="text-slate-500">{ "…" }</span> },
     }
 }
 
 /// The configured domains (primary + aliases + wildcards), or "none".
 fn domains_summary(state: &Fetch<SiteConfig>) -> Html {
     match state {
-        Fetch::Loading => html! { <span class="text-slate-400 text-sm">{ "…" }</span> },
+        Fetch::Loading => html! { <span class="text-slate-500 text-sm">{ "…" }</span> },
         Fetch::Failed(err) => {
-            html! { <span class="text-rose-500 text-sm" title={err.to_string()}>{ "error" }</span> }
+            html! { <span class="text-rose-700 text-sm" title={err.to_string()}>{ "error" }</span> }
         }
         Fetch::Ready(config) => {
             let domains = &config.domains;
@@ -182,7 +184,7 @@ fn domains_summary(state: &Fetch<SiteConfig>) -> Html {
             hosts.extend(domains.aliases.iter().cloned());
             hosts.extend(domains.wildcards.iter().cloned());
             if hosts.is_empty() {
-                html! { <span class="text-sm text-slate-400">{ "none configured" }</span> }
+                html! { <span class="text-sm text-slate-500">{ "none configured" }</span> }
             } else {
                 html! {
                     <div class="flex flex-wrap gap-1">

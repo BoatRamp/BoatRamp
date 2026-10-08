@@ -137,7 +137,7 @@ pub fn text_field(props: &TextFieldProps) -> Html {
                        "focus:ring-sky-500", font
                    )} />
             if let Some(hint) = &props.hint {
-                <span class="mt-1 block text-xs text-slate-400">{ hint }</span>
+                <span class="mt-1 block text-xs text-slate-500">{ hint }</span>
             }
         </label>
     }
@@ -175,7 +175,7 @@ pub fn textarea_field(props: &TextAreaFieldProps) -> Html {
                              font-mono shadow-sm focus:border-sky-500 focus:outline-none \
                              focus:ring-1 focus:ring-sky-500" />
             if let Some(hint) = &props.hint {
-                <span class="mt-1 block text-xs text-slate-400">{ hint }</span>
+                <span class="mt-1 block text-xs text-slate-500">{ hint }</span>
             }
         </label>
     }
@@ -213,11 +213,137 @@ pub fn check_field(props: &CheckFieldProps) -> Html {
     }
 }
 
-/// A collapsible section wrapper used to group the config editor's panels.
+/// Shared text-`<input>` classes, including the focus ring, for the hand-rolled
+/// (ref-based / uncontrolled) inputs that don't go through [`TextField`]. Keeps
+/// every input's focus affordance consistent (an a11y must).
+pub const INPUT: &str = "w-full rounded-md border border-slate-300 px-2.5 py-1.5 text-sm shadow-sm \
+     focus:border-sky-500 focus:outline-none focus:ring-1 focus:ring-sky-500";
+/// Shared `<select>` classes (with the focus ring).
+pub const SELECT: &str = "rounded-md border border-slate-300 px-2.5 py-1.5 text-sm shadow-sm \
+     focus:border-sky-500 focus:outline-none focus:ring-1 focus:ring-sky-500";
+
+/// A button's visual weight. The weight encodes blast radius so an operator can
+/// learn it: solid rose = irreversible, outline rose = reversible/row-level.
+#[derive(Clone, Copy, PartialEq)]
+pub enum BtnVariant {
+    /// The single accent (sky) — a commit action (Save / Mint / Set / Start).
+    Primary,
+    /// Neutral outline — a non-committing or read action.
+    Secondary,
+    /// Solid rose — an IRREVERSIBLE action (prune delete, blob purge, KV import,
+    /// revoke node/token, remove root anchor).
+    Danger,
+    /// Outline rose — a reversible / row-level removal (alias, challenge, user).
+    DangerSubtle,
+}
+
+impl BtnVariant {
+    fn classes(self) -> &'static str {
+        match self {
+            BtnVariant::Primary => "bg-sky-600 text-white hover:bg-sky-700",
+            BtnVariant::Secondary => "border border-slate-300 text-slate-700 hover:bg-slate-50",
+            BtnVariant::Danger => "bg-rose-600 text-white hover:bg-rose-700",
+            BtnVariant::DangerSubtle => "border border-rose-300 text-rose-700 hover:bg-rose-50",
+        }
+    }
+}
+
+/// The shared button: a [`BtnVariant`] weight, a baked-in in-flight (`busy`)
+/// state that disables (so a mutating action can't double-fire) and swaps the
+/// label, a `disabled` prop, and a consistent focus ring.
+#[derive(Properties, PartialEq)]
+pub struct ButtonProps {
+    /// The button text.
+    pub label: AttrValue,
+    /// Visual weight / blast radius.
+    #[prop_or(BtnVariant::Secondary)]
+    pub variant: BtnVariant,
+    /// While `true`, the button is disabled and shows `busy_label` (or the label).
+    #[prop_or_default]
+    pub busy: bool,
+    /// The label to show while `busy` (e.g. "Saving…"); defaults to `label`.
+    #[prop_or_default]
+    pub busy_label: Option<AttrValue>,
+    /// Disable regardless of `busy` (e.g. nothing to save).
+    #[prop_or_default]
+    pub disabled: bool,
+    /// Click handler.
+    #[prop_or_default]
+    pub onclick: Callback<MouseEvent>,
+}
+
+#[function_component(Button)]
+pub fn button(props: &ButtonProps) -> Html {
+    let label = if props.busy {
+        props
+            .busy_label
+            .clone()
+            .unwrap_or_else(|| props.label.clone())
+    } else {
+        props.label.clone()
+    };
+    html! {
+        <button type="button" onclick={props.onclick.clone()}
+                disabled={props.busy || props.disabled}
+                class={classes!(
+                    "rounded-md", "px-3", "py-1.5", "text-sm", "font-medium",
+                    "focus-visible:outline-none", "focus-visible:ring-2",
+                    "focus-visible:ring-sky-500", "focus-visible:ring-offset-2",
+                    "disabled:opacity-50", "disabled:pointer-events-none",
+                    props.variant.classes()
+                )}>
+            { label }
+        </button>
+    }
+}
+
+/// A small copy-to-clipboard button with a transient "Copied" state, for the
+/// "shown once" secrets (a minted token / a join token) where manual text
+/// selection is error-prone (a slip means re-minting).
+#[derive(Properties, PartialEq)]
+pub struct CopyButtonProps {
+    /// The exact text copied to the clipboard.
+    pub value: AttrValue,
+}
+
+#[function_component(CopyButton)]
+pub fn copy_button(props: &CopyButtonProps) -> Html {
+    let copied = use_state(|| false);
+    let onclick = {
+        let copied = copied.clone();
+        let value = props.value.to_string();
+        Callback::from(move |_: MouseEvent| {
+            if let Some(nav) = web_sys::window().map(|w| w.navigator()) {
+                let _ = nav.clipboard().write_text(&value);
+            }
+            copied.set(true);
+            let copied = copied.clone();
+            gloo_timers::callback::Timeout::new(1500, move || copied.set(false)).forget();
+        })
+    };
+    html! {
+        <button type="button" onclick={onclick}
+                class="shrink-0 rounded-md border border-slate-300 px-2 py-1 text-xs font-medium \
+                       text-slate-600 hover:bg-slate-50 focus-visible:outline-none \
+                       focus-visible:ring-2 focus-visible:ring-sky-500 focus-visible:ring-offset-2">
+            { if *copied { "Copied" } else { "Copy" } }
+        </button>
+    }
+}
+
+/// A titled card section. An optional right-aligned header `action` (e.g. a
+/// Refresh/Delete button) and an optional `description` line under the title —
+/// so views stop hand-duplicating this shell.
 #[derive(Properties, PartialEq)]
 pub struct SectionProps {
     /// The section title.
     pub title: AttrValue,
+    /// Optional one-line description under the title.
+    #[prop_or_default]
+    pub description: Option<AttrValue>,
+    /// Optional right-aligned control in the header.
+    #[prop_or_default]
+    pub action: Html,
     /// The section body.
     pub children: Html,
 }
@@ -226,7 +352,15 @@ pub struct SectionProps {
 pub fn section(props: &SectionProps) -> Html {
     html! {
         <section class="rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
-            <h3 class="mb-4 text-base font-semibold text-slate-900">{ &props.title }</h3>
+            <div class="mb-4 flex items-start justify-between gap-3">
+                <div>
+                    <h3 class="text-base font-semibold text-slate-900">{ &props.title }</h3>
+                    if let Some(desc) = &props.description {
+                        <p class="mt-0.5 text-sm text-slate-500">{ desc }</p>
+                    }
+                </div>
+                { props.action.clone() }
+            </div>
             <div class="space-y-4">{ props.children.clone() }</div>
         </section>
     }

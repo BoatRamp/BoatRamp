@@ -5,6 +5,35 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.18.0] - 2026-10-08
+
+Web **console UX polish** — design-system, accessibility, and safety hardening across the console,
+from an independent UX Architect review (and re-verified by a second UX pass before release).
+Console-only; no server, WIT, or shim change.
+
+- **Keyboard & screen-reader access:** the dashboard site cards (the primary drill-down) are now real
+  `<button>`s, not bare clickable `<div>`s; every interactive control has a visible focus ring —
+  including the node-ops danger buttons (blob drain/purge, KV import, cluster promote/revoke).
+- **Scope clarity (safety):** the nav is split into labelled **project** (Sites, Functions) and
+  **node** (Monitoring, Maintenance, Tokens) groups, and the project selector renders inert with a
+  "node scope" note on node-global pages — so a node-wide, irreversible op can no longer look as if
+  it's scoped to the selected project. The Maintenance page gained a heading + a node-scope caption.
+- **Contrast:** removed sub-WCAG-AA text colors (`slate-400` text, `-600`/`-500` colored body text)
+  in favor of AA-passing shades; status still always carries a text label, never color alone.
+- **Destructive-action affordance:** a shared `Button` primitive with Primary / Secondary / Danger
+  (solid, irreversible) / DangerSubtle (reversible) weights and a built-in in-flight disable — which
+  also fixes double-fire on Prune "Delete now" and token minting. Token revoke and root-anchor remove
+  are now at the solid-danger weight their blast radius warrants.
+- **Fewer footguns:** the config editor tracks unsaved changes (an "unsaved changes" pill, a Discard
+  button, Save disabled when clean, and the "saved" pill resets on the next edit); the shown-once
+  minted token and cluster join-token each get a Copy button; narrow-screen tables scroll instead of
+  overflowing; `<th scope>` and a styled file input round out the a11y pass.
+- Shared `Section` (optional header-action + description slots) and `INPUT`/`SELECT` focus-ring
+  constants reduce the hand-duplicated markup the view code had drifted into.
+
+Deferred to later stages: a sticky in-page section nav, deep-linkable per-site tabs, type-to-confirm
+on the few irreversible node ops, and a dark theme.
+
 ## [0.17.0] - 2026-10-08
 
 Web **console alignment (stage 3)** — multi-project foundation. The console was implicitly scoped to

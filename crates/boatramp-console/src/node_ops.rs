@@ -23,7 +23,7 @@ use crate::format::{human_bytes, now_unix};
 use crate::hooks::{Fetch, use_api};
 use crate::models::{DaemonConfigResponse, JoinToken, MeshMember};
 use crate::ndjson::{self, StreamEnd};
-use crate::widgets::{ErrorBanner, Pill, Section, Spinner, TextField, Tone};
+use crate::widgets::{CopyButton, ErrorBanner, Pill, Section, Spinner, TextField, Tone};
 
 // ===========================================================================
 // Blobs — drain + purge (NDJSON progress streams)
@@ -330,7 +330,7 @@ fn report_block(r: &Value) -> Html {
             if !missing.is_empty() {
                 <ul class="space-y-0.5">
                     { for missing.iter().map(|k| html! {
-                        <li class="font-mono text-xs text-rose-600">{ k }</li>
+                        <li class="font-mono text-xs text-rose-700">{ k }</li>
                     }) }
                 </ul>
             }
@@ -548,13 +548,16 @@ pub fn kv_import() -> Html {
             <p class="text-sm text-slate-500">
                 { "Restore or overlay a boatramp-kv-dump. Dry-run plans the write; Apply commits it." }
             </p>
-            <input type="file" onchange={on_file} class="block text-sm text-slate-600" />
+            <input type="file" onchange={on_file}
+                   class="block text-sm text-slate-600 file:mr-3 file:rounded-md file:border-0 \
+                          file:bg-slate-100 file:px-3 file:py-1.5 file:text-sm file:font-medium \
+                          hover:file:bg-slate-200" />
             if let Some(name) = &*filename {
                 <p class="text-xs text-slate-500">{ format!("selected: {name}") }</p>
             }
             <label class="flex items-center gap-2 text-sm text-amber-700">
                 <input type="checkbox" checked={*force} onchange={on_force}
-                       class="h-4 w-4 rounded border-slate-300 text-amber-600 focus:ring-amber-500" />
+                       class="h-4 w-4 rounded border-slate-300 text-amber-700 focus:ring-amber-500" />
                 { "force — overlay onto a non-empty / already-identified control plane (commingles data)" }
             </label>
             <div class="flex gap-2">
@@ -633,17 +636,19 @@ pub fn cluster() -> Html {
         },
         Fetch::Ready(list) => html! {
             <Section title="Cluster">
-                <table class="w-full text-sm">
-                    <thead>
-                        <tr class="border-b border-slate-200 text-left text-slate-500">
-                            <th class="py-2 font-medium">{ "Node" }</th>
-                            <th class="py-2 font-medium">{ "Role" }</th>
-                            <th class="py-2 font-medium">{ "Status" }</th>
-                            <th class="py-2 font-medium">{ "Address" }</th>
-                        </tr>
-                    </thead>
-                    <tbody>{ for list.iter().map(member_row) }</tbody>
-                </table>
+                <div class="overflow-x-auto">
+                    <table class="w-full min-w-[32rem] text-sm">
+                        <thead>
+                            <tr class="border-b border-slate-200 text-left text-slate-500">
+                                <th scope="col" class="py-2 font-medium">{ "Node" }</th>
+                                <th scope="col" class="py-2 font-medium">{ "Role" }</th>
+                                <th scope="col" class="py-2 font-medium">{ "Status" }</th>
+                                <th scope="col" class="py-2 font-medium">{ "Address" }</th>
+                            </tr>
+                        </thead>
+                        <tbody>{ for list.iter().map(member_row) }</tbody>
+                    </table>
+                </div>
                 <JoinTokenCard />
                 <NodeAction title="Promote a learner" verb="Promote" path="/api/cluster/promote"
                             confirm_msg="Promote this learner to a voter?" on_done={members.reload.clone()} />
@@ -722,6 +727,7 @@ fn join_token_card() -> Html {
                                 { format!("expires in ~{} min — shown once, copy it now",
                                           tok.expires_at.saturating_sub(now_unix()).div_ceil(60)) }
                             </p>
+                            <div class="flex justify-end"><CopyButton value={tok.token.clone()} /></div>
                             <pre class="overflow-auto rounded-lg bg-slate-900 p-3 text-xs text-slate-100">{ &tok.token }</pre>
                         </div>
                     },
@@ -925,7 +931,9 @@ fn anchor_row(
         <li class="flex items-center justify-between gap-3">
             <span class="truncate font-mono text-xs text-slate-700">{ key }</span>
             <button onclick={remove}
-                    class="shrink-0 text-xs font-medium text-rose-600 hover:text-rose-700">
+                    class="shrink-0 rounded-md bg-rose-600 px-2 py-0.5 text-xs font-medium \
+                           text-white hover:bg-rose-700 focus-visible:outline-none \
+                           focus-visible:ring-2 focus-visible:ring-sky-500 focus-visible:ring-offset-2">
                 { "Remove" }
             </button>
         </li>
@@ -1010,9 +1018,11 @@ pub fn authz_policy_view() -> Html {
 // ===========================================================================
 
 const BTN_SECONDARY: &str = "rounded-md border border-slate-300 px-3 py-1.5 text-sm font-medium text-slate-700 \
-     hover:bg-slate-50 disabled:opacity-50";
+     hover:bg-slate-50 disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 \
+     focus-visible:ring-sky-500 focus-visible:ring-offset-2";
 const BTN_DANGER: &str = "rounded-md bg-rose-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-rose-700 \
-     disabled:opacity-50";
+     disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500 \
+     focus-visible:ring-offset-2";
 const SELECT: &str = "rounded-md border border-slate-300 px-2.5 py-1.5 text-sm shadow-sm focus:border-sky-500 \
      focus:outline-none focus:ring-1 focus:ring-sky-500";
 
