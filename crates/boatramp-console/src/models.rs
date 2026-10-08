@@ -189,3 +189,45 @@ pub struct KvStatus {
     #[serde(flatten)]
     pub detail: serde_json::Map<String, serde_json::Value>,
 }
+
+// ---- Node ops (the Maintenance page's node-ops sections) ------------------
+
+/// One row of `GET /api/cluster/members` (server inline `MeshMember`).
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct MeshMember {
+    /// The Raft node id.
+    pub node: u64,
+    /// Whether the member is a voter (vs a learner).
+    #[serde(default)]
+    pub voter: bool,
+    /// Whether the member has caught up to the log.
+    #[serde(default)]
+    pub caught_up: bool,
+    /// Whether the member is the current leader.
+    #[serde(default)]
+    pub leader: bool,
+    /// The member's advertised mesh address (absent for some members).
+    #[serde(default)]
+    pub addr: Option<String>,
+}
+
+/// Response of `POST /api/cluster/join-token` (server inline `CreateJoinTokenResponse`).
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct JoinToken {
+    /// The single-use join token (base64url) — shown ONCE, never stored.
+    pub token: String,
+    /// When the token expires (unix seconds).
+    pub expires_at: u64,
+}
+
+/// Response of `GET /api/daemon/config` — the stored dynamic daemon config plus
+/// its generation (sha256-hex, `null` when none stored). The config body is
+/// kept as raw JSON for a read-only pretty view (editing comes in a later stage).
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct DaemonConfigResponse {
+    /// The stored config's generation hash, or `null` when the file baseline is in effect.
+    #[serde(default)]
+    pub generation: Option<String>,
+    /// The effective `DaemonConfig` as JSON (rendered pretty, read-only this stage).
+    pub config: serde_json::Value,
+}

@@ -71,6 +71,14 @@ web-sys = { version = "0.3", features = [
   "AbortController",
   "AbortSignal",
   "TextDecoder",
+  # KV export (binary download) + KV import (local dump file read): build a Blob
+  # from the fetched bytes, download it via an object URL + a synthetic anchor,
+  # and read an uploaded dump file's bytes via `File::array_buffer`.
+  "Blob",
+  "Url",
+  "HtmlAnchorElement",
+  "File",
+  "FileList",
 ] }
 gloo-dialogs = "0.2"
 

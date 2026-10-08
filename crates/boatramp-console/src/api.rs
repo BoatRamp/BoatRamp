@@ -10,8 +10,8 @@
 //! valid but lacks the required `*`/`site:<name>` scope).
 
 use gloo_net::http::{RequestBuilder, Response};
-use serde::de::DeserializeOwned;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 
 /// An API call failure, with enough detail for the UI and the 401 interceptor.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -165,6 +165,46 @@ impl ApiClient {
             .authed(RequestBuilder::new(&self.url(path)).method(gloo_net::http::Method::DELETE));
         send(req).await?;
         Ok(())
+    }
+
+    /// `POST path` with no body, returning the response as text (the control-plane
+    /// KV checkpoint at `/api/kv-checkpoint`, which replies `text/plain`).
+    pub async fn post_text(&self, path: &str) -> ApiResult<String> {
+        let req =
+            self.authed(RequestBuilder::new(&self.url(path)).method(gloo_net::http::Method::POST));
+        let resp = send(req).await?;
+        resp.text()
+            .await
+            .map_err(|err| ApiError::Transport(err.to_string()))
+    }
+
+    /// `GET path`, returning the raw response bytes (the control-plane KV export
+    /// at `/api/kv-export`, which is an `application/octet-stream` binary dump).
+    pub async fn get_bytes(&self, path: &str) -> ApiResult<Vec<u8>> {
+        let req = self.authed(RequestBuilder::new(&self.url(path)));
+        let resp = send(req).await?;
+        resp.binary()
+            .await
+            .map_err(|err| ApiError::Transport(err.to_string()))
+    }
+
+    /// `POST path` with a raw `bytes` body under `content_type`, deserializing
+    /// the JSON response into `T` (the control-plane KV import at
+    /// `/api/kv-import`, which takes an `application/octet-stream` dump).
+    pub async fn post_bytes_json<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        content_type: &str,
+        bytes: Vec<u8>,
+    ) -> ApiResult<T> {
+        let body = js_sys::Uint8Array::from(bytes.as_slice());
+        let req = self
+            .authed(RequestBuilder::new(&self.url(path)).method(gloo_net::http::Method::POST))
+            .header("Content-Type", content_type)
+            .body(body)
+            .map_err(|err| ApiError::Transport(err.to_string()))?;
+        let resp = check(req.send().await)?;
+        decode_json(resp).await
     }
 }
 

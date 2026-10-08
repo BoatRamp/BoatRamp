@@ -15,6 +15,8 @@ mod logstream;
 mod maintenance;
 mod models;
 mod monitoring;
+mod ndjson;
+mod node_ops;
 mod observability;
 mod oidc;
 mod tokens;

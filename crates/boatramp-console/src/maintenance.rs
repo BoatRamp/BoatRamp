@@ -9,19 +9,36 @@ use wasm_bindgen_futures::spawn_local;
 use yew::prelude::*;
 
 use crate::auth::use_session;
-use crate::format::relative_age;
-use crate::hooks::{use_api, Fetch};
+use crate::format::{human_bytes, relative_age};
+use crate::hooks::{Fetch, use_api};
+use crate::node_ops::{
+    AuthzPolicyView, BlobDrain, BlobPurge, Cluster, DaemonConfigView, KvCheckpoint, KvExport,
+    KvImport, RootAnchors,
+};
 use crate::widgets::{ErrorBanner, Pill, Spinner, Tone};
 
-/// The maintenance view: prune, scrub, certs.
+/// The node-ops surface: certificates, blob ops, control-plane KV, cluster, and
+/// trust/RBAC — grouped so the destructive actions read as what they touch.
 #[function_component(Maintenance)]
 pub fn maintenance() -> Html {
     html! {
-        <div class="space-y-8">
-            <Certs />
-            <Prune />
-            <Scrub />
+        <div class="space-y-10">
+            { group("Certificates", html! { <Certs /> }) }
+            { group("Blobs", html! { <><Prune /><Scrub /><BlobDrain /><BlobPurge /></> }) }
+            { group("Control-plane KV", html! { <><KvCheckpoint /><KvExport /><KvImport /></> }) }
+            { group("Cluster", html! { <Cluster /> }) }
+            { group("Trust & RBAC", html! { <><RootAnchors /><DaemonConfigView /><AuthzPolicyView /></> }) }
         </div>
+    }
+}
+
+/// A titled group of maintenance sections.
+fn group(title: &str, children: Html) -> Html {
+    html! {
+        <section>
+            <h2 class="mb-4 text-lg font-semibold text-slate-900">{ title.to_string() }</h2>
+            <div class="space-y-6">{ children }</div>
+        </section>
     }
 }
 
@@ -295,21 +312,5 @@ fn stat(props: &StatProps) -> Html {
             <dt class="text-slate-500">{ &props.label }</dt>
             <dd class="font-medium text-slate-800">{ &props.value }</dd>
         </div>
-    }
-}
-
-/// Human-readable byte size (binary units).
-fn human_bytes(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
-    let mut value = bytes as f64;
-    let mut unit = 0;
-    while value >= 1024.0 && unit < UNITS.len() - 1 {
-        value /= 1024.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{bytes} B")
-    } else {
-        format!("{value:.1} {}", UNITS[unit])
     }
 }
