@@ -10,17 +10,18 @@
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
-use boatramp_types::access::{hash_password, BasicAuth, RateLimit};
+use boatramp_types::access::{BasicAuth, RateLimit, hash_password};
 use boatramp_types::config::{HandlersSiteConfig, Hsts, SiteConfig};
 use wasm_bindgen_futures::spawn_local;
 use web_sys::HtmlInputElement;
 use yew::prelude::*;
 
 use crate::auth::use_session;
-use crate::hooks::{use_api, Fetch};
+use crate::hooks::{Fetch, use_api};
 use crate::verify::DomainVerifications;
 use crate::widgets::{
-    CheckField, ErrorBanner, Pill, Section, Spinner, TextAreaField, TextField, Tone,
+    BtnVariant, Button, CheckField, ErrorBanner, Pill, Section, Spinner, TextAreaField, TextField,
+    Tone,
 };
 
 /// The config editor for one site.
@@ -71,19 +72,27 @@ fn config_form(props: &ConfigFormProps) -> Html {
     let site = props.site.clone();
     // The working copy the form edits; `PUT` sends this verbatim.
     let config = use_state(|| (*props.initial).clone());
+    // The last-saved baseline: edits are "dirty" against this, and a successful
+    // save advances it (so "saved" doesn't go stale as editing continues, and a
+    // Discard can restore it).
+    let baseline = use_state(|| (*props.initial).clone());
     // Save status: idle / saving / saved / error.
     let status = use_state(|| SaveStatus::Idle);
+
+    let dirty = *config != *baseline;
 
     let save = {
         let session = session.clone();
         let site = site.clone();
         let config = config.clone();
+        let baseline = baseline.clone();
         let status = status.clone();
         Callback::from(move |_: MouseEvent| {
             let client = session.client();
             let session = session.clone();
             let site = site.clone();
             let body = (*config).clone();
+            let baseline = baseline.clone();
             let status = status.clone();
             status.set(SaveStatus::Saving);
             spawn_local(async move {
@@ -91,11 +100,24 @@ fn config_form(props: &ConfigFormProps) -> Html {
                     .put_json(&format!("/api/sites/{site}/config"), &body)
                     .await
                 {
-                    Ok(()) => status.set(SaveStatus::Saved),
+                    Ok(()) => {
+                        baseline.set(body);
+                        status.set(SaveStatus::Saved);
+                    }
                     Err(err) if err.is_unauthorized() => session.sign_out(),
                     Err(err) => status.set(SaveStatus::Error(err.to_string())),
                 }
             });
+        })
+    };
+
+    let discard = {
+        let config = config.clone();
+        let baseline = baseline.clone();
+        let status = status.clone();
+        Callback::from(move |_: MouseEvent| {
+            config.set((*baseline).clone());
+            status.set(SaveStatus::Idle);
         })
     };
 
@@ -111,12 +133,13 @@ fn config_form(props: &ConfigFormProps) -> Html {
 
             <div class="sticky bottom-4 flex items-center justify-end gap-3 rounded-xl border \
                         border-slate-200 bg-white/90 p-4 shadow backdrop-blur">
-                { save_status_view(&status) }
-                <button onclick={save} disabled={matches!(&*status, SaveStatus::Saving)}
-                        class="rounded-md bg-sky-600 px-4 py-2 text-sm font-medium text-white \
-                               hover:bg-sky-700 disabled:opacity-50">
-                    { "Save config" }
-                </button>
+                { save_bar_status(&status, dirty) }
+                if dirty {
+                    <Button variant={BtnVariant::Secondary} label="Discard" onclick={discard} />
+                }
+                <Button variant={BtnVariant::Primary}
+                        busy={matches!(&*status, SaveStatus::Saving)} busy_label="Saving…"
+                        disabled={!dirty} label="Save config" onclick={save} />
             </div>
         </div>
     }
@@ -153,14 +176,18 @@ enum SaveStatus {
     Error(String),
 }
 
-fn save_status_view(status: &SaveStatus) -> Html {
+/// The save-bar indicator. A pending edit (`dirty`) shows an amber "unsaved
+/// changes" pill, which takes precedence over a stale "saved" so the operator is
+/// never misled into thinking new edits are persisted.
+fn save_bar_status(status: &SaveStatus, dirty: bool) -> Html {
     match status {
-        SaveStatus::Idle => Html::default(),
         SaveStatus::Saving => html! { <span class="text-sm text-slate-500">{ "Saving…" }</span> },
-        SaveStatus::Saved => html! { <Pill text="saved" tone={Tone::Good} /> },
         SaveStatus::Error(msg) => html! {
-            <span class="text-sm text-rose-600" title={msg.clone()}>{ "Save failed" }</span>
+            <span class="text-sm text-rose-700" title={msg.clone()}>{ "Save failed" }</span>
         },
+        _ if dirty => html! { <Pill text="unsaved changes" tone={Tone::Warn} /> },
+        SaveStatus::Saved => html! { <Pill text="saved" tone={Tone::Good} /> },
+        SaveStatus::Idle => Html::default(),
     }
 }
 
@@ -529,7 +556,7 @@ fn basic_auth_users(props: &PanelProps) -> Html {
         <div>
             <p class="mb-2 text-sm font-medium text-slate-600">{ "Users" }</p>
             if users.is_empty() {
-                <p class="text-sm text-slate-400">{ "No users — anyone is prompted but none can pass." }</p>
+                <p class="text-sm text-slate-500">{ "No users — anyone is prompted but none can pass." }</p>
             } else {
                 <ul class="divide-y divide-slate-100">
                     { for users.iter().map(|name| {
@@ -543,7 +570,7 @@ fn basic_auth_users(props: &PanelProps) -> Html {
                             <li class="flex items-center justify-between py-1.5 text-sm">
                                 <span class="font-medium text-slate-700">{ &name }</span>
                                 <button onclick={on_remove}
-                                        class="text-xs font-medium text-rose-600 hover:underline">
+                                        class="text-xs font-medium text-rose-700 hover:underline">
                                     { "Remove" }
                                 </button>
                             </li>
@@ -553,9 +580,11 @@ fn basic_auth_users(props: &PanelProps) -> Html {
             }
             <form onsubmit={add} class="mt-2 flex flex-wrap items-end gap-2">
                 <input ref={user_ref} placeholder="username"
-                       class="rounded-md border border-slate-300 px-2.5 py-1.5 text-sm" />
+                       class="rounded-md border border-slate-300 px-2.5 py-1.5 text-sm shadow-sm \
+                              focus:border-sky-500 focus:outline-none focus:ring-1 focus:ring-sky-500" />
                 <input ref={pass_ref} type="password" placeholder="password" autocomplete="new-password"
-                       class="rounded-md border border-slate-300 px-2.5 py-1.5 text-sm" />
+                       class="rounded-md border border-slate-300 px-2.5 py-1.5 text-sm shadow-sm \
+                              focus:border-sky-500 focus:outline-none focus:ring-1 focus:ring-sky-500" />
                 <button type="submit"
                         class="rounded-md border border-slate-300 px-3 py-1.5 text-sm font-medium \
                                text-slate-700 hover:bg-slate-50">

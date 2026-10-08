@@ -9,10 +9,13 @@
 use wasm_bindgen_futures::spawn_local;
 use web_sys::HtmlSelectElement;
 use yew::prelude::*;
+use yew_router::prelude::use_route;
 
 use crate::auth::{DEFAULT_PROJECT, use_session};
 use crate::hooks::{Fetch, use_api};
 use crate::models::ProjectSummary;
+use crate::widgets::{BtnVariant, Button};
+use crate::{Route, is_node_route};
 
 /// The header project control: a dropdown to switch the active project, plus a
 /// toggle-reveal inline form to create one. On a token without `System·Read`
@@ -20,6 +23,11 @@ use crate::models::ProjectSummary;
 #[function_component(ProjectSelector)]
 pub fn project_selector() -> Html {
     let session = use_session();
+    // Whether the current page is node-global (project is irrelevant there).
+    let on_node = use_route::<Route>()
+        .as_ref()
+        .map(is_node_route)
+        .unwrap_or(false);
     let projects = use_api(|client| async move {
         client
             .get_json::<Vec<ProjectSummary>>("/api/projects")
@@ -62,9 +70,28 @@ pub fn project_selector() -> Html {
         }
     };
 
+    // On a node-global page the active project does not apply; show it inert so
+    // an operator is never misled into thinking a node op is project-scoped.
+    if on_node {
+        return html! {
+            <div class="flex items-center gap-1.5"
+                 title="this page is node-global — not scoped to a project">
+                <span class="text-[11px] uppercase tracking-wide text-slate-500">{ "project" }</span>
+                <span class="rounded-md border border-slate-200 bg-slate-50 px-2 py-1 text-sm \
+                             font-medium text-slate-500">{ active.clone() }</span>
+                <span class="text-xs text-slate-500">{ "node scope" }</span>
+            </div>
+        };
+    }
+
+    let aria = if *creating {
+        "cancel new project"
+    } else {
+        "create a project"
+    };
     html! {
         <div class="flex items-center gap-1.5">
-            <span class="text-xs text-slate-400">{ "project" }</span>
+            <span class="text-[11px] uppercase tracking-wide text-slate-500">{ "project" }</span>
             <select onchange={on_change}
                     class="rounded-md border border-slate-300 py-1 pl-2 pr-7 text-sm font-medium \
                            text-slate-700 focus:border-sky-500 focus:outline-none focus:ring-1 \
@@ -73,9 +100,11 @@ pub fn project_selector() -> Html {
                     <option value={n.clone()} selected={*n == active}>{ n.clone() }</option>
                 }) }
             </select>
-            <button onclick={toggle_create} title="create a project"
+            <button onclick={toggle_create} title="create a project" aria-label={aria}
+                    aria-expanded={(*creating).to_string()}
                     class="rounded-md border border-slate-300 px-2 py-1 text-sm font-medium \
-                           text-slate-600 hover:bg-slate-50">
+                           text-slate-600 hover:bg-slate-50 focus-visible:outline-none \
+                           focus-visible:ring-2 focus-visible:ring-sky-500 focus-visible:ring-offset-2">
                 { if *creating { "×" } else { "+" } }
             </button>
             if *creating {
@@ -154,13 +183,10 @@ fn create_project(props: &CreateProjectProps) -> Html {
             <input value={(*name).clone()} oninput={on_input} placeholder="new-project-slug"
                    class="w-40 rounded-md border border-slate-300 px-2 py-1 text-sm shadow-sm \
                           focus:border-sky-500 focus:outline-none focus:ring-1 focus:ring-sky-500" />
-            <button onclick={create} disabled={*busy}
-                    class="rounded-md bg-sky-600 px-2.5 py-1 text-sm font-medium text-white \
-                           hover:bg-sky-700 disabled:opacity-50">
-                { if *busy { "…" } else { "Create" } }
-            </button>
+            <Button variant={BtnVariant::Primary} busy={*busy} busy_label="…"
+                    label="Create" onclick={create} />
             if let Some(msg) = &*error {
-                <span class="text-xs text-rose-600">{ msg }</span>
+                <span class="text-xs text-rose-700">{ msg }</span>
             }
         </div>
     }

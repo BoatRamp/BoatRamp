@@ -76,7 +76,7 @@ fn console_base() -> Option<AttrValue> {
 /// The console's client-side routes. Kept deliberately shallow (the per-site
 /// tabs stay component-local); paths are relative to the router `basename`.
 #[derive(Clone, Routable, PartialEq)]
-enum Route {
+pub(crate) enum Route {
     /// The all-sites overview (dashboard).
     #[at("/")]
     Sites,
@@ -102,6 +102,16 @@ enum Route {
     #[not_found]
     #[at("/404")]
     NotFound,
+}
+
+/// Whether a route's data is NODE-global (not scoped to the active project), so
+/// the project selector is inert there and says so. Sites/Functions are
+/// project-scoped; Monitoring/Maintenance/Tokens are node-global.
+pub(crate) fn is_node_route(route: &Route) -> bool {
+    matches!(
+        route,
+        Route::Monitoring | Route::Maintenance | Route::Tokens
+    )
 }
 
 /// The top-nav group a route belongs to, so `/sites/:name` still lights up the
@@ -181,9 +191,14 @@ fn shell() -> Html {
                 <div class="mx-auto flex max-w-6xl items-center justify-between px-6 py-4">
                     <div class="flex items-center gap-6">
                         <h1 class="text-lg font-semibold tracking-tight">{ "boatramp console" }</h1>
-                        <nav class="flex items-center gap-1">
+                        <nav class="flex flex-wrap items-center gap-1">
+                            <span class="mr-0.5 text-[11px] uppercase tracking-wide text-slate-500"
+                                  title="scoped to the active project">{ "project" }</span>
                             <NavItem to={Route::Sites} label="Sites" />
                             <NavItem to={Route::Functions} label="Functions" />
+                            <span class="mx-2 h-5 w-px bg-slate-200" aria-hidden="true"></span>
+                            <span class="mr-0.5 text-[11px] uppercase tracking-wide text-slate-500"
+                                  title="node-global — not scoped to a project">{ "node" }</span>
                             <NavItem to={Route::Monitoring} label="Monitoring" />
                             <NavItem to={Route::Maintenance} label="Maintenance" />
                             <NavItem to={Route::Tokens} label="Tokens" />

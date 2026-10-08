@@ -13,7 +13,7 @@ use yew::prelude::*;
 
 use crate::auth::use_session;
 use crate::format::{relative_age, short_id};
-use crate::hooks::{use_api, Fetch};
+use crate::hooks::{Fetch, use_api};
 use crate::models::SetAliasRequest;
 use crate::widgets::{ErrorBanner, Pill, Spinner, Tone};
 
@@ -193,7 +193,7 @@ fn deployment_row(
             </td>
             <td class="py-2.5 text-right">
                 if is_current {
-                    <span class="text-xs text-slate-400">{ "current" }</span>
+                    <span class="text-xs text-slate-500">{ "current" }</span>
                 } else {
                     <button onclick={on_click}
                             class="rounded-md border border-slate-300 px-2.5 py-1 text-xs \
@@ -329,14 +329,14 @@ fn aliases(props: &SiteProp) -> Html {
                         <li class="flex items-center justify-between py-2 text-sm">
                             <span>
                                 <span class="font-medium text-slate-800">{ &name }</span>
-                                <span class="mx-2 text-slate-400">{ "→" }</span>
+                                <span class="mx-2 text-slate-500">{ "→" }</span>
                                 <span class="font-mono text-slate-600" title={id.clone()}>
                                     { short_id(id) }
                                 </span>
                             </span>
                             <button onclick={on_remove}
                                     class="rounded-md border border-rose-200 px-2 py-1 text-xs \
-                                           font-medium text-rose-600 hover:bg-rose-50">
+                                           font-medium text-rose-700 hover:bg-rose-50">
                                 { "Remove" }
                             </button>
                         </li>

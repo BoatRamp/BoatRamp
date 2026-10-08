@@ -9,11 +9,11 @@ use yew::prelude::*;
 
 use crate::auth::use_session;
 use crate::format::relative_age;
-use crate::hooks::{use_api, Fetch};
+use crate::hooks::{Fetch, use_api};
 use crate::models::{
     CreateTokenRequest, CreateTokenResponse, GrantedRole, InvalidateRequest, TokenMeta,
 };
-use crate::widgets::{ErrorBanner, Pill, Spinner, Tone};
+use crate::widgets::{CopyButton, ErrorBanner, INPUT, Pill, Section, Spinner, Tone};
 
 /// The tokens + cache view.
 #[function_component(Tokens)]
@@ -35,6 +35,8 @@ fn token_list() -> Html {
     // The freshly-minted plaintext token, shown once after creation.
     let minted = use_state(|| Option::<String>::None);
     let action_error = use_state(|| Option::<String>::None);
+    // In-flight guard so a double-submit can't mint two tokens.
+    let minting = use_state(|| false);
     let label_ref = use_node_ref();
     let roles_ref = use_node_ref();
 
@@ -43,6 +45,7 @@ fn token_list() -> Html {
         let reload = list.reload.clone();
         let minted = minted.clone();
         let action_error = action_error.clone();
+        let minting = minting.clone();
         let label_ref = label_ref.clone();
         let roles_ref = roles_ref.clone();
         Callback::from(move |e: SubmitEvent| {
@@ -74,19 +77,22 @@ fn token_list() -> Html {
             let reload = reload.clone();
             let minted = minted.clone();
             let action_error = action_error.clone();
+            let minting = minting.clone();
             let label_ref = label_ref.clone();
             let roles_ref = roles_ref.clone();
             action_error.set(None);
+            minting.set(true);
             spawn_local(async move {
                 let body = CreateTokenRequest {
                     label,
                     roles,
                     ttl_secs: None,
                 };
-                match client
+                let outcome = client
                     .post_json::<_, CreateTokenResponse>("/api/tokens", &body)
-                    .await
-                {
+                    .await;
+                minting.set(false);
+                match outcome {
                     Ok(resp) => {
                         minted.set(Some(resp.token));
                         if let Some(el) = label_ref.cast::<HtmlInputElement>() {
@@ -135,30 +141,34 @@ fn token_list() -> Html {
             <p class="text-sm text-slate-500">{ "No tokens minted." }</p>
         },
         Fetch::Ready(tokens) => html! {
-            <table class="w-full text-sm">
-                <thead>
-                    <tr class="border-b border-slate-200 text-left text-slate-500">
-                        <th class="py-2 font-medium">{ "Label" }</th>
-                        <th class="py-2 font-medium">{ "Roles" }</th>
-                        <th class="py-2 font-medium">{ "Created" }</th>
-                        <th class="py-2 font-medium text-right">{ "Action" }</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    { for tokens.iter().map(|t| token_row(t, &revoke)) }
-                </tbody>
-            </table>
+            <div class="overflow-x-auto">
+                <table class="w-full min-w-[36rem] text-sm">
+                    <thead>
+                        <tr class="border-b border-slate-200 text-left text-slate-500">
+                            <th scope="col" class="py-2 font-medium">{ "Label" }</th>
+                            <th scope="col" class="py-2 font-medium">{ "Roles" }</th>
+                            <th scope="col" class="py-2 font-medium">{ "Created" }</th>
+                            <th scope="col" class="py-2 font-medium text-right">{ "Action" }</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        { for tokens.iter().map(|t| token_row(t, &revoke)) }
+                    </tbody>
+                </table>
+            </div>
         },
     };
 
     html! {
-        <section class="rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
-            <h3 class="mb-4 text-base font-semibold text-slate-900">{ "API tokens" }</h3>
+        <Section title="API tokens">
             if let Some(token) = &*minted {
                 <div class="mb-4 rounded-lg border border-emerald-200 bg-emerald-50 p-4">
-                    <p class="text-sm font-medium text-emerald-800">
-                        { "New token — copy it now, it won't be shown again:" }
-                    </p>
+                    <div class="flex items-center justify-between gap-2">
+                        <p class="text-sm font-medium text-emerald-800">
+                            { "New token — copy it now, it won't be shown again:" }
+                        </p>
+                        <CopyButton value={token.clone()} />
+                    </div>
                     <code class="mt-2 block break-all rounded bg-white p-2 font-mono text-xs text-slate-700">
                         { token }
                     </code>
@@ -170,23 +180,24 @@ fn token_list() -> Html {
             { rows }
             <form onsubmit={create} class="mt-4 flex flex-wrap items-end gap-3 border-t border-slate-100 pt-4">
                 <div class="flex-1 min-w-[10rem]">
-                    <label class="block text-xs font-medium text-slate-500">{ "Label" }</label>
-                    <input ref={label_ref} placeholder="ci-deploy"
-                           class="mt-1 w-full rounded-md border border-slate-300 px-2.5 py-1.5 text-sm" />
+                    <label class="block text-sm font-medium text-slate-700">{ "Label" }</label>
+                    <input ref={label_ref} placeholder="ci-deploy" class={classes!("mt-1", INPUT)} />
                 </div>
                 <div class="flex-1 min-w-[12rem]">
-                    <label class="block text-xs font-medium text-slate-500">
+                    <label class="block text-sm font-medium text-slate-700">
                         { "Roles (e.g. admin, publisher:blog)" }
                     </label>
                     <input ref={roles_ref} placeholder="publisher:blog, viewer:docs"
-                           class="mt-1 w-full rounded-md border border-slate-300 px-2.5 py-1.5 text-sm font-mono" />
+                           class={classes!("mt-1", INPUT, "font-mono")} />
                 </div>
-                <button type="submit"
-                        class="rounded-md bg-sky-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-sky-700">
-                    { "Mint token" }
+                <button type="submit" disabled={*minting}
+                        class="rounded-md bg-sky-600 px-3 py-1.5 text-sm font-medium text-white \
+                               hover:bg-sky-700 disabled:opacity-50 focus-visible:outline-none \
+                               focus-visible:ring-2 focus-visible:ring-sky-500 focus-visible:ring-offset-2">
+                    { if *minting { "Minting…" } else { "Mint token" } }
                 </button>
             </form>
-        </section>
+        </Section>
     }
 }
 
@@ -219,8 +230,9 @@ fn token_row(token: &TokenMeta, revoke: &Callback<String>) -> Html {
             <td class="py-2.5 text-slate-600">{ relative_age(token.created_at) }</td>
             <td class="py-2.5 text-right">
                 <button onclick={on_click}
-                        class="rounded-md border border-rose-200 px-2.5 py-1 text-xs font-medium \
-                               text-rose-600 hover:bg-rose-50">
+                        class="rounded-md bg-rose-600 px-2.5 py-1 text-xs font-medium text-white \
+                               hover:bg-rose-700 focus-visible:outline-none focus-visible:ring-2 \
+                               focus-visible:ring-sky-500 focus-visible:ring-offset-2">
                     { "Revoke" }
                 </button>
             </td>
@@ -298,7 +310,8 @@ fn cache_invalidation() -> Html {
             <h3 class="mb-4 text-base font-semibold text-slate-900">{ "Cache invalidation" }</h3>
             <label class="block text-sm font-medium text-slate-700">{ "Keys (one per line)" }</label>
             <textarea ref={keys_ref} rows="3"
-                      class="mt-1 w-full rounded-md border border-slate-300 px-2.5 py-1.5 text-sm font-mono" />
+                      class="mt-1 w-full rounded-md border border-slate-300 px-2.5 py-1.5 text-sm font-mono \
+                             shadow-sm focus:border-sky-500 focus:outline-none focus:ring-1 focus:ring-sky-500" />
             <div class="mt-3 flex items-center gap-3">
                 <button onclick={on_invalidate}
                         class="rounded-md bg-sky-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-sky-700">
@@ -306,14 +319,14 @@ fn cache_invalidation() -> Html {
                 </button>
                 <button onclick={on_flush}
                         class="rounded-md border border-rose-300 px-3 py-1.5 text-sm font-medium \
-                               text-rose-600 hover:bg-rose-50">
+                               text-rose-700 hover:bg-rose-50">
                     { "Flush all" }
                 </button>
                 if let Some(result) = &*status {
                     {
                         match result {
-                            Ok(msg) => html! { <span class="text-sm text-emerald-600">{ msg }</span> },
-                            Err(msg) => html! { <span class="text-sm text-rose-600">{ msg }</span> },
+                            Ok(msg) => html! { <span class="text-sm text-emerald-700">{ msg }</span> },
+                            Err(msg) => html! { <span class="text-sm text-rose-700">{ msg }</span> },
                         }
                     }
                 }

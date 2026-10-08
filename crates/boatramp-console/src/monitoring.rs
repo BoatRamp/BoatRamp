@@ -19,7 +19,7 @@ use crate::models::{
     BlobStatus, InstanceStatsSnapshot, KvStatus, LaneStats, NodeVersion, ProcessMemory,
 };
 use crate::observability::Metrics;
-use crate::widgets::{ErrorBanner, Pill, Spinner, Tone};
+use crate::widgets::{BtnVariant, Button, ErrorBanner, Pill, Section, Spinner, Tone};
 
 /// The Monitoring page: node version + instance stats + blob/kv health + metrics.
 #[function_component(Monitoring)]
@@ -187,7 +187,7 @@ fn lane_card(name: &str, lane: &LaneStats) -> Html {
         <div class="rounded-lg border border-slate-200 p-4">
             <div class="mb-3 flex items-center justify-between">
                 <h4 class="text-sm font-semibold text-slate-900">{ name }</h4>
-                <span class="text-xs text-slate-400">
+                <span class="text-xs text-slate-500">
                     { format!("{} / {} warm", lane.warm_now, lane.warm_capacity) }
                 </span>
             </div>
@@ -217,19 +217,10 @@ fn stat(label: &str, value: String) -> Html {
 /// A section card with a title and a Refresh button wired to `reload`.
 fn card(title: &str, reload: Callback<()>, body: Html) -> Html {
     let on_refresh = Callback::from(move |_: MouseEvent| reload.emit(()));
-    html! {
-        <section class="rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
-            <div class="mb-4 flex items-center justify-between">
-                <h3 class="text-base font-semibold text-slate-900">{ title }</h3>
-                <button onclick={on_refresh}
-                        class="rounded-md border border-slate-300 px-2.5 py-1 text-sm font-medium \
-                               text-slate-700 hover:bg-slate-50">
-                    { "Refresh" }
-                </button>
-            </div>
-            { body }
-        </section>
-    }
+    let action = html! {
+        <Button variant={BtnVariant::Secondary} label="Refresh" onclick={on_refresh} />
+    };
+    html! { <Section title={title.to_string()} action={action}>{ body }</Section> }
 }
 
 /// Shown when `/api/instance-stats` 404s because the server was built without

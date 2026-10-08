@@ -13,7 +13,7 @@ use yew::prelude::*;
 
 use crate::auth::use_session;
 use crate::models::CheckResult;
-use crate::widgets::{ErrorBanner, Pill, Spinner, Tone};
+use crate::widgets::{BtnVariant, Button, ErrorBanner, INPUT, Pill, SELECT, Spinner, Tone};
 
 /// Percent-encode a host for a URL path segment. Hostnames are `[a-z0-9.-]` plus
 /// a leading `*.` for wildcards; only `*` needs escaping (matches the CLI's
@@ -152,20 +152,21 @@ pub fn domain_verifications(props: &DomainVerificationsProps) -> Html {
             { body }
             <form onsubmit={start} class="mt-4 flex flex-wrap items-end gap-3 border-t border-slate-100 pt-4">
                 <div class="flex-1 min-w-[12rem]">
-                    <label class="block text-xs font-medium text-slate-500">{ "Host" }</label>
+                    <label class="block text-sm font-medium text-slate-700">{ "Host" }</label>
                     <input ref={host_ref} placeholder="example.com or *.example.com"
-                           class="mt-1 w-full rounded-md border border-slate-300 px-2.5 py-1.5 text-sm font-mono" />
+                           class={classes!("mt-1", INPUT, "font-mono")} />
                 </div>
                 <div>
-                    <label class="block text-xs font-medium text-slate-500">{ "Method" }</label>
-                    <select onchange={on_method}
-                            class="mt-1 rounded-md border border-slate-300 px-2.5 py-1.5 text-sm">
+                    <label class="block text-sm font-medium text-slate-700">{ "Method" }</label>
+                    <select onchange={on_method} class={classes!("mt-1", SELECT)}>
                         <option value="http" selected={*method == VerificationMethod::Http}>{ "HTTP token" }</option>
                         <option value="dns" selected={*method == VerificationMethod::Dns}>{ "DNS TXT" }</option>
                     </select>
                 </div>
                 <button type="submit"
-                        class="rounded-md bg-sky-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-sky-700">
+                        class="rounded-md bg-sky-600 px-3 py-1.5 text-sm font-medium text-white \
+                               hover:bg-sky-700 focus-visible:outline-none focus-visible:ring-2 \
+                               focus-visible:ring-sky-500 focus-visible:ring-offset-2">
                     { "Start challenge" }
                 </button>
             </form>
@@ -294,36 +295,29 @@ fn challenge(props: &ChallengeProps) -> Html {
                 <span class="font-mono text-sm font-medium text-slate-800">{ &v.host }</span>
                 <div class="flex items-center gap-3">
                     <Pill text={label} tone={tone} />
-                    <span class="text-xs text-slate-400">{ v.method.as_str() }</span>
+                    <span class="text-xs text-slate-500">{ v.method.as_str() }</span>
                 </div>
             </div>
             <div class="mt-3 space-y-2">{ instructions }</div>
             if let Some(result) = &*check {
                 <div class="mt-3 text-sm">
                     if result.passed {
-                        <span class="text-emerald-600">
+                        <span class="text-emerald-700">
                             { if result.attached { "Verified and attached." } else { "Verified." } }
                         </span>
                     } else {
-                        <span class="text-amber-600">
+                        <span class="text-amber-700">
                             { result.detail.clone().unwrap_or_else(|| "Not yet — check the record.".into()) }
                         </span>
                     }
                 </div>
             }
             if let Some(msg) = &*error {
-                <p class="mt-2 text-sm text-rose-600">{ msg }</p>
+                <p class="mt-2 text-sm text-rose-700">{ msg }</p>
             }
             <div class="mt-3 flex gap-2">
-                <button onclick={run_check}
-                        class="rounded-md bg-sky-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-sky-700">
-                    { "Check now" }
-                </button>
-                <button onclick={remove}
-                        class="rounded-md border border-rose-200 px-3 py-1.5 text-xs font-medium \
-                               text-rose-600 hover:bg-rose-50">
-                    { "Drop" }
-                </button>
+                <Button variant={BtnVariant::Primary} label="Check now" onclick={run_check} />
+                <Button variant={BtnVariant::DangerSubtle} label="Drop" onclick={remove} />
             </div>
         </li>
     }

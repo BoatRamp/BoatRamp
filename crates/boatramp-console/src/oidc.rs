@@ -12,8 +12,8 @@
 //! for convenience; the per-flow PKCE secrets live in `sessionStorage` and are
 //! cleared the moment the callback completes.
 
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use gloo_net::http::{Method, RequestBuilder};
 use gloo_storage::{LocalStorage, SessionStorage, Storage};
 use serde::Deserialize;
