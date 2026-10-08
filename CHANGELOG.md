@@ -5,6 +5,33 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.16.0] - 2026-10-08
+
+Web **console alignment (stage 2)** — node operations. The Maintenance page becomes a sectioned
+node-ops surface (Certificates / Blobs / Control-plane KV / Cluster / Trust & RBAC), adding the
+`System·Admin` operational endpoints the console lacked. Console-only; no server, WIT, or shim change.
+
+- **Blobs**: blob **drain** (`POST /api/blob-drain`) and **purge** (`POST /api/blob-purge`), both as
+  live NDJSON progress streams (fetch-based, Bearer-carrying), alongside the existing prune/scrub.
+  Dry-run is the default; the real action is behind a confirmation naming exactly what it changes.
+  A 422 (no `[serve.blob_fallback]`) and a 409 (unsafe unreferenced GC while a fallback is attached)
+  surface as the server's own message.
+- **Control-plane KV**: **checkpoint** (`POST /api/kv-checkpoint`), **export**
+  (`GET /api/kv-export`, downloaded as an opaque binary dump — sealed secret ciphertext + config +
+  RBAC, never rendered), and **import** (`POST /api/kv-import`, file upload) with a dry-run plan by
+  default, a confirmed apply, and a separate explicit **force** toggle for commingling onto a
+  non-empty control plane.
+- **Cluster**: membership table (`GET /api/cluster/members`), **join-token** minting (shown once),
+  and confirmed **promote** / **revoke**. On a non-cluster node the endpoints 501 and the surface
+  shows "This node is not a cluster node."
+- **Trust & RBAC**: root trust anchors (`GET/PUT/DELETE /api/auth/root`) with make-before-break
+  guidance (add-then-remove, each removal confirmed), plus **read-only** views of the dynamic daemon
+  config (`GET /api/daemon/config`) and the RBAC policy (`GET /api/authz/policy`) — their editors
+  come in a later stage.
+
+Every destructive action defaults to dry-run and requires a confirmation that names its exact
+effect; secret values are never displayed. Reviewed for UI safety before release.
+
 ## [0.15.0] - 2026-10-07
 
 Web **console alignment (stage 1 of a staged series)** — bringing the embedded management console
