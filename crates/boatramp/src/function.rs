@@ -380,6 +380,27 @@ pub async fn run(args: FunctionArgs, config: &ProjectConfig) -> Result<()> {
                     println!("{}", f.name);
                     println!("  runtime: {}", f.runtime);
                     println!("  version: {}", f.version);
+                    // The effective in-site tenancy so an operator can confirm pass-vs-deny without
+                    // probing. `None` ⇒ the route declares no tenancy (inherits the site decision).
+                    match &f.tenancy {
+                        Some(t) => {
+                            let mut parts = vec![format!("mode={}", t.mode)];
+                            if let Some(c) = &t.column {
+                                parts.push(format!("column={c}"));
+                            }
+                            if let Some(r) = &t.read {
+                                parts.push(format!("read={r}"));
+                            }
+                            if let Some(w) = &t.write {
+                                parts.push(format!("write={w}"));
+                            }
+                            if let Some(u) = &t.on_unresolved {
+                                parts.push(format!("on_unresolved={u}"));
+                            }
+                            println!("  tenancy: {}", parts.join(" "));
+                        }
+                        None => println!("  tenancy: (none — inherits the site decision)"),
+                    }
                     for t in &f.triggers {
                         println!("  trigger: {t}");
                     }

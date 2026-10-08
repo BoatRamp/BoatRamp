@@ -52,6 +52,13 @@ pub(super) async fn list_functions(
                 runtime: f.config.runtime.as_str().to_string(),
                 version: f.active,
                 triggers: trigs,
+                // Surface the route's declared tenancy (scope + on_unresolved) so pass-vs-deny is
+                // confirmable without probing. `None` ⇒ inherits the site decision.
+                tenancy: f
+                    .config
+                    .tenancy
+                    .as_ref()
+                    .map(boatramp_core::function::TenancySummary::of),
             });
         }
     }
@@ -68,6 +75,11 @@ pub(super) async fn list_functions(
                         version: f.active,
                         // A top-level function has a stable invoke URL (FA-3).
                         triggers: vec![format!("invoke {}", f.name)],
+                        tenancy: f
+                            .config
+                            .tenancy
+                            .as_ref()
+                            .map(boatramp_core::function::TenancySummary::of),
                     });
                 }
             }

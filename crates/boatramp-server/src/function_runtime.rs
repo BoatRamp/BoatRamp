@@ -1068,6 +1068,8 @@ pub(super) async fn build_function_bindings(
                 None,
                 Vec::new(),
                 false,
+                // Tenant-agnostic admin path — not an `on_unresolved: "pass"` bind.
+                false,
             );
         }
         #[cfg(feature = "migrate")]
@@ -1310,6 +1312,10 @@ pub(super) async fn build_function_bindings(
             resolved_tenant_string(&caller_tenant),
             config.blobstore_containers.clone(),
             multi_tenant,
+            // Honor `on_unresolved: "pass"` uniformly on the async/invoke lane too.
+            host_tenancy
+                .as_ref()
+                .is_some_and(boatramp_handlers::HostTenancy::pass_unresolved),
         );
     }
     // The host-verified sealed principal for THIS invocation (PLAN-async-persona): only on a lane that

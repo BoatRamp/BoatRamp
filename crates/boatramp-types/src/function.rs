@@ -991,6 +991,81 @@ pub fn materialize(
         .collect()
 }
 
+/// A read-only summary of a route/function's declared in-site tenancy, surfaced on
+/// [`FunctionSummary`] so an operator can confirm the scope + the `on_unresolved` pass-vs-deny
+/// decision WITHOUT black-box probing (the gap construens hit diagnosing an applied-but-seemingly-
+/// ignored `on_unresolved: "pass"`). `None` on [`FunctionSummary::tenancy`] ⇒ the function declares
+/// no tenancy of its own and inherits the site decision (read the site config to see that one).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TenancySummary {
+    /// The tenancy class: `"scoped"` | `"target"` | `"disabled"`.
+    pub mode: String,
+    /// The tenant column (`scoped` only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub column: Option<String>,
+    /// Read access mode (`scoped`): `none` | `null` | `own` | `own_or_null` | `all`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read: Option<String>,
+    /// Write access mode (`scoped`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write: Option<String>,
+    /// The unresolved-request policy (`scoped`): `"deny"` (default) | `"pass"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_unresolved: Option<String>,
+}
+
+impl TenancySummary {
+    /// Summarize a declared [`Tenancy`](crate::tenancy::Tenancy) for the read-only function view.
+    pub fn of(t: &crate::tenancy::Tenancy) -> Self {
+        use crate::tenancy::{AccessMode, OnUnresolved, Tenancy};
+        let access = |m: &AccessMode| {
+            match m {
+                AccessMode::None => "none",
+                AccessMode::Null => "null",
+                AccessMode::Own => "own",
+                AccessMode::OwnOrNull => "own_or_null",
+                AccessMode::All => "all",
+            }
+            .to_string()
+        };
+        match t {
+            Tenancy::Disabled => Self {
+                mode: "disabled".to_string(),
+                column: None,
+                read: None,
+                write: None,
+                on_unresolved: None,
+            },
+            Tenancy::Scoped {
+                column,
+                read,
+                write,
+                on_unresolved,
+                ..
+            } => Self {
+                mode: "scoped".to_string(),
+                column: Some(column.clone()),
+                read: Some(access(read)),
+                write: Some(access(write)),
+                on_unresolved: Some(
+                    match on_unresolved {
+                        OnUnresolved::Pass => "pass",
+                        OnUnresolved::Deny => "deny",
+                    }
+                    .to_string(),
+                ),
+            },
+            Tenancy::Target { .. } => Self {
+                mode: "target".to_string(),
+                column: None,
+                read: Some("target".to_string()),
+                write: None,
+                on_unresolved: None,
+            },
+        }
+    }
+}
+
 /// One entry in the `GET /api/functions` view: a function plus its resolved
 /// active version and the triggers that reach it. The read-only projection the
 /// server returns and the CLI/console render.
@@ -1006,6 +1081,11 @@ pub struct FunctionSummary {
     pub version: String,
     /// Rendered triggers that reach this function.
     pub triggers: Vec<String>,
+    /// The function's declared in-site tenancy (scope + `on_unresolved`), so an operator can confirm
+    /// pass-vs-deny without probing. `None` ⇒ no own tenancy (inherits the site). Elided when absent
+    /// so a pre-existing consumer (and the console's field-subset mirror) is unaffected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenancy: Option<TenancySummary>,
 }
 
 #[cfg(test)]

@@ -355,6 +355,14 @@ impl HostTenancy {
         &self.facts
     }
 
+    /// Whether this (null-principal) tenancy carries `on_unresolved: "pass"` — a scoped READ under it
+    /// confines to zero rows / an empty own-space (never a refusal, never cross-tenant), while writes
+    /// stay denied. Consulted by every surface that honors `pass` (the AST SQL/ORM scope, the legacy
+    /// `sql_marker`, and the `wasi:blobstore` `{tenant}` binding) so the behavior is uniform.
+    pub fn pass_unresolved(&self) -> bool {
+        self.pass_unresolved
+    }
+
     /// The resolved own-[`ScopeAxis::Tenant`] value, if any — the value the `Own`/`OwnOrNull` scope
     /// modes bind.
     fn tenant_value(&self) -> Option<&SqlValue> {
@@ -695,6 +703,13 @@ impl HostTenancy {
     /// confines every table reference, not a single guest-placed marker. Calling this under a target
     /// principal fails closed ([`TenantDenied::NoSource`]) so a weaker single-table marker can never
     /// be substituted for the airtight rewrite.
+    ///
+    /// NOTE (liveness): this legacy `{scope}`-marker path has NO live funnel caller today — raw guest
+    /// SQL is confined by the AST rewrite (`sql::apply_scope_marker` → [`rewrite_own_read`](Self::rewrite_own_read)),
+    /// and the live null-principal `on_unresolved: "pass"` → zero-rows behavior lives there and in
+    /// `orm::no_principal_read_pred`. The `pass`/zero-rows arm below is kept DEFENSIVELY so a future
+    /// revival of the marker path (e.g. a GDC marker) cannot silently reintroduce the deny-under-pass
+    /// bug; it is covered by the `on_unresolved_pass_confinement_gate_sql_marker` anti-hollow gate.
     pub fn sql_marker(
         &self,
         axis: Axis,
@@ -708,22 +723,34 @@ impl HostTenancy {
             return Err(TenantDenied::NoSource);
         }
         let col = &self.column;
+        // Null-principal `on_unresolved: "pass"` applies to READ only (the gate mutation `deny_pass`
+        // turns it off so the anti-hollow test goes RED).
+        let pass = self.pass_unresolved
+            && matches!(axis, Axis::Read)
+            && crate::pass_mutation().as_deref() != Some("deny_pass");
         match self.mode(axis) {
             AccessMode::None => Err(TenantDenied::NoAccess),
             AccessMode::All => Ok(("1 = 1".to_string(), Vec::new())),
             AccessMode::Null => Ok((format!("{col} IS NULL"), Vec::new())),
-            AccessMode::Own => {
-                let v = self.tenant_value().cloned().ok_or(TenantDenied::NoSource)?;
-                Ok((format!("{col} = ?{}", param_count + 1), vec![v]))
-            }
-            AccessMode::OwnOrNull => {
+            AccessMode::Own => match self.tenant_value().cloned() {
+                Some(v) => Ok((format!("{col} = ?{}", param_count + 1), vec![v])),
+                // Null-principal `on_unresolved: "pass"` READ → zero rows (the marker-path analog of
+                // `no_principal_pred`'s `1 = 0` / `orm::no_principal_read_pred`'s empty OR), never a
+                // refusal. Read-only: a write axis with no principal still denies (NoSource below).
+                None if pass => Ok(("1 = 0".to_string(), Vec::new())),
+                None => Err(TenantDenied::NoSource),
+            },
+            AccessMode::OwnOrNull => match self.tenant_value().cloned() {
                 // `own+null` is an OWN-axis mode.
-                let v = self.tenant_value().cloned().ok_or(TenantDenied::NoSource)?;
-                Ok((
+                Some(v) => Ok((
                     format!("({col} = ?{} OR {col} IS NULL)", param_count + 1),
                     vec![v],
-                ))
-            }
+                )),
+                // A null-principal `pass` read fails closed to zero rows — it does NOT fall through
+                // to the base/`IS NULL` rows (the 0.12.1 design: unresolved ⇒ zero rows).
+                None if pass => Ok(("1 = 0".to_string(), Vec::new())),
+                None => Err(TenantDenied::NoSource),
+            },
         }
     }
 }

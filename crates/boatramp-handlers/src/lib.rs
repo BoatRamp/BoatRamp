@@ -19,6 +19,23 @@ pub mod logging;
 #[cfg(feature = "sql")]
 pub mod tenant;
 
+/// The active `on_unresolved: "pass"` anti-hollow mutation (reads `BOATRAMP_PASS_MUTATION`), or
+/// `None`. `deny_pass` reverts the null-principal pass handling on EVERY surface — the always-compiled
+/// `wasi:blobstore` `{tenant}` binding AND the `sql`-gated `tenant::HostTenancy::sql_marker` — back to
+/// the old hard refusal, so the pass gate goes RED (the handling is load-bearing, not hollow). Lives
+/// at the crate root (NOT the `sql`-gated `tenant` module) so the always-compiled blob surface can
+/// consult it. Present ONLY under `cfg(test)` or the `pass-gate-mutation` feature; a shipped build has
+/// neither, so it is a dead `None` and the pass handling is unconditional. Mirrors the `blob-list` seam.
+#[cfg(any(test, feature = "pass-gate-mutation"))]
+pub(crate) fn pass_mutation() -> Option<String> {
+    std::env::var("BOATRAMP_PASS_MUTATION").ok()
+}
+#[cfg(not(any(test, feature = "pass-gate-mutation")))]
+#[inline]
+pub(crate) fn pass_mutation() -> Option<String> {
+    None
+}
+
 #[cfg(feature = "engine")]
 pub use bindings::Bindings;
 #[cfg(feature = "admin")]

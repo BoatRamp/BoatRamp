@@ -5,6 +5,36 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.19.0] - 2026-10-08
+
+Fix: an applied **`on_unresolved: "pass"`** route is now honored on every tenant-scoped surface a
+request can hit, not just the SQL/ORM read path. A null-principal request (an unknown host with no
+resolvable tenant) confines to its own/empty space — reads see nothing, writes refuse — instead of
+hard-refusing with a 500.
+
+- **Blob storage (`wasi:blobstore`):** a `{tenant}`-templated container (e.g. `assets-{tenant}`)
+  under a null principal now resolves to an empty own-space — reads return empty/not-found, writes
+  refuse — the blob analog of a scoped read's `1 = 0`, instead of the hard "no resolved tenant to
+  expand a `{tenant}` entry" refusal that 500'd the guest. It never reaches another tenant's
+  container (even a crafted `assets-<other>` only sees an empty space); a non-permitted container
+  still hard-denies.
+- **Legacy SQL `{scope}` marker path:** a null-principal scoped read confines to `1 = 0` (zero rows)
+  rather than refusing (writes still deny) — defensive parity for a path with no live funnel caller
+  today (the live raw-SQL confinement is the AST rewrite, which already honored `pass`).
+- **Observability:** `boatramp function get` now reports each route's effective tenancy, including
+  `on_unresolved` (pass vs deny), so an operator can confirm what was actually applied/activated
+  without black-box probing.
+
+Not changed: the SQL/ORM AST read path already honored `pass`. Known follow-up: the `/graphql`
+gateway does not yet propagate a gateway-level `pass` to subgraph fetches — it fail-closes (refuses)
+there, so there is no leak; a subgraph still gets `pass` from its own route tenancy.
+
+Host/daemon-side only; no WIT/shim change. Writes stay denied under `pass` on every surface.
+Mutation-verified: a `deny_pass` mutation (compiled out of shipped builds) reverts the confinement on
+the blob and marker surfaces and turns the CI gate RED on both, proving it load-bearing. An
+independent security review confirmed a null-principal `pass` can only narrow access — never reach
+another tenant's data or an all-tenant namespace.
+
 ## [0.18.0] - 2026-10-08
 
 Web **console UX polish** — design-system, accessibility, and safety hardening across the console,

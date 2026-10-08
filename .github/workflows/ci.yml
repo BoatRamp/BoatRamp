@@ -497,6 +497,41 @@ jobs:
             fi
           done
 
+      # ON-UNRESOLVED PASS gate (construens on_unresolved-pass-not-honored): an applied
+      # `on_unresolved: "pass"` must be honored on EVERY surface a storefront hits, not only the AST
+      # SQL/ORM read path — a null-principal pass bind CONFINES (empty / zero rows) instead of hard
+      # -refusing, while writes stay denied. The gate drives the two surfaces that previously dropped
+      # the flag: the `wasi:blobstore` `{tenant}` binding (own container opens EMPTY; another tenant's
+      # objects stay unreachable; writes refuse) and the legacy SQL `sql_marker` (read → `1 = 0`).
+      # Markers `ON-UNRESOLVED PASS OK (blob)` + `(sql_marker)`. The gate is TWO tests (one per surface)
+      # so EACH surface's mutation-RED is proven independently — a combined test would panic on the
+      # first assert and never exercise the second. MUTATION-VERIFIED: `BOATRAMP_PASS_MUTATION=deny_pass`
+      # (via `pass-gate-mutation`, compiled OUT of shipped builds) reverts BOTH to the old refusal and
+      # MUST turn BOTH tests RED.
+      - name: "on_unresolved pass gate (applied `pass` confines, not refuses, on blob + sql_marker)"
+        run: |
+          set -eo pipefail
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-handlers \
+            --features engine,sql on_unresolved_pass_confinement_gate -- --nocapture 2>&1 | tee pass.log
+          grep -qE 'test result: ok\. 2 passed' pass.log \
+            || { echo "::error::on_unresolved pass gate did not run both halves (silent skip/failure, or the count drifted from 2 — blob + sql_marker)" >&2; exit 1; }
+          grep -q 'ON-UNRESOLVED PASS OK (blob)' pass.log \
+            || { echo "::error::on_unresolved pass gate: the BLOB half never reached its marker (a blob pass-confinement regression or a skipped test)" >&2; exit 1; }
+          grep -q 'ON-UNRESOLVED PASS OK (sql_marker)' pass.log \
+            || { echo "::error::on_unresolved pass gate: the sql_marker half never reached its marker (a marker pass-confinement regression or a skipped test)" >&2; exit 1; }
+          # Under the mutation BOTH tests must fail. `cargo test` exits non-zero if any fail (the `if`
+          # catches a surviving HOLLOW gate); then assert BOTH went RED (not just one) so neither
+          # surface's confinement is silently un-load-bearing.
+          if BOATRAMP_PASS_MUTATION=deny_pass cargo-zigbuild test --target x86_64-unknown-linux-musl \
+            -p boatramp-handlers --features engine,sql,pass-gate-mutation \
+            on_unresolved_pass_confinement_gate > pass-deny_pass.log 2>&1; then
+            echo "::error::on_unresolved pass gate is HOLLOW — it passed under BOATRAMP_PASS_MUTATION=deny_pass (a null-principal pass surface still refuses, or no longer confines)" >&2
+            exit 1
+          fi
+          grep -qE 'test result: FAILED\. 0 passed; 2 failed' pass-deny_pass.log \
+            || { echo "::error::on_unresolved pass mutation turned only one half RED — expected BOTH blob + sql_marker to fail under deny_pass (one surface's confinement is not load-bearing)" >&2; exit 1; }
+          echo "on_unresolved pass mutation verified: 'deny_pass' turns BOTH halves RED → the pass confinement is load-bearing on the blob AND sql_marker surfaces."
+
       # MULTI-ISSUER TRUST gate (token_claims `issuer_trust` + per-`iss` JWKS discovery, the trust-axis
       # dual of the claim transform). The token's `iss` is checked against the operator policy
       # (explicit `allow` ∪ an anchored host-suffix) BEFORE any fetch — fail-closed, no network on an
@@ -589,7 +624,7 @@ jobs:
       # `run_as: deployer` cron fires as is bound to the per-(project,site) ACTIVATION by the verified
       # activator, id-bound — never the global content-addressed meta. Marker `SYSTEM PRINCIPAL
       # ACTIVATION OK`. Mutations: `content_keyed` (drop the id binding → cross-deployment
-      # mis-application), `skip_clear` (a non-system activation leaves a stale System record).
+      # misapplication), `skip_clear` (a non-system activation leaves a stale System record).
       - name: "system-principal activation gate (per-(project,site), id-bound)"
         run: |
           set -eo pipefail

@@ -27,6 +27,11 @@ async-lane-gate-mutation = ["engine", "messaging"]
 # container-prefix join + the strip-back + the marker-hide each go RED when neutered. The seam also
 # lives under `cfg(test)`; this feature arms it for an out-of-test gate run. NEVER in a shipped build.
 blob-list-gate-mutation = []
+# Anti-hollow gate lane for the `on_unresolved: "pass"` null-principal confinement: arms the
+# `BOATRAMP_PASS_MUTATION` seam (`tenant::pass_mutation`) so a CI gate can prove that neutering the
+# pass handling (`deny_pass`) makes the `wasi:blobstore` `{tenant}` binding AND the legacy
+# `sql_marker` refuse again (the gate goes RED). Also under `cfg(test)`; NEVER in a shipped build.
+pass-gate-mutation = []
 engine = [
   "dep:wasmtime",
   "dep:wasmtime-wasi",
