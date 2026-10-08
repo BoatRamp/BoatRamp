@@ -5,6 +5,26 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.17.0] - 2026-10-08
+
+Web **console alignment (stage 3)** — multi-project foundation. The console was implicitly scoped to
+the `default` project; it now carries an **active project** and a header selector to switch and create
+projects, so every project-scoped view (and the family stages to come) operates under the chosen
+project. Console-only; no server, WIT, or shim change.
+
+- **Project selector** in the header: lists projects (`GET /api/projects`), switches the active
+  project, and creates one inline (`POST /api/projects`). The active project persists across reloads;
+  a token that can't list projects degrades to the current project as a static label.
+- The `ApiClient` now carries the active project and rewrites project-scoped family paths
+  (`/api/sites…`, `/api/functions…`, `/api/tenancy…`) to their qualified form
+  `/api/projects/<proj>/…` for any non-`default` project — so the existing Sites and Functions views
+  (and their config / deployments / aliases / domains / logs) re-scope with no per-call changes.
+  Node-global pages (Monitoring, Maintenance, Tokens) are unaffected. The live-log SSE stream is
+  routed through the same rewrite, so logs follow the active project too.
+
+A dedicated projects page (per-project tenancy-schema view/edit, project delete) is a later stage;
+this stage establishes the scope selector the family stages build on.
+
 ## [0.16.0] - 2026-10-08
 
 Web **console alignment (stage 2)** — node operations. The Maintenance page becomes a sectioned

@@ -57,8 +57,18 @@ impl ApiError {
 /// A `Result` over [`ApiError`].
 pub type ApiResult<T> = Result<T, ApiError>;
 
-/// The control-plane API client. Holds the base URL and an optional bearer
-/// token; cheap to clone.
+/// The project-scoped API path prefixes: when a non-`default` project is active,
+/// a request to one of these is rewritten from its bare global form
+/// `/api/<family>/…` to the project-qualified form `/api/projects/<proj>/<family>/…`
+/// (which the server's `project_scope` layer maps back). Node-global paths
+/// (`/api/metrics`, `/api/instance-stats`, `/api/tokens`, `/api/projects` itself,
+/// the node-ops endpoints, …) are NOT listed, so they are never rewritten. This
+/// list grows as each console stage adds a project-scoped family.
+const PROJECT_FAMILIES: &[&str] = &["/api/sites", "/api/functions", "/api/tenancy"];
+
+/// The control-plane API client. Holds the base URL, an optional bearer token,
+/// and the active project (whose non-`default` value scopes the family paths);
+/// cheap to clone.
 #[derive(Clone, PartialEq)]
 pub struct ApiClient {
     /// Base URL of the control-plane server, without a trailing slash. Empty for
@@ -66,22 +76,62 @@ pub struct ApiClient {
     base: String,
     /// The bearer token, if signed in.
     token: Option<String>,
+    /// The active project; `"default"` (or empty) uses the bare global paths.
+    project: String,
 }
 
 impl ApiClient {
     /// A client against `base` (trailing slash trimmed; empty = same-origin)
-    /// with an optional bearer `token`.
+    /// with an optional bearer `token`, scoped to the `default` project.
     pub fn new(base: impl Into<String>, token: Option<String>) -> Self {
         let base = base.into();
         Self {
             base: base.trim_end_matches('/').to_string(),
             token,
+            project: "default".to_string(),
         }
     }
 
-    /// Build a full URL for `path` (which must start with `/`).
+    /// Scope this client to `project` (builder). The `default` project keeps the
+    /// bare global paths; any other project qualifies the [`PROJECT_FAMILIES`].
+    #[must_use]
+    pub fn with_project(mut self, project: impl Into<String>) -> Self {
+        self.project = project.into();
+        self
+    }
+
+    /// Rewrite a request `path` to the project-qualified form when a non-`default`
+    /// project is active and `path` is a project-scoped family; otherwise return
+    /// it unchanged. `/api/sites/x` → `/api/projects/<proj>/sites/x`.
+    fn project_scoped<'a>(&self, path: &'a str) -> std::borrow::Cow<'a, str> {
+        if self.project.is_empty() || self.project == "default" {
+            return path.into();
+        }
+        for fam in PROJECT_FAMILIES {
+            if let Some(rest) = path.strip_prefix(fam) {
+                if rest.is_empty() || rest.starts_with('/') {
+                    // Drop the leading "/api", keep "/sites/x", requalify.
+                    let after_api = &path[4..];
+                    return format!("/api/projects/{}{after_api}", self.project).into();
+                }
+            }
+        }
+        path.into()
+    }
+
+    /// Build a full URL for `path` (which must start with `/`), applying the
+    /// active-project rewrite.
     fn url(&self, path: &str) -> String {
-        format!("{}{}", self.base, path)
+        format!("{}{}", self.base, self.project_scoped(path))
+    }
+
+    /// The same project-rewritten absolute URL, for callers that issue a raw
+    /// `fetch` outside this client (the SSE log tail, which can't use the typed
+    /// methods because `EventSource` can't carry the Bearer). Keeps the log
+    /// stream on the same project as every other call.
+    #[must_use]
+    pub fn abs_url(&self, path: &str) -> String {
+        self.url(path)
     }
 
     /// Attach the bearer header (if any) to a request builder.
