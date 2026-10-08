@@ -10,7 +10,7 @@ use wasm_bindgen_futures::spawn_local;
 use yew::prelude::*;
 
 use crate::auth::use_session;
-use crate::hooks::{use_api, Fetch};
+use crate::hooks::{Fetch, use_api};
 use crate::logstream;
 use crate::models::{LogEntry, LogsResponse};
 use crate::widgets::{ErrorBanner, Pill, Spinner, Tone};
@@ -166,11 +166,11 @@ fn log_tail(props: &LogTailProps) -> Html {
                 }
                 // 2. Live tail over SSE (fetch streaming carries the Bearer).
                 if let Some(token) = session.bearer() {
-                    let api_base = session.api_base();
-                    let url = format!(
-                        "{}{site}/_boatramp/logs/stream",
-                        api_base.trim_end_matches('/')
-                    );
+                    // Route through the client so the stream is on the same
+                    // (project-rewritten) path as the poll seed above.
+                    let url = session
+                        .client()
+                        .abs_url(&format!("{site}/_boatramp/logs/stream"));
                     let buffer = buffer.clone();
                     let force = force.clone();
                     handle = Some(logstream::open(&url, &token, move |payload| {

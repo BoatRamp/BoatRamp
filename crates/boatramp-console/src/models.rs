@@ -231,3 +231,27 @@ pub struct DaemonConfigResponse {
     /// The effective `DaemonConfig` as JSON (rendered pretty, read-only this stage).
     pub config: serde_json::Value,
 }
+
+// ---- Projects (the multi-project selector) --------------------------------
+
+/// One entry from `GET /api/projects` (server `boatramp_core::project::Project`).
+/// Only the fields the selector renders are modeled; serde ignores the rest.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct ProjectSummary {
+    /// The project slug — the `{proj}` segment in `/api/projects/{proj}/…`.
+    pub name: String,
+    /// Display metadata (optional free-text name / description).
+    #[serde(default)]
+    pub meta: ProjectMeta,
+}
+
+/// The `meta` block of a [`ProjectSummary`].
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+pub struct ProjectMeta {
+    /// A human display name (falls back to the slug when empty).
+    #[serde(default)]
+    pub display: String,
+    /// Free-text description.
+    #[serde(default)]
+    pub description: String,
+}

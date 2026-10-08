@@ -18,19 +18,30 @@ use crate::oidc::{self, OidcConfig};
 
 /// `sessionStorage` key for the persisted bearer token.
 const TOKEN_KEY: &str = "boatramp.console.token";
+/// `sessionStorage` key for the active project (survives reload).
+const PROJECT_KEY: &str = "boatramp.console.project";
+/// The reserved project that owns pre-project resources; its API paths are the
+/// bare global forms.
+pub const DEFAULT_PROJECT: &str = "default";
 
 /// The reactive auth/session context shared across the app: the current bearer
-/// token (if signed in) and the API base URL. Cloning is cheap; equality drives
-/// re-render when the token changes (sign-in / sign-out).
+/// token (if signed in), the API base URL, and the active project. Cloning is
+/// cheap; equality drives re-render when the token or project changes.
 #[derive(Clone, PartialEq)]
 pub struct Session {
     /// The bearer token, or `None` when signed out.
     token: Option<String>,
     /// API base URL (empty = same-origin dogfood deploy).
     base: String,
+    /// The active project — scopes the project-family API paths. `"default"`
+    /// uses the bare global forms.
+    project: String,
     /// Setter handle, so any component can sign in / out and the whole tree
     /// re-renders. Set the new token (or `None` to sign out).
     set: Callback<Option<String>>,
+    /// Setter for the active project; re-renders the tree so every data view
+    /// re-fetches under the new project.
+    set_project: Callback<String>,
 }
 
 impl Session {
@@ -51,10 +62,26 @@ impl Session {
         self.token.clone()
     }
 
-    /// An [`ApiClient`] bound to the current token + base URL — the handle every
-    /// data view uses to call the control-plane API.
+    /// An [`ApiClient`] bound to the current token + base URL + active project —
+    /// the handle every data view uses to call the control-plane API.
     pub fn client(&self) -> ApiClient {
-        ApiClient::new(self.base.clone(), self.token.clone())
+        ApiClient::new(self.base.clone(), self.token.clone()).with_project(self.project.clone())
+    }
+
+    /// The active project (`"default"` for the bare global paths).
+    pub fn project(&self) -> &str {
+        &self.project
+    }
+
+    /// Switch the active project; persists it and re-renders the tree so every
+    /// data view re-fetches under the new project.
+    pub fn set_project(&self, project: String) {
+        if project == DEFAULT_PROJECT {
+            SessionStorage::delete(PROJECT_KEY);
+        } else {
+            let _ = SessionStorage::set(PROJECT_KEY, &project);
+        }
+        self.set_project.emit(project);
     }
 
     /// Persist `token` and re-render the tree (the login → dashboard switch).
@@ -85,18 +112,27 @@ pub struct AuthProviderProps {
 
 #[function_component(AuthProvider)]
 pub fn auth_provider(props: &AuthProviderProps) -> Html {
-    // Seed from sessionStorage so a reload stays signed in.
+    // Seed from sessionStorage so a reload stays signed in / on the same project.
     let token = use_state(|| SessionStorage::get::<String>(TOKEN_KEY).ok());
+    let project = use_state(|| {
+        SessionStorage::get::<String>(PROJECT_KEY).unwrap_or_else(|_| DEFAULT_PROJECT.to_string())
+    });
 
     let set = {
         let token = token.clone();
         Callback::from(move |next: Option<String>| token.set(next))
     };
+    let set_project = {
+        let project = project.clone();
+        Callback::from(move |next: String| project.set(next))
+    };
 
     let session = Session {
         token: (*token).clone(),
         base: props.base.clone(),
+        project: (*project).clone(),
         set,
+        set_project,
     };
 
     html! {

@@ -19,6 +19,7 @@ mod ndjson;
 mod node_ops;
 mod observability;
 mod oidc;
+mod project;
 mod tokens;
 mod verify;
 mod widgets;
@@ -34,6 +35,7 @@ use maintenance::Maintenance;
 use models::{FunctionSummary, WhoAmI};
 use monitoring::{Monitoring, NodeVersionBadge};
 use observability::{FunctionLogs, SiteObservability};
+use project::ProjectSelector;
 use tokens::Tokens;
 use wasm_bindgen_futures::spawn_local;
 use widgets::{ErrorBanner, Spinner};
@@ -188,6 +190,7 @@ fn shell() -> Html {
                         </nav>
                     </div>
                     <div class="flex items-center gap-3">
+                        <ProjectSelector />
                         <NodeVersionBadge />
                         <Identity />
                         <button onclick={on_sign_out}
