@@ -531,6 +531,18 @@ jobs:
           grep -qE 'test result: FAILED\. 0 passed; 2 failed' pass-deny_pass.log \
             || { echo "::error::on_unresolved pass mutation turned only one half RED — expected BOTH blob + sql_marker to fail under deny_pass (one surface's confinement is not load-bearing)" >&2; exit 1; }
           echo "on_unresolved pass mutation verified: 'deny_pass' turns BOTH halves RED → the pass confinement is load-bearing on the blob AND sql_marker surfaces."
+          # Gateway item-1 plumbing (v0.20.0): the two boatramp-server gateway-pass tests are NON-HOLLOW
+          # — severance-verified at build time (cutting `apply_gateway_pass` turns the consume test RED;
+          # cutting `inherited_fn_tenant`'s flag turns the edge test RED) — so running them here is
+          # continuous regression protection that a gateway-level `on_unresolved:pass` actually carries
+          # into a subgraph's inherited tenancy. The confinement SEAM they ride is the SAME `deny_pass`
+          # one proven RED above (so no separate server mutation run is needed).
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-server \
+            --features handlers gateway_pass_ -- --nocapture 2>&1 | tee gateway-pass.log
+          grep -qE 'test result: ok\. 2 passed' gateway-pass.log \
+            || { echo "::error::gateway on_unresolved:pass plumbing: both tests must run (edge + consume; count drifted from 2)" >&2; exit 1; }
+          grep -q 'GATEWAY PASS OK (edge)' gateway-pass.log && grep -q 'GATEWAY PASS OK (consume)' gateway-pass.log \
+            || { echo "::error::gateway on_unresolved:pass plumbing: a marker was missing (plumbing regression or a skipped test)" >&2; exit 1; }
 
       # MULTI-ISSUER TRUST gate (token_claims `issuer_trust` + per-`iss` JWKS discovery, the trust-axis
       # dual of the claim transform). The token's `iss` is checked against the operator policy

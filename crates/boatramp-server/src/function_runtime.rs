@@ -29,6 +29,10 @@ pub(super) enum FnTenant {
     Inherited(
         Vec<boatramp_handlers::ScopeFact>,
         Option<boatramp_handlers::SealedPrincipal>,
+        // Gateway-level `on_unresolved: "pass"`: when the inherited caller facts are empty
+        // (unresolved) and the /graphql gateway opts into pass, the callee's OWN read confines to
+        // zero rows instead of fail-closing. Read-axis-only; inert once facts resolve; writes deny.
+        bool,
     ),
     /// The **durable async lane** (Stage 4): a queue/bus drain carrying an optional host-minted
     /// [signed-context envelope](boatramp_core::cose::mint_context) stamped at publish from the
@@ -787,9 +791,19 @@ pub(super) async fn execute_function(
             );
         }
     };
-    let wasm = match read_blob_fully(deploy, component).await {
-        Ok(bytes) => bytes,
-        Err(response) => return (response, 0),
+    // PERF (construens memory-instance, v0.14.0 warm-skip extended to the invoke/durable/cron/webhook
+    // lanes): `serve_with_limits*` serve a WARM component from the engine's compiled `ProxyPre` cache
+    // and never look at the bytes, so re-reading the component blob here — a full remote GET on an
+    // S3/Tigris backend just to discard it — is pure per-invocation latency. Read it ONLY on a cold
+    // miss; a warm component serves from memory. (All three serve lanes funnel through the same
+    // request-lane cache `request_component_warm` peeks.)
+    let wasm = if inner.engine.request_component_warm(component) {
+        Vec::new()
+    } else {
+        match read_blob_fully(deploy, component).await {
+            Ok(bytes) => bytes,
+            Err(response) => return (response, 0),
+        }
     };
     // Project-qualify the guest binding scope (BR-TEN-1): a same-named function
     // in two tenants must not share one kv/blob/messaging/logs namespace.
@@ -857,30 +871,18 @@ pub(super) async fn execute_function(
     let limits = function_limits(function.config.limits.as_ref());
     let request = prepare_invoke_request(request);
     let start = std::time::Instant::now();
-    let result = match lane {
-        boatramp_handlers::Lane::Sync => {
-            inner
-                .engine
-                .serve_with_limits(component, &wasm, request, bindings, limits)
-                .await
-        }
-        boatramp_handlers::Lane::Async => {
-            inner
-                .engine
-                .serve_with_limits_async(component, &wasm, request, bindings, limits)
-                .await
-        }
-        // Function invokes are Sync (synchronous call) or Async (durable); the streaming lane
-        // is HTTP-handler-only. Handle it for exhaustiveness — it runs there correctly if a
-        // streaming invoke path is ever added.
-        boatramp_handlers::Lane::Streaming => {
-            inner
-                .engine
-                .serve_with_limits_streaming(component, &wasm, request, bindings, limits)
-                .await
-        }
-    };
+    // One `serve_lane` call on the chosen lane (Sync/Async for invokes; Streaming handled for
+    // exhaustiveness) — it returns the per-serve `ServeTiming` for the cold/instantiate_ms signal.
+    let timed = inner
+        .engine
+        .serve_lane(component, &wasm, request, bindings, limits, lane)
+        .await;
     let elapsed = start.elapsed();
+    // Timing is known only on a successful serve; a pre-serve error carries none.
+    let (result, cold, instantiate_ms) = match timed {
+        Ok((response, t)) => (Ok(response), Some(t.cold), Some(t.instantiate_us / 1_000)),
+        Err(err) => (Err(err), None, None),
+    };
     inner.metrics.observe(
         &function.name,
         metrics::Trigger::Invoke,
@@ -888,6 +890,8 @@ pub(super) async fn execute_function(
         component,
         metrics::Outcome::from_result(&result),
         elapsed,
+        cold,
+        instantiate_ms,
     );
     let response = match result {
         Ok(response) => {
@@ -978,6 +982,9 @@ pub(crate) async fn execute_migration_function(
         component,
         metrics::Outcome::from_result(&result),
         elapsed,
+        // Control-plane migration (cold acceptable); per-invocation instance timing not surfaced.
+        None,
+        None,
     );
     let response = match result {
         Ok(response) => {
@@ -1204,14 +1211,22 @@ pub(super) async fn build_function_bindings(
                 .map_err(|e| BindingsError::Refused(e.to_string()))?,
                 false,
             ),
-            FnTenant::Inherited(value, _sealed) => (
-                crate::tenant_resolve::resolve_inherited_tenancy(
-                    config.tenancy.as_ref(),
-                    imports_tenant_scoped_data,
-                    posture,
-                    value.clone(),
-                )
-                .map_err(|e| BindingsError::Refused(e.to_string()))?,
+            FnTenant::Inherited(value, _sealed, gateway_pass) => (
+                // Gateway-level `on_unresolved: "pass"`: when the gateway caller was unresolved (empty
+                // inherited facts) and opted into pass, confine this callee's OWN read to zero rows
+                // instead of fail-closing. `resolve_inherited_tenancy` itself is untouched (session /
+                // normal-invoke callers unaffected); `apply_gateway_pass` ORs the flag in on the
+                // gateway edge only — inert once a principal resolves (read-axis-only); writes deny.
+                apply_gateway_pass(
+                    crate::tenant_resolve::resolve_inherited_tenancy(
+                        config.tenancy.as_ref(),
+                        imports_tenant_scoped_data,
+                        posture,
+                        value.clone(),
+                    )
+                    .map_err(|e| BindingsError::Refused(e.to_string()))?,
+                    *gateway_pass,
+                ),
                 false,
             ),
             // The durable async lane: a `signed_context` source resolves the producer's stamped
@@ -1269,6 +1284,13 @@ pub(super) async fn build_function_bindings(
         .as_ref()
         .map(|h| h.facts().to_vec())
         .unwrap_or_default();
+    // Symmetric to the external /graphql gateway: carry THIS function's `on_unresolved: "pass"` into
+    // an in-process `graphql::run` fan-out, so an unresolved caller's subgraph own-read confines to
+    // zero rows instead of fail-closing. Empty `caller_tenant` + this flag ⇒ zero-rows; inert once a
+    // principal resolves; writes always deny.
+    let caller_pass = host_tenancy
+        .as_ref()
+        .is_some_and(boatramp_handlers::HostTenancy::pass_unresolved);
     // The resolved principal's CLASS (PLAN-system-principal P3), so a SYSTEM invocation's `emit` seals
     // a system context (no tenant) rather than failing to stamp one. Default `Tenant` when there is no
     // resolved tenancy (an unscoped producer), unchanged.
@@ -1335,7 +1357,7 @@ pub(super) async fn build_function_bindings(
                 anchor.as_ref(),
             )
         }
-        FnTenant::Inherited(_, sealed) => sealed.clone(),
+        FnTenant::Inherited(_, sealed, _) => sealed.clone(),
         _ => None,
     };
     if let Some(principal) = sealed_principal.clone() {
@@ -1492,7 +1514,12 @@ pub(super) async fn build_function_bindings(
         && let Some(invoker) = inner.invoker.get()
     {
         bindings = bindings.with_invoke(
-            invoker.scoped(project, caller_tenant.clone(), sealed_principal.clone()),
+            invoker.scoped_with_pass(
+                project,
+                caller_tenant.clone(),
+                sealed_principal.clone(),
+                caller_pass,
+            ),
             config.invoke_targets.clone(),
             depth,
         );
@@ -1508,7 +1535,12 @@ pub(super) async fn build_function_bindings(
         // above) — the async lane's own-scoped supergraph writes + `role(…)` fields then resolve
         // instead of failing closed (PLAN-async-persona).
         bindings = bindings.with_graphql(
-            runner.scoped(project, caller_tenant.clone(), sealed_principal.clone()),
+            runner.scoped_with_pass(
+                project,
+                caller_tenant.clone(),
+                sealed_principal.clone(),
+                caller_pass,
+            ),
             depth,
         );
     }
@@ -1655,6 +1687,12 @@ pub(crate) struct FunctionInvoker {
     /// same value the caller sees. `None` when the caller carries no verified seal (the sync lane).
     /// Host-propagated, never from the guest's invoke request.
     sealed_principal: Option<boatramp_handlers::SealedPrincipal>,
+    /// A gateway-level `on_unresolved: "pass"` carried from the /graphql caller (or an in-process
+    /// `graphql::run` fan-out): when the caller is unresolved (`caller_tenant` empty) and opted into
+    /// pass, an invoked subgraph's OWN read confines to zero rows instead of fail-closing. Read-axis-
+    /// only and inert once a principal resolves; writes always deny. `false` on every non-gateway
+    /// edge (set only by [`scoped_with_pass`](Self::scoped_with_pass)).
+    caller_pass_unresolved: bool,
 }
 
 #[cfg(feature = "handlers")]
@@ -1666,6 +1704,7 @@ impl FunctionInvoker {
             project: ProjectRef::DEFAULT.as_str().to_string(),
             caller_tenant: Vec::new(),
             sealed_principal: None,
+            caller_pass_unresolved: false,
         }
     }
 
@@ -1681,14 +1720,76 @@ impl FunctionInvoker {
         caller_tenant: Vec<boatramp_handlers::ScopeFact>,
         sealed_principal: Option<boatramp_handlers::SealedPrincipal>,
     ) -> Arc<dyn boatramp_handlers::Invoker> {
-        Arc::new(Self {
+        self.scoped_with_pass(project, caller_tenant, sealed_principal, false)
+    }
+
+    /// Like [`scoped`](Self::scoped) but also carries the caller's gateway-level
+    /// `on_unresolved: "pass"` flag — used ONLY by the /graphql gateway edges and the in-process
+    /// `graphql::run` fan-out, so a subgraph's own read confines to zero rows (not fail-close) when
+    /// the gateway caller is unresolved. Every other caller uses `scoped` (flag `false`), unchanged.
+    pub(crate) fn scoped_with_pass(
+        &self,
+        project: ProjectRef<'_>,
+        caller_tenant: Vec<boatramp_handlers::ScopeFact>,
+        sealed_principal: Option<boatramp_handlers::SealedPrincipal>,
+        caller_pass_unresolved: bool,
+    ) -> Arc<dyn boatramp_handlers::Invoker> {
+        Arc::new(self.make_scoped(
+            project,
+            caller_tenant,
+            sealed_principal,
+            caller_pass_unresolved,
+        ))
+    }
+
+    /// The concrete scoped [`FunctionInvoker`] behind [`scoped_with_pass`] — factored out so a test
+    /// can drive the SAME construction (and the [`FnTenant`] it later builds) rather than a copy.
+    fn make_scoped(
+        &self,
+        project: ProjectRef<'_>,
+        caller_tenant: Vec<boatramp_handlers::ScopeFact>,
+        sealed_principal: Option<boatramp_handlers::SealedPrincipal>,
+        caller_pass_unresolved: bool,
+    ) -> Self {
+        Self {
             deploy: self.deploy.clone(),
             runtime: self.runtime.clone(),
             project: project.as_str().to_string(),
             caller_tenant,
             sealed_principal,
-        })
+            caller_pass_unresolved,
+        }
     }
+
+    /// The [`FnTenant::Inherited`] this invoker carries down an in-project invoke — the SINGLE
+    /// construction `invoke`/`invoke_streaming` use (and the gateway-pass gate asserts), so the
+    /// `caller_pass_unresolved` plumbing is observed in production form, never mirrored.
+    fn inherited_fn_tenant(&self) -> FnTenant {
+        FnTenant::Inherited(
+            self.caller_tenant.clone(),
+            self.sealed_principal.clone(),
+            self.caller_pass_unresolved,
+        )
+    }
+}
+
+/// Apply a gateway-level `on_unresolved: "pass"` to a resolved inherited tenancy: when
+/// `gateway_pass`, OR `pass_unresolved` in (so an UNRESOLVED callee's OWN read confines to zero
+/// rows instead of fail-closing); a no-op otherwise. The SINGLE production site for the gateway-pass
+/// arm, so a test drives this rather than a copy. Read-axis-only + inert once a principal resolves
+/// (enforced by the tenancy confiner); never widens, writes always deny.
+#[cfg(feature = "handlers")]
+fn apply_gateway_pass(
+    resolved: Option<boatramp_handlers::HostTenancy>,
+    gateway_pass: bool,
+) -> Option<boatramp_handlers::HostTenancy> {
+    resolved.map(|h| {
+        if gateway_pass {
+            h.with_unresolved_pass(true)
+        } else {
+            h
+        }
+    })
 }
 
 #[cfg(feature = "handlers")]
@@ -1741,7 +1842,7 @@ impl boatramp_handlers::Invoker for FunctionInvoker {
             // caller's host-verified sealed principal (never the guest's invoke request), applying its
             // own declared grant. Carrying the sealed principal is what lets a subgraph sub-fetch a
             // consumer's `graphql::run` triggers see the same `{tenant, persona}` (PLAN-async-persona).
-            FnTenant::Inherited(self.caller_tenant.clone(), self.sealed_principal.clone()),
+            self.inherited_fn_tenant(),
         )
         .await;
         let invoke_response = buffer_invoke_response(response).await;
@@ -1854,7 +1955,7 @@ impl boatramp_handlers::Invoker for FunctionInvoker {
             depth,
             boatramp_handlers::Lane::Sync,
             // The sibling inherits the caller's principal AND its host-verified sealed principal.
-            FnTenant::Inherited(self.caller_tenant.clone(), self.sealed_principal.clone()),
+            self.inherited_fn_tenant(),
         )
         .await;
         let stream_response = stream_invoke_response(response);
@@ -3658,6 +3759,70 @@ mod blobstore_dimension0_tests {
         }
     }
 
+    /// Item 1 — EDGE plumbing. Drives the REAL `make_scoped` (behind `scoped`/`scoped_with_pass`) →
+    /// `inherited_fn_tenant` — the SAME construction `invoke`/`invoke_streaming` use to build the
+    /// `FnTenant::Inherited` carried down a /graphql gateway (or in-process fan-out) edge. NOT a
+    /// re-implementation: severing `scoped_with_pass`'s flag, `make_scoped`, or `inherited_fn_tenant`
+    /// (dropping `caller_pass_unresolved`) turns this RED. A gateway edge carries pass; `scoped`
+    /// (every non-gateway caller) does not.
+    #[test]
+    fn gateway_pass_carries_through_the_invoker_into_the_invoke_fn_tenant() {
+        let storage = Arc::new(MemStorage::default());
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let base = FunctionInvoker::new(DeployStore::new(storage, kv), std::sync::Weak::new());
+
+        let pass = base.make_scoped(ProjectRef::new("shop"), Vec::new(), None, true);
+        assert!(
+            matches!(pass.inherited_fn_tenant(), FnTenant::Inherited(_, _, true)),
+            "a gateway edge (scoped_with_pass …, true) must carry pass into the FnTenant invoke builds"
+        );
+        let plain = base.make_scoped(ProjectRef::new("shop"), Vec::new(), None, false);
+        assert!(
+            matches!(
+                plain.inherited_fn_tenant(),
+                FnTenant::Inherited(_, _, false)
+            ),
+            "a non-gateway edge (scoped) must NOT carry pass"
+        );
+        println!("GATEWAY PASS OK (edge)");
+    }
+
+    /// Item 1 — CONSUME arm. Drives the REAL `resolve_inherited_tenancy` + `apply_gateway_pass` (the
+    /// production arm in `build_function_bindings`), NOT a mirror. For an UNRESOLVED caller (empty
+    /// inherited facts) against a subgraph route declaring `on_unresolved: Deny`: `gateway_pass=true`
+    /// sets `pass_unresolved` (→ its OWN read confines to zero rows via the leaf confiner, which the
+    /// boatramp-handlers `on_unresolved_pass_confinement_gate_*` prove RED under
+    /// `BOATRAMP_PASS_MUTATION=deny_pass`); `gateway_pass=false` leaves it fail-closed. Severing
+    /// `apply_gateway_pass` turns the `true` case RED. Never widens (read-axis-only, inert once a
+    /// principal resolves; writes always deny).
+    #[test]
+    fn gateway_pass_confines_an_unresolved_deny_subgraph_instead_of_refusing() {
+        let tenancy = scoped(); // on_unresolved: Deny
+        let resolve = |gateway_pass: bool| {
+            let posture = crate::tenant_resolve::TenantPosture {
+                require_declaration: false,
+                allow_cross_tenant: false,
+            };
+            let resolved = crate::tenant_resolve::resolve_inherited_tenancy(
+                Some(&tenancy),
+                true,
+                posture,
+                Vec::new(), // unresolved caller: empty inherited facts
+            )
+            .expect("inherited tenancy resolves for a declared scoped route");
+            apply_gateway_pass(resolved, gateway_pass)
+        };
+        assert!(
+            resolve(true).is_some_and(|h| h.pass_unresolved()),
+            "gateway pass must confine an unresolved Deny subgraph to zero rows, not refuse"
+        );
+        assert!(
+            resolve(false).is_some_and(|h| !h.pass_unresolved()),
+            "no gateway pass → the subgraph stays fail-closed"
+        );
+        println!("GATEWAY PASS OK (consume)");
+    }
+
     #[tokio::test]
     async fn blob_only_undeclared_tenancy_is_refused_under_strict_posture() {
         let rt = runtime_with_site("shop", "blog").await;
@@ -3705,7 +3870,7 @@ mod blobstore_dimension0_tests {
             "fn/api",
             &config,
             0,
-            &FnTenant::Inherited(own, None),
+            &FnTenant::Inherited(own, None, false),
             None,
             None,
             None,
@@ -3839,7 +4004,7 @@ mod blobstore_dimension0_tests {
                 "fn/api",
                 &config,
                 0,
-                &FnTenant::Inherited(own, None),
+                &FnTenant::Inherited(own, None, false),
                 None,
                 None,
                 None,

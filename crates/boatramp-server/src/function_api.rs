@@ -40,6 +40,18 @@ pub(super) async fn list_functions(
             Err(err) => return deploy_error_response(err),
         };
         let (specs, triggers) = function::desugar(&manifest.config);
+        // The EFFECTIVE tenancy of a site-derived route is its own declared tenancy when present,
+        // else the site-level fallback — mirroring the serve path's route-vs-site selection — so the
+        // reported `on_unresolved` matches what gets bound. One extra store read per site.
+        let site_cfg = deploy
+            .get_site_config(project.as_ref(), &site)
+            .await
+            .ok()
+            .flatten();
+        let site_tenancy = site_cfg
+            .as_ref()
+            .and_then(|c| c.handlers.as_ref())
+            .and_then(|h| h.tenancy.as_ref());
         for f in function::materialize(&specs, &site, &manifest.files, 0) {
             let trigs = triggers
                 .iter()
@@ -52,12 +64,14 @@ pub(super) async fn list_functions(
                 runtime: f.config.runtime.as_str().to_string(),
                 version: f.active,
                 triggers: trigs,
-                // Surface the route's declared tenancy (scope + on_unresolved) so pass-vs-deny is
-                // confirmable without probing. `None` ⇒ inherits the site decision.
+                // Surface the EFFECTIVE tenancy (route decl, else the site fallback) so pass-vs-deny
+                // is confirmable without probing. `None` ⇒ neither the route nor the site declares a
+                // tenancy (the serve path then applies the project/node posture).
                 tenancy: f
                     .config
                     .tenancy
                     .as_ref()
+                    .or(site_tenancy)
                     .map(boatramp_core::function::TenancySummary::of),
             });
         }
@@ -75,6 +89,9 @@ pub(super) async fn list_functions(
                         version: f.active,
                         // A top-level function has a stable invoke URL (FA-3).
                         triggers: vec![format!("invoke {}", f.name)],
+                        // ASYMMETRY vs site-derived routes: a top-level function has NO site ceiling
+                        // to fall back to, so this is its DECLARED tenancy only; `None` ⇒ its
+                        // undeclared effective tenancy is the project/node posture, not a site.
                         tenancy: f
                             .config
                             .tenancy

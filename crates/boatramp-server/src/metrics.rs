@@ -187,6 +187,10 @@ impl Metrics {
         out
     }
     /// Record a finished invocation **and** emit the structured log line.
+    // A telemetry sink: each argument is an orthogonal dimension of the `handler invocation` signal
+    // (site/trigger/route/component/outcome/duration + the instance cold/instantiate timing), so
+    // bundling them into a struct would only move the fan-out, not reduce it.
+    #[allow(clippy::too_many_arguments)]
     pub fn observe(
         &self,
         site: &str,
@@ -195,6 +199,12 @@ impl Metrics {
         component_hash: &str,
         outcome: Outcome,
         duration: Duration,
+        // Per-invocation instance timing (construens ask #3), when this invocation drove a serve:
+        // `cold` = it paid a (re)compile; `instantiate_ms` = the per-invocation instantiate cost.
+        // `None` on a path with no serve (e.g. a pre-serve refusal / the consumer lane) → logged as
+        // `cold=false, instantiate_ms=0` so the line's schema is stable; the `outcome` disambiguates.
+        cold: Option<bool>,
+        instantiate_ms: Option<u64>,
     ) {
         {
             let mut map = self.inner.lock().unwrap();
@@ -210,6 +220,8 @@ impl Metrics {
             component = component_hash,
             outcome = outcome.as_str(),
             duration_ms = duration.as_millis() as u64,
+            cold = cold.unwrap_or(false),
+            instantiate_ms = instantiate_ms.unwrap_or(0),
             "handler invocation"
         );
     }

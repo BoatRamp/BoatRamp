@@ -594,7 +594,9 @@ pub(super) async fn dispatch_session_post(
         // A session re-entry inherits the caller's tenant facts; it carries no `signed_context`-derived
         // sealed principal here, so persona is not propagated onto the session lane (PLAN-async-persona
         // scopes the sealed principal to the consumer → `graphql::run` chain).
-        &crate::function_runtime::FnTenant::Inherited(caller_tenant, None),
+        // A session re-entry carries no gateway-level `on_unresolved: "pass"` (that flag is only
+        // propagated on the /graphql gateway + in-process `graphql::run` edges).
+        &crate::function_runtime::FnTenant::Inherited(caller_tenant, None, false),
         bearer.as_deref(),
         domain_context.as_deref(),
         // A session re-entry is never a migration step.
@@ -653,6 +655,10 @@ pub(super) async fn dispatch_session_post(
         &entry.hash,
         metrics::Outcome::from_result(&result),
         start.elapsed(),
+        // Session serves via `dispatch_session` (not the timed `serve_lane`); the session-lane
+        // cold/instantiate cost is in the per-lane + per-component stats.
+        None,
+        None,
     );
     match result {
         Ok(()) => {

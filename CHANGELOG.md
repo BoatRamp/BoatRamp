@@ -5,6 +5,35 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.20.0] - 2026-10-08
+
+Completes the `on_unresolved:"pass"` + observability/perf follow-ups surfaced by v0.19.0 — honoring
+`pass` on the last surface, closing the per-request component re-read on every lane, and delivering
+the rest of the construens memory-observability asks.
+
+- **`on_unresolved:"pass"` on the `/graphql` gateway:** a gateway-level `pass` now propagates into
+  subgraph fetches (and the in-process `graphql::run` fan-out), so an unresolved caller confines to
+  zero rows instead of fail-closing — completing "every surface" (blob + SQL/ORM + marker shipped in
+  v0.19.0). The direct-serve site-handler path got the same parity. Writes stay denied and a resolved
+  principal is never downgraded; an independent security review confirmed no widening/leak, and the
+  plumbing is guarded by two severance-verified (non-hollow) tests.
+- **Warm-path component re-read closed on every lane:** the v0.14.0 HTTP warm-skip now also covers the
+  function-invoke / durable-consumer / cron-queue / webhook funnel, the cron-route path, and the
+  `wasi:messaging` consumer lane (with an empty-bytes guard added to `consumer_pre`). A warm
+  invocation no longer re-fetches and discards the component blob.
+- **Per-invocation cold/instantiate timing:** the `handler invocation` signal now carries `cold` and
+  `instantiate_ms`, so the gap between dispatch and execution is attributable (observability ask #3).
+- **Per-component instance stats:** `/api/instance-stats` gains an additive `component_stats`
+  (per-component warm resident bytes, in-flight, and rejection/`overloaded` count) plus instantiate/
+  compile **p50/p99** histograms (ask #4). `warm_components` is unchanged (console back-compat).
+  Admission is fail-fast (no waiters queue), so "queue depth" = in-flight + rejections; the per-topic
+  messaging outstanding is surfaced with the forthcoming `/api/node-health`.
+- **`boatramp function get`** now reports a route's **effective** tenancy (including the site-level
+  fallback and `on_unresolved`), so pass-vs-deny is confirmable without black-box probing.
+
+Host/daemon-side only; no WIT/shim change. The gateway-pass confinement is mutation-verified (rides
+the v0.19.0 `deny_pass` gate); its plumbing is continuously guarded by the non-hollow gateway tests.
+
 ## [0.19.0] - 2026-10-08
 
 Fix: an applied **`on_unresolved: "pass"`** route is now honored on every tenant-scoped surface a
