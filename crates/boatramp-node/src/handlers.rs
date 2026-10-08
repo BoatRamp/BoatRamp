@@ -253,6 +253,77 @@ pub async fn build_handler_runtime(
             rebuild_interval: rebuild,
         });
     }
+    // JWKS freshness for the token-verification cache (the federated-gateway overhead fix): two tiers —
+    // `own` (operator-fixed `jwks_url`/`jwks_env`) and `foreign` (user-declared multi-issuer discovery,
+    // tighter by default). Each tier's `refresh` is the background-refresh age (no request blocks) and
+    // `hard_ttl` is the revocation bound (past it a request blocks on a fresh fetch, fail-closed). Floor
+    // each at 60 s and keep `refresh < hard_ttl` (clamp hard_ttl up with a loud warn otherwise).
+    {
+        // A 24 h sanity ceiling on the hard TTL (the revocation bound): a longer window is almost
+        // certainly a misconfiguration (e.g. a fat-fingered value) and would defeat revocation for the
+        // less-trusted FOREIGN tier. Not a policy — just a backstop; the normal 60 s–hours range is
+        // untouched. `refresh` is held below half the ceiling so `hard > refresh` always has headroom.
+        const JWKS_HARD_TTL_CEILING: u64 = 86_400;
+        let jwks_tier = |refresh_secs: u64,
+                         hard_secs: u64,
+                         tier: &str|
+         -> boatramp_server::JwksTier {
+            let refresh = refresh_secs.clamp(60, JWKS_HARD_TTL_CEILING / 2);
+            let mut hard = hard_secs.clamp(60, JWKS_HARD_TTL_CEILING);
+            if hard_secs > JWKS_HARD_TTL_CEILING {
+                tracing::warn!(
+                    tier,
+                    requested_hard_ttl_secs = hard_secs,
+                    applied_hard_ttl_secs = hard,
+                    "[handlers] jwks hard_ttl exceeds the 24 h sanity ceiling — clamped down (a \
+                         longer revocation window is almost certainly a misconfiguration)"
+                );
+            }
+            if hard <= refresh {
+                let adjusted = refresh.saturating_mul(2).min(JWKS_HARD_TTL_CEILING);
+                tracing::warn!(
+                    tier,
+                    refresh_secs = refresh,
+                    requested_hard_ttl_secs = hard,
+                    applied_hard_ttl_secs = adjusted,
+                    "[handlers] jwks hard_ttl must exceed refresh — clamped up"
+                );
+                hard = adjusted;
+            }
+            boatramp_server::JwksTier {
+                refresh: std::time::Duration::from_secs(refresh),
+                hard_ttl: std::time::Duration::from_secs(hard),
+            }
+        };
+        let own = jwks_tier(
+            handlers_cfg
+                .and_then(|h| h.jwks_refresh_secs)
+                .unwrap_or(120),
+            handlers_cfg
+                .and_then(|h| h.jwks_hard_ttl_secs)
+                .unwrap_or(600),
+            "own",
+        );
+        let foreign = jwks_tier(
+            handlers_cfg
+                .and_then(|h| h.jwks_foreign_refresh_secs)
+                .unwrap_or(60),
+            handlers_cfg
+                .and_then(|h| h.jwks_foreign_hard_ttl_secs)
+                .unwrap_or(300),
+            "foreign",
+        );
+        let prewarm = handlers_cfg.and_then(|h| h.jwks_prewarm).unwrap_or(true);
+        boatramp_server::set_jwks_config(boatramp_server::JwksConfig {
+            own,
+            foreign,
+            prewarm,
+        });
+        // Pre-warm of the first-party (`own`-tier) JWKS is wired at the node.rs startup call site
+        // (`collect_own_jwks_prewarm` → `boatramp_server::prewarm_own_jwks`), where the `deploy` store
+        // is in scope to enumerate configured sites. `prewarm_own_jwks` honors the `prewarm` flag set
+        // just above.
+    }
     // Apply the posture's host-env secret-ref gate (fail-closed if never set).
     runtime.set_allow_env_secret_refs(allow_env_secret_refs);
     // Apply the posture's in-site tenancy knobs (Stage 0; fail-closed if never set).

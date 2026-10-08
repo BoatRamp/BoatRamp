@@ -5,6 +5,51 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.21.0] - 2026-10-08
+
+Removes the ~1 s of per-request overhead inside the **federated GraphQL gateway** (construens
+`boatramp-federated-gateway-overhead`) and makes a `/graphql` request's time attributable. The JWKS
+fetch on the token-claims auth path — the one uncached phase (compose + plan were already memoized per
+composition version) — was paid on every request. It is now served from a cache and refreshed in the
+**background**, so no request blocks on it.
+
+- **Cached + background-refreshed (the ~1 s fix, zero-hiccup):** a warm request — including the common
+  case of a token with an unknown / rotated-out / keyless `kid`, which previously forced a fresh ~1 s
+  fetch on every call only to then fail verification — is served from the cached verifier with no
+  network hop. When an entry passes its `refresh` age it is refreshed by a **single-flight background
+  task** while the current keys keep serving, so (after the one cold fetch per issuer) **no request
+  ever blocks on a JWKS fetch**. A cold miss, or an entry past its `hard_ttl` revocation bound, blocks
+  on that single-flight fetch and **fails closed** if it fails — a verifier older than `hard_ttl` is
+  never served without a fresh fetch, bounding how long a key revoked at the IdP can keep verifying.
+- **Two tiers, operator-tunable:** `own` (first-party, operator-fixed `jwks_url`/`jwks_env`) and
+  `foreign` (user-declared multi-issuer `issuer_trust`+`jwks` discovery, less trusted → tighter bound).
+  Each tier has a `refresh` and a `hard_ttl` knob under `[handlers]`
+  (`jwks_refresh_secs` / `jwks_hard_ttl_secs` / `jwks_foreign_refresh_secs` /
+  `jwks_foreign_hard_ttl_secs`, also `BOATRAMP_HANDLERS_JWKS_*`), defaulting to own 120 s/600 s and
+  foreign 60 s/300 s, floored at 60 s and validated `refresh < hard_ttl`. `jwks_prewarm` (default on)
+  fetches the first-party JWKS at startup so even the first request is instant.
+- **Fail-fast + leak-proof cache:** both fetch paths — the own-tier pooled client and the foreign-tier
+  SSRF-guarded client — carry a 3 s connect / 5 s request timeout, and the fetch is additionally capped
+  by an absolute deadline, so a hung IdP's refresh gives up fast (the current keys keep serving until
+  `hard_ttl`) and can never pin the single-flight lock. A short negative-cache collapses an IdP-outage
+  request pile-up to one fetch per window (still fail-closed). The cache is keyed by
+  `(url, issuer, audience)` — never URL alone — so two routes sharing a `jwks_url` but pinning a
+  different issuer/audience can't cross-serve verifiers, and both the cache and the per-key single-flight
+  bookkeeping are capped (oldest-evicted) so a misconfigured broad trust policy can't grow them unbounded.
+- **Per-phase gateway observability:** every federated `/graphql` request now emits a structured
+  `boatramp::gateway` phase-timing line (`auth_us` / `compose_us` / `plan_us` / `fanout_us` /
+  `total_us`) and a `Server-Timing` response header, so where a request's time goes is visible from the
+  log or an external probe without subtracting subgraph durations by hand.
+
+Host/daemon-side only; no WIT/shim change. An independent security review confirmed the background
+refresh, the single-flight, the `hard_ttl` revocation bound and the cache-key hardening. The fix ships
+behind a CI-hard **end-to-end performance gate** reproducing the failure shape: a 20-subgraph
+federation + single-issuer JWKS, firing an empty query under a 50-way concurrent mass-call against a
+delayed JWKS mock, asserts the fetch collapses to O(1) and every warm request stays ≪ the mock delay
+(ms, no spike) — and is mutation-verified (a `disable_cache` seam, compiled out of shipped builds,
+forces a per-request fetch and turns the gate RED). The trust-path invariants stay mutation-verified by
+the existing issuer-trust gate.
+
 ## [0.20.0] - 2026-10-08
 
 Completes the `on_unresolved:"pass"` + observability/perf follow-ups surfaced by v0.19.0 — honoring
