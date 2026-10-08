@@ -678,6 +678,11 @@ pub(crate) struct FederationRunner {
     /// `sealed-principal()` import returns, and can authorize a `role(…)`-gated field as the presenting
     /// caller. `None` ⇒ no sealed principal to inherit (the sync lane). Host-carried, guest-blind.
     sealed_principal: Option<boatramp_handlers::SealedPrincipal>,
+    /// A gateway-level `on_unresolved: "pass"` carried onto every federated sub-fetch: when the
+    /// caller is unresolved (`caller_tenant` empty) and opted into pass, a subgraph's OWN read
+    /// confines to zero rows instead of fail-closing. Read-axis-only, inert once a principal
+    /// resolves, writes always deny — so it never widens. `false` on every non-pass runner.
+    caller_pass_unresolved: bool,
 }
 
 impl FederationRunner {
@@ -688,25 +693,44 @@ impl FederationRunner {
             project: boatramp_core::project::DEFAULT_PROJECT.to_string(),
             caller_tenant: Vec::new(),
             sealed_principal: None,
+            caller_pass_unresolved: false,
         }
     }
 
-    /// A runner scoped to `project` (all registry/plan/execute lookups are project-qualified) and
-    /// carrying the caller's resolved `caller_tenant` principal + host-verified `sealed_principal` —
-    /// mirrors the invoker's per-tenant scoping ([`FunctionInvoker::scoped`](crate::function_runtime)),
-    /// so a `graphql::run` sub-fetch inherits the caller's tenancy AND sealed principal exactly like an
-    /// `emit::invoke` callee does (PLAN-async-persona).
+    /// Test-only convenience: [`scoped_with_pass`](Self::scoped_with_pass) with the gateway-pass flag
+    /// off. Every production caller passes the flag explicitly (the direct-serve + fan-out edges now
+    /// use `scoped_with_pass`), so this exists only for tests — `#[cfg(test)]` keeps it out of the
+    /// production lib build (no dead-code warning).
+    #[cfg(test)]
     pub(crate) fn scoped(
         &self,
         project: boatramp_core::project::ProjectRef<'_>,
         caller_tenant: Vec<boatramp_handlers::ScopeFact>,
         sealed_principal: Option<boatramp_handlers::SealedPrincipal>,
     ) -> std::sync::Arc<dyn boatramp_handlers::SupergraphRunner> {
+        self.scoped_with_pass(project, caller_tenant, sealed_principal, false)
+    }
+
+    /// A runner scoped to `project` (all registry/plan/execute lookups are project-qualified),
+    /// carrying the caller's resolved `caller_tenant` principal + host-verified `sealed_principal` —
+    /// so a `graphql::run` sub-fetch inherits the caller's tenancy AND sealed principal like an
+    /// `emit::invoke` callee (PLAN-async-persona) — plus the caller's gateway-level
+    /// `on_unresolved: "pass"`: when the caller is unresolved and opted into pass, the subgraph's
+    /// own-read confines to zero rows rather than fail-closing. Pass is `false` on every non-gateway
+    /// edge; read-axis-only, inert once a principal resolves, writes always deny.
+    pub(crate) fn scoped_with_pass(
+        &self,
+        project: boatramp_core::project::ProjectRef<'_>,
+        caller_tenant: Vec<boatramp_handlers::ScopeFact>,
+        sealed_principal: Option<boatramp_handlers::SealedPrincipal>,
+        caller_pass_unresolved: bool,
+    ) -> std::sync::Arc<dyn boatramp_handlers::SupergraphRunner> {
         std::sync::Arc::new(Self {
             runtime: self.runtime.clone(),
             project: project.as_str().to_string(),
             caller_tenant,
             sealed_principal,
+            caller_pass_unresolved,
         })
     }
 }
@@ -805,7 +829,7 @@ impl boatramp_handlers::SupergraphRunner for FederationRunner {
             // closed (pre-v0.4.6). The GDC's own row policy still governs SQL-backed subgraphs; this
             // only supplies the inherited principal to function subgraphs. Axis-preserving (a target
             // fact stays target), so it never widens a scope. (PLAN-async-lane-propagation.)
-            invoker.scoped(
+            invoker.scoped_with_pass(
                 boatramp_core::project::ProjectRef::new(project),
                 self.caller_tenant.clone(),
                 // Carry the caller's host-verified sealed principal onto the sub-fetch (PLAN-async
@@ -813,6 +837,10 @@ impl boatramp_handlers::SupergraphRunner for FederationRunner {
                 // — the async-lane `role(…)` authorizes as the presenting caller. `None` on the sync
                 // lane (the bearer path is unchanged).
                 self.sealed_principal.clone(),
+                // Gateway-level `on_unresolved: "pass"` (in-process graphql::run twin): an unresolved
+                // caller's own sub-fetch confines to zero rows instead of fail-closing. Inert once
+                // resolved; never widens.
+                self.caller_pass_unresolved,
             ),
             project.to_string(),
             inner.sql.clone(),

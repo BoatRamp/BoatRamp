@@ -79,12 +79,12 @@ pub use bindings::tenant_secrets::{TenantSecretRefused, TenantSecretsBinding};
 pub use engine::SessionBatch;
 #[cfg(feature = "engine")]
 pub use engine::{
-    HandlerEngine, HandlerError, Lane, Limits, MAX_CONSUMER_ERROR_LEN, build_engine,
+    HandlerEngine, HandlerError, Lane, Limits, MAX_CONSUMER_ERROR_LEN, ServeTiming, build_engine,
     build_engine_pooling, empty_body,
 };
 #[cfg(feature = "engine")]
 pub use instance_stats::{
-    InstanceStats, InstanceStatsSnapshot, LaneStats, ProcessMemory, StatLane,
+    ComponentStat, InstanceStats, InstanceStatsSnapshot, LaneStats, ProcessMemory, StatLane,
 };
 #[cfg(feature = "engine")]
 pub use logging::{LogSink, LogStream};

@@ -175,6 +175,19 @@ pub enum Lane {
     Streaming,
 }
 
+/// Per-serve cost returned by [`Engine::serve_lane`], so the server can attribute per-invocation
+/// latency (construens ask #3): `cold` is whether this serve paid a cranelift (re)compile vs reused a
+/// warm component; `instantiate_us` is the per-invocation `instantiate_async` cost (distinct from the
+/// cold compile and from the handler body). The `serve_with_limits*` wrappers discard it; the metered
+/// HTTP + function-invoke paths read it onto the `handler invocation` signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServeTiming {
+    /// This serve paid a cold (re)compile (a warm-cache miss).
+    pub cold: bool,
+    /// Per-invocation instantiate cost in microseconds.
+    pub instantiate_us: u64,
+}
+
 /// Epoch ticks happen every this many milliseconds; the store deadline is
 /// `timeout_ms / EPOCH_TICK_MS` ticks.
 const EPOCH_TICK_MS: u64 = 10;
@@ -1233,10 +1246,28 @@ impl HandlerEngine {
         self.cache.lock().unwrap().contains(hash)
     }
 
-    fn proxy_pre(&self, hash: &str, wasm: &[u8]) -> Result<ProxyPre<HostState>, HandlerError> {
+    /// The CONSUMER-lane analog of [`request_component_warm`](Self::request_component_warm): a
+    /// non-promoting peek of the SEPARATE `consumer_cache` (the messaging consumer serves via
+    /// `dispatch_message` → `consumer_pre`, not the request `cache`). `true` ⇒ `dispatch_message` will
+    /// hit the warm `ConsumerPre` and never look at the bytes, so the caller may pass an empty slice
+    /// and skip the per-message component-blob re-read (a remote GET it would only discard). A stale
+    /// warm-skip (evicted in the window) degrades to a clear, transient compile error on that one
+    /// message (`consumer_pre`'s empty-bytes guard), never a wrong result.
+    #[cfg(feature = "messaging")]
+    pub fn request_consumer_warm(&self, hash: &str) -> bool {
+        self.consumer_cache.lock().unwrap().contains(hash)
+    }
+
+    /// Returns the pre-instantiated component and whether this call paid a COLD compile (`true`) vs a
+    /// warm-cache hit (`false`) — the per-serve `cold` signal [`serve_lane`] surfaces as `ServeTiming`.
+    fn proxy_pre(
+        &self,
+        hash: &str,
+        wasm: &[u8],
+    ) -> Result<(ProxyPre<HostState>, bool), HandlerError> {
         if let Some(pre) = self.cache.lock().unwrap().get(hash) {
             self.stats.request.record_warm_hit();
-            return Ok(pre.clone());
+            return Ok((pre.clone(), false));
         }
         // A cold miss needs the bytes. If the caller skipped the read on a stale warm-check (the
         // component was evicted in the window), fail this one request with a clear, retryable message
@@ -1268,7 +1299,9 @@ impl HandlerEngine {
         self.stats
             .request
             .record_evictions(cache_insert_evicted(&self.cache, hash, pre.clone()));
-        Ok(pre)
+        // Per-component resident-footprint proxy (source wasm length), recorded at compile.
+        self.stats.record_resident_bytes(hash, wasm.len() as u64);
+        Ok((pre, true))
     }
 
     /// Compile a consumer component (cached by `hash`) into a reusable
@@ -1282,6 +1315,16 @@ impl HandlerEngine {
         if let Some(pre) = self.consumer_cache.lock().unwrap().get(hash) {
             self.stats.consumer.record_warm_hit();
             return Ok(pre.clone());
+        }
+        // A cold miss needs the bytes. If the caller skipped the per-message read on a stale
+        // warm-check (evicted in the window), fail this one message with a clear, retryable message
+        // rather than feeding empty bytes into the compiler. Mirrors `proxy_pre`'s guard.
+        if wasm.is_empty() {
+            return Err(HandlerError::Compile(
+                "consumer component not resident and no bytes supplied (evicted between the \
+                 warm-check and dispatch; retry — or raise [handlers] instance_cache_size)"
+                    .into(),
+            ));
         }
         let compiled_at = std::time::Instant::now();
         let component = Component::from_binary(&self.engine, wasm)
@@ -1308,6 +1351,7 @@ impl HandlerEngine {
             hash,
             pre.clone(),
         ));
+        self.stats.record_resident_bytes(hash, wasm.len() as u64);
         Ok(pre)
     }
 
@@ -1334,7 +1378,13 @@ impl HandlerEngine {
         let _permit = self
             .lane_semaphore(Lane::Async)
             .try_acquire()
-            .map_err(|_| HandlerError::Overloaded)?;
+            .map_err(|_| {
+                self.stats.record_overloaded(hash);
+                HandlerError::Overloaded
+            })?;
+        // Count this component's in-flight invocation for the per-component stats (RAII: decremented
+        // on drop, so a trap/early-return can't leak the count).
+        let _cguard = self.stats.enter_component(hash);
         let consumer_pre = self.consumer_pre(hash, wasm)?;
         let mut store = self.new_store(bindings, self.effective_limits(Lane::Async, limits));
         let instantiated_at = std::time::Instant::now();
@@ -1712,6 +1762,7 @@ impl HandlerEngine {
     {
         self.serve_lane(hash, wasm, request, bindings, limits, Lane::Sync)
             .await
+            .map(|(response, _timing)| response)
     }
 
     /// Like [`serve_with_limits`](Self::serve_with_limits) but on the **async**
@@ -1732,6 +1783,7 @@ impl HandlerEngine {
     {
         self.serve_lane(hash, wasm, request, bindings, limits, Lane::Async)
             .await
+            .map(|(response, _timing)| response)
     }
 
     /// Like [`serve_with_limits`](Self::serve_with_limits) but on the
@@ -1753,11 +1805,15 @@ impl HandlerEngine {
     {
         self.serve_lane(hash, wasm, request, bindings, limits, Lane::Streaming)
             .await
+            .map(|(response, _timing)| response)
     }
 
-    /// The shared serve core: acquire `lane`'s concurrency permit, clamp to
-    /// `lane`'s ceiling, and drive the guest.
-    async fn serve_lane<B>(
+    /// The shared serve core: acquire `lane`'s concurrency permit, clamp to `lane`'s ceiling, and
+    /// drive the guest. Returns the response plus a [`ServeTiming`] (`cold` = this serve paid a
+    /// compile; `instantiate_us` = the per-invocation instantiate cost) so the server can attribute
+    /// per-invocation latency. The thin `serve_with_limits*` wrappers drop the timing for the many
+    /// callers that don't need it; the metered HTTP + function-invoke paths call this directly.
+    pub async fn serve_lane<B>(
         &self,
         hash: &str,
         wasm: &[u8],
@@ -1765,16 +1821,19 @@ impl HandlerEngine {
         bindings: Bindings,
         limits: Limits,
         lane: Lane,
-    ) -> Result<http::Response<HyperOutgoingBody>, HandlerError>
+    ) -> Result<(http::Response<HyperOutgoingBody>, ServeTiming), HandlerError>
     where
         B: HttpBody<Data = Bytes> + Send + 'static,
         B::Error: std::fmt::Display + Send,
     {
-        let _permit = self
-            .lane_semaphore(lane)
-            .try_acquire()
-            .map_err(|_| HandlerError::Overloaded)?;
-        let proxy_pre = self.proxy_pre(hash, wasm)?;
+        let _permit = self.lane_semaphore(lane).try_acquire().map_err(|_| {
+            self.stats.record_overloaded(hash);
+            HandlerError::Overloaded
+        })?;
+        // Count this component's in-flight invocation (RAII: decremented on drop — same scope as the
+        // lane permit, so a trap/early-return can't leak the count).
+        let _cguard = self.stats.enter_component(hash);
+        let (proxy_pre, cold) = self.proxy_pre(hash, wasm)?;
 
         let effective = self.effective_limits(lane, limits);
         let mut store = self.new_store(bindings, effective);
@@ -1823,9 +1882,17 @@ impl HandlerEngine {
             .instantiate_async(&mut store)
             .await
             .map_err(|e| classify(&e, store.data().oom()))?;
+        let instantiate_elapsed = instantiated_at.elapsed();
         self.stats
             .request
-            .record_instantiation(instantiated_at.elapsed().as_nanos() as u64);
+            .record_instantiation(instantiate_elapsed.as_nanos() as u64);
+        // Per-serve timing surfaced to the server for the per-invocation `cold`/`instantiate_ms`
+        // signal (construens ask #3): distinguishes a cold (re)compile + the instantiate cost from
+        // the handler body and from queueing.
+        let timing = ServeTiming {
+            cold,
+            instantiate_us: instantiate_elapsed.as_micros() as u64,
+        };
 
         // The `Store` moves into the drive task below, so grab a clone of the OOM flag now to read
         // back after a trap (the moved store is otherwise unreachable from here).
@@ -1847,7 +1914,7 @@ impl HandlerEngine {
 
         match receiver.await {
             // Guest produced a response head; let `task` keep streaming the body.
-            Ok(Ok(response)) => Ok(response),
+            Ok(Ok(response)) => Ok((response, timing)),
             // Guest explicitly produced an error response.
             Ok(Err(code)) => Err(HandlerError::Trap(format!("{code:?}"))),
             // Sender dropped before a response — the guest trapped/returned first.

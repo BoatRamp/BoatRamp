@@ -284,7 +284,7 @@ pub(super) async fn dispatch_handler(
                     // so skip the resolution (and its schema load) for it.
                     let runs_server_graphql =
                         gql.federated || gql.data.as_ref().is_some_and(|d| d.enabled);
-                    let caller_own = if runs_server_graphql {
+                    let (caller_own, caller_pass) = if runs_server_graphql {
                         match resolve_gateway_caller_facts(
                             inner,
                             project,
@@ -295,11 +295,11 @@ pub(super) async fn dispatch_handler(
                         )
                         .await
                         {
-                            Ok(facts) => facts,
+                            Ok(pair) => pair,
                             Err(resp) => return resp,
                         }
                     } else {
-                        Vec::new()
+                        (Vec::new(), false)
                     };
                     // Federation gateway: plan the query against the project's registered
                     // subgraphs and execute it by dispatching fetches to the subgraph
@@ -314,6 +314,7 @@ pub(super) async fn dispatch_handler(
                             domain_context.as_deref(),
                             target_handle.as_deref(),
                             caller_own,
+                            caller_pass,
                             // #495: the site's edge-visibility manifest (per-operation +
                             // per-subgraph excludes) — resolved fresh per request against the
                             // supergraph inside the gateway, so a manifest change takes effect
@@ -335,6 +336,7 @@ pub(super) async fn dispatch_handler(
                             &variables,
                             bearer.as_deref(),
                             caller_own,
+                            caller_pass,
                         )
                         .await;
                     }
@@ -528,16 +530,21 @@ pub(super) async fn dispatch_handler(
     // A streaming handler runs on the isolated streaming lane (its own concurrency budget + a
     // much larger wall-clock), so a long-lived SSE/token stream never holds a fast-request slot;
     // a buffered handler stays on the tight sync request lane.
-    let result = if handler.streaming {
-        inner
-            .engine
-            .serve_with_limits_streaming(&entry.hash, &wasm, request, bindings, limits)
-            .await
+    // A streaming handler runs on the isolated streaming lane; a buffered one on the tight sync
+    // request lane. One `serve_lane` call returns the per-serve `ServeTiming` for the
+    // cold/instantiate_ms signal.
+    let lane = if handler.streaming {
+        boatramp_handlers::Lane::Streaming
     } else {
-        inner
-            .engine
-            .serve_with_limits(&entry.hash, &wasm, request, bindings, limits)
-            .await
+        boatramp_handlers::Lane::Sync
+    };
+    let timed = inner
+        .engine
+        .serve_lane(&entry.hash, &wasm, request, bindings, limits, lane)
+        .await;
+    let (result, cold, instantiate_ms) = match timed {
+        Ok((response, t)) => (Ok(response), Some(t.cold), Some(t.instantiate_us / 1_000)),
+        Err(err) => (Err(err), None, None),
     };
     inner.metrics.observe(
         site,
@@ -546,6 +553,8 @@ pub(super) async fn dispatch_handler(
         &entry.hash,
         metrics::Outcome::from_result(&result),
         start.elapsed(),
+        cold,
+        instantiate_ms,
     );
     let mut response = match result {
         Ok(response) => {
@@ -611,7 +620,7 @@ async fn resolve_gateway_caller_facts(
     site_handlers: &boatramp_core::config::HandlersSiteConfig,
     bearer: Option<&str>,
     domain_context: Option<&str>,
-) -> std::result::Result<Vec<boatramp_handlers::ScopeFact>, Response> {
+) -> std::result::Result<(Vec<boatramp_handlers::ScopeFact>, bool), Response> {
     // The effective in-site tenancy for the `/graphql` route: the per-handler decision when it
     // narrows within the site ceiling (a widening is refused fail-closed), else the site decision.
     let effective = match handler.tenancy.as_ref() {
@@ -640,7 +649,7 @@ async fn resolve_gateway_caller_facts(
         effective,
         Some(boatramp_core::tenancy::Tenancy::Target { .. })
     ) {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), false));
     }
     let knobs = inner.project_tenancy_knobs(project);
     let posture = crate::tenant_resolve::TenantPosture {
@@ -685,24 +694,25 @@ async fn resolve_gateway_caller_facts(
     // "undeclared tenancy refused under strict posture" check applies to a handler that DIRECTLY
     // queries. An undeclared gateway tenancy therefore yields no own facts (own fetches fail-closed),
     // never a hard refusal of the whole query.
-    let facts = crate::tenant_resolve::resolve_host_tenancy(effective, false, posture, inputs)
+    let resolved = crate::tenant_resolve::resolve_host_tenancy(effective, false, posture, inputs)
         .await
         .map_err(|_| {
             graphql_guard::error_response(
                 "tenancy: the /graphql route requires a tenancy declaration under this project's posture",
             )
         })?
-        .map(|h| h.with_schema(schema.as_ref()))
-        // NOTE (on_unresolved pass, deliberate non-propagation): collapsing to `facts()` drops the
-        // resolved `pass_unresolved` flag, so a GATEWAY-level `on_unresolved: "pass"` is NOT carried
-        // into a wasm subgraph's own-fetch — an unresolved caller yields empty own facts and the
-        // subgraph's own read fail-closes (refuses), rather than confining to zero rows. This is SAFE
-        // (fail-closed, never widens anon access); it is only less lenient than the direct-funnel
-        // pass. Propagating it would thread the flag through the federation fan-out AND the shared
-        // inherited-tenancy resolution — deferred. A subgraph gets `pass` from its OWN route tenancy.
-        .map(|h| h.facts().to_vec())
-        .unwrap_or_default();
-    Ok(facts)
+        .map(|h| h.with_schema(schema.as_ref()));
+    // Carry BOTH the resolved caller own-facts AND the gateway-level `on_unresolved: "pass"` flag.
+    // An unresolved caller under a gateway `pass` yields EMPTY own facts (never widened), but the
+    // flag lets a subgraph's OWN read confine to zero rows (`1 = 0`) instead of fail-closing —
+    // matching the direct-funnel pass. `pass_unresolved` is read-axis-only and inert the moment a
+    // principal resolves (facts non-empty); writes always deny. So the worst case is read-deny →
+    // zero-rows, never a widening.
+    let caller_pass = resolved
+        .as_ref()
+        .is_some_and(boatramp_handlers::HostTenancy::pass_unresolved);
+    let facts = resolved.map(|h| h.facts().to_vec()).unwrap_or_default();
+    Ok((facts, caller_pass))
 }
 
 #[allow(clippy::too_many_arguments)] // host-trusted inputs threaded from dispatch; grouping them into a struct would only obscure the plumbing
@@ -715,6 +725,10 @@ async fn federation_gateway(
     domain_context: Option<&str>,
     target_handle: Option<&str>,
     caller_own: Vec<boatramp_handlers::ScopeFact>,
+    // Gateway-level `on_unresolved: "pass"`: when the caller is unresolved (empty `caller_own`) and
+    // the /graphql route opts into pass, a subgraph's OWN read confines to zero rows instead of
+    // fail-closing. Inert once `caller_own` is non-empty; never widens.
+    caller_pass: bool,
     // #495: the site's edge-visibility manifest — `"subgraph.field"` per-operation excludes and
     // per-subgraph excludes. Resolved fresh per request against the supergraph (union-only, unknown
     // entries ignored+warned) so a change takes effect immediately with no recomposition lag.
@@ -785,10 +799,11 @@ async fn federation_gateway(
         // anonymous caller resolves no facts, so an `own` fetch still refuses (anon is not widened).
         // The external `/graphql` edge is the SYNC lane (a bearer request, no `signed_context` seal),
         // so no sealed principal rides — `sealed-principal()` returns `none` here (PLAN-async-persona).
-        invoker.scoped(
+        invoker.scoped_with_pass(
             boatramp_core::project::ProjectRef::new(project),
             caller_own,
             None,
+            caller_pass,
         ),
         project.to_string(),
         inner.sql.clone(),
@@ -1057,6 +1072,9 @@ async fn data_connector_serve(
     variables: &serde_json::Value,
     bearer: Option<&str>,
     caller_own: Vec<boatramp_handlers::ScopeFact>,
+    // Gateway-level `on_unresolved: "pass"` (see `federation_gateway`): an unresolved caller's
+    // delegated `own` fetch confines to zero rows instead of fail-closing. Inert once resolved.
+    caller_pass: bool,
 ) -> Response {
     let Some(provider) = &inner.sql else {
         return (
@@ -1118,12 +1136,13 @@ async fn data_connector_serve(
         // symmetric to the federation gateway; the pre-v0.4.11 empty set fail-closed every delegated
         // `own` read post-P48. Anon resolves none, so the delegated `own` fetch still refuses.
         let invoker = inner.invoker.get().map(|inv| {
-            inv.scoped(
+            inv.scoped_with_pass(
                 boatramp_core::project::ProjectRef::new(project),
                 caller_own.clone(),
                 // The GDC edge is the sync request lane (no `signed_context` seal); no sealed principal
                 // rides a delegated-field resolution here (PLAN-async-persona).
                 None,
+                caller_pass,
             )
         });
         crate::graphql_data::runner::execute(
@@ -2189,10 +2208,15 @@ pub(super) async fn build_bindings(
         // resolved in-site tenant + host-verified sealed principal so the sibling inherits both
         // (host-carried, not guest-set) — PLAN-async-persona.
         bindings = bindings.with_invoke(
-            invoker.scoped(
+            // Parity with the top-level-function fan-out: carry THIS handler's own
+            // `on_unresolved: "pass"` into its in-process sibling invokes, so an unresolved
+            // directly-served handler zero-rows its sub-fetches instead of fail-closing. Inert
+            // once a principal resolves (`handler_caller_pass` rides the resolved HostTenancy).
+            invoker.scoped_with_pass(
                 project,
                 handler_caller_tenant.clone(),
                 sealed_principal.clone(),
+                handler_caller_pass,
             ),
             invoke_targets.to_vec(),
             depth,
@@ -2210,10 +2234,13 @@ pub(super) async fn build_bindings(
         // `graphql::run` sub-fetch inherits its tenancy + persona (symmetric to `with_invoke` above),
         // rather than failing closed on an `own` op or a `role(…)` field (PLAN-async-persona).
         bindings = bindings.with_graphql(
-            runner.scoped(
+            // Same parity: carry the handler's own `on_unresolved: "pass"` into its in-process
+            // `graphql::run` sub-fetch (symmetric to `with_invoke` above and the function fan-out).
+            runner.scoped_with_pass(
                 project,
                 handler_caller_tenant.clone(),
                 sealed_principal.clone(),
+                handler_caller_pass,
             ),
             depth,
         );
@@ -3289,6 +3316,10 @@ pub(super) async fn dispatch_consumer_batch(
                     component_hash,
                     metrics::Outcome::Error,
                     std::time::Duration::ZERO,
+                    // Pre-delivery refusal — no serve; consumer-lane instance timing lives in the
+                    // per-lane + per-component stats.
+                    None,
+                    None,
                 );
                 tracing::warn!(
                     id = msg.id,
@@ -3365,6 +3396,10 @@ pub(super) async fn dispatch_consumer_batch(
             component_hash,
             outcome,
             start.elapsed(),
+            // Consumer lane serves via `dispatch_message` (not `serve_lane`); its cold/instantiate
+            // cost is captured in the consumer per-lane counters + the per-component stats.
+            None,
+            None,
         );
         match result {
             Ok(()) => match messaging.ack(&msg).await {

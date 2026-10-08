@@ -969,19 +969,31 @@ pub(super) async fn run_scheduler_tick(
                                 tracing::warn!(site, component = %consumer.component, "consumer component missing");
                                 continue;
                             };
-                            // Cache the (content-addressed) component bytes by hash.
-                            if !wasm_cache.contains_key(&entry.hash) {
-                                match read_blob_bytes(deploy, &entry.hash).await {
-                                    Ok(bytes) => {
-                                        wasm_cache.insert(entry.hash.clone(), bytes);
-                                    }
-                                    Err(err) => {
-                                        tracing::warn!(site, %err, "reading consumer component failed");
-                                        continue;
+                            // PERF (v0.20.0 warm-skip, consumer lane): the messaging consumer serves
+                            // via `dispatch_message` → `consumer_pre` → the engine's SEPARATE
+                            // `consumer_cache`. On a warm hit that cache serves the compiled
+                            // `ConsumerPre` and never looks at the bytes, so re-reading the component
+                            // blob each drain cycle — a remote GET on an S3/Tigris backend just to
+                            // discard it — is pure latency. Skip the read when warm and pass an empty
+                            // slice; a stale warm-skip (evicted in the window) fails that one message
+                            // with a clear retryable error (`consumer_pre`'s empty-bytes guard), never
+                            // a wrong result.
+                            let wasm: &[u8] = if inner.engine.request_consumer_warm(&entry.hash) {
+                                &[]
+                            } else {
+                                if !wasm_cache.contains_key(&entry.hash) {
+                                    match read_blob_bytes(deploy, &entry.hash).await {
+                                        Ok(bytes) => {
+                                            wasm_cache.insert(entry.hash.clone(), bytes);
+                                        }
+                                        Err(err) => {
+                                            tracing::warn!(site, %err, "reading consumer component failed");
+                                            continue;
+                                        }
                                     }
                                 }
-                            }
-                            let wasm = &wasm_cache[&entry.hash];
+                                &wasm_cache[&entry.hash]
+                            };
                             let bindings = match build_bindings(
                                 inner,
                                 project,
@@ -1411,11 +1423,18 @@ async fn fire_cron(
     let Some(entry) = manifest.files.get(&handler.component) else {
         return;
     };
-    let wasm = match read_blob_bytes(deploy, &entry.hash).await {
-        Ok(wasm) => wasm,
-        Err(err) => {
-            tracing::warn!(site, %err, "reading cron handler component failed");
-            return;
+    // PERF (v0.14.0 warm-skip, cron-route lane): this serves via `serve_with_limits` (the request
+    // ProxyPre cache `request_component_warm` peeks), so a warm component needs no bytes — skip the
+    // blob read on a warm hit; read only on a cold miss.
+    let wasm = if inner.engine.request_component_warm(&entry.hash) {
+        Vec::new()
+    } else {
+        match read_blob_bytes(deploy, &entry.hash).await {
+            Ok(wasm) => wasm,
+            Err(err) => {
+                tracing::warn!(site, %err, "reading cron handler component failed");
+                return;
+            }
         }
     };
     // PLAN-system-principal P2: a `run_as: deployer` cron fires as the system principal ONLY when the
@@ -1509,6 +1528,10 @@ async fn fire_cron(
         &entry.hash,
         metrics::Outcome::from_result(&result),
         start.elapsed(),
+        // Cron-route serve goes via `serve_with_limits` (not the timed `serve_lane`); the
+        // request-lane cold/instantiate cost is in the per-lane + per-component stats.
+        None,
+        None,
     );
     match result {
         Ok(response) => {
