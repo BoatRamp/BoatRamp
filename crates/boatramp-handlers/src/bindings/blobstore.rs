@@ -130,6 +130,13 @@ pub struct BlobBinding {
     /// multi-tenant site with an EMPTY `containers` allowlist denies every `wasi:blobstore` container
     /// op (fail-closed); a single-tenant/dev site stays permissive.
     pub(crate) multi_tenant: bool,
+    /// Whether this invocation is a null-principal `on_unresolved: "pass"` bind (set from the resolved
+    /// [`HostTenancy::pass_unresolved`]). When set and there is NO resolved own `tenant`, a `{tenant}`
+    /// container the guest asks for resolves to [`ContainerAccess::NullScoped`] — an EMPTY own-space
+    /// (reads see nothing, writes refuse) — the blob analog of the SQL/ORM null-principal `1 = 0`,
+    /// instead of the hard refusal that otherwise 500s the guest. It NEVER widens access: a
+    /// null-scoped container cannot reach another tenant's objects. `false` ⇒ the prior deny stands.
+    pub(crate) pass_unresolved: bool,
 }
 
 /// An opened container handle: the storage, the container's key prefix
@@ -138,7 +145,32 @@ pub struct Container {
     storage: Arc<dyn Storage>,
     prefix: String,
     name: String,
+    /// A null-principal `on_unresolved: "pass"` container (opened via [`ContainerAccess::NullScoped`]):
+    /// it has no real keyspace, so READ ops return empty/not-found without touching storage and WRITE
+    /// ops refuse. The blob analog of a scoped read confined to `1 = 0`.
+    null_scoped: bool,
 }
+
+/// The write-denial for any mutating op on a null-scoped (`pass`, no principal) container — the blob
+/// analog of the SQL/ORM null-principal write refusal. A clean authz error, not a backend fault.
+const NULL_SCOPED_WRITE_DENIED: &str =
+    "writes denied: unresolved-pass null principal (on_unresolved: \"pass\" is read-only)";
+
+/// How the tenant-confinement choke point ([`BlobHost::container_access`]) resolved a container name.
+enum ContainerAccess {
+    /// A permitted container: its host key prefix (`hblob/{site}/{name}/`).
+    Open(String),
+    /// A null-principal `on_unresolved: "pass"` bind asked for its own (`{tenant}`-shaped) container
+    /// but has no resolved tenant: an EMPTY own-space (reads see nothing, writes refuse) — never
+    /// another tenant's data. The blob analog of a scoped read confined to `1 = 0`.
+    NullScoped,
+}
+
+/// The crate-root `on_unresolved: "pass"` anti-hollow mutation seam (`crate::pass_mutation`):
+/// `deny_pass` reverts the pass handling on every surface so the gate goes RED. Shared with the
+/// `sql`-gated `tenant::sql_marker` and lives at the crate root so this always-compiled blob surface
+/// can consult it (the `tenant` module is `#[cfg(feature = "sql")]`).
+use crate::pass_mutation;
 
 impl Container {
     fn object_key(&self, object: &str) -> Result<String, String> {
@@ -357,8 +389,13 @@ impl BlobHost<'_> {
     /// allowlist miss; a `{tenant}` entry with no resolved own tenant; and the multi-tenant
     /// deny-default. These are an AUTHORIZATION category, returned directly — NOT through
     /// [`blob_err`] (which masks a backend fault as "blob backend unavailable").
-    fn container_prefix(&self, name: &str) -> Result<String, String> {
+    fn container_access(&self, name: &str) -> Result<ContainerAccess, String> {
         let binding = self.binding.ok_or_else(|| "access denied".to_string())?;
+        // A null-principal `on_unresolved: "pass"` bind with no resolved tenant resolves its OWN
+        // (`{tenant}`-shaped) container to an empty own-space instead of a hard refusal. The gate
+        // mutation `deny_pass` turns this off (reverting to the old deny) so the anti-hollow test
+        // goes RED — proving the pass handling is load-bearing.
+        let pass = binding.pass_unresolved && pass_mutation().as_deref() != Some("deny_pass");
 
         if !binding.containers.is_empty() {
             // A declared allowlist is ALWAYS enforced regardless of the multi-tenant posture (C3).
@@ -368,6 +405,11 @@ impl BlobHost<'_> {
             // literal `{tenant}` — the match is exact equality against the host-expanded form, and
             // the tenant is never guest-supplied).
             let mut saw_unexpandable_template = false;
+            // Whether the request lines up with the SHAPE (`{before}…{after}`) of a `{tenant}` entry
+            // we could not expand — i.e. it IS the guest's own per-tenant container, just unresolvable
+            // under a null principal. (Even a crafted `assets-<other>` only reaches an EMPTY space, so
+            // this never leaks another tenant's objects.)
+            let mut saw_unresolved_own_shape = false;
             let mut matched = false;
             for entry in &binding.containers {
                 match entry.split_once(TENANT_TEMPLATE) {
@@ -385,7 +427,15 @@ impl BlobHost<'_> {
                             // A `{tenant}` entry we cannot expand (no resolved own tenant): record it so a
                             // request that lines up ONLY with such an entry fails closed distinctly (C5),
                             // never a silent access-denied that could hide a wrongly-scoped invocation.
-                            None => saw_unexpandable_template = true,
+                            None => {
+                                saw_unexpandable_template = true;
+                                if name.len() >= before.len() + after.len()
+                                    && name.starts_with(before)
+                                    && name.ends_with(after)
+                                {
+                                    saw_unresolved_own_shape = true;
+                                }
+                            }
                         }
                     }
                     None => {
@@ -397,6 +447,12 @@ impl BlobHost<'_> {
                 }
             }
             if !matched {
+                // Null-principal pass: the guest's OWN (`{tenant}`-shaped) container becomes an empty
+                // own-space — never another tenant's data, never a write. A name matching NO entry
+                // stays a hard not-permitted deny even under pass.
+                if pass && saw_unresolved_own_shape {
+                    return Ok(ContainerAccess::NullScoped);
+                }
                 return Err(if saw_unexpandable_template {
                     format!(
                         "blobstore_containers: no resolved tenant to expand a {TENANT_TEMPLATE} \
@@ -424,7 +480,18 @@ impl BlobHost<'_> {
         // tid carries `.`/`@`, so KEY-safety (`validate_key_segment`), not the strict slug. `..` is
         // already inert (fs `resolve` rejects; cloud literal); belt, not the load-bearing fix.
         validate_key_segment("container", name).map_err(|e| format!("invalid container: {e}"))?;
-        Ok(format!("{}{name}/", binding.prefix))
+        Ok(ContainerAccess::Open(format!("{}{name}/", binding.prefix)))
+    }
+
+    /// The container key prefix for a WRITE/create-oriented op (create/delete-container, copy/move).
+    /// A null-scoped (`pass`, no principal) container has no writable keyspace, so it is DENIED here —
+    /// the read-open path uses [`container_access`](Self::container_access) directly to get an empty
+    /// (not errored) handle.
+    fn container_prefix(&self, name: &str) -> Result<String, String> {
+        match self.container_access(name)? {
+            ContainerAccess::Open(prefix) => Ok(prefix),
+            ContainerAccess::NullScoped => Err(NULL_SCOPED_WRITE_DENIED.to_string()),
+        }
     }
 
     fn storage(&self) -> Result<Arc<dyn Storage>, String> {
@@ -534,6 +601,13 @@ impl blobstore::container::HostContainer for BlobHost<'_> {
         this: Resource<Container>,
     ) -> Result<blobstore::types::ContainerMetadata, String> {
         let container = self.table.get(&this).map_err(estr)?;
+        // Null-scoped: an empty own-space; report it as present-but-empty without touching storage.
+        if container.null_scoped {
+            return Ok(blobstore::types::ContainerMetadata {
+                name: container.name.clone(),
+                created_at: 0,
+            });
+        }
         let (storage, marker, name) = (
             container.storage.clone(),
             container.marker_key(),
@@ -551,6 +625,11 @@ impl blobstore::container::HostContainer for BlobHost<'_> {
         end: u64,
     ) -> Result<Resource<IncomingValue>, String> {
         let container = self.table.get(&this).map_err(estr)?;
+        // Null-scoped (`pass`, no principal): the own-space is empty → every object is not-found,
+        // without touching storage. The blob analog of a scoped read returning zero rows.
+        if container.null_scoped {
+            return Err(format!("no such object: {name}"));
+        }
         let (storage, key) = (container.storage.clone(), container.object_key(&name)?);
         // Offsets are inclusive. `end == u64::MAX` is the "whole object, host clamps to size"
         // sentinel the shim's `blob::get` passes (`get-data(_, 0, u64::MAX)`) — map it to a to-end
@@ -574,6 +653,9 @@ impl blobstore::container::HostContainer for BlobHost<'_> {
     ) -> Result<(), String> {
         let bytes = self.table.get(&data).map_err(estr)?.pipe.contents();
         let container = self.table.get(&this).map_err(estr)?;
+        if container.null_scoped {
+            return Err(NULL_SCOPED_WRITE_DENIED.to_string());
+        }
         let (storage, key) = (container.storage.clone(), container.object_key(&name)?);
         storage
             .put(&key, once_stream(bytes), PutMeta::default())
@@ -587,6 +669,16 @@ impl blobstore::container::HostContainer for BlobHost<'_> {
         this: Resource<Container>,
     ) -> Result<Resource<StreamObjectNames>, String> {
         let container = self.table.get(&this).map_err(estr)?;
+        // Null-scoped: the own-space is empty → list yields nothing, without touching storage.
+        if container.null_scoped {
+            return self
+                .table
+                .push(StreamObjectNames {
+                    names: Vec::new(),
+                    cursor: 0,
+                })
+                .map_err(estr);
+        }
         let (storage, prefix) = (container.storage.clone(), container.prefix.clone());
         let names = storage
             .list(&prefix)
@@ -610,6 +702,9 @@ impl blobstore::container::HostContainer for BlobHost<'_> {
         name: String,
     ) -> Result<(), String> {
         let container = self.table.get(&this).map_err(estr)?;
+        if container.null_scoped {
+            return Err(NULL_SCOPED_WRITE_DENIED.to_string());
+        }
         let (storage, key) = (container.storage.clone(), container.object_key(&name)?);
         storage
             .delete(&key)
@@ -623,6 +718,9 @@ impl blobstore::container::HostContainer for BlobHost<'_> {
         names: Vec<String>,
     ) -> Result<(), String> {
         let container = self.table.get(&this).map_err(estr)?;
+        if container.null_scoped {
+            return Err(NULL_SCOPED_WRITE_DENIED.to_string());
+        }
         let storage = container.storage.clone();
         let keys: Vec<String> = names
             .iter()
@@ -643,6 +741,10 @@ impl blobstore::container::HostContainer for BlobHost<'_> {
         name: String,
     ) -> Result<bool, String> {
         let container = self.table.get(&this).map_err(estr)?;
+        // Null-scoped: the own-space is empty → no object exists.
+        if container.null_scoped {
+            return Ok(false);
+        }
         let (storage, key) = (container.storage.clone(), container.object_key(&name)?);
         match storage.head(&key).await {
             Ok(_) => Ok(true),
@@ -657,6 +759,9 @@ impl blobstore::container::HostContainer for BlobHost<'_> {
         name: String,
     ) -> Result<blobstore::types::ObjectMetadata, String> {
         let container = self.table.get(&this).map_err(estr)?;
+        if container.null_scoped {
+            return Err(format!("no such object: {name}"));
+        }
         let (storage, key, cname) = (
             container.storage.clone(),
             container.object_key(&name)?,
@@ -677,6 +782,9 @@ impl blobstore::container::HostContainer for BlobHost<'_> {
 
     async fn clear(&mut self, this: Resource<Container>) -> Result<(), String> {
         let container = self.table.get(&this).map_err(estr)?;
+        if container.null_scoped {
+            return Err(NULL_SCOPED_WRITE_DENIED.to_string());
+        }
         let (storage, prefix) = (container.storage.clone(), container.prefix.clone());
         // Delete every object but keep the marker, so the container still exists.
         for meta in storage
@@ -735,6 +843,7 @@ impl blobstore::container::HostStreamObjectNames for BlobHost<'_> {
 
 impl blobstore::blobstore::Host for BlobHost<'_> {
     async fn create_container(&mut self, name: String) -> Result<Resource<Container>, String> {
+        // `container_prefix` denies a null-scoped (`pass`, no principal) container — create is a write.
         let prefix = self.container_prefix(&name)?;
         let storage = self.storage()?;
         // The marker's body records creation time.
@@ -751,12 +860,28 @@ impl blobstore::blobstore::Host for BlobHost<'_> {
                 storage,
                 prefix,
                 name,
+                null_scoped: false,
             })
             .map_err(estr)
     }
 
     async fn get_container(&mut self, name: String) -> Result<Resource<Container>, String> {
-        let prefix = self.container_prefix(&name)?;
+        // A null-scoped (`pass`, no principal) own-container opens as an EMPTY handle (reads see
+        // nothing, writes refuse) rather than 500ing — the blob analog of a scoped read's zero rows.
+        let prefix = match self.container_access(&name)? {
+            ContainerAccess::NullScoped => {
+                return self
+                    .table
+                    .push(Container {
+                        storage: self.storage()?,
+                        prefix: String::new(),
+                        name,
+                        null_scoped: true,
+                    })
+                    .map_err(estr);
+            }
+            ContainerAccess::Open(prefix) => prefix,
+        };
         let storage = self.storage()?;
         if !marker_exists(&*storage, &prefix).await? {
             return Err(format!("no such container: {name}"));
@@ -766,11 +891,13 @@ impl blobstore::blobstore::Host for BlobHost<'_> {
                 storage,
                 prefix,
                 name,
+                null_scoped: false,
             })
             .map_err(estr)
     }
 
     async fn delete_container(&mut self, name: String) -> Result<(), String> {
+        // Write op: `container_prefix` denies a null-scoped container.
         let prefix = self.container_prefix(&name)?;
         let storage = self.storage()?;
         for meta in storage
@@ -787,7 +914,11 @@ impl blobstore::blobstore::Host for BlobHost<'_> {
     }
 
     async fn container_exists(&mut self, name: String) -> Result<bool, String> {
-        let prefix = self.container_prefix(&name)?;
+        // A null-scoped (`pass`, no principal) own-container is an empty space → reports as absent.
+        let prefix = match self.container_access(&name)? {
+            ContainerAccess::NullScoped => return Ok(false),
+            ContainerAccess::Open(prefix) => prefix,
+        };
         let storage = self.storage()?;
         marker_exists(&*storage, &prefix).await
     }
@@ -881,6 +1012,7 @@ pub async fn read_object_through_guest_binding(
         tenant: None,
         containers: Vec::new(),
         multi_tenant: false,
+        pass_unresolved: false,
     };
     let mut table = ResourceTable::new();
     let mut host = BlobHost::new(&mut table, Some(&binding));
@@ -893,6 +1025,7 @@ pub async fn read_object_through_guest_binding(
             storage: binding.storage.clone(),
             prefix: format!("hblob/{site}/{container}/"),
             name: container.to_string(),
+            null_scoped: false,
         })
         .map_err(estr)?;
     let rep = handle.rep();
@@ -931,8 +1064,17 @@ impl blob_list::Host for BlobHost<'_> {
         after: Option<String>,
         limit: u32,
     ) -> Result<blob_list::Page, String> {
-        // Single tenant-confinement choke point: hblob/{site}/{container}/ (allowlist-gated).
-        let container_prefix = self.container_prefix(&container)?;
+        // Single tenant-confinement choke point: hblob/{site}/{container}/ (allowlist-gated). A
+        // null-scoped (`pass`, no principal) own-container lists as empty (read → zero rows analog).
+        let container_prefix = match self.container_access(&container)? {
+            ContainerAccess::NullScoped => {
+                return Ok(blob_list::Page {
+                    names: Vec::new(),
+                    cursor: None,
+                });
+            }
+            ContainerAccess::Open(prefix) => prefix,
+        };
         let storage = self.storage()?;
         let guest_prefix = prefix.as_deref().unwrap_or("");
         screen_list_prefix(guest_prefix)?;
@@ -1082,6 +1224,7 @@ mod tests {
             tenant: None,
             containers: Vec::new(),
             multi_tenant: false,
+            pass_unresolved: false,
         }
     }
 
@@ -1502,6 +1645,7 @@ mod tests {
             tenant: tenant.map(str::to_string),
             containers: containers.iter().map(|s| (*s).to_string()).collect(),
             multi_tenant,
+            pass_unresolved: false,
         }
     }
 
@@ -1549,6 +1693,119 @@ mod tests {
             exists.is_err() && exists.unwrap_err().contains("not permitted"),
             "container_exists on a forbidden container must Err, not Ok(false)"
         );
+    }
+
+    /// ANTI-HOLLOW GATE — BLOB half (construens `on_unresolved: "pass"`): a null-principal `pass` bind
+    /// CONFINES instead of refusing on the always-compiled `wasi:blobstore` `{tenant}` surface (the
+    /// guest's own container opens EMPTY; another tenant's objects stay unreachable; writes refuse) —
+    /// the blob analog of the SQL/ORM null-principal `1 = 0`. MUTATION-VERIFIED:
+    /// `BOATRAMP_PASS_MUTATION=deny_pass` (armed by the `pass-gate-mutation` feature / `cfg(test)`)
+    /// reverts it to the old hard refusal and MUST turn this RED. Marker `ON-UNRESOLVED PASS OK
+    /// (blob)`. Split from the `sql_marker` half (below) so EACH surface's mutation-RED is proven in
+    /// its own run — a single combined test panics on the first assert and never reaches the second.
+    /// The CI gate runs both under `engine,sql`.
+    #[cfg(feature = "sql")]
+    #[tokio::test]
+    async fn on_unresolved_pass_confinement_gate_blob() {
+        let storage = Arc::new(MemStorage::default());
+        // A REAL tenant's object, to prove the null-principal guest cannot reach it under pass.
+        storage.map.lock().unwrap().insert(
+            "hblob/shop/assets-firm-a/logo.png".to_string(),
+            b"secret".to_vec(),
+        );
+        let mut bind = confined(
+            storage.clone(),
+            "hblob/shop/",
+            None, // no resolved own tenant (the context-absent wildcard host)
+            &["assets-{tenant}"],
+            true,
+        );
+        bind.pass_unresolved = true;
+        let mut table = ResourceTable::new();
+        let mut host = BlobHost::new(&mut table, Some(&bind));
+
+        // The guest's own `{tenant}` container opens as an EMPTY handle (NOT a 500 / refusal) — the
+        // blob analog of a scoped read returning zero rows. (Under `deny_pass` this `get_container`
+        // refuses → the `expect` panics → the gate goes RED.)
+        let c = host
+            .get_container("assets-firm-a".into())
+            .await
+            .expect("pass: own {tenant} container opens empty, not refused");
+        let stream = host.list_objects(c).await.expect("pass: list ok");
+        let (names, _at_end) = host
+            .read_stream_object_names(stream, 100)
+            .expect("pass: read names");
+        assert!(
+            names.is_empty(),
+            "pass: a null-scoped container lists EMPTY (zero-rows analog); saw {names:?}"
+        );
+        // The REAL tenant's object is NOT reachable through the null-scoped handle.
+        let c = host.get_container("assets-firm-a".into()).await.unwrap();
+        assert!(
+            !host.has_object(c, "logo.png".into()).await.unwrap(),
+            "pass: a null-scoped read must NOT reach the real tenant's object"
+        );
+        // Even a crafted OTHER-tenant-shaped name only reaches an EMPTY space (never their data).
+        let c = host
+            .get_container("assets-firm-b".into())
+            .await
+            .expect("pass: a {tenant}-shaped name opens empty, never another tenant's data");
+        assert!(!host.has_object(c, "logo.png".into()).await.unwrap());
+        // Writes refuse on every path.
+        let c = host.get_container("assets-firm-a".into()).await.unwrap();
+        assert!(
+            host.delete_object(c, "logo.png".into())
+                .await
+                .unwrap_err()
+                .contains("writes denied"),
+            "pass: a null-scoped write (delete) must refuse"
+        );
+        assert!(
+            host.create_container("assets-firm-a".into())
+                .await
+                .unwrap_err()
+                .contains("writes denied"),
+            "pass: create is a write and must refuse under a null principal"
+        );
+
+        println!("ON-UNRESOLVED PASS OK (blob)");
+    }
+
+    /// ANTI-HOLLOW GATE — SQL `sql_marker` half. A null-principal `pass` scoped READ via the legacy
+    /// `{scope}`-marker path confines to `1 = 0` (zero rows), not a refusal; a write still denies.
+    /// DEFENSIVE / VESTIGIAL: `sql_marker` has NO live caller today — the funnel's raw SQL is
+    /// neutralised + AST-rewritten by `sql::apply_scope_marker` → `HostTenancy::rewrite_own_read`
+    /// (the real live null-principal `1 = 0` lives there and in `orm::no_principal_read_pred`, already
+    /// gated by the ORM tenancy tests). This half keeps the marker path consistent so a future
+    /// revival (e.g. a GDC marker) cannot silently reintroduce the deny-under-pass bug, and is gated
+    /// by the SAME `deny_pass` mutation seam so its mutation-RED is proven independently of the blob
+    /// half. Marker `ON-UNRESOLVED PASS OK (sql_marker)`.
+    #[cfg(feature = "sql")]
+    #[tokio::test]
+    async fn on_unresolved_pass_confinement_gate_sql_marker() {
+        use crate::tenant::{Axis, HostTenancy};
+        use boatramp_core::tenancy::AccessMode;
+
+        let ht = HostTenancy::new("tenant_id", None, AccessMode::Own, AccessMode::None)
+            .with_unresolved_pass(true);
+        let (sql, params) = ht
+            .sql_marker(Axis::Read, 0)
+            .expect("pass: a null-principal scoped read confines to zero rows, not a refusal");
+        assert_eq!(
+            sql, "1 = 0",
+            "pass: sql_marker read must be the zero-rows predicate"
+        );
+        assert!(
+            params.is_empty(),
+            "pass: the zero-rows predicate binds no params"
+        );
+        // The WRITE axis under a null principal still denies (pass is read-only).
+        assert!(
+            ht.sql_marker(Axis::Write, 0).is_err(),
+            "pass: a null-principal WRITE must still deny (NoSource), never confine"
+        );
+
+        println!("ON-UNRESOLVED PASS OK (sql_marker)");
     }
 
     /// A `{tenant}` entry with NO resolved own tenant (an `all`/anon/target/unscoped invocation) fails

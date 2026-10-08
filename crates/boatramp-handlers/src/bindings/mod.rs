@@ -183,6 +183,12 @@ impl Bindings {
     /// tenancy fact that scopes `sql`/`orm`). An empty allowlist denies every container op on a
     /// multi-tenant site (fail-closed) and stays permissive on a single-tenant/dev site. Mirrors the
     /// `blob-upload` mint path's `resolve_container`.
+    /// `pass_unresolved` is set from the resolved [`HostTenancy::pass_unresolved`]
+    /// (`crate::tenant::HostTenancy::pass_unresolved`): a null-principal `on_unresolved: "pass"` bind.
+    /// When set with no resolved `tenant`, a `{tenant}` container resolves to an EMPTY own-space
+    /// (reads empty, writes refuse) instead of a hard refusal — the blob analog of a scoped read's
+    /// `1 = 0`. It never widens access (another tenant's container stays unreachable).
+    #[allow(clippy::too_many_arguments)]
     pub fn with_blobstore(
         mut self,
         site: &str,
@@ -191,6 +197,7 @@ impl Bindings {
         tenant: Option<String>,
         containers: Vec<String>,
         multi_tenant: bool,
+        pass_unresolved: bool,
     ) -> Self {
         self.blobstore = Some(blobstore::BlobBinding {
             storage,
@@ -199,6 +206,7 @@ impl Bindings {
             tenant,
             containers,
             multi_tenant,
+            pass_unresolved,
         });
         self
     }

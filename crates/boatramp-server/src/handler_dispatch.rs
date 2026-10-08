@@ -693,6 +693,13 @@ async fn resolve_gateway_caller_facts(
             )
         })?
         .map(|h| h.with_schema(schema.as_ref()))
+        // NOTE (on_unresolved pass, deliberate non-propagation): collapsing to `facts()` drops the
+        // resolved `pass_unresolved` flag, so a GATEWAY-level `on_unresolved: "pass"` is NOT carried
+        // into a wasm subgraph's own-fetch — an unresolved caller yields empty own facts and the
+        // subgraph's own read fail-closes (refuses), rather than confining to zero rows. This is SAFE
+        // (fail-closed, never widens anon access); it is only less lenient than the direct-funnel
+        // pass. Propagating it would thread the flag through the federation fan-out AND the shared
+        // inherited-tenancy resolution — deferred. A subgraph gets `pass` from its OWN route tenancy.
         .map(|h| h.facts().to_vec())
         .unwrap_or_default();
     Ok(facts)
@@ -1742,7 +1749,7 @@ pub(super) async fn build_bindings(
     // A sql/orm importer that declares no tenancy is refused under the strict posture (Dimension
     // 0); an `all` grant is capped to `own` unless the posture opens cross-tenant access. The
     // resolved value is carried into the `invoke` binding below so a sibling inherits it.
-    let (handler_caller_tenant, handler_caller_kind) = {
+    let (handler_caller_tenant, handler_caller_kind, handler_caller_pass) = {
         let imports_db = !granted_sql_databases(imports, &site_handlers.allow_imports).is_empty();
         // Security HIGH-1: `wasi:blobstore` carries per-tenant blob assets ⇒ it is a tenant-scoped
         // DATA capability like sql/orm, so a blob-importing handler on a multi-tenant posture must
@@ -1986,11 +1993,18 @@ pub(super) async fn build_bindings(
                 .map(boatramp_handlers::HostTenancy::principal_kind)
                 .unwrap_or_default()
         };
+        // The resolved `on_unresolved: "pass"` flag — carried out alongside the facts so the
+        // `wasi:blobstore` bind below honors pass the same way the SQL/ORM scope does (the facts
+        // vec alone drops it). `false` for a resolved/absent principal.
+        let pass_unresolved = tenancy
+            .as_ref()
+            .is_some_and(boatramp_handlers::HostTenancy::pass_unresolved);
         // Carry the resolved principal (axis-tagged facts) so a sibling this handler invokes
         // inherits it (each fact keeps its axis).
         (
             tenancy.map(|h| h.facts().to_vec()).unwrap_or_default(),
             kind,
+            pass_unresolved,
         )
     };
     // `wasi:blobstore` (REORDERED to here, post tenant-resolution): the host-side tenant confinement
@@ -2033,6 +2047,9 @@ pub(super) async fn build_bindings(
             super::function_runtime::resolved_tenant_string(&handler_caller_tenant),
             blobstore_containers.to_vec(),
             multi_tenant,
+            // Honor `on_unresolved: "pass"` on the blob surface too: a null-principal pass bind with
+            // no resolved tenant gets an EMPTY own-space for its `{tenant}` container (not a 500).
+            handler_caller_pass,
         );
     }
     // The host-verified sealed principal for THIS invocation (PLAN-async-persona): resolved from the
