@@ -123,6 +123,12 @@ mod graphql_apq;
 mod graphql_cache;
 #[cfg(feature = "handlers")]
 mod graphql_data;
+/// The node-wide JWKS freshness policy (two-tier: own vs foreign) + the startup pre-warm entry, so the
+/// node (`boatramp-node::handlers`) installs the `[handlers]` JWKS knobs into the token-verification
+/// cache once at startup. See [`graphql_data::token`]. The token module is `oidc`-gated, so the export
+/// requires both `handlers` and `oidc` (a `handlers`-without-`oidc` server has no JWKS verification).
+#[cfg(all(feature = "handlers", feature = "oidc"))]
+pub use graphql_data::token::{JwksConfig, JwksTier, prewarm_own_jwks, set_jwks_config};
 #[cfg(feature = "handlers")]
 mod graphql_federation;
 #[cfg(feature = "handlers")]

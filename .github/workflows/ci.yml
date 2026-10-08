@@ -627,6 +627,50 @@ jobs:
             echo "issuer-trust LIVE mutation verified: follow_redirects turns the gate RED → the redirect refusal is load-bearing."
           fi
 
+      # FEDERATED-GATEWAY JWKS PERF gate (boatramp-federated-gateway-overhead): the construens repro —
+      # a 20-subgraph federation + single-issuer JWKS (`token_claims:(issuer, jwks_url)`), firing an
+      # empty-returning query under a 50-way concurrent mass-call, must stay in the MS range with NO
+      # per-request JWKS fetch and NO spike. A delayed localhost JWKS mock stands in for the ~1 s IdP
+      # round-trip; the gate asserts the fetch collapses to O(1) hits (not ~N) and every warm request is
+      # ≪ the delay. Marker `FEDERATION-20 JWKS WARM-MS OK`. MUTATION-VERIFIED: `disable_cache` forces a
+      # per-request fetch → every request pays the delay (hits ~N) → the gate MUST go RED.
+      - name: "federated-gateway JWKS perf gate (20 subgraphs, mass-call, ms/no-spike)"
+        run: |
+          set -eo pipefail
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-server \
+            --features handlers,oidc --lib federation_20_jwks_warm_is_ms_without_spikes \
+            -- --ignored --nocapture 2>&1 | tee jwks-perf.log
+          grep -qE 'test result: ok\. 1 passed' jwks-perf.log \
+            || { echo "::error::JWKS perf gate did not run (silent skip or a failure)" >&2; exit 1; }
+          grep -q 'FEDERATION-20 JWKS WARM-MS OK' jwks-perf.log \
+            || { echo "::error::JWKS perf gate never reached its marker (a regression or a skipped test)" >&2; exit 1; }
+          if BOATRAMP_JWKS_MUTATION=disable_cache cargo-zigbuild test \
+            --target x86_64-unknown-linux-musl -p boatramp-server \
+            --features handlers,oidc,jwks-gate-mutation \
+            --lib federation_20_jwks_warm_is_ms_without_spikes -- --ignored \
+            > jwks-perf-nocache.log 2>&1; then
+            echo "::error::JWKS perf gate is HOLLOW — it passed under disable_cache (a per-request JWKS fetch no longer spikes a 20-subgraph mass-call — the cache is not actually load-bearing)" >&2
+            exit 1
+          else
+            echo "JWKS perf mutation verified: disable_cache turns the gate RED → the JWKS cache is load-bearing."
+          fi
+
+      # Background-refresh zero-hiccup + single-flight: a request landing in [refresh, hard_ttl) serves
+      # the current verifier IMMEDIATELY (never blocks on the fetch) while ONE background refresh runs
+      # off-path; N concurrent such requests trigger ~1 refresh, not N. Non-hollow by construction (the
+      # `delta <= 2` / `worst < D/2` assertions fail if single-flight or non-blocking regresses).
+      # Marker `JWKS BACKGROUND-REFRESH SINGLE-FLIGHT OK`.
+      - name: "federated-gateway JWKS background-refresh + single-flight gate"
+        run: |
+          set -eo pipefail
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-server \
+            --features handlers,oidc --lib background_refresh_serves_immediately_and_is_single_flight \
+            -- --ignored --nocapture 2>&1 | tee jwks-bgrefresh.log
+          grep -qE 'test result: ok\. 1 passed' jwks-bgrefresh.log \
+            || { echo "::error::JWKS background-refresh gate did not run (silent skip or a failure)" >&2; exit 1; }
+          grep -q 'JWKS BACKGROUND-REFRESH SINGLE-FLIGHT OK' jwks-bgrefresh.log \
+            || { echo "::error::JWKS background-refresh gate never reached its marker (zero-hiccup/single-flight regressed)" >&2; exit 1; }
+
       # SYSTEM-PRINCIPAL provenance gates (PLAN-system-principal): the first-class no-tenant `system`
       # principal is produced ONLY from a verified system source. Four anti-hollow gates, each armed via
       # `BOATRAMP_SYSPRINCIPAL_MUTATION` (through `system-principal-gate-mutation`, compiled OUT of

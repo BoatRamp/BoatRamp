@@ -264,6 +264,22 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
         secrets_envelope.clone(),
     )
     .await?;
+    // JWKS pre-warm (federated-gateway overhead fix): fetch the configured first-party (`own`-tier)
+    // JWKS up front so even the FIRST request per first-party issuer is instant, not a cold fetch.
+    // Best-effort + spawned (a slow/unreachable IdP must never delay node readiness); the token
+    // cache's single-flight lock dedups a pre-warm fetch against a concurrent first request.
+    // `prewarm_own_jwks` internally honors the `[handlers] jwks_prewarm` flag (no-op when off).
+    // Sites deployed AFTER startup simply warm lazily on first request (today's behavior).
+    #[cfg(feature = "handlers")]
+    {
+        let prewarm_deploy = deploy.clone();
+        tokio::spawn(async move {
+            let entries = collect_own_jwks_prewarm(&prewarm_deploy).await;
+            if !entries.is_empty() {
+                boatramp_server::prewarm_own_jwks(&entries).await;
+            }
+        });
+    }
     // Hand the runtime the SAME per-tenant secret store `Arc` the control-plane routes hold (task
     // #493), so a guest `tenant-secrets` `get` and a control-plane `PUT` seal/unseal against ONE
     // store. Unset when no `[secrets]` envelope, so the guest binding is not built (fail-closed).
@@ -814,6 +830,62 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
 const GUEST_EGRESS_EXTRA_CA_ENV: &str = "BOATRAMP_GUEST_EGRESS_EXTRA_CA_FILE";
 
 /// Parse the operator's guest-egress extra-CA PEM ([`GUEST_EGRESS_EXTRA_CA_ENV`]) into rustls trust
+/// Collect the first-party (`own`-tier) JWKS URLs to pre-warm at startup: every site's gateway-level
+/// `[handlers.graphql.data].claims_from_token` that is single-issuer (`jwks_url` set) and NOT
+/// multi-issuer (`issuer_trust` unset) — foreign/multi-issuer issuers can't be pre-warmed (unknown
+/// until a token arrives), and `jwks_env` is an env var, not a fetch. Returns deduped
+/// `(url, issuer, audience)` tuples. Best-effort: a per-site read error is logged and skipped, never
+/// propagated (pre-warm must not fail node startup). Per-route `HandlerConfig`/consumer/session/
+/// function `token_claims` live in content-addressed deployment manifests not enumerated here; those
+/// warm lazily on first request (today's behavior).
+#[cfg(feature = "handlers")]
+async fn collect_own_jwks_prewarm(deploy: &DeployStore) -> Vec<(String, String, Option<String>)> {
+    use boatramp_core::project::ProjectRef;
+    let sites = match deploy.list_sites_all().await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %e, "JWKS pre-warm: could not list sites; skipping pre-warm");
+            return Vec::new();
+        }
+    };
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for (project, site) in sites {
+        let sc = match deploy
+            .get_site_config(ProjectRef::new(&project), &site)
+            .await
+        {
+            Ok(Some(sc)) => sc,
+            Ok(None) => continue,
+            Err(e) => {
+                tracing::warn!(project = %project, site = %site, error = %e,
+                    "JWKS pre-warm: could not load site config; skipping");
+                continue;
+            }
+        };
+        let Some(claims) = sc
+            .handlers
+            .as_ref()
+            .and_then(|h| h.graphql.as_ref())
+            .and_then(|g| g.data.as_ref())
+            .and_then(|d| d.claims_from_token.as_ref())
+        else {
+            continue;
+        };
+        // OWN tier only: operator-fixed single-issuer `jwks_url`, never multi-issuer discovery.
+        if claims.issuer_trust.is_some() {
+            continue;
+        }
+        if let Some(url) = claims.jwks_url.as_ref() {
+            let entry = (url.clone(), claims.issuer.clone(), claims.audience.clone());
+            if seen.insert(entry.clone()) {
+                out.push(entry);
+            }
+        }
+    }
+    out
+}
+
 /// anchors, gated by the `allow_guest_egress_extra_ca` posture (`allow`). No env set ⇒ empty (the
 /// default). `allow == false` (e.g. multi-tenant) with a file set ⇒ empty + a warning (the posture
 /// refuses it). Set + readable + ≥1 cert ⇒ those certs. Set-but-unreadable / no valid cert ⇒ a hard

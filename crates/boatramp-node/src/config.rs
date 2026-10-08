@@ -558,6 +558,29 @@ impl ServerConfig {
             }
         }
 
+        // --- handler JWKS freshness (`[handlers]` two-tier own/foreign refresh + hard-ttl + prewarm) ---
+        // Env parity for the token-verification JWKS cache knobs, so a file-less (`[env]`-only) fleet
+        // can tune the gateway's auth-freshness posture without a `boatramp.cfg` + roll. Materialises
+        // `[handlers]` only when a JWKS var is set (an unset environment conjures no section).
+        if source.any(JWKS_ENV_VARS) {
+            let handlers = self.handlers.get_or_insert_with(HandlersConfig::default);
+            if let Some(v) = source.parse("BOATRAMP_HANDLERS_JWKS_REFRESH_SECS")? {
+                handlers.jwks_refresh_secs = Some(v);
+            }
+            if let Some(v) = source.parse("BOATRAMP_HANDLERS_JWKS_HARD_TTL_SECS")? {
+                handlers.jwks_hard_ttl_secs = Some(v);
+            }
+            if let Some(v) = source.parse("BOATRAMP_HANDLERS_JWKS_FOREIGN_REFRESH_SECS")? {
+                handlers.jwks_foreign_refresh_secs = Some(v);
+            }
+            if let Some(v) = source.parse("BOATRAMP_HANDLERS_JWKS_FOREIGN_HARD_TTL_SECS")? {
+                handlers.jwks_foreign_hard_ttl_secs = Some(v);
+            }
+            if let Some(v) = source.parse_bool("BOATRAMP_HANDLERS_JWKS_PREWARM")? {
+                handlers.jwks_prewarm = Some(v);
+            }
+        }
+
         // --- handler sql external databases (`handlers.bindings.sql.databases`) ---
         // The bring-your-own / managed-compute DB map, keyed by name. There is no
         // config file to enumerate the members, so the member names are discovered
@@ -902,6 +925,16 @@ const SQL_ENV_VARS: &[&str] = &[
     "BOATRAMP_HANDLERS_SQL_MIGRATE_TRUSTED_EXTENSIONS",
     "BOATRAMP_HANDLERS_SQL_MAX_DECLARED_DATABASES",
     "BOATRAMP_HANDLERS_SQL_MAX_DECLARED_VOLUME_MIB",
+];
+
+/// The `[handlers]` JWKS-freshness env levers (two-tier own/foreign refresh + hard-ttl + prewarm),
+/// mirroring the `jwks_*` fields on [`HandlersConfig`]. Kept in sync by the forgot-a-knob guard test.
+const JWKS_ENV_VARS: &[&str] = &[
+    "BOATRAMP_HANDLERS_JWKS_REFRESH_SECS",
+    "BOATRAMP_HANDLERS_JWKS_HARD_TTL_SECS",
+    "BOATRAMP_HANDLERS_JWKS_FOREIGN_REFRESH_SECS",
+    "BOATRAMP_HANDLERS_JWKS_FOREIGN_HARD_TTL_SECS",
+    "BOATRAMP_HANDLERS_JWKS_PREWARM",
 ];
 
 /// The fixed prefix of a keyed `handlers.bindings.sql.databases` variable —
@@ -1495,6 +1528,34 @@ pub struct HandlersConfig {
     /// (between-bytes) timeout is left at wasmtime's default so a slow token
     /// stream is not cut mid-flight. Absent ⇒ wasmtime's default.
     pub outbound_timeout_ms: Option<u64>,
+    /// **JWKS freshness — `own` (first-party) tier: background-refresh age** (seconds). The soft age at
+    /// which a node-fixed `token_claims.jwks_url`/`jwks_env` verifier is refreshed in the BACKGROUND
+    /// (the current keys keep serving — no request blocks on the fetch). Absent ⇒ 120 s. Floored at 60 s.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jwks_refresh_secs: Option<u64>,
+    /// **JWKS freshness — `own` tier: hard TTL / revocation bound** (seconds). The age past which the
+    /// first-party keys are no longer served and a request BLOCKS on a fresh fetch (fail-closed on
+    /// failure) — caps how long a key revoked at the IdP can keep verifying. Absent ⇒ 600 s. Must be
+    /// `> jwks_refresh_secs` (else clamped up, with a warning). Floored at 60 s.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jwks_hard_ttl_secs: Option<u64>,
+    /// **JWKS freshness — `foreign` (user-declared multi-issuer) tier: background-refresh age**
+    /// (seconds). As [`jwks_refresh_secs`](Self::jwks_refresh_secs) but for the multi-issuer
+    /// (`issuer_trust`+`jwks` discovery) path, which is less trusted. Absent ⇒ 60 s. Floored at 60 s.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jwks_foreign_refresh_secs: Option<u64>,
+    /// **JWKS freshness — `foreign` tier: hard TTL / revocation bound** (seconds). As
+    /// [`jwks_hard_ttl_secs`](Self::jwks_hard_ttl_secs) but for user-declared issuers — typically set
+    /// TIGHTER (faster revocation of a potentially-compromised foreign key). Absent ⇒ 300 s. Must be
+    /// `> jwks_foreign_refresh_secs`. Floored at 60 s.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jwks_foreign_hard_ttl_secs: Option<u64>,
+    /// **JWKS pre-warm at startup.** When on (the default), the node fetches each configured
+    /// first-party (`own`-tier) `jwks_url` at startup so even the FIRST request is instant; foreign
+    /// (user-declared) issuers can't be pre-warmed (they aren't known until a token arrives). Set
+    /// `false` to skip startup JWKS fetches (the first request per issuer then pays the fetch). Absent ⇒ on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jwks_prewarm: Option<bool>,
 }
 
 /// `handlers.bindings` — per-binding backend configuration. kv/blob reuse the
@@ -3584,6 +3645,41 @@ mod tests {
                 SQL_ENV_VARS.contains(&var),
                 "{var} missing from SQL_ENV_VARS — a sql-binding scalar lost its env lever \
                  (the forgot-a-knob gap); add it to the registry + an overlay arm"
+            );
+        }
+    }
+
+    #[test]
+    fn env_wires_the_jwks_freshness_knobs_over_the_default() {
+        // The two-tier JWKS freshness knobs are env-settable (12-factor parity), and every lever is
+        // registered in JWKS_ENV_VARS — a forgot-a-knob guard so a new `jwks_*` field can't silently
+        // lose its env override.
+        let mut cfg = ServerConfig::default();
+        assert!(cfg.handlers.is_none());
+        cfg.apply_env_overrides(&env(&[
+            ("BOATRAMP_HANDLERS_JWKS_REFRESH_SECS", "90"),
+            ("BOATRAMP_HANDLERS_JWKS_HARD_TTL_SECS", "450"),
+            ("BOATRAMP_HANDLERS_JWKS_FOREIGN_REFRESH_SECS", "30"),
+            ("BOATRAMP_HANDLERS_JWKS_FOREIGN_HARD_TTL_SECS", "150"),
+            ("BOATRAMP_HANDLERS_JWKS_PREWARM", "false"),
+        ]))
+        .expect("valid env overrides apply");
+        let h = cfg.handlers.expect("handlers materialised from env");
+        assert_eq!(h.jwks_refresh_secs, Some(90));
+        assert_eq!(h.jwks_hard_ttl_secs, Some(450));
+        assert_eq!(h.jwks_foreign_refresh_secs, Some(30));
+        assert_eq!(h.jwks_foreign_hard_ttl_secs, Some(150));
+        assert_eq!(h.jwks_prewarm, Some(false));
+        for var in [
+            "BOATRAMP_HANDLERS_JWKS_REFRESH_SECS",
+            "BOATRAMP_HANDLERS_JWKS_HARD_TTL_SECS",
+            "BOATRAMP_HANDLERS_JWKS_FOREIGN_REFRESH_SECS",
+            "BOATRAMP_HANDLERS_JWKS_FOREIGN_HARD_TTL_SECS",
+            "BOATRAMP_HANDLERS_JWKS_PREWARM",
+        ] {
+            assert!(
+                JWKS_ENV_VARS.contains(&var),
+                "{var} missing from JWKS_ENV_VARS — a JWKS freshness knob lost its env lever"
             );
         }
     }

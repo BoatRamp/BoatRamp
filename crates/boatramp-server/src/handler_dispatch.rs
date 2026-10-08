@@ -284,6 +284,9 @@ pub(super) async fn dispatch_handler(
                     // so skip the resolution (and its schema load) for it.
                     let runs_server_graphql =
                         gql.federated || gql.data.as_ref().is_some_and(|d| d.enabled);
+                    // Time the auth phase (token verify + any JWKS fetch) — the phase that carried the
+                    // ~1 s pre-TTL overhead; surfaced in the gateway phase log + `Server-Timing`.
+                    let auth_start = std::time::Instant::now();
                     let (caller_own, caller_pass) = if runs_server_graphql {
                         match resolve_gateway_caller_facts(
                             inner,
@@ -301,6 +304,7 @@ pub(super) async fn dispatch_handler(
                     } else {
                         (Vec::new(), false)
                     };
+                    let auth_us = auth_start.elapsed().as_micros() as u64;
                     // Federation gateway: plan the query against the project's registered
                     // subgraphs and execute it by dispatching fetches to the subgraph
                     // functions, instead of running a single handler component.
@@ -321,6 +325,7 @@ pub(super) async fn dispatch_handler(
                             // immediately (no recomposition lag) and never widens.
                             &gql.edge_hidden_operations,
                             &gql.edge_hidden_subgraphs,
+                            auth_us,
                         )
                         .await;
                     }
@@ -734,10 +739,14 @@ async fn federation_gateway(
     // entries ignored+warned) so a change takes effect immediately with no recomposition lag.
     edge_hidden_operations: &[String],
     edge_hidden_subgraphs: &[String],
+    // Micros spent in the auth phase (token verify + any JWKS fetch) at the call site — folded into
+    // the per-phase timing (structured log + `Server-Timing`) so the JWKS cost is visible.
+    auth_us: u64,
 ) -> Response {
     // Compose + plan, memoized per project by composition version (and the operation hash for
     // the plan) — the same `graphql_cache` the in-process `graphql::run` path uses, so neither
     // path re-lists/re-parses/re-plans a graph that only changes on deploy.
+    let t_compose = std::time::Instant::now();
     let cached = match inner
         .graphql_cache
         .supergraph(inner.kv.as_ref(), project)
@@ -752,6 +761,8 @@ async fn federation_gateway(
                 .into_response();
         }
     };
+    // Warm: a cache hit (version match) — just the version `kv.get`, not a recompose.
+    let compose_us = t_compose.elapsed().as_micros() as u64;
     let op_hash = crate::graphql_apq::sha256_hex(query);
     // #495: the EFFECTIVE hidden set for the external edge =
     //   supergraph.edge_hidden_roots  ∪  resolve(edge_hidden_operations)  ∪  roots_owned_by(edge_hidden_subgraphs).
@@ -764,6 +775,7 @@ async fn federation_gateway(
         edge_hidden_subgraphs,
     );
     log_hidden_root_decisions(query, &effective_hidden, &op_hash);
+    let t_plan = std::time::Instant::now();
     let plan = match inner.graphql_cache.plan(
         project,
         cached.version,
@@ -779,6 +791,8 @@ async fn federation_gateway(
             );
         }
     };
+    // Warm: a per-(op,version,visibility) plan-cache hit — pure-CPU on a miss, no I/O either way.
+    let plan_us = t_plan.elapsed().as_micros() as u64;
     let Some(invoker) = inner.invoker.get() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -850,7 +864,40 @@ async fn federation_gateway(
             }));
         }
     }
-    axum::Json(crate::graphql_gateway::execute(&plan, &runner, variables).await).into_response()
+    let t_fanout = std::time::Instant::now();
+    let result = crate::graphql_gateway::execute(&plan, &runner, variables).await;
+    let fanout_us = t_fanout.elapsed().as_micros() as u64;
+    let total_us = auth_us + compose_us + plan_us + fanout_us;
+    // One structured line per federated request: where the gateway's time actually went (auth incl.
+    // any JWKS fetch / compose / plan / subgraph fan-out), so a regression is attributable from the
+    // log alone (this is how the ~1 s JWKS overhead was localized).
+    tracing::info!(
+        target: "boatramp::gateway",
+        op_hash = %op_hash,
+        auth_us,
+        compose_us,
+        plan_us,
+        fanout_us,
+        total_us,
+        "graphql federated request phase timing"
+    );
+    let mut response = axum::Json(result).into_response();
+    // Server-Timing (per the spec, durations in ms) so the same breakdown is visible to the client /
+    // an external probe without reading the node's logs.
+    let server_timing = format!(
+        "auth;dur={:.1}, compose;dur={:.1}, plan;dur={:.1}, fanout;dur={:.1}",
+        auth_us as f64 / 1000.0,
+        compose_us as f64 / 1000.0,
+        plan_us as f64 / 1000.0,
+        fanout_us as f64 / 1000.0,
+    );
+    if let Ok(value) = axum::http::HeaderValue::from_str(&server_timing) {
+        response.headers_mut().insert(
+            axum::http::header::HeaderName::from_static("server-timing"),
+            value,
+        );
+    }
+    response
 }
 
 /// Build the external edge's effective edge-hidden root set (#495) from the three sources, as a

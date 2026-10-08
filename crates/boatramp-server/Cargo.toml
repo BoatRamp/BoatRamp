@@ -130,6 +130,13 @@ shared-mode-gate-mutation = ["boatramp-core/shared-mode-gate-mutation"]
 # (fetch a private/loopback addr) — each turning the issuer-trust gate RED. Needs `oidc` (the verify
 # path). Compiled OUT of every real build (the seams also live under this crate's own `cfg(test)`).
 issuer-trust-gate-mutation = ["oidc"]
+# TEST-ONLY anti-hollow lane for the federated-gateway JWKS perf fix (boatramp-federated-gateway-
+# overhead): `BOATRAMP_JWKS_MUTATION=disable_cache` makes `graphql_data/token.rs::resolve_url_verifier`
+# bypass the cache + single-flight (every request fetches the JWKS), so the FEDERATION-20 perf gate —
+# asserting a 20-subgraph + JWKS mass-call collapses to O(1) fetches with no per-request spike — goes
+# RED. Needs `handlers`+`oidc` (the gate composes subgraphs + verifies tokens). Compiled OUT of every
+# real build (the seam also lives under this crate's own `cfg(test)`).
+jwks-gate-mutation = ["handlers", "oidc"]
 # TEST-ONLY anti-hollow lane for the consumer/cron blob-scope fix (boatramp-consumer-blob-scope-bug):
 # `BOATRAMP_CONSUMERSCOPE_MUTATION=bare_scope` makes `scheduler.rs::consumer_dispatch_scope` drop the
 # project qualification (the pre-fix bug), so the gate — asserting a consumer's scope equals the
