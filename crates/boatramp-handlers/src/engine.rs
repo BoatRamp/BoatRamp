@@ -3,6 +3,7 @@
 
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
+use std::path::Path;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -67,22 +68,140 @@ pub struct SessionBatch {
 /// survives a restart and the first request after a cold start skips
 /// recompilation. The cache is best-effort: a missing config file or an
 /// unwritable cache dir degrades to no caching rather than failing.
-fn base_config() -> Result<Config, HandlerError> {
+fn base_config(cache_dir: Option<&Path>) -> Result<Config, HandlerError> {
     let mut config = Config::new();
     config.wasm_component_model(true);
     config.async_support(true);
     config.epoch_interruption(true);
     config.consume_fuel(true);
-    // Enable the on-disk compilation cache at wasmtime's default location.
-    // `cache_config_load_default` treats a missing config file as "use the
-    // default enabled cache", and cache writes are themselves best-effort.
-    config.cache_config_load_default()?;
+    configure_compile_cache(&mut config, cache_dir);
     Ok(config)
 }
 
-/// Build the shared engine with the default **on-demand** instance allocator.
-pub fn build_engine() -> Result<Engine, HandlerError> {
-    Ok(Engine::new(&base_config()?)?)
+/// Enable wasmtime's on-disk compile cache so a component's compiled artifact survives a restart —
+/// the first request after a cold start **deserializes in ms** instead of paying a multi-second
+/// cranelift compile. Best-effort throughout: any failure logs a warning and degrades to no caching
+/// rather than failing engine construction.
+///
+/// When `cache_dir` is `Some`, the cache is pinned to `<cache_dir>/wasmtime-cache` on the operator's
+/// **persistent data volume**. This matters because wasmtime's default location
+/// (`cache_config_load_default`) resolves to `~/.cache/wasmtime` — the *ephemeral container rootfs* on
+/// a distroless node — so it is WIPED on every restart/roll, and the first visitor after each deploy
+/// then eats the full compile (and, on a small node, a concurrent burst stampedes behind it). `None`
+/// (tests, or a caller without a data dir) falls back to that ephemeral default, still best-effort.
+fn configure_compile_cache(config: &mut Config, cache_dir: Option<&Path>) {
+    // `#[cfg(test)]` severance seam: when forced, ignore the data dir and take the `None` (default,
+    // ephemeral) branch even though a dir was threaded — so the durability gate can prove its
+    // "cache files land under the data volume" assertion actually depends on this pinning (the
+    // mutation makes it land at the default location instead → the gate's data-dir check goes empty).
+    #[cfg(test)]
+    let cache_dir = if compile_cache_mutation_forces_default() {
+        None
+    } else {
+        cache_dir
+    };
+    match cache_dir {
+        Some(dir) => {
+            if let Err(e) = enable_persistent_compile_cache(config, dir) {
+                tracing::warn!(
+                    target: "boatramp::handler",
+                    data_dir = %dir.display(),
+                    error = %e,
+                    "wasm compile cache could not be pinned to the data volume; serving continues \
+                     WITHOUT a persisted cache (components recompile on the first request after each restart)"
+                );
+            }
+        }
+        None => {
+            // `cache_config_load_default()` itself returns an error when it cannot resolve a default
+            // directory (e.g. no `$HOME` on a container) — swallow that rather than failing engine
+            // construction, honoring the best-effort contract (the prior code's `?` could hard-fail boot).
+            if let Err(e) = config.cache_config_load_default() {
+                tracing::debug!(
+                    target: "boatramp::handler",
+                    error = %e,
+                    "wasm compile cache not enabled (no default cache dir resolvable); serving continues uncached"
+                );
+            }
+        }
+    }
+}
+
+/// Pin the compile cache to `<data_dir>/wasmtime-cache` by generating a wasmtime cache-config TOML at
+/// `<data_dir>/wasmtime-cache.toml` and loading it. wasmtime 30's only programmatic cache knob is
+/// `cache_config_load(path)` (a TOML file); there is no in-memory `Cache` type until a later release.
+/// Returns an error (for the caller to log + degrade) if the dir can't be created or the config can't
+/// be written/loaded.
+fn enable_persistent_compile_cache(
+    config: &mut Config,
+    data_dir: &Path,
+) -> Result<(), HandlerError> {
+    let cache_root = data_dir.join("wasmtime-cache");
+    std::fs::create_dir_all(&cache_root)
+        .map_err(|e| HandlerError::Internal(format!("create {}: {e}", cache_root.display())))?;
+    // Security (defense-in-depth): the cache holds EXECUTABLE native artifacts — a wasmtime cache hit
+    // loads compiled host code — so a group/other-writable `/data` must not let another local principal
+    // plant a forged artifact (it is not content-MAC'd). Restrict to owner-only, best-effort.
+    restrict_perms(&cache_root, 0o700);
+    // TOML-basic-string escape the directory (backslash + quote) so a Windows-style or quote-bearing
+    // data dir can never produce invalid TOML.
+    let escaped = cache_root
+        .to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
+    let toml = format!("[cache]\nenabled = true\ndirectory = \"{escaped}\"\n");
+    let toml_path = data_dir.join("wasmtime-cache.toml");
+    std::fs::write(&toml_path, toml)
+        .map_err(|e| HandlerError::Internal(format!("write {}: {e}", toml_path.display())))?;
+    restrict_perms(&toml_path, 0o600);
+    config
+        .cache_config_load(&toml_path)
+        .map_err(|e| HandlerError::Internal(format!("load {}: {e}", toml_path.display())))?;
+    tracing::info!(
+        target: "boatramp::handler",
+        cache_dir = %cache_root.display(),
+        "wasm compile cache pinned to the persistent data volume (survives restarts)"
+    );
+    Ok(())
+}
+
+/// Best-effort restrict a path to owner-only (`0o700` for the cache dir, `0o600` for its config) on
+/// unix. The compile cache holds executable native artifacts, so a loosely-permissioned `/data` must
+/// not let another local principal plant one. Best-effort: a failure (unsupported FS, race) is ignored
+/// — the worst case is the inherited umask, exactly as before this pinning existed. No-op off unix.
+#[cfg(unix)]
+fn restrict_perms(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
+}
+#[cfg(not(unix))]
+fn restrict_perms(_path: &Path, _mode: u32) {}
+
+/// Build the shared engine with the default **on-demand** instance allocator. `cache_dir` pins the
+/// persisted compile cache to the data volume (see [`configure_compile_cache`]); `None` uses the
+/// ephemeral default.
+pub fn build_engine(cache_dir: Option<&Path>) -> Result<Engine, HandlerError> {
+    Ok(Engine::new(&base_config(cache_dir)?)?)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// `#[cfg(test)]`-only severance seam for the compile-cache durability gate: when set, forces
+    /// [`configure_compile_cache`] to take the `None` (default, ephemeral) branch even though a data
+    /// dir was threaded. The gate's mutation arm flips this to prove that its "cache files land under
+    /// the data volume" assertion genuinely depends on the pinning — with the mutation, the files land
+    /// at the default location and the data-dir check goes empty. Compiled out of every shipped build.
+    static COMPILE_CACHE_FORCE_DEFAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn compile_cache_mutation_forces_default() -> bool {
+    COMPILE_CACHE_FORCE_DEFAULT.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+pub(crate) fn force_compile_cache_default(on: bool) {
+    COMPILE_CACHE_FORCE_DEFAULT.with(|c| c.set(on));
 }
 
 /// Build the engine with the **pooling** instance allocator (H8, opt-in): it
@@ -92,9 +211,12 @@ pub fn build_engine() -> Result<Engine, HandlerError> {
 /// cap, so a clamped invocation always fits. Pooling reserves a large block of
 /// virtual address space up front (≈ `memory_bytes × total_memories`), so it is
 /// a tuning choice an operator opts into and benchmarks for their workload.
-pub fn build_engine_pooling(limits: &Limits) -> Result<Engine, HandlerError> {
+pub fn build_engine_pooling(
+    limits: &Limits,
+    cache_dir: Option<&Path>,
+) -> Result<Engine, HandlerError> {
     use wasmtime::{InstanceAllocationStrategy, PoolingAllocationConfig};
-    let mut config = base_config()?;
+    let mut config = base_config(cache_dir)?;
     // Headroom over the concurrency cap: a single component instantiates several
     // core instances + memories (WASI + the capability worlds). `with_pooling_lanes` feeds the
     // SUMMED lane concurrency here (a `usize`), so SATURATE the u32 cast rather than silently
@@ -807,17 +929,40 @@ impl Drop for HandlerEngine {
 
 impl HandlerEngine {
     /// Build the engine with `limits`, caching up to `cache_size` compiled
-    /// components. Uses the default on-demand instance allocator.
+    /// components. Uses the default on-demand instance allocator. The persisted compile cache falls
+    /// back to wasmtime's ephemeral default location; a production node that wants the cache to
+    /// survive restarts uses [`new_with_cache_dir`](Self::new_with_cache_dir) instead.
     pub fn new(limits: Limits, cache_size: usize) -> Result<Self, HandlerError> {
-        Self::from_engine(build_engine()?, limits, cache_size)
+        Self::new_with_cache_dir(limits, cache_size, None)
+    }
+
+    /// Like [`new`](Self::new) but pins the persisted compile cache to `cache_dir` (the operator's
+    /// durable data volume) so a component's compiled artifact survives a restart — the first request
+    /// after a roll deserializes in ms instead of paying a cranelift compile. `None` ⇒ the ephemeral
+    /// default (identical to [`new`](Self::new)).
+    pub fn new_with_cache_dir(
+        limits: Limits,
+        cache_size: usize,
+        cache_dir: Option<&Path>,
+    ) -> Result<Self, HandlerError> {
+        Self::from_engine(build_engine(cache_dir)?, limits, cache_size)
     }
 
     /// Like [`new`](Self::new) but with the **pooling** instance allocator (H8,
     /// opt-in): instances come from a pre-reserved pool, so instantiation skips
     /// per-call allocation. The pool is sized against `limits`; reserves a large
-    /// block of virtual memory up front (see [`build_engine_pooling`]).
-    pub fn with_pooling(limits: Limits, cache_size: usize) -> Result<Self, HandlerError> {
-        Self::from_engine(build_engine_pooling(&limits)?, limits, cache_size)
+    /// block of virtual memory up front (see [`build_engine_pooling`]). `cache_dir` pins the
+    /// persisted compile cache to the data volume (`None` ⇒ ephemeral default).
+    pub fn with_pooling(
+        limits: Limits,
+        cache_size: usize,
+        cache_dir: Option<&Path>,
+    ) -> Result<Self, HandlerError> {
+        Self::from_engine(
+            build_engine_pooling(&limits, cache_dir)?,
+            limits,
+            cache_size,
+        )
     }
 
     /// Like [`with_pooling`](Self::with_pooling) but for the full three-lane model:
@@ -838,6 +983,7 @@ impl HandlerEngine {
         async_: Limits,
         streaming: Limits,
         cache_size: usize,
+        cache_dir: Option<&Path>,
     ) -> Result<Self, HandlerError> {
         // Per-slot memory is the LARGEST lane ceiling (any lane's instance must fit a slot). Slot
         // COUNT, however, must cover the lanes running at once: the three lane semaphores are
@@ -885,7 +1031,7 @@ impl HandlerEngine {
             max_concurrency: pool_concurrency,
             ..sync
         };
-        let engine = build_engine_pooling(&pool_limits).map_err(|e| {
+        let engine = build_engine_pooling(&pool_limits, cache_dir).map_err(|e| {
             HandlerError::Internal(format!(
                 "pooling allocator could not reserve ~{reservation_gib} GiB of virtual address \
                  space for the raised memory ceiling ({} MiB × {total_memories} slots): {e}. \
@@ -2033,7 +2179,91 @@ mod tests {
 
     #[test]
     fn engine_builds() {
-        build_engine().expect("engine builds");
+        build_engine(None).expect("engine builds");
+    }
+
+    /// Anti-hollow gate (image-serve-latency Ask A): the wasm compile cache MUST be pinned to the
+    /// operator's persistent data volume so a component's compiled artifact survives a restart — the
+    /// first request after a roll then deserializes (ms) instead of paying a cranelift compile (and,
+    /// on a small node, a concurrent burst stampeding behind that one compile → the measured 13–16 s
+    /// first reload). Proven by compiling a real component under a threaded data dir and asserting the
+    /// artifact lands THERE. The `#[cfg(test)]` severance seam then forces the ephemeral default even
+    /// though a data dir was threaded, and the SAME assertion goes empty — so a hollow "pinning" that
+    /// didn't actually pin (or a reversion to `cache_config_load_default`) fails the gate.
+    #[test]
+    fn compile_cache_durable_gate() {
+        const HTTP_200: &[u8] = include_bytes!("../tests/fixtures/http-200.wasm");
+
+        let unique = |tag: &str| {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            std::env::temp_dir().join(format!(
+                "boatramp-cachegate-{}-{nanos}-{tag}",
+                std::process::id()
+            ))
+        };
+        let wait_nonempty = |dir: &Path| -> bool {
+            for _ in 0..50 {
+                if std::fs::read_dir(dir)
+                    .map(|mut e| e.next().is_some())
+                    .unwrap_or(false)
+                {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            false
+        };
+        let is_empty = |dir: &Path| -> bool {
+            std::fs::read_dir(dir)
+                .map(|mut e| e.next().is_none())
+                .unwrap_or(true)
+        };
+
+        // --- Real path: the cache is pinned to the data volume ---
+        let data_dir = unique("real");
+        std::fs::create_dir_all(&data_dir).expect("mk data dir");
+        let cache_root = data_dir.join("wasmtime-cache");
+        force_compile_cache_default(false);
+        {
+            let engine = build_engine(Some(&data_dir)).expect("engine with pinned cache");
+            Component::new(&engine, HTTP_200).expect("component compiles");
+        }
+        // The cache worker may flush just after `Component::new` returns, so poll.
+        let durable = wait_nonempty(&cache_root);
+
+        // --- Mutation: force the ephemeral default even though a data dir was threaded ---
+        let data_dir2 = unique("mutated");
+        std::fs::create_dir_all(&data_dir2).expect("mk data dir 2");
+        let cache_root2 = data_dir2.join("wasmtime-cache");
+        force_compile_cache_default(true);
+        {
+            let engine = build_engine(Some(&data_dir2)).expect("engine (mutated)");
+            Component::new(&engine, HTTP_200).expect("component compiles (mutated)");
+        }
+        force_compile_cache_default(false);
+        // Give an async cache worker the same grace, then assert the data volume stayed empty (the
+        // mutated compile went to the default location, never `<data_dir2>/wasmtime-cache`).
+        std::thread::sleep(Duration::from_millis(500));
+        let mutated_empty = !cache_root2.exists() || is_empty(&cache_root2);
+
+        // Best-effort cleanup before asserting, so a failure never leaks temp dirs.
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let _ = std::fs::remove_dir_all(&data_dir2);
+
+        assert!(
+            durable,
+            "compile cache must be populated under the data volume ({})",
+            cache_root.display()
+        );
+        assert!(
+            mutated_empty,
+            "MUTATION must defeat durability: nothing should land under the data volume, but {} is populated",
+            cache_root2.display()
+        );
+        println!("COMPILE-CACHE DURABLE OK");
     }
 
     #[test]

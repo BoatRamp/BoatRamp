@@ -570,7 +570,7 @@ async fn streaming_ceiling_defaults_to_the_sync_ceiling_until_opted_in() {
 async fn pooling_allocator_serves_real_components() {
     // The pooling allocator must be sized so a real wasi:http + wasi:keyvalue
     // component instantiates and serves (under-sizing fails instantiation).
-    let engine = HandlerEngine::with_pooling(Limits::default(), 16).expect("pooling engine");
+    let engine = HandlerEngine::with_pooling(Limits::default(), 16, None).expect("pooling engine");
     let response = engine
         .serve("http-200", HTTP_200, request(), no_caps())
         .await

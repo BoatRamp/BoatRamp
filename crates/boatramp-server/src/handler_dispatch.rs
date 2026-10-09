@@ -464,6 +464,8 @@ pub(super) async fn dispatch_handler(
     // a `TimingStorage` writing into it, and we snapshot it after `serve_lane` to fold the blob GET/HEAD
     // µs into the phase log (otherwise hidden inside `serve_us`).
     let blob_timing = std::sync::Arc::new(boatramp_storage::BlobOpTiming::default());
+    // Ask B-1: split the opaque `bindings_us` into resolve vs binding-build vs messaging-build.
+    let bindings_timing = std::sync::Arc::new(BindingsTiming::default());
     let t_bindings = std::time::Instant::now();
     let bindings = match build_bindings(
         inner,
@@ -500,6 +502,8 @@ pub(super) async fn dispatch_handler(
         false,
         // Ask-1: time this request's blob reads (get / head / get_range) for the phase log.
         Some(blob_timing.clone()),
+        // Ask B-1: record the resolve / messaging-build sub-phase µs for the phase log.
+        Some(bindings_timing.clone()),
     )
     .await
     {
@@ -640,18 +644,28 @@ pub(super) async fn dispatch_handler(
     // All-zero on a route with no blobstore binding. Separating `head_us` from `get_us`/`range_us` is
     // the Ask-3 signal (the per-serve marker check vs the object read); `blob_ops` counts the read ops.
     let (blob_get_us, blob_head_us, blob_range_us, blob_ops) = blob_timing.snapshot();
+    // Ask B-1: split the opaque `bindings_us` so a ~multi-second bindings phase can be localized.
+    // `resolve_us` = auth (token verify) + in-site tenancy-resolve + the per-table tenancy-schema KV
+    // load; `binding_build_us` = the remainder (every `.with_*` construction, incl. messaging); and
+    // `messaging_build_us` (⊆ binding_build) isolates the one binding that does per-request async work
+    // (`mint_producer_context`). Together they answer "is the cost auth/tenancy, or a binding build?".
+    let (resolve_us, messaging_build_us) = bindings_timing.snapshot();
+    let binding_build_us = bindings_us.saturating_sub(resolve_us);
     // One structured line per plain handler request: where the host-side time went — session / component
-    // blob (cold only) / bindings (auth + tenancy + binding build) / instantiate / serve-to-head / body
-    // assembly, plus the blob read ops — so a per-request cost is attributable from the log alone (the
-    // Ask-1 observability). `total_us` is the true plain-path wall-clock; a gap vs the phase sum is the
-    // un-instrumented warm-check / edge-cache lookup / header extraction between phases. (The blob GET
-    // also counts inside `serve_us`: the guest buffers it before producing the head.)
+    // blob (cold only) / bindings (auth + tenancy + binding build, now sub-split) / instantiate /
+    // serve-to-head / body assembly, plus the blob read ops — so a per-request cost is attributable from
+    // the log alone (the Ask-1 observability). `total_us` is the true plain-path wall-clock; a gap vs the
+    // phase sum is the un-instrumented warm-check / edge-cache lookup / header extraction between phases.
+    // (The blob GET also counts inside `serve_us`: the guest buffers it before producing the head.)
     tracing::info!(
         target: "boatramp::handler",
         route = %handler.route,
         session_us,
         component_us,
         bindings_us,
+        resolve_us,
+        binding_build_us,
+        messaging_build_us,
         cold,
         instantiate_us,
         serve_us,
@@ -666,10 +680,12 @@ pub(super) async fn dispatch_handler(
     // Server-Timing (durations in ms, per spec) so the same breakdown is visible to the client / an
     // external probe without the node's logs (mirrors the federated gateway path).
     let server_timing = format!(
-        "session;dur={:.1}, component;dur={:.1}, bindings;dur={:.1}, instantiate;dur={:.1}, serve;dur={:.1}, body;dur={:.1}, blob;dur={:.1}",
+        "session;dur={:.1}, component;dur={:.1}, bindings;dur={:.1}, resolve;dur={:.1}, bindingbuild;dur={:.1}, instantiate;dur={:.1}, serve;dur={:.1}, body;dur={:.1}, blob;dur={:.1}",
         session_us as f64 / 1000.0,
         component_us as f64 / 1000.0,
         bindings_us as f64 / 1000.0,
+        resolve_us as f64 / 1000.0,
+        binding_build_us as f64 / 1000.0,
         instantiate_us as f64 / 1000.0,
         serve_us as f64 / 1000.0,
         body_us as f64 / 1000.0,
@@ -1786,6 +1802,39 @@ pub(super) async fn open_bindings_sql(
     }
 }
 
+/// Ask B-1 observability (image-serve-latency): per-sub-phase µs inside [`build_bindings`], so the
+/// otherwise-opaque `bindings_us` phase can be localized. `resolve_us` is auth (token verify) +
+/// in-site tenancy-resolve + the per-table tenancy-schema KV load (the big suspect — it makes the
+/// managed-DB / KV round-trips construens flagged); `messaging_build_us` is the `wasi:messaging`
+/// producer-binding construction, which mints a per-publish signed-context (`mint_producer_context`),
+/// the one post-resolution binding that does real per-request async work. The dispatch path derives
+/// `binding_build_us = bindings_us − resolve_us` (every non-resolve binding build, messaging
+/// included). `None` on the consumer/cron/test paths ⇒ no sub-timing recorded.
+#[derive(Default)]
+pub(super) struct BindingsTiming {
+    resolve_us: std::sync::atomic::AtomicU64,
+    messaging_build_us: std::sync::atomic::AtomicU64,
+}
+
+impl BindingsTiming {
+    fn set_resolve(&self, us: u64) {
+        self.resolve_us
+            .store(us, std::sync::atomic::Ordering::Relaxed);
+    }
+    fn set_messaging_build(&self, us: u64) {
+        self.messaging_build_us
+            .store(us, std::sync::atomic::Ordering::Relaxed);
+    }
+    /// `(resolve_us, messaging_build_us)` as recorded during the build.
+    pub(super) fn snapshot(&self) -> (u64, u64) {
+        (
+            self.resolve_us.load(std::sync::atomic::Ordering::Relaxed),
+            self.messaging_build_us
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+}
+
 #[allow(clippy::too_many_arguments)] // host-trusted inputs threaded from dispatch; a params struct would only obscure the plumbing
 pub(super) async fn build_bindings(
     inner: &HandlerRuntimeInner,
@@ -1858,6 +1907,10 @@ pub(super) async fn build_bindings(
     // the `boatramp::handler` phase log. Behavior-frozen (times only; no path/prefix/marker change).
     // `None` on every non-request lane (consumer/cron/test) ⇒ bare storage, identical to before.
     blob_timing: Option<std::sync::Arc<boatramp_storage::BlobOpTiming>>,
+    // Ask B-1 observability: when `Some`, the per-sub-phase µs (resolve vs messaging-binding build)
+    // are recorded here so the dispatch path can split the opaque `bindings_us`. `None` on every
+    // non-request lane ⇒ no sub-timing (identical behavior).
+    bindings_timing: Option<std::sync::Arc<BindingsTiming>>,
 ) -> Result<boatramp_handlers::Bindings, BindingsError> {
     let granted = |name: &str| {
         imports.iter().any(|i| i == name) && site_handlers.allow_imports.iter().any(|a| a == name)
@@ -1904,6 +1957,8 @@ pub(super) async fn build_bindings(
     // A sql/orm importer that declares no tenancy is refused under the strict posture (Dimension
     // 0); an `all` grant is capped to `own` unless the posture opens cross-tenant access. The
     // resolved value is carried into the `invoke` binding below so a sibling inherits it.
+    // Ask B-1: time the resolve block (auth + tenancy-resolve + per-table schema KV load) on its own.
+    let t_resolve = std::time::Instant::now();
     let (handler_caller_tenant, handler_caller_kind, handler_caller_pass) = {
         let imports_db = !granted_sql_databases(imports, &site_handlers.allow_imports).is_empty();
         // Security HIGH-1: `wasi:blobstore` carries per-tenant blob assets ⇒ it is a tenant-scoped
@@ -2162,6 +2217,9 @@ pub(super) async fn build_bindings(
             pass_unresolved,
         )
     };
+    if let Some(t) = &bindings_timing {
+        t.set_resolve(t_resolve.elapsed().as_micros() as u64);
+    }
     // `wasi:blobstore` (REORDERED to here, post tenant-resolution): the host-side tenant confinement
     // (`blobstore.rs::container_prefix`) needs THIS invocation's resolved OWN tenant to expand a
     // `{tenant}` allowlist entry, and the multi-tenant fact to apply the deny-default. `multi_tenant`
@@ -2234,6 +2292,10 @@ pub(super) async fn build_bindings(
     if let Some(principal) = sealed_principal.clone() {
         bindings = bindings.with_sealed_principal(principal);
     }
+    // Ask B-1: time the `wasi:messaging` producer-binding build specifically — it is the one
+    // post-resolution binding that does real per-request async work (`mint_producer_context` below),
+    // so construens can see whether it contributes to the opaque `bindings_us` on a messaging route.
+    let t_messaging_build = std::time::Instant::now();
     if granted("wasi:messaging") {
         // Plain topics are namespaced under the binding `scope` (the site, or the
         // preview scope), so a guest publishes only into its own namespace and
@@ -2256,6 +2318,9 @@ pub(super) async fn build_bindings(
                 signed_context,
             );
         }
+    }
+    if let Some(t) = &bindings_timing {
+        t.set_messaging_build(t_messaging_build.elapsed().as_micros() as u64);
     }
     // The read-only `messaging-stats` capability: surface the already-computed per-topic bus gauges
     // (dead-letter/backlog/in-flight + per-group depth) to a granted guest. A plain topic resolves
@@ -2992,6 +3057,8 @@ impl ConsumerRebuild<'_> {
             // cron flag — so it is never a `run_as_system` fire itself.
             false,
             // Ask-1 blob timing is request-lane only; the async consumer lane passes None (bare storage).
+            None,
+            // Ask B-1 bindings sub-timing is request-lane only; the consumer lane passes None.
             None,
         )
         .await
