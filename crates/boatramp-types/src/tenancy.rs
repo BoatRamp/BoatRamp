@@ -721,10 +721,27 @@ pub enum TableScope {
     /// Scope on the schema's [`default_tenant_key`](TenancySchema::default_tenant_key) = the resolved
     /// tenant (the common case).
     Tenant,
-    /// The identity table (`tenant`/`org`/`account`), keyed by its own PK: scope on `key` = the
-    /// resolved tenant instead of the default column (R2). `key` MUST be unique — a non-unique key
-    /// would match other tenants' rows — validated at schema load.
+    /// The IDENTITY table (`tenant`/`org`/`account`), keyed by its own PK: scope on `key` = the
+    /// resolved tenant instead of the default column (R2). `key` is the caller's contract to be
+    /// **unique** — one row per owner — because a confine to `key = <own>` on a non-unique column
+    /// would return another owner's rows too; the host does NOT introspect or validate uniqueness, so
+    /// declaring `TenantKeyed` on a non-unique column is an operator error. For the legitimate
+    /// MANY-rows-per-owner (collection) case use [`TableScope::Owned`], which is uniqueness-free.
     TenantKeyed { key: String },
+    /// Scope a table by a non-unique OWNERSHIP column equal to the resolved own value — the per-row
+    /// analog of [`TableScope::Tenant`] on an operator-named column instead of `default_tenant_key`.
+    /// For MANY-rows-per-owner collections (a designer's portfolio, chats): `column` is NON-UNIQUE by
+    /// design and no uniqueness is asserted or required. Non-uniqueness is safe here because the column
+    /// IS the owner — confining to `column = <own>` returns exactly the caller's own rows, never
+    /// another owner's. Read (own) → `column = <own>` (fail-closed `1 = 0` when the own value is
+    /// unresolved); write (own) host-stamps `column = <own>` and overwrites any forged value. Stays on
+    /// [`ScopeAxis::Tenant`] (the own axis — no new axis). Contrast [`TableScope::TenantKeyed`], the
+    /// identity (one-row-per-owner) variant.
+    ///
+    /// The route's own-axis source MUST resolve to the OWNER identity (e.g. the token `sub`), not a
+    /// tenant id — `column` is confined/stamped to that resolved value. A wrong resolution fails CLOSED
+    /// (`column = <wrong value>` matches no rows), never open.
+    Owned { column: String },
     /// Global reference/enum data (`countries`): reads are unscoped (reachable even by a
     /// principal-less request — fail-closed is per table-scope, not per invocation); writes are
     /// deny-by-default (a shared-data write is a cross-tenant blast). Host-declared, never
@@ -780,6 +797,42 @@ pub enum TableScope {
     /// `tenant = <resolved>` boundary — only the NULL rows are shared — so a tenant can never read
     /// another tenant's owned rows.
     TenantOrBase,
+}
+
+// Defense-in-depth: the `owned`-scope anti-hollow seam is for `cargo test` only. Fail the build loudly
+// if the gate feature is ever enabled in a non-test RELEASE profile (scoped to THIS seam).
+#[cfg(all(feature = "owned-gate-mutation", not(test), not(debug_assertions)))]
+compile_error!(
+    "owned-gate-mutation is a test-only anti-hollow seam and must never be compiled into a release \
+     build — remove it from the feature set"
+);
+
+/// The active [`TableScope::Owned`] lowering mutation (anti-hollow gate), or `None`. Present ONLY under
+/// `cfg(test)` or the `owned-gate-mutation` feature; a shipped build has neither, so [`owned_scope`]
+/// lowers unconditionally to its operator column and this is a dead `None`. Not a backdoor — it only
+/// exposes a test env var.
+#[cfg(any(test, feature = "owned-gate-mutation"))]
+fn owned_mutation() -> Option<String> {
+    std::env::var("BOATRAMP_OWNED_MUTATION").ok()
+}
+#[cfg(not(any(test, feature = "owned-gate-mutation")))]
+#[inline]
+fn owned_mutation() -> Option<String> {
+    None
+}
+
+/// Lower a [`TableScope::Owned`] column to its [`ResolvedScope::Column`]. A shipped build always returns
+/// `Column(column)` — confine/stamp on the operator-named owner column. The anti-hollow seam
+/// ([`owned_mutation`]) can corrupt this in a TEST build so the isolation gate goes RED.
+fn owned_scope(default_tenant_key: &str, column: &str) -> ResolvedScope {
+    match owned_mutation().as_deref() {
+        // MUTATION (gate `wrong_column`): confine on the SHARED tenant column instead of the owner
+        // column → two owners under one tenant leak into each other, turning the gate RED.
+        Some("wrong_column") => ResolvedScope::Column(default_tenant_key.to_string()),
+        // MUTATION (gate `unscoped`): drop confinement entirely → total cross-owner leak, gate RED.
+        Some("unscoped") => ResolvedScope::Unscoped,
+        _ => ResolvedScope::Column(column.to_string()),
+    }
 }
 
 /// The effective, host-resolved scope for one table (from [`TenancySchema::resolve`]) — the input
@@ -967,6 +1020,9 @@ impl TenancySchema {
         match self.tables.get(table)? {
             TableScope::Tenant => Some(ResolvedScope::Column(self.default_tenant_key.clone())),
             TableScope::TenantKeyed { key } => Some(ResolvedScope::Column(key.clone())),
+            // The non-unique owner-column collection scope — lowers to the SAME `Column(column)`
+            // machinery as `TenantKeyed`, just without the uniqueness contract (see `owned_scope`).
+            TableScope::Owned { column } => Some(owned_scope(&self.default_tenant_key, column)),
             // #503: a write-global `unscoped { writable: true }` resolves to the DISTINCT
             // `SharedWritable` (read-identical to `Unscoped`, but a non-target write is allowed
             // unstamped); a plain `unscoped` stays read-only-reference (`Unscoped`).
@@ -996,6 +1052,8 @@ impl TenancySchema {
                 let resolved = match scope {
                     TableScope::Tenant => ResolvedScope::Column(self.default_tenant_key.clone()),
                     TableScope::TenantKeyed { key } => ResolvedScope::Column(key.clone()),
+                    // The load-bearing arm for the `owned` gate: the confiner reads THIS map.
+                    TableScope::Owned { column } => owned_scope(&self.default_tenant_key, column),
                     // #503: mirror `resolve` — write-global ⇒ `SharedWritable`, plain ⇒ `Unscoped`.
                     TableScope::Unscoped { writable: true } => ResolvedScope::SharedWritable,
                     TableScope::Unscoped { writable: false } => ResolvedScope::Unscoped,
@@ -1131,13 +1189,44 @@ mod tests {
         for ts in [
             TableScope::Tenant,
             TableScope::TenantKeyed { key: "id".into() },
+            TableScope::Owned {
+                column: "owner_user_id".into(),
+            },
             TableScope::Unscoped { writable: false },
             TableScope::Unscoped { writable: true },
             TableScope::TenantOrSession,
+            TableScope::TenantOrBase,
         ] {
             let j = serde_json::to_string(&ts).unwrap();
             assert_eq!(ts, serde_json::from_str::<TableScope>(&j).unwrap());
         }
+    }
+
+    #[test]
+    fn owned_scope_lowers_to_its_column_not_the_default_tenant_key() {
+        // `Owned` lowers to the OPERATOR column (like `TenantKeyed`), never `default_tenant_key` — a
+        // collection table scoped by a non-unique owner column. No uniqueness is asserted anywhere.
+        let s = TenancySchema {
+            default_tenant_key: "tenant_id".into(),
+            tables: BTreeMap::from([(
+                "docs".into(),
+                TableScope::Owned {
+                    column: "owner_user_id".into(),
+                },
+            )]),
+            ..Default::default()
+        };
+        let col = ResolvedScope::Column("owner_user_id".into());
+        assert_eq!(s.resolve("docs"), Some(col.clone()));
+        assert_eq!(s.table_key_map().get("docs"), Some(&col));
+        // `{"kind":"owned","column":"..."}` is the on-the-wire form (zero extra serde attributes).
+        assert_eq!(
+            serde_json::to_string(&TableScope::Owned {
+                column: "owner_user_id".into()
+            })
+            .unwrap(),
+            r#"{"kind":"owned","column":"owner_user_id"}"#
+        );
     }
 
     #[test]

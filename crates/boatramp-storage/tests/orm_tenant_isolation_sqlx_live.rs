@@ -388,12 +388,17 @@ async fn run_pertable_battery(backend: Arc<dyn SqlBackend>, dialect: Dialect, en
             "DROP TABLE IF EXISTS tenant",
             "DROP TABLE IF EXISTS countries",
             "DROP TABLE IF EXISTS member",
+            "DROP TABLE IF EXISTS docs",
             "CREATE TABLE orders (id VARCHAR(64) PRIMARY KEY, tenant_id VARCHAR(64), item VARCHAR(255))",
             "CREATE TABLE tenant (id VARCHAR(64) PRIMARY KEY, plan VARCHAR(64))",
             "CREATE TABLE countries (code VARCHAR(8) PRIMARY KEY, name VARCHAR(64))",
             // `member` keyed on `account_id` (NOT the default) with a shared `tenant_id='acme'` on
             // BOTH rows — the write-axis leak fixture (a tenant_id-keyed write would reach globex).
             "CREATE TABLE member (account_id VARCHAR(64) PRIMARY KEY, tenant_id VARCHAR(64), secret VARCHAR(255))",
+            // `docs` is a MANY-rows-per-owner collection (`TableScope::Owned`) keyed on the NON-UNIQUE
+            // `owner_user_id`; it ALSO carries `tenant_id` — both owners share `tenant_id='acme'`, so a
+            // confine on the wrong (tenant) column would fail to isolate; only the owner column does.
+            "CREATE TABLE docs (id VARCHAR(64) PRIMARY KEY, owner_user_id VARCHAR(64), tenant_id VARCHAR(64), title VARCHAR(255))",
         ] {
             tx.execute(ddl, &[]).await.unwrap();
         }
@@ -421,6 +426,14 @@ async fn run_pertable_battery(backend: Arc<dyn SqlBackend>, dialect: Dialect, en
         )
         .await
         .unwrap();
+        // Two owners A/B under the SAME `tenant_id='acme'`, each with TWO docs — duplicate
+        // `owner_user_id` values (the uniqueness-free property `TenantKeyed` forbids).
+        tx.execute(
+            "INSERT INTO docs (id, owner_user_id, tenant_id, title) VALUES ('d_a1','sub_a','acme','a1'),('d_a2','sub_a','acme','a2'),('d_b1','sub_b','acme','b1'),('d_b2','sub_b','acme','b2')",
+            &[],
+        )
+        .await
+        .unwrap();
         tx.commit().await.unwrap();
     }
 
@@ -440,6 +453,12 @@ async fn run_pertable_battery(backend: Arc<dyn SqlBackend>, dialect: Dialect, en
                 },
             ),
             ("countries".into(), TableScope::Unscoped { writable: false }),
+            (
+                "docs".into(),
+                TableScope::Owned {
+                    column: "owner_user_id".into(),
+                },
+            ),
         ]),
         ..Default::default()
     };
@@ -633,13 +652,107 @@ async fn run_pertable_battery(backend: Arc<dyn SqlBackend>, dialect: Dialect, en
         );
     }
 
+    // 7) `docs` (Owned on the NON-UNIQUE `owner_user_id`): two owners under the SAME tenant_id are
+    //    isolated on the OWNER column, with duplicate owner values (many rows per owner).
+    {
+        // READ: owner A sees EXACTLY its two docs (never B's) despite the shared tenant_id; the
+        // compiled predicate names `owner_user_id`, not `tenant_id`.
+        let mut s = Select {
+            columns: vec![item(Expr::col("title"))],
+            ..Select::from("docs")
+        };
+        s.force_scope(&scope_for("sub_a")).unwrap();
+        let (sql, params) = s.compile(dialect).unwrap();
+        assert!(
+            sql.contains("owner_user_id") && !sql.contains("tenant_id"),
+            "[{engine}] an owned table must confine on owner_user_id, not tenant_id: {sql}"
+        );
+        let mut tx = backend.begin().await.unwrap();
+        let mut got = run_query(tx.as_mut(), &sql, &params).await;
+        got.sort();
+        assert_eq!(
+            got,
+            vec!["a1".to_string(), "a2".to_string()],
+            "[{engine}] owner A sees exactly its own two docs (duplicate owner value, same tenant as B)"
+        );
+        tx.commit().await.unwrap();
+
+        // INSERT forge: a forged `owner_user_id='sub_b'` under owner A is host-stamped back to 'sub_a'.
+        let mut ins = Insert {
+            table: "docs".into(),
+            rows: vec![RowValues {
+                cells: vec![
+                    Assignment {
+                        column: "id".into(),
+                        value: Expr::val(t("d_a3")),
+                    },
+                    Assignment {
+                        column: "owner_user_id".into(),
+                        value: Expr::val(t("sub_b")), // forgery attempt
+                    },
+                    Assignment {
+                        column: "tenant_id".into(),
+                        value: Expr::val(t("acme")),
+                    },
+                    Assignment {
+                        column: "title".into(),
+                        value: Expr::val(t("a3")),
+                    },
+                ],
+            }],
+            conflict: None,
+            scope: None,
+            returning: vec![],
+            from_select: None,
+        };
+        ins.force_scope(Some(&scope_for("sub_a")), Some(&scope_for("sub_a")))
+            .unwrap();
+        let (sql, params) = ins.compile(dialect).unwrap();
+        let mut tx = backend.begin().await.unwrap();
+        tx.execute(&sql, &params).await.unwrap();
+        let owner = run_query(
+            tx.as_mut(),
+            "SELECT owner_user_id FROM docs WHERE id = 'd_a3'",
+            &[],
+        )
+        .await;
+        assert_eq!(
+            owner,
+            vec!["sub_a".to_string()],
+            "[{engine}] insert stamped owner A; forged owner_user_id=sub_b overwritten"
+        );
+        tx.commit().await.unwrap();
+
+        // DELETE: A deletes-all → only A's rows go (incl. the inserted d_a3); B's two rows survive the
+        // same-tenant cross-owner boundary.
+        let mut del = Delete {
+            table: "docs".into(),
+            filter: Predicate::And(Vec::new()),
+            scope: None,
+            returning: vec![],
+        };
+        del.force_scope(&scope_for("sub_a")).unwrap();
+        let (sql, params) = del.compile(dialect).unwrap();
+        let mut tx = backend.begin().await.unwrap();
+        tx.execute(&sql, &params).await.unwrap();
+        let mut survivors = run_query(tx.as_mut(), "SELECT id FROM docs", &[]).await;
+        survivors.sort();
+        assert_eq!(
+            survivors,
+            vec!["d_b1".to_string(), "d_b2".to_string()],
+            "[{engine}] A's DELETE-all left exactly B's two rows (same-tenant cross-owner survives)"
+        );
+        tx.commit().await.unwrap();
+    }
+
     println!(
         "ORM PER-TABLE-KEY TENANCY OK [{engine}]: Tenant table on default tenant_id; identity \
          TenantKeyed table on its own PK (uniform tenant_id scope rejected by the engine); \
          Unscoped reference table global for reads; per-ref join keys each on its own column; a \
          WRITE is bounded on the target's declared key (a cross-tenant DELETE affects 0 rows), \
          refuses an undeclared target, and refuses a write to an Unscoped table; an undeclared table \
-         refused deny-by-default"
+         refused deny-by-default; an Owned collection isolates NON-UNIQUE owners on owner_user_id \
+         (same-tenant cross-owner read/delete confined, a forged owner stamp overwritten)"
     );
 }
 
