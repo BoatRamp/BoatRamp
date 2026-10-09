@@ -979,7 +979,7 @@ impl HandlerRuntime {
         self.inner
             .as_ref()
             .and_then(|i| i.data_dir.get())
-            .map(|p| p.as_path())
+            .map(std::path::PathBuf::as_path)
     }
 
     /// Wire the MF-3 GraphQL-registry stale-authz fence (multi-writer `shared` mode): the uncached
