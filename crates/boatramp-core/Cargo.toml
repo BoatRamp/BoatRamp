@@ -39,6 +39,11 @@ kv-conformance = []
 # enables this, which enables `boatramp-types/blob-drain-gate-mutation` — where the `Right::required`
 # `POST /api/blob-drain` arm carries the LOWER_AUTHZ seam. Compiled OUT of every real build.
 blob-drain-gate-mutation = ["boatramp-types/blob-drain-gate-mutation"]
+# TEST-ONLY, NEVER SHIPPED: pass-through of the `owned`-scope anti-hollow seam to `boatramp-types` for
+# the `OWNED-COLUMN ISOLATION OK` gate. A downstream test lane (`boatramp-storage`'s owner-isolation
+# gate) enables this → `boatramp-types/owned-gate-mutation`, where `owned_scope` carries the
+# `BOATRAMP_OWNED_MUTATION` seam. Compiled OUT of every real build.
+owned-gate-mutation = ["boatramp-types/owned-gate-mutation"]
 # TEST-ONLY, NEVER SHIPPED: arm the MF-1 crown-jewel CAS mutation seam
 # ([`crownjewel::cas_mutation_active`]) in a NON-test build, so a downstream test lane (e.g.
 # `boatramp-storage`'s live-Postgres crown-jewel gates) can set

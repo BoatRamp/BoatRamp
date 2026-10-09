@@ -5,6 +5,33 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.22.0] - 2026-10-09
+
+Adds a `TableScope::Owned { column }` tenancy variant for scoping MANY-rows-per-owner collections by a
+non-unique ownership column on the own axis (construens `boatramp-owned-column-scope`). Host/daemon-side
+only; no WIT/shim change.
+
+- **`Owned { column }`** scopes a table by `column = <resolved own value>` — the per-row analog of
+  `Tenant`, on an operator-named column instead of `default_tenant_key`, for collections (a designer's
+  portfolio, chats) where the owner column is non-unique by design. It is the sibling of `TenantKeyed`
+  (the one-row-per-owner identity variant) without the uniqueness contract. Config:
+  `{"kind":"owned","column":"owner_user_id"}` in the project tenancy `tables` map.
+- **Isolation is inherited, not reimplemented:** `Owned` lowers to the same `ResolvedScope::Column` as
+  `TenantKeyed`/`Tenant`, so reads confine to `column = <own>` (fail-closed `1 = 0` when unresolved),
+  writes host-stamp `column = <own>` and overwrite a forged value, and it is refused as an unscoped-write
+  target — all unchanged. Non-uniqueness is safe because plain `Tenant` already confines a non-unique
+  column (`tenant_id`); uniqueness was never load-bearing on the confine path. Stays on
+  `ScopeAxis::Tenant` (no new axis). The route's own-axis source must resolve to the owner id (e.g. a
+  token `sub`); a wrong resolution fails closed, never open.
+- **Mutation-verified isolation gate:** a real-engine test seeds two owners under the same `tenant_id`
+  but different `owner_user_id`, each with duplicate owner values, and asserts owner A never
+  reads/updates/deletes B's rows and a forged owner stamp is overwritten. Two mutations (compiled out of
+  shipped builds via `owned-gate-mutation`) turn it RED — `unscoped` (drop confinement) and
+  `wrong_column` (confine on the shared `tenant_id`). Gated on libsql in CI and mirrored across live
+  Postgres + MySQL. An independent security review confirmed no cross-owner leak on the non-unique column.
+- Corrected the `TenantKeyed` doc, which inaccurately claimed its key uniqueness was "validated at schema
+  load" — it is a caller contract for the identity case, not host-validated.
+
 ## [0.21.0] - 2026-10-08
 
 Removes the ~1 s of per-request overhead inside the **federated GraphQL gateway** (construens

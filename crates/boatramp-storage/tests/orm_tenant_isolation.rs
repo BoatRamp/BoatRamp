@@ -856,6 +856,242 @@ async fn orm_per_table_key_scope_isolates_on_a_real_engine() {
     );
 }
 
+/// GATE (`owned`-column owner isolation): a [`TableScope::Owned { column }`] scopes a
+/// MANY-rows-per-owner collection by a NON-UNIQUE owner column on the own axis
+/// ([`ScopeAxis::Tenant`]). Two owners under the SAME `tenant_id` but different `owner_user_id` are
+/// fully isolated — reads/writes confine to `owner_user_id`, never the shared `tenant_id` — and
+/// DUPLICATE owner values (many rows per owner) prove the uniqueness-free property. Asserted
+/// behaviorally against a real libsql: owner A reads/updates/deletes only its own rows; an INSERT is
+/// host-stamped to A and a forged `owner_user_id` is overwritten; B's rows are untouched throughout.
+/// Marker `OWNED-COLUMN ISOLATION OK [libsql]`. MUTATION-VERIFIED via the `owned-gate-mutation` seam:
+/// `BOATRAMP_OWNED_MUTATION=unscoped` (drop confinement → A sees ALL rows, a cross-owner LEAK) and
+/// `=wrong_column` (confine on the shared `tenant_id` instead of the owner column → the owner confine
+/// breaks) both turn the read-isolation assertion RED. Same `#[ignore]` + `test-orm-tenancy` CI gate
+/// rationale as the siblings above.
+#[tokio::test]
+#[ignore = "run via the test-orm-tenancy CI job on the host toolchain (static-musl test binary segfaults in libsql's bundled SQLite)"]
+async fn owned_column_scope_isolates_non_unique_owners_on_a_real_engine() {
+    use boatramp_core::tenancy::{TableScope, TenancySchema};
+    use std::collections::BTreeMap;
+
+    let dir = std::env::temp_dir().join(format!("boatramp-orm-owned-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let backends = LibsqlSqlBackends::local(&dir);
+    let db = backends.database("default", "designers", "").await.unwrap();
+
+    // `docs` is a MANY-rows-per-owner collection scoped by the NON-UNIQUE `owner_user_id` (a designer's
+    // token `sub`). It ALSO carries `tenant_id` — BOTH owners share `tenant_id='acme'`, so a confine on
+    // the WRONG (tenant) column would fail to isolate (the `wrong_column` mutation), and NO confinement
+    // leaks B's rows to A (the `unscoped` mutation); only the owner-column confine isolates.
+    let schema = TenancySchema {
+        default_tenant_key: "tenant_id".into(),
+        session_key: None,
+        tables: BTreeMap::from([(
+            "docs".into(),
+            TableScope::Owned {
+                column: "owner_user_id".into(),
+            },
+        )]),
+        ..Default::default()
+    };
+    let keys = TableKeys::PerTable(schema.table_key_map());
+    // The resolved OWN value is the designer's `sub` (a `ScopeAxis::Tenant` fact — same axis as
+    // `Tenant`/`TenantKeyed`, no new axis). `keys` (PerTable) redirects `docs` to `owner_user_id`.
+    let owner = |sub: &str| Scope {
+        column: "tenant_id".into(),
+        value: Some(t(sub)),
+        session: None,
+        mode: ScopeMode::Own,
+        keys: keys.clone(),
+        unscoped_writes: std::collections::BTreeSet::new(),
+        pass_unresolved: false,
+    };
+
+    // Seed: owners A (`sub_a`) and B (`sub_b`), SAME `tenant_id='acme'`, each with TWO docs — duplicate
+    // `owner_user_id` values (the uniqueness-free case `TenantKeyed` forbids).
+    {
+        let mut tx = db.begin().await.unwrap();
+        tx.execute(
+            "CREATE TABLE docs (id TEXT PRIMARY KEY, owner_user_id TEXT, tenant_id TEXT, title TEXT)",
+            &[],
+        )
+        .await
+        .unwrap();
+        tx.execute(
+            "INSERT INTO docs (id, owner_user_id, tenant_id, title) VALUES \
+             ('a1','sub_a','acme','a-one'),('a2','sub_a','acme','a-two'),\
+             ('b1','sub_b','acme','b-one'),('b2','sub_b','acme','b-two')",
+            &[],
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    // 1) READ: owner A sees EXACTLY its two docs (never B's) despite the shared tenant_id; the predicate
+    //    names `owner_user_id`, not `tenant_id`. (Under `unscoped` → all 4 rows = LEAK; under
+    //    `wrong_column` → `tenant_id = 'sub_a'` matches nothing = broken. Both fail this assertion.)
+    {
+        let mut s = Select {
+            columns: vec![item(Expr::col("title"))],
+            ..Select::from("docs")
+        };
+        s.force_scope(&owner("sub_a")).unwrap();
+        let (sql, params) = s.compile(Dialect::Sqlite).unwrap();
+        assert!(
+            sql.contains("owner_user_id = ?") && !sql.contains("tenant_id = ?"),
+            "an owned table must confine on `owner_user_id`, not `tenant_id`: {sql}"
+        );
+        let mut tx = db.begin().await.unwrap();
+        let mut got = run_query(tx.as_mut(), &sql, &params).await;
+        got.sort();
+        assert_eq!(
+            got,
+            vec!["a-one".to_string(), "a-two".to_string()],
+            "owner A sees exactly its OWN two docs (duplicate owner value, same tenant as B)"
+        );
+        tx.commit().await.unwrap();
+    }
+
+    // 2) INSERT: A's insert is host-stamped `owner_user_id='sub_a'`; a forged `owner_user_id='sub_b'` is
+    //    overwritten to A.
+    {
+        let mut ins = Insert {
+            table: "docs".into(),
+            rows: vec![RowValues {
+                cells: vec![
+                    Assignment {
+                        column: "id".into(),
+                        value: Expr::val(t("a3")),
+                    },
+                    Assignment {
+                        column: "owner_user_id".into(),
+                        value: Expr::val(t("sub_b")), // forgery attempt
+                    },
+                    Assignment {
+                        column: "tenant_id".into(),
+                        value: Expr::val(t("acme")),
+                    },
+                    Assignment {
+                        column: "title".into(),
+                        value: Expr::val(t("a-three")),
+                    },
+                ],
+            }],
+            conflict: None,
+            scope: None,
+            returning: vec![],
+            from_select: None,
+        };
+        ins.force_scope(Some(&owner("sub_a")), Some(&owner("sub_a")))
+            .unwrap();
+        let (sql, params) = ins.compile(Dialect::Sqlite).unwrap();
+        let mut tx = db.begin().await.unwrap();
+        tx.execute(&sql, &params).await.unwrap();
+        let o = tx
+            .query("SELECT owner_user_id FROM docs WHERE id = 'a3'", &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            o.rows[0][0],
+            t("sub_a"),
+            "insert stamped owner A; forged owner_user_id=sub_b ignored"
+        );
+        tx.commit().await.unwrap();
+    }
+
+    // 3) UPDATE: A updates-all and tries to reassign the owner → only A's rows change, owner stays A,
+    //    B's rows untouched (same tenant_id).
+    {
+        let mut upd = Update {
+            table: "docs".into(),
+            set: vec![
+                Assignment {
+                    column: "owner_user_id".into(),
+                    value: Expr::val(t("sub_b")), // reassignment attempt
+                },
+                Assignment {
+                    column: "title".into(),
+                    value: Expr::val(t("a-edited")),
+                },
+            ],
+            filter: Predicate::And(Vec::new()),
+            scope: None,
+            returning: vec![],
+        };
+        upd.force_scope(&owner("sub_a")).unwrap();
+        let (sql, params) = upd.compile(Dialect::Sqlite).unwrap();
+        let mut tx = db.begin().await.unwrap();
+        tx.execute(&sql, &params).await.unwrap();
+        let b = run_query(
+            tx.as_mut(),
+            "SELECT title FROM docs WHERE owner_user_id='sub_b' ORDER BY id",
+            &[],
+        )
+        .await;
+        assert_eq!(
+            b,
+            vec!["b-one".to_string(), "b-two".to_string()],
+            "B's rows untouched by A's update-all"
+        );
+        let a_owners = run_query(
+            tx.as_mut(),
+            "SELECT DISTINCT owner_user_id FROM docs WHERE title = 'a-edited'",
+            &[],
+        )
+        .await;
+        assert_eq!(
+            a_owners,
+            vec!["sub_a".to_string()],
+            "A's rows stay owned by A (owner not reassignable)"
+        );
+        tx.commit().await.unwrap();
+    }
+
+    // 4) DELETE: A deletes-all → only A's rows go; B's two rows survive (cross-owner, same tenant).
+    {
+        let mut del = Delete {
+            table: "docs".into(),
+            filter: Predicate::And(Vec::new()),
+            scope: None,
+            returning: vec![],
+        };
+        del.force_scope(&owner("sub_a")).unwrap();
+        let (sql, params) = del.compile(Dialect::Sqlite).unwrap();
+        let mut tx = db.begin().await.unwrap();
+        tx.execute(&sql, &params).await.unwrap();
+        let mut survivors = run_query(tx.as_mut(), "SELECT id FROM docs", &[]).await;
+        survivors.sort();
+        assert_eq!(
+            survivors,
+            vec!["b1".to_string(), "b2".to_string()],
+            "A's DELETE-all left exactly B's two rows (same-tenant cross-owner rows survive)"
+        );
+        tx.commit().await.unwrap();
+    }
+
+    // 5) Symmetric: owner B reads exactly its own rows.
+    {
+        let mut s = Select {
+            columns: vec![item(Expr::col("title"))],
+            ..Select::from("docs")
+        };
+        s.force_scope(&owner("sub_b")).unwrap();
+        let (sql, params) = s.compile(Dialect::Sqlite).unwrap();
+        let mut tx = db.begin().await.unwrap();
+        let mut got = run_query(tx.as_mut(), &sql, &params).await;
+        got.sort();
+        assert_eq!(
+            got,
+            vec!["b-one".to_string(), "b-two".to_string()],
+            "owner B sees exactly its own rows"
+        );
+        tx.commit().await.unwrap();
+    }
+
+    println!("OWNED-COLUMN ISOLATION OK [libsql]");
+}
+
 /// **Live** proof of the Stage 3 R3 **anonymous-first disjunct** (`TableScope::TenantOrSession`) on a
 /// real libsql engine: a table whose rows are owned EITHER by a resolved tenant (`tenant_id = T`) OR
 /// by an anonymous session (`session_id = S`, on `tenant_id IS NULL` rows). Proves, end to end, that

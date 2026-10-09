@@ -1103,8 +1103,8 @@ jobs:
           # / injective namespace).
           cargo test -p boatramp-storage \
             --features sql --test orm_tenant_isolation -- --ignored --nocapture 2>&1 | tee orm-tenancy.log
-          grep -qE 'test result: ok\. 9 passed' orm-tenancy.log \
-            || { echo "::error::ORM tenant isolation tests did not all pass (silent skip or failure? count drifted from 9?)" >&2; exit 1; }
+          grep -qE 'test result: ok\. 10 passed' orm-tenancy.log \
+            || { echo "::error::ORM tenant isolation tests did not all pass (silent skip or failure? count drifted from 10?)" >&2; exit 1; }
           grep -q 'ORM IN-SITE TENANT ISOLATION OK' orm-tenancy.log \
             || { echo "::error::ORM tenant isolation never reached its success marker (a cross-tenant breach or a skipped test)" >&2; exit 1; }
           grep -q 'ORM PER-TABLE-KEY TENANCY OK' orm-tenancy.log \
@@ -1123,6 +1123,8 @@ jobs:
             || { echo "::error::v0.12.x on_unresolved:pass gate never reached its marker (a null-principal scoped read leaked rows, a resolved host regressed, a write was allowed, or a skipped test)" >&2; exit 1; }
           grep -q 'CLAIM TRANSFORM DERIVED-KEY SAFE OK' orm-tenancy.log \
             || { echo "::error::v0.12.x claim-transform derived-key gate never reached its marker (an unscreened/fallback/non-injective derived tenant key, or a skipped test)" >&2; exit 1; }
+          grep -q 'OWNED-COLUMN ISOLATION OK \[libsql\]' orm-tenancy.log \
+            || { echo "::error::v0.22.0 owned-column owner-isolation gate never reached its marker (a non-unique owner-column scope that doesn't isolate owners, or a skipped test)" >&2; exit 1; }
           # v0.10.0 grouped-aggregate gate is MUTATION-VERIFIED: dropping the pre-aggregation force_scope
           # (BOATRAMP_ORMGROUPBY_MUTATION=skip_scope) leaks another tenant's rows into the grouped
           # aggregates, so the gate's equality-to-single-tenant baseline MUST fail. A pass-under-mutation
@@ -1169,6 +1171,24 @@ jobs:
               exit 1
             else
               echo "claim-transform mutation verified: $mut turns the derived-key gate RED → the screen is load-bearing."
+            fi
+          done
+          # v0.22.0 owned-column owner-isolation gate is MUTATION-VERIFIED: each BOATRAMP_OWNED_MUTATION
+          # corrupts the `TableScope::Owned` lowering (via the `owned-gate-mutation` feature, compiled OUT
+          # of shipped builds), which MUST turn the read-isolation assertion RED: `unscoped` drops
+          # confinement so owner A sees ALL rows (a cross-owner LEAK); `wrong_column` confines on the
+          # shared `tenant_id` instead of `owner_user_id` so the owner confine breaks. A pass-under-mutation
+          # (a hollow gate) fails the merge.
+          for mut in unscoped wrong_column; do
+            if BOATRAMP_OWNED_MUTATION="$mut" cargo test -p boatramp-storage \
+              --features "sql owned-gate-mutation" \
+              --test orm_tenant_isolation -- --ignored \
+              owned_column_scope_isolates_non_unique_owners_on_a_real_engine \
+              > "owned-mutation-$mut.log" 2>&1; then
+              echo "::error::owned-column isolation gate is HOLLOW — it passed under BOATRAMP_OWNED_MUTATION=$mut (a non-unique owner-column scope that doesn't actually isolate owners)" >&2
+              exit 1
+            else
+              echo "owned-column mutation verified: $mut turns the owner-isolation gate RED → the owner-column lowering is load-bearing."
             fi
           done
       - name: "v0.12.4 H2 SQLite KV cancellation-heal gate"

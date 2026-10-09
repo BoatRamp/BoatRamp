@@ -21,6 +21,12 @@ description = "Shared, wasm-clean wire types + routing/config logic for boatramp
 # load-bearing (the mutation must FAIL the gate). Plumbed from `boatramp-server`'s gate feature via
 # `boatramp-core`. Compiled OUT of every real build.
 blob-drain-gate-mutation = []
+# TEST-ONLY, NEVER SHIPPED: the anti-hollow seam for the `OWNED-COLUMN ISOLATION OK` gate. When ON AND
+# `BOATRAMP_OWNED_MUTATION` is set, `owned_scope` lowers a `TableScope::Owned` to the wrong column
+# (`wrong_column` → the shared `default_tenant_key`) or drops confinement (`unscoped`) — so the
+# owner-isolation gate goes RED, proving the owner-column lowering is load-bearing. A `compile_error!`
+# guard fails any release build that enables it. Compiled OUT of every real build.
+owned-gate-mutation = []
 
 [dependencies]
 serde.workspace = true

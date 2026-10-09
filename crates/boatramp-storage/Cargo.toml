@@ -121,6 +121,11 @@ claim-transform-gate-mutation = ["boatramp-core/claim-transform-gate-mutation"]
 # stamp + the target-route refusal are load-bearing. Pass-through to
 # `boatramp-core/basewrite-gate-mutation`. Compiled OUT of every real build.
 basewrite-gate-mutation = ["boatramp-core/basewrite-gate-mutation"]
+# The `owned`-column owner-isolation gate lane (`OWNED-COLUMN ISOLATION OK`). With this ON and
+# `BOATRAMP_OWNED_MUTATION=wrong_column|unscoped`, `TableScope::Owned` lowers to the shared tenant
+# column / unscoped, so the owner-isolation gate goes RED — proving the owner-column confine + stamp
+# are load-bearing. Pass-through to `boatramp-core/owned-gate-mutation`. Compiled OUT of every real build.
+owned-gate-mutation = ["boatramp-core/owned-gate-mutation"]
 # The blob-read fault-classifier gate lane. With this ON and
 # `BOATRAMP_BLOBFAULT_MUTATION=flatten_403`, `blob_fault::classify` collapses AccessDenied→NotFound
 # (the exact blob-read-404 incident), so the classifier-distinctness gate goes RED — proving the
