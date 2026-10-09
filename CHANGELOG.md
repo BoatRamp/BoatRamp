@@ -5,6 +5,31 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.23.0] - 2026-10-09
+
+Per-phase latency observability for plain handlers (construens `boatramp-image-serve-latency`, Ask 1 —
+the primary ask). Extends the v0.21.0 federated-gateway instrumentation to EVERY handler dispatch, so a
+plain `#[handler]` route's host-side cost is attributable instead of a single opaque `duration_ms`.
+Host/daemon-side only; no WIT/shim change.
+
+- **`boatramp::handler` phase-timing log + `Server-Timing` header** on every plain-handler dispatch,
+  covering `session` / `component` (cold component-blob read) / `bindings` (auth + tenancy-resolve +
+  binding build) / `instantiate` / `serve` (time-to-head) / `body`, in microseconds, plus `total_us`
+  (true wall-clock — a gap vs the phase sum points at un-instrumented work). Durations + the route
+  pattern only (no token/claim/path), so no new log cardinality or leak. The existing `duration_ms`
+  metric is byte-identical.
+- **Host blob-op timing via a transparent `TimingStorage` decorator:** the object `GET` and the
+  per-serve container-marker `HEAD` — which otherwise hide inside `serve_us` (the guest buffers the
+  blob before producing the head) — now surface as separate `blob_get_us` / `blob_head_us` /
+  `blob_range_us` counters. `TimingStorage` wraps the already-confined `Arc<dyn Storage>` per request
+  and delegates every method verbatim, timing only the three reads — no path/prefix/marker/confinement
+  change.
+
+This is the observability half of the image-serve-latency work: it makes the serialization *localizable*
+(S3-client connection layer vs the twice-per-request tenancy KV read vs the marker-HEAD doubling) rather
+than guessed. The serialization fix + a read-through blob cache (Asks 3 + 2) follow in a subsequent
+release, driven by what this instrumentation measures on the cold/uncached path.
+
 ## [0.22.0] - 2026-10-09
 
 Adds a `TableScope::Owned { column }` tenancy variant for scoping MANY-rows-per-owner collections by a

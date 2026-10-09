@@ -88,6 +88,8 @@ pub mod tenant_provision;
 #[cfg(feature = "cache")]
 pub mod cache;
 
+pub mod timing;
+
 #[cfg(feature = "fallback")]
 pub mod fallback;
 
@@ -145,6 +147,8 @@ pub use sql_sqlx::{ExternalSqlKind, ExternalSqlOptions};
 
 #[cfg(feature = "cache")]
 pub use cache::CachedStorage;
+
+pub use timing::{BlobOpTiming, TimingStorage};
 
 #[cfg(feature = "fallback")]
 pub use fallback::{FallbackStorage, FallbackWhen};

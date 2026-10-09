@@ -359,12 +359,19 @@ pub(super) async fn dispatch_handler(
     // mint — the host-signed session cookie. `session_cookie` feeds the `Session` scope-fact; a
     // freshly-minted `set_session_cookie` is added to the response (`Set-Cookie`) below. Resolved
     // **before** the edge cache so a session-scoped response is never shared-cached (see below).
+    // Per-phase handler timing (Ask-1 observability, symmetric to the `boatramp::gateway` phase log +
+    // `Server-Timing` the federated path got in v0.21.0): a plain `#[handler]` otherwise exposes only a
+    // single `duration_ms` (time-to-head), so a host-side cost is unattributable. `dispatch_start` is the
+    // plain-path wall-clock anchor (the cheap pre-session routing/scope setup is excluded).
+    let dispatch_start = std::time::Instant::now();
+    let t_session = std::time::Instant::now();
     let (session_cookie, set_session_cookie) = resolve_or_mint_session(
         request.headers(),
         inner,
         boatramp_core::project::ProjectRef::new(project),
     )
     .await;
+    let session_us = t_session.elapsed().as_micros() as u64;
     // The edge cache is keyed on the project/site + path, NOT the session id, so it MUST NOT serve
     // or store a response computed under a per-visitor `Session` fact — that would leak one anon
     // visitor's `tenant IS NULL` rows to another. When a session fact is in play, bypass the cache
@@ -410,6 +417,9 @@ pub(super) async fn dispatch_handler(
     // remote blob backend (S3/Tigris) is a full network GET of a multi-hundred-KB component just to
     // discard it, is pure per-request latency (the ~0.5 s "not compute" steady cost). Read the blob
     // ONLY on a cold miss; a warm component serves from memory with no backend hit.
+    // `component_us`: the warm-check + (cold-miss only) component-blob GET — a known per-request cost on
+    // a remote blob backend; the v0.14.0 warm-skip keeps it ~0 on a warm hit.
+    let t_component = std::time::Instant::now();
     let wasm = if inner.engine.request_component_warm(&entry.hash) {
         Vec::new()
     } else {
@@ -418,6 +428,7 @@ pub(super) async fn dispatch_handler(
             Err(response) => return response,
         }
     };
+    let component_us = t_component.elapsed().as_micros() as u64;
 
     // The correlation id assigned by the access-log layer, so captured guest logs carry the
     // same id as the request's `boatramp::access` line.
@@ -449,6 +460,11 @@ pub(super) async fn dispatch_handler(
         .query()
         .and_then(|q| query_value(q, "handle"))
         .map(str::to_string);
+    // Ask-1: a per-request blob-op timing handle; `build_bindings` wraps the `wasi:blobstore` storage in
+    // a `TimingStorage` writing into it, and we snapshot it after `serve_lane` to fold the blob GET/HEAD
+    // µs into the phase log (otherwise hidden inside `serve_us`).
+    let blob_timing = std::sync::Arc::new(boatramp_storage::BlobOpTiming::default());
+    let t_bindings = std::time::Instant::now();
     let bindings = match build_bindings(
         inner,
         boatramp_core::project::ProjectRef::new(project),
@@ -482,6 +498,8 @@ pub(super) async fn dispatch_handler(
         None,
         // The request/handler lane never fires as system (that is only a cron `run_as: deployer`).
         false,
+        // Ask-1: time this request's blob reads (get / head / get_range) for the phase log.
+        Some(blob_timing.clone()),
     )
     .await
     {
@@ -504,6 +522,9 @@ pub(super) async fn dispatch_handler(
             return handler_unavailable();
         }
     };
+    // `bindings_us` = auth (JWKS/bearer verify) + tenancy-resolve + binding construction — there is no
+    // standalone auth phase on the plain path; it all happens inside `build_bindings`.
+    let bindings_us = t_bindings.elapsed().as_micros() as u64;
 
     // Per-site concurrency cap (held through the head response; the engine has
     // its own global cap on top). Keyed by `scope`, so a preview's load can't
@@ -547,20 +568,31 @@ pub(super) async fn dispatch_handler(
         .engine
         .serve_lane(&entry.hash, &wasm, request, bindings, limits, lane)
         .await;
-    let (result, cold, instantiate_ms) = match timed {
-        Ok((response, t)) => (Ok(response), Some(t.cold), Some(t.instantiate_us / 1_000)),
-        Err(err) => (Err(err), None, None),
+    let (result, cold, instantiate_ms, instantiate_us) = match timed {
+        Ok((response, t)) => (
+            Ok(response),
+            Some(t.cold),
+            Some(t.instantiate_us / 1_000),
+            Some(t.instantiate_us),
+        ),
+        Err(err) => (Err(err), None, None, None),
     };
+    // `serve_us` = time-to-head (the existing `duration_ms` metric, captured once and reused — the metric
+    // is unchanged). The blob GET lives INSIDE this: the guest buffers the object before producing the head.
+    let serve_elapsed = start.elapsed();
     inner.metrics.observe(
         site,
         metrics::Trigger::Http,
         &handler.route,
         &entry.hash,
         metrics::Outcome::from_result(&result),
-        start.elapsed(),
+        serve_elapsed,
         cold,
         instantiate_ms,
     );
+    // `body_us` = response assembly (into_parts + the optional edge-cache store, which awaits a KV write
+    // OUTSIDE time-to-head, + the Set-Cookie append) — NOT client transfer, which streams after return.
+    let t_body = std::time::Instant::now();
     let mut response = match result {
         Ok(response) => {
             let (parts, body) = response.into_parts();
@@ -597,6 +629,57 @@ pub(super) async fn dispatch_handler(
         response
             .headers_mut()
             .append(axum::http::header::SET_COOKIE, value);
+    }
+    let body_us = t_body.elapsed().as_micros() as u64;
+    let cold = cold.unwrap_or(false);
+    let instantiate_us = instantiate_us.unwrap_or(0);
+    let serve_us = serve_elapsed.as_micros() as u64;
+    let total_us = dispatch_start.elapsed().as_micros() as u64;
+    // Blob read-op timings for THIS request, from the `TimingStorage` wrapping the `wasi:blobstore`
+    // binding — the object GET + the container-marker HEAD that otherwise hide inside `serve_us`.
+    // All-zero on a route with no blobstore binding. Separating `head_us` from `get_us`/`range_us` is
+    // the Ask-3 signal (the per-serve marker check vs the object read); `blob_ops` counts the read ops.
+    let (blob_get_us, blob_head_us, blob_range_us, blob_ops) = blob_timing.snapshot();
+    // One structured line per plain handler request: where the host-side time went — session / component
+    // blob (cold only) / bindings (auth + tenancy + binding build) / instantiate / serve-to-head / body
+    // assembly, plus the blob read ops — so a per-request cost is attributable from the log alone (the
+    // Ask-1 observability). `total_us` is the true plain-path wall-clock; a gap vs the phase sum is the
+    // un-instrumented warm-check / edge-cache lookup / header extraction between phases. (The blob GET
+    // also counts inside `serve_us`: the guest buffers it before producing the head.)
+    tracing::info!(
+        target: "boatramp::handler",
+        route = %handler.route,
+        session_us,
+        component_us,
+        bindings_us,
+        cold,
+        instantiate_us,
+        serve_us,
+        body_us,
+        total_us,
+        blob_get_us,
+        blob_head_us,
+        blob_range_us,
+        blob_ops,
+        "handler request phase timing"
+    );
+    // Server-Timing (durations in ms, per spec) so the same breakdown is visible to the client / an
+    // external probe without the node's logs (mirrors the federated gateway path).
+    let server_timing = format!(
+        "session;dur={:.1}, component;dur={:.1}, bindings;dur={:.1}, instantiate;dur={:.1}, serve;dur={:.1}, body;dur={:.1}, blob;dur={:.1}",
+        session_us as f64 / 1000.0,
+        component_us as f64 / 1000.0,
+        bindings_us as f64 / 1000.0,
+        instantiate_us as f64 / 1000.0,
+        serve_us as f64 / 1000.0,
+        body_us as f64 / 1000.0,
+        (blob_get_us + blob_head_us + blob_range_us) as f64 / 1000.0,
+    );
+    if let Ok(value) = axum::http::HeaderValue::from_str(&server_timing) {
+        response.headers_mut().insert(
+            axum::http::header::HeaderName::from_static("server-timing"),
+            value,
+        );
     }
     response
 }
@@ -1769,6 +1852,12 @@ pub(super) async fn build_bindings(
     // ONLY by `fire_cron` for a `run_as: deployer` cron whose captured deployer was a System·Admin
     // (the sole provenance-verified system source on this path); `false` on every other call.
     run_as_system: bool,
+    // Ask-1 observability (image-serve latency): when `Some`, the `wasi:blobstore` binding's storage is
+    // wrapped in a `TimingStorage` decorator recording per-read-op µs into this shared handle, so the
+    // blob GET + container-marker HEAD — otherwise hidden inside the guest invoke — are attributable in
+    // the `boatramp::handler` phase log. Behavior-frozen (times only; no path/prefix/marker change).
+    // `None` on every non-request lane (consumer/cron/test) ⇒ bare storage, identical to before.
+    blob_timing: Option<std::sync::Arc<boatramp_storage::BlobOpTiming>>,
 ) -> Result<boatramp_handlers::Bindings, BindingsError> {
     let granted = |name: &str| {
         imports.iter().any(|i| i == name) && site_handlers.allow_imports.iter().any(|a| a == name)
@@ -2106,9 +2195,19 @@ pub(super) async fn build_bindings(
                  every container op will be denied; add blobstore_containers: [\"assets-{{tenant}}\"]"
             );
         }
+        // Ask-1: time this invocation's blob read ops (get / head / get_range) WITHOUT touching the blob
+        // path — `TimingStorage` delegates every method unchanged, recording only read-op µs. `None`
+        // (non-request lanes) ⇒ bare storage, byte-identical to before.
+        let blob_storage: std::sync::Arc<dyn boatramp_core::Storage> = match &blob_timing {
+            Some(t) => std::sync::Arc::new(boatramp_storage::TimingStorage::new(
+                inner.storage.clone(),
+                t.clone(),
+            )),
+            None => inner.storage.clone(),
+        };
         bindings = bindings.with_blobstore(
             scope,
-            inner.storage.clone(),
+            blob_storage,
             max_blob,
             super::function_runtime::resolved_tenant_string(&handler_caller_tenant),
             blobstore_containers.to_vec(),
@@ -2892,6 +2991,8 @@ impl ConsumerRebuild<'_> {
             // A consumer resolves the system class from the drained seal (`signed_context`), never a
             // cron flag — so it is never a `run_as_system` fire itself.
             false,
+            // Ask-1 blob timing is request-lane only; the async consumer lane passes None (bare storage).
+            None,
         )
         .await
         // The async lane has no HTTP response to 503 — a consumer nacks on any bindings failure
