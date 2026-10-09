@@ -451,6 +451,10 @@ pub fn router_with_fast(
         // memory-instance-observability). NOT per-site — the engine is shared node-wide; authz gates
         // it `System·Read`.
         .route("/api/instance-stats", get(node_instance_stats))
+        // Node-global health snapshot (construens node-health-alerting): `/data` filesystem headroom
+        // (the disk-full incident signal) + later managed-SQL health. NOT per-site; authz gates it
+        // `System·Read` in `authz::Right::required`.
+        .route("/api/node-health", get(node_health))
         .route("/api/sites/{site}/_boatramp/logs", get(operator_logs))
         .route(
             "/api/sites/{site}/_boatramp/logs/stream",

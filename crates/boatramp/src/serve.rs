@@ -1141,7 +1141,10 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
     }
 
     tracing::info!(
-        blobs = ?args.blobs, kv = ?args.kv, tls = ?args.tls,
+        // Log the EFFECTIVE blob backend (`blob_args.blobs` = `[serve].blobs` overriding the flag),
+        // not the clap default `args.blobs` — the old `args.blobs` here hid a config-vs-flag mismatch
+        // (e.g. logging `Fs` while actually serving S3), which obscured a prod diagnosis.
+        blobs = ?blob_args.blobs, blobs_flag = ?args.blobs, kv = ?args.kv, tls = ?args.tls,
         auth = !auth.is_disabled(), "starting boatramp"
     );
     // In a TLS mode, optionally bind a second plain-HTTP listener that redirects

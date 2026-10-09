@@ -5,6 +5,28 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.24.0] - 2026-10-09
+
+Node-health observability — Stage 1 of the construens node-health-alerting request (incident: a node's
+`/data` silently filled to 100%, managed Postgres couldn't create its sandbox, and every DB-backed
+request failed with no alert). Host/daemon-side only; no WIT/shim change. (Stage 2 — the alerting loop,
+sealed-secret webhook/email channels, and the orphaned-replica reaper — follows as a separate, security-
+reviewed release.)
+
+- **`/data` filesystem headroom** — the signal whose absence hid the incident. A POSIX `libc::statvfs`
+  read (no new dependency; `None` off-unix or on any error, never panics) surfaces `data_bytes_total` /
+  `data_bytes_used` / `data_used_pct` as **additive** fields in the node instance-stats response (so
+  `boatramp stats --instances` shows them; existing fields unchanged for console back-compat).
+- **`GET /api/node-health`** — a node-global health snapshot (the `/data` figures today; managed-SQL
+  health in Stage 2), gated **`System·Admin`** by an **explicit** authz arm — never a per-project
+  `/api/*` mapping — with a test asserting a project-scoped admin is refused.
+- **Startup blob-backend log fix** — the serve log reported the clap default (`Fs`) instead of the
+  effective resolved backend; it now logs the effective backend (and the flag separately).
+
+Known Stage-2 item: the `/data` figures + `/api/node-health` are currently `handlers`-gated (carried via
+the handler runtime, like `/api/instance-stats`), so a lean (no-handlers) node doesn't yet expose them;
+Stage 2 threads `data_dir` via `ServerOptions` so the disk signal is available regardless of handlers.
+
 ## [0.23.0] - 2026-10-09
 
 Per-phase latency observability for plain handlers (construens `boatramp-image-serve-latency`, Ask 1 —

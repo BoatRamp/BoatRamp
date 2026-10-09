@@ -448,6 +448,11 @@ impl Right {
             // per-project mapping) — it reveals resident component hashes + memory across every project
             // on the node, so a project-scoped role must not reach it.
             "/api/instance-stats" => Self::new(Resource::System, None, Action::Read),
+            // Node-global health snapshot (construens node-health-alerting): `/data` filesystem
+            // headroom + (later) managed-SQL health. A NODE-global read gated `System·Read`
+            // EXPLICITLY — never a per-project mapping (it reveals node-wide disk/health, and the
+            // disk-full incident it guards is a node fault, not a project one).
+            "/api/node-health" => Self::new(Resource::System, None, Action::Read),
             // Listing projects is a node-level read; creating one is a node-admin act
             // (only `/api/projects` exactly — a specific project is handled above).
             "/api/projects" => {
@@ -2085,6 +2090,29 @@ mod tests {
         );
         let admin = AuthzPolicy::default_policy().rights_for(&[GrantedRole::global("admin")]);
         assert!(admin.allows(&required), "a node admin may read node stats");
+    }
+
+    #[test]
+    fn node_health_endpoint_is_node_global_system_read() {
+        // construens node-health-alerting: `/api/node-health` is a NODE-global read (disk headroom /
+        // health are node faults, not project ones), gated `System·Read` EXPLICITLY — a project-scoped
+        // role (even that project's admin) must NOT reach it (a per-project mapping would leak node-wide
+        // state + invert the node-global-authz discipline [[node-global-endpoint-authz]]).
+        let required = Right::required("GET", "/api/node-health").expect("route is gated");
+        assert_eq!(required, Right::new(Resource::System, None, Action::Read));
+        let proj_admin = AuthzPolicy::default_policy()
+            .rights_for(&[GrantedRole::scoped("project_admin", "acme")]);
+        assert!(
+            !proj_admin.allows(&required),
+            "a project-scoped admin must not reach the node-global health endpoint"
+        );
+        let operator = AuthzPolicy::default_policy().rights_for(&[GrantedRole::global("operator")]);
+        assert!(
+            operator.allows(&required),
+            "an operator (System·Read) may read node health"
+        );
+        let admin = AuthzPolicy::default_policy().rights_for(&[GrantedRole::global("admin")]);
+        assert!(admin.allows(&required), "a node admin may read node health");
     }
 
     #[test]
