@@ -190,12 +190,13 @@ mod operator;
 pub(crate) use operator::prometheus_metrics;
 #[cfg(feature = "handlers")]
 pub(crate) use operator::{
-    node_instance_stats, operator_bus_dlq, operator_bus_dlq_list, operator_bus_queue_group,
-    operator_bus_queue_groups, operator_bus_queue_pause, operator_bus_queue_peek,
-    operator_bus_queue_policy, operator_bus_queue_replay, operator_dlq, operator_dlq_list,
-    operator_function_logs, operator_function_logs_stream, operator_handler_stats, operator_logs,
-    operator_logs_stream, operator_queue_group, operator_queue_groups, operator_queue_pause,
-    operator_queue_peek, operator_queue_policy, operator_queue_replay,
+    node_health, node_instance_stats, operator_bus_dlq, operator_bus_dlq_list,
+    operator_bus_queue_group, operator_bus_queue_groups, operator_bus_queue_pause,
+    operator_bus_queue_peek, operator_bus_queue_policy, operator_bus_queue_replay, operator_dlq,
+    operator_dlq_list, operator_function_logs, operator_function_logs_stream,
+    operator_handler_stats, operator_logs, operator_logs_stream, operator_queue_group,
+    operator_queue_groups, operator_queue_pause, operator_queue_peek, operator_queue_policy,
+    operator_queue_replay,
 };
 mod proxy;
 pub use proxy::spawn_compute_reconcile;
@@ -375,6 +376,11 @@ struct HandlerRuntimeInner {
     /// unlimited), from the security posture. Set once at serve
     /// startup via [`HandlerRuntime::set_max_blob_bytes`]; unset reads as `0`.
     max_blob_bytes: std::sync::OnceLock<u64>,
+    /// The node's data directory (`<dir>` for filesystem backends; the volume that holds the SlateDB
+    /// KV, managed PGDATA, and the secrets KEK). Set once at serve startup via
+    /// [`HandlerRuntime::set_data_dir`]; read by the node-health endpoint for `/data` filesystem
+    /// headroom (`libc::statvfs`). `None` when unset.
+    data_dir: std::sync::OnceLock<std::path::PathBuf>,
     /// Max size of a Wasm component blob accepted at activation (`0` = unlimited),
     /// from the security posture. Checked against the manifest's file
     /// size *before* the blob is read. Set via
@@ -766,6 +772,7 @@ impl HandlerRuntime {
                 cron_leader_gate: std::sync::OnceLock::new(),
                 async_shard_gate: std::sync::OnceLock::new(),
                 max_blob_bytes: std::sync::OnceLock::new(),
+                data_dir: std::sync::OnceLock::new(),
                 max_component_bytes: std::sync::OnceLock::new(),
                 allow_env_secret_refs: std::sync::OnceLock::new(),
                 require_tenancy_declaration: std::sync::OnceLock::new(),
@@ -955,6 +962,24 @@ impl HandlerRuntime {
         if let Some(inner) = self.inner.as_ref() {
             let _ = inner.max_blob_bytes.set(max_bytes);
         }
+    }
+
+    /// Record the node's data directory (the volume holding the SlateDB KV, managed PGDATA, and the
+    /// secrets KEK). Set once at serve startup; the node-health endpoint reads its filesystem headroom.
+    #[cfg(feature = "handlers")]
+    pub fn set_data_dir(&self, dir: std::path::PathBuf) {
+        if let Some(inner) = self.inner.as_ref() {
+            let _ = inner.data_dir.set(dir);
+        }
+    }
+
+    /// The node's data directory, if recorded (see [`HandlerRuntime::set_data_dir`]).
+    #[cfg(feature = "handlers")]
+    pub fn data_dir(&self) -> Option<&std::path::Path> {
+        self.inner
+            .as_ref()
+            .and_then(|i| i.data_dir.get())
+            .map(|p| p.as_path())
     }
 
     /// Wire the MF-3 GraphQL-registry stale-authz fence (multi-writer `shared` mode): the uncached

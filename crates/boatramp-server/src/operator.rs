@@ -161,9 +161,97 @@ pub(super) async fn node_instance_stats(
     Extension(handlers): Extension<Arc<HandlerRuntime>>,
 ) -> Response {
     match handlers.instance_stats() {
-        Some(stats) => Json(stats).into_response(),
+        Some(stats) => {
+            // Additively merge the node `/data` filesystem headroom (construens node-health-alerting):
+            // console back-compat preserved — existing fields are unchanged and the new `data_*` keys
+            // are ignored by older clients; `boatramp stats --instances` (a raw-Value passthrough)
+            // surfaces them automatically.
+            let mut v = serde_json::to_value(&stats).unwrap_or_else(|_| serde_json::json!({}));
+            if let (Some(obj), Some(fs)) = (
+                v.as_object_mut(),
+                handlers.data_dir().and_then(data_fs_usage),
+            ) {
+                fs.merge_into(obj);
+            }
+            Json(v).into_response()
+        }
         None => Json(serde_json::json!({ "handlers": false })).into_response(),
     }
+}
+
+/// `/data` filesystem headroom for the node's data volume (SlateDB KV + managed PGDATA + secrets KEK).
+/// THE signal the disk-full incident needed: a silently-100%-full `/data` stopped managed PG from
+/// creating its sandbox, failing every DB-backed request with no alert.
+#[cfg(feature = "handlers")]
+pub(super) struct DataFsUsage {
+    bytes_total: u64,
+    bytes_used: u64,
+    used_pct: f64,
+}
+
+#[cfg(feature = "handlers")]
+impl DataFsUsage {
+    /// Insert the flat `data_bytes_total` / `data_bytes_used` / `data_used_pct` keys into `obj`
+    /// (`used_pct` rounded to 2 dp; `null` only if non-finite).
+    fn merge_into(&self, obj: &mut serde_json::Map<String, serde_json::Value>) {
+        obj.insert("data_bytes_total".into(), self.bytes_total.into());
+        obj.insert("data_bytes_used".into(), self.bytes_used.into());
+        obj.insert(
+            "data_used_pct".into(),
+            serde_json::Number::from_f64((self.used_pct * 100.0).round() / 100.0)
+                .map_or(serde_json::Value::Null, serde_json::Value::Number),
+        );
+    }
+}
+
+/// Read `/data` usage via POSIX `libc::statvfs` (any unix — Linux prod + macOS dev). `None` on a
+/// non-unix target or on ANY statvfs error — never panics. `used_pct` = (total − free)/total, i.e.
+/// "how full the disk is" (what the disk-full alert cares about), not df's reserved-block-excluding
+/// Use%. The `as u64` casts are width-safe across platforms (`fsblkcnt_t` is u32 or u64).
+#[cfg(all(feature = "handlers", unix))]
+pub(super) fn data_fs_usage(dir: &std::path::Path) -> Option<DataFsUsage> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
+    // SAFETY: a zeroed `statvfs` is a valid initial state; `path` is a valid NUL-terminated C string;
+    // `statvfs` only reads `path` and writes `stat`.
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(path.as_ptr(), &mut stat) } != 0 {
+        return None;
+    }
+    let frsize = stat.f_frsize as u64;
+    let bytes_total = frsize.checked_mul(stat.f_blocks as u64)?;
+    let bytes_free = frsize.checked_mul(stat.f_bfree as u64)?;
+    let bytes_used = bytes_total.saturating_sub(bytes_free);
+    let used_pct = if bytes_total > 0 {
+        bytes_used as f64 / bytes_total as f64 * 100.0
+    } else {
+        0.0
+    };
+    Some(DataFsUsage {
+        bytes_total,
+        bytes_used,
+        used_pct,
+    })
+}
+
+#[cfg(all(feature = "handlers", not(unix)))]
+pub(super) fn data_fs_usage(_dir: &std::path::Path) -> Option<DataFsUsage> {
+    None
+}
+
+/// `GET /api/node-health` (construens node-health-alerting): the NODE-global health snapshot. Stage 1
+/// surfaces `/data` filesystem headroom — the disk-full incident signal (a silently-full `/data`
+/// bricked managed PG with no alert); managed-SQL health + the alerting loop/channels arrive in a later
+/// stage. Read-only; the authz table gates it `System·Read` (a NODE-global read — disk/health are node
+/// faults, never a per-project right). The `data_*` figures are absent when the data dir is unknown or
+/// statvfs is unavailable (off-Linux).
+#[cfg(feature = "handlers")]
+pub(super) async fn node_health(Extension(handlers): Extension<Arc<HandlerRuntime>>) -> Response {
+    let mut obj = serde_json::Map::new();
+    if let Some(fs) = handlers.data_dir().and_then(data_fs_usage) {
+        fs.merge_into(&mut obj);
+    }
+    Json(serde_json::Value::Object(obj)).into_response()
 }
 
 /// The versioned DLQ view schema (UX5): bumped only on a breaking shape change, so a client can
