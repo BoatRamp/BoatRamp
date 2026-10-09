@@ -469,6 +469,24 @@ jobs:
             echo "blob-fault mutation verified: flatten_403 turns the gate RED → the 403≠404 distinction is load-bearing."
           fi
 
+      # MARKER-DEDUP CONFINEMENT gate (image-serve-latency Ask 3a): the per-serve `.boatramp-container`
+      # HEAD is dedup'd by a process-wide, positive-only `MarkerHeadCache` WITHOUT weakening the Dim-0
+      # container confinement (`container_access` still runs on every op; the cache sees only
+      # fully-resolved tenant-confined keys). An IN-PROCESS typed-mutation matrix proves the three
+      # fail-closed rules are each load-bearing — `key_by_basename` (collapse distinct confined prefixes),
+      # `cache_negative` (serve an absent marker as owned), `skip_invalidation` (serve a deleted container
+      # as still-owned) — each flips an assertion INSIDE the test, so a regressed rule fails the gate.
+      # Marker `MARKER-DEDUP CONFINEMENT OK`.
+      - name: "blob marker-dedup confinement gate (dedup never bypasses container confinement)"
+        run: |
+          set -eo pipefail
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-storage \
+            --features marker-cache marker_cache -- --nocapture 2>&1 | tee marker-dedup.log
+          grep -qE 'test result: ok\. 5 passed' marker-dedup.log \
+            || { echo "::error::marker-dedup gate did not run (silent skip/failure, or the count drifted from 5)" >&2; exit 1; }
+          grep -q 'MARKER-DEDUP CONFINEMENT OK' marker-dedup.log \
+            || { echo "::error::marker-dedup gate never reached its marker (a confinement/invalidation regression or a skipped test)" >&2; exit 1; }
+
       # BLOB-LIST PREFIX-CONFINEMENT gate (construens blob-list-prefix): the new guest `blob-list`
       # (server-side prefix filter + bounded/resumable page) must stay inside the guest's container.
       # The guest `prefix` is JOINED under the host container prefix (`hblob/{site}/{container}/`) and

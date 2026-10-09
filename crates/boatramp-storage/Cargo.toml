@@ -70,6 +70,10 @@ sql-mysql = ["dep:sqlx", "dep:sqlparser", "dep:log", "sqlx/mysql"]
 # A bounded local read-through cache over any `Storage`:
 # clustered/CF nodes front the shared object store with a hot-blob cache.
 cache = ["dep:lru", "dep:bytes"]
+# A process-wide, positive-only cache of VERIFIED container markers: skips the per-serve
+# `.boatramp-container` HEAD round-trip without touching confinement. Needs `bytes` (the `Storage`
+# zero-copy accessor it delegates). No `lru` — a small capped map suffices for tiny marker metas.
+marker-cache = ["dep:bytes"]
 # A read-fallback composite over two `Storage` backends (blob-backend migration Part 2):
 # serve the new (primary) backend first, fall through to the old (secondary) on a
 # definitive, allowlisted primary miss, so a `--blobs` switch has no serving gap while
