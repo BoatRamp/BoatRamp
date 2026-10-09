@@ -1039,6 +1039,8 @@ pub(super) async fn run_scheduler_tick(
                                 None,
                                 // A consumer resolves any system class from the drained seal, not here.
                                 false,
+                                // Ask-1 blob timing is request-lane only; background triggers pass None.
+                                None,
                             )
                             .await
                             {
@@ -1495,6 +1497,8 @@ async fn fire_cron(
         None,
         // PLAN-system-principal P2: fire as system iff this cron's deployer was a System·Admin.
         run_as_system,
+        // Ask-1 blob timing is request-lane only; the cron trigger passes None (bare storage).
+        None,
     )
     .await
     {
