@@ -5,6 +5,39 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.26.0] - 2026-10-09
+
+Image-serve-latency, driven by what the v0.23.0 instrumentation measured on the live `/img` leg — which
+moved the dominant cost off the blob path entirely. Two fixes: a durable wasm compile cache (Ask A, the
+~14 s post-deploy first hit) and sub-instrumentation of the opaque `bindings_us` phase (Ask B step 1, the
+~7 s warm steady-state, observability-first). Host/daemon-side only; no WIT/shim change.
+
+- **Durable wasm compile cache (Ask A).** The persisted compile cache is now pinned to the operator's
+  **persistent data volume** (`<data_dir>/wasmtime-cache`) instead of wasmtime's default location —
+  which resolves to `~/.cache/wasmtime` on the *ephemeral container rootfs* of a distroless node and is
+  therefore WIPED on every restart/roll. The symptom: the first visitor after each deploy paid a full
+  cranelift compile (≈1 s p50, ≈5 s worst case for a ~900 KB component), and on a small node a ~48-way
+  concurrent gallery burst stampeded behind that one compile → a measured 13–16 s first reload. With the
+  cache on `/data` the artifact survives a restart, so the first request **deserializes in ms**. The
+  cache self-bounds at wasmtime's 512 MiB soft limit with its own cleanup worker (and `/data` headroom is
+  already surfaced by v0.24.0's node-health). The pinning is **best-effort**: an unwritable dir logs a
+  warning and degrades to no caching — never a boot failure (the prior `cache_config_load_default()?`
+  could in fact *hard-fail* engine construction when no `$HOME` resolved; that is fixed too). The cache
+  dir is created `0700` and its config `0600` (best-effort, unix): the cache holds *executable* native
+  artifacts, so `/data` must stay serve-user-owned and not group/other-writable or network-shared — an
+  independent security review flagged `/data` as now an RCE trust boundary (no guest-reachable write
+  path: the blob FS backend at `<data_dir>/blobs` is `..`-confined and can't traverse to it).
+  Mutation-verified gate `COMPILE-CACHE DURABLE OK`: a real component compiled under a threaded data dir
+  must land its artifact there, and a `#[cfg(test)]` severance seam forcing the ephemeral default makes
+  the same assertion go empty (so a reversion to the default location turns the gate RED).
+- **`bindings_us` sub-instrumentation (Ask B, step 1 — observability).** The `boatramp::handler` phase
+  line and the `Server-Timing` header now split the previously-opaque `bindings_us` into `resolve_us`
+  (auth / token-verify + in-site tenancy-resolve + the per-table tenancy-schema KV load), `binding_build_us`
+  (the remaining per-import binding construction), and `messaging_build_us` (the one post-resolution
+  binding that does real per-request async work — `wasi:messaging` mints a per-publish signed context).
+  This localizes a multi-second warm bindings phase from the log alone, exactly as Ask 1 did for the
+  whole dispatch. Behavior-frozen (timings only); the Ask B *fix* follows once the split is measured live.
+
 ## [0.25.0] - 2026-10-09
 
 Blob marker-`HEAD` dedup — part of the construens image-serve-latency work (Ask 3a). Eliminates the

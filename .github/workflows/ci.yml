@@ -487,6 +487,25 @@ jobs:
           grep -q 'MARKER-DEDUP CONFINEMENT OK' marker-dedup.log \
             || { echo "::error::marker-dedup gate never reached its marker (a confinement/invalidation regression or a skipped test)" >&2; exit 1; }
 
+      # COMPILE-CACHE DURABILITY gate (image-serve-latency Ask A): the wasm compile cache MUST be pinned
+      # to the operator's PERSISTENT data volume so a component's compiled artifact survives a restart —
+      # the first request after a roll then deserializes in ms instead of paying a cranelift compile
+      # (which, on a small node, a ~48-way gallery burst stampedes behind → the measured 13–16 s first
+      # reload). The IN-PROCESS test compiles a real component under a threaded data dir and asserts the
+      # artifact lands THERE; its `#[cfg(test)]` severance seam then forces the ephemeral default even
+      # though a data dir was threaded, and the SAME assertion goes empty — so a hollow pinning (or a
+      # reversion to `cache_config_load_default`, wasmtime's `~/.cache/wasmtime` ephemeral location on a
+      # distroless node) turns the gate RED. Marker `COMPILE-CACHE DURABLE OK`.
+      - name: "wasm compile-cache durability gate (compiled artifact survives a restart on the data volume)"
+        run: |
+          set -eo pipefail
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-handlers \
+            --features engine --lib compile_cache_durable_gate -- --nocapture 2>&1 | tee compile-cache.log
+          grep -qE 'test result: ok\. 1 passed' compile-cache.log \
+            || { echo "::error::compile-cache durability gate did not run (silent skip/failure)" >&2; exit 1; }
+          grep -q 'COMPILE-CACHE DURABLE OK' compile-cache.log \
+            || { echo "::error::compile-cache durability gate never reached its marker (the compile cache is no longer pinned to the data volume → components recompile after each restart)" >&2; exit 1; }
+
       # BLOB-LIST PREFIX-CONFINEMENT gate (construens blob-list-prefix): the new guest `blob-list`
       # (server-side prefix filter + bounded/resumable page) must stay inside the guest's container.
       # The guest `prefix` is JOINED under the host container prefix (`hblob/{site}/{container}/`) and

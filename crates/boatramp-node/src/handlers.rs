@@ -183,17 +183,29 @@ pub async fn build_handler_runtime(
             "[handlers] instance_cache_size clamped to [1, 16384]"
         );
     }
+    // Pin the wasmtime compile cache to the persistent data volume so a component's compiled artifact
+    // survives a restart/roll (the first request after a deploy then deserializes in ms instead of
+    // paying a multi-second cranelift compile, which on a small node a concurrent burst stampedes
+    // behind). Without this, wasmtime defaults to `~/.cache/wasmtime` on the ephemeral container
+    // rootfs — wiped every restart. Best-effort inside the engine (an unwritable dir degrades to no
+    // cache, never a boot failure).
+    let compile_cache_dir = Some(data_dir);
     let engine = if handlers_cfg.is_some_and(|h| h.pooling) {
         boatramp_handlers::HandlerEngine::with_pooling_lanes(
             sync_limits,
             async_limits,
             streaming_limits,
             instance_cache_size,
+            compile_cache_dir,
         )?
     } else {
-        boatramp_handlers::HandlerEngine::new(sync_limits, instance_cache_size)?
-            .with_async_limits(async_limits)
-            .with_streaming_limits(streaming_limits)
+        boatramp_handlers::HandlerEngine::new_with_cache_dir(
+            sync_limits,
+            instance_cache_size,
+            compile_cache_dir,
+        )?
+        .with_async_limits(async_limits)
+        .with_streaming_limits(streaming_limits)
     }
     .with_outbound_timeout(outbound_timeout)
     .with_private_egress(allow_guest_private_egress)

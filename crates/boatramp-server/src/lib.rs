@@ -7349,6 +7349,7 @@ mod tests {
                     None,
                     false,
                     None,
+                    None,
                 )
                 .await
                 .expect("no secrets → resolves")
@@ -7490,6 +7491,7 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
                 None,
             )
             .await;
