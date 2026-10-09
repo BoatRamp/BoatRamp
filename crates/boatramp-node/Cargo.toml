@@ -96,6 +96,9 @@ handlers = [
   # The handler auth path verifies app bearer tokens against a JWKS (token_claims / the federated
   # gateway), which lives behind the server's `oidc` feature — so a handlers node always ships it.
   "boatramp-server/oidc",
+  # The serve path dedups the per-request container-marker HEAD via a process-wide marker cache
+  # (confinement-preserving); a handlers node always wires it.
+  "boatramp-storage/marker-cache",
   "sql",
 ]
 # External bring-your-own SQL for the handler `sql` binding (each implies handlers).

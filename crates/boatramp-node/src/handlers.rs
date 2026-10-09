@@ -83,6 +83,20 @@ pub async fn build_handler_runtime(
     // gateway below; keep it from tripping unused-variable in a no-email build.
     #[cfg(not(feature = "email"))]
     let _ = allow_guest_email;
+    // Front the shared blob backend with a process-wide, positive-only container-marker cache so the
+    // serve path skips the per-request `.boatramp-container` HEAD round-trip for an already-verified
+    // container. Confinement is UNTOUCHED — the binding's `container_access` still runs on every op and
+    // the cache only ever sees fully-resolved, tenant-confined keys; it caches a marker only on a
+    // confirmed `Ok` and invalidates on a marker delete (fail-closed). `0` disables it (pass-through).
+    // Wrapped here (INSIDE the per-request `TimingStorage` the dispatch path adds), so a marker-cache hit
+    // shows `blob_head_us≈0` in the v0.23.0 phase timing.
+    const DEFAULT_BLOB_MARKER_CACHE: usize = 4096;
+    let marker_cache_entries = handlers_cfg
+        .and_then(|h| h.blob_marker_cache_entries)
+        .unwrap_or(DEFAULT_BLOB_MARKER_CACHE);
+    let storage: Arc<dyn boatramp_core::Storage> = Arc::new(
+        boatramp_storage::MarkerHeadCache::new(storage, marker_cache_entries),
+    );
     // Two engine ceilings by lane. The **sync** ceiling bounds connection-bearing
     // requests (site handlers, synchronous invokes) — kept tight so a slow
     // handler can't pin a client, a proxy, and the shared request pool; default

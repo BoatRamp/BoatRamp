@@ -90,6 +90,11 @@ pub mod cache;
 
 pub mod timing;
 
+/// The verified-container-marker head cache (blob serve-path dedup). Needs `bytes` for the `Storage`
+/// zero-copy accessor it delegates, so it rides a small feature that pulls it.
+#[cfg(feature = "marker-cache")]
+pub mod marker_cache;
+
 #[cfg(feature = "fallback")]
 pub mod fallback;
 
@@ -149,6 +154,9 @@ pub use sql_sqlx::{ExternalSqlKind, ExternalSqlOptions};
 pub use cache::CachedStorage;
 
 pub use timing::{BlobOpTiming, TimingStorage};
+
+#[cfg(feature = "marker-cache")]
+pub use marker_cache::MarkerHeadCache;
 
 #[cfg(feature = "fallback")]
 pub use fallback::{FallbackStorage, FallbackWhen};

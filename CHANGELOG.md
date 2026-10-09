@@ -5,6 +5,32 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.25.0] - 2026-10-09
+
+Blob marker-`HEAD` dedup — part of the construens image-serve-latency work (Ask 3a). Eliminates the
+per-serve `.boatramp-container` marker `HEAD` round-trip (one of two serial object-store round-trips per
+blob serve) without weakening Dim-0 blob tenant confinement. Host/daemon-side only; no WIT/shim change.
+
+- **`MarkerHeadCache`** — a process-wide, transparent `Storage` decorator fronting the shared blob
+  backend that memoizes a VERIFIED `.boatramp-container` marker, so a container open skips the redundant
+  `HEAD`. Positive-only (caches only an `Ok` marker — never a `NotFound` or a backend fault, so a
+  403-as-fault can't become a cached "owned"); keyed by the fully-resolved, tenant-confined marker key
+  (never a guest name — two tenants can't collide); invalidated on the marker's `delete`/`put` (a
+  destroyed container re-probes and fail-closes; a re-created one refreshes). Wired INSIDE the per-request
+  `TimingStorage` so a cache hit shows `blob_head_us≈0` in the v0.23.0 phase timing. `[handlers]
+  blob_marker_cache_entries` (default 4096; 0 disables).
+- **Confinement is unchanged:** the binding's `container_access` choke still runs on every op and refuses
+  a cross-tenant/foreign container BEFORE the cache is consulted — the decorator only removes a
+  round-trip, never the authorization. An independent security review confirmed the cache cannot collapse
+  confined keys, fabricate ownership, or outlive a destroy. Mutation-verified gate `MARKER-DEDUP
+  CONFINEMENT OK` (`KeyByBasename` / `CacheNegative` / `SkipInvalidation` each turn it RED).
+  `supports_watch`/`watch` delegate to the inner backend (a non-delegating decorator would silently
+  disable blob-change triggers — caught by the review + a regression test).
+
+The provable half of image-serve-latency Ask 3; the connection-layer serialization (Ask 3b) and the
+read-through blob cache (Ask 2) follow, driven by what the v0.23.0 instrumentation measures on the
+cold/uncached path.
+
 ## [0.24.0] - 2026-10-09
 
 Node-health observability — Stage 1 of the construens node-health-alerting request (incident: a node's

@@ -1436,6 +1436,15 @@ pub struct HandlersConfig {
     /// surface reports `warm_capacity` + `evictions` so the right value is measured, not guessed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instance_cache_size: Option<usize>,
+    /// **Blob container-marker cache size** (entries). Every blob container open re-`HEAD`s the
+    /// `.boatramp-container` ownership marker — a second serial object-store round-trip per serve. A
+    /// process-wide, positive-only cache of VERIFIED markers (keyed by the fully-resolved, tenant-confined
+    /// container prefix; invalidated on container delete) skips that HEAD for an already-verified
+    /// container WITHOUT touching confinement (`container_access` still runs on every op). Absent ⇒ 4096;
+    /// `0` disables the cache (every open re-HEADs). A node rarely has more than a handful of live
+    /// containers, so the default is generous headroom.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blob_marker_cache_entries: Option<usize>,
     /// Engine-wide **safety max** on a *connection-bearing* invocation (a site
     /// handler or a synchronous function/webhook invoke), milliseconds. A route
     /// or function may declare a *lower* timeout, never a higher one. Kept tight
