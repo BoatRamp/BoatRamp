@@ -497,11 +497,17 @@ pub(super) async fn dispatch_handler(
     // marker; a forged `x-boatramp-egress-depth` verifies to 0, so an external client cannot use this
     // to bypass the gate. In-process invoke/graphql fan-out bypasses dispatch entirely, so HTTP
     // self-egress is the only re-entry that reaches here.
+    // Ask B-3 follow-up (C): time the serve-admission PERMIT WAIT. Under a burst the gate (cap =
+    // serve_concurrency) becomes a queue, and that wait happens BEFORE the timed phases below — so it
+    // was only visible as `total_us − Σphases`. Surface it as its own `gate_wait` phase so queue depth
+    // is directly measurable (and `serve_concurrency` sizable from data, not inference).
+    let t_gate = std::time::Instant::now();
     let _admission = if inner.engine.verified_self_egress_depth(request.headers()) > 0 {
         None
     } else {
         acquire_component_admission(inner, &entry.hash).await
     };
+    let gate_wait_us = t_gate.elapsed().as_micros() as u64;
     // Ask-1: a per-request blob-op timing handle; `build_bindings` wraps the `wasi:blobstore` storage in
     // a `TimingStorage` writing into it, and we snapshot it after `serve_lane` to fold the blob GET/HEAD
     // µs into the phase log (otherwise hidden inside `serve_us`).
@@ -528,6 +534,9 @@ pub(super) async fn dispatch_handler(
         &handler.blobstore_containers,
         // Per-guest secret allowlist (task #492): empty ⇒ the whole site pool, else only these keys.
         &handler.secrets,
+        // Ask B-3 (B): `no_secrets` ⇒ resolve ZERO site secrets for this handler (a blob/image route
+        // that reads none shouldn't pay to resolve+unseal the site's auth secrets every serve).
+        handler.no_secrets,
         // A site handler is the entry point of a call chain (reached over HTTP), so it
         // invokes siblings at depth 0; the host caps each subsequent hop.
         0,
@@ -712,6 +721,7 @@ pub(super) async fn dispatch_handler(
     tracing::info!(
         target: "boatramp::handler",
         route = %handler.route,
+        gate_wait_us,
         session_us,
         component_us,
         bindings_us,
@@ -738,7 +748,8 @@ pub(super) async fn dispatch_handler(
     // carries the same numbers for the operator.
     if inner.server_timing_header() {
         let server_timing = format!(
-            "session;dur={:.1}, component;dur={:.1}, bindings;dur={:.1}, resolve;dur={:.1}, bindingbuild;dur={:.1}, blobbuild;dur={:.1}, msgbuild;dur={:.1}, secretget;dur={:.1}, bindgap;dur={:.1}, instantiate;dur={:.1}, serve;dur={:.1}, body;dur={:.1}, blob;dur={:.1}",
+            "gate_wait;dur={:.1}, session;dur={:.1}, component;dur={:.1}, bindings;dur={:.1}, resolve;dur={:.1}, bindingbuild;dur={:.1}, blobbuild;dur={:.1}, msgbuild;dur={:.1}, secretget;dur={:.1}, bindgap;dur={:.1}, instantiate;dur={:.1}, serve;dur={:.1}, body;dur={:.1}, blob;dur={:.1}",
+            gate_wait_us as f64 / 1000.0,
             session_us as f64 / 1000.0,
             component_us as f64 / 1000.0,
             bindings_us as f64 / 1000.0,
@@ -1961,6 +1972,9 @@ pub(super) async fn build_bindings(
     // this guest is granted. Empty ⇒ inject the whole pool (default, non-breaking); non-empty ⇒ inject
     // only the named keys (least-privilege). Filtered at the `resolve_env` choke point below.
     secret_allowlist: &[String],
+    // Ask B-3 (B): resolve ZERO site secrets for this handler (least-privilege opt-out). Threaded to
+    // `resolve_env`, which then skips the site pool entirely (a no-secret route touches the store 0×).
+    no_secrets: bool,
     depth: u32,
     request_id: Option<&str>,
     // Stage 0 tenant-source inputs (the verified bearer for a token source; the routed domain's
@@ -2694,11 +2708,25 @@ pub(super) async fn build_bindings(
     // per site/handler secret (now fetched concurrently). Lands in the post-messaging `bindgap`
     // region, so this `secretget` split makes the per-serve secret cost visible in the phase log.
     let t_secret_env = std::time::Instant::now();
+    // Ask B-3 (B): a `no_secrets` handler resolves ONLY its static `env` — swap in a site config whose
+    // secret pool is empty so `resolve_env` skips the store entirely (the clone is on the opt-out path
+    // only; `resolve_env` reads nothing but `.secrets` off this). A blob route then touches the secret
+    // store zero times per serve.
+    let no_secret_cfg;
+    let effective_site_handlers = if no_secrets {
+        no_secret_cfg = boatramp_core::config::HandlersSiteConfig {
+            secrets: std::collections::BTreeMap::new(),
+            ..site_handlers.clone()
+        };
+        &no_secret_cfg
+    } else {
+        site_handlers
+    };
     let env = resolve_env(
         site,
         project,
         deploy_env,
-        site_handlers,
+        effective_site_handlers,
         secret_allowlist,
         allow_env_secret_refs,
         inner.secret_store.get().map(std::convert::AsRef::as_ref),
@@ -3179,6 +3207,8 @@ impl ConsumerRebuild<'_> {
             self.upload_containers,
             self.blobstore_containers,
             self.secret_allowlist,
+            // Consumers resolve their secrets as before (no `no_secrets` opt-out on the async lane).
+            false,
             0,
             None,
             None,

@@ -348,6 +348,8 @@ jobs:
             || { echo "::error::secret-resolution floor gate did not run (silent skip or a failure)" >&2; exit 1; }
           grep -q 'SECRET-RESOLUTION PARALLEL OK' secret-floor.log \
             || { echo "::error::secret resolution regressed to serial (per-secret .await-in-a-loop)" >&2; exit 1; }
+          grep -q 'NO-SECRETS SCOPE OK' secret-floor.log \
+            || { echo "::error::a no_secrets handler no longer resolves ZERO site secrets (Ask B-3 B regressed)" >&2; exit 1; }
           grep -q 'SERVER-TIMING DEFAULT-OFF OK' secret-floor.log \
             || { echo "::error::the Server-Timing response header is no longer default-off" >&2; exit 1; }
 

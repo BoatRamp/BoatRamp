@@ -7080,6 +7080,7 @@ mod tests {
             files,
             config: DeployConfig {
                 handlers: vec![HandlerConfig {
+                    no_secrets: false,
                     tenancy: None,
                     token_claims: None,
                     route: "/".into(),
@@ -7252,6 +7253,7 @@ mod tests {
             files,
             config: DeployConfig {
                 handlers: vec![HandlerConfig {
+                    no_secrets: false,
                     tenancy: None,
                     token_claims: None,
                     route: "/".into(),
@@ -7431,6 +7433,8 @@ mod tests {
                     &[],
                     // Per-guest secret allowlist (task #492): empty ⇒ the whole site pool.
                     &[],
+                    // no_secrets (Ask B-3 B): false ⇒ unchanged.
+                    false,
                     0,
                     None,
                     None,
@@ -7574,6 +7578,8 @@ mod tests {
                 &[],
                 // Per-guest secret allowlist (task #492): empty ⇒ the whole site pool.
                 &[],
+                // no_secrets (Ask B-3 B): false ⇒ unchanged.
+                false,
                 0,
                 None,
                 None,

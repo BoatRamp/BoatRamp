@@ -1016,6 +1016,8 @@ pub(super) async fn run_scheduler_tick(
                                 &consumer.blobstore_containers,
                                 // Per-guest secret allowlist (task #492): empty ⇒ the whole site pool.
                                 &consumer.secrets,
+                                // Consumers resolve their secrets as before (no `no_secrets` opt-out).
+                                false,
                                 0,
                                 // Background consumers have no request context to correlate with.
                                 None,
@@ -1482,6 +1484,8 @@ async fn fire_cron(
         &handler.blobstore_containers,
         // A cron-triggered handler inherits the matched handler's per-guest secret allowlist (#492).
         &handler.secrets,
+        // …and its `no_secrets` opt-out (Ask B-3 B).
+        handler.no_secrets,
         0,
         // A cron trigger has no inbound request to correlate with.
         None,

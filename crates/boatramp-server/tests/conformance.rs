@@ -1554,6 +1554,7 @@ async fn handler_route_dispatches_through_engine() {
     );
     let config = DeployConfig {
         handlers: vec![HandlerConfig {
+            no_secrets: false,
             secrets: Vec::new(),
             tenancy: None,
             token_claims: None,
@@ -1711,6 +1712,7 @@ async fn perf_host_await_overlap_repro() {
     );
     let config = DeployConfig {
         handlers: vec![HandlerConfig {
+            no_secrets: false,
             secrets: Vec::new(),
             tenancy: None,
             token_claims: None,
@@ -1933,6 +1935,7 @@ async fn serve_admission_gate_bounds_concurrency() {
             files,
             config: DeployConfig {
                 handlers: vec![HandlerConfig {
+                    no_secrets: false,
                     secrets: Vec::new(),
                     tenancy: None,
                     token_claims: None,
@@ -2147,6 +2150,7 @@ async fn latency_floor_repro() {
             files,
             config: DeployConfig {
                 handlers: vec![HandlerConfig {
+                    no_secrets: false,
                     secrets: Vec::new(),
                     // Schema load at build_bindings is UNCONDITIONAL (runs every serve regardless of
                     // the handler's tenancy); `None` keeps the anonymous serve a clean 200 while still
@@ -2317,7 +2321,12 @@ async fn secret_resolution_floor_gate() {
 
     // One warm serve of an `/img` handler whose SITE declares `n_secrets` `boatramp:` secrets, each
     // `store.get` delayed `delay_ms`. Returns (bindgap_ms, server_timing_header_present).
-    async fn measure(n_secrets: usize, delay_ms: u64, server_timing: bool) -> (f64, bool) {
+    async fn measure(
+        n_secrets: usize,
+        delay_ms: u64,
+        server_timing: bool,
+        no_secrets: bool,
+    ) -> (f64, bool) {
         let storage = Arc::new(MemStorage::default());
         let data_kv: Arc<dyn boatramp_core::kv::KvStore> = Arc::new(MemoryKv::new());
         let secret_kv: Arc<dyn boatramp_core::kv::KvStore> = Arc::new(ConcurrencyProbeKv {
@@ -2355,6 +2364,7 @@ async fn secret_resolution_floor_gate() {
             files,
             config: DeployConfig {
                 handlers: vec![HandlerConfig {
+                    no_secrets,
                     secrets: Vec::new(),
                     tenancy: None,
                     token_claims: None,
@@ -2438,7 +2448,7 @@ async fn secret_resolution_floor_gate() {
 
     // (1) CONCURRENT secret resolution: 8 secrets @ 25 ms/get. Serial would be ~200 ms; concurrent
     // is ~1 get. Generous bound (< 90 ms) so it can't flake, but far below the ~200 ms serial cost.
-    let (secretget, present) = measure(8, 25, true).await;
+    let (secretget, present) = measure(8, 25, true, false).await;
     assert!(present, "server_timing(true) must emit the header");
     assert!(
         secretget > 15.0,
@@ -2449,15 +2459,23 @@ async fn secret_resolution_floor_gate() {
         "secret resolution must be CONCURRENT — 8 SERIAL 25 ms gets would be ~200 ms; saw {secretget} \
          (a regression to the per-secret `.await`-in-a-loop)"
     );
-    // (2) Server-Timing header DEFAULT-OFF.
-    let (_off, present_off) = measure(0, 0, false).await;
+    // (2) `no_secrets` opt-out (Ask B-3 B): the SAME 8-secret site, but the handler sets
+    // `no_secrets: true` → it resolves NONE, so `secretget` is ~0 (not even one get). Proves a blob
+    // route touches the secret store zero times per serve.
+    let (secretget_none, _) = measure(8, 25, true, true).await;
+    assert!(
+        secretget_none < 5.0,
+        "a `no_secrets` handler must resolve ZERO site secrets (≈0ms), not pay even one get; saw {secretget_none}"
+    );
+    // (3) Server-Timing header DEFAULT-OFF.
+    let (_off, present_off) = measure(0, 0, false, false).await;
     assert!(
         !present_off,
         "the Server-Timing response header must be DEFAULT-OFF (absent unless set_server_timing(true))"
     );
     println!(
         "SECRET-RESOLUTION PARALLEL OK (8×25ms secrets → secretget {secretget:.1}ms, not ~200ms serial); \
-         SERVER-TIMING DEFAULT-OFF OK"
+         NO-SECRETS SCOPE OK (no_secrets → {secretget_none:.1}ms); SERVER-TIMING DEFAULT-OFF OK"
     );
 }
 
@@ -2497,6 +2515,7 @@ async fn cookie_auth_csrf_gate_fires_in_the_pipeline() {
     );
     let config = DeployConfig {
         handlers: vec![HandlerConfig {
+            no_secrets: false,
             secrets: Vec::new(),
             tenancy: None,
             token_claims: None,
@@ -4088,6 +4107,7 @@ async fn activation_during_traffic_drops_no_requests() {
         },
     );
     let handler = HandlerConfig {
+        no_secrets: false,
         secrets: Vec::new(),
         tenancy: None,
         token_claims: None,
@@ -4256,6 +4276,7 @@ async fn preview_runs_handlers_scoped_off_live_state() {
         files,
         config: DeployConfig {
             handlers: vec![HandlerConfig {
+                no_secrets: false,
                 secrets: Vec::new(),
                 tenancy: None,
                 token_claims: None,
@@ -4386,6 +4407,7 @@ async fn activation_refuses_broken_component() {
         files,
         config: DeployConfig {
             handlers: vec![HandlerConfig {
+                no_secrets: false,
                 secrets: Vec::new(),
                 tenancy: None,
                 token_claims: None,
@@ -4626,6 +4648,7 @@ async fn activation_refuses_disallowed_import() {
         files,
         config: DeployConfig {
             handlers: vec![HandlerConfig {
+                no_secrets: false,
                 secrets: Vec::new(),
                 tenancy: None,
                 token_claims: None,
@@ -4733,6 +4756,7 @@ async fn activation_refuses_oversized_component() {
         files,
         config: DeployConfig {
             handlers: vec![HandlerConfig {
+                no_secrets: false,
                 secrets: Vec::new(),
                 tenancy: None,
                 token_claims: None,
@@ -4843,6 +4867,7 @@ async fn handler_route_with_sql_dispatches_through_engine() {
         files,
         config: DeployConfig {
             handlers: vec![HandlerConfig {
+                no_secrets: false,
                 secrets: Vec::new(),
                 tenancy: None,
                 token_claims: None,
@@ -4977,6 +5002,7 @@ async fn handler_opens_named_sql_databases_with_least_privilege() {
         files,
         config: DeployConfig {
             handlers: vec![HandlerConfig {
+                no_secrets: false,
                 secrets: Vec::new(),
                 tenancy: None,
                 token_claims: None,
@@ -5109,6 +5135,7 @@ async fn per_site_timeout_cap_applies() {
         files,
         config: DeployConfig {
             handlers: vec![HandlerConfig {
+                no_secrets: false,
                 secrets: Vec::new(),
                 tenancy: None,
                 token_claims: None,
@@ -5627,6 +5654,7 @@ async fn operator_endpoint_reports_invocation_and_consumer_stats() {
         files,
         config: DeployConfig {
             handlers: vec![HandlerConfig {
+                no_secrets: false,
                 secrets: Vec::new(),
                 tenancy: None,
                 token_claims: None,
@@ -5788,6 +5816,7 @@ async fn guest_logs_captured_and_served() {
         files,
         config: DeployConfig {
             handlers: vec![HandlerConfig {
+                no_secrets: false,
                 secrets: Vec::new(),
                 tenancy: None,
                 token_claims: None,
@@ -5926,6 +5955,7 @@ async fn guest_logs_suppressed_when_capture_disabled() {
         files,
         config: DeployConfig {
             handlers: vec![HandlerConfig {
+                no_secrets: false,
                 secrets: Vec::new(),
                 tenancy: None,
                 token_claims: None,
@@ -6126,6 +6156,7 @@ async fn handler_env_injected_host_env_not_inherited() {
         files,
         config: DeployConfig {
             handlers: vec![HandlerConfig {
+                no_secrets: false,
                 tenancy: None,
                 token_claims: None,
                 route: "/env".to_string(),
@@ -6254,6 +6285,7 @@ async fn handler_secret_allowlist_scopes_the_site_pool_end_to_end() {
             files,
             config: DeployConfig {
                 handlers: vec![HandlerConfig {
+                    no_secrets: false,
                     tenancy: None,
                     token_claims: None,
                     route: "/env".to_string(),
@@ -7810,6 +7842,7 @@ async fn mesh_dispatch(
         files,
         config: DeployConfig {
             handlers: vec![HandlerConfig {
+                no_secrets: false,
                 secrets: Vec::new(),
                 tenancy: None,
                 token_claims: None,
@@ -8000,6 +8033,7 @@ async fn federation_gateway_stitches_real_subgraph_functions() {
         files,
         config: DeployConfig {
             handlers: vec![HandlerConfig {
+                no_secrets: false,
                 secrets: Vec::new(),
                 tenancy: None,
                 token_claims: None,
@@ -8188,6 +8222,7 @@ async fn gateway_admission_gate_bounds_concurrency() {
             files,
             config: DeployConfig {
                 handlers: vec![HandlerConfig {
+                    no_secrets: false,
                     secrets: Vec::new(),
                     tenancy: None,
                     token_claims: None,
@@ -8338,6 +8373,7 @@ async fn federation_gateway_executes_a_mutation_forwarding_its_argument() {
         files,
         config: DeployConfig {
             handlers: vec![HandlerConfig {
+                no_secrets: false,
                 secrets: Vec::new(),
                 tenancy: None,
                 token_claims: None,
@@ -8472,6 +8508,7 @@ async fn graphql_edge_is_scoped_to_the_endpoint_route_not_the_whole_site() {
         },
     );
     let handler_on = |route: &str| HandlerConfig {
+        no_secrets: false,
         secrets: Vec::new(),
         tenancy: None,
         token_claims: None,
@@ -8710,6 +8747,7 @@ async fn edge_visibility_hides_an_internal_op_from_the_external_edge() {
         files,
         config: DeployConfig {
             handlers: vec![HandlerConfig {
+                no_secrets: false,
                 secrets: Vec::new(),
                 tenancy: None,
                 token_claims: None,
@@ -8930,6 +8968,7 @@ async fn graphql_data_connector_serves_from_the_database_with_row_isolation() {
         files,
         config: DeployConfig {
             handlers: vec![HandlerConfig {
+                no_secrets: false,
                 secrets: Vec::new(),
                 tenancy: None,
                 token_claims: None,
@@ -9182,6 +9221,7 @@ async fn graphql_data_connector_delegates_a_field_to_a_wasm_function() {
         files,
         config: DeployConfig {
             handlers: vec![HandlerConfig {
+                no_secrets: false,
                 secrets: Vec::new(),
                 tenancy: None,
                 token_claims: None,
@@ -9333,6 +9373,7 @@ async fn graphql_data_connector_mutations_write_with_row_isolation() {
         files,
         config: DeployConfig {
             handlers: vec![HandlerConfig {
+                no_secrets: false,
                 secrets: Vec::new(),
                 tenancy: None,
                 token_claims: None,
@@ -9553,6 +9594,7 @@ async fn federation_composes_a_sql_subgraph_with_a_wasm_subgraph() {
         files,
         config: DeployConfig {
             handlers: vec![HandlerConfig {
+                no_secrets: false,
                 secrets: Vec::new(),
                 tenancy: None,
                 token_claims: None,
@@ -9708,6 +9750,7 @@ async fn registering_a_sql_subgraph_via_the_admin_api_composes_and_serves() {
         files,
         config: DeployConfig {
             handlers: vec![HandlerConfig {
+                no_secrets: false,
                 secrets: Vec::new(),
                 tenancy: None,
                 token_claims: None,
@@ -9962,6 +10005,7 @@ async fn graphql_data_connector_isolates_by_a_verified_app_token_claim() {
         files,
         config: DeployConfig {
             handlers: vec![HandlerConfig {
+                no_secrets: false,
                 secrets: Vec::new(),
                 tenancy: None,
                 token_claims: None,

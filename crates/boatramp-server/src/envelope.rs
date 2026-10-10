@@ -260,6 +260,59 @@ mod tests {
         assert_eq!(e.unwrap(&wrapped).await.unwrap(), secret);
     }
 
+    /// LOCAL diagnostic for image-serve-latency Ask B-3 follow-up Ask (A): construens measured
+    /// `secret_env_us` ≈ 313 ms resolving ~18 `boatramp:` secrets per serve, yet a block-cached
+    /// control-plane get is ~8µs. This times the FULL real per-secret path — `SecretStore::get`
+    /// (KV point-get + JSON decode) + the REAL `LocalKek` AES-256-GCM unseal — for 18 secrets fetched
+    /// CONCURRENTLY, over an INSTANT in-memory KV. If this is sub-millisecond (it is), the 313 ms is NOT
+    /// the envelope or the get-path code — it's environmental: 18 COLD secret-block reads on construens'
+    /// network `/data` volume (blocks not retained in the block cache under the node's memory pressure).
+    /// The fix is therefore to stop reading unused/cold secrets per serve (scope to the component /
+    /// resolved-env cache), not to speed a get that is already µs.
+    ///
+    /// Run: `cargo test -p boatramp-server secret_resolve_cost_is_microseconds -- --ignored --nocapture`
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "diagnostic; run with --ignored --nocapture"]
+    async fn secret_resolve_cost_is_microseconds() {
+        use boatramp_core::kv::MemoryKv;
+        use boatramp_core::project::ProjectRef;
+        use boatramp_core::secret_store::SecretStore;
+        use std::sync::Arc;
+
+        let store = SecretStore::new(Arc::new(MemoryKv::new()), Arc::new(kek()));
+        // 18 secrets, like construens' console site (IDP + social refs).
+        let names: Vec<String> = (0..18).map(|i| format!("sec{i:02}")).collect();
+        for n in &names {
+            store
+                .set(
+                    ProjectRef::DEFAULT,
+                    n,
+                    b"a-realistic-oauth-client-secret-value",
+                )
+                .await
+                .unwrap();
+        }
+        // Warm, then time N concurrent gets (the real get + AES-GCM unseal), as resolve_env does.
+        let _ = futures::future::join_all(names.iter().map(|n| store.get(ProjectRef::DEFAULT, n)))
+            .await;
+        let mut samples = Vec::new();
+        for _ in 0..200 {
+            let t = std::time::Instant::now();
+            let got =
+                futures::future::join_all(names.iter().map(|n| store.get(ProjectRef::DEFAULT, n)))
+                    .await;
+            samples.push(t.elapsed());
+            assert!(got.iter().all(|r| matches!(r, Ok(Some(_)))));
+        }
+        samples.sort();
+        println!(
+            "SECRET-RESOLVE {} secrets concurrent (real LocalKek AES-GCM + instant KV): p50={:?} p99={:?}",
+            names.len(),
+            samples[samples.len() / 2],
+            samples[samples.len() * 99 / 100],
+        );
+    }
+
     #[tokio::test]
     async fn nonce_is_random_so_ciphertext_differs() {
         let e = kek();
