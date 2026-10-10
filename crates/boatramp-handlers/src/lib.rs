@@ -8,6 +8,7 @@
 
 #[cfg(feature = "engine")]
 mod bindings;
+pub mod concurrency;
 #[cfg(feature = "engine")]
 mod engine;
 /// Host-side observability for the wasm component instance lifecycle (warm/cold/evict + durations).
@@ -40,6 +41,7 @@ pub(crate) fn pass_mutation() -> Option<String> {
 pub use bindings::Bindings;
 #[cfg(feature = "admin")]
 pub use bindings::admin::{AdminController, AdminError, DomainChallenge, Surface as AdminSurface};
+pub use concurrency::KeyedSemaphores;
 // M5 gate helper: read a blob back through the REAL guest `wasi:blobstore` read-path (proves S3-ingress
 // guest read-through). `#[doc(hidden)]` — for the live gate + integration tests only.
 #[cfg(feature = "blob-upload")]

@@ -460,6 +460,15 @@ pub(super) async fn dispatch_handler(
         .query()
         .and_then(|q| query_value(q, "handle"))
         .map(str::to_string);
+    // Ask B: per-COMPONENT serve-admission. Acquire a permit (keyed by component hash) BEFORE the
+    // expensive `build_bindings` + instantiate + serve-to-head region and hold it until this function
+    // returns the head (the body then streams on its own task, not holding the permit). So at most
+    // `serve_concurrency` requests per component are ever in that region at once; a burst beyond it
+    // (a gallery firing ~48 `/img` thumbnails) queues cheaply on the semaphore rather than
+    // oversubscribing the tokio workers — the fix for the measured multi-second `bindgap` park. The
+    // gate is disabled (`None`, legacy unbounded) when `serve_concurrency` is 0. Cancellation-safe:
+    // if the client hangs up, this future is dropped and the permit is released / never taken.
+    let _admission = acquire_component_admission(inner, &entry.hash).await;
     // Ask-1: a per-request blob-op timing handle; `build_bindings` wraps the `wasi:blobstore` storage in
     // a `TimingStorage` writing into it, and we snapshot it after `serve_lane` to fold the blob GET/HEAD
     // µs into the phase log (otherwise hidden inside `serve_us`).

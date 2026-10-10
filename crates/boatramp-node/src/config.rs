@@ -1445,6 +1445,18 @@ pub struct HandlersConfig {
     /// containers, so the default is generous headroom.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blob_marker_cache_entries: Option<usize>,
+    /// **Per-component serve-admission concurrency** (image-serve-latency Ask B). Caps how many
+    /// requests to the SAME component (keyed by content hash) are concurrently inside the expensive
+    /// `build_bindings` + instantiate + serve-to-head region; a burst beyond it (e.g. a gallery firing
+    /// dozens of `/img` thumbnails) queues cheaply on a semaphore instead of oversubscribing the tokio
+    /// workers, which on a small-core node makes each request's await-resumptions pile up into a
+    /// multi-second scheduling stall (the measured `bindgap`). Absent ⇒ a host-parallelism default
+    /// (`available_parallelism * 4`, floored at 8) so a small node is bounded out of the box; `0`
+    /// disables the gate (legacy unbounded serve). Raise it on a big node, or lower it if one hot
+    /// component should be tighter; `/api/instance-stats` + the `bindgap` Server-Timing phase make the
+    /// right value measurable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serve_concurrency: Option<usize>,
     /// Engine-wide **safety max** on a *connection-bearing* invocation (a site
     /// handler or a synchronous function/webhook invoke), milliseconds. A route
     /// or function may declare a *lower* timeout, never a higher one. Kept tight

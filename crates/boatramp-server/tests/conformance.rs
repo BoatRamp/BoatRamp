@@ -1643,6 +1643,366 @@ async fn handler_route_dispatches_through_engine() {
     assert_eq!(kv.get("hkv/blog/hits").await.unwrap(), Some(b"2".to_vec()));
 }
 
+/// A `KvStore` that sleeps `delay` before each `get`/`put`, modeling slow host-mediated I/O (a remote
+/// blob/KV op) WITHOUT a network — so a serve diagnostic can see whether a guest's host-import `.await`
+/// yields its worker thread (N slow ops overlap ⇒ ~one delay) or holds it (serialize to ceil(N/workers)
+/// waves). Delegates to an inner `MemoryKv`.
+#[cfg(feature = "handlers")]
+struct LatencyKv {
+    inner: boatramp_core::kv::MemoryKv,
+    delay: std::time::Duration,
+}
+
+#[cfg(feature = "handlers")]
+#[async_trait::async_trait]
+impl boatramp_core::kv::KvStore for LatencyKv {
+    async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, boatramp_core::kv::KvError> {
+        tokio::time::sleep(self.delay).await;
+        self.inner.get(key).await
+    }
+    async fn put(&self, key: &str, value: Vec<u8>) -> Result<(), boatramp_core::kv::KvError> {
+        tokio::time::sleep(self.delay).await;
+        self.inner.put(key, value).await
+    }
+    async fn delete(&self, key: &str) -> Result<(), boatramp_core::kv::KvError> {
+        self.inner.delete(key).await
+    }
+    async fn list_prefix(&self, prefix: &str) -> Result<Vec<String>, boatramp_core::kv::KvError> {
+        self.inner.list_prefix(prefix).await
+    }
+}
+
+/// DIAGNOSTIC (`--ignored`): serve `kv-counter` (host `get`+`put` per request) through the REAL
+/// dispatch at increasing concurrency on a **2-worker** runtime, with a `LatencyKv` injecting 200 ms
+/// per op. Isolates the one untested path: does a guest's host-import `.await` (the blob/KV I/O) YIELD
+/// its worker thread so N slow requests overlap (~400 ms total regardless of N), or HOLD it so they
+/// serialize to ceil(N/2) waves (~N/2 × 400 ms)? The `/img` blob read is the same host-await shape.
+#[cfg(feature = "handlers")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "diagnostic: prints timings"]
+async fn perf_host_await_overlap_repro() {
+    use boatramp_core::config::{HandlerConfig, HandlersSiteConfig};
+    use boatramp_handlers::{HandlerEngine, Limits};
+    use std::time::Instant;
+
+    const KV_COUNTER: &[u8] =
+        include_bytes!("../../boatramp-handlers/tests/fixtures/kv-counter.wasm");
+
+    let storage = Arc::new(MemStorage::default());
+    let cp_kv = Arc::new(MemoryKv::new());
+    let data_kv: Arc<dyn boatramp_core::kv::KvStore> = Arc::new(LatencyKv {
+        inner: MemoryKv::new(),
+        delay: std::time::Duration::from_millis(200),
+    });
+    let deploy = DeployStore::new(storage.clone(), cp_kv.clone());
+    let hash = sha256_hex(KV_COUNTER);
+    let stream: ByteStream =
+        futures::stream::once(async move { Ok(bytes::Bytes::from_static(KV_COUNTER)) }).boxed();
+    deploy.put_blob(&hash, stream).await.unwrap();
+    let mut files = BTreeMap::new();
+    files.insert(
+        "c.wasm".to_string(),
+        FileEntry {
+            hash: hash.clone(),
+            size: KV_COUNTER.len() as u64,
+            content_type: None,
+            variants: BTreeMap::new(),
+        },
+    );
+    let config = DeployConfig {
+        handlers: vec![HandlerConfig {
+            secrets: Vec::new(),
+            tenancy: None,
+            token_claims: None,
+            route: "/count".to_string(),
+            methods: Vec::new(),
+            component: "c.wasm".to_string(),
+            imports: vec!["wasi:keyvalue".to_string()],
+            streaming: false,
+            limits: None,
+            env: BTreeMap::new(),
+            invoke_targets: Vec::new(),
+            stats_topics: Vec::new(),
+            tenant_secret_names: Vec::new(),
+            upload_containers: Vec::new(),
+            blobstore_containers: Vec::new(),
+        }],
+        ..Default::default()
+    };
+    let manifest = Manifest {
+        files,
+        config,
+        ..Default::default()
+    };
+    let id = deploy.put_manifest(&manifest).await.unwrap();
+    deploy
+        .activate(ProjectRef::DEFAULT, "blog", &id)
+        .await
+        .unwrap();
+    deploy
+        .set_site_config(
+            ProjectRef::DEFAULT,
+            "blog",
+            &SiteConfig {
+                handlers: Some(HandlersSiteConfig {
+                    enabled: true,
+                    allow_imports: vec!["wasi:keyvalue".to_string()],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
+    let runtime = HandlerRuntime::new(engine, data_kv, storage, None, None);
+    let app = router(deploy, Auth::disabled(), runtime);
+
+    let fire = |app: axum::Router| async move {
+        let mut req = Request::builder()
+            .method("GET")
+            .uri("/_sites/blog/count")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40000))));
+        let t = Instant::now();
+        let resp = app.oneshot(req).await.unwrap();
+        let st = resp
+            .headers()
+            .get("server-timing")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        (t.elapsed().as_secs_f64() * 1000.0, st)
+    };
+    let dur = |st: &Option<String>, name: &str| -> f64 {
+        st.as_deref()
+            .and_then(|s| {
+                s.split(',').find_map(|p| {
+                    p.trim()
+                        .strip_prefix(&format!("{name};dur="))
+                        .and_then(|v| v.parse::<f64>().ok())
+                })
+            })
+            .unwrap_or(f64::NAN)
+    };
+    let _ = fire(app.clone()).await; // warm
+
+    println!("\n==== perf_host_await_overlap_repro (kv-counter, 200ms/op, worker_threads=2) ====");
+    println!("(overlap ⇒ total ~= one request; serialize ⇒ total ~= ceil(N/2) × one request)");
+    for n in [1usize, 2, 8, 24, 48] {
+        let start = Instant::now();
+        let handles: Vec<_> = (0..n).map(|_| tokio::spawn(fire(app.clone()))).collect();
+        let results = futures::future::join_all(handles).await;
+        let wall = start.elapsed().as_secs_f64() * 1000.0;
+        let mut serves: Vec<f64> = results
+            .iter()
+            .map(|r| dur(&r.as_ref().unwrap().1, "serve"))
+            .collect();
+        serves.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let p = |q: f64| serves[((serves.len() as f64 - 1.0) * q) as usize];
+        println!(
+            "N={n:>2}  wall={wall:8.1}ms  serve[p50={:8.1} p99={:8.1} max={:8.1}] ms",
+            p(0.5),
+            p(0.99),
+            p(1.0),
+        );
+    }
+    println!("==== end ====\n");
+}
+
+/// A `KvStore` that records the MAX number of host KV ops running concurrently. Each op bumps an
+/// in-flight counter (recording the running max), sleeps briefly so overlap is observable, then
+/// decrements. A guest's host-KV op runs INSIDE the serve region (after the serve-admission permit is
+/// acquired), so "max concurrent KV ops" is a faithful proxy for "max concurrent serves of this
+/// component" — which the Ask-B admission gate caps.
+#[cfg(feature = "handlers")]
+struct ConcurrencyProbeKv {
+    inner: boatramp_core::kv::MemoryKv,
+    inflight: Arc<std::sync::atomic::AtomicUsize>,
+    max_seen: Arc<std::sync::atomic::AtomicUsize>,
+    delay: std::time::Duration,
+}
+
+#[cfg(feature = "handlers")]
+impl ConcurrencyProbeKv {
+    async fn enter(&self) {
+        use std::sync::atomic::Ordering::SeqCst;
+        let n = self.inflight.fetch_add(1, SeqCst) + 1;
+        self.max_seen.fetch_max(n, SeqCst);
+        tokio::time::sleep(self.delay).await;
+    }
+    fn exit(&self) {
+        self.inflight
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[cfg(feature = "handlers")]
+#[async_trait::async_trait]
+impl boatramp_core::kv::KvStore for ConcurrencyProbeKv {
+    async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, boatramp_core::kv::KvError> {
+        self.enter().await;
+        let r = self.inner.get(key).await;
+        self.exit();
+        r
+    }
+    async fn put(&self, key: &str, value: Vec<u8>) -> Result<(), boatramp_core::kv::KvError> {
+        self.enter().await;
+        let r = self.inner.put(key, value).await;
+        self.exit();
+        r
+    }
+    async fn delete(&self, key: &str) -> Result<(), boatramp_core::kv::KvError> {
+        self.inner.delete(key).await
+    }
+    async fn list_prefix(&self, prefix: &str) -> Result<Vec<String>, boatramp_core::kv::KvError> {
+        self.inner.list_prefix(prefix).await
+    }
+}
+
+/// CI PERF GATE (image-serve-latency Ask B): the per-component serve-admission gate must BOUND how many
+/// requests to one component run the serve region concurrently. This is the fix for the measured
+/// `bindgap` scheduling park — a gallery firing N requests at one component must admit at most
+/// `serve_concurrency` into the expensive region and queue the rest, instead of putting N dispatch
+/// tasks on the workers at once.
+///
+/// Deterministic (no timing assertion): a `ConcurrencyProbeKv` records the max concurrent host-KV ops,
+/// which equals the max concurrent serves (the KV op runs after the admission permit is held). We fire
+/// N=8 concurrent requests at ONE component and assert:
+///   - with the gate at cap=2, max concurrent serves ≤ 2 (the gate bounds it);
+///   - with the gate DISABLED (cap=0), max concurrent serves > 2 (reaches well above — proving the gate
+///     is what bounds it, not some other limit, and that disabling it restores legacy unbounded serve).
+/// The marker `SERVE-ADMISSION-GATE OK` is grepped by capability.yml so a regression that silently
+/// stops bounding concurrency fails CI loudly.
+#[cfg(feature = "handlers")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn serve_admission_gate_bounds_concurrency() {
+    use boatramp_core::config::{HandlerConfig, HandlersSiteConfig};
+    use boatramp_handlers::{HandlerEngine, Limits};
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+
+    const KV_COUNTER: &[u8] =
+        include_bytes!("../../boatramp-handlers/tests/fixtures/kv-counter.wasm");
+    const N: usize = 8;
+
+    // Returns the max concurrent serves observed when firing N requests at one component with the
+    // runtime's serve-admission cap set to `cap` (0 = gate disabled).
+    async fn max_concurrent_serves(cap: usize) -> usize {
+        let storage = Arc::new(MemStorage::default());
+        let cp_kv = Arc::new(MemoryKv::new());
+        let max_seen = Arc::new(AtomicUsize::new(0));
+        let data_kv: Arc<dyn boatramp_core::kv::KvStore> = Arc::new(ConcurrencyProbeKv {
+            inner: MemoryKv::new(),
+            inflight: Arc::new(AtomicUsize::new(0)),
+            max_seen: max_seen.clone(),
+            delay: std::time::Duration::from_millis(40),
+        });
+        let deploy = DeployStore::new(storage.clone(), cp_kv.clone());
+        let hash = sha256_hex(KV_COUNTER);
+        let stream: ByteStream =
+            futures::stream::once(async move { Ok(bytes::Bytes::from_static(KV_COUNTER)) }).boxed();
+        deploy.put_blob(&hash, stream).await.unwrap();
+        let mut files = BTreeMap::new();
+        files.insert(
+            "c.wasm".to_string(),
+            FileEntry {
+                hash: hash.clone(),
+                size: KV_COUNTER.len() as u64,
+                content_type: None,
+                variants: BTreeMap::new(),
+            },
+        );
+        let manifest = Manifest {
+            files,
+            config: DeployConfig {
+                handlers: vec![HandlerConfig {
+                    secrets: Vec::new(),
+                    tenancy: None,
+                    token_claims: None,
+                    route: "/count".to_string(),
+                    methods: Vec::new(),
+                    component: "c.wasm".to_string(),
+                    imports: vec!["wasi:keyvalue".to_string()],
+                    streaming: false,
+                    limits: None,
+                    env: BTreeMap::new(),
+                    invoke_targets: Vec::new(),
+                    stats_topics: Vec::new(),
+                    tenant_secret_names: Vec::new(),
+                    upload_containers: Vec::new(),
+                    blobstore_containers: Vec::new(),
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let id = deploy.put_manifest(&manifest).await.unwrap();
+        deploy
+            .activate(ProjectRef::DEFAULT, "blog", &id)
+            .await
+            .unwrap();
+        deploy
+            .set_site_config(
+                ProjectRef::DEFAULT,
+                "blog",
+                &SiteConfig {
+                    handlers: Some(HandlersSiteConfig {
+                        enabled: true,
+                        allow_imports: vec!["wasi:keyvalue".to_string()],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
+        let runtime = HandlerRuntime::new(engine, data_kv, storage, None, None);
+        runtime.set_serve_concurrency(cap);
+        let app = router(deploy, Auth::disabled(), runtime);
+
+        // Warm the compile cache once so the burst is all-warm (and the probe isn't skewed by a cold
+        // compile). Then fire N concurrent requests at the ONE component.
+        let fire = |app: axum::Router| async move {
+            let mut req = Request::builder()
+                .method("GET")
+                .uri("/_sites/blog/count")
+                .body(Body::empty())
+                .unwrap();
+            req.extensions_mut()
+                .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40000))));
+            let resp = app.oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        };
+        fire(app.clone()).await;
+        max_seen.store(0, SeqCst); // ignore the warm-up request
+        let handles: Vec<_> = (0..N).map(|_| tokio::spawn(fire(app.clone()))).collect();
+        for h in handles {
+            h.await.unwrap();
+        }
+        max_seen.load(SeqCst)
+    }
+
+    let gated = max_concurrent_serves(2).await;
+    let unbounded = max_concurrent_serves(0).await;
+
+    assert!(
+        gated <= 2,
+        "serve-admission gate (cap=2) must bound concurrent serves to ≤ 2, saw {gated}"
+    );
+    assert!(
+        unbounded > 2,
+        "with the gate disabled (cap=0), {N} concurrent requests must reach > 2 concurrent serves \
+         (proving the gate — not some other limit — is what bounds it); saw {unbounded}"
+    );
+    println!(
+        "SERVE-ADMISSION-GATE OK (cap=2 → max {gated} concurrent serves; disabled → max {unbounded} of {N})"
+    );
+}
+
 /// Browser cookie session auth through the real `router()` → dispatch: a cookie-authenticated
 /// request is CSRF-checked against the configured origins *before* the handler runs, and a
 /// same-origin one passes through. (The cookie value becomes a standard `Authorization: Bearer`

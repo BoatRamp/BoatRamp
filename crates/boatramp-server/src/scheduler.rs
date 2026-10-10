@@ -1632,13 +1632,48 @@ pub(super) fn acquire_site_permit(
     let Some(max) = site_handlers.max_concurrency else {
         return Ok(None);
     };
-    let semaphore = {
-        let mut map = inner.site_semaphores.lock().unwrap();
-        map.entry(site.to_string())
-            .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(max as usize)))
-            .clone()
-    };
-    semaphore.try_acquire_owned().map(Some).map_err(|_| ())
+    // `KeyedSemaphores::gate` re-sizes the gate if `max` changed since last use, so a `maxConcurrency`
+    // reload takes effect without a restart. `try_acquire` keeps the shed-to-503 semantics unchanged.
+    inner
+        .site_semaphores
+        .gate(site, max as usize)
+        .try_acquire_owned()
+        .map(Some)
+        .map_err(|_| ())
+}
+
+/// Acquire a permit from the per-COMPONENT serve-admission gate (image-serve-latency Ask B), keyed by
+/// component blob `hash`, created on first use and sized to the effective
+/// [`serve_admission_cap`](crate::HandlerRuntimeInner::serve_admission_cap). `Ok(None)` when the gate
+/// is disabled (cap `0`) — byte-for-byte the legacy unbounded path.
+///
+/// Unlike [`acquire_site_permit`] (a `try_acquire` that 503s a site over its own declared cap), this
+/// **waits** (`acquire_owned().await`): a request over the per-component budget parks cheaply on the
+/// semaphore (no polling, so it does not add to the tokio-worker thrash that causes the `bindgap`
+/// park) and is admitted in turn. It is acquired BEFORE `build_bindings` and held through serve-to-head
+/// (dropped once the head is produced; the body streams afterward on its own task), so at most `cap`
+/// requests are ever inside the expensive region per component. The queue depth is bounded upstream by
+/// the edge/site concurrency caps, so the wait cannot pile up without limit. On a cancelled request
+/// (client hangup) the future is dropped and the permit is never acquired / is released — no leak.
+#[cfg(feature = "handlers")]
+pub(super) async fn acquire_component_admission(
+    inner: &HandlerRuntimeInner,
+    hash: &str,
+) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    let cap = inner.serve_admission_cap();
+    if cap == 0 {
+        return None;
+    }
+    // The per-component `Arc<Semaphore>` lives in the engine (co-located with the other per-component
+    // state); `gate` resolves it synchronously (no lock across the await below) and re-sizes it if the
+    // cap changed. The semaphore is never closed, so `acquire_owned` only errors on close — treat that
+    // as "no gate" (fail-open: never turn an admission-gate quirk into a dropped request).
+    inner
+        .engine
+        .serve_admission(hash, cap)
+        .acquire_owned()
+        .await
+        .ok()
 }
 
 /// Map a handler engine error to an HTTP status.

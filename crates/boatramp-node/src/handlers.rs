@@ -262,6 +262,11 @@ pub async fn build_handler_runtime(
     // Apply the posture's host-side blob cap + component-size cap.
     runtime.set_max_blob_bytes(max_blob_bytes);
     runtime.set_max_component_bytes(max_component_bytes);
+    // Per-component serve-admission cap (image-serve-latency Ask B). Only override the host-parallelism
+    // default when the operator set `[handlers] serve_concurrency` explicitly (incl. `0` to disable).
+    if let Some(cap) = handlers_cfg.and_then(|h| h.serve_concurrency) {
+        runtime.set_serve_concurrency(cap);
+    }
     // Event-driven delivery cadences (B17): the two operator `[handlers]` knobs (absent ⇒ default).
     // Pure latency/idle-cost tradeoff — never affects at-least-once.
     {
