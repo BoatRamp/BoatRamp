@@ -91,3 +91,67 @@ async fn s3_round_trip_and_range() {
         Err(StorageError::NotFound(_))
     ));
 }
+
+/// DIAGNOSTIC (`--ignored`): does a concurrent burst of small-object GETs through the S3 backend keep
+/// per-GET latency flat, or does it balloon (serialize)? This is the `/img` serve leg — the real
+/// suspect once `build_bindings` and the pipeline were proven flat. Seeds a ~12 KB object (a webp
+/// derivative), warms one connection, then fires N concurrent `get_range` for N in 1..48, printing the
+/// per-GET latency distribution + wall-clock. Flat per-GET as N grows ⇒ the client parallelizes fine
+/// (any remote slowness is network/TLS); ballooning per-GET ⇒ the client serializes (a pool cap / lock).
+/// Point `BOATRAMP_TEST_S3_ENDPOINT` at minio (localhost: isolates the client) or at Tigris (real
+/// network). Run with the same env as `s3_round_trip_and_range`, plus ` -- --ignored --nocapture`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "diagnostic: concurrent-GET latency vs concurrency"]
+async fn s3_concurrency_repro() {
+    use std::time::Instant;
+    let Some(options) = options() else {
+        eprintln!("skip: set BOATRAMP_TEST_S3_ENDPOINT + BOATRAMP_TEST_S3_BUCKET (+ AWS_* creds)");
+        return;
+    };
+    let storage = std::sync::Arc::new(S3Storage::connect(options).await);
+    let key = "zz/der-repro-12k.webp";
+    let payload = vec![0x42u8; 12 * 1024];
+    let seed = payload.clone();
+    let body: ByteStream =
+        futures::stream::once(async move { Ok(bytes::Bytes::from(seed)) }).boxed();
+    storage.put(key, body, PutMeta::default()).await.unwrap();
+    // Warm one connection (first GET pays TLS/connect).
+    let _ = collect(storage.get(key).await.unwrap().body).await;
+
+    println!(
+        "\n==== s3_concurrency_repro ({} B object) ====",
+        payload.len()
+    );
+    for n in [1usize, 4, 8, 16, 32, 48] {
+        let start = Instant::now();
+        let handles: Vec<_> = (0..n)
+            .map(|_| {
+                let s = storage.clone();
+                let k = key.to_string();
+                tokio::spawn(async move {
+                    let t = Instant::now();
+                    let obj = s.get_range(&k, 0, None).await.expect("get_range");
+                    let got = collect(obj.body).await;
+                    assert_eq!(got.len(), 12 * 1024);
+                    t.elapsed().as_secs_f64() * 1000.0
+                })
+            })
+            .collect();
+        let mut ms: Vec<f64> = futures::future::join_all(handles)
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+        let wall = start.elapsed().as_secs_f64() * 1000.0;
+        ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let p = |q: f64| ms[((ms.len() as f64 - 1.0) * q) as usize];
+        println!(
+            "N={n:>2}  wall={wall:8.1}ms  per_get[p50={:8.1} p99={:8.1} max={:8.1}] ms",
+            p(0.5),
+            p(0.99),
+            p(1.0),
+        );
+    }
+    storage.delete(key).await.ok();
+    println!("==== end ====\n");
+}
