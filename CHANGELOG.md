@@ -40,9 +40,10 @@ change.
   the workers the same way (measured on the live node: subgraph fanout ~17ms→~1s at 24 concurrent).
   The gateway entry now takes the same admission permit, keyed per project, with the same
   self-egress exemption. `serve_concurrency` bounds both the handler and the gateway paths.
-- A deterministic CI merge-gate (`SERVE-ADMISSION-GATE OK`) proves the admission bound holds (max
-  concurrent serves ≤ cap enabled, > cap disabled), so a regression that silently drops the gate fails
-  the merge.
+- Deterministic CI merge-gates prove the admission bound holds on BOTH paths — `SERVE-ADMISSION-GATE
+  OK` for the `/img` plain handler and `GATEWAY-ADMISSION-GATE OK` for the federated `/graphql` gateway
+  (each: max concurrent serves ≤ cap enabled, > cap disabled) — so a regression that silently drops
+  either gate fails the merge.
 
 > **Upgrade note — the serve-admission gate is ON by default.** A component that previously sustained
 > more than `available_parallelism × 4` (min 8) concurrent requests now queues the excess (bounded
