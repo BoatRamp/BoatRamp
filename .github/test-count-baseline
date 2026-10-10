@@ -11,4 +11,4 @@ SERVER_FEATURES_MIN=332
 # `test-handlers` lane: `cargo test -p boatramp-handlers --all-features` (the wasm handler engine's
 # unit + `tests/serve.rs` integration surface — closes the nightly-only blind spot that let two stale
 # serve consumer-error asserts sit red unnoticed).
-HANDLERS_MIN=218
+HANDLERS_MIN=224

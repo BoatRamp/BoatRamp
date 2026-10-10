@@ -1012,6 +1012,17 @@ impl HandlerRuntime {
         }
     }
 
+    /// The EFFECTIVE per-component serve-admission cap (the operator's `[handlers] serve_concurrency`,
+    /// else the host-parallelism default; `0` ⇒ disabled). The node logs this at startup so an
+    /// operator can correlate a post-upgrade latency change to the default-on gate.
+    #[cfg(feature = "handlers")]
+    pub fn serve_concurrency(&self) -> usize {
+        self.inner
+            .as_ref()
+            .map(|i| i.serve_admission_cap())
+            .unwrap_or(0)
+    }
+
     /// Record the node's data directory (the volume holding the SlateDB KV, managed PGDATA, and the
     /// secrets KEK). Set once at serve startup; the node-health endpoint reads its filesystem headroom.
     #[cfg(feature = "handlers")]
