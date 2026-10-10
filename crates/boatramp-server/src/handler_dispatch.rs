@@ -649,8 +649,16 @@ pub(super) async fn dispatch_handler(
     // load; `binding_build_us` = the remainder (every `.with_*` construction, incl. messaging); and
     // `messaging_build_us` (⊆ binding_build) isolates the one binding that does per-request async work
     // (`mint_producer_context`). Together they answer "is the cost auth/tenancy, or a binding build?".
-    let (resolve_us, messaging_build_us) = bindings_timing.snapshot();
+    let (resolve_us, messaging_build_us, blobstore_build_us) = bindings_timing.snapshot();
     let binding_build_us = bindings_us.saturating_sub(resolve_us);
+    // Ask B-2: the part of `binding_build_us` NOT in the blobstore build nor the messaging mint. For a
+    // route whose only post-resolve bindings are blobstore+messaging (e.g. the console `/img` leg), a
+    // large `bindgap` with small `blobstore_build_us`/`messaging_build_us` means the multi-second cost
+    // is dispatch-task scheduling PARK between operations (the runtime can't re-poll this task under a
+    // burst), NOT any single call — exactly the distinction the earlier opaque number couldn't make.
+    let bind_gap_us = binding_build_us
+        .saturating_sub(messaging_build_us)
+        .saturating_sub(blobstore_build_us);
     // One structured line per plain handler request: where the host-side time went — session / component
     // blob (cold only) / bindings (auth + tenancy + binding build, now sub-split) / instantiate /
     // serve-to-head / body assembly, plus the blob read ops — so a per-request cost is attributable from
@@ -666,6 +674,8 @@ pub(super) async fn dispatch_handler(
         resolve_us,
         binding_build_us,
         messaging_build_us,
+        blobstore_build_us,
+        bind_gap_us,
         cold,
         instantiate_us,
         serve_us,
@@ -680,12 +690,15 @@ pub(super) async fn dispatch_handler(
     // Server-Timing (durations in ms, per spec) so the same breakdown is visible to the client / an
     // external probe without the node's logs (mirrors the federated gateway path).
     let server_timing = format!(
-        "session;dur={:.1}, component;dur={:.1}, bindings;dur={:.1}, resolve;dur={:.1}, bindingbuild;dur={:.1}, instantiate;dur={:.1}, serve;dur={:.1}, body;dur={:.1}, blob;dur={:.1}",
+        "session;dur={:.1}, component;dur={:.1}, bindings;dur={:.1}, resolve;dur={:.1}, bindingbuild;dur={:.1}, blobbuild;dur={:.1}, msgbuild;dur={:.1}, bindgap;dur={:.1}, instantiate;dur={:.1}, serve;dur={:.1}, body;dur={:.1}, blob;dur={:.1}",
         session_us as f64 / 1000.0,
         component_us as f64 / 1000.0,
         bindings_us as f64 / 1000.0,
         resolve_us as f64 / 1000.0,
         binding_build_us as f64 / 1000.0,
+        blobstore_build_us as f64 / 1000.0,
+        messaging_build_us as f64 / 1000.0,
+        bind_gap_us as f64 / 1000.0,
         instantiate_us as f64 / 1000.0,
         serve_us as f64 / 1000.0,
         body_us as f64 / 1000.0,
@@ -1814,6 +1827,13 @@ pub(super) async fn open_bindings_sql(
 pub(super) struct BindingsTiming {
     resolve_us: std::sync::atomic::AtomicU64,
     messaging_build_us: std::sync::atomic::AtomicU64,
+    // Ask B-2: the `wasi:blobstore` binding construction on its own, so the post-resolve
+    // `binding_build_us` can be split into blobstore-build vs messaging-build vs an unaccounted
+    // remainder (`bindgap`). The source shows the blobstore build is a cheap `Arc` clone + struct
+    // build (no I/O / lock / await); if a multi-second `binding_build` shows `blobstore_build_us`
+    // small AND `messaging_build_us` small, the cost is the REMAINDER — i.e. dispatch-task scheduling
+    // park between operations under a burst, not any single call. That distinction is the whole point.
+    blobstore_build_us: std::sync::atomic::AtomicU64,
 }
 
 impl BindingsTiming {
@@ -1825,11 +1845,17 @@ impl BindingsTiming {
         self.messaging_build_us
             .store(us, std::sync::atomic::Ordering::Relaxed);
     }
-    /// `(resolve_us, messaging_build_us)` as recorded during the build.
-    pub(super) fn snapshot(&self) -> (u64, u64) {
+    fn set_blobstore_build(&self, us: u64) {
+        self.blobstore_build_us
+            .store(us, std::sync::atomic::Ordering::Relaxed);
+    }
+    /// `(resolve_us, messaging_build_us, blobstore_build_us)` as recorded during the build.
+    pub(super) fn snapshot(&self) -> (u64, u64, u64) {
         (
             self.resolve_us.load(std::sync::atomic::Ordering::Relaxed),
             self.messaging_build_us
+                .load(std::sync::atomic::Ordering::Relaxed),
+            self.blobstore_build_us
                 .load(std::sync::atomic::Ordering::Relaxed),
         )
     }
@@ -2220,6 +2246,8 @@ pub(super) async fn build_bindings(
     if let Some(t) = &bindings_timing {
         t.set_resolve(t_resolve.elapsed().as_micros() as u64);
     }
+    // Ask B-2: time the `wasi:blobstore` binding construction on its own (the construens `/img` suspect).
+    let t_blobstore_build = std::time::Instant::now();
     // `wasi:blobstore` (REORDERED to here, post tenant-resolution): the host-side tenant confinement
     // (`blobstore.rs::container_prefix`) needs THIS invocation's resolved OWN tenant to expand a
     // `{tenant}` allowlist entry, and the multi-tenant fact to apply the deny-default. `multi_tenant`
@@ -2274,6 +2302,9 @@ pub(super) async fn build_bindings(
             // no resolved tenant gets an EMPTY own-space for its `{tenant}` container (not a 500).
             handler_caller_pass,
         );
+    }
+    if let Some(t) = &bindings_timing {
+        t.set_blobstore_build(t_blobstore_build.elapsed().as_micros() as u64);
     }
     // The host-verified sealed principal for THIS invocation (PLAN-async-persona): resolved from the
     // durable `signed_context` envelope (verified against the fleet anchor — the SAME verify/expiry/
