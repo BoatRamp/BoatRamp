@@ -6,7 +6,7 @@
 
 # `test-server-features` lane:
 # `cargo test -p boatramp-server --features handlers,oidc,mcp,compression,domain-verify-dns`.
-SERVER_FEATURES_MIN=332
+SERVER_FEATURES_MIN=333
 
 # `test-handlers` lane: `cargo test -p boatramp-handlers --all-features` (the wasm handler engine's
 # unit + `tests/serve.rs` integration surface — closes the nightly-only blind spot that let two stale
