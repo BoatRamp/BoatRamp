@@ -319,15 +319,21 @@ jobs:
       # cap so a burst queues cheaply instead. This runs the deterministic gate (max concurrent serves
       # ≤ cap when enabled, > cap when disabled — proving the gate, not some other limit, is the bound)
       # and asserts its marker, so a `#[cfg]`/rename that silently drops the gate fails the merge.
-      - name: Serve-admission concurrency gate
+      - name: Serve-admission concurrency gates (/img plain handler + /graphql gateway)
         run: |
           set -eo pipefail
+          # Both the plain-handler (`/img`) and federated-gateway (`/graphql`) paths must bound
+          # per-component serve concurrency to `serve_concurrency` (the image-serve-latency Ask B fix).
+          # Each test fires a burst at ONE component and proves max-concurrent-serves ≤ cap when enabled
+          # and > cap when disabled, so a `#[cfg]`/rename silently dropping EITHER gate fails the merge.
           cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-server \
-            --features handlers serve_admission_gate_bounds_concurrency -- --nocapture 2>&1 | tee serve-admission.log
-          grep -qE 'test result: ok\. 1 passed' serve-admission.log \
-            || { echo "::error::serve-admission gate did not run (silent skip or a failure)" >&2; exit 1; }
+            --features handlers admission_gate_bounds_concurrency -- --nocapture 2>&1 | tee serve-admission.log
+          grep -qE 'test result: ok\. 2 passed' serve-admission.log \
+            || { echo "::error::admission gates did not both run (silent skip or a failure)" >&2; exit 1; }
           grep -q 'SERVE-ADMISSION-GATE OK' serve-admission.log \
-            || { echo "::error::serve-admission gate never reached its marker (the per-component admission bound regressed)" >&2; exit 1; }
+            || { echo "::error::serve-admission gate never reached its marker (the per-component /img admission bound regressed)" >&2; exit 1; }
+          grep -q 'GATEWAY-ADMISSION-GATE OK' serve-admission.log \
+            || { echo "::error::gateway-admission gate never reached its marker (the federated /graphql gateway admission bound regressed)" >&2; exit 1; }
 
       # #503 CROSS-SURFACE HARD GATE (marker `SCOPED UNSCOPED-WRITE CROSS-SURFACE OK`, mirrors the
       # v0.5.0 `DB-NAME SCREENING CROSS-SURFACE OK` convention). A `scoped` route may WRITE a

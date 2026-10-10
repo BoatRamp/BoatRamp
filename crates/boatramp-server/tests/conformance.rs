@@ -1823,19 +1823,33 @@ struct ConcurrencyProbeKv {
     inflight: Arc<std::sync::atomic::AtomicUsize>,
     max_seen: Arc<std::sync::atomic::AtomicUsize>,
     delay: std::time::Duration,
+    /// Only track concurrency (and apply `delay`) for keys containing this substring; `None` tracks
+    /// every op. The `/img` gate test leaves it `None` (the guest `wasi:keyvalue` op it watches is the
+    /// only interesting op). The gateway gate test sets it to the per-invoke tenancy key so the probe
+    /// observes ONLY the post-admission-gate subgraph fanout, not the pre-gate per-request deployment/
+    /// config resolution the dispatch does for every request (which would read N-way concurrent
+    /// regardless of the gate and mask its effect).
+    count_filter: Option<&'static str>,
 }
 
 #[cfg(feature = "handlers")]
 impl ConcurrencyProbeKv {
-    async fn enter(&self) {
-        use std::sync::atomic::Ordering::SeqCst;
-        let n = self.inflight.fetch_add(1, SeqCst) + 1;
-        self.max_seen.fetch_max(n, SeqCst);
-        tokio::time::sleep(self.delay).await;
+    fn tracks(&self, key: &str) -> bool {
+        self.count_filter.is_none_or(|f| key.contains(f))
     }
-    fn exit(&self) {
-        self.inflight
-            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    async fn enter(&self, key: &str) {
+        use std::sync::atomic::Ordering::SeqCst;
+        if self.tracks(key) {
+            let n = self.inflight.fetch_add(1, SeqCst) + 1;
+            self.max_seen.fetch_max(n, SeqCst);
+            tokio::time::sleep(self.delay).await;
+        }
+    }
+    fn exit(&self, key: &str) {
+        if self.tracks(key) {
+            self.inflight
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
     }
 }
 
@@ -1843,15 +1857,15 @@ impl ConcurrencyProbeKv {
 #[async_trait::async_trait]
 impl boatramp_core::kv::KvStore for ConcurrencyProbeKv {
     async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, boatramp_core::kv::KvError> {
-        self.enter().await;
+        self.enter(key).await;
         let r = self.inner.get(key).await;
-        self.exit();
+        self.exit(key);
         r
     }
     async fn put(&self, key: &str, value: Vec<u8>) -> Result<(), boatramp_core::kv::KvError> {
-        self.enter().await;
+        self.enter(key).await;
         let r = self.inner.put(key, value).await;
-        self.exit();
+        self.exit(key);
         r
     }
     async fn delete(&self, key: &str) -> Result<(), boatramp_core::kv::KvError> {
@@ -1898,6 +1912,7 @@ async fn serve_admission_gate_bounds_concurrency() {
             inflight: Arc::new(AtomicUsize::new(0)),
             max_seen: max_seen.clone(),
             delay: std::time::Duration::from_millis(40),
+            count_filter: None,
         });
         let deploy = DeployStore::new(storage.clone(), cp_kv.clone());
         let hash = sha256_hex(KV_COUNTER);
@@ -7629,6 +7644,201 @@ async fn federation_gateway_stitches_real_subgraph_functions() {
     assert_eq!(
         out["data"]["users"][1]["reviews"][0]["body"],
         serde_json::json!("review for 2")
+    );
+}
+
+/// CI PERF GATE (image-serve-latency Ask B — gateway follow-up): the federated `/graphql` gateway
+/// **entry** must ALSO be bounded by the per-component serve-admission gate, not just the `/img`
+/// plain-handler path. This is the second half of the fix the user flagged: "on startup the graphql
+/// wasm building trashes concurrency too". On a shim bump / cold start a burst of federated queries
+/// fans *each* one out to its subgraphs; with no gate at the gateway entry those fanouts oversubscribe
+/// the scheduler exactly like the un-gated `/img` path did (the measured 17ms → 962ms@24 balloon). The
+/// fix (`handler_dispatch.rs`) acquires the same `graphql:{project}` admission permit before the
+/// federated dispatch, so this proves the gateway serve is gated, mirroring
+/// [`serve_admission_gate_bounds_concurrency`] for the plain path.
+///
+/// Deterministic (no timing assertion), same technique as the `/img` gate test: the runtime data-KV is
+/// a [`ConcurrencyProbeKv`]. Every subgraph invoke in a federated fanout does a `load_project_tenancy`
+/// read on it (`function_runtime.rs`), and that work runs AFTER the gateway admission permit is held —
+/// so the max concurrent probe ops tracks the max concurrent gateway-entry serves. The supergraph
+/// composition is memoized after the warm-up request, so the burst's probe ops are the per-invoke
+/// tenancy reads, not registry churn. We fire N concurrent federated queries at ONE gateway and assert:
+///   - with the gate at cap=1, concurrency stays bounded to a single query's fanout breadth;
+///   - with the gate DISABLED (cap=0), the N fanouts overlap to well above that (proving the gate — not
+///     some other limit — is what bounds the gateway path, and that cap=0 restores legacy unbounded).
+/// Marker `GATEWAY-ADMISSION-GATE OK` is grepped by capability.yml so a regression that silently stops
+/// gating the gateway fails CI loudly.
+#[cfg(feature = "handlers")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gateway_admission_gate_bounds_concurrency() {
+    use boatramp_core::config::{
+        DeployConfig, HandlerConfig, HandlerGraphqlConfig, HandlersSiteConfig, SiteConfig,
+    };
+    use boatramp_handlers::{HandlerEngine, Limits};
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+
+    const ACCOUNTS: &[u8] =
+        include_bytes!("../../boatramp-handlers/tests/fixtures/graphql-accounts.wasm");
+    const REVIEWS: &[u8] =
+        include_bytes!("../../boatramp-handlers/tests/fixtures/graphql-reviews.wasm");
+    const HTTP_200: &[u8] = include_bytes!("../../boatramp-handlers/tests/fixtures/http-200.wasm");
+    const N: usize = 6;
+
+    // Max concurrent gateway-entry serves observed when firing N federated queries at one gateway with
+    // the runtime's serve-admission cap set to `cap` (0 = gate disabled).
+    async fn max_concurrent_gateway_serves(cap: usize) -> usize {
+        let storage = Arc::new(MemStorage::default());
+        let max_seen = Arc::new(AtomicUsize::new(0));
+        // One probe KV backs BOTH the deploy/registry and the runtime data-KV (as the real node does).
+        // Every read during a federated serve happens inside the gateway admission gate, so the probe
+        // observes exactly the gated concurrency.
+        let kv: Arc<dyn boatramp_core::kv::KvStore> = Arc::new(ConcurrencyProbeKv {
+            inner: MemoryKv::new(),
+            inflight: Arc::new(AtomicUsize::new(0)),
+            max_seen: max_seen.clone(),
+            delay: std::time::Duration::from_millis(40),
+            // Count ONLY reads of the `accounts` subgraph's function record
+            // (`project/default/functions/accounts`, read by `get_function` inside the fanout invoke).
+            // That read happens strictly AFTER the gateway admission permit is held — the gateway entry
+            // resolves the `gw` SITE and its caller-facts tenancy (`config/tenancy`) PRE-gate, but never
+            // touches a subgraph function record — so this key's concurrency == the gateway serve
+            // concurrency. (We key on one subgraph: accounts is invoked exactly once per federated query,
+            // so the per-query signal is clean.)
+            count_filter: Some("functions/accounts"),
+        });
+        let deploy = DeployStore::new(storage.clone(), kv.clone());
+
+        // Two ordinary subgraph functions the gateway invokes by name.
+        deploy_test_function(&deploy, "accounts", ACCOUNTS, Vec::new()).await;
+        deploy_test_function(&deploy, "reviews", REVIEWS, Vec::new()).await;
+        kv.put(
+            "graphql/default/subgraph/accounts",
+            b"type Query { users: [User] } type User @key(fields: \"id\") { id: ID! name: String }"
+                .to_vec(),
+        )
+        .await
+        .unwrap();
+        kv.put(
+            "graphql/default/subgraph/reviews",
+            b"type Query { topReviews: [Review] } type Review { id: ID! body: String } extend type User @key(fields: \"id\") { id: ID! @external reviews: [Review] }"
+                .to_vec(),
+        )
+        .await
+        .unwrap();
+
+        // The gateway site (its component is never run for a federated op; point it at http-200).
+        let gw_hash = sha256_hex(HTTP_200);
+        let gw_stream: ByteStream =
+            futures::stream::once(async move { Ok(bytes::Bytes::from_static(HTTP_200)) }).boxed();
+        deploy.put_blob(&gw_hash, gw_stream).await.unwrap();
+        let mut files = BTreeMap::new();
+        files.insert(
+            "gw.wasm".to_string(),
+            FileEntry {
+                hash: gw_hash.clone(),
+                size: HTTP_200.len() as u64,
+                content_type: None,
+                variants: BTreeMap::new(),
+            },
+        );
+        let manifest = Manifest {
+            files,
+            config: DeployConfig {
+                handlers: vec![HandlerConfig {
+                    secrets: Vec::new(),
+                    tenancy: None,
+                    token_claims: None,
+                    route: "/graphql".into(),
+                    methods: Vec::new(),
+                    component: "gw.wasm".into(),
+                    imports: Vec::new(),
+                    streaming: false,
+                    limits: None,
+                    env: BTreeMap::new(),
+                    invoke_targets: Vec::new(),
+                    stats_topics: Vec::new(),
+                    tenant_secret_names: Vec::new(),
+                    upload_containers: Vec::new(),
+                    blobstore_containers: Vec::new(),
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let id = deploy.put_manifest(&manifest).await.unwrap();
+        deploy
+            .activate(ProjectRef::DEFAULT, "gw", &id)
+            .await
+            .unwrap();
+        deploy
+            .set_site_config(
+                ProjectRef::DEFAULT,
+                "gw",
+                &SiteConfig {
+                    handlers: Some(HandlersSiteConfig {
+                        enabled: true,
+                        graphql: Some(HandlerGraphqlConfig {
+                            enabled: true,
+                            federated: true,
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
+        let runtime = HandlerRuntime::new(engine, kv.clone(), storage, None, None);
+        runtime.set_invoker(deploy.clone());
+        runtime.set_serve_concurrency(cap);
+        let app = router(deploy.clone(), Auth::disabled(), runtime);
+
+        let fire = |app: axum::Router| async move {
+            let mut req = Request::builder()
+                .method("POST")
+                .uri("/_sites/gw/graphql")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"query":"{ users { name reviews { body } } }"}"#,
+                ))
+                .unwrap();
+            req.extensions_mut()
+                .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40000))));
+            let resp = app.oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        };
+        // Warm the compile + supergraph-composition caches once so the burst is all-warm (cold compile
+        // + first compose would otherwise skew the probe).
+        fire(app.clone()).await;
+        max_seen.store(0, SeqCst); // ignore the warm-up request
+        let handles: Vec<_> = (0..N).map(|_| tokio::spawn(fire(app.clone()))).collect();
+        for h in handles {
+            h.await.unwrap();
+        }
+        max_seen.load(SeqCst)
+    }
+
+    let gated = max_concurrent_gateway_serves(1).await;
+    let unbounded = max_concurrent_gateway_serves(0).await;
+
+    // cap=1 admits one gateway serve at a time, and each query invokes the `accounts` subgraph exactly
+    // once, so the gated case can see at most one such invoke in flight. The point is it does NOT scale
+    // with N, unlike the disabled case.
+    assert!(
+        gated <= 2,
+        "gateway admission gate (cap=1) must keep concurrent gateway serves bounded (≤ 2), saw {gated}"
+    );
+    assert!(
+        unbounded > gated,
+        "with the gateway gate disabled (cap=0), {N} concurrent federated queries must overlap to \
+         MORE concurrent serves than the gated case (proving the gateway gate — not some other limit \
+         — is what bounds it); gated={gated}, unbounded={unbounded}"
+    );
+    println!(
+        "GATEWAY-ADMISSION-GATE OK (cap=1 → max {gated} concurrent gateway serves; disabled → max {unbounded} of {N})"
     );
 }
 
