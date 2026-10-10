@@ -1475,7 +1475,9 @@ pub struct HandlersConfig {
     /// cores; lower it to cap aggregate live concurrency. Read once at startup. NOTE: with `[handlers]
     /// pooling` on, the shared instance pool is sized off the summed lane concurrencies, so a larger
     /// value enlarges the up-front virtual reservation (the non-pooling default sizes memory
-    /// per-invocation and is unaffected).
+    /// per-invocation and is unaffected). Unlike `serve_concurrency`, `0` is NOT "disable" — the
+    /// global sync lane is a required safety ceiling, so a configured `0` is rejected (falls back to
+    /// the host default, with a loud WARN at startup).
     pub sync_max_concurrency: Option<usize>,
     /// Engine-wide safety max on a *durable async* invocation — the drain that
     /// runs `?mode=async` calls, workflow steps, cron/queue/blob triggers, and

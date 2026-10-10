@@ -61,6 +61,25 @@ fn default_sync_concurrency() -> usize {
     sync_concurrency_for_cores(cores)
 }
 
+/// Resolve the effective global sync-lane ceiling from the operator's `sync_max_concurrency`.
+///
+/// `None` ⇒ the host-scaled default. A positive value is honored verbatim (an operator may
+/// deliberately run a tight lane). `Some(0)` is treated as **invalid**, NOT as "disable": unlike the
+/// per-component `serve_concurrency` gate (where `0` means pass-through), the global sync lane is a
+/// required node-wide safety ceiling — remove it and a burst oversubscribes the workers again (the
+/// bug this release fixes). The engine's own `.max(1)` floor means a `0` would otherwise *silently*
+/// collapse the whole node to one concurrent live serve; instead we fall back to the host default (the
+/// caller logs a loud WARN), so the boot log and the enforced value never diverge. Pure (the WARN is a
+/// side effect at the call site) so the `0`-is-not-disable contract is unit-tested.
+#[cfg(feature = "handlers")]
+fn resolve_sync_concurrency(configured: Option<usize>) -> usize {
+    match configured {
+        // 0 is invalid (not "disable") → host default; the caller WARNs.
+        None | Some(0) => default_sync_concurrency(),
+        Some(n) => n,
+    }
+}
+
 #[cfg(all(test, feature = "handlers"))]
 mod sync_concurrency_default_tests {
     use super::sync_concurrency_for_cores;
@@ -85,6 +104,32 @@ mod sync_concurrency_default_tests {
         );
         assert_eq!(sync_concurrency_for_cores(32), 128);
         assert_eq!(sync_concurrency_for_cores(64), 256);
+    }
+
+    /// `0` must NOT behave like `serve_concurrency = 0` (disable). For the global sync lane it is
+    /// invalid and resolves to the host default — never a silent collapse to 1 (the engine's `.max(1)`
+    /// floor). A positive value passes through verbatim; `None` is the default.
+    #[test]
+    fn sync_max_concurrency_zero_is_not_disable() {
+        use super::{default_sync_concurrency, resolve_sync_concurrency};
+        let default = default_sync_concurrency();
+        assert!(default >= 64, "host default is floored at 64");
+        assert_eq!(
+            resolve_sync_concurrency(Some(0)),
+            default,
+            "0 is invalid → host default, NOT 1 and NOT disable"
+        );
+        assert_eq!(
+            resolve_sync_concurrency(None),
+            default,
+            "unset → host default"
+        );
+        assert_eq!(
+            resolve_sync_concurrency(Some(1)),
+            1,
+            "a positive value is honored verbatim"
+        );
+        assert_eq!(resolve_sync_concurrency(Some(200)), 200);
     }
 }
 
@@ -171,9 +216,22 @@ pub async fn build_handler_runtime(
         // The GLOBAL sync-lane ceiling. Scales with host size by default (`cores * 4`, floored at the
         // historical 64) so adding vCPUs past ~16 actually raises aggregate live throughput instead of
         // pinning at a fixed 64 — the ceiling the per-component `serve_concurrency` gate hands off to.
-        max_concurrency: handlers_cfg
-            .and_then(|h| h.sync_max_concurrency)
-            .unwrap_or_else(default_sync_concurrency),
+        // A configured `0` is invalid (the lane is a required safety ceiling, NOT disable-able like the
+        // per-component gate) → fall back to the host default with a loud WARN, never a silent collapse
+        // to 1 concurrent live serve.
+        max_concurrency: {
+            let configured = handlers_cfg.and_then(|h| h.sync_max_concurrency);
+            if configured == Some(0) {
+                tracing::warn!(
+                    default = default_sync_concurrency(),
+                    "[handlers] sync_max_concurrency = 0 is invalid: the global sync lane is a \
+                     required node-wide safety ceiling and cannot be disabled (unlike \
+                     serve_concurrency, where 0 means pass-through). Using the host-scaled default \
+                     instead — set a positive value to override."
+                );
+            }
+            resolve_sync_concurrency(configured)
+        },
         ..defaults
     };
     let async_limits = boatramp_handlers::Limits {
