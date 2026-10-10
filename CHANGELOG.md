@@ -61,6 +61,12 @@ change.
 > logs the effective cap at startup. A re-entrant self-egress call (a guest making a blocking HTTP call
 > back to its own node) is exempt from the gate (nonce-verified) so it can never deadlock against the
 > outer request's permit. `serve_concurrency` is read once at startup — changing it needs a restart.
+>
+> The new host-scaled `sync_max_concurrency` default is additive on the concurrency axis (≤ 16 vCPU it
+> stays 64), but if you run `[handlers] pooling` on a large host (> ~16 vCPU), the auto-scaled sync lane
+> enlarges the shared instance pool's up-front virtual reservation on upgrade. That reservation is
+> fail-closed (an implausible one refuses boot with a message naming the knobs to lower), so pin
+> `sync_max_concurrency` explicitly, or lower a `*_max_memory_mb`, if a large pooling node won't start.
 
 ## [0.26.0] - 2026-10-09
 
