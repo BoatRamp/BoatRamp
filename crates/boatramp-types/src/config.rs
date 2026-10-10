@@ -555,6 +555,17 @@ pub struct HandlerConfig {
     /// `env` is unaffected.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub secrets: Vec<String>,
+    /// Resolve **NO** site secrets for this handler (least-privilege opt-out). The `secrets`
+    /// allowlist above can scope DOWN to a subset, but an *empty* allowlist means "the whole site
+    /// pool" (the non-breaking #492 default), so there was no way to say "none". A blob/image serve
+    /// route on a secret-heavy site (e.g. construens `/img` on a site that declares ~18 IDP/OAuth
+    /// secrets site-wide) reads none of them, yet paid to resolve + unseal all of them on every serve
+    /// (image-serve-latency Ask B-3). Set `no_secrets: true` so `resolve_env` skips the site pool
+    /// entirely for this handler — it then touches the secret store zero times per serve. The
+    /// handler's own static `env` is unaffected. Default `false` (unchanged behavior). Mutually
+    /// exclusive with a non-empty `secrets` allowlist (declaring both is an activation error).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_secrets: bool,
     /// Function-to-function invoke allowlist (FI): the target names this handler may
     /// call through the `invoke` capability (same contract as
     /// [`FunctionConfig::invoke_targets`](crate::function::FunctionConfig)). Each entry
