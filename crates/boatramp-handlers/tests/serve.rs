@@ -740,3 +740,101 @@ async fn consumer_without_keyvalue_grant_errors() {
     // (a denial, not a crash), so the dispatcher classifies it `ConsumerError`, not `Trap`.
     assert!(matches!(err, HandlerError::ConsumerError(_)), "{err}");
 }
+
+/// DIAGNOSTIC (`--ignored`): N concurrent FIRST (cold) serves of the SAME uncached component. If the
+/// serve-path compile is single-flighted, exactly ONE cranelift compile runs (`cold_misses == 1`) and
+/// the other N-1 share it; if not, all N compile (`cold_misses == N`) — the cold-gallery herd that,
+/// with a ~1 MB component on 2 vCPU, stacks into construens' ~112 s first reload.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "diagnostic: prints the cold-compile herd count"]
+async fn cold_compile_herd_repro() {
+    let engine = std::sync::Arc::new(HandlerEngine::new(Limits::default(), 64).expect("engine"));
+    let n = 48usize;
+    let start = std::time::Instant::now();
+    let mut handles = Vec::new();
+    for _ in 0..n {
+        let e = engine.clone();
+        handles.push(tokio::spawn(async move {
+            e.serve("herd-component", HTTP_200, request(), no_caps())
+                .await
+                .map(|r| r.status().as_u16())
+        }));
+    }
+    let mut ok = 0usize;
+    for h in handles {
+        if matches!(h.await, Ok(Ok(200))) {
+            ok += 1;
+        }
+    }
+    let wall = start.elapsed();
+    let cold = engine.instance_stats().request.cold_misses;
+    println!("\n==== cold_compile_herd_repro ====");
+    println!("N={n} cold concurrent serves  ok={ok}  wall={wall:?}  cold_misses={cold}");
+    println!("(single-flighted => cold_misses=1; herd => cold_misses=N={n})\n");
+}
+
+/// DIAGNOSTIC (`--ignored`): WARM-component concurrency scaling on a 2-vCPU-emulating runtime
+/// (`worker_threads=2`). Reads a REAL component from `$BOATRAMP_REPRO_COMPONENT` (kept OUT of the repo
+/// — point it at a scratchpad copy), warms it (compile+cache the `ProxyPre`), then fires N concurrent
+/// WARM serves for N in {1,4,8,16,32,48}, printing per-serve wall-clock p50/p99/max + total.
+///
+/// This reproduces construens' warm `/img` symptom with ZERO blob/sql/network: every serve is a pure
+/// instantiate+run of the cached component. If per-serve balloons SUPER-linearly with N, the bottleneck
+/// is instantiation CPU/memory of the large (~10 MB compiled) component under core starvation — and the
+/// "7 s `binding_build_us`" is that dispatch-task PARK, misattributed by the `bindings_us - resolve_us`
+/// wall-clock remainder (there is no I/O or lock in the blobstore binding build). A flat/linear curve
+/// refutes the instantiation hypothesis. `$BOATRAMP_REPRO_CAP` overrides the engine concurrency cap
+/// (default 64, construens' `warm_capacity`); set it to ~cores to test the admission-gate fix.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "diagnostic: warm large-component concurrency scaling (needs $BOATRAMP_REPRO_COMPONENT)"]
+async fn warm_component_concurrency_repro() {
+    let Ok(path) = std::env::var("BOATRAMP_REPRO_COMPONENT") else {
+        eprintln!(
+            "skip: set BOATRAMP_REPRO_COMPONENT=/path/to/component.wasm (and optionally BOATRAMP_REPRO_CAP)"
+        );
+        return;
+    };
+    let wasm = std::sync::Arc::new(std::fs::read(&path).expect("read component"));
+    let cap: usize = std::env::var("BOATRAMP_REPRO_CAP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(64);
+    println!(
+        "\n==== warm_component_concurrency_repro ({} KB wasm, workers=2, engine_cap={cap}) ====",
+        wasm.len() / 1024
+    );
+    let engine = std::sync::Arc::new(HandlerEngine::new(Limits::default(), cap).expect("engine"));
+    // Warm: compile + cache the ProxyPre and pay the first instantiate, so the burst is all-warm.
+    let _ = engine.serve("repro", &wasm, request(), no_caps()).await;
+    let cold0 = engine.instance_stats().request.cold_misses;
+
+    for n in [1usize, 4, 8, 16, 32, 48] {
+        let start = std::time::Instant::now();
+        let mut handles = Vec::new();
+        for _ in 0..n {
+            let e = engine.clone();
+            let w = wasm.clone();
+            handles.push(tokio::spawn(async move {
+                let t = std::time::Instant::now();
+                let _ = e.serve("repro", w.as_slice(), request(), no_caps()).await;
+                t.elapsed().as_secs_f64() * 1000.0
+            }));
+        }
+        let mut ms = Vec::new();
+        for h in handles {
+            ms.push(h.await.unwrap());
+        }
+        let wall = start.elapsed().as_secs_f64() * 1000.0;
+        ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let p = |q: f64| ms[((ms.len() as f64 - 1.0) * q) as usize];
+        println!(
+            "N={n:>2}  wall={wall:8.1}ms  per_serve[p50={:8.1} p99={:8.1} max={:8.1}] ms  (per/N={:6.1})",
+            p(0.5),
+            p(0.99),
+            p(1.0),
+            wall / n as f64,
+        );
+    }
+    let cold1 = engine.instance_stats().request.cold_misses;
+    println!("cold_misses: start={cold0} end={cold1} (warm if unchanged across the bursts)\n");
+}
