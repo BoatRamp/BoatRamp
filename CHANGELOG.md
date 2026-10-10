@@ -5,7 +5,7 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
-## [0.27.0] - unreleased
+## [0.27.0] - 2026-10-10
 
 Image-serve-latency Ask B — the fix for the warm `/img` gallery stall, now that the Ask B-2
 `bindgap` sub-instrumentation (below) proved it. Measured on the live 2-vCPU node: a gallery firing
