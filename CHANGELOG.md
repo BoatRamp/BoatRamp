@@ -40,6 +40,15 @@ change.
   the workers the same way (measured on the live node: subgraph fanout ~17ms→~1s at 24 concurrent).
   The gateway entry now takes the same admission permit, keyed per project, with the same
   self-egress exemption. `serve_concurrency` bounds both the handler and the gateway paths.
+- **The global sync lane now scales with host size.** The per-component gate hands off to the engine's
+  node-wide sync-lane ceiling, which was pinned at a fixed `64` with no operator knob — so above ~16
+  vCPU, adding cores bought no extra concurrent live throughput (the gate scaled, the lane behind it did
+  not). New `[handlers] sync_max_concurrency` knob, defaulting to `available_parallelism × 4` floored at
+  **64**: byte-identical to the old fixed 64 on any node up to the ~16-vCPU crossover (purely additive —
+  no node that worked before is tightened) and scaling past it so a bigger box actually raises aggregate
+  live throughput. The node logs both the per-component gate and the sync-lane ceiling at startup. (With
+  `pooling` on, a larger value enlarges the shared-pool reservation, as the existing lane-sizing note
+  says; the non-pooling default is unaffected.)
 - Deterministic CI merge-gates prove the admission bound holds on BOTH paths — `SERVE-ADMISSION-GATE
   OK` for the `/img` plain handler and `GATEWAY-ADMISSION-GATE OK` for the federated `/graphql` gateway
   (each: max concurrent serves ≤ cap enabled, > cap disabled) — so a regression that silently drops

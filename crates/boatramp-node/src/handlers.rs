@@ -40,6 +40,54 @@ const DEFAULT_STREAMING_TIMEOUT_MS: u64 = 15 * 60 * 1000;
 #[cfg(feature = "handlers")]
 const DEFAULT_STREAMING_CONCURRENCY: usize = 64;
 
+/// The host-parallelism default for the GLOBAL sync-lane concurrency ceiling, given the detected
+/// core count: `cores * 4`, floored at the historical **64**. The `* 4` matches the per-component
+/// `serve_concurrency` gate (so a single hot component can use its whole per-component budget without
+/// the global lane binding first), and the 64 floor makes this purely additive — identical to the old
+/// fixed `Limits::default().max_concurrency = 64` on any node up to ~16 vCPU, and only scaling ABOVE
+/// that, where the fixed 64 used to cap aggregate live throughput with no knob to lift it. Factored out
+/// of [`available_parallelism`] so the formula is unit-testable without a specific host.
+#[cfg(feature = "handlers")]
+fn sync_concurrency_for_cores(cores: usize) -> usize {
+    cores.saturating_mul(4).max(64)
+}
+
+/// The effective default sync-lane concurrency for THIS host (detected cores → [`sync_concurrency_for_cores`]).
+#[cfg(feature = "handlers")]
+fn default_sync_concurrency() -> usize {
+    let cores = std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(1);
+    sync_concurrency_for_cores(cores)
+}
+
+#[cfg(all(test, feature = "handlers"))]
+mod sync_concurrency_default_tests {
+    use super::sync_concurrency_for_cores;
+
+    /// The core-scaled sync-lane default must be PURELY ADDITIVE: byte-identical to the historical
+    /// fixed `max_concurrency = 64` on any node up to the ~16-vCPU crossover (`cores * 4 == 64`), and
+    /// only scaling ABOVE that — so the fix lifts the big-node ceiling without tightening any node that
+    /// worked before. Also must never underflow on a degenerate core count.
+    #[test]
+    fn sync_lane_default_is_additive_then_scales_with_cores() {
+        for cores in [0usize, 1, 2, 4, 8, 16] {
+            assert_eq!(
+                sync_concurrency_for_cores(cores),
+                64,
+                "≤16 vCPU must stay at the historical 64 (cores={cores})"
+            );
+        }
+        assert_eq!(
+            sync_concurrency_for_cores(17),
+            68,
+            "just past the crossover scales"
+        );
+        assert_eq!(sync_concurrency_for_cores(32), 128);
+        assert_eq!(sync_concurrency_for_cores(64), 256);
+    }
+}
+
 /// Build the WebAssembly handler runtime. With the `handlers` feature it wraps a
 /// wasmtime engine serving the kv/blob bindings from the server's own backends;
 /// otherwise it is an empty placeholder (handler routes fall through to static).
@@ -120,6 +168,12 @@ pub async fn build_handler_runtime(
             .and_then(|h| h.sync_max_memory_mb)
             .map(mib)
             .unwrap_or(defaults.memory_bytes),
+        // The GLOBAL sync-lane ceiling. Scales with host size by default (`cores * 4`, floored at the
+        // historical 64) so adding vCPUs past ~16 actually raises aggregate live throughput instead of
+        // pinning at a fixed 64 — the ceiling the per-component `serve_concurrency` gate hands off to.
+        max_concurrency: handlers_cfg
+            .and_then(|h| h.sync_max_concurrency)
+            .unwrap_or_else(default_sync_concurrency),
         ..defaults
     };
     let async_limits = boatramp_handlers::Limits {
@@ -276,6 +330,14 @@ pub async fn build_handler_runtime(
             "serve-admission gate active: ≤ {cap} concurrent serves per component"
         ),
     }
+    // The GLOBAL sync-lane ceiling the gate hands off to — host-scaled by default (so a big node is not
+    // silently pinned at the old fixed 64). Logged alongside the per-component gate so the two
+    // concurrency ceilings are both visible at boot.
+    tracing::info!(
+        sync_concurrency = sync_limits.max_concurrency,
+        "sync lane: ≤ {} concurrent live serves node-wide",
+        sync_limits.max_concurrency
+    );
     // Event-driven delivery cadences (B17): the two operator `[handlers]` knobs (absent ⇒ default).
     // Pure latency/idle-cost tradeoff — never affects at-least-once.
     {
