@@ -691,7 +691,8 @@ pub(super) async fn dispatch_handler(
     // load; `binding_build_us` = the remainder (every `.with_*` construction, incl. messaging); and
     // `messaging_build_us` (⊆ binding_build) isolates the one binding that does per-request async work
     // (`mint_producer_context`). Together they answer "is the cost auth/tenancy, or a binding build?".
-    let (resolve_us, messaging_build_us, blobstore_build_us) = bindings_timing.snapshot();
+    let (resolve_us, messaging_build_us, blobstore_build_us, secret_env_us) =
+        bindings_timing.snapshot();
     let binding_build_us = bindings_us.saturating_sub(resolve_us);
     // Ask B-2: the part of `binding_build_us` NOT in the blobstore build nor the messaging mint. For a
     // route whose only post-resolve bindings are blobstore+messaging (e.g. the console `/img` leg), a
@@ -700,7 +701,8 @@ pub(super) async fn dispatch_handler(
     // burst), NOT any single call — exactly the distinction the earlier opaque number couldn't make.
     let bind_gap_us = binding_build_us
         .saturating_sub(messaging_build_us)
-        .saturating_sub(blobstore_build_us);
+        .saturating_sub(blobstore_build_us)
+        .saturating_sub(secret_env_us);
     // One structured line per plain handler request: where the host-side time went — session / component
     // blob (cold only) / bindings (auth + tenancy + binding build, now sub-split) / instantiate /
     // serve-to-head / body assembly, plus the blob read ops — so a per-request cost is attributable from
@@ -717,6 +719,7 @@ pub(super) async fn dispatch_handler(
         binding_build_us,
         messaging_build_us,
         blobstore_build_us,
+        secret_env_us,
         bind_gap_us,
         cold,
         instantiate_us,
@@ -729,28 +732,33 @@ pub(super) async fn dispatch_handler(
         blob_ops,
         "handler request phase timing"
     );
-    // Server-Timing (durations in ms, per spec) so the same breakdown is visible to the client / an
-    // external probe without the node's logs (mirrors the federated gateway path).
-    let server_timing = format!(
-        "session;dur={:.1}, component;dur={:.1}, bindings;dur={:.1}, resolve;dur={:.1}, bindingbuild;dur={:.1}, blobbuild;dur={:.1}, msgbuild;dur={:.1}, bindgap;dur={:.1}, instantiate;dur={:.1}, serve;dur={:.1}, body;dur={:.1}, blob;dur={:.1}",
-        session_us as f64 / 1000.0,
-        component_us as f64 / 1000.0,
-        bindings_us as f64 / 1000.0,
-        resolve_us as f64 / 1000.0,
-        binding_build_us as f64 / 1000.0,
-        blobstore_build_us as f64 / 1000.0,
-        messaging_build_us as f64 / 1000.0,
-        bind_gap_us as f64 / 1000.0,
-        instantiate_us as f64 / 1000.0,
-        serve_us as f64 / 1000.0,
-        body_us as f64 / 1000.0,
-        (blob_get_us + blob_head_us + blob_range_us) as f64 / 1000.0,
-    );
-    if let Ok(value) = axum::http::HeaderValue::from_str(&server_timing) {
-        response.headers_mut().insert(
-            axum::http::header::HeaderName::from_static("server-timing"),
-            value,
+    // Server-Timing (durations in ms, per spec) mirrors the structured log above, but on the WIRE.
+    // DEFAULT OFF (`inner.server_timing_header()`): exposing the per-phase breakdown to every client
+    // leaks internal phase structure + a timing side-channel, so the header is opt-in; the log always
+    // carries the same numbers for the operator.
+    if inner.server_timing_header() {
+        let server_timing = format!(
+            "session;dur={:.1}, component;dur={:.1}, bindings;dur={:.1}, resolve;dur={:.1}, bindingbuild;dur={:.1}, blobbuild;dur={:.1}, msgbuild;dur={:.1}, secretget;dur={:.1}, bindgap;dur={:.1}, instantiate;dur={:.1}, serve;dur={:.1}, body;dur={:.1}, blob;dur={:.1}",
+            session_us as f64 / 1000.0,
+            component_us as f64 / 1000.0,
+            bindings_us as f64 / 1000.0,
+            resolve_us as f64 / 1000.0,
+            binding_build_us as f64 / 1000.0,
+            blobstore_build_us as f64 / 1000.0,
+            messaging_build_us as f64 / 1000.0,
+            secret_env_us as f64 / 1000.0,
+            bind_gap_us as f64 / 1000.0,
+            instantiate_us as f64 / 1000.0,
+            serve_us as f64 / 1000.0,
+            body_us as f64 / 1000.0,
+            (blob_get_us + blob_head_us + blob_range_us) as f64 / 1000.0,
         );
+        if let Ok(value) = axum::http::HeaderValue::from_str(&server_timing) {
+            response.headers_mut().insert(
+                axum::http::header::HeaderName::from_static("server-timing"),
+                value,
+            );
+        }
     }
     response
 }
@@ -1036,20 +1044,23 @@ async fn federation_gateway(
         "graphql federated request phase timing"
     );
     let mut response = axum::Json(result).into_response();
-    // Server-Timing (per the spec, durations in ms) so the same breakdown is visible to the client /
-    // an external probe without reading the node's logs.
-    let server_timing = format!(
-        "auth;dur={:.1}, compose;dur={:.1}, plan;dur={:.1}, fanout;dur={:.1}",
-        auth_us as f64 / 1000.0,
-        compose_us as f64 / 1000.0,
-        plan_us as f64 / 1000.0,
-        fanout_us as f64 / 1000.0,
-    );
-    if let Ok(value) = axum::http::HeaderValue::from_str(&server_timing) {
-        response.headers_mut().insert(
-            axum::http::header::HeaderName::from_static("server-timing"),
-            value,
+    // Server-Timing mirrors the gateway phase log, but on the WIRE — DEFAULT OFF (opt-in via
+    // `[handlers] server_timing`), same rationale as the plain path (don't leak the phase breakdown /
+    // a timing side-channel to clients; the log always has it).
+    if inner.server_timing_header() {
+        let server_timing = format!(
+            "auth;dur={:.1}, compose;dur={:.1}, plan;dur={:.1}, fanout;dur={:.1}",
+            auth_us as f64 / 1000.0,
+            compose_us as f64 / 1000.0,
+            plan_us as f64 / 1000.0,
+            fanout_us as f64 / 1000.0,
         );
+        if let Ok(value) = axum::http::HeaderValue::from_str(&server_timing) {
+            response.headers_mut().insert(
+                axum::http::header::HeaderName::from_static("server-timing"),
+                value,
+            );
+        }
     }
     response
 }
@@ -1876,6 +1887,12 @@ pub(super) struct BindingsTiming {
     // small AND `messaging_build_us` small, the cost is the REMAINDER — i.e. dispatch-task scheduling
     // park between operations under a burst, not any single call. That distinction is the whole point.
     blobstore_build_us: std::sync::atomic::AtomicU64,
+    // Ask B-3: the `resolve_env` secret-resolution region on its own — one project-scoped secret
+    // `store.get` + unseal PER site/handler secret, previously SERIAL (now concurrent). It lands in
+    // the post-messaging `bindgap` region, so splitting it out tells whether a multi-ms `bindgap` is
+    // the secret fan-out (and how much) vs the rest. Log-only (surfaced in the phase log + the
+    // default-OFF Server-Timing header), so the REAL per-serve cost is measurable on a node.
+    secret_env_us: std::sync::atomic::AtomicU64,
 }
 
 impl BindingsTiming {
@@ -1891,13 +1908,19 @@ impl BindingsTiming {
         self.blobstore_build_us
             .store(us, std::sync::atomic::Ordering::Relaxed);
     }
-    /// `(resolve_us, messaging_build_us, blobstore_build_us)` as recorded during the build.
-    pub(super) fn snapshot(&self) -> (u64, u64, u64) {
+    fn set_secret_env(&self, us: u64) {
+        self.secret_env_us
+            .store(us, std::sync::atomic::Ordering::Relaxed);
+    }
+    /// `(resolve_us, messaging_build_us, blobstore_build_us, secret_env_us)` as recorded during the build.
+    pub(super) fn snapshot(&self) -> (u64, u64, u64, u64) {
         (
             self.resolve_us.load(std::sync::atomic::Ordering::Relaxed),
             self.messaging_build_us
                 .load(std::sync::atomic::Ordering::Relaxed),
             self.blobstore_build_us
+                .load(std::sync::atomic::Ordering::Relaxed),
+            self.secret_env_us
                 .load(std::sync::atomic::Ordering::Relaxed),
         )
     }
@@ -2667,6 +2690,10 @@ pub(super) async fn build_bindings(
     // posture a bare / `env:` ref into the operator's environment is refused
     // (fail-closed) — the site config's author is an untrusted tenant.
     let allow_env_secret_refs = inner.allow_env_secret_refs.get().copied().unwrap_or(false);
+    // Ask B-3: time the env + secret resolution on its own — one project-scoped `store.get` + unseal
+    // per site/handler secret (now fetched concurrently). Lands in the post-messaging `bindgap`
+    // region, so this `secretget` split makes the per-serve secret cost visible in the phase log.
+    let t_secret_env = std::time::Instant::now();
     let env = resolve_env(
         site,
         project,
@@ -2678,6 +2705,9 @@ pub(super) async fn build_bindings(
         inner.env_source(),
     )
     .await?;
+    if let Some(t) = &bindings_timing {
+        t.set_secret_env(t_secret_env.elapsed().as_micros() as u64);
+    }
     bindings = bindings.with_env(env);
     Ok(bindings)
 }
@@ -2785,6 +2815,14 @@ pub(super) async fn resolve_secret_env(
         .iter()
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
+    // PASS 1 — resolve the synchronous (host-`env:`) refs in place, validate + collect the
+    // project-scoped `boatramp:` refs. These used to be fetched one-at-a-time with `.await` INSIDE
+    // this loop, so a handler with N `boatramp:` secrets paid a per-serve floor of
+    // `N × secret-get-latency` (measured linear: on a slow control-plane KV each serial get adds its
+    // whole round-trip). The gets are independent, so PASS 2 fires them CONCURRENTLY instead —
+    // `N × latency` collapses to ~`1 × latency` — still fetched FRESH every serve (no caching, so
+    // rotation is immediate).
+    let mut boatramp_refs: Vec<(String, String)> = Vec::new();
     for (guest_name, secret_ref) in secrets {
         match parse_secret_ref(secret_ref) {
             // Bare / `env:` — the operator's own namespace. Permitted only when
@@ -2815,31 +2853,13 @@ pub(super) async fn resolve_secret_env(
             // `allow_env_secret_refs`. Fail-closed if no store is configured; a
             // missing secret is warned + skipped (like a missing env var).
             SecretRef::Boatramp(name) => {
-                let Some(store) = secret_store else {
+                if secret_store.is_none() {
                     return Err(format!(
                         "secret ref {guest_name:?} → boatramp:{name} cannot be resolved: no \
                          internal secret store is configured (a [secrets] key envelope is required)"
                     ));
-                };
-                match store.get(project, name).await {
-                    Ok(Some(bytes)) => {
-                        let value = String::from_utf8(bytes).map_err(|_| {
-                            format!("boatramp secret {name:?} is not valid UTF-8 for an env var")
-                        })?;
-                        env.retain(|(k, _)| k != guest_name);
-                        env.push((guest_name.clone(), value));
-                    }
-                    Ok(None) => tracing::warn!(
-                        label,
-                        secret = %guest_name,
-                        "secret references boatramp:{name}, which is not set; not injected"
-                    ),
-                    Err(err) => {
-                        return Err(format!(
-                            "resolving boatramp secret {name:?} for {guest_name:?} failed: {err}"
-                        ));
-                    }
                 }
+                boatramp_refs.push((guest_name.clone(), name.to_string()));
             }
             // A reserved scheme we recognise but don't yet implement — fail-closed
             // rather than fall through to reading the env.
@@ -2848,6 +2868,38 @@ pub(super) async fn resolve_secret_env(
                     "secret ref {guest_name:?} uses the {scheme:?} scheme, which is not yet \
                      supported"
                 ));
+            }
+        }
+    }
+    // PASS 2 — fetch every `boatramp:` secret CONCURRENTLY (each an independent project-scoped get +
+    // unseal). Guest env-var names are unique BTreeMap keys, so the per-result `retain`+`push`
+    // (secret overrides a same-named static env entry) is order-independent. A fetch error on ANY
+    // secret still fails closed (the message names the secret); a missing one is warned + skipped.
+    if let Some(store) = secret_store {
+        let fetched =
+            futures::future::join_all(boatramp_refs.iter().map(|(guest_name, name)| async move {
+                (guest_name, name, store.get(project, name).await)
+            }))
+            .await;
+        for (guest_name, name, result) in fetched {
+            match result {
+                Ok(Some(bytes)) => {
+                    let value = String::from_utf8(bytes).map_err(|_| {
+                        format!("boatramp secret {name:?} is not valid UTF-8 for an env var")
+                    })?;
+                    env.retain(|(k, _)| k != guest_name);
+                    env.push((guest_name.clone(), value));
+                }
+                Ok(None) => tracing::warn!(
+                    label,
+                    secret = %guest_name,
+                    "secret references boatramp:{name}, which is not set; not injected"
+                ),
+                Err(err) => {
+                    return Err(format!(
+                        "resolving boatramp secret {name:?} for {guest_name:?} failed: {err}"
+                    ));
+                }
             }
         }
     }

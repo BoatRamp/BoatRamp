@@ -1479,6 +1479,13 @@ pub struct HandlersConfig {
     /// global sync lane is a required safety ceiling, so a configured `0` is rejected (falls back to
     /// the host default, with a loud WARN at startup).
     pub sync_max_concurrency: Option<usize>,
+    /// Emit the per-phase `Server-Timing` RESPONSE HEADER to clients. Default **off** (absent ⇒
+    /// `false`): the per-phase breakdown always goes to the structured phase-timing LOG (operator
+    /// observability), but putting it on the wire exposes internal phase structure + a timing
+    /// side-channel to every caller. Turn it on for a debugging window (e.g. correlating a client's
+    /// slow request to a host phase), off in production. Read once at startup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_timing: Option<bool>,
     /// Engine-wide safety max on a *durable async* invocation — the drain that
     /// runs `?mode=async` calls, workflow steps, cron/queue/blob triggers, and
     /// `wasi:messaging` consumers, milliseconds. No client is connected and the

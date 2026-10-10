@@ -396,6 +396,17 @@ pub async fn build_handler_runtime(
         "sync lane: ≤ {} concurrent live serves node-wide",
         sync_limits.max_concurrency
     );
+    // Server-Timing RESPONSE HEADER — default OFF (the per-phase breakdown always goes to the log;
+    // the header exposes it + a timing side-channel to clients, so it is opt-in).
+    if let Some(enabled) = handlers_cfg.and_then(|h| h.server_timing) {
+        runtime.set_server_timing(enabled);
+    }
+    if runtime.server_timing_enabled() {
+        tracing::info!(
+            "Server-Timing response header ENABLED ([handlers] server_timing = true) — the per-phase \
+             breakdown is exposed to clients; disable it in production"
+        );
+    }
     // Event-driven delivery cadences (B17): the two operator `[handlers]` knobs (absent ⇒ default).
     // Pure latency/idle-cost tradeoff — never affects at-least-once.
     {

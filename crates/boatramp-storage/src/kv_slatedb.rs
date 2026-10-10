@@ -1226,6 +1226,93 @@ mod tests {
         settings
     }
 
+    /// LOCAL diagnostic (serve-latency-floor, Ask B-3): measure the REAL latency of a single SlateDB
+    /// `get` of a stable "secret"-like key through the PRODUCTION open path (`Settings::default()` ⇒
+    /// compactor + GC on, plus the default 512 MiB foyer block cache that `DbBuilder::new` wires and
+    /// `with_settings` never touches). With that block cache a WARM get should be sub-millisecond; the
+    /// serve-path floor assumed ~8 ms/secret-get, so this settles whether the get is actually slow and
+    /// under what conditions:
+    ///   - `cold`   : the first read (populates the block cache from the SST on disk);
+    ///   - `warm`   : repeated reads of the same key (should be block-cache hits ⇒ sub-ms);
+    ///   - `churn`  : the same key while a background writer creates SST churn (put+flush many keys) —
+    ///                tests the hypothesis that a write-heavy control plane evicts/invalidates the
+    ///                block for a stable key, forcing a disk read every serve despite the cache.
+    ///
+    /// Run: `cargo test -p boatramp-storage --features slatedb slatedb_get_latency -- --ignored --nocapture`
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "diagnostic; run with --ignored --nocapture"]
+    async fn slatedb_get_latency() {
+        use std::time::Instant;
+        const KEY: &str = "project/default/config/secret/api-key";
+
+        let dir = tempfile::tempdir().unwrap();
+        let kv = Arc::new(
+            SlateKv::open_local_with_flush_policy(
+                dir.path(),
+                Duration::from_millis(5),
+                KvOpenPolicy::Strict,
+            )
+            .await
+            .unwrap(),
+        );
+        // A stable key, flushed to an SST (not the live memtable) — the shape of a config/secret read
+        // on a long-running node.
+        kv.put(KEY, b"s3cr3t-value".to_vec()).await.unwrap();
+        kv.flush().await.unwrap();
+
+        let pct = |mut v: Vec<std::time::Duration>, p: usize| {
+            v.sort();
+            v[(v.len() * p / 100).min(v.len() - 1)]
+        };
+
+        // Cold first read, then warm repeats.
+        let cold = {
+            let t = Instant::now();
+            assert!(kv.get(KEY).await.unwrap().is_some());
+            t.elapsed()
+        };
+        let mut warm = Vec::new();
+        for _ in 0..2000 {
+            let t = Instant::now();
+            let _ = kv.get(KEY).await.unwrap();
+            warm.push(t.elapsed());
+        }
+        println!(
+            "SLATEDB-GET warm: cold={:?}  p50={:?}  p99={:?}",
+            cold,
+            pct(warm.clone(), 50),
+            pct(warm, 99)
+        );
+
+        // CHURN FIRST (to completion), THEN measure — a write-heavy control plane shape: many distinct
+        // keys + frequent flushes create L0 SSTs, and compaction rewrites the sorted run containing the
+        // stable key into NEW SST ids, so the block cached under the OLD id is stale and the next get
+        // must read the new SST block from the object store (a MISS). If that happens, `p50` jumps from
+        // the ~8µs cache-hit to the ~cold-read latency (here local SSD ~0.3ms; on fly's network /data
+        // volume that cold read is milliseconds — the real floor, if the control plane churns).
+        for i in 0..400u64 {
+            kv.put(&format!("churn/{i:08}"), vec![0u8; 512])
+                .await
+                .unwrap();
+            if i % 8 == 0 {
+                kv.flush().await.unwrap();
+            }
+        }
+        // Let the background compactor rewrite SSTs.
+        tokio::time::sleep(Duration::from_millis(750)).await;
+        let mut churn = Vec::new();
+        for _ in 0..2000 {
+            let t = Instant::now();
+            let _ = kv.get(KEY).await.unwrap();
+            churn.push(t.elapsed());
+        }
+        println!(
+            "SLATEDB-GET after 400-key churn+compaction: p50={:?}  p99={:?}",
+            pct(churn.clone(), 50),
+            pct(churn, 99)
+        );
+    }
+
     /// Run a SlateDB test `body` under a timeout guard, retrying on a **fresh**
     /// directory. With the background compactor + GC disabled ([`test_settings`])
     /// the close/reopen stall this used to paper over is gone, so this is now a

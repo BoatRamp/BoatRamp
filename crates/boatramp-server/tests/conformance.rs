@@ -2018,6 +2018,449 @@ async fn serve_admission_gate_bounds_concurrency() {
     );
 }
 
+/// LOCAL serve-latency-floor diagnostic (image-serve-latency Ask B-3) — reproduce the `/img`
+/// `bindgap` floor on THIS machine, no construens, no network. Drives the REAL serve path
+/// (`router` → `build_bindings`) and reads the `Server-Timing` phase breakdown off the response,
+/// while varying the two independent variables:
+///
+///   1. the project **tenancy-schema size** (`load_project_tenancy` deserializes + builds this per
+///      serve) over an INSTANT in-memory KV — so if `bindgap` grows with the table count the floor is
+///      the schema DECODE (CPU, re-done every serve); if it stays flat the floor is the KV GET I/O
+///      (and the construens 43 ms is a slow backend, not the decode);
+///   2. a per-`config/tenancy`-get DELAY + concurrency on a 2-worker runtime — to reproduce the
+///      ~15× burst amplification (scheduling park on that one `await`).
+///
+/// This is the harness that settles get-vs-decode without touching a production node. Not a CI gate —
+/// run it manually:
+///   cargo test -p boatramp-server --features handlers latency_floor_repro -- --ignored --nocapture
+#[cfg(feature = "handlers")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "diagnostic; run with --ignored --nocapture"]
+async fn latency_floor_repro() {
+    use boatramp_core::config::{HandlerConfig, HandlersSiteConfig};
+    use boatramp_core::envelope::{EnvelopeError, KeyEnvelope};
+    use boatramp_core::secret_store::SecretStore;
+    use boatramp_core::tenancy::{TableScope, TenancySchema};
+    use boatramp_handlers::{HandlerEngine, Limits};
+    use std::sync::atomic::AtomicUsize;
+
+    const HTTP_200: &[u8] = include_bytes!("../../boatramp-handlers/tests/fixtures/http-200.wasm");
+
+    // A trivial reversible envelope (NOT encryption) for the harness — the per-serve secret resolution
+    // calls `unwrap` on each fetched value, so this exercises the real round-trip cheaply.
+    struct HarnessEnvelope;
+    #[async_trait::async_trait]
+    impl KeyEnvelope for HarnessEnvelope {
+        async fn wrap(&self, p: &[u8]) -> Result<Vec<u8>, EnvelopeError> {
+            Ok(p.to_vec())
+        }
+        async fn unwrap(&self, c: &[u8]) -> Result<Vec<u8>, EnvelopeError> {
+            Ok(c.to_vec())
+        }
+    }
+
+    // A project tenancy schema with `n` plain tenant-scoped tables — the thing a per-serve
+    // `load_project_tenancy` deserializes and builds.
+    fn schema_of(n: usize) -> Vec<u8> {
+        let mut tables = BTreeMap::new();
+        for i in 0..n {
+            tables.insert(format!("table_{i:05}"), TableScope::Tenant);
+        }
+        let schema = TenancySchema {
+            default_tenant_key: "tenant_id".to_string(),
+            session_key: None,
+            tables,
+            target_eligible_fields: Default::default(),
+            public_subsets: Default::default(),
+            handles: Default::default(),
+        };
+        serde_json::to_vec(&schema).unwrap()
+    }
+
+    // Pull one `name;dur=<ms>` phase out of a Server-Timing header value.
+    fn phase(st: &str, name: &str) -> f64 {
+        st.split(',')
+            .find_map(|p| {
+                let p = p.trim();
+                p.strip_prefix(name)?.strip_prefix(";dur=")?.parse().ok()
+            })
+            .unwrap_or(-1.0)
+    }
+
+    // Build a fresh serve path (data-KV = instant MemoryKv, or a `delay_ms`-per-`config/tenancy`-get
+    // wrapper), deploy an `/img` handler with `Tenancy::Own` over a schema of `n_tables`, warm it,
+    // then fire `concurrency` requests and return the last request's (bindingbuild, bindgap, serve) ms.
+    async fn run(
+        n_tables: usize,
+        n_secrets: usize,
+        secret_delay_ms: u64,
+        concurrency: usize,
+    ) -> (f64, f64, f64, String) {
+        let storage = Arc::new(MemStorage::default());
+        // Control-plane / data KV: instant (the tenancy-schema read we already showed lands in
+        // `resolve`, not `bindgap`).
+        let data_kv: Arc<dyn boatramp_core::kv::KvStore> = Arc::new(MemoryKv::new());
+        data_kv
+            .put("project/default/config/tenancy", schema_of(n_tables))
+            .await
+            .unwrap();
+
+        // Secret store on its OWN kv, with a per-op delay simulating the slow /data SlateDB get.
+        // `resolve_env` does one `store.get()` PER secret, serially, in the untimed `bindgap` region.
+        let secret_kv: Arc<dyn boatramp_core::kv::KvStore> = if secret_delay_ms == 0 {
+            Arc::new(MemoryKv::new())
+        } else {
+            Arc::new(ConcurrencyProbeKv {
+                inner: MemoryKv::new(),
+                inflight: Arc::new(AtomicUsize::new(0)),
+                max_seen: Arc::new(AtomicUsize::new(0)),
+                delay: std::time::Duration::from_millis(secret_delay_ms),
+                count_filter: None,
+            })
+        };
+        let secret_store = SecretStore::new(secret_kv, Arc::new(HarnessEnvelope));
+        let mut site_secrets = BTreeMap::new();
+        for i in 0..n_secrets {
+            secret_store
+                .set(ProjectRef::DEFAULT, &format!("sec{i:03}"), b"value")
+                .await
+                .unwrap();
+            site_secrets.insert(format!("SEC_{i:03}"), format!("boatramp:sec{i:03}"));
+        }
+
+        let deploy = DeployStore::new(storage.clone(), data_kv.clone());
+        let hash = sha256_hex(HTTP_200);
+        let stream: ByteStream =
+            futures::stream::once(async move { Ok(bytes::Bytes::from_static(HTTP_200)) }).boxed();
+        deploy.put_blob(&hash, stream).await.unwrap();
+        let mut files = BTreeMap::new();
+        files.insert(
+            "c.wasm".to_string(),
+            FileEntry {
+                hash: hash.clone(),
+                size: HTTP_200.len() as u64,
+                content_type: None,
+                variants: BTreeMap::new(),
+            },
+        );
+        let manifest = Manifest {
+            files,
+            config: DeployConfig {
+                handlers: vec![HandlerConfig {
+                    secrets: Vec::new(),
+                    // Schema load at build_bindings is UNCONDITIONAL (runs every serve regardless of
+                    // the handler's tenancy); `None` keeps the anonymous serve a clean 200 while still
+                    // paying the per-serve `load_project_tenancy` get+decode we're measuring.
+                    tenancy: None,
+                    token_claims: None,
+                    route: "/img".to_string(),
+                    methods: Vec::new(),
+                    component: "c.wasm".to_string(),
+                    imports: Vec::new(),
+                    streaming: false,
+                    limits: None,
+                    env: BTreeMap::new(),
+                    invoke_targets: Vec::new(),
+                    stats_topics: Vec::new(),
+                    tenant_secret_names: Vec::new(),
+                    upload_containers: Vec::new(),
+                    blobstore_containers: Vec::new(),
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let id = deploy.put_manifest(&manifest).await.unwrap();
+        deploy
+            .activate(ProjectRef::DEFAULT, "blog", &id)
+            .await
+            .unwrap();
+        deploy
+            .set_site_config(
+                ProjectRef::DEFAULT,
+                "blog",
+                &SiteConfig {
+                    handlers: Some(HandlersSiteConfig {
+                        enabled: true,
+                        // The site secret POOL `resolve_env` resolves on every serve (one store.get
+                        // per entry, serially).
+                        secrets: site_secrets,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
+        let runtime = HandlerRuntime::new(engine, data_kv, storage, None, None);
+        runtime.set_secret_store(Arc::new(secret_store));
+        // The Server-Timing header is default-OFF (v0.28.0); this diagnostic reads the phase
+        // breakdown off it, so enable it here (exercises the runtime toggle too).
+        runtime.set_server_timing(true);
+        let app = router(deploy, Auth::disabled(), runtime);
+
+        // A UNIQUE query per request defeats the edge response cache (which would otherwise
+        // short-circuit the whole build_bindings path on the 2nd identical GET), so every serve
+        // actually re-runs `load_project_tenancy` — the thing under test.
+        let fire = |app: axum::Router, nonce: u64| async move {
+            let mut req = Request::builder()
+                .method("GET")
+                .uri(format!("/_sites/blog/img?n={nonce}"))
+                .body(Body::empty())
+                .unwrap();
+            req.extensions_mut()
+                .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40000))));
+            let resp = app.oneshot(req).await.unwrap();
+            let status = resp.status();
+            let st = resp
+                .headers()
+                .get("server-timing")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+            (status, st)
+        };
+
+        // Warm the compile cache (distinct nonce), then measure fresh (cache-busted) serves.
+        let (warm_status, warm_st) = fire(app.clone(), 0).await;
+        assert_eq!(
+            warm_status,
+            StatusCode::OK,
+            "serve did not reach 200 (so no Server-Timing); st={warm_st:?}"
+        );
+        let last = if concurrency <= 1 {
+            fire(app.clone(), 1).await.1
+        } else {
+            let handles: Vec<_> = (0..concurrency)
+                .map(|i| tokio::spawn(fire(app.clone(), 1000 + i as u64)))
+                .collect();
+            let mut st = String::new();
+            for h in handles {
+                st = h.await.unwrap().1;
+            }
+            st
+        };
+        let _ = phase; // (kept for future targeted asserts)
+        (
+            phase(&last, "resolve"),
+            phase(&last, "bindings"),
+            phase(&last, "bindgap"),
+            last,
+        )
+    }
+
+    println!(
+        "\n=== (1) TENANCY-SCHEMA decode lands in `resolve` (NOT bindgap) — instant KV, single ==="
+    );
+    for n in [0usize, 100, 1000, 20000] {
+        let (resolve, bindings, bindgap, _raw) = run(n, 0, 0, 1).await;
+        println!(
+            "    tables={n:>6}   resolve={resolve:>7.2}  bindings={bindings:>7.2}  bindgap={bindgap:>7.2}"
+        );
+    }
+
+    println!(
+        "\n=== (2) SECRET resolution — its own `secretget` phase; 8ms/get, single call, vary count ==="
+    );
+    println!(
+        "    (AFTER the parallelize fix: secretget ≈ ONE 8ms get regardless of N; serial would be N×8ms)"
+    );
+    for s in [0usize, 1, 5, 10, 20] {
+        let (_resolve, _bindings, _bindgap, raw) = run(0, s, 8, 1).await;
+        let secretget = phase(&raw, "secretget");
+        println!("    secrets={s:>3}   secretget={secretget:>7.2}");
+        if s == 10 {
+            println!("      raw: {raw}");
+        }
+    }
+
+    println!("\n=== (3) BURST — 10 secrets @ 8ms/get, single vs burst (2 workers) ===");
+    for c in [1usize, 8, 24] {
+        let (_resolve, _bindings, _bindgap, raw) = run(0, 10, 8, c).await;
+        let secretget = phase(&raw, "secretget");
+        println!("    concurrency={c:>3}   secretget={secretget:>7.2}");
+    }
+    println!();
+}
+
+/// CI GATE for the v0.28.0 serve-latency-floor fix (image-serve-latency Ask B-3), which
+/// `latency_floor_repro` proved locally. Two invariants, each with a grepped marker:
+///   1. **Per-serve secret resolution is CONCURRENT** — `resolve_env` fetches every `boatramp:`
+///      secret at once, so `bindgap` does NOT scale with the secret count. The old serial loop made
+///      8 secrets at a 25 ms get cost ~200 ms; concurrent is ~1 get (~25 ms). A regression back to
+///      serial `.await`-in-a-loop fails here loudly.
+///   2. **The `Server-Timing` response header is DEFAULT-OFF** — absent unless `set_server_timing`
+///      enables it (the breakdown stays in the log; exposing it on the wire is opt-in).
+#[cfg(feature = "handlers")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn secret_resolution_floor_gate() {
+    use boatramp_core::config::{HandlerConfig, HandlersSiteConfig};
+    use boatramp_core::envelope::{EnvelopeError, KeyEnvelope};
+    use boatramp_core::secret_store::SecretStore;
+    use boatramp_handlers::{HandlerEngine, Limits};
+    use std::sync::atomic::AtomicUsize;
+
+    const HTTP_200: &[u8] = include_bytes!("../../boatramp-handlers/tests/fixtures/http-200.wasm");
+
+    struct Env;
+    #[async_trait::async_trait]
+    impl KeyEnvelope for Env {
+        async fn wrap(&self, p: &[u8]) -> Result<Vec<u8>, EnvelopeError> {
+            Ok(p.to_vec())
+        }
+        async fn unwrap(&self, c: &[u8]) -> Result<Vec<u8>, EnvelopeError> {
+            Ok(c.to_vec())
+        }
+    }
+
+    // One warm serve of an `/img` handler whose SITE declares `n_secrets` `boatramp:` secrets, each
+    // `store.get` delayed `delay_ms`. Returns (bindgap_ms, server_timing_header_present).
+    async fn measure(n_secrets: usize, delay_ms: u64, server_timing: bool) -> (f64, bool) {
+        let storage = Arc::new(MemStorage::default());
+        let data_kv: Arc<dyn boatramp_core::kv::KvStore> = Arc::new(MemoryKv::new());
+        let secret_kv: Arc<dyn boatramp_core::kv::KvStore> = Arc::new(ConcurrencyProbeKv {
+            inner: MemoryKv::new(),
+            inflight: Arc::new(AtomicUsize::new(0)),
+            max_seen: Arc::new(AtomicUsize::new(0)),
+            delay: std::time::Duration::from_millis(delay_ms),
+            count_filter: None,
+        });
+        let secret_store = SecretStore::new(secret_kv, Arc::new(Env));
+        let mut site_secrets = BTreeMap::new();
+        for i in 0..n_secrets {
+            secret_store
+                .set(ProjectRef::DEFAULT, &format!("sec{i:03}"), b"value")
+                .await
+                .unwrap();
+            site_secrets.insert(format!("SEC_{i:03}"), format!("boatramp:sec{i:03}"));
+        }
+        let deploy = DeployStore::new(storage.clone(), data_kv.clone());
+        let hash = sha256_hex(HTTP_200);
+        let stream: ByteStream =
+            futures::stream::once(async move { Ok(bytes::Bytes::from_static(HTTP_200)) }).boxed();
+        deploy.put_blob(&hash, stream).await.unwrap();
+        let mut files = BTreeMap::new();
+        files.insert(
+            "c.wasm".to_string(),
+            FileEntry {
+                hash: hash.clone(),
+                size: HTTP_200.len() as u64,
+                content_type: None,
+                variants: BTreeMap::new(),
+            },
+        );
+        let manifest = Manifest {
+            files,
+            config: DeployConfig {
+                handlers: vec![HandlerConfig {
+                    secrets: Vec::new(),
+                    tenancy: None,
+                    token_claims: None,
+                    route: "/img".to_string(),
+                    methods: Vec::new(),
+                    component: "c.wasm".to_string(),
+                    imports: Vec::new(),
+                    streaming: false,
+                    limits: None,
+                    env: BTreeMap::new(),
+                    invoke_targets: Vec::new(),
+                    stats_topics: Vec::new(),
+                    tenant_secret_names: Vec::new(),
+                    upload_containers: Vec::new(),
+                    blobstore_containers: Vec::new(),
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let id = deploy.put_manifest(&manifest).await.unwrap();
+        deploy
+            .activate(ProjectRef::DEFAULT, "blog", &id)
+            .await
+            .unwrap();
+        deploy
+            .set_site_config(
+                ProjectRef::DEFAULT,
+                "blog",
+                &SiteConfig {
+                    handlers: Some(HandlersSiteConfig {
+                        enabled: true,
+                        secrets: site_secrets,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
+        let runtime = HandlerRuntime::new(engine, data_kv, storage, None, None);
+        runtime.set_secret_store(Arc::new(secret_store));
+        runtime.set_server_timing(server_timing);
+        let app = router(deploy, Auth::disabled(), runtime);
+        let fire = |app: axum::Router, nonce: u64| async move {
+            let mut req = Request::builder()
+                .method("GET")
+                .uri(format!("/_sites/blog/img?n={nonce}"))
+                .body(Body::empty())
+                .unwrap();
+            req.extensions_mut()
+                .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40000))));
+            let resp = app.oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            resp.headers()
+                .get("server-timing")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+        };
+        let _ = fire(app.clone(), 0).await; // warm the compile cache
+        let st = fire(app.clone(), 1).await; // measured (cache-busted via a fresh nonce)
+        let present = st.is_some();
+        // The secret-resolution region is its own `secretget` phase (Ask B-3).
+        let secretget = st
+            .as_deref()
+            .map(|s| {
+                s.split(',')
+                    .find_map(|p| {
+                        p.trim()
+                            .strip_prefix("secretget")?
+                            .strip_prefix(";dur=")?
+                            .parse::<f64>()
+                            .ok()
+                    })
+                    .unwrap_or(-1.0)
+            })
+            .unwrap_or(-1.0);
+        (secretget, present)
+    }
+
+    // (1) CONCURRENT secret resolution: 8 secrets @ 25 ms/get. Serial would be ~200 ms; concurrent
+    // is ~1 get. Generous bound (< 90 ms) so it can't flake, but far below the ~200 ms serial cost.
+    let (secretget, present) = measure(8, 25, true).await;
+    assert!(present, "server_timing(true) must emit the header");
+    assert!(
+        secretget > 15.0,
+        "sanity: the 8 secret gets must actually run (≈ one 25 ms get); saw {secretget}"
+    );
+    assert!(
+        secretget < 90.0,
+        "secret resolution must be CONCURRENT — 8 SERIAL 25 ms gets would be ~200 ms; saw {secretget} \
+         (a regression to the per-secret `.await`-in-a-loop)"
+    );
+    // (2) Server-Timing header DEFAULT-OFF.
+    let (_off, present_off) = measure(0, 0, false).await;
+    assert!(
+        !present_off,
+        "the Server-Timing response header must be DEFAULT-OFF (absent unless set_server_timing(true))"
+    );
+    println!(
+        "SECRET-RESOLUTION PARALLEL OK (8×25ms secrets → secretget {secretget:.1}ms, not ~200ms serial); \
+         SERVER-TIMING DEFAULT-OFF OK"
+    );
+}
+
 /// Browser cookie session auth through the real `router()` → dispatch: a cookie-authenticated
 /// request is CSRF-checked against the configured origins *before* the handler runs, and a
 /// same-origin one passes through. (The cookie value becomes a standard `Authorization: Bearer`

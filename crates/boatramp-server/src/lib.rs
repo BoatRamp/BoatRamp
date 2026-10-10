@@ -343,6 +343,12 @@ struct HandlerRuntimeInner {
     /// — co-located with the other per-component state; this is just the policy knob the dispatch
     /// reads to size it.
     serve_admission_cap: std::sync::OnceLock<usize>,
+    /// Whether to emit the per-phase `Server-Timing` RESPONSE HEADER to clients. Default **off**:
+    /// the breakdown always goes to the structured phase-timing LOG (operator-only), but exposing it
+    /// on the wire leaks internal phase structure + a timing side-channel to every caller, so the
+    /// header is opt-in via `[handlers] server_timing` / [`HandlerRuntime::set_server_timing`]. `None`
+    /// ⇒ off.
+    server_timing_header: std::sync::OnceLock<bool>,
     /// Per-scope SSE connection semaphores (per-site cap), created on first use and keyed by binding
     /// scope so a preview's streams can't exhaust the live site's budget. The audited
     /// [`KeyedSemaphores`](boatramp_handlers::KeyedSemaphores) owns the map (and re-sizes on a
@@ -648,6 +654,13 @@ impl HandlerRuntimeInner {
             .unwrap_or_else(default_serve_admission_cap)
     }
 
+    /// Whether to emit the per-phase `Server-Timing` response header (default **off** — the
+    /// breakdown is always in the structured log; the header is an opt-in client exposure).
+    #[cfg(feature = "handlers")]
+    pub(crate) fn server_timing_header(&self) -> bool {
+        self.server_timing_header.get().copied().unwrap_or(false)
+    }
+
     /// The injectable env source for config-named host-env secret lookups — the
     /// real process environment ([`boatramp_core::env::SystemEnv`]) unless a test
     /// wired a `MapEnv` via [`HandlerRuntime::set_env_source`]. Threaded into
@@ -800,6 +813,7 @@ impl HandlerRuntime {
                 messaging,
                 site_semaphores: boatramp_handlers::KeyedSemaphores::new(),
                 serve_admission_cap: std::sync::OnceLock::new(),
+                server_timing_header: std::sync::OnceLock::new(),
                 stream_semaphores: boatramp_handlers::KeyedSemaphores::new(),
                 stream_ip_counts: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
                 metrics: metrics::Metrics::default(),
@@ -1010,6 +1024,26 @@ impl HandlerRuntime {
         if let Some(inner) = self.inner.as_ref() {
             let _ = inner.serve_admission_cap.set(cap);
         }
+    }
+
+    /// Enable the per-phase `Server-Timing` RESPONSE HEADER (`[handlers] server_timing`). Default
+    /// **off**: the breakdown always goes to the structured phase-timing log, but the header exposes
+    /// internal phase structure + a timing side-channel to every client, so it is opt-in (turn it on
+    /// for a debugging window, off in production). Set once at serve startup.
+    #[cfg(feature = "handlers")]
+    pub fn set_server_timing(&self, enabled: bool) {
+        if let Some(inner) = self.inner.as_ref() {
+            let _ = inner.server_timing_header.set(enabled);
+        }
+    }
+
+    /// The EFFECTIVE `Server-Timing` header setting (default off). Logged at startup so an operator
+    /// can confirm the header is not being exposed in production.
+    #[cfg(feature = "handlers")]
+    pub fn server_timing_enabled(&self) -> bool {
+        self.inner
+            .as_ref()
+            .is_some_and(|inner| inner.server_timing_header())
     }
 
     /// The EFFECTIVE per-component serve-admission cap (the operator's `[handlers] serve_concurrency`,
