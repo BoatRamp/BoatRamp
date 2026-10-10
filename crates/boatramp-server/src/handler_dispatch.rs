@@ -305,6 +305,26 @@ pub(super) async fn dispatch_handler(
                         (Vec::new(), false)
                     };
                     let auth_us = auth_start.elapsed().as_micros() as u64;
+                    // Ask B (compose follow-up): bound concurrent server-side GraphQL requests PER
+                    // PROJECT. The federated gateway and the data connector both serve off the
+                    // composed supergraph and (for federation) fan out to subgraph functions via
+                    // `serve_lane` DIRECTLY — a path that bypasses the per-handler admission gate below
+                    // (it `return`s here, before line ~480). So a burst of concurrent `/graphql`
+                    // requests otherwise oversubscribes the workers exactly like the `/img` gallery did
+                    // (measured on the live node: fanout ~17ms→~1s at 24-concurrent). Gate the gateway
+                    // ENTRY, keyed by project (the supergraph's scope), so at most `serve_concurrency`
+                    // gateway requests run that region at once and the rest queue cheaply — the same
+                    // KeyedSemaphores + cap the handler path uses. The internal fanout (serve_lane) and
+                    // `graphql::run` never re-enter THIS dispatch entry, so there is no reentrancy here;
+                    // but a guest that HTTP-self-calls `/graphql` would, so the SAME nonce-verified
+                    // self-egress exemption applies (depth > 0 skips; a forged header verifies to 0 ⇒
+                    // still gated, no bypass). Held until this function returns the gateway response.
+                    let _gw_admission =
+                        if inner.engine.verified_self_egress_depth(&parts.headers) > 0 {
+                            None
+                        } else {
+                            acquire_component_admission(inner, &format!("graphql:{project}")).await
+                        };
                     // Federation gateway: plan the query against the project's registered
                     // subgraphs and execute it by dispatching fetches to the subgraph
                     // functions, instead of running a single handler component.
