@@ -5,6 +5,39 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.27.0] - unreleased
+
+Image-serve-latency Ask B — the fix for the warm `/img` gallery stall, now that the Ask B-2
+`bindgap` sub-instrumentation (below) proved it. Measured on the live 2-vCPU node: a gallery firing
+~48 requests at ONE component put 48 dispatch tasks into the `build_bindings` + instantiate +
+serve-to-head region at once — far more runnable tasks than tokio workers — so their await-resumptions
+queued and the wall-clock piled into `bindgap` (4–7 s @48). It was **not** any binding construction
+(`blobbuild`=0.0 ms, `msgbuild`=0.2 ms) — it was scheduling park. Host/daemon-side only; no WIT/shim
+change.
+
+- **Per-component serve-admission gate.** A `tokio::sync::Semaphore` keyed by component content hash,
+  acquired before `build_bindings` and held through serve-to-head, bounds how many requests to one
+  component are in that expensive region at once; the rest WAIT cheaply on the semaphore (a parked
+  waiter does not poll, so it does not add to the thrash) — the ecosystem-standard "limit concurrency
+  before the scarce resource" fix. New `[handlers] serve_concurrency` knob: `0` disables it (legacy
+  unbounded serve), absent ⇒ `available_parallelism × 4` (floored at 8), so a small-core node is
+  bounded out of the box. Cancellation-safe (a client hangup releases/never-takes the permit). A bonus:
+  capping concurrent serves also caps the cold-burst's concurrent new object-store connections, so a
+  gallery's first load no longer stampedes a fresh connection pool.
+- **`KeyedSemaphores`.** The open-coded `Mutex<HashMap<key, Arc<Semaphore>>>` "lazy per-key gate"
+  pattern (per-site, per-stream, per-consumer) is now one audited type that owns the invariant in a
+  single place (the lock is never held across an `.await`) and rebuilds a gate when its cap changes —
+  so a `max_concurrency` / `max_stream_connections` reload now takes effect without a restart (the old
+  `or_insert_with` silently ignored cap changes until then).
+- **`bindgap` sub-instrumentation (Ask B-2).** The opaque `binding_build_us` phase is split into
+  `blobbuild` (the `wasi:blobstore` binding construction), `msgbuild` (the per-publish signed-context
+  mint), and `bindgap` (the unaccounted remainder) in both the `boatramp::handler` log line and the
+  `Server-Timing` response header, so a multi-second bindings phase is attributable to a specific
+  sub-cost — or, as here, to scheduling park (a large `bindgap` with the others ≈ 0).
+- A deterministic CI merge-gate (`SERVE-ADMISSION-GATE OK`) proves the admission bound holds (max
+  concurrent serves ≤ cap enabled, > cap disabled), so a regression that silently drops the gate fails
+  the merge.
+
 ## [0.26.0] - 2026-10-09
 
 Image-serve-latency, driven by what the v0.23.0 instrumentation measured on the live `/img` leg — which
