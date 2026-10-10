@@ -1465,6 +1465,18 @@ pub struct HandlersConfig {
     /// a node safety ceiling, not a per-invocation budget, and is distinct from
     /// a per-site `max_timeout_ms`.
     pub sync_max_timeout_ms: Option<u64>,
+    /// Max concurrent in-flight *sync-lane* invocations node-wide — the GLOBAL ceiling every
+    /// connection-bearing serve (site handler, synchronous invoke, and the `/graphql` gateway's
+    /// subgraph fan-out) passes through, distinct from the PER-COMPONENT `serve_concurrency` gate.
+    /// Absent ⇒ a host-parallelism default (`available_parallelism * 4`, floored at **64** — so it is
+    /// unchanged on nodes up to ~16 vCPU and only scales ABOVE that). Without this, the lane was pinned
+    /// at 64 regardless of host size, so adding vCPUs past ~16 bought no extra concurrent live
+    /// throughput and there was no knob to lift it. Raise it on a big node to let the sync lane use more
+    /// cores; lower it to cap aggregate live concurrency. Read once at startup. NOTE: with `[handlers]
+    /// pooling` on, the shared instance pool is sized off the summed lane concurrencies, so a larger
+    /// value enlarges the up-front virtual reservation (the non-pooling default sizes memory
+    /// per-invocation and is unaffected).
+    pub sync_max_concurrency: Option<usize>,
     /// Engine-wide safety max on a *durable async* invocation — the drain that
     /// runs `?mode=async` calls, workflow steps, cron/queue/blob triggers, and
     /// `wasi:messaging` consumers, milliseconds. No client is connected and the
