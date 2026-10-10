@@ -2876,29 +2876,39 @@ pub(super) async fn resolve_secret_env(
     // (secret overrides a same-named static env entry) is order-independent. A fetch error on ANY
     // secret still fails closed (the message names the secret); a missing one is warned + skipped.
     if let Some(store) = secret_store {
-        let fetched =
-            futures::future::join_all(boatramp_refs.iter().map(|(guest_name, name)| async move {
-                (guest_name, name, store.get(project, name).await)
-            }))
-            .await;
-        for (guest_name, name, result) in fetched {
-            match result {
-                Ok(Some(bytes)) => {
-                    let value = String::from_utf8(bytes).map_err(|_| {
-                        format!("boatramp secret {name:?} is not valid UTF-8 for an env var")
-                    })?;
-                    env.retain(|(k, _)| k != guest_name);
-                    env.push((guest_name.clone(), value));
-                }
-                Ok(None) => tracing::warn!(
-                    label,
-                    secret = %guest_name,
-                    "secret references boatramp:{name}, which is not set; not injected"
-                ),
-                Err(err) => {
-                    return Err(format!(
-                        "resolving boatramp secret {name:?} for {guest_name:?} failed: {err}"
-                    ));
+        // Fetch concurrently, but BOUND the per-serve fan-out (security-review LOW): a site's
+        // `secrets:` map is tenant deploy config with no hard count cap, so firing ALL gets at once
+        // would let a tenant inflate the map to burst the shared control-plane KV every serve (noisy
+        // neighbor). Fetch in CHUNKS of `SECRET_FETCH_FANOUT` — within a chunk the gets run at once, so
+        // the realistic handful-of-secrets case is fully concurrent (one round-trip), and even a huge
+        // map is `⌈N/32⌉` round-trips, not N serial. The per-result apply is order-independent (unique
+        // guest-var keys), and a fetch error on any secret still fails closed.
+        const SECRET_FETCH_FANOUT: usize = 32;
+        for chunk in boatramp_refs.chunks(SECRET_FETCH_FANOUT) {
+            let fetched =
+                futures::future::join_all(chunk.iter().map(|(guest_name, name)| async move {
+                    (guest_name, name, store.get(project, name).await)
+                }))
+                .await;
+            for (guest_name, name, result) in fetched {
+                match result {
+                    Ok(Some(bytes)) => {
+                        let value = String::from_utf8(bytes).map_err(|_| {
+                            format!("boatramp secret {name:?} is not valid UTF-8 for an env var")
+                        })?;
+                        env.retain(|(k, _)| k != guest_name);
+                        env.push((guest_name.clone(), value));
+                    }
+                    Ok(None) => tracing::warn!(
+                        label,
+                        secret = %guest_name,
+                        "secret references boatramp:{name}, which is not set; not injected"
+                    ),
+                    Err(err) => {
+                        return Err(format!(
+                            "resolving boatramp secret {name:?} for {guest_name:?} failed: {err}"
+                        ));
+                    }
                 }
             }
         }
