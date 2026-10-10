@@ -34,6 +34,12 @@ change.
   mint), and `bindgap` (the unaccounted remainder) in both the `boatramp::handler` log line and the
   `Server-Timing` response header, so a multi-second bindings phase is attributable to a specific
   sub-cost — or, as here, to scheduling park (a large `bindgap` with the others ≈ 0).
+- **The federated GraphQL gateway is gated too.** The `/graphql` federation path serves off the
+  composed supergraph and fans out to subgraph functions via `serve_lane` directly — a path that
+  `return`s before the per-handler gate — so a burst of concurrent `/graphql` requests oversubscribed
+  the workers the same way (measured on the live node: subgraph fanout ~17ms→~1s at 24 concurrent).
+  The gateway entry now takes the same admission permit, keyed per project, with the same
+  self-egress exemption. `serve_concurrency` bounds both the handler and the gateway paths.
 - A deterministic CI merge-gate (`SERVE-ADMISSION-GATE OK`) proves the admission bound holds (max
   concurrent serves ≤ cap enabled, > cap disabled), so a regression that silently drops the gate fails
   the merge.
