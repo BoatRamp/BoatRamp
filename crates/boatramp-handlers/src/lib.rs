@@ -8,6 +8,7 @@
 
 #[cfg(feature = "engine")]
 mod bindings;
+#[cfg(feature = "engine")]
 pub mod concurrency;
 #[cfg(feature = "engine")]
 mod engine;
@@ -41,6 +42,7 @@ pub(crate) fn pass_mutation() -> Option<String> {
 pub use bindings::Bindings;
 #[cfg(feature = "admin")]
 pub use bindings::admin::{AdminController, AdminError, DomainChallenge, Surface as AdminSurface};
+#[cfg(feature = "engine")]
 pub use concurrency::KeyedSemaphores;
 // M5 gate helper: read a blob back through the REAL guest `wasi:blobstore` read-path (proves S3-ingress
 // guest read-through). `#[doc(hidden)]` — for the live gate + integration tests only.
