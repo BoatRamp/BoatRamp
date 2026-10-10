@@ -5,6 +5,36 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.28.0] - 2026-10-10
+
+Image-serve-latency Ask B-3 — the remaining warm-serve floor, plus a security hardening. A local
+harness reproduced the serve path on a laptop (no production node), and a SlateDB get benchmark
+settled the mechanism: a warm, block-cached control-plane get is **~8 µs** (the default 512 MiB foyer
+block cache works, and holds under churn + compaction), and the tenancy-schema decode lands in the
+`resolve` phase (small for a normal schema). Neither was the floor. The floor was **`resolve_env`
+resolving a site/handler's `boatramp:` secrets with a SERIAL `store.get().await` per secret**, in the
+untimed post-messaging `bindgap` region — so N secrets cost N × per-get latency (and each serial
+`.await` also pays scheduling latency on a saturated node).
+
+- **Per-serve secret resolution is now concurrent.** `resolve_env` classifies the refs once, then
+  fetches all `boatramp:` secrets at once (`join_all`) instead of one-at-a-time — `N × latency` →
+  `~1 × latency`. Still fetched FRESH every serve (no caching, so a rotation takes effect immediately);
+  semantics unchanged (unique guest-var keys keep the dedup order-independent, a fetch error still
+  fails closed, a missing store is still refused up front).
+- **The `Server-Timing` response header is now DEFAULT-OFF.** The per-phase breakdown
+  (`session`/`bindings`/`bindgap`/`serve`/…) is valuable operator observability, but exposing it on the
+  wire leaks internal phase structure + a timing side-channel to every client. It always goes to the
+  structured phase-timing LOG; the response header is now opt-in via `[handlers] server_timing` (config)
+  or `HandlerRuntime::set_server_timing` (runtime), and the node logs when it is enabled. **Upgrade
+  note:** if you scrape `Server-Timing` from a boatramp response, set `[handlers] server_timing = true`
+  to restore it (or read the per-request phase log instead).
+- **`secretget;dur=` phase** split out of `bindgap` (in the phase log, and the now-opt-in header), so
+  the real per-serve secret-resolution cost is measurable on a node.
+- CI gate `SECRET-RESOLUTION PARALLEL OK` proves the secret fan-out does NOT scale with the secret
+  count (8 secrets at a 25 ms/get stay ~one get, not ~200 ms serial), and `SERVER-TIMING DEFAULT-OFF
+  OK` proves the header is absent unless enabled. Local diagnostics (ignored): `latency_floor_repro`
+  (serve path) and `slatedb_get_latency` (raw get latency, warm/cold/under-churn).
+
 ## [0.27.0] - 2026-10-10
 
 Image-serve-latency Ask B — the fix for the warm `/img` gallery stall, now that the Ask B-2

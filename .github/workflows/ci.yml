@@ -335,6 +335,22 @@ jobs:
           grep -q 'GATEWAY-ADMISSION-GATE OK' serve-admission.log \
             || { echo "::error::gateway-admission gate never reached its marker (the federated /graphql gateway admission bound regressed)" >&2; exit 1; }
 
+      # image-serve-latency Ask B-3: per-serve secret resolution must be CONCURRENT (the serve-path
+      # floor was a SERIAL `store.get().await` per secret), and the `Server-Timing` response header
+      # must be DEFAULT-OFF (opt-in client exposure). A regression to serial `.await`-in-a-loop, or
+      # the header turning back on by default, fails the merge.
+      - name: Secret-resolution floor gate (concurrent secret fan-out + Server-Timing default-off)
+        run: |
+          set -eo pipefail
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-server \
+            --features handlers secret_resolution_floor_gate -- --nocapture 2>&1 | tee secret-floor.log
+          grep -qE 'test result: ok\. 1 passed' secret-floor.log \
+            || { echo "::error::secret-resolution floor gate did not run (silent skip or a failure)" >&2; exit 1; }
+          grep -q 'SECRET-RESOLUTION PARALLEL OK' secret-floor.log \
+            || { echo "::error::secret resolution regressed to serial (per-secret .await-in-a-loop)" >&2; exit 1; }
+          grep -q 'SERVER-TIMING DEFAULT-OFF OK' secret-floor.log \
+            || { echo "::error::the Server-Timing response header is no longer default-off" >&2; exit 1; }
+
       # #503 CROSS-SURFACE HARD GATE (marker `SCOPED UNSCOPED-WRITE CROSS-SURFACE OK`, mirrors the
       # v0.5.0 `DB-NAME SCREENING CROSS-SURFACE OK` convention). A `scoped` route may WRITE a
       # genuinely-global table via two opt-ins (write-global `unscoped { writable: true }` OR a
