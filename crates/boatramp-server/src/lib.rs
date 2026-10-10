@@ -250,8 +250,8 @@ use scheduler::{AsyncPass, run_scheduler_tick};
 use scheduler::{CONSUMER_BATCH, CONSUMER_LEASE, CONSUMER_MAX_ATTEMPTS};
 #[cfg(feature = "handlers")]
 pub(crate) use scheduler::{
-    CronNow, acquire_site_permit, effective_limits, handler_error_response, handler_unavailable,
-    sql_starting_response,
+    CronNow, acquire_component_admission, acquire_site_permit, effective_limits,
+    handler_error_response, handler_unavailable, sql_starting_response,
 };
 #[cfg(feature = "handlers")]
 mod function_runtime;
@@ -330,15 +330,24 @@ struct HandlerRuntimeInner {
     /// Internal messaging substrate for the `wasi:messaging` binding (publish;
     /// consumer dispatch is driven separately). Absent = messaging not offered.
     messaging: Option<Arc<dyn boatramp_core::messaging::Messaging>>,
-    /// Per-site concurrency semaphores (for sites that set `maxConcurrency`),
-    /// created on first use.
-    site_semaphores:
-        std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Semaphore>>>,
-    /// Per-scope SSE connection semaphores (per-site cap),
-    /// created on first use and keyed by binding scope so a preview's streams
-    /// can't exhaust the live site's budget.
-    stream_semaphores:
-        std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Semaphore>>>,
+    /// Per-site concurrency semaphores (for sites that set `maxConcurrency`), created on first use.
+    /// The audited [`KeyedSemaphores`](boatramp_handlers::KeyedSemaphores) now owns the map +
+    /// the lock-vs-await discipline — and rebuilds a gate when the site's cap changes, so a
+    /// `maxConcurrency` reload takes effect without a restart (the old open-coded `or_insert_with`
+    /// silently ignored cap changes).
+    site_semaphores: boatramp_handlers::KeyedSemaphores,
+    /// The per-component serve-admission cap (image-serve-latency Ask B); `0` ⇒ disabled (legacy
+    /// unbounded serve). `None` ⇒ the host-parallelism default ([`default_serve_admission_cap`]);
+    /// `Some(n)` is the operator's `[handlers] serve_concurrency`. The gate itself (the per-component
+    /// `Arc<Semaphore>` map) lives in the engine — [`boatramp_handlers::HandlerEngine::serve_admission`]
+    /// — co-located with the other per-component state; this is just the policy knob the dispatch
+    /// reads to size it.
+    serve_admission_cap: std::sync::OnceLock<usize>,
+    /// Per-scope SSE connection semaphores (per-site cap), created on first use and keyed by binding
+    /// scope so a preview's streams can't exhaust the live site's budget. The audited
+    /// [`KeyedSemaphores`](boatramp_handlers::KeyedSemaphores) owns the map (and re-sizes on a
+    /// `maxStreamConnections` reload).
+    stream_semaphores: boatramp_handlers::KeyedSemaphores,
     /// Live SSE connection counts per `(scope, client-ip)`, for the per-IP cap.
     /// `Arc` so a connection's RAII guard can decrement it on drop.
     stream_ip_counts: Arc<std::sync::Mutex<std::collections::HashMap<(String, IpAddr), u32>>>,
@@ -610,8 +619,35 @@ pub struct BlobUploadMintConfig {
     pub max_bytes_ceiling: Option<u64>,
 }
 
+/// The default per-component serve-admission cap when the operator sets no `[handlers]
+/// serve_concurrency` (image-serve-latency Ask B). Derived from host parallelism so a small-core node
+/// bounds oversubscription out of the box: `available_parallelism * 4`, floored at 8. The `*4` keeps
+/// enough in-flight to overlap the I/O-bound serve legs (the blob GET) while capping the runnable-task
+/// count far below the ~48-wide burst that produced the park — on a 2-vCPU node this is 8, which cut
+/// the measured 48-wide `bindgap` without throttling normal traffic (handlers rarely need >8
+/// concurrent per component on 2 cores). Generous on big hosts; an operator caps it explicitly if a
+/// component should be tighter, or sets `0` to disable the gate entirely.
+#[cfg(feature = "handlers")]
+fn default_serve_admission_cap() -> usize {
+    let cores = match std::thread::available_parallelism() {
+        Ok(n) => n.get(),
+        Err(_) => 1,
+    };
+    cores.saturating_mul(4).max(8)
+}
+
 #[cfg(feature = "handlers")]
 impl HandlerRuntimeInner {
+    /// The effective per-component serve-admission cap: the operator's `[handlers] serve_concurrency`
+    /// if set, else the host-parallelism default. `0` ⇒ the gate is disabled (legacy unbounded serve).
+    #[cfg(feature = "handlers")]
+    pub(crate) fn serve_admission_cap(&self) -> usize {
+        self.serve_admission_cap
+            .get()
+            .copied()
+            .unwrap_or_else(default_serve_admission_cap)
+    }
+
     /// The injectable env source for config-named host-env secret lookups — the
     /// real process environment ([`boatramp_core::env::SystemEnv`]) unless a test
     /// wired a `MapEnv` via [`HandlerRuntime::set_env_source`]. Threaded into
@@ -762,8 +798,9 @@ impl HandlerRuntime {
                 storage,
                 sql,
                 messaging,
-                site_semaphores: std::sync::Mutex::new(std::collections::HashMap::new()),
-                stream_semaphores: std::sync::Mutex::new(std::collections::HashMap::new()),
+                site_semaphores: boatramp_handlers::KeyedSemaphores::new(),
+                serve_admission_cap: std::sync::OnceLock::new(),
+                stream_semaphores: boatramp_handlers::KeyedSemaphores::new(),
                 stream_ip_counts: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
                 metrics: metrics::Metrics::default(),
                 logs: Arc::new(logs::LogStore::default()),
@@ -961,6 +998,17 @@ impl HandlerRuntime {
     pub fn set_max_blob_bytes(&self, max_bytes: u64) {
         if let Some(inner) = self.inner.as_ref() {
             let _ = inner.max_blob_bytes.set(max_bytes);
+        }
+    }
+
+    /// Set the per-component serve-admission cap from `[handlers] serve_concurrency` (image-serve-latency
+    /// Ask B). `0` disables the gate (legacy unbounded). Unset ⇒ the host-parallelism default
+    /// ([`default_serve_admission_cap`]). Set once at serve startup; see
+    /// [`HandlerRuntimeInner::component_admission`].
+    #[cfg(feature = "handlers")]
+    pub fn set_serve_concurrency(&self, cap: usize) {
+        if let Some(inner) = self.inner.as_ref() {
+            let _ = inner.serve_admission_cap.set(cap);
         }
     }
 

@@ -82,13 +82,13 @@ pub(super) fn acquire_stream_permit(
         .max_stream_connections
         .unwrap_or(DEFAULT_STREAM_CONNECTIONS)
         .max(1) as usize;
-    let semaphore = {
-        let mut map = inner.stream_semaphores.lock().unwrap();
-        map.entry(scope.to_string())
-            .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(max)))
-            .clone()
-    };
-    semaphore.try_acquire_owned().map_err(|_| ())
+    // `KeyedSemaphores::gate` re-sizes on a `maxStreamConnections` reload; `try_acquire` keeps the
+    // shed-to-503 semantics.
+    inner
+        .stream_semaphores
+        .gate(scope, max)
+        .try_acquire_owned()
+        .map_err(|_| ())
 }
 
 /// Acquire a per-`(scope, IP)` live-stream slot, returning an RAII guard that

@@ -25,6 +25,7 @@ use wasmtime_wasi_http::types::HostIncomingRequest;
 use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpView};
 
 use crate::bindings::{self, Bindings};
+use crate::concurrency::KeyedSemaphores;
 
 /// Generated bindings for the **consumer** world (`wasi:messaging` incoming
 /// handler): imports the producer (host-provided) and exports `handle`, which
@@ -800,17 +801,17 @@ fn lane_gate_mutation() -> Option<String> {
 /// holds one small entry per declared consumer (bounded, not per-message).
 #[cfg(feature = "messaging")]
 #[derive(Default)]
-struct ConsumerGates(Mutex<std::collections::HashMap<String, (usize, Arc<Semaphore>)>>);
+struct ConsumerGates(KeyedSemaphores);
 
 #[cfg(feature = "messaging")]
 impl ConsumerGates {
     /// Resolve the `Arc<Semaphore>` for consumer `key`, sized `min(cap, lane_ceiling)` (floored at 1)
     /// — the per-consumer value can never exceed the operator lane budget. Rebuilt if the effective
-    /// cap changed (next `apply`). This is a **synchronous** map lookup/insert (NO `.await`): the
+    /// cap changed (next `apply`). The map + the lock-vs-await discipline live in
+    /// [`KeyedSemaphores`](boatramp_core::concurrency::KeyedSemaphores) now (the one audited home for
+    /// this pattern); this wrapper only applies the lane-ceiling clamp (and its mutation seam). The
     /// caller resolves the gate ONCE per batch and `.acquire_owned()`s a permit per message off the
-    /// returned `Arc`, so the map lock is taken once per batch, not once per message. Keeping the
-    /// lock and the await strictly separate is also why there is no "guard across await" to reason
-    /// about — this fn never awaits.
+    /// returned `Arc`, so no guard is ever held across an await.
     fn gate(&self, key: &str, cap: usize, lane_ceiling: usize) -> Arc<Semaphore> {
         // MUTATION SEAM (G-conc): the per-consumer cap is floored by the lane budget so a declared
         // `max_concurrency` can never raise a consumer above the operator's `async_max_concurrency`.
@@ -820,15 +821,7 @@ impl ConsumerGates {
         } else {
             cap.min(lane_ceiling).max(1)
         };
-        let mut map = self.0.lock().unwrap();
-        match map.get(key) {
-            Some((c, s)) if *c == eff => Arc::clone(s),
-            _ => {
-                let s = Arc::new(Semaphore::new(eff));
-                map.insert(key.to_string(), (eff, Arc::clone(&s)));
-                s
-            }
-        }
+        self.0.gate(key, eff)
     }
 }
 
@@ -886,6 +879,13 @@ pub struct HandlerEngine {
     /// with no `max_concurrency` never enters it and shares the async lane budget exactly as before.
     #[cfg(feature = "messaging")]
     consumer_gates: ConsumerGates,
+    /// Per-component serve-path ADMISSION gates (image-serve-latency Ask B), keyed by component blob
+    /// hash. Resolved by [`serve_admission`](Self::serve_admission) and acquired by the request
+    /// dispatch BEFORE `build_bindings`, so a burst to one component (a gallery firing ~48 `/img`
+    /// thumbnails) admits only a bounded number into the expensive build+serve region and queues the
+    /// rest cheaply — the fix for the measured `bindgap` scheduling park. The same audited
+    /// [`KeyedSemaphores`] the consumer gates use; keyed by a deploy-derived hash (bounded set).
+    request_gates: KeyedSemaphores,
     /// Concurrency cap on **compilation** (deploy-resilience #2): bounds how many cranelift
     /// compiles run at once, so a bulk precompile (e.g. an apply uploading many components, each
     /// warming the cache via [`precompile_gated`](Self::precompile_gated)) can't spike RSS on a
@@ -1070,6 +1070,7 @@ impl HandlerEngine {
             consumer_cache: Mutex::new(LruCache::new(capacity)),
             #[cfg(feature = "messaging")]
             consumer_gates: ConsumerGates::default(),
+            request_gates: KeyedSemaphores::default(),
             #[cfg(feature = "session")]
             session_cache: Mutex::new(LruCache::new(capacity)),
             semaphore: Semaphore::new(limits.max_concurrency.max(1)),
@@ -1139,6 +1140,18 @@ impl HandlerEngine {
     pub fn consumer_gate(&self, key: &str, cap: usize) -> Arc<Semaphore> {
         self.consumer_gates
             .gate(key, cap, self.async_limits.max_concurrency)
+    }
+
+    /// Resolve the **per-component serve-admission** gate (image-serve-latency Ask B): the
+    /// `Arc<Semaphore>` sized `cap` for component blob `hash`, created on first use and rebuilt if the
+    /// cap changed. The request dispatch resolves this BEFORE `build_bindings` and `.acquire_owned()`s
+    /// a permit off the returned `Arc` (held through serve-to-head), so at most `cap` requests are
+    /// ever inside the expensive build+instantiate+serve region per component — the rest queue cheaply
+    /// on the semaphore instead of oversubscribing the tokio workers (the measured `bindgap` park).
+    /// The lookup is synchronous (the lock is never held across the caller's await). Call only with
+    /// `cap >= 1`; the caller treats `cap == 0` as "gate disabled" and skips this entirely.
+    pub fn serve_admission(&self, hash: &str, cap: usize) -> Arc<Semaphore> {
+        self.request_gates.gate(hash, cap)
     }
 
     /// The sync-lane wall-clock ceiling (ms): connection-bearing requests (site
