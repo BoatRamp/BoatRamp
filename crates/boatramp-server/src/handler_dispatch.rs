@@ -468,7 +468,20 @@ pub(super) async fn dispatch_handler(
     // oversubscribing the tokio workers — the fix for the measured multi-second `bindgap` park. The
     // gate is disabled (`None`, legacy unbounded) when `serve_concurrency` is 0. Cancellation-safe:
     // if the client hangs up, this future is dropped and the permit is released / never taken.
-    let _admission = acquire_component_admission(inner, &entry.hash).await;
+    //
+    // EXCEPTION (reentrant-deadlock guard): a NONCE-VERIFIED re-entrant self-egress call (a guest
+    // that made a blocking HTTP call back to its own node, continuing the chain at depth > 0) must
+    // NOT take a second permit — the OUTER request in the chain already holds this component's permit,
+    // so gating the inner call too would be a circular wait under load (every permit held by an outer
+    // request blocked awaiting its inner call's permit). We skip the gate ONLY on a nonce-verified
+    // marker; a forged `x-boatramp-egress-depth` verifies to 0, so an external client cannot use this
+    // to bypass the gate. In-process invoke/graphql fan-out bypasses dispatch entirely, so HTTP
+    // self-egress is the only re-entry that reaches here.
+    let _admission = if inner.engine.verified_self_egress_depth(request.headers()) > 0 {
+        None
+    } else {
+        acquire_component_admission(inner, &entry.hash).await
+    };
     // Ask-1: a per-request blob-op timing handle; `build_bindings` wraps the `wasi:blobstore` storage in
     // a `TimingStorage` writing into it, and we snapshot it after `serve_lane` to fold the blob GET/HEAD
     // µs into the phase log (otherwise hidden inside `serve_us`).

@@ -267,6 +267,15 @@ pub async fn build_handler_runtime(
     if let Some(cap) = handlers_cfg.and_then(|h| h.serve_concurrency) {
         runtime.set_serve_concurrency(cap);
     }
+    // Log the EFFECTIVE cap at startup (default-on): an operator can then correlate a post-upgrade
+    // latency change to the gate, and see what to raise / set to 0 to disable.
+    match runtime.serve_concurrency() {
+        0 => tracing::info!("serve-admission gate DISABLED ([handlers] serve_concurrency = 0)"),
+        cap => tracing::info!(
+            serve_concurrency = cap,
+            "serve-admission gate active: ≤ {cap} concurrent serves per component"
+        ),
+    }
     // Event-driven delivery cadences (B17): the two operator `[handlers]` knobs (absent ⇒ default).
     // Pure latency/idle-cost tradeoff — never affects at-least-once.
     {

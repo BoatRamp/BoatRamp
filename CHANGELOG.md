@@ -38,6 +38,14 @@ change.
   concurrent serves ≤ cap enabled, > cap disabled), so a regression that silently drops the gate fails
   the merge.
 
+> **Upgrade note — the serve-admission gate is ON by default.** A component that previously sustained
+> more than `available_parallelism × 4` (min 8) concurrent requests now queues the excess (bounded
+> latency, nothing dropped). If a handler legitimately needs deeper in-flight concurrency, raise
+> `[handlers] serve_concurrency`, or set it to `0` to restore the pre-0.27.0 unbounded serve. The node
+> logs the effective cap at startup. A re-entrant self-egress call (a guest making a blocking HTTP call
+> back to its own node) is exempt from the gate (nonce-verified) so it can never deadlock against the
+> outer request's permit. `serve_concurrency` is read once at startup — changing it needs a restart.
+
 ## [0.26.0] - 2026-10-09
 
 Image-serve-latency, driven by what the v0.23.0 instrumentation measured on the live `/img` leg — which

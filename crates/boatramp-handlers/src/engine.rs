@@ -1154,6 +1154,28 @@ impl HandlerEngine {
         self.request_gates.gate(hash, cap)
     }
 
+    /// The NONCE-VERIFIED inbound self-egress recursion depth from [`SELF_EGRESS_DEPTH_HEADER`]:
+    /// trust the marker only when it carries THIS process's [`egress_nonce`](Self::egress_nonce) (an
+    /// external client cannot forge it), else `0` (a fresh external request, or a forged/absent/
+    /// malformed marker). The request dispatch calls this BEFORE the serve-admission gate to SKIP the
+    /// gate for a re-entrant self-call (depth > 0): the outer request in the self-call chain already
+    /// holds this component's permit, so making the inner re-entrant call also take one would be a
+    /// reentrant deadlock under load (the outer holds a permit while awaiting the inner's → circular
+    /// wait until the outer's wall-clock timeout). Because a bogus header verifies to `0`, the gate
+    /// still bounds EVERY real external burst — the skip cannot be used to bypass it.
+    pub fn verified_self_egress_depth(&self, headers: &http::HeaderMap) -> u32 {
+        headers
+            .get(SELF_EGRESS_DEPTH_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.split_once(':'))
+            .and_then(|(n, d)| {
+                (u64::from_str_radix(n, 16).ok()? == self.egress_nonce)
+                    .then(|| d.parse::<u32>().ok())
+                    .flatten()
+            })
+            .unwrap_or(0)
+    }
+
     /// The sync-lane wall-clock ceiling (ms): connection-bearing requests (site
     /// handlers, synchronous invokes) are clamped to this. A deploy that declares a
     /// larger per-handler/site timeout can inspect this to warn that sync calls will
@@ -2007,21 +2029,11 @@ impl HandlerEngine {
         // errors map to `ErrorCode` — so the live request body flows into the
         // guest frame-by-frame instead of being buffered up front.
         let (parts, body) = request.into_parts();
-        // Inbound self-egress recursion depth: trust the marker only when it carries this
-        // process's nonce (an external client can't forge it) — otherwise this is a fresh
-        // external request at depth 0. A guest self-call then continues the chain at depth+1.
-        let nonce = store.data().egress_nonce;
-        let egress_depth = parts
-            .headers
-            .get(SELF_EGRESS_DEPTH_HEADER)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.split_once(':'))
-            .and_then(|(n, d)| {
-                (u64::from_str_radix(n, 16).ok()? == nonce)
-                    .then(|| d.parse::<u32>().ok())
-                    .flatten()
-            })
-            .unwrap_or(0);
+        // Inbound self-egress recursion depth (nonce-verified — an external client can't forge it;
+        // a fresh external request is depth 0, a guest self-call continues the chain at depth+1). The
+        // SAME verification the request dispatch uses to skip the serve-admission gate for a
+        // re-entrant self-call, so the two can never drift.
+        let egress_depth = self.verified_self_egress_depth(&parts.headers);
         store.data_mut().egress_depth = egress_depth;
         let incoming = HostIncomingBody::new(
             stream_incoming_body(body, effective.max_body_bytes),
@@ -2193,6 +2205,38 @@ mod tests {
     #[test]
     fn engine_builds() {
         build_engine(None).expect("engine builds");
+    }
+
+    /// The reentrant-deadlock guard (image-serve-latency Ask B, security review HIGH): the request
+    /// dispatch skips the per-component serve-admission gate for a re-entrant self-egress call, keyed
+    /// on `verified_self_egress_depth > 0`. That skip MUST be forge-proof — an external client passing
+    /// a bogus `x-boatramp-egress-depth` must verify to depth 0 (still gated), or the gate could be
+    /// bypassed and the park re-created. Only the marker carrying THIS process's nonce is trusted.
+    #[tokio::test]
+    async fn verified_self_egress_depth_trusts_only_the_process_nonce() {
+        let engine = HandlerEngine::new(Limits::default(), 4).expect("engine");
+        let nonce = engine.egress_nonce;
+        let hdr = |val: String| {
+            let mut h = http::HeaderMap::new();
+            h.insert(SELF_EGRESS_DEPTH_HEADER, val.parse().unwrap());
+            h
+        };
+        // Correct process nonce ⇒ the depth is trusted (a genuine self-call chain).
+        assert_eq!(
+            engine.verified_self_egress_depth(&hdr(format!("{nonce:x}:3"))),
+            3
+        );
+        // Wrong nonce ⇒ forged ⇒ depth 0 (cannot be used to skip/bypass the gate).
+        assert_eq!(
+            engine.verified_self_egress_depth(&hdr(format!("{:x}:3", nonce.wrapping_add(1)))),
+            0
+        );
+        // Absent / malformed marker ⇒ fresh external request at depth 0.
+        assert_eq!(
+            engine.verified_self_egress_depth(&http::HeaderMap::new()),
+            0
+        );
+        assert_eq!(engine.verified_self_egress_depth(&hdr("garbage".into())), 0);
     }
 
     /// Anti-hollow gate (image-serve-latency Ask A): the wasm compile cache MUST be pinned to the
