@@ -268,6 +268,10 @@ pub fn host_capability_features_detailed() -> Vec<CapabilityFeature> {
     // Base grantable capabilities (the KNOWN_IMPORTS tokens) — the established interface grants.
     let mut f: Vec<CapabilityFeature> = boatramp_core::config::known_imports()
         .iter()
+        // `wasi:sockets` (gated outbound-TCP, PLAN-handler-tcp-egress) IS a KNOWN_IMPORT so a deploy
+        // may DECLARE it offline, but it is advertised as Experimental below (not Stable) — a new,
+        // posture-gated, off-by-default surface. Filtered here so it isn't ALSO advertised Stable.
+        .filter(|&&name| name != "wasi:sockets")
         .map(|&name| CapabilityFeature {
             name,
             lifecycle: Stable,
@@ -371,6 +375,20 @@ pub fn host_capability_features_detailed() -> Vec<CapabilityFeature> {
         // until the shape settles.
         f.push(CapabilityFeature {
             name: "orm-subquery",
+            lifecycle: Experimental,
+        });
+    }
+    // The gated `wasi:sockets` outbound-TCP capability (PLAN-handler-tcp-egress): connect-only,
+    // per-handler-allowlisted, posture-gated (`allow_guest_tcp_egress`, off under multi-tenant). The
+    // socket host is ALWAYS linked when the engine is compiled (`wasmtime_wasi::add_to_linker_async`),
+    // so host SUPPORT is advertised whenever handlers are — the posture/allowlist are a separate
+    // RUNTIME decision, exactly like `wasi:http` egress is advertised yet SSRF-gated at runtime. A
+    // guest declares `requires = ["wasi:sockets"]` so a deploy against a host predating it is refused
+    // cleanly (instead of failing to instantiate). Experimental until the shape (incl. the deferred
+    // inbound bind/listen epic) settles.
+    if cfg!(feature = "handlers") {
+        f.push(CapabilityFeature {
+            name: "wasi:sockets",
             lifecycle: Experimental,
         });
     }
@@ -923,6 +941,12 @@ mod tests {
         // enabled it, so `boatramp capabilities` lists it and the `requires` ABI gate is meaningful.
         // (Its absence in the released image was the construens presigned-blob-upload gap — GATE.)
         assert_eq!(host.contains(&"blob-upload"), cfg!(feature = "blob-upload"));
+        // The gated `wasi:sockets` outbound-TCP capability (PLAN-handler-tcp-egress) is advertised
+        // whenever handlers are compiled (the socket host is always linked), so a guest's
+        // `requires = ["wasi:sockets"]` is admitted on a supporting host and refused cleanly on one
+        // predating it. It is a KNOWN_IMPORT (declarable offline) but advertised Experimental, not
+        // Stable — asserted below so a regression to Stable (or a dropped advertisement) is caught.
+        assert!(host.contains(&"wasi:sockets"));
         // The detailed registry pairs each name with a lifecycle, and its names are exactly the
         // flat list (one source of truth — the flat list derives from the detailed one).
         let detailed = host_capability_features_detailed();
@@ -945,6 +969,11 @@ mod tests {
         );
         assert_eq!(
             lifecycle("orm-own-pref"),
+            Some(super::Lifecycle::Experimental)
+        );
+        // `wasi:sockets` is advertised Experimental (NOT the blanket-Stable KNOWN_IMPORTS lifecycle).
+        assert_eq!(
+            lifecycle("wasi:sockets"),
             Some(super::Lifecycle::Experimental)
         );
         // The admission filter keeps only requirements the host cannot satisfy.

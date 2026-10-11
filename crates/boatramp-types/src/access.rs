@@ -255,10 +255,28 @@ fn ipv6_is_global(a: Ipv6Addr) -> bool {
     if a.is_loopback() || a.is_unspecified() || a.is_multicast() {
         return false;
     }
+    // Any IPv6 form that EMBEDS an IPv4 address is only as global as that embedded v4 — otherwise an
+    // internal v4 (loopback/private/CGNAT/the cloud-metadata address) smuggled through a v4-mapped
+    // (`::ffff:a.b.c.d`), deprecated v4-compatible (`::a.b.c.d`, `::/96`), or NAT64
+    // (`64:ff9b::a.b.c.d`, RFC 6052) IPv6 literal would read as global and slip the SSRF floor. Unwrap
+    // each to the embedded v4 and reuse the v4 rule. (`::`/`::1` are caught as unspecified/loopback
+    // above, so the `::/96` branch never misclassifies them.)
+    let segs = a.segments();
     if let Some(v4) = a.to_ipv4_mapped() {
         return ipv4_is_global(v4);
     }
-    let first = a.segments()[0];
+    let embedded_v4 = |lo0: u16, lo1: u16| {
+        Ipv4Addr::new((lo0 >> 8) as u8, lo0 as u8, (lo1 >> 8) as u8, lo1 as u8)
+    };
+    // NAT64 well-known prefix 64:ff9b::/96 — low 32 bits are the embedded v4.
+    if segs[0] == 0x0064 && segs[1] == 0xff9b && segs[2..6].iter().all(|&s| s == 0) {
+        return ipv4_is_global(embedded_v4(segs[6], segs[7]));
+    }
+    // IPv4-compatible ::/96 (deprecated) — high 96 bits zero, low 32 the embedded v4.
+    if segs[..6].iter().all(|&s| s == 0) {
+        return ipv4_is_global(embedded_v4(segs[6], segs[7]));
+    }
+    let first = segs[0];
     if (first & 0xfe00) == 0xfc00 {
         return false; // fc00::/7 unique local
     }
@@ -274,7 +292,12 @@ mod tests {
 
     #[test]
     fn global_ip_blocks_internal_ranges() {
-        let public = ["8.8.8.8", "1.1.1.1", "2606:4700:4700::1111"];
+        let public = [
+            "8.8.8.8",
+            "1.1.1.1",
+            "2606:4700:4700::1111",
+            "64:ff9b::808:808", // NAT64-embedded GLOBAL v4 (8.8.8.8) stays global
+        ];
         let internal = [
             "127.0.0.1",
             "10.1.2.3",
@@ -286,7 +309,14 @@ mod tests {
             "::1",
             "fc00::1",
             "fe80::1",
-            "::ffff:127.0.0.1", // v4-mapped loopback
+            "::ffff:127.0.0.1",       // v4-mapped loopback
+            "::ffff:169.254.169.254", // v4-mapped metadata
+            "::7f00:1",               // v4-compatible ::/96 loopback (::127.0.0.1)
+            "::a01:203",              // v4-compatible ::/96 private (::10.1.2.3)
+            "::ffff:a9fe:a9fe",       // v4-mapped metadata (hex form)
+            "64:ff9b::7f00:1",        // NAT64 loopback (::127.0.0.1)
+            "64:ff9b::a9fe:a9fe",     // NAT64 cloud metadata (169.254.169.254)
+            "64:ff9b::0a01:0203",     // NAT64 private (10.1.2.3)
         ];
         for ip in public {
             assert!(is_global_ip(ip.parse().unwrap()), "{ip} should be global");

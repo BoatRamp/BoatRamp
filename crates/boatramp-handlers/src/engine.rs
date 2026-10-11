@@ -774,6 +774,22 @@ async fn egress_target_allowed(
     Ok(EgressPlan { self_depth: None })
 }
 
+// KNOWN / ACCEPTED LIMITATIONS (PLAN-handler-tcp-egress TE-3, security-review accepted — not fixed in
+// this stage, tracked for a follow-up):
+//  1. Per-connect DNS for DOMAIN allowlist entries is UNCACHED: every connect to a domain entry does a
+//     fresh `lookup_host`. TODO(tcp-egress): add a short-TTL positive/negative resolve cache (the SSRF
+//     floor still independently gates each resolved peer, so a stale cache can't widen reach) + a
+//     per-handler egress-connect metric and an operator connect-rate/-count limit.
+//  2. `allow_ip_name_lookup(true)` (enabled in `new_store` only under the posture + a non-empty
+//     allowlist) lets a granted guest resolve ARBITRARY names host-side — a low-bandwidth DNS
+//     side-channel/exfil vector independent of the connect allowlist (resolution ≠ connection; only an
+//     allowlisted+SSRF-cleared peer is ever reachable). Accepted for now; a future tightening could
+//     scope name lookups to the allowlist's own domains.
+//  3. A broad CIDR entry (e.g. `0.0.0.0/0:443`) is a config FOOTGUN — it allowlists every global host
+//     on that port (the SSRF floor still bars private/metadata unless `allow_guest_private_egress`).
+//     The allowlist is host/operator config (never guest-supplied), so this is an operator-review
+//     concern; TODO(tcp-egress): a deploy-time lint warning on an overly-broad entry.
+//
 /// Whether `addr` (a resolved TCP `connect` peer) is permitted by the per-handler outbound-TCP
 /// `egress_allowlist` (`PLAN-handler-tcp-egress`). Each allowlist entry is `<target>:<port>`, where
 /// `<target>` is an **IP literal** (exact match), a **CIDR** (membership), or a **domain** (resolved
@@ -825,6 +841,52 @@ async fn tcp_egress_allowed(allowlist: &[String], addr: SocketAddr) -> bool {
     false
 }
 
+/// The full outbound-TCP connect authorization decision (`PLAN-handler-tcp-egress`): the single pure
+/// predicate the installed `socket_addr_check` closure ([`HandlerEngine::new_store`]) calls, so the
+/// TESTED code is the ENFORCED code. Returns `true` (permit) only when ALL hold:
+/// 1. **posture** — `posture_tcp_egress` is on (`allow_guest_tcp_egress`). Defense-in-depth: the
+///    closure is only INSTALLED when the posture is on, but carrying the check here means the gate
+///    still denies even if the install site regressed.
+/// 2. **connect-only** — `use_` is `TcpConnect`; every `bind`/`listen` and all UDP are denied
+///    (inbound stays the container/microVM model).
+/// 3. **SSRF floor** — the peer is globally routable, unless `allow_private_egress` is separately on
+///    (so an allowlisted private/metadata target still needs that opt-in).
+/// 4. **allowlist** — the peer matches a per-handler [`tcp_egress_allowed`] entry (IP/CIDR/domain + port).
+///
+/// The `tcpegress_mutation()` seam (test/`tcpegress-gate-mutation` only) neuters exactly one check at
+/// a time so the CI gate proves each is load-bearing; a shipped build evaluates all four.
+async fn tcp_connect_decision(
+    use_: SocketAddrUse,
+    addr: SocketAddr,
+    allowlist: &[String],
+    allow_private: bool,
+    posture_tcp_egress: bool,
+) -> bool {
+    let mutation = tcpegress_mutation();
+    let mutating = |m: &str| mutation.as_deref() == Some(m);
+
+    // (1) Posture gate.
+    if !posture_tcp_egress && !mutating("drop_posture") {
+        return false;
+    }
+    // (2) Connect-only.
+    if !matches!(use_, SocketAddrUse::TcpConnect) && !mutating("admit_bind_listen") {
+        return false;
+    }
+    // (3) SSRF floor (applied BEFORE the allowlist so an allowlisted private target still needs the
+    // separate `allow_guest_private_egress` opt-in). No mutation neuters the floor here — the
+    // metadata/private SSRF property is already gate-proven by `is_global_ip`'s own unit tests; this
+    // gate's three mutations target the capability-specific checks (posture/connect-only/allowlist).
+    if !allow_private && !boatramp_core::access::is_global_ip(addr.ip()) {
+        return false;
+    }
+    // (4) Allowlist membership.
+    if mutating("admit_unallowlisted") {
+        return true;
+    }
+    tcp_egress_allowed(allowlist, addr).await
+}
+
 /// The active async-lane mutation (anti-hollow gates), or `None`. Present ONLY under `cfg(test)`
 /// (this crate's own unit gates) or the `async-lane-gate-mutation` feature; a shipped build has
 /// neither, so both lane clamps below — the per-invocation memory down-clamp in
@@ -837,6 +899,22 @@ fn lane_gate_mutation() -> Option<String> {
 #[cfg(not(any(test, feature = "async-lane-gate-mutation")))]
 #[inline]
 fn lane_gate_mutation() -> Option<String> {
+    None
+}
+
+/// The active TCP-egress gate mutation (`PLAN-handler-tcp-egress` TE-3 anti-hollow gate), or `None`.
+/// Present ONLY under `cfg(test)` (the in-crate gate) or the `tcpegress-gate-mutation` feature; a
+/// shipped build has neither, so [`tcp_connect_decision`]'s three security checks are unconditional
+/// and this is a dead `None`. Each recognized value neuters ONE check so the CI gate can prove it
+/// goes RED: `admit_unallowlisted` (bypass the allowlist), `admit_bind_listen` (drop connect-only),
+/// `drop_posture` (ignore the posture gate). NOT a backdoor — it only reads a test env var.
+#[cfg(any(test, feature = "tcpegress-gate-mutation"))]
+fn tcpegress_mutation() -> Option<String> {
+    std::env::var("BOATRAMP_TCPEGRESS_MUTATION").ok()
+}
+#[cfg(not(any(test, feature = "tcpegress-gate-mutation")))]
+#[inline]
+fn tcpegress_mutation() -> Option<String> {
     None
 }
 
@@ -1952,25 +2030,18 @@ impl HandlerEngine {
         let egress_allowlist = bindings.egress_allowlist();
         if self.allow_tcp_egress && !egress_allowlist.is_empty() {
             let allow_private = self.allow_private_egress;
+            let posture_tcp_egress = self.allow_tcp_egress;
             let allowlist = egress_allowlist;
             wasi_builder.allow_tcp(true);
             wasi_builder.allow_udp(false);
             wasi_builder.allow_ip_name_lookup(true);
             wasi_builder.socket_addr_check(move |addr, use_| {
                 let allowlist = allowlist.clone();
+                // The decision is the pure `tcp_connect_decision` (the SAME predicate the TE-3 gate
+                // tests + mutation-verifies), so the enforced path and the tested path never drift.
                 Box::pin(async move {
-                    // (a) Connect-only: refuse bind/listen and every UDP use outright.
-                    if !matches!(use_, SocketAddrUse::TcpConnect) {
-                        return false;
-                    }
-                    // (c) SSRF floor: a non-global peer is refused unless private egress is allowed —
-                    // applied BEFORE the allowlist so an allowlisted private target still needs the
-                    // separate `allow_guest_private_egress` opt-in.
-                    if !allow_private && !boatramp_core::access::is_global_ip(addr.ip()) {
-                        return false;
-                    }
-                    // (b) Allowlist membership (IP / CIDR / host-resolved domain + port).
-                    tcp_egress_allowed(&allowlist, addr).await
+                    tcp_connect_decision(use_, addr, &allowlist, allow_private, posture_tcp_egress)
+                        .await
                 })
             });
         }
@@ -2380,6 +2451,136 @@ mod tests {
             engine.with_tcp_egress(true).allow_tcp_egress,
             "the builder flips the posture flag"
         );
+    }
+
+    /// `PLAN-handler-tcp-egress` TE-3 (MUST-HAVE #1): direct tests of the ENFORCED decision
+    /// [`tcp_connect_decision`] — the exact predicate the installed `socket_addr_check` closure calls
+    /// — across all four security dimensions. (a) `bind`/`listen` + every UDP use are denied even
+    /// with a matching allowlist + posture on; (b) an allowlisted PRIVATE/metadata peer is denied
+    /// when `allow_private` is off and admitted when on; (c) a non-allowlisted global peer is denied
+    /// and an allowlisted one admitted; (d) posture off denies everything.
+    #[tokio::test]
+    async fn tcp_connect_decision_enforces_all_dimensions() {
+        let sa = |s: &str| s.parse::<SocketAddr>().unwrap();
+        let allow = vec![
+            "93.184.216.34:443".to_string(),  // allowlisted global
+            "10.0.0.5:5432".to_string(),      // allowlisted private
+            "169.254.169.254:80".to_string(), // allowlisted metadata
+        ];
+        let global = sa("93.184.216.34:443");
+
+        // (a) Connect-only: bind/listen + every UDP use denied, even allowlisted + posture on.
+        for bad in [
+            SocketAddrUse::TcpBind,
+            SocketAddrUse::UdpBind,
+            SocketAddrUse::UdpConnect,
+            SocketAddrUse::UdpOutgoingDatagram,
+        ] {
+            assert!(
+                !tcp_connect_decision(bad, global, &allow, true, true).await,
+                "non-connect use {bad:?} must be denied"
+            );
+        }
+        // …and TcpConnect to the same allowlisted global IS permitted.
+        assert!(tcp_connect_decision(SocketAddrUse::TcpConnect, global, &allow, false, true).await);
+
+        // (b) SSRF floor on an allowlisted PRIVATE + METADATA peer: denied w/o allow_private, admitted with.
+        for peer in ["10.0.0.5:5432", "169.254.169.254:80"] {
+            assert!(
+                !tcp_connect_decision(SocketAddrUse::TcpConnect, sa(peer), &allow, false, true)
+                    .await,
+                "{peer} (allowlisted, non-global) must be denied without allow_private"
+            );
+            assert!(
+                tcp_connect_decision(SocketAddrUse::TcpConnect, sa(peer), &allow, true, true).await,
+                "{peer} must be admitted once allow_private is on"
+            );
+        }
+
+        // (c) Allowlist: a non-allowlisted GLOBAL target is denied; an allowlisted one admitted.
+        // `8.8.4.4` is a genuinely global public IP (NOT RFC-5737 documentation space), so the SSRF
+        // floor passes and the ALLOWLIST is the actual decider here.
+        assert!(
+            !tcp_connect_decision(
+                SocketAddrUse::TcpConnect,
+                sa("8.8.4.4:443"),
+                &allow,
+                false,
+                true
+            )
+            .await,
+            "a non-allowlisted global target must be denied"
+        );
+
+        // (d) Posture gate: off ⇒ even an allowlisted global connect is denied.
+        assert!(
+            !tcp_connect_decision(SocketAddrUse::TcpConnect, global, &allow, true, false).await,
+            "posture off must deny every connect"
+        );
+    }
+
+    /// `PLAN-handler-tcp-egress` TE-3 (MUST-HAVE #2): the CI-hard, mutation-verified gate. Drives the
+    /// ENFORCED [`tcp_connect_decision`] across the three security dimensions and prints the marker
+    /// `TCP-EGRESS ALLOWLIST OK` so the merge gate can assert it RAN. MUTATION-VERIFIED: re-run under
+    /// each `BOATRAMP_TCPEGRESS_MUTATION` — `admit_unallowlisted` (bypass the allowlist),
+    /// `admit_bind_listen` (drop connect-only), `drop_posture` (ignore the posture gate) — EACH must
+    /// make exactly one assertion flip and FAIL the gate. A pass-under-mutation = a hollow gate.
+    #[tokio::test]
+    async fn tcp_egress_allowlist_gate() {
+        let sa = |s: &str| s.parse::<SocketAddr>().unwrap();
+        let allow = vec!["93.184.216.34:443".to_string(), "10.0.0.5:5432".to_string()];
+        let global = sa("93.184.216.34:443");
+
+        // Dimension 1 — connect-only: bind + UDP denied (mutation `admit_bind_listen` flips this).
+        assert!(
+            !tcp_connect_decision(SocketAddrUse::TcpBind, global, &allow, true, true).await,
+            "connect-only: TcpBind must be denied"
+        );
+        assert!(
+            !tcp_connect_decision(SocketAddrUse::UdpConnect, global, &allow, true, true).await,
+            "connect-only: UdpConnect must be denied"
+        );
+
+        // Dimension 2 — allowlist: allowlisted global admitted, non-allowlisted denied (mutation
+        // `admit_unallowlisted` flips the deny).
+        assert!(
+            tcp_connect_decision(SocketAddrUse::TcpConnect, global, &allow, false, true).await,
+            "allowlisted global must be admitted"
+        );
+        // `8.8.4.4` is genuinely global (not RFC-5737 documentation), so it clears the SSRF floor and
+        // the ALLOWLIST is what denies it — exactly what the `admit_unallowlisted` mutation must flip.
+        assert!(
+            !tcp_connect_decision(
+                SocketAddrUse::TcpConnect,
+                sa("8.8.4.4:443"),
+                &allow,
+                false,
+                true
+            )
+            .await,
+            "non-allowlisted global must be denied"
+        );
+
+        // Dimension 3 — posture gate: off ⇒ deny-all (mutation `drop_posture` flips this).
+        assert!(
+            !tcp_connect_decision(SocketAddrUse::TcpConnect, global, &allow, true, false).await,
+            "posture off must deny every connect"
+        );
+
+        // SSRF floor (bonus coverage; mutation-proven separately via is_global_ip's own gate).
+        assert!(
+            !tcp_connect_decision(
+                SocketAddrUse::TcpConnect,
+                sa("10.0.0.5:5432"),
+                &allow,
+                false,
+                true
+            )
+            .await,
+            "an allowlisted private target must still clear the SSRF floor"
+        );
+
+        println!("TCP-EGRESS ALLOWLIST OK");
     }
 
     /// The reentrant-deadlock guard (image-serve-latency Ask B, security review HIGH): the request

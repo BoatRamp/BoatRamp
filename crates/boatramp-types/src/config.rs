@@ -638,8 +638,11 @@ pub struct HandlerConfig {
     /// allowlisted target is still held to the `is_global_ip` SSRF floor unless the posture also
     /// allows private egress. Only consulted when `imports` contains `wasi:sockets` AND the node
     /// posture [`allow_guest_tcp_egress`](crate::security::SecurityPosture::allow_guest_tcp_egress)
-    /// is on — with the posture off the capability is refused at deploy and the runtime denies all.
-    /// Host config on the deploy record, never guest-supplied at runtime.
+    /// is on — with the posture off the RUNTIME denies all (the socket host's deny-all default
+    /// stands; the engine never installs a permissive check). In this stage the capability is NOT
+    /// refused at deploy: a deploy declaring `wasi:sockets` parses and activates regardless of
+    /// posture, so the gate is purely runtime (fail-closed). Host config on the deploy record, never
+    /// guest-supplied at runtime.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub egress_allowlist: Vec<String>,
     /// Per-handler in-site tenancy decision (Dimension 0), overriding the site-level
