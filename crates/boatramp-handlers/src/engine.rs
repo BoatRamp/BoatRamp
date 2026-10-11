@@ -1035,6 +1035,18 @@ const TCP_CONN_WRITE_BUDGET: usize = 64 * 1024;
 #[cfg(feature = "tcp-listener")]
 const CONN_EPOCH_YIELD_TICKS: u64 = 25;
 
+// HIGH-fix regression guard (compile-time): the conn-lane yield budget MUST be a small, non-zero tick
+// count — never 0 and never effectively infinite (a `u64::MAX`-style value would disable yielding and
+// let a CPU-bound guest pin a worker + starve the watchdog). A sub-second window keeps the watchdog
+// re-polled promptly. Fails the BUILD (not just a test) if someone widens or zeroes it.
+#[cfg(feature = "tcp-listener")]
+const _: () = assert!(
+    CONN_EPOCH_YIELD_TICKS > 0
+        && CONN_EPOCH_YIELD_TICKS <= 100
+        && CONN_EPOCH_YIELD_TICKS * EPOCH_TICK_MS <= 1000,
+    "CONN_EPOCH_YIELD_TICKS must be a small, non-zero, sub-second epoch-yield budget"
+);
+
 /// Why an inbound-TCP connection was torn down by the host (PLAN-handler-tcp-inbound) rather than the
 /// guest returning. Both are a normal end of a long-lived connection — the conn lane's DoS bound —
 /// NOT a handler failure.
@@ -1062,8 +1074,11 @@ async fn conn_watchdog(
     max_conn_duration: Duration,
     started: tokio::time::Instant,
 ) -> ConnTimeout {
-    // Poll at a fraction of the idle window (bounded) so a timeout is observed promptly but cheaply.
-    let tick = (idle_timeout / 4).clamp(Duration::from_millis(50), Duration::from_secs(5));
+    // Poll at a fraction of the SHORTER of the two windows (bounded) so EITHER a short idle_timeout OR
+    // a short max_conn_duration is observed promptly — an idle-only tick would miss a max-duration far
+    // shorter than idle (and vice-versa).
+    let tick =
+        (idle_timeout.min(max_conn_duration) / 4).clamp(Duration::from_millis(50), Duration::from_secs(5));
     loop {
         tokio::time::sleep(tick).await;
         let idle_for = last_activity
@@ -2256,6 +2271,12 @@ impl HandlerEngine {
         // WITHOUT trapping (the long-lived goal is preserved). The engine-wide epoch ticker drives it.
         // Fuel stays unmetered — CPU is bounded by wall-clock `max_conn_duration` via the watchdog.
         store.epoch_deadline_async_yield_and_update(CONN_EPOCH_YIELD_TICKS);
+        // `epoch_deadline_async_yield_and_update` sets only the BEHAVIOR (yield + re-arm by the budget);
+        // it does NOT arm the first deadline, which `new_store` left at the request-sized value. Arm it
+        // to the yield budget so the FIRST yield lands at ~CONN_EPOCH_YIELD_TICKS ticks, not seconds out
+        // (otherwise a non-yielding guest would run unchecked until the request-sized deadline — the
+        // exact starvation this fix prevents).
+        store.set_epoch_deadline(CONN_EPOCH_YIELD_TICKS);
         let _ = store.set_fuel(u64::MAX);
         // Wrap the accepted socket halves so any byte movement (either direction) refreshes the idle
         // clock, then hand them to the guest as host-owned `wasi:io` stream resources. The guest imports
@@ -3119,23 +3140,6 @@ mod tests {
         assert!(
             !conn_lane_grants_socket_authority(),
             "the inbound-TCP conn lane must never grant the guest wasi:sockets authority"
-        );
-    }
-
-    /// PLAN-handler-tcp-inbound HIGH-fix: the conn lane arms the epoch to YIELD with a small, non-zero
-    /// tick budget — NOT `u64::MAX` (which would disable yielding and let a CPU-bound guest pin a worker
-    /// + starve the wall-clock watchdog). A regression that re-disabled the epoch would make this fail.
-    #[cfg(feature = "tcp-listener")]
-    #[test]
-    fn conn_lane_epoch_yield_budget_is_small_and_nonzero() {
-        assert!(CONN_EPOCH_YIELD_TICKS > 0, "yield budget must be non-zero");
-        assert!(
-            CONN_EPOCH_YIELD_TICKS <= 100,
-            "yield budget must stay small (sub-second), never effectively infinite (u64::MAX)"
-        );
-        assert!(
-            CONN_EPOCH_YIELD_TICKS * EPOCH_TICK_MS <= 1000,
-            "the yield window must be sub-second so the watchdog is re-polled promptly"
         );
     }
 
