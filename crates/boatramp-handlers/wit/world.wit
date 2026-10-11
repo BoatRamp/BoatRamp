@@ -1345,3 +1345,48 @@ world session-host {
 world session-import-host {
   import session;
 }
+
+/// Value types for the host-owned inbound-TCP **listener** capability (PLAN-handler-tcp-inbound):
+/// a guest component handles an ALREADY-ACCEPTED connection the HOST (operator) owns. The host
+/// binds + listens + accepts on an operator-declared `[serve.listeners.<name>]` and re-enters the
+/// guest's export once per connection — so the guest NEVER receives `wasi:sockets` (it holds no
+/// bind/listen/connect authority; bind stays host-side, which is what makes the surface safe enough
+/// to exist). This mirrors the `wasi:http/incoming-handler` host-owns-the-resource convention.
+interface tcp-connection-types {
+  /// Why a connection handler failed (the guest-returned `Err`). The carried text is
+  /// guest-controlled — treated as UNTRUSTED (bounded + sanitized host-side before an operator sees
+  /// it, exactly like a consumer error).
+  record connection-error {
+    message: string,
+  }
+}
+
+/// The guest's inbound-TCP **connection handler** (PLAN-handler-tcp-inbound). The host hands each
+/// accepted connection's peer address plus its `wasi:io` byte streams as already-constructed
+/// resources (host-owned, pushed into the store table — the guest imports only `wasi:io/streams`,
+/// never `wasi:sockets`). The guest reads `input` / writes `output` for the connection's life; a
+/// peer drop surfaces as a stream error on the next read/write, and returning (`Ok`/`Err`) ends the
+/// connection (the host closes the socket). A single blocking `handle` owns one store + instance +
+/// conn-lane permit for the connection — bounded by the lane ceiling, the listener `max_conns`, and
+/// idle + max-duration timeouts (NOT the per-invocation epoch deadline).
+interface tcp-connection-handler {
+  // wasi:io version-pinned (0.2.3) so it matches the wasi:io the host serves (the same pin the
+  // vendored wasi:blobstore uses) — an unversioned `wasi:io/streams` does not resolve the deps tree.
+  use wasi:io/streams@0.2.3.{input-stream, output-stream};
+  use tcp-connection-types.{connection-error};
+
+  /// Handle one accepted connection. `peer` is the remote address (`ip:port`, informational only —
+  /// a raw socket carries no Host/path/principal, so tenancy is operator-pinned in the listener
+  /// config, never derived from here).
+  handle: func(peer: string, input: input-stream, output: output-stream) -> result<_, connection-error>;
+}
+
+/// A host-owned-listener component: it EXPORTS the connection handler and imports ONLY `wasi:io`
+/// (the handed connection streams) plus whatever existing capabilities the operator grants it —
+/// NEVER `wasi:sockets`. The host `bindgen!`s this world for the export caller (invoking
+/// `tcp-connection-handler.handle`), reusing the engine linker's deny-all socket host default: NO
+/// permissive `socket_addr_check` and NO `allow_tcp` for this lane (the v0.30.0 connect-only egress
+/// gate at the socket host is untouched). See PLAN-handler-tcp-inbound.
+world tcp-connection-host {
+  export tcp-connection-handler;
+}

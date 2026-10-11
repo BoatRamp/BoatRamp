@@ -52,6 +52,25 @@ mod session_world {
     });
 }
 
+// The tcp-connection-host world: the export caller for `tcp-connection-handler.handle`, which the host
+// re-enters ONCE per already-accepted inbound connection (PLAN-handler-tcp-inbound). The world EXPORTS
+// the handler and imports only `wasi:io` — mapped here to the SAME `wasmtime_wasi::bindings::io` host
+// types the engine linker already serves (`add_to_linker_async`), so the `input-stream`/`output-stream`
+// the host pushes into the store table (`AsyncReadStream`/`AsyncWriteStream`) are the resource type the
+// generated `call_handle` expects. The guest receives NO `wasi:sockets` (the socket host's deny-all
+// default stands; no permissive `socket_addr_check`, no `allow_tcp` for this lane).
+#[cfg(feature = "tcp-listener")]
+mod tcp_connection_world {
+    wasmtime::component::bindgen!({
+        path: "wit",
+        world: "boatramp:handlers/tcp-connection-host",
+        async: true,
+        with: {
+            "wasi:io": wasmtime_wasi::bindings::io,
+        },
+    });
+}
+
 /// One re-entry's input for [`HandlerEngine::dispatch_session`]: the session id, the checkpoint to
 /// resume from (if any), and the pending inbound frames in order. Frames are opaque bytes.
 #[cfg(feature = "session")]
@@ -918,6 +937,159 @@ fn tcpegress_mutation() -> Option<String> {
     None
 }
 
+/// The inbound-TCP **listener dispatch** authorization decision (PLAN-handler-tcp-inbound). The single
+/// pure predicate [`HandlerEngine::dispatch_tcp_connection`] calls BEFORE it ever instantiates a guest,
+/// so the TESTED code is the ENFORCED code (mirrors the egress `tcp_connect_decision` convention).
+/// Returns `true` (dispatch) only when BOTH belt-and-suspenders gates hold:
+/// 1. **posture** — `posture_listener_enabled` is on (the node posture `allow_guest_tcp_listener`, off
+///    under multi-tenant). The serve accept loop is ALSO gated on this before it ever binds, so
+///    carrying it here is defense-in-depth: dispatch still denies even if the bind-site regressed.
+/// 2. **declared** — the operator DECLARED this listener in `[serve.listeners.<name>]`. The accept loop
+///    only runs for a declared listener (it iterates the config map), so the real call site passes the
+///    config-lookup result; carrying the check here proves (via the gate mutation) it is load-bearing.
+///
+/// This gate grants NO socket authority — that invariant is a SEPARATE structural property
+/// ([`HandlerEngine::conn_lane_grants_socket_authority`]). The `tcplistener_mutation()` seam
+/// (test/`tcp-listener-gate-mutation` only) neuters exactly one check so the CI gate proves each is
+/// load-bearing: `drop_posture` ignores (1); `admit_undeclared` ignores (2). A shipped build evaluates
+/// both unconditionally.
+#[cfg(feature = "tcp-listener")]
+fn tcp_listener_dispatch_decision(posture_listener_enabled: bool, listener_declared: bool) -> bool {
+    let mutation = tcplistener_mutation();
+    let mutating = |m: &str| mutation.as_deref() == Some(m);
+
+    // (1) Posture gate.
+    if !posture_listener_enabled && !mutating("drop_posture") {
+        return false;
+    }
+    // (2) Operator-declared gate.
+    if !listener_declared && !mutating("admit_undeclared") {
+        return false;
+    }
+    true
+}
+
+/// Whether the inbound-TCP **connection lane** grants the guest raw socket authority (`allow_tcp` /
+/// a permissive `socket_addr_check`). ALWAYS `false` — the load-bearing safety invariant of
+/// PLAN-handler-tcp-inbound is that a host-owned-listener guest receives ONLY the accepted
+/// connection's `wasi:io` streams and NEVER `wasi:sockets` (operator owns the socket; bind/listen/
+/// connect authority stays host-side; the v0.30.0 connect-only egress gate at the socket host is
+/// untouched). [`HandlerEngine::dispatch_tcp_connection`] CALLS this to decide whether to grant the
+/// conn-lane store socket authority (so tested == enforced) — and, being always-false, never does.
+/// The `add_socket_authority` gate mutation flips it `true` so the CI gate's structural assertion goes
+/// RED: a regression that handed this lane socket authority is caught at merge.
+#[cfg(feature = "tcp-listener")]
+fn conn_lane_grants_socket_authority() -> bool {
+    tcplistener_mutation().as_deref() == Some("add_socket_authority")
+}
+
+/// The active TCP-listener gate mutation (PLAN-handler-tcp-inbound anti-hollow gate), or `None`.
+/// Present ONLY under `cfg(test)` (the in-crate gate) or the `tcp-listener-gate-mutation` feature; a
+/// shipped build has neither, so [`tcp_listener_dispatch_decision`]'s two checks are unconditional and
+/// [`conn_lane_grants_socket_authority`] is a constant `false`. Each recognized value neuters ONE
+/// property so the CI gate proves it goes RED: `drop_posture` / `admit_undeclared` (the dispatch
+/// gates), `add_socket_authority` (the no-raw-sockets structural invariant). NOT a backdoor — it only
+/// reads a test env var.
+#[cfg(feature = "tcp-listener")]
+fn tcplistener_mutation() -> Option<String> {
+    #[cfg(any(test, feature = "tcp-listener-gate-mutation"))]
+    {
+        std::env::var("BOATRAMP_TCPLISTENER_MUTATION").ok()
+    }
+    #[cfg(not(any(test, feature = "tcp-listener-gate-mutation")))]
+    {
+        None
+    }
+}
+
+/// The write buffer (bytes) for a listener connection's host→guest→peer `AsyncWriteStream`
+/// (PLAN-handler-tcp-inbound). 64 KiB — enough to keep a chatty writer from stalling on
+/// per-chunk backpressure without buffering unboundedly.
+#[cfg(feature = "tcp-listener")]
+const TCP_CONN_WRITE_BUDGET: usize = 64 * 1024;
+
+/// Why an inbound-TCP connection was torn down by the host (PLAN-handler-tcp-inbound) rather than the
+/// guest returning. Both are a normal end of a long-lived connection — the conn lane's DoS bound —
+/// NOT a handler failure.
+#[cfg(feature = "tcp-listener")]
+enum ConnTimeout {
+    /// No bytes flowed in EITHER direction for the listener's `idle_timeout`.
+    Idle,
+    /// The connection reached the listener's `max_conn_duration` absolute lifetime cap.
+    MaxDuration,
+}
+
+/// An `AsyncRead`/`AsyncWrite` adapter that stamps a shared "last activity" instant whenever bytes
+/// actually move (PLAN-handler-tcp-inbound), so the conn-lane idle watchdog can tear a silent
+/// connection down. Wraps BOTH halves (read bytes from the peer AND write bytes to the peer count as
+/// activity), so an actively-streaming connection is never killed as idle. The inner half is `Unpin`
+/// (a tokio `OwnedReadHalf`/`OwnedWriteHalf`), so the adapter is `Unpin` and delegates by pin-projection.
+#[cfg(feature = "tcp-listener")]
+struct IdleTracked<T> {
+    inner: T,
+    last_activity: Arc<Mutex<std::time::Instant>>,
+}
+
+#[cfg(feature = "tcp-listener")]
+impl<T> IdleTracked<T> {
+    fn new(inner: T, last_activity: Arc<Mutex<std::time::Instant>>) -> Self {
+        Self {
+            inner,
+            last_activity,
+        }
+    }
+    fn touch(&self) {
+        if let Ok(mut g) = self.last_activity.lock() {
+            *g = std::time::Instant::now();
+        }
+    }
+}
+
+#[cfg(feature = "tcp-listener")]
+impl<T: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for IdleTracked<T> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let r = Pin::new(&mut self.inner).poll_read(cx, buf);
+        if matches!(r, Poll::Ready(Ok(()))) && buf.filled().len() > before {
+            self.touch();
+        }
+        r
+    }
+}
+
+#[cfg(feature = "tcp-listener")]
+impl<T: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for IdleTracked<T> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let r = Pin::new(&mut self.inner).poll_write(cx, buf);
+        if let Poll::Ready(Ok(n)) = &r
+            && *n > 0
+        {
+            self.touch();
+        }
+        r
+    }
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
 /// Per-consumer concurrency gates (P2 resource isolation): a lazily-created [`Semaphore`] per
 /// consumer identity, so one consumer's burst (e.g. a thumbnail backfill) can't occupy the shared
 /// async lane and starve other consumers.
@@ -984,6 +1156,23 @@ pub struct HandlerEngine {
     /// Separate compile cache for session (`session-handler` export) components.
     #[cfg(feature = "session")]
     session_cache: Mutex<LruCache<String, session_world::SessionHostPre<HostState>>>,
+    /// Separate compile cache for tcp-connection (`tcp-connection-handler` export) components
+    /// (PLAN-handler-tcp-inbound) — a different world than the request `ProxyPre` / session cache.
+    #[cfg(feature = "tcp-listener")]
+    tcp_connection_cache: Mutex<LruCache<String, tcp_connection_world::TcpConnectionHostPre<HostState>>>,
+    /// The **inbound-TCP connection lane** concurrency gate (PLAN-handler-tcp-inbound): a dedicated
+    /// pool so a burst of long-lived listener connections can never exhaust the sync request pool nor
+    /// starve the async drain. Each live connection holds one permit for its whole life (a single
+    /// blocking `handle`); `max_conns` per listener + this global ceiling together bound the fan-out.
+    /// Defaults to the sync `limits.max_concurrency` (no separate Phase 1 config knob).
+    #[cfg(feature = "tcp-listener")]
+    tcp_conn_semaphore: Semaphore,
+    /// The inbound-TCP connection lane ceiling — the (memory) clamp a listener dispatch is held to.
+    /// Defaults to the sync `limits`; the per-invocation epoch deadline + CPU fuel are DISABLED for
+    /// this lane in favor of idle + max-connection-duration timeouts (a long-lived `handle` must not
+    /// trip the request epoch). See [`HandlerEngine::dispatch_tcp_connection`].
+    #[cfg(feature = "tcp-listener")]
+    tcp_conn_limits: Limits,
     /// The [`Lane::Sync`] ceiling — connection-bearing requests are clamped to
     /// this (default 10s). Named `limits` for back-compat with existing callers.
     limits: Limits,
@@ -1053,6 +1242,14 @@ pub struct HandlerEngine {
     /// refused regardless of the per-handler allowlist. `true` installs the connect-only,
     /// allowlist-gated, SSRF-floored check. Never affects `wasi:http` egress (its own gate).
     allow_tcp_egress: bool,
+    /// Whether the node posture allows host-owned inbound-TCP **listeners** to dispatch to a guest
+    /// (`allow_guest_tcp_listener`, off under multi-tenant) — PLAN-handler-tcp-inbound. `false` (the
+    /// default) makes [`dispatch_tcp_connection`](Self::dispatch_tcp_connection) refuse before it ever
+    /// instantiates a guest (via the pure [`tcp_listener_dispatch_decision`]); the serve accept loop is
+    /// ALSO gated on it before it binds, so both layers fail closed. This is INDEPENDENT of
+    /// `allow_tcp_egress` (inbound ≠ outbound authority). It NEVER grants the guest `wasi:sockets`.
+    #[cfg_attr(not(feature = "tcp-listener"), allow(dead_code))]
+    allow_tcp_listener: bool,
     epoch_ticker: tokio::task::JoinHandle<()>,
 }
 
@@ -1208,6 +1405,15 @@ impl HandlerEngine {
             request_gates: KeyedSemaphores::default(),
             #[cfg(feature = "session")]
             session_cache: Mutex::new(LruCache::new(capacity)),
+            #[cfg(feature = "tcp-listener")]
+            tcp_connection_cache: Mutex::new(LruCache::new(capacity)),
+            // The inbound-TCP connection lane defaults to the sync ceiling + its own independent pool,
+            // so an engine built without any listener behaves identically (the lane is inert until a
+            // listener dispatches). PLAN-handler-tcp-inbound.
+            #[cfg(feature = "tcp-listener")]
+            tcp_conn_semaphore: Semaphore::new(limits.max_concurrency.max(1)),
+            #[cfg(feature = "tcp-listener")]
+            tcp_conn_limits: limits,
             semaphore: Semaphore::new(limits.max_concurrency.max(1)),
             // The async + streaming lanes default to the sync ceiling + an equally-sized,
             // *independent* pool each, so an engine built without opting in behaves
@@ -1236,6 +1442,9 @@ impl HandlerEngine {
             // Deny-by-default: the socket host stays deny-all until an operator opts the posture in
             // via `with_tcp_egress`. A node that never calls it can never grant outbound TCP.
             allow_tcp_egress: false,
+            // Deny-by-default: inbound listeners dispatch only once an operator opts the posture in via
+            // `with_tcp_listener`. A node that never calls it can never dispatch a listener connection.
+            allow_tcp_listener: false,
             limits,
             epoch_ticker,
         })
@@ -1350,6 +1559,19 @@ impl HandlerEngine {
     #[must_use]
     pub fn with_tcp_egress(mut self, allow: bool) -> Self {
         self.allow_tcp_egress = allow;
+        self
+    }
+
+    /// Permit (or refuse) host-owned inbound-TCP **listeners** to dispatch an accepted connection to a
+    /// guest — the operator posture's `allow_guest_tcp_listener` (PLAN-handler-tcp-inbound). Default
+    /// (`false`, off under multi-tenant) makes [`dispatch_tcp_connection`](Self::dispatch_tcp_connection)
+    /// refuse before instantiating any guest. This is INDEPENDENT of [`with_tcp_egress`](Self::with_tcp_egress)
+    /// (inbound ≠ outbound authority) and NEVER grants the guest `wasi:sockets`: a dispatched connection
+    /// is handed only its already-accepted `wasi:io` byte streams; the socket host's deny-all default
+    /// (no permissive `socket_addr_check`, no `allow_tcp`) stands for this lane.
+    #[must_use]
+    pub fn with_tcp_listener(mut self, allow: bool) -> Self {
+        self.allow_tcp_listener = allow;
         self
     }
 
@@ -1851,6 +2073,193 @@ impl HandlerEngine {
                 "session handler returned error: {err:?}"
             ))),
             Err(trap) => Err(classify(&trap, store.data().oom())),
+        }
+    }
+
+    /// Compile + pre-instantiate a **tcp-connection** component (`tcp-connection-handler` export),
+    /// cached by hash (PLAN-handler-tcp-inbound). Mirrors [`session_pre`](Self::session_pre).
+    #[cfg(feature = "tcp-listener")]
+    fn tcp_connection_pre(
+        &self,
+        hash: &str,
+        wasm: &[u8],
+    ) -> Result<tcp_connection_world::TcpConnectionHostPre<HostState>, HandlerError> {
+        if let Some(pre) = self.tcp_connection_cache.lock().unwrap().get(hash) {
+            return Ok(pre.clone());
+        }
+        let compiled_at = std::time::Instant::now();
+        let component = Component::from_binary(&self.engine, wasm)
+            .map_err(|err| HandlerError::Compile(err.to_string()))?;
+        let instance_pre = self
+            .build_linker()?
+            .instantiate_pre(&component)
+            .map_err(|err| HandlerError::Compile(err.to_string()))?;
+        let pre = tcp_connection_world::TcpConnectionHostPre::new(instance_pre)
+            .map_err(|_| HandlerError::Compile("component is not a tcp-connection handler".into()))?;
+        tracing::info!(
+            component = %hash,
+            lane = "tcp-connection",
+            compile_ms = compiled_at.elapsed().as_millis() as u64,
+            "wasm component cold-compiled (warm-cache miss)"
+        );
+        let _evicted = cache_insert_evicted(&self.tcp_connection_cache, hash, pre.clone());
+        Ok(pre)
+    }
+
+    /// Drive one host-owned inbound-TCP **connection** through a guest `tcp-connection-handler`
+    /// (`hash`), handing it the ALREADY-ACCEPTED connection's peer address + `wasi:io` byte streams
+    /// (PLAN-handler-tcp-inbound). The host owns the socket (operator declared the listener + bound
+    /// it); the guest receives NO `wasi:sockets` — only the connection's `input-stream`/`output-stream`
+    /// as host-constructed resources. Runs on the dedicated **conn lane** (its own permit), with the
+    /// per-invocation epoch deadline + CPU fuel DISABLED in favour of `idle_timeout` +
+    /// `max_conn_duration` (a long-lived `handle` must not trip the request-sized epoch); the linear-
+    /// memory ceiling still binds. A peer drop surfaces to the guest as a stream error; the guest
+    /// returning, trapping, or either timeout all end the connection and drop the store (closing the
+    /// socket — clean teardown).
+    ///
+    /// Two gates to dispatch (belt-and-suspenders, via the pure [`tcp_listener_dispatch_decision`]): the
+    /// node posture must allow listeners AND the operator must have DECLARED this listener. Returns
+    /// `Overloaded` when the conn lane is full. `listener_declared` is the caller's config-lookup result
+    /// (the serve accept loop only runs for a declared listener).
+    #[cfg(feature = "tcp-listener")]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn dispatch_tcp_connection<R, W>(
+        &self,
+        hash: &str,
+        wasm: &[u8],
+        peer: String,
+        read_half: R,
+        write_half: W,
+        bindings: Bindings,
+        limits: Limits,
+        idle_timeout: Duration,
+        max_conn_duration: Duration,
+        listener_declared: bool,
+    ) -> Result<(), HandlerError>
+    where
+        R: tokio::io::AsyncRead + Send + Unpin + 'static,
+        W: tokio::io::AsyncWrite + Send + Unpin + 'static,
+    {
+        // TWO gates to dispatch, via the SINGLE enforced predicate the mutation-verified gate drives
+        // (tested == enforced): the node posture allows inbound listeners AND this listener was declared.
+        if !tcp_listener_dispatch_decision(self.allow_tcp_listener, listener_declared) {
+            return Err(HandlerError::Internal(
+                "inbound TCP listener dispatch refused (posture `allow_guest_tcp_listener` is off, \
+                 or the listener is not operator-declared)"
+                    .into(),
+            ));
+        }
+        // STRUCTURAL SAFETY INVARIANT (mutation-gated): the conn lane NEVER grants the guest raw socket
+        // authority (`wasi:sockets`). `conn_lane_grants_socket_authority()` is a constant `false` in
+        // every shipped build, so this guard never fires — the guest's only network surface is the
+        // handed `wasi:io` streams. The `add_socket_authority` gate mutation flips it, and this guard
+        // then fails CLOSED here while the structural gate test goes RED (tested == enforced).
+        if conn_lane_grants_socket_authority() {
+            return Err(HandlerError::Internal(
+                "inbound TCP connection lane must never grant the guest raw socket authority \
+                 (wasi:sockets) — refusing to dispatch"
+                    .into(),
+            ));
+        }
+        // One conn-lane permit per live connection (held for the connection's whole life), so a burst of
+        // long-lived listener connections can't exhaust the sync request pool nor starve the async drain.
+        let _permit = self
+            .tcp_conn_semaphore
+            .try_acquire()
+            .map_err(|_| HandlerError::Overloaded)?;
+        let pre = self.tcp_connection_pre(hash, wasm)?;
+        // Clamp the memory ceiling to the conn-lane ceiling (a per-listener override may only lower it).
+        let eff = Limits {
+            memory_bytes: limits.memory_bytes.min(self.tcp_conn_limits.memory_bytes),
+            ..self.tcp_conn_limits
+        };
+        let mut store = self.new_store(bindings, eff);
+        // Conn lane: the per-invocation epoch deadline + CPU fuel are the WRONG bound for a continuous
+        // byte stream (a long-lived `handle` would trip the request epoch) — disable both and bound the
+        // connection by idle + max-duration instead. The memory limiter is unchanged (still binds).
+        store.set_epoch_deadline(u64::MAX);
+        let _ = store.set_fuel(u64::MAX);
+        // Wrap the accepted socket halves so any byte movement (either direction) refreshes the idle
+        // clock, then hand them to the guest as host-owned `wasi:io` stream resources. The guest imports
+        // only `wasi:io/streams` (never `wasi:sockets`), so these are its sole network surface.
+        let last_activity = Arc::new(Mutex::new(std::time::Instant::now()));
+        let in_stream: wasmtime_wasi::DynInputStream = Box::new(wasmtime_wasi::pipe::AsyncReadStream::new(
+            IdleTracked::new(read_half, Arc::clone(&last_activity)),
+        ));
+        let out_stream: wasmtime_wasi::DynOutputStream =
+            Box::new(wasmtime_wasi::pipe::AsyncWriteStream::new(
+                TCP_CONN_WRITE_BUDGET,
+                IdleTracked::new(write_half, Arc::clone(&last_activity)),
+            ));
+        let in_res = store
+            .data_mut()
+            .table
+            .push(in_stream)
+            .map_err(|e| HandlerError::Internal(format!("push input-stream: {e}")))?;
+        let out_res = store
+            .data_mut()
+            .table
+            .push(out_stream)
+            .map_err(|e| HandlerError::Internal(format!("push output-stream: {e}")))?;
+        let conn = pre
+            .instantiate_async(&mut store)
+            .await
+            .map_err(|e| classify(&e, store.data().oom()))?;
+        // Drive the guest handler against the host idle + max-duration watchdog. Whichever resolves
+        // first wins; a timeout cancels (drops) the guest future, and dropping the store below tears the
+        // connection down (the stream resources' reader/writer tasks are cancelled, closing the socket).
+        let outcome = {
+            let call = conn
+                .boatramp_handlers_tcp_connection_handler()
+                .call_handle(&mut store, &peer, in_res, out_res);
+            tokio::pin!(call);
+            let watchdog = async {
+                // Poll at a fraction of the idle window (bounded) so idle detection is prompt but cheap.
+                let tick = (idle_timeout / 4).clamp(Duration::from_millis(50), Duration::from_secs(5));
+                let started = std::time::Instant::now();
+                loop {
+                    tokio::time::sleep(tick).await;
+                    let idle_for = last_activity
+                        .lock()
+                        .map(|g| g.elapsed())
+                        .unwrap_or_default();
+                    if idle_for >= idle_timeout {
+                        return ConnTimeout::Idle;
+                    }
+                    if started.elapsed() >= max_conn_duration {
+                        return ConnTimeout::MaxDuration;
+                    }
+                }
+            };
+            tokio::pin!(watchdog);
+            tokio::select! {
+                r = &mut call => Ok(r),
+                kind = &mut watchdog => Err(kind),
+            }
+        };
+        // Close any per-invocation SQL transaction: commit only on a clean guest return.
+        #[cfg(feature = "sql")]
+        store
+            .data_mut()
+            .sql
+            .finalize(matches!(&outcome, Ok(Ok(Ok(())))))
+            .await;
+        match outcome {
+            Ok(Ok(Ok(()))) => Ok(()),
+            Ok(Ok(Err(err))) => Err(HandlerError::Trap(format!(
+                "tcp-connection handler returned error: {err:?}"
+            ))),
+            Ok(Err(trap)) => Err(classify(&trap, store.data().oom())),
+            // An idle/max-duration teardown is the normal end of a long-lived connection (the conn-lane
+            // DoS bound), not a handler failure.
+            Err(ConnTimeout::Idle) => {
+                tracing::debug!(component = %hash, %peer, "tcp-connection idle-timeout teardown");
+                Ok(())
+            }
+            Err(ConnTimeout::MaxDuration) => {
+                tracing::debug!(component = %hash, %peer, "tcp-connection max-duration teardown");
+                Ok(())
+            }
         }
     }
 
@@ -2581,6 +2990,75 @@ mod tests {
         );
 
         println!("TCP-EGRESS ALLOWLIST OK");
+    }
+
+    /// PLAN-handler-tcp-inbound: direct tests of the ENFORCED inbound-listener dispatch decision
+    /// [`tcp_listener_dispatch_decision`] — the exact predicate `dispatch_tcp_connection` calls — plus
+    /// the no-raw-sockets structural invariant [`conn_lane_grants_socket_authority`]. (a) posture off
+    /// denies; (b) an undeclared listener denies; (c) both on dispatches; (d) the conn lane grants NO
+    /// socket authority.
+    #[cfg(feature = "tcp-listener")]
+    #[test]
+    fn tcp_listener_dispatch_decision_enforces_both_gates() {
+        // (a) Posture off ⇒ deny, even for a declared listener.
+        assert!(
+            !tcp_listener_dispatch_decision(false, true),
+            "posture off must deny dispatch"
+        );
+        // (b) Undeclared listener ⇒ deny, even with the posture on.
+        assert!(
+            !tcp_listener_dispatch_decision(true, false),
+            "an undeclared listener must deny dispatch"
+        );
+        // (c) Posture on AND declared ⇒ dispatch.
+        assert!(
+            tcp_listener_dispatch_decision(true, true),
+            "posture on + declared must dispatch"
+        );
+        // (d) The conn lane never grants raw socket authority.
+        assert!(
+            !conn_lane_grants_socket_authority(),
+            "the inbound-TCP conn lane must never grant the guest wasi:sockets authority"
+        );
+    }
+
+    /// PLAN-handler-tcp-inbound: the CI-hard, mutation-verified gate. Drives the ENFORCED
+    /// [`tcp_listener_dispatch_decision`] across BOTH dispatch gates AND the no-raw-sockets structural
+    /// invariant [`conn_lane_grants_socket_authority`], then prints the marker `TCP-LISTENER DISPATCH
+    /// OK` so the merge gate can assert it RAN. MUTATION-VERIFIED: re-run under each
+    /// `BOATRAMP_TCPLISTENER_MUTATION` — `drop_posture` (dispatch when the posture is off),
+    /// `admit_undeclared` (dispatch to a listener the operator never declared), `add_socket_authority`
+    /// (hand the conn lane raw socket authority) — EACH must flip one assertion and FAIL the gate. A
+    /// pass-under-mutation = a hollow gate.
+    #[cfg(feature = "tcp-listener")]
+    #[test]
+    fn tcp_listener_dispatch_gate() {
+        // Gate 1 — posture: off ⇒ deny-all (mutation `drop_posture` flips this).
+        assert!(
+            !tcp_listener_dispatch_decision(false, true),
+            "posture off must deny every dispatch"
+        );
+        // Gate 2 — operator-declared: an undeclared listener is denied even with the posture on
+        // (mutation `admit_undeclared` flips this).
+        assert!(
+            !tcp_listener_dispatch_decision(true, false),
+            "an undeclared listener must be denied"
+        );
+        // Both on ⇒ dispatch (the positive path; no mutation flips this true→true, so it stays green
+        // under every mutation and can't mask a RED).
+        assert!(
+            tcp_listener_dispatch_decision(true, true),
+            "posture on + declared must dispatch"
+        );
+        // Structural invariant — the conn lane grants NO raw socket authority (mutation
+        // `add_socket_authority` flips this): the load-bearing "guest never gets wasi:sockets bind/
+        // listen/connect" property of the whole design.
+        assert!(
+            !conn_lane_grants_socket_authority(),
+            "the inbound-TCP conn lane must never grant the guest raw socket authority (wasi:sockets)"
+        );
+
+        println!("TCP-LISTENER DISPATCH OK");
     }
 
     /// The reentrant-deadlock guard (image-serve-latency Ask B, security review HIGH): the request
