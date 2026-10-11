@@ -176,6 +176,33 @@ pub async fn build_handler_runtime(
     // gateway below; keep it from tripping unused-variable in a no-email build.
     #[cfg(not(feature = "email"))]
     let _ = allow_guest_email;
+    // Optionally hedge a slow blob read: when the first GET has not returned within `blob_hedge_delay_ms`,
+    // race a second one and take whichever lands first (idempotent reads trade spare CPU/IO for a tighter
+    // fetch tail — the measured serve-path p99 is the external store's GET tail while CPU is idle). Off by
+    // default (unset/0). Wrapped BELOW the marker cache (closest to the real backend) so a hedge re-enters
+    // the backend, not the cache; a concurrent-hedge cap (`blob_hedge_max_inflight`) prevents a storm when
+    // the whole store is slow.
+    let storage: Arc<dyn boatramp_core::Storage> = match handlers_cfg
+        .and_then(|h| h.blob_hedge_delay_ms)
+        .filter(|ms| *ms > 0)
+    {
+        Some(delay_ms) => {
+            let max = handlers_cfg
+                .and_then(|h| h.blob_hedge_max_inflight)
+                .unwrap_or(0);
+            tracing::info!(
+                blob_hedge_delay_ms = delay_ms,
+                blob_hedge_max_inflight = max,
+                "blob hedged-read active: racing a 2nd GET for a read slower than the delay"
+            );
+            Arc::new(boatramp_storage::HedgedStorage::new(
+                storage,
+                std::time::Duration::from_millis(delay_ms),
+                max,
+            ))
+        }
+        None => storage,
+    };
     // Front the shared blob backend with a process-wide, positive-only container-marker cache so the
     // serve path skips the per-request `.boatramp-container` HEAD round-trip for an already-verified
     // container. Confinement is UNTOUCHED — the binding's `container_access` still runs on every op and

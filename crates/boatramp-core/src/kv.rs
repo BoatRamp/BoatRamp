@@ -617,7 +617,21 @@ pub trait ChangePublisher: Send + Sync {
 /// deployments exist.
 pub struct CachedKv {
     inner: Arc<dyn KvStore>,
-    cache: Mutex<LruCache<String, Vec<u8>>>,
+    /// `Some(bytes)` = a cached present value; **`None` = a cached ABSENCE** (a negative/tombstone
+    /// entry). Caching misses too is what keeps a hot *absent* key — e.g. a declared-but-unset
+    /// `boatramp:<NAME>` secret ref resolved on every serve — from re-hitting the backing LSM each
+    /// request (a negative lookup must scan SST filters to prove absence; on a network-volume
+    /// control plane that was measured at ~240–400 ms **per missing secret, per serve**). PRESENT
+    /// values are cached for every key; an ABSENCE is cached ONLY for the secret keyspace
+    /// ([`CachedKv::negative_cacheable`]) — a missing secret fails CLOSED, whereas an authz key
+    /// (`revoked/…`, policy, domain) can mean "absent ⇒ permit" and so must stay read-through fresh.
+    /// Correctness is willful-signal, not TTL: every write path overwrites or drops the key's entry
+    /// (`put`/`compare_and_swap` → `Some`, `delete` → secret-tombstone `None` else evict, the changelog
+    /// `invalidate_keys` → pop), so a set/rotated secret is visible on the very next read. A stale
+    /// negative is therefore only possible for a secret write that bypasses BOTH this cache AND the
+    /// changelog (a separate multi-writer process) — and even then fails CLOSED (a secret reads as
+    /// unset, never a wrong/leaked value).
+    cache: Mutex<LruCache<String, Option<Vec<u8>>>>,
     /// Shared-mode coherence hook: announces local writes to peers. `None` for
     /// single-process / Raft deployments (no peers to notify).
     publisher: Option<Arc<dyn ChangePublisher>>,
@@ -639,6 +653,37 @@ impl CachedKv {
     pub fn with_publisher(mut self, publisher: Arc<dyn ChangePublisher>) -> Self {
         self.publisher = Some(publisher);
         self
+    }
+
+    /// Whether an ABSENCE at `key` is safe to cache (a negative/tombstone). ONLY the operator/tenant
+    /// SECRET keyspace qualifies: a missing secret ref fails CLOSED (the handler receives no value and
+    /// denies), so a transiently-stale "absent" can never grant access. Every OTHER key may encode
+    /// "absent ⇒ PERMIT" — token-revocation markers (`revoked/<cti>`), access policy, domain state —
+    /// so its absence MUST stay read-through fresh: a cached tombstone would mask a peer node's
+    /// freshly-written revoke/deny until the next cache-coherence poll under shared/multi-writer HA
+    /// (see `boatramp_server::auth::Auth::revocation`, which treats key-absent as not-revoked). Present
+    /// values are cached for every key (positive caching is invalidated by the write signals); only the
+    /// ABSENCE is scoped. Allowlist, not denylist: an unmatched secret-key variant merely loses the
+    /// cache optimization (read-through, the pre-fix behavior) — it can never re-open the authz hole.
+    ///
+    /// The match is ANCHORED to the exact secret keyspaces — the top-level `secret/…`, and a
+    /// project-scoped `project/<proj>/secret/…` or `project/<proj>/tenant-secret/…` (see
+    /// `boatramp_core::deploy::keys`) — rather than an unanchored `contains("/secret/")`. Anchoring is
+    /// deliberate forward-proofing: a future non-secret "absent ⇒ permit" key that merely CONTAINED a
+    /// `secret` path segment deeper in its path (e.g. `project/<p>/acl/secret-rules/…`) must NOT be
+    /// silently negative-cached, or it would re-open exactly the hole this scoping closes.
+    fn negative_cacheable(key: &str) -> bool {
+        // Top-level secret keyspace (legacy / tooling).
+        if key.starts_with("secret/") {
+            return true;
+        }
+        // `project/<proj>/{secret|tenant-secret}/…` — skip the single `<proj>` segment, then require the
+        // NEXT segment to be exactly the secret store, not just any later `secret` in the path.
+        key.strip_prefix("project/")
+            .and_then(|rest| rest.split_once('/'))
+            .is_some_and(|(_proj, tail)| {
+                tail.starts_with("secret/") || tail.starts_with("tenant-secret/")
+            })
     }
 
     /// Announce changed keys to peers, if a publisher is attached.
@@ -665,10 +710,17 @@ impl CachedKv {
                 match op {
                     WriteOp::Put(key, value) => {
                         changed.push(key.clone());
-                        cache.put(key, value);
+                        cache.put(key, Some(value));
                     }
                     WriteOp::Delete(key) => {
-                        cache.pop(&key);
+                        // A deleted SECRET keeps a negative tombstone; any other key is EVICTED so its
+                        // absence re-reads through — never a stale "absent ⇒ permit" (symmetry with
+                        // `delete`; see `negative_cacheable`).
+                        if Self::negative_cacheable(&key) {
+                            cache.put(key.clone(), None);
+                        } else {
+                            cache.pop(&key);
+                        }
                         changed.push(key);
                     }
                 }
@@ -706,30 +758,46 @@ impl KvStore for CachedKv {
     async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, KvError> {
         {
             let mut cache = self.cache.lock().unwrap();
-            if let Some(value) = cache.get(key) {
-                return Ok(Some(value.clone()));
+            if let Some(cached) = cache.get(key) {
+                // Hit: `Some(bytes)` serves the value; `None` serves a cached ABSENCE without
+                // re-hitting the backing store (the negative-lookup fix — see the `cache` field).
+                return Ok(cached.clone());
             }
         }
         let value = self.inner.get(key).await?;
-        if let Some(bytes) = &value {
+        // Always cache a PRESENT value (invalidated by the write signals). Cache an ABSENCE only for the
+        // secret keyspace — every other key's absence stays read-through fresh so a peer's revoke/deny is
+        // never masked by a stale tombstone (see `negative_cacheable`).
+        if value.is_some() || Self::negative_cacheable(key) {
             self.cache
                 .lock()
                 .unwrap()
-                .put(key.to_string(), bytes.clone());
+                .put(key.to_string(), value.clone());
         }
         Ok(value)
     }
 
     async fn put(&self, key: &str, value: Vec<u8>) -> Result<(), KvError> {
         self.inner.put(key, value.clone()).await?;
-        self.cache.lock().unwrap().put(key.to_string(), value);
+        // Overwrites any `None` tombstone → a newly-set key is visible to the next read at once.
+        self.cache.lock().unwrap().put(key.to_string(), Some(value));
         self.announce(vec![key.to_string()]).await;
         Ok(())
     }
 
     async fn delete(&self, key: &str) -> Result<(), KvError> {
         self.inner.delete(key).await?;
-        self.cache.lock().unwrap().pop(key);
+        // A deleted SECRET keeps a negative tombstone (served without re-proving absence); any other key
+        // is EVICTED so its absence re-reads through — never a stale "absent ⇒ permit" (see
+        // `negative_cacheable`).
+        {
+            let mut cache = self.cache.lock().unwrap();
+            if Self::negative_cacheable(key) {
+                cache.put(key.to_string(), None);
+            } else {
+                cache.pop(key);
+            }
+        }
         self.announce(vec![key.to_string()]).await;
         Ok(())
     }
@@ -778,7 +846,9 @@ impl KvStore for CachedKv {
             .compare_and_swap(key, expected, new.clone())
             .await?;
         if swapped {
-            self.cache.lock().unwrap().put(key.to_string(), new);
+            // Overwrites any `None` tombstone → a just-set/rotated secret (the SecretStore write
+            // path) is visible to the next serve's resolution immediately, no TTL wait.
+            self.cache.lock().unwrap().put(key.to_string(), Some(new));
             self.announce(vec![key.to_string()]).await;
         }
         Ok(swapped)
@@ -1105,6 +1175,145 @@ mod tests {
         // SIGHUP-style invalidation → the next read pulls the fresh value.
         kv.invalidate_cache();
         assert_eq!(kv.get("k").await.unwrap(), Some(b"v2".to_vec()));
+    }
+
+    /// NEGATIVE-CACHE gate (serve-latency, secret-resolution). A declared-but-unset secret ref is a
+    /// KV **miss** resolved on every serve; on the node a single such miss was measured at
+    /// ~240–400 ms (a negative LSM lookup over the network volume). `CachedKv` must cache the miss,
+    /// and — crucially — the cache must be invalidated by a WILLFUL per-key WRITE SIGNAL (not a TTL),
+    /// so a later `set`/rotate is visible on the very next read. Each assertion below writes DIRECTLY
+    /// to the backing store to bypass `CachedKv`'s own invalidation, so a stale read proves the entry
+    /// was genuinely cached, and a fresh read proves the specific signal dropped it.
+    #[tokio::test]
+    async fn cachedkv_caches_negatives_and_signal_invalidates() {
+        let backing = Arc::new(MemoryKv::new());
+        let kv = CachedKv::new(backing.clone(), 32);
+
+        // 1) A miss is CACHED: after the first `None`, a value sneaked straight into the backing
+        //    store is still masked (a non-caching `get` would surface it) — this is the fix for the
+        //    ~400 ms-per-serve negative secret lookup.
+        assert_eq!(kv.get("secret/APPLE_CLIENT_ID").await.unwrap(), None);
+        backing
+            .put("secret/APPLE_CLIENT_ID", b"sneaked".to_vec())
+            .await
+            .unwrap();
+        assert_eq!(
+            kv.get("secret/APPLE_CLIENT_ID").await.unwrap(),
+            None,
+            "negative lookup must be cached (not re-hit the backing LSM every serve)"
+        );
+
+        // 2) SIGNAL: `put` through CachedKv overwrites the negative → visible at once.
+        assert_eq!(kv.get("secret/SET_VIA_PUT").await.unwrap(), None); // caches a tombstone
+        kv.put("secret/SET_VIA_PUT", b"v".to_vec()).await.unwrap();
+        assert_eq!(
+            kv.get("secret/SET_VIA_PUT").await.unwrap(),
+            Some(b"v".to_vec()),
+            "put must willfully invalidate the negative"
+        );
+
+        // 3) SIGNAL: `compare_and_swap` (the `SecretStore::set` path) from absent → present.
+        assert_eq!(kv.get("secret/SET_VIA_CAS").await.unwrap(), None); // caches a tombstone
+        assert!(
+            kv.compare_and_swap("secret/SET_VIA_CAS", None, b"v".to_vec())
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            kv.get("secret/SET_VIA_CAS").await.unwrap(),
+            Some(b"v".to_vec()),
+            "CAS must willfully invalidate the negative"
+        );
+
+        // 4) SIGNAL: the cross-node changelog poller's `invalidate_keys` drops a negative → re-fetch.
+        assert_eq!(kv.get("secret/PEER_SET").await.unwrap(), None); // caches a tombstone
+        backing
+            .put("secret/PEER_SET", b"from-peer".to_vec())
+            .await
+            .unwrap(); // a peer wrote it, bypassing this cache
+        kv.invalidate_keys(&["secret/PEER_SET".to_string()]);
+        assert_eq!(
+            kv.get("secret/PEER_SET").await.unwrap(),
+            Some(b"from-peer".to_vec()),
+            "invalidate_keys must drop the negative so the next read re-fetches"
+        );
+
+        // 5) `delete` records the post-delete ABSENCE as a negative (served without re-proving it).
+        kv.put("secret/TO_DELETE", b"v".to_vec()).await.unwrap();
+        assert_eq!(
+            kv.get("secret/TO_DELETE").await.unwrap(),
+            Some(b"v".to_vec())
+        );
+        kv.delete("secret/TO_DELETE").await.unwrap();
+        backing
+            .put("secret/TO_DELETE", b"resurrected".to_vec())
+            .await
+            .unwrap(); // sneak a value back in behind the cache
+        assert_eq!(
+            kv.get("secret/TO_DELETE").await.unwrap(),
+            None,
+            "delete must cache the absence (negative tombstone)"
+        );
+
+        // 6) SECURITY: a NON-secret key's absence is NOT cached — it stays read-through fresh, so a
+        //    peer node's freshly-written value (e.g. a token-revocation marker) is seen at once and a
+        //    revoked token can't keep authorizing reads off a stale tombstone (shared/multi-writer HA).
+        assert_eq!(kv.get("revoked/token-cti").await.unwrap(), None);
+        backing
+            .put("revoked/token-cti", b"revoked".to_vec())
+            .await
+            .unwrap(); // a peer revokes it, bypassing this cache
+        assert_eq!(
+            kv.get("revoked/token-cti").await.unwrap(),
+            Some(b"revoked".to_vec()),
+            "a non-secret absence must NOT be cached — revocation stays read-through fresh"
+        );
+        // And a non-secret delete EVICTS rather than tombstoning, so a later peer write is visible.
+        kv.put("domain/example.com", b"owned".to_vec())
+            .await
+            .unwrap();
+        kv.delete("domain/example.com").await.unwrap();
+        backing
+            .put("domain/example.com", b"peer-claimed".to_vec())
+            .await
+            .unwrap();
+        assert_eq!(
+            kv.get("domain/example.com").await.unwrap(),
+            Some(b"peer-claimed".to_vec()),
+            "a non-secret delete must evict (not tombstone) so a peer re-claim is seen"
+        );
+    }
+
+    #[test]
+    fn negative_cacheable_anchors_to_the_secret_keyspace() {
+        // The real secret keyspaces (deploy::keys) — absence IS cacheable (fails closed).
+        assert!(CachedKv::negative_cacheable("secret/APPLE_CLIENT_ID")); // top-level
+        assert!(CachedKv::negative_cacheable("project/acme/secret/API_KEY"));
+        assert!(CachedKv::negative_cacheable(
+            "project/acme/tenant-secret/ten_x/SMTP"
+        ));
+        // Authz / "absent ⇒ permit" keys — absence must NEVER be cached.
+        assert!(!CachedKv::negative_cacheable(
+            "authz/revoked/deadbeefcafef00d"
+        ));
+        assert!(!CachedKv::negative_cacheable("authz/policy"));
+        assert!(!CachedKv::negative_cacheable("domain/example.com"));
+        // Anchoring (forward-proofing): a `secret` segment DEEPER in a project path must NOT match, so a
+        // future non-secret "absent ⇒ permit" marker living under some other namespace can't be masked.
+        assert!(!CachedKv::negative_cacheable(
+            "project/acme/acl/secret-rules/allow"
+        ));
+        assert!(!CachedKv::negative_cacheable(
+            "project/acme/config/my-secret/x"
+        ));
+        // The tenant-secret INDEX is not the value keyspace — not cached (perf-only, fail-safe).
+        assert!(!CachedKv::negative_cacheable(
+            "project/acme/tenant-secret-index/ten_x"
+        ));
+        // CI merge-gate marker (grep'd in ci.yml): absence caching is anchored to the secret keyspace,
+        // so an authz "absent ⇒ permit" key is never masked by a stale tombstone. A rename/`#[cfg]`-out
+        // that silently drops this test is caught by the gate's "did not run" guard.
+        println!("NEGATIVE-CACHE SECRET-SCOPED OK");
     }
 
     #[tokio::test]

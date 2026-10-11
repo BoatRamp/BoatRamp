@@ -150,17 +150,19 @@ impl SqlSession {
     /// principal value bound to the operator's configured GUC name(s). Empty for an `all` write (no
     /// resolved principal — the value is set per statement from the row) or when no RLS GUC / not
     /// Postgres. Computed from `&self` so it can be emitted on a freshly-begun tx without a borrow
-    /// clash. Each entry is `(sql, params)` for one `SELECT set_config(?, ?, true)`.
-    fn rls_tx_sets(&self, name: &str) -> Vec<(String, Vec<SqlValue>)> {
+    /// clash. The host-resolved `(name, value)` GUCs set transaction-locally at open; the backend
+    /// applies them — the Postgres backend folds them into the `BEGIN` round-trip
+    /// ([`SqlBackend::begin_with_gucs`]), others issue one combined `set_config` statement.
+    fn rls_gucs(&self, name: &str) -> Vec<(String, SqlValue)> {
         let (Some(guc), Some(tenancy)) = (self.rls_guc(name), self.tenancy.as_ref()) else {
             return Vec::new();
         };
-        let mut sets = Vec::new();
+        let mut gucs: Vec<(String, SqlValue)> = Vec::new();
         if let Some(tv) = tenancy.rls_tenant_value() {
-            sets.push(boatramp_core::sql::render_set_local_guc(&guc.tenant, tv));
+            gucs.push((guc.tenant.clone(), tv.clone()));
         }
         if let (Some(sname), Some(sv)) = (&guc.session, tenancy.rls_session_value()) {
-            sets.push(boatramp_core::sql::render_set_local_guc(sname, sv));
+            gucs.push((sname.clone(), sv.clone()));
         }
         // The principal-CLASS GUC (construens `cron-system-principal`): `"system"` for a system
         // principal (no tenant — the tenant GUC above is left unset, so reads fall to `IS NULL` only),
@@ -173,12 +175,9 @@ impl SqlSession {
             } else {
                 "tenant"
             };
-            sets.push(boatramp_core::sql::render_set_local_guc(
-                kname,
-                &SqlValue::Text(kind_val.to_string()),
-            ));
+            gucs.push((kname.clone(), SqlValue::Text(kind_val.to_string())));
         }
-        sets
+        gucs
     }
 
     /// Set the RLS tenant GUC on the (write) transaction for `name` to an EXPLICIT value — the path
@@ -329,18 +328,14 @@ impl SqlSession {
                 .get(name)
                 .ok_or_else(|| SqlError::Other(format!("sql database {name:?} not granted")))?
                 .clone();
-            let mut txn = if read_only {
-                backend.begin_read_only().await
-            } else {
-                backend.begin().await
-            }?;
-            // v0.4.20: set the per-transaction RLS tenant GUC (own/target/session) right after the
-            // tx opens — right after the backend's own `boatramp.project`/`site` context — so an
-            // app's Postgres RLS mirrors the injected predicate. `all` writes add nothing here (no
-            // resolved principal); they set the GUC per statement from the row. `SET LOCAL`, bound.
-            for (sql, params) in self.rls_tx_sets(name) {
-                txn.execute(&sql, &params).await?;
-            }
+            // v0.4.20: set the per-transaction RLS tenant GUC (own/target/session) as the tx opens —
+            // so an app's Postgres RLS mirrors the injected predicate. `all` writes add nothing here
+            // (no resolved principal); they set the GUC per statement from the row. Opening and the
+            // GUC sets go together via `begin_with_gucs`: the Postgres backend folds `BEGIN` + the
+            // (combined) `set_config` into ONE round-trip — one fewer round-trip (and one fewer async
+            // scheduling point, which dominates under CPU contention) per per-serve read.
+            let gucs = self.rls_gucs(name);
+            let txn = backend.begin_with_gucs(read_only, &gucs).await?;
             self.txns.insert(key.clone(), txn);
         }
         Ok(self.txns.get_mut(&key).expect("inserted above").as_mut())

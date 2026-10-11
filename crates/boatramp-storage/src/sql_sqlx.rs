@@ -686,6 +686,32 @@ mod postgres_backend {
             begin_on(pool, true).await
         }
 
+        /// Postgres override: send `BEGIN [READ ONLY]` + the RLS GUC sets as ONE simple-query
+        /// round-trip (vs the trait default's BEGIN then a separate `set_config` round-trip). The
+        /// pool/read-only selection mirrors `begin`/`begin_read_only`; see `render_begin_with_gucs_pg`
+        /// for the injection-safety argument (fixed GUC names, host-resolved validated values, escaped).
+        async fn begin_with_gucs(
+            &self,
+            read_only: bool,
+            gucs: &[(String, SqlValue)],
+        ) -> Result<Box<dyn SqlTransaction>, SqlError> {
+            let (pool, ro) = if read_only {
+                (self.read_pool.as_ref().unwrap_or(&self.pool), true)
+            } else {
+                (&self.pool, self.read_only)
+            };
+            let mut conn = pool.acquire().await.map_err(map_err)?;
+            let sql = boatramp_core::sql::render_begin_with_gucs_pg(ro, gucs);
+            // `raw_sql` = the simple-query protocol, so the multi-statement `BEGIN …; SELECT …` runs
+            // as ONE round-trip (the extended/prepared path is single-statement). Run it via the
+            // connection's `Executor` (same form as `begin_on`'s `BEGIN`) to keep the borrow simple.
+            (&mut *conn)
+                .execute(sqlx::raw_sql(&sql))
+                .await
+                .map_err(map_err)?;
+            Ok(Box::new(PgTransaction { conn }))
+        }
+
         async fn query_autocommit(
             &self,
             sql: &str,

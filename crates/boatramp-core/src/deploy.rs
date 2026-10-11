@@ -164,10 +164,12 @@ pub struct DeployStoreInner {
     /// Hot-path cache of `Host` → resolved `(project, site)` domain routing, so the
     /// serve path skips the per-request `domain/<host>` (+ wildcard-suffix walk) KV
     /// gets. Crucially it caches **misses** too: [`CachedKv`](crate::kv::CachedKv)
-    /// never caches a negative lookup, and the common case — a `Host` with no custom
-    /// domain that falls through to the default site — is all misses, so without this
-    /// every request re-hits the KV up the label chain (profiled as the single
-    /// dominant per-request read under proxy load). Invalidated by `domain_epoch`.
+    /// does not negative-cache a `domain/<host>` lookup (its tombstones are scoped to the
+    /// secret keyspace — [`CachedKv::negative_cacheable`](crate::kv::CachedKv) — so an
+    /// "absent ⇒ default site" domain miss stays read-through there), and the common case —
+    /// a `Host` with no custom domain that falls through to the default site — is all misses,
+    /// so without THIS cache every request re-hits the KV up the label chain (profiled as the
+    /// single dominant per-request read under proxy load). Invalidated by `domain_epoch`.
     domain_cache: Arc<std::sync::RwLock<DomainResolveCache>>,
     /// Monotonic generation for `domain_cache`, bumped on every domain-index write
     /// (`set_site_config` / `delete_site`). A resolution cached under an older

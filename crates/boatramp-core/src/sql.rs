@@ -219,6 +219,78 @@ pub fn render_set_local_guc(name: &str, value: &SqlValue) -> (String, Vec<SqlVal
     )
 }
 
+/// Render SEVERAL transaction-local GUC sets as ONE statement — `SELECT set_config(?,?,true),
+/// set_config(?,?,true), …` — so N GUCs cost ONE round-trip instead of N. Each per-serve read
+/// transaction sets the tenant (+ optional session + principal-kind) GUCs at open; on a
+/// colocated-pg deployment each extra round-trip is tens of ms, so folding them is a real latency
+/// win. Semantics are identical to issuing each [`render_set_local_guc`] separately: every NAME and
+/// VALUE is a bound parameter (injection-safe), `true` keeps each `SET LOCAL`-scoped (auto-cleared at
+/// COMMIT/ROLLBACK), and `set_config` returns the value (ignored). Returns `None` for an empty set.
+/// Postgres only.
+pub fn render_set_local_gucs(gucs: &[(String, SqlValue)]) -> Option<(String, Vec<SqlValue>)> {
+    if gucs.is_empty() {
+        return None;
+    }
+    let mut exprs = Vec::with_capacity(gucs.len());
+    let mut params = Vec::with_capacity(gucs.len() * 2);
+    for (i, (name, value)) in gucs.iter().enumerate() {
+        let base = i * 2;
+        exprs.push(format!("set_config(?{}, ?{}, true)", base + 1, base + 2));
+        // Reuse the single-GUC renderer for the value→text coercion + fail-safe handling, taking
+        // only its bound params ([name, text]); the placeholders are renumbered above.
+        let (_, ps) = render_set_local_guc(name, value);
+        params.extend(ps);
+    }
+    Some((format!("SELECT {}", exprs.join(", ")), params))
+}
+
+/// Quote a Postgres string **literal** for safe inlining, INDEPENDENT of the server's
+/// `standard_conforming_strings` setting. Uses the escape-string form `E'…'` and doubles BOTH the
+/// single-quote (`'`→`''`) AND the backslash (`\`→`\\`): in an `E''` string a backslash is an escape
+/// character, so a value ending in `\` would otherwise eat the closing quote (escape-sequence injection)
+/// on a server with `standard_conforming_strings = off`. Doubling both makes the literal unambiguous
+/// under either setting. Used to INLINE the RLS GUC sets into the same round-trip as `BEGIN`
+/// ([`render_begin_with_gucs_pg`]); callers pass only host-controlled, validated inputs (the operator's
+/// fixed GUC names and host-resolved, path-segment-safe tenant/session ids that never legitimately
+/// contain `'` or `\`), never guest text — so this escaping is defense-in-depth over that invariant.
+fn pg_quote_literal(s: &str) -> String {
+    format!("E'{}'", s.replace('\\', "\\\\").replace('\'', "''"))
+}
+
+/// Render `BEGIN [READ ONLY]` **and** the transaction-local RLS GUC sets as ONE Postgres
+/// simple-query command — so a per-serve read transaction's open + RLS setup is a SINGLE round-trip
+/// instead of two (a `BEGIN` round-trip then a `SELECT set_config(…)` round-trip). The `BEGIN` is
+/// transaction control (text protocol), which the parameterized/extended path can't batch with the
+/// GUC statement, so the GUC name/value are INLINED as Postgres literals here. That is injection-safe
+/// because (a) the setting NAMES come from the operator's fixed [`RlsGuc`] config, (b) the VALUES are
+/// host-resolved, validated resource ids (never guest input), and (c) every literal is escaped via
+/// [`pg_quote_literal`], which is injection-safe regardless of the server's `standard_conforming_strings`
+/// setting. With no GUCs this is just the bare `BEGIN`.
+pub fn render_begin_with_gucs_pg(read_only: bool, gucs: &[(String, SqlValue)]) -> String {
+    let begin = if read_only {
+        "BEGIN READ ONLY"
+    } else {
+        "BEGIN"
+    };
+    if gucs.is_empty() {
+        return begin.to_string();
+    }
+    let exprs: Vec<String> = gucs
+        .iter()
+        .map(|(name, value)| {
+            // Reuse the single-GUC renderer for the value→text coercion (incl. its fail-safe
+            // empty-string for non-text), then inline the [name, text] it bound.
+            let (_, p) = render_set_local_guc(name, value);
+            let lit = |v: &SqlValue| match v {
+                SqlValue::Text(s) => pg_quote_literal(s),
+                _ => pg_quote_literal(""),
+            };
+            format!("set_config({}, {}, true)", lit(&p[0]), lit(&p[1]))
+        })
+        .collect();
+    format!("{begin}; SELECT {}", exprs.join(", "))
+}
+
 /// The SQL dialect a backend speaks. The `orm` compiler is `?N`-portable for almost
 /// everything (the backend rewrites the placeholders), and only consults this for the
 /// handful of constructs whose *syntax* genuinely differs across engines — currently JSON
@@ -274,6 +346,28 @@ pub trait SqlBackend: Send + Sync {
     /// single-node and replica-less deployments behave identically.
     async fn begin_read_only(&self) -> Result<Box<dyn SqlTransaction>, SqlError> {
         self.begin().await
+    }
+
+    /// Open a transaction (read-only when `read_only`) AND apply the transaction-local RLS GUCs in
+    /// one call. The default opens the transaction, then issues the folded `SELECT set_config(…)` —
+    /// two round-trips. The Postgres backend overrides this to send `BEGIN [READ ONLY]` + the GUC
+    /// sets as ONE round-trip ([`render_begin_with_gucs_pg`]); on a colocated-pg deployment each saved
+    /// round-trip is also one fewer async scheduling point, which matters most under CPU contention.
+    /// `gucs` is the host-resolved `(name, value)` list; empty ⇒ a bare transaction, no setup.
+    async fn begin_with_gucs(
+        &self,
+        read_only: bool,
+        gucs: &[(String, SqlValue)],
+    ) -> Result<Box<dyn SqlTransaction>, SqlError> {
+        let mut txn = if read_only {
+            self.begin_read_only().await?
+        } else {
+            self.begin().await?
+        };
+        if let Some((sql, params)) = render_set_local_gucs(gucs) {
+            txn.execute(&sql, &params).await?;
+        }
+        Ok(txn)
     }
 
     /// Run a multi-statement SQL **script** as one unit (the simple-query protocol),
@@ -994,6 +1088,76 @@ pub fn script_has_create_extension_in(script: &str, dialect: GuardDialect) -> bo
             .windows(2)
             .any(|w| w[0] == "create" && w[1] == "extension"),
         None => true, // fail closed
+    }
+}
+
+#[cfg(test)]
+mod set_local_guc_fold_tests {
+    use super::{SqlValue, render_begin_with_gucs_pg, render_set_local_guc, render_set_local_gucs};
+
+    #[test]
+    fn begin_with_gucs_pg_combines_into_one_command_and_escapes_literals() {
+        // No GUCs → the bare transaction open (one round-trip, no setup).
+        assert_eq!(render_begin_with_gucs_pg(true, &[]), "BEGIN READ ONLY");
+        assert_eq!(render_begin_with_gucs_pg(false, &[]), "BEGIN");
+
+        // GUCs → `BEGIN …; SELECT set_config(…), …` in ONE simple-query command; names/values are
+        // inlined as `E'…'` escape-string literals — the quote is doubled (`'`→`''`) AND the backslash
+        // is doubled (`\`→`\\`), so the literal is unambiguous regardless of `standard_conforming_strings`
+        // (a trailing `\` cannot eat the closing quote). The escaped values are defense-in-depth: real
+        // ids are path-segment-safe and never carry `'`/`\`.
+        let sql = render_begin_with_gucs_pg(
+            true,
+            &[
+                ("app.tenant_id".into(), SqlValue::Text("ten_a".into())),
+                ("app.session_id".into(), SqlValue::Text("o'brien".into())),
+                ("app.principal".into(), SqlValue::Text("a\\b".into())),
+            ],
+        );
+        assert_eq!(
+            sql,
+            "BEGIN READ ONLY; SELECT set_config(E'app.tenant_id', E'ten_a', true), \
+             set_config(E'app.session_id', E'o''brien', true), \
+             set_config(E'app.principal', E'a\\\\b', true)"
+        );
+    }
+
+    #[test]
+    fn folds_many_gucs_into_one_statement_with_renumbered_placeholders() {
+        // Empty → None (no round-trip at all).
+        assert!(render_set_local_gucs(&[]).is_none());
+
+        // One GUC is byte-identical to the single renderer (same round-trip either way).
+        let one =
+            render_set_local_gucs(&[("app.tenant_id".into(), SqlValue::Text("ten_a".into()))])
+                .unwrap();
+        assert_eq!(
+            one,
+            render_set_local_guc("app.tenant_id", &SqlValue::Text("ten_a".into()))
+        );
+
+        // Three GUCs → ONE statement, placeholders renumbered 1..6, params in [name, value] order.
+        let (sql, params) = render_set_local_gucs(&[
+            ("app.tenant_id".into(), SqlValue::Text("ten_a".into())),
+            ("app.session_id".into(), SqlValue::Text("sess_b".into())),
+            ("app.principal_kind".into(), SqlValue::Text("tenant".into())),
+        ])
+        .unwrap();
+        assert_eq!(
+            sql,
+            "SELECT set_config(?1, ?2, true), set_config(?3, ?4, true), set_config(?5, ?6, true)"
+        );
+        assert_eq!(
+            params,
+            vec![
+                SqlValue::Text("app.tenant_id".into()),
+                SqlValue::Text("ten_a".into()),
+                SqlValue::Text("app.session_id".into()),
+                SqlValue::Text("sess_b".into()),
+                SqlValue::Text("app.principal_kind".into()),
+                SqlValue::Text("tenant".into()),
+            ]
+        );
     }
 }
 
