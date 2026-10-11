@@ -172,6 +172,7 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
     let max_handler_blob_bytes = options.posture.max_handler_blob_bytes;
     let max_component_bytes = options.posture.max_component_bytes;
     let allow_guest_private_egress = options.posture.allow_guest_private_egress;
+    let allow_guest_tcp_egress = options.posture.allow_guest_tcp_egress;
     let allow_env_secret_refs = options.posture.allow_env_secret_refs;
     let allow_guest_email = options.posture.allow_guest_email;
     // The instance's own serve socket(s) a guest self-call may reach, when the posture allows
@@ -254,6 +255,7 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
         max_handler_blob_bytes,
         max_component_bytes,
         allow_guest_private_egress,
+        allow_guest_tcp_egress,
         self_egress_addrs,
         guest_egress_extra_roots,
         allow_env_secret_refs,

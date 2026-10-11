@@ -1014,6 +1014,8 @@ pub(super) async fn run_scheduler_tick(
                                 &consumer.upload_containers,
                                 // The consumer's plain-`wasi:blobstore` allowlist (host-enforced tenant confinement).
                                 &consumer.blobstore_containers,
+                                // The consumer's outbound-TCP `egress_allowlist` (gated `wasi:sockets`): empty ⇒ deny-all.
+                                &consumer.egress_allowlist,
                                 // Per-guest secret allowlist (task #492): empty ⇒ the whole site pool.
                                 &consumer.secrets,
                                 // Consumers resolve their secrets as before (no `no_secrets` opt-out).
@@ -1079,6 +1081,7 @@ pub(super) async fn run_scheduler_tick(
                                     tenant_secret_names: &consumer.tenant_secret_names,
                                     upload_containers: &consumer.upload_containers,
                                     blobstore_containers: &consumer.blobstore_containers,
+                                    egress_allowlist: &consumer.egress_allowlist,
                                     secret_allowlist: &consumer.secrets,
                                 });
                             // Dispatch ONCE per matching concrete topic (v0.7.1 fan-in). For a
@@ -1482,6 +1485,8 @@ async fn fire_cron(
         &handler.upload_containers,
         // A cron-triggered handler inherits the matched handler's plain-`wasi:blobstore` allowlist.
         &handler.blobstore_containers,
+        // A cron-triggered handler inherits the matched handler's outbound-TCP `egress_allowlist`.
+        &handler.egress_allowlist,
         // A cron-triggered handler inherits the matched handler's per-guest secret allowlist (#492).
         &handler.secrets,
         // …and its `no_secrets` opt-out (Ask B-3 B).

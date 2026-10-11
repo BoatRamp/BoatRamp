@@ -1,7 +1,7 @@
 //! The wasmtime component engine: compile (cached by blob hash), instantiate
 //! per request, drive `wasi:http/incoming-handler`, and enforce limits.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::num::NonZeroUsize;
 use std::path::Path;
 use std::pin::Pin;
@@ -17,7 +17,7 @@ use lru::LruCache;
 use tokio::sync::Semaphore;
 use wasmtime::component::{Component, Linker, ResourceTable};
 use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder};
-use wasmtime_wasi::{IoView, WasiCtx, WasiCtxBuilder, WasiView};
+use wasmtime_wasi::{IoView, SocketAddrUse, WasiCtx, WasiCtxBuilder, WasiView};
 use wasmtime_wasi_http::bindings::ProxyPre;
 use wasmtime_wasi_http::bindings::http::types::{ErrorCode, Scheme};
 use wasmtime_wasi_http::body::{HostIncomingBody, HyperIncomingBody, HyperOutgoingBody};
@@ -774,6 +774,57 @@ async fn egress_target_allowed(
     Ok(EgressPlan { self_depth: None })
 }
 
+/// Whether `addr` (a resolved TCP `connect` peer) is permitted by the per-handler outbound-TCP
+/// `egress_allowlist` (`PLAN-handler-tcp-egress`). Each allowlist entry is `<target>:<port>`, where
+/// `<target>` is an **IP literal** (exact match), a **CIDR** (membership), or a **domain** (resolved
+/// host-side and matched against the peer IP — the resolve-then-compare of [`egress_target_allowed`]).
+/// A match requires BOTH the port and the target to agree. An **empty** allowlist matches nothing
+/// (deny-all). This answers ONLY the allowlist-membership question; the caller (the `new_store`
+/// `socket_addr_check` closure) separately enforces connect-only + the `is_global_ip` SSRF floor, so
+/// a private/loopback target is still refused here unless the posture also allows private egress.
+async fn tcp_egress_allowed(allowlist: &[String], addr: SocketAddr) -> bool {
+    for entry in allowlist {
+        // Split the REQUIRED trailing `:<port>`. Split on the LAST colon so an IPv6 literal/CIDR
+        // target (which itself contains colons) keeps its colons: `[::1]:993`, `2001:db8::/32:993`,
+        // `10.0.0.0/8:5432`, `db.internal:5432`.
+        let Some((target, port_s)) = entry.rsplit_once(':') else {
+            continue; // no port ⇒ malformed, never matches (fail-closed)
+        };
+        let Ok(port) = port_s.parse::<u16>() else {
+            continue;
+        };
+        if port != addr.port() {
+            continue;
+        }
+        // Tolerate brackets on an IPv6 literal target (`[2001:db8::1]`).
+        let target = target.trim_start_matches('[').trim_end_matches(']');
+        // 1) Exact IP literal.
+        if let Ok(ip) = target.parse::<IpAddr>() {
+            if ip == addr.ip() {
+                return true;
+            }
+            continue;
+        }
+        // 2) CIDR membership.
+        if let Ok(net) = target.parse::<ipnet::IpNet>() {
+            if net.contains(&addr.ip()) {
+                return true;
+            }
+            continue;
+        }
+        // 3) Domain: resolve host-side and match the peer IP (resolve-then-compare). An
+        //    unresolvable entry simply doesn't match — another entry may still permit the peer.
+        if let Ok(resolved) = tokio::net::lookup_host((target, port)).await {
+            for sa in resolved {
+                if sa.ip() == addr.ip() {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 /// The active async-lane mutation (anti-hollow gates), or `None`. Present ONLY under `cfg(test)`
 /// (this crate's own unit gates) or the `async-lane-gate-mutation` feature; a shipped build has
 /// neither, so both lane clamps below — the per-invocation memory down-clamp in
@@ -918,6 +969,12 @@ pub struct HandlerEngine {
     /// A per-process random nonce stamped on the self-egress depth header so an external
     /// client can't forge it. Generated once at engine build.
     egress_nonce: u64,
+    /// Whether a guest's gated `wasi:sockets` capability may open an outbound TCP `connect` (the
+    /// operator posture's `allow_guest_tcp_egress`). `false` (the default) keeps the socket host
+    /// deny-all: `new_store` never installs a permissive `socket_addr_check`, so every connect is
+    /// refused regardless of the per-handler allowlist. `true` installs the connect-only,
+    /// allowlist-gated, SSRF-floored check. Never affects `wasi:http` egress (its own gate).
+    allow_tcp_egress: bool,
     epoch_ticker: tokio::task::JoinHandle<()>,
 }
 
@@ -1098,6 +1155,9 @@ impl HandlerEngine {
                 getrandom::getrandom(&mut b).ok();
                 u64::from_le_bytes(b)
             },
+            // Deny-by-default: the socket host stays deny-all until an operator opts the posture in
+            // via `with_tcp_egress`. A node that never calls it can never grant outbound TCP.
+            allow_tcp_egress: false,
             limits,
             epoch_ticker,
         })
@@ -1198,6 +1258,20 @@ impl HandlerEngine {
     #[must_use]
     pub fn with_private_egress(mut self, allow: bool) -> Self {
         self.allow_private_egress = allow;
+        self
+    }
+
+    /// Permit (or refuse) a guest's gated `wasi:sockets` capability to open an outbound TCP
+    /// `connect` — the operator posture's `allow_guest_tcp_egress` (`PLAN-handler-tcp-egress`).
+    /// Default (`false`) keeps the socket host deny-all (no permissive `socket_addr_check` is ever
+    /// installed, so every target is refused). When `true`, `new_store` installs a check that is
+    /// **connect-only** (denies `bind`/`listen`/UDP), permits a resolved peer ONLY if it matches
+    /// this invocation's per-handler `egress_allowlist` (IP / CIDR / host-resolved domain + port),
+    /// and still applies the `is_global_ip` SSRF floor unless `with_private_egress` is also on.
+    /// Independent of every `wasi:http` egress knob.
+    #[must_use]
+    pub fn with_tcp_egress(mut self, allow: bool) -> Self {
+        self.allow_tcp_egress = allow;
         self
     }
 
@@ -1863,6 +1937,43 @@ impl HandlerEngine {
         for (key, value) in bindings.env() {
             wasi_builder.env(key, value);
         }
+        // Gated `wasi:sockets` outbound-TCP (`PLAN-handler-tcp-egress`). Deny-by-default: unless the
+        // node posture allows TCP egress AND this invocation carries a non-empty per-handler
+        // allowlist, no permissive `socket_addr_check` is installed — so the socket host's default
+        // (`SocketAddrCheck::default()` denies ALL) stands and every connect fails closed. When both
+        // hold, install a check that is (a) **connect-only** — every non-`TcpConnect` use
+        // (`bind`/`listen`, all UDP) is denied, so inbound stays the container/microVM model; (b)
+        // **allowlisted** — a resolved peer is permitted only if it matches an `egress_allowlist`
+        // entry (IP / CIDR / host-resolved domain + port); and (c) **SSRF-floored** — even an
+        // allowlisted peer must be globally routable unless `allow_private_egress` is also on, so the
+        // capability can't be an SSRF bypass to the metadata endpoint / private ranges. UDP is also
+        // blanket-disabled and `ip-name-lookup` is enabled only here (gated to the posture) so a guest
+        // can resolve an allowlisted domain before connecting.
+        let egress_allowlist = bindings.egress_allowlist();
+        if self.allow_tcp_egress && !egress_allowlist.is_empty() {
+            let allow_private = self.allow_private_egress;
+            let allowlist = egress_allowlist;
+            wasi_builder.allow_tcp(true);
+            wasi_builder.allow_udp(false);
+            wasi_builder.allow_ip_name_lookup(true);
+            wasi_builder.socket_addr_check(move |addr, use_| {
+                let allowlist = allowlist.clone();
+                Box::pin(async move {
+                    // (a) Connect-only: refuse bind/listen and every UDP use outright.
+                    if !matches!(use_, SocketAddrUse::TcpConnect) {
+                        return false;
+                    }
+                    // (c) SSRF floor: a non-global peer is refused unless private egress is allowed —
+                    // applied BEFORE the allowlist so an allowlisted private target still needs the
+                    // separate `allow_guest_private_egress` opt-in.
+                    if !allow_private && !boatramp_core::access::is_global_ip(addr.ip()) {
+                        return false;
+                    }
+                    // (b) Allowlist membership (IP / CIDR / host-resolved domain + port).
+                    tcp_egress_allowed(&allowlist, addr).await
+                })
+            });
+        }
         let wasi = wasi_builder.build();
         // The memory ceiling is the already-clamped (lane ∧ component) `effective_limits` value; the
         // `MemLimiter` only *observes* a denied grow (for `out-of-memory` classification) without
@@ -2205,6 +2316,70 @@ mod tests {
     #[test]
     fn engine_builds() {
         build_engine(None).expect("engine builds");
+    }
+
+    /// `PLAN-handler-tcp-egress` TE-2: the outbound-TCP allowlist-membership core. Covers the three
+    /// entry shapes (IP literal / CIDR / host-resolved domain) + the REQUIRED port match + the
+    /// empty-allowlist deny-all. The connect-only + SSRF-floor checks live in the `new_store` closure
+    /// around this (and are exercised by the TE-3 live gate); this asserts the membership semantics.
+    #[tokio::test]
+    async fn tcp_egress_allowlist_membership() {
+        let sa = |s: &str| s.parse::<SocketAddr>().unwrap();
+
+        // Empty allowlist ⇒ deny-all (nothing to match).
+        assert!(!tcp_egress_allowed(&[], sa("93.184.216.34:443")).await);
+
+        // Exact IP + port.
+        let ip = vec!["93.184.216.34:443".to_string()];
+        assert!(tcp_egress_allowed(&ip, sa("93.184.216.34:443")).await);
+        // Right IP, WRONG port ⇒ deny (the port is part of the target).
+        assert!(!tcp_egress_allowed(&ip, sa("93.184.216.34:8443")).await);
+        // Right port, WRONG IP ⇒ deny.
+        assert!(!tcp_egress_allowed(&ip, sa("93.184.216.35:443")).await);
+
+        // CIDR membership + port.
+        let cidr = vec!["10.0.0.0/8:5432".to_string()];
+        assert!(tcp_egress_allowed(&cidr, sa("10.1.2.3:5432")).await);
+        assert!(!tcp_egress_allowed(&cidr, sa("11.0.0.1:5432")).await); // outside the block
+        assert!(!tcp_egress_allowed(&cidr, sa("10.1.2.3:5433")).await); // wrong port
+
+        // IPv6 literal + CIDR (last-colon split must keep the address colons).
+        let v6 = vec![
+            "[2001:db8::1]:993".to_string(),
+            "2001:db8::/32:995".to_string(),
+        ];
+        assert!(tcp_egress_allowed(&v6, sa("[2001:db8::1]:993")).await);
+        assert!(tcp_egress_allowed(&v6, sa("[2001:db8::dead]:995")).await); // CIDR
+        assert!(!tcp_egress_allowed(&v6, sa("[2001:dead::1]:995")).await); // outside /32
+
+        // Domain: resolve host-side and match the peer IP. `localhost` resolves to loopback, so this
+        // exercises the resolve-then-compare path with no network dependency. (The SSRF floor that
+        // would otherwise block loopback is applied by the closure, NOT by this membership helper.)
+        let dom = vec!["localhost:993".to_string()];
+        assert!(tcp_egress_allowed(&dom, sa("127.0.0.1:993")).await);
+        assert!(!tcp_egress_allowed(&dom, sa("127.0.0.1:994")).await); // wrong port
+        // A non-loopback IP is not what `localhost` resolves to ⇒ deny.
+        assert!(!tcp_egress_allowed(&dom, sa("93.184.216.34:993")).await);
+
+        // Malformed entries (no port) never match.
+        assert!(!tcp_egress_allowed(&["93.184.216.34".to_string()], sa("93.184.216.34:443")).await);
+    }
+
+    /// Deny-by-default wiring: an engine built WITHOUT `with_tcp_egress` must leave the socket host
+    /// deny-all. `new_store` is the only installer of a permissive `socket_addr_check`, and it does so
+    /// only when `allow_tcp_egress && !allowlist.is_empty()`; a default engine has `allow_tcp_egress`
+    /// false, so no check is ever installed regardless of the per-handler allowlist.
+    #[tokio::test]
+    async fn tcp_egress_defaults_denied() {
+        let engine = HandlerEngine::new(Limits::default(), 4).expect("engine");
+        assert!(
+            !engine.allow_tcp_egress,
+            "default posture denies TCP egress"
+        );
+        assert!(
+            engine.with_tcp_egress(true).allow_tcp_egress,
+            "the builder flips the posture flag"
+        );
     }
 
     /// The reentrant-deadlock guard (image-serve-latency Ask B, security review HIGH): the request
