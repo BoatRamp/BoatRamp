@@ -38,6 +38,13 @@ pass-gate-mutation = []
 # the posture gate — goes RED when neutered (`admit_unallowlisted`/`admit_bind_listen`/`drop_posture`).
 # Also armed under `cfg(test)`; NEVER enabled in a shipped build (it only reads a test env var).
 tcpegress-gate-mutation = ["engine"]
+# Anti-hollow gate lane for the host-owned inbound-TCP listener dispatch gate (PLAN-handler-tcp-inbound):
+# arms the `BOATRAMP_TCPLISTENER_MUTATION` seam (`engine::tcplistener_mutation`) so the CI gate can prove
+# the two dispatch checks in `tcp_listener_dispatch_decision` — the posture gate and the operator-declared
+# gate — go RED when neutered (`drop_posture`/`admit_undeclared`), AND that the conn-lane store grants NO
+# socket authority (`add_socket_authority` must turn the structural assertion RED). Pulls `tcp-listener`
+# (the world + dispatch path the gate drives). Also armed under `cfg(test)`; NEVER in a shipped build.
+tcp-listener-gate-mutation = ["tcp-listener"]
 engine = [
   "dep:wasmtime",
   "dep:wasmtime-wasi",
@@ -128,6 +135,15 @@ tenant-secrets = ["engine", "dep:async-trait"]
 # `BlobUploadMinter` impl lives a layer up, boatramp-server); this gates only the WIT interface + the
 # object-safe minter seam + linker. Off by default; the server turns it on inside its `handlers` feature.
 blob-upload = ["engine", "dep:async-trait"]
+# The `tcp-listener` capability (host-owned inbound-TCP listeners, PLAN-handler-tcp-inbound): the host
+# binds/listens/accepts on an operator-declared `[serve.listeners.<name>]` and re-enters a guest's
+# `tcp-connection-handler` export once per ALREADY-ACCEPTED connection, handing it the connection's
+# `wasi:io` streams as host-owned resources. The guest NEVER receives `wasi:sockets` (no bind/listen/
+# connect authority; the deny-all socket host default stands — no permissive `socket_addr_check`, no
+# `allow_tcp` for this lane). The accept loop + per-connection binding build live a layer up
+# (boatramp-server/boatramp); this gates the WIT `tcp-connection-host` world + the engine's conn-lane
+# dispatch. Off by default (experimental); the shipped binary turns it on via batteries-included.
+tcp-listener = ["engine"]
 
 [dependencies]
 boatramp-core.workspace = true
