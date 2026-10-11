@@ -162,7 +162,10 @@ blob-fallback-gate-mutation = ["fs", "fallback"]
 # (`CompositeBlobBackends::backend` → GLOBAL for every project), so CI can prove the gate is
 # load-bearing by asserting the isolation test FAILS under `BOATRAMP_BLOB_PERPROJECT_MUTATION`.
 # Compiled OUT of every real build.
-blob-perproject-gate-mutation = ["handlers", "boatramp-storage/blob-perproject-gate-mutation"]
+blob-perproject-gate-mutation = [
+  "handlers",
+  "boatramp-storage/blob-perproject-gate-mutation",
+]
 
 [dev-dependencies]
 # The in-process fidelity test (`node::tests`) drives the assembled router with a

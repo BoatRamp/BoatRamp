@@ -277,13 +277,13 @@ pub use migrate::{MigrateMode, run_migration};
 /// an inbound frame that re-enters the guest `session-handler`.
 #[cfg(feature = "session")]
 mod session_serve;
+#[cfg(feature = "handlers")]
+mod stream;
 /// Host-owned inbound-TCP listener serving (PLAN-handler-tcp-inbound): the reusable accept loop +
 /// lifecycle that hands each accepted connection to a guest `tcp-connection-handler`. `pub` so the
 /// orchestration layer (`boatramp::serve::spawn_listeners`) can spawn one per `[serve.listeners.<name>]`.
 #[cfg(feature = "tcp-listener")]
 pub mod tcp_listener_serve;
-#[cfg(feature = "handlers")]
-mod stream;
 #[cfg(feature = "handlers")]
 mod workflow;
 pub use auth::{Auth, require_auth};
