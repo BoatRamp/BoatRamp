@@ -1,0 +1,22 @@
+# Example WebAssembly *inbound-TCP connection* guest (PLAN-handler-tcp-inbound) — the COMPUTE-BOUND
+# fixture for the HIGH-fix proof. Exports the boatramp `tcp-connection-handler` and, on dispatch,
+# IGNORES the connection and busy-loops forever (`loop { core::hint::spin_loop() }`) with NO suspending
+# host call — so the only thing that can preempt it is the conn-lane epoch-YIELD letting the host
+# wall-clock watchdog drop the call at `max_conn_duration`. Without the HIGH fix (epoch disabled) this
+# guest would pin a worker and hang the watchdog. Built with `cargo build --release --target
+# wasm32-wasip2`; consumed as a fixture. Excluded from the workspace (targets wasm).
+[package]
+name = "boatramp-example-tcp-spin"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.46"
+
+[profile.release]
+opt-level = "s"
+strip = true

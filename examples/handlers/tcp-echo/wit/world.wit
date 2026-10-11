@@ -1,0 +1,12 @@
+// Example WebAssembly *inbound-TCP connection* guest world (PLAN-handler-tcp-inbound): imports only
+// `wasi:io/streams` (to read/write the accepted connection's byte streams the host hands it) and
+// exports the boatramp `tcp-connection-handler` the host re-enters once per accepted connection. The
+// guest holds NO `wasi:sockets` authority — bind/listen/accept stay host-side. Built to a component
+// with `cargo build --release --target wasm32-wasip2`; consumed as a fixture by the inbound-TCP live
+// gate exercising the real accept→dispatch→streams→teardown path.
+package boatramp:caps-example;
+
+world tcp-echo {
+  import wasi:io/streams@0.2.3;
+  export boatramp:handlers/tcp-connection-handler;
+}
