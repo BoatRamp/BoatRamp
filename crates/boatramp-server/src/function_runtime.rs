@@ -1612,7 +1612,18 @@ pub(super) async fn build_function_bindings(
         inner.env_source(),
     )
     .await?;
-    Ok(bindings.with_env(env))
+    bindings = bindings.with_env(env);
+    // Gated `wasi:sockets` outbound-TCP allowlist for a STANDALONE top-level function
+    // (PLAN-handler-tcp-egress): attach the function's `egress_allowlist` ONLY when it is granted the
+    // capability (declares the `wasi:sockets` import; validated at deploy). Deny-by-default preserved
+    // — an ungranted or empty allowlist leaves the engine's socket host deny-all, and even a granted,
+    // non-empty allowlist reaches nothing unless the node posture `allow_guest_tcp_egress` is on (the
+    // engine's `tcp_connect_decision` enforces connect-only + allowlist + SSRF-floor identically to
+    // the site-handler / consumer / session lane).
+    if granted("wasi:sockets") && !config.egress_allowlist.is_empty() {
+        bindings = bindings.with_egress_allowlist(config.egress_allowlist.clone());
+    }
+    Ok(bindings)
 }
 
 /// Per-invocation limits for a function: its own `limits` (memory/timeout/fuel),
@@ -3757,6 +3768,78 @@ mod blobstore_dimension0_tests {
             unscoped_writes: Vec::new(),
             on_unresolved: boatramp_core::tenancy::OnUnresolved::Deny,
         }
+    }
+
+    /// A standalone top-level function that imports ONLY the gated `wasi:sockets` capability, with the
+    /// given outbound-TCP `egress_allowlist`.
+    fn sockets_config(imports: &[&str], allowlist: &[&str]) -> FunctionConfig {
+        FunctionConfig {
+            imports: imports.iter().map(|s| (*s).to_string()).collect(),
+            egress_allowlist: allowlist.iter().map(|s| (*s).to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    /// PLAN-handler-tcp-egress — the STANDALONE top-level function lane. `build_function_bindings`
+    /// attaches the function's `egress_allowlist` to the bindings ONLY when it is granted
+    /// `wasi:sockets` (declares the import) — the deny-by-default wiring for the lane `function_runtime`
+    /// serves. The engine's connect-only + allowlist + SSRF-floor + posture checks then apply
+    /// unchanged (proven lane-agnostically by the handlers-crate `TCP-EGRESS ALLOWLIST OK` gate); this
+    /// asserts the SERVER-side wiring that feeds them.
+    #[tokio::test]
+    async fn standalone_function_sockets_grant_attaches_the_egress_allowlist() {
+        let rt = runtime_with_site("shop", "blog").await;
+        let inner = rt.inner.as_ref().unwrap();
+
+        // Granted (imports `wasi:sockets`) + non-empty allowlist ⇒ attached verbatim.
+        let granted = sockets_config(
+            &["wasi:sockets"],
+            &["imap.example.com:993", "10.0.0.5:5432"],
+        );
+        let bindings = build_function_bindings(
+            inner,
+            ProjectRef::new("shop"),
+            "shop/fn/mail",
+            "fn/mail",
+            &granted,
+            0,
+            &FnTenant::Background,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("a sockets-only function builds");
+        assert_eq!(
+            &*bindings.egress_allowlist(),
+            &[
+                "imap.example.com:993".to_string(),
+                "10.0.0.5:5432".to_string()
+            ],
+            "a wasi:sockets-granted standalone function must carry its egress_allowlist"
+        );
+
+        // NOT granted (no `wasi:sockets` import) ⇒ deny-all: the allowlist is NOT attached even though
+        // it is present in config. The engine then keeps the socket host deny-all default.
+        let ungranted = sockets_config(&[], &["imap.example.com:993"]);
+        let bindings = build_function_bindings(
+            inner,
+            ProjectRef::new("shop"),
+            "shop/fn/x",
+            "fn/x",
+            &ungranted,
+            0,
+            &FnTenant::Background,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("an import-less function builds");
+        assert!(
+            bindings.egress_allowlist().is_empty(),
+            "an ungranted standalone function must carry NO socket allowlist (deny-all)"
+        );
     }
 
     /// Item 1 — EDGE plumbing. Drives the REAL `make_scoped` (behind `scoped`/`scoped_with_pass`) →

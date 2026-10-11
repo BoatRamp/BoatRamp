@@ -329,7 +329,9 @@ impl Bindings {
 
     /// This invocation's outbound-TCP allowlist (empty ⇒ deny-all). Read by the engine's `new_store`
     /// when the node posture permits TCP egress; the `Arc` clone is cheap (per-request hot path).
-    pub(crate) fn egress_allowlist(&self) -> Arc<[String]> {
+    /// Public (mirroring [`blobstore`](Self::blobstore)) so a host-side test can assert whether the
+    /// gated `wasi:sockets` allowlist was attached for a given import/grant shape.
+    pub fn egress_allowlist(&self) -> Arc<[String]> {
         self.egress_allowlist.clone()
     }
 
