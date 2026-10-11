@@ -853,6 +853,10 @@ pub async fn build_handler_runtime(
     _max_blob_bytes: u64,
     _max_component_bytes: u64,
     _allow_guest_private_egress: bool,
+    // Kept in lockstep with the `#[cfg(feature = "handlers")]` signature + the single
+    // node.rs caller (the caller passes the posture value unconditionally); a lean
+    // node has no guest TCP-egress to gate, so it is ignored.
+    _allow_guest_tcp_egress: bool,
     _self_egress_addrs: Vec<std::net::SocketAddr>,
     // Kept in lockstep with the `#[cfg(feature = "handlers")]` signature + the single
     // node.rs caller (the caller passes the posture value unconditionally); a lean
