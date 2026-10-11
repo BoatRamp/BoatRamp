@@ -1,0 +1,23 @@
+# Example WebAssembly *inbound-TCP connection* guest (PLAN-handler-tcp-inbound): exports the boatramp
+# `tcp-connection-handler` (the host binds + listens + accepts and re-enters this export ONCE per
+# already-accepted connection, handing it the peer address + the connection's `wasi:io` byte streams)
+# and imports ONLY `wasi:io/streams` — NEVER `wasi:sockets` (the host owns the socket). This guest
+# echoes every inbound byte back to the peer until EOF/peer-drop, then returns — exercising the real
+# accept→dispatch→streams→teardown byte path end to end for the inbound-TCP live gate.
+# Built to a component with `cargo build --release --target wasm32-wasip2`; consumed as a fixture.
+# Excluded from the workspace (targets wasm).
+[package]
+name = "boatramp-example-tcp-echo"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.46"
+
+[profile.release]
+opt-level = "s"
+strip = true

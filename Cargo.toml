@@ -38,6 +38,8 @@ exclude = [
   "examples/handlers/graphql-agent",
   "examples/handlers/graphql-scope-probe",
   "examples/handlers/migrate-fn",
+  "examples/handlers/tcp-echo",
+  "examples/handlers/tcp-spin",
   "examples/compose/edge",
   "examples/compose/plugin",
   "crates/boatramp-console",

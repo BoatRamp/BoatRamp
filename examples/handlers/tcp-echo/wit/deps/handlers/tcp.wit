@@ -1,0 +1,22 @@
+// The boatramp inbound-TCP *listener* capability interfaces, vendored for the guest
+// (PLAN-handler-tcp-inbound). These MUST match the host's definitions in boatramp-handlers
+// (crates/boatramp-handlers/wit/world.wit) EXACTLY so the component links against the engine's
+// export caller. The guest EXPORTS `tcp-connection-handler` and is handed the already-accepted
+// connection's `wasi:io` streams — it imports NO `wasi:sockets`.
+package boatramp:handlers;
+
+interface tcp-connection-types {
+  /// Why a connection handler failed (the guest-returned `Err`). Guest-controlled text; the host
+  /// bounds + sanitizes it before an operator sees it.
+  record connection-error {
+    message: string,
+  }
+}
+
+interface tcp-connection-handler {
+  use wasi:io/streams@0.2.3.{input-stream, output-stream};
+  use tcp-connection-types.{connection-error};
+
+  /// Handle one accepted connection. `peer` is the remote `ip:port` (informational only).
+  handle: func(peer: string, input: input-stream, output: output-stream) -> result<_, connection-error>;
+}
