@@ -165,6 +165,13 @@ sql-postgres = ["boatramp-storage/sql-postgres"]
 # event-driven re-entry over the durable async lane. Implies `handlers`. Experimental.
 session = ["handlers", "boatramp-handlers/session"]
 
+# Host-owned inbound-TCP listeners (`boatramp:handlers/tcp-connection-host`, PLAN-handler-tcp-inbound):
+# the node binds + listens + accepts on an operator-declared `[serve.listeners.<name>]` and re-enters a
+# guest's `tcp-connection-handler` export per accepted connection, handing it ONLY the connection's
+# `wasi:io` streams (NEVER `wasi:sockets`). Gates the `HandlerRuntime::dispatch_tcp_connection` wiring +
+# the `tcp_listener_serve` accept-loop module + the capability advert. Implies `handlers`. Experimental.
+tcp-listener = ["handlers", "boatramp-handlers/tcp-listener"]
+
 # DNS-TXT domain ownership verification. Pulls a resolver (hickory)
 # for the public-DNS TXT lookup; off by default so the lean build verifies via
 # the HTTP-token method (no extra dependency). The verification logic is always

@@ -277,6 +277,11 @@ pub use migrate::{MigrateMode, run_migration};
 /// an inbound frame that re-enters the guest `session-handler`.
 #[cfg(feature = "session")]
 mod session_serve;
+/// Host-owned inbound-TCP listener serving (PLAN-handler-tcp-inbound): the reusable accept loop +
+/// lifecycle that hands each accepted connection to a guest `tcp-connection-handler`. `pub` so the
+/// orchestration layer (`boatramp::serve::spawn_listeners`) can spawn one per `[serve.listeners.<name>]`.
+#[cfg(feature = "tcp-listener")]
+pub mod tcp_listener_serve;
 #[cfg(feature = "handlers")]
 mod stream;
 #[cfg(feature = "handlers")]
@@ -925,6 +930,95 @@ impl HandlerRuntime {
         }
         let _ = (hash, wasm);
         Ok(())
+    }
+
+    /// Drive one host-owned inbound-TCP connection through a guest `tcp-connection-handler`
+    /// (PLAN-handler-tcp-inbound). Resolve the OPERATOR-PINNED project+site's ACTIVE deployment, load
+    /// `component`, build the guest bindings with an operator-pinned Dimension-0 tenancy
+    /// ([`FnTenant::Background`] — a raw socket carries no Host/path/principal, so there is nothing
+    /// per-connection to resolve), and hand the already-accepted connection's `wasi:io` streams to the
+    /// guest via the engine conn lane. The guest receives NO `wasi:sockets`. `fn_config` MUST carry an
+    /// EMPTY `egress_allowlist` (the caller enforces it; a tcp-connection-host guest can't hold
+    /// `wasi:sockets` anyway), so the conn-lane store never installs a permissive socket check.
+    ///
+    /// `Ok(())` is a clean end (the guest returned, or an idle / max-duration teardown); `Err(_)` is a
+    /// dispatch or handler failure. The accept loop logs the outcome. A no-op `Err` on a `disabled()`
+    /// runtime (a node with no wasm engine — it would never have spawned a listener).
+    #[cfg(all(feature = "handlers", feature = "tcp-listener"))]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn dispatch_tcp_connection(
+        &self,
+        deploy: &boatramp_core::deploy::DeployStore,
+        project: &str,
+        site: &str,
+        component: &str,
+        fn_config: &boatramp_core::function::FunctionConfig,
+        peer: String,
+        read_half: tokio::net::tcp::OwnedReadHalf,
+        write_half: tokio::net::tcp::OwnedWriteHalf,
+        idle_timeout: std::time::Duration,
+        max_conn_duration: std::time::Duration,
+    ) -> Result<(), String> {
+        let Some(inner) = self.inner.as_ref() else {
+            return Err("handler runtime disabled (no wasm engine on this node)".into());
+        };
+        let project_ref = boatramp_core::project::ProjectRef::new(project);
+        let manifest = deploy
+            .current_manifest(project_ref, site)
+            .await
+            .map_err(|e| format!("resolve manifest {project}/{site}: {e}"))?
+            .ok_or_else(|| format!("no active deployment for {project}/{site}"))?;
+        let entry = manifest.files.get(component).ok_or_else(|| {
+            format!("listener component {component:?} not in the {project}/{site} deployment")
+        })?;
+        let hash = entry.hash.clone();
+        let wasm = crate::handler_dispatch::read_blob_bytes(deploy, &hash)
+            .await
+            .map_err(|e| format!("read component blob {hash}: {e}"))?;
+        // Operator-pinned Dimension-0 tenancy: `Background` carries no per-connection source, so the
+        // only tenancy is `fn_config.tenancy` (resolved once from the listener config).
+        let scope = project_ref.qualified(site);
+        let bindings = crate::function_runtime::build_function_bindings(
+            inner,
+            project_ref,
+            &scope,
+            site,
+            fn_config,
+            0,
+            &crate::function_runtime::FnTenant::Background,
+            None,
+            None,
+            None,
+        )
+        .await
+        .map_err(|e| match e {
+            crate::handler_dispatch::BindingsError::Refused(detail) => {
+                format!("listener bindings refused: {detail}")
+            }
+            crate::handler_dispatch::BindingsError::NotReady { detail, .. } => {
+                format!("listener bindings not ready (managed dependency starting): {detail}")
+            }
+        })?;
+        let limits = crate::function_runtime::function_limits(fn_config.limits.as_ref());
+        inner
+            .engine
+            .dispatch_tcp_connection(
+                &hash,
+                &wasm,
+                peer,
+                read_half,
+                write_half,
+                bindings,
+                limits,
+                idle_timeout,
+                max_conn_duration,
+                // The serve accept loop only runs for an operator-DECLARED listener (it iterates the
+                // config map), so the operator-declared gate is satisfied; the posture gate is
+                // enforced inside the engine (`tcp_listener_dispatch_decision`, defense-in-depth).
+                true,
+            )
+            .await
+            .map_err(|e| format!("tcp-connection dispatch: {e}"))
     }
 
     /// Acquire a compile permit (deploy-resilience #2/#1a), held by the caller across a blob read +

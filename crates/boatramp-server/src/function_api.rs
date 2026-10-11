@@ -268,10 +268,11 @@ pub fn host_capability_features_detailed() -> Vec<CapabilityFeature> {
     // Base grantable capabilities (the KNOWN_IMPORTS tokens) — the established interface grants.
     let mut f: Vec<CapabilityFeature> = boatramp_core::config::known_imports()
         .iter()
-        // `wasi:sockets` (gated outbound-TCP, PLAN-handler-tcp-egress) IS a KNOWN_IMPORT so a deploy
-        // may DECLARE it offline, but it is advertised as Experimental below (not Stable) — a new,
-        // posture-gated, off-by-default surface. Filtered here so it isn't ALSO advertised Stable.
-        .filter(|&&name| name != "wasi:sockets")
+        // `wasi:sockets` (gated outbound-TCP, PLAN-handler-tcp-egress) and `tcp-listener` (host-owned
+        // inbound-TCP listeners, PLAN-handler-tcp-inbound) are KNOWN_IMPORTS so a deploy may DECLARE
+        // them offline, but both are advertised as Experimental below (not Stable) — new, posture-gated,
+        // off-by-default surfaces. Filtered here so neither is ALSO advertised Stable.
+        .filter(|&&name| name != "wasi:sockets" && name != "tcp-listener")
         .map(|&name| CapabilityFeature {
             name,
             lifecycle: Stable,
@@ -389,6 +390,20 @@ pub fn host_capability_features_detailed() -> Vec<CapabilityFeature> {
     if cfg!(feature = "handlers") {
         f.push(CapabilityFeature {
             name: "wasi:sockets",
+            lifecycle: Experimental,
+        });
+    }
+    // The host-owned inbound-TCP **listener** capability (PLAN-handler-tcp-inbound): the node binds +
+    // listens + accepts on an operator-declared `[serve.listeners.<name>]` and re-enters a guest's
+    // `tcp-connection-handler` export per accepted connection, handing it only `wasi:io` streams (NEVER
+    // `wasi:sockets`). Cargo-gated on `tcp-listener` (which pulls the WIT world + conn-lane dispatch);
+    // posture-gated (`allow_guest_tcp_listener`, off under multi-tenant) + operator-declared at RUNTIME.
+    // A guest declares `requires = ["tcp-listener"]` so a deploy against a host predating it is refused
+    // cleanly (instead of failing to instantiate). Experimental until the shape (incl. deferred host-TLS)
+    // settles.
+    if cfg!(feature = "tcp-listener") {
+        f.push(CapabilityFeature {
+            name: "tcp-listener",
             lifecycle: Experimental,
         });
     }

@@ -259,6 +259,14 @@ const KNOWN_IMPORTS: &[&str] = &[
     // `allow_guest_tcp_egress` (off under `multi-tenant`) AND a non-empty per-handler
     // `egress_allowlist` — deny-by-default at every layer.
     "wasi:sockets",
+    // Host-owned inbound-TCP **listener** capability (`PLAN-handler-tcp-inbound`). A listener's guest
+    // EXPORTS `tcp-connection-handler` (and `use`s `tcp-connection-types`); granting it here only lets
+    // a component DECLARE it. The host owns the socket and hands the guest only `wasi:io` streams — the
+    // guest NEVER imports `wasi:sockets`. Reaching anything additionally needs the posture flag
+    // `allow_guest_tcp_listener` (off under `multi-tenant`) AND an operator-declared
+    // `[serve.listeners.<name>]` — deny-by-default at every layer. Advertised Experimental (not the
+    // blanket-Stable KNOWN_IMPORTS lifecycle).
+    "tcp-listener",
 ];
 
 /// The import names a deploy may declare in a handler's `imports` (baseline WASI

@@ -1172,6 +1172,11 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
         blobs = ?blob_args.blobs, blobs_flag = ?args.blobs, kv = ?args.kv, tls = ?args.tls,
         auth = !auth.is_disabled(), "starting boatramp"
     );
+    // Host-owned inbound-TCP listeners (PLAN-handler-tcp-inbound): bind + accept each declared
+    // `[serve.listeners.<name>]`, gated on the posture. Single-node. Borrows `posture` before the TLS
+    // redirect below consumes it.
+    #[cfg(feature = "tcp-listener")]
+    spawn_listeners(&serve_cfg.listeners, &posture, &handlers, &deploy);
     // In a TLS mode, optionally bind a second plain-HTTP listener that redirects
     // to HTTPS. Ignored for `--tls off`.
     #[cfg(feature = "tls")]
@@ -2513,6 +2518,72 @@ fn spawn_s3_ingress(
     Ok(())
 }
 
+/// Bind + serve every declared host-owned inbound-TCP `[serve.listeners.<name>]`
+/// (PLAN-handler-tcp-inbound), gated on the posture `allow_guest_tcp_listener`. The TWO gates to
+/// dispatch: GATE 1 = this posture flag (off under multi-tenant ⇒ nothing is bound); GATE 2 = the
+/// operator-declared config map iterated here. Each listener's binding config (imports / env /
+/// operator-pinned tenancy) is carried in a `FunctionConfig` with an EMPTY `egress_allowlist` (the
+/// Phase-1 invariant: a `tcp-connection-host` guest holds no `wasi:sockets`). Shared by the
+/// single-node and cluster spawn blocks (mirrors `spawn_s3_ingress`).
+#[cfg(feature = "tcp-listener")]
+fn spawn_listeners(
+    // Borrow only the `listeners` map (not the whole `ServeConfig`, whose other fields are moved out
+    // into node assembly before this point).
+    listeners: &std::collections::BTreeMap<String, boatramp_node::config::ListenerConfig>,
+    posture: &boatramp_core::security::SecurityPosture,
+    handlers: &boatramp_server::HandlerRuntime,
+    deploy: &DeployStore,
+) {
+    if listeners.is_empty() {
+        return;
+    }
+    // GATE 1 (posture): off under multi-tenant ⇒ bind NOTHING (and say so loudly, so a declared-but-
+    // disabled listener is never a silent surprise). The engine's `tcp_listener_dispatch_decision`
+    // ALSO refuses at dispatch (defense-in-depth), but gating here means the socket is never bound.
+    if !posture.allow_guest_tcp_listener {
+        tracing::warn!(
+            count = listeners.len(),
+            "[serve.listeners] are declared but the posture `allow_guest_tcp_listener` is OFF \
+             (multi-tenant default); NOT binding any inbound-TCP listener"
+        );
+        return;
+    }
+    for (name, l) in listeners {
+        // `bind` is validated non-None + the Phase-1-unsupported fields refused at config load
+        // (`validate_listeners`), so a listener that reaches here is well-formed.
+        let Some(bind) = l.bind else { continue };
+        let fn_config = boatramp_core::function::FunctionConfig {
+            imports: l.imports.clone(),
+            env: l.env.clone(),
+            tenancy: l.tenancy.clone(),
+            // Phase-1 invariant: NO per-listener outbound egress (a tcp-connection-host guest can't
+            // hold wasi:sockets); `validate_listeners` already refuses a non-empty allowlist.
+            egress_allowlist: Vec::new(),
+            ..Default::default()
+        };
+        let params = boatramp_server::tcp_listener_serve::ListenerParams {
+            name: name.clone(),
+            bind,
+            project: l.project.clone(),
+            site: l.site.clone(),
+            component: l.component.clone(),
+            fn_config,
+            max_conns: l
+                .max_conns
+                .unwrap_or(boatramp_node::config::DEFAULT_LISTENER_MAX_CONNS),
+            idle_timeout: std::time::Duration::from_millis(
+                l.idle_timeout_ms
+                    .unwrap_or(boatramp_node::config::DEFAULT_LISTENER_IDLE_TIMEOUT_MS),
+            ),
+            max_conn_duration: std::time::Duration::from_millis(
+                l.max_conn_duration_ms
+                    .unwrap_or(boatramp_node::config::DEFAULT_LISTENER_MAX_CONN_DURATION_MS),
+            ),
+        };
+        boatramp_server::tcp_listener_serve::spawn_listener(handlers.clone(), deploy.clone(), params);
+    }
+}
+
 /// Run in **self-hosted cluster mode**: the control-plane
 /// `KvStore` and the `wasi:messaging` coordinator come from an embedded-Raft
 /// cluster node instead of the local backends. This node serves its peer mesh
@@ -3280,6 +3351,11 @@ async fn run_cluster(
     .await?;
 
     tracing::info!(tls = ?args.tls, "cluster: serving public traffic");
+    // Host-owned inbound-TCP listeners (PLAN-handler-tcp-inbound): bind + accept each declared
+    // `[serve.listeners.<name>]`, gated on the posture. Cluster path. Borrows `options.posture` before
+    // the TLS redirect below consumes it.
+    #[cfg(feature = "tcp-listener")]
+    spawn_listeners(&cluster_serve_cfg.listeners, &options.posture, &handlers, &deploy);
     #[cfg(feature = "tls")]
     if !matches!(args.tls, TlsMode::Off) {
         let redirect = args
