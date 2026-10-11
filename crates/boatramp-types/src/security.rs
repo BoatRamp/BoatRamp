@@ -109,6 +109,7 @@ impl SecurityProfile {
                 allow_guest_self_egress: true,
                 allow_guest_egress_extra_ca: false,
                 allow_guest_tcp_egress: false,
+                allow_guest_tcp_listener: false,
                 max_handler_blob_bytes: MT_MAX_BLOB,
                 max_component_bytes: MT_MAX_COMPONENT,
                 oidc_require_audience: true,
@@ -140,6 +141,7 @@ impl SecurityProfile {
                 allow_guest_self_egress: true,
                 allow_guest_egress_extra_ca: true,
                 allow_guest_tcp_egress: true,
+                allow_guest_tcp_listener: true,
                 max_handler_blob_bytes: ST_MAX_BLOB,
                 max_component_bytes: ST_MAX_COMPONENT,
                 oidc_require_audience: true,
@@ -171,6 +173,7 @@ impl SecurityProfile {
                 allow_guest_self_egress: true,
                 allow_guest_egress_extra_ca: true,
                 allow_guest_tcp_egress: true,
+                allow_guest_tcp_listener: true,
                 max_handler_blob_bytes: 0,
                 max_component_bytes: 0,
                 oidc_require_audience: false,
@@ -230,6 +233,11 @@ pub struct PostureOverrides {
     /// Off under `multi-tenant`; on under `single-tenant`/`dev`. See
     /// [`SecurityPosture::allow_guest_tcp_egress`].
     pub allow_guest_tcp_egress: Option<bool>,
+    /// Permit host-owned inbound-TCP **listeners** to dispatch an accepted connection to a guest.
+    /// Off under `multi-tenant`; on under `single-tenant`/`dev`. Independent of
+    /// `allow_guest_tcp_egress` (inbound ≠ outbound). See
+    /// [`SecurityPosture::allow_guest_tcp_listener`].
+    pub allow_guest_tcp_listener: Option<bool>,
     /// Cap on handler blobstore host reads/ranges/copies in bytes (`0` = unlimited).
     pub max_handler_blob_bytes: Option<u64>,
     /// Cap on a Wasm component blob in bytes (`0` = unlimited).
@@ -426,6 +434,11 @@ impl SecurityConfig {
             o.allow_guest_tcp_egress.is_some(),
         );
         row(
+            "allow_guest_tcp_listener",
+            p.allow_guest_tcp_listener.to_string(),
+            o.allow_guest_tcp_listener.is_some(),
+        );
+        row(
             "max_handler_blob_bytes",
             fmt_cap(p.max_handler_blob_bytes),
             o.max_handler_blob_bytes.is_some(),
@@ -578,6 +591,18 @@ pub struct SecurityPosture {
     /// unless [`allow_guest_private_egress`](Self::allow_guest_private_egress) is separately on. Any
     /// single wiring omission fails CLOSED.
     pub allow_guest_tcp_egress: bool,
+    /// Permit host-owned inbound-TCP **listeners** (`[serve.listeners.<name>]`) to dispatch an
+    /// accepted connection to a guest `tcp-connection-handler` (`PLAN-handler-tcp-inbound`). Off under
+    /// `multi-tenant` (deny-by-default: a new, unproven surface — an untrusted site writer would
+    /// process arbitrary inbound bytes with no HTTP framing / WAF / visitor-auth, even though the HOST
+    /// owns the socket); on under `single-tenant`/`dev` (the operator owns every site, parity with
+    /// `allow_guest_tcp_egress`). INDEPENDENT of `allow_guest_tcp_egress` (inbound ≠ outbound
+    /// authority). This is ONLY the posture gate: the operator must ALSO declare the listener in
+    /// `[serve.listeners.<name>]`, and the guest is handed only the accepted connection's `wasi:io`
+    /// streams — it NEVER receives `wasi:sockets` (bind/listen/connect stay host-side). Off ⇒ the
+    /// serve accept loop never binds AND [`dispatch_tcp_connection`] refuses; any single wiring
+    /// omission fails CLOSED.
+    pub allow_guest_tcp_listener: bool,
     /// Cap on handler blobstore host reads/ranges/copies, `0` = unlimited.
     pub max_handler_blob_bytes: u64,
     /// Cap on a Wasm component blob, `0` = unlimited.
@@ -736,6 +761,9 @@ fn apply(mut base: SecurityPosture, o: &PostureOverrides) -> SecurityPosture {
     }
     if let Some(v) = o.allow_guest_tcp_egress {
         base.allow_guest_tcp_egress = v;
+    }
+    if let Some(v) = o.allow_guest_tcp_listener {
+        base.allow_guest_tcp_listener = v;
     }
     if let Some(v) = o.max_handler_blob_bytes {
         base.max_handler_blob_bytes = v;
