@@ -983,6 +983,21 @@ fn conn_lane_grants_socket_authority() -> bool {
     tcplistener_mutation().as_deref() == Some("add_socket_authority")
 }
 
+/// The REAL no-raw-sockets invariant (PLAN-handler-tcp-inbound security-review MEDIUM): a conn-lane
+/// dispatch's [`Bindings`] MUST carry an EMPTY outbound-TCP `egress_allowlist`. This is the exact
+/// precondition [`HandlerEngine::new_store`] checks before it would install a permissive
+/// `socket_addr_check` (`self.allow_tcp_egress && !egress_allowlist.is_empty()`), so an empty
+/// allowlist means the socket host's deny-all default stands for this lane — the guest's only network
+/// surface is the handed `wasi:io` streams. [`HandlerEngine::dispatch_tcp_connection`] CALLS this on
+/// the received bindings and fails CLOSED when it is violated (tested == enforced — the gate drives
+/// the SAME predicate, and the `add_socket_authority` mutation injects a non-empty allowlist into the
+/// gate's bindings so this returns `false` ⇒ the gate goes RED). Pure (no mutation seam itself) — the
+/// property is a fact of the bindings, not a flag.
+#[cfg(feature = "tcp-listener")]
+fn conn_lane_sockets_denied(bindings: &Bindings) -> bool {
+    bindings.egress_allowlist().is_empty()
+}
+
 /// The active TCP-listener gate mutation (PLAN-handler-tcp-inbound anti-hollow gate), or `None`.
 /// Present ONLY under `cfg(test)` (the in-crate gate) or the `tcp-listener-gate-mutation` feature; a
 /// shipped build has neither, so [`tcp_listener_dispatch_decision`]'s two checks are unconditional and
@@ -1008,15 +1023,60 @@ fn tcplistener_mutation() -> Option<String> {
 #[cfg(feature = "tcp-listener")]
 const TCP_CONN_WRITE_BUDGET: usize = 64 * 1024;
 
+/// How many epoch ticks a conn-lane guest runs before the engine epoch forces its async fiber to
+/// YIELD (`epoch_deadline_async_yield_and_update`) — PLAN-handler-tcp-inbound HIGH-fix. At
+/// [`EPOCH_TICK_MS`] (10ms) this is ~250ms. Yield ≠ trap: a long-lived `handle` is preserved, but a
+/// CPU-bound guest (a parser loop / decompression bomb on untrusted peer bytes) that never makes a
+/// suspending host call is still forced to return `Poll::Pending` periodically, so (a) it can't pin a
+/// shared tokio worker thread, and (b) the wall-clock idle/max-duration watchdog in the dispatch
+/// `select!` actually gets re-polled and can drop the call. MUST be a small, non-zero budget — a
+/// `u64::MAX` (or a trap deadline) would reintroduce the starvation. The engine-wide epoch ticker
+/// ([`HandlerEngine::from_engine`]) drives the ticks for every store, this lane included.
+#[cfg(feature = "tcp-listener")]
+const CONN_EPOCH_YIELD_TICKS: u64 = 25;
+
 /// Why an inbound-TCP connection was torn down by the host (PLAN-handler-tcp-inbound) rather than the
 /// guest returning. Both are a normal end of a long-lived connection — the conn lane's DoS bound —
 /// NOT a handler failure.
 #[cfg(feature = "tcp-listener")]
+#[derive(Debug, PartialEq, Eq)]
 enum ConnTimeout {
     /// No bytes flowed in EITHER direction for the listener's `idle_timeout`.
     Idle,
     /// The connection reached the listener's `max_conn_duration` absolute lifetime cap.
     MaxDuration,
+}
+
+/// The conn-lane wall-clock watchdog (PLAN-handler-tcp-inbound): resolves to [`ConnTimeout::Idle`]
+/// when no bytes have moved in either direction for `idle_timeout`, or [`ConnTimeout::MaxDuration`]
+/// when the connection has been live for `max_conn_duration` — whichever first. `started` is the
+/// connection's start instant and `last_activity` the shared "last byte moved" instant the
+/// [`IdleTracked`] stream adapters stamp. Extracted so the timing logic is unit-testable (via
+/// `tokio::time::pause`) WITHOUT a guest component — it is driven concurrently with the guest
+/// `call_handle` in the dispatch `select!`, so the two paths never drift. Uses [`tokio::time::Instant`]
+/// throughout so a paused test clock controls it deterministically.
+#[cfg(feature = "tcp-listener")]
+async fn conn_watchdog(
+    last_activity: Arc<Mutex<tokio::time::Instant>>,
+    idle_timeout: Duration,
+    max_conn_duration: Duration,
+    started: tokio::time::Instant,
+) -> ConnTimeout {
+    // Poll at a fraction of the idle window (bounded) so a timeout is observed promptly but cheaply.
+    let tick = (idle_timeout / 4).clamp(Duration::from_millis(50), Duration::from_secs(5));
+    loop {
+        tokio::time::sleep(tick).await;
+        let idle_for = last_activity
+            .lock()
+            .map(|g| g.elapsed())
+            .unwrap_or_default();
+        if idle_for >= idle_timeout {
+            return ConnTimeout::Idle;
+        }
+        if started.elapsed() >= max_conn_duration {
+            return ConnTimeout::MaxDuration;
+        }
+    }
 }
 
 /// An `AsyncRead`/`AsyncWrite` adapter that stamps a shared "last activity" instant whenever bytes
@@ -1027,12 +1087,12 @@ enum ConnTimeout {
 #[cfg(feature = "tcp-listener")]
 struct IdleTracked<T> {
     inner: T,
-    last_activity: Arc<Mutex<std::time::Instant>>,
+    last_activity: Arc<Mutex<tokio::time::Instant>>,
 }
 
 #[cfg(feature = "tcp-listener")]
 impl<T> IdleTracked<T> {
-    fn new(inner: T, last_activity: Arc<Mutex<std::time::Instant>>) -> Self {
+    fn new(inner: T, last_activity: Arc<Mutex<tokio::time::Instant>>) -> Self {
         Self {
             inner,
             last_activity,
@@ -1040,7 +1100,7 @@ impl<T> IdleTracked<T> {
     }
     fn touch(&self) {
         if let Ok(mut g) = self.last_activity.lock() {
-            *g = std::time::Instant::now();
+            *g = tokio::time::Instant::now();
         }
     }
 }
@@ -2161,6 +2221,18 @@ impl HandlerEngine {
                     .into(),
             ));
         }
+        // REAL no-raw-sockets invariant (security-review MEDIUM): the received bindings MUST carry no
+        // outbound-TCP egress allowlist — the exact precondition `new_store` checks before it would
+        // install a permissive `socket_addr_check`. Empty ⇒ the socket host's deny-all default stands.
+        // Fail CLOSED if a conn-lane dispatch ever carried one (the serve layer always passes an empty
+        // allowlist; this guards a future refactor from silently handing the guest connect authority).
+        if !conn_lane_sockets_denied(&bindings) {
+            return Err(HandlerError::Internal(
+                "inbound TCP connection lane bindings carry an outbound-TCP egress allowlist — \
+                 refusing (would grant the guest wasi:sockets connect authority)"
+                    .into(),
+            ));
+        }
         // One conn-lane permit per live connection (held for the connection's whole life), so a burst of
         // long-lived listener connections can't exhaust the sync request pool nor starve the async drain.
         let _permit = self
@@ -2174,15 +2246,21 @@ impl HandlerEngine {
             ..self.tcp_conn_limits
         };
         let mut store = self.new_store(bindings, eff);
-        // Conn lane: the per-invocation epoch deadline + CPU fuel are the WRONG bound for a continuous
-        // byte stream (a long-lived `handle` would trip the request epoch) — disable both and bound the
-        // connection by idle + max-duration instead. The memory limiter is unchanged (still binds).
-        store.set_epoch_deadline(u64::MAX);
+        // Conn lane (security-review HIGH): the per-invocation epoch TRAP deadline + CPU fuel are the
+        // wrong bound for a continuous byte stream (a long-lived `handle` would trip the request epoch).
+        // But disabling the epoch outright (`u64::MAX`) lets a CPU-bound guest that makes no suspending
+        // host call run forever inside ONE `call_handle` poll — pinning a tokio worker AND starving the
+        // wall-clock watchdog in the `select!` below (so idle/max-duration could never fire). Instead
+        // arm the epoch to YIELD every `CONN_EPOCH_YIELD_TICKS`: the fiber periodically returns
+        // `Poll::Pending` (so the watchdog is re-polled and can drop the call, and no worker is pinned)
+        // WITHOUT trapping (the long-lived goal is preserved). The engine-wide epoch ticker drives it.
+        // Fuel stays unmetered — CPU is bounded by wall-clock `max_conn_duration` via the watchdog.
+        store.epoch_deadline_async_yield_and_update(CONN_EPOCH_YIELD_TICKS);
         let _ = store.set_fuel(u64::MAX);
         // Wrap the accepted socket halves so any byte movement (either direction) refreshes the idle
         // clock, then hand them to the guest as host-owned `wasi:io` stream resources. The guest imports
         // only `wasi:io/streams` (never `wasi:sockets`), so these are its sole network surface.
-        let last_activity = Arc::new(Mutex::new(std::time::Instant::now()));
+        let last_activity = Arc::new(Mutex::new(tokio::time::Instant::now()));
         let in_stream: wasmtime_wasi::DynInputStream = Box::new(wasmtime_wasi::pipe::AsyncReadStream::new(
             IdleTracked::new(read_half, Arc::clone(&last_activity)),
         ));
@@ -2213,24 +2291,12 @@ impl HandlerEngine {
                 .boatramp_handlers_tcp_connection_handler()
                 .call_handle(&mut store, &peer, in_res, out_res);
             tokio::pin!(call);
-            let watchdog = async {
-                // Poll at a fraction of the idle window (bounded) so idle detection is prompt but cheap.
-                let tick = (idle_timeout / 4).clamp(Duration::from_millis(50), Duration::from_secs(5));
-                let started = std::time::Instant::now();
-                loop {
-                    tokio::time::sleep(tick).await;
-                    let idle_for = last_activity
-                        .lock()
-                        .map(|g| g.elapsed())
-                        .unwrap_or_default();
-                    if idle_for >= idle_timeout {
-                        return ConnTimeout::Idle;
-                    }
-                    if started.elapsed() >= max_conn_duration {
-                        return ConnTimeout::MaxDuration;
-                    }
-                }
-            };
+            let watchdog = conn_watchdog(
+                Arc::clone(&last_activity),
+                idle_timeout,
+                max_conn_duration,
+                tokio::time::Instant::now(),
+            );
             tokio::pin!(watchdog);
             tokio::select! {
                 r = &mut call => Ok(r),
@@ -2246,8 +2312,13 @@ impl HandlerEngine {
             .await;
         match outcome {
             Ok(Ok(Ok(()))) => Ok(()),
+            // The guest-returned `connection-error.message` is UNTRUSTED (guest-controlled length) and
+            // the WIT promises it is bounded host-side — truncate it to `MAX_CONSUMER_ERROR_LEN` before
+            // it is formatted into the error + logged, mirroring the consumer-error path (the DLQ/log
+            // layer strips control chars). (security-review LOW).
             Ok(Ok(Err(err))) => Err(HandlerError::Trap(format!(
-                "tcp-connection handler returned error: {err:?}"
+                "tcp-connection handler returned error: {}",
+                err.message.chars().take(MAX_CONSUMER_ERROR_LEN).collect::<String>()
             ))),
             Ok(Err(trap)) => Err(classify(&trap, store.data().oom())),
             // An idle/max-duration teardown is the normal end of a long-lived connection (the conn-lane
@@ -2992,11 +3063,27 @@ mod tests {
         println!("TCP-EGRESS ALLOWLIST OK");
     }
 
+    /// The `Bindings` a conn-lane dispatch would carry: an EMPTY outbound-TCP egress allowlist ⇒
+    /// `new_store` installs no socket check (the guest's only network surface is the handed `wasi:io`
+    /// streams). Under the `add_socket_authority` gate mutation it injects a NON-EMPTY allowlist — the
+    /// breach the structural gate must catch via the ENFORCED `conn_lane_sockets_denied` predicate
+    /// (security-review MEDIUM: the gate now proves the REAL property, not a symbolic constant).
+    #[cfg(feature = "tcp-listener")]
+    fn gate_conn_lane_bindings() -> Bindings {
+        let b = Bindings::default();
+        if tcplistener_mutation().as_deref() == Some("add_socket_authority") {
+            b.with_egress_allowlist(vec!["0.0.0.0/0:443".to_string()])
+        } else {
+            b
+        }
+    }
+
     /// PLAN-handler-tcp-inbound: direct tests of the ENFORCED inbound-listener dispatch decision
     /// [`tcp_listener_dispatch_decision`] — the exact predicate `dispatch_tcp_connection` calls — plus
-    /// the no-raw-sockets structural invariant [`conn_lane_grants_socket_authority`]. (a) posture off
-    /// denies; (b) an undeclared listener denies; (c) both on dispatches; (d) the conn lane grants NO
-    /// socket authority.
+    /// the REAL no-raw-sockets invariant [`conn_lane_sockets_denied`] (empty egress allowlist) and the
+    /// defense-in-depth constant guard. (a) posture off denies; (b) an undeclared listener denies; (c)
+    /// both on dispatches; (d) empty-allowlist bindings deny sockets while an allowlist-bearing one is
+    /// correctly detected as a breach; (e) the constant guard is off.
     #[cfg(feature = "tcp-listener")]
     #[test]
     fn tcp_listener_dispatch_decision_enforces_both_gates() {
@@ -3015,11 +3102,72 @@ mod tests {
             tcp_listener_dispatch_decision(true, true),
             "posture on + declared must dispatch"
         );
-        // (d) The conn lane never grants raw socket authority.
+        // (d) The REAL no-raw-sockets invariant reads the actual bindings fact: an empty egress
+        // allowlist denies sockets; a bindings CARRYING an allowlist is correctly flagged as a breach
+        // (proving the predicate isn't a constant — it's the precondition `new_store` checks).
+        assert!(
+            conn_lane_sockets_denied(&Bindings::default()),
+            "empty-allowlist conn-lane bindings must deny socket authority"
+        );
+        assert!(
+            !conn_lane_sockets_denied(
+                &Bindings::default().with_egress_allowlist(vec!["93.184.216.34:443".to_string()])
+            ),
+            "bindings carrying an egress allowlist must be flagged (they WOULD grant connect authority)"
+        );
+        // (e) The defense-in-depth constant guard is off in a shipped build.
         assert!(
             !conn_lane_grants_socket_authority(),
             "the inbound-TCP conn lane must never grant the guest wasi:sockets authority"
         );
+    }
+
+    /// PLAN-handler-tcp-inbound HIGH-fix: the conn lane arms the epoch to YIELD with a small, non-zero
+    /// tick budget — NOT `u64::MAX` (which would disable yielding and let a CPU-bound guest pin a worker
+    /// + starve the wall-clock watchdog). A regression that re-disabled the epoch would make this fail.
+    #[cfg(feature = "tcp-listener")]
+    #[test]
+    fn conn_lane_epoch_yield_budget_is_small_and_nonzero() {
+        assert!(CONN_EPOCH_YIELD_TICKS > 0, "yield budget must be non-zero");
+        assert!(
+            CONN_EPOCH_YIELD_TICKS <= 100,
+            "yield budget must stay small (sub-second), never effectively infinite (u64::MAX)"
+        );
+        assert!(
+            CONN_EPOCH_YIELD_TICKS * EPOCH_TICK_MS <= 1000,
+            "the yield window must be sub-second so the watchdog is re-polled promptly"
+        );
+    }
+
+    /// PLAN-handler-tcp-inbound HIGH-fix: the conn-lane wall-clock watchdog (the enforcer the yield
+    /// makes effective) resolves to `MaxDuration` / `Idle` on its own — tested WITHOUT a guest via a
+    /// "guest that yields but never completes" (a bare pending future is never re-polled; the watchdog
+    /// drives purely off its own timers). Short real-time thresholds, with the two bounds far apart so
+    /// the SMALLER one deterministically wins (`idle_for ≈ started.elapsed()` from a shared clock).
+    #[cfg(feature = "tcp-listener")]
+    #[tokio::test]
+    async fn conn_watchdog_fires_max_duration_then_idle() {
+        // max (120ms) < idle (300ms) ⇒ MaxDuration fires first.
+        let last = Arc::new(Mutex::new(tokio::time::Instant::now()));
+        let kind = conn_watchdog(
+            Arc::clone(&last),
+            Duration::from_millis(300),
+            Duration::from_millis(120),
+            tokio::time::Instant::now(),
+        )
+        .await;
+        assert_eq!(kind, ConnTimeout::MaxDuration, "max-duration must fire first");
+
+        // idle (120ms) < max (10s) ⇒ Idle fires first (no activity ever stamped).
+        let last = Arc::new(Mutex::new(tokio::time::Instant::now()));
+        let kind = conn_watchdog(
+            Arc::clone(&last),
+            Duration::from_millis(120),
+            Duration::from_secs(10),
+            tokio::time::Instant::now(),
+        )
+        .await;
+        assert_eq!(kind, ConnTimeout::Idle, "idle must fire first");
     }
 
     /// PLAN-handler-tcp-inbound: the CI-hard, mutation-verified gate. Drives the ENFORCED
@@ -3050,9 +3198,18 @@ mod tests {
             tcp_listener_dispatch_decision(true, true),
             "posture on + declared must dispatch"
         );
-        // Structural invariant — the conn lane grants NO raw socket authority (mutation
-        // `add_socket_authority` flips this): the load-bearing "guest never gets wasi:sockets bind/
-        // listen/connect" property of the whole design.
+        // Structural no-raw-sockets invariant (security-review MEDIUM — now the REAL property, not a
+        // symbolic constant): a conn-lane dispatch's bindings carry NO egress allowlist, the exact
+        // precondition that keeps `new_store` from installing a socket check. The `add_socket_authority`
+        // mutation injects a non-empty allowlist into these bindings, so the ENFORCED
+        // `conn_lane_sockets_denied` predicate (the same one `dispatch_tcp_connection` fails closed on)
+        // returns false ⇒ the gate goes RED.
+        assert!(
+            conn_lane_sockets_denied(&gate_conn_lane_bindings()),
+            "conn-lane bindings must carry NO egress allowlist (empty ⇒ new_store grants no socket authority)"
+        );
+        // Defense-in-depth: the standalone dispatch-refusal constant guard also denies socket authority
+        // (also flipped by `add_socket_authority`).
         assert!(
             !conn_lane_grants_socket_authority(),
             "the inbound-TCP conn lane must never grant the guest raw socket authority (wasi:sockets)"
