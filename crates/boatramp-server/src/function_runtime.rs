@@ -1070,7 +1070,10 @@ pub(super) async fn build_function_bindings(
             // not multi-tenant), consistent with its known-minimal-but-admin-trusted binding set.
             bindings = bindings.with_blobstore(
                 scope,
-                inner.storage.clone(),
+                // Per-project blob backend (PLAN-per-project-blob-backend): the migration step stages
+                // into ITS project's backend (host-resolved `project`, never guest input); an
+                // unconfigured project resolves the global default (byte-identical).
+                inner.blob_backends.backend(project),
                 max_blob,
                 None,
                 Vec::new(),
@@ -1329,7 +1332,10 @@ pub(super) async fn build_function_bindings(
         }
         bindings = bindings.with_blobstore(
             scope,
-            inner.storage.clone(),
+            // Per-project blob backend (PLAN-per-project-blob-backend): resolve for THIS invocation's
+            // HOST-resolved `project` (never guest input, invariant 1); unconfigured ⇒ global default.
+            // Key-prefix confinement still runs on top (invariant 2).
+            inner.blob_backends.backend(project),
             max_blob,
             resolved_tenant_string(&caller_tenant),
             config.blobstore_containers.clone(),
@@ -2611,7 +2617,15 @@ pub(super) async fn put_trigger_handler(
             )
                 .into_response();
         };
-        if !inner.storage.supports_watch() {
+        // Check the PROJECT's backend (PLAN-per-project-blob-backend) — a blob trigger is registered
+        // against the backend the function's blobs actually live on (host-resolved project, never guest
+        // input); an unconfigured project resolves the global default (byte-identical). A per-project S3
+        // backend with no native watch (no provisioned pipeline) correctly fails this gate.
+        if !inner
+            .blob_backends
+            .backend(project.as_ref())
+            .supports_watch()
+        {
             return (
                 StatusCode::BAD_REQUEST,
                 "this storage backend does not support blob-change triggers\n",

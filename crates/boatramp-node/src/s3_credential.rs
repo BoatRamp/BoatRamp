@@ -224,8 +224,39 @@ fn parse_secret_ref(secret_ref: &str) -> SecretRef<'_> {
 ///   (else [`S3CredentialError::EnvRefNotPermitted`], fail-closed like a guest `env:` ref).
 ///
 /// The result holds the plaintext in memory inside a redacted [`SealedS3Credential`].
+///
+/// The `boatramp:<name>` ref is resolved under [`ProjectRef::DEFAULT`] (the reserved operator/node
+/// scope). A **per-project** blob backend (PLAN-per-project-blob-backend) instead calls
+/// [`resolve_s3_credential_for_project`] so its `boatramp:` ref unseals from THAT project's own sealed
+/// store — binding the credential to the project, never the node default.
 pub async fn resolve_s3_credential(
     config: &crate::config::S3CredentialConfig,
+    kv: Arc<dyn KvStore>,
+    envelope: Option<Arc<dyn KeyEnvelope>>,
+    allow_env_secret_refs: bool,
+    env_source: &dyn EnvSource,
+) -> Result<SealedS3Credential, S3CredentialError> {
+    resolve_s3_credential_for_project(
+        config,
+        ProjectRef::DEFAULT,
+        kv,
+        envelope,
+        allow_env_secret_refs,
+        env_source,
+    )
+    .await
+}
+
+/// Resolve a base S3 credential (as [`resolve_s3_credential`]) but keyed to a specific `project`
+/// (PLAN-per-project-blob-backend): a `boatramp:<name>` secret ref unseals from THAT project's sealed
+/// [`SecretStore`] subtree rather than [`ProjectRef::DEFAULT`]. Used by the per-project blob-backend
+/// wiring so project ACME's backend credential is sealed in ACME's own secret store (invariant 1 —
+/// authority bound to the project). `env:`/bare refs are project-independent (the operator's own
+/// environment), posture-gated identically. `project` is the serve's host-resolved project, never guest
+/// input.
+pub async fn resolve_s3_credential_for_project(
+    config: &crate::config::S3CredentialConfig,
+    project: ProjectRef<'_>,
     kv: Arc<dyn KvStore>,
     envelope: Option<Arc<dyn KeyEnvelope>>,
     allow_env_secret_refs: bool,
@@ -262,7 +293,7 @@ pub async fn resolve_s3_credential(
             // to the ambient env chain (that would mask the misconfig this feature exists to remove).
             let envelope = envelope.ok_or(S3CredentialError::NoEnvelope)?;
             let store = SecretStore::new(kv, envelope);
-            match store.get(ProjectRef::DEFAULT, name).await {
+            match store.get(project, name).await {
                 Ok(Some(bytes)) => {
                     String::from_utf8(bytes).map_err(|_| S3CredentialError::NotUtf8)?
                 }

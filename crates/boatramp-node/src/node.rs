@@ -48,6 +48,14 @@ pub struct NodeInput<'a> {
     pub data_dir: &'a Path,
     /// The object store built by [`crate::blobs::build_blobs`].
     pub storage: Arc<dyn Storage>,
+    /// Per-project blob backends (PLAN-per-project-blob-backend): a `project → RAW backend` map the
+    /// serve wiring built (each with its own sealed S3 credential, fail-closed on an unresolvable one).
+    /// RAW (undecorated) — the handler runtime wraps each in the SAME MarkerHeadCache + opt-in
+    /// HedgedStorage decorator stack as the global `storage` and assembles a `CompositeBlobBackends`
+    /// over the global default. Empty ⇒ no overrides (every project resolves the global; an all-global
+    /// deployment is byte-for-byte unchanged). The project a backend binds to is host-resolved at serve
+    /// time, never guest input (invariant 1).
+    pub per_project_blob_backends: std::collections::HashMap<String, Arc<dyn Storage>>,
     /// The metadata KV, already cache-fronted, built by [`crate::backends::build_kv`].
     pub kv: Arc<dyn KvStore>,
     /// The control-plane auth built by [`crate::auth::configure_auth`].
@@ -156,6 +164,7 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
         config,
         data_dir,
         storage,
+        per_project_blob_backends,
         kv,
         auth,
         options,
@@ -249,6 +258,7 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
     let handlers = crate::handlers::build_handler_runtime(
         kv.clone(),
         compute_storage.clone(),
+        per_project_blob_backends,
         data_dir,
         config.handlers.as_ref(),
         messaging,
@@ -1032,6 +1042,7 @@ mod tests {
             config: &config,
             data_dir: tmp.path(),
             storage,
+            per_project_blob_backends: std::collections::HashMap::new(),
             kv,
             auth: boatramp_server::Auth::disabled(),
             options,

@@ -322,7 +322,15 @@ struct HandlerRuntimeInner {
     /// fan-out, no attempt-burning overload storm).
     async_drain_gate: Arc<tokio::sync::Semaphore>,
     kv: Arc<dyn boatramp_core::kv::KvStore>,
-    storage: Arc<dyn boatramp_core::Storage>,
+    /// Per-project blob-backend resolver (PLAN-per-project-blob-backend). The `wasi:blobstore` binding
+    /// resolves `blob_backends.backend(project)` at binding build — the serve's HOST-resolved project,
+    /// never guest input (invariant 1) — so project ACME can serve its blobs from its own bucket while
+    /// an unconfigured project (and node-internal blob paths) resolve `default_backend()` (the global,
+    /// byte-identical to the pre-per-project single backend). Key-prefix confinement still runs on top
+    /// of whatever resolves (invariant 2). A node that never configured per-project backends gets a
+    /// [`GlobalBlobBackend`](boatramp_core::blob_backends::GlobalBlobBackend) here (one backend, one
+    /// credential) via [`HandlerRuntime::new`].
+    blob_backends: Arc<dyn boatramp_core::blob_backends::BlobBackends>,
     /// Per-site SQL database provider (libsql — single-node files by default;
     /// absent = the `sql` capability is not offered, so handlers requesting it
     /// are refused at activation).
@@ -800,6 +808,36 @@ impl HandlerRuntime {
         sql: Option<Arc<dyn boatramp_core::sql::SqlBackends>>,
         messaging: Option<Arc<dyn boatramp_core::messaging::Messaging>>,
     ) -> Self {
+        // No per-project blob backends: every project resolves the one global `storage` (the
+        // pre-per-project behavior — one backend, one credential, byte-identical). The node wiring that
+        // configures `[serve.blob_backends]` uses [`Self::new_with_backends`] with a
+        // `CompositeBlobBackends` resolver instead.
+        Self::new_with_backends(
+            engine,
+            kv,
+            Arc::new(boatramp_core::blob_backends::GlobalBlobBackend::new(
+                storage,
+            )),
+            sql,
+            messaging,
+        )
+    }
+
+    /// Build a runtime whose `wasi:blobstore` binding resolves its backend per project through
+    /// `blob_backends` (PLAN-per-project-blob-backend) instead of a single global `storage`. The
+    /// resolver's `default_backend()` is the node-wide backend (used for the reserved `default`
+    /// project, any unconfigured project, and node-internal blob paths — watch/messaging), so a
+    /// resolver built from only a global backend is behavior-identical to [`Self::new`]. Each backend
+    /// in the resolver is already decorator-wrapped (MarkerHeadCache + opt-in HedgedStorage) by the
+    /// node wiring, exactly like the global.
+    #[cfg(feature = "handlers")]
+    pub fn new_with_backends(
+        engine: boatramp_handlers::HandlerEngine,
+        kv: Arc<dyn boatramp_core::kv::KvStore>,
+        blob_backends: Arc<dyn boatramp_core::blob_backends::BlobBackends>,
+        sql: Option<Arc<dyn boatramp_core::sql::SqlBackends>>,
+        messaging: Option<Arc<dyn boatramp_core::messaging::Messaging>>,
+    ) -> Self {
         // Size the async drain gate to the engine's async-lane concurrency
         // (read before `engine` is moved into the runtime).
         let async_drain_slots = engine.async_max_concurrency().max(1);
@@ -808,7 +846,7 @@ impl HandlerRuntime {
                 engine,
                 async_drain_gate: Arc::new(tokio::sync::Semaphore::new(async_drain_slots)),
                 kv,
-                storage,
+                blob_backends,
                 sql,
                 messaging,
                 site_semaphores: boatramp_handlers::KeyedSemaphores::new(),
@@ -4091,6 +4129,103 @@ mod tests {
         async fn list(&self, _: &str) -> Result<Vec<ObjectMeta>, StorageError> {
             Ok(Vec::new())
         }
+    }
+
+    /// Seed `storage` with `content` at the raw guest key `hblob/{site}/{container}/{object}` — the
+    /// exact key `read_object_through_guest_binding` reads back, so a per-project isolation test can
+    /// land a DISTINCT sentinel in each backend at the SAME key.
+    #[cfg(feature = "handlers")]
+    async fn seed_blob(storage: &Arc<dyn boatramp_core::Storage>, content: &'static [u8]) {
+        use futures::StreamExt;
+        let body: ByteStream =
+            futures::stream::once(async move { Ok(bytes::Bytes::from_static(content)) }).boxed();
+        storage
+            .put(
+                "hblob/blog/assets/file",
+                body,
+                boatramp_core::PutMeta::default(),
+            )
+            .await
+            .expect("seed blob");
+    }
+
+    /// BP-3 (PLAN-per-project-blob-backend): a handler bound to project A reads its OWN backend, never
+    /// project B's; an UNCONFIGURED project (and the reserved `default`) resolve the GLOBAL default,
+    /// never another project's backend. Drives the REAL guest `wasi:blobstore` read-path
+    /// (`read_object_through_guest_binding`) over the backend the runtime's resolver picks for each
+    /// HOST-resolved project — exactly what `build_bindings` passes to `with_blobstore`.
+    ///
+    /// MUTATION-VERIFIABLE (the #503/#499 gate convention): three physically distinct backends hold a
+    /// DISTINCT sentinel at the SAME key, so the only thing deciding which bytes a read returns is WHICH
+    /// backend the project resolved. A resolver mutation that (a) returns the global for a configured
+    /// project, or (b) returns project B's backend for A, makes the guest read the WRONG sentinel → this
+    /// test FAILS. Key-prefix confinement still runs on top (invariant 2). Gate:
+    /// `BLOB PER-PROJECT ISOLATION OK`.
+    #[cfg(feature = "handlers")]
+    #[tokio::test]
+    async fn blob_backend_is_bound_per_project_and_isolated() {
+        use boatramp_core::blob_backends::BlobBackends;
+        use boatramp_handlers::{HandlerEngine, Limits};
+
+        let global: Arc<dyn boatramp_core::Storage> = Arc::new(MemStorage::default());
+        let backend_a: Arc<dyn boatramp_core::Storage> = Arc::new(MemStorage::default());
+        let backend_b: Arc<dyn boatramp_core::Storage> = Arc::new(MemStorage::default());
+        seed_blob(&global, b"global-default").await;
+        seed_blob(&backend_a, b"backend-A").await;
+        seed_blob(&backend_b, b"backend-B").await;
+
+        let mut per_project: std::collections::HashMap<String, Arc<dyn boatramp_core::Storage>> =
+            std::collections::HashMap::new();
+        per_project.insert("proja".to_string(), backend_a.clone());
+        per_project.insert("projb".to_string(), backend_b.clone());
+        let composite: Arc<dyn BlobBackends> = Arc::new(
+            boatramp_storage::CompositeBlobBackends::new(global.clone(), per_project),
+        );
+
+        let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        // The runtime carries the resolver (BP-2) — the SAME `inner.blob_backends` the `wasi:blobstore`
+        // binding build consults per HOST-resolved project (BP-3).
+        let rt = HandlerRuntime::new_with_backends(engine, kv, composite, None, None);
+        let inner = rt.inner.as_ref().unwrap();
+
+        // `project` is the serve's host-resolved project (never guest input). Resolve its backend
+        // exactly as the binding build does, then read the sentinel back through the real guest path.
+        async fn read_via(inner: &HandlerRuntimeInner, project: &str) -> Vec<u8> {
+            let backend = inner
+                .blob_backends
+                .backend(boatramp_core::project::ProjectRef::new(project));
+            boatramp_handlers::read_object_through_guest_binding(backend, "blog", "assets", "file")
+                .await
+                .expect("guest read-through")
+        }
+
+        // Project A reads ITS OWN backend — not B's, not the global's.
+        assert_eq!(
+            read_via(inner, "proja").await,
+            b"backend-A",
+            "project A must resolve its OWN backend, never the global or another project's"
+        );
+        // Project B reads ITS OWN backend.
+        assert_eq!(
+            read_via(inner, "projb").await,
+            b"backend-B",
+            "project B must resolve its OWN backend"
+        );
+        // An UNCONFIGURED project resolves the GLOBAL default — crucially NOT another project's backend
+        // (no cross-project leak via a missing entry; fail-closed to the shared default).
+        assert_eq!(
+            read_via(inner, "projc").await,
+            b"global-default",
+            "an unconfigured project resolves the GLOBAL default, never another project's backend"
+        );
+        // The reserved `default` project resolves the global default (back-compat, invariant 5).
+        assert_eq!(
+            read_via(inner, boatramp_core::project::DEFAULT_PROJECT).await,
+            b"global-default",
+            "the reserved default project resolves the global default"
+        );
+        println!("BLOB PER-PROJECT ISOLATION OK");
     }
 
     /// Build an `ObservedInstance` for the wake-from-zero helper tests, owned by
