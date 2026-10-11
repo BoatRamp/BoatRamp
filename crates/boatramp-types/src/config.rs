@@ -1970,6 +1970,7 @@ mod tests {
             handlers: vec![HandlerConfig {
                 tenancy: None,
                 token_claims: None,
+                no_secrets: false,
                 route: "/h".into(),
                 methods: Vec::new(),
                 component: "h.wasm".into(),

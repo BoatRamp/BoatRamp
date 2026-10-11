@@ -1097,6 +1097,7 @@ mod tests {
         HandlerConfig {
             tenancy: None,
             token_claims: None,
+            no_secrets: false,
             route: route.into(),
             methods: methods
                 .iter()
