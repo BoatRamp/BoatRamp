@@ -253,6 +253,12 @@ const KNOWN_IMPORTS: &[&str] = &[
     "wasi:clocks",
     "wasi:random",
     "wasi:logging",
+    // Outbound-TCP `connect` capability (`PLAN-handler-tcp-egress`). The socket host is always
+    // linked and deny-by-default (`SocketAddrCheck::default()` rejects every target); granting it
+    // here only lets a handler DECLARE it. Reaching anything additionally needs the posture flag
+    // `allow_guest_tcp_egress` (off under `multi-tenant`) AND a non-empty per-handler
+    // `egress_allowlist` — deny-by-default at every layer.
+    "wasi:sockets",
 ];
 
 /// The import names a deploy may declare in a handler's `imports` (baseline WASI
@@ -622,6 +628,20 @@ pub struct HandlerConfig {
     /// `wasi:blobstore` and the site allows it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub blobstore_containers: Vec<String>,
+    /// Per-handler **outbound-TCP allowlist** for the gated `wasi:sockets` capability
+    /// (`PLAN-handler-tcp-egress`): the `host:port` / `ip:port` / `CIDR:port` targets this handler
+    /// may `connect` to. Least-privilege, mirroring [`upload_containers`](Self::upload_containers):
+    /// **empty ⇒ deny-all** (a handler that imports `wasi:sockets` but names no targets can reach
+    /// nothing). A domain entry (`db.internal:5432`) is resolved host-side and matched against the
+    /// resolved peer IP; an `ip:port` / `CIDR:port` entry (`10.0.0.5:5432`, `10.0.0.0/8:5432`) is
+    /// matched structurally. The gate is `connect`-only (never `bind`/`listen`), and even an
+    /// allowlisted target is still held to the `is_global_ip` SSRF floor unless the posture also
+    /// allows private egress. Only consulted when `imports` contains `wasi:sockets` AND the node
+    /// posture [`allow_guest_tcp_egress`](crate::security::SecurityPosture::allow_guest_tcp_egress)
+    /// is on — with the posture off the capability is refused at deploy and the runtime denies all.
+    /// Host config on the deploy record, never guest-supplied at runtime.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub egress_allowlist: Vec<String>,
     /// Per-handler in-site tenancy decision (Dimension 0), overriding the site-level
     /// [`HandlersSiteConfig::tenancy`] for this route. Absent ⇒ inherit the site decision. When
     /// present it must **narrow within** the site ceiling ([`crate::tenancy::Tenancy::narrows_within`])
@@ -795,6 +815,12 @@ pub struct ConsumerConfig {
     /// on a multi-tenant consumer ⇒ deny-all (fail-closed); empty single-tenant ⇒ permissive.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub blobstore_containers: Vec<String>,
+    /// Per-component **outbound-TCP allowlist** for the gated `wasi:sockets` capability (same
+    /// contract as [`HandlerConfig::egress_allowlist`]): the `host:port` / `ip:port` / `CIDR:port`
+    /// targets this consumer may `connect` to. **Empty ⇒ deny-all.** `connect`-only, posture-gated
+    /// (`allow_guest_tcp_egress`), SSRF-floored.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub egress_allowlist: Vec<String>,
 }
 
 /// serde `skip_serializing_if` helper: a `Latest` start is the default and elided.
@@ -910,6 +936,12 @@ pub struct SessionConfig {
     /// contract as [`HandlerConfig::stats_topics`]).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stats_topics: Vec<String>,
+    /// Per-component **outbound-TCP allowlist** for the gated `wasi:sockets` capability (same
+    /// contract as [`HandlerConfig::egress_allowlist`]): the `host:port` / `ip:port` / `CIDR:port`
+    /// targets this session's component may `connect` to. **Empty ⇒ deny-all.** `connect`-only,
+    /// posture-gated (`allow_guest_tcp_egress`), SSRF-floored.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub egress_allowlist: Vec<String>,
     /// In-site tenancy decision for this session's `sql`/`orm` (Dimension 0). Resolved once at
     /// **open** from the verified source and carried across every re-entry, so a frame-triggered
     /// query is host-scoped identically to a normal handler. Absent ⇒ plain (project = database).
@@ -1984,6 +2016,7 @@ mod tests {
                 tenant_secret_names: Vec::new(),
                 upload_containers: Vec::new(),
                 blobstore_containers: Vec::new(),
+                egress_allowlist: Vec::new(),
             }],
             ..Default::default()
         };
@@ -2106,8 +2139,51 @@ mod tests {
         assert!(check_import("tenant-secrets").is_err());
         assert!(check_import("tenant-secrets:*").is_err());
         assert!(check_import("tenant-secrets:write").is_err());
+        // The gated outbound-TCP capability is accepted offline (it is in `KNOWN_IMPORTS`); the
+        // posture flag + per-handler `egress_allowlist` gate reach at activation/runtime, not here.
+        assert!(check_import("wasi:sockets").is_ok());
         // A wholly-unknown import is still rejected.
         assert!(check_import("wasi:filesystem").is_err());
+    }
+
+    #[test]
+    fn handler_config_with_a_sockets_import_and_egress_allowlist_round_trips() {
+        // `PLAN-handler-tcp-egress` TE-1: the offline validator accepts a manifest declaring the
+        // gated `wasi:sockets` import, and the per-handler `egress_allowlist` round-trips. (Deny-by-
+        // default still holds: the capability does nothing until the node posture allows it AND the
+        // allowlist is non-empty — enforced at activation/runtime, not at parse.)
+        let text = r#"(
+            handlers: [
+                ( route: "/imap", methods: ["POST"],
+                  component: "handlers/imap.wasm",
+                  imports: ["wasi:sockets"],
+                  egress_allowlist: ["imap.example.com:993", "10.0.0.0/8:5432"] ),
+            ],
+            consumers: [
+                ( topic: "mail/fetch", component: "handlers/fetch.wasm",
+                  imports: ["wasi:sockets"],
+                  egress_allowlist: ["pop.example.com:995"] ),
+            ],
+        )"#;
+        let config = DeployConfig::from_ron(text).expect("a wasi:sockets manifest parses");
+        assert_eq!(config.handlers[0].imports, vec!["wasi:sockets".to_string()]);
+        assert_eq!(
+            config.handlers[0].egress_allowlist,
+            vec![
+                "imap.example.com:993".to_string(),
+                "10.0.0.0/8:5432".to_string()
+            ]
+        );
+        assert_eq!(
+            config.consumers[0].egress_allowlist,
+            vec!["pop.example.com:995".to_string()]
+        );
+        // An empty / absent allowlist is the deny-all default (serde default, skip-if-empty).
+        let empty = DeployConfig::from_ron(
+            r#"( handlers: [ ( route: "/x", component: "x.wasm", imports: ["wasi:sockets"] ) ] )"#,
+        )
+        .expect("parses without an allowlist");
+        assert!(empty.handlers[0].egress_allowlist.is_empty());
     }
 
     #[test]
