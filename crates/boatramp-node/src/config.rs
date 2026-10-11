@@ -430,6 +430,9 @@ impl ServerConfig {
             if let Some(v) = source.parse_bool("BOATRAMP_SECURITY_ALLOW_GUEST_EGRESS_EXTRA_CA")? {
                 o.allow_guest_egress_extra_ca = Some(v);
             }
+            if let Some(v) = source.parse_bool("BOATRAMP_SECURITY_ALLOW_GUEST_TCP_EGRESS")? {
+                o.allow_guest_tcp_egress = Some(v);
+            }
             if let Some(v) = source.parse("BOATRAMP_SECURITY_MAX_HANDLER_BLOB_BYTES")? {
                 o.max_handler_blob_bytes = Some(v);
             }
@@ -961,6 +964,7 @@ const SECURITY_ENV_VARS: &[&str] = &[
     "BOATRAMP_SECURITY_ALLOW_GUEST_PRIVATE_EGRESS",
     "BOATRAMP_SECURITY_ALLOW_GUEST_SELF_EGRESS",
     "BOATRAMP_SECURITY_ALLOW_GUEST_EGRESS_EXTRA_CA",
+    "BOATRAMP_SECURITY_ALLOW_GUEST_TCP_EGRESS",
     "BOATRAMP_SECURITY_MAX_HANDLER_BLOB_BYTES",
     "BOATRAMP_SECURITY_MAX_COMPONENT_BYTES",
     "BOATRAMP_SECURITY_OIDC_REQUIRE_AUDIENCE",
@@ -3558,7 +3562,7 @@ mod tests {
 
     #[test]
     fn each_guest_feature_env_var_moves_its_own_posture_field() {
-        // Cross-wiring guard: set each of the six guest-feature vars ALONE over the multi-tenant
+        // Cross-wiring guard: set each of the guest-feature vars ALONE over the multi-tenant
         // default and assert THAT var's own resolved field flips — so a copy-paste arm mapping a var
         // to the wrong field (or an unregistered var that never materialises the section) fails here.
         // Complements `every_posture_override_field_has_an_env_mapping` below (which proves coverage
@@ -3571,6 +3575,9 @@ mod tests {
             ),
             ("BOATRAMP_SECURITY_ALLOW_GUEST_EGRESS_EXTRA_CA", |p| {
                 p.allow_guest_egress_extra_ca
+            }),
+            ("BOATRAMP_SECURITY_ALLOW_GUEST_TCP_EGRESS", |p| {
+                p.allow_guest_tcp_egress
             }),
             ("BOATRAMP_SECURITY_ALLOW_GUEST_ADMIN_DOMAINS", |p| {
                 p.allow_guest_admin_domains

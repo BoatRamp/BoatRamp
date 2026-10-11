@@ -125,6 +125,12 @@ mod imp {
         match (pkg, iface) {
             ("wasi:keyvalue", _) => Some("wasi:keyvalue"),
             ("wasi:blobstore", _) => Some("wasi:blobstore"),
+            // Outbound-TCP `connect` capability (`PLAN-handler-tcp-egress`). The socket host is
+            // always linked and deny-by-default; granting the token only lets a handler DECLARE the
+            // import. Reaching anything additionally needs the posture flag `allow_guest_tcp_egress`
+            // (refused at deploy / denied at runtime when off) AND a non-empty per-handler
+            // `egress_allowlist`. `connect`-only: `bind`/`listen` stay denied in the runtime gate.
+            ("wasi:sockets", _) => Some("wasi:sockets"),
             // `orm` is a **typed view of the same `sql` capability** — it runs on the
             // same per-invocation SQL session/backend and `use`s `sql-types`. So it
             // is the `sql` token: declaring `sql` grants orm (and inherits the
@@ -237,9 +243,11 @@ mod imp {
                 continue;
             }
             // A grantable capability is allowed only if the deploy declared its
-            // token. Anything that maps to no capability (wasi:filesystem,
-            // wasi:sockets, an unknown boatramp:handlers interface, ...) is
-            // refused even when it appears in `imports`.
+            // token. Anything that maps to no capability (wasi:filesystem, an
+            // unknown boatramp:handlers interface, ...) is refused even when it
+            // appears in `imports`. (`wasi:sockets` DOES map to a capability now —
+            // the gated outbound-TCP token — so it is declaration-gated like the rest,
+            // not refused outright.)
             match capability_token(pkg, iface) {
                 // The bare token (`sql`), or a **named** grant of the same capability
                 // (`sql:product`, `sql:*`) — a component imports the single `sql` interface and
@@ -721,6 +729,7 @@ mod imp {
                     tenant_secret_names: Vec::new(),
                     upload_containers: Vec::new(),
                     blobstore_containers: Vec::new(),
+                    egress_allowlist: Vec::new(),
                 }],
                 ..Default::default()
             };

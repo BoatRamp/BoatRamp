@@ -1117,6 +1117,7 @@ mod tests {
             tenant_secret_names: Vec::new(),
             upload_containers: Vec::new(),
             blobstore_containers: Vec::new(),
+            egress_allowlist: Vec::new(),
         }
     }
 
@@ -1158,6 +1159,7 @@ mod tests {
                 tenant_secret_names: Vec::new(),
                 upload_containers: Vec::new(),
                 blobstore_containers: Vec::new(),
+                egress_allowlist: Vec::new(),
             }],
             crons: vec![CronConfig {
                 schedule: "0 * * * *".into(),

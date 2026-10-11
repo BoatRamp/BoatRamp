@@ -108,6 +108,7 @@ impl SecurityProfile {
                 allow_guest_private_egress: false,
                 allow_guest_self_egress: true,
                 allow_guest_egress_extra_ca: false,
+                allow_guest_tcp_egress: false,
                 max_handler_blob_bytes: MT_MAX_BLOB,
                 max_component_bytes: MT_MAX_COMPONENT,
                 oidc_require_audience: true,
@@ -138,6 +139,7 @@ impl SecurityProfile {
                 allow_guest_private_egress: true,
                 allow_guest_self_egress: true,
                 allow_guest_egress_extra_ca: true,
+                allow_guest_tcp_egress: true,
                 max_handler_blob_bytes: ST_MAX_BLOB,
                 max_component_bytes: ST_MAX_COMPONENT,
                 oidc_require_audience: true,
@@ -168,6 +170,7 @@ impl SecurityProfile {
                 allow_guest_private_egress: true,
                 allow_guest_self_egress: true,
                 allow_guest_egress_extra_ca: true,
+                allow_guest_tcp_egress: true,
                 max_handler_blob_bytes: 0,
                 max_component_bytes: 0,
                 oidc_require_audience: false,
@@ -223,6 +226,10 @@ pub struct PostureOverrides {
     /// a hermetic HTTPS test double. Verification is still fully performed; this only widens the CA
     /// set. Off (and refused) under `multi-tenant`. No effect unless a CA file is also configured.
     pub allow_guest_egress_extra_ca: Option<bool>,
+    /// Permit a guest handler's gated `wasi:sockets` capability to open an outbound TCP `connect`.
+    /// Off under `multi-tenant`; on under `single-tenant`/`dev`. See
+    /// [`SecurityPosture::allow_guest_tcp_egress`].
+    pub allow_guest_tcp_egress: Option<bool>,
     /// Cap on handler blobstore host reads/ranges/copies in bytes (`0` = unlimited).
     pub max_handler_blob_bytes: Option<u64>,
     /// Cap on a Wasm component blob in bytes (`0` = unlimited).
@@ -414,6 +421,11 @@ impl SecurityConfig {
             o.allow_guest_egress_extra_ca.is_some(),
         );
         row(
+            "allow_guest_tcp_egress",
+            p.allow_guest_tcp_egress.to_string(),
+            o.allow_guest_tcp_egress.is_some(),
+        );
+        row(
             "max_handler_blob_bytes",
             fmt_cap(p.max_handler_blob_bytes),
             o.max_handler_blob_bytes.is_some(),
@@ -554,6 +566,16 @@ pub struct SecurityPosture {
     /// trusted single-tenant/dev fleet may opt in (e.g. to reach a hermetic HTTPS test double under
     /// a test CA). Verification is still fully performed — this only widens the accepted CA set.
     pub allow_guest_egress_extra_ca: bool,
+    /// Permit a **guest** handler's gated `wasi:sockets` capability to open an **outbound TCP
+    /// `connect`** (`PLAN-handler-tcp-egress`). Off under `multi-tenant` (the deny-by-default: the
+    /// capability is refused at deploy AND the runtime `socket_addr_check` denies every target); on
+    /// under `single-tenant`/`dev`. This is only the posture gate — a granted handler still reaches
+    /// ONLY its per-handler [`egress_allowlist`](crate::config::HandlerConfig::egress_allowlist)
+    /// (empty ⇒ nothing), only `connect` (never `bind`/`listen` — inbound stays the container/
+    /// microVM model), and even an allowlisted target is held to the `is_global_ip` SSRF floor
+    /// unless [`allow_guest_private_egress`](Self::allow_guest_private_egress) is separately on. Any
+    /// single wiring omission fails CLOSED.
+    pub allow_guest_tcp_egress: bool,
     /// Cap on handler blobstore host reads/ranges/copies, `0` = unlimited.
     pub max_handler_blob_bytes: u64,
     /// Cap on a Wasm component blob, `0` = unlimited.
@@ -709,6 +731,9 @@ fn apply(mut base: SecurityPosture, o: &PostureOverrides) -> SecurityPosture {
     }
     if let Some(v) = o.allow_guest_egress_extra_ca {
         base.allow_guest_egress_extra_ca = v;
+    }
+    if let Some(v) = o.allow_guest_tcp_egress {
+        base.allow_guest_tcp_egress = v;
     }
     if let Some(v) = o.max_handler_blob_bytes {
         base.max_handler_blob_bytes = v;

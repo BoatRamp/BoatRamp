@@ -4513,6 +4513,7 @@ mod tests {
                     tenant_secret_names: Vec::new(),
                     upload_containers: Vec::new(),
                     blobstore_containers: Vec::new(),
+                    egress_allowlist: Vec::new(),
                     topic: "orders/created".into(),
                     component: "consumer.wasm".into(),
                     imports: vec!["wasi:keyvalue".into()],
@@ -4682,6 +4683,7 @@ mod tests {
                     tenant_secret_names: Vec::new(),
                     upload_containers: Vec::new(),
                     blobstore_containers: Vec::new(),
+                    egress_allowlist: Vec::new(),
                 }],
                 ..Default::default()
             },
@@ -5112,6 +5114,7 @@ mod tests {
                     tenant_secret_names: Vec::new(),
                     upload_containers: Vec::new(),
                     blobstore_containers: Vec::new(),
+                    egress_allowlist: Vec::new(),
                 }],
                 ..Default::default()
             },
@@ -7096,6 +7099,7 @@ mod tests {
                     tenant_secret_names: Vec::new(),
                     upload_containers: Vec::new(),
                     blobstore_containers: Vec::new(),
+                    egress_allowlist: Vec::new(),
                 }],
                 crons: vec![CronConfig {
                     schedule: "* * * * *".into(),
@@ -7269,6 +7273,7 @@ mod tests {
                     tenant_secret_names: Vec::new(),
                     upload_containers: Vec::new(),
                     blobstore_containers: Vec::new(),
+                    egress_allowlist: Vec::new(),
                 }],
                 crons: vec![CronConfig {
                     schedule: "* * * * *".into(),
