@@ -5,6 +5,36 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.30.0] - 2026-10-11
+
+Two capability features, built and security-reviewed in parallel: per-project blob backends, and
+gated outbound-TCP egress for guest handlers. Both are opt-in and fail closed — an all-global,
+no-sockets deployment is byte-for-byte unchanged.
+
+- **Per-project blob backends.** A node can now point individual projects at their own object store
+  while everything else shares the node default, configured under `[serve.blob_backends.<project>]`
+  (each block takes the same shape as the top-level `[serve]` backend, including a sealed
+  `[serve.blob_backends.<project>.s3_credential]`). Resolution is keyed by the serve's host-resolved
+  project through a new `BlobBackends` seam (`CompositeBlobBackends`): a configured project gets its
+  own fully-built backend (MarkerHeadCache + the opt-in `HedgedStorage`, exactly like the global one),
+  and any unconfigured or misspelled project — plus the reserved `default` project — falls to the
+  GLOBAL default, never to another project's store, so a missing entry can only fail closed to the
+  shared backend and never leak across a project boundary. The reserved `default` key and an invalid
+  project name are both rejected at config load. A CI mutation gate (`BLOB PER-PROJECT ISOLATION OK`)
+  proves the resolver — forcing it to hand every project the global backend turns the isolation test
+  RED. Off unless at least one `[serve.blob_backends.<project>]` is configured.
+- **Gated outbound-TCP egress for guest handlers (`wasi:sockets`).** A handler, consumer, session, or
+  standalone function can now open outbound TCP connections, but only when it both declares the
+  `wasi:sockets` capability AND carries a non-empty `egress_allowlist` of `host:port` / `ip:port` /
+  `CIDR:port` destinations — connect-only (no bind/listen), allowlist-checked, and behind the existing
+  SSRF floor (a private/link-local/loopback target still requires `allow_guest_private_egress`).
+  Deny-by-default at every layer: an empty allowlist, an un-granted capability, or a posture with
+  egress off all deny every connection. A new posture flag `allow_guest_tcp_egress` gates the feature —
+  **false under `MultiTenant`**, true under `SingleTenant`/`Dev`. A CI mutation gate
+  (`TCP-EGRESS ALLOWLIST OK`) proves the runtime decision: admitting a non-allowlisted destination,
+  admitting a bind/listen, or ignoring the posture each must turn the gate RED. Inbound/listening
+  sockets remain unimplemented, reserved as a future posture-gated epic.
+
 ## [0.29.0] - 2026-10-11
 
 Image-serve-latency, continued — the remaining boatramp-side wins after an on-node investigation
