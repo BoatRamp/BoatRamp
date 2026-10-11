@@ -88,6 +88,12 @@ pub mod tenant_provision;
 #[cfg(feature = "cache")]
 pub mod cache;
 
+/// Per-project blob-backend overlay (`CompositeBlobBackends`) — resolves a project's own backend from
+/// an operator-configured map, else the global default. Always compiled (the node wiring resolves
+/// through it); backend-agnostic over `Arc<dyn Storage>`.
+pub mod composite_blob;
+pub use composite_blob::CompositeBlobBackends;
+
 pub mod timing;
 
 /// The verified-container-marker head cache (blob serve-path dedup). Needs `bytes` for the `Storage`
