@@ -1,5 +1,13 @@
-//! A bounded, process-wide cache of VERIFIED blob container-markers, so a hot serve path does not
+//! A bounded, per-BACKEND cache of VERIFIED blob container-markers, so a hot serve path does not
 //! re-`HEAD` the `.boatramp-container` marker on every request.
+//!
+//! **One instance PER backend — NEVER shared or static across backends.** The serve wiring creates a
+//! fresh `MarkerHeadCache` for the global backend AND for each per-project backend
+//! (PLAN-per-project-blob-backend); a single cache shared across backends would be a CROSS-PROJECT
+//! CONFINEMENT BYPASS — a container marker verified on project A's bucket would be cached by its
+//! fully-resolved key and then served for project B's identically-keyed container on a DIFFERENT
+//! bucket. Do NOT "optimize" this into a process-global/`static`/one-shared-instance cache. (Within one
+//! backend the cache is still shared across that backend's requests — the intended dedup.)
 //!
 //! Every blob container open (`get_container` / `container_exists` / a `copy`-dest) runs the Dim-0
 //! tenant-confinement choke (`container_access`, in the `wasi:blobstore` binding) and THEN probes the
@@ -50,8 +58,9 @@ enum MarkerCacheMutation {
     KeyByBasename,
 }
 
-/// A process-wide, positive-only cache of verified container markers fronting a shared [`Storage`].
-/// Bounded by entry count (markers are tiny). See the [module docs](self) for the fail-closed policy.
+/// A positive-only cache of verified container markers fronting ONE [`Storage`] backend. Bounded by
+/// entry count (markers are tiny). ONE instance per backend — NEVER shared/static across backends (a
+/// shared cache is a cross-project confinement bypass; see the [module docs](self)).
 pub struct MarkerHeadCache {
     inner: Arc<dyn Storage>,
     /// `None` ⇒ disabled (pure pass-through); `Some` ⇒ bounded positive cache of verified marker metas.

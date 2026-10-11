@@ -578,6 +578,36 @@ jobs:
           grep -q 'MARKER-DEDUP CONFINEMENT OK' marker-dedup.log \
             || { echo "::error::marker-dedup gate never reached its marker (a confinement/invalidation regression or a skipped test)" >&2; exit 1; }
 
+      # BLOB PER-PROJECT ISOLATION gate (PLAN-per-project-blob-backend BP-3): a handler bound to project
+      # A serves `wasi:blobstore` from A's OWN backend, never project B's; an unconfigured project (and
+      # the reserved `default`) resolve the GLOBAL default, never another project's backend. The test
+      # decorates each backend with the REAL serve-path `wrap_blob_backend` (so it also proves each
+      # backend gets its OWN MarkerHeadCache — a shared cache would be a cross-project confinement
+      # bypass) and reads back through the REAL guest `wasi:blobstore` read-path over a
+      # `CompositeBlobBackends`. Marker `BLOB PER-PROJECT ISOLATION OK`. MUTATION-VERIFIED: with
+      # `blob-perproject-gate-mutation` + `BOATRAMP_BLOB_PERPROJECT_MUTATION`, the resolver returns the
+      # GLOBAL backend for every project, so the gate MUST go RED — a pass-under-mutation is hollow.
+      - name: "blob per-project isolation gate (a project's handler can't reach another project's backend)"
+        run: |
+          set -eo pipefail
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-node \
+            --features handlers --lib blob_per_project_isolation_gate -- --nocapture 2>&1 | tee perproject-iso.log
+          grep -qE 'test result: ok\. 1 passed' perproject-iso.log \
+            || { echo "::error::blob per-project isolation gate did not run (silent skip/failure, or the count drifted from 1)" >&2; exit 1; }
+          grep -q 'BLOB PER-PROJECT ISOLATION OK' perproject-iso.log \
+            || { echo "::error::blob per-project isolation gate never reached its marker (a per-project resolution / backend-isolation regression or a skipped test)" >&2; exit 1; }
+          # Mutation check: force the resolver to hand every project the GLOBAL backend — the gate MUST
+          # fail. If it PASSES under the mutation, the gate is HOLLOW (it is not actually proving
+          # per-project isolation), which is itself a merge failure.
+          if BOATRAMP_BLOB_PERPROJECT_MUTATION=1 cargo-zigbuild test --target x86_64-unknown-linux-musl \
+            -p boatramp-node --features handlers,blob-perproject-gate-mutation \
+            --lib blob_per_project_isolation_gate > perproject-mutation.log 2>&1; then
+            echo "::error::blob per-project isolation gate is HOLLOW — it passed when the resolver was mutated to return the GLOBAL backend for every project (cross-project isolation is not actually proven)" >&2
+            exit 1
+          else
+            echo "blob per-project isolation mutation verified: resolving the GLOBAL backend for a configured project turns the gate RED → per-project resolution is load-bearing."
+          fi
+
       # COMPILE-CACHE DURABILITY gate (image-serve-latency Ask A): the wasm compile cache MUST be pinned
       # to the operator's PERSISTENT data volume so a component's compiled artifact survives a restart —
       # the first request after a roll then deserializes in ms instead of paying a cranelift compile

@@ -136,6 +136,38 @@ mod sync_concurrency_default_tests {
 /// Build the WebAssembly handler runtime. With the `handlers` feature it wraps a
 /// wasmtime engine serving the kv/blob bindings from the server's own backends;
 /// otherwise it is an empty placeholder (handler routes fall through to static).
+/// Wrap ONE raw blob backend in the serve-path decorator stack (PLAN-per-project-blob-backend): an
+/// opt-in [`HedgedStorage`](boatramp_storage::HedgedStorage) closest to the backend (racing a 2nd GET
+/// for a slow read; `None` delay ⇒ no hedge) under a per-backend
+/// [`MarkerHeadCache`](boatramp_storage::MarkerHeadCache) (dedups the `.boatramp-container` HEAD;
+/// `0` entries ⇒ pass-through). Called ONCE for the global backend and ONCE per per-project backend, so
+/// every backend — global or per-project — gets the IDENTICAL stack and its OWN FRESH `MarkerHeadCache`.
+///
+/// SECURITY: the `MarkerHeadCache` here is a per-backend instance and MUST stay one — a cache shared
+/// (or made `static`) across backends would serve project A's verified container marker for project B's
+/// identically-keyed container on a DIFFERENT bucket, a cross-project confinement bypass. The
+/// `BLOB PER-PROJECT ISOLATION OK` gate proves two backends wrapped here hold independent caches.
+#[cfg(feature = "handlers")]
+fn wrap_blob_backend(
+    raw: Arc<dyn boatramp_core::Storage>,
+    hedge_delay_ms: Option<u64>,
+    hedge_max_inflight: usize,
+    marker_cache_entries: usize,
+) -> Arc<dyn boatramp_core::Storage> {
+    let hedged: Arc<dyn boatramp_core::Storage> = match hedge_delay_ms {
+        Some(delay_ms) => Arc::new(boatramp_storage::HedgedStorage::new(
+            raw,
+            std::time::Duration::from_millis(delay_ms),
+            hedge_max_inflight,
+        )),
+        None => raw,
+    };
+    Arc::new(boatramp_storage::MarkerHeadCache::new(
+        hedged,
+        marker_cache_entries,
+    ))
+}
+
 #[cfg(feature = "handlers")]
 #[allow(clippy::too_many_arguments)]
 pub async fn build_handler_runtime(
@@ -218,19 +250,17 @@ pub async fn build_handler_runtime(
     let marker_cache_entries = handlers_cfg
         .and_then(|h| h.blob_marker_cache_entries)
         .unwrap_or(DEFAULT_BLOB_MARKER_CACHE);
+    // One FRESH decorator stack per backend — see `wrap_blob_backend` (the `MarkerHeadCache` MUST be a
+    // per-backend instance, never shared/static across backends, or a verified container marker from
+    // one project's bucket would be served for another's identically-keyed container: a cross-project
+    // confinement bypass). The isolation gate proves each backend gets its own cache.
     let wrap_blob = |raw: Arc<dyn boatramp_core::Storage>| -> Arc<dyn boatramp_core::Storage> {
-        let hedged: Arc<dyn boatramp_core::Storage> = match hedge_delay_ms {
-            Some(delay_ms) => Arc::new(boatramp_storage::HedgedStorage::new(
-                raw,
-                std::time::Duration::from_millis(delay_ms),
-                hedge_max_inflight,
-            )),
-            None => raw,
-        };
-        Arc::new(boatramp_storage::MarkerHeadCache::new(
-            hedged,
+        wrap_blob_backend(
+            raw,
+            hedge_delay_ms,
+            hedge_max_inflight,
             marker_cache_entries,
-        ))
+        )
     };
     // The global default backend (used for the reserved `default` project, any unconfigured project,
     // and node-internal blob paths — watch/messaging). Wrapping it here keeps the single-backend path
@@ -424,6 +454,9 @@ pub async fn build_handler_runtime(
              durability is UNAFFECTED. Set 0 (the default) for stronger-than-JetStream durability."
         );
     }
+    // NODE-INTERNAL blob paths (the `LogMessaging` substrate here; `DeployStore`/compute in node.rs)
+    // use the GLOBAL default backend, NOT the per-project resolver — per-project backends scope the
+    // GUEST `wasi:blobstore` binding only (in scope per PLAN-per-project-blob-backend).
     let messaging: Arc<dyn boatramp_core::messaging::Messaging> = messaging_override
         .unwrap_or_else(|| {
             Arc::new(
@@ -978,5 +1011,186 @@ mod tests {
             .unwrap()
             .expect("credential sealed on first resolve under the default project");
         assert_ne!(sealed.len(), 0);
+    }
+}
+
+/// Cross-project blob-isolation gate (PLAN-per-project-blob-backend BP-3). The authoritative,
+/// mutation-verified gate (`BLOB PER-PROJECT ISOLATION OK`). It lives here, not in boatramp-server,
+/// because it drives the REAL serve-path decoration ([`wrap_blob_backend`]) — which needs the
+/// `marker-cache`/`hedged` storage features a handlers node (and only a handlers node) enables — over a
+/// [`CompositeBlobBackends`](boatramp_storage::CompositeBlobBackends) resolver read through the REAL
+/// guest `wasi:blobstore` read-path.
+#[cfg(all(test, feature = "handlers"))]
+mod perproject_isolation_gate {
+    use super::wrap_blob_backend;
+    use boatramp_core::blob_backends::BlobBackends;
+    use boatramp_core::project::{DEFAULT_PROJECT, ProjectRef};
+    use boatramp_core::{ByteStream, GetObject, ObjectMeta, PutMeta, Storage, StorageError};
+    use futures::StreamExt;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    /// A trivial in-memory object store (test double). `get_range` returns the whole object (range is
+    /// irrelevant to this gate); `head` reports presence.
+    #[derive(Default)]
+    struct MemStorage {
+        objects: Mutex<HashMap<String, Vec<u8>>>,
+    }
+    #[async_trait::async_trait]
+    impl Storage for MemStorage {
+        async fn get(&self, key: &str) -> Result<GetObject, StorageError> {
+            let bytes = self
+                .objects
+                .lock()
+                .unwrap()
+                .get(key)
+                .cloned()
+                .ok_or_else(|| StorageError::NotFound(key.to_string()))?;
+            let body: ByteStream =
+                futures::stream::once(async move { Ok(bytes::Bytes::from(bytes)) }).boxed();
+            Ok(GetObject {
+                meta: ObjectMeta {
+                    key: key.to_string(),
+                    ..Default::default()
+                },
+                body,
+            })
+        }
+        async fn get_range(
+            &self,
+            key: &str,
+            _: u64,
+            _: Option<u64>,
+        ) -> Result<GetObject, StorageError> {
+            self.get(key).await
+        }
+        async fn put(
+            &self,
+            key: &str,
+            mut body: ByteStream,
+            _: PutMeta,
+        ) -> Result<ObjectMeta, StorageError> {
+            let mut buf = Vec::new();
+            while let Some(chunk) = body.next().await {
+                buf.extend_from_slice(&chunk?);
+            }
+            self.objects.lock().unwrap().insert(key.to_string(), buf);
+            Ok(ObjectMeta {
+                key: key.to_string(),
+                ..Default::default()
+            })
+        }
+        async fn head(&self, key: &str) -> Result<ObjectMeta, StorageError> {
+            self.objects
+                .lock()
+                .unwrap()
+                .get(key)
+                .map(|_| ObjectMeta {
+                    key: key.to_string(),
+                    ..Default::default()
+                })
+                .ok_or_else(|| StorageError::NotFound(key.to_string()))
+        }
+        async fn delete(&self, key: &str) -> Result<(), StorageError> {
+            self.objects.lock().unwrap().remove(key);
+            Ok(())
+        }
+        async fn list(&self, _: &str) -> Result<Vec<ObjectMeta>, StorageError> {
+            Ok(Vec::new())
+        }
+    }
+
+    async fn seed(storage: &Arc<dyn Storage>, key: &str, content: &'static [u8]) {
+        use futures::StreamExt;
+        let body: ByteStream =
+            futures::stream::once(async move { Ok(bytes::Bytes::from_static(content)) }).boxed();
+        storage
+            .put(key, body, PutMeta::default())
+            .await
+            .expect("seed blob");
+    }
+
+    /// The decorator stack used by the real serve path: hedging OFF (so the gate exercises the
+    /// marker-cache, the security-relevant decorator) + an active per-backend marker cache.
+    fn decorate(raw: Arc<dyn Storage>) -> Arc<dyn Storage> {
+        wrap_blob_backend(raw, None, 0, 64)
+    }
+
+    #[tokio::test]
+    async fn blob_per_project_isolation_gate() {
+        // Three physically distinct backends, each with a DISTINCT sentinel at the SAME object key, so
+        // the ONLY thing deciding which bytes a read returns is WHICH backend the project resolves.
+        let global_raw: Arc<dyn Storage> = Arc::new(MemStorage::default());
+        let a_raw: Arc<dyn Storage> = Arc::new(MemStorage::default());
+        let b_raw: Arc<dyn Storage> = Arc::new(MemStorage::default());
+        seed(&global_raw, "hblob/blog/assets/file", b"global-default").await;
+        seed(&a_raw, "hblob/blog/assets/file", b"backend-A").await;
+        seed(&b_raw, "hblob/blog/assets/file", b"backend-B").await;
+        // Backend A ALSO holds a verified container marker; B does NOT — used below to prove each
+        // backend gets its OWN MarkerHeadCache (a shared cache would serve A's marker for B).
+        seed(&a_raw, "hblob/blog/assets/.boatramp-container", b"1").await;
+
+        // Decorate each backend EXACTLY as the serve path does (`wrap_blob_backend`) — a fresh, per-
+        // backend MarkerHeadCache — then overlay them on the global default in a CompositeBlobBackends.
+        let global = decorate(global_raw);
+        let a = decorate(a_raw);
+        let b = decorate(b_raw);
+        let mut per_project: HashMap<String, Arc<dyn Storage>> = HashMap::new();
+        per_project.insert("proja".to_string(), a);
+        per_project.insert("projb".to_string(), b);
+        let backends: Arc<dyn BlobBackends> = Arc::new(
+            boatramp_storage::CompositeBlobBackends::new(global, per_project),
+        );
+
+        // Resolve each HOST-resolved project's backend exactly as the `wasi:blobstore` binding build
+        // does, then read the sentinel back through the REAL guest read-path.
+        async fn read_project(backends: &Arc<dyn BlobBackends>, project: &str) -> Vec<u8> {
+            let backend = backends.backend(ProjectRef::new(project));
+            boatramp_handlers::read_object_through_guest_binding(backend, "blog", "assets", "file")
+                .await
+                .expect("guest read-through")
+        }
+        assert_eq!(
+            read_project(&backends, "proja").await,
+            b"backend-A",
+            "project A must resolve its OWN backend, never the global or another project's"
+        );
+        assert_eq!(
+            read_project(&backends, "projb").await,
+            b"backend-B",
+            "project B must resolve its OWN backend"
+        );
+        assert_eq!(
+            read_project(&backends, "projc").await,
+            b"global-default",
+            "an UNCONFIGURED project resolves the GLOBAL default, never another project's backend"
+        );
+        assert_eq!(
+            read_project(&backends, DEFAULT_PROJECT).await,
+            b"global-default",
+            "the reserved default project resolves the global default"
+        );
+
+        // Each per-project backend owns a SEPARATE MarkerHeadCache (a shared one is a cross-project
+        // confinement bypass). Verify A's container marker on A's backend (caches a positive), then the
+        // SAME marker key on B's backend MUST still be absent — if the caches were shared, B would serve
+        // A's cached positive.
+        let marker = "hblob/blog/assets/.boatramp-container";
+        backends
+            .backend(ProjectRef::new("proja"))
+            .head(marker)
+            .await
+            .expect("A's container marker is present + verified (populates A's marker cache)");
+        let b_marker = backends
+            .backend(ProjectRef::new("projb"))
+            .head(marker)
+            .await;
+        assert!(
+            matches!(b_marker, Err(StorageError::NotFound(_))),
+            "project B's backend has its OWN marker cache — A's verified marker must NOT leak into B \
+             (a shared MarkerHeadCache would be a cross-project confinement bypass); got {b_marker:?}"
+        );
+
+        println!("BLOB PER-PROJECT ISOLATION OK");
     }
 }

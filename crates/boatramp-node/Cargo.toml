@@ -155,6 +155,14 @@ s3-sealed-cred-gate-mutation = ["s3"]
 # backends) + `fallback` (the `FallbackStorage` composite) + a real `DeployStore` over it for the
 # GC-refusal invariant.
 blob-fallback-gate-mutation = ["fs", "fallback"]
+# CI gate lane for the per-project blob-backend cross-project isolation gate
+# (`BLOB PER-PROJECT ISOLATION OK`, PLAN-per-project-blob-backend). Implies `handlers` (the gate drives
+# the real `wrap_blob_backend` decoration + the guest `wasi:blobstore` read-path over a
+# `CompositeBlobBackends`) and passes through to the storage-crate mutation seam
+# (`CompositeBlobBackends::backend` → GLOBAL for every project), so CI can prove the gate is
+# load-bearing by asserting the isolation test FAILS under `BOATRAMP_BLOB_PERPROJECT_MUTATION`.
+# Compiled OUT of every real build.
+blob-perproject-gate-mutation = ["handlers", "boatramp-storage/blob-perproject-gate-mutation"]
 
 [dev-dependencies]
 # The in-process fidelity test (`node::tests`) drives the assembled router with a
