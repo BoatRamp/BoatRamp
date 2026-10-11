@@ -127,9 +127,11 @@ mod imp {
             ("wasi:blobstore", _) => Some("wasi:blobstore"),
             // Outbound-TCP `connect` capability (`PLAN-handler-tcp-egress`). The socket host is
             // always linked and deny-by-default; granting the token only lets a handler DECLARE the
-            // import. Reaching anything additionally needs the posture flag `allow_guest_tcp_egress`
-            // (refused at deploy / denied at runtime when off) AND a non-empty per-handler
-            // `egress_allowlist`. `connect`-only: `bind`/`listen` stay denied in the runtime gate.
+            // import (accepted at deploy regardless of posture — there is NO deploy-time refusal in
+            // this stage). Reaching anything additionally needs, at RUNTIME, the posture flag
+            // `allow_guest_tcp_egress` (off ⇒ the engine never installs a permissive socket check, so
+            // every connect fails closed) AND a non-empty per-handler `egress_allowlist`.
+            // `connect`-only: `bind`/`listen` stay denied in the runtime gate.
             ("wasi:sockets", _) => Some("wasi:sockets"),
             // `orm` is a **typed view of the same `sql` capability** — it runs on the
             // same per-invocation SQL session/backend and `use`s `sql-types`. So it

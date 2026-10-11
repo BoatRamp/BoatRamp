@@ -502,6 +502,39 @@ jobs:
           grep -qE 'test result: ok\. 1 passed' oom-classify.log \
             || { echo "::error::OOM classification gate did not run (silent skip or a failure)" >&2; exit 1; }
 
+      # PLAN-handler-tcp-egress TCP-EGRESS ALLOWLIST GATE (marker `TCP-EGRESS ALLOWLIST OK`). The gated
+      # `wasi:sockets` outbound-TCP capability is deny-by-default at every layer: the socket host is
+      # deny-all until the engine installs a permissive `socket_addr_check`, which it does ONLY when the
+      # posture allows TCP egress AND a non-empty per-handler allowlist is present; the installed check
+      # is connect-only (no bind/listen/UDP), allowlist-gated (IP/CIDR/host-resolved-domain + port), and
+      # SSRF-floored (`is_global_ip` unless `allow_guest_private_egress`). This gate drives the SINGLE
+      # enforced predicate `tcp_connect_decision` (the same fn the closure calls, so tested == enforced)
+      # across all three capability-specific dimensions and asserts the marker + pass count catch a
+      # silent skip/rename. MUTATION-VERIFIED (the #503 convention): the SAME test re-run under each
+      # `BOATRAMP_TCPEGRESS_MUTATION` neuters ONE security check — `admit_unallowlisted` (bypass the
+      # allowlist), `admit_bind_listen` (drop connect-only), `drop_posture` (ignore the posture gate) —
+      # and MUST FAIL; a PASS-under-mutation (a hollow gate) fails the merge.
+      - name: "tcp-egress allowlist gate (connect-only, allowlisted, posture-gated)"
+        run: |
+          set -eo pipefail
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-handlers \
+            --features engine tcp_egress_allowlist_gate -- --nocapture 2>&1 | tee tcp-egress.log
+          grep -qE 'test result: ok\. 1 passed' tcp-egress.log \
+            || { echo "::error::tcp-egress gate did not run (silent skip or a failure)" >&2; exit 1; }
+          grep -q 'TCP-EGRESS ALLOWLIST OK' tcp-egress.log \
+            || { echo "::error::tcp-egress gate never reached its marker (a wasi:sockets connect-gate regression)" >&2; exit 1; }
+          # Mutation guard: each mutation MUST fail the gate (proving each check is load-bearing).
+          for mut in admit_unallowlisted admit_bind_listen drop_posture; do
+            if BOATRAMP_TCPEGRESS_MUTATION="$mut" cargo-zigbuild test --target x86_64-unknown-linux-musl \
+              -p boatramp-handlers --features engine tcp_egress_allowlist_gate \
+              -- --nocapture > "tcp-egress-mutation-$mut.log" 2>&1; then
+              echo "::error::tcp-egress gate is HOLLOW — it passed under mutation '$mut' (a wasi:sockets connect-gate security property is not actually enforced)" >&2
+              exit 1
+            else
+              echo "tcp-egress mutation verified: '$mut' fails the gate as expected."
+            fi
+          done
+
       # BLOB-READ FAULT-CLASS gate (boatramp-blob-read-error-granularity): a failed blob read
       # (`get`/`get_range`/`head`) must classify its concrete outcome — 404 / 403 AccessDenied / 416 /
       # throttle (503/429) / 5xx / transport — into DISTINCT kinds, so a 403 under-scoped credential or

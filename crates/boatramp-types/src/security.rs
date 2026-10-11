@@ -567,9 +567,11 @@ pub struct SecurityPosture {
     /// a test CA). Verification is still fully performed — this only widens the accepted CA set.
     pub allow_guest_egress_extra_ca: bool,
     /// Permit a **guest** handler's gated `wasi:sockets` capability to open an **outbound TCP
-    /// `connect`** (`PLAN-handler-tcp-egress`). Off under `multi-tenant` (the deny-by-default: the
-    /// capability is refused at deploy AND the runtime `socket_addr_check` denies every target); on
-    /// under `single-tenant`/`dev`. This is only the posture gate — a granted handler still reaches
+    /// `connect`** (`PLAN-handler-tcp-egress`). Off under `multi-tenant` (the deny-by-default: with
+    /// this off the engine installs NO permissive `socket_addr_check`, so the socket host's deny-all
+    /// default stands and every connect fails closed at RUNTIME — the capability is NOT refused at
+    /// deploy in this stage); on under `single-tenant`/`dev`. This is only the posture gate — a
+    /// granted handler still reaches
     /// ONLY its per-handler [`egress_allowlist`](crate::config::HandlerConfig::egress_allowlist)
     /// (empty ⇒ nothing), only `connect` (never `bind`/`listen` — inbound stays the container/
     /// microVM model), and even an allowlisted target is held to the `is_global_ip` SSRF floor

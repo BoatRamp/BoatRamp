@@ -32,6 +32,12 @@ blob-list-gate-mutation = []
 # pass handling (`deny_pass`) makes the `wasi:blobstore` `{tenant}` binding AND the legacy
 # `sql_marker` refuse again (the gate goes RED). Also under `cfg(test)`; NEVER in a shipped build.
 pass-gate-mutation = []
+# Anti-hollow gate lane for the gated `wasi:sockets` outbound-TCP connect gate (PLAN-handler-tcp-egress):
+# arms the `BOATRAMP_TCPEGRESS_MUTATION` seam (`engine::tcpegress_mutation`) so the CI gate can prove
+# each of the three security checks in `tcp_connect_decision` — allowlist membership, connect-only, and
+# the posture gate — goes RED when neutered (`admit_unallowlisted`/`admit_bind_listen`/`drop_posture`).
+# Also armed under `cfg(test)`; NEVER enabled in a shipped build (it only reads a test env var).
+tcpegress-gate-mutation = ["engine"]
 engine = [
   "dep:wasmtime",
   "dep:wasmtime-wasi",
