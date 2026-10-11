@@ -13,6 +13,7 @@
 use bytes::Bytes;
 use futures::stream::BoxStream;
 
+pub mod blob_backends;
 pub mod blob_provision;
 pub mod cache_coherence;
 #[cfg(feature = "authz")]
