@@ -125,6 +125,21 @@ pub enum ConfigError {
         /// A trailing remediation hint.
         cure: &'static str,
     },
+    /// A `[serve.listeners.<name>]` (host-owned inbound-TCP listener, PLAN-handler-tcp-inbound) is
+    /// invalid: a blank `component`, a non-positive `max_conns`/timeout, a declared-but-unsupported
+    /// `tls` block (Phase 1 is plaintext-only), or a non-empty `egress_allowlist` (a
+    /// `tcp-connection-host` guest imports only `wasi:io` — it cannot hold `wasi:sockets`). Refused at
+    /// config load (fail-closed, boot-LOUD) rather than binding a listener that would silently
+    /// mislead the operator.
+    #[error("inbound TCP listener {name:?}: {reason}{cure}")]
+    InvalidListener {
+        /// The offending listener key (the `listeners` map key).
+        name: String,
+        /// Why it was rejected.
+        reason: &'static str,
+        /// A trailing remediation hint (empty unless there is a concrete cure to point at).
+        cure: &'static str,
+    },
 }
 
 /// Project configuration, loaded from `project.cfg` (RON) in the project folder.
@@ -286,6 +301,7 @@ impl ServerConfig {
         };
         config.validate_sql_db_names()?;
         config.validate_blob_backend_projects()?;
+        config.validate_listeners()?;
         Ok(config)
     }
 
@@ -445,6 +461,9 @@ impl ServerConfig {
             }
             if let Some(v) = source.parse_bool("BOATRAMP_SECURITY_ALLOW_GUEST_TCP_EGRESS")? {
                 o.allow_guest_tcp_egress = Some(v);
+            }
+            if let Some(v) = source.parse_bool("BOATRAMP_SECURITY_ALLOW_GUEST_TCP_LISTENER")? {
+                o.allow_guest_tcp_listener = Some(v);
             }
             if let Some(v) = source.parse("BOATRAMP_SECURITY_MAX_HANDLER_BLOB_BYTES")? {
                 o.max_handler_blob_bytes = Some(v);
@@ -794,6 +813,46 @@ impl ServerConfig {
             }
         }
 
+        // --- serve inbound-TCP listeners (`[serve.listeners.<name>]`) ---
+        // PLAN-handler-tcp-inbound. A keyed map (like the SQL `databases` / blob `backends` maps) with
+        // no config file to enumerate its members, so listener NAMES are discovered from the
+        // environment: any `BOATRAMP_SERVE_LISTENER_<NAME>_<FIELD>` declares listener `<NAME>`. Each
+        // SCALAR field is merged per-field (env-over-file); the structured fields (imports/tenancy/env)
+        // and the Phase-1-refused `tls`/`egress_allowlist` are set only from the config file. The
+        // boot-LOUD `validate_listeners` still runs on the merged result (so an env-declared listener
+        // with a Phase-1-unsupported knob fails closed exactly like a file-declared one).
+        if source.any_with_prefix(LISTENER_ENV_PREFIX) {
+            let serve = self.serve.get_or_insert_with(ServeConfig::default);
+            for name in source.listener_names() {
+                let l = serve.listeners.entry(name.clone()).or_default();
+                let prefix = format!("{LISTENER_ENV_PREFIX}{name}_");
+                if let Some(v) = source.parse::<SocketAddr>(&format!("{prefix}BIND"))? {
+                    l.bind = Some(v);
+                }
+                if let Some(v) = source.get(&format!("{prefix}COMPONENT")) {
+                    l.component = v;
+                }
+                if let Some(v) = source.get(&format!("{prefix}PROJECT")) {
+                    l.project = v;
+                }
+                if let Some(v) = source.get(&format!("{prefix}SITE")) {
+                    l.site = v;
+                }
+                if let Some(v) = source.parse_list(&format!("{prefix}IMPORTS")) {
+                    l.imports = v;
+                }
+                if let Some(v) = source.parse::<usize>(&format!("{prefix}MAX_CONNS"))? {
+                    l.max_conns = Some(v);
+                }
+                if let Some(v) = source.parse::<u64>(&format!("{prefix}IDLE_TIMEOUT_MS"))? {
+                    l.idle_timeout_ms = Some(v);
+                }
+                if let Some(v) = source.parse::<u64>(&format!("{prefix}MAX_CONN_DURATION_MS"))? {
+                    l.max_conn_duration_ms = Some(v);
+                }
+            }
+        }
+
         // --- serve S3-ingress cloud brokering (`[serve.s3_ingress_cloud]`) ---
         // Env parity for the blob-upload minter's cloud-brokering policy, so a file-less fleet (e.g. the
         // Tigris presigned-only deployment, whose `boatramp.cfg` existed ONLY to carry
@@ -938,6 +997,10 @@ impl ServerConfig {
         // reserved `default` project (which always resolves the global `[serve]` backend). Runs on the
         // fully merged (file + env) map (PLAN-per-project-blob-backend).
         self.validate_blob_backend_projects()?;
+        // Fail closed (boot-LOUD) on an invalid `[serve.listeners.<name>]` — a blank component/project/
+        // site/bind, a non-positive cap/timeout, a Phase-1-unsupported `tls`/`egress_allowlist`. Runs on
+        // the fully merged (file + env) map (PLAN-handler-tcp-inbound).
+        self.validate_listeners()?;
         Ok(())
     }
 
@@ -1035,6 +1098,68 @@ impl ServerConfig {
         }
         Ok(())
     }
+
+    /// Validate every configured `[serve.listeners.<name>]` (PLAN-handler-tcp-inbound), fail-closed +
+    /// boot-LOUD on the fully merged (file + env) map. A host-owned inbound-TCP listener is a new,
+    /// unproven surface, so a half-declared or Phase-1-unsupported one REFUSES the node rather than
+    /// binding something that would silently mislead the operator:
+    /// - a blank `bind` / `component` / `project` / `site` (all required),
+    /// - a `max_conns` / `idle_timeout_ms` / `max_conn_duration_ms` explicitly set to `0`,
+    /// - a declared `tls` block (Phase 1 is plaintext-only — deferred fast-follow),
+    /// - a non-empty `egress_allowlist` (a `tcp-connection-host` guest imports only `wasi:io`; it
+    ///   cannot hold `wasi:sockets`, so per-listener outbound egress is a deferred follow-up).
+    fn validate_listeners(&self) -> Result<(), ConfigError> {
+        let Some(serve) = self.serve.as_ref() else {
+            return Ok(());
+        };
+        for (name, l) in &serve.listeners {
+            let err = |reason: &'static str, cure: &'static str| {
+                Err(ConfigError::InvalidListener {
+                    name: name.clone(),
+                    reason,
+                    cure,
+                })
+            };
+            if l.bind.is_none() {
+                return err("missing `bind` address", " — set `bind = \"0.0.0.0:<port>\"`");
+            }
+            if l.component.trim().is_empty() {
+                return err("missing `component` (the guest .wasm path)", "");
+            }
+            if l.project.trim().is_empty() {
+                return err("missing `project`", "");
+            }
+            if l.site.trim().is_empty() {
+                return err("missing `site`", "");
+            }
+            if l.max_conns == Some(0) {
+                return err("`max_conns` must be > 0", " — omit it for the default");
+            }
+            if l.idle_timeout_ms == Some(0) {
+                return err("`idle_timeout_ms` must be > 0", " — omit it for the default");
+            }
+            if l.max_conn_duration_ms == Some(0) {
+                return err(
+                    "`max_conn_duration_ms` must be > 0",
+                    " — omit it for the default",
+                );
+            }
+            if l.tls.is_some() {
+                return err(
+                    "per-listener TLS is not implemented in this release (plaintext-only)",
+                    " — terminate TLS in front of boatramp, or remove the `tls` block",
+                );
+            }
+            if !l.egress_allowlist.is_empty() {
+                return err(
+                    "per-listener outbound `egress_allowlist` is not supported (a tcp-connection-host \
+                     guest imports only wasi:io — it cannot hold wasi:sockets)",
+                    " — remove `egress_allowlist`",
+                );
+            }
+        }
+        Ok(())
+    }
 }
 
 /// The `BOATRAMP_*` variables that populate the `[compute]` section. Kept as one
@@ -1068,6 +1193,7 @@ const SECURITY_ENV_VARS: &[&str] = &[
     "BOATRAMP_SECURITY_ALLOW_GUEST_SELF_EGRESS",
     "BOATRAMP_SECURITY_ALLOW_GUEST_EGRESS_EXTRA_CA",
     "BOATRAMP_SECURITY_ALLOW_GUEST_TCP_EGRESS",
+    "BOATRAMP_SECURITY_ALLOW_GUEST_TCP_LISTENER",
     "BOATRAMP_SECURITY_MAX_HANDLER_BLOB_BYTES",
     "BOATRAMP_SECURITY_MAX_COMPONENT_BYTES",
     "BOATRAMP_SECURITY_OIDC_REQUIRE_AUDIENCE",
@@ -1200,6 +1326,28 @@ const BLOB_BACKEND_FIELD_SUFFIXES: &[&str] = &[
     "_S3_BUCKET",
     "_S3_REGION",
     "_KIND",
+];
+
+/// The fixed prefix of a keyed `[serve.listeners.<name>]` variable —
+/// `BOATRAMP_SERVE_LISTENER_<NAME>_<FIELD>` (PLAN-handler-tcp-inbound). Listener names aren't known
+/// ahead of time (there is no config file to enumerate them under env-only config), so they are
+/// discovered by scanning the environment for this prefix — mirroring [`BLOB_BACKEND_ENV_PREFIX`].
+const LISTENER_ENV_PREFIX: &str = "BOATRAMP_SERVE_LISTENER_";
+
+/// The recognised `_<FIELD>` suffixes of a `[serve.listeners]` variable, ordered so a name-isolating
+/// strip matches the **longest** suffix first (so `_MAX_CONN_DURATION_MS` wins over `_MAX_CONNS`). Each
+/// mirrors a SCALAR field of [`ListenerConfig`]; the structured fields (`imports`/`env`/`tenancy`) and
+/// the Phase-1-refused `tls`/`egress_allowlist` are set only from the config file. `_IMPORTS` is a
+/// comma-separated list. Kept in sync by the `listener_env_covers_every_field` forgot-a-knob guard.
+const LISTENER_FIELD_SUFFIXES: &[&str] = &[
+    "_MAX_CONN_DURATION_MS",
+    "_IDLE_TIMEOUT_MS",
+    "_MAX_CONNS",
+    "_COMPONENT",
+    "_IMPORTS",
+    "_PROJECT",
+    "_BIND",
+    "_SITE",
 ];
 
 /// The `BOATRAMP_*` variables that populate the `[secrets]` section (excluding the
@@ -1360,6 +1508,29 @@ impl EnvSource {
             .filter_map(|n| {
                 let rest = n.strip_prefix(BLOB_BACKEND_ENV_PREFIX)?;
                 BLOB_BACKEND_FIELD_SUFFIXES
+                    .iter()
+                    .find_map(|suffix| rest.strip_suffix(suffix))
+                    .filter(|name| !name.is_empty())
+                    .map(str::to_string)
+            })
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    /// The distinct `<NAME>` tokens of every `BOATRAMP_SERVE_LISTENER_<NAME>_<FIELD>` variable that is
+    /// set (PLAN-handler-tcp-inbound). The name is everything between the fixed prefix and the *last*
+    /// `_<FIELD>` segment (suffixes matched longest-first), so a listener name may itself contain
+    /// underscores. Returned sorted + de-duplicated so the map is built deterministically. Mirrors
+    /// [`Self::blob_backend_projects`].
+    fn listener_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .names()
+            .filter(|n| n.starts_with(LISTENER_ENV_PREFIX) && self.get(n).is_some())
+            .filter_map(|n| {
+                let rest = n.strip_prefix(LISTENER_ENV_PREFIX)?;
+                LISTENER_FIELD_SUFFIXES
                     .iter()
                     .find_map(|suffix| rest.strip_suffix(suffix))
                     .filter(|name| !name.is_empty())
@@ -2549,7 +2720,106 @@ pub struct ServeConfig {
     /// [`DEFAULT_KV_CHECKPOINT_INTERVAL_SECS`], close budget [`DEFAULT_KV_CLOSE_DEADLINE_SECS`]).
     /// See [`KvConfig`].
     pub kv: Option<KvConfig>,
+    /// `[serve.listeners.<name>]` — host-owned **inbound-TCP listeners** (PLAN-handler-tcp-inbound).
+    /// Each declares a bind address + a target guest `tcp-connection-handler` component (pinned to a
+    /// project + site + Dimension-0 tenancy): the node binds + listens + accepts and re-enters the
+    /// guest once per ALREADY-ACCEPTED connection, handing it only the connection's `wasi:io` streams
+    /// (the guest NEVER receives `wasi:sockets`). GATED on the posture `allow_guest_tcp_listener` (off
+    /// under multi-tenant) AND the declaration here — both must hold. Empty ⇒ no listeners (the common
+    /// case; serving is byte-for-byte unchanged). Env parity: `BOATRAMP_SERVE_LISTENER_<NAME>_*`. See
+    /// [`ListenerConfig`].
+    #[serde(default)]
+    pub listeners: BTreeMap<String, ListenerConfig>,
 }
+
+/// `[serve.listeners.<name>]` — a **host-owned inbound-TCP listener** (PLAN-handler-tcp-inbound). The
+/// node binds + listens + accepts on `bind` and dispatches each accepted connection to the guest
+/// `component`'s `tcp-connection-handler` export, with tenancy OPERATOR-PINNED here (a raw socket
+/// carries no Host/path/principal, so there is nothing per-connection to resolve). The guest is handed
+/// only the connection's `wasi:io` byte streams — it holds NO `wasi:sockets` authority (bind stays
+/// host-side). Modeled on [`boatramp_core::function::FunctionConfig`] / the session route config.
+///
+/// Phase 1 is **plaintext-only** and **no per-listener egress**: a declared `tls` block or a non-empty
+/// `egress_allowlist` is REFUSED at config load (fail-closed, boot-LOUD) rather than silently ignored —
+/// per-listener host-TLS and outbound egress are deferred follow-ups. See [`validate_listeners`].
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ListenerConfig {
+    /// The address the node binds + listens + accepts on (e.g. `0.0.0.0:9000`). **Required** (a blank
+    /// `bind` is refused at config load).
+    pub bind: Option<SocketAddr>,
+    /// Path to the guest `.wasm` within the pinned site's deployment (exports `tcp-connection-handler`).
+    /// **Required**.
+    pub component: String,
+    /// The project this listener's component is deployed under (host-resolved, never guest input). The
+    /// active deployment of `project`/`site` is what the accept loop serves. **Required**.
+    pub project: String,
+    /// The site within `project` whose active deployment holds `component`. **Required**.
+    pub site: String,
+    /// Requested capabilities (interface names; see `KNOWN_IMPORTS`). A listener component declares
+    /// whatever `sql`/`orm`/`kv`/… it uses per connection — NOT `wasi:sockets` (the host owns the
+    /// socket; a `tcp-connection-host` guest imports only `wasi:io`, handed the accepted streams).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub imports: Vec<String>,
+    /// Static environment variables injected into the component (never secrets).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
+    /// DEFERRED (Phase 1): a per-listener outbound-TCP allowlist. A `tcp-connection-host` guest imports
+    /// ONLY `wasi:io` — it cannot hold `wasi:sockets` — so this is unusable in Phase 1 and a non-empty
+    /// value is REFUSED at config load (fail-closed) rather than silently dropped. Kept for forward
+    /// parity with the handler/session `egress_allowlist`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub egress_allowlist: Vec<String>,
+    /// Operator-pinned Dimension-0 tenancy for this listener's `sql`/`orm` (resolved once from this
+    /// config, carried on every connection — nothing per-connection to resolve from). Absent ⇒ plain
+    /// (project = database).
+    #[serde(
+        default,
+        deserialize_with = "boatramp_core::tenancy::de_opt_tenancy",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub tenancy: Option<boatramp_core::tenancy::Tenancy>,
+    /// DEFERRED (Phase 1): per-listener host-TLS. Phase 1 ships plaintext-only; a declared `tls` block
+    /// is REFUSED at config load (fail-closed) so an operator is never misled into thinking a listener
+    /// terminates TLS when it does not. Terminate TLS in front of boatramp, or wait for the fast-follow.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls: Option<ListenerTlsConfig>,
+    /// Cap on simultaneously-live connections for THIS listener (a per-listener DoS bound on top of the
+    /// engine's conn-lane ceiling). `0` is refused; absent ⇒ [`DEFAULT_LISTENER_MAX_CONNS`].
+    pub max_conns: Option<usize>,
+    /// Tear a connection down after this many milliseconds with NO bytes in either direction (idle
+    /// timeout — the conn lane replaces the per-invocation epoch deadline with this). `0` is refused;
+    /// absent ⇒ [`DEFAULT_LISTENER_IDLE_TIMEOUT_MS`].
+    pub idle_timeout_ms: Option<u64>,
+    /// Absolute cap (milliseconds) on a single connection's lifetime regardless of activity. `0` is
+    /// refused; absent ⇒ [`DEFAULT_LISTENER_MAX_CONN_DURATION_MS`].
+    pub max_conn_duration_ms: Option<u64>,
+}
+
+/// DEFERRED (Phase 1): per-listener host-TLS material. Present in the schema for forward parity, but a
+/// declared `tls` block is REFUSED at config load in Phase 1 (plaintext-only) — see [`ListenerConfig`].
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ListenerTlsConfig {
+    /// PEM certificate chain path.
+    pub cert_file: Option<PathBuf>,
+    /// PEM private-key path.
+    pub key_file: Option<PathBuf>,
+}
+
+/// Default per-listener live-connection cap when `[serve.listeners.<name>] max_conns` is unset
+/// (PLAN-handler-tcp-inbound). 256 — a generous but bounded ceiling on top of the engine conn lane.
+pub const DEFAULT_LISTENER_MAX_CONNS: usize = 256;
+
+/// Default per-listener idle timeout (ms) when `idle_timeout_ms` is unset — 60s. A connection with no
+/// bytes in either direction for this long is torn down (so a connection that opens and sends nothing
+/// can't hold a store + instance + conn-lane permit forever).
+pub const DEFAULT_LISTENER_IDLE_TIMEOUT_MS: u64 = 60_000;
+
+/// Default per-listener absolute max-connection-duration (ms) when `max_conn_duration_ms` is unset —
+/// 1h. Bounds a single connection's lifetime regardless of activity (CPU is wall-clock-bounded here,
+/// since the conn lane disables the per-invocation CPU-fuel budget).
+pub const DEFAULT_LISTENER_MAX_CONN_DURATION_MS: u64 = 3_600_000;
 
 /// `[serve.s3_credential]` — a **node-level base S3 credential source** (#505) sourcing the base AWS
 /// credential from boatramp's `[secrets]` sealed store rather than the ambient env chain. Consumed by
@@ -3774,6 +4044,9 @@ mod tests {
             ("BOATRAMP_SECURITY_ALLOW_GUEST_TCP_EGRESS", |p| {
                 p.allow_guest_tcp_egress
             }),
+            ("BOATRAMP_SECURITY_ALLOW_GUEST_TCP_LISTENER", |p| {
+                p.allow_guest_tcp_listener
+            }),
             ("BOATRAMP_SECURITY_ALLOW_GUEST_ADMIN_DOMAINS", |p| {
                 p.allow_guest_admin_domains
             }),
@@ -4208,6 +4481,100 @@ mod tests {
             BLOB_BACKEND_FIELD_SUFFIXES.len(),
             expected.len(),
             "BLOB_BACKEND_FIELD_SUFFIXES has a suffix with no matching expected field (stale lever)"
+        );
+    }
+
+    #[test]
+    fn env_wires_an_inbound_tcp_listener_with_no_file() {
+        // PLAN-handler-tcp-inbound: a keyed `[serve.listeners.<name>]` map discovered from env with NO
+        // config file (mirrors the blob-backend map). The listener name may contain underscores (name
+        // isolation strips the LONGEST field suffix — `edge_api` survives).
+        let mut cfg = ServerConfig::default();
+        assert!(cfg.serve.is_none());
+        cfg.apply_env_overrides(&env(&[
+            ("BOATRAMP_SERVE_LISTENER_edge_api_BIND", "0.0.0.0:9000"),
+            ("BOATRAMP_SERVE_LISTENER_edge_api_COMPONENT", "echo.wasm"),
+            ("BOATRAMP_SERVE_LISTENER_edge_api_PROJECT", "acme"),
+            ("BOATRAMP_SERVE_LISTENER_edge_api_SITE", "prod"),
+            ("BOATRAMP_SERVE_LISTENER_edge_api_IMPORTS", "sql,wasi:keyvalue"),
+            ("BOATRAMP_SERVE_LISTENER_edge_api_MAX_CONNS", "32"),
+            ("BOATRAMP_SERVE_LISTENER_edge_api_IDLE_TIMEOUT_MS", "15000"),
+            (
+                "BOATRAMP_SERVE_LISTENER_edge_api_MAX_CONN_DURATION_MS",
+                "120000",
+            ),
+        ]))
+        .expect("valid inbound-TCP listener env overrides apply + validate");
+        let serve = cfg.serve.expect("serve materialised from env");
+        let l = serve
+            .listeners
+            .get("edge_api")
+            .expect("the edge_api listener was discovered from env (underscore survives isolation)");
+        assert_eq!(l.bind, Some("0.0.0.0:9000".parse().unwrap()));
+        assert_eq!(l.component, "echo.wasm");
+        assert_eq!(l.project, "acme");
+        assert_eq!(l.site, "prod");
+        assert_eq!(l.imports, vec!["sql".to_string(), "wasi:keyvalue".to_string()]);
+        assert_eq!(l.max_conns, Some(32));
+        assert_eq!(l.idle_timeout_ms, Some(15000));
+        assert_eq!(l.max_conn_duration_ms, Some(120000));
+    }
+
+    #[test]
+    fn listener_validation_fails_closed() {
+        // A half-declared or Phase-1-unsupported listener REFUSES the node (boot-LOUD), never binds
+        // something that would silently mislead the operator (PLAN-handler-tcp-inbound).
+        // (a) a missing bind.
+        let err = ServerConfig::parse(
+            r#"( serve: ( listeners: { "l": ( component: "c.wasm", project: "p", site: "s" ) } ) )"#,
+        )
+        .expect_err("a listener with no bind must be refused");
+        assert!(matches!(err, ConfigError::InvalidListener { .. }), "{err:?}");
+        // (b) a Phase-1-unsupported `tls` block.
+        let err = ServerConfig::parse(
+            r#"( serve: ( listeners: { "l": ( bind: "0.0.0.0:9000", component: "c.wasm", project: "p", site: "s", tls: ( cert_file: "x.pem", key_file: "y.pem" ) ) } ) )"#,
+        )
+        .expect_err("a declared tls block must be refused in Phase 1 (plaintext-only)");
+        assert!(matches!(err, ConfigError::InvalidListener { .. }), "{err:?}");
+        // (c) a non-empty egress_allowlist (a tcp-connection-host guest can't hold wasi:sockets).
+        let err = ServerConfig::parse(
+            r#"( serve: ( listeners: { "l": ( bind: "0.0.0.0:9000", component: "c.wasm", project: "p", site: "s", egress_allowlist: ["x:443"] ) } ) )"#,
+        )
+        .expect_err("a non-empty per-listener egress_allowlist must be refused in Phase 1");
+        assert!(matches!(err, ConfigError::InvalidListener { .. }), "{err:?}");
+        // (d) a valid listener parses.
+        ServerConfig::parse(
+            r#"( serve: ( listeners: { "l": ( bind: "0.0.0.0:9000", component: "c.wasm", project: "p", site: "s" ) } ) )"#,
+        )
+        .expect("a fully-declared plaintext listener is valid");
+    }
+
+    #[test]
+    fn listener_env_covers_every_scalar_field() {
+        // Forgot-a-knob guard (mirrors the blob-backend guard): every SCALAR field of `ListenerConfig`
+        // with an env lever MUST have a suffix in `LISTENER_FIELD_SUFFIXES`, so a newly added scalar
+        // can't silently lose its env knob. (The structured `imports`/`env`/`tenancy` + Phase-1-refused
+        // `tls`/`egress_allowlist` are deliberately file-only; `_IMPORTS` is the one list lever.)
+        let expected: &[&str] = &[
+            "_BIND",
+            "_COMPONENT",
+            "_PROJECT",
+            "_SITE",
+            "_IMPORTS",
+            "_MAX_CONNS",
+            "_IDLE_TIMEOUT_MS",
+            "_MAX_CONN_DURATION_MS",
+        ];
+        for suffix in expected {
+            assert!(
+                LISTENER_FIELD_SUFFIXES.contains(suffix),
+                "{suffix} missing from LISTENER_FIELD_SUFFIXES — a listener field lost its env lever"
+            );
+        }
+        assert_eq!(
+            LISTENER_FIELD_SUFFIXES.len(),
+            expected.len(),
+            "LISTENER_FIELD_SUFFIXES has a suffix with no matching expected field (stale lever)"
         );
     }
 
