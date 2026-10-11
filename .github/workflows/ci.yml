@@ -568,6 +568,24 @@ jobs:
             fi
           done
 
+      # PLAN-handler-tcp-inbound TCP-LISTENER LIVE GATE (marker `TCP-LISTENER LIVE OK`). Dynamically
+      # proves the REAL inbound-TCP byte path against REAL compiled guest components (tcp-echo.wasm /
+      # tcp-spin.wasm) over REAL loopback sockets: (a) echo round-trip, (b) idle-timeout teardown,
+      # (c) MAX-DURATION preemption of a NON-YIELDING compute-bound guest (THE HIGH-fix proof — the
+      # conn-lane epoch-yield is what lets the host watchdog drop a spinning fiber; without it this
+      # HANGS), (d) peer-drop cleanup. Each scenario asserts within a bounded wall-clock, so a
+      # regression turns the test RED rather than hanging CI. The gate greps the success marker + the
+      # pass count, so a silent skip/compile-out fails the job.
+      - name: "tcp-listener live gate (echo / idle / spin-preempt / peer-drop)"
+        run: |
+          set -eo pipefail
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-server \
+            --features tcp-listener --test tcp_listener_live -- --nocapture 2>&1 | tee tcp-listener-live.log
+          grep -qE 'test result: ok\. 1 passed' tcp-listener-live.log \
+            || { echo "::error::tcp-listener live gate did not run (silent skip or a failure)" >&2; exit 1; }
+          grep -q 'TCP-LISTENER LIVE OK' tcp-listener-live.log \
+            || { echo "::error::tcp-listener live gate never reached its marker (an inbound-TCP serve-path regression — likely the conn-lane epoch-yield/teardown)" >&2; exit 1; }
+
       # BLOB-READ FAULT-CLASS gate (boatramp-blob-read-error-granularity): a failed blob read
       # (`get`/`get_range`/`head`) must classify its concrete outcome — 404 / 403 AccessDenied / 416 /
       # throttle (503/429) / 5xx / transport — into DISTINCT kinds, so a 403 under-scoped credential or
