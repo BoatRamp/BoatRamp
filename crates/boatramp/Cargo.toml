@@ -65,6 +65,7 @@ default = [
   # grant), so compiling it in enables minting for no one by itself.
   "blob-upload-cloud",
   "session",
+  "tcp-listener",
   "cluster",
   "operator",
   "mcp",
@@ -241,6 +242,11 @@ blob-upload-azure = [
 ]
 blob-upload-cloud = ["blob-upload-aws", "blob-upload-gcs", "blob-upload-azure"]
 session = ["handlers", "boatramp-server/session"]
+# Host-owned inbound-TCP listeners (`[serve.listeners.<name>]`, PLAN-handler-tcp-inbound): the serve
+# `spawn_listeners` accept loop + the `tcp-connection-host` conn-lane dispatch. Implies `handlers`.
+# Experimental; batteries-included in the default build (runtime-opt-in via the posture + a declared
+# `[serve.listeners.<name>]`, so compiling it in binds nothing by itself).
+tcp-listener = ["handlers", "boatramp-server/tcp-listener"]
 # Self-hosted **cluster mode** (`boatramp serve --mode cluster`): embedded Raft
 # over the HTTP peer mesh, durable per-node Raft stores, and the RaftKv /
 # RaftMessaging serving facades. Pulls boatramp-cluster +

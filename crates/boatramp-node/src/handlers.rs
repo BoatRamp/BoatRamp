@@ -190,6 +190,11 @@ pub async fn build_handler_runtime(
     // (`PLAN-handler-tcp-egress`). Off under multi-tenant; when off the engine installs no permissive
     // socket check, so every connect fails closed regardless of a handler's `egress_allowlist`.
     allow_guest_tcp_egress: bool,
+    // Posture: whether host-owned inbound-TCP listeners (`[serve.listeners.<name>]`) may dispatch an
+    // accepted connection to a guest `tcp-connection-handler` (`PLAN-handler-tcp-inbound`). Off under
+    // multi-tenant; when off the engine refuses every listener dispatch. INDEPENDENT of
+    // `allow_guest_tcp_egress` (inbound ≠ outbound) and NEVER grants the guest `wasi:sockets`.
+    allow_guest_tcp_listener: bool,
     // Posture: the instance's own serve socket(s) a guest self-call may reach (empty ⇒ off).
     self_egress_addrs: Vec<std::net::SocketAddr>,
     // Dev-posture guest-egress extra CA(s), DER-encoded (empty ⇒ stock webpki-only egress trust).
@@ -425,6 +430,7 @@ pub async fn build_handler_runtime(
     .with_outbound_timeout(outbound_timeout)
     .with_private_egress(allow_guest_private_egress)
     .with_tcp_egress(allow_guest_tcp_egress)
+    .with_tcp_listener(allow_guest_tcp_listener)
     .with_self_egress(self_egress_addrs)
     .with_guest_egress_extra_roots(guest_egress_extra_roots);
     let sql = build_sql_backends(
@@ -857,6 +863,10 @@ pub async fn build_handler_runtime(
     // node.rs caller (the caller passes the posture value unconditionally); a lean
     // node has no guest TCP-egress to gate, so it is ignored.
     _allow_guest_tcp_egress: bool,
+    // Kept in lockstep with the `#[cfg(feature = "handlers")]` signature + the single
+    // node.rs caller (the caller passes the posture value unconditionally); a lean
+    // node has no guest listener to dispatch, so it is ignored.
+    _allow_guest_tcp_listener: bool,
     _self_egress_addrs: Vec<std::net::SocketAddr>,
     // Kept in lockstep with the `#[cfg(feature = "handlers")]` signature + the single
     // node.rs caller (the caller passes the posture value unconditionally); a lean

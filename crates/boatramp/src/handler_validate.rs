@@ -133,6 +133,16 @@ mod imp {
             // every connect fails closed) AND a non-empty per-handler `egress_allowlist`.
             // `connect`-only: `bind`/`listen` stay denied in the runtime gate.
             ("wasi:sockets", _) => Some("wasi:sockets"),
+            // Host-owned inbound-TCP **listener** capability (`PLAN-handler-tcp-inbound`). A listener's
+            // guest EXPORTS `tcp-connection-handler` (an export, so normally not on the import path) and
+            // `use`s `tcp-connection-types`; both label as the `tcp-listener` token here so a component
+            // referencing them is declaration-gated like any other capability rather than refused as a
+            // "disallowed interface". The guest imports NO `wasi:sockets` (the host owns the socket and
+            // hands it only `wasi:io` streams); reaching anything additionally needs, at RUNTIME, the
+            // posture `allow_guest_tcp_listener` AND an operator-declared `[serve.listeners.<name>]`.
+            ("boatramp:handlers", "tcp-connection-types" | "tcp-connection-handler") => {
+                Some("tcp-listener")
+            }
             // `orm` is a **typed view of the same `sql` capability** — it runs on the
             // same per-invocation SQL session/backend and `use`s `sql-types`. So it
             // is the `sql` token: declaring `sql` grants orm (and inherits the
@@ -197,7 +207,7 @@ mod imp {
     /// function-manifest `requires`, checked at deploy — see
     /// `PLAN-capability-contract-versioning-v2`. Bump when the capability surface
     /// changes so operators can see it; it links nothing.
-    const HOST_HANDLERS_VERSION: (u64, u64, u64) = (0, 6, 0);
+    const HOST_HANDLERS_VERSION: (u64, u64, u64) = (0, 7, 0);
 
     /// The capability surface a host advertises (see the crate-level re-export).
     #[derive(Debug, serde::Serialize)]
