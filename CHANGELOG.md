@@ -5,6 +5,38 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.31.0] - 2026-10-12
+
+Inbound/listening TCP for guest handlers — the sequel to v0.30.0's outbound egress. A node can now
+accept raw TCP connections and hand them to a guest component, so a handler can serve a non-HTTP
+protocol (POP3/IMAP/SMTP/LMTP, a custom-protocol broker). Experimental, opt-in, and fail-closed; an
+all-default deployment is unchanged.
+
+- **Host-owned declarative TCP listeners (`[serve.listeners.<name>]`).** The **node** (operator
+  authority) binds + listens + accepts on a declared bind address and hands each *already-accepted*
+  connection to a target guest component as `wasi:io` `input-stream` / `output-stream` resources. The
+  **guest receives no `wasi:sockets` authority** — it imports only `wasi:io/streams` and holds no
+  bind/listen/connect capability, so the operator (not an untrusted site writer) owns every socket.
+  This is why inbound is safe to offer at all. The new guest world `tcp-connection-host` exports
+  `handle(peer, input, output)`; peer address is informational only. Tenancy is **operator-pinned** in
+  the listener config (a raw socket has no Host/path/principal to resolve from). Phase 1 is
+  plaintext-only; `tls` and any non-empty `egress_allowlist` on a listener are **refused at config
+  load** (boot-loud), not silently ignored.
+- **Posture + two-gate dispatch.** A new posture flag `allow_guest_tcp_listener` gates the feature —
+  **off by default under `multi-tenant`**, on under `single-tenant`/`dev`. A connection is dispatched
+  only when the operator has **declared** the listener **and** the posture flag is on.
+- **Connection lifecycle / DoS containment.** Each connection runs under a dedicated conn lane with a
+  per-listener `max_conns` cap, an **idle timeout and a max-connection-duration timeout**, and the
+  memory ceiling. The conn lane uses cooperative epoch-yield (not the per-invocation epoch deadline)
+  so a compute-bound guest that makes no suspending host call is still preempted at
+  `max_conn_duration` — proven by a live integration gate that tears down a busy-looping guest, and a
+  security review that specifically drove this path.
+- **Admission.** `tcp-listener` is advertised as an Experimental capability feature and requires
+  `requires = ["tcp-listener"]`, so a deploy against a pre-feature host is refused cleanly (host
+  handler-contract version 0.6 → 0.7). The guest-side `boatramp-uchron-shim` ships a matching
+  `tcp-listener` capability the same cycle. Inbound UDP and guest-driven `bind`/`listen` remain
+  future work.
+
 ## [0.30.0] - 2026-10-11
 
 Two capability features, built and security-reviewed in parallel: per-project blob backends, and
