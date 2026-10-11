@@ -149,6 +149,14 @@ pub struct FunctionConfig {
     /// Only consulted when `imports` contains `wasi:blobstore`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub blobstore_containers: Vec<String>,
+    /// Per-component **outbound-TCP allowlist** for the gated `wasi:sockets` capability (same contract
+    /// as [`crate::config::HandlerConfig::egress_allowlist`]): the `host:port` / `ip:port` /
+    /// `CIDR:port` targets this function may `connect` to. **Empty ⇒ deny-all.** A standalone
+    /// top-level function opts into outbound TCP by naming targets here; the engine's
+    /// `socket_addr_check` then enforces it connect-only + SSRF-floored, and ONLY when the node
+    /// posture `allow_guest_tcp_egress` is on. Only consulted when `imports` contains `wasi:sockets`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub egress_allowlist: Vec<String>,
     /// The site a **standalone top-level function** mints blob-upload credentials for
     /// (`boatramp:handlers/blob-upload`, S3 external ingress). A site handler mints for its own
     /// host-routed site, but a standalone function has no single resolved site — so it names one here,
@@ -253,6 +261,8 @@ impl FunctionConfig {
             upload_containers: h.upload_containers.clone(),
             // Carry the handler's plain-`wasi:blobstore` container allowlist likewise (grant parity).
             blobstore_containers: h.blobstore_containers.clone(),
+            // Carry the handler's outbound-TCP `egress_allowlist` likewise (gated `wasi:sockets` parity).
+            egress_allowlist: h.egress_allowlist.clone(),
             // A desugared handler-function runs on the site-handler dispatch path, where the site is
             // host-ROUTED (not config-declared) — so it has no `blob_upload_site` of its own. The
             // `blob_upload_site` field is exclusively the STANDALONE top-level function's way to name
@@ -279,6 +289,8 @@ impl FunctionConfig {
             upload_containers: c.upload_containers.clone(),
             // Carry the consumer's plain-`wasi:blobstore` container allowlist likewise.
             blobstore_containers: c.blobstore_containers.clone(),
+            // Carry the consumer's outbound-TCP `egress_allowlist` likewise (gated `wasi:sockets`).
+            egress_allowlist: c.egress_allowlist.clone(),
             ..Default::default()
         }
     }
