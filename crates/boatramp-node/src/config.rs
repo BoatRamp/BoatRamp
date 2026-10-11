@@ -1121,7 +1121,10 @@ impl ServerConfig {
                 })
             };
             if l.bind.is_none() {
-                return err("missing `bind` address", " — set `bind = \"0.0.0.0:<port>\"`");
+                return err(
+                    "missing `bind` address",
+                    " — set `bind = \"0.0.0.0:<port>\"`",
+                );
             }
             if l.component.trim().is_empty() {
                 return err("missing `component` (the guest .wasm path)", "");
@@ -1136,7 +1139,10 @@ impl ServerConfig {
                 return err("`max_conns` must be > 0", " — omit it for the default");
             }
             if l.idle_timeout_ms == Some(0) {
-                return err("`idle_timeout_ms` must be > 0", " — omit it for the default");
+                return err(
+                    "`idle_timeout_ms` must be > 0",
+                    " — omit it for the default",
+                );
             }
             if l.max_conn_duration_ms == Some(0) {
                 return err(
@@ -4496,7 +4502,10 @@ mod tests {
             ("BOATRAMP_SERVE_LISTENER_edge_api_COMPONENT", "echo.wasm"),
             ("BOATRAMP_SERVE_LISTENER_edge_api_PROJECT", "acme"),
             ("BOATRAMP_SERVE_LISTENER_edge_api_SITE", "prod"),
-            ("BOATRAMP_SERVE_LISTENER_edge_api_IMPORTS", "sql,wasi:keyvalue"),
+            (
+                "BOATRAMP_SERVE_LISTENER_edge_api_IMPORTS",
+                "sql,wasi:keyvalue",
+            ),
             ("BOATRAMP_SERVE_LISTENER_edge_api_MAX_CONNS", "32"),
             ("BOATRAMP_SERVE_LISTENER_edge_api_IDLE_TIMEOUT_MS", "15000"),
             (
@@ -4506,15 +4515,17 @@ mod tests {
         ]))
         .expect("valid inbound-TCP listener env overrides apply + validate");
         let serve = cfg.serve.expect("serve materialised from env");
-        let l = serve
-            .listeners
-            .get("edge_api")
-            .expect("the edge_api listener was discovered from env (underscore survives isolation)");
+        let l = serve.listeners.get("edge_api").expect(
+            "the edge_api listener was discovered from env (underscore survives isolation)",
+        );
         assert_eq!(l.bind, Some("0.0.0.0:9000".parse().unwrap()));
         assert_eq!(l.component, "echo.wasm");
         assert_eq!(l.project, "acme");
         assert_eq!(l.site, "prod");
-        assert_eq!(l.imports, vec!["sql".to_string(), "wasi:keyvalue".to_string()]);
+        assert_eq!(
+            l.imports,
+            vec!["sql".to_string(), "wasi:keyvalue".to_string()]
+        );
         assert_eq!(l.max_conns, Some(32));
         assert_eq!(l.idle_timeout_ms, Some(15000));
         assert_eq!(l.max_conn_duration_ms, Some(120000));
@@ -4529,19 +4540,28 @@ mod tests {
             r#"( serve: ( listeners: { "l": ( component: "c.wasm", project: "p", site: "s" ) } ) )"#,
         )
         .expect_err("a listener with no bind must be refused");
-        assert!(matches!(err, ConfigError::InvalidListener { .. }), "{err:?}");
+        assert!(
+            matches!(err, ConfigError::InvalidListener { .. }),
+            "{err:?}"
+        );
         // (b) a Phase-1-unsupported `tls` block.
         let err = ServerConfig::parse(
             r#"( serve: ( listeners: { "l": ( bind: "0.0.0.0:9000", component: "c.wasm", project: "p", site: "s", tls: ( cert_file: "x.pem", key_file: "y.pem" ) ) } ) )"#,
         )
         .expect_err("a declared tls block must be refused in Phase 1 (plaintext-only)");
-        assert!(matches!(err, ConfigError::InvalidListener { .. }), "{err:?}");
+        assert!(
+            matches!(err, ConfigError::InvalidListener { .. }),
+            "{err:?}"
+        );
         // (c) a non-empty egress_allowlist (a tcp-connection-host guest can't hold wasi:sockets).
         let err = ServerConfig::parse(
             r#"( serve: ( listeners: { "l": ( bind: "0.0.0.0:9000", component: "c.wasm", project: "p", site: "s", egress_allowlist: ["x:443"] ) } ) )"#,
         )
         .expect_err("a non-empty per-listener egress_allowlist must be refused in Phase 1");
-        assert!(matches!(err, ConfigError::InvalidListener { .. }), "{err:?}");
+        assert!(
+            matches!(err, ConfigError::InvalidListener { .. }),
+            "{err:?}"
+        );
         // (d) a valid listener parses.
         ServerConfig::parse(
             r#"( serve: ( listeners: { "l": ( bind: "0.0.0.0:9000", component: "c.wasm", project: "p", site: "s" ) } ) )"#,

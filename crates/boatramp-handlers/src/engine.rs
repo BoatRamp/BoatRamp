@@ -1077,8 +1077,8 @@ async fn conn_watchdog(
     // Poll at a fraction of the SHORTER of the two windows (bounded) so EITHER a short idle_timeout OR
     // a short max_conn_duration is observed promptly — an idle-only tick would miss a max-duration far
     // shorter than idle (and vice-versa).
-    let tick =
-        (idle_timeout.min(max_conn_duration) / 4).clamp(Duration::from_millis(50), Duration::from_secs(5));
+    let tick = (idle_timeout.min(max_conn_duration) / 4)
+        .clamp(Duration::from_millis(50), Duration::from_secs(5));
     loop {
         tokio::time::sleep(tick).await;
         let idle_for = last_activity
@@ -1151,10 +1151,7 @@ impl<T: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for IdleTracked<T> 
         }
         r
     }
-    fn poll_flush(
-        mut self: Pin<&mut Self>,
-        cx: &mut TaskContext<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
         Pin::new(&mut self.inner).poll_flush(cx)
     }
     fn poll_shutdown(
@@ -1234,7 +1231,8 @@ pub struct HandlerEngine {
     /// Separate compile cache for tcp-connection (`tcp-connection-handler` export) components
     /// (PLAN-handler-tcp-inbound) — a different world than the request `ProxyPre` / session cache.
     #[cfg(feature = "tcp-listener")]
-    tcp_connection_cache: Mutex<LruCache<String, tcp_connection_world::TcpConnectionHostPre<HostState>>>,
+    tcp_connection_cache:
+        Mutex<LruCache<String, tcp_connection_world::TcpConnectionHostPre<HostState>>>,
     /// The **inbound-TCP connection lane** concurrency gate (PLAN-handler-tcp-inbound): a dedicated
     /// pool so a burst of long-lived listener connections can never exhaust the sync request pool nor
     /// starve the async drain. Each live connection holds one permit for its whole life (a single
@@ -2169,8 +2167,9 @@ impl HandlerEngine {
             .build_linker()?
             .instantiate_pre(&component)
             .map_err(|err| HandlerError::Compile(err.to_string()))?;
-        let pre = tcp_connection_world::TcpConnectionHostPre::new(instance_pre)
-            .map_err(|_| HandlerError::Compile("component is not a tcp-connection handler".into()))?;
+        let pre = tcp_connection_world::TcpConnectionHostPre::new(instance_pre).map_err(|_| {
+            HandlerError::Compile("component is not a tcp-connection handler".into())
+        })?;
         tracing::info!(
             component = %hash,
             lane = "tcp-connection",
@@ -2282,9 +2281,11 @@ impl HandlerEngine {
         // clock, then hand them to the guest as host-owned `wasi:io` stream resources. The guest imports
         // only `wasi:io/streams` (never `wasi:sockets`), so these are its sole network surface.
         let last_activity = Arc::new(Mutex::new(tokio::time::Instant::now()));
-        let in_stream: wasmtime_wasi::DynInputStream = Box::new(wasmtime_wasi::pipe::AsyncReadStream::new(
-            IdleTracked::new(read_half, Arc::clone(&last_activity)),
-        ));
+        let in_stream: wasmtime_wasi::DynInputStream =
+            Box::new(wasmtime_wasi::pipe::AsyncReadStream::new(IdleTracked::new(
+                read_half,
+                Arc::clone(&last_activity),
+            )));
         let out_stream: wasmtime_wasi::DynOutputStream =
             Box::new(wasmtime_wasi::pipe::AsyncWriteStream::new(
                 TCP_CONN_WRITE_BUDGET,
@@ -2339,7 +2340,10 @@ impl HandlerEngine {
             // layer strips control chars). (security-review LOW).
             Ok(Ok(Err(err))) => Err(HandlerError::Trap(format!(
                 "tcp-connection handler returned error: {}",
-                err.message.chars().take(MAX_CONSUMER_ERROR_LEN).collect::<String>()
+                err.message
+                    .chars()
+                    .take(MAX_CONSUMER_ERROR_LEN)
+                    .collect::<String>()
             ))),
             Ok(Err(trap)) => Err(classify(&trap, store.data().oom())),
             // An idle/max-duration teardown is the normal end of a long-lived connection (the conn-lane
@@ -3160,7 +3164,11 @@ mod tests {
             tokio::time::Instant::now(),
         )
         .await;
-        assert_eq!(kind, ConnTimeout::MaxDuration, "max-duration must fire first");
+        assert_eq!(
+            kind,
+            ConnTimeout::MaxDuration,
+            "max-duration must fire first"
+        );
 
         // idle (120ms) < max (10s) ⇒ Idle fires first (no activity ever stamped).
         let last = Arc::new(Mutex::new(tokio::time::Instant::now()));

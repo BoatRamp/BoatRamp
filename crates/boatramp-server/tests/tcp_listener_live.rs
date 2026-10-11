@@ -168,8 +168,13 @@ async fn tcp_listener_live_echo_idle_spin_peerdrop() {
     // ---- a. ECHO round-trip ----------------------------------------------------------------------
     {
         let (runtime, deploy) = live_runtime(TCP_ECHO, 1).await;
-        let (handle, addr) =
-            bind_and_serve(runtime, deploy, Duration::from_secs(5), Duration::from_secs(30)).await;
+        let (handle, addr) = bind_and_serve(
+            runtime,
+            deploy,
+            Duration::from_secs(5),
+            Duration::from_secs(30),
+        )
+        .await;
         let mut client = TcpStream::connect(addr).await.unwrap();
         let _ = client.set_nodelay(true);
         let payload = b"hello, tcp world";
@@ -212,7 +217,10 @@ async fn tcp_listener_live_echo_idle_spin_peerdrop() {
             .await
             .expect("client read after idle teardown timed out")
             .expect("client read after idle teardown errored");
-        assert_eq!(n, 0, "the peer socket must be closed (EOF) after idle teardown");
+        assert_eq!(
+            n, 0,
+            "the peer socket must be closed (EOF) after idle teardown"
+        );
     }
 
     // ---- c. MAX-DURATION teardown of the SPIN guest (THE HIGH-FIX PROOF) --------------------------
@@ -230,8 +238,12 @@ async fn tcp_listener_live_echo_idle_spin_peerdrop() {
         let _client = TcpStream::connect(addr).await.unwrap();
         // Hard 10s outer timeout: WITHOUT the epoch-yield fix the dispatch hangs (the fiber pins a
         // worker, the watchdog can't be re-polled) and this panics RED. WITH the fix it returns at ~1s.
-        let (res, elapsed) = await_dispatch(handle, Duration::from_secs(10), "spin max-duration").await;
-        assert!(res.is_ok(), "spin max-duration teardown should end cleanly: {res:?}");
+        let (res, elapsed) =
+            await_dispatch(handle, Duration::from_secs(10), "spin max-duration").await;
+        assert!(
+            res.is_ok(),
+            "spin max-duration teardown should end cleanly: {res:?}"
+        );
         assert!(
             elapsed < Duration::from_secs(5),
             "spin teardown took {elapsed:?} — the epoch-yield must let the watchdog preempt a \
@@ -242,8 +254,13 @@ async fn tcp_listener_live_echo_idle_spin_peerdrop() {
     // ---- d. PEER-DROP mid-stream -----------------------------------------------------------------
     {
         let (runtime, deploy) = live_runtime(TCP_ECHO, 4).await;
-        let (handle, addr) =
-            bind_and_serve(runtime, deploy, Duration::from_secs(5), Duration::from_secs(30)).await;
+        let (handle, addr) = bind_and_serve(
+            runtime,
+            deploy,
+            Duration::from_secs(5),
+            Duration::from_secs(30),
+        )
+        .await;
         let mut client = TcpStream::connect(addr).await.unwrap();
         let _ = client.set_nodelay(true);
         // Partial write + read it back (confirming the guest is engaged), then DROP the client.
@@ -258,7 +275,10 @@ async fn tcp_listener_live_echo_idle_spin_peerdrop() {
         drop(client); // abrupt peer drop mid-stream
         // The guest's input stream must surface the drop (EOF) and the connection clean up — bounded.
         let (res, elapsed) = await_dispatch(handle, Duration::from_secs(5), "peer-drop").await;
-        assert!(res.is_ok(), "peer-drop should clean up without error: {res:?}");
+        assert!(
+            res.is_ok(),
+            "peer-drop should clean up without error: {res:?}"
+        );
         assert!(
             elapsed < Duration::from_secs(4),
             "peer-drop cleanup took too long ({elapsed:?}) — the drop didn't surface to the guest"

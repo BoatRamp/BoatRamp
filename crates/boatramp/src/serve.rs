@@ -2580,7 +2580,11 @@ fn spawn_listeners(
                     .unwrap_or(boatramp_node::config::DEFAULT_LISTENER_MAX_CONN_DURATION_MS),
             ),
         };
-        boatramp_server::tcp_listener_serve::spawn_listener(handlers.clone(), deploy.clone(), params);
+        boatramp_server::tcp_listener_serve::spawn_listener(
+            handlers.clone(),
+            deploy.clone(),
+            params,
+        );
     }
 }
 
@@ -3355,7 +3359,12 @@ async fn run_cluster(
     // `[serve.listeners.<name>]`, gated on the posture. Cluster path. Borrows `options.posture` before
     // the TLS redirect below consumes it.
     #[cfg(feature = "tcp-listener")]
-    spawn_listeners(&cluster_serve_cfg.listeners, &options.posture, &handlers, &deploy);
+    spawn_listeners(
+        &cluster_serve_cfg.listeners,
+        &options.posture,
+        &handlers,
+        &deploy,
+    );
     #[cfg(feature = "tls")]
     if !matches!(args.tls, TlsMode::Off) {
         let redirect = args
