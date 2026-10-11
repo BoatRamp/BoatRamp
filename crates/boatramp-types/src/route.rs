@@ -758,6 +758,7 @@ mod tests {
         let handler = |route: &str, methods: &[&str]| HandlerConfig {
             tenancy: None,
             token_claims: None,
+            no_secrets: false,
             route: route.into(),
             methods: methods
                 .iter()

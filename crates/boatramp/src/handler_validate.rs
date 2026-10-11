@@ -707,6 +707,7 @@ mod imp {
                 handlers: vec![HandlerConfig {
                     tenancy: None,
                     token_claims: None,
+                    no_secrets: false,
                     route: "/intake/status".into(),
                     methods: vec!["GET".into()],
                     component: "portal.wasm".into(),
