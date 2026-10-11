@@ -2371,12 +2371,17 @@ pub(super) async fn build_bindings(
         // Ask-1: time this invocation's blob read ops (get / head / get_range) WITHOUT touching the blob
         // path — `TimingStorage` delegates every method unchanged, recording only read-op µs. `None`
         // (non-request lanes) ⇒ bare storage, byte-identical to before.
+        // Per-project blob backend (PLAN-per-project-blob-backend): resolve the backend for THIS
+        // invocation's HOST-resolved `project` (never guest input, invariant 1) — an unconfigured
+        // project resolves the global default (byte-identical). Key-prefix confinement
+        // (`container_access`) still runs on top of whatever resolves (invariant 2).
+        let project_backend = inner.blob_backends.backend(project);
         let blob_storage: std::sync::Arc<dyn boatramp_core::Storage> = match &blob_timing {
             Some(t) => std::sync::Arc::new(boatramp_storage::TimingStorage::new(
-                inner.storage.clone(),
+                project_backend,
                 t.clone(),
             )),
-            None => inner.storage.clone(),
+            None => project_backend,
         };
         bindings = bindings.with_blobstore(
             scope,

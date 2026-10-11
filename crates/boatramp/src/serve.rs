@@ -716,6 +716,22 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
                 mesh: None,
             }
         });
+        // PLAN-per-project-blob-backend: per-project blob backends are NOT supported on the cluster
+        // path in this cut — their sealed `boatramp:` credentials resolve against the REPLICATED
+        // control-plane KV, which does not exist at blob-build time on a cluster (the blob backend is
+        // built BEFORE the Raft node). Rather than silently ignore an operator's explicit
+        // `[serve.blob_backends]` (which would fall a configured project back to the global backend —
+        // surprising, and against invariant 4's no-silent-fallback), REFUSE loud. Single-node serves
+        // them fully. (A follow-up can build them in `run_cluster` after the replicated KV is up.)
+        if !serve_cfg.blob_backends.is_empty() {
+            return Err(Error::S3Ingress(format!(
+                "[serve.blob_backends] (per-project blob backends) is not supported on the cluster \
+                 path in this release ({} project(s) configured): their sealed credentials need the \
+                 replicated control-plane KV, which is unavailable at blob-build time on a cluster. \
+                 Remove [serve.blob_backends] or run single-node.",
+                serve_cfg.blob_backends.len()
+            )));
+        }
         // #505 (cluster path): the blob storage must be built BEFORE the Raft node (it feeds
         // `build_node` for cross-node message payloads), which is before the replicated control-plane KV
         // exists — so a `boatramp:` (KV-backed) node-cred ref cannot be resolved here. Refuse a
@@ -945,6 +961,20 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
         );
     }
 
+    // Per-project blob backends (PLAN-per-project-blob-backend): build each project's RAW backend with
+    // its OWN sealed credential now that the control-plane `kv` + `[secrets]` envelope exist. FAIL
+    // CLOSED — an unresolvable backend ERRORS the serve, never a silent fallback (invariant 4). Empty
+    // (the common case) ⇒ no overrides (byte-identical). The handler runtime decorates + overlays them
+    // on the global default. (The cluster path refused a non-empty map earlier.)
+    let per_project_blob_backends = build_per_project_blob_backends(
+        &serve_cfg.blob_backends,
+        kv.clone(),
+        config.secrets.as_ref(),
+        &data_dir,
+        options.posture.allow_env_secret_refs,
+    )
+    .await?;
+
     // Layout guard (0.2.0): refuse to serve a store still on the pre-project layout
     // 1 — a half-read store would silently drop sites/functions/compute. The operator
     // migrates explicitly (`boatramp migrate`); `--auto-migrate` opts into an in-place
@@ -1114,6 +1144,7 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
         config,
         data_dir: data_dir.as_path(),
         storage,
+        per_project_blob_backends,
         kv,
         auth,
         options,
@@ -1377,6 +1408,89 @@ async fn build_blobs_with_sealed_cred(
 
     let built = build_blobs(&effective, data_dir, notify_tier, notify_account).await?;
     Ok((built, resolved))
+}
+
+/// Build the per-project blob backends from `[serve.blob_backends]` (PLAN-per-project-blob-backend).
+///
+/// Each project's RAW (undecorated) backend is built with ITS OWN sealed base S3 credential, resolved
+/// under THAT project's sealed store ([`resolve_s3_credential_for_project`], invariant 1 — authority
+/// bound to the project, never a global artifact). **FAIL CLOSED** (invariant 4): a declared backend
+/// whose kind is unset, or whose credential/bucket cannot be resolved/built, ERRORS the serve — it is
+/// never silently dropped or fallen back to the global/another project's backend (that would leak
+/// objects across the intended boundary). The returned map is RAW; the handler runtime wraps each in
+/// the SAME decorator stack as the global (MarkerHeadCache + opt-in HedgedStorage) and overlays them on
+/// the global default. Per-project blob-change WATCH provisioning is out of scope for this cut (built
+/// with `notify_tier: None`), so a per-project S3 backend's `blob` trigger needs a self-watching
+/// backend or a follow-up provider. The project keys are host-config (validated at config load), never
+/// guest input.
+async fn build_per_project_blob_backends(
+    configs: &std::collections::BTreeMap<String, boatramp_node::config::BlobBackendConfig>,
+    kv: Arc<dyn KvStore>,
+    secrets: Option<&crate::config::SecretsConfig>,
+    data_dir: &Path,
+    allow_env_secret_refs: bool,
+) -> Result<std::collections::HashMap<String, Arc<dyn boatramp_core::Storage>>> {
+    let mut out: std::collections::HashMap<String, Arc<dyn boatramp_core::Storage>> =
+        std::collections::HashMap::new();
+    for (project, cfg) in configs {
+        // Fail closed: a per-project backend MUST name its kind — a forgotten `blobs` would otherwise
+        // build an `fs` backend at the SHARED node dir that does NOT physically isolate the project.
+        let Some(kind) = cfg.blobs else {
+            return Err(Error::S3Ingress(format!(
+                "[serve.blob_backends.{project}] must set `blobs` (fs/s3/gcs/azure); a per-project \
+                 backend with no kind would not isolate the project's blobs"
+            )));
+        };
+        let mut blob_args = BlobArgs {
+            blobs: kind,
+            s3_bucket: cfg.s3_bucket.clone(),
+            s3_endpoint: cfg.s3_endpoint.clone(),
+            s3_region: cfg.s3_region.clone(),
+            s3_path_style: cfg.s3_path_style,
+            s3_credential: None,
+            gcs_bucket: None,
+            gcs_endpoint: None,
+            gcs_anonymous: false,
+            azure_account: None,
+            azure_container: None,
+            azure_access_key: None,
+            azure_emulator: false,
+        };
+        // Resolve the per-project sealed base S3 credential under THIS project's sealed store
+        // (invariant 1). Absent ⇒ the ambient AWS env chain (same posture as the global default). A
+        // configured-but-unresolvable credential is a fail-closed startup error (invariant 4).
+        if let Some(cred_cfg) = cfg.s3_credential.as_ref() {
+            let envelope = serve_secrets_envelope(secrets, data_dir)?;
+            let cred = boatramp_node::s3_credential::resolve_s3_credential_for_project(
+                cred_cfg,
+                boatramp_core::project::ProjectRef::new(project),
+                kv.clone(),
+                envelope,
+                allow_env_secret_refs,
+                &boatramp_core::env::SystemEnv,
+            )
+            .await
+            .map_err(|e| {
+                Error::S3Ingress(format!("[serve.blob_backends.{project}] credential: {e}"))
+            })?;
+            tracing::info!(
+                project = %project,
+                access_key_id = %cred.access_key_id(),
+                "sourcing the per-project base S3 credential from the [secrets] sealed store \
+                 ([serve.blob_backends])"
+            );
+            blob_args.s3_credential = Some(cred);
+        }
+        // Build the backend — fail-closed: a missing bucket / a disabled backend feature ERRORS here
+        // (never a silent fallback). No watch provisioning for a per-project backend in this cut.
+        let built = build_blobs(&blob_args, data_dir, None, None)
+            .await
+            .map_err(|e| {
+                Error::S3Ingress(format!("[serve.blob_backends.{project}] backend: {e}"))
+            })?;
+        out.insert(project.clone(), built.storage);
+    }
+    Ok(out)
 }
 
 /// A short human identity for a `[serve.blob_fallback]` secondary — the backend plus its
@@ -3133,6 +3247,10 @@ async fn run_cluster(
         config,
         data_dir: data_dir.as_path(),
         storage,
+        // PLAN-per-project-blob-backend: the cluster path refused a non-empty `[serve.blob_backends]`
+        // up front (their sealed credentials need the replicated KV, unavailable at blob-build time),
+        // so there are never per-project backends here.
+        per_project_blob_backends: std::collections::HashMap::new(),
         kv,
         auth,
         options,

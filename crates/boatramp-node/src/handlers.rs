@@ -141,6 +141,12 @@ mod sync_concurrency_default_tests {
 pub async fn build_handler_runtime(
     kv: Arc<dyn KvStore>,
     storage: Arc<dyn boatramp_core::Storage>,
+    // Per-project blob backends (PLAN-per-project-blob-backend): RAW (undecorated) `project → backend`
+    // the serve wiring built with per-project sealed credentials (fail-closed on an unresolvable one).
+    // Each is wrapped in the SAME decorator stack as the global `storage` below, then overlaid on the
+    // global default in a `CompositeBlobBackends`. Empty ⇒ every project resolves the global default
+    // (an all-global deployment is byte-for-byte unchanged).
+    per_project_blob_backends: std::collections::HashMap<String, Arc<dyn boatramp_core::Storage>>,
     data_dir: &Path,
     handlers_cfg: Option<&crate::config::HandlersConfig>,
     messaging_override: Option<Arc<dyn boatramp_core::messaging::Messaging>>,
@@ -180,47 +186,83 @@ pub async fn build_handler_runtime(
     // gateway below; keep it from tripping unused-variable in a no-email build.
     #[cfg(not(feature = "email"))]
     let _ = allow_guest_email;
-    // Optionally hedge a slow blob read: when the first GET has not returned within `blob_hedge_delay_ms`,
-    // race a second one and take whichever lands first (idempotent reads trade spare CPU/IO for a tighter
-    // fetch tail — the measured serve-path p99 is the external store's GET tail while CPU is idle). Off by
-    // default (unset/0). Wrapped BELOW the marker cache (closest to the real backend) so a hedge re-enters
-    // the backend, not the cache; a concurrent-hedge cap (`blob_hedge_max_inflight`) prevents a storm when
-    // the whole store is slow.
-    let storage: Arc<dyn boatramp_core::Storage> = match handlers_cfg
+    // The blob decorator stack, applied IDENTICALLY to the global backend AND every per-project
+    // backend (PLAN-per-project-blob-backend), so a per-project bucket inherits the exact same
+    // tail/latency behavior with no special-casing (invariant: decorators wrap each resolved backend).
+    //
+    // Inner→outer: (1) optionally hedge a slow blob read — when the first GET has not returned within
+    // `blob_hedge_delay_ms`, race a second one and take whichever lands first (idempotent reads trade
+    // spare CPU/IO for a tighter fetch tail). Off by default; wrapped CLOSEST to the real backend so a
+    // hedge re-enters the backend, not the cache; `blob_hedge_max_inflight` caps a storm when the whole
+    // store is slow. (2) a process-wide, positive-only container-marker cache so the serve path skips
+    // the per-request `.boatramp-container` HEAD for an already-verified container. Confinement is
+    // UNTOUCHED — the binding's `container_access` still runs on every op and the cache only ever sees
+    // fully-resolved, tenant-confined keys; it caches a marker only on a confirmed `Ok` and invalidates
+    // on a marker delete (fail-closed). `0` disables it (pass-through). Wrapped here (INSIDE the
+    // per-request `TimingStorage` the dispatch path adds), so a marker-cache hit shows `blob_head_us≈0`.
+    let hedge_delay_ms = handlers_cfg
         .and_then(|h| h.blob_hedge_delay_ms)
-        .filter(|ms| *ms > 0)
-    {
-        Some(delay_ms) => {
-            let max = handlers_cfg
-                .and_then(|h| h.blob_hedge_max_inflight)
-                .unwrap_or(0);
-            tracing::info!(
-                blob_hedge_delay_ms = delay_ms,
-                blob_hedge_max_inflight = max,
-                "blob hedged-read active: racing a 2nd GET for a read slower than the delay"
-            );
-            Arc::new(boatramp_storage::HedgedStorage::new(
-                storage,
-                std::time::Duration::from_millis(delay_ms),
-                max,
-            ))
-        }
-        None => storage,
-    };
-    // Front the shared blob backend with a process-wide, positive-only container-marker cache so the
-    // serve path skips the per-request `.boatramp-container` HEAD round-trip for an already-verified
-    // container. Confinement is UNTOUCHED — the binding's `container_access` still runs on every op and
-    // the cache only ever sees fully-resolved, tenant-confined keys; it caches a marker only on a
-    // confirmed `Ok` and invalidates on a marker delete (fail-closed). `0` disables it (pass-through).
-    // Wrapped here (INSIDE the per-request `TimingStorage` the dispatch path adds), so a marker-cache hit
-    // shows `blob_head_us≈0` in the v0.23.0 phase timing.
+        .filter(|ms| *ms > 0);
+    let hedge_max_inflight = handlers_cfg
+        .and_then(|h| h.blob_hedge_max_inflight)
+        .unwrap_or(0);
+    // Log the hedge posture ONCE for the node (not per backend) — it is a node-wide knob.
+    if let Some(delay_ms) = hedge_delay_ms {
+        tracing::info!(
+            blob_hedge_delay_ms = delay_ms,
+            blob_hedge_max_inflight = hedge_max_inflight,
+            "blob hedged-read active: racing a 2nd GET for a read slower than the delay"
+        );
+    }
     const DEFAULT_BLOB_MARKER_CACHE: usize = 4096;
     let marker_cache_entries = handlers_cfg
         .and_then(|h| h.blob_marker_cache_entries)
         .unwrap_or(DEFAULT_BLOB_MARKER_CACHE);
-    let storage: Arc<dyn boatramp_core::Storage> = Arc::new(
-        boatramp_storage::MarkerHeadCache::new(storage, marker_cache_entries),
-    );
+    let wrap_blob = |raw: Arc<dyn boatramp_core::Storage>| -> Arc<dyn boatramp_core::Storage> {
+        let hedged: Arc<dyn boatramp_core::Storage> = match hedge_delay_ms {
+            Some(delay_ms) => Arc::new(boatramp_storage::HedgedStorage::new(
+                raw,
+                std::time::Duration::from_millis(delay_ms),
+                hedge_max_inflight,
+            )),
+            None => raw,
+        };
+        Arc::new(boatramp_storage::MarkerHeadCache::new(
+            hedged,
+            marker_cache_entries,
+        ))
+    };
+    // The global default backend (used for the reserved `default` project, any unconfigured project,
+    // and node-internal blob paths — watch/messaging). Wrapping it here keeps the single-backend path
+    // byte-identical to the pre-per-project build.
+    let storage: Arc<dyn boatramp_core::Storage> = wrap_blob(storage);
+    // Overlay the operator-configured per-project backends (each wrapped identically) on the global
+    // default. Empty ⇒ a trivial `GlobalBlobBackend` (one backend, one credential) so an all-global
+    // deployment allocates no composite and is byte-for-byte unchanged. A guest can never reach another
+    // project's backend: the resolver is keyed by the serve's host-resolved project, and a missing
+    // entry falls to the GLOBAL default, never to another project (invariants 1 + 5).
+    let blob_backends: Arc<dyn boatramp_core::blob_backends::BlobBackends> =
+        if per_project_blob_backends.is_empty() {
+            Arc::new(boatramp_core::blob_backends::GlobalBlobBackend::new(
+                storage.clone(),
+            ))
+        } else {
+            let wrapped: std::collections::HashMap<String, Arc<dyn boatramp_core::Storage>> =
+                per_project_blob_backends
+                    .into_iter()
+                    .map(|(project, raw)| (project, wrap_blob(raw)))
+                    .collect();
+            tracing::info!(
+                projects = wrapped.len(),
+                "per-project blob backends active: {} project(s) serve wasi:blobstore from their own \
+                 backend (PLAN-per-project-blob-backend)",
+                wrapped.len()
+            );
+            Arc::new(boatramp_storage::CompositeBlobBackends::new(
+                storage.clone(),
+                wrapped,
+            ))
+        };
     // Two engine ceilings by lane. The **sync** ceiling bounds connection-bearing
     // requests (site handlers, synchronous invokes) — kept tight so a slow
     // handler can't pin a client, a proxy, and the shared request pool; default
@@ -401,8 +443,13 @@ pub async fn build_handler_runtime(
     let messaging_for_email = messaging.clone();
     #[cfg(feature = "email")]
     let email_envelope = secrets_envelope.clone();
-    let runtime =
-        boatramp_server::HandlerRuntime::new(engine, kv, storage, Some(sql), Some(messaging));
+    let runtime = boatramp_server::HandlerRuntime::new_with_backends(
+        engine,
+        kv,
+        blob_backends,
+        Some(sql),
+        Some(messaging),
+    );
     // Apply the posture's host-side blob cap + component-size cap.
     runtime.set_max_blob_bytes(max_blob_bytes);
     runtime.set_max_component_bytes(max_component_bytes);
@@ -763,6 +810,10 @@ async fn build_sql_backends(
 pub async fn build_handler_runtime(
     _kv: Arc<dyn KvStore>,
     _storage: Arc<dyn boatramp_core::Storage>,
+    // Per-project blob backends (PLAN-per-project-blob-backend); a lean (no-handlers) node has no
+    // guest blob binding to serve, so the map is ignored (kept in lockstep with the handlers signature
+    // + the single node.rs caller).
+    _per_project_blob_backends: std::collections::HashMap<String, Arc<dyn boatramp_core::Storage>>,
     _data_dir: &Path,
     _handlers_cfg: Option<&crate::config::HandlersConfig>,
     _messaging_override: Option<Arc<dyn boatramp_core::messaging::Messaging>>,

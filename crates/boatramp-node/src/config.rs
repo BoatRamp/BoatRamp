@@ -113,6 +113,18 @@ pub enum ConfigError {
         /// default case, where it points at the `default` cure).
         cure: &'static str,
     },
+    /// A `[serve.blob_backends.<project>]` key is not a valid project name, or is the reserved
+    /// `default` project (which always resolves the global `[serve]` backend). Refused at config load
+    /// (fail-closed) rather than silently binding a project's blobs to the wrong backend.
+    #[error("per-project blob backend {name:?}: {reason}{cure}")]
+    InvalidBlobBackendProject {
+        /// The offending project key (the `blob_backends` map key).
+        name: String,
+        /// Why it was rejected.
+        reason: &'static str,
+        /// A trailing remediation hint.
+        cure: &'static str,
+    },
 }
 
 /// Project configuration, loaded from `project.cfg` (RON) in the project folder.
@@ -273,6 +285,7 @@ impl ServerConfig {
             ConfigFormat::Json => serde_json::from_str(text)?,
         };
         config.validate_sql_db_names()?;
+        config.validate_blob_backend_projects()?;
         Ok(config)
     }
 
@@ -728,6 +741,59 @@ impl ServerConfig {
             }
         }
 
+        // --- serve per-project blob backends (`[serve.blob_backends.<project>]`) ---
+        // PLAN-per-project-blob-backend. A keyed map (like the SQL `databases` map) with no config
+        // file to enumerate its members, so member PROJECT names are discovered from the environment:
+        // any `BOATRAMP_SERVE_BLOB_BACKEND_<PROJECT>_<FIELD>` declares project `<PROJECT>`. Each is
+        // merged per-field (env-over-file) into whatever the file declared under that name. The sealed
+        // credential's two public refs are flattened as `_S3_ACCESS_KEY_ID` / `_S3_SECRET_ACCESS_KEY`
+        // (the secret is always a `boatramp:`/`env:` REFERENCE, never the raw secret — invariant 3).
+        if source.any_with_prefix(BLOB_BACKEND_ENV_PREFIX) {
+            let serve = self.serve.get_or_insert_with(ServeConfig::default);
+            for name in source.blob_backend_projects() {
+                let be = serve.blob_backends.entry(name.clone()).or_default();
+                let prefix = format!("{BLOB_BACKEND_ENV_PREFIX}{name}_");
+                if let Some(v) = source.parse_enum(
+                    &format!("{prefix}KIND"),
+                    &[
+                        ("fs", crate::backends::BlobBackend::Fs),
+                        ("s3", crate::backends::BlobBackend::S3),
+                        ("gcs", crate::backends::BlobBackend::Gcs),
+                        ("azure", crate::backends::BlobBackend::Azure),
+                    ],
+                )? {
+                    be.blobs = Some(v);
+                }
+                if let Some(v) = source.get(&format!("{prefix}S3_BUCKET")) {
+                    be.s3_bucket = Some(v);
+                }
+                if let Some(v) = source.get(&format!("{prefix}S3_ENDPOINT")) {
+                    be.s3_endpoint = Some(v);
+                }
+                if let Some(v) = source.get(&format!("{prefix}S3_REGION")) {
+                    be.s3_region = Some(v);
+                }
+                if let Some(v) = source.parse_bool(&format!("{prefix}S3_PATH_STYLE"))? {
+                    be.s3_path_style = v;
+                }
+                // The sealed base S3 credential — materialised only when one of its refs is set. The
+                // `access_key_id` is public; the `secret_access_key` is a `boatramp:`/`env:` ref.
+                let access_key_id = source.get(&format!("{prefix}S3_ACCESS_KEY_ID"));
+                let secret_ref = source.get(&format!("{prefix}S3_SECRET_ACCESS_KEY"));
+                if access_key_id.is_some() || secret_ref.is_some() {
+                    let cred = be
+                        .s3_credential
+                        .get_or_insert_with(S3CredentialConfig::default);
+                    if let Some(v) = access_key_id {
+                        cred.access_key_id = v;
+                    }
+                    if let Some(v) = secret_ref {
+                        cred.secret_access_key = v;
+                    }
+                }
+            }
+        }
+
         // --- serve S3-ingress cloud brokering (`[serve.s3_ingress_cloud]`) ---
         // Env parity for the blob-upload minter's cloud-brokering policy, so a file-less fleet (e.g. the
         // Tigris presigned-only deployment, whose `boatramp.cfg` existed ONLY to carry
@@ -868,6 +934,10 @@ impl ServerConfig {
         // which is no longer produced by the `DEFAULT` token but could still be
         // written literally in a `boatramp.cfg` file.
         self.validate_sql_db_names()?;
+        // Fail closed on a `[serve.blob_backends]` key that is not a valid project name, or is the
+        // reserved `default` project (which always resolves the global `[serve]` backend). Runs on the
+        // fully merged (file + env) map (PLAN-per-project-blob-backend).
+        self.validate_blob_backend_projects()?;
         Ok(())
     }
 
@@ -927,6 +997,39 @@ impl ServerConfig {
                     reason: "the `bramp-db-` compute-workload prefix is reserved for \
                              boatramp-derived managed-database servers",
                     cure: " — rename the `compute` workload to not start with `bramp-db-`",
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate every configured `[serve.blob_backends.<project>]` key
+    /// (PLAN-per-project-blob-backend). A key must be a valid project name (the canonical
+    /// [`validate_resource_name`](boatramp_core::project::validate_resource_name), `kind = "project"`),
+    /// and must NOT be the reserved `default` project: the `default` project ALWAYS resolves the global
+    /// `[serve]` backend (invariant 5), so a `[serve.blob_backends.default]` entry would be ambiguous
+    /// (the node-wide backend is configured under `[serve]`, not here). Both are boot-LOUD refusals
+    /// (fail-closed — an operator learns of a bad name at `serve` boot, not at the first request). The
+    /// project the entry binds to is host-routed at serve time, never guest input (invariant 1).
+    fn validate_blob_backend_projects(&self) -> Result<(), ConfigError> {
+        let Some(serve) = self.serve.as_ref() else {
+            return Ok(());
+        };
+        for name in serve.blob_backends.keys() {
+            if name == boatramp_core::project::DEFAULT_PROJECT {
+                return Err(ConfigError::InvalidBlobBackendProject {
+                    name: name.clone(),
+                    reason: "the reserved `default` project always resolves the global [serve] blob \
+                             backend",
+                    cure: " — configure the node-wide backend under [serve] (blobs/s3_*), not \
+                           [serve.blob_backends.default]",
+                });
+            }
+            if let Err(err) = boatramp_core::project::validate_resource_name("project", name) {
+                return Err(ConfigError::InvalidBlobBackendProject {
+                    name: err.value,
+                    reason: err.reason,
+                    cure: boatramp_core::project::INVALID_NAME_CURE,
                 });
             }
         }
@@ -1078,6 +1181,27 @@ const SQL_DB_FIELD_SUFFIXES: &[&str] = &[
     "_USER",
 ];
 
+/// The fixed prefix of a keyed `[serve.blob_backends.<project>]` variable —
+/// `BOATRAMP_SERVE_BLOB_BACKEND_<PROJECT>_<FIELD>` (PLAN-per-project-blob-backend). Member project
+/// names aren't known ahead of time (there is no config file to enumerate them), so they are discovered
+/// by scanning the environment for this prefix — mirroring [`SQL_DB_ENV_PREFIX`].
+const BLOB_BACKEND_ENV_PREFIX: &str = "BOATRAMP_SERVE_BLOB_BACKEND_";
+
+/// The recognised `_<FIELD>` suffixes of a `[serve.blob_backends]` variable, ordered so a
+/// name-isolating strip matches the **longest** suffix first (so `_S3_SECRET_ACCESS_KEY` wins over any
+/// shorter overlap). Each mirrors a field of [`BlobBackendConfig`] (the sealed credential's two public
+/// refs are flattened as `_S3_ACCESS_KEY_ID` / `_S3_SECRET_ACCESS_KEY`). Kept in sync by the
+/// `blob_backend_env_covers_every_field` forgot-a-knob guard test.
+const BLOB_BACKEND_FIELD_SUFFIXES: &[&str] = &[
+    "_S3_SECRET_ACCESS_KEY",
+    "_S3_ACCESS_KEY_ID",
+    "_S3_PATH_STYLE",
+    "_S3_ENDPOINT",
+    "_S3_BUCKET",
+    "_S3_REGION",
+    "_KIND",
+];
+
 /// The `BOATRAMP_*` variables that populate the `[secrets]` section (excluding the
 /// nested `vault` sub-config, gated separately by [`SECRETS_VAULT_ENV_VARS`]).
 const SECRETS_ENV_VARS: &[&str] = &[
@@ -1213,6 +1337,29 @@ impl EnvSource {
                 // Strip the recognised field suffix to isolate `<NAME>`. The suffixes
                 // are matched longest-first so `READ_URL_ENV` wins over `URL_ENV`.
                 SQL_DB_FIELD_SUFFIXES
+                    .iter()
+                    .find_map(|suffix| rest.strip_suffix(suffix))
+                    .filter(|name| !name.is_empty())
+                    .map(str::to_string)
+            })
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    /// The distinct `<PROJECT>` tokens of every `BOATRAMP_SERVE_BLOB_BACKEND_<PROJECT>_<FIELD>`
+    /// variable that is set (PLAN-per-project-blob-backend). The name is everything between the fixed
+    /// prefix and the *last* `_<FIELD>` segment, so a project name may itself contain underscores (the
+    /// field suffix is one of a known set, matched longest-first). Returned sorted + de-duplicated so
+    /// the map is built deterministically. Mirrors [`Self::sql_database_names`].
+    fn blob_backend_projects(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .names()
+            .filter(|n| n.starts_with(BLOB_BACKEND_ENV_PREFIX) && self.get(n).is_some())
+            .filter_map(|n| {
+                let rest = n.strip_prefix(BLOB_BACKEND_ENV_PREFIX)?;
+                BLOB_BACKEND_FIELD_SUFFIXES
                     .iter()
                     .find_map(|suffix| rest.strip_suffix(suffix))
                     .filter(|name| !name.is_empty())
@@ -2287,6 +2434,16 @@ pub struct ServeConfig {
     /// restart (the node logs a prominent startup WARNING while it is active, and GC prune is
     /// refused). Absent ⇒ no fallback (unchanged). See [`BlobFallbackConfig`].
     pub blob_fallback: Option<BlobFallbackConfig>,
+    /// `[serve.blob_backends.<project>]` — **per-project** blob object-store overrides
+    /// (PLAN-per-project-blob-backend). A project named here serves its `wasi:blobstore` data from its
+    /// OWN bucket/endpoint/credential instead of the one node-wide `[serve]` backend; a project with NO
+    /// entry — and the reserved `default` project — resolves the global default (invariant 5: an
+    /// all-global deployment is byte-for-byte unchanged). Operator-configured (node config + sealed
+    /// `[secrets]`), mirroring `[handlers.bindings.sql.databases]`; a project OWNER declaring its own
+    /// backend is out of scope for this cut. Each entry's sealed S3 credential is a secret **reference**
+    /// (`boatramp:`/`env:`), never inlined (invariant 3). Empty ⇒ no overrides (the common case). See
+    /// [`BlobBackendConfig`]. Env parity: `BOATRAMP_SERVE_BLOB_BACKEND_<PROJECT>_*`.
+    pub blob_backends: BTreeMap<String, BlobBackendConfig>,
     /// Token root **private** key (hex) — issuing node: verifies *and* mints
     /// tokens / OIDC exchanges.
     pub auth_root_private_key: Option<String>,
@@ -2419,6 +2576,44 @@ pub struct S3CredentialConfig {
     /// `[secrets]` envelope; the resolved value is redacted from `Debug`/logs. A `boatramp:`/`env:`
     /// ref configured with NO `[secrets]` envelope is a fail-closed startup error.
     pub secret_access_key: String,
+}
+
+/// `[serve.blob_backends.<project>]` — a **per-project** blob object-store backend
+/// (PLAN-per-project-blob-backend). Same backend-descriptor shape as the `[serve]` primary's S3 fields
+/// plus its OWN sealed base S3 credential (`#505` path), so project ACME can point its `wasi:blobstore`
+/// at its own bucket/endpoint/account. Key-prefix confinement (`container_access`) still runs on top —
+/// a separate bucket adds PHYSICAL isolation, it does not replace the confinement (invariant 2).
+///
+/// Operator-configured; the backend is bound to the serve's **host-resolved** project at serve wiring,
+/// never to guest input (invariant 1). The sealed credential is resolved under THIS project's sealed
+/// `[secrets]` store at wiring; a declared backend whose credential/bucket cannot be built REFUSES the
+/// serve (fail-closed — never a silent fallback to the global or another project's backend, invariant
+/// 4). First cut is S3 (and `fs`, which is degenerate — it shares the node blob dir, so only a cloud
+/// bucket gives physical isolation); a per-project `gcs`/`azure` needs its own descriptor fields and is
+/// a follow-up (declaring one fails closed at build — the required bucket/account is absent).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BlobBackendConfig {
+    /// The backend kind (`fs`/`s3`/`gcs`/`azure`). **Required** (mirrors the SQL binding's required
+    /// `kind`): a per-project backend with no explicit kind is a startup error, so a forgotten
+    /// `blobs = "s3"` can't silently build an `fs` backend at the shared node dir that would NOT
+    /// isolate the project's blobs. Resolved at serve wiring (fail-closed when absent).
+    pub blobs: Option<crate::backends::BlobBackend>,
+    /// S3 bucket (`blobs = s3`) — the project's OWN bucket.
+    pub s3_bucket: Option<String>,
+    /// S3 endpoint URL (a MinIO/R2/Tigris endpoint) for this project's backend.
+    pub s3_endpoint: Option<String>,
+    /// S3 region for this project's backend.
+    pub s3_region: Option<String>,
+    /// Use S3 path-style addressing (MinIO) for this project's backend.
+    #[serde(default)]
+    pub s3_path_style: bool,
+    /// This project's OWN sealed base S3 credential (`#505`) — resolved through the SAME
+    /// `resolve_s3_credential` path as the node primary, but keyed under THIS project's sealed store
+    /// (`boatramp:<name>` resolves against `project`'s secrets, not the node default). The
+    /// `access_key_id` is a public identifier; `secret_access_key` is a `boatramp:`/`env:` **reference**
+    /// (never the raw secret in config, invariant 3). Absent ⇒ the ambient AWS env chain.
+    pub s3_credential: Option<S3CredentialConfig>,
 }
 
 /// `[serve.blob_fallback]` — a **read-only SECONDARY blob backend** for a zero-downtime backend switch
@@ -3936,6 +4131,147 @@ mod tests {
                 "{var} is not an s3_ingress_cloud lever"
             );
         }
+    }
+
+    #[test]
+    fn env_wires_the_per_project_blob_backend_over_the_default() {
+        // PLAN-per-project-blob-backend: a keyed `[serve.blob_backends.<project>]` map discovered from
+        // the env with NO config file, mirroring the SQL `databases` map. The project name may contain
+        // underscores (name isolation strips the LONGEST field suffix). The sealed credential is a
+        // REFERENCE (`boatramp:`/`env:`), never the raw secret (invariant 3).
+        let mut cfg = ServerConfig::default();
+        assert!(cfg.serve.is_none());
+        cfg.apply_env_overrides(&env(&[
+            ("BOATRAMP_SERVE_BLOB_BACKEND_acme_eu_KIND", "s3"),
+            (
+                "BOATRAMP_SERVE_BLOB_BACKEND_acme_eu_S3_BUCKET",
+                "acme-eu-blobs",
+            ),
+            (
+                "BOATRAMP_SERVE_BLOB_BACKEND_acme_eu_S3_ENDPOINT",
+                "https://s3.eu.example.com",
+            ),
+            ("BOATRAMP_SERVE_BLOB_BACKEND_acme_eu_S3_REGION", "eu-west-1"),
+            ("BOATRAMP_SERVE_BLOB_BACKEND_acme_eu_S3_PATH_STYLE", "true"),
+            (
+                "BOATRAMP_SERVE_BLOB_BACKEND_acme_eu_S3_ACCESS_KEY_ID",
+                "AKIAACME",
+            ),
+            (
+                "BOATRAMP_SERVE_BLOB_BACKEND_acme_eu_S3_SECRET_ACCESS_KEY",
+                "boatramp:acme-eu-s3",
+            ),
+        ]))
+        .expect("valid per-project blob-backend env overrides apply");
+        let serve = cfg.serve.expect("serve materialised from env");
+        let be = serve.blob_backends.get("acme_eu").expect(
+            "the acme_eu per-project backend was discovered from env (underscore survives name \
+             isolation)",
+        );
+        assert_eq!(be.blobs, Some(crate::backends::BlobBackend::S3));
+        assert_eq!(be.s3_bucket.as_deref(), Some("acme-eu-blobs"));
+        assert_eq!(be.s3_endpoint.as_deref(), Some("https://s3.eu.example.com"));
+        assert_eq!(be.s3_region.as_deref(), Some("eu-west-1"));
+        assert!(be.s3_path_style);
+        let cred = be
+            .s3_credential
+            .as_ref()
+            .expect("sealed credential materialised from its two refs");
+        assert_eq!(cred.access_key_id, "AKIAACME");
+        // The secret is the REFERENCE as written — never an inlined secret value (invariant 3).
+        assert_eq!(cred.secret_access_key, "boatramp:acme-eu-s3");
+    }
+
+    #[test]
+    fn blob_backend_env_covers_every_field() {
+        // Forgot-a-knob guard (mirrors the SQL-DB + hedge guards): every field of `BlobBackendConfig`
+        // reachable from config MUST have an env suffix in `BLOB_BACKEND_FIELD_SUFFIXES`, so a newly
+        // added field can't silently lose its env lever. Set every suffix for one project and assert
+        // each field landed; assert the suffix set is exactly the expected one (no stale/missing lever).
+        let expected: &[&str] = &[
+            "_KIND",
+            "_S3_BUCKET",
+            "_S3_ENDPOINT",
+            "_S3_REGION",
+            "_S3_PATH_STYLE",
+            "_S3_ACCESS_KEY_ID",
+            "_S3_SECRET_ACCESS_KEY",
+        ];
+        for suffix in expected {
+            assert!(
+                BLOB_BACKEND_FIELD_SUFFIXES.contains(suffix),
+                "{suffix} missing from BLOB_BACKEND_FIELD_SUFFIXES — a blob-backend field lost its \
+                 env lever"
+            );
+        }
+        assert_eq!(
+            BLOB_BACKEND_FIELD_SUFFIXES.len(),
+            expected.len(),
+            "BLOB_BACKEND_FIELD_SUFFIXES has a suffix with no matching expected field (stale lever)"
+        );
+    }
+
+    #[test]
+    fn blob_backend_rejects_the_reserved_default_project() {
+        // Invariant 5: the reserved `default` project ALWAYS resolves the global `[serve]` backend, so
+        // a `[serve.blob_backends.default]` entry is refused at load (fail-closed, boot-loud) — the
+        // node-wide backend is configured under `[serve]`, not here.
+        let err = ServerConfig::parse(
+            r#"( serve: ( blob_backends: { "default": ( blobs: s3, s3_bucket: "x" ) } ) )"#,
+        )
+        .expect_err("a `default`-keyed per-project blob backend must be refused");
+        assert!(
+            matches!(err, ConfigError::InvalidBlobBackendProject { .. }),
+            "reserved-default blob backend is InvalidBlobBackendProject, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn blob_backend_rejects_an_unsafe_project_name() {
+        // A `blob_backends` key is a project name threaded into the per-project data-plane scope, so it
+        // runs the canonical slug validator (fail-closed on a path-traversal / injection shape).
+        let err = ServerConfig::parse(
+            r#"( serve: ( blob_backends: { "../evil": ( blobs: s3, s3_bucket: "x" ) } ) )"#,
+        )
+        .expect_err("a path-traversal project key must be refused");
+        assert!(
+            matches!(err, ConfigError::InvalidBlobBackendProject { .. }),
+            "unsafe blob-backend project name is InvalidBlobBackendProject, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn blob_backend_config_rejects_unknown_fields_and_inlined_secret_stays_a_ref() {
+        // `deny_unknown_fields` on `BlobBackendConfig` + its `S3CredentialConfig` catches a typo'd key
+        // at load; and the sealed credential's `secret_access_key` is stored verbatim as the REFERENCE
+        // the operator wrote (a `boatramp:` name), never re-interpreted into a raw secret.
+        let cfg = ServerConfig::parse(
+            r#"( serve: ( blob_backends: { "acme": (
+                blobs: s3,
+                s3_bucket: "acme-blobs",
+                s3_credential: ( access_key_id: "AKIA", secret_access_key: "boatramp:acme" ),
+            ) } ) )"#,
+        )
+        .expect("a well-formed per-project blob backend parses");
+        let be = cfg
+            .serve
+            .unwrap()
+            .blob_backends
+            .remove("acme")
+            .expect("acme backend parsed");
+        assert_eq!(be.blobs, Some(crate::backends::BlobBackend::S3));
+        assert_eq!(
+            be.s3_credential.unwrap().secret_access_key,
+            "boatramp:acme",
+            "the secret stays the indirect reference, never an inlined secret"
+        );
+        let bad = ServerConfig::parse(
+            r#"( serve: ( blob_backends: { "acme": ( blobs: s3, bogus: 1 ) } ) )"#,
+        );
+        assert!(
+            bad.is_err(),
+            "an unknown [serve.blob_backends.<p>] field must be rejected (deny_unknown_fields)"
+        );
     }
 
     #[test]

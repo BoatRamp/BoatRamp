@@ -659,7 +659,11 @@ pub(super) async fn spawn_blob_watcher(
     // use, so a watcher and the ledger/provisioner agree).
     let project_ref = ProjectRef::new(&project);
     let storage_prefix = blob_storage_prefix(project_ref, &function.name, prefix);
-    let mut stream = match inner.storage.watch(&storage_prefix).await {
+    // Watch the PROJECT's own backend (PLAN-per-project-blob-backend): the function's blobs live under
+    // its project-qualified namespace on ITS backend (host-resolved project, never guest input); an
+    // unconfigured project resolves the global default (byte-identical to the pre-per-project watch).
+    let project_storage = inner.blob_backends.backend(project_ref);
+    let mut stream = match project_storage.watch(&storage_prefix).await {
         Ok(Some(stream)) => stream,
         Ok(None) => return None,
         Err(err) => {
