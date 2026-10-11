@@ -144,6 +144,12 @@ owned-gate-mutation = ["boatramp-core/owned-gate-mutation"]
 # 403/404 (and the other classes') distinction is load-bearing. Compiled OUT of every real build (the
 # seam also lives under this crate's own `cfg(test)`).
 blob-fault-gate-mutation = []
+# The per-project blob-backend cross-project isolation gate lane (PLAN-per-project-blob-backend). With
+# this ON and `BOATRAMP_BLOB_PERPROJECT_MUTATION` set, `CompositeBlobBackends::backend` resolves the
+# GLOBAL default for EVERY project instead of its own backend — the exact "wrong/global backend for a
+# project that declared its own" regression — so the isolation gate goes RED, proving the per-project
+# resolution is load-bearing. Compiled OUT of every real build.
+blob-perproject-gate-mutation = []
 
 [dependencies]
 boatramp-core.workspace = true

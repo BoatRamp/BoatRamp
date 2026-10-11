@@ -723,14 +723,8 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
         // `[serve.blob_backends]` (which would fall a configured project back to the global backend —
         // surprising, and against invariant 4's no-silent-fallback), REFUSE loud. Single-node serves
         // them fully. (A follow-up can build them in `run_cluster` after the replicated KV is up.)
-        if !serve_cfg.blob_backends.is_empty() {
-            return Err(Error::S3Ingress(format!(
-                "[serve.blob_backends] (per-project blob backends) is not supported on the cluster \
-                 path in this release ({} project(s) configured): their sealed credentials need the \
-                 replicated control-plane KV, which is unavailable at blob-build time on a cluster. \
-                 Remove [serve.blob_backends] or run single-node.",
-                serve_cfg.blob_backends.len()
-            )));
+        if let Some(msg) = cluster_per_project_backend_refusal(&serve_cfg.blob_backends) {
+            return Err(Error::S3Ingress(msg));
         }
         // #505 (cluster path): the blob storage must be built BEFORE the Raft node (it feeds
         // `build_node` for cross-node message payloads), which is before the replicated control-plane KV
@@ -1408,6 +1402,27 @@ async fn build_blobs_with_sealed_cred(
 
     let built = build_blobs(&effective, data_dir, notify_tier, notify_account).await?;
     Ok((built, resolved))
+}
+
+/// The cluster-path refusal for per-project blob backends (PLAN-per-project-blob-backend): `Some(msg)`
+/// when `[serve.blob_backends]` is non-empty on a cluster, `None` otherwise. Per-project sealed
+/// `boatramp:` credentials resolve against the REPLICATED control-plane KV, which does not exist at
+/// blob-build time on a cluster (the blob backend is built BEFORE the Raft node) — so rather than
+/// silently ignore an operator's explicit config (which would fall a configured project back to the
+/// global backend, against invariant 4's no-silent-fallback), the serve REFUSES loud. Extracted as a
+/// pure predicate so the fail-closed behavior is unit-testable without standing up a cluster.
+fn cluster_per_project_backend_refusal(
+    configs: &std::collections::BTreeMap<String, boatramp_node::config::BlobBackendConfig>,
+) -> Option<String> {
+    (!configs.is_empty()).then(|| {
+        format!(
+            "[serve.blob_backends] (per-project blob backends) is not supported on the cluster path \
+             in this release ({} project(s) configured): their sealed credentials need the \
+             replicated control-plane KV, which is unavailable at blob-build time on a cluster. \
+             Remove [serve.blob_backends] or run single-node.",
+            configs.len()
+        )
+    })
 }
 
 /// Build the per-project blob backends from `[serve.blob_backends]` (PLAN-per-project-blob-backend).
@@ -4130,6 +4145,8 @@ mod tests {
         KvOpenFailureRoute, declared_kv_writer_model, kv_open_failure_route,
         multi_writer_cluster_refusal,
     };
+    // Per-project blob-backend fail-closed gates (PLAN-per-project-blob-backend) — NOT cluster-gated.
+    use super::{Error, build_per_project_blob_backends, cluster_per_project_backend_refusal};
     use boatramp_core::kv::WriterModel;
     use boatramp_node::backends::KvBackend;
     use boatramp_node::config::SqlKvConfig;
@@ -4139,6 +4156,97 @@ mod tests {
             kind: kind.to_string(),
             ..Default::default()
         }
+    }
+
+    /// PLAN-per-project-blob-backend (fail-closed #4): a per-project backend with NO `blobs` kind MUST
+    /// error the serve build — never a silent `fs` backend at the shared node dir that wouldn't isolate
+    /// the project's blobs.
+    #[tokio::test]
+    async fn per_project_backend_without_kind_fails_closed() {
+        use boatramp_node::config::BlobBackendConfig;
+        let mut configs = std::collections::BTreeMap::new();
+        configs.insert("acme".to_string(), BlobBackendConfig::default()); // blobs: None
+        let kv: std::sync::Arc<dyn boatramp_core::kv::KvStore> =
+            std::sync::Arc::new(boatramp_core::kv::MemoryKv::new());
+        // Can't `.expect_err` — the Ok type (`HashMap<_, Arc<dyn Storage>>`) isn't `Debug`.
+        let err = match build_per_project_blob_backends(
+            &configs,
+            kv,
+            None,
+            std::path::Path::new("/tmp"),
+            true,
+        )
+        .await
+        {
+            Err(e) => e,
+            Ok(_) => panic!("a per-project backend with no kind must fail closed, not build"),
+        };
+        let msg = err.to_string();
+        assert!(
+            matches!(err, Error::S3Ingress(_)) && msg.contains("must set `blobs`"),
+            "a kindless per-project backend must refuse the serve (never a silent fs fallback); got: {msg}"
+        );
+    }
+
+    /// PLAN-per-project-blob-backend (fail-closed #4): a per-project backend whose sealed credential
+    /// cannot be resolved (here an `env:` ref under a posture that forbids host-env refs) MUST error the
+    /// serve build — never a silent fallback to the global/ambient chain or another project's backend.
+    #[tokio::test]
+    async fn per_project_backend_unresolvable_credential_fails_closed() {
+        use boatramp_node::config::{BlobBackendConfig, S3CredentialConfig};
+        let mut configs = std::collections::BTreeMap::new();
+        configs.insert(
+            "acme".to_string(),
+            BlobBackendConfig {
+                blobs: Some(boatramp_node::backends::BlobBackend::Fs),
+                s3_credential: Some(S3CredentialConfig {
+                    access_key_id: "AKIA".to_string(),
+                    // An `env:` ref — refused BEFORE any backend build when the posture forbids host-env
+                    // refs (multi-tenant), so this errors feature-independently (no envelope/KV needed).
+                    secret_access_key: "env:NOPE_UNSET_VAR".to_string(),
+                }),
+                ..Default::default()
+            },
+        );
+        let kv: std::sync::Arc<dyn boatramp_core::kv::KvStore> =
+            std::sync::Arc::new(boatramp_core::kv::MemoryKv::new());
+        let err = match build_per_project_blob_backends(
+            &configs,
+            kv,
+            None,
+            std::path::Path::new("/tmp"),
+            false, // allow_env_secret_refs = false ⇒ an `env:` ref is refused
+        )
+        .await
+        {
+            Err(e) => e,
+            Ok(_) => panic!("an unresolvable per-project credential must fail closed, not build"),
+        };
+        assert!(
+            matches!(err, Error::S3Ingress(_)) && err.to_string().contains("acme"),
+            "an unresolvable per-project credential must refuse the serve, naming the project; got: {err}"
+        );
+    }
+
+    /// PLAN-per-project-blob-backend: a non-empty `[serve.blob_backends]` on the CLUSTER path is refused
+    /// LOUD (its sealed creds need the replicated KV, absent at blob-build time) — never silently
+    /// ignored into a global-backend fallback. An empty map proceeds (no refusal).
+    #[test]
+    fn cluster_refuses_per_project_backends() {
+        use boatramp_node::config::BlobBackendConfig;
+        let empty = std::collections::BTreeMap::new();
+        assert!(
+            cluster_per_project_backend_refusal(&empty).is_none(),
+            "an empty [serve.blob_backends] must NOT be refused on the cluster path"
+        );
+        let mut configs = std::collections::BTreeMap::new();
+        configs.insert("acme".to_string(), BlobBackendConfig::default());
+        let msg = cluster_per_project_backend_refusal(&configs)
+            .expect("a non-empty [serve.blob_backends] must be refused on the cluster path");
+        assert!(
+            msg.contains("cluster") && msg.contains("blob_backends"),
+            "the cluster refusal must name the cluster + the offending section; got: {msg}"
+        );
     }
 
     /// C7/UX-C4 — the DECLARED writer model is derived WITHOUT opening the store: Postgres/MySQL are

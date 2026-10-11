@@ -2635,6 +2635,12 @@ pub(super) async fn put_trigger_handler(
         // On a cloud object store a native pipeline (S3→SQS, …) must be
         // provisioned per the operator tier before the watch can fire. A
         // self-watching backend (fs) has no provider and needs nothing.
+        //
+        // PLAN-per-project-blob-backend LIMITATION: this watch PROVIDER is the GLOBAL one
+        // (`built_blobs.watch_provider`); per-project backends have no own provider in this cut. So a
+        // per-project S3 bucket's `blob` trigger is NOT provisioned here — the `supports_watch()` gate
+        // above fail-closes it with a clear 400 (a per-project self-watching `fs` backend still works).
+        // A per-project cloud trigger provider is a follow-up.
         if let Some(provider) = inner.watch_provider.get() {
             let storage_prefix = blob_storage_prefix(project.as_ref(), &name, prefix);
             let tier = inner.provision_tier.get().copied().unwrap_or_default();

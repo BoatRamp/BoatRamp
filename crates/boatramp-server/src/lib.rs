@@ -4149,21 +4149,21 @@ mod tests {
             .expect("seed blob");
     }
 
-    /// BP-3 (PLAN-per-project-blob-backend): a handler bound to project A reads its OWN backend, never
-    /// project B's; an UNCONFIGURED project (and the reserved `default`) resolve the GLOBAL default,
-    /// never another project's backend. Drives the REAL guest `wasi:blobstore` read-path
-    /// (`read_object_through_guest_binding`) over the backend the runtime's resolver picks for each
-    /// HOST-resolved project — exactly what `build_bindings` passes to `with_blobstore`.
+    /// BP-2 (PLAN-per-project-blob-backend): the `HandlerRuntime` CARRIES the per-project resolver and
+    /// the field the `wasi:blobstore` binding build reads (`inner.blob_backends`) resolves per
+    /// HOST-resolved project — project A reads its OWN backend, an unconfigured project (and `default`)
+    /// read the GLOBAL default, never another project's. Proven through the REAL guest `wasi:blobstore`
+    /// read-path over the resolved backend.
     ///
-    /// MUTATION-VERIFIABLE (the #503/#499 gate convention): three physically distinct backends hold a
-    /// DISTINCT sentinel at the SAME key, so the only thing deciding which bytes a read returns is WHICH
-    /// backend the project resolved. A resolver mutation that (a) returns the global for a configured
-    /// project, or (b) returns project B's backend for A, makes the guest read the WRONG sentinel → this
-    /// test FAILS. Key-prefix confinement still runs on top (invariant 2). Gate:
-    /// `BLOB PER-PROJECT ISOLATION OK`.
+    /// This covers the runtime-WIRING (that `new_with_backends` stores the resolver and the binding
+    /// build consults it). The AUTHORITATIVE, mutation-verified, DECORATED cross-project isolation gate
+    /// — `BLOB PER-PROJECT ISOLATION OK` — lives in boatramp-node
+    /// (`handlers::perproject_isolation_gate`), where the real `wrap_blob_backend` decoration +
+    /// `marker-cache`/`hedged` storage features are reachable (boatramp-server's `handlers` feature
+    /// does not pull them). Key-prefix confinement still runs on top (invariant 2).
     #[cfg(feature = "handlers")]
     #[tokio::test]
-    async fn blob_backend_is_bound_per_project_and_isolated() {
+    async fn blob_backend_runtime_carries_resolver_and_resolves_per_project() {
         use boatramp_core::blob_backends::BlobBackends;
         use boatramp_handlers::{HandlerEngine, Limits};
 
@@ -4225,7 +4225,9 @@ mod tests {
             b"global-default",
             "the reserved default project resolves the global default"
         );
-        println!("BLOB PER-PROJECT ISOLATION OK");
+        // NOTE: the `BLOB PER-PROJECT ISOLATION OK` CI gate marker is emitted by the authoritative,
+        // decorated, mutation-verified gate in boatramp-node — not here (this is the runtime-wiring
+        // unit test).
     }
 
     /// Build an `ObservedInstance` for the wake-from-zero helper tests, owned by

@@ -33,6 +33,16 @@ impl CompositeBlobBackends {
 
 impl BlobBackends for CompositeBlobBackends {
     fn backend(&self, project: ProjectRef<'_>) -> Arc<dyn Storage> {
+        // GATE MUTATION SEAM (PLAN-per-project-blob-backend isolation gate): force the resolver to
+        // ignore the per-project map and hand EVERY project the GLOBAL default — the exact "resolve the
+        // wrong/global backend for a project that declared its own" regression the cross-project
+        // isolation gate must catch. Compiled OUT of every shipped build (feature off by default); the
+        // gate turns it on and re-runs the isolation test, which MUST then go RED (a pass-under-mutation
+        // is a hollow gate). Placed FIRST so it defeats the real resolution below.
+        #[cfg(feature = "blob-perproject-gate-mutation")]
+        if std::env::var("BOATRAMP_BLOB_PERPROJECT_MUTATION").is_ok_and(|v| !v.is_empty()) {
+            return Arc::clone(&self.default);
+        }
         // A configured non-default project gets its own backend; everything else (the reserved
         // `default` project, any unconfigured project) gets the GLOBAL default — never another
         // project's backend, so a missing/misspelled entry can only fall CLOSED to the shared default,
