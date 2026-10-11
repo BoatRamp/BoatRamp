@@ -127,6 +127,9 @@ blob-upload = ["engine", "dep:async-trait"]
 boatramp-core.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true }
+# CIDR matching for the gated `wasi:sockets` outbound-TCP allowlist (PLAN-handler-tcp-egress):
+# a `CIDR:port` allowlist entry is matched structurally against the resolved connect IP.
+ipnet.workspace = true
 
 wasmtime = { workspace = true, optional = true }
 wasmtime-wasi = { workspace = true, optional = true }

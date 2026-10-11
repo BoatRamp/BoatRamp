@@ -153,6 +153,13 @@ pub struct Bindings {
     /// deploy's static `env` plus the site's resolved `secrets`. The guest sees
     /// *only* these — the host's own environment is never inherited.
     env: Vec<(String, String)>,
+    /// Per-handler **outbound-TCP allowlist** for the gated `wasi:sockets` capability
+    /// (`PLAN-handler-tcp-egress`): the `host:port` / `ip:port` / `CIDR:port` targets this
+    /// invocation may `connect` to. Empty ⇒ deny-all (the engine installs no permissive
+    /// `socket_addr_check`, so every connect is refused). Consulted by the engine's `new_store`
+    /// only when the node posture `allow_guest_tcp_egress` is on; even then the gate is
+    /// connect-only and SSRF-floored. Never guest-supplied — host config on the deploy record.
+    egress_allowlist: Arc<[String]>,
 }
 
 impl Bindings {
@@ -307,6 +314,23 @@ impl Bindings {
     /// The guest's environment variables.
     pub(crate) fn env(&self) -> &[(String, String)] {
         &self.env
+    }
+
+    /// Set this invocation's per-handler outbound-TCP `egress_allowlist` for the gated
+    /// `wasi:sockets` capability (`PLAN-handler-tcp-egress`). Entries are `host:port` / `ip:port` /
+    /// `CIDR:port`. Attach ONLY when the component is granted `wasi:sockets` (declared import + site
+    /// allow-list); an ungranted or empty allowlist leaves the engine's deny-all socket default in
+    /// place. Host config on the deploy record — never guest-supplied.
+    #[must_use]
+    pub fn with_egress_allowlist(mut self, allowlist: Vec<String>) -> Self {
+        self.egress_allowlist = Arc::from(allowlist);
+        self
+    }
+
+    /// This invocation's outbound-TCP allowlist (empty ⇒ deny-all). Read by the engine's `new_store`
+    /// when the node posture permits TCP egress; the `Arc` clone is cheap (per-request hot path).
+    pub(crate) fn egress_allowlist(&self) -> Arc<[String]> {
+        self.egress_allowlist.clone()
     }
 
     /// The granted SQL databases (`name -> backend`).

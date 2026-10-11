@@ -532,6 +532,8 @@ pub(super) async fn dispatch_handler(
         &handler.upload_containers,
         // Per-component plain-`wasi:blobstore` container allowlist (host-enforced tenant confinement).
         &handler.blobstore_containers,
+        // Per-handler outbound-TCP allowlist for the gated `wasi:sockets` capability: empty ⇒ deny-all.
+        &handler.egress_allowlist,
         // Per-guest secret allowlist (task #492): empty ⇒ the whole site pool, else only these keys.
         &handler.secrets,
         // Ask B-3 (B): `no_secrets` ⇒ resolve ZERO site secrets for this handler (a blob/image route
@@ -1968,6 +1970,12 @@ pub(super) async fn build_bindings(
     // multi-tenant site ⇒ deny-all (fail-closed); empty single-tenant ⇒ permissive. Only consulted
     // when `wasi:blobstore` is granted.
     blobstore_containers: &[String],
+    // Per-handler outbound-TCP allowlist for the gated `wasi:sockets` capability
+    // (`PLAN-handler-tcp-egress`): the `host:port` / `ip:port` / `CIDR:port` targets this component
+    // may `connect` to. Empty ⇒ deny-all (least-privilege). Attached to the bindings ONLY when
+    // `wasi:sockets` is granted (declared import + site allow); the engine's `socket_addr_check` then
+    // enforces it connect-only + SSRF-floored, and ONLY when the node posture allows TCP egress.
+    egress_allowlist: &[String],
     // Per-guest secret allowlist (task #492): the subset of the site `[handlers].secrets` pool KEYS
     // this guest is granted. Empty ⇒ inject the whole pool (default, non-breaking); non-empty ⇒ inject
     // only the named keys (least-privilege). Filtered at the `resolve_env` choke point below.
@@ -2737,6 +2745,13 @@ pub(super) async fn build_bindings(
         t.set_secret_env(t_secret_env.elapsed().as_micros() as u64);
     }
     bindings = bindings.with_env(env);
+    // Attach the gated `wasi:sockets` outbound-TCP allowlist ONLY when the component is granted the
+    // capability (declared import + site allow). Deny-by-default: an ungranted component leaves the
+    // allowlist empty, so the engine keeps the socket host deny-all — and even a granted component
+    // reaches nothing unless the node posture `allow_guest_tcp_egress` is on (enforced in the engine).
+    if granted("wasi:sockets") && !egress_allowlist.is_empty() {
+        bindings = bindings.with_egress_allowlist(egress_allowlist.to_vec());
+    }
     Ok(bindings)
 }
 
@@ -3176,6 +3191,9 @@ pub(super) struct ConsumerRebuild<'a> {
     /// The consumer's per-component plain-`wasi:blobstore` container allowlist (host-enforced tenant
     /// confinement). Threaded so a per-message rebuild confines blob access identically to the tick build.
     pub blobstore_containers: &'a [String],
+    /// The consumer's per-component outbound-TCP `egress_allowlist` for the gated `wasi:sockets`
+    /// capability. Empty ⇒ deny-all. Threaded so a per-message rebuild gates socket egress identically.
+    pub egress_allowlist: &'a [String],
     /// The consumer's per-guest secret allowlist (task #492): the subset of the site pool KEYS it is
     /// granted. Empty ⇒ the whole pool. Threaded so a per-message rebuild scopes secrets identically
     /// to the once-per-tick build.
@@ -3206,6 +3224,7 @@ impl ConsumerRebuild<'_> {
             self.tenant_secret_names,
             self.upload_containers,
             self.blobstore_containers,
+            self.egress_allowlist,
             self.secret_allowlist,
             // Consumers resolve their secrets as before (no `no_secrets` opt-out on the async lane).
             false,

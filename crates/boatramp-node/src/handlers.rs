@@ -148,6 +148,10 @@ pub async fn build_handler_runtime(
     max_component_bytes: u64,
     // Posture: whether a guest's outbound `wasi:http` may reach private/loopback hosts.
     allow_guest_private_egress: bool,
+    // Posture: whether a guest's gated `wasi:sockets` capability may open an outbound TCP `connect`
+    // (`PLAN-handler-tcp-egress`). Off under multi-tenant; when off the engine installs no permissive
+    // socket check, so every connect fails closed regardless of a handler's `egress_allowlist`.
+    allow_guest_tcp_egress: bool,
     // Posture: the instance's own serve socket(s) a guest self-call may reach (empty ⇒ off).
     self_egress_addrs: Vec<std::net::SocketAddr>,
     // Dev-posture guest-egress extra CA(s), DER-encoded (empty ⇒ stock webpki-only egress trust).
@@ -348,6 +352,7 @@ pub async fn build_handler_runtime(
     }
     .with_outbound_timeout(outbound_timeout)
     .with_private_egress(allow_guest_private_egress)
+    .with_tcp_egress(allow_guest_tcp_egress)
     .with_self_egress(self_egress_addrs)
     .with_guest_egress_extra_roots(guest_egress_extra_roots);
     let sql = build_sql_backends(

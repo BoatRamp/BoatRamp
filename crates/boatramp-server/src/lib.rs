@@ -7436,6 +7436,8 @@ mod tests {
                     &[],
                     // Plain-`wasi:blobstore` container allowlist (tenant confinement): empty ⇒ permissive here.
                     &[],
+                    // Outbound-TCP `egress_allowlist` (gated `wasi:sockets`): empty ⇒ deny-all.
+                    &[],
                     // Per-guest secret allowlist (task #492): empty ⇒ the whole site pool.
                     &[],
                     // no_secrets (Ask B-3 B): false ⇒ unchanged.
@@ -7580,6 +7582,8 @@ mod tests {
                 // Blob-upload container allowlist (S3 ingress): empty ⇒ deny-all.
                 &[],
                 // Plain-`wasi:blobstore` container allowlist (tenant confinement): empty ⇒ permissive here.
+                &[],
+                // Outbound-TCP `egress_allowlist` (gated `wasi:sockets`): empty ⇒ deny-all.
                 &[],
                 // Per-guest secret allowlist (task #492): empty ⇒ the whole site pool.
                 &[],
@@ -7755,6 +7759,7 @@ mod tests {
             tenant_secret_names: &[],
             upload_containers: &[],
             blobstore_containers: &[],
+            egress_allowlist: &[],
             secret_allowlist: &[],
         };
 
