@@ -353,6 +353,23 @@ jobs:
           grep -q 'SERVER-TIMING DEFAULT-OFF OK' secret-floor.log \
             || { echo "::error::the Server-Timing response header is no longer default-off" >&2; exit 1; }
 
+      # v0.29.0 NEGATIVE-CACHE SECRET-SCOPING GATE. `CachedKv` caches an ABSENCE (negative lookup) to
+      # kill the ~400 ms-per-serve unset-secret re-read, but ONLY for the secret keyspace — an authz
+      # "absent ⇒ permit" key (token revocation `authz/revoked/<cti>`, policy, `domain/<host>`) must
+      # stay read-through fresh, or a stale tombstone would mask a peer node's freshly-written
+      # revoke/deny under shared/multi-writer HA (the security-review finding for this release). This
+      # gate runs the scoping tests and asserts they RAN (the marker + pass count catch a silent
+      # skip/rename/`#[cfg]`-out of exactly the test that locks the invariant).
+      - name: Negative-cache secret-scoping gate (authz absence stays read-through fresh)
+        run: |
+          set -eo pipefail
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-core --lib \
+            kv::tests::negative_cacheable_anchors_to_the_secret_keyspace -- --nocapture 2>&1 | tee negcache.log
+          grep -qE 'test result: ok\. 1 passed' negcache.log \
+            || { echo "::error::negative-cache secret-scoping gate did not run (silent skip or a failure)" >&2; exit 1; }
+          grep -q 'NEGATIVE-CACHE SECRET-SCOPED OK' negcache.log \
+            || { echo "::error::CachedKv negative caching is no longer anchored to the secret keyspace — an authz 'absent ⇒ permit' key could be masked by a stale tombstone" >&2; exit 1; }
+
       # #503 CROSS-SURFACE HARD GATE (marker `SCOPED UNSCOPED-WRITE CROSS-SURFACE OK`, mirrors the
       # v0.5.0 `DB-NAME SCREENING CROSS-SURFACE OK` convention). A `scoped` route may WRITE a
       # genuinely-global table via two opt-ins (write-global `unscoped { writable: true }` OR a

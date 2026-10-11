@@ -19,7 +19,9 @@ use futures::{StreamExt, TryStreamExt};
 
 use azure_core_v1::Bytes as AzBytes;
 use azure_core_v1::error::ErrorKind;
-use azure_core_v1::http::{ClientOptions, RequestContent, StatusCode, Url};
+use azure_core_v1::http::{
+    ClientOptions, ExponentialRetryOptions, RequestContent, RetryOptions, StatusCode, Url,
+};
 use azure_storage_blob::models::{
     BlobClientDeleteOptions, BlobClientDownloadOptions, BlobClientGetPropertiesResultHeaders,
     BlobContainerClientListBlobsOptions, BlockBlobClientCommitBlockListOptions,
@@ -457,6 +459,14 @@ fn build_blob_service(opts: &AzureOptions) -> Result<BlobServiceClient, StorageE
     let options = BlobServiceClientOptions {
         client_options: ClientOptions {
             per_try_policies: vec![policy],
+            // Bound the retry window and cap attempts (the SDK default is 8 retries over 60s) so a slow
+            // or flapping Azure endpoint can't stall a serve for a minute. The hedged-read wrapper
+            // (`crate::HedgedStorage`) handles the common fetch tail; this caps the pathological case.
+            retry: RetryOptions::exponential(ExponentialRetryOptions {
+                max_retries: 2,
+                max_total_elapsed: azure_core_v1::time::Duration::seconds(15),
+                ..Default::default()
+            }),
             ..Default::default()
         },
         ..Default::default()

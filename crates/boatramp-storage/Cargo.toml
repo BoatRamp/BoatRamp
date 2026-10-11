@@ -32,6 +32,10 @@ gcs = [
   "dep:google-cloud-pubsub",
   "dep:serde_json",
   "dep:bytes",
+  # A timeout-bounded `reqwest` client is injected as the GCS SDK's HTTP client (its `ClientConfig.http`
+  # takes a `reqwest_middleware::ClientWithMiddleware`); the SDK otherwise uses an unbounded default.
+  "dep:reqwest",
+  "dep:reqwest-middleware",
   "tokio/sync",
 ]
 # Azure Blob backend (GA azure-sdk-for-rust 1.x — the single Azure generation).
@@ -74,6 +78,10 @@ cache = ["dep:lru", "dep:bytes"]
 # `.boatramp-container` HEAD round-trip without touching confinement. Needs `bytes` (the `Storage`
 # zero-copy accessor it delegates). No `lru` — a small capped map suffices for tiny marker metas.
 marker-cache = ["dep:bytes"]
+# The hedged-read blob wrapper (`HedgedStorage`): races a second read against a slow first one to cut
+# the serve-path fetch tail. Backend-agnostic (decorates any `Storage`); needs tokio time/sync/macros
+# for the delayed race + the concurrent-hedge cap. Rides the serve path alongside `marker-cache`.
+hedged = ["tokio/time", "tokio/sync", "tokio/macros"]
 # A read-fallback composite over two `Storage` backends (blob-backend migration Part 2):
 # serve the new (primary) backend first, fall through to the old (secondary) on a
 # definitive, allowlisted primary miss, so a `--blobs` switch has no serving gap while
@@ -165,6 +173,9 @@ sha2 = { workspace = true, optional = true }
 subtle = { workspace = true, optional = true }
 base64 = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
+# Wraps the timeout-bounded `reqwest` client into the GCS SDK's `ClientConfig.http` (matches the
+# `reqwest-middleware 0.4` the GCS 0.24 SDK itself uses).
+reqwest-middleware = { version = "0.4", optional = true }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 slatedb = { workspace = true, optional = true }

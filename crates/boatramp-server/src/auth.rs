@@ -470,9 +470,11 @@ impl AuthInner {
     }
 
     /// Whether the token's revocation id (`cti`) is marked revoked. `Ok(true)` = revoked; `Ok(false)`
-    /// = a clean absence (`CachedKv` never caches an absent key, so a freshly-written revoke is seen
-    /// at once — revocation is fresh by construction); `Err` = the store was UNREACHABLE, so the
-    /// caller fails CLOSED in shared mode (MF-4).
+    /// = a clean absence — the `authz/revoked/<cti>` key is NOT in `CachedKv`'s secret keyspace, so its
+    /// absence is never negative-cached ([`boatramp_core::kv::CachedKv::negative_cacheable`] gates
+    /// tombstones to the secret keyspace precisely so "absent ⇒ not revoked" stays read-through fresh);
+    /// a freshly-written revoke on any node is therefore seen at once — revocation is fresh by
+    /// construction. `Err` = the store was UNREACHABLE, so the caller fails CLOSED in shared mode (MF-4).
     async fn revocation(&self, cti: &str, is_write: bool) -> Result<bool, KvError> {
         let (store, _) = self.authz_read_store(is_write);
         store

@@ -14,9 +14,25 @@ use aws_sdk_s3::error::{DisplayErrorContext, ProvideErrorMetadata, SdkError};
 use aws_sdk_s3::operation::RequestId;
 use aws_sdk_s3::primitives::ByteStream as AwsByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::blob_fault;
+
+/// Bound a stuck TCP/TLS **connect** and a single hung **attempt** on every S3 client build. A dead or
+/// slow-to-establish connection to an external store (Tigris/R2/MinIO) is a common cause of the
+/// serve-path blob-fetch p99 tail; without an explicit ceiling the AWS SDK default lets a pathological
+/// connect/attempt hang far longer than a healthy fetch (p50 ≈ 16ms) ever needs. These bound only the
+/// *pathological* case — a legitimately slow-but-progressing fetch is left alone (the hedged-read
+/// wrapper, [`crate::HedgedStorage`], races the *typical* tail). Applied uniformly so every S3-compatible
+/// backend gets the same ceiling.
+fn with_http_tuning(builder: aws_sdk_s3::config::Builder) -> aws_sdk_s3::config::Builder {
+    builder.timeout_config(
+        aws_sdk_s3::config::timeout::TimeoutConfig::builder()
+            .connect_timeout(Duration::from_secs(2))
+            .operation_attempt_timeout(Duration::from_secs(10))
+            .build(),
+    )
+}
 
 /// Size of each multipart-upload part. S3 requires every part except the last
 /// to be at least 5 MiB; 8 MiB keeps part counts low while bounding the buffer.
@@ -146,6 +162,7 @@ impl S3Storage {
                 secret_access_key,
             ));
         }
+        let builder = with_http_tuning(builder);
         Self::new(aws_sdk_s3::Client::from_conf(builder.build()), opts.bucket)
     }
 
@@ -180,6 +197,7 @@ impl S3Storage {
         if opts.force_path_style {
             builder = builder.force_path_style(true);
         }
+        let builder = with_http_tuning(builder);
         let s3 = aws_sdk_s3::Client::from_conf(builder.build());
         let sqs = aws_sdk_sqs::Client::new(&shared);
         let storage = Self::new(s3.clone(), opts.bucket.clone()).with_sqs_notify(sqs.clone());

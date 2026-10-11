@@ -581,6 +581,41 @@ impl ServerConfig {
             }
         }
 
+        // --- handler concurrency lanes (`[handlers]` serve/sync/async caps) ------
+        // Env parity for the per-component serve-admission gate and the two lane ceilings, so a
+        // file-less (`[env]`-only) fleet can tune them without a `boatramp.cfg` + roll (these were
+        // previously the last `[handlers]` scalars with no env lever, which pinned a knob like
+        // `serve_concurrency` into the config file). Materialises `[handlers]` only when one is set.
+        // Each is an `Option<usize>` set as-is; `serve_concurrency = 0` is the MEANINGFUL "disable the
+        // gate" value, and a `sync_max_concurrency = 0` is rejected downstream (the global sync lane is
+        // a required safety ceiling) — the env lever changes neither semantic, only the input path.
+        if source.any(HANDLER_CONCURRENCY_ENV_VARS) {
+            let handlers = self.handlers.get_or_insert_with(HandlersConfig::default);
+            if let Some(v) = source.parse("BOATRAMP_HANDLERS_SERVE_CONCURRENCY")? {
+                handlers.serve_concurrency = Some(v);
+            }
+            if let Some(v) = source.parse("BOATRAMP_HANDLERS_SYNC_MAX_CONCURRENCY")? {
+                handlers.sync_max_concurrency = Some(v);
+            }
+            if let Some(v) = source.parse("BOATRAMP_HANDLERS_ASYNC_MAX_CONCURRENCY")? {
+                handlers.async_max_concurrency = Some(v);
+            }
+        }
+
+        // --- handler blob-serve hedge (`[handlers]` blob_hedge_*) ----------------
+        // Env parity for the hedged-read tail knobs, so an env-only fleet can turn hedging on (and tune
+        // its delay / concurrent-hedge cap) without a `boatramp.cfg`. Materialises `[handlers]` only when
+        // one is set; `delay_ms` unset/0 keeps hedging off (one GET per read).
+        if source.any(HANDLER_BLOB_HEDGE_ENV_VARS) {
+            let handlers = self.handlers.get_or_insert_with(HandlersConfig::default);
+            if let Some(v) = source.parse("BOATRAMP_HANDLERS_BLOB_HEDGE_DELAY_MS")? {
+                handlers.blob_hedge_delay_ms = Some(v);
+            }
+            if let Some(v) = source.parse("BOATRAMP_HANDLERS_BLOB_HEDGE_MAX_INFLIGHT")? {
+                handlers.blob_hedge_max_inflight = Some(v);
+            }
+        }
+
         // --- handler sql external databases (`handlers.bindings.sql.databases`) ---
         // The bring-your-own / managed-compute DB map, keyed by name. There is no
         // config file to enumerate the members, so the member names are discovered
@@ -687,6 +722,44 @@ impl ServerConfig {
                 if let Some(v) = source.get(&format!("{prefix}TENANT_ALL_MARKER")) {
                     db.tenant_all_marker = Some(v);
                 }
+            }
+        }
+
+        // --- serve S3-ingress cloud brokering (`[serve.s3_ingress_cloud]`) ---
+        // Env parity for the blob-upload minter's cloud-brokering policy, so a file-less fleet (e.g. the
+        // Tigris presigned-only deployment, whose `boatramp.cfg` existed ONLY to carry
+        // `aws_presigned_only`) needs no config file. Materialises the nested struct only when one is
+        // set. These are POLICY toggles, not key material: the AWS base credential the mint signs from
+        // stays the sealed `[secrets]` one (`BOATRAMP_SECRETS_*`), unchanged. `aws_role_arn` /
+        // `aws_use_federation_token` / `aws_presigned_only` remain mutually validated at wiring — the env
+        // lever is only the input path, not a relaxation of that fail-loud check.
+        if source.any(S3_INGRESS_CLOUD_ENV_VARS) {
+            let serve = self.serve.get_or_insert_with(ServeConfig::default);
+            let ic = serve
+                .s3_ingress_cloud
+                .get_or_insert_with(S3IngressCloud::default);
+            if let Some(v) = source.get("BOATRAMP_S3_INGRESS_CLOUD_AWS_ROLE_ARN") {
+                ic.aws_role_arn = Some(v);
+            }
+            if let Some(v) =
+                source.parse_bool("BOATRAMP_S3_INGRESS_CLOUD_AWS_USE_FEDERATION_TOKEN")?
+            {
+                ic.aws_use_federation_token = v;
+            }
+            if let Some(v) = source.parse_bool("BOATRAMP_S3_INGRESS_CLOUD_AWS_PRESIGNED_ONLY")? {
+                ic.aws_presigned_only = v;
+            }
+            if let Some(v) = source.get("BOATRAMP_S3_INGRESS_CLOUD_GCS_CLIENT_EMAIL") {
+                ic.gcs_client_email = Some(v);
+            }
+            if let Some(v) = source.get("BOATRAMP_S3_INGRESS_CLOUD_AZURE_ACCOUNT") {
+                ic.azure_account = Some(v);
+            }
+            if let Some(v) = source.get("BOATRAMP_S3_INGRESS_CLOUD_AZURE_SERVICE_URL") {
+                ic.azure_service_url = Some(v);
+            }
+            if let Some(v) = source.parse_bool("BOATRAMP_S3_INGRESS_CLOUD_AZURE_HNS")? {
+                ic.azure_hns = v;
             }
         }
 
@@ -935,6 +1008,36 @@ const JWKS_ENV_VARS: &[&str] = &[
     "BOATRAMP_HANDLERS_JWKS_FOREIGN_REFRESH_SECS",
     "BOATRAMP_HANDLERS_JWKS_FOREIGN_HARD_TTL_SECS",
     "BOATRAMP_HANDLERS_JWKS_PREWARM",
+];
+
+/// The `[handlers]` concurrency-lane env levers (per-component serve-admission gate + the global
+/// sync/async lane ceilings), mirroring the `serve_concurrency` / `sync_max_concurrency` /
+/// `async_max_concurrency` fields on [`HandlersConfig`]. Kept in sync by the forgot-a-knob guard test.
+const HANDLER_CONCURRENCY_ENV_VARS: &[&str] = &[
+    "BOATRAMP_HANDLERS_SERVE_CONCURRENCY",
+    "BOATRAMP_HANDLERS_SYNC_MAX_CONCURRENCY",
+    "BOATRAMP_HANDLERS_ASYNC_MAX_CONCURRENCY",
+];
+
+/// The `[handlers]` hedged-blob-read env levers (serve-path fetch-tail cut), mirroring the
+/// `blob_hedge_delay_ms` / `blob_hedge_max_inflight` fields on [`HandlersConfig`]. Kept in sync by the
+/// forgot-a-knob guard test.
+const HANDLER_BLOB_HEDGE_ENV_VARS: &[&str] = &[
+    "BOATRAMP_HANDLERS_BLOB_HEDGE_DELAY_MS",
+    "BOATRAMP_HANDLERS_BLOB_HEDGE_MAX_INFLIGHT",
+];
+
+/// The `[serve.s3_ingress_cloud]` env levers (the blob-upload minter's cloud-brokering policy),
+/// mirroring the fields on [`S3IngressCloud`]. Kept in sync by the forgot-a-knob guard test. These are
+/// policy toggles only; the signing credential stays the sealed `[secrets]` one.
+const S3_INGRESS_CLOUD_ENV_VARS: &[&str] = &[
+    "BOATRAMP_S3_INGRESS_CLOUD_AWS_ROLE_ARN",
+    "BOATRAMP_S3_INGRESS_CLOUD_AWS_USE_FEDERATION_TOKEN",
+    "BOATRAMP_S3_INGRESS_CLOUD_AWS_PRESIGNED_ONLY",
+    "BOATRAMP_S3_INGRESS_CLOUD_GCS_CLIENT_EMAIL",
+    "BOATRAMP_S3_INGRESS_CLOUD_AZURE_ACCOUNT",
+    "BOATRAMP_S3_INGRESS_CLOUD_AZURE_SERVICE_URL",
+    "BOATRAMP_S3_INGRESS_CLOUD_AZURE_HNS",
 ];
 
 /// The fixed prefix of a keyed `handlers.bindings.sql.databases` variable —
@@ -1445,6 +1548,20 @@ pub struct HandlersConfig {
     /// containers, so the default is generous headroom.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blob_marker_cache_entries: Option<usize>,
+    /// **Hedged blob-read delay** (milliseconds). When a serve's object GET has not returned within this
+    /// many ms, the host races a SECOND GET and takes whichever lands first — cutting the serve-path
+    /// fetch tail on an external store (measured: `blob_range` p50 ≈ 16ms but p99 ≈ 727ms, with CPU
+    /// idle). Blob reads are idempotent, so the hedge is always safe; the loser is cancelled. Absent/`0`
+    /// ⇒ disabled (one GET per read). Set it a little above the warm p90 (e.g. 60–100ms) so only the
+    /// genuinely-slow tail hedges. Pairs with [`blob_hedge_max_inflight`](Self::blob_hedge_max_inflight).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blob_hedge_delay_ms: Option<u64>,
+    /// **Concurrent-hedge cap** — the max number of in-flight hedge (second) reads at once. Guards against
+    /// a hedge storm when the whole store is slow (every read would otherwise double): over the cap a slow
+    /// read simply waits on its single request. Absent ⇒ a small internal default (16). Only meaningful
+    /// when [`blob_hedge_delay_ms`](Self::blob_hedge_delay_ms) is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blob_hedge_max_inflight: Option<usize>,
     /// **Per-component serve-admission concurrency** (image-serve-latency Ask B). Caps how many
     /// requests to the SAME component (keyed by content hash) are concurrently inside the expensive
     /// `build_bindings` + instantiate + serve-to-head region; a burst beyond it (e.g. a gallery firing
@@ -3722,6 +3839,94 @@ mod tests {
             assert!(
                 JWKS_ENV_VARS.contains(&var),
                 "{var} missing from JWKS_ENV_VARS — a JWKS freshness knob lost its env lever"
+            );
+        }
+    }
+
+    #[test]
+    fn env_wires_the_handler_concurrency_knobs_over_the_default() {
+        // The per-component serve-admission gate + the two lane ceilings are env-settable (12-factor
+        // parity), and every lever is registered in HANDLER_CONCURRENCY_ENV_VARS — a forgot-a-knob guard
+        // so a new concurrency field can't silently lose its env override and get pinned back into a
+        // `boatramp.cfg`. `serve_concurrency = 0` is the MEANINGFUL "disable the gate" value and must
+        // round-trip as `Some(0)`, not be dropped.
+        let mut cfg = ServerConfig::default();
+        assert!(cfg.handlers.is_none());
+        cfg.apply_env_overrides(&env(&[
+            ("BOATRAMP_HANDLERS_SERVE_CONCURRENCY", "0"),
+            ("BOATRAMP_HANDLERS_SYNC_MAX_CONCURRENCY", "128"),
+            ("BOATRAMP_HANDLERS_ASYNC_MAX_CONCURRENCY", "16"),
+        ]))
+        .expect("valid env overrides apply");
+        let h = cfg.handlers.expect("handlers materialised from env");
+        assert_eq!(h.serve_concurrency, Some(0), "0 = disable must round-trip");
+        assert_eq!(h.sync_max_concurrency, Some(128));
+        assert_eq!(h.async_max_concurrency, Some(16));
+        for var in [
+            "BOATRAMP_HANDLERS_SERVE_CONCURRENCY",
+            "BOATRAMP_HANDLERS_SYNC_MAX_CONCURRENCY",
+            "BOATRAMP_HANDLERS_ASYNC_MAX_CONCURRENCY",
+        ] {
+            assert!(
+                HANDLER_CONCURRENCY_ENV_VARS.contains(&var),
+                "{var} missing from HANDLER_CONCURRENCY_ENV_VARS — a concurrency knob lost its env lever"
+            );
+        }
+    }
+
+    #[test]
+    fn env_wires_the_blob_hedge_knobs_over_the_default() {
+        // The hedged-read tail knobs are env-settable so a file-less fleet can turn hedging on and tune
+        // it; every lever is registered in HANDLER_BLOB_HEDGE_ENV_VARS (forgot-a-knob guard).
+        let mut cfg = ServerConfig::default();
+        assert!(cfg.handlers.is_none());
+        cfg.apply_env_overrides(&env(&[
+            ("BOATRAMP_HANDLERS_BLOB_HEDGE_DELAY_MS", "80"),
+            ("BOATRAMP_HANDLERS_BLOB_HEDGE_MAX_INFLIGHT", "24"),
+        ]))
+        .expect("valid env overrides apply");
+        let h = cfg.handlers.expect("handlers materialised from env");
+        assert_eq!(h.blob_hedge_delay_ms, Some(80));
+        assert_eq!(h.blob_hedge_max_inflight, Some(24));
+        for var in [
+            "BOATRAMP_HANDLERS_BLOB_HEDGE_DELAY_MS",
+            "BOATRAMP_HANDLERS_BLOB_HEDGE_MAX_INFLIGHT",
+        ] {
+            assert!(
+                HANDLER_BLOB_HEDGE_ENV_VARS.contains(&var),
+                "{var} missing from HANDLER_BLOB_HEDGE_ENV_VARS — a hedge knob lost its env lever"
+            );
+        }
+    }
+
+    #[test]
+    fn env_wires_the_s3_ingress_cloud_knobs_over_the_default() {
+        // The blob-upload minter's cloud-brokering policy is env-settable, so the Tigris presigned-only
+        // deployment needs no `boatramp.cfg` for it. Every lever is registered in
+        // S3_INGRESS_CLOUD_ENV_VARS (forgot-a-knob guard). The signing credential is NOT here — it stays
+        // the sealed `[secrets]` one; these are policy toggles only.
+        let mut cfg = ServerConfig::default();
+        assert!(cfg.serve.is_none());
+        cfg.apply_env_overrides(&env(&[(
+            "BOATRAMP_S3_INGRESS_CLOUD_AWS_PRESIGNED_ONLY",
+            "true",
+        )]))
+        .expect("valid env overrides apply");
+        let ic = cfg
+            .serve
+            .expect("serve materialised from env")
+            .s3_ingress_cloud
+            .expect("s3_ingress_cloud materialised from env");
+        assert!(ic.aws_presigned_only, "presigned-only toggled on via env");
+        assert!(
+            !ic.aws_use_federation_token,
+            "untouched toggle stays default"
+        );
+        assert!(ic.aws_role_arn.is_none(), "untouched field stays None");
+        for var in S3_INGRESS_CLOUD_ENV_VARS {
+            assert!(
+                var.starts_with("BOATRAMP_S3_INGRESS_CLOUD_"),
+                "{var} is not an s3_ingress_cloud lever"
             );
         }
     }

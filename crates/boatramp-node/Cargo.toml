@@ -99,6 +99,9 @@ handlers = [
   # The serve path dedups the per-request container-marker HEAD via a process-wide marker cache
   # (confinement-preserving); a handlers node always wires it.
   "boatramp-storage/marker-cache",
+  # The serve path can hedge a slow blob read (race a 2nd GET) to cut the fetch tail; opt-in at runtime
+  # via `[handlers] blob_hedge_delay_ms` / its env, off by default — a handlers node always ships it.
+  "boatramp-storage/hedged",
   "sql",
 ]
 # External bring-your-own SQL for the handler `sql` binding (each implies handlers).

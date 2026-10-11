@@ -113,6 +113,17 @@ impl GcsStorage {
         if let Some(endpoint) = opts.endpoint {
             config.storage_endpoint = endpoint;
         }
+        // Inject a timeout-bounded HTTP client (the SDK's default is unbounded): a stuck or slow GCS
+        // endpoint is capped at a connect + overall ceiling instead of hanging a serve. The hedged-read
+        // wrapper (`crate::HedgedStorage`) handles the common fetch tail; this caps the pathological
+        // case. `ClientConfig.http` takes a `reqwest_middleware::ClientWithMiddleware`, so the tuned
+        // `reqwest` client is wrapped with a no-op middleware builder.
+        let http = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(2))
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .map_err(|err| StorageError::backend(format!("GCS http client: {err}")))?;
+        config.http = Some(reqwest_middleware::ClientBuilder::new(http).build());
         Ok(Self::new(Client::new(config), opts.bucket))
     }
 

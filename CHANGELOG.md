@@ -5,6 +5,52 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.29.0] - 2026-10-11
+
+Image-serve-latency, continued — the remaining boatramp-side wins after an on-node investigation
+settled that the dominant cost on a small shared-CPU box is CPU-steal, not boatramp logic (measured:
+moving the node to dedicated CPU collapsed a 48-image cold burst from ~11s to ~0.4s, and per-phase
+timing showed the serve path itself — secret resolution, binding resolve, instantiate — at sub-millisecond
+once CPU was available). The levers that *are* boatramp's: cache the hot absent-secret lookup, cut the
+per-read SQL round-trips, hedge the slow blob fetch, and make every serve knob env-settable so a
+12-factor fleet can tune them without a `boatramp.cfg`. Plus a security hardening of the negative cache.
+
+- **Negative-lookup caching for secrets (scoped).** `CachedKv` now caches an ABSENCE as well as a
+  present value, so a declared-but-unset `boatramp:<NAME>` secret ref — re-resolved on every serve —
+  stops re-hitting the backing LSM (a negative lookup scans SST filters to prove absence; ~240–400 ms
+  per missing secret per serve on a network-volume control plane). **Security:** the absence cache is
+  ANCHORED to the secret keyspace only (`secret/…`, `project/<p>/secret/…`, `project/<p>/tenant-secret/…`).
+  Every other key — token-revocation markers, access policy, domain routing — stays read-through on
+  absence, because those encode "absent ⇒ permit" and a stale tombstone would mask a peer node's
+  freshly-written revoke/deny under shared/multi-writer HA. Present values are cached for every key
+  (invalidated by the existing write signals); only the absence is scoped.
+- **Fewer SQL round-trips per read.** A per-serve read transaction's open + RLS setup now ships as ONE
+  Postgres simple-query command (`BEGIN READ ONLY; SELECT set_config(…), …`) instead of a separate
+  `BEGIN` then `SELECT set_config` — and the N per-GUC `set_config` calls fold into one statement. The
+  inlined GUC literals are escaped with the `E'…'` escape-string form (doubling both `'` and `\`), so
+  the inlining is injection-safe regardless of the server's `standard_conforming_strings` setting; the
+  names are fixed config and the values are host-resolved, path-segment-safe ids (never guest text).
+- **Hedged blob reads (`HedgedStorage`).** An opt-in decorator over any blob backend: when a serve's
+  object GET has not returned within `[handlers] blob_hedge_delay_ms`, it races a second GET and takes
+  whichever lands first (blob reads are idempotent; the loser is cancelled), capped by
+  `blob_hedge_max_inflight` so a store-wide brown-out can't amplify load. This trades spare CPU for a
+  tighter fetch tail — measured on Tigris at concurrency 96, the serve-path `blob_range` p99 dropped
+  **491 ms → 92 ms** with hedging on. Off by default.
+- **Bounded blob-backend transport.** The S3 client now sets explicit connect/attempt timeouts
+  (2 s / 10 s); GCS gets a timeout-bounded HTTP client (2 s / 30 s); Azure caps its retry window
+  (2 retries / 15 s). These bound a stuck external-store fetch instead of hanging a serve; no change to
+  auth, credentials, or TLS verification.
+- **12-factor serve knobs (env parity).** The per-component serve-admission gate
+  (`BOATRAMP_HANDLERS_SERVE_CONCURRENCY`), the sync/async lane ceilings
+  (`…_SYNC_MAX_CONCURRENCY` / `…_ASYNC_MAX_CONCURRENCY`), the blob-hedge knobs
+  (`…_BLOB_HEDGE_DELAY_MS` / `…_BLOB_HEDGE_MAX_INFLIGHT`), and the blob-upload minter's cloud-brokering
+  policy (`BOATRAMP_S3_INGRESS_CLOUD_*`) are now env-settable. Together with the existing
+  `BOATRAMP_BLOBS` / `BOATRAMP_S3_*` and `…_POOL_MAX`, an env-only deployment no longer needs a
+  `boatramp.cfg` for the serve path. These are operator config / policy toggles only — no secret or
+  credential value is accepted via env (the signing credential stays the sealed `[secrets]` one).
+- **Component-scoped secrets (`no_secrets`)** + a `gate_wait` serve phase and a `secretget` timing
+  phase for serve-path observability.
+
 ## [0.28.0] - 2026-10-10
 
 Image-serve-latency Ask B-3 — the remaining warm-serve floor, plus a security hardening. A local

@@ -519,6 +519,11 @@
               pkgs.nixfmt
               # WebAssembly component tooling for the `handlers` engine.
               pkgs.wasm-tools
+              # Playwright MCP (browser e2e / live-serve diagnosis): the stdio MCP server with a
+              # Nix-pinned, version-matched Chromium baked in via PLAYWRIGHT_BROWSERS_PATH — no npm
+              # `playwright install` download, fully reproducible. The Claude Code MCP (gitignored
+              # `.mcp.json`) launches it via `nix develop --command playwright-mcp`.
+              pkgs.playwright-mcp
               # Node.js for the JS function template's `jco componentize` build
               # (`boatramp function build` fetches a version-pinned `jco` via npx).
               pkgs.nodejs

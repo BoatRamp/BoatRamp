@@ -98,6 +98,11 @@ pub mod marker_cache;
 #[cfg(feature = "fallback")]
 pub mod fallback;
 
+/// The hedged-read blob wrapper (`HedgedStorage`) — races a second read against a slow first one to cut
+/// the serve-path fetch tail (idempotent reads, spare CPU). Backend-agnostic decorator over `Storage`.
+#[cfg(feature = "hedged")]
+pub mod hedged;
+
 /// The backend-agnostic **blob-backend migration** copy engine (`list`/`head`/`get`/`put`
 /// over the [`Storage`](boatramp_core::Storage) trait). Drives both the offline node-local
 /// `boatramp blob migrate` (re-exported as `boatramp_node::blob_migrate`) and the
@@ -155,6 +160,8 @@ pub use cache::CachedStorage;
 
 pub use timing::{BlobOpTiming, TimingStorage};
 
+#[cfg(feature = "hedged")]
+pub use hedged::HedgedStorage;
 #[cfg(feature = "marker-cache")]
 pub use marker_cache::MarkerHeadCache;
 
