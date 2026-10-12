@@ -126,7 +126,7 @@ pub async fn run(args: MigrateArgs, config: &ServerConfig) -> Result<(), Error> 
         // Substrate-complete gate (Finding 8, HIGH-2c): clearing the KV dual soak disengages the
         // runtime blob read-fallback, so refuse until blob (the marker `blob rehome --finalize` sets)
         // AND libsql (a cheap on-disk scan) are re-homed.
-        finalize_substrate_gate(kv.as_ref(), &args.node_config).await?;
+        finalize_substrate_gate(kv.as_ref(), &args.node_config, &data_dir).await?;
         migrate::finalize(kv.as_ref()).await?
     } else {
         // FORCE STAGE (Finding 8, HIGH-2a): the default-scope re-home MUST enter the dual soak so the
@@ -161,17 +161,15 @@ pub async fn run(args: MigrateArgs, config: &ServerConfig) -> Result<(), Error> 
 async fn finalize_substrate_gate(
     kv: &dyn boatramp_core::kv::KvStore,
     node_config: &std::path::Path,
+    data_dir: &std::path::Path,
 ) -> Result<(), Error> {
     let node_cfg = boatramp_node::config::ServerConfig::load(node_config, None)?;
-    let data_dir = node_cfg
-        .serve
-        .as_ref()
-        .and_then(|s| s.data_dir.clone())
-        .unwrap_or_else(|| PathBuf::from("./data"));
     let mut outstanding: Vec<String> = Vec::new();
 
-    // libsql: a cheap on-disk scan of the node's libsql dir (local bindings only).
-    if let Some(dir) = boatramp_node::default_scope::libsql_dir_for(&node_cfg, &data_dir) {
+    // libsql: a cheap on-disk scan of the node's libsql dir (local bindings only). Use the SAME
+    // run-level `data_dir` the serve guard + `assemble` use (honoring `--data-dir`), NOT
+    // `node_cfg.serve.data_dir` — a `--data-dir`-overridden node keeps its DBs under the override.
+    if let Some(dir) = boatramp_node::default_scope::libsql_dir_for(&node_cfg, data_dir) {
         let projects = boatramp_node::default_scope::known_projects(kv).await?;
         let bare = boatramp_node::default_scope::libsql_bare_default_idents(&dir, &projects);
         if !bare.is_empty() {

@@ -180,4 +180,83 @@ mod tests {
         std::fs::write(tmp.path().join("default").join("blog.db"), b"x").unwrap();
         assert!(libsql_bare_default_idents(tmp.path(), &HashSet::new()).is_empty());
     }
+
+    /// A list-only in-memory `Storage` double (only `list` is exercised by the detector).
+    #[derive(Default)]
+    struct KeyStore {
+        keys: Vec<String>,
+    }
+    #[async_trait::async_trait]
+    impl Storage for KeyStore {
+        async fn get(&self, key: &str) -> Result<boatramp_core::GetObject, StorageError> {
+            Err(StorageError::NotFound(key.into()))
+        }
+        async fn get_range(
+            &self,
+            key: &str,
+            _: u64,
+            _: Option<u64>,
+        ) -> Result<boatramp_core::GetObject, StorageError> {
+            Err(StorageError::NotFound(key.into()))
+        }
+        async fn put(
+            &self,
+            key: &str,
+            _: boatramp_core::ByteStream,
+            _: boatramp_core::PutMeta,
+        ) -> Result<boatramp_core::ObjectMeta, StorageError> {
+            Err(StorageError::unsupported(key))
+        }
+        async fn head(&self, key: &str) -> Result<boatramp_core::ObjectMeta, StorageError> {
+            Err(StorageError::NotFound(key.into()))
+        }
+        async fn delete(&self, _: &str) -> Result<(), StorageError> {
+            Ok(())
+        }
+        async fn list(&self, prefix: &str) -> Result<Vec<boatramp_core::ObjectMeta>, StorageError> {
+            Ok(self
+                .keys
+                .iter()
+                .filter(|k| k.starts_with(prefix))
+                .map(|k| boatramp_core::ObjectMeta {
+                    key: k.clone(),
+                    size: Some(1),
+                    content_type: None,
+                    etag: None,
+                })
+                .collect())
+        }
+    }
+
+    #[tokio::test]
+    async fn blob_detector_true_for_bare_default_false_when_rehomed_or_named() {
+        let projects: HashSet<String> = ["default", "acme"].iter().map(|s| s.to_string()).collect();
+
+        // A bare default-scoped object (`hblob/{site}/…`, site not a project) ⇒ outstanding.
+        let bare: Arc<dyn Storage> = Arc::new(KeyStore {
+            keys: vec![
+                "hblob/default/shop/c/ok".into(), // already re-homed
+                "hblob/acme/site/c/ok".into(),    // named project
+                "hblob/blog/c/needs".into(),      // BARE default scope — the one that matters
+            ],
+        });
+        assert!(
+            blob_default_outstanding(&bare, &projects).await.unwrap(),
+            "a bare default-scoped blob object must read as outstanding"
+        );
+
+        // Only re-homed + named-project objects (across all three families) ⇒ NOT outstanding.
+        let clean: Arc<dyn Storage> = Arc::new(KeyStore {
+            keys: vec![
+                "hblob/default/blog/c/ok".into(),
+                "mqp/default/blog/orders/17".into(),
+                "mqgp/default/blog/orders/18".into(),
+                "hblob/acme/site/c/ok".into(),
+            ],
+        });
+        assert!(
+            !blob_default_outstanding(&clean, &projects).await.unwrap(),
+            "re-homed + named-project objects only must NOT read as outstanding"
+        );
+    }
 }

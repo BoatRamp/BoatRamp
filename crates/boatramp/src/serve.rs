@@ -3345,13 +3345,11 @@ async fn run_cluster(
         }
     }
     // HIGH-1b/HIGH-3: refuse to serve an un-re-homed default-project libsql (a remote sqld binding is
-    // a no-op here). Derive the data dir from config (the cluster path keeps no `data_dir` local).
-    let cluster_data_dir = config
-        .serve
-        .as_ref()
-        .and_then(|s| s.data_dir.clone())
-        .unwrap_or_else(|| std::path::PathBuf::from("./data"));
-    default_scope_libsql_guard(config, &cluster_data_dir, kv.as_ref()).await?;
+    // a no-op here). Use the run-level `data_dir` PARAMETER — the SAME value `assemble(NodeInput {
+    // data_dir: data_dir.as_path(), … })` builds the SQL backend from below — so the guard scans
+    // exactly where the DBs live (identical source to the single-node guard). A `--data-dir` override
+    // that differs from `config.serve.data_dir` must NOT be scanned at the wrong path.
+    default_scope_libsql_guard(config, &data_dir, kv.as_ref()).await?;
 
     // Cluster-wide rate limiting shares the *replicated* RaftKv across nodes.
     if args.cluster_rate_limit || config.serve.as_ref().is_some_and(|s| s.cluster_rate_limit) {
