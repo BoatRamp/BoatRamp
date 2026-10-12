@@ -109,6 +109,11 @@ pub fn router_with_fast(
             posture.domain_verify_allow_private,
         ))
     });
+    // The generic DNS record-verifier probe (`verify-records`). Built ONCE here so
+    // its DoH resolver + positive/negative cache are reused for the server's life.
+    let record_probe: Arc<dyn boatramp_core::record_verify::RecordProbe> = options
+        .record_probe
+        .unwrap_or_else(|| Arc::new(domain_verify::ServerRecordProbe::new()));
     let upload_guard = Arc::new(UploadGuard::new(options.limits));
     // Rate-limit backend: a cluster-wide KV fixed-window when configured, else
     // the per-node in-process token buckets.
@@ -174,6 +179,14 @@ pub fn router_with_fast(
         .route(
             "/api/sites/{site}/domains/{host}/attach-unverified",
             post(domain_verify::attach_domain_unverified),
+        )
+        // Operator-only generic multi-record DNS verifier (record-set verify, Phase 1).
+        // Read-only (attaches/persists nothing); gated at `system·admin` in
+        // `authz::Right::required` — it resolves arbitrary record names, so a
+        // site-scoped publisher must never reach it (the `attach-unverified` precedent).
+        .route(
+            "/api/sites/{site}/domains/{host}/verify-records",
+            post(domain_verify::verify_records),
         )
         .route("/api/sites/{site}/aliases", get(list_aliases))
         .route(
@@ -646,6 +659,7 @@ pub fn router_with_fast(
         .layer(Extension(bootstrap))
         .layer(Extension(mesh_control))
         .layer(Extension(probe))
+        .layer(Extension(record_probe))
         .layer(Extension(operator_sql_cap))
         .layer(Extension(migration_substrate_cap))
         .layer(Extension(tenant_repair_cap))
