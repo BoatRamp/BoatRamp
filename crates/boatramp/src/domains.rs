@@ -110,6 +110,59 @@ enum DomainCommand {
     },
     /// List the site's hostnames and any pending verifications.
     Ls,
+    /// **Operator only.** Verify a set of DNS records resolve as expected (a
+    /// read-only diagnostic — it attaches and persists nothing). Each `--record`
+    /// is `KIND[/MODE]:NAME=VALUE`, where KIND is `txt`|`mx`|`cname`|`a` and MODE
+    /// is `exact` (default) | `contains` | `prefix` (`contains`/`prefix` are TXT
+    /// only). Needs a server built with `domain-verify-dns` and a `system·admin`
+    /// token.
+    VerifyRecords {
+        /// Host this record set belongs to (operator context; records name
+        /// themselves).
+        host: String,
+        /// A record spec `KIND[/MODE]:NAME=VALUE` (repeatable), e.g.
+        /// `txt:_acme.example.com=tok`, `a:example.com=192.0.2.1`,
+        /// `txt/contains:_dmarc.example.com=p=reject`.
+        #[arg(long = "record", short = 'r', required = true, value_name = "SPEC")]
+        records: Vec<String>,
+    },
+}
+
+/// Parse one `KIND[/MODE]:NAME=VALUE` record spec. `VALUE` is everything after the
+/// first `=`, so it may itself contain `=`/`:` (e.g. a DMARC policy or an IPv6
+/// address); `NAME` has no `=`.
+fn parse_record_spec(raw: &str) -> Result<boatramp_core::record_verify::RecordSpec> {
+    use boatramp_core::record_verify::{MatchMode, RecordKind, RecordSpec};
+
+    let bad = |msg: &str| {
+        Error::Verify(format!(
+            "invalid --record `{raw}`: {msg} (expected KIND[/MODE]:NAME=VALUE)"
+        ))
+    };
+    let (kind_part, rest) = raw.split_once(':').ok_or_else(|| bad("missing `:`"))?;
+    let (name, value) = rest.split_once('=').ok_or_else(|| bad("missing `=`"))?;
+    if name.is_empty() {
+        return Err(bad("empty record name"));
+    }
+    let (kind_str, mode_str) = match kind_part.split_once('/') {
+        Some((k, m)) => (k, m),
+        None => (kind_part, "exact"),
+    };
+    let kind = kind_str
+        .parse::<RecordKind>()
+        .map_err(|e| bad(&e.to_string()))?;
+    let match_mode = mode_str
+        .parse::<MatchMode>()
+        .map_err(|e| bad(&e.to_string()))?;
+    let spec = RecordSpec {
+        kind,
+        name: name.to_string(),
+        value: value.to_string(),
+        match_mode,
+    };
+    // Reject an illegal (kind, mode) pair locally, before the round-trip.
+    spec.validate().map_err(|e| bad(&e.to_string()))?;
+    Ok(spec)
 }
 
 /// Entry point for `boatramp domain`.
@@ -224,6 +277,37 @@ pub async fn run(args: DomainArgs, config: &ProjectConfig) -> Result<()> {
             cp.remove_domain_verification(&site, &host).await?;
             println!("detached {host} from {site}");
             Ok(())
+        }
+        DomainCommand::VerifyRecords { host, records } => {
+            let specs = records
+                .iter()
+                .map(|r| parse_record_spec(r))
+                .collect::<Result<Vec<_>>>()?;
+            let report = cp.verify_records(&site, &host, &specs).await?;
+            for (spec, status) in specs.iter().zip(report.records.iter()) {
+                let mark = match status.status {
+                    boatramp_core::record_verify::RecordState::Ok => "ok",
+                    boatramp_core::record_verify::RecordState::Mismatch => "MISMATCH",
+                    boatramp_core::record_verify::RecordState::Missing => "MISSING",
+                };
+                let found = if status.found.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    status.found.join(", ")
+                };
+                println!(
+                    "{mark}  {} {} = {}  [found: {found}]",
+                    spec.kind, spec.name, spec.value
+                );
+            }
+            if report.verified {
+                println!("\nall {} record(s) verified for {host}", specs.len());
+                Ok(())
+            } else {
+                Err(Error::Verify(format!(
+                    "one or more records did not verify for {host}"
+                )))
+            }
         }
     }
 }
