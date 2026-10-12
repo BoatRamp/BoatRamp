@@ -682,6 +682,82 @@ jobs:
             fi
           done
 
+      # DEFAULT-SCOPE DISJOINTNESS gate (v0.31.0 Finding 8): `ProjectRef::qualified` is two-segment
+      # for EVERY project INCLUDING the reserved `default` (`default/{base}`), so a default-project
+      # workload's client-composed-key keyspace (`hblob/`, `hkv/`, `mq*/`) is prefix-disjoint from
+      # every named project's — closing the collision where the pre-fix bare-default scope `acme` was
+      # a prefix of the named project `acme`'s `acme/…`. Marker `DEFAULT-SCOPE DISJOINT OK`.
+      # MUTATION-VERIFIED: `BOATRAMP_DEFAULTSCOPE_MUTATE_BARE_QUALIFIED` (via the
+      # `default-scope-gate-mutation` feature) restores the bare-default branch in `qualified()` → RED.
+      - name: "default-scope disjointness gate (Finding 8: default is a two-segment project)"
+        run: |
+          set -eo pipefail
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-core \
+            --features default-scope-gate-mutation default_scope_disjoint_gate -- --nocapture 2>&1 | tee default-scope-disjoint.log
+          grep -qE 'test result: ok\. 1 passed' default-scope-disjoint.log \
+            || { echo "::error::default-scope disjointness gate did not run (silent skip or a failure)" >&2; exit 1; }
+          grep -q 'DEFAULT-SCOPE DISJOINT OK' default-scope-disjoint.log \
+            || { echo "::error::default-scope disjointness gate never reached its marker (a default-project scope regression — Finding 8)" >&2; exit 1; }
+          if BOATRAMP_DEFAULTSCOPE_MUTATE_BARE_QUALIFIED=1 cargo-zigbuild test --target x86_64-unknown-linux-musl \
+            -p boatramp-core --features default-scope-gate-mutation default_scope_disjoint_gate \
+            -- --nocapture > default-scope-disjoint-mutation.log 2>&1; then
+            echo "::error::default-scope disjointness gate is HOLLOW — it passed with the bare-default branch restored (the Finding 8 collision is not actually closed)" >&2
+            exit 1
+          else
+            echo "default-scope disjointness mutation verified: BARE_QUALIFIED turns the gate RED."
+          fi
+
+      # DEFAULT-SCOPE RESERVATION gate (v0.31.0 Finding 8): `create_project` reserves the `default`
+      # project name (409 with the RESERVED message), so a NAMED `default` project can never be
+      # created to re-collide with the reserved default's own two-segment scope — WITHOUT adding a
+      # `default` rejection to `validate_resource_name` (which must keep accepting it). Marker
+      # `DEFAULT-SCOPE RESERVE OK`. MUTATION-VERIFIED: `BOATRAMP_DEFAULTSCOPE_MUTATE_ACCEPT_DEFAULT`
+      # drops the reservation, so the create falls through to the generic conflict (not the RESERVED
+      # message) and the gate goes RED.
+      - name: "default-scope project-reservation gate (Finding 8: `default` reserved at create)"
+        run: |
+          set -eo pipefail
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-server \
+            --features default-scope-gate-mutation create_project_reserves_default -- --nocapture 2>&1 | tee default-scope-reserve.log
+          grep -qE 'test result: ok\. 1 passed' default-scope-reserve.log \
+            || { echo "::error::default-scope reservation gate did not run (silent skip or a failure)" >&2; exit 1; }
+          grep -q 'DEFAULT-SCOPE RESERVE OK' default-scope-reserve.log \
+            || { echo "::error::default-scope reservation gate never reached its marker" >&2; exit 1; }
+          if BOATRAMP_DEFAULTSCOPE_MUTATE_ACCEPT_DEFAULT=1 cargo-zigbuild test --target x86_64-unknown-linux-musl \
+            -p boatramp-server --features default-scope-gate-mutation create_project_reserves_default \
+            -- --nocapture > default-scope-reserve-mutation.log 2>&1; then
+            echo "::error::default-scope reservation gate is HOLLOW — create_project accepted the reserved default project under the mutation" >&2
+            exit 1
+          else
+            echo "default-scope reservation mutation verified: ACCEPT_DEFAULT turns the gate RED."
+          fi
+
+      # DEFAULT-SCOPE BLOB READ-FALLBACK + RETIRE gate (v0.31.0 Finding 8, blob substrate): the
+      # translating read-fallback serves a bare `hblob/{site}/…` object at the new `hblob/default/…`
+      # spelling the post-flip runtime composes, and the re-home `retire` deletes an old key ONLY
+      # after its new key verifies present (copy-before-delete). Marker `DEFAULT-SCOPE FALLBACK OK`.
+      # MUTATION-VERIFIED: `DISABLE_FALLBACK` (the fallback stops serving the old datum) and
+      # `RETIRE_BEFORE_VERIFY` (retire deletes the source before the new key verifies) each → RED.
+      - name: "default-scope blob read-fallback + retire gate (Finding 8: copy-before-delete)"
+        run: |
+          set -eo pipefail
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-storage \
+            --features default-scope-gate-mutation default_scope_fallback_gate -- --nocapture 2>&1 | tee default-scope-fallback.log
+          grep -qE 'test result: ok\. 1 passed' default-scope-fallback.log \
+            || { echo "::error::default-scope blob fallback gate did not run (silent skip or a failure)" >&2; exit 1; }
+          grep -q 'DEFAULT-SCOPE FALLBACK OK' default-scope-fallback.log \
+            || { echo "::error::default-scope blob fallback gate never reached its marker" >&2; exit 1; }
+          for mut in DISABLE_FALLBACK RETIRE_BEFORE_VERIFY; do
+            if env "BOATRAMP_DEFAULTSCOPE_MUTATE_$mut=1" cargo-zigbuild test --target x86_64-unknown-linux-musl \
+              -p boatramp-storage --features default-scope-gate-mutation default_scope_fallback_gate \
+              -- --nocapture > "default-scope-fallback-mutation-$mut.log" 2>&1; then
+              echo "::error::default-scope blob fallback gate is HOLLOW — it passed under mutation '$mut'" >&2
+              exit 1
+            else
+              echo "default-scope fallback mutation verified: '$mut' turns the gate RED."
+            fi
+          done
+
       # BLOB-READ FAULT-CLASS gate (boatramp-blob-read-error-granularity): a failed blob read
       # (`get`/`get_range`/`head`) must classify its concrete outcome — 404 / 403 AccessDenied / 416 /
       # throttle (503/429) / 5xx / transport — into DISTINCT kinds, so a 403 under-scoped credential or
