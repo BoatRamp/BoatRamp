@@ -1371,21 +1371,34 @@ pub(super) async fn run_scheduler_tick(
     {
         match messaging.indexed_topics().await {
             Ok(indexed) => {
+                // v0.31.0 Finding 8 soak (polish #6): during the default-scope dual soak the OLD
+                // bare-spelling topics linger alongside their re-homed `default/…` twins. The old
+                // topic is no longer covered (consumers now subscribe to `default/…`), so it would
+                // falsely read as orphaned. Suppress an uncovered bare topic whose `default/<topic>`
+                // twin is ALSO indexed — that is a soak leftover, not genuine uncovered work. (A
+                // genuinely-bare topic with a live consumer is COVERED and never reaches this branch.)
+                let indexed_set: std::collections::HashSet<&String> = indexed.iter().collect();
                 let mut orphaned = std::collections::BTreeMap::new();
-                for topic in indexed {
+                for topic in &indexed {
                     // Covered if ANY active subscription matches this concrete topic (an exact
                     // literal or a `{tenant}` template) — reuse the SAME matcher the dispatch uses,
                     // so the orphaned signal and the delivery path agree exactly.
                     let covered = active_subscriptions.iter().any(|sub| {
-                        boatramp_core::messaging::tenant_tmpl_matches(sub, &topic).is_some()
+                        boatramp_core::messaging::tenant_tmpl_matches(sub, topic).is_some()
                     });
                     if covered {
+                        continue;
+                    }
+                    // Suppress a default-scope soak leftover (an un-finalized old bare spelling).
+                    if !topic.starts_with("default/")
+                        && indexed_set.contains(&format!("default/{topic}"))
+                    {
                         continue;
                     }
                     // Uncovered: count its claimable backlog (an uncovered topic is never claimed,
                     // so its whole backlog is never-attempted `attempts=0` work). A topic with zero
                     // backlog is not orphaned work — skip it (idle/drained).
-                    let backlog = messaging.backlog(&topic).await.unwrap_or(0);
+                    let backlog = messaging.backlog(topic).await.unwrap_or(0);
                     if backlog > 0 {
                         tracing::warn!(
                             topic = %topic,
@@ -1394,7 +1407,7 @@ pub(super) async fn run_scheduler_tick(
                              subscription covering it (a declared-but-un-routable consumer, or a \
                              producer with no consumer) — messages will never be delivered"
                         );
-                        orphaned.insert(topic, backlog as u64);
+                        orphaned.insert(topic.clone(), backlog as u64);
                     }
                 }
                 inner.metrics.set_orphaned_topics(orphaned);
