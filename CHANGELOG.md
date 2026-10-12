@@ -81,6 +81,46 @@ matcher), CNAME reported verbatim without chasing, and a per-request spec cap + 
 existing ownership-challenge flow (`domain add`/`verify`) is unchanged. Operator-only for now; an
 importable in-guest capability is deferred pending a guest-egress review.
 
+### Default-scope tenancy fix + no-data-loss migration (BREAKING — Security Finding 8)
+
+`ProjectRef::qualified` no longer special-cases the reserved `default` project to a bare, one-segment
+data-plane scope. It is now **always** two-segment (`qualified(default, "blog") == "default/blog"`),
+so `default` is a normal project, **disjoint** from every named project. The pre-fix bare default
+(`qualified(default, "acme") == "acme"`) was a **prefix of** the named project `acme`'s `acme/…`,
+letting a `default`-project workload collide with a same-named named project across every
+client-composed-key family (`hblob/{scope}/…`, `hkv/{scope}/…`, `mq*/{topic}/…`). Dropping the
+special-case closes the collision at the root.
+
+This **re-homes live tenant data** (`{base}` → `default/{base}`). The control-plane schema version is
+bumped and the serve-startup guard **refuses to serve** a below-version store until it is migrated
+(no silent auto-flip). See [`docs/default-scope-migration.md`](docs/default-scope-migration.md) for
+the full operator runbook. In brief:
+
+- **KV (`hkv/` + all `mq*/`).** A new online migration (`default-scope-rehome`, schema version 2) run
+  by `boatramp migrate` (`--stage` → soak → `--finalize`): copy → read-back verify (never deletes),
+  then a verify-then-delete finalize. Idempotent + prefix-aware — only a bare default scope re-homes
+  (a named project's or an already-`default/`-scoped key is a no-op). Consumer-group **offsets**
+  (`mqgstate`) re-home in the same forward pass as their log, and the old spelling is deleted only at
+  finalize, so there is no lost message and no double-delivery (one authoritative spelling at a time).
+- **Blob (`hblob/`, `mqp/`, `mqgp/`).** During the KV `dual` soak the node wraps every
+  `wasi:blobstore` backend in a **translating read-fallback** (a miss at the new `…/default/…` key
+  retries the old bare key, serves it, and background-copies it forward), so serving has no gap. A
+  `blob_rehome` drain/retire engine re-homes the rest: drain copies + `head`-verifies + never deletes
+  the source; retire deletes an old key only after its new key verifies (copy-before-delete).
+  `blob_fallback_when` now also covers `mqp/`.
+- **libsql SQL.** Local single-node: `LibsqlSqlBackends::rehome_default_site_db` copy-verifies
+  (`VACUUM INTO` → `integrity_check` → remove source + WAL/SHM → drop the cached identity), an
+  operator step. Remote sqld / cluster: a **documented, mandatory** operator step (create the new
+  namespace, copy, cut over) — an in-process remote move is **refused** fail-closed.
+- **Managed Postgres/MySQL (RLS) is UNAFFECTED** — no `qualified()` feeds the managed SQL backends;
+  their tenancy keys on the tenant-axis column, not the scope string. No RLS migration.
+
+`default` stays reserved at **project-create** (409) and a valid resource-name string everywhere else
+(`validate_resource_name` unchanged — DEFAULT_DB_NAME + routing rely on it). Mutation-verified CI
+gates: `DEFAULT-SCOPE DISJOINT OK` (restoring the bare-default branch → RED), `DEFAULT-SCOPE RESERVE
+OK` (accepting a `default` project → RED), and `DEFAULT-SCOPE FALLBACK OK` (disabling the fallback, or
+deleting a source before its new key verifies → RED).
+
 ## [0.30.0] - 2026-10-11
 
 Two capability features, built and security-reviewed in parallel: per-project blob backends, and
