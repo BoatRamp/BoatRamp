@@ -28,19 +28,42 @@ impl<'a> ProjectRef<'a> {
 
     /// Project-qualify a guest **data-plane** namespace `base` (a handler/function
     /// binding scope, a SQL identity, a messaging topic, or a blob-watch storage
-    /// prefix): the bare `base` for the reserved `default` project — so a
-    /// pre-project / single-project store keeps byte-identical keys and needs no
-    /// data migration — else `"<project>/<base>"`. Project names are validated to
-    /// carry no `/` ([`validate_resource_name`]), so the single separator is
-    /// unambiguous. This is the tenant boundary for the guest **data** plane
-    /// (kv/blob/sql/messaging/logs), parallel to the `project/<proj>/…` keys the
-    /// control plane already uses.
+    /// prefix): **always** `"<project>/<base>"`, including the reserved `default`
+    /// project (`qualified(DEFAULT, "blog") == "default/blog"`). Project names are
+    /// validated to carry no `/` ([`validate_resource_name`]), so the single
+    /// separator is unambiguous. This is the tenant boundary for the guest **data**
+    /// plane (kv/blob/sql/messaging/logs), parallel to the `project/<proj>/…` keys
+    /// the control plane already uses.
+    ///
+    /// **v0.31.0 BREAKING (Security Finding 8):** `default` used to special-case to
+    /// the BARE `base` (one segment) so a pre-project / single-project store kept
+    /// byte-identical keys and needed no data migration. That single-segment default
+    /// made a `default`-project workload COLLIDE with a same-named NAMED project across
+    /// every client-composed-key data family (`hblob/{scope}/…`, `hkv/{scope}/…`,
+    /// `mq*/{topic}/…`): e.g. `qualified(DEFAULT, "acme")` == `"acme"` was a prefix of
+    /// `qualified("acme", "blog")` == `"acme/blog"`. Dropping the special-case makes
+    /// `default` a normal two-segment project, DISJOINT from all named projects (no named
+    /// project can be `default` — reserved at project-create). The old "byte-identical
+    /// keys / no data migration" claim is therefore now **FALSE**: a `default`-scoped
+    /// store must be re-homed `{base}` → `default/{base}`. The physical substrates that
+    /// PERSIST the scope string migrate via `boatramp migrate` (KV: `hkv/` + `mq*/`), the
+    /// translating blob read-fallback + drain (blob: `hblob/`, `mqp/`, `mqgp/`), and the
+    /// libsql copy-verify re-home (local `{dir}/{ident}.db`; remote sqld is a documented
+    /// operator step). pg/MySQL RLS is **unaffected** — no `qualified()` feeds the managed
+    /// SQL backends (tenancy there keys on the tenant-axis column, not the scope string),
+    /// so operators must NOT expect an RLS migration.
     pub fn qualified(&self, base: &str) -> String {
-        if self.0 == DEFAULT_PROJECT {
-            base.to_string()
-        } else {
-            format!("{}/{base}", self.0)
+        // GATE MUTATION SEAM (`DEFAULT-SCOPE DISJOINT OK`): restore the pre-fix bare-default branch so
+        // the disjointness gate goes RED — proving the two-segment default scope is load-bearing.
+        // Compiled ONLY under the gate lane; a shipped build (and a plain `cargo test`) has neither.
+        #[cfg(feature = "default-scope-gate-mutation")]
+        if self.0 == DEFAULT_PROJECT
+            && std::env::var("BOATRAMP_DEFAULTSCOPE_MUTATE_BARE_QUALIFIED")
+                .is_ok_and(|v| !v.is_empty() && v != "0")
+        {
+            return base.to_string();
         }
+        format!("{}/{base}", self.0)
     }
 }
 
@@ -726,6 +749,70 @@ mod tests {
         assert!(
             cli_sql_path("").contains("//"),
             "empty db name DOES collapse the path to `//` (why it must be rejected)"
+        );
+    }
+
+    /// v0.31.0 Finding 8: `qualified` is two-segment for EVERY project, including the reserved
+    /// `default` — so a `default`-project workload's data-plane scope is DISJOINT from every named
+    /// project's. The pre-fix bare-default (`qualified(DEFAULT, x) == x`) is gone.
+    #[test]
+    fn qualified_is_two_segment_for_every_project_including_default() {
+        assert_eq!(ProjectRef::DEFAULT.qualified("blog"), "default/blog");
+        assert_eq!(ProjectRef::new("acme").qualified("blog"), "acme/blog");
+        // The exact Finding-8 collision is closed: the default's scope for site "acme" is NOT a
+        // prefix of the named project "acme"'s scope.
+        let d = ProjectRef::DEFAULT.qualified("acme"); // "default/acme"
+        let n = ProjectRef::new("acme").qualified("blog"); // "acme/blog"
+        assert_ne!(d, "acme");
+        for fam in ["hblob", "hkv", "mq", "mqgstate", "mqgp"] {
+            let dk = format!("{fam}/{d}/");
+            let nk = format!("{fam}/{n}/");
+            assert!(
+                !dk.starts_with(&nk) && !nk.starts_with(&dk),
+                "{fam}: default and named scopes must be prefix-disjoint: {dk} vs {nk}"
+            );
+        }
+    }
+
+    /// The mutation-verified `DEFAULT-SCOPE DISJOINT OK` gate (anti-hollow). Compiled ONLY under the
+    /// `default-scope-gate-mutation` feature; `BOATRAMP_DEFAULTSCOPE_MUTATE_BARE_QUALIFIED=1` arms the
+    /// seam in [`ProjectRef::qualified`] that restores the pre-fix bare-default branch, so the
+    /// disjointness assertions below FAIL (the marker is never printed) — proving the two-segment
+    /// default scope is load-bearing.
+    #[cfg(feature = "default-scope-gate-mutation")]
+    #[test]
+    fn default_scope_disjoint_gate() {
+        // For the default project and a named project that SHARE a client-composed name, no segment
+        // can bridge them across `hblob/`, `hkv/`, and `mq*/`.
+        let default_acme = ProjectRef::DEFAULT.qualified("acme"); // must be "default/acme"
+        let named_acme = ProjectRef::new("acme").qualified("blog"); // "acme/blog"
+        assert!(
+            default_acme.starts_with("default/"),
+            "the default scope must be two-segment default/…: {default_acme}"
+        );
+        assert_ne!(
+            default_acme, "acme",
+            "the pre-fix bare-default branch must be gone (BARE_QUALIFIED mutation restores it)"
+        );
+        for fam in ["hblob", "hkv", "mq", "mqgstate", "mqgp", "mqdead"] {
+            // e.g. hblob/{qualified(DEFAULT,"acme")}/{container="blog"}/k
+            let default_key = format!("{fam}/{default_acme}/blog/k");
+            let named_prefix = format!("{fam}/{named_acme}/");
+            assert!(
+                default_key.starts_with(&format!("{fam}/default/")),
+                "{fam}: a default-project key must live under {fam}/default/: {default_key}"
+            );
+            assert!(
+                !default_key.starts_with(&named_prefix),
+                "{fam}: a default-project key must NOT be prefix-related to the named project's \
+                 keyspace {named_prefix} (Finding 8 collision): {default_key}"
+            );
+        }
+        println!(
+            "DEFAULT-SCOPE DISJOINT OK: ProjectRef::qualified is two-segment for every project \
+             including the reserved default, so a default-project workload's hblob/hkv/mq* keyspace \
+             is prefix-disjoint from every named project's (Finding 8 closed). Mutation-verified: \
+             BOATRAMP_DEFAULTSCOPE_MUTATE_BARE_QUALIFIED=1 FAILS this gate."
         );
     }
 }

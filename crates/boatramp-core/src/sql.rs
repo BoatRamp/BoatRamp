@@ -1680,10 +1680,15 @@ pub trait SqlBackends: Send + Sync {
     /// `site` within tenant `project`. The implementation applies its configured
     /// [`PreviewSqlMode`]. The default is [`PreviewSqlMode::Empty`] — an isolated
     /// database keyed by project+site+preview, so a preview can never touch live
-    /// state. The default composition qualifies `site` by `project` first, then
-    /// appends the trusted `_preview/{preview}` suffix (both from validated
-    /// parts), and delegates to [`database`](Self::database) under the reserved
-    /// `default` project so the already-qualified identity is not re-qualified.
+    /// state. The default composition appends the trusted `_preview/{preview}`
+    /// suffix to `site` and delegates to [`database`](Self::database) under the
+    /// **real** `project`, which qualifies the whole once into
+    /// `{project}/{site}/_preview/{preview}` (v0.31.0: this is now
+    /// `default/{site}/_preview/{preview}` for the reserved default — the
+    /// two-segment default scope — never the old bare `{site}/_preview/{preview}`).
+    /// Routing through the real `project` (not `DEFAULT`) is what keeps the
+    /// post–Finding-8 single-qualification correct: delegating under `DEFAULT` would
+    /// now double-prefix `default/`.
     async fn preview_database(
         &self,
         project: &str,
@@ -1691,13 +1696,8 @@ pub trait SqlBackends: Send + Sync {
         name: &str,
         preview: &str,
     ) -> Result<Arc<dyn SqlBackend>, SqlError> {
-        let qualified = crate::project::ProjectRef::new(project).qualified(site);
-        self.database(
-            crate::project::DEFAULT_PROJECT,
-            &format!("{qualified}/_preview/{preview}"),
-            name,
-        )
-        .await
+        self.database(project, &format!("{site}/_preview/{preview}"), name)
+            .await
     }
 
     /// **Relocate** the database `from_name` of `site` within tenant `project` to

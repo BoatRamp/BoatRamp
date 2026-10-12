@@ -1640,9 +1640,13 @@ async fn handler_route_dispatches_through_engine() {
         assert_eq!(&body[..], expected.as_bytes());
     }
 
-    // The counter landed under the site's handler-kv prefix.
+    // The counter landed under the site's handler-kv prefix (v0.31.0 Finding 8: the default
+    // project is now the two-segment `default/blog` scope).
     use boatramp_core::kv::KvStore;
-    assert_eq!(kv.get("hkv/blog/hits").await.unwrap(), Some(b"2".to_vec()));
+    assert_eq!(
+        kv.get("hkv/default/blog/hits").await.unwrap(),
+        Some(b"2".to_vec())
+    );
 }
 
 /// A `KvStore` that sleeps `delay` before each `get`/`put`, modeling slow host-mediated I/O (a remote
@@ -3170,7 +3174,7 @@ async fn webhook_ingress_publishes_verified_event_to_the_bus() {
     let sig = hmac_sha256_hex(b"ingress-key", body);
 
     // A verified webhook is Accepted (202) and the event lands on the project bus
-    // (default project → bare `bus/…`), with the exact body.
+    // (default project → `default/bus/…` since v0.31.0 Finding 8), with the exact body.
     let resp = app
         .clone()
         .oneshot(webhook_request("ingest", body, Some(&sig)))
@@ -3179,7 +3183,7 @@ async fn webhook_ingress_publishes_verified_event_to_the_bus() {
     assert_eq!(resp.status(), StatusCode::ACCEPTED);
     let batch = messaging
         .claim(
-            "bus/orders.created",
+            "default/bus/orders.created",
             std::time::Duration::from_secs(30),
             10,
             5,
@@ -3504,7 +3508,7 @@ async fn function_cron_trigger_runs_a_scheduled_invocation() {
     assert_eq!(triggers.as_array().unwrap().len(), 1);
 
     // The scheduler fires the cron → the scheduled invocation runs → counter++.
-    let hits = poll_kv(&kv, "hkv/fn/counter/hits").await;
+    let hits = poll_kv(&kv, "hkv/default/fn/counter/hits").await;
     let n: u32 = String::from_utf8_lossy(&hits).trim().parse().unwrap();
     assert!(n >= 1, "counter did not advance: {n}");
 
@@ -3562,8 +3566,12 @@ async fn function_queue_trigger_dispatches_a_message() {
     deploy_test_function(&deploy, "worker", KV_COUNTER, vec!["wasi:keyvalue".into()]).await;
 
     let messaging: Arc<dyn Messaging> = Arc::new(LogMessaging::new(storage.clone(), kv.clone()));
-    // A job waiting on the function's namespaced topic before the scheduler runs.
-    messaging.publish("fn/worker/jobs", b"job-1").await.unwrap();
+    // A job waiting on the function's namespaced topic before the scheduler runs. v0.31.0 Finding 8:
+    // the default project's function topic is the two-segment `default/fn/worker/jobs`.
+    messaging
+        .publish("default/fn/worker/jobs", b"job-1")
+        .await
+        .unwrap();
 
     let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
     let runtime = HandlerRuntime::new(engine, kv.clone(), storage, None, Some(messaging.clone()));
@@ -3582,7 +3590,7 @@ async fn function_queue_trigger_dispatches_a_message() {
     );
 
     // The scheduler claims the message and invokes the function → counter++.
-    let hits = poll_kv(&kv, "hkv/fn/worker/hits").await;
+    let hits = poll_kv(&kv, "hkv/default/fn/worker/hits").await;
     let n: u32 = String::from_utf8_lossy(&hits).trim().parse().unwrap();
     assert!(n >= 1, "worker did not run: {n}");
 }
@@ -3607,9 +3615,12 @@ async fn bus_queue_trigger_drains_the_shared_project_bus() {
     deploy_test_function(&deploy, "worker", KV_COUNTER, vec!["wasi:keyvalue".into()]).await;
 
     let messaging: Arc<dyn Messaging> = Arc::new(LogMessaging::new(storage.clone(), kv.clone()));
-    // An event on the shared project bus (default project → bare `bus/…`),
-    // published by some *other* component — not the worker's own private queue.
-    messaging.publish("bus/jobs", b"job-1").await.unwrap();
+    // An event on the shared project bus (default project → `default/bus/…` since v0.31.0
+    // Finding 8), published by some *other* component — not the worker's own private queue.
+    messaging
+        .publish("default/bus/jobs", b"job-1")
+        .await
+        .unwrap();
 
     let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
     let runtime = HandlerRuntime::new(engine, kv.clone(), storage, None, Some(messaging.clone()));
@@ -3630,15 +3641,15 @@ async fn bus_queue_trigger_drains_the_shared_project_bus() {
 
     // The scheduler claims the bus message and invokes the worker → counter++,
     // even though the worker never published it.
-    let hits = poll_kv(&kv, "hkv/fn/worker/hits").await;
+    let hits = poll_kv(&kv, "hkv/default/fn/worker/hits").await;
     let n: u32 = String::from_utf8_lossy(&hits).trim().parse().unwrap();
     assert!(n >= 1, "worker did not drain the bus: {n}");
 }
 
 /// The PROJECT-BUS operator surface (`/api/projects/<proj>/_boatramp/bus/…`, v0.4.24)
 /// inspects + manages the SHARED project bus (`{project}/bus/{topic}`) — the operator
-/// counterpart to the site surface, but namespaced to the project (default → bare
-/// `bus/…`, named → `<proj>/bus/…`). This drives the endpoints through the real router
+/// counterpart to the site surface, namespaced to the project (v0.31.0 Finding 8: default →
+/// `default/bus/…`, named → `<proj>/bus/…`). This drives the endpoints through the real router
 /// and asserts the critical property: each project's endpoint touches ONLY its own bus
 /// namespace (cross-project isolation), the peek shape matches the site surface, and a
 /// destructive DLQ POST returns the versioned response.
@@ -3653,9 +3664,12 @@ async fn project_bus_operator_surface_is_project_namespaced() {
     let deploy = DeployStore::new(storage.clone(), kv.clone());
 
     let messaging: Arc<dyn Messaging> = Arc::new(LogMessaging::new(storage.clone(), kv.clone()));
-    // Two DISTINCT project buses carry different payloads: the default project's bus is
-    // the bare `bus/<topic>` keyspace; a named project's is `<proj>/bus/<topic>`.
-    messaging.publish("bus/jobs", b"default-job").await.unwrap();
+    // Two DISTINCT project buses carry different payloads: the default project's bus is the
+    // `default/bus/<topic>` keyspace (v0.31.0 Finding 8); a named project's is `<proj>/bus/<topic>`.
+    messaging
+        .publish("default/bus/jobs", b"default-job")
+        .await
+        .unwrap();
     messaging
         .publish("acme/bus/jobs", b"acme-job")
         .await
@@ -3732,7 +3746,7 @@ async fn project_bus_operator_surface_is_project_namespaced() {
     assert_eq!(purged["affected"], 0, "acme DLQ was empty");
 
     // The default bus's live message survived acme's purge (namespaces are disjoint).
-    let still_there = messaging.peek("bus/jobs", 10).await.unwrap();
+    let still_there = messaging.peek("default/bus/jobs", 10).await.unwrap();
     assert_eq!(still_there.len(), 1);
     assert_eq!(still_there[0].payload, b"default-job");
 }
@@ -3784,14 +3798,16 @@ async fn function_blob_trigger_fires_on_a_write() {
             futures::stream::once(async { Ok(bytes::Bytes::from_static(b"{}")) }).boxed();
         storage
             .put(
-                "hblob/fn/counter/uploads/report.json",
+                // v0.31.0 Finding 8: the default project's function watches the two-segment
+                // `hblob/default/fn/counter/uploads/` prefix.
+                "hblob/default/fn/counter/uploads/report.json",
                 body,
                 PutMeta::default(),
             )
             .await
             .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        if let Some(hits) = kv.get("hkv/fn/counter/hits").await.unwrap()
+        if let Some(hits) = kv.get("hkv/default/fn/counter/hits").await.unwrap()
             && String::from_utf8_lossy(&hits)
                 .trim()
                 .parse::<u32>()
@@ -3941,10 +3957,14 @@ async fn function_blob_trigger_provisions_and_retracts_via_cloud_provider() {
     );
     assert_eq!(
         provider.provisioned.lock().unwrap().as_slice(),
-        &["hblob/fn/counter/uploads/".to_string()]
+        &["hblob/default/fn/counter/uploads/".to_string()]
     );
     let record = deploy
-        .get_managed_notification(ProjectRef::DEFAULT, "counter", "hblob/fn/counter/uploads/")
+        .get_managed_notification(
+            ProjectRef::DEFAULT,
+            "counter",
+            "hblob/default/fn/counter/uploads/",
+        )
         .await
         .unwrap()
         .expect("ledger records the provisioned pipeline");
@@ -3963,7 +3983,11 @@ async fn function_blob_trigger_provisions_and_retracts_via_cloud_provider() {
     assert_eq!(provider.retracted.lock().unwrap().len(), 1);
     assert!(
         deploy
-            .get_managed_notification(ProjectRef::DEFAULT, "counter", "hblob/fn/counter/uploads/")
+            .get_managed_notification(
+                ProjectRef::DEFAULT,
+                "counter",
+                "hblob/default/fn/counter/uploads/"
+            )
             .await
             .unwrap()
             .is_none()
@@ -4368,15 +4392,16 @@ async fn preview_runs_handlers_scoped_off_live_state() {
         assert_eq!(&body[..], expected.as_bytes());
     }
 
-    // The counter landed under the *preview* prefix, leaving live state untouched.
+    // The counter landed under the *preview* prefix, leaving live state untouched. (v0.31.0
+    // Finding 8: the default project's site scope is the two-segment `default/blog`.)
     assert_eq!(
-        kv.get(&format!("hkv/blog/_preview/{id}/hits"))
+        kv.get(&format!("hkv/default/blog/_preview/{id}/hits"))
             .await
             .unwrap(),
         Some(b"2".to_vec())
     );
     assert_eq!(
-        kv.get("hkv/blog/hits").await.unwrap(),
+        kv.get("hkv/default/blog/hits").await.unwrap(),
         None,
         "preview must not write the live site's kv"
     );
@@ -5308,7 +5333,9 @@ async fn stream_route_fans_out_text_and_binary_events() {
     let mut body = response.into_body().into_data_stream();
 
     // UTF-8 payload → verbatim under the topic's event name.
-    log.publish("blog/orders/created", b"hello").await.unwrap();
+    log.publish("default/blog/orders/created", b"hello")
+        .await
+        .unwrap();
     let chunk = tokio::time::timeout(Duration::from_secs(5), body.next())
         .await
         .expect("timed out waiting for text event")
@@ -5320,7 +5347,7 @@ async fn stream_route_fans_out_text_and_binary_events() {
     assert!(text.contains("id: "), "event must carry an id: {text:?}");
 
     // Binary payload → base64 under a `{topic}.b64` event.
-    log.publish("blog/orders/created", &[0xff, 0xfe, 0x00])
+    log.publish("default/blog/orders/created", &[0xff, 0xfe, 0x00])
         .await
         .unwrap();
     let chunk = tokio::time::timeout(Duration::from_secs(5), body.next())
@@ -5497,7 +5524,7 @@ async fn websocket_stream_fans_out_and_publishes() {
 
     // Subscribe to the publish topic up front so the client→server direction is
     // observable (live broadcast only delivers post-subscribe messages).
-    let mut ingest = log.subscribe("blog/ingest", None);
+    let mut ingest = log.subscribe("default/blog/ingest", None);
 
     let url = format!("ws://127.0.0.1:{port}/_sites/blog/ws");
     let (mut ws, _resp) = tokio_tungstenite::connect_async(&url)
@@ -5507,7 +5534,9 @@ async fn websocket_stream_fans_out_and_publishes() {
     // server→client: the subscription is registered in the upgrade task, so give
     // it a beat, then a publish reaches the client.
     tokio::time::sleep(Duration::from_millis(150)).await;
-    log.publish("blog/events", b"hello-ws").await.unwrap();
+    log.publish("default/blog/events", b"hello-ws")
+        .await
+        .unwrap();
     let msg = tokio::time::timeout(Duration::from_secs(5), ws.next())
         .await
         .expect("recv within timeout")
@@ -5559,16 +5588,20 @@ async fn operator_dlq_endpoint_redrives_and_purges() {
     let runtime = HandlerRuntime::new(engine, kv, storage, None, Some(messaging));
     let app = router(deploy, Auth::disabled(), runtime);
 
-    // Force a dead letter on the site-namespaced topic `blog/orders` (publish,
-    // then claim past max_attempts=1).
-    log.publish("blog/orders", b"poison").await.unwrap();
+    // Force a dead letter on the site-namespaced topic `default/blog/orders` (the operator endpoint
+    // project-qualifies the scope-relative `orders` to the same `default/blog/…` keyspace the
+    // dispatcher uses — v0.31.0 Finding 8), then claim past max_attempts=1.
+    log.publish("default/blog/orders", b"poison").await.unwrap();
     for _ in 0..2 {
         let _ = log
-            .claim("blog/orders", Duration::ZERO, 10, 1)
+            .claim("default/blog/orders", Duration::ZERO, 10, 1)
             .await
             .unwrap();
     }
-    assert_eq!(log.dead_letter_count("blog/orders").await.unwrap(), 1);
+    assert_eq!(
+        log.dead_letter_count("default/blog/orders").await.unwrap(),
+        1
+    );
 
     // Redrive via the endpoint: the topic is given scope-relative (`orders`).
     let dlq = |action: &str| {
@@ -5587,9 +5620,12 @@ async fn operator_dlq_endpoint_redrives_and_purges() {
         .unwrap();
     let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(parsed["affected"], 1);
-    assert_eq!(log.dead_letter_count("blog/orders").await.unwrap(), 0);
     assert_eq!(
-        log.backlog("blog/orders").await.unwrap(),
+        log.dead_letter_count("default/blog/orders").await.unwrap(),
+        0
+    );
+    assert_eq!(
+        log.backlog("default/blog/orders").await.unwrap(),
         1,
         "requeued live"
     );
@@ -5597,11 +5633,14 @@ async fn operator_dlq_endpoint_redrives_and_purges() {
     // Dead-letter it again, then purge via the endpoint.
     for _ in 0..2 {
         let _ = log
-            .claim("blog/orders", Duration::ZERO, 10, 1)
+            .claim("default/blog/orders", Duration::ZERO, 10, 1)
             .await
             .unwrap();
     }
-    assert_eq!(log.dead_letter_count("blog/orders").await.unwrap(), 1);
+    assert_eq!(
+        log.dead_letter_count("default/blog/orders").await.unwrap(),
+        1
+    );
     let response = app.oneshot(dlq("purge")).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let body = axum::body::to_bytes(response.into_body(), 1 << 16)
@@ -5609,9 +5648,12 @@ async fn operator_dlq_endpoint_redrives_and_purges() {
         .unwrap();
     let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(parsed["affected"], 1);
-    assert_eq!(log.dead_letter_count("blog/orders").await.unwrap(), 0);
     assert_eq!(
-        log.backlog("blog/orders").await.unwrap(),
+        log.dead_letter_count("default/blog/orders").await.unwrap(),
+        0
+    );
+    assert_eq!(
+        log.backlog("default/blog/orders").await.unwrap(),
         0,
         "purge drops it"
     );
@@ -5755,8 +5797,12 @@ async fn operator_endpoint_reports_invocation_and_consumer_stats() {
 
     // Two queued messages on the consumer topic → backlog 2 (router() runs no
     // background scheduler, so nothing drains them).
-    log.publish("blog/orders/created", b"a").await.unwrap();
-    log.publish("blog/orders/created", b"b").await.unwrap();
+    log.publish("default/blog/orders/created", b"a")
+        .await
+        .unwrap();
+    log.publish("default/blog/orders/created", b"b")
+        .await
+        .unwrap();
 
     // Operator stats endpoint.
     let req = Request::builder()

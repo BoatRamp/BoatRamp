@@ -82,6 +82,12 @@ basewrite-gate-mutation = []
 # by absence, not the positive marker). Each turns a provenance gate RED. Compiled OUT of every real
 # build (the seams also compile under this crate's own `cfg(test)`).
 system-principal-gate-mutation = []
+# The default-scope disjointness gate lane (v0.31.0 Finding 8, `DEFAULT-SCOPE DISJOINT OK`). When ON,
+# `ProjectRef::qualified` compiles a `BOATRAMP_DEFAULTSCOPE_MUTATE_BARE_QUALIFIED` seam that restores
+# the pre-fix bare-default branch (`qualified(DEFAULT, base) == base`), so the disjointness gate goes
+# RED — proving the two-segment default scope is load-bearing. Compiled OUT of every real build (the
+# seam + gate test also compile under this crate's own `cfg(test)`).
+default-scope-gate-mutation = []
 
 [dependencies]
 # The shared, wasm-clean type + routing/config layer (re-exported below so

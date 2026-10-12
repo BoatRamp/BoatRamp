@@ -48,9 +48,20 @@ pub(super) async fn create_project(
         )
             .into_response();
     }
-    // `default` is reserved (the home of pre-project resources); it always exists
-    // and can never be (re-)created or deleted.
-    if name == boatramp_core::project::DEFAULT_PROJECT {
+    // `default` is reserved (the home of the two-segment `default/…` data plane); it always exists
+    // and can never be (re-)created or deleted. This is the create-gate half of the v0.31.0 Finding 8
+    // disjointness invariant: a named `default` project would re-collide with the reserved default's
+    // own `default/{site}` scope.
+    //
+    // GATE MUTATION SEAM (`DEFAULT-SCOPE RESERVE OK`): drop the reservation (accept `default`) so the
+    // reservation gate goes RED. Compiled ONLY under the gate lane.
+    #[cfg(feature = "default-scope-gate-mutation")]
+    let reservation_active = std::env::var("BOATRAMP_DEFAULTSCOPE_MUTATE_ACCEPT_DEFAULT")
+        .map(|v| v.is_empty() || v == "0")
+        .unwrap_or(true);
+    #[cfg(not(feature = "default-scope-gate-mutation"))]
+    let reservation_active = true;
+    if reservation_active && name == boatramp_core::project::DEFAULT_PROJECT {
         return (
             StatusCode::CONFLICT,
             format!("project {name:?} is reserved\n"),
@@ -630,5 +641,105 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::CONFLICT);
+    }
+
+    /// Regression (v0.31.0 Finding 8): `default` is RESERVED at project-create — it is the
+    /// home of the (now two-segment) `default`-project data plane, so a NAMED project can
+    /// never be `default`. This is the create-gate half of what makes `qualified(DEFAULT, …)`
+    /// == `"default/…"` disjoint from every named project: if `create_project` accepted
+    /// `default`, a named `default/<site>` scope could re-collide with the reserved default's
+    /// own `default/<site>` scope. The reservation lives ONLY here (project-create) — NOT in
+    /// `validate_resource_name`, which MUST keep accepting `default` as a site/database/project
+    /// name string (DEFAULT_DB_NAME + role-target/project-scope routing rely on it).
+    #[tokio::test]
+    async fn create_project_reserves_default() {
+        let deploy = deploy();
+        // The bare reserved name → 409 with the RESERVED message. Asserting the message (not merely
+        // the 409) is what makes the gate load-bearing: `default` always exists as a synthesized
+        // project, so dropping the reservation still 409s via the "already exists" path — only the
+        // reservation produces the distinct "reserved" body, so the ACCEPT_DEFAULT mutation (which
+        // falls through to "already exists") turns this RED.
+        let resp = create_project(
+            State(deploy.clone()),
+            Json(CreateProjectRequest {
+                name: DEFAULT_PROJECT.to_string(),
+                display: String::new(),
+                description: String::new(),
+                region: None,
+            }),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::CONFLICT,
+            "creating the reserved `default` project must be 409"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&body).contains("reserved"),
+            "the 409 must be the RESERVATION ({:?}), not a generic conflict",
+            String::from_utf8_lossy(&body)
+        );
+        // Whitespace-padded `  default  ` is trimmed first, so it is ALSO rejected as reserved.
+        let resp = create_project(
+            State(deploy.clone()),
+            Json(CreateProjectRequest {
+                name: "  default  ".to_string(),
+                display: String::new(),
+                description: String::new(),
+                region: None,
+            }),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::CONFLICT,
+            "a whitespace-padded `default` must still be rejected after the trim"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&body).contains("reserved"),
+            "the trimmed `default` must also hit the RESERVATION, not a generic conflict"
+        );
+
+        // A DIFFERENT name still creates (the reservation is only `default`), and a name that
+        // merely LOOKS like a default-scope collision target (a plain slug) is accepted — the
+        // disjointness is carried by the two-segment scope, not by rejecting ordinary names.
+        for ok in ["acme", "blog"] {
+            let resp = create_project(
+                State(deploy.clone()),
+                Json(CreateProjectRequest {
+                    name: ok.to_string(),
+                    display: String::new(),
+                    description: String::new(),
+                    region: None,
+                }),
+            )
+            .await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::CREATED,
+                "an ordinary project `{ok}` must still be creatable"
+            );
+        }
+
+        // And the validator itself must NOT have grown a `default` rejection — `default` stays a
+        // valid resource-name STRING (the DEFAULT_DB_NAME + routing contract).
+        assert!(boatramp_core::project::validate_resource_name("project", "default").is_ok());
+        assert!(boatramp_core::project::validate_resource_name("database", "default").is_ok());
+
+        // The `DEFAULT-SCOPE RESERVE OK` gate marker. Mutation-verified:
+        // `BOATRAMP_DEFAULTSCOPE_MUTATE_ACCEPT_DEFAULT=1` (under the `default-scope-gate-mutation`
+        // feature) drops the reservation, so the two CONFLICT assertions above FAIL — proving the
+        // create-gate reservation is load-bearing.
+        println!(
+            "DEFAULT-SCOPE RESERVE OK: create_project reserves the `default` project name (409), \
+             without adding a `default` rejection to validate_resource_name. Mutation-verified: \
+             BOATRAMP_DEFAULTSCOPE_MUTATE_ACCEPT_DEFAULT=1 FAILS this gate."
+        );
     }
 }

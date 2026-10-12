@@ -807,7 +807,8 @@ pub(super) async fn execute_function(
     };
     // Project-qualify the guest binding scope (BR-TEN-1): a same-named function
     // in two tenants must not share one kv/blob/messaging/logs namespace.
-    // `default` → bare `fn/<name>` (byte-identical, back-compat).
+    // EVERY project qualifies (v0.31.0 Finding 8): `default` → `default/fn/<name>`,
+    // disjoint from named projects.
     let fn_ident = format!("fn/{}", function.name);
     let scope = project.qualified(&fn_ident);
     // The SQL provider qualifies + validates `project` + `site` itself, so it
@@ -2735,8 +2736,8 @@ pub(super) async fn delete_trigger_handler(
 
 /// The full storage key prefix a function's `Blob { prefix }` trigger watches:
 /// the function's **project-qualified** blobstore namespace
-/// (`hblob/{qualified(project, fn/<name>)}/` — `hblob/fn/<name>/` for the
-/// `default` project, `hblob/{project}/fn/<name>/` otherwise, matching the
+/// (`hblob/{qualified(project, fn/<name>)}/` — `hblob/default/fn/<name>/` for the
+/// `default` project (v0.31.0 Finding 8), `hblob/{project}/fn/<name>/` otherwise, matching the
 /// function's blob binding) joined with the trigger-relative prefix. The
 /// provisioner (bucket-notification filter), the notification ledger, and the
 /// `spawn_blob_watcher` consumer all key off this, so they must agree.

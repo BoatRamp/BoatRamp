@@ -161,12 +161,12 @@ mod tests {
 
     #[test]
     fn composes_the_guest_readable_prefix_default_project() {
-        // default project ⇒ NO project segment (byte-identical to the pre-project blob layout),
-        // matching the guest binding's `hblob/{site}/{container}/`.
+        // v0.31.0 Finding 8: the reserved `default` project is now the two-segment `default/{site}`,
+        // matching the guest binding's `hblob/{qualified-site}/{container}/` = `hblob/default/{site}/…`.
         let (decoded, key) =
             compose_object_key("default", "blog", "photos", "avatars/u1/x.jpg").expect("valid key");
         assert_eq!(decoded, "avatars/u1/x.jpg");
-        assert_eq!(key, "hblob/blog/photos/avatars/u1/x.jpg");
+        assert_eq!(key, "hblob/default/blog/photos/avatars/u1/x.jpg");
     }
 
     #[test]
@@ -214,7 +214,10 @@ mod tests {
         assert!(compose_object_key("default", "s", "c", ".BoatRamp-Uploads/u/p").is_err()); // case-fold
         // And the staging-key composer itself lands EXACTLY under that reserved segment.
         let part = staging_part_key("default", "s", "c", "UPLOADID", 3);
-        assert_eq!(part, "hblob/s/c/.boatramp-uploads/UPLOADID/part-00000003");
+        assert_eq!(
+            part,
+            "hblob/default/s/c/.boatramp-uploads/UPLOADID/part-00000003"
+        );
         assert!(part.contains("/.boatramp-uploads/"));
     }
 
@@ -245,7 +248,7 @@ mod tests {
         }
         // A normal single-segment container still composes fine.
         let (_, key) = compose_object_key("default", "s", "photos", "k").unwrap();
-        assert_eq!(key, "hblob/s/photos/k");
+        assert_eq!(key, "hblob/default/s/photos/k");
     }
 
     #[test]
