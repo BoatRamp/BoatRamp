@@ -586,6 +586,38 @@ jobs:
           grep -q 'TCP-LISTENER LIVE OK' tcp-listener-live.log \
             || { echo "::error::tcp-listener live gate never reached its marker (an inbound-TCP serve-path regression — likely the conn-lane epoch-yield/teardown)" >&2; exit 1; }
 
+      # EXT-METHOD ROUTING gate (mailroom #4, marker `EXT-METHOD ROUTING OK`). Edge routing accepts
+      # extension / WebDAV verbs (PROPFIND, PROPPATCH, REPORT, MKCALENDAR, MKCOL, MOVE, COPY — CalDAV
+      # RFC 4791 / CardDAV RFC 6352) and an explicit per-route `methods: ["*"]` catch-all, while STILL
+      # rejecting a non-RFC-7230-token method (no injection via the method string). This drives the
+      # SINGLE enforced surfaces — `route::match_handler` (→ the pure `method_matches` predicate) for
+      # routing and `DeployConfig::from_ron` (→ `check_http_method`) for validation, so TESTED ==
+      # ENFORCED — and asserts the marker + pass count catch a silent skip/rename. MUTATION-VERIFIED
+      # (the #503 convention): the SAME test re-run under each `BOATRAMP_EXTMETHOD_MUTATION` neuters ONE
+      # property — `drop_ext_match` (a declared PROPFIND stops routing), `drop_wildcard` (the `*`
+      # catch-all stops matching), `admit_nontoken` (validation accepts a garbage method) — and MUST
+      # FAIL; a PASS-under-mutation (a hollow gate) fails the merge.
+      - name: "ext-method routing gate (WebDAV verbs + `*` catch-all, non-token rejected)"
+        run: |
+          set -eo pipefail
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-types \
+            ext_method_routing_gate -- --nocapture 2>&1 | tee ext-method.log
+          grep -qE 'test result: ok\. 1 passed' ext-method.log \
+            || { echo "::error::ext-method gate did not run (silent skip or a failure)" >&2; exit 1; }
+          grep -q 'EXT-METHOD ROUTING OK' ext-method.log \
+            || { echo "::error::ext-method gate never reached its marker (an edge method-routing/validation regression)" >&2; exit 1; }
+          # Mutation guard: each mutation MUST fail the gate (proving each property is load-bearing).
+          for mut in drop_ext_match drop_wildcard admit_nontoken; do
+            if BOATRAMP_EXTMETHOD_MUTATION="$mut" cargo-zigbuild test --target x86_64-unknown-linux-musl \
+              -p boatramp-types ext_method_routing_gate \
+              -- --nocapture > "ext-method-mutation-$mut.log" 2>&1; then
+              echo "::error::ext-method gate is HOLLOW — it passed under mutation '$mut' (an edge method-routing/validation security property is not actually enforced)" >&2
+              exit 1
+            else
+              echo "ext-method mutation verified: '$mut' fails the gate as expected."
+            fi
+          done
+
       # BLOB-READ FAULT-CLASS gate (boatramp-blob-read-error-granularity): a failed blob read
       # (`get`/`get_range`/`head`) must classify its concrete outcome — 404 / 403 AccessDenied / 416 /
       # throttle (503/429) / 5xx / transport — into DISTINCT kinds, so a 403 under-scoped credential or
