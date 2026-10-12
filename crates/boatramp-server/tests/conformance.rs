@@ -3787,25 +3787,34 @@ async fn function_blob_trigger_fires_on_a_write() {
         StatusCode::OK
     );
 
-    // Write under the watched prefix until the trigger fires. Retrying the write
-    // makes the test robust to the scheduler's watcher-spawn timing — an FS watcher
-    // only sees events after it starts, so a single fixed-sleep write can race the
-    // spawn under parallel load (each retry is a fresh event once the watch is up).
+    // Write under the watched prefix until the trigger fires, up to a generous deadline.
+    // Retrying makes the test robust to the FS watcher's spawn/warm-up timing: a watcher
+    // only sees events after it starts, and on macOS FSEvents a freshly-created (now two-
+    // segment, v0.31.0 Finding 8) watch dir can take seconds to begin delivering — much
+    // longer under the parallel CPU load of the full suite (on Linux `inotify` arms
+    // synchronously and fires in <1s; this ceiling only ever bites the macOS FSEvents
+    // warm-up). Each iteration writes a DISTINCT key so every write is a guaranteed-fresh
+    // `Create` (FSEvents can coalesce repeated writes to one path, but never two distinct
+    // creates) — once the watch is up, the very next create fires the trigger and we break
+    // early (the happy path returns in ~1-2s; the deadline is only reached on a real break).
     use boatramp_core::kv::KvStore;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
     let mut fired = false;
-    for _ in 0..50 {
+    let mut i = 0u32;
+    while std::time::Instant::now() < deadline {
         let body: ByteStream =
             futures::stream::once(async { Ok(bytes::Bytes::from_static(b"{}")) }).boxed();
         storage
             .put(
                 // v0.31.0 Finding 8: the default project's function watches the two-segment
                 // `hblob/default/fn/counter/uploads/` prefix.
-                "hblob/default/fn/counter/uploads/report.json",
+                &format!("hblob/default/fn/counter/uploads/report-{i}.json"),
                 body,
                 PutMeta::default(),
             )
             .await
             .unwrap();
+        i += 1;
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         if let Some(hits) = kv.get("hkv/default/fn/counter/hits").await.unwrap()
             && String::from_utf8_lossy(&hits)
@@ -3818,7 +3827,7 @@ async fn function_blob_trigger_fires_on_a_write() {
             break;
         }
     }
-    assert!(fired, "blob trigger did not fire after repeated writes");
+    assert!(fired, "blob trigger did not fire before the deadline");
 
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -5333,9 +5342,7 @@ async fn stream_route_fans_out_text_and_binary_events() {
     let mut body = response.into_body().into_data_stream();
 
     // UTF-8 payload → verbatim under the topic's event name.
-    log.publish("default/blog/orders/created", b"hello")
-        .await
-        .unwrap();
+    log.publish("blog/orders/created", b"hello").await.unwrap();
     let chunk = tokio::time::timeout(Duration::from_secs(5), body.next())
         .await
         .expect("timed out waiting for text event")
@@ -5347,7 +5354,7 @@ async fn stream_route_fans_out_text_and_binary_events() {
     assert!(text.contains("id: "), "event must carry an id: {text:?}");
 
     // Binary payload → base64 under a `{topic}.b64` event.
-    log.publish("default/blog/orders/created", &[0xff, 0xfe, 0x00])
+    log.publish("blog/orders/created", &[0xff, 0xfe, 0x00])
         .await
         .unwrap();
     let chunk = tokio::time::timeout(Duration::from_secs(5), body.next())
@@ -5524,7 +5531,7 @@ async fn websocket_stream_fans_out_and_publishes() {
 
     // Subscribe to the publish topic up front so the client→server direction is
     // observable (live broadcast only delivers post-subscribe messages).
-    let mut ingest = log.subscribe("default/blog/ingest", None);
+    let mut ingest = log.subscribe("blog/ingest", None);
 
     let url = format!("ws://127.0.0.1:{port}/_sites/blog/ws");
     let (mut ws, _resp) = tokio_tungstenite::connect_async(&url)
@@ -5534,9 +5541,7 @@ async fn websocket_stream_fans_out_and_publishes() {
     // server→client: the subscription is registered in the upgrade task, so give
     // it a beat, then a publish reaches the client.
     tokio::time::sleep(Duration::from_millis(150)).await;
-    log.publish("default/blog/events", b"hello-ws")
-        .await
-        .unwrap();
+    log.publish("blog/events", b"hello-ws").await.unwrap();
     let msg = tokio::time::timeout(Duration::from_secs(5), ws.next())
         .await
         .expect("recv within timeout")
@@ -5796,7 +5801,10 @@ async fn operator_endpoint_reports_invocation_and_consumer_stats() {
     );
 
     // Two queued messages on the consumer topic → backlog 2 (router() runs no
-    // background scheduler, so nothing drains them).
+    // background scheduler, so nothing drains them). The topic is the consumer's
+    // PROJECT-QUALIFIED dispatch namespace `default/blog/orders/created` (v0.31.0
+    // Finding 8): the operator stats endpoint reads the backlog on the SAME
+    // namespaced topic the scheduler drains, so the publish must target it too.
     log.publish("default/blog/orders/created", b"a")
         .await
         .unwrap();
