@@ -262,6 +262,10 @@ pub struct MigrateOptions {
     /// `false` the pass stops after the forward phase, leaving old state for a
     /// soak/rollback window (`dual`); a later `finalize` runs the cleanups.
     pub finalize: bool,
+    /// Override the fail-closed pre-migration conflict guard (v0.31.0 Finding 8): proceed with the
+    /// default-scope re-home even when a default-project resource is named `default` or like a known
+    /// project (its data will NOT be re-homed). Off by default — the operator must knowingly opt in.
+    pub allow_default_named_resource: bool,
 }
 
 impl MigrateOptions {
@@ -270,6 +274,7 @@ impl MigrateOptions {
         Self {
             dry_run: false,
             finalize: true,
+            allow_default_named_resource: false,
         }
     }
 }
@@ -312,6 +317,24 @@ pub enum MigrateError {
     /// (De)serializing the marker / a record failed.
     #[error("migration serde error: {0}")]
     Serde(String),
+    /// The default-scope re-home (migration 2) is blocked by a pre-existing scope conflict: a
+    /// reserved-`default`-project resource is named `default` (its bare data-plane scope `default` is
+    /// indistinguishable from an already-re-homed `default/…` key), or is named like a KNOWN project
+    /// (its bare scope `{name}` commingles with that project's keyspace — the pre-existing Finding-8
+    /// collision). In either case the re-home predicate cannot safely move the resource's data, so
+    /// `--finalize` would orphan (or has already commingled) it. Fail-closed: rename the resource(s)
+    /// first, or re-run with `--allow-default-named-resource` to proceed anyway (their data will NOT
+    /// be re-homed). Detected PRE-forward only (before any `default/…` re-homed key exists).
+    #[error(
+        "refusing the default-scope re-home: the default project has resource(s) whose bare \
+         data-plane scope conflicts with the re-home ({resources:?}). Rename them (redeploy under a \
+         new name / `boatramp sql move`), or re-run with --allow-default-named-resource to proceed \
+         anyway (their default-scoped data will NOT be re-homed). See docs/default-scope-migration.md."
+    )]
+    DefaultNamedResource {
+        /// The offending resource identities (e.g. `["site/default", "compute/acme (commingles with project `acme`)"]`).
+        resources: Vec<String>,
+    },
 }
 
 /// Read the schema-version marker, tolerantly mapping the pre-mechanism marker shape.
@@ -401,6 +424,27 @@ async fn run(
     if !has_pending_forward && state.unfinalized.is_empty() && state.in_progress.is_none() {
         report.already_migrated = true;
         return Ok(report);
+    }
+
+    // Fail-closed PRE-MIGRATION guard (v0.31.0 Finding 8): BEFORE migration 2's forward runs (so no
+    // `…/default/…` re-homed key exists yet), refuse if a default-project resource's bare data-plane
+    // scope conflicts with the re-home — a site/compute named `default` (collides with the re-home
+    // prefix) or named like a KNOWN project (the pre-existing commingling). Skipped on resume (the
+    // pre-forward invariant no longer holds) and when the operator overrides. This is the KV-level
+    // (control-plane-resource) half; blob/libsql substrate-completeness is observed by the node-level
+    // readiness guard.
+    let v2_pending = state.version < DEFAULT_SCOPE_REHOME_VERSION;
+    let resuming_v2 = state
+        .in_progress
+        .as_ref()
+        .is_some_and(|ip| ip.target == DEFAULT_SCOPE_REHOME_VERSION);
+    if v2_pending && !resuming_v2 && !opts.allow_default_named_resource {
+        let conflicts = default_scope_premigration_conflicts(kv).await?;
+        if !conflicts.is_empty() {
+            return Err(MigrateError::DefaultNamedResource {
+                resources: conflicts,
+            });
+        }
     }
 
     // A dry run reports the pending forward work without persisting anything.
@@ -690,6 +734,54 @@ async fn known_projects(kv: &dyn KvStore) -> Result<HashSet<String>, MigrateErro
         }
     }
     Ok(set)
+}
+
+/// Pre-forward conflict scan (v0.31.0 Finding 8): default-project resources whose BARE data-plane
+/// scope conflicts with the default-scope re-home — a site or compute workload literally named
+/// `default` (its scope collides with the `default/…` re-home prefix) or named like a KNOWN project
+/// (its bare scope `{name}` commingles with that project's keyspace, the pre-existing collision).
+/// Returns a human list of offending `kind/name (reason)` identities (empty ⇒ clear).
+///
+/// Scans the control-plane resource pointers (`project/default/site|compute/<name>`), which are
+/// stable regardless of the data-plane re-home, so it is correct whenever called — but it is only
+/// *meaningful as a fail-closed gate* PRE-forward (the engine skips it on resume). Functions are not
+/// scanned: their scope is always `fn/<name>` (first segment `fn`), so a function can never collide.
+pub async fn default_scope_premigration_conflicts(
+    kv: &dyn KvStore,
+) -> Result<Vec<String>, MigrateError> {
+    let projects = known_projects(kv).await?; // includes the reserved `default`
+    let mut out = Vec::new();
+    for kind in ["site", "compute"] {
+        let mut seen = HashSet::new();
+        // Both layouts: the v1+ project-scoped pointer (`project/default/<kind>/<name>`) and the
+        // pre-v1 flat family (`<kind>/<name>`, a v0 store not yet project-re-keyed) — so the guard
+        // holds whether migration 1 has run or not.
+        for prefix in [
+            format!("project/{DEFAULT_PROJECT}/{kind}/"),
+            format!("{kind}/"),
+        ] {
+            for key in kv.list_prefix(&prefix).await? {
+                let Some(rest) = key.strip_prefix(&prefix) else {
+                    continue;
+                };
+                let name = rest.split('/').next().unwrap_or("");
+                if name.is_empty() || !seen.insert(name.to_string()) {
+                    continue;
+                }
+                if name == DEFAULT_PROJECT {
+                    out.push(format!(
+                        "{kind}/{name} (named `default` — its scope collides with the re-home prefix)"
+                    ));
+                } else if projects.contains(name) {
+                    out.push(format!(
+                        "{kind}/{name} (commingles with the existing project `{name}`)"
+                    ));
+                }
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
 }
 
 /// The **default-scope re-home key transform** — the single, mutation-gated predicate that decides,
@@ -1231,6 +1323,7 @@ mod tests {
             MigrateOptions {
                 dry_run: true,
                 finalize: true,
+                ..Default::default()
             },
         )
         .await
@@ -1259,6 +1352,7 @@ mod tests {
             MigrateOptions {
                 dry_run: false,
                 finalize: false,
+                ..Default::default()
             },
         )
         .await
@@ -1546,6 +1640,7 @@ mod tests {
             MigrateOptions {
                 dry_run: false,
                 finalize: false,
+                ..Default::default()
             },
         )
         .await
@@ -1600,6 +1695,7 @@ mod tests {
             MigrateOptions {
                 dry_run: false,
                 finalize: false,
+                ..Default::default()
             },
         )
         .await
@@ -1648,6 +1744,80 @@ mod tests {
             kv.get("hkv/acme/shop/k").await.unwrap().as_deref(),
             Some(&b"v"[..])
         );
+    }
+
+    /// Fail-closed pre-migration guard (Finding 8): a default-project site literally named `default`,
+    /// or named like a known project (commingling), REFUSES the re-home — unless overridden. Detected
+    /// pre-forward; skipped on resume.
+    #[tokio::test]
+    async fn default_scope_premigration_guard_refuses_conflicts() {
+        // (1) Named `default`.
+        let kv = MemoryKv::new();
+        kv.put("projectmeta/default", b"h".to_vec()).await.unwrap();
+        kv.put("project/default/site/default", b"cfg".to_vec())
+            .await
+            .unwrap();
+        kv.put("hkv/blog/k", b"v".to_vec()).await.unwrap();
+        persist_state(
+            &kv,
+            &SchemaState {
+                version: 1,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let conflicts = default_scope_premigration_conflicts(&kv).await.unwrap();
+        assert_eq!(conflicts.len(), 1, "a site named `default` is a conflict");
+        assert!(conflicts[0].contains("site/default"));
+        let err = migrate(&kv, MigrateOptions::one_shot()).await;
+        assert!(
+            matches!(err, Err(MigrateError::DefaultNamedResource { .. })),
+            "the re-home must refuse a default-named resource, got {err:?}"
+        );
+        // Nothing was migrated (the guard fired before the forward).
+        assert!(kv.get("hkv/default/blog/k").await.unwrap().is_none());
+        // Override proceeds (the conflicting resource's data is simply not re-homed).
+        let ok = migrate(
+            &kv,
+            MigrateOptions {
+                dry_run: false,
+                finalize: false,
+                allow_default_named_resource: true,
+            },
+        )
+        .await;
+        assert!(
+            ok.is_ok(),
+            "the override must let the re-home proceed: {ok:?}"
+        );
+
+        // (2) Commingling: a default-project COMPUTE workload named like an existing project `acme`.
+        let kv = MemoryKv::new();
+        kv.put("projectmeta/default", b"h".to_vec()).await.unwrap();
+        kv.put("projectmeta/acme", b"h".to_vec()).await.unwrap();
+        kv.put("project/default/compute/acme", b"spec".to_vec())
+            .await
+            .unwrap();
+        persist_state(
+            &kv,
+            &SchemaState {
+                version: 1,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let conflicts = default_scope_premigration_conflicts(&kv).await.unwrap();
+        assert_eq!(conflicts.len(), 1);
+        assert!(
+            conflicts[0].contains("compute/acme") && conflicts[0].contains("commingles"),
+            "a default compute named like project `acme` must surface as commingling: {conflicts:?}"
+        );
+        assert!(matches!(
+            migrate(&kv, MigrateOptions::one_shot()).await,
+            Err(MigrateError::DefaultNamedResource { .. })
+        ));
     }
 
     // ---- framework tests: prove the engine chains an arbitrary migration list -----

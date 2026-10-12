@@ -81,6 +81,17 @@ pub enum Error {
         /// The shared backend identity.
         identity: String,
     },
+    /// Opening the control-plane KV (for the `projectmeta/` set the `blob rehome` translator needs)
+    /// failed — delegated to the same `serve` store builder, so the same `--kv`/`--data-dir` guidance
+    /// applies.
+    #[error(transparent)]
+    KvOpen(#[from] Box<crate::serve::Error>),
+    /// Reading the `projectmeta/` project set from the control-plane KV failed.
+    #[error("reading the project set from the control-plane KV: {0}")]
+    KvRead(String),
+    /// The default-scope blob re-home engine (`blob rehome`) reported a storage/verification error.
+    #[error("blob rehome: {0}")]
+    Rehome(String),
 }
 
 /// `blob` module result; `Err` is [`Error`].
@@ -158,6 +169,46 @@ enum BlobCommand {
     /// secondary is currently attached (the node is mid-migration). The direct, structured answer to
     /// "is this node still in TRANSITION mode?" — no log-grepping. Read-only (System·Read).
     Status(StatusArgs),
+    /// **Default-scope blob re-home** (v0.31.0 Finding 8), offline + node-local — the blob half of the
+    /// `boatramp migrate` default-scope re-key. Re-homes the node's own bare default-scoped blob
+    /// objects (`hblob/{site}/…`, `mqp/…`, `mqgp/…`) to their two-segment `…/default/…` spelling IN
+    /// PLACE on the node's own backend (built from `--node-config`'s `[serve]` block, like
+    /// `blob migrate`). It reads the `projectmeta/` project set from the control-plane KV so a named
+    /// project's keys are never touched.
+    ///
+    /// Two phases mirroring `boatramp migrate --stage`/`--finalize`: the default (drain) copies every
+    /// re-homeable object old→new, `head`-verifies, and NEVER deletes the source; `--finalize`
+    /// (retire) deletes each old key ONLY after its new key verifies present (copy-before-delete). Run
+    /// the daemon-side read-fallback bridges serving during the drain; run `--finalize` only after the
+    /// drain verifies, together with `boatramp migrate --finalize`. Run with the node STOPPED (it opens
+    /// the control-plane KV). Local libsql + managed-DB data are migrated separately (`sql rehome-default`
+    /// / `boatramp migrate`).
+    Rehome(RehomeArgs),
+}
+
+/// Arguments for `boatramp blob rehome` (offline, node-local — v0.31.0 Finding 8).
+#[derive(Debug, clap::Args)]
+pub struct RehomeArgs {
+    /// Path to the running node's config (`boatramp.cfg` shape). Its `[serve]` blob block is the
+    /// backend re-homed in place, and its `[serve].data_dir` locates the control-plane KV.
+    #[arg(long, default_value = "boatramp.cfg")]
+    node_config: std::path::PathBuf,
+    /// Metadata (KV) backend holding the `projectmeta/` project set. Must match `serve`.
+    #[arg(long, value_enum, default_value_t = boatramp_node::backends::KvBackend::Slatedb)]
+    kv: boatramp_node::backends::KvBackend,
+    /// Data directory for the control-plane KV (flag > `[serve].data_dir` > `./data`). Must match `serve`.
+    #[arg(long)]
+    data_dir: Option<std::path::PathBuf>,
+    /// Finalize: delete each old bare-scoped key ONLY after its new `…/default/…` key verifies present
+    /// (copy-before-delete). Without this the run is the non-destructive drain (copy + verify, keep old).
+    #[arg(long)]
+    finalize: bool,
+    /// Classify/would-copy (drain) or would-delete (finalize) only; write + delete nothing.
+    #[arg(long)]
+    dry_run: bool,
+    /// Emit the run's summary as JSON instead of a human line.
+    #[arg(long)]
+    json: bool,
 }
 
 /// Arguments for `boatramp blob purge`. Exactly one of `--unreferenced` / `--drained-source` is
@@ -317,6 +368,11 @@ pub async fn run(args: BlobArgs, config: &ProjectConfig) -> Result<()> {
     if let BlobCommand::Migrate(a) = args.command {
         return migrate(a).await;
     }
+    // `rehome` is likewise NODE-LOCAL (offline): it re-homes the node's own blob backend in place and
+    // reads the project set from the control-plane KV — no control-plane server.
+    if let BlobCommand::Rehome(a) = args.command {
+        return rehome(a).await;
+    }
 
     let server = client::resolve_server(args.server, config)?;
     let cp = client::ControlPlane::new(
@@ -340,8 +396,161 @@ pub async fn run(args: BlobArgs, config: &ProjectConfig) -> Result<()> {
         BlobCommand::Status(a) => status(&cp, a).await?,
         // Handled node-locally above (returned before the control-plane client was built).
         BlobCommand::Migrate(_) => unreachable!("handled before the control-plane client"),
+        BlobCommand::Rehome(_) => unreachable!("handled before the control-plane client"),
     }
     Ok(())
+}
+
+/// Run the offline, node-local default-scope blob re-home (`boatramp blob rehome`, v0.31.0 Finding 8).
+/// Builds the node's OWN primary blob backend from `--node-config`'s `[serve]` block (same path as
+/// `blob migrate`'s destination), opens the control-plane KV for the `projectmeta/` set (so a named
+/// project's keys are never touched), then runs the `blob_rehome` drain (default) or retire
+/// (`--finalize`) over the `hblob/`,`mqp/`,`mqgp/` families.
+#[cfg(feature = "fallback")]
+async fn rehome(a: RehomeArgs) -> Result<()> {
+    use std::sync::Arc;
+
+    // 1. The node's own primary blob backend (the `[serve]` block of `--node-config`).
+    let side = build_primary_side("rehome", &a.node_config).await?;
+    if !a.json {
+        println!("blob rehome: backend = {}", side.identity);
+    }
+
+    // 2. The control-plane KV, for the `projectmeta/` project set the project-aware translator needs.
+    //    Opened STRICT (a re-home is not a crash recovery) — run with the node STOPPED.
+    let config = boatramp_node::config::ServerConfig::load(&a.node_config, None)?;
+    let data_dir = a
+        .data_dir
+        .clone()
+        .or_else(|| config.serve.as_ref().and_then(|s| s.data_dir.clone()))
+        .unwrap_or_else(|| std::path::PathBuf::from("./data"));
+    let kv = crate::serve::build_control_plane_kv(
+        a.kv,
+        &data_dir,
+        None,
+        boatramp_core::kv::KvOpenPolicy::Strict,
+        None,
+    )
+    .await
+    .map_err(|e| Error::KvOpen(Box::new(crate::serve::Error::from(e))))?;
+    let mut projects = std::collections::HashSet::new();
+    for key in kv
+        .list_prefix(boatramp_core::project::POINTER_PREFIX)
+        .await
+        .map_err(|e| Error::KvRead(e.to_string()))?
+    {
+        if let Some(name) = key.strip_prefix(boatramp_core::project::POINTER_PREFIX)
+            && !name.is_empty()
+            && !name.contains('/')
+        {
+            projects.insert(name.to_string());
+        }
+    }
+
+    // 3. Drive the engine. The default is the non-destructive drain; `--finalize` is the retire
+    //    (copy-before-delete). The `to_new` translator skips named projects + already-`default/` keys.
+    let projects = Arc::new(projects);
+    let storage = side.storage.clone(); // kept for the post-retire verification + marker
+    let opts = boatramp_storage::blob_rehome::RehomeOptions {
+        prefixes: boatramp_node::blobs::DEFAULT_SCOPE_BLOB_FAMILIES
+            .iter()
+            .map(|&p| p.to_string())
+            .collect(),
+        to_new: boatramp_node::blobs::default_scope_to_new(projects.clone()),
+        dry_run: a.dry_run,
+    };
+    let (phase, report) = if a.finalize {
+        (
+            "retire",
+            boatramp_storage::blob_rehome::retire(side.storage, &opts)
+                .await
+                .map_err(|e| Error::Rehome(e.to_string()))?,
+        )
+    } else {
+        (
+            "drain",
+            boatramp_storage::blob_rehome::drain(side.storage, &opts)
+                .await
+                .map_err(|e| Error::Rehome(e.to_string()))?,
+        )
+    };
+
+    // After a real retire, VERIFY no bare default-scoped object remains and set the control-plane KV
+    // marker `boatramp migrate --finalize` requires (HIGH-2c sequence) — the explicit "blob substrate
+    // retired" signal from the command that holds the backend. A node with no blob data sets it here
+    // too (a 0-object retire).
+    let mut blob_marker_set = false;
+    if a.finalize && !a.dry_run {
+        let outstanding =
+            boatramp_node::default_scope::blob_default_outstanding(&storage, projects.as_ref())
+                .await
+                .map_err(|e| Error::Rehome(e.to_string()))?;
+        if outstanding {
+            return Err(Error::Rehome(
+                "bare default-scoped blob object(s) still present after retire — run `blob rehome` \
+                 (drain) to copy them forward first, then re-run `--finalize`. The migrate-finalize \
+                 marker was NOT set."
+                    .into(),
+            ));
+        }
+        kv.put(
+            boatramp_node::default_scope::BLOB_RETIRED_MARKER,
+            b"1".to_vec(),
+        )
+        .await
+        .map_err(|e| Error::KvRead(e.to_string()))?;
+        kv.flush().await.map_err(|e| Error::KvRead(e.to_string()))?;
+        blob_marker_set = true;
+    }
+
+    if a.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "phase": phase,
+                "dry_run": a.dry_run,
+                "total": report.total,
+                "copied": report.copied,
+                "skipped": report.skipped,
+                "deleted": report.deleted,
+                "blob_retired_marker_set": blob_marker_set,
+            }))?
+        );
+    } else if a.finalize {
+        println!(
+            "blob rehome (retire{}): {} old key(s) deleted after their new key verified, of {} \
+             re-homeable object(s). Old bare default-scoped keys reclaimed.{}",
+            if a.dry_run { ", dry-run" } else { "" },
+            report.deleted,
+            report.total,
+            if blob_marker_set {
+                " Blob substrate verified re-homed — `boatramp migrate --finalize` may now proceed."
+            } else {
+                ""
+            }
+        );
+    } else {
+        println!(
+            "blob rehome (drain{}): {} object(s) copied old→new (verified), {} already present, of \
+             {} re-homeable object(s). Source kept — run `blob rehome --finalize` after a verified \
+             soak (with `boatramp migrate --finalize`).",
+            if a.dry_run { ", dry-run" } else { "" },
+            report.copied,
+            report.skipped,
+            report.total
+        );
+    }
+    Ok(())
+}
+
+/// `boatramp blob rehome` is unavailable in a build without a blob-backend feature (no `fallback`).
+#[cfg(not(feature = "fallback"))]
+async fn rehome(_a: RehomeArgs) -> Result<()> {
+    Err(Error::Usage(
+        "`blob rehome` needs a blob-backend feature (e.g. --features fs/s3/gcs/azure); rebuild \
+         with one"
+            .into(),
+    ))
 }
 
 /// Trigger the daemon-mediated blob drain (`boatramp blob drain`, v0.6.3): POST `/api/blob-drain`, then
