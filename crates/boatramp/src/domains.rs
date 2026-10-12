@@ -131,6 +131,24 @@ enum DomainCommand {
 /// Parse one `KIND[/MODE]:NAME=VALUE` record spec. `VALUE` is everything after the
 /// first `=`, so it may itself contain `=`/`:` (e.g. a DMARC policy or an IPv6
 /// address); `NAME` has no `=`.
+/// Escape ASCII/Unicode control characters (C0, DEL, C1 — including ESC `0x1b`,
+/// newline, and CR) in a string before printing it to the operator's terminal.
+/// Resolved DNS record values are attacker-controllable, so printing them raw
+/// would allow terminal-escape sequences or injected log lines on the operator's
+/// console. Printable text is left untouched; a control char renders as `\xNN`.
+fn sanitize_for_terminal(s: &str) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c.is_control() {
+            let _ = write!(out, "\\x{:02x}", c as u32);
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 fn parse_record_spec(raw: &str) -> Result<boatramp_core::record_verify::RecordSpec> {
     use boatramp_core::record_verify::{MatchMode, RecordKind, RecordSpec};
 
@@ -293,7 +311,16 @@ pub async fn run(args: DomainArgs, config: &ProjectConfig) -> Result<()> {
                 let found = if status.found.is_empty() {
                     "(none)".to_string()
                 } else {
-                    status.found.join(", ")
+                    // Resolved record values are attacker-controllable (anyone who
+                    // controls a queried zone can embed ESC/newline bytes in a TXT
+                    // record), so escape control chars before printing them to the
+                    // operator's terminal — no terminal-escape / log-spoofing.
+                    status
+                        .found
+                        .iter()
+                        .map(|v| sanitize_for_terminal(v))
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 };
                 println!(
                     "{mark}  {} {} = {}  [found: {found}]",
@@ -447,4 +474,36 @@ async fn ls(cp: &crate::client::ControlPlane, site: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_escapes_control_chars_but_keeps_printable() {
+        // ESC, newline, CR, tab, DEL → escaped; printable (incl. non-ASCII) kept.
+        assert_eq!(
+            sanitize_for_terminal("v=spf1\x1b[31m\nok\tx\x7f café"),
+            "v=spf1\\x1b[31m\\x0aok\\x09x\\x7f café"
+        );
+        assert_eq!(
+            sanitize_for_terminal("plain.example.com"),
+            "plain.example.com"
+        );
+    }
+
+    #[test]
+    fn parse_record_spec_value_may_contain_equals_and_colon() {
+        let spec = parse_record_spec("txt/contains:_dmarc.example.com=p=reject;rua=x").unwrap();
+        assert_eq!(spec.name, "_dmarc.example.com");
+        assert_eq!(spec.value, "p=reject;rua=x");
+
+        // IPv6 A value (colons) survives — split is on the first `=` only.
+        let spec = parse_record_spec("a:host.example.com=2001:db8::1").unwrap();
+        assert_eq!(spec.value, "2001:db8::1");
+
+        // Contains/Prefix on a non-TXT kind is rejected locally.
+        assert!(parse_record_spec("a/contains:example.com=192.0.2.1").is_err());
+    }
 }
