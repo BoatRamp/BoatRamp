@@ -145,7 +145,12 @@ pub async fn retire(
             continue;
         }
 
-        // Verify the new key is present at matching size BEFORE deleting the old one.
+        // Verify the new key is present at matching SIZE BEFORE deleting the old one. Note (polish
+        // #6): this verifies size only, NOT a content hash — the drain copies the source body
+        // verbatim (identity bytes) and `head` confirms the destination landed at the full length, so
+        // a size match on an immutable copy is the completeness signal (the same basis as
+        // `blob_migrate`'s size-based skip). A content-hash re-verify would re-read every object and
+        // is out of scope.
         let verified = matches!(storage.head(&new).await, Ok(meta) if meta.size == Some(old_size));
         if !verified {
             return Err(RehomeError::Verify { old, new });

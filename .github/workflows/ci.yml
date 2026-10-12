@@ -758,6 +758,25 @@ jobs:
             fi
           done
 
+      # DEFAULT-SCOPE SUBSTRATE-READINESS gate (v0.31.0 Finding 8, security-review HIGH-1/3 + #4): the
+      # fail-closed pre-migration conflict guard (a default-project resource named `default` or like a
+      # known project REFUSES the re-home; `--allow-default-named-resource` proceeds) and the
+      # node-level blob/libsql outstanding detectors (the serve guard + `boatramp migrate --finalize`
+      # observe blob + libsql, not just KV). The guard test is two-sided (refuse + override), so a
+      # regression that drops the refusal OR ignores the override turns it RED; the detector tests pin
+      # the bare-vs-re-homed / named-project classification. A silent skip (pass count drift) fails.
+      - name: "default-scope substrate-readiness gate (pre-migration guard + blob/libsql detectors)"
+        run: |
+          set -eo pipefail
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-core \
+            migrate::tests::default_scope_premigration_guard_refuses_conflicts -- --nocapture 2>&1 | tee ds-guard.log
+          grep -qE 'test result: ok\. 1 passed' ds-guard.log \
+            || { echo "::error::default-scope pre-migration guard gate did not run (silent skip, or the refuse/override property regressed)" >&2; exit 1; }
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-node \
+            default_scope:: -- --nocapture 2>&1 | tee ds-detect.log
+          grep -qE 'test result: ok\. 2 passed' ds-detect.log \
+            || { echo "::error::default-scope substrate detector gate did not run (silent skip, or the libsql bare-vs-re-homed detector regressed)" >&2; exit 1; }
+
       # BLOB-READ FAULT-CLASS gate (boatramp-blob-read-error-granularity): a failed blob read
       # (`get`/`get_range`/`head`) must classify its concrete outcome — 404 / 403 AccessDenied / 416 /
       # throttle (503/429) / 5xx / transport — into DISTINCT kinds, so a 403 under-scoped credential or
