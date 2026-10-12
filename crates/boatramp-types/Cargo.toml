@@ -33,6 +33,14 @@ owned-gate-mutation = []
 # `*` catch-all stops matching), `drop_ext_match` (a declared extension verb stops routing). A
 # `compile_error!` guard fails any release build that enables it. Compiled OUT of every real build.
 extmethod-gate-mutation = []
+# TEST-ONLY, NEVER SHIPPED: the anti-hollow seam for the `RECORD-VERIFY MATCH OK` gate (DNS
+# record-set verification, Phase 1). When ON AND `BOATRAMP_RECORDVERIFY_MUTATION` is set,
+# `record_verify::evaluate` neuters exactly one match-security property — `missing_is_ok` (an absent
+# record passes), `mismatch_is_ok` (a wrong value passes), or `accept_illegal_mode` (Contains/Prefix
+# honored for A/CNAME/MX) — so the gate can prove each is load-bearing (the mutation must FAIL the
+# gate). A `compile_error!` guard fails any non-test release build that enables it. Compiled OUT of
+# every real build.
+record-verify-gate-mutation = []
 
 [dependencies]
 serde.workspace = true

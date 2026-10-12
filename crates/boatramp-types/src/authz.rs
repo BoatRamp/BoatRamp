@@ -224,6 +224,17 @@ impl Right {
             return Some(Self::new(Resource::System, None, Action::Admin));
         }
 
+        // The generic multi-record DNS verifier (`domain verify-records`) is an
+        // operator-only diagnostic that resolves ARBITRARY record names over DNS —
+        // not confined to a host the site owns. Like `attach-unverified`, it must
+        // never be reachable by a site-scoped publisher, so gate it at `system·admin`
+        // explicitly, above the per-site branch that would otherwise map a
+        // `/domains/` POST to the site-write right. (Matches both the direct and the
+        // project-scoped `/api/projects/<p>/sites/…` path forms.)
+        if m == "POST" && path.contains("/domains/") && path.ends_with("/verify-records") {
+            return Some(Self::new(Resource::System, None, Action::Admin));
+        }
+
         // Persistent-**volume** management (`compute volume ls/rm`) is a NODE-GLOBAL
         // operator tool: it lists/removes volume directories across *every*
         // project/tenant on the node (keyed by bare volume name, not scoped to a
@@ -1738,6 +1749,26 @@ mod tests {
         assert!(!site_write.satisfies(&required));
         // A system-admin right does.
         assert!(Right::new(Resource::System, None, Action::Admin).satisfies(&required));
+    }
+
+    #[test]
+    fn verify_records_is_admin_only() {
+        // The generic multi-record DNS verifier (`domain verify-records`) resolves
+        // arbitrary record names, so it must need system·admin in BOTH path forms —
+        // never the site-write right the per-site `/domains/` mapping would give a
+        // scoped publisher.
+        let admin = Right::new(Resource::System, None, Action::Admin);
+        for path in [
+            "/api/sites/blog/domains/example.com/verify-records",
+            "/api/projects/acme/sites/blog/domains/example.com/verify-records",
+        ] {
+            let required = Right::required("POST", path).expect("route is gated");
+            assert_eq!(required, admin, "{path} must need system·admin");
+            // A publisher's site-write right does not satisfy the admin gate.
+            let site_write = Right::new(Resource::Site, Some("acme/blog".into()), Action::Write);
+            assert!(!site_write.satisfies(&required));
+            assert!(admin.satisfies(&required));
+        }
     }
 
     #[test]
