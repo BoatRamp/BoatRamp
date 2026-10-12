@@ -298,6 +298,12 @@ pub async fn build_handler_runtime(
                 wrapped,
             ))
         };
+    // Default-scope re-home (v0.31.0 Finding 8): while the control-plane store is in the default-scope
+    // migration's `dual` soak, wrap every resolved backend in a translating read-fallback so a
+    // not-yet-drained bare `hblob/{site}/…`/`mqp/…`/`mqgp/…` object is still served at the new
+    // `…/default/…` spelling the post-flip runtime composes. A no-op (byte-identical) outside the soak.
+    #[cfg(feature = "fallback")]
+    let blob_backends = crate::blobs::default_scope_blob_fallback(kv.as_ref(), blob_backends).await;
     // Two engine ceilings by lane. The **sync** ceiling bounds connection-bearing
     // requests (site handlers, synchronous invokes) — kept tight so a slow
     // handler can't pin a client, a proxy, and the shared request pool; default
