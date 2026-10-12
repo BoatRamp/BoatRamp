@@ -97,29 +97,34 @@ bumped and the serve-startup guard **refuses to serve** a below-version store un
 the full operator runbook. In brief:
 
 - **KV (`hkv/` + all `mq*/`).** A new online migration (`default-scope-rehome`, schema version 2) run
-  by `boatramp migrate` (`--stage` → soak → `--finalize`): copy → read-back verify (never deletes),
-  then a verify-then-delete finalize. Idempotent + prefix-aware — only a bare default scope re-homes
-  (a named project's or an already-`default/`-scoped key is a no-op). Consumer-group **offsets**
-  (`mqgstate`) re-home in the same forward pass as their log, and the old spelling is deleted only at
-  finalize, so there is no lost message and no double-delivery (one authoritative spelling at a time).
-- **Blob (`hblob/`, `mqp/`, `mqgp/`).** During the KV `dual` soak the node wraps every
-  `wasi:blobstore` backend in a **translating read-fallback** (a miss at the new `…/default/…` key
-  retries the old bare key, serves it, and background-copies it forward), so serving has no gap. A
-  `blob_rehome` drain/retire engine re-homes the rest: drain copies + `head`-verifies + never deletes
-  the source; retire deletes an old key only after its new key verifies (copy-before-delete).
+  by `boatramp migrate` — which now **stages** by default (and under `serve --auto-migrate`), never
+  one-shot, so the dual soak that powers the blob read-fallback is always entered. `--finalize`
+  reclaims the old KV keys only after a substrate-complete check (blob retired + libsql re-homed,
+  because clearing the soak disengages the fallback). Copy → read-back verify (never deletes), then a
+  verify-then-delete finalize. Idempotent + prefix-aware. Consumer-group **offsets** (`mqgstate`)
+  re-home in the same forward pass as their log (no lost message, no double-delivery). A fail-closed
+  **pre-migration guard** refuses a default-project resource named `default` or like a known project
+  (commingling), overridable with `--allow-default-named-resource`.
+- **Blob (`hblob/`, `mqp/`, `mqgp/`).** During the soak the node wraps every `wasi:blobstore` backend
+  in a **translating read-fallback** (a miss at the new `…/default/…` key retries the old bare key,
+  serves it, background-copies it forward). The operator drives `boatramp blob rehome` (drain:
+  copy + `head`-verify + never delete) then `boatramp blob rehome --finalize` (retire: delete only
+  after the new key verifies — copy-before-delete; sets the marker `migrate --finalize` requires).
   `blob_fallback_when` now also covers `mqp/`.
-- **libsql SQL.** Local single-node: `LibsqlSqlBackends::rehome_default_site_db` copy-verifies
-  (`VACUUM INTO` → `integrity_check` → remove source + WAL/SHM → drop the cached identity), an
-  operator step. Remote sqld / cluster: a **documented, mandatory** operator step (create the new
-  namespace, copy, cut over) — an in-process remote move is **refused** fail-closed.
+- **libsql SQL.** `boatramp sql rehome-default --site <site>` copy-verifies local DBs
+  (`VACUUM INTO` → `integrity_check` → remove source + WAL/SHM → drop the cached identity); a REMOTE
+  sqld binding is **refused** fail-closed (documented manual namespace step). libsql has **no runtime
+  fallback**, so the serve path REFUSES to start while a bare default-project `{dir}/{site}.db` exists
+  (it would boot onto an empty DB) — run `sql rehome-default` first (pre-serve, no source lock).
 - **Managed Postgres/MySQL (RLS) is UNAFFECTED** — no `qualified()` feeds the managed SQL backends;
   their tenancy keys on the tenant-axis column, not the scope string. No RLS migration.
 
 `default` stays reserved at **project-create** (409) and a valid resource-name string everywhere else
 (`validate_resource_name` unchanged — DEFAULT_DB_NAME + routing rely on it). Mutation-verified CI
 gates: `DEFAULT-SCOPE DISJOINT OK` (restoring the bare-default branch → RED), `DEFAULT-SCOPE RESERVE
-OK` (accepting a `default` project → RED), and `DEFAULT-SCOPE FALLBACK OK` (disabling the fallback, or
-deleting a source before its new key verifies → RED).
+OK` (accepting a `default` project → RED), `DEFAULT-SCOPE FALLBACK OK` (disabling the fallback, or
+deleting a source before its new key verifies → RED), plus a substrate-readiness gate over the
+pre-migration conflict guard + the blob/libsql detectors.
 
 ## [0.30.0] - 2026-10-11
 
