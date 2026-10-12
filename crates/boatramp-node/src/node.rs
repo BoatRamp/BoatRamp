@@ -479,6 +479,28 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
     #[cfg(not(feature = "handlers"))]
     let sql_resolver: Option<Arc<dyn boatramp_core::compute::ComputeBindingResolver>> = None;
 
+    // Activate the compute blob-shim (PLAN-compute-bindings): the symmetric sibling of the
+    // sql-shim — bind its listener + build the resolver when a blob provider and
+    // `compute.blob_shim_url` are both present, so a workload's `--bind blob` reaches the
+    // SAME per-site `hblob/{qualified-site}/…` namespace a `wasi:blobstore` handler sees.
+    #[cfg(feature = "handlers")]
+    let blob_resolver = boatramp_server::blob_shim::spawn_blob_shim(
+        handlers.blob_backends(),
+        config
+            .compute
+            .as_ref()
+            .and_then(|c| c.blob_shim_url.clone()),
+    )
+    .await;
+    #[cfg(not(feature = "handlers"))]
+    let blob_resolver: Option<Arc<dyn boatramp_core::compute::ComputeBindingResolver>> = None;
+
+    // One resolver for the reconcile: each shim filters to its own binding kind, so chaining
+    // them lets a workload declaring both `sql` and `blob` bindings be served by both from a
+    // single `resolve` call.
+    let binding_resolver =
+        boatramp_core::compute::ChainedBindingResolver::chain([sql_resolver, blob_resolver]);
+
     // Managed compute-backed SQL (PLAN-managed-compute-sql P2-b): if the handler
     // `sql` config declares any managed database, inject its `POSTGRES_*`/`MYSQL_*`
     // server-init env into the DB workload at launch from the sealed credential.
@@ -762,7 +784,7 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
         is_leader.clone(),
         compute_reconcile_tick(),
         COMPUTE_IDLE_TIMEOUT,
-        sql_resolver,
+        binding_resolver,
         managed_db_resolver,
     );
 
