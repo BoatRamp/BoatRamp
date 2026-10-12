@@ -154,6 +154,14 @@ system-principal-gate-mutation = [
   "oidc",
   "boatramp-core/system-principal-gate-mutation",
 ]
+# TEST-ONLY anti-hollow lane for the compute blob-shim (PLAN-compute-bindings): arms the three
+# `BOATRAMP_COMPUTEBLOB_MUTATION` seams in `blob_shim.rs` — `allow_cross_container` (a site/container-
+# bound token reaches a DIFFERENT container), `allow_traversal` (a `../` object key escapes the
+# container prefix), `admit_unmatched` (a missing/unknown bearer token is admitted) — each turning the
+# `COMPUTE BLOB-SHIM SCOPED OK` gate RED. Needs `handlers` (the shared-namespace positive proof reads
+# back through the real `wasi:blobstore` host binding). Compiled OUT of every real build (the seams also
+# live under this crate's own `cfg(test)`, so the in-crate gate arms them).
+compute-blob-shim-gate-mutation = ["handlers"]
 
 # TEST-ONLY lane: the MF-3/MF-4 live-Postgres authz twins open a real multi-writer `SqlKv`
 # (`boatramp-storage/sql-postgres`) so node B's fence read-through / fail-closed shed is exercised
