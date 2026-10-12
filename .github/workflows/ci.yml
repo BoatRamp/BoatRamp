@@ -535,6 +535,36 @@ jobs:
             fi
           done
 
+      # DNS RECORD-VERIFY MATCH GATE (marker `RECORD-VERIFY MATCH OK`, mailroom #2 Phase 1). The pure
+      # `record_verify::evaluate` matcher is the whole security surface of the generic multi-record
+      # verifier: it decides Ok/Mismatch/Missing per record. This gate drives it (deterministic, no live
+      # DNS) across its three load-bearing properties and asserts the marker + pass count catch a silent
+      # skip/rename. MUTATION-VERIFIED (the #503 convention): the SAME test re-run under each
+      # `BOATRAMP_RECORDVERIFY_MUTATION` (via `record-verify-gate-mutation`, compiled OUT of shipped
+      # builds) neuters ONE property — `missing_is_ok` (an absent record passes), `mismatch_is_ok` (a
+      # wrong value passes), `accept_illegal_mode` (Contains/Prefix honored for A/CNAME/MX) — and MUST
+      # FAIL; a PASS-under-mutation (a hollow gate) fails the merge.
+      - name: "record-verify match gate (missing/mismatch/illegal-mode)"
+        run: |
+          set -eo pipefail
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-types \
+            --features record-verify-gate-mutation record_verify_match_gate -- --nocapture 2>&1 | tee record-verify.log
+          grep -qE 'test result: ok\. 1 passed' record-verify.log \
+            || { echo "::error::record-verify gate did not run (silent skip or a failure)" >&2; exit 1; }
+          grep -q 'RECORD-VERIFY MATCH OK' record-verify.log \
+            || { echo "::error::record-verify gate never reached its marker (a DNS record matcher regression)" >&2; exit 1; }
+          # Mutation guard: each mutation MUST fail the gate (proving each property is load-bearing).
+          for mut in missing_is_ok mismatch_is_ok accept_illegal_mode; do
+            if BOATRAMP_RECORDVERIFY_MUTATION="$mut" cargo-zigbuild test --target x86_64-unknown-linux-musl \
+              -p boatramp-types --features record-verify-gate-mutation record_verify_match_gate \
+              -- --nocapture > "record-verify-mutation-$mut.log" 2>&1; then
+              echo "::error::record-verify gate is HOLLOW — it passed under mutation '$mut' (a DNS record match security property is not actually enforced)" >&2
+              exit 1
+            else
+              echo "record-verify mutation verified: '$mut' fails the gate as expected."
+            fi
+          done
+
       # PLAN-handler-tcp-inbound TCP-LISTENER DISPATCH GATE (marker `TCP-LISTENER DISPATCH OK`). Host-owned
       # inbound-TCP listeners dispatch to a guest ONLY when BOTH gates hold — the node posture
       # `allow_guest_tcp_listener` (off under multi-tenant) AND an operator-declared `[serve.listeners.<name>]`
