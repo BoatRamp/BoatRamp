@@ -22,17 +22,163 @@ use boatramp_storage::FsStorage;
 /// falls through to the read-only secondary ONLY for a boatramp-OWNED key —
 /// - a content-addressed deploy blob (`{2hex}/{64hex}`, via [`boatramp_core::deploy::is_blob_key`]),
 /// - a guest object (`hblob/…`),
-/// - a messaging object (`mqgp/…`).
+/// - a messaging PAYLOAD — both the work-queue payload (`mqp/…`) and the grouped/retained payload
+///   (`mqgp/…`).
 ///
 /// Any OTHER key (e.g. a stray `config/…` that should never live in the blob store — the mutable
 /// control-plane records are in the KV, not `Storage`) is primary-only, so it can NEVER silently
 /// resurrect off a secondary during a transition (Security Finding F4/G5-cp, defense-in-depth). The
 /// predicate is supplied to the generic [`FallbackStorage`](boatramp_storage::FallbackStorage), which
 /// hardcodes no app prefixes.
+///
+/// v0.31.0: `mqp/` was added alongside `mqgp/` so that, during the default-scope re-home soak
+/// (Finding 8), a work-queue payload re-homed from `mqp/{topic}/…` to `mqp/default/{topic}/…` is
+/// fallback-eligible too — without it a default-scoped work-queue payload would 404 on the new
+/// spelling during a concurrent backend switch.
 #[cfg(feature = "fallback")]
 pub fn blob_fallback_when() -> boatramp_storage::FallbackWhen {
     Arc::new(|k: &str| {
-        boatramp_core::deploy::is_blob_key(k) || k.starts_with("hblob/") || k.starts_with("mqgp/")
+        boatramp_core::deploy::is_blob_key(k)
+            || k.starts_with("hblob/")
+            || k.starts_with("mqp/")
+            || k.starts_with("mqgp/")
+    })
+}
+
+/// The guest-blob data families whose keys the default-scope re-home (v0.31.0 Finding 8) re-homes:
+/// the guest object store and both messaging payload stores. `hkv/` + the `mq*/` INDICES live in the
+/// KV, not `Storage`, so they migrate via `boatramp migrate`, not here.
+#[cfg(feature = "fallback")]
+pub const DEFAULT_SCOPE_BLOB_FAMILIES: &[&str] = &["hblob/", "mqp/", "mqgp/"];
+
+/// Timeout bounding each translated secondary read in the default-scope blob fallback (a wedged
+/// backend degrades a translated miss to `NotFound`, never a serve-path hang). Matches the default
+/// used by the backend-switch fallback.
+#[cfg(feature = "fallback")]
+const DEFAULT_SCOPE_FALLBACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The **new→old** translator for the default-scope blob fallback: for a post-flip key
+/// `{family}default/{rest}` under a known data family, name the pre-flip bare key `{family}{rest}` to
+/// fall back to. Purely syntactic (no project set needed): only a `…/default/…` key is translatable,
+/// so a named project's `{family}{project}/…` key never falls back and no cross-scope resurrection is
+/// possible.
+#[cfg(feature = "fallback")]
+pub fn default_scope_to_old() -> boatramp_storage::KeyTranslate {
+    Arc::new(|k: &str| {
+        for fam in DEFAULT_SCOPE_BLOB_FAMILIES {
+            if let Some(rest) = k.strip_prefix(fam) {
+                let suffix = rest.strip_prefix("default/")?;
+                return Some(format!("{fam}{suffix}"));
+            }
+        }
+        None
+    })
+}
+
+/// The **old→new** translator (project-aware) for the default-scope blob fallback's `list` union and
+/// the [`blob_rehome`](boatramp_storage::blob_rehome) drain/retire: for a bare default-scoped key
+/// `{family}{base}/…` (whose scope segment is NOT a known project), name the re-homed
+/// `{family}default/{base}/…`. A named project's key and an already-`default/` key both yield `None`.
+#[cfg(feature = "fallback")]
+pub fn default_scope_to_new(
+    projects: std::sync::Arc<std::collections::HashSet<String>>,
+) -> boatramp_storage::KeyTranslate {
+    Arc::new(move |k: &str| {
+        for fam in DEFAULT_SCOPE_BLOB_FAMILIES {
+            if let Some(rest) = k.strip_prefix(fam) {
+                let first = rest.split('/').next().unwrap_or("");
+                if first.is_empty()
+                    || first == boatramp_core::project::DEFAULT_PROJECT
+                    || projects.contains(first)
+                {
+                    return None;
+                }
+                return Some(format!(
+                    "{fam}{}/{rest}",
+                    boatramp_core::project::DEFAULT_PROJECT
+                ));
+            }
+        }
+        None
+    })
+}
+
+/// A [`BlobBackends`](boatramp_core::blob_backends::BlobBackends) decorator that wraps each resolved
+/// backend in a [`TranslatingFallbackStorage`](boatramp_storage::TranslatingFallbackStorage) — the
+/// serve-path half of the default-scope blob re-home (Finding 8). Enabled ONLY while the store is in
+/// the default-scope migration's `dual` soak (see [`default_scope_blob_fallback`]); removed (by
+/// restarting after `boatramp migrate --finalize` + a verified blob retire) once the soak ends.
+#[cfg(feature = "fallback")]
+pub struct DefaultScopeFallbackBackends {
+    inner: Arc<dyn boatramp_core::blob_backends::BlobBackends>,
+    to_old: boatramp_storage::KeyTranslate,
+    to_new: boatramp_storage::KeyTranslate,
+}
+
+#[cfg(feature = "fallback")]
+impl boatramp_core::blob_backends::BlobBackends for DefaultScopeFallbackBackends {
+    fn backend(&self, project: boatramp_core::project::ProjectRef<'_>) -> Arc<dyn Storage> {
+        Arc::new(boatramp_storage::TranslatingFallbackStorage::new(
+            self.inner.backend(project),
+            self.to_old.clone(),
+            self.to_new.clone(),
+            DEFAULT_SCOPE_FALLBACK_TIMEOUT,
+        ))
+    }
+    fn default_backend(&self) -> Arc<dyn Storage> {
+        Arc::new(boatramp_storage::TranslatingFallbackStorage::new(
+            self.inner.default_backend(),
+            self.to_old.clone(),
+            self.to_new.clone(),
+            DEFAULT_SCOPE_FALLBACK_TIMEOUT,
+        ))
+    }
+}
+
+/// If the control-plane store `kv` is in the **default-scope migration's `dual` soak** (its forward
+/// re-key has run but the destructive finalize is deferred), wrap `inner` so every `wasi:blobstore`
+/// backend serves a not-yet-drained bare `hblob/{site}/…`/`mqp/…`/`mqgp/…` object at the new
+/// `…/default/…` spelling the post-flip runtime composes — the zero-downtime blob transition. Returns
+/// `None` (the inner resolver unchanged) when the store is not in that soak, so a fully-migrated or
+/// pre-migration node is byte-for-byte unchanged. The named-project set (for the `list`-union / drain
+/// translator) is read once here from `projectmeta/`.
+#[cfg(feature = "fallback")]
+pub async fn default_scope_blob_fallback(
+    kv: &dyn boatramp_core::kv::KvStore,
+    inner: Arc<dyn boatramp_core::blob_backends::BlobBackends>,
+) -> Arc<dyn boatramp_core::blob_backends::BlobBackends> {
+    let in_soak = boatramp_core::migrate::read_state(kv)
+        .await
+        .map(|s| {
+            s.unfinalized
+                .contains(&boatramp_core::migrate::DEFAULT_SCOPE_REHOME_VERSION)
+        })
+        .unwrap_or(false);
+    if !in_soak {
+        return inner;
+    }
+    // The named projects (for the project-aware old→new translator). Read once at wiring.
+    let mut projects = std::collections::HashSet::new();
+    if let Ok(keys) = kv.list_prefix(boatramp_core::project::POINTER_PREFIX).await {
+        for key in keys {
+            if let Some(name) = key.strip_prefix(boatramp_core::project::POINTER_PREFIX)
+                && !name.is_empty()
+                && !name.contains('/')
+            {
+                projects.insert(name.to_string());
+            }
+        }
+    }
+    tracing::warn!(
+        "default-scope blob read-fallback ACTIVE (migration {} in dual soak): serving bare \
+         default-scoped blobs at their new default/ spelling. Run the blob re-home drain, then \
+         `boatramp migrate --finalize` + retire the old blobs, and restart to disable it.",
+        boatramp_core::migrate::DEFAULT_SCOPE_REHOME_VERSION
+    );
+    Arc::new(DefaultScopeFallbackBackends {
+        inner,
+        to_old: default_scope_to_old(),
+        to_new: default_scope_to_new(std::sync::Arc::new(projects)),
     })
 }
 

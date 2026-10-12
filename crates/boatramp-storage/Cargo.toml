@@ -88,7 +88,7 @@ hedged = ["tokio/time", "tokio/sync", "tokio/macros"]
 # `boatramp blob migrate` drains the secondary. `tokio/time` bounds each secondary read
 # (a wedged secondary degrades a miss to NotFound, never a hang); `bytes` for the
 # `Storage::mapped` return type.
-fallback = ["dep:bytes", "tokio/time"]
+fallback = ["dep:bytes", "tokio/time", "tokio/rt"]
 # CI gate lane for Part 1 of the blob-backend migration (`BLOB MIGRATE COMPLETE OK`). When ON, the
 # `blob_migrate::gate` battery compiles + each `BOATRAMP_BLOBMIG_MUTATE_*` env var neuters exactly
 # ONE invariant (via a `#[cfg(feature = "blob-migrate-gate-mutation")]` seam), so CI can prove the
@@ -150,6 +150,14 @@ blob-fault-gate-mutation = []
 # project that declared its own" regression — so the isolation gate goes RED, proving the per-project
 # resolution is load-bearing. Compiled OUT of every real build.
 blob-perproject-gate-mutation = []
+# The default-scope re-home blob gate lane (v0.31.0 Finding 8, `DEFAULT-SCOPE FALLBACK OK`). When ON,
+# the translating read-fallback + the `blob_rehome` retire compile their `BOATRAMP_DEFAULTSCOPE_MUTATE_*`
+# env-var seams, so CI can prove the gate is load-bearing by asserting every mutation FAILS it:
+# `DISABLE_FALLBACK` (the fallback stops serving the old datum at the new spelling) and
+# `RETIRE_BEFORE_VERIFY` (retire deletes the old key before the new key verifies). Implies `fs` (the
+# gate runs fs→fs in a tempdir) + `fallback` (the translating fallback lives there). Compiled OUT of
+# every real build.
+default-scope-gate-mutation = ["fs", "fallback"]
 
 [dependencies]
 boatramp-core.workspace = true

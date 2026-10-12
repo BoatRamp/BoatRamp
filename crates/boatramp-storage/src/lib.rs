@@ -104,6 +104,19 @@ pub mod marker_cache;
 #[cfg(feature = "fallback")]
 pub mod fallback;
 
+/// The **translating** read-fallback (`TranslatingFallbackStorage`) + the default-scope blob
+/// re-home drain/retire engine (`blob_rehome`) — the blob half of the v0.31.0 default-scope re-key
+/// (Finding 8). The fallback bridges the soak by serving a bare `hblob/{site}/…` object at the new
+/// `hblob/default/{site}/…` spelling the post-flip runtime composes; `blob_rehome` proactively
+/// copies (drain) then, after verify, deletes (retire) the old keys. Rides the same `fallback`
+/// feature as the backend-switch `FallbackStorage` (both are transition aids over `Storage`).
+#[cfg(feature = "fallback")]
+pub mod translating_fallback;
+
+/// The default-scope blob re-home drain + retire engine (see [`translating_fallback`]).
+#[cfg(feature = "fallback")]
+pub mod blob_rehome;
+
 /// The hedged-read blob wrapper (`HedgedStorage`) — races a second read against a slow first one to cut
 /// the serve-path fetch tail (idempotent reads, spare CPU). Backend-agnostic decorator over `Storage`.
 #[cfg(feature = "hedged")]
@@ -173,3 +186,6 @@ pub use marker_cache::MarkerHeadCache;
 
 #[cfg(feature = "fallback")]
 pub use fallback::{FallbackStorage, FallbackWhen};
+
+#[cfg(feature = "fallback")]
+pub use translating_fallback::{KeyTranslate, TranslatingFallbackStorage};
