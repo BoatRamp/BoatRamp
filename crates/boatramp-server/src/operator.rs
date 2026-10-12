@@ -400,14 +400,26 @@ pub(super) struct DlqListQuery {
     filter: DlqFilterWire,
 }
 
-/// Namespace a scope-relative topic exactly as the dispatcher does: `{site}/{topic}`, or
-/// `{site}/{alias}/{topic}` for a background-alias consumer — so an operator only touches their own
-/// site's queues.
+/// Namespace a scope-relative topic exactly as the dispatcher does
+/// ([`consumer_dispatch_scope`](crate::scheduler)): `{qualified-site}/{topic}`, or
+/// `{qualified-site}/{alias}/{topic}` for a background-alias consumer — so an operator only touches
+/// their own site's queues, in the SAME keyspace the consumer dead-letters into. The site is
+/// project-qualified via [`ProjectRef::qualified`] for EVERY project, including the reserved
+/// `default` (v0.31.0 Finding 8: `default/{site}/…`); pre-fix this special-cased `default` to the
+/// bare site, which silently diverged from the (unchanged-raw) dispatcher only because the two then
+/// coincided. Threading the `ProjectContext` closes that divergence for the default project AND the
+/// previously-unqualified named-project case.
 #[cfg(feature = "handlers")]
-fn dlq_namespace(site: &str, alias: &Option<String>, topic: &str) -> String {
+fn dlq_namespace(
+    project: &crate::project_scope::ProjectContext,
+    site: &str,
+    alias: &Option<String>,
+    topic: &str,
+) -> String {
+    let scope = project.as_ref().qualified(site);
     match alias {
-        Some(alias) => format!("{site}/{alias}/{topic}"),
-        None => format!("{site}/{topic}"),
+        Some(alias) => format!("{scope}/{alias}/{topic}"),
+        None => format!("{scope}/{topic}"),
     }
 }
 
@@ -444,6 +456,7 @@ fn messaging_or_unavailable(
 #[cfg(feature = "handlers")]
 pub(super) async fn operator_dlq_list(
     Extension(handlers): Extension<Arc<HandlerRuntime>>,
+    Extension(project): Extension<crate::project_scope::ProjectContext>,
     Path(site): Path<String>,
     axum::extract::Query(q): axum::extract::Query<DlqListQuery>,
 ) -> Response {
@@ -451,7 +464,7 @@ pub(super) async fn operator_dlq_list(
         Ok(m) => m,
         Err(resp) => return resp,
     };
-    let namespaced = dlq_namespace(&site, &q.alias, &q.topic);
+    let namespaced = dlq_namespace(&project, &site, &q.alias, &q.topic);
     dlq_list_core(messaging.as_ref(), &namespaced, q.show, q.filter).await
 }
 
@@ -540,6 +553,7 @@ const QUEUE_PEEK_MAX: usize = 100;
 #[cfg(feature = "handlers")]
 pub(super) async fn operator_queue_peek(
     Extension(handlers): Extension<Arc<HandlerRuntime>>,
+    Extension(project): Extension<crate::project_scope::ProjectContext>,
     Path(site): Path<String>,
     axum::extract::Query(q): axum::extract::Query<QueuePeekQuery>,
 ) -> Response {
@@ -547,7 +561,7 @@ pub(super) async fn operator_queue_peek(
         Ok(m) => m,
         Err(resp) => return resp,
     };
-    let namespaced = dlq_namespace(&site, &q.alias, &q.topic);
+    let namespaced = dlq_namespace(&project, &site, &q.alias, &q.topic);
     queue_peek_core(messaging.as_ref(), &namespaced, q.limit).await
 }
 
@@ -618,6 +632,7 @@ struct QueueReplayResponse {
 #[cfg(feature = "handlers")]
 pub(super) async fn operator_queue_replay(
     Extension(handlers): Extension<Arc<HandlerRuntime>>,
+    Extension(project): Extension<crate::project_scope::ProjectContext>,
     Path(site): Path<String>,
     axum::extract::Query(q): axum::extract::Query<QueueReplayQuery>,
 ) -> Response {
@@ -625,7 +640,7 @@ pub(super) async fn operator_queue_replay(
         Ok(m) => m,
         Err(resp) => return resp,
     };
-    let namespaced = dlq_namespace(&site, &q.alias, &q.topic);
+    let namespaced = dlq_namespace(&project, &site, &q.alias, &q.topic);
     queue_replay_core(messaging.as_ref(), &namespaced, q.after.as_deref(), q.limit).await
 }
 
@@ -701,6 +716,7 @@ struct QueueGroupsResponse {
 #[cfg(feature = "handlers")]
 pub(super) async fn operator_queue_groups(
     Extension(handlers): Extension<Arc<HandlerRuntime>>,
+    Extension(project): Extension<crate::project_scope::ProjectContext>,
     Path(site): Path<String>,
     axum::extract::Query(q): axum::extract::Query<QueueGroupsQuery>,
 ) -> Response {
@@ -708,7 +724,7 @@ pub(super) async fn operator_queue_groups(
         Ok(m) => m,
         Err(resp) => return resp,
     };
-    let namespaced = dlq_namespace(&site, &q.alias, &q.topic);
+    let namespaced = dlq_namespace(&project, &site, &q.alias, &q.topic);
     queue_groups_core(messaging.as_ref(), &namespaced).await
 }
 
@@ -763,6 +779,7 @@ pub(super) struct QueuePauseRequest {
 #[cfg(feature = "handlers")]
 pub(super) async fn operator_queue_pause(
     Extension(handlers): Extension<Arc<HandlerRuntime>>,
+    Extension(project): Extension<crate::project_scope::ProjectContext>,
     Path(site): Path<String>,
     Json(req): Json<QueuePauseRequest>,
 ) -> Response {
@@ -770,7 +787,7 @@ pub(super) async fn operator_queue_pause(
         Ok(m) => m,
         Err(resp) => return resp,
     };
-    let namespaced = dlq_namespace(&site, &req.alias, &req.topic);
+    let namespaced = dlq_namespace(&project, &site, &req.alias, &req.topic);
     queue_pause_core(messaging.as_ref(), &namespaced, req.paused).await
 }
 
@@ -816,6 +833,7 @@ pub(super) struct QueuePolicyRequest {
 #[cfg(feature = "handlers")]
 pub(super) async fn operator_queue_policy(
     Extension(handlers): Extension<Arc<HandlerRuntime>>,
+    Extension(project): Extension<crate::project_scope::ProjectContext>,
     Path(site): Path<String>,
     Json(req): Json<QueuePolicyRequest>,
 ) -> Response {
@@ -823,7 +841,7 @@ pub(super) async fn operator_queue_policy(
         Ok(m) => m,
         Err(resp) => return resp,
     };
-    let namespaced = dlq_namespace(&site, &req.alias, &req.topic);
+    let namespaced = dlq_namespace(&project, &site, &req.alias, &req.topic);
     queue_policy_core(messaging.as_ref(), &namespaced, &req).await
 }
 
@@ -890,6 +908,7 @@ pub(super) struct QueueGroupRequest {
 #[cfg(feature = "handlers")]
 pub(super) async fn operator_queue_group(
     Extension(handlers): Extension<Arc<HandlerRuntime>>,
+    Extension(project): Extension<crate::project_scope::ProjectContext>,
     Path(site): Path<String>,
     Json(req): Json<QueueGroupRequest>,
 ) -> Response {
@@ -897,7 +916,7 @@ pub(super) async fn operator_queue_group(
         Ok(m) => m,
         Err(resp) => return resp,
     };
-    let namespaced = dlq_namespace(&site, &req.alias, &req.topic);
+    let namespaced = dlq_namespace(&project, &site, &req.alias, &req.topic);
     queue_group_core(
         messaging.as_ref(),
         &namespaced,
@@ -941,6 +960,7 @@ async fn queue_group_core(
 #[cfg(feature = "handlers")]
 pub(super) async fn operator_dlq(
     Extension(handlers): Extension<Arc<HandlerRuntime>>,
+    Extension(project): Extension<crate::project_scope::ProjectContext>,
     Path(site): Path<String>,
     Json(req): Json<DlqRequest>,
 ) -> Response {
@@ -948,7 +968,7 @@ pub(super) async fn operator_dlq(
         Ok(m) => m,
         Err(resp) => return resp,
     };
-    let namespaced = dlq_namespace(&site, &req.alias, &req.topic);
+    let namespaced = dlq_namespace(&project, &site, &req.alias, &req.topic);
     dlq_mutate_core(
         messaging.as_ref(),
         &namespaced,

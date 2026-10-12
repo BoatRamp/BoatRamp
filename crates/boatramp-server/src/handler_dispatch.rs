@@ -36,9 +36,9 @@ pub(super) async fn dispatch_handler(
     //
     // The base identity is then **project-qualified** (BR-TEN-1): a same-named
     // site in two tenant projects must not share one kv/blob/messaging/logs
-    // namespace or one concurrency semaphore. `default` → byte-identical to the
-    // pre-project layout (no data migration); any other project prefixes
-    // `"<project>/"`. SQL is resolved separately below (its provider qualifies
+    // namespace or one concurrency semaphore. EVERY project (v0.31.0 Finding 8,
+    // including the reserved `default`) prefixes `"<project>/"` — `default/<site>`,
+    // disjoint from all named projects. SQL is resolved separately below (its provider qualifies
     // internally, so it takes the raw `site` + `project`, not this scope).
     let project_ref = boatramp_core::project::ProjectRef::new(project);
     let base = match preview {

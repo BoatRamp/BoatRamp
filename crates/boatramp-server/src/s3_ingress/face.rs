@@ -1103,11 +1103,11 @@ mod e2e {
         .await;
         let resp = handle(&h.state, req, NOW).await;
         assert_eq!(resp.status(), StatusCode::OK);
-        // Guest read-through: the object is at hblob/blog/photos/avatars/u1.jpg (default project ⇒ no
-        // project segment), byte-identical.
+        // Guest read-through: the object is at hblob/default/blog/photos/avatars/u1.jpg (v0.31.0
+        // Finding 8: the default project is the two-segment `default/{site}` scope).
         let (_d, key) =
             keypath::compose_object_key("default", "blog", "photos", "avatars/u1.jpg").unwrap();
-        assert_eq!(key, "hblob/blog/photos/avatars/u1.jpg");
+        assert_eq!(key, "hblob/default/blog/photos/avatars/u1.jpg");
         assert_eq!(h.map.get_bytes(&key).unwrap(), body);
     }
 
@@ -1184,7 +1184,9 @@ mod e2e {
             "cross-container must be refused"
         );
         assert!(
-            h.map.get_bytes("hblob/blog/docs/avatars/u1.jpg").is_none(),
+            h.map
+                .get_bytes("hblob/default/blog/docs/avatars/u1.jpg")
+                .is_none(),
             "no object committed to the wrong container"
         );
 
@@ -1233,7 +1235,7 @@ mod e2e {
         }
         let first = handle(&h.state, mk(&h, b"first").await, NOW).await;
         assert_eq!(first.status(), StatusCode::OK);
-        let key = "hblob/blog/photos/once.bin";
+        let key = "hblob/default/blog/photos/once.bin";
         assert_eq!(h.map.get_bytes(key).unwrap(), b"first");
         // Second PUT (overwrite) ⇒ refused, original preserved.
         let second = handle(&h.state, mk(&h, b"second").await, NOW).await;
@@ -1278,7 +1280,7 @@ mod e2e {
         assert!(String::from_utf8_lossy(&body).contains("BoatrampSha256Mismatch"));
         assert!(
             h.map
-                .get_bytes(&format!("hblob/blog/cas/{wrong_key}"))
+                .get_bytes(&format!("hblob/default/blog/cas/{wrong_key}"))
                 .is_none(),
             "no committed object on mismatch"
         );
@@ -1302,7 +1304,7 @@ mod e2e {
         assert_eq!(handle(&h.state, ok, NOW).await.status(), StatusCode::OK);
         assert_eq!(
             h.map
-                .get_bytes(&format!("hblob/blog/cas/{real_hash}"))
+                .get_bytes(&format!("hblob/default/blog/cas/{real_hash}"))
                 .unwrap(),
             real_bytes
         );
@@ -1412,7 +1414,9 @@ mod e2e {
             "a valid aws-chunked PUT succeeds"
         );
         assert_eq!(
-            h.map.get_bytes("hblob/blog/photos/chunked.bin").unwrap(),
+            h.map
+                .get_bytes("hblob/default/blog/photos/chunked.bin")
+                .unwrap(),
             b"Hello, chunked!",
             "the de-framed payload lands guest-readable"
         );
@@ -1495,7 +1499,7 @@ mod e2e {
         assert_eq!(r.status(), StatusCode::OK);
 
         // Guest read-through: the assembled object is at the hblob key, parts concatenated in order.
-        let final_key = format!("hblob/blog/{container}/{key}");
+        let final_key = format!("hblob/default/blog/{container}/{key}");
         assert_eq!(h.map.get_bytes(&final_key).unwrap(), b"AAAABBBB");
         // Staging is gone (GC'd on complete).
         let staging = keypath::staging_prefix("default", "blog", container, &upload_id);

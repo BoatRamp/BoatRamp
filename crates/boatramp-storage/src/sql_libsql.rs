@@ -547,10 +547,10 @@ impl SqlBackends for LibsqlSqlBackends {
         // built from validated parts (the `fn/<name>` function-SQL identity — a
         // literal `fn` segment plus the function name — is the one case that
         // carries a `/`; each `/`-separated segment is validated on its own).
-        // They are then composed into the internal identity: the bare `site` for
-        // the reserved `default` project (byte-identical to the pre-project
-        // layout — no migration) else `"<project>/<site>"`, which `local_path`
-        // joins as subdirs and `namespace`/`dns_token` hashes.
+        // They are then composed into the internal identity `"<project>/<site>"` for EVERY project
+        // (v0.31.0 Finding 8, including the reserved `default` → `default/<site>`, which re-homes the
+        // old bare `{site}.db` — see `rehome_default_site_db` + docs/default-scope-migration.md),
+        // which `local_path` joins as subdirs and `namespace`/`dns_token` hashes.
         validate_db_name("project", project)?;
         validate_site_ident(site)?;
         validate_db_name("database", name)?;
@@ -820,6 +820,151 @@ impl LibsqlSqlBackends {
         let backend: Arc<dyn SqlBackend> = Arc::new(self.open_one(ident, name).await?);
         cache.insert(key, backend.clone());
         Ok(backend)
+    }
+
+    /// **Default-scope re-home** (v0.31.0 Finding 8): relocate a reserved-`default`-project site's
+    /// libsql database `(site, name)` from its OLD bare identity (`site`, the pre-fix
+    /// `qualified(DEFAULT, site)`) to its NEW two-segment identity (`default/site`), data intact.
+    ///
+    /// Before the Finding-8 fix, `ProjectRef::qualified(DEFAULT, site)` was the BARE `site`, so a
+    /// default-project database lived at `{dir}/{site}.db` (named: `{dir}/{site}/{name}.db`). After
+    /// the fix it is `default/site`, so it must move to `{dir}/default/{site}.db` (named:
+    /// `{dir}/default/{site}/{name}.db`). This is a **local, single-node** operator step (documented,
+    /// not auto-gated): a managed pg/MySQL node keys tenancy on the tenant-axis column (no
+    /// `qualified()`), and a **remote sqld** namespace relocation needs an atomic server-side fork API
+    /// sqld does not expose — so this REFUSES remote fail-closed (pointing at the documented
+    /// create-namespace / copy / cutover operator step), never attempting a lossy app-level move.
+    ///
+    /// Data-preserving, no-clobber, re-runnable-safe — the exact sequence [`Self::move_database`]
+    /// uses: `VACUUM INTO` the destination (online-consistent snapshot) → `PRAGMA integrity_check` →
+    /// only then remove the source + its `-wal`/`-shm` sidecars → drop the cached `database_ident`
+    /// entries so a re-open sees the new path. Idempotent: a destination that already holds the data
+    /// (a completed prior run) with the source gone is a no-op success.
+    pub async fn rehome_default_site_db(
+        &self,
+        site: &str,
+        name: &str,
+    ) -> Result<MoveDatabaseReport, SqlError> {
+        validate_site_ident(site)?;
+        validate_db_name("database", name)?;
+
+        // REMOTE (sqld): refuse — a namespace relocation must be atomic. Detected structurally from
+        // how the backend was constructed, never from a name.
+        let Mode::Local { dir } = &self.mode else {
+            return Err(SqlError::other(
+                "libsql default-scope re-home is supported for local single-node databases only; a \
+                 remote sqld default namespace must be migrated by the documented operator step \
+                 (create the new `bramp-{dns_token(default/site)}` namespace, copy, cut over) — see \
+                 docs/default-scope-migration.md",
+            ));
+        };
+
+        let name = canonical_name(name);
+        // OLD identity = the bare pre-fix default scope; NEW identity = the two-segment `default/site`.
+        let old_ident = site.to_string();
+        let new_ident = ProjectRef::DEFAULT.qualified(site);
+        let src_path = Self::local_path(dir, &old_ident, name);
+        let dst_path = Self::local_path(dir, &new_ident, name);
+        if src_path == dst_path {
+            return Err(SqlError::other(
+                "default-scope re-home is a no-op: source and destination resolve to the same path",
+            ));
+        }
+
+        // Idempotent: a source already gone AND a non-empty destination present ⇒ a completed prior
+        // run. Report success without touching anything.
+        let src_meta = std::fs::metadata(&src_path);
+        if src_meta.is_err()
+            && std::fs::metadata(&dst_path)
+                .map(|m| m.len() > 0)
+                .unwrap_or(false)
+        {
+            return Ok(MoveDatabaseReport {
+                project: boatramp_core::project::DEFAULT_PROJECT.to_string(),
+                site: site.to_string(),
+                from: src_path.display().to_string(),
+                to: dst_path.display().to_string(),
+                integrity: "ok (already re-homed)".to_string(),
+            });
+        }
+        // Source must exist (non-empty) to re-home.
+        match src_meta {
+            Ok(meta) if meta.len() > 0 => {}
+            Ok(_) => {
+                return Err(SqlError::other(format!(
+                    "source database is empty (nothing to re-home): {}",
+                    src_path.display()
+                )));
+            }
+            Err(_) => {
+                return Err(SqlError::other(format!(
+                    "source database not found: {}",
+                    src_path.display()
+                )));
+            }
+        }
+        // Destination must not already hold data — never clobber (a zero-byte stub is tolerated).
+        if let Ok(meta) = std::fs::metadata(&dst_path)
+            && meta.len() > 0
+        {
+            return Err(SqlError::other(format!(
+                "destination database already exists (refusing to overwrite): {}",
+                dst_path.display()
+            )));
+        }
+        if let Some(parent) = dst_path.parent() {
+            std::fs::create_dir_all(parent).map_err(SqlError::other)?;
+        }
+        let _ = std::fs::remove_file(&dst_path);
+
+        // Snapshot the live source into the destination (online-consistent).
+        let source = self.open_one(&old_ident, name).await?;
+        source.vacuum_into(&dst_path).await?;
+
+        // Verify the destination is sound BEFORE dropping the source.
+        let dst = LibsqlSql::open_local(&dst_path).await?;
+        let integrity = {
+            let mut tx = dst.begin_read_only().await?;
+            let rows = tx.query("PRAGMA integrity_check", &[]).await?;
+            tx.commit().await?;
+            match rows.rows.first().and_then(|r| r.first()) {
+                Some(SqlValue::Text(s)) => s.clone(),
+                other => {
+                    return Err(SqlError::other(format!(
+                        "destination integrity_check returned an unexpected result: {other:?}"
+                    )));
+                }
+            }
+        };
+        if integrity != "ok" {
+            let _ = std::fs::remove_file(&dst_path);
+            return Err(SqlError::other(format!(
+                "destination integrity_check failed after copy (source left intact): {integrity}"
+            )));
+        }
+
+        // Verified — remove the source + its WAL/SHM sidecars.
+        std::fs::remove_file(&src_path).map_err(SqlError::other)?;
+        for suffix in ["-wal", "-shm"] {
+            let mut sidecar = src_path.clone().into_os_string();
+            sidecar.push(suffix);
+            let _ = std::fs::remove_file(std::path::PathBuf::from(sidecar));
+        }
+
+        // Evict any cached backend keyed at the OLD and NEW identities so a re-open sees the new path.
+        {
+            let mut cache = self.cache.lock().await;
+            cache.remove(&(old_ident.clone(), name.to_string()));
+            cache.remove(&(new_ident.clone(), name.to_string()));
+        }
+
+        Ok(MoveDatabaseReport {
+            project: boatramp_core::project::DEFAULT_PROJECT.to_string(),
+            site: site.to_string(),
+            from: src_path.display().to_string(),
+            to: dst_path.display().to_string(),
+            integrity,
+        })
     }
 }
 
@@ -1135,9 +1280,10 @@ mod tests {
         // A valid composite site identity (the function-SQL `fn/<name>` shape)
         // is accepted and lands under `dir`.
         backends.database("default", "fn/blog", "").await.unwrap();
-        assert!(dir.join("fn/blog.db").exists());
-        // A normal site/name is accepted, and its file lands under `dir`. The
-        // `default` project keeps the pre-project on-disk layout (bare site).
+        // v0.31.0 Finding 8: the `default` project is now the two-segment `default/{site}`, so the
+        // composite site `fn/blog` lands at `default/fn/blog.db`.
+        assert!(dir.join("default/fn/blog.db").exists());
+        // A normal site/name is accepted, and its file lands under `dir`.
         backends
             .database("default", "my-site_1", "my-db_1")
             .await
@@ -1424,10 +1570,11 @@ mod tests {
     }
 
     /// Tenant isolation (BR-TEN-1): the same site name in two different projects
-    /// resolves to **distinct** databases, and the reserved `default` project
-    /// keeps the byte-identical pre-project on-disk path (back-compat).
+    /// resolves to **distinct** databases, and the reserved `default` project is a
+    /// normal two-segment scope `default/{site}` (v0.31.0 Finding 8), DISJOINT from
+    /// every named project.
     #[tokio::test]
-    async fn same_site_in_two_projects_is_isolated_and_default_is_backcompat() {
+    async fn same_site_in_two_projects_is_isolated_and_default_is_two_segment() {
         let dir = factory_dir("tenant");
         let backends = LibsqlSqlBackends::local(dir.clone());
         // Two projects, same site name.
@@ -1446,17 +1593,17 @@ mod tests {
             one(&globex, "SELECT v FROM t").await,
             vec![SqlValue::Text("globex".into())]
         );
-        // On disk, a non-default project nests the site under `<project>/`,
-        // while `default` keeps the bare `<site>.db` (byte-identical, no
-        // migration).
+        // On disk, EVERY project nests the site under `<project>/` — including the reserved
+        // `default`, which now lands at `default/<site>.db` (Finding 8), disjoint from the named
+        // projects' `acme/`/`globex/` trees.
         assert!(dir.join("acme/blog.db").exists());
         assert!(dir.join("globex/blog.db").exists());
         let default_db = backends.database("default", "blog", "").await.unwrap();
         put(&default_db, "CREATE TABLE t (v TEXT)").await;
-        assert!(dir.join("blog.db").exists());
+        assert!(dir.join("default/blog.db").exists());
         assert_eq!(
-            LibsqlSqlBackends::local_path(&dir, "blog", ""),
-            dir.join("blog.db")
+            LibsqlSqlBackends::local_path(&dir, "default/blog", ""),
+            dir.join("default/blog.db")
         );
     }
 
@@ -1505,38 +1652,44 @@ mod tests {
             vec![SqlValue::Integer(2)]
         );
 
-        // ZERO data movement: only the pre-existing `{site}.db` exists; the raw
-        // `default` name did NOT derive a second `{site}/default.db` file.
+        // The name folding is independent of the (v0.31.0 two-segment) project scope: the default
+        // DB for `default/blog` is the single file `default/blog.db`, and the raw `default` NAME did
+        // NOT derive a second `default/blog/default.db`.
         assert!(
-            dir.join("blog.db").exists(),
+            dir.join("default/blog.db").exists(),
             "the canonical default file exists"
         );
         assert!(
-            !dir.join("blog").join("default.db").exists(),
+            !dir.join("default").join("blog").join("default.db").exists(),
             "the `default` spelling must NOT create a second file — the data is unmoved"
         );
-        // The path derivation agrees: both spellings map to `{site}.db`.
+        // The path derivation agrees: both name spellings map to the one `default/blog.db`.
         assert_eq!(
-            LibsqlSqlBackends::local_path(&dir, "blog", canonical_name("")),
-            dir.join("blog.db")
+            LibsqlSqlBackends::local_path(&dir, "default/blog", canonical_name("")),
+            dir.join("default/blog.db")
         );
         assert_eq!(
             LibsqlSqlBackends::local_path(
                 &dir,
-                "blog",
+                "default/blog",
                 canonical_name(boatramp_core::project::DEFAULT_DB_NAME)
             ),
-            dir.join("blog.db")
+            dir.join("default/blog.db")
         );
 
-        // A NAMED binding is untouched: its own `{site}/{name}.db`, distinct data.
+        // A NAMED binding is untouched: its own `{ident}/{name}.db`, distinct data.
         let named = backends
             .database("default", "blog", "analytics")
             .await
             .unwrap();
         put(&named, "CREATE TABLE t (v TEXT)").await;
         put(&named, "INSERT INTO t VALUES ('named')").await;
-        assert!(dir.join("blog").join("analytics.db").exists());
+        assert!(
+            dir.join("default")
+                .join("blog")
+                .join("analytics.db")
+                .exists()
+        );
         assert_eq!(
             one(&named, "SELECT v FROM t").await,
             vec![SqlValue::Text("named".into())],
@@ -1575,8 +1728,9 @@ mod tests {
         let from = backends.database("default", "blog", "").await.unwrap();
         put(&from, "CREATE TABLE t (v TEXT)").await;
         put(&from, "INSERT INTO t VALUES ('keepme')").await;
-        // Force a WAL sidecar to exist so we prove it's cleaned up too.
-        assert!(dir.join("blog.db").exists());
+        // Force a WAL sidecar to exist so we prove it's cleaned up too. (v0.31.0: the default
+        // project's default DB now lives at the two-segment `default/blog.db`.)
+        assert!(dir.join("default/blog.db").exists());
 
         let report = backends
             .move_database("default", "blog", "", "analytics")
@@ -1600,14 +1754,19 @@ mod tests {
             vec![SqlValue::Text("keepme".into())]
         );
 
-        // The source file + WAL/SHM sidecars are gone.
+        // The source file + WAL/SHM sidecars are gone (at the two-segment default path).
         assert!(
-            !dir.join("blog.db").exists(),
+            !dir.join("default/blog.db").exists(),
             "the source default file must be removed after a verified move"
         );
-        assert!(!dir.join("blog.db-wal").exists());
-        assert!(!dir.join("blog.db-shm").exists());
-        assert!(dir.join("blog").join("analytics.db").exists());
+        assert!(!dir.join("default/blog.db-wal").exists());
+        assert!(!dir.join("default/blog.db-shm").exists());
+        assert!(
+            dir.join("default")
+                .join("blog")
+                .join("analytics.db")
+                .exists()
+        );
     }
 
     /// A move refuses to clobber an existing (non-empty) destination — fail-closed,
@@ -1638,7 +1797,7 @@ mod tests {
             one(&from, "SELECT v FROM t").await,
             vec![SqlValue::Text("src".into())]
         );
-        assert!(dir.join("blog").join("src.db").exists());
+        assert!(dir.join("default").join("blog").join("src.db").exists());
     }
 
     /// A move refuses when the source is absent — a clear error, not a silent success.
@@ -1711,7 +1870,7 @@ mod tests {
             );
         }
         // The source is untouched by any rejected attempt.
-        assert!(dir.join("blog").join("src.db").exists());
+        assert!(dir.join("default").join("blog").join("src.db").exists());
     }
 
     /// A move against a REMOTE (sqld) backend is refused with the typed
@@ -1734,6 +1893,119 @@ mod tests {
             matches!(&err, SqlError::Other(m)
                 if m.contains("local single-node databases only")
                     && m.contains("namespace-fork")),
+            "got {err:?}"
+        );
+    }
+
+    // ---- default-scope re-home (v0.31.0 Finding 8) --------------------------
+
+    /// A LOCAL default-scope re-home copy-verifies a pre-fix bare `{dir}/{site}.db` to the post-fix
+    /// `{dir}/default/{site}.db`, preserving data, then removes the source — so after the
+    /// `qualified()` flip `database("default", site, "")` (now resolving the two-segment identity)
+    /// reads the migrated rows.
+    #[tokio::test]
+    async fn rehome_default_site_db_local_preserves_data() {
+        let dir = factory_dir("rehome-ok");
+        let backends = LibsqlSqlBackends::local(dir.clone());
+
+        // Seed data at the OLD bare path a pre-fix default-project default DB lived at.
+        let old_path = dir.join("blog.db");
+        std::fs::create_dir_all(&dir).unwrap();
+        {
+            let seed: Arc<dyn SqlBackend> =
+                Arc::new(LibsqlSql::open_local(&old_path).await.unwrap());
+            put(&seed, "CREATE TABLE t (v TEXT)").await;
+            put(&seed, "INSERT INTO t VALUES ('premigration')").await;
+        }
+        assert!(old_path.exists(), "seeded old bare default DB");
+
+        let report = backends
+            .rehome_default_site_db("blog", "")
+            .await
+            .expect("local re-home succeeds");
+        assert_eq!(report.integrity, "ok");
+        assert_eq!(report.project, "default");
+        assert_eq!(report.site, "blog");
+        assert!(report.from.ends_with("blog.db"));
+        assert!(report.to.ends_with("default/blog.db"));
+
+        // The new two-segment path holds the data; the old bare path (+ sidecars) is gone.
+        assert!(dir.join("default").join("blog.db").exists());
+        assert!(
+            !old_path.exists(),
+            "source removed after a verified re-home"
+        );
+        assert!(!dir.join("blog.db-wal").exists());
+        assert!(!dir.join("blog.db-shm").exists());
+
+        // Post-flip, `database("default","blog","")` resolves `default/blog` and reads the rows.
+        let db = backends.database("default", "blog", "").await.unwrap();
+        assert_eq!(
+            one(&db, "SELECT v FROM t").await,
+            vec![SqlValue::Text("premigration".into())]
+        );
+    }
+
+    /// Re-home refuses to clobber a non-empty destination (fail-closed; source intact).
+    #[tokio::test]
+    async fn rehome_refuses_existing_destination() {
+        let dir = factory_dir("rehome-clobber");
+        let backends = LibsqlSqlBackends::local(dir.clone());
+        std::fs::create_dir_all(dir.join("default")).unwrap();
+        {
+            let old: Arc<dyn SqlBackend> =
+                Arc::new(LibsqlSql::open_local(&dir.join("blog.db")).await.unwrap());
+            put(&old, "CREATE TABLE t (v TEXT)").await;
+            let new: Arc<dyn SqlBackend> = Arc::new(
+                LibsqlSql::open_local(&dir.join("default").join("blog.db"))
+                    .await
+                    .unwrap(),
+            );
+            put(&new, "CREATE TABLE t (v TEXT)").await;
+        }
+        let err = backends
+            .rehome_default_site_db("blog", "")
+            .await
+            .expect_err("must refuse to overwrite a non-empty destination");
+        assert!(matches!(&err, SqlError::Other(m) if m.contains("already exists")));
+        assert!(dir.join("blog.db").exists(), "source intact after refusal");
+    }
+
+    /// Re-home is idempotent: once the source is gone and the destination holds the data, a re-run
+    /// reports success without error (so a resumed/repeated operator pass converges).
+    #[tokio::test]
+    async fn rehome_is_idempotent_after_completion() {
+        let dir = factory_dir("rehome-idem");
+        let backends = LibsqlSqlBackends::local(dir.clone());
+        std::fs::create_dir_all(&dir).unwrap();
+        {
+            let seed: Arc<dyn SqlBackend> =
+                Arc::new(LibsqlSql::open_local(&dir.join("blog.db")).await.unwrap());
+            put(&seed, "CREATE TABLE t (v TEXT)").await;
+        }
+        backends.rehome_default_site_db("blog", "").await.unwrap();
+        let again = backends.rehome_default_site_db("blog", "").await.unwrap();
+        assert!(again.integrity.contains("already re-homed"));
+    }
+
+    /// A re-home against a REMOTE (sqld) backend is refused, pointing at the documented operator
+    /// step — an app-level namespace copy could lose concurrent writes, so it is never attempted.
+    #[tokio::test]
+    async fn rehome_refuses_remote_backend() {
+        let backends = LibsqlSqlBackends::remote(
+            "http://sqld.internal:8080",
+            "http://sqld.internal:8081",
+            "",
+            None,
+        );
+        let err = backends
+            .rehome_default_site_db("blog", "")
+            .await
+            .expect_err("remote re-home must be refused");
+        assert!(
+            matches!(&err, SqlError::Other(m)
+                if m.contains("local single-node databases only")
+                    && m.contains("operator step")),
             "got {err:?}"
         );
     }

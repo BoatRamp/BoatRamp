@@ -62,9 +62,9 @@ pub(super) enum AsyncPass {
 /// `{site}/{alias}`). PROJECT-QUALIFIED, identical to the handler path (`project_ref.qualified`) and
 /// the function path, so a consumer/cron's `wasi:blobstore` (`hblob/{scope}/…`) and its plain-topic
 /// namespace resolve to the SAME namespace this project's handlers use, isolated across projects that
-/// share a site name. `qualified` is a no-op for the default project (byte-identical to the pre-fix
-/// bare scope), so only non-default projects change — closing the bug where a non-default project's
-/// consumer addressed an empty, cross-project-colliding `hblob/{site}/…`.
+/// share a site name. `qualified` is two-segment for EVERY project including the reserved `default`
+/// (v0.31.0 Finding 8: `default` ⇒ `default/{base}`, disjoint from every named project), closing the
+/// bug where a project's consumer addressed an empty, cross-project-colliding `hblob/{site}/…`.
 #[cfg(feature = "handlers")]
 fn consumer_dispatch_scope(project: ProjectRef<'_>, base: &str) -> String {
     // MUTATION SEAM (gate `bare_scope`): drop the project qualification, reproducing the bug (the
@@ -1753,10 +1753,11 @@ mod consumer_scope_gate {
             consumer_dispatch_scope(p, "console/thumbs"),
             "construens-preview/console/thumbs"
         );
-        // Default project: byte-identical to the bare site (no regression on the pre-project layout).
+        // Default project: now the two-segment `default/{site}` (v0.31.0 Finding 8), DISJOINT from
+        // every named project's scope.
         assert_eq!(
             consumer_dispatch_scope(ProjectRef::DEFAULT, "console"),
-            "console"
+            "default/console"
         );
         // Cross-project isolation: two projects' `console` consumers get DISTINCT scopes, so one can
         // never address the other's `hblob/.../console/...` namespace.

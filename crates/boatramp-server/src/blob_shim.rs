@@ -268,9 +268,10 @@ impl BlobShimResolver {
         // The per-project blob backend the `wasi:blobstore` binding build reads
         // (`inner.blob_backends`); an unconfigured project resolves the global default.
         let storage = self.provider.backend(ProjectRef::new(project));
-        // `hblob/{qualified-site}/` — `hblob/{site}/` for the `default` project,
-        // `hblob/{project}/{site}/` otherwise (ProjectRef::qualified), matching the host
-        // binding's `format!("hblob/{site}/")` where `site` is `project.qualified(site)`.
+        // `hblob/{qualified-site}/` — `hblob/{project}/{site}/` for EVERY project including the
+        // reserved `default` (`hblob/default/{site}/`, v0.31.0 Finding 8; ProjectRef::qualified),
+        // matching the host binding's `format!("hblob/{site}/")` where `site` is
+        // `project.qualified(site)`.
         let qualified_site = ProjectRef::new(project).qualified(workload);
         Some(BlobScope {
             storage,
@@ -1041,7 +1042,8 @@ mod tests {
         let resolver = resolver(&shim, storage.clone());
 
         // Site "api", container-bound to "assets" (`--bind blob:assets`); project default,
-        // so the qualified site is just "api" → prefix `hblob/api/`.
+        // so the qualified site is the two-segment `default/api` (v0.31.0 Finding 8) → prefix
+        // `hblob/default/api/`.
         let env = resolver
             .resolve("default", "api", 0, &[blob_binding("assets")])
             .await;
@@ -1068,7 +1070,7 @@ mod tests {
         // key ALWAYS begins with the token's own (never client-named) site prefix — so
         // cross-SITE is structurally impossible.
         let (_, key) = authorize(Some(&scope), "assets", "k").expect("own container admitted");
-        assert_eq!(key, "hblob/api/assets/k");
+        assert_eq!(key, "hblob/default/api/assets/k");
         assert!(key.starts_with(&scope.site_prefix));
 
         // ---- (ii) path-traversal confinement ------------------------------------------
@@ -1107,7 +1109,9 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         let via_guest = boatramp_handlers::read_object_through_guest_binding(
             storage.clone(),
-            "api",
+            // The shim composes the two-segment default scope `hblob/default/api/…` (Finding 8), so
+            // the guest read-through must name the qualified site `default/api`.
+            "default/api",
             "assets",
             "shared.bin",
         )
@@ -1122,7 +1126,7 @@ mod tests {
         // key) is served by the shim GET.
         storage
             .put(
-                "hblob/api/assets/from-guest.bin",
+                "hblob/default/api/assets/from-guest.bin",
                 once_stream(Bytes::from_static(b"from-guest")),
                 PutMeta::default(),
             )

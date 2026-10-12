@@ -4823,13 +4823,15 @@ mod tests {
             .await
             .unwrap();
 
-        // One message in the production namespace, one in a preview namespace.
+        // One message in the production namespace, one in a preview namespace. v0.31.0 Finding 8:
+        // the default project's consumer subscribes under the two-segment `default/blog/…` scope, so
+        // the published topics must carry it too.
         messaging
-            .publish("blog/orders/created", b"live")
+            .publish("default/blog/orders/created", b"live")
             .await
             .unwrap();
         messaging
-            .publish("blog/_preview/abc/orders/created", b"preview")
+            .publish("default/blog/_preview/abc/orders/created", b"preview")
             .await
             .unwrap();
 
@@ -4862,15 +4864,17 @@ mod tests {
             .unwrap();
         }
 
-        // The production message was delivered + counted.
+        // The production message was delivered + counted (under the two-segment default scope).
         assert_eq!(
-            kv.get("hkv/blog/delivered/orders/created").await.unwrap(),
+            kv.get("hkv/default/blog/delivered/orders/created")
+                .await
+                .unwrap(),
             Some(b"1".to_vec())
         );
         // The preview-namespaced message was never claimed (no background work
         // for previews) — its counter doesn't exist.
         assert_eq!(
-            kv.get("hkv/blog/_preview/abc/delivered/orders/created")
+            kv.get("hkv/default/blog/_preview/abc/delivered/orders/created")
                 .await
                 .unwrap(),
             None
@@ -5075,25 +5079,30 @@ mod tests {
         // Publish a good batch to each tenant's concrete topic, each sealed for its OWN tenant.
         let acme = seal_ctx(&signer, "acme").await;
         let globex = seal_ctx(&signer, "globex").await;
+        // v0.31.0 Finding 8: the default project's bus consumer subscribes under the two-segment
+        // `default/bus/…` scope, so concrete topics + the per-concrete counter carry `default/`.
         messaging
-            .publish_ctx("bus/sync/acme/import", b"ok", Some(&acme))
+            .publish_ctx("default/bus/sync/acme/import", b"ok", Some(&acme))
             .await
             .unwrap();
         messaging
-            .publish_ctx("bus/sync/globex/import", b"ok", Some(&globex))
+            .publish_ctx("default/bus/sync/globex/import", b"ok", Some(&globex))
             .await
             .unwrap();
         run_ticks(&inner, &deploy, 8).await;
 
         // BOTH tenants delivered — each observed via the guest's per-concrete-topic counter
-        // (`hkv/blog/delivered/sync/<tenant>/import`), proving the ONE templated consumer fanned in.
+        // (`hkv/default/blog/delivered/sync/<tenant>/import`), proving the ONE templated consumer
+        // fanned in.
         assert_eq!(
-            kv.get("hkv/blog/delivered/sync/acme/import").await.unwrap(),
+            kv.get("hkv/default/blog/delivered/sync/acme/import")
+                .await
+                .unwrap(),
             Some(b"1".to_vec()),
             "acme's good message delivered to the templated consumer"
         );
         assert_eq!(
-            kv.get("hkv/blog/delivered/sync/globex/import")
+            kv.get("hkv/default/blog/delivered/sync/globex/import")
                 .await
                 .unwrap(),
             Some(b"1".to_vec()),
@@ -5105,11 +5114,16 @@ mod tests {
         // DLQ stays empty — each concrete topic keys its own work-queue + DLQ (Item 4, preserved for
         // free by `claim_grouped(concrete, …)`/`mqdead/{concrete}`).
         messaging
-            .publish_ctx("bus/sync/acme/import", b"poison", Some(&acme))
+            .publish_ctx("default/bus/sync/acme/import", b"poison", Some(&acme))
             .await
             .unwrap();
         let claimed = messaging
-            .claim("bus/sync/acme/import", Duration::from_secs(30), 10, 5)
+            .claim(
+                "default/bus/sync/acme/import",
+                Duration::from_secs(30),
+                10,
+                5,
+            )
             .await
             .unwrap();
         let poison = claimed
@@ -5119,7 +5133,7 @@ mod tests {
         messaging.dead_letter(poison, "test-poison").await.unwrap();
         assert!(
             messaging
-                .dead_letter_count("bus/sync/acme/import")
+                .dead_letter_count("default/bus/sync/acme/import")
                 .await
                 .unwrap()
                 >= 1,
@@ -5127,7 +5141,7 @@ mod tests {
         );
         assert_eq!(
             messaging
-                .dead_letter_count("bus/sync/globex/import")
+                .dead_letter_count("default/bus/sync/globex/import")
                 .await
                 .unwrap(),
             0,
@@ -5159,12 +5173,14 @@ mod tests {
         // A non-templated consumer has NO bound tenant ⇒ no bind-verify: a message with NO sealed
         // context still delivers (unchanged).
         messaging
-            .publish("bus/orders/created", b"ok")
+            .publish("default/bus/orders/created", b"ok")
             .await
             .unwrap();
         run_ticks(&inner, &deploy, 4).await;
         assert_eq!(
-            kv.get("hkv/blog/delivered/orders/created").await.unwrap(),
+            kv.get("hkv/default/blog/delivered/orders/created")
+                .await
+                .unwrap(),
             Some(b"1".to_vec()),
             "the non-templated consumer exact-matches its literal topic (unchanged)"
         );
@@ -5303,12 +5319,12 @@ mod tests {
         // A COVERED topic with work (matched by the `{tenant}` consumer).
         let acme = seal_ctx(&signer, "acme").await;
         messaging
-            .publish_ctx("bus/sync/acme/import", b"ok", Some(&acme))
+            .publish_ctx("default/bus/sync/acme/import", b"ok", Some(&acme))
             .await
             .unwrap();
         // An UNCOVERED topic with work (no consumer subscription matches it).
         messaging
-            .publish("bus/nobody/listening", b"stuck")
+            .publish("default/bus/nobody/listening", b"stuck")
             .await
             .unwrap();
 
@@ -5317,11 +5333,11 @@ mod tests {
         let orphaned = inner.metrics.orphaned_topics();
 
         assert!(
-            orphaned.contains_key("bus/nobody/listening"),
+            orphaned.contains_key("default/bus/nobody/listening"),
             "an uncovered topic with claimable work raises the orphaned signal: {orphaned:?}"
         );
         assert!(
-            !orphaned.contains_key("bus/sync/acme/import"),
+            !orphaned.contains_key("default/bus/sync/acme/import"),
             "a topic WITH a matching {{tenant}} consumer does NOT raise the signal: {orphaned:?}"
         );
     }
@@ -5426,7 +5442,7 @@ mod tests {
         let start = std::time::Instant::now();
         while start.elapsed() < deadline {
             if kv
-                .get("hkv/blog/delivered/orders/created")
+                .get("hkv/default/blog/delivered/orders/created")
                 .await
                 .unwrap()
                 .as_deref()
@@ -5463,8 +5479,9 @@ mod tests {
         });
         let handle = rt.spawn_scheduler(deploy).unwrap();
         // Publish AFTER the drainer is spawned/parked — with no wake, only the safety-net can deliver.
+        // (v0.31.0 Finding 8: the default project's consumer subscribes under `default/blog/…`.)
         messaging
-            .publish("blog/orders/created", b"x")
+            .publish("default/blog/orders/created", b"x")
             .await
             .unwrap();
         assert!(
@@ -5494,16 +5511,21 @@ mod tests {
         });
         // Publish, then DELETE the ready marker (the crash window: index durable, marker not applied).
         messaging
-            .publish("blog/orders/created", b"x")
+            .publish("default/blog/orders/created", b"x")
             .await
             .unwrap();
-        kv.delete(&ready_key("blog/orders/created")).await.unwrap();
+        kv.delete(&ready_key("default/blog/orders/created"))
+            .await
+            .unwrap();
         assert!(
             messaging.ready_topics().await.unwrap().is_empty(),
             "precondition: the ready marker is lost"
         );
         assert_eq!(
-            messaging.backlog("blog/orders/created").await.unwrap(),
+            messaging
+                .backlog("default/blog/orders/created")
+                .await
+                .unwrap(),
             1,
             "precondition: the message itself is NOT lost"
         );
@@ -5539,7 +5561,7 @@ mod tests {
         const N: u32 = 40;
         for _ in 0..N {
             messaging
-                .publish("blog/orders/created", b"x")
+                .publish("default/blog/orders/created", b"x")
                 .await
                 .unwrap();
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -5566,11 +5588,16 @@ mod tests {
         // Publish + claim-with-a-short-lease OUT OF BAND (no ack), so the message is leased-but-pending
         // — exactly the state a crash leaves behind. Then start the drainer fresh (empty due-heap).
         messaging
-            .publish("blog/orders/created", b"x")
+            .publish("default/blog/orders/created", b"x")
             .await
             .unwrap();
         let leased = messaging
-            .claim("blog/orders/created", Duration::from_millis(500), 10, 5)
+            .claim(
+                "default/blog/orders/created",
+                Duration::from_millis(500),
+                10,
+                5,
+            )
             .await
             .unwrap();
         assert_eq!(leased.len(), 1, "the message is leased (unacked)");
@@ -5700,7 +5727,7 @@ mod tests {
         // Drive real delivery so the drainer is actively claiming + writing the store.
         for _ in 0..5 {
             messaging
-                .publish("blog/orders/created", b"x")
+                .publish("default/blog/orders/created", b"x")
                 .await
                 .unwrap();
         }
@@ -7301,8 +7328,8 @@ mod tests {
             assert!(response.status().is_success(), "invocation should succeed");
         }
 
-        // The three writes landed under THREE distinct host kv keys: the two
-        // tenants are project-qualified, and `default` keeps the bare key.
+        // The three writes landed under THREE distinct host kv keys — EVERY project is
+        // project-qualified, including the reserved `default` (v0.31.0 Finding 8: `default/fn/…`).
         assert_eq!(
             kv.get("hkv/acme/fn/store/hits").await.unwrap(),
             Some(b"1".to_vec()),
@@ -7314,9 +7341,9 @@ mod tests {
             "globex's write must be tenant-qualified"
         );
         assert_eq!(
-            kv.get("hkv/fn/store/hits").await.unwrap(),
+            kv.get("hkv/default/fn/store/hits").await.unwrap(),
             Some(b"1".to_vec()),
-            "the default project must keep the byte-identical pre-project key"
+            "the default project is now the two-segment `default/…` scope, disjoint from the others"
         );
         // Sanity: had the fix regressed, all three would have collided on the
         // bare key and it would read "3", not "1".
@@ -7437,7 +7464,10 @@ mod tests {
         for h in handles {
             h.await.unwrap();
         }
-        assert_eq!(kv.get("hkv/blog/hits").await.unwrap(), Some(b"1".to_vec()));
+        assert_eq!(
+            kv.get("hkv/default/blog/hits").await.unwrap(),
+            Some(b"1".to_vec())
+        );
 
         // Same minute → deduped (no fire).
         let (_, handles) = run_scheduler_tick(
@@ -7453,7 +7483,10 @@ mod tests {
         .await
         .unwrap();
         assert!(handles.is_empty());
-        assert_eq!(kv.get("hkv/blog/hits").await.unwrap(), Some(b"1".to_vec()));
+        assert_eq!(
+            kv.get("hkv/default/blog/hits").await.unwrap(),
+            Some(b"1".to_vec())
+        );
 
         // Next minute → fires again.
         let (_, handles) = run_scheduler_tick(
@@ -7471,7 +7504,10 @@ mod tests {
         for h in handles {
             h.await.unwrap();
         }
-        assert_eq!(kv.get("hkv/blog/hits").await.unwrap(), Some(b"2".to_vec()));
+        assert_eq!(
+            kv.get("hkv/default/blog/hits").await.unwrap(),
+            Some(b"2".to_vec())
+        );
 
         // overlap=Skip: a previous fire still running → the next minute is skipped.
         // The cron dedup key is project-qualified (`default|blog|cron|0`) so a
@@ -7494,7 +7530,10 @@ mod tests {
         .await
         .unwrap();
         assert!(handles.is_empty());
-        assert_eq!(kv.get("hkv/blog/hits").await.unwrap(), Some(b"2".to_vec()));
+        assert_eq!(
+            kv.get("hkv/default/blog/hits").await.unwrap(),
+            Some(b"2".to_vec())
+        );
     }
 
     /// Cluster cron single-firing: with a leader gate that
@@ -7611,7 +7650,7 @@ mod tests {
         .unwrap();
         // No cron fired (a follower); the counter was never written.
         assert!(handles.is_empty(), "a non-leader must not fire crons");
-        assert_eq!(kv.get("hkv/blog/hits").await.unwrap(), None);
+        assert_eq!(kv.get("hkv/default/blog/hits").await.unwrap(), None);
     }
 
     /// Gap 4a: `project_tenancy_knobs` returns the operator's per-project override for a listed
@@ -8352,7 +8391,7 @@ mod b10_async_shard_tests {
         tick(&rt, &deploy, AsyncPass::Sharded, ConsumerFilter::Skip).await;
 
         assert!(
-            poll_hits(&kv, "hkv/fn/worker/hits", b"1").await,
+            poll_hits(&kv, "hkv/default/fn/worker/hits", b"1").await,
             "an owns-all shard gate drains the queued invocation exactly once (== legacy)"
         );
     }
@@ -8452,7 +8491,7 @@ mod b10_async_shard_tests {
         );
         let _ = (ra, rb);
         assert!(
-            poll_hits(&kv, "hkv/fn/worker/hits", b"1").await,
+            poll_hits(&kv, "hkv/default/fn/worker/hits", b"1").await,
             "double-owner window: the CAS admits EXACTLY ONE execution (hits == 1)"
         );
         // Harden the detector (gate2 is the direct CAS proof; this guards the integration path): the
@@ -8460,7 +8499,10 @@ mod b10_async_shard_tests {
         // claim that admitted both drainers would advance it toward 2.
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
         assert_eq!(
-            kv.get("hkv/fn/worker/hits").await.unwrap().as_deref(),
+            kv.get("hkv/default/fn/worker/hits")
+                .await
+                .unwrap()
+                .as_deref(),
             Some(b"1".as_ref()),
             "double-owner window: exactly one execution — the counter never reaches 2"
         );
@@ -8492,7 +8534,7 @@ mod b10_async_shard_tests {
         )
         .await;
         assert!(
-            poll_hits(&kv, "hkv/fn/worker/hits", b"2").await,
+            poll_hits(&kv, "hkv/default/fn/worker/hits", b"2").await,
             "no-owner window: the unsharded safety-net drains the orphaned invocation (hits now 2)"
         );
 
@@ -8533,7 +8575,7 @@ mod b10_async_shard_tests {
             tick(&b, &deploy, AsyncPass::Sharded, ConsumerFilter::Skip),
         );
         assert!(
-            poll_hits(&kv, "hkv/fn/worker/hits", b"1").await,
+            poll_hits(&kv, "hkv/default/fn/worker/hits", b"1").await,
             "the expired lease is reclaimed and run EXACTLY once (hits == 1), never double-run"
         );
         let settled =
@@ -8842,7 +8884,7 @@ mod b10_async_shard_tests {
             tick(&new, &deploy, AsyncPass::Sharded, ConsumerFilter::Skip),
         );
         assert!(
-            poll_hits(&kv, "hkv/fn/worker/hits", b"1").await,
+            poll_hits(&kv, "hkv/default/fn/worker/hits", b"1").await,
             "old(owns-all) ⊕ new(sharded) skew: exactly one execution, no function unowned"
         );
     }

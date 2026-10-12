@@ -255,7 +255,9 @@ mod battery {
                  through (proving the check is load-bearing)"
             );
             assert!(
-                h.map.get_bytes("hblob/blog/docs/avatars/u1.jpg").is_some(),
+                h.map
+                    .get_bytes("hblob/default/blog/docs/avatars/u1.jpg")
+                    .is_some(),
                 "MUTATION SKIP_SCOPE: the cross-container object should have landed"
             );
             // The mutation demonstrated the breach; that is enough for this invariant. (The gate as a
@@ -272,7 +274,9 @@ mod battery {
             "cross-container PUT must be refused"
         );
         assert!(
-            h.map.get_bytes("hblob/blog/docs/avatars/u1.jpg").is_none(),
+            h.map
+                .get_bytes("hblob/default/blog/docs/avatars/u1.jpg")
+                .is_none(),
             "no object may land in the wrong container"
         );
 
@@ -441,7 +445,7 @@ mod battery {
             );
             assert!(
                 h.map
-                    .get_bytes(&format!("hblob/blog/cas/{wrong_key}"))
+                    .get_bytes(&format!("hblob/default/blog/cas/{wrong_key}"))
                     .is_some(),
                 "MUTATION SKIP_SHA256: the wrong-key object should have landed"
             );
@@ -462,7 +466,7 @@ mod battery {
         );
         assert!(
             h.map
-                .get_bytes(&format!("hblob/blog/cas/{wrong_key}"))
+                .get_bytes(&format!("hblob/default/blog/cas/{wrong_key}"))
                 .is_none(),
             "no committed object on a mismatch"
         );
@@ -928,7 +932,7 @@ mod battery {
     async fn invariant_8_overwrite() {
         let h = harness();
         let mutated = env_on("BOATRAMP_S3INGRESS_MUTATE_SKIP_CREATE_ONLY");
-        let key = "hblob/blog/photos/once.bin";
+        let key = "hblob/default/blog/photos/once.bin";
 
         let mk = |body: &'static [u8]| {
             let h = &h;

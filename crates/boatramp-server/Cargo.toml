@@ -163,6 +163,14 @@ system-principal-gate-mutation = [
 # live under this crate's own `cfg(test)`, so the in-crate gate arms them).
 compute-blob-shim-gate-mutation = ["handlers"]
 
+# The default-scope project-reservation gate lane (v0.31.0 Finding 8, `DEFAULT-SCOPE RESERVE OK`).
+# When ON, `create_project` compiles a `BOATRAMP_DEFAULTSCOPE_MUTATE_ACCEPT_DEFAULT` seam that drops
+# the reserved-name rejection (accepts a `default` project), turning the reservation gate RED —
+# proving the create-gate half of the disjointness invariant is load-bearing (a named `default`
+# project would re-collide with the reserved default's own two-segment scope). Compiled OUT of every
+# real build (the seam also lives under this crate's own `cfg(test)`, so the in-crate gate arms it).
+default-scope-gate-mutation = []
+
 # TEST-ONLY lane: the MF-3/MF-4 live-Postgres authz twins open a real multi-writer `SqlKv`
 # (`boatramp-storage/sql-postgres`) so node B's fence read-through / fail-closed shed is exercised
 # against a REAL shared primary. Env-gated on `BOATRAMP_TEST_PG_URL`; skips cleanly when unset.
