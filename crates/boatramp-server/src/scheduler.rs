@@ -1375,8 +1375,16 @@ pub(super) async fn run_scheduler_tick(
                 // bare-spelling topics linger alongside their re-homed `default/…` twins. The old
                 // topic is no longer covered (consumers now subscribe to `default/…`), so it would
                 // falsely read as orphaned. Suppress an uncovered bare topic whose `default/<topic>`
-                // twin is ALSO indexed — that is a soak leftover, not genuine uncovered work. (A
-                // genuinely-bare topic with a live consumer is COVERED and never reaches this branch.)
+                // twin is ALSO indexed — but ONLY while migration 2 is in its `dual` soak, so the
+                // suppression can never mask a genuine orphan post-finalize. (A genuinely-bare topic
+                // with a live consumer is COVERED and never reaches this branch.)
+                let in_default_scope_soak = boatramp_core::migrate::read_state(inner.kv.as_ref())
+                    .await
+                    .map(|s| {
+                        s.unfinalized
+                            .contains(&boatramp_core::migrate::DEFAULT_SCOPE_REHOME_VERSION)
+                    })
+                    .unwrap_or(false);
                 let indexed_set: std::collections::HashSet<&String> = indexed.iter().collect();
                 let mut orphaned = std::collections::BTreeMap::new();
                 for topic in &indexed {
@@ -1389,8 +1397,10 @@ pub(super) async fn run_scheduler_tick(
                     if covered {
                         continue;
                     }
-                    // Suppress a default-scope soak leftover (an un-finalized old bare spelling).
-                    if !topic.starts_with("default/")
+                    // Suppress a default-scope soak leftover (an un-finalized old bare spelling) —
+                    // only during the soak (gated above), never after `--finalize`.
+                    if in_default_scope_soak
+                        && !topic.starts_with("default/")
                         && indexed_set.contains(&format!("default/{topic}"))
                     {
                         continue;

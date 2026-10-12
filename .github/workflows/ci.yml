@@ -774,8 +774,8 @@ jobs:
             || { echo "::error::default-scope pre-migration guard gate did not run (silent skip, or the refuse/override property regressed)" >&2; exit 1; }
           cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-node \
             default_scope:: -- --nocapture 2>&1 | tee ds-detect.log
-          grep -qE 'test result: ok\. 2 passed' ds-detect.log \
-            || { echo "::error::default-scope substrate detector gate did not run (silent skip, or the libsql bare-vs-re-homed detector regressed)" >&2; exit 1; }
+          grep -qE 'test result: ok\. 3 passed' ds-detect.log \
+            || { echo "::error::default-scope substrate detector gate did not run (silent skip, or the libsql/blob bare-vs-re-homed detector regressed)" >&2; exit 1; }
 
       # BLOB-READ FAULT-CLASS gate (boatramp-blob-read-error-granularity): a failed blob read
       # (`get`/`get_range`/`head`) must classify its concrete outcome — 404 / 403 AccessDenied / 416 /
