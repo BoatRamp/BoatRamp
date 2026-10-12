@@ -36,6 +36,7 @@ use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 
 mod admin_api;
+pub mod blob_shim;
 pub mod sql_shim;
 #[cfg(feature = "oidc")]
 pub(crate) use admin_api::auth_exchange;
@@ -1112,6 +1113,16 @@ impl HandlerRuntime {
     #[cfg(feature = "handlers")]
     pub fn sql_backends(&self) -> Option<Arc<dyn boatramp_core::sql::SqlBackends>> {
         self.inner.as_ref().and_then(|inner| inner.sql.clone())
+    }
+
+    /// The per-project blob-backend resolver, if a handler runtime is present. Backs the
+    /// compute blob-shim (PLAN-compute-bindings) so an opaque workload reads/writes the
+    /// SAME per-site `hblob/{qualified-site}/…` namespace — over the SAME [`Storage`]
+    /// backend — the `wasi:blobstore` host binding resolves. The symmetric analogue of
+    /// [`Self::sql_backends`].
+    #[cfg(feature = "handlers")]
+    pub fn blob_backends(&self) -> Option<Arc<dyn boatramp_core::blob_backends::BlobBackends>> {
+        self.inner.as_ref().map(|inner| inner.blob_backends.clone())
     }
 
     /// Wire the cloud blob-change notification provisioner (FA-5b2). Set once at
