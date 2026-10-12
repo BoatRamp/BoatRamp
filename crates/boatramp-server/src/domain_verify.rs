@@ -25,6 +25,7 @@ use boatramp_core::domain_verify::{
     CheckResult, DomainProbe, VerificationMethod, VerifyError, check_ownership,
 };
 use boatramp_core::project::ProjectRef;
+use boatramp_core::record_verify::{RecordProbe, RecordSpec, evaluate, resolve_specs};
 use serde::Deserialize;
 
 use crate::deploy_error_response;
@@ -212,6 +213,288 @@ async fn resolve_txt(name: &str) -> Result<Vec<String>, VerifyError> {
         })
         .collect();
     Ok(values)
+}
+
+/// The real generic DNS record probe (Phase 1 of the record-set verifier): resolve
+/// TXT/MX/CNAME/A over hickory **DoH** against a pinned, operator-allowlisted
+/// endpoint. The resolver — and its positive/negative cache — is built **once**
+/// (at [`ServerRecordProbe::new`]) and reused, so an operator who publishes a
+/// record then re-checks sees it without each call paying a fresh resolver build.
+///
+/// Like [`ServerDomainProbe`], the live resolver is compiled only with the
+/// `domain-verify-dns` feature; without it the lookups return a clear
+/// [`VerifyError::Unsupported`] rather than silently failing.
+pub struct ServerRecordProbe {
+    #[cfg(feature = "domain-verify-dns")]
+    resolver: hickory_resolver::TokioAsyncResolver,
+}
+
+impl ServerRecordProbe {
+    /// Build the probe, constructing the DoH resolver once (feature-gated).
+    pub fn new() -> Self {
+        Self {
+            #[cfg(feature = "domain-verify-dns")]
+            resolver: build_doh_resolver(),
+        }
+    }
+}
+
+impl Default for ServerRecordProbe {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A pinned, operator-allowlisted DoH endpoint. The IPs are checked with the
+/// shared [`is_global_ip`](boatramp_core::access::is_global_ip) SSRF floor at
+/// construction — a non-global endpoint is refused — so the verifier can never be
+/// aimed at an internal/metadata resolver.
+#[cfg(feature = "domain-verify-dns")]
+struct DohEndpoint {
+    ips: Vec<std::net::IpAddr>,
+    port: u16,
+    /// The TLS server name the endpoint's certificate is verified against.
+    tls_name: String,
+}
+
+#[cfg(feature = "domain-verify-dns")]
+impl DohEndpoint {
+    /// Cloudflare `1.1.1.1` / `1.0.0.1` (the default).
+    fn cloudflare() -> Self {
+        use std::net::{IpAddr, Ipv4Addr};
+        Self {
+            ips: vec![
+                IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+                IpAddr::V4(Ipv4Addr::new(1, 0, 0, 1)),
+            ],
+            port: 443,
+            tls_name: "cloudflare-dns.com".to_string(),
+        }
+    }
+
+    /// Google `8.8.8.8` / `8.8.4.4`.
+    fn google() -> Self {
+        use std::net::{IpAddr, Ipv4Addr};
+        Self {
+            ips: vec![
+                IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+                IpAddr::V4(Ipv4Addr::new(8, 8, 4, 4)),
+            ],
+            port: 443,
+            tls_name: "dns.google".to_string(),
+        }
+    }
+
+    /// The configured endpoint. `BOATRAMP_DNS_VERIFY_DOH` selects it: `cloudflare`
+    /// (default) / `google`, or a custom `ip[,ip]@tls_name[:port]`. Any non-global
+    /// endpoint IP is dropped (the SSRF floor); if nothing global remains the
+    /// default (Cloudflare) is used — the endpoint is always a public resolver.
+    fn configured() -> Self {
+        let endpoint = match std::env::var("BOATRAMP_DNS_VERIFY_DOH").ok().as_deref() {
+            Some("google") => Self::google(),
+            Some("cloudflare") | None | Some("") => Self::cloudflare(),
+            Some(custom) => Self::parse(custom).unwrap_or_else(Self::cloudflare),
+        };
+        endpoint.allowlisted()
+    }
+
+    /// Parse a custom `ip[,ip]@tls_name[:port]` endpoint.
+    fn parse(spec: &str) -> Option<Self> {
+        let (ips_part, name_part) = spec.split_once('@')?;
+        let (tls_name, port) = match name_part.rsplit_once(':') {
+            Some((name, p)) => (name.to_string(), p.parse().ok()?),
+            None => (name_part.to_string(), 443u16),
+        };
+        if tls_name.is_empty() {
+            return None;
+        }
+        let ips: Vec<std::net::IpAddr> = ips_part
+            .split(',')
+            .filter_map(|ip| ip.trim().parse().ok())
+            .collect();
+        if ips.is_empty() {
+            return None;
+        }
+        Some(Self {
+            ips,
+            port,
+            tls_name,
+        })
+    }
+
+    /// Drop any non-global endpoint IP (SSRF floor); fall back to Cloudflare if
+    /// that leaves nothing.
+    fn allowlisted(self) -> Self {
+        let ips: Vec<std::net::IpAddr> = self
+            .ips
+            .into_iter()
+            .filter(|ip| boatramp_core::access::is_global_ip(*ip))
+            .collect();
+        if ips.is_empty() {
+            tracing::warn!(
+                "record-verify DoH endpoint had no globally-routable IP; falling back to default"
+            );
+            return Self::cloudflare();
+        }
+        Self {
+            ips,
+            port: self.port,
+            tls_name: self.tls_name,
+        }
+    }
+}
+
+/// Build the single, reused DoH resolver for the record verifier. The positive
+/// cache honors each record's TTL but is capped at 5 min (so an operator who just
+/// changed a record isn't pinned to a stale answer), and the negative cache has a
+/// short 5-15s floor (so a freshly-published name that was NXDOMAIN moments ago is
+/// re-queried quickly — the "publish then verify" loop).
+#[cfg(feature = "domain-verify-dns")]
+fn build_doh_resolver() -> hickory_resolver::TokioAsyncResolver {
+    use hickory_resolver::TokioAsyncResolver;
+    use hickory_resolver::config::{NameServerConfigGroup, ResolverConfig, ResolverOpts};
+
+    let endpoint = DohEndpoint::configured();
+    // `from_ips_https` builds DoH name servers with TLS verification against
+    // `tls_name` (SNI + cert name), so the pinned endpoint is authenticated.
+    let group = NameServerConfigGroup::from_ips_https(
+        &endpoint.ips,
+        endpoint.port,
+        endpoint.tls_name,
+        true,
+    );
+    let config = ResolverConfig::from_parts(None, Vec::new(), group);
+
+    let mut opts = ResolverOpts::default();
+    opts.positive_max_ttl = Some(Duration::from_secs(300));
+    opts.negative_min_ttl = Some(Duration::from_secs(5));
+    opts.negative_max_ttl = Some(Duration::from_secs(15));
+    // DoH only — never silently fall back to cleartext UDP/TCP on the system
+    // resolver (that would defeat the pinned, verified endpoint).
+    opts.try_tcp_on_error = false;
+
+    TokioAsyncResolver::tokio(config, opts)
+}
+
+/// Map a hickory lookup error to an empty result when the name simply has no
+/// records of the queried kind (verification then reports `Missing`, not an
+/// error), else a [`VerifyError::Probe`].
+#[cfg(feature = "domain-verify-dns")]
+fn empty_or_probe_err<T>(
+    err: hickory_resolver::error::ResolveError,
+) -> Result<Vec<T>, VerifyError> {
+    use hickory_resolver::error::ResolveErrorKind;
+    if matches!(err.kind(), ResolveErrorKind::NoRecordsFound { .. }) {
+        Ok(Vec::new())
+    } else {
+        Err(VerifyError::Probe(err.to_string()))
+    }
+}
+
+#[cfg(feature = "domain-verify-dns")]
+impl ServerRecordProbe {
+    async fn resolve_txt_doh(&self, name: &str) -> Result<Vec<String>, VerifyError> {
+        let lookup = match self.resolver.txt_lookup(name).await {
+            Ok(lookup) => lookup,
+            Err(err) => return empty_or_probe_err(err),
+        };
+        // A single TXT record may arrive as several ≤255-byte chunks; join them
+        // (same reconstruction the ownership TXT path uses).
+        Ok(lookup
+            .iter()
+            .map(|txt| {
+                txt.txt_data()
+                    .iter()
+                    .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
+                    .collect::<String>()
+            })
+            .collect())
+    }
+
+    async fn resolve_mx_doh(&self, name: &str) -> Result<Vec<String>, VerifyError> {
+        let lookup = match self.resolver.mx_lookup(name).await {
+            Ok(lookup) => lookup,
+            Err(err) => return empty_or_probe_err(err),
+        };
+        // The exchange host (preference is not part of the match; see the matcher).
+        Ok(lookup.iter().map(|mx| mx.exchange().to_utf8()).collect())
+    }
+
+    async fn resolve_cname_doh(&self, name: &str) -> Result<Vec<String>, VerifyError> {
+        use hickory_resolver::proto::rr::{RData, RecordType};
+        // A direct CNAME query — the canonical-name target is reported verbatim and
+        // never chased to an address (that is the `A` kind's job).
+        let lookup = match self.resolver.lookup(name, RecordType::CNAME).await {
+            Ok(lookup) => lookup,
+            Err(err) => return empty_or_probe_err(err),
+        };
+        Ok(lookup
+            .iter()
+            .filter_map(|rdata| match rdata {
+                RData::CNAME(cname) => Some(cname.0.to_utf8()),
+                _ => None,
+            })
+            .collect())
+    }
+
+    async fn resolve_a_doh(&self, name: &str) -> Result<Vec<String>, VerifyError> {
+        let lookup = match self.resolver.ipv4_lookup(name).await {
+            Ok(lookup) => lookup,
+            Err(err) => return empty_or_probe_err(err),
+        };
+        Ok(lookup.iter().map(|a| a.0.to_string()).collect())
+    }
+}
+
+#[async_trait::async_trait]
+impl RecordProbe for ServerRecordProbe {
+    async fn lookup_txt(&self, name: &str) -> Result<Vec<String>, VerifyError> {
+        #[cfg(feature = "domain-verify-dns")]
+        {
+            self.resolve_txt_doh(name).await
+        }
+        #[cfg(not(feature = "domain-verify-dns"))]
+        {
+            let _ = name;
+            Err(VerifyError::Unsupported(VerificationMethod::Dns))
+        }
+    }
+
+    async fn lookup_mx(&self, name: &str) -> Result<Vec<String>, VerifyError> {
+        #[cfg(feature = "domain-verify-dns")]
+        {
+            self.resolve_mx_doh(name).await
+        }
+        #[cfg(not(feature = "domain-verify-dns"))]
+        {
+            let _ = name;
+            Err(VerifyError::Unsupported(VerificationMethod::Dns))
+        }
+    }
+
+    async fn lookup_cname(&self, name: &str) -> Result<Vec<String>, VerifyError> {
+        #[cfg(feature = "domain-verify-dns")]
+        {
+            self.resolve_cname_doh(name).await
+        }
+        #[cfg(not(feature = "domain-verify-dns"))]
+        {
+            let _ = name;
+            Err(VerifyError::Unsupported(VerificationMethod::Dns))
+        }
+    }
+
+    async fn lookup_a(&self, name: &str) -> Result<Vec<String>, VerifyError> {
+        #[cfg(feature = "domain-verify-dns")]
+        {
+            self.resolve_a_doh(name).await
+        }
+        #[cfg(not(feature = "domain-verify-dns"))]
+        {
+            let _ = name;
+            Err(VerifyError::Unsupported(VerificationMethod::Dns))
+        }
+    }
 }
 
 /// `?method=dns|http` on the start endpoint (default `http`, which works in
@@ -446,6 +729,67 @@ pub(crate) async fn check_domain_verification(
         )
             .into_response(),
         // The probe itself failed (network/resolver) — upstream, not our fault.
+        Err(err) => (StatusCode::BAD_GATEWAY, format!("{err}\n")).into_response(),
+    }
+}
+
+/// The request body for `POST …/verify-records`: the set of expected DNS records
+/// to check. The `(site, host)` are taken from the path (as the other
+/// domain-verification endpoints take them), for operator context/logging — the
+/// records to resolve are named explicitly by each spec.
+#[derive(Debug, Deserialize)]
+pub(crate) struct VerifyRecordsRequest {
+    specs: Vec<RecordSpec>,
+}
+
+/// The maximum specs one `verify-records` request may carry — the per-request
+/// analogue of the reconcile sweep's `MAX_PROBES_PER_TICK` fan-out cap, so a
+/// single operator call can't be turned into an unbounded DNS-probe burst.
+const MAX_RECORD_SPECS: usize = 64;
+
+/// `POST /api/sites/{site}/domains/{host}/verify-records` — the generic, **operator
+/// -only** multi-record DNS verifier (Phase 1). Resolve every spec over DNS and
+/// report, per record, whether what's published matches. Stateless and read-only:
+/// it attaches nothing and persists nothing (unlike the ownership check). Gated at
+/// `System·Admin` in [`crate::authz`] (it resolves arbitrary record names, so it
+/// must never be reachable by a site-scoped publisher).
+pub(crate) async fn verify_records(
+    Extension(record_probe): Extension<Arc<dyn RecordProbe>>,
+    Path((site, host)): Path<(String, String)>,
+    Json(req): Json<VerifyRecordsRequest>,
+) -> Response {
+    if req.specs.is_empty() {
+        return (StatusCode::BAD_REQUEST, "no record specs to verify\n").into_response();
+    }
+    if req.specs.len() > MAX_RECORD_SPECS {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!(
+                "too many record specs ({}, max {MAX_RECORD_SPECS})\n",
+                req.specs.len()
+            ),
+        )
+            .into_response();
+    }
+    // Reject an illegal `(kind, mode)` pair at the boundary (`Contains`/`Prefix`
+    // only on TXT) with a clear 400, rather than a silently-never-matching record.
+    for spec in &req.specs {
+        if let Err(err) = spec.validate() {
+            return (StatusCode::BAD_REQUEST, format!("{err}\n")).into_response();
+        }
+    }
+    tracing::debug!(%site, %host, specs = req.specs.len(), "verify-records");
+
+    match resolve_specs(record_probe.as_ref(), &req.specs).await {
+        Ok(resolved) => Json(evaluate(&req.specs, &resolved)).into_response(),
+        // The DNS resolver isn't compiled into this build (no `domain-verify-dns`).
+        Err(VerifyError::Unsupported(_)) => (
+            StatusCode::NOT_IMPLEMENTED,
+            "DNS record verification is not supported by this build; rebuild with the \
+             `domain-verify-dns` feature\n",
+        )
+            .into_response(),
+        // The resolver itself failed (network/DoH) — upstream, not our fault.
         Err(err) => (StatusCode::BAD_GATEWAY, format!("{err}\n")).into_response(),
     }
 }

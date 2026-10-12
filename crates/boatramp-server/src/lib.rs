@@ -1913,6 +1913,10 @@ pub struct ServerOptions {
     /// Domain-ownership probe override (tests inject a scripted one); `None`
     /// uses the live HTTP/DNS probe.
     pub probe: Option<Arc<dyn boatramp_core::domain_verify::DomainProbe>>,
+    /// Generic DNS record-verifier probe override (tests inject a scripted one);
+    /// `None` uses the live DoH [`ServerRecordProbe`](domain_verify::ServerRecordProbe),
+    /// built once so its resolver cache is reused across the server's lifetime.
+    pub record_probe: Option<Arc<dyn boatramp_core::record_verify::RecordProbe>>,
     /// Site to serve for a `Host` that matches no domain, instead of `404`.
     /// `None` keeps the 404 default.
     pub default_site: Option<String>,

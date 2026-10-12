@@ -274,9 +274,16 @@ async-trait.workspace = true
 # constructs a concrete backend, only drives the trait.)
 boatramp-storage = { workspace = true }
 
-# Public-DNS TXT resolver for the `domain-verify-dns` feature (DNS ownership
-# method). Optional; the HTTP-token method needs no resolver.
-hickory-resolver = { version = "0.24", optional = true }
+# Public-DNS resolver for the `domain-verify-dns` feature: the TXT ownership
+# method AND the generic multi-record verifier (`verify-records`). The
+# `dns-over-https-rustls` feature adds DoH so the record verifier resolves over a
+# pinned, TLS-verified, operator-allowlisted endpoint. Optional; the HTTP-token
+# ownership method needs no resolver.
+hickory-resolver = { version = "0.24", default-features = false, features = [
+  "dns-over-https-rustls",
+  "system-config",
+  "tokio-runtime",
+], optional = true }
 
 # JWT verification for the `oidc` control-plane auth feature. Optional.
 jsonwebtoken = { version = "9", optional = true }
