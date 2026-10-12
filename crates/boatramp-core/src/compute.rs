@@ -997,6 +997,62 @@ pub trait ComputeBindingResolver: Send + Sync {
     );
 }
 
+/// Combine several [`ComputeBindingResolver`]s into one. `resolve` concatenates each inner
+/// resolver's env and `release` releases each. Every concrete resolver (the sql-shim, the
+/// blob-shim) already filters to its OWN [`BindingKind`] and ignores the rest, so a
+/// workload that declares both a `sql` and a `blob` binding is served by both shims from a
+/// single `resolve` call. This lets the node hand the reconcile ONE resolver even though
+/// the sql-shim and blob-shim are distinct — the reconcile takes a single
+/// `Option<&dyn ComputeBindingResolver>`.
+pub struct ChainedBindingResolver {
+    resolvers: Vec<Arc<dyn ComputeBindingResolver>>,
+}
+
+impl ChainedBindingResolver {
+    /// Chain the given resolvers, dropping any `None`. Returns `None` when none remain (the
+    /// feature stays off), the sole resolver unwrapped when exactly one remains (no wrapper
+    /// overhead), else a chained composite.
+    pub fn chain(
+        resolvers: impl IntoIterator<Item = Option<Arc<dyn ComputeBindingResolver>>>,
+    ) -> Option<Arc<dyn ComputeBindingResolver>> {
+        let mut resolvers: Vec<_> = resolvers.into_iter().flatten().collect();
+        match resolvers.len() {
+            0 => None,
+            1 => resolvers.pop(),
+            _ => Some(Arc::new(Self { resolvers })),
+        }
+    }
+}
+
+#[async_trait]
+impl ComputeBindingResolver for ChainedBindingResolver {
+    async fn resolve(
+        &self,
+        project: &str,
+        workload: &str,
+        replica: u32,
+        bindings: &[ComputeBinding],
+    ) -> Vec<(String, String)> {
+        let mut env = Vec::new();
+        for resolver in &self.resolvers {
+            env.extend(resolver.resolve(project, workload, replica, bindings).await);
+        }
+        env
+    }
+
+    async fn release(
+        &self,
+        project: &str,
+        workload: &str,
+        replica: u32,
+        bindings: &[ComputeBinding],
+    ) {
+        for resolver in &self.resolvers {
+            resolver.release(project, workload, replica, bindings).await;
+        }
+    }
+}
+
 /// Injects **server-initialization env** (`POSTGRES_*` / `MYSQL_*`) into a compute
 /// workload that a handler `sql` binding manages (PLAN-managed-compute-sql, Phase
 /// 2). The reverse of [`ComputeBindingResolver`]: that wires a *guest* to reach
