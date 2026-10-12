@@ -490,6 +490,10 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
             .compute
             .as_ref()
             .and_then(|c| c.blob_shim_url.clone()),
+        config
+            .compute
+            .as_ref()
+            .and_then(|c| c.blob_shim_max_object_bytes),
     )
     .await;
     #[cfg(not(feature = "handlers"))]

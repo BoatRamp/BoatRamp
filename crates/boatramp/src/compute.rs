@@ -157,8 +157,12 @@ enum ComputeCommand {
         #[arg(long = "region")]
         regions: Vec<String>,
         /// Managed binding the workload depends on, `<kind>[:<name>]` (repeatable):
-        /// `sql` binds the site database, `sql:analytics` a named external DB. The
-        /// endpoint URL + token are injected into the guest env (`BOATRAMP_SQL_URL`).
+        /// `sql` binds the site database, `sql:analytics` a named external DB; `blob`
+        /// binds the site blob store, `blob:assets` one named container. The endpoint
+        /// URL + token are injected into the guest env (`BOATRAMP_SQL_URL` /
+        /// `BOATRAMP_BLOB_URL`). NOTE: a bare `blob` (no `:<name>`) is SITE-WIDE — the
+        /// workload can read/write EVERY container in its site's `hblob/{site}/` space;
+        /// use `blob:<name>` to confine it to one container.
         #[arg(long = "bind")]
         bind: Vec<String>,
     },

@@ -2521,6 +2521,34 @@ pub(crate) fn disable_nagle(stream: &mut tokio::net::TcpStream) {
     }
 }
 
+/// Parse the listener bind [`SocketAddr`] from a compute-shim base URL
+/// (`scheme://host:port[/…]`) — shared by the sql-shim and the blob-shim. The shim binds the
+/// HOST the operator named in the URL (the compute bridge-gateway IP / loopback that makes it
+/// reachable from the guests) and NEVER widens to all interfaces on its own: a literal IP binds
+/// that exact IP; a hostname is resolved and its first address bound (so a name resolving to no
+/// local address simply fails the subsequent `bind`, fail-closed); an explicit `0.0.0.0` / `[::]`
+/// is the operator's own choice, honored as-is. Returns `None` when the URL carries no resolvable
+/// `host:port`.
+///
+/// SECURITY (why not `0.0.0.0`): a shim is a token-gated DATA plane — a whole tenant SQL database,
+/// or the whole `hblob/{site}/` object namespace — whose per-replica token is injected into an
+/// often-untrusted compute-guest env. Binding all interfaces would turn any token leak or future
+/// auth regression into an off-node/internet-reachable one on a node that has a public interface.
+/// Operators MUST point `compute.{sql,blob}_shim_url` at the compute bridge-gateway IP (or
+/// loopback), never a public address.
+pub(crate) fn shim_bind_addr(base_url: &str) -> Option<std::net::SocketAddr> {
+    use std::net::ToSocketAddrs;
+    // Drop the scheme (if present) and any path/query/fragment, leaving `host:port`.
+    let authority = base_url
+        .rsplit_once("://")
+        .map_or(base_url, |(_, rest)| rest)
+        .split(['/', '?', '#'])
+        .next()?;
+    // `to_socket_addrs` parses `IP:port` directly and resolves `name:port` — the one-time startup
+    // resolution; a config that cannot resolve returns `None` (fail-closed, no all-interfaces widen).
+    authority.to_socket_addrs().ok()?.next()
+}
+
 /// [`serve`] with explicit [`ServerOptions`] (e.g. operational request limits).
 pub async fn serve_with(
     addr: SocketAddr,
