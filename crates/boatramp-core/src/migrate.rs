@@ -53,6 +53,8 @@
 //! re-verifying, so racers converge. The marker cursor is a last-writer-wins `put` (no
 //! CAS), so a race can at worst redo a step, never skip a delete-guard.
 
+use std::collections::HashSet;
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
@@ -69,7 +71,37 @@ pub const PREMIGRATION_INDEX_KEY: &str = "schema/premigration-index";
 
 /// The latest schema version this binary knows how to reach — the highest-versioned
 /// entry in [`registry`]. A store below this must be migrated before it will serve.
-pub const CURRENT_VERSION: u32 = 1;
+pub const CURRENT_VERSION: u32 = 2;
+
+/// The version produced by the **default-scope re-home** migration ([`DefaultScopeRehomeV2`],
+/// v0.31.0 Finding 8). Exposed so the serve wiring can detect that the store is in this
+/// migration's `dual` soak (`unfinalized.contains(&DEFAULT_SCOPE_REHOME_VERSION)`) and enable the
+/// translating blob read-fallback for the transition window — the blob substrate's analogue of the
+/// KV copy-before-delete this migration performs (the KV finalize and the blob retire are meant to
+/// happen together at the end of the soak; see the docs).
+pub const DEFAULT_SCOPE_REHOME_VERSION: u32 = 2;
+
+/// The guest **data-plane** KV families the default-scope re-key (migration 2) moves from the bare
+/// `{base}` scope to the two-segment `{DEFAULT_PROJECT}/{base}` scope (Finding 8). Each key is
+/// `{family}{scope}/…` (or `{family}{scope}` for the single-segment markers `mqpause/`/`mqpolicy/`/
+/// `mqready/`/`mqlogmax/`), where `{scope}` is the `ProjectRef::qualified(..)` output. The payload
+/// BLOBS (`mqp/`, `mqgp/`) live in a different substrate and migrate via the translating blob
+/// read-fallback + drain, NOT here. `mqgstate/` carries the durable consumer-group OFFSETS, so it is
+/// re-homed in the SAME forward pass as its `mqglog/`/`mqgd/` index — the runtime addresses the new
+/// spelling only after the forward completes (the version guard), and the old spelling is deleted
+/// only at finalize, so no message is lost and no topic is claimable under two spellings at once.
+pub const DEFAULT_SCOPE_FAMILIES: &[&str] = &[
+    "hkv/",      // guest key/value
+    "mq/",       // work-queue index records
+    "mqdead/",   // dead-lettered records
+    "mqpause/",  // per-topic pause flag (key is `mqpause/{topic}`)
+    "mqpolicy/", // per-topic operator policy (`mqpolicy/{topic}`)
+    "mqready/",  // per-topic ready-set marker (`mqready/{topic}`)
+    "mqglog/",   // grouped retained log
+    "mqgstate/", // consumer-group durable state (hwm + in-flight OFFSETS)
+    "mqlogmax/", // per-topic latest-id gate (`mqlogmax/{topic}`)
+    "mqgd/",     // grouped dead-letters
+];
 
 /// The mutable per-name families the project re-key (migration 1) moves under
 /// `project/<default>/…`. Order is irrelevant to correctness (families are independent)
@@ -494,7 +526,7 @@ async fn write_premigration_index(kv: &dyn KvStore) -> Result<(), MigrateError> 
 /// change here as a new [`Migration`] with the next version; never renumber or reorder
 /// an existing one.
 fn registry() -> Vec<Box<dyn Migration>> {
-    vec![Box::new(ProjectRekeyV1)]
+    vec![Box::new(ProjectRekeyV1), Box::new(DefaultScopeRehomeV2)]
 }
 
 /// One ordered, versioned, forward-only migration.
@@ -584,6 +616,112 @@ impl Migration for ProjectRekeyV1 {
     }
 }
 
+/// Migration **2** — re-home the bare **default-scoped** guest data plane under the two-segment
+/// `default/…` scope (v0.31.0 Finding 8). Before this, [`ProjectRef::qualified`] special-cased the
+/// reserved `default` project to a BARE one-segment scope (`qualified(DEFAULT, "blog") == "blog"`),
+/// which let a `default`-project workload collide with a same-named NAMED project across every
+/// client-composed-key family (`hblob/`, `hkv/`, `mq*/`). Dropping that special-case makes `default`
+/// a normal two-segment project; this migration re-homes the KV substrates that PERSIST the bare
+/// default scope (`hkv/` + every `mq*/` KV family) from `{family}{base}/…` to
+/// `{family}default/{base}/…`. Online (the old-key delete is deferred to `--finalize`).
+///
+/// The transform is the **default-scope re-home** ([`rehome_default_scope`]): a key is moved ONLY
+/// when its scope segment is a bare default scope (not a known project name), so a named project's
+/// keys are never touched and a re-run (or a dual-soak re-scan that sees both spellings) is a no-op.
+/// This is a *default-scope re-home* — insert `default/` AFTER the family prefix — NOT the
+/// `project/<proj>/` wrap [`RekeyFamily`] hard-codes; it mirrors [`RekeyFamily`]/[`DeleteOldFamily`]'s
+/// copy→verify / re-read→byte-compare→delete invariants with that transform parameterized in.
+struct DefaultScopeRehomeV2;
+
+#[async_trait]
+impl Migration for DefaultScopeRehomeV2 {
+    fn version(&self) -> u32 {
+        DEFAULT_SCOPE_REHOME_VERSION
+    }
+    fn id(&self) -> &'static str {
+        "default-scope-rehome"
+    }
+    fn description(&self) -> &'static str {
+        "re-home the bare default-scoped guest data plane (hkv/ + mq*/ KV families) under the \
+         two-segment default/ scope (Finding 8)"
+    }
+    async fn is_applicable(&self, kv: &dyn KvStore) -> Result<bool, MigrateError> {
+        // Applicable iff at least one key under a data-plane family is a bare default scope needing
+        // re-home — a store with only named-project (already two-segment) data-plane keys is NOT
+        // applicable, so it advances vacuously without a spurious dual soak. Short-circuits on the
+        // first re-homeable key. (Only ever reached while the store is below this version — once at
+        // version 2 the startup `status` guard never re-scans these families.)
+        let projects = known_projects(kv).await?;
+        for family in DEFAULT_SCOPE_FAMILIES {
+            for key in kv.list_prefix(family).await? {
+                if rehome_default_scope(family, &key, &projects).is_some() {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+    fn forward_steps(&self) -> Vec<Box<dyn Step>> {
+        DEFAULT_SCOPE_FAMILIES
+            .iter()
+            .map(|family| Box::new(RehomeDefaultScope { family }) as Box<dyn Step>)
+            .collect()
+    }
+    fn cleanup_steps(&self) -> Vec<Box<dyn Step>> {
+        DEFAULT_SCOPE_FAMILIES
+            .iter()
+            .map(|family| Box::new(DeleteRehomedDefaultScope { family }) as Box<dyn Step>)
+            .collect()
+    }
+}
+
+/// The set of **known project names** (the `projectmeta/<name>` pointer keys), including the reserved
+/// `default` once the v1 re-key has materialized it. Used by [`rehome_default_scope`] to tell a bare
+/// default scope (a site/function/topic-base belonging to the default project) from a key that is
+/// already two-segment-scoped under a named project.
+async fn known_projects(kv: &dyn KvStore) -> Result<HashSet<String>, MigrateError> {
+    let mut set = HashSet::new();
+    for key in kv.list_prefix(project::POINTER_PREFIX).await? {
+        if let Some(name) = key.strip_prefix(project::POINTER_PREFIX)
+            && !name.is_empty()
+            && !name.contains('/')
+        {
+            set.insert(name.to_string());
+        }
+    }
+    Ok(set)
+}
+
+/// The **default-scope re-home key transform** — the single, mutation-gated predicate that decides,
+/// idempotently and prefix-aware, whether a data-plane key is a bare default scope to re-home.
+///
+/// Given a key `{family}{rest}` (where `{rest}` begins with the `ProjectRef::qualified(..)` scope
+/// segment), returns:
+/// - `Some("{family}default/{rest}")` when `{rest}`'s FIRST segment is a **bare default scope** — a
+///   site/function/topic-base that is NOT a known project name. This is exactly a pre-fix
+///   `qualified(DEFAULT, base)` == `base` key, re-homed to the post-fix `default/base`.
+/// - `None` (a **NO-OP**) when the first segment is already a known project (a named project — the
+///   key belongs to it, never re-home) OR the reserved `default` (already two-segment-scoped). The
+///   explicit `default` check makes a re-run — and a dual-soak re-scan that lists both the old
+///   `{family}{base}/…` and the new `{family}default/{base}/…` spellings — strictly idempotent: only
+///   bare default-scoped keys ever move.
+///
+/// `family` must end in `/`. A key not under `family`, or with an empty scope segment, is `None`.
+fn rehome_default_scope(family: &str, key: &str, projects: &HashSet<String>) -> Option<String> {
+    let rest = key.strip_prefix(family)?;
+    let first = rest.split('/').next().unwrap_or("");
+    if first.is_empty() {
+        return None;
+    }
+    // Idempotent + prefix-aware: `default` (already re-homed) and every named project are left
+    // alone. The explicit `DEFAULT_PROJECT` guard does not rely on `projectmeta/default` existing,
+    // so idempotency holds even on an oddly-shaped store.
+    if first == DEFAULT_PROJECT || projects.contains(first) {
+        return None;
+    }
+    Some(format!("{family}{DEFAULT_PROJECT}/{rest}"))
+}
+
 // ---- reusable migration steps ----------------------------------------------------
 
 /// One idempotent, resumable unit of a migration. `id` is stable (recorded in the
@@ -667,6 +805,94 @@ impl Step for DeleteOldFamily {
     ) -> Result<(), MigrateError> {
         for old_key in kv.list_prefix(self.family).await? {
             let new_key = format!("project/{}/{}", self.project, old_key);
+            if dry_run {
+                continue;
+            }
+            match (kv.get(&old_key).await?, kv.get(&new_key).await?) {
+                (Some(o), Some(n)) if o == n => kv.delete(&old_key).await?,
+                (Some(_), _) => return Err(MigrateError::Verify(new_key)),
+                (None, _) => {}
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Copy one data-plane family's bare default-scoped keys to their two-segment `default/…` keys
+/// (copy → read-back verify; **never** deletes — [`DeleteRehomedDefaultScope`] is the finalize half).
+/// The default-scope analogue of [`RekeyFamily`], differing only in the transform: it inserts
+/// `default/` AFTER the family prefix via [`rehome_default_scope`], and SKIPS any key whose scope
+/// segment is a known project (named, or the already-re-homed `default`) — so a named project's keys
+/// and an already-migrated key are both no-ops, and listing a family that already contains both
+/// spellings re-copies nothing.
+struct RehomeDefaultScope {
+    family: &'static str,
+}
+
+#[async_trait]
+impl Step for RehomeDefaultScope {
+    fn id(&self) -> String {
+        format!("rehome:default-scope:{}", self.family)
+    }
+    async fn run(
+        &self,
+        kv: &dyn KvStore,
+        dry_run: bool,
+        report: &mut MigrationReport,
+    ) -> Result<(), MigrateError> {
+        let projects = known_projects(kv).await?;
+        let mut moved = 0;
+        for old_key in kv.list_prefix(self.family).await? {
+            let Some(new_key) = rehome_default_scope(self.family, &old_key, &projects) else {
+                continue; // named-project / already-re-homed key: leave it
+            };
+            if dry_run {
+                moved += 1;
+                continue;
+            }
+            let Some(value) = kv.get(&old_key).await? else {
+                continue; // vanished between listing and read
+            };
+            kv.put(&new_key, value.clone()).await?;
+            if kv.get(&new_key).await?.as_deref() != Some(value.as_slice()) {
+                return Err(MigrateError::Verify(new_key));
+            }
+            moved += 1;
+        }
+        if moved > 0 {
+            report.rekeyed.push((self.family.to_string(), moved));
+        }
+        Ok(())
+    }
+}
+
+/// Delete the old bare default-scoped keys of one data-plane family whose two-segment `default/…`
+/// counterpart is present and byte-identical — the finalize half of copy-verify-delete, the
+/// default-scope analogue of [`DeleteOldFamily`]. Idempotent; refuses to delete an old key whose new
+/// key is absent or mismatched (so a partially-copied family never loses data). A key that is NOT a
+/// bare default scope (a named project's key, or an already-re-homed `default/…` key) yields `None`
+/// from the transform and is left untouched — critical here because, unlike the v1 families, both
+/// the old and the new spelling share the SAME family prefix, so the cleanup listing sees both.
+struct DeleteRehomedDefaultScope {
+    family: &'static str,
+}
+
+#[async_trait]
+impl Step for DeleteRehomedDefaultScope {
+    fn id(&self) -> String {
+        format!("delete-rehomed:default-scope:{}", self.family)
+    }
+    async fn run(
+        &self,
+        kv: &dyn KvStore,
+        dry_run: bool,
+        _report: &mut MigrationReport,
+    ) -> Result<(), MigrateError> {
+        let projects = known_projects(kv).await?;
+        for old_key in kv.list_prefix(self.family).await? {
+            let Some(new_key) = rehome_default_scope(self.family, &old_key, &projects) else {
+                continue; // not a bare default scope (named project, or already the new spelling)
+            };
             if dry_run {
                 continue;
             }
@@ -1133,6 +1359,295 @@ mod tests {
             .unwrap();
         assert_eq!(read_state(&dual).await.unwrap().unfinalized, vec![1]);
         assert_eq!(status(&dual).await.unwrap(), Status::Dual);
+    }
+
+    // ---- migration 2: default-scope re-home (Finding 8) ---------------------------
+
+    /// A HashSet of named projects (+ `default`) for the predicate unit tests.
+    fn projects(names: &[&str]) -> HashSet<String> {
+        names.iter().map(|&s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn rehome_default_scope_predicate_moves_only_bare_default_scopes() {
+        // `default` + the named project `acme` are known; `blog`/`fn` are bare default scopes.
+        let known = projects(&["default", "acme"]);
+
+        // A bare default scope re-homes: insert `default/` AFTER the family prefix.
+        assert_eq!(
+            rehome_default_scope("hkv/", "hkv/blog/counter", &known).as_deref(),
+            Some("hkv/default/blog/counter")
+        );
+        // A default-project FUNCTION topic (first segment `fn`, not a project) re-homes whole.
+        assert_eq!(
+            rehome_default_scope("mq/", "mq/fn/resize/uploads/17-ab", &known).as_deref(),
+            Some("mq/default/fn/resize/uploads/17-ab")
+        );
+        // A single-segment marker key (`mqpause/{topic}`) re-homes too.
+        assert_eq!(
+            rehome_default_scope("mqpause/", "mqpause/blog", &known).as_deref(),
+            Some("mqpause/default/blog")
+        );
+        // A consumer-group OFFSET key (the critical one) re-homes with its group/id tail intact.
+        assert_eq!(
+            rehome_default_scope("mqgstate/", "mqgstate/blog/group-a", &known).as_deref(),
+            Some("mqgstate/default/blog/group-a")
+        );
+
+        // A NAMED project's key is a NO-OP (it belongs to that project).
+        assert_eq!(
+            rehome_default_scope("hkv/", "hkv/acme/shop/counter", &known),
+            None
+        );
+        // An ALREADY-re-homed key is a NO-OP (idempotency — survives a dual-soak re-scan that sees
+        // both spellings, and holds even if `projectmeta/default` were absent).
+        assert_eq!(
+            rehome_default_scope("hkv/", "hkv/default/blog/counter", &projects(&["acme"])),
+            None
+        );
+        // Non-family / empty-scope keys are left alone.
+        assert_eq!(rehome_default_scope("hkv/", "mq/blog/x", &known), None);
+        assert_eq!(rehome_default_scope("hkv/", "hkv/", &known), None);
+    }
+
+    /// Seed a v1-layout store (version 1 recorded) carrying BOTH a bare default-scoped data plane
+    /// and a named project `acme`'s two-segment data plane, across every family migration 2 touches.
+    async fn seed_default_scope(kv: &MemoryKv) {
+        // The project pointers the predicate reads (as v1 would have left them).
+        kv.put("projectmeta/default", b"h0".to_vec()).await.unwrap();
+        kv.put("projectmeta/acme", b"h1".to_vec()).await.unwrap();
+
+        // --- bare default-scoped keys (must re-home) ---
+        kv.put("hkv/blog/counter", b"7".to_vec()).await.unwrap();
+        kv.put("hkv/blog/sub/key", b"v".to_vec()).await.unwrap();
+        kv.put("mq/blog/17-aa", b"rec".to_vec()).await.unwrap();
+        kv.put("mqdead/blog/9-bb", b"dead".to_vec()).await.unwrap();
+        kv.put("mqpause/blog", b"".to_vec()).await.unwrap();
+        kv.put("mqpolicy/blog", b"{}".to_vec()).await.unwrap();
+        kv.put("mqready/blog", b"".to_vec()).await.unwrap();
+        kv.put("mqglog/blog/17-aa", b"".to_vec()).await.unwrap();
+        kv.put("mqgstate/blog/grp", b"offs".to_vec()).await.unwrap();
+        kv.put("mqlogmax/blog", b"17-aa".to_vec()).await.unwrap();
+        kv.put("mqgd/blog/grp/9-bb", b"gdead".to_vec())
+            .await
+            .unwrap();
+        // A default-project FUNCTION topic (multi-segment base).
+        kv.put("mq/fn/resize/uploads/1-cc", b"r".to_vec())
+            .await
+            .unwrap();
+
+        // --- named project `acme` keys (must NOT move) ---
+        kv.put("hkv/acme/shop/counter", b"42".to_vec())
+            .await
+            .unwrap();
+        kv.put("mq/acme/shop/3-dd", b"rec2".to_vec()).await.unwrap();
+        kv.put("mqgstate/acme/shop/grp", b"offs2".to_vec())
+            .await
+            .unwrap();
+
+        // Record the store at v1 so only migration 2 runs.
+        persist_state(
+            kv,
+            &SchemaState {
+                version: 1,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn default_scope_rehome_moves_bare_and_leaves_named() {
+        let kv = MemoryKv::new();
+        seed_default_scope(&kv).await;
+        assert_eq!(status(&kv).await.unwrap(), Status::NeedsMigration);
+
+        let report = migrate(&kv, MigrateOptions::one_shot()).await.unwrap();
+        assert!(report.total_rekeyed() > 0);
+
+        // Every bare default-scoped key re-homed under `default/…`, old key gone (one-shot).
+        for (old, new) in [
+            ("hkv/blog/counter", "hkv/default/blog/counter"),
+            ("hkv/blog/sub/key", "hkv/default/blog/sub/key"),
+            ("mq/blog/17-aa", "mq/default/blog/17-aa"),
+            ("mqdead/blog/9-bb", "mqdead/default/blog/9-bb"),
+            ("mqpause/blog", "mqpause/default/blog"),
+            ("mqpolicy/blog", "mqpolicy/default/blog"),
+            ("mqready/blog", "mqready/default/blog"),
+            ("mqglog/blog/17-aa", "mqglog/default/blog/17-aa"),
+            ("mqgstate/blog/grp", "mqgstate/default/blog/grp"),
+            ("mqlogmax/blog", "mqlogmax/default/blog"),
+            ("mqgd/blog/grp/9-bb", "mqgd/default/blog/grp/9-bb"),
+            (
+                "mq/fn/resize/uploads/1-cc",
+                "mq/default/fn/resize/uploads/1-cc",
+            ),
+        ] {
+            assert!(
+                kv.get(new).await.unwrap().is_some(),
+                "{new} must exist after re-home"
+            );
+            assert!(
+                kv.get(old).await.unwrap().is_none(),
+                "{old} must be deleted by the one-shot finalize"
+            );
+        }
+
+        // Named project `acme` keys are byte-untouched (never re-homed, never double-nested).
+        assert_eq!(
+            kv.get("hkv/acme/shop/counter").await.unwrap().as_deref(),
+            Some(&b"42"[..])
+        );
+        assert_eq!(
+            kv.get("mqgstate/acme/shop/grp").await.unwrap().as_deref(),
+            Some(&b"offs2"[..])
+        );
+        assert!(
+            kv.get("hkv/default/acme/shop/counter")
+                .await
+                .unwrap()
+                .is_none(),
+            "a named project's key must never be pulled under default/"
+        );
+
+        assert_eq!(read_state(&kv).await.unwrap().version, 2);
+        assert_eq!(status(&kv).await.unwrap(), Status::Ready);
+    }
+
+    #[tokio::test]
+    async fn default_scope_rehome_is_idempotent() {
+        let kv = MemoryKv::new();
+        seed_default_scope(&kv).await;
+        migrate(&kv, MigrateOptions::one_shot()).await.unwrap();
+        let before = kv.list_prefix("").await.unwrap();
+
+        let again = migrate(&kv, MigrateOptions::one_shot()).await.unwrap();
+        assert!(again.already_migrated);
+        assert_eq!(again.total_rekeyed(), 0);
+        // No double-nesting, no new keys, nothing moved.
+        assert!(
+            kv.get("hkv/default/default/blog/counter")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(kv.list_prefix("").await.unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn default_scope_dual_stage_then_finalize_keeps_offsets() {
+        let kv = MemoryKv::new();
+        seed_default_scope(&kv).await;
+
+        // Stage: copy + verify, keep the old keys (the soak window the blob drain runs in).
+        let staged = migrate(
+            &kv,
+            MigrateOptions {
+                dry_run: false,
+                finalize: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(staged.dual);
+        assert_eq!(status(&kv).await.unwrap(), Status::Dual);
+        assert!(
+            read_state(&kv)
+                .await
+                .unwrap()
+                .unfinalized
+                .contains(&DEFAULT_SCOPE_REHOME_VERSION)
+        );
+        // Messaging continuity: the consumer-group OFFSET is readable at BOTH spellings during the
+        // soak (old kept, new copied), so a claim against either spelling finds the hwm/in-flight.
+        assert_eq!(
+            kv.get("mqgstate/blog/grp").await.unwrap().as_deref(),
+            Some(&b"offs"[..]),
+            "old offset kept during the dual soak"
+        );
+        assert_eq!(
+            kv.get("mqgstate/default/blog/grp")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(&b"offs"[..]),
+            "new-spelling offset copied in the SAME forward pass as the log"
+        );
+
+        // Finalize: the old spelling becomes claimable-nothing (deleted) only now.
+        let done = finalize(&kv).await.unwrap();
+        assert!(!done.dual);
+        assert!(kv.get("mqgstate/blog/grp").await.unwrap().is_none());
+        assert!(kv.get("mq/blog/17-aa").await.unwrap().is_none());
+        assert_eq!(
+            kv.get("mqgstate/default/blog/grp")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(&b"offs"[..])
+        );
+        assert_eq!(status(&kv).await.unwrap(), Status::Ready);
+    }
+
+    #[tokio::test]
+    async fn default_scope_finalize_never_deletes_an_unverified_old_key() {
+        // The copy-before-delete guard: a tampered/absent new key must BLOCK the old delete.
+        let kv = MemoryKv::new();
+        seed_default_scope(&kv).await;
+        migrate(
+            &kv,
+            MigrateOptions {
+                dry_run: false,
+                finalize: false,
+            },
+        )
+        .await
+        .unwrap();
+        // Corrupt one new-spelling value so it no longer byte-matches its old key.
+        kv.put("mqgstate/default/blog/grp", b"TAMPERED".to_vec())
+            .await
+            .unwrap();
+        let err = finalize(&kv).await;
+        assert!(
+            matches!(err, Err(MigrateError::Verify(_))),
+            "finalize must refuse to delete an old key whose new counterpart mismatches"
+        );
+        // The old key is intact — no data lost.
+        assert_eq!(
+            kv.get("mqgstate/blog/grp").await.unwrap().as_deref(),
+            Some(&b"offs"[..])
+        );
+    }
+
+    #[tokio::test]
+    async fn default_scope_vacuous_on_named_only_store() {
+        // A store with ONLY named-project data-plane keys has nothing to re-home → migration 2 is
+        // vacuously applied (no dual soak), store advances to v2 and is Ready.
+        let kv = MemoryKv::new();
+        kv.put("projectmeta/default", b"h".to_vec()).await.unwrap();
+        kv.put("projectmeta/acme", b"h".to_vec()).await.unwrap();
+        kv.put("hkv/acme/shop/k", b"v".to_vec()).await.unwrap();
+        persist_state(
+            &kv,
+            &SchemaState {
+                version: 1,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let report = migrate(&kv, MigrateOptions::one_shot()).await.unwrap();
+        assert!(!report.dual, "no bare default keys ⇒ no dual soak");
+        assert_eq!(report.total_rekeyed(), 0);
+        assert_eq!(read_state(&kv).await.unwrap().version, 2);
+        assert!(read_state(&kv).await.unwrap().unfinalized.is_empty());
+        assert_eq!(status(&kv).await.unwrap(), Status::Ready);
+        assert_eq!(
+            kv.get("hkv/acme/shop/k").await.unwrap().as_deref(),
+            Some(&b"v"[..])
+        );
     }
 
     // ---- framework tests: prove the engine chains an arbitrary migration list -----
