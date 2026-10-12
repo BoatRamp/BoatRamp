@@ -11,8 +11,10 @@
 //! against-the-internet leg is exercised in live testing). Without the feature the DNS
 //! method returns a clear, actionable error instead of silently failing.
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
+
+use tokio::sync::Semaphore;
 
 use boatramp_core::time::now_unix;
 
@@ -747,6 +749,21 @@ pub(crate) struct VerifyRecordsRequest {
 /// single operator call can't be turned into an unbounded DNS-probe burst.
 const MAX_RECORD_SPECS: usize = 64;
 
+/// A modest cap on **concurrent in-flight** `verify-records` resolutions,
+/// process-wide. The endpoint is already `System·Admin`-gated and capped at
+/// [`MAX_RECORD_SPECS`] per request, but nothing otherwise bounds *sustained*
+/// fan-out: a rogue/compromised admin token — or a future authz regression —
+/// could drive back-to-back requests and keep the DoH resolver saturated. This
+/// semaphore bounds the blast radius: once this many verifications are already
+/// running, a further request is refused (429) rather than piling on. A global
+/// concurrency floor (not per-caller tuning) — deliberately simple.
+const MAX_CONCURRENT_VERIFY_RECORDS: usize = 4;
+
+/// Guards the concurrent-resolution count for [`verify_records`] (see
+/// [`MAX_CONCURRENT_VERIFY_RECORDS`]).
+static VERIFY_RECORDS_SEMAPHORE: LazyLock<Semaphore> =
+    LazyLock::new(|| Semaphore::new(MAX_CONCURRENT_VERIFY_RECORDS));
+
 /// `POST /api/sites/{site}/domains/{host}/verify-records` — the generic, **operator
 /// -only** multi-record DNS verifier (Phase 1). Resolve every spec over DNS and
 /// report, per record, whether what's published matches. Stateless and read-only:
@@ -779,6 +796,20 @@ pub(crate) async fn verify_records(
         }
     }
     tracing::debug!(%site, %host, specs = req.specs.len(), "verify-records");
+
+    // Blast-radius bound: refuse immediately (don't queue) once the concurrent-
+    // resolution cap is reached, so sustained calls can't keep the DoH resolver
+    // saturated. The permit is held across the resolve and released on return.
+    let _permit = match VERIFY_RECORDS_SEMAPHORE.try_acquire() {
+        Ok(permit) => permit,
+        Err(_) => {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                "too many concurrent record verifications in flight; retry shortly\n",
+            )
+                .into_response();
+        }
+    };
 
     match resolve_specs(record_probe.as_ref(), &req.specs).await {
         Ok(resolved) => Json(evaluate(&req.specs, &resolved)).into_response(),
