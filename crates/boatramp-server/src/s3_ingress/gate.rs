@@ -165,11 +165,20 @@ async fn run(h: &Harness, req: S3Request) -> (StatusCode, String) {
 }
 
 /// Read `key` back through the REAL guest `compat::blob` read-path (proves guest read-through at
-/// `hblob/…`). Delegates to the production `wasi:blobstore` binding, not the raw store.
+/// `hblob/…`). Delegates to the production `wasi:blobstore` binding, not the raw store. The gate's
+/// session is the default project + site `blog`; v0.31.0 Finding 8 makes that the two-segment
+/// `default/blog` scope, so the read-through names the QUALIFIED site `default/blog` — identical to
+/// what the s3-ingress write path (`compose_object_key` → `qualified(default, "blog")`) composes, so
+/// this still proves write/read agree on one key (the whole point of the gate).
 async fn guest_read(h: &Harness, container: &str, object: &str) -> Vec<u8> {
-    boatramp_handlers::read_object_through_guest_binding(h.map.clone(), "blog", container, object)
-        .await
-        .unwrap_or_else(|e| panic!("guest read-through failed for {container}/{object}: {e}"))
+    boatramp_handlers::read_object_through_guest_binding(
+        h.map.clone(),
+        "default/blog",
+        container,
+        object,
+    )
+    .await
+    .unwrap_or_else(|e| panic!("guest read-through failed for {container}/{object}: {e}"))
 }
 
 /// Whether a mutation env var is set (the gate reads them so the SAME test body inverts under a

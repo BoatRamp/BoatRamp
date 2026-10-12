@@ -1313,13 +1313,24 @@ async fn collect_consumer_stats(
     let Some(site_handlers) = site_config.handlers.as_ref().filter(|h| h.enabled) else {
         return Ok(out);
     };
+    // The dispatch scope is PROJECT-QUALIFIED, identical to the scheduler's
+    // `consumer_dispatch_scope` (and the DLQ namespace): `default/{site}` for the
+    // reserved default project (v0.31.0 Finding 8 — `ProjectRef::qualified` is two-
+    // segment for EVERY project). The backlog MUST be read on the SAME namespaced
+    // topic the drainer consumes, else operator stats under-report to 0 for every
+    // default-project consumer. Pre-Finding-8 the bare site coincided with the
+    // (then also bare) dispatch scope; the two-segment change split them, so this
+    // mirrors the dispatcher's qualification here too.
     let mut active: Vec<(String, String)> = Vec::new();
     if let Some(id) = deploy.current_id(ProjectRef::DEFAULT, site).await? {
-        active.push((id, site.to_string()));
+        active.push((id, ProjectRef::DEFAULT.qualified(site)));
     }
     for alias in &site_handlers.background_aliases {
         if let Some(id) = deploy.get_alias(ProjectRef::DEFAULT, site, alias).await? {
-            active.push((id, format!("{site}/{alias}")));
+            active.push((
+                id,
+                ProjectRef::DEFAULT.qualified(&format!("{site}/{alias}")),
+            ));
         }
     }
     for (id, scope) in active {

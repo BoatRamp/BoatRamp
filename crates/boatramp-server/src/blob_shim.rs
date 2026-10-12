@@ -1018,7 +1018,10 @@ mod tests {
                 .map
                 .lock()
                 .unwrap()
-                .contains_key("hblob/api/docs/big.bin"),
+                // Project default ⇒ the two-segment qualified site `default/api`
+                // (v0.31.0 Finding 8): the real storage key an over-cap write would
+                // have landed at, so the negative assertion still bites.
+                .contains_key("hblob/default/api/docs/big.bin"),
             "an over-cap object must not be persisted"
         );
         // At/under the cap → OK.

@@ -7510,10 +7510,11 @@ mod tests {
         );
 
         // overlap=Skip: a previous fire still running → the next minute is skipped.
-        // The cron dedup key is project-qualified (`default|blog|cron|0`) so a
-        // same-named site in another project can't dedup this one.
+        // The cron dedup key is `{project}|{qualified-scope}|cron|{idx}`; v0.31.0 Finding 8 makes the
+        // default project's scope the two-segment `default/blog`, so the key is
+        // `default|default/blog|cron|0` (still disjoint from any other project's same-named site).
         crons
-            .get("default|blog|cron|0")
+            .get("default|default/blog|cron|0")
             .unwrap()
             .running
             .store(true, Ordering::Release);
