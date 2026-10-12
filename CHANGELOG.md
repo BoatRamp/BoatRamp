@@ -7,10 +7,16 @@ versions.
 
 ## [0.31.0] - 2026-10-12
 
-Inbound/listening TCP for guest handlers — the sequel to v0.30.0's outbound egress. A node can now
-accept raw TCP connections and hand them to a guest component, so a handler can serve a non-HTTP
-protocol (POP3/IMAP/SMTP/LMTP, a custom-protocol broker). Experimental, opt-in, and fail-closed; an
-all-default deployment is unchanged.
+Four capability features in one release: the inbound/listening-TCP sequel to v0.30.0's outbound
+egress, plus three general platform gaps raised by downstream apps — a compute blob-shim, extension
+(WebDAV) HTTP methods in routing, and a generic DNS record-set verifier. Every one is opt-in and
+fail-closed; an all-default deployment is unchanged. Each ships behind its own mutation-verified
+(and, for inbound-TCP, live) CI gate.
+
+### Inbound/listening TCP for guest handlers
+
+A node can now accept raw TCP connections and hand them to a guest component, so a handler can serve a
+non-HTTP protocol (POP3/IMAP/SMTP/LMTP, a custom-protocol broker). Experimental, opt-in, fail-closed.
 
 - **Host-owned declarative TCP listeners (`[serve.listeners.<name>]`).** The **node** (operator
   authority) binds + listens + accepts on a declared bind address and hands each *already-accepted*
@@ -36,6 +42,44 @@ all-default deployment is unchanged.
   handler-contract version 0.6 → 0.7). The guest-side `boatramp-uchron-shim` ships a matching
   `tcp-listener` capability the same cycle. Inbound UDP and guest-driven `bind`/`listen` remain
   future work.
+
+### Compute blob-shim — `boatramp compute set --bind blob` is now backed
+
+A native compute workload can now read/write the **same** blob objects a wasm handler sees via
+`wasi:blobstore`, symmetric with the existing `--bind sql`. Previously `--bind blob` parsed but was
+inert (no shim backed it, `BOATRAMP_BLOB_URL` was never set). The node now spawns a blob-shim (config
+`[compute].blob_shim_url`) serving the per-site `hblob/{site}/{container}/{key}` namespace over the
+same `Storage` backend through a small HTTP API (`PUT`/`GET` with `Range:`/`HEAD`/`DELETE`), and
+`--bind blob[:<container>]` injects a live `BOATRAMP_BLOB_URL` + a scoped `…_AUTH_TOKEN`. The token is
+a per-node-secret HMAC bound to `(project, workload, name, replica)`; the **site is carried by the
+token, never a client field**, so cross-site is structural, cross-container is rejected for a
+container-pinned token, and keys run the same `validate_object_key` screen as the host binding (no
+traversal / reserved-namespace escape). The shim binds **only the host its configured URL names**
+(not all interfaces), PUTs are size-capped (`blob_shim_max_object_bytes`, default 5 GiB), and the
+bearer token is matched via a salted hash. The identical listener-bind hardening was applied to the
+existing SQL shim.
+
+### Extension / WebDAV HTTP methods in edge routing
+
+A route's `methods:` now accepts any valid RFC 7230 method token — the WebDAV verbs (`PROPFIND`,
+`PROPPATCH`, `REPORT`, `MKCALENDAR`, `MKCOL`, `MOVE`, `COPY`) CalDAV (RFC 4791) / CardDAV (RFC 6352)
+need — plus an explicit per-route `methods: ["*"]` catch-all, while still rejecting non-token junk
+(no injection via the method string). Extension verbs reach the handler as `wasi:http`
+`method.other("…")`. The `"*"` catch-all is explicit and per-route — it never broadens another route,
+and no method-gated security check (CORS, cacheability, gateway retry, static-file serving,
+control-plane write classification) is bypassed by an extension verb or the catch-all.
+
+### Generic DNS record-set verifier (Phase 1)
+
+A new operator verb/endpoint verifies an arbitrary expected record set
+`[{kind: TXT|MX|CNAME|A, name, value, match: exact|contains|prefix}]`, returning per-record
+`ok|mismatch|missing` + an overall `verified` — `boatramp domain verify-records` and a `System·Admin`
+control-plane endpoint. It resolves over DoH (pinned, `is_global_ip`-guarded endpoint; a single
+long-lived cache with a short negative TTL so a just-published record verifies promptly), with
+`contains`/`prefix` legal for TXT only (rejected for A/CNAME/MX at the boundary **and** in the
+matcher), CNAME reported verbatim without chasing, and a per-request spec cap + a concurrency cap. The
+existing ownership-challenge flow (`domain add`/`verify`) is unchanged. Operator-only for now; an
+importable in-guest capability is deferred pending a guest-egress review.
 
 ## [0.30.0] - 2026-10-11
 
