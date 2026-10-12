@@ -1216,6 +1216,43 @@ impl ControlPlane {
             .await?)
     }
 
+    /// Operator-only generic DNS record-set verifier (`domain verify-records`):
+    /// resolve `specs` over DNS and return the per-record [`VerifyReport`]. The
+    /// server gates this at `system·admin`, so a site-scoped token gets a 403. A
+    /// `400` (bad spec), `501` (no DNS feature) or other non-2xx is surfaced
+    /// verbatim as [`ClientError::Refused`].
+    pub async fn verify_records(
+        &self,
+        site: &str,
+        host: &str,
+        specs: &[boatramp_core::record_verify::RecordSpec],
+    ) -> Result<boatramp_core::record_verify::VerifyReport> {
+        let seg = self.sites_seg();
+        let Self {
+            http: client,
+            base: server,
+            ..
+        } = self;
+        let resp = client
+            .post(format!(
+                "{server}/api/{seg}/{site}/domains/{}/verify-records",
+                host_segment(host)
+            ))
+            .json(&serde_json::json!({ "specs": specs }))
+            .send()
+            .await?;
+        let status = resp.status();
+        if status.is_success() {
+            Ok(resp.json().await?)
+        } else {
+            let body = resp.text().await.unwrap_or_default();
+            Err(ClientError::Refused(format!(
+                "verify-records refused ({status}): {}",
+                body.trim()
+            )))
+        }
+    }
+
     /// Activate a deployment id for a site (the atomic switch / rollback).
     pub async fn activate(&self, site: &str, id: &str) -> Result<()> {
         let seg = self.sites_seg();
