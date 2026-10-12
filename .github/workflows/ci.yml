@@ -648,6 +648,40 @@ jobs:
             fi
           done
 
+      # PLAN-compute-bindings COMPUTE BLOB-SHIM SCOPED GATE (marker `COMPUTE BLOB-SHIM SCOPED OK`). The
+      # compute blob-shim gives an opaque workload the SAME per-site `hblob/{qualified-site}/{container}/
+      # {key}` blob namespace — over the SAME `Storage` backend — a `wasi:blobstore` handler sees, scoped
+      # by a bearer token the shim mints (the site is bound by the TOKEN, never a client field). This gate
+      # drives the SINGLE enforced decision `blob_shim::authorize` + `BlobShim::authenticate` (the same
+      # code every HTTP method handler calls, so tested == enforced) across the three security dimensions,
+      # AND proves the shared-namespace property by reading a shim PUT back THROUGH the real
+      # `wasi:blobstore` host binding (and a guest-landed object back through the shim GET). Asserts the
+      # marker + pass count catch a silent skip/rename. MUTATION-VERIFIED: the SAME test re-run under each
+      # `BOATRAMP_COMPUTEBLOB_MUTATION` neuters ONE check and MUST FAIL — `allow_cross_container` (a token
+      # scoped to site A / container X reaches a DIFFERENT container), `allow_traversal` (a `../` key
+      # escapes the container prefix), `admit_unmatched` (an unauthenticated/mismatched token is admitted).
+      # A pass-under-mutation (a hollow gate) fails the merge.
+      - name: "compute blob-shim scoped gate (site/container-bound, traversal-safe, authed; shared namespace)"
+        run: |
+          set -eo pipefail
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-server \
+            --features handlers compute_blob_shim_scoped_gate -- --nocapture 2>&1 | tee compute-blob-shim.log
+          grep -qE 'test result: ok\. 1 passed' compute-blob-shim.log \
+            || { echo "::error::compute blob-shim gate did not run (silent skip or a failure)" >&2; exit 1; }
+          grep -q 'COMPUTE BLOB-SHIM SCOPED OK' compute-blob-shim.log \
+            || { echo "::error::compute blob-shim gate never reached its marker (a token-scope / traversal / auth / shared-namespace regression)" >&2; exit 1; }
+          # Mutation guard: each mutation MUST fail the gate (proving each check is load-bearing).
+          for mut in allow_cross_container allow_traversal admit_unmatched; do
+            if BOATRAMP_COMPUTEBLOB_MUTATION="$mut" cargo-zigbuild test --target x86_64-unknown-linux-musl \
+              -p boatramp-server --features handlers compute_blob_shim_scoped_gate \
+              -- --nocapture > "compute-blob-shim-mutation-$mut.log" 2>&1; then
+              echo "::error::compute blob-shim gate is HOLLOW — it passed under mutation '$mut' (a blob-shim scope/auth security property is not actually enforced)" >&2
+              exit 1
+            else
+              echo "compute blob-shim mutation verified: '$mut' fails the gate as expected."
+            fi
+          done
+
       # BLOB-READ FAULT-CLASS gate (boatramp-blob-read-error-granularity): a failed blob read
       # (`get`/`get_range`/`head`) must classify its concrete outcome — 404 / 403 AccessDenied / 416 /
       # throttle (503/429) / 5xx / transport — into DISTINCT kinds, so a 403 under-scoped credential or
