@@ -34,6 +34,12 @@ pub enum Error {
     /// instead of an opaque server error or a `//`-collapsed path).
     #[error("{0}")]
     InvalidDb(String),
+    /// Loading/parsing the `--node-config` failed (`sql rehome-default`, offline).
+    #[error(transparent)]
+    Config(#[from] boatramp_node::config::ConfigError),
+    /// The offline default-scope libsql re-home (`sql rehome-default`) refused or failed.
+    #[error("sql rehome-default: {0}")]
+    Rehome(String),
 }
 
 /// Validate a `--db` name through the one canonical resource-identifier validator
@@ -118,6 +124,28 @@ enum SqlCommand {
         #[arg(long)]
         site: Option<String>,
     },
+    /// **Default-scope re-home** a reserved-`default`-project site's libsql database (v0.31.0
+    /// Finding 8), OFFLINE + node-local — the libsql half of the `boatramp migrate` default-scope
+    /// re-key. Copy-verifies the pre-fix bare `{dir}/{site}.db` to the post-fix
+    /// `{dir}/default/{site}.db` (`VACUUM INTO` → `integrity_check` → remove source + WAL/SHM), data
+    /// intact, then a reopen via `database("default", site, …)` resolves the new two-segment path.
+    ///
+    /// **Local single-node only.** A node whose `handlers.bindings.sql` is a REMOTE sqld (`url = …`)
+    /// is refused fail-closed, pointing at the manual namespace-migration operator step — an
+    /// app-level remote move could lose writes racing the copy. Run with the node STOPPED (a
+    /// maintenance op), before starting the new binary. Reads `--node-config` (not `--server`).
+    RehomeDefault {
+        /// The site whose default-project database is being re-homed.
+        #[arg(long)]
+        site: String,
+        /// The database binding name to re-home (`default` = the site's default database).
+        #[arg(long, default_value = boatramp_core::project::DEFAULT_DB_NAME)]
+        db: String,
+        /// Path to the node config (`boatramp.cfg` shape) whose `handlers.bindings.sql` + `[serve]`
+        /// data_dir locate the libsql store. Defaults to `boatramp.cfg`.
+        #[arg(long, default_value = "boatramp.cfg")]
+        node_config: std::path::PathBuf,
+    },
 }
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
@@ -130,6 +158,17 @@ enum Format {
 
 /// Entry point for `boatramp sql`.
 pub async fn run(args: SqlArgs, config: &ProjectConfig) -> Result<()> {
+    // `rehome-default` is OFFLINE + node-local (reads `--node-config`, builds the local libsql
+    // backend, never a control-plane server) — handle it before resolving the server target.
+    if let SqlCommand::RehomeDefault {
+        site,
+        db,
+        node_config,
+    } = args.command
+    {
+        return rehome_default(&site, &db, &node_config).await;
+    }
+
     let server = client::resolve_server(args.server, config)?;
     let http = client::http_client(client::token(config).as_deref());
     // Honor the global `--project`: operator SQL is project-owned, so target
@@ -264,8 +303,71 @@ pub async fn run(args: SqlArgs, config: &ProjectConfig) -> Result<()> {
                 Err(_) => println!("{}", body.trim()),
             }
         }
+        // Handled offline above (returned before the server target was resolved).
+        SqlCommand::RehomeDefault { .. } => {
+            unreachable!("handled offline before server resolution")
+        }
     }
     Ok(())
+}
+
+/// Run the offline, node-local default-scope libsql re-home (`boatramp sql rehome-default`, v0.31.0
+/// Finding 8). Loads `--node-config`, refuses fail-closed for a REMOTE sqld binding (pointing at the
+/// manual namespace-migration operator step), else builds the LOCAL libsql backend and copy-verifies
+/// the site's bare `{dir}/{site}.db` to its two-segment `{dir}/default/{site}.db` via the inherent
+/// [`rehome_default_site_db`](boatramp_storage::LibsqlSqlBackends::rehome_default_site_db).
+#[cfg(feature = "sql")]
+async fn rehome_default(site: &str, db: &str, node_config: &std::path::Path) -> Result<()> {
+    let config = boatramp_node::config::ServerConfig::load(node_config, None)?;
+    let sql_cfg = config
+        .handlers
+        .as_ref()
+        .and_then(|h| h.bindings.sql.as_ref());
+    // REMOTE sqld (a `handlers.bindings.sql.url`): refuse fail-closed — an app-level namespace move
+    // could lose writes racing the copy. Point at the manual operator step; never attempt it.
+    if sql_cfg.and_then(|c| c.url.as_ref()).is_some() {
+        return Err(Error::Rehome(
+            "this node's libsql is a REMOTE sqld (handlers.bindings.sql.url is set); a default-scope \
+             namespace relocation is a MANUAL operator step — create the new namespace \
+             bramp-{dns_token(\"default/<site>\")}, copy, and cut over (see \
+             docs/default-scope-migration.md). Refused fail-closed."
+                .into(),
+        ));
+    }
+    let data_dir = config
+        .serve
+        .as_ref()
+        .and_then(|s| s.data_dir.clone())
+        .unwrap_or_else(|| std::path::PathBuf::from("./data"));
+    let dir = sql_cfg
+        .and_then(|c| c.dir.clone())
+        .unwrap_or_else(|| data_dir.join("handlers-sql"));
+    let backends = boatramp_storage::LibsqlSqlBackends::local(dir);
+    // The method folds `""`/`default` to the one canonical default DB, so pass `db` verbatim.
+    let report = backends
+        .rehome_default_site_db(site, db)
+        .await
+        .map_err(|e| Error::Rehome(e.to_string()))?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "status": "rehomed",
+            "project": report.project,
+            "site": report.site,
+            "from": report.from,
+            "to": report.to,
+            "integrity": report.integrity,
+        }))?
+    );
+    Ok(())
+}
+
+/// `boatramp sql rehome-default` is unavailable in a build without the libsql backend (`sql` feature).
+#[cfg(not(feature = "sql"))]
+async fn rehome_default(_site: &str, _db: &str, _node_config: &std::path::Path) -> Result<()> {
+    Err(Error::Rehome(
+        "`sql rehome-default` needs the libsql backend (rebuild with --features sql)".into(),
+    ))
 }
 
 /// Render a `{columns, rows}` query response as a bordered text table.

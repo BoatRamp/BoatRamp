@@ -29,6 +29,25 @@ pub enum Error {
     /// Flushing the migrated store to durable storage failed.
     #[error("flushing the migrated store failed: {0}")]
     Flush(String),
+    /// Loading the `--node-config` for the `--finalize` substrate gate failed.
+    #[error(transparent)]
+    Config(#[from] boatramp_node::config::ConfigError),
+    /// A control-plane KV read failed during the `--finalize` substrate gate.
+    #[error(transparent)]
+    Kv(#[from] boatramp_core::kv::KvError),
+    /// `--finalize` is blocked (v0.31.0 Finding 8, HIGH-2c): clearing the KV dual soak would
+    /// disengage the runtime blob read-fallback, so the blob + libsql substrates must be re-homed
+    /// first. Reports which remains.
+    #[error(
+        "refusing `--finalize`: the default-scope re-home is not substrate-complete — {reason}. \
+         Clearing the KV dual soak now would disengage the blob read-fallback and strand data. \
+         Complete `boatramp blob rehome --finalize` + `boatramp sql rehome-default`, then re-run. \
+         See docs/default-scope-migration.md."
+    )]
+    FinalizeNotSubstrateComplete {
+        /// What is still outstanding (libsql bare DBs and/or the blob-retired marker).
+        reason: String,
+    },
 }
 
 /// `boatramp migrate` arguments.
@@ -46,16 +65,30 @@ pub struct MigrateArgs {
     #[arg(long)]
     dry_run: bool,
 
-    /// Copy + verify + rewrite domain values, but keep the old-layout keys for a
-    /// soak/rollback window (the `2-dual` state). A later `--finalize` deletes them.
-    /// Without this the migration is one-shot (copy then delete).
+    /// Copy + verify, keeping the old-layout keys for a soak/rollback window (the `dual` state).
+    /// v0.31.0: this is now the DEFAULT behavior (the default-scope re-home MUST soak so the
+    /// translating blob read-fallback engages), so the flag is accepted for clarity/compat but the
+    /// forward pass always stages — a later `--finalize` reclaims the old keys.
     #[arg(long, conflicts_with_all = ["dry_run", "finalize"])]
     stage: bool,
 
-    /// Delete the old-layout keys left by an earlier `--stage` run, completing the
-    /// migration to layout 2.
+    /// Delete the old-layout keys left by the staged forward pass, completing the migration. For the
+    /// default-scope re-home (v0.31.0 Finding 8) this REFUSES until the blob + libsql substrates are
+    /// re-homed (it reads `--node-config` to check), because clearing the dual soak disengages the
+    /// blob read-fallback.
     #[arg(long, conflicts_with = "dry_run")]
     finalize: bool,
+
+    /// Override the fail-closed pre-migration conflict guard (a default-project resource named
+    /// `default`, or like a known project): proceed with the re-home anyway — that resource's
+    /// default-scoped data will NOT be re-homed. Only set this if you understand the consequence.
+    #[arg(long)]
+    allow_default_named_resource: bool,
+
+    /// Node config (`boatramp.cfg` shape) used by `--finalize` to locate the libsql dir (+ the blob
+    /// retired marker) for the substrate-complete gate. Defaults to `boatramp.cfg`.
+    #[arg(long, default_value = "boatramp.cfg")]
+    node_config: PathBuf,
 }
 
 /// Run the `migrate` command.
@@ -90,13 +123,21 @@ pub async fn run(args: MigrateArgs, config: &ServerConfig) -> Result<(), Error> 
     );
 
     let report = if args.finalize {
+        // Substrate-complete gate (Finding 8, HIGH-2c): clearing the KV dual soak disengages the
+        // runtime blob read-fallback, so refuse until blob (the marker `blob rehome --finalize` sets)
+        // AND libsql (a cheap on-disk scan) are re-homed.
+        finalize_substrate_gate(kv.as_ref(), &args.node_config).await?;
         migrate::finalize(kv.as_ref()).await?
     } else {
+        // FORCE STAGE (Finding 8, HIGH-2a): the default-scope re-home MUST enter the dual soak so the
+        // translating blob read-fallback engages (a one-shot would strand cold default blobs). So the
+        // forward pass never inline-finalizes; `--finalize` (gated above) reclaims the old keys.
         migrate::migrate(
             kv.as_ref(),
             MigrateOptions {
                 dry_run: args.dry_run,
-                finalize: !args.stage,
+                finalize: false,
+                allow_default_named_resource: args.allow_default_named_resource,
             },
         )
         .await?
@@ -110,6 +151,56 @@ pub async fn run(args: MigrateArgs, config: &ServerConfig) -> Result<(), Error> 
         kv.flush().await.map_err(|e| Error::Flush(e.to_string()))?;
     }
     Ok(())
+}
+
+/// The substrate-complete gate for `--finalize` (v0.31.0 Finding 8, HIGH-2c): clearing the KV dual
+/// soak disengages the runtime blob read-fallback, so refuse until BOTH the blob substrate is retired
+/// (the marker `boatramp blob rehome --finalize` sets) AND the default-project libsql is re-homed (no
+/// bare `{dir}/*.db`). A remote sqld libsql binding (no local dir) is a documented operator step and
+/// is not gated here. Reports every outstanding substrate at once.
+async fn finalize_substrate_gate(
+    kv: &dyn boatramp_core::kv::KvStore,
+    node_config: &std::path::Path,
+) -> Result<(), Error> {
+    let node_cfg = boatramp_node::config::ServerConfig::load(node_config, None)?;
+    let data_dir = node_cfg
+        .serve
+        .as_ref()
+        .and_then(|s| s.data_dir.clone())
+        .unwrap_or_else(|| PathBuf::from("./data"));
+    let mut outstanding: Vec<String> = Vec::new();
+
+    // libsql: a cheap on-disk scan of the node's libsql dir (local bindings only).
+    if let Some(dir) = boatramp_node::default_scope::libsql_dir_for(&node_cfg, &data_dir) {
+        let projects = boatramp_node::default_scope::known_projects(kv).await?;
+        let bare = boatramp_node::default_scope::libsql_bare_default_idents(&dir, &projects);
+        if !bare.is_empty() {
+            outstanding.push(format!(
+                "libsql not re-homed ({bare:?}) — run `boatramp sql rehome-default --site <site>`"
+            ));
+        }
+    }
+    // blob: require the marker `blob rehome --finalize` sets once the blob substrate is verified
+    // retired (a node with no blob data still sets it by running that command once — a 0-object pass).
+    if kv
+        .get(boatramp_node::default_scope::BLOB_RETIRED_MARKER)
+        .await?
+        .is_none()
+    {
+        outstanding.push(
+            "blob not verified-retired — run `boatramp blob rehome` (drain) then `boatramp blob \
+             rehome --finalize` (retire)"
+                .to_string(),
+        );
+    }
+
+    if outstanding.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::FinalizeNotSubstrateComplete {
+            reason: outstanding.join("; "),
+        })
+    }
 }
 
 /// A one-line description of a store's layout status.

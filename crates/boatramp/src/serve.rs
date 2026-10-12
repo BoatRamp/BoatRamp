@@ -189,11 +189,61 @@ pub enum Error {
     /// UX-C4): a multi-writer SQL control-plane KV backend configured alongside a Raft cluster.
     #[error("{0}")]
     ContradictoryCoordination(String),
+    /// The default project has libsql databases still at the bare pre-`default/` on-disk layout
+    /// (v0.31.0 Finding 8, HIGH-1): libsql has no runtime fallback, so serving would open the
+    /// non-existent `{dir}/default/{site}.db` and auto-create an EMPTY database. Refused fail-closed
+    /// until re-homed with `boatramp sql rehome-default` (run with the node stopped).
+    #[error(
+        "refusing to serve: the default project has un-re-homed libsql database(s) at the bare \
+         on-disk layout ({idents:?}); run `boatramp sql rehome-default --site <site>` for each \
+         (node stopped) — serving now would boot onto an EMPTY database (v0.31.0 Finding 8). See \
+         docs/default-scope-migration.md."
+    )]
+    DefaultScopeLibsqlUnrehomed {
+        /// The un-re-homed default-project libsql identities.
+        idents: Vec<String>,
+    },
 }
 
 impl From<boatramp_core::migrate::MigrateError> for Error {
     fn from(e: boatramp_core::migrate::MigrateError) -> Self {
         Self::Migrate(e.to_string())
+    }
+}
+
+/// Default-scope serve guard (v0.31.0 Finding 8, HIGH-1b/HIGH-3): refuse to serve when the default
+/// project's LIBSQL data is still at the bare pre-`default/` on-disk layout. Unlike KV (version-guard)
+/// and blob (runtime read-fallback during the dual soak), libsql has **no** runtime bridge — the
+/// post-flip `database("default", site)` would open the non-existent `{dir}/default/{site}.db` and
+/// auto-create an EMPTY database — so this is a hard refusal until `boatramp sql rehome-default` runs.
+/// A remote sqld binding (no local dir) is a documented operator step, not auto-guarded here.
+async fn default_scope_libsql_guard(
+    config: &ServerConfig,
+    data_dir: &std::path::Path,
+    kv: &dyn boatramp_core::kv::KvStore,
+) -> Result<()> {
+    let Some(dir) = boatramp_node::default_scope::libsql_dir_for(config, data_dir) else {
+        return Ok(());
+    };
+    let projects = boatramp_node::default_scope::known_projects(kv).await?;
+    let bare = boatramp_node::default_scope::libsql_bare_default_idents(&dir, &projects);
+    if bare.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::DefaultScopeLibsqlUnrehomed { idents: bare })
+    }
+}
+
+/// `MigrateOptions` for the serve-startup `--auto-migrate`: **stage** (enter the dual soak), never
+/// one-shot (v0.31.0 Finding 8, HIGH-2a). One-shot would empty `unfinalized`, disengaging the
+/// translating blob read-fallback, so cold default blobs/payloads would 404. Staging keeps the old
+/// keys + the fallback live; the operator runs the blob drain + libsql re-home, then
+/// `boatramp migrate --finalize` (which verifies both substrates before clearing the soak).
+fn auto_migrate_stage_opts() -> boatramp_core::migrate::MigrateOptions {
+    boatramp_core::migrate::MigrateOptions {
+        dry_run: false,
+        finalize: false,
+        allow_default_named_resource: false,
     }
 }
 
@@ -977,27 +1027,36 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
     match migrate::status(kv.as_ref()).await? {
         migrate::Status::Ready => {}
         migrate::Status::Dual => tracing::warn!(
-            "control-plane store is in the 2-dual soak window; \
-             run `boatramp migrate --finalize` to reclaim the old-layout keys"
+            "control-plane store is in the dual soak window; the translating blob read-fallback is \
+             active. Complete the default-scope re-home — `boatramp sql rehome-default` (libsql) + \
+             `boatramp blob rehome` then `--finalize` (blob) — then `boatramp migrate --finalize` to \
+             reclaim the old-layout keys (it verifies blob + libsql are re-homed first)"
         ),
         migrate::Status::NeedsMigration => {
             if args.auto_migrate {
+                // STAGE (dual soak), never one-shot (Finding 8, HIGH-2a): a one-shot would clear
+                // `unfinalized`, disengaging the blob read-fallback and stranding cold default blobs.
                 tracing::warn!(
-                    "control-plane store is on the pre-0.2.0 layout; running a one-shot \
-                     project re-keying migration (--auto-migrate)"
+                    "control-plane store is below the current schema version; STAGING a migration \
+                     (--auto-migrate) into the dual soak (the blob read-fallback engages). Run \
+                     `boatramp sql rehome-default` + `boatramp blob rehome` then `boatramp migrate \
+                     --finalize` to complete the default-scope re-home"
                 );
-                let report =
-                    migrate::migrate(kv.as_ref(), migrate::MigrateOptions::one_shot()).await?;
+                let report = migrate::migrate(kv.as_ref(), auto_migrate_stage_opts()).await?;
                 tracing::info!(
                     rekeyed = report.total_rekeyed(),
                     owner_entries = report.owner_entries,
-                    "control-plane store migrated to the project-scoped layout"
+                    dual = report.dual,
+                    "control-plane store staged to the project-scoped layout (dual soak)"
                 );
             } else {
                 return Err(Error::UnmigratedStore);
             }
         }
     }
+    // HIGH-1b/HIGH-3: libsql has no runtime fallback, so refuse to serve a default project whose
+    // libsql data is un-re-homed (would boot onto an empty DB). Runs regardless of KV status.
+    default_scope_libsql_guard(config, &data_dir, kv.as_ref()).await?;
 
     // Handle for a final flush on graceful shutdown (SHUT-1): `kv` is moved into
     // the deploy store below; this clone reaches its backing store's `flush`.
@@ -3261,27 +3320,38 @@ async fn run_cluster(
     match migrate::status(kv.as_ref()).await? {
         migrate::Status::Ready => {}
         migrate::Status::Dual => tracing::warn!(
-            "control-plane store is in the dual soak window; \
-             run `boatramp migrate --finalize` to reclaim the old-layout keys"
+            "control-plane store is in the dual soak window; the translating blob read-fallback is \
+             active. Complete the default-scope re-home (`boatramp sql rehome-default` + `boatramp \
+             blob rehome`) then `boatramp migrate --finalize` (verifies blob + libsql first)"
         ),
         migrate::Status::NeedsMigration => {
             if args.auto_migrate {
+                // STAGE (dual soak), never one-shot (Finding 8, HIGH-2a) — see the single-node path.
                 tracing::warn!(
-                    "control-plane store is below the current schema version; running a \
-                     one-shot migration through the cluster (--auto-migrate)"
+                    "control-plane store is below the current schema version; STAGING a migration \
+                     through the cluster into the dual soak (--auto-migrate). Run `boatramp sql \
+                     rehome-default` + `boatramp blob rehome` then `boatramp migrate --finalize`"
                 );
-                let report =
-                    migrate::migrate(kv.as_ref(), migrate::MigrateOptions::one_shot()).await?;
+                let report = migrate::migrate(kv.as_ref(), auto_migrate_stage_opts()).await?;
                 tracing::info!(
                     rekeyed = report.total_rekeyed(),
                     owner_entries = report.owner_entries,
-                    "control-plane store migrated to the project-scoped layout"
+                    dual = report.dual,
+                    "control-plane store staged to the project-scoped layout (dual soak)"
                 );
             } else {
                 return Err(Error::UnmigratedStore);
             }
         }
     }
+    // HIGH-1b/HIGH-3: refuse to serve an un-re-homed default-project libsql (a remote sqld binding is
+    // a no-op here). Derive the data dir from config (the cluster path keeps no `data_dir` local).
+    let cluster_data_dir = config
+        .serve
+        .as_ref()
+        .and_then(|s| s.data_dir.clone())
+        .unwrap_or_else(|| std::path::PathBuf::from("./data"));
+    default_scope_libsql_guard(config, &cluster_data_dir, kv.as_ref()).await?;
 
     // Cluster-wide rate limiting shares the *replicated* RaftKv across nodes.
     if args.cluster_rate_limit || config.serve.as_ref().is_some_and(|s| s.cluster_rate_limit) {

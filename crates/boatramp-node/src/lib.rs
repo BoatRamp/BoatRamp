@@ -41,8 +41,13 @@ pub mod blob_fallback;
 ))]
 pub use boatramp_storage::blob_migrate;
 pub mod blobs;
+
 pub mod compute;
 pub mod config;
+/// Substrate-complete default-scope readiness detectors (v0.31.0 Finding 8): observe whether the
+/// default project's BLOB + LIBSQL data is still un-re-homed, so the serve guard + `boatramp migrate
+/// --finalize` reach the same bar as the KV version-guard.
+pub mod default_scope;
 pub mod error;
 pub use error::Error;
 pub mod handlers;
