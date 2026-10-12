@@ -430,15 +430,98 @@ fn check_import(import: &str) -> Result<(), ConfigError> {
     }
 }
 
+/// The canonical standard HTTP verbs. Each is also a valid RFC 7230 `token`; they are
+/// named explicitly so routing can treat these (and only these) case-insensitively — a
+/// wire `post` still answers a declared `POST` — while an extension verb is matched
+/// exactly. See [`crate::route::method_matches`].
+pub(crate) const STANDARD_METHODS: &[&str] =
+    &["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"];
+
+/// The explicit per-route catch-all sentinel: a route whose `methods` contains `"*"`
+/// answers EVERY method. `*` is itself a valid RFC 7230 `tchar`, but no real HTTP method
+/// is named `*`, so treating a declared `*` as the wildcard is unambiguous — and it is
+/// opt-in per route, never an implicit broadening of any other route's method set.
+pub(crate) const METHOD_WILDCARD: &str = "*";
+
+/// RFC 7230 `tchar`: the characters allowed in a `token` (hence in an HTTP method).
+/// `tchar = "!" / "#" / "$" / "%" / "&" / "'" / "*" / "+" / "-" / "." / "^" / "_" /
+/// "`" / "|" / "~" / DIGIT / ALPHA`.
+fn is_tchar(b: u8) -> bool {
+    b.is_ascii_alphanumeric()
+        || matches!(
+            b,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+}
+
+/// Whether `method` is a valid RFC 7230 `method` = `token` = `1*tchar`. Rejects the empty
+/// string and anything carrying a space, CTL, CR/LF, DEL or a separator — so a method
+/// token can never carry whitespace or a second request line (no request-smuggling /
+/// header-injection via the method string).
+fn is_http_method_token(method: &str) -> bool {
+    !method.is_empty() && method.bytes().all(is_tchar)
+}
+
+/// Validate a configured route method: any valid RFC 7230 `token`. This admits the
+/// standard verbs, the explicit `*` catch-all (`*` is a `tchar`), and extension verbs —
+/// PROPFIND, PROPPATCH, REPORT, MKCALENDAR, MKCOL, MOVE, COPY, … — so a WebDAV / CalDAV
+/// (RFC 4791) / CardDAV (RFC 6352) handler can be routed. Anything that is not a `token`
+/// (a space, CTL, CR/LF, or separator) is rejected, so the method string cannot be an
+/// injection vector. The wildcard/extension-match SEMANTICS live in routing
+/// ([`crate::route::method_matches`]); this is purely the parse-time token gate.
 fn check_http_method(method: &str) -> Result<(), ConfigError> {
-    const METHODS: &[&str] = &["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"];
-    if METHODS.contains(&method) {
+    // Anti-hollow gate hook: `admit_nontoken` drops the token guard so the CI gate can prove
+    // the guard is load-bearing (RED when a garbage method is wrongly accepted). Dead `None` —
+    // and so a dead branch — in a shipped build.
+    if extmethod_gate_mutation().as_deref() == Some("admit_nontoken") {
+        return Ok(());
+    }
+    if is_http_method_token(method) {
         Ok(())
     } else {
         Err(ConfigError::parse(format!(
-            "unknown HTTP method {method:?}"
+            "invalid HTTP method {method:?}: expected a standard verb, the `*` catch-all, or a \
+             valid RFC 7230 token (an extension verb such as PROPFIND)"
         )))
     }
+}
+
+// Defense-in-depth: the ext-method routing anti-hollow seam is for `cargo test` only. Fail the build
+// loudly if the gate feature is ever enabled in a non-test RELEASE profile (scoped to THIS seam).
+#[cfg(all(feature = "extmethod-gate-mutation", not(test), not(debug_assertions)))]
+compile_error!(
+    "extmethod-gate-mutation is a test-only anti-hollow seam and must never be compiled into a \
+     release build — remove it from the feature set"
+);
+
+/// The active ext-method routing/validation gate mutation (anti-hollow CI gate), or `None`. Present
+/// ONLY under `cfg(test)` or the `extmethod-gate-mutation` feature; a shipped build has neither, so
+/// both [`check_http_method`]'s token guard and [`crate::route::method_matches`]'s wildcard/extension
+/// arms are unconditional and this is a dead `None`. Each recognized value neuters ONE property so the
+/// CI gate can prove it goes RED: `admit_nontoken` (validation accepts a non-token method),
+/// `drop_wildcard` (the `*` catch-all stops matching), `drop_ext_match` (a declared extension verb
+/// stops matching). NOT a backdoor — it only reads a test env var.
+#[cfg(any(test, feature = "extmethod-gate-mutation"))]
+pub(crate) fn extmethod_gate_mutation() -> Option<String> {
+    std::env::var("BOATRAMP_EXTMETHOD_MUTATION").ok()
+}
+#[cfg(not(any(test, feature = "extmethod-gate-mutation")))]
+#[inline]
+pub(crate) fn extmethod_gate_mutation() -> Option<String> {
+    None
 }
 
 /// Validate a standard 5-field cron schedule (`minute hour dom month dow`).
@@ -2362,10 +2445,12 @@ mod tests {
             )
             .is_err()
         );
-        // Bad HTTP method.
+        // Bad HTTP method: not an RFC 7230 token (embedded space). `FETCH` is now accepted
+        // as an extension verb — only a NON-token method is rejected (see
+        // `http_methods_accept_tokens_reject_non_tokens`).
         assert!(
             DeployConfig::from_ron(
-                r#"( handlers: [ ( route: "/a", component: "a.wasm", methods: ["FETCH"] ) ] )"#
+                r#"( handlers: [ ( route: "/a", component: "a.wasm", methods: ["GET THING"] ) ] )"#
             )
             .is_err()
         );
@@ -2385,6 +2470,51 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn http_methods_accept_tokens_reject_non_tokens() {
+        // Standard verbs.
+        for m in STANDARD_METHODS {
+            assert!(
+                check_http_method(m).is_ok(),
+                "standard verb {m} must validate"
+            );
+        }
+        // Extension (WebDAV / CalDAV / CardDAV) verbs — all valid RFC 7230 tokens.
+        for m in [
+            "PROPFIND",
+            "PROPPATCH",
+            "REPORT",
+            "MKCALENDAR",
+            "MKCOL",
+            "MOVE",
+            "COPY",
+            "ACL", // a token with only ALPHA
+        ] {
+            assert!(
+                check_http_method(m).is_ok(),
+                "extension verb {m} must validate"
+            );
+        }
+        // The explicit `*` catch-all validates.
+        assert!(check_http_method(METHOD_WILDCARD).is_ok());
+        // Non-token methods are rejected (no injection via the method string).
+        for bad in [
+            "",            // empty
+            "GET THING",   // space
+            "GE/T",        // separator `/`
+            "GET\r\nHost", // CR/LF (request smuggling)
+            "GET\tX",      // TAB
+            "G(ET)",       // separators `(` `)`
+            "GET;X",       // separator `;`
+            "GET@X",       // separator `@`
+        ] {
+            assert!(
+                check_http_method(bad).is_err(),
+                "non-token method {bad:?} must be rejected"
+            );
+        }
     }
 
     #[test]

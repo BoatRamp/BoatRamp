@@ -221,8 +221,10 @@ fn interpolate_to(
 /// this only when [`resolve`] did not produce a redirect, and dispatches the
 /// match in preference to any file/rewrite outcome.
 ///
-/// An empty `methods` list matches every method; otherwise the request
-/// `method` must appear in it (case-insensitive).
+/// Method matching is delegated to [`method_matches`]: an empty `methods` list
+/// matches every method; a `*` entry is the explicit per-route catch-all; a standard
+/// verb matches case-insensitively; an extension verb (e.g. `PROPFIND`) matches
+/// case-sensitively.
 pub fn match_handler<'a>(
     handlers: &'a [crate::config::HandlerConfig],
     method: &str,
@@ -234,15 +236,49 @@ pub fn match_handler<'a>(
         std::borrow::Cow::Owned(format!("/{request_path}"))
     };
     handlers.iter().find(|handler| {
-        let method_ok = handler.methods.is_empty()
-            || handler
-                .methods
-                .iter()
-                .any(|m| m.eq_ignore_ascii_case(method));
-        method_ok
+        method_matches(&handler.methods, method)
             && Pattern::compile(&handler.route)
                 .map(|pattern| pattern.is_match(&path))
                 .unwrap_or(false)
+    })
+}
+
+/// Whether a handler's declared `methods` answer a request `method`. This is the SINGLE
+/// method-matching predicate [`match_handler`] enforces, so the tested predicate is the
+/// enforced predicate.
+///
+/// - An empty list answers every method (the historical default).
+/// - A `*` entry ([`crate::config::METHOD_WILDCARD`]) is the explicit, opt-in per-route
+///   catch-all and answers every method. It never broadens any other route.
+/// - A standard verb ([`crate::config::STANDARD_METHODS`], canonical uppercase) matches
+///   **case-insensitively** — a wire `post` still answers a declared `POST` (unchanged
+///   behavior).
+/// - Any other token is an **extension verb** (PROPFIND, MKCALENDAR, REPORT, …) and
+///   matches **case-sensitively**. HTTP methods are case-sensitive and WebDAV verbs are
+///   canonically uppercase, so an exact match avoids silently folding a mixed-case verb
+///   onto a declared one.
+///
+/// A matched extension method reaches the guest unchanged, carried as the `wasi-http`
+/// `method.other("<TOKEN>")` case (the host never canonicalizes an unknown verb).
+pub fn method_matches(methods: &[String], method: &str) -> bool {
+    if methods.is_empty() {
+        return true;
+    }
+    // Read once; in a shipped build this is a dead `None` (see `extmethod_gate_mutation`).
+    let mutation = crate::config::extmethod_gate_mutation();
+    methods.iter().any(|declared| {
+        if declared.as_str() == crate::config::METHOD_WILDCARD {
+            // Anti-hollow hook: `drop_wildcard` neuters the catch-all so the CI gate goes RED.
+            return mutation.as_deref() != Some("drop_wildcard");
+        }
+        if crate::config::STANDARD_METHODS.contains(&declared.as_str()) {
+            return declared.eq_ignore_ascii_case(method);
+        }
+        // Extension verb: exact, case-sensitive match. `drop_ext_match` neuters it for the gate.
+        if mutation.as_deref() == Some("drop_ext_match") {
+            return false;
+        }
+        declared.as_str() == method
     })
 }
 
@@ -793,5 +829,119 @@ mod tests {
         assert!(match_handler(&handlers, "PUT", "/hooks/x").is_some());
         // No route matches.
         assert!(match_handler(&handlers, "GET", "/static/page").is_none());
+    }
+
+    /// Build a minimal handler bound to `route` answering `methods`.
+    fn mk_handler(route: &str, methods: &[&str]) -> crate::config::HandlerConfig {
+        crate::config::HandlerConfig {
+            tenancy: None,
+            token_claims: None,
+            no_secrets: false,
+            route: route.into(),
+            methods: methods
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect(),
+            component: "h.wasm".into(),
+            imports: Vec::new(),
+            streaming: false,
+            limits: None,
+            env: BTreeMap::new(),
+            secrets: Vec::new(),
+            invoke_targets: Vec::new(),
+            stats_topics: Vec::new(),
+            tenant_secret_names: Vec::new(),
+            upload_containers: Vec::new(),
+            blobstore_containers: Vec::new(),
+            egress_allowlist: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn handler_matching_extension_and_wildcard_methods() {
+        // A route declaring an extension verb routes that verb (case-sensitive, exact).
+        let dav = vec![mk_handler("/dav/*", &["PROPFIND", "REPORT"])];
+        assert!(match_handler(&dav, "PROPFIND", "/dav/cal").is_some());
+        assert!(match_handler(&dav, "REPORT", "/dav/cal").is_some());
+        // A different verb (even a standard one) does NOT match a PROPFIND/REPORT-only route.
+        assert!(match_handler(&dav, "GET", "/dav/cal").is_none());
+        // Extension verbs match case-sensitively: a mixed-case `PropFind` is NOT folded onto
+        // a declared `PROPFIND`.
+        assert!(match_handler(&dav, "PropFind", "/dav/cal").is_none());
+
+        // Standard verbs stay case-insensitive (unchanged behavior).
+        let post = vec![mk_handler("/o", &["POST"])];
+        assert!(match_handler(&post, "post", "/o").is_some());
+        assert!(match_handler(&post, "POST", "/o").is_some());
+
+        // The explicit `*` catch-all answers an arbitrary method, but only on its own route.
+        let any = vec![mk_handler("/any/*", &["*"])];
+        assert!(match_handler(&any, "MKCALENDAR", "/any/z").is_some());
+        assert!(match_handler(&any, "GET", "/any/z").is_some());
+        assert!(match_handler(&any, "WHATEVER", "/any/z").is_some());
+        // `*` is per-route: it does not broaden the PROPFIND-only route above.
+        assert!(match_handler(&dav, "MKCALENDAR", "/dav/cal").is_none());
+    }
+
+    // #4 (mailroom) EXT-METHOD ROUTING anti-hollow gate. Drives the REAL enforced surfaces —
+    // `match_handler` (→ `method_matches`) for routing and `DeployConfig::from_ron` (→
+    // `check_http_method`) for validation, so TESTED == ENFORCED — and prints `EXT-METHOD ROUTING OK`
+    // so the merge gate can assert it RAN. MUTATION-VERIFIED (the #503 convention): re-run under each
+    // `BOATRAMP_EXTMETHOD_MUTATION` — `drop_ext_match` (a declared PROPFIND stops routing),
+    // `drop_wildcard` (the `*` catch-all stops matching), `admit_nontoken` (validation accepts a
+    // garbage method) — and each MUST fail this test (a PASS-under-mutation = a hollow gate).
+    #[test]
+    fn ext_method_routing_gate() {
+        // (i) A route declaring PROPFIND routes a PROPFIND request. `drop_ext_match` flips this.
+        let dav = vec![mk_handler("/dav/*", &["PROPFIND"])];
+        assert!(
+            match_handler(&dav, "PROPFIND", "/dav/x").is_some(),
+            "a PROPFIND route must route a PROPFIND request"
+        );
+        // A PROPFIND-only route must NOT answer an unrelated method.
+        assert!(
+            match_handler(&dav, "GET", "/dav/x").is_none(),
+            "a PROPFIND-only route must not answer GET"
+        );
+
+        // (ii) The `*` catch-all matches an arbitrary method. `drop_wildcard` flips this.
+        let any = vec![mk_handler("/any/*", &["*"])];
+        assert!(
+            match_handler(&any, "MKCALENDAR", "/any/z").is_some(),
+            "the `*` catch-all must match an arbitrary method"
+        );
+
+        // (iii) Validation ACCEPTS `PROPFIND` and `*`, REJECTS a non-token garbage method.
+        // `admit_nontoken` flips the rejection.
+        assert!(
+            DeployConfig::from_ron(
+                r#"( handlers: [ ( route: "/d", component: "d.wasm", methods: ["PROPFIND"] ) ] )"#
+            )
+            .is_ok(),
+            "`methods: [\"PROPFIND\"]` must validate"
+        );
+        assert!(
+            DeployConfig::from_ron(
+                r#"( handlers: [ ( route: "/d", component: "d.wasm", methods: ["*"] ) ] )"#
+            )
+            .is_ok(),
+            "`methods: [\"*\"]` must validate"
+        );
+        assert!(
+            DeployConfig::from_ron(
+                r#"( handlers: [ ( route: "/d", component: "d.wasm", methods: ["GET THING"] ) ] )"#
+            )
+            .is_err(),
+            "a non-token method must be rejected by validation"
+        );
+        assert!(
+            DeployConfig::from_ron(
+                r#"( handlers: [ ( route: "/d", component: "d.wasm", methods: ["GE/T"] ) ] )"#
+            )
+            .is_err(),
+            "a method with a separator must be rejected by validation"
+        );
+
+        println!("EXT-METHOD ROUTING OK");
     }
 }

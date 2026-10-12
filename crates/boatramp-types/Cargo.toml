@@ -27,6 +27,12 @@ blob-drain-gate-mutation = []
 # owner-isolation gate goes RED, proving the owner-column lowering is load-bearing. A `compile_error!`
 # guard fails any release build that enables it. Compiled OUT of every real build.
 owned-gate-mutation = []
+# TEST-ONLY, NEVER SHIPPED: the anti-hollow seam for the `EXT-METHOD ROUTING OK` gate (mailroom #4).
+# When ON AND `BOATRAMP_EXTMETHOD_MUTATION` is set, `extmethod_gate_mutation` neuters ONE property so
+# the gate goes RED: `admit_nontoken` (validation accepts a non-token method), `drop_wildcard` (the
+# `*` catch-all stops matching), `drop_ext_match` (a declared extension verb stops routing). A
+# `compile_error!` guard fails any release build that enables it. Compiled OUT of every real build.
+extmethod-gate-mutation = []
 
 [dependencies]
 serde.workspace = true
