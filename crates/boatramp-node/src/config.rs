@@ -371,6 +371,9 @@ impl ServerConfig {
             if let Some(v) = source.get("BOATRAMP_COMPUTE_BLOB_SHIM_URL") {
                 compute.blob_shim_url = Some(v);
             }
+            if let Some(v) = source.parse("BOATRAMP_COMPUTE_BLOB_SHIM_MAX_OBJECT_BYTES")? {
+                compute.blob_shim_max_object_bytes = Some(v);
+            }
             // The two shared-kernel enums have no `FromStr`, only a serde
             // `rename_all = "lowercase"`; map their variants by that same spelling.
             if let Some(v) = source.parse_enum(
@@ -1182,6 +1185,7 @@ const COMPUTE_ENV_VARS: &[&str] = &[
     "BOATRAMP_COMPUTE_REGION",
     "BOATRAMP_COMPUTE_SQL_SHIM_URL",
     "BOATRAMP_COMPUTE_BLOB_SHIM_URL",
+    "BOATRAMP_COMPUTE_BLOB_SHIM_MAX_OBJECT_BYTES",
     "BOATRAMP_COMPUTE_MANAGED_DB_PRIVILEGE",
     "BOATRAMP_COMPUTE_DOCKER_ENDPOINT",
     "BOATRAMP_COMPUTE_DOCKER_VOLUME_MODE",
@@ -1664,7 +1668,9 @@ pub struct ComputeConfig {
     /// Guest-reachable base URL of the compute **sql-shim** (PLAN-compute-bindings) —
     /// e.g. `http://10.0.0.1:8081` (the compute bridge gateway) or the docker bridge
     /// gateway. Set ⇒ a workload's `--bind sql` reaches the managed database through a
-    /// listener bound on `0.0.0.0:<port>`. `None` (default) ⇒ compute sql bindings off.
+    /// listener bound on the **host:port this URL names** (the bridge-gateway IP /
+    /// loopback — NOT all interfaces; a token-gated tenant-SQL data plane must not be
+    /// off-node reachable). `None` (default) ⇒ compute sql bindings off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(not(feature = "handlers"), allow(dead_code))]
     pub sql_shim_url: Option<String>,
@@ -1672,11 +1678,20 @@ pub struct ComputeConfig {
     /// e.g. `http://10.0.0.1:8082` (the compute bridge gateway) or the docker bridge
     /// gateway. Set ⇒ a workload's `--bind blob` reaches the SAME per-site
     /// `hblob/{qualified-site}/…` blob namespace a `wasi:blobstore` handler sees, through a
-    /// listener bound on `0.0.0.0:<port>`. `None` (default) ⇒ compute blob bindings off.
-    /// The direct analogue of [`Self::sql_shim_url`].
+    /// listener bound on the **host:port this URL names** (the bridge-gateway IP /
+    /// loopback — NOT all interfaces; the token-gated `hblob/{site}/` data plane must not
+    /// be off-node reachable). `None` (default) ⇒ compute blob bindings off. The direct
+    /// analogue of [`Self::sql_shim_url`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(not(feature = "handlers"), allow(dead_code))]
     pub blob_shim_url: Option<String>,
+    /// Per-object PUT ceiling (bytes) for the compute blob-shim — bounds a single write so a
+    /// compromised/buggy workload cannot exhaust node/bucket storage with one unbounded PUT (`413`
+    /// on an oversize PUT). `None` (default) ⇒ the shim's built-in default (5 GiB, S3's single-PUT
+    /// limit); `Some(0)` ⇒ unlimited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(not(feature = "handlers"), allow(dead_code))]
+    pub blob_shim_max_object_bytes: Option<u64>,
     /// Privilege strategy for a managed database's stock image on a shared-kernel
     /// backend (see [`ManagedDbPrivilege`]). `rootless` by default.
     #[serde(default)]
@@ -1792,6 +1807,7 @@ impl Default for ComputeConfig {
             docker_volume_mode: boatramp_docker::DockerVolumeMode::default(),
             sql_shim_url: None,
             blob_shim_url: None,
+            blob_shim_max_object_bytes: None,
             managed_db_privilege: ManagedDbPrivilege::default(),
             internal_dns: default_internal_dns(),
             dns_upstream: default_dns_upstream(),

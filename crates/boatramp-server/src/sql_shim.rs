@@ -29,34 +29,68 @@ use boatramp_core::compute::{BindingKind, ComputeBinding, ComputeBindingResolver
 use boatramp_core::sql::{SqlBackend, SqlBackends, SqlValue};
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
 
 /// The shim's token → resolved backend registry, shared with the HTTP handler.
-#[derive(Clone, Default)]
+///
+/// The registry is keyed on `SHA-256(salt ∥ token)`, never the raw bearer token, so token
+/// ADMISSION (the `HashMap` key compare) is timing-safe: a probe can at most learn a prefix of a
+/// preimage-resistant hash of a 256-bit secret token, never the token itself (LOW hardening,
+/// Security review — defense-in-depth atop the already-unguessable HMAC token).
+/// The sql-shim's registry map: token-key (`SHA-256(salt ∥ token)`) → resolved tenant backend.
+type SqlRegistry = HashMap<[u8; 32], Arc<dyn SqlBackend>>;
+
+#[derive(Clone)]
 pub struct SqlShim {
-    registry: Arc<RwLock<HashMap<String, Arc<dyn SqlBackend>>>>,
+    registry: Arc<RwLock<SqlRegistry>>,
+    salt: [u8; 32],
+}
+
+impl Default for SqlShim {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SqlShim {
-    /// A fresh, empty shim.
+    /// A fresh, empty shim with a per-instance random admission salt.
     pub fn new() -> Self {
-        Self::default()
+        let mut salt = [0u8; 32];
+        // A failed RNG only weakens the (defense-in-depth) salt to zero — admission stays timing-safe
+        // because the key is still a preimage-resistant hash of a 256-bit secret token.
+        let _ = getrandom::getrandom(&mut salt);
+        Self {
+            registry: Arc::new(RwLock::new(HashMap::new())),
+            salt,
+        }
+    }
+
+    /// The registry key for a bearer `token`: `SHA-256(salt ∥ token)`.
+    fn key(&self, token: &str) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(self.salt);
+        hasher.update(token.as_bytes());
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&hasher.finalize());
+        out
     }
 
     /// Register a bearer `token` for an already-resolved, tenant-scoped `backend`.
     /// Idempotent: re-registering the same token replaces the mapping.
-    pub async fn register(&self, token: String, backend: Arc<dyn SqlBackend>) {
-        self.registry.write().await.insert(token, backend);
+    pub async fn register(&self, token: &str, backend: Arc<dyn SqlBackend>) {
+        let key = self.key(token);
+        self.registry.write().await.insert(key, backend);
     }
 
     /// Drop a token when its workload replica is torn down.
     pub async fn deregister(&self, token: &str) {
-        self.registry.write().await.remove(token);
+        let key = self.key(token);
+        self.registry.write().await.remove(&key);
     }
 
     async fn lookup(&self, token: &str) -> Option<Arc<dyn SqlBackend>> {
-        self.registry.read().await.get(token).cloned()
+        self.registry.read().await.get(&self.key(token)).cloned()
     }
 
     /// The axum router: `POST /v2/pipeline` (+ `/v3/pipeline`), the hrana-over-HTTP
@@ -118,7 +152,9 @@ impl SqlShimResolver {
             mac.update(&[0]);
         }
         mac.update(&replica.to_le_bytes());
-        mac.update(format!("{:?}", binding.kind).as_bytes());
+        // A STABLE discriminant byte — never `format!("{:?}", kind)`, which would silently rotate
+        // every live token if the enum were reordered/renamed.
+        mac.update(&[binding.kind.stable_tag()]);
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
     }
 }
@@ -152,7 +188,7 @@ impl ComputeBindingResolver for SqlShimResolver {
                 }
             };
             let token = self.token(project, workload, replica, binding);
-            self.shim.register(token.clone(), backend).await;
+            self.shim.register(&token, backend).await;
             let url_env = binding.url_env();
             env.push((url_env.clone(), self.base_url.clone()));
             env.push((format!("{url_env}_AUTH_TOKEN"), token));
@@ -179,20 +215,20 @@ impl ComputeBindingResolver for SqlShimResolver {
 
 /// Activate the compute sql-shim: bind its listener and build the resolver to hand
 /// the compute reconcile. `shim_url` is the guest-reachable base URL (e.g.
-/// `http://10.0.0.1:8081`, or the docker bridge gateway); the shim binds
-/// `0.0.0.0:<port-from-url>`. Returns `None` — the feature stays off — when there is
-/// no sql provider, no `shim_url`, or the bind fails.
+/// `http://10.0.0.1:8081`, or the docker bridge gateway); the shim binds the **host:port the
+/// URL names** — the compute bridge-gateway IP / loopback the operator configured — NOT all
+/// interfaces (see [`crate::shim_bind_addr`]). This is a token-gated tenant-SQL DATA plane, so it
+/// MUST NOT be reachable off-node; point `compute.sql_shim_url` at the bridge gateway (or
+/// loopback), never a public address. Returns `None` — the feature stays off — when there is no
+/// sql provider, no `shim_url`, or the host:port does not resolve / bind.
 pub async fn spawn_sql_shim(
     sql: Option<Arc<dyn SqlBackends>>,
     shim_url: Option<String>,
 ) -> Option<Arc<dyn ComputeBindingResolver>> {
     let sql = sql?;
     let base_url = shim_url?;
-    let Some(port) = base_url
-        .rsplit_once(':')
-        .and_then(|(_, p)| p.trim_end_matches('/').parse::<u16>().ok())
-    else {
-        tracing::warn!(%base_url, "compute.sql_shim_url has no :port; sql bindings disabled");
+    let Some(bind) = crate::shim_bind_addr(&base_url) else {
+        tracing::warn!(%base_url, "compute.sql_shim_url has no resolvable host:port; sql bindings disabled");
         return None;
     };
     let mut secret = [0u8; 32];
@@ -202,7 +238,6 @@ pub async fn spawn_sql_shim(
     }
     let shim = SqlShim::new();
     let router = shim.router();
-    let bind = std::net::SocketAddr::from(([0, 0, 0, 0], port));
     match tokio::net::TcpListener::bind(bind).await {
         Ok(listener) => {
             // TCP_NODELAY: the hrana-over-HTTP shim serves small JSON responses to
@@ -568,7 +603,7 @@ mod tests {
     async fn a_registered_token_runs_a_query_and_maps_values() {
         let shim = SqlShim::new();
         let backend = Arc::new(FakeBackend::default());
-        shim.register("tok".to_string(), backend.clone()).await;
+        shim.register("tok", backend.clone()).await;
 
         // want_rows: true → query → the fake's 1x1 row comes back hrana-encoded.
         let body = serde_json::json!({
@@ -597,8 +632,7 @@ mod tests {
     #[tokio::test]
     async fn want_rows_false_routes_to_execute_and_returns_affected() {
         let shim = SqlShim::new();
-        shim.register("tok".to_string(), Arc::new(FakeBackend::default()))
-            .await;
+        shim.register("tok", Arc::new(FakeBackend::default())).await;
         let body = serde_json::json!({
             "requests": [
                 { "type": "execute", "stmt": { "sql": "INSERT INTO t VALUES (1)", "want_rows": false }}
@@ -658,8 +692,7 @@ mod tests {
     #[tokio::test]
     async fn deregister_revokes_access() {
         let shim = SqlShim::new();
-        shim.register("tok".to_string(), Arc::new(FakeBackend::default()))
-            .await;
+        shim.register("tok", Arc::new(FakeBackend::default())).await;
         shim.deregister("tok").await;
         let body = serde_json::json!({ "requests": [{ "type": "close" }] });
         assert_eq!(

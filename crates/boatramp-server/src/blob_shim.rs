@@ -25,8 +25,29 @@
 //! path-traversal key can never escape the container prefix. The token is
 //! boatramp-minted (HMAC over the per-node secret), instance-scoped, and rotatable
 //! (a fresh per-node secret on restart re-derives it); the operator's storage
-//! credentials never enter the guest. The listener binds node-internally, the same
-//! way the sql-shim does (not publicly exposed).
+//! credentials never enter the guest.
+//!
+//! ## Network posture (listener bind)
+//!
+//! The listener binds the **host the operator names in `compute.blob_shim_url`** — the compute
+//! bridge-gateway IP / loopback that makes it reachable from the guests — via
+//! [`crate::shim_bind_addr`], NEVER all interfaces on its own. This is a token-gated DATA plane
+//! over the whole `hblob/{site}/` namespace whose per-replica token is injected into an
+//! often-untrusted guest env, so it MUST NOT be reachable off-node: operators point
+//! `blob_shim_url` at the bridge gateway (or loopback), never a public address. (An explicit
+//! `0.0.0.0` in the URL is honored as the operator's own choice.)
+//!
+//! ## Known limitation (accepted — Security review Finding 8)
+//!
+//! The site identity is `ProjectRef::qualified(project, workload)`: the `default` project is
+//! UNQUALIFIED (`hblob/{workload}/`) while a named project is prefixed (`hblob/{project}/{site}/`).
+//! A `default`-project workload NAMED like a real project (e.g. workload `acme/api` is impossible —
+//! names carry no `/` — but a workload `acme` under `default` yields `hblob/acme/…`, colliding with
+//! project `acme`'s prefix) therefore shares that project's `hblob/` subtree. This is an INHERITED
+//! property of the node-wide `hblob/` tenancy scheme (the SAME collision a `wasi:blobstore` handler
+//! has), not introduced here; the shim faithfully reuses `qualified` rather than inventing a parallel
+//! layout. The proper fix lives in the tenancy scheme (`ProjectRef::qualified`) and is owned
+//! separately — a conscious acceptance for this change.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -44,8 +65,13 @@ use boatramp_core::project::{ProjectRef, validate_key_segment, validate_object_k
 use boatramp_core::{ByteStream, PutMeta, Storage, StorageError};
 use futures::StreamExt as _;
 use hmac::{Hmac, Mac};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
+
+/// Default per-object PUT ceiling (5 GiB — S3's single-`PutObject` limit) when the operator sets no
+/// `compute.blob_shim_max_object_bytes`. Bounds a single write so a compromised/buggy guest cannot
+/// exhaust node/bucket storage with one unbounded PUT. `0` (operator-configured) = unlimited.
+pub const DEFAULT_MAX_OBJECT_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 
 /// A token-resolved blob capability: the site's [`Storage`] backend, the key prefix the
 /// token is confined to (`hblob/{project-qualified-site}/` — host-stamped, never
@@ -62,26 +88,67 @@ struct BlobScope {
 }
 
 /// The shim's token → resolved [`BlobScope`] registry, shared with the HTTP handlers.
-#[derive(Clone, Default)]
+///
+/// The registry is keyed on `SHA-256(salt ∥ token)`, never the raw bearer token, so token
+/// ADMISSION (the `HashMap` key compare) is timing-safe: a probe can at most learn a prefix of a
+/// preimage-resistant hash of a 256-bit secret token, never the token itself (LOW hardening,
+/// Security review — defense-in-depth atop the already-unguessable HMAC token).
+#[derive(Clone)]
 pub struct BlobShim {
-    registry: Arc<RwLock<HashMap<String, BlobScope>>>,
+    registry: Arc<RwLock<HashMap<[u8; 32], BlobScope>>>,
+    salt: [u8; 32],
+    /// Per-object PUT ceiling in bytes (`0` = unlimited); a larger write is refused `413`.
+    max_object_bytes: u64,
+}
+
+impl Default for BlobShim {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl BlobShim {
-    /// A fresh, empty shim.
+    /// A fresh, empty shim with a per-instance random admission salt and the default per-object
+    /// PUT ceiling ([`DEFAULT_MAX_OBJECT_BYTES`]).
     pub fn new() -> Self {
-        Self::default()
+        let mut salt = [0u8; 32];
+        // A failed RNG only weakens the (defense-in-depth) salt to zero — admission stays timing-safe
+        // because the key is still a preimage-resistant hash of a 256-bit secret token.
+        let _ = getrandom::getrandom(&mut salt);
+        Self {
+            registry: Arc::new(RwLock::new(HashMap::new())),
+            salt,
+            max_object_bytes: DEFAULT_MAX_OBJECT_BYTES,
+        }
+    }
+
+    /// Set the per-object PUT ceiling (`0` = unlimited). Builder used by [`spawn_blob_shim`].
+    pub fn with_max_object_bytes(mut self, max_object_bytes: u64) -> Self {
+        self.max_object_bytes = max_object_bytes;
+        self
+    }
+
+    /// The registry key for a bearer `token`: `SHA-256(salt ∥ token)`.
+    fn key(&self, token: &str) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(self.salt);
+        hasher.update(token.as_bytes());
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&hasher.finalize());
+        out
     }
 
     /// Register a bearer `token` for an already-resolved, site-scoped `scope`.
     /// Idempotent: re-registering the same token replaces the mapping.
-    async fn register(&self, token: String, scope: BlobScope) {
-        self.registry.write().await.insert(token, scope);
+    async fn register(&self, token: &str, scope: BlobScope) {
+        let key = self.key(token);
+        self.registry.write().await.insert(key, scope);
     }
 
     /// Drop a token when its workload replica is torn down.
     async fn deregister(&self, token: &str) {
-        self.registry.write().await.remove(token);
+        let key = self.key(token);
+        self.registry.write().await.remove(&key);
     }
 
     /// Resolve a presented bearer `token` to its [`BlobScope`], or `None` for a missing
@@ -92,7 +159,7 @@ impl BlobShim {
     async fn authenticate(&self, token: Option<&str>) -> Option<BlobScope> {
         let reg = self.registry.read().await;
         if let Some(t) = token
-            && let Some(scope) = reg.get(t).cloned()
+            && let Some(scope) = reg.get(&self.key(t)).cloned()
         {
             return Some(scope);
         }
@@ -169,7 +236,9 @@ impl BlobShimResolver {
             mac.update(&[0]);
         }
         mac.update(&replica.to_le_bytes());
-        mac.update(format!("{:?}", binding.kind).as_bytes());
+        // A STABLE discriminant byte — never `format!("{:?}", kind)`, which would silently rotate
+        // every live token if the enum were reordered/renamed.
+        mac.update(&[binding.kind.stable_tag()]);
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
     }
 
@@ -229,7 +298,7 @@ impl ComputeBindingResolver for BlobShimResolver {
                 continue;
             };
             let token = self.token(project, workload, replica, binding);
-            self.shim.register(token.clone(), scope).await;
+            self.shim.register(&token, scope).await;
             let url_env = binding.url_env();
             env.push((url_env.clone(), self.base_url.clone()));
             env.push((format!("{url_env}_AUTH_TOKEN"), token));
@@ -256,21 +325,21 @@ impl ComputeBindingResolver for BlobShimResolver {
 
 /// Activate the compute blob-shim: bind its listener and build the resolver to hand the
 /// compute reconcile. `shim_url` is the guest-reachable base URL (e.g.
-/// `http://10.0.0.1:8082`, or the docker bridge gateway); the shim binds
-/// `0.0.0.0:<port-from-url>` — the SAME node-internal bind the sql-shim uses. Returns
+/// `http://10.0.0.1:8082`, or the docker bridge gateway); the shim binds the **host:port the
+/// URL names** — the compute bridge-gateway IP / loopback the operator configured — NOT all
+/// interfaces (see [`crate::shim_bind_addr`] for the security rationale). `max_object_bytes`
+/// caps a single PUT (`None` ⇒ [`DEFAULT_MAX_OBJECT_BYTES`]; `Some(0)` ⇒ unlimited). Returns
 /// `None` — the feature stays off — when there is no blob provider, no `shim_url`, or the
-/// bind fails. The direct analogue of [`crate::sql_shim::spawn_sql_shim`].
+/// host:port does not resolve / bind. The direct analogue of [`crate::sql_shim::spawn_sql_shim`].
 pub async fn spawn_blob_shim(
     blob: Option<Arc<dyn BlobBackends>>,
     shim_url: Option<String>,
+    max_object_bytes: Option<u64>,
 ) -> Option<Arc<dyn ComputeBindingResolver>> {
     let blob = blob?;
     let base_url = shim_url?;
-    let Some(port) = base_url
-        .rsplit_once(':')
-        .and_then(|(_, p)| p.trim_end_matches('/').parse::<u16>().ok())
-    else {
-        tracing::warn!(%base_url, "compute.blob_shim_url has no :port; blob bindings disabled");
+    let Some(bind) = crate::shim_bind_addr(&base_url) else {
+        tracing::warn!(%base_url, "compute.blob_shim_url has no resolvable host:port; blob bindings disabled");
         return None;
     };
     let mut secret = [0u8; 32];
@@ -278,9 +347,9 @@ pub async fn spawn_blob_shim(
         tracing::error!("getrandom failed; blob bindings disabled");
         return None;
     }
-    let shim = BlobShim::new();
+    let shim =
+        BlobShim::new().with_max_object_bytes(max_object_bytes.unwrap_or(DEFAULT_MAX_OBJECT_BYTES));
     let router = shim.router();
-    let bind = std::net::SocketAddr::from(([0, 0, 0, 0], port));
     match tokio::net::TcpListener::bind(bind).await {
         Ok(listener) => {
             // TCP_NODELAY: the shim serves small control responses (PUT/HEAD/DELETE) to the
@@ -547,15 +616,56 @@ async fn put_object(
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
-    // Stream the guest's body straight into the backend — never buffer the whole object.
+
+    // Per-object size cap (`0` = unlimited): bound a single write so a compromised/buggy guest
+    // cannot exhaust node/bucket storage with one unbounded PUT (storage-exhaustion DoS).
+    let cap = shim.max_object_bytes;
+    // Fast path: an honest `Content-Length` over the cap is refused BEFORE reading the body.
+    if cap != 0
+        && let Some(len) = headers
+            .get(header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok())
+        && len > cap
+    {
+        return oversize(cap);
+    }
+    // Streaming enforcement for a chunked / Content-Length-lying client: count bytes as they
+    // arrive and abort the stream once the cap is crossed (the object is never fully buffered).
+    let over = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let over_writer = over.clone();
+    let mut seen: u64 = 0;
     let stream: ByteStream = body
         .into_data_stream()
-        .map(|chunk| chunk.map_err(|e| StorageError::backend(e.to_string())))
+        .map(move |chunk| {
+            let bytes = chunk.map_err(|e| StorageError::backend(e.to_string()))?;
+            if cap != 0 {
+                seen = seen.saturating_add(bytes.len() as u64);
+                if seen > cap {
+                    over_writer.store(true, std::sync::atomic::Ordering::Relaxed);
+                    return Err(StorageError::backend(
+                        "object exceeds the per-object size cap",
+                    ));
+                }
+            }
+            Ok(bytes)
+        })
         .boxed();
     match storage.put(&skey, stream, PutMeta { content_type }).await {
         Ok(_) => (StatusCode::OK, key).into_response(),
+        // A put failure caused by the cap guard is a 413, not a backend fault.
+        Err(_) if over.load(std::sync::atomic::Ordering::Relaxed) => oversize(cap),
         Err(err) => storage_fault("put", &skey, err),
     }
+}
+
+/// The `413 Payload Too Large` refusal for an over-cap PUT.
+fn oversize(cap: u64) -> Response {
+    (
+        StatusCode::PAYLOAD_TOO_LARGE,
+        format!("object exceeds the {cap}-byte per-object limit\n"),
+    )
+        .into_response()
 }
 
 /// `HEAD /{container}/{*key}`: existence + size, no body.
@@ -860,6 +970,59 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
         let body = to_bytes(resp.into_body(), 1 << 20).await.unwrap();
         assert_eq!(&body[..], b"234");
+    }
+
+    /// Security HIGH: the shim binds the HOST the `blob_shim_url` names (bridge-gateway IP /
+    /// loopback), NEVER widening to all interfaces on its own.
+    #[test]
+    fn bind_addr_honors_configured_host_never_all_interfaces() {
+        // A literal IP binds that exact IP, not 0.0.0.0.
+        let a = crate::shim_bind_addr("http://127.0.0.1:8082/").expect("ip:port");
+        assert_eq!(a.ip(), std::net::IpAddr::from([127, 0, 0, 1]));
+        assert_eq!(a.port(), 8082);
+        assert!(!a.ip().is_unspecified(), "must not widen to all interfaces");
+        // No scheme + a bare host:port still parses.
+        assert_eq!(crate::shim_bind_addr("10.0.0.1:9000").unwrap().port(), 9000);
+        // An explicit 0.0.0.0 is the operator's OWN choice — honored as-is.
+        assert!(
+            crate::shim_bind_addr("http://0.0.0.0:8082")
+                .unwrap()
+                .ip()
+                .is_unspecified()
+        );
+        // No resolvable host:port ⇒ None (fail closed; never a silent all-interfaces fallback).
+        assert!(crate::shim_bind_addr("http://").is_none());
+    }
+
+    /// Security LOW: a PUT above the per-object cap is refused `413` and nothing is stored;
+    /// an at/under-cap PUT succeeds.
+    #[tokio::test]
+    async fn put_rejects_oversize_object_with_413() {
+        let shim = BlobShim::new().with_max_object_bytes(4);
+        let storage = Arc::new(MemStorage::default());
+        let resolver = resolver(&shim, storage.clone());
+        let env = resolver
+            .resolve("default", "api", 0, &[blob_binding("")])
+            .await;
+        let token = env
+            .iter()
+            .find(|(k, _)| k == "BOATRAMP_BLOB_URL_AUTH_TOKEN")
+            .map(|(_, v)| v.clone())
+            .unwrap();
+        // 10 bytes > 4-byte cap → 413 (caught by the streaming guard), nothing stored.
+        let (status, _) = request(&shim, "PUT", "/docs/big.bin", Some(&token), b"0123456789").await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(
+            !storage
+                .map
+                .lock()
+                .unwrap()
+                .contains_key("hblob/api/docs/big.bin"),
+            "an over-cap object must not be persisted"
+        );
+        // At/under the cap → OK.
+        let (status, _) = request(&shim, "PUT", "/docs/ok.bin", Some(&token), b"1234").await;
+        assert_eq!(status, StatusCode::OK);
     }
 
     /// **CI mutation gate** (PLAN-compute-bindings anti-hollow, marker `COMPUTE BLOB-SHIM

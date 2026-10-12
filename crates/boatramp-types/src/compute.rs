@@ -269,6 +269,19 @@ impl ComputeBinding {
 }
 
 impl BindingKind {
+    /// A **stable** 1-byte discriminant for this kind, used where a derivation must not shift if the
+    /// enum is ever reordered or a variant renamed — the compute shims' token HMAC, where
+    /// `format!("{:?}", kind)` would silently rotate every live token on a rename. Append-only:
+    /// NEVER renumber an existing variant.
+    pub fn stable_tag(self) -> u8 {
+        match self {
+            Self::Sql => 1,
+            Self::Kv => 2,
+            Self::Blob => 3,
+            Self::Messaging => 4,
+        }
+    }
+
     /// The default env var an endpoint of this kind is injected as.
     pub fn default_url_env(self) -> &'static str {
         match self {
