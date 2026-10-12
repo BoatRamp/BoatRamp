@@ -76,7 +76,8 @@ pub mod time;
 pub use boatramp_types::{SCHEMA_VERSION, schema_version};
 pub use boatramp_types::{
     access, authz, blob_notify, config, cron, daemon_config, dns_managed, domain_verify, function,
-    gateway, geo, host, logs, matcher, predicate, route, security, site, tenancy, waf, workflow,
+    gateway, geo, host, logs, matcher, predicate, record_verify, route, security, site, tenancy,
+    waf, workflow,
 };
 
 pub use error::{ConfigError, DeployError, KvError, StorageError};

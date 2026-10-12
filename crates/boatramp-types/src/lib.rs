@@ -30,6 +30,7 @@ pub mod manifest;
 pub mod matcher;
 pub mod predicate;
 pub mod project;
+pub mod record_verify;
 pub mod route;
 pub mod security;
 pub mod site;
