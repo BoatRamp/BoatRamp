@@ -843,48 +843,52 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
         DOMAIN_VERIFY_RECONCILE_TICK,
     );
 
-    // Native project export/import capability (env-clone) — wired only when a managed
-    // SQL binding, a secrets envelope, the docker backend, and the operator-SQL seam are
-    // ALL present (the deps the driver needs). `None` otherwise ⇒ the routes return 501.
+    // Native project export/import capability (env-clone). The node ALWAYS has the
+    // deploy + KV + blob deps, so the driver is always wired (a node with no SQL still
+    // exports its KV slice + blobs); the engine contexts attach optionally — the managed
+    // pg/mysql ephemeral-dump context when a docker backend + envelope + operator-SQL are
+    // present, and the LOCAL libsql backend when the `sql` binding is embedded libsql
+    // (not remote sqld).
     #[cfg(feature = "project-export")]
     let project_export_cap: Option<Arc<dyn boatramp_core::project_export::ProjectExport>> = {
-        let sql = config
+        let sql_cfg = config
             .handlers
             .as_ref()
-            .and_then(|h| h.bindings.sql.as_ref())
-            .filter(|s| !s.databases.is_empty());
-        match (
-            sql,
-            export_envelope,
-            export_docker_backend,
-            operator_sql.clone(),
-        ) {
-            (Some(sql), Some(envelope), Some(backend), Some(op)) => {
-                let published = config
-                    .compute
-                    .as_ref()
-                    .map(|c| {
-                        matches!(
-                            c.docker_endpoint,
-                            boatramp_docker::DockerEndpoint::Published
-                        )
-                    })
-                    .unwrap_or(true);
-                Some(Arc::new(crate::project_export::NodeProjectExport::new(
-                    sql.databases.clone(),
-                    deploy.clone(),
-                    kv.clone(),
-                    envelope,
-                    export_blobs,
-                    backend,
-                    published,
-                    op,
-                    data_dir.join("project-export"),
-                ))
-                    as Arc<dyn boatramp_core::project_export::ProjectExport>)
-            }
-            _ => None,
+            .and_then(|h| h.bindings.sql.as_ref());
+        let databases = sql_cfg.map(|s| s.databases.clone()).unwrap_or_default();
+        let mut driver = crate::project_export::NodeProjectExport::new(
+            databases,
+            deploy.clone(),
+            kv.clone(),
+            export_blobs,
+            data_dir.join("project-export"),
+        );
+        if let (Some(backend), Some(envelope), Some(op)) =
+            (export_docker_backend, export_envelope, operator_sql.clone())
+        {
+            let published = config
+                .compute
+                .as_ref()
+                .map(|c| {
+                    matches!(
+                        c.docker_endpoint,
+                        boatramp_docker::DockerEndpoint::Published
+                    )
+                })
+                .unwrap_or(true);
+            driver = driver.with_managed_pg(backend, envelope, op, published);
         }
+        // Local libsql backend (embedded per-site DBs) — skipped for a remote-sqld project
+        // (no local file to snapshot). Mirrors `build_sql_backends`' dir derivation.
+        if sql_cfg.map(|c| c.url.is_none()).unwrap_or(true) {
+            let dir = sql_cfg
+                .and_then(|c| c.dir.clone())
+                .unwrap_or_else(|| data_dir.join("handlers-sql"));
+            driver = driver.with_libsql(std::sync::Arc::new(
+                boatramp_storage::LibsqlSqlBackends::local(dir),
+            ));
+        }
+        Some(Arc::new(driver) as Arc<dyn boatramp_core::project_export::ProjectExport>)
     };
     #[cfg(not(feature = "project-export"))]
     let project_export_cap: Option<Arc<dyn boatramp_core::project_export::ProjectExport>> = None;

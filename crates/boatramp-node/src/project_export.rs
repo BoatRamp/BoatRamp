@@ -99,6 +99,22 @@ fn db_from_pg_member(path: &str) -> Option<&str> {
         .and_then(|s| s.strip_suffix(".pgc"))
 }
 
+/// The bundle member path for a site's default libsql database.
+fn libsql_member_path(project: &str, site: &str) -> String {
+    format!("libsql/{project}/{site}/default.sqlite")
+}
+
+/// Recover the SITE from a `libsql/<project>/<site>/default.sqlite` member path (the
+/// source project segment is discarded — the import re-qualifies with the TARGET
+/// project).
+fn site_from_libsql_member(path: &str) -> Option<&str> {
+    let body = path
+        .strip_prefix("libsql/")?
+        .strip_suffix("/default.sqlite")?;
+    // body = "<project>/<site>"; site is the last segment (project/site carry no `/`).
+    Some(body.rsplit_once('/').map(|(_, s)| s).unwrap_or(body))
+}
+
 /// The blob-store key prefix covering a project's objects.
 ///
 /// Every blob key is `hblob/{qualified-site}/{container}/{key}` where the qualified site
@@ -156,89 +172,127 @@ fn fingerprint_rows(rows: &boatramp_core::sql::SqlRows) -> String {
 // The driver
 // ---------------------------------------------------------------------------
 
-/// A libsql export/import target: an already-project-qualified site identity + database
-/// name (the `snapshot_into` arguments). Phase 1 takes these explicitly; full per-site
-/// enumeration is a follow-up.
-#[derive(Debug, Clone)]
-pub struct LibsqlTarget {
-    /// The project-qualified site identity (as the libsql backend uses).
-    pub site: String,
-    /// The database name (`""`/`"default"` fold to the reserved default).
-    pub name: String,
-    /// The bundle member path (`libsql/<...>.sqlite`).
-    pub member_path: String,
-}
-
 /// The node's [`ProjectExport`] implementation.
+///
+/// Always constructible from the node's always-present deps (deploy + KV + blobs); the
+/// engine contexts attach optionally — [`with_managed_pg`](Self::with_managed_pg) for the
+/// pg/mysql ephemeral-dump path, [`with_libsql`](Self::with_libsql) for the embedded
+/// libsql path — so a libsql-only project (no managed SQL at all) still exports its
+/// libsql + KV + blobs.
 pub struct NodeProjectExport {
     databases: BTreeMap<String, ExternalDatabaseConfig>,
     deploy: DeployStore,
     kv: Arc<dyn KvStore>,
-    envelope: Arc<dyn KeyEnvelope>,
     blobs: Arc<dyn Storage>,
+    /// The LOCAL libsql backend, when the project's `sql` binding is embedded libsql
+    /// (not remote sqld). `None` ⇒ no local libsql to snapshot (remote, or no binding).
+    /// The driver enumerates the project's sites AUTHORITATIVELY from the deploy store
+    /// and snapshots each site's default DB that actually exists on disk.
     libsql: Option<Arc<LibsqlSqlBackends>>,
-    libsql_targets: Vec<LibsqlTarget>,
-    backend: Arc<dyn ComputeBackend>,
+    /// The compute backend running the ephemeral `pg_dump`/`mysqldump` client. `None` ⇒
+    /// no pg/mysql export/import on this node.
+    backend: Option<Arc<dyn ComputeBackend>>,
+    /// The secrets envelope used to unseal a managed DB credential. `None` with a managed
+    /// binding ⇒ that binding can't be dumped (fail-closed per database).
+    envelope: Option<Arc<dyn KeyEnvelope>>,
+    /// The operator-SQL seam used to version-detect (`SHOW server_version_num` /
+    /// `SELECT VERSION()`) + fingerprint the schema ledger. `None` ⇒ no pg/mysql path.
+    operator_sql: Option<Arc<dyn boatramp_core::sql::OperatorSql>>,
     published_endpoint: bool,
-    operator_sql: Arc<dyn boatramp_core::sql::OperatorSql>,
     work_dir: PathBuf,
     connect_timeout_secs: u32,
 }
 
 impl NodeProjectExport {
-    /// Build the driver. `published_endpoint` is `true` when the docker backend reports
-    /// endpoints as host-loopback publishes (so a colocated DB must be reached at its
-    /// bridge IP). `work_dir` is where staging + bundle temp files are written.
-    #[allow(clippy::too_many_arguments)]
+    /// Build the driver from the always-present node deps. Attach the pg/mysql context
+    /// with [`with_managed_pg`](Self::with_managed_pg) and the libsql backend with
+    /// [`with_libsql`](Self::with_libsql). `work_dir` holds staging + bundle temp files.
     pub fn new(
         databases: BTreeMap<String, ExternalDatabaseConfig>,
         deploy: DeployStore,
         kv: Arc<dyn KvStore>,
-        envelope: Arc<dyn KeyEnvelope>,
         blobs: Arc<dyn Storage>,
-        backend: Arc<dyn ComputeBackend>,
-        published_endpoint: bool,
-        operator_sql: Arc<dyn boatramp_core::sql::OperatorSql>,
         work_dir: PathBuf,
     ) -> Self {
         Self {
             databases,
             deploy,
             kv,
-            envelope,
             blobs,
             libsql: None,
-            libsql_targets: Vec::new(),
-            backend,
-            published_endpoint,
-            operator_sql,
+            backend: None,
+            envelope: None,
+            operator_sql: None,
+            published_endpoint: true,
             work_dir,
             connect_timeout_secs: 10,
         }
     }
 
-    /// Attach the libsql backend + the explicit `(site, name)` targets to export/import.
+    /// Attach the pg/mysql ephemeral-dump context: the compute backend that runs the
+    /// client container, the secrets envelope (to unseal a managed credential), the
+    /// operator-SQL seam (version-detect + schema fingerprint), and whether the backend's
+    /// endpoints are host-loopback publishes (so a colocated DB must be reached at its
+    /// bridge IP).
     #[must_use]
-    pub fn with_libsql(
+    pub fn with_managed_pg(
         mut self,
-        libsql: Arc<LibsqlSqlBackends>,
-        targets: Vec<LibsqlTarget>,
+        backend: Arc<dyn ComputeBackend>,
+        envelope: Arc<dyn KeyEnvelope>,
+        operator_sql: Arc<dyn boatramp_core::sql::OperatorSql>,
+        published_endpoint: bool,
     ) -> Self {
-        self.libsql = Some(libsql);
-        self.libsql_targets = targets;
+        self.backend = Some(backend);
+        self.envelope = Some(envelope);
+        self.operator_sql = Some(operator_sql);
+        self.published_endpoint = published_endpoint;
         self
     }
 
-    /// Resolve a managed compute-backed Postgres database to a reachable connection +
-    /// the matching client image + the detected `server_version_num`.
-    async fn resolve_pg(
+    /// Attach the LOCAL libsql backend so the driver snapshots each site's embedded DB on
+    /// export and places members back on import. Pass `None`-equivalent (don't call this)
+    /// for a remote-sqld project (no local file to snapshot).
+    #[must_use]
+    pub fn with_libsql(mut self, libsql: Arc<LibsqlSqlBackends>) -> Self {
+        self.libsql = Some(libsql);
+        self
+    }
+
+    /// The pg/mysql context (compute backend + envelope + operator-SQL), or a clear
+    /// `Unavailable` error when the node has no managed-SQL/compute context.
+    fn pg_ctx(
+        &self,
+    ) -> Result<
+        (
+            &Arc<dyn ComputeBackend>,
+            &Arc<dyn KeyEnvelope>,
+            &Arc<dyn boatramp_core::sql::OperatorSql>,
+        ),
+        Perr,
+    > {
+        match (&self.backend, &self.envelope, &self.operator_sql) {
+            (Some(b), Some(e), Some(o)) => Ok((b, e, o)),
+            _ => Err(Perr::Unavailable(
+                "SQL (pg/mysql) export/import needs a managed-SQL + compute context \
+                 (a docker backend, a [secrets] envelope, and the operator-SQL seam) — \
+                 not available on this node"
+                    .into(),
+            )),
+        }
+    }
+
+    /// Resolve a managed compute-backed SQL database to its reachable endpoint parts
+    /// `(host, port, user, password, database)` — the same derivation the runtime uses
+    /// (`operator_target` + the healthy replica endpoint + the unsealed credential), with
+    /// a colocated `Published` DB reached at its container bridge IP.
+    async fn resolve_managed_endpoint(
         &self,
         project: &str,
         db: &str,
         cfg: &ExternalDatabaseConfig,
-    ) -> Result<(PgConnection, String, String), Perr> {
+    ) -> Result<SqlEndpoint, Perr> {
+        let (backend, envelope, _op) = self.pg_ctx()?;
         let target = operator_target(cfg, project, db).map_err(other)?;
-        // The healthy, running replica's endpoint + handle (for bridge-IP resolution).
         let states = self
             .deploy
             .list_replica_states(ProjectRef::new(&target.endpoint_project), &target.workload)
@@ -254,7 +308,7 @@ impl NodeProjectExport {
                 ))
             })?;
         let direct = if self.published_endpoint {
-            self.backend.replica_direct_host(&replica.handle).await
+            backend.replica_direct_host(&replica.handle).await
         } else {
             None
         };
@@ -263,13 +317,31 @@ impl NodeProjectExport {
             direct.as_deref(),
             self.published_endpoint,
         );
-        let password = ManagedSqlCredentials::new(self.kv.clone(), self.envelope.clone())
+        let password = ManagedSqlCredentials::new(self.kv.clone(), envelope.clone())
             .password(&target.cred_project, &target.cred_workload)
             .await
             .map_err(Perr::Other)?;
+        Ok(SqlEndpoint {
+            host,
+            port: replica.endpoint.port,
+            user: target.user,
+            password,
+            database: target.database,
+        })
+    }
+
+    /// Resolve a managed compute-backed Postgres database to a `PgConnection` + the
+    /// matching client image + the detected `server_version_num`.
+    async fn resolve_pg(
+        &self,
+        project: &str,
+        db: &str,
+        cfg: &ExternalDatabaseConfig,
+    ) -> Result<(PgConnection, String, String), Perr> {
+        let (_b, _e, op) = self.pg_ctx()?;
+        let ep = self.resolve_managed_endpoint(project, db, cfg).await?;
         // Version detect via the operator-SQL seam.
-        let banner = self
-            .operator_sql
+        let banner = op
             .query(project, db, "SHOW server_version_num")
             .await
             .map_err(other)?;
@@ -280,32 +352,31 @@ impl NodeProjectExport {
         })?;
         let image = boatramp_core::compute::pg_client_image_for_server_version(&server_version_num)
             .map_err(|e| Perr::Other(format!("database {db:?}: {e}")))?;
-        let conn = PgConnection {
-            host,
-            port: replica.endpoint.port,
-            user: target.user,
-            password,
-            database: target.database,
-            connect_timeout_secs: self.connect_timeout_secs,
-        };
-        Ok((conn, image, server_version_num))
+        Ok((
+            ep.into_pg(self.connect_timeout_secs),
+            image,
+            server_version_num,
+        ))
     }
 
     /// Best-effort schema-ledger fingerprint of a Postgres database (the applied
     /// migration set + content hashes). `None` if the ledger can't be read (e.g. no
-    /// migrations table) — the skew check then simply has nothing to compare.
+    /// migrations table, or no operator-SQL seam) — the skew check then has nothing to
+    /// compare.
     async fn schema_fingerprint(&self, project: &str, db: &str) -> Option<String> {
+        let op = self.operator_sql.as_ref()?;
         let sql = "SELECT id, ordinal, content_hash FROM boatramp_migrations.schema_migrations \
                    ORDER BY ordinal, id";
-        match self.operator_sql.query(project, db, sql).await {
+        match op.query(project, db, sql).await {
             Ok(rows) => Some(fingerprint_rows(&rows)),
             Err(_) => None,
         }
     }
 
-    /// Run a pg client (`pg_dump`/`pg_restore`) in an ephemeral container, streaming
-    /// `stdin` in (optional) and stdout to `sink_path`. Returns the exit code.
-    async fn run_pg_client(
+    /// Run a SQL client (`pg_dump`/`pg_restore`/`mysqldump`/`mysql`) in an ephemeral
+    /// container, streaming `stdin` in (optional) and stdout to `stdout_path`. Returns
+    /// the exit code.
+    async fn run_sql_client(
         &self,
         image: &str,
         argv: &[String],
@@ -313,22 +384,46 @@ impl NodeProjectExport {
         stdin_path: Option<&Path>,
         stdout_path: &Path,
     ) -> Result<i32, Perr> {
+        let (backend, _e, _o) = self.pg_ctx()?;
         let out = tokio::fs::File::create(stdout_path).await.map_err(other)?;
         let mut sink = out.compat_write();
         let code = if let Some(inp) = stdin_path {
             let f = tokio::fs::File::open(inp).await.map_err(other)?;
             let mut rdr = f.compat();
-            self.backend
+            backend
                 .run_ephemeral(image, argv, env, Some(&mut rdr), &mut sink)
                 .await
                 .map_err(other)?
         } else {
-            self.backend
+            backend
                 .run_ephemeral(image, argv, env, None, &mut sink)
                 .await
                 .map_err(other)?
         };
         Ok(code)
+    }
+}
+
+/// The resolved reachable endpoint of a SQL database (managed or external) — the raw
+/// parts the ephemeral client connects with.
+struct SqlEndpoint {
+    host: String,
+    port: u16,
+    user: String,
+    password: String,
+    database: String,
+}
+
+impl SqlEndpoint {
+    fn into_pg(self, connect_timeout_secs: u32) -> PgConnection {
+        PgConnection {
+            host: self.host,
+            port: self.port,
+            user: self.user,
+            password: self.password,
+            database: self.database,
+            connect_timeout_secs,
+        }
     }
 }
 
@@ -363,7 +458,7 @@ impl ProjectExport for NodeProjectExport {
                 let inv = pg_dump_invocation(&conn, data_only);
                 let out = stage.join(format!("{db}.pgc"));
                 let code = self
-                    .run_pg_client(&image, &inv.argv, &inv.env, None, &out)
+                    .run_sql_client(&image, &inv.argv, &inv.env, None, &out)
                     .await?;
                 if code != 0 {
                     return Err(Perr::Other(format!("pg_dump for {db:?} exited {code}")));
@@ -380,22 +475,36 @@ impl ProjectExport for NodeProjectExport {
                     }),
                 });
             } else if kind_is_libsql(&cfg.kind) {
-                // libsql handled via the explicit targets below (snapshot_into).
+                // The per-site embedded libsql default DBs are exported below via the
+                // authoritative site enumeration — not through this named-binding loop.
             } else {
-                // mysql / external-URL pg: Phase-1 skip with a note on the bundle later.
+                // mysql / external-URL pg: handled in their own branches below.
             }
         }
 
-        // --- libsql snapshots (explicit targets) ---
+        // --- libsql snapshots: enumerate the project's sites AUTHORITATIVELY from the
+        //     deploy store (never a filesystem walk), and snapshot each site's embedded
+        //     default libsql DB that actually exists on disk. A managed-pg/external
+        //     project has no local libsql backend wired (`self.libsql` is `None`), so its
+        //     sites are skipped here and go through the pg path instead. ---
         if let Some(libsql) = &self.libsql {
-            for t in &self.libsql_targets {
-                let dest = stage.join(format!("libsql-{}.sqlite", sanitize(&t.member_path)));
+            let sites = self
+                .deploy
+                .list_sites(ProjectRef::new(project))
+                .await
+                .map_err(other)?;
+            for site in sites {
+                let qsite = ProjectRef::new(project).qualified(&site);
+                if !libsql.local_database_exists(&qsite, "") {
+                    continue; // a site that never wrote SQL — nothing to snapshot
+                }
+                let dest = stage.join(format!("libsql-{}.sqlite", sanitize(&site)));
                 libsql
-                    .snapshot_into(&t.site, &t.name, &dest)
+                    .snapshot_into(&qsite, "", &dest)
                     .await
                     .map_err(other)?;
                 staged.push(StagedMember {
-                    path: t.member_path.clone(),
+                    path: libsql_member_path(project, &site),
                     kind: MemberKind::Libsql,
                     source: dest,
                     pg: None,
@@ -517,7 +626,7 @@ impl ProjectExport for NodeProjectExport {
                 let member_file = extract.join(&m.path);
                 let devnull = session.join(format!("{db}.restore.out"));
                 let code = self
-                    .run_pg_client(&image, &inv.argv, &inv.env, Some(&member_file), &devnull)
+                    .run_sql_client(&image, &inv.argv, &inv.env, Some(&member_file), &devnull)
                     .await?;
                 if code != 0 {
                     return Err(Perr::Other(format!("pg_restore for {db:?} exited {code}")));
@@ -526,19 +635,31 @@ impl ProjectExport for NodeProjectExport {
             report.pg_databases += 1;
         }
 
-        // --- libsql members: placement is a documented follow-up (no-clobber + integrity
-        //     swap of the target file) — recorded as a note so the operator knows. ---
-        let libsql_count = manifest
+        // --- libsql members: place each verified snapshot into the target site's
+        //     embedded DB (no-clobber + integrity verify), re-qualifying the site under
+        //     the TARGET project. Requires the local libsql backend. ---
+        for m in manifest
             .members
             .iter()
             .filter(|m| m.kind == MemberKind::Libsql)
-            .count();
-        if libsql_count > 0 {
-            report.libsql_databases = libsql_count;
-            report.notes.push(format!(
-                "{libsql_count} libsql member(s) extracted + verified; in-place placement \
-                 (no-clobber + integrity swap) is wired in a follow-up"
-            ));
+        {
+            let Some(libsql) = &self.libsql else {
+                return Err(Perr::Unavailable(
+                    "bundle carries libsql members but this node has no local libsql backend to \
+                     restore them into"
+                        .into(),
+                ));
+            };
+            let site = site_from_libsql_member(&m.path)
+                .ok_or_else(|| Perr::Other(format!("bad libsql member path {:?}", m.path)))?;
+            let qsite = ProjectRef::new(project).qualified(site);
+            if opts.apply {
+                libsql
+                    .restore_snapshot(&qsite, "", &extract.join(&m.path))
+                    .await
+                    .map_err(other)?;
+            }
+            report.libsql_databases += 1;
         }
 
         // --- control-plane KV (FULL bundles only; --data-only carries app data only) ---
@@ -647,6 +768,25 @@ mod tests {
         assert_eq!(pg_member_path("app"), "sql/app.pgc");
         assert_eq!(db_from_pg_member("sql/app.pgc"), Some("app"));
         assert_eq!(db_from_pg_member("libsql/x.sqlite"), None);
+    }
+
+    #[test]
+    fn libsql_member_path_round_trips_the_site() {
+        assert_eq!(
+            libsql_member_path("acme", "blog"),
+            "libsql/acme/blog/default.sqlite"
+        );
+        // The SITE is recovered (the source project segment is discarded on import).
+        assert_eq!(
+            site_from_libsql_member("libsql/acme/blog/default.sqlite"),
+            Some("blog")
+        );
+        assert_eq!(
+            site_from_libsql_member("libsql/default/www/default.sqlite"),
+            Some("www")
+        );
+        assert_eq!(site_from_libsql_member("sql/app.pgc"), None);
+        assert_eq!(site_from_libsql_member("libsql/bad"), None);
     }
 
     #[test]

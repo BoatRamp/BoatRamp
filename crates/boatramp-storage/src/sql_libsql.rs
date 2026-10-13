@@ -884,6 +884,89 @@ impl LibsqlSqlBackends {
         Ok(integrity)
     }
 
+    /// Whether a **local** libsql database `(site, name)` exists on disk as a non-empty
+    /// file — so the project-export driver snapshots only sites that actually have data,
+    /// never materializing an empty file for a site that never used SQL. `site` is the
+    /// already project-qualified identity; `name` folds `""`/`"default"` to the reserved
+    /// default. Always `false` for a remote (sqld) backend (no local file).
+    pub fn local_database_exists(&self, site: &str, name: &str) -> bool {
+        match &self.mode {
+            Mode::Local { dir } => {
+                let path = Self::local_path(dir, site, canonical_name(name));
+                std::fs::metadata(&path)
+                    .map(|m| m.len() > 0)
+                    .unwrap_or(false)
+            }
+            Mode::Remote { .. } => false,
+        }
+    }
+
+    /// **Place a snapshot into the local libsql store** for project IMPORT — the inverse
+    /// of [`Self::snapshot_into`]: copy the verified bundle file `src` into the database
+    /// `(site, name)`'s on-disk location, NO-CLOBBER (refuse a non-empty destination so a
+    /// restore never overwrites live data), then verify the placed file with
+    /// `PRAGMA integrity_check` and evict any cached handle so a reopen sees it. `site` is
+    /// the already project-qualified identity. Local single-node only (a remote sqld
+    /// namespace restore needs a server-side load API — refused).
+    pub async fn restore_snapshot(
+        &self,
+        site: &str,
+        name: &str,
+        src: &Path,
+    ) -> Result<(), SqlError> {
+        let Mode::Local { dir } = &self.mode else {
+            return Err(SqlError::other(
+                "libsql restore is supported for local single-node databases only; a remote sqld \
+                 namespace restore is not yet supported",
+            ));
+        };
+        let canon = canonical_name(name);
+        let dst = Self::local_path(dir, site, canon);
+        // No-clobber: never overwrite a non-empty destination (a live tenant database).
+        if let Ok(meta) = std::fs::metadata(&dst)
+            && meta.len() > 0
+        {
+            return Err(SqlError::other(format!(
+                "destination database already exists (refusing to overwrite): {}",
+                dst.display()
+            )));
+        }
+        if let Some(parent) = dst.parent() {
+            std::fs::create_dir_all(parent).map_err(SqlError::other)?;
+        }
+        // Clear any zero-byte stub, then copy the snapshot into place.
+        let _ = std::fs::remove_file(&dst);
+        std::fs::copy(src, &dst).map_err(SqlError::other)?;
+
+        // Verify the placed file is a sound SQLite database before accepting it.
+        let placed = LibsqlSql::open_local(&dst).await?;
+        let integrity = {
+            let mut tx = placed.begin_read_only().await?;
+            let rows = tx.query("PRAGMA integrity_check", &[]).await?;
+            tx.commit().await?;
+            match rows.rows.first().and_then(|r| r.first()) {
+                Some(SqlValue::Text(s)) => s.clone(),
+                other => {
+                    return Err(SqlError::other(format!(
+                        "restored integrity_check returned an unexpected result: {other:?}"
+                    )));
+                }
+            }
+        };
+        if integrity != "ok" {
+            let _ = std::fs::remove_file(&dst);
+            return Err(SqlError::other(format!(
+                "restored integrity_check failed after copy: {integrity}"
+            )));
+        }
+        // Evict any cached backend keyed at this identity so a later open sees the file.
+        {
+            let mut cache = self.cache.lock().await;
+            cache.remove(&(site.to_string(), canon.to_string()));
+        }
+        Ok(())
+    }
+
     /// **Default-scope re-home** (v0.31.0 Finding 8): relocate a reserved-`default`-project site's
     /// libsql database `(site, name)` from its OLD bare identity (`site`, the pre-fix
     /// `qualified(DEFAULT, site)`) to its NEW two-segment identity (`default/site`), data intact.
@@ -2039,6 +2122,51 @@ mod tests {
             one(&snap, "SELECT v FROM t").await,
             vec![SqlValue::Text("exported".into())]
         );
+    }
+
+    /// Restore places a verified snapshot into a fresh (site, name), no-clobber.
+    #[tokio::test]
+    async fn restore_snapshot_places_and_refuses_clobber() {
+        let dir = factory_dir("restore-ok");
+        let backends = LibsqlSqlBackends::local(dir.clone());
+        std::fs::create_dir_all(&dir).unwrap();
+        // Produce a snapshot file from a seeded source (via snapshot_into).
+        let seed_path = dir.join("src.db");
+        {
+            let seed: Arc<dyn SqlBackend> =
+                Arc::new(LibsqlSql::open_local(&seed_path).await.unwrap());
+            put(&seed, "CREATE TABLE t (v TEXT)").await;
+            put(&seed, "INSERT INTO t VALUES ('restored')").await;
+        }
+        let snap = dir.join("bundle/app.sqlite");
+        backends
+            .snapshot_into("src", "", &snap)
+            .await
+            .expect("make snapshot");
+
+        // A target site with no data yet does not exist.
+        assert!(!backends.local_database_exists("tgt", ""));
+        // Place the snapshot into the fresh target.
+        backends
+            .restore_snapshot("tgt", "", &snap)
+            .await
+            .expect("restore into fresh target");
+        assert!(backends.local_database_exists("tgt", ""));
+        // Read the restored file back directly (restore keyed the raw ident "tgt", so its
+        // default DB is `{dir}/tgt.db`).
+        let placed: Arc<dyn SqlBackend> =
+            Arc::new(LibsqlSql::open_local(&dir.join("tgt.db")).await.unwrap());
+        assert_eq!(
+            one(&placed, "SELECT v FROM t").await,
+            vec![SqlValue::Text("restored".into())]
+        );
+
+        // No-clobber: a second restore into the now-non-empty target is refused.
+        let err = backends
+            .restore_snapshot("tgt", "", &snap)
+            .await
+            .expect_err("must refuse to overwrite a non-empty destination");
+        assert!(matches!(&err, SqlError::Other(m) if m.contains("already exists")));
     }
 
     /// Re-home refuses to clobber a non-empty destination (fail-closed; source intact).
