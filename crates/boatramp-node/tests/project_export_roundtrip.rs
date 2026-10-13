@@ -131,10 +131,14 @@ async fn mysql_run(
     let out_path = td.path().join("out");
     // `db` here is always a test-controlled identifier (never user input), safe to inline.
     let target = db.map(|d| format!(" {d}")).unwrap_or_default();
+    // Host/port/user are explicit (conn_args): env() now carries only MYSQL_PWD, and the
+    // `mysql` client would otherwise fall back to the local socket. The flag values are an
+    // IP/port/slug (no shell metacharacters), safe to inline into the sh -c string.
+    let conn = c.conn_args().join(" ");
     let argv = vec![
         "sh".to_string(),
         "-c".to_string(),
-        format!("mysql --connect-timeout=10 -N --batch{target} 2>&1"),
+        format!("mysql {conn} --connect-timeout=10 -N --batch{target} 2>&1"),
     ];
     let env = c.env();
     let infile = tokio::fs::File::open(&sql_path).await.unwrap();
