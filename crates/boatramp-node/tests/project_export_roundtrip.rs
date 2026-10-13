@@ -601,7 +601,24 @@ async fn project_export_roundtrip_mysql() {
             .run_ephemeral(image, &inv.argv, &inv.env, None, &mut sink)
             .await
             .expect("mysqldump run_ephemeral");
-        assert_eq!(code, 0, "mysqldump exit code");
+        if code != 0 {
+            // mysqldump's stdout is the dump, so we can't fold stderr into it on the
+            // happy path; on failure, re-run routing stderr->sink (dump discarded) to
+            // surface the reason (run_ephemeral drops container stderr on non-zero exit).
+            let diag_argv = vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                format!("{} 2>&1 1>/dev/null", inv.argv.join(" ")),
+            ];
+            let errf = td.path().join("dump.err");
+            let ef = tokio::fs::File::create(&errf).await.unwrap();
+            let mut esink = ef.compat_write();
+            let _ = backend
+                .run_ephemeral(image, &diag_argv, &inv.env, None, &mut esink)
+                .await;
+            let err = tokio::fs::read_to_string(&errf).await.unwrap_or_default();
+            panic!("mysqldump exit code = {code}; mysqldump stderr:\n{err}");
+        }
     }
     assert!(
         std::fs::metadata(&dump)
