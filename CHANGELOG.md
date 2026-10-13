@@ -5,6 +5,19 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.31.1] - 2026-10-13
+
+Fix a lean-build regression (no functional change to the default/batteries build or any shipped
+artifact).
+
+- **The minimal `boatramp --no-default-features --features fs` build now compiles.** `serve::Error`'s
+  `Kv(#[from] KvError)` variant was gated behind `slatedb`/`cloudflare-kv`, so a build with a blob
+  backend but no KV-backend feature lost `From<KvError>` while the serve/assemble path still
+  `?`-converts a `KvError` (`E0277`). The variant is now unconditional (`KvError` is always available
+  in core). The default/batteries build and every released artifact were unaffected — this only broke a
+  supported lean config, which `--all-features` CI didn't exercise (the nightly `capability.yml` caught
+  it). The lean `--features fs` build is now part of the **merge gate** so the class can't ship again.
+
 ## [0.31.0] - 2026-10-12
 
 Four capability features in one release: the inbound/listening-TCP sequel to v0.30.0's outbound

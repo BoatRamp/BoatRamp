@@ -165,8 +165,11 @@ pub enum Error {
     #[cfg(feature = "cluster")]
     #[error(transparent)]
     Bootstrap(Box<boatramp_cluster::node::BootstrapError>),
-    /// Opening the SlateDB / Cloudflare KV metadata store failed.
-    #[cfg(any(feature = "slatedb", feature = "cloudflare-kv"))]
+    /// Opening the control-plane KV metadata store failed. Unconditional: the
+    /// serve/assemble path `?`-converts a `KvError` regardless of which KV backend
+    /// feature is compiled in, and `KvError` is always available in core — gating this
+    /// variant on `slatedb`/`cloudflare-kv` broke the minimal `--features fs` build
+    /// (`From<KvError> for Error` vanished while the `?` sites remained).
     #[error(transparent)]
     Kv(#[from] boatramp_core::kv::KvError),
     /// Building the WebAssembly handler engine failed.
