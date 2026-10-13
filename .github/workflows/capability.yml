@@ -385,11 +385,26 @@ jobs:
           done
           PGIP="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' brexport-pg)"
           echo "pgvector bridge IP: $PGIP"
+          # Same colocated-reachability shape for MySQL: a stock mysql:8.0 on the default
+          # bridge (native-password auth so the plaintext bridge connection works; 8.0 is
+          # pinned because `--default-authentication-plugin` is gone in 8.4). The ephemeral
+          # mysqldump/mysql client containers the test launches reach it by its bridge IP.
+          docker rm -f brexport-mysql >/dev/null 2>&1 || true
+          docker run -d --name brexport-mysql -e MYSQL_ROOT_PASSWORD=mysql \
+            mysql:8.0 --default-authentication-plugin=mysql_native_password >/dev/null
+          for i in $(seq 1 90); do
+            docker exec brexport-mysql mysqladmin ping -h 127.0.0.1 -uroot -pmysql >/dev/null 2>&1 && break
+            sleep 2
+          done
+          MYIP="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' brexport-mysql)"
+          echo "mysql bridge IP: $MYIP"
           BOATRAMP_TEST_PG_URL="postgres://postgres:postgres@${PGIP}:5432/postgres" \
+          BOATRAMP_TEST_MYSQL_URL="mysql://root:mysql@${MYIP}:3306/mysql" \
             timeout -k 30 900 cargo test -p boatramp-node --features project-export \
             --test project_export_roundtrip \
             -- --test-threads=1 --nocapture 2>&1 | tee project-export.log
           docker rm -f brexport-pg >/dev/null 2>&1 || true
+          docker rm -f brexport-mysql >/dev/null 2>&1 || true
           # The test self-skips (and still prints `test result: ok`) when pg/docker are
           # absent — the exact silent-skip trap. Gate on the success marker that prints ONLY
           # after the real export -> bundle(SHA-256 verify) -> fresh-DB -> import ->
@@ -402,6 +417,11 @@ jobs:
           # same invocation — its marker proves it was not silently feature-gated away.
           grep -q 'PROJECT EXPORT LIBSQL ROUNDTRIP OK' project-export.log \
             || { echo "::error::libsql project export round-trip never reached its marker (silent skip or a regression?)" >&2; exit 1; }
+          # MySQL round-trip: self-skips without a reachable MySQL/docker (the silent-skip
+          # trap), so gate on its marker which prints ONLY after the real mysqldump ->
+          # bundle(SHA-256) -> drop -> mysql-restore -> ROW-equality round-trip.
+          grep -q 'PROJECT EXPORT MYSQL ROUNDTRIP OK' project-export.log \
+            || { echo "::error::mysql project export round-trip never reached its marker (silent skip or a regression?)" >&2; exit 1; }
 
       - name: CRIU checkpoint/restore (informational — restore is kernel-sensitive)
         continue-on-error: true

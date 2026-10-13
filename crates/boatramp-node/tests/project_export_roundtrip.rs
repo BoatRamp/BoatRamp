@@ -23,7 +23,10 @@ use std::sync::Arc;
 
 use boatramp_core::compute::{ComputeBackend, pg_client_image_for_server_version};
 use boatramp_docker::DockerBackend;
-use boatramp_node::pg_client::{PgConnection, pg_dump_invocation, pg_restore_invocation};
+use boatramp_node::pg_client::{
+    MysqlConnection, PgConnection, mysql_restore_invocation, mysqldump_invocation,
+    pg_dump_invocation, pg_restore_invocation,
+};
 use boatramp_node::project_bundle::{self, MemberKind, PgMemberInfo, SourceInfo, StagedMember};
 
 /// Parse `postgres://user:pass@host:port/db` into the parts (best-effort, for the test
@@ -43,6 +46,23 @@ fn parse_pg_url(url: &str) -> Option<(String, String, String, u16, String)> {
     let (host, port) = match hostport.rsplit_once(':') {
         Some((h, p)) => (h.to_string(), p.parse().ok()?),
         None => (hostport.to_string(), 5432),
+    };
+    Some((user, password, host, port, db))
+}
+
+/// Parse `mysql://user:pass@host:port/db` into the parts (best-effort, for the test URL).
+fn parse_mysql_url(url: &str) -> Option<(String, String, String, u16, String)> {
+    let rest = url.strip_prefix("mysql://")?;
+    let (userinfo, hostpart) = rest.rsplit_once('@')?;
+    let (user, password) = match userinfo.split_once(':') {
+        Some((u, p)) => (u.to_string(), p.to_string()),
+        None => (userinfo.to_string(), String::new()),
+    };
+    let (hostport, db) = hostpart.split_once('/')?;
+    let db = db.split(['?', '&']).next().unwrap_or(db).to_string();
+    let (host, port) = match hostport.rsplit_once(':') {
+        Some((h, p)) => (h.to_string(), p.parse().ok()?),
+        None => (hostport.to_string(), 3306),
     };
     Some((user, password, host, port, db))
 }
@@ -85,6 +105,46 @@ async fn psql(
             .await
             .expect("psql run_ephemeral")
     };
+    let out = tokio::fs::read_to_string(&out_path)
+        .await
+        .unwrap_or_default();
+    (code, out.trim().to_string())
+}
+
+/// Run a `mysql` client script in an ephemeral container, returning `(exit_code,
+/// stdout_trimmed)`. The SQL is fed on stdin (so no shell-quoting of statements), under
+/// `sh -c '… 2>&1'` so a failed statement's stderr merges into the sink (run_ephemeral
+/// drops container stderr on a non-zero exit). `-N --batch` gives clean, header-less,
+/// tab-separated output. `db` names an optional default database (`None` for a
+/// maintenance connection, e.g. CREATE/DROP DATABASE).
+async fn mysql_run(
+    backend: &dyn ComputeBackend,
+    image: &str,
+    c: &MysqlConnection,
+    db: Option<&str>,
+    sql: &str,
+) -> (i32, String) {
+    use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+    let td = tempfile::tempdir().unwrap();
+    let sql_path = td.path().join("in.sql");
+    tokio::fs::write(&sql_path, sql).await.unwrap();
+    let out_path = td.path().join("out");
+    // `db` here is always a test-controlled identifier (never user input), safe to inline.
+    let target = db.map(|d| format!(" {d}")).unwrap_or_default();
+    let argv = vec![
+        "sh".to_string(),
+        "-c".to_string(),
+        format!("mysql --connect-timeout=10 -N --batch{target} 2>&1"),
+    ];
+    let env = c.env();
+    let infile = tokio::fs::File::open(&sql_path).await.unwrap();
+    let mut rdr = infile.compat();
+    let f = tokio::fs::File::create(&out_path).await.unwrap();
+    let mut sink = f.compat_write();
+    let code = backend
+        .run_ephemeral(image, &argv, &env, Some(&mut rdr), &mut sink)
+        .await
+        .expect("mysql run_ephemeral");
     let out = tokio::fs::read_to_string(&out_path)
         .await
         .unwrap_or_default();
@@ -447,6 +507,204 @@ async fn project_export_roundtrip_libsql() {
     );
 
     println!("PROJECT EXPORT LIBSQL ROUNDTRIP OK");
+}
+
+/// **Live MySQL export/import round-trip** (Tier-2 / nightly — needs a Docker daemon AND a
+/// MySQL server). Self-skipping on `BOATRAMP_TEST_MYSQL_URL` + a reachable Docker daemon.
+///
+/// Mirrors the pg gate against the REAL tools (`mysqldump`/`mysql` in an ephemeral
+/// container via `run_ephemeral`, the `BRPROJ` bundle): create + seed a source database,
+/// EXPORT it with a FULL `mysqldump --databases` (schema + data, carrying `CREATE
+/// DATABASE`/`USE`), bundle it (SHA-256 verified), EXTRACT + verify, DROP the source db,
+/// then IMPORT the dump via `mysql` streaming from stdin (the FULL dump recreates the db),
+/// and assert ROW equality. Emits `PROJECT EXPORT MYSQL ROUNDTRIP OK`.
+#[tokio::test]
+async fn project_export_roundtrip_mysql() {
+    // --- self-skip gates ---
+    let Ok(url) = std::env::var("BOATRAMP_TEST_MYSQL_URL") else {
+        eprintln!("SKIP: BOATRAMP_TEST_MYSQL_URL unset (live mysql round-trip not run)");
+        return;
+    };
+    let Some((user, password, host, port, _db)) = parse_mysql_url(&url) else {
+        eprintln!("SKIP: BOATRAMP_TEST_MYSQL_URL is not a mysql://user:pw@host:port/db URL");
+        return;
+    };
+    let backend = match DockerBackend::connect() {
+        Ok(b) if b.reachable().await => b,
+        _ => {
+            eprintln!("SKIP: no reachable Docker daemon (live mysql round-trip not run)");
+            return;
+        }
+    };
+    let backend: Arc<dyn ComputeBackend> = Arc::new(backend);
+    // Pin 8.0: `mysql:8` may float to 8.4 where `--default-authentication-plugin` is gone;
+    // the capability container pairs this with native-password auth over the plaintext
+    // bridge. The client image ships both `mysqldump` and `mysql`.
+    let image = "mysql:8.0";
+
+    let suffix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let src_db = format!("brexport_mysql_rt_{suffix}");
+    let mkconn = |db: &str| MysqlConnection {
+        host: host.clone(),
+        port,
+        user: user.clone(),
+        password: password.clone(),
+        database: db.to_string(),
+        connect_timeout_secs: 10,
+    };
+    // A maintenance connection (no default db) for CREATE/DROP DATABASE.
+    let admin = mkconn("");
+    let expect = "1:alpha\n2:beta\n3:gamma";
+
+    // --- create + seed the source database ---
+    let (code, out) = mysql_run(
+        backend.as_ref(),
+        image,
+        &admin,
+        None,
+        &format!("DROP DATABASE IF EXISTS {src_db}; CREATE DATABASE {src_db};"),
+    )
+    .await;
+    assert_eq!(code, 0, "create source database; mysql output:\n{out}");
+    let (code, out) = mysql_run(
+        backend.as_ref(),
+        image,
+        &admin,
+        Some(&src_db),
+        "CREATE TABLE t(id INT PRIMARY KEY, v TEXT); \
+         INSERT INTO t VALUES (1,'alpha'),(2,'beta'),(3,'gamma');",
+    )
+    .await;
+    assert_eq!(code, 0, "seed source table; mysql output:\n{out}");
+    let (_code, got_src) = mysql_run(
+        backend.as_ref(),
+        image,
+        &admin,
+        Some(&src_db),
+        "SELECT CONCAT(id, ':', v) FROM t ORDER BY id;",
+    )
+    .await;
+    assert_eq!(got_src, expect, "source rows");
+
+    // --- EXPORT: mysqldump FULL -> bundle member (stdout is the dump; keep it clean) ---
+    let td = tempfile::tempdir().unwrap();
+    let dump = td.path().join("dump.sql");
+    {
+        use tokio_util::compat::TokioAsyncWriteCompatExt;
+        let inv = mysqldump_invocation(&mkconn(&src_db), /* data_only = */ false);
+        let f = tokio::fs::File::create(&dump).await.unwrap();
+        let mut sink = f.compat_write();
+        let code = backend
+            .run_ephemeral(image, &inv.argv, &inv.env, None, &mut sink)
+            .await
+            .expect("mysqldump run_ephemeral");
+        assert_eq!(code, 0, "mysqldump exit code");
+    }
+    assert!(
+        std::fs::metadata(&dump)
+            .map(|m| m.len() > 0)
+            .unwrap_or(false),
+        "mysqldump produced a non-empty dump"
+    );
+
+    // --- bundle it (SHA-256) + extract + verify ---
+    let bundle = td.path().join("mysql-rt.brproj");
+    let member_path = format!("sql/{src_db}.sql");
+    let staged = vec![StagedMember {
+        path: member_path.clone(),
+        kind: MemberKind::MysqlDump,
+        source: dump.clone(),
+        pg: None,
+    }];
+    project_bundle::write_bundle(
+        &bundle,
+        suffix,
+        false,
+        SourceInfo {
+            project: "default".to_string(),
+            site: None,
+        },
+        &staged,
+    )
+    .expect("write bundle");
+    let extract = td.path().join("extract");
+    let manifest = project_bundle::extract_and_verify(&bundle, &extract).expect("extract + verify");
+    let member = extract.join(
+        &manifest
+            .members
+            .iter()
+            .find(|m| m.kind == MemberKind::MysqlDump)
+            .expect("mysql member in manifest")
+            .path,
+    );
+    assert!(member.exists(), "extracted mysql member present");
+
+    // --- DROP the source db, then IMPORT the FULL dump (recreates it via CREATE DATABASE/USE) ---
+    let (code, out) = mysql_run(
+        backend.as_ref(),
+        image,
+        &admin,
+        None,
+        &format!("DROP DATABASE IF EXISTS {src_db};"),
+    )
+    .await;
+    assert_eq!(
+        code, 0,
+        "drop source database before restore; mysql output:\n{out}"
+    );
+    {
+        use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+        let inv = mysql_restore_invocation(&mkconn(&src_db), /* data_only = */ false);
+        // `mysql` restore reads the dump from stdin; run it under `sh -c … 2>&1` so a
+        // failed statement surfaces (run_ephemeral drops stderr on a non-zero exit).
+        let restore_argv = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            format!("{} 2>&1", inv.argv.join(" ")),
+        ];
+        let infile = tokio::fs::File::open(&member).await.unwrap();
+        let mut rdr = infile.compat();
+        let out_path = td.path().join("restore.out");
+        let out = tokio::fs::File::create(&out_path).await.unwrap();
+        let mut sink = out.compat_write();
+        let code = backend
+            .run_ephemeral(image, &restore_argv, &inv.env, Some(&mut rdr), &mut sink)
+            .await
+            .expect("mysql restore run_ephemeral");
+        let restore_out = tokio::fs::read_to_string(&out_path)
+            .await
+            .unwrap_or_default();
+        assert_eq!(
+            code, 0,
+            "mysql restore exit code; mysql output:\n{restore_out}"
+        );
+    }
+
+    // --- assert ROW equality on the restored db ---
+    let (_code, got_tgt) = mysql_run(
+        backend.as_ref(),
+        image,
+        &admin,
+        Some(&src_db),
+        "SELECT CONCAT(id, ':', v) FROM t ORDER BY id;",
+    )
+    .await;
+    assert_eq!(got_tgt, expect, "restored rows match the source");
+
+    // --- cleanup (best-effort) ---
+    let _ = mysql_run(
+        backend.as_ref(),
+        image,
+        &admin,
+        None,
+        &format!("DROP DATABASE IF EXISTS {src_db};"),
+    )
+    .await;
+
+    println!("PROJECT EXPORT MYSQL ROUNDTRIP OK");
 }
 
 #[test]
