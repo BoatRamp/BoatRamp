@@ -1185,6 +1185,79 @@ impl ManagedDbEngine {
     }
 }
 
+/// Why picking the export/import **client image** for a detected server version failed.
+/// A version-detect that can't be mapped to a safe client image REFUSES rather than
+/// guessing — a client older than the server cannot restore its dump (new catalog
+/// features, archive-format version), so guessing would silently corrupt a migration.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum VersionMapError {
+    /// The server version banner could not be parsed into a version number.
+    #[error("unrecognized server version banner {0:?}: cannot select a matching client image")]
+    Unparsable(String),
+    /// The detected server major is older than the oldest client image we ship a tag
+    /// for (we never guess an ancient client).
+    #[error(
+        "server major {0} is too old: no matching export/import client image is available \
+         (minimum supported Postgres major is {1})"
+    )]
+    TooOld(u32, u32),
+    /// The detected server major is newer than the newest client image we can name — we
+    /// refuse rather than pick an older client that could not read the newer server's
+    /// dump (a client MUST be >= the server).
+    #[error(
+        "server major {0} is newer than any export/import client image this build can name \
+         (maximum known Postgres major is {1}); refusing to pick an older client that could \
+         not restore its dump — upgrade boatramp or widen the client-image map"
+    )]
+    TooNew(u32, u32),
+}
+
+/// Oldest Postgres major this build will select an export/import client image for.
+/// pgvector publishes per-major tags; pre-10 servers use a different `server_version_num`
+/// encoding and are long out of support, so they are refused.
+pub const PG_CLIENT_MIN_MAJOR: u32 = 13;
+/// Newest Postgres major this build knows a `pgvector/pgvector:pg<major>` tag exists for.
+/// A server beyond this is refused (not downgraded to an older client) — bump this, and
+/// re-verify the tag exists, when a newer major ships.
+pub const PG_CLIENT_MAX_MAJOR: u32 = 18;
+
+/// Map a Postgres server's `SHOW server_version_num` banner to the stock client image
+/// whose `pg_dump`/`pg_restore` can safely dump+restore it — a pgvector image at the
+/// **same major** (which satisfies "client major >= server major", the load-bearing
+/// invariant: an older client cannot read a newer server's dump).
+///
+/// `server_version_num` is Postgres' integer form: for pg >= 10 it is
+/// `major * 10000 + minor` (e.g. `160004` → major 16). Pre-10 banners (which encode the
+/// major differently and are out of support) and any major outside the known
+/// `pgvector/pgvector:pg<major>` tag range are REFUSED with a clear
+/// [`VersionMapError`] rather than guessing a mismatched client.
+///
+/// Extensible: MySQL (`SELECT VERSION()` → `mysql:<maj.min>`) is the documented
+/// fast-follow; MariaDB is an explicit unsupported-until-detected edge. Keep this pure
+/// (no IO) so the version-match invariant is unit-mutation-gated in the merge gate.
+pub fn pg_client_image_for_server_version(
+    server_version_num: &str,
+) -> Result<String, VersionMapError> {
+    let trimmed = server_version_num.trim();
+    let n: u32 = trimmed
+        .parse()
+        .map_err(|_| VersionMapError::Unparsable(server_version_num.to_string()))?;
+    // Pre-10 encodes as major*10000 + minor*100 + patch (e.g. 9.6.24 -> 90624), so a
+    // value below 100000 is a pre-10 server — out of support, refused.
+    if n < 100_000 {
+        let major = n / 10_000;
+        return Err(VersionMapError::TooOld(major, PG_CLIENT_MIN_MAJOR));
+    }
+    let major = n / 10_000;
+    if major < PG_CLIENT_MIN_MAJOR {
+        return Err(VersionMapError::TooOld(major, PG_CLIENT_MIN_MAJOR));
+    }
+    if major > PG_CLIENT_MAX_MAJOR {
+        return Err(VersionMapError::TooNew(major, PG_CLIENT_MAX_MAJOR));
+    }
+    Ok(format!("pgvector/pgvector:pg{major}"))
+}
+
 /// Synthesize the immutable [`ComputeSpec`] for a managed co-located database from a
 /// stock engine image, so the auto-registration path (node assembly) and the
 /// capability gate build the **identical** workload — the gate proves exactly what
@@ -1659,6 +1732,56 @@ async fn launch_one(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pg_client_image_matches_the_server_major() {
+        // pg16 server (160004) -> the pg16 client, NOT an older one. This is the
+        // load-bearing version-match: the anti-hollow gate mutates this to pick a lower
+        // major (e.g. pg13) and the live round-trip's restore then errors.
+        assert_eq!(
+            pg_client_image_for_server_version("160004").unwrap(),
+            "pgvector/pgvector:pg16"
+        );
+        assert_eq!(
+            pg_client_image_for_server_version("170001").unwrap(),
+            "pgvector/pgvector:pg17"
+        );
+        // The default managed image is pg16 — detection must agree with it.
+        assert_eq!(
+            pg_client_image_for_server_version("160000").unwrap(),
+            "pgvector/pgvector:pg16"
+        );
+        // Whitespace in the banner is tolerated.
+        assert_eq!(
+            pg_client_image_for_server_version("  150002\n").unwrap(),
+            "pgvector/pgvector:pg15"
+        );
+    }
+
+    #[test]
+    fn pg_client_image_refuses_rather_than_guesses() {
+        // Unparsable banner.
+        assert!(matches!(
+            pg_client_image_for_server_version("not-a-number"),
+            Err(VersionMapError::Unparsable(_))
+        ));
+        // Pre-10 (9.6.24 -> 90624) is too old.
+        assert!(matches!(
+            pg_client_image_for_server_version("90624"),
+            Err(VersionMapError::TooOld(9, _))
+        ));
+        // A major below the client-image floor.
+        assert!(matches!(
+            pg_client_image_for_server_version("120004"),
+            Err(VersionMapError::TooOld(12, PG_CLIENT_MIN_MAJOR))
+        ));
+        // A major beyond what we can name an image for: refuse (never downgrade the
+        // client below the server — it could not read the newer dump).
+        assert!(matches!(
+            pg_client_image_for_server_version("990000"),
+            Err(VersionMapError::TooNew(99, PG_CLIENT_MAX_MAJOR))
+        ));
+    }
 
     #[test]
     fn compute_instance_id_qualifies_by_project_but_keeps_default_bare() {
