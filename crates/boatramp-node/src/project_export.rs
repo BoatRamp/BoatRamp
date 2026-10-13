@@ -101,18 +101,14 @@ fn db_from_pg_member(path: &str) -> Option<&str> {
 
 /// The blob-store key prefix covering a project's objects.
 ///
-/// Blob keys are `hblob/<qualified-site>/…`; a non-default project's objects therefore
-/// live under `hblob/<project>/`. The reserved `default` project shares the `hblob/`
-/// root with per-site keys, so a precise default-project prefix is ambiguous — returned
-/// as `hblob/` with the over-capture documented (CAVEAT: the exact qualified-site
-/// blob-key encoding must be confirmed against the live blob layer before the 0.32.0
-/// cut; some fixtures show a `proj~site` tilde form).
+/// Every blob key is `hblob/{qualified-site}/{container}/{key}` where the qualified site
+/// is `ProjectRef::qualified(project, site) = "{project}/{site}"` for EVERY project —
+/// including the reserved `default` (`hblob/default/{site}/…`, the v0.31.0 Finding-8
+/// two-segment default scope; see `blob_shim`'s `format!("hblob/{qualified_site}/")`).
+/// So a project's objects all live under `hblob/{project}/`, with no over-capture (the
+/// trailing `/` means `hblob/foo/` never matches a sibling `hblob/foobar/`).
 fn blob_project_prefix(project: &str) -> String {
-    if project == "default" || project.is_empty() {
-        "hblob/".to_string()
-    } else {
-        format!("hblob/{project}/")
-    }
+    format!("hblob/{project}/")
 }
 
 /// Choose the host a sibling ephemeral client should connect to: in `Published` docker
@@ -654,11 +650,14 @@ mod tests {
     }
 
     #[test]
-    fn blob_prefix_scopes_non_default_project() {
+    fn blob_prefix_is_two_segment_for_every_project() {
+        // Post-0.31.0 (Finding 8): EVERY project's blobs live under `hblob/{project}/`,
+        // including the reserved default — NOT the pre-fix bare `hblob/` root.
         assert_eq!(blob_project_prefix("acme"), "hblob/acme/");
-        // The reserved default shares the root (documented over-capture caveat).
-        assert_eq!(blob_project_prefix("default"), "hblob/");
-        assert_eq!(blob_project_prefix(""), "hblob/");
+        assert_eq!(blob_project_prefix("default"), "hblob/default/");
+        // The trailing `/` prevents a sibling-project over-capture: `foo`'s prefix is
+        // NOT a prefix of `foobar`'s keys.
+        assert!(!blob_project_prefix("foobar").starts_with(&blob_project_prefix("foo")));
     }
 
     #[test]
