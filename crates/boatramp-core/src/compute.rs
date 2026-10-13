@@ -405,6 +405,45 @@ pub trait ComputeBackend: Send + Sync {
         Err(BackendError::Unsupported)
     }
 
+    /// Run a **one-shot ephemeral container** from `image` (no persisted workload,
+    /// no replica identity), streaming its stdout to `stdout` as it is produced, and
+    /// return the command's exit code. The lifeblood of project export/import: the
+    /// client-image `pg_dump`/`pg_restore`/`psql` runs here, reaching the database
+    /// over the network while its credential rides in `env` (never argv).
+    ///
+    /// Contract:
+    /// - `argv` is the command + args (no shell).
+    /// - `env` is the process environment as `(KEY, VALUE)` pairs — this is where a
+    ///   DSN / `PGPASSWORD` belongs, so the credential never shows in `ps`/`inspect`
+    ///   argv. Callers MUST NOT place a credential in `argv`.
+    /// - `stdin`, when present, is written to the command's standard input and the
+    ///   stream is then half-closed (EOF), fed **concurrently** with draining stdout so
+    ///   a large piped restore cannot deadlock on a full pipe.
+    /// - `stdout` receives the command's standard output **as a true byte stream** —
+    ///   chunks are written straight through as they arrive, never buffered whole, so a
+    ///   multi-gigabyte dump flows to the sink (a file / tar member) with bounded memory.
+    ///   Standard error is captured (bounded) for diagnostics only.
+    ///
+    /// The container runs on the hardened baseline (dropped caps, read-only root,
+    /// `no-new-privileges`, PID cap) with **no published port**, and is auto-removed on
+    /// exit (with a best-effort force-remove fallback + a kill on timeout) so a hung run
+    /// against an unreachable DSN can neither leak a container nor hang forever.
+    ///
+    /// Only the shared-kernel backend that can run an ad-hoc client container
+    /// implements it (remote `docker`); the native `container`, VM, and edge backends
+    /// return [`BackendError::Unsupported`]. The caller gates this behind the admin
+    /// `System·Admin` export/import surface.
+    async fn run_ephemeral(
+        &self,
+        _image: &str,
+        _argv: &[String],
+        _env: &[(String, String)],
+        _stdin: Option<&[u8]>,
+        _stdout: &mut (dyn futures::io::AsyncWrite + Send + Unpin),
+    ) -> Result<i32, BackendError> {
+        Err(BackendError::Unsupported)
+    }
+
     /// List this backend's persistent volumes (the host-side backing for a
     /// spec's [`VolumeRef`]s). Only the backends that own an on-node volume
     /// directory implement it (the native `container` backend, under
