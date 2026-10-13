@@ -1110,6 +1110,51 @@ mod tests {
         assert!(data_only_skew_blocks(None, None));
     }
 
+    /// Driver-level (in-process, no Docker): a `--data-only` export must NOT stage the
+    /// control-plane KV slice, while a FULL export must. Drives the real
+    /// `NodeProjectExport::export` with an empty `databases` map (no pg/mysql ⇒ no
+    /// ephemeral container) + no libsql, so only the KV/blob orchestration runs. This is
+    /// the mutation gate for the Ask-4(a) invariant (a data-only bundle carries no
+    /// identity/RBAC/routing/secret bytes).
+    #[tokio::test]
+    async fn data_only_export_omits_the_control_plane_kv_slice() {
+        use boatramp_core::Storage;
+        use boatramp_core::deploy::DeployStore;
+        use boatramp_core::kv::{KvStore, MemoryKv};
+        use boatramp_storage::fs::FsStorage;
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        // A control-plane key so the FULL slice is non-trivial — exactly the kind of
+        // RBAC/routing byte a data-only bundle must never carry.
+        kv.put("routing/acme/site", b"x".to_vec()).await.unwrap();
+        let blobs: Arc<dyn Storage> = Arc::new(FsStorage::new(tmp.path().join("blobs")));
+        let deploy = DeployStore::new(blobs.clone(), kv.clone());
+        let work = tmp.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let drv = NodeProjectExport::new(BTreeMap::new(), deploy, kv.clone(), blobs.clone(), work);
+
+        // FULL export carries the control-plane KV slice...
+        let full = drv.export("acme", false).await.expect("full export");
+        let mf = project_bundle::read_manifest(&full).expect("read full manifest");
+        assert!(!mf.data_only, "full manifest is not data-only");
+        assert!(
+            mf.members.iter().any(|m| m.kind == MemberKind::Kv),
+            "a FULL bundle must carry the control-plane KV slice"
+        );
+
+        // ...a data-only export must NOT (the Ask-4(a) safety invariant).
+        let donly = drv.export("acme", true).await.expect("data-only export");
+        let md = project_bundle::read_manifest(&donly).expect("read data-only manifest");
+        assert!(md.data_only, "data-only manifest flags data_only");
+        assert!(
+            !md.members.iter().any(|m| m.kind == MemberKind::Kv),
+            "a data-only bundle must NOT carry the control-plane KV slice (Ask-4a leak)"
+        );
+    }
+
     #[test]
     fn blob_rekey_only_on_project_rename() {
         let dir = std::path::Path::new("/x/extract/blobs");
