@@ -55,6 +55,9 @@ pub mod migrate;
 pub mod mode;
 pub mod orm;
 pub mod project;
+/// The operator-facing project export/import capability (native env-clone) — a core
+/// trait node implements and the admin API / CLI consume.
+pub mod project_export;
 pub mod redact;
 pub mod secret_store;
 /// The duplex/resumable session delivery-semantics model (Stage 1 of `PLAN-session-primitive`).
