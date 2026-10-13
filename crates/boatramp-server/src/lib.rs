@@ -50,9 +50,10 @@ pub(crate) use admin_api::{
     get_daemon_config, get_database, get_deployment, get_project_tenancy, get_site_config,
     invalidate_cache, list_aliases, list_compute, list_compute_volumes, list_databases,
     list_deployments, list_sites, migrate_apply, migrate_baseline, migrate_dry_run, migrate_status,
-    prune_delete, prune_report, put_blob, put_compute, put_daemon_config, put_project_tenancy,
-    put_site_config, remove_alias, repair_apply, repair_dry_run, rollback_daemon_config,
-    scrub_blobs, set_alias, sql_exec, sql_move, sql_ping, sql_query,
+    project_export, project_import, prune_delete, prune_report, put_blob, put_compute,
+    put_daemon_config, put_project_tenancy, put_site_config, remove_alias, repair_apply,
+    repair_dry_run, rollback_daemon_config, scrub_blobs, set_alias, sql_exec, sql_move, sql_ping,
+    sql_query,
 };
 #[cfg(feature = "handlers")]
 pub(crate) use admin_api::{
@@ -2040,6 +2041,11 @@ pub struct ServerOptions {
     /// Backs `POST /api/compute/{name}/exec`; `None` ⇒ `501`. Gated at the handler by
     /// the `allow_compute_exec` posture. Wired by the node with the compute backends.
     pub compute_exec: Option<Arc<dyn boatramp_core::compute::ComputeExec>>,
+    /// Native project export/import capability (env-clone). Backs
+    /// `POST /api/project-export` / `POST /api/project-import` (`System·Admin`); `None`
+    /// ⇒ those routes return `501`. Wired by the node when the `project-export` driver
+    /// is built (a managed-DB + compute node).
+    pub project_export: Option<Arc<dyn boatramp_core::project_export::ProjectExport>>,
     /// Operator volume-reclamation capability (list + remove persistent volumes).
     /// Backs `GET /api/compute/volumes` + `DELETE /api/compute/volumes/{name}`;
     /// `None` ⇒ `501`. Admin-scoped (the deny-safe `/api/compute/*` default). Wired

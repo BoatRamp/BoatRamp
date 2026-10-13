@@ -2185,6 +2185,245 @@ pub(super) async fn compute_exec(
 }
 
 // ---------------------------------------------------------------------------
+// Native project export / import (`POST /api/project-export` / `/api/project-import`)
+// ---------------------------------------------------------------------------
+
+/// Defense-in-depth (mirrors `control_api::assert_kv_dump_is_system_admin`): re-derive
+/// that `path` is gated `System·Admin` inside the handler, so a routing/table regression
+/// cannot silently downgrade a node-global, data-moving export/import to a project right.
+fn assert_project_export_is_system_admin(method: &str, path: &str, what: &str) -> Option<Response> {
+    use boatramp_core::authz::{Action, Resource, Right};
+    match Right::required(method, path) {
+        Some(right)
+            if right.resource == Resource::System
+                && right.target.is_none()
+                && right.action == Action::Admin =>
+        {
+            None
+        }
+        _ => Some(
+            (
+                StatusCode::FORBIDDEN,
+                format!("{what} requires System·Admin\n"),
+            )
+                .into_response(),
+        ),
+    }
+}
+
+/// `POST /api/project-export` query: the project + whether to produce a `--data-only`
+/// bundle (app data only; the Phase-1 default) vs a full schema+data bundle.
+#[derive(Debug, Deserialize)]
+pub(super) struct ProjectExportQuery {
+    project: String,
+    #[serde(default = "default_data_only")]
+    data_only: bool,
+}
+
+fn default_data_only() -> bool {
+    true
+}
+
+/// Export a project to a `BRPROJ` bundle, streamed as the response body
+/// (`System·Admin`). The bundle is written to a node temp file, then streamed and
+/// unlinked (the open fd keeps it readable until the stream ends, so it is cleaned up
+/// even on a client disconnect). `501` when no export driver is wired.
+pub(super) async fn project_export(
+    Extension(cap): Extension<Option<Arc<dyn boatramp_core::project_export::ProjectExport>>>,
+    Query(q): Query<ProjectExportQuery>,
+) -> Response {
+    if let Some(forbidden) =
+        assert_project_export_is_system_admin("POST", "/api/project-export", "project export")
+    {
+        return forbidden;
+    }
+    let Some(cap) = cap else {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            "project export is not available on this node\n",
+        )
+            .into_response();
+    };
+    if q.project.is_empty() {
+        return (StatusCode::BAD_REQUEST, "project is required\n").into_response();
+    }
+    let path = match cap.export(&q.project, q.data_only).await {
+        Ok(p) => p,
+        Err(boatramp_core::project_export::ProjectExportError::Unavailable(m)) => {
+            return (StatusCode::NOT_IMPLEMENTED, format!("{m}\n")).into_response();
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("project export failed: {e}\n"),
+            )
+                .into_response();
+        }
+    };
+    let file = match tokio::fs::File::open(&path).await {
+        Ok(f) => f,
+        Err(e) => {
+            let _ = tokio::fs::remove_file(&path).await;
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("project export: cannot open bundle: {e}\n"),
+            )
+                .into_response();
+        }
+    };
+    // Unlink now; the open fd keeps the bytes readable until the stream drains (unix),
+    // so the temp bundle never leaks even if the client disconnects mid-download.
+    let _ = tokio::fs::remove_file(&path).await;
+    let stream = futures::stream::try_unfold(
+        (file, vec![0u8; 64 * 1024]),
+        |(mut file, mut buf)| async move {
+            use tokio::io::AsyncReadExt;
+            let n = file.read(&mut buf).await?;
+            if n == 0 {
+                Ok::<_, std::io::Error>(None)
+            } else {
+                Ok(Some((
+                    bytes::Bytes::copy_from_slice(&buf[..n]),
+                    (file, buf),
+                )))
+            }
+        },
+    );
+    let mut resp = Body::from_stream(stream).into_response();
+    resp.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/octet-stream"),
+    );
+    if let Ok(cd) = HeaderValue::from_str(&format!(
+        "attachment; filename=\"boatramp-project-{}.brproj\"",
+        q.project
+    )) {
+        resp.headers_mut().insert(header::CONTENT_DISPOSITION, cd);
+    }
+    resp
+}
+
+/// `POST /api/project-import` query: the project + import flags (`apply` executes vs a
+/// dry-run plan; `force` overlays a non-empty control-plane KV; `allow_schema_skew`
+/// proceeds past a Postgres schema-ledger fingerprint mismatch).
+#[derive(Debug, Default, Deserialize)]
+pub(super) struct ProjectImportQuery {
+    project: String,
+    #[serde(default)]
+    apply: bool,
+    #[serde(default)]
+    force: bool,
+    #[serde(default)]
+    allow_schema_skew: bool,
+}
+
+/// Import a `BRPROJ` bundle (the request body) into a project (`System·Admin`). The body
+/// is streamed to a node temp file (never buffered whole), then handed to the driver;
+/// dry-run unless `?apply=true`. Returns the import report JSON. `501` when no driver is
+/// wired, `409` on a schema skew / KV commingle refusal.
+pub(super) async fn project_import(
+    Extension(cap): Extension<Option<Arc<dyn boatramp_core::project_export::ProjectExport>>>,
+    Query(q): Query<ProjectImportQuery>,
+    body: Body,
+) -> Response {
+    if let Some(forbidden) =
+        assert_project_export_is_system_admin("POST", "/api/project-import", "project import")
+    {
+        return forbidden;
+    }
+    let Some(cap) = cap else {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            "project import is not available on this node\n",
+        )
+            .into_response();
+    };
+    if q.project.is_empty() {
+        return (StatusCode::BAD_REQUEST, "project is required\n").into_response();
+    }
+    // Stream the request body to a temp bundle file (bounded memory for a huge bundle).
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = std::env::temp_dir().join(format!("boatramp-import-{}-{nanos}.brproj", q.project));
+    {
+        use futures::StreamExt;
+        use tokio::io::AsyncWriteExt;
+        let mut f = match tokio::fs::File::create(&tmp).await {
+            Ok(f) => f,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("project import: cannot stage bundle: {e}\n"),
+                )
+                    .into_response();
+            }
+        };
+        let mut stream = body.into_data_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = match chunk {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = tokio::fs::remove_file(&tmp).await;
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        format!("project import: body read failed: {e}\n"),
+                    )
+                        .into_response();
+                }
+            };
+            if let Err(e) = f.write_all(&chunk).await {
+                let _ = tokio::fs::remove_file(&tmp).await;
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("project import: stage write failed: {e}\n"),
+                )
+                    .into_response();
+            }
+        }
+        if let Err(e) = f.flush().await {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("project import: stage flush failed: {e}\n"),
+            )
+                .into_response();
+        }
+    }
+    let opts = boatramp_core::project_export::ImportOptions {
+        apply: q.apply,
+        force: q.force,
+        allow_schema_skew: q.allow_schema_skew,
+    };
+    let res = cap.import(&q.project, &tmp, opts).await;
+    let _ = tokio::fs::remove_file(&tmp).await;
+    match res {
+        Ok(report) => (StatusCode::OK, Json(report)).into_response(),
+        Err(boatramp_core::project_export::ProjectExportError::SchemaSkew(dbs)) => (
+            StatusCode::CONFLICT,
+            format!(
+                "project import: schema SKEW for {dbs:?} — the target's migrated schema differs \
+                 from the source bundle; re-send with `?allow_schema_skew=true` only if you \
+                 intend to load the data anyway\n"
+            ),
+        )
+            .into_response(),
+        Err(boatramp_core::project_export::ProjectExportError::Commingle(m)) => {
+            (StatusCode::CONFLICT, format!("{m}\n")).into_response()
+        }
+        Err(boatramp_core::project_export::ProjectExportError::Unavailable(m)) => {
+            (StatusCode::NOT_IMPLEMENTED, format!("{m}\n")).into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("project import failed: {e}\n"),
+        )
+            .into_response(),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Persistent-volume management (`GET /api/compute/volumes`,
 // `DELETE /api/compute/volumes/{name}`)
 // ---------------------------------------------------------------------------

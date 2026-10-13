@@ -642,6 +642,15 @@ impl Right {
             // project-scoped matcher, so a project-scoped token can never satisfy them.
             "/api/kv-export" => Self::new(Resource::System, None, Action::Admin),
             "/api/kv-import" => Self::new(Resource::System, None, Action::Admin),
+            // Native project export/import (env-clone, `POST /api/project-export` / `POST
+            // /api/project-import`): a node-GLOBAL op that moves a project's LIVE tenant data —
+            // managed-DB dumps, the control-plane KV slice, blobs — between environments. Gated
+            // `System·Admin` EXPLICITLY (never a per-project right): an export streams real data
+            // out and an import writes/overlays it. Same hyphenated-path collision-avoidance as the
+            // kv-* arms (the SINGULAR path never matches a `/api/<family>/*` project matcher), and
+            // re-checked defense-in-depth at each handler.
+            "/api/project-export" => Self::new(Resource::System, None, Action::Admin),
+            "/api/project-import" => Self::new(Resource::System, None, Action::Admin),
             // The structured blob transition-mode state (`GET /api/blob-status`, v0.6.4): whether a
             // read-fallback secondary is attached (the node is mid-migration). A READ-only node
             // status — the same grade as `/api/sites` / `/api/metrics` — so `system·read` (never a

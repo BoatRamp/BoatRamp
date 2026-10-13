@@ -69,12 +69,18 @@ default = [
   "cluster",
   "operator",
   "mcp",
+  "project-export",
 ]
 # The read-fallback composite (blob-backend migration Part 2): `[serve.blob_fallback]` wraps
 # `FallbackStorage` over the built primary. Generic (no cloud dep of its own), so each blob-backend
 # feature turns it on and it rides along with any backend the binary can build.
 fallback = ["boatramp-node/fallback"]
 fs = ["boatramp-storage/fs", "boatramp-node/fs", "fallback"]
+# Native project export/import (env-clone): turns on the server-side driver
+# (`boatramp-node/project-export`, which implies sql-postgres + fs). The CLI
+# `project export|import` client verbs are always built (thin HTTP clients); this
+# gates the SERVE-side capability that answers `/api/project-{export,import}`.
+project-export = ["sql-postgres", "fs", "boatramp-node/project-export"]
 s3 = ["boatramp-storage/s3", "boatramp-node/s3", "fallback"]
 gcs = ["boatramp-storage/gcs", "boatramp-node/gcs", "fallback"]
 azure = ["boatramp-storage/azure", "boatramp-node/azure", "fallback"]

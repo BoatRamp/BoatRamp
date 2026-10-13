@@ -117,6 +117,39 @@ enum ProjectCommand {
     /// secrets` env store. Mutating verbs need `Secrets·Write`; `ls` needs `Secrets·Read`.
     #[command(name = "tenant-secrets")]
     TenantSecrets(crate::project_tenant_secrets::TenantSecretsArgs),
+    /// Export a project's data (managed DB dumps + the control-plane KV slice + blobs)
+    /// to a portable BRPROJ bundle, streamed from the RUNNING node (`System·Admin`).
+    Export {
+        /// The project to export.
+        name: String,
+        /// Write the bundle to this file.
+        #[arg(long)]
+        out: std::path::PathBuf,
+        /// Export a FULL bundle (schema + data). Default: `--data-only` (app data only —
+        /// no identity/RBAC/routing).
+        #[arg(long)]
+        full: bool,
+    },
+    /// Import a BRPROJ bundle into a project on the RUNNING node (`System·Admin`).
+    /// Dry-run (a plan, no mutation) unless `--apply`.
+    Import {
+        /// The project to import into.
+        name: String,
+        /// The bundle file to import.
+        #[arg(long = "in", value_name = "FILE")]
+        input: std::path::PathBuf,
+        /// Execute the import (default: a dry-run plan — mutate nothing).
+        #[arg(long)]
+        apply: bool,
+        /// Overlay a non-empty control-plane KV destination (the commingle override; only
+        /// meaningful for a FULL bundle).
+        #[arg(long)]
+        force: bool,
+        /// Proceed despite a Postgres schema-ledger fingerprint mismatch between the
+        /// bundle and the target.
+        #[arg(long)]
+        allow_schema_skew: bool,
+    },
 }
 
 /// Whether a `--force` confirmation `typed` at the prompt authorizes deleting
@@ -516,6 +549,32 @@ pub async fn run(args: ProjectArgs, config: &ProjectConfig) -> Result<()> {
         }
         ProjectCommand::Repair(rargs) => {
             crate::project_repair::run(rargs, &cp).await?;
+        }
+        ProjectCommand::Export { name, out, full } => {
+            cp.project_export(&name, !full, &out).await?;
+            println!(
+                "exported project `{name}` ({}) -> {}",
+                if full { "full" } else { "data-only" },
+                out.display()
+            );
+        }
+        ProjectCommand::Import {
+            name,
+            input,
+            apply,
+            force,
+            allow_schema_skew,
+        } => {
+            let report = cp
+                .project_import(&name, &input, apply, force, allow_schema_skew)
+                .await?;
+            if !apply {
+                println!("project import DRY-RUN (no mutation; re-run with --apply):");
+            }
+            print!("{report}");
+            if !report.ends_with('\n') {
+                println!();
+            }
         }
         ProjectCommand::TenantSecrets(tsargs) => {
             crate::project_tenant_secrets::run(tsargs, &cp).await?;

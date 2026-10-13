@@ -53,6 +53,7 @@ pub fn router_with_fast(
     let managed_db_declare_cap = options.managed_db_declare.clone();
     let tenant_deprovisioner_cap = options.tenant_deprovisioner.clone();
     let compute_exec_cap = options.compute_exec.clone();
+    let project_export_cap = options.project_export.clone();
     let compute_volumes_cap = options.compute_volumes.clone();
     let compute_control_cap = options.compute_control.clone();
     // The project-scoped internal secret store (`None` when no `[secrets]` envelope
@@ -389,6 +390,11 @@ pub fn router_with_fast(
         // Admin-scoped (deny-safe `Right::required` default for `/api/compute/*`)
         // AND gated at the handler by the `allow_compute_exec` posture.
         .route("/api/compute/{name}/exec", post(compute_exec))
+        // Native project export/import (env-clone): stream a project's BRPROJ bundle out,
+        // or import one in. System·Admin (the SINGULAR hyphen paths never match a
+        // `/api/<family>/*` project matcher) + re-checked defense-in-depth at the handler.
+        .route("/api/project-export", post(project_export))
+        .route("/api/project-import", post(project_import))
         // Operator SQL to a managed co-located database: run a migration script or a
         // single query via the sealed managed credential (resolved server-side).
         // Admin-scoped (deny-safe `Right::required` default for `/api/sql/*`).
@@ -666,6 +672,7 @@ pub fn router_with_fast(
         .layer(Extension(managed_db_declare_cap))
         .layer(Extension(tenant_deprovisioner_cap))
         .layer(Extension(compute_exec_cap))
+        .layer(Extension(project_export_cap))
         .layer(Extension(compute_volumes_cap))
         .layer(Extension(compute_control_cap))
         .layer(Extension(secret_store_cap))
