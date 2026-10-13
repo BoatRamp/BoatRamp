@@ -55,6 +55,7 @@ pub mod migrate;
 pub mod mode;
 pub mod orm;
 pub mod project;
+pub mod redact;
 pub mod secret_store;
 /// The duplex/resumable session delivery-semantics model (Stage 1 of `PLAN-session-primitive`).
 pub mod session;

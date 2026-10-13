@@ -871,9 +871,11 @@ impl ComputeBackend for DockerBackend {
             Ok(Ok(code)) => Ok(code),
             Ok(Err(e)) if stderr_buf.is_empty() => Err(e),
             Ok(Err(e)) => {
-                // A bounded stderr tail aids diagnosis. The DSN never appears here: it
-                // rode in `env`, and the client tools do not echo it to stderr.
-                let tail = String::from_utf8_lossy(&stderr_buf);
+                // A bounded stderr tail aids diagnosis. The credential rode in `env`,
+                // not in a string, so it cannot reach here — but run the tail through
+                // the DSN redactor anyway (defense-in-depth) so a client tool that ever
+                // echoed a connection string could not leak it into this error.
+                let tail = boatramp_core::redact::redact_dsn(&String::from_utf8_lossy(&stderr_buf));
                 Err(BackendError::Other(format!("{e}; stderr: {tail}")))
             }
         }
