@@ -255,6 +255,15 @@ jobs:
       - name: Test (musl)
         run: cargo-zigbuild test --target x86_64-unknown-linux-musl --workspace --no-default-features --features boatramp/fs,boatramp/slatedb
 
+      # Minimal lean config: the boatramp binary with ONLY `fs` (NO KV-backend feature).
+      # This combo regressed once (v0.31.0): `serve::Error`'s `Kv(#[from] KvError)` variant was
+      # gated on `slatedb`/`cloudflare-kv`, so `From<KvError>` vanished while the serve/assemble
+      # path still `?`-converts a KvError → E0277. It compiled fine under `--all-features` and was
+      # caught only by the nightly `capability.yml`. Build it at the MERGE gate so a feature-combo
+      # compile break in a supported lean config can't ship green again.
+      - name: Minimal feature build (boatramp --features fs, no KV backend)
+        run: cargo-zigbuild build --target x86_64-unknown-linux-musl -p boatramp --no-default-features --features fs
+
       # Uniform db-name parameter screening (v0.5.0): the cross-surface consistency
       # guard must actually RUN — a silent skip is not evidence. Run the integration
       # test with `--nocapture` and assert its gate marker, so a `#[cfg]`/rename that
