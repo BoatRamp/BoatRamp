@@ -20,7 +20,8 @@ use boatramp_core::compute::{
 };
 use bollard::Docker;
 use bollard::container::{
-    Config, CreateContainerOptions, LogOutput, RemoveContainerOptions, StopContainerOptions,
+    AttachContainerOptions, Config, CreateContainerOptions, KillContainerOptions, LogOutput,
+    RemoveContainerOptions, StopContainerOptions, WaitContainerOptions,
 };
 use bollard::exec::{CreateExecOptions, StartExecResults};
 use bollard::image::CreateImageOptions;
@@ -426,28 +427,7 @@ impl ComputeBackend for DockerBackend {
                 ));
             }
         };
-        // Split the reference into `from_image` + `tag`, defaulting an untagged
-        // reference to `:latest`. Without a tag the daemon's `fromImage=<name>` (no
-        // `tag`) pulls **every** tag of the repo -- which is slow and 501s on any
-        // repo that still has an ancient v1-manifest tag. A digest-pinned reference
-        // is passed whole (no tag).
-        let (from_image, tag) = image_pull_target(&reference);
-        let options = CreateImageOptions {
-            from_image: from_image.clone(),
-            tag: tag.clone(),
-            ..Default::default()
-        };
-        let mut pull = self.docker.create_image(Some(options), None, None);
-        while let Some(step) = pull.next().await {
-            step.map_err(|e| BackendError::Materialize(format!("pull {reference}: {e}")))?;
-        }
-        // Record the fully-qualified reference actually pulled, so `launch` runs the
-        // exact tag (not the bare, all-tags-ambiguous name).
-        let reference = if tag.is_empty() {
-            reference
-        } else {
-            format!("{from_image}:{tag}")
-        };
+        let reference = self.pull_image(&reference).await?;
         Ok(Artifact::Image { reference })
     }
 
@@ -707,9 +687,252 @@ impl ComputeBackend for DockerBackend {
             stderr,
         })
     }
+
+    async fn run_ephemeral(
+        &self,
+        image: &str,
+        argv: &[String],
+        env: &[(String, String)],
+        stdin: Option<&[u8]>,
+        stdout: &mut (dyn futures::io::AsyncWrite + Send + Unpin),
+    ) -> Result<i32, BackendError> {
+        // `input` (bollard's stdin writer) is a tokio writer; the caller's `stdout`
+        // sink is a std-agnostic `futures` writer. Both extension traits are in scope.
+        use futures::io::AsyncWriteExt as FuturesWriteExt;
+        use tokio::io::AsyncWriteExt as TokioWriteExt;
+
+        if argv.is_empty() {
+            return Err(BackendError::Other("run_ephemeral: empty argv".into()));
+        }
+
+        // Pull the client image (pg_dump/pg_restore/psql live here).
+        let reference = self.pull_image(image).await?;
+
+        // Hardened one-shot: dropped caps, read-only root, no-new-privileges, PID cap,
+        // auto-removed on exit, and NO published port — it only needs network egress to
+        // reach the database, which the daemon bridge NATs out of the box.
+        let mut host_config = hardened_host_config(512, 1, RestartPolicy::Never, false, &[]);
+        host_config.auto_remove = Some(true);
+
+        let env_strings: Vec<String> = env.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        let config = Config {
+            image: Some(reference),
+            cmd: Some(argv.to_vec()),
+            env: Some(env_strings),
+            host_config: Some(host_config),
+            attach_stdin: Some(stdin.is_some()),
+            attach_stdout: Some(true),
+            attach_stderr: Some(true),
+            open_stdin: Some(stdin.is_some()),
+            stdin_once: Some(stdin.is_some()),
+            ..Default::default()
+        };
+
+        let name = ephemeral_container_name();
+        let created = self
+            .docker
+            .create_container(
+                Some(CreateContainerOptions {
+                    name: name.clone(),
+                    platform: None,
+                }),
+                config,
+            )
+            .await
+            .map_err(|e| BackendError::Other(format!("ephemeral create: {e}")))?;
+
+        // Attach BEFORE start so no output is missed, requesting a live bidirectional
+        // stream.
+        let attach = self
+            .docker
+            .attach_container(
+                &created.id,
+                Some(AttachContainerOptions::<String> {
+                    stdin: Some(stdin.is_some()),
+                    stdout: Some(true),
+                    stderr: Some(true),
+                    stream: Some(true),
+                    logs: Some(false),
+                    detach_keys: None,
+                }),
+            )
+            .await
+            .map_err(|e| BackendError::Other(format!("ephemeral attach: {e}")))?;
+        let mut output = attach.output;
+        let mut input = attach.input;
+
+        // The wait stream is lazy — its request is sent on first poll, which happens
+        // inside the join below, concurrently with the drain and BEFORE the
+        // auto-removed container can vanish, so the exit code is never lost to the race.
+        let mut wait = Box::pin(
+            self.docker
+                .wait_container(&created.id, None::<WaitContainerOptions<String>>),
+        );
+
+        self.docker
+            .start_container::<String>(&created.id, None)
+            .await
+            .map_err(|e| BackendError::Other(format!("ephemeral start: {e}")))?;
+
+        // Feed stdin, stream stdout to the sink, and await the exit code — all
+        // concurrently, bounded by a backstop timeout. Feeding stdin alongside the
+        // drain avoids a full-pipe deadlock on a large piped restore.
+        let mut stderr_buf: Vec<u8> = Vec::new();
+        let run = async {
+            let writer =
+                async {
+                    if let Some(bytes) = stdin {
+                        input.write_all(bytes).await.map_err(|e| {
+                            BackendError::Other(format!("ephemeral stdin write: {e}"))
+                        })?;
+                        input.flush().await.map_err(|e| {
+                            BackendError::Other(format!("ephemeral stdin flush: {e}"))
+                        })?;
+                    }
+                    // Half-close stdin so the command sees EOF (also when there was none).
+                    input
+                        .shutdown()
+                        .await
+                        .map_err(|e| BackendError::Other(format!("ephemeral stdin close: {e}")))?;
+                    Ok::<(), BackendError>(())
+                };
+            let reader = async {
+                while let Some(chunk) = output.next().await {
+                    match chunk
+                        .map_err(|e| BackendError::Other(format!("ephemeral output: {e}")))?
+                    {
+                        // TRUE streaming: write each stdout chunk straight to the sink,
+                        // never buffering the (multi-GB) payload in memory.
+                        LogOutput::StdOut { message } => {
+                            stdout.write_all(&message).await.map_err(|e| {
+                                BackendError::Other(format!("ephemeral sink write: {e}"))
+                            })?;
+                        }
+                        LogOutput::StdErr { message } | LogOutput::Console { message } => {
+                            if stderr_buf.len() < EPHEMERAL_STDERR_CAP {
+                                let take =
+                                    (EPHEMERAL_STDERR_CAP - stderr_buf.len()).min(message.len());
+                                stderr_buf.extend_from_slice(&message[..take]);
+                            }
+                        }
+                        LogOutput::StdIn { .. } => {}
+                    }
+                }
+                stdout
+                    .flush()
+                    .await
+                    .map_err(|e| BackendError::Other(format!("ephemeral sink flush: {e}")))?;
+                Ok::<(), BackendError>(())
+            };
+            let waiter = async {
+                match wait.next().await {
+                    Some(Ok(resp)) => Ok::<i32, BackendError>(resp.status_code as i32),
+                    // bollard maps a NON-ZERO exit to this error — it is a legitimate
+                    // exit code (e.g. pg_restore flagging a failed object), returned as-is.
+                    Some(Err(bollard::errors::Error::DockerContainerWaitError {
+                        code, ..
+                    })) => Ok(code as i32),
+                    Some(Err(e)) => Err(BackendError::Other(format!("ephemeral wait: {e}"))),
+                    None => Ok(0),
+                }
+            };
+            let (w, r, code) = tokio::join!(writer, reader, waiter);
+            w?;
+            r?;
+            code
+        };
+
+        let outcome = tokio::time::timeout(EPHEMERAL_RUN_TIMEOUT, run).await;
+
+        // Cleanup: auto_remove should already reap it, but kill-on-timeout +
+        // best-effort force-remove guarantee no leaked container or host-port/PID hold.
+        if outcome.is_err() {
+            let _ = self
+                .docker
+                .kill_container(&name, None::<KillContainerOptions<String>>)
+                .await;
+        }
+        let _ = self
+            .docker
+            .remove_container(
+                &name,
+                Some(RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await;
+
+        match outcome {
+            Err(_) => Err(BackendError::Other(format!(
+                "ephemeral run timed out after {}s (killed)",
+                EPHEMERAL_RUN_TIMEOUT.as_secs()
+            ))),
+            Ok(Ok(code)) => Ok(code),
+            Ok(Err(e)) if stderr_buf.is_empty() => Err(e),
+            Ok(Err(e)) => {
+                // A bounded stderr tail aids diagnosis. The DSN never appears here: it
+                // rode in `env`, and the client tools do not echo it to stderr.
+                let tail = String::from_utf8_lossy(&stderr_buf);
+                Err(BackendError::Other(format!("{e}; stderr: {tail}")))
+            }
+        }
+    }
+}
+
+/// A generous wall-clock backstop for a single `run_ephemeral` invocation. The real
+/// "unreachable DSN" hang is bounded far tighter by the client's own connect timeout
+/// (the driver sets `connect_timeout` in the DSN), so this exists only to guarantee a
+/// wedged daemon / stuck stream can never pin a container (and the host port/PID budget)
+/// forever. Deliberately large so a legitimate multi-hour dump of a big database is not
+/// killed mid-flight.
+const EPHEMERAL_RUN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(6 * 3600);
+
+/// Cap on captured stderr from an ephemeral run (diagnostics only — stdout is the
+/// streamed payload). Bounds memory if a failing client floods stderr.
+const EPHEMERAL_STDERR_CAP: usize = 64 * 1024;
+
+/// A monotonic suffix so two concurrent ephemeral runs never collide on a container
+/// name (the daemon rejects a duplicate name). Combined with the process-start nanos.
+static EPHEMERAL_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A unique, daemon-safe container name for a one-shot ephemeral run.
+fn ephemeral_container_name() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let seq = EPHEMERAL_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("boatramp-ephemeral-{nanos}-{seq}")
 }
 
 impl DockerBackend {
+    /// Pull `reference` from its registry (reused by `materialize` and the one-shot
+    /// `run_ephemeral` client pull) and return the fully-qualified reference actually
+    /// pulled.
+    ///
+    /// Split the reference into `from_image` + `tag`, defaulting an untagged reference
+    /// to `:latest`. Without a tag the daemon's `fromImage=<name>` (no `tag`) pulls
+    /// **every** tag of the repo — slow, and 501s on any repo that still carries an
+    /// ancient v1-manifest tag. A digest-pinned reference is passed whole (no tag).
+    async fn pull_image(&self, reference: &str) -> Result<String, BackendError> {
+        let (from_image, tag) = image_pull_target(reference);
+        let options = CreateImageOptions {
+            from_image: from_image.clone(),
+            tag: tag.clone(),
+            ..Default::default()
+        };
+        let mut pull = self.docker.create_image(Some(options), None, None);
+        while let Some(step) = pull.next().await {
+            step.map_err(|e| BackendError::Materialize(format!("pull {reference}: {e}")))?;
+        }
+        Ok(if tag.is_empty() {
+            reference.to_string()
+        } else {
+            format!("{from_image}:{tag}")
+        })
+    }
+
     /// The container's primary IPv4 address (the default bridge, or the first
     /// network it's attached to).
     async fn container_ip(&self, id: &str) -> Result<String, BackendError> {
@@ -971,6 +1194,19 @@ mod tests {
             serde_json::from_str::<DockerVolumeMode>("\"bind\"").unwrap(),
             DockerVolumeMode::Bind
         );
+    }
+
+    #[test]
+    fn ephemeral_container_name_is_unique_and_prefixed() {
+        let a = ephemeral_container_name();
+        let b = ephemeral_container_name();
+        // Prefixed so it never collides with a workload container (`boatramp-<id>`)
+        // and is recognizable as a one-shot.
+        assert!(a.starts_with("boatramp-ephemeral-"), "got {a}");
+        assert!(b.starts_with("boatramp-ephemeral-"), "got {b}");
+        // The monotonic sequence guarantees two back-to-back names never collide, even
+        // within the same nanosecond — the daemon rejects a duplicate name.
+        assert_ne!(a, b);
     }
 
     #[test]
