@@ -176,6 +176,11 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
         node_id,
         worker_exe,
     } = input;
+    // Keep a clone of the node blob storage for the project-export driver (it copies the
+    // project's blob prefix in/out via `blob_migrate`), captured before `storage` is
+    // moved into the handler runtime below.
+    #[cfg(feature = "project-export")]
+    let export_blobs = storage.clone();
     // Copy out the posture scalars up front so `options` can be moved into the
     // returned `RunningNode` without a lingering borrow.
     let max_handler_blob_bytes = options.posture.max_handler_blob_bytes;
@@ -460,6 +465,12 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
     // every persisted replica's `(workload, replica, endpoint-ip)`; each backend keeps
     // only the IPs in its own subnet (a cheap no-op for docker/cloudflare/VMM).
     crate::compute::adopt_running_replica_ips(&deploy, &compute_backends).await;
+    // Capture the docker backend for the project-export driver BEFORE `compute_backends`
+    // is consumed by the reconcile loop below (a cheap `Arc` clone; `None` ⇒ no docker
+    // daemon, so the export driver is not wired).
+    #[cfg(feature = "project-export")]
+    let export_docker_backend: Option<Arc<dyn boatramp_core::compute::ComputeBackend>> =
+        compute_backends.get("docker").cloned();
     // Per-project internal DNS (service discovery): start the resolver on the bridge
     // gateway so a guest resolves peers by name within its project. On by default;
     // starts only when the container backend + bridge are up (Linux). Detached for
@@ -536,6 +547,11 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
     // envelope; wired only when one is present (fail-closed like every managed-DB path).
     #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
     let declare_envelope = secrets_envelope.clone();
+    // …and a clone for the project-export driver (it unseals managed-DB credentials to
+    // assemble the dump/restore connection). Captured here before the resolver match
+    // moves the original.
+    #[cfg(feature = "project-export")]
+    let export_envelope = secrets_envelope.clone();
     #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
     let managed_db_resolver: Option<Arc<dyn boatramp_core::compute::ManagedDbEnvResolver>> = match (
         config
@@ -827,9 +843,56 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
         DOMAIN_VERIFY_RECONCILE_TICK,
     );
 
+    // Native project export/import capability (env-clone) — wired only when a managed
+    // SQL binding, a secrets envelope, the docker backend, and the operator-SQL seam are
+    // ALL present (the deps the driver needs). `None` otherwise ⇒ the routes return 501.
+    #[cfg(feature = "project-export")]
+    let project_export_cap: Option<Arc<dyn boatramp_core::project_export::ProjectExport>> = {
+        let sql = config
+            .handlers
+            .as_ref()
+            .and_then(|h| h.bindings.sql.as_ref())
+            .filter(|s| !s.databases.is_empty());
+        match (
+            sql,
+            export_envelope,
+            export_docker_backend,
+            operator_sql.clone(),
+        ) {
+            (Some(sql), Some(envelope), Some(backend), Some(op)) => {
+                let published = config
+                    .compute
+                    .as_ref()
+                    .map(|c| {
+                        matches!(
+                            c.docker_endpoint,
+                            boatramp_docker::DockerEndpoint::Published
+                        )
+                    })
+                    .unwrap_or(true);
+                Some(Arc::new(crate::project_export::NodeProjectExport::new(
+                    sql.databases.clone(),
+                    deploy.clone(),
+                    kv.clone(),
+                    envelope,
+                    export_blobs,
+                    backend,
+                    published,
+                    op,
+                    data_dir.join("project-export"),
+                ))
+                    as Arc<dyn boatramp_core::project_export::ProjectExport>)
+            }
+            _ => None,
+        }
+    };
+    #[cfg(not(feature = "project-export"))]
+    let project_export_cap: Option<Arc<dyn boatramp_core::project_export::ProjectExport>> = None;
+
     // Wire the operator capabilities onto the options the router is built from.
     let mut options = options;
     options.operator_sql = operator_sql;
+    options.project_export = project_export_cap;
     options.migration_substrate = migration_substrate;
     options.tenant_repair = tenant_repair;
     options.managed_db_declare = managed_db_declare;

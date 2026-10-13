@@ -845,6 +845,108 @@ impl ControlPlane {
         }
     }
 
+    /// Export a project to a `BRPROJ` bundle (`POST /api/project-export`, `System·Admin`),
+    /// STREAMING the response body to `out` (written to a `.part` sibling then renamed, so a
+    /// partial download never masquerades as a complete bundle). `data_only` selects the
+    /// app-data-only bundle vs full schema+data.
+    pub async fn project_export(
+        &self,
+        project: &str,
+        data_only: bool,
+        out: &std::path::Path,
+    ) -> Result<()> {
+        use futures::StreamExt;
+        use tokio::io::AsyncWriteExt;
+        let Self {
+            http: client,
+            base: server,
+            ..
+        } = self;
+        let resp = client
+            .post(format!("{server}/api/project-export"))
+            .query(&[
+                ("project", project),
+                ("data_only", if data_only { "true" } else { "false" }),
+            ])
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ClientError::Refused(format!(
+                "project export refused ({status}): {}",
+                body.trim_end()
+            )));
+        }
+        let tmp = std::path::PathBuf::from(format!("{}.part", out.display()));
+        let mut f = tokio::fs::File::create(&tmp)
+            .await
+            .map_err(|e| ClientError::Refused(format!("cannot create {}: {e}", tmp.display())))?;
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            f.write_all(&chunk)
+                .await
+                .map_err(|e| ClientError::Refused(format!("write {}: {e}", tmp.display())))?;
+        }
+        f.flush()
+            .await
+            .map_err(|e| ClientError::Refused(format!("flush {}: {e}", tmp.display())))?;
+        drop(f);
+        tokio::fs::rename(&tmp, out)
+            .await
+            .map_err(|e| ClientError::Refused(format!("finalize bundle {}: {e}", out.display())))?;
+        Ok(())
+    }
+
+    /// Import a `BRPROJ` bundle into a project (`POST /api/project-import`, `System·Admin`),
+    /// STREAMING `bundle` as the request body. Returns the server's report text (JSON). A
+    /// non-2xx — `409` schema-skew / KV-commingle refusal, `501` no driver — is surfaced
+    /// verbatim as [`ClientError::Refused`].
+    pub async fn project_import(
+        &self,
+        project: &str,
+        bundle: &std::path::Path,
+        apply: bool,
+        force: bool,
+        allow_schema_skew: bool,
+    ) -> Result<String> {
+        let Self {
+            http: client,
+            base: server,
+            ..
+        } = self;
+        let file = tokio::fs::File::open(bundle)
+            .await
+            .map_err(|e| ClientError::Refused(format!("cannot open {}: {e}", bundle.display())))?;
+        let body = reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(file));
+        let resp = client
+            .post(format!("{server}/api/project-import"))
+            .query(&[
+                ("project", project),
+                ("apply", if apply { "true" } else { "false" }),
+                ("force", if force { "true" } else { "false" }),
+                (
+                    "allow_schema_skew",
+                    if allow_schema_skew { "true" } else { "false" },
+                ),
+            ])
+            .header("content-type", "application/octet-stream")
+            .body(body)
+            .send()
+            .await?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if status.is_success() {
+            Ok(text)
+        } else {
+            Err(ClientError::Refused(format!(
+                "project import refused ({status}): {}",
+                text.trim_end()
+            )))
+        }
+    }
+
     /// Trigger a schema-migration `verb` (`apply` / `dry-run` / `baseline`) over an
     /// already-uploaded step-set bundle (`POST /api/{seg}/migrate/{db}/{verb}`;
     /// `Project·Admin`). A step failure comes back as `422` whose body is still a valid
