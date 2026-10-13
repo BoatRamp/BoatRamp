@@ -610,19 +610,26 @@ impl ProjectExport for NodeProjectExport {
         tokio::fs::create_dir_all(&stage).await.map_err(other)?;
         let mut staged: Vec<StagedMember> = Vec::new();
 
-        // --- control-plane KV slice (always) ---
-        self.deploy.checkpoint().await.map_err(other)?;
-        let kv_bytes = boatramp_core::kv_dump::export_to_bytes(self.kv.as_ref(), created_at)
-            .await
-            .map_err(other)?;
-        let kv_path = stage.join("kv.brkvdump");
-        tokio::fs::write(&kv_path, &kv_bytes).await.map_err(other)?;
-        staged.push(StagedMember {
-            path: KV_MEMBER_PATH.to_string(),
-            kind: MemberKind::Kv,
-            source: kv_path,
-            pg: None,
-        });
+        // --- control-plane KV slice (FULL export only) ---
+        // A `--data-only` bundle carries application data (pg/mysql rows + libsql + blobs)
+        // ONLY — never the control-plane KV slice (RBAC, routing, personas, sealed
+        // secrets). Staging it here even for data-only would physically place
+        // identity/RBAC/secret bytes inside a "data-only" artifact (a cross-environment
+        // leak), even though the import side skips restoring it. Fail safe: don't stage it.
+        if !data_only {
+            self.deploy.checkpoint().await.map_err(other)?;
+            let kv_bytes = boatramp_core::kv_dump::export_to_bytes(self.kv.as_ref(), created_at)
+                .await
+                .map_err(other)?;
+            let kv_path = stage.join("kv.brkvdump");
+            tokio::fs::write(&kv_path, &kv_bytes).await.map_err(other)?;
+            staged.push(StagedMember {
+                path: KV_MEMBER_PATH.to_string(),
+                kind: MemberKind::Kv,
+                source: kv_path,
+                pg: None,
+            });
+        }
 
         // --- per-engine dumps (pg + mysql; managed OR external bring-your-own-URL) ---
         for (db, cfg) in &self.databases {
