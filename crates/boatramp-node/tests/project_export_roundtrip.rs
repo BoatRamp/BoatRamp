@@ -19,7 +19,6 @@
 //! would surface here as a corrupt/short dump that fails the restore + the row check).
 #![cfg(feature = "project-export")]
 
-use std::path::Path;
 use std::sync::Arc;
 
 use boatramp_core::compute::{ComputeBackend, pg_client_image_for_server_version};
