@@ -37,14 +37,31 @@ Therefore **`--include-identity` transports the KEK (+ the on-disk sealed key fi
   source-sealed artifacts unwrap") holds *for free*, by construction. The operator then
   re-provisions (managed-pg credential, secrets) under the target's own identity.
 
+## Two modes, period (owner, 2026-10-14)
+
+There is NO sharing of one key across *distinct* environments (prod + preview on one key is
+bad hygiene — a compromise of the weaker env unseals the stronger one). The import has
+exactly two legitimate modes:
+
+- **`adopt` = backup/recovery of the SAME environment.** The same key is reused *because it is
+  the same environment* being restored onto new hardware. Local: install the KEK the bundle
+  carries. Vault: the recovered node is wired to the same KMS key (nothing to carry). This is
+  the construens "faithful clone — sealed creds unwrap, tokens stay valid" case, understood as
+  recovery.
+- **`fresh` = a DIFFERENT environment.** Different environment ⇒ different key ⇒ adopt is
+  impossible ⇒ fresh is enforced: the target mints its own KEK and source-sealed secrets are
+  dropped (clean target, re-provision).
+
 ## Envelope-type branches (`[secrets].envelope`)
 
 - **`local`** (the `secrets/kek` file): KEK is 32 transportable bytes. `--include-identity`
-  supported. adopt installs it as the target's `secrets/kek`.
+  supported; adopt installs it as the target's `secrets/kek` (recovery of the same env).
 - **`vault`**: the KEK lives in an external KMS and **never leaves Vault**. `--include-identity`
-  is **refused** with guidance: for a faithful clone, point the target's `[secrets.vault]` at
-  the *same* key (shared KMS) and import with `--identity adopt-external` (reuses the shared
-  Vault key, no KEK bytes in the bundle); otherwise use `--identity fresh`.
+  is **refused** (there is nothing extractable to carry; a KMS exists precisely so keys don't
+  leave it). A Vault **recovery** adopt simply restores onto a node already wired to the same
+  KMS key (the sealed secrets unseal because it is the same key); a different environment has a
+  different key ⇒ `fresh`. There is NO "adopt-external across environments" — that would be the
+  one-key-many-envs anti-pattern above.
 - **`none`**: nothing is sealed ⇒ `--include-identity` is a no-op/refused (nothing to carry).
 
 ## The transport container ("B" / PKCS#12-pattern)
@@ -94,14 +111,14 @@ first cut writes them and documents that they won't unseal. **Open Q — see bel
   KEK in the clear (grep the bytes); `adopt` on a bundle with no identity member ⇒ error;
   `adopt` with the wrong transport key ⇒ AEAD failure, no partial install.
 
-## Open questions for the owner
+## Resolved decisions (owner, 2026-10-14)
 
-1. **Transport passphrase supply** — `--transport-key-file` (recommended) vs an interactive
-   prompt vs env only. Recommend the key-file (scriptable, no-argv-leak).
-2. **`fresh` + source-sealed secrets** — write the inert ciphertext and document, or actively
-   **drop** `project/<p>/secret/*` (and the managed-pg credential) on a fresh import so the
-   target starts clean? Recommend **drop** (cleaner, and makes Ask-4(c) a positive "absent"
-   rather than "present-but-inert") — but it changes what a fresh clone looks like.
-3. **Vault adopt** — is a shared-KMS `adopt-external` (point both at the same Vault key) worth
-   building in this cut, or refuse Vault `--include-identity` entirely and support only
-   `fresh` for Vault nodes in 0.32.0?
+1. **Transport passphrase supply** — support **all three**, precedence
+   `--transport-key-file <0600 path>` → `BOATRAMP_EXPORT_TRANSPORT_KEY` env → interactive
+   prompt (fallback). Never argv.
+2. **`fresh` + source-sealed secrets** — **drop** them: a fresh import removes source-sealed
+   `project/<p>/secret/*` and the managed-pg credential so the target starts clean and
+   re-provisions. Makes Ask-4(c) a positive "absent," not "present-but-inert."
+3. **Vault** — refuse `--include-identity` on a Vault node (nothing extractable to carry).
+   Vault recovery = restore onto a node wired to the same KMS key; a different env ⇒ `fresh`.
+   No `adopt-external` / no one-key-many-envs. (See "Two modes, period".)
