@@ -102,13 +102,19 @@ pub fn pg_dump_invocation(conn: &PgConnection, data_only: bool) -> SqlInvocation
 
 /// Build the `pg_restore` invocation for an IMPORT (reads the custom-format dump from
 /// stdin). `--data-only` restores only the data into the target's existing migrated
-/// schema; `--exit-on-error` aborts loudly on the first failed object.
+/// schema; `--exit-on-error` aborts loudly on the first failed object. Unlike `psql`/
+/// `pg_dump`, `pg_restore` does NOT infer the target from `PGDATABASE` — without `-d`
+/// (restore into a database) or `-f` (emit a script) it refuses with "one of -d/--dbname
+/// and -f/--file must be specified"; so the target database is named with `-d` (the host/
+/// port/user/password still come from the env, and the db name is not a credential).
 pub fn pg_restore_invocation(conn: &PgConnection, data_only: bool) -> SqlInvocation {
     let mut argv = vec![
         "pg_restore".to_string(),
         "--no-owner".to_string(),
         "--no-privileges".to_string(),
         "--exit-on-error".to_string(),
+        "-d".to_string(),
+        conn.database.clone(),
     ];
     if data_only {
         argv.push("--data-only".to_string());
@@ -237,6 +243,21 @@ mod tests {
         let restore_full = pg_restore_invocation(&conn(), false);
         assert!(restore_do.argv.iter().any(|a| a == "--data-only"));
         assert!(!restore_full.argv.iter().any(|a| a == "--data-only"));
+        // pg_restore needs an explicit `-d <db>` target (it does NOT read PGDATABASE);
+        // without it the restore aborts "one of -d/--dbname and -f/--file must be
+        // specified". The db name follows the `-d` flag as its own argv element.
+        for inv in [&restore_do, &restore_full] {
+            let pos = inv
+                .argv
+                .iter()
+                .position(|a| a == "-d")
+                .expect("pg_restore argv must carry -d");
+            assert_eq!(
+                inv.argv.get(pos + 1).map(String::as_str),
+                Some(conn().database.as_str()),
+                "the target database must follow -d"
+            );
+        }
     }
 
     #[test]
