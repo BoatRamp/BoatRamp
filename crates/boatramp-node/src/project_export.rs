@@ -39,6 +39,7 @@ use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use boatramp_core::Storage;
 use boatramp_core::compute::{ComputeBackend, ReplicaPhase};
 use boatramp_core::deploy::DeployStore;
+use boatramp_core::env::EnvSource;
 use boatramp_core::envelope::KeyEnvelope;
 use boatramp_core::kv::KvStore;
 use boatramp_core::project::ProjectRef;
@@ -50,7 +51,10 @@ use boatramp_storage::sql_libsql::LibsqlSqlBackends;
 
 use crate::config::ExternalDatabaseConfig;
 use crate::managed_sql::{ManagedSqlCredentials, operator_target};
-use crate::pg_client::{PgConnection, pg_dump_invocation, pg_restore_invocation};
+use crate::pg_client::{
+    MysqlConnection, PgConnection, mysql_restore_invocation, mysqldump_invocation,
+    pg_dump_invocation, pg_restore_invocation,
+};
 use crate::project_bundle::{
     self, KV_MEMBER_PATH, MemberKind, PgMemberInfo, SourceInfo, StagedMember,
 };
@@ -88,6 +92,37 @@ fn kind_is_libsql(kind: &str) -> bool {
     )
 }
 
+/// Whether a binding `kind` names MySQL/MariaDB (MariaDB is detected + refused later by
+/// the version banner, not the kind string).
+fn kind_is_mysql(kind: &str) -> bool {
+    matches!(kind.to_ascii_lowercase().as_str(), "mysql" | "mariadb")
+}
+
+/// Parse a `postgres://` / `mysql://` DSN into `(user, password, host, port, database)`
+/// for an EXTERNAL (bring-your-own-URL) binding. Best-effort for the standard shape; the
+/// password is split on the FIRST `:` so a `:`-bearing password survives. `None` for a
+/// shape we don't recognize (the caller then refuses rather than misconnect).
+fn parse_sql_url(url: &str) -> Option<(String, String, String, u16, String)> {
+    let (scheme, rest) = url.split_once("://")?;
+    let default_port = match scheme {
+        "postgres" | "postgresql" => 5432,
+        "mysql" | "mariadb" => 3306,
+        _ => return None,
+    };
+    let (userinfo, hostpart) = rest.rsplit_once('@')?;
+    let (user, password) = match userinfo.split_once(':') {
+        Some((u, p)) => (u.to_string(), p.to_string()),
+        None => (userinfo.to_string(), String::new()),
+    };
+    let (hostport, db) = hostpart.split_once('/')?;
+    let db = db.split(['?', '&']).next().unwrap_or(db).to_string();
+    let (host, port) = match hostport.rsplit_once(':') {
+        Some((h, p)) => (h.to_string(), p.parse().ok()?),
+        None => (hostport.to_string(), default_port),
+    };
+    Some((user, password, host, port, db))
+}
+
 /// The bundle member path for a Postgres database dump.
 fn pg_member_path(db: &str) -> String {
     format!("sql/{db}.pgc")
@@ -97,6 +132,17 @@ fn pg_member_path(db: &str) -> String {
 fn db_from_pg_member(path: &str) -> Option<&str> {
     path.strip_prefix("sql/")
         .and_then(|s| s.strip_suffix(".pgc"))
+}
+
+/// The bundle member path for a MySQL database dump.
+fn mysql_member_path(db: &str) -> String {
+    format!("sql/{db}.sql")
+}
+
+/// Recover the database name from a `sql/<db>.sql` member path.
+fn db_from_mysql_member(path: &str) -> Option<&str> {
+    path.strip_prefix("sql/")
+        .and_then(|s| s.strip_suffix(".sql"))
 }
 
 /// The bundle member path for a site's default libsql database.
@@ -198,6 +244,9 @@ pub struct NodeProjectExport {
     /// The operator-SQL seam used to version-detect (`SHOW server_version_num` /
     /// `SELECT VERSION()`) + fingerprint the schema ledger. `None` ⇒ no pg/mysql path.
     operator_sql: Option<Arc<dyn boatramp_core::sql::OperatorSql>>,
+    /// Host-env source for an EXTERNAL binding's `url_env` lookup. Production is
+    /// [`SystemEnv`](boatramp_core::env::SystemEnv); a test injects a map.
+    env_source: Arc<dyn EnvSource>,
     published_endpoint: bool,
     work_dir: PathBuf,
     connect_timeout_secs: u32,
@@ -223,10 +272,19 @@ impl NodeProjectExport {
             backend: None,
             envelope: None,
             operator_sql: None,
+            env_source: Arc::new(boatramp_core::env::SystemEnv),
             published_endpoint: true,
             work_dir,
             connect_timeout_secs: 10,
         }
+    }
+
+    /// Replace the host-env source (for an external binding's `url_env`). Tests inject a
+    /// map; production keeps [`SystemEnv`](boatramp_core::env::SystemEnv).
+    #[must_use]
+    pub fn with_env_source(mut self, env_source: Arc<dyn EnvSource>) -> Self {
+        self.env_source = env_source;
+        self
     }
 
     /// Attach the pg/mysql ephemeral-dump context: the compute backend that runs the
@@ -258,40 +316,89 @@ impl NodeProjectExport {
         self
     }
 
-    /// The pg/mysql context (compute backend + envelope + operator-SQL), or a clear
-    /// `Unavailable` error when the node has no managed-SQL/compute context.
-    fn pg_ctx(
-        &self,
-    ) -> Result<
-        (
-            &Arc<dyn ComputeBackend>,
-            &Arc<dyn KeyEnvelope>,
-            &Arc<dyn boatramp_core::sql::OperatorSql>,
-        ),
-        Perr,
-    > {
-        match (&self.backend, &self.envelope, &self.operator_sql) {
-            (Some(b), Some(e), Some(o)) => Ok((b, e, o)),
-            _ => Err(Perr::Unavailable(
-                "SQL (pg/mysql) export/import needs a managed-SQL + compute context \
-                 (a docker backend, a [secrets] envelope, and the operator-SQL seam) — \
-                 not available on this node"
+    /// The compute backend that runs the ephemeral SQL client, or a clear `Unavailable`
+    /// error (a node with no docker backend cannot dump/restore pg/mysql).
+    fn require_backend(&self) -> Result<&Arc<dyn ComputeBackend>, Perr> {
+        self.backend.as_ref().ok_or_else(|| {
+            Perr::Unavailable(
+                "pg/mysql export/import needs a compute backend to run the client container — \
+                 none on this node"
                     .into(),
-            )),
+            )
+        })
+    }
+
+    /// The operator-SQL seam (version-detect + schema fingerprint), or `Unavailable`.
+    fn require_op(&self) -> Result<&Arc<dyn boatramp_core::sql::OperatorSql>, Perr> {
+        self.operator_sql.as_ref().ok_or_else(|| {
+            Perr::Unavailable(
+                "pg/mysql export/import needs the operator-SQL seam (a managed SQL binding) — \
+                 not configured on this node"
+                    .into(),
+            )
+        })
+    }
+
+    /// Resolve a SQL database (managed compute-backed OR external bring-your-own-URL) to
+    /// its reachable endpoint parts `(host, port, user, password, database)`.
+    async fn resolve_endpoint(
+        &self,
+        project: &str,
+        db: &str,
+        cfg: &ExternalDatabaseConfig,
+    ) -> Result<SqlEndpoint, Perr> {
+        if cfg.compute.as_deref().is_some_and(|c| !c.is_empty()) {
+            self.resolve_managed_endpoint(project, db, cfg).await
+        } else if !cfg.url_env.is_empty() {
+            // EXTERNAL: the DSN lives in `url_env`; use its host VERBATIM (the daemon
+            // bridge NATs egress to it). The credential comes from the URL, never a sealed
+            // store, so no envelope is needed.
+            let url = self.env_source.get(&cfg.url_env).ok_or_else(|| {
+                Perr::Other(format!(
+                    "database {db:?}: external URL env var {} is unset",
+                    cfg.url_env
+                ))
+            })?;
+            let (user, password, host, port, database) = parse_sql_url(&url).ok_or_else(|| {
+                // Never echo the URL (it carries the credential) — name only the env var.
+                Perr::Other(format!(
+                    "database {db:?}: external URL in {} is not a parseable \
+                     postgres://|mysql:// DSN",
+                    cfg.url_env
+                ))
+            })?;
+            Ok(SqlEndpoint {
+                host,
+                port,
+                user,
+                password,
+                database,
+            })
+        } else {
+            Err(Perr::Other(format!(
+                "database {db:?}: neither compute-backed (managed) nor `url_env` (external) — \
+                 nothing to dump"
+            )))
         }
     }
 
-    /// Resolve a managed compute-backed SQL database to its reachable endpoint parts
-    /// `(host, port, user, password, database)` — the same derivation the runtime uses
-    /// (`operator_target` + the healthy replica endpoint + the unsealed credential), with
-    /// a colocated `Published` DB reached at its container bridge IP.
+    /// Resolve a managed compute-backed SQL database to its reachable endpoint parts —
+    /// the same derivation the runtime uses (`operator_target` + the healthy replica
+    /// endpoint + the unsealed credential), with a colocated `Published` DB reached at its
+    /// container bridge IP.
     async fn resolve_managed_endpoint(
         &self,
         project: &str,
         db: &str,
         cfg: &ExternalDatabaseConfig,
     ) -> Result<SqlEndpoint, Perr> {
-        let (backend, envelope, _op) = self.pg_ctx()?;
+        let backend = self.require_backend()?;
+        let envelope = self.envelope.as_ref().ok_or_else(|| {
+            Perr::Unavailable(format!(
+                "managed database {db:?} needs a [secrets] envelope to unseal its credential — \
+                 none on this node"
+            ))
+        })?;
         let target = operator_target(cfg, project, db).map_err(other)?;
         let states = self
             .deploy
@@ -330,7 +437,7 @@ impl NodeProjectExport {
         })
     }
 
-    /// Resolve a managed compute-backed Postgres database to a `PgConnection` + the
+    /// Resolve a Postgres database (managed or external) to a `PgConnection` + the
     /// matching client image + the detected `server_version_num`.
     async fn resolve_pg(
         &self,
@@ -338,9 +445,9 @@ impl NodeProjectExport {
         db: &str,
         cfg: &ExternalDatabaseConfig,
     ) -> Result<(PgConnection, String, String), Perr> {
-        let (_b, _e, op) = self.pg_ctx()?;
-        let ep = self.resolve_managed_endpoint(project, db, cfg).await?;
-        // Version detect via the operator-SQL seam.
+        let op = self.require_op()?;
+        let ep = self.resolve_endpoint(project, db, cfg).await?;
+        // Version detect via the operator-SQL seam (works for managed + external).
         let banner = op
             .query(project, db, "SHOW server_version_num")
             .await
@@ -357,6 +464,29 @@ impl NodeProjectExport {
             image,
             server_version_num,
         ))
+    }
+
+    /// Resolve a MySQL database (managed or external) to a `MysqlConnection` + the
+    /// matching `mysql:<maj.min>` client image + the detected version banner. A MariaDB
+    /// banner is REFUSED (distinct dialect — see [`mysql_client_image_for_server_version`]).
+    async fn resolve_mysql(
+        &self,
+        project: &str,
+        db: &str,
+        cfg: &ExternalDatabaseConfig,
+    ) -> Result<(MysqlConnection, String, String), Perr> {
+        let op = self.require_op()?;
+        let ep = self.resolve_endpoint(project, db, cfg).await?;
+        let banner = op
+            .query(project, db, "SELECT VERSION()")
+            .await
+            .map_err(other)?;
+        let version = scalar_text(&banner).ok_or_else(|| {
+            Perr::Other(format!("database {db:?}: empty SELECT VERSION() result"))
+        })?;
+        let image = boatramp_core::compute::mysql_client_image_for_server_version(&version)
+            .map_err(|e| Perr::Other(format!("database {db:?}: {e}")))?;
+        Ok((ep.into_mysql(self.connect_timeout_secs), image, version))
     }
 
     /// Best-effort schema-ledger fingerprint of a Postgres database (the applied
@@ -384,7 +514,7 @@ impl NodeProjectExport {
         stdin_path: Option<&Path>,
         stdout_path: &Path,
     ) -> Result<i32, Perr> {
-        let (backend, _e, _o) = self.pg_ctx()?;
+        let backend = self.require_backend()?;
         let out = tokio::fs::File::create(stdout_path).await.map_err(other)?;
         let mut sink = out.compat_write();
         let code = if let Some(inp) = stdin_path {
@@ -425,6 +555,17 @@ impl SqlEndpoint {
             connect_timeout_secs,
         }
     }
+
+    fn into_mysql(self, connect_timeout_secs: u32) -> MysqlConnection {
+        MysqlConnection {
+            host: self.host,
+            port: self.port,
+            user: self.user,
+            password: self.password,
+            database: self.database,
+            connect_timeout_secs,
+        }
+    }
 }
 
 #[async_trait]
@@ -450,10 +591,14 @@ impl ProjectExport for NodeProjectExport {
             pg: None,
         });
 
-        // --- per-engine dumps ---
+        // --- per-engine dumps (pg + mysql; managed OR external bring-your-own-URL) ---
         for (db, cfg) in &self.databases {
-            if kind_is_postgres(&cfg.kind) && cfg.compute.as_deref().is_some_and(|c| !c.is_empty())
-            {
+            // A binding is dumpable here iff it is compute-backed (managed) OR names an
+            // external DSN env var; a `libsql` binding's per-site DBs go through the
+            // authoritative site enumeration below instead.
+            let dumpable =
+                cfg.compute.as_deref().is_some_and(|c| !c.is_empty()) || !cfg.url_env.is_empty();
+            if kind_is_postgres(&cfg.kind) && dumpable {
                 let (conn, image, server_version_num) = self.resolve_pg(project, db, cfg).await?;
                 let inv = pg_dump_invocation(&conn, data_only);
                 let out = stage.join(format!("{db}.pgc"));
@@ -474,12 +619,30 @@ impl ProjectExport for NodeProjectExport {
                         schema_fingerprint,
                     }),
                 });
-            } else if kind_is_libsql(&cfg.kind) {
-                // The per-site embedded libsql default DBs are exported below via the
-                // authoritative site enumeration — not through this named-binding loop.
-            } else {
-                // mysql / external-URL pg: handled in their own branches below.
+            } else if kind_is_mysql(&cfg.kind) && dumpable {
+                let (conn, image, version) = self.resolve_mysql(project, db, cfg).await?;
+                let inv = mysqldump_invocation(&conn, data_only);
+                let out = stage.join(format!("{db}.sql"));
+                let code = self
+                    .run_sql_client(&image, &inv.argv, &inv.env, None, &out)
+                    .await?;
+                if code != 0 {
+                    return Err(Perr::Other(format!("mysqldump for {db:?} exited {code}")));
+                }
+                let schema_fingerprint = self.schema_fingerprint(project, db).await;
+                staged.push(StagedMember {
+                    path: mysql_member_path(db),
+                    kind: MemberKind::MysqlDump,
+                    source: out,
+                    pg: Some(PgMemberInfo {
+                        server_version_num: version,
+                        client_image: image,
+                        schema_fingerprint,
+                    }),
+                });
             }
+            // A `libsql` binding (or a binding with neither compute nor url_env) is handled
+            // by the per-site libsql enumeration below — nothing to do in this loop.
         }
 
         // --- libsql snapshots: enumerate the project's sites AUTHORITATIVELY from the
@@ -635,6 +798,47 @@ impl ProjectExport for NodeProjectExport {
             report.pg_databases += 1;
         }
 
+        // --- mysql: schema-skew check, then restore (apply) ---
+        for m in manifest
+            .members
+            .iter()
+            .filter(|m| m.kind == MemberKind::MysqlDump)
+        {
+            let db = db_from_mysql_member(&m.path)
+                .ok_or_else(|| Perr::Other(format!("bad mysql member path {:?}", m.path)))?;
+            let cfg = self.databases.get(db).ok_or_else(|| {
+                Perr::Other(format!("import: no database named {db:?} on this node"))
+            })?;
+            let (conn, image, _ver) = self.resolve_mysql(project, db, cfg).await?;
+
+            // Schema-ledger fingerprint SKEW check (both sides must agree for --data-only).
+            let src_fp = m.pg.as_ref().and_then(|p| p.schema_fingerprint.clone());
+            let tgt_fp = self.schema_fingerprint(project, db).await;
+            if let (Some(src_fp), Some(tgt_fp)) = (src_fp, tgt_fp)
+                && src_fp != tgt_fp
+            {
+                report.schema_skew.push(db.to_string());
+                if !opts.allow_schema_skew {
+                    return Err(Perr::SchemaSkew(vec![db.to_string()]));
+                }
+            }
+
+            if opts.apply {
+                let inv = mysql_restore_invocation(&conn, manifest.data_only);
+                let member_file = extract.join(&m.path);
+                let devnull = session.join(format!("{db}.myrestore.out"));
+                let code = self
+                    .run_sql_client(&image, &inv.argv, &inv.env, Some(&member_file), &devnull)
+                    .await?;
+                if code != 0 {
+                    return Err(Perr::Other(format!(
+                        "mysql restore for {db:?} exited {code}"
+                    )));
+                }
+            }
+            report.pg_databases += 1;
+        }
+
         // --- libsql members: place each verified snapshot into the target site's
         //     embedded DB (no-clobber + integrity verify), re-qualifying the site under
         //     the TARGET project. Requires the local libsql backend. ---
@@ -761,6 +965,49 @@ mod tests {
         assert!(kind_is_libsql("libsql"));
         assert!(kind_is_libsql("sqlite3"));
         assert!(!kind_is_libsql("mysql"));
+        assert!(kind_is_mysql("mysql"));
+        assert!(kind_is_mysql("MariaDB"));
+        assert!(!kind_is_mysql("postgres"));
+    }
+
+    #[test]
+    fn mysql_member_path_round_trips() {
+        assert_eq!(mysql_member_path("shop"), "sql/shop.sql");
+        assert_eq!(db_from_mysql_member("sql/shop.sql"), Some("shop"));
+        // A pg member (`.pgc`) is NOT a mysql member.
+        assert_eq!(db_from_mysql_member("sql/app.pgc"), None);
+    }
+
+    #[test]
+    fn parse_sql_url_handles_pg_and_mysql_dsns() {
+        assert_eq!(
+            parse_sql_url("postgres://u:p@h:5432/db"),
+            Some(("u".into(), "p".into(), "h".into(), 5432, "db".into()))
+        );
+        assert_eq!(
+            parse_sql_url("mysql://svc:pw@10.0.0.6:3306/shop?ssl=true"),
+            Some((
+                "svc".into(),
+                "pw".into(),
+                "10.0.0.6".into(),
+                3306,
+                "shop".into()
+            ))
+        );
+        // Default ports when omitted.
+        assert_eq!(
+            parse_sql_url("postgres://u:p@h/db").map(|t| t.3),
+            Some(5432)
+        );
+        assert_eq!(parse_sql_url("mysql://u:p@h/db").map(|t| t.3), Some(3306));
+        // A ':'-bearing password survives (split on the FIRST ':').
+        assert_eq!(
+            parse_sql_url("mysql://u:a:b@h:3306/db").map(|t| t.1),
+            Some("a:b".into())
+        );
+        // Unknown scheme / garbage -> None (refuse, don't misconnect).
+        assert_eq!(parse_sql_url("redis://h/0"), None);
+        assert_eq!(parse_sql_url("not-a-url"), None);
     }
 
     #[test]

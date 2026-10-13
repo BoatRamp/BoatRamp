@@ -1,13 +1,14 @@
-//! Pure builders for the **Postgres export/import client invocation** that the driver
-//! runs inside [`run_ephemeral`](boatramp_core::compute::ComputeBackend::run_ephemeral):
-//! the `argv` and the process environment.
+//! Pure builders for the **SQL export/import client invocation** (Postgres + MySQL) that
+//! the driver runs inside
+//! [`run_ephemeral`](boatramp_core::compute::ComputeBackend::run_ephemeral): the `argv`
+//! and the process environment.
 //!
 //! ## The credential non-leak rule lives here
-//! The password rides in the **`PGPASSWORD` environment variable**, NEVER in argv —
-//! argv shows in `ps` and `docker inspect`, the environment does not. In fact no DSN
-//! string is assembled at all: the discrete `PG*` connection variables connect the
-//! client, so there is no connection string to accidentally `format!` into a log. The
-//! only secret is `PGPASSWORD`, and it is in the environment.
+//! The password rides in an **environment variable** (`PGPASSWORD` for Postgres,
+//! `MYSQL_PWD` for MySQL), NEVER in argv — argv shows in `ps` and `docker inspect`, the
+//! environment does not. No DSN string is assembled at all: the discrete `PG*` / `MYSQL*`
+//! connection variables connect the client, so there is no connection string to
+//! accidentally `format!` into a log. The only secret is the password env var.
 //!
 //! ## `--data-only` vs full
 //! `--data-only` emits/restores ONLY the table data; the target keeps its OWN migrated
@@ -60,7 +61,7 @@ impl PgConnection {
 /// A fully-built client invocation: the `argv` (no credential) + the environment (the
 /// credential), ready to hand to `run_ephemeral(image, argv, env, …)`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PgInvocation {
+pub struct SqlInvocation {
     /// The command + args — NEVER carries a credential.
     pub argv: Vec<String>,
     /// The process environment — carries `PGPASSWORD`.
@@ -69,7 +70,7 @@ pub struct PgInvocation {
 
 /// Build the `pg_dump` invocation for an EXPORT. Custom format (`-Fc`): compressed and
 /// the natural input to `pg_restore`. `--data-only` emits only the data.
-pub fn pg_dump_invocation(conn: &PgConnection, data_only: bool) -> PgInvocation {
+pub fn pg_dump_invocation(conn: &PgConnection, data_only: bool) -> SqlInvocation {
     let mut argv = vec![
         "pg_dump".to_string(),
         "--no-owner".to_string(),
@@ -79,7 +80,7 @@ pub fn pg_dump_invocation(conn: &PgConnection, data_only: bool) -> PgInvocation 
     if data_only {
         argv.push("--data-only".to_string());
     }
-    PgInvocation {
+    SqlInvocation {
         argv,
         env: conn.env(),
     }
@@ -88,7 +89,7 @@ pub fn pg_dump_invocation(conn: &PgConnection, data_only: bool) -> PgInvocation 
 /// Build the `pg_restore` invocation for an IMPORT (reads the custom-format dump from
 /// stdin). `--data-only` restores only the data into the target's existing migrated
 /// schema; `--exit-on-error` aborts loudly on the first failed object.
-pub fn pg_restore_invocation(conn: &PgConnection, data_only: bool) -> PgInvocation {
+pub fn pg_restore_invocation(conn: &PgConnection, data_only: bool) -> SqlInvocation {
     let mut argv = vec![
         "pg_restore".to_string(),
         "--no-owner".to_string(),
@@ -98,7 +99,83 @@ pub fn pg_restore_invocation(conn: &PgConnection, data_only: bool) -> PgInvocati
     if data_only {
         argv.push("--data-only".to_string());
     }
-    PgInvocation {
+    SqlInvocation {
+        argv,
+        env: conn.env(),
+    }
+}
+
+/// A resolved MySQL connection target for the client. The password goes in `MYSQL_PWD`
+/// (the env the mysql/mysqldump clients read), never argv.
+#[derive(Debug, Clone)]
+pub struct MysqlConnection {
+    /// The reachable host.
+    pub host: String,
+    /// The server port.
+    pub port: u16,
+    /// The role to connect as.
+    pub user: String,
+    /// The password — the ONLY secret; it goes in `MYSQL_PWD`, never argv.
+    pub password: String,
+    /// The physical database to dump/restore.
+    pub database: String,
+    /// A bounded connect timeout (seconds).
+    pub connect_timeout_secs: u32,
+}
+
+impl MysqlConnection {
+    /// The discrete `MYSQL*` connection environment. `MYSQL_PWD` carries the password
+    /// (never argv); the rest name the host/port/user so no DSN string is built.
+    pub fn env(&self) -> Vec<(String, String)> {
+        vec![
+            ("MYSQL_HOST".to_string(), self.host.clone()),
+            ("MYSQL_TCP_PORT".to_string(), self.port.to_string()),
+            ("MYSQL_USER".to_string(), self.user.clone()),
+            ("MYSQL_PWD".to_string(), self.password.clone()),
+        ]
+    }
+
+    /// The `--connect-timeout=<secs>` arg both clients accept (there is no env for it).
+    fn connect_timeout_arg(&self) -> String {
+        format!("--connect-timeout={}", self.connect_timeout_secs)
+    }
+}
+
+/// Build the `mysqldump` invocation for an EXPORT. `--single-transaction` takes a
+/// consistent snapshot without locking (InnoDB); `--no-tablespaces` avoids the `PROCESS`
+/// privilege requirement. A FULL dump emits schema + data under `--databases <db>` (so
+/// the stream carries `CREATE DATABASE`/`USE`); `--data-only` emits only the rows for
+/// `<db>` (`--no-create-info`), restored into the target's existing schema.
+pub fn mysqldump_invocation(conn: &MysqlConnection, data_only: bool) -> SqlInvocation {
+    let mut argv = vec![
+        "mysqldump".to_string(),
+        "--single-transaction".to_string(),
+        "--no-tablespaces".to_string(),
+        conn.connect_timeout_arg(),
+    ];
+    if data_only {
+        argv.push("--no-create-info".to_string());
+        argv.push(conn.database.clone());
+    } else {
+        argv.push("--databases".to_string());
+        argv.push(conn.database.clone());
+    }
+    SqlInvocation {
+        argv,
+        env: conn.env(),
+    }
+}
+
+/// Build the `mysql` invocation for an IMPORT (reads the SQL dump from stdin). A FULL
+/// bundle's dump carries its own `USE <db>` (from `--databases`), so no positional db is
+/// needed; a `--data-only` dump has none, so the target `<db>` is named on the command
+/// line. The database name is NOT a credential, so passing it in argv is fine.
+pub fn mysql_restore_invocation(conn: &MysqlConnection, data_only: bool) -> SqlInvocation {
+    let mut argv = vec!["mysql".to_string(), conn.connect_timeout_arg()];
+    if data_only {
+        argv.push(conn.database.clone());
+    }
+    SqlInvocation {
         argv,
         env: conn.env(),
     }
@@ -177,5 +254,68 @@ mod tests {
         assert_eq!(get("PGDATABASE").as_deref(), Some("app"));
         // A bounded connect timeout so an unreachable DSN fails fast.
         assert_eq!(get("PGCONNECT_TIMEOUT").as_deref(), Some("10"));
+    }
+
+    fn myconn() -> MysqlConnection {
+        MysqlConnection {
+            host: "10.0.0.6".to_string(),
+            port: 3306,
+            user: "svc".to_string(),
+            password: "sup3r-s3cret-pw".to_string(),
+            database: "app".to_string(),
+            connect_timeout_secs: 10,
+        }
+    }
+
+    #[test]
+    fn mysql_data_only_toggles_and_credential_stays_in_env() {
+        // data-only diverges: dump uses --no-create-info (no --databases); full uses
+        // --databases; restore names the db only for data-only.
+        let dump_do = mysqldump_invocation(&myconn(), true);
+        let dump_full = mysqldump_invocation(&myconn(), false);
+        assert!(dump_do.argv.iter().any(|a| a == "--no-create-info"));
+        assert!(!dump_full.argv.iter().any(|a| a == "--no-create-info"));
+        assert!(dump_full.argv.iter().any(|a| a == "--databases"));
+        assert!(!dump_do.argv.iter().any(|a| a == "--databases"));
+
+        let restore_do = mysql_restore_invocation(&myconn(), true);
+        let restore_full = mysql_restore_invocation(&myconn(), false);
+        assert!(restore_do.argv.iter().any(|a| a == "app"));
+        assert!(!restore_full.argv.iter().any(|a| a == "app"));
+
+        // The password is in MYSQL_PWD (env), never argv; no DSN in argv.
+        let c = myconn();
+        for inv in [
+            mysqldump_invocation(&c, true),
+            mysql_restore_invocation(&c, false),
+        ] {
+            assert!(
+                inv.env
+                    .iter()
+                    .any(|(k, v)| k == "MYSQL_PWD" && v == &c.password),
+                "MYSQL_PWD must be set in the environment"
+            );
+            for a in &inv.argv {
+                assert!(
+                    !a.contains(&c.password),
+                    "credential leaked into argv: {a:?}"
+                );
+                assert!(
+                    !a.contains("://"),
+                    "a DSN must never be built into argv: {a:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mysql_env_carries_the_discrete_connection() {
+        let e = myconn().env();
+        let get = |k: &str| e.iter().find(|(kk, _)| kk == k).map(|(_, v)| v.clone());
+        assert_eq!(get("MYSQL_HOST").as_deref(), Some("10.0.0.6"));
+        assert_eq!(get("MYSQL_TCP_PORT").as_deref(), Some("3306"));
+        assert_eq!(get("MYSQL_USER").as_deref(), Some("svc"));
+        // The password is here, never argv.
+        assert_eq!(get("MYSQL_PWD").as_deref(), Some("sup3r-s3cret-pw"));
     }
 }
