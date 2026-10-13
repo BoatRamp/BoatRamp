@@ -155,7 +155,10 @@ impl MysqlConnection {
         ]
     }
 
-    /// The `--connect-timeout=<secs>` arg both clients accept (there is no env for it).
+    /// The `--connect-timeout=<secs>` arg the `mysql` client accepts (there is no env for
+    /// it). NOTE: `mysqldump` does NOT register this option — passing it there fails with
+    /// "[ERROR] unknown variable 'connect-timeout=10'" — so only `mysql_restore_invocation`
+    /// uses it, never `mysqldump_invocation`.
     fn connect_timeout_arg(&self) -> String {
         format!("--connect-timeout={}", self.connect_timeout_secs)
     }
@@ -165,13 +168,14 @@ impl MysqlConnection {
 /// consistent snapshot without locking (InnoDB); `--no-tablespaces` avoids the `PROCESS`
 /// privilege requirement. A FULL dump emits schema + data under `--databases <db>` (so
 /// the stream carries `CREATE DATABASE`/`USE`); `--data-only` emits only the rows for
-/// `<db>` (`--no-create-info`), restored into the target's existing schema.
+/// `<db>` (`--no-create-info`), restored into the target's existing schema. No
+/// `--connect-timeout`: `mysqldump` does not register it (it rejects it as an unknown
+/// variable); the overall ephemeral-run timeout bounds a stuck dump instead.
 pub fn mysqldump_invocation(conn: &MysqlConnection, data_only: bool) -> SqlInvocation {
     let mut argv = vec![
         "mysqldump".to_string(),
         "--single-transaction".to_string(),
         "--no-tablespaces".to_string(),
-        conn.connect_timeout_arg(),
     ];
     if data_only {
         argv.push("--no-create-info".to_string());
@@ -326,9 +330,25 @@ mod tests {
         assert!(!dump_full.argv.iter().any(|a| a == "--no-create-info"));
         assert!(dump_full.argv.iter().any(|a| a == "--databases"));
         assert!(!dump_do.argv.iter().any(|a| a == "--databases"));
+        // mysqldump does NOT register --connect-timeout (it fails with "unknown variable");
+        // it must never appear on a dump invocation, but the mysql restore client DOES
+        // accept it.
+        for d in [&dump_do, &dump_full] {
+            assert!(
+                !d.argv.iter().any(|a| a.starts_with("--connect-timeout")),
+                "mysqldump must not carry --connect-timeout"
+            );
+        }
 
         let restore_do = mysql_restore_invocation(&myconn(), true);
         let restore_full = mysql_restore_invocation(&myconn(), false);
+        assert!(
+            restore_full
+                .argv
+                .iter()
+                .any(|a| a.starts_with("--connect-timeout")),
+            "the mysql restore client should carry --connect-timeout"
+        );
         assert!(restore_do.argv.iter().any(|a| a == "app"));
         assert!(!restore_full.argv.iter().any(|a| a == "app"));
 
