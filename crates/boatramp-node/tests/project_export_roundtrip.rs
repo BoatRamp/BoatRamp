@@ -208,15 +208,27 @@ async fn project_export_roundtrip_live() {
     // --- create a fresh target database ---
     let target_db = format!("brexport_rt_{suffix}_tgt");
     // CREATE DATABASE must run outside a transaction, against a maintenance db.
+    // psql sends a single `-c` multi-statement string as ONE implicit transaction,
+    // and the server rejects "CREATE DATABASE cannot run inside a transaction block";
+    // so DROP and CREATE go as two separate single-statement invocations (each a
+    // standalone implicit transaction, which CREATE DATABASE is allowed to be).
     let maint = conn(&user, &password, &host, port, "postgres");
-    let (code, _) = psql(
+    let (dcode, _) = psql(
         backend.as_ref(),
         &image,
         &maint,
-        &format!("DROP DATABASE IF EXISTS {target_db}; CREATE DATABASE {target_db};"),
+        &format!("DROP DATABASE IF EXISTS {target_db}"),
     )
     .await;
-    assert_eq!(code, 0, "create target database");
+    assert_eq!(dcode, 0, "drop pre-existing target database");
+    let (ccode, _) = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!("CREATE DATABASE {target_db}"),
+    )
+    .await;
+    assert_eq!(ccode, 0, "create target database");
     let tgt = conn(&user, &password, &host, port, &target_db);
 
     // --- IMPORT: pg_restore streaming the member in via stdin (FULL restore) ---
