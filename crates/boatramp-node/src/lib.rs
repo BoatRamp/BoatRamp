@@ -63,6 +63,9 @@ pub mod managed_sql;
 #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
 pub mod managed_db_declare;
 pub mod node;
+/// Pure builders for the Postgres export/import client invocation (argv + `PG*` env);
+/// the credential non-leak rule (password in env, never argv) lives here.
+pub mod pg_client;
 /// The BRPROJ project export/import bundle format (tar + JSON MANIFEST + per-member
 /// SHA-256). Dependency-light + testable in every build; the driver that fills it is
 /// feature-gated.
