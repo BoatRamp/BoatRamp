@@ -235,17 +235,32 @@ async fn project_export_roundtrip_live() {
     {
         use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
         let inv = pg_restore_invocation(&tgt, /* data_only = */ false);
+        // `run_ephemeral` drops captured container stderr on a non-zero exit, so a failed
+        // restore would surface only a bare code. Run the SAME argv under `sh -c … 2>&1`
+        // so pg_restore's diagnostics merge into the sink and land in the failure message.
+        // The shell only redirects fds; stdin (the piped member) and the argv are the
+        // product driver's exactly.
+        let restore_argv = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            format!("{} 2>&1", inv.argv.join(" ")),
+        ];
         let infile = tokio::fs::File::open(&member).await.unwrap();
         let mut rdr = infile.compat();
-        let out = tokio::fs::File::create(td.path().join("restore.out"))
-            .await
-            .unwrap();
+        let out_path = td.path().join("restore.out");
+        let out = tokio::fs::File::create(&out_path).await.unwrap();
         let mut sink = out.compat_write();
         let code = backend
-            .run_ephemeral(&image, &inv.argv, &inv.env, Some(&mut rdr), &mut sink)
+            .run_ephemeral(&image, &restore_argv, &inv.env, Some(&mut rdr), &mut sink)
             .await
             .expect("pg_restore run_ephemeral");
-        assert_eq!(code, 0, "pg_restore exit code");
+        let restore_out = tokio::fs::read_to_string(&out_path)
+            .await
+            .unwrap_or_default();
+        assert_eq!(
+            code, 0,
+            "pg_restore exit code; pg_restore output:\n{restore_out}"
+        );
     }
 
     // --- assert ROW + SCHEMA equality on the target ---
@@ -275,6 +290,163 @@ async fn project_export_roundtrip_live() {
     .await;
 
     println!("PROJECT EXPORT ROUNDTRIP OK");
+}
+
+/// **In-process libsql snapshot → bundle → restore round-trip** (no Docker, no external
+/// server — embedded libsql). Seeds a local libsql database through the public
+/// `SqlBackends::database` accessor at the project-qualified identity the driver snapshots
+/// (`default`-style `project/site`), `snapshot_into`s a staged member (`VACUUM INTO` +
+/// `PRAGMA integrity_check`), bundles it (SHA-256), extracts + verifies, then
+/// `restore_snapshot`s the extracted member into a FRESH store (no-clobber + integrity
+/// check) and asserts ROW equality against the source. Finally proves the no-clobber guard
+/// refuses a second restore over the now-populated target. Emits the gate's libsql marker.
+///
+/// Unlike the pg/mysql round-trips this needs no server/daemon, so it also runs in the
+/// merge gate when the `project-export` feature is built — but the capability gate greps
+/// its marker so a silent skip (e.g. the libsql backend feature-gated away) is caught.
+#[tokio::test]
+async fn project_export_roundtrip_libsql() {
+    use boatramp_core::project::ProjectRef;
+    use boatramp_core::sql::{SqlBackend, SqlBackends, SqlValue};
+    use boatramp_storage::sql_libsql::LibsqlSqlBackends;
+
+    let project = "acme";
+    let site = "blog";
+    let expect: Vec<(i64, String)> = vec![
+        (1, "alpha".to_string()),
+        (2, "beta".to_string()),
+        (3, "gamma".to_string()),
+    ];
+
+    // --- seed the source libsql db at the project-qualified default-db identity ---
+    let src_dir = tempfile::tempdir().expect("src dir");
+    let backends = LibsqlSqlBackends::local(src_dir.path());
+    {
+        let db: Arc<dyn SqlBackend> = backends
+            .database(project, site, "")
+            .await
+            .expect("open source db");
+        let mut tx = db.begin().await.expect("begin");
+        tx.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)", &[])
+            .await
+            .expect("create");
+        let n = tx
+            .execute(
+                "INSERT INTO t VALUES (?1,?2),(?3,?4),(?5,?6)",
+                &[
+                    SqlValue::Integer(1),
+                    SqlValue::Text("alpha".into()),
+                    SqlValue::Integer(2),
+                    SqlValue::Text("beta".into()),
+                    SqlValue::Integer(3),
+                    SqlValue::Text("gamma".into()),
+                ],
+            )
+            .await
+            .expect("insert");
+        assert_eq!(n, 3, "seeded three rows");
+        tx.commit().await.expect("commit");
+    }
+
+    // The identity the driver snapshots: `ProjectRef::qualified` (two-segment post-v0.31.0).
+    let qsite = ProjectRef::new(project).qualified(site);
+
+    // --- EXPORT: snapshot_into a staged member (VACUUM INTO + integrity_check) ---
+    let stage_dir = tempfile::tempdir().expect("stage dir");
+    let snap = stage_dir.path().join("default.sqlite");
+    let integrity = backends
+        .snapshot_into(&qsite, "", &snap)
+        .await
+        .expect("snapshot_into");
+    assert_eq!(integrity, "ok", "snapshot integrity_check");
+    assert!(
+        std::fs::metadata(&snap)
+            .map(|m| m.len() > 0)
+            .unwrap_or(false),
+        "snapshot file present + non-empty"
+    );
+
+    // --- bundle it (SHA-256) + extract + verify ---
+    let member_path = format!("libsql/{project}/{site}/default.sqlite");
+    let staged = vec![StagedMember {
+        path: member_path.clone(),
+        kind: MemberKind::Libsql,
+        source: snap.clone(),
+        pg: None,
+    }];
+    let td = tempfile::tempdir().expect("bundle dir");
+    let bundle = td.path().join("libsql-rt.brproj");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    project_bundle::write_bundle(
+        &bundle,
+        now,
+        false,
+        SourceInfo {
+            project: project.to_string(),
+            site: Some(site.to_string()),
+        },
+        &staged,
+    )
+    .expect("write bundle");
+    let extract = td.path().join("extract");
+    let manifest = project_bundle::extract_and_verify(&bundle, &extract).expect("extract + verify");
+    assert!(
+        manifest
+            .members
+            .iter()
+            .any(|m| m.kind == MemberKind::Libsql && m.path == member_path),
+        "libsql member present in the verified manifest"
+    );
+    let member_file = extract.join(&member_path);
+    assert!(member_file.exists(), "extracted libsql member present");
+
+    // --- IMPORT: restore_snapshot into a FRESH store (no-clobber + integrity_check) ---
+    let tgt_dir = tempfile::tempdir().expect("tgt dir");
+    let tgt = LibsqlSqlBackends::local(tgt_dir.path());
+    tgt.restore_snapshot(&qsite, "", &member_file)
+        .await
+        .expect("restore_snapshot");
+
+    // --- reopen + assert ROW equality against the source ---
+    let rdb: Arc<dyn SqlBackend> = tgt
+        .database(project, site, "")
+        .await
+        .expect("open restored db");
+    let mut tx = rdb.begin().await.expect("begin restored");
+    let rows = tx
+        .query("SELECT id, v FROM t ORDER BY id", &[])
+        .await
+        .expect("query restored");
+    tx.commit().await.expect("commit restored");
+    let got: Vec<(i64, String)> = rows
+        .rows
+        .iter()
+        .map(|r| {
+            let id = match &r[0] {
+                SqlValue::Integer(i) => *i,
+                other => panic!("id not integer: {other:?}"),
+            };
+            let v = match &r[1] {
+                SqlValue::Text(s) => s.clone(),
+                other => panic!("v not text: {other:?}"),
+            };
+            (id, v)
+        })
+        .collect();
+    assert_eq!(got, expect, "restored rows match the source");
+
+    // --- no-clobber: a second restore over the now-populated target must refuse ---
+    assert!(
+        tgt.restore_snapshot(&qsite, "", &member_file)
+            .await
+            .is_err(),
+        "restore_snapshot must refuse to overwrite a non-empty destination"
+    );
+
+    println!("PROJECT EXPORT LIBSQL ROUNDTRIP OK");
 }
 
 #[test]
