@@ -61,6 +61,14 @@ getrandom.workspace = true
 # async ManagedDbEnvResolver/ComputeEndpointResolver traits in non-test code; only
 # used under the sql features but a tiny dep so it stays unconditional.
 async-trait.workspace = true
+# The project export/import bundle (`project_bundle`): a tar of a MANIFEST + the per-
+# engine dumps, with per-member SHA-256 checksums. `tar` (sync, over files) assembles
+# it; `sha2`/`hex` compute the member checksums. All tiny, so unconditional — the
+# bundle FORMAT is dependency-light and testable in every build; the heavier driver
+# that fills it is feature-gated.
+tar.workspace = true
+sha2.workspace = true
+hex.workspace = true
 
 [features]
 # Cfg markers matching the binary's feature set: `config` parses every section in

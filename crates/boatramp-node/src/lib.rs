@@ -63,6 +63,10 @@ pub mod managed_sql;
 #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
 pub mod managed_db_declare;
 pub mod node;
+/// The BRPROJ project export/import bundle format (tar + JSON MANIFEST + per-member
+/// SHA-256). Dependency-light + testable in every build; the driver that fills it is
+/// feature-gated.
+pub mod project_bundle;
 #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
 pub mod repair;
 /// Node-level base S3 credential sourcing from the `[secrets]` sealed store (#505).
