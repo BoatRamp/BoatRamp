@@ -144,14 +144,25 @@ pub struct MysqlConnection {
 }
 
 impl MysqlConnection {
-    /// The discrete `MYSQL*` connection environment. `MYSQL_PWD` carries the password
-    /// (never argv); the rest name the host/port/user so no DSN string is built.
+    /// The connection ENVIRONMENT: `MYSQL_PWD` (the password) ONLY. The password is the
+    /// sole secret and goes in the env every MySQL client reads, never argv. Host/port/
+    /// user are NOT placed here — unlike libpq's `PGHOST` (honored by all libpq tools),
+    /// `MYSQL_HOST` is read by the `mysql` CLI ALONE; `mysqldump` ignores it and defaults
+    /// to the local unix socket ("Can't connect to local MySQL server through socket"),
+    /// so the host/port/user travel in argv via [`conn_args`](Self::conn_args).
     pub fn env(&self) -> Vec<(String, String)> {
+        vec![("MYSQL_PWD".to_string(), self.password.clone())]
+    }
+
+    /// The non-secret connection args every MySQL client (both `mysql` and `mysqldump`)
+    /// honors: `--host`, `--port`, `--user`. A real host IP (not "localhost") forces TCP
+    /// rather than the local socket. None of these is a credential, so argv is correct;
+    /// no DSN string is assembled.
+    pub fn conn_args(&self) -> Vec<String> {
         vec![
-            ("MYSQL_HOST".to_string(), self.host.clone()),
-            ("MYSQL_TCP_PORT".to_string(), self.port.to_string()),
-            ("MYSQL_USER".to_string(), self.user.clone()),
-            ("MYSQL_PWD".to_string(), self.password.clone()),
+            format!("--host={}", self.host),
+            format!("--port={}", self.port),
+            format!("--user={}", self.user),
         ]
     }
 
@@ -166,17 +177,19 @@ impl MysqlConnection {
 
 /// Build the `mysqldump` invocation for an EXPORT. `--single-transaction` takes a
 /// consistent snapshot without locking (InnoDB); `--no-tablespaces` avoids the `PROCESS`
-/// privilege requirement. A FULL dump emits schema + data under `--databases <db>` (so
-/// the stream carries `CREATE DATABASE`/`USE`); `--data-only` emits only the rows for
-/// `<db>` (`--no-create-info`), restored into the target's existing schema. No
-/// `--connect-timeout`: `mysqldump` does not register it (it rejects it as an unknown
-/// variable); the overall ephemeral-run timeout bounds a stuck dump instead.
+/// privilege requirement. Host/port/user are explicit ([`conn_args`](MysqlConnection::conn_args))
+/// because `mysqldump` ignores `MYSQL_HOST`. A FULL dump emits schema + data under
+/// `--databases <db>` (so the stream carries `CREATE DATABASE`/`USE`); `--data-only` emits
+/// only the rows for `<db>` (`--no-create-info`), restored into the target's existing
+/// schema. No `--connect-timeout`: `mysqldump` does not register it (unknown variable);
+/// the overall ephemeral-run timeout bounds a stuck dump instead.
 pub fn mysqldump_invocation(conn: &MysqlConnection, data_only: bool) -> SqlInvocation {
     let mut argv = vec![
         "mysqldump".to_string(),
         "--single-transaction".to_string(),
         "--no-tablespaces".to_string(),
     ];
+    argv.extend(conn.conn_args());
     if data_only {
         argv.push("--no-create-info".to_string());
         argv.push(conn.database.clone());
@@ -190,12 +203,16 @@ pub fn mysqldump_invocation(conn: &MysqlConnection, data_only: bool) -> SqlInvoc
     }
 }
 
-/// Build the `mysql` invocation for an IMPORT (reads the SQL dump from stdin). A FULL
-/// bundle's dump carries its own `USE <db>` (from `--databases`), so no positional db is
-/// needed; a `--data-only` dump has none, so the target `<db>` is named on the command
-/// line. The database name is NOT a credential, so passing it in argv is fine.
+/// Build the `mysql` invocation for an IMPORT (reads the SQL dump from stdin). Host/port/
+/// user are explicit ([`conn_args`](MysqlConnection::conn_args)) so the client connects
+/// over TCP, not the local socket. A FULL bundle's dump carries its own `USE <db>` (from
+/// `--databases`), so no positional db is needed; a `--data-only` dump has none, so the
+/// target `<db>` is named on the command line. The database name is NOT a credential, so
+/// passing it in argv is fine.
 pub fn mysql_restore_invocation(conn: &MysqlConnection, data_only: bool) -> SqlInvocation {
-    let mut argv = vec!["mysql".to_string(), conn.connect_timeout_arg()];
+    let mut argv = vec!["mysql".to_string()];
+    argv.extend(conn.conn_args());
+    argv.push(conn.connect_timeout_arg());
     if data_only {
         argv.push(conn.database.clone());
     }
@@ -364,6 +381,13 @@ mod tests {
                     .any(|(k, v)| k == "MYSQL_PWD" && v == &c.password),
                 "MYSQL_PWD must be set in the environment"
             );
+            // Host must be explicit in argv: mysqldump ignores MYSQL_HOST and would hit
+            // the local socket (error 2002) without it.
+            assert!(
+                inv.argv.iter().any(|a| a == &format!("--host={}", c.host)),
+                "the connection host must be explicit in argv: {:?}",
+                inv.argv
+            );
             for a in &inv.argv {
                 assert!(
                     !a.contains(&c.password),
@@ -379,12 +403,22 @@ mod tests {
 
     #[test]
     fn mysql_env_carries_the_discrete_connection() {
-        let e = myconn().env();
-        let get = |k: &str| e.iter().find(|(kk, _)| kk == k).map(|(_, v)| v.clone());
-        assert_eq!(get("MYSQL_HOST").as_deref(), Some("10.0.0.6"));
-        assert_eq!(get("MYSQL_TCP_PORT").as_deref(), Some("3306"));
-        assert_eq!(get("MYSQL_USER").as_deref(), Some("svc"));
-        // The password is here, never argv.
-        assert_eq!(get("MYSQL_PWD").as_deref(), Some("sup3r-s3cret-pw"));
+        let c = myconn();
+        // The ENV carries ONLY the password (the sole secret) — mysqldump ignores
+        // MYSQL_HOST, so host/port/user must NOT be relied on via env.
+        let e = c.env();
+        assert_eq!(e.len(), 1, "env carries only MYSQL_PWD");
+        assert_eq!(e[0].0, "MYSQL_PWD");
+        assert_eq!(e[0].1, "sup3r-s3cret-pw");
+        // Host/port/user travel in argv (so both mysql and mysqldump connect over TCP),
+        // and never the password.
+        let a = c.conn_args();
+        assert!(a.iter().any(|x| x == "--host=10.0.0.6"));
+        assert!(a.iter().any(|x| x == "--port=3306"));
+        assert!(a.iter().any(|x| x == "--user=svc"));
+        assert!(
+            !a.iter().any(|x| x.contains("sup3r-s3cret-pw")),
+            "password never in conn_args"
+        );
     }
 }
