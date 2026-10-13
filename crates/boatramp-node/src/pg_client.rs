@@ -5,10 +5,15 @@
 //!
 //! ## The credential non-leak rule lives here
 //! The password rides in an **environment variable** (`PGPASSWORD` for Postgres,
-//! `MYSQL_PWD` for MySQL), NEVER in argv — argv shows in `ps` and `docker inspect`, the
-//! environment does not. No DSN string is assembled at all: the discrete `PG*` / `MYSQL*`
-//! connection variables connect the client, so there is no connection string to
-//! accidentally `format!` into a log. The only secret is the password env var.
+//! `MYSQL_PWD` for MySQL), NEVER in argv. Both argv and the container environment are
+//! visible to a privileged `docker inspect`, but argv leaks far more broadly — it shows
+//! in every process listing (`ps`, `/proc/<pid>/cmdline`) inside and outside the
+//! container, to any local observer, no daemon privilege required — whereas the
+//! container environment is only reachable with daemon/inspect access. Env is therefore
+//! the smaller exposure (not zero), and it is the right choice over argv. No DSN string
+//! is assembled at all: the discrete `PG*` / `MYSQL*` connection variables connect the
+//! client, so there is no connection string to accidentally `format!` into a log. The
+//! only secret is the password env var.
 //!
 //! ## `--data-only` vs full
 //! `--data-only` emits/restores ONLY the table data; the target keeps its OWN migrated
@@ -69,7 +74,13 @@ pub struct SqlInvocation {
 }
 
 /// Build the `pg_dump` invocation for an EXPORT. Custom format (`-Fc`): compressed and
-/// the natural input to `pg_restore`. `--data-only` emits only the data.
+/// the natural input to `pg_restore`. `--data-only` emits only the data AND EXCLUDES the
+/// host-owned migration ledger's rows (`boatramp_migrations.*`): the ledger is a schema
+/// INSIDE the tenant database, so a plain `--data-only` dump would carry its rows and a
+/// `pg_restore --data-only --exit-on-error` into the already-migrated target (the
+/// matching-fingerprint case — the PRIMARY use) would hit a primary-key conflict on the
+/// ledger and abort. Excluding it keeps the target's own `boatramp_migrations` ledger
+/// intact (the stated property).
 pub fn pg_dump_invocation(conn: &PgConnection, data_only: bool) -> SqlInvocation {
     let mut argv = vec![
         "pg_dump".to_string(),
@@ -79,6 +90,9 @@ pub fn pg_dump_invocation(conn: &PgConnection, data_only: bool) -> SqlInvocation
     ];
     if data_only {
         argv.push("--data-only".to_string());
+        // Exclude the host-owned migration ledger's DATA (schema-qualified pattern) so
+        // the restore does not collide with the target's existing ledger rows.
+        argv.push("--exclude-table-data=boatramp_migrations.*".to_string());
     }
     SqlInvocation {
         argv,
@@ -204,6 +218,20 @@ mod tests {
         let dump_full = pg_dump_invocation(&conn(), false);
         assert!(dump_do.argv.iter().any(|a| a == "--data-only"));
         assert!(!dump_full.argv.iter().any(|a| a == "--data-only"));
+        // A --data-only dump EXCLUDES the migration ledger's rows so a restore into an
+        // already-migrated target does not PK-conflict on it; a full dump does not.
+        assert!(
+            dump_do
+                .argv
+                .iter()
+                .any(|a| a == "--exclude-table-data=boatramp_migrations.*")
+        );
+        assert!(
+            !dump_full
+                .argv
+                .iter()
+                .any(|a| a == "--exclude-table-data=boatramp_migrations.*")
+        );
 
         let restore_do = pg_restore_invocation(&conn(), true);
         let restore_full = pg_restore_invocation(&conn(), false);

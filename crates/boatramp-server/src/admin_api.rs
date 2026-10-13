@@ -2247,6 +2247,11 @@ pub(super) async fn project_export(
     if q.project.is_empty() {
         return (StatusCode::BAD_REQUEST, "project is required\n").into_response();
     }
+    // Slug-validate before the name flows into temp paths, `local_path`, the blob prefix
+    // and `ProjectRef::qualified` — a `..`/`/` would traverse (mirrors every sibling).
+    if let Some(resp) = reject_invalid_name("project", &q.project) {
+        return resp;
+    }
     let path = match cap.export(&q.project, q.data_only).await {
         Ok(p) => p,
         Err(boatramp_core::project_export::ProjectExportError::Unavailable(m)) => {
@@ -2341,16 +2346,39 @@ pub(super) async fn project_import(
     if q.project.is_empty() {
         return (StatusCode::BAD_REQUEST, "project is required\n").into_response();
     }
-    // Stream the request body to a temp bundle file (bounded memory for a huge bundle).
+    // Slug-validate before the name reaches any path / `ProjectRef::qualified`.
+    if let Some(resp) = reject_invalid_name("project", &q.project) {
+        return resp;
+    }
+    // Stream the request body to a bundle file under the node's PRIVATE staging dir
+    // (never world-readable `/tmp` — the bundle carries full DB dumps): the dir is
+    // created `0700`, the file `0600` + `O_EXCL` (`create_new`). Bounded memory.
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let tmp = std::env::temp_dir().join(format!("boatramp-import-{}-{nanos}.brproj", q.project));
+    let stage_dir = cap.staging_root().join("incoming");
+    if let Err(e) = tokio::fs::create_dir_all(&stage_dir).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("project import: cannot create staging dir: {e}\n"),
+        )
+            .into_response();
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&stage_dir, std::fs::Permissions::from_mode(0o700));
+    }
+    let tmp = stage_dir.join(format!("import-{}-{nanos}.brproj", q.project));
     {
         use futures::StreamExt;
         use tokio::io::AsyncWriteExt;
-        let mut f = match tokio::fs::File::create(&tmp).await {
+        let mut open = tokio::fs::OpenOptions::new();
+        open.write(true).create_new(true); // O_EXCL
+        #[cfg(unix)]
+        open.mode(0o600);
+        let mut f = match open.open(&tmp).await {
             Ok(f) => f,
             Err(e) => {
                 return (

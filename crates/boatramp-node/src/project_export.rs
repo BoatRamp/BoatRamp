@@ -161,6 +161,38 @@ fn site_from_libsql_member(path: &str) -> Option<&str> {
     Some(body.rsplit_once('/').map(|(_, s)| s).unwrap_or(body))
 }
 
+/// Defense-in-depth project-slug validation at the DRIVER entry (the admin handler
+/// already rejects an invalid slug, but a direct driver caller must be guarded too — the
+/// `project` string flows into temp paths, libsql `local_path`, the blob prefix, and
+/// `ProjectRef::qualified`, so a `..`/`/` would traverse). Mirrors the canonical
+/// resource-name validator every other surface uses.
+fn check_project_slug(project: &str) -> Result<(), Perr> {
+    boatramp_core::project::validate_resource_name("project", project)
+        .map_err(|e| Perr::Other(e.to_string()))
+}
+
+/// Whether a `--data-only` import must REFUSE (absent `--allow-schema-skew`): it may
+/// proceed ONLY when both schema-ledger fingerprints are present AND equal (proven
+/// compatible). A mismatch — OR a MISSING fingerprint on either side — cannot prove the
+/// target's existing schema matches the data, so it blocks (fail-closed).
+fn data_only_skew_blocks(src_fp: Option<&str>, tgt_fp: Option<&str>) -> bool {
+    !matches!((src_fp, tgt_fp), (Some(s), Some(t)) if s == t)
+}
+
+/// The `(from, to)` directory pair to rename so extracted blob keys
+/// `hblob/{source}/…` become `hblob/{target}/…` (re-qualified to the TARGET project on
+/// import), or `None` when `source == target` (no re-key needed). `extract_blobs` is the
+/// directory the `blobs/` members were extracted into.
+fn blob_rekey_dirs(extract_blobs: &Path, source: &str, target: &str) -> Option<(PathBuf, PathBuf)> {
+    if source == target {
+        return None;
+    }
+    Some((
+        extract_blobs.join("hblob").join(source),
+        extract_blobs.join("hblob").join(target),
+    ))
+}
+
 /// The blob-store key prefix covering a project's objects.
 ///
 /// Every blob key is `hblob/{qualified-site}/{container}/{key}` where the qualified site
@@ -571,6 +603,7 @@ impl SqlEndpoint {
 #[async_trait]
 impl ProjectExport for NodeProjectExport {
     async fn export(&self, project: &str, data_only: bool) -> Result<PathBuf, Perr> {
+        check_project_slug(project)?;
         let created_at = now_secs();
         let session = self.work_dir.join(format!("export-{project}-{created_at}"));
         let stage = session.join("stage");
@@ -721,12 +754,19 @@ impl ProjectExport for NodeProjectExport {
         Ok(bundle)
     }
 
+    /// The node data-dir work area — the API handler stages an incoming bundle here
+    /// (node-private), never in world-readable `/tmp`.
+    fn staging_root(&self) -> PathBuf {
+        self.work_dir.clone()
+    }
+
     async fn import(
         &self,
         project: &str,
         bundle: &Path,
         opts: ImportOptions,
     ) -> Result<ImportReport, Perr> {
+        check_project_slug(project)?;
         let session = self
             .work_dir
             .join(format!("import-{project}-{}", now_secs()));
@@ -752,6 +792,22 @@ impl ProjectExport for NodeProjectExport {
         // --- blobs ---
         let blob_src_dir = extract.join("blobs");
         if blob_src_dir.exists() {
+            // RE-QUALIFY blob keys to the TARGET project. The bundle's blob members are
+            // keyed `hblob/{source_project}/{site}/…`; the FsStorage maps a file's path to
+            // its key verbatim, so renaming the `{source_project}` segment directory to the
+            // target's re-keys every object at once — `hblob/{source}/…` → `hblob/{target}/…`.
+            // A no-op when source == target; on a project RENAME (preview-a → preview-b)
+            // this lands the objects in the TARGET's scope instead of commingling under the
+            // source's. (`project` is a validated slug, so the join cannot traverse.)
+            if let Some((from, to)) =
+                blob_rekey_dirs(&blob_src_dir, &manifest.source.project, project)
+                && from.exists()
+            {
+                if let Some(parent) = to.parent() {
+                    tokio::fs::create_dir_all(parent).await.map_err(other)?;
+                }
+                tokio::fs::rename(&from, &to).await.map_err(other)?;
+            }
             let src: Arc<dyn Storage> = Arc::new(boatramp_storage::FsStorage::new(&blob_src_dir));
             let bopts = boatramp_storage::blob_migrate::MigrateOptions {
                 dry_run: !opts.apply,
@@ -772,15 +828,19 @@ impl ProjectExport for NodeProjectExport {
             })?;
             let (conn, image, _ver) = self.resolve_pg(project, db, cfg).await?;
 
-            // Schema-ledger fingerprint SKEW check (both sides must agree for --data-only).
-            let src_fp = m.pg.as_ref().and_then(|p| p.schema_fingerprint.clone());
-            let tgt_fp = self.schema_fingerprint(project, db).await;
-            if let (Some(src_fp), Some(tgt_fp)) = (src_fp, tgt_fp)
-                && src_fp != tgt_fp
-            {
-                report.schema_skew.push(db.to_string());
-                if !opts.allow_schema_skew {
-                    return Err(Perr::SchemaSkew(vec![db.to_string()]));
+            // Schema-ledger fingerprint SKEW check — for a `--data-only` import the data
+            // lands into the target's EXISTING schema, so we must PROVE the schemas agree
+            // (both fingerprints present AND equal). A mismatch OR a MISSING fingerprint on
+            // either side means "cannot prove compatibility" ⇒ fail CLOSED (require
+            // `--allow-schema-skew`). A full bundle carries its own schema, so no check.
+            if manifest.data_only {
+                let src_fp = m.pg.as_ref().and_then(|p| p.schema_fingerprint.clone());
+                let tgt_fp = self.schema_fingerprint(project, db).await;
+                if data_only_skew_blocks(src_fp.as_deref(), tgt_fp.as_deref()) {
+                    report.schema_skew.push(db.to_string());
+                    if !opts.allow_schema_skew {
+                        return Err(Perr::SchemaSkew(vec![db.to_string()]));
+                    }
                 }
             }
 
@@ -811,15 +871,19 @@ impl ProjectExport for NodeProjectExport {
             })?;
             let (conn, image, _ver) = self.resolve_mysql(project, db, cfg).await?;
 
-            // Schema-ledger fingerprint SKEW check (both sides must agree for --data-only).
-            let src_fp = m.pg.as_ref().and_then(|p| p.schema_fingerprint.clone());
-            let tgt_fp = self.schema_fingerprint(project, db).await;
-            if let (Some(src_fp), Some(tgt_fp)) = (src_fp, tgt_fp)
-                && src_fp != tgt_fp
-            {
-                report.schema_skew.push(db.to_string());
-                if !opts.allow_schema_skew {
-                    return Err(Perr::SchemaSkew(vec![db.to_string()]));
+            // Schema-ledger fingerprint SKEW check — for a `--data-only` import the data
+            // lands into the target's EXISTING schema, so we must PROVE the schemas agree
+            // (both fingerprints present AND equal). A mismatch OR a MISSING fingerprint on
+            // either side means "cannot prove compatibility" ⇒ fail CLOSED (require
+            // `--allow-schema-skew`). A full bundle carries its own schema, so no check.
+            if manifest.data_only {
+                let src_fp = m.pg.as_ref().and_then(|p| p.schema_fingerprint.clone());
+                let tgt_fp = self.schema_fingerprint(project, db).await;
+                if data_only_skew_blocks(src_fp.as_deref(), tgt_fp.as_deref()) {
+                    report.schema_skew.push(db.to_string());
+                    if !opts.allow_schema_skew {
+                        return Err(Perr::SchemaSkew(vec![db.to_string()]));
+                    }
                 }
             }
 
@@ -1015,6 +1079,43 @@ mod tests {
         assert_eq!(pg_member_path("app"), "sql/app.pgc");
         assert_eq!(db_from_pg_member("sql/app.pgc"), Some("app"));
         assert_eq!(db_from_pg_member("libsql/x.sqlite"), None);
+    }
+
+    #[test]
+    fn check_project_slug_rejects_traversal() {
+        assert!(check_project_slug("acme").is_ok());
+        assert!(check_project_slug("preview-b").is_ok());
+        // A traversing / separator-bearing project is refused (defense-in-depth).
+        assert!(check_project_slug("../etc").is_err());
+        assert!(check_project_slug("a/b").is_err());
+        assert!(check_project_slug("").is_err());
+    }
+
+    #[test]
+    fn data_only_skew_fails_closed_on_a_missing_fingerprint() {
+        // Proven compatible ONLY when both present AND equal.
+        assert!(!data_only_skew_blocks(Some("abc"), Some("abc")));
+        // Mismatch blocks.
+        assert!(data_only_skew_blocks(Some("abc"), Some("xyz")));
+        // A MISSING fingerprint on EITHER side blocks (fail-closed) — the security fix.
+        assert!(data_only_skew_blocks(None, Some("abc")));
+        assert!(data_only_skew_blocks(Some("abc"), None));
+        assert!(data_only_skew_blocks(None, None));
+    }
+
+    #[test]
+    fn blob_rekey_only_on_project_rename() {
+        let dir = std::path::Path::new("/x/extract/blobs");
+        // Same project -> no re-key.
+        assert_eq!(blob_rekey_dirs(dir, "acme", "acme"), None);
+        // Rename -> move hblob/{source} -> hblob/{target}.
+        assert_eq!(
+            blob_rekey_dirs(dir, "preview-a", "preview-b"),
+            Some((
+                dir.join("hblob").join("preview-a"),
+                dir.join("hblob").join("preview-b"),
+            ))
+        );
     }
 
     #[test]

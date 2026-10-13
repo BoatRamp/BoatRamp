@@ -93,4 +93,12 @@ pub trait ProjectExport: Send + Sync {
         bundle: &Path,
         opts: ImportOptions,
     ) -> Result<ImportReport, ProjectExportError>;
+
+    /// A node-private directory the API handler should stage an INCOMING import bundle
+    /// into (a bundle carries a full DB dump — it must never sit in world-readable
+    /// `/tmp`). The node implementation returns its own data-dir work area; the default
+    /// is the system temp dir (used only by a stub with no node context).
+    fn staging_root(&self) -> PathBuf {
+        std::env::temp_dir()
+    }
 }

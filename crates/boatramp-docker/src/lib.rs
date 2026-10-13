@@ -762,8 +762,10 @@ impl ComputeBackend for DockerBackend {
             .map_err(|e| BackendError::Other(format!("ephemeral create: {e}")))?;
 
         // Attach BEFORE start so no output is missed, requesting a live bidirectional
-        // stream.
-        let attach = self
+        // stream. If attach (or start, below) fails, the container was CREATED but never
+        // ran — `auto_remove` only reaps a container that actually started, so force-
+        // remove it here or it leaks and accumulates on repeated daemon errors.
+        let attach = match self
             .docker
             .attach_container(
                 &created.id,
@@ -777,7 +779,13 @@ impl ComputeBackend for DockerBackend {
                 }),
             )
             .await
-            .map_err(|e| BackendError::Other(format!("ephemeral attach: {e}")))?;
+        {
+            Ok(a) => a,
+            Err(e) => {
+                self.force_remove_container(&name).await;
+                return Err(BackendError::Other(format!("ephemeral attach: {e}")));
+            }
+        };
         let mut output = attach.output;
         let mut input = attach.input;
 
@@ -789,10 +797,14 @@ impl ComputeBackend for DockerBackend {
                 .wait_container(&created.id, None::<WaitContainerOptions<String>>),
         );
 
-        self.docker
+        if let Err(e) = self
+            .docker
             .start_container::<String>(&created.id, None)
             .await
-            .map_err(|e| BackendError::Other(format!("ephemeral start: {e}")))?;
+        {
+            self.force_remove_container(&name).await;
+            return Err(BackendError::Other(format!("ephemeral start: {e}")));
+        }
 
         // Feed stdin, stream stdout to the sink, and await the exit code — all
         // concurrently, bounded by a backstop timeout. Feeding stdin alongside the
@@ -883,16 +895,7 @@ impl ComputeBackend for DockerBackend {
                 .kill_container(&name, None::<KillContainerOptions<String>>)
                 .await;
         }
-        let _ = self
-            .docker
-            .remove_container(
-                &name,
-                Some(RemoveContainerOptions {
-                    force: true,
-                    ..Default::default()
-                }),
-            )
-            .await;
+        self.force_remove_container(&name).await;
 
         match outcome {
             Err(_) => Err(BackendError::Other(format!(
@@ -952,6 +955,22 @@ fn ephemeral_container_name() -> String {
 }
 
 impl DockerBackend {
+    /// Best-effort force-remove a container by name (ignores "no such container"). Used
+    /// to reap an ephemeral container on every exit path — including a created-but-never-
+    /// started one that `auto_remove` would NOT reap.
+    async fn force_remove_container(&self, name: &str) {
+        let _ = self
+            .docker
+            .remove_container(
+                name,
+                Some(RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await;
+    }
+
     /// Pull `reference` from its registry (reused by `materialize` and the one-shot
     /// `run_ephemeral` client pull) and return the fully-qualified reference actually
     /// pulled.
