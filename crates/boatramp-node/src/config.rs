@@ -1665,6 +1665,13 @@ pub struct ComputeConfig {
     /// across daemons + Docker Desktop / macOS); `bind` bind-mounts a host directory
     /// under `<data_dir>/compute/volumes/<name>` (local daemon only).
     pub docker_volume_mode: boatramp_docker::DockerVolumeMode,
+    /// Wall-clock backstop (seconds) for one project export/import client run
+    /// (`run_ephemeral`: a `pg_dump`/`pg_restore` container). `0` (default) keeps the
+    /// backend's generous built-in default (6h). Raise it for a very large migration so
+    /// the backstop never kills legitimate work; the real unreachable-DSN hang is bounded
+    /// far tighter by the client's own connect timeout.
+    #[serde(default)]
+    pub docker_ephemeral_timeout_secs: u64,
     /// Guest-reachable base URL of the compute **sql-shim** (PLAN-compute-bindings) —
     /// e.g. `http://10.0.0.1:8081` (the compute bridge gateway) or the docker bridge
     /// gateway. Set ⇒ a workload's `--bind sql` reaches the managed database through a
@@ -1805,6 +1812,7 @@ impl Default for ComputeConfig {
             region: None,
             docker_endpoint: boatramp_docker::DockerEndpoint::default(),
             docker_volume_mode: boatramp_docker::DockerVolumeMode::default(),
+            docker_ephemeral_timeout_secs: 0,
             sql_shim_url: None,
             blob_shim_url: None,
             blob_shim_max_object_bytes: None,

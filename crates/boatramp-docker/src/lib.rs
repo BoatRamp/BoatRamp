@@ -178,6 +178,12 @@ pub struct DockerBackend {
     /// (single-tenant only); off under the multi-tenant guard, so a cap-add spec is
     /// forced back to the dropped-`ALL` default.
     cap_add_allowed: bool,
+    /// Wall-clock backstop for a single [`run_ephemeral`](ComputeBackend::run_ephemeral)
+    /// invocation (export/import client run). Generous by default
+    /// ([`EPHEMERAL_RUN_TIMEOUT`]); the operator raises it for a very large migration so
+    /// the backstop never kills legitimate work (the real unreachable-DSN hang is bounded
+    /// far tighter by the client's own connect timeout).
+    ephemeral_timeout: std::time::Duration,
 }
 
 impl DockerBackend {
@@ -193,6 +199,7 @@ impl DockerBackend {
             data_dir: PathBuf::from("."),
             writable_root_allowed: false,
             cap_add_allowed: false,
+            ephemeral_timeout: EPHEMERAL_RUN_TIMEOUT,
         })
     }
 
@@ -205,7 +212,17 @@ impl DockerBackend {
             data_dir: PathBuf::from("."),
             writable_root_allowed: false,
             cap_add_allowed: false,
+            ephemeral_timeout: EPHEMERAL_RUN_TIMEOUT,
         }
+    }
+
+    /// Set the wall-clock backstop for a single `run_ephemeral` invocation (0 ⇒ keep the
+    /// generous default). Wired from `[compute] docker_ephemeral_timeout_secs`.
+    pub fn with_ephemeral_timeout(mut self, timeout: std::time::Duration) -> Self {
+        if !timeout.is_zero() {
+            self.ephemeral_timeout = timeout;
+        }
+        self
     }
 
     /// Select how a launched workload's endpoint is reported (see [`DockerEndpoint`]).
@@ -693,17 +710,20 @@ impl ComputeBackend for DockerBackend {
         image: &str,
         argv: &[String],
         env: &[(String, String)],
-        stdin: Option<&[u8]>,
+        mut stdin: Option<&mut (dyn futures::io::AsyncRead + Send + Unpin)>,
         stdout: &mut (dyn futures::io::AsyncWrite + Send + Unpin),
     ) -> Result<i32, BackendError> {
-        // `input` (bollard's stdin writer) is a tokio writer; the caller's `stdout`
-        // sink is a std-agnostic `futures` writer. Both extension traits are in scope.
+        // `input` (bollard's stdin writer) is a tokio writer; the caller's `stdin`
+        // reader + `stdout` sink are std-agnostic `futures` streams. All the extension
+        // traits are in scope.
+        use futures::io::AsyncReadExt as FuturesReadExt;
         use futures::io::AsyncWriteExt as FuturesWriteExt;
         use tokio::io::AsyncWriteExt as TokioWriteExt;
 
         if argv.is_empty() {
             return Err(BackendError::Other("run_ephemeral: empty argv".into()));
         }
+        let has_stdin = stdin.is_some();
 
         // Pull the client image (pg_dump/pg_restore/psql live here).
         let reference = self.pull_image(image).await?;
@@ -720,11 +740,11 @@ impl ComputeBackend for DockerBackend {
             cmd: Some(argv.to_vec()),
             env: Some(env_strings),
             host_config: Some(host_config),
-            attach_stdin: Some(stdin.is_some()),
+            attach_stdin: Some(has_stdin),
             attach_stdout: Some(true),
             attach_stderr: Some(true),
-            open_stdin: Some(stdin.is_some()),
-            stdin_once: Some(stdin.is_some()),
+            open_stdin: Some(has_stdin),
+            stdin_once: Some(has_stdin),
             ..Default::default()
         };
 
@@ -748,7 +768,7 @@ impl ComputeBackend for DockerBackend {
             .attach_container(
                 &created.id,
                 Some(AttachContainerOptions::<String> {
-                    stdin: Some(stdin.is_some()),
+                    stdin: Some(has_stdin),
                     stdout: Some(true),
                     stderr: Some(true),
                     stream: Some(true),
@@ -779,23 +799,34 @@ impl ComputeBackend for DockerBackend {
         // drain avoids a full-pipe deadlock on a large piped restore.
         let mut stderr_buf: Vec<u8> = Vec::new();
         let run = async {
-            let writer =
-                async {
-                    if let Some(bytes) = stdin {
-                        input.write_all(bytes).await.map_err(|e| {
+            let writer = async {
+                if let Some(reader) = stdin.as_mut() {
+                    // STREAM stdin in: read a chunk, write it, repeat — never buffer
+                    // the (multi-GB) restore payload whole. Symmetric with stdout.
+                    let mut buf = [0u8; 64 * 1024];
+                    loop {
+                        let n = reader.read(&mut buf).await.map_err(|e| {
+                            BackendError::Other(format!("ephemeral stdin read: {e}"))
+                        })?;
+                        if n == 0 {
+                            break;
+                        }
+                        input.write_all(&buf[..n]).await.map_err(|e| {
                             BackendError::Other(format!("ephemeral stdin write: {e}"))
                         })?;
-                        input.flush().await.map_err(|e| {
-                            BackendError::Other(format!("ephemeral stdin flush: {e}"))
-                        })?;
                     }
-                    // Half-close stdin so the command sees EOF (also when there was none).
                     input
-                        .shutdown()
+                        .flush()
                         .await
-                        .map_err(|e| BackendError::Other(format!("ephemeral stdin close: {e}")))?;
-                    Ok::<(), BackendError>(())
-                };
+                        .map_err(|e| BackendError::Other(format!("ephemeral stdin flush: {e}")))?;
+                }
+                // Half-close stdin so the command sees EOF (also when there was none).
+                input
+                    .shutdown()
+                    .await
+                    .map_err(|e| BackendError::Other(format!("ephemeral stdin close: {e}")))?;
+                Ok::<(), BackendError>(())
+            };
             let reader = async {
                 while let Some(chunk) = output.next().await {
                     match chunk
@@ -842,7 +873,7 @@ impl ComputeBackend for DockerBackend {
             code
         };
 
-        let outcome = tokio::time::timeout(EPHEMERAL_RUN_TIMEOUT, run).await;
+        let outcome = tokio::time::timeout(self.ephemeral_timeout, run).await;
 
         // Cleanup: auto_remove should already reap it, but kill-on-timeout +
         // best-effort force-remove guarantee no leaked container or host-port/PID hold.
@@ -866,7 +897,7 @@ impl ComputeBackend for DockerBackend {
         match outcome {
             Err(_) => Err(BackendError::Other(format!(
                 "ephemeral run timed out after {}s (killed)",
-                EPHEMERAL_RUN_TIMEOUT.as_secs()
+                self.ephemeral_timeout.as_secs()
             ))),
             Ok(Ok(code)) => Ok(code),
             Ok(Err(e)) if stderr_buf.is_empty() => Err(e),
@@ -880,9 +911,21 @@ impl ComputeBackend for DockerBackend {
             }
         }
     }
+
+    async fn replica_direct_host(&self, handle: &InstanceHandle) -> Option<String> {
+        // The container name is encoded in the handle ref (fallback to the deterministic
+        // name); `container_ip` resolves its bridge IP from an inspect. A sibling
+        // ephemeral client on the same daemon bridge reaches that IP directly, even when
+        // the operator endpoint is a host-loopback publish (`Published` mode).
+        let name = decode_ref(&handle.backend_ref)
+            .map(|(n, _, _)| n)
+            .unwrap_or_else(|| container_name(&handle.project, &handle.workload, handle.replica));
+        self.container_ip(&name).await.ok()
+    }
 }
 
-/// A generous wall-clock backstop for a single `run_ephemeral` invocation. The real
+/// The generous DEFAULT wall-clock backstop for a single `run_ephemeral` invocation
+/// (overridable via [`DockerBackend::with_ephemeral_timeout`]). The real
 /// "unreachable DSN" hang is bounded far tighter by the client's own connect timeout
 /// (the driver sets `connect_timeout` in the DSN), so this exists only to guarantee a
 /// wedged daemon / stuck stream can never pin a container (and the host port/PID budget)
