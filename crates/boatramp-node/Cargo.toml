@@ -69,6 +69,10 @@ async-trait.workspace = true
 tar.workspace = true
 sha2.workspace = true
 hex.workspace = true
+# `compat` adapters (tokio <-> futures AsyncRead/Write) for the project-export driver:
+# it streams a bundle member file (tokio) through `ComputeBackend::run_ephemeral`'s
+# std-agnostic `futures` stdin/stdout. Optional — pulled only by `project-export`.
+tokio-util = { workspace = true, features = ["compat"], optional = true }
 
 [features]
 # Cfg markers matching the binary's feature set: `config` parses every section in
@@ -115,6 +119,12 @@ handlers = [
 # External bring-your-own SQL for the handler `sql` binding (each implies handlers).
 sql-postgres = ["handlers", "boatramp-storage/sql-postgres"]
 sql-mysql = ["handlers", "boatramp-storage/sql-mysql"]
+# Native project export/import driver (env-clone): the cross-crate orchestration that
+# runs `pg_dump`/`pg_restore` in an ephemeral docker container, snapshots libsql,
+# exports the control-plane KV slice, and copies blobs, assembling/reading a BRPROJ
+# bundle. Needs the managed-pg DSN seam (sql-postgres => handlers => the libsql engine)
+# and a local blob backend (fs) for the blob staging store.
+project-export = ["sql-postgres", "fs", "dep:tokio-util"]
 # The per-project SMTP email gateway (`boatramp:handlers/email`): wires the profile
 # store + delivery spool into the handler runtime. Enables the server's `email`
 # feature (which pulls `boatramp-handlers/email` + lettre); implies handlers.

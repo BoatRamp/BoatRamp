@@ -822,6 +822,68 @@ impl LibsqlSqlBackends {
         Ok(backend)
     }
 
+    /// **Snapshot a libsql database into `dest`** for project export — a
+    /// transactionally-consistent copy (`VACUUM INTO`, safe online), then verified with
+    /// `PRAGMA integrity_check`, and crucially **WITHOUT ever touching the source** (the
+    /// one difference from [`Self::move_database`]: no source delete). `site` is the
+    /// already project-qualified site identity (as the rest of this backend uses) and
+    /// `name` the database name (`""`/`"default"` fold to the reserved default).
+    ///
+    /// Local single-node only: `VACUUM INTO '<path>'` writes on the database host's
+    /// filesystem, so a **remote sqld** snapshot would land on the sqld host, not in the
+    /// local bundle — refused fail-closed (a remote namespace snapshot needs a sqld fork
+    /// API, a documented fast-follow). Returns the verified `integrity_check` result
+    /// (`"ok"`). A pre-existing `dest` stub is removed first (`VACUUM INTO` refuses an
+    /// existing output file); on an integrity failure the bad copy is removed and the
+    /// source is left intact.
+    pub async fn snapshot_into(
+        &self,
+        site: &str,
+        name: &str,
+        dest: &Path,
+    ) -> Result<String, SqlError> {
+        // REMOTE (sqld): refuse — detected structurally from how the backend was built.
+        let Mode::Local { .. } = &self.mode else {
+            return Err(SqlError::other(
+                "libsql snapshot is supported for local single-node databases only; a remote sqld \
+                 namespace snapshot needs a server-side fork API and is not yet supported",
+            ));
+        };
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent).map_err(SqlError::other)?;
+        }
+        // A stale zero-byte/partial stub would make `VACUUM INTO` fail ("output file
+        // already exists"); remove it so the snapshot is the sole writer of `dest`.
+        let _ = std::fs::remove_file(dest);
+
+        // Snapshot the live source (online-consistent) WITHOUT deleting it.
+        let source = self.open_one(site, name).await?;
+        source.vacuum_into(dest).await?;
+
+        // Verify the destination is a sound SQLite database (the rehome/move discipline).
+        let dst = LibsqlSql::open_local(dest).await?;
+        let integrity = {
+            let mut tx = dst.begin_read_only().await?;
+            let rows = tx.query("PRAGMA integrity_check", &[]).await?;
+            tx.commit().await?;
+            match rows.rows.first().and_then(|r| r.first()) {
+                Some(SqlValue::Text(s)) => s.clone(),
+                other => {
+                    return Err(SqlError::other(format!(
+                        "snapshot integrity_check returned an unexpected result: {other:?}"
+                    )));
+                }
+            }
+        };
+        if integrity != "ok" {
+            let _ = std::fs::remove_file(dest);
+            return Err(SqlError::other(format!(
+                "snapshot integrity_check failed after copy (source left intact): {integrity}"
+            )));
+        }
+        Ok(integrity)
+    }
+
     /// **Default-scope re-home** (v0.31.0 Finding 8): relocate a reserved-`default`-project site's
     /// libsql database `(site, name)` from its OLD bare identity (`site`, the pre-fix
     /// `qualified(DEFAULT, site)`) to its NEW two-segment identity (`default/site`), data intact.
@@ -1943,6 +2005,39 @@ mod tests {
         assert_eq!(
             one(&db, "SELECT v FROM t").await,
             vec![SqlValue::Text("premigration".into())]
+        );
+    }
+
+    /// Snapshot copies the data into `dest`, verifies it, and leaves the source intact.
+    #[tokio::test]
+    async fn snapshot_into_copies_and_keeps_source() {
+        let dir = factory_dir("snapshot-ok");
+        let backends = LibsqlSqlBackends::local(dir.clone());
+        std::fs::create_dir_all(&dir).unwrap();
+        // Seed at the exact (site, name) path `open_one`/`snapshot_into` resolve.
+        let src_path = dir.join("blog.db");
+        {
+            let seed: Arc<dyn SqlBackend> =
+                Arc::new(LibsqlSql::open_local(&src_path).await.unwrap());
+            put(&seed, "CREATE TABLE t (v TEXT)").await;
+            put(&seed, "INSERT INTO t VALUES ('exported')").await;
+        }
+
+        let dest = dir.join("bundle").join("blog.sqlite");
+        let integrity = backends
+            .snapshot_into("blog", "", &dest)
+            .await
+            .expect("local snapshot succeeds");
+        assert_eq!(integrity, "ok");
+
+        // The SOURCE is still present (snapshot never deletes it).
+        assert!(src_path.exists(), "source must survive a snapshot");
+
+        // The snapshot holds the data.
+        let snap: Arc<dyn SqlBackend> = Arc::new(LibsqlSql::open_local(&dest).await.unwrap());
+        assert_eq!(
+            one(&snap, "SELECT v FROM t").await,
+            vec![SqlValue::Text("exported".into())]
         );
     }
 

@@ -70,6 +70,10 @@ pub mod pg_client;
 /// SHA-256). Dependency-light + testable in every build; the driver that fills it is
 /// feature-gated.
 pub mod project_bundle;
+/// The project export/import DRIVER (env-clone orchestration) — `boatramp-node`'s impl
+/// of `boatramp_core::project_export::ProjectExport`, behind the `project-export` feature.
+#[cfg(feature = "project-export")]
+pub mod project_export;
 #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
 pub mod repair;
 /// Node-level base S3 credential sourcing from the `[secrets]` sealed store (#505).
