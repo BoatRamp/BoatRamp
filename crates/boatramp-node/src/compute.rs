@@ -195,7 +195,10 @@ pub async fn build_compute(
                 .with_volume_mode(cfg.docker_volume_mode)
                 .with_data_dir(data_dir)
                 .with_writable_root_allowed(!strict)
-                .with_cap_add_allowed(!strict);
+                .with_cap_add_allowed(!strict)
+                .with_ephemeral_timeout(std::time::Duration::from_secs(
+                    cfg.docker_ephemeral_timeout_secs,
+                ));
             if docker.reachable().await {
                 backends.insert("docker".to_string(), std::sync::Arc::new(docker));
             } else {

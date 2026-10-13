@@ -416,9 +416,11 @@ pub trait ComputeBackend: Send + Sync {
     /// - `env` is the process environment as `(KEY, VALUE)` pairs — this is where a
     ///   DSN / `PGPASSWORD` belongs, so the credential never shows in `ps`/`inspect`
     ///   argv. Callers MUST NOT place a credential in `argv`.
-    /// - `stdin`, when present, is written to the command's standard input and the
-    ///   stream is then half-closed (EOF), fed **concurrently** with draining stdout so
-    ///   a large piped restore cannot deadlock on a full pipe.
+    /// - `stdin`, when present, is a **reader streamed** to the command's standard input
+    ///   as it is read (never buffered whole — a multi-gigabyte restore flows in with
+    ///   bounded memory, symmetric with `stdout`), then the stream is half-closed (EOF).
+    ///   It is fed **concurrently** with draining stdout so a large piped restore cannot
+    ///   deadlock on a full pipe.
     /// - `stdout` receives the command's standard output **as a true byte stream** —
     ///   chunks are written straight through as they arrive, never buffered whole, so a
     ///   multi-gigabyte dump flows to the sink (a file / tar member) with bounded memory.
@@ -438,10 +440,21 @@ pub trait ComputeBackend: Send + Sync {
         _image: &str,
         _argv: &[String],
         _env: &[(String, String)],
-        _stdin: Option<&[u8]>,
+        _stdin: Option<&mut (dyn futures::io::AsyncRead + Send + Unpin)>,
         _stdout: &mut (dyn futures::io::AsyncWrite + Send + Unpin),
     ) -> Result<i32, BackendError> {
         Err(BackendError::Unsupported)
+    }
+
+    /// Resolve a **direct, intra-backend-reachable host** for a running replica — e.g. a
+    /// docker container's bridge IP — so another workload the same backend launches (a
+    /// one-shot [`run_ephemeral`](Self::run_ephemeral) client) can reach it even when the
+    /// operator-facing [`Endpoint`] is a host-loopback publish a sibling container cannot
+    /// route to (the `Published` docker endpoint mode). `None` (the default) means the
+    /// operator endpoint is already directly reachable (external DSNs, `Bridge` mode),
+    /// so the caller uses it verbatim.
+    async fn replica_direct_host(&self, _handle: &InstanceHandle) -> Option<String> {
+        None
     }
 
     /// List this backend's persistent volumes (the host-side backing for a
