@@ -1223,6 +1223,15 @@ pub enum VersionMapError {
          not restore its dump — upgrade boatramp or widen the client-image map"
     )]
     TooNew(u32, u32),
+    /// The MySQL-shaped server is actually **MariaDB** (a distinct wire/dump dialect). A
+    /// `mysql`/`mysqldump` client can MISDUMP or misrestore it, so we REFUSE rather than
+    /// silently use the wrong client — MariaDB support needs its own client image.
+    #[error(
+        "server is MariaDB ({0:?}), not MySQL: refusing to dump/restore it with a mysql client \
+         (distinct dialect); MariaDB export/import needs a dedicated mariadb client (not yet \
+         supported)"
+    )]
+    MariaDb(String),
 }
 
 /// Oldest Postgres major this build will select an export/import client image for.
@@ -1269,6 +1278,44 @@ pub fn pg_client_image_for_server_version(
         return Err(VersionMapError::TooNew(major, PG_CLIENT_MAX_MAJOR));
     }
     Ok(format!("pgvector/pgvector:pg{major}"))
+}
+
+/// Oldest MySQL major this build will select a client image for (pre-5 is long dead).
+pub const MYSQL_CLIENT_MIN_MAJOR: u32 = 5;
+
+/// The leading run of ASCII digits of `s`, parsed (`"0-log"` → `0`, `""` → `None`).
+fn leading_u32(s: &str) -> Option<u32> {
+    let digits: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().ok()
+}
+
+/// Map a MySQL server's `SELECT VERSION()` banner to the stock `mysql:<maj>.<min>` client
+/// image whose `mysqldump`/`mysql` can dump+restore it (same major.minor — a client >=
+/// the server). A **MariaDB** banner (the version string contains `MariaDB`, e.g.
+/// `"10.11.6-MariaDB-…"`) is REFUSED with [`VersionMapError::MariaDb`] — its dialect needs
+/// a dedicated client, never a silent mysql dump. A pre-5 or unparsable banner is refused.
+/// Pure (no IO) so it is unit-mutation-gated in the merge gate.
+pub fn mysql_client_image_for_server_version(version: &str) -> Result<String, VersionMapError> {
+    let v = version.trim();
+    if v.to_ascii_lowercase().contains("mariadb") {
+        return Err(VersionMapError::MariaDb(version.to_string()));
+    }
+    // A MySQL banner leads with "maj.min[.patch][-suffix]" (e.g. "8.0.35", "8.4.0",
+    // "5.7.44", "8.0.35-0ubuntu0.1"). Take the leading digit runs of the first two dot
+    // segments.
+    let mut segs = v.split('.');
+    let major = segs
+        .next()
+        .and_then(leading_u32)
+        .ok_or_else(|| VersionMapError::Unparsable(version.to_string()))?;
+    let minor = segs
+        .next()
+        .and_then(leading_u32)
+        .ok_or_else(|| VersionMapError::Unparsable(version.to_string()))?;
+    if major < MYSQL_CLIENT_MIN_MAJOR {
+        return Err(VersionMapError::TooOld(major, MYSQL_CLIENT_MIN_MAJOR));
+    }
+    Ok(format!("mysql:{major}.{minor}"))
 }
 
 /// Synthesize the immutable [`ComputeSpec`] for a managed co-located database from a
@@ -1793,6 +1840,45 @@ mod tests {
         assert!(matches!(
             pg_client_image_for_server_version("990000"),
             Err(VersionMapError::TooNew(99, PG_CLIENT_MAX_MAJOR))
+        ));
+    }
+
+    #[test]
+    fn mysql_client_image_matches_major_minor_and_refuses_mariadb() {
+        // maj.min image at the server's version (ignore patch + suffix).
+        assert_eq!(
+            mysql_client_image_for_server_version("8.0.35").unwrap(),
+            "mysql:8.0"
+        );
+        assert_eq!(
+            mysql_client_image_for_server_version("8.4.0").unwrap(),
+            "mysql:8.4"
+        );
+        assert_eq!(
+            mysql_client_image_for_server_version("5.7.44").unwrap(),
+            "mysql:5.7"
+        );
+        assert_eq!(
+            mysql_client_image_for_server_version("8.0.35-0ubuntu0.1").unwrap(),
+            "mysql:8.0"
+        );
+        // MariaDB is REFUSED (a distinct dialect) — never silently dumped with mysql.
+        assert!(matches!(
+            mysql_client_image_for_server_version("10.11.6-MariaDB-1:10.11.6+maria~ubu2204"),
+            Err(VersionMapError::MariaDb(_))
+        ));
+        assert!(matches!(
+            mysql_client_image_for_server_version("11.4.2-MariaDB"),
+            Err(VersionMapError::MariaDb(_))
+        ));
+        // Pre-5 and unparsable are refused.
+        assert!(matches!(
+            mysql_client_image_for_server_version("4.1.22"),
+            Err(VersionMapError::TooOld(4, MYSQL_CLIENT_MIN_MAJOR))
+        ));
+        assert!(matches!(
+            mysql_client_image_for_server_version("not-a-version"),
+            Err(VersionMapError::Unparsable(_))
         ));
     }
 

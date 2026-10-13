@@ -51,6 +51,8 @@ pub const KV_MEMBER_PATH: &str = "kv.brkvdump";
 pub enum MemberKind {
     /// A Postgres `pg_dump` (under `sql/<db>.pgc`).
     PgDump,
+    /// A MySQL `mysqldump` (under `sql/<db>.sql`).
+    MysqlDump,
     /// A libsql `VACUUM INTO` snapshot (under `libsql/<project>/<site>/<db>.sqlite`).
     Libsql,
     /// The control-plane KV logical slice (`kv.brkvdump`).
@@ -59,15 +61,18 @@ pub enum MemberKind {
     Blob,
 }
 
-/// Postgres provenance for a `PgDump` member: the detected server version, the client
-/// image used to produce (and required to restore) it, and the schema-ledger
-/// fingerprint for the import schema-skew check.
+/// SQL-dump provenance for a `PgDump`/`MysqlDump` member: the detected server version,
+/// the client image used to produce (and required to restore) it, and the schema-ledger
+/// fingerprint for the import schema-skew check. (Field named `pg` historically; it
+/// carries MySQL provenance too — the engine is the member's [`MemberKind`].)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PgMemberInfo {
-    /// The source server's `SHOW server_version_num` (e.g. `"160004"`).
+    /// The source server's version banner (`SHOW server_version_num` for Postgres,
+    /// `SELECT VERSION()` for MySQL).
     pub server_version_num: String,
-    /// The `pgvector/pgvector:pg<major>` client image the dump was produced with — an
-    /// import MUST use a client whose major is >= this (the version-match invariant).
+    /// The client image the dump was produced with (`pgvector/pgvector:pg<major>` or
+    /// `mysql:<maj.min>`) — an import MUST use a client whose version is >= this (the
+    /// version-match invariant).
     pub client_image: String,
     /// A fingerprint of the source's `boatramp_migrations` ledger, so a `--data-only`
     /// import can REFUSE a schema-skewed target (its migrated schema differs from what
