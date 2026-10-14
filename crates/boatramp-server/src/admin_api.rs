@@ -2218,10 +2218,27 @@ pub(super) struct ProjectExportQuery {
     project: String,
     #[serde(default = "default_data_only")]
     data_only: bool,
+    /// Also include the identity transport container (requires the transport-key header).
+    /// Default off — the safe, identity-free bundle.
+    #[serde(default)]
+    include_identity: bool,
 }
 
 fn default_data_only() -> bool {
     true
+}
+
+/// The HTTP header carrying the operator transport passphrase for `--include-identity`
+/// export / `--identity adopt` import. A header (not a query param) so the secret never
+/// lands in a URL / access log; sent over TLS. The value is the raw passphrase bytes.
+const TRANSPORT_KEY_HEADER: &str = "x-boatramp-transport-key";
+
+fn transport_key_from_headers(headers: &HeaderMap) -> Option<Vec<u8>> {
+    headers
+        .get(TRANSPORT_KEY_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.as_bytes().to_vec())
+        .filter(|b| !b.is_empty())
 }
 
 /// Export a project to a `BRPROJ` bundle, streamed as the response body
@@ -2230,6 +2247,7 @@ fn default_data_only() -> bool {
 /// even on a client disconnect). `501` when no export driver is wired.
 pub(super) async fn project_export(
     Extension(cap): Extension<Option<Arc<dyn boatramp_core::project_export::ProjectExport>>>,
+    headers: HeaderMap,
     Query(q): Query<ProjectExportQuery>,
 ) -> Response {
     if let Some(forbidden) =
@@ -2252,11 +2270,18 @@ pub(super) async fn project_export(
     if let Some(resp) = reject_invalid_name("project", &q.project) {
         return resp;
     }
-    // `--include-identity` + transport key are wired into the request in a follow-up; today
-    // this endpoint exports the identity-free bundle (the safe default).
+    let transport_key = transport_key_from_headers(&headers);
+    if q.include_identity && transport_key.is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "include_identity requires the X-Boatramp-Transport-Key header\n",
+        )
+            .into_response();
+    }
     let export_opts = boatramp_core::project_export::ExportOptions {
         data_only: q.data_only,
-        ..Default::default()
+        include_identity: q.include_identity,
+        transport_key,
     };
     let path = match cap.export(&q.project, &export_opts).await {
         Ok(p) => p,
@@ -2326,6 +2351,15 @@ pub(super) struct ProjectImportQuery {
     force: bool,
     #[serde(default)]
     allow_schema_skew: bool,
+    /// `fresh` (default — mint own identity, drop source-sealed secrets) or `adopt`
+    /// (install the bundle's KEK for a same-environment recovery; requires the
+    /// transport-key header).
+    #[serde(default = "default_identity")]
+    identity: String,
+}
+
+fn default_identity() -> String {
+    "fresh".to_string()
 }
 
 /// Import a `BRPROJ` bundle (the request body) into a project (`System·Admin`). The body
@@ -2335,6 +2369,7 @@ pub(super) struct ProjectImportQuery {
 pub(super) async fn project_import(
     Extension(cap): Extension<Option<Arc<dyn boatramp_core::project_export::ProjectExport>>>,
     Query(q): Query<ProjectImportQuery>,
+    headers: HeaderMap,
     body: Body,
 ) -> Response {
     if let Some(forbidden) =
@@ -2425,13 +2460,33 @@ pub(super) async fn project_import(
                 .into_response();
         }
     }
+    let identity = match q.identity.as_str() {
+        "fresh" => boatramp_core::project_export::IdentityChoice::Fresh,
+        "adopt" => match transport_key_from_headers(&headers) {
+            Some(transport_key) => {
+                boatramp_core::project_export::IdentityChoice::Adopt { transport_key }
+            }
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "identity=adopt requires the X-Boatramp-Transport-Key header\n",
+                )
+                    .into_response();
+            }
+        },
+        other => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("identity must be 'fresh' or 'adopt', got {other:?}\n"),
+            )
+                .into_response();
+        }
+    };
     let opts = boatramp_core::project_export::ImportOptions {
         apply: q.apply,
         force: q.force,
         allow_schema_skew: q.allow_schema_skew,
-        // The request-side `--identity {adopt|fresh}` plumbing is a follow-up; default to the
-        // safe Fresh (never installs source identity) until it is wired.
-        identity: boatramp_core::project_export::IdentityChoice::Fresh,
+        identity,
     };
     let res = cap.import(&q.project, &tmp, opts).await;
     let _ = tokio::fs::remove_file(&tmp).await;

@@ -853,6 +853,8 @@ impl ControlPlane {
         &self,
         project: &str,
         data_only: bool,
+        include_identity: bool,
+        transport_key: Option<Vec<u8>>,
         out: &std::path::Path,
     ) -> Result<()> {
         use futures::StreamExt;
@@ -862,14 +864,24 @@ impl ControlPlane {
             base: server,
             ..
         } = self;
-        let resp = client
-            .post(format!("{server}/api/project-export"))
-            .query(&[
-                ("project", project),
-                ("data_only", if data_only { "true" } else { "false" }),
-            ])
-            .send()
-            .await?;
+        let mut req = client.post(format!("{server}/api/project-export")).query(&[
+            ("project", project),
+            ("data_only", if data_only { "true" } else { "false" }),
+            (
+                "include_identity",
+                if include_identity { "true" } else { "false" },
+            ),
+        ]);
+        if let Some(key) = &transport_key {
+            // Secret → an HTTP header (over TLS), never a query param / command line.
+            let value = std::str::from_utf8(key).map_err(|_| {
+                ClientError::Refused(
+                    "transport key must be valid UTF-8 for the request header".into(),
+                )
+            })?;
+            req = req.header("x-boatramp-transport-key", value);
+        }
+        let resp = req.send().await?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
@@ -910,6 +922,8 @@ impl ControlPlane {
         apply: bool,
         force: bool,
         allow_schema_skew: bool,
+        identity: &str,
+        transport_key: Option<Vec<u8>>,
     ) -> Result<String> {
         let Self {
             http: client,
@@ -920,7 +934,7 @@ impl ControlPlane {
             .await
             .map_err(|e| ClientError::Refused(format!("cannot open {}: {e}", bundle.display())))?;
         let body = reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(file));
-        let resp = client
+        let mut req = client
             .post(format!("{server}/api/project-import"))
             .query(&[
                 ("project", project),
@@ -930,11 +944,19 @@ impl ControlPlane {
                     "allow_schema_skew",
                     if allow_schema_skew { "true" } else { "false" },
                 ),
+                ("identity", identity),
             ])
-            .header("content-type", "application/octet-stream")
-            .body(body)
-            .send()
-            .await?;
+            .header("content-type", "application/octet-stream");
+        if let Some(key) = &transport_key {
+            // Secret → an HTTP header (over TLS), never a query param / command line.
+            let value = std::str::from_utf8(key).map_err(|_| {
+                ClientError::Refused(
+                    "transport key must be valid UTF-8 for the request header".into(),
+                )
+            })?;
+            req = req.header("x-boatramp-transport-key", value);
+        }
+        let resp = req.body(body).send().await?;
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
         if status.is_success() {

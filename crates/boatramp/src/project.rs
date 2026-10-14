@@ -129,6 +129,15 @@ enum ProjectCommand {
         /// no identity/RBAC/routing).
         #[arg(long)]
         full: bool,
+        /// Include the identity transport container (the project KEK, passphrase-wrapped)
+        /// for a same-environment RECOVERY. Implies a FULL bundle; requires a transport key
+        /// (--transport-key-file, else BOATRAMP_EXPORT_TRANSPORT_KEY, else an interactive
+        /// prompt). Local KEK envelopes only.
+        #[arg(long)]
+        include_identity: bool,
+        /// File holding the transport passphrase that wraps/opens the identity container.
+        #[arg(long, value_name = "FILE")]
+        transport_key_file: Option<std::path::PathBuf>,
     },
     /// Import a BRPROJ bundle into a project on the RUNNING node (`System·Admin`).
     /// Dry-run (a plan, no mutation) unless `--apply`.
@@ -149,6 +158,15 @@ enum ProjectCommand {
         /// bundle and the target.
         #[arg(long)]
         allow_schema_skew: bool,
+        /// Identity decision: `fresh` (default — the target mints its own identity and
+        /// source-sealed secrets are dropped) or `adopt` (install the bundle's KEK for a
+        /// same-environment recovery; requires a transport key).
+        #[arg(long, default_value = "fresh", value_parser = ["fresh", "adopt"])]
+        identity: String,
+        /// File holding the transport passphrase (for `--identity adopt`). Falls back to
+        /// BOATRAMP_EXPORT_TRANSPORT_KEY, then an interactive prompt.
+        #[arg(long, value_name = "FILE")]
+        transport_key_file: Option<std::path::PathBuf>,
     },
 }
 
@@ -158,6 +176,34 @@ enum ProjectCommand {
 /// TTY.
 fn confirmation_matches(project: &str, typed: &str) -> bool {
     typed.trim() == project
+}
+
+/// Resolve the identity-transport passphrase, in precedence order (owner decision,
+/// 2026-10-14): `--transport-key-file` (0600-ish operator file, trailing newline trimmed),
+/// then `BOATRAMP_EXPORT_TRANSPORT_KEY`, then a hidden interactive prompt. Never echoed,
+/// never placed on a command line.
+fn resolve_transport_key(file: Option<&std::path::Path>, prompt: &str) -> Result<Vec<u8>> {
+    if let Some(p) = file {
+        let s = std::fs::read_to_string(p).map_err(Error::Io)?;
+        let key = s.trim_end_matches(['\n', '\r']).as_bytes().to_vec();
+        if key.is_empty() {
+            return Err(Error::Aborted(format!(
+                "transport key file {} is empty",
+                p.display()
+            )));
+        }
+        return Ok(key);
+    }
+    if let Ok(v) = std::env::var("BOATRAMP_EXPORT_TRANSPORT_KEY") {
+        if !v.is_empty() {
+            return Ok(v.into_bytes());
+        }
+    }
+    let pw = rpassword::prompt_password(prompt).map_err(Error::Io)?;
+    if pw.is_empty() {
+        return Err(Error::Aborted("transport key must not be empty".into()));
+    }
+    Ok(pw.into_bytes())
 }
 
 /// A one-line human summary of a teardown [plan](crate::client) for the operator, e.g.
@@ -550,11 +596,30 @@ pub async fn run(args: ProjectArgs, config: &ProjectConfig) -> Result<()> {
         ProjectCommand::Repair(rargs) => {
             crate::project_repair::run(rargs, &cp).await?;
         }
-        ProjectCommand::Export { name, out, full } => {
-            cp.project_export(&name, !full, &out).await?;
+        ProjectCommand::Export {
+            name,
+            out,
+            full,
+            include_identity,
+            transport_key_file,
+        } => {
+            // `--include-identity` implies a FULL bundle (data-only carries no
+            // control-plane / identity), and needs a transport key to wrap the KEK.
+            let data_only = !full && !include_identity;
+            let transport_key = if include_identity {
+                Some(resolve_transport_key(
+                    transport_key_file.as_deref(),
+                    "Transport passphrase (wraps the exported KEK): ",
+                )?)
+            } else {
+                None
+            };
+            cp.project_export(&name, data_only, include_identity, transport_key, &out)
+                .await?;
             println!(
-                "exported project `{name}` ({}) -> {}",
-                if full { "full" } else { "data-only" },
+                "exported project `{name}` ({}{}) -> {}",
+                if data_only { "data-only" } else { "full" },
+                if include_identity { " +identity" } else { "" },
                 out.display()
             );
         }
@@ -564,9 +629,27 @@ pub async fn run(args: ProjectArgs, config: &ProjectConfig) -> Result<()> {
             apply,
             force,
             allow_schema_skew,
+            identity,
+            transport_key_file,
         } => {
+            let transport_key = if identity == "adopt" {
+                Some(resolve_transport_key(
+                    transport_key_file.as_deref(),
+                    "Transport passphrase (opens the bundle's KEK): ",
+                )?)
+            } else {
+                None
+            };
             let report = cp
-                .project_import(&name, &input, apply, force, allow_schema_skew)
+                .project_import(
+                    &name,
+                    &input,
+                    apply,
+                    force,
+                    allow_schema_skew,
+                    &identity,
+                    transport_key,
+                )
                 .await?;
             if !apply {
                 println!("project import DRY-RUN (no mutation; re-run with --apply):");
