@@ -196,6 +196,29 @@ jobs:
           grep -q 'container exec OK: echo captured + stdin round-tripped' exec.log \
             || { echo "::error::container exec never reached the success marker (silent skip?)" >&2; exit 1; }
 
+      - name: One-shot run_ephemeral round-trip — native project export/import engine (hard gate)
+        run: |
+          set -o pipefail
+          BIN="$(realpath target/debug/boatramp)"
+          # The native `ComputeBackend::run_ephemeral` (env-clone item 3): with no persisted
+          # workload, resolve a small OCI image via the DEFAULT daemonless pull, launch a
+          # hardened one-shot jail with veth egress, and prove the ephemeral contract live —
+          # (A) stdout STREAMS out + the exit code is captured (`sh -c 'echo hi'` → `hi`, 0),
+          # (B) stdin STREAMS in over the dedicated pipe (`cat` echoes a fed payload — the
+          # restore direction, decoupled from the handshake fd), and (C) a non-zero exit is
+          # returned as a LEGITIMATE code (`sh -c 'exit 7'` → Ok(7)), not an error. This is
+          # the engine behind project export/import on the native container backend.
+          timeout -k 30 600 sudo -E env "PATH=$PATH" "BOATRAMP_BIN=$BIN" \
+            cargo test -p boatramp-container --test container_live \
+            container_live_run_ephemeral -- --ignored --nocapture 2>&1 | tee ephemeral.log
+          # A silent skip (missing BOATRAMP_BIN) still prints `test result: ok` — the exact
+          # anti-silent-skip trap. Gate on the end-of-test marker that prints ONLY after all
+          # three streamed-stdout / streamed-stdin / non-zero-exit assertions held.
+          grep -qE 'test result: ok' ephemeral.log \
+            || { echo "::error::run_ephemeral round-trip did not pass" >&2; exit 1; }
+          grep -q 'native run_ephemeral OK: streamed stdout + stdin round-trip + non-zero exit code' ephemeral.log \
+            || { echo "::error::run_ephemeral never reached the success marker (silent skip?)" >&2; exit 1; }
+
       - name: Co-located Postgres (pgvector) from an OCI image — rootless + host-root (hard gate)
         run: |
           set -o pipefail

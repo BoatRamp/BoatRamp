@@ -130,6 +130,38 @@ pub struct SandboxPlan {
     /// filter installed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seccomp_allow: Option<Vec<String>>,
+    /// **One-shot ephemeral mode only** — a raw file descriptor the launcher has
+    /// already arranged for this worker to inherit, which the worker `dup2`s onto the
+    /// guest's standard input (fd 0) immediately before `execve`. `None` (the normal
+    /// launch) leaves the guest's fd 0 as whatever the worker inherited (the EOF'd
+    /// launcher handshake pipe), exactly as before — so the launch path is byte-for-byte
+    /// unchanged and the schema stays v1.
+    ///
+    /// It exists so [`ContainerBackend::run_ephemeral`](crate::backend::ContainerBackend)
+    /// can stream a multi-gigabyte `pg_restore`/`mysql` payload into the guest over a
+    /// **dedicated** pipe that is decoupled from the launcher↔worker handshake (which
+    /// uses the worker's own fd 0 for the `plan`/`go` lines). Routing the payload over
+    /// the handshake fd instead would race the worker's `read_line("go")` buffered read,
+    /// which could swallow the first chunk of the payload — silent dump corruption. A
+    /// dedicated inherited fd removes that race entirely. The fd number is meaningful
+    /// only inside the worker process that inherited it; it is never a host path or a
+    /// credential. Ignored unless this plan is run by the ephemeral path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exec_stdin_fd: Option<i32>,
+    /// Remount the pivoted container **root filesystem read-only** just before dropping
+    /// privileges (the standard-mount `/proc`·`/sys`·`/tmp`·`/run`·`/dev` are separate
+    /// mounts set up first, so they stay as configured — a writable `/tmp` + `/run`
+    /// remain). `false` (the default, every launched workload) leaves the rootfs writable
+    /// and is omitted from the serialized plan, so the launch path is byte-identical.
+    ///
+    /// Set `true` by [`ContainerBackend::run_ephemeral`](crate::backend::ContainerBackend)
+    /// for a one-shot client: the client never needs to write its rootfs (dumps go to the
+    /// streamed stdout, scratch to `/tmp`), and a one-shot pivots into the SHARED, cached
+    /// staged-image directory that sibling ephemeral runs reuse — a read-only root keeps a
+    /// buggy or hostile client from mutating that shared cache, matching the docker
+    /// backend's `readonly_rootfs` hardening.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub readonly_root: bool,
     /// The `/etc/resolv.conf` body to write into the jail (after `pivot_root`, into
     /// the container rootfs) so the guest resolves through boatramp's internal DNS on
     /// the bridge gateway. Populated by the backend from the container's project +
@@ -200,6 +232,8 @@ impl SandboxPlan {
             cgroup,
             cap_add: Vec::new(),
             seccomp_allow: Some(crate::seccomp::default_allowlist()),
+            exec_stdin_fd: None,
+            readonly_root: false,
             resolv_conf: None,
             namespaces: Namespaces::default(),
         }
@@ -330,6 +364,31 @@ mod tests {
         for danger in crate::seccomp::DANGEROUS_DENIED {
             assert!(!allow.iter().any(|s| s == danger), "denies {danger}");
         }
+    }
+
+    #[test]
+    fn exec_stdin_fd_defaults_none_and_is_omitted_then_round_trips() {
+        // The normal launch leaves it None, and None is NOT serialized — so the launch
+        // path's plan JSON is byte-identical to before (schema stays v1).
+        let mut plan = SandboxPlan::for_spec(&spec(1, 128), "/r", "h", 0, 0);
+        assert_eq!(plan.exec_stdin_fd, None);
+        // Default: a writable rootfs, and both one-shot fields omitted — so the launch
+        // path's plan JSON is byte-identical to before (schema stays v1).
+        assert!(!plan.readonly_root);
+        let json = serde_json::to_string(&plan).unwrap();
+        assert!(
+            !json.contains("exec_stdin_fd") && !json.contains("readonly_root"),
+            "the one-shot fields must be omitted at their defaults: {json}"
+        );
+        // The one-shot ephemeral path sets them; they then round-trip through the worker.
+        plan.exec_stdin_fd = Some(7);
+        plan.readonly_root = true;
+        let json = serde_json::to_string(&plan).unwrap();
+        assert!(json.contains("\"exec_stdin_fd\":7"));
+        assert!(json.contains("\"readonly_root\":true"));
+        let back = serde_json::from_str::<SandboxPlan>(&json).unwrap();
+        assert_eq!(back.exec_stdin_fd, Some(7));
+        assert!(back.readonly_root);
     }
 
     #[test]

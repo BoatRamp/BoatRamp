@@ -23,8 +23,8 @@ use nix::sched::{CloneFlags, unshare};
 use nix::sys::stat::{Mode, SFlag, mknod};
 use nix::sys::wait::{WaitStatus, waitpid};
 use nix::unistd::{
-    ForkResult, Gid, Uid, chdir, execve, fork, pivot_root, setgroups, sethostname, setresgid,
-    setresuid,
+    ForkResult, Gid, Uid, chdir, close, dup2, execve, fork, pivot_root, setgroups, sethostname,
+    setresgid, setresuid,
 };
 use std::convert::Infallible;
 use std::ffi::CString;
@@ -256,11 +256,42 @@ fn jail_and_exec(plan: &SandboxPlan) -> Result<Infallible, WorkerError> {
     // the backing dir would be host-root-owned, i.e. `nobody` in the namespace, which
     // namespace-root cannot chown (EPERM) — so ownership is the launcher's job, not ours.
 
+    // One-shot ephemeral mode: remount the pivoted root **read-only** now — after the
+    // resolv.conf write (which needs `/etc` writable) and the standard sub-mounts
+    // (`/proc`·`/sys`·`/tmp`·`/run`·`/dev` are separate mounts, so they stay as
+    // configured: `/tmp`+`/run` remain writable), but BEFORE dropping privileges (the
+    // remount needs the userns `CAP_SYS_ADMIN` we still hold). A no-op for a normal
+    // launch. See [`SandboxPlan::readonly_root`](crate::sandbox::SandboxPlan).
+    if plan.readonly_root {
+        nix::mount::mount(
+            None::<&str>,
+            "/",
+            None::<&str>,
+            MsFlags::MS_REMOUNT | MsFlags::MS_BIND | MsFlags::MS_RDONLY,
+            None::<&str>,
+        )
+        .map_err(|e| WorkerError::Syscall("remount root ro", e))?;
+    }
+
     // Drop privileges first (sets `no_new_privs`), then install seccomp — so the
     // filter can be applied without CAP_SYS_ADMIN and only the entrypoint (and
     // the `execve` to reach it) runs under it. `cap_add` (single-tenant, posture-gated
     // by the backend) retains the listed capabilities; empty ⇒ drop them all.
     apply_privileges(plan.uid, plan.gid, &plan.cap_add)?;
+    // One-shot ephemeral mode: redirect the guest's standard input to the dedicated,
+    // launcher-provided pipe the worker inherited, instead of the (EOF'd) handshake
+    // stdin. Done here — after the privilege drop, before seccomp — so `dup2`/`close`
+    // run unconstrained (both touch only this process's own fd table, so no privilege is
+    // needed). `None` for a normal launch leaves the guest's fd 0 untouched, exactly as
+    // before. See [`SandboxPlan::exec_stdin_fd`](crate::sandbox::SandboxPlan).
+    if let Some(fd) = plan.exec_stdin_fd {
+        dup2(fd, 0).map_err(|e| WorkerError::Syscall("dup2 ephemeral stdin", e))?;
+        // Close the now-duplicated original so the guest holds exactly one copy (and the
+        // pipe's EOF semantics are not blurred by a stray fd). Never 0/1/2.
+        if fd > 2 {
+            let _ = close(fd);
+        }
+    }
     if let Some(allow) = &plan.seccomp_allow {
         crate::seccomp::install(allow).map_err(WorkerError::Seccomp)?;
     }

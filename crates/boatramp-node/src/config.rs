@@ -1722,6 +1722,25 @@ pub struct ComputeConfig {
     /// `boatramp.internal`.
     #[serde(default = "default_dns_domain")]
     pub dns_domain: String,
+    /// **Air-gap override** for the project export/import **client images** the native
+    /// container backend runs via `run_ephemeral` (a `pg_dump`/`pg_restore`/`mysqldump`/
+    /// `mysql`/`psql` one-shot). Maps a client image reference → a **preloaded rootfs**, so
+    /// an export/import can run with NO registry pull on an isolated node. The value is
+    /// either an **absolute host path** to an already-unpacked rootfs directory (used
+    /// verbatim), or a **Storage blob hash** of a rootfs tar the backend stages like any
+    /// `RootSource::Tar`. Empty (the default) ⇒ every client image is pulled + built
+    /// on demand over the registry HTTP API (daemonless), the same path `materialize`
+    /// uses. Only the native `container` backend consults this; the remote `docker`
+    /// backend pulls through its daemon. Example:
+    ///
+    /// ```toml
+    /// [compute.client_image_rootfs]
+    /// "pgvector/pgvector:pg16" = "/var/lib/boatramp/client-rootfs/pg16"
+    /// "mysql:8.0"              = "9f86d0818...<rootfs-tar-blob-sha256>"
+    /// ```
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub client_image_rootfs: BTreeMap<String, String>,
 }
 
 /// Default for [`ComputeConfig::internal_dns`] — on (activates only with the
@@ -1820,6 +1839,7 @@ impl Default for ComputeConfig {
             internal_dns: default_internal_dns(),
             dns_upstream: default_dns_upstream(),
             dns_domain: default_dns_domain(),
+            client_image_rootfs: BTreeMap::new(),
         }
     }
 }
