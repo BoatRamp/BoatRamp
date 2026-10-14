@@ -387,6 +387,9 @@ reqwest.workspace = true
 walkdir.workspace = true
 sha2.workspace = true
 hex.workspace = true
+# Hidden passphrase entry for the `project export/import` transport key (the
+# interactive fallback when neither --transport-key-file nor the env var is set).
+rpassword = "7"
 base64.workspace = true
 brotli.workspace = true
 flate2.workspace = true
