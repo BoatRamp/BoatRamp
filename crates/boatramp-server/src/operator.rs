@@ -251,18 +251,20 @@ pub(super) fn data_fs_usage(_dir: &std::path::Path) -> Option<DataFsUsage> {
 #[cfg(feature = "handlers")]
 const DATA_BREAKDOWN_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// Process-global cache of the last `/data` breakdown: `(computed_at, data_dir, breakdown)`. The node
-/// has a single data dir, but the dir is part of the key so a path change invalidates the entry.
+/// The cached `/data` breakdown payload: when it was computed, for which data dir, and the
+/// per-category byte map. Aliased to keep the cache static's type under clippy's complexity bar.
 #[cfg(feature = "handlers")]
-static DATA_BREAKDOWN_CACHE: std::sync::OnceLock<
-    std::sync::Mutex<
-        Option<(
-            std::time::Instant,
-            std::path::PathBuf,
-            serde_json::Map<String, serde_json::Value>,
-        )>,
-    >,
-> = std::sync::OnceLock::new();
+type CachedDataBreakdown = (
+    std::time::Instant,
+    std::path::PathBuf,
+    serde_json::Map<String, serde_json::Value>,
+);
+
+/// Process-global cache of the last `/data` breakdown. The node has a single data dir, but the dir
+/// is part of the key so a path change invalidates the entry.
+#[cfg(feature = "handlers")]
+static DATA_BREAKDOWN_CACHE: std::sync::OnceLock<std::sync::Mutex<Option<CachedDataBreakdown>>> =
+    std::sync::OnceLock::new();
 
 /// The `/data` per-category breakdown, cached for [`DATA_BREAKDOWN_TTL`] and computed OFF the async
 /// worker. [`data_dir_breakdown`] is a blocking recursive `std::fs` walk that can take seconds on a
