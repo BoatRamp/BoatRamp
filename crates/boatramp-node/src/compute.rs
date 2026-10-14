@@ -278,6 +278,13 @@ pub async fn build_compute(
                     // specific client images to a PRELOADED rootfs (no registry pull).
                     // Empty (default) keeps the on-demand OCI pull+build path.
                     let c = c.with_client_image_rootfs(cfg.client_image_rootfs.clone());
+                    // Multi-tenant posture: refuse an unauthenticated on-demand pull of a mutable
+                    // client-image tag for `run_ephemeral` — require a preloaded (air-gap) image or
+                    // an `@sha256:`-pinned ref, so a registry/MITM cannot substitute an image that
+                    // would run with the managed-DB credential + egress (M1).
+                    let c = c.with_require_pinned_client_image(strict);
+                    // Reclaim one-shot cgroups orphaned by a hard crash mid-export/import (L2).
+                    c.sweep_orphaned_ephemeral_cgroups();
                     backends.insert("container".to_string(), std::sync::Arc::new(c));
                 }
                 Err(e) => tracing::warn!(%e, "container backend unavailable"),

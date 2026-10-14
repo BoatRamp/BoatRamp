@@ -84,7 +84,11 @@ fn kind_is_postgres(kind: &str) -> bool {
     )
 }
 
-/// Whether a binding `kind` names libsql/SQLite.
+/// Whether a binding `kind` names libsql/SQLite. Completes the kind-classification trio
+/// (`postgres`/`mysql`/`libsql`) and is exercised by the `kind_detection` gate; the export loop
+/// routes a libsql binding through the per-site snapshot path rather than this classifier, so it
+/// has no non-test caller.
+#[allow(dead_code)]
 fn kind_is_libsql(kind: &str) -> bool {
     matches!(
         kind.to_ascii_lowercase().as_str(),
@@ -320,10 +324,13 @@ async fn write_kek_file(path: &std::path::Path, kek: &[u8]) -> Result<(), Perr> 
         {
             use std::io::Write;
             use std::os::unix::fs::OpenOptionsExt;
+            // O_EXCL (`create_new`): never clobber or truncate an existing KEK. The adopt caller
+            // has already read-and-compared any existing KEK (no-clobber); creating exclusively
+            // here closes the check→write TOCTOU window — if a KEK appeared in between, the write
+            // fails loudly rather than overwriting the master secret.
             let mut f = std::fs::OpenOptions::new()
                 .write(true)
-                .create(true)
-                .truncate(true)
+                .create_new(true)
                 .mode(0o600)
                 .open(&path)?;
             f.write_all(&kek)
@@ -729,9 +736,19 @@ impl ProjectExport for NodeProjectExport {
         // leak), even though the import side skips restoring it. Fail safe: don't stage it.
         if !data_only {
             self.deploy.checkpoint().await.map_err(other)?;
-            let kv_bytes = boatramp_core::kv_dump::export_to_bytes(self.kv.as_ref(), created_at)
+            // Scope the control-plane KV slice to THIS project (C1 cross-tenant isolation): scan
+            // the store, keep ONLY the project's owned keyspace + the site-config bodies it
+            // references, and drop every other tenant's material plus the global TLS/routing/daemon
+            // keyspaces (fail-closed). A whole-store dump here would ship every tenant's sealed
+            // secrets, TLS private keys and DB credentials inside a single-project bundle.
+            let all = boatramp_core::kv_dump::scan_dumpable(self.kv.as_ref())
                 .await
                 .map_err(other)?;
+            let scoped = boatramp_core::project_export::scope_entries_to_project(
+                all,
+                ProjectRef::new(project),
+            );
+            let kv_bytes = boatramp_core::kv_dump::encode_dump(&scoped, created_at);
             let kv_path = stage.join("kv.brkvdump");
             tokio::fs::write(&kv_path, &kv_bytes).await.map_err(other)?;
             staged.push(StagedMember {
@@ -1169,7 +1186,16 @@ impl ProjectExport for NodeProjectExport {
             let kv_file = extract.join(KV_MEMBER_PATH);
             if kv_file.exists() {
                 let bytes = tokio::fs::read(&kv_file).await.map_err(other)?;
-                let decoded = boatramp_core::kv_dump::decode_dump(&bytes).map_err(other)?;
+                let mut decoded = boatramp_core::kv_dump::decode_dump(&bytes).map_err(other)?;
+                // Re-qualify the control-plane slice to the TARGET project (matches the blob +
+                // libsql re-qualification above), so a project-rename import lands every owned key
+                // in the target's scope — and the --fresh drop below (keyed on the target) removes
+                // the right sealed keys rather than nothing.
+                boatramp_core::project_export::rekey_entries_to_target(
+                    &mut decoded.entries,
+                    &manifest.source.project,
+                    project,
+                );
                 if opts.apply {
                     match boatramp_core::kv_dump::apply_import(
                         self.kv.as_ref(),
@@ -1373,9 +1399,12 @@ mod tests {
 
         let tmp = tempfile::tempdir().unwrap();
         let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
-        // A control-plane key so the FULL slice is non-trivial — exactly the kind of
-        // RBAC/routing byte a data-only bundle must never carry.
-        kv.put("routing/acme/site", b"x".to_vec()).await.unwrap();
+        // An OWNED control-plane key so the FULL slice is non-trivial — exactly the kind of
+        // config/secret byte a data-only bundle must never carry (and that the C1 allowlist
+        // scopes INTO a full export, unlike a synthetic non-owned key).
+        kv.put("project/acme/config/tenancy", b"{}".to_vec())
+            .await
+            .unwrap();
         let blobs: Arc<dyn Storage> = Arc::new(FsStorage::new(tmp.path().join("blobs")));
         let deploy = DeployStore::new(blobs.clone(), kv.clone());
         let work = tmp.path().join("work");
@@ -1572,8 +1601,12 @@ mod tests {
         for (k, v) in [
             ("project/acme/secret/api-key", &b"sealed"[..]),
             ("project/acme/tenant-secret/t1/token", &b"sealed-t"[..]),
+            ("project/acme/email/smtp", &b"sealed-pw"[..]), // H1: email is sealed → dropped on fresh
+            ("managed-sql-cred/acme/pg", &b"sealed-cred"[..]), // H1: DB cred → dropped on fresh
             ("_cp/leader", &b"node-1"[..]),
-            ("routing/acme/site", &b"r"[..]),
+            // A real OWNED, non-secret control-plane key — kept on fresh (and scoped into the
+            // export, unlike a synthetic non-owned key which the C1 allowlist would exclude).
+            ("project/acme/config/tenancy", &b"{}"[..]),
         ] {
             src_kv.put(k, v.to_vec()).await.unwrap();
         }
@@ -1655,6 +1688,15 @@ mod tests {
             "adopt keeps the sealed secret (it unseals under the adopted KEK)"
         );
         assert!(
+            a_kv.get("project/acme/email/smtp").await.unwrap().is_some()
+                && a_kv
+                    .get("managed-sql-cred/acme/pg")
+                    .await
+                    .unwrap()
+                    .is_some(),
+            "adopt keeps the sealed email profile + managed-DB credential"
+        );
+        assert!(
             a_kv.get("_cp/leader").await.unwrap().is_none(),
             "import never writes a reserved _cp/* key (Ask-4b)"
         );
@@ -1689,8 +1731,22 @@ mod tests {
             "fresh dropped the source per-tenant secret (Ask-4c)"
         );
         assert!(
-            f_kv.get("routing/acme/site").await.unwrap().is_some(),
-            "fresh keeps non-secret control-plane config (routing)"
+            f_kv.get("project/acme/email/smtp").await.unwrap().is_none(),
+            "fresh dropped the source SMTP profile's sealed password (H1)"
+        );
+        assert!(
+            f_kv.get("managed-sql-cred/acme/pg")
+                .await
+                .unwrap()
+                .is_none(),
+            "fresh dropped the source managed-DB credential (H1)"
+        );
+        assert!(
+            f_kv.get("project/acme/config/tenancy")
+                .await
+                .unwrap()
+                .is_some(),
+            "fresh keeps non-secret, environment-neutral control-plane config (tenancy map)"
         );
         assert!(
             f_kv.get("_cp/leader").await.unwrap().is_none(),

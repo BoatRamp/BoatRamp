@@ -1285,7 +1285,7 @@ pub const MYSQL_CLIENT_MIN_MAJOR: u32 = 5;
 
 /// The leading run of ASCII digits of `s`, parsed (`"0-log"` → `0`, `""` → `None`).
 fn leading_u32(s: &str) -> Option<u32> {
-    let digits: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();
+    let digits: String = s.chars().take_while(char::is_ascii_digit).collect();
     digits.parse().ok()
 }
 

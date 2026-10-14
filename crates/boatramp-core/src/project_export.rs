@@ -19,21 +19,135 @@ use serde::Serialize;
 
 use crate::project::ProjectRef;
 
-/// The control-plane KV prefixes that hold a project's KEK-**sealed** secrets — the keyspace
-/// a `--identity fresh` import drops (they could never unseal under the target's own KEK, so
-/// dropping them makes "zero source-sealed artifacts" a positive absence). The SINGLE source
-/// of truth for "sealed-secret keyspace", built from the canonical `deploy::keys` builders:
-/// `project/<p>/secret/` (operator/app env secrets), `project/<p>/tenant-secret/` (ALL
-/// per-tenant secrets), and `project/<p>/tenant-secret-index/`. The project-wide
-/// `tenant-secret/` prefix is composed here (there is deliberately no guest-facing builder
-/// for it — a `list` is always tenant-scoped to avoid a cross-tenant name oracle); this is an
-/// admin-only teardown scan, not a guest enumeration.
+/// The control-plane KV key PREFIXES a project **exclusively owns** — the structural allowlist
+/// the project export is scoped to (the C1 cross-tenant-isolation invariant). A single-project
+/// bundle carries ONLY keys under these prefixes, plus the site-config bodies the project's own
+/// sites reference (`siteconfig/<hash>`, content-addressed — resolved by the driver from the
+/// project's `site/` pointers, since a config blob is keyed by its own hash, not by project).
+///
+/// **Nothing from the global / shared keyspace rides along.** Another project's
+/// `project/<other>/…`, EVERY project's TLS private keys (`cert/<domain>`), the global
+/// routing-ownership records (`domain/<host>`, `wildcard/<suffix>`), the node's `daemonconfig/…`,
+/// and the `_cp/*` / `_inval/*` coordination feeds are ALL excluded — fail-closed: a key under
+/// none of these prefixes is never exported. Routing + TLS are deliberately kept OUT of a
+/// portable bundle: a TLS private key never leaves the node, and the target re-establishes
+/// routing and re-issues certs (ACME) under its OWN identity on import. This is both the simplest
+/// auditable answer to "a single-project export must carry zero other-project material" and the
+/// strictest custody posture for the global crown jewels.
+///
+/// The shapes mirror the canonical `deploy::keys` builders (and `managed_sql`'s
+/// `managed-sql-cred/<project>/<workload>`); each prefix ends in `/` so a sibling project can
+/// never be over-captured (`project/foo/` is not a prefix of `project/foobar/…`).
+pub fn project_owned_prefixes(project: ProjectRef<'_>) -> Vec<String> {
+    vec![
+        format!("project/{project}/"),
+        crate::deploy::keys::graphql_registry_prefix(project), // graphql/<p>/
+        crate::deploy::keys::graphql_safelist_prefix(project), // hapq/<p>/
+        format!("managed-sql-cred/{project}/"),
+    ]
+}
+
+/// Whether `key` is owned by `project` under the [`project_owned_prefixes`] structural allowlist.
+/// (Does NOT cover the referenced `siteconfig/<hash>` bodies — those are content-addressed and
+/// resolved separately by the driver from the project's `site/` pointers.)
+#[must_use]
+pub fn project_owns_key(key: &str, project: ProjectRef<'_>) -> bool {
+    project_owned_prefixes(project)
+        .iter()
+        .any(|p| key.starts_with(p.as_str()))
+}
+
+/// The control-plane KV prefixes holding a project's KEK-**sealed** / environment-coupled
+/// material — the keyspace a `--identity fresh` import DROPS after the restore (it was sealed
+/// under the SOURCE KEK and can never unseal under the target's own key, so dropping it makes
+/// "zero source-sealed artifacts" a POSITIVE absence rather than present-but-inert). The SINGLE
+/// source of truth, built from the canonical `deploy::keys` builders:
+///   - `project/<p>/secret/`              operator / app env secrets
+///   - `project/<p>/tenant-secret/`       ALL per-tenant secrets
+///   - `project/<p>/tenant-secret-index/` the per-tenant name index
+///   - `project/<p>/email/`               SMTP profiles (sealed password)   ← was missing (H1)
+///   - `managed-sql-cred/<p>/`            managed-DB credentials             ← was missing (H1)
+///
+/// Prefixes are keyed on the TARGET project; the driver re-qualifies an imported slice to the
+/// target BEFORE the drop, so a project-rename import drops the right keys. (TLS keys and routing
+/// — `cert/`, `domain/`, `wildcard/` — are never exported at all, so there is nothing to drop
+/// there; see [`project_owned_prefixes`].) The project-wide `tenant-secret/` prefix is composed
+/// here deliberately (no guest-facing builder — a `list` is always tenant-scoped to avoid a
+/// cross-tenant name oracle); this is an admin-only teardown scan, not a guest enumeration.
 pub fn sealed_secret_prefixes(project: ProjectRef<'_>) -> Vec<String> {
     vec![
         crate::deploy::keys::secret_prefix(project),
         format!("project/{project}/tenant-secret/"),
         format!("project/{project}/tenant-secret-index/"),
+        crate::deploy::keys::email_profile_prefix(project),
+        format!("managed-sql-cred/{project}/"),
     ]
+}
+
+/// Scope a whole-store KV scan down to the keys a single `project` owns — the C1 cross-tenant
+/// isolation filter applied to the exported control-plane slice. Keeps ONLY [`project_owns_key`]
+/// matches plus the content-addressed site-config bodies (`siteconfig/<hash>`) this project's own
+/// `site/` pointers reference (a pointer `project/<p>/site/<site>` stores the raw UTF-8 hash of
+/// its current `SiteConfig`, whose body lives at the GLOBAL `siteconfig/<hash>`; including only the
+/// referenced hashes keeps the restore faithful — sites would otherwise dangle — without pulling
+/// any OTHER project's config body). Every other key is dropped (fail-closed), so a single-project
+/// bundle can physically carry no other tenant's `project/…`, no TLS key (`cert/…`), no routing
+/// record (`domain/…`, `wildcard/…`) and no node `daemonconfig/…`. `entries` is a full
+/// [`crate::kv_dump::scan_dumpable`] result (the reserved `_cp/*` / `_inval/*` feeds already
+/// removed).
+#[must_use]
+pub fn scope_entries_to_project(
+    entries: Vec<crate::kv::KvDumpEntry>,
+    project: ProjectRef<'_>,
+) -> Vec<crate::kv::KvDumpEntry> {
+    let site_pointer_prefix = format!("project/{project}/site/");
+    let mut referenced_siteconfig: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    for e in &entries {
+        if e.key.starts_with(&site_pointer_prefix)
+            && let Ok(hash) = std::str::from_utf8(&e.value)
+        {
+            let hash = hash.trim();
+            if !hash.is_empty() {
+                referenced_siteconfig.insert(crate::deploy::keys::site_config_blob(hash));
+            }
+        }
+    }
+    entries
+        .into_iter()
+        .filter(|e| project_owns_key(&e.key, project) || referenced_siteconfig.contains(&e.key))
+        .collect()
+}
+
+/// Re-qualify a project-scoped KV slice's keys from the SOURCE project to the TARGET, so an import
+/// under a different name lands every owned control-plane key in the target's scope — matching the
+/// blob and libsql re-qualification the driver already does. Rewrites the leading project segment
+/// of the owned prefixes (`project/<s>/…`, `graphql/<s>/…`, `hapq/<s>/…`, `managed-sql-cred/<s>/…`);
+/// the content-addressed `siteconfig/<hash>` bodies are identity-free and kept verbatim (the
+/// re-keyed site pointer still references the same hash). A no-op when `source == target` (the
+/// common same-name cross-environment move). Rename is best-effort key-PATH re-qualification — like
+/// blobs/libsql it does not rewrite project references embedded inside opaque config bodies.
+pub fn rekey_entries_to_target(entries: &mut [crate::kv::KvDumpEntry], source: &str, target: &str) {
+    if source == target {
+        return;
+    }
+    for e in entries {
+        e.key = rekey_owned_key(&e.key, source, target);
+    }
+}
+
+/// Rewrite the SOURCE project segment of one owned KV key to the TARGET (see
+/// [`rekey_entries_to_target`]); any non-owned key (e.g. the content-addressed `siteconfig/<hash>`)
+/// is returned unchanged.
+#[must_use]
+pub fn rekey_owned_key(key: &str, source: &str, target: &str) -> String {
+    for head in ["project/", "graphql/", "hapq/", "managed-sql-cred/"] {
+        let src_pref = format!("{head}{source}/");
+        if let Some(rest) = key.strip_prefix(&src_pref) {
+            return format!("{head}{target}/{rest}");
+        }
+    }
+    key.to_string()
 }
 
 /// Flags for an export. `Debug` is implemented by hand to **redact** the transport key so
@@ -195,5 +309,149 @@ pub trait ProjectExport: Send + Sync {
     /// is the system temp dir (used only by a stub with no node context).
     fn staging_root(&self) -> PathBuf {
         std::env::temp_dir()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kv::KvDumpEntry;
+
+    fn e(key: &str, value: &[u8]) -> KvDumpEntry {
+        KvDumpEntry {
+            key: key.to_string(),
+            value: value.to_vec(),
+            version: 1,
+        }
+    }
+
+    /// GATE (C1 cross-tenant isolation): a single-project export's KV slice carries ZERO other
+    /// tenant's material and NO global TLS/routing/daemon keys. Two projects (`acme`, `globex`)
+    /// plus the global crown-jewel keyspaces share one store; scoping to `acme` keeps exactly
+    /// acme's owned keyspace + the site-config body acme references, and drops everything else.
+    #[test]
+    fn scope_excludes_other_tenants_and_global_crown_jewels() {
+        let all = vec![
+            // --- acme's OWNED keyspace (must survive) ---
+            e("project/acme/secret/api-key", b"sealed"),
+            e("project/acme/tenant-secret/t1/token", b"sealed-t"),
+            e("project/acme/tenant-secret-index/t1", b"idx"),
+            e("project/acme/email/smtp", b"sealed-pw"),
+            e("project/acme/config/tenancy", b"{}"),
+            e("project/acme/site/web", b"HASHACME"), // pointer → siteconfig/HASHACME
+            e("graphql/acme/subgraph/users", b"sdl"),
+            e("hapq/acme/abc123", b"op"),
+            e("managed-sql-cred/acme/pg", b"sealed-cred"),
+            e("siteconfig/HASHACME", b"{...acme config...}"), // referenced by acme → survive
+            // --- OTHER tenant's material (every one MUST be excluded) ---
+            e("project/globex/secret/other", b"globex-sealed"),
+            e("project/globex/email/smtp", b"globex-pw"),
+            e("managed-sql-cred/globex/pg", b"globex-cred"),
+            e("graphql/globex/subgraph/x", b"globex-sdl"),
+            e("hapq/globex/zzz", b"globex-op"),
+            e("siteconfig/HASHGLOBEX", b"{...globex config...}"), // NOT referenced by acme
+            // sibling-prefix over-capture guard: `acmecorp` is NOT `acme`.
+            e("project/acmecorp/secret/s", b"neighbour-sealed"),
+            // --- global crown jewels / node state (MUST be excluded) ---
+            e("cert/acme.example.com", b"TLS-PRIVATE-KEY-acme"),
+            e("cert/globex.example.com", b"TLS-PRIVATE-KEY-globex"),
+            e("domain/acme.example.com", br#"{"project":"acme"}"#),
+            e("wildcard/.acme.dev", br#"{"project":"acme"}"#),
+            e("daemonconfig/deadbeef", b"node-config"),
+        ];
+
+        let kept: std::collections::BTreeSet<String> =
+            scope_entries_to_project(all, ProjectRef::new("acme"))
+                .into_iter()
+                .map(|x| x.key)
+                .collect();
+
+        let expected: std::collections::BTreeSet<String> = [
+            "project/acme/secret/api-key",
+            "project/acme/tenant-secret/t1/token",
+            "project/acme/tenant-secret-index/t1",
+            "project/acme/email/smtp",
+            "project/acme/config/tenancy",
+            "project/acme/site/web",
+            "graphql/acme/subgraph/users",
+            "hapq/acme/abc123",
+            "managed-sql-cred/acme/pg",
+            "siteconfig/HASHACME",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        assert_eq!(
+            kept, expected,
+            "exactly acme's keyspace + its referenced site config"
+        );
+
+        // The load-bearing security assertions, stated independently of the exact set:
+        assert!(
+            !kept.iter().any(|k| k.contains("globex")),
+            "NO other-tenant (globex) key may appear in acme's export"
+        );
+        assert!(
+            !kept.iter().any(|k| k.starts_with("cert/")),
+            "NO TLS private key (any project) travels in a portable bundle"
+        );
+        assert!(
+            !kept
+                .iter()
+                .any(|k| k.starts_with("domain/") || k.starts_with("wildcard/")),
+            "NO global routing-ownership record travels"
+        );
+        assert!(
+            !kept.iter().any(|k| k.starts_with("daemonconfig/")),
+            "NO node daemon config travels with a project"
+        );
+        assert!(
+            !kept.contains("project/acmecorp/secret/s"),
+            "a sibling project sharing a name PREFIX is not over-captured"
+        );
+        assert!(
+            !kept.contains("siteconfig/HASHGLOBEX"),
+            "only the site-config bodies THIS project references are carried"
+        );
+    }
+
+    /// GATE (H1): `--identity fresh` drops the COMPLETE sealed / environment-coupled keyspace —
+    /// including the previously-missed `email/` and `managed-sql-cred/` families.
+    #[test]
+    fn sealed_prefixes_cover_the_complete_coupled_keyspace() {
+        let p = sealed_secret_prefixes(ProjectRef::new("acme"));
+        for want in [
+            "project/acme/secret/",
+            "project/acme/tenant-secret/",
+            "project/acme/tenant-secret-index/",
+            "project/acme/email/",
+            "managed-sql-cred/acme/",
+        ] {
+            assert!(
+                p.iter().any(|x| x == want),
+                "fresh-drop set must include {want:?}"
+            );
+        }
+    }
+
+    /// The import re-key rewrites ONLY the owned project segment, leaving content-addressed
+    /// bodies untouched and never over-rewriting a sibling-prefix project.
+    #[test]
+    fn rekey_rewrites_owned_segment_only() {
+        let rk = |k: &str| rekey_owned_key(k, "acme", "beta");
+        assert_eq!(rk("project/acme/secret/x"), "project/beta/secret/x");
+        assert_eq!(rk("graphql/acme/subgraph/u"), "graphql/beta/subgraph/u");
+        assert_eq!(rk("hapq/acme/h"), "hapq/beta/h");
+        assert_eq!(rk("managed-sql-cred/acme/pg"), "managed-sql-cred/beta/pg");
+        // Content-addressed body — identity-free, untouched.
+        assert_eq!(rk("siteconfig/HASH"), "siteconfig/HASH");
+        // Sibling-prefix project is NOT rewritten.
+        assert_eq!(rk("project/acmecorp/secret/x"), "project/acmecorp/secret/x");
+        // source == target is a no-op over a whole slice.
+        let mut slice = vec![e("project/acme/secret/x", b"v")];
+        rekey_entries_to_target(&mut slice, "acme", "acme");
+        assert_eq!(slice[0].key, "project/acme/secret/x");
+        rekey_entries_to_target(&mut slice, "acme", "beta");
+        assert_eq!(slice[0].key, "project/beta/secret/x");
     }
 }
