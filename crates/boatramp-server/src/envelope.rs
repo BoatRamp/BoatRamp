@@ -12,6 +12,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use argon2::{Algorithm, Argon2, Params, Version};
 use async_trait::async_trait;
 use aws_lc_rs::aead::{AES_256_GCM, Aad, LessSafeKey, NONCE_LEN, Nonce, UnboundKey};
 use aws_lc_rs::rand::{SecureRandom, SystemRandom};
@@ -241,12 +242,177 @@ fn write_private_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Identity transport container (project-export `--include-identity`)
+//
+// A passphrase-protected, portable container for the exported identity material
+// (the raw KEK + on-disk sealed key files). Same guarantees as PKCS#12 — portable,
+// tamper-detected, useless without the operator's transport passphrase — but over our
+// own key types: an Argon2id KDF turns the passphrase into a 32-byte key and AES-256-GCM
+// seals the payload. The container carries its own KDF salt + params and the AEAD nonce;
+// the raw payload never appears in the output, and the header (salt + params) is bound as
+// AEAD associated data so a tampered KDF parameter fails the open rather than silently
+// weakening the derivation.
+// ---------------------------------------------------------------------------
+
+/// Magic for the identity transport container (bytes `BRIDT1`: boatramp identity transport, v1).
+const TRANSPORT_MAGIC: &[u8; 6] = b"BRIDT1";
+/// KDF salt length.
+const TRANSPORT_SALT_LEN: usize = 16;
+/// Argon2id parameters, recorded in the header so an unwrap derives the same key.
+/// 64 MiB / 3 passes / 1 lane — a solid transport-key derivation (not an online check).
+const TK_M_COST: u32 = 65_536;
+const TK_T_COST: u32 = 3;
+const TK_P_COST: u32 = 1;
+/// Header length that precedes the nonce: salt + three u32 params.
+const TRANSPORT_HDR_PARAMS: usize = TRANSPORT_SALT_LEN + 4 * 3;
+
+/// Derive a 32-byte key from `passphrase` + `salt` via Argon2id with the given params.
+fn transport_kdf(
+    passphrase: &[u8],
+    salt: &[u8],
+    m: u32,
+    t: u32,
+    p: u32,
+) -> Result<[u8; KEK_LEN], EnvelopeError> {
+    let params = Params::new(m, t, p, Some(KEK_LEN))
+        .map_err(|e| EnvelopeError::new(format!("argon2 params: {e}")))?;
+    let a2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+    let mut key = [0u8; KEK_LEN];
+    a2.hash_password_into(passphrase, salt, &mut key)
+        .map_err(|e| EnvelopeError::new(format!("argon2 kdf: {e}")))?;
+    Ok(key)
+}
+
+/// Wrap `payload` into a passphrase-protected transport container (the PKCS#12-pattern
+/// wrapper for exported identity material). `passphrase` must be non-empty.
+pub fn transport_wrap(payload: &[u8], passphrase: &[u8]) -> Result<Vec<u8>, EnvelopeError> {
+    if passphrase.is_empty() {
+        return Err(EnvelopeError::new("transport passphrase must not be empty"));
+    }
+    let rng = SystemRandom::new();
+    let mut salt = [0u8; TRANSPORT_SALT_LEN];
+    rng.fill(&mut salt)
+        .map_err(|_| EnvelopeError::new("generating salt"))?;
+    let mut nonce_bytes = [0u8; NONCE_LEN];
+    rng.fill(&mut nonce_bytes)
+        .map_err(|_| EnvelopeError::new("generating nonce"))?;
+
+    // Fixed header (magic + salt + params): bound as AEAD AAD so tampering the KDF
+    // parameters fails the open instead of silently changing the derivation.
+    let mut header = Vec::with_capacity(TRANSPORT_MAGIC.len() + TRANSPORT_HDR_PARAMS);
+    header.extend_from_slice(TRANSPORT_MAGIC);
+    header.extend_from_slice(&salt);
+    header.extend_from_slice(&TK_M_COST.to_be_bytes());
+    header.extend_from_slice(&TK_T_COST.to_be_bytes());
+    header.extend_from_slice(&TK_P_COST.to_be_bytes());
+
+    let dk = transport_kdf(passphrase, &salt, TK_M_COST, TK_T_COST, TK_P_COST)?;
+    let unbound = UnboundKey::new(&AES_256_GCM, &dk)
+        .map_err(|_| EnvelopeError::new("invalid derived key"))?;
+    let key = LessSafeKey::new(unbound);
+    let nonce = Nonce::assume_unique_for_key(nonce_bytes);
+    let mut in_out = payload.to_vec();
+    key.seal_in_place_append_tag(nonce, Aad::from(&header), &mut in_out)
+        .map_err(|_| EnvelopeError::new("transport seal failed"))?;
+
+    let mut out = Vec::with_capacity(header.len() + NONCE_LEN + in_out.len());
+    out.extend_from_slice(&header);
+    out.extend_from_slice(&nonce_bytes);
+    out.extend_from_slice(&in_out);
+    Ok(out)
+}
+
+/// Unwrap a [`transport_wrap`] container with `passphrase`. Fails with no partial output on
+/// a wrong passphrase or any tamper (including a tampered KDF parameter, via the AAD bind).
+pub fn transport_unwrap(container: &[u8], passphrase: &[u8]) -> Result<Vec<u8>, EnvelopeError> {
+    if !container.starts_with(TRANSPORT_MAGIC.as_slice()) {
+        return Err(EnvelopeError::new("not a transport container (bad magic)"));
+    }
+    if container.len() < TRANSPORT_MAGIC.len() + TRANSPORT_HDR_PARAMS + NONCE_LEN {
+        return Err(EnvelopeError::new("truncated transport container"));
+    }
+    let (header, body) = container.split_at(TRANSPORT_MAGIC.len() + TRANSPORT_HDR_PARAMS);
+    let params = &header[TRANSPORT_MAGIC.len()..];
+    let (salt, rest) = params.split_at(TRANSPORT_SALT_LEN);
+    let m = u32::from_be_bytes(rest[0..4].try_into().unwrap());
+    let t = u32::from_be_bytes(rest[4..8].try_into().unwrap());
+    let p = u32::from_be_bytes(rest[8..12].try_into().unwrap());
+    let (nonce_bytes, ciphertext) = body.split_at(NONCE_LEN);
+
+    let dk = transport_kdf(passphrase, salt, m, t, p)?;
+    let unbound = UnboundKey::new(&AES_256_GCM, &dk)
+        .map_err(|_| EnvelopeError::new("invalid derived key"))?;
+    let key = LessSafeKey::new(unbound);
+    let nonce = Nonce::try_assume_unique_for_key(nonce_bytes)
+        .map_err(|_| EnvelopeError::new("bad nonce"))?;
+    let mut in_out = ciphertext.to_vec();
+    let plaintext = key
+        .open_in_place(nonce, Aad::from(header), &mut in_out)
+        .map_err(|_| {
+            EnvelopeError::new("transport unwrap failed (wrong passphrase or tampered)")
+        })?;
+    Ok(plaintext.to_vec())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn kek() -> LocalKek {
         LocalKek::from_bytes([7u8; KEK_LEN])
+    }
+
+    // ---- identity transport container -------------------------------------
+
+    #[test]
+    fn transport_round_trips_and_hides_the_payload() {
+        // A representative payload: a 32-byte KEK plus a tag.
+        let payload = {
+            let mut v = vec![0xABu8; KEK_LEN];
+            v.extend_from_slice(b"+keyfiles");
+            v
+        };
+        let pass = b"correct horse battery staple";
+        let c = transport_wrap(&payload, pass).unwrap();
+        // The raw payload never appears in the container bytes.
+        assert!(
+            !c.windows(payload.len()).any(|w| w == payload.as_slice()),
+            "payload must not appear in the container"
+        );
+        // Each wrap is randomized (fresh salt + nonce) → distinct ciphertext.
+        let c2 = transport_wrap(&payload, pass).unwrap();
+        assert_ne!(c, c2, "salt+nonce must randomize the container");
+        // Round-trips under the same passphrase.
+        assert_eq!(transport_unwrap(&c, pass).unwrap(), payload);
+    }
+
+    #[test]
+    fn transport_rejects_wrong_passphrase_tamper_and_bad_input() {
+        let payload = b"the exported identity material".to_vec();
+        let pass = b"s3cret-transport-key";
+        let c = transport_wrap(&payload, pass).unwrap();
+
+        // Wrong passphrase → AEAD open fails, no partial output.
+        assert!(transport_unwrap(&c, b"wrong-key").is_err());
+
+        // Tampered ciphertext (flip the last byte) → fails.
+        let mut t = c.clone();
+        *t.last_mut().unwrap() ^= 0x01;
+        assert!(transport_unwrap(&t, pass).is_err());
+
+        // Tampered KDF parameter (an m_cost byte, bound as AAD) → fails rather than
+        // silently weakening the derivation. m_cost starts right after magic + salt.
+        let m_off = TRANSPORT_MAGIC.len() + TRANSPORT_SALT_LEN;
+        let mut p = c.clone();
+        p[m_off] ^= 0x01;
+        assert!(transport_unwrap(&p, pass).is_err());
+
+        // Empty passphrase refused at wrap.
+        assert!(transport_wrap(&payload, b"").is_err());
+        // Bad magic + truncated → clean errors, no panic.
+        assert!(transport_unwrap(b"not-a-container", pass).is_err());
+        assert!(transport_unwrap(TRANSPORT_MAGIC.as_slice(), pass).is_err());
     }
 
     #[tokio::test]
