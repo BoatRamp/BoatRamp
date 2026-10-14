@@ -20,6 +20,7 @@ mod node_ops;
 mod observability;
 mod oidc;
 mod project;
+mod project_transfer;
 mod tokens;
 mod verify;
 mod widgets;

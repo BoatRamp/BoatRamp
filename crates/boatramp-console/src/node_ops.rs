@@ -1056,7 +1056,7 @@ fn sign_out_cb(session: &crate::auth::Session) -> Callback<()> {
 }
 
 /// Read a `File`'s bytes via its `arrayBuffer()`.
-async fn read_file_bytes(file: web_sys::File) -> Result<Vec<u8>, String> {
+pub(crate) async fn read_file_bytes(file: web_sys::File) -> Result<Vec<u8>, String> {
     let buf = JsFuture::from(file.array_buffer()).await.map_err(|e| {
         e.as_string()
             .unwrap_or_else(|| "could not read file".to_string())
@@ -1066,7 +1066,7 @@ async fn read_file_bytes(file: web_sys::File) -> Result<Vec<u8>, String> {
 
 /// Trigger a browser download of `bytes` as `filename` (Blob → object URL →
 /// a programmatic `<a download>` click → revoke).
-fn trigger_download(filename: &str, bytes: &[u8]) -> Result<(), String> {
+pub(crate) fn trigger_download(filename: &str, bytes: &[u8]) -> Result<(), String> {
     download_inner(filename, bytes).map_err(|e| {
         e.as_string()
             .unwrap_or_else(|| "download failed".to_string())

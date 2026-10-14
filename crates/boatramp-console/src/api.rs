@@ -256,6 +256,45 @@ impl ApiClient {
         let resp = check(req.send().await)?;
         decode_json(resp).await
     }
+
+    /// `GET path` with one extra request header, returning the raw response bytes — the
+    /// project-export bundle download. The transport passphrase rides in the
+    /// `X-Boatramp-Transport-Key` HEADER (a secret, so never a query param / URL).
+    pub async fn get_bytes_with_header(
+        &self,
+        path: &str,
+        header_name: &str,
+        header_value: &str,
+    ) -> ApiResult<Vec<u8>> {
+        let req = self
+            .authed(RequestBuilder::new(&self.url(path)))
+            .header(header_name, header_value);
+        let resp = send(req).await?;
+        resp.binary()
+            .await
+            .map_err(|err| ApiError::Transport(err.to_string()))
+    }
+
+    /// `POST path` with a raw `bytes` body + one extra request header, deserializing the
+    /// JSON response into `T` — project import (the bundle body + the transport-key header).
+    pub async fn post_bytes_json_with_header<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        content_type: &str,
+        header_name: &str,
+        header_value: &str,
+        bytes: Vec<u8>,
+    ) -> ApiResult<T> {
+        let body = js_sys::Uint8Array::from(bytes.as_slice());
+        let req = self
+            .authed(RequestBuilder::new(&self.url(path)).method(gloo_net::http::Method::POST))
+            .header("Content-Type", content_type)
+            .header(header_name, header_value)
+            .body(body)
+            .map_err(|err| ApiError::Transport(err.to_string()))?;
+        let resp = check(req.send().await)?;
+        decode_json(resp).await
+    }
 }
 
 /// Send a builder (a request with no JSON body) and map the status.

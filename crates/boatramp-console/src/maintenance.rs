@@ -15,6 +15,7 @@ use crate::node_ops::{
     AuthzPolicyView, BlobDrain, BlobPurge, Cluster, DaemonConfigView, KvCheckpoint, KvExport,
     KvImport, RootAnchors,
 };
+use crate::project_transfer::{ProjectExport, ProjectImport};
 use crate::widgets::{BtnVariant, Button, ErrorBanner, Pill, Section, Spinner, Tone};
 
 /// The node-ops surface: certificates, blob ops, control-plane KV, cluster, and
@@ -32,6 +33,7 @@ pub fn maintenance() -> Html {
             { group("Certificates", html! { <Certs /> }) }
             { group("Blobs", html! { <><Prune /><Scrub /><BlobDrain /><BlobPurge /></> }) }
             { group("Control-plane KV", html! { <><KvCheckpoint /><KvExport /><KvImport /></> }) }
+            { group("Project transfer", html! { <><ProjectExport /><ProjectImport /></> }) }
             { group("Cluster", html! { <Cluster /> }) }
             { group("Trust & RBAC", html! { <><RootAnchors /><DaemonConfigView /><AuthzPolicyView /></> }) }
         </div>
