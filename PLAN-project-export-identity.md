@@ -27,7 +27,26 @@ only identity material that lives *outside* the sealed KV is:
    not carry them. (Enumerate from `[secrets]`/`[mesh]` config at export; include their
    sealed bytes.)
 
-Therefore **`--include-identity` transports the KEK (+ the on-disk sealed key files)**, and:
+### What the container actually carries (refined 2026-10-14)
+
+Enumerating what boatramp persists *outside* the KEK-sealed KV:
+- **KEK** (`secrets/kek`) — carry it (the master; nothing else unseals without it).
+- **Mesh key** (`<data_dir>/mesh/identity.key`) — **excluded**: it is the *node's* cluster-
+  membership identity, not the project/environment's. A recovered node mints its own.
+- **cert keys, sealed operator/app secrets, the IdP/OIDC seed, the managed-pg credential** —
+  all **KEK-sealed values in the KV slice**, already carried by the FULL bundle; they unseal
+  under the adopted KEK. Nothing separate to carry.
+- A control-plane **signer key sourced from config/env** (not a boatramp-persisted artifact)
+  is **out of scope** — it is the operator's to redeploy on the recovery node (the construens
+  request itself notes identity config lives in "config/env, not in KV"). boatramp exports its
+  *persisted state* (KEK + KV slice + pg/mysql/libsql + blobs); the operator deploys the same
+  node config. A signer key that IS a sealed KV secret rides in the slice like any other.
+
+So the container payload is, in practice, **just the KEK** (a versioned `{kek, key_files:[]}`
+struct keeps room for a future on-disk sealed file, but `key_files` is empty today). This is
+the minimal-but-correct boundary; the security review should confirm it.
+
+Therefore **`--include-identity` transports the KEK**, and:
 - **adopt** = install the source KEK (+ key files) ⇒ the KV slice's sealed secrets (incl.
   the IdP seed + managed-pg cred) unseal ⇒ faithful clone. *This is what resolves decision
   #4: the IdP seed is not a separate member — it rides in the KV slice and unseals under the
