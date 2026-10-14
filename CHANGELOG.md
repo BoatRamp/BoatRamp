@@ -5,6 +5,45 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.33.0] - 2026-10-14
+
+Control-plane KV **data-volume observability + a durable manifest-GC fix**. A shared node's SlateDB
+control-plane KV had grown to 17 GB (87% of the volume — accumulated manifest versions that were
+never garbage-collected) and tipped Postgres into `No space left on device`. Root-caused and fixed so
+`/data` tracks the logical store (~17 MB) again, plus operator visibility into what's on the volume.
+
+### The manifest-retention leak — root cause + durable fix
+
+- **Root cause:** SlateDB's embedded garbage collector dies permanently on its first transient tick
+  error (its dispatcher runs each tick as `handle().await?`, so one error exits the loop and nothing
+  restarts it). The compactor is a separate task and keeps running, so `compacted/` stays tiny while
+  `manifest/` + `compactions/` grow unbounded.
+- **Fix — a supervised online GC on the writer daemon.** A new `[serve.kv.slatedb]`-configured
+  background task (`gc_interval`, default 15 min; `gc_min_age`, default 1 h) runs an online-safe
+  reclaim — a plain `run_gc_once` over manifest/wal/compacted/compactions, **no checkpoint-drop and no
+  compaction**, the same non-fencing list+delete predicate the embedded GC uses — inside a loop that
+  **logs and continues on error** (the inverse of the die-on-error dispatcher). Writer-gated (a
+  read-replica and every non-SlateDB backend are no-ops); conservative `min_age` so a reader mid-scan
+  never loses a referenced object. This keeps `/data` from re-filling even though the embedded GC is
+  unreliable.
+
+### Operator tooling + observability
+
+- **`boatramp kv stats`** — physical vs logical footprint + per-subdir (`wal`/`compacted`/`manifest`/
+  `compactions`) breakdown and the reclaimable delta. Read-only.
+- **`boatramp kv compact [--apply]`** — offline full-merge compaction + GC reclaim (dry-run default;
+  `--apply` is irreversible — it drops protective checkpoints + reclaims with `min_age=0`).
+  **OFFLINE ONLY:** it cannot detect a running daemon (SlateDB's writer open is take-over, not
+  refuse-if-live), so stop the daemon first — the command says so plainly rather than falsely claiming
+  a fence will protect you. (A uniform out-of-band daemon lock across the offline `kv` verbs is a
+  tracked follow-up.)
+- **`/data` composition breakdown** added to `GET /api/node-health` and `/api/instance-stats`
+  (`System·Read`): per-top-level-category byte totals (`kv-slate`, `blobs`, `compute`, …). Computed off
+  the async worker (`spawn_blocking`) behind a 60 s cache so polling a large store never stalls a
+  worker. No per-tenant names are exposed.
+
+No WIT/shim change.
+
 ## [0.32.0] - 2026-10-14
 
 Native **project export / import / clone** (env-clone): move or recover one project — its
