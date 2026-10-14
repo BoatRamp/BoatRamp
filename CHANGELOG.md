@@ -5,6 +5,70 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.32.0] - 2026-10-14
+
+Native **project export / import / clone** (env-clone): move or recover one project — its
+managed-database data, libsql snapshots, blob objects, and control-plane state — between
+boatramp environments as a single self-describing `BRPROJ` bundle. Operator-gated
+(`System·Admin`), opt-in, and built to a hard cross-tenant-isolation invariant: a
+single-project bundle carries **only** that project's material. New `boatramp project
+export|import` CLI, a console "Project transfer" panel (Maintenance), and the
+`POST /api/project-export` / `/api/project-import` admin endpoints.
+
+### What a bundle carries
+
+- **Managed Postgres + MySQL**: version-detected, dumped/restored through an **ephemeral client
+  container** (`pg_dump`/`pg_restore`/`mysqldump`/`mysql`) run by the compute backend — streamed,
+  so a multi-GB dump flows with bounded memory. **libsql**: per-site embedded-DB snapshots
+  (no-clobber + integrity-verified on restore). **Blobs**: the project's object store, re-qualified
+  to the target project on a rename.
+- **Control-plane KV slice (full bundle)**: the project's config, routing pointers, RBAC/personas,
+  GraphQL registry, and KEK-sealed secrets — **project-scoped by a fail-closed allowlist**
+  (`project/<p>/`, `graphql/<p>/`, `hapq/<p>/`, `managed-sql-cred/<p>/`, plus the content-addressed
+  `siteconfig/<hash>` bodies the project's own sites reference). Nothing from the global/shared
+  keyspace rides along: no other tenant's keys, **no TLS private keys** (`cert/*`), and no global
+  routing-ownership records — a portable bundle never contains a TLS key, and a clone can't claim
+  the source's verified domains. A `--data-only` bundle carries application data only (no
+  control-plane slice, no identity).
+
+### Identity model (recover the same environment vs. clone to a different one)
+
+- **`export --include-identity`** (default OFF) stages the project KEK in a passphrase-wrapped
+  transport container (Argon2id → AES-256-GCM, header bound as AAD; the PKCS#12 pattern). The
+  transport passphrase travels only in the `X-Boatramp-Transport-Key` **header** (never a query
+  param or a log line); the CLI resolves it from `--transport-key-file`, then
+  `BOATRAMP_EXPORT_TRANSPORT_KEY`, then a hidden prompt. Refused for a Vault/KMS KEK (not
+  extractable) and for a data-only bundle.
+- **`import --identity adopt`** (same-environment backup/recovery) installs the source KEK
+  (`O_EXCL`, `0600`, no-clobber) **before** the restore, so the sealed secrets, managed-DB
+  credential and SMTP passwords unseal and existing tokens stay valid.
+- **`import --identity fresh`** (a different environment) installs no KEK and, after the restore,
+  **drops the complete source-sealed keyspace** — operator/app secrets, all per-tenant secrets,
+  SMTP profiles, and the managed-DB credential — so the target starts clean and re-provisions under
+  its own identity (zero source-sealed artifacts remain). On a project *rename* the imported slice
+  is re-qualified source→target first, so the drop removes the right keys.
+- A `--data-only` restore is **fail-closed on schema skew**: it proceeds only when the source and
+  target schema-ledger fingerprints are both present and equal (override with `--allow-schema-skew`).
+
+### Hardening (security-reviewed)
+
+- The ephemeral export/import client image is pulled on demand by default; under the **multi-tenant
+  posture** an unauthenticated pull of a mutable tag is refused — the image must be preloaded via
+  `[compute] client_image_rootfs` (air-gap) or pinned by `@sha256:` digest, so a registry/MITM can't
+  substitute an image that would run with the managed-DB credential.
+- The transport container's Argon2 parameters are clamped before key derivation (a crafted bundle
+  can't demand gigabytes of memory to OOM the importer pre-authentication).
+- A hard crash mid-export/import leaves no accumulating resource: one-shot `ephm-*` cgroups are swept
+  at node startup (the veth pair dies with the container netns; the IP is reclaimed by the IPAM GC).
+
+### Notes
+
+- A full control-plane restore deliberately carries no function/component **code** (deploy artifacts
+  live in blob storage, not the KV slice), no TLS keys and no routing ownership; the import report
+  names the follow-up on the target — re-deploy code, re-verify + re-attach domains, let ACME
+  re-issue certs.
+- No WIT/shim change.
+
 ## [0.31.1] - 2026-10-13
 
 Fix a lean-build regression (no functional change to the default/batteries build or any shipped
