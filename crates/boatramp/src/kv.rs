@@ -91,6 +91,22 @@ enum KvCommand {
     /// (bytes + count). REFUSES a non-empty `--to` destination unless `--force`. Reserved `_cp/*` /
     /// `_inval/*` feeds are skipped (regenerated). OFFLINE/quiesced by default.
     Migrate(MigrateArgs),
+    /// Report the control-plane SlateDB store's PHYSICAL vs LOGICAL size (kv-data-observability) — the
+    /// diagnostic the 17.2 GB ENOSPC incident lacked. PHYSICAL = a walk of every object under the
+    /// store root (live AND superseded SSTs, every manifest version, every WAL object), broken down
+    /// per subdir (`wal/`, `compacted/`, `manifest/`, `compactions/`). LOGICAL = the bytes the CURRENT
+    /// manifest actually references (live SSTs). The gap is reclaimable garbage — `boatramp kv compact`
+    /// reclaims it. Pure read-only; safe against a quiesced store.
+    Stats(StatsArgs),
+    /// Compact + garbage-collect the control-plane SlateDB store to reclaim the physical-vs-logical gap
+    /// (kv-data-observability). DRY-RUN by default (prints the physical/logical stats + the reclaimable
+    /// delta, and runs GC in dry-run so slatedb logs the delete candidates — mutates NOTHING). `--apply`
+    /// performs a one-shot FULL MERGE of every L0 SST + sorted run into one sorted run, then GCs the
+    /// now-unreferenced garbage (superseded SSTs + old manifests + replayed WAL). GC deletion is
+    /// IRREVERSIBLE. OFFLINE ONLY: STOP the daemon first — SlateDB is single-writer (manifest fencing)
+    /// and a running daemon runs its own embedded compactor + GC, which this would contend. Like
+    /// `kv repair` / `kv recover`, it addresses `<data-dir>/kv-slate` directly.
+    Compact(CompactArgs),
 }
 
 /// A source/destination KV ENDPOINT descriptor for `export`/`import`/`migrate` — `scheme:rest`:
@@ -453,6 +469,32 @@ struct CheckpointArgs {
     server: Option<String>,
 }
 
+/// Arguments for `boatramp kv stats`.
+#[derive(Debug, Args)]
+struct StatsArgs {
+    #[command(flatten)]
+    addr: StoreAddr,
+}
+
+/// Arguments for `boatramp kv compact`.
+#[derive(Debug, Args)]
+struct CompactArgs {
+    #[command(flatten)]
+    addr: StoreAddr,
+
+    /// Perform the compaction + GC reclaim. Without this the command is a DRY-RUN: it prints the
+    /// physical/logical stats and the reclaimable delta, runs GC in dry-run (slatedb logs the delete
+    /// candidates), and mutates NOTHING. `--apply` runs the full-merge compaction then the
+    /// IRREVERSIBLE GC. OFFLINE ONLY — stop the daemon first.
+    #[arg(long)]
+    apply: bool,
+
+    /// Max seconds to wait for the full-merge compaction to land before stopping the compactor (a
+    /// large store merges a lot of data). Default 3600 (1 hour). Only used with `--apply`.
+    #[arg(long, value_name = "SECONDS", default_value_t = 3600)]
+    timeout_secs: u64,
+}
+
 /// Errors surfaced by `boatramp kv`.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -489,6 +531,8 @@ pub async fn run(args: KvArgs) -> Result<(), Error> {
         KvCommand::Export(export) => run_export(export).await,
         KvCommand::Import(import) => run_import(import).await,
         KvCommand::Migrate(migrate) => run_migrate(migrate).await,
+        KvCommand::Stats(stats) => run_stats(stats).await,
+        KvCommand::Compact(compact) => run_compact(compact).await,
     }
 }
 
@@ -1309,6 +1353,192 @@ fn print_report(report: &RepairReport, applied_mode: bool) {
             "  NOTE (honest loss-window): applying on a HARD-CRASH store may lose the most-recent \
              acked-into-WAL-but-not-yet-L0 writes; a graceful shutdown is lossless."
         );
+    }
+}
+
+/// `boatramp kv stats` — report the store's physical-vs-logical footprint (kv-data-observability).
+async fn run_stats(args: StatsArgs) -> Result<(), Error> {
+    if let Some(msg) = args.addr.not_applicable("stats") {
+        println!("{msg}");
+        return Ok(());
+    }
+    let (store, root) = args.addr.build()?;
+    let physical = boatramp_storage::kv_slatedb::kv_physical_stats(&store, &root)
+        .await
+        .map_err(|e| Error::Store(e.to_string()))?;
+    let logical = boatramp_storage::kv_slatedb::kv_logical_stats(&store, &root)
+        .await
+        .map_err(|e| Error::Store(e.to_string()))?;
+    print_kv_stats(&physical, &logical);
+    Ok(())
+}
+
+/// `boatramp kv compact` — DRY-RUN (default) prints the stats + reclaimable delta and runs GC in
+/// dry-run; `--apply` runs the OFFLINE full-merge compaction then the IRREVERSIBLE GC reclaim.
+async fn run_compact(args: CompactArgs) -> Result<(), Error> {
+    use boatramp_storage::kv_slatedb::{kv_compact, kv_gc, kv_logical_stats, kv_physical_stats};
+
+    if let Some(msg) = args.addr.not_applicable("compact") {
+        println!("{msg}");
+        return Ok(());
+    }
+    let (store, root) = args.addr.build()?;
+
+    let physical_before = kv_physical_stats(&store, &root)
+        .await
+        .map_err(|e| Error::Store(e.to_string()))?;
+    let logical_before = kv_logical_stats(&store, &root)
+        .await
+        .map_err(|e| Error::Store(e.to_string()))?;
+
+    if !args.apply {
+        println!("kv compact: DRY-RUN (no changes made). Current store footprint:");
+        print_kv_stats(&physical_before, &logical_before);
+        println!(
+            "\n  A compaction + GC would merge every L0 SST + sorted run into one sorted run and \
+             reclaim the now-unreferenced garbage (superseded SSTs + old manifests + replayed WAL).\n  \
+             Running GC in DRY-RUN below (slatedb logs each delete CANDIDATE; nothing is deleted):"
+        );
+        kv_gc(&store, &root, true, std::time::Duration::ZERO)
+            .await
+            .map_err(|e| Error::Store(e.to_string()))?;
+        println!(
+            "\n  OFFLINE ONLY — STOP the daemon first, then re-run with `--apply` to compact + \
+             reclaim (GC deletion is IRREVERSIBLE)."
+        );
+        return Ok(());
+    }
+
+    // APPLY. OFFLINE: the daemon MUST be stopped (single-writer fencing + the daemon's own embedded
+    // compactor/GC would contend this standalone one).
+    println!(
+        "kv compact --apply: OFFLINE full-merge compaction + GC reclaim. (If the daemon is still \
+         running, SlateDB's single-writer fencing will fail this — stop it first.)"
+    );
+    println!("\n  BEFORE:");
+    print_kv_stats(&physical_before, &logical_before);
+
+    let outcome = kv_compact(
+        &store,
+        &root,
+        std::time::Duration::from_secs(args.timeout_secs),
+    )
+    .await
+    .map_err(|e| Error::Store(e.to_string()))?;
+    match (&outcome.spec, outcome.merged, outcome.timed_out) {
+        (Some(spec), true, _) => println!(
+            "\n  COMPACTED: merged {} run(s) → {} sorted run [spec {spec}].",
+            outcome.runs_before, outcome.runs_after
+        ),
+        (Some(spec), false, true) => println!(
+            "\n  WARNING: the full-merge compaction [spec {spec}] did NOT land within {}s (still {} \
+             run(s)). GC will still reclaim any already-unreferenced garbage, but re-run with a larger \
+             `--timeout-secs` to complete the merge.",
+            args.timeout_secs, outcome.runs_after
+        ),
+        (Some(spec), false, false) => println!(
+            "\n  NOTE: the submitted full-merge [spec {spec}] did not reach a single sorted run \
+             (still {} run(s)); proceeding to GC.",
+            outcome.runs_after
+        ),
+        (None, _, _) => println!(
+            "\n  Nothing to merge ({} run(s) — already compact); proceeding to GC to reclaim old \
+             manifests / WAL.",
+            outcome.runs_before
+        ),
+    }
+
+    let gc = kv_gc(&store, &root, false, std::time::Duration::ZERO)
+        .await
+        .map_err(|e| Error::Store(e.to_string()))?;
+    if gc.dropped_checkpoints > 0 {
+        println!(
+            "  GC: dropped {} protective checkpoint(s) (safe OFFLINE), then reclaimed unreferenced \
+             SSTs + old manifests + replayed WAL.",
+            gc.dropped_checkpoints
+        );
+    } else {
+        println!("  GC: reclaimed unreferenced SSTs + old manifests + replayed WAL.");
+    }
+
+    let physical_after = kv_physical_stats(&store, &root)
+        .await
+        .map_err(|e| Error::Store(e.to_string()))?;
+    let logical_after = kv_logical_stats(&store, &root)
+        .await
+        .map_err(|e| Error::Store(e.to_string()))?;
+    println!("\n  AFTER:");
+    print_kv_stats(&physical_after, &logical_after);
+    let reclaimed = physical_before
+        .total_bytes
+        .saturating_sub(physical_after.total_bytes);
+    println!(
+        "\n  RECLAIMED: {} ({} → {} physical).",
+        human_bytes(reclaimed),
+        human_bytes(physical_before.total_bytes),
+        human_bytes(physical_after.total_bytes),
+    );
+    Ok(())
+}
+
+/// Print a physical-vs-logical stats block: totals, the reclaimable delta, and the per-subdir
+/// physical breakdown.
+fn print_kv_stats(
+    physical: &boatramp_storage::kv_slatedb::KvPhysicalStats,
+    logical: &boatramp_storage::kv_slatedb::KvLogicalStats,
+) {
+    let reclaimable = physical.total_bytes.saturating_sub(logical.live_bytes);
+    let pct = if physical.total_bytes > 0 {
+        reclaimable as f64 / physical.total_bytes as f64 * 100.0
+    } else {
+        0.0
+    };
+    println!(
+        "  physical:    {} in {} object(s)",
+        human_bytes(physical.total_bytes),
+        physical.total_objects
+    );
+    println!(
+        "  logical:     {} in {} live SST(s) (manifest gen {}, {} L0 + {} sorted run(s))",
+        human_bytes(logical.live_bytes),
+        logical.live_sst_count,
+        logical.manifest_id,
+        logical.l0_count,
+        logical.sorted_run_count,
+    );
+    println!(
+        "  reclaimable: {} ({pct:.1}% of physical — superseded SSTs + old manifests + replayed WAL)",
+        human_bytes(reclaimable),
+    );
+    if !physical.dirs.is_empty() {
+        println!("  by subdir:");
+        for d in &physical.dirs {
+            println!(
+                "    {:<12} {} in {} object(s)",
+                format!("{}/", d.name),
+                human_bytes(d.bytes),
+                d.objects
+            );
+        }
+    }
+}
+
+/// Human-readable bytes (binary units), e.g. `17.2 GiB`. Diagnostic-only formatting.
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 6] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
+    if bytes == 0 {
+        return "0 B".to_string();
+    }
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
     }
 }
 
