@@ -797,6 +797,11 @@ pub async fn kv_gc(
     let admin = kv_admin(store, root);
     let mut dropped_checkpoints = 0;
     if !dry_run {
+        // Drops EVERY checkpoint. Safe today: nothing in the repo creates a detached/backup
+        // checkpoint (`create_checkpoint` is unused, clone-detach disabled), so the only checkpoints
+        // present are slatedb's own transient protective ones. FOOTGUN for the future: if a backup
+        // feature ever uses slatedb's detached-checkpoint mechanism on the control-plane store,
+        // restrict this to the compactor's protective checkpoints instead of dropping all.
         for cp in admin.list_checkpoints(None).await.map_err(backend)? {
             admin.delete_checkpoint(cp.id).await.map_err(backend)?;
             dropped_checkpoints += 1;

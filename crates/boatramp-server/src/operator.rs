@@ -169,7 +169,7 @@ pub(super) async fn node_instance_stats(
             // them automatically.
             let mut v = serde_json::to_value(&stats).unwrap_or_else(|_| serde_json::json!({}));
             if let (Some(obj), Some(dir)) = (v.as_object_mut(), handlers.data_dir()) {
-                merge_data_usage(obj, dir);
+                merge_data_usage(obj, dir).await;
             }
             Json(v).into_response()
         }
@@ -244,12 +244,67 @@ pub(super) fn data_fs_usage(_dir: &std::path::Path) -> Option<DataFsUsage> {
 /// statvfs error drops only the flat keys, an unreadable data dir drops only the breakdown, and an
 /// older client that knows neither key is unaffected. Used by BOTH `/api/node-health` and
 /// `/api/instance-stats`, so the two surfaces report the same composition.
+/// How long a computed `/data` composition breakdown is reused before a fresh walk. The headroom
+/// signal does not need per-request freshness, and these endpoints are polled by the console
+/// monitoring UI — on the very-large store this feature targets a per-request full tree walk would
+/// stall a worker on every poll, so cache it briefly.
 #[cfg(feature = "handlers")]
-fn merge_data_usage(obj: &mut serde_json::Map<String, serde_json::Value>, dir: &std::path::Path) {
+const DATA_BREAKDOWN_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Process-global cache of the last `/data` breakdown: `(computed_at, data_dir, breakdown)`. The node
+/// has a single data dir, but the dir is part of the key so a path change invalidates the entry.
+#[cfg(feature = "handlers")]
+static DATA_BREAKDOWN_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<
+        Option<(
+            std::time::Instant,
+            std::path::PathBuf,
+            serde_json::Map<String, serde_json::Value>,
+        )>,
+    >,
+> = std::sync::OnceLock::new();
+
+/// The `/data` per-category breakdown, cached for [`DATA_BREAKDOWN_TTL`] and computed OFF the async
+/// worker. [`data_dir_breakdown`] is a blocking recursive `std::fs` walk that can take seconds on a
+/// multi-gigabyte / many-object store (exactly the store node-health is polled against during a
+/// disk-full incident), so running it inline on a tokio worker would stall the runtime; `spawn_blocking`
+/// keeps it off the async threads and the TTL keeps frequent polls from re-walking.
+#[cfg(feature = "handlers")]
+async fn cached_data_breakdown(
+    dir: &std::path::Path,
+) -> Option<serde_json::Map<String, serde_json::Value>> {
+    let cache = DATA_BREAKDOWN_CACHE.get_or_init(|| std::sync::Mutex::new(None));
+    if let Ok(guard) = cache.lock()
+        && let Some((at, cached_dir, map)) = guard.as_ref()
+        && cached_dir == dir
+        && at.elapsed() < DATA_BREAKDOWN_TTL
+    {
+        return Some(map.clone());
+    }
+    let owned = dir.to_path_buf();
+    let computed = tokio::task::spawn_blocking(move || data_dir_breakdown(&owned))
+        .await
+        .ok()
+        .flatten()?;
+    if let Ok(mut guard) = cache.lock() {
+        *guard = Some((
+            std::time::Instant::now(),
+            dir.to_path_buf(),
+            computed.clone(),
+        ));
+    }
+    Some(computed)
+}
+
+#[cfg(feature = "handlers")]
+async fn merge_data_usage(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    dir: &std::path::Path,
+) {
     if let Some(fs) = data_fs_usage(dir) {
         fs.merge_into(obj);
     }
-    if let Some(breakdown) = data_dir_breakdown(dir) {
+    if let Some(breakdown) = cached_data_breakdown(dir).await {
         obj.insert(
             "data_breakdown".into(),
             serde_json::Value::Object(breakdown),
@@ -325,7 +380,7 @@ fn dir_size_recursive(dir: &std::path::Path, depth: u32) -> u64 {
 pub(super) async fn node_health(Extension(handlers): Extension<Arc<HandlerRuntime>>) -> Response {
     let mut obj = serde_json::Map::new();
     if let Some(dir) = handlers.data_dir() {
-        merge_data_usage(&mut obj, dir);
+        merge_data_usage(&mut obj, dir).await;
     }
     Json(serde_json::Value::Object(obj)).into_response()
 }

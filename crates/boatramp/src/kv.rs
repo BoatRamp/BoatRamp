@@ -1409,11 +1409,36 @@ async fn run_compact(args: CompactArgs) -> Result<(), Error> {
         return Ok(());
     }
 
-    // APPLY. OFFLINE: the daemon MUST be stopped (single-writer fencing + the daemon's own embedded
-    // compactor/GC would contend this standalone one).
+    // APPLY. OFFLINE ONLY + IRREVERSIBLE. The reclaim below is NON-FENCING (a standalone `Admin`
+    // that drops the protective checkpoints then deletes every unreferenced object with min_age=0),
+    // so nothing in the reclaim itself would detect or stop it running against a live daemon — it
+    // would delete SSTs/manifests a reader is mid-scan on. So FIRST actively PROBE the single-writer
+    // fence by opening the store as a writer (the same Strict open the sibling offline verbs use): a
+    // live daemon holds the fence and this open fails LOUD → we refuse. On success no writer is live;
+    // we release the probe and run the offline reclaim. (A small probe-release→reclaim window is
+    // inherent to an offline maintenance tool — there is no run-lock/pidfile under the data dir to
+    // consult; the operator still runs this with the daemon stopped.)
+    match args
+        .addr
+        .open_store(boatramp_storage::kv_slatedb::KvOpenPolicy::Strict)
+        .await
+    {
+        Ok(probe) => {
+            // No live writer — release the fence before the standalone Admin reclaim.
+            boatramp_core::kv::KvStore::close(&probe).await.ok();
+        }
+        Err(e) => {
+            return Err(Error::Store(format!(
+                "refusing `kv compact --apply`: could not acquire the single-writer fence, so a \
+                 live daemon appears to hold this store — STOP it first. This command is \
+                 OFFLINE-ONLY, and its reclaim is IRREVERSIBLE and non-fencing: run against a live \
+                 daemon it would delete objects a reader is still using. (fence probe: {e})"
+            )));
+        }
+    }
     println!(
-        "kv compact --apply: OFFLINE full-merge compaction + GC reclaim. (If the daemon is still \
-         running, SlateDB's single-writer fencing will fail this — stop it first.)"
+        "kv compact --apply: OFFLINE full-merge compaction + GC reclaim (single-writer fence \
+         acquired — no live daemon detected). GC deletion is IRREVERSIBLE."
     );
     println!("\n  BEFORE:");
     print_kv_stats(&physical_before, &logical_before);

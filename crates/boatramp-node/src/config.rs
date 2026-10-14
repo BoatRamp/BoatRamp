@@ -3124,6 +3124,9 @@ pub struct SlatedbKvConfig {
     /// [`DEFAULT_KV_GC_MIN_AGE_SECS`] (1h) — never zero, so a reader replica mid-scan over a
     /// just-superseded manifest generation can never have a needed object reclaimed out from under it.
     /// A tuned positive value is honored (e.g. a single-node deploy with no read replicas may lower it).
+    /// CAVEAT: lowering it is UNSAFE whenever ANY read replica polls this shared store — a value below
+    /// the time a replica may spend mid-scan reintroduces the "object reclaimed out from under a
+    /// reader" hazard. Only lower it on a node you are certain has no read replicas.
     pub gc_min_age: Option<u64>,
 }
 
