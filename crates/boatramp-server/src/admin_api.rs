@@ -2429,6 +2429,9 @@ pub(super) async fn project_import(
         apply: q.apply,
         force: q.force,
         allow_schema_skew: q.allow_schema_skew,
+        // The request-side `--identity {adopt|fresh}` plumbing is a follow-up; default to the
+        // safe Fresh (never installs source identity) until it is wired.
+        identity: boatramp_core::project_export::IdentityChoice::Fresh,
     };
     let res = cap.import(&q.project, &tmp, opts).await;
     let _ = tokio::fs::remove_file(&tmp).await;

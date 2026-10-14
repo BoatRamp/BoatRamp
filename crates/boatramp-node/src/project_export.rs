@@ -44,7 +44,7 @@ use boatramp_core::envelope::KeyEnvelope;
 use boatramp_core::kv::KvStore;
 use boatramp_core::project::ProjectRef;
 use boatramp_core::project_export::{
-    ExportOptions, ImportOptions, ImportReport, ProjectExport, ProjectExportError,
+    ExportOptions, IdentityChoice, ImportOptions, ImportReport, ProjectExport, ProjectExportError,
 };
 use boatramp_core::sql::SqlValue;
 use boatramp_storage::sql_libsql::LibsqlSqlBackends;
@@ -286,8 +286,6 @@ fn identity_payload_bytes(kek: &[u8]) -> Result<Vec<u8>, Perr> {
 }
 
 /// Parse an [`identity_payload_bytes`] blob back to the raw KEK (import `--identity adopt`).
-// Wired by the import `--identity adopt` path (next step); kept with its serializer pair.
-#[allow(dead_code)]
 fn parse_identity_payload(bytes: &[u8]) -> Result<Vec<u8>, Perr> {
     let rest = bytes
         .strip_prefix(IDENTITY_PAYLOAD_MAGIC.as_slice())
@@ -307,6 +305,37 @@ fn parse_identity_payload(bytes: &[u8]) -> Result<Vec<u8>, Perr> {
         return Err(Perr::Other("identity payload: KEK length mismatch".into()));
     }
     Ok(kek.to_vec())
+}
+
+/// Install `kek` at `path` as the node's `secrets/kek`, `0600` (owner-only) — the master
+/// secret must never be world/group-readable. Used by `--identity adopt`.
+async fn write_kek_file(path: &std::path::Path, kek: &[u8]) -> Result<(), Perr> {
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await.map_err(other)?;
+    }
+    let path = path.to_path_buf();
+    let kek = kek.to_vec();
+    tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&path)?;
+            f.write_all(&kek)
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::write(&path, &kek)
+        }
+    })
+    .await
+    .map_err(other)?
+    .map_err(other)
 }
 
 /// Always constructible from the node's always-present deps (deploy + KV + blobs); the
@@ -926,6 +955,68 @@ impl ProjectExport for NodeProjectExport {
             ..Default::default()
         };
 
+        // --- identity (adopt only; BEFORE the restore so the KV slice's sealed secrets
+        // unseal under the installed KEK). `fresh` installs nothing and drops the source
+        // sealed-secret keyspace after the KV restore (below). ---
+        if let IdentityChoice::Adopt { transport_key } = &opts.identity {
+            let Some(id_member) = manifest
+                .members
+                .iter()
+                .find(|m| m.kind == MemberKind::Identity)
+            else {
+                return Err(Perr::Other(
+                    "--identity adopt requires a bundle exported with --include-identity \
+                     (no identity member present); use --identity fresh to import a bundle \
+                     without identity"
+                        .into(),
+                ));
+            };
+            match self.identity_source.as_ref() {
+                Some(IdentityEnvelope::Local { kek_file }) => {
+                    let container = tokio::fs::read(extract.join(&id_member.path))
+                        .await
+                        .map_err(other)?;
+                    let payload =
+                        boatramp_server::envelope::transport_unwrap(&container, transport_key)
+                            .map_err(|e| {
+                                Perr::Other(format!(
+                                    "opening the identity container (wrong transport key?): {e}"
+                                ))
+                            })?;
+                    let kek = parse_identity_payload(&payload)?;
+                    // No-clobber: never adopt OVER a different live KEK — adopt is recovery
+                    // onto a fresh node, not cloning one env's identity onto another.
+                    match tokio::fs::read(kek_file).await {
+                        Ok(existing) if existing != kek => {
+                            return Err(Perr::Other(format!(
+                                "refusing to adopt: this node already holds a DIFFERENT KEK at \
+                                 {} — adopt is for recovery onto a fresh node; use --identity \
+                                 fresh to import into a different environment",
+                                kek_file.display()
+                            )));
+                        }
+                        Ok(_) => { /* identical KEK already present — idempotent */ }
+                        Err(_) => {
+                            if opts.apply {
+                                write_kek_file(kek_file, &kek).await?;
+                            }
+                        }
+                    }
+                    report
+                        .notes
+                        .push("identity: adopted the source KEK (recovery)".into());
+                }
+                Some(IdentityEnvelope::Vault) | Some(IdentityEnvelope::None) | None => {
+                    return Err(Perr::Other(
+                        "--identity adopt installs a local KEK from the bundle, but this node's \
+                         secrets envelope is not local; for a Vault recovery point \
+                         [secrets.vault] at the same key, or use --identity fresh"
+                            .into(),
+                    ));
+                }
+            }
+        }
+
         // Order: blobs -> pg/libsql -> kv.
 
         // --- blobs ---
@@ -1111,6 +1202,29 @@ impl ProjectExport for NodeProjectExport {
                     report.kv_records = plan.would_write;
                 }
             }
+        }
+
+        // --- fresh identity: drop the source sealed-secret keyspace (Ask-4c) ---
+        // A `fresh` import of a FULL bundle just restored the SOURCE's KEK-sealed secrets
+        // (operator/app + per-tenant), which can never unseal under this node's own
+        // (different) KEK. Drop them so the target starts clean and re-provisions — making
+        // "zero source-sealed artifacts that unwrap" a POSITIVE absence rather than
+        // present-but-inert. Only for a FULL bundle (data-only carries no KV/secrets) and
+        // only when applying.
+        if matches!(opts.identity, IdentityChoice::Fresh) && !manifest.data_only && opts.apply {
+            let prefixes =
+                boatramp_core::project_export::sealed_secret_prefixes(ProjectRef::new(project));
+            let mut dropped = 0usize;
+            for prefix in &prefixes {
+                for key in self.kv.list_prefix(prefix).await.map_err(other)? {
+                    self.kv.delete_checkpointed(&key).await.map_err(other)?;
+                    dropped += 1;
+                }
+            }
+            report.notes.push(format!(
+                "identity: --fresh dropped {dropped} source-sealed secret key(s); re-provision \
+                 secrets + the managed-DB credential on the target"
+            ));
         }
 
         let _ = tokio::fs::remove_dir_all(&session).await;
@@ -1430,6 +1544,181 @@ mod tests {
                 .await
                 .is_err(),
             "include-identity on a Vault envelope is refused"
+        );
+    }
+
+    /// Driver-level (in-process): `adopt` installs the source KEK and keeps the KV slice's
+    /// sealed secrets; `fresh` installs no KEK and DROPS the source sealed-secret keyspace;
+    /// neither imports `_cp/*`; and `adopt` on a bundle with no identity member is refused.
+    /// The Ask-4(b) (never import `_cp/*`) + Ask-4(c) (fresh ⇒ zero source-sealed artifacts)
+    /// gate.
+    #[tokio::test]
+    async fn adopt_installs_kek_and_fresh_drops_source_secrets() {
+        use boatramp_core::Storage;
+        use boatramp_core::deploy::DeployStore;
+        use boatramp_core::kv::{KvStore, MemoryKv};
+        use boatramp_storage::fs::FsStorage;
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let kek = [0x3Cu8; 32];
+        let src_kek_file = tmp.path().join("src-kek");
+        std::fs::write(&src_kek_file, kek).unwrap();
+
+        // Source: a sealed secret, a per-tenant secret, a reserved `_cp/*` key (must NOT
+        // export), and a non-secret control-plane key (routing — kept on fresh).
+        let src_kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        for (k, v) in [
+            ("project/acme/secret/api-key", &b"sealed"[..]),
+            ("project/acme/tenant-secret/t1/token", &b"sealed-t"[..]),
+            ("_cp/leader", &b"node-1"[..]),
+            ("routing/acme/site", &b"r"[..]),
+        ] {
+            src_kv.put(k, v.to_vec()).await.unwrap();
+        }
+        let src_blobs: Arc<dyn Storage> = Arc::new(FsStorage::new(tmp.path().join("src-blobs")));
+        let src = NodeProjectExport::new(
+            BTreeMap::new(),
+            DeployStore::new(src_blobs.clone(), src_kv.clone()),
+            src_kv.clone(),
+            src_blobs,
+            {
+                let w = tmp.path().join("src-work");
+                std::fs::create_dir_all(&w).unwrap();
+                w
+            },
+        )
+        .with_identity_source(IdentityEnvelope::Local {
+            kek_file: src_kek_file.clone(),
+        });
+        let pass = b"transport-pass".to_vec();
+        let bundle = src
+            .export(
+                "acme",
+                &ExportOptions {
+                    data_only: false,
+                    include_identity: true,
+                    transport_key: Some(pass.clone()),
+                },
+            )
+            .await
+            .expect("export with identity");
+
+        // Build a fresh target driver (empty KV, a kek_file path that does not yet exist).
+        let target = |tag: &str| {
+            let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+            let blobs: Arc<dyn Storage> =
+                Arc::new(FsStorage::new(tmp.path().join(format!("{tag}-blobs"))));
+            let work = tmp.path().join(format!("{tag}-work"));
+            std::fs::create_dir_all(&work).unwrap();
+            let kek_file = tmp.path().join(format!("{tag}-kek"));
+            let drv = NodeProjectExport::new(
+                BTreeMap::new(),
+                DeployStore::new(blobs.clone(), kv.clone()),
+                kv.clone(),
+                blobs,
+                work,
+            )
+            .with_identity_source(IdentityEnvelope::Local {
+                kek_file: kek_file.clone(),
+            });
+            (drv, kv, kek_file)
+        };
+
+        // --- adopt: installs the KEK, keeps sealed secrets, never writes _cp/* ---
+        let (adopt_drv, a_kv, a_kek) = target("a");
+        adopt_drv
+            .import(
+                "acme",
+                &bundle,
+                ImportOptions {
+                    apply: true,
+                    identity: IdentityChoice::Adopt {
+                        transport_key: pass.clone(),
+                    },
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("adopt import");
+        assert_eq!(
+            std::fs::read(&a_kek).unwrap(),
+            kek,
+            "adopt installed the source KEK"
+        );
+        assert!(
+            a_kv.get("project/acme/secret/api-key")
+                .await
+                .unwrap()
+                .is_some(),
+            "adopt keeps the sealed secret (it unseals under the adopted KEK)"
+        );
+        assert!(
+            a_kv.get("_cp/leader").await.unwrap().is_none(),
+            "import never writes a reserved _cp/* key (Ask-4b)"
+        );
+
+        // --- fresh: installs NO KEK, drops the source sealed-secret keyspace ---
+        let (fresh_drv, f_kv, f_kek) = target("f");
+        fresh_drv
+            .import(
+                "acme",
+                &bundle,
+                ImportOptions {
+                    apply: true,
+                    identity: IdentityChoice::Fresh,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("fresh import");
+        assert!(!f_kek.exists(), "fresh installs no KEK");
+        assert!(
+            f_kv.get("project/acme/secret/api-key")
+                .await
+                .unwrap()
+                .is_none(),
+            "fresh dropped the source sealed secret (Ask-4c)"
+        );
+        assert!(
+            f_kv.get("project/acme/tenant-secret/t1/token")
+                .await
+                .unwrap()
+                .is_none(),
+            "fresh dropped the source per-tenant secret (Ask-4c)"
+        );
+        assert!(
+            f_kv.get("routing/acme/site").await.unwrap().is_some(),
+            "fresh keeps non-secret control-plane config (routing)"
+        );
+        assert!(
+            f_kv.get("_cp/leader").await.unwrap().is_none(),
+            "import never writes a reserved _cp/* key (Ask-4b)"
+        );
+
+        // --- adopt on a bundle WITHOUT an identity member is refused ---
+        let plain = src
+            .export("acme", &ExportOptions::default())
+            .await
+            .expect("plain export");
+        let (no_id_drv, _k, _f) = target("n");
+        assert!(
+            no_id_drv
+                .import(
+                    "acme",
+                    &plain,
+                    ImportOptions {
+                        apply: true,
+                        identity: IdentityChoice::Adopt {
+                            transport_key: pass.clone(),
+                        },
+                        ..Default::default()
+                    },
+                )
+                .await
+                .is_err(),
+            "adopt on a bundle with no identity member is refused"
         );
     }
 
