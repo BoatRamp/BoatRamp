@@ -455,6 +455,408 @@ pub(crate) fn build_s3_object_store(cfg: &S3StoreConfig) -> Result<Arc<dyn Objec
     Ok(Arc::new(builder.build().map_err(backend)?))
 }
 
+// ===================================================================================
+// KV data-observability + offline compaction/GC (construens kv-data-observability).
+//
+// The control-plane SlateDB store can grow its PHYSICAL footprint (superseded SSTs + old
+// manifests + old WAL objects) far past its LOGICAL (live) size when the embedded compactor/GC
+// cannot keep up with a high checkpoint-per-write churn — the 17.2 GB ENOSPC incident. These
+// read-only stats make the logical-vs-physical gap visible, and the offline compaction/GC lever
+// reclaims it. All are backend-agnostic (local disk or S3/R2): they go through the same
+// `object_store` + root the opener uses, and the `slatedb::admin::Admin` API over that store.
+//
+// OFFLINE ONLY for the mutating path: SlateDB is single-writer (manifest fencing) AND a running
+// daemon runs its OWN embedded compactor + GC, so a second live `Admin` compactor would contend
+// the fence. The CLI (`boatramp kv compact`) refuses/documents offline, exactly like `kv repair`
+// / `kv recover`. The stats reads are safe to run against a quiesced store.
+// ===================================================================================
+
+/// Physical byte total + object count for one top-level subdirectory of the SlateDB store layout
+/// (`wal/`, `compacted/`, `manifest/`, `compactions/`, or an unexpected `other`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KvDirStat {
+    /// The subdirectory name (first path segment under the store root).
+    pub name: String,
+    /// Number of objects under it.
+    pub objects: u64,
+    /// Total bytes of those objects.
+    pub bytes: u64,
+}
+
+/// The PHYSICAL footprint of the SlateDB store: a walk of every object under the store root,
+/// bucketed by top-level subdir. This is "how much disk the store actually occupies" — SSTs (live
+/// AND superseded), every manifest version, every WAL object, and the compactor job state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KvPhysicalStats {
+    /// Total bytes across every object under the root.
+    pub total_bytes: u64,
+    /// Total object count under the root.
+    pub total_objects: u64,
+    /// Per-subdir breakdown (`wal`, `compacted`, `manifest`, `compactions`, `other`), sorted by name.
+    pub dirs: Vec<KvDirStat>,
+}
+
+/// The LOGICAL (live) size of the store: the sum of the estimated sizes of every SST the CURRENT
+/// manifest references (L0 SST views + every SST in every sorted run). Everything physical beyond
+/// this — superseded SSTs, old manifests, replayed WAL — is reclaimable garbage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KvLogicalStats {
+    /// The manifest version these figures were read from.
+    pub manifest_id: u64,
+    /// Count of L0 SST views referenced by the manifest.
+    pub l0_count: u64,
+    /// Count of sorted runs referenced by the manifest.
+    pub sorted_run_count: u64,
+    /// Count of SSTs referenced (L0 views + every SST across all sorted runs).
+    pub live_sst_count: u64,
+    /// Sum of `estimate_size()` over every referenced SST — the live bytes.
+    pub live_bytes: u64,
+}
+
+/// Walk every object under `root` and bucket it by its first path segment (`wal`/`compacted`/
+/// `manifest`/`compactions`, else `other`). Backend-agnostic (the `object_store` `list`, the same
+/// the WAL-repair scan uses). Read-only.
+pub async fn kv_physical_stats(
+    store: &Arc<dyn ObjectStore>,
+    root: &str,
+) -> Result<KvPhysicalStats, KvError> {
+    use futures::StreamExt;
+    use std::collections::BTreeMap;
+
+    let root_prefix = ObjPath::from(root);
+    let mut stream = store.list(Some(&root_prefix));
+    let mut buckets: BTreeMap<String, (u64, u64)> = BTreeMap::new();
+    let mut total_bytes = 0u64;
+    let mut total_objects = 0u64;
+    while let Some(item) = stream.next().await {
+        let meta = item.map_err(backend)?;
+        let size = meta.size;
+        total_bytes = total_bytes.saturating_add(size);
+        total_objects = total_objects.saturating_add(1);
+        let bucket = subdir_bucket(&meta.location, root);
+        let entry = buckets.entry(bucket).or_insert((0, 0));
+        entry.0 = entry.0.saturating_add(1);
+        entry.1 = entry.1.saturating_add(size);
+    }
+    let dirs = buckets
+        .into_iter()
+        .map(|(name, (objects, bytes))| KvDirStat {
+            name,
+            objects,
+            bytes,
+        })
+        .collect();
+    Ok(KvPhysicalStats {
+        total_bytes,
+        total_objects,
+        dirs,
+    })
+}
+
+/// The first path segment of `location` under `root` — the SlateDB subdir the object lives in. An
+/// object whose path has no segment under the root (none expected in a well-formed store) buckets
+/// into `other`.
+fn subdir_bucket(location: &ObjPath, root: &str) -> String {
+    let full = location.to_string();
+    let rest = full
+        .strip_prefix(root)
+        .map(|r| r.trim_start_matches('/'))
+        .unwrap_or(full.as_str());
+    match rest.split('/').next() {
+        Some(seg) if !seg.is_empty() && rest.contains('/') => seg.to_string(),
+        _ => "other".to_string(),
+    }
+}
+
+/// Sum the estimated sizes of every SST the latest manifest references. The `slatedb::admin::Admin`
+/// read path is read-only (it never mutates the store). An empty store (no manifest yet) reports
+/// all-zero. Read-only.
+pub async fn kv_logical_stats(
+    store: &Arc<dyn ObjectStore>,
+    root: &str,
+) -> Result<KvLogicalStats, KvError> {
+    let admin = kv_admin(store, root);
+    let Some(manifest) = admin.read_manifest(None).await.map_err(backend)? else {
+        return Ok(KvLogicalStats {
+            manifest_id: 0,
+            l0_count: 0,
+            sorted_run_count: 0,
+            live_sst_count: 0,
+            live_bytes: 0,
+        });
+    };
+    let mut live_bytes = 0u64;
+    let mut live_sst_count = 0u64;
+    for view in manifest.l0() {
+        live_bytes = live_bytes.saturating_add(view.sst.estimate_size());
+        live_sst_count += 1;
+    }
+    for sr in manifest.compacted() {
+        for view in sr.sst_views() {
+            live_bytes = live_bytes.saturating_add(view.sst.estimate_size());
+            live_sst_count += 1;
+        }
+    }
+    Ok(KvLogicalStats {
+        manifest_id: manifest.id(),
+        l0_count: manifest.l0().len() as u64,
+        sorted_run_count: manifest.compacted().len() as u64,
+        live_sst_count,
+        live_bytes,
+    })
+}
+
+/// Build a read/maintenance [`Admin`](slatedb::admin::Admin) over the SAME object store + root the
+/// opener uses. Single-writer: the caller guarantees the daemon is stopped for any mutating use.
+fn kv_admin(store: &Arc<dyn ObjectStore>, root: &str) -> slatedb::admin::Admin {
+    slatedb::admin::Admin::builder(root.to_string(), store.clone()).build()
+}
+
+/// The outcome of an offline [`kv_compact`] pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KvCompactOutcome {
+    /// Runs present BEFORE (L0 SST views + sorted runs in the manifest).
+    pub runs_before: u64,
+    /// Runs present AFTER (ideally 1 sorted run, 0 L0).
+    pub runs_after: u64,
+    /// `true` if the full-merge landed (manifest reached a single sorted run with no L0). `false` if
+    /// there was nothing to merge (≤1 run / already one sorted run), or the merge did not complete
+    /// within the timeout.
+    pub merged: bool,
+    /// Human-readable description of the full-merge that was run, if one was run.
+    pub spec: Option<String>,
+    /// `true` if a full-merge was run but did not reach the merged shape before the timeout (a
+    /// diagnostic — the caller must NOT report success).
+    pub timed_out: bool,
+}
+
+/// OFFLINE one-shot full-merge compaction via the standalone `slatedb::admin::Admin` compactor: run
+/// the compactor with the embedded size-tiered scheduler TUNED to merge EVERY L0 SST view + EVERY
+/// sorted run into a SINGLE sorted run in one step (`min_compaction_sources = 2`,
+/// `max_compaction_sources`/`include_size_threshold` set effectively unbounded — see
+/// [`compactor_run_options`]), poll the manifest until the merge lands (`l0` empty + exactly one
+/// sorted run) or `timeout` elapses, then stop it gracefully. Does NOT garbage-collect (that is
+/// [`kv_gc`]); after a successful merge the old inputs are unreferenced garbage a GC pass reclaims.
+///
+/// Why the scheduler drives the merge rather than an explicit
+/// [`submit_compaction`](slatedb::admin::Admin::submit_compaction): `submit_compaction` requires a
+/// pre-existing `.compactions` job-state object (a store whose embedded compactor never initialized
+/// one — exactly the offline-maintenance case — yields `InvalidDBState`). Running the compactor
+/// creates `.compactions` itself and lets slatedb's own validator pick the sources/destination, so
+/// it is robust whether the store came from a live daemon (where `.compactions` exists) or not, and
+/// it sidesteps the known fragility of racing a hand-rolled spec against the coordinator's own
+/// proposals. The TUNED scheduler proposes a single all-L0 → one-SR merge (then merges any remaining
+/// runs together), which is the same one-shot full merge the ask calls for.
+///
+/// OFFLINE ONLY: the daemon must be stopped (SlateDB single-writer fencing + the daemon's own
+/// embedded compactor would contend). A store already at ≤1 run returns `merged: false` without
+/// running the compactor.
+pub async fn kv_compact(
+    store: &Arc<dyn ObjectStore>,
+    root: &str,
+    timeout: Duration,
+) -> Result<KvCompactOutcome, KvError> {
+    let admin = kv_admin(store, root);
+    let manifest = admin
+        .read_manifest(None)
+        .await
+        .map_err(backend)?
+        .ok_or_else(|| KvError::backend("kv compact: the store has no manifest to compact"))?;
+
+    let l0_count = manifest.l0().len();
+    let sr_count = manifest.compacted().len();
+    let runs_before = (l0_count + sr_count) as u64;
+
+    // Nothing to merge: 0/1 total run, or already a single sorted run with no L0.
+    if runs_before < 2 || (l0_count == 0 && sr_count == 1) {
+        return Ok(KvCompactOutcome {
+            runs_before,
+            runs_after: runs_before,
+            merged: false,
+            spec: None,
+            timed_out: false,
+        });
+    }
+
+    // Run the standalone compactor with the full-merge-tuned scheduler + a tight poll cadence. It
+    // blocks until the cancellation token fires; a watcher (reading the manifest through a SECOND
+    // Admin so it never shares the compactor's borrow of `admin`) cancels the token the moment the
+    // merge lands, or after `timeout`.
+    let token = tokio_util::sync::CancellationToken::new();
+    let opts = compactor_run_options();
+    let watcher_token = token.clone();
+    let watcher_store = store.clone();
+    let watcher_root = root.to_string();
+    let watcher = async move {
+        let watch_admin = kv_admin(&watcher_store, &watcher_root);
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut timed_out = false;
+        loop {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if let Ok(Some(m)) = watch_admin.read_manifest(None).await
+                && m.l0().is_empty()
+                && m.compacted().len() == 1
+            {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                timed_out = true;
+                break;
+            }
+        }
+        watcher_token.cancel();
+        timed_out
+    };
+
+    let (compact_res, timed_out) =
+        tokio::join!(admin.run_compactor_with_options(token, opts), watcher);
+    compact_res.map_err(backend)?;
+
+    // Re-read the final shape to report accurately (never claim a merge that did not land).
+    let after = admin
+        .read_manifest(None)
+        .await
+        .map_err(backend)?
+        .ok_or_else(|| KvError::backend("kv compact: manifest vanished mid-compaction"))?;
+    let runs_after = (after.l0().len() + after.compacted().len()) as u64;
+    let merged = after.l0().is_empty() && after.compacted().len() == 1;
+    Ok(KvCompactOutcome {
+        runs_before,
+        runs_after,
+        merged,
+        spec: Some(format!(
+            "full-merge {runs_before} run(s) ({l0_count} L0 + {sr_count} sorted run(s)) -> 1 sorted run"
+        )),
+        timed_out: timed_out && !merged,
+    })
+}
+
+/// The `CompactorOptions` the offline full-merge pass runs with: a tight poll/commit cadence (so a
+/// small store merges in well under a second) and the size-tiered scheduler TUNED so a single
+/// proposal sweeps every available run into one output — `min_compaction_sources = 2` (merge as soon
+/// as there are ≥2 runs), `max_compaction_sources` unbounded (no clamp splitting the merge into
+/// batches), and `include_size_threshold` enormous (every sorted run qualifies to join the merge
+/// regardless of size skew). The embedded worker stays enabled (it executes the merge in-process).
+fn compactor_run_options() -> slatedb::config::CompactorOptions {
+    let mut scheduler_options = std::collections::HashMap::new();
+    scheduler_options.insert("min_compaction_sources".to_string(), "2".to_string());
+    scheduler_options.insert("max_compaction_sources".to_string(), u32::MAX.to_string());
+    scheduler_options.insert("include_size_threshold".to_string(), "1e9".to_string());
+    slatedb::config::CompactorOptions {
+        poll_interval: Duration::from_millis(50),
+        commit_compacted_interval: Duration::from_millis(50),
+        scheduler_options,
+        ..Default::default()
+    }
+}
+
+/// The outcome of an offline [`kv_gc`] pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KvGcOutcome {
+    /// `true` if this was a dry-run (logged candidates, deleted nothing, dropped no checkpoint).
+    pub dry_run: bool,
+    /// Number of protective checkpoints dropped before the reclaim (apply only — see [`kv_gc`]).
+    pub dropped_checkpoints: usize,
+}
+
+/// OFFLINE garbage-collection pass via the standalone `slatedb::admin::Admin` GC: one foreground
+/// run that reclaims objects no longer referenced by the latest manifest — superseded/compacted-away
+/// SSTs, old manifest versions, replayed WAL objects, stale compactor job files. `dry_run` LOGS the
+/// candidates and deletes NOTHING (the safe default); otherwise deletion is IRREVERSIBLE. `min_age`
+/// is the minimum object age before reclamation — pass a low/zero value for an offline store to
+/// reclaim promptly (there are no concurrent writers whose in-flight objects a young-object cutoff
+/// would protect). The zero-byte WAL FENCE directory is left in slatedb's conservative dry-run
+/// default regardless (its deletion is the documented single-writer data-loss footgun, and fence
+/// objects are negligible), so this never deletes a fence object.
+///
+/// APPLY also DROPS every manifest checkpoint first. slatedb writes a 15-minute protective checkpoint
+/// on each compaction commit (pinning the pre-compaction manifest + its now-superseded SSTs) so that
+/// an in-flight reader scan cannot have an SST deleted out from under it. OFFLINE there are no reader
+/// scans, and without dropping these the GC cannot reclaim the just-compacted-away SSTs for 15
+/// minutes — which would make an operator's `kv compact --apply` appear to free almost nothing. This
+/// is IRREVERSIBLE and the reason the OFFLINE requirement is load-bearing: dropping a protective
+/// checkpoint while the daemon still serves reads could surface a missing-SST error to a live reader.
+/// A dry-run drops no checkpoint (read-only).
+///
+/// OFFLINE ONLY: a running daemon's embedded GC + this standalone GC would both mutate the store.
+pub async fn kv_gc(
+    store: &Arc<dyn ObjectStore>,
+    root: &str,
+    dry_run: bool,
+    min_age: Duration,
+) -> Result<KvGcOutcome, KvError> {
+    let admin = kv_admin(store, root);
+    let mut dropped_checkpoints = 0;
+    if !dry_run {
+        for cp in admin.list_checkpoints(None).await.map_err(backend)? {
+            admin.delete_checkpoint(cp.id).await.map_err(backend)?;
+            dropped_checkpoints += 1;
+        }
+    }
+    admin
+        .run_gc_once(gc_options(dry_run, min_age))
+        .await
+        .map_err(backend)?;
+    Ok(KvGcOutcome {
+        dry_run,
+        dropped_checkpoints,
+    })
+}
+
+/// Build the per-directory GC options: `manifest` / `wal` / `compacted` / `compactions` all share
+/// `dry_run` + `min_age`; the WAL `wal_fence` directory stays in its conservative dry-run default
+/// (never deleted here — the documented data-loss footgun). `interval: None` is irrelevant for the
+/// one-shot [`Admin::run_gc_once`].
+fn gc_options(dry_run: bool, min_age: Duration) -> slatedb::config::GarbageCollectorOptions {
+    use slatedb::config::{GarbageCollectorDirectoryOptions, GarbageCollectorOptions};
+    let dir = GarbageCollectorDirectoryOptions {
+        interval: None,
+        min_age,
+        dry_run,
+    };
+    GarbageCollectorOptions {
+        manifest_options: Some(dir),
+        wal_options: Some(dir),
+        // Fence objects: keep slatedb's conservative dry-run (NEVER delete a WAL fence here).
+        wal_fence_options: Some(GarbageCollectorDirectoryOptions {
+            interval: None,
+            min_age,
+            dry_run: true,
+        }),
+        compacted_options: Some(dir),
+        compactions_options: Some(dir),
+        // Clone-detach is not part of a control-plane store; leave it disabled.
+        detach_options: None,
+        metric_level: None,
+        boundary_files_enabled: true,
+        object_store_max_retries: None,
+    }
+}
+
+/// ONLINE-SAFE garbage-collection pass — the reclaim the daemon runs on a schedule against its OWN
+/// live store (see [`SlateKv::run_online_gc`]). Unlike [`kv_gc`] it NEVER drops checkpoints and never
+/// compacts: it is exactly `slatedb::admin::Admin::run_gc_once` over the `manifest`/`wal`/`compacted`/
+/// `compactions` directories, each of which only LISTS and DELETES objects that the latest manifest
+/// no longer references (not the latest manifest, not any object pinned by an active checkpoint, and
+/// nothing younger than `min_age`). That predicate is precisely what SlateDB's embedded GC does, so
+/// it is safe concurrent with the live single writer and its readers — it writes no fencing manifest
+/// (verified: `manifest_gc` deletes via `delete_manifest_unchecked`). It reclaims the manifest/
+/// bookkeeping leak that accumulates when the unsupervised embedded GC task has died; it does NOT
+/// force-reclaim freshly-superseded SSTs still inside their 15-minute protective-checkpoint window
+/// (those come back naturally once the checkpoint ages out — no checkpoint-drop needed). Pass a
+/// conservative `min_age` (≥ a few minutes) so a young object a concurrent reader is mid-scan on is
+/// never a candidate.
+pub async fn kv_gc_online(
+    store: &Arc<dyn ObjectStore>,
+    root: &str,
+    min_age: Duration,
+) -> Result<(), KvError> {
+    kv_admin(store, root)
+        .run_gc_once(gc_options(false, min_age))
+        .await
+        .map_err(backend)
+}
+
 impl SlateKv {
     /// Open a store over an arbitrary `object_store` backend (rooted at `path`)
     /// using SlateDB's default settings — the throughput-oriented profile for
@@ -2951,5 +3353,300 @@ mod tests {
             Some(b"deploy-42".to_vec())
         );
         kv.close().await.unwrap();
+    }
+
+    /// **KV-DATA-OBSERVABILITY GATE** — the offline compaction + GC lever actually reclaims PHYSICAL
+    /// garbage, and the stats report the gap. Reproduces the 17.2 GB-ENOSPC incident shape in
+    /// miniature: with the embedded compactor + GC OFF (and the L0 cap raised so overwrites pile up
+    /// rather than back-pressure), 16 rounds of overwriting the same 24 keys — each `checkpoint()`
+    /// freezing a fresh L0 SST — leave ~16 superseded L0 SSTs the manifest still references.
+    /// [`kv_compact`] then full-merges them into ONE sorted run (the old L0s become UNREFERENCED
+    /// garbage, still physically on disk), and [`kv_gc`] reclaims it.
+    ///
+    /// Anti-hollow: it asserts REAL byte-level movement on disk — the reclaimable delta
+    /// (physical − logical) DOMINATES the live set after the merge and collapses toward 0 after GC,
+    /// and the physical total drops to within a small multiple of logical. A no-op compaction/GC or
+    /// a stats function that returned a constant would fail these. Runs WITHOUT Docker (SlateDB is
+    /// embedded). On-disk close/reopen ⇒ `#[ignore]`d for the static-musl harness; run unignored on
+    /// the host toolchain (`cargo test -p boatramp-storage --features slatedb compact_gc -- --ignored`).
+    #[serial_test::serial]
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "on-disk compaction/GC; run unignored on the host toolchain"]
+    async fn offline_compact_gc_reclaims_superseded_sst_garbage() {
+        with_fresh_slatedb_dir("compact-gc-reclaim", |dir| async move {
+            // 1. GENERATE GARBAGE: compactor + GC OFF, L0 caps raised so overwrites pile up L0 SSTs
+            //    instead of back-pressuring. One checkpoint-freeze per round ⇒ one L0 SST + a new
+            //    manifest version — the high checkpoint-per-write churn the incident hit.
+            // `test_settings` already turns the compactor + GC OFF and sets a low flush interval; raise
+            // the L0 caps so overwrites pile up L0 SSTs instead of back-pressuring (compactor is off).
+            let mut settings = test_settings(Some(Duration::from_millis(5)));
+            settings.l0_max_ssts = 100_000;
+            settings.l0_max_ssts_per_key = 100_000;
+
+            const KEYS: usize = 24;
+            const ROUNDS: usize = 16;
+            {
+                let kv = SlateKv::open_local_settings(&dir, settings).await.unwrap();
+                for round in 0..ROUNDS {
+                    for k in 0..KEYS {
+                        // A fresh ~1.5 KiB value each round ⇒ every prior version is superseded.
+                        let val = vec![(round as u8).wrapping_add(k as u8); 1536];
+                        kv.put(&format!("current/site-{k:03}"), val).await.unwrap();
+                    }
+                    // Exercise deletes (tombstones) too — the ask's "write + overwrite/delete".
+                    if round % 4 == 3 {
+                        kv.delete(&format!("current/site-{round:03}")).await.unwrap();
+                    }
+                    kv.checkpoint().await.unwrap();
+                }
+                KvStore::close(&kv).await.unwrap();
+            }
+
+            let store = fs_store(&dir);
+            let root = "kv";
+
+            // 2. COMPACT (full merge, no GC yet): the superseded L0 SSTs merge into ONE sorted run;
+            //    the old L0 inputs become UNREFERENCED garbage still physically on disk.
+            let outcome = kv_compact(&store, root, Duration::from_secs(15)).await.unwrap();
+            assert!(
+                outcome.runs_before >= 2,
+                "expected ≥2 runs of garbage to merge; got {outcome:?}"
+            );
+            assert!(
+                outcome.merged && outcome.runs_after == 1,
+                "the full merge must land into a single sorted run; got {outcome:?}"
+            );
+
+            let phys_pre_gc = kv_physical_stats(&store, root).await.unwrap();
+            let logi_pre_gc = kv_logical_stats(&store, root).await.unwrap();
+            let reclaimable_pre = phys_pre_gc.total_bytes.saturating_sub(logi_pre_gc.live_bytes);
+            // The superseded L0 SSTs (plus old manifests / WAL) are now unreferenced: a large delta
+            // that DOMINATES the (deduplicated, single-run) live set.
+            assert!(
+                reclaimable_pre > logi_pre_gc.live_bytes,
+                "post-merge reclaimable garbage ({reclaimable_pre} B) must dominate the live set \
+                 ({} B); phys={phys_pre_gc:?} logi={logi_pre_gc:?}",
+                logi_pre_gc.live_bytes,
+            );
+
+            // 3. GC (apply, min_age 0) reclaims the unreferenced garbage. Its apply path also drops
+            //    the compactor's 15-min protective checkpoint that pins the pre-merge manifest + old
+            //    L0 SSTs (safe offline — no in-flight reader scans), without which the just-superseded
+            //    SSTs would survive GC for 15 minutes.
+            let gc = kv_gc(&store, root, false, Duration::ZERO).await.unwrap();
+            assert!(
+                gc.dropped_checkpoints >= 1,
+                "GC apply must drop the compactor's protective checkpoint; got {gc:?}"
+            );
+
+            let phys_post = kv_physical_stats(&store, root).await.unwrap();
+            let logi_post = kv_logical_stats(&store, root).await.unwrap();
+            let reclaimable_post = phys_post.total_bytes.saturating_sub(logi_post.live_bytes);
+
+            // REAL shrink: physical dropped by more than half and now sits near logical.
+            assert!(
+                phys_post.total_bytes < phys_pre_gc.total_bytes / 2,
+                "GC must reclaim a large fraction of the physical footprint: {} B → {} B",
+                phys_pre_gc.total_bytes,
+                phys_post.total_bytes,
+            );
+            assert!(
+                reclaimable_post.saturating_mul(4) < reclaimable_pre,
+                "post-GC reclaimable ({reclaimable_post} B) must be far below pre-GC \
+                 ({reclaimable_pre} B)",
+            );
+            assert!(
+                phys_post.total_bytes <= logi_post.live_bytes.saturating_mul(3) + 64 * 1024,
+                "post-GC physical ({} B) should sit near logical ({} B); phys={phys_post:?}",
+                phys_post.total_bytes,
+                logi_post.live_bytes,
+            );
+
+            // Compaction + GC is lossless for live keys.
+            let kv = SlateKv::open_local_settings(&dir, test_settings(None))
+                .await
+                .unwrap();
+            assert!(
+                kv.get("current/site-000").await.unwrap().is_some(),
+                "a live key must survive compaction + GC"
+            );
+            KvStore::close(&kv).await.unwrap();
+
+            eprintln!(
+                "KV COMPACT+GC RECLAIM OK: physical {} → {} B (logical {} B); reclaimable {} → {} B",
+                phys_pre_gc.total_bytes,
+                phys_post.total_bytes,
+                logi_post.live_bytes,
+                reclaimable_pre,
+                reclaimable_post,
+            );
+        })
+        .await;
+    }
+
+    /// The `manifest/` subdir object count + bytes from a physical-stats walk (0 if absent).
+    async fn manifest_dir(store: &Arc<dyn ObjectStore>, root: &str) -> KvDirStat {
+        kv_physical_stats(store, root)
+            .await
+            .unwrap()
+            .dirs
+            .into_iter()
+            .find(|d| d.name == "manifest")
+            .unwrap_or(KvDirStat {
+                name: "manifest".into(),
+                objects: 0,
+                bytes: 0,
+            })
+    }
+
+    /// GATE (durable fix — reproduces the PROD leak + proves the online fix). With the compactor +
+    /// GC OFF — exactly the prod state once the unsupervised embedded GC task has died — every
+    /// `checkpoint()` freeze writes a NEW manifest version that nothing prunes, so `manifest/` grows
+    /// unbounded (the 16.5 GB incident in miniature). [`kv_gc_online`] — a plain `run_gc_once`, NO
+    /// checkpoint-drop and NO compaction — then reclaims the stale manifest versions down toward the
+    /// single live one, and the store reopens with every key intact (the online GC only deletes
+    /// manifests the latest no longer references; the live L0 SSTs are untouched → lossless).
+    ///
+    /// Anti-hollow: it asserts the failure shape FIRST (≥N accumulated manifests) so a no-op GC would
+    /// fail the reclaim assertion, and REAL byte/object movement after. On-disk close/reopen ⇒
+    /// `#[ignore]`d for the static-musl harness; run unignored on the host toolchain
+    /// (`cargo test -p boatramp-storage --features slatedb online_gc -- --ignored`).
+    #[serial_test::serial]
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "on-disk GC; run unignored on the host toolchain"]
+    async fn online_gc_reclaims_stale_manifests_without_checkpoint_drop() {
+        with_fresh_slatedb_dir("online-gc-manifests", |dir| async move {
+            // Compactor + GC OFF (test_settings). Raise the L0 caps so the per-round L0 SSTs pile up
+            // instead of back-pressuring `put` (with the compactor off nothing would drain them).
+            let mut settings = test_settings(Some(Duration::from_millis(5)));
+            settings.l0_max_ssts = 100_000;
+            settings.l0_max_ssts_per_key = 100_000;
+            const ROUNDS: usize = 20;
+            {
+                let kv = SlateKv::open_local_settings(&dir, settings).await.unwrap();
+                for round in 0..ROUNDS {
+                    kv.put(
+                        &format!("current/site-{:03}", round % 8),
+                        vec![round as u8; 256],
+                    )
+                    .await
+                    .unwrap();
+                    // Each freeze writes a fresh manifest version; with GC off they pile up.
+                    kv.checkpoint().await.unwrap();
+                }
+                KvStore::close(&kv).await.unwrap();
+            }
+
+            let store = fs_store(&dir);
+            let root = "kv";
+
+            // FAILURE SHAPE: many manifest versions accumulated, nothing pruned them.
+            let man_pre = manifest_dir(&store, root).await;
+            assert!(
+                man_pre.objects >= 12,
+                "expected many accumulated manifest versions (the leak) over {ROUNDS} rounds; \
+                 got {man_pre:?}"
+            );
+
+            // THE FIX: a plain online GC (no checkpoint-drop, no compaction) reclaims them.
+            kv_gc_online(&store, root, Duration::ZERO).await.unwrap();
+
+            let man_post = manifest_dir(&store, root).await;
+            assert!(
+                man_post.objects >= 1,
+                "the latest manifest is always kept; got {man_post:?}"
+            );
+            assert!(
+                man_post.objects * 2 <= man_pre.objects,
+                "online GC must reclaim the stale manifests: {} → {} objects",
+                man_pre.objects,
+                man_post.objects
+            );
+            assert!(
+                man_post.bytes < man_pre.bytes / 2,
+                "manifest bytes must drop by more than half: {} → {} B",
+                man_pre.bytes,
+                man_post.bytes
+            );
+
+            // LOSSLESS: the live data (referenced L0 SSTs) was untouched — every key reopens intact.
+            let kv = SlateKv::open_local_settings(&dir, test_settings(None))
+                .await
+                .unwrap();
+            for site in 0..8usize {
+                assert!(
+                    kv.get(&format!("current/site-{site:03}"))
+                        .await
+                        .unwrap()
+                        .is_some(),
+                    "live key site-{site:03} must survive the manifest GC"
+                );
+            }
+            KvStore::close(&kv).await.unwrap();
+
+            eprintln!(
+                "KV ONLINE-GC MANIFEST RECLAIM OK: manifest {} → {} objects ({} → {} B)",
+                man_pre.objects, man_post.objects, man_pre.bytes, man_post.bytes
+            );
+        })
+        .await;
+    }
+
+    /// GATE (online safety — the daemon use). The periodic GC runs against the daemon's OWN live
+    /// store while it is still serving. This opens a writer, piles up manifests, then runs
+    /// [`kv_gc_online`] against the SAME store WHILE the writer is open, and asserts the writer is
+    /// undisturbed (prior reads still resolve, new writes still commit) AND stale manifests were
+    /// reclaimed — i.e. the GC is non-fencing and never deletes a manifest the live writer needs.
+    #[serial_test::serial]
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "on-disk GC; run unignored on the host toolchain"]
+    async fn online_gc_is_safe_concurrent_with_a_live_writer() {
+        with_fresh_slatedb_dir("online-gc-live", |dir| async move {
+            // Compactor + GC OFF; raise the L0 caps so the per-round SSTs pile up without
+            // back-pressuring `put` (nothing drains L0 with the compactor off).
+            let mut settings = test_settings(Some(Duration::from_millis(5)));
+            settings.l0_max_ssts = 100_000;
+            settings.l0_max_ssts_per_key = 100_000;
+            let kv = SlateKv::open_local_settings(&dir, settings).await.unwrap();
+            for round in 0..20usize {
+                kv.put(&format!("k/{}", round % 8), vec![round as u8; 256])
+                    .await
+                    .unwrap();
+                kv.checkpoint().await.unwrap();
+            }
+
+            let store = fs_store(&dir);
+            let man_pre = manifest_dir(&store, "kv").await;
+            assert!(
+                man_pre.objects >= 12,
+                "expected accumulated manifests; got {man_pre:?}"
+            );
+
+            // Reclaim WHILE the writer is open + serving.
+            kv_gc_online(&store, "kv", Duration::ZERO).await.unwrap();
+
+            // The live writer is undisturbed — prior reads resolve, new writes commit.
+            assert!(
+                kv.get("k/0").await.unwrap().is_some(),
+                "a concurrent online GC must not disturb the live writer's reads"
+            );
+            kv.put("k/after-gc", vec![1, 2, 3]).await.unwrap();
+            kv.checkpoint().await.unwrap();
+            assert_eq!(
+                kv.get("k/after-gc").await.unwrap(),
+                Some(vec![1, 2, 3]),
+                "the writer keeps committing after a concurrent GC"
+            );
+
+            let man_post = manifest_dir(&store, "kv").await;
+            assert!(
+                man_post.objects < man_pre.objects,
+                "online GC reclaimed stale manifests even with a live writer: {} → {}",
+                man_pre.objects,
+                man_post.objects
+            );
+            KvStore::close(&kv).await.unwrap();
+        })
+        .await;
     }
 }

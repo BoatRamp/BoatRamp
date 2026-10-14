@@ -162,16 +162,14 @@ pub(super) async fn node_instance_stats(
 ) -> Response {
     match handlers.instance_stats() {
         Some(stats) => {
-            // Additively merge the node `/data` filesystem headroom (construens node-health-alerting):
-            // console back-compat preserved — existing fields are unchanged and the new `data_*` keys
-            // are ignored by older clients; `boatramp stats --instances` (a raw-Value passthrough)
-            // surfaces them automatically.
+            // Additively merge the node `/data` filesystem headroom + per-category composition
+            // (construens node-health-alerting + kv-data-observability): console back-compat preserved
+            // — existing fields are unchanged and the new `data_*` keys + `data_breakdown` object are
+            // ignored by older clients; `boatramp stats --instances` (a raw-Value passthrough) surfaces
+            // them automatically.
             let mut v = serde_json::to_value(&stats).unwrap_or_else(|_| serde_json::json!({}));
-            if let (Some(obj), Some(fs)) = (
-                v.as_object_mut(),
-                handlers.data_dir().and_then(data_fs_usage),
-            ) {
-                fs.merge_into(obj);
+            if let (Some(obj), Some(dir)) = (v.as_object_mut(), handlers.data_dir()) {
+                merge_data_usage(obj, dir);
             }
             Json(v).into_response()
         }
@@ -239,17 +237,95 @@ pub(super) fn data_fs_usage(_dir: &std::path::Path) -> Option<DataFsUsage> {
     None
 }
 
+/// Merge the `/data` usage signals into a node-global response object: the flat statvfs keys
+/// (`data_bytes_total` / `data_bytes_used` / `data_used_pct`, console back-compat — see
+/// [`DataFsUsage::merge_into`]) PLUS the additive `data_breakdown` per-category object (the
+/// disk-full incident's missing "WHICH subtree is eating /data" signal). Both are best-effort: a
+/// statvfs error drops only the flat keys, an unreadable data dir drops only the breakdown, and an
+/// older client that knows neither key is unaffected. Used by BOTH `/api/node-health` and
+/// `/api/instance-stats`, so the two surfaces report the same composition.
+#[cfg(feature = "handlers")]
+fn merge_data_usage(obj: &mut serde_json::Map<String, serde_json::Value>, dir: &std::path::Path) {
+    if let Some(fs) = data_fs_usage(dir) {
+        fs.merge_into(obj);
+    }
+    if let Some(breakdown) = data_dir_breakdown(dir) {
+        obj.insert(
+            "data_breakdown".into(),
+            serde_json::Value::Object(breakdown),
+        );
+    }
+}
+
+/// `du`-style per-category byte totals of the node's data dir: one entry per TOP-LEVEL subdirectory
+/// (`kv-slate`, `blobs`, `handlers-sql` + the managed-PG PGDATA, `wasmtime-cache`, `.cache`,
+/// `secrets`, `mesh`/`raft`, `compute`, any `kv-slate.crashed-*`, …), keyed by the subdir name with
+/// its recursive byte total. THE signal the 17.2 GB ENOSPC incident lacked: the flat `data_used_pct`
+/// said "/data is full" but not that `kv-slate/` was 87% of it. Pure read-only (never deletes); the
+/// per-file detail is summed away so the walk is bounded to top-level-subdir totals (an on-demand
+/// admin read). `None` when the data dir cannot be listed (never panics); loose top-level files and
+/// symlinks are skipped (a symlinked subtree is not followed — no loops, no double counting).
+#[cfg(feature = "handlers")]
+fn data_dir_breakdown(dir: &std::path::Path) -> Option<serde_json::Map<String, serde_json::Value>> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    let mut out = serde_json::Map::new();
+    for entry in entries.flatten() {
+        // `DirEntry::metadata()` does NOT traverse a symlink (unlike `fs::metadata`), so a symlinked
+        // subdir reports `is_symlink()` here and is skipped rather than followed.
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if !meta.is_dir() {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let bytes = dir_size_recursive(&entry.path(), 0);
+        out.insert(name, serde_json::Value::from(bytes));
+    }
+    Some(out)
+}
+
+/// Recursive byte total of `dir` (files only; symlinks skipped so no loop can run away), depth-capped
+/// as a belt-and-braces guard against a pathologically deep tree. Every I/O error is swallowed to a
+/// partial sum — a breakdown is a best-effort headroom signal, never a request that can fail.
+#[cfg(feature = "handlers")]
+fn dir_size_recursive(dir: &std::path::Path, depth: u32) -> u64 {
+    const MAX_DEPTH: u32 = 64;
+    if depth >= MAX_DEPTH {
+        return 0;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut total = 0u64;
+    for entry in entries.flatten() {
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if meta.is_dir() {
+            total = total.saturating_add(dir_size_recursive(&entry.path(), depth + 1));
+        } else if meta.is_file() {
+            total = total.saturating_add(meta.len());
+        }
+        // Symlinks (meta.is_symlink()) are neither followed nor counted.
+    }
+    total
+}
+
 /// `GET /api/node-health` (construens node-health-alerting): the NODE-global health snapshot. Stage 1
 /// surfaces `/data` filesystem headroom — the disk-full incident signal (a silently-full `/data`
 /// bricked managed PG with no alert); managed-SQL health + the alerting loop/channels arrive in a later
 /// stage. Read-only; the authz table gates it `System·Read` (a NODE-global read — disk/health are node
 /// faults, never a per-project right). The `data_*` figures are absent when the data dir is unknown or
-/// statvfs is unavailable (off-Linux).
+/// statvfs is unavailable (off-Linux); the additive `data_breakdown` object (per-top-level-subdir byte
+/// totals — kv-data-observability) is absent when the data dir cannot be listed.
 #[cfg(feature = "handlers")]
 pub(super) async fn node_health(Extension(handlers): Extension<Arc<HandlerRuntime>>) -> Response {
     let mut obj = serde_json::Map::new();
-    if let Some(fs) = handlers.data_dir().and_then(data_fs_usage) {
-        fs.merge_into(&mut obj);
+    if let Some(dir) = handlers.data_dir() {
+        merge_data_usage(&mut obj, dir);
     }
     Json(serde_json::Value::Object(obj)).into_response()
 }
