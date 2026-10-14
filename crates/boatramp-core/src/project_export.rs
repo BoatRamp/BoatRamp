@@ -17,6 +17,37 @@ use std::path::{Path, PathBuf};
 use async_trait::async_trait;
 use serde::Serialize;
 
+/// Flags for an export. `Debug` is implemented by hand to **redact** the transport key so
+/// it can never reach a log line.
+#[derive(Clone, Default)]
+pub struct ExportOptions {
+    /// App-data-only bundle (pg/mysql rows + libsql + blobs); EXCLUDES the control-plane KV
+    /// slice and identity. Mutually exclusive with `include_identity`.
+    pub data_only: bool,
+    /// Also stage the identity transport container (the project KEK, passphrase-wrapped) so
+    /// an `--identity adopt` recovery can unseal the KV slice's sealed secrets. Requires
+    /// `transport_key` and a local KEK envelope (refused for Vault / none). Default OFF —
+    /// the safe, identity-free bundle.
+    pub include_identity: bool,
+    /// The operator transport passphrase wrapping the identity container, resolved by the
+    /// caller from `--transport-key-file` / env / prompt. Required iff `include_identity`.
+    /// Secret — never logged (see the hand-written `Debug`).
+    pub transport_key: Option<Vec<u8>>,
+}
+
+impl std::fmt::Debug for ExportOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExportOptions")
+            .field("data_only", &self.data_only)
+            .field("include_identity", &self.include_identity)
+            .field(
+                "transport_key",
+                &self.transport_key.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
+}
+
 /// Flags for an import.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ImportOptions {
@@ -81,9 +112,13 @@ pub enum ProjectExportError {
 #[async_trait]
 pub trait ProjectExport: Send + Sync {
     /// Export `project` to a freshly-written bundle file, returning its path. The caller
-    /// (the API handler) streams the file to the response, then deletes it. `data_only`
-    /// selects the Phase-1 app-data-only bundle (vs schema+data).
-    async fn export(&self, project: &str, data_only: bool) -> Result<PathBuf, ProjectExportError>;
+    /// (the API handler) streams the file to the response, then deletes it. `opts` selects
+    /// data-only vs full and whether to include the identity transport container.
+    async fn export(
+        &self,
+        project: &str,
+        opts: &ExportOptions,
+    ) -> Result<PathBuf, ProjectExportError>;
 
     /// Import the bundle at `bundle` into `project`. Dry-run (plan only) unless
     /// `opts.apply`. Returns a summary report.

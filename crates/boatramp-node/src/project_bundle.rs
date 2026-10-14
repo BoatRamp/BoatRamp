@@ -45,6 +45,10 @@ pub const MANIFEST_PATH: &str = "MANIFEST";
 /// The control-plane KV slice's tar-entry path (the `kv_dump::export_to_bytes` bytes).
 pub const KV_MEMBER_PATH: &str = "kv.brkvdump";
 
+/// The identity transport-container's tar-entry path (`--include-identity` only): the
+/// passphrase-wrapped KEK, produced by `boatramp_server::envelope::transport_wrap`.
+pub const IDENTITY_MEMBER_PATH: &str = "identity/identity.brid";
+
 /// Which engine a bundle member came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -59,6 +63,10 @@ pub enum MemberKind {
     Kv,
     /// A blob-store object (under `blobs/<...>`).
     Blob,
+    /// The passphrase-wrapped identity transport container (`identity/identity.brid`),
+    /// present only under `--include-identity`. Carries the project's KEK (transport-wrapped)
+    /// so an `--identity adopt` (recovery) can unseal the KV slice's sealed secrets.
+    Identity,
 }
 
 /// SQL-dump provenance for a `PgDump`/`MysqlDump` member: the detected server version,

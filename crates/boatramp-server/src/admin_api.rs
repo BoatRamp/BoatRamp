@@ -2252,7 +2252,13 @@ pub(super) async fn project_export(
     if let Some(resp) = reject_invalid_name("project", &q.project) {
         return resp;
     }
-    let path = match cap.export(&q.project, q.data_only).await {
+    // `--include-identity` + transport key are wired into the request in a follow-up; today
+    // this endpoint exports the identity-free bundle (the safe default).
+    let export_opts = boatramp_core::project_export::ExportOptions {
+        data_only: q.data_only,
+        ..Default::default()
+    };
+    let path = match cap.export(&q.project, &export_opts).await {
         Ok(p) => p,
         Err(boatramp_core::project_export::ProjectExportError::Unavailable(m)) => {
             return (StatusCode::NOT_IMPLEMENTED, format!("{m}\n")).into_response();
