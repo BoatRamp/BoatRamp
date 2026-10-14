@@ -1749,23 +1749,34 @@ impl ContainerBackend {
     }
 }
 
-/// Remove every `ephm-*` cgroup directory under `root`, returning the count removed. Factored out
-/// of [`ContainerBackend::sweep_orphaned_ephemeral_cgroups`] so the prefix selectivity is unit-
-/// testable against a temp dir without writing to the real cgroupfs. Silent when `root` is absent.
-fn sweep_ephemeral_cgroups_in(root: &Path) -> usize {
+/// The `ephm-*` one-shot cgroup directories directly under `root` — NEVER a live workload cgroup
+/// (`<workload>-<n>`). This PURE SELECTION is separated from the kill+rmdir so the prefix selectivity
+/// (the security-relevant property — never sweep a live workload cgroup) is unit-testable against a
+/// plain temp dir, without the cgroupfs-specific mechanics (on real cgroupfs `cgroup.kill` is a
+/// pseudo-file and `rmdir` removes an empty cgroup; a temp dir models neither). Empty when `root` is
+/// absent (no delegated cgroup subtree, or not a cgroup host).
+fn ephemeral_cgroup_dirs(root: &Path) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(root) else {
-        return 0; // no delegated cgroup subtree (or not a cgroup host) — nothing to sweep
+        return Vec::new();
     };
+    entries
+        .flatten()
+        .filter(|e| {
+            e.file_name()
+                .to_str()
+                .is_some_and(|n| n.starts_with("ephm-"))
+        })
+        .map(|e| e.path())
+        .collect()
+}
+
+/// Remove every `ephm-*` cgroup directory under `root` (selected by [`ephemeral_cgroup_dirs`]),
+/// returning the count removed. Each is killed (`cgroup.kill`) then `rmdir`'d — cgroupfs `rmdir`
+/// removes an empty cgroup even though its pseudo-control-files remain. Silent when `root` is absent.
+fn sweep_ephemeral_cgroups_in(root: &Path) -> usize {
     let mut swept = 0usize;
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        // ONLY one-shot ids — never a live workload cgroup (`<workload>-<n>`).
-        if !name.starts_with("ephm-") {
-            continue;
-        }
-        let dir = entry.path();
-        // Kill any survivor still pinned to the cgroup, then remove the (now empty) directory.
+    for dir in ephemeral_cgroup_dirs(root) {
+        // Kill any survivor still pinned to the cgroup, then remove the (now empty) cgroup.
         let _ = std::fs::write(dir.join("cgroup.kill"), b"1");
         if std::fs::remove_dir(&dir).is_ok() {
             swept += 1;
@@ -3297,30 +3308,35 @@ mod tests {
         let _ = std::fs::remove_dir_all(&preload);
     }
 
-    /// GATE (L2): the boot sweep removes ONLY `ephm-*` one-shot cgroups, never a live workload
-    /// cgroup (`<workload>-<n>`), and is silent when the cgroup subtree is absent.
+    /// GATE (L2): the boot sweep SELECTS only `ephm-*` one-shot cgroups, never a live workload cgroup
+    /// (`<workload>-<n>`), and is silent when the cgroup subtree is absent. Asserts the PURE SELECTION
+    /// (`ephemeral_cgroup_dirs`) — the security-relevant property — not the cgroupfs kill+rmdir
+    /// mechanics: a plain temp dir cannot model cgroupfs (there `cgroup.kill` is a real file, not a
+    /// pseudo-file, so the sweep's write would leave the dir non-empty and `rmdir` would fail, whereas
+    /// on real cgroupfs `rmdir` removes the empty cgroup). So selectivity is what we gate here.
     #[test]
     fn ephemeral_cgroup_sweep_is_prefix_selective() {
         let root = unique_dir("cgroup-sweep");
-        std::fs::create_dir_all(root.join("ephm-123-0")).unwrap();
-        std::fs::create_dir_all(root.join("ephm-456-1")).unwrap();
-        std::fs::create_dir_all(root.join("pg-0")).unwrap(); // a live workload — must survive
-        std::fs::create_dir_all(root.join("web-2")).unwrap(); // a live workload — must survive
+        for d in ["ephm-123-0", "ephm-456-1", "pg-0", "web-2"] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
 
-        let swept = sweep_ephemeral_cgroups_in(&root);
-        assert_eq!(swept, 2, "both ephm-* one-shot cgroups removed");
-        assert!(!root.join("ephm-123-0").exists());
-        assert!(!root.join("ephm-456-1").exists());
-        assert!(
-            root.join("pg-0").exists(),
-            "a live workload cgroup is never swept"
-        );
-        assert!(
-            root.join("web-2").exists(),
-            "a live workload cgroup is never swept"
+        let selected: std::collections::BTreeSet<String> = ephemeral_cgroup_dirs(&root)
+            .iter()
+            .filter_map(|p| p.file_name().and_then(|n| n.to_str()).map(String::from))
+            .collect();
+        let want: std::collections::BTreeSet<String> =
+            ["ephm-123-0".to_string(), "ephm-456-1".to_string()]
+                .into_iter()
+                .collect();
+        assert_eq!(
+            selected, want,
+            "only ephm-* one-shot cgroups are selected; a live workload cgroup (pg-0/web-2) is \
+             never swept"
         );
 
-        // Absent subtree ⇒ silent no-op (returns 0, no panic).
+        // Absent subtree ⇒ empty selection + the sweep is a silent 0 (no panic).
+        assert!(ephemeral_cgroup_dirs(&root.join("does-not-exist")).is_empty());
         assert_eq!(sweep_ephemeral_cgroups_in(&root.join("does-not-exist")), 0);
 
         let _ = std::fs::remove_dir_all(&root);

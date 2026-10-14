@@ -194,10 +194,10 @@ fn resolve_transport_key(file: Option<&std::path::Path>, prompt: &str) -> Result
         }
         return Ok(key);
     }
-    if let Ok(v) = std::env::var("BOATRAMP_EXPORT_TRANSPORT_KEY") {
-        if !v.is_empty() {
-            return Ok(v.into_bytes());
-        }
+    if let Ok(v) = std::env::var("BOATRAMP_EXPORT_TRANSPORT_KEY")
+        && !v.is_empty()
+    {
+        return Ok(v.into_bytes());
     }
     let pw = rpassword::prompt_password(prompt).map_err(Error::Io)?;
     if pw.is_empty() {

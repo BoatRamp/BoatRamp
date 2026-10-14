@@ -915,6 +915,10 @@ impl ControlPlane {
     /// STREAMING `bundle` as the request body. Returns the server's report text (JSON). A
     /// non-2xx — `409` schema-skew / KV-commingle refusal, `501` no driver — is surfaced
     /// verbatim as [`ClientError::Refused`].
+    // Each argument is a distinct import knob the API exposes (apply/force/allow-schema-skew/
+    // identity/transport-key); a wrapper struct would only move the same fields the single CLI
+    // caller already unpacks, so mirror the API surface directly.
+    #[allow(clippy::too_many_arguments)]
     pub async fn project_import(
         &self,
         project: &str,
