@@ -1253,6 +1253,19 @@ impl ProjectExport for NodeProjectExport {
             ));
         }
 
+        // Operational prerequisites after a FULL control-plane restore — the portable bundle
+        // deliberately carries no function/component CODE (deploy artifacts live in blob storage,
+        // not this slice), no TLS private keys and no global routing ownership. Surface the
+        // follow-up steps so the target is not silently half-restored.
+        if !manifest.data_only {
+            report.notes.push(
+                "post-import: re-deploy function/component code (deploy artifacts are not \
+                 bundled), re-verify + re-attach the project's domains, and let ACME re-issue TLS \
+                 certs (routing + certs are intentionally not carried in a portable bundle)"
+                    .into(),
+            );
+        }
+
         let _ = tokio::fs::remove_dir_all(&session).await;
         Ok(report)
     }
