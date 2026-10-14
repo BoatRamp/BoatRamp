@@ -422,6 +422,11 @@ jobs:
           # bundle(SHA-256) -> drop -> mysql-restore -> ROW-equality round-trip.
           grep -q 'PROJECT EXPORT MYSQL ROUNDTRIP OK' project-export.log \
             || { echo "::error::mysql project export round-trip never reached its marker (silent skip or a regression?)" >&2; exit 1; }
+          # Full-DRIVER round-trip: drives the real NodeProjectExport.export/import (not the
+          # reconstructed primitives), so the driver's resolve_pg + run_sql_client glue is
+          # exercised live. Same self-skip trap → gate on its marker.
+          grep -q 'PROJECT EXPORT DRIVER ROUNDTRIP OK' project-export.log \
+            || { echo "::error::full-driver project export round-trip never reached its marker (silent skip or a regression?)" >&2; exit 1; }
 
       - name: CRIU checkpoint/restore (informational — restore is kernel-sensitive)
         continue-on-error: true
