@@ -13,8 +13,9 @@ pub struct SpinnerProps {
 #[function_component(Spinner)]
 pub fn spinner(props: &SpinnerProps) -> Html {
     html! {
-        <div class="flex items-center justify-center gap-3 py-10 text-slate-500">
-            <span class="h-4 w-4 animate-spin rounded-full border-2 border-slate-300 border-t-sky-600" />
+        <div role="status" class="flex items-center justify-center gap-3 py-10 text-slate-500">
+            <span aria-hidden="true"
+                  class="h-4 w-4 animate-spin rounded-full border-2 border-slate-300 border-t-sky-600" />
             <span class="text-sm">{ &props.label }</span>
         </div>
     }
@@ -37,7 +38,7 @@ pub fn error_banner(props: &ErrorBannerProps) -> Html {
         .clone()
         .map(|cb| Callback::from(move |_: MouseEvent| cb.emit(())));
     html! {
-        <div class="flex items-center justify-between rounded-lg border border-rose-200 bg-rose-50 px-4 py-3">
+        <div role="alert" class="flex items-center justify-between rounded-lg border border-rose-200 bg-rose-50 px-4 py-3">
             <p class="text-sm text-rose-700">{ &props.message }</p>
             if let Some(on_click) = on_click {
                 <button onclick={on_click}
@@ -68,7 +69,7 @@ impl Tone {
         match self {
             Tone::Good => "bg-emerald-100 text-emerald-700",
             Tone::Neutral => "bg-slate-100 text-slate-600",
-            Tone::Warn => "bg-amber-100 text-amber-700",
+            Tone::Warn => "bg-amber-100 text-amber-800",
             Tone::Bad => "bg-rose-100 text-rose-700",
         }
     }
@@ -190,6 +191,9 @@ pub struct CheckFieldProps {
     pub checked: bool,
     /// Emits the new checked state on toggle.
     pub on_change: Callback<bool>,
+    /// Disable the control (dimmed, not toggle-able) — e.g. a mutually-excluded option.
+    #[prop_or_default]
+    pub disabled: bool,
 }
 
 #[function_component(CheckField)]
@@ -204,10 +208,18 @@ pub fn check_field(props: &CheckFieldProps) -> Html {
             on_change.emit(checked);
         })
     };
+    // `items-start` + a `shrink-0`, slightly-dropped box keeps the box aligned to the first
+    // line when a long label wraps (instead of vertically centering / shrinking).
+    let row = if props.disabled {
+        "flex items-start gap-2 opacity-50"
+    } else {
+        "flex items-start gap-2"
+    };
     html! {
-        <label class="flex items-center gap-2">
-            <input type="checkbox" checked={props.checked} onchange={on_change}
-                   class="h-4 w-4 rounded border-slate-300 text-sky-600 focus:ring-sky-500" />
+        <label class={row}>
+            <input type="checkbox" checked={props.checked} disabled={props.disabled}
+                   onchange={on_change}
+                   class="mt-0.5 h-4 w-4 shrink-0 rounded border-slate-300 text-sky-600 focus:ring-sky-500" />
             <span class="text-sm text-slate-700">{ &props.label }</span>
         </label>
     }
