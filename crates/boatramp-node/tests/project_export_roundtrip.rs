@@ -728,6 +728,178 @@ async fn project_export_roundtrip_mysql() {
     println!("PROJECT EXPORT MYSQL ROUNDTRIP OK");
 }
 
+/// **Live full-DRIVER round-trip** — drives the real `NodeProjectExport::export()` /
+/// `import()` (not the reconstructed primitives the pg/mysql/libsql tests use), closing the
+/// "driver has no end-to-end live coverage" gap for the pg path: it exercises the driver's
+/// `resolve_pg` (version-detect + endpoint) + `run_sql_client` streaming (pg_dump stdout →
+/// bundle stage; pg_restore ← the staged member). External `url_env` binding (so no
+/// compute/deploy resolution), single driver, same-db drop-and-restore. The KV/blob/identity
+/// orchestration is already gated in-process; this adds the live pg glue. Self-skips exactly
+/// like the pg round-trip. Emits `PROJECT EXPORT DRIVER ROUNDTRIP OK`.
+#[tokio::test]
+async fn project_export_roundtrip_driver_live() {
+    use boatramp_core::Storage;
+    use boatramp_core::deploy::DeployStore;
+    use boatramp_core::env::MapEnv;
+    use boatramp_core::envelope::KeyEnvelope;
+    use boatramp_core::kv::{KvStore, MemoryKv};
+    use boatramp_core::project_export::{
+        ExportOptions, IdentityChoice, ImportOptions, ProjectExport,
+    };
+    use boatramp_node::config::ExternalDatabaseConfig;
+    use boatramp_node::managed_sql::NodeOperatorSql;
+    use boatramp_node::project_export::NodeProjectExport;
+    use boatramp_storage::fs::FsStorage;
+    use std::collections::BTreeMap;
+
+    let Ok(url) = std::env::var("BOATRAMP_TEST_PG_URL") else {
+        eprintln!("SKIP: BOATRAMP_TEST_PG_URL unset (live driver round-trip not run)");
+        return;
+    };
+    let Some((user, password, host, port, db)) = parse_pg_url(&url) else {
+        eprintln!("SKIP: BOATRAMP_TEST_PG_URL is not a postgres URL");
+        return;
+    };
+    let backend = match DockerBackend::connect() {
+        Ok(b) if b.reachable().await => b,
+        _ => {
+            eprintln!("SKIP: no reachable Docker daemon (live driver round-trip not run)");
+            return;
+        }
+    };
+    let backend: Arc<dyn ComputeBackend> = Arc::new(backend);
+
+    // Build the full driver over an EXTERNAL url_env pg binding pointing at the test DSN.
+    let databases = BTreeMap::from([(
+        "app".to_string(),
+        ExternalDatabaseConfig {
+            kind: "postgres".to_string(),
+            url_env: "BR_DRV_DSN".to_string(),
+            ..Default::default()
+        },
+    )]);
+    let env: Arc<dyn boatramp_core::env::EnvSource> =
+        Arc::new(MapEnv::new().with("BR_DRV_DSN", &url));
+    let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+    kv.put("routing/default/x", b"r".to_vec()).await.unwrap();
+    let td = tempfile::tempdir().unwrap();
+    let blobs: Arc<dyn Storage> = Arc::new(FsStorage::new(td.path().join("blobs")));
+    // The managed path requires an envelope even for an external binding (it unseals a
+    // MANAGED credential — unused here, external reads the DSN from env). A local KEK fits.
+    let envelope: Arc<dyn KeyEnvelope> =
+        Arc::new(boatramp_server::envelope::LocalKek::from_bytes([0u8; 32]));
+    let op: Arc<dyn boatramp_core::sql::OperatorSql> = Arc::new(
+        NodeOperatorSql::new(
+            databases.clone(),
+            kv.clone(),
+            Some(envelope.clone()),
+            DeployStore::new(blobs.clone(), kv.clone()),
+        )
+        .with_env_source(env.clone()),
+    );
+    let work = td.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let driver = NodeProjectExport::new(
+        databases,
+        DeployStore::new(blobs.clone(), kv.clone()),
+        kv.clone(),
+        blobs.clone(),
+        work,
+    )
+    .with_env_source(env.clone())
+    .with_managed_pg(backend.clone(), envelope, op, false);
+
+    // Detect the client image (the first psql uses a fixed image just to read the version).
+    let src = conn(&user, &password, &host, port, &db);
+    let (code, ver) = psql(
+        backend.as_ref(),
+        "postgres:16",
+        &src,
+        "SHOW server_version_num",
+    )
+    .await;
+    assert_eq!(code, 0, "SHOW server_version_num; is the DSN reachable?");
+    let image = pg_client_image_for_server_version(&ver).expect("version maps to a client image");
+
+    // Seed a table in the source db.
+    let (code, _) = psql(
+        backend.as_ref(),
+        &image,
+        &src,
+        "DROP TABLE IF EXISTS brdrv_rt; CREATE TABLE brdrv_rt(id int primary key, v text); \
+         INSERT INTO brdrv_rt VALUES (1,'alpha'),(2,'beta');",
+    )
+    .await;
+    assert_eq!(code, 0, "seed source table");
+    let expect = "1:alpha\n2:beta";
+
+    // EXPORT through the driver (full) — exercises resolve_pg + run_sql_client(pg_dump).
+    let bundle = driver
+        .export(
+            "default",
+            &ExportOptions {
+                data_only: false,
+                include_identity: false,
+                transport_key: None,
+            },
+        )
+        .await
+        .expect("driver export");
+    let manifest = project_bundle::read_manifest(&bundle).expect("read manifest");
+    assert!(
+        manifest
+            .members
+            .iter()
+            .any(|m| m.kind == MemberKind::PgDump),
+        "driver export staged a pg dump member"
+    );
+    assert!(
+        manifest.members.iter().any(|m| m.kind == MemberKind::Kv),
+        "driver export staged the control-plane KV slice"
+    );
+
+    // Drop the table, then IMPORT through the driver — exercises run_sql_client(pg_restore).
+    // `force` overlays the (non-empty, same-process) KV; identity Fresh (no identity member).
+    let (code, _) = psql(backend.as_ref(), &image, &src, "DROP TABLE brdrv_rt").await;
+    assert_eq!(code, 0, "drop before restore");
+    let report = driver
+        .import(
+            "default",
+            &bundle,
+            ImportOptions {
+                apply: true,
+                force: true,
+                identity: IdentityChoice::Fresh,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("driver import");
+    assert!(
+        report.pg_databases >= 1,
+        "driver import restored at least one pg database"
+    );
+
+    // ROW equality after the full driver round-trip.
+    let (_, got) = psql(
+        backend.as_ref(),
+        &image,
+        &src,
+        "SELECT id || ':' || v FROM brdrv_rt ORDER BY id",
+    )
+    .await;
+    assert_eq!(got, expect, "driver round-trip restored the rows");
+
+    let _ = psql(
+        backend.as_ref(),
+        &image,
+        &src,
+        "DROP TABLE IF EXISTS brdrv_rt",
+    )
+    .await;
+    println!("PROJECT EXPORT DRIVER ROUNDTRIP OK");
+}
+
 #[test]
 fn parse_pg_url_handles_the_common_shapes() {
     // A pure unit guard so the URL parser is covered in the MERGE gate (no network).
