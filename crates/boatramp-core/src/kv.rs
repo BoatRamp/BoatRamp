@@ -298,6 +298,26 @@ pub trait KvStore: Send + Sync {
         Ok(())
     }
 
+    /// **Periodic online-safe maintenance GC** — reclaim the physical storage the backend's own
+    /// background GC would, run from a SUPERVISED cadence task on the writer so a transient error can
+    /// never permanently stop it (the durable fix for the embedded-GC-dies-on-first-error leak that
+    /// grew `manifest/` + `compactions/` unbounded). The default is a **no-op**: the `sql`, `memory`
+    /// and Cloudflare-KV backends self-manage their own storage reclamation (the SQL engine's vacuum /
+    /// autovacuum, an in-memory map, or the remote KV service), so there is nothing a boatramp cadence
+    /// task should reclaim for them.
+    ///
+    /// Only the embedded-LSM backend (SlateDB) overrides it, and only on the single **writer** handle
+    /// (a read replica is a no-op): it runs an online-safe `run_gc_once` over the store's
+    /// `manifest`/`wal`/`compacted`/`compactions` directories — the SAME non-fencing list+delete the
+    /// embedded GC performs (it never drops a checkpoint, never compacts, and respects `min_age` +
+    /// every active checkpoint), so it is safe concurrent with the live writer and its readers. The
+    /// caller supplies a conservative `min_age` (≥ a few minutes, default ≥ 1h) so a young object a
+    /// reader replica is mid-scan on is never a deletion candidate. Wrappers ([`CachedKv`],
+    /// [`CheckpointKv`]) forward it to their inner store.
+    async fn maintenance_gc(&self, _min_age: std::time::Duration) -> Result<(), KvError> {
+        Ok(())
+    }
+
     /// A durable [`put`](Self::put) that ALSO advances the durable frontier before returning — the
     /// **crown-jewel write** variant. Equivalent to `put(..).await?; checkpoint().await`, but named
     /// so the frontier-sync is unmissable at the call site (and greppable for the Security review).
@@ -755,6 +775,13 @@ impl KvStore for CachedKv {
         self.inner.checkpoint().await
     }
 
+    async fn maintenance_gc(&self, min_age: std::time::Duration) -> Result<(), KvError> {
+        // Forward to the backing store: physical-storage reclamation is entirely the inner store's
+        // concern (the LRU holds only reads). Without this forward, the supervised cadence task would
+        // hit the trait no-op and never reclaim the SlateDB manifest/compactions leak.
+        self.inner.maintenance_gc(min_age).await
+    }
+
     async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, KvError> {
         {
             let mut cache = self.cache.lock().unwrap();
@@ -959,6 +986,11 @@ impl KvStore for CheckpointKv {
 
     async fn checkpoint(&self) -> Result<(), KvError> {
         self.inner.checkpoint().await
+    }
+
+    async fn maintenance_gc(&self, min_age: std::time::Duration) -> Result<(), KvError> {
+        // Forward to the backing store: physical-storage reclamation is the inner store's concern.
+        self.inner.maintenance_gc(min_age).await
     }
 
     fn atomic_write_batch(&self) -> bool {
@@ -1175,6 +1207,33 @@ mod tests {
         // SIGHUP-style invalidation → the next read pulls the fresh value.
         kv.invalidate_cache();
         assert_eq!(kv.get("k").await.unwrap(), Some(b"v2".to_vec()));
+    }
+
+    /// A non-SlateDB [`KvStore`]'s [`maintenance_gc`](KvStore::maintenance_gc) is a NO-OP (the trait
+    /// default): `memory`/`sql`/Cloudflare self-manage their storage, so the supervised cadence task
+    /// does nothing for them — and the wrappers ([`CachedKv`], [`CheckpointKv`]) forward to the inner
+    /// store rather than swallowing or erroring. The storage crate separately gates that SlateKv's
+    /// override actually reclaims (`online_gc_*`); this just proves the no-op contract + forwarding.
+    #[tokio::test]
+    async fn maintenance_gc_is_a_noop_for_non_slatedb_backends() {
+        let one_hour = std::time::Duration::from_secs(3600);
+
+        // The in-memory backend inherits the default no-op — returns Ok without touching anything.
+        let mem = MemoryKv::new();
+        mem.put("k", b"v".to_vec()).await.unwrap();
+        mem.maintenance_gc(one_hour).await.unwrap();
+        assert_eq!(
+            mem.get("k").await.unwrap(),
+            Some(b"v".to_vec()),
+            "a no-op maintenance GC must not disturb the store's data"
+        );
+
+        // The LRU + checkpoint wrappers forward it to their inner store (still a no-op here) — proving
+        // the supervised task reaches the real backend through a wrapped handle, not the trait no-op.
+        let cached = CachedKv::new(Arc::new(MemoryKv::new()), 8);
+        cached.maintenance_gc(one_hour).await.unwrap();
+        let checkpointed = CheckpointKv::new(Arc::new(MemoryKv::new()));
+        checkpointed.maintenance_gc(one_hour).await.unwrap();
     }
 
     /// NEGATIVE-CACHE gate (serve-latency, secret-resolution). A declared-but-unset secret ref is a

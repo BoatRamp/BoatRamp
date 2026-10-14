@@ -1160,6 +1160,12 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
     // shutdown. Both come from `[serve.kv]` (+ env override) — see `resolve_kv_durability`.
     let (kv_checkpoint_interval, kv_close_deadline) = resolve_kv_durability(serve_cfg.kv.as_ref());
     spawn_kv_checkpoint(kv.clone(), kv_checkpoint_interval);
+    // Supervised online maintenance GC (kv-data-observability durable fix): reclaim the stale
+    // manifest/compactions objects the embedded GC leaks when it dies on its first transient error.
+    // Runs over the UNCACHED `kv_backend` (the reclaim is a store-physical op; the LRU is irrelevant)
+    // — a SlateDB writer runs it, every other backend is a cheap no-op. See `spawn_kv_maintenance_gc`.
+    let (kv_gc_interval, kv_gc_min_age) = resolve_kv_gc(serve_cfg.kv.as_ref());
+    spawn_kv_maintenance_gc(kv_backend.clone(), kv_gc_interval, kv_gc_min_age);
     // MF-3/MF-4 — in multi-writer `shared` mode the authorizer gets the fence + the UNCACHED backing
     // store so it can read the authz keyspace THROUGH the cache (fence) and FAIL CLOSED (shed) when
     // the shared DB is unreachable. Single-writer passes `None` → the authz path is unchanged.
@@ -1732,6 +1738,40 @@ fn resolve_kv_durability(
     (checkpoint, close)
 }
 
+/// Resolve the `[serve.kv]` online maintenance-GC knobs (kv-data-observability durable fix) — the
+/// supervised reclaim cadence and the minimum object age — from config, with an env override so a fly
+/// deploy can tune them with no config file: `BOATRAMP_KV_GC_INTERVAL` / `BOATRAMP_KV_GC_MIN_AGE`
+/// (both seconds). An `interval` of `None` ⇒ the task is DISABLED (`gc_interval = 0` in config, or the
+/// env set to `0`). An unparsable env value is ignored (config/default wins) with a WARN. Shared by
+/// `run` (single-node) and `run_cluster` (node-local durable store).
+fn resolve_kv_gc(
+    kv_cfg: Option<&boatramp_node::config::KvConfig>,
+) -> (Option<std::time::Duration>, std::time::Duration) {
+    fn env_secs(var: &str) -> Option<u64> {
+        match std::env::var(var) {
+            Ok(raw) => match raw.trim().parse::<u64>() {
+                Ok(secs) => Some(secs),
+                Err(_) => {
+                    tracing::warn!(%var, value = %raw, "ignoring unparsable env override (want seconds)");
+                    None
+                }
+            },
+            Err(_) => None,
+        }
+    }
+    let cfg = kv_cfg.cloned().unwrap_or_default();
+    let interval = match env_secs("BOATRAMP_KV_GC_INTERVAL") {
+        Some(0) => None, // env explicitly disables the task
+        Some(secs) => Some(std::time::Duration::from_secs(secs)),
+        None => cfg.gc_interval(),
+    };
+    let min_age = match env_secs("BOATRAMP_KV_GC_MIN_AGE") {
+        Some(secs) if secs > 0 => std::time::Duration::from_secs(secs),
+        _ => cfg.gc_min_age(),
+    };
+    (interval, min_age)
+}
+
 /// Resolve the `[serve.kv.sql]` SQL-KV backend connection (UX-C2), overlaying the
 /// `BOATRAMP_KV_SQL_*` env (env wins) so a fly deploy can configure `--kv sql` with no config file:
 /// `BOATRAMP_KV_SQL_KIND`, `BOATRAMP_KV_SQL_PATH`, `BOATRAMP_KV_SQL_URL_ENV`,
@@ -1808,6 +1848,61 @@ fn spawn_kv_checkpoint(kv: Arc<dyn KvStore>, interval: Option<std::time::Duratio
             }
         }
     });
+}
+
+/// The supervised online-maintenance-GC loop body (kv-data-observability durable fix). Every
+/// `interval` it calls [`KvStore::maintenance_gc`](boatramp_core::kv::KvStore::maintenance_gc) — an
+/// online-safe `run_gc_once` on the SlateDB writer (a no-op for a reader / a non-SlateDB backend) —
+/// reclaiming the stale manifest/compactions/WAL objects the embedded GC would. **The loop NEVER
+/// exits on error — that is the entire point of the fix**: slatedb-0.16's embedded GC dispatcher runs
+/// each tick as `handle(msg).await?`, so its FIRST transient error exits the run loop permanently and
+/// nothing restarts it (prod grew `manifest/` to 16.5 GB). This supervisor catches the error, logs it,
+/// and retries on the next tick, so a transient object-store blip can never permanently stop reclaim.
+/// Factored out of [`spawn_kv_maintenance_gc`] so the survives-an-error property is unit-testable
+/// without a full daemon. Loops forever; the caller spawns it detached (it lives for the process).
+async fn kv_maintenance_loop(
+    kv: Arc<dyn KvStore>,
+    interval: std::time::Duration,
+    min_age: std::time::Duration,
+) {
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    ticker.tick().await; // consume the immediate first tick (reclaim on the cadence, not at boot)
+    loop {
+        ticker.tick().await;
+        // The SlateKv override logs reclaimed bytes on success (`target: "kv_maintenance_gc"`); here we
+        // only handle the error, and CRUCIALLY continue the loop so one bad tick is never terminal.
+        if let Err(e) = kv.maintenance_gc(min_age).await {
+            tracing::warn!(error = %e, "KV maintenance GC failed; will retry next interval");
+        }
+    }
+}
+
+/// Spawn the supervised online maintenance-GC task on the control-plane KV writer (kv-data-observability
+/// durable fix). `interval` `None` ⇒ the task is DISABLED (`[serve.kv.slatedb] gc_interval = 0`), leaving
+/// only SlateDB's (fragile, dies-on-first-error) embedded GC — logged so the operator knows reclaim is
+/// unsupervised. The task is detached (lives for the process) and error-tolerant: see
+/// [`kv_maintenance_loop`]. A non-SlateDB / reader store's `maintenance_gc` is a cheap no-op, so this is
+/// always safe to spawn regardless of backend.
+fn spawn_kv_maintenance_gc(
+    kv: Arc<dyn KvStore>,
+    interval: Option<std::time::Duration>,
+    min_age: std::time::Duration,
+) {
+    let Some(interval) = interval else {
+        tracing::info!(
+            "control-plane KV online maintenance GC DISABLED (`[serve.kv.slatedb] gc_interval = 0`); \
+             only SlateDB's embedded GC runs (which stops permanently on its first transient error)"
+        );
+        return;
+    };
+    tracing::info!(
+        interval_s = interval.as_secs(),
+        min_age_s = min_age.as_secs(),
+        "control-plane KV online maintenance GC enabled (supervised reclaim; survives transient \
+         errors and retries next interval)"
+    );
+    tokio::spawn(kv_maintenance_loop(kv, interval, min_age));
 }
 
 /// Best-effort read of the control-plane store's `DEGRADED.json` breadcrumb (v0.9.0 KV-recovery, C6)
@@ -3041,6 +3136,14 @@ async fn run_cluster(
     let (kv_checkpoint_interval, kv_close_deadline) =
         resolve_kv_durability(config.serve.as_ref().and_then(|s| s.kv.as_ref()));
     spawn_kv_checkpoint(durable_kv_handle.clone(), kv_checkpoint_interval);
+    // Supervised online maintenance GC for the node-local durable Raft store (kv-data-observability
+    // durable fix): it is a SlateDB writer too, so its embedded GC can die on a transient error and
+    // leak the same manifest/compactions bytes. The online `run_gc_once` only deletes objects the
+    // latest manifest no longer references (never the live log/state), exactly as the embedded GC
+    // would — safe concurrent with openraft, bounded by the conservative `min_age`.
+    let (kv_gc_interval, kv_gc_min_age) =
+        resolve_kv_gc(config.serve.as_ref().and_then(|s| s.kv.as_ref()));
+    spawn_kv_maintenance_gc(durable_kv_handle.clone(), kv_gc_interval, kv_gc_min_age);
 
     use boatramp_cluster::mesh::{self, MeshIdentity, MeshTls, TrustSet};
 
@@ -4588,6 +4691,83 @@ mod tests {
         assert!(
             outcome.is_ok(),
             "A3: a stalled close must be abandoned at the CONFIGURED close_deadline, not hang"
+        );
+    }
+
+    /// **Durable-fix gate** — the supervised maintenance-GC loop SURVIVES a `maintenance_gc` error and
+    /// KEEPS RUNNING. This is the entire point of the fix: slatedb-0.16's embedded GC dispatcher runs
+    /// each tick as `handle(msg).await?`, so its FIRST transient error exits the loop permanently and
+    /// nothing restarts it (prod leaked `manifest/` to 16.5 GB). [`kv_maintenance_loop`] must instead
+    /// catch the error, log it, and run AGAIN on the next interval. The double errors on its first call
+    /// and succeeds after; the gate asserts the loop reached the later (successful) ticks — i.e. the
+    /// first error did NOT terminate it.
+    ///
+    /// Anti-hollow mutation: change the loop's `if let Err(e) = …` to `kv.maintenance_gc(..).await?`
+    /// (propagate) — the task then returns on the first error, the counter stops at 1, and this fails.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn kv_maintenance_loop_survives_an_error_and_keeps_running() {
+        use boatramp_core::kv::{KvError, KvStore};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // A store whose first `maintenance_gc` ERRORS (a transient object-store blip), then succeeds —
+        // counting every call so we can see the loop kept ticking past the error.
+        struct FlakyGcKv {
+            calls: Arc<AtomicUsize>,
+        }
+        #[async_trait::async_trait]
+        impl KvStore for FlakyGcKv {
+            async fn get(&self, _k: &str) -> std::result::Result<Option<Vec<u8>>, KvError> {
+                Ok(None)
+            }
+            async fn put(&self, _k: &str, _v: Vec<u8>) -> std::result::Result<(), KvError> {
+                Ok(())
+            }
+            async fn delete(&self, _k: &str) -> std::result::Result<(), KvError> {
+                Ok(())
+            }
+            async fn list_prefix(&self, _p: &str) -> std::result::Result<Vec<String>, KvError> {
+                Ok(Vec::new())
+            }
+            async fn maintenance_gc(
+                &self,
+                _min_age: std::time::Duration,
+            ) -> std::result::Result<(), KvError> {
+                // Fail the FIRST tick (the exact shape the embedded GC dies on), succeed thereafter.
+                let n = self.calls.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    Err(KvError::backend(
+                        "transient object-store error on the first GC tick",
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let kv: Arc<dyn KvStore> = Arc::new(FlakyGcKv {
+            calls: calls.clone(),
+        });
+        let interval = std::time::Duration::from_secs(900);
+        let min_age = std::time::Duration::from_secs(3600);
+        let handle = tokio::spawn(super::kv_maintenance_loop(kv, interval, min_age));
+
+        // Let the task reach its first real `ticker.tick().await` (the boot tick is consumed up front).
+        tokio::task::yield_now().await;
+        // Drive several intervals on the virtual clock. Tick 1 errors; the loop must continue and run
+        // ticks 2, 3, 4 — so the counter climbs well past 1.
+        for _ in 0..4 {
+            tokio::time::advance(interval).await;
+            tokio::task::yield_now().await;
+        }
+        handle.abort();
+
+        let total = calls.load(Ordering::SeqCst);
+        assert!(
+            total >= 3,
+            "the supervised loop must survive the first-tick error and keep running (ran {total} \
+             ticks; a loop that exits on error would stop at 1)"
         );
     }
 
