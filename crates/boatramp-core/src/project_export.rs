@@ -17,6 +17,25 @@ use std::path::{Path, PathBuf};
 use async_trait::async_trait;
 use serde::Serialize;
 
+use crate::project::ProjectRef;
+
+/// The control-plane KV prefixes that hold a project's KEK-**sealed** secrets — the keyspace
+/// a `--identity fresh` import drops (they could never unseal under the target's own KEK, so
+/// dropping them makes "zero source-sealed artifacts" a positive absence). The SINGLE source
+/// of truth for "sealed-secret keyspace", built from the canonical `deploy::keys` builders:
+/// `project/<p>/secret/` (operator/app env secrets), `project/<p>/tenant-secret/` (ALL
+/// per-tenant secrets), and `project/<p>/tenant-secret-index/`. The project-wide
+/// `tenant-secret/` prefix is composed here (there is deliberately no guest-facing builder
+/// for it — a `list` is always tenant-scoped to avoid a cross-tenant name oracle); this is an
+/// admin-only teardown scan, not a guest enumeration.
+pub fn sealed_secret_prefixes(project: ProjectRef<'_>) -> Vec<String> {
+    vec![
+        crate::deploy::keys::secret_prefix(project),
+        format!("project/{project}/tenant-secret/"),
+        format!("project/{project}/tenant-secret-index/"),
+    ]
+}
+
 /// Flags for an export. `Debug` is implemented by hand to **redact** the transport key so
 /// it can never reach a log line.
 #[derive(Clone, Default)]
@@ -48,8 +67,36 @@ impl std::fmt::Debug for ExportOptions {
     }
 }
 
-/// Flags for an import.
-#[derive(Debug, Clone, Copy, Default)]
+/// The identity decision for an import (construens Ask-2 / Ask-4 c/d). The CLI/API surface
+/// requires the operator to choose explicitly; the in-core default is the SAFE `Fresh`.
+#[derive(Clone, Default)]
+pub enum IdentityChoice {
+    /// A DIFFERENT environment: the target keeps/mints its own KEK and the source-sealed
+    /// secrets are dropped (they would never unseal under the target's key). The safe
+    /// default.
+    #[default]
+    Fresh,
+    /// Backup/recovery of the SAME environment: install the source KEK — opened from the
+    /// bundle's transport-wrapped identity member with `transport_key` — BEFORE the restore,
+    /// so the KV slice's sealed secrets unseal and existing tokens stay valid.
+    Adopt {
+        /// The operator transport passphrase that opens the identity container. Secret —
+        /// never logged (see the hand-written `Debug`).
+        transport_key: Vec<u8>,
+    },
+}
+
+impl std::fmt::Debug for IdentityChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Fresh => f.write_str("Fresh"),
+            Self::Adopt { .. } => f.write_str("Adopt { transport_key: <redacted> }"),
+        }
+    }
+}
+
+/// Flags for an import. `Debug` is hand-written so the adopt transport key cannot leak.
+#[derive(Clone, Default)]
 pub struct ImportOptions {
     /// Execute the import (default `false` ⇒ a dry-run plan, no mutation).
     pub apply: bool,
@@ -60,6 +107,19 @@ pub struct ImportOptions {
     /// and the target (a `--data-only` restore into a schema-skewed target). Default
     /// `false` ⇒ REFUSE on skew.
     pub allow_schema_skew: bool,
+    /// Adopt the source identity (recovery) or mint fresh (a different environment).
+    pub identity: IdentityChoice,
+}
+
+impl std::fmt::Debug for ImportOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ImportOptions")
+            .field("apply", &self.apply)
+            .field("force", &self.force)
+            .field("allow_schema_skew", &self.allow_schema_skew)
+            .field("identity", &self.identity)
+            .finish()
+    }
 }
 
 /// The outcome of an export or import — a legible summary for the operator / API JSON.
