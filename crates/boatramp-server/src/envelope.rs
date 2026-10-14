@@ -264,6 +264,16 @@ const TRANSPORT_SALT_LEN: usize = 16;
 const TK_M_COST: u32 = 65_536;
 const TK_T_COST: u32 = 3;
 const TK_P_COST: u32 = 1;
+/// Upper bounds on the Argon2 parameters an UNWRAP will honour from the (pre-authentication)
+/// container header. The header is AEAD-AAD-bound, but the KDF necessarily runs BEFORE the tag can
+/// be checked, so an attacker-crafted container could otherwise declare gigabytes of Argon2 memory
+/// and OOM the importer before authentication (a pre-auth DoS). The wrap always records the fixed
+/// `TK_*` costs; these ceilings sit well above them (room for a future cost bump) while capping a
+/// single derivation's memory far below a denial-of-service. A too-SMALL value needs no clamp —
+/// `Params::new` rejects it cheaply.
+const TK_M_COST_MAX: u32 = 262_144; // 256 MiB
+const TK_T_COST_MAX: u32 = 16;
+const TK_P_COST_MAX: u32 = 16;
 /// Header length that precedes the nonce: salt + three u32 params.
 const TRANSPORT_HDR_PARAMS: usize = TRANSPORT_SALT_LEN + 4 * 3;
 
@@ -340,6 +350,16 @@ pub fn transport_unwrap(container: &[u8], passphrase: &[u8]) -> Result<Vec<u8>, 
     let p = u32::from_be_bytes(rest[8..12].try_into().unwrap());
     let (nonce_bytes, ciphertext) = body.split_at(NONCE_LEN);
 
+    // Clamp the header-declared KDF cost BEFORE deriving: the header is AEAD-AAD-bound, but the
+    // derivation runs before the tag is verified, so an unbounded `m` from a crafted container is a
+    // pre-authentication memory-exhaustion DoS. Refuse out-of-range params up front.
+    if m > TK_M_COST_MAX || t > TK_T_COST_MAX || p > TK_P_COST_MAX {
+        return Err(EnvelopeError::new(
+            "transport container declares out-of-range KDF parameters (refused before key \
+             derivation to prevent a pre-authentication memory-exhaustion DoS)",
+        ));
+    }
+
     let dk = transport_kdf(passphrase, salt, m, t, p)?;
     let unbound = UnboundKey::new(&AES_256_GCM, &dk)
         .map_err(|_| EnvelopeError::new("invalid derived key"))?;
@@ -413,6 +433,28 @@ mod tests {
         // Bad magic + truncated → clean errors, no panic.
         assert!(transport_unwrap(b"not-a-container", pass).is_err());
         assert!(transport_unwrap(TRANSPORT_MAGIC.as_slice(), pass).is_err());
+    }
+
+    /// GATE (M2): a container declaring an absurd Argon2 memory cost is refused BEFORE the KDF
+    /// runs, so a crafted bundle cannot OOM the importer at the pre-authentication derivation step.
+    /// The m_cost u32 is the four bytes immediately after magic + salt (big-endian).
+    #[test]
+    fn transport_refuses_out_of_range_kdf_cost_before_derivation() {
+        let pass = b"s3cret-transport-key";
+        let c = transport_wrap(b"identity material".as_slice(), pass).unwrap();
+        let m_off = TRANSPORT_MAGIC.len() + TRANSPORT_SALT_LEN;
+        let mut poisoned = c.clone();
+        // u32::MAX KiB of Argon2 memory — an OOM weapon. The clamp must reject it outright.
+        poisoned[m_off..m_off + 4].copy_from_slice(&u32::MAX.to_be_bytes());
+        let err = transport_unwrap(&poisoned, pass).unwrap_err();
+        assert!(
+            format!("{err}").contains("out-of-range KDF parameters"),
+            "a huge m_cost must be refused by the pre-derivation clamp, got: {err}"
+        );
+        // A value just above the ceiling is also refused (boundary).
+        let mut just_over = c.clone();
+        just_over[m_off..m_off + 4].copy_from_slice(&(TK_M_COST_MAX + 1).to_be_bytes());
+        assert!(transport_unwrap(&just_over, pass).is_err());
     }
 
     #[tokio::test]

@@ -421,6 +421,15 @@ pub struct ContainerBackend {
     /// resolved by the on-demand OCI pull+build path (`stage_image`). Set by
     /// [`Self::with_client_image_rootfs`] from the `[compute] client_image_rootfs` config.
     client_image_rootfs: std::collections::BTreeMap<String, String>,
+    /// Whether a one-shot [`run_ephemeral`](ComputeBackend::run_ephemeral) client image MUST be
+    /// provenance-pinned: preloaded via [`client_image_rootfs`](Self::client_image_rootfs) (no
+    /// pull) or referenced by an `@sha256:` **digest** (a content-addressed pull the registry
+    /// cannot substitute). Set from the multi-tenant posture (`strict`): there, an unauthenticated
+    /// on-demand pull of a mutable tag is refused, because a compromised/MITM'd registry could
+    /// swap in a malicious image that runs with the managed-DB credential in its environment and
+    /// egress to the database. Off (the default) under the single-tenant/operator posture, which
+    /// keeps the convenient tag pull. Set by [`Self::with_require_pinned_client_image`].
+    require_pinned_client_image: bool,
     /// Wall-clock backstop for a single [`run_ephemeral`](ComputeBackend::run_ephemeral)
     /// invocation (one export/import client run). Generous by default
     /// ([`EPHEMERAL_RUN_TIMEOUT`]); an operator raises it for a very large migration so the
@@ -461,8 +470,19 @@ impl ContainerBackend {
             userns_base: crate::worker::USERNS_HOST_BASE,
             internal_dns_domain: None,
             client_image_rootfs: std::collections::BTreeMap::new(),
+            require_pinned_client_image: false,
             ephemeral_timeout: EPHEMERAL_RUN_TIMEOUT,
         })
+    }
+
+    /// Require a one-shot client image to be provenance-pinned (preloaded via the air-gap map or
+    /// referenced by an `@sha256:` digest), refusing an unauthenticated on-demand pull of a mutable
+    /// tag. The node sets this from the multi-tenant posture (`strict`). See
+    /// [`require_pinned_client_image`](Self::require_pinned_client_image).
+    #[must_use]
+    pub fn with_require_pinned_client_image(mut self, require: bool) -> Self {
+        self.require_pinned_client_image = require;
+        self
     }
 
     /// Enable writing each container's `/etc/resolv.conf` to point at the internal
@@ -1398,6 +1418,19 @@ impl ContainerBackend {
             // A Storage blob hash of a rootfs tar — staged like a RootSource::Tar.
             return self.stage_rootfs(preloaded).await;
         }
+        // Not air-gap-mapped: an on-demand registry pull. Under the multi-tenant posture, refuse
+        // a MUTABLE tag — a compromised/MITM'd registry could substitute a malicious image that
+        // runs with the managed-DB credential in its environment and egress to the database. A
+        // `@sha256:` digest makes the pull content-addressed (the registry cannot swap the bytes
+        // without failing the digest), so it is accepted; otherwise require the operator to
+        // preload the image via `[compute] client_image_rootfs`.
+        if self.require_pinned_client_image && !image.contains("@sha256:") {
+            return Err(BackendError::Materialize(format!(
+                "multi-tenant posture: refusing an unauthenticated on-demand pull of client image \
+                 {image:?}. Preload it via `[compute] client_image_rootfs`, or pin it by digest \
+                 (`<image>@sha256:<hex>`), so a registry cannot substitute the bytes."
+            )));
+        }
         // Default: daemonless OCI pull + layer overlay, cached + idempotent.
         self.stage_image(image).await
     }
@@ -1695,6 +1728,50 @@ impl ContainerBackend {
         let _ = VethNetwork::for_vm(id, &self.bridge).teardown().await;
         self.ipam.lock().expect("ipam mutex").release_ephemeral(ip);
     }
+
+    /// Boot-time sweep of one-shot resources orphaned by a HARD node crash mid-`run_ephemeral`
+    /// (the happy path always runs [`ephemeral_teardown`]). A stale ephemeral IP is already
+    /// reclaimed by the IPAM GC, and a crashed run's veth PAIR is removed with its container network
+    /// namespace (a veth dies with either peer's netns). What persists is the empty `ephm-*` cgroup
+    /// directory under `/sys/fs/cgroup/boatramp/` — a cgroup is not refcounted to the process — so
+    /// over repeated crashes these accumulate. This kills any survivor pinned to each and removes
+    /// the directory. Best-effort; safe to call once at startup, before the backend serves any
+    /// request, so no in-flight one-shot can race it. Only `ephm-`-prefixed directories are touched
+    /// — never a live workload cgroup (`<workload>-<n>`).
+    pub fn sweep_orphaned_ephemeral_cgroups(&self) {
+        let swept = sweep_ephemeral_cgroups_in(Path::new("/sys/fs/cgroup/boatramp"));
+        if swept > 0 {
+            tracing::info!(
+                swept,
+                "swept orphaned one-shot (ephemeral) cgroups at startup"
+            );
+        }
+    }
+}
+
+/// Remove every `ephm-*` cgroup directory under `root`, returning the count removed. Factored out
+/// of [`ContainerBackend::sweep_orphaned_ephemeral_cgroups`] so the prefix selectivity is unit-
+/// testable against a temp dir without writing to the real cgroupfs. Silent when `root` is absent.
+fn sweep_ephemeral_cgroups_in(root: &Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return 0; // no delegated cgroup subtree (or not a cgroup host) — nothing to sweep
+    };
+    let mut swept = 0usize;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        // ONLY one-shot ids — never a live workload cgroup (`<workload>-<n>`).
+        if !name.starts_with("ephm-") {
+            continue;
+        }
+        let dir = entry.path();
+        // Kill any survivor still pinned to the cgroup, then remove the (now empty) directory.
+        let _ = std::fs::write(dir.join("cgroup.kill"), b"1");
+        if std::fs::remove_dir(&dir).is_ok() {
+            swept += 1;
+        }
+    }
+    swept
 }
 
 /// Resource caps for staging a rootfs archive. Defaults are
@@ -3153,5 +3230,99 @@ mod tests {
             !shared.is_free(Ipv4Addr::new(10, 0, 0, 2)),
             "the container backend reserved into the SHARED pool"
         );
+    }
+
+    /// GATE (M1): under the multi-tenant posture (`with_require_pinned_client_image(true)`), a
+    /// one-shot client image resolved by an unauthenticated on-demand pull of a MUTABLE tag is
+    /// refused BEFORE any network pull; an `@sha256:`-pinned ref or a preloaded air-gap mapping is
+    /// accepted. The single-tenant default keeps the convenient tag pull.
+    #[tokio::test]
+    async fn ephemeral_client_image_pin_policy() {
+        let data_dir = unique_dir("pinpolicy");
+        let mk = |require: bool, map: std::collections::BTreeMap<String, String>| {
+            ContainerBackend::new(
+                Arc::new(OneBlob(Vec::new())),
+                data_dir.clone(),
+                "br-boatramp".into(),
+                "10.0.0.0/24",
+                PathBuf::from("/proc/self/exe"),
+            )
+            .expect("backend")
+            .with_require_pinned_client_image(require)
+            .with_client_image_rootfs(map)
+        };
+
+        // Strict + a mutable tag + no air-gap mapping ⇒ refused before any pull.
+        let strict = mk(true, std::collections::BTreeMap::new());
+        let err = strict
+            .resolve_client_rootfs("postgres:16")
+            .await
+            .expect_err("mutable tag must be refused under the pin policy");
+        assert!(
+            matches!(&err, BackendError::Materialize(m) if m.contains("multi-tenant")),
+            "refusal names the posture, got: {err:?}"
+        );
+
+        // Strict + a preloaded air-gap rootfs (absolute dir) ⇒ accepted (bypasses the pull).
+        let preload = unique_dir("airgap-rootfs");
+        std::fs::create_dir_all(&preload).unwrap();
+        let mapped = mk(
+            true,
+            std::collections::BTreeMap::from([(
+                "postgres:16".to_string(),
+                preload.display().to_string(),
+            )]),
+        );
+        assert_eq!(
+            mapped.resolve_client_rootfs("postgres:16").await.unwrap(),
+            preload,
+            "an air-gap-mapped image bypasses the pin policy"
+        );
+
+        // A digest-pinned ref passes the policy gate (the subsequent pull is a separate concern;
+        // here we only assert the policy does NOT refuse it — the error, if any, is a pull error,
+        // never the multi-tenant refusal).
+        let pinned = mk(true, std::collections::BTreeMap::new());
+        if let Err(BackendError::Materialize(m)) = pinned
+            .resolve_client_rootfs("postgres:16@sha256:0000000000000000000000000000000000000000000000000000000000000000")
+            .await
+        {
+            assert!(
+                !m.contains("multi-tenant"),
+                "a digest-pinned ref must pass the pin policy; got a posture refusal: {m}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let _ = std::fs::remove_dir_all(&preload);
+    }
+
+    /// GATE (L2): the boot sweep removes ONLY `ephm-*` one-shot cgroups, never a live workload
+    /// cgroup (`<workload>-<n>`), and is silent when the cgroup subtree is absent.
+    #[test]
+    fn ephemeral_cgroup_sweep_is_prefix_selective() {
+        let root = unique_dir("cgroup-sweep");
+        std::fs::create_dir_all(root.join("ephm-123-0")).unwrap();
+        std::fs::create_dir_all(root.join("ephm-456-1")).unwrap();
+        std::fs::create_dir_all(root.join("pg-0")).unwrap(); // a live workload — must survive
+        std::fs::create_dir_all(root.join("web-2")).unwrap(); // a live workload — must survive
+
+        let swept = sweep_ephemeral_cgroups_in(&root);
+        assert_eq!(swept, 2, "both ephm-* one-shot cgroups removed");
+        assert!(!root.join("ephm-123-0").exists());
+        assert!(!root.join("ephm-456-1").exists());
+        assert!(
+            root.join("pg-0").exists(),
+            "a live workload cgroup is never swept"
+        );
+        assert!(
+            root.join("web-2").exists(),
+            "a live workload cgroup is never swept"
+        );
+
+        // Absent subtree ⇒ silent no-op (returns 0, no panic).
+        assert_eq!(sweep_ephemeral_cgroups_in(&root.join("does-not-exist")), 0);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

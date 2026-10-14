@@ -781,7 +781,11 @@ async fn project_export_roundtrip_driver_live() {
     let env: Arc<dyn boatramp_core::env::EnvSource> =
         Arc::new(MapEnv::new().with("BR_DRV_DSN", &url));
     let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
-    kv.put("routing/default/x", b"r".to_vec()).await.unwrap();
+    // A real OWNED control-plane key so the scoped KV slice is non-trivial (a synthetic
+    // non-owned key would be excluded by the C1 project-scoping, leaving the slice empty).
+    kv.put("project/default/config/tenancy", b"{}".to_vec())
+        .await
+        .unwrap();
     let td = tempfile::tempdir().unwrap();
     let blobs: Arc<dyn Storage> = Arc::new(FsStorage::new(td.path().join("blobs")));
     // The managed path requires an envelope even for an external binding (it unseals a
