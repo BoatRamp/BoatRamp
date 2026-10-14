@@ -3021,6 +3021,23 @@ pub const DEFAULT_KV_CHECKPOINT_INTERVAL_SECS: u64 = 10;
 /// budget rarely bites; operators should still raise fly `kill_timeout` to ≥ their measured drain+close.
 pub const DEFAULT_KV_CLOSE_DEADLINE_SECS: u64 = 20;
 
+/// Default control-plane SlateDB **online maintenance-GC** cadence (seconds) when `[serve.kv.slatedb]
+/// gc_interval` is unset (kv-data-observability durable fix). The supervised writer task reclaims the
+/// stale manifest/compactions/WAL/compacted objects the embedded GC would — SURVIVING the transient
+/// tick error that kills the unsupervised embedded GC permanently (the 16.5 GB manifest-retention
+/// leak). 900s (15 min) matches the cadence of the embedded GC's own protective-checkpoint window, so
+/// freshly-superseded SSTs age out of their checkpoint before the next reclaim; a 0 DISABLES the task.
+pub const DEFAULT_KV_GC_INTERVAL_SECS: u64 = 900;
+
+/// Default **minimum object age** (seconds) before the online maintenance GC will reclaim an object,
+/// when `[serve.kv.slatedb] gc_min_age` is unset. 3600s (1h) is deliberately CONSERVATIVE: the online
+/// GC only deletes objects the latest manifest no longer references, but a read replica polling the
+/// shared store could still be mid-scan over a manifest generation that just became stale — a min_age
+/// this large guarantees such a needed-but-unreferenced object is never a deletion candidate while any
+/// plausible replica scan is in flight. A 0 (or unset) falls back to this default — it is never zero
+/// (a zero min_age would reintroduce exactly the mid-scan deletion hazard this bound closes).
+pub const DEFAULT_KV_GC_MIN_AGE_SECS: u64 = 3600;
+
 /// `[serve.kv]` — control-plane KV configuration. The backend itself is selected by `--kv` /
 /// `BOATRAMP_KV` (`slatedb` default, `sql`, `memory`, `cloudflare`); this block holds the
 /// backend-specific settings, nested so a knob can never silently mislead under the wrong backend
@@ -3060,6 +3077,26 @@ impl KvConfig {
             _ => std::time::Duration::from_secs(DEFAULT_KV_CLOSE_DEADLINE_SECS),
         }
     }
+
+    /// The resolved online maintenance-GC cadence (SlateDB): `None` ⇒ the task is DISABLED (explicit
+    /// `0`); else the configured seconds, or [`DEFAULT_KV_GC_INTERVAL_SECS`] when unset/absent.
+    pub fn gc_interval(&self) -> Option<std::time::Duration> {
+        match self.slatedb.as_ref().and_then(|s| s.gc_interval) {
+            Some(0) => None,
+            Some(secs) => Some(std::time::Duration::from_secs(secs)),
+            None => Some(std::time::Duration::from_secs(DEFAULT_KV_GC_INTERVAL_SECS)),
+        }
+    }
+
+    /// The resolved online maintenance-GC minimum object age (SlateDB). A configured `0` (or
+    /// unset/absent) falls back to [`DEFAULT_KV_GC_MIN_AGE_SECS`] — never zero, so a reader replica
+    /// mid-scan over a just-superseded manifest generation is always protected.
+    pub fn gc_min_age(&self) -> std::time::Duration {
+        match self.slatedb.as_ref().and_then(|s| s.gc_min_age) {
+            Some(secs) if secs > 0 => std::time::Duration::from_secs(secs),
+            _ => std::time::Duration::from_secs(DEFAULT_KV_GC_MIN_AGE_SECS),
+        }
+    }
 }
 
 /// `[serve.kv.slatedb]` — control-plane SlateDB KV durability knobs (v0.9.0 KV-recovery). Both are
@@ -3078,6 +3115,16 @@ pub struct SlatedbKvConfig {
     /// Graceful drain+close budget, seconds. Unset ⇒ [`DEFAULT_KV_CLOSE_DEADLINE_SECS`]. `0` is
     /// rejected up to the default (a zero budget would abandon every close, guaranteeing a torn tail).
     pub close_deadline: Option<u64>,
+    /// **Online maintenance-GC cadence**, seconds (kv-data-observability durable fix). Unset ⇒
+    /// [`DEFAULT_KV_GC_INTERVAL_SECS`] (ON). `0` DISABLES the supervised GC task entirely (leaving only
+    /// SlateDB's embedded GC — which dies permanently on its first transient tick error, the leak this
+    /// task works around; disable only if you run an external offline `boatramp kv compact` cadence).
+    pub gc_interval: Option<u64>,
+    /// **Online maintenance-GC minimum object age**, seconds. Unset (or `0`) ⇒
+    /// [`DEFAULT_KV_GC_MIN_AGE_SECS`] (1h) — never zero, so a reader replica mid-scan over a
+    /// just-superseded manifest generation can never have a needed object reclaimed out from under it.
+    /// A tuned positive value is honored (e.g. a single-node deploy with no read replicas may lower it).
+    pub gc_min_age: Option<u64>,
 }
 
 /// `[serve.kv.sql]` — the **SQL control-plane KV** backend connection (`--kv sql`). The connection
@@ -5090,11 +5137,24 @@ mod tests {
             std::time::Duration::from_secs(super::DEFAULT_KV_CLOSE_DEADLINE_SECS),
             "an absent/unset close_deadline defaults to the generous budget"
         );
+        // The online maintenance-GC knobs default ON (15 min) with a conservative 1h min_age.
+        assert_eq!(
+            default_kv.gc_interval(),
+            Some(std::time::Duration::from_secs(
+                super::DEFAULT_KV_GC_INTERVAL_SECS
+            )),
+            "an absent/unset gc_interval defaults to the ON cadence"
+        );
+        assert_eq!(
+            default_kv.gc_min_age(),
+            std::time::Duration::from_secs(super::DEFAULT_KV_GC_MIN_AGE_SECS),
+            "an absent/unset gc_min_age defaults to the conservative 1h floor"
+        );
 
-        // An explicit block: a tuned cadence + a tuned close budget, now nested under `slatedb`
-        // (UX-C3) so they never appear to apply under a non-SlateDB backend.
+        // An explicit block: a tuned cadence + a tuned close budget + tuned GC knobs, now nested under
+        // `slatedb` (UX-C3) so they never appear to apply under a non-SlateDB backend.
         let cfg = server(
-            r#"( serve: ( kv: ( slatedb: ( checkpoint_interval: 5, close_deadline: 30 ) ) ) )"#,
+            r#"( serve: ( kv: ( slatedb: ( checkpoint_interval: 5, close_deadline: 30, gc_interval: 300, gc_min_age: 600 ) ) ) )"#,
         );
         let kv = cfg.serve.unwrap().kv.unwrap();
         assert_eq!(
@@ -5102,11 +5162,15 @@ mod tests {
             Some(std::time::Duration::from_secs(5))
         );
         assert_eq!(kv.close_deadline(), std::time::Duration::from_secs(30));
+        assert_eq!(kv.gc_interval(), Some(std::time::Duration::from_secs(300)));
+        assert_eq!(kv.gc_min_age(), std::time::Duration::from_secs(600));
 
         // checkpoint_interval = 0 DISABLES the cadence; a 0 close_deadline falls back to the default
         // (a zero close budget would abandon every close, guaranteeing a torn tail — never allowed).
+        // gc_interval = 0 DISABLES the maintenance task; a 0 gc_min_age clamps up to the default (a
+        // zero min_age would reintroduce the reader-mid-scan deletion hazard — never allowed).
         let cfg = server(
-            r#"( serve: ( kv: ( slatedb: ( checkpoint_interval: 0, close_deadline: 0 ) ) ) )"#,
+            r#"( serve: ( kv: ( slatedb: ( checkpoint_interval: 0, close_deadline: 0, gc_interval: 0, gc_min_age: 0 ) ) ) )"#,
         );
         let kv = cfg.serve.unwrap().kv.unwrap();
         assert_eq!(kv.checkpoint_interval(), None, "0 disables the cadence");
@@ -5114,6 +5178,12 @@ mod tests {
             kv.close_deadline(),
             std::time::Duration::from_secs(super::DEFAULT_KV_CLOSE_DEADLINE_SECS),
             "a 0 close_deadline is clamped up to the default, never zero"
+        );
+        assert_eq!(kv.gc_interval(), None, "0 disables the maintenance GC task");
+        assert_eq!(
+            kv.gc_min_age(),
+            std::time::Duration::from_secs(super::DEFAULT_KV_GC_MIN_AGE_SECS),
+            "a 0 gc_min_age is clamped up to the conservative default, never zero"
         );
 
         // The SQL KV backend connection parses under `sql` (UX-C2: `url_env`, never a raw URL).

@@ -48,6 +48,15 @@ pub use boatramp_core::kv::KvOpenPolicy;
 #[derive(Clone)]
 pub struct SlateKv {
     backend: Backend,
+    /// The `object_store` backend this store was opened over — the SAME value handed to
+    /// `Db::builder(path, store)`. Retained so the supervised [`maintenance_gc`](KvStore::maintenance_gc)
+    /// can run an online-safe [`kv_gc_online`] over it WITHOUT reopening the store or threading the
+    /// object store separately through the node. Shared across clones (every clone fronts the same `Db`).
+    store: Arc<dyn ObjectStore>,
+    /// The store root (the `path` prefix handed to `Db::builder`) — e.g. `"kv"` for the local
+    /// control-plane store, or the R2/S3 key prefix. Pairs with [`store`](Self::store) for
+    /// [`kv_gc_online`] / [`kv_physical_stats`].
+    root: String,
     /// Serializes [`compare_and_swap`](KvStore::compare_and_swap) within this writer process (B10):
     /// SlateDB has no read-conditional-write primitive, but it is single-writer (manifest fencing),
     /// so the only concurrent CAS racers are tasks in THIS process. Holding this async mutex across
@@ -834,7 +843,8 @@ fn gc_options(dry_run: bool, min_age: Duration) -> slatedb::config::GarbageColle
 }
 
 /// ONLINE-SAFE garbage-collection pass — the reclaim the daemon runs on a schedule against its OWN
-/// live store (see [`SlateKv::run_online_gc`]). Unlike [`kv_gc`] it NEVER drops checkpoints and never
+/// live store (via the supervised [`KvStore::maintenance_gc`], which SlateKv overrides to call this
+/// on the writer). Unlike [`kv_gc`] it NEVER drops checkpoints and never
 /// compacts: it is exactly `slatedb::admin::Admin::run_gc_once` over the `manifest`/`wal`/`compacted`/
 /// `compactions` directories, each of which only LISTS and DELETES objects that the latest manifest
 /// no longer references (not the latest manifest, not any object pinned by an active checkpoint, and
@@ -971,7 +981,7 @@ impl SlateKv {
                 }
             }
         }
-        let db = match Db::builder(path.to_string(), store)
+        let db = match Db::builder(path.to_string(), store.clone())
             .with_settings(settings)
             .build()
             .await
@@ -979,14 +989,18 @@ impl SlateKv {
             Ok(db) => db,
             Err(err) => return Err(map_open_error(err)),
         };
-        Ok(Self::from_writer(db))
+        Ok(Self::from_writer(db, store, path.to_string()))
     }
 
     /// Wrap an opened SlateDB writer `Db` as a control-plane [`SlateKv`] (fresh CAS lock + a clean
     /// checkpoint dirty flag). The single writer-handle constructor, shared by every open path.
-    fn from_writer(db: Db) -> Self {
+    /// `store` + `root` are the SAME object store + path the `Db` was built over, retained so the
+    /// supervised [`maintenance_gc`](KvStore::maintenance_gc) can reclaim online without reopening.
+    fn from_writer(db: Db, store: Arc<dyn ObjectStore>, root: String) -> Self {
         Self {
             backend: Backend::Writer(Arc::new(db)),
+            store,
+            root,
             cas_lock: Arc::new(tokio::sync::Mutex::new(())),
             dirty: Arc::new(AtomicBool::new(false)),
         }
@@ -1075,7 +1089,7 @@ impl SlateKv {
                 tracing::info!(
                     "control-plane KV opened cleanly (self-heal armed; nothing to repair)"
                 );
-                return Ok(Self::from_writer(db));
+                return Ok(Self::from_writer(db, store, path.to_string()));
             }
             Err(err) => {
                 let raw = err.to_string();
@@ -1125,12 +1139,12 @@ impl SlateKv {
                                      acked loss (`.compactions` carries no committed data). Review with \
                                      `boatramp kv status`; `--ack` clears the breadcrumb."
                                 );
-                                let db = Db::builder(path.to_string(), store)
+                                let db = Db::builder(path.to_string(), store.clone())
                                     .with_settings(settings)
                                     .build()
                                     .await
                                     .map_err(map_open_error)?;
-                                return Ok(Self::from_writer(db));
+                                return Ok(Self::from_writer(db, store, path.to_string()));
                             }
                             Ok(crate::wal_repair::CompactionsRecovery::NotCorrupt) => {
                                 // Not the compactions shape either. Only proceed to the WAL-tail self-heal
@@ -1173,12 +1187,12 @@ impl SlateKv {
                              open). The torn manifest generation(s) were quarantined for forensics. \
                              Review with `boatramp kv status`; `--ack` clears the breadcrumb."
                         );
-                        let db = Db::builder(path.to_string(), store)
+                        let db = Db::builder(path.to_string(), store.clone())
                             .with_settings(settings)
                             .build()
                             .await
                             .map_err(map_open_error)?;
-                        return Ok(Self::from_writer(db));
+                        return Ok(Self::from_writer(db, store, path.to_string()));
                     }
                     Err(e) => {
                         // The manifest shape was detected but F2 REFUSED (no decodable generation, a WAL
@@ -1246,12 +1260,12 @@ impl SlateKv {
         }
 
         // 4. Open the serving writer over the now-clean store (the Apply's verify used a throwaway).
-        let db = Db::builder(path.to_string(), store)
+        let db = Db::builder(path.to_string(), store.clone())
             .with_settings(settings)
             .build()
             .await
             .map_err(map_open_error)?;
-        Ok(Self::from_writer(db))
+        Ok(Self::from_writer(db, store, path.to_string()))
     }
 
     /// Open a **read-only replica** over an `object_store` backend that some
@@ -1260,12 +1274,16 @@ impl SlateKv {
     /// writes error. Pair with the shared-mode changelog (`--shared-cache-
     /// coherence`) so a replica's config cache is invalidated on peer writes.
     pub async fn open_reader(store: Arc<dyn ObjectStore>, path: &str) -> Result<Self, KvError> {
-        let reader = DbReaderBuilder::new(path.to_string(), store)
+        let reader = DbReaderBuilder::new(path.to_string(), store.clone())
             .build()
             .await
             .map_err(backend)?;
         Ok(Self {
             backend: Backend::Reader(Arc::new(reader)),
+            // Retained for field-parity with the writer handle; a reader's `maintenance_gc` is a
+            // no-op (reclamation is the writer's job), so these are never used to delete here.
+            store,
+            root: path.to_string(),
             cas_lock: Arc::new(tokio::sync::Mutex::new(())),
             dirty: Arc::new(AtomicBool::new(false)),
         })
@@ -1404,6 +1422,56 @@ impl KvStore for SlateKv {
                 Ok(())
             }
             // A read replica has no memtable/frontier of its own (it polls the writer's manifest).
+            Backend::Reader(_) => Ok(()),
+        }
+    }
+
+    async fn maintenance_gc(&self, min_age: std::time::Duration) -> Result<(), KvError> {
+        // ONLY the single writer reclaims: SlateDB is single-writer (manifest fencing), and a read
+        // replica serves the writer's committed manifest/L0 — reclamation is exclusively the writer's
+        // job, so a reader is a no-op (never deletes from a store another process owns).
+        match &self.backend {
+            Backend::Writer(_) => {
+                // Measure the physical footprint before/after so each successful run reports the bytes
+                // reclaimed (the 16.5 GB-leak incident's missing "it's working" signal). Both reads are
+                // BEST-EFFORT: a stats error must never mask the reclaim result — the GC still ran.
+                let before = kv_physical_stats(&self.store, &self.root).await.ok();
+                // The reclaim itself — a plain online-safe `run_gc_once` (NO checkpoint-drop, NO
+                // compaction): exactly what the embedded GC does, so it is safe concurrent with this
+                // live writer and its readers. An error propagates so the supervised cadence task can
+                // log it and retry next tick (the loop must survive it — that IS the durable fix).
+                kv_gc_online(&self.store, &self.root, min_age).await?;
+                let after = kv_physical_stats(&self.store, &self.root).await.ok();
+                match (before, after) {
+                    (Some(before), Some(after)) => {
+                        let reclaimed = before.total_bytes.saturating_sub(after.total_bytes);
+                        let objects = before.total_objects.saturating_sub(after.total_objects);
+                        tracing::info!(
+                            target: "kv_maintenance_gc",
+                            reclaimed_bytes = reclaimed,
+                            reclaimed_objects = objects,
+                            total_bytes_after = after.total_bytes,
+                            total_objects_after = after.total_objects,
+                            min_age_s = min_age.as_secs(),
+                            "control-plane KV online maintenance GC ran: reclaimed {reclaimed} B \
+                             ({objects} objects); store now {} B across {} objects",
+                            after.total_bytes,
+                            after.total_objects,
+                        );
+                    }
+                    _ => {
+                        // Stats unavailable (e.g. a transient list error) — the GC still ran; report
+                        // that it ran rather than a byte count we could not measure.
+                        tracing::info!(
+                            target: "kv_maintenance_gc",
+                            min_age_s = min_age.as_secs(),
+                            "control-plane KV online maintenance GC ran (physical-stats unavailable; \
+                             reclaimed-bytes not measured this tick)"
+                        );
+                    }
+                }
+                Ok(())
+            }
             Backend::Reader(_) => Ok(()),
         }
     }
@@ -3646,6 +3714,73 @@ mod tests {
                 man_post.objects
             );
             KvStore::close(&kv).await.unwrap();
+        })
+        .await;
+    }
+
+    /// GATE (durable-fix WIRING — distinct from the reclaim gates above, which call [`kv_gc_online`]
+    /// DIRECTLY). This exercises the NEW seam the daemon actually uses: the
+    /// [`KvStore::maintenance_gc`] OVERRIDE on `SlateKv`, which must (a) be WRITER-GATED — a reader
+    /// replica is a no-op, never deleting from a store it does not own — and (b) reclaim via the
+    /// RETAINED `store` + `root` fields (a mis-wire there would pass every direct-primitive gate yet
+    /// break the daemon). The supervised loop calls exactly this method, so this proves the end-to-end
+    /// wiring. Anti-hollow: asserts the leak shape FIRST, then real manifest reclaim through the trait.
+    #[serial_test::serial]
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "on-disk GC; run unignored on the host toolchain"]
+    async fn maintenance_gc_override_is_writer_gated_and_reclaims_via_retained_store() {
+        with_fresh_slatedb_dir("maintenance-gc-override", |dir| async move {
+            // Compactor + GC OFF; raise the L0 caps so the per-round SSTs pile up without
+            // back-pressuring `put` (nothing drains L0 with the compactor off).
+            let mut settings = test_settings(Some(Duration::from_millis(5)));
+            settings.l0_max_ssts = 100_000;
+            settings.l0_max_ssts_per_key = 100_000;
+            let kv = SlateKv::open_local_settings(&dir, settings).await.unwrap();
+            for round in 0..20usize {
+                kv.put(&format!("current/site-{:03}", round % 8), vec![round as u8; 256])
+                    .await
+                    .unwrap();
+                kv.checkpoint().await.unwrap();
+            }
+
+            let store = fs_store(&dir);
+            let man_pre = manifest_dir(&store, "kv").await;
+            assert!(
+                man_pre.objects >= 12,
+                "expected accumulated manifests (the leak); got {man_pre:?}"
+            );
+
+            // (b) The WRITER's trait override reclaims — through the retained `self.store`/`self.root`,
+            // NOT a re-opened store or an externally-threaded object store. `Duration::ZERO` so the
+            // test's just-written objects are all eligible (there are no concurrent readers here).
+            KvStore::maintenance_gc(&kv, Duration::ZERO).await.unwrap();
+            let man_post = manifest_dir(&store, "kv").await;
+            assert!(
+                man_post.objects < man_pre.objects,
+                "the SlateKv maintenance_gc override must reclaim stale manifests via its retained \
+                 store+root: {} → {}",
+                man_pre.objects,
+                man_post.objects
+            );
+
+            // Live writer undisturbed — every key still resolves after the self-GC (lossless).
+            assert!(
+                kv.get("current/site-000").await.unwrap().is_some(),
+                "a live key must survive the writer's own maintenance GC"
+            );
+            KvStore::close(&kv).await.unwrap();
+
+            // (a) A READER replica's override is a NO-OP: it returns Ok and deletes nothing (the
+            // manifest count is unchanged by the reader call).
+            let reader = SlateKv::open_local_reader(&dir).await.unwrap();
+            let before = manifest_dir(&store, "kv").await;
+            KvStore::maintenance_gc(&reader, Duration::ZERO).await.unwrap();
+            let after = manifest_dir(&store, "kv").await;
+            assert_eq!(
+                after.objects, before.objects,
+                "a reader replica's maintenance_gc must be a no-op (reclamation is the writer's job)"
+            );
+            KvStore::close(&reader).await.unwrap();
         })
         .await;
     }
