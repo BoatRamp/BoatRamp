@@ -279,6 +279,9 @@ subtle.workspace = true
 # AES-256-GCM for the local-KEK secrets-at-rest envelope. Same provider the
 # mesh + rustls already use.
 aws-lc-rs = "1.17"
+# Argon2id KDF for the project-export identity transport container (passphrase ->
+# 32-byte AES key; the PKCS#12-pattern wrapper around the exported KEK).
+argon2.workspace = true
 # Implementing the core `DomainProbe` trait (domain ownership verification).
 async-trait.workspace = true
 
