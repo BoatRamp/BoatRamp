@@ -44,7 +44,7 @@ use boatramp_core::envelope::KeyEnvelope;
 use boatramp_core::kv::KvStore;
 use boatramp_core::project::ProjectRef;
 use boatramp_core::project_export::{
-    ImportOptions, ImportReport, ProjectExport, ProjectExportError,
+    ExportOptions, ImportOptions, ImportReport, ProjectExport, ProjectExportError,
 };
 use boatramp_core::sql::SqlValue;
 use boatramp_storage::sql_libsql::LibsqlSqlBackends;
@@ -56,7 +56,7 @@ use crate::pg_client::{
     pg_dump_invocation, pg_restore_invocation,
 };
 use crate::project_bundle::{
-    self, KV_MEMBER_PATH, MemberKind, PgMemberInfo, SourceInfo, StagedMember,
+    self, IDENTITY_MEMBER_PATH, KV_MEMBER_PATH, MemberKind, PgMemberInfo, SourceInfo, StagedMember,
 };
 
 type Perr = ProjectExportError;
@@ -252,6 +252,63 @@ fn fingerprint_rows(rows: &boatramp_core::sql::SqlRows) -> String {
 
 /// The node's [`ProjectExport`] implementation.
 ///
+/// What the identity export needs to know about the node's secrets envelope — a minimal,
+/// NON-secret projection of the node's `EnvelopeSpec` (never the Vault token). Set via
+/// [`with_identity_source`](NodeProjectExport::with_identity_source); absent ⇒
+/// `--include-identity` is refused (no local KEK to carry).
+#[derive(Debug, Clone)]
+pub enum IdentityEnvelope {
+    /// A local KEK file (raw 32 bytes) — the only kind whose KEK is transportable.
+    Local { kek_file: PathBuf },
+    /// A Vault/KMS-backed KEK — never extractable, so `--include-identity` is refused.
+    Vault,
+    /// No secrets envelope — nothing is sealed, nothing to carry.
+    None,
+}
+
+/// Magic for the identity payload carried INSIDE the transport container.
+const IDENTITY_PAYLOAD_MAGIC: &[u8; 6] = b"BRIDP1";
+
+/// Serialize the identity payload: currently just the raw KEK, framed
+/// `[magic][u8 version=1][u8 kek_len][kek]` — unambiguous and extensible (a future version
+/// may append on-disk sealed key files). The payload is sealed by the AEAD transport
+/// container, so this framing only needs to round-trip deterministically.
+fn identity_payload_bytes(kek: &[u8]) -> Result<Vec<u8>, Perr> {
+    if kek.len() > u8::MAX as usize {
+        return Err(Perr::Other("KEK too large for the identity payload".into()));
+    }
+    let mut v = Vec::with_capacity(IDENTITY_PAYLOAD_MAGIC.len() + 2 + kek.len());
+    v.extend_from_slice(IDENTITY_PAYLOAD_MAGIC);
+    v.push(1u8);
+    v.push(kek.len() as u8);
+    v.extend_from_slice(kek);
+    Ok(v)
+}
+
+/// Parse an [`identity_payload_bytes`] blob back to the raw KEK (import `--identity adopt`).
+// Wired by the import `--identity adopt` path (next step); kept with its serializer pair.
+#[allow(dead_code)]
+fn parse_identity_payload(bytes: &[u8]) -> Result<Vec<u8>, Perr> {
+    let rest = bytes
+        .strip_prefix(IDENTITY_PAYLOAD_MAGIC.as_slice())
+        .ok_or_else(|| Perr::Other("identity payload: bad magic".into()))?;
+    if rest.len() < 2 {
+        return Err(Perr::Other("identity payload: truncated header".into()));
+    }
+    if rest[0] != 1 {
+        return Err(Perr::Other(format!(
+            "identity payload: unsupported version {}",
+            rest[0]
+        )));
+    }
+    let kek_len = rest[1] as usize;
+    let kek = &rest[2..];
+    if kek.len() != kek_len {
+        return Err(Perr::Other("identity payload: KEK length mismatch".into()));
+    }
+    Ok(kek.to_vec())
+}
+
 /// Always constructible from the node's always-present deps (deploy + KV + blobs); the
 /// engine contexts attach optionally — [`with_managed_pg`](Self::with_managed_pg) for the
 /// pg/mysql ephemeral-dump path, [`with_libsql`](Self::with_libsql) for the embedded
@@ -280,6 +337,9 @@ pub struct NodeProjectExport {
     /// [`SystemEnv`](boatramp_core::env::SystemEnv); a test injects a map.
     env_source: Arc<dyn EnvSource>,
     published_endpoint: bool,
+    /// The secrets-envelope projection for `--include-identity` (local KEK path / Vault /
+    /// none). `None` ⇒ identity export is refused. Never holds a secret (no Vault token).
+    identity_source: Option<IdentityEnvelope>,
     work_dir: PathBuf,
     connect_timeout_secs: u32,
 }
@@ -306,6 +366,7 @@ impl NodeProjectExport {
             operator_sql: None,
             env_source: Arc::new(boatramp_core::env::SystemEnv),
             published_endpoint: true,
+            identity_source: None,
             work_dir,
             connect_timeout_secs: 10,
         }
@@ -345,6 +406,14 @@ impl NodeProjectExport {
     #[must_use]
     pub fn with_libsql(mut self, libsql: Arc<LibsqlSqlBackends>) -> Self {
         self.libsql = Some(libsql);
+        self
+    }
+
+    /// Attach the secrets-envelope projection so `--include-identity` can carry the project
+    /// KEK (local envelope only). Not called ⇒ `--include-identity` is refused.
+    #[must_use]
+    pub fn with_identity_source(mut self, source: IdentityEnvelope) -> Self {
+        self.identity_source = Some(source);
         self
     }
 
@@ -602,8 +671,21 @@ impl SqlEndpoint {
 
 #[async_trait]
 impl ProjectExport for NodeProjectExport {
-    async fn export(&self, project: &str, data_only: bool) -> Result<PathBuf, Perr> {
+    async fn export(&self, project: &str, opts: &ExportOptions) -> Result<PathBuf, Perr> {
         check_project_slug(project)?;
+        // A data-only bundle carries NO control-plane / identity material at all, so the
+        // two flags are mutually exclusive — refuse the contradiction rather than silently
+        // pick one.
+        if opts.data_only && opts.include_identity {
+            return Err(Perr::Other(
+                "--data-only and --include-identity are mutually exclusive: a data-only \
+                 bundle carries application data only (no control-plane KV, no identity)"
+                    .into(),
+            ));
+        }
+        // Bound once so the downstream uses (incl. the spawned bundle-write task) are a
+        // plain `Copy` of the flag, not a borrow of `opts`.
+        let data_only = opts.data_only;
         let created_at = now_secs();
         let session = self.work_dir.join(format!("export-{project}-{created_at}"));
         let stage = session.join("stage");
@@ -629,6 +711,56 @@ impl ProjectExport for NodeProjectExport {
                 source: kv_path,
                 pg: None,
             });
+        }
+
+        // --- identity transport container (`--include-identity` only) ---
+        // Carries the project KEK (passphrase-wrapped) so an `--identity adopt` recovery can
+        // unseal the KV slice's sealed secrets. Local envelope only: a Vault KEK can't be
+        // extracted, and `none` has nothing to carry.
+        if opts.include_identity {
+            let transport_key = opts
+                .transport_key
+                .as_deref()
+                .ok_or_else(|| Perr::Other("--include-identity requires a transport key".into()))?;
+            match self.identity_source.as_ref() {
+                Some(IdentityEnvelope::Local { kek_file }) => {
+                    let kek = tokio::fs::read(kek_file).await.map_err(|e| {
+                        Perr::Other(format!("reading KEK {}: {e}", kek_file.display()))
+                    })?;
+                    let payload = identity_payload_bytes(&kek)?;
+                    let container =
+                        boatramp_server::envelope::transport_wrap(&payload, transport_key)
+                            .map_err(|e| {
+                                Perr::Other(format!("wrapping the identity container: {e}"))
+                            })?;
+                    let id_path = stage.join("identity.brid");
+                    tokio::fs::write(&id_path, &container)
+                        .await
+                        .map_err(other)?;
+                    staged.push(StagedMember {
+                        path: IDENTITY_MEMBER_PATH.to_string(),
+                        kind: MemberKind::Identity,
+                        source: id_path,
+                        pg: None,
+                    });
+                }
+                Some(IdentityEnvelope::Vault) => {
+                    return Err(Perr::Other(
+                        "--include-identity is not supported for a Vault KEK: the key never \
+                         leaves the KMS and cannot be bundled. For a faithful recovery, point \
+                         the target node's [secrets.vault] at the same key; otherwise use \
+                         --identity fresh."
+                            .into(),
+                    ));
+                }
+                Some(IdentityEnvelope::None) | None => {
+                    return Err(Perr::Other(
+                        "--include-identity requires a local KEK envelope \
+                         ([secrets].envelope = \"local\"); none is configured on this node"
+                            .into(),
+                    ));
+                }
+            }
         }
 
         // --- per-engine dumps (pg + mysql; managed OR external bring-your-own-URL) ---
@@ -1137,7 +1269,16 @@ mod tests {
         let drv = NodeProjectExport::new(BTreeMap::new(), deploy, kv.clone(), blobs.clone(), work);
 
         // FULL export carries the control-plane KV slice...
-        let full = drv.export("acme", false).await.expect("full export");
+        let full = drv
+            .export(
+                "acme",
+                &ExportOptions {
+                    data_only: false,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("full export");
         let mf = project_bundle::read_manifest(&full).expect("read full manifest");
         assert!(!mf.data_only, "full manifest is not data-only");
         assert!(
@@ -1146,12 +1287,149 @@ mod tests {
         );
 
         // ...a data-only export must NOT (the Ask-4(a) safety invariant).
-        let donly = drv.export("acme", true).await.expect("data-only export");
+        let donly = drv
+            .export(
+                "acme",
+                &ExportOptions {
+                    data_only: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("data-only export");
         let md = project_bundle::read_manifest(&donly).expect("read data-only manifest");
         assert!(md.data_only, "data-only manifest flags data_only");
         assert!(
             !md.members.iter().any(|m| m.kind == MemberKind::Kv),
             "a data-only bundle must NOT carry the control-plane KV slice (Ask-4a leak)"
+        );
+    }
+
+    /// Driver-level (in-process): `--include-identity` wraps the KEK into an Identity member
+    /// that round-trips under the transport key, and the refusals hold (data-only+identity,
+    /// no transport key, a Vault source). Default export carries NO identity member. The
+    /// Ask-4(d) gate: identity is excluded by default and only present under the flag.
+    #[tokio::test]
+    async fn include_identity_wraps_the_kek_and_refusals_hold() {
+        use boatramp_core::Storage;
+        use boatramp_core::deploy::DeployStore;
+        use boatramp_core::kv::{KvStore, MemoryKv};
+        use boatramp_storage::fs::FsStorage;
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let kek = [0x5Au8; 32];
+        let kek_file = tmp.path().join("kek");
+        std::fs::write(&kek_file, kek).unwrap();
+
+        let mk = |suffix: &str, src: Option<IdentityEnvelope>| {
+            let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+            let blobs: Arc<dyn Storage> =
+                Arc::new(FsStorage::new(tmp.path().join(format!("b{suffix}"))));
+            let deploy = DeployStore::new(blobs.clone(), kv.clone());
+            let work = tmp.path().join(format!("w{suffix}"));
+            std::fs::create_dir_all(&work).unwrap();
+            let mut d = NodeProjectExport::new(BTreeMap::new(), deploy, kv, blobs, work);
+            if let Some(s) = src {
+                d = d.with_identity_source(s);
+            }
+            d
+        };
+
+        let pass = b"operator-transport-passphrase".to_vec();
+        let drv = mk(
+            "local",
+            Some(IdentityEnvelope::Local {
+                kek_file: kek_file.clone(),
+            }),
+        );
+
+        // include-identity (full) → an Identity member that unwraps to the exact KEK.
+        let bundle = drv
+            .export(
+                "acme",
+                &ExportOptions {
+                    data_only: false,
+                    include_identity: true,
+                    transport_key: Some(pass.clone()),
+                },
+            )
+            .await
+            .expect("include-identity export");
+        let extract = tmp.path().join("ex-id");
+        let manifest = project_bundle::extract_and_verify(&bundle, &extract).expect("extract");
+        let idm = manifest
+            .members
+            .iter()
+            .find(|m| m.kind == MemberKind::Identity)
+            .expect("identity member present");
+        let container = std::fs::read(extract.join(&idm.path)).unwrap();
+        let payload =
+            boatramp_server::envelope::transport_unwrap(&container, &pass).expect("unwrap");
+        assert_eq!(
+            parse_identity_payload(&payload).unwrap(),
+            kek,
+            "the wrapped KEK round-trips"
+        );
+        assert!(
+            boatramp_server::envelope::transport_unwrap(&container, b"wrong").is_err(),
+            "wrong transport key cannot open the container"
+        );
+
+        // Default export → NO identity member.
+        let plain = drv
+            .export("acme", &ExportOptions::default())
+            .await
+            .expect("default export");
+        let ex2 = tmp.path().join("ex-plain");
+        let m2 = project_bundle::extract_and_verify(&plain, &ex2).unwrap();
+        assert!(
+            !m2.members.iter().any(|m| m.kind == MemberKind::Identity),
+            "default bundle carries no identity member"
+        );
+
+        // Refusals: data-only+identity, missing transport key, and a Vault source.
+        assert!(
+            drv.export(
+                "acme",
+                &ExportOptions {
+                    data_only: true,
+                    include_identity: true,
+                    transport_key: Some(pass.clone()),
+                },
+            )
+            .await
+            .is_err(),
+            "data-only + include-identity is refused"
+        );
+        assert!(
+            drv.export(
+                "acme",
+                &ExportOptions {
+                    data_only: false,
+                    include_identity: true,
+                    transport_key: None,
+                },
+            )
+            .await
+            .is_err(),
+            "include-identity without a transport key is refused"
+        );
+        let vault = mk("vault", Some(IdentityEnvelope::Vault));
+        assert!(
+            vault
+                .export(
+                    "acme",
+                    &ExportOptions {
+                        data_only: false,
+                        include_identity: true,
+                        transport_key: Some(pass.clone()),
+                    },
+                )
+                .await
+                .is_err(),
+            "include-identity on a Vault envelope is refused"
         );
     }
 
