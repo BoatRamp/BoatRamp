@@ -3727,7 +3727,7 @@ mod tests {
     /// DIRECTLY). This exercises the NEW seam the daemon actually uses: the
     /// [`KvStore::maintenance_gc`] OVERRIDE on `SlateKv`, which must (a) be WRITER-GATED — a reader
     /// replica is a no-op, never deleting from a store it does not own — and (b) reclaim via the
-    /// RETAINED `store` + `root` fields (a mis-wire there would pass every direct-primitive gate yet
+    /// RETAINED `store` + `root` fields (a wiring bug there would pass every direct-primitive gate yet
     /// break the daemon). The supervised loop calls exactly this method, so this proves the end-to-end
     /// wiring. Anti-hollow: asserts the leak shape FIRST, then real manifest reclaim through the trait.
     #[serial_test::serial]
