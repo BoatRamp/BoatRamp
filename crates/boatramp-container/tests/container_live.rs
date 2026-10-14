@@ -556,3 +556,107 @@ async fn container_exec_runs_command_and_round_trips_stdin() {
     let _ = std::fs::remove_dir_all(&data_dir);
     eprintln!("container exec OK: echo captured + stdin round-tripped");
 }
+
+/// **One-shot `run_ephemeral`** (the native project-export/import engine): with NO
+/// persisted workload, pull a small OCI image daemonless (the DEFAULT on-demand path —
+/// `stage_image`), launch a hardened one-shot jail on it with veth egress, and prove the
+/// three load-bearing properties of the ephemeral contract:
+///   (A) **stdout streams out** + the exit code is captured — `sh -c 'echo hi'` → the
+///       sink receives `hi` and the code is 0;
+///   (B) **stdin streams in** over the dedicated pipe — `cat` echoes a payload we feed it
+///       back on stdout (the restore direction, decoupled from the handshake fd);
+///   (C) a **non-zero exit is a legitimate code**, returned as `Ok(code)` not an error —
+///       `sh -c 'exit 7'` → `Ok(7)`.
+///
+/// Mirrors the co-located-Postgres seam: needs Linux + root + a bridge (for the veth
+/// netns wiring, exercised even though `echo`/`cat` need no DB), and network to pull the
+/// image. Ignored by default; skips (passes) when `BOATRAMP_BIN` is absent. Uses a small
+/// busybox image by default (override with `CONTAINER_EPHEMERAL_IMAGE`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs Linux + root + a bridge (privileged live seam); pulls a small OCI image"]
+async fn container_live_run_ephemeral() {
+    let Some(bin) = std::env::var_os("BOATRAMP_BIN") else {
+        eprintln!("container_live_run_ephemeral: set BOATRAMP_BIN to run");
+        return;
+    };
+    let bridge = std::env::var("CONTAINER_BRIDGE").unwrap_or_else(|_| "br-boatramp".into());
+    let subnet = std::env::var("CONTAINER_SUBNET").unwrap_or_else(|_| "10.0.0.0/24".into());
+    let image =
+        std::env::var("CONTAINER_EPHEMERAL_IMAGE").unwrap_or_else(|_| "busybox:latest".into());
+    let data_dir = std::env::temp_dir().join(format!("boatramp-cephm-{}", std::process::id()));
+    let backend = ContainerBackend::new(
+        // Storage is unused for the DEFAULT image path (the pull is over HTTP).
+        Arc::new(FileBlob(Vec::new())),
+        data_dir.clone(),
+        bridge,
+        &subnet,
+        PathBuf::from(bin),
+    )
+    .expect("backend");
+
+    // (A) Streamed stdout + exit code: `sh -c 'echo hi'`.
+    let mut sink = futures::io::Cursor::new(Vec::<u8>::new());
+    let code = backend
+        .run_ephemeral(
+            &image,
+            &[
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "echo hi".to_string(),
+            ],
+            &[],
+            None,
+            &mut sink,
+        )
+        .await
+        .expect("run_ephemeral echo");
+    let out = String::from_utf8_lossy(sink.get_ref()).trim().to_string();
+    eprintln!("run_ephemeral echo: code={code} stdout={out:?}");
+    assert_eq!(code, 0, "echo exits 0");
+    assert_eq!(
+        out, "hi",
+        "the client's stdout must stream back to the sink"
+    );
+
+    // (B) Streamed stdin (the restore direction): `cat` echoes the fed payload.
+    let payload = b"boatramp-ephemeral-stdin-roundtrip".to_vec();
+    let mut reader = futures::io::Cursor::new(payload.clone());
+    let mut sink = futures::io::Cursor::new(Vec::<u8>::new());
+    let code = backend
+        .run_ephemeral(
+            &image,
+            &["/bin/cat".to_string()],
+            &[],
+            Some(&mut reader),
+            &mut sink,
+        )
+        .await
+        .expect("run_ephemeral cat");
+    assert_eq!(code, 0, "cat exits 0");
+    assert_eq!(
+        sink.get_ref(),
+        &payload,
+        "cat must echo the STREAMED stdin back on stdout (restore path)"
+    );
+
+    // (C) A non-zero exit is a legitimate code (returned as Ok), not an error.
+    let mut sink = futures::io::Cursor::new(Vec::<u8>::new());
+    let code = backend
+        .run_ephemeral(
+            &image,
+            &[
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "exit 7".to_string(),
+            ],
+            &[],
+            None,
+            &mut sink,
+        )
+        .await
+        .expect("run_ephemeral exit-7 returns Ok(code), not Err");
+    assert_eq!(code, 7, "a non-zero client exit is returned as Ok(7)");
+
+    let _ = std::fs::remove_dir_all(&data_dir);
+    eprintln!("native run_ephemeral OK: streamed stdout + stdin round-trip + non-zero exit code");
+}

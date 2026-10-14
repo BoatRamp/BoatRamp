@@ -274,6 +274,10 @@ pub async fn build_compute(
                         Some(a) => c.with_ip_authority(a.clone()),
                         None => c,
                     };
+                    // Air-gap override for project export/import's `run_ephemeral`: map
+                    // specific client images to a PRELOADED rootfs (no registry pull).
+                    // Empty (default) keeps the on-demand OCI pull+build path.
+                    let c = c.with_client_image_rootfs(cfg.client_image_rootfs.clone());
                     backends.insert("container".to_string(), std::sync::Arc::new(c));
                 }
                 Err(e) => tracing::warn!(%e, "container backend unavailable"),

@@ -10,7 +10,7 @@
 //! the actual jail + boot is the Linux seam (`container_live`).
 
 use std::net::Ipv4Addr;
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, RawFd};
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -352,6 +352,25 @@ impl IpLifecycle {
         self.release_if_last(ip);
         Some(ip)
     }
+
+    /// Allocate a **transient** address for a one-shot ephemeral container (an
+    /// export/import client), WITHOUT recording it in the `(project,workload,replica)`
+    /// ownership map: an ephemeral run is not a persisted replica, so it is never adopted
+    /// at boot nor reclaimed by the A2 GC — [`release_ephemeral`](Self::release_ephemeral)
+    /// returns it the moment the run ends. Drawn from the SAME shared authority as every
+    /// replica, so it can never collide with a live workload's address while it is held.
+    fn allocate_ephemeral(&mut self) -> Result<Ipv4Addr, BackendError> {
+        self.authority
+            .allocate()
+            .map_err(|e| BackendError::Launch(e.to_string()))
+    }
+
+    /// Return a transient ephemeral address to the shared pool. Unconditional (an
+    /// ephemeral address is never shared with a tracked replica, so the last-user rule
+    /// does not apply) and idempotent.
+    fn release_ephemeral(&mut self, ip: Ipv4Addr) {
+        self.authority.release(ip);
+    }
 }
 
 /// The native container backend: rootfs staging + per-node IPAM + veth wiring,
@@ -392,6 +411,22 @@ pub struct ContainerBackend {
     /// (internal DNS on); `None` ⇒ leave the image's resolv.conf (feature off). Set by
     /// [`Self::with_internal_dns`] from `compute.internal_dns` / `compute.dns_domain`.
     internal_dns_domain: Option<String>,
+    /// **Air-gap override** for the one-shot [`run_ephemeral`](ComputeBackend::run_ephemeral)
+    /// client image → a **preloaded rootfs**, so an export/import can run with NO registry
+    /// pull. Keyed by the exact client image reference the driver asks for (e.g.
+    /// `pgvector/pgvector:pg16`); the value is either an **absolute host path** to an
+    /// already-unpacked rootfs directory (used verbatim, never pulled), or a **Storage
+    /// blob hash** of a rootfs tar the backend stages the same way `materialize` stages a
+    /// `RootSource::Tar` (`stage_rootfs`). Empty (the default) ⇒ every client image is
+    /// resolved by the on-demand OCI pull+build path (`stage_image`). Set by
+    /// [`Self::with_client_image_rootfs`] from the `[compute] client_image_rootfs` config.
+    client_image_rootfs: std::collections::BTreeMap<String, String>,
+    /// Wall-clock backstop for a single [`run_ephemeral`](ComputeBackend::run_ephemeral)
+    /// invocation (one export/import client run). Generous by default
+    /// ([`EPHEMERAL_RUN_TIMEOUT`]); an operator raises it for a very large migration so the
+    /// backstop never kills legitimate work (the real unreachable-DSN hang is bounded far
+    /// tighter by the client's own connect timeout). Set by [`Self::with_ephemeral_timeout`].
+    ephemeral_timeout: Duration,
 }
 
 impl ContainerBackend {
@@ -425,6 +460,8 @@ impl ContainerBackend {
             cap_add_allowed: false,
             userns_base: crate::worker::USERNS_HOST_BASE,
             internal_dns_domain: None,
+            client_image_rootfs: std::collections::BTreeMap::new(),
+            ephemeral_timeout: EPHEMERAL_RUN_TIMEOUT,
         })
     }
 
@@ -435,6 +472,29 @@ impl ContainerBackend {
     /// internal resolver is active.
     pub fn with_internal_dns(mut self, domain: Option<String>) -> Self {
         self.internal_dns_domain = domain;
+        self
+    }
+
+    /// Supply the **air-gap** map of export/import client image reference → a preloaded
+    /// rootfs (an absolute unpacked-rootfs path, or a Storage blob hash of a rootfs tar),
+    /// so [`run_ephemeral`](ComputeBackend::run_ephemeral) resolves those images with no
+    /// registry pull. Empty (the default) keeps the on-demand OCI pull+build path. Wired
+    /// from `[compute] client_image_rootfs`. See [`Self::client_image_rootfs`].
+    pub fn with_client_image_rootfs(
+        mut self,
+        map: std::collections::BTreeMap<String, String>,
+    ) -> Self {
+        self.client_image_rootfs = map;
+        self
+    }
+
+    /// Set the wall-clock backstop for a single `run_ephemeral` invocation (0 ⇒ keep the
+    /// generous built-in default [`EPHEMERAL_RUN_TIMEOUT`]). Mirrors the docker backend's
+    /// `with_ephemeral_timeout`.
+    pub fn with_ephemeral_timeout(mut self, timeout: Duration) -> Self {
+        if !timeout.is_zero() {
+            self.ephemeral_timeout = timeout;
+        }
         self
     }
 
@@ -971,6 +1031,47 @@ impl ComputeBackend for ContainerBackend {
         .map_err(|e| BackendError::Other(format!("exec: join: {e}")))?
     }
 
+    /// Run a **one-shot ephemeral client container** from `image` (no persisted
+    /// workload, no replica identity) — the native-backend engine for project
+    /// export/import. Resolves the client image to a rootfs (an on-demand OCI pull by
+    /// default; a preloaded air-gap rootfs when `image` is in
+    /// [`client_image_rootfs`](Self::client_image_rootfs)), launches a **hardened
+    /// one-shot** jail on it running `argv` with `env` and veth egress to reach the
+    /// database, **streams** `stdin` in and stdout out (never buffering — a multi-GB
+    /// `pg_dump`/`pg_restore` flows with bounded memory), captures the exit code
+    /// (non-zero is a legitimate code, returned as `Ok(code)`), and tears the container
+    /// down on every path. See the trait contract on
+    /// [`ComputeBackend::run_ephemeral`](boatramp_core::compute::ComputeBackend::run_ephemeral).
+    async fn run_ephemeral(
+        &self,
+        image: &str,
+        argv: &[String],
+        env: &[(String, String)],
+        stdin: Option<&mut (dyn futures::io::AsyncRead + Send + Unpin)>,
+        stdout: &mut (dyn futures::io::AsyncWrite + Send + Unpin),
+    ) -> Result<i32, BackendError> {
+        if argv.is_empty() {
+            return Err(BackendError::Other("run_ephemeral: empty argv".into()));
+        }
+        // Resolve the client image to an unpacked rootfs (air-gap map, else OCI pull).
+        let rootfs = self.resolve_client_rootfs(image).await?;
+        let rootfs = rootfs.display().to_string();
+
+        // A unique id (cgroup / veth / hostname / log stem) + a transient IP drawn from
+        // the SAME shared pool as every replica, so it can't collide with a live workload.
+        let id = ephemeral_container_id();
+        let ip = self.ipam.lock().expect("ipam mutex").allocate_ephemeral()?;
+
+        // Run the one-shot; GUARANTEE teardown (veth + cgroup + IP) on every path — a
+        // leaked ephemeral container (or a wedged run against an unreachable DSN) must
+        // never hold a veth, a cgroup, or a pool address.
+        let outcome = self
+            .run_ephemeral_inner(&id, &rootfs, ip, image, argv, env, stdin, stdout)
+            .await;
+        self.ephemeral_teardown(&id, ip).await;
+        outcome
+    }
+
     /// List the persistent volumes this node backs: the directories under
     /// `<data_dir>/compute/volumes/`, each with its recursive on-disk size. Keyed
     /// by volume name (not VM), so this is the same directory `stage_volumes`
@@ -1271,6 +1372,328 @@ impl ContainerBackend {
                 port,
             },
         })
+    }
+
+    /// Resolve a [`run_ephemeral`](ComputeBackend::run_ephemeral) client `image` to an
+    /// unpacked rootfs directory the worker can `pivot_root` into.
+    ///
+    /// Air-gap first: if `image` is in [`client_image_rootfs`](Self::client_image_rootfs),
+    /// use the preloaded rootfs and DO NOT pull — an absolute path is an already-unpacked
+    /// rootfs directory (used verbatim), anything else is a Storage blob hash of a rootfs
+    /// tar staged exactly like a `RootSource::Tar` ([`stage_rootfs`](Self::stage_rootfs)).
+    /// Otherwise the default: pull the OCI image + overlay its layers on demand
+    /// ([`stage_image`](Self::stage_image), the same path `materialize` uses).
+    async fn resolve_client_rootfs(&self, image: &str) -> Result<PathBuf, BackendError> {
+        if let Some(preloaded) = self.client_image_rootfs.get(image) {
+            let p = Path::new(preloaded);
+            if p.is_absolute() {
+                // A preloaded, already-unpacked rootfs directory — used as-is, never pulled.
+                if tokio::fs::try_exists(p).await.unwrap_or(false) {
+                    return Ok(p.to_path_buf());
+                }
+                return Err(BackendError::Materialize(format!(
+                    "air-gap client rootfs for {image:?} not found at {preloaded}"
+                )));
+            }
+            // A Storage blob hash of a rootfs tar — staged like a RootSource::Tar.
+            return self.stage_rootfs(preloaded).await;
+        }
+        // Default: daemonless OCI pull + layer overlay, cached + idempotent.
+        self.stage_image(image).await
+    }
+
+    /// The one-shot body: build the hardened sandbox plan, (optionally) set up the
+    /// dedicated stdin pipe, wire the host veth, spawn + hand off to the `__sandbox`
+    /// worker over the netns handshake, then stream stdin↔stdout and capture the exit
+    /// code, all bounded by [`ephemeral_timeout`](Self::ephemeral_timeout). The caller
+    /// ([`run_ephemeral`](ComputeBackend::run_ephemeral)) owns teardown on every path.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_ephemeral_inner(
+        &self,
+        id: &str,
+        rootfs: &str,
+        ip: Ipv4Addr,
+        image: &str,
+        argv: &[String],
+        env: &[(String, String)],
+        mut stdin: Option<&mut (dyn futures::io::AsyncRead + Send + Unpin)>,
+        stdout: &mut (dyn futures::io::AsyncWrite + Send + Unpin),
+    ) -> Result<i32, BackendError> {
+        use futures::io::AsyncReadExt as FuturesReadExt;
+        use futures::io::AsyncWriteExt as FuturesWriteExt;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::process::ExitStatusExt;
+        use tokio::io::AsyncReadExt as TokioReadExt;
+
+        // --- The hardened one-shot sandbox plan. ---
+        // A minimal synthetic spec feeds `SandboxPlan::for_spec`, so the one-shot inherits
+        // the SAME hardened baseline as a launched workload: the pivoted (shared, never
+        // mutated) rootfs, `/proc`·`/sys` ro, `/tmp`·`/run`·`/dev` tmpfs, cgroup cpu/mem/PID
+        // caps, the default-deny seccomp allow-list, and the rootless user namespace. The
+        // client runs as namespace-root (`0 → host base`) with EVERY capability dropped
+        // (`cap_add` is left empty regardless of posture — a dump/restore client never
+        // needs a privileged entrypoint), and NO persistent volume.
+        let spec = ComputeSpec {
+            version: 1,
+            root: RootSource::Image(image.to_string()),
+            kernel: String::new(),
+            kernel_cmdline: None,
+            vcpus: 1,
+            mem_mib: EPHEMERAL_MEM_MIB,
+            entrypoint: argv.to_vec(),
+            env: env.iter().cloned().collect(),
+            port: 0,
+            restart: boatramp_core::compute::RestartPolicy::Never,
+            startup_grace_secs: 0,
+            scale_to_zero: false,
+            volumes: Vec::new(),
+            writable_root: false,
+            cap_add: Vec::new(),
+            user: None,
+            isolation: boatramp_core::compute::IsolationRequirement::Trusted,
+            prefer_backend: None,
+            bindings: Vec::new(),
+        };
+        let mut plan = SandboxPlan::for_spec(&spec, rootfs, id, GUEST_UID, GUEST_GID);
+        // Read-only rootfs: a one-shot client never writes its rootfs (dumps stream to
+        // stdout, scratch to the writable `/tmp`·`/run` tmpfs), and it pivots into the
+        // SHARED cached staged image — so a read-only root keeps a buggy/hostile client
+        // from mutating that cache. Matches the docker backend's `readonly_rootfs`.
+        plan.readonly_root = true;
+        // Point the client at the internal resolver on the bridge gateway when enabled, so
+        // an external DSN hostname resolves (the resolver forwards external queries). A
+        // one-shot has no project scope, so the empty project drops the `search` line and
+        // keeps only the gateway `nameserver` (see `resolvconf::render`). `None` ⇒ leave
+        // whatever the client image shipped.
+        if let Some(domain) = &self.internal_dns_domain {
+            plan.resolv_conf = Some(crate::resolvconf::render(self.gateway, "", domain));
+        }
+
+        // --- Dedicated stdin pipe (only when the caller streams a payload). ---
+        // The worker inherits the READ end (non-CLOEXEC) and `dup2`s it onto the guest's
+        // fd 0 (`SandboxPlan::exec_stdin_fd`), so the payload channel is fully decoupled
+        // from the launcher↔worker handshake on the worker's own fd 0/1 — a multi-GB
+        // restore can never race the worker's buffered `read_line("go")` and lose bytes.
+        // The WRITE end is CLOEXEC so the worker never inherits it; dropping it (the sole
+        // writer) is what gives the guest's stdin a clean EOF.
+        let mut stdin_writer: Option<tokio::net::unix::pipe::Sender> = None;
+        let read_end_guard;
+        if stdin.is_some() {
+            let (read_end, write_end) = nix::unistd::pipe()
+                .map_err(|e| BackendError::Other(format!("ephemeral stdin pipe: {e}")))?;
+            set_cloexec(write_end.as_raw_fd())
+                .map_err(|e| BackendError::Other(format!("ephemeral stdin pipe cloexec: {e}")))?;
+            plan.exec_stdin_fd = Some(read_end.as_raw_fd());
+            stdin_writer = Some(
+                tokio::net::unix::pipe::Sender::from_owned_fd(write_end)
+                    .map_err(|e| BackendError::Other(format!("ephemeral stdin sender: {e}")))?,
+            );
+            // Keep the read end alive across the spawn below so the worker inherits it.
+            read_end_guard = Some(read_end);
+        } else {
+            read_end_guard = None;
+        }
+
+        // --- Host veth + worker spawn + netns handshake (mirrors `launch_inner`). ---
+        let veth = VethNetwork::for_vm(id, &self.bridge);
+        veth.host_setup()
+            .await
+            .map_err(|e| BackendError::Launch(format!("veth host setup: {e}")))?;
+
+        let mut child = tokio::process::Command::new(&self.self_exe)
+            .arg("__sandbox")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| BackendError::Launch(format!("spawn worker: {e}")))?;
+        // The worker has forked and inherited the stdin-pipe read end; release the
+        // launcher's own copy so the guest's stdin sees EOF once we drop the write end.
+        drop(read_end_guard);
+
+        let pid = child
+            .id()
+            .ok_or_else(|| BackendError::Launch("worker has no pid".into()))?;
+        let mut cstdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| BackendError::Launch("worker stdin".into()))?;
+        let mut cstdout = BufReader::new(
+            child
+                .stdout
+                .take()
+                .ok_or_else(|| BackendError::Launch("worker stdout".into()))?,
+        );
+        let mut cstderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| BackendError::Launch("worker stderr".into()))?;
+
+        // Send the plan (line 1) and wait for the worker to signal it has unshared.
+        let plan_json =
+            serde_json::to_string(&plan).map_err(|e| BackendError::Launch(e.to_string()))?;
+        cstdin
+            .write_all(format!("{plan_json}\n").as_bytes())
+            .await
+            .map_err(|e| BackendError::Launch(format!("send plan: {e}")))?;
+        let mut ready = String::new();
+        cstdout
+            .read_line(&mut ready)
+            .await
+            .map_err(|e| BackendError::Launch(format!("await ready: {e}")))?;
+        if ready.trim() != "ready" {
+            // The worker died in `prepare` before signaling ready; surface its stderr.
+            let mut why = String::new();
+            let _ = cstderr.read_to_string(&mut why).await;
+            let _ = veth.teardown().await;
+            return Err(BackendError::Launch(format!(
+                "worker did not signal ready (got {ready:?}); worker stderr:\n{}",
+                why.trim_end()
+            )));
+        }
+
+        // Write the userns id maps + move the veth peer into the worker's netns +
+        // configure eth0/lo there — identical to the launch path: the client needs egress
+        // to reach the database (an external DSN, or a co-located DB's bridge IP).
+        if plan.namespaces.user {
+            write_userns_maps(pid, self.userns_base)
+                .map_err(|e| BackendError::Launch(format!("write userns maps: {e}")))?;
+        }
+        veth.move_peer_into_netns(pid)
+            .await
+            .map_err(|e| BackendError::Launch(format!("move veth peer: {e}")))?;
+        configure_in_netns(pid, &veth.peer_veth, ip, self.prefix, self.gateway)
+            .map_err(|e| BackendError::Launch(format!("netns config: {e}")))?;
+
+        // Networking ready — release the worker to jail + exec the client.
+        cstdin
+            .write_all(b"go\n")
+            .await
+            .map_err(|e| BackendError::Launch(format!("signal go: {e}")))?;
+        cstdin
+            .flush()
+            .await
+            .map_err(|e| BackendError::Launch(format!("flush go: {e}")))?;
+        // The handshake is done with the worker's own stdin; the guest's real stdin is the
+        // dedicated pipe (or EOF when none). Dropping it EOFs the worker monitor's fd 0.
+        drop(cstdin);
+
+        // --- Stream stdin in, stdout out, drain stderr, await the exit code — all
+        //     concurrently, bounded by the backstop timeout. Feeding stdin alongside the
+        //     stdout drain avoids a full-pipe deadlock on a large piped restore. ---
+        let mut stderr_tail: Vec<u8> = Vec::new();
+        let run = async {
+            // (a) STREAM the restore payload in (never buffered), then EOF.
+            let writer = async {
+                if let Some(reader) = stdin.as_mut() {
+                    use tokio::io::AsyncWriteExt as TokioWriteExt;
+                    let sender = stdin_writer
+                        .as_mut()
+                        .expect("stdin sender present when stdin is");
+                    let mut buf = [0u8; 64 * 1024];
+                    loop {
+                        let n = reader.read(&mut buf).await.map_err(|e| {
+                            BackendError::Other(format!("ephemeral stdin read: {e}"))
+                        })?;
+                        if n == 0 {
+                            break;
+                        }
+                        sender.write_all(&buf[..n]).await.map_err(|e| {
+                            BackendError::Other(format!("ephemeral stdin write: {e}"))
+                        })?;
+                    }
+                }
+                // Drop the write end → the guest's stdin sees EOF.
+                stdin_writer.take();
+                Ok::<(), BackendError>(())
+            };
+            // (b) TRUE-stream the client's stdout straight to the sink (never buffered).
+            let reader =
+                async {
+                    let mut buf = [0u8; 64 * 1024];
+                    loop {
+                        let n = cstdout.read(&mut buf).await.map_err(|e| {
+                            BackendError::Other(format!("ephemeral stdout read: {e}"))
+                        })?;
+                        if n == 0 {
+                            break;
+                        }
+                        stdout.write_all(&buf[..n]).await.map_err(|e| {
+                            BackendError::Other(format!("ephemeral sink write: {e}"))
+                        })?;
+                    }
+                    stdout
+                        .flush()
+                        .await
+                        .map_err(|e| BackendError::Other(format!("ephemeral sink flush: {e}")))?;
+                    Ok::<(), BackendError>(())
+                };
+            // (c) Capture a bounded stderr tail for diagnostics only (best-effort).
+            let stderr_drain = async {
+                let mut buf = [0u8; 8192];
+                while let Ok(n) = cstderr.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                    if stderr_tail.len() < EPHEMERAL_STDERR_CAP {
+                        let take = (EPHEMERAL_STDERR_CAP - stderr_tail.len()).min(n);
+                        stderr_tail.extend_from_slice(&buf[..take]);
+                    }
+                }
+            };
+            // (d) The worker monitor exits with the guest's code; a signal → 128+signal.
+            let waiter = async {
+                let status = child
+                    .wait()
+                    .await
+                    .map_err(|e| BackendError::Other(format!("ephemeral wait: {e}")))?;
+                Ok::<i32, BackendError>(
+                    status
+                        .code()
+                        .unwrap_or_else(|| 128 + status.signal().unwrap_or(0)),
+                )
+            };
+            let (w, r, _e, code) = tokio::join!(writer, reader, stderr_drain, waiter);
+            w?;
+            r?;
+            code
+        };
+
+        let outcome = tokio::time::timeout(self.ephemeral_timeout, run).await;
+
+        match outcome {
+            Ok(Ok(code)) => Ok(code),
+            Ok(Err(e)) if stderr_tail.is_empty() => Err(e),
+            Ok(Err(e)) => {
+                // A bounded stderr tail aids diagnosis. The credential rode in `env`, never
+                // a string, so it cannot reach here — but run the tail through the DSN
+                // redactor anyway (defense-in-depth) in case a client tool ever echoed one.
+                let tail =
+                    boatramp_core::redact::redact_dsn(&String::from_utf8_lossy(&stderr_tail));
+                Err(BackendError::Other(format!("{e}; stderr: {tail}")))
+            }
+            Err(_) => {
+                // Timed out: kill the worker monitor now (the cgroup.kill in teardown reaps
+                // the jailed tree). The borrow of `child` ended when `run` was dropped.
+                let _ = child.start_kill();
+                Err(BackendError::Other(format!(
+                    "ephemeral run timed out after {}s (killed)",
+                    self.ephemeral_timeout.as_secs()
+                )))
+            }
+        }
+    }
+
+    /// Tear down a one-shot ephemeral container: kill its cgroup's process tree + remove
+    /// the cgroup (as [`stop`](ComputeBackend::stop) does), tear down the veth, and
+    /// release its transient IP. Best-effort per field so one failure can't strand
+    /// another — an ephemeral run must never leak a cgroup, a veth, or a pool address.
+    async fn ephemeral_teardown(&self, id: &str, ip: Ipv4Addr) {
+        let cgroup = format!("/sys/fs/cgroup/boatramp/{id}");
+        let _ = std::fs::write(format!("{cgroup}/cgroup.kill"), b"1");
+        let _ = std::fs::remove_dir(&cgroup);
+        let _ = VethNetwork::for_vm(id, &self.bridge).teardown().await;
+        self.ipam.lock().expect("ipam mutex").release_ephemeral(ip);
     }
 }
 
@@ -1957,6 +2380,58 @@ fn parse_fib_trie_locals(trie: &str) -> Vec<String> {
     out
 }
 
+// ---------------------------------------------------------------------------
+// One-shot ephemeral client-container support (run_ephemeral)
+// ---------------------------------------------------------------------------
+
+/// Memory cap (MiB) for a one-shot `run_ephemeral` client container — a `pg_dump`/
+/// `pg_restore`/`mysql`/`psql` process streams, so this is generous without being
+/// unbounded. Mirrors the docker backend's 512 MiB ephemeral cap.
+const EPHEMERAL_MEM_MIB: u32 = 512;
+
+/// The generous DEFAULT wall-clock backstop for a single `run_ephemeral` invocation
+/// (overridable via [`ContainerBackend::with_ephemeral_timeout`]). The real
+/// "unreachable DSN" hang is bounded far tighter by the client's own connect timeout, so
+/// this exists only to guarantee a wedged client / stuck stream can never pin a container
+/// (and its veth / cgroup / pool address) forever. Deliberately large so a legitimate
+/// multi-hour dump of a big database is not killed mid-flight. Matches the docker backend.
+const EPHEMERAL_RUN_TIMEOUT: Duration = Duration::from_secs(6 * 3600);
+
+/// Cap on captured stderr from an ephemeral run (diagnostics only — stdout is the
+/// streamed payload). Bounds memory if a failing client floods stderr.
+const EPHEMERAL_STDERR_CAP: usize = 64 * 1024;
+
+/// A monotonic suffix so two concurrent ephemeral runs never collide on an id (which keys
+/// the cgroup / veth / hostname). Combined with the process-clock nanos.
+static EPHEMERAL_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A unique container id for a one-shot ephemeral run (the cgroup / veth / hostname / log
+/// stem). `ephm-<nanos>-<seq>` is ASCII `[a-z0-9-]` and clamped to the UTS hostname limit
+/// like every other container id, so it is always a legal hostname + interface-name input.
+fn ephemeral_container_id() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let seq = EPHEMERAL_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    clamp_container_id(format!("ephm-{nanos}-{seq}"))
+}
+
+/// Set `FD_CLOEXEC` on `fd` so a subsequent `execve` (the re-exec'd `__sandbox` worker)
+/// does NOT inherit it. Used on the launcher-held **write** end of the ephemeral stdin
+/// pipe: if the worker inherited that write end, the guest's stdin would never see EOF
+/// when the launcher finishes streaming (a hung restore). The read end is left
+/// non-CLOEXEC so the worker DOES inherit it (and `dup2`s it onto the guest's fd 0).
+fn set_cloexec(fd: RawFd) -> std::io::Result<()> {
+    // SAFETY: `fd` is a live, owned pipe fd; `F_SETFD`/`FD_CLOEXEC` is a pure flag set.
+    let rc = unsafe { nix::libc::fcntl(fd, nix::libc::F_SETFD, nix::libc::FD_CLOEXEC) };
+    if rc < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2567,6 +3042,90 @@ mod tests {
         );
         // Reclaiming an untracked key is a no-op (returns None).
         assert_eq!(life.gc_release(&key("default", "gone", 9)), None);
+    }
+
+    #[test]
+    fn ephemeral_container_id_is_unique_clamped_and_prefixed() {
+        let a = ephemeral_container_id();
+        let b = ephemeral_container_id();
+        // Recognizable as a one-shot + never collides with a workload id (`<workload>-N`).
+        assert!(a.starts_with("ephm-"), "got {a}");
+        // Always a legal UTS hostname (clamped) and an ifname-safe input.
+        assert!(a.len() <= HOSTNAME_MAX && b.len() <= HOSTNAME_MAX);
+        // The monotonic sequence guarantees two back-to-back ids never collide.
+        assert_ne!(a, b);
+    }
+
+    #[tokio::test]
+    async fn resolve_client_rootfs_uses_an_absolute_airgap_path_verbatim() {
+        // An absolute air-gap path is a preloaded rootfs used AS-IS (never pulled): map a
+        // client image to an existing dir and assert resolve returns exactly it.
+        let dir = unique_dir("airgap-rootfs");
+        std::fs::create_dir_all(&dir).unwrap();
+        let image = "pgvector/pgvector:pg16";
+        let backend = ContainerBackend::new(
+            Arc::new(OneBlob(Vec::new())),
+            unique_dir("airgap-data"),
+            "br-test".into(),
+            "10.0.0.0/24",
+            PathBuf::from("/bin/true"),
+        )
+        .unwrap()
+        .with_client_image_rootfs(BTreeMap::from([(
+            image.to_string(),
+            dir.display().to_string(),
+        )]));
+        let got = backend
+            .resolve_client_rootfs(image)
+            .await
+            .expect("air-gap rootfs resolves");
+        assert_eq!(got, dir, "the preloaded rootfs is used verbatim (no pull)");
+
+        // A mapped-but-missing absolute path fails CLOSED (never silently falls back to a
+        // pull — an air-gap operator asked for this exact rootfs).
+        let backend = backend.with_client_image_rootfs(BTreeMap::from([(
+            image.to_string(),
+            "/nonexistent/air-gap/rootfs".to_string(),
+        )]));
+        assert!(
+            backend.resolve_client_rootfs(image).await.is_err(),
+            "a missing preloaded rootfs must error, not fall back to a pull"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn run_ephemeral_rejects_empty_argv() {
+        let backend = ContainerBackend::new(
+            Arc::new(OneBlob(Vec::new())),
+            unique_dir("ephm-argv"),
+            "br-test".into(),
+            "10.0.0.0/24",
+            PathBuf::from("/bin/true"),
+        )
+        .unwrap();
+        let mut sink: Vec<u8> = Vec::new();
+        let err = backend
+            .run_ephemeral("busybox:latest", &[], &[], None, &mut sink)
+            .await
+            .expect_err("empty argv is rejected before any pull/launch");
+        assert!(matches!(err, BackendError::Other(m) if m.contains("empty argv")));
+    }
+
+    #[test]
+    fn ephemeral_ip_alloc_release_does_not_touch_the_replica_map() {
+        // An ephemeral IP is transient: allocated from the shared pool but NEVER recorded
+        // in the (project,workload,replica) ownership map, so it is not adopted/GC'd as a
+        // replica — and released the moment the run ends.
+        let mut life = IpLifecycle::new(IpAuthority::new("10.0.0.0/24").unwrap());
+        let ip = life.allocate_ephemeral().expect("allocate ephemeral");
+        assert!(!life.authority.is_free(ip), "held while the run is live");
+        assert!(
+            life.assigned_keys().is_empty(),
+            "an ephemeral IP must not enter the replica ownership map"
+        );
+        life.release_ephemeral(ip);
+        assert!(life.authority.is_free(ip), "released when the run ends");
     }
 
     #[tokio::test]
