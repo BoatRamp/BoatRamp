@@ -5565,11 +5565,109 @@ pub(crate) mod figment_resolve {
     /// Vars whose target is a `rename_all = "lowercase"` enum with no `FromStr`.
     /// `apply_env_overrides` matches these case-insensitively against a lowercase
     /// variant table; we emit the lowercased token so serde deserializes the same
-    /// variant. (`serve.blobs` and the per-backend `_KIND` are handled inline.)
+    /// variant. (The per-backend `_KIND` inside the blob-backends map is handled inline.)
     const ENUM_VARS: &[&str] = &[
+        "BOATRAMP_BLOBS",
         "BOATRAMP_COMPUTE_MANAGED_DB_PRIVILEGE",
         "BOATRAMP_COMPUTE_DOCKER_ENDPOINT",
         "BOATRAMP_COMPUTE_DOCKER_VOLUME_MODE",
+    ];
+
+    /// The `serve.*` scalar aliases (the former Loader-A clap `#[arg(env)]` surface,
+    /// unified here). Explicit (env → path) pairs because the env names are irregular —
+    /// they drop the `serve` segment (`BOATRAMP_ADDR`, not `BOATRAMP_SERVE_ADDR`) and one
+    /// is a field-name mismatch (`BOATRAMP_UPLOAD_IDLE_TIMEOUT` → `upload_idle_timeout_secs`)
+    /// — so the mapping is aliased, never path-derived (risk P1). Bool/numeric fields are
+    /// emitted as strings and coerced by `extract_lossy`; `blobs` is in `ENUM_VARS`.
+    /// (The file-only serve fields — `s3_ingress_*`, `blob_notify_*`, `console`, `signer`,
+    /// `blob_fallback`, `s3_credential` — have no clap/env today and stay file-only, carried
+    /// by the figment file layer.) `auth_root_private_key` / `bootstrap_secret` /
+    /// `azure_access_key` are secret-bearing config fields (as they are today via clap); they
+    /// resolve into the config but are REDACTED by `config dump`/`explain`.
+    const SERVE_SCALARS: &[(&str, &[&str])] = &[
+        ("BOATRAMP_BLOBS", &["serve", "blobs"]),
+        ("BOATRAMP_S3_BUCKET", &["serve", "s3_bucket"]),
+        ("BOATRAMP_S3_ENDPOINT", &["serve", "s3_endpoint"]),
+        ("BOATRAMP_S3_REGION", &["serve", "s3_region"]),
+        ("BOATRAMP_S3_PATH_STYLE", &["serve", "s3_path_style"]),
+        ("BOATRAMP_ADDR", &["serve", "addr"]),
+        ("BOATRAMP_DATA_DIR", &["serve", "data_dir"]),
+        ("BOATRAMP_GCS_BUCKET", &["serve", "gcs_bucket"]),
+        ("BOATRAMP_GCS_ENDPOINT", &["serve", "gcs_endpoint"]),
+        ("BOATRAMP_GCS_ANONYMOUS", &["serve", "gcs_anonymous"]),
+        ("BOATRAMP_AZURE_ACCOUNT", &["serve", "azure_account"]),
+        ("BOATRAMP_AZURE_CONTAINER", &["serve", "azure_container"]),
+        ("BOATRAMP_AZURE_ACCESS_KEY", &["serve", "azure_access_key"]),
+        ("BOATRAMP_AZURE_EMULATOR", &["serve", "azure_emulator"]),
+        (
+            "BOATRAMP_AUTH_ROOT_PRIVATE_KEY",
+            &["serve", "auth_root_private_key"],
+        ),
+        (
+            "BOATRAMP_AUTH_ROOT_PUBLIC_KEY",
+            &["serve", "auth_root_public_key"],
+        ),
+        ("BOATRAMP_BOOTSTRAP_SECRET", &["serve", "bootstrap_secret"]),
+        ("BOATRAMP_MAX_UPLOAD_BYTES", &["serve", "max_upload_bytes"]),
+        (
+            "BOATRAMP_UPLOAD_IDLE_TIMEOUT",
+            &["serve", "upload_idle_timeout_secs"],
+        ),
+        (
+            "BOATRAMP_MAX_CONCURRENT_UPLOADS",
+            &["serve", "max_concurrent_uploads"],
+        ),
+        (
+            "BOATRAMP_HTTP_REDIRECT_ADDR",
+            &["serve", "http_redirect_addr"],
+        ),
+        ("BOATRAMP_DEFAULT_SITE", &["serve", "default_site"]),
+        ("BOATRAMP_POP_ORIGIN", &["serve", "pop_origin"]),
+        ("BOATRAMP_PROTECT_PREVIEWS", &["serve", "protect_previews"]),
+        (
+            "BOATRAMP_CLUSTER_RATE_LIMIT",
+            &["serve", "cluster_rate_limit"],
+        ),
+        (
+            "BOATRAMP_SHARED_CACHE_COHERENCE",
+            &["serve", "shared_cache_coherence"],
+        ),
+    ];
+
+    /// The `serve.kv.*` aliases (the former Loader-C ad-hoc `std::env::var` surface). The env
+    /// names drop BOTH `serve` and (for slatedb) the `slatedb` segment, so they are aliased
+    /// explicitly (risk P1/P10). The `0`-disables-cadence semantics are preserved by
+    /// `KvConfig::{checkpoint_interval,gc_interval}` reading the resolved `Some(0)`.
+    /// (The Loader-C RUNTIME knobs that are NOT config fields — `BOATRAMP_KV_AUTHZ_FENCE_SECS`,
+    /// `BOATRAMP_POD_NAME`, `BOATRAMP_COMPUTE_RECONCILE_TICK_MS`/`_NET_DEBUG` — stay as direct
+    /// serve reads and are intentionally NOT mapped into the config, matching today.)
+    const SERVE_KV: &[(&str, &[&str])] = &[
+        (
+            "BOATRAMP_KV_CHECKPOINT_INTERVAL",
+            &["serve", "kv", "slatedb", "checkpoint_interval"],
+        ),
+        (
+            "BOATRAMP_KV_CLOSE_DEADLINE",
+            &["serve", "kv", "slatedb", "close_deadline"],
+        ),
+        (
+            "BOATRAMP_KV_GC_INTERVAL",
+            &["serve", "kv", "slatedb", "gc_interval"],
+        ),
+        (
+            "BOATRAMP_KV_GC_MIN_AGE",
+            &["serve", "kv", "slatedb", "gc_min_age"],
+        ),
+        ("BOATRAMP_KV_SQL_KIND", &["serve", "kv", "sql", "kind"]),
+        ("BOATRAMP_KV_SQL_PATH", &["serve", "kv", "sql", "path"]),
+        (
+            "BOATRAMP_KV_SQL_URL_ENV",
+            &["serve", "kv", "sql", "url_env"],
+        ),
+        (
+            "BOATRAMP_KV_SQL_POOL_MAX",
+            &["serve", "kv", "sql", "pool_max"],
+        ),
     ];
 
     /// Insert `value` at the nested `path`, creating intermediate dicts as needed.
@@ -5621,39 +5719,10 @@ pub(crate) mod figment_resolve {
     pub(crate) fn env_overlay_dict(source: &EnvSource) -> Dict {
         let mut d = Dict::new();
 
-        // --- serve S3 blob backend (the Loader-A clap scalars, unified) ---------
-        emit(&mut d, source, "BOATRAMP_BLOBS", &["serve", "blobs"]); // enum via inline below
-        if let Some(v) = source.get("BOATRAMP_BLOBS") {
-            put(
-                &mut d,
-                &["serve", "blobs"],
-                Value::from(v.trim().to_ascii_lowercase()),
-            );
+        // --- serve.* scalars (former Loader-A) + serve.kv.* (former Loader-C) ----
+        for (var, path) in SERVE_SCALARS.iter().chain(SERVE_KV) {
+            emit(&mut d, source, var, path);
         }
-        emit(
-            &mut d,
-            source,
-            "BOATRAMP_S3_BUCKET",
-            &["serve", "s3_bucket"],
-        );
-        emit(
-            &mut d,
-            source,
-            "BOATRAMP_S3_ENDPOINT",
-            &["serve", "s3_endpoint"],
-        );
-        emit(
-            &mut d,
-            source,
-            "BOATRAMP_S3_REGION",
-            &["serve", "s3_region"],
-        );
-        emit(
-            &mut d,
-            source,
-            "BOATRAMP_S3_PATH_STYLE",
-            &["serve", "s3_path_style"],
-        );
 
         // --- compute (`compute.<field>`) ----------------------------------------
         for var in COMPUTE_ENV_VARS {
@@ -6541,6 +6610,123 @@ pub(crate) mod figment_resolve {
                 ("BOATRAMP_SERVE_LISTENER_edge_PROJECT", "proj"),
                 ("BOATRAMP_SERVE_LISTENER_edge_SITE", "site"),
             ]);
+        }
+
+        // --- serve.* scalars + serve.kv.* (Loader A / C) --------------------------
+        // These are NOT in `apply_env_overrides` (they were the serve-only clap/ad-hoc
+        // loaders), so the apply_env oracle doesn't apply. They're asserted directly:
+        // the figment env overlay resolves each into its ServeConfig field (the same
+        // field clap/the ad-hoc read populate from the same BOATRAMP_<NAME> var today).
+
+        /// Env-only figment resolution via the full pipeline (base-seed + env), so the
+        /// serve-scalar secrets' deny-unknown neighbours aren't an issue (serve is
+        /// `#[serde(default)]`).
+        fn serve_from_env(pairs: &[(&str, &str)]) -> ServeConfig {
+            figment_env(pairs)
+                .serve
+                .expect("serve materialised from env")
+        }
+
+        #[test]
+        fn serve_scalars_full_extract() {
+            let s = serve_from_env(&[
+                ("BOATRAMP_ADDR", "0.0.0.0:8080"),
+                ("BOATRAMP_DATA_DIR", "/data"),
+                ("BOATRAMP_BLOBS", "s3"),
+                ("BOATRAMP_S3_BUCKET", "b"),
+                ("BOATRAMP_S3_PATH_STYLE", "true"),
+                ("BOATRAMP_GCS_BUCKET", "gb"),
+                ("BOATRAMP_GCS_ENDPOINT", "http://gcs"),
+                ("BOATRAMP_GCS_ANONYMOUS", "yes"),
+                ("BOATRAMP_AZURE_ACCOUNT", "acct"),
+                ("BOATRAMP_AZURE_CONTAINER", "cont"),
+                ("BOATRAMP_AZURE_ACCESS_KEY", "secret-key"),
+                ("BOATRAMP_AZURE_EMULATOR", "true"),
+                ("BOATRAMP_AUTH_ROOT_PRIVATE_KEY", "deadbeef"),
+                ("BOATRAMP_AUTH_ROOT_PUBLIC_KEY", "cafe"),
+                ("BOATRAMP_BOOTSTRAP_SECRET", "boot"),
+                ("BOATRAMP_MAX_UPLOAD_BYTES", "1048576"),
+                ("BOATRAMP_UPLOAD_IDLE_TIMEOUT", "30"),
+                ("BOATRAMP_MAX_CONCURRENT_UPLOADS", "16"),
+                ("BOATRAMP_HTTP_REDIRECT_ADDR", "0.0.0.0:80"),
+                ("BOATRAMP_DEFAULT_SITE", "construens"),
+                ("BOATRAMP_POP_ORIGIN", "https://cp.example.com"),
+                ("BOATRAMP_PROTECT_PREVIEWS", "true"),
+                ("BOATRAMP_CLUSTER_RATE_LIMIT", "true"),
+                ("BOATRAMP_SHARED_CACHE_COHERENCE", "true"),
+            ]);
+            assert_eq!(s.addr, Some("0.0.0.0:8080".parse().unwrap()));
+            assert_eq!(s.data_dir.as_deref(), Some(std::path::Path::new("/data")));
+            assert!(matches!(s.blobs, Some(crate::backends::BlobBackend::S3)));
+            assert_eq!(s.s3_bucket.as_deref(), Some("b"));
+            assert!(s.s3_path_style);
+            assert_eq!(s.gcs_bucket.as_deref(), Some("gb"));
+            assert!(s.gcs_anonymous, "GCS anonymous coerced from \"yes\"");
+            assert_eq!(s.azure_account.as_deref(), Some("acct"));
+            assert_eq!(s.azure_access_key.as_deref(), Some("secret-key"));
+            assert!(s.azure_emulator);
+            assert_eq!(s.auth_root_private_key.as_deref(), Some("deadbeef"));
+            assert_eq!(s.auth_root_public_key.as_deref(), Some("cafe"));
+            assert_eq!(s.bootstrap_secret.as_deref(), Some("boot"));
+            assert_eq!(s.max_upload_bytes, Some(1_048_576));
+            // The field-name mismatch: env UPLOAD_IDLE_TIMEOUT → field upload_idle_timeout_secs.
+            assert_eq!(s.upload_idle_timeout_secs, Some(30));
+            assert_eq!(s.max_concurrent_uploads, Some(16));
+            assert_eq!(s.http_redirect_addr, Some("0.0.0.0:80".parse().unwrap()));
+            assert_eq!(s.default_site.as_deref(), Some("construens"));
+            assert_eq!(s.pop_origin.as_deref(), Some("https://cp.example.com"));
+            assert!(s.protect_previews);
+            assert!(s.cluster_rate_limit);
+            assert!(s.shared_cache_coherence);
+        }
+
+        #[test]
+        fn serve_kv_knobs_full_extract() {
+            let s = serve_from_env(&[
+                ("BOATRAMP_KV_CHECKPOINT_INTERVAL", "0"),
+                ("BOATRAMP_KV_CLOSE_DEADLINE", "30"),
+                ("BOATRAMP_KV_GC_INTERVAL", "600"),
+                ("BOATRAMP_KV_GC_MIN_AGE", "3600"),
+                ("BOATRAMP_KV_SQL_KIND", "sqlite"),
+                ("BOATRAMP_KV_SQL_PATH", "/data/kv.db"),
+                ("BOATRAMP_KV_SQL_URL_ENV", "KV_URL"),
+                ("BOATRAMP_KV_SQL_POOL_MAX", "8"),
+            ]);
+            let kv = s.kv.expect("serve.kv materialised");
+            // `0` round-trips as Some(0) (the meaningful "disable cadence" value — KvConfig
+            // maps Some(0) → None at resolve time, preserving Loader-C semantics). Checked on
+            // the resolver BEFORE moving the sub-structs out.
+            assert_eq!(
+                kv.checkpoint_interval(),
+                None,
+                "Some(0) disables the cadence"
+            );
+            let slate = kv.slatedb.clone().expect("serve.kv.slatedb materialised");
+            assert_eq!(slate.checkpoint_interval, Some(0));
+            assert_eq!(slate.close_deadline, Some(30));
+            assert_eq!(slate.gc_interval, Some(600));
+            assert_eq!(slate.gc_min_age, Some(3600));
+            let sql = kv.sql.expect("serve.kv.sql materialised");
+            assert_eq!(sql.kind, "sqlite");
+            assert_eq!(sql.path.as_deref(), Some("/data/kv.db"));
+            assert_eq!(sql.url_env.as_deref(), Some("KV_URL"));
+            assert_eq!(sql.pool_max, Some(8));
+        }
+
+        /// Drift guard for the serve surface: every SERVE_SCALARS + SERVE_KV var produces
+        /// an overlay entry (the Loader-A/C analog of `overlay_honors_every_loader_b_fixed_var`).
+        #[test]
+        fn overlay_honors_every_serve_var() {
+            let mut unhandled = Vec::new();
+            for (var, _) in SERVE_SCALARS.iter().chain(SERVE_KV) {
+                if env_overlay_dict(&map(&[(var, "x")])).is_empty() {
+                    unhandled.push(*var);
+                }
+            }
+            assert!(
+                unhandled.is_empty(),
+                "overlay produced nothing for these serve vars: {unhandled:?}"
+            );
         }
     }
 }
