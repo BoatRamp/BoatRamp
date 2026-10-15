@@ -164,6 +164,13 @@ base64 = "0.22"
 
 brotli = "7"
 flate2 = "1"
+# Layered config resolution (defaults → file → env → flags) for the node daemon
+# config. Already in the tree transitively (slatedb → figment), so pinning it as a
+# direct dep adds no new crate. `default-features = false`: we need only the core
+# `Figment`/`Provider`/`Value` + the `Serialized` provider — NOT figment's own `Env`
+# provider (its generic name-derivation can't reproduce boatramp's irregular env
+# names or dynamic-keyed maps; boatramp supplies a custom overlay provider instead).
+figment = { version = "0.10", default-features = false }
 # tar reader for the OCI→ext4 rootfs build, behind the
 # `boatramp-firecracker/build` feature.
 tar = "0.4"

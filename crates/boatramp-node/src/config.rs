@@ -1466,10 +1466,10 @@ const CLUSTER_MESH_ENV_VARS: &[&str] = &[
 /// explicit map for a deterministic unit test. Keeping the lookup behind this enum
 /// lets [`ServerConfig::apply_env_overrides`] be tested without touching (racy,
 /// process-global) `std::env`.
-enum EnvSource {
+pub(crate) enum EnvSource {
     /// The live process environment (`std::env::var`).
     Process,
-    /// A fixed name→value map (tests only).
+    /// A fixed name→value map (tests only; production always resolves `Process`).
     #[cfg(test)]
     Map(BTreeMap<String, String>),
 }
@@ -5448,5 +5448,629 @@ mod tests {
             ServerConfig::parse_with_format(doc, ConfigFormat::Ron).is_err(),
             "the same document must FAIL under Ron — else the fmt selection is hollow"
         );
+    }
+}
+
+// ============================================================================
+// WIP (`config-figment` feature): the single figment-based env→config overlay.
+// ============================================================================
+//
+// This module is the heart of the config-system rewrite tracked in
+// docs/config-figment-migration.md. It builds the `BOATRAMP_*`
+// environment layer as a figment `Dict`, to be merged (defaults → file → env →
+// flags) and extracted ONCE, by EVERY subcommand — replacing the three
+// hand-maintained, serve-biased env loaders:
+//
+//   A. the serve clap `#[arg(env = …)]` layer (serve-only),
+//   B. `ServerConfig::apply_env_overrides` (runs in `load`, so everywhere), and
+//   C. ad-hoc `std::env::var` reads in serve (serve-only).
+//
+// The core bug the rewrite fixes: A & C are serve-only, so `BOATRAMP_S3_BUCKET`
+// (and the other serve/kv knobs) are honored by `serve` but NOT by `boatramp
+// migrate` / `blob migrate` — the offline ops that most need them.
+//
+// ## Design: emit strings, extract lossy
+//
+// The overlay emits every scalar as a STRING value, lists as arrays, and the
+// (rare) rename_all enums as their lowercased token. Nothing is parsed here, so
+// the overlay is infallible. At extraction time `Figment::extract_lossy` coerces
+// each string to the target field's type:
+//   * bool fields  — via `Value::to_bool_lossy`, whose accepted spellings
+//     (`true/yes/1/on` + `false/no/0/off`, case-insensitive) are EXACTLY
+//     `EnvSource::parse_bool`'s, so the P4 bool-spelling parity holds for free;
+//   * numeric fields — via `to_num_lossy` (a non-numeric value stays a string and
+//     then fails to deserialize — LOUDLY, exactly as `apply_env_overrides` failed
+//     at override time, just deferred to extract);
+//   * string / enum / path / socket-addr fields read the string directly.
+// A string destined for a string field is never coerced (lossy only kicks in when
+// the TARGET is bool/number), so a numeric-looking bucket name or region survives.
+//
+// ## Faithful, drift-proof mapping
+//
+// The fixed-var overlay is DRIVEN BY the same `*_ENV_VARS` const tables that
+// `apply_env_overrides` and the forgot-a-knob guard tests use, deriving each
+// config path from the var name by the section's rule (drop `serve`, drop
+// `bindings`, drop `overrides`, …). So a var that exists in a const table is
+// handled by construction — no third hand-maintained list to drift. The only
+// per-var classification is the small `LIST_VARS` / `ENUM_VARS` sets below.
+//
+// ## Scope of THIS commit (scaffolding)
+//
+// Implemented + parity-tested here: the whole of Loader B (compute, security,
+// handlers, s3_ingress_cloud, secrets, cluster + the three dynamic-keyed maps)
+// plus the serve S3 blob scalars. NOT yet wired (tracked in the plan): the file
+// layer (RON/JSON → figment Value), the explicit-CLI-flag layer (the
+// `ValueSource::CommandLine` filter that subsumes the `--blobs` explicit-set
+// probe), the remaining serve.* scalars + the Loader-C `serve.kv.*` knobs, and
+// the `#[serde(default)]` additions some `deny_unknown_fields` structs need to
+// deserialize from a partial env sub-dict (see the plan's "pre-reqs").
+#[cfg(feature = "config-figment")]
+pub(crate) mod figment_resolve {
+    // WIP scaffolding: the overlay + provider are built and parity-tested here but
+    // not yet wired into `ServerConfig::load` (that is the flip step in the plan,
+    // once the file + flag layers land and the `#[serde(default)]` pre-reqs are in).
+    // Until then its items are exercised only by this module's own tests.
+    #![allow(dead_code)]
+
+    use super::*;
+    use figment::value::{Dict, Map as FigMap, Tag, Value};
+    use figment::{Error, Metadata, Profile, Provider};
+
+    /// Vars whose value is a comma-separated list (trimmed, empty items dropped —
+    /// `EnvSource::parse_list` semantics), emitted as a figment `Array`.
+    const LIST_VARS: &[&str] = &[
+        "BOATRAMP_COMPUTE_KERNEL_SIGNING_PUBKEYS",
+        "BOATRAMP_COMPUTE_KERNEL_ALLOWED_HASHES",
+        "BOATRAMP_HANDLERS_SQL_MIGRATE_TRUSTED_EXTENSIONS",
+        "BOATRAMP_CLUSTER_ROOT_PUBKEYS",
+        "BOATRAMP_CLUSTER_SEEDS",
+    ];
+
+    /// Vars whose target is a `rename_all = "lowercase"` enum with no `FromStr`.
+    /// `apply_env_overrides` matches these case-insensitively against a lowercase
+    /// variant table; we emit the lowercased token so serde deserializes the same
+    /// variant. (`serve.blobs` and the per-backend `_KIND` are handled inline.)
+    const ENUM_VARS: &[&str] = &[
+        "BOATRAMP_COMPUTE_MANAGED_DB_PRIVILEGE",
+        "BOATRAMP_COMPUTE_DOCKER_ENDPOINT",
+        "BOATRAMP_COMPUTE_DOCKER_VOLUME_MODE",
+    ];
+
+    /// Insert `value` at the nested `path`, creating intermediate dicts as needed.
+    fn put(dict: &mut Dict, path: &[&str], value: Value) {
+        let (last, parents) = path.split_last().expect("path is non-empty");
+        let mut cursor = dict;
+        for seg in parents {
+            let entry = cursor
+                .entry((*seg).to_string())
+                .or_insert_with(|| Value::Dict(Tag::Default, Dict::new()));
+            if !matches!(entry, Value::Dict(..)) {
+                *entry = Value::Dict(Tag::Default, Dict::new());
+            }
+            cursor = match entry {
+                Value::Dict(_, inner) => inner,
+                _ => unreachable!("entry was just forced to a Dict"),
+            };
+        }
+        cursor.insert((*last).to_string(), value);
+    }
+
+    /// Emit the right value KIND for `var` (list / enum / plain scalar) at `path`,
+    /// iff the var is set to a non-empty value.
+    fn emit(dict: &mut Dict, source: &EnvSource, var: &str, path: &[&str]) {
+        if LIST_VARS.contains(&var) {
+            if let Some(items) = source.parse_list(var) {
+                put(dict, path, Value::from(items));
+            }
+        } else if ENUM_VARS.contains(&var) {
+            if let Some(v) = source.get(var) {
+                put(dict, path, Value::from(v.trim().to_ascii_lowercase()));
+            }
+        } else if let Some(v) = source.get(var) {
+            put(dict, path, Value::from(v));
+        }
+    }
+
+    /// `var` with `prefix` stripped, lowercased — the config field name for the
+    /// section whose env vars are `<prefix><FIELD>` (the inverse of the uppercasing
+    /// the forgot-a-knob guards assert).
+    fn field_of(var: &str, prefix: &str) -> String {
+        var.strip_prefix(prefix)
+            .expect("var belongs to this section's prefix")
+            .to_ascii_lowercase()
+    }
+
+    /// Build the `BOATRAMP_*` environment overlay as a figment `Dict`. Infallible
+    /// (see the module docs); a malformed value is rejected at `extract_lossy`.
+    pub(crate) fn env_overlay_dict(source: &EnvSource) -> Dict {
+        let mut d = Dict::new();
+
+        // --- serve S3 blob backend (the Loader-A clap scalars, unified) ---------
+        emit(&mut d, source, "BOATRAMP_BLOBS", &["serve", "blobs"]); // enum via inline below
+        if let Some(v) = source.get("BOATRAMP_BLOBS") {
+            put(
+                &mut d,
+                &["serve", "blobs"],
+                Value::from(v.trim().to_ascii_lowercase()),
+            );
+        }
+        emit(
+            &mut d,
+            source,
+            "BOATRAMP_S3_BUCKET",
+            &["serve", "s3_bucket"],
+        );
+        emit(
+            &mut d,
+            source,
+            "BOATRAMP_S3_ENDPOINT",
+            &["serve", "s3_endpoint"],
+        );
+        emit(
+            &mut d,
+            source,
+            "BOATRAMP_S3_REGION",
+            &["serve", "s3_region"],
+        );
+        emit(
+            &mut d,
+            source,
+            "BOATRAMP_S3_PATH_STYLE",
+            &["serve", "s3_path_style"],
+        );
+
+        // --- compute (`compute.<field>`) ----------------------------------------
+        for var in COMPUTE_ENV_VARS {
+            let field = field_of(var, "BOATRAMP_COMPUTE_");
+            emit(&mut d, source, var, &["compute", field.as_str()]);
+        }
+
+        // --- security (`security.profile` + `security.overrides.<field>`) -------
+        for var in SECURITY_ENV_VARS {
+            if *var == "BOATRAMP_SECURITY_PROFILE" {
+                emit(&mut d, source, var, &["security", "profile"]);
+            } else {
+                let field = field_of(var, "BOATRAMP_SECURITY_");
+                emit(
+                    &mut d,
+                    source,
+                    var,
+                    &["security", "overrides", field.as_str()],
+                );
+            }
+        }
+
+        // --- handlers: sql binding scalars (`handlers.bindings.sql.<field>`) ----
+        // (`bindings` is dropped from the env name — the P1 rename the alias rule
+        // reproduces.)
+        for var in SQL_ENV_VARS {
+            let field = field_of(var, "BOATRAMP_HANDLERS_SQL_");
+            emit(
+                &mut d,
+                source,
+                var,
+                &["handlers", "bindings", "sql", field.as_str()],
+            );
+        }
+
+        // --- handlers: jwks / concurrency / blob-hedge scalars (`handlers.<f>`) --
+        for var in JWKS_ENV_VARS
+            .iter()
+            .chain(HANDLER_CONCURRENCY_ENV_VARS)
+            .chain(HANDLER_BLOB_HEDGE_ENV_VARS)
+        {
+            let field = field_of(var, "BOATRAMP_HANDLERS_");
+            emit(&mut d, source, var, &["handlers", field.as_str()]);
+        }
+
+        // --- serve.s3_ingress_cloud (`serve` dropped from the env name) ---------
+        for var in S3_INGRESS_CLOUD_ENV_VARS {
+            let field = field_of(var, "BOATRAMP_S3_INGRESS_CLOUD_");
+            emit(
+                &mut d,
+                source,
+                var,
+                &["serve", "s3_ingress_cloud", field.as_str()],
+            );
+        }
+
+        // --- secrets (+ nested vault) -------------------------------------------
+        for var in SECRETS_ENV_VARS {
+            if let Some(rest) = var.strip_prefix("BOATRAMP_SECRETS_VAULT_") {
+                emit(
+                    &mut d,
+                    source,
+                    var,
+                    &["secrets", "vault", rest.to_ascii_lowercase().as_str()],
+                );
+            } else {
+                let field = field_of(var, "BOATRAMP_SECRETS_");
+                emit(&mut d, source, var, &["secrets", field.as_str()]);
+            }
+        }
+
+        // --- cluster (+ nested mesh) --------------------------------------------
+        // The overlay always emits a cluster field when set; the `listen`
+        // requirement (ClusterConfig has no Default) is enforced LOUDLY at extract,
+        // rather than silently dropped as `apply_env_overrides` did for an env-only
+        // cluster without a listen. See the plan's parity notes.
+        for var in CLUSTER_ENV_VARS {
+            if let Some(rest) = var.strip_prefix("BOATRAMP_CLUSTER_MESH_") {
+                emit(
+                    &mut d,
+                    source,
+                    var,
+                    &["cluster", "mesh", rest.to_ascii_lowercase().as_str()],
+                );
+            } else {
+                let field = field_of(var, "BOATRAMP_CLUSTER_");
+                emit(&mut d, source, var, &["cluster", field.as_str()]);
+            }
+        }
+
+        // --- dynamic maps (P0: the generic Env provider cannot do these) --------
+        blob_backends_overlay(&mut d, source);
+        sql_databases_overlay(&mut d, source);
+        listeners_overlay(&mut d, source);
+
+        d
+    }
+
+    /// `[serve.blob_backends.<project>]` — keyed by project, member names scanned
+    /// from the environment (there is no file to enumerate them). Mirrors the
+    /// `apply_env_overrides` block, flattening the sealed credential's two public
+    /// refs under `s3_credential`.
+    fn blob_backends_overlay(d: &mut Dict, source: &EnvSource) {
+        for name in source.blob_backend_projects() {
+            let prefix = format!("{BLOB_BACKEND_ENV_PREFIX}{name}_");
+            let n = name.as_str();
+            if let Some(v) = source.get(&format!("{prefix}KIND")) {
+                put(
+                    d,
+                    &["serve", "blob_backends", n, "blobs"],
+                    Value::from(v.trim().to_ascii_lowercase()),
+                );
+            }
+            for (suffix, field) in [
+                ("S3_BUCKET", "s3_bucket"),
+                ("S3_ENDPOINT", "s3_endpoint"),
+                ("S3_REGION", "s3_region"),
+                ("S3_PATH_STYLE", "s3_path_style"),
+            ] {
+                if let Some(v) = source.get(&format!("{prefix}{suffix}")) {
+                    put(d, &["serve", "blob_backends", n, field], Value::from(v));
+                }
+            }
+            if let Some(v) = source.get(&format!("{prefix}S3_ACCESS_KEY_ID")) {
+                put(
+                    d,
+                    &[
+                        "serve",
+                        "blob_backends",
+                        name.as_str(),
+                        "s3_credential",
+                        "access_key_id",
+                    ],
+                    Value::from(v),
+                );
+            }
+            if let Some(v) = source.get(&format!("{prefix}S3_SECRET_ACCESS_KEY")) {
+                put(
+                    d,
+                    &[
+                        "serve",
+                        "blob_backends",
+                        name.as_str(),
+                        "s3_credential",
+                        "secret_access_key",
+                    ],
+                    Value::from(v),
+                );
+            }
+        }
+    }
+
+    /// `handlers.bindings.sql.databases.<name>` — keyed external-DB map. The
+    /// reserved `DEFAULT` env token maps to the real key `"default"`
+    /// (`DEFAULT_DB_NAME`); every other name is used verbatim.
+    fn sql_databases_overlay(d: &mut Dict, source: &EnvSource) {
+        for name in source.sql_database_names() {
+            let key = if name == "DEFAULT" {
+                boatramp_core::project::DEFAULT_DB_NAME.to_string()
+            } else {
+                name.clone()
+            };
+            let prefix = format!("{SQL_DB_ENV_PREFIX}{name}_");
+            let k = key.as_str();
+            // scalar string fields
+            for (suffix, field) in [
+                ("KIND", "kind"),
+                ("URL_ENV", "url_env"),
+                ("READ_URL_ENV", "read_url_env"),
+                ("COMPUTE", "compute"),
+                ("DATABASE", "database"),
+                ("USER", "user"),
+                ("PASSWORD_ENV", "password_env"),
+                ("POOL_MAX", "pool_max"),
+                ("READ_ONLY", "read_only"),
+                ("ALLOW_PREVIEW", "allow_preview"),
+                ("CONNECT_TIMEOUT_SECS", "connect_timeout_secs"),
+                ("IMAGE", "image"),
+                ("VOLUME_SIZE_MIB", "volume_size_mib"),
+                ("STARTUP_GRACE_SECS", "startup_grace_secs"),
+                ("RLS_SESSION", "rls_session"),
+                ("TENANT_GUC", "tenant_guc"),
+                ("SESSION_GUC", "session_guc"),
+                ("TENANT_ALL_MARKER", "tenant_all_marker"),
+            ] {
+                if let Some(v) = source.get(&format!("{prefix}{suffix}")) {
+                    put(
+                        d,
+                        &["handlers", "bindings", "sql", "databases", k, field],
+                        Value::from(v),
+                    );
+                }
+            }
+            // enum fields (lowercased token)
+            for (suffix, field) in [("TENANT", "tenant"), ("TENANT_SCOPE", "tenant_scope")] {
+                if let Some(v) = source.get(&format!("{prefix}{suffix}")) {
+                    put(
+                        d,
+                        &["handlers", "bindings", "sql", "databases", k, field],
+                        Value::from(v.trim().to_ascii_lowercase()),
+                    );
+                }
+            }
+        }
+    }
+
+    /// `[serve.listeners.<name>]` — keyed inbound-TCP listeners. Only the SCALAR +
+    /// `imports` (list) fields are env-settable; structured fields (tenancy/env/tls)
+    /// are file-only.
+    fn listeners_overlay(d: &mut Dict, source: &EnvSource) {
+        for name in source.listener_names() {
+            let prefix = format!("{LISTENER_ENV_PREFIX}{name}_");
+            let n = name.as_str();
+            for (suffix, field) in [
+                ("BIND", "bind"),
+                ("COMPONENT", "component"),
+                ("PROJECT", "project"),
+                ("SITE", "site"),
+                ("MAX_CONNS", "max_conns"),
+                ("IDLE_TIMEOUT_MS", "idle_timeout_ms"),
+                ("MAX_CONN_DURATION_MS", "max_conn_duration_ms"),
+            ] {
+                if let Some(v) = source.get(&format!("{prefix}{suffix}")) {
+                    put(d, &["serve", "listeners", n, field], Value::from(v));
+                }
+            }
+            if let Some(items) = source.parse_list(&format!("{prefix}IMPORTS")) {
+                put(d, &["serve", "listeners", n, "imports"], Value::from(items));
+            }
+        }
+    }
+
+    /// A figment [`Provider`] carrying the `BOATRAMP_*` environment overlay. Merged
+    /// into the pipeline ABOVE the file layer (env overrides file) and BELOW the
+    /// explicit-flag layer.
+    pub(crate) struct BoatrampEnv(Dict);
+
+    impl BoatrampEnv {
+        pub(crate) fn new(source: &EnvSource) -> Self {
+            Self(env_overlay_dict(source))
+        }
+    }
+
+    impl Provider for BoatrampEnv {
+        fn metadata(&self) -> Metadata {
+            Metadata::named("BOATRAMP_* environment")
+        }
+
+        fn data(&self) -> Result<FigMap<Profile, Dict>, Error> {
+            let mut map = FigMap::new();
+            map.insert(Profile::Default, self.0.clone());
+            Ok(map)
+        }
+    }
+
+    /// Resolve a [`ServerConfig`] from the environment overlay ALONE (no file, no
+    /// flags). This is the env half of the eventual `load_with_figment`; it exists
+    /// now so the overlay can be parity-tested end-to-end against
+    /// `apply_env_overrides` without the file/flag layers.
+    #[cfg(test)]
+    pub(crate) fn resolve_from_env(source: &EnvSource) -> Result<ServerConfig, Box<Error>> {
+        figment::Figment::new()
+            .merge(BoatrampEnv::new(source))
+            .extract_lossy()
+            .map_err(Box::new)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn map(pairs: &[(&str, &str)]) -> EnvSource {
+            EnvSource::Map(
+                pairs
+                    .iter()
+                    .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                    .collect(),
+            )
+        }
+
+        /// The keystone drift guard: EVERY fixed `BOATRAMP_*` var the old loader
+        /// (`apply_env_overrides`) honors must also be produced by the new overlay.
+        /// Because the overlay iterates the same `*_ENV_VARS` const tables, this
+        /// holds by construction — the test is the regression guard that a future
+        /// edit can't quietly drop a section's table from the overlay loop, and
+        /// that no const var escapes classification. (The forgot-a-knob guards in
+        /// the parent module already prove every struct FIELD has a const-table
+        /// var; together they chain field → var → overlay entry.)
+        #[test]
+        fn overlay_honors_every_loader_b_fixed_var() {
+            let all: Vec<&str> = COMPUTE_ENV_VARS
+                .iter()
+                .chain(SECURITY_ENV_VARS)
+                .chain(SQL_ENV_VARS)
+                .chain(JWKS_ENV_VARS)
+                .chain(HANDLER_CONCURRENCY_ENV_VARS)
+                .chain(HANDLER_BLOB_HEDGE_ENV_VARS)
+                .chain(S3_INGRESS_CLOUD_ENV_VARS)
+                .chain(SECRETS_ENV_VARS)
+                .chain(CLUSTER_ENV_VARS)
+                .copied()
+                .collect();
+            let mut unhandled = Vec::new();
+            for var in all {
+                // A socket-addr-ish sample keeps the value non-empty; the overlay
+                // emits strings (no parse), so any non-empty value exercises it.
+                let dict = env_overlay_dict(&map(&[(var, "x")]));
+                if dict.is_empty() {
+                    unhandled.push(var);
+                }
+            }
+            assert!(
+                unhandled.is_empty(),
+                "overlay produced nothing for these registered Loader-B vars \
+                 (a drift gap — wire them into env_overlay_dict): {unhandled:?}"
+            );
+        }
+
+        /// P4: the overlay's bool spellings match `parse_bool` end-to-end, via
+        /// figment's `to_bool_lossy` at `extract_lossy`.
+        #[test]
+        fn bool_spellings_round_trip_like_parse_bool() {
+            for (raw, expect) in [
+                ("on", true),
+                ("1", true),
+                ("yes", true),
+                ("TRUE", true),
+                ("off", false),
+                ("0", false),
+                ("no", false),
+            ] {
+                let cfg = resolve_from_env(&map(&[(
+                    "BOATRAMP_SECURITY_ALLOW_SHARED_KERNEL_COMPUTE",
+                    raw,
+                )]))
+                .expect("extract");
+                assert_eq!(
+                    cfg.security
+                        .expect("security materialised")
+                        .overrides
+                        .allow_shared_kernel_compute,
+                    Some(expect),
+                    "bool spelling {raw:?} must parse like parse_bool"
+                );
+            }
+        }
+
+        /// Empty env value = UNSET (never clobbers to `""`), matching `EnvSource::get`.
+        #[test]
+        fn empty_value_is_unset() {
+            let dict = env_overlay_dict(&map(&[("BOATRAMP_S3_BUCKET", "")]));
+            assert!(dict.is_empty(), "an empty value must be treated as unset");
+        }
+
+        /// Parity oracle for a section whose struct deserializes from a partial dict
+        /// (`ComputeConfig` is `#[serde(default)]`): the figment pipeline yields the
+        /// SAME `compute` config as `apply_env_overrides`, across str / int / list /
+        /// enum / bool field kinds.
+        #[test]
+        fn compute_matches_apply_env_overrides() {
+            let pairs = &[
+                ("BOATRAMP_COMPUTE_VCPUS", "4"),
+                ("BOATRAMP_COMPUTE_MEM_MIB", "2048"),
+                ("BOATRAMP_COMPUTE_REGION", "ams"),
+                (
+                    "BOATRAMP_COMPUTE_KERNEL_SIGNING_PUBKEYS",
+                    "es256:aa, es256:bb",
+                ),
+                ("BOATRAMP_COMPUTE_MANAGED_DB_PRIVILEGE", "rootless"),
+                ("BOATRAMP_COMPUTE_INTERNAL_DNS", "on"),
+            ];
+            let via_figment = resolve_from_env(&map(pairs)).expect("figment extract");
+            let mut via_apply = ServerConfig::default();
+            via_apply
+                .apply_env_overrides(&map(pairs))
+                .expect("apply_env_overrides");
+            assert_eq!(
+                format!("{:?}", via_figment.compute),
+                format!("{:?}", via_apply.compute),
+                "the figment compute section must equal apply_env_overrides'"
+            );
+        }
+
+        /// Parity oracle for the serve S3 scalars (the construens finalize concern)
+        /// — `ServeConfig` is `#[serde(default)]`. Covers the enum (`blobs`), a
+        /// string, and the bool (`s3_path_style`).
+        #[test]
+        fn serve_s3_scalars_extract() {
+            let cfg = resolve_from_env(&map(&[
+                ("BOATRAMP_BLOBS", "s3"),
+                ("BOATRAMP_S3_BUCKET", "construens-blobs"),
+                ("BOATRAMP_S3_ENDPOINT", "https://fly.storage.tigris.dev"),
+                ("BOATRAMP_S3_REGION", "auto"),
+                ("BOATRAMP_S3_PATH_STYLE", "true"),
+            ]))
+            .expect("extract");
+            let serve = cfg.serve.expect("serve materialised from env");
+            assert_eq!(serve.s3_bucket.as_deref(), Some("construens-blobs"));
+            assert_eq!(serve.s3_region.as_deref(), Some("auto"));
+            assert!(serve.s3_path_style, "s3_path_style coerced from \"true\"");
+        }
+
+        /// P0#2: the dynamic blob-backends map populates at the right nested path,
+        /// including the flattened sealed-credential public ref.
+        #[test]
+        fn blob_backends_dynamic_map_shape() {
+            let dict = env_overlay_dict(&map(&[
+                ("BOATRAMP_SERVE_BLOB_BACKEND_myproj_KIND", "s3"),
+                ("BOATRAMP_SERVE_BLOB_BACKEND_myproj_S3_BUCKET", "p-blobs"),
+                (
+                    "BOATRAMP_SERVE_BLOB_BACKEND_myproj_S3_ACCESS_KEY_ID",
+                    "AKIA",
+                ),
+            ]));
+            let serve = match dict.get("serve") {
+                Some(Value::Dict(_, s)) => s,
+                _ => panic!("serve dict present"),
+            };
+            let backends = match serve.get("blob_backends") {
+                Some(Value::Dict(_, b)) => b,
+                _ => panic!("blob_backends dict present"),
+            };
+            let myproj = match backends.get("myproj") {
+                Some(Value::Dict(_, p)) => p,
+                _ => panic!("myproj backend present"),
+            };
+            assert!(matches!(myproj.get("blobs"), Some(Value::String(_, s)) if s == "s3"));
+            assert!(matches!(myproj.get("s3_bucket"), Some(Value::String(_, s)) if s == "p-blobs"));
+            match myproj.get("s3_credential") {
+                Some(Value::Dict(_, cred)) => assert!(
+                    matches!(cred.get("access_key_id"), Some(Value::String(_, s)) if s == "AKIA")
+                ),
+                _ => panic!("s3_credential flattened under the backend"),
+            }
+        }
+
+        /// P0#1: the SQL `databases` map resolves the reserved `DEFAULT` token to
+        /// the real key `"default"`.
+        #[test]
+        fn sql_db_default_token_maps_to_default_key() {
+            let dict = env_overlay_dict(&map(&[(
+                "BOATRAMP_HANDLERS_SQL_DB_DEFAULT_KIND",
+                "postgres",
+            )]));
+            // handlers.bindings.sql.databases.default.kind == "postgres"
+            let mut cur = &dict;
+            for seg in ["handlers", "bindings", "sql", "databases", "default"] {
+                cur = match cur.get(seg) {
+                    Some(Value::Dict(_, inner)) => inner,
+                    _ => panic!("missing dict segment {seg}"),
+                };
+            }
+            assert!(matches!(cur.get("kind"), Some(Value::String(_, s)) if s == "postgres"));
+        }
     }
 }
