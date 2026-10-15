@@ -47,7 +47,6 @@ pub enum Error {
     #[error(transparent)]
     Migrate(#[from] crate::apply::Error),
     /// Resolving the STATIC daemon config (`boatramp.cfg` + env) for `config dump` failed.
-    #[cfg(feature = "config-figment")]
     #[error(transparent)]
     DaemonConfig(#[from] crate::config::ConfigError),
 }
@@ -106,11 +105,10 @@ enum ConfigCommand {
         #[arg(long)]
         write: bool,
     },
-    /// Resolve the STATIC daemon config (`boatramp.cfg` + `BOATRAMP_*` env, via the
-    /// `config-figment` pipeline) and print it as JSON with secret-bearing fields REDACTED.
-    /// Purely client-side — no server is contacted; this is the resolved config `serve`
-    /// would load. (Distinct from `get`/`set`, which read/write the live DYNAMIC config.)
-    #[cfg(feature = "config-figment")]
+    /// Resolve the STATIC daemon config (`boatramp.cfg` + `BOATRAMP_*` env, via the layered
+    /// config pipeline) and print it as JSON with secret-bearing fields REDACTED. Purely
+    /// client-side — no server is contacted; this is the resolved config `serve` would load.
+    /// (Distinct from `get`/`set`, which read/write the live DYNAMIC config.)
     Dump {
         /// The daemon config file to resolve (default `boatramp.cfg`). Env overlays it.
         #[arg(long, default_value = "boatramp.cfg")]
@@ -143,7 +141,6 @@ pub async fn run(args: ConfigArgs, config: &ProjectConfig) -> Result<()> {
         ConfigCommand::Migrate { file, write } => {
             return migrate_manifest(file, *write);
         }
-        #[cfg(feature = "config-figment")]
         ConfigCommand::Dump { file, explain } => {
             let resolved = crate::config::ServerConfig::load(file, None)?;
             println!("{}", resolved.dump_redacted()?);
@@ -164,11 +161,12 @@ pub async fn run(args: ConfigArgs, config: &ProjectConfig) -> Result<()> {
         ConfigCommand::Set { key, value } => set(&http, &server, &key, &value).await,
         ConfigCommand::Rollback => rollback(&http, &server).await,
         ConfigCommand::Apply { file } => apply(&http, &server, &file).await,
-        ConfigCommand::List | ConfigCommand::Describe { .. } | ConfigCommand::Migrate { .. } => {
+        ConfigCommand::List
+        | ConfigCommand::Describe { .. }
+        | ConfigCommand::Migrate { .. }
+        | ConfigCommand::Dump { .. } => {
             unreachable!("handled above")
         }
-        #[cfg(feature = "config-figment")]
-        ConfigCommand::Dump { .. } => unreachable!("handled above"),
     }
 }
 

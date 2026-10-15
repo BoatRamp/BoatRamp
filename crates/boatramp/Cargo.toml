@@ -71,12 +71,6 @@ default = [
   "mcp",
   "project-export",
 ]
-# WIP: the figment single config-resolution pipeline (defaults → file → env → flags) that
-# supersedes the three hand-maintained env loaders. DELIBERATELY NOT in `default` (the one
-# exception to batteries-included): it changes security-sensitive config resolution, so it
-# ships OPT-IN until the owner flips the default. Forwards to boatramp-node's gate; enabling
-# it turns on the `boatramp config` subcommand + routes serve/offline config through figment.
-config-figment = ["boatramp-node/config-figment"]
 # The read-fallback composite (blob-backend migration Part 2): `[serve.blob_fallback]` wraps
 # `FallbackStorage` over the built primary. Generic (no cloud dep of its own), so each blob-backend
 # feature turns it on and it rides along with any backend the binary can build.

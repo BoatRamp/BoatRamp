@@ -643,29 +643,22 @@ pub struct ServeArgs {
     oidc_scope_claim: Option<String>,
 }
 
-impl ServeArgs {
-    /// Merge upload limits from flags/env over the `serve` config defaults, then
-    /// fall back to the security posture's default cap: an
-    /// unconfigured `max_upload_bytes` is no longer unbounded. The posture's `0`
-    /// means "explicitly unlimited" (e.g. the `dev` profile).
-    fn server_limits(
-        &self,
-        serve_cfg: &crate::config::ServeConfig,
-        posture: &boatramp_core::security::SecurityPosture,
-    ) -> boatramp_server::ServerLimits {
-        boatramp_server::ServerLimits {
-            max_upload_bytes: self
-                .max_upload_bytes
-                .or(serve_cfg.max_upload_bytes)
-                .or_else(|| (posture.max_upload_bytes != 0).then_some(posture.max_upload_bytes)),
-            upload_idle_timeout: self
-                .upload_idle_timeout_secs
-                .or(serve_cfg.upload_idle_timeout_secs)
-                .map(std::time::Duration::from_secs),
-            max_concurrent_uploads: self
-                .max_concurrent_uploads
-                .or(serve_cfg.max_concurrent_uploads),
-        }
+/// Upload limits from the resolved `serve` config (flags/env/file already merged by the
+/// config pipeline), falling back to the security posture's default cap: an unconfigured
+/// `max_upload_bytes` is no longer unbounded. The posture's `0` means "explicitly unlimited"
+/// (e.g. the `dev` profile).
+fn server_limits(
+    serve_cfg: &crate::config::ServeConfig,
+    posture: &boatramp_core::security::SecurityPosture,
+) -> boatramp_server::ServerLimits {
+    boatramp_server::ServerLimits {
+        max_upload_bytes: serve_cfg
+            .max_upload_bytes
+            .or_else(|| (posture.max_upload_bytes != 0).then_some(posture.max_upload_bytes)),
+        upload_idle_timeout: serve_cfg
+            .upload_idle_timeout_secs
+            .map(std::time::Duration::from_secs),
+        max_concurrent_uploads: serve_cfg.max_concurrent_uploads,
     }
 }
 
@@ -677,38 +670,35 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
     // absent `[security]` ⇒ the strict `multi-tenant` default. Threaded into
     // `ServerOptions` so it reaches the cluster path too.
     let posture = config.security.clone().unwrap_or_default().resolve()?;
-    // Server-level options (flag/env > `serve` config). Resolved before the
-    // `serve` fields below are consumed.
+    // Server-level options, read from the resolved `serve` config (the pipeline already
+    // merged flags/env/file). Resolved before the `serve` fields below are consumed.
     let mut options = boatramp_server::ServerOptions {
-        limits: args.server_limits(&serve_cfg, &posture),
-        default_site: args.default_site.clone().or(serve_cfg.default_site.clone()),
-        pop_origin: args.pop_origin.clone().or(serve_cfg.pop_origin.clone()),
-        protect_previews: args.protect_previews || serve_cfg.protect_previews,
+        limits: server_limits(&serve_cfg, &posture),
+        default_site: serve_cfg.default_site.clone(),
+        pop_origin: serve_cfg.pop_origin.clone(),
+        protect_previews: serve_cfg.protect_previews,
         posture,
         // The listener terminates TLS in any non-`Off` mode; used to derive the
-        // request scheme when X-Forwarded-Proto isn't trusted.
+        // request scheme when X-Forwarded-Proto isn't trusted. (`--tls` is a runtime
+        // selector, not a config field.)
         served_over_tls: !matches!(args.tls, TlsMode::Off),
-        bootstrap_secret: args
-            .bootstrap_secret
-            .clone()
-            .or(serve_cfg.bootstrap_secret.clone()),
+        bootstrap_secret: serve_cfg.bootstrap_secret.clone(),
         ..Default::default()
     };
-    // Resolve the `[serve.kv.sql]` connection config early (a pure config+env read, no I/O) so the
+    // The `[serve.kv.sql]` connection config (resolved by the pipeline) — read early so the
     // DERIVED coordination model is known BEFORE the cluster dispatch / any store open (kv-sql WS4).
-    let sql_kv_cfg = resolve_sql_kv_config(serve_cfg.kv.as_ref().and_then(|k| k.sql.as_ref()));
+    let sql_kv_cfg = serve_cfg.kv.as_ref().and_then(|k| k.sql.clone());
     // The backend's DECLARED writer model (UX-C4 / C1 / C7): a multi-writer backend (Postgres/MySQL)
     // self-coordinates — N stateless nodes share one DB, no Raft — which auto-implies shared-mode
     // cache coherence + cluster-wide rate limiting, and REFUSES a Raft cluster alongside it.
+    // (`--kv` is a runtime backend selector, not a config field.)
     let multi_writer = declared_kv_writer_model(args.kv, sql_kv_cfg.as_ref())
         == boatramp_core::kv::WriterModel::MultiWriter;
-    // Cluster-wide rate limiting: an explicit flag/config, OR auto-on under a multi-writer backend
-    // (the N-node shared topology — per-node buckets would under-count). (UX-C4 derive-not-flag.)
-    let cluster_rate_limit =
-        args.cluster_rate_limit || serve_cfg.cluster_rate_limit || multi_writer;
-    let addr = args
+    // Cluster-wide rate limiting: the resolved config value, OR auto-on under a multi-writer
+    // backend (the N-node shared topology — per-node buckets would under-count). (UX-C4.)
+    let cluster_rate_limit = serve_cfg.cluster_rate_limit || multi_writer;
+    let addr = serve_cfg
         .addr
-        .or(serve_cfg.addr)
         .unwrap_or_else(|| "127.0.0.1:8080".parse().expect("valid default addr"));
     // Implicit host routing (first-label `<site>.host` / sole-site at root) is a
     // dev / single-operator convenience: enable it when the posture allows, or
@@ -736,10 +726,9 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
             );
         }
     }
-    let data_dir = args
+    let data_dir = serve_cfg
         .data_dir
         .clone()
-        .or(serve_cfg.data_dir)
         .unwrap_or_else(|| PathBuf::from("./data"));
 
     // Cloud blob-change notification provisioning config (FA-5b2): the tier + the
@@ -754,56 +743,25 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
     // call, once its KV/envelope exist. This keeps ONE credential source honored on both paths without
     // opening a stray store or reading the base key from the ambient env when a sealed source is set.
     let s3_credential_cfg = serve_cfg.s3_credential.clone();
-    // The blob backend + its per-backend options resolve flag/env > `[serve]` config > built-in
-    // default — the uniform `serve` precedence. `--blobs`/`BOATRAMP_BLOBS` has a clap default of
-    // `fs`, so a config-level `[serve].blobs` is honoured only when the flag/env was NOT explicitly
-    // set; the fs/anonymous/path-style/emulator toggles are ORed (a set flag can only enable an
-    // option) so the config value is honoured. `boatramp blob migrate` reads the SAME `[serve]`
-    // fields from its `--from`/`--to` config files.
-    let blobs_explicit =
-        std::env::var_os("BOATRAMP_BLOBS").is_some() || args.blobs != BlobBackend::Fs;
+    // The blob backend + its per-backend options come from the resolved `[serve]` config (the
+    // pipeline already merged `--blobs`/`BOATRAMP_BLOBS`/file with flag>env>file precedence; a
+    // defaulted `--blobs fs` is absent from the flag layer, so a `[serve].blobs` is honoured —
+    // the old `var_os` explicit-set probe is subsumed). Unset ⇒ `fs`. `boatramp blob migrate`
+    // reads the SAME `[serve]` fields from its `--from`/`--to` config files.
     let blob_args = BlobArgs {
-        blobs: if blobs_explicit {
-            args.blobs
-        } else {
-            serve_cfg.blobs.unwrap_or(args.blobs)
-        },
-        s3_bucket: args
-            .s3_bucket
-            .clone()
-            .or_else(|| serve_cfg.s3_bucket.clone()),
-        s3_endpoint: args
-            .s3_endpoint
-            .clone()
-            .or_else(|| serve_cfg.s3_endpoint.clone()),
-        s3_region: args
-            .s3_region
-            .clone()
-            .or_else(|| serve_cfg.s3_region.clone()),
-        s3_path_style: args.s3_path_style || serve_cfg.s3_path_style,
+        blobs: serve_cfg.blobs.unwrap_or(BlobBackend::Fs),
+        s3_bucket: serve_cfg.s3_bucket.clone(),
+        s3_endpoint: serve_cfg.s3_endpoint.clone(),
+        s3_region: serve_cfg.s3_region.clone(),
+        s3_path_style: serve_cfg.s3_path_style,
         s3_credential: None,
-        gcs_bucket: args
-            .gcs_bucket
-            .clone()
-            .or_else(|| serve_cfg.gcs_bucket.clone()),
-        gcs_endpoint: args
-            .gcs_endpoint
-            .clone()
-            .or_else(|| serve_cfg.gcs_endpoint.clone()),
-        gcs_anonymous: args.gcs_anonymous || serve_cfg.gcs_anonymous,
-        azure_account: args
-            .azure_account
-            .clone()
-            .or_else(|| serve_cfg.azure_account.clone()),
-        azure_container: args
-            .azure_container
-            .clone()
-            .or_else(|| serve_cfg.azure_container.clone()),
-        azure_access_key: args
-            .azure_access_key
-            .clone()
-            .or_else(|| serve_cfg.azure_access_key.clone()),
-        azure_emulator: args.azure_emulator || serve_cfg.azure_emulator,
+        gcs_bucket: serve_cfg.gcs_bucket.clone(),
+        gcs_endpoint: serve_cfg.gcs_endpoint.clone(),
+        gcs_anonymous: serve_cfg.gcs_anonymous,
+        azure_account: serve_cfg.azure_account.clone(),
+        azure_container: serve_cfg.azure_container.clone(),
+        azure_access_key: serve_cfg.azure_access_key.clone(),
+        azure_emulator: serve_cfg.azure_emulator,
     };
 
     // UX-C4 self-contradiction refusal: a MULTI-WRITER SQL backend (self-coordinating) configured
@@ -901,13 +859,14 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
     }
 
     // `--kv-s3` runs the SlateDB control-plane store on the S3 object store (R2),
-    // reusing the `--blobs s3` addressing (bucket/endpoint/region/path-style) +
-    // AWS-env credentials, so a volumeless container keeps durable metadata.
+    // reusing the resolved `[serve].s3_*` addressing (bucket/endpoint/region/path-style) +
+    // AWS-env credentials, so a volumeless container keeps durable metadata. (`--kv-s3` and
+    // its prefix are runtime kv-backend selectors, not config fields.)
     let slate_s3 = args.kv_s3.then(|| boatramp_node::backends::SlateKvS3 {
-        bucket: args.s3_bucket.clone().unwrap_or_default(),
-        endpoint: args.s3_endpoint.clone(),
-        region: args.s3_region.clone(),
-        path_style: args.s3_path_style,
+        bucket: serve_cfg.s3_bucket.clone().unwrap_or_default(),
+        endpoint: serve_cfg.s3_endpoint.clone(),
+        region: serve_cfg.s3_region.clone(),
+        path_style: serve_cfg.s3_path_style,
         prefix: args.kv_s3_prefix.clone(),
     });
     // Cold-open recovery policy (v0.9.0 KV-recovery, C8/C11). This `run` is the SINGLE-NODE path
@@ -990,7 +949,7 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
     // over the *uncached* backend and poll it to invalidate peer-changed keys. AUTO-ON under a
     // multi-writer backend (UX-C4 derive-not-flag); the standalone `--shared-cache-coherence` flag is
     // DEPRECATED (honored, with a one-line note, for the legacy shared-SlateDB/Cloudflare topology).
-    let flag_shared = args.shared_cache_coherence || serve_cfg.shared_cache_coherence;
+    let flag_shared = serve_cfg.shared_cache_coherence;
     if flag_shared && multi_writer {
         tracing::info!(
             "note: `--shared-cache-coherence` / `[serve].shared_cache_coherence` is DEPRECATED and \
@@ -1234,14 +1193,17 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
     // Periodic control-plane KV checkpoint + graceful-close budget (v0.9.0 KV-recovery, C1/C12).
     // The cadence advances the durable frontier so the self-heal-on-open trailing-tail loss window
     // stays bounded (default-ON, dirty-gated no-op when idle); the close budget bounds the graceful
-    // shutdown. Both come from `[serve.kv]` (+ env override) — see `resolve_kv_durability`.
-    let (kv_checkpoint_interval, kv_close_deadline) = resolve_kv_durability(serve_cfg.kv.as_ref());
+    // shutdown. Both come from the resolved `[serve.kv.slatedb]` (the pipeline merged env/file;
+    // `KvConfig` maps a `Some(0)` to "disabled"/the default).
+    let kv_cfg = serve_cfg.kv.clone().unwrap_or_default();
+    let (kv_checkpoint_interval, kv_close_deadline) =
+        (kv_cfg.checkpoint_interval(), kv_cfg.close_deadline());
     spawn_kv_checkpoint(kv.clone(), kv_checkpoint_interval);
     // Supervised online maintenance GC (kv-data-observability durable fix): reclaim the stale
     // manifest/compactions objects the embedded GC leaks when it dies on its first transient error.
     // Runs over the UNCACHED `kv_backend` (the reclaim is a store-physical op; the LRU is irrelevant)
     // — a SlateDB writer runs it, every other backend is a cheap no-op. See `spawn_kv_maintenance_gc`.
-    let (kv_gc_interval, kv_gc_min_age) = resolve_kv_gc(serve_cfg.kv.as_ref());
+    let (kv_gc_interval, kv_gc_min_age) = (kv_cfg.gc_interval(), kv_cfg.gc_min_age());
     spawn_kv_maintenance_gc(kv_backend.clone(), kv_gc_interval, kv_gc_min_age);
     // MF-3/MF-4 — in multi-writer `shared` mode the authorizer gets the fence + the UNCACHED backing
     // store so it can read the authz keyspace THROUGH the cache (fence) and FAIL CLOSED (shed) when
@@ -1254,12 +1216,8 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
         });
     let auth = boatramp_node::auth::configure_auth(
         serve_cfg.signer.as_ref(),
-        args.auth_root_private_key
-            .clone()
-            .or(serve_cfg.auth_root_private_key.clone()),
-        args.auth_root_public_key
-            .clone()
-            .or(serve_cfg.auth_root_public_key.clone()),
+        serve_cfg.auth_root_private_key.clone(),
+        serve_cfg.auth_root_public_key.clone(),
         &mut options,
         kv.clone(),
         shared_authz,
@@ -1326,7 +1284,7 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
     // to HTTPS. Ignored for `--tls off`.
     #[cfg(feature = "tls")]
     if !matches!(args.tls, TlsMode::Off)
-        && let Some(redirect_addr) = args.http_redirect_addr.or(serve_cfg.http_redirect_addr)
+        && let Some(redirect_addr) = serve_cfg.http_redirect_addr
     {
         spawn_http_redirect(redirect_addr, deploy.clone(), posture);
     }
@@ -1780,118 +1738,6 @@ async fn quiesce_and_close(
             false
         }
     }
-}
-
-/// Resolve the `[serve.kv]` durability knobs (v0.9.0 KV-recovery) — the periodic-checkpoint cadence
-/// (C1) and the graceful-close budget (C12) — from config, with an env override so a fly deploy can
-/// tune them without a config file: `BOATRAMP_KV_CHECKPOINT_INTERVAL` / `BOATRAMP_KV_CLOSE_DEADLINE`
-/// (both seconds). An unparsable env value is ignored (the config/default wins) with a WARN — never a
-/// silent misparse. Shared by `run` (single-node) and `run_cluster`.
-fn resolve_kv_durability(
-    kv_cfg: Option<&boatramp_node::config::KvConfig>,
-) -> (Option<std::time::Duration>, std::time::Duration) {
-    fn env_secs(var: &str) -> Option<u64> {
-        match std::env::var(var) {
-            Ok(raw) => match raw.trim().parse::<u64>() {
-                Ok(secs) => Some(secs),
-                Err(_) => {
-                    tracing::warn!(%var, value = %raw, "ignoring unparsable env override (want seconds)");
-                    None
-                }
-            },
-            Err(_) => None,
-        }
-    }
-    let cfg = kv_cfg.cloned().unwrap_or_default();
-    let checkpoint = match env_secs("BOATRAMP_KV_CHECKPOINT_INTERVAL") {
-        Some(0) => None, // env explicitly disables the cadence
-        Some(secs) => Some(std::time::Duration::from_secs(secs)),
-        None => cfg.checkpoint_interval(),
-    };
-    let close = match env_secs("BOATRAMP_KV_CLOSE_DEADLINE") {
-        Some(secs) if secs > 0 => std::time::Duration::from_secs(secs),
-        _ => cfg.close_deadline(),
-    };
-    (checkpoint, close)
-}
-
-/// Resolve the `[serve.kv]` online maintenance-GC knobs (kv-data-observability durable fix) — the
-/// supervised reclaim cadence and the minimum object age — from config, with an env override so a fly
-/// deploy can tune them with no config file: `BOATRAMP_KV_GC_INTERVAL` / `BOATRAMP_KV_GC_MIN_AGE`
-/// (both seconds). An `interval` of `None` ⇒ the task is DISABLED (`gc_interval = 0` in config, or the
-/// env set to `0`). An unparsable env value is ignored (config/default wins) with a WARN. Shared by
-/// `run` (single-node) and `run_cluster` (node-local durable store).
-fn resolve_kv_gc(
-    kv_cfg: Option<&boatramp_node::config::KvConfig>,
-) -> (Option<std::time::Duration>, std::time::Duration) {
-    fn env_secs(var: &str) -> Option<u64> {
-        match std::env::var(var) {
-            Ok(raw) => match raw.trim().parse::<u64>() {
-                Ok(secs) => Some(secs),
-                Err(_) => {
-                    tracing::warn!(%var, value = %raw, "ignoring unparsable env override (want seconds)");
-                    None
-                }
-            },
-            Err(_) => None,
-        }
-    }
-    let cfg = kv_cfg.cloned().unwrap_or_default();
-    let interval = match env_secs("BOATRAMP_KV_GC_INTERVAL") {
-        Some(0) => None, // env explicitly disables the task
-        Some(secs) => Some(std::time::Duration::from_secs(secs)),
-        None => cfg.gc_interval(),
-    };
-    let min_age = match env_secs("BOATRAMP_KV_GC_MIN_AGE") {
-        Some(secs) if secs > 0 => std::time::Duration::from_secs(secs),
-        _ => cfg.gc_min_age(),
-    };
-    (interval, min_age)
-}
-
-/// Resolve the `[serve.kv.sql]` SQL-KV backend connection (UX-C2), overlaying the
-/// `BOATRAMP_KV_SQL_*` env (env wins) so a fly deploy can configure `--kv sql` with no config file:
-/// `BOATRAMP_KV_SQL_KIND`, `BOATRAMP_KV_SQL_PATH`, `BOATRAMP_KV_SQL_URL_ENV`,
-/// `BOATRAMP_KV_SQL_POOL_MAX`. Returns `None` when neither the config block nor any env var is set
-/// (the non-SQL backends ignore it; the SQL backend then errors with actionable guidance). The URL
-/// itself is NEVER taken from config/env directly — only the NAME of the env var holding it
-/// (`url_env`), mirroring `ExternalDatabaseConfig`.
-fn resolve_sql_kv_config(
-    base: Option<&boatramp_node::config::SqlKvConfig>,
-) -> Option<boatramp_node::config::SqlKvConfig> {
-    let env = |key: &str| std::env::var(key).ok().filter(|v| !v.trim().is_empty());
-    let kind = env("BOATRAMP_KV_SQL_KIND");
-    let path = env("BOATRAMP_KV_SQL_PATH");
-    let url_env = env("BOATRAMP_KV_SQL_URL_ENV");
-    let pool_max = env("BOATRAMP_KV_SQL_POOL_MAX").and_then(|v| match v.trim().parse::<u32>() {
-        Ok(n) => Some(n),
-        Err(_) => {
-            tracing::warn!(
-                var = "BOATRAMP_KV_SQL_POOL_MAX",
-                value = %v,
-                "ignoring unparsable env override (want a positive integer)"
-            );
-            None
-        }
-    });
-    if base.is_none() && kind.is_none() && path.is_none() && url_env.is_none() && pool_max.is_none()
-    {
-        return None;
-    }
-    let mut cfg = base.cloned().unwrap_or_default();
-    if let Some(kind) = kind {
-        cfg.kind = kind;
-    }
-    if let Some(path) = path {
-        cfg.path = Some(path);
-    }
-    if let Some(url_env) = url_env {
-        cfg.url_env = Some(url_env);
-    }
-    if let Some(pool_max) = pool_max {
-        cfg.pool_max = Some(pool_max);
-    }
-    Some(cfg)
 }
 
 /// Spawn the periodic control-plane KV checkpoint task (v0.9.0 KV-recovery, C1). Every `interval` it
@@ -3027,7 +2873,6 @@ impl boatramp_cluster::http::ClientWriteAuthz for MeshWriteAuthz {
 #[cfg(feature = "cluster")]
 #[allow(clippy::type_complexity)]
 async fn build_mesh_write_gate(
-    args: &ServeArgs,
     config: &ServerConfig,
     mesh_cfg: &crate::config::MeshConfig,
 ) -> Result<(
@@ -3040,12 +2885,10 @@ async fn build_mesh_write_gate(
     if !mesh_cfg.gate_client_writes.unwrap_or(false) {
         return Ok((None, None));
     }
-    let priv_hex = args.auth_root_private_key.clone().or_else(|| {
-        config
-            .serve
-            .as_ref()
-            .and_then(|s| s.auth_root_private_key.clone())
-    });
+    let priv_hex = config
+        .serve
+        .as_ref()
+        .and_then(|s| s.auth_root_private_key.clone());
     let Some(priv_hex) = priv_hex else {
         tracing::warn!(
             "cluster.mesh.gate_client_writes is set but no token root private key is \
@@ -3210,8 +3053,15 @@ async fn run_cluster(
     // committed entries durable; this is defense-in-depth), and the close budget bounds the graceful
     // shutdown. (C8: the cluster self-heal-on-open stays STRICT — that is wired at the open site, not
     // here; the cadence/close budget are orthogonal loss-window bounds that always help.)
-    let (kv_checkpoint_interval, kv_close_deadline) =
-        resolve_kv_durability(config.serve.as_ref().and_then(|s| s.kv.as_ref()));
+    let cluster_kv_cfg = config
+        .serve
+        .as_ref()
+        .and_then(|s| s.kv.clone())
+        .unwrap_or_default();
+    let (kv_checkpoint_interval, kv_close_deadline) = (
+        cluster_kv_cfg.checkpoint_interval(),
+        cluster_kv_cfg.close_deadline(),
+    );
     spawn_kv_checkpoint(durable_kv_handle.clone(), kv_checkpoint_interval);
     // Supervised online maintenance GC for the node-local durable Raft store (kv-data-observability
     // durable fix): it is a SlateDB writer too, so its embedded GC can die on a transient error and
@@ -3219,7 +3069,7 @@ async fn run_cluster(
     // latest manifest no longer references (never the live log/state), exactly as the embedded GC
     // would — safe concurrent with openraft, bounded by the conservative `min_age`.
     let (kv_gc_interval, kv_gc_min_age) =
-        resolve_kv_gc(config.serve.as_ref().and_then(|s| s.kv.as_ref()));
+        (cluster_kv_cfg.gc_interval(), cluster_kv_cfg.gc_min_age());
     spawn_kv_maintenance_gc(durable_kv_handle.clone(), kv_gc_interval, kv_gc_min_age);
 
     use boatramp_cluster::mesh::{self, MeshIdentity, MeshTls, TrustSet};
@@ -3379,7 +3229,7 @@ async fn run_cluster(
 
     // Optionally gate mesh client-writes behind a control-plane cluster-write
     // capability (this node's capability + the authorizer for incoming forwards).
-    let (write_capability, write_authz) = build_mesh_write_gate(&args, config, &mesh_cfg).await?;
+    let (write_capability, write_authz) = build_mesh_write_gate(config, &mesh_cfg).await?;
     if write_authz.is_some() {
         tracing::info!("cluster: mesh client-write gating enabled");
     }
@@ -3533,7 +3383,7 @@ async fn run_cluster(
     default_scope_libsql_notice(config, &data_dir, kv.as_ref()).await;
 
     // Cluster-wide rate limiting shares the *replicated* RaftKv across nodes.
-    if args.cluster_rate_limit || config.serve.as_ref().is_some_and(|s| s.cluster_rate_limit) {
+    if config.serve.as_ref().is_some_and(|s| s.cluster_rate_limit) {
         options.cluster_rate_limit_kv = Some(kv.clone());
     }
     // SIGHUP also force-reloads the daemon config (the ApplyObserver already
@@ -3542,12 +3392,8 @@ async fn run_cluster(
     let cluster_serve_cfg = config.serve.clone().unwrap_or_default();
     let auth = boatramp_node::auth::configure_auth(
         cluster_serve_cfg.signer.as_ref(),
-        args.auth_root_private_key
-            .clone()
-            .or(cluster_serve_cfg.auth_root_private_key.clone()),
-        args.auth_root_public_key
-            .clone()
-            .or(cluster_serve_cfg.auth_root_public_key),
+        cluster_serve_cfg.auth_root_private_key.clone(),
+        cluster_serve_cfg.auth_root_public_key.clone(),
         &mut options,
         kv.clone(),
         // Raft cluster = single-writer over a node-local store (replication keeps every node
@@ -3616,9 +3462,7 @@ async fn run_cluster(
     );
     #[cfg(feature = "tls")]
     if !matches!(args.tls, TlsMode::Off) {
-        let redirect = args
-            .http_redirect_addr
-            .or_else(|| config.serve.as_ref().and_then(|s| s.http_redirect_addr));
+        let redirect = config.serve.as_ref().and_then(|s| s.http_redirect_addr);
         if let Some(redirect_addr) = redirect {
             spawn_http_redirect(redirect_addr, deploy.clone(), options.posture);
         }

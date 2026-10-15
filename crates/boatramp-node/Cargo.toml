@@ -38,10 +38,9 @@ boatramp-storage = { workspace = true, optional = true }
 # Optional: derives `clap::ValueEnum` on the backend-selection enums so the CLI
 # binary uses them directly in its args. A non-CLI embedder never pulls clap.
 clap = { workspace = true, optional = true }
-# Layered config resolution (`config-figment` feature, WIP): the single env→config
-# pipeline that replaces the three hand-maintained env loaders. Optional so the
-# default build is untouched while the migration lands behind the feature.
-figment = { workspace = true, optional = true }
+# Layered config resolution: the single `defaults → file → env → flags` pipeline
+# (`config::figment_resolve`) that is the node's only config loader.
+figment.workspace = true
 ron.workspace = true
 serde = { workspace = true, features = ["derive"] }
 # Serializing the managed-DB soft-delete tombstone records into the control-plane KV
@@ -84,12 +83,6 @@ tokio-util = { workspace = true, features = ["compat"], optional = true }
 # cfg-gated to the feature that consumes them. The binary forwards each of its
 # features to the matching one here so the gating stays consistent.
 acme-dns = []
-# WIP: the figment-based single config-resolution pipeline (defaults → file → env →
-# flags) that supersedes the three hand-maintained env loaders (serve clap `#[arg(env)]`,
-# `apply_env_overrides`, ad-hoc `std::env::var`). Off by default: lands + is parity-tested
-# behind the feature, then flips to the default path and the old loaders are deleted. See
-# docs/config-figment-migration.md.
-config-figment = ["dep:figment"]
 azure = ["dep:boatramp-storage", "boatramp-storage/azure", "fallback"]
 # Derive `clap::ValueEnum` on the backend enums (enabled by the CLI binary).
 clap = ["dep:clap"]
