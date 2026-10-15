@@ -1118,7 +1118,7 @@ pub async fn default_scope_collisions(
             }
         }
     }
-    out.sort_by(|a, b| a.describe().cmp(&b.describe()));
+    out.sort_by_key(DefaultScopeCollision::describe);
     Ok(out)
 }
 

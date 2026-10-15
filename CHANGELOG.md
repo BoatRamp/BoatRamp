@@ -5,6 +5,64 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.34.0] - 2026-10-15
+
+**Migration-safety rewrite + two data-loss fixes.** A routine v0.30→v0.33 roll crash-looped a
+production node: `serve --auto-migrate` ran the v0.31 default-scope re-home as a boot side effect, hit
+a name collision, and exited non-zero into a restart loop. This release rewrites the control-plane
+store migration so a binary roll can never brick a boot, makes the re-home reversible and interactive,
+and fixes two independent data-loss bugs the incident exposed. No WIT/shim change.
+
+### serve never bricks on a store migration
+
+- `serve` NO LONGER runs a data re-home as a boot side effect and NEVER exits on a below-version store.
+  A store below the current schema version is served on its EXISTING layout via new
+  backward-read-compat decorators — so rolling the binary is a true no-op (no crash-loop, no 503
+  window, nothing appears to vanish) — and it logs the explicit `boatramp migrate` step. Both the
+  single-node and cluster paths.
+- Backward-read-compat on all three substrates, selected from the store's schema state and a no-op on
+  a fresh/migrated store: KV (`hkv/` + `mq*/` translate to the bare old spelling, reads and writes),
+  blob (a pure translating backend), and libsql (an open-path resolver that opens the bare file in
+  place — also closing the earlier hazard where a post-flip open auto-created an EMPTY database).
+- `--auto-migrate` is kept but made FAILURE-SAFE: it stages at boot (before the runtime is built), and
+  on ANY failure logs and falls through to serving the existing layout — it can no longer exit.
+
+### Reversible + interactive migration
+
+- `boatramp migrate --abort` rolls a staged (dual-soak) migration back to the exact pre-forward bytes,
+  fail-closed: it refuses (deleting nothing) if any staged key received a write during the soak.
+- `boatramp migrate --interactive` + a console **Store migration** wizard (Maintenance page) walk the
+  operator through the plan, pausing at each decision (a name collision → rename / skip / abort) and
+  staging the chosen routes. The console arms the answers and the node stages them at the next restart
+  (before serving), so no process ever serves through a stale layout.
+- New `System·Admin` admin API `/api/store-migrate/{status,arm,abort}` backs the console — node-global,
+  at a hyphen path that cannot inherit the per-project `/api/migrate/` (SQL-schema) right.
+
+### Resolving a default-scope name collision (manual)
+
+The re-home refuses — as an offline `boatramp migrate` error, never a boot brick — when a
+default-project `site`/`compute` is named `default` or like an existing tenant project, because the two
+share a bare keyspace with no provenance to split them. Resolve it with existing operator tools:
+**re-create the colliding default-project resource under a new, non-colliding name via the normal
+deploy flow (e.g. `boatramp deploy --site <new> …`), delete the old one, then re-run `boatramp
+migrate`** (interactive or not). `--interactive` / the console wizard surface each collision and
+re-check it. The old silent-strand `--allow-default-named-resource` flag is removed.
+
+### Data-loss fixes
+
+- **GC deleted live function components.** `collect_garbage` / `blob purge --unreferenced --apply`
+  referenced only site-manifest blobs, but a live function's component lives in the same
+  content-addressed store (and `delete_function` defers its cleanup to prune) — so a prune deleted the
+  component of a LIVE function and every invoke then 404'd. Fixed: GC now references every live
+  function's active + retained components. New `boatramp blob verify` (+ `GET /api/blob-verify`,
+  `System·Read`) lists dead references (referenced-but-missing blobs); repair by re-uploading
+  (`boatramp blob put`, same content hash) or re-deploying.
+- **`kv compact --apply` reclaimed no manifests.** The v0.33 manifest GC was a silent no-op after its
+  first run — SlateDB advances a `gc/manifest.boundary` file via `PutMode::Update`, which
+  `object_store`'s `LocalFileSystem` (a local fly volume) returns `NotImplemented` for, and SlateDB
+  swallows the error — so both the offline compact and the online supervised GC deleted zero
+  manifests. Fixed (`boundary_files_enabled: false`); both now reclaim the backlog.
+
 ## [0.33.0] - 2026-10-14
 
 Control-plane KV **data-volume observability + a durable manifest-GC fix**. A shared node's SlateDB

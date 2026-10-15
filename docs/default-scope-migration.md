@@ -28,11 +28,28 @@ re-homes the data that persists the scope string: `{base}` → `default/{base}`.
 - **Ephemeral state** (in-memory permit/meter/log-scope keys) recomputes after the upgrade — no
   migration.
 
-## The serve guard (hard data-safety gate)
+## Serve on a below-version store (v0.34.0: never bricks)
 
-The control-plane schema version is bumped. A node whose store is below the new version **refuses to
-serve** until it is migrated (`boatramp migrate`), exactly like the 0.2.0 project re-key. A silent
-auto-flip would make a running node's default-scoped data appear to vanish; the guard prevents that.
+**As of v0.34.0 `serve` never refuses, and never re-homes as a boot side effect.** A node whose store
+is below the new version **serves its EXISTING layout** via backward-read-compat decorators (KV
+`hkv/`+`mq*/`, a translating blob backend, and a libsql open-path resolver) — so rolling the new binary
+onto an un-migrated store is a true no-op (no crash-loop, no 503 window, nothing appears to vanish). It
+logs the explicit `boatramp migrate` step. The re-home is a deliberate, operator-run step you perform
+when ready; it is reversible until you finalize (`boatramp migrate --abort`).
+
+`serve --auto-migrate` is still accepted and still stages the re-home at boot (before the runtime is
+built — the zero-stale-decorator path), but it is now **failure-safe**: any staging error (a name
+collision, a mid-flight interruption, a transient error) is logged and the node falls through to
+serving the existing layout. It can no longer exit the process. (This replaced the pre-v0.34.0 guard
+that refused to serve and, under `--auto-migrate`, crash-looped on a collision.)
+
+### Interactive migration (v0.34.0)
+
+`boatramp migrate --interactive` (CLI) and the console **Store migration** wizard (Maintenance page,
+`System·Admin`) walk you through the plan, prompt at each decision point (a name collision →
+rename / skip / abort), and stage the re-home honoring your answers. The console *arms* the answers and
+the node stages them at the next restart (via `serve --auto-migrate`, before it serves); the CLI stages
+directly. Both drive the same engine, so the surfaces can't diverge.
 
 ## Migration, substrate by substrate
 
@@ -88,9 +105,15 @@ sets) and the default-project libsql is re-homed (an on-disk scan via `--node-co
 clearing the soak disengages the blob read-fallback.
 
 A **fail-closed pre-migration guard** refuses the forward pass if a default-project site/compute is
-named `default` (its bare scope collides with the re-home prefix) or like a known project (the
-pre-existing commingling); rename it first, or re-run with `--allow-default-named-resource` (its data
-will NOT be re-homed).
+named `default` (its bare scope collides with the re-home prefix) or like an existing tenant project
+(the pre-existing commingling — the two share a bare keyspace with no provenance to split them). This
+is an OFFLINE `boatramp migrate` refusal, **not** a serve error — the node keeps serving the existing
+layout meanwhile (and `serve --auto-migrate` falls back to serving rather than failing). **Resolve it
+manually** with the existing operator tools: re-create the colliding default-project resource under a
+new, non-colliding name via the normal deploy flow (e.g. `boatramp deploy --site <new> …`), delete the
+old one, then re-run `boatramp migrate`. The `--interactive` flow and the console wizard surface each
+collision as a rename / skip / abort decision and re-check it. (The old `--allow-default-named-resource`
+flag, which proceeded while silently stranding the resource's data, has been **removed**.)
 
 **Messaging continuity.** `mqgstate/{topic}/{group}` offsets are copied in the **same forward pass** as
 their `mqglog`/`mqgd` and before the new binary serves (the version guard enforces this). The runtime
@@ -136,8 +159,16 @@ no writer):
 
 ## Rollback
 
-While the KV migration is staged (pre-`--finalize`) and the blob old keys are not yet retired, the old
-spelling still exists — revert the binary and the node serves the old scope again. **libsql is the
-exception:** `boatramp sql rehome-default` MOVES the file (no soak), so reverting after it requires
-restoring `{dir}/{site}.db` from backup (or moving `{dir}/default/{site}.db` back). After the KV
-`--finalize` + the blob retire, rollback is a restore from backup.
+**Before any re-home has run** (v0.34.0): rolling the binary back and forth is a no-op either way —
+the new binary serves the un-migrated store via backward-read-compat, and the old binary serves it
+natively.
+
+**While the KV migration is staged (pre-`--finalize`)**: the old spelling still exists, so reverting
+the binary serves the old scope again. Better, `boatramp migrate --abort` rolls the stage back to the
+exact pre-forward bytes (fail-closed — it refuses, deleting nothing, if any staged key received a
+write during the soak). **libsql is the exception:** `boatramp sql rehome-default` MOVES the file (no
+soak), so reverting after it run requires restoring `{dir}/{site}.db` from backup (or moving
+`{dir}/default/{site}.db` back); `--abort` covers KV + blob, not libsql.
+
+**After the KV `--finalize` + the blob retire**: the old keys are gone, so rollback is a restore from
+backup.
