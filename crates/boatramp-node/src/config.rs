@@ -140,11 +140,10 @@ pub enum ConfigError {
         /// A trailing remediation hint (empty unless there is a concrete cure to point at).
         cure: &'static str,
     },
-    /// The layered `config-figment` pipeline failed to resolve/extract the merged config
-    /// (a bad numeric/addr env value that figment's lossy coercion rejects, a `[cluster]`
-    /// missing its required `listen`, etc.). The figment error is rendered to a string so
-    /// `ConfigError` stays small. Only produced on the `config-figment` path.
-    #[cfg(feature = "config-figment")]
+    /// The layered config pipeline failed to resolve/extract the merged config (a bad
+    /// numeric/addr env value that figment's lossy coercion rejects, a `[cluster]` missing
+    /// its required `listen`, etc.). The figment error is rendered to a string so
+    /// `ConfigError` stays small.
     #[error("config resolution: {0}")]
     Resolve(String),
 }
@@ -322,48 +321,25 @@ impl ServerConfig {
     /// alternative decoder into the same typed struct; it does not change the
     /// file < env precedence.
     pub fn load(path: &Path, override_: Option<ConfigFormat>) -> Result<Self, ConfigError> {
-        // The `config-figment` pipeline unifies file + env (+ flags, applied by the caller)
-        // into ONE resolution used by serve AND the offline ops. With no explicit CLI flags
-        // here, this is defaults → file → env — the same inputs `apply_env_overrides` layered
-        // (and the parity battery asserts the SAME result). The serve binary passes its
-        // `ValueSource::CommandLine` flags as the top layer via `load_with_figment` directly.
-        #[cfg(feature = "config-figment")]
-        {
-            figment_resolve::load_with_figment(
-                path,
-                override_,
-                &EnvSource::Process,
-                figment::value::Dict::new(),
-            )
-        }
-        #[cfg(not(feature = "config-figment"))]
-        {
-            let fmt = resolve_format(path, override_);
-            let mut config = match std::fs::read_to_string(path) {
-                Ok(contents) => {
-                    Self::parse_with_format(&contents, fmt).map_err(|err| ConfigError::File {
-                        path: path.display().to_string(),
-                        source: Box::new(err),
-                    })?
-                }
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => Self::default(),
-                Err(err) => return Err(err.into()),
-            };
-            config.apply_env_overrides(&EnvSource::Process)?;
-            Ok(config)
-        }
+        // The ONE layered pipeline (defaults → file → env), used by serve AND every offline
+        // op. With no explicit CLI flags here, this is file + env; the serve binary passes its
+        // `ValueSource::CommandLine` flags as the top layer via `load_with_flags`.
+        figment_resolve::load_with_figment(
+            path,
+            override_,
+            &EnvSource::Process,
+            figment::value::Dict::new(),
+        )
     }
 
-    /// Load through the figment pipeline with an explicit **CLI-flag** top layer
-    /// (`config-figment` only). `cli_flags` is a map `{BOATRAMP_<NAME>: raw-value}` of the
-    /// args the operator set on the COMMAND LINE (the serve binary builds it from
-    /// `clap::ArgMatches`, keeping only `ValueSource::CommandLine` — so a defaulted
-    /// `--blobs fs` is absent and never clobbers file/env, subsuming the old `--blobs`
-    /// `var_os` probe). Resolution is `base-seed → file → env → these flags`. Keys the
-    /// overlay doesn't recognise (runtime/selector flags like `--tls`, the cluster-action
+    /// Load through the pipeline with an explicit **CLI-flag** top layer. `cli_flags` is a map
+    /// `{BOATRAMP_<NAME>: raw-value}` of the args the operator set on the COMMAND LINE (the
+    /// serve binary builds it from `clap::ArgMatches`, keeping only `ValueSource::CommandLine`
+    /// — so a defaulted `--blobs fs` is absent and never clobbers file/env, subsuming the old
+    /// `--blobs` `var_os` probe). Resolution is `base-seed → file → env → these flags`. Keys
+    /// the overlay doesn't recognise (runtime/selector flags like `--tls`, the cluster-action
     /// flags) are ignored, so they never enter the config. The binary passes a plain map —
     /// figment types stay internal to this crate.
-    #[cfg(feature = "config-figment")]
     pub fn load_with_flags(
         path: &Path,
         override_: Option<ConfigFormat>,
@@ -374,735 +350,22 @@ impl ServerConfig {
     }
 
     /// Serialize the (already-resolved) config for `boatramp config dump`, with the
-    /// secret-bearing fields REDACTED (`config-figment` only). The config is now
-    /// `Serialize` (for the figment file layer), which would otherwise expose the
-    /// control-plane root key / bootstrap secret / azure access key in a dump. Returns
-    /// pretty JSON (also a valid config input format).
-    #[cfg(feature = "config-figment")]
+    /// secret-bearing fields REDACTED. The config is `Serialize` (for the file layer), which
+    /// would otherwise expose the control-plane root key / bootstrap secret / azure access
+    /// key / signer key / join-token in a dump. Returns pretty JSON (also a valid config
+    /// input format).
     pub fn dump_redacted(&self) -> Result<String, ConfigError> {
         figment_resolve::dump_redacted(self)
     }
 
-    /// Layer `BOATRAMP_*` environment overrides onto the loaded config for the
-    /// `compute`, `security`, and handler-`sql` sections — the operational knobs
-    /// that were previously reachable only through the `boatramp.cfg` file.
-    ///
-    /// **Precedence: env overrides file.** This matches the existing `serve`
-    /// section (its `#[arg(long, env = …)]` flags already let an env var win over
-    /// the file value), keeping the resolution rule uniform. A set variable
-    /// updates the field even when the file also set it; an unset variable leaves
-    /// the file (or built-in default) untouched. When a section is absent from the
-    /// file but any of its variables are set, the section is materialised from its
-    /// defaults first — so no config file is required to configure it.
-    ///
-    /// `source` supplies the variables (the process environment in production; an
-    /// explicit map in tests), so this stays a pure function of its inputs.
-    ///
-    /// Superseded by the `config-figment` pipeline: under that feature `load` resolves
-    /// through `figment_resolve::load_with_figment` instead, so this is retained only for
-    /// the non-feature build and as the parity-battery oracle (hence the `allow(dead_code)`
-    /// in a non-test feature build). Deleted when the feature becomes the default.
-    #[cfg_attr(feature = "config-figment", allow(dead_code))]
+    /// Test-only adapter: layer the `BOATRAMP_*` env overlay over `self` (the base/file) THROUGH
+    /// the real figment pipeline. The production Loader-B `apply_env_overrides` is gone; this thin
+    /// delegator keeps the pre-figment env tests — which assert specific resolved fields after
+    /// `cfg.apply_env_overrides(&env(…))` — running against the ONE pipeline (so they are genuine
+    /// figment tests, not a second implementation).
+    #[cfg(test)]
     fn apply_env_overrides(&mut self, source: &EnvSource) -> Result<(), ConfigError> {
-        // --- compute ---------------------------------------------------------
-        // Materialise `[compute]` only if at least one of its variables is set, so
-        // an unset environment leaves an absent section absent (⇒ no compute).
-        if source.any(COMPUTE_ENV_VARS) {
-            let compute = self.compute.get_or_insert_with(ComputeConfig::default);
-            if let Some(v) = source.get("BOATRAMP_COMPUTE_BRIDGE") {
-                compute.bridge = v;
-            }
-            if let Some(v) = source.get("BOATRAMP_COMPUTE_SUBNET") {
-                compute.subnet = v;
-            }
-            if let Some(v) = source.parse("BOATRAMP_COMPUTE_VCPUS")? {
-                compute.vcpus = v;
-            }
-            if let Some(v) = source.parse("BOATRAMP_COMPUTE_MEM_MIB")? {
-                compute.mem_mib = v;
-            }
-            if let Some(v) = source.get("BOATRAMP_COMPUTE_REGION") {
-                compute.region = Some(v);
-            }
-            if let Some(v) = source.get("BOATRAMP_COMPUTE_SQL_SHIM_URL") {
-                compute.sql_shim_url = Some(v);
-            }
-            if let Some(v) = source.get("BOATRAMP_COMPUTE_BLOB_SHIM_URL") {
-                compute.blob_shim_url = Some(v);
-            }
-            if let Some(v) = source.parse("BOATRAMP_COMPUTE_BLOB_SHIM_MAX_OBJECT_BYTES")? {
-                compute.blob_shim_max_object_bytes = Some(v);
-            }
-            // The two shared-kernel enums have no `FromStr`, only a serde
-            // `rename_all = "lowercase"`; map their variants by that same spelling.
-            if let Some(v) = source.parse_enum(
-                "BOATRAMP_COMPUTE_MANAGED_DB_PRIVILEGE",
-                &[
-                    ("rootless", ManagedDbPrivilege::Rootless),
-                    ("caps", ManagedDbPrivilege::Caps),
-                ],
-            )? {
-                compute.managed_db_privilege = v;
-            }
-            if let Some(v) = source.parse_enum(
-                "BOATRAMP_COMPUTE_DOCKER_ENDPOINT",
-                &[
-                    ("published", boatramp_docker::DockerEndpoint::Published),
-                    ("bridge", boatramp_docker::DockerEndpoint::Bridge),
-                ],
-            )? {
-                compute.docker_endpoint = v;
-            }
-            if let Some(v) = source.parse_enum(
-                "BOATRAMP_COMPUTE_DOCKER_VOLUME_MODE",
-                &[
-                    ("named", boatramp_docker::DockerVolumeMode::Named),
-                    ("bind", boatramp_docker::DockerVolumeMode::Bind),
-                ],
-            )? {
-                compute.docker_volume_mode = v;
-            }
-            // Kernel trust anchors — comma-separated lists. These are
-            // security-critical: they are the trust anchor for the posture-scaled
-            // kernel bar, so a value here decides which kernels a `multi-tenant`
-            // node will boot. In a 12-factor deployment the environment IS the
-            // operator's trusted config source (a fly.toml `[env]` is committed the
-            // same as a file), so they are exposed here — but an operator should
-            // know the environment is *more* visible than a file (it leaks through
-            // `/proc/<pid>/environ` and is inherited by every subprocess), so a
-            // file remains the better home for them when one is available.
-            if let Some(v) = source.parse_list("BOATRAMP_COMPUTE_KERNEL_SIGNING_PUBKEYS") {
-                compute.kernel_signing_pubkeys = v;
-            }
-            if let Some(v) = source.parse_list("BOATRAMP_COMPUTE_KERNEL_ALLOWED_HASHES") {
-                compute.kernel_allowed_hashes = v;
-            }
-            // Internal DNS (per-project service discovery on the bridge gateway).
-            if let Some(v) = source.parse_bool("BOATRAMP_COMPUTE_INTERNAL_DNS")? {
-                compute.internal_dns = v;
-            }
-            if let Some(v) = source.get("BOATRAMP_COMPUTE_DNS_UPSTREAM") {
-                compute.dns_upstream = v;
-            }
-            if let Some(v) = source.get("BOATRAMP_COMPUTE_DNS_DOMAIN") {
-                compute.dns_domain = v;
-            }
-        }
-
-        // --- security --------------------------------------------------------
-        // Always materialise `[security]` when any knob is set: an absent section
-        // resolves to the strict `multi-tenant` default, and an env override then
-        // layers over that exactly as a file `overrides` block would.
-        if source.any(SECURITY_ENV_VARS) {
-            let security = self
-                .security
-                .get_or_insert_with(boatramp_core::security::SecurityConfig::default);
-            if let Some(v) = source.get("BOATRAMP_SECURITY_PROFILE") {
-                security.profile = Some(v);
-            }
-            let o = &mut security.overrides;
-            if let Some(v) =
-                source.parse_bool("BOATRAMP_SECURITY_ALLOW_UNAUTHENTICATED_PUBLIC_BIND")?
-            {
-                o.allow_unauthenticated_public_bind = Some(v);
-            }
-            if let Some(v) = source.parse("BOATRAMP_SECURITY_MAX_UPLOAD_BYTES")? {
-                o.max_upload_bytes = Some(v);
-            }
-            if let Some(v) = source.parse_bool("BOATRAMP_SECURITY_ALLOW_SITE_UNIX_UPSTREAMS")? {
-                o.allow_site_unix_upstreams = Some(v);
-            }
-            if let Some(v) = source.parse_bool("BOATRAMP_SECURITY_ALLOW_SITE_PRIVATE_UPSTREAMS")? {
-                o.allow_site_private_upstreams = Some(v);
-            }
-            if let Some(v) = source.parse_bool("BOATRAMP_SECURITY_ALLOW_GUEST_PRIVATE_EGRESS")? {
-                o.allow_guest_private_egress = Some(v);
-            }
-            if let Some(v) = source.parse_bool("BOATRAMP_SECURITY_ALLOW_GUEST_SELF_EGRESS")? {
-                o.allow_guest_self_egress = Some(v);
-            }
-            if let Some(v) = source.parse_bool("BOATRAMP_SECURITY_ALLOW_GUEST_EGRESS_EXTRA_CA")? {
-                o.allow_guest_egress_extra_ca = Some(v);
-            }
-            if let Some(v) = source.parse_bool("BOATRAMP_SECURITY_ALLOW_GUEST_TCP_EGRESS")? {
-                o.allow_guest_tcp_egress = Some(v);
-            }
-            if let Some(v) = source.parse_bool("BOATRAMP_SECURITY_ALLOW_GUEST_TCP_LISTENER")? {
-                o.allow_guest_tcp_listener = Some(v);
-            }
-            if let Some(v) = source.parse("BOATRAMP_SECURITY_MAX_HANDLER_BLOB_BYTES")? {
-                o.max_handler_blob_bytes = Some(v);
-            }
-            if let Some(v) = source.parse("BOATRAMP_SECURITY_MAX_COMPONENT_BYTES")? {
-                o.max_component_bytes = Some(v);
-            }
-            if let Some(v) = source.parse_bool("BOATRAMP_SECURITY_OIDC_REQUIRE_AUDIENCE")? {
-                o.oidc_require_audience = Some(v);
-            }
-            if let Some(v) = source.parse_bool("BOATRAMP_SECURITY_DOMAIN_VERIFY_ALLOW_PRIVATE")? {
-                o.domain_verify_allow_private = Some(v);
-            }
-            if let Some(v) = source.parse_bool("BOATRAMP_SECURITY_DOMAIN_VERIFY_SELF_SERVE")? {
-                o.domain_verify_self_serve = Some(v);
-            }
-            if let Some(v) = source.parse_bool("BOATRAMP_SECURITY_ALLOW_SHARED_KERNEL_COMPUTE")? {
-                o.allow_shared_kernel_compute = Some(v);
-            }
-            if let Some(v) = source.parse_bool("BOATRAMP_SECURITY_ALLOW_COMPUTE_EXEC")? {
-                o.allow_compute_exec = Some(v);
-            }
-            if let Some(v) = source.parse_bool("BOATRAMP_SECURITY_RATELIMIT_FAIL_OPEN")? {
-                o.ratelimit_fail_open = Some(v);
-            }
-            if let Some(v) = source.parse_bool("BOATRAMP_SECURITY_ALLOW_IMPLICIT_ROUTING")? {
-                o.allow_implicit_routing = Some(v);
-            }
-            if let Some(v) = source.parse_bool("BOATRAMP_SECURITY_REQUIRE_POP")? {
-                o.require_pop = Some(v);
-            }
-            if let Some(v) = source.parse_bool("BOATRAMP_SECURITY_REQUIRE_DOMAIN_VERIFICATION")? {
-                o.require_domain_verification = Some(v);
-            }
-            if let Some(v) = source.parse_bool("BOATRAMP_SECURITY_ALLOW_ENV_SECRET_REFS")? {
-                o.allow_env_secret_refs = Some(v);
-            }
-            // The multi-tenant sub-knobs (Gap 4b): previously file-only, now env-settable so a
-            // 12-factor deployment can tune tenancy isolation + guest capability minting without a
-            // `boatramp.cfg`. Fleet-scoped (a per-project override still lives in the config file).
-            if let Some(v) = source.parse_bool("BOATRAMP_SECURITY_REQUIRE_TENANCY_DECLARATION")? {
-                o.require_tenancy_declaration = Some(v);
-            }
-            if let Some(v) = source.parse_bool("BOATRAMP_SECURITY_ALLOW_CROSS_TENANT_DB")? {
-                o.allow_cross_tenant_db = Some(v);
-            }
-            if let Some(v) = source.parse_bool("BOATRAMP_SECURITY_ALLOW_GUEST_MINT_CAPABILITY")? {
-                o.allow_guest_mint_capability = Some(v);
-            }
-            if let Some(v) = source.parse("BOATRAMP_SECURITY_MAX_GUEST_CAPABILITY_TTL_SECS")? {
-                o.max_guest_capability_ttl_secs = Some(v);
-            }
-            // Remaining guest-feature knobs — env parity for a 12-factor fleet that runs env-only
-            // (no `boatramp.cfg`). Each preset defaults these OFF under `multi-tenant`, so an
-            // env-only multi-tenant deployment had no lever to opt a guest feature back on. The
-            // override field + `apply()` + `explain()` already exist for every one; only the env
-            // mapping was missing (`allow_guest_email` regressed prod SMTP on the P48 cutover).
-            if let Some(v) = source.parse_bool("BOATRAMP_SECURITY_ALLOW_GUEST_EMAIL")? {
-                o.allow_guest_email = Some(v);
-            }
-            if let Some(v) = source.parse_bool("BOATRAMP_SECURITY_ALLOW_GUEST_ADMIN_DOMAINS")? {
-                o.allow_guest_admin_domains = Some(v);
-            }
-            if let Some(v) = source.parse_bool("BOATRAMP_SECURITY_ALLOW_GUEST_ADMIN_EMAIL")? {
-                o.allow_guest_admin_email = Some(v);
-            }
-            if let Some(v) = source.parse_bool("BOATRAMP_SECURITY_ALLOW_GUEST_ADMIN_SITE")? {
-                o.allow_guest_admin_site = Some(v);
-            }
-            if let Some(v) = source.parse_bool("BOATRAMP_SECURITY_ALLOW_GUEST_ADMIN_SECRETS")? {
-                o.allow_guest_admin_secrets = Some(v);
-            }
-        }
-
-        // --- handler sql (`handlers.bindings.sql`) ---------------------------
-        // Materialise the nested `handlers.bindings.sql` chain only when a `sql`
-        // variable is set, so an unset environment doesn't conjure an empty
-        // handlers section. The variables mirror the config path
-        // (`BOATRAMP_HANDLERS_SQL_*`) and cover the cluster-vs-single-node knobs;
-        // secrets stay indirected via `*_TOKEN_ENV` names, never the token itself.
-        if source.any(SQL_ENV_VARS) {
-            let handlers = self.handlers.get_or_insert_with(HandlersConfig::default);
-            let sql = handlers
-                .bindings
-                .sql
-                .get_or_insert_with(SqlBindingConfig::default);
-            if let Some(v) = source.get("BOATRAMP_HANDLERS_SQL_DIR") {
-                sql.dir = Some(PathBuf::from(v));
-            }
-            if let Some(v) = source.get("BOATRAMP_HANDLERS_SQL_URL") {
-                sql.url = Some(v);
-            }
-            if let Some(v) = source.get("BOATRAMP_HANDLERS_SQL_ADMIN_URL") {
-                sql.admin_url = Some(v);
-            }
-            if let Some(v) = source.get("BOATRAMP_HANDLERS_SQL_REPLICA_URL") {
-                sql.replica_url = Some(v);
-            }
-            if let Some(v) = source.get("BOATRAMP_HANDLERS_SQL_TOKEN_ENV") {
-                sql.token_env = Some(v);
-            }
-            if let Some(v) = source.get("BOATRAMP_HANDLERS_SQL_ADMIN_TOKEN_ENV") {
-                sql.admin_token_env = Some(v);
-            }
-            if let Some(v) = source.get("BOATRAMP_HANDLERS_SQL_PREVIEW_MODE") {
-                sql.preview_mode = Some(v);
-            }
-            if let Some(v) = source.get("BOATRAMP_HANDLERS_SQL_PREVIEW_INIT") {
-                sql.preview_init = Some(PathBuf::from(v));
-            }
-            if let Some(v) = source.parse("BOATRAMP_HANDLERS_SQL_DEPROVISION_GRACE_SECS")? {
-                sql.deprovision_grace_secs = Some(v);
-            }
-            // The owner-gated migration trusted-extension allowlist — a comma-separated list
-            // (e.g. `pg_trgm,pgcrypto`). Env-over-file, like the scalars above; unset ⇒ keep the
-            // file value (which stays `None`/empty = the safe deny-all default). This is only an
-            // input path to the field; the migrator's `Extension`-step gate / fail-closed refusal /
-            // `sql`-step `CREATE EXTENSION` ban are unchanged.
-            if let Some(v) = source.parse_list("BOATRAMP_HANDLERS_SQL_MIGRATE_TRUSTED_EXTENSIONS") {
-                sql.migrate_trusted_extensions = Some(v);
-            }
-            if let Some(v) = source.parse("BOATRAMP_HANDLERS_SQL_MAX_DECLARED_DATABASES")? {
-                sql.max_declared_databases = Some(v);
-            }
-            if let Some(v) = source.parse("BOATRAMP_HANDLERS_SQL_MAX_DECLARED_VOLUME_MIB")? {
-                sql.max_declared_volume_mib = Some(v);
-            }
-        }
-
-        // --- handler JWKS freshness (`[handlers]` two-tier own/foreign refresh + hard-ttl + prewarm) ---
-        // Env parity for the token-verification JWKS cache knobs, so a file-less (`[env]`-only) fleet
-        // can tune the gateway's auth-freshness posture without a `boatramp.cfg` + roll. Materialises
-        // `[handlers]` only when a JWKS var is set (an unset environment conjures no section).
-        if source.any(JWKS_ENV_VARS) {
-            let handlers = self.handlers.get_or_insert_with(HandlersConfig::default);
-            if let Some(v) = source.parse("BOATRAMP_HANDLERS_JWKS_REFRESH_SECS")? {
-                handlers.jwks_refresh_secs = Some(v);
-            }
-            if let Some(v) = source.parse("BOATRAMP_HANDLERS_JWKS_HARD_TTL_SECS")? {
-                handlers.jwks_hard_ttl_secs = Some(v);
-            }
-            if let Some(v) = source.parse("BOATRAMP_HANDLERS_JWKS_FOREIGN_REFRESH_SECS")? {
-                handlers.jwks_foreign_refresh_secs = Some(v);
-            }
-            if let Some(v) = source.parse("BOATRAMP_HANDLERS_JWKS_FOREIGN_HARD_TTL_SECS")? {
-                handlers.jwks_foreign_hard_ttl_secs = Some(v);
-            }
-            if let Some(v) = source.parse_bool("BOATRAMP_HANDLERS_JWKS_PREWARM")? {
-                handlers.jwks_prewarm = Some(v);
-            }
-        }
-
-        // --- handler concurrency lanes (`[handlers]` serve/sync/async caps) ------
-        // Env parity for the per-component serve-admission gate and the two lane ceilings, so a
-        // file-less (`[env]`-only) fleet can tune them without a `boatramp.cfg` + roll (these were
-        // previously the last `[handlers]` scalars with no env lever, which pinned a knob like
-        // `serve_concurrency` into the config file). Materialises `[handlers]` only when one is set.
-        // Each is an `Option<usize>` set as-is; `serve_concurrency = 0` is the MEANINGFUL "disable the
-        // gate" value, and a `sync_max_concurrency = 0` is rejected downstream (the global sync lane is
-        // a required safety ceiling) — the env lever changes neither semantic, only the input path.
-        if source.any(HANDLER_CONCURRENCY_ENV_VARS) {
-            let handlers = self.handlers.get_or_insert_with(HandlersConfig::default);
-            if let Some(v) = source.parse("BOATRAMP_HANDLERS_SERVE_CONCURRENCY")? {
-                handlers.serve_concurrency = Some(v);
-            }
-            if let Some(v) = source.parse("BOATRAMP_HANDLERS_SYNC_MAX_CONCURRENCY")? {
-                handlers.sync_max_concurrency = Some(v);
-            }
-            if let Some(v) = source.parse("BOATRAMP_HANDLERS_ASYNC_MAX_CONCURRENCY")? {
-                handlers.async_max_concurrency = Some(v);
-            }
-        }
-
-        // --- handler blob-serve hedge (`[handlers]` blob_hedge_*) ----------------
-        // Env parity for the hedged-read tail knobs, so an env-only fleet can turn hedging on (and tune
-        // its delay / concurrent-hedge cap) without a `boatramp.cfg`. Materialises `[handlers]` only when
-        // one is set; `delay_ms` unset/0 keeps hedging off (one GET per read).
-        if source.any(HANDLER_BLOB_HEDGE_ENV_VARS) {
-            let handlers = self.handlers.get_or_insert_with(HandlersConfig::default);
-            if let Some(v) = source.parse("BOATRAMP_HANDLERS_BLOB_HEDGE_DELAY_MS")? {
-                handlers.blob_hedge_delay_ms = Some(v);
-            }
-            if let Some(v) = source.parse("BOATRAMP_HANDLERS_BLOB_HEDGE_MAX_INFLIGHT")? {
-                handlers.blob_hedge_max_inflight = Some(v);
-            }
-        }
-
-        // --- handler sql external databases (`handlers.bindings.sql.databases`) ---
-        // The bring-your-own / managed-compute DB map, keyed by name. There is no
-        // config file to enumerate the members, so the member names are discovered
-        // from the environment: any `BOATRAMP_HANDLERS_SQL_DB_<NAME>_<FIELD>`
-        // variable declares database `<NAME>`. Each env-declared DB is merged into
-        // (overriding, per field, by key) whatever the file already declared under
-        // that name — the same env-over-file precedence as the scalars.
-        //
-        // The default database (the binding a handler opens as `sql.open("")`) is
-        // addressed by the reserved `DEFAULT` token, which can't appear as a literal
-        // in a variable name: `BOATRAMP_HANDLERS_SQL_DB_DEFAULT_KIND` populates the
-        // reserved [`DEFAULT_DB_NAME`](boatramp_core::project::DEFAULT_DB_NAME) key
-        // (`"default"`). As of v0.5.0 this is a real, path-segment-safe name (never the
-        // empty string), so the binding is addressable as `--db default` and every
-        // db-name ingress carries a valid URL path segment. The guest-facing
-        // `sql.open("")` contract is preserved by aliasing `"" ⇄ "default"` at the
-        // backend-resolution boundary — external bindings are a pure label over their
-        // connection params, so the renamed binding points at the SAME physical DB.
-        if source.any_with_prefix(SQL_DB_ENV_PREFIX) {
-            let handlers = self.handlers.get_or_insert_with(HandlersConfig::default);
-            let sql = handlers
-                .bindings
-                .sql
-                .get_or_insert_with(SqlBindingConfig::default);
-            for name in source.sql_database_names() {
-                // `DEFAULT` is the reserved token for the default database; it maps to
-                // the reserved real name `"default"` (v0.5.0; was the empty string).
-                let key = if name == "DEFAULT" {
-                    boatramp_core::project::DEFAULT_DB_NAME.to_string()
-                } else {
-                    name.clone()
-                };
-                let db = sql.databases.entry(key).or_default();
-                let prefix = format!("{SQL_DB_ENV_PREFIX}{name}_");
-                if let Some(v) = source.get(&format!("{prefix}KIND")) {
-                    db.kind = v;
-                }
-                if let Some(v) = source.get(&format!("{prefix}URL_ENV")) {
-                    db.url_env = v;
-                }
-                if let Some(v) = source.get(&format!("{prefix}READ_URL_ENV")) {
-                    db.read_url_env = Some(v);
-                }
-                if let Some(v) = source.get(&format!("{prefix}COMPUTE")) {
-                    db.compute = Some(v);
-                }
-                if let Some(v) = source.get(&format!("{prefix}DATABASE")) {
-                    db.database = Some(v);
-                }
-                if let Some(v) = source.get(&format!("{prefix}USER")) {
-                    db.user = Some(v);
-                }
-                if let Some(v) = source.get(&format!("{prefix}PASSWORD_ENV")) {
-                    db.password_env = Some(v);
-                }
-                if let Some(v) = source.parse(&format!("{prefix}POOL_MAX"))? {
-                    db.pool_max = Some(v);
-                }
-                if let Some(v) = source.parse_bool(&format!("{prefix}READ_ONLY"))? {
-                    db.read_only = v;
-                }
-                if let Some(v) = source.parse_bool(&format!("{prefix}ALLOW_PREVIEW"))? {
-                    db.allow_preview = v;
-                }
-                if let Some(v) = source.parse(&format!("{prefix}CONNECT_TIMEOUT_SECS"))? {
-                    db.connect_timeout_secs = Some(v);
-                }
-                if let Some(v) = source.get(&format!("{prefix}IMAGE")) {
-                    db.image = Some(v);
-                }
-                if let Some(v) = source.parse(&format!("{prefix}VOLUME_SIZE_MIB"))? {
-                    db.volume_size_mib = Some(v);
-                }
-                if let Some(v) = source.parse(&format!("{prefix}STARTUP_GRACE_SECS"))? {
-                    db.startup_grace_secs = Some(v);
-                }
-                if let Some(v) = source.parse_enum(
-                    &format!("{prefix}TENANT"),
-                    &[
-                        ("single", TenantIsolation::Single),
-                        ("shared", TenantIsolation::Shared),
-                    ],
-                )? {
-                    db.tenant = v;
-                }
-                if let Some(v) = source.parse_enum(
-                    &format!("{prefix}TENANT_SCOPE"),
-                    &[
-                        ("project", TenantScope::Project),
-                        ("site", TenantScope::Site),
-                    ],
-                )? {
-                    db.tenant_scope = v;
-                }
-                if let Some(v) = source.parse_bool(&format!("{prefix}RLS_SESSION"))? {
-                    db.rls_session = v;
-                }
-                if let Some(v) = source.get(&format!("{prefix}TENANT_GUC")) {
-                    db.tenant_guc = Some(v);
-                }
-                if let Some(v) = source.get(&format!("{prefix}SESSION_GUC")) {
-                    db.session_guc = Some(v);
-                }
-                if let Some(v) = source.get(&format!("{prefix}TENANT_ALL_MARKER")) {
-                    db.tenant_all_marker = Some(v);
-                }
-            }
-        }
-
-        // --- serve per-project blob backends (`[serve.blob_backends.<project>]`) ---
-        // PLAN-per-project-blob-backend. A keyed map (like the SQL `databases` map) with no config
-        // file to enumerate its members, so member PROJECT names are discovered from the environment:
-        // any `BOATRAMP_SERVE_BLOB_BACKEND_<PROJECT>_<FIELD>` declares project `<PROJECT>`. Each is
-        // merged per-field (env-over-file) into whatever the file declared under that name. The sealed
-        // credential's two public refs are flattened as `_S3_ACCESS_KEY_ID` / `_S3_SECRET_ACCESS_KEY`
-        // (the secret is always a `boatramp:`/`env:` REFERENCE, never the raw secret — invariant 3).
-        if source.any_with_prefix(BLOB_BACKEND_ENV_PREFIX) {
-            let serve = self.serve.get_or_insert_with(ServeConfig::default);
-            for name in source.blob_backend_projects() {
-                let be = serve.blob_backends.entry(name.clone()).or_default();
-                let prefix = format!("{BLOB_BACKEND_ENV_PREFIX}{name}_");
-                if let Some(v) = source.parse_enum(
-                    &format!("{prefix}KIND"),
-                    &[
-                        ("fs", crate::backends::BlobBackend::Fs),
-                        ("s3", crate::backends::BlobBackend::S3),
-                        ("gcs", crate::backends::BlobBackend::Gcs),
-                        ("azure", crate::backends::BlobBackend::Azure),
-                    ],
-                )? {
-                    be.blobs = Some(v);
-                }
-                if let Some(v) = source.get(&format!("{prefix}S3_BUCKET")) {
-                    be.s3_bucket = Some(v);
-                }
-                if let Some(v) = source.get(&format!("{prefix}S3_ENDPOINT")) {
-                    be.s3_endpoint = Some(v);
-                }
-                if let Some(v) = source.get(&format!("{prefix}S3_REGION")) {
-                    be.s3_region = Some(v);
-                }
-                if let Some(v) = source.parse_bool(&format!("{prefix}S3_PATH_STYLE"))? {
-                    be.s3_path_style = v;
-                }
-                // The sealed base S3 credential — materialised only when one of its refs is set. The
-                // `access_key_id` is public; the `secret_access_key` is a `boatramp:`/`env:` ref.
-                let access_key_id = source.get(&format!("{prefix}S3_ACCESS_KEY_ID"));
-                let secret_ref = source.get(&format!("{prefix}S3_SECRET_ACCESS_KEY"));
-                if access_key_id.is_some() || secret_ref.is_some() {
-                    let cred = be
-                        .s3_credential
-                        .get_or_insert_with(S3CredentialConfig::default);
-                    if let Some(v) = access_key_id {
-                        cred.access_key_id = v;
-                    }
-                    if let Some(v) = secret_ref {
-                        cred.secret_access_key = v;
-                    }
-                }
-            }
-        }
-
-        // --- serve inbound-TCP listeners (`[serve.listeners.<name>]`) ---
-        // PLAN-handler-tcp-inbound. A keyed map (like the SQL `databases` / blob `backends` maps) with
-        // no config file to enumerate its members, so listener NAMES are discovered from the
-        // environment: any `BOATRAMP_SERVE_LISTENER_<NAME>_<FIELD>` declares listener `<NAME>`. Each
-        // SCALAR field is merged per-field (env-over-file); the structured fields (imports/tenancy/env)
-        // and the Phase-1-refused `tls`/`egress_allowlist` are set only from the config file. The
-        // boot-LOUD `validate_listeners` still runs on the merged result (so an env-declared listener
-        // with a Phase-1-unsupported knob fails closed exactly like a file-declared one).
-        if source.any_with_prefix(LISTENER_ENV_PREFIX) {
-            let serve = self.serve.get_or_insert_with(ServeConfig::default);
-            for name in source.listener_names() {
-                let l = serve.listeners.entry(name.clone()).or_default();
-                let prefix = format!("{LISTENER_ENV_PREFIX}{name}_");
-                if let Some(v) = source.parse::<SocketAddr>(&format!("{prefix}BIND"))? {
-                    l.bind = Some(v);
-                }
-                if let Some(v) = source.get(&format!("{prefix}COMPONENT")) {
-                    l.component = v;
-                }
-                if let Some(v) = source.get(&format!("{prefix}PROJECT")) {
-                    l.project = v;
-                }
-                if let Some(v) = source.get(&format!("{prefix}SITE")) {
-                    l.site = v;
-                }
-                if let Some(v) = source.parse_list(&format!("{prefix}IMPORTS")) {
-                    l.imports = v;
-                }
-                if let Some(v) = source.parse::<usize>(&format!("{prefix}MAX_CONNS"))? {
-                    l.max_conns = Some(v);
-                }
-                if let Some(v) = source.parse::<u64>(&format!("{prefix}IDLE_TIMEOUT_MS"))? {
-                    l.idle_timeout_ms = Some(v);
-                }
-                if let Some(v) = source.parse::<u64>(&format!("{prefix}MAX_CONN_DURATION_MS"))? {
-                    l.max_conn_duration_ms = Some(v);
-                }
-            }
-        }
-
-        // --- serve S3-ingress cloud brokering (`[serve.s3_ingress_cloud]`) ---
-        // Env parity for the blob-upload minter's cloud-brokering policy, so a file-less fleet (e.g. the
-        // Tigris presigned-only deployment, whose `boatramp.cfg` existed ONLY to carry
-        // `aws_presigned_only`) needs no config file. Materialises the nested struct only when one is
-        // set. These are POLICY toggles, not key material: the AWS base credential the mint signs from
-        // stays the sealed `[secrets]` one (`BOATRAMP_SECRETS_*`), unchanged. `aws_role_arn` /
-        // `aws_use_federation_token` / `aws_presigned_only` remain mutually validated at wiring — the env
-        // lever is only the input path, not a relaxation of that fail-loud check.
-        if source.any(S3_INGRESS_CLOUD_ENV_VARS) {
-            let serve = self.serve.get_or_insert_with(ServeConfig::default);
-            let ic = serve
-                .s3_ingress_cloud
-                .get_or_insert_with(S3IngressCloud::default);
-            if let Some(v) = source.get("BOATRAMP_S3_INGRESS_CLOUD_AWS_ROLE_ARN") {
-                ic.aws_role_arn = Some(v);
-            }
-            if let Some(v) =
-                source.parse_bool("BOATRAMP_S3_INGRESS_CLOUD_AWS_USE_FEDERATION_TOKEN")?
-            {
-                ic.aws_use_federation_token = v;
-            }
-            if let Some(v) = source.parse_bool("BOATRAMP_S3_INGRESS_CLOUD_AWS_PRESIGNED_ONLY")? {
-                ic.aws_presigned_only = v;
-            }
-            if let Some(v) = source.get("BOATRAMP_S3_INGRESS_CLOUD_GCS_CLIENT_EMAIL") {
-                ic.gcs_client_email = Some(v);
-            }
-            if let Some(v) = source.get("BOATRAMP_S3_INGRESS_CLOUD_AZURE_ACCOUNT") {
-                ic.azure_account = Some(v);
-            }
-            if let Some(v) = source.get("BOATRAMP_S3_INGRESS_CLOUD_AZURE_SERVICE_URL") {
-                ic.azure_service_url = Some(v);
-            }
-            if let Some(v) = source.parse_bool("BOATRAMP_S3_INGRESS_CLOUD_AZURE_HNS")? {
-                ic.azure_hns = v;
-            }
-        }
-
-        // --- serve top-level S3 object backend (`[serve]` blobs/s3_*) ---
-        // Env parity for the PRIMARY blob-backend selection, so the OFFLINE ops (`boatramp migrate
-        // --finalize` / `blob rehome`, which resolve a backend from the config file ALONE — there is
-        // no `ServeArgs` off the serve hot path) see the same object store `serve` does via its
-        // `--blobs`/`--s3-*` flags. `serve` already honoured `BOATRAMP_BLOBS`/`BOATRAMP_S3_*` through
-        // clap; this extends the SAME levers to every other config consumer, so a file-less fleet (the
-        // Tigris-only construens deployment) needs no `boatramp.cfg` for its object store. The flag
-        // still wins for `serve` (uniform `serve` precedence: file < this env overlay < flag). The
-        // credential is NOT set here — it stays the standard `AWS_*` env (or a sealed credential),
-        // unchanged (invariant 3: env is never raw key material).
-        if source.any(SERVE_S3_BACKEND_ENV_VARS) {
-            let serve = self.serve.get_or_insert_with(ServeConfig::default);
-            if let Some(v) = source.parse_enum(
-                "BOATRAMP_BLOBS",
-                &[
-                    ("fs", crate::backends::BlobBackend::Fs),
-                    ("s3", crate::backends::BlobBackend::S3),
-                    ("gcs", crate::backends::BlobBackend::Gcs),
-                    ("azure", crate::backends::BlobBackend::Azure),
-                ],
-            )? {
-                serve.blobs = Some(v);
-            }
-            if let Some(v) = source.get("BOATRAMP_S3_BUCKET") {
-                serve.s3_bucket = Some(v);
-            }
-            if let Some(v) = source.get("BOATRAMP_S3_ENDPOINT") {
-                serve.s3_endpoint = Some(v);
-            }
-            if let Some(v) = source.get("BOATRAMP_S3_REGION") {
-                serve.s3_region = Some(v);
-            }
-            if let Some(v) = source.parse_bool("BOATRAMP_S3_PATH_STYLE")? {
-                serve.s3_path_style = v;
-            }
-        }
-
-        // --- secrets (`[secrets]`) -------------------------------------------
-        // Envelope encryption for private keys at rest. `kek_file` holds a *path*
-        // (never key material) and the Vault token stays indirected via
-        // `token_env` (a variable name, not the token). Materialise the nested
-        // `vault` sub-config only when a vault variable is set.
-        if source.any(SECRETS_ENV_VARS) {
-            let secrets = self.secrets.get_or_insert_with(SecretsConfig::default);
-            if let Some(v) = source.get("BOATRAMP_SECRETS_ENVELOPE") {
-                secrets.envelope = v;
-            }
-            if let Some(v) = source.get("BOATRAMP_SECRETS_KEK_FILE") {
-                secrets.kek_file = Some(PathBuf::from(v));
-            }
-            if source.any(SECRETS_VAULT_ENV_VARS) {
-                let vault = secrets
-                    .vault
-                    .get_or_insert_with(VaultSecretsConfig::default);
-                if let Some(v) = source.get("BOATRAMP_SECRETS_VAULT_ADDR") {
-                    vault.addr = v;
-                }
-                if let Some(v) = source.get("BOATRAMP_SECRETS_VAULT_KEY") {
-                    vault.key = v;
-                }
-                if let Some(v) = source.get("BOATRAMP_SECRETS_VAULT_TOKEN_ENV") {
-                    vault.token_env = v;
-                }
-            }
-        }
-
-        // --- cluster (`[cluster]`) -------------------------------------------
-        // The self-hosted cluster section's own fields. The founding/joining
-        // *actions* already have their own `serve` flags with env
-        // (`BOATRAMP_CLUSTER_INIT` / `_JOIN` / `_ADVERTISE_ADDR`); those are
-        // distinct from — and not duplicated by — the `[cluster]` section fields
-        // exposed here. `join_token` keeps a secret out of plain sight via the
-        // usual `env:VAR` / `path:/file` prefix, so the env holds the *reference*,
-        // not the token. `ClusterConfig` has no `Default` (a founder needs at least
-        // a `listen`), so a `BOATRAMP_CLUSTER_LISTEN` is required to materialise an
-        // absent section from the environment.
-        if source.any(CLUSTER_ENV_VARS) {
-            // Materialise an absent section only if a bind address is supplied;
-            // otherwise there is no valid `ClusterConfig` to build (it has no
-            // `Default` — a node must know where to bind its mesh). When the file
-            // already declared `[cluster]`, its `listen` stands and the other env
-            // fields layer over it even without `BOATRAMP_CLUSTER_LISTEN`.
-            let listen = source.parse::<SocketAddr>("BOATRAMP_CLUSTER_LISTEN")?;
-            if self.cluster.is_none()
-                && let Some(listen) = listen
-            {
-                self.cluster = Some(ClusterConfig {
-                    listen,
-                    root_pubkeys: Vec::new(),
-                    seeds: Vec::new(),
-                    join_token: None,
-                    store_dir: None,
-                    mesh: None,
-                });
-            }
-            if let Some(cluster) = self.cluster.as_mut() {
-                // A `listen` override applies to an already-present section too (a
-                // freshly materialised one already carries it).
-                if let Some(v) = listen {
-                    cluster.listen = v;
-                }
-                if let Some(v) = source.parse_list("BOATRAMP_CLUSTER_ROOT_PUBKEYS") {
-                    cluster.root_pubkeys = v;
-                }
-                if let Some(v) = source.parse_list("BOATRAMP_CLUSTER_SEEDS") {
-                    cluster.seeds = v;
-                }
-                if let Some(v) = source.get("BOATRAMP_CLUSTER_JOIN_TOKEN") {
-                    cluster.join_token = Some(v);
-                }
-                if let Some(v) = source.get("BOATRAMP_CLUSTER_STORE_DIR") {
-                    cluster.store_dir = Some(PathBuf::from(v));
-                }
-                if source.any(CLUSTER_MESH_ENV_VARS) {
-                    let mesh = cluster.mesh.get_or_insert_with(MeshConfig::default);
-                    if let Some(v) = source.get("BOATRAMP_CLUSTER_MESH_KEY_FILE") {
-                        mesh.key_file = Some(PathBuf::from(v));
-                    }
-                    if let Some(v) = source.get("BOATRAMP_CLUSTER_MESH_KEY_ROTATION") {
-                        mesh.key_rotation = Some(v);
-                    }
-                    if let Some(v) = source.get("BOATRAMP_CLUSTER_MESH_JOIN_TOKEN_TTL") {
-                        mesh.join_token_ttl = Some(v);
-                    }
-                    if let Some(v) =
-                        source.parse_bool("BOATRAMP_CLUSTER_MESH_GATE_CLIENT_WRITES")?
-                    {
-                        mesh.gate_client_writes = Some(v);
-                    }
-                }
-            }
-        }
-
-        // Fail closed on any db-binding name that is not a safe URL path segment.
-        // Runs on the fully merged (file + env) `databases` map, so it catches a name
-        // from either source — and (crucially) the legacy empty-string default key,
-        // which is no longer produced by the `DEFAULT` token but could still be
-        // written literally in a `boatramp.cfg` file.
-        self.validate_sql_db_names()?;
-        // Fail closed on a `[serve.blob_backends]` key that is not a valid project name, or is the
-        // reserved `default` project (which always resolves the global `[serve]` backend). Runs on the
-        // fully merged (file + env) map (PLAN-per-project-blob-backend).
-        self.validate_blob_backend_projects()?;
-        // Fail closed (boot-LOUD) on an invalid `[serve.listeners.<name>]` — a blank component/project/
-        // site/bind, a non-positive cap/timeout, a Phase-1-unsupported `tls`/`egress_allowlist`. Runs on
-        // the fully merged (file + env) map (PLAN-handler-tcp-inbound).
-        self.validate_listeners()?;
+        *self = figment_resolve::resolve_env_over(self, source)?;
         Ok(())
     }
 
@@ -1383,26 +646,6 @@ const S3_INGRESS_CLOUD_ENV_VARS: &[&str] = &[
     "BOATRAMP_S3_INGRESS_CLOUD_AZURE_HNS",
 ];
 
-/// The top-level `[serve]` S3 object-backend env levers — the PRIMARY blob-backend selection plus
-/// its S3 addressing, mirroring the `blobs`/`s3_bucket`/`s3_endpoint`/`s3_region`/`s3_path_style`
-/// fields on [`ServeConfig`]. These give the OFFLINE ops (`boatramp migrate`/`blob rehome`, which
-/// build a backend from a config file ALONE — no `ServeArgs`) the same env parity `serve` already has
-/// through its `--blobs`/`--s3-*` flags, so a file-less fleet (the Tigris-only construens deployment)
-/// resolves its object store from `[env]` with no `boatramp.cfg`. Kept in sync by the
-/// `env_wires_the_serve_s3_backend_over_the_default` forgot-a-knob guard test. The signing credential
-/// is deliberately NOT here: the base S3 credential stays the standard `AWS_ACCESS_KEY_ID` /
-/// `AWS_SECRET_ACCESS_KEY` the object-store client reads directly (or a sealed `[serve.s3_credential]`),
-/// unchanged. gcs/azure PRIMARY-backend env parity is deferred to the figment config migration — this
-/// targeted lever covers the S3 backend the fleet actually runs on (mirrors the per-project
-/// `blob_backends` block, which is likewise S3-only).
-const SERVE_S3_BACKEND_ENV_VARS: &[&str] = &[
-    "BOATRAMP_BLOBS",
-    "BOATRAMP_S3_BUCKET",
-    "BOATRAMP_S3_ENDPOINT",
-    "BOATRAMP_S3_REGION",
-    "BOATRAMP_S3_PATH_STYLE",
-];
-
 /// The fixed prefix of a keyed `handlers.bindings.sql.databases` variable —
 /// `BOATRAMP_HANDLERS_SQL_DB_<NAME>_<FIELD>`. Member names aren't known ahead of
 /// time (there is no config file to enumerate them), so they are discovered by
@@ -1513,25 +756,14 @@ const CLUSTER_ENV_VARS: &[&str] = &[
     "BOATRAMP_CLUSTER_MESH_GATE_CLIENT_WRITES",
 ];
 
-/// The `BOATRAMP_*` variables that populate the nested `[cluster.mesh]` sub-config.
-#[cfg_attr(feature = "config-figment", allow(dead_code))]
-const CLUSTER_MESH_ENV_VARS: &[&str] = &[
-    "BOATRAMP_CLUSTER_MESH_KEY_FILE",
-    "BOATRAMP_CLUSTER_MESH_KEY_ROTATION",
-    "BOATRAMP_CLUSTER_MESH_JOIN_TOKEN_TTL",
-    "BOATRAMP_CLUSTER_MESH_GATE_CLIENT_WRITES",
-];
-
-/// Where env-override values come from: the real process environment, or an
-/// explicit map for a deterministic unit test. Keeping the lookup behind this enum
-/// lets [`ServerConfig::apply_env_overrides`] be tested without touching (racy,
-/// process-global) `std::env`.
+/// Where env-override values come from: the real process environment, or an explicit map
+/// (the CLI-flag layer, which reuses the env overlay to turn `{BOATRAMP_<NAME>: value}`
+/// command-line flags into a figment dict; and deterministic unit tests — no racy,
+/// process-global `std::env`).
 pub(crate) enum EnvSource {
     /// The live process environment (`std::env::var`).
     Process,
-    /// A fixed name→value map: tests, and the `config-figment` flag layer (which reuses
-    /// the env overlay to turn `{BOATRAMP_<NAME>: value}` CLI flags into a figment dict).
-    #[cfg(any(test, feature = "config-figment"))]
+    /// A fixed name→value map (the CLI-flag layer + tests).
     Map(BTreeMap<String, String>),
 }
 
@@ -1541,7 +773,6 @@ impl EnvSource {
     fn get(&self, var: &str) -> Option<String> {
         let raw = match self {
             Self::Process => std::env::var(var).ok(),
-            #[cfg(any(test, feature = "config-figment"))]
             Self::Map(m) => m.get(var).cloned(),
         };
         raw.filter(|v| !v.is_empty())
@@ -1552,56 +783,13 @@ impl EnvSource {
         vars.iter().any(|v| self.get(v).is_some())
     }
 
-    /// Whether any variable whose name starts with `prefix` is set (to a
-    /// non-empty value). Used to decide whether to materialise a keyed map (the
-    /// `databases` env scheme) whose member names aren't known ahead of time.
-    #[cfg_attr(feature = "config-figment", allow(dead_code))]
-    fn any_with_prefix(&self, prefix: &str) -> bool {
-        self.names()
-            .any(|name| name.starts_with(prefix) && self.get(&name).is_some())
-    }
-
     /// The full set of variable names visible to this source. Used to discover the
     /// keyed-map member names from the environment (there is no config file to
     /// enumerate them). Returned owned so it doesn't borrow the process env.
     fn names(&self) -> Box<dyn Iterator<Item = String> + '_> {
         match self {
             Self::Process => Box::new(std::env::vars().map(|(k, _)| k)),
-            #[cfg(any(test, feature = "config-figment"))]
             Self::Map(m) => Box::new(m.keys().cloned()),
-        }
-    }
-
-    /// Parse `var` as one of a fixed set of string-mapped variants, mapping an
-    /// unknown value to a clear [`ConfigError::Env`] that names the variable and
-    /// the accepted values. Used for the config enums that have no `FromStr`
-    /// (their only string mapping is a serde `rename_all`). `Ok(None)` when unset.
-    #[cfg_attr(feature = "config-figment", allow(dead_code))]
-    fn parse_enum<T: Copy>(
-        &self,
-        var: &str,
-        variants: &[(&str, T)],
-    ) -> Result<Option<T>, ConfigError> {
-        match self.get(var) {
-            Some(raw) => {
-                let lower = raw.trim().to_ascii_lowercase();
-                variants
-                    .iter()
-                    .find(|(name, _)| *name == lower)
-                    .map(|(_, v)| Some(*v))
-                    .ok_or_else(|| ConfigError::Env {
-                        var: var.to_string(),
-                        reason: format!(
-                            "expected one of {}, got {raw:?}",
-                            variants
-                                .iter()
-                                .map(|(n, _)| *n)
-                                .collect::<Vec<_>>()
-                                .join("/")
-                        ),
-                    })
-            }
-            None => Ok(None),
         }
     }
 
@@ -1689,43 +877,6 @@ impl EnvSource {
                 .map(str::to_string)
                 .collect()
         })
-    }
-
-    /// Parse `var` as any [`FromStr`](std::str::FromStr) type (numbers), mapping a
-    /// parse failure to a clear [`ConfigError::Env`]. `Ok(None)` when the variable
-    /// is unset.
-    #[cfg_attr(feature = "config-figment", allow(dead_code))]
-    fn parse<T>(&self, var: &str) -> Result<Option<T>, ConfigError>
-    where
-        T: std::str::FromStr,
-        T::Err: std::fmt::Display,
-    {
-        match self.get(var) {
-            Some(raw) => raw.parse::<T>().map(Some).map_err(|e| ConfigError::Env {
-                var: var.to_string(),
-                reason: e.to_string(),
-            }),
-            None => Ok(None),
-        }
-    }
-
-    /// Parse `var` as a boolean, accepting the common truthy/falsey spellings
-    /// (`true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off`) case-insensitively so an
-    /// operator isn't surprised by a strict `true`-only parse. `Ok(None)` when
-    /// unset.
-    #[cfg_attr(feature = "config-figment", allow(dead_code))]
-    fn parse_bool(&self, var: &str) -> Result<Option<bool>, ConfigError> {
-        match self.get(var) {
-            Some(raw) => match raw.trim().to_ascii_lowercase().as_str() {
-                "true" | "1" | "yes" | "on" => Ok(Some(true)),
-                "false" | "0" | "no" | "off" => Ok(Some(false)),
-                other => Err(ConfigError::Env {
-                    var: var.to_string(),
-                    reason: format!("expected a boolean (true/false), got {other:?}"),
-                }),
-            },
-            None => Ok(None),
-        }
     }
 }
 
@@ -3580,28 +2731,30 @@ mod tests {
                 "{raw:?} ⇒ {want}"
             );
         }
-        // A non-boolean value is a clear error, not a silent default.
+        // A non-boolean value is a clear error, not a silent default. (The pipeline rejects it
+        // LOUDLY at extract as a `Resolve` error — figment's message names the field path, not
+        // the env var, but a malformed value is never silently defaulted.)
         let mut cfg = ServerConfig::default();
         let err = cfg
             .apply_env_overrides(&env(&[("BOATRAMP_SECURITY_REQUIRE_POP", "maybe")]))
             .expect_err("garbage boolean is rejected");
-        match err {
-            ConfigError::Env { var, .. } => assert_eq!(var, "BOATRAMP_SECURITY_REQUIRE_POP"),
-            other => panic!("expected ConfigError::Env, got {other:?}"),
-        }
+        assert!(
+            matches!(err, ConfigError::Resolve(_)),
+            "garbage bool must fail loudly, got {err:?}"
+        );
     }
 
     #[test]
-    fn env_number_parse_error_names_the_variable() {
-        // A non-numeric numeric var is rejected with the variable named.
+    fn env_number_parse_error_is_loud() {
+        // A non-numeric numeric var is rejected LOUDLY (never silently defaulted).
         let mut cfg = ServerConfig::default();
         let err = cfg
             .apply_env_overrides(&env(&[("BOATRAMP_COMPUTE_VCPUS", "lots")]))
             .expect_err("garbage number is rejected");
-        match err {
-            ConfigError::Env { var, .. } => assert_eq!(var, "BOATRAMP_COMPUTE_VCPUS"),
-            other => panic!("expected ConfigError::Env, got {other:?}"),
-        }
+        assert!(
+            matches!(err, ConfigError::Resolve(_)),
+            "garbage number must fail loudly, got {err:?}"
+        );
     }
 
     #[test]
@@ -3899,8 +3052,10 @@ mod tests {
     }
 
     #[test]
-    fn env_enum_parse_error_names_the_variable_and_variants() {
-        // An unknown enum value is a clear error that names the offending variable.
+    fn env_enum_parse_error_is_loud() {
+        // An unknown enum value is rejected LOUDLY at extract (never silently defaulted). The
+        // pipeline's `Resolve` error carries figment's message (which names the field + the
+        // unknown variant), not the old hand-built "one of rootless/caps" text.
         let mut cfg = ServerConfig::default();
         let err = cfg
             .apply_env_overrides(&env(&[(
@@ -3908,13 +3063,10 @@ mod tests {
                 "superuser",
             )]))
             .expect_err("unknown enum variant is rejected");
-        match err {
-            ConfigError::Env { var, reason } => {
-                assert_eq!(var, "BOATRAMP_COMPUTE_MANAGED_DB_PRIVILEGE");
-                assert!(reason.contains("rootless") && reason.contains("caps"));
-            }
-            other => panic!("expected ConfigError::Env, got {other:?}"),
-        }
+        assert!(
+            matches!(err, ConfigError::Resolve(_)),
+            "unknown enum variant must fail loudly, got {err:?}"
+        );
         // The docker enums map their lowercase serde variants too.
         let mut cfg = ServerConfig::default();
         cfg.apply_env_overrides(&env(&[
@@ -4019,14 +3171,16 @@ mod tests {
             Some(true)
         );
 
-        // Without a listen (and no file section) there is nothing to materialise:
-        // a non-listen cluster var alone leaves the section absent.
+        // Decision 4: a `[cluster]` without its required `listen` (here: a non-listen cluster
+        // var alone, no file section) now FAILS LOUDLY at extract — the old loader silently
+        // dropped the section, which could mask a misconfigured cluster.
         let mut cfg = ServerConfig::default();
-        cfg.apply_env_overrides(&env(&[("BOATRAMP_CLUSTER_SEEDS", "https://10.0.0.1:8080")]))
-            .expect("applies");
+        let err = cfg
+            .apply_env_overrides(&env(&[("BOATRAMP_CLUSTER_SEEDS", "https://10.0.0.1:8080")]))
+            .expect_err("a cluster section without `listen` must fail loudly");
         assert!(
-            cfg.cluster.is_none(),
-            "no listen + no file section ⇒ no cluster"
+            matches!(err, ConfigError::Resolve(_)),
+            "cluster-without-listen must be a loud resolution error, got {err:?}"
         );
     }
 
@@ -4640,47 +3794,6 @@ mod tests {
                 "{var} is not an s3_ingress_cloud lever"
             );
         }
-    }
-
-    #[test]
-    fn env_wires_the_serve_s3_backend_over_the_default() {
-        // The PRIMARY `[serve]` S3 object backend is env-settable so the OFFLINE ops (`boatramp
-        // migrate`/`blob rehome`, which build a backend from the config file ALONE, no `ServeArgs`)
-        // resolve the same Tigris store `serve` does — the lever that lets the construens fleet drop
-        // its `boatramp.cfg` and set BOATRAMP_BLOBS/BOATRAMP_S3_* in fly `[env]`. Every lever is
-        // registered in SERVE_S3_BACKEND_ENV_VARS (forgot-a-knob guard). The credential is NOT here —
-        // it stays the standard `AWS_*` env (invariant 3).
-        let mut cfg = ServerConfig::default();
-        assert!(cfg.serve.is_none());
-        cfg.apply_env_overrides(&env(&[
-            ("BOATRAMP_BLOBS", "s3"),
-            ("BOATRAMP_S3_BUCKET", "construens-blobs"),
-            ("BOATRAMP_S3_ENDPOINT", "https://fly.storage.tigris.dev"),
-            ("BOATRAMP_S3_REGION", "auto"),
-            ("BOATRAMP_S3_PATH_STYLE", "true"),
-        ]))
-        .expect("valid serve S3-backend env overrides apply");
-        let serve = cfg.serve.expect("serve materialised from env");
-        assert_eq!(serve.blobs, Some(crate::backends::BlobBackend::S3));
-        assert_eq!(serve.s3_bucket.as_deref(), Some("construens-blobs"));
-        assert_eq!(
-            serve.s3_endpoint.as_deref(),
-            Some("https://fly.storage.tigris.dev")
-        );
-        assert_eq!(serve.s3_region.as_deref(), Some("auto"));
-        assert!(serve.s3_path_style);
-        // Forgot-a-knob guard: the lever set is exactly these five (no stale/missing lever); a new
-        // top-level `[serve]` S3 field can't silently lose its env parity for the offline ops.
-        assert_eq!(
-            SERVE_S3_BACKEND_ENV_VARS,
-            [
-                "BOATRAMP_BLOBS",
-                "BOATRAMP_S3_BUCKET",
-                "BOATRAMP_S3_ENDPOINT",
-                "BOATRAMP_S3_REGION",
-                "BOATRAMP_S3_PATH_STYLE",
-            ]
-        );
     }
 
     #[test]
@@ -5517,66 +4630,46 @@ mod tests {
 }
 
 // ============================================================================
-// WIP (`config-figment` feature): the single figment-based env→config overlay.
+// The single figment-based config resolver (serve + every offline op).
 // ============================================================================
 //
-// This module is the heart of the config-system rewrite tracked in
-// docs/config-figment-migration.md. It builds the `BOATRAMP_*`
-// environment layer as a figment `Dict`, to be merged (defaults → file → env →
-// flags) and extracted ONCE, by EVERY subcommand — replacing the three
-// hand-maintained, serve-biased env loaders:
+// This module is the config system (shipped in v0.35.0; design record in
+// docs/config-figment-migration.md). `load_with_figment` merges, in order,
+//   base-seed → file → `BOATRAMP_*` env → explicit CLI flags
+// into ONE `ServerConfig`, used by `ServerConfig::load` (serve AND the offline ops:
+// `migrate`, `blob`, `token`). It REPLACED the three hand-rolled env loaders:
 //
 //   A. the serve clap `#[arg(env = …)]` layer (serve-only),
-//   B. `ServerConfig::apply_env_overrides` (runs in `load`, so everywhere), and
+//   B. `apply_env_overrides` (ran in `load`, so everywhere), and
 //   C. ad-hoc `std::env::var` reads in serve (serve-only).
 //
-// The core bug the rewrite fixes: A & C are serve-only, so `BOATRAMP_S3_BUCKET`
-// (and the other serve/kv knobs) are honored by `serve` but NOT by `boatramp
-// migrate` / `blob migrate` — the offline ops that most need them.
+// The core bug it fixed: A & C were serve-only, so `BOATRAMP_S3_BUCKET` (and the
+// serve/kv knobs) were honored by `serve` but NOT by `migrate`/`blob` — the offline
+// ops that most need them. Now the env surface is uniform across all subcommands.
 //
 // ## Design: emit strings, extract lossy
 //
-// The overlay emits every scalar as a STRING value, lists as arrays, and the
-// (rare) rename_all enums as their lowercased token. Nothing is parsed here, so
-// the overlay is infallible. At extraction time `Figment::extract_lossy` coerces
-// each string to the target field's type:
-//   * bool fields  — via `Value::to_bool_lossy`, whose accepted spellings
-//     (`true/yes/1/on` + `false/no/0/off`, case-insensitive) are EXACTLY
-//     `EnvSource::parse_bool`'s, so the P4 bool-spelling parity holds for free;
-//   * numeric fields — via `to_num_lossy` (a non-numeric value stays a string and
-//     then fails to deserialize — LOUDLY, exactly as `apply_env_overrides` failed
-//     at override time, just deferred to extract);
+// The env/flag overlay emits every scalar as a STRING value (trimmed), lists as
+// arrays, and the (rare) rename_all enums as their lowercased token. Nothing is
+// parsed here, so the overlay is infallible. At extraction `Figment::extract_lossy`
+// coerces each string to the target field's type:
+//   * bool fields  — via `Value::to_bool_lossy` (`true/yes/1/on` + `false/no/0/off`,
+//     case-insensitive — the spellings the old `parse_bool` accepted);
+//   * numeric fields — via `to_num_lossy` (a non-numeric value fails to deserialize
+//     LOUDLY — a malformed value is rejected, never silently defaulted);
 //   * string / enum / path / socket-addr fields read the string directly.
-// A string destined for a string field is never coerced (lossy only kicks in when
-// the TARGET is bool/number), so a numeric-looking bucket name or region survives.
+// A string destined for a string field is never coerced (lossy only fires when the
+// TARGET is bool/number), so a numeric-looking bucket name or region survives.
 //
 // ## Faithful, drift-proof mapping
 //
-// The fixed-var overlay is DRIVEN BY the same `*_ENV_VARS` const tables that
-// `apply_env_overrides` and the forgot-a-knob guard tests use, deriving each
-// config path from the var name by the section's rule (drop `serve`, drop
-// `bindings`, drop `overrides`, …). So a var that exists in a const table is
-// handled by construction — no third hand-maintained list to drift. The only
-// per-var classification is the small `LIST_VARS` / `ENUM_VARS` sets below.
-//
-// ## Scope of THIS commit (scaffolding)
-//
-// Implemented + parity-tested here: the whole of Loader B (compute, security,
-// handlers, s3_ingress_cloud, secrets, cluster + the three dynamic-keyed maps)
-// plus the serve S3 blob scalars. NOT yet wired (tracked in the plan): the file
-// layer (RON/JSON → figment Value), the explicit-CLI-flag layer (the
-// `ValueSource::CommandLine` filter that subsumes the `--blobs` explicit-set
-// probe), the remaining serve.* scalars + the Loader-C `serve.kv.*` knobs, and
-// the `#[serde(default)]` additions some `deny_unknown_fields` structs need to
-// deserialize from a partial env sub-dict (see the plan's "pre-reqs").
-#[cfg(feature = "config-figment")]
+// The fixed-var overlay is DRIVEN BY the `*_ENV_VARS` const tables (+ the explicit
+// `SERVE_SCALARS` / `SERVE_KV` alias tables for the irregular serve names), deriving
+// each config path by the section's rule (drop `serve`, drop `bindings`, drop
+// `overrides`, …). Those tables are now the SINGLE source of truth; the forgot-a-knob
+// guard tests assert every struct field has a table entry, and the drift guards assert
+// every table entry is honored by the overlay — field ↔ var ↔ overlay, no drift.
 pub(crate) mod figment_resolve {
-    // WIP scaffolding: the overlay + provider are built and parity-tested here but
-    // not yet wired into `ServerConfig::load` (that is the flip step in the plan,
-    // once the file + flag layers land and the `#[serde(default)]` pre-reqs are in).
-    // Until then its items are exercised only by this module's own tests.
-    #![allow(dead_code)]
-
     use super::*;
     use figment::providers::Serialized;
     use figment::value::{Dict, Map as FigMap, Tag, Value};
@@ -5721,6 +4814,13 @@ pub(crate) mod figment_resolve {
 
     /// Emit the right value KIND for `var` (list / enum / plain scalar) at `path`,
     /// iff the var is set to a non-empty value.
+    ///
+    /// Scalar values are **trimmed**: the legacy `parse_bool`/`parse`/`parse_enum` all did
+    /// `.trim()`, and figment's `to_bool_lossy` does NOT trim — so without this a templated
+    /// `BOATRAMP_..._BOOL="true\n"` (fly.toml / k8s block scalar) would fail to coerce
+    /// instead of parsing `true`. Trimming the string scalars too is harmless (a config
+    /// value's surrounding whitespace is never meaningful, and `get` already treats a
+    /// whitespace-only value as unset). A trimmed-to-empty value is dropped (unset).
     fn emit(dict: &mut Dict, source: &EnvSource, var: &str, path: &[&str]) {
         if LIST_VARS.contains(&var) {
             if let Some(items) = source.parse_list(var) {
@@ -5731,7 +4831,10 @@ pub(crate) mod figment_resolve {
                 put(dict, path, Value::from(v.trim().to_ascii_lowercase()));
             }
         } else if let Some(v) = source.get(var) {
-            put(dict, path, Value::from(v));
+            let trimmed = v.trim();
+            if !trimmed.is_empty() {
+                put(dict, path, Value::from(trimmed.to_string()));
+            }
         }
     }
 
@@ -6150,6 +5253,36 @@ pub(crate) mod figment_resolve {
         Ok(cfg)
     }
 
+    /// Resolve the `BOATRAMP_*` env overlay OVER an already-parsed base config (the base
+    /// standing in for the file layer): `base-seed → base → env`. Equivalent to
+    /// [`load_with_figment`] with the file already read into `base` and no flags. Test-only —
+    /// it backs the `#[cfg(test)]` `apply_env_overrides` adapter so the pre-figment env tests
+    /// (which layer env over a parsed `boatramp.cfg` struct) run THROUGH the real pipeline.
+    #[cfg(test)]
+    pub(crate) fn resolve_env_over(
+        base: &ServerConfig,
+        source: &EnvSource,
+    ) -> Result<ServerConfig, ConfigError> {
+        let seed = base_seed(source).map_err(|e| ConfigError::Resolve(e.to_string()))?;
+        let file = file_layer(base).map_err(|e| ConfigError::Resolve(e.to_string()))?;
+        let cfg: ServerConfig = Figment::new()
+            .merge(DictLayer {
+                name: "base defaults",
+                dict: seed,
+            })
+            .merge(DictLayer {
+                name: "base config",
+                dict: file,
+            })
+            .merge(BoatrampEnv::new(source))
+            .extract_lossy()
+            .map_err(|e| ConfigError::Resolve(e.to_string()))?;
+        cfg.validate_sql_db_names()?;
+        cfg.validate_blob_backend_projects()?;
+        cfg.validate_listeners()?;
+        Ok(cfg)
+    }
+
     /// Build the explicit-CLI-**flag** figment layer from a `{BOATRAMP_<NAME>: value}` map
     /// of the args the operator set on the command line. Reuses [`env_overlay_dict`] (a
     /// flag's name→path mapping is the SAME as its env var's), so only recognised config
@@ -6169,6 +5302,12 @@ pub(crate) mod figment_resolve {
         "bootstrap_secret",
         "azure_access_key",
         "secret_access_key",
+        // The external token signer's in-process root key (`[serve.signer] Local { private_key }`)
+        // is raw key material in the config — mask it (Security MEDIUM).
+        "private_key",
+        // `[cluster] join_token` is a secret REFERENCE by convention (`env:`/`path:`), but the
+        // schema allows a raw-inlined token, so mask it to be safe (Security MEDIUM).
+        "join_token",
     ];
 
     fn redact(value: &mut serde_json::Value) {
@@ -6297,13 +5436,11 @@ pub(crate) mod figment_resolve {
             assert!(dict.is_empty(), "an empty value must be treated as unset");
         }
 
-        /// Parity oracle for a section whose struct deserializes from a partial dict
-        /// (`ComputeConfig` is `#[serde(default)]`): the figment pipeline yields the
-        /// SAME `compute` config as `apply_env_overrides`, across str / int / list /
-        /// enum / bool field kinds.
+        /// `[compute]` resolves from env across str / int / list / enum / bool field kinds
+        /// (`ComputeConfig` is `#[serde(default)]`, so a partial env dict fills the rest).
         #[test]
-        fn compute_matches_apply_env_overrides() {
-            let pairs = &[
+        fn compute_resolves_from_env() {
+            let c = resolve_from_env(&map(&[
                 ("BOATRAMP_COMPUTE_VCPUS", "4"),
                 ("BOATRAMP_COMPUTE_MEM_MIB", "2048"),
                 ("BOATRAMP_COMPUTE_REGION", "ams"),
@@ -6313,22 +5450,31 @@ pub(crate) mod figment_resolve {
                 ),
                 ("BOATRAMP_COMPUTE_MANAGED_DB_PRIVILEGE", "rootless"),
                 ("BOATRAMP_COMPUTE_INTERNAL_DNS", "on"),
-            ];
-            let via_figment = resolve_from_env(&map(pairs)).expect("figment extract");
-            let mut via_apply = ServerConfig::default();
-            via_apply
-                .apply_env_overrides(&map(pairs))
-                .expect("apply_env_overrides");
+            ]))
+            .expect("figment extract")
+            .compute
+            .expect("compute materialised from env");
+            assert_eq!(c.vcpus, 4);
+            assert_eq!(c.mem_mib, 2048);
+            assert_eq!(c.region.as_deref(), Some("ams"));
             assert_eq!(
-                format!("{:?}", via_figment.compute),
-                format!("{:?}", via_apply.compute),
-                "the figment compute section must equal apply_env_overrides'"
+                c.kernel_signing_pubkeys,
+                vec!["es256:aa".to_string(), "es256:bb".to_string()],
+                "comma-list trimmed + split"
             );
+            assert_eq!(c.managed_db_privilege, ManagedDbPrivilege::Rootless);
+            assert!(c.internal_dns, "bool coerced from \"on\"");
         }
 
-        /// Parity oracle for the serve S3 scalars (the construens finalize concern)
-        /// — `ServeConfig` is `#[serde(default)]`. Covers the enum (`blobs`), a
-        /// string, and the bool (`s3_path_style`).
+        /// The serve S3 scalars (the construens finalize concern) resolve from env —
+        /// `ServeConfig` is `#[serde(default)]`. Asserts ALL FIVE top-level `[serve]` S3-backend
+        /// levers (`blobs`/`s3_bucket`/`s3_endpoint`/`s3_region`/`s3_path_style`) resolve — the
+        /// enum, three strings, and the bool. This resolves through the pipeline with NO flag layer
+        /// (`resolve_from_env`), i.e. exactly the way the OFFLINE ops (`migrate`/`blob rehome`) see
+        /// the object store from the environment — the parity that v0.34.0's hand-added Loader-B
+        /// `SERVE_S3_BACKEND_ENV_VARS` arm provided and the figment overlay (`SERVE_SCALARS`) now
+        /// subsumes. So a file-less fleet (the Tigris-only construens deployment) needs no
+        /// `boatramp.cfg` for its object store.
         #[test]
         fn serve_s3_scalars_extract() {
             let cfg = resolve_from_env(&map(&[
@@ -6340,7 +5486,12 @@ pub(crate) mod figment_resolve {
             ]))
             .expect("extract");
             let serve = cfg.serve.expect("serve materialised from env");
+            assert_eq!(serve.blobs, Some(crate::backends::BlobBackend::S3));
             assert_eq!(serve.s3_bucket.as_deref(), Some("construens-blobs"));
+            assert_eq!(
+                serve.s3_endpoint.as_deref(),
+                Some("https://fly.storage.tigris.dev")
+            );
             assert_eq!(serve.s3_region.as_deref(), Some("auto"));
             assert!(serve.s3_path_style, "s3_path_style coerced from \"true\"");
         }
@@ -6398,16 +5549,12 @@ pub(crate) mod figment_resolve {
             assert!(matches!(cur.get("kind"), Some(Value::String(_, s)) if s == "postgres"));
         }
 
-        // ====================================================================
-        // Full-surface parity battery (the release-ready gate for Loader B).
-        // ====================================================================
-        //
-        // For every `apply_env_overrides` section + every dynamic map, assert the figment
-        // pipeline (`load_with_figment` with no file, no flags) yields the SAME ServerConfig
-        // as `apply_env_overrides`, compared via pretty-Debug. A green battery is the bar
-        // that lets Loader B be retired. (Serve-scalar env vars — BOATRAMP_BLOBS / S3_* etc.
-        // — are Loader A, NOT handled by apply_env_overrides, so they are asserted directly
-        // in `serve_s3_scalars_extract`, not here.)
+        // The figment pipeline resolves an offline op's config (base-seed + env, no file, no
+        // flags) — `figment_env` — used by the direct section/serve tests below. (The old
+        // full-surface parity battery, which compared this to `apply_env_overrides`, retired
+        // with Loader B; its equivalence was proven green at the cutover, and the direct
+        // per-section tests — here + the `env_wires_*` tests in `config::tests`, which now run
+        // THROUGH the pipeline via the test adapter — are the spec going forward.)
 
         /// The figment pipeline an offline op takes: base-seed + env, no file, no flags.
         fn figment_env(pairs: &[(&str, &str)]) -> ServerConfig {
@@ -6420,281 +5567,9 @@ pub(crate) mod figment_resolve {
             .expect("figment load_with_figment")
         }
 
-        /// The legacy loader, the parity oracle.
-        fn apply_env(pairs: &[(&str, &str)]) -> ServerConfig {
-            let mut c = ServerConfig::default();
-            c.apply_env_overrides(&map(pairs))
-                .expect("apply_env_overrides");
-            c
-        }
-
-        #[track_caller]
-        fn assert_parity(pairs: &[(&str, &str)]) {
-            assert_eq!(
-                format!("{:#?}", figment_env(pairs)),
-                format!("{:#?}", apply_env(pairs)),
-                "figment pipeline must equal apply_env_overrides for {pairs:?}"
-            );
-        }
-
-        #[test]
-        fn parity_compute_full() {
-            assert_parity(&[
-                ("BOATRAMP_COMPUTE_BRIDGE", "br0"),
-                ("BOATRAMP_COMPUTE_SUBNET", "10.9.0.0/16"),
-                ("BOATRAMP_COMPUTE_VCPUS", "4"),
-                ("BOATRAMP_COMPUTE_MEM_MIB", "2048"),
-                ("BOATRAMP_COMPUTE_REGION", "ams"),
-                ("BOATRAMP_COMPUTE_SQL_SHIM_URL", "http://shim:1"),
-                ("BOATRAMP_COMPUTE_BLOB_SHIM_URL", "http://shim:2"),
-                ("BOATRAMP_COMPUTE_BLOB_SHIM_MAX_OBJECT_BYTES", "1048576"),
-                ("BOATRAMP_COMPUTE_MANAGED_DB_PRIVILEGE", "rootless"),
-                ("BOATRAMP_COMPUTE_DOCKER_ENDPOINT", "published"),
-                ("BOATRAMP_COMPUTE_DOCKER_VOLUME_MODE", "named"),
-                (
-                    "BOATRAMP_COMPUTE_KERNEL_SIGNING_PUBKEYS",
-                    "es256:aa, es256:bb",
-                ),
-                (
-                    "BOATRAMP_COMPUTE_KERNEL_ALLOWED_HASHES",
-                    "sha256:1,sha256:2",
-                ),
-                ("BOATRAMP_COMPUTE_INTERNAL_DNS", "true"),
-                ("BOATRAMP_COMPUTE_DNS_UPSTREAM", "1.1.1.1:53"),
-                ("BOATRAMP_COMPUTE_DNS_DOMAIN", "internal"),
-            ]);
-        }
-
-        #[test]
-        fn parity_security_full() {
-            // profile + every override knob (bool + numeric) — the P1 drop-`overrides` path.
-            let mut pairs = vec![("BOATRAMP_SECURITY_PROFILE", "multi-tenant")];
-            for v in SECURITY_ENV_VARS {
-                if *v == "BOATRAMP_SECURITY_PROFILE" {
-                    continue;
-                }
-                // numeric knobs get a number; everything else a bool — both coerce lossily.
-                let val = if v.ends_with("_BYTES") || v.ends_with("_SECS") {
-                    "123"
-                } else {
-                    "true"
-                };
-                pairs.push((v, val));
-            }
-            assert_parity(&pairs);
-        }
-
-        #[test]
-        fn parity_handlers_sql_scalars_full() {
-            assert_parity(&[
-                ("BOATRAMP_HANDLERS_SQL_DIR", "/var/sql"),
-                ("BOATRAMP_HANDLERS_SQL_URL", "http://sqld:8080"),
-                ("BOATRAMP_HANDLERS_SQL_ADMIN_URL", "http://sqld:9090"),
-                ("BOATRAMP_HANDLERS_SQL_REPLICA_URL", "http://sqld:8081"),
-                ("BOATRAMP_HANDLERS_SQL_TOKEN_ENV", "SQL_TOKEN"),
-                ("BOATRAMP_HANDLERS_SQL_ADMIN_TOKEN_ENV", "SQL_ADMIN_TOKEN"),
-                ("BOATRAMP_HANDLERS_SQL_PREVIEW_MODE", "copy"),
-                ("BOATRAMP_HANDLERS_SQL_PREVIEW_INIT", "/init.sql"),
-                ("BOATRAMP_HANDLERS_SQL_DEPROVISION_GRACE_SECS", "60"),
-                (
-                    "BOATRAMP_HANDLERS_SQL_MIGRATE_TRUSTED_EXTENSIONS",
-                    "pg_trgm, pgcrypto",
-                ),
-                ("BOATRAMP_HANDLERS_SQL_MAX_DECLARED_DATABASES", "32"),
-                ("BOATRAMP_HANDLERS_SQL_MAX_DECLARED_VOLUME_MIB", "1048576"),
-            ]);
-        }
-
-        #[test]
-        fn parity_handlers_jwks_concurrency_hedge_full() {
-            assert_parity(&[
-                ("BOATRAMP_HANDLERS_JWKS_REFRESH_SECS", "90"),
-                ("BOATRAMP_HANDLERS_JWKS_HARD_TTL_SECS", "450"),
-                ("BOATRAMP_HANDLERS_JWKS_FOREIGN_REFRESH_SECS", "30"),
-                ("BOATRAMP_HANDLERS_JWKS_FOREIGN_HARD_TTL_SECS", "150"),
-                ("BOATRAMP_HANDLERS_JWKS_PREWARM", "false"),
-                ("BOATRAMP_HANDLERS_SERVE_CONCURRENCY", "0"),
-                ("BOATRAMP_HANDLERS_SYNC_MAX_CONCURRENCY", "128"),
-                ("BOATRAMP_HANDLERS_ASYNC_MAX_CONCURRENCY", "16"),
-                ("BOATRAMP_HANDLERS_BLOB_HEDGE_DELAY_MS", "150"),
-                ("BOATRAMP_HANDLERS_BLOB_HEDGE_MAX_INFLIGHT", "4"),
-            ]);
-        }
-
-        #[test]
-        fn parity_s3_ingress_cloud_full() {
-            assert_parity(&[
-                (
-                    "BOATRAMP_S3_INGRESS_CLOUD_AWS_ROLE_ARN",
-                    "arn:aws:iam::1:role/x",
-                ),
-                (
-                    "BOATRAMP_S3_INGRESS_CLOUD_AWS_USE_FEDERATION_TOKEN",
-                    "false",
-                ),
-                ("BOATRAMP_S3_INGRESS_CLOUD_AWS_PRESIGNED_ONLY", "true"),
-                ("BOATRAMP_S3_INGRESS_CLOUD_GCS_CLIENT_EMAIL", "svc@proj.iam"),
-                ("BOATRAMP_S3_INGRESS_CLOUD_AZURE_ACCOUNT", "acct"),
-                (
-                    "BOATRAMP_S3_INGRESS_CLOUD_AZURE_SERVICE_URL",
-                    "https://acct.blob",
-                ),
-                ("BOATRAMP_S3_INGRESS_CLOUD_AZURE_HNS", "true"),
-            ]);
-        }
-
-        #[test]
-        fn parity_secrets_with_vault_full() {
-            // Exercises decision 2: the deny_unknown VaultSecretsConfig materialized COMPLETE
-            // from env (addr + key required) via the base-seed layer.
-            assert_parity(&[
-                ("BOATRAMP_SECRETS_ENVELOPE", "vault"),
-                ("BOATRAMP_SECRETS_KEK_FILE", "/data/kek"),
-                ("BOATRAMP_SECRETS_VAULT_ADDR", "https://vault:8200"),
-                ("BOATRAMP_SECRETS_VAULT_KEY", "transit/boatramp"),
-                ("BOATRAMP_SECRETS_VAULT_TOKEN_ENV", "VAULT_TOKEN"),
-            ]);
-        }
-
-        #[test]
-        fn parity_secrets_vault_partial_env_materializes_complete() {
-            // Only addr set: decision 2 must still produce a COMPLETE vault (key defaults to
-            // ""), matching apply_env_overrides' get_or_insert_with(default).
-            assert_parity(&[
-                ("BOATRAMP_SECRETS_ENVELOPE", "vault"),
-                ("BOATRAMP_SECRETS_VAULT_ADDR", "https://vault:8200"),
-            ]);
-        }
-
-        #[test]
-        fn parity_cluster_with_mesh_full() {
-            assert_parity(&[
-                ("BOATRAMP_CLUSTER_LISTEN", "10.0.0.2:7000"),
-                ("BOATRAMP_CLUSTER_ROOT_PUBKEYS", "es256:03a1, es256:03a2"),
-                ("BOATRAMP_CLUSTER_SEEDS", "https://10.0.0.1:8080"),
-                ("BOATRAMP_CLUSTER_JOIN_TOKEN", "env:JOIN"),
-                ("BOATRAMP_CLUSTER_STORE_DIR", "/data/raft"),
-                ("BOATRAMP_CLUSTER_MESH_KEY_FILE", "/data/mesh.key"),
-                ("BOATRAMP_CLUSTER_MESH_KEY_ROTATION", "24h"),
-                ("BOATRAMP_CLUSTER_MESH_JOIN_TOKEN_TTL", "10m"),
-                ("BOATRAMP_CLUSTER_MESH_GATE_CLIENT_WRITES", "true"),
-            ]);
-        }
-
-        #[test]
-        fn parity_sql_databases_map_full() {
-            // The reserved DEFAULT token + a named DB, covering scalar/enum/bool/int fields.
-            assert_parity(&[
-                ("BOATRAMP_HANDLERS_SQL_DB_DEFAULT_KIND", "postgres"),
-                ("BOATRAMP_HANDLERS_SQL_DB_DEFAULT_COMPUTE", "pg"),
-                ("BOATRAMP_HANDLERS_SQL_DB_DEFAULT_DATABASE", "app"),
-                ("BOATRAMP_HANDLERS_SQL_DB_DEFAULT_USER", "app"),
-                ("BOATRAMP_HANDLERS_SQL_DB_DEFAULT_TENANT", "shared"),
-                ("BOATRAMP_HANDLERS_SQL_DB_DEFAULT_TENANT_SCOPE", "project"),
-                ("BOATRAMP_HANDLERS_SQL_DB_DEFAULT_RLS_SESSION", "true"),
-                (
-                    "BOATRAMP_HANDLERS_SQL_DB_DEFAULT_TENANT_GUC",
-                    "app.tenant_id",
-                ),
-                (
-                    "BOATRAMP_HANDLERS_SQL_DB_DEFAULT_SESSION_GUC",
-                    "app.session_id",
-                ),
-                ("BOATRAMP_HANDLERS_SQL_DB_DEFAULT_TENANT_ALL_MARKER", "*"),
-                ("BOATRAMP_HANDLERS_SQL_DB_analytics_KIND", "postgres"),
-                (
-                    "BOATRAMP_HANDLERS_SQL_DB_analytics_URL_ENV",
-                    "ANALYTICS_URL",
-                ),
-                ("BOATRAMP_HANDLERS_SQL_DB_analytics_READ_ONLY", "true"),
-                ("BOATRAMP_HANDLERS_SQL_DB_analytics_POOL_MAX", "8"),
-                (
-                    "BOATRAMP_HANDLERS_SQL_DB_analytics_CONNECT_TIMEOUT_SECS",
-                    "5",
-                ),
-            ]);
-        }
-
-        #[test]
-        fn parity_blob_backends_map_full() {
-            // Exercises decision 2 for the per-project sealed credential (complete sub-dict).
-            assert_parity(&[
-                ("BOATRAMP_SERVE_BLOB_BACKEND_myproj_KIND", "s3"),
-                (
-                    "BOATRAMP_SERVE_BLOB_BACKEND_myproj_S3_BUCKET",
-                    "myproj-blobs",
-                ),
-                (
-                    "BOATRAMP_SERVE_BLOB_BACKEND_myproj_S3_ENDPOINT",
-                    "https://s3.example",
-                ),
-                ("BOATRAMP_SERVE_BLOB_BACKEND_myproj_S3_REGION", "auto"),
-                ("BOATRAMP_SERVE_BLOB_BACKEND_myproj_S3_PATH_STYLE", "true"),
-                (
-                    "BOATRAMP_SERVE_BLOB_BACKEND_myproj_S3_ACCESS_KEY_ID",
-                    "AKIA",
-                ),
-                (
-                    "BOATRAMP_SERVE_BLOB_BACKEND_myproj_S3_SECRET_ACCESS_KEY",
-                    "boatramp:myproj-s3",
-                ),
-            ]);
-        }
-
-        #[test]
-        fn parity_listeners_map_full() {
-            assert_parity(&[
-                ("BOATRAMP_SERVE_LISTENER_edge_BIND", "0.0.0.0:7100"),
-                ("BOATRAMP_SERVE_LISTENER_edge_COMPONENT", "tcp-echo"),
-                ("BOATRAMP_SERVE_LISTENER_edge_PROJECT", "proj"),
-                ("BOATRAMP_SERVE_LISTENER_edge_SITE", "site"),
-                (
-                    "BOATRAMP_SERVE_LISTENER_edge_IMPORTS",
-                    "wasi:io/streams, wasi:io/error",
-                ),
-                ("BOATRAMP_SERVE_LISTENER_edge_MAX_CONNS", "64"),
-                ("BOATRAMP_SERVE_LISTENER_edge_IDLE_TIMEOUT_MS", "30000"),
-                (
-                    "BOATRAMP_SERVE_LISTENER_edge_MAX_CONN_DURATION_MS",
-                    "600000",
-                ),
-            ]);
-        }
-
-        #[test]
-        fn parity_combined_whole_surface() {
-            // One map touching every Loader-B section + all three maps at once — the merged
-            // ServerConfig must match apply_env_overrides field-for-field.
-            assert_parity(&[
-                ("BOATRAMP_COMPUTE_VCPUS", "2"),
-                ("BOATRAMP_COMPUTE_MEM_MIB", "1024"),
-                ("BOATRAMP_COMPUTE_KERNEL_SIGNING_PUBKEYS", "es256:aa"),
-                ("BOATRAMP_SECURITY_PROFILE", "multi-tenant"),
-                ("BOATRAMP_SECURITY_ALLOW_SHARED_KERNEL_COMPUTE", "true"),
-                ("BOATRAMP_SECURITY_MAX_UPLOAD_BYTES", "99"),
-                ("BOATRAMP_HANDLERS_SQL_URL", "http://sqld:8080"),
-                ("BOATRAMP_HANDLERS_SERVE_CONCURRENCY", "32"),
-                ("BOATRAMP_HANDLERS_BLOB_HEDGE_DELAY_MS", "150"),
-                ("BOATRAMP_S3_INGRESS_CLOUD_AWS_PRESIGNED_ONLY", "true"),
-                ("BOATRAMP_SECRETS_ENVELOPE", "local"),
-                ("BOATRAMP_SECRETS_KEK_FILE", "/data/kek"),
-                ("BOATRAMP_CLUSTER_LISTEN", "10.0.0.2:7000"),
-                ("BOATRAMP_CLUSTER_MESH_GATE_CLIENT_WRITES", "true"),
-                ("BOATRAMP_HANDLERS_SQL_DB_DEFAULT_KIND", "postgres"),
-                ("BOATRAMP_SERVE_BLOB_BACKEND_myproj_KIND", "s3"),
-                ("BOATRAMP_SERVE_BLOB_BACKEND_myproj_S3_BUCKET", "b"),
-                ("BOATRAMP_SERVE_LISTENER_edge_COMPONENT", "tcp-echo"),
-                ("BOATRAMP_SERVE_LISTENER_edge_BIND", "0.0.0.0:7100"),
-                ("BOATRAMP_SERVE_LISTENER_edge_PROJECT", "proj"),
-                ("BOATRAMP_SERVE_LISTENER_edge_SITE", "site"),
-            ]);
-        }
-
-        // --- serve.* scalars + serve.kv.* (Loader A / C) --------------------------
-        // These are NOT in `apply_env_overrides` (they were the serve-only clap/ad-hoc
-        // loaders), so the apply_env oracle doesn't apply. They're asserted directly:
-        // the figment env overlay resolves each into its ServeConfig field (the same
-        // field clap/the ad-hoc read populate from the same BOATRAMP_<NAME> var today).
+        // --- serve.* scalars + serve.kv.* (former Loader A / C) -------------------
+        // The pipeline resolves these (the serve-only clap `#[arg(env)]` + ad-hoc env reads
+        // the rewrite subsumed) into their ServeConfig fields, asserted directly below.
 
         /// Env-only figment resolution via the full pipeline (base-seed + env), so the
         /// serve-scalar secrets' deny-unknown neighbours aren't an issue (serve is
@@ -6832,10 +5707,14 @@ pub(crate) mod figment_resolve {
                 [("BOATRAMP_S3_BUCKET".to_string(), "from-flag".to_string())]
                     .into_iter()
                     .collect();
-            let cfg = load_with_figment(&path, None, &env, flag_overlay_dict(&flags))
-                .expect("resolve");
+            let cfg =
+                load_with_figment(&path, None, &env, flag_overlay_dict(&flags)).expect("resolve");
             let serve = cfg.serve.expect("serve");
-            assert_eq!(serve.s3_bucket.as_deref(), Some("from-flag"), "flag beats env+file");
+            assert_eq!(
+                serve.s3_bucket.as_deref(),
+                Some("from-flag"),
+                "flag beats env+file"
+            );
             assert_eq!(
                 serve.s3_endpoint.as_deref(),
                 Some("from-env-endpoint"),
@@ -6869,6 +5748,122 @@ pub(crate) mod figment_resolve {
             assert!(dump.contains("<redacted>"), "secrets shown as <redacted>");
             // A non-secret field is still shown in full.
             assert!(dump.contains("construens"), "non-secret values are shown");
+        }
+
+        /// Security MEDIUM: the external signer's in-process `private_key` and a raw-inlined
+        /// `cluster.join_token` must be redacted in a dump (the config is `Serialize`, so a raw
+        /// dump would otherwise print the signing key / join secret in cleartext).
+        #[test]
+        fn dump_redacts_signer_key_and_join_token() {
+            let file = r#"(
+                serve: ( signer: Local( private_key: "SIGNERPRIVKEYSECRET" ) ),
+                cluster: ( listen: "10.0.0.2:7000", join_token: "RAWJOINTOKENSECRET" ),
+            )"#;
+            let cfg = ServerConfig::parse_with_format(file, ConfigFormat::Ron).expect("parse");
+            let dump = cfg.dump_redacted().expect("dump");
+            assert!(
+                !dump.contains("SIGNERPRIVKEYSECRET"),
+                "signer private_key leaked:\n{dump}"
+            );
+            assert!(
+                !dump.contains("RAWJOINTOKENSECRET"),
+                "cluster join_token leaked:\n{dump}"
+            );
+            assert!(dump.contains("<redacted>"));
+        }
+
+        /// Security LOW (bool trim): a templated env value with trailing whitespace
+        /// (`"true\n"` from a fly.toml / k8s block scalar) must still coerce — the overlay
+        /// trims scalar values so figment's non-trimming `to_bool_lossy` sees `true`. Also
+        /// covers an enum with surrounding whitespace.
+        #[test]
+        fn trailing_whitespace_on_bool_and_enum_still_parses() {
+            let cfg = resolve_from_env(&map(&[
+                ("BOATRAMP_SECURITY_REQUIRE_TENANCY_DECLARATION", "true\n"),
+                ("BOATRAMP_COMPUTE_MANAGED_DB_PRIVILEGE", "  rootless \n"),
+            ]))
+            .expect("extract despite trailing whitespace");
+            assert_eq!(
+                cfg.security
+                    .expect("security")
+                    .overrides
+                    .require_tenancy_declaration,
+                Some(true),
+                "a trailing-newline bool must parse as true"
+            );
+            assert_eq!(
+                cfg.compute.expect("compute").managed_db_privilege,
+                ManagedDbPrivilege::Rootless,
+                "a whitespace-padded enum must parse"
+            );
+        }
+
+        /// Security LOW (file round-trip): the file-only, isolation-bearing structured fields
+        /// must survive the file → derived-`Serialize` → `extract_lossy` path intact — the
+        /// riskiest being a listener `tenancy: Scoped{…}` (custom `de_opt_tenancy` + an
+        /// internally-tagged enum), plus a `security.profiles` and a `security.projects` entry.
+        #[test]
+        fn file_only_structured_fields_round_trip() {
+            let file = r#"(
+                serve: ( listeners: {
+                    "edge": (
+                        component: "tcp-echo", project: "proj", site: "site",
+                        bind: "0.0.0.0:7100",
+                        tenancy: (mode: "scoped", column: "tenant_id"),
+                    ),
+                } ),
+                security: (
+                    profile: "multi-tenant",
+                    profiles: { "preview": ( allow_guest_email: true ) },
+                    projects: { "proj": ( allow_cross_tenant_db: true ) },
+                ),
+            )"#;
+            // The pipeline path a file-configured serve takes (file → figment → extract), no env.
+            let cfg = load_with_figment(
+                write_temp_cfg(file).as_path(),
+                None,
+                &EnvSource::Map(BTreeMap::new()),
+                Dict::new(),
+            )
+            .expect("resolve file through the pipeline");
+            let serve = cfg.serve.expect("serve");
+            let l = serve.listeners.get("edge").expect("listener edge survived");
+            assert_eq!(l.component, "tcp-echo");
+            match l.tenancy.as_ref().expect("tenancy survived (Some)") {
+                boatramp_core::tenancy::Tenancy::Scoped { column, .. } => {
+                    assert_eq!(column, "tenant_id");
+                }
+                other => panic!("tenancy did not round-trip as Scoped: {other:?}"),
+            }
+            let sec = cfg.security.expect("security");
+            assert!(
+                sec.profiles
+                    .get("preview")
+                    .expect("profile survived")
+                    .allow_guest_email
+                    == Some(true)
+            );
+            assert!(
+                sec.projects
+                    .get("proj")
+                    .expect("project override survived")
+                    .allow_cross_tenant_db
+                    == Some(true)
+            );
+        }
+
+        /// Write `text` to a unique temp `.cfg` and return its path (leaked into the temp dir;
+        /// fine for a test process). Used by the file round-trip test.
+        fn write_temp_cfg(text: &str) -> std::path::PathBuf {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static N: AtomicU32 = AtomicU32::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "brtest-rt-{}-{}.cfg",
+                std::process::id(),
+                N.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::write(&path, text).expect("write temp cfg");
+            path
         }
     }
 }
