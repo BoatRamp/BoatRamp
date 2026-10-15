@@ -75,7 +75,10 @@ pub(crate) use blob_drain::blob_drain as blob_drain_handler;
 /// (unreferenced GC front door, or the drained-secondary decommission) and a way to query the
 /// mid-migration state structurally instead of grepping a startup WARNING.
 mod blob_purge;
-pub(crate) use blob_purge::{blob_purge as blob_purge_handler, blob_status as blob_status_handler};
+pub(crate) use blob_purge::{
+    blob_purge as blob_purge_handler, blob_status as blob_status_handler,
+    blob_verify as blob_verify_handler,
+};
 /// The control-plane STORE-layout migration admin surface (`/api/store-migrate/*`, `System·Admin`) —
 /// the console wizard's back end for the default-scope re-home. Distinct from the per-project SQL
 /// schema migration (`/api/migrate/*`, `Project·Admin`); node-destructive, so node-global System·Admin.

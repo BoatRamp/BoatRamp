@@ -169,6 +169,12 @@ enum BlobCommand {
     /// secondary is currently attached (the node is mid-migration). The direct, structured answer to
     /// "is this node still in TRANSITION mode?" — no log-grepping. Read-only (System·Read).
     Status(StatusArgs),
+    /// **Verify content-addressed references** (System·Read): list every blob a LIVE site deployment
+    /// or function references that is MISSING from the backend — a dead reference that would 404 on
+    /// invoke/serve (the `identity`-component-missing shape). Read-only. To repair one, re-upload the
+    /// bytes (`boatramp blob put <file>`) or re-deploy the resource; the GC fix that stops new dead
+    /// references (referencing live function components) ships alongside this.
+    Verify(VerifyArgs),
     /// **Default-scope blob re-home** (v0.31.0 Finding 8), offline + node-local — the blob half of the
     /// `boatramp migrate` default-scope re-key. Re-homes the node's own bare default-scoped blob
     /// objects (`hblob/{site}/…`, `mqp/…`, `mqgp/…`) to their two-segment `…/default/…` spelling IN
@@ -244,6 +250,14 @@ pub struct PurgeArgs {
 #[derive(Debug, clap::Args)]
 pub struct StatusArgs {
     /// Emit the status as JSON instead of a human line.
+    #[arg(long)]
+    json: bool,
+}
+
+/// Arguments for `boatramp blob verify`.
+#[derive(Debug, clap::Args)]
+pub struct VerifyArgs {
+    /// Emit the dead-reference list as JSON instead of human lines.
     #[arg(long)]
     json: bool,
 }
@@ -394,6 +408,7 @@ pub async fn run(args: BlobArgs, config: &ProjectConfig) -> Result<()> {
         // General provably-safe purge + structured transition status (v0.6.4), both control-plane clients.
         BlobCommand::Purge(a) => purge(&cp, a).await?,
         BlobCommand::Status(a) => status(&cp, a).await?,
+        BlobCommand::Verify(a) => verify(&cp, a).await?,
         // Handled node-locally above (returned before the control-plane client was built).
         BlobCommand::Migrate(_) => unreachable!("handled before the control-plane client"),
         BlobCommand::Rehome(_) => unreachable!("handled before the control-plane client"),
@@ -647,6 +662,46 @@ async fn status(cp: &client::ControlPlane, a: StatusArgs) -> Result<()> {
             );
         }
     }
+    Ok(())
+}
+
+/// `boatramp blob verify`: list dead content-addressed references (referenced-but-missing blobs).
+async fn verify(cp: &client::ControlPlane, a: VerifyArgs) -> Result<()> {
+    let state = cp.blob_verify().await?;
+    if a.json {
+        println!("{}", serde_json::to_string_pretty(&state)?);
+        return Ok(());
+    }
+    let dead = state
+        .get("dead_references")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if dead.is_empty() {
+        println!("blob verify: OK — every referenced blob is present in the backend.");
+        return Ok(());
+    }
+    println!(
+        "blob verify: {} DEAD reference(s) — referenced by a live deployment/function but MISSING \
+         from the backend (would 404 on invoke/serve):",
+        dead.len()
+    );
+    for d in &dead {
+        let hash = d
+            .get("hash")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?");
+        let referrer = d
+            .get("referrer")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        println!("  • {hash}  ({referrer})");
+    }
+    println!(
+        "\nTo repair: re-upload each missing blob (`boatramp blob put <file>` restores it under the \
+         same content hash) or re-deploy the resource. (A node on this release no longer creates \
+         these — GC now references live function components.)"
+    );
     Ok(())
 }
 

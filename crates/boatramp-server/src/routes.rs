@@ -303,6 +303,11 @@ pub fn router_with_fast(
         // `authz::Right::required` (the same grade as `/api/sites`/`/api/metrics`); the hyphen path
         // again avoids the `/api/blobs/` matcher.
         .route("/api/blob-status", get(blob_status_handler))
+        // Dead content-addressed references: blobs a live deployment/function references but that are
+        // MISSING from the backend (would 404 on invoke/serve). Read-only node status → System·Read
+        // in `authz::Right::required` (same grade as /api/blob-status); the hyphen path avoids the
+        // /api/blobs/ matcher.
+        .route("/api/blob-verify", get(blob_verify_handler))
         // Control-plane STORE-layout migration (the default-scope re-home) — the console wizard's back
         // end. `status` is System·Read; `arm` (persist the operator's answers for the next boot-time
         // stage) and `abort` (un-arm / roll back a dual-soak) are node-destructive → System·Admin,

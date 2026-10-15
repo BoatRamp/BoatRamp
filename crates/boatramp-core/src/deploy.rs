@@ -67,6 +67,18 @@ pub struct GcOptions {
     pub keep_age_secs: Option<u64>,
 }
 
+/// A referenced-but-MISSING content-addressed blob — a dead reference found by
+/// [`DeployStore::verify_blobs`]. The referenced component/file is pointed at by a live site
+/// deployment or function but is absent from the blob backend (e.g. deleted by the pre-fix GC bug, or
+/// lost in a backend migration) — so an invoke/serve of it would 404.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DeadBlobReference {
+    /// The missing blob's content hash (its CAS key is `{hash[..2]}/{hash}`).
+    pub hash: String,
+    /// A human hint at what references it (e.g. `"function default/identity"`).
+    pub referrer: String,
+}
+
 /// Most recent activations retained per site.
 const MAX_HISTORY: usize = 100;
 
@@ -3920,6 +3932,13 @@ impl DeployStore {
                 orphan_manifests.push(key.clone());
             }
         }
+        // CRITICAL (data-loss fix): a live FUNCTION's component blobs live in the SAME content-addressed
+        // CAS as site files but are NOT named by any site manifest — and `delete_function` defers their
+        // cleanup to this prune. Without adding them to `referenced`, the blob sweep below would delete
+        // the component of a LIVE function (every function invoke then 404s — the construens `identity`
+        // incident shape). So reference every stored function's active + retained version components.
+        self.extend_live_function_components(&mut referenced)
+            .await?;
 
         let blobs = self.storage.list("").await?;
         let blobs_total = blobs.len();
@@ -3983,6 +4002,91 @@ impl DeployStore {
             blobs_removed,
             bytes_reclaimed,
         })
+    }
+
+    /// Add every LIVE function's component blob hashes (its `active` + all retained `versions`) to
+    /// `referenced`, across every project. A function's component is content-addressed in the SAME
+    /// blob CAS as site files but is referenced by no site manifest, and [`delete_function`] defers
+    /// component cleanup to prune — so this is what keeps a prune (or an integrity scan) from treating
+    /// a LIVE function's component as garbage. Retained versions are kept too (a rollback target).
+    async fn extend_live_function_components(
+        &self,
+        referenced: &mut std::collections::BTreeSet<String>,
+    ) -> Result<(), DeployError> {
+        for project in self.discover_projects().await? {
+            for f in self
+                .list_stored_functions(ProjectRef::new(&project))
+                .await?
+            {
+                if !f.active.is_empty() {
+                    referenced.insert(f.active.clone());
+                }
+                for v in &f.versions {
+                    referenced.insert(v.component.clone());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The authoritative set of content-addressed blob hashes that are IN USE — referenced by a live
+    /// site deployment (its manifest's `blob_hashes`, under the same retention as GC's `live` set) OR
+    /// by a live function's component versions. The inverse of GC's "unreferenced" (which this now
+    /// feeds): what must be PRESENT in the backend. [`verify_blobs`](Self::verify_blobs) checks each is
+    /// present; `collect_garbage` uses the same union so a prune never deletes one.
+    pub async fn referenced_blobs(
+        &self,
+        opts: &GcOptions,
+    ) -> Result<std::collections::BTreeSet<String>, DeployError> {
+        let live_ids = self.live_deployment_ids(opts).await?;
+        let now = now_unix();
+        let mut referenced = std::collections::BTreeSet::new();
+        for key in self.kv.list_prefix("manifests/").await? {
+            let id = key.strip_prefix("manifests/").unwrap_or(&key);
+            if (live_ids.contains(id) || self.within_grace(id, now, opts).await?)
+                && let Some(bytes) = self.kv.get(&key).await?
+                && let Ok(manifest) = Manifest::from_bytes(&bytes)
+            {
+                referenced.extend(manifest.blob_hashes());
+            }
+        }
+        self.extend_live_function_components(&mut referenced)
+            .await?;
+        Ok(referenced)
+    }
+
+    /// A referenced blob that is MISSING from the backend — a dead reference (`boatramp blob verify`).
+    /// Read-only. `referrer` is a human hint at what points at it (a site deployment or a function).
+    pub async fn verify_blobs(
+        &self,
+        opts: &GcOptions,
+    ) -> Result<Vec<DeadBlobReference>, DeployError> {
+        let referenced = self.referenced_blobs(opts).await?;
+        let mut dead = Vec::new();
+        for hash in referenced {
+            if !self.has_blob(&hash).await? {
+                let referrer = self.describe_blob_referrer(&hash).await;
+                dead.push(DeadBlobReference { hash, referrer });
+            }
+        }
+        Ok(dead)
+    }
+
+    /// Best-effort human description of what references `hash` (a live function `project/name`, or a
+    /// site deployment) — for the `verify` report. Returns `"unknown"` if it can't be attributed.
+    async fn describe_blob_referrer(&self, hash: &str) -> String {
+        if let Ok(projects) = self.discover_projects().await {
+            for project in &projects {
+                if let Ok(funcs) = self.list_stored_functions(ProjectRef::new(project)).await {
+                    for f in &funcs {
+                        if f.active == hash || f.versions.iter().any(|v| v.component == hash) {
+                            return format!("function {project}/{}", f.name);
+                        }
+                    }
+                }
+            }
+        }
+        "site deployment or retained history".to_string()
     }
 
     /// Verify every stored blob still hashes to its key — an integrity scrub
@@ -7098,6 +7202,104 @@ mod tests {
         assert_eq!(
             store.current_id(acme, "site").await.unwrap().as_deref(),
             Some(id_shared.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn gc_preserves_live_function_components() {
+        // REGRESSION (data-loss bug): a live FUNCTION's component blobs live in the same CAS as site
+        // files but are named by no site manifest, and `delete_function` defers their cleanup to
+        // prune. Before the fix, `collect_garbage`'s referenced set omitted them, so a prune deleted a
+        // LIVE function's component (every invoke then 404s — the construens `identity` incident). With
+        // the fix they are referenced and survive; an unreferenced orphan is still reclaimed.
+        use crate::function::{Function, FunctionConfig, Lifecycle, Owner};
+        use crate::kv::MemoryKv;
+        let store = DeployStore::new(Arc::new(MemStorage::default()), Arc::new(MemoryKv::new()));
+        let active = sha256_hex(b"identity.wasm");
+        let retained = sha256_hex(b"identity-v1.wasm");
+        let dead = sha256_hex(b"orphan.wasm");
+        store
+            .put_blob(&active, once_bytes(b"identity.wasm"))
+            .await
+            .unwrap();
+        store
+            .put_blob(&retained, once_bytes(b"identity-v1.wasm"))
+            .await
+            .unwrap();
+        store
+            .put_blob(&dead, once_bytes(b"orphan.wasm"))
+            .await
+            .unwrap();
+
+        // A live function with a retained older version + a newer active one — no site manifests.
+        let mut f = Function::new(
+            "identity",
+            Owner::Project("default".into()),
+            &retained,
+            FunctionConfig::default(),
+            Lifecycle::Independent,
+            1,
+        );
+        f.upsert_version(&active, Lifecycle::Independent, 2);
+        store.put_function(ProjectRef::DEFAULT, &f).await.unwrap();
+
+        store.collect_garbage(true).await.unwrap();
+
+        assert!(
+            store.has_blob(&active).await.unwrap(),
+            "a LIVE function's active component must survive prune"
+        );
+        assert!(
+            store.has_blob(&retained).await.unwrap(),
+            "a retained function version's component must survive prune (rollback target)"
+        );
+        assert!(
+            !store.has_blob(&dead).await.unwrap(),
+            "a genuinely unreferenced blob is still reclaimed"
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_blobs_detects_a_dead_function_reference() {
+        // A live function references a component that is MISSING from the backend (the identity-404
+        // shape) — `verify_blobs` reports it as a dead reference, attributed to the function.
+        use crate::function::{Function, FunctionConfig, Lifecycle, Owner};
+        use crate::kv::MemoryKv;
+        let store = DeployStore::new(Arc::new(MemStorage::default()), Arc::new(MemoryKv::new()));
+        let present = sha256_hex(b"present.wasm");
+        let missing = sha256_hex(b"missing.wasm");
+        store
+            .put_blob(&present, once_bytes(b"present.wasm"))
+            .await
+            .unwrap();
+        // Register `identity` whose active component blob was NOT uploaded (or was lost).
+        let f = Function::new(
+            "identity",
+            Owner::Project("default".into()),
+            &missing,
+            FunctionConfig::default(),
+            Lifecycle::Independent,
+            1,
+        );
+        store.put_function(ProjectRef::DEFAULT, &f).await.unwrap();
+        // A healthy function too, so verify reports ONLY the dead one.
+        let g = Function::new(
+            "healthy",
+            Owner::Project("default".into()),
+            &present,
+            FunctionConfig::default(),
+            Lifecycle::Independent,
+            1,
+        );
+        store.put_function(ProjectRef::DEFAULT, &g).await.unwrap();
+
+        let dead = store.verify_blobs(&GcOptions::default()).await.unwrap();
+        assert_eq!(dead.len(), 1, "exactly the one missing component: {dead:?}");
+        assert_eq!(dead[0].hash, missing);
+        assert!(
+            dead[0].referrer.contains("identity"),
+            "the dead reference must name the referring function: {}",
+            dead[0].referrer
         );
     }
 

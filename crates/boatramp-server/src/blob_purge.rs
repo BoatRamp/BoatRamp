@@ -211,6 +211,25 @@ pub(super) async fn blob_status(State(deploy): State<DeployStore>) -> Response {
     Json(serde_json::json!({ "blob_fallback_active": active })).into_response()
 }
 
+/// Dead content-addressed references (`GET /api/blob-verify`, `System·Read`): every blob a LIVE site
+/// deployment or function references but that is MISSING from the backend — an invoke/serve of it
+/// would 404 (the construens `identity` incident shape). Read-only. To repair a dead reference,
+/// re-upload the bytes (`boatramp blob put <file>`) or re-deploy the resource; the fix that STOPS the
+/// GC from creating them (referencing live function components) shipped alongside this.
+pub(super) async fn blob_verify(State(deploy): State<DeployStore>) -> Response {
+    match deploy
+        .verify_blobs(&boatramp_core::deploy::GcOptions::default())
+        .await
+    {
+        Ok(dead) => Json(serde_json::json!({ "dead_references": dead })).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("blob verify failed: {e}\n"),
+        )
+            .into_response(),
+    }
+}
+
 /// Serialize the final `unreferenced` (GC) report line (trailing `\n`), tagged `"type":"report"`.
 fn gc_report_line(report: &GcReport, apply: bool) -> String {
     let message = if apply {

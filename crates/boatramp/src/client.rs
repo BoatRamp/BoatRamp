@@ -2147,6 +2147,20 @@ impl ControlPlane {
         Ok(resp.json::<serde_json::Value>().await?)
     }
 
+    /// Dead content-addressed references (`GET /api/blob-verify`): blobs a live deployment/function
+    /// references but that are missing from the backend. Returns the raw `{ "dead_references": [...] }`.
+    pub async fn blob_verify(&self) -> Result<serde_json::Value> {
+        let Self {
+            http, base: server, ..
+        } = self;
+        let resp = http
+            .get(format!("{server}/api/blob-verify"))
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(resp.json::<serde_json::Value>().await?)
+    }
+
     /// Hash a local file and upload it as a blob; returns its content-address.
     pub async fn put_file_blob(&self, path: &std::path::Path) -> Result<String> {
         let hash = hash_file(path).await?;
