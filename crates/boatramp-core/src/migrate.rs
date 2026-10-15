@@ -438,7 +438,57 @@ pub async fn migrate(
     kv: &dyn KvStore,
     opts: MigrateOptions,
 ) -> Result<MigrationReport, MigrateError> {
-    run(kv, opts, &registry()).await
+    // Non-interactive: an empty skip set ⇒ the guard refuses on ANY default-scope collision.
+    run(kv, opts, &HashSet::new(), &registry()).await
+}
+
+/// An operator's answers to the interactive migration's [`MigrationDecision`]s. Collisions resolved by
+/// renaming are simply gone from the next scan (nothing to carry); this records the ones the operator
+/// chose to SKIP (proceed, leaving the resource un-re-homed/bare) and whether any decision was answered
+/// `abort`. Serde so the console admin surface can persist/replay it (`schema/pending-decision`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MigrationAnswers {
+    /// Collision decision ids (`collision:{kind}/{name}`) the operator chose to SKIP.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub skip_collisions: Vec<String>,
+    /// The operator chose `abort` at a decision — the migration must not proceed.
+    #[serde(skip_serializing_if = "std::ops::Not::not", default)]
+    pub aborted: bool,
+}
+
+/// The outcome of an interactive stage ([`migrate_with_answers`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InteractiveOutcome {
+    /// The operator aborted at a decision; nothing was changed.
+    Aborted,
+    /// The stage ran; carries its report.
+    Staged(MigrationReport),
+}
+
+/// Stage the migration honoring the operator's interactive [`MigrationAnswers`]. Unlike the
+/// non-interactive [`migrate`], a collision the operator chose to SKIP does not refuse (the resource
+/// is left bare / un-re-homed); a collision that is neither renamed-away nor skipped STILL refuses
+/// fail-closed (so the driver can re-prompt). `abort` short-circuits without touching the store.
+/// Always STAGES into the dual soak (never inline-finalizes) — finalize stays an explicit later step.
+pub async fn migrate_with_answers(
+    kv: &dyn KvStore,
+    answers: &MigrationAnswers,
+) -> Result<InteractiveOutcome, MigrateError> {
+    if answers.aborted {
+        return Ok(InteractiveOutcome::Aborted);
+    }
+    let skip: HashSet<String> = answers.skip_collisions.iter().cloned().collect();
+    let report = run(
+        kv,
+        MigrateOptions {
+            dry_run: false,
+            finalize: false,
+        },
+        &skip,
+        &registry(),
+    )
+    .await?;
+    Ok(InteractiveOutcome::Staged(report))
 }
 
 /// Complete a store staged into the `dual` soak (and apply any pending forward): a
@@ -518,6 +568,7 @@ async fn abort_with(
 async fn run(
     kv: &dyn KvStore,
     opts: MigrateOptions,
+    skip_collisions: &HashSet<String>,
     migrations: &[Box<dyn Migration>],
 ) -> Result<MigrationReport, MigrateError> {
     let mut state = read_state(kv).await?;
@@ -533,19 +584,28 @@ async fn run(
     // `…/default/…` re-homed key exists yet), refuse if a default-project resource's bare data-plane
     // scope conflicts with the re-home — a site/compute named `default` (collides with the re-home
     // prefix) or named like a KNOWN project (the pre-existing commingling). Skipped on resume (the
-    // pre-forward invariant no longer holds) and when the operator overrides. This is the KV-level
-    // (control-plane-resource) half; blob/libsql substrate-completeness is observed by the node-level
-    // readiness guard.
+    // pre-forward invariant no longer holds). `skip_collisions` holds the decision ids
+    // (`collision:{kind}/{name}`) the operator explicitly chose to SKIP via the interactive flow — a
+    // skipped resource is left bare (its data is NOT re-homed; `rehome_default_scope` already no-ops
+    // it) and does NOT refuse; a collision that is neither resolved (renamed away) nor skipped STILL
+    // refuses fail-closed. The non-interactive `migrate()` passes an empty set, so it refuses on ANY
+    // collision (unchanged). This is the KV-level half; blob/libsql substrate-completeness is observed
+    // by the node-level readiness guard.
     let v2_pending = state.version < DEFAULT_SCOPE_REHOME_VERSION;
     let resuming_v2 = state
         .in_progress
         .as_ref()
         .is_some_and(|ip| ip.target == DEFAULT_SCOPE_REHOME_VERSION);
     if v2_pending && !resuming_v2 {
-        let conflicts = default_scope_premigration_conflicts(kv).await?;
-        if !conflicts.is_empty() {
+        let unresolved: Vec<String> = default_scope_collisions(kv)
+            .await?
+            .into_iter()
+            .filter(|c| !skip_collisions.contains(&format!("collision:{}/{}", c.kind, c.name)))
+            .map(|c| c.describe())
+            .collect();
+        if !unresolved.is_empty() {
             return Err(MigrateError::DefaultNamedResource {
-                resources: conflicts,
+                resources: unresolved,
             });
         }
     }
@@ -1115,6 +1175,7 @@ pub async fn plan(kv: &dyn KvStore) -> Result<MigrationPlan, MigrateError> {
                     dry_run: true,
                     finalize: false,
                 },
+                &HashSet::new(),
                 &registry(),
             )
             .await?;
@@ -2260,6 +2321,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn migrate_with_answers_honors_skip_abort_and_still_refuses_unanswered() {
+        // Seed a store with the clean default data + a COMPUTE collision (named like tenant `acme`).
+        let seed = || async {
+            let kv = MemoryKv::new();
+            seed_default_scope(&kv).await;
+            kv.put("project/default/compute/acme", b"spec".to_vec())
+                .await
+                .unwrap();
+            kv
+        };
+
+        // (1) No answers → the collision is unresolved → refuses fail-closed (driver re-prompts).
+        let kv = seed().await;
+        assert!(matches!(
+            migrate_with_answers(&kv, &MigrationAnswers::default()).await,
+            Err(MigrateError::DefaultNamedResource { .. })
+        ));
+        assert_eq!(read_state(&kv).await.unwrap().version, 1, "nothing staged");
+
+        // (2) Operator aborts → no-op, store untouched.
+        let kv = seed().await;
+        assert_eq!(
+            migrate_with_answers(
+                &kv,
+                &MigrationAnswers {
+                    aborted: true,
+                    ..Default::default()
+                }
+            )
+            .await
+            .unwrap(),
+            InteractiveOutcome::Aborted
+        );
+        assert_eq!(read_state(&kv).await.unwrap().version, 1);
+        assert!(kv.get("hkv/default/blog/counter").await.unwrap().is_none());
+
+        // (3) Operator SKIPS the collision → stages (dual soak); the non-colliding default data
+        // re-homes, and the skipped resource's bare scope is left as-is.
+        let kv = seed().await;
+        let out = migrate_with_answers(
+            &kv,
+            &MigrationAnswers {
+                skip_collisions: vec!["collision:compute/acme".to_string()],
+                aborted: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(out, InteractiveOutcome::Staged(_)));
+        assert_eq!(status(&kv).await.unwrap(), Status::Dual);
+        assert!(
+            kv.get("hkv/default/blog/counter").await.unwrap().is_some(),
+            "the non-colliding default data re-homed"
+        );
+        // The tenant project `acme`'s own keyspace is untouched by the skip.
+        assert_eq!(
+            kv.get("hkv/acme/shop/counter").await.unwrap().as_deref(),
+            Some(&b"42"[..])
+        );
+    }
+
+    #[tokio::test]
     async fn default_scope_dual_stage_then_finalize_keeps_offsets() {
         let kv = MemoryKv::new();
         seed_default_scope(&kv).await;
@@ -2491,9 +2614,14 @@ mod tests {
         let kv = MemoryKv::new();
         seed_legacy(&kv).await;
 
-        run(&kv, MigrateOptions::one_shot(), &chain())
-            .await
-            .unwrap();
+        run(
+            &kv,
+            MigrateOptions::one_shot(),
+            &std::collections::HashSet::new(),
+            &chain(),
+        )
+        .await
+        .unwrap();
 
         // Both migrations applied: v1 re-keyed the store, v2 wrote its sentinel.
         assert!(
@@ -2514,9 +2642,14 @@ mod tests {
         assert_eq!(ids, vec!["project-rekey", "add-sentinel"]);
 
         // Idempotent re-run.
-        let again = run(&kv, MigrateOptions::one_shot(), &chain())
-            .await
-            .unwrap();
+        let again = run(
+            &kv,
+            MigrateOptions::one_shot(),
+            &std::collections::HashSet::new(),
+            &chain(),
+        )
+        .await
+        .unwrap();
         assert!(again.already_migrated);
     }
 
@@ -2538,9 +2671,14 @@ mod tests {
         .await
         .unwrap();
 
-        let report = run(&kv, MigrateOptions::one_shot(), &chain())
-            .await
-            .unwrap();
+        let report = run(
+            &kv,
+            MigrateOptions::one_shot(),
+            &std::collections::HashSet::new(),
+            &chain(),
+        )
+        .await
+        .unwrap();
         // v1 was not re-run (no rekeyed families), v2 applied.
         assert!(report.rekeyed.is_empty());
         assert_eq!(
