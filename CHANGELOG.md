@@ -38,15 +38,25 @@ and fixes two independent data-loss bugs the incident exposed. No WIT/shim chang
 - New `System·Admin` admin API `/api/store-migrate/{status,arm,abort}` backs the console — node-global,
   at a hyphen path that cannot inherit the per-project `/api/migrate/` (SQL-schema) right.
 
-### Resolving a default-scope name collision (manual)
+### Default-scope name collisions — data-aware
 
-The re-home refuses — as an offline `boatramp migrate` error, never a boot brick — when a
-default-project `site`/`compute` is named `default` or like an existing tenant project, because the two
-share a bare keyspace with no provenance to split them. Resolve it with existing operator tools:
-**re-create the colliding default-project resource under a new, non-colliding name via the normal
-deploy flow (e.g. `boatramp deploy --site <new> …`), delete the old one, then re-run `boatramp
-migrate`** (interactive or not). `--interactive` / the console wizard surface each collision and
-re-check it. The old silent-strand `--allow-default-named-resource` flag is removed.
+A default-project `site`/`compute` named `default`, or named like an existing tenant project, would
+share a bare keyspace with that project with no provenance to split the two. The re-home is now
+**data-aware** about this: when the colliding default-project resource has provably NO data-plane
+footprint — its capability ceiling permits neither `wasi:keyvalue` nor `wasi:messaging`, no attributable
+`hkv/`/`mq*/` key exists under its name, and (online only) an authoritative blob scan of `hblob/`/`mqp/`/
+`mqgp/` finds no object — there is nothing to strand, so the online re-home (the `serve` boot stage, the
+console **Store migration** wizard, and the `/api/store-migrate` API) proceeds automatically. This is
+the common case, e.g. a marketing `site` that only serves `wasi:http` (the incident's own
+`site/construens`).
+
+A **data-bearing** commingle, a resource named literally `default`, a reserved-scope-prefix name, any
+store/scan error, and *every* collision seen by the offline `boatramp migrate` CLI (which has no
+object-store handle, so it stays conservative and blocks) still refuse — as an offline error, never a
+boot brick. Resolve those with existing operator tools: **re-create the colliding resource under a new,
+non-colliding name via the normal deploy flow (e.g. `boatramp deploy --site <new> …`), delete the old
+one, then re-run `boatramp migrate`** (interactive or not). `--interactive` / the console wizard surface
+each collision and re-check it. The old silent-strand `--allow-default-named-resource` flag is removed.
 
 ### Data-loss fixes
 
@@ -62,6 +72,17 @@ re-check it. The old silent-strand `--allow-default-named-resource` flag is remo
   `object_store`'s `LocalFileSystem` (a local fly volume) returns `NotImplemented` for, and SlateDB
   swallows the error — so both the offline compact and the online supervised GC deleted zero
   manifests. Fixed (`boundary_files_enabled: false`); both now reclaim the backlog.
+
+### Configuration
+
+- The offline store ops (`boatramp migrate`, `boatramp blob rehome`) now resolve the top-level
+  `[serve]` S3 object backend from the environment — `BOATRAMP_BLOBS` plus `BOATRAMP_S3_BUCKET` /
+  `_ENDPOINT` / `_REGION` / `_PATH_STYLE` — the same levers `serve` already honored through its flags.
+  Previously those five had env parity only on the `serve` path, so an offline `migrate`/`rehome` on a
+  file-less node couldn't see the object store from the environment. A file-less fleet (one configured
+  entirely through `[env]`) therefore no longer needs a `boatramp.cfg` just to point the offline ops at
+  its bucket. The base S3 credential is unchanged — the standard `AWS_ACCESS_KEY_ID`/
+  `AWS_SECRET_ACCESS_KEY` chain or a sealed `[serve.s3_credential]`; env never carries raw key material.
 
 ## [0.33.0] - 2026-10-14
 
