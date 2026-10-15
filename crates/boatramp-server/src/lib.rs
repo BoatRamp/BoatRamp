@@ -350,6 +350,15 @@ struct HandlerRuntimeInner {
     /// [`GlobalBlobBackend`](boatramp_core::blob_backends::GlobalBlobBackend) here (one backend, one
     /// credential) via [`HandlerRuntime::new`].
     blob_backends: Arc<dyn boatramp_core::blob_backends::BlobBackends>,
+    /// The RAW (undecorated) DEFAULT-project blob backend — `blob_backends.backend(DEFAULT)` captured
+    /// BEFORE the `default_scope_blob_fallback` migration decorator wraps it (Security LOW-A2). The
+    /// store-migration admin surface scans THIS for the data-aware collision gate, so its view of the
+    /// bare `hblob/{name}/…` keyspace matches what the migration-authoritative boot stage sees — the
+    /// decorated backend's construction-time project snapshot could otherwise translate/hide those
+    /// keys and make the wizard under-report. `None` ⇒ the runtime was built without a separate raw
+    /// handle (the global `new()` path / tests, where the resolver backend is itself undecorated), and
+    /// the caller falls back to `blob_backends.backend(DEFAULT)`.
+    raw_default_blob_backend: Option<Arc<dyn boatramp_core::Storage>>,
     /// Per-site SQL database provider (libsql — single-node files by default;
     /// absent = the `sql` capability is not offered, so handlers requesting it
     /// are refused at activation).
@@ -837,6 +846,9 @@ impl HandlerRuntime {
             Arc::new(boatramp_core::blob_backends::GlobalBlobBackend::new(
                 storage,
             )),
+            // No separate raw handle: this global backend is itself undecorated, so the admin scan
+            // falls back to `blob_backends.backend(DEFAULT)` (identical here).
+            None,
             sql,
             messaging,
         )
@@ -854,6 +866,7 @@ impl HandlerRuntime {
         engine: boatramp_handlers::HandlerEngine,
         kv: Arc<dyn boatramp_core::kv::KvStore>,
         blob_backends: Arc<dyn boatramp_core::blob_backends::BlobBackends>,
+        raw_default_blob_backend: Option<Arc<dyn boatramp_core::Storage>>,
         sql: Option<Arc<dyn boatramp_core::sql::SqlBackends>>,
         messaging: Option<Arc<dyn boatramp_core::messaging::Messaging>>,
     ) -> Self {
@@ -866,6 +879,7 @@ impl HandlerRuntime {
                 async_drain_gate: Arc::new(tokio::sync::Semaphore::new(async_drain_slots)),
                 kv,
                 blob_backends,
+                raw_default_blob_backend,
                 sql,
                 messaging,
                 site_semaphores: boatramp_handlers::KeyedSemaphores::new(),
@@ -1136,6 +1150,16 @@ impl HandlerRuntime {
     #[cfg(feature = "handlers")]
     pub fn blob_backends(&self) -> Option<Arc<dyn boatramp_core::blob_backends::BlobBackends>> {
         self.inner.as_ref().map(|inner| inner.blob_backends.clone())
+    }
+
+    /// The RAW (undecorated) DEFAULT-project blob backend, for the store-migration data-aware
+    /// collision scan (Security LOW-A2). `None` ⇒ no separate raw handle was wired (the global
+    /// `new()` path / tests); the caller then falls back to `blob_backends().backend(DEFAULT)`.
+    #[cfg(feature = "handlers")]
+    pub fn raw_default_blob_backend(&self) -> Option<Arc<dyn boatramp_core::Storage>> {
+        self.inner
+            .as_ref()
+            .and_then(|inner| inner.raw_default_blob_backend.clone())
     }
 
     /// Wire the cloud blob-change notification provisioner (FA-5b2). Set once at
@@ -4341,7 +4365,7 @@ mod tests {
         let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
         // The runtime carries the resolver (BP-2) — the SAME `inner.blob_backends` the `wasi:blobstore`
         // binding build consults per HOST-resolved project (BP-3).
-        let rt = HandlerRuntime::new_with_backends(engine, kv, composite, None, None);
+        let rt = HandlerRuntime::new_with_backends(engine, kv, composite, None, None, None);
         let inner = rt.inner.as_ref().unwrap();
 
         // `project` is the serve's host-resolved project (never guest input). Resolve its backend

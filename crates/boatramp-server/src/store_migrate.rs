@@ -64,10 +64,52 @@ fn migrate_error_response(e: MigrateError) -> Response {
     (code, format!("{e}\n")).into_response()
 }
 
+/// Build a [`migrate::BlobScopeScanner`] over the node's DEFAULT-project blob backend, so the
+/// data-aware collision gate (feature A) can prove a commingle has no blob footprint. `None` when
+/// handlers are disabled (no blob backend) — the gate then treats every commingle as blocking
+/// (conservative).
+///
+/// Scans the RAW (undecorated) DEFAULT backend ([`HandlerRuntime::raw_default_blob_backend`], Security
+/// LOW-A2) so this admin view of the bare `hblob/{name}/…` keyspace matches the migration-authoritative
+/// boot stage's raw scan — the default-scope `TranslatingStorage`/fallback decorator carries a
+/// construction-time project snapshot, and a colliding tenant project created AFTER this serve booted
+/// is absent from it, so the decorated backend would translate/hide `hblob/{name}/…` and the wizard
+/// could under-report. Falls back to the resolver's `backend(DEFAULT)` only when no raw handle was
+/// wired (a global/undecorated runtime, where the two are identical).
+fn blob_scope_scanner(handlers: &HandlerRuntime) -> Option<migrate::StorageBlobScopeScanner> {
+    // `handlers`-feature-gated; without it the node has no object backend at all, so there is nothing
+    // to scan ⇒ `None` ⇒ the gate treats every commingle as blocking.
+    #[cfg(feature = "handlers")]
+    {
+        let backend = handlers.raw_default_blob_backend().or_else(|| {
+            handlers
+                .blob_backends()
+                .map(|b| b.backend(boatramp_core::project::ProjectRef::DEFAULT))
+        })?;
+        Some(migrate::StorageBlobScopeScanner::new(backend))
+    }
+    #[cfg(not(feature = "handlers"))]
+    {
+        let _ = handlers;
+        None
+    }
+}
+
 /// `GET /api/store-migrate/status` (`System·Read`) — the migration plan + any armed answers.
-pub(super) async fn store_migrate_status(State(deploy): State<DeployStore>) -> Response {
+pub(super) async fn store_migrate_status(
+    State(deploy): State<DeployStore>,
+    Extension(handlers): Extension<Arc<HandlerRuntime>>,
+) -> Response {
     let kv = deploy.kv().as_ref();
-    let plan = match migrate::plan(kv).await {
+    let scanner = blob_scope_scanner(&handlers);
+    let plan = match migrate::plan(
+        kv,
+        scanner
+            .as_ref()
+            .map(|s| s as &dyn migrate::BlobScopeScanner),
+    )
+    .await
+    {
         Ok(p) => p,
         Err(e) => return migrate_error_response(e),
     };
@@ -83,6 +125,7 @@ pub(super) async fn store_migrate_status(State(deploy): State<DeployStore>) -> R
 /// skipped nor resolved (so the boot stage can't refuse); `abort` arms a "do not stage".
 pub(super) async fn store_migrate_arm(
     State(deploy): State<DeployStore>,
+    Extension(handlers): Extension<Arc<HandlerRuntime>>,
     Json(answers): Json<MigrationAnswers>,
 ) -> Response {
     if let Some(forbidden) = assert_store_migrate_is_system_admin("/api/store-migrate/arm") {
@@ -96,8 +139,17 @@ pub(super) async fn store_migrate_arm(
     // the whole thing is a "do not migrate" and the other answers don't matter). A decision answered
     // with an `External` route (e.g. rename — the operator re-creates the resource via the deploy flow)
     // is NOT yet resolved: it must be done out-of-band so the decision is gone from the plan BEFORE
-    // arming, else the boot stage would refuse. An unanswered decision is likewise unresolved.
-    let plan = match migrate::plan(kv).await {
+    // arming, else the boot stage would refuse. An unanswered decision is likewise unresolved. The blob
+    // scanner feeds the plan's feature-A data-aware gate (a no-footprint commingle won't surface here).
+    let scanner = blob_scope_scanner(&handlers);
+    let plan = match migrate::plan(
+        kv,
+        scanner
+            .as_ref()
+            .map(|s| s as &dyn migrate::BlobScopeScanner),
+    )
+    .await
+    {
         Ok(p) => p,
         Err(e) => return migrate_error_response(e),
     };

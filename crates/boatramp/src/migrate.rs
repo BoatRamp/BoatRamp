@@ -163,12 +163,15 @@ pub async fn run(args: MigrateArgs, config: &ServerConfig) -> Result<(), Error> 
         // FORCE STAGE (Finding 8, HIGH-2a): the default-scope re-home MUST enter the dual soak so the
         // translating blob read-fallback engages (a one-shot would strand cold default blobs). So the
         // forward pass never inline-finalizes; `--finalize` (gated above) reclaims the old keys.
+        // Offline CLI: no object-store handle, so pass `None` — the data-aware collision gate then
+        // treats every commingle as blocking (conservative; the relaxation is online/wizard-only).
         migrate::migrate(
             kv.as_ref(),
             MigrateOptions {
                 dry_run: args.dry_run,
                 finalize: false,
             },
+            None,
         )
         .await?
     };
@@ -189,7 +192,7 @@ pub async fn run(args: MigrateArgs, config: &ServerConfig) -> Result<(), Error> 
 /// the console wizard uses, so the two surfaces can never diverge. Thin stdin/stdout glue; the engine
 /// logic (skip/abort/refuse) is unit-tested in `boatramp-core`.
 async fn interactive_migrate(kv: &dyn boatramp_core::kv::KvStore) -> Result<(), Error> {
-    let plan = migrate::plan(kv).await?;
+    let plan = migrate::plan(kv, None).await?; // offline CLI: no blob scanner (see the stage path above)
     match plan.status {
         Status::Ready => {
             println!("nothing to do: the store is already at the current layout.");
@@ -289,7 +292,7 @@ async fn interactive_migrate(kv: &dyn boatramp_core::kv::KvStore) -> Result<(), 
         return Ok(());
     }
 
-    match migrate::migrate_with_answers(kv, &answers).await? {
+    match migrate::migrate_with_answers(kv, &answers, None).await? {
         migrate::InteractiveOutcome::Aborted => println!("aborted — nothing was changed."),
         migrate::InteractiveOutcome::Staged(report) => {
             print_report(&report, false);

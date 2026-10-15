@@ -302,6 +302,16 @@ pub async fn build_handler_runtime(
     // migration's `dual` soak, wrap every resolved backend in a translating read-fallback so a
     // not-yet-drained bare `hblob/{site}/…`/`mqp/…`/`mqgp/…` object is still served at the new
     // `…/default/…` spelling the post-flip runtime composes. A no-op (byte-identical) outside the soak.
+    // Security LOW-A2: capture the RAW (undecorated) DEFAULT blob backend BEFORE the default-scope
+    // migration fallback wraps it, and thread it into the runtime. The store-migration admin surface
+    // scans THIS for the data-aware collision gate, so its view of the bare `hblob/{name}/…` keyspace
+    // matches the migration-authoritative boot stage's raw scan — the decorator's construction-time
+    // project snapshot could otherwise translate/hide those keys and make the wizard under-report.
+    let raw_default_blob_backend: Arc<dyn boatramp_core::Storage> =
+        boatramp_core::blob_backends::BlobBackends::backend(
+            blob_backends.as_ref(),
+            boatramp_core::project::ProjectRef::DEFAULT,
+        );
     #[cfg(feature = "fallback")]
     let blob_backends = crate::blobs::default_scope_blob_fallback(kv.as_ref(), blob_backends).await;
     // Two engine ceilings by lane. The **sync** ceiling bounds connection-bearing
@@ -502,6 +512,7 @@ pub async fn build_handler_runtime(
         // `wasi:keyvalue` binding; control-plane keys pass through the decorator untouched.
         data_plane_kv,
         blob_backends,
+        Some(raw_default_blob_backend),
         Some(sql),
         Some(messaging),
     );
