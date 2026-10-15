@@ -206,14 +206,18 @@ async fn interactive_migrate(kv: &dyn boatramp_core::kv::KvStore) -> Result<(), 
         Status::NeedsMigration => {}
     }
 
-    println!("\nPlan — re-home the default project to the project-scoped layout:");
+    println!("\nMigration plan:");
     for line in &plan.summary {
         println!("  • {line}");
     }
 
-    // Collect a route per decision.
+    // Collect a route per decision. GENERIC: the CLI acts on each route's `action` (the engine's
+    // migration-agnostic contract), never on a route-`key` string — so a future migration's decisions
+    // render + act with no CLI change. `External` routes (the operator resolves out-of-band, then
+    // re-runs) are collected as guidance and never staged; `Stage` routes go into the answers; `Abort`
+    // short-circuits.
     let mut answers = migrate::MigrationAnswers::default();
-    let mut pending_renames: Vec<String> = Vec::new();
+    let mut pending_external: Vec<String> = Vec::new();
     for d in &plan.decisions {
         println!("\n{}", d.question);
         for (i, r) in d.routes.iter().enumerate() {
@@ -223,39 +227,56 @@ async fn interactive_migrate(kv: &dyn boatramp_core::kv::KvStore) -> Result<(), 
             }
         }
         let chosen = prompt_route(d)?;
-        match chosen.key.as_str() {
-            "abort" => {
-                println!("\naborting the migration — nothing was changed.");
-                return Ok(());
-            }
-            "skip" => answers.skip_collisions.push(d.id.clone()),
-            "rename" => {
-                let prompt = chosen
-                    .input
-                    .as_ref()
-                    .map(|i| i.prompt.as_str())
-                    .unwrap_or("new name");
-                let new_name = prompt_line(&format!("  {prompt}: "))?;
+        if chosen.action == migrate::RouteAction::Abort {
+            println!("\naborting the migration — nothing was changed.");
+            return Ok(());
+        }
+        // Collect the route's free-text input (e.g. a new name), if it asks for one.
+        let value = if let Some(input) = &chosen.input {
+            Some(
+                prompt_line(&format!("  {}: ", input.prompt))?
+                    .trim()
+                    .to_string(),
+            )
+        } else {
+            None
+        };
+        match chosen.action {
+            migrate::RouteAction::External => {
+                // Must be performed out-of-band first; carry the migration's own guidance (its `note`)
+                // verbatim so the CLI needs no per-migration knowledge of what the route entails.
                 let resource = d.id.strip_prefix("collision:").unwrap_or(&d.id);
-                pending_renames.push(format!(
-                    "{resource}: re-create it as `{new_name}` via the normal deploy flow (e.g. \
-                     redeploy the site under the new name), then delete the old `{resource}`"
-                ));
+                let note = chosen
+                    .note
+                    .as_deref()
+                    .unwrap_or("resolve this externally, then re-run the plan");
+                let detail = value
+                    .as_deref()
+                    .map(|v| format!(" (you chose: `{v}`)"))
+                    .unwrap_or_default();
+                pending_external.push(format!("{resource}{detail}: {note}"));
             }
-            other => {
-                return Err(Error::Interactive(format!("unexpected route `{other}`")));
+            migrate::RouteAction::Stage => {
+                answers.choices.insert(
+                    d.id.clone(),
+                    migrate::DecisionChoice {
+                        route: chosen.key.clone(),
+                        value,
+                    },
+                );
             }
+            migrate::RouteAction::Abort => unreachable!("handled above"),
         }
     }
 
-    // Any rename must be done externally (through the proven deploy path) BEFORE staging — print the
-    // guidance and stop; the operator re-runs once the collisions are gone.
-    if !pending_renames.is_empty() {
+    // Any out-of-band route must be done first (through the proven deploy path) BEFORE staging — print
+    // the guidance and stop; the operator re-runs once the collisions are gone.
+    if !pending_external.is_empty() {
         println!(
-            "\nResolve these renames first, then re-run `boatramp migrate --interactive` (the \
-             collision clears once the resource no longer shares a name):"
+            "\nResolve these first (out of band), then re-run `boatramp migrate --interactive` (the \
+             decision clears once the collision is gone):"
         );
-        for step in &pending_renames {
+        for step in &pending_external {
             println!("  • {step}");
         }
         return Ok(());

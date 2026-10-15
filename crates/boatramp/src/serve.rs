@@ -292,6 +292,25 @@ async fn auto_migrate_on_boot(kv: &dyn boatramp_core::kv::KvStore) {
     }
 }
 
+/// Boot-time WARN enumerating any operator-answerable migration decisions that block a
+/// straight-through re-home (Security L-1) — so a below-version node surfaces *why* `boatramp migrate`
+/// will prompt/refuse, instead of the operator discovering it only when they run it. GENERIC: it logs
+/// each pending decision's own question from [`migrate::plan`]; serve embeds no migration specifics
+/// (no collision scan, no default-scope knowledge). Best-effort — a plan error is already surfaced by
+/// the `status` path, so a failure here is silent.
+async fn log_pending_migration_decisions(kv: &dyn boatramp_core::kv::KvStore) {
+    if let Ok(plan) = migrate::plan(kv).await {
+        for d in &plan.decisions {
+            tracing::warn!(
+                decision = %d.id,
+                "a pending migration decision must be resolved before the re-home can complete \
+                 (run `boatramp migrate --interactive` or the console wizard): {}",
+                d.question
+            );
+        }
+    }
+}
+
 /// `serve` module result; `Err` is [`Error`].
 type Result<T> = std::result::Result<T, Error>;
 
@@ -1097,6 +1116,7 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
                      migrate --abort`), then `boatramp migrate --finalize`. (`serve` without \
                      --auto-migrate never re-homes.)"
                 );
+                log_pending_migration_decisions(kv.as_ref()).await;
             }
         }
     }
@@ -3485,6 +3505,7 @@ async fn run_cluster(
                      no-op. Re-home when ready: `boatramp migrate` (reversible with `--abort`) then \
                      `--finalize`."
                 );
+                log_pending_migration_decisions(kv.as_ref()).await;
             }
         }
     }

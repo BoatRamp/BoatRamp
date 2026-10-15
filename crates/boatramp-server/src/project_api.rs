@@ -68,6 +68,20 @@ pub(super) async fn create_project(
         )
             .into_response();
     }
+    // Security LOW-1 / LOW-1b: the FIXED data-plane scope-prefix literals (`fn` for functions, `bus`
+    // for the project-bus keyspace) are reserved too — each is the first scope segment of a keyspace
+    // (`{prefix}/… → hkv/{prefix}/…`, `mq*/{prefix}/…`). A tenant project literally named like one
+    // would commingle with every project's `{prefix}/…` keyspace (and, pre-re-home, silently strand
+    // the default project's own under the tenant's `{prefix}/` prefix — the Finding-8 class the
+    // default-scope disjointness invariant exists to prevent). Reserving them keeps project names
+    // disjoint from the reserved scope-prefix literals. Single source: `RESERVED_SCOPE_PREFIXES`.
+    if boatramp_core::project::RESERVED_SCOPE_PREFIXES.contains(&name) {
+        return (
+            StatusCode::CONFLICT,
+            format!("project {name:?} is reserved (it is a reserved data-plane scope prefix `{name}/`)\n"),
+        )
+            .into_response();
+    }
     match deploy.get_project(name).await {
         Ok(Some(_)) => {
             return (
