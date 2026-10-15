@@ -76,6 +76,15 @@ pub(crate) use blob_drain::blob_drain as blob_drain_handler;
 /// mid-migration state structurally instead of grepping a startup WARNING.
 mod blob_purge;
 pub(crate) use blob_purge::{blob_purge as blob_purge_handler, blob_status as blob_status_handler};
+/// The control-plane STORE-layout migration admin surface (`/api/store-migrate/*`, `System·Admin`) —
+/// the console wizard's back end for the default-scope re-home. Distinct from the per-project SQL
+/// schema migration (`/api/migrate/*`, `Project·Admin`); node-destructive, so node-global System·Admin.
+mod store_migrate;
+pub(crate) use store_migrate::{
+    store_migrate_abort as store_migrate_abort_handler,
+    store_migrate_arm as store_migrate_arm_handler,
+    store_migrate_status as store_migrate_status_handler,
+};
 /// The server-side minter backing the guest `blob-upload` capability (S3 external ingress): mints the
 /// fleet-signed session token, derives the secret, and shapes the presigned-put | temp-credentials
 /// variant.

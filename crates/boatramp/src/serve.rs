@@ -234,6 +234,64 @@ fn auto_migrate_stage_opts() -> boatramp_core::migrate::MigrateOptions {
     }
 }
 
+/// Boot-time `--auto-migrate` stage, FAILURE-SAFE (the migration-safety contract): it NEVER returns an
+/// error — on any failure it logs and the caller falls through to serving the EXISTING layout via
+/// backward-read-compat (never a crash-loop). Runs BEFORE `build_handler_runtime`, so the stage + the
+/// version flip happen while no runtime/decorator exists — the zero-stale-decorator path.
+///
+/// If the console wizard **armed** interactive answers ([`migrate::ARMED_ANSWERS_KEY`]), they are
+/// consumed here (a collision the operator chose to SKIP proceeds, leaving that resource bare;
+/// `abort` skips staging), then cleared on a successful stage. With nothing armed it is a plain stage,
+/// which refuses fail-closed on any collision (logged → serve the existing layout; the operator then
+/// uses `boatramp migrate --interactive` or the console wizard to resolve).
+async fn auto_migrate_on_boot(kv: &dyn boatramp_core::kv::KvStore) {
+    match migrate::read_armed_answers(kv).await {
+        Ok(Some(answers)) => match migrate::migrate_with_answers(kv, &answers).await {
+            Ok(migrate::InteractiveOutcome::Staged(report)) => {
+                tracing::info!(
+                    rekeyed = report.total_rekeyed(),
+                    dual = report.dual,
+                    "control-plane store staged to the project-scoped layout (dual soak) via \
+                     --auto-migrate, honoring the armed interactive answers"
+                );
+                if let Err(e) = migrate::clear_armed_answers(kv).await {
+                    tracing::warn!(error = %e, "could not clear the consumed armed migration answers");
+                }
+            }
+            Ok(migrate::InteractiveOutcome::Aborted) => {
+                tracing::warn!(
+                    "armed migration answers requested ABORT — not staging; serving the existing \
+                     layout. Clearing the armed answers."
+                );
+                let _ = migrate::clear_armed_answers(kv).await;
+            }
+            Err(e) => tracing::warn!(
+                error = %e,
+                "armed --auto-migrate stage could NOT complete — serving the EXISTING layout via \
+                 backward-read-compat (NOT exiting). Resolve and re-arm via the console wizard or \
+                 `boatramp migrate --interactive`."
+            ),
+        },
+        Ok(None) => match migrate::migrate(kv, auto_migrate_stage_opts()).await {
+            Ok(report) => tracing::info!(
+                rekeyed = report.total_rekeyed(),
+                dual = report.dual,
+                "control-plane store staged to the project-scoped layout (dual soak) via --auto-migrate"
+            ),
+            Err(e) => tracing::warn!(
+                error = %e,
+                "--auto-migrate could NOT complete the re-home — serving the EXISTING layout via \
+                 backward-read-compat instead (NOT exiting). Resolve the issue and run `boatramp \
+                 migrate` (or the console wizard) when ready. See docs/default-scope-migration.md."
+            ),
+        },
+        Err(e) => tracing::warn!(
+            error = %e,
+            "could not read armed migration answers at boot; serving the existing layout"
+        ),
+    }
+}
+
 /// `serve` module result; `Err` is [`Error`].
 type Result<T> = std::result::Result<T, Error>;
 
@@ -1026,33 +1084,18 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
         ),
         migrate::Status::NeedsMigration => {
             if args.auto_migrate {
-                // `--auto-migrate` stages the re-home on boot (operator opt-in). FAILURE-SAFE (the
-                // migration-safety fix for the incident): on ANY error — a name collision, a mid-flight
-                // interruption, a transient KV error — LOG it and fall through to serving the EXISTING
-                // layout via backward-read-compat. NEVER propagate (which would exit the process into a
-                // crash-loop — the exact regression). On success the store is staged into the dual soak
-                // and served at the new layout.
-                match migrate::migrate(kv.as_ref(), auto_migrate_stage_opts()).await {
-                    Ok(report) => tracing::info!(
-                        rekeyed = report.total_rekeyed(),
-                        dual = report.dual,
-                        "control-plane store staged to the project-scoped layout (dual soak) via \
-                         --auto-migrate"
-                    ),
-                    Err(e) => tracing::warn!(
-                        error = %e,
-                        "--auto-migrate could NOT complete the re-home — serving the EXISTING layout \
-                         via backward-read-compat instead (NOT exiting). Resolve the issue and run \
-                         `boatramp migrate` when ready. See docs/default-scope-migration.md."
-                    ),
-                }
+                // Stage at boot (operator opt-in), BEFORE build_handler_runtime — honoring any armed
+                // console-wizard answers — and FAILURE-SAFE: never exits; on failure serves the
+                // existing layout via backward-read-compat. See `auto_migrate_on_boot`.
+                auto_migrate_on_boot(kv.as_ref()).await;
             } else {
                 tracing::warn!(
                     "control-plane store is BELOW the current schema version — serving its EXISTING \
                      (un-migrated) layout via backward-read-compat, so rolling this binary is a no-op \
                      and nothing is lost. Re-home when ready: `boatramp migrate --dry-run` to preview, \
-                     `boatramp migrate` to stage (reversible with `boatramp migrate --abort`), then \
-                     `boatramp migrate --finalize`. (`serve` without --auto-migrate never re-homes.)"
+                     `boatramp migrate` (or `--interactive`) to stage (reversible with `boatramp \
+                     migrate --abort`), then `boatramp migrate --finalize`. (`serve` without \
+                     --auto-migrate never re-homes.)"
                 );
             }
         }
@@ -3431,23 +3474,10 @@ async fn run_cluster(
         ),
         migrate::Status::NeedsMigration => {
             if args.auto_migrate {
-                // Stage through the cluster (Raft consensus; idempotent + re-verifying) on boot.
-                // FAILURE-SAFE: on any error, LOG and serve the EXISTING layout via
-                // backward-read-compat — never propagate (no crash-loop).
-                match migrate::migrate(kv.as_ref(), auto_migrate_stage_opts()).await {
-                    Ok(report) => tracing::info!(
-                        rekeyed = report.total_rekeyed(),
-                        dual = report.dual,
-                        "control-plane store staged to the project-scoped layout (dual soak) via \
-                         --auto-migrate (cluster)"
-                    ),
-                    Err(e) => tracing::warn!(
-                        error = %e,
-                        "--auto-migrate could NOT complete the re-home — serving the EXISTING layout \
-                         via backward-read-compat instead (NOT exiting). Resolve the issue and run \
-                         `boatramp migrate` when ready. See docs/default-scope-migration.md."
-                    ),
-                }
+                // Stage through the cluster (Raft consensus; idempotent + re-verifying) on boot,
+                // honoring any armed console-wizard answers, FAILURE-SAFE (never exits). See
+                // `auto_migrate_on_boot`.
+                auto_migrate_on_boot(kv.as_ref()).await;
             } else {
                 tracing::warn!(
                     "control-plane store is BELOW the current schema version — serving its EXISTING \

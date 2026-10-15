@@ -491,6 +491,41 @@ pub async fn migrate_with_answers(
     Ok(InteractiveOutcome::Staged(report))
 }
 
+/// The reserved key holding **armed** interactive answers — the operator's [`MigrationAnswers`]
+/// collected via the console wizard, to be consumed by the next `serve --auto-migrate` at BOOT (before
+/// the handler runtime + its layout decorators are built), so the stage runs with no process ever
+/// serving through a stale layout (the zero-window path). A `schema/` global key, so the
+/// backward-read-compat decorator passes it through untouched on every store.
+pub const ARMED_ANSWERS_KEY: &str = "schema/migrate-answers";
+
+/// Read the armed interactive answers, if any (`None` ⇒ nothing armed).
+pub async fn read_armed_answers(
+    kv: &dyn KvStore,
+) -> Result<Option<MigrationAnswers>, MigrateError> {
+    match kv.get(ARMED_ANSWERS_KEY).await? {
+        Some(bytes) => Ok(Some(
+            serde_json::from_slice(&bytes).map_err(|e| MigrateError::Serde(e.to_string()))?,
+        )),
+        None => Ok(None),
+    }
+}
+
+/// **Arm** interactive answers for the next boot-time stage (the console wizard writes these, then the
+/// operator restarts and `serve --auto-migrate` consumes them). Durable (frontier-synced) so a crash
+/// can't lose them.
+pub async fn arm_answers(kv: &dyn KvStore, answers: &MigrationAnswers) -> Result<(), MigrateError> {
+    let bytes = serde_json::to_vec(answers).map_err(|e| MigrateError::Serde(e.to_string()))?;
+    kv.put_durable_checkpointed(ARMED_ANSWERS_KEY, bytes)
+        .await?;
+    Ok(())
+}
+
+/// Clear any armed answers (consumed after a successful boot-time stage, or when the operator un-arms).
+pub async fn clear_armed_answers(kv: &dyn KvStore) -> Result<(), MigrateError> {
+    kv.delete_checkpointed(ARMED_ANSWERS_KEY).await?;
+    Ok(())
+}
+
 /// Complete a store staged into the `dual` soak (and apply any pending forward): a
 /// one-shot pass that runs every deferred cleanup and flips to the current version.
 pub async fn finalize(kv: &dyn KvStore) -> Result<MigrationReport, MigrateError> {
