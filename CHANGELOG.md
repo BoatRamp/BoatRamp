@@ -5,6 +5,48 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.35.0] - 2026-10-15
+
+**One layered config resolver for every subcommand.** boatramp's daemon configuration is now
+resolved by a single [figment](https://github.com/SergioBenitez/Figment)-based pipeline —
+`built-in defaults → boatramp.cfg → BOATRAMP_* env → explicit CLI flags`, highest wins — that
+replaces the three hand-rolled, serve-biased env loaders (the `serve` clap `#[arg(env)]`
+layer, `apply_env_overrides`, and the ad-hoc `std::env::var` reads for `serve.kv.*`). Env
+coverage used to drift and was serve-only; it is now uniform and single-sourced.
+
+### Added
+
+- **The `BOATRAMP_*` daemon-config env vars now configure every subcommand**, not just
+  `serve`: the offline operations `boatramp migrate`, `boatramp blob …`, and `boatramp token
+  …` honor them too. A file-less (12-factor) deployment can drive `blob migrate` from
+  `BOATRAMP_BLOBS` / `BOATRAMP_S3_BUCKET` / the whole `[serve]` + `[serve.kv]` surface, exactly
+  as `serve` does. **Env variable names are unchanged.**
+- **`boatramp config dump [--file boatramp.cfg] [--explain]`** — print the fully resolved
+  static daemon config (file + env) as JSON, with the secret-bearing fields (auth root key,
+  bootstrap secret, azure access key, external-signer key, sealed-credential refs,
+  `cluster.join_token`) **redacted**. Client-side; no server contacted.
+
+### Changed
+
+- Resolution precedence is uniform everywhere: **explicit CLI flag > `BOATRAMP_*` env >
+  config file > built-in default**. A flag left at its default no longer shadows the file or
+  env (the former `--blobs`-explicit-set special case is gone). Config can be given entirely by
+  file, entirely by env, or any mix.
+- A **malformed value fails loudly at startup** — a non-numeric number, unknown enum, or bad
+  address is rejected rather than silently defaulted. Bool values accept the same
+  `true/false/1/0/yes/no/on/off` spellings as before (now whitespace-tolerant, so a templated
+  `"true\n"` parses).
+
+### Fixed
+
+- **A `[cluster]` section missing its required `listen` is now rejected at load** instead of
+  being silently dropped — a misconfigured cluster can no longer boot as a non-cluster node.
+- The fail-closed config validators (SQL db-name / blob-project / listener checks) now run on
+  the **fully merged** (file + env + flags) config, so an invalid entry introduced by any layer
+  fails closed at boot.
+
+No HTTP/WIT/shim change. See `docs/src/explanation/config-model.md` for the config contract.
+
 ## [0.34.0] - 2026-10-15
 
 **Migration-safety rewrite + two data-loss fixes.** A routine v0.30→v0.33 roll crash-looped a
