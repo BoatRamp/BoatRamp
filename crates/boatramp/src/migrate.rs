@@ -48,6 +48,9 @@ pub enum Error {
         /// What is still outstanding (libsql bare DBs and/or the blob-retired marker).
         reason: String,
     },
+    /// Reading the operator's input during an interactive migration failed.
+    #[error("interactive migration: {0}")]
+    Interactive(String),
 }
 
 /// `boatramp migrate` arguments.
@@ -86,6 +89,12 @@ pub struct MigrateArgs {
     /// bare DB is the rollback target — see docs/default-scope-migration.md.)
     #[arg(long, conflicts_with_all = ["dry_run", "stage", "finalize"])]
     abort: bool,
+
+    /// Interactive (question-driven) migration: show the plan, PROMPT at each decision point (a
+    /// name collision → rename / skip / abort), then stage honoring your answers. The guided CLI flow
+    /// over the same `plan` + apply engine the console wizard uses. OFFLINE (node stopped).
+    #[arg(long, short = 'i', conflicts_with_all = ["dry_run", "stage", "finalize", "abort"])]
+    interactive: bool,
 
     /// Node config (`boatramp.cfg` shape) used by `--finalize` to locate the libsql dir (+ the blob
     /// retired marker) for the substrate-complete gate. Defaults to `boatramp.cfg`.
@@ -137,6 +146,13 @@ pub async fn run(args: MigrateArgs, config: &ServerConfig) -> Result<(), Error> 
         return Ok(());
     }
 
+    // INTERACTIVE: the question-driven flow (plan → prompt decisions → stage honoring the answers).
+    if args.interactive {
+        interactive_migrate(kv.as_ref()).await?;
+        kv.flush().await.map_err(|e| Error::Flush(e.to_string()))?;
+        return Ok(());
+    }
+
     let report = if args.finalize {
         // Substrate-complete gate (Finding 8, HIGH-2c): clearing the KV dual soak disengages the
         // runtime blob read-fallback, so refuse until blob (the marker `blob rehome --finalize` sets)
@@ -165,6 +181,151 @@ pub async fn run(args: MigrateArgs, config: &ServerConfig) -> Result<(), Error> 
         kv.flush().await.map_err(|e| Error::Flush(e.to_string()))?;
     }
     Ok(())
+}
+
+/// The interactive (question-driven) migration flow: show the plan, prompt the operator at each
+/// decision (a name collision → rename / skip / abort), and stage honoring the answers. The CLI half
+/// of the interactive migration — it drives the SAME `migrate::plan` + `migrate_with_answers` engine
+/// the console wizard uses, so the two surfaces can never diverge. Thin stdin/stdout glue; the engine
+/// logic (skip/abort/refuse) is unit-tested in `boatramp-core`.
+async fn interactive_migrate(kv: &dyn boatramp_core::kv::KvStore) -> Result<(), Error> {
+    let plan = migrate::plan(kv).await?;
+    match plan.status {
+        Status::Ready => {
+            println!("nothing to do: the store is already at the current layout.");
+            return Ok(());
+        }
+        Status::Dual => {
+            println!(
+                "the store is already staged (dual soak). Re-home the blob + libsql substrates, then \
+                 `boatramp migrate --finalize` to complete it — or `boatramp migrate --abort` to roll \
+                 it back."
+            );
+            return Ok(());
+        }
+        Status::NeedsMigration => {}
+    }
+
+    println!("\nPlan — re-home the default project to the project-scoped layout:");
+    for line in &plan.summary {
+        println!("  • {line}");
+    }
+
+    // Collect a route per decision.
+    let mut answers = migrate::MigrationAnswers::default();
+    let mut pending_renames: Vec<String> = Vec::new();
+    for d in &plan.decisions {
+        println!("\n{}", d.question);
+        for (i, r) in d.routes.iter().enumerate() {
+            println!("  {}) {}", i + 1, r.label);
+            if let Some(note) = &r.note {
+                println!("     ({note})");
+            }
+        }
+        let chosen = prompt_route(d)?;
+        match chosen.key.as_str() {
+            "abort" => {
+                println!("\naborting the migration — nothing was changed.");
+                return Ok(());
+            }
+            "skip" => answers.skip_collisions.push(d.id.clone()),
+            "rename" => {
+                let prompt = chosen
+                    .input
+                    .as_ref()
+                    .map(|i| i.prompt.as_str())
+                    .unwrap_or("new name");
+                let new_name = prompt_line(&format!("  {prompt}: "))?;
+                let resource = d.id.strip_prefix("collision:").unwrap_or(&d.id);
+                pending_renames.push(format!(
+                    "{resource}: re-create it as `{new_name}` via the normal deploy flow (e.g. \
+                     redeploy the site under the new name), then delete the old `{resource}`"
+                ));
+            }
+            other => {
+                return Err(Error::Interactive(format!("unexpected route `{other}`")));
+            }
+        }
+    }
+
+    // Any rename must be done externally (through the proven deploy path) BEFORE staging — print the
+    // guidance and stop; the operator re-runs once the collisions are gone.
+    if !pending_renames.is_empty() {
+        println!(
+            "\nResolve these renames first, then re-run `boatramp migrate --interactive` (the \
+             collision clears once the resource no longer shares a name):"
+        );
+        for step in &pending_renames {
+            println!("  • {step}");
+        }
+        return Ok(());
+    }
+
+    if !prompt_yes(
+        "\nProceed to STAGE the re-home now (non-destructive; reversible with --abort)?",
+    )? {
+        println!("cancelled.");
+        return Ok(());
+    }
+
+    match migrate::migrate_with_answers(kv, &answers).await? {
+        migrate::InteractiveOutcome::Aborted => println!("aborted — nothing was changed."),
+        migrate::InteractiveOutcome::Staged(report) => {
+            print_report(&report, false);
+            println!(
+                "\nStaged into the dual soak. NEXT:\n  \
+                 1. RESTART the node so it adopts the new layout (a running daemon keeps serving the \
+                 OLD layout until restarted).\n  \
+                 2. Re-home the other substrates: `boatramp sql rehome-default` + `boatramp blob \
+                 rehome`.\n  \
+                 3. `boatramp migrate --finalize` to reclaim the old keys (gated until step 2).\n  \
+                 Reversible until finalize: `boatramp migrate --abort`."
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Prompt the operator to choose one of a decision's routes (by number or by key); re-prompts on an
+/// invalid entry. EOF/`q` is treated as a cancel (maps to the `abort` route if present, else errors).
+fn prompt_route(d: &migrate::MigrationDecision) -> Result<&migrate::DecisionRoute, Error> {
+    loop {
+        let line = prompt_line("  choose [number or name]: ")?;
+        let line = line.trim();
+        if let Ok(n) = line.parse::<usize>()
+            && n >= 1
+            && n <= d.routes.len()
+        {
+            return Ok(&d.routes[n - 1]);
+        }
+        if let Some(r) = d.routes.iter().find(|r| r.key.eq_ignore_ascii_case(line)) {
+            return Ok(r);
+        }
+        println!("  (please enter 1–{} or a route name)", d.routes.len());
+    }
+}
+
+/// Read one line from stdin after printing `prompt`.
+fn prompt_line(prompt: &str) -> Result<String, Error> {
+    use std::io::Write;
+    print!("{prompt}");
+    std::io::stdout()
+        .flush()
+        .map_err(|e| Error::Interactive(e.to_string()))?;
+    let mut line = String::new();
+    let n = std::io::stdin()
+        .read_line(&mut line)
+        .map_err(|e| Error::Interactive(e.to_string()))?;
+    if n == 0 {
+        return Err(Error::Interactive("unexpected end of input".to_string()));
+    }
+    Ok(line)
+}
+
+/// A yes/no confirmation (default NO).
+fn prompt_yes(question: &str) -> Result<bool, Error> {
+    let line = prompt_line(&format!("{question} [y/N] "))?;
+    Ok(matches!(line.trim(), "y" | "Y" | "yes" | "YES"))
 }
 
 /// The substrate-complete gate for `--finalize` (v0.31.0 Finding 8, HIGH-2c): clearing the KV dual
