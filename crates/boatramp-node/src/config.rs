@@ -897,6 +897,43 @@ impl ServerConfig {
             }
         }
 
+        // --- serve top-level S3 object backend (`[serve]` blobs/s3_*) ---
+        // Env parity for the PRIMARY blob-backend selection, so the OFFLINE ops (`boatramp migrate
+        // --finalize` / `blob rehome`, which resolve a backend from the config file ALONE — there is
+        // no `ServeArgs` off the serve hot path) see the same object store `serve` does via its
+        // `--blobs`/`--s3-*` flags. `serve` already honoured `BOATRAMP_BLOBS`/`BOATRAMP_S3_*` through
+        // clap; this extends the SAME levers to every other config consumer, so a file-less fleet (the
+        // Tigris-only construens deployment) needs no `boatramp.cfg` for its object store. The flag
+        // still wins for `serve` (uniform `serve` precedence: file < this env overlay < flag). The
+        // credential is NOT set here — it stays the standard `AWS_*` env (or a sealed credential),
+        // unchanged (invariant 3: env is never raw key material).
+        if source.any(SERVE_S3_BACKEND_ENV_VARS) {
+            let serve = self.serve.get_or_insert_with(ServeConfig::default);
+            if let Some(v) = source.parse_enum(
+                "BOATRAMP_BLOBS",
+                &[
+                    ("fs", crate::backends::BlobBackend::Fs),
+                    ("s3", crate::backends::BlobBackend::S3),
+                    ("gcs", crate::backends::BlobBackend::Gcs),
+                    ("azure", crate::backends::BlobBackend::Azure),
+                ],
+            )? {
+                serve.blobs = Some(v);
+            }
+            if let Some(v) = source.get("BOATRAMP_S3_BUCKET") {
+                serve.s3_bucket = Some(v);
+            }
+            if let Some(v) = source.get("BOATRAMP_S3_ENDPOINT") {
+                serve.s3_endpoint = Some(v);
+            }
+            if let Some(v) = source.get("BOATRAMP_S3_REGION") {
+                serve.s3_region = Some(v);
+            }
+            if let Some(v) = source.parse_bool("BOATRAMP_S3_PATH_STYLE")? {
+                serve.s3_path_style = v;
+            }
+        }
+
         // --- secrets (`[secrets]`) -------------------------------------------
         // Envelope encryption for private keys at rest. `kek_file` holds a *path*
         // (never key material) and the Vault token stays indirected via
@@ -1285,6 +1322,26 @@ const S3_INGRESS_CLOUD_ENV_VARS: &[&str] = &[
     "BOATRAMP_S3_INGRESS_CLOUD_AZURE_ACCOUNT",
     "BOATRAMP_S3_INGRESS_CLOUD_AZURE_SERVICE_URL",
     "BOATRAMP_S3_INGRESS_CLOUD_AZURE_HNS",
+];
+
+/// The top-level `[serve]` S3 object-backend env levers — the PRIMARY blob-backend selection plus
+/// its S3 addressing, mirroring the `blobs`/`s3_bucket`/`s3_endpoint`/`s3_region`/`s3_path_style`
+/// fields on [`ServeConfig`]. These give the OFFLINE ops (`boatramp migrate`/`blob rehome`, which
+/// build a backend from a config file ALONE — no `ServeArgs`) the same env parity `serve` already has
+/// through its `--blobs`/`--s3-*` flags, so a file-less fleet (the Tigris-only construens deployment)
+/// resolves its object store from `[env]` with no `boatramp.cfg`. Kept in sync by the
+/// `env_wires_the_serve_s3_backend_over_the_default` forgot-a-knob guard test. The signing credential
+/// is deliberately NOT here: the base S3 credential stays the standard `AWS_ACCESS_KEY_ID` /
+/// `AWS_SECRET_ACCESS_KEY` the object-store client reads directly (or a sealed `[serve.s3_credential]`),
+/// unchanged. gcs/azure PRIMARY-backend env parity is deferred to the figment config migration — this
+/// targeted lever covers the S3 backend the fleet actually runs on (mirrors the per-project
+/// `blob_backends` block, which is likewise S3-only).
+const SERVE_S3_BACKEND_ENV_VARS: &[&str] = &[
+    "BOATRAMP_BLOBS",
+    "BOATRAMP_S3_BUCKET",
+    "BOATRAMP_S3_ENDPOINT",
+    "BOATRAMP_S3_REGION",
+    "BOATRAMP_S3_PATH_STYLE",
 ];
 
 /// The fixed prefix of a keyed `handlers.bindings.sql.databases` variable —
@@ -4518,6 +4575,47 @@ mod tests {
                 "{var} is not an s3_ingress_cloud lever"
             );
         }
+    }
+
+    #[test]
+    fn env_wires_the_serve_s3_backend_over_the_default() {
+        // The PRIMARY `[serve]` S3 object backend is env-settable so the OFFLINE ops (`boatramp
+        // migrate`/`blob rehome`, which build a backend from the config file ALONE, no `ServeArgs`)
+        // resolve the same Tigris store `serve` does — the lever that lets the construens fleet drop
+        // its `boatramp.cfg` and set BOATRAMP_BLOBS/BOATRAMP_S3_* in fly `[env]`. Every lever is
+        // registered in SERVE_S3_BACKEND_ENV_VARS (forgot-a-knob guard). The credential is NOT here —
+        // it stays the standard `AWS_*` env (invariant 3).
+        let mut cfg = ServerConfig::default();
+        assert!(cfg.serve.is_none());
+        cfg.apply_env_overrides(&env(&[
+            ("BOATRAMP_BLOBS", "s3"),
+            ("BOATRAMP_S3_BUCKET", "construens-blobs"),
+            ("BOATRAMP_S3_ENDPOINT", "https://fly.storage.tigris.dev"),
+            ("BOATRAMP_S3_REGION", "auto"),
+            ("BOATRAMP_S3_PATH_STYLE", "true"),
+        ]))
+        .expect("valid serve S3-backend env overrides apply");
+        let serve = cfg.serve.expect("serve materialised from env");
+        assert_eq!(serve.blobs, Some(crate::backends::BlobBackend::S3));
+        assert_eq!(serve.s3_bucket.as_deref(), Some("construens-blobs"));
+        assert_eq!(
+            serve.s3_endpoint.as_deref(),
+            Some("https://fly.storage.tigris.dev")
+        );
+        assert_eq!(serve.s3_region.as_deref(), Some("auto"));
+        assert!(serve.s3_path_style);
+        // Forgot-a-knob guard: the lever set is exactly these five (no stale/missing lever); a new
+        // top-level `[serve]` S3 field can't silently lose its env parity for the offline ops.
+        assert_eq!(
+            SERVE_S3_BACKEND_ENV_VARS,
+            [
+                "BOATRAMP_BLOBS",
+                "BOATRAMP_S3_BUCKET",
+                "BOATRAMP_S3_ENDPOINT",
+                "BOATRAMP_S3_REGION",
+                "BOATRAMP_S3_PATH_STYLE",
+            ]
+        );
     }
 
     #[test]
