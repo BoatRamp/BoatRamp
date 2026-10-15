@@ -295,6 +295,40 @@ impl ApiClient {
         let resp = check(req.send().await)?;
         decode_json(resp).await
     }
+
+    /// `POST path` with a JSON `body`, deserializing the JSON response into `T`. Unlike
+    /// [`post_json`](Self::post_json), a non-2xx (other than 401/403) reads the response
+    /// BODY as text into [`ApiError::Status`] rather than the bare status reason phrase —
+    /// so an operator-actionable server message (e.g. the store migration's `409` naming
+    /// the unresolved decisions) survives for the UI to show.
+    pub async fn post_json_detailed<B: Serialize, T: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> ApiResult<T> {
+        let req = self
+            .authed(RequestBuilder::new(&self.url(path)).method(gloo_net::http::Method::POST))
+            .json(body)
+            .map_err(|err| ApiError::Transport(err.to_string()))?;
+        let resp = req
+            .send()
+            .await
+            .map_err(|err| ApiError::Transport(err.to_string()))?;
+        decode_json_or_err_body(resp).await
+    }
+
+    /// `POST path` with no body, deserializing the JSON response into `T`, reading the
+    /// error BODY on a non-2xx like [`post_json_detailed`](Self::post_json_detailed) (used
+    /// by the store migration's bodyless `abort`, whose `409` carries a message).
+    pub async fn post_empty_detailed<T: DeserializeOwned>(&self, path: &str) -> ApiResult<T> {
+        let req =
+            self.authed(RequestBuilder::new(&self.url(path)).method(gloo_net::http::Method::POST));
+        let resp = req
+            .send()
+            .await
+            .map_err(|err| ApiError::Transport(err.to_string()))?;
+        decode_json_or_err_body(resp).await
+    }
 }
 
 /// Send a builder (a request with no JSON body) and map the status.
@@ -326,4 +360,25 @@ async fn decode_json<T: DeserializeOwned>(resp: Response) -> ApiResult<T> {
     resp.json::<T>()
         .await
         .map_err(|err| ApiError::Transport(err.to_string()))
+}
+
+/// Decode a 2xx JSON body into `T`; for a non-2xx (other than 401/403) read the response
+/// BODY text into [`ApiError::Status`] — unlike [`check`], which keeps only the status
+/// reason phrase. Backs the `*_detailed` POSTs so server messages reach the operator.
+async fn decode_json_or_err_body<T: DeserializeOwned>(resp: Response) -> ApiResult<T> {
+    let status = resp.status();
+    if (200..300).contains(&status) {
+        return decode_json(resp).await;
+    }
+    match status {
+        401 => Err(ApiError::Unauthorized),
+        403 => Err(ApiError::Forbidden),
+        code => {
+            let body = resp.text().await.unwrap_or_default();
+            Err(ApiError::Status {
+                code,
+                body: body.trim().to_string(),
+            })
+        }
+    }
 }
