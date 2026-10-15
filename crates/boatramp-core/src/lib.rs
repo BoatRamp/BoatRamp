@@ -49,6 +49,9 @@ pub mod kv;
 /// Portable, versioned, backend-agnostic KV dump format + a generic `KvStore`↔`KvStore` copier
 /// (kv-sql WS7) — the one representation behind `kv export` / `import` / `migrate`.
 pub mod kv_dump;
+/// Backward-read-compat decorator so a current binary serves an un-migrated (pre-default-scope-re-home)
+/// store's old data-plane layout — rolling the binary is a no-op, the re-home stays explicit.
+pub mod kv_translate;
 pub mod messaging;
 /// Online, resumable migration of a pre-0.2.0 store to the project-scoped layout.
 pub mod migrate;

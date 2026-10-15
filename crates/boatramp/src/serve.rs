@@ -176,15 +176,6 @@ pub enum Error {
     #[cfg(feature = "handlers")]
     #[error(transparent)]
     Handler(#[from] boatramp_handlers::HandlerError),
-    /// The control-plane store holds pre-0.2.0 (layout 1) data and has not been
-    /// migrated to the project-scoped layout. Refusing to serve so a half-read
-    /// store can't silently drop sites/functions. Run `boatramp migrate` (or start
-    /// with `--auto-migrate`).
-    #[error(
-        "the control-plane store is not migrated to the project-scoped (0.2.0) layout; \
-         run `boatramp migrate` first, or start `serve --auto-migrate`"
-    )]
-    UnmigratedStore,
     /// Running the store migration failed.
     #[error("store migration failed: {0}")]
     Migrate(String),
@@ -192,20 +183,6 @@ pub enum Error {
     /// UX-C4): a multi-writer SQL control-plane KV backend configured alongside a Raft cluster.
     #[error("{0}")]
     ContradictoryCoordination(String),
-    /// The default project has libsql databases still at the bare pre-`default/` on-disk layout
-    /// (v0.31.0 Finding 8, HIGH-1): libsql has no runtime fallback, so serving would open the
-    /// non-existent `{dir}/default/{site}.db` and auto-create an EMPTY database. Refused fail-closed
-    /// until re-homed with `boatramp sql rehome-default` (run with the node stopped).
-    #[error(
-        "refusing to serve: the default project has un-re-homed libsql database(s) at the bare \
-         on-disk layout ({idents:?}); run `boatramp sql rehome-default --site <site>` for each \
-         (node stopped) — serving now would boot onto an EMPTY database (v0.31.0 Finding 8). See \
-         docs/default-scope-migration.md."
-    )]
-    DefaultScopeLibsqlUnrehomed {
-        /// The un-re-homed default-project libsql identities.
-        idents: Vec<String>,
-    },
 }
 
 impl From<boatramp_core::migrate::MigrateError> for Error {
@@ -214,39 +191,46 @@ impl From<boatramp_core::migrate::MigrateError> for Error {
     }
 }
 
-/// Default-scope serve guard (v0.31.0 Finding 8, HIGH-1b/HIGH-3): refuse to serve when the default
-/// project's LIBSQL data is still at the bare pre-`default/` on-disk layout. Unlike KV (version-guard)
-/// and blob (runtime read-fallback during the dual soak), libsql has **no** runtime bridge — the
-/// post-flip `database("default", site)` would open the non-existent `{dir}/default/{site}.db` and
-/// auto-create an EMPTY database — so this is a hard refusal until `boatramp sql rehome-default` runs.
-/// A remote sqld binding (no local dir) is a documented operator step, not auto-guarded here.
-async fn default_scope_libsql_guard(
+/// Default-scope serve notice (Finding-8 migration-safety rewrite): when the default project's LOCAL
+/// libsql data is still at the bare pre-`default/` on-disk layout, LOG it — the open-path resolver
+/// ([`LibsqlSqlBackends::resolve_local_path`](boatramp_storage)) now serves the bare file IN PLACE
+/// (reads + writes), so rolling the binary is a no-op and the old empty-DB-auto-create hazard
+/// (v0.31.0 HIGH-1) is closed. This is NO LONGER a refusal: a below-version node stays up. The
+/// operator re-homes deliberately with `boatramp sql rehome-default` + `boatramp migrate --finalize`.
+/// A remote sqld binding (no local dir) has no local-file fallback and stays a documented operator
+/// step (not covered here). Best-effort: a state-read error is swallowed (the node still serves).
+async fn default_scope_libsql_notice(
     config: &ServerConfig,
     data_dir: &std::path::Path,
     kv: &dyn boatramp_core::kv::KvStore,
-) -> Result<()> {
+) {
     let Some(dir) = boatramp_node::default_scope::libsql_dir_for(config, data_dir) else {
-        return Ok(());
+        return;
     };
-    let projects = boatramp_node::default_scope::known_projects(kv).await?;
+    let Ok(projects) = boatramp_node::default_scope::known_projects(kv).await else {
+        return;
+    };
     let bare = boatramp_node::default_scope::libsql_bare_default_idents(&dir, &projects);
-    if bare.is_empty() {
-        Ok(())
-    } else {
-        Err(Error::DefaultScopeLibsqlUnrehomed { idents: bare })
+    if !bare.is_empty() {
+        tracing::warn!(
+            idents = ?bare,
+            "serving un-re-homed default-project libsql database(s) IN PLACE at the bare on-disk \
+             layout (backward-read-compat). Run `boatramp sql rehome-default --site <site>` for each, \
+             then `boatramp migrate --finalize`, to complete the re-home."
+        );
     }
 }
 
 /// `MigrateOptions` for the serve-startup `--auto-migrate`: **stage** (enter the dual soak), never
 /// one-shot (v0.31.0 Finding 8, HIGH-2a). One-shot would empty `unfinalized`, disengaging the
-/// translating blob read-fallback, so cold default blobs/payloads would 404. Staging keeps the old
-/// keys + the fallback live; the operator runs the blob drain + libsql re-home, then
-/// `boatramp migrate --finalize` (which verifies both substrates before clearing the soak).
+/// translating blob read-fallback. Staging keeps the old keys + the fallback live; the operator runs
+/// the blob drain + libsql re-home, then `boatramp migrate --finalize`. Migration-safety rewrite: the
+/// serve caller now treats any failure here as NON-fatal (logs + serves the existing layout via
+/// backward-read-compat) rather than exiting.
 fn auto_migrate_stage_opts() -> boatramp_core::migrate::MigrateOptions {
     boatramp_core::migrate::MigrateOptions {
         dry_run: false,
         finalize: false,
-        allow_default_named_resource: false,
     }
 }
 
@@ -1027,6 +1011,11 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
     // migrates explicitly (`boatramp migrate`); `--auto-migrate` opts into an in-place
     // one-shot migration here. A `2-dual` store serves fine (reads are off the new
     // keys) and only needs a later `boatramp migrate --finalize` to reclaim old keys.
+    // Migration-safety (Finding-8 rewrite): `serve` NEVER runs a data re-home as a boot side effect,
+    // and NEVER exits on a below-version store. A store below the current schema version is served on
+    // its EXISTING layout via the data-plane backward-read-compat decorators (KV/blob/libsql installed
+    // in the handler-runtime build), so rolling this binary is a no-op and nothing appears to vanish;
+    // the operator re-homes deliberately with the explicit, dry-runnable, reversible `boatramp migrate`.
     match migrate::status(kv.as_ref()).await? {
         migrate::Status::Ready => {}
         migrate::Status::Dual => tracing::warn!(
@@ -1037,29 +1026,42 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
         ),
         migrate::Status::NeedsMigration => {
             if args.auto_migrate {
-                // STAGE (dual soak), never one-shot (Finding 8, HIGH-2a): a one-shot would clear
-                // `unfinalized`, disengaging the blob read-fallback and stranding cold default blobs.
-                tracing::warn!(
-                    "control-plane store is below the current schema version; STAGING a migration \
-                     (--auto-migrate) into the dual soak (the blob read-fallback engages). Run \
-                     `boatramp sql rehome-default` + `boatramp blob rehome` then `boatramp migrate \
-                     --finalize` to complete the default-scope re-home"
-                );
-                let report = migrate::migrate(kv.as_ref(), auto_migrate_stage_opts()).await?;
-                tracing::info!(
-                    rekeyed = report.total_rekeyed(),
-                    owner_entries = report.owner_entries,
-                    dual = report.dual,
-                    "control-plane store staged to the project-scoped layout (dual soak)"
-                );
+                // `--auto-migrate` stages the re-home on boot (operator opt-in). FAILURE-SAFE (the
+                // migration-safety fix for the incident): on ANY error — a name collision, a mid-flight
+                // interruption, a transient KV error — LOG it and fall through to serving the EXISTING
+                // layout via backward-read-compat. NEVER propagate (which would exit the process into a
+                // crash-loop — the exact regression). On success the store is staged into the dual soak
+                // and served at the new layout.
+                match migrate::migrate(kv.as_ref(), auto_migrate_stage_opts()).await {
+                    Ok(report) => tracing::info!(
+                        rekeyed = report.total_rekeyed(),
+                        dual = report.dual,
+                        "control-plane store staged to the project-scoped layout (dual soak) via \
+                         --auto-migrate"
+                    ),
+                    Err(e) => tracing::warn!(
+                        error = %e,
+                        "--auto-migrate could NOT complete the re-home — serving the EXISTING layout \
+                         via backward-read-compat instead (NOT exiting). Resolve the issue and run \
+                         `boatramp migrate` when ready. See docs/default-scope-migration.md."
+                    ),
+                }
             } else {
-                return Err(Error::UnmigratedStore);
+                tracing::warn!(
+                    "control-plane store is BELOW the current schema version — serving its EXISTING \
+                     (un-migrated) layout via backward-read-compat, so rolling this binary is a no-op \
+                     and nothing is lost. Re-home when ready: `boatramp migrate --dry-run` to preview, \
+                     `boatramp migrate` to stage (reversible with `boatramp migrate --abort`), then \
+                     `boatramp migrate --finalize`. (`serve` without --auto-migrate never re-homes.)"
+                );
             }
         }
     }
-    // HIGH-1b/HIGH-3: libsql has no runtime fallback, so refuse to serve a default project whose
-    // libsql data is un-re-homed (would boot onto an empty DB). Runs regardless of KV status.
-    default_scope_libsql_guard(config, &data_dir, kv.as_ref()).await?;
+    // Finding-8 migration-safety: a below-version default project's LOCAL libsql databases are now
+    // served IN PLACE at their bare on-disk layout by the open-path resolver (no empty-DB
+    // auto-create), so this is a LOG, never a refusal — the node stays up. (A REMOTE sqld binding has
+    // no local-file fallback and stays a documented operator step; it is not auto-guarded here.)
+    default_scope_libsql_notice(config, &data_dir, kv.as_ref()).await;
 
     // Handle for a final flush on graceful shutdown (SHUT-1): `kv` is moved into
     // the deploy store below; this clone reaches its backing store's `flush`.
@@ -3414,15 +3416,12 @@ async fn run_cluster(
     // The control-plane KvStore + messaging are the cluster facades.
     let kv: Arc<dyn KvStore> = node.kv.clone();
 
-    // Layout guard (0.2.0), cluster path — the same fail-closed gate the single-node
-    // path applies: refuse to serve a store still on the pre-project layout 1, since a
-    // half-read store would silently drop sites/functions/compute. `node.kv` is the
-    // replicated RaftKv facade, so a `--auto-migrate` here writes through Raft consensus
-    // (a follower's writes forward to the leader) and every migration step is idempotent
-    // + re-verifying — so even a concurrent racer converges rather than corrupts, no
-    // CAS/leader-election needed. The load-bearing case is the founder (the leader,
-    // authoritative for its own store) booting on legacy data; a joiner only ever
-    // reaches an already-running cluster, which this guard kept from serving unmigrated.
+    // Migration-safety (Finding-8 rewrite), cluster path — the same non-exiting discipline the
+    // single-node path applies: `serve` NEVER re-homes on boot and NEVER exits on a below-version
+    // store. A store below the current schema version is served on its EXISTING layout via the
+    // data-plane backward-read-compat decorators, so a rolling cluster upgrade is a no-op; the operator
+    // re-homes deliberately with `boatramp migrate` (through Raft consensus — idempotent + re-verifying
+    // — when they choose to). No founder/joiner can be bricked by a routine binary roll.
     match migrate::status(kv.as_ref()).await? {
         migrate::Status::Ready => {}
         migrate::Status::Dual => tracing::warn!(
@@ -3432,30 +3431,39 @@ async fn run_cluster(
         ),
         migrate::Status::NeedsMigration => {
             if args.auto_migrate {
-                // STAGE (dual soak), never one-shot (Finding 8, HIGH-2a) — see the single-node path.
-                tracing::warn!(
-                    "control-plane store is below the current schema version; STAGING a migration \
-                     through the cluster into the dual soak (--auto-migrate). Run `boatramp sql \
-                     rehome-default` + `boatramp blob rehome` then `boatramp migrate --finalize`"
-                );
-                let report = migrate::migrate(kv.as_ref(), auto_migrate_stage_opts()).await?;
-                tracing::info!(
-                    rekeyed = report.total_rekeyed(),
-                    owner_entries = report.owner_entries,
-                    dual = report.dual,
-                    "control-plane store staged to the project-scoped layout (dual soak)"
-                );
+                // Stage through the cluster (Raft consensus; idempotent + re-verifying) on boot.
+                // FAILURE-SAFE: on any error, LOG and serve the EXISTING layout via
+                // backward-read-compat — never propagate (no crash-loop).
+                match migrate::migrate(kv.as_ref(), auto_migrate_stage_opts()).await {
+                    Ok(report) => tracing::info!(
+                        rekeyed = report.total_rekeyed(),
+                        dual = report.dual,
+                        "control-plane store staged to the project-scoped layout (dual soak) via \
+                         --auto-migrate (cluster)"
+                    ),
+                    Err(e) => tracing::warn!(
+                        error = %e,
+                        "--auto-migrate could NOT complete the re-home — serving the EXISTING layout \
+                         via backward-read-compat instead (NOT exiting). Resolve the issue and run \
+                         `boatramp migrate` when ready. See docs/default-scope-migration.md."
+                    ),
+                }
             } else {
-                return Err(Error::UnmigratedStore);
+                tracing::warn!(
+                    "control-plane store is BELOW the current schema version — serving its EXISTING \
+                     (un-migrated) layout via backward-read-compat, so a rolling cluster upgrade is a \
+                     no-op. Re-home when ready: `boatramp migrate` (reversible with `--abort`) then \
+                     `--finalize`."
+                );
             }
         }
     }
-    // HIGH-1b/HIGH-3: refuse to serve an un-re-homed default-project libsql (a remote sqld binding is
-    // a no-op here). Use the run-level `data_dir` PARAMETER — the SAME value `assemble(NodeInput {
-    // data_dir: data_dir.as_path(), … })` builds the SQL backend from below — so the guard scans
-    // exactly where the DBs live (identical source to the single-node guard). A `--data-dir` override
-    // that differs from `config.serve.data_dir` must NOT be scanned at the wrong path.
-    default_scope_libsql_guard(config, &data_dir, kv.as_ref()).await?;
+    // Finding-8 migration-safety: a below-version default project's LOCAL libsql databases are served
+    // IN PLACE by the open-path resolver — a LOG, not a refusal. Use the run-level `data_dir`
+    // PARAMETER — the SAME value `assemble(NodeInput { data_dir: data_dir.as_path(), … })` builds the
+    // SQL backend from below — so the scan matches where the DBs live. (A remote sqld binding is a
+    // no-op here and stays a documented operator step.)
+    default_scope_libsql_notice(config, &data_dir, kv.as_ref()).await;
 
     // Cluster-wide rate limiting shares the *replicated* RaftKv across nodes.
     if args.cluster_rate_limit || config.serve.as_ref().is_some_and(|s| s.cluster_rate_limit) {

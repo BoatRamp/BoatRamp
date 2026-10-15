@@ -438,6 +438,33 @@ impl LibsqlSqlBackends {
         }
     }
 
+    /// Resolve the on-disk path to OPEN for `(site, name)`, with **un-migrated default-scope
+    /// backward-read-compat** (Finding 8 migration-safety rewrite). The runtime composes the new
+    /// two-segment `default/{base}` scope, so the canonical path is `{dir}/default/{base}.db`; but a
+    /// store that has not yet run the libsql re-home (`boatramp sql rehome-default`) still holds the
+    /// data at the pre-fix bare `{dir}/{base}.db`. So: prefer the new path when it exists; otherwise, if
+    /// this is the default project's scope (`default/…`) and the bare old path exists, OPEN THE OLD
+    /// FILE IN PLACE — reads and writes land on the one real database, byte-identical to the old binary
+    /// and reversible by a rollback. Only when NEITHER exists (a genuinely fresh default-project
+    /// database) do we fall through to the new path and create it there. This is what makes rolling the
+    /// binary a no-op AND closes the HIGH-1 hazard where a post-flip open auto-created an EMPTY new db
+    /// while the real data sat at the bare path. A named project (`{project}/…`) never falls back — it
+    /// was never bare — so no cross-project path can be reached.
+    fn resolve_local_path(dir: &Path, site: &str, name: &str) -> PathBuf {
+        let new_path = Self::local_path(dir, site, name);
+        if new_path.exists() {
+            return new_path;
+        }
+        let default_prefix = format!("{}/", boatramp_core::project::DEFAULT_PROJECT);
+        if let Some(bare) = site.strip_prefix(&default_prefix) {
+            let old_path = Self::local_path(dir, bare, name);
+            if old_path.exists() {
+                return old_path;
+            }
+        }
+        new_path
+    }
+
     /// The binding identity for a preview deployment's database. `site` here is
     /// the **already project-qualified** site identity (bare `site` for the
     /// `default` project, `"<project>/<site>"` otherwise); both it and `preview`
@@ -469,7 +496,9 @@ impl LibsqlSqlBackends {
         let name = canonical_name(name);
         match &self.mode {
             Mode::Local { dir } => {
-                let path = Self::local_path(dir, site, name);
+                // Resolve with un-migrated default-scope backward-read-compat: open the bare old file
+                // in place when the new path has no database yet (see `resolve_local_path`).
+                let path = Self::resolve_local_path(dir, site, name);
                 if let Some(parent) = path.parent() {
                     std::fs::create_dir_all(parent).map_err(SqlError::other)?;
                 }
@@ -1367,6 +1396,48 @@ mod tests {
             LibsqlSqlBackends::local_path(dir, "blog", "logs"),
             PathBuf::from("/data/blog/logs.db")
         );
+    }
+
+    /// Un-migrated default-scope backward-read-compat resolver (Finding-8 migration-safety): the new
+    /// `default/{site}` identity opens the bare OLD file IN PLACE when the new path has no DB yet, so
+    /// rolling the binary is a no-op and no empty DB is auto-created (closes HIGH-1). The new path wins
+    /// when present; a fresh default DB falls through to the new path; a named project never falls back.
+    #[test]
+    fn resolve_local_path_opens_old_in_place_then_prefers_new() {
+        let dir = factory_dir("resolve-compat");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // (1) Un-migrated: only the bare OLD file exists → the `default/blog` identity resolves to it.
+        std::fs::write(dir.join("blog.db"), b"old").unwrap();
+        assert_eq!(
+            LibsqlSqlBackends::resolve_local_path(&dir, "default/blog", ""),
+            dir.join("blog.db"),
+            "un-migrated: open the bare old file in place (no empty-DB auto-create)"
+        );
+
+        // (2) Re-homed: once the NEW file exists it wins (dual-soak / finalized).
+        std::fs::create_dir_all(dir.join("default")).unwrap();
+        std::fs::write(dir.join("default/blog.db"), b"new").unwrap();
+        assert_eq!(
+            LibsqlSqlBackends::resolve_local_path(&dir, "default/blog", ""),
+            dir.join("default/blog.db"),
+            "re-homed: prefer the new path"
+        );
+
+        // (3) Fresh default DB (neither exists) → the new path (created there).
+        assert_eq!(
+            LibsqlSqlBackends::resolve_local_path(&dir, "default/fresh", ""),
+            dir.join("default/fresh.db")
+        );
+
+        // (4) A named project NEVER falls back to a bare path — even if a stray bare file exists —
+        // so no cross-project path can be reached.
+        std::fs::write(dir.join("acme.db"), b"stray").unwrap();
+        assert_eq!(
+            LibsqlSqlBackends::resolve_local_path(&dir, "acme/blog", ""),
+            dir.join("acme/blog.db")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// End-to-end via the public `SqlBackends` API: an unsafe `project`, `site`,

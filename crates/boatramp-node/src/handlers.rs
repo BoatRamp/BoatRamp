@@ -448,6 +448,14 @@ pub async fn build_handler_runtime(
         &boatramp_core::env::SystemEnv,
     )
     .await?;
+    // Un-migrated-store default-scope backward-read-compat (Finding-8 migration-safety rewrite): the
+    // GUEST data-plane kv handle (guest `wasi:keyvalue` + the `mq*/` messaging indices) is wrapped so a
+    // legacy store below the re-home version serves its default project's bare old spelling in place —
+    // reads AND writes — making a roll of this binary a no-op. A no-op (same `Arc`) on a fresh /
+    // migrated / dual store. The RAW `kv` is kept for every control-plane store (secrets, email,
+    // sql-cred) and for the schema-state reads above/below — the decorator only ever touches `hkv/` +
+    // `mq*/` keys, but keeping control-plane on the raw handle is explicit about the boundary.
+    let data_plane_kv = boatramp_core::kv_translate::default_scope_compat_kv(kv.clone()).await;
     // The `wasi:messaging` substrate: single-node `LogMessaging` over the same
     // blob/KV backends by default, or the cluster coordinator when one is given.
     // Relaxed messaging-publish durability (operator opt-in; 0/absent ⇒ strong, the default). A
@@ -472,7 +480,7 @@ pub async fn build_handler_runtime(
     let messaging: Arc<dyn boatramp_core::messaging::Messaging> = messaging_override
         .unwrap_or_else(|| {
             Arc::new(
-                boatramp_core::messaging::LogMessaging::new(storage.clone(), kv.clone())
+                boatramp_core::messaging::LogMessaging::new(storage.clone(), data_plane_kv.clone())
                     .with_max_unflushed(max_unflushed),
             )
         });
@@ -490,7 +498,9 @@ pub async fn build_handler_runtime(
     let email_envelope = secrets_envelope.clone();
     let runtime = boatramp_server::HandlerRuntime::new_with_backends(
         engine,
-        kv,
+        // The data-plane handle (default-scope backward-read-compat applied) backs the guest
+        // `wasi:keyvalue` binding; control-plane keys pass through the decorator untouched.
+        data_plane_kv,
         blob_backends,
         Some(sql),
         Some(messaging),

@@ -79,11 +79,13 @@ pub struct MigrateArgs {
     #[arg(long, conflicts_with = "dry_run")]
     finalize: bool,
 
-    /// Override the fail-closed pre-migration conflict guard (a default-project resource named
-    /// `default`, or like a known project): proceed with the re-home anyway — that resource's
-    /// default-scoped data will NOT be re-homed. Only set this if you understand the consequence.
-    #[arg(long)]
-    allow_default_named_resource: bool,
+    /// Abort a staged (dual-soak) migration, rolling the store back to its exact pre-forward bytes —
+    /// the reverse of a `stage`. OFFLINE (run with the node stopped). Fail-closed: refuses, deleting
+    /// nothing, if any staged key received a write during the soak (that write would be lost); finalize
+    /// forward instead, or reconcile manually. (libsql: abort removes the re-homed COPY; the retained
+    /// bare DB is the rollback target — see docs/default-scope-migration.md.)
+    #[arg(long, conflicts_with_all = ["dry_run", "stage", "finalize"])]
+    abort: bool,
 
     /// Node config (`boatramp.cfg` shape) used by `--finalize` to locate the libsql dir (+ the blob
     /// retired marker) for the substrate-complete gate. Defaults to `boatramp.cfg`.
@@ -122,6 +124,19 @@ pub async fn run(args: MigrateArgs, config: &ServerConfig) -> Result<(), Error> 
         describe(migrate::status(kv.as_ref()).await?)
     );
 
+    // ABORT: roll a staged (dual-soak) migration back to the pre-migration layout. Prints what it did,
+    // flushes, and re-prints the resulting status.
+    if args.abort {
+        migrate::abort(kv.as_ref()).await?;
+        println!(
+            "aborted the staged migration — the store is rolled back to its pre-migration layout \
+             (old keys only); a prior binary can serve it, and `boatramp migrate` can re-stage it."
+        );
+        kv.flush().await.map_err(|e| Error::Flush(e.to_string()))?;
+        println!("now: {}", describe(migrate::status(kv.as_ref()).await?));
+        return Ok(());
+    }
+
     let report = if args.finalize {
         // Substrate-complete gate (Finding 8, HIGH-2c): clearing the KV dual soak disengages the
         // runtime blob read-fallback, so refuse until blob (the marker `blob rehome --finalize` sets)
@@ -137,7 +152,6 @@ pub async fn run(args: MigrateArgs, config: &ServerConfig) -> Result<(), Error> 
             MigrateOptions {
                 dry_run: args.dry_run,
                 finalize: false,
-                allow_default_named_resource: args.allow_default_named_resource,
             },
         )
         .await?
