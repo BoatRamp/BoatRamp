@@ -244,9 +244,12 @@ fn auto_migrate_stage_opts() -> boatramp_core::migrate::MigrateOptions {
 /// `abort` skips staging), then cleared on a successful stage. With nothing armed it is a plain stage,
 /// which refuses fail-closed on any collision (logged → serve the existing layout; the operator then
 /// uses `boatramp migrate --interactive` or the console wizard to resolve).
-async fn auto_migrate_on_boot(kv: &dyn boatramp_core::kv::KvStore) {
+async fn auto_migrate_on_boot(
+    kv: &dyn boatramp_core::kv::KvStore,
+    blobs: Option<&dyn migrate::BlobScopeScanner>,
+) {
     match migrate::read_armed_answers(kv).await {
-        Ok(Some(answers)) => match migrate::migrate_with_answers(kv, &answers).await {
+        Ok(Some(answers)) => match migrate::migrate_with_answers(kv, &answers, blobs).await {
             Ok(migrate::InteractiveOutcome::Staged(report)) => {
                 tracing::info!(
                     rekeyed = report.total_rekeyed(),
@@ -272,7 +275,7 @@ async fn auto_migrate_on_boot(kv: &dyn boatramp_core::kv::KvStore) {
                  `boatramp migrate --interactive`."
             ),
         },
-        Ok(None) => match migrate::migrate(kv, auto_migrate_stage_opts()).await {
+        Ok(None) => match migrate::migrate(kv, auto_migrate_stage_opts(), blobs).await {
             Ok(report) => tracing::info!(
                 rekeyed = report.total_rekeyed(),
                 dual = report.dual,
@@ -298,8 +301,11 @@ async fn auto_migrate_on_boot(kv: &dyn boatramp_core::kv::KvStore) {
 /// each pending decision's own question from [`migrate::plan`]; serve embeds no migration specifics
 /// (no collision scan, no default-scope knowledge). Best-effort — a plan error is already surfaced by
 /// the `status` path, so a failure here is silent.
-async fn log_pending_migration_decisions(kv: &dyn boatramp_core::kv::KvStore) {
-    if let Ok(plan) = migrate::plan(kv).await {
+async fn log_pending_migration_decisions(
+    kv: &dyn boatramp_core::kv::KvStore,
+    blobs: Option<&dyn migrate::BlobScopeScanner>,
+) {
+    if let Ok(plan) = migrate::plan(kv, blobs).await {
         for d in &plan.decisions {
             tracing::warn!(
                 decision = %d.id,
@@ -1093,6 +1099,12 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
     // its EXISTING layout via the data-plane backward-read-compat decorators (KV/blob/libsql installed
     // in the handler-runtime build), so rolling this binary is a no-op and nothing appears to vanish;
     // the operator re-homes deliberately with the explicit, dry-runnable, reversible `boatramp migrate`.
+    // Feature A: the DEFAULT-project blob scanner over the RAW (undecorated) global object backend
+    // built above, so the data-aware collision gate can prove a commingle has no blob footprint at
+    // `--auto-migrate` boot (a colliding scope is a known-project name, which the backward-compat
+    // decorator passes through anyway — but `storage` here is the undecorated backend regardless).
+    let boot_blob_scanner = migrate::StorageBlobScopeScanner::new(storage.clone());
+    let boot_blobs: Option<&dyn migrate::BlobScopeScanner> = Some(&boot_blob_scanner);
     match migrate::status(kv.as_ref()).await? {
         migrate::Status::Ready => {}
         migrate::Status::Dual => tracing::warn!(
@@ -1106,7 +1118,7 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
                 // Stage at boot (operator opt-in), BEFORE build_handler_runtime — honoring any armed
                 // console-wizard answers — and FAILURE-SAFE: never exits; on failure serves the
                 // existing layout via backward-read-compat. See `auto_migrate_on_boot`.
-                auto_migrate_on_boot(kv.as_ref()).await;
+                auto_migrate_on_boot(kv.as_ref(), boot_blobs).await;
             } else {
                 tracing::warn!(
                     "control-plane store is BELOW the current schema version — serving its EXISTING \
@@ -1116,7 +1128,7 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
                      migrate --abort`), then `boatramp migrate --finalize`. (`serve` without \
                      --auto-migrate never re-homes.)"
                 );
-                log_pending_migration_decisions(kv.as_ref()).await;
+                log_pending_migration_decisions(kv.as_ref(), boot_blobs).await;
             }
         }
     }
@@ -3485,6 +3497,10 @@ async fn run_cluster(
     // data-plane backward-read-compat decorators, so a rolling cluster upgrade is a no-op; the operator
     // re-homes deliberately with `boatramp migrate` (through Raft consensus — idempotent + re-verifying
     // — when they choose to). No founder/joiner can be bricked by a routine binary roll.
+    // Feature A: the DEFAULT-project blob scanner over the RAW global object backend (same as the
+    // single-node path), so the data-aware collision gate can prove a commingle has no blob footprint.
+    let boot_blob_scanner = migrate::StorageBlobScopeScanner::new(storage.clone());
+    let boot_blobs: Option<&dyn migrate::BlobScopeScanner> = Some(&boot_blob_scanner);
     match migrate::status(kv.as_ref()).await? {
         migrate::Status::Ready => {}
         migrate::Status::Dual => tracing::warn!(
@@ -3497,7 +3513,7 @@ async fn run_cluster(
                 // Stage through the cluster (Raft consensus; idempotent + re-verifying) on boot,
                 // honoring any armed console-wizard answers, FAILURE-SAFE (never exits). See
                 // `auto_migrate_on_boot`.
-                auto_migrate_on_boot(kv.as_ref()).await;
+                auto_migrate_on_boot(kv.as_ref(), boot_blobs).await;
             } else {
                 tracing::warn!(
                     "control-plane store is BELOW the current schema version — serving its EXISTING \
@@ -3505,7 +3521,7 @@ async fn run_cluster(
                      no-op. Re-home when ready: `boatramp migrate` (reversible with `--abort`) then \
                      `--finalize`."
                 );
-                log_pending_migration_decisions(kv.as_ref()).await;
+                log_pending_migration_decisions(kv.as_ref(), boot_blobs).await;
             }
         }
     }

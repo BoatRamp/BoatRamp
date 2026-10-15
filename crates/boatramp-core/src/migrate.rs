@@ -62,6 +62,86 @@ use crate::kv::{KvStore, WriteOp};
 use crate::project::{self, DEFAULT_PROJECT, DomainOwner, owner_kind};
 use crate::time::now_unix;
 
+/// The default-scope **blob** families — the object-store analogue of [`DEFAULT_SCOPE_FAMILIES`]: the
+/// guest object store (`hblob/`) + the two messaging-payload stores (`mqp/`, `mqgp/`). They live on
+/// the object backend (Tigris/S3/fs), NOT the control-plane KV, so the offline KV-only migration
+/// cannot scan them — a [`BlobScopeScanner`] injects that capability.
+pub const DEFAULT_SCOPE_BLOB_FAMILIES: &[&str] = &["hblob/", "mqp/", "mqgp/"];
+
+/// The distinct second-level scope segments a [`BlobScopeScanner`] found under one first scope segment
+/// across the [`DEFAULT_SCOPE_BLOB_FAMILIES`] — enough for [`default_scope_collisions`] to run the same
+/// tenant-attribution it runs on the KV families. `bare_marker` ⇒ a single-segment object
+/// `{family}{scope}` (no `/{seg}/…`) exists, which is the default resource's own.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BlobScopeSegments {
+    /// The `{seg}` values present in `{family}{scope}/{seg}/…` keys, across the blob families.
+    pub segments: HashSet<String>,
+    /// A bare single-segment object `{family}{scope}` exists (the default resource's own marker).
+    pub bare_marker: bool,
+}
+
+/// A host capability that lists the scope segments present in the [`DEFAULT_SCOPE_BLOB_FAMILIES`] on
+/// the object store. The migration's data-aware collision gate (feature A) needs to know whether a
+/// colliding default-project resource has any BLOB data under its bare scope, but blobs are on the
+/// object backend (Tigris/S3/fs) which the offline KV-only migration has no handle to. So the online
+/// callers (the `/api/store-migrate/*` admin API; `serve --auto-migrate` boot, when the backend is
+/// available) inject one; the offline `boatramp migrate` CLI passes `None`, which makes the blob
+/// dimension UNPROVABLE and so keeps a commingle BLOCKING (fail-closed). The scanner only LISTS — the
+/// tenant-attribution logic stays in [`default_scope_collisions`].
+#[async_trait]
+pub trait BlobScopeScanner: Send + Sync {
+    /// The second-level scope segments present under `scope` across the default-scope blob families
+    /// (see [`BlobScopeSegments`]). Errors propagate (a scan error ⇒ the gate fails closed).
+    async fn blob_scope_segments(&self, scope: &str) -> Result<BlobScopeSegments, MigrateError>;
+}
+
+/// The production [`BlobScopeScanner`]: lists one [`crate::Storage`] blob backend (the DEFAULT
+/// project's — `BlobBackends::backend(ProjectRef::DEFAULT)`). The online callers build one of these
+/// from the live node's blob backend; the offline CLI passes `None` instead. A `list` failure maps to
+/// [`MigrateError::BlobScan`] (fail-closed).
+pub struct StorageBlobScopeScanner {
+    backend: std::sync::Arc<dyn crate::Storage>,
+}
+
+impl StorageBlobScopeScanner {
+    /// Wrap the DEFAULT-project blob backend.
+    pub fn new(backend: std::sync::Arc<dyn crate::Storage>) -> Self {
+        Self { backend }
+    }
+}
+
+#[async_trait]
+impl BlobScopeScanner for StorageBlobScopeScanner {
+    async fn blob_scope_segments(&self, scope: &str) -> Result<BlobScopeSegments, MigrateError> {
+        let mut segments = HashSet::new();
+        let mut bare_marker = false;
+        for family in DEFAULT_SCOPE_BLOB_FAMILIES {
+            // A degenerate bare object `{family}{scope}` (no container) ⇒ the default resource's own.
+            if self.backend.head(&format!("{family}{scope}")).await.is_ok() {
+                bare_marker = true;
+            }
+            let prefix = format!("{family}{scope}/");
+            let objs = self
+                .backend
+                .list(&prefix)
+                .await
+                .map_err(|e| MigrateError::BlobScan(e.to_string()))?;
+            for obj in objs {
+                if let Some(rest) = obj.key.strip_prefix(&prefix) {
+                    let seg = rest.split('/').next().unwrap_or("");
+                    if !seg.is_empty() {
+                        segments.insert(seg.to_string());
+                    }
+                }
+            }
+        }
+        Ok(BlobScopeSegments {
+            segments,
+            bare_marker,
+        })
+    }
+}
+
 /// The global marker key recording the store's schema version + migration progress.
 pub const SCHEMA_KEY: &str = "schema/version";
 
@@ -377,6 +457,11 @@ pub enum MigrateError {
         /// The diverged staged keys that block a lossless abort.
         keys: Vec<String>,
     },
+    /// The injected [`BlobScopeScanner`] failed to list the object store while judging a commingle
+    /// collision's blob footprint (feature A). Fail-closed: the gate cannot prove the blob dimension
+    /// clean, so the pass errors rather than relaxing.
+    #[error("blob scope scan failed while classifying a default-scope collision: {0}")]
+    BlobScan(String),
 }
 
 /// Read the schema-version marker, tolerantly mapping the pre-mechanism marker shape.
@@ -442,10 +527,13 @@ async fn status_of(
 pub async fn migrate(
     kv: &dyn KvStore,
     opts: MigrateOptions,
+    blobs: Option<&dyn BlobScopeScanner>,
 ) -> Result<MigrationReport, MigrateError> {
     // Non-interactive: empty answers ⇒ a migration with an unresolved mandatory decision refuses
     // (its `precheck` sees no answer for the fork). The generic engine knows no migration specifics.
-    run(kv, opts, &MigrationAnswers::default(), &registry()).await
+    // `blobs` is the injected object-store scanner (feature A); `None` (the offline CLI) keeps a
+    // commingle blocking because its blob dimension can't be proven clean.
+    run(kv, opts, &MigrationAnswers::default(), blobs, &registry()).await
 }
 
 /// An operator's answers to the interactive migration's [`MigrationDecision`]s — a GENERIC map from
@@ -499,6 +587,7 @@ pub enum InteractiveOutcome {
 pub async fn migrate_with_answers(
     kv: &dyn KvStore,
     answers: &MigrationAnswers,
+    blobs: Option<&dyn BlobScopeScanner>,
 ) -> Result<InteractiveOutcome, MigrateError> {
     let report = run(
         kv,
@@ -507,6 +596,7 @@ pub async fn migrate_with_answers(
             finalize: false,
         },
         answers,
+        blobs,
         &registry(),
     )
     .await?;
@@ -555,7 +645,9 @@ pub async fn clear_armed_answers(kv: &dyn KvStore) -> Result<(), MigrateError> {
 /// Complete a store staged into the `dual` soak (and apply any pending forward): a
 /// one-shot pass that runs every deferred cleanup and flips to the current version.
 pub async fn finalize(kv: &dyn KvStore) -> Result<MigrationReport, MigrateError> {
-    migrate(kv, MigrateOptions::one_shot()).await
+    // Finalize runs the deferred cleanups of an ALREADY-staged store (version already advanced), so no
+    // pending forward migration's precheck/collision gate runs — the blob scanner is irrelevant here.
+    migrate(kv, MigrateOptions::one_shot(), None).await
 }
 
 /// **Abort** a store staged into the dual soak — roll it back to its exact pre-forward bytes, the
@@ -630,6 +722,7 @@ async fn run(
     kv: &dyn KvStore,
     opts: MigrateOptions,
     answers: &MigrationAnswers,
+    blobs: Option<&dyn BlobScopeScanner>,
     migrations: &[Box<dyn Migration>],
 ) -> Result<MigrationReport, MigrateError> {
     let mut state = read_state(kv).await?;
@@ -662,7 +755,7 @@ async fn run(
     // armed answers are replayed (so a legitimately-resolved collision still passes); a plain
     // `migrate` resume with no answers refuses fail-closed (the operator re-runs `--interactive`).
     for m in migrations.iter().filter(|m| m.version() > state.version) {
-        match m.precheck(kv, answers).await? {
+        match m.precheck(kv, blobs, answers).await? {
             Precheck::Proceed => {}
             Precheck::Aborted => {
                 report.aborted = true;
@@ -875,7 +968,15 @@ trait Migration: Send + Sync {
     /// complete, given the store's current (pre-forward) state. The generic [`plan`] aggregates these
     /// across the pending migrations; each is rendered by the CLI prompt loop / console wizard, and the
     /// operator's choice comes back in [`MigrationAnswers`]. Default: none.
-    async fn decisions(&self, _kv: &dyn KvStore) -> Result<Vec<MigrationDecision>, MigrateError> {
+    ///
+    /// `_blobs` is an optional injected host capability (an object-store [`BlobScopeScanner`]) a
+    /// migration MAY use to inspect blob-family state the offline KV engine can't see; it is generic
+    /// capability plumbing (the engine neither inspects nor requires it), and the default ignores it.
+    async fn decisions(
+        &self,
+        _kv: &dyn KvStore,
+        _blobs: Option<&dyn BlobScopeScanner>,
+    ) -> Result<Vec<MigrationDecision>, MigrateError> {
         Ok(Vec::new())
     }
 
@@ -891,9 +992,12 @@ trait Migration: Send + Sync {
     /// data-plane forward never mutates); never against data-plane state the forward is actively
     /// rewriting (which would read as half-done on resume). A guard that cannot meet this contract must
     /// be redesigned, not skipped — skipping on resume re-opens any window a collision can appear in.
+    /// `_blobs`: the same optional injected object-store [`BlobScopeScanner`] as [`decisions`]
+    /// (generic capability plumbing; the default ignores it).
     async fn precheck(
         &self,
         _kv: &dyn KvStore,
+        _blobs: Option<&dyn BlobScopeScanner>,
         _answers: &MigrationAnswers,
     ) -> Result<Precheck, MigrateError> {
         Ok(Precheck::Proceed)
@@ -1073,9 +1177,14 @@ impl Migration for DefaultScopeRehomeV2 {
 
     // ---- this migration's OWN interactive decisions + answer interpretation (Finding 8) ----------
 
-    async fn decisions(&self, kv: &dyn KvStore) -> Result<Vec<MigrationDecision>, MigrateError> {
-        // One decision per pre-forward scope collision — rename / skip / abort.
-        Ok(default_scope_collisions(kv)
+    async fn decisions(
+        &self,
+        kv: &dyn KvStore,
+        blobs: Option<&dyn BlobScopeScanner>,
+    ) -> Result<Vec<MigrationDecision>, MigrateError> {
+        // One decision per pre-forward scope collision — rename / skip / abort. The data-aware gate
+        // (feature A) inside `default_scope_collisions` uses `blobs` to clear a no-data-plane commingle.
+        Ok(default_scope_collisions(kv, blobs)
             .await?
             .into_iter()
             .map(collision_decision)
@@ -1085,16 +1194,18 @@ impl Migration for DefaultScopeRehomeV2 {
     async fn precheck(
         &self,
         kv: &dyn KvStore,
+        blobs: Option<&dyn BlobScopeScanner>,
         answers: &MigrationAnswers,
     ) -> Result<Precheck, MigrateError> {
-        // Re-scan the collisions (pre-forward; the engine skips precheck on resume) and interpret the
+        // Re-scan the collisions (pre-forward; valid mid-resume — control-plane only) and interpret the
         // operator's answer for each. A `rename` is resolved by the collision being GONE from this scan
         // (the operator re-created the resource externally), so a collision STILL present answered
         // anything other than a safe `skip` is unresolved — refuse fail-closed, naming it. Any decision
-        // answered `abort` cancels the whole pass.
+        // answered `abort` cancels the whole pass. (A data-bearing-free commingle is already dropped by
+        // the feature-A gate in `default_scope_collisions`, so it never reaches here.)
         let mut unresolved = Vec::new();
         let mut aborting = false;
-        for c in default_scope_collisions(kv).await? {
+        for c in default_scope_collisions(kv, blobs).await? {
             let id = format!("collision:{}/{}", c.kind, c.name);
             match answers.route(&id) {
                 Some("abort") => aborting = true,
@@ -1150,7 +1261,9 @@ pub(crate) async fn known_projects(kv: &dyn KvStore) -> Result<HashSet<String>, 
 pub async fn default_scope_premigration_conflicts(
     kv: &dyn KvStore,
 ) -> Result<Vec<String>, MigrateError> {
-    Ok(default_scope_collisions(kv)
+    // No blob scanner here (a KV-only call site) ⇒ the data-aware gate treats every commingle as
+    // blocking (conservative), which is the correct behavior for this string-refusal view.
+    Ok(default_scope_collisions(kv, None)
         .await?
         .iter()
         .map(DefaultScopeCollision::describe)
@@ -1209,12 +1322,174 @@ impl DefaultScopeCollision {
     }
 }
 
+/// The handler `imports` tokens (a subset of [`crate::config::known_imports`]) that let a site's guest
+/// code write a bare **KV / messaging** key under its own scope — `wasi:keyvalue` → `hkv/`,
+/// `wasi:messaging` → `mq*/`. This set is the COINCIDENCE BACKSTOP for the KV/mq dimension of the
+/// data-aware gate (feature A / Security HIGH-A1): a site whose ceiling permits one of these could have
+/// written a `{family}{site}/{seg}/…` key whose `{seg}` coincidentally equals a tenant site name,
+/// defeating [`scope_has_unattributable_kv`]'s attribution — so such a site is kept blocking. It is
+/// SOUND as a KV/mq signal because no HOST path writes `hkv/{site}/…` / `mq*/{site}/…` without the
+/// guest importing the capability. It is deliberately NOT used for blobs: S3/object INGRESS lands
+/// `hblob/{site}/…` with no `allow_imports` consultation, so the ceiling is not a sound blob guard —
+/// blobs are checked authoritatively by an injected [`BlobScopeScanner`] instead.
+const KV_MESSAGING_IMPORTS: &[&str] = &["wasi:keyvalue", "wasi:messaging"];
+
+/// The TENANT project `name`'s own second-level scope segments: its site names (`project/{name}/site/*`)
+/// plus the reserved scope-prefix literals ([`project::RESERVED_SCOPE_PREFIXES`] = `fn`/`bus`). A
+/// data-plane key `{family}{name}/{seg}/…` whose `{seg}` is in this set is the tenant's; anything else
+/// (or a bare single-segment marker) is a possible DEFAULT-side key. Shared by the KV/mq + blob scans.
+async fn tenant_segments(kv: &dyn KvStore, name: &str) -> Result<HashSet<String>, MigrateError> {
+    let mut segs: HashSet<String> = HashSet::new();
+    let prefix = format!("project/{name}/site/");
+    for key in kv.list_prefix(&prefix).await? {
+        if let Some(rest) = key.strip_prefix(&prefix) {
+            let seg = rest.split('/').next().unwrap_or("");
+            if !seg.is_empty() {
+                segs.insert(seg.to_string());
+            }
+        }
+    }
+    for p in project::RESERVED_SCOPE_PREFIXES {
+        segs.insert((*p).to_string());
+    }
+    Ok(segs)
+}
+
+/// Whether the DEFAULT-project SITE `site`'s handler-capability ceiling permits a KV/messaging
+/// capability — i.e. a handler on it *could* have written a bare `hkv/{site}/…` / `mq*/{site}/…` key
+/// (`SiteConfig.handlers.allow_imports`; only this site's handlers write under scope `site`, since a
+/// top-level function scopes to `fn/<name>`). `None`/disabled handlers ⇒ no guest code ran ⇒ `false`.
+/// A ceiling naming any [`KV_MESSAGING_IMPORTS`] token ⇒ `true` (the KV/mq coincidence backstop — see
+/// that const). FAIL-CLOSED: an absent pointer, a dangling/unparseable config ⇒ `true`. (Blobs are NOT
+/// judged here — the ceiling cannot see object ingress; [`scope_has_unattributable_blob`] covers them.)
+async fn site_ceiling_permits_kv_mq(kv: &dyn KvStore, site: &str) -> Result<bool, MigrateError> {
+    // Resolve the config-blob hash via the site pointer (v1+ `project/default/site/<site>`, or the
+    // pre-v1 flat `site/<site>`).
+    let mut hash = None;
+    for ptr in [
+        format!("project/{DEFAULT_PROJECT}/site/{site}"),
+        format!("site/{site}"),
+    ] {
+        if let Some(bytes) = kv.get(&ptr).await? {
+            hash = Some(String::from_utf8_lossy(&bytes).into_owned());
+            break;
+        }
+    }
+    let Some(hash) = hash else {
+        return Ok(true); // the pointer the scan saw is gone from under us → fail-closed
+    };
+    let Some(body) = kv.get(&format!("siteconfig/{hash}")).await? else {
+        return Ok(true); // dangling config body → fail-closed
+    };
+    match crate::config::SiteConfig::from_json(&body) {
+        Ok(cfg) => match &cfg.handlers {
+            // Handlers disabled for the site ⇒ no guest code ran ⇒ no KV/mq writes.
+            None => Ok(false),
+            Some(h) if !h.enabled => Ok(false),
+            // The ceiling permits a KV/mq capability ⇒ a handler could have written such a key.
+            Some(h) => Ok(h
+                .allow_imports
+                .iter()
+                .any(|i| KV_MESSAGING_IMPORTS.contains(&i.as_str()))),
+        },
+        Err(_) => Ok(true), // unparseable config → fail-closed
+    }
+}
+
+/// Whether any bare KV/messaging key under scope `name` is NOT attributable to the TENANT project
+/// `name` (`tenant_segs` from [`tenant_segments`]) — a possible DEFAULT-side key the re-home would
+/// strand. Catches leftover data from a *historically-dropped* capability the current ceiling no longer
+/// shows. Scans the families the offline KV engine can read — `hkv/` + every `mq*/` in
+/// [`DEFAULT_SCOPE_FAMILIES`]. A key is the tenant's when it is `{family}{name}/{seg}/…` with `{seg}` ∈
+/// `tenant_segs`; a bare single-segment marker `{family}{name}` or any other `{seg}` is a possible
+/// DEFAULT-side key ⇒ `true`.
+async fn scope_has_unattributable_kv(
+    kv: &dyn KvStore,
+    name: &str,
+    tenant_segs: &HashSet<String>,
+) -> Result<bool, MigrateError> {
+    for family in DEFAULT_SCOPE_FAMILIES {
+        // A bare single-segment marker (`mqpause/{name}`, …) is the default resource's own.
+        if kv.get(&format!("{family}{name}")).await?.is_some() {
+            return Ok(true);
+        }
+        let prefix = format!("{family}{name}/");
+        for key in kv.list_prefix(&prefix).await? {
+            let Some(rest) = key.strip_prefix(&prefix) else {
+                continue;
+            };
+            let seg = rest.split('/').next().unwrap_or("");
+            if seg.is_empty() || !tenant_segs.contains(seg) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Whether any BLOB key under scope `name` (across [`DEFAULT_SCOPE_BLOB_FAMILIES`]) is NOT attributable
+/// to the TENANT project `name` — the AUTHORITATIVE blob guard (Security HIGH-A1). Object INGRESS
+/// (`hblob/{site}/…`) is written with no `allow_imports` consultation, so the ceiling cannot judge
+/// blobs; only listing the object store can. The `scanner` lists the second-level segments present;
+/// this applies the SAME attribution as [`scope_has_unattributable_kv`] (a `{seg}` ∈ `tenant_segs` is
+/// the tenant's; a bare marker or any other `{seg}` is a possible DEFAULT-side blob ⇒ `true`).
+async fn scope_has_unattributable_blob(
+    scanner: &dyn BlobScopeScanner,
+    name: &str,
+    tenant_segs: &HashSet<String>,
+) -> Result<bool, MigrateError> {
+    let found = scanner.blob_scope_segments(name).await?;
+    if found.bare_marker {
+        return Ok(true);
+    }
+    Ok(found.segments.iter().any(|seg| !tenant_segs.contains(seg)))
+}
+
+/// Whether a `CommingleProject` collision on default-project `kind`/`name` is DATA-BEARING — i.e. the
+/// re-home could strand real default-side bytes under the tenant-readable `{name}/…` prefix (so it must
+/// stay BLOCKING). It is NON-data-bearing (relaxable) ONLY when ALL hold, else `true` (fail-closed):
+///   - `kind == "site"` (a `compute` resource — whose capability/keyspace the offline KV engine can't
+///     cheaply judge — always blocks);
+///   - no unattributable KV/messaging key ([`scope_has_unattributable_kv`]);
+///   - the site's ceiling permits NEITHER KV nor messaging ([`site_ceiling_permits_kv_mq`] — the KV/mq
+///     coincidence backstop); and
+///   - a `BlobScopeScanner` is present AND reports no unattributable blob
+///     ([`scope_has_unattributable_blob`]). `blobs == None` (the offline CLI) ⇒ the blob dimension is
+///     unprovable ⇒ `true` (block). This is the Security HIGH-A1 fix: blobs are guarded by LISTING the
+///     object store, never by the capability ceiling (ingress bypasses `allow_imports`).
+async fn commingle_is_data_bearing(
+    kv: &dyn KvStore,
+    blobs: Option<&dyn BlobScopeScanner>,
+    kind: &str,
+    name: &str,
+) -> Result<bool, MigrateError> {
+    if kind != "site" {
+        return Ok(true); // compute (or anything non-site) → fail-closed
+    }
+    let tenant = tenant_segments(kv, name).await?;
+    // (a) Leftover KV/messaging data not attributable to the tenant.
+    if scope_has_unattributable_kv(kv, name, &tenant).await? {
+        return Ok(true);
+    }
+    // (b) KV/mq coincidence backstop: a KV/mq-capable ceiling could hide a key under a coinciding seg.
+    if site_ceiling_permits_kv_mq(kv, name).await? {
+        return Ok(true);
+    }
+    // (c) Blobs — authoritative object-store scan; absent scanner ⇒ unprovable ⇒ block.
+    match blobs {
+        None => Ok(true),
+        Some(scanner) => scope_has_unattributable_blob(scanner, name, &tenant).await,
+    }
+}
+
 /// Pre-forward conflict scan, STRUCTURED (the source of [`default_scope_premigration_conflicts`]).
 /// Scans the control-plane `site`/`compute` pointers of the default project (both the v1+
 /// `project/default/<kind>/<name>` and the pre-v1 flat `<kind>/<name>` shapes) and classifies each
-/// name that is `default` or a known tenant project. Sorted, de-duplicated.
+/// name that is `default` or a known tenant project. A `CommingleProject` collision is kept only when
+/// it is data-bearing (see [`commingle_is_data_bearing`] — feature A, fail-closed). Sorted, de-duped.
 pub async fn default_scope_collisions(
     kv: &dyn KvStore,
+    blobs: Option<&dyn BlobScopeScanner>,
 ) -> Result<Vec<DefaultScopeCollision>, MigrateError> {
     let projects = known_projects(kv).await?; // includes the reserved `default`
     let mut out = Vec::new();
@@ -1240,6 +1515,21 @@ pub async fn default_scope_collisions(
                     None
                 };
                 if let Some(reason) = reason {
+                    // DATA-AWARE gate (feature A): a `CommingleProject` collision is only BLOCKING when
+                    // the colliding default resource could actually hold commingling data-plane data.
+                    // If it provably has NONE — no handler data-plane capability AND no leftover
+                    // KV/messaging key that isn't the tenant's — the re-home can proceed: the forward
+                    // already leaves the tenant's `{name}/…` keys untouched (a known project), there is
+                    // nothing of the default resource's to strand, and post-v2 the default resource
+                    // writes to the disjoint `default/{name}/…`. Fail-closed (`commingle_is_data_bearing`
+                    // returns `true` on any uncertainty — a compute resource, an unreadable config, an
+                    // unattributable key). `NamedDefault` is unaffected (its own skip route handles it);
+                    // `ReservedScopePrefix` (`fn`/`bus`) is emitted separately below and never relaxed.
+                    if reason == CollisionReason::CommingleProject
+                        && !commingle_is_data_bearing(kv, blobs, kind, name).await?
+                    {
+                        continue;
+                    }
                     out.push(DefaultScopeCollision {
                         kind: kind.to_string(),
                         name: name.to_string(),
@@ -1359,15 +1649,19 @@ pub struct MigrationPlan {
 /// [`Migration::decisions`] (the engine embeds none itself). Writes NOTHING. When any decision is
 /// pending the dry-run summary is skipped (the engine refuses to stage until the operator resolves
 /// them, so there is no clean forward to preview yet).
-pub async fn plan(kv: &dyn KvStore) -> Result<MigrationPlan, MigrateError> {
+pub async fn plan(
+    kv: &dyn KvStore,
+    blobs: Option<&dyn BlobScopeScanner>,
+) -> Result<MigrationPlan, MigrateError> {
     let state = read_state(kv).await?;
     let status = status(kv).await?;
     let migrations = registry();
 
-    // Each pending migration contributes its own operator-answerable forks.
+    // Each pending migration contributes its own operator-answerable forks (feature A's data-aware
+    // gate uses `blobs` to clear a no-data-plane commingle; `None` ⇒ every commingle surfaces).
     let mut decisions: Vec<MigrationDecision> = Vec::new();
     for m in migrations.iter().filter(|m| m.version() > state.version) {
-        decisions.extend(m.decisions(kv).await?);
+        decisions.extend(m.decisions(kv, blobs).await?);
     }
 
     let mut summary = Vec::new();
@@ -1381,6 +1675,7 @@ pub async fn plan(kv: &dyn KvStore) -> Result<MigrationPlan, MigrateError> {
                     finalize: false,
                 },
                 &MigrationAnswers::default(),
+                blobs,
                 &migrations,
             )
             .await?;
@@ -1979,7 +2274,9 @@ mod tests {
         seed_legacy(&legacy).await;
         assert_eq!(status(&legacy).await.unwrap(), Status::NeedsMigration);
 
-        migrate(&legacy, MigrateOptions::one_shot()).await.unwrap();
+        migrate(&legacy, MigrateOptions::one_shot(), None)
+            .await
+            .unwrap();
         assert_eq!(status(&legacy).await.unwrap(), Status::Ready);
         // The version advanced + is recorded in history.
         let state = read_state(&legacy).await.unwrap();
@@ -1991,7 +2288,9 @@ mod tests {
     async fn migrate_rekeys_mutable_families_and_rewrites_domain_values() {
         let kv = MemoryKv::new();
         seed_legacy(&kv).await;
-        let report = migrate(&kv, MigrateOptions::one_shot()).await.unwrap();
+        let report = migrate(&kv, MigrateOptions::one_shot(), None)
+            .await
+            .unwrap();
 
         assert_eq!(
             kv.get("project/default/current/blog")
@@ -2069,11 +2368,15 @@ mod tests {
     async fn migrate_is_idempotent() {
         let kv = MemoryKv::new();
         seed_legacy(&kv).await;
-        let first = migrate(&kv, MigrateOptions::one_shot()).await.unwrap();
+        let first = migrate(&kv, MigrateOptions::one_shot(), None)
+            .await
+            .unwrap();
         assert!(first.total_rekeyed() > 0);
 
         let before: Vec<String> = kv.list_prefix("project/").await.unwrap();
-        let second = migrate(&kv, MigrateOptions::one_shot()).await.unwrap();
+        let second = migrate(&kv, MigrateOptions::one_shot(), None)
+            .await
+            .unwrap();
         assert!(second.already_migrated);
         assert_eq!(second.total_rekeyed(), 0);
         assert_eq!(kv.list_prefix("project/").await.unwrap(), before);
@@ -2089,6 +2392,7 @@ mod tests {
                 dry_run: true,
                 finalize: true,
             },
+            None,
         )
         .await
         .unwrap();
@@ -2117,6 +2421,7 @@ mod tests {
                 dry_run: false,
                 finalize: false,
             },
+            None,
         )
         .await
         .unwrap();
@@ -2168,7 +2473,9 @@ mod tests {
         };
         persist_state(&kv, &partial).await.unwrap();
 
-        migrate(&kv, MigrateOptions::one_shot()).await.unwrap();
+        migrate(&kv, MigrateOptions::one_shot(), None)
+            .await
+            .unwrap();
         assert_eq!(status(&kv).await.unwrap(), Status::Ready);
         assert_eq!(
             kv.get("project/default/compute/api")
@@ -2320,7 +2627,9 @@ mod tests {
         seed_default_scope(&kv).await;
         assert_eq!(status(&kv).await.unwrap(), Status::NeedsMigration);
 
-        let report = migrate(&kv, MigrateOptions::one_shot()).await.unwrap();
+        let report = migrate(&kv, MigrateOptions::one_shot(), None)
+            .await
+            .unwrap();
         assert!(report.total_rekeyed() > 0);
 
         // Every bare default-scoped key re-homed under `default/…`, old key gone (one-shot).
@@ -2376,10 +2685,14 @@ mod tests {
     async fn default_scope_rehome_is_idempotent() {
         let kv = MemoryKv::new();
         seed_default_scope(&kv).await;
-        migrate(&kv, MigrateOptions::one_shot()).await.unwrap();
+        migrate(&kv, MigrateOptions::one_shot(), None)
+            .await
+            .unwrap();
         let before = kv.list_prefix("").await.unwrap();
 
-        let again = migrate(&kv, MigrateOptions::one_shot()).await.unwrap();
+        let again = migrate(&kv, MigrateOptions::one_shot(), None)
+            .await
+            .unwrap();
         assert!(again.already_migrated);
         assert_eq!(again.total_rekeyed(), 0);
         // No double-nesting, no new keys, nothing moved.
@@ -2412,6 +2725,7 @@ mod tests {
                 dry_run: false,
                 finalize: false,
             },
+            None,
         )
         .await;
         assert!(
@@ -2441,6 +2755,7 @@ mod tests {
                 dry_run: false,
                 finalize: false,
             },
+            None,
         )
         .await
         .unwrap();
@@ -2493,6 +2808,7 @@ mod tests {
                 dry_run: false,
                 finalize: false,
             },
+            None,
         )
         .await;
         assert!(
@@ -2532,6 +2848,7 @@ mod tests {
                     dry_run: false,
                     finalize: false,
                 },
+                None,
             )
             .await;
             assert!(
@@ -2545,7 +2862,7 @@ mod tests {
             );
 
             // The interactive plan surfaces it as rename/abort (no skip — not auto-splittable).
-            let p = plan(&kv).await.unwrap();
+            let p = plan(&kv, None).await.unwrap();
             let d = p
                 .decisions
                 .iter()
@@ -2558,6 +2875,198 @@ mod tests {
                 "a reserved-prefix collision is rename-or-abort only (`{prefix}`)"
             );
         }
+    }
+
+    /// Seed a DEFAULT-project site `site` (the colliding resource) with a stored `SiteConfig`: its
+    /// handler-capability ceiling is `handlers` (`None` ⇒ handlers disabled). Backs feature-A tests.
+    async fn seed_default_site_config(kv: &MemoryKv, site: &str, handlers: Option<&[&str]>) {
+        let hcfg = handlers.map(|imports| crate::config::HandlersSiteConfig {
+            enabled: true,
+            allow_imports: imports.iter().copied().map(String::from).collect(),
+            ..Default::default()
+        });
+        let cfg = crate::config::SiteConfig {
+            handlers: hcfg,
+            ..Default::default()
+        };
+        let hash = format!("cfg-{site}");
+        kv.put(
+            &format!("siteconfig/{hash}"),
+            serde_json::to_vec(&cfg).unwrap(),
+        )
+        .await
+        .unwrap();
+        kv.put(&format!("project/default/site/{site}"), hash.into_bytes())
+            .await
+            .unwrap();
+    }
+
+    /// A test-double [`BlobScopeScanner`] returning a fixed segment set for any scope.
+    struct FakeBlobScanner {
+        segments: Vec<&'static str>,
+        bare_marker: bool,
+    }
+    #[async_trait]
+    impl BlobScopeScanner for FakeBlobScanner {
+        async fn blob_scope_segments(
+            &self,
+            _scope: &str,
+        ) -> Result<BlobScopeSegments, MigrateError> {
+            Ok(BlobScopeSegments {
+                segments: self.segments.iter().copied().map(String::from).collect(),
+                bare_marker: self.bare_marker,
+            })
+        }
+    }
+    /// A scanner reporting the given second-level blob segments (and no bare marker).
+    fn blob_scanner(segments: &[&'static str]) -> FakeBlobScanner {
+        FakeBlobScanner {
+            segments: segments.to_vec(),
+            bare_marker: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn commingle_with_no_data_plane_footprint_is_non_blocking_and_proceeds() {
+        // Feature A (the construens shape): a DEFAULT-project site named like tenant project `acme`,
+        // whose handler ceiling grants no KV/mq capability, whose scope holds no unattributable KV/mq
+        // key, AND whose blobs (per the injected scanner) are all the tenant's, is NON-blocking — the
+        // re-home proceeds, leaving the tenant's keyspace untouched.
+        let kv = MemoryKv::new();
+        seed_default_scope(&kv).await; // bare default data + tenant project `acme` (hkv/acme/shop/…)
+        kv.put("project/acme/site/shop", b"ht".to_vec()) // make tenant acme's site `shop` attributable
+            .await
+            .unwrap();
+        seed_default_site_config(&kv, "acme", Some(&["wasi:http", "wasi:io"])).await;
+        // The object store holds only the tenant's own blobs (`hblob/acme/shop/…`).
+        let scanner = blob_scanner(&["shop"]);
+
+        let cols = default_scope_collisions(&kv, Some(&scanner)).await.unwrap();
+        assert!(
+            !cols.iter().any(|c| c.kind == "site" && c.name == "acme"),
+            "a no-data-plane site commingle must be relaxed to non-blocking, got {cols:?}"
+        );
+
+        let out = migrate(
+            &kv,
+            MigrateOptions {
+                dry_run: false,
+                finalize: false,
+            },
+            Some(&scanner),
+        )
+        .await
+        .unwrap();
+        assert!(out.dual, "the re-home staged");
+        assert_eq!(
+            kv.get("hkv/acme/shop/counter").await.unwrap().as_deref(),
+            Some(&b"42"[..]),
+            "the tenant project acme's keyspace is untouched"
+        );
+        assert!(
+            kv.get("hkv/default/blog/counter").await.unwrap().is_some(),
+            "the non-colliding default data re-homed"
+        );
+    }
+
+    #[tokio::test]
+    async fn commingle_with_a_data_plane_capability_still_blocks() {
+        // A site whose ceiling PERMITS a KV capability (`wasi:keyvalue`) could have written commingling
+        // data (defeating the KV attribution via a coinciding segment) → must stay BLOCKING (M-1), even
+        // with a clean blob scanner.
+        let kv = MemoryKv::new();
+        seed_default_scope(&kv).await;
+        kv.put("project/acme/site/shop", b"ht".to_vec())
+            .await
+            .unwrap();
+        seed_default_site_config(&kv, "acme", Some(&["wasi:http", "wasi:keyvalue"])).await;
+        let scanner = blob_scanner(&["shop"]); // blobs clean — the block is on the KV/mq ceiling
+
+        let cols = default_scope_collisions(&kv, Some(&scanner)).await.unwrap();
+        assert!(
+            cols.iter().any(|c| c.kind == "site"
+                && c.name == "acme"
+                && c.reason == CollisionReason::CommingleProject),
+            "a KV/mq-capable site commingle must stay blocking, got {cols:?}"
+        );
+        assert!(
+            matches!(
+                migrate(
+                    &kv,
+                    MigrateOptions {
+                        dry_run: false,
+                        finalize: false,
+                    },
+                    Some(&scanner),
+                )
+                .await,
+                Err(MigrateError::DefaultNamedResource { .. })
+            ),
+            "the migration refuses a data-bearing commingle"
+        );
+    }
+
+    #[tokio::test]
+    async fn commingle_with_unattributable_leftover_kv_still_blocks() {
+        // Ceiling now HTTP-only + clean blobs, BUT a leftover default-side KV key remains under a second
+        // segment that is NOT a tenant site → unattributable → must stay BLOCKING (covers a
+        // historically-dropped KV capability the ceiling no longer shows).
+        let kv = MemoryKv::new();
+        seed_default_scope(&kv).await;
+        kv.put("project/acme/site/shop", b"ht".to_vec())
+            .await
+            .unwrap();
+        seed_default_site_config(&kv, "acme", Some(&["wasi:http"])).await;
+        kv.put("hkv/acme/ghost/key", b"leftover".to_vec())
+            .await
+            .unwrap();
+        let scanner = blob_scanner(&["shop"]);
+
+        let cols = default_scope_collisions(&kv, Some(&scanner)).await.unwrap();
+        assert!(
+            cols.iter().any(|c| c.kind == "site" && c.name == "acme"),
+            "an unattributable leftover KV key keeps the commingle blocking, got {cols:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn commingle_with_unattributable_blob_still_blocks() {
+        // Security HIGH-A1: KV + ceiling provably clean, BUT the object store holds a blob under a
+        // segment that is NOT a tenant site (an S3 ingress object the ceiling can't see) → the
+        // authoritative blob scan must keep the commingle BLOCKING.
+        let kv = MemoryKv::new();
+        seed_default_scope(&kv).await;
+        kv.put("project/acme/site/shop", b"ht".to_vec())
+            .await
+            .unwrap();
+        seed_default_site_config(&kv, "acme", Some(&["wasi:http"])).await;
+        // `hblob/acme/ghost/…` — a default-side ingress blob under a non-tenant segment.
+        let scanner = blob_scanner(&["ghost"]);
+
+        let cols = default_scope_collisions(&kv, Some(&scanner)).await.unwrap();
+        assert!(
+            cols.iter().any(|c| c.kind == "site" && c.name == "acme"),
+            "an unattributable blob keeps the commingle blocking, got {cols:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn commingle_offline_without_a_blob_scanner_blocks() {
+        // Even with KV + ceiling provably clean, the OFFLINE path (`blobs = None`, e.g. `boatramp
+        // migrate` CLI) can't prove the blob dimension clean ⇒ the commingle stays BLOCKING. The
+        // data-aware relaxation is thus online/wizard-only.
+        let kv = MemoryKv::new();
+        seed_default_scope(&kv).await;
+        kv.put("project/acme/site/shop", b"ht".to_vec())
+            .await
+            .unwrap();
+        seed_default_site_config(&kv, "acme", Some(&["wasi:http", "wasi:io"])).await;
+
+        let cols = default_scope_collisions(&kv, None).await.unwrap();
+        assert!(
+            cols.iter().any(|c| c.kind == "site" && c.name == "acme"),
+            "offline (no blob scanner) must keep a commingle blocking, got {cols:?}"
+        );
     }
 
     /// Snapshot every DATA key (everything except the migration's own `schema/` bookkeeping), so an
@@ -2590,6 +3099,7 @@ mod tests {
                 dry_run: false,
                 finalize: false,
             },
+            None,
         )
         .await
         .unwrap();
@@ -2630,6 +3140,7 @@ mod tests {
                 dry_run: false,
                 finalize: false,
             },
+            None,
         )
         .await
         .unwrap();
@@ -2686,7 +3197,7 @@ mod tests {
     async fn plan_surfaces_a_clean_migration_without_decisions() {
         let kv = MemoryKv::new();
         seed_default_scope(&kv).await; // bare default data + tenant acme, no colliding resource
-        let p = plan(&kv).await.unwrap();
+        let p = plan(&kv, None).await.unwrap();
         assert_eq!(p.status, Status::NeedsMigration);
         assert_eq!(p.current_version, 1);
         assert_eq!(p.target_version, CURRENT_VERSION);
@@ -2706,7 +3217,7 @@ mod tests {
         kv.put("project/default/compute/acme", b"spec".to_vec())
             .await
             .unwrap();
-        let p = plan(&kv).await.unwrap();
+        let p = plan(&kv, None).await.unwrap();
         assert_eq!(p.decisions.len(), 1, "exactly the one collision");
         let d = &p.decisions[0];
         assert_eq!(d.id, "collision:compute/acme");
@@ -2762,7 +3273,7 @@ mod tests {
         // (1) No answers → the collision is unresolved → refuses fail-closed (driver re-prompts).
         let kv = seed().await;
         assert!(matches!(
-            migrate_with_answers(&kv, &MigrationAnswers::default()).await,
+            migrate_with_answers(&kv, &MigrationAnswers::default(), None).await,
             Err(MigrateError::DefaultNamedResource { .. })
         ));
         assert_eq!(read_state(&kv).await.unwrap().version, 1, "nothing staged");
@@ -2770,7 +3281,7 @@ mod tests {
         // (2) Operator aborts at the collision → no-op, store untouched.
         let kv = seed().await;
         assert_eq!(
-            migrate_with_answers(&kv, &answer("collision:compute/acme", "abort"))
+            migrate_with_answers(&kv, &answer("collision:compute/acme", "abort"), None)
                 .await
                 .unwrap(),
             InteractiveOutcome::Aborted
@@ -2783,7 +3294,7 @@ mod tests {
         let kv = seed().await;
         assert!(
             matches!(
-                migrate_with_answers(&kv, &answer("collision:compute/acme", "skip")).await,
+                migrate_with_answers(&kv, &answer("collision:compute/acme", "skip"), None).await,
                 Err(MigrateError::DefaultNamedResource { .. })
             ),
             "a commingle skip must NOT be honored"
@@ -2797,7 +3308,7 @@ mod tests {
         kv.put("project/default/site/default", b"cfg".to_vec())
             .await
             .unwrap();
-        let out = migrate_with_answers(&kv, &answer("collision:site/default", "skip"))
+        let out = migrate_with_answers(&kv, &answer("collision:site/default", "skip"), None)
             .await
             .unwrap();
         assert!(matches!(out, InteractiveOutcome::Staged(_)));
@@ -2825,6 +3336,7 @@ mod tests {
                 dry_run: false,
                 finalize: false,
             },
+            None,
         )
         .await
         .unwrap();
@@ -2879,6 +3391,7 @@ mod tests {
                 dry_run: false,
                 finalize: false,
             },
+            None,
         )
         .await
         .unwrap();
@@ -2916,7 +3429,9 @@ mod tests {
         .await
         .unwrap();
 
-        let report = migrate(&kv, MigrateOptions::one_shot()).await.unwrap();
+        let report = migrate(&kv, MigrateOptions::one_shot(), None)
+            .await
+            .unwrap();
         assert!(!report.dual, "no bare default keys ⇒ no dual soak");
         assert_eq!(report.total_rekeyed(), 0);
         assert_eq!(read_state(&kv).await.unwrap().version, 2);
@@ -2952,7 +3467,7 @@ mod tests {
         let conflicts = default_scope_premigration_conflicts(&kv).await.unwrap();
         assert_eq!(conflicts.len(), 1, "a site named `default` is a conflict");
         assert!(conflicts[0].contains("site/default"));
-        let err = migrate(&kv, MigrateOptions::one_shot()).await;
+        let err = migrate(&kv, MigrateOptions::one_shot(), None).await;
         assert!(
             matches!(err, Err(MigrateError::DefaultNamedResource { .. })),
             "the re-home must refuse a default-named resource, got {err:?}"
@@ -2985,7 +3500,7 @@ mod tests {
             "a default compute named like project `acme` must surface as commingling: {conflicts:?}"
         );
         assert!(matches!(
-            migrate(&kv, MigrateOptions::one_shot()).await,
+            migrate(&kv, MigrateOptions::one_shot(), None).await,
             Err(MigrateError::DefaultNamedResource { .. })
         ));
     }
@@ -3047,6 +3562,7 @@ mod tests {
             &kv,
             MigrateOptions::one_shot(),
             &MigrationAnswers::default(),
+            None,
             &chain(),
         )
         .await
@@ -3075,6 +3591,7 @@ mod tests {
             &kv,
             MigrateOptions::one_shot(),
             &MigrationAnswers::default(),
+            None,
             &chain(),
         )
         .await
@@ -3104,6 +3621,7 @@ mod tests {
             &kv,
             MigrateOptions::one_shot(),
             &MigrationAnswers::default(),
+            None,
             &chain(),
         )
         .await
