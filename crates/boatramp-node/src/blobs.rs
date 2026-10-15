@@ -135,18 +135,60 @@ impl boatramp_core::blob_backends::BlobBackends for DefaultScopeFallbackBackends
     }
 }
 
-/// If the control-plane store `kv` is in the **default-scope migration's `dual` soak** (its forward
-/// re-key has run but the destructive finalize is deferred), wrap `inner` so every `wasi:blobstore`
-/// backend serves a not-yet-drained bare `hblob/{site}/…`/`mqp/…`/`mqgp/…` object at the new
-/// `…/default/…` spelling the post-flip runtime composes — the zero-downtime blob transition. Returns
-/// `None` (the inner resolver unchanged) when the store is not in that soak, so a fully-migrated or
-/// pre-migration node is byte-for-byte unchanged. The named-project set (for the `list`-union / drain
-/// translator) is read once here from `projectmeta/`.
+/// A [`BlobBackends`](boatramp_core::blob_backends::BlobBackends) decorator that wraps each resolved
+/// backend in a pure [`TranslatingStorage`](boatramp_storage::TranslatingStorage) — the serve-path
+/// blob half of the **un-migrated-store backward-read-compat** (the Finding-8 migration-safety
+/// rewrite). Unlike [`DefaultScopeFallbackBackends`] (the `dual`-soak read-fallback, which writes the
+/// new spelling), this rewrites the key new→old on EVERY op, so a legacy store that has not yet run
+/// `boatramp migrate` serves its default project's `hblob/{site}/…`/`mqp/…`/`mqgp/…` objects at the
+/// bare old spelling IN PLACE — reads and writes both land there, so rolling the binary is a no-op and
+/// a rollback loses nothing.
+#[cfg(feature = "fallback")]
+pub struct DefaultScopeTranslatingBackends {
+    inner: Arc<dyn boatramp_core::blob_backends::BlobBackends>,
+    to_old: boatramp_storage::KeyTranslate,
+    to_new: boatramp_storage::KeyTranslate,
+}
+
+#[cfg(feature = "fallback")]
+impl boatramp_core::blob_backends::BlobBackends for DefaultScopeTranslatingBackends {
+    fn backend(&self, project: boatramp_core::project::ProjectRef<'_>) -> Arc<dyn Storage> {
+        Arc::new(boatramp_storage::TranslatingStorage::new(
+            self.inner.backend(project),
+            self.to_old.clone(),
+            self.to_new.clone(),
+        ))
+    }
+    fn default_backend(&self) -> Arc<dyn Storage> {
+        Arc::new(boatramp_storage::TranslatingStorage::new(
+            self.inner.default_backend(),
+            self.to_old.clone(),
+            self.to_new.clone(),
+        ))
+    }
+}
+
+/// Wrap `inner` for the default-scope blob transition, selecting the mode from the control-plane
+/// store's schema state:
+///
+/// - **UN-MIGRATED** (below the re-home version, carrying bare default-scoped data — see
+///   [`boatramp_core::migrate::default_scope_compat_needed`]): a pure [`TranslatingStorage`] wrap, so
+///   the default project's blobs are read AND written at their bare old spelling in place (rolling the
+///   binary is a no-op; nothing is lost on rollback).
+/// - **`dual` soak** (forward staged, finalize deferred): the read-fallback
+///   ([`DefaultScopeFallbackBackends`]) — serve a not-yet-drained bare object at the new spelling while
+///   writes converge onto the new spelling.
+/// - otherwise (fresh / finalized): `inner` unchanged (byte-for-byte).
+///
+/// The named-project set (for the project-aware old→new `list` translator) is read once here.
 #[cfg(feature = "fallback")]
 pub async fn default_scope_blob_fallback(
     kv: &dyn boatramp_core::kv::KvStore,
     inner: Arc<dyn boatramp_core::blob_backends::BlobBackends>,
 ) -> Arc<dyn boatramp_core::blob_backends::BlobBackends> {
+    let unmigrated = boatramp_core::migrate::default_scope_compat_needed(kv)
+        .await
+        .unwrap_or(false);
     let in_soak = boatramp_core::migrate::read_state(kv)
         .await
         .map(|s| {
@@ -154,7 +196,7 @@ pub async fn default_scope_blob_fallback(
                 .contains(&boatramp_core::migrate::DEFAULT_SCOPE_REHOME_VERSION)
         })
         .unwrap_or(false);
-    if !in_soak {
+    if !unmigrated && !in_soak {
         return inner;
     }
     // The named projects (for the project-aware old→new translator). Read once at wiring.
@@ -169,6 +211,21 @@ pub async fn default_scope_blob_fallback(
             }
         }
     }
+    let to_old = default_scope_to_old();
+    let to_new = default_scope_to_new(std::sync::Arc::new(projects));
+    if unmigrated {
+        tracing::warn!(
+            "default-scope blob backward-read-compat ACTIVE (store un-migrated): the default \
+             project's blobs are read AND written at their bare old spelling in place. Rolling this \
+             binary is a no-op; run `boatramp migrate` + `boatramp blob rehome` then \
+             `boatramp migrate --finalize` to re-home to the default/ spelling."
+        );
+        return Arc::new(DefaultScopeTranslatingBackends {
+            inner,
+            to_old,
+            to_new,
+        });
+    }
     tracing::warn!(
         "default-scope blob read-fallback ACTIVE (migration {} in dual soak): serving bare \
          default-scoped blobs at their new default/ spelling. Run the blob re-home drain, then \
@@ -177,8 +234,8 @@ pub async fn default_scope_blob_fallback(
     );
     Arc::new(DefaultScopeFallbackBackends {
         inner,
-        to_old: default_scope_to_old(),
-        to_new: default_scope_to_new(std::sync::Arc::new(projects)),
+        to_old,
+        to_new,
     })
 }
 

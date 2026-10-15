@@ -113,6 +113,13 @@ pub mod fallback;
 #[cfg(feature = "fallback")]
 pub mod translating_fallback;
 
+/// A **pure key-translating** decorator (`TranslatingStorage`) — new→old on EVERY op (read + write) —
+/// the blob half of the un-migrated-store backward-read-compat (the migration-safety rewrite). Serves
+/// the OLD layout in place so rolling the binary is a no-op; distinct from the soak-only read-fallback
+/// above. Rides the same `fallback` feature (it reuses `KeyTranslate` + the default-scope translators).
+#[cfg(feature = "fallback")]
+pub mod translating;
+
 /// The default-scope blob re-home drain + retire engine (see [`translating_fallback`]).
 #[cfg(feature = "fallback")]
 pub mod blob_rehome;
@@ -187,5 +194,7 @@ pub use marker_cache::MarkerHeadCache;
 #[cfg(feature = "fallback")]
 pub use fallback::{FallbackStorage, FallbackWhen};
 
+#[cfg(feature = "fallback")]
+pub use translating::TranslatingStorage;
 #[cfg(feature = "fallback")]
 pub use translating_fallback::{KeyTranslate, TranslatingFallbackStorage};

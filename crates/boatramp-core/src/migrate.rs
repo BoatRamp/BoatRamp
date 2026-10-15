@@ -262,10 +262,6 @@ pub struct MigrateOptions {
     /// `false` the pass stops after the forward phase, leaving old state for a
     /// soak/rollback window (`dual`); a later `finalize` runs the cleanups.
     pub finalize: bool,
-    /// Override the fail-closed pre-migration conflict guard (v0.31.0 Finding 8): proceed with the
-    /// default-scope re-home even when a default-project resource is named `default` or like a known
-    /// project (its data will NOT be re-homed). Off by default — the operator must knowingly opt in.
-    pub allow_default_named_resource: bool,
 }
 
 impl MigrateOptions {
@@ -274,7 +270,6 @@ impl MigrateOptions {
         Self {
             dry_run: false,
             finalize: true,
-            allow_default_named_resource: false,
         }
     }
 }
@@ -321,19 +316,61 @@ pub enum MigrateError {
     /// reserved-`default`-project resource is named `default` (its bare data-plane scope `default` is
     /// indistinguishable from an already-re-homed `default/…` key), or is named like a KNOWN project
     /// (its bare scope `{name}` commingles with that project's keyspace — the pre-existing Finding-8
-    /// collision). In either case the re-home predicate cannot safely move the resource's data, so
-    /// `--finalize` would orphan (or has already commingled) it. Fail-closed: rename the resource(s)
-    /// first, or re-run with `--allow-default-named-resource` to proceed anyway (their data will NOT
-    /// be re-homed). Detected PRE-forward only (before any `default/…` re-homed key exists).
+    /// collision). The commingled keyspace carries no provenance, so the re-home cannot auto-split it
+    /// without risking a cross-tenant mix — it refuses, fail-closed. This is an OFFLINE `boatramp
+    /// migrate` refusal (the node keeps serving the existing layout meanwhile — it never bricks a
+    /// boot — and `serve --auto-migrate` logs it and falls back to serving). Resolve it manually with
+    /// the existing operator tools: re-create each listed default-project resource under a
+    /// non-colliding name via the normal deploy flow and delete the old one, then re-run `boatramp
+    /// migrate` (docs/default-scope-migration.md has the step-by-step). Detected PRE-forward
+    /// only (before any `default/…` re-homed key exists).
     #[error(
         "refusing the default-scope re-home: the default project has resource(s) whose bare \
-         data-plane scope conflicts with the re-home ({resources:?}). Rename them (redeploy under a \
-         new name / `boatramp sql move`), or re-run with --allow-default-named-resource to proceed \
-         anyway (their default-scoped data will NOT be re-homed). See docs/default-scope-migration.md."
+         data-plane scope conflicts with the re-home ({resources:?}). This is an offline `boatramp \
+         migrate` refusal, not a serve error — the node keeps serving the existing layout (and \
+         `serve --auto-migrate` falls back to serving rather than failing). To resolve: re-create \
+         each listed default-project resource under a NON-colliding name via the normal deploy flow \
+         and delete the old one (the conflict is a resource named like a tenant project, or \
+         `default`), then re-run `boatramp migrate`. See docs/default-scope-migration.md."
     )]
     DefaultNamedResource {
         /// The offending resource identities (e.g. `["site/default", "compute/acme (commingles with project `acme`)"]`).
         resources: Vec<String>,
+    },
+    /// `migrate --abort` found no staged (dual-soak) migration to roll back — the store is either
+    /// already at a clean version (nothing unfinalized) or below any online migration.
+    #[error(
+        "nothing to abort: the store has no migration in the dual soak (run `boatramp migrate status`)"
+    )]
+    AbortNothingStaged,
+    /// `migrate --abort` refused because a forward phase is interrupted mid-flight (a crash-resume
+    /// cursor is present). Re-run `boatramp migrate` to complete the forward into the dual soak first,
+    /// then abort.
+    #[error(
+        "cannot abort: a migration forward phase is interrupted mid-flight; re-run `boatramp migrate` \
+         to finish staging it into the dual soak, then `--abort`"
+    )]
+    AbortMidFlight,
+    /// `migrate --abort` refused because a staged migration does not support a verified lossless
+    /// reverse (it is not [`Migration::abortable`]). Finalizing forward is the only completion.
+    #[error("cannot abort: staged migration version {version} is not reversible")]
+    AbortNotSupported {
+        /// The non-abortable staged migration version.
+        version: u32,
+    },
+    /// `migrate --abort` refused because rolling back would LOSE data: a staged NEW key diverged from
+    /// its retained OLD twin (a write landed during the soak). Fail-closed — nothing is deleted.
+    /// Finalize forward (`boatramp migrate --finalize`) or reconcile the listed keys manually.
+    #[error(
+        "cannot abort without data loss: {} staged key(s) received writes during the soak and have no \
+         identical pre-migration twin to roll back to (e.g. {first}). Finalize forward instead, or \
+         reconcile manually.",
+        keys.len(),
+        first = keys.first().map(String::as_str).unwrap_or("")
+    )]
+    AbortWouldLoseData {
+        /// The diverged staged keys that block a lossless abort.
+        keys: Vec<String>,
     },
 }
 
@@ -410,6 +447,72 @@ pub async fn finalize(kv: &dyn KvStore) -> Result<MigrationReport, MigrateError>
     migrate(kv, MigrateOptions::one_shot()).await
 }
 
+/// **Abort** a store staged into the dual soak — roll it back to its exact pre-forward bytes, the
+/// inverse of staging a `migrate`. An OFFLINE operator action (run with the node stopped; opening the
+/// store fences a live writer). Aborts every unfinalized online migration, newest-first:
+///
+/// 1. **Verify** each is [`Migration::abortable`] and its [`abort_verify`](Migration::abort_verify)
+///    passes — writing NOTHING — so an abort is wholly safe or wholly refused (fail-closed on any key
+///    that received a soak-window write).
+/// 2. **Durably downgrade** the schema marker below the aborted versions FIRST, so a crash during the
+///    next step leaves a safe below-version store (served via backward-read-compat) whose leftover NEW
+///    keys are harmless orphans a re-run reclaims.
+/// 3. **Clean up** — delete the staged NEW keys (idempotent/resumable).
+///
+/// Refuses if nothing is staged ([`MigrateError::AbortNothingStaged`]) or a forward is interrupted
+/// mid-flight ([`MigrateError::AbortMidFlight`]).
+pub async fn abort(kv: &dyn KvStore) -> Result<MigrationReport, MigrateError> {
+    abort_with(kv, &registry()).await
+}
+
+async fn abort_with(
+    kv: &dyn KvStore,
+    migrations: &[Box<dyn Migration>],
+) -> Result<MigrationReport, MigrateError> {
+    let mut state = read_state(kv).await?;
+    if state.in_progress.is_some() {
+        return Err(MigrateError::AbortMidFlight);
+    }
+    if state.unfinalized.is_empty() {
+        return Err(MigrateError::AbortNothingStaged);
+    }
+    // Staged migrations, newest-first.
+    let mut staged = state.unfinalized.clone();
+    staged.sort_unstable();
+    staged.reverse();
+    // 1. VERIFY every staged migration is reversible and would lose nothing (writes nothing).
+    for v in &staged {
+        let m = migrations
+            .iter()
+            .find(|m| m.version() == *v)
+            .ok_or(MigrateError::AbortNotSupported { version: *v })?;
+        if !m.abortable() {
+            return Err(MigrateError::AbortNotSupported { version: *v });
+        }
+        m.abort_verify(kv).await?;
+    }
+    // 2. DURABLY DOWNGRADE the marker FIRST (crash-safe). Drop the aborted versions from history +
+    //    unfinalized and set `version` to the highest surviving applied version.
+    let aborted: HashSet<u32> = staged.iter().copied().collect();
+    state.history.retain(|r| !aborted.contains(&r.version));
+    state.unfinalized.retain(|v| !aborted.contains(v));
+    // Return to the version just below the EARLIEST aborted migration. The registry is sequential and
+    // the unfinalized set is a contiguous top suffix, so this is exactly the pre-stage version.
+    // (Recomputing from `history` alone is wrong — a store can reach its prior version with no history
+    // record, e.g. a legacy store whose v1 predates history tracking; the seed/`LegacyMarker` path.)
+    let floor = staged.iter().copied().min().unwrap_or(0);
+    state.version = floor.saturating_sub(1);
+    state.updated_at = now_unix();
+    persist_state(kv, &state).await?;
+    // 3. CLEANUP — delete the staged NEW keys (idempotent; a crash here resumes on re-run).
+    for v in &staged {
+        if let Some(m) = migrations.iter().find(|m| m.version() == *v) {
+            m.abort_cleanup(kv).await?;
+        }
+    }
+    Ok(MigrationReport::default())
+}
+
 /// The engine core, parameterized by the migration list so tests can drive it with a
 /// synthetic chain.
 async fn run(
@@ -438,7 +541,7 @@ async fn run(
         .in_progress
         .as_ref()
         .is_some_and(|ip| ip.target == DEFAULT_SCOPE_REHOME_VERSION);
-    if v2_pending && !resuming_v2 && !opts.allow_default_named_resource {
+    if v2_pending && !resuming_v2 {
         let conflicts = default_scope_premigration_conflicts(kv).await?;
         if !conflicts.is_empty() {
             return Err(MigrateError::DefaultNamedResource {
@@ -601,6 +704,33 @@ trait Migration: Send + Sync {
     fn online(&self) -> bool {
         !self.cleanup_steps().is_empty()
     }
+
+    /// Whether this (online) migration can be **aborted** while in the dual soak — rolled back to the
+    /// exact pre-forward bytes. Default `false`: a migration that does not implement a verified,
+    /// lossless reverse is not abortable (the engine refuses `migrate --abort` while it is staged, so a
+    /// half-reverse can never corrupt). The default-scope re-home overrides this to `true` (its forward
+    /// is a non-destructive copy, so deleting the copy is a clean reverse).
+    fn abortable(&self) -> bool {
+        false
+    }
+
+    /// Phase 1 of abort — **verify, write nothing**: refuse (all-or-nothing) if rolling back would
+    /// lose data, i.e. a staged NEW key diverged from its retained OLD twin (a write during the soak).
+    /// Run across the whole migration BEFORE any delete, so an abort is either wholly safe or wholly
+    /// refused. Default: nothing to verify.
+    async fn abort_verify(&self, _kv: &dyn KvStore) -> Result<(), MigrateError> {
+        Ok(())
+    }
+
+    /// Phase 2 of abort — **cleanup**: delete the staged NEW keys (whose OLD twin `abort_verify`
+    /// confirmed is present + identical), returning the store to its pre-forward bytes. Idempotent +
+    /// resumable (an already-deleted NEW key is skipped), and run by the engine ONLY after it has
+    /// durably downgraded the schema marker below this version — so a crash mid-cleanup leaves a safe
+    /// below-version store (served via backward-read-compat) with harmless orphan NEW keys a re-run
+    /// reclaims. Default: nothing to clean up.
+    async fn abort_cleanup(&self, _kv: &dyn KvStore) -> Result<(), MigrateError> {
+        Ok(())
+    }
 }
 
 /// Migration **1** — re-key the flat, pre-0.2.0 store to the project-scoped layout: move
@@ -717,13 +847,69 @@ impl Migration for DefaultScopeRehomeV2 {
             .map(|family| Box::new(DeleteRehomedDefaultScope { family }) as Box<dyn Step>)
             .collect()
     }
+    fn abortable(&self) -> bool {
+        // The forward is a non-destructive copy (the bare OLD keys are retained until finalize), so
+        // deleting the re-homed NEW keys is a provably-lossless reverse (verified below).
+        true
+    }
+    async fn abort_verify(&self, kv: &dyn KvStore) -> Result<(), MigrateError> {
+        // Refuse (all-or-nothing) if any re-homed NEW key (`{family}default/{suffix}`) diverged from
+        // its retained OLD twin (`{family}{suffix}`) — a write during the soak the reverse would lose.
+        // Writes nothing; the engine deletes only after this passes for the whole migration.
+        let mut divergent = Vec::new();
+        for family in DEFAULT_SCOPE_FAMILIES {
+            for new_key in kv.list_prefix(family).await? {
+                let Some(old_key) = default_scope_to_bare(family, &new_key) else {
+                    continue; // not a re-homed default/ key (bare old key, named project)
+                };
+                match (kv.get(&old_key).await?, kv.get(&new_key).await?) {
+                    // Clean: the NEW key equals its retained OLD twin → safe to drop the NEW copy.
+                    (Some(o), Some(n)) if o == n => {}
+                    // The NEW key is already gone (a prior partial abort) → nothing to lose.
+                    (_, None) => {}
+                    // The NEW key is present but has no identical OLD twin — a soak-window write the
+                    // reverse would discard. Refuse, naming the key.
+                    (_, Some(_)) => divergent.push(new_key),
+                }
+            }
+        }
+        if divergent.is_empty() {
+            Ok(())
+        } else {
+            divergent.sort();
+            Err(MigrateError::AbortWouldLoseData { keys: divergent })
+        }
+    }
+    async fn abort_cleanup(&self, kv: &dyn KvStore) -> Result<(), MigrateError> {
+        // Delete every re-homed NEW key (verified clean by `abort_verify`), leaving only the bare OLD
+        // keys — the exact pre-forward bytes. Idempotent: an already-deleted NEW key simply isn't
+        // listed. Re-verifies the OLD twin per key as a belt-and-suspenders (never deletes a NEW key
+        // lacking an identical OLD twin, even if state changed since `abort_verify`).
+        for family in DEFAULT_SCOPE_FAMILIES {
+            for new_key in kv.list_prefix(family).await? {
+                let Some(old_key) = default_scope_to_bare(family, &new_key) else {
+                    continue;
+                };
+                match (kv.get(&old_key).await?, kv.get(&new_key).await?) {
+                    (Some(o), Some(n)) if o == n => kv.delete(&new_key).await?,
+                    (_, None) => {}
+                    (_, Some(_)) => {
+                        return Err(MigrateError::AbortWouldLoseData {
+                            keys: vec![new_key],
+                        });
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// The set of **known project names** (the `projectmeta/<name>` pointer keys), including the reserved
 /// `default` once the v1 re-key has materialized it. Used by [`rehome_default_scope`] to tell a bare
 /// default scope (a site/function/topic-base belonging to the default project) from a key that is
 /// already two-segment-scoped under a named project.
-async fn known_projects(kv: &dyn KvStore) -> Result<HashSet<String>, MigrateError> {
+pub(crate) async fn known_projects(kv: &dyn KvStore) -> Result<HashSet<String>, MigrateError> {
     let mut set = HashSet::new();
     for key in kv.list_prefix(project::POINTER_PREFIX).await? {
         if let Some(name) = key.strip_prefix(project::POINTER_PREFIX)
@@ -799,7 +985,11 @@ pub async fn default_scope_premigration_conflicts(
 ///   bare default-scoped keys ever move.
 ///
 /// `family` must end in `/`. A key not under `family`, or with an empty scope segment, is `None`.
-fn rehome_default_scope(family: &str, key: &str, projects: &HashSet<String>) -> Option<String> {
+pub(crate) fn rehome_default_scope(
+    family: &str,
+    key: &str,
+    projects: &HashSet<String>,
+) -> Option<String> {
     let rest = key.strip_prefix(family)?;
     let first = rest.split('/').next().unwrap_or("");
     if first.is_empty() {
@@ -812,6 +1002,46 @@ fn rehome_default_scope(family: &str, key: &str, projects: &HashSet<String>) -> 
         return None;
     }
     Some(format!("{family}{DEFAULT_PROJECT}/{rest}"))
+}
+
+/// The **new→old** (purely syntactic) inverse of [`rehome_default_scope`] for ONE family: given a
+/// post-fix two-segment key `{family}default/{rest}`, name the pre-fix bare key `{family}{rest}`.
+/// `None` for any key that is not a re-homed `{family}default/…` key (a named project's key, a
+/// non-family key). No project set is needed — only an explicit `default/` second segment translates,
+/// so a named project's `{family}{project}/…` key can never be wrongly stripped (the KV analogue of the
+/// blob substrate's `default_scope_to_old`). Used by the un-migrated-store backward-read-compat
+/// decorator (to address the old spelling the store physically holds) and by the migration's
+/// `--abort` step (to name the new key to remove).
+pub(crate) fn default_scope_to_bare(family: &str, key: &str) -> Option<String> {
+    let rest = key.strip_prefix(family)?;
+    let after = rest.strip_prefix(DEFAULT_PROJECT)?;
+    // `default` must be a WHOLE first segment: a scoped `{family}default/{tail}`, or the degenerate
+    // bare marker `{family}default` (a topic literally named `default` — impossible, `default` is a
+    // reserved project name, but handled for totality). A key like `{family}defaultish/…` must NOT
+    // match, so anything other than a `/` boundary or end-of-key is rejected.
+    let tail = if let Some(t) = after.strip_prefix('/') {
+        t
+    } else if after.is_empty() {
+        after
+    } else {
+        return None;
+    };
+    Some(format!("{family}{tail}"))
+}
+
+/// Whether a store needs the **un-migrated backward-read-compat** decoration: it is below the
+/// default-scope re-home version AND actually carries bare default-scoped data-plane data to serve
+/// (migration 2 is applicable). A fresh store born at the current layout (version 0, no bare data) is
+/// `false` — it already composes and persists the new two-segment spelling, so wrapping it would wrongly
+/// strip writes to the old spelling. A staged/finalized store (version ≥ 2) is `false` — its new keys
+/// are present. So this is `true` exactly for a legacy store (e.g. a v1 single-project store) that has
+/// not yet run `boatramp migrate`, which is the only case that must serve the old layout un-migrated.
+pub async fn default_scope_compat_needed(kv: &dyn KvStore) -> Result<bool, MigrateError> {
+    let state = read_state(kv).await?;
+    if state.version >= DEFAULT_SCOPE_REHOME_VERSION {
+        return Ok(false);
+    }
+    DefaultScopeRehomeV2.is_applicable(kv).await
 }
 
 // ---- reusable migration steps ----------------------------------------------------
@@ -1629,6 +1859,128 @@ mod tests {
         assert_eq!(kv.list_prefix("").await.unwrap(), before);
     }
 
+    /// Snapshot every DATA key (everything except the migration's own `schema/` bookkeeping), so an
+    /// abort round-trip can be asserted byte-for-byte on the actual tenant/guest data (the schema
+    /// marker + the premigration-index audit artifact are expected to differ after an abort).
+    async fn data_snapshot(kv: &MemoryKv) -> std::collections::BTreeMap<String, Vec<u8>> {
+        let mut out = std::collections::BTreeMap::new();
+        for key in kv.list_prefix("").await.unwrap() {
+            if key.starts_with("schema/") {
+                continue;
+            }
+            if let Some(v) = kv.get(&key).await.unwrap() {
+                out.insert(key, v);
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn default_scope_abort_restores_exact_bytes() {
+        // GATE: `MIGRATE ABORT EXACT-BYTES OK` — staging then aborting returns the store to the exact
+        // pre-stage DATA bytes (every re-homed NEW key removed, every OLD key intact), version back to 1.
+        let kv = MemoryKv::new();
+        seed_default_scope(&kv).await;
+        let before = data_snapshot(&kv).await;
+
+        let staged = migrate(
+            &kv,
+            MigrateOptions {
+                dry_run: false,
+                finalize: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(staged.dual);
+        assert_eq!(status(&kv).await.unwrap(), Status::Dual);
+        assert!(
+            kv.get("hkv/default/blog/counter").await.unwrap().is_some(),
+            "stage must have copied the new spelling"
+        );
+
+        abort(&kv).await.unwrap();
+
+        assert_eq!(
+            data_snapshot(&kv).await,
+            before,
+            "abort must restore the EXACT pre-stage data keyspace"
+        );
+        assert_eq!(read_state(&kv).await.unwrap().version, 1);
+        assert_eq!(status(&kv).await.unwrap(), Status::NeedsMigration);
+        assert!(
+            kv.get("hkv/default/blog/counter").await.unwrap().is_none(),
+            "no re-homed NEW key may survive an abort"
+        );
+        println!("MIGRATE ABORT EXACT-BYTES OK");
+    }
+
+    #[tokio::test]
+    async fn default_scope_abort_fails_closed_on_a_soak_window_write() {
+        // GATE (the load-bearing safety property): abort must REFUSE, deleting nothing, if a staged NEW
+        // key diverged from its retained OLD twin during the soak — losing that write would be silent
+        // data loss. Covers both divergence shapes: an overwrite (old twin present, mismatched) and a
+        // brand-new key (no old twin).
+        let kv = MemoryKv::new();
+        seed_default_scope(&kv).await;
+        migrate(
+            &kv,
+            MigrateOptions {
+                dry_run: false,
+                finalize: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        // (a) overwrite an existing re-homed key — diverges from its OLD twin.
+        kv.put("hkv/default/blog/counter", b"SOAK-WRITE".to_vec())
+            .await
+            .unwrap();
+        let err = abort(&kv).await;
+        assert!(
+            matches!(err, Err(MigrateError::AbortWouldLoseData { .. })),
+            "abort must refuse a diverged soak write, got {err:?}"
+        );
+        // Nothing was deleted; the store is still in the dual soak with the soak write intact.
+        assert_eq!(
+            kv.get("hkv/default/blog/counter").await.unwrap().as_deref(),
+            Some(&b"SOAK-WRITE"[..])
+        );
+        assert_eq!(read_state(&kv).await.unwrap().version, 2);
+        assert_eq!(status(&kv).await.unwrap(), Status::Dual);
+
+        // Restore the key to its twin's value so (a) no longer diverges, then (b) add a brand-new
+        // NEW-spelling key with no OLD twin — abort must still refuse.
+        kv.put("hkv/default/blog/counter", b"7".to_vec())
+            .await
+            .unwrap();
+        kv.put("hkv/default/blog/fresh", b"new".to_vec())
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                abort(&kv).await,
+                Err(MigrateError::AbortWouldLoseData { .. })
+            ),
+            "abort must refuse a brand-new soak key with no pre-migration twin"
+        );
+        assert!(
+            kv.get("hkv/default/blog/fresh").await.unwrap().is_some(),
+            "the refused abort must delete nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn abort_refuses_when_nothing_staged() {
+        let kv = MemoryKv::new();
+        seed_default_scope(&kv).await; // version 1, nothing staged
+        assert!(matches!(
+            abort(&kv).await,
+            Err(MigrateError::AbortNothingStaged)
+        ));
+    }
+
     #[tokio::test]
     async fn default_scope_dual_stage_then_finalize_keeps_offsets() {
         let kv = MemoryKv::new();
@@ -1775,22 +2127,10 @@ mod tests {
             matches!(err, Err(MigrateError::DefaultNamedResource { .. })),
             "the re-home must refuse a default-named resource, got {err:?}"
         );
-        // Nothing was migrated (the guard fired before the forward).
+        // Nothing was migrated (the guard fired before the forward) — the store is untouched, so the
+        // node keeps serving the existing layout; the operator resolves via `resolve-collision`.
         assert!(kv.get("hkv/default/blog/k").await.unwrap().is_none());
-        // Override proceeds (the conflicting resource's data is simply not re-homed).
-        let ok = migrate(
-            &kv,
-            MigrateOptions {
-                dry_run: false,
-                finalize: false,
-                allow_default_named_resource: true,
-            },
-        )
-        .await;
-        assert!(
-            ok.is_ok(),
-            "the override must let the re-home proceed: {ok:?}"
-        );
+        assert!(kv.get("hkv/blog/k").await.unwrap().is_some());
 
         // (2) Commingling: a default-project COMPUTE workload named like an existing project `acme`.
         let kv = MemoryKv::new();
