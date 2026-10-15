@@ -1,10 +1,16 @@
 # Config resolution rewrite: one `figment` pipeline for every subcommand
 
-Status: **WIP scaffolding landed** behind the off-by-default `config-figment` feature
-(`crates/boatramp-node`). The `BOATRAMP_*` environment overlay + its figment provider
-are implemented and parity-tested against today's loader; the file + flag layers and the
-flip to the default path are the remaining work (below). This doc is the spec the
-remainder executes from.
+Status: **RELEASE-READY** behind the off-by-default `config-figment` feature (target
+v0.35.0). The full pipeline — defaults/base-seed → **file** → **env** → explicit **CLI
+flags** — is implemented and wired into `ServerConfig::load` (so serve AND every offline op
+resolve through it) and the serve dispatch (which builds the flag layer). It covers the
+COMPLETE surface (former Loaders A/B/C): the `serve.*` scalars, the `serve.kv.*` knobs, the
+`[security]`/`[compute]`/`[handlers]`/`[secrets]`/`[cluster]` sections, and the three
+dynamic-keyed maps. A full-surface parity battery asserts equivalence with the legacy
+loaders, and `boatramp config dump` (the Serialize dividend) prints the resolved config with
+secrets redacted. The feature is **off by default** — the default-flip + deleting the legacy
+loaders is the owner's release decision (see Cutover). The four design decisions below were
+resolved by the owner; this doc records the as-built design.
 
 ## Why
 
@@ -130,58 +136,79 @@ per-flag probe needed — the probe was a one-off of this rule.
 | **P6** do-not-map | AWS ambient chain, `*_env`/`*_ENV` secret-indirection names, VAULT_TOKEN, `join_token` refs, sealed creds, KEK/root/bootstrap material | the overlay emits the *reference* fields (`token_env`, `password_env`, `s3_credential.secret_access_key` ref) exactly as today, and **never** invents a fixed env mapping for the secret VALUE; the ambient AWS chain + VAULT_TOKEN are resolved downstream, untouched |
 | **P7** out-of-scope | client-CLI clap env, guest-shim injected env, cloudflare output env, test/mutation vars | not part of `ServerConfig`; the node overlay never touches them |
 
-## Pre-reqs before the flip (flagged — not done in the scaffold)
+## The four decisions, as built
 
-1. **File layer without `Serialize`.** The config structs are `Deserialize`-only, so the
-   parsed struct can't be fed to figment via `Serialized`, and `figment::value::Value`
-   isn't plainly `Deserialize`-targetable (it carries a `Tag`). Two options:
-   (a) derive `Serialize` on the config structs (cross-crate: node structs +
-   `boatramp_core::security::*`), enabling `Serialized::defaults(parsed)` and a
-   `config dump`; or (b) parse the RON/JSON text into `serde_json::Value` and convert to a
-   figment `Value`. (a) is preferred (round-trippable config) but larger; decide before
-   the flip.
-2. **`deny_unknown_fields` structs that lack a struct-level `#[serde(default)]`.**
-   `S3CredentialConfig`, `VaultSecretsConfig`, `BlobBackendConfig` (and verify
-   `SecurityConfig`) cannot deserialize from a *partial* env sub-dict today — the current
-   code builds the full struct then sets fields. Adding `#[serde(default)]` is the clean
-   fix **but also loosens file parsing** (a file omitting a field would get the default
-   instead of erroring) — a deliberate behavior decision, not a silent change. Each struct
-   already derives `Default`, so it is safe where we want it.
-3. **Validators on the merged result.** `apply_env_overrides` ends by running
-   `validate_sql_db_names` / `validate_blob_backend_projects` / `validate_listeners` on the
-   file+env result. The figment path must run these on the extracted config too (it is
-   stricter — it also catches a listener/blob/db-name problem introduced purely by the file
-   layer, which today is validated only at parse). Confirm this is the same accept/reject
-   set, or flag the (safer) divergence.
-4. **Loud vs silent cluster-without-listen.** `apply_env_overrides` silently drops an
-   env-only `[cluster]` with no `listen`; the figment path fails **loudly** at extract
-   (ClusterConfig has no `listen` default). This is arguably better; confirm it's
-   acceptable.
+1. **File layer → derived `Serialize`.** `#[derive(Serialize)]` is on the whole `ServerConfig`
+   tree (24 node types + `BlobBackend` + `boatramp_core::security::{SecurityConfig,
+   ProjectPostureOverride}`). The parsed file serializes straight into a figment layer via
+   figment's own serializer (`to_dict`); absent `Option` sections serialize to `Empty` and are
+   `prune_empty`-d so they never clobber a lower layer. Also unlocks `config dump`.
+2. **Strict file parsing kept** for the `deny_unknown_fields` sub-structs — NO struct-level
+   `#[serde(default)]` added. Only two (`VaultSecretsConfig`, `S3CredentialConfig`) have a
+   required field; a **base-seed layer below the file** emits their COMPLETE defaults when env
+   references them, so a partial env sub-dict never reaches extract — and the file's own fields
+   still win (seed < file < env). The file keeps erroring on a missing required field as today.
+3. **Validators run on the full merged result** (`validate_sql_db_names` /
+   `_blob_backend_projects` / `_listeners`) — stricter than `apply_env_overrides` (also validates
+   a file-introduced entry). Intended.
+4. **`[cluster]` without `listen` fails LOUDLY** at extract (no `ClusterConfig` `listen`
+   default) — not the old silent drop. Intended.
 
-## Rollout
+## config dump (the Serialize dividend)
 
-1. ✅ Land the overlay + provider + parity tests behind `config-figment` (this commit).
-2. Add the file layer + flag layer + the pre-reqs above; implement
-   `load_with_figment(path, override, flags)` returning `ServerConfig` (map
-   `figment::Error → ConfigError`).
-3. Broaden the equivalence battery to the **whole** Loader-B surface + a file+env+flags
-   matrix, asserting `load_with_figment == load` (compare `{:?}`), until green across the
-   board.
-4. Flip: route `ServerConfig::load` (and the offline ops) through `load_with_figment`
-   under the feature; run the full CI matrix.
-5. Delete Loaders A/B/C and make the feature the default (then drop the feature gate). The
-   `*_ENV_VARS` const tables collapse into the overlay's single source of truth; the
-   forgot-a-knob guards retarget onto it.
+`boatramp config dump [--file boatramp.cfg] [--explain]` resolves the static daemon config
+through the pipeline and prints it as JSON with the secret-bearing fields **redacted**
+(`auth_root_private_key`, `bootstrap_secret`, `azure_access_key`, `secret_access_key`; secret
+*reference* / env-var-NAME fields like `token_env`/`url_env` are left intact). This is necessary
+*because* decision 1 made the config `Serialize` — a raw dump would otherwise expose the
+control-plane root key. (Client-side, no server; distinct from `config get/set`, the live
+dynamic config.)
 
-## Test oracle (this commit)
+## Flag layer (as built)
 
-`crates/boatramp-node/src/config.rs`, module `config::figment_resolve::tests`:
+serve parses via `ArgMatches` (`get_matches` + `from_arg_matches`), and `serve_cli_flags` builds
+a `{BOATRAMP_<NAME>: raw-value}` map of the args whose `ValueSource == CommandLine` (env name from
+each arg's own clap definition). `ServerConfig::load_with_flags` turns that into the TOP figment
+layer by **reusing the env overlay** (a flag's name→path mapping equals its env var's). A
+defaulted `--blobs fs` is `DefaultValue`, so it's absent — subsuming the old `var_os` probe. serve
+still composes `args` over the resolved config; since the flag layer and clap's `args` carry the
+same explicit flags, they agree, so the eventual flip (serve consuming only the resolved config)
+is correct.
 
-- `overlay_honors_every_loader_b_fixed_var` — the drift guard (every Loader-B const var →
-  an overlay entry).
-- `compute_matches_apply_env_overrides` — full `extract_lossy` vs `apply_env_overrides`
-  across str/int/list/enum/bool (ComputeConfig is `#[serde(default)]`).
-- `bool_spellings_round_trip_like_parse_bool` — P4.
-- `serve_s3_scalars_extract` — the construens finalize concern (enum/str/bool).
-- `blob_backends_dynamic_map_shape` / `sql_db_default_token_maps_to_default_key` — P0 maps.
+## Cutover (owner decides the release)
+
+The feature is **off by default**; the flip is a release-strategy decision for v0.35.0:
+- **Ship opt-in** (`--features config-figment`): zero risk to the default build; operators who
+  want the unified pipeline (notably offline ops honoring `BOATRAMP_*`) opt in. The legacy loaders
+  stay the default path.
+- **Flip the default**: add `config-figment` to the `default` feature set; the whole fleet's
+  config resolution moves to figment. Higher blast radius — config is security-sensitive (tenancy
+  postures, sealed creds) — but the full-surface parity battery + the end-to-end binary check make
+  it proven-equivalent.
+
+Recommendation and risk tradeoff are in the release-ready report. When the owner approves the
+flip: add `config-figment` to both crates' `default`, run the full CI matrix (all-features +
+lean + musl), then in a FOLLOW-UP delete Loaders A/B/C and drop the gate (the `*_ENV_VARS` const
+tables + overlay collapse to one source; the forgot-a-knob guards retarget onto it). The version
+bump + CHANGELOG happen at the cut, not here.
+
+## Test oracle
+
+`crates/boatramp-node/src/config.rs`, module `config::figment_resolve::tests` (24 tests):
+
+- `overlay_honors_every_loader_b_fixed_var` / `overlay_honors_every_serve_var` — drift guards
+  (every registered env var → an overlay entry).
+- `parity_*` (compute / security / handlers-sql / jwks-concurrency-hedge / s3-ingress / secrets
+  (+vault, +partial-env) / cluster (+mesh) / sql-databases / blob-backends / listeners / combined)
+  — `load_with_figment` == `apply_env_overrides`, pretty-Debug-equal, across the whole Loader-B
+  surface + all three maps.
+- `serve_scalars_full_extract` / `serve_kv_knobs_full_extract` — Loader A/C fields resolve into
+  their ServeConfig path (asserted directly; clap-env can't be driven via `EnvSource::Map`).
+- `flag_env_file_precedence` — flag > env > file through the full pipeline.
+- `dump_redacts_secrets` — no secret value appears in a dump.
+- `bool_spellings_round_trip_like_parse_bool`, `empty_value_is_unset` — P4.
+
+End-to-end (real feature binary): `config dump` with a file + env shows env-over-file, a serve
+scalar coerced string→number, the file's `auth_root_private_key` as `<redacted>`, and file-only
+values; `serve --help` intact.
 - `empty_value_is_unset` — P4.
