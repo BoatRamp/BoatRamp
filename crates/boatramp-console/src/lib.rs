@@ -21,6 +21,7 @@ mod observability;
 mod oidc;
 mod project;
 mod project_transfer;
+mod store_migration;
 mod tokens;
 mod verify;
 mod widgets;
