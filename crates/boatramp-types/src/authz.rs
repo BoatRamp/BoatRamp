@@ -495,6 +495,17 @@ impl Right {
             // deploy-grade publisher right the `/api/sql/` path below uses (a ship-only CI token must
             // not be able to migrate the schema). Read-only `status` needs only `Project·Read`.
             // Gated explicitly ABOVE the `/api/sql/` catch-all so a publisher cannot reach it.
+            // Control-plane STORE-layout migration (the default-scope re-home — the console wizard's
+            // back end). NODE-DESTRUCTIVE, so node-global `System·Admin` for the mutating verbs and
+            // `System·Read` for status — NEVER the per-project `Project·Admin(default)` the
+            // `/api/migrate/` SQL-schema arm below resolves to. The SINGULAR-HYPHEN path
+            // `/api/store-migrate/…` cannot match `starts_with("/api/migrate/")`, and these explicit
+            // arms sit ABOVE that arm as defense-in-depth (a store-migration token must never be a
+            // per-project right). Re-checked in-handler via `assert_store_migrate_is_system_admin`.
+            "/api/store-migrate/status" => Self::new(Resource::System, None, Action::Read),
+            p if p.starts_with("/api/store-migrate/") => {
+                Self::new(Resource::System, None, Action::Admin)
+            }
             p if p.starts_with("/api/migrate/") => Self::new(
                 Resource::Project,
                 Some(default_project.clone()),

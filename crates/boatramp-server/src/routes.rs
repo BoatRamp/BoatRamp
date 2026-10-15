@@ -303,6 +303,22 @@ pub fn router_with_fast(
         // `authz::Right::required` (the same grade as `/api/sites`/`/api/metrics`); the hyphen path
         // again avoids the `/api/blobs/` matcher.
         .route("/api/blob-status", get(blob_status_handler))
+        // Control-plane STORE-layout migration (the default-scope re-home) — the console wizard's back
+        // end. `status` is System·Read; `arm` (persist the operator's answers for the next boot-time
+        // stage) and `abort` (un-arm / roll back a dual-soak) are node-destructive → System·Admin,
+        // gated EXPLICITLY in `authz::Right::required` at a SINGULAR-HYPHEN path that can't collide with
+        // the per-project `/api/migrate/` matcher, and re-checked defense-in-depth in each handler.
+        // (The destructive FINALIZE stays the explicit post-restart `boatramp migrate --finalize` CLI
+        // step — not exposed online.)
+        .route(
+            "/api/store-migrate/status",
+            get(store_migrate_status_handler),
+        )
+        .route("/api/store-migrate/arm", post(store_migrate_arm_handler))
+        .route(
+            "/api/store-migrate/abort",
+            post(store_migrate_abort_handler),
+        )
         // The running node's boatramp version (v0.7.4): the exact package version of the binary
         // serving this request. On the AUTHED `/api` router (NOT the public `/healthz`/`/readyz`
         // router), gated `system·read` in `authz::Right::required` — an operator-only read, so a
