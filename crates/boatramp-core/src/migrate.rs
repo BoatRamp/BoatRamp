@@ -241,7 +241,7 @@ impl LegacyMarker {
 // ---- public API (stable: consumed by the CLI + serve startup guard) --------------
 
 /// How a store needs to be treated on startup.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Status {
     /// At the current version with nothing pending (or empty) — serve as-is.
     Ready,
@@ -935,13 +935,65 @@ pub(crate) async fn known_projects(kv: &dyn KvStore) -> Result<HashSet<String>, 
 pub async fn default_scope_premigration_conflicts(
     kv: &dyn KvStore,
 ) -> Result<Vec<String>, MigrateError> {
+    Ok(default_scope_collisions(kv)
+        .await?
+        .iter()
+        .map(DefaultScopeCollision::describe)
+        .collect())
+}
+
+/// Why a default-project resource's bare scope conflicts with the re-home.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CollisionReason {
+    /// The resource is literally named `default` — its bare scope collides with the `default/…`
+    /// re-home prefix.
+    NamedDefault,
+    /// The resource is named like a KNOWN tenant project — its bare scope `{name}` commingles with
+    /// that project's keyspace (the pre-existing Finding-8 collision), undecidable to auto-split.
+    CommingleProject,
+}
+
+/// A structured default-scope collision — a default-project `site`/`compute` whose bare data-plane
+/// scope conflicts with the re-home. The structured form backs both the string refusal
+/// ([`default_scope_premigration_conflicts`]) and the interactive [`plan`]'s operator-answered
+/// decision (rename / skip / abort).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DefaultScopeCollision {
+    /// The resource kind (`site` / `compute`).
+    pub kind: String,
+    /// The colliding resource name.
+    pub name: String,
+    /// Why it conflicts.
+    pub reason: CollisionReason,
+}
+
+impl DefaultScopeCollision {
+    /// The one-line human description (stable substrings `"<kind>/<name>"` + `"commingles"`, relied on
+    /// by the `DefaultNamedResource` error message and its test).
+    pub fn describe(&self) -> String {
+        let Self { kind, name, reason } = self;
+        match reason {
+            CollisionReason::NamedDefault => format!(
+                "{kind}/{name} (named `default` — its scope collides with the re-home prefix)"
+            ),
+            CollisionReason::CommingleProject => {
+                format!("{kind}/{name} (commingles with the existing project `{name}`)")
+            }
+        }
+    }
+}
+
+/// Pre-forward conflict scan, STRUCTURED (the source of [`default_scope_premigration_conflicts`]).
+/// Scans the control-plane `site`/`compute` pointers of the default project (both the v1+
+/// `project/default/<kind>/<name>` and the pre-v1 flat `<kind>/<name>` shapes) and classifies each
+/// name that is `default` or a known tenant project. Sorted, de-duplicated.
+pub async fn default_scope_collisions(
+    kv: &dyn KvStore,
+) -> Result<Vec<DefaultScopeCollision>, MigrateError> {
     let projects = known_projects(kv).await?; // includes the reserved `default`
     let mut out = Vec::new();
     for kind in ["site", "compute"] {
         let mut seen = HashSet::new();
-        // Both layouts: the v1+ project-scoped pointer (`project/default/<kind>/<name>`) and the
-        // pre-v1 flat family (`<kind>/<name>`, a v0 store not yet project-re-keyed) — so the guard
-        // holds whether migration 1 has run or not.
         for prefix in [
             format!("project/{DEFAULT_PROJECT}/{kind}/"),
             format!("{kind}/"),
@@ -954,20 +1006,193 @@ pub async fn default_scope_premigration_conflicts(
                 if name.is_empty() || !seen.insert(name.to_string()) {
                     continue;
                 }
-                if name == DEFAULT_PROJECT {
-                    out.push(format!(
-                        "{kind}/{name} (named `default` — its scope collides with the re-home prefix)"
-                    ));
+                let reason = if name == DEFAULT_PROJECT {
+                    Some(CollisionReason::NamedDefault)
                 } else if projects.contains(name) {
-                    out.push(format!(
-                        "{kind}/{name} (commingles with the existing project `{name}`)"
-                    ));
+                    Some(CollisionReason::CommingleProject)
+                } else {
+                    None
+                };
+                if let Some(reason) = reason {
+                    out.push(DefaultScopeCollision {
+                        kind: kind.to_string(),
+                        name: name.to_string(),
+                        reason,
+                    });
                 }
             }
         }
     }
-    out.sort();
+    out.sort_by(|a, b| a.describe().cmp(&b.describe()));
     Ok(out)
+}
+
+// ---- interactive migration: the operator-answerable decision model ---------------
+
+/// An operator-answerable fork in the migration — a point with more than one valid route that the
+/// interactive flow (CLI prompts / console wizard) presents and the operator chooses. Serde so the
+/// console admin API can render + park it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MigrationDecision {
+    /// Stable id an answer references (e.g. `collision:site/construens`).
+    pub id: String,
+    /// The question to put to the operator.
+    pub question: String,
+    /// The routes the operator may choose among.
+    pub routes: Vec<DecisionRoute>,
+}
+
+/// One route of a [`MigrationDecision`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DecisionRoute {
+    /// Stable key an answer carries (e.g. `rename`).
+    pub key: String,
+    /// Human label.
+    pub label: String,
+    /// A free-text input this route needs (e.g. the new name for a rename), with its prompt.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input: Option<RouteInput>,
+    /// A consequence/warning to show before choosing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+/// A free-text input a [`DecisionRoute`] requires from the operator.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RouteInput {
+    /// What to prompt for.
+    pub prompt: String,
+    /// How to validate it.
+    pub kind: RouteInputKind,
+}
+
+/// The validation class for a [`RouteInput`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RouteInputKind {
+    /// A resource slug (validated by [`crate::project::validate_resource_name`]).
+    ResourceName,
+}
+
+/// The interactive migration plan — the current status, the target version, a human summary of the
+/// forward work (from a dry run that writes nothing), and the operator-answerable [`MigrationDecision`]s
+/// that must be resolved before the re-home can complete. Both the CLI prompt loop and the console
+/// admin wizard render this; it is the read-only first step of an interactive migration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MigrationPlan {
+    /// The store's current layout status.
+    pub status: Status,
+    /// The store's current schema version.
+    pub current_version: u32,
+    /// The version the migration would reach.
+    pub target_version: u32,
+    /// Forks the operator must resolve to proceed (empty ⇒ a straight-through migration).
+    pub decisions: Vec<MigrationDecision>,
+    /// Human lines describing the forward work (or why none).
+    pub summary: Vec<String>,
+}
+
+/// Compute the interactive [`MigrationPlan`] for a store — status, the forward-work summary, and the
+/// operator-answerable decisions (currently: one per default-scope collision — rename / skip / abort).
+/// Writes NOTHING. When collisions exist the dry-run summary is skipped (the engine refuses to stage a
+/// colliding store until the operator resolves them, so there is no clean forward to preview yet).
+pub async fn plan(kv: &dyn KvStore) -> Result<MigrationPlan, MigrateError> {
+    let state = read_state(kv).await?;
+    let status = status(kv).await?;
+
+    let decisions: Vec<MigrationDecision> = default_scope_collisions(kv)
+        .await?
+        .into_iter()
+        .map(collision_decision)
+        .collect();
+
+    let mut summary = Vec::new();
+    if status == Status::NeedsMigration {
+        if decisions.is_empty() {
+            // No collisions → a dry run previews the forward work (writes nothing).
+            let report = run(
+                kv,
+                MigrateOptions {
+                    dry_run: true,
+                    finalize: false,
+                },
+                &registry(),
+            )
+            .await?;
+            for (family, n) in &report.rekeyed {
+                summary.push(format!("re-home {n} key(s) under {family}"));
+            }
+            if summary.is_empty() {
+                summary.push("no bare default-scoped data-plane keys to re-home".to_string());
+            }
+        } else {
+            summary.push(
+                "Resolve the decision(s) above, then re-run the plan — the re-home proceeds once no \
+                 collision remains."
+                    .to_string(),
+            );
+        }
+    }
+
+    Ok(MigrationPlan {
+        status,
+        current_version: state.version,
+        target_version: CURRENT_VERSION,
+        decisions,
+        summary,
+    })
+}
+
+/// Build the operator-answerable decision for one collision: rename (with a new-name input) / skip
+/// (leave un-re-homed) / abort.
+fn collision_decision(c: DefaultScopeCollision) -> MigrationDecision {
+    let commingle = matches!(c.reason, CollisionReason::CommingleProject);
+    let DefaultScopeCollision { kind, name, .. } = &c;
+    MigrationDecision {
+        id: format!("collision:{kind}/{name}"),
+        question: format!(
+            "default-project {kind} `{name}` {} — how do you want to resolve it before the re-home?",
+            if commingle {
+                format!("commingles with the existing tenant project `{name}`")
+            } else {
+                "is named `default`, which collides with the re-home prefix".to_string()
+            }
+        ),
+        routes: vec![
+            DecisionRoute {
+                key: "rename".to_string(),
+                label: format!("Re-create the {kind} under a new, non-colliding name"),
+                input: Some(RouteInput {
+                    prompt: "new name".to_string(),
+                    kind: RouteInputKind::ResourceName,
+                }),
+                note: Some(if commingle {
+                    "Guest data this resource wrote under the shared scope is commingled with the \
+                     tenant and is NOT auto-moved — confirm it has none, or reconcile it manually."
+                        .to_string()
+                } else {
+                    "Re-creates via the normal deploy path, which carries its deploy history, \
+                     domains, aliases and functions."
+                        .to_string()
+                }),
+            },
+            DecisionRoute {
+                key: "skip".to_string(),
+                label: "Leave it un-re-homed".to_string(),
+                input: None,
+                note: Some(
+                    "Its bare default-scoped data stays as-is (stranded at finalize); the rest of \
+                     the default project still re-homes."
+                        .to_string(),
+                ),
+            },
+            DecisionRoute {
+                key: "abort".to_string(),
+                label: "Cancel the migration".to_string(),
+                input: None,
+                note: None,
+            },
+        ],
+    }
 }
 
 /// The **default-scope re-home key transform** — the single, mutation-gated predicate that decides,
@@ -1979,6 +2204,59 @@ mod tests {
             abort(&kv).await,
             Err(MigrateError::AbortNothingStaged)
         ));
+    }
+
+    #[tokio::test]
+    async fn plan_surfaces_a_clean_migration_without_decisions() {
+        let kv = MemoryKv::new();
+        seed_default_scope(&kv).await; // bare default data + tenant acme, no colliding resource
+        let p = plan(&kv).await.unwrap();
+        assert_eq!(p.status, Status::NeedsMigration);
+        assert_eq!(p.current_version, 1);
+        assert_eq!(p.target_version, CURRENT_VERSION);
+        assert!(p.decisions.is_empty(), "no collisions in the clean fixture");
+        assert!(
+            p.summary.iter().any(|s| s.contains("re-home")),
+            "a clean plan previews the forward work: {:?}",
+            p.summary
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_surfaces_a_collision_as_a_rename_skip_abort_decision() {
+        let kv = MemoryKv::new();
+        seed_default_scope(&kv).await;
+        // A default-project COMPUTE named like the existing tenant project `acme` → commingle collision.
+        kv.put("project/default/compute/acme", b"spec".to_vec())
+            .await
+            .unwrap();
+        let p = plan(&kv).await.unwrap();
+        assert_eq!(p.decisions.len(), 1, "exactly the one collision");
+        let d = &p.decisions[0];
+        assert_eq!(d.id, "collision:compute/acme");
+        let keys: Vec<&str> = d.routes.iter().map(|r| r.key.as_str()).collect();
+        assert_eq!(keys, vec!["rename", "skip", "abort"]);
+        let rename = d.routes.iter().find(|r| r.key == "rename").unwrap();
+        assert!(
+            matches!(
+                rename.input,
+                Some(RouteInput {
+                    kind: RouteInputKind::ResourceName,
+                    ..
+                })
+            ),
+            "the rename route must take a resource-name input"
+        );
+        // A collision defers the dry-run preview to after resolution.
+        assert!(
+            p.summary.iter().any(|s| s.contains("Resolve the decision")),
+            "summary should point at resolving the collision first: {:?}",
+            p.summary
+        );
+        // The plan is serde round-trippable (the console admin API renders it as JSON).
+        let json = serde_json::to_string(&p).unwrap();
+        let back: MigrationPlan = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, p);
     }
 
     #[tokio::test]
