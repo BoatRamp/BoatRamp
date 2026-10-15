@@ -388,10 +388,20 @@ fn decisions_view(
 
             { summary_block(plan) }
 
+            if any_abort {
+                <div role="alert" class="rounded-md border border-amber-300 bg-amber-50 px-3 py-2">
+                    <p class="text-sm text-amber-800">
+                        { "Abort is selected on a decision — this cancels the ENTIRE migration, and \
+                           your skip/rename answers on the other decisions are ignored. Clear it to \
+                           keep resolving collisions." }
+                    </p>
+                </div>
+            }
+
             <div class="flex flex-wrap items-center gap-2 border-t border-slate-100 pt-4">
                 <Button variant={BtnVariant::Primary} busy={**busy} busy_label="Arming…"
                         disabled={!armable}
-                        label={if any_abort { "Arm (cancel migration)" } else { "Arm & stage at restart" }}
+                        label={if any_abort { "Record 'do not migrate'" } else { "Arm & stage at restart" }}
                         onclick={on_arm} />
                 <Button variant={BtnVariant::Secondary} label="Re-check"
                         onclick={reload_click(reload)} />
@@ -421,7 +431,7 @@ fn armed_view(
     reload: &Callback<()>,
 ) -> Html {
     let headline = if armed.aborted {
-        "A \u{201c}do not migrate\u{201d} decision is armed — the next restart will NOT stage the re-home."
+        "A 'do not migrate' decision is armed — the next restart will NOT stage the re-home."
             .to_string()
     } else if armed.skip_collisions.is_empty() {
         "The re-home is armed.".to_string()
@@ -476,8 +486,8 @@ fn dual_view(
     let on_abort = abort_callback(session, action, busy, reload, AbortKind::RollBack);
     html! {
         <div class="space-y-4">
-            <div class="flex items-center gap-2">
-                <Pill text="staged" tone={Tone::Good} />
+            <div role="status" class="flex items-center gap-2">
+                <Pill text="staged · finalize pending" tone={Tone::Warn} />
                 <span class="text-sm text-slate-600">
                     { format!("Schema version {} — forward done, old keys retained (dual soak).", plan.current_version) }
                 </span>
@@ -486,7 +496,7 @@ fn dual_view(
                 { "Staged — restart to adopt, then re-home blob + libsql and run " }
                 <code class="font-mono text-xs">{ "boatramp migrate --finalize" }</code>
                 { " (CLI) to drop the old keys. The finalize is deliberately not exposed here: it \
-                   must run after the restart and the other substrates, with the substrate-complete gate." }
+                   must run after the restart and the other substrates are re-homed." }
             </p>
             <div class="flex flex-wrap items-center gap-2 border-t border-slate-100 pt-4">
                 <Button variant={BtnVariant::Danger} busy={**busy} busy_label="Rolling back…"
@@ -508,7 +518,7 @@ fn restarting_view(err: &ApiError) -> Html {
             <div class="flex items-center gap-3 rounded-lg border border-slate-200 bg-slate-50 px-4 py-3">
                 <Spinner label="Restarting… reconnecting" />
             </div>
-            <p class="text-xs text-slate-400">{ format!("(last attempt: {err})") }</p>
+            <p class="text-xs text-slate-500">{ format!("(last attempt: {err})") }</p>
         </div>
     }
 }
@@ -606,8 +616,7 @@ fn arm_consequences(answers: &MigrationAnswers, any_rename: bool) -> Html {
         return html! {};
     }
     let line = if answers.aborted {
-        "Arming records a \u{201c}do not migrate\u{201d} decision; the next restart stages nothing."
-            .to_string()
+        "Arming records a 'do not migrate' decision; the next restart stages nothing.".to_string()
     } else if answers.skip_collisions.is_empty() {
         "Arming stages the full re-home at the next restart.".to_string()
     } else {
@@ -637,14 +646,14 @@ fn id_list(label: &str, ids: &[String]) -> Html {
 fn action_banner(msg: &ActionMsg) -> Html {
     match msg {
         ActionMsg::Ok(text) => html! {
-            <div class="flex items-start gap-2 rounded-lg border border-emerald-200 bg-emerald-50 px-4 py-3">
+            <div role="status" class="flex items-start gap-2 rounded-lg border border-emerald-200 bg-emerald-50 px-4 py-3">
                 <Pill text="done" tone={Tone::Good} />
                 <span class="text-sm text-emerald-800">{ text }</span>
             </div>
         },
         ActionMsg::Err(text) => html! {
             <div role="alert" class="rounded-lg border border-rose-200 bg-rose-50 px-4 py-3">
-                <p class="text-sm text-rose-700" style="white-space: pre-wrap">{ text }</p>
+                <p class="text-sm text-rose-700 whitespace-pre-wrap">{ text }</p>
             </div>
         },
     }
@@ -680,18 +689,18 @@ fn arm_callback(
     let tick = tick.clone();
     Callback::from(move |_: MouseEvent| {
         let prompt = if answers.aborted {
-            "Arm a \u{201c}do not migrate\u{201d} decision?\n\nThe next node restart will NOT stage the \
+            "Arm a 'do not migrate' decision?\n\nThe next node restart will NOT stage the \
              re-home. Nothing changes now."
                 .to_string()
         } else if answers.skip_collisions.is_empty() {
             "Arm the migration and stage it at the next restart?\n\nThis only records the decision — the \
-             re-home runs when you restart the node with `serve --auto-migrate` (it stages at boot, before \
+             re-home runs when you restart the node with serve --auto-migrate (it stages at boot, before \
              serving). Nothing destructive happens now."
                 .to_string()
         } else {
             format!(
                 "Arm the migration, leaving {} collision(s) un-re-homed?\n\nThis only records the decision \
-                 — the re-home runs at the next restart (`serve --auto-migrate`, staged at boot). Nothing \
+                 — the re-home runs at the next restart (serve --auto-migrate, staged at boot). Nothing \
                  destructive happens now.",
                 answers.skip_collisions.len()
             )
@@ -717,7 +726,7 @@ fn arm_callback(
             match outcome {
                 Ok(resp) => {
                     let msg = if resp.aborted {
-                        "Armed a \u{201c}do not migrate\u{201d} decision.".to_string()
+                        "Armed a 'do not migrate' decision.".to_string()
                     } else if resp.restart_required {
                         format!("Armed. {}", resp.next)
                     } else {
