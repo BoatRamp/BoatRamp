@@ -317,7 +317,7 @@ pub struct PostureOverrides {
 /// capability-mint ceiling. It can never widen reach into **another** project — cross-project
 /// isolation is structural (project = database), not a posture knob. So one serve process can host a
 /// strict-isolation project alongside a looser one on a shared, multi-project machine.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ProjectPostureOverride {
     /// Override [`SecurityPosture::require_tenancy_declaration`] for this project.
@@ -345,7 +345,7 @@ pub struct ResolvedProjectTenancy {
 }
 
 /// The raw `[security]` config section as written in `boatramp.cfg` (RON).
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SecurityConfig {
     /// Selected profile: a built-in (`multi-tenant` / `single-tenant` / `dev`) or

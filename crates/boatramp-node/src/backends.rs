@@ -19,7 +19,7 @@ use crate::error::Result;
 /// `Deserialize` (lowercase: `fs`/`s3`/`gcs`/`azure`) so `[serve].blobs` in `boatramp.cfg` can
 /// select the backend — the config-level analog of the `--blobs` flag, which `boatramp blob
 /// migrate` reads to build a source/destination backend from a config file alone.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 #[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
 pub enum BlobBackend {
