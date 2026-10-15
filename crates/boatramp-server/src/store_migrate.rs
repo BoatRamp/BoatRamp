@@ -24,7 +24,7 @@
 
 use super::*;
 
-use boatramp_core::migrate::{self, MigrateError, MigrationAnswers};
+use boatramp_core::migrate::{self, MigrateError, MigrationAnswers, RouteAction};
 
 /// Defense-in-depth (mirrors [`assert_blob_purge_is_system_admin`](crate::blob_purge)): re-derive the
 /// right the authoritative table requires for `path` and assert it is node-global `System·Admin`
@@ -90,30 +90,41 @@ pub(super) async fn store_migrate_arm(
     }
     let kv = deploy.kv().as_ref();
 
-    // Validate: every live collision decision must be SKIP'd (or the whole thing aborted) — a
-    // collision the operator means to RENAME must be resolved externally (re-deploy under a new name)
-    // BEFORE arming, so it is gone from the plan. Otherwise the boot stage would refuse.
-    if !answers.aborted {
-        let plan = match migrate::plan(kv).await {
-            Ok(p) => p,
-            Err(e) => return migrate_error_response(e),
-        };
-        let unresolved: Vec<&str> = plan
-            .decisions
-            .iter()
-            .filter(|d| !answers.skip_collisions.contains(&d.id))
-            .map(|d| d.id.as_str())
-            .collect();
-        if !unresolved.is_empty() {
-            return (
-                StatusCode::CONFLICT,
-                format!(
-                    "cannot arm: unresolved decision(s) {unresolved:?} — skip them, rename them away \
-                     (re-deploy under a non-colliding name), or abort.\n"
-                ),
-            )
-                .into_response();
+    // Validate GENERICALLY against the live plan, keying off each chosen route's `action` (the engine's
+    // migration-agnostic contract) — never off a route-`key` string. Every live decision must resolve
+    // to a `Stage` route (the migration will honor it) unless the operator chose an `Abort` route (then
+    // the whole thing is a "do not migrate" and the other answers don't matter). A decision answered
+    // with an `External` route (e.g. rename — the operator re-creates the resource via the deploy flow)
+    // is NOT yet resolved: it must be done out-of-band so the decision is gone from the plan BEFORE
+    // arming, else the boot stage would refuse. An unanswered decision is likewise unresolved.
+    let plan = match migrate::plan(kv).await {
+        Ok(p) => p,
+        Err(e) => return migrate_error_response(e),
+    };
+    let mut aborting = false;
+    let mut unresolved: Vec<&str> = Vec::new();
+    for d in &plan.decisions {
+        match answers
+            .route(&d.id)
+            .and_then(|k| d.routes.iter().find(|r| r.key == k))
+        {
+            Some(route) => match route.action {
+                RouteAction::Abort => aborting = true,
+                RouteAction::Stage => {}
+                RouteAction::External => unresolved.push(d.id.as_str()),
+            },
+            None => unresolved.push(d.id.as_str()),
         }
+    }
+    if !aborting && !unresolved.is_empty() {
+        return (
+            StatusCode::CONFLICT,
+            format!(
+                "cannot arm: unresolved decision(s) {unresolved:?} — resolve each (e.g. re-deploy a \
+                 colliding resource under a non-colliding name so it leaves the plan), or abort.\n"
+            ),
+        )
+            .into_response();
     }
 
     if let Err(e) = migrate::arm_answers(kv, &answers).await {
@@ -123,7 +134,7 @@ pub(super) async fn store_migrate_arm(
     let _ = deploy.kv().flush().await;
     Json(serde_json::json!({
         "armed": true,
-        "aborted": answers.aborted,
+        "aborted": aborting,
         "restart_required": true,
         "next": "Restart the node: `serve --auto-migrate` stages the re-home at boot (before the \
                  runtime is built). Then re-home blob + libsql and run `boatramp migrate --finalize`."

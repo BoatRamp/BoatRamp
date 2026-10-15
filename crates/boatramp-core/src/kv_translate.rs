@@ -71,12 +71,17 @@ impl DefaultScopeCompatKv {
     }
 
     /// old→new: translate a key read from the store back to the two-segment spelling the runtime
-    /// expects. Project-aware: a named project's key and an already-`default/` key are returned
-    /// unchanged (`rehome_default_scope` yields `None`); only a genuine bare default scope is re-spelled.
-    fn up(&self, key: String) -> String {
+    /// expects, against a CURRENT named-project set. Project-aware: a named project's key and an
+    /// already-`default/` key are returned unchanged (`rehome_default_scope` yields `None`); only a
+    /// genuine bare default scope is re-spelled. `projects` is read FRESH per list/scan (see
+    /// [`current_projects`](Self::current_projects)), NOT snapshotted at construction — so a tenant
+    /// project created AFTER this decorator was built is never wrongly rewritten under the default scope,
+    /// which would otherwise surface its topics/keys as `default/{proj}/…` to node-wide messaging
+    /// sweeps (Security finding H-1).
+    fn up_with(&self, key: String, projects: &HashSet<String>) -> String {
         for fam in DEFAULT_SCOPE_FAMILIES {
             if key.starts_with(fam) {
-                return match rehome_default_scope(fam, &key, &self.projects) {
+                return match rehome_default_scope(fam, &key, projects) {
                     Some(new_key) => new_key,
                     None => key,
                 };
@@ -85,8 +90,14 @@ impl DefaultScopeCompatKv {
         key
     }
 
-    fn up_keys(&self, keys: Vec<String>) -> Vec<String> {
-        keys.into_iter().map(|k| self.up(k)).collect()
+    /// The CURRENT named-project set, re-read from the store on every list/scan so the old→new
+    /// back-translation can never mislabel a tenant project created after this decorator was built
+    /// (H-1). Falls back to the construction-time snapshot only if the (cheap `projectmeta/`) read
+    /// transiently fails — never staler than before, and the common path is always fresh.
+    async fn current_projects(&self) -> HashSet<String> {
+        known_projects(self.inner.as_ref())
+            .await
+            .unwrap_or_else(|_| (*self.projects).clone())
     }
 
     fn down_ops(&self, ops: Vec<WriteOp>) -> Vec<WriteOp> {
@@ -115,7 +126,11 @@ impl KvStore for DefaultScopeCompatKv {
 
     async fn list_prefix(&self, prefix: &str) -> Result<Vec<String>, KvError> {
         let keys = self.inner.list_prefix(&self.down(prefix)).await?;
-        Ok(self.up_keys(keys))
+        let projects = self.current_projects().await;
+        Ok(keys
+            .into_iter()
+            .map(|k| self.up_with(k, &projects))
+            .collect())
     }
 
     async fn list_from(
@@ -132,12 +147,20 @@ impl KvStore for DefaultScopeCompatKv {
             .inner
             .list_from(&self.down(prefix), after, limit)
             .await?;
-        Ok(self.up_keys(keys))
+        let projects = self.current_projects().await;
+        Ok(keys
+            .into_iter()
+            .map(|k| self.up_with(k, &projects))
+            .collect())
     }
 
     async fn scan_prefix(&self, prefix: &str) -> Result<Vec<(String, Vec<u8>)>, KvError> {
         let pairs = self.inner.scan_prefix(&self.down(prefix)).await?;
-        Ok(pairs.into_iter().map(|(k, v)| (self.up(k), v)).collect())
+        let projects = self.current_projects().await;
+        Ok(pairs
+            .into_iter()
+            .map(|(k, v)| (self.up_with(k, &projects), v))
+            .collect())
     }
 
     async fn dump_scan(&self) -> Result<Vec<KvDumpEntry>, KvError> {
@@ -337,6 +360,48 @@ mod tests {
             vec!["mqready/default/blog".to_string()]
         );
         println!("ROLL-NOOP OLD-LAYOUT OK");
+    }
+
+    #[tokio::test]
+    async fn post_construction_tenant_is_never_pulled_under_default() {
+        // H-1 regression: a tenant project created AFTER the decorator is built (the pre-migration
+        // serve window stays live) must NOT have its data-plane keys surfaced under the default scope
+        // by a family-wide list — which the drain/ready-set sweeps run over the decorated handle. The
+        // construction-time project snapshot would mislabel it; the per-list fresh read must not.
+        let raw = Arc::new(MemoryKv::new());
+        raw.put("projectmeta/default", b"h".to_vec()).await.unwrap();
+        raw.put("hkv/blog/x", b"1".to_vec()).await.unwrap(); // a bare default key (makes v2 applicable)
+        // No `evil` project exists yet → it is ABSENT from the decorator's construction snapshot.
+        let compat = default_scope_compat_kv(raw.clone()).await;
+        assert!(
+            !Arc::ptr_eq(&(raw.clone() as Arc<dyn KvStore>), &compat),
+            "the un-migrated store must be wrapped"
+        );
+        // NOW create tenant `evil` + its data (the post-construction window).
+        raw.put("projectmeta/evil", b"h".to_vec()).await.unwrap();
+        raw.put("hkv/evil/site/y", b"2".to_vec()).await.unwrap();
+        raw.put("mq/evil/base/1-aa", b"m".to_vec()).await.unwrap();
+
+        // A family-wide list maps the DEFAULT's bare key up, and leaves `evil`'s keys VERBATIM —
+        // never `hkv/default/evil/…` (which a stale snapshot would have produced).
+        let mut hkv = compat.list_prefix("hkv/").await.unwrap();
+        hkv.sort();
+        assert_eq!(
+            hkv,
+            vec![
+                "hkv/default/blog/x".to_string(),
+                "hkv/evil/site/y".to_string(),
+            ]
+        );
+        assert!(
+            !hkv.iter().any(|k| k.starts_with("hkv/default/evil/")),
+            "a post-construction tenant must never be pulled under the default scope"
+        );
+        assert_eq!(
+            compat.list_prefix("mq/").await.unwrap(),
+            vec!["mq/evil/base/1-aa".to_string()],
+            "the tenant's topic index stays under its own scope, not default/"
+        );
     }
 
     #[tokio::test]

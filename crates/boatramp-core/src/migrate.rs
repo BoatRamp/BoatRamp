@@ -53,7 +53,7 @@
 //! re-verifying, so racers converge. The marker cursor is a last-writer-wins `put` (no
 //! CAS), so a race can at worst redo a step, never skip a delete-guard.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -290,6 +290,11 @@ pub struct MigrationReport {
     pub already_migrated: bool,
     /// The store is left in the `dual` soak (forward done, cleanup deferred).
     pub dual: bool,
+    /// A pending migration's [`Migration::precheck`] returned [`Precheck::Aborted`] — the operator
+    /// chose to cancel at one of its interactive decisions, so the pass changed nothing. Only ever set
+    /// on the interactive path ([`migrate_with_answers`]); always `false` otherwise.
+    #[serde(skip_serializing_if = "std::ops::Not::not", default)]
+    pub aborted: bool,
 }
 
 impl MigrationReport {
@@ -438,22 +443,42 @@ pub async fn migrate(
     kv: &dyn KvStore,
     opts: MigrateOptions,
 ) -> Result<MigrationReport, MigrateError> {
-    // Non-interactive: an empty skip set ⇒ the guard refuses on ANY default-scope collision.
-    run(kv, opts, &HashSet::new(), &registry()).await
+    // Non-interactive: empty answers ⇒ a migration with an unresolved mandatory decision refuses
+    // (its `precheck` sees no answer for the fork). The generic engine knows no migration specifics.
+    run(kv, opts, &MigrationAnswers::default(), &registry()).await
 }
 
-/// An operator's answers to the interactive migration's [`MigrationDecision`]s. Collisions resolved by
-/// renaming are simply gone from the next scan (nothing to carry); this records the ones the operator
-/// chose to SKIP (proceed, leaving the resource un-re-homed/bare) and whether any decision was answered
-/// `abort`. Serde so the console admin surface can persist/replay it (`schema/pending-decision`).
+/// An operator's answers to the interactive migration's [`MigrationDecision`]s — a GENERIC map from
+/// each [`MigrationDecision::id`] to the [`DecisionRoute`] the operator chose (plus any free-text
+/// input the route required). The engine carries this opaquely and hands it to each migration's
+/// [`Migration::precheck`]; **only the owning migration interprets its own decision ids + route keys**
+/// (the generic engine knows nothing about what a route "means"). A decision the operator resolved by
+/// an [`RouteAction::External`] route (e.g. re-creating a colliding resource via the deploy flow) is
+/// simply gone from the next plan, so nothing need be carried for it. Serde so the console admin
+/// surface can persist/replay it (armed answers — [`ARMED_ANSWERS_KEY`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MigrationAnswers {
-    /// Collision decision ids (`collision:{kind}/{name}`) the operator chose to SKIP.
-    #[serde(skip_serializing_if = "Vec::is_empty", default)]
-    pub skip_collisions: Vec<String>,
-    /// The operator chose `abort` at a decision — the migration must not proceed.
-    #[serde(skip_serializing_if = "std::ops::Not::not", default)]
-    pub aborted: bool,
+    /// `decision id` → the operator's chosen route for it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub choices: BTreeMap<String, DecisionChoice>,
+}
+
+/// One answer: the [`DecisionRoute::key`] the operator chose, and the value they supplied for its
+/// [`RouteInput`] (if it had one).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DecisionChoice {
+    /// The chosen route's [`key`](DecisionRoute::key).
+    pub route: String,
+    /// The free-text value the route's [`RouteInput`] asked for, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+}
+
+impl MigrationAnswers {
+    /// The route key the operator chose for `decision_id`, if answered.
+    pub fn route(&self, decision_id: &str) -> Option<&str> {
+        self.choices.get(decision_id).map(|c| c.route.as_str())
+    }
 }
 
 /// The outcome of an interactive stage ([`migrate_with_answers`]).
@@ -465,30 +490,31 @@ pub enum InteractiveOutcome {
     Staged(MigrationReport),
 }
 
-/// Stage the migration honoring the operator's interactive [`MigrationAnswers`]. Unlike the
-/// non-interactive [`migrate`], a collision the operator chose to SKIP does not refuse (the resource
-/// is left bare / un-re-homed); a collision that is neither renamed-away nor skipped STILL refuses
-/// fail-closed (so the driver can re-prompt). `abort` short-circuits without touching the store.
-/// Always STAGES into the dual soak (never inline-finalizes) — finalize stays an explicit later step.
+/// Stage the migration honoring the operator's interactive [`MigrationAnswers`]. The generic engine
+/// hands the answers to each pending migration's [`Migration::precheck`], which interprets them:
+/// a fork the operator resolved acceptably proceeds, a fork answered `abort` cancels the whole pass
+/// ([`InteractiveOutcome::Aborted`], store untouched), and a fork left unresolved STILL refuses
+/// fail-closed (so the driver can re-prompt). Always STAGES into the dual soak (never
+/// inline-finalizes) — finalize stays an explicit later step.
 pub async fn migrate_with_answers(
     kv: &dyn KvStore,
     answers: &MigrationAnswers,
 ) -> Result<InteractiveOutcome, MigrateError> {
-    if answers.aborted {
-        return Ok(InteractiveOutcome::Aborted);
-    }
-    let skip: HashSet<String> = answers.skip_collisions.iter().cloned().collect();
     let report = run(
         kv,
         MigrateOptions {
             dry_run: false,
             finalize: false,
         },
-        &skip,
+        answers,
         &registry(),
     )
     .await?;
-    Ok(InteractiveOutcome::Staged(report))
+    if report.aborted {
+        Ok(InteractiveOutcome::Aborted)
+    } else {
+        Ok(InteractiveOutcome::Staged(report))
+    }
 }
 
 /// The reserved key holding **armed** interactive answers — the operator's [`MigrationAnswers`]
@@ -603,7 +629,7 @@ async fn abort_with(
 async fn run(
     kv: &dyn KvStore,
     opts: MigrateOptions,
-    skip_collisions: &HashSet<String>,
+    answers: &MigrationAnswers,
     migrations: &[Box<dyn Migration>],
 ) -> Result<MigrationReport, MigrateError> {
     let mut state = read_state(kv).await?;
@@ -615,33 +641,33 @@ async fn run(
         return Ok(report);
     }
 
-    // Fail-closed PRE-MIGRATION guard (v0.31.0 Finding 8): BEFORE migration 2's forward runs (so no
-    // `…/default/…` re-homed key exists yet), refuse if a default-project resource's bare data-plane
-    // scope conflicts with the re-home — a site/compute named `default` (collides with the re-home
-    // prefix) or named like a KNOWN project (the pre-existing commingling). Skipped on resume (the
-    // pre-forward invariant no longer holds). `skip_collisions` holds the decision ids
-    // (`collision:{kind}/{name}`) the operator explicitly chose to SKIP via the interactive flow — a
-    // skipped resource is left bare (its data is NOT re-homed; `rehome_default_scope` already no-ops
-    // it) and does NOT refuse; a collision that is neither resolved (renamed away) nor skipped STILL
-    // refuses fail-closed. The non-interactive `migrate()` passes an empty set, so it refuses on ANY
-    // collision (unchanged). This is the KV-level half; blob/libsql substrate-completeness is observed
-    // by the node-level readiness guard.
-    let v2_pending = state.version < DEFAULT_SCOPE_REHOME_VERSION;
-    let resuming_v2 = state
-        .in_progress
-        .as_ref()
-        .is_some_and(|ip| ip.target == DEFAULT_SCOPE_REHOME_VERSION);
-    if v2_pending && !resuming_v2 {
-        let unresolved: Vec<String> = default_scope_collisions(kv)
-            .await?
-            .into_iter()
-            .filter(|c| !skip_collisions.contains(&format!("collision:{}/{}", c.kind, c.name)))
-            .map(|c| c.describe())
-            .collect();
-        if !unresolved.is_empty() {
-            return Err(MigrateError::DefaultNamedResource {
-                resources: unresolved,
-            });
+    // GENERIC pre-forward gate. Each pending migration validates the operator's answers against its
+    // OWN state via [`Migration::precheck`] and decides whether it may proceed — the engine never
+    // inspects a migration's specific decisions, it only honors the three verdicts: `Proceed`,
+    // `Aborted` (the operator cancelled at one of this migration's forks — the whole pass is a no-op),
+    // or an `Err` refusal (an unresolved mandatory fork; the non-interactive `migrate()` hits this on
+    // ANY such fork because it passes empty answers). A migration with no interactive decisions uses
+    // the trait default (`Proceed`). Runs before the dry-run preview too, so a `--dry-run` on an
+    // unresolved store surfaces the refusal rather than a misleading empty preview.
+    //
+    // ALWAYS run — including on RESUME of an interrupted forward (Security HIGH-1). `precheck` is a
+    // guard, so it must be valid whenever called: it validates against state the forward does NOT
+    // invalidate (operator answers + control-plane pointers), never against data-plane state the
+    // forward is actively rewriting. The default-scope re-home's `precheck` scans the control-plane
+    // `project/default/site|compute/` pointers (untouched by the data-plane forward), so it is correct
+    // mid-resume too. Skipping it on resume would let a collision that FIRST APPEARS during a
+    // mid-flight interruption window (e.g. a tenant project created with a colliding name while the
+    // forward is stalled) be silently proceeded past when the pass resumes — re-opening the
+    // cross-tenant commingle exposure this gate exists to prevent. On a `--auto-migrate` resume the
+    // armed answers are replayed (so a legitimately-resolved collision still passes); a plain
+    // `migrate` resume with no answers refuses fail-closed (the operator re-runs `--interactive`).
+    for m in migrations.iter().filter(|m| m.version() > state.version) {
+        match m.precheck(kv, answers).await? {
+            Precheck::Proceed => {}
+            Precheck::Aborted => {
+                report.aborted = true;
+                return Ok(report);
+            }
         }
     }
 
@@ -771,6 +797,16 @@ fn registry() -> Vec<Box<dyn Migration>> {
     vec![Box::new(ProjectRekeyV1), Box::new(DefaultScopeRehomeV2)]
 }
 
+/// A migration's verdict after validating the operator's [`MigrationAnswers`] against its own
+/// pre-forward state — the generic engine's only interface to a migration's interactive decisions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Precheck {
+    /// Every mandatory fork this migration surfaces is resolved acceptably — run the forward.
+    Proceed,
+    /// The operator chose to cancel at one of this migration's decisions — the whole pass is a no-op.
+    Aborted,
+}
+
 /// One ordered, versioned, forward-only migration.
 #[async_trait]
 trait Migration: Send + Sync {
@@ -825,6 +861,42 @@ trait Migration: Send + Sync {
     /// reclaims. Default: nothing to clean up.
     async fn abort_cleanup(&self, _kv: &dyn KvStore) -> Result<(), MigrateError> {
         Ok(())
+    }
+
+    // ---- interactive migration: a migration owns its OWN questions + answer interpretation --------
+    //
+    // The generic engine never embeds a migration's specific questions or actions. A migration that
+    // has an operator-answerable fork (a point with more than one valid route — e.g. a name collision)
+    // surfaces it from `decisions` and interprets the operator's answers in `precheck`. A migration
+    // with no fork uses the defaults below (no decisions; always `Proceed`), so the straight-through
+    // case needs nothing.
+
+    /// The operator-answerable [`MigrationDecision`]s THIS migration needs resolved before it can
+    /// complete, given the store's current (pre-forward) state. The generic [`plan`] aggregates these
+    /// across the pending migrations; each is rendered by the CLI prompt loop / console wizard, and the
+    /// operator's choice comes back in [`MigrationAnswers`]. Default: none.
+    async fn decisions(&self, _kv: &dyn KvStore) -> Result<Vec<MigrationDecision>, MigrateError> {
+        Ok(Vec::new())
+    }
+
+    /// Validate the operator's `answers` against this migration's state and decide whether it may
+    /// proceed. Called by the engine before the forward (and on the non-interactive path with empty
+    /// answers). Return [`Precheck::Proceed`] to run the forward, [`Precheck::Aborted`] if the operator
+    /// chose to cancel, or an `Err` to refuse fail-closed (a mandatory decision left unresolved).
+    /// Default: `Proceed` — no decisions to gate on. Writes nothing.
+    ///
+    /// CONTRACT (Security HIGH-1): this is a safety guard the engine runs on EVERY pass, **including a
+    /// RESUME of an interrupted forward** — so it must be valid whenever called. Validate only against
+    /// state the forward does NOT invalidate (the operator `answers`, and control-plane facts the
+    /// data-plane forward never mutates); never against data-plane state the forward is actively
+    /// rewriting (which would read as half-done on resume). A guard that cannot meet this contract must
+    /// be redesigned, not skipped — skipping on resume re-opens any window a collision can appear in.
+    async fn precheck(
+        &self,
+        _kv: &dyn KvStore,
+        _answers: &MigrationAnswers,
+    ) -> Result<Precheck, MigrateError> {
+        Ok(Precheck::Proceed)
     }
 }
 
@@ -998,6 +1070,54 @@ impl Migration for DefaultScopeRehomeV2 {
         }
         Ok(())
     }
+
+    // ---- this migration's OWN interactive decisions + answer interpretation (Finding 8) ----------
+
+    async fn decisions(&self, kv: &dyn KvStore) -> Result<Vec<MigrationDecision>, MigrateError> {
+        // One decision per pre-forward scope collision — rename / skip / abort.
+        Ok(default_scope_collisions(kv)
+            .await?
+            .into_iter()
+            .map(collision_decision)
+            .collect())
+    }
+
+    async fn precheck(
+        &self,
+        kv: &dyn KvStore,
+        answers: &MigrationAnswers,
+    ) -> Result<Precheck, MigrateError> {
+        // Re-scan the collisions (pre-forward; the engine skips precheck on resume) and interpret the
+        // operator's answer for each. A `rename` is resolved by the collision being GONE from this scan
+        // (the operator re-created the resource externally), so a collision STILL present answered
+        // anything other than a safe `skip` is unresolved — refuse fail-closed, naming it. Any decision
+        // answered `abort` cancels the whole pass.
+        let mut unresolved = Vec::new();
+        let mut aborting = false;
+        for c in default_scope_collisions(kv).await? {
+            let id = format!("collision:{}/{}", c.kind, c.name);
+            match answers.route(&id) {
+                Some("abort") => aborting = true,
+                // A `NamedDefault` skip is honored (no tenant shares the scope; the bytes stay bare
+                // within the default project's own scope). A `CommingleProject` skip is NOT (Security
+                // M-1): its stranded bytes stay under the bare `{name}` prefix the same-named TENANT
+                // reads, a cross-tenant exposure — so a commingle is rename-or-abort only and refuses
+                // here even if a `skip` is somehow submitted.
+                Some("skip") if c.reason == CollisionReason::NamedDefault => {}
+                _ => unresolved.push(c.describe()),
+            }
+        }
+        if !unresolved.is_empty() {
+            return Err(MigrateError::DefaultNamedResource {
+                resources: unresolved,
+            });
+        }
+        Ok(if aborting {
+            Precheck::Aborted
+        } else {
+            Precheck::Proceed
+        })
+    }
 }
 
 /// The set of **known project names** (the `projectmeta/<name>` pointer keys), including the reserved
@@ -1046,6 +1166,12 @@ pub enum CollisionReason {
     /// The resource is named like a KNOWN tenant project — its bare scope `{name}` commingles with
     /// that project's keyspace (the pre-existing Finding-8 collision), undecidable to auto-split.
     CommingleProject,
+    /// A **tenant project** is named like a reserved data-plane scope-prefix literal (currently only
+    /// [`FUNCTION_SCOPE_PREFIX`] = `fn`): its keyspace `{family}{name}/…` commingles with EVERY
+    /// project's function keyspace `{family}{project}/fn/…`, and pre-re-home it shadows the default
+    /// project's own functions (`{family}fn/…`). `fn` is reserved at project-create (Security LOW-1);
+    /// an already-existing such project must be renamed before the re-home — it is NOT auto-splittable.
+    ReservedScopePrefix,
 }
 
 /// A structured default-scope collision — a default-project `site`/`compute` whose bare data-plane
@@ -1074,6 +1200,11 @@ impl DefaultScopeCollision {
             CollisionReason::CommingleProject => {
                 format!("{kind}/{name} (commingles with the existing project `{name}`)")
             }
+            CollisionReason::ReservedScopePrefix => format!(
+                "{kind}/{name} (the tenant project `{name}` is named like the reserved data-plane \
+                 scope prefix `{name}/` and commingles with every project's `{name}/…` keyspace — \
+                 rename it)"
+            ),
         }
     }
 }
@@ -1118,6 +1249,22 @@ pub async fn default_scope_collisions(
             }
         }
     }
+    // Security LOW-1 / LOW-1b: a TENANT project named like a reserved data-plane scope-prefix literal
+    // (`fn` for functions, `bus` for the project-bus keyspace) commingles with every project's
+    // `{prefix}/…` keyspace and, pre-re-home, shadows the default project's own (`{family}{prefix}/…`).
+    // These are reserved at project-create, but an ALREADY-existing such project (pre-dating the
+    // reservation) must be refused fail-closed here — the re-home would otherwise treat
+    // `{family}{prefix}/…` as the tenant's and silently strand the default project's data. Single
+    // source: `RESERVED_SCOPE_PREFIXES` (shared with the create-gate so the two can't drift).
+    for prefix in project::RESERVED_SCOPE_PREFIXES {
+        if projects.contains(*prefix) {
+            out.push(DefaultScopeCollision {
+                kind: "project".to_string(),
+                name: (*prefix).to_string(),
+                reason: CollisionReason::ReservedScopePrefix,
+            });
+        }
+    }
     out.sort_by_key(DefaultScopeCollision::describe);
     Ok(out)
 }
@@ -1144,12 +1291,33 @@ pub struct DecisionRoute {
     pub key: String,
     /// Human label.
     pub label: String,
+    /// What a driver does when the operator picks this route — so the CLI / console need no
+    /// per-migration knowledge of what a route *means*.
+    pub action: RouteAction,
     /// A free-text input this route needs (e.g. the new name for a rename), with its prompt.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input: Option<RouteInput>,
     /// A consequence/warning to show before choosing.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+}
+
+/// What the driver (CLI prompt loop / console wizard) does once the operator picks a route — the
+/// generic, migration-agnostic contract that lets a driver act without knowing a route's meaning.
+/// A migration declares it per route; the drivers and the engine's answer-handling key off this,
+/// never off a route's `key` string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RouteAction {
+    /// Record the choice in [`MigrationAnswers`] and stage; the owning migration's
+    /// [`Migration::precheck`]/forward interprets it (e.g. leave a resource un-migrated).
+    Stage,
+    /// Cancel the whole migration. The driver arms a "do not migrate" / stops; the migration's
+    /// `precheck` reports [`Precheck::Aborted`].
+    Abort,
+    /// The operator must perform this out-of-band first (see the route's `note`/`input`), after which
+    /// the decision is gone from the next plan. The driver shows the guidance and does NOT stage while
+    /// this route is chosen (the engine would refuse it anyway — fail-closed).
+    External,
 }
 
 /// A free-text input a [`DecisionRoute`] requires from the operator.
@@ -1187,43 +1355,45 @@ pub struct MigrationPlan {
 }
 
 /// Compute the interactive [`MigrationPlan`] for a store — status, the forward-work summary, and the
-/// operator-answerable decisions (currently: one per default-scope collision — rename / skip / abort).
-/// Writes NOTHING. When collisions exist the dry-run summary is skipped (the engine refuses to stage a
-/// colliding store until the operator resolves them, so there is no clean forward to preview yet).
+/// operator-answerable decisions. GENERIC: it aggregates each pending migration's own
+/// [`Migration::decisions`] (the engine embeds none itself). Writes NOTHING. When any decision is
+/// pending the dry-run summary is skipped (the engine refuses to stage until the operator resolves
+/// them, so there is no clean forward to preview yet).
 pub async fn plan(kv: &dyn KvStore) -> Result<MigrationPlan, MigrateError> {
     let state = read_state(kv).await?;
     let status = status(kv).await?;
+    let migrations = registry();
 
-    let decisions: Vec<MigrationDecision> = default_scope_collisions(kv)
-        .await?
-        .into_iter()
-        .map(collision_decision)
-        .collect();
+    // Each pending migration contributes its own operator-answerable forks.
+    let mut decisions: Vec<MigrationDecision> = Vec::new();
+    for m in migrations.iter().filter(|m| m.version() > state.version) {
+        decisions.extend(m.decisions(kv).await?);
+    }
 
     let mut summary = Vec::new();
     if status == Status::NeedsMigration {
         if decisions.is_empty() {
-            // No collisions → a dry run previews the forward work (writes nothing).
+            // No pending decisions → a dry run previews the forward work (writes nothing).
             let report = run(
                 kv,
                 MigrateOptions {
                     dry_run: true,
                     finalize: false,
                 },
-                &HashSet::new(),
-                &registry(),
+                &MigrationAnswers::default(),
+                &migrations,
             )
             .await?;
             for (family, n) in &report.rekeyed {
                 summary.push(format!("re-home {n} key(s) under {family}"));
             }
             if summary.is_empty() {
-                summary.push("no bare default-scoped data-plane keys to re-home".to_string());
+                summary.push("no keys to re-home".to_string());
             }
         } else {
             summary.push(
-                "Resolve the decision(s) above, then re-run the plan — the re-home proceeds once no \
-                 collision remains."
+                "Resolve the decision(s) above, then re-run the plan — the migration proceeds once no \
+                 decision remains."
                     .to_string(),
             );
         }
@@ -1241,54 +1411,87 @@ pub async fn plan(kv: &dyn KvStore) -> Result<MigrationPlan, MigrateError> {
 /// Build the operator-answerable decision for one collision: rename (with a new-name input) / skip
 /// (leave un-re-homed) / abort.
 fn collision_decision(c: DefaultScopeCollision) -> MigrationDecision {
-    let commingle = matches!(c.reason, CollisionReason::CommingleProject);
-    let DefaultScopeCollision { kind, name, .. } = &c;
+    let DefaultScopeCollision { kind, name, reason } = &c;
+    let question = match reason {
+        CollisionReason::NamedDefault => format!(
+            "default-project {kind} `{name}` is named `default`, which collides with the re-home \
+             prefix — how do you want to resolve it before the re-home?"
+        ),
+        CollisionReason::CommingleProject => format!(
+            "default-project {kind} `{name}` commingles with the existing tenant project `{name}` — \
+             how do you want to resolve it before the re-home?"
+        ),
+        CollisionReason::ReservedScopePrefix => format!(
+            "tenant project `{name}` is named like the reserved data-plane scope prefix `{name}/`, so \
+             it commingles with every project's `{name}/…` keyspace — how do you want to resolve it \
+             before the re-home?"
+        ),
+    };
     MigrationDecision {
         id: format!("collision:{kind}/{name}"),
-        question: format!(
-            "default-project {kind} `{name}` {} — how do you want to resolve it before the re-home?",
-            if commingle {
-                format!("commingles with the existing tenant project `{name}`")
-            } else {
-                "is named `default`, which collides with the re-home prefix".to_string()
-            }
-        ),
-        routes: vec![
-            DecisionRoute {
-                key: "rename".to_string(),
-                label: format!("Re-create the {kind} under a new, non-colliding name"),
-                input: Some(RouteInput {
-                    prompt: "new name".to_string(),
-                    kind: RouteInputKind::ResourceName,
-                }),
-                note: Some(if commingle {
-                    "Guest data this resource wrote under the shared scope is commingled with the \
-                     tenant and is NOT auto-moved — confirm it has none, or reconcile it manually."
-                        .to_string()
-                } else {
-                    "Re-creates via the normal deploy path, which carries its deploy history, \
-                     domains, aliases and functions."
-                        .to_string()
-                }),
-            },
-            DecisionRoute {
-                key: "skip".to_string(),
-                label: "Leave it un-re-homed".to_string(),
-                input: None,
-                note: Some(
-                    "Its bare default-scoped data stays as-is (stranded at finalize); the rest of \
-                     the default project still re-homes."
-                        .to_string(),
-                ),
-            },
-            DecisionRoute {
-                key: "abort".to_string(),
-                label: "Cancel the migration".to_string(),
-                input: None,
-                note: None,
-            },
-        ],
+        question,
+        routes: collision_routes(*reason),
     }
+}
+
+/// The routes offered for a collision. `rename` and `abort` are always available; `skip` (proceed,
+/// leaving the resource un-re-homed/bare) is offered ONLY for a `NamedDefault` collision — a
+/// `CommingleProject` / `ReservedScopePrefix` must NOT be skippable (Security M-1 + LOW-1): its
+/// stranded bytes would stay under the bare `{name}` prefix the same-named tenant reads, a
+/// cross-tenant exposure. Those are rename-or-abort only (and the engine refuses such a skip even if
+/// one is somehow submitted).
+fn collision_routes(reason: CollisionReason) -> Vec<DecisionRoute> {
+    let rename_note = match reason {
+        CollisionReason::NamedDefault => {
+            "Re-creates via the normal deploy path, which carries its deploy history, domains, \
+             aliases and functions."
+        }
+        CollisionReason::CommingleProject => {
+            "Guest data this resource wrote under the shared scope is commingled with the tenant and \
+             is NOT auto-moved — confirm it has none, or reconcile it manually."
+        }
+        CollisionReason::ReservedScopePrefix => {
+            "Rename the tenant project away from the reserved scope-prefix name (re-create its \
+             resources under a non-reserved project name via the normal deploy flow and delete the \
+             old project), then re-check — the re-home proceeds once no project is named like a \
+             reserved scope prefix."
+        }
+    };
+    let mut routes = vec![DecisionRoute {
+        key: "rename".to_string(),
+        label: "Re-create it under a new, non-colliding name".to_string(),
+        // The operator re-creates it externally (the deploy flow); the collision then clears from the
+        // next plan. The engine never performs the rename, so this never produces a stageable answer.
+        action: RouteAction::External,
+        input: Some(RouteInput {
+            prompt: "new name".to_string(),
+            kind: RouteInputKind::ResourceName,
+        }),
+        note: Some(rename_note.to_string()),
+    }];
+    if matches!(reason, CollisionReason::NamedDefault) {
+        // NamedDefault only: no tenant shares the scope, so leaving it bare strands it within the
+        // default project's own scope (not cross-tenant).
+        routes.push(DecisionRoute {
+            key: "skip".to_string(),
+            label: "Leave it un-re-homed".to_string(),
+            action: RouteAction::Stage,
+            input: None,
+            note: Some(
+                "Its bare default-scoped data stays as-is (stranded at finalize); the rest of the \
+                 default project still re-homes."
+                    .to_string(),
+            ),
+        });
+    }
+    routes.push(DecisionRoute {
+        key: "abort".to_string(),
+        label: "Cancel the migration".to_string(),
+        action: RouteAction::Abort,
+        input: None,
+        note: None,
+    });
+    routes
 }
 
 /// The **default-scope re-home key transform** — the single, mutation-gated predicate that decides,
@@ -1496,6 +1699,17 @@ impl Step for RehomeDefaultScope {
             let Some(value) = kv.get(&old_key).await? else {
                 continue; // vanished between listing and read
             };
+            // M-2 (fail-closed): never OVERWRITE a pre-existing DIVERGENT new key. A new key already
+            // equal to the bare value is an idempotent re-copy (skip); a new key that DIFFERS is a
+            // write made against the new spelling (e.g. a guest write during a transient fail-open
+            // serve window) — overwriting it with the bare value would be silent data loss, so refuse.
+            if let Some(existing) = kv.get(&new_key).await? {
+                if existing == value {
+                    moved += 1;
+                    continue;
+                }
+                return Err(MigrateError::Verify(new_key));
+            }
             kv.put(&new_key, value.clone()).await?;
             if kv.get(&new_key).await?.as_deref() != Some(value.as_slice()) {
                 return Err(MigrateError::Verify(new_key));
@@ -1874,7 +2088,6 @@ mod tests {
             MigrateOptions {
                 dry_run: true,
                 finalize: true,
-                ..Default::default()
             },
         )
         .await
@@ -1903,7 +2116,6 @@ mod tests {
             MigrateOptions {
                 dry_run: false,
                 finalize: false,
-                ..Default::default()
             },
         )
         .await
@@ -2180,6 +2392,174 @@ mod tests {
         assert_eq!(kv.list_prefix("").await.unwrap(), before);
     }
 
+    #[tokio::test]
+    async fn default_scope_rehome_refuses_to_overwrite_a_divergent_new_key() {
+        // Security M-2 (fail-closed forward): the re-home must NEVER overwrite a pre-existing NEW key
+        // that DIVERGES from its bare OLD twin — such a key is a write made against the new spelling
+        // (e.g. a guest write during a transient fail-open serve window), and clobbering it with the
+        // bare value would be silent data loss. A new key EQUAL to the bare value is an idempotent
+        // re-copy and must pass.
+
+        // (a) Divergent pre-existing new key ⇒ refuse (Verify), nothing clobbered, nothing staged.
+        let kv = MemoryKv::new();
+        seed_default_scope(&kv).await;
+        kv.put("hkv/default/blog/counter", b"CONCURRENT".to_vec())
+            .await
+            .unwrap(); // diverges from the bare OLD twin `hkv/blog/counter` = "7"
+        let err = migrate(
+            &kv,
+            MigrateOptions {
+                dry_run: false,
+                finalize: false,
+            },
+        )
+        .await;
+        assert!(
+            matches!(&err, Err(MigrateError::Verify(k)) if k == "hkv/default/blog/counter"),
+            "a divergent pre-existing new key must refuse fail-closed, got {err:?}"
+        );
+        assert_eq!(
+            kv.get("hkv/default/blog/counter").await.unwrap().as_deref(),
+            Some(&b"CONCURRENT"[..]),
+            "the divergent new key must be left UNTOUCHED (never overwritten with the bare value)"
+        );
+        assert_eq!(
+            kv.get("hkv/blog/counter").await.unwrap().as_deref(),
+            Some(&b"7"[..]),
+            "the bare old twin is intact"
+        );
+
+        // (b) An IDENTICAL pre-existing new key is an idempotent re-copy ⇒ stages cleanly.
+        let kv = MemoryKv::new();
+        seed_default_scope(&kv).await;
+        kv.put("hkv/default/blog/counter", b"7".to_vec())
+            .await
+            .unwrap(); // equals the bare OLD twin — a benign re-copy
+        let report = migrate(
+            &kv,
+            MigrateOptions {
+                dry_run: false,
+                finalize: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(report.dual);
+        assert_eq!(
+            kv.get("hkv/default/blog/counter").await.unwrap().as_deref(),
+            Some(&b"7"[..])
+        );
+        // The rest of the bare default data still re-homed.
+        assert!(kv.get("hkv/default/blog/sub/key").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn resume_re_runs_the_commingle_guard_on_a_mid_flight_collision() {
+        // Security HIGH-1 (cross-tenant exposure via the resume path): the engine must re-run a
+        // migration's `precheck` on RESUME of an interrupted forward — NOT skip it. If a commingle
+        // collision first APPEARS during a mid-flight interruption window (a tenant project created
+        // with a name matching a default-project resource while the v2 forward is stalled), the resume
+        // must refuse fail-closed, exactly as a fresh pass would — otherwise the default resource's
+        // bytes strand under the bare `{name}` prefix the same-named tenant reads.
+        let kv = MemoryKv::new();
+        seed_default_scope(&kv).await; // bare default data + tenant project `acme`
+
+        // The v2 forward was recorded in-progress (interrupted mid-flight) ...
+        persist_state(
+            &kv,
+            &SchemaState {
+                version: 1,
+                unfinalized: Vec::new(),
+                in_progress: Some(InProgress {
+                    target: DEFAULT_SCOPE_REHOME_VERSION,
+                    steps_done: Vec::new(),
+                }),
+                history: Vec::new(),
+                updated_at: 1,
+            },
+        )
+        .await
+        .unwrap();
+        // ... and in the window a default-project COMPUTE named like tenant `acme` was created — a
+        // commingle that did NOT exist when the forward's first precheck passed.
+        kv.put("project/default/compute/acme", b"spec".to_vec())
+            .await
+            .unwrap();
+
+        // Resuming (plain `migrate`, no answers) MUST refuse — precheck re-scans on resume.
+        let err = migrate(
+            &kv,
+            MigrateOptions {
+                dry_run: false,
+                finalize: false,
+            },
+        )
+        .await;
+        assert!(
+            matches!(&err, Err(MigrateError::DefaultNamedResource { resources }) if resources.iter().any(|r| r.contains("compute/acme"))),
+            "a commingle that appears during the interruption window must be refused on resume, got {err:?}"
+        );
+        // Nothing staged: the default resource's bytes were NOT stranded under the tenant's prefix.
+        assert_eq!(
+            read_state(&kv).await.unwrap().version,
+            1,
+            "the store stays below v2 — the resume refused rather than proceeding past the commingle"
+        );
+        assert!(
+            kv.get("hkv/default/blog/counter").await.unwrap().is_none(),
+            "no forward ran"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tenant_named_like_a_reserved_scope_prefix_is_refused_fail_closed() {
+        // Security LOW-1 + LOW-1b: a tenant project named like a reserved data-plane scope-prefix
+        // literal (`fn` for functions, `bus` for the project bus) commingles with that keyspace, so
+        // pre-re-home it shadows the default project's own `{prefix}/…` data. The re-home must REFUSE
+        // fail-closed (never silently strand) for EVERY reserved prefix, and the interactive plan must
+        // surface each as a rename/abort decision (NO skip — not auto-splittable). Guards against the
+        // `fn`/`bus` reservation sites drifting (both read `RESERVED_SCOPE_PREFIXES`).
+        for prefix in crate::project::RESERVED_SCOPE_PREFIXES {
+            let kv = MemoryKv::new();
+            seed_default_scope(&kv).await; // bare default data + tenant `acme`
+            kv.put(&format!("projectmeta/{prefix}"), b"h".to_vec())
+                .await
+                .unwrap(); // a tenant project literally named like the reserved prefix
+
+            let err = migrate(
+                &kv,
+                MigrateOptions {
+                    dry_run: false,
+                    finalize: false,
+                },
+            )
+            .await;
+            assert!(
+                matches!(&err, Err(MigrateError::DefaultNamedResource { resources }) if resources.iter().any(|r| r.contains(&format!("project/{prefix}")) && r.contains(&format!("{prefix}/")))),
+                "a tenant project named `{prefix}` must refuse the re-home fail-closed, got {err:?}"
+            );
+            assert_eq!(
+                read_state(&kv).await.unwrap().version,
+                1,
+                "nothing staged for `{prefix}`"
+            );
+
+            // The interactive plan surfaces it as rename/abort (no skip — not auto-splittable).
+            let p = plan(&kv).await.unwrap();
+            let d = p
+                .decisions
+                .iter()
+                .find(|d| d.id == format!("collision:project/{prefix}"))
+                .unwrap_or_else(|| panic!("the `{prefix}` collision is surfaced as a decision"));
+            let keys: Vec<&str> = d.routes.iter().map(|r| r.key.as_str()).collect();
+            assert_eq!(
+                keys,
+                vec!["rename", "abort"],
+                "a reserved-prefix collision is rename-or-abort only (`{prefix}`)"
+            );
+        }
+    }
+
     /// Snapshot every DATA key (everything except the migration's own `schema/` bookkeeping), so an
     /// abort round-trip can be asserted byte-for-byte on the actual tenant/guest data (the schema
     /// marker + the premigration-index audit artifact are expected to differ after an abort).
@@ -2331,7 +2711,9 @@ mod tests {
         let d = &p.decisions[0];
         assert_eq!(d.id, "collision:compute/acme");
         let keys: Vec<&str> = d.routes.iter().map(|r| r.key.as_str()).collect();
-        assert_eq!(keys, vec!["rename", "skip", "abort"]);
+        // A COMMINGLE offers rename/abort only — NO skip (Security M-1: skipping would strand the
+        // resource's bytes under the tenant-readable `{name}` prefix).
+        assert_eq!(keys, vec!["rename", "abort"]);
         let rename = d.routes.iter().find(|r| r.key == "rename").unwrap();
         assert!(
             matches!(
@@ -2366,6 +2748,16 @@ mod tests {
                 .unwrap();
             kv
         };
+        // One generic answer: decision id → chosen route key (no free-text value for skip/abort).
+        let answer = |id: &str, route: &str| MigrationAnswers {
+            choices: BTreeMap::from([(
+                id.to_string(),
+                DecisionChoice {
+                    route: route.to_string(),
+                    value: None,
+                },
+            )]),
+        };
 
         // (1) No answers → the collision is unresolved → refuses fail-closed (driver re-prompts).
         let kv = seed().await;
@@ -2375,45 +2767,49 @@ mod tests {
         ));
         assert_eq!(read_state(&kv).await.unwrap().version, 1, "nothing staged");
 
-        // (2) Operator aborts → no-op, store untouched.
+        // (2) Operator aborts at the collision → no-op, store untouched.
         let kv = seed().await;
         assert_eq!(
-            migrate_with_answers(
-                &kv,
-                &MigrationAnswers {
-                    aborted: true,
-                    ..Default::default()
-                }
-            )
-            .await
-            .unwrap(),
+            migrate_with_answers(&kv, &answer("collision:compute/acme", "abort"))
+                .await
+                .unwrap(),
             InteractiveOutcome::Aborted
         );
         assert_eq!(read_state(&kv).await.unwrap().version, 1);
         assert!(kv.get("hkv/default/blog/counter").await.unwrap().is_none());
 
-        // (3) Operator SKIPS the collision → stages (dual soak); the non-colliding default data
-        // re-homes, and the skipped resource's bare scope is left as-is.
+        // (3) Skipping a COMMINGLE collision is REFUSED (Security M-1) — it would strand the default
+        // resource's bytes under the tenant-readable `{name}` prefix. It stays fail-closed.
         let kv = seed().await;
-        let out = migrate_with_answers(
-            &kv,
-            &MigrationAnswers {
-                skip_collisions: vec!["collision:compute/acme".to_string()],
-                aborted: false,
-            },
-        )
-        .await
-        .unwrap();
+        assert!(
+            matches!(
+                migrate_with_answers(&kv, &answer("collision:compute/acme", "skip")).await,
+                Err(MigrateError::DefaultNamedResource { .. })
+            ),
+            "a commingle skip must NOT be honored"
+        );
+        assert_eq!(read_state(&kv).await.unwrap().version, 1, "nothing staged");
+
+        // (4) Skipping a NAMED-`default` collision IS honored (no tenant shares the scope) → stages;
+        // the non-colliding default data re-homes, the tenant's keyspace is untouched.
+        let kv = MemoryKv::new();
+        seed_default_scope(&kv).await;
+        kv.put("project/default/site/default", b"cfg".to_vec())
+            .await
+            .unwrap();
+        let out = migrate_with_answers(&kv, &answer("collision:site/default", "skip"))
+            .await
+            .unwrap();
         assert!(matches!(out, InteractiveOutcome::Staged(_)));
         assert_eq!(status(&kv).await.unwrap(), Status::Dual);
         assert!(
             kv.get("hkv/default/blog/counter").await.unwrap().is_some(),
             "the non-colliding default data re-homed"
         );
-        // The tenant project `acme`'s own keyspace is untouched by the skip.
         assert_eq!(
             kv.get("hkv/acme/shop/counter").await.unwrap().as_deref(),
-            Some(&b"42"[..])
+            Some(&b"42"[..]),
+            "the tenant project acme's keyspace is untouched by the skip"
         );
     }
 
@@ -2428,7 +2824,6 @@ mod tests {
             MigrateOptions {
                 dry_run: false,
                 finalize: false,
-                ..Default::default()
             },
         )
         .await
@@ -2483,7 +2878,6 @@ mod tests {
             MigrateOptions {
                 dry_run: false,
                 finalize: false,
-                ..Default::default()
             },
         )
         .await
@@ -2652,7 +3046,7 @@ mod tests {
         run(
             &kv,
             MigrateOptions::one_shot(),
-            &std::collections::HashSet::new(),
+            &MigrationAnswers::default(),
             &chain(),
         )
         .await
@@ -2680,7 +3074,7 @@ mod tests {
         let again = run(
             &kv,
             MigrateOptions::one_shot(),
-            &std::collections::HashSet::new(),
+            &MigrationAnswers::default(),
             &chain(),
         )
         .await
@@ -2709,7 +3103,7 @@ mod tests {
         let report = run(
             &kv,
             MigrateOptions::one_shot(),
-            &std::collections::HashSet::new(),
+            &MigrationAnswers::default(),
             &chain(),
         )
         .await

@@ -180,7 +180,19 @@ impl boatramp_core::blob_backends::BlobBackends for DefaultScopeTranslatingBacke
 ///   writes converge onto the new spelling.
 /// - otherwise (fresh / finalized): `inner` unchanged (byte-for-byte).
 ///
-/// The named-project set (for the project-aware old→new `list` translator) is read once here.
+/// The named-project set (for the project-aware old→new `list` translator) is read once here, at
+/// serve-boot. This serve-path snapshot is **safe against staleness** (Security MED-1 — unlike the KV
+/// decorator, it is NOT made fresh-per-list, and it need not be): (1) guest/serve blob lists are
+/// ALWAYS project-SCOPED (`backend(project)` + a `hblob/{scope}/…` prefix), and `TranslatingStorage`
+/// bounds the inner list to that scope via `to_old` BEFORE `to_new` relabels — so a stale `to_new`
+/// can only relabel keys already inside the requested scope, never pull an out-of-scope tenant
+/// key in (proven by `translating::tests::a_stale_project_snapshot_cannot_expose_a_tenant_via_a_scoped_list`);
+/// (2) the only FAMILY-WIDE (un-scoped) consumer, the `boatramp blob rehome` drain, builds its OWN
+/// `to_new` from a project set read fresh at command invocation (see `crates/boatramp/src/blob.rs`),
+/// so it is never stale; (3) blob GC/prune is REFUSED while this decorator is active (`allows_prune()
+/// == false`). A tenant that shares the default's scoped prefix is the separate `CommingleProject`
+/// collision the migration refuses pre-stage AND on resume (Security M-1 + HIGH-1), not a snapshot
+/// issue.
 #[cfg(feature = "fallback")]
 pub async fn default_scope_blob_fallback(
     kv: &dyn boatramp_core::kv::KvStore,

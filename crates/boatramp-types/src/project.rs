@@ -28,6 +28,26 @@ use crate::manifest::sha256_hex;
 /// is written (everything else references this constant).
 pub const DEFAULT_PROJECT: &str = "default";
 
+/// The reserved first scope segment of every FUNCTION's data-plane keyspace: a function's base is
+/// `fn/<name>`, so its project-qualified keys are `{family}{project}/fn/<name>/…`.
+pub const FUNCTION_SCOPE_PREFIX: &str = "fn";
+
+/// The reserved first scope segment of the shared project-BUS keyspace: bus topics are
+/// `project.qualified("bus")` → `{family}{project}/bus/<topic>/…` (bare `bus/<topic>` for the
+/// pre-re-home default project).
+pub const BUS_SCOPE_PREFIX: &str = "bus";
+
+/// Every FIXED data-plane scope-prefix literal — a base segment written as a constant (not a dynamic
+/// site/compute/function name) in a `ProjectRef::qualified(..)` call. Because each occupies the same
+/// position as a PROJECT name in a bare (pre-re-home) default scope (`{family}{prefix}/…`), a tenant
+/// project literally named like one would commingle with every project's `{prefix}/…` keyspace and,
+/// pre-re-home, shadow the default project's own (Security LOW-1 / LOW-1b). So each is reserved as a
+/// project name at project-create, exactly as [`DEFAULT_PROJECT`] is. SINGLE SOURCE OF TRUTH — both
+/// the create-gate and the migration's collision scan iterate this, so they can't drift. Re-confirm
+/// this set against the `.qualified("<literal>")` / `.qualified(&format!("<literal>/…"))` callers
+/// whenever a new fixed base is introduced (currently exactly `fn` + `bus`).
+pub const RESERVED_SCOPE_PREFIXES: &[&str] = &[FUNCTION_SCOPE_PREFIX, BUS_SCOPE_PREFIX];
+
 /// The reserved real name of the **default SQL database binding** — the binding a
 /// guest opens as `sql.open("")` and an operator/CLI addresses as `--db default`.
 ///

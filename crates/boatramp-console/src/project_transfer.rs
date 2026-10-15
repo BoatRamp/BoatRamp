@@ -445,7 +445,10 @@ pub fn project_import() -> Html {
 /// Render the project-import `ImportReport` JSON (dry-run plan or applied result).
 fn import_report_view(report: &Value) -> Html {
     let n = |k: &str| report.get(k).and_then(Value::as_u64).unwrap_or(0);
-    let dry = report.get("dry_run").and_then(Value::as_bool).unwrap_or(true);
+    let dry = report
+        .get("dry_run")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
     let skew = report
         .get("schema_skew")
         .and_then(Value::as_array)

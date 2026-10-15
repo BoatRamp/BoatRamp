@@ -22,7 +22,7 @@
 //! ## Wire types (console-side mirror — DRIFT RISK)
 //!
 //! The engine types ([`MigrationPlan`]/`MigrationDecision`/`DecisionRoute`/
-//! `RouteInput`/`RouteInputKind`/`MigrationAnswers`/`Status`) live only in
+//! `RouteAction`/`RouteInput`/`RouteInputKind`/`MigrationAnswers`/`DecisionChoice`/`Status`) live only in
 //! `boatramp_core::migrate`, which is a native crate the console cannot depend
 //! on. Sharing them (moving them into `boatramp-types` and re-exporting from
 //! `boatramp_core::migrate`) was out of reach for this change: it would mean
@@ -34,7 +34,7 @@
 //! compile time and would fail deserialization at runtime. The durable fix is to
 //! promote these to `boatramp-types` in a change that may touch `boatramp-core`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use gloo_dialogs::confirm;
 use gloo_timers::callback::Timeout;
@@ -100,10 +100,24 @@ struct MigrationDecision {
 struct DecisionRoute {
     key: String,
     label: String,
+    action: RouteAction,
     #[serde(default)]
     input: Option<RouteInput>,
     #[serde(default)]
     note: Option<String>,
+}
+
+/// What the driver does when the operator picks a route (mirror of
+/// `boatramp_core::migrate::RouteAction`; serialized externally-tagged → bare variant name). The
+/// wizard keys its arm-ability + staging off this, never off a route-`key` string.
+#[derive(Clone, Copy, PartialEq, Eq, Deserialize)]
+enum RouteAction {
+    /// Record the choice and stage; the migration interprets it.
+    Stage,
+    /// Cancel the whole migration ("do not migrate").
+    Abort,
+    /// Resolve out-of-band first (re-create the resource), then re-check — not stageable here.
+    External,
 }
 
 /// A free-text input a route requires (mirror of `boatramp_core::migrate::RouteInput`).
@@ -121,13 +135,21 @@ enum RouteInputKind {
 }
 
 /// The operator's answers — POSTed to `arm` (`Serialize`), and echoed back in `status.armed`
-/// (`Deserialize`). Mirror of `boatramp_core::migrate::MigrationAnswers`.
+/// (`Deserialize`). GENERIC: a map from each decision id to the route the operator chose. Mirror of
+/// `boatramp_core::migrate::MigrationAnswers`.
 #[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 struct MigrationAnswers {
     #[serde(default)]
-    skip_collisions: Vec<String>,
-    #[serde(default)]
-    aborted: bool,
+    choices: BTreeMap<String, DecisionChoice>,
+}
+
+/// One answer: the chosen route key (+ any input value). Mirror of
+/// `boatramp_core::migrate::DecisionChoice`.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+struct DecisionChoice {
+    route: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    value: Option<String>,
 }
 
 /// `POST /api/store-migrate/arm` → `{armed, aborted, restart_required, next}`.
@@ -266,6 +288,7 @@ pub fn store_migration() -> Html {
                 dual_view(plan, &session, &action, &busy, &reload)
             } else if resp.armed.is_some() {
                 armed_view(
+                    plan,
                     resp.armed.as_ref().unwrap(),
                     &session,
                     &action,
@@ -329,38 +352,26 @@ fn decisions_view(
     polling: &UseStateHandle<bool>,
     tick: &UseStateHandle<u32>,
 ) -> Html {
-    // Arm-ability: an `abort` pick arms a "do not migrate" and always applies;
-    // otherwise every decision must be answered and none left on `rename` (which
-    // the server refuses until it is resolved externally and gone from the plan).
-    let any_abort = plan
-        .decisions
-        .iter()
-        .any(|d| choices.get(&d.id).map(String::as_str) == Some("abort"));
-    let all_answered = plan.decisions.iter().all(|d| choices.contains_key(&d.id));
-    let any_rename = plan
-        .decisions
-        .iter()
-        .any(|d| choices.get(&d.id).map(String::as_str) == Some("rename"));
-    let armable = any_abort || (all_answered && !any_rename);
+    // Arm-ability (keyed off each chosen route's generic `action`, never a route-`key` string): an
+    // `Abort` pick arms a "do not migrate" and always applies; otherwise every decision must be
+    // answered and none left on an `External` route (which the server refuses until it is resolved
+    // out-of-band and gone from the plan).
+    let picks = classify(plan, choices);
+    let armable = picks.aborted || (picks.all_answered && !picks.any_external);
+    let answers = assemble_answers(plan, choices);
+    let any_abort = picks.aborted;
+    let any_rename = picks.any_external;
 
-    let answers = {
-        let aborted = any_abort;
-        let skip_collisions = if aborted {
-            Vec::new()
-        } else {
-            plan.decisions
-                .iter()
-                .filter(|d| choices.get(&d.id).map(String::as_str) == Some("skip"))
-                .map(|d| d.id.clone())
-                .collect()
-        };
-        MigrationAnswers {
-            skip_collisions,
-            aborted,
-        }
-    };
-
-    let on_arm = arm_callback(answers.clone(), session, action, busy, polling, tick);
+    let on_arm = arm_callback(
+        answers.clone(),
+        picks.aborted,
+        picks.staged.len(),
+        session,
+        action,
+        busy,
+        polling,
+        tick,
+    );
 
     html! {
         <div class="space-y-5">
@@ -416,7 +427,7 @@ fn decisions_view(
                 }
             </div>
 
-            { arm_consequences(&answers, any_rename) }
+            { arm_consequences(picks.aborted, picks.staged.len(), picks.any_external) }
         </div>
     }
 }
@@ -424,21 +435,30 @@ fn decisions_view(
 /// ARM result + RESTART — answers are armed and the node must be restarted to
 /// stage them. Keep polling; show how to proceed, and offer to un-arm.
 fn armed_view(
+    plan: &MigrationPlan,
     armed: &MigrationAnswers,
     session: &Session,
     action: &UseStateHandle<Option<ActionMsg>>,
     busy: &UseStateHandle<bool>,
     reload: &Callback<()>,
 ) -> Html {
-    let headline = if armed.aborted {
+    // Classify the armed choices against the (still-populated, pre-restart) plan — keyed off each
+    // route's generic `action`, never a route-`key` string.
+    let armed_choices: HashMap<String, String> = armed
+        .choices
+        .iter()
+        .map(|(id, c)| (id.clone(), c.route.clone()))
+        .collect();
+    let picks = classify(plan, &armed_choices);
+    let headline = if picks.aborted {
         "A 'do not migrate' decision is armed — the next restart will NOT stage the re-home."
             .to_string()
-    } else if armed.skip_collisions.is_empty() {
+    } else if picks.staged.is_empty() {
         "The re-home is armed.".to_string()
     } else {
         format!(
             "The re-home is armed, skipping {} collision(s).",
-            armed.skip_collisions.len()
+            picks.staged.len()
         )
     };
     let on_unarm = abort_callback(session, action, busy, reload, AbortKind::Unarm);
@@ -449,7 +469,7 @@ fn armed_view(
                 <Pill text="armed" tone={Tone::Warn} />
                 <span class="text-sm text-slate-600">{ headline }</span>
             </div>
-            if !armed.aborted {
+            if !picks.aborted {
                 <ol class="list-decimal space-y-1 pl-5 text-sm text-slate-600">
                     <li>{ "Restart the node now — " }<code class="font-mono text-xs">{ "serve --auto-migrate" }</code>
                         { " stages the re-home at boot, before it serves (no process serves a stale layout)." }</li>
@@ -457,8 +477,8 @@ fn armed_view(
                         { " — this panel updates automatically." }</li>
                 </ol>
             }
-            if !armed.skip_collisions.is_empty() {
-                { id_list("Skipping", &armed.skip_collisions) }
+            if !picks.staged.is_empty() {
+                { id_list("Skipping", &picks.staged) }
             }
             <div class="flex items-center gap-3 rounded-lg border border-slate-200 bg-slate-50 px-4 py-3">
                 <Spinner label="Waiting for restart… reconnecting" />
@@ -527,6 +547,63 @@ fn restarting_view(err: &ApiError) -> Html {
 // Decision + summary rendering
 // ===========================================================================
 
+/// The operator's in-progress picks, classified against the plan's route `action`s (the generic,
+/// migration-agnostic contract) — so the wizard decides arm-ability and wording without knowing what
+/// any particular route *means*.
+#[derive(Default)]
+struct Picks {
+    /// A decision was answered with an `Abort` route → arming records a "do not migrate".
+    aborted: bool,
+    /// A decision was answered with an `External` route (resolve out-of-band first) → not armable yet.
+    any_external: bool,
+    /// Every decision has a recognized answer.
+    all_answered: bool,
+    /// Decision ids answered with a `Stage` route (staged as-is, e.g. left un-re-homed).
+    staged: Vec<String>,
+}
+
+/// Classify `choices` (decision id → chosen route key) against the plan's routes.
+fn classify(plan: &MigrationPlan, choices: &HashMap<String, String>) -> Picks {
+    let action = |d: &MigrationDecision, key: &str| -> Option<RouteAction> {
+        d.routes.iter().find(|r| r.key == key).map(|r| r.action)
+    };
+    let mut p = Picks {
+        all_answered: true,
+        ..Default::default()
+    };
+    for d in &plan.decisions {
+        match choices.get(&d.id).and_then(|k| action(d, k)) {
+            Some(RouteAction::Abort) => p.aborted = true,
+            Some(RouteAction::External) => p.any_external = true,
+            Some(RouteAction::Stage) => p.staged.push(d.id.clone()),
+            None => p.all_answered = false,
+        }
+    }
+    p
+}
+
+/// Assemble the wire answers from the operator's picks (only decisions that are in the plan; the
+/// wizard collects no free-text value — an `External` rename is resolved out-of-band).
+fn assemble_answers(plan: &MigrationPlan, choices: &HashMap<String, String>) -> MigrationAnswers {
+    MigrationAnswers {
+        choices: plan
+            .decisions
+            .iter()
+            .filter_map(|d| {
+                choices.get(&d.id).map(|route| {
+                    (
+                        d.id.clone(),
+                        DecisionChoice {
+                            route: route.clone(),
+                            value: None,
+                        },
+                    )
+                })
+            })
+            .collect(),
+    }
+}
+
 /// One decision as a radio group; the rename route, when picked, shows the
 /// external-action guidance + a Re-check button (the wizard does not rename).
 fn decision_card(
@@ -535,6 +612,11 @@ fn decision_card(
     on_pick: &Callback<(String, String)>,
     reload: &Callback<()>,
 ) -> Html {
+    // Show the out-of-band guidance when the SELECTED route is an `External` one (generic — not the
+    // `"rename"` key specifically).
+    let selected_external = selected
+        .and_then(|k| decision.routes.iter().find(|r| r.key == k))
+        .is_some_and(|r| r.action == RouteAction::External);
     html! {
         <fieldset class="rounded-lg border border-slate-200 p-4">
             <legend class="px-1 text-sm font-medium text-slate-800">{ &decision.question }</legend>
@@ -543,7 +625,7 @@ fn decision_card(
                     route_row(&decision.id, r, selected == Some(r.key.as_str()), on_pick)
                 }) }
             </div>
-            if selected == Some("rename") {
+            if selected_external {
                 <div class="mt-3 rounded-md border border-amber-200 bg-amber-50 px-3 py-2">
                     <p class="text-xs text-amber-800">
                         { "Re-create this resource under the new, non-colliding name via the normal \
@@ -611,18 +693,18 @@ fn summary_block(plan: &MigrationPlan) -> Html {
 
 /// A preview of what arming will persist, so the confirm() is not the first the
 /// operator learns of it.
-fn arm_consequences(answers: &MigrationAnswers, any_rename: bool) -> Html {
-    if any_rename {
+fn arm_consequences(aborted: bool, staged_count: usize, any_external: bool) -> Html {
+    if any_external {
         return html! {};
     }
-    let line = if answers.aborted {
+    let line = if aborted {
         "Arming records a 'do not migrate' decision; the next restart stages nothing.".to_string()
-    } else if answers.skip_collisions.is_empty() {
+    } else if staged_count == 0 {
         "Arming stages the full re-home at the next restart.".to_string()
     } else {
         format!(
-            "Arming stages the re-home at the next restart, leaving {} collision(s) un-re-homed.",
-            answers.skip_collisions.len()
+            "Arming stages the re-home at the next restart, leaving {staged_count} collision(s) \
+             un-re-homed."
         )
     };
     html! { <p class="text-xs text-slate-500">{ line }</p> }
@@ -673,9 +755,13 @@ enum AbortKind {
     Unarm,
 }
 
-/// Build the confirm()-gated ARM click handler for the assembled `answers`.
+/// Build the confirm()-gated ARM click handler for the assembled `answers`. `aborted`/`staged_count`
+/// (already classified from the plan's route actions) only shape the confirm wording.
+#[allow(clippy::too_many_arguments)]
 fn arm_callback(
     answers: MigrationAnswers,
+    aborted: bool,
+    staged_count: usize,
     session: &Session,
     action: &UseStateHandle<Option<ActionMsg>>,
     busy: &UseStateHandle<bool>,
@@ -688,21 +774,20 @@ fn arm_callback(
     let polling = polling.clone();
     let tick = tick.clone();
     Callback::from(move |_: MouseEvent| {
-        let prompt = if answers.aborted {
+        let prompt = if aborted {
             "Arm a 'do not migrate' decision?\n\nThe next node restart will NOT stage the \
              re-home. Nothing changes now."
                 .to_string()
-        } else if answers.skip_collisions.is_empty() {
+        } else if staged_count == 0 {
             "Arm the migration and stage it at the next restart?\n\nThis only records the decision — the \
              re-home runs when you restart the node with serve --auto-migrate (it stages at boot, before \
              serving). Nothing destructive happens now."
                 .to_string()
         } else {
             format!(
-                "Arm the migration, leaving {} collision(s) un-re-homed?\n\nThis only records the decision \
-                 — the re-home runs at the next restart (serve --auto-migrate, staged at boot). Nothing \
-                 destructive happens now.",
-                answers.skip_collisions.len()
+                "Arm the migration, leaving {staged_count} collision(s) un-re-homed?\n\nThis only records \
+                 the decision — the re-home runs at the next restart (serve --auto-migrate, staged at \
+                 boot). Nothing destructive happens now."
             )
         };
         if !confirm(&prompt) {

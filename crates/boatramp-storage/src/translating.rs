@@ -381,4 +381,58 @@ mod tests {
     async fn prune_is_disabled_during_the_transition() {
         assert!(!wrap(Arc::new(Mem::default())).allows_prune());
     }
+
+    #[tokio::test]
+    async fn a_stale_project_snapshot_cannot_expose_a_tenant_via_a_scoped_list() {
+        // Security MED-1 (blob `to_new` uses a serve-boot project snapshot): prove the staleness can
+        // NOT cause cross-tenant exposure on the serve path, which lists SCOPED to a single project
+        // prefix. Here `to_new` is STALE — it does NOT know the named project `acme` (created after the
+        // snapshot), so it would RELABEL a bare `hblob/acme/…` key under `default/`. Even so, a scoped
+        // list of the default project's own container never surfaces the tenant's key: `down()` bounds
+        // the inner list to the requested scope, so `to_new`'s wrong classification only ever relabels
+        // keys already inside that scope — it can never pull an out-of-scope tenant key in. (A tenant
+        // that SHARES the default's scoped prefix is the separate `CommingleProject` collision the
+        // migration refuses pre-stage + on resume; it is not a `to_new` staleness issue.)
+        let to_old: KeyTranslate = Arc::new(|k: &str| {
+            let rest = k.strip_prefix("hblob/")?;
+            let suffix = rest.strip_prefix("default/")?;
+            Some(format!("hblob/{suffix}"))
+        });
+        // STALE: knows NO named projects, so every bare `hblob/{x}/…` looks re-homeable.
+        let stale_to_new: KeyTranslate = Arc::new(|k: &str| {
+            let rest = k.strip_prefix("hblob/")?;
+            let first = rest.split('/').next().unwrap_or("");
+            if first.is_empty() || first == "default" {
+                return None;
+            }
+            Some(format!("hblob/default/{rest}"))
+        });
+        let mem = Arc::new(Mem::default());
+        mem.seed("hblob/blog/a", b"A"); // the default project's own (bare, not yet drained)
+        mem.seed("hblob/acme/secret", b"TENANT"); // a tenant created AFTER the snapshot
+        let s = TranslatingStorage::new(mem.clone(), to_old, stale_to_new);
+
+        // A guest of the DEFAULT project lists its `blog` container — scoped. It must see ONLY its own
+        // object, never the tenant's, despite the stale snapshot.
+        let keys: Vec<String> = s
+            .list("hblob/default/blog/")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|m| m.key)
+            .collect();
+        assert_eq!(
+            keys,
+            vec!["hblob/default/blog/a".to_string()],
+            "a scoped list is bounded by the scope prefix — a stale snapshot cannot surface a tenant"
+        );
+        // And a scoped read of the tenant's key THROUGH the default's new spelling misses (the tenant
+        // lives at a different scope; `down()` of `hblob/default/acme/secret` is `hblob/acme/secret`
+        // which IS the tenant's — this is the commingle case, not staleness: the default has no
+        // container `acme` here, so the default guest would never address it).
+        assert!(
+            s.list("hblob/default/zzz/").await.unwrap().is_empty(),
+            "an unrelated default container lists empty"
+        );
+    }
 }
