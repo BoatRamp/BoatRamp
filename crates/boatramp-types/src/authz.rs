@@ -667,6 +667,7 @@ impl Right {
             // status — the same grade as `/api/sites` / `/api/metrics` — so `system·read` (never a
             // per-project right). Same hyphen-path collision-avoidance as the sibling `blob-*` arms.
             "/api/blob-status" => Self::new(Resource::System, None, Action::Read),
+            "/api/blob-verify" => Self::new(Resource::System, None, Action::Read),
             // The control-plane KV degraded state (`GET /api/kv-status`, v0.9.0 KV-recovery, C6):
             // whether a self-heal-on-open quarantined a torn WAL tail. A READ-only node status
             // (the same grade as `/api/blob-status` / `/api/metrics`) exposing NO secrets — only the
