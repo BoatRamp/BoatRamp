@@ -28,7 +28,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use clap_complete::Shell;
 
 mod access;
@@ -373,6 +373,44 @@ fn run_vz_worker(json: Option<String>) -> Result<(), CliError> {
     Ok(())
 }
 
+/// Build the `config-figment` serve flag layer: a `{BOATRAMP_<NAME>: raw-value}` map of the
+/// serve args the operator set ON THE COMMAND LINE. The env name comes from each arg's own
+/// clap definition (`Arg::get_env`), and only `ValueSource::CommandLine` args are included —
+/// env-sourced values (figment's env overlay handles those) and defaults are excluded, so a
+/// defaulted `--blobs fs` never enters the layer. Keys the config overlay doesn't recognise
+/// (runtime/selector flags like `--tls`, `--kv`, the cluster-action flags) are mapped here but
+/// ignored by `flag_overlay_dict`, so they never reach the config.
+#[cfg(feature = "config-figment")]
+fn serve_cli_flags(matches: &clap::ArgMatches) -> std::collections::BTreeMap<String, String> {
+    use clap::parser::ValueSource;
+    let mut out = std::collections::BTreeMap::new();
+    let Some(sub) = matches.subcommand_matches("serve") else {
+        return out;
+    };
+    let cmd = Cli::command();
+    let Some(serve_def) = cmd.find_subcommand("serve") else {
+        return out;
+    };
+    for arg in serve_def.get_arguments() {
+        let Some(env) = arg.get_env() else {
+            continue; // only env-named args map to a config field
+        };
+        let id = arg.get_id().as_str();
+        if sub.value_source(id) != Some(ValueSource::CommandLine) {
+            continue; // env / default sourced → not an explicit CLI flag
+        }
+        // A value arg yields its raw token; a set boolean flag (ArgAction::SetTrue) has no
+        // raw value, so record "true" — the overlay/extract coerces it.
+        let value = sub
+            .get_raw(id)
+            .and_then(|mut vs| vs.next())
+            .and_then(|o| o.to_str().map(str::to_string))
+            .unwrap_or_else(|| "true".to_string());
+        out.insert(env.to_string_lossy().into_owned(), value);
+    }
+    out
+}
+
 async fn async_main() -> Result<(), CliError> {
     // Structured logs (incl. the `boatramp::access` line) go to stderr; set
     // `BOATRAMP_LOG_FORMAT=json` for a machine-readable JSON sink.
@@ -388,7 +426,14 @@ async fn async_main() -> Result<(), CliError> {
         builder.init();
     }
 
-    let cli = Cli::parse();
+    // Parse via ArgMatches (not `Cli::parse()`) so the `config-figment` serve flag layer can
+    // read each arg's `ValueSource` (CommandLine vs env vs default). `from_arg_matches` on
+    // clap's OWN matches is infallible — it is exactly what `Cli::parse()` does internally.
+    let matches = Cli::command().get_matches();
+    let cli = Cli::from_arg_matches(&matches)
+        .expect("clap re-derive from its own validated matches is infallible");
+    #[cfg(not(feature = "config-figment"))]
+    let _ = &matches; // only the figment serve flag layer consults the raw matches
 
     // `completions` / `man` are pure generators over the command tree — no config,
     // no network. Handle them before any config load.
@@ -414,6 +459,17 @@ async fn async_main() -> Result<(), CliError> {
         };
         // The serve `--format` overrides the extension-based auto-detection for the
         // daemon config; env overrides still layer on top after the parse.
+        //
+        // Under `config-figment` the config is resolved by the ONE pipeline
+        // (defaults → file → env → explicit CLI flags): the flag layer is built from the
+        // serve subcommand's `ValueSource::CommandLine` args (so a defaulted `--blobs fs`
+        // is absent and can't clobber file/env — subsuming the old `--blobs` `var_os`
+        // probe). serve still composes `args` over this config; since the flag layer and
+        // clap's args carry the SAME explicit flags, they agree.
+        #[cfg(feature = "config-figment")]
+        let config =
+            config::ServerConfig::load_with_flags(&path, args.format, &serve_cli_flags(&matches))?;
+        #[cfg(not(feature = "config-figment"))]
         let config = config::ServerConfig::load(&path, args.format)?;
         serve::run(args, &config).await?;
         return Ok(());

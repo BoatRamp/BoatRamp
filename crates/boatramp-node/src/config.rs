@@ -354,6 +354,35 @@ impl ServerConfig {
         }
     }
 
+    /// Load through the figment pipeline with an explicit **CLI-flag** top layer
+    /// (`config-figment` only). `cli_flags` is a map `{BOATRAMP_<NAME>: raw-value}` of the
+    /// args the operator set on the COMMAND LINE (the serve binary builds it from
+    /// `clap::ArgMatches`, keeping only `ValueSource::CommandLine` — so a defaulted
+    /// `--blobs fs` is absent and never clobbers file/env, subsuming the old `--blobs`
+    /// `var_os` probe). Resolution is `base-seed → file → env → these flags`. Keys the
+    /// overlay doesn't recognise (runtime/selector flags like `--tls`, the cluster-action
+    /// flags) are ignored, so they never enter the config. The binary passes a plain map —
+    /// figment types stay internal to this crate.
+    #[cfg(feature = "config-figment")]
+    pub fn load_with_flags(
+        path: &Path,
+        override_: Option<ConfigFormat>,
+        cli_flags: &BTreeMap<String, String>,
+    ) -> Result<Self, ConfigError> {
+        let flags = figment_resolve::flag_overlay_dict(cli_flags);
+        figment_resolve::load_with_figment(path, override_, &EnvSource::Process, flags)
+    }
+
+    /// Serialize the (already-resolved) config for `boatramp config dump`, with the
+    /// secret-bearing fields REDACTED (`config-figment` only). The config is now
+    /// `Serialize` (for the figment file layer), which would otherwise expose the
+    /// control-plane root key / bootstrap secret / azure access key in a dump. Returns
+    /// pretty JSON (also a valid config input format).
+    #[cfg(feature = "config-figment")]
+    pub fn dump_redacted(&self) -> Result<String, ConfigError> {
+        figment_resolve::dump_redacted(self)
+    }
+
     /// Layer `BOATRAMP_*` environment overrides onto the loaded config for the
     /// `compute`, `security`, and handler-`sql` sections — the operational knobs
     /// that were previously reachable only through the `boatramp.cfg` file.
@@ -1500,8 +1529,9 @@ const CLUSTER_MESH_ENV_VARS: &[&str] = &[
 pub(crate) enum EnvSource {
     /// The live process environment (`std::env::var`).
     Process,
-    /// A fixed name→value map (tests only; production always resolves `Process`).
-    #[cfg(test)]
+    /// A fixed name→value map: tests, and the `config-figment` flag layer (which reuses
+    /// the env overlay to turn `{BOATRAMP_<NAME>: value}` CLI flags into a figment dict).
+    #[cfg(any(test, feature = "config-figment"))]
     Map(BTreeMap<String, String>),
 }
 
@@ -1511,7 +1541,7 @@ impl EnvSource {
     fn get(&self, var: &str) -> Option<String> {
         let raw = match self {
             Self::Process => std::env::var(var).ok(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "config-figment"))]
             Self::Map(m) => m.get(var).cloned(),
         };
         raw.filter(|v| !v.is_empty())
@@ -1537,7 +1567,7 @@ impl EnvSource {
     fn names(&self) -> Box<dyn Iterator<Item = String> + '_> {
         match self {
             Self::Process => Box::new(std::env::vars().map(|(k, _)| k)),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "config-figment"))]
             Self::Map(m) => Box::new(m.keys().cloned()),
         }
     }
@@ -6120,6 +6150,54 @@ pub(crate) mod figment_resolve {
         Ok(cfg)
     }
 
+    /// Build the explicit-CLI-**flag** figment layer from a `{BOATRAMP_<NAME>: value}` map
+    /// of the args the operator set on the command line. Reuses [`env_overlay_dict`] (a
+    /// flag's name→path mapping is the SAME as its env var's), so only recognised config
+    /// knobs produce entries and the runtime/selector flags (`--tls`, cluster-actions, …)
+    /// are ignored. This dict is merged as the TOP layer (above the Process env), so an
+    /// explicit flag wins over env + file — matching clap's `flag > env` precedence today.
+    pub(crate) fn flag_overlay_dict(cli_flags: &BTreeMap<String, String>) -> Dict {
+        env_overlay_dict(&EnvSource::Map(cli_flags.clone()))
+    }
+
+    /// Config-tree field names whose VALUES are raw secret material — redacted by
+    /// [`dump_redacted`]. Secret *references* and env-var-NAME fields (`token_env`,
+    /// `url_env`, `pin_env`, `password_env`, `access_token_env`) are NOT secrets and are
+    /// left intact; only the fields that can hold raw key/secret bytes are masked.
+    const SECRET_FIELDS: &[&str] = &[
+        "auth_root_private_key",
+        "bootstrap_secret",
+        "azure_access_key",
+        "secret_access_key",
+    ];
+
+    fn redact(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (k, v) in map.iter_mut() {
+                    if SECRET_FIELDS.contains(&k.as_str()) && !v.is_null() {
+                        *v = serde_json::Value::String("<redacted>".to_string());
+                    } else {
+                        redact(v);
+                    }
+                }
+            }
+            serde_json::Value::Array(items) => items.iter_mut().for_each(redact),
+            _ => {}
+        }
+    }
+
+    /// Serialize the resolved [`ServerConfig`] for `boatramp config dump`, REDACTING the
+    /// secret-bearing fields ([`SECRET_FIELDS`]). The config is `Serialize` for the figment
+    /// file layer, which would otherwise expose the control-plane root key / bootstrap
+    /// secret / azure access key / sealed-cred ref in a dump. Pretty JSON (also a valid
+    /// config input).
+    pub(crate) fn dump_redacted(cfg: &ServerConfig) -> Result<String, ConfigError> {
+        let mut v = serde_json::to_value(cfg).map_err(ConfigError::Json)?;
+        redact(&mut v);
+        serde_json::to_string_pretty(&v).map_err(ConfigError::Json)
+    }
+
     /// Resolve a [`ServerConfig`] from the environment overlay ALONE (no file, no
     /// flags) — a thin test helper for the sections that deserialize from a partial env
     /// dict. Sections needing the base-seed (decision 2) are tested through
@@ -6727,6 +6805,70 @@ pub(crate) mod figment_resolve {
                 unhandled.is_empty(),
                 "overlay produced nothing for these serve vars: {unhandled:?}"
             );
+        }
+
+        // --- the flag layer: precedence + the config dump redaction ---------------
+
+        /// `flag > env > file` precedence (matching clap's `flag > env` + the file fallback),
+        /// resolved through the full pipeline.
+        #[test]
+        fn flag_env_file_precedence() {
+            let path = std::env::temp_dir().join(format!(
+                "brtest-figment-{}-{:?}.cfg",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            std::fs::write(
+                &path,
+                r#"( serve: ( s3_bucket: "from-file", s3_region: "file-region", s3_endpoint: "file-endpoint" ) )"#,
+            )
+            .unwrap();
+
+            let env = map(&[
+                ("BOATRAMP_S3_BUCKET", "from-env"),
+                ("BOATRAMP_S3_ENDPOINT", "from-env-endpoint"),
+            ]);
+            let flags: BTreeMap<String, String> =
+                [("BOATRAMP_S3_BUCKET".to_string(), "from-flag".to_string())]
+                    .into_iter()
+                    .collect();
+            let cfg = load_with_figment(&path, None, &env, flag_overlay_dict(&flags))
+                .expect("resolve");
+            let serve = cfg.serve.expect("serve");
+            assert_eq!(serve.s3_bucket.as_deref(), Some("from-flag"), "flag beats env+file");
+            assert_eq!(
+                serve.s3_endpoint.as_deref(),
+                Some("from-env-endpoint"),
+                "env beats file when no flag"
+            );
+            assert_eq!(
+                serve.s3_region.as_deref(),
+                Some("file-region"),
+                "file survives when neither env nor flag set it"
+            );
+            std::fs::remove_file(&path).ok();
+        }
+
+        /// `config dump` must redact the raw-secret fields (the control-plane root key,
+        /// bootstrap secret, azure access key, sealed-cred ref) — never emit their values.
+        #[test]
+        fn dump_redacts_secrets() {
+            let cfg = figment_env(&[
+                ("BOATRAMP_AUTH_ROOT_PRIVATE_KEY", "deadbeefsecret"),
+                ("BOATRAMP_BOOTSTRAP_SECRET", "topsecretboot"),
+                ("BOATRAMP_AZURE_ACCESS_KEY", "azuresecretkey"),
+                ("BOATRAMP_DEFAULT_SITE", "construens"),
+            ]);
+            let dump = dump_redacted(&cfg).expect("dump");
+            for leaked in ["deadbeefsecret", "topsecretboot", "azuresecretkey"] {
+                assert!(
+                    !dump.contains(leaked),
+                    "config dump leaked a secret value: {leaked}\n{dump}"
+                );
+            }
+            assert!(dump.contains("<redacted>"), "secrets shown as <redacted>");
+            // A non-secret field is still shown in full.
+            assert!(dump.contains("construens"), "non-secret values are shown");
         }
     }
 }
