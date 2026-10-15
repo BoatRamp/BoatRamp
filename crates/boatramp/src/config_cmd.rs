@@ -46,6 +46,10 @@ pub enum Error {
     /// Migrating an `apply` manifest to the current schema failed.
     #[error(transparent)]
     Migrate(#[from] crate::apply::Error),
+    /// Resolving the STATIC daemon config (`boatramp.cfg` + env) for `config dump` failed.
+    #[cfg(feature = "config-figment")]
+    #[error(transparent)]
+    DaemonConfig(#[from] crate::config::ConfigError),
 }
 
 /// `config` module result; `Err` is [`Error`].
@@ -102,6 +106,19 @@ enum ConfigCommand {
         #[arg(long)]
         write: bool,
     },
+    /// Resolve the STATIC daemon config (`boatramp.cfg` + `BOATRAMP_*` env, via the
+    /// `config-figment` pipeline) and print it as JSON with secret-bearing fields REDACTED.
+    /// Purely client-side — no server is contacted; this is the resolved config `serve`
+    /// would load. (Distinct from `get`/`set`, which read/write the live DYNAMIC config.)
+    #[cfg(feature = "config-figment")]
+    Dump {
+        /// The daemon config file to resolve (default `boatramp.cfg`). Env overlays it.
+        #[arg(long, default_value = "boatramp.cfg")]
+        file: PathBuf,
+        /// Also print the resolution-order legend to stderr.
+        #[arg(long)]
+        explain: bool,
+    },
 }
 
 /// The `GET /api/daemon/config` response.
@@ -126,6 +143,18 @@ pub async fn run(args: ConfigArgs, config: &ProjectConfig) -> Result<()> {
         ConfigCommand::Migrate { file, write } => {
             return migrate_manifest(file, *write);
         }
+        #[cfg(feature = "config-figment")]
+        ConfigCommand::Dump { file, explain } => {
+            let resolved = crate::config::ServerConfig::load(file, None)?;
+            println!("{}", resolved.dump_redacted()?);
+            if *explain {
+                eprintln!(
+                    "resolved: built-in defaults < {} < BOATRAMP_* env  (secret fields redacted)",
+                    file.display()
+                );
+            }
+            return Ok(());
+        }
         _ => {}
     }
     let server = client::resolve_server(args.server, config)?;
@@ -138,6 +167,8 @@ pub async fn run(args: ConfigArgs, config: &ProjectConfig) -> Result<()> {
         ConfigCommand::List | ConfigCommand::Describe { .. } | ConfigCommand::Migrate { .. } => {
             unreachable!("handled above")
         }
+        #[cfg(feature = "config-figment")]
+        ConfigCommand::Dump { .. } => unreachable!("handled above"),
     }
 }
 
