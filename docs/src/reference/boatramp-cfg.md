@@ -1,16 +1,25 @@
 # boatramp.cfg schema
 
 `boatramp.cfg` is the server config, read by `boatramp serve`. It is
-[RON](https://github.com/ron-rs/ron). Every value can also be set as a flag or an
-environment variable, which take precedence. The whole file is optional — `serve`
-runs with defaults without it.
+[RON](https://github.com/ron-rs/ron) (or JSON — see `--format`). Every value can also be set
+as an environment variable or a flag, which take precedence. The whole file is optional —
+`serve` runs with defaults without it.
 
 ```sh
 boatramp serve --config boatramp.cfg
 ```
 
-Precedence for any value: **flag / environment variable > `boatramp.cfg` >
-built-in default**.
+Precedence for any value: **explicit CLI flag > environment variable > `boatramp.cfg` >
+built-in default** — one layered resolver (see [the configuration
+model](../explanation/config-model.md)).
+
+The same `BOATRAMP_*` variables resolve this config for **every** subcommand, not just
+`serve`: the offline operations (`boatramp migrate`, `boatramp blob …`, `boatramp token …`)
+now honor them too, so e.g. `BOATRAMP_BLOBS` / `BOATRAMP_S3_BUCKET` configure `blob migrate`
+with no config file. Run [`boatramp config
+dump`](../explanation/config-model.md#inspecting-the-resolved-config) to print the resolved
+config (secrets redacted). A malformed value (bad number/enum/address, or a `[cluster]` with
+no `listen`) fails loudly at startup rather than defaulting silently.
 
 Top-level sections, all optional:
 

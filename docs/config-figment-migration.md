@@ -1,16 +1,20 @@
 # Config resolution rewrite: one `figment` pipeline for every subcommand
 
-Status: **RELEASE-READY** behind the off-by-default `config-figment` feature (target
-v0.35.0). The full pipeline — defaults/base-seed → **file** → **env** → explicit **CLI
-flags** — is implemented and wired into `ServerConfig::load` (so serve AND every offline op
-resolve through it) and the serve dispatch (which builds the flag layer). It covers the
-COMPLETE surface (former Loaders A/B/C): the `serve.*` scalars, the `serve.kv.*` knobs, the
-`[security]`/`[compute]`/`[handlers]`/`[secrets]`/`[cluster]` sections, and the three
-dynamic-keyed maps. A full-surface parity battery asserts equivalence with the legacy
-loaders, and `boatramp config dump` (the Serialize dividend) prints the resolved config with
-secrets redacted. The feature is **off by default** — the default-flip + deleting the legacy
-loaders is the owner's release decision (see Cutover). The four design decisions below were
-resolved by the owner; this doc records the as-built design.
+> **Shipped in v0.35.0** — history, not a plan. figment is now the ONLY config path: the
+> layered pipeline (defaults/base-seed → **file** → **env** → explicit **CLI flags**) is
+> unconditional in `ServerConfig::load`, and the three hand-rolled loaders it replaced
+> (serve clap `#[arg(env)]`, `apply_env_overrides`, the ad-hoc `serve.kv.*` env reads) are
+> deleted. There is **no `config-figment` feature flag** — it was removed at the cutover.
+> User-facing contract: [docs/src/explanation/config-model.md](src/explanation/config-model.md).
+> This file is the design/rationale record (why it is shaped this way).
+
+It covers the COMPLETE surface (former Loaders A/B/C): the `serve.*` scalars, the `serve.kv.*`
+knobs, the `[security]`/`[compute]`/`[handlers]`/`[secrets]`/`[cluster]` sections, and the three
+dynamic-keyed maps. `boatramp config dump` (the Serialize dividend) prints the resolved config
+with secrets redacted. The four design decisions below were resolved by the owner; this doc
+records the as-built design. (Equivalence with the old loaders was proven by a full-surface
+parity battery that was green at the cutover; it has since been replaced by direct
+per-section tests, as the old `apply_env_overrides` oracle was deleted with the loaders.)
 
 ## Why
 
@@ -175,22 +179,18 @@ still composes `args` over the resolved config; since the flag layer and clap's 
 same explicit flags, they agree, so the eventual flip (serve consuming only the resolved config)
 is correct.
 
-## Cutover (owner decides the release)
+## Cutover (done in v0.35.0)
 
-The feature is **off by default**; the flip is a release-strategy decision for v0.35.0:
-- **Ship opt-in** (`--features config-figment`): zero risk to the default build; operators who
-  want the unified pipeline (notably offline ops honoring `BOATRAMP_*`) opt in. The legacy loaders
-  stay the default path.
-- **Flip the default**: add `config-figment` to the `default` feature set; the whole fleet's
-  config resolution moves to figment. Higher blast radius — config is security-sensitive (tenancy
-  postures, sealed creds) — but the full-surface parity battery + the end-to-end binary check make
-  it proven-equivalent.
-
-Recommendation and risk tradeoff are in the release-ready report. When the owner approves the
-flip: add `config-figment` to both crates' `default`, run the full CI matrix (all-features +
-lean + musl), then in a FOLLOW-UP delete Loaders A/B/C and drop the gate (the `*_ENV_VARS` const
-tables + overlay collapse to one source; the forgot-a-knob guards retarget onto it). The version
-bump + CHANGELOG happen at the cut, not here.
+The owner chose the full cutover over an opt-in flag: figment is the ONLY config path. At the
+cut the `config-figment` feature was removed from both crates, `ServerConfig::load` was made
+unconditionally figment, and the three legacy loaders were deleted in one change — Loader B
+(`apply_env_overrides`, ~664 lines) + its parse helpers, the serve-side Loader-A runtime
+duplication (`args.X.or(serve_cfg.X)` combos + the `--blobs` `var_os` probe), and the Loader-C
+ad-hoc `serve.kv.*` env reads. serve now consumes only the resolved `ServerConfig` (clap still
+PARSES flags — they feed the flag layer + the non-config runtime selectors `--tls`/`--kv`/…).
+The `*_ENV_VARS` const tables + `*_FIELD_SUFFIXES` + env-scan helpers stayed — they are the
+overlay's single source of truth. A `#[cfg(test)]` adapter routes the pre-figment `env_wires_*`
+tests through the pipeline so they remain genuine (non-oracle) figment tests.
 
 ## Test oracle
 

@@ -79,8 +79,10 @@ where the right person controls it:
   functions and compute — in one manifest, see
   [`boatramp apply`](../how-to/apply.md). See
   [`project.cfg`](../reference/project-cfg.md).
-- **`boatramp.cfg`** — the server config, read by `serve`. It covers the bind
-  address, storage backends, TLS, request limits, and any `cluster` section. See
+- **`boatramp.cfg`** — the server config, read by `serve` (and by the daemon ops
+  `migrate`/`blob`/`token`). It covers the bind address, storage backends, TLS, request
+  limits, and any `cluster` section, and every value is equally settable via a `BOATRAMP_*`
+  env var or a flag (one layered resolver). See
   [`boatramp.cfg`](../reference/boatramp-cfg.md).
 - **Per-site config** — domains, transport security, access control,
   compression, and **handler** policy. This lives in the control-plane store, not
