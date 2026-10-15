@@ -842,7 +842,20 @@ fn gc_options(dry_run: bool, min_age: Duration) -> slatedb::config::GarbageColle
         // Clone-detach is not part of a control-plane store; leave it disabled.
         detach_options: None,
         metric_level: None,
-        boundary_files_enabled: true,
+        // DISABLED deliberately (v0.34.0 fix). The boundary file is only a write-fence OPTIMIZATION —
+        // SlateDB's manifest + compactions GC call `advance_boundary()` with `?` BEFORE their delete
+        // pass, and `advance_boundary` issues `PutMode::Update` once the `gc/manifest.boundary` file
+        // exists. `object_store`'s `LocalFileSystem` (a local fly volume — our single-node data dir)
+        // returns `NotImplemented` for `PutMode::Update`, which aborts `collect()` before any delete;
+        // SlateDB's `run_gc_task` then SWALLOWS the error (logs, never propagates). Net: after the
+        // FIRST GC creates the boundary file, every later GC silently deletes ZERO manifests — both the
+        // offline `kv compact --apply` AND the online supervised `kv_gc_online` — so `manifest/` +
+        // `compactions/` grow unbounded (the v0.33.0 manifest-GC leak was never actually reclaimed).
+        // Disabling the boundary makes the GC go straight to its delete pass (SlateDB supports + tests
+        // this path, and never reuses a manifest id, so the fence is unnecessary for our single-writer
+        // monotonic-id control plane); it is a safe superset that also works on S3 (where Update IS
+        // implemented). See construens `boatramp-kv-compact-manifest-gc-gap.md`.
+        boundary_files_enabled: false,
         object_store_max_retries: None,
     }
 }
@@ -3660,6 +3673,105 @@ mod tests {
             eprintln!(
                 "KV ONLINE-GC MANIFEST RECLAIM OK: manifest {} → {} objects ({} → {} B)",
                 man_pre.objects, man_post.objects, man_pre.bytes, man_post.bytes
+            );
+        })
+        .await;
+    }
+
+    /// GATE (reproduces the PROD leak that v0.33.0 shipped — construens
+    /// `boatramp-kv-compact-manifest-gc-gap.md`). The existing test above runs GC exactly ONCE, which
+    /// on a local filesystem takes SlateDB's boundary `PutMode::Create` path and succeeds — so it never
+    /// caught the real bug. In prod, GC always runs a SECOND+ time: once a `gc/manifest.boundary` file
+    /// exists, SlateDB's manifest + compactions GC advance it via `PutMode::Update`, which
+    /// `object_store`'s `LocalFileSystem` returns `NotImplemented` for; that error aborts `collect()`
+    /// BEFORE the delete pass and SlateDB SWALLOWS it — so every later GC silently deletes ZERO
+    /// manifests (the 202k-object / 16.8 GiB backlog that `kv compact --apply` "reclaimed" 5.7 MiB of).
+    ///
+    /// This runs the reclaim TWICE — the 2nd run is the one prod always hit — and asserts the 2nd run
+    /// STILL collapses `manifest/`. With the bug the 2nd GC reclaims nothing (assertion fails); with the
+    /// fix (`boundary_files_enabled: false`, so the delete pass never depends on the broken Update
+    /// path) both runs reclaim. Exercises the OFFLINE `kv compact --apply` GC (`kv_gc`, min_age=0,
+    /// checkpoint-drop); the online `kv_gc_online` shares the same `gc_options`, so the fix covers both.
+    #[serial_test::serial]
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "on-disk GC; run unignored on the host toolchain"]
+    async fn compact_gc_reclaims_manifests_on_the_second_run_local_fs() {
+        with_fresh_slatedb_dir("compact-gc-second-run", |dir| async move {
+            // Compactor + GC OFF; raised L0 caps so per-round SSTs pile up (nothing drains L0).
+            let mk = || {
+                let mut s = test_settings(Some(Duration::from_millis(5)));
+                s.l0_max_ssts = 100_000;
+                s.l0_max_ssts_per_key = 100_000;
+                s
+            };
+            const ROUNDS: usize = 20;
+            let churn = |dir: std::path::PathBuf, tag: u8| async move {
+                let kv = SlateKv::open_local_settings(&dir, mk()).await.unwrap();
+                for round in 0..ROUNDS {
+                    kv.put(
+                        &format!("current/site-{:03}", round % 8),
+                        vec![tag.wrapping_add(round as u8); 256],
+                    )
+                    .await
+                    .unwrap();
+                    kv.checkpoint().await.unwrap(); // each freeze writes a fresh manifest version
+                }
+                KvStore::close(&kv).await.unwrap();
+            };
+
+            // Round 1: churn manifests, then the FIRST offline reclaim (this is the run that worked in
+            // the old test — it takes the boundary Create path under the bug).
+            churn(dir.clone(), 0).await;
+            let store = fs_store(&dir);
+            let root = "kv";
+            let pre1 = manifest_dir(&store, root).await;
+            assert!(pre1.objects >= 12, "leak shape (round 1): {pre1:?}");
+            kv_gc(&store, root, false, Duration::ZERO).await.unwrap();
+            let mid = manifest_dir(&store, root).await;
+            assert!(
+                mid.objects * 2 <= pre1.objects,
+                "first reclaim must shrink manifest/: {} → {}",
+                pre1.objects,
+                mid.objects
+            );
+
+            // Round 2: churn a SECOND batch, then reclaim AGAIN — the run prod always reached.
+            churn(dir.clone(), 100).await;
+            let pre2 = manifest_dir(&store, root).await;
+            assert!(pre2.objects >= 12, "leak shape (round 2): {pre2:?}");
+            kv_gc(&store, root, false, Duration::ZERO).await.unwrap();
+            let post = manifest_dir(&store, root).await;
+            assert!(
+                post.objects * 2 <= pre2.objects,
+                "REGRESSION: the SECOND reclaim must still shrink manifest/ (prod left all 202k here): \
+                 {} → {} objects",
+                pre2.objects,
+                post.objects
+            );
+            assert!(
+                post.bytes < pre2.bytes / 2,
+                "second reclaim must drop manifest bytes by more than half: {} → {} B",
+                pre2.bytes,
+                post.bytes
+            );
+
+            // LOSSLESS: the live data survives both reclaims.
+            let kv = SlateKv::open_local_settings(&dir, test_settings(None))
+                .await
+                .unwrap();
+            for site in 0..8usize {
+                assert!(
+                    kv.get(&format!("current/site-{site:03}"))
+                        .await
+                        .unwrap()
+                        .is_some(),
+                    "live key site-{site:03} must survive repeated manifest GC"
+                );
+            }
+            KvStore::close(&kv).await.unwrap();
+            eprintln!(
+                "KV COMPACT-GC SECOND-RUN RECLAIM OK: round-2 manifest {} → {} objects",
+                pre2.objects, post.objects
             );
         })
         .await;
