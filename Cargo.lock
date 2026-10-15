@@ -1845,6 +1845,7 @@ dependencies = [
  "boatramp-vz",
  "bytes",
  "clap",
+ "figment",
  "futures",
  "getrandom 0.2.17",
  "hex",
