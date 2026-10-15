@@ -5,8 +5,12 @@ storage layout see `KEYSPACE.md`; for multi-node and Cloudflare see
 `CLOUDFLARE.md`.
 
 boatramp has one binary with subcommands. Configuration precedence is uniform
-everywhere: **flag/env > config file > built-in default**. The config file is
-`project.cfg` for the project commands and `boatramp.cfg` for `serve` (both RON).
+everywhere: **explicit CLI flag > `BOATRAMP_*` env > config file > built-in default**. The
+config file is `project.cfg` for the project commands and `boatramp.cfg` for `serve` (both
+RON). The daemon-config env vars resolve the same way for `serve` AND the offline ops
+(`migrate`, `blob`, `token`), so a 12-factor deployment can configure every subcommand from
+the environment alone; `boatramp config dump` prints what a node would resolve (secrets
+redacted). See `docs/src/explanation/config-model.md`.
 
 ## Quick start
 

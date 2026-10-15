@@ -5,9 +5,11 @@ page documents each command. Any command also prints its own flags with
 `boatramp <command> --help`, and group commands list their sub-actions with
 `boatramp <command> help`.
 
-Precedence for any overridable value: **flag / environment variable > config
-file > built-in default**. Project commands read `project.cfg`; `serve` reads
-`boatramp.cfg`.
+Precedence for any overridable value: **explicit CLI flag > environment variable > config
+file > built-in default** (one layered resolver — see [the configuration
+model](../explanation/config-model.md)). Project commands read `project.cfg`; `serve` and the
+daemon operations (`migrate`, `blob`, `token`) read `boatramp.cfg`, and the `BOATRAMP_*`
+daemon-config env vars resolve the same for all of them.
 
 ## Global flags
 
@@ -732,6 +734,7 @@ fleet-wide without a restart. See the
 | `apply -f <file>` | Replace the whole dynamic config from a JSON file. |
 | `list` | List the dynamic (runtime-settable) keys. |
 | `describe <key>` | A key's change class (`dynamic` vs `restart`). |
+| `dump [--file boatramp.cfg] [--explain]` | Print the resolved **static** daemon config (`boatramp.cfg` + `BOATRAMP_*` env) as JSON, secrets redacted. **Client-side only** — no server is contacted. |
 | `migrate <file> [--write]` | Upgrade an [`apply`](#boatramp-apply) manifest to the current schema. **Client-side only** — no server is contacted. |
 
 `config set` on a `restart`-class key (a trust anchor, posture, or listener

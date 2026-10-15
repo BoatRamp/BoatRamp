@@ -23,6 +23,55 @@ caps, and the fleet [default microVM kernel](./compute-model.md).
 
 The server runs on `effective = file baseline ⊕ dynamic overrides`.
 
+## Resolving the static config
+
+The static `boatramp.cfg` baseline is itself resolved by **one layered pipeline**, lowest to
+highest precedence:
+
+```
+built-in defaults  →  config file (boatramp.cfg, RON or JSON)  →  BOATRAMP_* environment  →  explicit CLI flags
+```
+
+A later layer wins per field. So an env var overrides the file, and a flag you actually type
+on the command line overrides both — while a flag left at its default never shadows the file
+or env. You can configure a node entirely from the environment (no `boatramp.cfg` at all), or
+from a file, or any mix.
+
+**The env surface is uniform across every subcommand.** The same `BOATRAMP_*` variables that
+configure `boatramp serve` now also configure the offline operations — `boatramp migrate`,
+`boatramp blob …`, `boatramp token …` — which previously ignored most of them. For example
+`BOATRAMP_BLOBS` / `BOATRAMP_S3_BUCKET` (and the whole `[serve]` + `[serve.kv]` surface) are
+honored by `blob migrate` and `migrate` with no config file, exactly as by `serve`. The env
+variable names are unchanged.
+
+Inspect what a node would resolve with [`boatramp config dump`](#inspecting-the-resolved-config).
+
+### Precedence and parsing notes
+
+- **Empty is unset.** `VAR=` (empty or whitespace-only) is treated as unset — it never
+  clobbers a file value with `""`.
+- **Booleans** accept `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off` (case-insensitive), with
+  surrounding whitespace trimmed (so a templated `"true\n"` still parses).
+- **Lists** (e.g. kernel trust anchors, the SQL migration extension allowlist) are
+  comma-separated, trimmed, with empty items dropped.
+- **Dynamic-keyed maps** are populated by scanning the environment:
+  `BOATRAMP_HANDLERS_SQL_DB_<NAME>_<FIELD>`, `BOATRAMP_SERVE_BLOB_BACKEND_<PROJECT>_<FIELD>`,
+  `BOATRAMP_SERVE_LISTENER_<NAME>_<FIELD>`.
+- **A malformed value fails loudly at startup** — a non-numeric number, an unknown enum, a bad
+  address is rejected, never silently defaulted.
+- **Validation runs on the merged result:** a `[cluster]` section is rejected if it has no
+  `listen`, and the SQL-db-name / blob-project / listener checks run over the fully merged
+  (file + env + flags) config, so an invalid entry from any layer fails closed at boot.
+
+### Inspecting the resolved config
+
+`boatramp config dump [--file boatramp.cfg] [--explain]` prints the fully resolved static
+config (file + `BOATRAMP_*` env) as JSON, with the **secret-bearing fields redacted** (the auth
+root key, bootstrap secret, azure access key, external-signer key, sealed-credential refs, and
+`cluster.join_token` show as `<redacted>`). It is client-side — no server is contacted — and is
+the quickest way to see what a node *would* load. (This is distinct from `boatramp config
+get`/`set`, which read and write the live **dynamic** config over the control-plane API.)
+
 ## Why the anchors stay static
 
 The static file's security value is that **mutating it needs host access, not an
