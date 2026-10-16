@@ -465,12 +465,20 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
     // every persisted replica's `(workload, replica, endpoint-ip)`; each backend keeps
     // only the IPs in its own subnet (a cheap no-op for docker/cloudflare/VMM).
     crate::compute::adopt_running_replica_ips(&deploy, &compute_backends).await;
-    // Capture the docker backend for the project-export driver BEFORE `compute_backends`
-    // is consumed by the reconcile loop below (a cheap `Arc` clone; `None` ⇒ no docker
-    // daemon, so the export driver is not wired).
+    // Capture a run_ephemeral-capable compute backend for the project-export/import + `sql exec`
+    // managed-SQL seam BEFORE `compute_backends` is consumed by the reconcile loop below (a cheap
+    // `Arc` clone). Prefer the Docker-daemon backend, but FALL BACK to the native `container`
+    // backend — both implement `run_ephemeral` (the native one since v0.32.0), so the seam wires on
+    // a fly/firecracker (container-only) node too, not only a Docker host. `None` ⇒ neither backend
+    // is present, so the managed-SQL export seam is not wired (the `501 operator-SQL seam not
+    // configured`). This was the gap: it previously required `"docker"` and silently no-op'd on every
+    // container node.
     #[cfg(feature = "project-export")]
-    let export_docker_backend: Option<Arc<dyn boatramp_core::compute::ComputeBackend>> =
-        compute_backends.get("docker").cloned();
+    let export_sql_backend: Option<Arc<dyn boatramp_core::compute::ComputeBackend>> =
+        compute_backends
+            .get("docker")
+            .or_else(|| compute_backends.get("container"))
+            .cloned();
     // Per-project internal DNS (service discovery): start the resolver on the bridge
     // gateway so a guest resolves peers by name within its project. On by default;
     // starts only when the container backend + bridge are up (Linux). Detached for
@@ -863,8 +871,16 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
             export_blobs,
             data_dir.join("project-export"),
         );
+        // Operator digest-pin / override for the ephemeral SQL-client images (the `pg_dump`/
+        // `mysqldump`/`psql` one-shots), so a `pgvector/pgvector:pg16@sha256:<hex>` ref can be
+        // supplied by env and accepted under the multi-tenant posture without rootfs staging. `None`
+        // ⇒ the version-computed tag.
+        if let Some(c) = config.compute.as_ref() {
+            driver =
+                driver.with_client_images(c.pg_client_image.clone(), c.mysql_client_image.clone());
+        }
         if let (Some(backend), Some(envelope), Some(op)) =
-            (export_docker_backend, export_envelope, operator_sql.clone())
+            (export_sql_backend, export_envelope, operator_sql.clone())
         {
             let published = config
                 .compute

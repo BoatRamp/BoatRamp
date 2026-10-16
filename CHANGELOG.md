@@ -5,6 +5,27 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.35.1] - 2026-10-16
+
+**Fix: `project export` / `import` (and `sql exec`) now work on a container/firecracker node.** The
+managed-SQL seam that dumps/restores a Postgres/MySQL database via an ephemeral `pg_dump`/`mysqldump`/`psql`
+one-shot was wired ONLY from the Docker-daemon backend — so on a node without Docker, i.e. every
+fly/firecracker (native `container`) node, it silently never wired and `boatramp project export <project>`
+failed with `pg/mysql export/import needs the operator-SQL seam … not configured on this node`. It now also
+wires off the native `container` backend (which has implemented `run_ephemeral` since v0.32.0), so
+export/import/`sql exec` of a managed database work on a container-only node.
+
+### Pin the ephemeral SQL-client image by digest (config)
+
+- New `[compute] pg_client_image` / `mysql_client_image` — env `BOATRAMP_COMPUTE_PG_CLIENT_IMAGE` /
+  `BOATRAMP_COMPUTE_MYSQL_CLIENT_IMAGE`. When set, the value is used VERBATIM as the ephemeral client image
+  instead of the version-computed `pgvector/pgvector:pg{major}` / `mysql:<maj.min>` tag — so an operator can
+  supply a provenance-pinned `name@sha256:<hex>` ref that the **multi-tenant** posture accepts (it refuses an
+  unauthenticated on-demand pull of a mutable tag), with **no rootfs staging**: boatramp pulls + runs it
+  through the normal on-demand path. A wrong-major pin fails loud at dump time. This is the lighter-weight
+  alternative to the air-gap `[compute] client_image_rootfs` map for a node with registry egress; `None`
+  (default) keeps the computed tag, and one pin covers export, import, and `sql exec` (a single seam).
+
 ## [0.35.0] - 2026-10-15
 
 **One layered config resolver for every subcommand.** boatramp's daemon configuration is now
