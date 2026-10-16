@@ -553,6 +553,8 @@ const COMPUTE_ENV_VARS: &[&str] = &[
     "BOATRAMP_COMPUTE_INTERNAL_DNS",
     "BOATRAMP_COMPUTE_DNS_UPSTREAM",
     "BOATRAMP_COMPUTE_DNS_DOMAIN",
+    "BOATRAMP_COMPUTE_PG_CLIENT_IMAGE",
+    "BOATRAMP_COMPUTE_MYSQL_CLIENT_IMAGE",
 ];
 
 /// The `BOATRAMP_*` variables that populate the `[security]` section.
@@ -1014,6 +1016,23 @@ pub struct ComputeConfig {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub client_image_rootfs: BTreeMap<String, String>,
+    /// **Digest-pin / override** for the Postgres client image the project export/import + `sql exec`
+    /// seams run via `run_ephemeral` (`pg_dump`/`pg_restore`/`psql`). When set, this image reference is
+    /// used VERBATIM instead of the version-computed `pgvector/pgvector:pg{major}` tag — so an operator
+    /// can pin it by digest (`pgvector/pgvector:pg16@sha256:<hex>`) and have it accepted under the
+    /// multi-tenant posture (which refuses an un-pinned mutable-tag pull), with NO rootfs staging:
+    /// boatramp pulls + runs it through the normal on-demand path. The lighter-weight alternative to
+    /// [`Self::client_image_rootfs`] for a node with registry egress. `None` (default) ⇒ the computed
+    /// tag. Env: `BOATRAMP_COMPUTE_PG_CLIENT_IMAGE`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub pg_client_image: Option<String>,
+    /// MySQL counterpart of [`Self::pg_client_image`] — pins/overrides the `mysql:<maj.min>` client
+    /// image for the export/import/`sql exec` `run_ephemeral` (`mysqldump`/`mysql`). Env:
+    /// `BOATRAMP_COMPUTE_MYSQL_CLIENT_IMAGE`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub mysql_client_image: Option<String>,
 }
 
 /// Default for [`ComputeConfig::internal_dns`] — on (activates only with the
@@ -1113,6 +1132,8 @@ impl Default for ComputeConfig {
             dns_upstream: default_dns_upstream(),
             dns_domain: default_dns_domain(),
             client_image_rootfs: BTreeMap::new(),
+            pg_client_image: None,
+            mysql_client_image: None,
         }
     }
 }

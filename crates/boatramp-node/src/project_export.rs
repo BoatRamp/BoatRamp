@@ -378,6 +378,13 @@ pub struct NodeProjectExport {
     identity_source: Option<IdentityEnvelope>,
     work_dir: PathBuf,
     connect_timeout_secs: u32,
+    /// Operator digest-pin / override for the ephemeral Postgres client image
+    /// (`pg_dump`/`pg_restore`/`psql`). `Some` ⇒ used verbatim instead of the version-computed
+    /// `pgvector/pgvector:pg{major}` tag — e.g. a `@sha256:`-pinned ref accepted under the
+    /// multi-tenant posture. `None` ⇒ the computed tag.
+    pg_client_image: Option<String>,
+    /// MySQL counterpart — overrides the computed `mysql:<maj.min>` client image.
+    mysql_client_image: Option<String>,
 }
 
 impl NodeProjectExport {
@@ -405,6 +412,49 @@ impl NodeProjectExport {
             identity_source: None,
             work_dir,
             connect_timeout_secs: 10,
+            pg_client_image: None,
+            mysql_client_image: None,
+        }
+    }
+
+    /// Supply an operator override for the ephemeral SQL-client images (the `pg_dump`/`mysqldump`/
+    /// `psql` one-shots). Each `Some(ref)` is used VERBATIM in place of the version-computed tag —
+    /// so a digest-pinned ref (`pgvector/pgvector:pg16@sha256:<hex>`) can be accepted under the
+    /// multi-tenant posture with no rootfs staging. `None` keeps the computed tag.
+    #[must_use]
+    pub fn with_client_images(
+        mut self,
+        pg_client_image: Option<String>,
+        mysql_client_image: Option<String>,
+    ) -> Self {
+        self.pg_client_image = pg_client_image;
+        self.mysql_client_image = mysql_client_image;
+        self
+    }
+
+    /// The Postgres client image for `server_version_num`: the operator override
+    /// ([`with_client_images`](Self::with_client_images)) used VERBATIM, else the version-computed
+    /// `pgvector/pgvector:pg{major}` tag. A verbatim override lets a `@sha256:`-pinned ref be
+    /// accepted under the multi-tenant posture; a wrong-major pin fails loud at `pg_dump` time.
+    fn pg_image(
+        &self,
+        server_version_num: &str,
+    ) -> Result<String, boatramp_core::compute::VersionMapError> {
+        match &self.pg_client_image {
+            Some(pinned) => Ok(pinned.clone()),
+            None => boatramp_core::compute::pg_client_image_for_server_version(server_version_num),
+        }
+    }
+
+    /// MySQL counterpart of [`pg_image`](Self::pg_image) — the override verbatim, else the
+    /// computed `mysql:<maj.min>` tag.
+    fn mysql_image(
+        &self,
+        version: &str,
+    ) -> Result<String, boatramp_core::compute::VersionMapError> {
+        match &self.mysql_client_image {
+            Some(pinned) => Ok(pinned.clone()),
+            None => boatramp_core::compute::mysql_client_image_for_server_version(version),
         }
     }
 
@@ -594,7 +644,8 @@ impl NodeProjectExport {
                 "database {db:?}: empty SHOW server_version_num result"
             ))
         })?;
-        let image = boatramp_core::compute::pg_client_image_for_server_version(&server_version_num)
+        let image = self
+            .pg_image(&server_version_num)
             .map_err(|e| Perr::Other(format!("database {db:?}: {e}")))?;
         Ok((
             ep.into_pg(self.connect_timeout_secs),
@@ -621,7 +672,8 @@ impl NodeProjectExport {
         let version = scalar_text(&banner).ok_or_else(|| {
             Perr::Other(format!("database {db:?}: empty SELECT VERSION() result"))
         })?;
-        let image = boatramp_core::compute::mysql_client_image_for_server_version(&version)
+        let image = self
+            .mysql_image(&version)
             .map_err(|e| Perr::Other(format!("database {db:?}: {e}")))?;
         Ok((ep.into_mysql(self.connect_timeout_secs), image, version))
     }
@@ -1324,6 +1376,46 @@ mod tests {
         assert!(kind_is_mysql("mysql"));
         assert!(kind_is_mysql("MariaDB"));
         assert!(!kind_is_mysql("postgres"));
+    }
+
+    #[test]
+    fn client_image_override_is_used_verbatim_else_computed() {
+        use boatramp_core::Storage;
+        use boatramp_core::deploy::DeployStore;
+        use boatramp_core::kv::{KvStore, MemoryKv};
+        use boatramp_storage::fs::FsStorage;
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let blobs: Arc<dyn Storage> = Arc::new(FsStorage::new(tmp.path().join("blobs")));
+        let deploy = DeployStore::new(blobs.clone(), kv.clone());
+        let drv =
+            NodeProjectExport::new(BTreeMap::new(), deploy, kv, blobs, tmp.path().join("work"));
+
+        // No override: delegates to the version computer (and errors on an unmappable version).
+        assert_eq!(
+            drv.pg_image("160004").unwrap(),
+            boatramp_core::compute::pg_client_image_for_server_version("160004").unwrap()
+        );
+        assert!(drv.pg_image("not-a-number").is_err());
+
+        // Override: used VERBATIM and bypasses the version map entirely — a `@sha256:`-pinned ref
+        // is returned even for a version the computer would reject, so the operator's pin reaches
+        // `resolve_client_rootfs` (accepted under the multi-tenant posture) unchanged.
+        let pinned = drv.with_client_images(
+            Some("pgvector/pgvector:pg16@sha256:dead".into()),
+            Some("mysql:8.4@sha256:beef".into()),
+        );
+        assert_eq!(
+            pinned.pg_image("not-a-number").unwrap(),
+            "pgvector/pgvector:pg16@sha256:dead"
+        );
+        assert_eq!(
+            pinned.mysql_image("not-a-version").unwrap(),
+            "mysql:8.4@sha256:beef"
+        );
     }
 
     #[test]
