@@ -1,6 +1,7 @@
 //! The wasmtime component engine: compile (cached by blob hash), instantiate
 //! per request, drive `wasi:http/incoming-handler`, and enforce limits.
 
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::num::NonZeroUsize;
 use std::path::Path;
@@ -88,6 +89,10 @@ pub struct SessionBatch {
 /// survives a restart and the first request after a cold start skips
 /// recompilation. The cache is best-effort: a missing config file or an
 /// unwritable cache dir degrades to no caching rather than failing.
+/// Domain-separation tag for the AOT engine fingerprint (cold-start cap-req 09). Bump the
+/// suffix if the fingerprint derivation ever changes, to partition old artifacts out.
+const AOT_FINGERPRINT_DOMAIN: &[u8] = b"boatramp-aot-fingerprint-v1";
+
 fn base_config(cache_dir: Option<&Path>) -> Result<Config, HandlerError> {
     let mut config = Config::new();
     config.wasm_component_model(true);
@@ -1221,6 +1226,16 @@ pub struct HandlerEngine {
     /// surface (construens memory-instance-observability). `Arc` so the server can hold a handle.
     stats: Arc<crate::instance_stats::InstanceStats>,
     cache: Mutex<LruCache<String, ProxyPre<HostState>>>,
+    /// Request-lane **warm floor** (cold-start cap-req 09): components pinned here are
+    /// NEVER LRU-evicted, so a latency-critical face never cold-starts under capacity
+    /// pressure. A SEPARATE map (not an LRU pin) so it sidesteps the LRU's len-vs-cap
+    /// accounting entirely and gives a hard "pinned ⇒ never cold" guarantee. Checked
+    /// before `cache` on the serve path; bounded by `keep_warm_max`.
+    pinned: Mutex<HashMap<String, ProxyPre<HostState>>>,
+    /// The node-global cap on pinned (warm-floor) request components (`[handlers]
+    /// keep_warm_max`). `0` ⇒ the warm floor is OFF (no component is ever pinned), so an
+    /// engine built without it behaves exactly as before.
+    keep_warm_max: usize,
     /// Separate compile cache for consumer (`wasi:messaging`) components — a
     /// different world (`handle` export) than the request `ProxyPre`.
     #[cfg(feature = "messaging")]
@@ -1471,6 +1486,10 @@ impl HandlerEngine {
             engine,
             stats: Arc::new(crate::instance_stats::InstanceStats::default()),
             cache,
+            // Warm floor OFF by default (cap 0, empty pinned set) — identical to prior behavior
+            // until an operator sets `[handlers] keep_warm_max` via `with_keep_warm_max`.
+            pinned: Mutex::new(HashMap::new()),
+            keep_warm_max: 0,
             #[cfg(feature = "messaging")]
             consumer_cache: Mutex::new(LruCache::new(capacity)),
             #[cfg(feature = "messaging")]
@@ -1546,6 +1565,134 @@ impl HandlerEngine {
         self.streaming_semaphore = Semaphore::new(streaming_limits.max_concurrency.max(1));
         self.streaming_limits = streaming_limits;
         self
+    }
+
+    /// Set the **warm-floor** cap (`[handlers] keep_warm_max`): the maximum number of
+    /// request components [`pin_request_component`](Self::pin_request_component) may pin in
+    /// the never-evicted set. `0` (the default) keeps the floor OFF. An engine built without
+    /// this behaves exactly as before.
+    #[must_use]
+    pub fn with_keep_warm_max(mut self, keep_warm_max: usize) -> Self {
+        self.keep_warm_max = keep_warm_max;
+        self
+    }
+
+    /// Pin component `hash` in the request-lane **warm floor** so it is never LRU-evicted —
+    /// a latency-critical face stays warm under capacity pressure (cold-start cap-req 09).
+    /// Compiles the component once (reusing [`compile`](Self::compile)) and inserts it into
+    /// the pinned set. A no-op (returns `Ok`) when the floor is off (`keep_warm_max == 0`)
+    /// or already at capacity with this hash not already pinned — the LRU then handles it as
+    /// before (best-effort floor, never an error that would fail a deploy). Already-pinned ⇒
+    /// re-compiled + replaced (a deploy re-point).
+    pub fn pin_request_component(&self, hash: &str, wasm: &[u8]) -> Result<(), HandlerError> {
+        if self.keep_warm_max == 0 {
+            return Ok(());
+        }
+        {
+            let pinned = self.pinned.lock().unwrap();
+            if !pinned.contains_key(hash) && pinned.len() >= self.keep_warm_max {
+                // At capacity and this is a new hash — leave it to the LRU rather than
+                // evicting another pinned (latency-critical) component.
+                tracing::warn!(
+                    target: "boatramp::handler",
+                    %hash, cap = self.keep_warm_max,
+                    "warm floor at capacity; component not pinned (served via the LRU cache)"
+                );
+                return Ok(());
+            }
+        }
+        let pre = self.compile(wasm)?;
+        self.pinned.lock().unwrap().insert(hash.to_string(), pre);
+        Ok(())
+    }
+
+    /// Drop component `hash` from the warm floor (deploy churn / unpin). A no-op if it was
+    /// not pinned. The component may still be served from the LRU cache afterwards.
+    pub fn unpin_request_component(&self, hash: &str) {
+        self.pinned.lock().unwrap().remove(hash);
+    }
+
+    /// Compile `wasm` ONCE, warm the request-lane cache (like [`precompile`](Self::precompile)),
+    /// AND return the portable **serialized artifact** for cross-node upload (cold-start
+    /// cap-req 09, producer path). A single compile serves both the local warm-up and the
+    /// artifact. The returned bytes are the wasmtime-serialized `Component` — the caller
+    /// (serve layer) frames + MACs them before storing; they are NOT self-authenticating.
+    pub fn precompile_and_serialize_request(
+        &self,
+        hash: &str,
+        wasm: &[u8],
+    ) -> Result<Vec<u8>, HandlerError> {
+        let component = Component::from_binary(&self.engine, wasm)
+            .map_err(|err| HandlerError::Compile(err.to_string()))?;
+        let artifact = component
+            .serialize()
+            .map_err(|err| HandlerError::Compile(format!("serialize component: {err}")))?;
+        let instance_pre = self
+            .build_linker()?
+            .instantiate_pre(&component)
+            .map_err(|err| HandlerError::Compile(err.to_string()))?;
+        let pre = ProxyPre::new(instance_pre).map_err(|_| {
+            HandlerError::Compile("component is not a wasi:http/proxy handler".into())
+        })?;
+        cache_insert_evicted(&self.cache, hash, pre);
+        Ok(artifact)
+    }
+
+    /// Hydrate a **MAC-verified** serialized artifact into the request-lane cache, skipping
+    /// cranelift entirely (cold-start cap-req 09, consumer path). The subsequent serve is a
+    /// warm hit (no cold miss recorded), exactly as if the component had been compiled.
+    ///
+    /// # Security
+    /// `artifact` MUST already have been integrity-verified by the caller (the cluster-keyed
+    /// AOT MAC in `boatramp-server::aot`). `Component::deserialize` loads EXECUTABLE native
+    /// code and is only lightly validated — its embedded version check fails closed on a
+    /// cross-wasmtime-version blob but is explicitly NOT integrity protection against a
+    /// same-version forgery. Passing unverified bytes here is arbitrary code execution. Any
+    /// deserialize error returns `Err` so the caller falls back to compile-from-source.
+    pub fn hydrate_request_artifact(
+        &self,
+        hash: &str,
+        artifact: &[u8],
+    ) -> Result<(), HandlerError> {
+        // SAFETY: the caller has verified the cluster AOT MAC over exactly these bytes, so
+        // they were produced by a trusted node's `Component::serialize` for this engine
+        // fingerprint — satisfying `deserialize`'s "only previously-serialized bytes"
+        // contract. A tampered/foreign blob never reaches here (MAC check precedes this call).
+        let component = unsafe { Component::deserialize(&self.engine, artifact) }
+            .map_err(|err| HandlerError::Compile(format!("deserialize AOT artifact: {err}")))?;
+        let instance_pre = self
+            .build_linker()?
+            .instantiate_pre(&component)
+            .map_err(|err| HandlerError::Compile(err.to_string()))?;
+        let pre = ProxyPre::new(instance_pre).map_err(|_| {
+            HandlerError::Compile("component is not a wasi:http/proxy handler".into())
+        })?;
+        cache_insert_evicted(&self.cache, hash, pre);
+        Ok(())
+    }
+
+    /// A stable 32-byte fingerprint of this engine's codegen-relevant configuration, used to
+    /// PARTITION the AOT artifact cache so an incompatible artifact is never fetched
+    /// (cold-start cap-req 09). Derived from wasmtime's `precompile_compatibility_hash`
+    /// ("binaries from one engine deserialize in another iff this matches") via a
+    /// DETERMINISTIC (fixed-seed) reduction, domain-separated. Not security-load-bearing —
+    /// the artifact MAC and `deserialize`'s own version check are the safety gates; a wrong
+    /// fingerprint only ever causes a cache miss or a safe `Err`, never an unsafe load.
+    pub fn artifact_fingerprint(&self) -> [u8; 32] {
+        use sha2::Digest as _;
+        use std::hash::{Hash as _, Hasher as _};
+        // DefaultHasher is fixed-seed (NOT RandomState), so this is stable across nodes
+        // running the same binary — the only requirement.
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.engine.precompile_compatibility_hash().hash(&mut h);
+        let compat = h.finish();
+        let mut d = sha2::Sha256::new();
+        d.update(AOT_FINGERPRINT_DOMAIN);
+        d.update(compat.to_le_bytes());
+        let out = d.finalize();
+        let mut fp = [0u8; 32];
+        fp.copy_from_slice(&out);
+        fp
     }
 
     /// Resolve the **per-consumer** concurrency gate (P2 resource isolation): the `Arc<Semaphore>`
@@ -1871,7 +2018,9 @@ impl HandlerEngine {
     /// `instance_cache_size` distinct components — degrades to a clear, transient compile error on that
     /// one request, not a wrong result; size the cache ≥ your component count to preclude it.)
     pub fn request_component_warm(&self, hash: &str) -> bool {
-        self.cache.lock().unwrap().contains(hash)
+        // A pinned (warm-floor) component is always resident — count it warm so the serve
+        // path elides the blob read exactly as for an LRU-warm component.
+        self.pinned.lock().unwrap().contains_key(hash) || self.cache.lock().unwrap().contains(hash)
     }
 
     /// The CONSUMER-lane analog of [`request_component_warm`](Self::request_component_warm): a
@@ -1893,6 +2042,11 @@ impl HandlerEngine {
         hash: &str,
         wasm: &[u8],
     ) -> Result<(ProxyPre<HostState>, bool), HandlerError> {
+        // Warm floor first: a pinned component is a warm hit and never touches the LRU.
+        if let Some(pre) = self.pinned.lock().unwrap().get(hash) {
+            self.stats.request.record_warm_hit();
+            return Ok((pre.clone(), false));
+        }
         if let Some(pre) = self.cache.lock().unwrap().get(hash) {
             self.stats.request.record_warm_hit();
             return Ok((pre.clone(), false));

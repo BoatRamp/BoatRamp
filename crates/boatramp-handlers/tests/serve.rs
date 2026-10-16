@@ -838,3 +838,98 @@ async fn warm_component_concurrency_repro() {
     let cold1 = engine.instance_stats().request.cold_misses;
     println!("cold_misses: start={cold0} end={cold1} (warm if unchanged across the bursts)\n");
 }
+
+// --- cold-start cap-req 09: AOT artifact round-trip + warm floor ----------------
+
+/// Producer→consumer AOT round-trip: engine A serializes a compiled component; a FRESH
+/// engine B (empty cache, as a new replica would be) HYDRATES the artifact and serves it
+/// WITHOUT paying a cold compile. This is the portable-artifact invariant (test (b)).
+#[tokio::test(flavor = "multi_thread")]
+async fn aot_artifact_round_trips_and_skips_compile() {
+    let producer = engine();
+    let artifact = producer
+        .precompile_and_serialize_request("http-200", HTTP_200)
+        .expect("serialize artifact");
+    assert!(!artifact.is_empty(), "a serialized artifact has bytes");
+
+    // A fresh engine (a new replica) hydrates + serves with no cranelift compile.
+    let consumer = engine();
+    consumer
+        .hydrate_request_artifact("http-200", &artifact)
+        .expect("hydrate verified artifact");
+    let response = consumer
+        .serve("http-200", HTTP_200, request(), no_caps())
+        .await
+        .expect("hydrated component serves");
+    assert_eq!(response.status(), 200);
+    let snap = consumer.instance_stats();
+    assert_eq!(
+        snap.request.cold_misses, 0,
+        "a hydrated artifact must skip the cold compile entirely"
+    );
+    assert_eq!(
+        snap.request.warm_hits, 1,
+        "the serve is a warm hit off the hydrated cache"
+    );
+}
+
+/// The engine fingerprint is DETERMINISTIC across two engines built from the same config
+/// (so a cluster peer addresses the same artifact), and never the zero sentinel.
+#[tokio::test(flavor = "multi_thread")]
+async fn artifact_fingerprint_is_stable_and_nonzero() {
+    let a = engine();
+    let b = engine();
+    assert_eq!(
+        a.artifact_fingerprint(),
+        b.artifact_fingerprint(),
+        "same engine config ⇒ same fingerprint (peers agree on the artifact key)"
+    );
+    assert_ne!(a.artifact_fingerprint(), [0u8; 32]);
+}
+
+/// Warm floor (test (c)): a PINNED component survives capacity pressure that would evict
+/// it from a bare LRU. With a 1-slot cache + a 1-slot floor, pin `http-200`, churn the LRU
+/// with a DIFFERENT component, and confirm `http-200` is still warm and serves as a warm
+/// hit — never cold-recompiled.
+#[tokio::test(flavor = "multi_thread")]
+async fn warm_floor_pins_against_capacity_pressure() {
+    let engine = HandlerEngine::new(Limits::default(), 1)
+        .expect("engine")
+        .with_keep_warm_max(1);
+    engine
+        .pin_request_component("http-200", HTTP_200)
+        .expect("pin");
+    assert!(engine.request_component_warm("http-200"), "pinned ⇒ warm");
+
+    // Churn the single LRU slot with a DISTINCT cache key (same bytes, different hash) —
+    // this would evict an UNPINNED http-200 from the 1-slot LRU.
+    let churn = engine
+        .serve("churn-a", HTTP_200, request(), no_caps())
+        .await
+        .expect("churn component serves");
+    assert_eq!(churn.status(), 200);
+
+    // The pin held: http-200 is still warm, and serving it is a warm hit (no cold compile).
+    assert!(
+        engine.request_component_warm("http-200"),
+        "the pinned component survived the LRU churn"
+    );
+    let warm_before = engine.instance_stats().request.warm_hits;
+    let response = engine
+        .serve("http-200", HTTP_200, request(), no_caps())
+        .await
+        .expect("pinned component serves");
+    assert_eq!(response.status(), 200);
+    let snap = engine.instance_stats();
+    assert_eq!(
+        snap.request.warm_hits,
+        warm_before + 1,
+        "the pinned serve is a warm hit"
+    );
+    // Only the churn component ever cold-compiled on the serve path; the pin kept http-200
+    // out of the cold path entirely.
+    assert_eq!(
+        snap.request.cold_misses, 1,
+        "exactly the churn component compiled; the pinned one never cold-started"
+    );
+}
