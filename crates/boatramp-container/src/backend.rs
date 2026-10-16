@@ -695,6 +695,12 @@ impl ContainerBackend {
                 tokio::fs::rename(&tmp, &dir).await.map_err(|e| {
                     BackendError::Materialize(format!("publish rootfs {}: {e}", dir.display()))
                 })?;
+                // Persist the image's OCI runtime config (`Env`/`WorkingDir`) as a sidecar
+                // next to the staged rootfs, so an ephemeral one-shot can seed the client's
+                // `PATH` + cwd from it WITHOUT a re-pull on the cached-rootfs fast path.
+                // Best-effort: a fetch/write failure here is recovered by an on-demand fetch
+                // in `client_image_config`, and a hard miss degrades to the default env.
+                self.persist_image_config_sidecar(image).await;
                 Ok(dir)
             }
             Err(e) => {
@@ -705,6 +711,81 @@ impl ContainerBackend {
             }
         }
     }
+
+    /// Path to the on-disk sidecar caching a staged image's OCI runtime config
+    /// (`<data_dir>/compute/images/<sha256(ref)>.b<base>.imgcfg.json`) — a SIBLING of the
+    /// staged rootfs directory, so the config never appears inside the guest filesystem.
+    fn image_config_sidecar(&self, image: &str) -> PathBuf {
+        let key = boatramp_types::manifest::sha256_hex(image.as_bytes());
+        self.data_dir
+            .join("compute")
+            .join("images")
+            .join(format!("{key}.b{}.imgcfg.json", self.userns_base))
+    }
+
+    /// Fetch the image's OCI config from the registry and write the sidecar (best-effort,
+    /// never errors). Called at stage time; the ephemeral path reads the sidecar back.
+    async fn persist_image_config_sidecar(&self, image: &str) {
+        if let Ok(cfg) = boatramp_firecracker::oci::pull_image_config(image).await
+            && let Ok(json) = serde_json::to_vec(&cfg)
+        {
+            let _ = tokio::fs::write(self.image_config_sidecar(image), json).await;
+        }
+    }
+
+    /// Resolve the client image's OCI runtime config (`Env`, `WorkingDir`) for an ephemeral
+    /// one-shot. Prefer the on-disk sidecar (written at stage time); on a miss — an image
+    /// staged by a pre-0.35.2 server, a sidecar write that failed — fetch once from the
+    /// registry and cache it. An air-gap preloaded rootfs (no registry to query) or an
+    /// offline fetch yields the DEFAULT (empty) config, so the one-shot runs with just the
+    /// caller's env + the libc default `PATH`, exactly as before this fix (never fails the
+    /// run). A `@sha256:`-pinned image makes this fetch content-addressed; the multi-tenant
+    /// mutable-tag refusal already fired in `resolve_client_rootfs` before we reach here.
+    async fn client_image_config(&self, image: &str) -> boatramp_firecracker::oci::ImageConfig {
+        let sidecar = self.image_config_sidecar(image);
+        if let Ok(bytes) = tokio::fs::read(&sidecar).await
+            && let Ok(cfg) =
+                serde_json::from_slice::<boatramp_firecracker::oci::ImageConfig>(&bytes)
+        {
+            return cfg;
+        }
+        if self.client_image_rootfs.contains_key(image) {
+            // Air-gap preloaded rootfs — there is no registry to fetch the config from.
+            return boatramp_firecracker::oci::ImageConfig::default();
+        }
+        match boatramp_firecracker::oci::pull_image_config(image).await {
+            Ok(cfg) => {
+                if let Ok(json) = serde_json::to_vec(&cfg) {
+                    let _ = tokio::fs::write(&sidecar, json).await;
+                }
+                cfg
+            }
+            Err(_) => boatramp_firecracker::oci::ImageConfig::default(),
+        }
+    }
+}
+
+/// Merge an image config's `KEY=VALUE` environment (the base — notably `PATH`) with the
+/// caller's `(KEY, VALUE)` overrides applied on top: an override REPLACES the same-key
+/// image entry, a new key is appended. Mirrors `oci::effective_env` over the backend's
+/// pair shape. The caller's connection vars (`PG*`/`MYSQL*`) thus win, while the image
+/// supplies the `PATH` the client binaries live on. A malformed image entry (no `=`) is
+/// skipped.
+fn merge_env(image_env: &[String], overrides: &[(String, String)]) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = image_env
+        .iter()
+        .filter_map(|kv| {
+            kv.split_once('=')
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+        })
+        .collect();
+    for (k, v) in overrides {
+        match out.iter_mut().find(|(ek, _)| ek == k) {
+            Some(slot) => slot.1 = v.clone(),
+            None => out.push((k.clone(), v.clone())),
+        }
+    }
+    out
 }
 
 #[async_trait]
@@ -1077,6 +1158,15 @@ impl ComputeBackend for ContainerBackend {
         let rootfs = self.resolve_client_rootfs(image).await?;
         let rootfs = rootfs.display().to_string();
 
+        // Seed the client's environment + cwd from the pulled image's OCI config so a bare
+        // `pg_dump`/`pg_restore`/`psql`/`mysql*` (no absolute path) resolves against the
+        // image's own `PATH` (e.g. `/usr/lib/postgresql/16/bin` on `pgvector/pgvector`)
+        // instead of failing with `127`. The caller's env (the PG*/MYSQL* connection vars)
+        // is overlaid on top and WINS on any key conflict; the worker's `execvpe` performs
+        // the actual `PATH` search. A default (empty) config leaves behavior as before.
+        let image_cfg = self.client_image_config(image).await;
+        let merged_env = merge_env(&image_cfg.env, env);
+
         // A unique id (cgroup / veth / hostname / log stem) + a transient IP drawn from
         // the SAME shared pool as every replica, so it can't collide with a live workload.
         let id = ephemeral_container_id();
@@ -1086,7 +1176,17 @@ impl ComputeBackend for ContainerBackend {
         // leaked ephemeral container (or a wedged run against an unreachable DSN) must
         // never hold a veth, a cgroup, or a pool address.
         let outcome = self
-            .run_ephemeral_inner(&id, &rootfs, ip, image, argv, env, stdin, stdout)
+            .run_ephemeral_inner(
+                &id,
+                &rootfs,
+                ip,
+                image,
+                argv,
+                &merged_env,
+                &image_cfg.workdir,
+                stdin,
+                stdout,
+            )
             .await;
         self.ephemeral_teardown(&id, ip).await;
         outcome
@@ -1449,6 +1549,7 @@ impl ContainerBackend {
         image: &str,
         argv: &[String],
         env: &[(String, String)],
+        workdir: &str,
         mut stdin: Option<&mut (dyn futures::io::AsyncRead + Send + Unpin)>,
         stdout: &mut (dyn futures::io::AsyncWrite + Send + Unpin),
     ) -> Result<i32, BackendError> {
@@ -1493,6 +1594,9 @@ impl ContainerBackend {
         // SHARED cached staged image — so a read-only root keeps a buggy/hostile client
         // from mutating that cache. Matches the docker backend's `readonly_rootfs`.
         plan.readonly_root = true;
+        // Start the client in the image's `WorkingDir` (empty ⇒ the pivoted root `/`); the
+        // worker honors it best-effort just before `execvpe`.
+        plan.workdir = workdir.to_string();
         // Point the client at the internal resolver on the bridge gateway when enabled, so
         // an external DSN hostname resolves (the resolver forwards external queries). A
         // one-shot has no project scope, so the empty project drops the `search` line and
@@ -2527,6 +2631,54 @@ mod tests {
     use boatramp_core::{GetObject, ObjectMeta, PutMeta, StorageError};
     use bytes::Bytes;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn merge_env_seeds_image_path_and_caller_vars_win() {
+        // The image supplies `PATH` (where the client binaries live); the caller supplies
+        // only the connection vars. The result carries BOTH, so a bare `pg_dump` resolves.
+        let image_env = vec![
+            "PATH=/usr/local/bin:/usr/lib/postgresql/16/bin:/usr/bin:/bin".to_string(),
+            "LANG=en_US.utf8".to_string(),
+            "PGDATA=/var/lib/postgresql/data".to_string(),
+        ];
+        let overrides = vec![
+            ("PGHOST".to_string(), "db.internal".to_string()),
+            ("PGPASSWORD".to_string(), "s3cret".to_string()),
+            // A caller override of an image key MUST win.
+            ("PGDATA".to_string(), "/tmp/ignored".to_string()),
+        ];
+        let merged = merge_env(&image_env, &overrides);
+        let lookup = |k: &str| {
+            merged
+                .iter()
+                .find(|(ek, _)| ek == k)
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(
+            lookup("PATH"),
+            Some("/usr/local/bin:/usr/lib/postgresql/16/bin:/usr/bin:/bin"),
+            "the image PATH must survive so execvpe can find the client binary"
+        );
+        assert_eq!(lookup("PGHOST"), Some("db.internal"));
+        assert_eq!(lookup("PGPASSWORD"), Some("s3cret"));
+        assert_eq!(
+            lookup("PGDATA"),
+            Some("/tmp/ignored"),
+            "a caller override replaces the same-key image entry"
+        );
+        // No duplicate key for the overridden entry.
+        assert_eq!(merged.iter().filter(|(k, _)| k == "PGDATA").count(), 1);
+    }
+
+    #[test]
+    fn merge_env_handles_empty_image_env_and_malformed_entries() {
+        // No image config (air-gap / default) ⇒ just the caller's env, unchanged.
+        let only_caller = merge_env(&[], &[("PGHOST".to_string(), "h".to_string())]);
+        assert_eq!(only_caller, vec![("PGHOST".to_string(), "h".to_string())]);
+        // An image entry without '=' is skipped, not panicked on.
+        let merged = merge_env(&["BROKEN".to_string(), "PATH=/bin".to_string()], &[]);
+        assert_eq!(merged, vec![("PATH".to_string(), "/bin".to_string())]);
+    }
 
     /// A `Storage` that serves one in-memory blob for every `get` — enough to
     /// exercise the `materialize` rootfs-staging path with no privilege (the

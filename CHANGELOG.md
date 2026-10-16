@@ -5,6 +5,30 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.35.2] - 2026-10-16
+
+**Fix: `project export` / `import` (and `sql exec`) now actually run the SQL client on a
+container/firecracker node.** v0.35.1 wired the managed-SQL seam off the native `container` backend, but
+two defects in that backend's never-before-exercised ephemeral-one-shot path still broke the real dump on a
+no-Docker (fly/firecracker, multi-tenant) node:
+
+- **A `name:tag@digest` image ref 404'd the manifest.** The OCI reference parser split on `@` first and left
+  the `:tag` embedded in the repository path, so a digest pin of the form shown in the v0.35.1 docs
+  (`pgvector/pgvector:pg16@sha256:…`) resolved to repo `pgvector/pgvector:pg16` and the manifest GET 404'd.
+  A ref that carries BOTH a tag and a digest now strips the tag (the digest is authoritative), so the
+  documented pin form works; a tag-less digest pin was unaffected.
+- **The client ran without the image's `PATH` → `pg_dump … exited 127`.** The native `container` backend's
+  one-shot worker `execve`'d the bare `argv[0]` (`pg_dump`) with only the `PG*`/`MYSQL*` connection vars in
+  its environment — no `PATH` and no PATH search — so a client binary that lives on a non-default directory
+  (e.g. `/usr/lib/postgresql/16/bin` on `pgvector/pgvector`) was not found and the dump exited 127. The
+  backend now seeds the one-shot's environment from the **pulled image's OCI config `Env`** (notably `PATH`,
+  with the caller's connection vars overlaid on top and winning on conflicts) and honors the image's
+  `WorkingDir`, and the worker resolves a bare `argv[0]` against that `PATH` (`execvpe`; an absolute
+  `argv[0]` is still used verbatim, so every existing launch is byte-for-byte unchanged). The image config is
+  cached in a sidecar beside the staged rootfs, so the cached-rootfs fast path needs no re-pull. Because this
+  is the single `run_ephemeral` seam, the one fix covers `project export`, `project import` (`pg_restore`),
+  and `sql exec`, for both Postgres and MySQL clients.
+
 ## [0.35.1] - 2026-10-16
 
 **Fix: `project export` / `import` (and `sql exec`) now work on a container/firecracker node.** The

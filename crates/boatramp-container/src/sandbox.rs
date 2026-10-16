@@ -162,6 +162,14 @@ pub struct SandboxPlan {
     /// backend's `readonly_rootfs` hardening.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub readonly_root: bool,
+    /// The working directory to `chdir` into just before `execve` (the image's OCI
+    /// `WorkingDir`). Empty (the default, every launched workload) leaves the cwd at the
+    /// pivoted root `/` and is omitted from the serialized plan, so the launch path is
+    /// byte-identical. Set by [`ContainerBackend::run_ephemeral`](crate::backend::ContainerBackend)
+    /// from the pulled image's config so a one-shot client starts where the image expects;
+    /// honored best-effort (a missing dir does not fail the run).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub workdir: String,
     /// The `/etc/resolv.conf` body to write into the jail (after `pivot_root`, into
     /// the container rootfs) so the guest resolves through boatramp's internal DNS on
     /// the bridge gateway. Populated by the backend from the container's project +
@@ -234,6 +242,7 @@ impl SandboxPlan {
             seccomp_allow: Some(crate::seccomp::default_allowlist()),
             exec_stdin_fd: None,
             readonly_root: false,
+            workdir: String::new(),
             resolv_conf: None,
             namespaces: Namespaces::default(),
         }
@@ -375,20 +384,26 @@ mod tests {
         // Default: a writable rootfs, and both one-shot fields omitted — so the launch
         // path's plan JSON is byte-identical to before (schema stays v1).
         assert!(!plan.readonly_root);
+        assert!(plan.workdir.is_empty());
         let json = serde_json::to_string(&plan).unwrap();
         assert!(
-            !json.contains("exec_stdin_fd") && !json.contains("readonly_root"),
+            !json.contains("exec_stdin_fd")
+                && !json.contains("readonly_root")
+                && !json.contains("workdir"),
             "the one-shot fields must be omitted at their defaults: {json}"
         );
         // The one-shot ephemeral path sets them; they then round-trip through the worker.
         plan.exec_stdin_fd = Some(7);
         plan.readonly_root = true;
+        plan.workdir = "/var/lib/postgresql".to_string();
         let json = serde_json::to_string(&plan).unwrap();
         assert!(json.contains("\"exec_stdin_fd\":7"));
         assert!(json.contains("\"readonly_root\":true"));
+        assert!(json.contains("\"workdir\":\"/var/lib/postgresql\""));
         let back = serde_json::from_str::<SandboxPlan>(&json).unwrap();
         assert_eq!(back.exec_stdin_fd, Some(7));
         assert!(back.readonly_root);
+        assert_eq!(back.workdir, "/var/lib/postgresql");
     }
 
     #[test]

@@ -202,7 +202,23 @@ pub fn build_ext4(root: &Path, out: &Path, size_mib: u64) -> Result<(), OciError
 fn parse_reference(image: &str) -> (String, String, String) {
     // Split the tag/digest off the name.
     let (name, reference) = if let Some((n, d)) = image.split_once('@') {
-        (n.to_string(), d.to_string())
+        // A ref may carry BOTH a tag and a digest (`name:tag@digest`, e.g.
+        // `pgvector/pgvector:pg16@sha256:…`). The digest is authoritative, so strip the
+        // tag from the name — otherwise the `:tag` stays embedded in the repository path
+        // and the manifest GET hits `/v2/<repo:tag>/manifests/<digest>` → 404. The tag is
+        // a `:` in the FINAL path component (after the last `/`); a `:` earlier in `n` is a
+        // registry `host:port` and must be preserved.
+        let name = match n.rsplit_once('/') {
+            Some((prefix, last)) => match last.split_once(':') {
+                Some((repo_last, _tag)) => format!("{prefix}/{repo_last}"),
+                None => n.to_string(),
+            },
+            None => match n.split_once(':') {
+                Some((repo, _tag)) => repo.to_string(),
+                None => n.to_string(),
+            },
+        };
+        (name, d.to_string())
     } else if let Some((n, t)) = image.rsplit_once(':') {
         // A ':' after the last '/' is a tag (not a registry port).
         if t.contains('/') {
@@ -316,7 +332,7 @@ struct ResolvedManifest {
 
 /// The subset of an OCI image's runtime config the init needs (the `config`
 /// object of the image config blob): the process to run + its environment.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ImageConfig {
     /// `Entrypoint` argv (prepended to `cmd`).
     pub entrypoint: Vec<String>,
@@ -460,6 +476,16 @@ pub async fn pull_image(image: &str) -> Result<(ImageConfig, Vec<Vec<u8>>), OciE
     let config = parse_image_config(&mut r).await?;
     let layers = fetch_layers(&mut r).await?;
     Ok((config, layers))
+}
+
+/// Pull ONLY an image's runtime [`ImageConfig`] — the manifest resolve + the (small)
+/// config blob, with no layer download. The container backend uses this to recover the
+/// image's `Env` (notably `PATH`) and `WorkingDir` for an ephemeral one-shot whose rootfs
+/// is already staged (layers cached), so a bare `pg_dump`/`pg_restore`/`psql` resolves
+/// against the image's own `PATH` instead of failing with `127`. Network seam.
+pub async fn pull_image_config(image: &str) -> Result<ImageConfig, OciError> {
+    let mut r = resolve_manifest(image).await?;
+    parse_image_config(&mut r).await
 }
 
 /// Fetch + parse the image config blob into an [`ImageConfig`].
@@ -684,6 +710,51 @@ pub async fn build_rootfs_dir(image: &str, out: &Path) -> Result<(), OciError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_reference_strips_tag_when_a_digest_is_present() {
+        // `name:tag@digest` — the digest is authoritative; the `:tag` must NOT stay in the
+        // repo (else the manifest GET 404s). This is the exact form the digest-pin docs show.
+        let (reg, repo, r) = parse_reference("pgvector/pgvector:pg16@sha256:abc123");
+        assert_eq!(reg, "registry-1.docker.io");
+        assert_eq!(repo, "pgvector/pgvector");
+        assert_eq!(r, "sha256:abc123");
+
+        // A single-name official image with both tag and digest → `library/` + stripped tag.
+        let (reg, repo, r) = parse_reference("postgres:16@sha256:def456");
+        assert_eq!(reg, "registry-1.docker.io");
+        assert_eq!(repo, "library/postgres");
+        assert_eq!(r, "sha256:def456");
+
+        // A private registry WITH a port + a tag + a digest — the host:port is preserved,
+        // only the final-component `:tag` is stripped.
+        let (reg, repo, r) = parse_reference("reg.example.com:5000/team/img:v1@sha256:cab");
+        assert_eq!(reg, "reg.example.com:5000");
+        assert_eq!(repo, "team/img");
+        assert_eq!(r, "sha256:cab");
+    }
+
+    #[test]
+    fn parse_reference_digest_only_and_tag_only_still_work() {
+        // Tag-less digest pin (the documented workaround) keeps parsing correctly.
+        let (reg, repo, r) = parse_reference("pgvector/pgvector@sha256:aaa");
+        assert_eq!(
+            (reg.as_str(), repo.as_str(), r.as_str()),
+            ("registry-1.docker.io", "pgvector/pgvector", "sha256:aaa",)
+        );
+        // Plain tag.
+        let (reg, repo, r) = parse_reference("pgvector/pgvector:pg16");
+        assert_eq!(
+            (reg.as_str(), repo.as_str(), r.as_str()),
+            ("registry-1.docker.io", "pgvector/pgvector", "pg16",)
+        );
+        // A registry host with a port, tag-only (the port must not be mistaken for a tag).
+        let (reg, repo, r) = parse_reference("reg.example.com:5000/img:v2");
+        assert_eq!(
+            (reg.as_str(), repo.as_str(), r.as_str()),
+            ("reg.example.com:5000", "img", "v2",)
+        );
+    }
 
     /// Build an uncompressed tar from `(path, contents)` files + explicit dirs.
     fn tar_with(files: &[(&str, &[u8])], dirs: &[&str]) -> Vec<u8> {
