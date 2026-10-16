@@ -518,6 +518,17 @@ pub(crate) mod keys {
         }
     }
 
+    /// Portable AOT component artifact (cold-start cap-req 09):
+    /// `aot/<engine-fingerprint-hex>/<component-wasm-hash>`. A GLOBAL, host-written control
+    /// key (the same family as `manifests/`/`siteconfig/`/`blob`), partitioned by the
+    /// engine fingerprint so an incompatible node never fetches it. NOT the tenant `hblob/`
+    /// namespace — a guest's `wasi:blobstore` binding (confined to `hblob/<project>/…`)
+    /// cannot read or write it. Its bytes are MAC-authenticated at the serve layer, not CAS
+    /// self-verified (they are native code, not the wasm hash).
+    pub fn aot_artifact(fingerprint_hex: &str, wasm_hash: &str) -> String {
+        format!("aot/{fingerprint_hex}/{wasm_hash}")
+    }
+
     /// The **mutable pointer** for a site: `project/<proj>/site/<site>` → the content
     /// hash of its current `SiteConfig`. Tiny; the only key that changes on a config
     /// edit, so it's the only thing the shared-mode invalidation feed must carry.
@@ -925,6 +936,52 @@ impl DeployStore {
     /// Open a blob for streaming reads.
     pub async fn open_blob(&self, hash: &str) -> Result<GetObject, DeployError> {
         Ok(self.storage.get(&keys::blob(hash)).await?)
+    }
+
+    /// Store a portable AOT artifact (cold-start cap-req 09) under
+    /// `aot/<fingerprint>/<wasm-hash>`. Unlike [`put_blob`](DeployStore::put_blob) this does
+    /// NOT verify the bytes hash to a content address — an AOT artifact is native code, not
+    /// the component wasm, so its hash is unknown to a fetching node; its integrity is the
+    /// cluster-keyed MAC the serve layer frames it with, verified before `deserialize`.
+    pub async fn put_aot_artifact(
+        &self,
+        fingerprint_hex: &str,
+        wasm_hash: &str,
+        body: ByteStream,
+    ) -> Result<(), DeployError> {
+        let key = keys::aot_artifact(fingerprint_hex, wasm_hash);
+        self.storage.put(&key, body, PutMeta::default()).await?;
+        Ok(())
+    }
+
+    /// Open a portable AOT artifact for streaming reads (`NotFound` ⇒ the caller compiles
+    /// from source — a cache miss, never an error that fails a request).
+    pub async fn open_aot_artifact(
+        &self,
+        fingerprint_hex: &str,
+        wasm_hash: &str,
+    ) -> Result<GetObject, DeployError> {
+        Ok(self
+            .storage
+            .get(&keys::aot_artifact(fingerprint_hex, wasm_hash))
+            .await?)
+    }
+
+    /// Whether a portable AOT artifact is already stored for this `(fingerprint, wasm-hash)`.
+    pub async fn has_aot_artifact(
+        &self,
+        fingerprint_hex: &str,
+        wasm_hash: &str,
+    ) -> Result<bool, DeployError> {
+        match self
+            .storage
+            .head(&keys::aot_artifact(fingerprint_hex, wasm_hash))
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(StorageError::NotFound(_)) => Ok(false),
+            Err(err) => Err(err.into()),
+        }
     }
 
     /// The open local file backing a content-addressed blob, for the zero-copy
@@ -7848,5 +7905,44 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(beta[0].handle.project, "beta");
+    }
+
+    #[tokio::test]
+    async fn aot_artifact_put_open_has_round_trip() {
+        use crate::kv::MemoryKv;
+        let store = DeployStore::new(Arc::new(MemStorage::default()), Arc::new(MemoryKv::new()));
+        let fp = "deadbeef".repeat(8); // a 64-hex engine fingerprint
+        let wasm_hash = "a".repeat(64);
+
+        // Key format + partition.
+        assert_eq!(
+            keys::aot_artifact(&fp, &wasm_hash),
+            format!("aot/{fp}/{wasm_hash}")
+        );
+        assert!(!store.has_aot_artifact(&fp, &wasm_hash).await.unwrap());
+
+        // Arbitrary (non-content-addressed) bytes — the AOT path must NOT hash-verify
+        // (native code, not the wasm hash; integrity is the MAC at the serve layer).
+        let artifact = vec![1u8, 2, 3, 4, 5, 6, 7, 8];
+        let body = {
+            let a = artifact.clone();
+            futures::stream::once(async move { Ok(bytes::Bytes::from(a)) }).boxed()
+        };
+        store.put_aot_artifact(&fp, &wasm_hash, body).await.unwrap();
+        assert!(store.has_aot_artifact(&fp, &wasm_hash).await.unwrap());
+
+        let obj = store.open_aot_artifact(&fp, &wasm_hash).await.unwrap();
+        let mut got = Vec::new();
+        let mut rbody = obj.body;
+        while let Some(chunk) = rbody.next().await {
+            got.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(
+            got, artifact,
+            "AOT bytes round-trip verbatim (no hash check)"
+        );
+
+        // A DIFFERENT fingerprint partition is a miss — an incompatible node never fetches.
+        assert!(!store.has_aot_artifact("cafe", &wasm_hash).await.unwrap());
     }
 }

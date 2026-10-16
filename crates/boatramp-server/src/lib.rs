@@ -36,6 +36,10 @@ use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 
 mod admin_api;
+/// Cold-start cap-req 09: the cluster-authenticated AOT artifact wire frame (MAC + verify
+/// + key derivation). Public so the node can derive the cluster AOT MAC key where it
+/// unseals the cluster secret.
+pub mod aot;
 pub mod blob_shim;
 pub mod sql_shim;
 #[cfg(feature = "oidc")]
