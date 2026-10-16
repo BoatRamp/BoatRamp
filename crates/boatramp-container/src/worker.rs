@@ -23,7 +23,7 @@ use nix::sched::{CloneFlags, unshare};
 use nix::sys::stat::{Mode, SFlag, mknod};
 use nix::sys::wait::{WaitStatus, waitpid};
 use nix::unistd::{
-    ForkResult, Gid, Uid, chdir, close, dup2, execve, fork, pivot_root, setgroups, sethostname,
+    ForkResult, Gid, Uid, chdir, close, dup2, execvpe, fork, pivot_root, setgroups, sethostname,
     setresgid, setresuid,
 };
 use std::convert::Infallible;
@@ -292,6 +292,14 @@ fn jail_and_exec(plan: &SandboxPlan) -> Result<Infallible, WorkerError> {
             let _ = close(fd);
         }
     }
+    // Honor the image's `WorkingDir` (best-effort): a one-shot client should start where
+    // the image expects. A missing/inaccessible dir must NOT fail the run (the pg/mysql
+    // clients don't depend on the cwd), so a failed chdir leaves the cwd at the pivoted
+    // root `/`. Empty ⇒ the normal launch, cwd unchanged. `chdir` is in the seccomp
+    // allow-list, so ordering vs. the filter install below is immaterial.
+    if !plan.workdir.is_empty() {
+        let _ = chdir(plan.workdir.as_str());
+    }
     if let Some(allow) = &plan.seccomp_allow {
         crate::seccomp::install(allow).map_err(WorkerError::Seccomp)?;
     }
@@ -301,8 +309,15 @@ fn jail_and_exec(plan: &SandboxPlan) -> Result<Infallible, WorkerError> {
     let argv = cstrings(&plan.argv)?;
     let env: Vec<String> = plan.env.iter().map(|(k, v)| format!("{k}={v}")).collect();
     let envp = cstrings(&env)?;
-    execve(&path, &argv, &envp).map_err(|e| WorkerError::Syscall("execve", e))?;
-    unreachable!("execve returned without error");
+    // `execvpe` (not `execve`): a bare `argv[0]` without a `/` (e.g. `pg_dump`) is resolved
+    // against the `PATH` in `envp` — which the backend seeds from the pulled image's config
+    // `Env` — so a client binary under a non-default dir (e.g. `/usr/lib/postgresql/16/bin`
+    // on `pgvector/pgvector`) is found instead of failing with `127`. An `argv[0]` that
+    // DOES contain a `/` is used verbatim (no PATH search), so every existing launch whose
+    // entrypoint is an absolute path behaves exactly as `execve` did. The PATH search uses
+    // only `execve` syscalls (already allow-listed), so it is seccomp-safe.
+    execvpe(&path, &argv, &envp).map_err(|e| WorkerError::Syscall("execvpe", e))?;
+    unreachable!("execvpe returned without error");
 }
 
 /// Make the mount tree private, then `pivot_root` into `root`, detaching the old
