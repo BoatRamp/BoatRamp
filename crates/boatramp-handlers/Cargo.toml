@@ -58,6 +58,7 @@ engine = [
   "dep:futures",
   "dep:tracing",
   "dep:getrandom",
+  "dep:sha2",
   # The read-only instance-lifecycle stats snapshot (`instance_stats`) serializes to the admin stats
   # surface, so the engine lane pulls serde (already in the graph via the server/types layer).
   "dep:serde",
@@ -171,6 +172,9 @@ hyper-util = { workspace = true, optional = true }
 bytes = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }
+# A deterministic digest for the AOT-artifact engine fingerprint (cold-start cap-req 09):
+# reduces wasmtime's `precompile_compatibility_hash` to a stable 32-byte cache-partition key.
+sha2 = { workspace = true, optional = true }
 # A per-process nonce stamps the self-egress depth marker so an external client can't forge it.
 getrandom = { workspace = true, optional = true }
 # For the object-safe `Invoker` trait behind the `invoke` feature.
