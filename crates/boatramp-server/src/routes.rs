@@ -53,6 +53,7 @@ pub fn router_with_fast(
     let managed_db_declare_cap = options.managed_db_declare.clone();
     let tenant_deprovisioner_cap = options.tenant_deprovisioner.clone();
     let compute_exec_cap = options.compute_exec.clone();
+    let dev_blob_bind_cap = options.dev_blob_bind.clone();
     let project_export_cap = options.project_export.clone();
     let compute_volumes_cap = options.compute_volumes.clone();
     let compute_control_cap = options.compute_control.clone();
@@ -411,6 +412,10 @@ pub fn router_with_fast(
         // Admin-scoped (deny-safe `Right::required` default for `/api/compute/*`)
         // AND gated at the handler by the `allow_compute_exec` posture.
         .route("/api/compute/{name}/exec", post(compute_exec))
+        // Dev/CI blob-shim affordance: mint a BOATRAMP_BLOB_URL + token for a non-managed
+        // local process. System·Admin (node-global, `is_compute_maintenance_path`) AND
+        // gated at the handler by the `allow_dev_blob_bind` posture (off outside `dev`).
+        .route("/api/compute/dev-bind-blob", post(compute_dev_bind_blob))
         // Native project export/import (env-clone): stream a project's BRPROJ bundle out,
         // or import one in. System·Admin (the SINGULAR hyphen paths never match a
         // `/api/<family>/*` project matcher) + re-checked defense-in-depth at the handler.
@@ -693,6 +698,7 @@ pub fn router_with_fast(
         .layer(Extension(managed_db_declare_cap))
         .layer(Extension(tenant_deprovisioner_cap))
         .layer(Extension(compute_exec_cap))
+        .layer(Extension(dev_blob_bind_cap))
         .layer(Extension(project_export_cap))
         .layer(Extension(compute_volumes_cap))
         .layer(Extension(compute_control_cap))

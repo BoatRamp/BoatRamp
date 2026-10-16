@@ -2185,6 +2185,119 @@ pub(super) async fn compute_exec(
 }
 
 // ---------------------------------------------------------------------------
+// Dev/CI blob-shim affordance (`POST /api/compute/dev-bind-blob`)
+// ---------------------------------------------------------------------------
+
+/// `POST /api/compute/dev-bind-blob` body: bind a NON-managed local process to the
+/// blob-shim for one site (a dev/CI test-harness affordance). `site` is the workload/site
+/// identity (a managed workload's name stands in for its site); `container` optionally
+/// confines the credential to one `--bind blob:<container>`; `project` selects the blob
+/// namespace's project (default `"default"`).
+#[derive(Debug, Deserialize)]
+pub(super) struct DevBindBlobRequest {
+    site: String,
+    #[serde(default)]
+    container: Option<String>,
+    #[serde(default)]
+    project: Option<String>,
+}
+
+/// `POST /api/compute/dev-bind-blob` response: the env the caller exports into the local
+/// process — `BOATRAMP_BLOB_URL` + `BOATRAMP_BLOB_URL_AUTH_TOKEN` (the blob analogue of
+/// `DATABASE_URL`).
+#[derive(Debug, Serialize)]
+pub(super) struct DevBindBlobResponse {
+    env: Vec<(String, String)>,
+}
+
+/// The synthetic replica index a dev bind derives its token under — `u32::MAX`, OUTSIDE
+/// the managed-replica index space, so a dev token never collides with a live workload
+/// replica's token (even one whose workload name equals `site`).
+const DEV_BIND_REPLICA: u32 = u32::MAX;
+
+/// Mint + register a blob-shim credential for a NON-managed local process (dev/CI). Gated
+/// `System·Admin` (node-global, `is_compute_maintenance_path`) AND the `allow_dev_blob_bind`
+/// posture (off outside `dev`). Reuses the EXACT managed `resolve()` path — the same token
+/// derivation + scope resolution + registry insert a `--bind blob` workload gets — so the
+/// dev credential is identical in strength + confinement (site-scoped, container-bound when
+/// named) to a managed one, just handed to an external process. `501` when the blob-shim is
+/// not wired on this node.
+pub(super) async fn compute_dev_bind_blob(
+    Extension(posture): Extension<boatramp_core::security::SecurityPosture>,
+    Extension(resolver): Extension<Option<Arc<dyn boatramp_core::compute::ComputeBindingResolver>>>,
+    Json(req): Json<DevBindBlobRequest>,
+) -> Response {
+    // Defense-in-depth: re-derive that this path is `System·Admin` (node-global), so a
+    // routing/table regression cannot silently downgrade a credential-minting endpoint.
+    if let Some(forbidden) = assert_project_export_is_system_admin(
+        "POST",
+        "/api/compute/dev-bind-blob",
+        "compute dev-bind-blob",
+    ) {
+        return forbidden;
+    }
+    if !posture.allow_dev_blob_bind {
+        return (
+            StatusCode::FORBIDDEN,
+            "compute dev-bind-blob is disabled; set the `allow_dev_blob_bind` posture \
+             (BOATRAMP_SECURITY_ALLOW_DEV_BLOB_BIND=true — on by default only in the `dev` \
+             profile) to enable it\n",
+        )
+            .into_response();
+    }
+    let Some(resolver) = resolver else {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            "the compute blob-shim is not active on this node (no blob provider or \
+             `compute.blob_shim_url` configured)\n",
+        )
+            .into_response();
+    };
+    if req.site.is_empty() {
+        return (StatusCode::BAD_REQUEST, "site is required\n").into_response();
+    }
+    let project = req.project.as_deref().unwrap_or("default");
+    // Slug-validate everything that flows into the token scope + `hblob/…` storage prefix
+    // (mirrors the managed path's `validate_key_segment`/`reject_invalid_name` choke points
+    // — a `..`/`/` would traverse). The container, when named, is additionally re-validated
+    // inside the resolver's `scope` (fail-closed → empty env → 400 below).
+    if let Some(resp) = reject_invalid_name("project", project) {
+        return resp;
+    }
+    if let Some(resp) = reject_invalid_name("site", &req.site) {
+        return resp;
+    }
+    if let Some(c) = req.container.as_deref()
+        && let Some(resp) = reject_invalid_name("container", c)
+    {
+        return resp;
+    }
+    let binding = boatramp_core::compute::ComputeBinding {
+        kind: boatramp_core::compute::BindingKind::Blob,
+        name: req.container.unwrap_or_default(),
+        url_env: None,
+    };
+    let env = resolver
+        .resolve(
+            project,
+            &req.site,
+            DEV_BIND_REPLICA,
+            std::slice::from_ref(&binding),
+        )
+        .await;
+    if env.is_empty() {
+        // The resolver produced nothing — the blob binding's scope failed to resolve (an
+        // invalid container the resolver rejects). Fail closed, never a silent empty 200.
+        return (
+            StatusCode::BAD_REQUEST,
+            "the blob binding did not resolve (check the container name)\n",
+        )
+            .into_response();
+    }
+    (StatusCode::OK, Json(DevBindBlobResponse { env })).into_response()
+}
+
+// ---------------------------------------------------------------------------
 // Native project export / import (`POST /api/project-export` / `/api/project-import`)
 // ---------------------------------------------------------------------------
 
@@ -3799,6 +3912,130 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+    }
+
+    /// A `ComputeBindingResolver` that returns a canned env for a `blob` binding — so the
+    /// dev-bind handler's GATE matrix (posture / 501 / validation / empty-resolve) is
+    /// testable without the live shim. `env` empty ⇒ simulate a binding the resolver
+    /// rejected (e.g. a bad container).
+    struct FakeBlobResolver {
+        env: Vec<(String, String)>,
+    }
+
+    #[async_trait::async_trait]
+    impl boatramp_core::compute::ComputeBindingResolver for FakeBlobResolver {
+        async fn resolve(
+            &self,
+            _project: &str,
+            _workload: &str,
+            _replica: u32,
+            bindings: &[boatramp_core::compute::ComputeBinding],
+        ) -> Vec<(String, String)> {
+            if bindings
+                .iter()
+                .any(|b| b.kind == boatramp_core::compute::BindingKind::Blob)
+            {
+                self.env.clone()
+            } else {
+                Vec::new()
+            }
+        }
+        async fn release(
+            &self,
+            _project: &str,
+            _workload: &str,
+            _replica: u32,
+            _bindings: &[boatramp_core::compute::ComputeBinding],
+        ) {
+        }
+    }
+
+    fn posture_with_dev_bind(on: bool) -> boatramp_core::security::SecurityPosture {
+        let mut p = boatramp_core::security::SecurityPosture::default();
+        p.allow_dev_blob_bind = on;
+        p
+    }
+
+    #[tokio::test]
+    async fn dev_bind_blob_gate_matrix() {
+        let env = vec![
+            (
+                "BOATRAMP_BLOB_URL".to_string(),
+                "http://10.0.0.1:8082".to_string(),
+            ),
+            (
+                "BOATRAMP_BLOB_URL_AUTH_TOKEN".to_string(),
+                "tok-abc".to_string(),
+            ),
+        ];
+        let resolver: Arc<dyn boatramp_core::compute::ComputeBindingResolver> =
+            Arc::new(FakeBlobResolver { env: env.clone() });
+        let req = || DevBindBlobRequest {
+            site: "mailroom".into(),
+            container: None,
+            project: None,
+        };
+
+        // Posture OFF ⇒ 403 even with a resolver wired (the gate, not availability).
+        let resp = compute_dev_bind_blob(
+            Extension(posture_with_dev_bind(false)),
+            Extension(Some(resolver.clone())),
+            Json(req()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        // Posture ON but no resolver (blob-shim inactive) ⇒ 501.
+        let resp = compute_dev_bind_blob(
+            Extension(posture_with_dev_bind(true)),
+            Extension(None),
+            Json(req()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+
+        // Posture ON + resolver ⇒ 200 with the BLOB_URL + token env.
+        let resp = compute_dev_bind_blob(
+            Extension(posture_with_dev_bind(true)),
+            Extension(Some(resolver.clone())),
+            Json(req()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let pairs = body["env"].as_array().expect("env array");
+        assert!(
+            pairs.iter().any(|p| p[0] == "BOATRAMP_BLOB_URL"),
+            "env carries BOATRAMP_BLOB_URL"
+        );
+        assert!(
+            pairs.iter().any(|p| p[0] == "BOATRAMP_BLOB_URL_AUTH_TOKEN"),
+            "env carries the auth token"
+        );
+
+        // Empty site ⇒ 400 (fail closed, before touching the resolver).
+        let resp = compute_dev_bind_blob(
+            Extension(posture_with_dev_bind(true)),
+            Extension(Some(resolver.clone())),
+            Json(DevBindBlobRequest {
+                site: String::new(),
+                container: None,
+                project: None,
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // Resolver returns EMPTY (a rejected container) ⇒ 400, never a silent empty 200.
+        let empty: Arc<dyn boatramp_core::compute::ComputeBindingResolver> =
+            Arc::new(FakeBlobResolver { env: Vec::new() });
+        let resp = compute_dev_bind_blob(
+            Extension(posture_with_dev_bind(true)),
+            Extension(Some(empty)),
+            Json(req()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     /// An `OperatorSql` whose `ping` returns a canned fleet — so the handler's shape

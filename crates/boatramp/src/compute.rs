@@ -252,6 +252,28 @@ enum ComputeCommand {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         argv: Vec<String>,
     },
+    /// Mint a blob-shim credential for a NON-managed local process (dev/CI) and print it
+    /// as env — the blob analogue of `DATABASE_URL`. The process then reads/writes the
+    /// SAME `--site` blob namespace a managed workload (or a `wasi:blobstore` handler) for
+    /// that site sees, so a handler↔native-worker shared-blob round-trip can be exercised
+    /// offline. Requires the server's `allow_dev_blob_bind` posture (on by default only in
+    /// `dev`); System·Admin. Example:
+    /// `eval "$(boatramp compute bind-blob --site mailroom --export)"`.
+    BindBlob {
+        /// The site (the workload identity) whose blob namespace to bind.
+        #[arg(long)]
+        site: String,
+        /// Confine the credential to one container (`--bind blob:<container>`); omit for a
+        /// site-wide credential.
+        #[arg(long)]
+        container: Option<String>,
+        /// The project owning the blob namespace (default `default`).
+        #[arg(long)]
+        project: Option<String>,
+        /// Prefix each line with `export ` so the output is `eval`-able in a shell.
+        #[arg(long)]
+        export: bool,
+    },
     /// Manage persistent volumes: list them (with in-use / orphaned status) and
     /// reclaim a decommissioned workload's volume. The safe flow is `compute rm
     /// <workload>` first (unregister → the reconcile loop stops it), then
@@ -638,6 +660,40 @@ pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<()> {
             let code = out["exit_code"].as_i64().unwrap_or(0);
             if code != 0 {
                 std::process::exit(code as i32);
+            }
+        }
+        ComputeCommand::BindBlob {
+            site,
+            container,
+            project,
+            export,
+        } => {
+            let body = serde_json::json!({
+                "site": site,
+                "container": container,
+                "project": project,
+            });
+            // Node-global endpoint (System·Admin); the blob-namespace project is carried in
+            // the BODY, not the path.
+            let resp = http
+                .post(format!("{server}/api/compute/dev-bind-blob"))
+                .json(&body)
+                .send()
+                .await?;
+            let status = resp.status();
+            if !status.is_success() {
+                let text = resp.text().await.unwrap_or_default();
+                return Err(Error::Server(format!(
+                    "compute bind-blob failed: {status}: {}",
+                    text.trim()
+                )));
+            }
+            let out: serde_json::Value = resp.json().await?;
+            let prefix = if export { "export " } else { "" };
+            for pair in out["env"].as_array().into_iter().flatten() {
+                if let (Some(k), Some(v)) = (pair[0].as_str(), pair[1].as_str()) {
+                    println!("{prefix}{k}={v}");
+                }
             }
         }
         ComputeCommand::Volume(VolumeCommand::Ls) => {

@@ -816,6 +816,13 @@ fn is_compute_maintenance_path(path: &str) -> bool {
             || rest == "reconcile"
             || rest == "maintenance"
             || rest.starts_with("maintenance/")
+            // The dev/CI blob-bind affordance (`compute bind-blob`) mints a site-scoped
+            // blob-shim credential for a NON-managed process for ANY project/site on the
+            // node — node-global like the tools above, so `system·admin`, never a
+            // per-project grant (the general `/api/compute/*` catch-all would otherwise map
+            // it to a `Project` right any tenant's token satisfies). Posture-gated
+            // (`allow_dev_blob_bind`) at the handler too.
+            || rest == "dev-bind-blob"
     )
 }
 
@@ -1853,9 +1860,14 @@ mod tests {
             ("POST", "/api/compute/maintenance/restart"),
             ("POST", "/api/compute/maintenance/set-health"),
             ("POST", "/api/compute/maintenance/netdiag"),
+            // The dev/CI blob-bind affordance mints a site-scoped blob credential for ANY
+            // project/site — node-global, so system·admin in both forms (NOT the per-project
+            // right the general `/api/compute/*` mapping would otherwise give).
+            ("POST", "/api/compute/dev-bind-blob"),
             // Project-scoped form (the `project_scope` rewrite's original path).
             ("GET", "/api/projects/acme/compute/status"),
             ("POST", "/api/projects/acme/compute/maintenance/set-health"),
+            ("POST", "/api/projects/acme/compute/dev-bind-blob"),
         ] {
             let required = Right::required(method, path).expect("route is gated");
             assert_eq!(required, admin, "{method} {path} must need system·admin");
@@ -1874,6 +1886,16 @@ mod tests {
         // is not the maintenance surface — it keeps its per-project right.
         assert_eq!(
             Right::required("GET", "/api/compute/statuspage"),
+            Some(Right::new(
+                Resource::Project,
+                Some(crate::project::DEFAULT_PROJECT.to_string()),
+                Action::Read
+            ))
+        );
+        // The dev-bind match is EXACT: a workload named `dev-bind-blobby` is not the
+        // affordance and keeps its per-project right (the gate never over-matches a prefix).
+        assert_eq!(
+            Right::required("GET", "/api/compute/dev-bind-blobby"),
             Some(Right::new(
                 Resource::Project,
                 Some(crate::project::DEFAULT_PROJECT.to_string()),

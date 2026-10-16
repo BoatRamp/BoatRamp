@@ -117,6 +117,7 @@ impl SecurityProfile {
                 domain_verify_self_serve: true,
                 allow_shared_kernel_compute: false,
                 allow_compute_exec: false,
+                allow_dev_blob_bind: false,
                 ratelimit_fail_open: false,
                 allow_implicit_routing: false,
                 require_pop: false,
@@ -149,6 +150,7 @@ impl SecurityProfile {
                 domain_verify_self_serve: true,
                 allow_shared_kernel_compute: true,
                 allow_compute_exec: false,
+                allow_dev_blob_bind: false,
                 ratelimit_fail_open: false,
                 allow_implicit_routing: true,
                 require_pop: false,
@@ -181,6 +183,7 @@ impl SecurityProfile {
                 domain_verify_self_serve: true,
                 allow_shared_kernel_compute: true,
                 allow_compute_exec: true,
+                allow_dev_blob_bind: true,
                 ratelimit_fail_open: true,
                 allow_implicit_routing: true,
                 require_pop: false,
@@ -260,6 +263,13 @@ pub struct PostureOverrides {
     /// (docker-exec style). Arbitrary code execution in the workload, so **off** in
     /// every profile but `dev`; an operator opts in for migrations/backups/debug.
     pub allow_compute_exec: Option<bool>,
+    /// Permit `boatramp compute bind-blob` — minting a blob-shim `BOATRAMP_BLOB_URL` +
+    /// token for a **non-managed** local process (a dev/CI test-harness affordance so a
+    /// locally-run native binary shares a site's blob namespace, the blob analogue of
+    /// pointing a process at `DATABASE_URL`). It hands a site-scoped credential to a
+    /// process OUTSIDE the sandboxed-workload model, so **off** in every profile but
+    /// `dev`; a single-tenant CI node opts in explicitly.
+    pub allow_dev_blob_bind: Option<bool>,
     /// Fail **open** (allow) instead of closed when the rate-limit KV is unreadable.
     pub ratelimit_fail_open: Option<bool>,
     /// Serve a site at root for an unmatched `Host` **without** an explicit domain
@@ -474,6 +484,11 @@ impl SecurityConfig {
             o.allow_compute_exec.is_some(),
         );
         row(
+            "allow_dev_blob_bind",
+            p.allow_dev_blob_bind.to_string(),
+            o.allow_dev_blob_bind.is_some(),
+        );
+        row(
             "ratelimit_fail_open",
             p.ratelimit_fail_open.to_string(),
             o.ratelimit_fail_open.is_some(),
@@ -618,6 +633,9 @@ pub struct SecurityPosture {
     pub allow_shared_kernel_compute: bool,
     /// Permit `boatramp compute exec` (run a command inside a running workload).
     pub allow_compute_exec: bool,
+    /// Permit `boatramp compute bind-blob` (mint a blob-shim URL + token for a
+    /// non-managed local process — a dev/CI affordance; off outside `dev`).
+    pub allow_dev_blob_bind: bool,
     /// Fail open instead of closed on rate-limit KV errors.
     pub ratelimit_fail_open: bool,
     /// Resolve an unmatched `Host` to a site without an explicit domain
@@ -785,6 +803,9 @@ fn apply(mut base: SecurityPosture, o: &PostureOverrides) -> SecurityPosture {
     }
     if let Some(v) = o.allow_compute_exec {
         base.allow_compute_exec = v;
+    }
+    if let Some(v) = o.allow_dev_blob_bind {
+        base.allow_dev_blob_bind = v;
     }
     if let Some(v) = o.ratelimit_fail_open {
         base.ratelimit_fail_open = v;

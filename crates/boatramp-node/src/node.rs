@@ -518,6 +518,12 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
     #[cfg(not(feature = "handlers"))]
     let blob_resolver: Option<Arc<dyn boatramp_core::compute::ComputeBindingResolver>> = None;
 
+    // Retain a clone of the blob resolver (before it is moved into the reconcile chain) so
+    // the dev/CI affordance `POST /api/compute/dev-bind-blob` can mint + register a blob
+    // credential for a non-managed local process through the EXACT managed `resolve` path.
+    // `None` when the blob-shim is inactive ⇒ that endpoint returns `501`.
+    let dev_blob_bind_resolver = blob_resolver.clone();
+
     // One resolver for the reconcile: each shim filters to its own binding kind, so chaining
     // them lets a workload declaring both `sql` and `blob` bindings be served by both from a
     // single `resolve` call.
@@ -918,6 +924,7 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
     options.managed_db_declare = managed_db_declare;
     options.tenant_deprovisioner = tenant_deprovisioner;
     options.compute_exec = compute_exec;
+    options.dev_blob_bind = dev_blob_bind_resolver;
     options.compute_volumes = compute_volumes;
     options.compute_control = compute_control;
     // The internal secret store backs the admin secrets API (set/list/delete). Not
