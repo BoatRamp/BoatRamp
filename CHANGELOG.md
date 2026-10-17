@@ -87,6 +87,23 @@ inert until configured — a node that enables neither behaves exactly as before
   tag (swap during an incident, swap back). `gdb` is omitted to keep the image small; `strace`/`ltrace`
   need `--cap-add=SYS_PTRACE` at runtime.
 
+- **On-demand per-SNI TLS issuance at scale (`[serve.on_demand_tls]`, default off).** On a cluster
+  `--tls acme-dns` node, enabling this lets the edge **issue + cache a certificate on the first TLS
+  handshake** for an unknown custom hostname — so a multi-tenant edge fronting thousands of customer
+  domains no longer needs a pre-registered cert per hostname. Issuance is **gated by the #02
+  verified-domain allowlist**: only a hostname that has been attached + ownership-verified can trigger
+  an order; an arbitrary/unverified SNI is refused with **no ACME order placed**, so a flood of unknown
+  names cannot become an ACME / rate-limit storm (a negative cache, a bounded trigger queue, a global
+  concurrency cap, and an hourly order limiter bound the worst case). The first handshake for a new
+  name fails fast and the client's retry is served once the cert is warm; the cert persists in the
+  replicated control-plane store and the **leader is the sole issuer** (followers serve the replicated
+  cert, never contacting the CA), so N replicas don't each order. Default challenge is **TLS-ALPN-01**
+  on the 443 edge (no extra port), composed with the existing static wildcard resolver (the wildcard
+  wins; on-demand handles everything else). Env/config: `[serve.on_demand_tls] enabled`, `challenge`
+  (`tls-alpn-01`/`dns-01`), `directory_url`, `contact_email`, `max_inflight`, `negative_ttl_secs`,
+  `rate_limit_per_hour`. (Follow-ups: the mail-listener SNI path, DNS-01 on-demand wiring, a replicated
+  cross-node issuance queue, and reusing one ACME account across restarts.)
+
 ### Fixed
 
 - **Streaming-lane lifecycle: a streaming response now occupies its slot for the stream's whole
