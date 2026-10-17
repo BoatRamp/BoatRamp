@@ -3951,9 +3951,10 @@ mod tests {
     }
 
     fn posture_with_dev_bind(on: bool) -> boatramp_core::security::SecurityPosture {
-        let mut p = boatramp_core::security::SecurityPosture::default();
-        p.allow_dev_blob_bind = on;
-        p
+        boatramp_core::security::SecurityPosture {
+            allow_dev_blob_bind: on,
+            ..Default::default()
+        }
     }
 
     #[tokio::test]

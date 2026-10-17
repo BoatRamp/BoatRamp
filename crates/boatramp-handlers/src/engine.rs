@@ -1916,6 +1916,24 @@ impl HandlerEngine {
         Self::run_compile_off_runtime(|| self.precompile(hash, wasm))
     }
 
+    /// [`precompile_and_serialize_request`](Self::precompile_and_serialize_request) behind the
+    /// same compile-concurrency gate + off-runtime compile as
+    /// [`precompile_gated`](Self::precompile_gated) — the producer path for the portable AOT
+    /// artifact (cold-start cap-req 09): one gated compile both warms the local cache AND yields
+    /// the serialized artifact the serve layer frames + publishes for fresh replicas.
+    pub async fn precompile_and_serialize_gated(
+        &self,
+        hash: &str,
+        wasm: &[u8],
+    ) -> Result<Vec<u8>, HandlerError> {
+        let _permit = self
+            .compile_gate
+            .acquire()
+            .await
+            .expect("compile gate is never closed");
+        Self::run_compile_off_runtime(|| self.precompile_and_serialize_request(hash, wasm))
+    }
+
     /// [`precompile_consumer`](Self::precompile_consumer) behind the same compile gate (#2), with the
     /// same off-runtime compile as [`precompile_gated`](Self::precompile_gated).
     #[cfg(feature = "messaging")]

@@ -412,6 +412,12 @@ pub async fn build_handler_runtime(
         .and_then(|h| h.instance_cache_size)
         .unwrap_or(64);
     let instance_cache_size = requested_cache.clamp(1, MAX_INSTANCE_CACHE);
+    // Warm floor (cap-req 09): the node-global cap on pinned request components (`0`/absent ⇒
+    // off). Clamped to the warm-cache size so the floor can never exceed total resident slots.
+    let keep_warm_max = handlers_cfg
+        .and_then(|h| h.keep_warm_max)
+        .unwrap_or(0)
+        .min(instance_cache_size);
     if instance_cache_size != requested_cache {
         tracing::warn!(
             requested = requested_cache,
@@ -448,7 +454,8 @@ pub async fn build_handler_runtime(
     .with_tcp_egress(allow_guest_tcp_egress)
     .with_tcp_listener(allow_guest_tcp_listener)
     .with_self_egress(self_egress_addrs)
-    .with_guest_egress_extra_roots(guest_egress_extra_roots);
+    .with_guest_egress_extra_roots(guest_egress_extra_roots)
+    .with_keep_warm_max(keep_warm_max);
     let sql = build_sql_backends(
         handlers_cfg.and_then(|h| h.bindings.sql.as_ref()),
         data_dir,
@@ -519,6 +526,33 @@ pub async fn build_handler_runtime(
     // Apply the posture's host-side blob cap + component-size cap.
     runtime.set_max_blob_bytes(max_blob_bytes);
     runtime.set_max_component_bytes(max_component_bytes);
+    // Portable cross-node AOT artifact cache (cap-req 09): enable ONLY when the operator opts
+    // in AND a `[secrets]` envelope exists to seal the cluster AOT root. Without the envelope
+    // the feature stays off (the node still compiles + warm-caches, and the warm floor is
+    // unaffected). Default off — it loads native code off the shared blob store, gated on the
+    // cluster secret + a per-artifact MAC.
+    if handlers_cfg
+        .and_then(|h| h.aot_artifact_cache)
+        .unwrap_or(false)
+    {
+        if let Some(envelope) = secrets_envelope.clone() {
+            // Default per-artifact ceiling (native code is large); `0` ⇒ unlimited.
+            const DEFAULT_AOT_MAX_BYTES: u64 = 256 * 1024 * 1024;
+            let max_bytes = handlers_cfg
+                .and_then(|h| h.aot_artifact_max_bytes)
+                .unwrap_or(DEFAULT_AOT_MAX_BYTES);
+            runtime.enable_aot(envelope, max_bytes);
+            tracing::info!(
+                aot_max_bytes = max_bytes,
+                "portable cross-node AOT artifact cache enabled"
+            );
+        } else {
+            tracing::warn!(
+                "`[handlers] aot_artifact_cache` is on but no `[secrets]` envelope is configured; \
+                 cross-node AOT disabled (components compile from source)"
+            );
+        }
+    }
     // Per-component serve-admission cap (image-serve-latency Ask B). Only override the host-parallelism
     // default when the operator set `[handlers] serve_concurrency` explicitly (incl. `0` to disable).
     if let Some(cap) = handlers_cfg.and_then(|h| h.serve_concurrency) {
