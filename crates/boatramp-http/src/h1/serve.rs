@@ -444,6 +444,15 @@ where
                         if let Err(e) = write_all_vectored(io, &mut parts).await {
                             return (Err(e), true);
                         }
+                        // Flush each streamed chunk to the transport so a streaming / SSE event
+                        // reaches the client promptly, instead of lingering in a buffered (TLS
+                        // record) writer until the next chunk or the terminating 0-chunk
+                        // (PLAN-handler-stream-lifecycle GAP3 — the TLS corner). Plaintext TCP
+                        // flush is a no-op, so this only adds a syscall on the TLS path, where
+                        // prompt per-event delivery is the point of the streaming lane.
+                        if let Err(e) = io.flush().await {
+                            return (Err(e), true);
+                        }
                     }
                     // Source failed mid-stream: abort WITHOUT the terminating 0-chunk, so
                     // the client sees a truncated chunked body (an error), not a clean end.

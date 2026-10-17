@@ -355,6 +355,12 @@ pub struct ServeTiming {
 /// `timeout_ms / EPOCH_TICK_MS` ticks.
 const EPOCH_TICK_MS: u64 = 10;
 
+/// Default streaming-lane idle cap (ms) — a streaming response that emits no body frame for this
+/// long is torn down and its slot reclaimed (PLAN-handler-stream-lifecycle GAP2). 600 s matches the
+/// `[stream]` SSE fan-out's idle window, so a well-behaved heartbeat-sending stream is never killed
+/// while a silent (slowloris) one is. Overridable per node via `with_streaming_idle_ms`.
+const DEFAULT_STREAMING_IDLE_MS: u64 = 600_000;
+
 /// Upper bound (chars) on the guest-returned error text carried by
 /// [`HandlerError::ConsumerError`]. The guest controls this string, so it is bounded here before it
 /// is stored (and the DLQ layer sanitizes control chars before an operator sees it).
@@ -1297,7 +1303,19 @@ pub struct HandlerEngine {
     async_semaphore: Semaphore,
     /// A **separate** concurrency gate for the streaming lane, so a burst of
     /// long-lived streams can't exhaust the sync request pool or the async drain.
-    streaming_semaphore: Semaphore,
+    ///
+    /// `Arc` (unlike the sync/async gates) so the streaming permit can be taken as an
+    /// [`OwnedSemaphorePermit`] and carried **inside the response body** — a streaming slot
+    /// is occupied for the stream's whole life, not merely until the head is produced
+    /// (PLAN-handler-stream-lifecycle GAP1). A plain borrowed permit would have to be dropped
+    /// when `serve_lane` returns the head, un-bounding `streaming_max_concurrency`.
+    streaming_semaphore: Arc<Semaphore>,
+    /// Idle cap (ms) for a streaming-lane response: if no body frame flows to the client for
+    /// this long, the host tears the stream down and reclaims its slot
+    /// (PLAN-handler-stream-lifecycle GAP2 — the slowloris bound for the streaming lane, mirroring
+    /// the inbound-TCP conn-lane idle watchdog). The absolute lifetime is separately bounded by the
+    /// `streaming_limits.timeout_ms` epoch deadline. Defaults to [`DEFAULT_STREAMING_IDLE_MS`].
+    streaming_idle_ms: u64,
     /// Per-consumer concurrency gates (P2 resource isolation) — see [`ConsumerGates`]. A consumer
     /// with no `max_concurrency` never enters it and shares the async lane budget exactly as before.
     #[cfg(feature = "messaging")]
@@ -1530,8 +1548,9 @@ impl HandlerEngine {
             // exactly as before (back-compat for tests and existing callers).
             async_semaphore: Semaphore::new(limits.max_concurrency.max(1)),
             async_limits: limits,
-            streaming_semaphore: Semaphore::new(limits.max_concurrency.max(1)),
+            streaming_semaphore: Arc::new(Semaphore::new(limits.max_concurrency.max(1))),
             streaming_limits: limits,
+            streaming_idle_ms: DEFAULT_STREAMING_IDLE_MS,
             // Serialize bulk precompiles by default (safest for a memory-bound host); operators with
             // headroom raise it via `with_compile_concurrency`.
             compile_gate: Arc::new(Semaphore::new(1)),
@@ -1580,8 +1599,20 @@ impl HandlerEngine {
     /// starve the durable async drain either.
     #[must_use]
     pub fn with_streaming_limits(mut self, streaming_limits: Limits) -> Self {
-        self.streaming_semaphore = Semaphore::new(streaming_limits.max_concurrency.max(1));
+        self.streaming_semaphore =
+            Arc::new(Semaphore::new(streaming_limits.max_concurrency.max(1)));
         self.streaming_limits = streaming_limits;
+        self
+    }
+
+    /// Set the streaming-lane **idle cap** (`[handlers] streaming_idle_timeout_ms`): a streaming
+    /// response whose body produces no frame to the client for this long is torn down and its slot
+    /// reclaimed (PLAN-handler-stream-lifecycle GAP2). Floored at 1 s so a fat-fingered `0` can't
+    /// make every stream instantly idle-killable. The absolute lifetime stays bounded by
+    /// `streaming_limits.timeout_ms`.
+    #[must_use]
+    pub fn with_streaming_idle_ms(mut self, idle_ms: u64) -> Self {
+        self.streaming_idle_ms = idle_ms.max(1_000);
         self
     }
 
@@ -1864,6 +1895,20 @@ impl HandlerEngine {
     #[must_use]
     pub fn streaming_max_concurrency(&self) -> usize {
         self.streaming_limits.max_concurrency
+    }
+
+    /// The [`Lane::Streaming`] idle cap, milliseconds (see [`with_streaming_idle_ms`](Self::with_streaming_idle_ms)).
+    #[must_use]
+    pub fn streaming_idle_ms(&self) -> u64 {
+        self.streaming_idle_ms
+    }
+
+    /// Live permits currently available on the streaming lane — 0 when every slot is occupied.
+    /// Exposed for tests asserting a streaming slot is held for the stream's whole life
+    /// (PLAN-handler-stream-lifecycle GAP1), not merely until the head is produced.
+    #[must_use]
+    pub fn streaming_available_permits(&self) -> usize {
+        self.streaming_semaphore.available_permits()
     }
 
     /// Compile (and cache) a component without serving it — the activation
@@ -2666,7 +2711,10 @@ impl HandlerEngine {
         match lane {
             Lane::Sync => &self.semaphore,
             Lane::Async => &self.async_semaphore,
-            Lane::Streaming => &self.streaming_semaphore,
+            // The streaming lane acquires an OWNED permit directly off the `Arc` in `serve_lane`
+            // (carried into the response body); this borrowed view is here only for symmetry /
+            // `lane_ceiling` callers.
+            Lane::Streaming => self.streaming_semaphore.as_ref(),
         }
     }
 
@@ -2885,12 +2933,31 @@ impl HandlerEngine {
         B: HttpBody<Data = Bytes> + Send + 'static,
         B::Error: std::fmt::Display + Send,
     {
-        let _permit = self.lane_semaphore(lane).try_acquire().map_err(|_| {
-            self.stats.record_overloaded(hash);
-            HandlerError::Overloaded
-        })?;
-        // Count this component's in-flight invocation (RAII: decremented on drop — same scope as the
-        // lane permit, so a trap/early-return can't leak the count).
+        // Concurrency permit. The streaming lane takes an OWNED permit it carries INTO the response
+        // body (released only when the stream ends / the client disconnects — GAP1), so
+        // `streaming_max_concurrency` actually bounds concurrent open streams; the sync/async lanes
+        // hold a borrowed permit for the serve scope (their bodies are short-lived). Both map a full
+        // lane to `Overloaded`.
+        let (_permit, streaming_permit) = if lane == Lane::Streaming {
+            let owned = self
+                .streaming_semaphore
+                .clone()
+                .try_acquire_owned()
+                .map_err(|_| {
+                    self.stats.record_overloaded(hash);
+                    HandlerError::Overloaded
+                })?;
+            (None, Some(owned))
+        } else {
+            let borrowed = self.lane_semaphore(lane).try_acquire().map_err(|_| {
+                self.stats.record_overloaded(hash);
+                HandlerError::Overloaded
+            })?;
+            (Some(borrowed), None)
+        };
+        // Count this component's in-flight invocation (RAII: decremented on drop). For the streaming
+        // lane this guard is moved into the response body so the in-flight count — like the permit —
+        // tracks the stream's whole life, not just time-to-head; other lanes drop it at serve-scope end.
         let _cguard = self.stats.enter_component(hash);
         let (proxy_pre, cold) = self.proxy_pre(hash, wasm)?;
 
@@ -2962,8 +3029,33 @@ impl HandlerEngine {
         });
 
         match receiver.await {
-            // Guest produced a response head; let `task` keep streaming the body.
-            Ok(Ok(response)) => Ok((response, timing)),
+            // Guest produced a response head; `task` keeps streaming the body.
+            Ok(Ok(response)) => {
+                if lane == Lane::Streaming {
+                    // Carry the lane slot + in-flight guard INTO the response body so the stream
+                    // occupies a slot for its whole life (GAP1), and arm an idle/max-duration
+                    // watchdog that tears the guest down and reclaims the slot (GAP2). Dropping the
+                    // body (client disconnect, or the server finishing it) aborts the guest promptly.
+                    let permit =
+                        streaming_permit.expect("the streaming lane acquired an owned permit");
+                    let guest_abort = task.abort_handle();
+                    // `task` (the JoinHandle) is dropped here → the guest runs detached, reclaimed
+                    // via `guest_abort` on idle / max-duration / body-drop.
+                    let response = guard_streaming_response(
+                        response,
+                        guest_abort,
+                        permit,
+                        _cguard,
+                        self.streaming_idle_ms,
+                        effective.timeout_ms,
+                    );
+                    Ok((response, timing))
+                } else {
+                    // Non-streaming lanes: any (short) body keeps streaming on the detached `task`;
+                    // the borrowed permit + `_cguard` drop at serve-scope end as before.
+                    Ok((response, timing))
+                }
+            }
             // Guest explicitly produced an error response.
             Ok(Err(code)) => Err(HandlerError::Trap(format!("{code:?}"))),
             // Sender dropped before a response — the guest trapped/returned first.
@@ -2974,6 +3066,140 @@ impl HandlerEngine {
             },
         }
     }
+}
+
+/// Teardown reason for a streaming-lane response (PLAN-handler-stream-lifecycle GAP2).
+#[derive(Debug, PartialEq, Eq)]
+enum StreamTimeout {
+    /// No body frame was emitted to the client for the lane's idle window.
+    Idle,
+    /// The stream reached the lane's absolute `timeout_ms` lifetime.
+    MaxDuration,
+}
+
+/// The streaming-lane wall-clock watchdog: resolves to [`StreamTimeout::Idle`] when no body frame
+/// has flowed for `idle` (the shared `last_activity` is stamped by [`GuardedStreamBody::poll_frame`]),
+/// or [`StreamTimeout::MaxDuration`] when the stream has been live for `max` — whichever first.
+/// Deliberately the same shape as the inbound-TCP [`conn_watchdog`] so the two long-lived-lifecycle
+/// bounds never drift, and unit-testable with `tokio::time::pause` (no guest component needed). Uses
+/// [`tokio::time::Instant`] throughout so a paused test clock controls it deterministically.
+async fn stream_watchdog(
+    last_activity: Arc<Mutex<tokio::time::Instant>>,
+    idle: Duration,
+    max: Duration,
+) -> StreamTimeout {
+    let started = tokio::time::Instant::now();
+    // Poll at a fraction of the shorter window (bounded) so either a short idle or a short max is
+    // observed promptly.
+    let tick = (idle.min(max) / 4).clamp(Duration::from_millis(50), Duration::from_secs(5));
+    loop {
+        tokio::time::sleep(tick).await;
+        let idle_for = last_activity
+            .lock()
+            .map(|g| g.elapsed())
+            .unwrap_or_default();
+        if idle_for >= idle {
+            return StreamTimeout::Idle;
+        }
+        if started.elapsed() >= max {
+            return StreamTimeout::MaxDuration;
+        }
+    }
+}
+
+/// Aborts its wrapped tasks on drop. Carried by a [`GuardedStreamBody`] so that dropping the body
+/// (client disconnect, or the server finishing the stream) promptly tears down both the guest task
+/// and its idle watchdog — after which the lane permit + in-flight guard the body also carries are
+/// released (PLAN-handler-stream-lifecycle).
+struct AbortOnDrop(Vec<tokio::task::AbortHandle>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        for h in &self.0 {
+            h.abort();
+        }
+    }
+}
+
+/// A streaming response body that occupies its lane slot for the stream's **whole life**
+/// (PLAN-handler-stream-lifecycle GAP1): it carries the lane's [`OwnedSemaphorePermit`] and the
+/// component in-flight [`ComponentGuard`](crate::instance_stats::ComponentGuard), released only when
+/// the body is dropped (fully sent, or the client disconnected). It also stamps `last_activity` on
+/// every emitted frame so the idle watchdog can reclaim a silent (slowloris) stream, and holds an
+/// [`AbortOnDrop`] that tears the guest task + watchdog down when the body is dropped. Delegates all
+/// body semantics to `inner`.
+struct GuardedStreamBody {
+    inner: HyperOutgoingBody,
+    last_activity: Arc<Mutex<tokio::time::Instant>>,
+    // Drop order (declaration order): abort the tasks first, then release the slot + in-flight count.
+    _abort: AbortOnDrop,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+    _cguard: crate::instance_stats::ComponentGuard,
+}
+
+impl HttpBody for GuardedStreamBody {
+    type Data = Bytes;
+    type Error = ErrorCode;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, ErrorCode>>> {
+        let this = self.get_mut();
+        let r = Pin::new(&mut this.inner).poll_frame(cx);
+        // Stamp activity on a real frame to the client so the idle watchdog never kills an
+        // actively-producing stream.
+        if let Poll::Ready(Some(Ok(_))) = &r
+            && let Ok(mut g) = this.last_activity.lock()
+        {
+            *g = tokio::time::Instant::now();
+        }
+        r
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+/// Wrap a streaming guest's response so its lane slot + in-flight guard live for the stream's whole
+/// life, and spawn the idle/max-duration watchdog that reclaims the slot. See [`GuardedStreamBody`].
+fn guard_streaming_response(
+    response: http::Response<HyperOutgoingBody>,
+    guest_abort: tokio::task::AbortHandle,
+    permit: tokio::sync::OwnedSemaphorePermit,
+    cguard: crate::instance_stats::ComponentGuard,
+    idle_ms: u64,
+    max_ms: u64,
+) -> http::Response<HyperOutgoingBody> {
+    let (parts, inner) = response.into_parts();
+    let last_activity = Arc::new(Mutex::new(tokio::time::Instant::now()));
+    let wd_last = Arc::clone(&last_activity);
+    let wd_abort = guest_abort.clone();
+    let watchdog = tokio::spawn(async move {
+        let reason = stream_watchdog(
+            wd_last,
+            Duration::from_millis(idle_ms.max(1_000)),
+            Duration::from_millis(max_ms.max(1)),
+        )
+        .await;
+        // Tear the guest down → its wasi-http outgoing body ends → the server finishes the response
+        // → the body is dropped → the permit + guard release.
+        tracing::debug!(target: "boatramp::handler", ?reason, "streaming response torn down by the lane watchdog");
+        wd_abort.abort();
+    });
+    let body = GuardedStreamBody {
+        inner,
+        last_activity,
+        _abort: AbortOnDrop(vec![guest_abort, watchdog.abort_handle()]),
+        _permit: permit,
+        _cguard: cguard,
+    };
+    http::Response::from_parts(parts, body.boxed())
 }
 
 /// An empty request body (for synthetic requests / requests without a body).
@@ -3371,6 +3597,93 @@ mod tests {
         )
         .await;
         assert_eq!(kind, ConnTimeout::Idle, "idle must fire first");
+    }
+
+    /// PLAN-handler-stream-lifecycle GAP2: the streaming-lane watchdog resolves to `Idle` / `MaxDuration`
+    /// on its own, without a guest — the same shape (and test shape) as the conn-lane watchdog above.
+    #[tokio::test]
+    async fn stream_watchdog_fires_idle_then_max_duration() {
+        // idle (120ms) < max (10s), no frame ever stamped ⇒ Idle fires first.
+        let last = Arc::new(Mutex::new(tokio::time::Instant::now()));
+        let r = stream_watchdog(
+            Arc::clone(&last),
+            Duration::from_millis(120),
+            Duration::from_secs(10),
+        )
+        .await;
+        assert_eq!(r, StreamTimeout::Idle, "idle must fire when no frame flows");
+
+        // max (120ms) < idle (10s) and the stream keeps emitting frames (stamped) ⇒ MaxDuration wins.
+        let last = Arc::new(Mutex::new(tokio::time::Instant::now()));
+        let stamper = {
+            let last = Arc::clone(&last);
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    if let Ok(mut g) = last.lock() {
+                        *g = tokio::time::Instant::now();
+                    }
+                }
+            })
+        };
+        let r = stream_watchdog(
+            Arc::clone(&last),
+            Duration::from_secs(10),
+            Duration::from_millis(120),
+        )
+        .await;
+        stamper.abort();
+        assert_eq!(
+            r,
+            StreamTimeout::MaxDuration,
+            "max-duration must fire even while the stream stays active"
+        );
+    }
+
+    /// PLAN-handler-stream-lifecycle GAP1 (the HIGH): a streaming response occupies its lane slot for
+    /// the body's WHOLE life — not merely until the head is produced — and releases it when the body is
+    /// dropped (client disconnect / stream finished). Proven at the `guard_streaming_response` seam with
+    /// a synthetic body + a 1-permit semaphore, so no wasm guest is needed. Before the fix the permit
+    /// dropped when `serve_lane` returned the head, so this would read 1 while the stream was still live.
+    #[tokio::test]
+    async fn streaming_slot_held_for_body_life_and_released_on_drop() {
+        let sem = Arc::new(Semaphore::new(1));
+        let permit = sem.clone().try_acquire_owned().expect("one permit");
+        assert_eq!(sem.available_permits(), 0, "owned permit taken");
+
+        let stats = crate::instance_stats::InstanceStats::default();
+        let cguard = stats.enter_component("h");
+
+        // Stand-in for the still-streaming guest task (never completes on its own).
+        let task = tokio::spawn(std::future::pending::<()>());
+        let abort = task.abort_handle();
+
+        let inner: HyperOutgoingBody = Empty::<Bytes>::new()
+            .map_err(|never: std::convert::Infallible| -> ErrorCode { match never {} })
+            .boxed();
+        // Long idle/max so the watchdog never fires during the test — we assert lifecycle, not teardown.
+        let wrapped = guard_streaming_response(
+            http::Response::new(inner),
+            abort,
+            permit,
+            cguard,
+            600_000,
+            900_000,
+        );
+
+        assert_eq!(
+            sem.available_permits(),
+            0,
+            "the streaming slot must stay held while the response body is alive (GAP1)"
+        );
+
+        drop(wrapped);
+        tokio::task::yield_now().await; // let the aborted guest/watchdog tasks settle
+        assert_eq!(
+            sem.available_permits(),
+            1,
+            "dropping the response body must release the streaming slot"
+        );
     }
 
     /// PLAN-handler-tcp-inbound: the CI-hard, mutation-verified gate. Drives the ENFORCED

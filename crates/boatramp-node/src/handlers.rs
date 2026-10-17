@@ -40,6 +40,12 @@ const DEFAULT_STREAMING_TIMEOUT_MS: u64 = 15 * 60 * 1000;
 #[cfg(feature = "handlers")]
 const DEFAULT_STREAMING_CONCURRENCY: usize = 64;
 
+/// Default streaming-lane idle cap (ms): a stream emitting no frame for this long is torn down and
+/// its slot reclaimed. 600 s matches the `[stream]` SSE fan-out idle window — a heartbeat-sending
+/// stream is never killed, a silent (slowloris) one is. Mirrors `boatramp_handlers`'s own default.
+#[cfg(feature = "handlers")]
+const DEFAULT_STREAMING_IDLE_MS: u64 = 600_000;
+
 /// The host-parallelism default for the GLOBAL sync-lane concurrency ceiling, given the detected
 /// core count: `cores * 4`, floored at the historical **64**. The `* 4` matches the per-component
 /// `serve_concurrency` gate (so a single hot component can use its whole per-component budget without
@@ -455,6 +461,11 @@ pub async fn build_handler_runtime(
     .with_tcp_listener(allow_guest_tcp_listener)
     .with_self_egress(self_egress_addrs)
     .with_guest_egress_extra_roots(guest_egress_extra_roots)
+    .with_streaming_idle_ms(
+        handlers_cfg
+            .and_then(|h| h.streaming_idle_timeout_ms)
+            .unwrap_or(DEFAULT_STREAMING_IDLE_MS),
+    )
     .with_keep_warm_max(keep_warm_max);
     let sql = build_sql_backends(
         handlers_cfg.and_then(|h| h.bindings.sql.as_ref()),

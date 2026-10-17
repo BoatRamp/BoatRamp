@@ -1398,6 +1398,13 @@ pub struct HandlersConfig {
     /// Optional CPU **fuel** ceiling for a streaming-lane response. Absent ⇒
     /// unmetered (a stream is I/O-bound on the client, not CPU-bound).
     pub streaming_max_fuel: Option<u64>,
+    /// **Idle cap** for a streaming-lane response (ms): if the handler emits no body frame to the
+    /// client for this long, the host tears the stream down and reclaims its lane slot — the
+    /// slowloris bound for the streaming lane, so a `streaming_max_concurrency`-sized burst of
+    /// silent streams can't hold every slot. A well-behaved SSE stream sends heartbeats well inside
+    /// it. The absolute lifetime stays bounded by `streaming_max_timeout_ms`. Floored at 1 s. Absent
+    /// ⇒ 600 s (matches the `[stream]` fan-out idle window).
+    pub streaming_idle_timeout_ms: Option<u64>,
     /// Optional ceiling on a guest's **outbound** `wasi:http` call — the connect
     /// and time-to-first-byte wait — milliseconds, independent of the invocation
     /// timeout, so a hung upstream is bounded on its own terms. The streaming
