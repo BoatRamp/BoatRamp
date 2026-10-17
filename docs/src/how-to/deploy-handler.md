@@ -133,6 +133,29 @@ curl https://my-site.example/api/health
 A method outside the handler's `methods` list returns `405`; a path outside the
 route pattern falls through to rewrites, then static content.
 
+## Stream a response (SSE, chunked, token streaming)
+
+A handler normally returns a complete, buffered response. To instead hold one response
+**open** and write its body incrementally — a `text/event-stream` a browser `EventSource`
+consumes, chunked output, or an LLM token stream — mark the route **streaming**. With the
+shim that is a `#[handler(stream)]` body; it emits `"streaming": true` on the route in the
+manifest. The guest sets the response head (e.g. `Content-Type: text/event-stream`) and then
+writes body frames over the life of the call; the edge flushes each frame to the client
+promptly.
+
+A streaming handler runs on an **isolated streaming lane** — its own concurrency budget
+(`streaming_max_concurrency`) and a much larger wall-clock than a fast request — so a
+long-lived stream never ties up a fast-request slot. The host holds the lane slot for the
+stream's whole life and reclaims it when the stream ends, the client disconnects, or the
+stream emits no frame for the idle cap (`[handlers] streaming_idle_timeout_ms`, default
+600 s); an absolute `streaming_max_timeout_ms` bounds the maximum duration. Send a periodic
+heartbeat (a comment line or a keep-alive event) so a quiet SSE feed is never idle-reaped.
+
+This is one call, one response body you write yourself. For the other two push shapes — a
+host-only topic **fan-out** to many subscribers, or a resumable **duplex session** that runs
+your code per inbound frame — see [Run consumers, crons, and streams](./background-work.md)
+and [Build a duplex agent session](./sessions.md).
+
 ## Reference
 
 - Route and import fields: [project.cfg schema](../reference/project-cfg.md).
