@@ -25,6 +25,13 @@ pub struct GatewayConfig {
     pub upstreams: BTreeMap<String, Upstream>,
     /// Path routes; the first match forwards to its named upstream.
     pub routes: Vec<GatewayRoute>,
+    /// **Site tier only:** path globs that a *project*-declared route may never shadow or capture
+    /// (e.g. `/.well-known/**`, an auth-callback path). Enforced structurally when the two tiers'
+    /// routes are merged ([`resolve_gateway`]) — a project route whose match falls under a reserved
+    /// glob is skipped at serve, so even a bypassed declare-time check cannot let a tenant hijack a
+    /// reserved path. Empty ⇒ nothing reserved (unchanged single-tier behavior).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reserved_paths: Vec<String>,
 }
 
 impl GatewayConfig {
@@ -32,6 +39,12 @@ impl GatewayConfig {
     /// otherwise).
     pub fn is_enabled(&self) -> bool {
         !self.routes.is_empty()
+    }
+
+    /// No upstreams and no routes — used by the project-tier `DeployConfig.gateway` skip-serializer
+    /// so an unused gateway never lands in the (content-addressed) manifest.
+    pub fn is_empty(&self) -> bool {
+        self.upstreams.is_empty() && self.routes.is_empty()
     }
 
     /// The first route whose pattern matches `path` (patterns are cached by
@@ -42,6 +55,305 @@ impl GatewayConfig {
                 .map(|pattern| pattern.is_match(path))
                 .unwrap_or(false)
         })
+    }
+}
+
+/// Which tier owns a resolved gateway match — and therefore which target-space rule binds it at
+/// serve time (the project tier may only reach its own compute + public hosts; the operator tier
+/// authorizes private reach).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GatewayTier {
+    /// A site/operator-declared route — OR a project route that referenced a `shared` site upstream
+    /// (the reach was authorized by the operator, so the operator address policy applies).
+    Operator,
+    /// A project/app-author-declared route to a project-declared upstream (own compute / public).
+    Project,
+}
+
+/// A resolved route match in the merged (project ∪ referenced-site) namespace.
+pub struct GatewayMatch<'a> {
+    /// Which tier's authority governs this match (operator routes win on a tie).
+    pub tier: GatewayTier,
+    /// The matched route's upstream name (for runtime state keying + dispatch).
+    pub upstream_name: &'a str,
+    /// The resolved upstream. For a reference this is the **site** struct — the project never gets a
+    /// copy, so its target/host/TLS/creds stay opaque (RESTRICTION 3).
+    pub upstream: &'a Upstream,
+    /// True when a project route resolved to a `shared` site upstream (a reference, not a project
+    /// upstream).
+    pub via_reference: bool,
+}
+
+/// The outcome of resolving a request path against the two-tier gateway.
+pub enum GatewayResolution<'a> {
+    /// No gateway route matched — fall through to the rest of the serve pipeline (static/handlers).
+    NoMatch,
+    /// A route matched but its named upstream did not resolve (unknown name, or a project route
+    /// naming a non-`shared` site upstream) — a config error; the caller returns `502`. Preserves the
+    /// existing operator behavior for a dangling route.
+    UnknownUpstream {
+        /// The tier whose route matched.
+        tier: GatewayTier,
+        /// The unresolved upstream name.
+        name: String,
+    },
+    /// A route matched and its upstream resolved.
+    Matched(GatewayMatch<'a>),
+}
+
+/// Resolve `path` against the merged project+site gateway with **operator precedence** (RESTRICTION
+/// 2), the **reserved-path hijack guard** (RESTRICTION 2), and **reference opacity** (RESTRICTION 3).
+///
+/// Order:
+/// 1. **Operator routes first.** A matching `site` route wins (operator may serve any path, incl. a
+///    reserved one — the operator owns it). Its upstream resolves against `site.upstreams`.
+/// 2. **Reserved paths bar the project tier.** If no operator route matched and `path` falls under any
+///    `site.reserved_paths` glob, the project tier may not serve it → `NoMatch` (falls through to
+///    normal serving; a tenant route can never capture a reserved path).
+/// 3. **Project routes.** The first matching `project` route resolves its upstream name in the merged
+///    namespace: a `project`-declared upstream (→ [`GatewayTier::Project`]) first, else a `shared`
+///    `site` upstream (→ a reference: [`GatewayTier::Operator`], `via_reference = true`, the site
+///    struct returned opaquely). A name that is neither ⇒ `UnknownUpstream` (deny-by-default).
+pub fn resolve_gateway<'a>(
+    project: Option<&'a GatewayConfig>,
+    site: Option<&'a GatewayConfig>,
+    path: &str,
+) -> GatewayResolution<'a> {
+    // 1. Operator routes take precedence.
+    if let Some(site) = site
+        && let Some(route) = site.match_route(path)
+    {
+        return match site.upstreams.get(&route.upstream) {
+            Some(up) => GatewayResolution::Matched(GatewayMatch {
+                tier: GatewayTier::Operator,
+                upstream_name: &route.upstream,
+                upstream: up,
+                via_reference: false,
+            }),
+            None => GatewayResolution::UnknownUpstream {
+                tier: GatewayTier::Operator,
+                name: route.upstream.clone(),
+            },
+        };
+    }
+
+    let Some(project) = project else {
+        return GatewayResolution::NoMatch;
+    };
+
+    // 2. A reserved path is never served by a project route (operator territory) — structural, so a
+    //    bypassed declare-time check still cannot let a tenant capture it.
+    if let Some(site) = site
+        && site.reserved_paths.iter().any(|r| {
+            Pattern::compile(r)
+                .map(|p| p.is_match(path))
+                .unwrap_or(false)
+        })
+    {
+        return GatewayResolution::NoMatch;
+    }
+
+    // 3. Project routes, resolved in the merged namespace.
+    if let Some(route) = project.match_route(path) {
+        if let Some(up) = project.upstreams.get(&route.upstream) {
+            return GatewayResolution::Matched(GatewayMatch {
+                tier: GatewayTier::Project,
+                upstream_name: &route.upstream,
+                upstream: up,
+                via_reference: false,
+            });
+        }
+        if let Some(site) = site
+            && let Some(up) = site.upstreams.get(&route.upstream)
+            && up.shared
+        {
+            // A reference: the reach was granted by the operator, so the operator policy governs,
+            // and the project sees only the name (the returned `upstream` is the site struct).
+            return GatewayResolution::Matched(GatewayMatch {
+                tier: GatewayTier::Operator,
+                upstream_name: &route.upstream,
+                upstream: up,
+                via_reference: true,
+            });
+        }
+        return GatewayResolution::UnknownUpstream {
+            tier: GatewayTier::Project,
+            name: route.upstream.clone(),
+        };
+    }
+
+    GatewayResolution::NoMatch
+}
+
+/// Validate a **site/operator** gateway: every route references a declared upstream, and every route
+/// pattern + reserved-path glob compiles. (The private-upstream trust decision is the operator's to
+/// make, bounded by the node posture at serve — not refused here.)
+pub fn validate_site_gateway(site: &GatewayConfig) -> Result<(), crate::ConfigError> {
+    for route in &site.routes {
+        Pattern::compile(&route.matches)?;
+        if !site.upstreams.contains_key(&route.upstream) {
+            return Err(crate::ConfigError::parse(format!(
+                "site gateway route `{}` references unknown upstream `{}`",
+                route.matches, route.upstream
+            )));
+        }
+    }
+    for reserved in &site.reserved_paths {
+        Pattern::compile(reserved)?;
+    }
+    Ok(())
+}
+
+/// Validate a **project/app-author** gateway against the invariant *a tier may only declare reach it
+/// holds*. `site` (the operator gateway, if any) is consulted for `shared`-grant resolution.
+///
+/// Refuses: a project upstream marked `shared` (a project cannot grant); a project upstream whose
+/// literal target host is a private/loopback/internal/metadata address (RESTRICTION 1 — DNS names
+/// are allowed here and bounded at serve); a route referencing neither a project upstream nor a
+/// `shared` site upstream (deny-by-default); and a project upstream name that collides with a shared
+/// site upstream (ambiguous — fork 5, reject).
+pub fn validate_project_gateway(
+    project: &GatewayConfig,
+    site: Option<&GatewayConfig>,
+) -> Result<(), crate::ConfigError> {
+    for (name, up) in &project.upstreams {
+        if up.shared {
+            return Err(crate::ConfigError::parse(format!(
+                "project gateway upstream `{name}` sets `shared` — only a site/operator upstream may \
+                 be a referenceable grant (a project cannot grant reach it does not hold)"
+            )));
+        }
+        // Collision with a shared site upstream (ambiguous) — only checkable when the site config is
+        // in hand (the CLI/serve path); standalone deploy validation has no SiteConfig.
+        if site.is_some_and(|s| s.upstreams.get(name).is_some_and(|u| u.shared)) {
+            return Err(crate::ConfigError::parse(format!(
+                "project gateway upstream `{name}` collides with a shared site upstream of the same \
+                 name — rename the project upstream, or drop it to reference the site grant"
+            )));
+        }
+        // RESTRICTION 1 (declare-time fail-fast): a compute-by-name upstream is own-compute (allowed);
+        // otherwise a literal private/internal host is refused. A DNS name passes here and is bounded
+        // by the project-tier address gate at serve.
+        if up.compute.is_none() {
+            for host in upstream_literal_hosts(up) {
+                if host_is_literal_private(&host) {
+                    return Err(crate::ConfigError::parse(format!(
+                        "project gateway upstream `{name}` targets a private/internal address \
+                         `{host}` — the project tier may only reach its own compute, a public host, \
+                         or a shared site upstream; declare the private backend as a site upstream \
+                         and mark it `shared`"
+                    )));
+                }
+            }
+        }
+    }
+    for route in &project.routes {
+        Pattern::compile(&route.matches)?;
+        let in_project = project.upstreams.contains_key(&route.upstream);
+        // The route→upstream existence check needs the SiteConfig to resolve a `shared` reference, so
+        // it only fires when `site` is in hand (CLI/serve). Standalone deploy validation (`site =
+        // None`) leaves a name not declared in the project to be resolved — and denied-by-default if
+        // ungranted — at serve (`resolve_gateway` → `UnknownUpstream`).
+        if let Some(s) = site {
+            let in_shared_site = s.upstreams.get(&route.upstream).is_some_and(|u| u.shared);
+            if !in_project && !in_shared_site {
+                return Err(crate::ConfigError::parse(format!(
+                    "project gateway route `{}` references upstream `{}`, which is neither a project \
+                     upstream nor a shared site upstream",
+                    route.matches, route.upstream
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The literal target hosts of an upstream (its `target`, pooled `targets`, and `discover.host`), for
+/// the declare-time private-address screen.
+fn upstream_literal_hosts(up: &Upstream) -> Vec<String> {
+    let mut hosts = Vec::new();
+    if !up.target.trim().is_empty()
+        && let Some(h) = extract_host(&up.target)
+    {
+        hosts.push(h);
+    }
+    for t in &up.targets {
+        if let Some(h) = extract_host(t) {
+            hosts.push(h);
+        }
+    }
+    if let Some(d) = &up.discover
+        && let Some(h) = extract_host(&d.host)
+    {
+        hosts.push(h);
+    }
+    hosts
+}
+
+/// Extract the host of an upstream target: `scheme://[user@]host[:port][/path]`, `host:port`, a bare
+/// host, or a bracketed IPv6 literal. `None` when empty.
+fn extract_host(s: &str) -> Option<String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let after_scheme = match s.find("://") {
+        Some(i) => &s[i + 3..],
+        None => s,
+    };
+    let authority = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(after_scheme);
+    let authority = authority.rsplit('@').next().unwrap_or(authority);
+    if let Some(rest) = authority.strip_prefix('[') {
+        // Bracketed IPv6 literal: `[::1]:port`.
+        if let Some(end) = rest.find(']') {
+            return Some(rest[..end].to_string());
+        }
+    }
+    let host = authority.split(':').next().unwrap_or(authority);
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_string())
+    }
+}
+
+/// Whether `host` parses as a non-public IP literal (private/loopback/link-local/ULA/unspecified/
+/// CGNAT/metadata). A DNS name (not an IP literal) returns `false` — allowed at declare, bounded at
+/// serve. This is the declare-time fail-fast screen; the serve-time address gate is authoritative.
+fn host_is_literal_private(host: &str) -> bool {
+    match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => !ip_is_public(ip),
+        Err(_) => false,
+    }
+}
+
+fn ip_is_public(ip: std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            !(v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                || o[0] == 0
+                // CGNAT 100.64.0.0/10
+                || (o[0] == 100 && (o[1] & 0xc0) == 0x40))
+        }
+        IpAddr::V6(v6) => {
+            let seg = v6.segments();
+            !(v6.is_loopback()
+                || v6.is_unspecified()
+                // ULA fc00::/7
+                || (seg[0] & 0xfe00) == 0xfc00
+                // link-local fe80::/10
+                || (seg[0] & 0xffc0) == 0xfe80)
+        }
     }
 }
 
@@ -134,6 +446,13 @@ pub struct Upstream {
     /// Header rewrites applied to the response before returning it.
     #[serde(skip_serializing_if = "HeaderOps::is_empty")]
     pub header_down: HeaderOps,
+    /// **Site tier only:** expose this upstream's *name* as a referenceable grant into the project
+    /// namespace, so a project route/upstream may forward to it by name. The project sees ONLY the
+    /// name — never the target / host_header / TLS / credentials (reference opacity, like a secret
+    /// reference hides the backend value). Must be `false` on a project-declared upstream (a project
+    /// cannot grant reach it does not hold); validated at declare time.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub shared: bool,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -339,6 +658,7 @@ mod tests {
                     upstream: "app".into(),
                 },
             ],
+            ..Default::default()
         };
         assert_eq!(cfg.match_route("/api/v1/x").unwrap().upstream, "api");
         assert_eq!(cfg.match_route("/anything").unwrap().upstream, "app");
@@ -384,6 +704,7 @@ mod tests {
                 matches: "/api/**".into(),
                 upstream: "api".into(),
             }],
+            ..Default::default()
         };
         let json = serde_json::to_string(&cfg).unwrap();
         assert_eq!(serde_json::from_str::<GatewayConfig>(&json).unwrap(), cfg);
@@ -449,6 +770,7 @@ mod tests {
                 matches: "/**".into(),
                 upstream: "pool".into(),
             }],
+            ..Default::default()
         };
         let json = serde_json::to_string(&cfg).unwrap();
         let back = serde_json::from_str::<GatewayConfig>(&json).unwrap();
@@ -515,5 +837,176 @@ mod tests {
                 "default upstream leaked {absent}: {json}"
             );
         }
+    }
+
+    // ---- Symmetric two-tier gateway (release 0.37.0) ----
+
+    #[test]
+    fn resolve_gateway_operator_precedence_and_reserved_paths() {
+        let mut site = GatewayConfig::default();
+        site.upstreams
+            .insert("ops".into(), upstream("http://10.0.0.9:80", None));
+        site.routes.push(GatewayRoute {
+            matches: "/admin/**".into(),
+            upstream: "ops".into(),
+        });
+        site.reserved_paths.push("/.well-known/**".into());
+
+        let mut project = GatewayConfig::default();
+        project.upstreams.insert(
+            "web".into(),
+            Upstream {
+                compute: Some("web".into()),
+                ..Default::default()
+            },
+        );
+        // The project even TRIES to grab the reserved path — it must not win it.
+        project.routes.push(GatewayRoute {
+            matches: "/.well-known/**".into(),
+            upstream: "web".into(),
+        });
+        project.routes.push(GatewayRoute {
+            matches: "/**".into(),
+            upstream: "web".into(),
+        });
+
+        // Operator route wins where it matches.
+        match resolve_gateway(Some(&project), Some(&site), "/admin/x") {
+            GatewayResolution::Matched(m) => {
+                assert_eq!(m.tier, GatewayTier::Operator);
+                assert_eq!(m.upstream_name, "ops");
+            }
+            _ => panic!("operator route must win"),
+        }
+        // Reserved path: the project route is structurally barred ⇒ falls through (NoMatch), NEVER
+        // the project upstream — the anti-hijack guard.
+        assert!(matches!(
+            resolve_gateway(Some(&project), Some(&site), "/.well-known/acme"),
+            GatewayResolution::NoMatch
+        ));
+        // A normal path resolves to the project tier.
+        match resolve_gateway(Some(&project), Some(&site), "/hello") {
+            GatewayResolution::Matched(m) => {
+                assert_eq!(m.tier, GatewayTier::Project);
+                assert!(!m.via_reference);
+            }
+            _ => panic!("project route must serve a normal path"),
+        }
+    }
+
+    #[test]
+    fn resolve_gateway_reference_is_operator_tier_and_opaque() {
+        let mut site = GatewayConfig::default();
+        site.upstreams.insert(
+            "db".into(),
+            Upstream {
+                target: "http://10.0.0.5:5432".into(),
+                shared: true,
+                ..Default::default()
+            },
+        );
+        let mut project = GatewayConfig::default();
+        project.routes.push(GatewayRoute {
+            matches: "/db/**".into(),
+            upstream: "db".into(),
+        });
+        // A project route referencing a SHARED site upstream resolves as the operator tier (the
+        // operator authorized the reach), via_reference, returning the SITE struct (opaque — the
+        // project never copied it).
+        match resolve_gateway(Some(&project), Some(&site), "/db/x") {
+            GatewayResolution::Matched(m) => {
+                assert_eq!(m.tier, GatewayTier::Operator);
+                assert!(m.via_reference);
+                assert_eq!(m.upstream.target, "http://10.0.0.5:5432");
+            }
+            _ => panic!("a shared reference must resolve"),
+        }
+        // A reference to a NON-shared site upstream is denied (deny-by-default).
+        let mut site_unshared = GatewayConfig::default();
+        site_unshared
+            .upstreams
+            .insert("db".into(), upstream("http://10.0.0.5:5432", None));
+        assert!(matches!(
+            resolve_gateway(Some(&project), Some(&site_unshared), "/db/x"),
+            GatewayResolution::UnknownUpstream {
+                tier: GatewayTier::Project,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn validate_project_gateway_enforces_the_target_space() {
+        // own-compute: allowed.
+        let mut p = GatewayConfig::default();
+        p.upstreams.insert(
+            "w".into(),
+            Upstream {
+                compute: Some("w".into()),
+                ..Default::default()
+            },
+        );
+        p.routes.push(GatewayRoute {
+            matches: "/**".into(),
+            upstream: "w".into(),
+        });
+        assert!(validate_project_gateway(&p, None).is_ok());
+
+        // public host: allowed.
+        let mut public = GatewayConfig::default();
+        public
+            .upstreams
+            .insert("ext".into(), upstream("https://api.example.com", None));
+        assert!(validate_project_gateway(&public, None).is_ok());
+
+        // raw private / loopback / link-local-metadata: REFUSED (the bright line).
+        for bad in [
+            "http://10.0.0.5:8080",
+            "http://127.0.0.1:9000",
+            "http://169.254.169.254/latest",
+            "http://[fd00::1]:80",
+        ] {
+            let mut g = GatewayConfig::default();
+            g.upstreams.insert("bad".into(), upstream(bad, None));
+            assert!(
+                validate_project_gateway(&g, None).is_err(),
+                "a project upstream to {bad} must be refused"
+            );
+        }
+
+        // a project upstream marked `shared` is refused (a project cannot grant).
+        let mut sh = GatewayConfig::default();
+        sh.upstreams.insert(
+            "x".into(),
+            Upstream {
+                target: "https://ok.example.com".into(),
+                shared: true,
+                ..Default::default()
+            },
+        );
+        assert!(validate_project_gateway(&sh, None).is_err());
+
+        // With a SiteConfig: a route to a shared site upstream is OK; to an absent name is refused.
+        let mut site = GatewayConfig::default();
+        site.upstreams.insert(
+            "grant".into(),
+            Upstream {
+                target: "http://10.0.0.9:80".into(),
+                shared: true,
+                ..Default::default()
+            },
+        );
+        let mut ref_ok = GatewayConfig::default();
+        ref_ok.routes.push(GatewayRoute {
+            matches: "/g/**".into(),
+            upstream: "grant".into(),
+        });
+        assert!(validate_project_gateway(&ref_ok, Some(&site)).is_ok());
+        let mut ref_bad = GatewayConfig::default();
+        ref_bad.routes.push(GatewayRoute {
+            matches: "/g/**".into(),
+            upstream: "absent".into(),
+        });
+        assert!(validate_project_gateway(&ref_bad, Some(&site)).is_err());
     }
 }

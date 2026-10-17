@@ -68,6 +68,13 @@ pub struct DeployConfig {
     /// host re-enters per inbound frame, with host-owned ordering/resume/lifetime.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sessions: Vec<SessionConfig>,
+    /// **Project-tier reverse proxy** (symmetric with the operator-tier `SiteConfig.gateway`). An
+    /// upstream declared here may target ONLY the project's own compute workload (by name), a PUBLIC
+    /// host, or a `shared` site upstream (by name) — a raw private/internal address is refused at the
+    /// project tier (the project tier never authorizes new private reach; that is the operator's to
+    /// grant). Rides the `project.cfg` routing bundle; validated by [`Self::compile_check`].
+    #[serde(default, skip_serializing_if = "crate::gateway::GatewayConfig::is_empty")]
+    pub gateway: crate::gateway::GatewayConfig,
 }
 
 impl Default for DeployConfig {
@@ -90,6 +97,7 @@ impl Default for DeployConfig {
             crons: Vec::new(),
             streams: Vec::new(),
             sessions: Vec::new(),
+            gateway: crate::gateway::GatewayConfig::default(),
         }
     }
 }
@@ -150,6 +158,12 @@ impl DeployConfig {
             Pattern::compile(&header.matches)?;
         }
         self.check_handlers()?;
+        // Project-tier gateway: patterns compile, target-space (no raw private), and route→upstream
+        // resolution. `site = None` here — the deploy bundle is validated standalone at `sync`/
+        // `validate`; a route referencing a `shared` site upstream is resolved against the live
+        // SiteConfig at serve, and a project upstream's own-compute/public targets are the common
+        // case this catches. (The serve-time address gate is the security authority.)
+        crate::gateway::validate_project_gateway(&self.gateway, None)?;
         Ok(())
     }
 
