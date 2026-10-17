@@ -40,6 +40,26 @@ inert until configured — a node that enables neither behaves exactly as before
   (default 32 MiB). Env `BOATRAMP_HANDLERS_AOT_ARTIFACT_CACHE` / `_AOT_ARTIFACT_MAX_BYTES`. The
   existing on-disk wasmtime compile cache (restart-local) is unchanged and complementary.
 
+- **Zero-copy blob-ref handler responses.** A handler serving a large STORED object (a download,
+  an attachment) can now respond with a **blob reference** instead of copying the bytes through the
+  guest in 4 KiB WASI chunks: it returns an empty body plus `x-boatramp-blob-ref: <container>/<key>`
+  (status + content-type set as usual), and the edge streams that object straight from the handler's
+  own blob backend — `sendfile` on a local backend over plaintext, an mmap'd slice on TLS, or a
+  host-side stream on a remote backend — so the object bytes never traverse the guest. A single HTTP
+  `Range` is honored (`206` + `Content-Range`). The reference resolves through the handler's EXACT
+  `wasi:blobstore` confinement (host-stamped `hblob/{project-qualified-site}/` prefix + the
+  `blobstore_containers` allowlist + the object-key traversal screen), so it grants no new authority —
+  only a faster path to bytes the handler could already read; a traversal / cross-site ref is refused.
+  Absent the header, responses are byte-for-byte unchanged (small/generated bodies still buffer). No
+  WIT/shim change (a guest library sets the header; the host does the swap).
+
+- **Optional swap-in `-debug` container images.** The Release GHCR step now also builds + pushes
+  `…:<tag>-debug` (+ `:debug`) variants of the base and cloudflare images, bundling a shell +
+  `strace`/`ltrace`/`procps`/`lsof`/`busybox`/`coreutils` for incident debugging. Additive — the lean
+  default images are unchanged (the debug tooling is a separate layer on the same app layer), opt-in by
+  tag (swap during an incident, swap back). `gdb` is omitted to keep the image small; `strace`/`ltrace`
+  need `--cap-add=SYS_PTRACE` at runtime.
+
 ## [0.35.2] - 2026-10-16
 
 **Fix: `project export` / `import` (and `sql exec`) now actually run the SQL client on a
