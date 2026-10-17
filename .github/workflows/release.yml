@@ -334,28 +334,39 @@ jobs:
           tag="${GITHUB_REF_NAME}"
           base="ghcr.io/${GITHUB_REPOSITORY,,}"
           : > image-refs.txt
-          # Realize BOTH image closures in ONE `nix build`, so the daemon substitutes their
-          # (nightly-cached) ~230 MiB tarballs from cachix CONCURRENTLY. The old per-variant loop
-          # downloaded them serially — the GHCR long pole (measured ~5 min + ~15 min of cachix
-          # egress on the two blobs). Substitution is NOT gated by `--max-jobs`, so `--max-jobs 1`
-          # stays as the OOM guard for the rare cache-miss recompile; only the download parallelises.
-          # `--print-out-paths` lists the store paths in installable order (container first), which
-          # is more robust than numbered `--out-link` symlinks.
-          mapfile -t IMG < <(nix build ".#container" ".#container-cloudflare" \
-            --max-jobs 1 --cores 2 --no-link --print-build-logs --print-out-paths)
-          i=0
-          for variant in container container-cloudflare; do
-            repo="$base"
-            [ "$variant" = "container-cloudflare" ] && repo="${base}-cloudflare"
-            tar="${IMG[$i]}"
-            i=$((i + 1))
-            nix run nixpkgs#skopeo -- copy "docker-archive:${tar}" "docker://${repo}:${tag}"
-            nix run nixpkgs#skopeo -- copy "docker-archive:${tar}" "docker://${repo}:latest"
-            # Record the pushed image by digest (the immutable ref cosign/SBOM pin to) PLUS the
-            # on-disk archive path, so the sign step SBOMs the local image instead of re-pulling it.
-            digest="$(nix run nixpkgs#skopeo -- inspect --format '{{.Digest}}' "docker://${repo}:${tag}")"
+          # Realize all FOUR image closures (lean base + cloudflare, plus their opt-in `-debug`
+          # swap-ins) in ONE `nix build`, so the daemon substitutes their (nightly-cached) tarballs
+          # from cachix CONCURRENTLY. Substitution is NOT gated by `--max-jobs`, so `--max-jobs 1`
+          # stays as the OOM guard for a rare cache-miss recompile; only the download parallelises.
+          # The debug layers (shell + strace/ltrace/procps/lsof) dedup against the shared app +
+          # cacert layers, so GHCR only uploads the extra layers.
+          nix build ".#container" ".#container-cloudflare" \
+                    ".#container-debug" ".#container-cloudflare-debug" \
+            --max-jobs 1 --cores 2 --no-link --print-build-logs
+
+          # Push one variant under one or more tags; record the immutable digest (first tag) + the
+          # local archive path for the sign/SBOM step. Resolve each store path by ATTR (a cache hit
+          # after the batch build above), so the mapping never depends on build-output ordering.
+          push() {  # $1=attr  $2=repo  $3…=tags (first = the immutable one to digest-record)
+            local attr="$1" repo="$2"; shift 2
+            local tar; tar="$(nix build ".#${attr}" --no-link --print-out-paths)"
+            local t
+            for t in "$@"; do
+              nix run nixpkgs#skopeo -- copy "docker-archive:${tar}" "docker://${repo}:${t}"
+            done
+            local digest
+            digest="$(nix run nixpkgs#skopeo -- inspect --format '{{.Digest}}' "docker://${repo}:${1}")"
             echo "${repo}@${digest} ${tar}" >> image-refs.txt
-          done
+          }
+
+          #   base             → ghcr.io/<owner>/boatramp            :<tag>        :latest
+          #   base-debug       → ghcr.io/<owner>/boatramp            :<tag>-debug  :debug
+          #   cloudflare       → ghcr.io/<owner>/boatramp-cloudflare  :<tag>        :latest
+          #   cloudflare-debug → ghcr.io/<owner>/boatramp-cloudflare  :<tag>-debug  :debug
+          push container                  "$base"              "$tag"         latest
+          push container-debug            "$base"              "${tag}-debug" debug
+          push container-cloudflare       "${base}-cloudflare" "$tag"         latest
+          push container-cloudflare-debug "${base}-cloudflare" "${tag}-debug" debug
           cat image-refs.txt
 
       # Supply chain: keyless-sign each image + attach a CycloneDX SBOM (both via

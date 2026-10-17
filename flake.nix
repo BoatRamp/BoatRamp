@@ -272,6 +272,11 @@
             {
               pkg,
               user ? null,
+              # Opt-in extra store paths layered on top of the lean base (the `*-debug`
+              # variants pass `debugTools`). Empty for the lean default images, so those
+              # stay byte-identical. `buildLayeredImage` dedups layers by store path, so a
+              # debug image shares the app + cacert layers with the base.
+              extraContents ? [ ],
             }:
             pkgs.dockerTools.buildLayeredImage {
               name = "boatramp";
@@ -279,7 +284,8 @@
               contents = [
                 pkg
                 pkgs.cacert
-              ];
+              ]
+              ++ extraContents;
               # The hardened non-root image (uid 65534) has no writable directory of
               # its own — its CWD `/` and `/tmp` are root-owned — so the filesystem
               # state backends (SlateDB kv / fs blobs) can't create their dirs and
@@ -303,6 +309,22 @@
               }
               // lib.optionalAttrs (user != null) { User = user; };
             };
+
+          # Opt-in debug toolset for the `*-debug` image variants (incident debugging +
+          # basic profiling). Layered ON TOP of the SAME app + cacert layers, so pulling a
+          # `-debug` image when the lean base is already resident fetches only these extra
+          # layers. NEVER present in the lean default images. `gdb` is intentionally omitted
+          # (its closure — python3 etc. — is the entire size premium; strace/ltrace cover
+          # the common incident path); add it back here if interactive debugging is needed.
+          debugTools = with pkgs; [
+            busybox # ash shell + a broad basic-tool kit (ls/cat/grep/sed/vi/wget/netstat/…)
+            bashInteractive # a real interactive bash
+            coreutils # GNU coreutils (faithful behavior over the busybox applets)
+            strace # syscall tracing
+            ltrace # library-call tracing
+            procps # ps / top / free / vmstat
+            lsof # open files + sockets
+          ];
         in
         {
           # Apply the rust-overlay so `pkgs.rust-bin` is available everywhere in
@@ -473,12 +495,27 @@
             # musl + jemalloc binary — no glibc/loader closure, and jemalloc keeps
             # the concurrency throughput musl's own malloc would throw away.
             container = mkImage { pkg = boatrampMuslBin; };
+            # Debug swap-in of the base image: identical app + entrypoint + Env, plus the
+            # `debugTools` (shell + strace/ltrace/procps/lsof). Pushed as `:<tag>-debug`, so
+            # it is a drop-in you swap the tag to during an incident, then swap back. Opt-in
+            # only — never the default.
+            container-debug = mkImage {
+              pkg = boatrampMuslBin;
+              extraContents = debugTools;
+            };
             # Cloudflare image: the same static binary, configured for remote state
             # (R2 + KV) at runtime, so it needs no volume and stays hardened as
             # non-root.
             container-cloudflare = mkImage {
               pkg = boatrampMuslBin;
               user = "65534:65534";
+            };
+            # Debug swap-in of the cloudflare (non-root) image — the variant most likely to
+            # need in-cluster debugging. Same `debugTools`, same non-root uid.
+            container-cloudflare-debug = mkImage {
+              pkg = boatrampMuslBin;
+              user = "65534:65534";
+              extraContents = debugTools;
             };
           };
 
