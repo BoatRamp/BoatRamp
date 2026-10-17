@@ -53,10 +53,17 @@ pub fn derive_key(cluster_aot_root: &[u8; 32]) -> [u8; 32] {
 /// Binding the fingerprint + wasm_hash (from the lookup key) stops a frame minted for one
 /// `(fingerprint, wasm_hash)` partition from being replayed under another.
 fn mac_message(fingerprint: &[u8; 32], wasm_hash: &str, serialized: &[u8]) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(1 + 32 + wasm_hash.len() + serialized.len());
+    // LENGTH-DELIMIT the variable fields so two different `(wasm_hash, serialized)` splits can
+    // never produce the same MAC input (a classic ambiguous-concatenation footgun). Component
+    // hashes are fixed 64-hex today so it is not currently exploitable, but delimiting keeps it
+    // sound if the hash format ever changes. `fingerprint` is fixed 32 bytes; `serialized` is
+    // last, so prefixing `wasm_hash`'s length is sufficient to make the parse unambiguous.
+    let hash = wasm_hash.as_bytes();
+    let mut msg = Vec::with_capacity(1 + 32 + 4 + hash.len() + serialized.len());
     msg.push(FMT_VER);
     msg.extend_from_slice(fingerprint);
-    msg.extend_from_slice(wasm_hash.as_bytes());
+    msg.extend_from_slice(&(hash.len() as u32).to_le_bytes());
+    msg.extend_from_slice(hash);
     msg.extend_from_slice(serialized);
     msg
 }

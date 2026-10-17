@@ -1658,11 +1658,13 @@ pub(super) async fn read_blob_bytes(
 }
 
 /// A hard safety ceiling on how many bytes the AOT consumer will read from the shared blob
-/// store before verifying the MAC — so a malicious oversize `aot/…` blob can never OOM a
-/// node (the MAC is computed over the whole frame, so it must be buffered first). The
-/// operator's `aot_artifact_max_bytes` narrows this further.
+/// store before verifying the MAC — so a principal who can write the shared store but lacks
+/// the cluster key cannot amplify a cold start by planting a giant blob at `aot/<fp>/<hash>`
+/// (the MAC is computed over the whole frame, so it must be buffered before it can be
+/// rejected). A real wasmtime-serialized component artifact is single-digit-to-tens of MiB,
+/// so 64 MiB is already generous headroom; `aot_artifact_max_bytes` narrows it further.
 #[cfg(feature = "handlers")]
-const AOT_CONSUMER_HARD_MAX: u64 = 512 * 1024 * 1024;
+const AOT_CONSUMER_HARD_MAX: u64 = 64 * 1024 * 1024;
 
 /// Cold-start cap-req 09 (consumer): try to hydrate the request component from a portable,
 /// MAC-VERIFIED AOT artifact instead of recompiling from source. Returns `true` only when
