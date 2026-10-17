@@ -3677,7 +3677,9 @@ async fn serve_cluster_acme_dns(
             account_envelope.clone(),
         )
     });
-    let on_demand = on_demand_engine.as_ref().map(|o| o.resolver());
+    let on_demand = on_demand_engine
+        .as_ref()
+        .map(crate::on_demand_tls::OnDemandTls::resolver);
     let base = CertRequest {
         directory_url: args.acme_directory.clone(),
         contact_email: args.acme_contact.clone(),

@@ -262,7 +262,7 @@ impl OnDemandIssuer {
                 match crate::acme_dns::certified_key_from_pem(&stored.chain_pem, &stored.key_pem) {
                     Ok(ck) => self.cache.insert_issued(sni, Arc::new(ck)),
                     Err(e) => {
-                        tracing::warn!(target: "boatramp::acme", %sni, error = %e, "on-demand cert parse failed")
+                        tracing::warn!(target: "boatramp::acme", %sni, error = %e, "on-demand cert parse failed");
                     }
                 }
             }
@@ -816,7 +816,7 @@ mod tests {
     ) -> Arc<OnDemandIssuer> {
         Arc::new(OnDemandIssuer {
             gate: Arc::new(StubGate {
-                allowed: allowed.iter().map(|s| s.to_string()).collect(),
+                allowed: allowed.iter().copied().map(String::from).collect(),
                 lookups,
             }),
             issuer: Arc::new(StubIssuer { orders }),

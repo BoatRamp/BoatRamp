@@ -267,51 +267,6 @@ fn tls_alpn01_cert_from_digest(
     Ok((cert.pem(), key_pair.serialize_pem()))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn acme_identifier_ext_value_wraps_digest_as_octet_string() {
-        let digest = [0xabu8; 32];
-        let v = acme_identifier_ext_value(&digest);
-        assert_eq!(v[0], 0x04, "OCTET STRING tag");
-        assert_eq!(v[1], 32, "length byte");
-        assert_eq!(&v[2..], &digest[..], "the 32-byte digest follows");
-        assert_eq!(v.len(), 34);
-    }
-
-    #[test]
-    fn tls_alpn01_cert_is_pem_and_digest_bound() {
-        let (cert_a, key_a) =
-            tls_alpn01_cert_from_digest("mail.example.com", &[0x11u8; 32]).unwrap();
-        let (cert_b, _key_b) =
-            tls_alpn01_cert_from_digest("mail.example.com", &[0x22u8; 32]).unwrap();
-        assert!(cert_a.starts_with("-----BEGIN CERTIFICATE-----"));
-        assert!(key_a.contains("PRIVATE KEY"));
-        // The challenge cert is bound to the key-authorization digest — a different digest ⇒ a
-        // different cert (the acmeIdentifier extension differs).
-        assert_ne!(cert_a, cert_b, "the cert must incorporate the digest");
-    }
-
-    #[test]
-    fn dns01_solver_reports_its_type() {
-        struct NoopProvider;
-        #[async_trait]
-        impl DnsProvider for NoopProvider {
-            async fn upsert(&self, _r: &DnsRecord) -> Result<(), crate::dns::DnsError> {
-                Ok(())
-            }
-            async fn delete(&self, _r: &DnsRecord) -> Result<(), crate::dns::DnsError> {
-                Ok(())
-            }
-        }
-        let p = NoopProvider;
-        let solver = Dns01Solver::new(&p, 60);
-        assert_eq!(solver.challenge_type(), ChallengeType::Dns01);
-    }
-}
-
 /// Create a fresh ACME account at `directory_url`. The returned [`AccountCredentials`] is opaque but
 /// serde-serializable — the caller persists it (sealed) and reuses the account via [`restore_account`]
 /// across restarts/replicas, so the CA's `newAccount` rate limit is hit once, not per order.
@@ -390,4 +345,49 @@ async fn drive_to_certificate(
         certificate_pem,
         private_key_pem: key_pair.serialize_pem(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn acme_identifier_ext_value_wraps_digest_as_octet_string() {
+        let digest = [0xabu8; 32];
+        let v = acme_identifier_ext_value(&digest);
+        assert_eq!(v[0], 0x04, "OCTET STRING tag");
+        assert_eq!(v[1], 32, "length byte");
+        assert_eq!(&v[2..], &digest[..], "the 32-byte digest follows");
+        assert_eq!(v.len(), 34);
+    }
+
+    #[test]
+    fn tls_alpn01_cert_is_pem_and_digest_bound() {
+        let (cert_a, key_a) =
+            tls_alpn01_cert_from_digest("mail.example.com", &[0x11u8; 32]).unwrap();
+        let (cert_b, _key_b) =
+            tls_alpn01_cert_from_digest("mail.example.com", &[0x22u8; 32]).unwrap();
+        assert!(cert_a.starts_with("-----BEGIN CERTIFICATE-----"));
+        assert!(key_a.contains("PRIVATE KEY"));
+        // The challenge cert is bound to the key-authorization digest — a different digest ⇒ a
+        // different cert (the acmeIdentifier extension differs).
+        assert_ne!(cert_a, cert_b, "the cert must incorporate the digest");
+    }
+
+    #[test]
+    fn dns01_solver_reports_its_type() {
+        struct NoopProvider;
+        #[async_trait]
+        impl DnsProvider for NoopProvider {
+            async fn upsert(&self, _r: &DnsRecord) -> Result<(), crate::dns::DnsError> {
+                Ok(())
+            }
+            async fn delete(&self, _r: &DnsRecord) -> Result<(), crate::dns::DnsError> {
+                Ok(())
+            }
+        }
+        let p = NoopProvider;
+        let solver = Dns01Solver::new(&p, 60);
+        assert_eq!(solver.challenge_type(), ChallengeType::Dns01);
+    }
 }
