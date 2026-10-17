@@ -426,3 +426,280 @@ async fn tcp_listener_tls_live_terminates_and_refuses_plaintext() {
         "TCP-LISTENER-TLS LIVE OK: host-TLS termination (implicit) + plaintext-client refusal"
     );
 }
+
+/// Like [`bind_and_serve_tls`] but STARTTLS (cap-req 06, Stage B): the EXACT accept-arm path for a
+/// `tls.starttls` listener — spawn the real [`boatramp_server::tcp_starttls`] pump on the raw socket
+/// (it interposes the plaintext dialog + upgrades in-band on the declared trigger) and dispatch the
+/// guest on the resulting duplex halves. No reimplementation: the live gate drives the production pump.
+async fn bind_and_serve_starttls(
+    runtime: HandlerRuntime,
+    deploy: DeployStore,
+    server_cfg: Arc<rustls::ServerConfig>,
+    grammar: boatramp_server::tcp_starttls::StarttlsGrammar,
+    idle: Duration,
+    max_dur: Duration,
+) -> (JoinHandle<Result<(), String>>, std::net::SocketAddr) {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let acceptor = tokio_rustls::TlsAcceptor::from(server_cfg);
+    let handle = tokio::spawn(async move {
+        let (stream, peer) = listener.accept().await.unwrap();
+        let _ = stream.set_nodelay(true);
+        let (g_read, g_write, pump) =
+            boatramp_server::tcp_starttls::spawn_pump(stream, acceptor, grammar);
+        let res = runtime
+            .dispatch_tcp_connection(
+                &deploy,
+                ProjectRef::DEFAULT.as_str(),
+                SITE,
+                COMPONENT,
+                &FunctionConfig::default(),
+                peer.to_string(),
+                g_read,
+                g_write,
+                idle,
+                max_dur,
+            )
+            .await;
+        pump.abort(); // guest returned ⇒ tear the pump + socket down (no-op if it already ended)
+        res
+    });
+    (handle, addr)
+}
+
+fn grammar(
+    trigger: &str,
+    response: &str,
+    tag_capture: bool,
+) -> boatramp_server::tcp_starttls::StarttlsGrammar {
+    boatramp_server::tcp_starttls::StarttlsGrammar {
+        trigger: trigger.to_string(),
+        response: response.to_string(),
+        tag_capture,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tcp_listener_starttls_live_upgrades_and_refuses_injection() {
+    use rustls::pki_types::ServerName;
+
+    // ---- (a) SMTP-shaped full upgrade + pre-upgrade plaintext proof ------------------------------
+    {
+        let (runtime, deploy) = live_runtime(TCP_ECHO, 20).await;
+        let (server_cfg, connector) = tls_fixtures();
+        let (handle, addr) = bind_and_serve_starttls(
+            runtime,
+            deploy,
+            server_cfg,
+            grammar("STARTTLS", "220 2.0.0 Ready to start TLS", false),
+            Duration::from_secs(5),
+            Duration::from_secs(30),
+        )
+        .await;
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let _ = client.set_nodelay(true);
+
+        // A non-trigger line is forwarded to the guest and echoed back over CLEARTEXT (proves the
+        // pre-upgrade dialog is genuine plaintext).
+        let hello = b"EHLO test\r\n";
+        client.write_all(hello).await.unwrap();
+        let mut echoed = vec![0u8; hello.len()];
+        tokio::time::timeout(Duration::from_secs(5), client.read_exact(&mut echoed))
+            .await
+            .expect("pre-upgrade plaintext echo timed out")
+            .expect("pre-upgrade plaintext echo failed");
+        assert_eq!(&echoed, hello, "the pre-upgrade dialog is plaintext");
+
+        // The trigger line: the host injects the declared response (NOT an echo — the guest never
+        // sees STARTTLS).
+        client.write_all(b"STARTTLS\r\n").await.unwrap();
+        let resp_expected = b"220 2.0.0 Ready to start TLS\r\n";
+        let mut resp = vec![0u8; resp_expected.len()];
+        tokio::time::timeout(Duration::from_secs(5), client.read_exact(&mut resp))
+            .await
+            .expect("STARTTLS response timed out")
+            .expect("STARTTLS response read failed");
+        assert_eq!(
+            &resp, resp_expected,
+            "the host injected the declared response; the guest never handled STARTTLS"
+        );
+
+        // Upgrade: the TLS handshake runs on the SAME socket the host now wraps.
+        let domain = ServerName::try_from("localhost").unwrap();
+        let mut tls = connector
+            .connect(domain, client)
+            .await
+            .expect("STARTTLS client handshake");
+
+        // The guest now serves over the decrypted stream — echo the post-TLS bytes.
+        let post = b"hello post-tls";
+        tls.write_all(post).await.unwrap();
+        let mut got = vec![0u8; post.len()];
+        tokio::time::timeout(Duration::from_secs(5), tls.read_exact(&mut got))
+            .await
+            .expect("post-TLS echo timed out")
+            .expect("post-TLS echo failed");
+        assert_eq!(&got, post, "the guest serves over the upgraded TLS stream");
+        tls.shutdown().await.ok();
+        let (res, _) = await_dispatch(handle, Duration::from_secs(5), "starttls-smtp").await;
+        assert!(res.is_ok(), "SMTP STARTTLS dispatch ends cleanly: {res:?}");
+    }
+
+    // ---- (a′) IMAP tag-capture upgrade — SAME engine, DIFFERENT config ---------------------------
+    {
+        let (runtime, deploy) = live_runtime(TCP_ECHO, 21).await;
+        let (server_cfg, connector) = tls_fixtures();
+        let (handle, addr) = bind_and_serve_starttls(
+            runtime,
+            deploy,
+            server_cfg,
+            grammar("STARTTLS", "{tag} OK begin TLS", true),
+            Duration::from_secs(5),
+            Duration::from_secs(30),
+        )
+        .await;
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let _ = client.set_nodelay(true);
+
+        let cap = b"a1 CAPABILITY\r\n";
+        client.write_all(cap).await.unwrap();
+        let mut echoed = vec![0u8; cap.len()];
+        tokio::time::timeout(Duration::from_secs(5), client.read_exact(&mut echoed))
+            .await
+            .expect("imap pre-upgrade echo timed out")
+            .expect("imap pre-upgrade echo failed");
+        assert_eq!(&echoed, cap);
+
+        client.write_all(b"a2 STARTTLS\r\n").await.unwrap();
+        let resp_expected = b"a2 OK begin TLS\r\n"; // {tag} -> a2 (verbatim)
+        let mut resp = vec![0u8; resp_expected.len()];
+        tokio::time::timeout(Duration::from_secs(5), client.read_exact(&mut resp))
+            .await
+            .expect("imap STARTTLS response timed out")
+            .expect("imap STARTTLS response read failed");
+        assert_eq!(
+            &resp, resp_expected,
+            "the captured tag is echoed verbatim into the response — one generic engine, two configs"
+        );
+
+        let domain = ServerName::try_from("localhost").unwrap();
+        let mut tls = connector
+            .connect(domain, client)
+            .await
+            .expect("imap STARTTLS client handshake");
+        let post = b"done";
+        tls.write_all(post).await.unwrap();
+        let mut got = vec![0u8; post.len()];
+        tokio::time::timeout(Duration::from_secs(5), tls.read_exact(&mut got))
+            .await
+            .expect("imap post-TLS echo timed out")
+            .expect("imap post-TLS echo failed");
+        assert_eq!(&got, post);
+        tls.shutdown().await.ok();
+        let (res, _) = await_dispatch(handle, Duration::from_secs(5), "starttls-imap").await;
+        assert!(res.is_ok(), "IMAP STARTTLS dispatch ends cleanly: {res:?}");
+    }
+
+    // ---- (c) Injection safety (RFC 3207 §4 / CVE-2011-0411 class) ---------------------------------
+    {
+        let (runtime, deploy) = live_runtime(TCP_ECHO, 22).await;
+        let (server_cfg, _connector) = tls_fixtures();
+        let (handle, addr) = bind_and_serve_starttls(
+            runtime,
+            deploy,
+            server_cfg,
+            grammar("STARTTLS", "220 Ready", false),
+            Duration::from_secs(5),
+            Duration::from_secs(30),
+        )
+        .await;
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let _ = client.set_nodelay(true);
+
+        // Pipeline the trigger AND an injected command in ONE segment. A vulnerable server would
+        // buffer the post-trigger bytes and replay them as a post-TLS command.
+        client
+            .write_all(b"STARTTLS\r\nINJECTED-CMD please-run\r\n")
+            .await
+            .unwrap();
+
+        // The host-injected response arrives first (written before the handshake begins).
+        let resp_expected = b"220 Ready\r\n";
+        let mut resp = vec![0u8; resp_expected.len()];
+        tokio::time::timeout(Duration::from_secs(5), client.read_exact(&mut resp))
+            .await
+            .expect("injection-case response timed out")
+            .expect("injection-case response read failed");
+        assert_eq!(&resp, resp_expected);
+
+        // The host then feeds the socket (now holding `INJECTED-CMD…`) to the TLS layer, which reads
+        // it as a malformed ClientHello and fails the handshake. Whatever the client reads next is a
+        // TLS alert or EOF — and must NEVER contain the injected bytes (the guest never saw them;
+        // there is no post-TLS channel in which they could run).
+        let mut total = Vec::new();
+        let mut buf = [0u8; 256];
+        loop {
+            match tokio::time::timeout(Duration::from_secs(1), client.read(&mut buf)).await {
+                Ok(Ok(0)) | Err(_) => break, // EOF or quiet
+                Ok(Ok(n)) => total.extend_from_slice(&buf[..n]),
+                Ok(Err(_)) => break, // reset
+            }
+            if total.len() > 4096 {
+                break;
+            }
+        }
+        assert!(
+            !total.windows(b"INJECTED".len()).any(|w| w == b"INJECTED"),
+            "a byte pipelined after the trigger must NEVER cross the TLS boundary or be echoed/run"
+        );
+
+        // The failed handshake drops the pump → closes the duplex → the guest reads EOF → ends cleanly.
+        let (res, _) = await_dispatch(handle, Duration::from_secs(5), "starttls-injection").await;
+        assert!(
+            res.is_ok(),
+            "guest ends cleanly on EOF after a refused upgrade: {res:?}"
+        );
+    }
+
+    // ---- (d) Connect, speak, but never send the trigger ⇒ idle teardown --------------------------
+    {
+        let (runtime, deploy) = live_runtime(TCP_ECHO, 23).await;
+        let (server_cfg, _connector) = tls_fixtures();
+        let (handle, addr) = bind_and_serve_starttls(
+            runtime,
+            deploy,
+            server_cfg,
+            grammar("STARTTLS", "220 ok", false),
+            Duration::from_millis(500),
+            Duration::from_secs(30),
+        )
+        .await;
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let _ = client.set_nodelay(true);
+        // Speak one non-trigger line (echoed), then go silent — never send STARTTLS.
+        let line = b"EHLO x\r\n";
+        client.write_all(line).await.unwrap();
+        let mut echoed = vec![0u8; line.len()];
+        tokio::time::timeout(Duration::from_secs(5), client.read_exact(&mut echoed))
+            .await
+            .expect("pre-trigger echo timed out")
+            .expect("pre-trigger echo failed");
+        assert_eq!(&echoed, line);
+        // Silent now. The conn-lane idle watchdog (on the duplex) must tear the connection down.
+        let (res, elapsed) = await_dispatch(handle, Duration::from_secs(5), "starttls-idle").await;
+        assert!(
+            res.is_ok(),
+            "idle teardown of a pre-trigger connection: {res:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(4),
+            "idle teardown took {elapsed:?} — the watchdog must bound a STARTTLS connection stuck \
+             before the trigger"
+        );
+    }
+
+    println!(
+        "TCP-LISTENER-STARTTLS LIVE OK: smtp upgrade, imap tag-capture upgrade, pre-upgrade \
+         plaintext, injection refused, pre-trigger idle teardown — all held end to end."
+    );
+}

@@ -55,6 +55,13 @@ pub struct ListenerParams {
     /// (unchanged). The orchestrator (which holds `rustls`) builds the config from the sealed cert
     /// material; the private key lives only inside it and never reaches the guest.
     pub tls: Option<Arc<rustls::ServerConfig>>,
+    /// Declarative STARTTLS (cap-req 06, Stage B). `Some` ⇒ the connection starts in **plaintext**,
+    /// the host forwards the guest's dialog, and on the declared trigger line it upgrades the socket
+    /// to TLS in-band (requires `tls` to be `Some` — the same cert material). `None` ⇒ implicit TLS
+    /// (when `tls` is `Some`) or plaintext (when `tls` is `None`), unchanged. The grammar is the only
+    /// protocol-specific data; the host runs a generic trigger→response→wrap engine
+    /// ([`crate::tcp_starttls`]).
+    pub starttls: Option<crate::tcp_starttls::StarttlsGrammar>,
 }
 
 /// Spawn the accept loop for one listener, detached. Returns immediately; the loop runs until the
@@ -79,6 +86,7 @@ async fn run_listener(runtime: HandlerRuntime, deploy: DeployStore, params: List
         idle_timeout,
         max_conn_duration,
         tls,
+        starttls,
     } = params;
 
     let listener = match TcpListener::bind(bind).await {
@@ -142,16 +150,18 @@ async fn run_listener(runtime: HandlerRuntime, deploy: DeployStore, params: List
                 let fn_config = Arc::clone(&fn_config);
                 // Cheap clone (an `Arc<ServerConfig>` inside); `None` ⇒ the plaintext listener.
                 let tls = tls.clone();
+                // Declarative STARTTLS grammar (cap-req 06, Stage B); `None` ⇒ implicit TLS / plaintext.
+                let starttls = starttls.clone();
                 tokio::spawn(async move {
                     // Hold the per-listener permit for the connection's whole life.
                     let _permit = permit;
                     let peer = peer.to_string();
-                    match tls {
+                    match (tls, starttls) {
                         // Host-side TLS termination (cap-req 06, implicit TLS): complete the
                         // handshake BEFORE the guest sees any bytes, then hand the guest the
                         // DECRYPTED halves. A failed handshake drops the connection — there is NO
                         // plaintext fallthrough, and the cert key never reaches the guest.
-                        Some(acceptor) => match acceptor.accept(stream).await {
+                        (Some(acceptor), None) => match acceptor.accept(stream).await {
                             Ok(tls_stream) => {
                                 let (read_half, write_half) = tokio::io::split(tls_stream);
                                 drive(
@@ -166,7 +176,30 @@ async fn run_listener(runtime: HandlerRuntime, deploy: DeployStore, params: List
                                 "inbound-TLS handshake failed; dropping connection"
                             ),
                         },
-                        None => {
+                        // STARTTLS (cap-req 06, Stage B): the guest runs on an in-memory duplex while
+                        // the pump owns the socket — forwarding the plaintext dialog, upgrading to TLS
+                        // in-band on the declared trigger (the guest never sees the trigger and does no
+                        // crypto), then passing decrypted bytes through. A failed handshake drops the
+                        // pump, which closes the duplex → the guest reads EOF (no plaintext fallthrough).
+                        (Some(acceptor), Some(grammar)) => {
+                            let (g_read, g_write, pump) =
+                                crate::tcp_starttls::spawn_pump(stream, acceptor, grammar);
+                            drive(
+                                &runtime, &deploy, &name, project.as_str(), site.as_str(),
+                                component.as_str(), &fn_config, peer, g_read, g_write,
+                                idle_timeout, max_conn_duration,
+                            )
+                            .await;
+                            // Guest returned (completed / idle / max-duration) ⇒ tear the pump + socket
+                            // down. If the pump already ended (client gone / handshake failed) this is a
+                            // no-op.
+                            pump.abort();
+                        }
+                        // Plaintext listener — unchanged. A STARTTLS grammar without a cert is refused
+                        // at config validation, so `(None, Some(_))` cannot occur in practice; it is
+                        // handled here as a plaintext connection (fail-safe — never an unterminated
+                        // "STARTTLS" that silently stays cleartext).
+                        (None, _) => {
                             let (read_half, write_half) = stream.into_split();
                             drive(
                                 &runtime, &deploy, &name, project.as_str(), site.as_str(),

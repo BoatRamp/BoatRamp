@@ -515,17 +515,48 @@ impl ServerConfig {
                     " — omit it for the default",
                 );
             }
-            // Host-side per-listener TLS termination (cap-req 06): a declared `tls` block is now
-            // honored (implicit TLS — 465/993), but it MUST name both a cert and a key (the host
-            // loads them + terminates TLS, handing the guest a decrypted plaintext stream). STARTTLS
-            // is a separate follow-up; implicit TLS is what this validates.
-            if let Some(tls) = &l.tls
-                && (tls.cert_file.is_none() || tls.key_file.is_none())
-            {
-                return err(
-                    "listener `tls` requires both `cert_file` and `key_file`",
-                    " — set cert_file/key_file (PEM), or remove the `tls` block for a plaintext listener",
-                );
+            // Host-side per-listener TLS termination (cap-req 06): a declared `tls` block is honored,
+            // but it MUST name both a cert and a key (the host loads them + terminates TLS, handing the
+            // guest a decrypted plaintext stream). This holds for BOTH implicit TLS (465/993) and
+            // STARTTLS (25/587/143) — STARTTLS still terminates TLS after the in-band upgrade.
+            if let Some(tls) = &l.tls {
+                if tls.cert_file.is_none() || tls.key_file.is_none() {
+                    return err(
+                        "listener `tls` requires both `cert_file` and `key_file`",
+                        " — set cert_file/key_file (PEM), or remove the `tls` block for a plaintext listener",
+                    );
+                }
+                // Declarative STARTTLS grammar (cap-req 06, Stage B): the one piece of protocol data.
+                if let Some(st) = &tls.starttls {
+                    if st.trigger.trim().is_empty() {
+                        return err(
+                            "listener `tls.starttls.trigger` must be non-empty",
+                            " — e.g. trigger = \"STARTTLS\" (SMTP/IMAP) or \"STLS\" (POP3)",
+                        );
+                    }
+                    if st.response.trim().is_empty() {
+                        return err(
+                            "listener `tls.starttls.response` must be non-empty",
+                            " — the line the host sends before upgrading, e.g. \"220 Ready to start TLS\"",
+                        );
+                    }
+                    // `{tag}` in the response is only meaningful when a tag is captured — otherwise the
+                    // literal `{tag}` would leak to the wire.
+                    if st.response.contains("{tag}") && !st.tag_capture {
+                        return err(
+                            "listener `tls.starttls.response` uses `{tag}` but `tag_capture` is false",
+                            " — set tag_capture = true (IMAP-style), or remove the {tag} placeholder",
+                        );
+                    }
+                    // trigger/response are matched against / written as a single line — refuse embedded
+                    // CR/LF (which would split the line and could inject a second response line).
+                    if st.trigger.contains(['\r', '\n']) || st.response.contains(['\r', '\n']) {
+                        return err(
+                            "listener `tls.starttls` trigger/response must not contain CR or LF",
+                            " — they are a single line; the host appends CRLF to the response",
+                        );
+                    }
+                }
             }
             if !l.egress_allowlist.is_empty() {
                 return err(
@@ -2198,8 +2229,11 @@ pub struct ListenerConfig {
     pub max_conn_duration_ms: Option<u64>,
 }
 
-/// DEFERRED (Phase 1): per-listener host-TLS material. Present in the schema for forward parity, but a
-/// declared `tls` block is REFUSED at config load in Phase 1 (plaintext-only) — see [`ListenerConfig`].
+/// Per-listener host-side TLS material (cap-req 06). The host terminates TLS and hands the guest a
+/// decrypted plaintext stream (the guest does no crypto). With `starttls` absent this is **implicit
+/// TLS** (handshake at accept — 465/993); with `starttls` present it is **STARTTLS** (plaintext
+/// dialog, in-band upgrade on the declared trigger — 25/587/143). Either way requires both
+/// `cert_file` and `key_file`. File-only (never set from the env overlay).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ListenerTlsConfig {
@@ -2207,6 +2241,31 @@ pub struct ListenerTlsConfig {
     pub cert_file: Option<PathBuf>,
     /// PEM private-key path.
     pub key_file: Option<PathBuf>,
+    /// Absent ⇒ implicit TLS (handshake at accept). Present ⇒ STARTTLS (plaintext until the declared
+    /// trigger, then an in-band upgrade). Still requires `cert_file` + `key_file`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub starttls: Option<ListenerStarttlsConfig>,
+}
+
+/// Declarative STARTTLS grammar (cap-req 06, Stage B) — protocol-agnostic **data**. The host runs a
+/// generic trigger→response→wrap engine driven entirely by these fields; no SMTP/IMAP/POP3 shapes are
+/// hardcoded in the server. Examples:
+/// SMTP — `(trigger: "STARTTLS", response: "220 2.0.0 Ready to start TLS")`;
+/// POP3 — `(trigger: "STLS", response: "+OK begin TLS negotiation")`;
+/// IMAP — `(trigger: "STARTTLS", response: "{tag} OK begin TLS negotiation", tag_capture: true)`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ListenerStarttlsConfig {
+    /// The command the host watches for in the client→server direction, matched at a line boundary,
+    /// ASCII-case-insensitively. With `tag_capture` this is the token AFTER the leading tag.
+    pub trigger: String,
+    /// The single line the host writes to the client right before the handshake. `{tag}` is
+    /// substituted with the captured tag (only valid when `tag_capture`); the host appends CRLF.
+    pub response: String,
+    /// IMAP-shaped: capture the leading whitespace-delimited token of the trigger line and echo it
+    /// (verbatim) into `{tag}`.
+    #[serde(default)]
+    pub tag_capture: bool,
 }
 
 /// Default per-listener live-connection cap when `[serve.listeners.<name>] max_conns` is unset
@@ -4049,6 +4108,43 @@ mod tests {
             r#"( serve: ( listeners: { "l": ( bind: "0.0.0.0:9000", component: "c.wasm", project: "p", site: "s", tls: ( cert_file: "x.pem", key_file: "y.pem" ) ) } ) )"#,
         )
         .expect("a TLS listener with cert_file + key_file is valid");
+        // (f) a well-formed STARTTLS listener (cert + key + grammar) PARSES (cap-req 06, Stage B) —
+        //     SMTP-shaped and IMAP tag-capture-shaped.
+        ServerConfig::parse(
+            r#"( serve: ( listeners: { "l": ( bind: "0.0.0.0:587", component: "c.wasm", project: "p", site: "s", tls: ( cert_file: "x.pem", key_file: "y.pem", starttls: ( trigger: "STARTTLS", response: "220 2.0.0 Ready to start TLS" ) ) ) } ) )"#,
+        )
+        .expect("a well-formed SMTP STARTTLS listener is valid");
+        ServerConfig::parse(
+            r#"( serve: ( listeners: { "l": ( bind: "0.0.0.0:143", component: "c.wasm", project: "p", site: "s", tls: ( cert_file: "x.pem", key_file: "y.pem", starttls: ( trigger: "STARTTLS", response: "{tag} OK begin TLS", tag_capture: true ) ) ) } ) )"#,
+        )
+        .expect("a well-formed IMAP tag-capture STARTTLS listener is valid");
+        // (g) `{tag}` in the response without tag_capture is refused (the literal would leak to the wire).
+        let err = ServerConfig::parse(
+            r#"( serve: ( listeners: { "l": ( bind: "0.0.0.0:587", component: "c.wasm", project: "p", site: "s", tls: ( cert_file: "x.pem", key_file: "y.pem", starttls: ( trigger: "STARTTLS", response: "{tag} OK" ) ) ) } ) )"#,
+        )
+        .expect_err("`{tag}` without tag_capture must be refused");
+        assert!(
+            matches!(err, ConfigError::InvalidListener { .. }),
+            "{err:?}"
+        );
+        // (h) an empty trigger is refused.
+        let err = ServerConfig::parse(
+            r#"( serve: ( listeners: { "l": ( bind: "0.0.0.0:587", component: "c.wasm", project: "p", site: "s", tls: ( cert_file: "x.pem", key_file: "y.pem", starttls: ( trigger: "", response: "220 ok" ) ) ) } ) )"#,
+        )
+        .expect_err("an empty STARTTLS trigger must be refused");
+        assert!(
+            matches!(err, ConfigError::InvalidListener { .. }),
+            "{err:?}"
+        );
+        // (i) a STARTTLS grammar WITHOUT cert/key is refused (STARTTLS still terminates TLS).
+        let err = ServerConfig::parse(
+            r#"( serve: ( listeners: { "l": ( bind: "0.0.0.0:587", component: "c.wasm", project: "p", site: "s", tls: ( starttls: ( trigger: "STARTTLS", response: "220 ok" ) ) ) } ) )"#,
+        )
+        .expect_err("a STARTTLS grammar without cert/key must be refused");
+        assert!(
+            matches!(err, ConfigError::InvalidListener { .. }),
+            "{err:?}"
+        );
     }
 
     #[test]

@@ -307,6 +307,13 @@ mod stream;
 /// orchestration layer (`boatramp::serve::spawn_listeners`) can spawn one per `[serve.listeners.<name>]`.
 #[cfg(feature = "tcp-listener")]
 pub mod tcp_listener_serve;
+/// Declarative, protocol-agnostic STARTTLS for inbound guest listeners (cap-req 06, Stage B): the
+/// host-side pump that interposes the plaintext dialog, upgrades on a config-declared trigger, and
+/// passes decrypted bytes through — with no guest/WIT change. Gated like `tcp_listener_serve` (rustls
+/// / tokio-rustls are unconditional deps); the orchestrator only *builds* a grammar under its own
+/// `tls` feature.
+#[cfg(feature = "tcp-listener")]
+pub mod tcp_starttls;
 #[cfg(feature = "handlers")]
 mod workflow;
 pub use auth::{Auth, require_auth};
