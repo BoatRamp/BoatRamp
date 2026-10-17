@@ -1057,7 +1057,7 @@ impl HandlerRuntime {
     /// runtime (a node with no wasm engine — it would never have spawned a listener).
     #[cfg(all(feature = "handlers", feature = "tcp-listener"))]
     #[allow(clippy::too_many_arguments)]
-    pub async fn dispatch_tcp_connection(
+    pub async fn dispatch_tcp_connection<R, W>(
         &self,
         deploy: &boatramp_core::deploy::DeployStore,
         project: &str,
@@ -1065,11 +1065,20 @@ impl HandlerRuntime {
         component: &str,
         fn_config: &boatramp_core::function::FunctionConfig,
         peer: String,
-        read_half: tokio::net::tcp::OwnedReadHalf,
-        write_half: tokio::net::tcp::OwnedWriteHalf,
+        // Generic over the stream halves (cap-req 06) so BOTH a plaintext socket
+        // (`OwnedReadHalf`/`OwnedWriteHalf`) AND a host-terminated TLS stream's split halves
+        // (`ReadHalf`/`WriteHalf` of a `tokio_rustls::server::TlsStream`) flow through unchanged —
+        // the engine's `dispatch_tcp_connection` is already generic over `AsyncRead`/`AsyncWrite`,
+        // so TLS termination is transparent below here (the guest always sees decrypted bytes).
+        read_half: R,
+        write_half: W,
         idle_timeout: std::time::Duration,
         max_conn_duration: std::time::Duration,
-    ) -> Result<(), String> {
+    ) -> Result<(), String>
+    where
+        R: tokio::io::AsyncRead + Send + Unpin + 'static,
+        W: tokio::io::AsyncWrite + Send + Unpin + 'static,
+    {
         let Some(inner) = self.inner.as_ref() else {
             return Err("handler runtime disabled (no wasm engine on this node)".into());
         };

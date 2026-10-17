@@ -14,6 +14,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 
@@ -47,6 +48,13 @@ pub struct ListenerParams {
     pub idle_timeout: Duration,
     /// Absolute cap on a single connection's lifetime regardless of activity.
     pub max_conn_duration: Duration,
+    /// Host-side TLS termination (cap-req 06). `Some` ⇒ every accepted connection is wrapped in a
+    /// `TlsAcceptor` built from this `ServerConfig` BEFORE the guest sees it, so the guest gets a
+    /// plaintext stream over the decrypted connection (implicit TLS — 465/993). A failed handshake
+    /// drops the connection; there is NO plaintext fallthrough. `None` ⇒ the plaintext listener
+    /// (unchanged). The orchestrator (which holds `rustls`) builds the config from the sealed cert
+    /// material; the private key lives only inside it and never reaches the guest.
+    pub tls: Option<Arc<rustls::ServerConfig>>,
 }
 
 /// Spawn the accept loop for one listener, detached. Returns immediately; the loop runs until the
@@ -70,6 +78,7 @@ async fn run_listener(runtime: HandlerRuntime, deploy: DeployStore, params: List
         max_conns,
         idle_timeout,
         max_conn_duration,
+        tls,
     } = params;
 
     let listener = match TcpListener::bind(bind).await {
@@ -86,6 +95,10 @@ async fn run_listener(runtime: HandlerRuntime, deploy: DeployStore, params: List
         listener = %name, %bind, %project, %site, component = %component, max_conns,
         "serving host-owned inbound-TCP listener (PLAN-handler-tcp-inbound)"
     );
+
+    // Build the TLS acceptor once (cap-req 06); `None` ⇒ a plaintext listener. `TlsAcceptor` is a
+    // cheap `Arc` clone per connection.
+    let tls = tls.map(tokio_rustls::TlsAcceptor::from);
 
     // Per-listener live-connection cap: a live connection holds one permit for its whole life; at the
     // ceiling a new connection is dropped (fail-closed backpressure) rather than unboundedly spawned.
@@ -120,7 +133,6 @@ async fn run_listener(runtime: HandlerRuntime, deploy: DeployStore, params: List
                     drop(stream);
                     continue;
                 };
-                let (read_half, write_half) = stream.into_split();
                 let runtime = runtime.clone();
                 let deploy = deploy.clone();
                 let name = name.clone();
@@ -128,26 +140,41 @@ async fn run_listener(runtime: HandlerRuntime, deploy: DeployStore, params: List
                 let site = Arc::clone(&site);
                 let component = Arc::clone(&component);
                 let fn_config = Arc::clone(&fn_config);
+                // Cheap clone (an `Arc<ServerConfig>` inside); `None` ⇒ the plaintext listener.
+                let tls = tls.clone();
                 tokio::spawn(async move {
                     // Hold the per-listener permit for the connection's whole life.
                     let _permit = permit;
                     let peer = peer.to_string();
-                    if let Err(e) = runtime
-                        .dispatch_tcp_connection(
-                            &deploy,
-                            project.as_str(),
-                            site.as_str(),
-                            component.as_str(),
-                            &fn_config,
-                            peer.clone(),
-                            read_half,
-                            write_half,
-                            idle_timeout,
-                            max_conn_duration,
-                        )
-                        .await
-                    {
-                        tracing::warn!(listener = %name, %peer, error = %e, "inbound-TCP connection dispatch failed");
+                    match tls {
+                        // Host-side TLS termination (cap-req 06, implicit TLS): complete the
+                        // handshake BEFORE the guest sees any bytes, then hand the guest the
+                        // DECRYPTED halves. A failed handshake drops the connection — there is NO
+                        // plaintext fallthrough, and the cert key never reaches the guest.
+                        Some(acceptor) => match acceptor.accept(stream).await {
+                            Ok(tls_stream) => {
+                                let (read_half, write_half) = tokio::io::split(tls_stream);
+                                drive(
+                                    &runtime, &deploy, &name, project.as_str(), site.as_str(),
+                                    component.as_str(), &fn_config, peer, read_half, write_half,
+                                    idle_timeout, max_conn_duration,
+                                )
+                                .await;
+                            }
+                            Err(e) => tracing::warn!(
+                                listener = %name, %peer, error = %e,
+                                "inbound-TLS handshake failed; dropping connection"
+                            ),
+                        },
+                        None => {
+                            let (read_half, write_half) = stream.into_split();
+                            drive(
+                                &runtime, &deploy, &name, project.as_str(), site.as_str(),
+                                component.as_str(), &fn_config, peer, read_half, write_half,
+                                idle_timeout, max_conn_duration,
+                            )
+                            .await;
+                        }
                     }
                 });
             }
@@ -166,4 +193,45 @@ async fn run_listener(runtime: HandlerRuntime, deploy: DeployStore, params: List
         conn_gate.acquire_many(max_conns as u32),
     )
     .await;
+}
+
+/// Dispatch one accepted connection (plaintext socket halves OR a host-terminated TLS stream's
+/// split halves — `dispatch_tcp_connection` is generic over `AsyncRead`/`AsyncWrite`). The shared
+/// tail of the plaintext + TLS accept arms, so the only difference between them is how `(read, write)`
+/// is produced. Logs a dispatch failure (never a hard error — the accept loop keeps serving).
+#[allow(clippy::too_many_arguments)]
+async fn drive<R, W>(
+    runtime: &HandlerRuntime,
+    deploy: &DeployStore,
+    name: &str,
+    project: &str,
+    site: &str,
+    component: &str,
+    fn_config: &boatramp_core::function::FunctionConfig,
+    peer: String,
+    read_half: R,
+    write_half: W,
+    idle_timeout: Duration,
+    max_conn_duration: Duration,
+) where
+    R: AsyncRead + Send + Unpin + 'static,
+    W: AsyncWrite + Send + Unpin + 'static,
+{
+    if let Err(e) = runtime
+        .dispatch_tcp_connection(
+            deploy,
+            project,
+            site,
+            component,
+            fn_config,
+            peer.clone(),
+            read_half,
+            write_half,
+            idle_timeout,
+            max_conn_duration,
+        )
+        .await
+    {
+        tracing::warn!(listener = %name, %peer, error = %e, "inbound-TCP connection dispatch failed");
+    }
 }

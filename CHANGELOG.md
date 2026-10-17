@@ -53,6 +53,16 @@ inert until configured — a node that enables neither behaves exactly as before
   Absent the header, responses are byte-for-byte unchanged (small/generated bodies still buffer). No
   WIT/shim change (a guest library sets the header; the host does the swap).
 
+- **Host-side TLS termination for inbound guest listeners (implicit TLS).** A `[serve.listeners.<name>]`
+  may now declare a `tls` block (`cert_file` + `key_file`); the host completes the TLS handshake at
+  accept and hands the `tcp-connection-host` guest a **decrypted plaintext** stream — so a guest can
+  serve a TLS-mandatory protocol (e.g. SMTPS/IMAPS on 465/993) while staying TLS-free (no in-wasm
+  crypto). The private key lives only in the host's rustls config, never reaching the guest; a failed
+  handshake drops the connection (no plaintext fallthrough); a TLS-declared listener on a build without
+  the `tls` feature, or with an unloadable cert, is not bound (fail-closed). Reuses the HTTP edge's
+  rustls stack + conn-lane hardening. STARTTLS (in-band upgrade on 25/587/143) is a follow-up. No
+  guest/WIT change.
+
 - **Optional swap-in `-debug` container images.** The Release GHCR step now also builds + pushes
   `…:<tag>-debug` (+ `:debug`) variants of the base and cloudflare images, bundling a shell +
   `strace`/`ltrace`/`procps`/`lsof`/`busybox`/`coreutils` for incident debugging. Additive — the lean

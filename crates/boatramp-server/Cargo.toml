@@ -418,6 +418,10 @@ chrono = { version = "0.4", default-features = false, features = [
 
 [dev-dependencies]
 boatramp-core = { workspace = true }
+# Self-signed cert minting for the per-listener host-TLS live gate (cap-req 06):
+# `tcp_listener_tls_live` builds a `rustls::ServerConfig` from an rcgen cert + a
+# `tokio_rustls` client to prove the handshake terminates host-side.
+rcgen = "0.13"
 # Property-based fuzzing of the splice fast-path's hand-written HTTP/1 head parsers
 # (crates/boatramp-server/src/splice.rs): arbitrary bytes must never panic, and the
 # Content-Length + Transfer-Encoding desync case must never classify as splice-able.

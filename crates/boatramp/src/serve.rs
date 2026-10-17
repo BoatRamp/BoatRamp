@@ -2632,6 +2632,54 @@ fn spawn_listeners(
         // `bind` is validated non-None + the Phase-1-unsupported fields refused at config load
         // (`validate_listeners`), so a listener that reaches here is well-formed.
         let Some(bind) = l.bind else { continue };
+        // Host-side TLS termination for this listener (cap-req 06): build the rustls config from the
+        // listener's own cert material. A declared-TLS listener that can't be set up — a bad/missing
+        // cert, or a build without the `tls` feature — is NOT bound (fail-closed; never served
+        // plaintext). The key lives only inside the config, never reaching the guest.
+        #[cfg(feature = "tls")]
+        let tls_config = if let Some(t) = &l.tls {
+            let build = || -> Result<std::sync::Arc<rustls::ServerConfig>> {
+                let cert = t
+                    .cert_file
+                    .as_ref()
+                    .ok_or_else(|| Error::NoCert("<listener tls: cert_file unset>".into()))?;
+                let key = t
+                    .key_file
+                    .as_ref()
+                    .ok_or_else(|| Error::NoPrivateKey("<listener tls: key_file unset>".into()))?;
+                install_crypto_provider();
+                let (certs, private_key) = load_cert_chain_and_key(cert, key)?;
+                // One listener = one cert; no ALPN (mail implicit-TLS has none), no client auth.
+                let cfg = rustls::ServerConfig::builder()
+                    .with_no_client_auth()
+                    .with_single_cert(certs, private_key)?;
+                Ok(std::sync::Arc::new(cfg))
+            };
+            match build() {
+                Ok(cfg) => Some(cfg),
+                Err(e) => {
+                    tracing::error!(
+                        listener = %name, error = %e,
+                        "inbound-TLS listener setup failed; NOT binding it (serving continues)"
+                    );
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+        // No `tls` feature in this build: a plaintext listener binds as before; a TLS-declared one
+        // is refused (fail-closed). `None` type-infers to the field's `Option<Arc<ServerConfig>>`.
+        #[cfg(not(feature = "tls"))]
+        let tls_config = if l.tls.is_some() {
+            tracing::error!(
+                listener = %name,
+                "listener declares TLS but this build lacks the `tls` feature; NOT binding it"
+            );
+            continue;
+        } else {
+            None
+        };
         let fn_config = boatramp_core::function::FunctionConfig {
             imports: l.imports.clone(),
             env: l.env.clone(),
@@ -2659,6 +2707,7 @@ fn spawn_listeners(
                 l.max_conn_duration_ms
                     .unwrap_or(boatramp_node::config::DEFAULT_LISTENER_MAX_CONN_DURATION_MS),
             ),
+            tls: tls_config,
         };
         boatramp_server::tcp_listener_serve::spawn_listener(
             handlers.clone(),
