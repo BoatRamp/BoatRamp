@@ -1,0 +1,450 @@
+//! Cold-start cap-req 10 — zero-copy blob-ref handler responses.
+//!
+//! A wasm HTTP handler serving a large STORED object (JMAP blob download, CalDAV GET, a mail
+//! attachment) would otherwise read the object into the guest and write it back out in 4 KiB
+//! `blocking-write-and-flush` chunks (the WASI 0.2 ceiling) — a throughput wall. Instead a
+//! handler opts in by returning an EMPTY body plus the header
+//! `x-boatramp-blob-ref: <container>/<key>` (its status + content-type set normally); the host
+//! then streams that object STRAIGHT from the guest's own blob backend — `sendfile` on a local
+//! backend over a plaintext connection, an mmap'd slice on TLS, or a host-side stream on a
+//! remote backend — so the bytes never traverse the guest.
+//!
+//! Security: the referenced object is resolved through the guest's EXACT `wasi:blobstore`
+//! confinement ([`BlobBinding::resolve_blob_ref`]) — the host-stamped `hblob/{project-qualified
+//! -site}/` prefix, the `blobstore_containers` allowlist / `{tenant}` / multi-tenant deny, and
+//! the object-key traversal screen — so a traversal / cross-site / cross-tenant ref is
+//! structurally impossible. The blob-ref grants NO new authority: it is only a faster transport
+//! to bytes the guest's own `wasi:blobstore` get could already read.
+
+use axum::body::Body;
+use axum::http::response::Parts;
+use axum::http::{HeaderValue, StatusCode, header};
+use axum::response::{IntoResponse, Response};
+use boatramp_core::{Storage, StorageError};
+use boatramp_handlers::{BlobBinding, BlobRefDenied};
+use std::sync::Arc;
+
+/// The response header a handler sets to request a zero-copy blob-ref body. Value:
+/// `<container>/<key>` (the key may contain `/`). Removed before the response leaves the host.
+pub(crate) const BLOB_REF_HEADER: &str = "x-boatramp-blob-ref";
+
+/// A single parsed HTTP byte range (single-range only, like the blob-shim).
+enum RangeSpec {
+    From(u64),
+    FromTo(u64, u64),
+    Suffix(u64),
+}
+
+fn parse_range(value: &str) -> Option<RangeSpec> {
+    let spec = value.trim().strip_prefix("bytes=")?;
+    if spec.contains(',') {
+        return None; // single range only
+    }
+    let (start, end) = spec.split_once('-')?;
+    match (start.trim(), end.trim()) {
+        ("", "") => None,
+        ("", suffix) => Some(RangeSpec::Suffix(suffix.parse().ok()?)),
+        (start, "") => Some(RangeSpec::From(start.parse().ok()?)),
+        (start, end) => {
+            let (s, e): (u64, u64) = (start.parse().ok()?, end.parse().ok()?);
+            (s <= e).then_some(RangeSpec::FromTo(s, e))
+        }
+    }
+}
+
+/// Resolve a range against a known total size → `(offset, len)`, or `None` when unsatisfiable.
+fn resolve_range(spec: &RangeSpec, total: u64) -> Option<(u64, u64)> {
+    match *spec {
+        RangeSpec::From(s) if s < total => Some((s, total - s)),
+        RangeSpec::FromTo(s, e) if s < total => Some((s, e.min(total - 1) - s + 1)),
+        RangeSpec::Suffix(n) if n > 0 => {
+            let n = n.min(total);
+            Some((total - n, n))
+        }
+        _ => None,
+    }
+}
+
+/// A coarse, backend-detail-free refusal (mirrors the blob-shim's discipline — never leak the
+/// key or backend metadata to the guest's client).
+fn deny(status: StatusCode, msg: &'static str) -> Response {
+    (status, format!("{msg}\n")).into_response()
+}
+
+/// Swap an (empty-bodied) guest response carrying the blob-ref header for a host-streamed /
+/// sendfile body read from the guest's OWN confined blob scope. `parts` is the guest's response
+/// head (status + headers, the magic header already removed). Returns the final response, or a
+/// fail-closed refusal (403 no-grant / not-permitted, 400 bad ref/key, 404 missing, 416 bad
+/// range, 502 backend fault). `scope == None` ⇒ the handler emitted a ref without a
+/// `wasi:blobstore` grant → 403.
+pub(crate) async fn apply_blob_ref(
+    reference: &HeaderValue,
+    scope: Option<&BlobBinding>,
+    plaintext: bool,
+    req_range: Option<&str>,
+    is_head: bool,
+    parts: Parts,
+) -> Response {
+    let Some(scope) = scope else {
+        tracing::warn!(target: "boatramp::handler", "blob-ref response but the handler holds no wasi:blobstore grant");
+        return deny(StatusCode::FORBIDDEN, "blob-ref: no blobstore grant");
+    };
+    let Ok(reference) = reference.to_str() else {
+        return deny(StatusCode::BAD_REQUEST, "blob-ref: non-ascii reference");
+    };
+    // `<container>/<key>` — the key keeps embedded slashes (matches the shim's `/{container}/{*key}`).
+    let Some((container, object)) = reference.split_once('/') else {
+        return deny(
+            StatusCode::BAD_REQUEST,
+            "blob-ref: expected <container>/<key>",
+        );
+    };
+    if object.is_empty() {
+        return deny(StatusCode::BAD_REQUEST, "blob-ref: empty key");
+    }
+    // THE CONFINEMENT GATE: resolve through the guest's exact wasi:blobstore composition.
+    let (storage, skey) = match scope.resolve_blob_ref(container, object) {
+        Ok(resolved) => resolved,
+        Err(BlobRefDenied::NotPermitted(reason)) => {
+            tracing::warn!(target: "boatramp::handler", %reason, "blob-ref: container not permitted");
+            return deny(StatusCode::FORBIDDEN, "blob-ref: container not permitted");
+        }
+        Err(BlobRefDenied::BadKey(reason)) => {
+            tracing::warn!(target: "boatramp::handler", %reason, "blob-ref: invalid object key");
+            return deny(StatusCode::BAD_REQUEST, "blob-ref: invalid key");
+        }
+        // A null-principal pass bind's own-space is empty ⇒ nothing to serve.
+        Err(BlobRefDenied::NullScoped) => {
+            return deny(StatusCode::NOT_FOUND, "blob-ref: not found");
+        }
+    };
+    build_blob_response(
+        storage.as_ref(),
+        &skey,
+        parts,
+        plaintext,
+        req_range,
+        is_head,
+    )
+    .await
+}
+
+/// Build the response body for the resolved `(storage, key)` — size via `head` (also the
+/// existence check), then a single-range-aware sendfile / mmap / stream body.
+async fn build_blob_response(
+    storage: &dyn Storage,
+    skey: &str,
+    mut parts: Parts,
+    plaintext: bool,
+    req_range: Option<&str>,
+    is_head: bool,
+) -> Response {
+    let total: Option<u64> = match storage.head(skey).await {
+        Ok(meta) => meta.size,
+        Err(StorageError::NotFound(_)) => {
+            return deny(StatusCode::NOT_FOUND, "blob-ref: not found");
+        }
+        Err(err) => {
+            tracing::warn!(target: "boatramp::handler", error = %err, "blob-ref: backend head fault");
+            return deny(StatusCode::BAD_GATEWAY, "blob-ref: backend unavailable");
+        }
+    };
+
+    // Range only when both a (single, well-formed) range AND a known total are present.
+    let range = req_range.and_then(parse_range);
+    let (offset, len, partial) = match (range.as_ref(), total) {
+        (Some(spec), Some(total)) => match resolve_range(spec, total) {
+            Some((o, l)) => (o, Some(l), true),
+            None => {
+                let mut p = parts;
+                p.status = StatusCode::RANGE_NOT_SATISFIABLE;
+                set_header(&mut p, header::CONTENT_RANGE, &format!("bytes */{total}"));
+                return Response::from_parts(p, Body::empty());
+            }
+        },
+        // No range (or unknown size): the whole object.
+        _ => (0, total, false),
+    };
+
+    // Response head: keep the guest's status + headers; stamp length/range/accept-ranges and
+    // override any stale Content-Length the guest set on its empty body.
+    if partial {
+        parts.status = StatusCode::PARTIAL_CONTENT;
+        if let (Some(l), Some(total)) = (len, total) {
+            set_header(
+                &mut parts,
+                header::CONTENT_RANGE,
+                &format!("bytes {offset}-{}/{total}", offset + l - 1),
+            );
+        }
+    }
+    set_header(&mut parts, header::ACCEPT_RANGES, "bytes");
+    if let Some(l) = len {
+        set_header(&mut parts, header::CONTENT_LENGTH, &l.to_string());
+    } else {
+        parts.headers.remove(header::CONTENT_LENGTH);
+    }
+
+    // HEAD: the head + computed length, no body (the codec also suppresses bodies for HEAD).
+    if is_head {
+        return Response::from_parts(parts, Body::empty());
+    }
+
+    // Local backend over a plaintext connection → zero-copy sendfile (kernel-to-kernel). Attach
+    // the file as a `SendfileSource` extension on an empty-body response; the `http_serve` bridge
+    // turns it into a `Body::File`. On TLS/HTTP2 the bridge host-reads the region (still no guest
+    // copy) — but we prefer an mmap slice there to avoid a full host buffer on a large object.
+    if plaintext && let Some(file) = storage.local_file(skey) {
+        let flen = len
+            .or_else(|| file.metadata().ok().map(|m| m.len()))
+            .unwrap_or(0);
+        parts
+            .extensions
+            .insert(crate::serve_pipeline::SendfileSource {
+                file: Arc::new(file),
+                offset,
+                len: flen,
+            });
+        return Response::from_parts(parts, Body::empty());
+    }
+
+    // Local backend (TLS) → mmap the file and serve the (optionally sliced) borrowed frame,
+    // avoiding a full host read. `None` ⇒ fall through to the stream path.
+    if !plaintext && let Some(bytes) = storage.mapped(skey) {
+        let body = if partial {
+            let start = offset as usize;
+            let end = len.map_or(bytes.len(), |l| (start + l as usize).min(bytes.len()));
+            bytes.slice(start.min(bytes.len())..end)
+        } else {
+            bytes
+        };
+        return Response::from_parts(parts, Body::from(body));
+    }
+
+    // Remote / opaque backend → one host-side stream straight from the backend to the client.
+    let object = if partial {
+        storage.get_range(skey, offset, len).await
+    } else {
+        storage.get(skey).await
+    };
+    match object {
+        Ok(obj) => Response::from_parts(parts, Body::from_stream(obj.body)),
+        Err(StorageError::NotFound(_)) => deny(StatusCode::NOT_FOUND, "blob-ref: not found"),
+        Err(err) => {
+            tracing::warn!(target: "boatramp::handler", error = %err, "blob-ref: backend read fault");
+            deny(StatusCode::BAD_GATEWAY, "blob-ref: backend unavailable")
+        }
+    }
+}
+
+fn set_header(parts: &mut Parts, name: header::HeaderName, value: &str) {
+    if let Ok(v) = HeaderValue::from_str(value) {
+        parts.headers.insert(name, v);
+    }
+}
+
+#[cfg(all(test, feature = "handlers"))]
+mod tests {
+    //! Cap-req 10 body/range/missing/head legs. Confinement (`resolve_blob_ref`) is proven in
+    //! `boatramp-handlers::bindings::blobstore` tests; here we drive `build_blob_response` directly
+    //! against a precise in-memory backend (accurate `head`/`get_range`, optional local file).
+    use super::*;
+    use boatramp_core::{ByteStream, GetObject, ObjectMeta};
+    use bytes::Bytes;
+    use futures::StreamExt as _;
+
+    /// A one-object backend with ACCURATE size + range slicing, and an optional backing temp
+    /// file so the sendfile (local+plaintext) leg is exercisable.
+    struct MemBlob {
+        key: String,
+        bytes: Vec<u8>,
+        local: Option<Arc<std::path::PathBuf>>, // present ⇒ `local_file` returns an open handle
+    }
+
+    impl MemBlob {
+        fn remote(key: &str, bytes: &[u8]) -> Self {
+            Self {
+                key: key.into(),
+                bytes: bytes.to_vec(),
+                local: None,
+            }
+        }
+        fn local(key: &str, bytes: &[u8]) -> Self {
+            let dir = std::env::temp_dir().join(format!("br-blobref-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("obj.bin");
+            std::fs::write(&path, bytes).unwrap();
+            Self {
+                key: key.into(),
+                bytes: bytes.to_vec(),
+                local: Some(Arc::new(path)),
+            }
+        }
+        fn hit(&self, key: &str) -> bool {
+            key == self.key
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Storage for MemBlob {
+        async fn get(&self, key: &str) -> Result<GetObject, StorageError> {
+            if !self.hit(key) {
+                return Err(StorageError::NotFound(key.into()));
+            }
+            let b = Bytes::from(self.bytes.clone());
+            Ok(GetObject {
+                meta: ObjectMeta {
+                    key: key.into(),
+                    size: Some(self.bytes.len() as u64),
+                    ..Default::default()
+                },
+                body: (futures::stream::once(async move { Ok::<_, StorageError>(b) }).boxed())
+                    as ByteStream,
+            })
+        }
+        async fn get_range(
+            &self,
+            key: &str,
+            offset: u64,
+            len: Option<u64>,
+        ) -> Result<GetObject, StorageError> {
+            if !self.hit(key) {
+                return Err(StorageError::NotFound(key.into()));
+            }
+            let start = offset as usize;
+            let end = len.map_or(self.bytes.len(), |l| {
+                (start + l as usize).min(self.bytes.len())
+            });
+            let slice = Bytes::from(self.bytes[start.min(self.bytes.len())..end].to_vec());
+            let n = slice.len() as u64;
+            Ok(GetObject {
+                meta: ObjectMeta {
+                    key: key.into(),
+                    size: Some(n),
+                    ..Default::default()
+                },
+                body: (futures::stream::once(async move { Ok::<_, StorageError>(slice) }).boxed())
+                    as ByteStream,
+            })
+        }
+        async fn put(
+            &self,
+            _: &str,
+            _: ByteStream,
+            _: boatramp_core::PutMeta,
+        ) -> Result<ObjectMeta, StorageError> {
+            unimplemented!()
+        }
+        async fn head(&self, key: &str) -> Result<ObjectMeta, StorageError> {
+            if !self.hit(key) {
+                return Err(StorageError::NotFound(key.into()));
+            }
+            Ok(ObjectMeta {
+                key: key.into(),
+                size: Some(self.bytes.len() as u64),
+                ..Default::default()
+            })
+        }
+        async fn delete(&self, _: &str) -> Result<(), StorageError> {
+            Ok(())
+        }
+        async fn list(&self, _: &str) -> Result<Vec<ObjectMeta>, StorageError> {
+            Ok(vec![])
+        }
+        fn local_file(&self, key: &str) -> Option<std::fs::File> {
+            if self.hit(key) {
+                self.local
+                    .as_ref()
+                    .and_then(|p| std::fs::File::open(p.as_path()).ok())
+            } else {
+                None
+            }
+        }
+    }
+
+    fn parts() -> Parts {
+        axum::http::Response::new(()).into_parts().0 // default 200 + empty headers
+    }
+
+    async fn body_bytes(resp: Response) -> Vec<u8> {
+        axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec()
+    }
+
+    #[tokio::test]
+    async fn remote_whole_object_streams_with_content_length() {
+        let s = MemBlob::remote("hblob/default/api/assets/big.bin", b"hello world payload");
+        let resp = build_blob_response(
+            &s,
+            "hblob/default/api/assets/big.bin",
+            parts(),
+            false,
+            None,
+            false,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers().get(header::CONTENT_LENGTH).unwrap(), "19");
+        assert_eq!(body_bytes(resp).await, b"hello world payload");
+    }
+
+    #[tokio::test]
+    async fn remote_range_is_206_with_content_range_and_slice() {
+        let s = MemBlob::remote("k", b"0123456789");
+        let resp = build_blob_response(&s, "k", parts(), false, Some("bytes=2-4"), false).await;
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_RANGE).unwrap(),
+            "bytes 2-4/10"
+        );
+        assert_eq!(resp.headers().get(header::CONTENT_LENGTH).unwrap(), "3");
+        assert_eq!(body_bytes(resp).await, b"234");
+    }
+
+    #[tokio::test]
+    async fn unsatisfiable_range_is_416() {
+        let s = MemBlob::remote("k", b"0123456789");
+        let resp = build_blob_response(&s, "k", parts(), false, Some("bytes=50-60"), false).await;
+        assert_eq!(resp.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_RANGE).unwrap(),
+            "bytes */10"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_object_is_404() {
+        let s = MemBlob::remote("present", b"x");
+        let resp = build_blob_response(&s, "absent", parts(), false, None, false).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn head_has_length_and_empty_body() {
+        let s = MemBlob::remote("k", b"0123456789");
+        let resp = build_blob_response(&s, "k", parts(), false, None, true).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers().get(header::CONTENT_LENGTH).unwrap(), "10");
+        assert!(body_bytes(resp).await.is_empty(), "HEAD carries no body");
+    }
+
+    #[tokio::test]
+    async fn local_plaintext_attaches_sendfile_source() {
+        let s = MemBlob::local("k", b"0123456789");
+        let resp = build_blob_response(&s, "k", parts(), true, None, false).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers().get(header::CONTENT_LENGTH).unwrap(), "10");
+        let src = resp
+            .extensions()
+            .get::<crate::serve_pipeline::SendfileSource>()
+            .expect("sendfile source attached on local+plaintext");
+        assert_eq!(src.len, 10);
+        assert_eq!(src.offset, 0);
+        assert!(
+            body_bytes(resp).await.is_empty(),
+            "sendfile uses an empty body + the extension"
+        );
+    }
+}

@@ -40,6 +40,11 @@ mod admin_api;
 /// + key derivation). Public so the node can derive the cluster AOT MAC key where it
 /// unseals the cluster secret.
 pub mod aot;
+/// Cap-req 10: zero-copy blob-ref handler responses — the host swaps an empty guest response
+/// carrying `x-boatramp-blob-ref` for a sendfile/stream body from the guest's confined blob scope.
+/// Gated with its only caller (`handler_dispatch`) — it references the handler blob binding.
+#[cfg(feature = "handlers")]
+mod blob_ref;
 pub mod blob_shim;
 pub mod sql_shim;
 #[cfg(feature = "oidc")]

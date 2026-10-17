@@ -625,6 +625,22 @@ pub(super) async fn dispatch_handler(
     } else {
         boatramp_handlers::Lane::Sync
     };
+    // Zero-copy blob-ref response (cap-req 10): capture the guest's CONFINED blob scope + the
+    // transport facts BEFORE `request`/`bindings` are moved into `serve_lane`, so that if the
+    // handler's response carries `x-boatramp-blob-ref` we can stream the object straight from
+    // its own blob backend (sendfile/host-stream, no guest copy) under the same confinement.
+    let blob_scope = bindings.blobstore().cloned();
+    let blob_ref_plaintext = !request
+        .extensions()
+        .get::<crate::ServedOverTls>()
+        .map(|s| s.0)
+        .unwrap_or(false);
+    let blob_ref_req_range = request
+        .headers()
+        .get(axum::http::header::RANGE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let blob_ref_is_head = request.method() == axum::http::Method::HEAD;
     let timed = inner
         .engine
         .serve_lane(&entry.hash, &wasm, request, bindings, limits, lane)
@@ -656,25 +672,43 @@ pub(super) async fn dispatch_handler(
     let t_body = std::time::Instant::now();
     let mut response = match result {
         Ok(response) => {
-            let (parts, body) = response.into_parts();
-            let response = axum::http::Response::from_parts(parts, axum::body::Body::new(body));
-            // Cache the response if the site opted in and the response is cacheable.
-            // On a non-cacheable request/response this returns it untouched, so
-            // streaming is preserved.
-            match &cache_write {
-                Some((cfg, key, method, req_headers)) => {
-                    handler_cache::maybe_store(
-                        inner.kv.clone(),
-                        cfg,
-                        key,
-                        method,
-                        req_headers,
-                        response,
-                        handler_cache::now_secs(),
-                    )
-                    .await
+            let (mut parts, body) = response.into_parts();
+            // Zero-copy blob-ref (cap-req 10): a handler opts in by returning an empty body + the
+            // `x-boatramp-blob-ref: <container>/<key>` header. Detect it BEFORE the edge cache
+            // (which buffers the body) and swap in a host-streamed/sendfile body read from the
+            // guest's OWN confined blob scope — the object bytes never traverse the guest. The
+            // edge cache is bypassed for a blob-ref response (the bytes are large/content-addressed).
+            if let Some(reference) = parts.headers.remove(crate::blob_ref::BLOB_REF_HEADER) {
+                drop(body); // empty by convention
+                crate::blob_ref::apply_blob_ref(
+                    &reference,
+                    blob_scope.as_ref(),
+                    blob_ref_plaintext,
+                    blob_ref_req_range.as_deref(),
+                    blob_ref_is_head,
+                    parts,
+                )
+                .await
+            } else {
+                let response = axum::http::Response::from_parts(parts, axum::body::Body::new(body));
+                // Cache the response if the site opted in and the response is cacheable.
+                // On a non-cacheable request/response this returns it untouched, so
+                // streaming is preserved.
+                match &cache_write {
+                    Some((cfg, key, method, req_headers)) => {
+                        handler_cache::maybe_store(
+                            inner.kv.clone(),
+                            cfg,
+                            key,
+                            method,
+                            req_headers,
+                            response,
+                            handler_cache::now_secs(),
+                        )
+                        .await
+                    }
+                    None => response,
                 }
-                None => response,
             }
         }
         Err(err) => {

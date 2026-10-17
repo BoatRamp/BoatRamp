@@ -172,6 +172,125 @@ enum ContainerAccess {
 /// can consult it (the `tenant` module is `#[cfg(feature = "sql")]`).
 use crate::pass_mutation;
 
+/// Fail-closed refusal categories for a zero-copy blob-ref resolution ([`BlobBinding::resolve_blob_ref`]).
+/// Distinct + greppable; the serve layer maps each to a status.
+#[derive(Debug)]
+pub enum BlobRefDenied {
+    /// The container is not permitted (allowlist miss / unexpandable `{tenant}` / multi-tenant
+    /// deny-default / bad container segment) → 403.
+    NotPermitted(String),
+    /// The object name failed the traversal/reserved screen → 400.
+    BadKey(String),
+    /// A null-principal `pass` bind's own (`{tenant}`-shaped) container is an empty own-space → 404.
+    NullScoped,
+}
+
+impl BlobBinding {
+    /// The tenant-confinement choke point, as a method on the binding itself so BOTH the enforced
+    /// `wasi:blobstore` path (via [`BlobHost::container_access`]) AND the zero-copy blob-ref response
+    /// path ([`resolve_blob_ref`](Self::resolve_blob_ref)) run the IDENTICAL confinement — the tested
+    /// code stays the enforced code. Resolves `hblob/{site}/{container}/` for `name`, or a refusal.
+    /// The site is `self.prefix` (host-stamped at bind time), NEVER guest-supplied.
+    fn container_access(&self, name: &str) -> Result<ContainerAccess, String> {
+        // A null-principal `on_unresolved: "pass"` bind with no resolved tenant resolves its OWN
+        // (`{tenant}`-shaped) container to an empty own-space instead of a hard refusal. The gate
+        // mutation `deny_pass` turns this off so the anti-hollow test goes RED.
+        let pass = self.pass_unresolved && pass_mutation().as_deref() != Some("deny_pass");
+
+        if !self.containers.is_empty() {
+            // A declared allowlist is ALWAYS enforced regardless of the multi-tenant posture (C3).
+            let mut saw_unexpandable_template = false;
+            let mut saw_unresolved_own_shape = false;
+            let mut matched = false;
+            for entry in &self.containers {
+                match entry.split_once(TENANT_TEMPLATE) {
+                    Some((before, after)) => {
+                        match self.tenant.as_deref().filter(|s| !s.is_empty()) {
+                            Some(tenant) => {
+                                if name == format!("{before}{tenant}{after}") {
+                                    matched = true;
+                                    break;
+                                }
+                            }
+                            None => {
+                                saw_unexpandable_template = true;
+                                if name.len() >= before.len() + after.len()
+                                    && name.starts_with(before)
+                                    && name.ends_with(after)
+                                {
+                                    saw_unresolved_own_shape = true;
+                                }
+                            }
+                        }
+                    }
+                    None => {
+                        if entry == name {
+                            matched = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if !matched {
+                if pass && saw_unresolved_own_shape {
+                    return Ok(ContainerAccess::NullScoped);
+                }
+                return Err(if saw_unexpandable_template {
+                    format!(
+                        "blobstore_containers: no resolved tenant to expand a {TENANT_TEMPLATE} \
+                         entry for container '{name}'"
+                    )
+                } else {
+                    format!(
+                        "container '{name}' is not permitted by this component's \
+                         blobstore_containers allowlist"
+                    )
+                });
+            }
+        } else if self.multi_tenant {
+            // No allowlist on a multi-tenant site ⇒ deny-by-default (fail-closed).
+            return Err(format!(
+                "this multi-tenant site grants wasi:blobstore but declares no blobstore_containers; \
+                 add blobstore_containers: [\"assets-{TENANT_TEMPLATE}\"]"
+            ));
+        }
+        // else: single-tenant / dev with no allowlist ⇒ permissive (unchanged behavior).
+
+        // Defense-in-depth: the resolved container must be a safe KEY segment.
+        validate_key_segment("container", name).map_err(|e| format!("invalid container: {e}"))?;
+        Ok(ContainerAccess::Open(format!("{}{name}/", self.prefix)))
+    }
+
+    /// Resolve a guest-named `(container, object)` for a **zero-copy blob-ref response** to the
+    /// confined backend + the final storage key `hblob/{project-qualified-site}/{container}/{object}`,
+    /// reusing [`container_access`](Self::container_access) (allowlist / `{tenant}` / multi-tenant /
+    /// key-segment screen) then [`checked_object_key`] (object-key traversal screen). The key ALWAYS
+    /// begins with `self.prefix`, so a cross-site / traversal ref is structurally impossible — the same
+    /// confinement the guest's own `wasi:blobstore` get is held to.
+    pub fn resolve_blob_ref(
+        &self,
+        container: &str,
+        object: &str,
+    ) -> Result<(Arc<dyn Storage>, String), BlobRefDenied> {
+        match self
+            .container_access(container)
+            .map_err(BlobRefDenied::NotPermitted)?
+        {
+            ContainerAccess::Open(prefix) => Ok((
+                self.storage.clone(),
+                checked_object_key(&prefix, object).map_err(BlobRefDenied::BadKey)?,
+            )),
+            ContainerAccess::NullScoped => Err(BlobRefDenied::NullScoped),
+        }
+    }
+
+    /// The granted host-side read byte cap (`0` = unlimited). NOT applied on the blob-ref
+    /// sendfile/stream path (nothing is materialized in host memory) — exposed for parity.
+    pub fn max_blob_bytes(&self) -> u64 {
+        self.max_bytes
+    }
+}
+
 impl Container {
     fn object_key(&self, object: &str) -> Result<String, String> {
         checked_object_key(&self.prefix, object)
@@ -390,97 +509,12 @@ impl BlobHost<'_> {
     /// deny-default. These are an AUTHORIZATION category, returned directly — NOT through
     /// [`blob_err`] (which masks a backend fault as "blob backend unavailable").
     fn container_access(&self, name: &str) -> Result<ContainerAccess, String> {
+        // Delegate to the shared confinement on the binding itself, so the enforced
+        // `wasi:blobstore` path and the zero-copy blob-ref path run IDENTICAL code (the tested
+        // code stays the enforced code). The null-grant guard stays here (the binding method
+        // assumes a grant exists).
         let binding = self.binding.ok_or_else(|| "access denied".to_string())?;
-        // A null-principal `on_unresolved: "pass"` bind with no resolved tenant resolves its OWN
-        // (`{tenant}`-shaped) container to an empty own-space instead of a hard refusal. The gate
-        // mutation `deny_pass` turns this off (reverting to the old deny) so the anti-hollow test
-        // goes RED — proving the pass handling is load-bearing.
-        let pass = binding.pass_unresolved && pass_mutation().as_deref() != Some("deny_pass");
-
-        if !binding.containers.is_empty() {
-            // A declared allowlist is ALWAYS enforced regardless of the multi-tenant posture (C3).
-            // For each entry: a `{tenant}` entry is host-expanded with the resolved OWN tenant then
-            // exact-matched; a plain entry is exact-matched literally. `split_once` intercepts a
-            // `{tenant}`-bearing entry anywhere in the string (a guest cannot reach it by passing the
-            // literal `{tenant}` — the match is exact equality against the host-expanded form, and
-            // the tenant is never guest-supplied).
-            let mut saw_unexpandable_template = false;
-            // Whether the request lines up with the SHAPE (`{before}…{after}`) of a `{tenant}` entry
-            // we could not expand — i.e. it IS the guest's own per-tenant container, just unresolvable
-            // under a null principal. (Even a crafted `assets-<other>` only reaches an EMPTY space, so
-            // this never leaks another tenant's objects.)
-            let mut saw_unresolved_own_shape = false;
-            let mut matched = false;
-            for entry in &binding.containers {
-                match entry.split_once(TENANT_TEMPLATE) {
-                    // Security LOW-1: an EMPTY resolved tenant is treated as no resolved tenant (fail
-                    // closed), never expanded to an empty segment (`assets-`). Bind sites already filter
-                    // empties via `resolved_tenant_string`; this keeps the binding self-protecting.
-                    Some((before, after)) => {
-                        match binding.tenant.as_deref().filter(|s| !s.is_empty()) {
-                            Some(tenant) => {
-                                if name == format!("{before}{tenant}{after}") {
-                                    matched = true;
-                                    break;
-                                }
-                            }
-                            // A `{tenant}` entry we cannot expand (no resolved own tenant): record it so a
-                            // request that lines up ONLY with such an entry fails closed distinctly (C5),
-                            // never a silent access-denied that could hide a wrongly-scoped invocation.
-                            None => {
-                                saw_unexpandable_template = true;
-                                if name.len() >= before.len() + after.len()
-                                    && name.starts_with(before)
-                                    && name.ends_with(after)
-                                {
-                                    saw_unresolved_own_shape = true;
-                                }
-                            }
-                        }
-                    }
-                    None => {
-                        if entry == name {
-                            matched = true;
-                            break;
-                        }
-                    }
-                }
-            }
-            if !matched {
-                // Null-principal pass: the guest's OWN (`{tenant}`-shaped) container becomes an empty
-                // own-space — never another tenant's data, never a write. A name matching NO entry
-                // stays a hard not-permitted deny even under pass.
-                if pass && saw_unresolved_own_shape {
-                    return Ok(ContainerAccess::NullScoped);
-                }
-                return Err(if saw_unexpandable_template {
-                    format!(
-                        "blobstore_containers: no resolved tenant to expand a {TENANT_TEMPLATE} \
-                         entry for container '{name}'"
-                    )
-                } else {
-                    format!(
-                        "container '{name}' is not permitted by this component's \
-                         blobstore_containers allowlist"
-                    )
-                });
-            }
-        } else if binding.multi_tenant {
-            // No allowlist on a multi-tenant site ⇒ deny-by-default (fail-closed). The message names
-            // the one-line remedy. BREAKING for a multi-tenant guest that granted `wasi:blobstore`
-            // without declaring an allowlist.
-            return Err(format!(
-                "this multi-tenant site grants wasi:blobstore but declares no blobstore_containers; \
-                 add blobstore_containers: [\"assets-{TENANT_TEMPLATE}\"]"
-            ));
-        }
-        // else: single-tenant / dev with no allowlist ⇒ permissive (unchanged behavior).
-
-        // Defense-in-depth: the resolved container must be a safe KEY segment — a `{tenant}`-expanded
-        // tid carries `.`/`@`, so KEY-safety (`validate_key_segment`), not the strict slug. `..` is
-        // already inert (fs `resolve` rejects; cloud literal); belt, not the load-bearing fix.
-        validate_key_segment("container", name).map_err(|e| format!("invalid container: {e}"))?;
-        Ok(ContainerAccess::Open(format!("{}{name}/", binding.prefix)))
+        binding.container_access(name)
     }
 
     /// The container key prefix for a WRITE/create-oriented op (create/delete-container, copy/move).
@@ -1646,6 +1680,58 @@ mod tests {
             containers: containers.iter().map(|s| (*s).to_string()).collect(),
             multi_tenant,
             pass_unresolved: false,
+        }
+    }
+
+    /// Cap-req 10: `resolve_blob_ref` (the zero-copy blob-ref response resolver) runs the IDENTICAL
+    /// confinement as the enforced `wasi:blobstore` get — a traversal / cross-tenant / disallowed
+    /// container, or a traversal object key, is REFUSED, while the guest's OWN container+key resolves
+    /// to a key that ALWAYS begins with the host-stamped site prefix. The positive control makes the
+    /// refusals non-vacuous (the same structural guarantee as `compute_blob_shim_scoped_gate`).
+    #[test]
+    fn resolve_blob_ref_is_confined_to_the_guest_scope() {
+        let storage = Arc::new(MemStorage::default());
+        let bind = confined(
+            storage,
+            "hblob/default/api/",
+            Some("acme"),
+            &["assets-{tenant}"],
+            true,
+        );
+
+        // POSITIVE CONTROL: the guest's own container + a nested key resolves, confined to the prefix.
+        let (_s, key) = bind
+            .resolve_blob_ref("assets-acme", "msg/1.eml")
+            .expect("own container resolves");
+        assert_eq!(key, "hblob/default/api/assets-acme/msg/1.eml");
+        assert!(
+            key.starts_with("hblob/default/api/"),
+            "key is confined under the host-stamped site prefix"
+        );
+
+        // Cross-tenant / disallowed container → NotPermitted (allowlist miss).
+        assert!(matches!(
+            bind.resolve_blob_ref("assets-other", "k"),
+            Err(BlobRefDenied::NotPermitted(_))
+        ));
+        assert!(matches!(
+            bind.resolve_blob_ref("secrets", "k"),
+            Err(BlobRefDenied::NotPermitted(_))
+        ));
+        // A `..` container segment → NotPermitted (not in the allowlist; also key-segment screened).
+        assert!(matches!(
+            bind.resolve_blob_ref("..", "k"),
+            Err(BlobRefDenied::NotPermitted(_))
+        ));
+        // Traversal / absolute in the OBJECT key (valid container) → BadKey (object-key screen).
+        for bad in ["../escape", "a/../../b", "/abs", ".boatramp-marker"] {
+            assert!(
+                matches!(
+                    bind.resolve_blob_ref("assets-acme", bad),
+                    Err(BlobRefDenied::BadKey(_))
+                ),
+                "object key {bad:?} must be rejected by the key screen"
+            );
         }
     }
 

@@ -54,6 +54,12 @@ pub use bindings::blob_upload::{
 #[cfg(feature = "engine")]
 #[doc(hidden)]
 pub use bindings::blobstore::read_object_through_guest_binding;
+/// The confined blob capability + its zero-copy blob-ref resolver (cold-start cap-req 10):
+/// the serve layer uses `BlobBinding::resolve_blob_ref` to turn a handler-supplied
+/// `(container, key)` into a backend + the confined `hblob/{site}/…` key, reusing the exact
+/// `wasi:blobstore` confinement.
+#[cfg(feature = "engine")]
+pub use bindings::blobstore::{BlobBinding, BlobRefDenied};
 #[cfg(feature = "capability")]
 pub use bindings::capability::{CapabilityBinding, CapabilityMinter};
 #[cfg(feature = "email")]
