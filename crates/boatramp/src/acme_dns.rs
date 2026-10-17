@@ -340,8 +340,9 @@ impl ResolvesServerCert for SniCertResolver {
     }
 }
 
-/// Parse a PEM chain + key into a rustls [`CertifiedKey`].
-fn certified_key_from_pem(cert_pem: &str, key_pem: &str) -> Result<CertifiedKey> {
+/// Parse a PEM chain + key into a rustls [`CertifiedKey`]. `pub(crate)` so the on-demand TLS issuer
+/// (cap-req 03) builds the same `CertifiedKey` from a freshly-issued / stored cert.
+pub(crate) fn certified_key_from_pem(cert_pem: &str, key_pem: &str) -> Result<CertifiedKey> {
     let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
         rustls_pemfile::certs(&mut cert_pem.as_bytes()).collect::<std::result::Result<_, _>>()?;
     if certs.is_empty() {
