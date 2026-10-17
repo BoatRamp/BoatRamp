@@ -515,10 +515,16 @@ impl ServerConfig {
                     " — omit it for the default",
                 );
             }
-            if l.tls.is_some() {
+            // Host-side per-listener TLS termination (cap-req 06): a declared `tls` block is now
+            // honored (implicit TLS — 465/993), but it MUST name both a cert and a key (the host
+            // loads them + terminates TLS, handing the guest a decrypted plaintext stream). STARTTLS
+            // is a separate follow-up; implicit TLS is what this validates.
+            if let Some(tls) = &l.tls
+                && (tls.cert_file.is_none() || tls.key_file.is_none())
+            {
                 return err(
-                    "per-listener TLS is not implemented in this release (plaintext-only)",
-                    " — terminate TLS in front of boatramp, or remove the `tls` block",
+                    "listener `tls` requires both `cert_file` and `key_file`",
+                    " — set cert_file/key_file (PEM), or remove the `tls` block for a plaintext listener",
                 );
             }
             if !l.egress_allowlist.is_empty() {
@@ -4008,11 +4014,11 @@ mod tests {
             matches!(err, ConfigError::InvalidListener { .. }),
             "{err:?}"
         );
-        // (b) a Phase-1-unsupported `tls` block.
+        // (b) a `tls` block MISSING cert_file/key_file is refused (cap-req 06: host-TLS needs both).
         let err = ServerConfig::parse(
-            r#"( serve: ( listeners: { "l": ( bind: "0.0.0.0:9000", component: "c.wasm", project: "p", site: "s", tls: ( cert_file: "x.pem", key_file: "y.pem" ) ) } ) )"#,
+            r#"( serve: ( listeners: { "l": ( bind: "0.0.0.0:9000", component: "c.wasm", project: "p", site: "s", tls: ( cert_file: "x.pem" ) ) } ) )"#,
         )
-        .expect_err("a declared tls block must be refused in Phase 1 (plaintext-only)");
+        .expect_err("a tls block without a key_file must be refused");
         assert!(
             matches!(err, ConfigError::InvalidListener { .. }),
             "{err:?}"
@@ -4026,11 +4032,16 @@ mod tests {
             matches!(err, ConfigError::InvalidListener { .. }),
             "{err:?}"
         );
-        // (d) a valid listener parses.
+        // (d) a valid plaintext listener parses.
         ServerConfig::parse(
             r#"( serve: ( listeners: { "l": ( bind: "0.0.0.0:9000", component: "c.wasm", project: "p", site: "s" ) } ) )"#,
         )
         .expect("a fully-declared plaintext listener is valid");
+        // (e) a well-formed TLS listener (cert + key) now PARSES (cap-req 06).
+        ServerConfig::parse(
+            r#"( serve: ( listeners: { "l": ( bind: "0.0.0.0:9000", component: "c.wasm", project: "p", site: "s", tls: ( cert_file: "x.pem", key_file: "y.pem" ) ) } ) )"#,
+        )
+        .expect("a TLS listener with cert_file + key_file is valid");
     }
 
     #[test]

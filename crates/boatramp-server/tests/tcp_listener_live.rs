@@ -292,3 +292,137 @@ async fn tcp_listener_live_echo_idle_spin_peerdrop() {
          proof), and peer-drop cleanup all held end to end over real loopback sockets."
     );
 }
+
+/// cap-req 06: a self-signed cert → an `Arc<ServerConfig>` for the listener + a `TlsConnector`
+/// that trusts it (the test client). The private key lives only in the server config.
+fn tls_fixtures() -> (Arc<rustls::ServerConfig>, tokio_rustls::TlsConnector) {
+    // Match production's process-default provider (serve.rs `install_crypto_provider`); idempotent.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+    let cert_der = certified.cert.der().clone();
+    let key_der =
+        rustls::pki_types::PrivateKeyDer::Pkcs8(certified.key_pair.serialize_der().into());
+    let server_cfg = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert_der.clone()], key_der)
+        .unwrap();
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(cert_der).unwrap();
+    let client_cfg = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    (
+        Arc::new(server_cfg),
+        tokio_rustls::TlsConnector::from(Arc::new(client_cfg)),
+    )
+}
+
+/// Like [`bind_and_serve`] but the host TERMINATES TLS before the guest sees bytes — the exact
+/// accept→handshake→split→dispatch path `run_listener` takes for a `tls` listener (cap-req 06).
+async fn bind_and_serve_tls(
+    runtime: HandlerRuntime,
+    deploy: DeployStore,
+    server_cfg: Arc<rustls::ServerConfig>,
+    idle: Duration,
+    max_dur: Duration,
+) -> (JoinHandle<Result<(), String>>, std::net::SocketAddr) {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let acceptor = tokio_rustls::TlsAcceptor::from(server_cfg);
+    let handle = tokio::spawn(async move {
+        let (stream, peer) = listener.accept().await.unwrap();
+        let _ = stream.set_nodelay(true);
+        // Host-side TLS termination: a failed handshake returns Err (NO plaintext fallthrough).
+        let tls = acceptor
+            .accept(stream)
+            .await
+            .map_err(|e| format!("inbound-TLS handshake failed: {e}"))?;
+        let (read_half, write_half) = tokio::io::split(tls);
+        runtime
+            .dispatch_tcp_connection(
+                &deploy,
+                ProjectRef::DEFAULT.as_str(),
+                SITE,
+                COMPONENT,
+                &FunctionConfig::default(),
+                peer.to_string(),
+                read_half,
+                write_half,
+                idle,
+                max_dur,
+            )
+            .await
+    });
+    (handle, addr)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tcp_listener_tls_live_terminates_and_refuses_plaintext() {
+    // (a) IMPLICIT-TLS echo: the host terminates TLS; the guest echoes the DECRYPTED plaintext.
+    {
+        let (runtime, deploy) = live_runtime(TCP_ECHO, 10).await;
+        let (server_cfg, connector) = tls_fixtures();
+        let (handle, addr) = bind_and_serve_tls(
+            runtime,
+            deploy,
+            server_cfg,
+            Duration::from_secs(5),
+            Duration::from_secs(30),
+        )
+        .await;
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let domain = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        let mut tls = connector
+            .connect(domain, tcp)
+            .await
+            .expect("client TLS handshake");
+        let payload = b"hello over TLS";
+        tls.write_all(payload).await.unwrap();
+        let mut got = vec![0u8; payload.len()];
+        tokio::time::timeout(Duration::from_secs(5), tls.read_exact(&mut got))
+            .await
+            .expect("tls echo read timed out")
+            .expect("tls echo read failed");
+        assert_eq!(
+            &got, payload,
+            "the guest echoes the decrypted plaintext — the host terminated TLS"
+        );
+        tls.shutdown().await.ok();
+        let (res, _) = await_dispatch(handle, Duration::from_secs(5), "tls-echo").await;
+        assert!(res.is_ok(), "tls echo dispatch ends cleanly: {res:?}");
+    }
+    // (b) A PLAINTEXT client to a TLS listener is REFUSED: the handshake fails, the guest is NEVER
+    //     dispatched, and no bytes are echoed back (no plaintext fallthrough).
+    {
+        let (runtime, deploy) = live_runtime(TCP_ECHO, 11).await;
+        let (server_cfg, _connector) = tls_fixtures();
+        let (handle, addr) = bind_and_serve_tls(
+            runtime,
+            deploy,
+            server_cfg,
+            Duration::from_secs(5),
+            Duration::from_secs(30),
+        )
+        .await;
+        let mut raw = TcpStream::connect(addr).await.unwrap();
+        raw.write_all(b"not tls, just plaintext bytes").await.ok();
+        let (res, _) = await_dispatch(handle, Duration::from_secs(5), "tls-refuse").await;
+        assert!(
+            res.is_err(),
+            "a plaintext client to a TLS listener must be refused (no fallthrough): {res:?}"
+        );
+        // The client may receive a TLS alert (rustls rejecting the non-TLS ClientHello) or EOF —
+        // but NEVER an echo of its plaintext (the guest never ran, so it can't have echoed).
+        let mut buf = [0u8; 8];
+        if let Ok(Ok(n)) = tokio::time::timeout(Duration::from_secs(1), raw.read(&mut buf)).await {
+            assert_ne!(
+                &buf[..n.min(8)],
+                &b"not tls,"[..n.min(8)],
+                "the plaintext was NOT echoed — the connection is refused, not served"
+            );
+        }
+    }
+    println!(
+        "TCP-LISTENER-TLS LIVE OK: host-TLS termination (implicit) + plaintext-client refusal"
+    );
+}
