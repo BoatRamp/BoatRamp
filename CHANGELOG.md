@@ -70,6 +70,26 @@ inert until configured — a node that enables neither behaves exactly as before
   tag (swap during an incident, swap back). `gdb` is omitted to keep the image small; `strace`/`ltrace`
   need `--cap-add=SYS_PTRACE` at runtime.
 
+### Fixed
+
+- **Streaming-lane lifecycle: a streaming response now occupies its slot for the stream's whole
+  life, and a silent/abandoned stream is reclaimed.** A `#[handler(stream)]` response (SSE, chunked,
+  agent token streaming) previously released its streaming-lane concurrency permit and in-flight
+  count when it produced the response *head*, while the guest kept streaming the body on a detached
+  task — so `streaming_max_concurrency` did **not** actually bound the number of concurrent open
+  streams (a slow-client / long-SSE pile-up could exceed it) and a stream was torn down only by the
+  absolute `streaming_max_timeout_ms` epoch deadline. Now the lane permit **and** the component
+  in-flight guard are carried inside the response body and released only when the body completes or
+  the client disconnects (so the bound is real and a dropped connection reclaims the slot promptly),
+  and a per-node **idle cap** (`[handlers] streaming_idle_timeout_ms`, env
+  `BOATRAMP_HANDLERS_STREAMING_IDLE_TIMEOUT_MS`, default 600 s, floored at 1 s) tears down a stream
+  that emits no frame for that long — the slowloris bound for the streaming lane, mirroring the
+  inbound-TCP conn-lane idle/max-duration watchdog. A well-behaved heartbeat-sending SSE stream is
+  never affected. Each streamed chunk is now also **flushed** to the transport, so a streaming/SSE
+  event reaches the client promptly instead of lingering in a buffered TLS record until the next
+  chunk. No API/WIT change; a correctly-behaving stream is observably unchanged apart from prompter
+  delivery.
+
 ## [0.35.2] - 2026-10-16
 
 **Fix: `project export` / `import` (and `sql exec`) now actually run the SQL client on a
