@@ -153,6 +153,74 @@ not once per node. During a rare membership change (a node joining or leaving) a
 missed; crons are best-effort periodic, so a skipped minute during a reshuffle is expected, not a
 failure. On a single node this is unchanged — every scheduled minute fires.
 
+## Push events to browsers over SSE (streams)
+
+A **stream** is a host-level endpoint that fans a set of messaging topics out to connected clients
+as [Server-Sent Events][SSE] — the server→client push primitive for live dashboards, notifications,
+progress, and **presence / assignment** feeds. No guest runs per connection: anything in the project
+`publish`es to a topic (a handler, a consumer, a function, a webhook) and the host broadcasts each
+message to every client subscribed to that stream's route. A browser consumes it with a one-liner:
+
+```js
+const es = new EventSource("/live/inbox");
+es.onmessage = (e) => applyPresenceEvent(JSON.parse(e.data));
+```
+
+Declare a `stream` in `routing`, listing the topics it broadcasts:
+
+```ron
+routing: (
+    streams: [
+        // Browsers GET /live/inbox as an EventSource; every message published to either
+        // bus topic is delivered to all connected subscribers.
+        ( route: "GET /live/inbox",
+          topics: ["bus:inbox.presence", "bus:inbox.assignment"] ),
+    ],
+),
+```
+
+Publish from anywhere in the project — e.g. a handler that assigns a conversation emits the event on
+the bus, and every connected browser sees it without the handler knowing who is listening:
+
+```rust
+// inside a normal request handler, consumer, or function
+messaging::publish("bus:inbox.assignment",
+    serde_json::to_vec(&AssignmentEvent { conversation, agent })?.as_slice())?;
+```
+
+The producer needs `imports: ["wasi:messaging"]`; the stream route itself grants no guest capability
+(it is pure host fan-out). Because the topics are `bus:`-prefixed they are
+[project-scoped](#share-a-topic-across-components-the-project-bus), so a producer in one site and the
+stream endpoint in another meet on the same topic.
+
+**What the host handles for you:** each client gets an SSE connection with a periodic heartbeat
+(so an idle feed stays open through proxies); every event carries a monotonic `id:`, and a browser
+`EventSource` that drops and reconnects sends the last id as `Last-Event-ID`, so the host replays
+only what the client missed. A connection with no traffic for the idle window is torn down (the
+client reconnects if it still wants the feed), an absolute max-duration bounds it, and per-scope +
+per-IP connection caps (shared with the [session](./sessions.md) budget) bound a client that opens
+many. Put the route behind the usual [visitor-access](./visitor-access.md) controls to require a
+verified subscriber.
+
+**Add a client→server backchannel:** set `websocket: true` to serve the same route as a WebSocket
+instead of SSE (full-duplex), and give it a `publish_topic` so messages the client sends are
+published onto that topic for a consumer to process:
+
+```ron
+( route: "GET /live/chat", topics: ["bus:chat.out"],
+  websocket: true, publish_topic: "bus:chat.in" ),
+```
+
+### Which push primitive?
+
+| Use | Primitive | Guest code per connection? |
+| --- | --- | --- |
+| Fan a topic out to many subscribers (presence, notifications, dashboards) | **`stream`** (this section) | No — host-only pub/sub |
+| One request, one long response body the handler writes incrementally (token streaming, a progress feed from a single call) | a **streaming handler** (`streaming: true` + a `#[handler(stream)]` body — see [Deploy a handler](./deploy-handler.md)) | Yes — one `handle` call holds the body open |
+| A resumable, bidirectional channel that runs *your* code per inbound frame (agent UIs, chat with tool calls) | **`session`** (see [Build a duplex agent session](./sessions.md)) | Yes — re-entered per frame |
+
+[SSE]: https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events
+
 ## Operate the dead-letter queue
 
 When a message exhausts `max_attempts`, boatramp dead-letters it and retains the

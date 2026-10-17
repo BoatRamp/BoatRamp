@@ -90,6 +90,17 @@ inert until configured — a node that enables neither behaves exactly as before
   chunk. No API/WIT change; a correctly-behaving stream is observably unchanged apart from prompter
   delivery.
 
+### Documentation
+
+- **Server→client push (SSE) from handlers is now documented end-to-end.** "Run consumers, crons,
+  and streams" gains the missing **streams** section — declaring a host `[stream]` route that fans a
+  messaging topic out to browser `EventSource` clients (presence/assignment/notification feeds), the
+  publish side, Last-Event-ID resume, heartbeats, the idle/max-duration + per-scope/per-IP caps, and
+  the WebSocket backchannel variant — and "Deploy a handler" gains a **streaming responses** section
+  for a guest-authored `text/event-stream` body (`#[handler(stream)]`), including the streaming-lane
+  caps above. A decision table maps each push shape (stream fan-out · streaming handler · duplex
+  session) to its primitive. (These primitives already shipped; this closes the documentation gap.)
+
 ## [0.35.2] - 2026-10-16
 
 **Fix: `project export` / `import` (and `sql exec`) now actually run the SQL client on a
