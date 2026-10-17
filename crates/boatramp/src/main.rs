@@ -54,8 +54,10 @@ mod compression;
 mod compute;
 mod db;
 /// On-demand per-SNI TLS issuance at scale (cap-req 03): the allowlist-gated, single-flight,
-/// cluster-aware issuer + the resolve-None-retry SNI resolver.
-#[cfg(feature = "acme-dns")]
+/// cluster-aware issuer + the resolve-None-retry SNI resolver. Gated on `cluster` too: issuance uses
+/// the replicated cert store + the leader gate, and the only wiring is the cluster acme-dns serve path
+/// (single-node on-demand is a follow-up).
+#[cfg(all(feature = "acme-dns", feature = "cluster"))]
 mod on_demand_tls;
 // `boatramp kv repair`: offline WAL-tail repair for the SlateDB control-plane store.
 // Gated on `slatedb` (it operates on the SlateDB store).

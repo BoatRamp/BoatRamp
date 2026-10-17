@@ -3577,7 +3577,26 @@ async fn run_cluster(
                 };
             let cert_raft = node.raft.clone();
             let cert_node_id = node.node_id;
-            serve_cluster_acme_dns(
+            // On-demand per-SNI issuance (cap-req 03), when `[serve.on_demand_tls]` is enabled. Built
+            // here (deploy/cert_store/raft in scope); its resolver composes with the static wildcard
+            // resolver inside the serve path, and the engine is held alive across the serve.
+            let on_demand = config
+                .serve
+                .as_ref()
+                .and_then(|s| s.on_demand_tls.as_ref())
+                .and_then(|cfg| {
+                    let od_raft = node.raft.clone();
+                    let od_node_id = node.node_id;
+                    crate::on_demand_tls::from_serve_config(
+                        cfg,
+                        deploy.clone(),
+                        cert_store.clone(),
+                        Arc::new(move || boatramp_cluster::raft::is_leader(&od_raft, od_node_id)),
+                        None,
+                    )
+                });
+            let on_demand_resolver = on_demand.as_ref().map(|o| o.resolver());
+            let result = serve_cluster_acme_dns(
                 &args,
                 addr,
                 deploy,
@@ -3586,8 +3605,11 @@ async fn run_cluster(
                 options,
                 cert_store,
                 move || boatramp_cluster::raft::is_leader(&cert_raft, cert_node_id),
+                on_demand_resolver,
             )
-            .await
+            .await;
+            drop(on_demand); // keep the on-demand engine alive until the serve future returns
+            result
         }
         #[cfg(not(feature = "acme-dns"))]
         TlsMode::AcmeDns => serve_acme_dns(&args, addr, deploy, auth, handlers, options).await,
@@ -3638,6 +3660,7 @@ async fn serve_cluster_acme_dns(
     options: boatramp_server::ServerOptions,
     cert_store: Arc<dyn boatramp_core::cert::CertStore>,
     is_leader: impl Fn() -> bool + Send + Sync + Clone + 'static,
+    on_demand: Option<Arc<crate::on_demand_tls::OnDemandResolver>>,
 ) -> Result<()> {
     use boatramp_acme::acme::CertRequest;
     use std::time::Duration;
@@ -3671,22 +3694,27 @@ async fn serve_cluster_acme_dns(
     // HTTP/3: when enabled, stand up a QUIC endpoint sharing the same
     // ACME certs (build_server_configs gives a `h3`-ALPN config off one resolver);
     // its cert is hot-swapped on renewal below, exactly as the TCP path reloads.
+    // When on-demand TLS is enabled, the config composes the static wildcard certs with the
+    // per-SNI on-demand resolver (cap-req 03); otherwise it is the static resolver alone (unchanged).
     #[cfg(feature = "http3")]
     let (config, h3_endpoint) = if args.http3 {
-        let (tcp, h3) = crate::acme_dns::build_server_configs(entries)?;
+        let (tcp, h3) = crate::acme_dns::build_server_configs_maybe(entries, on_demand.clone())?;
         let endpoint =
             boatramp_server::http3_endpoint(addr, boatramp_server::quinn_server_config(h3)?)?;
         (tcp, Some(endpoint))
     } else {
-        (crate::acme_dns::build_server_config(entries)?, None)
+        (
+            crate::acme_dns::build_server_config_maybe(entries, on_demand.clone())?,
+            None,
+        )
     };
     #[cfg(not(feature = "http3"))]
-    let config = crate::acme_dns::build_server_config(entries)?;
+    let config = crate::acme_dns::build_server_config_maybe(entries, on_demand.clone())?;
     let tls = boatramp_server::ReloadableTls::new(config);
 
     // Background renewal: re-run the leader-gated pass and hot-swap (TCP + h3).
     {
-        let (tls, cert_store, provider, base, cache, domains, is_leader) = (
+        let (tls, cert_store, provider, base, cache, domains, is_leader, on_demand) = (
             tls.clone(),
             cert_store.clone(),
             provider.clone(),
@@ -3694,6 +3722,7 @@ async fn serve_cluster_acme_dns(
             cache.clone(),
             domains.clone(),
             is_leader.clone(),
+            on_demand.clone(),
         );
         #[cfg(feature = "http3")]
         let h3_renew = h3_endpoint.clone();
@@ -3713,7 +3742,10 @@ async fn serve_cluster_acme_dns(
                     Ok(entries) if !entries.is_empty() => {
                         #[cfg(feature = "http3")]
                         if let Some(endpoint) = &h3_renew {
-                            match crate::acme_dns::build_server_configs(entries) {
+                            match crate::acme_dns::build_server_configs_maybe(
+                                entries,
+                                on_demand.clone(),
+                            ) {
                                 Ok((tcp, h3)) => {
                                     tls.reload(tcp);
                                     match boatramp_server::quinn_server_config(h3) {
@@ -3728,7 +3760,10 @@ async fn serve_cluster_acme_dns(
                                 }
                             }
                         } else {
-                            match crate::acme_dns::build_server_config(entries) {
+                            match crate::acme_dns::build_server_config_maybe(
+                                entries,
+                                on_demand.clone(),
+                            ) {
                                 Ok(config) => tls.reload(config),
                                 Err(err) => {
                                     tracing::error!(%err, "cluster acme-dns: rebuilding TLS config failed");
@@ -3736,7 +3771,8 @@ async fn serve_cluster_acme_dns(
                             }
                         }
                         #[cfg(not(feature = "http3"))]
-                        match crate::acme_dns::build_server_config(entries) {
+                        match crate::acme_dns::build_server_config_maybe(entries, on_demand.clone())
+                        {
                             Ok(config) => tls.reload(config),
                             Err(err) => {
                                 tracing::error!(%err, "cluster acme-dns: rebuilding TLS config failed");

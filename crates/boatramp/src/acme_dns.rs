@@ -330,13 +330,44 @@ struct SniCertResolver {
     entries: Vec<(String, Arc<CertifiedKey>)>,
 }
 
-impl ResolvesServerCert for SniCertResolver {
-    fn resolve(&self, hello: ClientHello) -> Option<Arc<CertifiedKey>> {
-        let sni = hello.server_name()?;
+impl SniCertResolver {
+    /// The cached cert matching `sni` (exact or single-label wildcard). Factored out so a composite
+    /// resolver can try the static certs first (see [`CompositeResolver`]).
+    fn resolve_sni(&self, sni: &str) -> Option<Arc<CertifiedKey>> {
         self.entries
             .iter()
             .find(|(pattern, _)| sni_matches(pattern, sni))
             .map(|(_, key)| key.clone())
+    }
+}
+
+impl ResolvesServerCert for SniCertResolver {
+    fn resolve(&self, hello: ClientHello) -> Option<Arc<CertifiedKey>> {
+        self.resolve_sni(hello.server_name()?)
+    }
+}
+
+/// Serves the static (wildcard) certs first, then falls back to on-demand per-SNI issuance
+/// (cap-req 03). A concrete composite because `ResolvesServerCert::resolve` consumes the
+/// `ClientHello` by value — it extracts the SNI + ALPN once and dispatches to each tier's
+/// `resolve_sni`. Only built when `[serve.on_demand_tls]` is enabled; otherwise the static resolver
+/// is used alone (unchanged).
+#[cfg(all(feature = "acme-dns", feature = "cluster"))]
+#[derive(Debug)]
+struct CompositeResolver {
+    static_resolver: Arc<SniCertResolver>,
+    on_demand: Arc<crate::on_demand_tls::OnDemandResolver>,
+}
+
+#[cfg(all(feature = "acme-dns", feature = "cluster"))]
+impl ResolvesServerCert for CompositeResolver {
+    fn resolve(&self, hello: ClientHello) -> Option<Arc<CertifiedKey>> {
+        let sni = hello.server_name()?;
+        let is_acme_alpn = crate::on_demand_tls::is_acme_tls_alpn(&hello);
+        // A static (pre-known wildcard) cert wins; else on-demand per-SNI (serve/issue/trigger).
+        self.static_resolver
+            .resolve_sni(sni)
+            .or_else(|| self.on_demand.resolve_sni(sni, is_acme_alpn))
     }
 }
 
@@ -402,6 +433,74 @@ pub fn build_server_configs(
         .with_cert_resolver(resolver);
     h3.alpn_protocols = vec![b"h3".to_vec()];
     Ok((tcp, h3))
+}
+
+/// A TCP rustls config from an arbitrary cert resolver (shared by the static + composite builders),
+/// advertising ALPN `h2`/`http/1.1`.
+#[cfg(all(feature = "acme-dns", feature = "cluster"))]
+fn server_config_from(resolver: Arc<dyn ResolvesServerCert>) -> rustls::ServerConfig {
+    let mut config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_cert_resolver(resolver);
+    config.alpn_protocols = boatramp_server::alpn_h1_h2();
+    config
+}
+
+/// Like [`build_server_config`] but composed with an **on-demand** per-SNI resolver (cap-req 03): the
+/// static wildcard certs win, then on-demand issuance handles an unknown-but-verified custom domain.
+#[cfg(all(feature = "acme-dns", feature = "cluster"))]
+pub fn build_server_config_composite(
+    entries: Vec<(String, IssuedCert)>,
+    on_demand: Arc<crate::on_demand_tls::OnDemandResolver>,
+) -> Result<rustls::ServerConfig> {
+    let resolver: Arc<dyn ResolvesServerCert> = Arc::new(CompositeResolver {
+        static_resolver: sni_resolver(entries)?,
+        on_demand,
+    });
+    Ok(server_config_from(resolver))
+}
+
+/// Like [`build_server_configs`] (TCP + h3) but composed with the on-demand resolver (cap-req 03).
+#[cfg(all(feature = "http3", feature = "acme-dns", feature = "cluster"))]
+pub fn build_server_configs_composite(
+    entries: Vec<(String, IssuedCert)>,
+    on_demand: Arc<crate::on_demand_tls::OnDemandResolver>,
+) -> Result<(rustls::ServerConfig, rustls::ServerConfig)> {
+    let resolver: Arc<dyn ResolvesServerCert> = Arc::new(CompositeResolver {
+        static_resolver: sni_resolver(entries)?,
+        on_demand,
+    });
+    let tcp = server_config_from(resolver.clone());
+    let mut h3 = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_cert_resolver(resolver);
+    h3.alpn_protocols = vec![b"h3".to_vec()];
+    Ok((tcp, h3))
+}
+
+/// [`build_server_config`], composed with the on-demand resolver when `on_demand` is `Some` (cap-req
+/// 03), else the static resolver alone (unchanged). The serve path calls this at every (re)build site.
+#[cfg(all(feature = "acme-dns", feature = "cluster"))]
+pub fn build_server_config_maybe(
+    entries: Vec<(String, IssuedCert)>,
+    on_demand: Option<Arc<crate::on_demand_tls::OnDemandResolver>>,
+) -> Result<rustls::ServerConfig> {
+    match on_demand {
+        Some(r) => build_server_config_composite(entries, r),
+        None => build_server_config(entries),
+    }
+}
+
+/// [`build_server_configs`] (TCP + h3), composed with the on-demand resolver when `Some` (cap-req 03).
+#[cfg(all(feature = "http3", feature = "acme-dns", feature = "cluster"))]
+pub fn build_server_configs_maybe(
+    entries: Vec<(String, IssuedCert)>,
+    on_demand: Option<Arc<crate::on_demand_tls::OnDemandResolver>>,
+) -> Result<(rustls::ServerConfig, rustls::ServerConfig)> {
+    match on_demand {
+        Some(r) => build_server_configs_composite(entries, r),
+        None => build_server_configs(entries),
+    }
 }
 
 #[cfg(test)]

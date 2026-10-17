@@ -289,9 +289,9 @@ impl OnDemandTls {
         cert_store: Arc<dyn CertStore>,
         is_leader: Arc<dyn Fn() -> bool + Send + Sync>,
         now_unix: Arc<dyn Fn() -> u64 + Send + Sync>,
+        cache: Arc<CertCache>,
         cfg: OnDemandConfig,
     ) -> Self {
-        let cache = Arc::new(CertCache::default());
         let (tx, rx) = mpsc::channel(TRIGGER_QUEUE);
         let sem = Arc::new(Semaphore::new(cfg.max_inflight.max(1)));
         let limiter = RateLimiter::new(cfg.rate_limit_per_hour);
@@ -312,11 +312,6 @@ impl OnDemandTls {
         Self { cache, trigger: tx }
     }
 
-    /// The shared cert cache (a TLS-ALPN-01 solver installs challenge certs here).
-    pub fn cache(&self) -> Arc<CertCache> {
-        Arc::clone(&self.cache)
-    }
-
     /// A `rustls` cert resolver that serves cached certs + triggers on-demand issuance for an
     /// authorized miss (the issuance gate runs in the worker, never on the handshake path).
     pub fn resolver(&self) -> Arc<OnDemandResolver> {
@@ -325,6 +320,76 @@ impl OnDemandTls {
             trigger: self.trigger.clone(),
         })
     }
+}
+
+/// Build the on-demand TLS engine from the node `[serve.on_demand_tls]` config, or `None` when it is
+/// disabled (then the serve path uses the static resolver alone — unchanged). The `#02` allowlist is
+/// the `DeployStore`; issued certs persist (and replicate) via `cert_store`; `is_leader` gates CA
+/// contact. `dns_provider` is the node's ACME DNS provider, required only for the `dns-01` challenge.
+pub fn from_serve_config(
+    cfg: &boatramp_node::config::OnDemandTlsConfig,
+    deploy: boatramp_core::deploy::DeployStore,
+    cert_store: Arc<dyn CertStore>,
+    is_leader: Arc<dyn Fn() -> bool + Send + Sync>,
+    dns_provider: Option<Arc<dyn boatramp_acme::dns::DnsProvider>>,
+) -> Option<OnDemandTls> {
+    if !cfg.enabled {
+        return None;
+    }
+    let challenge = match cfg.challenge {
+        boatramp_node::config::OnDemandChallenge::TlsAlpn01 => AcmeChallenge::TlsAlpn01,
+        boatramp_node::config::OnDemandChallenge::Dns01 => match dns_provider {
+            Some(p) => AcmeChallenge::Dns01(p),
+            None => {
+                // DNS-01 on-demand needs the node's ACME DNS provider wired to this path (a
+                // follow-up); don't silently serve nothing — refuse to start on-demand and log.
+                tracing::error!(
+                    target: "boatramp::acme",
+                    "on_demand_tls challenge = dns-01 but no DNS provider is wired here yet; \
+                     on-demand issuance NOT enabled (use challenge = tls-alpn-01)"
+                );
+                return None;
+            }
+        },
+    };
+    let cache = Arc::new(CertCache::default());
+    let now_unix: Arc<dyn Fn() -> u64 + Send + Sync> = Arc::new(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    });
+    let directory_url = cfg
+        .directory_url
+        .clone()
+        .unwrap_or_else(|| "https://acme-v02.api.letsencrypt.org/directory".to_string());
+    let issuer = Arc::new(AcmeIssuer::new(
+        challenge,
+        directory_url,
+        cfg.contact_email.clone(),
+        Arc::clone(&cache),
+        Arc::clone(&now_unix),
+    ));
+    let gate = Arc::new(DeployGate { deploy });
+    let defaults = OnDemandConfig::default();
+    let runtime = OnDemandConfig {
+        negative_ttl: cfg
+            .negative_ttl_secs
+            .map(Duration::from_secs)
+            .unwrap_or(defaults.negative_ttl),
+        max_inflight: cfg.max_inflight.unwrap_or(defaults.max_inflight),
+        rate_limit_per_hour: cfg
+            .rate_limit_per_hour
+            .unwrap_or(defaults.rate_limit_per_hour),
+        renew_before_secs: defaults.renew_before_secs,
+    };
+    tracing::info!(
+        target: "boatramp::acme",
+        "on-demand per-SNI TLS issuance ENABLED (allowlist = verified custom domains)"
+    );
+    Some(OnDemandTls::start(
+        gate, issuer, cert_store, is_leader, now_unix, cache, runtime,
+    ))
 }
 
 /// A [`ResolvesServerCert`] that serves an issued cert by SNI, a TLS-ALPN-01 challenge cert on the
@@ -341,13 +406,13 @@ impl std::fmt::Debug for OnDemandResolver {
     }
 }
 
-impl ResolvesServerCert for OnDemandResolver {
-    fn resolve(&self, hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
-        let sni = hello.server_name()?;
+impl OnDemandResolver {
+    /// The resolution for a given `sni` (+ whether the handshake is a TLS-ALPN-01 validation),
+    /// factored out of [`resolve`](Self::resolve) so a composite resolver can call it after the static
+    /// resolver misses — `ResolvesServerCert::resolve` consumes the `ClientHello` by value, so a
+    /// composite must extract `sni`/ALPN once and dispatch via this method.
+    pub fn resolve_sni(&self, sni: &str, is_acme_alpn: bool) -> Option<Arc<CertifiedKey>> {
         // A TLS-ALPN-01 validation handshake: serve the challenge cert if a solver installed one.
-        let is_acme_alpn = hello
-            .alpn()
-            .is_some_and(|mut p| p.any(|proto| proto == ACME_TLS_ALPN));
         if is_acme_alpn {
             return self.cache.get_challenge(sni);
         }
@@ -361,6 +426,21 @@ impl ResolvesServerCert for OnDemandResolver {
     }
 }
 
+/// Whether a `ClientHello` carries the `acme-tls/1` ALPN (a TLS-ALPN-01 validation handshake).
+pub fn is_acme_tls_alpn(hello: &ClientHello<'_>) -> bool {
+    hello
+        .alpn()
+        .is_some_and(|mut p| p.any(|proto| proto == ACME_TLS_ALPN))
+}
+
+impl ResolvesServerCert for OnDemandResolver {
+    fn resolve(&self, hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        let sni = hello.server_name()?;
+        let is_acme_alpn = is_acme_tls_alpn(&hello);
+        self.resolve_sni(sni, is_acme_alpn)
+    }
+}
+
 /// How an [`AcmeIssuer`] proves control of a name to the CA.
 pub enum AcmeChallenge {
     /// TLS-ALPN-01 on the 443 edge — no extra port; the challenge cert is served through the shared
@@ -370,11 +450,14 @@ pub enum AcmeChallenge {
     Dns01(Arc<dyn boatramp_acme::dns::DnsProvider>),
 }
 
-/// The ACME-backed [`CertIssuer`]: reuses ONE [`Account`](boatramp_acme::acme::Account) across orders
-/// (persisted by the caller) and issues per-SNI via the configured challenge. For TLS-ALPN-01 it
-/// installs the challenge cert into the shared [`CertCache`] that the resolver serves.
+/// The ACME-backed [`CertIssuer`]: reuses ONE [`Account`](boatramp_acme::acme::Account) across orders,
+/// created **lazily on first issuance** (so enabling on-demand TLS adds no CA round trip at serve
+/// startup) and shared by concurrent issuances via a `OnceCell`. Issues per-SNI via the configured
+/// challenge; for TLS-ALPN-01 it installs the challenge cert into the shared [`CertCache`] the
+/// resolver serves. (Persisting the account across restarts to reuse it fleet-wide is a follow-up;
+/// today each process creates its own on first use — the CA `newAccount` limit is generous.)
 pub struct AcmeIssuer {
-    account: Arc<boatramp_acme::acme::Account>,
+    account: tokio::sync::OnceCell<Arc<boatramp_acme::acme::Account>>,
     challenge: AcmeChallenge,
     directory_url: String,
     contact_email: Option<String>,
@@ -386,9 +469,7 @@ pub struct AcmeIssuer {
 }
 
 impl AcmeIssuer {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
-        account: Arc<boatramp_acme::acme::Account>,
         challenge: AcmeChallenge,
         directory_url: String,
         contact_email: Option<String>,
@@ -396,7 +477,7 @@ impl AcmeIssuer {
         now_unix: Arc<dyn Fn() -> u64 + Send + Sync>,
     ) -> Self {
         Self {
-            account,
+            account: tokio::sync::OnceCell::new(),
             challenge,
             directory_url,
             contact_email,
@@ -407,11 +488,27 @@ impl AcmeIssuer {
             now_unix,
         }
     }
+
+    /// The shared ACME account, created once on first demand (concurrent callers await the same init).
+    async fn account(&self) -> Result<&Arc<boatramp_acme::acme::Account>, String> {
+        self.account
+            .get_or_try_init(|| async {
+                let (acc, _creds) = boatramp_acme::acme::create_account(
+                    &self.directory_url,
+                    self.contact_email.as_deref(),
+                )
+                .await?;
+                Ok::<_, boatramp_acme::acme::AcmeError>(Arc::new(acc))
+            })
+            .await
+            .map_err(|e| e.to_string())
+    }
 }
 
 #[async_trait]
 impl CertIssuer for AcmeIssuer {
     async fn issue(&self, sni: &str) -> Result<StoredCert, String> {
+        let account = self.account().await?;
         let request = boatramp_acme::acme::CertRequest {
             directory_url: self.directory_url.clone(),
             contact_email: self.contact_email.clone(),
@@ -423,13 +520,13 @@ impl CertIssuer for AcmeIssuer {
         let issued = match &self.challenge {
             AcmeChallenge::Dns01(provider) => {
                 let solver = boatramp_acme::acme::Dns01Solver::new(provider.as_ref(), self.dns_ttl);
-                boatramp_acme::acme::obtain_certificate_with(&self.account, &request, &solver).await
+                boatramp_acme::acme::obtain_certificate_with(account, &request, &solver).await
             }
             AcmeChallenge::TlsAlpn01 => {
                 let solver = TlsAlpn01Solver {
                     cache: Arc::clone(&self.cache),
                 };
-                boatramp_acme::acme::obtain_certificate_with(&self.account, &request, &solver).await
+                boatramp_acme::acme::obtain_certificate_with(account, &request, &solver).await
             }
         }
         .map_err(|e| e.to_string())?;
