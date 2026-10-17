@@ -32,6 +32,13 @@ const ACME_TLS_ALPN: &[u8] = b"acme-tls/1";
 /// handshake), so a new-SNI flood can't grow memory.
 const TRIGGER_QUEUE: usize = 256;
 
+/// Replicated-KV prefix for cross-node issuance requests (cap-req 03 #3).
+const CERTREQ_PREFIX: &str = "certreq/";
+/// How often the leader drains the certreq queue.
+const CERTREQ_INTERVAL: Duration = Duration::from_secs(30);
+/// Max certreq markers the leader processes per tick (bounds a flood of follower requests).
+const CERTREQ_BATCH: usize = 64;
+
 /// Stamped `notAfter` for an issued cert, as a conservative renewal heuristic (the issuer doesn't
 /// parse the real `notAfter`): 60 days ≤ a Let's Encrypt ~90-day cert, so `ensure_cert` renews well
 /// before true expiry (never after). Mirrors the cluster-TLS path's assumed-lifetime approach.
@@ -190,6 +197,10 @@ pub struct OnDemandIssuer {
     negative: Mutex<HashMap<String, Instant>>,
     sem: Arc<Semaphore>,
     limiter: RateLimiter,
+    /// The replicated control-plane KV for cross-node issuance requests (cap-req 03 #3): a FOLLOWER
+    /// that sees an authorized miss records `certreq/<sni>`, and the leader's [`certreq_consumer`]
+    /// drains it + issues — so a new SNI that only ever hits a follower still gets a cert.
+    certreq_kv: Arc<dyn boatramp_core::kv::KvStore>,
 }
 
 impl OnDemandIssuer {
@@ -255,9 +266,16 @@ impl OnDemandIssuer {
                     }
                 }
             }
-            // Follower with nothing stored yet: leave the cache empty; the client retries once the
-            // leader has issued + replicated. No CA call here.
-            Ok(None) => {}
+            // Follower with no stored cert for an AUTHORIZED name (we passed the gate above): record a
+            // replicated issuance request so the leader's `certreq_consumer` issues it — a new SNI that
+            // only ever hits a follower would otherwise never get a cert. Idempotent (re-write is a
+            // no-op). The client retries once the leader has issued + replicated. No CA call here.
+            Ok(None) => {
+                let key = format!("{CERTREQ_PREFIX}{sni}");
+                if let Err(e) = self.certreq_kv.put(&key, now.to_le_bytes().to_vec()).await {
+                    tracing::debug!(target: "boatramp::acme", %sni, error = %e, "could not record a cross-node certreq");
+                }
+            }
             Err(e) => {
                 tracing::warn!(target: "boatramp::acme", %sni, error = %e, "on-demand issuance failed");
                 self.deny(sni);
@@ -292,6 +310,52 @@ impl OnDemandIssuer {
             tokio::spawn(Arc::clone(&self).issue_deduped(sni));
         }
     }
+
+    /// Leader-gated drain of the replicated `certreq/*` queue (cap-req 03 #3). For each pending SNI:
+    /// if a cert now exists (issued directly, or replicated) drop the marker; if the name is no longer
+    /// authorized drop it (cleanup); else issue on the leader (`issue_one` → `ensure_cert` issues +
+    /// stores) and drop the marker once stored. So exactly one node (the leader) places the order,
+    /// while any node that saw the SNI can request it. Bounded per tick; a persistently-failing name
+    /// backs off via the negative cache and is retried on later ticks.
+    async fn certreq_consumer(self: Arc<Self>) {
+        loop {
+            tokio::time::sleep(CERTREQ_INTERVAL).await;
+            if !(self.is_leader)() {
+                continue;
+            }
+            self.certreq_drain_once().await;
+        }
+    }
+
+    /// One bounded drain pass over `certreq/*` (the leader-gated body of [`certreq_consumer`], split
+    /// out so it is unit-testable without the timer loop).
+    async fn certreq_drain_once(&self) {
+        let keys = match self
+            .certreq_kv
+            .list_from(CERTREQ_PREFIX, "", CERTREQ_BATCH)
+            .await
+        {
+            Ok(k) => k,
+            Err(e) => {
+                tracing::debug!(target: "boatramp::acme", error = %e, "certreq drain: list failed");
+                return;
+            }
+        };
+        for key in keys {
+            let sni = key.strip_prefix(CERTREQ_PREFIX).unwrap_or(&key).to_string();
+            // Already have the cert, or the name is no longer authorized ⇒ drop the marker.
+            let have_cert = matches!(self.cert_store.get(&sni).await, Ok(Some(_)));
+            if have_cert || !self.gate.is_authorized(&sni).await {
+                let _ = self.certreq_kv.delete(&key).await;
+                continue;
+            }
+            // Issue on the leader; drop the marker once the cert is stored.
+            self.issue_one(&sni).await;
+            if matches!(self.cert_store.get(&sni).await, Ok(Some(_))) {
+                let _ = self.certreq_kv.delete(&key).await;
+            }
+        }
+    }
 }
 
 /// The started on-demand TLS engine: owns the live [`CertCache`] and the trigger channel. Hand
@@ -312,6 +376,7 @@ impl OnDemandTls {
         now_unix: Arc<dyn Fn() -> u64 + Send + Sync>,
         cache: Arc<CertCache>,
         cfg: OnDemandConfig,
+        certreq_kv: Arc<dyn boatramp_core::kv::KvStore>,
     ) -> Self {
         let (tx, rx) = mpsc::channel(TRIGGER_QUEUE);
         let sem = Arc::new(Semaphore::new(cfg.max_inflight.max(1)));
@@ -328,8 +393,11 @@ impl OnDemandTls {
             negative: Mutex::new(HashMap::new()),
             sem,
             limiter,
+            certreq_kv,
         });
-        tokio::spawn(engine.run(rx));
+        tokio::spawn(Arc::clone(&engine).run(rx));
+        // Leader-gated cross-node issuance-request drain (cap-req 03 #3).
+        tokio::spawn(engine.certreq_consumer());
         Self { cache, trigger: tx }
     }
 
@@ -387,6 +455,8 @@ pub fn from_serve_config(
         .directory_url
         .clone()
         .unwrap_or_else(|| "https://acme-v02.api.letsencrypt.org/directory".to_string());
+    // The same replicated KV backs the ACME-account persistence and the cross-node certreq queue.
+    let certreq_kv = Arc::clone(&account_kv);
     let issuer = Arc::new(AcmeIssuer::new(
         challenge,
         directory_url,
@@ -414,7 +484,7 @@ pub fn from_serve_config(
         "on-demand per-SNI TLS issuance ENABLED (allowlist = verified custom domains)"
     );
     Some(OnDemandTls::start(
-        gate, issuer, cert_store, is_leader, now_unix, cache, runtime,
+        gate, issuer, cert_store, is_leader, now_unix, cache, runtime, certreq_kv,
     ))
 }
 
@@ -724,13 +794,33 @@ mod tests {
         lookups: Arc<AtomicUsize>,
         is_leader: bool,
     ) -> Arc<OnDemandIssuer> {
+        engine_full(
+            allowed,
+            orders,
+            lookups,
+            is_leader,
+            mem_store(),
+            Arc::new(boatramp_core::kv::MemoryKv::new()),
+        )
+    }
+
+    /// Like [`engine_as`] but with an explicit (shareable) cert store + certreq KV, for the cross-node
+    /// certreq test where a follower + a leader share the replicated stores.
+    fn engine_full(
+        allowed: &[&str],
+        orders: Arc<AtomicUsize>,
+        lookups: Arc<AtomicUsize>,
+        is_leader: bool,
+        cert_store: Arc<dyn CertStore>,
+        certreq_kv: Arc<dyn boatramp_core::kv::KvStore>,
+    ) -> Arc<OnDemandIssuer> {
         Arc::new(OnDemandIssuer {
             gate: Arc::new(StubGate {
                 allowed: allowed.iter().map(|s| s.to_string()).collect(),
                 lookups,
             }),
             issuer: Arc::new(StubIssuer { orders }),
-            cert_store: mem_store(),
+            cert_store,
             is_leader: Arc::new(move || is_leader),
             now_unix: Arc::new(|| 1_000_000),
             cache: Arc::new(CertCache::default()),
@@ -739,6 +829,7 @@ mod tests {
             negative: Mutex::new(HashMap::new()),
             sem: Arc::new(Semaphore::new(4)),
             limiter: RateLimiter::new(0),
+            certreq_kv,
         })
     }
 
@@ -849,5 +940,89 @@ mod tests {
             "an unverified SNI must place NO ACME order (the abuse gate)"
         );
         println!("ON-DEMAND ABUSE GATE OK: an unverified SNI placed no ACME order");
+    }
+
+    /// cap-req 03 #3: a new SNI that only ever hits a FOLLOWER still gets a cert — the follower records
+    /// a replicated `certreq` marker, and the leader's drain issues it (exactly once) + clears the
+    /// marker; a bogus/unauthorized marker is cleaned up without issuing.
+    #[tokio::test]
+    async fn certreq_queue_lets_a_follower_trigger_leader_issuance() {
+        let certreq_kv: Arc<dyn boatramp_core::kv::KvStore> =
+            Arc::new(boatramp_core::kv::MemoryKv::new());
+        let cert_store = mem_store();
+
+        // A FOLLOWER sees an authorized miss: NO order, but records a certreq marker.
+        let follower_orders = Arc::new(AtomicUsize::new(0));
+        let follower = engine_full(
+            &["mail.example.com"],
+            follower_orders.clone(),
+            Arc::new(AtomicUsize::new(0)),
+            false,
+            cert_store.clone(),
+            certreq_kv.clone(),
+        );
+        follower.issue_one("mail.example.com").await;
+        assert_eq!(
+            follower_orders.load(Ordering::SeqCst),
+            0,
+            "a follower places no order"
+        );
+        assert!(
+            certreq_kv
+                .get("certreq/mail.example.com")
+                .await
+                .unwrap()
+                .is_some(),
+            "the follower recorded a cross-node certreq marker"
+        );
+
+        // The LEADER drains: issues once, stores (replicates), and clears the marker.
+        let leader_orders = Arc::new(AtomicUsize::new(0));
+        let leader = engine_full(
+            &["mail.example.com"],
+            leader_orders.clone(),
+            Arc::new(AtomicUsize::new(0)),
+            true,
+            cert_store.clone(),
+            certreq_kv.clone(),
+        );
+        leader.certreq_drain_once().await;
+        assert_eq!(
+            leader_orders.load(Ordering::SeqCst),
+            1,
+            "the leader issued exactly once"
+        );
+        assert!(
+            cert_store.get("mail.example.com").await.unwrap().is_some(),
+            "the issued cert is stored (replicates to followers)"
+        );
+        assert!(
+            certreq_kv
+                .get("certreq/mail.example.com")
+                .await
+                .unwrap()
+                .is_none(),
+            "the marker is cleared after issuance"
+        );
+
+        // A bogus/unauthorized certreq marker is cleaned up without issuing.
+        certreq_kv
+            .put("certreq/evil.attacker.test", Vec::new())
+            .await
+            .unwrap();
+        leader.certreq_drain_once().await;
+        assert_eq!(
+            leader_orders.load(Ordering::SeqCst),
+            1,
+            "no order for an unauthorized certreq"
+        );
+        assert!(
+            certreq_kv
+                .get("certreq/evil.attacker.test")
+                .await
+                .unwrap()
+                .is_none(),
+            "the bogus marker is cleaned up"
+        );
     }
 }
