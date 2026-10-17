@@ -3577,26 +3577,11 @@ async fn run_cluster(
                 };
             let cert_raft = node.raft.clone();
             let cert_node_id = node.node_id;
-            // On-demand per-SNI issuance (cap-req 03), when `[serve.on_demand_tls]` is enabled. Built
-            // here (deploy/cert_store/raft in scope); its resolver composes with the static wildcard
-            // resolver inside the serve path, and the engine is held alive across the serve.
-            let on_demand = config
-                .serve
-                .as_ref()
-                .and_then(|s| s.on_demand_tls.as_ref())
-                .and_then(|cfg| {
-                    let od_raft = node.raft.clone();
-                    let od_node_id = node.node_id;
-                    crate::on_demand_tls::from_serve_config(
-                        cfg,
-                        deploy.clone(),
-                        cert_store.clone(),
-                        Arc::new(move || boatramp_cluster::raft::is_leader(&od_raft, od_node_id)),
-                        None,
-                    )
-                });
-            let on_demand_resolver = on_demand.as_ref().map(|o| o.resolver());
-            let result = serve_cluster_acme_dns(
+            // On-demand per-SNI issuance (cap-req 03), when `[serve.on_demand_tls]` is enabled. The
+            // engine is built INSIDE `serve_cluster_acme_dns` (where the ACME DNS provider is in scope,
+            // so `dns-01` on-demand works too) and held alive across the serve.
+            let on_demand_cfg = config.serve.as_ref().and_then(|s| s.on_demand_tls.clone());
+            serve_cluster_acme_dns(
                 &args,
                 addr,
                 deploy,
@@ -3605,11 +3590,9 @@ async fn run_cluster(
                 options,
                 cert_store,
                 move || boatramp_cluster::raft::is_leader(&cert_raft, cert_node_id),
-                on_demand_resolver,
+                on_demand_cfg,
             )
-            .await;
-            drop(on_demand); // keep the on-demand engine alive until the serve future returns
-            result
+            .await
         }
         #[cfg(not(feature = "acme-dns"))]
         TlsMode::AcmeDns => serve_acme_dns(&args, addr, deploy, auth, handlers, options).await,
@@ -3660,7 +3643,7 @@ async fn serve_cluster_acme_dns(
     options: boatramp_server::ServerOptions,
     cert_store: Arc<dyn boatramp_core::cert::CertStore>,
     is_leader: impl Fn() -> bool + Send + Sync + Clone + 'static,
-    on_demand: Option<Arc<crate::on_demand_tls::OnDemandResolver>>,
+    on_demand_cfg: Option<boatramp_node::config::OnDemandTlsConfig>,
 ) -> Result<()> {
     use boatramp_acme::acme::CertRequest;
     use std::time::Duration;
@@ -3673,6 +3656,20 @@ async fn serve_cluster_acme_dns(
     let kind = parse_dns_provider(&args.acme_dns_provider)?;
     let provider: Arc<dyn boatramp_acme::dns::DnsProvider> =
         crate::acme_dns::build_provider(kind).await?.into();
+    // On-demand per-SNI issuance (cap-req 03): build the engine here, where the ACME DNS provider is
+    // in hand (so a `dns-01` challenge works), with the #02 allowlist (`deploy`), the replicated cert
+    // store, and the leader gate. `on_demand_engine` is held for the whole serve; `on_demand` is its
+    // resolver, composed with the static wildcard resolver at every config (re)build below.
+    let on_demand_engine = on_demand_cfg.and_then(|cfg| {
+        crate::on_demand_tls::from_serve_config(
+            &cfg,
+            deploy.clone(),
+            cert_store.clone(),
+            Arc::new(is_leader.clone()),
+            Some(provider.clone()),
+        )
+    });
+    let on_demand = on_demand_engine.as_ref().map(|o| o.resolver());
     let base = CertRequest {
         directory_url: args.acme_directory.clone(),
         contact_email: args.acme_contact.clone(),
