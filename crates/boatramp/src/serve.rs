@@ -3566,20 +3566,22 @@ async fn run_cluster(
         // replicated control plane; every node serves the replicated cert.
         #[cfg(feature = "acme-dns")]
         TlsMode::AcmeDns => {
-            // Wrap replicated cert private keys at rest when `[secrets]` is set.
-            let cert_store: Arc<dyn boatramp_core::cert::CertStore> =
-                match build_cert_envelope(config.secrets.as_ref(), &data_dir)? {
-                    Some(envelope) => Arc::new(boatramp_core::cert::KvCertStore::with_envelope(
-                        node.kv.clone(),
-                        envelope,
-                    )),
-                    None => Arc::new(boatramp_core::cert::KvCertStore::new(node.kv.clone())),
-                };
+            // Wrap replicated cert private keys at rest when `[secrets]` is set. The envelope is also
+            // reused to wrap the on-demand ACME account credentials (cap-req 03 #2).
+            let cert_envelope = build_cert_envelope(config.secrets.as_ref(), &data_dir)?;
+            let cert_store: Arc<dyn boatramp_core::cert::CertStore> = match &cert_envelope {
+                Some(envelope) => Arc::new(boatramp_core::cert::KvCertStore::with_envelope(
+                    node.kv.clone(),
+                    envelope.clone(),
+                )),
+                None => Arc::new(boatramp_core::cert::KvCertStore::new(node.kv.clone())),
+            };
             let cert_raft = node.raft.clone();
             let cert_node_id = node.node_id;
             // On-demand per-SNI issuance (cap-req 03), when `[serve.on_demand_tls]` is enabled. The
             // engine is built INSIDE `serve_cluster_acme_dns` (where the ACME DNS provider is in scope,
-            // so `dns-01` on-demand works too) and held alive across the serve.
+            // so `dns-01` on-demand works too) and held alive across the serve. The replicated KV +
+            // envelope persist the ACME account across restarts/replicas (#2).
             let on_demand_cfg = config.serve.as_ref().and_then(|s| s.on_demand_tls.clone());
             serve_cluster_acme_dns(
                 &args,
@@ -3591,6 +3593,8 @@ async fn run_cluster(
                 cert_store,
                 move || boatramp_cluster::raft::is_leader(&cert_raft, cert_node_id),
                 on_demand_cfg,
+                node.kv.clone(),
+                cert_envelope,
             )
             .await
         }
@@ -3644,6 +3648,8 @@ async fn serve_cluster_acme_dns(
     cert_store: Arc<dyn boatramp_core::cert::CertStore>,
     is_leader: impl Fn() -> bool + Send + Sync + Clone + 'static,
     on_demand_cfg: Option<boatramp_node::config::OnDemandTlsConfig>,
+    account_kv: Arc<dyn boatramp_core::kv::KvStore>,
+    account_envelope: Option<Arc<dyn boatramp_core::envelope::KeyEnvelope>>,
 ) -> Result<()> {
     use boatramp_acme::acme::CertRequest;
     use std::time::Duration;
@@ -3667,6 +3673,8 @@ async fn serve_cluster_acme_dns(
             cert_store.clone(),
             Arc::new(is_leader.clone()),
             Some(provider.clone()),
+            account_kv.clone(),
+            account_envelope.clone(),
         )
     });
     let on_demand = on_demand_engine.as_ref().map(|o| o.resolver());

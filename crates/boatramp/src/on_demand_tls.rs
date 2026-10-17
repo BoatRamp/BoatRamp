@@ -347,12 +347,15 @@ impl OnDemandTls {
 /// disabled (then the serve path uses the static resolver alone — unchanged). The `#02` allowlist is
 /// the `DeployStore`; issued certs persist (and replicate) via `cert_store`; `is_leader` gates CA
 /// contact. `dns_provider` is the node's ACME DNS provider, required only for the `dns-01` challenge.
+#[allow(clippy::too_many_arguments)]
 pub fn from_serve_config(
     cfg: &boatramp_node::config::OnDemandTlsConfig,
     deploy: boatramp_core::deploy::DeployStore,
     cert_store: Arc<dyn CertStore>,
     is_leader: Arc<dyn Fn() -> bool + Send + Sync>,
     dns_provider: Option<Arc<dyn boatramp_acme::dns::DnsProvider>>,
+    account_kv: Arc<dyn boatramp_core::kv::KvStore>,
+    account_envelope: Option<Arc<dyn boatramp_core::envelope::KeyEnvelope>>,
 ) -> Option<OnDemandTls> {
     if !cfg.enabled {
         return None;
@@ -390,6 +393,8 @@ pub fn from_serve_config(
         cfg.contact_email.clone(),
         Arc::clone(&cache),
         Arc::clone(&now_unix),
+        account_kv,
+        account_envelope,
     ));
     let gate = Arc::new(DeployGate { deploy });
     let defaults = OnDemandConfig::default();
@@ -487,15 +492,24 @@ pub struct AcmeIssuer {
     propagation_delay: Duration,
     timeout: Duration,
     now_unix: Arc<dyn Fn() -> u64 + Send + Sync>,
+    /// Where the ACME account credentials persist (replicated control-plane KV), so the account is
+    /// reused across restarts/replicas instead of re-created per process (CA `newAccount` limit).
+    account_kv: Arc<dyn boatramp_core::kv::KvStore>,
+    /// Wraps the stored account credentials at rest (the account key is sensitive), when `[secrets]`
+    /// is configured — mirrors `KvCertStore`'s key-wrap. `None` ⇒ stored in the clear.
+    account_envelope: Option<Arc<dyn boatramp_core::envelope::KeyEnvelope>>,
 }
 
 impl AcmeIssuer {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         challenge: AcmeChallenge,
         directory_url: String,
         contact_email: Option<String>,
         cache: Arc<CertCache>,
         now_unix: Arc<dyn Fn() -> u64 + Send + Sync>,
+        account_kv: Arc<dyn boatramp_core::kv::KvStore>,
+        account_envelope: Option<Arc<dyn boatramp_core::envelope::KeyEnvelope>>,
     ) -> Self {
         Self {
             account: tokio::sync::OnceCell::new(),
@@ -507,22 +521,78 @@ impl AcmeIssuer {
             propagation_delay: Duration::from_secs(15),
             timeout: Duration::from_secs(120),
             now_unix,
+            account_kv,
+            account_envelope,
         }
     }
 
-    /// The shared ACME account, created once on first demand (concurrent callers await the same init).
+    /// The replicated-KV key the account credentials persist under (per ACME directory).
+    fn account_key(&self) -> String {
+        format!(
+            "acme-account/{}",
+            boatramp_core::deploy::sha256_hex(self.directory_url.as_bytes())
+        )
+    }
+
+    /// Serialize + (optionally) wrap the account credentials for storage.
+    async fn encode_creds(
+        &self,
+        creds: &boatramp_acme::acme::AccountCredentials,
+    ) -> Result<Vec<u8>, String> {
+        let json = serde_json::to_vec(creds).map_err(|e| e.to_string())?;
+        match &self.account_envelope {
+            Some(env) => env.wrap(&json).await.map_err(|e| e.to_string()),
+            None => Ok(json),
+        }
+    }
+
+    /// Unwrap + deserialize stored account credentials.
+    async fn decode_creds(
+        &self,
+        raw: &[u8],
+    ) -> Result<boatramp_acme::acme::AccountCredentials, String> {
+        let json = match &self.account_envelope {
+            Some(env) => env.unwrap(raw).await.map_err(|e| e.to_string())?,
+            None => raw.to_vec(),
+        };
+        serde_json::from_slice(&json).map_err(|e| e.to_string())
+    }
+
+    /// The shared ACME account: created once on first demand (concurrent callers await the same init),
+    /// restored from the replicated store across restarts/replicas, else created + persisted. Any
+    /// load/restore failure falls through to create (never a hard failure).
     async fn account(&self) -> Result<&Arc<boatramp_acme::acme::Account>, String> {
         self.account
             .get_or_try_init(|| async {
-                let (acc, _creds) = boatramp_acme::acme::create_account(
+                let key = self.account_key();
+                // 1. Try to restore a previously-stored account (no CA `newAccount`).
+                if let Ok(Some(raw)) = self.account_kv.get(&key).await {
+                    match self.decode_creds(&raw).await {
+                        Ok(creds) => match boatramp_acme::acme::restore_account(creds).await {
+                            Ok(acc) => return Ok(Arc::new(acc)),
+                            Err(e) => tracing::warn!(target: "boatramp::acme", error = %e, "stored ACME account failed to restore; creating a new one"),
+                        },
+                        Err(e) => tracing::warn!(target: "boatramp::acme", error = %e, "stored ACME account credentials were undecodable; creating a new one"),
+                    }
+                }
+                // 2. Create + persist (best-effort; a persist failure only costs a re-create later).
+                let (acc, creds) = boatramp_acme::acme::create_account(
                     &self.directory_url,
                     self.contact_email.as_deref(),
                 )
-                .await?;
-                Ok::<_, boatramp_acme::acme::AcmeError>(Arc::new(acc))
+                .await
+                .map_err(|e| e.to_string())?;
+                match self.encode_creds(&creds).await {
+                    Ok(stored) => {
+                        if let Err(e) = self.account_kv.put(&key, stored).await {
+                            tracing::warn!(target: "boatramp::acme", error = %e, "could not persist the ACME account (re-created on the next restart)");
+                        }
+                    }
+                    Err(e) => tracing::warn!(target: "boatramp::acme", error = %e, "could not encode the ACME account for storage"),
+                }
+                Ok::<_, String>(Arc::new(acc))
             })
             .await
-            .map_err(|e| e.to_string())
     }
 }
 
