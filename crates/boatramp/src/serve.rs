@@ -2680,6 +2680,18 @@ fn spawn_listeners(
         } else {
             None
         };
+        // Declarative STARTTLS grammar (cap-req 06, Stage B): carried alongside the TLS material.
+        // Validation already guarantees a `starttls` block implies cert+key, so the pump always has a
+        // `tls_config` to upgrade into. `None` ⇒ implicit TLS / plaintext (unchanged). Under
+        // `not(tls)` a TLS-declared listener already `continue`d above, so this is just `None`.
+        let starttls_grammar: Option<boatramp_server::tcp_starttls::StarttlsGrammar> =
+            l.tls.as_ref().and_then(|t| t.starttls.as_ref()).map(|s| {
+                boatramp_server::tcp_starttls::StarttlsGrammar {
+                    trigger: s.trigger.clone(),
+                    response: s.response.clone(),
+                    tag_capture: s.tag_capture,
+                }
+            });
         let fn_config = boatramp_core::function::FunctionConfig {
             imports: l.imports.clone(),
             env: l.env.clone(),
@@ -2708,6 +2720,7 @@ fn spawn_listeners(
                     .unwrap_or(boatramp_node::config::DEFAULT_LISTENER_MAX_CONN_DURATION_MS),
             ),
             tls: tls_config,
+            starttls: starttls_grammar,
         };
         boatramp_server::tcp_listener_serve::spawn_listener(
             handlers.clone(),

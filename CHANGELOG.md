@@ -60,8 +60,25 @@ inert until configured — a node that enables neither behaves exactly as before
   crypto). The private key lives only in the host's rustls config, never reaching the guest; a failed
   handshake drops the connection (no plaintext fallthrough); a TLS-declared listener on a build without
   the `tls` feature, or with an unloadable cert, is not bound (fail-closed). Reuses the HTTP edge's
-  rustls stack + conn-lane hardening. STARTTLS (in-band upgrade on 25/587/143) is a follow-up. No
-  guest/WIT change.
+  rustls stack + conn-lane hardening. No guest/WIT change.
+
+- **STARTTLS for inbound guest listeners (declarative, protocol-agnostic).** The same `tls` block may
+  now carry a `starttls` sub-block, turning a listener into a STARTTLS endpoint (25/587/143): the
+  connection starts **plaintext**, the host forwards the guest's own dialog (greeting, capability
+  advertisement) verbatim, and on a configured trigger line it upgrades the socket to TLS in-band,
+  then passes the decrypted bytes through — so a guest can serve SMTP/IMAP/POP3 STARTTLS while doing
+  no crypto and with no WIT/shim change (it runs byte-identically to a plaintext listener). The one
+  protocol-specific fact is **config data** — `starttls: ( trigger: "STARTTLS", response: "{tag} OK
+  begin TLS", tag_capture: true )` (IMAP; omit `tag_capture` for SMTP `STARTTLS` / POP3 `STLS`) — and
+  the host runs a generic trigger→response→upgrade engine with no mail-protocol shapes hardcoded.
+  **Injection-safe by construction** (RFC 3207 §4 / the CVE-2011-0411 class): the host reads the
+  pre-TLS bytes one at a time and stops at the trigger line's terminator, so a byte pipelined after
+  `STARTTLS` is consumed only by the TLS handshake (a malformed ClientHello ⇒ the handshake fails and
+  the connection drops) — never buffered and replayed as a post-TLS command. A STARTTLS listener
+  still requires `cert_file` + `key_file`; a `starttls` block without them, an empty trigger, or a
+  `{tag}` response without `tag_capture`, is refused at config load. The per-connection idle /
+  max-duration / max-conns bounds apply throughout (a client that connects but never sends the
+  trigger idle-times-out).
 
 - **Optional swap-in `-debug` container images.** The Release GHCR step now also builds + pushes
   `…:<tag>-debug` (+ `:debug`) variants of the base and cloudflare images, bundling a shell +
