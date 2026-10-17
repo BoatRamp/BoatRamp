@@ -383,8 +383,12 @@ async fn classify(head: &[u8], ctx: &SpliceCtx) -> Option<SplicePlan> {
     if !target.starts_with("http://") {
         return None;
     }
-    // Resolve + SSRF-pin exactly like the userspace proxy path.
-    let resolved_target = proxy::resolve_target(target, &ctx.posture).await.ok()?;
+    // Resolve + SSRF-pin exactly like the userspace proxy path. The splice fast-path serves only a
+    // SITE gateway upstream (operator tier), so the operator address policy applies.
+    let resolved_target =
+        proxy::resolve_target(target, proxy::GatewayTargetPolicy::Operator, &ctx.posture)
+            .await
+            .ok()?;
     if !proxy::gateway_addr_allowed(resolved_target.addr.ip(), &ctx.posture) {
         return None;
     }
@@ -1031,6 +1035,7 @@ mod tests {
                     matches: "/**".into(),
                     upstream: "backend".into(),
                 }],
+                ..Default::default()
             }),
             ..Default::default()
         };

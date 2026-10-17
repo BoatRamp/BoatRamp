@@ -1274,39 +1274,57 @@ async fn serve_resolved(
             return apply_vary(not_found(), &vary);
         }
     }
-    // Gateway: an operator-declared route forwards to a private
-    // upstream. Independent of the handlers feature; runs after redirects/
-    // handlers and **wins over static files** (the operator declared it). Access
-    // control already ran up front; only declared upstreams reach private addrs.
-    if !matches!(outcome, Outcome::Redirect { .. })
-        && let Some(gw) = site_config
-            .and_then(|c| c.gateway.as_ref())
-            .filter(|g| g.is_enabled())
-        && let Some(route) = gw.match_route(request_path)
-    {
-        return apply_vary(
-            match gw.upstreams.get(&route.upstream) {
-                Some(upstream) => {
-                    // A compute-backed upstream resolves its pool live from
-                    // the workload's healthy replica endpoints. Record
-                    // the request as activity so the reconcile loop
-                    // keeps the workload warm / wakes it, and only sleeps it
-                    // once genuinely idle.
+    // Gateway (symmetric two-tier): a route — SITE/operator OR PROJECT/app-author — forwards to an
+    // upstream. Operator routes win; a project route under an operator `reserved_paths` glob is
+    // barred; a project upstream may reach ONLY its own compute / a public host / a `shared` site
+    // grant (enforced by the tier-aware address policy in the proxy). Independent of the handlers
+    // feature; runs after redirects/handlers and **wins over static files**. Access control already
+    // ran up front; only an authorized upstream reaches a private addr.
+    if !matches!(outcome, Outcome::Redirect { .. }) {
+        use boatramp_core::gateway::{GatewayResolution, GatewayTier};
+        let site_gw = site_config.and_then(|c| c.gateway.as_ref());
+        let project_gw = &manifest.config.gateway;
+        // Inert unless some tier declares a route.
+        if project_gw.is_enabled() || site_gw.is_some_and(|g| g.is_enabled()) {
+            match boatramp_core::gateway::resolve_gateway(Some(project_gw), site_gw, request_path) {
+                // No gateway route matched — fall through to the rest of the pipeline.
+                GatewayResolution::NoMatch => {}
+                // A route matched but its upstream didn't resolve (unknown name, or an ungranted
+                // cross-tier reference) — 502, preserving the existing operator behavior for both tiers.
+                GatewayResolution::UnknownUpstream { .. } => {
+                    return apply_vary(
+                        (
+                            StatusCode::BAD_GATEWAY,
+                            "gateway route references an unknown upstream\n",
+                        )
+                            .into_response(),
+                        &vary,
+                    );
+                }
+                GatewayResolution::Matched(m) => {
+                    let upstream = m.upstream;
+                    // The tier's address policy: operator (incl. a `shared` reference) ⇒ posture-gated;
+                    // a project own-workload ⇒ its project-scoped replica addr; a project raw target ⇒
+                    // public-only (the bright line, posture-independent).
+                    let policy = match (m.tier, upstream.compute.is_some()) {
+                        (GatewayTier::Operator, _) => crate::proxy::GatewayTargetPolicy::Operator,
+                        (GatewayTier::Project, true) => {
+                            crate::proxy::GatewayTargetPolicy::ProjectOwnWorkload
+                        }
+                        (GatewayTier::Project, false) => {
+                            crate::proxy::GatewayTargetPolicy::ProjectRaw
+                        }
+                    };
+                    // A compute-backed upstream resolves its pool live from the workload's healthy
+                    // replica endpoints (project-scoped), recording activity so the reconcile loop keeps
+                    // it warm / wakes a parked replica. Identical to the prior operator path — now also
+                    // the project own-workload path.
                     let (compute_backends, compute_regions) = match &upstream.compute {
                         Some(workload) => {
-                            // Resolve the compute upstream against the site's OWN
-                            // project (not `default`), so a non-default tenant's
-                            // replica state is found — closing the project-blind
-                            // resolution that 502'd / never woke it.
                             let compute_project = project.unwrap_or(ProjectRef::DEFAULT.as_str());
                             gateway::record_activity(workload);
                             let mut pool =
                                 compute_endpoints(deploy, compute_project, workload).await;
-                            // Wake-from-zero: no live replica but one
-                            // is parked → nudge the reconcile loop to restore it
-                            // and hold this request until it's serving. The cold
-                            // start is invisible to the client; only a genuine
-                            // restore failure (timeout) falls through to 502.
                             if pool.is_empty()
                                 && has_parked_replica(deploy, compute_project, workload).await
                             {
@@ -1319,8 +1337,6 @@ async fn serve_resolved(
                                 )
                                 .await;
                             }
-                            // FA-8: for a nearest-region pool, tag each replica
-                            // endpoint with its node's region (from placement).
                             let regions =
                                 if upstream.lb == boatramp_core::gateway::LbPolicy::Nearest {
                                     Some(
@@ -1334,26 +1350,25 @@ async fn serve_resolved(
                         }
                         None => (None, None),
                     };
-                    dispatch_gateway(
-                        request,
-                        site.unwrap_or(""),
-                        &route.upstream,
-                        upstream,
-                        request_path,
-                        client_ip,
-                        compute_backends,
-                        compute_regions,
-                    )
-                    .await
+                    return apply_vary(
+                        dispatch_gateway(
+                            request,
+                            site.unwrap_or(""),
+                            project,
+                            m.upstream_name,
+                            upstream,
+                            policy,
+                            request_path,
+                            client_ip,
+                            compute_backends,
+                            compute_regions,
+                        )
+                        .await,
+                        &vary,
+                    );
                 }
-                None => (
-                    StatusCode::BAD_GATEWAY,
-                    "gateway route references an unknown upstream\n",
-                )
-                    .into_response(),
-            },
-            &vary,
-        );
+            }
+        }
     }
     // Plaintext (not TLS) gates the zero-copy `sendfile` static body. The listener
     // stamps `ServedOverTls`; absent (an unusual direct call) defaults to plaintext,

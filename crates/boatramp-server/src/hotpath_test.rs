@@ -217,6 +217,7 @@ async fn seed(up_addr: SocketAddr) -> DeployStore {
                         matches: "/**".into(),
                         upstream: "backend".into(),
                     }],
+                    ..Default::default()
                 }),
                 ..Default::default()
             },

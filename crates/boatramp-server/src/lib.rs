@@ -4035,6 +4035,49 @@ mod tests {
         assert!(!gateway_addr_allowed(metadata, &loose));
     }
 
+    #[test]
+    fn gateway_addr_gate_is_tier_aware() {
+        use crate::proxy::{GatewayTargetPolicy, gateway_addr_allowed_for};
+        use boatramp_core::security::SecurityProfile;
+        let strict = SecurityProfile::MultiTenant.preset();
+        let loose = SecurityProfile::SingleTenant.preset(); // allows SITE private upstreams
+
+        let public: IpAddr = "93.184.216.34".parse().unwrap();
+        let private: IpAddr = "10.1.2.3".parse().unwrap();
+        let metadata: IpAddr = IpAddr::V4(CLOUD_METADATA_IPV4);
+
+        // Operator arm == the wrapper (posture is the authority).
+        assert_eq!(
+            gateway_addr_allowed_for(private, GatewayTargetPolicy::Operator, &loose),
+            gateway_addr_allowed(private, &loose)
+        );
+        assert!(gateway_addr_allowed_for(private, GatewayTargetPolicy::Operator, &loose));
+        assert!(!gateway_addr_allowed_for(private, GatewayTargetPolicy::Operator, &strict));
+
+        // ProjectRaw: public-only, POSTURE-INDEPENDENT — a private target is refused even under the
+        // permissive posture (the project tier can never self-grant private reach).
+        assert!(gateway_addr_allowed_for(public, GatewayTargetPolicy::ProjectRaw, &strict));
+        assert!(gateway_addr_allowed_for(public, GatewayTargetPolicy::ProjectRaw, &loose));
+        assert!(!gateway_addr_allowed_for(private, GatewayTargetPolicy::ProjectRaw, &strict));
+        assert!(
+            !gateway_addr_allowed_for(private, GatewayTargetPolicy::ProjectRaw, &loose),
+            "a project raw target must be refused a private addr even under a permissive posture"
+        );
+
+        // ProjectOwnWorkload: a project-scoped replica addr (private by design) is admitted.
+        assert!(gateway_addr_allowed_for(private, GatewayTargetPolicy::ProjectOwnWorkload, &strict));
+
+        // Cloud-metadata is refused under EVERY policy (defense in depth).
+        for policy in [
+            GatewayTargetPolicy::Operator,
+            GatewayTargetPolicy::ProjectRaw,
+            GatewayTargetPolicy::ProjectOwnWorkload,
+        ] {
+            assert!(!gateway_addr_allowed_for(metadata, policy, &loose));
+            assert!(!gateway_addr_allowed_for(metadata, policy, &strict));
+        }
+    }
+
     /// Task #492 per-guest secret allowlist at the REAL `resolve_env` choke point (the exact
     /// function `build_bindings` calls). Two guests share one 2-entry site pool: guest A declares
     /// an allowlist of one key, guest B declares none. Asserts A's resolved env carries ONLY its

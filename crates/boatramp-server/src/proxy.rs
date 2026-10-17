@@ -743,6 +743,7 @@ static RESOLVED_TARGETS: std::sync::LazyLock<
 /// ready-to-return error response.
 pub(crate) async fn resolve_target(
     target: &str,
+    policy: GatewayTargetPolicy,
     posture: &boatramp_core::security::SecurityPosture,
 ) -> Result<ResolvedTarget, Response> {
     if let Some(hit) = RESOLVED_TARGETS.lock().unwrap().get(target)
@@ -774,10 +775,10 @@ pub(crate) async fn resolve_target(
         .into_iter()
         .flatten()
     {
-        // Refuse cloud-metadata always, and (unless the operator opts in) any
-        // non-global address — checked post-resolution so a hostname can't
-        // DNS-rebind to an internal target.
-        if !gateway_addr_allowed(addr.ip(), posture) {
+        // Refuse cloud-metadata always, and apply the tier's address rule — checked post-resolution
+        // so a hostname can't DNS-rebind to an internal target (a project `discover`/DNS target that
+        // resolves private is refused here by `ProjectRaw`, no special-casing).
+        if !gateway_addr_allowed_for(addr.ip(), policy, posture) {
             tracing::warn!(
                 %host, ip = %addr.ip(),
                 "gateway upstream refused: address not permitted by security posture"
@@ -839,10 +840,48 @@ pub(super) fn gateway_addr_allowed(
     ip: IpAddr,
     posture: &boatramp_core::security::SecurityPosture,
 ) -> bool {
+    gateway_addr_allowed_for(ip, GatewayTargetPolicy::Operator, posture)
+}
+
+/// Which tier's authority governs a gateway upstream — and therefore which address rule binds it
+/// (symmetric two-tier gateway, cap-req gateway). Derived once per request from the resolved route
+/// match ([`boatramp_core::gateway::resolve_gateway`]) in `serve_resolved`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum GatewayTargetPolicy {
+    /// A site/operator-declared upstream (or a project route referencing a `shared` site upstream):
+    /// the operator authorized the reach, so the node posture is the authority (today's behavior).
+    Operator,
+    /// A project-declared upstream with a RAW target (static/pool/DNS): the project tier may only
+    /// reach **public** hosts — this is POSTURE-INDEPENDENT (`allow_site_private_upstreams` is never
+    /// consulted), so a project can never self-grant private reach (RESTRICTION 1, the bright line).
+    ProjectRaw,
+    /// A project-declared upstream bound to the project's **own compute workload**: the resolved
+    /// replica address is private by design and admitted here, safe because the `(project, workload)`
+    /// resolver is project-scoped (a project can only name its own workloads).
+    ProjectOwnWorkload,
+}
+
+/// Whether a resolved gateway-upstream address is permitted under `policy` + `posture`. The
+/// cloud-metadata endpoint is **always** refused (defense in depth). See [`GatewayTargetPolicy`] for
+/// the per-tier rule. `gateway_addr_allowed` is the `Operator` arm (site-tier, posture-gated).
+pub(crate) fn gateway_addr_allowed_for(
+    ip: IpAddr,
+    policy: GatewayTargetPolicy,
+    posture: &boatramp_core::security::SecurityPosture,
+) -> bool {
     if ip == IpAddr::V4(CLOUD_METADATA_IPV4) {
         return false;
     }
-    posture.allow_site_private_upstreams || boatramp_core::access::is_global_ip(ip)
+    match policy {
+        // Public-only, POSTURE-INDEPENDENT — the project tier never authorizes private reach.
+        GatewayTargetPolicy::ProjectRaw => boatramp_core::access::is_global_ip(ip),
+        // A project-scoped own-workload replica (private by design); safe via project-scoped resolution.
+        GatewayTargetPolicy::ProjectOwnWorkload => true,
+        // Site-declared reach: the operator posture is the authority (unchanged behavior).
+        GatewayTargetPolicy::Operator => {
+            posture.allow_site_private_upstreams || boatramp_core::access::is_global_ip(ip)
+        }
+    }
 }
 
 /// Proxy to a **declared gateway upstream**: a private address is
@@ -859,8 +898,13 @@ pub(super) fn gateway_addr_allowed(
 pub(super) async fn dispatch_gateway(
     request: Request,
     site: &str,
+    // The serving project, for the tier-aware runtime-state key (a project upstream and a site
+    // upstream can share a name). `None` ⇒ the default project / an operator upstream.
+    project: Option<&str>,
     upstream_name: &str,
     upstream: &boatramp_core::gateway::Upstream,
+    // The tier's address policy (operator posture-gated / project public-only / project own-compute).
+    policy: GatewayTargetPolicy,
     request_path: &str,
     client_ip: IpAddr,
     // When the upstream is compute-backed (`upstream.compute`), the caller passes
@@ -877,7 +921,18 @@ pub(super) async fn dispatch_gateway(
     // below rebuilds the request (dropping extensions), so we thread the resolved
     // (Copy) posture into the proxy fns rather than re-reading it per attempt.
     let posture = request_posture(&request);
-    let state = gateway::upstream_state(site, upstream_name);
+    // Runtime-state key: an operator upstream keys on (site, name) as before; a project upstream
+    // keys on (site, project, name) so its health/discovery pool can never collide with a site
+    // upstream of the same name (the `\u{1}`-prefixed qualifier can't appear in a plain name).
+    let project_state_name;
+    let state = match policy {
+        GatewayTargetPolicy::Operator => gateway::upstream_state(site, upstream_name),
+        GatewayTargetPolicy::ProjectRaw | GatewayTargetPolicy::ProjectOwnWorkload => {
+            project_state_name =
+                format!("p\u{1}{}\u{1}{}", project.unwrap_or(""), upstream_name);
+            gateway::upstream_state(site, &project_state_name)
+        }
+    };
     // Arm active probing (no-op unless the upstream has active_health) so the
     // background prober has a current config snapshot.
     state.arm_active_probe(upstream);
@@ -915,7 +970,7 @@ pub(super) async fn dispatch_gateway(
     if !gateway_retryable(&request) || candidates.len() == 1 {
         let target = &candidates[0];
         let response =
-            proxy_upstream(request, upstream, target, request_path, client_ip, posture).await;
+            proxy_upstream(request, upstream, target, request_path, client_ip, policy, posture).await;
         state.record(
             target,
             !response.status().is_server_error(),
@@ -935,7 +990,7 @@ pub(super) async fn dispatch_gateway(
         *attempt.uri_mut() = uri.clone();
         *attempt.headers_mut() = headers.clone();
         let response =
-            proxy_upstream(attempt, upstream, target, request_path, client_ip, posture).await;
+            proxy_upstream(attempt, upstream, target, request_path, client_ip, policy, posture).await;
         let ok = !response.status().is_server_error();
         state.record(target, ok, upstream.passive_health, now);
         if ok {
@@ -1111,15 +1166,28 @@ async fn proxy_upstream(
     target: &str,
     request_path: &str,
     client_ip: IpAddr,
+    policy: GatewayTargetPolicy,
     posture: boatramp_core::security::SecurityPosture,
 ) -> Response {
     // WebSocket / generic HTTP upgrade: bridge the upgraded connection both ways.
     // reqwest can't upgrade, so this uses a hyper client conn.
     if is_upgrade_request(request.headers()) {
-        return proxy_upgrade(request, upstream, target, request_path, client_ip, posture).await;
+        return proxy_upgrade(request, upstream, target, request_path, client_ip, policy, posture)
+            .await;
     }
     // A `unix:/path` target forwards over a unix-domain socket.
     if let Some(socket_path) = target.strip_prefix("unix:") {
+        // A unix-socket upstream can reach local admin sockets (Docker/containerd/SSH-agent). It is
+        // NEVER a "public host", so the project tier may not use one — a project upstream to a unix
+        // socket is refused regardless of posture (RESTRICTION 1). The site tier may, with operator
+        // opt-in.
+        if !matches!(policy, GatewayTargetPolicy::Operator) {
+            tracing::warn!(
+                %target,
+                "gateway upstream refused: a project-tier upstream may not target a unix socket"
+            );
+            return (StatusCode::FORBIDDEN, "gateway upstream not allowed\n").into_response();
+        }
         // Site config is `site-write`; a unix-socket upstream can reach local
         // admin sockets (Docker/containerd/SSH-agent), so it requires operator
         // opt-in.
@@ -1147,13 +1215,13 @@ async fn proxy_upstream(
     }
     // Resolve + pin the declared target (parse + DNS), served from the cache when a
     // fresh entry exists — the parse and `lookup_host` are request-independent.
-    let resolved = match resolve_target(target, &posture).await {
+    let resolved = match resolve_target(target, policy, &posture).await {
         Ok(resolved) => resolved,
         Err(resp) => return resp,
     };
-    // Re-apply the SSRF address gate on every request against the pinned address —
+    // Re-apply the tier-aware SSRF address gate on every request against the pinned address —
     // caching the resolution never relaxes it (posture is per-request).
-    if !gateway_addr_allowed(resolved.addr.ip(), &posture) {
+    if !gateway_addr_allowed_for(resolved.addr.ip(), policy, &posture) {
         tracing::warn!(
             host = %resolved.host, ip = %resolved.addr.ip(),
             "gateway upstream refused: address not permitted by security posture"
@@ -1440,6 +1508,7 @@ async fn proxy_upgrade(
     target: &str,
     request_path: &str,
     client_ip: IpAddr,
+    policy: GatewayTargetPolicy,
     posture: boatramp_core::security::SecurityPosture,
 ) -> Response {
     // Register interest in the client-side upgrade (our own mechanism — the inbound
@@ -1462,8 +1531,16 @@ async fn proxy_upgrade(
         None => forwarded.into_owned(),
     };
 
-    // Unix-socket upstream — operator opt-in only (see `proxy_upstream`).
+    // Unix-socket upstream — operator-tier only, operator opt-in (see `proxy_upstream`). A project
+    // tier upstream may not reach a unix socket (not a public host).
     if let Some(socket_path) = target.strip_prefix("unix:") {
+        if !matches!(policy, GatewayTargetPolicy::Operator) {
+            tracing::warn!(
+                %target,
+                "gateway upgrade refused: a project-tier upstream may not target a unix socket"
+            );
+            return (StatusCode::FORBIDDEN, "gateway upstream not allowed\n").into_response();
+        }
         if !posture.allow_site_unix_upstreams {
             tracing::warn!(
                 %target,
@@ -1534,9 +1611,9 @@ async fn proxy_upgrade(
         Ok(addrs) => {
             let mut chosen = None;
             for addr in addrs {
-                // Cloud-metadata always refused; non-global refused unless the
-                // operator opted in (see `proxy_upstream`).
-                if !gateway_addr_allowed(addr.ip(), &posture) {
+                // Cloud-metadata always refused; the tier's address rule applies (see
+                // `proxy_upstream` / `gateway_addr_allowed_for`).
+                if !gateway_addr_allowed_for(addr.ip(), policy, &posture) {
                     tracing::warn!(
                         %host, ip = %addr.ip(),
                         "gateway upgrade refused: address not permitted by security posture"
