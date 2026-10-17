@@ -2163,6 +2163,54 @@ pub struct ServeConfig {
     /// [`ListenerConfig`].
     #[serde(default)]
     pub listeners: BTreeMap<String, ListenerConfig>,
+    /// `[serve.on_demand_tls]` — on-demand per-SNI ACME issuance at scale (cap-req 03). Absent or
+    /// `enabled = false` ⇒ OFF (the static `--tls acme-dns` resolver is byte-for-byte unchanged). When
+    /// on, the edge issues + caches a cert on the first TLS handshake for an unknown-but-#02-**verified**
+    /// custom domain, gated so an arbitrary/unverified SNI is refused (fail-closed). File-configured.
+    /// See [`OnDemandTlsConfig`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_demand_tls: Option<OnDemandTlsConfig>,
+}
+
+/// `[serve.on_demand_tls]` — on-demand per-SNI TLS issuance (cap-req 03). Off unless `enabled`. When
+/// on, an unknown-but-#02-verified SNI triggers issuance at handshake time (the client retries once
+/// the cert is warm); an unauthorized SNI is refused, so a flood of unknown names can't become an ACME
+/// storm. The ACME account + issued certs persist in the control-plane cert store and replicate across
+/// the cluster (the leader issues; followers serve the replicated cert).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct OnDemandTlsConfig {
+    /// Master toggle. `false` (default) ⇒ the whole feature is off.
+    pub enabled: bool,
+    /// How to prove control of a name to the CA. `tls-alpn-01` (default) validates on the 443 edge (no
+    /// extra port); `dns-01` uses the node's configured ACME DNS provider (an operator-controlled zone).
+    pub challenge: OnDemandChallenge,
+    /// ACME directory URL. Absent ⇒ the ACME client default (Let's Encrypt production).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub directory_url: Option<String>,
+    /// ACME account contact email (optional).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub contact_email: Option<String>,
+    /// Max concurrent in-flight issuances (global). Absent ⇒ 4.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_inflight: Option<usize>,
+    /// How long a refused/failed SNI is negatively cached (seconds). Absent ⇒ 300.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub negative_ttl_secs: Option<u64>,
+    /// Max CA orders per rolling hour (the account rate-limit floor). Absent ⇒ 50; `0` ⇒ unlimited.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_limit_per_hour: Option<u32>,
+}
+
+/// How [`OnDemandTlsConfig`] proves control of a name to the CA.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum OnDemandChallenge {
+    /// TLS-ALPN-01 on the 443 edge (default) — no extra port.
+    #[default]
+    TlsAlpn01,
+    /// DNS-01 via the node's configured ACME DNS provider (an operator-controlled zone / wildcard).
+    Dns01,
 }
 
 /// `[serve.listeners.<name>]` — a **host-owned inbound-TCP listener** (PLAN-handler-tcp-inbound). The

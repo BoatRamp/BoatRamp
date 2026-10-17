@@ -48,6 +48,10 @@ pub enum AcmeError {
     /// Timed out waiting for the issued certificate.
     #[error("timed out waiting for the ACME certificate")]
     CertificateTimeout,
+    /// A challenge solver failed to present/clean up its challenge (e.g. building or installing the
+    /// TLS-ALPN-01 challenge certificate).
+    #[error("challenge solver: {0}")]
+    Solver(String),
 }
 
 /// What to request and how to talk to the CA.

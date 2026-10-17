@@ -32,6 +32,11 @@ const ACME_TLS_ALPN: &[u8] = b"acme-tls/1";
 /// handshake), so a new-SNI flood can't grow memory.
 const TRIGGER_QUEUE: usize = 256;
 
+/// Stamped `notAfter` for an issued cert, as a conservative renewal heuristic (the issuer doesn't
+/// parse the real `notAfter`): 60 days ≤ a Let's Encrypt ~90-day cert, so `ensure_cert` renews well
+/// before true expiry (never after). Mirrors the cluster-TLS path's assumed-lifetime approach.
+const ASSUMED_CERT_LIFETIME_SECS: u64 = 60 * 24 * 3600;
+
 /// Runtime knobs for the issuer (the operator-facing `[serve] on_demand_tls` figment struct maps onto
 /// this in the serve wiring).
 #[derive(Debug, Clone)]
@@ -353,6 +358,117 @@ impl ResolvesServerCert for OnDemandResolver {
         // handshake. The client retries and hits the now-warm cache.
         let _ = self.trigger.try_send(sni.to_string());
         None
+    }
+}
+
+/// How an [`AcmeIssuer`] proves control of a name to the CA.
+pub enum AcmeChallenge {
+    /// TLS-ALPN-01 on the 443 edge — no extra port; the challenge cert is served through the shared
+    /// [`CertCache`] + the [`OnDemandResolver`] on the `acme-tls/1` handshake. The default.
+    TlsAlpn01,
+    /// DNS-01 via a provider (an operator-controlled zone / a wildcard name).
+    Dns01(Arc<dyn boatramp_acme::dns::DnsProvider>),
+}
+
+/// The ACME-backed [`CertIssuer`]: reuses ONE [`Account`](boatramp_acme::acme::Account) across orders
+/// (persisted by the caller) and issues per-SNI via the configured challenge. For TLS-ALPN-01 it
+/// installs the challenge cert into the shared [`CertCache`] that the resolver serves.
+pub struct AcmeIssuer {
+    account: Arc<boatramp_acme::acme::Account>,
+    challenge: AcmeChallenge,
+    directory_url: String,
+    contact_email: Option<String>,
+    cache: Arc<CertCache>,
+    dns_ttl: u32,
+    propagation_delay: Duration,
+    timeout: Duration,
+    now_unix: Arc<dyn Fn() -> u64 + Send + Sync>,
+}
+
+impl AcmeIssuer {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        account: Arc<boatramp_acme::acme::Account>,
+        challenge: AcmeChallenge,
+        directory_url: String,
+        contact_email: Option<String>,
+        cache: Arc<CertCache>,
+        now_unix: Arc<dyn Fn() -> u64 + Send + Sync>,
+    ) -> Self {
+        Self {
+            account,
+            challenge,
+            directory_url,
+            contact_email,
+            cache,
+            dns_ttl: 60,
+            propagation_delay: Duration::from_secs(15),
+            timeout: Duration::from_secs(120),
+            now_unix,
+        }
+    }
+}
+
+#[async_trait]
+impl CertIssuer for AcmeIssuer {
+    async fn issue(&self, sni: &str) -> Result<StoredCert, String> {
+        let request = boatramp_acme::acme::CertRequest {
+            directory_url: self.directory_url.clone(),
+            contact_email: self.contact_email.clone(),
+            domains: vec![sni.to_string()],
+            dns_ttl: self.dns_ttl,
+            propagation_delay: self.propagation_delay,
+            timeout: self.timeout,
+        };
+        let issued = match &self.challenge {
+            AcmeChallenge::Dns01(provider) => {
+                let solver = boatramp_acme::acme::Dns01Solver::new(provider.as_ref(), self.dns_ttl);
+                boatramp_acme::acme::obtain_certificate_with(&self.account, &request, &solver).await
+            }
+            AcmeChallenge::TlsAlpn01 => {
+                let solver = TlsAlpn01Solver {
+                    cache: Arc::clone(&self.cache),
+                };
+                boatramp_acme::acme::obtain_certificate_with(&self.account, &request, &solver).await
+            }
+        }
+        .map_err(|e| e.to_string())?;
+        let not_after = (self.now_unix)().saturating_add(ASSUMED_CERT_LIFETIME_SECS);
+        Ok(StoredCert::new(
+            issued.certificate_pem,
+            issued.private_key_pem,
+            not_after,
+        ))
+    }
+}
+
+/// A `boatramp_acme` [`ChallengeSolver`](boatramp_acme::acme::ChallengeSolver) for TLS-ALPN-01: build
+/// the ephemeral challenge cert for the identifier and install it in the shared [`CertCache`], which
+/// the [`OnDemandResolver`] serves on the `acme-tls/1` handshake; clear it on cleanup.
+struct TlsAlpn01Solver {
+    cache: Arc<CertCache>,
+}
+
+#[async_trait]
+impl boatramp_acme::acme::ChallengeSolver for TlsAlpn01Solver {
+    fn challenge_type(&self) -> boatramp_acme::acme::ChallengeType {
+        boatramp_acme::acme::ChallengeType::TlsAlpn01
+    }
+    async fn present(
+        &self,
+        identifier: &str,
+        key_auth: &boatramp_acme::acme::KeyAuthorization,
+    ) -> Result<(), boatramp_acme::acme::AcmeError> {
+        let (cert_pem, key_pem) =
+            boatramp_acme::acme::tls_alpn01_challenge_cert(identifier, key_auth)?;
+        let ck = crate::acme_dns::certified_key_from_pem(&cert_pem, &key_pem)
+            .map_err(|e| boatramp_acme::acme::AcmeError::Solver(e.to_string()))?;
+        self.cache.install_challenge(identifier, Arc::new(ck));
+        Ok(())
+    }
+    async fn cleanup(&self, identifier: &str) -> Result<(), boatramp_acme::acme::AcmeError> {
+        self.cache.clear_challenge(identifier);
+        Ok(())
     }
 }
 
