@@ -536,8 +536,12 @@ pub async fn build_handler_runtime(
         .unwrap_or(false)
     {
         if let Some(envelope) = secrets_envelope.clone() {
-            // Default per-artifact ceiling (native code is large); `0` ⇒ unlimited.
-            const DEFAULT_AOT_MAX_BYTES: u64 = 256 * 1024 * 1024;
+            // Default per-artifact ceiling. A real wasmtime-serialized component is
+            // single-digit-to-tens of MiB, so 32 MiB is generous; a tight default also bounds
+            // the cold-start amplification a non-key-holding blob-store writer could cause by
+            // planting an oversize `aot/…` blob (`0` ⇒ unlimited; the consumer hard cap still
+            // applies). Operators with unusually large components raise it explicitly.
+            const DEFAULT_AOT_MAX_BYTES: u64 = 32 * 1024 * 1024;
             let max_bytes = handlers_cfg
                 .and_then(|h| h.aot_artifact_max_bytes)
                 .unwrap_or(DEFAULT_AOT_MAX_BYTES);

@@ -5,6 +5,41 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.36.0] - 2026-10-17
+
+Two platform-capability features for first-party apps (mailroom). Both are off by default or
+inert until configured — a node that enables neither behaves exactly as before.
+
+### Added
+
+- **`boatramp compute bind-blob` — a dev/CI blob-shim affordance.** Mints a blob-shim
+  `BOATRAMP_BLOB_URL` + token for a **non-managed local process** (the blob analogue of pointing a
+  process at `DATABASE_URL`), so a test harness can exercise a handler↔native-worker shared-blob
+  round-trip offline. `boatramp compute bind-blob --site <s> [--container <c>] [--project <p>]
+  [--export]` prints the env to export. Backed by `POST /api/compute/dev-bind-blob`
+  (**`System·Admin`**, node-global) and gated by a new **`allow_dev_blob_bind`** posture knob
+  (env `BOATRAMP_SECURITY_ALLOW_DEV_BLOB_BIND`) that is **on only in the `dev` profile** (off in
+  single/multi-tenant; an operator opts in explicitly). The credential reuses the exact managed
+  binding path, so it carries the **identical** site/container confinement a managed workload gets.
+  `501` when the blob-shim is inactive.
+
+- **Warm floor for latency-critical handlers (`[handlers] keep_warm_max`).** Pins up to N request
+  components in a never-serve-evicted set so a latency-critical face does not cold-start under cache
+  pressure. Absent/`0` ⇒ off (the plain LRU). Env `BOATRAMP_HANDLERS_KEEP_WARM_MAX`.
+
+- **Portable cross-node AOT component cache (`[handlers] aot_artifact_cache`, default off).** When
+  enabled on a node that has a `[secrets]` envelope, each request component's precompiled artifact is
+  published (cluster-authenticated) to the shared blob store, and a **fresh replica hydrates it
+  instead of recompiling** — removing the first-request compile on a new/restarted/rolled replica.
+  Security: the artifact is loaded via `Component::deserialize` (native code), so every artifact is
+  wrapped in an **HMAC keyed by a per-cluster secret** (a dedicated 32-byte root, sealed via the
+  `[secrets]` envelope, stored in the control-plane KV, unsealed fleet-wide) and the MAC is **verified
+  before deserialize**; any miss/verification-failure/incompatibility **falls back to compiling the
+  content-addressed source** (never serves unverified code, never fails a request). A node without an
+  envelope never participates. Tunable per-artifact ceiling `[handlers] aot_artifact_max_bytes`
+  (default 32 MiB). Env `BOATRAMP_HANDLERS_AOT_ARTIFACT_CACHE` / `_AOT_ARTIFACT_MAX_BYTES`. The
+  existing on-disk wasmtime compile cache (restart-local) is unchanged and complementary.
+
 ## [0.35.2] - 2026-10-16
 
 **Fix: `project export` / `import` (and `sql exec`) now actually run the SQL client on a

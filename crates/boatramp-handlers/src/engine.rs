@@ -1,7 +1,6 @@
 //! The wasmtime component engine: compile (cached by blob hash), instantiate
 //! per request, drive `wasi:http/incoming-handler`, and enforce limits.
 
-use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::num::NonZeroUsize;
 use std::path::Path;
@@ -91,7 +90,24 @@ pub struct SessionBatch {
 /// unwritable cache dir degrades to no caching rather than failing.
 /// Domain-separation tag for the AOT engine fingerprint (cold-start cap-req 09). Bump the
 /// suffix if the fingerprint derivation ever changes, to partition old artifacts out.
-const AOT_FINGERPRINT_DOMAIN: &[u8] = b"boatramp-aot-fingerprint-v1";
+const AOT_FINGERPRINT_DOMAIN: &[u8] = b"boatramp-aot-fingerprint-v2";
+
+/// A `std::hash::Hasher` that feeds the hashed bytes into SHA-256, so a value implementing
+/// `Hash` (here wasmtime's `precompile_compatibility_hash()`, which is only exposed as
+/// `impl Hash`) can be reduced to a full 32-byte digest rather than a lossy 64-bit `finish`.
+/// Used only by [`HandlerEngine::artifact_fingerprint`]; `finish` returns a valid (hash-derived)
+/// u64 so the impl is well-behaved if ever reused, but the fingerprint path finalizes `.0` directly.
+struct Sha256Hasher(sha2::Sha256);
+
+impl std::hash::Hasher for Sha256Hasher {
+    fn write(&mut self, bytes: &[u8]) {
+        sha2::Digest::update(&mut self.0, bytes);
+    }
+    fn finish(&self) -> u64 {
+        let out = sha2::Digest::finalize(self.0.clone());
+        u64::from_le_bytes(out[..8].try_into().expect("sha256 ≥ 8 bytes"))
+    }
+}
 
 fn base_config(cache_dir: Option<&Path>) -> Result<Config, HandlerError> {
     let mut config = Config::new();
@@ -1226,12 +1242,13 @@ pub struct HandlerEngine {
     /// surface (construens memory-instance-observability). `Arc` so the server can hold a handle.
     stats: Arc<crate::instance_stats::InstanceStats>,
     cache: Mutex<LruCache<String, ProxyPre<HostState>>>,
-    /// Request-lane **warm floor** (cold-start cap-req 09): components pinned here are
-    /// NEVER LRU-evicted, so a latency-critical face never cold-starts under capacity
-    /// pressure. A SEPARATE map (not an LRU pin) so it sidesteps the LRU's len-vs-cap
-    /// accounting entirely and gives a hard "pinned ⇒ never cold" guarantee. Checked
-    /// before `cache` on the serve path; bounded by `keep_warm_max`.
-    pinned: Mutex<HashMap<String, ProxyPre<HostState>>>,
+    /// Request-lane **warm floor** (cold-start cap-req 09): a SEPARATE pinned set, checked
+    /// before the main `cache` on the serve path, that the main serve-LRU can NEVER evict — so
+    /// a latency-critical face does not cold-start under capacity pressure. It is itself a small
+    /// `keep_warm_max`-capacity LRU: a serve promotes (keeps active faces), and a NEW pin at
+    /// deploy time evicts the STALEST pinned entry rather than accumulating dead content-hashes
+    /// across redeploys. Empty + inert when the floor is off (`keep_warm_max == 0`).
+    pinned: Mutex<LruCache<String, ProxyPre<HostState>>>,
     /// The node-global cap on pinned (warm-floor) request components (`[handlers]
     /// keep_warm_max`). `0` ⇒ the warm floor is OFF (no component is ever pinned), so an
     /// engine built without it behaves exactly as before.
@@ -1486,9 +1503,10 @@ impl HandlerEngine {
             engine,
             stats: Arc::new(crate::instance_stats::InstanceStats::default()),
             cache,
-            // Warm floor OFF by default (cap 0, empty pinned set) — identical to prior behavior
-            // until an operator sets `[handlers] keep_warm_max` via `with_keep_warm_max`.
-            pinned: Mutex::new(HashMap::new()),
+            // Warm floor OFF by default (cap 0 ⇒ `pin_request_component` no-ops, so this stays
+            // empty) — identical to prior behavior until an operator sets `[handlers]
+            // keep_warm_max` via `with_keep_warm_max`, which rebuilds this at the real capacity.
+            pinned: Mutex::new(LruCache::new(NonZeroUsize::new(1).expect("1 is non-zero"))),
             keep_warm_max: 0,
             #[cfg(feature = "messaging")]
             consumer_cache: Mutex::new(LruCache::new(capacity)),
@@ -1574,6 +1592,11 @@ impl HandlerEngine {
     #[must_use]
     pub fn with_keep_warm_max(mut self, keep_warm_max: usize) -> Self {
         self.keep_warm_max = keep_warm_max;
+        // Size the pinned set to the cap (floored at 1 for the NonZero invariant; when the floor
+        // is off at 0, `pin_request_component` never inserts, so the set stays empty regardless).
+        self.pinned = Mutex::new(LruCache::new(
+            NonZeroUsize::new(keep_warm_max.max(1)).expect("max(1) is non-zero"),
+        ));
         self
     }
 
@@ -1588,28 +1611,21 @@ impl HandlerEngine {
         if self.keep_warm_max == 0 {
             return Ok(());
         }
-        {
-            let pinned = self.pinned.lock().unwrap();
-            if !pinned.contains_key(hash) && pinned.len() >= self.keep_warm_max {
-                // At capacity and this is a new hash — leave it to the LRU rather than
-                // evicting another pinned (latency-critical) component.
-                tracing::warn!(
-                    target: "boatramp::handler",
-                    %hash, cap = self.keep_warm_max,
-                    "warm floor at capacity; component not pinned (served via the LRU cache)"
-                );
-                return Ok(());
-            }
+        // Already pinned (a re-deploy of the same content hash) ⇒ promote, no recompile.
+        if self.pinned.lock().unwrap().get(hash).is_some() {
+            return Ok(());
         }
         let pre = self.compile(wasm)?;
-        self.pinned.lock().unwrap().insert(hash.to_string(), pre);
+        // Insert into the pinned LRU; at capacity this evicts the STALEST pinned entry (a
+        // superseded redeploy's hash), never a currently-served one (serving promotes it).
+        self.pinned.lock().unwrap().put(hash.to_string(), pre);
         Ok(())
     }
 
-    /// Drop component `hash` from the warm floor (deploy churn / unpin). A no-op if it was
-    /// not pinned. The component may still be served from the LRU cache afterwards.
+    /// Drop component `hash` from the warm floor (explicit unpin). A no-op if it was not
+    /// pinned. The component may still be served from the main LRU cache afterwards.
     pub fn unpin_request_component(&self, hash: &str) {
-        self.pinned.lock().unwrap().remove(hash);
+        self.pinned.lock().unwrap().pop(hash);
     }
 
     /// Compile `wasm` ONCE, warm the request-lane cache (like [`precompile`](Self::precompile)),
@@ -1680,16 +1696,18 @@ impl HandlerEngine {
     /// fingerprint only ever causes a cache miss or a safe `Err`, never an unsafe load.
     pub fn artifact_fingerprint(&self) -> [u8; 32] {
         use sha2::Digest as _;
-        use std::hash::{Hash as _, Hasher as _};
-        // DefaultHasher is fixed-seed (NOT RandomState), so this is stable across nodes
-        // running the same binary — the only requirement.
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        self.engine.precompile_compatibility_hash().hash(&mut h);
-        let compat = h.finish();
-        let mut d = sha2::Sha256::new();
-        d.update(AOT_FINGERPRINT_DOMAIN);
-        d.update(compat.to_le_bytes());
-        let out = d.finalize();
+        use std::hash::Hash as _;
+        // Feed wasmtime's compatibility hash through a SHA-256-backed hasher directly (no lossy
+        // u64 reduction), so the full compat digest — not 64 bits of it — distinguishes engine
+        // configs; this removes even a theoretical fingerprint collision that could make two
+        // incompatible engines share an `aot/<fp>/…` partition. Domain-separated + deterministic
+        // (SHA-256 has no per-process seed), so cluster peers on the same binary agree.
+        let mut hasher = Sha256Hasher(sha2::Sha256::new());
+        sha2::Digest::update(&mut hasher.0, AOT_FINGERPRINT_DOMAIN);
+        self.engine
+            .precompile_compatibility_hash()
+            .hash(&mut hasher);
+        let out = hasher.0.finalize();
         let mut fp = [0u8; 32];
         fp.copy_from_slice(&out);
         fp
@@ -2037,8 +2055,9 @@ impl HandlerEngine {
     /// one request, not a wrong result; size the cache ≥ your component count to preclude it.)
     pub fn request_component_warm(&self, hash: &str) -> bool {
         // A pinned (warm-floor) component is always resident — count it warm so the serve
-        // path elides the blob read exactly as for an LRU-warm component.
-        self.pinned.lock().unwrap().contains_key(hash) || self.cache.lock().unwrap().contains(hash)
+        // path elides the blob read exactly as for an LRU-warm component. `contains` does not
+        // promote (a non-mutating peek), matching the main-cache check.
+        self.pinned.lock().unwrap().contains(hash) || self.cache.lock().unwrap().contains(hash)
     }
 
     /// The CONSUMER-lane analog of [`request_component_warm`](Self::request_component_warm): a
