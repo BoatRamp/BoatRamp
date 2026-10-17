@@ -664,6 +664,34 @@ jobs:
             fi
           done
 
+      # cap-req 03 ON-DEMAND TLS ABUSE GATE (marker `ON-DEMAND ABUSE GATE OK`). On-demand per-SNI
+      # issuance issues a cert at handshake time only for a #02-VERIFIED custom domain; an
+      # arbitrary/unverified SNI must place ZERO ACME orders (else it is an ACME/rate-limit DoS + a
+      # mint-for-any-name hole). This drives the SINGLE enforced decision (`OnDemandIssuer::issue_one`'s
+      # allowlist gate) and asserts the marker + pass count catch a silent skip. MUTATION-VERIFIED (#503
+      # convention): the SAME test re-run under `BOATRAMP_ONDEMAND_MUTATION=skip_allowlist` neuters the
+      # allowlist check and MUST FAIL (an unverified SNI then issues); a PASS-under-mutation (hollow
+      # gate) fails the merge.
+      - name: "on-demand TLS abuse gate (unverified SNI issues nothing; mutation-verified)"
+        run: |
+          set -eo pipefail
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp \
+            --features acme-dns,cluster on_demand_tls::tests::on_demand_abuse_gate \
+            -- --nocapture 2>&1 | tee ondemand-gate.log
+          grep -qE 'test result: ok\. 1 passed' ondemand-gate.log \
+            || { echo "::error::on-demand abuse gate did not run (silent skip or a failure)" >&2; exit 1; }
+          grep -q 'ON-DEMAND ABUSE GATE OK' ondemand-gate.log \
+            || { echo "::error::on-demand abuse gate never reached its marker (an issuance-gate regression)" >&2; exit 1; }
+          # Mutation guard: neutering the #02 allowlist MUST fail the gate (proving it is load-bearing).
+          if BOATRAMP_ONDEMAND_MUTATION=skip_allowlist cargo-zigbuild test --target x86_64-unknown-linux-musl \
+            -p boatramp --features acme-dns,cluster on_demand_tls::tests::on_demand_abuse_gate \
+            -- --nocapture > ondemand-gate-mutation.log 2>&1; then
+            echo "::error::on-demand abuse gate is HOLLOW — it passed under skip_allowlist (the #02 verified-domain allowlist is not actually enforced before issuance)" >&2
+            exit 1
+          else
+            echo "on-demand abuse gate mutation verified: skip_allowlist fails the gate as expected."
+          fi
+
       # PLAN-compute-bindings COMPUTE BLOB-SHIM SCOPED GATE (marker `COMPUTE BLOB-SHIM SCOPED OK`). The
       # compute blob-shim gives an opaque workload the SAME per-site `hblob/{qualified-site}/{container}/
       # {key}` blob namespace — over the SAME `Storage` backend — a `wasi:blobstore` handler sees, scoped

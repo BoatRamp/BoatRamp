@@ -37,6 +37,18 @@ const TRIGGER_QUEUE: usize = 256;
 /// before true expiry (never after). Mirrors the cluster-TLS path's assumed-lifetime approach.
 const ASSUMED_CERT_LIFETIME_SECS: u64 = 60 * 24 * 3600;
 
+/// Anti-hollow mutation seam for the abuse gate (`BOATRAMP_ONDEMAND_MUTATION`). Armed only under
+/// `cfg(test)` or the `ondemand-gate-mutation` feature (a CI gate lane) — NEVER in a shipped build,
+/// where it is a `const None` the optimizer drops, so the allowlist check is always enforced.
+#[cfg(any(test, feature = "ondemand-gate-mutation"))]
+fn ondemand_mutation() -> Option<String> {
+    std::env::var("BOATRAMP_ONDEMAND_MUTATION").ok()
+}
+#[cfg(not(any(test, feature = "ondemand-gate-mutation")))]
+fn ondemand_mutation() -> Option<String> {
+    None
+}
+
 /// Runtime knobs for the issuer (the operator-facing `[serve] on_demand_tls` figment struct maps onto
 /// this in the serve wiring).
 #[derive(Debug, Clone)]
@@ -204,8 +216,17 @@ impl OnDemandIssuer {
         if self.negative_cached(sni) {
             return;
         }
-        // THE abuse gate — fail-closed, before any CA contact.
-        if !self.gate.is_authorized(sni).await {
+        // THE abuse gate — fail-closed, before any CA contact. Only a #02-verified domain may issue.
+        // MUTATION SEAM (abuse gate): `skip_allowlist` neuters this check so an unauthorized SNI would
+        // issue — the CI gate re-runs the abuse test under it and REQUIRES it to go RED (proving the
+        // allowlist is load-bearing). Armed only under `cfg(test)` / the `ondemand-gate-mutation`
+        // feature; a shipped build has `ondemand_mutation() == None`, so the seam is inert.
+        let authorized = if ondemand_mutation().as_deref() == Some("skip_allowlist") {
+            true
+        } else {
+            self.gate.is_authorized(sni).await
+        };
+        if !authorized {
             self.deny(sni);
             return;
         }
@@ -737,5 +758,26 @@ mod tests {
             0,
             "a follower must not place an order"
         );
+    }
+
+    /// The CI abuse-gate: an unverified SNI must place ZERO ACME orders. Run normally it PASSES; the
+    /// CI re-runs it under `BOATRAMP_ONDEMAND_MUTATION=skip_allowlist`, which neuters the #02 allowlist
+    /// check — it MUST then FAIL (the unauthorized SNI issues), proving the gate is load-bearing (the
+    /// #503 anti-hollow convention). Prints a marker the CI greps so a silent skip/rename fails the job.
+    #[tokio::test]
+    async fn on_demand_abuse_gate() {
+        let orders = Arc::new(AtomicUsize::new(0));
+        let eng = engine(
+            &["app.example.com"],
+            orders.clone(),
+            Arc::new(AtomicUsize::new(0)),
+        );
+        eng.issue_one("evil.attacker.test").await;
+        assert_eq!(
+            orders.load(Ordering::SeqCst),
+            0,
+            "an unverified SNI must place NO ACME order (the abuse gate)"
+        );
+        println!("ON-DEMAND ABUSE GATE OK: an unverified SNI placed no ACME order");
     }
 }

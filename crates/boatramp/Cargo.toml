@@ -119,6 +119,11 @@ shared-mode-gate-mutation = [
   "boatramp-server/shared-mode-gate-mutation",
   "boatramp-core/shared-mode-gate-mutation",
 ]
+# TEST-ONLY, NEVER SHIPPED: arms the on-demand-TLS abuse-gate mutation seam
+# (`BOATRAMP_ONDEMAND_MUTATION`) so the CI gate can prove the #02 verified-domain allowlist is
+# load-bearing (neutering it must let an unauthorized SNI issue ⇒ the abuse test goes RED). Pulls the
+# features the on_demand_tls module needs to compile. Compiled OUT of every real build.
+ondemand-gate-mutation = ["acme-dns", "cluster"]
 # HTTPS: `--tls custom` (operator cert) and `--tls acme` (automatic certs).
 tls = [
   "dep:rustls-acme",
