@@ -467,6 +467,19 @@ struct HandlerRuntimeInner {
     /// [`HandlerRuntime::set_secret_store`]; **unset means no `boatramp:` ref can
     /// resolve** (fail-closed — `resolve_secret_env` errors rather than injecting).
     secret_store: std::sync::OnceLock<Arc<boatramp_core::secret_store::SecretStore>>,
+    /// Cold-start cap-req 09 — the `[secrets]` key envelope, retained SOLELY to seal/unseal
+    /// the cluster AOT root secret. Set (by the node) ONLY when the `aot_artifact_cache`
+    /// posture/config is enabled; **unset ⇒ the portable cross-node AOT path is OFF** (the
+    /// serve path still compiles + the warm floor + local dir-cache still work). Its presence
+    /// is the AOT enable flag.
+    aot_envelope: std::sync::OnceLock<Arc<dyn boatramp_core::envelope::KeyEnvelope>>,
+    /// The per-PUT ceiling for an AOT artifact upload (native code is large); `0` ⇒ unlimited.
+    /// Set beside [`aot_envelope`](Self::aot_envelope). Absent ⇒ no AOT (envelope unset too).
+    aot_max_bytes: std::sync::OnceLock<u64>,
+    /// The lazily-derived cluster AOT MAC key (`HKDF(unseal(aot_mac_key KV), …)`), resolved
+    /// on first producer/consumer use. `Some(None)` memoizes "AOT unavailable" (no envelope,
+    /// or the get-or-create/unseal failed) so a degraded node does not retry every request.
+    aot_mac_key: tokio::sync::OnceCell<Option<[u8; 32]>>,
     /// The per-**tenant** sealed secret store (task #493) backing the guest
     /// `boatramp:handlers/tenant-secrets` binding. Set once at startup via
     /// [`HandlerRuntime::set_tenant_secret_store`] (the SAME `Arc` the control-plane routes hold),
@@ -684,6 +697,64 @@ fn default_serve_admission_cap() -> usize {
 
 #[cfg(feature = "handlers")]
 impl HandlerRuntimeInner {
+    /// The portable-AOT per-PUT ceiling (`0` ⇒ unlimited); `None` ⇒ AOT is disabled.
+    #[cfg(feature = "handlers")]
+    pub(crate) fn aot_max_bytes(&self) -> Option<u64> {
+        self.aot_max_bytes.get().copied()
+    }
+
+    /// The cluster AOT MAC key (cold-start cap-req 09), derived lazily on first use and
+    /// memoized. `None` ⇒ the cross-node AOT path is OFF for this node: AOT not enabled (no
+    /// envelope), or the sealed-root get-or-create/unseal failed (a degraded node then just
+    /// compiles from source — fail-safe, and the result is memoized so it never retries).
+    ///
+    /// Get-or-create: read the envelope-sealed cluster AOT root from the control-plane KV; if
+    /// absent, generate 32 random bytes, seal, and create-if-absent CAS them (a loser re-reads
+    /// the winner's), so every node converges on ONE root and derives the SAME MAC key.
+    #[cfg(feature = "handlers")]
+    pub(crate) async fn aot_mac_key(&self) -> Option<[u8; 32]> {
+        *self
+            .aot_mac_key
+            .get_or_init(|| self.derive_aot_mac_key())
+            .await
+    }
+
+    #[cfg(feature = "handlers")]
+    async fn derive_aot_mac_key(&self) -> Option<[u8; 32]> {
+        let envelope = self.aot_envelope.get()?;
+        let kv_key = boatramp_core::deploy::aot_mac_key_kv_key();
+        let root: Vec<u8> = match self.kv.get(&kv_key).await {
+            Ok(Some(wrapped)) => envelope.unwrap(&wrapped).await.ok()?,
+            Ok(None) => {
+                let mut fresh = [0u8; 32];
+                if getrandom::getrandom(&mut fresh).is_err() {
+                    return None;
+                }
+                let wrapped = envelope.wrap(&fresh).await.ok()?;
+                match self.kv.compare_and_swap(&kv_key, None, wrapped).await {
+                    // We created it — use our root.
+                    Ok(true) => fresh.to_vec(),
+                    // Lost the race (or CAS unsupported) — adopt the stored value.
+                    _ => {
+                        let stored = self.kv.get(&kv_key).await.ok()??;
+                        envelope.unwrap(&stored).await.ok()?
+                    }
+                }
+            }
+            Err(_) => return None,
+        };
+        if root.len() != 32 {
+            tracing::warn!(
+                target: "boatramp::handler",
+                "cluster AOT root is not 32 bytes; cross-node AOT disabled"
+            );
+            return None;
+        }
+        let mut root32 = [0u8; 32];
+        root32.copy_from_slice(&root);
+        Some(crate::aot::derive_key(&root32))
+    }
+
     /// The effective per-component serve-admission cap: the operator's `[handlers] serve_concurrency`
     /// if set, else the host-parallelism default. `0` ⇒ the gate is disabled (legacy unbounded serve).
     #[cfg(feature = "handlers")]
@@ -904,6 +975,9 @@ impl HandlerRuntime {
                 require_tenancy_declaration: std::sync::OnceLock::new(),
                 allow_cross_tenant_db: std::sync::OnceLock::new(),
                 secret_store: std::sync::OnceLock::new(),
+                aot_envelope: std::sync::OnceLock::new(),
+                aot_max_bytes: std::sync::OnceLock::new(),
+                aot_mac_key: tokio::sync::OnceCell::new(),
                 tenant_secret_store: std::sync::OnceLock::new(),
                 env_source: std::sync::OnceLock::new(),
                 function_meter_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -1436,6 +1510,23 @@ impl HandlerRuntime {
     pub fn set_secret_store(&self, store: Arc<boatramp_core::secret_store::SecretStore>) {
         if let Some(inner) = self.inner.as_ref() {
             let _ = inner.secret_store.set(store);
+        }
+    }
+
+    /// Enable the portable cross-node AOT artifact cache (cold-start cap-req 09): retain the
+    /// `[secrets]` key envelope (used ONLY to seal/unseal the cluster AOT root) + the per-PUT
+    /// size ceiling. Called by the node ONLY when the `aot_artifact_cache` config is on AND an
+    /// envelope exists; otherwise the AOT path stays off (the serve path still compiles, and
+    /// the warm floor + local dir-cache are unaffected). Idempotent (set-once).
+    #[cfg(feature = "handlers")]
+    pub fn enable_aot(
+        &self,
+        envelope: Arc<dyn boatramp_core::envelope::KeyEnvelope>,
+        max_bytes: u64,
+    ) {
+        if let Some(inner) = self.inner.as_ref() {
+            let _ = inner.aot_envelope.set(envelope);
+            let _ = inner.aot_max_bytes.set(max_bytes);
         }
     }
 

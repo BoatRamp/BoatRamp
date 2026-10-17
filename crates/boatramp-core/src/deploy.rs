@@ -140,6 +140,13 @@ pub fn is_blob_key(key: &str) -> bool {
 #[derive(Clone)]
 pub struct DeployStore(Arc<DeployStoreInner>);
 
+/// The control-plane KV key holding the envelope-sealed cluster AOT root (cold-start cap-req
+/// 09). A public wrapper over the `pub(crate)` `keys` module so the serve layer can
+/// get-or-create the sealed root against the raw KV it already holds.
+pub fn aot_mac_key_kv_key() -> String {
+    keys::aot_mac_key()
+}
+
 impl std::ops::Deref for DeployStore {
     type Target = DeployStoreInner;
     fn deref(&self) -> &DeployStoreInner {
@@ -527,6 +534,15 @@ pub(crate) mod keys {
     /// self-verified (they are native code, not the wasm hash).
     pub fn aot_artifact(fingerprint_hex: &str, wasm_hash: &str) -> String {
         format!("aot/{fingerprint_hex}/{wasm_hash}")
+    }
+
+    /// The single, node/cluster-global key holding the ENVELOPE-SEALED 32-byte cluster AOT
+    /// root secret (cold-start cap-req 09). Every node unseals the same replicated value, so
+    /// the derived AOT MAC key is identical fleet-wide; a node without the `[secrets]`
+    /// envelope cannot unseal it and so simply never shares AOT artifacts. Get-or-created
+    /// once via a create-if-absent CAS.
+    pub fn aot_mac_key() -> String {
+        "system/aot/sealed-root".to_string()
     }
 
     /// The **mutable pointer** for a site: `project/<proj>/site/<site>` → the content

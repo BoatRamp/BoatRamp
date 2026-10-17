@@ -442,6 +442,10 @@ pub(super) async fn dispatch_handler(
     let t_component = std::time::Instant::now();
     let wasm = if inner.engine.request_component_warm(&entry.hash) {
         Vec::new()
+    } else if try_hydrate_aot(inner, deploy, &entry.hash).await {
+        // Cold-start cap-req 09 (consumer): hydrated from a MAC-VERIFIED portable AOT
+        // artifact — the component is now warm, so (like a warm hit) skip the source read.
+        Vec::new()
     } else {
         match read_blob_fully(deploy, &entry.hash).await {
             Ok(bytes) => bytes,
@@ -1528,6 +1532,21 @@ pub(super) async fn precheck_component(
                     format!("{label} is not a valid wasi:messaging consumer: {e}")
                 })
             })?;
+    } else if inner.aot_max_bytes().is_some() {
+        // Request world, portable AOT cache ENABLED (cold-start cap-req 09, producer): one
+        // gated compile both warms the local cache AND yields the serialized artifact, which
+        // we then publish (best-effort) so a FRESH replica can hydrate it instead of
+        // recompiling. The compile still gates the activation; the publish never does.
+        let serialized = inner
+            .engine
+            .precompile_and_serialize_gated(&entry.hash, &wasm)
+            .await
+            .map_err(|err| {
+                let e = err.to_string();
+                translate_link_error(label, &e)
+                    .unwrap_or_else(|| format!("{label} failed to compile: {e}"))
+            })?;
+        maybe_publish_aot_artifact(inner, deploy, &entry.hash, serialized).await;
     } else {
         inner
             .engine
@@ -1539,7 +1558,65 @@ pub(super) async fn precheck_component(
                     .unwrap_or_else(|| format!("{label} failed to compile: {e}"))
             })?;
     }
+    // Warm FLOOR (cold-start cap-req 09): pin a REQUEST component so it never cold-starts
+    // under LRU pressure. A no-op (no compile) when the floor is off (`keep_warm_max == 0`)
+    // or the pinned set is already full; best-effort — a failure never fails the activation
+    // (the LRU cache still serves the component). Request lane only for v1.
+    if !is_consumer && let Err(err) = inner.engine.pin_request_component(&entry.hash, &wasm) {
+        tracing::warn!(
+            target: "boatramp::handler",
+            hash = %entry.hash, error = %err, "warm-floor pin failed (served via the LRU cache)"
+        );
+    }
     Ok(())
+}
+
+/// Cold-start cap-req 09 (producer): frame the serialized request-component artifact with the
+/// cluster MAC and publish it to the shared blob store for fresh replicas to hydrate.
+/// BEST-EFFORT: a missing cluster key, an oversize artifact, an existing entry, or a put
+/// failure all simply skip — never failing the activation (the serve path always has the
+/// content-addressed source as the fallback).
+#[cfg(feature = "handlers")]
+async fn maybe_publish_aot_artifact(
+    inner: &crate::HandlerRuntimeInner,
+    deploy: &DeployStore,
+    hash: &str,
+    serialized: Vec<u8>,
+) {
+    // Respect the operator's per-artifact size ceiling (native code is large; `0` ⇒ no cap).
+    if let Some(max) = inner.aot_max_bytes()
+        && max != 0
+        && serialized.len() as u64 > max
+    {
+        tracing::debug!(
+            target: "boatramp::handler",
+            %hash, len = serialized.len(), max, "AOT artifact over the size cap; not published"
+        );
+        return;
+    }
+    let Some(key) = inner.aot_mac_key().await else {
+        return; // AOT not available on this node (no envelope / sealed-root failure).
+    };
+    let fp = inner.engine.artifact_fingerprint();
+    let fp_hex = hex::encode(fp);
+    // Idempotent: another node (or a prior activation) may already have published it.
+    if deploy
+        .has_aot_artifact(&fp_hex, hash)
+        .await
+        .unwrap_or(false)
+    {
+        return;
+    }
+    let framed = crate::aot::frame(&key, &fp, hash, &serialized);
+    let body = futures::stream::once(async move { Ok(bytes::Bytes::from(framed)) }).boxed();
+    if let Err(err) = deploy.put_aot_artifact(&fp_hex, hash, body).await {
+        tracing::warn!(
+            target: "boatramp::handler",
+            %hash, error = %err, "publishing the AOT artifact failed (best-effort; ignored)"
+        );
+    } else {
+        tracing::debug!(target: "boatramp::handler", %hash, "published AOT artifact for fresh replicas");
+    }
 }
 
 /// Turn wasmtime's opaque "a matching implementation was not found in the linker" into an
@@ -1578,6 +1655,103 @@ pub(super) async fn read_blob_bytes(
         buf.extend_from_slice(&chunk?);
     }
     Ok(buf)
+}
+
+/// A hard safety ceiling on how many bytes the AOT consumer will read from the shared blob
+/// store before verifying the MAC — so a malicious oversize `aot/…` blob can never OOM a
+/// node (the MAC is computed over the whole frame, so it must be buffered first). The
+/// operator's `aot_artifact_max_bytes` narrows this further.
+#[cfg(feature = "handlers")]
+const AOT_CONSUMER_HARD_MAX: u64 = 512 * 1024 * 1024;
+
+/// Cold-start cap-req 09 (consumer): try to hydrate the request component from a portable,
+/// MAC-VERIFIED AOT artifact instead of recompiling from source. Returns `true` only when
+/// the artifact was fetched, its cluster MAC verified in CONSTANT TIME over the looked-up
+/// `(fingerprint, hash)`, AND `Component::deserialize` succeeded — the component is then warm
+/// in the engine cache. ANY miss / verification failure / deserialize error returns `false`,
+/// and the caller reads + compiles the source blob.
+///
+/// SECURITY: the MAC gate (`aot::verify`) runs BEFORE `hydrate_request_artifact`'s unsafe
+/// `Component::deserialize`, so a forged or tampered artifact (one a blob-store writer without
+/// the cluster key planted) never reaches the native-code loader — it fails the MAC and we
+/// fall back to compiling the content-addressed source. The read is size-capped so an
+/// oversize blob cannot exhaust memory before the check.
+#[cfg(feature = "handlers")]
+async fn try_hydrate_aot(
+    inner: &crate::HandlerRuntimeInner,
+    deploy: &DeployStore,
+    hash: &str,
+) -> bool {
+    // AOT disabled, or the cluster MAC key is unavailable (no `[secrets]` envelope / a
+    // sealed-root failure) ⇒ compile from source. Memoized, so this is cheap after the first.
+    let Some(key) = inner.aot_mac_key().await else {
+        return false;
+    };
+    hydrate_verified_artifact(&inner.engine, deploy, &key, inner.aot_max_bytes(), hash).await
+}
+
+/// The testable core of the AOT consumer (cold-start cap-req 09): fetch the `(fingerprint,
+/// hash)` artifact, size-cap the read, VERIFY the cluster MAC, and only then hydrate. Returns
+/// `true` iff a MAC-verified artifact hydrated. Split out from [`try_hydrate_aot`] (which only
+/// resolves the key) so the security-critical "verify-before-deserialize" wiring is unit-tested
+/// directly against a real engine + blob store. `max_bytes`: the operator's per-artifact cap
+/// (`None`/`Some(0)` ⇒ the hard safety ceiling).
+#[cfg(feature = "handlers")]
+async fn hydrate_verified_artifact(
+    engine: &boatramp_handlers::HandlerEngine,
+    deploy: &DeployStore,
+    key: &[u8; 32],
+    max_bytes: Option<u64>,
+    hash: &str,
+) -> bool {
+    let fp = engine.artifact_fingerprint();
+    let fp_hex = hex::encode(fp);
+    let object = match deploy.open_aot_artifact(&fp_hex, hash).await {
+        Ok(o) => o,
+        // A cache miss is the common first-touch case — not an error.
+        Err(_) => return false,
+    };
+    let cap = match max_bytes {
+        Some(0) | None => AOT_CONSUMER_HARD_MAX,
+        Some(n) => n.min(AOT_CONSUMER_HARD_MAX),
+    };
+    let mut body = object.body;
+    let mut framed = Vec::new();
+    while let Some(chunk) = body.next().await {
+        let Ok(bytes) = chunk else { return false };
+        if framed.len() as u64 + bytes.len() as u64 > cap {
+            tracing::warn!(
+                target: "boatramp::handler",
+                %hash, cap, "AOT artifact exceeds the read cap; compiling from source"
+            );
+            return false;
+        }
+        framed.extend_from_slice(&bytes);
+    }
+    // THE GATE: verify the cluster MAC (over the looked-up fingerprint + hash) BEFORE any
+    // deserialize. A failure here is a tampered/forged/foreign artifact ⇒ fail safe.
+    let Some(serialized) = crate::aot::verify(key, &fp, hash, &framed) else {
+        tracing::warn!(
+            target: "boatramp::handler",
+            %hash, "AOT artifact failed MAC verification; compiling from source"
+        );
+        return false;
+    };
+    match engine.hydrate_request_artifact(hash, serialized) {
+        Ok(()) => {
+            tracing::debug!(target: "boatramp::handler", %hash, "hydrated component from a verified AOT artifact");
+            true
+        }
+        // A verified artifact that still fails to deserialize = an engine/version drift the
+        // fingerprint did not separate; compile from source (safe, self-correcting).
+        Err(err) => {
+            tracing::warn!(
+                target: "boatramp::handler",
+                %hash, error = %err, "AOT hydrate failed post-verify; compiling from source"
+            );
+            false
+        }
+    }
 }
 
 /// Like [`read_blob_bytes`], mapping failure to an HTTP response (dispatch path).
@@ -4371,5 +4545,100 @@ mod secret_allowlist_tests {
         )
         .expect_err("a list with no project schema is refused");
         assert!(err.contains("no tenancy schema") && err.contains("countries"));
+    }
+}
+
+#[cfg(all(test, feature = "handlers"))]
+mod aot_consumer_tests {
+    //! Cold-start cap-req 09 — the AOT consumer WIRING: verify-before-hydrate, fail-safe.
+    //! The MAC itself is unit-tested in `crate::aot`; here we prove `hydrate_verified_artifact`
+    //! actually gates `Component::deserialize` on a passing MAC against a real engine + blob
+    //! store. The "forged" case uses REAL serialized bytes framed with the WRONG key — bytes
+    //! that WOULD deserialize fine — so a rejection proves the MAC (not deserialize) is the gate.
+    use super::*;
+    use crate::tests::MemStorage;
+    use boatramp_core::kv::MemoryKv;
+    use boatramp_handlers::{HandlerEngine, Limits};
+    use std::sync::Arc;
+
+    const HTTP_200: &[u8] = include_bytes!("../../boatramp-handlers/tests/fixtures/http-200.wasm");
+    const HASH: &str = "comp-http-200";
+
+    fn engine() -> HandlerEngine {
+        HandlerEngine::new(Limits::default(), 16).expect("engine")
+    }
+    fn deploy() -> DeployStore {
+        DeployStore::new(Arc::new(MemStorage::default()), Arc::new(MemoryKv::new()))
+    }
+
+    /// Produce + publish a framed artifact for `HTTP_200` under `key`.
+    async fn publish(store: &DeployStore, producer: &HandlerEngine, key: &[u8; 32]) {
+        let serialized = producer
+            .precompile_and_serialize_request(HASH, HTTP_200)
+            .expect("serialize");
+        let fp = producer.artifact_fingerprint();
+        let framed = crate::aot::frame(key, &fp, HASH, &serialized);
+        let body = futures::stream::once(async move { Ok(bytes::Bytes::from(framed)) }).boxed();
+        store
+            .put_aot_artifact(&hex::encode(fp), HASH, body)
+            .await
+            .expect("put artifact");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn verified_artifact_hydrates_and_skips_compile() {
+        let key = crate::aot::derive_key(&[5u8; 32]);
+        let store = deploy();
+        publish(&store, &engine(), &key).await;
+        // A FRESH consumer engine (same config ⇒ same fingerprint) hydrates without compiling.
+        let consumer = engine();
+        assert!(
+            hydrate_verified_artifact(&consumer, &store, &key, None, HASH).await,
+            "a MAC-verified artifact hydrates"
+        );
+        assert!(
+            consumer.request_component_warm(HASH),
+            "component is now warm"
+        );
+        assert_eq!(
+            consumer.instance_stats().request.cold_misses,
+            0,
+            "a hydrated artifact pays NO cranelift compile"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn forged_artifact_is_rejected_and_never_deserialized() {
+        // REAL serialized bytes, framed with the PRODUCER key…
+        let producer_key = crate::aot::derive_key(&[5u8; 32]);
+        let store = deploy();
+        publish(&store, &engine(), &producer_key).await;
+        // …but the consumer trusts a DIFFERENT cluster key: the MAC must reject it, even though
+        // the underlying bytes are a perfectly valid component that would deserialize.
+        let consumer = engine();
+        let wrong_key = crate::aot::derive_key(&[6u8; 32]);
+        assert!(
+            !hydrate_verified_artifact(&consumer, &store, &wrong_key, None, HASH).await,
+            "a wrong-key-MACed artifact is rejected by the MAC gate (not by deserialize)"
+        );
+        assert!(
+            !consumer.request_component_warm(HASH),
+            "the forged artifact was NEVER hydrated (never reached Component::deserialize)"
+        );
+        assert_eq!(
+            consumer.instance_stats().request.cold_misses,
+            0,
+            "and it did not compile either — a clean reject + fall-through"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn missing_artifact_is_a_clean_miss() {
+        let key = crate::aot::derive_key(&[5u8; 32]);
+        let consumer = engine();
+        assert!(
+            !hydrate_verified_artifact(&consumer, &deploy(), &key, None, "absent").await,
+            "a cache miss returns false (the caller compiles from source)"
+        );
     }
 }

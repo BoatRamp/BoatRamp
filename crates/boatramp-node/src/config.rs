@@ -636,6 +636,16 @@ const HANDLER_BLOB_HEDGE_ENV_VARS: &[&str] = &[
     "BOATRAMP_HANDLERS_BLOB_HEDGE_MAX_INFLIGHT",
 ];
 
+/// The `[handlers]` cold-start env levers (cap-req 09): the warm floor + the portable AOT
+/// artifact cache, mirroring the `keep_warm_max` / `aot_artifact_cache` /
+/// `aot_artifact_max_bytes` fields on [`HandlersConfig`]. Kept in sync by the forgot-a-knob
+/// guard test.
+const HANDLER_COLDSTART_ENV_VARS: &[&str] = &[
+    "BOATRAMP_HANDLERS_KEEP_WARM_MAX",
+    "BOATRAMP_HANDLERS_AOT_ARTIFACT_CACHE",
+    "BOATRAMP_HANDLERS_AOT_ARTIFACT_MAX_BYTES",
+];
+
 /// The `[serve.s3_ingress_cloud]` env levers (the blob-upload minter's cloud-brokering policy),
 /// mirroring the fields on [`S3IngressCloud`]. Kept in sync by the forgot-a-knob guard test. These are
 /// policy toggles only; the signing credential stays the sealed `[secrets]` one.
@@ -1220,6 +1230,26 @@ pub struct HandlersConfig {
     /// surface reports `warm_capacity` + `evictions` so the right value is measured, not guessed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instance_cache_size: Option<usize>,
+    /// **Warm floor** (cold-start cap-req 09): the maximum number of request components PINNED
+    /// in a never-evicted set, so a latency-critical face never cold-starts under LRU capacity
+    /// pressure. Absent/`0` ⇒ off (the plain LRU). Each activated request component is pinned
+    /// up to this cap (first-come); size it ≥ your latency-critical handler count. Pinned
+    /// components cost one resident instance each on top of the LRU, so keep it modest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_warm_max: Option<usize>,
+    /// **Portable cross-node AOT artifact cache** (cold-start cap-req 09). When `true` AND a
+    /// `[secrets]` envelope is configured, a node publishes each request component's precompiled
+    /// artifact (cluster-MAC-authenticated) to the shared blob store, and a FRESH replica
+    /// hydrates it instead of recompiling from source. Default **off** (opt-in): it loads
+    /// native code off the shared store, so it is gated on the cluster secret + a MAC check.
+    /// A node without the envelope silently never participates (it still compiles + warm-caches).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aot_artifact_cache: Option<bool>,
+    /// Per-artifact size ceiling for the AOT cache (bytes; `0` ⇒ unlimited). Native code is
+    /// large; an artifact over this is neither published nor (beyond a hard safety ceiling)
+    /// read. Absent ⇒ a generous default. Only consulted when `aot_artifact_cache` is on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aot_artifact_max_bytes: Option<u64>,
     /// **Blob container-marker cache size** (entries). Every blob container open re-`HEAD`s the
     /// `.boatramp-container` ownership marker — a second serial object-store round-trip per serve. A
     /// process-wide, positive-only cache of VERIFIED markers (keyed by the fully-resolved, tenant-confined
@@ -3787,6 +3817,34 @@ mod tests {
     }
 
     #[test]
+    fn env_wires_the_coldstart_knobs_over_the_default() {
+        // The warm floor + portable AOT cache (cap-req 09) are env-settable (12-factor parity);
+        // every lever is registered in HANDLER_COLDSTART_ENV_VARS — a forgot-a-knob guard.
+        let mut cfg = ServerConfig::default();
+        assert!(cfg.handlers.is_none());
+        cfg.apply_env_overrides(&env(&[
+            ("BOATRAMP_HANDLERS_KEEP_WARM_MAX", "8"),
+            ("BOATRAMP_HANDLERS_AOT_ARTIFACT_CACHE", "true"),
+            ("BOATRAMP_HANDLERS_AOT_ARTIFACT_MAX_BYTES", "268435456"),
+        ]))
+        .expect("valid env overrides apply");
+        let h = cfg.handlers.expect("handlers materialised from env");
+        assert_eq!(h.keep_warm_max, Some(8));
+        assert_eq!(h.aot_artifact_cache, Some(true));
+        assert_eq!(h.aot_artifact_max_bytes, Some(268_435_456));
+        for var in [
+            "BOATRAMP_HANDLERS_KEEP_WARM_MAX",
+            "BOATRAMP_HANDLERS_AOT_ARTIFACT_CACHE",
+            "BOATRAMP_HANDLERS_AOT_ARTIFACT_MAX_BYTES",
+        ] {
+            assert!(
+                HANDLER_COLDSTART_ENV_VARS.contains(&var),
+                "{var} missing from HANDLER_COLDSTART_ENV_VARS — a cold-start knob lost its env lever"
+            );
+        }
+    }
+
+    #[test]
     fn env_wires_the_s3_ingress_cloud_knobs_over_the_default() {
         // The blob-upload minter's cloud-brokering policy is env-settable, so the Tigris presigned-only
         // deployment needs no `boatramp.cfg` for it. Every lever is registered in
@@ -4918,6 +4976,7 @@ pub(crate) mod figment_resolve {
             .iter()
             .chain(HANDLER_CONCURRENCY_ENV_VARS)
             .chain(HANDLER_BLOB_HEDGE_ENV_VARS)
+            .chain(HANDLER_COLDSTART_ENV_VARS)
         {
             let field = field_of(var, "BOATRAMP_HANDLERS_");
             emit(&mut d, source, var, &["handlers", field.as_str()]);
@@ -5401,6 +5460,7 @@ pub(crate) mod figment_resolve {
                 .chain(JWKS_ENV_VARS)
                 .chain(HANDLER_CONCURRENCY_ENV_VARS)
                 .chain(HANDLER_BLOB_HEDGE_ENV_VARS)
+                .chain(HANDLER_COLDSTART_ENV_VARS)
                 .chain(S3_INGRESS_CLOUD_ENV_VARS)
                 .chain(SECRETS_ENV_VARS)
                 .chain(CLUSTER_ENV_VARS)
