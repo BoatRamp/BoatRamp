@@ -928,8 +928,7 @@ pub(super) async fn dispatch_gateway(
     let state = match policy {
         GatewayTargetPolicy::Operator => gateway::upstream_state(site, upstream_name),
         GatewayTargetPolicy::ProjectRaw | GatewayTargetPolicy::ProjectOwnWorkload => {
-            project_state_name =
-                format!("p\u{1}{}\u{1}{}", project.unwrap_or(""), upstream_name);
+            project_state_name = format!("p\u{1}{}\u{1}{}", project.unwrap_or(""), upstream_name);
             gateway::upstream_state(site, &project_state_name)
         }
     };
@@ -969,8 +968,16 @@ pub(super) async fn dispatch_gateway(
     // GET/HEAD with no declared/streamed body. Otherwise use a single backend.
     if !gateway_retryable(&request) || candidates.len() == 1 {
         let target = &candidates[0];
-        let response =
-            proxy_upstream(request, upstream, target, request_path, client_ip, policy, posture).await;
+        let response = proxy_upstream(
+            request,
+            upstream,
+            target,
+            request_path,
+            client_ip,
+            policy,
+            posture,
+        )
+        .await;
         state.record(
             target,
             !response.status().is_server_error(),
@@ -989,8 +996,16 @@ pub(super) async fn dispatch_gateway(
         *attempt.method_mut() = method.clone();
         *attempt.uri_mut() = uri.clone();
         *attempt.headers_mut() = headers.clone();
-        let response =
-            proxy_upstream(attempt, upstream, target, request_path, client_ip, policy, posture).await;
+        let response = proxy_upstream(
+            attempt,
+            upstream,
+            target,
+            request_path,
+            client_ip,
+            policy,
+            posture,
+        )
+        .await;
         let ok = !response.status().is_server_error();
         state.record(target, ok, upstream.passive_health, now);
         if ok {
@@ -1172,8 +1187,16 @@ async fn proxy_upstream(
     // WebSocket / generic HTTP upgrade: bridge the upgraded connection both ways.
     // reqwest can't upgrade, so this uses a hyper client conn.
     if is_upgrade_request(request.headers()) {
-        return proxy_upgrade(request, upstream, target, request_path, client_ip, policy, posture)
-            .await;
+        return proxy_upgrade(
+            request,
+            upstream,
+            target,
+            request_path,
+            client_ip,
+            policy,
+            posture,
+        )
+        .await;
     }
     // A `unix:/path` target forwards over a unix-domain socket.
     if let Some(socket_path) = target.strip_prefix("unix:") {

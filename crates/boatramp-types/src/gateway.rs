@@ -121,6 +121,23 @@ pub fn gateway_host_allowed(allowlist: &[String], host: &str) -> bool {
     allowlist.is_empty() || allowlist.iter().any(|g| gateway_host_matches(g, host))
 }
 
+/// The **authoritative serve-time** egress check for a PROJECT raw-target gateway upstream (two-tier
+/// gateway / 0.37.0): EVERY literal target host must satisfy BOTH the site operator's
+/// `project_egress_hosts` and the global admin's node `gateway_egress_allow` (each empty ⇒ no
+/// narrowing). A site operator may only narrow within the node floor, never past it — so a host must
+/// clear both. Called only for a `ProjectRaw`-policy match (own-compute + shared grants are exempt —
+/// their reach is vouched for by the tier that holds it). The IP bright line
+/// ([`crate::security`]-independent, in the proxy) is layered on top of this.
+pub fn project_raw_egress_allowed(
+    up: &Upstream,
+    site_allow: &[String],
+    node_allow: &[String],
+) -> bool {
+    upstream_literal_hosts(up)
+        .iter()
+        .all(|h| gateway_host_allowed(site_allow, h) && gateway_host_allowed(node_allow, h))
+}
+
 /// Which tier owns a resolved gateway match — and therefore which target-space rule binds it at
 /// serve time (the project tier may only reach its own compute + public hosts; the operator tier
 /// authorizes private reach).
@@ -1224,6 +1241,46 @@ mod tests {
         assert!(!gateway_host_allowed(
             &["*.ok.com".to_string()],
             "api.evil.com"
+        ));
+    }
+
+    #[test]
+    fn project_raw_egress_intersects_site_and_node() {
+        let up = upstream("https://api.vendor.com", None);
+        // Both empty ⇒ no narrowing ⇒ allowed.
+        assert!(project_raw_egress_allowed(&up, &[], &[]));
+        // One side narrows, the other empty ⇒ allowed (empty = no narrowing).
+        assert!(project_raw_egress_allowed(
+            &up,
+            &["*.vendor.com".to_string()],
+            &[]
+        ));
+        assert!(project_raw_egress_allowed(
+            &up,
+            &[],
+            &["api.vendor.com".to_string()]
+        ));
+        // Site allows but node does NOT ⇒ REFUSED (must clear BOTH levels).
+        assert!(!project_raw_egress_allowed(
+            &up,
+            &["*.vendor.com".to_string()],
+            &["*.other.com".to_string()]
+        ));
+        // Node allows but site does NOT ⇒ REFUSED.
+        assert!(!project_raw_egress_allowed(
+            &up,
+            &["*.other.com".to_string()],
+            &["*.vendor.com".to_string()]
+        ));
+        // Pooled targets: ONE out-of-allowlist host refuses the whole upstream.
+        let pool = Upstream {
+            targets: vec!["https://a.vendor.com".into(), "https://evil.com".into()],
+            ..Default::default()
+        };
+        assert!(!project_raw_egress_allowed(
+            &pool,
+            &["*.vendor.com".to_string()],
+            &[]
         ));
     }
 }

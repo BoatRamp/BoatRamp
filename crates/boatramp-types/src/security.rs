@@ -370,6 +370,15 @@ pub struct SecurityConfig {
     /// (and every non-tenancy knob) uses the fleet posture. Lets a shared, multi-project serve
     /// process run e.g. a strict-isolation production project alongside a looser preview project.
     pub projects: BTreeMap<String, ProjectPostureOverride>,
+    /// **Node-absolute egress-host allowlist for the PROJECT gateway tier** (two-tier gateway /
+    /// cap-req 0.37.0) — the global admin's floor. When non-empty, a `project.cfg`-declared gateway
+    /// upstream with a RAW target (not its own compute, not a shared-site grant) may only reach a host
+    /// matching one of these globs, on TOP of the public-only IP bright line and the site operator's
+    /// `GatewaySiteCaps.project_egress_hosts`. A site operator can only NARROW within this, never widen
+    /// past it. Empty (default) ⇒ no node-level host restriction (the IP bright line + any site
+    /// allowlist still apply). Globs match as [`crate::gateway::gateway_host_matches`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gateway_egress_allow: Vec<String>,
 }
 
 impl SecurityConfig {

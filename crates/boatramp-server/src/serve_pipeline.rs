@@ -1095,6 +1095,22 @@ pub(super) fn apply_vary(mut response: Response, vary: &[String]) -> Response {
     response
 }
 
+/// The global-admin node-absolute project-gateway egress-host allowlist (two-tier gateway / 0.37.0),
+/// set once at serve startup from `[security] gateway_egress_allow`. A node constant (not per-request
+/// nor per-project), so `OnceLock` — matching the `serve_admission_cap` / `server_timing_header`
+/// node-config pattern — avoids threading a non-Copy list through every serve layer. Empty when unset.
+static GATEWAY_EGRESS_ALLOW: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
+/// Set the node project-gateway egress allowlist (serve startup; first set wins, idempotent).
+pub fn set_gateway_egress_allow(list: Vec<String>) {
+    let _ = GATEWAY_EGRESS_ALLOW.set(list);
+}
+
+/// The node project-gateway egress allowlist, or `&[]` when unconfigured (⇒ no node narrowing).
+fn node_gateway_egress_allow() -> &'static [String] {
+    GATEWAY_EGRESS_ALLOW.get().map(Vec::as_slice).unwrap_or(&[])
+}
+
 #[allow(clippy::too_many_arguments)]
 #[cfg_attr(not(feature = "handlers"), allow(unused_variables))]
 async fn serve_resolved(
@@ -1285,7 +1301,9 @@ async fn serve_resolved(
         let site_gw = site_config.and_then(|c| c.gateway.as_ref());
         let project_gw = &manifest.config.gateway;
         // Inert unless some tier declares a route.
-        if project_gw.is_enabled() || site_gw.is_some_and(|g| g.is_enabled()) {
+        if project_gw.is_enabled()
+            || site_gw.is_some_and(boatramp_core::gateway::GatewayConfig::is_enabled)
+        {
             match boatramp_core::gateway::resolve_gateway(Some(project_gw), site_gw, request_path) {
                 // No gateway route matched — fall through to the rest of the pipeline.
                 GatewayResolution::NoMatch => {}
@@ -1315,6 +1333,32 @@ async fn serve_resolved(
                             crate::proxy::GatewayTargetPolicy::ProjectRaw
                         }
                     };
+                    // AUTHORITATIVE serve-time egress-host enforcement (0.37.0 Stage B.2): a project
+                    // RAW-target upstream's host must clear BOTH the site operator's
+                    // `project_egress_hosts` and the global admin's node `gateway_egress_allow` (each
+                    // empty ⇒ no narrowing). Declare-time validation is fail-fast; this is the gate that
+                    // binds even a config that bypassed it. (The IP bright line is layered on in the
+                    // proxy address gate; own-compute + shared grants use a different policy and skip
+                    // this.) Refuse with 502, like an unresolved upstream.
+                    if matches!(policy, crate::proxy::GatewayTargetPolicy::ProjectRaw) {
+                        let site_allow = site_config
+                            .map(|c| c.gateway_caps.project_egress_hosts.as_slice())
+                            .unwrap_or(&[]);
+                        if !boatramp_core::gateway::project_raw_egress_allowed(
+                            upstream,
+                            site_allow,
+                            node_gateway_egress_allow(),
+                        ) {
+                            return apply_vary(
+                                (
+                                    StatusCode::BAD_GATEWAY,
+                                    "gateway upstream host is not permitted by the egress allowlist\n",
+                                )
+                                    .into_response(),
+                                &vary,
+                            );
+                        }
+                    }
                     // A compute-backed upstream resolves its pool live from the workload's healthy
                     // replica endpoints (project-scoped), recording activity so the reconcile loop keeps
                     // it warm / wakes a parked replica. Identical to the prior operator path — now also

@@ -254,7 +254,7 @@ mod scheduler;
 mod serve_pipeline;
 #[cfg(feature = "handlers")]
 mod tenant_resolve;
-pub use serve_pipeline::{FastServe, http_redirect_router};
+pub use serve_pipeline::{FastServe, http_redirect_router, set_gateway_egress_allow};
 #[cfg(test)]
 mod hotpath_test;
 pub(crate) use serve_pipeline::{
@@ -4051,21 +4051,45 @@ mod tests {
             gateway_addr_allowed_for(private, GatewayTargetPolicy::Operator, &loose),
             gateway_addr_allowed(private, &loose)
         );
-        assert!(gateway_addr_allowed_for(private, GatewayTargetPolicy::Operator, &loose));
-        assert!(!gateway_addr_allowed_for(private, GatewayTargetPolicy::Operator, &strict));
+        assert!(gateway_addr_allowed_for(
+            private,
+            GatewayTargetPolicy::Operator,
+            &loose
+        ));
+        assert!(!gateway_addr_allowed_for(
+            private,
+            GatewayTargetPolicy::Operator,
+            &strict
+        ));
 
         // ProjectRaw: public-only, POSTURE-INDEPENDENT — a private target is refused even under the
         // permissive posture (the project tier can never self-grant private reach).
-        assert!(gateway_addr_allowed_for(public, GatewayTargetPolicy::ProjectRaw, &strict));
-        assert!(gateway_addr_allowed_for(public, GatewayTargetPolicy::ProjectRaw, &loose));
-        assert!(!gateway_addr_allowed_for(private, GatewayTargetPolicy::ProjectRaw, &strict));
+        assert!(gateway_addr_allowed_for(
+            public,
+            GatewayTargetPolicy::ProjectRaw,
+            &strict
+        ));
+        assert!(gateway_addr_allowed_for(
+            public,
+            GatewayTargetPolicy::ProjectRaw,
+            &loose
+        ));
+        assert!(!gateway_addr_allowed_for(
+            private,
+            GatewayTargetPolicy::ProjectRaw,
+            &strict
+        ));
         assert!(
             !gateway_addr_allowed_for(private, GatewayTargetPolicy::ProjectRaw, &loose),
             "a project raw target must be refused a private addr even under a permissive posture"
         );
 
         // ProjectOwnWorkload: a project-scoped replica addr (private by design) is admitted.
-        assert!(gateway_addr_allowed_for(private, GatewayTargetPolicy::ProjectOwnWorkload, &strict));
+        assert!(gateway_addr_allowed_for(
+            private,
+            GatewayTargetPolicy::ProjectOwnWorkload,
+            &strict
+        ));
 
         // Cloud-metadata is refused under EVERY policy (defense in depth).
         for policy in [

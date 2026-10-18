@@ -669,7 +669,12 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
     // Resolve the operator security posture once (profile preset + overrides);
     // absent `[security]` ⇒ the strict `multi-tenant` default. Threaded into
     // `ServerOptions` so it reaches the cluster path too.
-    let posture = config.security.clone().unwrap_or_default().resolve()?;
+    let security = config.security.clone().unwrap_or_default();
+    let posture = security.resolve()?;
+    // Node-absolute project-gateway egress-host allowlist (two-tier gateway / 0.37.0): the global
+    // admin's floor, set once for the serve process (read at the gateway serve decision for a project
+    // raw-target match). Both serve paths reach here (the comment above).
+    boatramp_server::set_gateway_egress_allow(security.gateway_egress_allow);
     // Server-level options, read from the resolved `serve` config (the pipeline already
     // merged flags/env/file). Resolved before the `serve` fields below are consumed.
     let mut options = boatramp_server::ServerOptions {
