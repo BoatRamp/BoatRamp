@@ -2607,14 +2607,15 @@ fn spawn_s3_ingress(
 /// operator-pinned tenancy) is carried in a `FunctionConfig` with an EMPTY `egress_allowlist` (the
 /// Phase-1 invariant: a `tcp-connection-host` guest holds no `wasi:sockets`). Shared by the
 /// single-node and cluster spawn blocks (mirrors `spawn_s3_ingress`).
-/// The on-demand resolver argument to [`spawn_listeners`] (cap-req 03 #4). It is the shared node
-/// on-demand engine's resolver, so a listener that opts in issues per-SNI certs through the *same*
-/// engine the public edge uses (one issuance budget, one cluster certreq single-flight — never a
-/// second engine). It exists only where the engine can (`all(acme-dns, cluster)`); every other build
-/// degrades it to an uninhabited `Option` that is always `None`, so the on-demand branch compiles out
-/// and every call site simply passes `None`.
+/// The on-demand engine argument to [`spawn_listeners`] (cap-req 03 #4). It is the shared node
+/// on-demand engine itself, so each opted-in listener mints its own PROJECT-SCOPED resolver from it
+/// (`scoped_resolver`) — one issuance budget, one cluster certreq single-flight, never a second engine
+/// (Security review Finding B: a listener serves only its own project's verified domains). It exists
+/// only where the engine can (`all(acme-dns, cluster)`); every other build degrades it to an
+/// uninhabited `Option` that is always `None`, so the on-demand branch compiles out and every call
+/// site simply passes `None`.
 #[cfg(all(feature = "tcp-listener", feature = "acme-dns", feature = "cluster"))]
-type ListenerOnDemand = Option<std::sync::Arc<crate::on_demand_tls::OnDemandResolver>>;
+type ListenerOnDemand = Option<std::sync::Arc<crate::on_demand_tls::OnDemandTls>>;
 #[cfg(all(
     feature = "tcp-listener",
     not(all(feature = "acme-dns", feature = "cluster"))
@@ -2678,15 +2679,19 @@ fn spawn_listeners(
                 // nothing of what speaks over the connection.
                 #[cfg(all(feature = "acme-dns", feature = "cluster"))]
                 if t.on_demand
-                    && let Some(od) = on_demand.clone()
+                    && let Some(engine) = on_demand.clone()
                 {
                     let cert_pem = std::fs::read_to_string(cert)?;
                     let key_pem = std::fs::read_to_string(key)?;
+                    // Mint a PROJECT-SCOPED resolver from the shared engine (Finding B): this listener
+                    // serves on-demand certs only for its own project's verified domains, never another
+                    // project's — even though all certs share one engine + cache.
+                    let scoped = engine.scoped_resolver(l.project.clone(), deploy.clone());
                     let cfg = crate::acme_dns::build_listener_server_config_composite(
                         &cert_pem,
                         &key_pem,
                         t.server_names.as_deref(),
-                        od,
+                        scoped,
                     )?;
                     return Ok(std::sync::Arc::new(cfg));
                 }
@@ -3732,20 +3737,22 @@ async fn serve_cluster_acme_dns(
     // in hand (so a `dns-01` challenge works), with the #02 allowlist (`deploy`), the replicated cert
     // store, and the leader gate. `on_demand_engine` is held for the whole serve; `on_demand` is its
     // resolver, composed with the static wildcard resolver at every config (re)build below.
-    let on_demand_engine = on_demand_cfg.and_then(|cfg| {
-        crate::on_demand_tls::from_serve_config(
-            &cfg,
-            deploy.clone(),
-            cert_store.clone(),
-            Arc::new(is_leader.clone()),
-            Some(provider.clone()),
-            account_kv.clone(),
-            account_envelope.clone(),
-        )
-    });
-    let on_demand = on_demand_engine
-        .as_ref()
-        .map(crate::on_demand_tls::OnDemandTls::resolver);
+    let on_demand_engine: Option<Arc<crate::on_demand_tls::OnDemandTls>> = on_demand_cfg
+        .and_then(|cfg| {
+            crate::on_demand_tls::from_serve_config(
+                &cfg,
+                deploy.clone(),
+                cert_store.clone(),
+                Arc::new(is_leader.clone()),
+                Some(provider.clone()),
+                account_kv.clone(),
+                account_envelope.clone(),
+            )
+        })
+        .map(Arc::new);
+    // The public EDGE resolver (unscoped — fronts every verified domain). Listeners mint their own
+    // PROJECT-SCOPED resolvers from the shared engine inside `spawn_listeners` (Finding B).
+    let on_demand = on_demand_engine.as_ref().map(|e| e.resolver());
     // Deferred listener spawn (cap-req 03 #4): now that the on-demand resolver exists, bind the
     // host-owned inbound-TCP listeners sharing it — a listener that opts in issues per-SNI through
     // this same engine (one budget, one certreq single-flight). `on_demand.clone()` is `None` when
@@ -3782,7 +3789,7 @@ async fn serve_cluster_acme_dns(
         &options.posture,
         &handlers,
         &deploy,
-        on_demand.clone(),
+        on_demand_engine.clone(),
     );
     // HTTP/3: when enabled, stand up a QUIC endpoint sharing the same
     // ACME certs (build_server_configs gives a `h3`-ALPN config off one resolver);

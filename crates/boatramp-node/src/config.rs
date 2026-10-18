@@ -2308,6 +2308,13 @@ pub struct ListenerTlsConfig {
     /// `cert_file` still serves `server_names` (and an SNI-less handshake). Default `false` ⇒ the static
     /// cert alone (unchanged). This is transport-level only — it carries no notion of what protocol runs
     /// over the listener.
+    ///
+    /// **Project-scoped** (Security review Finding B): a listener is bound to exactly one project (its
+    /// `project`), and that project may front many domains (its tenants/sites). On-demand serving here
+    /// is restricted to SNIs whose owning project is *this* project — the listener never serves (nor
+    /// routes to its guest) a cert for another project's domain, even though all certs share the one
+    /// engine + cache. Point an `on_demand` listener only at a guest that is meant to handle that whole
+    /// project's domains.
     #[serde(default)]
     pub on_demand: bool,
     /// SNI names the listener's own static `cert_file` serves directly (an SNI match here wins before

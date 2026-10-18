@@ -425,11 +425,29 @@ impl OnDemandTls {
     }
 
     /// A `rustls` cert resolver that serves cached certs + triggers on-demand issuance for an
-    /// authorized miss (the issuance gate runs in the worker, never on the handshake path).
+    /// authorized miss (the issuance gate runs in the worker, never on the handshake path). The public
+    /// edge resolver: UNSCOPED (serves every verified domain).
     pub fn resolver(&self) -> Arc<OnDemandResolver> {
         Arc::new(OnDemandResolver {
             cache: Arc::clone(&self.cache),
             trigger: self.trigger.clone(),
+            scope: None,
+        })
+    }
+
+    /// A resolver for a host-owned listener bound to `project` (cap-req 03 #4 / Finding B): shares the
+    /// SAME engine (one cache, one trigger, one issuance budget) but serves issued certs ONLY for
+    /// domains owned by `project`, using `deploy` for the synchronous owner check. A listener thus
+    /// never serves (nor routes to its guest) a cert for another project's domain.
+    pub fn scoped_resolver(
+        &self,
+        project: String,
+        deploy: boatramp_core::deploy::DeployStore,
+    ) -> Arc<OnDemandResolver> {
+        Arc::new(OnDemandResolver {
+            cache: Arc::clone(&self.cache),
+            trigger: self.trigger.clone(),
+            scope: Some(ListenerScope { project, deploy }),
         })
     }
 }
@@ -524,12 +542,30 @@ pub fn from_serve_config(
     ))
 }
 
+/// Restricts a listener's on-demand resolver to the domains of ONE project (cap-req 03 #4 / Security
+/// review Finding B). The public 443 edge has NO scope — it fronts every verified domain. A host-owned
+/// listener is bound to exactly one project (its operator-pinned `(project, site)`), and that project
+/// may front many domains (its tenants/sites). This scope makes the listener serve an issued cert ONLY
+/// for an SNI whose owning project matches — so a listener bound to project P can never serve a cert
+/// for another project's domain (and route that decrypted connection to P's guest), even though the
+/// certs share one engine + one cache. The check is the synchronous, fail-closed
+/// [`DeployStore::cached_owner`]: an SNI whose owner is not cached as this project is not served (and,
+/// when the owner is a KNOWN other project, not even triggered for issuance).
+#[derive(Clone)]
+pub struct ListenerScope {
+    project: String,
+    deploy: boatramp_core::deploy::DeployStore,
+}
+
 /// A [`ResolvesServerCert`] that serves an issued cert by SNI, a TLS-ALPN-01 challenge cert on the
 /// `acme-tls/1` handshake, and otherwise **triggers** on-demand issuance (non-blocking) and returns
 /// `None` — failing this handshake so the client retries once the cert is warm.
 pub struct OnDemandResolver {
     cache: Arc<CertCache>,
     trigger: mpsc::Sender<String>,
+    /// `None` at the public edge (serves every verified domain). `Some` on a host-owned listener,
+    /// restricting the issued-cert serve path to the scope's project (Finding B).
+    scope: Option<ListenerScope>,
 }
 
 impl std::fmt::Debug for OnDemandResolver {
@@ -545,9 +581,41 @@ impl OnDemandResolver {
     /// composite must extract `sni`/ALPN once and dispatch via this method.
     pub fn resolve_sni(&self, sni: &str, is_acme_alpn: bool) -> Option<Arc<CertifiedKey>> {
         // A TLS-ALPN-01 validation handshake: serve the challenge cert if a solver installed one.
+        // (Challenge certs are ephemeral + ALPN-gated and are validated at the 443 edge, so they are
+        // not scoped here.)
         if is_acme_alpn {
             return self.cache.get_challenge(sni);
         }
+        // Listener scope (Finding B): a scoped listener serves an issued cert ONLY for an SNI it can
+        // synchronously confirm belongs to its project; a KNOWN other-project owner is refused outright
+        // (no serve, no trigger); an UNKNOWN (uncached) owner fails closed for serving but still
+        // triggers an async resolution+issuance — the retry then either confirms in-project (served) or
+        // reveals another project (refused), so a wrong-project cert is never served.
+        if let Some(scope) = &self.scope {
+            match scope.deploy.cached_owner(sni) {
+                Some(owner) if owner.project == scope.project => {
+                    if let Some(key) = self.cache.get_issued(sni) {
+                        return Some(key);
+                    }
+                    // In-project but not yet issued: trigger, fail this handshake, serve on retry.
+                    let _ = self.trigger.try_send(sni.to_string());
+                    return None;
+                }
+                Some(_) => {
+                    // A confirmed OTHER project's domain: never served or issued by this listener.
+                    return None;
+                }
+                None => {
+                    // Owner not (freshly) cached: can't confirm in-project, so don't serve. Trigger an
+                    // async resolution (which populates the owner cache) so a legitimate in-project
+                    // domain is issued + servable on the retry. A wrong-project name issued this way is
+                    // still refused on the retry (owner then resolves to the other project).
+                    let _ = self.trigger.try_send(sni.to_string());
+                    return None;
+                }
+            }
+        }
+        // Unscoped edge: serve any issued cert, else trigger (gated + single-flighted in the worker).
         if let Some(key) = self.cache.get_issued(sni) {
             return Some(key);
         }
@@ -559,11 +627,31 @@ impl OnDemandResolver {
 
     /// Build a resolver over a pre-seeded [`CertCache`] with a dead trigger channel. Test-only seam
     /// (no engine, no issuance) for exercising the composite's handshake dispatch: a miss simply fails
-    /// the handshake instead of triggering issuance.
+    /// the handshake instead of triggering issuance. Unscoped (edge-like).
     #[cfg(test)]
     pub(crate) fn from_cache(cache: Arc<CertCache>) -> Self {
         let (tx, _rx) = mpsc::channel(1);
-        Self { cache, trigger: tx }
+        Self {
+            cache,
+            trigger: tx,
+            scope: None,
+        }
+    }
+
+    /// Like [`from_cache`](Self::from_cache) but PROJECT-SCOPED (test-only seam for Finding B): serves
+    /// an issued cert only for an SNI `deploy` resolves to `project`.
+    #[cfg(test)]
+    pub(crate) fn scoped_from_cache(
+        cache: Arc<CertCache>,
+        project: String,
+        deploy: boatramp_core::deploy::DeployStore,
+    ) -> Self {
+        let (tx, _rx) = mpsc::channel(1);
+        Self {
+            cache,
+            trigger: tx,
+            scope: Some(ListenerScope { project, deploy }),
+        }
     }
 }
 
@@ -942,6 +1030,93 @@ mod tests {
             "an unresolvable SNI is refused"
         );
         println!("ON-DEMAND GATE VERIFIED-ONLY OK: verified authorized, merely-attached refused");
+    }
+
+    // Finding-B scope: a host-owned listener's resolver serves an issued cert ONLY for an SNI owned by
+    // its own project — never another project's domain, even though both certs sit in the ONE shared
+    // cache. (Closes the cross-tenant plaintext-capture vector: a listener pinned to project P can't be
+    // induced to serve V's cert and route V's connection to P's guest.)
+    #[tokio::test]
+    async fn listener_scope_serves_only_its_own_projects_domains() {
+        use boatramp_core::deploy::DeployStore;
+        use boatramp_core::project::ProjectRef;
+
+        let store = DeployStore::new(
+            Arc::new(NullStorage),
+            Arc::new(boatramp_core::kv::MemoryKv::new()),
+        );
+        // Two projects, one domain each, both written into the domain index.
+        let mine = boatramp_core::config::SiteConfig {
+            domains: boatramp_core::config::DomainConfig {
+                primary: Some("mine.example.test".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let other = boatramp_core::config::SiteConfig {
+            domains: boatramp_core::config::DomainConfig {
+                primary: Some("other.example.test".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        store
+            .set_site_config(ProjectRef::new("mailroom"), "s", &mine)
+            .await
+            .unwrap();
+        store
+            .set_site_config(ProjectRef::new("storefront"), "s", &other)
+            .await
+            .unwrap();
+        // Warm the synchronous owner cache the scope check reads.
+        assert!(matches!(
+            store.resolve_site_by_host("mine.example.test").await,
+            Ok(Some(_))
+        ));
+        assert!(matches!(
+            store.resolve_site_by_host("other.example.test").await,
+            Ok(Some(_))
+        ));
+
+        // Both certs live in the ONE shared cache (as if the edge issued both).
+        let cache = Arc::new(CertCache::default());
+        for sni in ["mine.example.test", "other.example.test"] {
+            let (cert, key) = self_signed(sni);
+            cache.insert_issued(
+                sni,
+                Arc::new(crate::acme_dns::certified_key_from_pem(&cert, &key).unwrap()),
+            );
+        }
+
+        // A resolver scoped to the `mailroom` project (what a mailroom-pinned listener gets).
+        let scoped = OnDemandResolver::scoped_from_cache(
+            Arc::clone(&cache),
+            "mailroom".to_string(),
+            store.clone(),
+        );
+        assert!(
+            scoped.resolve_sni("mine.example.test", false).is_some(),
+            "serves its OWN project's verified domain"
+        );
+        assert!(
+            scoped.resolve_sni("other.example.test", false).is_none(),
+            "must NOT serve another project's domain, even though its cert is cached (Finding B)"
+        );
+        assert!(
+            scoped.resolve_sni("stranger.example.test", false).is_none(),
+            "an unknown SNI is not served"
+        );
+
+        // The UNSCOPED edge resolver over the same cache serves both (the edge fronts every domain).
+        let edge = OnDemandResolver::from_cache(Arc::clone(&cache));
+        assert!(edge.resolve_sni("mine.example.test", false).is_some());
+        assert!(
+            edge.resolve_sni("other.example.test", false).is_some(),
+            "the edge is unscoped and serves every verified domain"
+        );
+        println!(
+            "LISTENER PROJECT-SCOPE OK: own-project served, other-project refused, edge unscoped"
+        );
     }
 
     fn mem_store() -> Arc<dyn CertStore> {

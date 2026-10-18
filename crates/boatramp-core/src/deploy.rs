@@ -1524,6 +1524,23 @@ impl DeployStore {
         Ok(resolved)
     }
 
+    /// A **synchronous, non-blocking** read of the host→owner resolution cache: `Some(owner)` only
+    /// when a current-generation cached entry names an owning `(project, site)`. Returns `None` when
+    /// the host is not cached, is cached as a non-match, or the cache generation is stale — i.e. it
+    /// never does KV I/O and never confirms an owner it isn't certain of. Used on the TLS handshake
+    /// hot path (cap-req 03 #4) to decide, without `await`, whether an SNI belongs to a listener's
+    /// project before serving it a cert; an uncertain answer fails closed (caller refuses to serve and
+    /// triggers an async resolution that populates this cache for the retry).
+    pub fn cached_owner(&self, host: &str) -> Option<DomainOwner> {
+        let host = canon_host(host);
+        let epoch = self.domain_epoch.load(std::sync::atomic::Ordering::Acquire);
+        let cache = self.domain_cache.read().ok()?;
+        if cache.epoch != epoch {
+            return None; // a domain-index write superseded the cache ⇒ don't trust a stale mapping
+        }
+        cache.map.get(host.as_str())?.clone()
+    }
+
     /// The uncached `Host` → owner resolution: exact `domain/<host>`, then each
     /// wildcard suffix up the label chain. The KV source of truth behind
     /// [`resolve_site_by_host`](Self::resolve_site_by_host)'s cache.

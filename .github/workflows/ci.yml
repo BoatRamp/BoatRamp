@@ -711,6 +711,30 @@ jobs:
           grep -q 'LISTENER ON-DEMAND TLS COMPOSITE OK' listener-composite.log \
             || { echo "::error::listener on-demand composite gate never reached its marker (a per-SNI listener cert-dispatch regression)" >&2; exit 1; }
 
+      # cap-req 03 ON-DEMAND TLS TENANT-SCOPE GATES (Security review Findings A + B). TWO hard markers:
+      # (A) `ON-DEMAND GATE VERIFIED-ONLY OK` — the issuance allowlist authorizes a domain only when it
+      # is ownership-VERIFIED, not merely attached/resolvable (a raw set_site_config can write the domain
+      # index without proof; gating on resolution alone let a tenant churn the shared CA budget with bogus
+      # self-attached names). (B) `LISTENER PROJECT-SCOPE OK` — a host-owned listener bound to project P
+      # serves an on-demand cert ONLY for P's own domains, never another project's, even though all certs
+      # share the one engine + cache (closes the cross-tenant plaintext-capture vector). Both drive the
+      # real DeployStore gate/resolver; the markers + pass count catch a silent skip/rename.
+      - name: "on-demand TLS tenant-scope gates (verified-only issuance + per-project serving)"
+        run: |
+          set -eo pipefail
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp \
+            --features acme-dns,cluster \
+            on_demand_tls::tests::deploy_gate_requires_verification_not_mere_attachment \
+            -- --nocapture 2>&1 | tee ondemand-verified.log
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp \
+            --features acme-dns,cluster \
+            on_demand_tls::tests::listener_scope_serves_only_its_own_projects_domains \
+            -- --nocapture 2>&1 | tee ondemand-scope.log
+          grep -q 'ON-DEMAND GATE VERIFIED-ONLY OK' ondemand-verified.log \
+            || { echo "::error::on-demand verified-only gate never reached its marker (Finding A: issuance gates on mere resolvability, not verification)" >&2; exit 1; }
+          grep -q 'LISTENER PROJECT-SCOPE OK' ondemand-scope.log \
+            || { echo "::error::listener project-scope gate never reached its marker (Finding B: a listener can serve another project's domain)" >&2; exit 1; }
+
       # PLAN-compute-bindings COMPUTE BLOB-SHIM SCOPED GATE (marker `COMPUTE BLOB-SHIM SCOPED OK`). The
       # compute blob-shim gives an opaque workload the SAME per-site `hblob/{qualified-site}/{container}/
       # {key}` blob namespace — over the SAME `Storage` backend — a `wasi:blobstore` handler sees, scoped
