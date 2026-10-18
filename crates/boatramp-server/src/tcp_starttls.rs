@@ -102,6 +102,14 @@ fn match_trigger(line: &[u8], g: &StarttlsGrammar) -> Option<Option<String>> {
         if tag.is_empty() {
             return None;
         }
+        // Defensive: the tag is echoed verbatim into the response line, so refuse any ASCII control
+        // byte in it. A `\n`/space can't be here by construction (the line ends at `\n`; the tag stops
+        // at the first space), so this can't inject a second response line even without the check —
+        // but an embedded `\r`/NUL/control char has no legitimate place in a protocol tag, and
+        // rejecting it keeps the host-written response strictly single-line and control-free.
+        if tag.iter().any(u8::is_ascii_control) {
+            return None;
+        }
         let mut rest = &s[sp..];
         while rest.first() == Some(&b' ') {
             rest = &rest[1..];
@@ -273,6 +281,11 @@ mod tests {
         assert_eq!(match_trigger(b"STARTTLS\r\n", &imap), None);
         // Wrong command after the tag ⇒ no match.
         assert_eq!(match_trigger(b"a1 LOGIN\r\n", &imap), None);
+        // Defensive (LOW-1): a tag carrying an embedded control byte (here CR) is refused, so the
+        // host-written response stays strictly single-line and control-free. `\n` / space can't be in
+        // a tag by construction; `\r`, NUL and other controls are rejected here.
+        assert_eq!(match_trigger(b"a\r1 STARTTLS\r\n", &imap), None);
+        assert_eq!(match_trigger(b"a\x00 STARTTLS\n", &imap), None);
     }
 
     #[test]

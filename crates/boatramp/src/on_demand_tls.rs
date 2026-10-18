@@ -3,9 +3,10 @@
 //! A multi-tenant edge fronts many customer-owned hostnames. Pre-registering a cert per hostname does
 //! not scale; instead, on the first TLS handshake for an **authorized** but not-yet-issued SNI, the
 //! host issues (and caches) a cert, then serves the client on its retry. The authorization gate is the
-//! #02 verified-domain allowlist ([`DeployStore::resolve_site_by_host`]) — issuance for an arbitrary
-//! attacker-chosen SNI is **refused** (fail-closed), so a flood of unknown SNIs can never become an
-//! ACME / rate-limit storm.
+//! #02 verified-domain allowlist ([`DeployGate`]): the SNI must resolve to a site AND that site must
+//! hold an ownership-**verified** record for the host (not mere attachment). Issuance for an arbitrary
+//! attacker-chosen — or merely-attached-but-unverified — SNI is **refused** (fail-closed), so a flood
+//! of such SNIs can never become an ACME / rate-limit storm.
 //!
 //! This module is the security engine: the [`OnDemandResolver`] (a `rustls` cert resolver that serves
 //! a cached cert, or triggers issuance and fails this handshake so the client retries), and the
@@ -91,9 +92,15 @@ pub trait IssuanceGate: Send + Sync {
     async fn is_authorized(&self, sni: &str) -> bool;
 }
 
-/// The #02 verified-domain allowlist: an SNI is authorized iff it resolves to an attached site
-/// (`resolve_site_by_host` returns `Some`, which only happens for a host run through
-/// `attach_verified_domain`). An error resolving fails **closed**.
+/// The #02 verified-domain allowlist: an SNI is authorized iff it resolves to a site AND that site has
+/// an **ownership-verified** record for the host. Resolution alone is NOT sufficient — a raw
+/// `set_site_config` can write the `domain/<host>` index without any proof, whereas
+/// `attach_verified_domain` requires `is_domain_verified` first. Gating on resolution alone would let a
+/// tenant attach bogus/unverified hostnames to its own site and, by cycling SNIs for them, churn the
+/// shared CA rate-limit + in-flight budget (a cross-tenant availability vector) — even though the ACME
+/// challenge would ultimately refuse the cert. So we require verification here (defense-in-depth; it
+/// also makes "authorized" match the documented invariant). Any error resolving/checking fails
+/// **closed**.
 pub struct DeployGate {
     pub deploy: boatramp_core::deploy::DeployStore,
 }
@@ -101,7 +108,18 @@ pub struct DeployGate {
 #[async_trait]
 impl IssuanceGate for DeployGate {
     async fn is_authorized(&self, sni: &str) -> bool {
-        matches!(self.deploy.resolve_site_by_host(sni).await, Ok(Some(_)))
+        let Ok(Some(owner)) = self.deploy.resolve_site_by_host(sni).await else {
+            return false;
+        };
+        let site = boatramp_core::site::SiteName::new(owner.site);
+        self.deploy
+            .is_domain_verified(
+                boatramp_core::project::ProjectRef::new(&owner.project),
+                &site,
+                sni,
+            )
+            .await
+            .unwrap_or(false)
     }
 }
 
@@ -328,8 +346,11 @@ impl OnDemandIssuer {
     }
 
     /// One bounded drain pass over `certreq/*` (the leader-gated body of [`certreq_consumer`], split
-    /// out so it is unit-testable without the timer loop).
-    async fn certreq_drain_once(&self) {
+    /// out so it is unit-testable without the timer loop). Takes `&Arc<Self>` so issuance goes through
+    /// the per-node [`issue_deduped`](Self::issue_deduped) single-flight — a drain tick and a
+    /// concurrent resolver trigger for the same SNI then coalesce to ONE CA order instead of racing
+    /// into two.
+    async fn certreq_drain_once(self: &Arc<Self>) {
         let keys = match self
             .certreq_kv
             .list_from(CERTREQ_PREFIX, "", CERTREQ_BATCH)
@@ -349,8 +370,10 @@ impl OnDemandIssuer {
                 let _ = self.certreq_kv.delete(&key).await;
                 continue;
             }
-            // Issue on the leader; drop the marker once the cert is stored.
-            self.issue_one(&sni).await;
+            // Issue on the leader via the single-flight (coalesces with a concurrent resolver trigger
+            // for the same SNI); drop the marker once the cert is stored. If the name is already
+            // in-flight elsewhere, this no-ops and the marker is retried on a later tick.
+            Arc::clone(self).issue_deduped(sni.clone()).await;
             if matches!(self.cert_store.get(&sni).await, Ok(Some(_))) {
                 let _ = self.certreq_kv.delete(&key).await;
             }
@@ -457,6 +480,11 @@ pub fn from_serve_config(
         .unwrap_or_else(|| "https://acme-v02.api.letsencrypt.org/directory".to_string());
     // The same replicated KV backs the ACME-account persistence and the cross-node certreq queue.
     let certreq_kv = Arc::clone(&account_kv);
+    // LOW-3 (security review): without a `[secrets]` key envelope, issued cert private keys and the
+    // persisted ACME account credentials are stored UNENCRYPTED in the replicated control-plane KV
+    // (the documented fallback, same as the static cluster-cert store). Warn loudly so an operator
+    // enabling on-demand TLS in production configures `[secrets]`.
+    let envelope_wrapped = account_envelope.is_some();
     let issuer = Arc::new(AcmeIssuer::new(
         challenge,
         directory_url,
@@ -479,6 +507,14 @@ pub fn from_serve_config(
             .unwrap_or(defaults.rate_limit_per_hour),
         renew_before_secs: defaults.renew_before_secs,
     };
+    if !envelope_wrapped {
+        tracing::warn!(
+            target: "boatramp::acme",
+            "on-demand TLS is enabled WITHOUT a [secrets] key envelope: issued cert private keys and \
+             the ACME account credentials persist UNENCRYPTED in the control-plane store; configure \
+             [secrets] to wrap them at rest"
+        );
+    }
     tracing::info!(
         target: "boatramp::acme",
         "on-demand per-SNI TLS issuance ENABLED (allowlist = verified custom domains)"
@@ -781,6 +817,131 @@ mod tests {
         let params = rcgen::CertificateParams::new(vec![sni.to_string()]).unwrap();
         let cert = params.self_signed(&kp).unwrap();
         (cert.pem(), kp.serialize_pem())
+    }
+
+    /// A no-op blob [`Storage`] — `DeployStore`'s domain operations are KV-only, so this is never
+    /// touched; it only satisfies the `DeployStore::new` constructor for the gate test below.
+    struct NullStorage;
+    #[async_trait]
+    impl boatramp_core::Storage for NullStorage {
+        async fn get(
+            &self,
+            _: &str,
+        ) -> std::result::Result<boatramp_core::GetObject, boatramp_core::StorageError> {
+            Err(boatramp_core::StorageError::NotFound(String::new()))
+        }
+        async fn get_range(
+            &self,
+            _: &str,
+            _: u64,
+            _: Option<u64>,
+        ) -> std::result::Result<boatramp_core::GetObject, boatramp_core::StorageError> {
+            Err(boatramp_core::StorageError::NotFound(String::new()))
+        }
+        async fn put(
+            &self,
+            _: &str,
+            _: boatramp_core::ByteStream,
+            _: boatramp_core::PutMeta,
+        ) -> std::result::Result<boatramp_core::ObjectMeta, boatramp_core::StorageError> {
+            Err(boatramp_core::StorageError::unsupported("null"))
+        }
+        async fn head(
+            &self,
+            _: &str,
+        ) -> std::result::Result<boatramp_core::ObjectMeta, boatramp_core::StorageError> {
+            Err(boatramp_core::StorageError::NotFound(String::new()))
+        }
+        async fn delete(&self, _: &str) -> std::result::Result<(), boatramp_core::StorageError> {
+            Ok(())
+        }
+        async fn list(
+            &self,
+            _: &str,
+        ) -> std::result::Result<Vec<boatramp_core::ObjectMeta>, boatramp_core::StorageError>
+        {
+            Ok(Vec::new())
+        }
+    }
+
+    // Finding-A gate: on-demand issuance authorizes an attached + ownership-VERIFIED domain, and
+    // REFUSES a domain that is merely attached/resolvable but not verified (which a raw
+    // `set_site_config` can write without proof) — so a tenant can't churn the shared CA budget by
+    // cycling bogus self-attached names. Resolution alone is not authorization.
+    #[tokio::test]
+    async fn deploy_gate_requires_verification_not_mere_attachment() {
+        use boatramp_core::deploy::DeployStore;
+        use boatramp_core::project::ProjectRef;
+        use boatramp_core::site::SiteName;
+
+        let store = DeployStore::new(
+            Arc::new(NullStorage),
+            Arc::new(boatramp_core::kv::MemoryKv::new()),
+        );
+        let proj = ProjectRef::new("shop");
+        let site = SiteName::new("storefront");
+
+        // (1) A merely-ATTACHED, unverified domain: written into the site config (so it resolves) but
+        // never verified.
+        let cfg = boatramp_core::config::SiteConfig {
+            domains: boatramp_core::config::DomainConfig {
+                primary: Some("attached.example.test".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        store
+            .set_site_config(proj, "storefront", &cfg)
+            .await
+            .unwrap();
+
+        // (2) A properly VERIFIED + attached domain.
+        store
+            .start_domain_verification(
+                proj,
+                &site,
+                "verified.example.test",
+                boatramp_core::domain_verify::VerificationMethod::Dns,
+                100,
+            )
+            .await
+            .unwrap();
+        store
+            .mark_domain_verified(proj, &site, "verified.example.test")
+            .await
+            .unwrap();
+        store
+            .attach_verified_domain(proj, &site, "verified.example.test")
+            .await
+            .unwrap();
+
+        let gate = DeployGate {
+            deploy: store.clone(),
+        };
+
+        // Both resolve to a site (the loose, pre-fix condition would authorize BOTH)…
+        assert!(
+            matches!(
+                store.resolve_site_by_host("attached.example.test").await,
+                Ok(Some(_))
+            ),
+            "the unverified domain still resolves — resolution is not verification"
+        );
+        // …but only the verified one is AUTHORIZED for issuance.
+        assert!(
+            gate.is_authorized("verified.example.test").await,
+            "a verified attached domain is authorized for on-demand issuance"
+        );
+        assert!(
+            !gate.is_authorized("attached.example.test").await,
+            "a merely-attached, UNVERIFIED domain must NOT be authorized (Finding A)"
+        );
+        // An unknown SNI resolves to nothing ⇒ refused (fail-closed), unchanged.
+        assert!(
+            !gate.is_authorized("stranger.example.test").await,
+            "an unresolvable SNI is refused"
+        );
+        println!("ON-DEMAND GATE VERIFIED-ONLY OK: verified authorized, merely-attached refused");
     }
 
     fn mem_store() -> Arc<dyn CertStore> {
