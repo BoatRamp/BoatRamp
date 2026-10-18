@@ -1050,6 +1050,15 @@ fn tcplistener_mutation() -> Option<String> {
 #[cfg(feature = "tcp-listener")]
 const TCP_CONN_WRITE_BUDGET: usize = 64 * 1024;
 
+/// Node-global ceiling on concurrently-live session-mode listener connections (cap-req 08 / Security
+/// review LOW backstop). Generous — sized for the many-mostly-idle-connections use case (thousands of
+/// IMAP IDLE / long-poll sessions) so it never bites normal operation, while still capping a single
+/// misconfigured listener's socket + checkpoint footprint across a multi-listener node. A parked
+/// connection is cheap (no instance, no re-entry permit), so a high ceiling is safe. (A future config
+/// knob can make this operator-tunable; a fixed generous default is the LOW hardening here.)
+#[cfg(all(feature = "tcp-listener", feature = "session"))]
+const DEFAULT_SESSION_CONN_CAP: usize = 16_384;
+
 /// How many epoch ticks a conn-lane guest runs before the engine epoch forces its async fiber to
 /// YIELD (`epoch_deadline_async_yield_and_update`) — PLAN-handler-tcp-inbound HIGH-fix. At
 /// [`EPOCH_TICK_MS`] (10ms) this is ~250ms. Yield ≠ trap: a long-lived `handle` is preserved, but a
@@ -1287,6 +1296,14 @@ pub struct HandlerEngine {
     /// `dispatch_session_connection`. Defaults to `limits.max_concurrency`.
     #[cfg(all(feature = "tcp-listener", feature = "session"))]
     session_socket_semaphore: Semaphore,
+    /// NODE-GLOBAL ceiling on concurrently-live session-mode listener connections across ALL session
+    /// listeners (cap-req 08 / Security review LOW — a safety backstop above each listener's own
+    /// `max_conns`). A permit is held for a connection's WHOLE life (parked included), so it bounds the
+    /// aggregate socket + checkpoint footprint of a multi-listener node against a single misconfigured
+    /// listener. Generous by default ([`DEFAULT_SESSION_CONN_CAP`]) so it never bites the
+    /// many-idle-connections use case; `Arc` for owned per-connection permits.
+    #[cfg(all(feature = "tcp-listener", feature = "session"))]
+    session_conn_semaphore: std::sync::Arc<Semaphore>,
     /// The inbound-TCP connection lane ceiling — the (memory) clamp a listener dispatch is held to.
     /// Defaults to the sync `limits`; the per-invocation epoch deadline + CPU fuel are DISABLED for
     /// this lane in favor of idle + max-connection-duration timeouts (a long-lived `handle` must not
@@ -1553,6 +1570,9 @@ impl HandlerEngine {
             // ceiling, independent of the Async lane and the connection pool.
             #[cfg(all(feature = "tcp-listener", feature = "session"))]
             session_socket_semaphore: Semaphore::new(limits.max_concurrency.max(1)),
+            // Node-global live-session-connection ceiling (cap-req 08 / Security review LOW backstop).
+            #[cfg(all(feature = "tcp-listener", feature = "session"))]
+            session_conn_semaphore: std::sync::Arc::new(Semaphore::new(DEFAULT_SESSION_CONN_CAP)),
             #[cfg(feature = "tcp-listener")]
             tcp_conn_limits: limits,
             semaphore: Semaphore::new(limits.max_concurrency.max(1)),
@@ -2374,6 +2394,17 @@ impl HandlerEngine {
     /// driven over a raw listener socket cannot be 503'd mid-connection the way an HTTP POST can, so a
     /// re-entry applies backpressure by waiting for a lane slot. Total waiting is still bounded: the
     /// connection holds a per-listener `max_conns` slot and is reaped by its `max_conn_duration` cap.
+    /// Try to admit one more live session-mode listener connection against the node-global ceiling
+    /// ([`DEFAULT_SESSION_CONN_CAP`]). The returned owned permit is held by the connection driver for
+    /// the connection's WHOLE life (parked included) and released on close/EOF; `None` ⇒ the node is at
+    /// the ceiling and the connection must be refused (cap-req 08 / Security review LOW backstop).
+    #[cfg(all(feature = "session", feature = "tcp-listener"))]
+    pub fn acquire_session_conn(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        std::sync::Arc::clone(&self.session_conn_semaphore)
+            .try_acquire_owned()
+            .ok()
+    }
+
     #[cfg(all(feature = "session", feature = "tcp-listener"))]
     pub async fn dispatch_session_socket(
         &self,

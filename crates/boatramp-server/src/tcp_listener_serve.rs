@@ -110,8 +110,20 @@ async fn run_listener(runtime: HandlerRuntime, deploy: DeployStore, params: List
     };
     tracing::info!(
         listener = %name, %bind, %project, %site, component = %component, max_conns,
+        mode = if session_mode { "session" } else { "connection" },
         "serving host-owned inbound-TCP listener (PLAN-handler-tcp-inbound)"
     );
+    // One-time startup warning (cap-req 08 / Security review LOW): a session-mode listener on a build
+    // WITHOUT the `session` feature can't serve — every connection is dropped. Config validation can't
+    // see cargo features, so warn loudly ONCE here at bind instead of only per-connection in `drive`.
+    #[cfg(not(feature = "session"))]
+    if session_mode {
+        tracing::warn!(
+            listener = %name, %bind,
+            "listener is mode = \"session\" but this build lacks the `session` feature; every \
+             connection will be DROPPED — rebuild with `session` or use mode = \"connection\""
+        );
+    }
 
     // Build the TLS acceptor once (cap-req 06); `None` ⇒ a plaintext listener. `TlsAcceptor` is a
     // cheap `Arc` clone per connection.

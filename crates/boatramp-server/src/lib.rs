@@ -1159,6 +1159,13 @@ impl HandlerRuntime {
     /// dead peer (EOF/error) or the absolute `max_conn_duration` cap ends it. Framing stays
     /// protocol-agnostic: each read chunk is delivered as one opaque frame and the guest reassembles
     /// partial protocol units across re-entries via its checkpoint.
+    ///
+    /// Delivery is **at-least-once** w.r.t. guest effects (Security review INFO): a `send` reaches the
+    /// wire and a `checkpoint` updates the in-memory cell DURING a re-entry, but a per-invocation SQL
+    /// txn commits only on a clean re-entry — so a trap AFTER a `send` leaves bytes already on the wire
+    /// with the DB rolled back. A trap ends the connection (no resume), so there is no
+    /// stale-checkpoint-resume hazard, but a `session-handler` must be idempotent w.r.t. its own
+    /// effects, as with any streaming protocol.
     #[cfg(all(feature = "handlers", feature = "tcp-listener", feature = "session"))]
     #[allow(clippy::too_many_arguments)]
     pub async fn dispatch_session_connection<R, W>(
@@ -1189,6 +1196,15 @@ impl HandlerRuntime {
         let Some(inner) = self.inner.as_ref() else {
             return Err("handler runtime disabled (no wasm engine on this node)".into());
         };
+        // Node-global live-session-connection ceiling (Security review LOW backstop): admit this
+        // connection, or refuse if the node is at the cap. The permit is held for the connection's
+        // WHOLE life (parked included) and released when this function returns.
+        let Some(_conn_permit) = inner.engine.acquire_session_conn() else {
+            return Err(format!(
+                "node at the session-connection ceiling; refusing {peer} (per-listener max_conns + a \
+                 node-global backstop bound the aggregate socket/checkpoint footprint)"
+            ));
+        };
         let project_ref = boatramp_core::project::ProjectRef::new(project);
         // Resolve the component ONCE for the connection's life (a stable deployment; a redeploy is
         // picked up by a reconnect). A component that does not export `session-handler` fails the first
@@ -1208,7 +1224,15 @@ impl HandlerRuntime {
             .await
             .map_err(|e| format!("read component blob {hash}: {e}"))?;
         let limits = crate::function_runtime::function_limits(fn_config.limits.as_ref());
-        let session_limits = boatramp_core::session::SessionLimits::default();
+        // Socket-path session limits: a TIGHTER per-connection checkpoint cap than the HTTP-session
+        // default (Security review LOW — the checkpoint is in-memory and held for the connection's life;
+        // a session protocol's resume state is KB, not MB). 256 KiB comfortably fits a mail/IMAP session
+        // while bounding the aggregate (ceiling-capped connections × this) well down from the 4 MiB
+        // default. The frame cap still bounds a single outbound `send`.
+        let session_limits = boatramp_core::session::SessionLimits {
+            max_checkpoint_bytes: 256 * 1024,
+            ..boatramp_core::session::SessionLimits::default()
+        };
         let scope = project_ref.qualified(site);
 
         // Shared per-connection socket state: the boxed write half + in-memory checkpoint + closed flag
