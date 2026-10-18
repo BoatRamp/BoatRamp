@@ -95,6 +95,130 @@ pub(crate) fn controller(
     Arc::new(ServerSessionController::new(store, project, id))
 }
 
+// ---- socket-driven session controller (cap-req 08) ------------------------------------------------
+
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use tokio::io::AsyncWriteExt;
+
+/// The boxed async write half of a listener socket, shared between the connection driver and each
+/// re-entry's [`SocketSessionController`]. The `tokio::sync::Mutex` serializes guest `send`s (which run
+/// one re-entry at a time anyway) and lets the driver hand the same socket to successive re-entries.
+pub(crate) type SharedSocketWrite =
+    Arc<tokio::sync::Mutex<Box<dyn tokio::io::AsyncWrite + Send + Unpin>>>;
+
+/// Per-connection state a [`SocketSessionController`] shares across the connection's re-entries
+/// (cap-req 08): the socket write half, the in-memory resume checkpoint, the closed flag, and the
+/// outbound cursor. The driver owns these and clones the `Arc`s into a fresh controller per re-entry.
+#[derive(Clone)]
+pub(crate) struct SocketSessionState {
+    write: SharedSocketWrite,
+    checkpoint: Arc<std::sync::Mutex<Option<Vec<u8>>>>,
+    closed: Arc<AtomicBool>,
+    cursor: Arc<AtomicU64>,
+}
+
+impl SocketSessionState {
+    pub(crate) fn new(write: SharedSocketWrite) -> Self {
+        Self {
+            write,
+            checkpoint: Arc::new(std::sync::Mutex::new(None)),
+            closed: Arc::new(AtomicBool::new(false)),
+            cursor: Arc::new(AtomicU64::new(0)),
+        }
+    }
+    /// The current resume checkpoint (the `resumed` for the next re-entry's batch).
+    pub(crate) fn checkpoint_snapshot(&self) -> Option<Vec<u8>> {
+        self.checkpoint.lock().ok().and_then(|c| c.clone())
+    }
+    /// Whether the guest has closed the session (end the driver loop).
+    pub(crate) fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
+    /// Best-effort shut the socket write half (the driver's exit path, when the guest did not itself
+    /// `close`). Idempotent with the controller's `close`.
+    pub(crate) async fn shutdown(&self) {
+        self.closed.store(true, Ordering::Release);
+        let mut w = self.write.lock().await;
+        let _ = w.shutdown().await;
+    }
+}
+
+/// A [`SessionController`] for a session driven over a raw listener socket (cap-req 08). Unlike
+/// [`ServerSessionController`] (KV-backed, HTTP transport), the socket itself is the ordered outbound
+/// channel: `send` writes the frame straight to the socket (TCP owns ordering/acking, so no KV outbound
+/// buffer/cursor/SSE producer is involved); `checkpoint` stashes the resume snapshot in an in-memory
+/// per-connection cell (the socket is node-local — it can't migrate nodes or survive a restart, so KV
+/// durability buys nothing and in-memory avoids ANY guest-state-at-rest surface); `close` shuts the
+/// socket and ends the driver loop. Frames stay opaque bytes; the per-frame + per-checkpoint byte caps
+/// are enforced here (defense against a runaway guest).
+pub(crate) struct SocketSessionController {
+    state: SocketSessionState,
+    max_frame_bytes: usize,
+    max_checkpoint_bytes: usize,
+}
+
+impl SocketSessionController {
+    pub(crate) fn new(
+        state: SocketSessionState,
+        max_frame_bytes: usize,
+        max_checkpoint_bytes: usize,
+    ) -> Self {
+        Self {
+            state,
+            max_frame_bytes,
+            max_checkpoint_bytes,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl SessionController for SocketSessionController {
+    async fn send(&self, payload: Vec<u8>) -> Result<u64, boatramp_handlers::SessionError> {
+        use boatramp_handlers::SessionError as E;
+        if self.state.closed.load(Ordering::Acquire) {
+            return Err(E::Closed);
+        }
+        if payload.len() > self.max_frame_bytes {
+            return Err(E::FrameTooLarge);
+        }
+        let mut w = self.state.write.lock().await;
+        w.write_all(&payload)
+            .await
+            .map_err(|e| E::Other(format!("session socket write: {e}")))?;
+        w.flush()
+            .await
+            .map_err(|e| E::Other(format!("session socket flush: {e}")))?;
+        Ok(self.state.cursor.fetch_add(1, Ordering::Relaxed) + 1)
+    }
+
+    async fn checkpoint(&self, snapshot: Vec<u8>) -> Result<(), boatramp_handlers::SessionError> {
+        use boatramp_handlers::SessionError as E;
+        if self.state.closed.load(Ordering::Acquire) {
+            return Err(E::Closed);
+        }
+        if snapshot.len() > self.max_checkpoint_bytes {
+            return Err(E::Other(format!(
+                "session checkpoint exceeds the {}-byte cap",
+                self.max_checkpoint_bytes
+            )));
+        }
+        if let Ok(mut c) = self.state.checkpoint.lock() {
+            *c = Some(snapshot);
+        }
+        Ok(())
+    }
+
+    async fn close(&self, _reason: String) -> Result<(), boatramp_handlers::SessionError> {
+        // Mark closed first so an in-flight/subsequent send fails closed, then best-effort shut the
+        // socket write half (the driver loop also observes `is_closed()` and ends).
+        self.state.closed.store(true, Ordering::Release);
+        let mut w = self.state.write.lock().await;
+        let _ = w.shutdown().await;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -133,6 +257,47 @@ mod tests {
         let s = store();
         let ctl = ServerSessionController::new(s.clone(), "acme", "ghost");
         // No open → NotFound → the guest sees Closed (stop, don't retry).
+        assert!(matches!(
+            ctl.send(b"x".to_vec()).await,
+            Err(boatramp_handlers::SessionError::Closed)
+        ));
+    }
+
+    // cap-req 08: the socket controller routes `send`→socket bytes, `checkpoint`→the in-mem cell, and
+    // `close`→shutdown (after which send fails closed); frame/checkpoint caps are enforced.
+    #[tokio::test]
+    async fn socket_controller_routes_send_checkpoint_close() {
+        use tokio::io::AsyncReadExt;
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        // The controller writes the "server→client" direction; read it from the `client` end.
+        let (mut client_read, _client_write) = tokio::io::split(client);
+        let (_server_read, server_write) = tokio::io::split(server);
+        let state =
+            SocketSessionState::new(Arc::new(tokio::sync::Mutex::new(Box::new(server_write))));
+        let ctl = SocketSessionController::new(state.clone(), 8, 8);
+
+        // send → bytes on the wire + a monotonic cursor.
+        assert_eq!(ctl.send(b"hi".to_vec()).await.unwrap(), 1);
+        assert_eq!(ctl.send(b"yo".to_vec()).await.unwrap(), 2);
+        let mut buf = [0u8; 4];
+        client_read.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"hiyo");
+
+        // frame cap enforced (max_frame_bytes = 8).
+        assert!(matches!(
+            ctl.send(vec![0u8; 9]).await,
+            Err(boatramp_handlers::SessionError::FrameTooLarge)
+        ));
+
+        // checkpoint → the shared in-mem cell (not KV); cap enforced.
+        ctl.checkpoint(b"cp".to_vec()).await.unwrap();
+        assert_eq!(state.checkpoint_snapshot(), Some(b"cp".to_vec()));
+        assert!(ctl.checkpoint(vec![0u8; 9]).await.is_err());
+
+        // close → closed flag set; a subsequent send fails closed.
+        assert!(!state.is_closed());
+        ctl.close("done".into()).await.unwrap();
+        assert!(state.is_closed());
         assert!(matches!(
             ctl.send(b"x".to_vec()).await,
             Err(boatramp_handlers::SessionError::Closed)

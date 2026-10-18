@@ -2346,10 +2346,54 @@ impl HandlerEngine {
         bindings: Bindings,
         limits: Limits,
     ) -> Result<(), HandlerError> {
+        // HTTP-driven re-entry: a POST that can't get an Async-lane slot surfaces as a retryable 503,
+        // so acquire non-blocking and return `Overloaded` on contention.
         let _permit = self
             .lane_semaphore(Lane::Async)
             .try_acquire()
             .map_err(|_| HandlerError::Overloaded)?;
+        self.dispatch_session_inner(hash, wasm, batch, bindings, limits)
+            .await
+    }
+
+    /// Like [`dispatch_session`](Self::dispatch_session) but AWAITS the Async-lane permit instead of
+    /// returning `Overloaded` immediately (cap-req 08, the socket-driven session path). A session
+    /// driven over a raw listener socket cannot be 503'd mid-connection the way an HTTP POST can, so a
+    /// re-entry applies backpressure by waiting for a lane slot. Total waiting is still bounded: the
+    /// connection holds a per-listener `max_conns` slot and is reaped by its `max_conn_duration` cap.
+    #[cfg(all(feature = "session", feature = "tcp-listener"))]
+    pub async fn dispatch_session_socket(
+        &self,
+        hash: &str,
+        wasm: &[u8],
+        batch: SessionBatch,
+        bindings: Bindings,
+        limits: Limits,
+    ) -> Result<(), HandlerError> {
+        let _permit = self
+            .lane_semaphore(Lane::Async)
+            .acquire()
+            .await
+            .map_err(|_| HandlerError::Overloaded)?;
+        self.dispatch_session_inner(hash, wasm, batch, bindings, limits)
+            .await
+    }
+
+    /// The body of a session re-entry, AFTER the lane permit is held (shared by the HTTP
+    /// [`dispatch_session`](Self::dispatch_session) and the socket
+    /// [`dispatch_session_socket`](Self::dispatch_session_socket) paths — they differ only in how the
+    /// permit is acquired). Builds a fresh store, instantiates the `session-handler`, calls `handle`
+    /// once with the batch, finalizes the per-invocation SQL txn, and drops the store (so NO instance
+    /// survives the call — the hibernation property).
+    #[cfg(feature = "session")]
+    async fn dispatch_session_inner(
+        &self,
+        hash: &str,
+        wasm: &[u8],
+        batch: SessionBatch,
+        bindings: Bindings,
+        limits: Limits,
+    ) -> Result<(), HandlerError> {
         let session_pre = self.session_pre(hash, wasm)?;
         let mut store = self.new_store(bindings, self.effective_limits(Lane::Async, limits));
         let instantiated_at = std::time::Instant::now();

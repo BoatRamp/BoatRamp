@@ -1148,6 +1148,147 @@ impl HandlerRuntime {
             .map_err(|e| format!("tcp-connection dispatch: {e}"))
     }
 
+    /// Drive a host-owned inbound-TCP listener connection through the re-entrant SESSION model
+    /// (cap-req 08, `[serve.listeners.<name>] mode = "session"`). The host owns the socket; each
+    /// inbound read becomes one `session-handler` re-entry carrying the host-held resume checkpoint,
+    /// and **NO wasm instance is held between re-entries** — so a mostly-idle connection costs ~a
+    /// socket + a small in-memory checkpoint, not a pinned instance. The guest holds neither
+    /// `wasi:sockets` nor `wasi:io` (only opaque frames), so isolation is strictly stronger than the
+    /// `tcp-connection-host` model. A quiet connection is PARKED (the loop blocks on the socket read),
+    /// never evicted for inactivity — so a protocol-idle-but-alive peer (IMAP IDLE) survives; only a
+    /// dead peer (EOF/error) or the absolute `max_conn_duration` cap ends it. Framing stays
+    /// protocol-agnostic: each read chunk is delivered as one opaque frame and the guest reassembles
+    /// partial protocol units across re-entries via its checkpoint.
+    #[cfg(all(feature = "handlers", feature = "tcp-listener", feature = "session"))]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn dispatch_session_connection<R, W>(
+        &self,
+        deploy: &boatramp_core::deploy::DeployStore,
+        project: &str,
+        site: &str,
+        component: &str,
+        fn_config: &boatramp_core::function::FunctionConfig,
+        peer: String,
+        mut read_half: R,
+        write_half: W,
+        max_conn_duration: std::time::Duration,
+    ) -> Result<(), String>
+    where
+        R: tokio::io::AsyncRead + Send + Unpin + 'static,
+        W: tokio::io::AsyncWrite + Send + Unpin + 'static,
+    {
+        use tokio::io::AsyncReadExt;
+        // Coalesce all currently-available inbound bytes per read into one opaque frame (protocol-
+        // agnostic — the guest reassembles partial protocol units across re-entries via its checkpoint).
+        const SESSION_CONN_READ_BUF: usize = 64 * 1024;
+        let Some(inner) = self.inner.as_ref() else {
+            return Err("handler runtime disabled (no wasm engine on this node)".into());
+        };
+        let project_ref = boatramp_core::project::ProjectRef::new(project);
+        // Resolve the component ONCE for the connection's life (a stable deployment; a redeploy is
+        // picked up by a reconnect). A component that does not export `session-handler` fails the first
+        // re-entry's `session_pre` → the connection is dropped (fail-closed world check).
+        let manifest = deploy
+            .current_manifest(project_ref, site)
+            .await
+            .map_err(|e| format!("resolve manifest {project}/{site}: {e}"))?
+            .ok_or_else(|| format!("no active deployment for {project}/{site}"))?;
+        let entry = manifest.files.get(component).ok_or_else(|| {
+            format!(
+                "session listener component {component:?} not in the {project}/{site} deployment"
+            )
+        })?;
+        let hash = entry.hash.clone();
+        let wasm = crate::handler_dispatch::read_blob_bytes(deploy, &hash)
+            .await
+            .map_err(|e| format!("read component blob {hash}: {e}"))?;
+        let limits = crate::function_runtime::function_limits(fn_config.limits.as_ref());
+        let session_limits = boatramp_core::session::SessionLimits::default();
+        let scope = project_ref.qualified(site);
+
+        // Shared per-connection socket state: the boxed write half + in-memory checkpoint + closed flag
+        // + cursor. A fresh controller per re-entry clones these `Arc`s; the store/instance is dropped
+        // at the end of each `dispatch_session_socket`, so an idle connection holds none.
+        let state = crate::session_driver::SocketSessionState::new(std::sync::Arc::new(
+            tokio::sync::Mutex::new(
+                Box::new(write_half) as Box<dyn tokio::io::AsyncWrite + Send + Unpin>
+            ),
+        ));
+        // A process-unique opaque session id the guest sees (so same-peer reconnects never collide).
+        static CONN_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = format!(
+            "{peer}#{}",
+            CONN_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+
+        let deadline = tokio::time::Instant::now() + max_conn_duration;
+        let mut buf = vec![0u8; SESSION_CONN_READ_BUF];
+        loop {
+            let n = tokio::select! {
+                r = read_half.read(&mut buf) => match r {
+                    Ok(0) => break, // peer closed (FIN/EOF) — a dead/finished peer
+                    Ok(n) => n,
+                    Err(e) => {
+                        tracing::debug!(%peer, error = %e, "session listener read error; closing");
+                        break;
+                    }
+                },
+                _ = tokio::time::sleep_until(deadline) => {
+                    tracing::debug!(%peer, "session listener connection hit max_conn_duration; closing");
+                    break;
+                }
+            };
+            // Operator-pinned Background tenancy (identical to the tcp-connection listener), plus the
+            // socket-backed session controller for this re-entry.
+            let bindings = match crate::function_runtime::build_function_bindings(
+                inner,
+                project_ref,
+                &scope,
+                site,
+                fn_config,
+                0,
+                &crate::function_runtime::FnTenant::Background,
+                None,
+                None,
+                None,
+            )
+            .await
+            {
+                Ok(b) => b.with_session(std::sync::Arc::new(
+                    crate::session_driver::SocketSessionController::new(
+                        state.clone(),
+                        session_limits.max_frame_bytes,
+                        session_limits.max_checkpoint_bytes,
+                    ),
+                )),
+                Err(e) => {
+                    tracing::warn!(%peer, "session listener bindings unavailable; closing: {e:?}");
+                    break;
+                }
+            };
+            let batch = boatramp_handlers::SessionBatch {
+                id: id.clone(),
+                resumed: state.checkpoint_snapshot(),
+                frames: vec![buf[..n].to_vec()],
+            };
+            if let Err(e) = inner
+                .engine
+                .dispatch_session_socket(&hash, &wasm, batch, bindings, limits)
+                .await
+            {
+                tracing::warn!(%peer, error = %e, "session listener re-entry failed; closing");
+                break;
+            }
+            // The guest closed the session this re-entry ⇒ end the connection.
+            if state.is_closed() {
+                break;
+            }
+        }
+        // Best-effort shut the socket on exit (no-op if the guest already closed).
+        state.shutdown().await;
+        Ok(())
+    }
+
     /// Acquire a compile permit (deploy-resilience #2/#1a), held by the caller across a blob read +
     /// [`precompile_component_holding_permit`](Self::precompile_component_holding_permit) so an
     /// upload burst holds at most `compile_concurrency` full blobs resident at once. `None` when

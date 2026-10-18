@@ -62,6 +62,14 @@ pub struct ListenerParams {
     /// protocol-specific data; the host runs a generic trigger→response→wrap engine
     /// ([`crate::tcp_starttls`]).
     pub starttls: Option<crate::tcp_starttls::StarttlsGrammar>,
+    /// `true` ⇒ drive each connection through the re-entrant SESSION model (cap-req 08): the host owns
+    /// the socket and re-enters the guest's `session-handler` per inbound batch, holding NO instance
+    /// between batches (idle ⇒ socket + checkpoint only; `idle_timeout` does NOT evict). `false`
+    /// (default) ⇒ the long-lived `tcp-connection-handler` model (one instance pinned per connection).
+    /// A `bool` (not the node's `ListenerMode`) keeps this module free of a `boatramp-node` dependency;
+    /// the orchestrator maps the config. TLS/STARTTLS composition is identical — it only decides how the
+    /// `(read, write)` halves are produced.
+    pub session_mode: bool,
 }
 
 /// Spawn the accept loop for one listener, detached. Returns immediately; the loop runs until the
@@ -87,6 +95,7 @@ async fn run_listener(runtime: HandlerRuntime, deploy: DeployStore, params: List
         max_conn_duration,
         tls,
         starttls,
+        session_mode,
     } = params;
 
     let listener = match TcpListener::bind(bind).await {
@@ -167,7 +176,7 @@ async fn run_listener(runtime: HandlerRuntime, deploy: DeployStore, params: List
                                 drive(
                                     &runtime, &deploy, &name, project.as_str(), site.as_str(),
                                     component.as_str(), &fn_config, peer, read_half, write_half,
-                                    idle_timeout, max_conn_duration,
+                                    idle_timeout, max_conn_duration, session_mode,
                                 )
                                 .await;
                             }
@@ -187,7 +196,7 @@ async fn run_listener(runtime: HandlerRuntime, deploy: DeployStore, params: List
                             drive(
                                 &runtime, &deploy, &name, project.as_str(), site.as_str(),
                                 component.as_str(), &fn_config, peer, g_read, g_write,
-                                idle_timeout, max_conn_duration,
+                                idle_timeout, max_conn_duration, session_mode,
                             )
                             .await;
                             // Guest returned (completed / idle / max-duration) ⇒ tear the pump + socket
@@ -204,7 +213,7 @@ async fn run_listener(runtime: HandlerRuntime, deploy: DeployStore, params: List
                             drive(
                                 &runtime, &deploy, &name, project.as_str(), site.as_str(),
                                 component.as_str(), &fn_config, peer, read_half, write_half,
-                                idle_timeout, max_conn_duration,
+                                idle_timeout, max_conn_duration, session_mode,
                             )
                             .await;
                         }
@@ -246,10 +255,44 @@ async fn drive<R, W>(
     write_half: W,
     idle_timeout: Duration,
     max_conn_duration: Duration,
+    session_mode: bool,
 ) where
     R: AsyncRead + Send + Unpin + 'static,
     W: AsyncWrite + Send + Unpin + 'static,
 {
+    // Session mode (cap-req 08): drive the connection through the re-entrant session model (host owns
+    // the socket, no instance pinned between inbound batches, `idle_timeout` does not evict). Falls
+    // back to a loud drop if the `session` feature is not compiled into this build.
+    if session_mode {
+        #[cfg(feature = "session")]
+        {
+            if let Err(e) = runtime
+                .dispatch_session_connection(
+                    deploy,
+                    project,
+                    site,
+                    component,
+                    fn_config,
+                    peer.clone(),
+                    read_half,
+                    write_half,
+                    max_conn_duration,
+                )
+                .await
+            {
+                tracing::warn!(listener = %name, %peer, error = %e, "session listener connection dispatch failed");
+            }
+        }
+        #[cfg(not(feature = "session"))]
+        {
+            let _ = (read_half, write_half, idle_timeout, max_conn_duration);
+            tracing::error!(
+                listener = %name, %peer,
+                "listener is session-mode but this build lacks the `session` feature; dropping connection"
+            );
+        }
+        return;
+    }
     if let Err(e) = runtime
         .dispatch_tcp_connection(
             deploy,

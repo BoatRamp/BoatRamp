@@ -46,6 +46,12 @@ use tokio::task::JoinHandle;
 
 const TCP_ECHO: &[u8] = include_bytes!("../../boatramp-handlers/tests/fixtures/tcp-echo.wasm");
 const TCP_SPIN: &[u8] = include_bytes!("../../boatramp-handlers/tests/fixtures/tcp-spin.wasm");
+/// A `session-handler` guest (cap-req 08): on each inbound frame it checkpoints a running count and
+/// sends `echo#<count>:<frame>` — so re-entry #2 resuming `#2` proves the host-held checkpoint
+/// survived the instance drop between frames.
+#[cfg(feature = "session")]
+const SESSION_ECHO: &[u8] =
+    include_bytes!("../../boatramp-handlers/tests/fixtures/session-echo.wasm");
 
 const SITE: &str = "edgesite";
 const COMPONENT: &str = "tcp/handler.wasm";
@@ -701,5 +707,114 @@ async fn tcp_listener_starttls_live_upgrades_and_refuses_injection() {
     println!(
         "TCP-LISTENER-STARTTLS LIVE OK: smtp upgrade, imap tag-capture upgrade, pre-upgrade \
          plaintext, injection refused, pre-trigger idle teardown — all held end to end."
+    );
+}
+
+/// Like [`bind_and_serve`] but SESSION mode (cap-req 08): the host drives the accepted connection
+/// through [`HandlerRuntime::dispatch_session_connection`] (the re-entrant session model) instead of
+/// the long-lived `tcp-connection-handler`. No `idle_timeout` — a session connection is parked, not
+/// evicted, when quiet; only `max_dur` (and dead-peer EOF) ends it.
+#[cfg(feature = "session")]
+async fn bind_and_serve_session(
+    runtime: HandlerRuntime,
+    deploy: DeployStore,
+    max_dur: Duration,
+) -> (JoinHandle<Result<(), String>>, std::net::SocketAddr) {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move {
+        let (stream, peer) = listener.accept().await.unwrap();
+        let _ = stream.set_nodelay(true);
+        let (read_half, write_half) = stream.into_split();
+        runtime
+            .dispatch_session_connection(
+                &deploy,
+                ProjectRef::DEFAULT.as_str(),
+                SITE,
+                COMPONENT,
+                &FunctionConfig::default(),
+                peer.to_string(),
+                read_half,
+                write_half,
+                max_dur,
+            )
+            .await
+    });
+    (handle, addr)
+}
+
+/// cap-req 08 SESSION-OVER-LISTENER load-bearing gate. Drives a REAL `session-handler` guest over a
+/// REAL loopback socket through the re-entrant session path and proves the hibernation property end to
+/// end: (1) two inbound frames on ONE connection drive TWO instantiations — so the wasm instance is
+/// RELEASED between frames, not pinned for the connection's life (the whole point of #08); (2) the
+/// running count RESUMES across that drop (`echo#2`, not `echo#1`) — so the host-held checkpoint
+/// carried the guest's state while no instance existed; (3) a quiet gap between frames does NOT tear
+/// the connection down (parked, not evicted — the IMAP-IDLE property); (4) a peer EOF ends it cleanly.
+#[cfg(feature = "session")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn session_listener_live_reentry_checkpoint_and_instance_release() {
+    async fn read_exact_timed(client: &mut TcpStream, len: usize) -> Vec<u8> {
+        let mut buf = vec![0u8; len];
+        tokio::time::timeout(Duration::from_secs(5), client.read_exact(&mut buf))
+            .await
+            .expect("session echo read timed out")
+            .expect("session echo read failed");
+        buf
+    }
+
+    let (runtime, deploy) = live_runtime(SESSION_ECHO, 40).await;
+    let base_insts = runtime
+        .instance_stats()
+        .expect("engine present")
+        .session
+        .instantiations;
+    // Long absolute cap so the quiet gap below is not what ends the connection.
+    let (handle, addr) =
+        bind_and_serve_session(runtime.clone(), deploy, Duration::from_secs(30)).await;
+    let mut client = TcpStream::connect(addr).await.unwrap();
+    let _ = client.set_nodelay(true);
+
+    // Frame 1: the guest echoes `echo#1:hello` and checkpoints count=1 — all within ONE re-entry,
+    // after which the store (and instance) is dropped.
+    client.write_all(b"hello").await.unwrap();
+    let got1 = read_exact_timed(&mut client, b"echo#1:hello".len()).await;
+    assert_eq!(&got1, b"echo#1:hello", "first re-entry echoes with count=1");
+
+    // Quiet gap: the driver is now parked on the socket read holding NO instance. A quiet gap that
+    // would be irrelevant to a tcp-connection (which pins an instance regardless) proves the session
+    // connection stays alive while idle.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Frame 2: a FRESH re-entry resumes the count from the host-held checkpoint → `echo#2:world`.
+    client.write_all(b"world").await.unwrap();
+    let got2 = read_exact_timed(&mut client, b"echo#2:world".len()).await;
+    assert_eq!(
+        &got2, b"echo#2:world",
+        "count RESUMED across the instance drop — the host-held checkpoint carried the state"
+    );
+
+    // THE hibernation proof: two frames on ONE connection drove (at least) two instantiations — i.e.
+    // the instance was released and re-created per frame, never pinned for the connection's life.
+    let after = runtime
+        .instance_stats()
+        .expect("engine present")
+        .session
+        .instantiations;
+    assert!(
+        after - base_insts >= 2,
+        "two frames must re-instantiate (instance RELEASED between re-entries): {base_insts} → {after}"
+    );
+
+    // Clean close: drop the client → the driver reads EOF → the connection ends cleanly (bounded).
+    drop(client);
+    let (res, _) = await_dispatch(handle, Duration::from_secs(5), "session-listener").await;
+    assert!(
+        res.is_ok(),
+        "session connection ends cleanly on peer EOF: {res:?}"
+    );
+
+    println!(
+        "SESSION-LISTENER LIVE OK: re-entry + checkpoint-resume across the instance drop, two frames \
+         drove two instantiations (no pinned instance), survived an idle gap, clean EOF teardown."
     );
 }

@@ -2283,6 +2283,33 @@ pub struct ListenerConfig {
     /// Absolute cap (milliseconds) on a single connection's lifetime regardless of activity. `0` is
     /// refused; absent ⇒ [`DEFAULT_LISTENER_MAX_CONN_DURATION_MS`].
     pub max_conn_duration_ms: Option<u64>,
+    /// How the accepted connection is driven (cap-req 08). [`ListenerMode::Connection`] (default) is the
+    /// long-lived model: the guest's `tcp-connection-handler` holds the connection — and ONE wasm
+    /// instance — for the connection's whole life. [`ListenerMode::Session`] drives the connection
+    /// through the re-entrant **session** model instead: the host owns the socket, re-enters the guest's
+    /// `session-handler` per inbound batch carrying a host-held checkpoint, and holds NO instance between
+    /// batches — so thousands of mostly-idle connections (IMAP IDLE, long-poll) cost ~a socket each, not
+    /// an instance each, and a protocol-idle-but-alive connection is never torn down for inactivity
+    /// (only a dead peer or `max_conn_duration` reaps it). The component must export `session-handler`,
+    /// not `tcp-connection-handler`. Additive + back-compat: absent ⇒ `Connection` (unchanged).
+    #[serde(default)]
+    pub mode: ListenerMode,
+}
+
+/// How a `[serve.listeners.<name>]` drives each accepted connection (cap-req 08). See
+/// [`ListenerConfig::mode`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ListenerMode {
+    /// Long-lived `tcp-connection-handler` — one wasm instance pinned per connection for its whole life
+    /// (the original inbound-TCP model). The default.
+    #[default]
+    Connection,
+    /// Re-entrant `session-handler` — the host owns the socket and drives it through the session model,
+    /// holding NO instance between inbound batches (idle ⇒ socket + checkpoint only). `idle_timeout_ms`
+    /// does NOT tear a session connection down (a quiet connection is parked, not evicted); the absolute
+    /// `max_conn_duration_ms` cap and dead-peer detection still bound it.
+    Session,
 }
 
 /// Per-listener host-side TLS material (cap-req 06). The host terminates TLS and hands the guest a

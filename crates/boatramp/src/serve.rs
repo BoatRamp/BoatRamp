@@ -2769,6 +2769,9 @@ fn spawn_listeners(
             ),
             tls: tls_config,
             starttls: starttls_grammar,
+            // Session mode (cap-req 08): drive this listener's connections through the re-entrant
+            // session model (no instance pinned between idle inbound batches).
+            session_mode: matches!(l.mode, boatramp_node::config::ListenerMode::Session),
         };
         boatramp_server::tcp_listener_serve::spawn_listener(
             handlers.clone(),
