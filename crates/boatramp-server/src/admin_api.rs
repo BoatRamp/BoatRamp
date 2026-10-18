@@ -199,6 +199,24 @@ pub(super) async fn activate_deployment(
                 tracing::warn!(site, id, reason, "activation refused by handler pre-check");
                 return (StatusCode::UNPROCESSABLE_ENTITY, format!("{reason}\n")).into_response();
             }
+            // Two-tier gateway (0.37.0): a project manifest may only DECLARE gateway reach bounded by
+            // the site's grants + ceilings. This is the authoritative with-site declare point — count
+            // caps, the shared/collision rules, the route→upstream existence check, and the
+            // raw-target egress-host allowlist all fire here with the SiteConfig in hand (atop the
+            // posture-independent IP bright line re-checked on every resolved address at serve). A
+            // deploy with no project gateway has empty `upstreams`/`routes`, so this is a no-op for it.
+            if let Err(err) = boatramp_core::gateway::validate_project_gateway(
+                &manifest.config.gateway,
+                site_config.as_ref().and_then(|c| c.gateway.as_ref()),
+                site_config.as_ref().map(|c| &c.gateway_caps),
+            ) {
+                tracing::warn!(site, id, %err, "activation refused: project gateway over site bounds");
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    format!("gateway: {err}\n"),
+                )
+                    .into_response();
+            }
         }
         // A missing manifest falls through; `activate` returns the NotFound error.
         Ok(None) => {}
