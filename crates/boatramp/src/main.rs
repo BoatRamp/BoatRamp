@@ -428,11 +428,15 @@ fn serve_cli_flags(matches: &clap::ArgMatches) -> std::collections::BTreeMap<Str
 }
 
 async fn async_main() -> Result<(), CliError> {
-    // Structured logs (incl. the `boatramp::access` line) go to stderr; set
-    // `BOATRAMP_LOG_FORMAT=json` for a machine-readable JSON sink.
+    // Structured logs (incl. the `boatramp::access` line) go to STDERR — explicitly, because
+    // `tracing_subscriber::fmt()` otherwise defaults to stdout, which would co-mingle diagnostics with
+    // (and corrupt the JSON of) a command's result on stdout. Set `BOATRAMP_LOG_FORMAT=json` for a
+    // machine-readable JSON sink.
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("boatramp=info"));
-    let builder = tracing_subscriber::fmt().with_env_filter(filter);
+    let builder = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr);
     let json = std::env::var("BOATRAMP_LOG_FORMAT")
         .map(|v| v.eq_ignore_ascii_case("json"))
         .unwrap_or(false);
@@ -584,7 +588,7 @@ async fn async_main() -> Result<(), CliError> {
         Command::Status(args) => output::emit(mode, &manage::status(args, &config).await?)?,
         Command::Domain(args) => output::emit(mode, &domains::run(args, &config).await?)?,
         Command::Alias(args) => output::emit(mode, &alias::run(args, &config).await?)?,
-        Command::Project(args) => output::emit(mode, &project::run(args, &config).await?)?,
+        Command::Project(args) => output::emit(mode, &project::run(args, &config, mode).await?)?,
         Command::Access(args) => output::emit(mode, &access::run(args, &config).await?)?,
         Command::Handlers(args) => output::emit(mode, &handlers::run(args, &config).await?)?,
         Command::Compression(args) => output::emit(mode, &compression::run(args, &config).await?)?,

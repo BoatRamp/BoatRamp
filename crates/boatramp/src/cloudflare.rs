@@ -469,8 +469,9 @@ pub enum CloudflareOutput {
         app_name: String,
         version: String,
         instance_type: String,
-        /// A freshly generated control-plane root key (only when none was
-        /// supplied) — SAVE IT. The human view logs it via `tracing` at deploy time.
+        /// A freshly generated control-plane root key (only when none was supplied) — SAVE IT.
+        /// Surfaced once through this result (the human view prints an export line, JSON carries
+        /// the field), never through the log sink.
         generated_auth_root_private_key: Option<String>,
     },
 }
@@ -514,11 +515,25 @@ impl crate::output::Rendered for CloudflareOutput {
                 }
                 Ok(())
             }
-            Self::Deployed { .. } => {
+            Self::Deployed {
+                generated_auth_root_private_key,
+                ..
+            } => {
                 writeln!(
                     w,
                     "cloudflare: native deploy complete — boatramp running on CF Containers"
-                )
+                )?;
+                if let Some(key) = generated_auth_root_private_key {
+                    // The once-shown root key is delivered on the result channel (stdout), like
+                    // `auth init` — never the log sink. SAVE IT; it is unrecoverable.
+                    writeln!(
+                        w,
+                        "cloudflare: generated a control-plane root key — SAVE IT (mint tokens with \
+                         it, and set it to redeploy with the same root):"
+                    )?;
+                    writeln!(w, "  BOATRAMP_AUTH_ROOT_PRIVATE_KEY={key}")?;
+                }
+                Ok(())
             }
         }
     }
@@ -695,19 +710,14 @@ async fn deploy_native(args: &CloudflareArgs) -> Result<CloudflareOutput> {
     // listener with auth disabled (fail-closed), and the container must bind
     // 0.0.0.0 so the edge DO can reach it — so auth must be on. Prefer an
     // operator-provided key (stable across redeploys); otherwise generate one and
-    // print it once so the operator can mint tokens + redeploy with the same root.
+    // surface it once (through the command's result, never the log sink) so the
+    // operator can mint tokens + redeploy with the same root.
     let (auth_root_key, generated_key) = match args.auth_root_private_key.clone() {
         Some(key) => (key, None),
         None => {
             let signer =
                 boatramp_core::cose::LocalSigner::generate(boatramp_core::cose::TokenAlg::Es256);
             let key = signer.private_hex();
-            tracing::warn!(
-                "cloudflare: generated a control-plane root key — SAVE IT (mint tokens with it, \
-                 and set it to redeploy with the same root):\n  \
-                 BOATRAMP_AUTH_ROOT_PRIVATE_KEY={}",
-                key
-            );
             (key.clone(), Some(key))
         }
     };

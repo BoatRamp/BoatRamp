@@ -75,11 +75,7 @@ enum ProjectCommand {
     /// accepts (`Project·Read`, read-only). Lists each non-conforming name, why it
     /// fails, what it AFFECTS, and a copy-pasteable SUGGESTED FIX. Exits non-zero if any
     /// are found — a CI preflight for the breaking cutover.
-    Doctor {
-        /// Emit the findings as JSON instead of a human table.
-        #[arg(long)]
-        json: bool,
-    },
+    Doctor,
     /// Delete a project. Refused while it owns resources (unless `--force`) or if it
     /// is the reserved `default`.
     ///
@@ -388,8 +384,12 @@ fn owned_names(plan: &serde_json::Value) -> Vec<(String, String)> {
 
 /// `boatramp project doctor`: scan every project (and the names it owns) for
 /// identifiers the v0.7.0 slug allowlist rejects. Read-only. Prints a table (or JSON
-/// under `--json`) and exits non-zero when any non-conforming name is found.
-async fn doctor(cp: &client::ControlPlane, json: bool) -> Result<ProjectOutput> {
+/// under `--output-format json`) and exits non-zero when any non-conforming name is found.
+async fn doctor(
+    cp: &client::ControlPlane,
+    mode: crate::output::OutputMode,
+) -> Result<ProjectOutput> {
+    let json = matches!(mode, crate::output::OutputMode::Json);
     let projects = cp.list_projects().await?;
     let mut findings: Vec<Finding> = Vec::new();
 
@@ -524,7 +524,7 @@ pub enum ProjectOutput {
         report: String,
     },
     /// The output was already written directly by this arm (a delegated subcommand's own
-    /// printing, or `doctor --json`); nothing is left for `emit` to render.
+    /// printing, or `doctor`'s findings report); nothing is left for `emit` to render.
     Passthrough,
 }
 
@@ -602,7 +602,11 @@ impl crate::output::Rendered for ProjectOutput {
 }
 
 /// Entry point for `boatramp project`.
-pub async fn run(args: ProjectArgs, config: &ProjectConfig) -> Result<ProjectOutput> {
+pub async fn run(
+    args: ProjectArgs,
+    config: &ProjectConfig,
+    mode: crate::output::OutputMode,
+) -> Result<ProjectOutput> {
     let (server, http) = client::connect(args.server, config)?;
     // The project-collection endpoints (list/create/get/delete) are not project-scoped, so
     // the resolved project is inert for them; `migrate`, however, targets the active
@@ -638,7 +642,7 @@ pub async fn run(args: ProjectArgs, config: &ProjectConfig) -> Result<ProjectOut
             let project = cp.get_project(&name).await?;
             Ok(ProjectOutput::Show { project })
         }
-        ProjectCommand::Doctor { json } => doctor(&cp, json).await,
+        ProjectCommand::Doctor => doctor(&cp, mode).await,
         ProjectCommand::Rm {
             name,
             force,
