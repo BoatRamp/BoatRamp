@@ -5,12 +5,53 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
-## [0.36.0] - 2026-10-17
+## [0.36.0] - 2026-10-18
 
-Two platform-capability features for first-party apps (mailroom). Both are off by default or
-inert until configured — a node that enables neither behaves exactly as before.
+The whole mailroom capability-request backlog, bundled into one release: host-side support for
+first-party apps (mailroom) to run as boatramp guests. Every feature is off by default or inert
+until configured — a node that enables none behaves exactly as before.
 
 ### Added
+
+- **On-demand per-SNI TLS at scale (`[serve.on_demand_tls]`, default off).** A multi-tenant edge
+  fronting many customer-owned hostnames issues (and caches) a cert on the first TLS handshake for an
+  unknown-but-**verified** SNI, instead of pre-registering one per hostname. The authorization gate is
+  the #02 verified-domain allowlist: an SNI must resolve to a site AND hold an **ownership-verified**
+  record (exact, or a DNS-verified ancestor zone covering the subtree) — mere resolvability never
+  issues, so a flood of unknown names can't become an ACME storm. Default challenge TLS-ALPN-01 (the
+  443 edge, no extra port); `dns-01` via the node's ACME DNS provider. Cluster-aware: the leader
+  issues (sole DNS-01 writer) and followers serve the replicated cert via a cross-node certreq queue;
+  the ACME account persists (envelope-wrapped) across restarts. A dedicated host-owned **listener**
+  (e.g. a mail port) can opt in (`[serve.listeners.<name>.tls] on_demand`) and gets per-SNI issuance
+  the same way — protocol-agnostically (TLS management is unaware of what speaks over the connection)
+  and **scoped to its own project's** verified domains.
+
+- **Per-listener TLS termination for inbound guest listeners.** The host terminates TLS and hands the
+  guest a decrypted plaintext stream (the guest does no crypto): **implicit TLS** (465/993) via
+  `[serve.listeners.<name>.tls]` cert/key, and **declarative STARTTLS** (25/587/143) via a
+  `tls.starttls` grammar. STARTTLS is a generic, protocol-agnostic trigger→response→wrap pump — the
+  only protocol-specific datum is the operator-declared `trigger`/`response` (SMTP/IMAP/POP3 shapes are
+  config, not code) — and is injection-safe against the RFC 3207 §4 / CVE-2011-0411 class (byte-at-a-
+  time pre-TLS, the trigger line never forwarded, post-trigger bytes consumed only by the TLS layer).
+
+- **Session-over-listener mode (`[serve.listeners.<name>] mode = "session"`) — idle-connection
+  suspension.** Drives a listener connection through the re-entrant session model instead of the
+  long-lived `tcp-connection-handler`: the host owns the socket and re-enters the guest's
+  `session-handler` per inbound batch with a host-held checkpoint, holding **no wasm instance between
+  batches**. A mostly-idle connection (IMAP IDLE, long-poll) costs ~a socket + a small in-memory
+  checkpoint, not a pinned instance, and a protocol-idle-but-alive connection is never evicted for
+  inactivity (only `max_conn_duration` + a dead peer end it). The guest holds neither `wasi:sockets`
+  nor `wasi:io` (opaque frames only). Re-entries run on a dedicated concurrency pool (never the shared
+  async lane), each bounded by a per-re-entry wall-clock deadline, under a node-global connection
+  ceiling.
+
+- **Handler SSE / server→client push — documented end to end** (`background-work.md`,
+  `deploy-handler.md`): the host `[stream]` topic→SSE fan-out and the guest-authored streaming-response
+  lane (`#[handler(stream)]`), now with the streaming lane holding its concurrency permit for the
+  stream's life + an idle/max-duration reclaim.
+
+- **Debug GHCR image variants** — additive `-debug` tags (busybox + strace/ltrace/procps/lsof) built
+  in the Release GHCR step, for live diagnostics without a separate toolbox.
 
 - **`boatramp compute bind-blob` — a dev/CI blob-shim affordance.** Mints a blob-shim
   `BOATRAMP_BLOB_URL` + token for a **non-managed local process** (the blob analogue of pointing a
