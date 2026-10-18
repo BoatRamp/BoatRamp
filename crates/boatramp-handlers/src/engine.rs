@@ -1278,6 +1278,15 @@ pub struct HandlerEngine {
     /// Defaults to the sync `limits.max_concurrency` (no separate Phase 1 config knob).
     #[cfg(feature = "tcp-listener")]
     tcp_conn_semaphore: Semaphore,
+    /// DEDICATED concurrency pool for socket-driven SESSION re-entries (cap-req 08). A session-mode
+    /// listener re-entry must NOT share the [`Lane::Async`] semaphore (that lane serves messaging
+    /// consumers, HTTP sessions, crons — untrusted, blocking, long-held socket work there would starve
+    /// them; Security review HIGH-1), nor the connection pool (whose permits are held for a
+    /// connection's whole life). This is its own ceiling, acquired per re-entry (transient: a parked
+    /// idle connection holds none), bounded alongside the per-re-entry wall-clock watchdog in
+    /// `dispatch_session_connection`. Defaults to `limits.max_concurrency`.
+    #[cfg(all(feature = "tcp-listener", feature = "session"))]
+    session_socket_semaphore: Semaphore,
     /// The inbound-TCP connection lane ceiling — the (memory) clamp a listener dispatch is held to.
     /// Defaults to the sync `limits`; the per-invocation epoch deadline + CPU fuel are DISABLED for
     /// this lane in favor of idle + max-connection-duration timeouts (a long-lived `handle` must not
@@ -1540,6 +1549,10 @@ impl HandlerEngine {
             // listener dispatches). PLAN-handler-tcp-inbound.
             #[cfg(feature = "tcp-listener")]
             tcp_conn_semaphore: Semaphore::new(limits.max_concurrency.max(1)),
+            // Dedicated socket-session re-entry pool (cap-req 08 / Security review HIGH-1) — its own
+            // ceiling, independent of the Async lane and the connection pool.
+            #[cfg(all(feature = "tcp-listener", feature = "session"))]
+            session_socket_semaphore: Semaphore::new(limits.max_concurrency.max(1)),
             #[cfg(feature = "tcp-listener")]
             tcp_conn_limits: limits,
             semaphore: Semaphore::new(limits.max_concurrency.max(1)),
@@ -2369,9 +2382,40 @@ impl HandlerEngine {
         batch: SessionBatch,
         bindings: Bindings,
         limits: Limits,
+        listener_declared: bool,
     ) -> Result<(), HandlerError> {
+        // The SAME mutation-verified structural gates the connection lane enforces (Security review
+        // MEDIUM-1 — the session path must carry the same fail-closed backstop, so a future per-listener
+        // egress or a bind-site regression can't silently serve under a disabled posture or grant the
+        // guest socket authority). GATE 1: posture + operator-declared. GATE 2: never raw-socket
+        // authority. GATE 3: the bindings carry no outbound-TCP egress allowlist.
+        if !tcp_listener_dispatch_decision(self.allow_tcp_listener, listener_declared) {
+            return Err(HandlerError::Internal(
+                "session listener dispatch refused (posture `allow_guest_tcp_listener` is off, or the \
+                 listener is not operator-declared)"
+                    .into(),
+            ));
+        }
+        if conn_lane_grants_socket_authority() {
+            return Err(HandlerError::Internal(
+                "session listener lane must never grant the guest raw socket authority (wasi:sockets) \
+                 — refusing to dispatch"
+                    .into(),
+            ));
+        }
+        if !conn_lane_sockets_denied(&bindings) {
+            return Err(HandlerError::Internal(
+                "session listener bindings carry an outbound-TCP egress allowlist — refusing (would \
+                 grant the guest wasi:sockets connect authority)"
+                    .into(),
+            ));
+        }
+        // DEDICATED pool (Security review HIGH-1): a socket-session re-entry must NOT take the shared
+        // Async-lane permit (which serves consumers/HTTP-sessions/crons) — untrusted, blocking,
+        // long-held socket work there would starve them. Acquire the session-socket pool instead; the
+        // blocking wait is bounded by the per-re-entry wall-clock watchdog the driver wraps this in.
         let _permit = self
-            .lane_semaphore(Lane::Async)
+            .session_socket_semaphore
             .acquire()
             .await
             .map_err(|_| HandlerError::Overloaded)?;

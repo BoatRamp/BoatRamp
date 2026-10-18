@@ -61,6 +61,17 @@ const COMPONENT: &str = "tcp/handler.wasm";
 /// route), so the deployment only needs to hold the component file — `dispatch_tcp_connection`
 /// resolves it by (project, site, component path). `seq` keeps the temp blob dir unique per scenario.
 async fn live_runtime(component_wasm: &'static [u8], seq: u32) -> (HandlerRuntime, DeployStore) {
+    live_runtime_with_posture(component_wasm, seq, true).await
+}
+
+/// Like [`live_runtime`] but with the `allow_guest_tcp_listener` posture explicitly set — so a test
+/// can prove the engine-level dispatch gate refuses when the posture is OFF (cap-req 08 MEDIUM-1 /
+/// the shared mutation-verified `tcp_listener_dispatch_decision`).
+async fn live_runtime_with_posture(
+    component_wasm: &'static [u8],
+    seq: u32,
+    allow_tcp_listener: bool,
+) -> (HandlerRuntime, DeployStore) {
     let kv = Arc::new(MemoryKv::new());
     let dir = std::env::temp_dir().join(format!("br-tcp-live-{}-{seq}", std::process::id()));
     let storage = Arc::new(FsStorage::new(dir));
@@ -110,7 +121,7 @@ async fn live_runtime(component_wasm: &'static [u8], seq: u32) -> (HandlerRuntim
     // arm is satisfied by this being a resolved listener dispatch (we only dispatch declared listeners).
     let engine = HandlerEngine::new(Limits::default(), 16)
         .unwrap()
-        .with_tcp_listener(true);
+        .with_tcp_listener(allow_tcp_listener);
     let runtime = HandlerRuntime::new(engine, kv.clone(), storage, None, None);
     (runtime, deploy)
 }
@@ -718,6 +729,7 @@ async fn tcp_listener_starttls_live_upgrades_and_refuses_injection() {
 async fn bind_and_serve_session(
     runtime: HandlerRuntime,
     deploy: DeployStore,
+    reentry_timeout: Duration,
     max_dur: Duration,
 ) -> (JoinHandle<Result<(), String>>, std::net::SocketAddr) {
     let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
@@ -736,6 +748,7 @@ async fn bind_and_serve_session(
                 peer.to_string(),
                 read_half,
                 write_half,
+                reentry_timeout,
                 max_dur,
             )
             .await
@@ -768,9 +781,15 @@ async fn session_listener_live_reentry_checkpoint_and_instance_release() {
         .expect("engine present")
         .session
         .instantiations;
-    // Long absolute cap so the quiet gap below is not what ends the connection.
-    let (handle, addr) =
-        bind_and_serve_session(runtime.clone(), deploy, Duration::from_secs(30)).await;
+    // Generous per-re-entry deadline (the happy-path re-entries finish in ms) + a long absolute cap so
+    // the quiet gap below is not what ends the connection.
+    let (handle, addr) = bind_and_serve_session(
+        runtime.clone(),
+        deploy,
+        Duration::from_secs(5),
+        Duration::from_secs(30),
+    )
+    .await;
     let mut client = TcpStream::connect(addr).await.unwrap();
     let _ = client.set_nodelay(true);
 
@@ -813,8 +832,54 @@ async fn session_listener_live_reentry_checkpoint_and_instance_release() {
         "session connection ends cleanly on peer EOF: {res:?}"
     );
 
+    // ---- MEDIUM-1: the engine-level posture gate refuses on the SESSION path too -----------------
+    // With `allow_guest_tcp_listener` OFF, the re-entry's `tcp_listener_dispatch_decision` guard fails
+    // closed — the guest never runs, so an inbound frame is NOT echoed (belt-and-suspenders behind the
+    // bind-site posture gate, matching the connection path).
+    {
+        let (runtime_off, deploy_off) = live_runtime_with_posture(SESSION_ECHO, 41, false).await;
+        let base_off = runtime_off
+            .instance_stats()
+            .expect("engine present")
+            .session
+            .instantiations;
+        let (handle, addr) = bind_and_serve_session(
+            runtime_off.clone(),
+            deploy_off,
+            Duration::from_secs(5),
+            Duration::from_secs(30),
+        )
+        .await;
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let _ = client.set_nodelay(true);
+        client.write_all(b"hello").await.unwrap();
+        // No echo must arrive (the re-entry is refused). Reading returns EOF/err, never `echo#1:hello`.
+        let mut buf = [0u8; 16];
+        match tokio::time::timeout(Duration::from_secs(1), client.read(&mut buf)).await {
+            Ok(Ok(0)) | Err(_) => {} // EOF or quiet — refused, as required
+            Ok(Ok(n)) => assert_ne!(
+                &buf[..n.min(5)],
+                b"echo#",
+                "posture OFF must refuse the session re-entry — the guest must NOT have run"
+            ),
+            Ok(Err(_)) => {} // reset — also fine
+        }
+        let after_off = runtime_off
+            .instance_stats()
+            .expect("engine present")
+            .session
+            .instantiations;
+        assert_eq!(
+            after_off, base_off,
+            "posture OFF: the session guest was NEVER instantiated (dispatch refused before the store)"
+        );
+        drop(client);
+        let _ = await_dispatch(handle, Duration::from_secs(5), "session-posture-off").await;
+    }
+
     println!(
         "SESSION-LISTENER LIVE OK: re-entry + checkpoint-resume across the instance drop, two frames \
-         drove two instantiations (no pinned instance), survived an idle gap, clean EOF teardown."
+         drove two instantiations (no pinned instance), survived an idle gap, clean EOF teardown, \
+         and posture-OFF refuses the re-entry (guest never instantiated)."
     );
 }

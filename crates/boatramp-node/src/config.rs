@@ -2306,9 +2306,14 @@ pub enum ListenerMode {
     #[default]
     Connection,
     /// Re-entrant `session-handler` — the host owns the socket and drives it through the session model,
-    /// holding NO instance between inbound batches (idle ⇒ socket + checkpoint only). `idle_timeout_ms`
-    /// does NOT tear a session connection down (a quiet connection is parked, not evicted); the absolute
-    /// `max_conn_duration_ms` cap and dead-peer detection still bound it.
+    /// holding NO instance between inbound batches (idle ⇒ socket + checkpoint only). A quiet, PARKED
+    /// connection (blocked on the socket read between batches) is NOT evicted for inactivity — only the
+    /// absolute `max_conn_duration_ms` cap and dead-peer detection (EOF) end it, so a protocol-idle but
+    /// alive peer (IMAP IDLE) survives. In this mode `idle_timeout_ms` is reinterpreted as the
+    /// per-re-entry **processing deadline** — the max wall-clock ONE re-entry may spend (instantiate +
+    /// handle + write its response) — bounding a guest stalled on a slow/zero-window peer so it cannot
+    /// pin a session-pool slot + instance; a re-entry that exceeds it is cancelled and the connection
+    /// closed. Re-entries run on a DEDICATED concurrency pool, never the shared async lane.
     Session,
 }
 

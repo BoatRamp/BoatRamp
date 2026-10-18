@@ -276,6 +276,10 @@ async fn drive<R, W>(
                     peer.clone(),
                     read_half,
                     write_half,
+                    // `idle_timeout` is the PER-RE-ENTRY processing deadline in session mode (bounds a
+                    // single re-entry / a stuck slow-peer write), NOT a between-re-entry idle eviction —
+                    // a parked quiet connection survives, bounded only by `max_conn_duration`.
+                    idle_timeout,
                     max_conn_duration,
                 )
                 .await

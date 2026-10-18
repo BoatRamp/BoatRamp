@@ -1171,6 +1171,11 @@ impl HandlerRuntime {
         peer: String,
         mut read_half: R,
         write_half: W,
+        // Per-re-entry wall-clock bound (Security review HIGH-1): the max time ONE re-entry may spend
+        // processing a chunk + writing its response. Bounds a guest stalled writing to a slow/zero-window
+        // peer so it can't pin a session-pool slot + instance indefinitely. A PARKED (between-re-entry)
+        // connection is NOT bound by this — only by `max_conn_duration` + dead-peer EOF.
+        reentry_timeout: std::time::Duration,
         max_conn_duration: std::time::Duration,
     ) -> Result<(), String>
     where
@@ -1271,13 +1276,30 @@ impl HandlerRuntime {
                 resumed: state.checkpoint_snapshot(),
                 frames: vec![buf[..n].to_vec()],
             };
-            if let Err(e) = inner
+            // Wall-clock watchdog around the WHOLE re-entry (permit acquire + instantiate + handle +
+            // the guest's socket writes) — Security review HIGH-1. If a re-entry exceeds
+            // `reentry_timeout` (a guest stalled on a slow-peer write, say), drop the dispatch future
+            // (which releases the session-pool permit + the store/instance) and end the connection,
+            // rather than pinning a slot/instance for up to `max_conn_duration`. `true` = this is an
+            // operator-declared listener (the accept loop only drives declared listeners).
+            let reentry = inner
                 .engine
-                .dispatch_session_socket(&hash, &wasm, batch, bindings, limits)
-                .await
-            {
-                tracing::warn!(%peer, error = %e, "session listener re-entry failed; closing");
-                break;
+                .dispatch_session_socket(&hash, &wasm, batch, bindings, limits, true);
+            tokio::select! {
+                res = reentry => {
+                    if let Err(e) = res {
+                        tracing::warn!(%peer, error = %e, "session listener re-entry failed; closing");
+                        break;
+                    }
+                }
+                _ = tokio::time::sleep(reentry_timeout) => {
+                    tracing::warn!(
+                        %peer, ?reentry_timeout,
+                        "session listener re-entry exceeded its processing deadline; closing \
+                         (slow peer / stuck guest)"
+                    );
+                    break;
+                }
             }
             // The guest closed the session this re-entry ⇒ end the connection.
             if state.is_closed() {
