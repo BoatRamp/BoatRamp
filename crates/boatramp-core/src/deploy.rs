@@ -2575,6 +2575,46 @@ impl DeployStore {
             .is_some_and(|v| v.verified))
     }
 
+    /// Whether `host` is authorized for on-demand certificate issuance (cap-req 03): it must resolve to
+    /// a site AND be covered by an ownership-**verified** record — fail-closed on any error. "Covered"
+    /// means either (a) an exact verified record for the host (any method proves that one name), or
+    /// (b) a **DNS**-verified ancestor: a DNS-01 proof of a parent domain demonstrates control of its
+    /// DNS zone, which legitimately covers the whole subtree (the CA's own challenge for the specific
+    /// name remains the hard backstop at issuance time). An HTTP-token verification proves only the
+    /// single host it was issued for, so it never authorizes a subdomain. Mere resolvability does NOT
+    /// authorize — a raw `set_site_config` can write the routing index without any verification record,
+    /// which this refuses (Security review Finding A: otherwise a tenant could churn the shared CA
+    /// rate-limit budget with bogus self-attached names).
+    pub async fn is_host_issuance_authorized(&self, host: &str) -> bool {
+        // Not routable here ⇒ not ours ⇒ refuse (fail closed on any resolution error too).
+        let Ok(Some(owner)) = self.resolve_site_by_host(host).await else {
+            return false;
+        };
+        let project = ProjectRef::new(&owner.project);
+        let site = SiteName::new(owner.site.clone());
+        let host = canon_host(host);
+        // (a) exact verified record for this host.
+        if self
+            .is_domain_verified(project, &site, &host)
+            .await
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        // (b) a DNS-verified ancestor (zone control ⇒ subtree coverage). Walk the parent suffixes.
+        let mut rest = host.as_str();
+        while let Some((_, parent)) = rest.split_once('.') {
+            if let Ok(Some(v)) = self.get_domain_verification(project, &site, parent).await
+                && v.verified
+                && v.method == VerificationMethod::Dns
+            {
+                return true;
+            }
+            rest = parent;
+        }
+        false
+    }
+
     /// Mark `(site, host)`'s challenge verified and persist it. Errors if no
     /// challenge has been started.
     pub async fn mark_domain_verified(

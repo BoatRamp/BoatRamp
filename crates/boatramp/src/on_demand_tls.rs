@@ -108,18 +108,9 @@ pub struct DeployGate {
 #[async_trait]
 impl IssuanceGate for DeployGate {
     async fn is_authorized(&self, sni: &str) -> bool {
-        let Ok(Some(owner)) = self.deploy.resolve_site_by_host(sni).await else {
-            return false;
-        };
-        let site = boatramp_core::site::SiteName::new(owner.site);
-        self.deploy
-            .is_domain_verified(
-                boatramp_core::project::ProjectRef::new(&owner.project),
-                &site,
-                sni,
-            )
-            .await
-            .unwrap_or(false)
+        // Delegates to the core authority check: resolvable AND covered by a verified record (exact,
+        // or a DNS-verified ancestor zone), fail-closed. See `DeployStore::is_host_issuance_authorized`.
+        self.deploy.is_host_issuance_authorized(sni).await
     }
 }
 
@@ -1003,6 +994,26 @@ mod tests {
             .await
             .unwrap();
 
+        // (3) A DNS-verified WILDCARD: proves control of the zone ⇒ covers the whole subtree.
+        store
+            .start_domain_verification(
+                proj,
+                &site,
+                "*.wild.example.test",
+                boatramp_core::domain_verify::VerificationMethod::Dns,
+                100,
+            )
+            .await
+            .unwrap();
+        store
+            .mark_domain_verified(proj, &site, "*.wild.example.test")
+            .await
+            .unwrap();
+        store
+            .attach_verified_domain(proj, &site, "*.wild.example.test")
+            .await
+            .unwrap();
+
         let gate = DeployGate {
             deploy: store.clone(),
         };
@@ -1029,7 +1040,24 @@ mod tests {
             !gate.is_authorized("stranger.example.test").await,
             "an unresolvable SNI is refused"
         );
-        println!("ON-DEMAND GATE VERIFIED-ONLY OK: verified authorized, merely-attached refused");
+        // A subdomain under the DNS-verified wildcard is authorized — zone control covers the subtree
+        // (single- AND multi-label; the ACME challenge is the hard backstop for the specific name).
+        assert!(
+            gate.is_authorized("x.wild.example.test").await,
+            "a single-label subdomain under a DNS-verified wildcard is authorized"
+        );
+        assert!(
+            gate.is_authorized("a.b.wild.example.test").await,
+            "a multi-label subdomain under a DNS-verified wildcard is authorized (zone control)"
+        );
+        // But a subdomain of a merely-attached (unverified) name is NOT authorized.
+        assert!(
+            !gate.is_authorized("deep.attached.example.test").await,
+            "a subdomain of an unverified domain is refused"
+        );
+        println!(
+            "ON-DEMAND GATE VERIFIED-ONLY OK: verified + DNS-wildcard-subtree authorized, merely-attached refused"
+        );
     }
 
     // Finding-B scope: a host-owned listener's resolver serves an issued cert ONLY for an SNI owned by
