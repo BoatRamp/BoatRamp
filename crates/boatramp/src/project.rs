@@ -449,11 +449,11 @@ async fn doctor(
         }
     }
 
-    // `doctor` keeps its own output contract: a bespoke `--json` serialization and a
-    // non-zero exit when any finding is present (a CI preflight). Those are incompatible
-    // with the emit-once model (`emit` renders only the `Ok` value, and the findings must
-    // print *and* exit non-zero), so the findings/`--json` paths write directly here and
-    // signal via `Err`; only the clean human path flows through the typed result.
+    // `doctor` keeps its own output contract: a bespoke findings serialization (JSON under the
+    // global `--output-format json`) and a non-zero exit when any finding is present (a CI
+    // preflight). Those are incompatible with the emit-once model (`emit` renders only the `Ok`
+    // value, and the findings must print *and* exit non-zero), so the findings paths write directly
+    // here and signal via `Err`; only the clean human path flows through the typed result.
     if json {
         println!("{}", serde_json::to_string_pretty(&findings)?);
     } else if findings.is_empty() {
@@ -474,7 +474,7 @@ async fn doctor(
     }
 
     if findings.is_empty() {
-        // The `--json` clean path already wrote `[]`; nothing left for `emit` to render.
+        // The JSON clean path already wrote `[]`; nothing left for `emit` to render.
         Ok(ProjectOutput::Passthrough)
     } else {
         // Non-zero exit for CI preflight (mirrors the migration-gate refusal style).
