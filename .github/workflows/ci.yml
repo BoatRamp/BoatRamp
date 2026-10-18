@@ -577,6 +577,39 @@ jobs:
             fi
           done
 
+      # TWO-TIER GATEWAY SECURITY GATE (marker `GATEWAY MUTATION GATE OK`, cap-req 0.37.0). The project
+      # gateway tier may only DECLARE reach it holds; two serve-time security properties bound it: (a)
+      # RESERVED-PATH PRECEDENCE — a `project.cfg` route can never capture a site `reserved_paths` glob
+      # (operator territory), and (b) the EGRESS ALLOWLIST — a project raw-target host must clear BOTH
+      # the site `GatewaySiteCaps.project_egress_hosts` and the global-admin node `gateway_egress_allow`
+      # (each empty ⇒ no narrowing). This drives the pure `resolve_gateway` + `project_raw_egress_allowed`
+      # and asserts the marker + pass count catch a silent skip. MUTATION-VERIFIED: the SAME test re-run
+      # under each `BOATRAMP_GATEWAY_MUTATION` neuters ONE property — `skip_reserved` (a project route
+      # captures a reserved path) / `skip_egress` (a raw host bypasses the allowlist) — and MUST FAIL; a
+      # PASS-under-mutation (a hollow gate) fails the merge. (The project-tier IP bright line has its own
+      # tier-aware unit coverage in the serve crate.)
+      - name: "two-tier gateway security gate (reserved precedence + egress allowlist; mutation-verified)"
+        run: |
+          set -eo pipefail
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-types \
+            --features gateway-gate-mutation gateway::tests::gateway_mutation_gate \
+            -- --nocapture 2>&1 | tee gateway-gate.log
+          grep -qE 'test result: ok\. 1 passed' gateway-gate.log \
+            || { echo "::error::gateway security gate did not run (silent skip or a failure)" >&2; exit 1; }
+          grep -q 'GATEWAY MUTATION GATE OK' gateway-gate.log \
+            || { echo "::error::gateway security gate never reached its marker (a two-tier gateway target-space regression)" >&2; exit 1; }
+          # Mutation guard: each mutation MUST fail the gate (proving each property is load-bearing).
+          for mut in skip_reserved skip_egress; do
+            if BOATRAMP_GATEWAY_MUTATION="$mut" cargo-zigbuild test --target x86_64-unknown-linux-musl \
+              -p boatramp-types --features gateway-gate-mutation gateway::tests::gateway_mutation_gate \
+              -- --nocapture > "gateway-gate-mutation-$mut.log" 2>&1; then
+              echo "::error::gateway security gate is HOLLOW — it passed under mutation '$mut' (a two-tier gateway target-space security property is not actually enforced)" >&2
+              exit 1
+            else
+              echo "gateway gate mutation verified: '$mut' fails the gate as expected."
+            fi
+          done
+
       # PLAN-handler-tcp-inbound TCP-LISTENER DISPATCH GATE (marker `TCP-LISTENER DISPATCH OK`). Host-owned
       # inbound-TCP listeners dispatch to a guest ONLY when BOTH gates hold — the node posture
       # `allow_guest_tcp_listener` (off under multi-tenant) AND an operator-declared `[serve.listeners.<name>]`

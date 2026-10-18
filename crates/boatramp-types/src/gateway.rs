@@ -121,6 +121,25 @@ pub fn gateway_host_allowed(allowlist: &[String], host: &str) -> bool {
     allowlist.is_empty() || allowlist.iter().any(|g| gateway_host_matches(g, host))
 }
 
+/// Mutation seam for the gateway security gates (two-tier gateway / 0.37.0, mirroring the #503 /
+/// on-demand-TLS convention): returns the active `BOATRAMP_GATEWAY_MUTATION` value that NEUTERS one
+/// enforced check, so the CI mutation gate can prove each check is load-bearing (neuter ⇒ the gate
+/// test goes RED). Armed ONLY under `cfg(test)` / the `gateway-gate-mutation` feature — a shipped
+/// build returns `None`, so the seam is inert and can never relax a real gate.
+#[cfg(all(feature = "gateway-gate-mutation", not(test), not(debug_assertions)))]
+compile_error!(
+    "gateway-gate-mutation is a test-only anti-hollow seam and must never be compiled into a release \
+     build — remove it from the feature set"
+);
+#[cfg(any(test, feature = "gateway-gate-mutation"))]
+pub fn gateway_mutation() -> Option<String> {
+    std::env::var("BOATRAMP_GATEWAY_MUTATION").ok()
+}
+#[cfg(not(any(test, feature = "gateway-gate-mutation")))]
+pub fn gateway_mutation() -> Option<String> {
+    None
+}
+
 /// The **authoritative serve-time** egress check for a PROJECT raw-target gateway upstream (two-tier
 /// gateway / 0.37.0): EVERY literal target host must satisfy BOTH the site operator's
 /// `project_egress_hosts` and the global admin's node `gateway_egress_allow` (each empty ⇒ no
@@ -133,6 +152,11 @@ pub fn project_raw_egress_allowed(
     site_allow: &[String],
     node_allow: &[String],
 ) -> bool {
+    // MUTATION SEAM (`skip_egress`): neuter the allowlist ⇒ any host is permitted ⇒ the CI gate's
+    // "out-of-allowlist host refused" assertion goes RED, proving this check is load-bearing.
+    if gateway_mutation().as_deref() == Some("skip_egress") {
+        return true;
+    }
     upstream_literal_hosts(up)
         .iter()
         .all(|h| gateway_host_allowed(site_allow, h) && gateway_host_allowed(node_allow, h))
@@ -222,8 +246,11 @@ pub fn resolve_gateway<'a>(
     };
 
     // 2. A reserved path is never served by a project route (operator territory) — structural, so a
-    //    bypassed declare-time check still cannot let a tenant capture it.
-    if let Some(site) = site
+    //    bypassed declare-time check still cannot let a tenant capture it. MUTATION SEAM
+    //    (`skip_reserved`): neuter this guard ⇒ a project route captures a reserved path ⇒ the CI
+    //    gate's "reserved path not captured" assertion goes RED.
+    if gateway_mutation().as_deref() != Some("skip_reserved")
+        && let Some(site) = site
         && site.reserved_paths.iter().any(|r| {
             Pattern::compile(r)
                 .map(|p| p.is_match(path))
@@ -1282,5 +1309,39 @@ mod tests {
             &["*.vendor.com".to_string()],
             &[]
         ));
+    }
+
+    // Anti-hollow mutation gate (0.37.0): asserts the two serve-time security properties hold. The CI
+    // re-runs this under `BOATRAMP_GATEWAY_MUTATION=skip_reserved` and `=skip_egress`; each neuters one
+    // enforced check and MUST make this test FAIL (proving the check is load-bearing, tested==enforced).
+    #[test]
+    fn gateway_mutation_gate() {
+        // (1) reserved-path precedence: a project route under a site reserved glob must NOT capture it.
+        let mut site = GatewayConfig::default();
+        site.reserved_paths.push("/.well-known/**".into());
+        let mut project = GatewayConfig::default();
+        project
+            .upstreams
+            .insert("u".into(), upstream("https://api.good.example", None));
+        project.routes.push(GatewayRoute {
+            matches: "/.well-known/**".into(),
+            upstream: "u".into(),
+        });
+        assert!(
+            matches!(
+                resolve_gateway(Some(&project), Some(&site), "/.well-known/acme-challenge/x"),
+                GatewayResolution::NoMatch
+            ),
+            "a project route must NOT capture a site reserved path (skip_reserved mutation flips this)"
+        );
+
+        // (2) egress allowlist: a project raw host outside the site∩node allowlist must be refused.
+        let evil = upstream("https://evil.example.net", None);
+        assert!(
+            !project_raw_egress_allowed(&evil, &["*.good.example".to_string()], &[]),
+            "an out-of-allowlist project raw host must be refused (skip_egress mutation flips this)"
+        );
+
+        println!("GATEWAY MUTATION GATE OK: reserved-path precedence + egress allowlist both hold");
     }
 }

@@ -41,6 +41,12 @@ extmethod-gate-mutation = []
 # gate). A `compile_error!` guard fails any non-test release build that enables it. Compiled OUT of
 # every real build.
 record-verify-gate-mutation = []
+# TEST-ONLY, NEVER SHIPPED: the anti-hollow seam for the two-tier gateway security gates (0.37.0). When
+# ON AND `BOATRAMP_GATEWAY_MUTATION` is set, `gateway_mutation` neuters exactly one enforced property so
+# the gate goes RED: `skip_reserved` (a project route captures a site reserved path) or `skip_egress`
+# (a project raw target bypasses the site∩node egress allowlist). A `compile_error!` guard fails any
+# non-test release build that enables it. Compiled OUT of every real build.
+gateway-gate-mutation = []
 
 [dependencies]
 serde.workspace = true
