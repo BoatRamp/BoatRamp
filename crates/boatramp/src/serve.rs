@@ -3750,15 +3750,8 @@ async fn serve_cluster_acme_dns(
     // host-owned inbound-TCP listeners sharing it — a listener that opts in issues per-SNI through
     // this same engine (one budget, one certreq single-flight). `on_demand.clone()` is `None` when
     // on-demand TLS is disabled, so listeners then serve only their own static cert, exactly as the
-    // non-AcmeDns path would. Done before `options`/`handlers`/`deploy` are consumed by the serve.
-    #[cfg(feature = "tcp-listener")]
-    spawn_listeners(
-        listeners,
-        &options.posture,
-        &handlers,
-        &deploy,
-        on_demand.clone(),
-    );
+    // non-AcmeDns path would. (Spawned below, after the edge-cert readiness guard, so a node that bails
+    // with `NoCertsYet` never briefly binds listeners.)
     let base = CertRequest {
         directory_url: args.acme_directory.clone(),
         contact_email: args.acme_contact.clone(),
@@ -3777,6 +3770,20 @@ async fn serve_cluster_acme_dns(
     if entries.is_empty() {
         return Err(Error::NoCertsYet);
     }
+    // Deferred listener spawn (cap-req 03 #4): the on-demand resolver exists and the edge cert is
+    // ready, so bind the host-owned inbound-TCP listeners sharing that resolver — a listener that opts
+    // in issues per-SNI through this same engine (one budget, one certreq single-flight). `on_demand`
+    // is `None` when on-demand TLS is disabled, so listeners then serve only their own static cert,
+    // exactly as the non-AcmeDns path would. Done before `options`/`handlers`/`deploy` are consumed by
+    // the serve below.
+    #[cfg(feature = "tcp-listener")]
+    spawn_listeners(
+        listeners,
+        &options.posture,
+        &handlers,
+        &deploy,
+        on_demand.clone(),
+    );
     // HTTP/3: when enabled, stand up a QUIC endpoint sharing the same
     // ACME certs (build_server_configs gives a `h3`-ALPN config off one resolver);
     // its cert is hot-swapped on renewal below, exactly as the TCP path reloads.
