@@ -1025,4 +1025,191 @@ mod tests {
             "the bogus marker is cleaned up"
         );
     }
+
+    /// End-to-end on-demand issuance against a local [Pebble](https://github.com/letsencrypt/pebble)
+    /// CA via **DNS-01** (challtestsrv), driving the REAL `OnDemandIssuer` → `AcmeIssuer` →
+    /// `obtain_certificate_with` path: an authorized SNI gets a Pebble-signed cert into the store +
+    /// cache; an unauthorized SNI issues nothing. `#[ignore]`d — needs `pebble` + `pebble-challtestsrv`
+    /// on `PATH` (nix dev shell) + binds local ports. Run:
+    /// `cargo test -p boatramp --features acme-dns,cluster on_demand_issuance_against_pebble -- --ignored --nocapture`
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs pebble + pebble-challtestsrv on PATH (nix dev shell); binds local ports"]
+    async fn on_demand_issuance_against_pebble() {
+        use boatramp_acme::dns::{DnsError, DnsProvider, DnsRecord};
+        use std::time::Duration;
+
+        const CHALLTESTSRV_MGMT: &str = "http://127.0.0.1:8055";
+        const DIRECTORY_URL: &str = "https://localhost:14000/dir";
+
+        /// A `DnsProvider` backed by challtestsrv's management API (set/clear the `_acme-challenge` TXT).
+        struct ChallTestSrv {
+            client: reqwest::Client,
+        }
+        #[async_trait]
+        impl DnsProvider for ChallTestSrv {
+            async fn upsert(&self, record: &DnsRecord) -> Result<(), DnsError> {
+                self.client
+                    .post(format!("{CHALLTESTSRV_MGMT}/set-txt"))
+                    .json(&serde_json::json!({ "host": format!("{}.", record.name), "value": record.value }))
+                    .send()
+                    .await
+                    .and_then(reqwest::Response::error_for_status)
+                    .map_err(|e| DnsError::Backend(e.to_string()))?;
+                Ok(())
+            }
+            async fn delete(&self, record: &DnsRecord) -> Result<(), DnsError> {
+                self.client
+                    .post(format!("{CHALLTESTSRV_MGMT}/clear-txt"))
+                    .json(&serde_json::json!({ "host": format!("{}.", record.name) }))
+                    .send()
+                    .await
+                    .and_then(reqwest::Response::error_for_status)
+                    .map_err(|e| DnsError::Backend(e.to_string()))?;
+                Ok(())
+            }
+        }
+        /// A child process killed on drop (so a failed test leaks no pebble processes).
+        struct Child(tokio::process::Child);
+        impl Drop for Child {
+            fn drop(&mut self) {
+                let _ = self.0.start_kill();
+            }
+        }
+        fn on_path(bin: &str) -> bool {
+            std::process::Command::new(bin)
+                .arg("-help")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok()
+        }
+        fn mint_certs(dir: &std::path::Path) -> std::path::PathBuf {
+            use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+            let ca_key = KeyPair::generate().unwrap();
+            let mut ca_params = CertificateParams::new(Vec::new()).unwrap();
+            ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+            let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+            let leaf_key = KeyPair::generate().unwrap();
+            let leaf_params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+            let leaf_cert = leaf_params.signed_by(&leaf_key, &ca_cert, &ca_key).unwrap();
+            let ca_path = dir.join("ca.pem");
+            std::fs::write(&ca_path, ca_cert.pem()).unwrap();
+            std::fs::write(dir.join("cert.pem"), leaf_cert.pem()).unwrap();
+            std::fs::write(dir.join("key.pem"), leaf_key.serialize_pem()).unwrap();
+            ca_path
+        }
+
+        if !on_path("pebble") || !on_path("pebble-challtestsrv") {
+            eprintln!(
+                "skipping: pebble / pebble-challtestsrv not on PATH (run inside `nix develop`)"
+            );
+            return;
+        }
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let dir = std::env::temp_dir().join(format!("br-ondemand-pebble-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ca_path = mint_certs(&dir);
+        let config = serde_json::json!({ "pebble": {
+            "listenAddress": "0.0.0.0:14000", "managementListenAddress": "0.0.0.0:15000",
+            "certificate": dir.join("cert.pem"), "privateKey": dir.join("key.pem"),
+            "httpPort": 5002, "tlsPort": 5001, "ocspResponderURL": "" } });
+        let config_path = dir.join("pebble.json");
+        std::fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+        let _challtestsrv = Child(
+            tokio::process::Command::new("pebble-challtestsrv")
+                .args(["-dns01", ":8053", "-management", ":8055"])
+                .args(["-http01", "", "-https01", "", "-tlsalpn01", ""])
+                .kill_on_drop(true)
+                .spawn()
+                .expect("spawn pebble-challtestsrv"),
+        );
+        let _pebble = Child(
+            tokio::process::Command::new("pebble")
+                .args(["-config", config_path.to_str().unwrap()])
+                .args(["-dnsserver", "127.0.0.1:8053"])
+                .env("PEBBLE_VA_NOSLEEP", "1")
+                .kill_on_drop(true)
+                .spawn()
+                .expect("spawn pebble"),
+        );
+        let probe = reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .build()
+            .unwrap();
+        let mut ready = false;
+        for _ in 0..50 {
+            if probe
+                .get(DIRECTORY_URL)
+                .send()
+                .await
+                .map(|r| r.status().is_success())
+                .unwrap_or(false)
+            {
+                ready = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+        assert!(ready, "Pebble directory did not become ready");
+        // Trust the throwaway CA for instant-acme (honors SSL_CERT_FILE). Single-threaded here, before
+        // any concurrent env reads — the same documented exception as the boatramp-acme pebble test.
+        unsafe { std::env::set_var("SSL_CERT_FILE", &ca_path) };
+
+        // A real on-demand engine: DNS-01 via challtestsrv, an in-memory store, one authorized SNI.
+        let cache = Arc::new(CertCache::default());
+        let now_unix: Arc<dyn Fn() -> u64 + Send + Sync> = Arc::new(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0)
+        });
+        let issuer: Arc<dyn CertIssuer> = Arc::new(AcmeIssuer::new(
+            AcmeChallenge::Dns01(Arc::new(ChallTestSrv {
+                client: reqwest::Client::new(),
+            })),
+            DIRECTORY_URL.to_string(),
+            Some("ops@example.test".to_string()),
+            Arc::clone(&cache),
+            Arc::clone(&now_unix),
+            Arc::new(boatramp_core::kv::MemoryKv::new()),
+            None,
+        ));
+        let cert_store = mem_store();
+        let eng = Arc::new(OnDemandIssuer {
+            gate: Arc::new(StubGate {
+                allowed: ["www.deploy.test".to_string()].into_iter().collect(),
+                lookups: Arc::new(AtomicUsize::new(0)),
+            }),
+            issuer,
+            cert_store: Arc::clone(&cert_store),
+            is_leader: Arc::new(|| true),
+            now_unix,
+            cache: Arc::clone(&cache),
+            cfg: OnDemandConfig::default(),
+            inflight: Mutex::new(HashSet::new()),
+            negative: Mutex::new(HashMap::new()),
+            sem: Arc::new(Semaphore::new(4)),
+            limiter: RateLimiter::new(0),
+            certreq_kv: Arc::new(boatramp_core::kv::MemoryKv::new()),
+        });
+
+        // Authorized SNI ⇒ a real Pebble-signed cert lands in the store + the resolver cache.
+        eng.issue_one("www.deploy.test").await;
+        assert!(
+            matches!(cert_store.get("www.deploy.test").await, Ok(Some(_))),
+            "an authorized SNI issues + stores a real cert"
+        );
+        assert!(
+            cache.get_issued("www.deploy.test").is_some(),
+            "the issued cert is cached for the resolver"
+        );
+        // Unauthorized SNI ⇒ nothing issued (the #02 gate, end to end).
+        eng.issue_one("evil.deploy.test").await;
+        assert!(
+            matches!(cert_store.get("evil.deploy.test").await, Ok(None)),
+            "an unauthorized SNI issues nothing, even against a live CA"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        println!("ON-DEMAND PEBBLE E2E OK: authorized SNI issued via DNS-01, unauthorized refused");
+    }
 }
