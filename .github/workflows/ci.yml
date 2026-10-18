@@ -692,6 +692,25 @@ jobs:
             echo "on-demand abuse gate mutation verified: skip_allowlist fails the gate as expected."
           fi
 
+      # cap-req 03 #4 LISTENER ON-DEMAND TLS COMPOSITE GATE (marker `LISTENER ON-DEMAND TLS COMPOSITE OK`).
+      # A dedicated host-owned listener can share the ONE on-demand engine the public edge uses (never a
+      # second engine): its composite SNI resolver must (1) serve the listener's own static cert for its
+      # configured `server_names`, (2) serve a #02-VERIFIED SNI already issued+cached by the shared engine,
+      # (3) REFUSE an unknown/unverified SNI (no cert ⇒ failed handshake — no mint-for-any-name), and (4)
+      # serve the listener's own cert for an SNI-less handshake. This drives all four through a real
+      # in-memory rustls handshake (no sockets, no HTTP, no mail grammar — the composite is protocol-
+      # agnostic and advertises no ALPN). The marker + pass count catch a silent skip/rename.
+      - name: "listener on-demand TLS composite gate (own/cached served, unknown refused, no-SNI default)"
+        run: |
+          set -eo pipefail
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp \
+            --features acme-dns,cluster acme_dns::tests::listener_composite \
+            -- --nocapture 2>&1 | tee listener-composite.log
+          grep -qE 'test result: ok\. 1 passed' listener-composite.log \
+            || { echo "::error::listener on-demand composite gate did not run (silent skip or a failure)" >&2; exit 1; }
+          grep -q 'LISTENER ON-DEMAND TLS COMPOSITE OK' listener-composite.log \
+            || { echo "::error::listener on-demand composite gate never reached its marker (a per-SNI listener cert-dispatch regression)" >&2; exit 1; }
+
       # PLAN-compute-bindings COMPUTE BLOB-SHIM SCOPED GATE (marker `COMPUTE BLOB-SHIM SCOPED OK`). The
       # compute blob-shim gives an opaque workload the SAME per-site `hblob/{qualified-site}/{container}/
       # {key}` blob namespace — over the SAME `Storage` backend — a `wasi:blobstore` handler sees, scoped

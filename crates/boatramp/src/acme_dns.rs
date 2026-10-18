@@ -357,12 +357,22 @@ impl ResolvesServerCert for SniCertResolver {
 struct CompositeResolver {
     static_resolver: Arc<SniCertResolver>,
     on_demand: Arc<crate::on_demand_tls::OnDemandResolver>,
+    /// Cert served when the client sends **no** SNI. `None` at the public edge (an SNI-less handshake
+    /// there has no domain to serve and is refused — unchanged). `Some` for a dedicated listener that
+    /// carries its own static cert: it preserves the pre-composite `with_single_cert` behavior for a
+    /// client that negotiates TLS without SNI, while a client that *does* send a verified SNI still
+    /// gets per-domain on-demand issuance. This is transport-level only — nothing here knows or cares
+    /// what protocol runs over the connection.
+    default_cert: Option<Arc<CertifiedKey>>,
 }
 
 #[cfg(all(feature = "acme-dns", feature = "cluster"))]
 impl ResolvesServerCert for CompositeResolver {
     fn resolve(&self, hello: ClientHello) -> Option<Arc<CertifiedKey>> {
-        let sni = hello.server_name()?;
+        let Some(sni) = hello.server_name() else {
+            // No SNI: serve the listener's own cert if it has one (else refuse, as the edge does).
+            return self.default_cert.clone();
+        };
         let is_acme_alpn = crate::on_demand_tls::is_acme_tls_alpn(&hello);
         // A static (pre-known wildcard) cert wins; else on-demand per-SNI (serve/issue/trigger).
         self.static_resolver
@@ -456,8 +466,44 @@ pub fn build_server_config_composite(
     let resolver: Arc<dyn ResolvesServerCert> = Arc::new(CompositeResolver {
         static_resolver: sni_resolver(entries)?,
         on_demand,
+        default_cert: None,
     });
     Ok(server_config_from(resolver))
+}
+
+/// Build a rustls [`ServerConfig`](rustls::ServerConfig) for a **dedicated listener** (cap-req 03 #4):
+/// its own static cert (served for `server_names` by SNI, and with no SNI) composed with the shared
+/// on-demand per-SNI issuer, so a verified custom domain terminating here gets a cert the same way the
+/// public edge does.
+///
+/// Deliberately **protocol-agnostic**: it advertises **no ALPN** and routes nothing through
+/// [`server_config_from`] (which would stamp `h2`/`http-1.1`). TLS management must not assume what
+/// speaks over the connection — the listener's byte pump owns the protocol, the resolver owns only the
+/// handshake. `default_cert` preserves the pre-composite `with_single_cert` behavior for an SNI-less
+/// client; `on_demand` is the *same* `Arc` the edge uses, so there is a single rate-limit / issuance
+/// budget and a single cluster certreq single-flight (never a second engine — see the design note).
+#[cfg(all(feature = "acme-dns", feature = "cluster"))]
+pub fn build_listener_server_config_composite(
+    cert_pem: &str,
+    key_pem: &str,
+    server_names: Option<&[String]>,
+    on_demand: Arc<crate::on_demand_tls::OnDemandResolver>,
+) -> Result<rustls::ServerConfig> {
+    let own = Arc::new(certified_key_from_pem(cert_pem, key_pem)?);
+    let entries = server_names
+        .unwrap_or(&[])
+        .iter()
+        .map(|name| (name.clone(), own.clone()))
+        .collect();
+    let resolver: Arc<dyn ResolvesServerCert> = Arc::new(CompositeResolver {
+        static_resolver: Arc::new(SniCertResolver { entries }),
+        on_demand,
+        default_cert: Some(own),
+    });
+    // No ALPN: protocol-agnostic. Build the config directly rather than via `server_config_from`.
+    Ok(rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_cert_resolver(resolver))
 }
 
 /// Like [`build_server_configs`] (TCP + h3) but composed with the on-demand resolver (cap-req 03).
@@ -469,6 +515,7 @@ pub fn build_server_configs_composite(
     let resolver: Arc<dyn ResolvesServerCert> = Arc::new(CompositeResolver {
         static_resolver: sni_resolver(entries)?,
         on_demand,
+        default_cert: None,
     });
     let tcp = server_config_from(resolver.clone());
     let mut h3 = rustls::ServerConfig::builder()
@@ -602,5 +649,193 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(dir_mode, 0o700, "per-domain cache dir must be owner-only");
+    }
+
+    // ---- listener on-demand TLS composite (cap-req 03 #4) -------------------------------------
+    // An in-memory rustls handshake (no sockets, no HTTP, no mail grammar — protocol-agnostic) that
+    // exercises `build_listener_server_config_composite`'s SNI dispatch end to end: the listener's own
+    // static cert serves its `server_names` and an SNI-less handshake; a verified SNI already in the
+    // on-demand cache serves that cert; an unknown SNI is refused (no cert ⇒ failed handshake).
+    #[cfg(feature = "cluster")]
+    mod listener_composite {
+        use super::*;
+        use rustls::client::danger::{
+            HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
+        };
+        use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+        use rustls::{ClientConnection, DigitallySignedStruct, ServerConnection, SignatureScheme};
+
+        fn self_signed(name: &str) -> (String, String) {
+            let kp = rcgen::KeyPair::generate().unwrap();
+            let params = rcgen::CertificateParams::new(vec![name.to_string()]).unwrap();
+            let cert = params.self_signed(&kp).unwrap();
+            (cert.pem(), kp.serialize_pem())
+        }
+
+        /// The leaf cert DER of a PEM chain (what a server presents as `peer_certificates()[0]`).
+        fn leaf_der(cert_pem: &str) -> Vec<u8> {
+            rustls_pemfile::certs(&mut cert_pem.as_bytes())
+                .next()
+                .unwrap()
+                .unwrap()
+                .to_vec()
+        }
+
+        /// A client verifier that accepts any server cert — the test asserts WHICH cert the handshake
+        /// yielded (or that it failed), not trust-chain validity.
+        #[derive(Debug)]
+        struct AcceptAny;
+        impl ServerCertVerifier for AcceptAny {
+            fn verify_server_cert(
+                &self,
+                _end_entity: &CertificateDer<'_>,
+                _intermediates: &[CertificateDer<'_>],
+                _server_name: &ServerName<'_>,
+                _ocsp_response: &[u8],
+                _now: UnixTime,
+            ) -> std::result::Result<ServerCertVerified, rustls::Error> {
+                Ok(ServerCertVerified::assertion())
+            }
+            fn verify_tls12_signature(
+                &self,
+                _message: &[u8],
+                _cert: &CertificateDer<'_>,
+                _dss: &DigitallySignedStruct,
+            ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+                Ok(HandshakeSignatureValid::assertion())
+            }
+            fn verify_tls13_signature(
+                &self,
+                _message: &[u8],
+                _cert: &CertificateDer<'_>,
+                _dss: &DigitallySignedStruct,
+            ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+                Ok(HandshakeSignatureValid::assertion())
+            }
+            fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+                rustls::crypto::aws_lc_rs::default_provider()
+                    .signature_verification_algorithms
+                    .supported_schemes()
+            }
+        }
+
+        /// Pump handshake bytes between two in-memory connections until both finish, or `Err` if the
+        /// server (e.g.) resolves no cert for the SNI and aborts.
+        fn drive(
+            client: &mut ClientConnection,
+            server: &mut ServerConnection,
+        ) -> std::result::Result<(), rustls::Error> {
+            for _ in 0..32 {
+                let mut c2s = Vec::new();
+                while client.wants_write() {
+                    client.write_tls(&mut c2s).unwrap();
+                }
+                if !c2s.is_empty() {
+                    let mut rd: &[u8] = &c2s;
+                    while !rd.is_empty() {
+                        server.read_tls(&mut rd).unwrap();
+                    }
+                    server.process_new_packets()?;
+                }
+                let mut s2c = Vec::new();
+                while server.wants_write() {
+                    server.write_tls(&mut s2c).unwrap();
+                }
+                if !s2c.is_empty() {
+                    let mut rd: &[u8] = &s2c;
+                    while !rd.is_empty() {
+                        client.read_tls(&mut rd).unwrap();
+                    }
+                    client.process_new_packets()?;
+                }
+                if !client.is_handshaking() && !server.is_handshaking() {
+                    return Ok(());
+                }
+            }
+            Err(rustls::Error::General("handshake did not complete".into()))
+        }
+
+        /// The leaf cert a client handshaking with `name` is served, or `None` if the handshake fails.
+        fn served_cert(
+            config: &std::sync::Arc<rustls::ServerConfig>,
+            name: ServerName<'static>,
+        ) -> Option<Vec<u8>> {
+            let client_config = rustls::ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(std::sync::Arc::new(AcceptAny))
+                .with_no_client_auth();
+            let mut client =
+                ClientConnection::new(std::sync::Arc::new(client_config), name).unwrap();
+            let mut server = ServerConnection::new(config.clone()).unwrap();
+            drive(&mut client, &mut server).ok()?;
+            client
+                .peer_certificates()
+                .and_then(|c| c.first())
+                .map(|c| c.as_ref().to_vec())
+        }
+
+        #[test]
+        fn composite_serves_own_cached_and_refuses_unknown() {
+            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+            // The listener's own static cert, for one configured server name.
+            let (own_cert, own_key) = self_signed("own.example.test");
+            // A verified custom domain already issued + cached by the on-demand engine.
+            let (cached_cert, cached_key) = self_signed("cached.example.test");
+            let cache = std::sync::Arc::new(crate::on_demand_tls::CertCache::default());
+            cache.insert_issued(
+                "cached.example.test",
+                std::sync::Arc::new(certified_key_from_pem(&cached_cert, &cached_key).unwrap()),
+            );
+            // A from-cache resolver: a miss simply fails the handshake (no engine, no issuance).
+            let on_demand =
+                std::sync::Arc::new(crate::on_demand_tls::OnDemandResolver::from_cache(cache));
+
+            let server_names = vec!["own.example.test".to_string()];
+            let config = std::sync::Arc::new(
+                build_listener_server_config_composite(
+                    &own_cert,
+                    &own_key,
+                    Some(&server_names),
+                    on_demand,
+                )
+                .unwrap(),
+            );
+            // Protocol-agnostic: the composite advertises no ALPN.
+            assert!(
+                config.alpn_protocols.is_empty(),
+                "listener composite must advertise no ALPN (protocol-agnostic)"
+            );
+
+            let own = ServerName::try_from("own.example.test").unwrap();
+            let cached = ServerName::try_from("cached.example.test").unwrap();
+            let unknown = ServerName::try_from("unseeded.example.test").unwrap();
+            // An IP server name makes rustls send NO SNI → exercises the no-SNI default_cert branch.
+            let no_sni = ServerName::try_from("127.0.0.1").unwrap();
+
+            assert_eq!(
+                served_cert(&config, own).as_deref(),
+                Some(leaf_der(&own_cert).as_slice()),
+                "own configured server_name is served the listener's static cert"
+            );
+            assert_eq!(
+                served_cert(&config, cached).as_deref(),
+                Some(leaf_der(&cached_cert).as_slice()),
+                "a verified SNI in the on-demand cache is served that cert"
+            );
+            assert_eq!(
+                served_cert(&config, unknown),
+                None,
+                "an unknown (unverified, uncached) SNI is refused — no cert, failed handshake"
+            );
+            assert_eq!(
+                served_cert(&config, no_sni).as_deref(),
+                Some(leaf_der(&own_cert).as_slice()),
+                "an SNI-less handshake is served the listener's own default cert"
+            );
+            println!(
+                "LISTENER ON-DEMAND TLS COMPOSITE OK: own+cached served, unknown refused, no-SNI default"
+            );
+        }
     }
 }

@@ -557,6 +557,14 @@ impl ServerConfig {
                         );
                     }
                 }
+                // On-demand per-SNI issuance for this listener (cap-req 03 #4) shares the node's one
+                // on-demand engine — it is meaningless (and silently a no-op) unless that engine runs.
+                if tls.on_demand && !serve.on_demand_tls.as_ref().is_some_and(|o| o.enabled) {
+                    return err(
+                        "listener `tls.on_demand` requires `[serve.on_demand_tls] enabled = true`",
+                        " — enable node on-demand TLS, or set on_demand = false to serve only the static cert",
+                    );
+                }
             }
             if !l.egress_allowlist.is_empty() {
                 return err(
@@ -2293,6 +2301,20 @@ pub struct ListenerTlsConfig {
     /// trigger, then an in-band upgrade). Still requires `cert_file` + `key_file`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub starttls: Option<ListenerStarttlsConfig>,
+    /// Opt this listener into **on-demand per-SNI issuance** (cap-req 03 #4): a client that negotiates
+    /// TLS with a verified custom-domain SNI terminating here gets a cert issued the same way the public
+    /// edge does, sharing the one `[serve.on_demand_tls]` engine (one issuance budget, one cluster
+    /// certreq single-flight). Requires `[serve.on_demand_tls]` enabled at the node. The listener's own
+    /// `cert_file` still serves `server_names` (and an SNI-less handshake). Default `false` ⇒ the static
+    /// cert alone (unchanged). This is transport-level only — it carries no notion of what protocol runs
+    /// over the listener.
+    #[serde(default)]
+    pub on_demand: bool,
+    /// SNI names the listener's own static `cert_file` serves directly (an SNI match here wins before
+    /// on-demand). Absent/empty ⇒ the static cert serves only SNI-less handshakes (via the no-SNI
+    /// fallback); every presented SNI then goes to on-demand. Only meaningful with `on_demand = true`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_names: Option<Vec<String>>,
 }
 
 /// Declarative STARTTLS grammar (cap-req 06, Stage B) — protocol-agnostic **data**. The host runs a
@@ -4193,6 +4215,22 @@ mod tests {
             matches!(err, ConfigError::InvalidListener { .. }),
             "{err:?}"
         );
+        // (j) a listener `tls.on_demand = true` WITHOUT node on-demand TLS enabled is refused (cap-req
+        //     03 #4): the per-SNI engine it would share does not exist, so it would silently no-op.
+        let err = ServerConfig::parse(
+            r#"( serve: ( listeners: { "l": ( bind: "0.0.0.0:465", component: "c.wasm", project: "p", site: "s", tls: ( cert_file: "x.pem", key_file: "y.pem", on_demand: true ) ) } ) )"#,
+        )
+        .expect_err("listener on_demand without [serve.on_demand_tls] enabled must be refused");
+        assert!(
+            matches!(err, ConfigError::InvalidListener { .. }),
+            "{err:?}"
+        );
+        // (k) the same listener WITH node on-demand TLS enabled (+ its own cert/key + server_names)
+        //     parses — it shares the one engine.
+        ServerConfig::parse(
+            r#"( serve: ( on_demand_tls: ( enabled: true ), listeners: { "l": ( bind: "0.0.0.0:465", component: "c.wasm", project: "p", site: "s", tls: ( cert_file: "x.pem", key_file: "y.pem", on_demand: true, server_names: ["mail.example.test"] ) ) } ) )"#,
+        )
+        .expect("a listener on_demand with node on-demand TLS enabled is valid");
     }
 
     #[test]

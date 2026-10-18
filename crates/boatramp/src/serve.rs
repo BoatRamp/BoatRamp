@@ -1279,7 +1279,9 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
     // `[serve.listeners.<name>]`, gated on the posture. Single-node. Borrows `posture` before the TLS
     // redirect below consumes it.
     #[cfg(feature = "tcp-listener")]
-    spawn_listeners(&serve_cfg.listeners, &posture, &handlers, &deploy);
+    // Single-node serve has no on-demand engine (it is cluster-gated — see `on_demand_tls`), so
+    // listeners here serve only their own static cert.
+    spawn_listeners(&serve_cfg.listeners, &posture, &handlers, &deploy, None);
     // In a TLS mode, optionally bind a second plain-HTTP listener that redirects
     // to HTTPS. Ignored for `--tls off`.
     #[cfg(feature = "tls")]
@@ -2605,6 +2607,20 @@ fn spawn_s3_ingress(
 /// operator-pinned tenancy) is carried in a `FunctionConfig` with an EMPTY `egress_allowlist` (the
 /// Phase-1 invariant: a `tcp-connection-host` guest holds no `wasi:sockets`). Shared by the
 /// single-node and cluster spawn blocks (mirrors `spawn_s3_ingress`).
+/// The on-demand resolver argument to [`spawn_listeners`] (cap-req 03 #4). It is the shared node
+/// on-demand engine's resolver, so a listener that opts in issues per-SNI certs through the *same*
+/// engine the public edge uses (one issuance budget, one cluster certreq single-flight — never a
+/// second engine). It exists only where the engine can (`all(acme-dns, cluster)`); every other build
+/// degrades it to an uninhabited `Option` that is always `None`, so the on-demand branch compiles out
+/// and every call site simply passes `None`.
+#[cfg(all(feature = "tcp-listener", feature = "acme-dns", feature = "cluster"))]
+type ListenerOnDemand = Option<std::sync::Arc<crate::on_demand_tls::OnDemandResolver>>;
+#[cfg(all(
+    feature = "tcp-listener",
+    not(all(feature = "acme-dns", feature = "cluster"))
+))]
+type ListenerOnDemand = Option<std::convert::Infallible>;
+
 #[cfg(feature = "tcp-listener")]
 fn spawn_listeners(
     // Borrow only the `listeners` map (not the whole `ServeConfig`, whose other fields are moved out
@@ -2613,7 +2629,14 @@ fn spawn_listeners(
     posture: &boatramp_core::security::SecurityPosture,
     handlers: &boatramp_server::HandlerRuntime,
     deploy: &DeployStore,
+    // The shared on-demand engine's resolver (cap-req 03 #4), or `None` to serve only static certs.
+    // Only ever `Some` in an `all(acme-dns, cluster)` build (see [`ListenerOnDemand`]).
+    on_demand: ListenerOnDemand,
 ) {
+    // In a build without the on-demand engine the arg is an always-`None` uninhabited `Option`; keep
+    // it "used" so `-D warnings` stays green (the on-demand branch below is compiled out there).
+    #[cfg(not(all(feature = "acme-dns", feature = "cluster")))]
+    let _ = &on_demand;
     if listeners.is_empty() {
         return;
     }
@@ -2648,8 +2671,28 @@ fn spawn_listeners(
                     .as_ref()
                     .ok_or_else(|| Error::NoPrivateKey("<listener tls: key_file unset>".into()))?;
                 install_crypto_provider();
+                // On-demand per-SNI issuance for this listener (cap-req 03 #4): when it opts in AND
+                // the node on-demand engine runs, serve through the composite resolver (own static cert
+                // for its `server_names` + SNI-less handshakes; the shared engine issues for a verified
+                // custom-domain SNI). Protocol-agnostic: the composite advertises no ALPN and knows
+                // nothing of what speaks over the connection.
+                #[cfg(all(feature = "acme-dns", feature = "cluster"))]
+                if t.on_demand
+                    && let Some(od) = on_demand.clone()
+                {
+                    let cert_pem = std::fs::read_to_string(cert)?;
+                    let key_pem = std::fs::read_to_string(key)?;
+                    let cfg = crate::acme_dns::build_listener_server_config_composite(
+                        &cert_pem,
+                        &key_pem,
+                        t.server_names.as_deref(),
+                        od,
+                    )?;
+                    return Ok(std::sync::Arc::new(cfg));
+                }
                 let (certs, private_key) = load_cert_chain_and_key(cert, key)?;
-                // One listener = one cert; no ALPN (mail implicit-TLS has none), no client auth.
+                // Transport-level: one listener = one fixed cert, served regardless of SNI; no ALPN,
+                // no client auth. Protocol-agnostic — nothing here depends on what runs over the TLS.
                 let cfg = rustls::ServerConfig::builder()
                     .with_no_client_auth()
                     .with_single_cert(certs, private_key)?;
@@ -3515,13 +3558,27 @@ async fn run_cluster(
     // Host-owned inbound-TCP listeners (PLAN-handler-tcp-inbound): bind + accept each declared
     // `[serve.listeners.<name>]`, gated on the posture. Cluster path. Borrows `options.posture` before
     // the TLS redirect below consumes it.
+    //
+    // DEFERRAL (cap-req 03 #4): when this node serves cluster-managed ACME certs (`TlsMode::AcmeDns`)
+    // in an `acme-dns` build, the spawn is deferred into `serve_cluster_acme_dns`, which builds the one
+    // on-demand engine (DNS provider + cert store in hand) and spawns the listeners with its shared
+    // resolver — so a listener that opts into on-demand issues through the *same* engine as the edge.
+    // Every other mode (and every `not(acme-dns)` build, where the `AcmeDns` arm calls `serve_acme_dns`
+    // which does NOT spawn listeners) spawns here with no on-demand resolver.
+    #[cfg(all(feature = "tcp-listener", feature = "acme-dns"))]
+    let defer_listeners = matches!(args.tls, TlsMode::AcmeDns);
+    #[cfg(all(feature = "tcp-listener", not(feature = "acme-dns")))]
+    let defer_listeners = false;
     #[cfg(feature = "tcp-listener")]
-    spawn_listeners(
-        &cluster_serve_cfg.listeners,
-        &options.posture,
-        &handlers,
-        &deploy,
-    );
+    if !defer_listeners {
+        spawn_listeners(
+            &cluster_serve_cfg.listeners,
+            &options.posture,
+            &handlers,
+            &deploy,
+            None,
+        );
+    }
     #[cfg(feature = "tls")]
     if !matches!(args.tls, TlsMode::Off) {
         let redirect = config.serve.as_ref().and_then(|s| s.http_redirect_addr);
@@ -3595,6 +3652,9 @@ async fn run_cluster(
                 on_demand_cfg,
                 node.kv.clone(),
                 cert_envelope,
+                // Deferred listener spawn (cap-req 03 #4): these bind inside, with the on-demand engine.
+                #[cfg(feature = "tcp-listener")]
+                &cluster_serve_cfg.listeners,
             )
             .await
         }
@@ -3650,6 +3710,12 @@ async fn serve_cluster_acme_dns(
     on_demand_cfg: Option<boatramp_node::config::OnDemandTlsConfig>,
     account_kv: Arc<dyn boatramp_core::kv::KvStore>,
     account_envelope: Option<Arc<dyn boatramp_core::envelope::KeyEnvelope>>,
+    // Host-owned inbound-TCP listeners whose spawn was deferred here (cap-req 03 #4) so they can share
+    // the on-demand engine built below. Spawned once the resolver exists.
+    #[cfg(feature = "tcp-listener")] listeners: &std::collections::BTreeMap<
+        String,
+        boatramp_node::config::ListenerConfig,
+    >,
 ) -> Result<()> {
     use boatramp_acme::acme::CertRequest;
     use std::time::Duration;
@@ -3680,6 +3746,19 @@ async fn serve_cluster_acme_dns(
     let on_demand = on_demand_engine
         .as_ref()
         .map(crate::on_demand_tls::OnDemandTls::resolver);
+    // Deferred listener spawn (cap-req 03 #4): now that the on-demand resolver exists, bind the
+    // host-owned inbound-TCP listeners sharing it — a listener that opts in issues per-SNI through
+    // this same engine (one budget, one certreq single-flight). `on_demand.clone()` is `None` when
+    // on-demand TLS is disabled, so listeners then serve only their own static cert, exactly as the
+    // non-AcmeDns path would. Done before `options`/`handlers`/`deploy` are consumed by the serve.
+    #[cfg(feature = "tcp-listener")]
+    spawn_listeners(
+        listeners,
+        &options.posture,
+        &handlers,
+        &deploy,
+        on_demand.clone(),
+    );
     let base = CertRequest {
         directory_url: args.acme_directory.clone(),
         contact_email: args.acme_contact.clone(),

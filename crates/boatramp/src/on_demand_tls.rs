@@ -520,6 +520,15 @@ impl OnDemandResolver {
         let _ = self.trigger.try_send(sni.to_string());
         None
     }
+
+    /// Build a resolver over a pre-seeded [`CertCache`] with a dead trigger channel. Test-only seam
+    /// (no engine, no issuance) for exercising the composite's handshake dispatch: a miss simply fails
+    /// the handshake instead of triggering issuance.
+    #[cfg(test)]
+    pub(crate) fn from_cache(cache: Arc<CertCache>) -> Self {
+        let (tx, _rx) = mpsc::channel(1);
+        Self { cache, trigger: tx }
+    }
 }
 
 /// Whether a `ClientHello` carries the `acme-tls/1` ALPN (a TLS-ALPN-01 validation handshake).
