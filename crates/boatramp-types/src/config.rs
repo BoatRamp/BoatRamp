@@ -73,7 +73,10 @@ pub struct DeployConfig {
     /// host, or a `shared` site upstream (by name) — a raw private/internal address is refused at the
     /// project tier (the project tier never authorizes new private reach; that is the operator's to
     /// grant). Rides the `project.cfg` routing bundle; validated by [`Self::compile_check`].
-    #[serde(default, skip_serializing_if = "crate::gateway::GatewayConfig::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "crate::gateway::GatewayConfig::is_empty"
+    )]
     pub gateway: crate::gateway::GatewayConfig,
 }
 
@@ -163,7 +166,7 @@ impl DeployConfig {
         // `validate`; a route referencing a `shared` site upstream is resolved against the live
         // SiteConfig at serve, and a project upstream's own-compute/public targets are the common
         // case this catches. (The serve-time address gate is the security authority.)
-        crate::gateway::validate_project_gateway(&self.gateway, None)?;
+        crate::gateway::validate_project_gateway(&self.gateway, None, None)?;
         Ok(())
     }
 
@@ -1094,6 +1097,15 @@ pub struct SiteConfig {
     /// reaching a private address (the SSRF guard stays public-only otherwise).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gateway: Option<crate::gateway::GatewayConfig>,
+    /// The site operator's ceilings on what the PROJECT gateway tier (`project.cfg`) may declare under
+    /// this site (two-tier gateway, cap-req 0.37.0): max project upstreams, max per-upstream backend
+    /// fan-out, and a project raw-target egress-host allowlist. Default (all unset) ⇒ no site ceiling
+    /// (the public-only IP bright line + the node-absolute posture allowlist still apply).
+    #[serde(
+        default,
+        skip_serializing_if = "crate::gateway::GatewaySiteCaps::is_empty"
+    )]
+    pub gateway_caps: crate::gateway::GatewaySiteCaps,
 }
 
 impl Default for SiteConfig {
@@ -1106,6 +1118,7 @@ impl Default for SiteConfig {
             handlers: None,
             compression: CompressionConfig::default(),
             gateway: None,
+            gateway_caps: crate::gateway::GatewaySiteCaps::default(),
         }
     }
 }

@@ -58,6 +58,69 @@ impl GatewayConfig {
     }
 }
 
+/// The **site operator's** ceilings on what the PROJECT gateway tier (`project.cfg`) may declare under
+/// this site (two-tier gateway / cap-req 0.37.0). The site operator sets these on `SiteConfig`
+/// (`Site·Write`); they bound the app author beneath the site, intersected with the global admin's
+/// node-absolute [`SecurityPosture::gateway_egress_allow`](crate::security::SecurityPosture). A tier may
+/// only NARROW within the tier above it. All-unset (the default) ⇒ no site-level ceiling (the IP bright
+/// line + any node allowlist still apply).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct GatewaySiteCaps {
+    /// Max number of project-declared gateway upstreams. `None` ⇒ unbounded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_project_upstreams: Option<usize>,
+    /// Max backends (pooled `targets` fan-out) a single project upstream may declare. `None` ⇒
+    /// unbounded. Bounds a project fanning one upstream across many backends.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_backends: Option<usize>,
+    /// Host globs a project **raw-target** upstream may reach (a project own-compute workload and a
+    /// shared-site grant are exempt — their reach is already vouched for). Empty ⇒ no site-level host
+    /// narrowing (only the public-only IP bright line applies). Matched case-insensitively; `*` matches
+    /// one DNS label, `**` any suffix. The global-admin posture allowlist narrows this further.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub project_egress_hosts: Vec<String>,
+}
+
+impl GatewaySiteCaps {
+    /// No ceiling set — the default (skip-serialized so an unused caps block never lands in config).
+    pub fn is_empty(&self) -> bool {
+        self.max_project_upstreams.is_none()
+            && self.max_backends.is_none()
+            && self.project_egress_hosts.is_empty()
+    }
+}
+
+/// Whether `host` matches a gateway egress-host glob (case-insensitive): an exact host, a `*.suffix`
+/// single-label wildcard, or `**.suffix` / a bare `**` any-suffix wildcard. Used by BOTH the
+/// site-operator `project_egress_hosts` and the node-absolute posture allowlist — a project raw target
+/// is permitted only if its host matches at least one glob in a non-empty allowlist.
+pub fn gateway_host_matches(glob: &str, host: &str) -> bool {
+    let glob = glob.trim().to_ascii_lowercase();
+    let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    if glob == "**" {
+        return !host.is_empty();
+    }
+    if let Some(suffix) = glob.strip_prefix("**.") {
+        // Any-depth suffix: `**.example.com` matches `example.com` and `a.b.example.com`.
+        return host == suffix || host.ends_with(&format!(".{suffix}"));
+    }
+    if let Some(suffix) = glob.strip_prefix("*.") {
+        // Single-label: `*.example.com` matches `api.example.com`, not `a.b.example.com` or the apex.
+        return match host.strip_suffix(&format!(".{suffix}")) {
+            Some(label) => !label.is_empty() && !label.contains('.'),
+            None => false,
+        };
+    }
+    glob == host
+}
+
+/// Whether `host` is permitted by an egress-host allowlist: an empty allowlist means "no narrowing"
+/// (permitted), else `host` must match at least one glob.
+pub fn gateway_host_allowed(allowlist: &[String], host: &str) -> bool {
+    allowlist.is_empty() || allowlist.iter().any(|g| gateway_host_matches(g, host))
+}
+
 /// Which tier owns a resolved gateway match — and therefore which target-space rule binds it at
 /// serve time (the project tier may only reach its own compute + public hosts; the operator tier
 /// authorizes private reach).
@@ -215,7 +278,33 @@ pub fn validate_site_gateway(site: &GatewayConfig) -> Result<(), crate::ConfigEr
 pub fn validate_project_gateway(
     project: &GatewayConfig,
     site: Option<&GatewayConfig>,
+    caps: Option<&GatewaySiteCaps>,
 ) -> Result<(), crate::ConfigError> {
+    // Site-operator ceilings (two-tier gateway / 0.37.0): count caps + the raw-target egress-host
+    // allowlist. Only enforceable with the SiteConfig in hand (the apply/serve path); standalone deploy
+    // validation (`caps = None`) defers to the apply + the authoritative serve-time check.
+    if let Some(caps) = caps {
+        if let Some(max) = caps.max_project_upstreams
+            && project.upstreams.len() > max
+        {
+            return Err(crate::ConfigError::parse(format!(
+                "project gateway declares {} upstreams, over the site ceiling of {max} \
+                 (GatewaySiteCaps.max_project_upstreams)",
+                project.upstreams.len()
+            )));
+        }
+        if let Some(max) = caps.max_backends {
+            for (name, up) in &project.upstreams {
+                let backends = upstream_backend_count(up);
+                if backends > max {
+                    return Err(crate::ConfigError::parse(format!(
+                        "project gateway upstream `{name}` declares {backends} backends, over the \
+                         site ceiling of {max} (GatewaySiteCaps.max_backends)"
+                    )));
+                }
+            }
+        }
+    }
     for (name, up) in &project.upstreams {
         if up.shared {
             return Err(crate::ConfigError::parse(format!(
@@ -235,6 +324,9 @@ pub fn validate_project_gateway(
         // otherwise a literal private/internal host is refused. A DNS name passes here and is bounded
         // by the project-tier address gate at serve.
         if up.compute.is_none() {
+            let egress = caps
+                .map(|c| c.project_egress_hosts.as_slice())
+                .unwrap_or(&[]);
             for host in upstream_literal_hosts(up) {
                 if host_is_literal_private(&host) {
                     return Err(crate::ConfigError::parse(format!(
@@ -242,6 +334,16 @@ pub fn validate_project_gateway(
                          `{host}` — the project tier may only reach its own compute, a public host, \
                          or a shared site upstream; declare the private backend as a site upstream \
                          and mark it `shared`"
+                    )));
+                }
+                // Site egress-host allowlist (0.37.0): when the site operator sets one, a project
+                // raw-target host must match it. A DNS name is screened here against the glob list;
+                // the resolved IP + the node-absolute posture allowlist are the authoritative serve-
+                // time check. Empty allowlist ⇒ no narrowing.
+                if !gateway_host_allowed(egress, &host) {
+                    return Err(crate::ConfigError::parse(format!(
+                        "project gateway upstream `{name}` targets host `{host}`, which the site's \
+                         GatewaySiteCaps.project_egress_hosts allowlist does not permit"
                     )));
                 }
             }
@@ -266,6 +368,19 @@ pub fn validate_project_gateway(
         }
     }
     Ok(())
+}
+
+/// How many backends an upstream declares (for the site `max_backends` fan-out cap): the pooled
+/// `targets`, else 1 for a single `target`, else 0 (a compute-by-name upstream resolves its pool
+/// dynamically from the workload's replicas — it declares none, so it is never capped here).
+fn upstream_backend_count(up: &Upstream) -> usize {
+    if !up.targets.is_empty() {
+        up.targets.len()
+    } else if !up.target.trim().is_empty() {
+        1
+    } else {
+        0
+    }
 }
 
 /// The literal target hosts of an upstream (its `target`, pooled `targets`, and `discover.host`), for
@@ -950,14 +1065,14 @@ mod tests {
             matches: "/**".into(),
             upstream: "w".into(),
         });
-        assert!(validate_project_gateway(&p, None).is_ok());
+        assert!(validate_project_gateway(&p, None, None).is_ok());
 
         // public host: allowed.
         let mut public = GatewayConfig::default();
         public
             .upstreams
             .insert("ext".into(), upstream("https://api.example.com", None));
-        assert!(validate_project_gateway(&public, None).is_ok());
+        assert!(validate_project_gateway(&public, None, None).is_ok());
 
         // raw private / loopback / link-local-metadata: REFUSED (the bright line).
         for bad in [
@@ -969,7 +1084,7 @@ mod tests {
             let mut g = GatewayConfig::default();
             g.upstreams.insert("bad".into(), upstream(bad, None));
             assert!(
-                validate_project_gateway(&g, None).is_err(),
+                validate_project_gateway(&g, None, None).is_err(),
                 "a project upstream to {bad} must be refused"
             );
         }
@@ -984,7 +1099,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert!(validate_project_gateway(&sh, None).is_err());
+        assert!(validate_project_gateway(&sh, None, None).is_err());
 
         // With a SiteConfig: a route to a shared site upstream is OK; to an absent name is refused.
         let mut site = GatewayConfig::default();
@@ -1001,12 +1116,114 @@ mod tests {
             matches: "/g/**".into(),
             upstream: "grant".into(),
         });
-        assert!(validate_project_gateway(&ref_ok, Some(&site)).is_ok());
+        assert!(validate_project_gateway(&ref_ok, Some(&site), None).is_ok());
         let mut ref_bad = GatewayConfig::default();
         ref_bad.routes.push(GatewayRoute {
             matches: "/g/**".into(),
             upstream: "absent".into(),
         });
-        assert!(validate_project_gateway(&ref_bad, Some(&site)).is_err());
+        assert!(validate_project_gateway(&ref_bad, Some(&site), None).is_err());
+    }
+
+    #[test]
+    fn validate_project_gateway_enforces_site_caps() {
+        // max_project_upstreams: 2 upstreams over a cap of 1 → refused; a cap of 2 → ok.
+        let mut p = GatewayConfig::default();
+        p.upstreams
+            .insert("a".into(), upstream("https://a.example.com", None));
+        p.upstreams
+            .insert("b".into(), upstream("https://b.example.com", None));
+        let count1 = GatewaySiteCaps {
+            max_project_upstreams: Some(1),
+            ..Default::default()
+        };
+        assert!(validate_project_gateway(&p, None, Some(&count1)).is_err());
+        let count2 = GatewaySiteCaps {
+            max_project_upstreams: Some(2),
+            ..Default::default()
+        };
+        assert!(validate_project_gateway(&p, None, Some(&count2)).is_ok());
+
+        // max_backends: a pooled upstream with 3 targets over a cap of 2 → refused; 3 → ok.
+        let mut pool = GatewayConfig::default();
+        pool.upstreams.insert(
+            "pool".into(),
+            Upstream {
+                targets: vec![
+                    "https://1.example.com".into(),
+                    "https://2.example.com".into(),
+                    "https://3.example.com".into(),
+                ],
+                ..Default::default()
+            },
+        );
+        let be2 = GatewaySiteCaps {
+            max_backends: Some(2),
+            ..Default::default()
+        };
+        assert!(validate_project_gateway(&pool, None, Some(&be2)).is_err());
+        let be3 = GatewaySiteCaps {
+            max_backends: Some(3),
+            ..Default::default()
+        };
+        assert!(validate_project_gateway(&pool, None, Some(&be3)).is_ok());
+
+        // project_egress_hosts: a raw host outside the allowlist → refused; inside → ok; own-compute
+        // exempt.
+        let allow = GatewaySiteCaps {
+            project_egress_hosts: vec!["*.good.example".into()],
+            ..Default::default()
+        };
+        let mut evil = GatewayConfig::default();
+        evil.upstreams
+            .insert("x".into(), upstream("https://evil.example.net", None));
+        assert!(
+            validate_project_gateway(&evil, None, Some(&allow)).is_err(),
+            "a host outside the site egress allowlist is refused"
+        );
+        let mut good = GatewayConfig::default();
+        good.upstreams
+            .insert("x".into(), upstream("https://api.good.example", None));
+        assert!(
+            validate_project_gateway(&good, None, Some(&allow)).is_ok(),
+            "a host matching the site allowlist glob is allowed"
+        );
+        let mut comp = GatewayConfig::default();
+        comp.upstreams.insert(
+            "w".into(),
+            Upstream {
+                compute: Some("w".into()),
+                ..Default::default()
+            },
+        );
+        assert!(
+            validate_project_gateway(&comp, None, Some(&allow)).is_ok(),
+            "own-compute is exempt from the egress-host allowlist"
+        );
+
+        // No caps ⇒ unbounded (back-compat).
+        assert!(validate_project_gateway(&p, None, None).is_ok());
+    }
+
+    #[test]
+    fn gateway_host_glob_matching() {
+        assert!(gateway_host_matches("api.example.com", "API.Example.COM")); // exact, case-insensitive
+        assert!(gateway_host_matches("*.example.com", "api.example.com")); // single label
+        assert!(!gateway_host_matches("*.example.com", "a.b.example.com")); // not two labels
+        assert!(!gateway_host_matches("*.example.com", "example.com")); // not the apex
+        assert!(gateway_host_matches("**.example.com", "a.b.example.com")); // any depth
+        assert!(gateway_host_matches("**.example.com", "example.com")); // incl. the apex
+        assert!(gateway_host_matches("**", "anything.at.all"));
+        assert!(!gateway_host_matches("good.com", "evil.com"));
+        // empty allowlist ⇒ permitted (no narrowing); non-empty ⇒ must match.
+        assert!(gateway_host_allowed(&[], "anything"));
+        assert!(gateway_host_allowed(
+            &["*.ok.com".to_string()],
+            "api.ok.com"
+        ));
+        assert!(!gateway_host_allowed(
+            &["*.ok.com".to_string()],
+            "api.evil.com"
+        ));
     }
 }
