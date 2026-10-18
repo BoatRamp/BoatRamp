@@ -502,6 +502,7 @@ async fn gateway_proxies_to_declared_upstream() {
                     ..Default::default()
                 },
                 gateway: Some(GatewayConfig {
+                    reserved_paths: Vec::new(),
                     upstreams: BTreeMap::from([(
                         "backend".to_string(),
                         Upstream {
@@ -568,6 +569,7 @@ async fn gateway_refuses_site_private_upstream_under_multi_tenant() {
                     ..Default::default()
                 },
                 gateway: Some(GatewayConfig {
+                    reserved_paths: Vec::new(),
                     upstreams: BTreeMap::from([(
                         "backend".to_string(),
                         Upstream {
@@ -611,6 +613,7 @@ async fn gateway_refuses_site_unix_upstream_under_multi_tenant() {
                     ..Default::default()
                 },
                 gateway: Some(GatewayConfig {
+                    reserved_paths: Vec::new(),
                     upstreams: BTreeMap::from([(
                         "backend".to_string(),
                         Upstream {
@@ -679,6 +682,7 @@ async fn gateway_load_balances_and_fails_over_a_pool() {
                     ..Default::default()
                 },
                 gateway: Some(GatewayConfig {
+                    reserved_paths: Vec::new(),
                     upstreams: BTreeMap::from([
                         (
                             "lbpool".to_string(),
@@ -790,6 +794,7 @@ async fn gateway_proxies_to_unix_socket_upstream() {
                     ..Default::default()
                 },
                 gateway: Some(GatewayConfig {
+                    reserved_paths: Vec::new(),
                     upstreams: BTreeMap::from([(
                         "sock".to_string(),
                         Upstream {
@@ -883,6 +888,7 @@ async fn gateway_bridges_websocket_upgrade() {
                     ..Default::default()
                 },
                 gateway: Some(GatewayConfig {
+                    reserved_paths: Vec::new(),
                     upstreams: BTreeMap::from([(
                         "ws".to_string(),
                         Upstream {
