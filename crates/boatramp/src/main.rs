@@ -94,6 +94,7 @@ mod mcp;
 mod migrate;
 #[cfg(feature = "operator")]
 mod operator;
+mod output;
 mod project;
 mod project_migrate;
 mod project_repair;
@@ -121,6 +122,16 @@ struct Cli {
     /// falls back to `[publish].project`; env `BOATRAMP_PROJECT`).
     #[arg(long, global = true, env = "BOATRAMP_PROJECT")]
     project: Option<String>,
+
+    /// How to render command results: `human` (default) or `json`. Applies to every subcommand.
+    #[arg(
+        long = "output-format",
+        global = true,
+        value_enum,
+        env = "BOATRAMP_OUTPUT_FORMAT",
+        default_value_t = output::OutputMode::Human
+    )]
+    output_format: output::OutputMode,
 
     #[command(subcommand)]
     command: Command,
@@ -480,7 +491,7 @@ async fn async_main() -> Result<(), CliError> {
         let Command::Security(args) = cli.command else {
             unreachable!("guarded by matches! above")
         };
-        security::run(args, &config)?;
+        output::emit(cli.output_format, &security::run(args, &config)?)?;
         return Ok(());
     }
 
@@ -493,7 +504,7 @@ async fn async_main() -> Result<(), CliError> {
         let Command::Migrate(args) = cli.command else {
             unreachable!("guarded by matches! above")
         };
-        migrate::run(args, &config).await?;
+        output::emit(cli.output_format, &migrate::run(args, &config).await?)?;
         return Ok(());
     }
 
@@ -504,7 +515,7 @@ async fn async_main() -> Result<(), CliError> {
         let Command::Operator(args) = cli.command else {
             unreachable!("guarded by matches! above")
         };
-        operator::run(args).await?;
+        output::emit(cli.output_format, &operator::run(args).await?)?;
         return Ok(());
     }
 
@@ -528,7 +539,7 @@ async fn async_main() -> Result<(), CliError> {
         let Command::Kv(args) = cli.command else {
             unreachable!("guarded by matches! above")
         };
-        kv::run(args).await?;
+        output::emit(cli.output_format, &kv::run(args).await?)?;
         return Ok(());
     }
 
@@ -544,6 +555,9 @@ async fn async_main() -> Result<(), CliError> {
 
     // Each arm propagates its module's typed error into `CliError` via `?`; the
     // `#[from]` impls on `CliError` make every command's error a single dispatch.
+    // A converted command returns a typed result that `output::emit` renders once here (human
+    // text or JSON, per `--output-format`); arms not yet migrated still print internally.
+    let mode = cli.output_format;
     match cli.command {
         Command::Serve(_) => unreachable!("handled above"),
         Command::Security(_) => unreachable!("handled above"),
@@ -555,51 +569,55 @@ async fn async_main() -> Result<(), CliError> {
         #[cfg(feature = "slatedb")]
         Command::Kv(_) => unreachable!("handled above"),
         Command::Completions { .. } | Command::Man => unreachable!("handled above"),
-        Command::Sync(args) => sync::run(args, &config).await?,
-        Command::Apply(args) => apply::run(args, &config).await?,
-        Command::Build(args) => build::run(args, &config).await?,
-        Command::Bundle(args) => bundle::run(args, &config).await?,
-        Command::Compose(args) => compose::run(args)?,
-        Command::Validate(args) => build::validate(args)?,
-        Command::Capabilities(args) => capabilities::run(args),
-        Command::Version(args) => version::run(args, &config).await?,
-        Command::Deployments(args) => manage::list(args, &config).await?,
-        Command::Function(args) => function::run(args, &config).await?,
-        Command::Workflow(args) => workflow::run(args, &config).await?,
-        Command::Rollback(args) => manage::rollback(args, &config).await?,
-        Command::Status(args) => manage::status(args, &config).await?,
-        Command::Domain(args) => domains::run(args, &config).await?,
-        Command::Alias(args) => alias::run(args, &config).await?,
-        Command::Project(args) => project::run(args, &config).await?,
-        Command::Access(args) => access::run(args, &config).await?,
-        Command::Handlers(args) => handlers::run(args, &config).await?,
-        Command::Compression(args) => compression::run(args, &config).await?,
-        Command::SecurityHeaders(args) => security_headers::run(args, &config).await?,
-        Command::Graphql(args) => graphql::run(args, &config).await?,
-        Command::Token(args) => token::run(args, &config).await?,
-        Command::Secrets(args) => secrets::run(args, &config).await?,
-        Command::Tenancy(args) => tenancy::run(args, &config).await?,
+        Command::Sync(args) => output::emit(mode, &sync::run(args, &config).await?)?,
+        Command::Apply(args) => output::emit(mode, &apply::run(args, &config).await?)?,
+        Command::Build(args) => output::emit(mode, &build::run(args, &config).await?)?,
+        Command::Bundle(args) => output::emit(mode, &bundle::run(args, &config).await?)?,
+        Command::Compose(args) => output::emit(mode, &compose::run(args)?)?,
+        Command::Validate(args) => output::emit(mode, &build::validate(args)?)?,
+        Command::Capabilities(args) => output::emit(mode, &capabilities::run(args, mode))?,
+        Command::Version(args) => output::emit(mode, &version::run(args, &config).await?)?,
+        Command::Deployments(args) => output::emit(mode, &manage::list(args, &config).await?)?,
+        Command::Function(args) => output::emit(mode, &function::run(args, &config).await?)?,
+        Command::Workflow(args) => output::emit(mode, &workflow::run(args, &config).await?)?,
+        Command::Rollback(args) => output::emit(mode, &manage::rollback(args, &config).await?)?,
+        Command::Status(args) => output::emit(mode, &manage::status(args, &config).await?)?,
+        Command::Domain(args) => output::emit(mode, &domains::run(args, &config).await?)?,
+        Command::Alias(args) => output::emit(mode, &alias::run(args, &config).await?)?,
+        Command::Project(args) => output::emit(mode, &project::run(args, &config).await?)?,
+        Command::Access(args) => output::emit(mode, &access::run(args, &config).await?)?,
+        Command::Handlers(args) => output::emit(mode, &handlers::run(args, &config).await?)?,
+        Command::Compression(args) => output::emit(mode, &compression::run(args, &config).await?)?,
+        Command::SecurityHeaders(args) => {
+            output::emit(mode, &security_headers::run(args, &config).await?)?;
+        }
+        Command::Graphql(args) => output::emit(mode, &graphql::run(args, &config).await?)?,
+        Command::Token(args) => output::emit(mode, &token::run(args, &config).await?)?,
+        Command::Secrets(args) => output::emit(mode, &secrets::run(args, &config).await?)?,
+        Command::Tenancy(args) => output::emit(mode, &tenancy::run(args, &config).await?)?,
         #[cfg(feature = "email")]
-        Command::Email(args) => email::run(args, &config).await?,
-        Command::Cluster(args) => cluster::run(args, &config).await?,
-        Command::Auth(args) => authcmd::run(args, &config).await?,
-        Command::Gateway(args) => gateway::run(args, &config).await?,
-        Command::Compute(args) => compute::run(args, &config).await?,
-        Command::Sql(args) => sql::run(args, &config).await?,
-        Command::Db(args) => db::run(args, &config).await?,
-        Command::Blob(args) => blob::run(args, &config).await?,
-        Command::Config(args) => config_cmd::run(args, &config).await?,
+        Command::Email(args) => output::emit(mode, &email::run(args, &config).await?)?,
+        Command::Cluster(args) => output::emit(mode, &cluster::run(args, &config).await?)?,
+        Command::Auth(args) => output::emit(mode, &authcmd::run(args, &config).await?)?,
+        Command::Gateway(args) => output::emit(mode, &gateway::run(args, &config).await?)?,
+        Command::Compute(args) => output::emit(mode, &compute::run(args, &config).await?)?,
+        Command::Sql(args) => output::emit(mode, &sql::run(args, &config).await?)?,
+        Command::Db(args) => output::emit(mode, &db::run(args, &config).await?)?,
+        Command::Blob(args) => output::emit(mode, &blob::run(args, &config).await?)?,
+        Command::Config(args) => output::emit(mode, &config_cmd::run(args, &config).await?)?,
         #[cfg(feature = "acme-dns")]
-        Command::Dns(args) => dns::run(args, &config).await?,
-        Command::Logs(args) => logs::run(args, &config).await?,
-        Command::Stats(args) => logs::stats(args, &config).await?,
-        Command::Dlq(args) => dlq::run(args, &config).await?,
-        Command::Queue(args) => queue::run(args, &config).await?,
-        Command::Prune(args) => manage::prune(args, &config).await?,
-        Command::Scrub(args) => manage::scrub(args, &config).await?,
-        Command::CertStatus(args) => manage::cert_status(args, &config).await?,
+        Command::Dns(args) => output::emit(mode, &dns::run(args, &config).await?)?,
+        Command::Logs(args) => output::emit(mode, &logs::run(args, &config).await?)?,
+        Command::Stats(args) => output::emit(mode, &logs::stats(args, &config).await?)?,
+        Command::Dlq(args) => output::emit(mode, &dlq::run(args, &config).await?)?,
+        Command::Queue(args) => output::emit(mode, &queue::run(args, &config).await?)?,
+        Command::Prune(args) => output::emit(mode, &manage::prune(args, &config).await?)?,
+        Command::Scrub(args) => output::emit(mode, &manage::scrub(args, &config).await?)?,
+        Command::CertStatus(args) => {
+            output::emit(mode, &manage::cert_status(args, &config).await?)?;
+        }
         #[cfg(feature = "cluster")]
-        Command::Cloudflare(args) => cloudflare::run(args, &config).await?,
+        Command::Cloudflare(args) => output::emit(mode, &cloudflare::run(args, &config).await?)?,
     }
     Ok(())
 }

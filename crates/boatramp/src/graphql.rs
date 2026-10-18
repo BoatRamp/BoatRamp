@@ -104,15 +104,58 @@ enum SubgraphCommand {
     },
 }
 
+/// The result of a `graphql` subcommand, rendered by [`crate::output`].
+#[derive(Debug, serde::Serialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum GraphqlOutput {
+    /// A trusted operation was registered (`safelist add`).
+    Safelisted { hash: String },
+    /// The registered trusted operations (`safelist list`) — the admin API's
+    /// JSON body, verbatim.
+    Safelist { operations: serde_json::Value },
+    /// A trusted operation was removed (`safelist rm`).
+    SafelistRemoved { hash: String },
+    /// A subgraph was published. `kind` is `sdl`, `sql`, or `function`.
+    SubgraphPublished { name: String, kind: String },
+    /// A subgraph was removed.
+    SubgraphRemoved { name: String },
+    /// The composed supergraph SDL (`supergraph`).
+    Supergraph { sdl: String },
+}
+
+impl crate::output::Rendered for GraphqlOutput {
+    fn render_human(&self, w: &mut dyn std::io::Write) -> std::io::Result<()> {
+        match self {
+            Self::Safelisted { hash } => writeln!(w, "safelisted operation: {hash}"),
+            Self::Safelist { operations } => writeln!(
+                w,
+                "{}",
+                serde_json::to_string_pretty(operations).unwrap_or_default()
+            ),
+            Self::SafelistRemoved { hash } => {
+                writeln!(w, "removed safelisted operation {hash}")
+            }
+            // The human wording matches the original per-kind phrasing; `kind` rides the JSON shape.
+            Self::SubgraphPublished { name, kind } => match kind.as_str() {
+                "function" => writeln!(w, "registered function subgraph {name}"),
+                "sdl" => writeln!(w, "published subgraph {name}"),
+                other => writeln!(w, "published {other} subgraph {name}"),
+            },
+            Self::SubgraphRemoved { name } => writeln!(w, "removed subgraph {name}"),
+            Self::Supergraph { sdl } => writeln!(w, "{sdl}"),
+        }
+    }
+}
+
 /// Entry point for `boatramp graphql`.
-pub async fn run(args: GraphqlArgs, config: &ProjectConfig) -> Result<()> {
+pub async fn run(args: GraphqlArgs, config: &ProjectConfig) -> Result<GraphqlOutput> {
     let server = client::resolve_server(args.server, config)?;
     let project = client::resolve_project(config);
     let seg = client::project_seg(&project, "graphql");
     let http = client::http_client(client::token(config).as_deref());
     let base = format!("{server}/api/{seg}");
 
-    match args.command {
+    let out = match args.command {
         GraphqlCommand::Safelist { command } => match command {
             SafelistCommand::Add { query, file } => {
                 let query = read_input(query, file)?;
@@ -126,8 +169,9 @@ pub async fn run(args: GraphqlArgs, config: &ProjectConfig) -> Result<()> {
                 let hash = body
                     .get("hash")
                     .and_then(|h| h.as_str())
-                    .unwrap_or("(registered)");
-                println!("safelisted operation: {hash}");
+                    .unwrap_or("(registered)")
+                    .to_string();
+                GraphqlOutput::Safelisted { hash }
             }
             SafelistCommand::List => {
                 let body: serde_json::Value = http
@@ -138,17 +182,14 @@ pub async fn run(args: GraphqlArgs, config: &ProjectConfig) -> Result<()> {
                     .json()
                     .await
                     .unwrap_or_default();
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&body).unwrap_or_default()
-                );
+                GraphqlOutput::Safelist { operations: body }
             }
             SafelistCommand::Rm { hash } => {
                 http.delete(format!("{base}/safelist/{hash}"))
                     .send()
                     .await?
                     .error_for_status()?;
-                println!("removed safelisted operation {hash}");
+                GraphqlOutput::SafelistRemoved { hash }
             }
         },
         GraphqlCommand::Subgraph { command } => match command {
@@ -160,24 +201,34 @@ pub async fn run(args: GraphqlArgs, config: &ProjectConfig) -> Result<()> {
                     .send()
                     .await?
                     .error_for_status()?;
-                println!("published subgraph {name}");
+                GraphqlOutput::SubgraphPublished {
+                    name,
+                    kind: "sdl".to_string(),
+                }
             }
             SubgraphCommand::Sql { name, file } => {
                 put_json_subgraph(&http, &base, &name, "sql", &file).await?;
+                GraphqlOutput::SubgraphPublished {
+                    name,
+                    kind: "sql".to_string(),
+                }
             }
             SubgraphCommand::Function { name } => {
                 http.put(format!("{base}/subgraphs/{name}/function"))
                     .send()
                     .await?
                     .error_for_status()?;
-                println!("registered function subgraph {name}");
+                GraphqlOutput::SubgraphPublished {
+                    name,
+                    kind: "function".to_string(),
+                }
             }
             SubgraphCommand::Rm { name } => {
                 http.delete(format!("{base}/subgraphs/{name}"))
                     .send()
                     .await?
                     .error_for_status()?;
-                println!("removed subgraph {name}");
+                GraphqlOutput::SubgraphRemoved { name }
             }
         },
         GraphqlCommand::Supergraph => {
@@ -188,13 +239,14 @@ pub async fn run(args: GraphqlArgs, config: &ProjectConfig) -> Result<()> {
                 .error_for_status()?
                 .text()
                 .await?;
-            println!("{text}");
+            GraphqlOutput::Supergraph { sdl: text }
         }
-    }
-    Ok(())
+    };
+    Ok(out)
 }
 
-/// PUT a JSON-bodied subgraph (`sql` / `function`) from a request file.
+/// PUT a JSON-bodied subgraph (`sql` / `function`) from a request file. The
+/// caller reports the outcome; this only performs the request.
 async fn put_json_subgraph(
     http: &client::ApiClient,
     base: &str,
@@ -214,7 +266,6 @@ async fn put_json_subgraph(
         .send()
         .await?
         .error_for_status()?;
-    println!("published {kind} subgraph {name}");
     Ok(())
 }
 

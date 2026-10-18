@@ -443,11 +443,92 @@ fn render_readme(args: &CloudflareArgs, nodes: &[Node]) -> String {
     )
 }
 
+/// The result of `boatramp cloudflare`, rendered by [`crate::output`]. Deploy
+/// progress is reported on the `tracing` sink; this carries the outcome.
+// The `Plan` variant carries the full native deploy plan (script metadata + application request);
+// larger than the bare acks, but a short-lived build-then-emit value, so an allow over boxing.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, serde::Serialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum CloudflareOutput {
+    /// `--emit-artifacts <dir>` — reference files written for inspection.
+    Artifacts { dir: String },
+    /// `--dry-run` — the native deploy plan (nothing mutated). The structured
+    /// `metadata`/`application` are the pure planner outputs; the human view
+    /// pretty-prints them under their numbered steps.
+    Plan {
+        r2_bucket: String,
+        d1: String,
+        image: String,
+        worker_name: String,
+        metadata: boatramp_cloudflare::api::workers::ScriptMetadata,
+        application: boatramp_cloudflare::api::models::CreateApplicationRequest,
+    },
+    /// A completed native deploy.
+    Deployed {
+        app_name: String,
+        version: String,
+        instance_type: String,
+        /// A freshly generated control-plane root key (only when none was
+        /// supplied) — SAVE IT. The human view logs it via `tracing` at deploy time.
+        generated_auth_root_private_key: Option<String>,
+    },
+}
+
+impl crate::output::Rendered for CloudflareOutput {
+    fn render_human(&self, w: &mut dyn std::io::Write) -> std::io::Result<()> {
+        match self {
+            Self::Artifacts { dir } => {
+                writeln!(w, "Wrote deployment artifacts (for inspection) → {dir}")?;
+                writeln!(
+                    w,
+                    "Deploy natively with `boatramp cloudflare` (no --emit-artifacts)."
+                )
+            }
+            Self::Plan {
+                r2_bucket,
+                d1,
+                image,
+                worker_name,
+                metadata,
+                application,
+            } => {
+                let meta_json =
+                    serde_json::to_string_pretty(metadata).map_err(std::io::Error::other)?;
+                let app_json =
+                    serde_json::to_string_pretty(application).map_err(std::io::Error::other)?;
+                writeln!(
+                    w,
+                    "Native Cloudflare deploy plan (dry-run — nothing is mutated):\n"
+                )?;
+                writeln!(w, "  1. ensure R2 bucket    {r2_bucket:?}")?;
+                writeln!(w, "  2. ensure D1 database  {d1:?}")?;
+                writeln!(w, "  3. use container image {image:?}")?;
+                writeln!(w, "  4. upload edge Worker  {worker_name:?}, metadata:")?;
+                for line in meta_json.lines() {
+                    writeln!(w, "       {line}")?;
+                }
+                writeln!(w, "  5. create/roll out container application:")?;
+                for line in app_json.lines() {
+                    writeln!(w, "       {line}")?;
+                }
+                Ok(())
+            }
+            Self::Deployed { .. } => {
+                writeln!(
+                    w,
+                    "cloudflare: native deploy complete — boatramp running on CF Containers"
+                )
+            }
+        }
+    }
+}
+
 /// Deploy boatramp's cluster mode to Cloudflare — natively over the CF REST API
 /// (no wrangler, nothing generated for the operator to run). `--dry-run` previews
 /// the plan; `--emit-artifacts <dir>` writes the Dockerfile/Worker/config files
 /// for inspection instead of deploying.
-pub async fn run(args: CloudflareArgs, _config: &ProjectConfig) -> Result<()> {
+pub async fn run(args: CloudflareArgs, _config: &ProjectConfig) -> Result<CloudflareOutput> {
     if let Some(dir) = args.emit_artifacts.clone() {
         return emit_artifacts(&args, &dir);
     }
@@ -456,7 +537,7 @@ pub async fn run(args: CloudflareArgs, _config: &ProjectConfig) -> Result<()> {
 
 /// Write the deployment artifacts to `dir` for inspection (a debugging escape
 /// hatch — the deploy itself is native). No `wrangler.jsonc`: wrangler is gone.
-fn emit_artifacts(args: &CloudflareArgs, dir: &std::path::Path) -> Result<()> {
+fn emit_artifacts(args: &CloudflareArgs, dir: &std::path::Path) -> Result<CloudflareOutput> {
     let nodes = plan_topology(&args.regions, &args.primary, args.quorum, args.mesh_port)?;
     std::fs::create_dir_all(dir.join("worker/src"))?;
     std::fs::create_dir_all(dir.join("nodes"))?;
@@ -470,12 +551,9 @@ fn emit_artifacts(args: &CloudflareArgs, dir: &std::path::Path) -> Result<()> {
             render_node_config(&nodes, n.id, args.mesh_port),
         )?;
     }
-    println!(
-        "Wrote deployment artifacts (for inspection) → {}",
-        dir.display()
-    );
-    println!("Deploy natively with `boatramp cloudflare` (no --emit-artifacts).");
-    Ok(())
+    Ok(CloudflareOutput::Artifacts {
+        dir: dir.display().to_string(),
+    })
 }
 
 /// The native-deploy defaults. `standard` (0.5 vCPU, 4 GiB, 8 GB disk) is the
@@ -571,7 +649,7 @@ export default {{
 /// files. `--dry-run` previews the plan; otherwise it ensures the resources,
 /// uploads the edge Worker (creating the DO namespaces), then creates/rolls out
 /// the container application referencing the boatramp image.
-async fn deploy_native(args: &CloudflareArgs) -> Result<()> {
+async fn deploy_native(args: &CloudflareArgs) -> Result<CloudflareOutput> {
     use boatramp_cloudflare::api::{ApplicationAction, CfApi, plan_application};
     use boatramp_cloudflare::deploy;
 
@@ -610,7 +688,7 @@ async fn deploy_native(args: &CloudflareArgs) -> Result<()> {
             ),
             ("BOATRAMP_KV_S3".to_string(), "true".to_string()),
         ];
-        return print_native_plan(args, instances, plan_env);
+        return native_plan(args, instances, plan_env);
     }
 
     // Resolve the control-plane root key. boatramp refuses to bind a public
@@ -618,25 +696,26 @@ async fn deploy_native(args: &CloudflareArgs) -> Result<()> {
     // 0.0.0.0 so the edge DO can reach it — so auth must be on. Prefer an
     // operator-provided key (stable across redeploys); otherwise generate one and
     // print it once so the operator can mint tokens + redeploy with the same root.
-    let auth_root_key = match args.auth_root_private_key.clone() {
-        Some(key) => key,
+    let (auth_root_key, generated_key) = match args.auth_root_private_key.clone() {
+        Some(key) => (key, None),
         None => {
             let signer =
                 boatramp_core::cose::LocalSigner::generate(boatramp_core::cose::TokenAlg::Es256);
             let key = signer.private_hex();
-            println!(
+            tracing::warn!(
                 "cloudflare: generated a control-plane root key — SAVE IT (mint tokens with it, \
                  and set it to redeploy with the same root):\n  \
-                 BOATRAMP_AUTH_ROOT_PRIVATE_KEY={key}"
+                 BOATRAMP_AUTH_ROOT_PRIVATE_KEY={}",
+                key
             );
-            key
+            (key.clone(), Some(key))
         }
     };
     let api = CfApi::from_env()?;
     // Fail loud early if the pinned (non-public) container API drifted or the
     // token lacks the scope, before mutating anything.
     api.probe().await?;
-    println!("cloudflare: account reachable; container API responsive");
+    tracing::info!("cloudflare: account reachable; container API responsive");
 
     // 1. Resources (idempotent): R2 bucket (durable blobs, via the S3 API), D1
     //    (the handler `sql` binding), and a Workers KV namespace (the durable
@@ -644,9 +723,11 @@ async fn deploy_native(args: &CloudflareArgs) -> Result<()> {
     api.ensure_r2_bucket(&args.r2_bucket).await?;
     let d1 = api.ensure_d1_database(&args.d1).await?;
     let r2 = api.r2_s3_credentials().await?;
-    println!(
+    tracing::info!(
         "cloudflare: ensured R2 bucket {:?} + D1 database {:?} ({})",
-        args.r2_bucket, d1.name, d1.uuid
+        args.r2_bucket,
+        d1.name,
+        d1.uuid
     );
 
     // Deliver the container's runtime config as environment. The container runs on
@@ -704,14 +785,14 @@ async fn deploy_native(args: &CloudflareArgs) -> Result<()> {
     );
     api.upload_worker(deploy::WORKER_NAME, &metadata, vec![module])
         .await?;
-    println!("cloudflare: uploaded edge Worker {:?}", deploy::WORKER_NAME);
+    tracing::info!("cloudflare: uploaded edge Worker {:?}", deploy::WORKER_NAME);
 
     // With no custom domain, enable the `*.workers.dev` subdomain so the Worker is
     // reachable — a freshly-uploaded script has it disabled (requests would get a
     // Cloudflare 1042/404). With `--domain`, the operator's route is the entrypoint.
     if args.domains.is_empty() {
         api.enable_workers_dev(deploy::WORKER_NAME).await?;
-        println!(
+        tracing::info!(
             "cloudflare: enabled the workers.dev subdomain for {:?}",
             deploy::WORKER_NAME
         );
@@ -741,67 +822,62 @@ async fn deploy_native(args: &CloudflareArgs) -> Result<()> {
     // instance from it — so no separate rollout call is needed.
     let app = match plan_application(&existing, deploy::APP_NAME) {
         ApplicationAction::Create => {
-            println!(
+            tracing::info!(
                 "cloudflare: creating container application {:?}",
                 deploy::APP_NAME
             );
             api.create_application(&request).await?
         }
         ApplicationAction::Modify(id) => {
-            println!("cloudflare: updating container application {id}");
+            tracing::info!("cloudflare: updating container application {}", id);
             // Modify uses a distinct body (`configuration`, no create-only fields).
             let modify = deploy::modify_request(&request);
             api.modify_application(&id, &modify).await?
         }
     };
-    println!(
+    let version = app.version.map(|v| v.to_string()).unwrap_or_default();
+    tracing::info!(
         "cloudflare: container application {:?} at version {} ({} tier); an instance provisions \
          on the first request",
         deploy::APP_NAME,
-        app.version.map(|v| v.to_string()).unwrap_or_default(),
+        version,
         NATIVE_INSTANCE_TYPE,
     );
-    println!("cloudflare: native deploy complete — boatramp running on CF Containers");
-    Ok(())
+    Ok(CloudflareOutput::Deployed {
+        app_name: deploy::APP_NAME.to_string(),
+        version,
+        instance_type: NATIVE_INSTANCE_TYPE.to_string(),
+        generated_auth_root_private_key: generated_key,
+    })
 }
 
-/// Build and print the native-deploy plan (dry-run): the resources to ensure, the
-/// image, the Worker metadata (bindings + DO migration), and the container
-/// application request — all from the pure planners, mutating nothing.
-fn print_native_plan(
+/// Build the native-deploy plan (dry-run): the resources to ensure, the image, the
+/// Worker metadata (bindings + DO migration), and the container application request
+/// — all from the pure planners, mutating nothing. The rendering (human table or
+/// JSON) is [`CloudflareOutput::Plan`]'s job.
+fn native_plan(
     args: &CloudflareArgs,
     instances: u32,
     env: Vec<(String, String)>,
-) -> Result<()> {
+) -> Result<CloudflareOutput> {
     use boatramp_cloudflare::deploy;
     let bindings = deploy::worker_bindings(&args.r2_bucket, "<d1-id>", &args.primary);
     let metadata = deploy::worker_metadata(bindings, NATIVE_MIGRATION_TAG, NATIVE_COMPAT_DATE);
-    let app = deploy::application_request(
+    let application = deploy::application_request(
         &args.image,
         instances,
         NATIVE_INSTANCE_TYPE,
         env,
         "<node-do-namespace>",
     );
-    let meta_json =
-        serde_json::to_string_pretty(&metadata).map_err(|e| Error::Native(e.to_string()))?;
-    let app_json = serde_json::to_string_pretty(&app).map_err(|e| Error::Native(e.to_string()))?;
-    println!("Native Cloudflare deploy plan (dry-run — nothing is mutated):\n");
-    println!("  1. ensure R2 bucket    {:?}", args.r2_bucket);
-    println!("  2. ensure D1 database  {:?}", args.d1);
-    println!("  3. use container image {:?}", args.image);
-    println!(
-        "  4. upload edge Worker  {:?}, metadata:",
-        deploy::WORKER_NAME
-    );
-    for line in meta_json.lines() {
-        println!("       {line}");
-    }
-    println!("  5. create/roll out container application:");
-    for line in app_json.lines() {
-        println!("       {line}");
-    }
-    Ok(())
+    Ok(CloudflareOutput::Plan {
+        r2_bucket: args.r2_bucket.clone(),
+        d1: args.d1.clone(),
+        image: args.image.clone(),
+        worker_name: deploy::WORKER_NAME.to_string(),
+        metadata,
+        application,
+    })
 }
 
 #[cfg(test)]
@@ -866,9 +942,7 @@ mod tests {
     fn native_dry_run_builds_the_plan_without_io() {
         // The dry-run planner is pure — it must not touch the network or write files.
         let args = native_args();
-        assert!(
-            print_native_plan(&args, 1, vec![("BOATRAMP_CLUSTER_INIT".into(), "1".into())]).is_ok()
-        );
+        assert!(native_plan(&args, 1, vec![("BOATRAMP_CLUSTER_INIT".into(), "1".into())]).is_ok());
     }
 
     #[test]

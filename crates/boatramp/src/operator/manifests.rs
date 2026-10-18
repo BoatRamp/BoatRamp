@@ -45,7 +45,7 @@ pub(crate) fn crds_yaml() -> Result<String> {
 }
 
 /// The full install bundle as a YAML document stream: CRDs + RBAC + operator
-/// Deployment. Pure counterpart of [`print_manifests`], for snapshot tests.
+/// Deployment. Rendered by the `operator` command's typed output (`OperatorOutput`).
 pub(crate) fn manifests_yaml(args: &ManifestArgs) -> Result<String> {
     let mut out = crds_yaml()?;
     emit_to(&mut out, &service_account(&args.namespace))?;
@@ -56,18 +56,6 @@ pub(crate) fn manifests_yaml(args: &ManifestArgs) -> Result<String> {
         &deployment(&args.namespace, &args.image, args.replicas),
     )?;
     Ok(out)
-}
-
-/// Print the three CRDs as YAML, from the Rust definitions.
-pub fn print_crds() -> Result<()> {
-    print!("{}", crds_yaml()?);
-    Ok(())
-}
-
-/// Print the full install bundle: CRDs + RBAC + operator Deployment.
-pub fn print_manifests(args: &ManifestArgs) -> Result<()> {
-    print!("{}", manifests_yaml(args)?);
-    Ok(())
 }
 
 /// Append one object as a YAML document (k8s-openapi emits `apiVersion`/`kind`).

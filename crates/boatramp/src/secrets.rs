@@ -94,8 +94,42 @@ enum SecretsCommand {
     },
 }
 
+/// The result of a `secrets` subcommand, rendered by [`crate::output`].
+#[derive(Debug, serde::Serialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum SecretsOutput {
+    /// A secret was sealed under `name` (confirmed by metadata only — the value is
+    /// never echoed back).
+    Set { name: String, revision: u32 },
+    /// `secrets ls` — the project's secrets as value-free metadata.
+    List { secrets: Vec<SecretMeta> },
+    /// A secret was removed.
+    Removed { name: String },
+}
+
+impl crate::output::Rendered for SecretsOutput {
+    fn render_human(&self, w: &mut dyn std::io::Write) -> std::io::Result<()> {
+        match self {
+            Self::Set { name, revision } => {
+                writeln!(w, "set {name} (revision {revision})")
+            }
+            Self::List { secrets } => {
+                if secrets.is_empty() {
+                    return writeln!(w, "no secrets");
+                }
+                writeln!(w, "{:<32}  {:>8}  UPDATED", "NAME", "REVISION")?;
+                for s in secrets {
+                    writeln!(w, "{:<32}  {:>8}  {}", s.name, s.revision, s.updated_at)?;
+                }
+                Ok(())
+            }
+            Self::Removed { name } => writeln!(w, "removed {name}"),
+        }
+    }
+}
+
 /// Entry point for `boatramp secrets`.
-pub async fn run(args: SecretsArgs, config: &ProjectConfig) -> Result<()> {
+pub async fn run(args: SecretsArgs, config: &ProjectConfig) -> Result<SecretsOutput> {
     let server = client::resolve_server(args.server, config)?;
     let http = client::http_client(client::token(config).as_deref());
     // The project-scoped collection segment (`secrets` for the default project, else
@@ -115,19 +149,15 @@ pub async fn run(args: SecretsArgs, config: &ProjectConfig) -> Result<()> {
                 .await?;
             let meta: SecretMeta = parse_json(resp).await?;
             // Never echo the value; confirm by metadata only.
-            println!("set {} (revision {})", meta.name, meta.revision);
+            Ok(SecretsOutput::Set {
+                name: meta.name,
+                revision: meta.revision,
+            })
         }
         SecretsCommand::Ls => {
             let resp = http.get(format!("{server}/api/{seg}")).send().await?;
             let secrets: Vec<SecretMeta> = parse_json(resp).await?;
-            if secrets.is_empty() {
-                println!("no secrets");
-                return Ok(());
-            }
-            println!("{:<32}  {:>8}  UPDATED", "NAME", "REVISION");
-            for s in secrets {
-                println!("{:<32}  {:>8}  {}", s.name, s.revision, s.updated_at);
-            }
+            Ok(SecretsOutput::List { secrets })
         }
         SecretsCommand::Rm { name } => {
             let resp = http
@@ -135,10 +165,9 @@ pub async fn run(args: SecretsArgs, config: &ProjectConfig) -> Result<()> {
                 .send()
                 .await?;
             check_no_content(resp).await?;
-            println!("removed {name}");
+            Ok(SecretsOutput::Removed { name })
         }
     }
-    Ok(())
 }
 
 /// The `set` request body: the server seals `value` and stores it under `name`.

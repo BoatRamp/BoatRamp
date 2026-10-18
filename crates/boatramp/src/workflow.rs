@@ -4,7 +4,7 @@
 //! uploads the step DAG (validated server-side), `run` starts a durable run the
 //! executor advances, and `run-status` polls it.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::client;
 use crate::config::ProjectConfig;
@@ -95,15 +95,15 @@ enum WorkflowCommand {
 }
 
 /// A workflow definition as the server reports it (name + step ids for display).
-#[derive(Debug, Deserialize)]
-struct WorkflowView {
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct WorkflowView {
     name: String,
     #[serde(default)]
     steps: Vec<StepView>,
 }
 
-#[derive(Debug, Deserialize)]
-struct StepView {
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct StepView {
     id: String,
     function: String,
     #[serde(default)]
@@ -111,24 +111,87 @@ struct StepView {
 }
 
 /// A run record as the server reports it (id + status + per-step state).
-#[derive(Debug, Deserialize)]
-struct RunView {
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct RunView {
     id: String,
     status: String,
     #[serde(default)]
     steps: std::collections::BTreeMap<String, StepRunView>,
 }
 
-#[derive(Debug, Deserialize)]
-struct StepRunView {
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct StepRunView {
     status: String,
     #[serde(default)]
     attempts: u32,
 }
 
+/// The result of a `workflow` subcommand, rendered by [`crate::output`].
+#[derive(Debug, Serialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum WorkflowOutput {
+    /// A workflow was defined/replaced.
+    Defined { name: String },
+    /// `workflow ls` — the defined workflows.
+    List { workflows: Vec<WorkflowView> },
+    /// `workflow get` — one workflow definition.
+    Show { workflow: WorkflowView },
+    /// A run was started.
+    RunStarted { id: String, status: String },
+    /// `workflow run-status` — a run's status + per-step state.
+    RunStatus { run: RunView },
+    /// A workflow definition was removed.
+    Removed { name: String },
+}
+
+impl crate::output::Rendered for WorkflowOutput {
+    fn render_human(&self, w: &mut dyn std::io::Write) -> std::io::Result<()> {
+        match self {
+            Self::Defined { name } => writeln!(w, "defined workflow {name}"),
+            Self::List { workflows } => {
+                if workflows.is_empty() {
+                    return writeln!(w, "no workflows");
+                }
+                for wf in workflows {
+                    writeln!(w, "{}  ({} steps)", wf.name, wf.steps.len())?;
+                }
+                Ok(())
+            }
+            Self::Show { workflow } => {
+                writeln!(w, "{}", workflow.name)?;
+                for s in &workflow.steps {
+                    if s.depends_on.is_empty() {
+                        writeln!(w, "  {} -> {}", s.id, s.function)?;
+                    } else {
+                        writeln!(
+                            w,
+                            "  {} -> {}  (after {})",
+                            s.id,
+                            s.function,
+                            s.depends_on.join(", ")
+                        )?;
+                    }
+                }
+                Ok(())
+            }
+            Self::RunStarted { id, status } => {
+                writeln!(w, "started run {id} [{status}]")
+            }
+            Self::RunStatus { run } => {
+                writeln!(w, "{}  [{}]", run.id, run.status)?;
+                for (step_id, sr) in &run.steps {
+                    writeln!(w, "  {step_id}: {} (attempts={})", sr.status, sr.attempts)?;
+                }
+                Ok(())
+            }
+            Self::Removed { name } => writeln!(w, "removed workflow {name}"),
+        }
+    }
+}
+
 /// Run the `workflow` subcommand.
-pub async fn run(args: WorkflowArgs, config: &ProjectConfig) -> Result<()> {
-    match args.command {
+pub async fn run(args: WorkflowArgs, config: &ProjectConfig) -> Result<WorkflowOutput> {
+    let out = match args.command {
         WorkflowCommand::Define { name, file, server } => {
             let (server, http) = client::connect(server, config)?;
             let raw = read_file(&file).await?;
@@ -143,7 +206,7 @@ pub async fn run(args: WorkflowArgs, config: &ProjectConfig) -> Result<()> {
                 .send()
                 .await?
                 .error_for_status()?;
-            println!("defined workflow {name}");
+            WorkflowOutput::Defined { name }
         }
         WorkflowCommand::Ls { server } => {
             let (server, http) = client::connect(server, config)?;
@@ -154,13 +217,7 @@ pub async fn run(args: WorkflowArgs, config: &ProjectConfig) -> Result<()> {
                 .error_for_status()?
                 .json()
                 .await?;
-            if list.is_empty() {
-                println!("no workflows");
-                return Ok(());
-            }
-            for w in list {
-                println!("{}  ({} steps)", w.name, w.steps.len());
-            }
+            WorkflowOutput::List { workflows: list }
         }
         WorkflowCommand::Get { name, server } => {
             let (server, http) = client::connect(server, config)?;
@@ -171,19 +228,7 @@ pub async fn run(args: WorkflowArgs, config: &ProjectConfig) -> Result<()> {
                 .error_for_status()?
                 .json()
                 .await?;
-            println!("{}", w.name);
-            for s in &w.steps {
-                if s.depends_on.is_empty() {
-                    println!("  {} -> {}", s.id, s.function);
-                } else {
-                    println!(
-                        "  {} -> {}  (after {})",
-                        s.id,
-                        s.function,
-                        s.depends_on.join(", ")
-                    );
-                }
-            }
+            WorkflowOutput::Show { workflow: w }
         }
         WorkflowCommand::Run { name, data, server } => {
             let (server, http) = client::connect(server, config)?;
@@ -192,7 +237,10 @@ pub async fn run(args: WorkflowArgs, config: &ProjectConfig) -> Result<()> {
                 req = req.body(input.into_bytes());
             }
             let run: RunView = req.send().await?.error_for_status()?.json().await?;
-            println!("started run {} [{}]", run.id, run.status);
+            WorkflowOutput::RunStarted {
+                id: run.id,
+                status: run.status,
+            }
         }
         WorkflowCommand::RunStatus { name, id, server } => {
             let (server, http) = client::connect(server, config)?;
@@ -203,10 +251,7 @@ pub async fn run(args: WorkflowArgs, config: &ProjectConfig) -> Result<()> {
                 .error_for_status()?
                 .json()
                 .await?;
-            println!("{}  [{}]", run.id, run.status);
-            for (step_id, sr) in &run.steps {
-                println!("  {step_id}: {} (attempts={})", sr.status, sr.attempts);
-            }
+            WorkflowOutput::RunStatus { run }
         }
         WorkflowCommand::Rm { name, server } => {
             let (server, http) = client::connect(server, config)?;
@@ -214,10 +259,10 @@ pub async fn run(args: WorkflowArgs, config: &ProjectConfig) -> Result<()> {
                 .send()
                 .await?
                 .error_for_status()?;
-            println!("removed workflow {name}");
+            WorkflowOutput::Removed { name }
         }
-    }
-    Ok(())
+    };
+    Ok(out)
 }
 
 /// Read a steps file (`-` = stdin).

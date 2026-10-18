@@ -95,9 +95,6 @@ enum SqlCommand {
         /// The database binding name (`default` = the project's default database).
         #[arg(long, default_value = boatramp_core::project::DEFAULT_DB_NAME)]
         db: String,
-        /// Output format.
-        #[arg(long, value_enum, default_value_t = Format::Table)]
-        format: Format,
     },
     /// Actively probe each replica of a managed database — a TCP reachability check
     /// that BYPASSES the stored-health gate `query` trips on. Distinguishes "the DB is
@@ -148,16 +145,84 @@ enum SqlCommand {
     },
 }
 
-#[derive(Debug, Clone, Copy, clap::ValueEnum)]
-enum Format {
-    /// A bordered text table.
-    Table,
-    /// The raw `{columns, rows}` JSON.
-    Json,
+/// The result of a `boatramp sql` subcommand, rendered by [`crate::output`].
+///
+/// Query/ping/move/re-home results carry the structured server payload so a
+/// `--output-format json` consumer reads rows and reports structurally (never a
+/// pre-formatted table).
+#[derive(Debug, serde::Serialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum SqlOutput {
+    /// `sql exec` — the migration script was applied (the `ok` ack is logged to stderr).
+    Exec,
+    /// `sql query` — the row-returning result (`{columns, rows}`). The human view is a table;
+    /// `--output-format json` serializes `data` structurally.
+    Query { data: serde_json::Value },
+    /// `sql ping` — the per-replica reachability/health probe results.
+    Ping { replicas: Vec<serde_json::Value> },
+    /// `sql move` — the server's relocation report.
+    Move {
+        // The exact text the command historically printed (pretty JSON, or a non-JSON body
+        // verbatim); `report` carries the structured value for JSON consumers.
+        #[serde(skip)]
+        human: String,
+        report: serde_json::Value,
+    },
+    /// `sql rehome-default` — the offline libsql re-home report. Only the `sql` (libsql) feature's
+    /// `rehome_default` constructs it; the `not(sql)` stub errors out instead.
+    #[cfg(feature = "sql")]
+    RehomeDefault { report: serde_json::Value },
+}
+
+impl crate::output::Rendered for SqlOutput {
+    fn render_human(&self, w: &mut dyn std::io::Write) -> std::io::Result<()> {
+        match self {
+            // `exec` reports success via the `ok` line on the `tracing` sink (stderr); it
+            // writes nothing to stdout, exactly as before.
+            Self::Exec => Ok(()),
+            Self::Query { data } => write_table(data, w),
+            Self::Ping { replicas } => {
+                if replicas.is_empty() {
+                    return writeln!(
+                        w,
+                        "no replicas (the managed database has no compute replicas yet)"
+                    );
+                }
+                writeln!(
+                    w,
+                    "{:<21}  {:<9}  {:<7}  PHASE",
+                    "ENDPOINT", "REACHABLE", "HEALTHY"
+                )?;
+                for r in replicas {
+                    let endpoint = r["endpoint"].as_str().unwrap_or("?");
+                    let reachable = if r["tcp_reachable"].as_bool().unwrap_or(false) {
+                        "yes"
+                    } else {
+                        "NO"
+                    };
+                    let healthy = if r["healthy"].as_bool().unwrap_or(false) {
+                        "yes"
+                    } else {
+                        "NO"
+                    };
+                    let phase = r["phase"].as_str().unwrap_or("?");
+                    writeln!(w, "{endpoint:<21}  {reachable:<9}  {healthy:<7}  {phase}")?;
+                }
+                Ok(())
+            }
+            Self::Move { human, .. } => writeln!(w, "{human}"),
+            #[cfg(feature = "sql")]
+            Self::RehomeDefault { report } => writeln!(
+                w,
+                "{}",
+                serde_json::to_string_pretty(report).map_err(std::io::Error::other)?
+            ),
+        }
+    }
 }
 
 /// Entry point for `boatramp sql`.
-pub async fn run(args: SqlArgs, config: &ProjectConfig) -> Result<()> {
+pub async fn run(args: SqlArgs, config: &ProjectConfig) -> Result<SqlOutput> {
     // `rehome-default` is OFFLINE + node-local (reads `--node-config`, builds the local libsql
     // backend, never a control-plane server) — handle it before resolving the server target.
     if let SqlCommand::RehomeDefault {
@@ -176,7 +241,7 @@ pub async fn run(args: SqlArgs, config: &ProjectConfig) -> Result<()> {
     // per-tenant managed DB under a non-default project can't be reached.
     let seg = client::project_seg(&client::resolve_project(config), "sql");
 
-    match args.command {
+    let out = match args.command {
         SqlCommand::Exec { db, file } => {
             validate_db(&db)?;
             let sql = match file {
@@ -201,9 +266,11 @@ pub async fn run(args: SqlArgs, config: &ProjectConfig) -> Result<()> {
                     text.trim()
                 )));
             }
-            eprintln!("ok");
+            // The migration applied; the former stdout was empty and the ack rode stderr.
+            tracing::info!("ok");
+            SqlOutput::Exec
         }
-        SqlCommand::Query { db, sql, format } => {
+        SqlCommand::Query { db, sql } => {
             validate_db(&db)?;
             let resp = http
                 .post(format!("{server}/api/{seg}/{db}/query"))
@@ -218,11 +285,8 @@ pub async fn run(args: SqlArgs, config: &ProjectConfig) -> Result<()> {
                     text.trim()
                 )));
             }
-            let out: serde_json::Value = resp.json().await?;
-            match format {
-                Format::Json => println!("{}", serde_json::to_string_pretty(&out)?),
-                Format::Table => print_table(&out),
-            }
+            let data: serde_json::Value = resp.json().await?;
+            SqlOutput::Query { data }
         }
         SqlCommand::Ping { db } => {
             validate_db(&db)?;
@@ -239,29 +303,7 @@ pub async fn run(args: SqlArgs, config: &ProjectConfig) -> Result<()> {
                 )));
             }
             let replicas: Vec<serde_json::Value> = resp.json().await?;
-            if replicas.is_empty() {
-                println!("no replicas (the managed database has no compute replicas yet)");
-                return Ok(());
-            }
-            println!(
-                "{:<21}  {:<9}  {:<7}  PHASE",
-                "ENDPOINT", "REACHABLE", "HEALTHY"
-            );
-            for r in &replicas {
-                let endpoint = r["endpoint"].as_str().unwrap_or("?");
-                let reachable = if r["tcp_reachable"].as_bool().unwrap_or(false) {
-                    "yes"
-                } else {
-                    "NO"
-                };
-                let healthy = if r["healthy"].as_bool().unwrap_or(false) {
-                    "yes"
-                } else {
-                    "NO"
-                };
-                let phase = r["phase"].as_str().unwrap_or("?");
-                println!("{endpoint:<21}  {reachable:<9}  {healthy:<7}  {phase}");
-            }
+            SqlOutput::Ping { replicas }
         }
         SqlCommand::Move { db, to, site } => {
             // Screen both endpoint names client-side, before a request is built — the
@@ -297,18 +339,28 @@ pub async fn run(args: SqlArgs, config: &ProjectConfig) -> Result<()> {
                     body.trim()
                 )));
             }
-            // Print the server's JSON report ({status, from, to, integrity}).
+            // The server's JSON report ({status, from, to, integrity}); fall back to the
+            // raw body verbatim if it is not JSON (preserving the former output exactly).
             match serde_json::from_str::<serde_json::Value>(&body) {
-                Ok(v) => println!("{}", serde_json::to_string_pretty(&v)?),
-                Err(_) => println!("{}", body.trim()),
+                Ok(v) => {
+                    let human = serde_json::to_string_pretty(&v)?;
+                    SqlOutput::Move { human, report: v }
+                }
+                Err(_) => {
+                    let human = body.trim().to_string();
+                    SqlOutput::Move {
+                        report: serde_json::Value::String(human.clone()),
+                        human,
+                    }
+                }
             }
         }
         // Handled offline above (returned before the server target was resolved).
         SqlCommand::RehomeDefault { .. } => {
             unreachable!("handled offline before server resolution")
         }
-    }
-    Ok(())
+    };
+    Ok(out)
 }
 
 /// Run the offline, node-local default-scope libsql re-home (`boatramp sql rehome-default`, v0.31.0
@@ -317,7 +369,7 @@ pub async fn run(args: SqlArgs, config: &ProjectConfig) -> Result<()> {
 /// the site's bare `{dir}/{site}.db` to its two-segment `{dir}/default/{site}.db` via the inherent
 /// [`rehome_default_site_db`](boatramp_storage::LibsqlSqlBackends::rehome_default_site_db).
 #[cfg(feature = "sql")]
-async fn rehome_default(site: &str, db: &str, node_config: &std::path::Path) -> Result<()> {
+async fn rehome_default(site: &str, db: &str, node_config: &std::path::Path) -> Result<SqlOutput> {
     let config = boatramp_node::config::ServerConfig::load(node_config, None)?;
     let sql_cfg = config
         .handlers
@@ -348,30 +400,32 @@ async fn rehome_default(site: &str, db: &str, node_config: &std::path::Path) -> 
         .rehome_default_site_db(site, db)
         .await
         .map_err(|e| Error::Rehome(e.to_string()))?;
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&serde_json::json!({
+    Ok(SqlOutput::RehomeDefault {
+        report: serde_json::json!({
             "status": "rehomed",
             "project": report.project,
             "site": report.site,
             "from": report.from,
             "to": report.to,
             "integrity": report.integrity,
-        }))?
-    );
-    Ok(())
+        }),
+    })
 }
 
 /// `boatramp sql rehome-default` is unavailable in a build without the libsql backend (`sql` feature).
 #[cfg(not(feature = "sql"))]
-async fn rehome_default(_site: &str, _db: &str, _node_config: &std::path::Path) -> Result<()> {
+async fn rehome_default(
+    _site: &str,
+    _db: &str,
+    _node_config: &std::path::Path,
+) -> Result<SqlOutput> {
     Err(Error::Rehome(
         "`sql rehome-default` needs the libsql backend (rebuild with --features sql)".into(),
     ))
 }
 
 /// Render a `{columns, rows}` query response as a bordered text table.
-fn print_table(out: &serde_json::Value) {
+fn write_table(out: &serde_json::Value, w: &mut dyn std::io::Write) -> std::io::Result<()> {
     let headers: Vec<String> = out["columns"]
         .as_array()
         .map(|a| {
@@ -416,23 +470,25 @@ fn print_table(out: &serde_json::Value) {
             .collect::<Vec<_>>()
             .join(" | ")
     };
-    println!("{}", fmt_row(&headers));
-    println!(
+    writeln!(w, "{}", fmt_row(&headers))?;
+    writeln!(
+        w,
         "{}",
         widths
             .iter()
-            .map(|w| "-".repeat(*w))
+            .map(|width| "-".repeat(*width))
             .collect::<Vec<_>>()
             .join("-+-")
-    );
+    )?;
     for row in &cells {
-        println!("{}", fmt_row(row));
+        writeln!(w, "{}", fmt_row(row))?;
     }
-    println!(
+    writeln!(
+        w,
         "({} row{})",
         cells.len(),
         if cells.len() == 1 { "" } else { "s" }
-    );
+    )
 }
 
 #[cfg(test)]

@@ -22,9 +22,6 @@ pub enum Error {
     /// Resolving the server / building the client failed.
     #[error(transparent)]
     Config(#[from] crate::config::ConfigError),
-    /// Rendering `--json` output failed.
-    #[error("rendering the database view failed: {0}")]
-    Render(#[source] serde_json::Error),
     /// The `<name>` is not a safe URL path segment (validated client-side).
     #[error("{0}")]
     InvalidName(String),
@@ -39,10 +36,6 @@ pub struct DbArgs {
     /// boatramp server base URL (overrides `[publish].server`).
     #[arg(long, env = "BOATRAMP_SERVER", global = true)]
     server: Option<String>,
-
-    /// Emit raw JSON instead of a human table.
-    #[arg(long, global = true)]
-    json: bool,
 
     #[command(subcommand)]
     command: DbCommand,
@@ -79,91 +72,108 @@ fn validate_name(name: &str) -> Result<()> {
     })
 }
 
+/// The result of a `boatramp db` subcommand, rendered by [`crate::output`].
+///
+/// Each variant carries the actual declaration(s): the human view is a table, and
+/// `--output-format json` serializes them structurally.
+#[derive(Debug, serde::Serialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum DbOutput {
+    /// `db ls` — the project's declared managed databases.
+    Ls { databases: Vec<ApplyDatabase> },
+    /// `db get <name>` — one declaration.
+    // Boxed to keep this larger payload from dwarfing the other variants.
+    Get { database: Box<ApplyDatabase> },
+    /// `db status <name>` — the read-only status view (declaration + derived workload).
+    Status {
+        name: String,
+        view: serde_json::Value,
+    },
+}
+
+impl crate::output::Rendered for DbOutput {
+    fn render_human(&self, w: &mut dyn std::io::Write) -> std::io::Result<()> {
+        match self {
+            Self::Ls { databases } => {
+                if databases.is_empty() {
+                    return writeln!(w, "no declared managed databases in this project");
+                }
+                write_header(w)?;
+                for db in databases {
+                    write_row(w, db)?;
+                }
+                Ok(())
+            }
+            Self::Get { database } => {
+                write_header(w)?;
+                write_row(w, database)
+            }
+            Self::Status { name, view } => {
+                let workload = view.get("workload").and_then(|v| v.as_str()).unwrap_or("?");
+                writeln!(w, "database `{name}`")?;
+                writeln!(w, "  server workload: {workload}")?;
+                writeln!(w, "  declared:        yes")
+            }
+        }
+    }
+}
+
 /// Entry point for `boatramp db`.
-pub async fn run(args: DbArgs, config: &ProjectConfig) -> Result<()> {
+pub async fn run(args: DbArgs, config: &ProjectConfig) -> Result<DbOutput> {
     let (server, http) = client::connect(args.server.clone(), config)?;
     let project = client::resolve_project(config);
     let cp = ControlPlane::new(server, http, project);
     match args.command {
-        DbCommand::Ls => ls(&cp, args.json).await,
+        DbCommand::Ls => ls(&cp).await,
         DbCommand::Get { name } => {
             validate_name(&name)?;
-            get(&cp, &name, args.json).await
+            get(&cp, &name).await
         }
         DbCommand::Status { name } => {
             validate_name(&name)?;
-            status(&cp, &name, args.json).await
+            status(&cp, &name).await
         }
     }
 }
 
 /// `db ls` — list the declared managed databases.
-async fn ls(cp: &ControlPlane, json: bool) -> Result<()> {
-    let dbs = cp.list_databases().await?;
-    if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&dbs).map_err(Error::Render)?
-        );
-        return Ok(());
-    }
-    if dbs.is_empty() {
-        println!("no declared managed databases in this project");
-        return Ok(());
-    }
-    print_header();
-    for db in &dbs {
-        print_row(db);
-    }
-    Ok(())
+async fn ls(cp: &ControlPlane) -> Result<DbOutput> {
+    let databases = cp.list_databases().await?;
+    Ok(DbOutput::Ls { databases })
 }
 
 /// `db get <name>` — show one declaration.
-async fn get(cp: &ControlPlane, name: &str, json: bool) -> Result<()> {
+async fn get(cp: &ControlPlane, name: &str) -> Result<DbOutput> {
     let db = cp.get_database(name).await?;
-    if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&db).map_err(Error::Render)?
-        );
-        return Ok(());
-    }
-    print_header();
-    print_row(&db);
-    Ok(())
+    Ok(DbOutput::Get {
+        database: Box::new(db),
+    })
 }
 
 /// `db status <name>` — the read-only status view (declaration + derived workload).
-async fn status(cp: &ControlPlane, name: &str, json: bool) -> Result<()> {
+async fn status(cp: &ControlPlane, name: &str) -> Result<DbOutput> {
     let view = cp.database_status(name).await?;
-    if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&view).map_err(Error::Render)?
-        );
-        return Ok(());
-    }
-    let workload = view.get("workload").and_then(|v| v.as_str()).unwrap_or("?");
-    println!("database `{name}`");
-    println!("  server workload: {workload}");
-    println!("  declared:        yes");
-    Ok(())
+    Ok(DbOutput::Status {
+        name: name.to_string(),
+        view,
+    })
 }
 
 /// The human table header (shared by `ls` and `get`).
-fn print_header() {
+fn write_header(w: &mut dyn std::io::Write) -> std::io::Result<()> {
     let (name, kind, tenant, scope, size) = ("NAME", "KIND", "TENANT", "SCOPE", "SIZE");
-    println!("{name:<24}  {kind:<10}  {tenant:<8}  {scope:<8}  {size}");
+    writeln!(w, "{name:<24}  {kind:<10}  {tenant:<8}  {scope:<8}  {size}")
 }
 
 /// One human table row for a declared database.
-fn print_row(db: &ApplyDatabase) {
-    println!(
+fn write_row(w: &mut dyn std::io::Write, db: &ApplyDatabase) -> std::io::Result<()> {
+    writeln!(
+        w,
         "{:<24}  {:<10}  {:<8}  {:<8}  {:?}",
         db.name,
         format!("{:?}", db.kind).to_lowercase(),
         format!("{:?}", db.tenant).to_lowercase(),
         format!("{:?}", db.tenant_scope).to_lowercase(),
         db.size,
-    );
+    )
 }

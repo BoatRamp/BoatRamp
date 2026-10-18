@@ -119,8 +119,75 @@ enum CookieAuthCommand {
     Clear,
 }
 
+/// The result of a `handlers` subcommand, rendered by [`crate::output`].
+// `Show` carries the full `HandlersSiteConfig`; a larger data variant is fine
+// and clearer than boxing the policy payload.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, serde::Serialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum HandlersOutput {
+    /// `handlers show` — the site's current handler policy (`None` ⇒ unset).
+    Show {
+        site: String,
+        handlers: Option<HandlersSiteConfig>,
+    },
+    /// Handlers were enabled on the site.
+    Enabled {
+        site: String,
+        allow_imports: Vec<String>,
+    },
+    /// Handlers were disabled on the site.
+    Disabled { site: String },
+    /// The import allowlist was updated (`allow` / `deny`).
+    AllowImports {
+        site: String,
+        allow_imports: Vec<String>,
+    },
+    /// The edge response cache was enabled.
+    CacheEnabled { site: String },
+    /// The edge response cache was disabled.
+    CacheDisabled { site: String },
+    /// Cookie → bearer session auth was configured.
+    CookieAuthSet { site: String, cookie_name: String },
+    /// Cookie session auth was turned off.
+    CookieAuthCleared { site: String },
+}
+
+impl crate::output::Rendered for HandlersOutput {
+    fn render_human(&self, w: &mut dyn std::io::Write) -> std::io::Result<()> {
+        match self {
+            Self::Show { site, handlers } => write_policy(w, site, handlers.as_ref()),
+            Self::Enabled {
+                site,
+                allow_imports,
+            } => writeln!(
+                w,
+                "handlers enabled for {site} (allow_imports: {})",
+                fmt_list(allow_imports)
+            ),
+            Self::Disabled { site } => writeln!(w, "handlers disabled for {site}"),
+            Self::AllowImports {
+                site,
+                allow_imports,
+            } => writeln!(w, "allow_imports for {site}: {}", fmt_list(allow_imports)),
+            Self::CacheEnabled { site } => {
+                writeln!(w, "handlers cache enabled for {site}")
+            }
+            Self::CacheDisabled { site } => {
+                writeln!(w, "handlers cache disabled for {site}")
+            }
+            Self::CookieAuthSet { site, cookie_name } => {
+                writeln!(w, "cookie auth on {site}: cookie {cookie_name}")
+            }
+            Self::CookieAuthCleared { site } => {
+                writeln!(w, "cookie auth disabled for {site}")
+            }
+        }
+    }
+}
+
 /// Entry point for `boatramp handlers`.
-pub async fn run(args: HandlersArgs, config: &ProjectConfig) -> Result<()> {
+pub async fn run(args: HandlersArgs, config: &ProjectConfig) -> Result<HandlersOutput> {
     let (server, site) = client::resolve_target(args.server, args.site, config)?;
     let cp = client::ControlPlane::new(
         server,
@@ -130,14 +197,16 @@ pub async fn run(args: HandlersArgs, config: &ProjectConfig) -> Result<()> {
     let mut site_config = cp.fetch_site_config(&site).await?;
 
     if matches!(args.command, HandlersCommand::Show) {
-        print_policy(&site, site_config.handlers.as_ref());
-        return Ok(());
+        return Ok(HandlersOutput::Show {
+            site,
+            handlers: site_config.handlers.clone(),
+        });
     }
 
     let handlers = site_config
         .handlers
         .get_or_insert_with(HandlersSiteConfig::default);
-    match args.command {
+    let out = match args.command {
         HandlersCommand::Show => unreachable!("handled above"),
         HandlersCommand::Enable {
             allow,
@@ -162,14 +231,14 @@ pub async fn run(args: HandlersArgs, config: &ProjectConfig) -> Result<()> {
             if max_fuel.is_some() {
                 handlers.max_fuel = max_fuel;
             }
-            println!(
-                "handlers enabled for {site} (allow_imports: {})",
-                fmt_list(&handlers.allow_imports)
-            );
+            HandlersOutput::Enabled {
+                site: site.clone(),
+                allow_imports: handlers.allow_imports.clone(),
+            }
         }
         HandlersCommand::Disable => {
             handlers.enabled = false;
-            println!("handlers disabled for {site}");
+            HandlersOutput::Disabled { site: site.clone() }
         }
         HandlersCommand::Allow { imports } => {
             for import in imports {
@@ -177,17 +246,17 @@ pub async fn run(args: HandlersArgs, config: &ProjectConfig) -> Result<()> {
                     handlers.allow_imports.push(import);
                 }
             }
-            println!(
-                "allow_imports for {site}: {}",
-                fmt_list(&handlers.allow_imports)
-            );
+            HandlersOutput::AllowImports {
+                site: site.clone(),
+                allow_imports: handlers.allow_imports.clone(),
+            }
         }
         HandlersCommand::Deny { imports } => {
             handlers.allow_imports.retain(|e| !imports.contains(e));
-            println!(
-                "allow_imports for {site}: {}",
-                fmt_list(&handlers.allow_imports)
-            );
+            HandlersOutput::AllowImports {
+                site: site.clone(),
+                allow_imports: handlers.allow_imports.clone(),
+            }
         }
         HandlersCommand::Cache { command } => match command {
             CacheCommand::Enable {
@@ -204,13 +273,13 @@ pub async fn run(args: HandlersArgs, config: &ProjectConfig) -> Result<()> {
                 if max_ttl_secs.is_some() {
                     cache.max_ttl_secs = max_ttl_secs;
                 }
-                println!("handlers cache enabled for {site}");
+                HandlersOutput::CacheEnabled { site: site.clone() }
             }
             CacheCommand::Disable => {
                 if let Some(cache) = handlers.cache.as_mut() {
                     cache.enabled = false;
                 }
-                println!("handlers cache disabled for {site}");
+                HandlersOutput::CacheDisabled { site: site.clone() }
             }
         },
         HandlersCommand::CookieAuth { command } => match command {
@@ -223,17 +292,20 @@ pub async fn run(args: HandlersArgs, config: &ProjectConfig) -> Result<()> {
                     .get_or_insert_with(CookieAuthConfig::default);
                 ca.cookie_name = cookie_name.clone();
                 ca.allowed_origins = allowed_origins;
-                println!("cookie auth on {site}: cookie {cookie_name}");
+                HandlersOutput::CookieAuthSet {
+                    site: site.clone(),
+                    cookie_name,
+                }
             }
             CookieAuthCommand::Clear => {
                 handlers.cookie_auth = None;
-                println!("cookie auth disabled for {site}");
+                HandlersOutput::CookieAuthCleared { site: site.clone() }
             }
         },
-    }
+    };
 
     cp.put_site_config(&site, &site_config).await?;
-    Ok(())
+    Ok(out)
 }
 
 /// De-duplicate while preserving order.
@@ -252,30 +324,38 @@ fn fmt_list(list: &[String]) -> String {
     format!("[{}]", list.join(", "))
 }
 
-/// Print the site's handler policy for `handlers show`.
-fn print_policy(site: &str, handlers: Option<&HandlersSiteConfig>) {
+/// Write the site's handler policy for `handlers show`.
+fn write_policy(
+    w: &mut dyn std::io::Write,
+    site: &str,
+    handlers: Option<&HandlersSiteConfig>,
+) -> std::io::Result<()> {
     match handlers.filter(|h| h.enabled) {
         None => {
-            println!("handlers: disabled for {site}");
-            println!("  enable with: boatramp handlers enable --site {site} [--allow <import>]…");
+            writeln!(w, "handlers: disabled for {site}")?;
+            writeln!(
+                w,
+                "  enable with: boatramp handlers enable --site {site} [--allow <import>]…"
+            )?;
         }
         Some(h) => {
-            println!("handlers: enabled for {site}");
-            println!("  allow_imports: {}", fmt_list(&h.allow_imports));
+            writeln!(w, "handlers: enabled for {site}")?;
+            writeln!(w, "  allow_imports: {}", fmt_list(&h.allow_imports))?;
             if let Some(v) = h.max_memory_mb {
-                println!("  max_memory_mb: {v}");
+                writeln!(w, "  max_memory_mb: {v}")?;
             }
             if let Some(v) = h.max_timeout_ms {
-                println!("  max_timeout_ms: {v}");
+                writeln!(w, "  max_timeout_ms: {v}")?;
             }
             if let Some(v) = h.max_concurrency {
-                println!("  max_concurrency: {v}");
+                writeln!(w, "  max_concurrency: {v}")?;
             }
             if let Some(v) = h.max_fuel {
-                println!("  max_fuel: {v}");
+                writeln!(w, "  max_fuel: {v}")?;
             }
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -5,6 +5,47 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.37.0] - 2026-10-19
+
+Consistent command output across the whole CLI. Every `boatramp` subcommand now produces a *typed
+result* that is rendered once, at the dispatch boundary, as human-readable text (the default,
+unchanged) or machine-readable JSON — replacing the ad-hoc `println!` scattered through each command.
+The same command reports the same facts whatever the caller: a terminal, a captured pipe, or a script
+that wants JSON.
+
+### Added
+
+- **Global `--output-format human|json` (env `BOATRAMP_OUTPUT_FORMAT`, default `human`).** Applies to
+  every subcommand. `human` reproduces the previous text output; `json` emits the command's result as a
+  typed JSON object — a status as `{"result": "…", …}`, a listing as a real array, a report as a
+  structured object — for scripting and other callers. (Internals: a `crate::output::Rendered` trait
+  with a single `emit` at the dispatch boundary; ~43 command modules converted. Progress/status go to
+  the `tracing` sink, errors propagate as before.)
+
+### Changed / BREAKING (CLI)
+
+- **`--output-format` is the single output control; the legacy per-command output flags are removed.**
+  `version --json`, `capabilities --json`, `db --json`, `blob {migrate,drain,purge,status,verify,rehome}
+  --json`, `sql query --format`, and `compute status --format` no longer exist — pass
+  `--output-format json` instead. (`capabilities --check`, `blob mint-upload --emit`, and `serve --format`
+  — the `boatramp.cfg` decoder — are unaffected; they are not result-format flags.) JSON output is now the
+  canonical typed envelope, which differs from some commands' former ad-hoc JSON shapes.
+- **Progress, status, and diagnostics now go to the `tracing` sink (stderr), not stdout.** A command's
+  *result* is what renders to stdout (or as JSON); intermediate steps ("uploading…", per-item progress,
+  resolved-backend echoes) are `tracing` events on stderr, consistent with the server and with
+  `BOATRAMP_LOG_FORMAT=json`. Pipeable *data* — listings, exports, the `blob put` hash, `compute exec`'s
+  passthrough stream, the `logs --follow` tail — stays on stdout.
+
+### Notes / script impact
+
+- Scripts that parsed a command's confirmation/progress *text* from stdout should use the exit code or
+  `--output-format json`; the final result text/JSON remains on stdout.
+- A few commands print failure detail to stderr and exit non-zero on error (the typed result renders
+  only on success): `function test`/`invoke` (failure), `scrub` / `domain verify-records` (findings),
+  `project doctor` (findings).
+- `logs --follow` streams human lines and does not honor `--output-format json`; a bounded `logs` fetch
+  does.
+
 ## [0.36.0] - 2026-10-18
 
 The whole mailroom capability-request backlog, bundled into one release: host-side support for

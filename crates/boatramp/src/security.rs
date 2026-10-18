@@ -36,13 +36,34 @@ enum SecurityCommand {
     Explain,
 }
 
+/// The result of a `security` subcommand, rendered by [`crate::output`].
+#[derive(Debug, serde::Serialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum SecurityOutput {
+    /// `security explain` — the resolved posture, as the human text each knob's
+    /// value + source. The resolved [`SecurityPosture`](boatramp_core::security)
+    /// is not `Serialize`, so JSON carries the rendered explanation verbatim.
+    Explain { explanation: String },
+}
+
+impl crate::output::Rendered for SecurityOutput {
+    fn render_human(&self, w: &mut dyn std::io::Write) -> std::io::Result<()> {
+        match self {
+            // `explain()` already terminates each line; mirror the former `print!`
+            // (no extra trailing newline) with `write!`.
+            Self::Explain { explanation } => write!(w, "{explanation}"),
+        }
+    }
+}
+
 /// Entry point for `boatramp security`. Reads the server config (`boatramp.cfg`).
-pub fn run(args: SecurityArgs, config: &ServerConfig) -> Result<()> {
+pub fn run(args: SecurityArgs, config: &ServerConfig) -> Result<SecurityOutput> {
     match args.command {
         SecurityCommand::Explain => {
             let security = config.security.clone().unwrap_or_default();
-            print!("{}", security.explain()?);
+            Ok(SecurityOutput::Explain {
+                explanation: security.explain()?,
+            })
         }
     }
-    Ok(())
 }

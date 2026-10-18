@@ -13,6 +13,9 @@
 /// the `source()` chain) to stderr and exits non-zero.
 #[derive(Debug, thiserror::Error)]
 pub enum CliError {
+    /// Rendering a command's result to stdout (`crate::output::emit`) — e.g. a broken pipe.
+    #[error("writing output: {0}")]
+    Output(#[from] std::io::Error),
     /// Loading or parsing the project (`project.cfg`) or server (`boatramp.cfg`)
     /// config file.
     #[error(transparent)]

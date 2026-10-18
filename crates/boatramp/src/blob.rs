@@ -4,6 +4,8 @@
 //! ingress). `blob put` is the control-plane ARTIFACT namespace; `blob mint-upload` is the
 //! external-INGRESS credential minter — deliberately distinct verbs.
 
+use std::io::Write;
+
 use clap::Subcommand;
 
 use crate::client;
@@ -212,9 +214,6 @@ pub struct RehomeArgs {
     /// Classify/would-copy (drain) or would-delete (finalize) only; write + delete nothing.
     #[arg(long)]
     dry_run: bool,
-    /// Emit the run's summary as JSON instead of a human line.
-    #[arg(long)]
-    json: bool,
 }
 
 /// Arguments for `boatramp blob purge`. Exactly one of `--unreferenced` / `--drained-source` is
@@ -241,26 +240,15 @@ pub struct PurgeArgs {
     /// Ignored by `--unreferenced` (which GCs the whole content-addressed keyspace).
     #[arg(long)]
     prefix: Option<String>,
-    /// Emit the final report as JSON instead of a human summary (progress lines stay on stderr).
-    #[arg(long)]
-    json: bool,
 }
 
 /// Arguments for `boatramp blob status`.
 #[derive(Debug, clap::Args)]
-pub struct StatusArgs {
-    /// Emit the status as JSON instead of a human line.
-    #[arg(long)]
-    json: bool,
-}
+pub struct StatusArgs {}
 
 /// Arguments for `boatramp blob verify`.
 #[derive(Debug, clap::Args)]
-pub struct VerifyArgs {
-    /// Emit the dead-reference list as JSON instead of human lines.
-    #[arg(long)]
-    json: bool,
-}
+pub struct VerifyArgs {}
 
 /// Arguments for `boatramp blob drain`.
 #[derive(Debug, clap::Args)]
@@ -274,10 +262,6 @@ pub struct DrainArgs {
     /// Restrict the drain to secondary keys under this prefix (default: all objects).
     #[arg(long)]
     prefix: Option<String>,
-    /// Emit the final report as JSON instead of a human summary (progress lines are still streamed
-    /// to stderr as they arrive).
-    #[arg(long)]
-    json: bool,
 }
 
 /// Arguments for `boatramp blob migrate`.
@@ -314,9 +298,6 @@ pub struct MigrateArgs {
     /// Restrict the migration to source keys under this prefix (default: all objects).
     #[arg(long, default_value = "")]
     prefix: String,
-    /// Emit the run's summary as JSON instead of a human line.
-    #[arg(long)]
-    json: bool,
 }
 
 /// Arguments for `boatramp blob mint-upload`.
@@ -361,7 +342,7 @@ pub struct MintUploadArgs {
 /// The `--emit` output form.
 #[cfg(feature = "blob-upload")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-enum Emit {
+pub(crate) enum Emit {
     /// A human table + an `env` block (default).
     Human,
     /// A shell `export …` block (temp-credentials) or the presigned URL (presigned-put).
@@ -374,8 +355,339 @@ enum Emit {
     Json,
 }
 
+/// The result of a `boatramp blob` subcommand, rendered by [`crate::output`].
+///
+/// Each variant carries the facts a JSON consumer reads; [`render_human`](crate::output::Rendered::render_human)
+/// reproduces the exact text the command historically printed. The report subcommands
+/// (`migrate`/`drain`/`purge`/`status`/`verify`/`rehome`) keep their own `--json` flag: in human
+/// mode it still governs the rendering byte-for-byte (its old ad-hoc report JSON, or the human
+/// summary). That `json` flag is skipped from the typed serialization; `--output-format json` renders
+/// the named fields instead.
+// A build-then-emit result; one data-carrying variant (Migrate/Rehome reports) is larger than the
+// bare acks, but the value is short-lived and boxing would only obscure its shape/JSON.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, serde::Serialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum BlobOutput {
+    /// `blob put` — the content hash of the uploaded blob.
+    Put {
+        /// The content-addressed hash (the key other commands reference).
+        hash: String,
+    },
+    /// `blob mint-upload` — a minted S3 upload credential, rendered per `--emit`.
+    #[cfg(feature = "blob-upload")]
+    MintUpload {
+        /// The minted credential (serialized as the `--emit json` object).
+        #[serde(serialize_with = "serialize_mint_creds")]
+        creds: client::MintUploadResult,
+        /// The `--emit` form chosen for the human rendering.
+        #[serde(skip)]
+        emit: Emit,
+    },
+    /// `blob migrate` — the offline, node-local backend-migration summary.
+    Migrate {
+        /// Resolved source backend identity.
+        source: String,
+        /// Resolved destination backend identity.
+        dest: String,
+        /// Objects present in the source.
+        total_objects: u64,
+        /// Objects copied source→dest.
+        copied_objects: u64,
+        /// Objects already present in the destination (skipped).
+        skipped_objects: u64,
+        /// Bytes copied.
+        copied_bytes: u64,
+        /// Whether the post-copy verification passed.
+        verified: bool,
+        /// Whether this was a dry run.
+        dry_run: bool,
+        /// Whether a configured fallback→primary drain is now fully verified.
+        secondary_drained: bool,
+    },
+    /// `blob drain` — the daemon's final drain report (opaque server JSON).
+    Drain {
+        /// The daemon's final report object.
+        report: serde_json::Value,
+    },
+    /// `blob purge` — the daemon's final purge report (opaque server JSON).
+    Purge {
+        /// The daemon's final report object.
+        report: serde_json::Value,
+    },
+    /// `blob status` — the node's blob transition-mode state (opaque server JSON).
+    Status {
+        /// The node's structured status object.
+        state: serde_json::Value,
+    },
+    /// `blob verify` — the dead-reference report (opaque server JSON).
+    Verify {
+        /// The server's verification object (carries `dead_references`).
+        state: serde_json::Value,
+    },
+    /// `blob rehome` — the offline default-scope re-home summary.
+    Rehome {
+        /// `"drain"` or `"retire"`.
+        phase: &'static str,
+        /// Whether this was a dry run.
+        dry_run: bool,
+        /// Re-homeable objects considered.
+        total: u64,
+        /// Objects copied old→new.
+        copied: u64,
+        /// Objects already present at the new key.
+        skipped: u64,
+        /// Old keys deleted (retire only).
+        deleted: u64,
+        /// Whether the control-plane "blob substrate retired" marker was set.
+        blob_retired_marker_set: bool,
+    },
+}
+
+impl crate::output::Rendered for BlobOutput {
+    fn render_human(&self, w: &mut dyn std::io::Write) -> std::io::Result<()> {
+        match self {
+            Self::Put { hash } => writeln!(w, "{hash}"),
+            #[cfg(feature = "blob-upload")]
+            Self::MintUpload { creds, emit } => write_mint(creds, *emit, w),
+            // `source`/`dest` ride the JSON shape only; the human summary never showed them.
+            Self::Migrate {
+                total_objects,
+                copied_objects,
+                skipped_objects,
+                copied_bytes,
+                verified,
+                dry_run,
+                secondary_drained,
+                ..
+            } => write_migrate(
+                *total_objects,
+                *copied_objects,
+                *skipped_objects,
+                *copied_bytes,
+                *verified,
+                *dry_run,
+                *secondary_drained,
+                w,
+            ),
+            Self::Drain { report } => write_drain(report, w),
+            Self::Purge { report } => write_purge(report, w),
+            Self::Status { state } => write_status(state, w),
+            Self::Verify { state } => write_verify(state, w),
+            Self::Rehome {
+                phase,
+                dry_run,
+                total,
+                copied,
+                skipped,
+                deleted,
+                blob_retired_marker_set,
+            } => write_rehome(
+                phase,
+                *dry_run,
+                *total,
+                *copied,
+                *skipped,
+                *deleted,
+                *blob_retired_marker_set,
+                w,
+            ),
+        }
+    }
+}
+
+/// Serialize a minted credential as the self-describing `--emit json` object (the struct is
+/// `Deserialize`-only, so this maps its fields into a value for the typed JSON output).
+#[cfg(feature = "blob-upload")]
+fn serialize_mint_creds<S>(
+    c: &client::MintUploadResult,
+    s: S,
+) -> std::result::Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serde::Serialize::serialize(&mint_creds_value(c), s)
+}
+
+/// The `--emit json` object for a minted credential (shared by the JSON serialization and the human
+/// `--emit json` rendering so the two stay identical).
+#[cfg(feature = "blob-upload")]
+fn mint_creds_value(c: &client::MintUploadResult) -> serde_json::Value {
+    serde_json::json!({
+        "kind": c.kind,
+        "url": c.url,
+        "method": c.method,
+        "required_headers": c.required_headers,
+        "access_key_id": c.access_key_id,
+        "secret": c.secret,
+        "session_token": c.session_token,
+        "endpoint": c.endpoint,
+        "region": c.region,
+        "bucket": c.bucket,
+        "force_path_style": c.force_path_style,
+        "expires_at": c.expires_at,
+        "expires_in_secs": c.expires_in_secs,
+        "enforced": c.enforced,
+        "advisory": c.advisory,
+    })
+}
+
+/// Render the `blob migrate` summary (human line), byte-for-byte as the command historically
+/// printed it.
+#[allow(clippy::too_many_arguments)]
+fn write_migrate(
+    total_objects: u64,
+    copied_objects: u64,
+    skipped_objects: u64,
+    copied_bytes: u64,
+    verified: bool,
+    dry_run: bool,
+    secondary_drained: bool,
+    w: &mut dyn std::io::Write,
+) -> std::io::Result<()> {
+    let verb = if dry_run { "would copy" } else { "copied" };
+    writeln!(
+        w,
+        "blob migrate {}: {} {} object(s), skipped {} present, {} byte(s){}",
+        if dry_run { "(dry-run)" } else { "complete" },
+        verb,
+        copied_objects,
+        skipped_objects,
+        copied_bytes,
+        if verified {
+            format!("; VERIFY OK: {total_objects} object(s) present in destination")
+        } else {
+            String::new()
+        },
+    )?;
+    if secondary_drained {
+        writeln!(
+            w,
+            "SECONDARY FULLY DRAINED — safe to remove [serve].blob_fallback and restart the node."
+        )?;
+    }
+    Ok(())
+}
+
+/// Render the `blob drain` final report (human summary).
+fn write_drain(report: &serde_json::Value, w: &mut dyn std::io::Write) -> std::io::Result<()> {
+    let message = report
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("(no message)");
+    writeln!(w, "blob drain: {message}")
+}
+
+/// Render the `blob purge` final report (human summary).
+fn write_purge(report: &serde_json::Value, w: &mut dyn std::io::Write) -> std::io::Result<()> {
+    let message = report
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("(no message)");
+    writeln!(w, "blob purge: {message}")
+}
+
+/// Render the `blob status` transition-mode state (human line).
+fn write_status(state: &serde_json::Value, w: &mut dyn std::io::Write) -> std::io::Result<()> {
+    let active = state
+        .get("blob_fallback_active")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if active {
+        writeln!(
+            w,
+            "blob status: a read-fallback secondary is ATTACHED ([serve.blob_fallback]) — the \
+             node is mid-migration (TRANSITION mode). Drain it (blob drain / blob purge \
+             --drained-source), drop [serve.blob_fallback], and restart to finish."
+        )
+    } else {
+        writeln!(
+            w,
+            "blob status: no read-fallback secondary attached — the node is not mid-migration."
+        )
+    }
+}
+
+/// Render the `blob verify` dead-reference report (human lines).
+fn write_verify(state: &serde_json::Value, w: &mut dyn std::io::Write) -> std::io::Result<()> {
+    let dead = state
+        .get("dead_references")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if dead.is_empty() {
+        return writeln!(
+            w,
+            "blob verify: OK — every referenced blob is present in the backend."
+        );
+    }
+    writeln!(
+        w,
+        "blob verify: {} DEAD reference(s) — referenced by a live deployment/function but MISSING \
+         from the backend (would 404 on invoke/serve):",
+        dead.len()
+    )?;
+    for d in &dead {
+        let hash = d
+            .get("hash")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?");
+        let referrer = d
+            .get("referrer")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        writeln!(w, "  • {hash}  ({referrer})")?;
+    }
+    writeln!(
+        w,
+        "\nTo repair: re-upload each missing blob (`boatramp blob put <file>` restores it under the \
+         same content hash) or re-deploy the resource. (A node on this release no longer creates \
+         these — GC now references live function components.)"
+    )
+}
+
+/// Render the `blob rehome` summary (human line).
+#[allow(clippy::too_many_arguments)]
+fn write_rehome(
+    phase: &str,
+    dry_run: bool,
+    total: u64,
+    copied: u64,
+    skipped: u64,
+    deleted: u64,
+    blob_retired_marker_set: bool,
+    w: &mut dyn std::io::Write,
+) -> std::io::Result<()> {
+    if phase == "retire" {
+        writeln!(
+            w,
+            "blob rehome (retire{}): {} old key(s) deleted after their new key verified, of {} \
+             re-homeable object(s). Old bare default-scoped keys reclaimed.{}",
+            if dry_run { ", dry-run" } else { "" },
+            deleted,
+            total,
+            if blob_retired_marker_set {
+                " Blob substrate verified re-homed — `boatramp migrate --finalize` may now proceed."
+            } else {
+                ""
+            }
+        )
+    } else {
+        writeln!(
+            w,
+            "blob rehome (drain{}): {} object(s) copied old→new (verified), {} already present, of \
+             {} re-homeable object(s). Source kept — run `blob rehome --finalize` after a verified \
+             soak (with `boatramp migrate --finalize`).",
+            if dry_run { ", dry-run" } else { "" },
+            copied,
+            skipped,
+            total
+        )
+    }
+}
+
 /// Entry point for `boatramp blob`.
-pub async fn run(args: BlobArgs, config: &ProjectConfig) -> Result<()> {
+pub async fn run(args: BlobArgs, config: &ProjectConfig) -> Result<BlobOutput> {
     // `migrate` is NODE-LOCAL: it builds both blob backends in-process from two node config files
     // and never touches a control-plane server. Handle it before resolving the server target (the
     // other verbs are control-plane clients that require a `BOATRAMP_SERVER`/`[deploy].server`).
@@ -395,10 +707,10 @@ pub async fn run(args: BlobArgs, config: &ProjectConfig) -> Result<()> {
         client::resolve_project(config),
     );
 
-    match args.command {
+    let out = match args.command {
         BlobCommand::Put { file } => {
             let hash = cp.put_file_blob(&file).await?;
-            println!("{hash}");
+            BlobOutput::Put { hash }
         }
         #[cfg(feature = "blob-upload")]
         BlobCommand::MintUpload(a) => mint_upload(&cp, a).await?,
@@ -407,13 +719,13 @@ pub async fn run(args: BlobArgs, config: &ProjectConfig) -> Result<()> {
         BlobCommand::Drain(a) => drain(&cp, a).await?,
         // General provably-safe purge + structured transition status (v0.6.4), both control-plane clients.
         BlobCommand::Purge(a) => purge(&cp, a).await?,
-        BlobCommand::Status(a) => status(&cp, a).await?,
-        BlobCommand::Verify(a) => verify(&cp, a).await?,
+        BlobCommand::Status(_) => status(&cp).await?,
+        BlobCommand::Verify(_) => verify(&cp).await?,
         // Handled node-locally above (returned before the control-plane client was built).
         BlobCommand::Migrate(_) => unreachable!("handled before the control-plane client"),
         BlobCommand::Rehome(_) => unreachable!("handled before the control-plane client"),
-    }
-    Ok(())
+    };
+    Ok(out)
 }
 
 /// Run the offline, node-local default-scope blob re-home (`boatramp blob rehome`, v0.31.0 Finding 8).
@@ -422,14 +734,13 @@ pub async fn run(args: BlobArgs, config: &ProjectConfig) -> Result<()> {
 /// project's keys are never touched), then runs the `blob_rehome` drain (default) or retire
 /// (`--finalize`) over the `hblob/`,`mqp/`,`mqgp/` families.
 #[cfg(feature = "fallback")]
-async fn rehome(a: RehomeArgs) -> Result<()> {
+async fn rehome(a: RehomeArgs) -> Result<BlobOutput> {
     use std::sync::Arc;
 
     // 1. The node's own primary blob backend (the `[serve]` block of `--node-config`).
     let side = build_primary_side("rehome", &a.node_config).await?;
-    if !a.json {
-        println!("blob rehome: backend = {}", side.identity);
-    }
+    // Preamble echo of the resolved backend → tracing (diagnostic/stderr); the summary is the result.
+    tracing::info!(backend = %side.identity, "blob rehome: backend");
 
     // 2. The control-plane KV, for the `projectmeta/` project set the project-aware translator needs.
     //    Opened STRICT (a re-home is not a crash recovery) — run with the node STOPPED.
@@ -518,49 +829,20 @@ async fn rehome(a: RehomeArgs) -> Result<()> {
         blob_marker_set = true;
     }
 
-    if a.json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "phase": phase,
-                "dry_run": a.dry_run,
-                "total": report.total,
-                "copied": report.copied,
-                "skipped": report.skipped,
-                "deleted": report.deleted,
-                "blob_retired_marker_set": blob_marker_set,
-            }))?
-        );
-    } else if a.finalize {
-        println!(
-            "blob rehome (retire{}): {} old key(s) deleted after their new key verified, of {} \
-             re-homeable object(s). Old bare default-scoped keys reclaimed.{}",
-            if a.dry_run { ", dry-run" } else { "" },
-            report.deleted,
-            report.total,
-            if blob_marker_set {
-                " Blob substrate verified re-homed — `boatramp migrate --finalize` may now proceed."
-            } else {
-                ""
-            }
-        );
-    } else {
-        println!(
-            "blob rehome (drain{}): {} object(s) copied old→new (verified), {} already present, of \
-             {} re-homeable object(s). Source kept — run `blob rehome --finalize` after a verified \
-             soak (with `boatramp migrate --finalize`).",
-            if a.dry_run { ", dry-run" } else { "" },
-            report.copied,
-            report.skipped,
-            report.total
-        );
-    }
-    Ok(())
+    Ok(BlobOutput::Rehome {
+        phase,
+        dry_run: a.dry_run,
+        total: report.total,
+        copied: report.copied,
+        skipped: report.skipped,
+        deleted: report.deleted,
+        blob_retired_marker_set: blob_marker_set,
+    })
 }
 
 /// `boatramp blob rehome` is unavailable in a build without a blob-backend feature (no `fallback`).
 #[cfg(not(feature = "fallback"))]
-async fn rehome(_a: RehomeArgs) -> Result<()> {
+async fn rehome(_a: RehomeArgs) -> Result<BlobOutput> {
     Err(Error::Usage(
         "`blob rehome` needs a blob-backend feature (e.g. --features fs/s3/gcs/azure); rebuild \
          with one"
@@ -573,7 +855,7 @@ async fn rehome(_a: RehomeArgs) -> Result<()> {
 /// it arrives, and finally the human summary — or, with `--json`, the final report object — to stdout.
 /// Exits non-zero on a verify-failure or a refused/error status (mirrors `client.rs::migrate_trigger`'s
 /// 200-vs-422 branching, surfaced here through [`client::ControlPlane::blob_drain`]).
-async fn drain(cp: &client::ControlPlane, a: DrainArgs) -> Result<()> {
+async fn drain(cp: &client::ControlPlane, a: DrainArgs) -> Result<BlobOutput> {
     let final_report = cp
         .blob_drain(a.dry_run, a.concurrency, a.prefix.as_deref())
         .await?;
@@ -583,30 +865,26 @@ async fn drain(cp: &client::ControlPlane, a: DrainArgs) -> Result<()> {
     let verify_failed = final_report.get("missing").is_some();
     let errored = final_report.get("error").is_some();
 
-    if a.json {
-        println!("{}", serde_json::to_string_pretty(&final_report)?);
-    } else {
-        // The daemon's `message` already carries the human summary — including, on a verified drain,
-        // the exact "SECONDARY FULLY DRAINED — safe to remove [serve].blob_fallback…" signal — so
-        // print it verbatim (no duplication).
-        let message = final_report
-            .get("message")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("(no message)");
-        println!("blob drain: {message}");
-    }
-
-    // Non-zero exit on a verify-failure or a reported storage error (the drain did NOT complete).
+    // Non-zero exit on a verify-failure or a reported storage error (the drain did NOT complete). The
+    // report must still reach the user (the error message points at "the drain report above"), but
+    // `emit` never runs on the `Err` path — so surface it to stdout here (honoring `--json`), flush,
+    // then fail. The daemon's `message` already carries the human summary (incl. the verified-drain
+    // "SECONDARY FULLY DRAINED…" signal), printed verbatim.
     if verify_failed || errored {
+        let mut out = std::io::stdout().lock();
+        let _ = write_drain(&final_report, &mut out);
+        let _ = out.flush();
         return Err(Error::DrainIncomplete);
     }
-    Ok(())
+    Ok(BlobOutput::Drain {
+        report: final_report,
+    })
 }
 
 /// Run a general provably-safe blob purge (`boatramp blob purge`, v0.6.4): POST `/api/blob-purge` in
 /// the selected mode, consume the NDJSON stream (progress to stderr, the final report to stdout — or
 /// `--json`), and exit non-zero on a refusal/storage error. Dry-run unless `--apply`.
-async fn purge(cp: &client::ControlPlane, a: PurgeArgs) -> Result<()> {
+async fn purge(cp: &client::ControlPlane, a: PurgeArgs) -> Result<BlobOutput> {
     // The clap `ArgGroup` already guarantees exactly one mode is set (required + mutually exclusive),
     // but map it explicitly so the wire value is unambiguous.
     let mode = if a.unreferenced {
@@ -623,86 +901,30 @@ async fn purge(cp: &client::ControlPlane, a: PurgeArgs) -> Result<()> {
     // surfaced earlier as `ClientError::Refused` from `blob_purge`.
     let errored = final_report.get("error").is_some();
 
-    if a.json {
-        println!("{}", serde_json::to_string_pretty(&final_report)?);
-    } else {
-        let message = final_report
-            .get("message")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("(no message)");
-        println!("blob purge: {message}");
-    }
-
+    // As with `drain`: on the incomplete path the report must reach the user before the non-zero
+    // exit, but `emit` does not run on `Err` — so render it here (honoring `--json`), then fail.
     if errored {
+        let mut out = std::io::stdout().lock();
+        let _ = write_purge(&final_report, &mut out);
+        let _ = out.flush();
         return Err(Error::PurgeIncomplete);
     }
-    Ok(())
+    Ok(BlobOutput::Purge {
+        report: final_report,
+    })
 }
 
 /// Print the node's structured blob transition-mode state (`boatramp blob status`, v0.6.4): GET
 /// `/api/blob-status` and report whether a read-fallback secondary is attached (mid-migration).
-async fn status(cp: &client::ControlPlane, a: StatusArgs) -> Result<()> {
+async fn status(cp: &client::ControlPlane) -> Result<BlobOutput> {
     let state = cp.blob_status().await?;
-    if a.json {
-        println!("{}", serde_json::to_string_pretty(&state)?);
-    } else {
-        let active = state
-            .get("blob_fallback_active")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
-        if active {
-            println!(
-                "blob status: a read-fallback secondary is ATTACHED ([serve.blob_fallback]) — the \
-                 node is mid-migration (TRANSITION mode). Drain it (blob drain / blob purge \
-                 --drained-source), drop [serve.blob_fallback], and restart to finish."
-            );
-        } else {
-            println!(
-                "blob status: no read-fallback secondary attached — the node is not mid-migration."
-            );
-        }
-    }
-    Ok(())
+    Ok(BlobOutput::Status { state })
 }
 
 /// `boatramp blob verify`: list dead content-addressed references (referenced-but-missing blobs).
-async fn verify(cp: &client::ControlPlane, a: VerifyArgs) -> Result<()> {
+async fn verify(cp: &client::ControlPlane) -> Result<BlobOutput> {
     let state = cp.blob_verify().await?;
-    if a.json {
-        println!("{}", serde_json::to_string_pretty(&state)?);
-        return Ok(());
-    }
-    let dead = state
-        .get("dead_references")
-        .and_then(serde_json::Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    if dead.is_empty() {
-        println!("blob verify: OK — every referenced blob is present in the backend.");
-        return Ok(());
-    }
-    println!(
-        "blob verify: {} DEAD reference(s) — referenced by a live deployment/function but MISSING \
-         from the backend (would 404 on invoke/serve):",
-        dead.len()
-    );
-    for d in &dead {
-        let hash = d
-            .get("hash")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("?");
-        let referrer = d
-            .get("referrer")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("unknown");
-        println!("  • {hash}  ({referrer})");
-    }
-    println!(
-        "\nTo repair: re-upload each missing blob (`boatramp blob put <file>` restores it under the \
-         same content hash) or re-deploy the resource. (A node on this release no longer creates \
-         these — GC now references live function components.)"
-    );
-    Ok(())
+    Ok(BlobOutput::Verify { state })
 }
 
 /// Run the offline, node-local blob-backend migration (`boatramp blob migrate`). Resolves the SOURCE
@@ -712,14 +934,12 @@ async fn verify(cp: &client::ControlPlane, a: VerifyArgs) -> Result<()> {
 /// backend identities, REFUSES if they resolve equal, then copies every object source→dest with the
 /// [`boatramp_node::blob_migrate`] engine — and, on a verified fallback→primary drain, prints the
 /// "safe to remove [serve].blob_fallback" signal.
-async fn migrate(a: MigrateArgs) -> Result<()> {
+async fn migrate(a: MigrateArgs) -> Result<BlobOutput> {
     let (source, dest) = resolve_sides(&a).await?;
 
-    // Echo the RESOLVED source + destination identity before copying (never a credential).
-    if !a.json {
-        println!("blob migrate: source = {}", source.identity);
-        println!("blob migrate:   dest = {}", dest.identity);
-    }
+    // Echo the RESOLVED source + destination identity before copying (never a credential) → tracing
+    // (diagnostic/stderr); the identities also ride the typed result's `source`/`dest` facts.
+    tracing::info!(source = %source.identity, dest = %dest.identity, "blob migrate: resolved backends");
     // Refuse a migration whose source and destination resolve to the SAME backend — a no-op at best,
     // an in-place corruption at worst.
     if source.identity == dest.identity {
@@ -745,46 +965,17 @@ async fn migrate(a: MigrateArgs) -> Result<()> {
     // A verified fallback→primary drain: the secondary now has no object the primary lacks.
     let drained = report.verified && is_configured_drain;
 
-    if a.json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "source": source.identity,
-                "dest": dest.identity,
-                "total_objects": report.total_objects,
-                "copied_objects": report.copied_objects,
-                "skipped_objects": report.skipped_objects,
-                "copied_bytes": report.copied_bytes,
-                "verified": report.verified,
-                "dry_run": a.dry_run,
-                "secondary_drained": drained,
-            }))?
-        );
-    } else {
-        let verb = if a.dry_run { "would copy" } else { "copied" };
-        println!(
-            "blob migrate {}: {} {} object(s), skipped {} present, {} byte(s){}",
-            if a.dry_run { "(dry-run)" } else { "complete" },
-            verb,
-            report.copied_objects,
-            report.skipped_objects,
-            report.copied_bytes,
-            if report.verified {
-                format!(
-                    "; VERIFY OK: {} object(s) present in destination",
-                    report.total_objects
-                )
-            } else {
-                String::new()
-            },
-        );
-        if drained {
-            println!(
-                "SECONDARY FULLY DRAINED — safe to remove [serve].blob_fallback and restart the node."
-            );
-        }
-    }
-    Ok(())
+    Ok(BlobOutput::Migrate {
+        source: source.identity,
+        dest: dest.identity,
+        total_objects: report.total_objects,
+        copied_objects: report.copied_objects,
+        skipped_objects: report.skipped_objects,
+        copied_bytes: report.copied_bytes,
+        verified: report.verified,
+        dry_run: a.dry_run,
+        secondary_drained: drained,
+    })
 }
 
 /// A built migration side: the backend, its human identity (for the echo + the equal-refusal), and
@@ -1027,7 +1218,7 @@ fn build_secrets_envelope(
 
 /// Mint an upload credential and render it per `--emit`.
 #[cfg(feature = "blob-upload")]
-async fn mint_upload(cp: &client::ControlPlane, a: MintUploadArgs) -> Result<()> {
+async fn mint_upload(cp: &client::ControlPlane, a: MintUploadArgs) -> Result<BlobOutput> {
     if a.key.is_none() && a.prefix.is_none() {
         return Err(Error::Usage(
             "specify exactly one of --key or --prefix".into(),
@@ -1046,143 +1237,142 @@ async fn mint_upload(cp: &client::ControlPlane, a: MintUploadArgs) -> Result<()>
             a.sha256,
         )
         .await?;
-    render(&creds, a.emit);
-    Ok(())
+    Ok(BlobOutput::MintUpload {
+        creds,
+        emit: a.emit,
+    })
 }
 
-/// Render a minted credential in the requested form.
+/// Render a minted credential in the requested `--emit` form, byte-for-byte as the command printed it.
 #[cfg(feature = "blob-upload")]
-fn render(c: &client::MintUploadResult, emit: Emit) {
+fn write_mint(
+    c: &client::MintUploadResult,
+    emit: Emit,
+    w: &mut dyn std::io::Write,
+) -> std::io::Result<()> {
     let is_presigned = c.kind == "presigned_put";
     match emit {
         Emit::Json => {
             // Re-serialize the deserialized struct verbatim (stable field order via serde).
-            println!(
+            writeln!(
+                w,
                 "{}",
-                serde_json::to_string_pretty(&serde_json::json!({
-                    "kind": c.kind,
-                    "url": c.url,
-                    "method": c.method,
-                    "required_headers": c.required_headers,
-                    "access_key_id": c.access_key_id,
-                    "secret": c.secret,
-                    "session_token": c.session_token,
-                    "endpoint": c.endpoint,
-                    "region": c.region,
-                    "bucket": c.bucket,
-                    "force_path_style": c.force_path_style,
-                    "expires_at": c.expires_at,
-                    "expires_in_secs": c.expires_in_secs,
-                    "enforced": c.enforced,
-                    "advisory": c.advisory,
-                }))
-                .unwrap_or_default()
-            );
+                serde_json::to_string_pretty(&mint_creds_value(c)).unwrap_or_default()
+            )
         }
         Emit::Aws => {
             if is_presigned {
                 // A presigned PUT is not an SDK profile — there is nothing to put in ~/.aws.
-                eprintln!(
+                tracing::warn!(
                     "# a presigned-put credential is a single URL, not an SDK profile; use --emit env or json"
                 );
-                print_presigned(c);
+                write_presigned(c, w)
             } else {
-                println!("[boatramp-upload]");
-                println!("aws_access_key_id = {}", opt(&c.access_key_id));
-                println!("aws_secret_access_key = {}", opt(&c.secret));
-                println!("aws_session_token = {}", opt(&c.session_token));
-                println!("# region = {}", opt(&c.region));
-                println!("# endpoint_url = {}", opt(&c.endpoint));
-                println!("# addressing_style = path");
-                println!(
+                writeln!(w, "[boatramp-upload]")?;
+                writeln!(w, "aws_access_key_id = {}", opt(&c.access_key_id))?;
+                writeln!(w, "aws_secret_access_key = {}", opt(&c.secret))?;
+                writeln!(w, "aws_session_token = {}", opt(&c.session_token))?;
+                writeln!(w, "# region = {}", opt(&c.region))?;
+                writeln!(w, "# endpoint_url = {}", opt(&c.endpoint))?;
+                writeln!(w, "# addressing_style = path")?;
+                writeln!(
+                    w,
                     "# bucket = {}  (expires in {}s)",
                     opt(&c.bucket),
                     c.expires_in_secs
-                );
+                )
             }
         }
         Emit::Rclone => {
             if is_presigned {
-                eprintln!(
+                tracing::warn!(
                     "# a presigned-put credential is a single URL, not an rclone remote; use --emit env or json"
                 );
-                print_presigned(c);
+                write_presigned(c, w)
             } else {
-                println!("[boatramp-upload]");
-                println!("type = s3");
-                println!("provider = Other");
-                println!("access_key_id = {}", opt(&c.access_key_id));
-                println!("secret_access_key = {}", opt(&c.secret));
-                println!("session_token = {}", opt(&c.session_token));
-                println!("region = {}", opt(&c.region));
-                println!("endpoint = {}", opt(&c.endpoint));
-                println!("force_path_style = true");
+                writeln!(w, "[boatramp-upload]")?;
+                writeln!(w, "type = s3")?;
+                writeln!(w, "provider = Other")?;
+                writeln!(w, "access_key_id = {}", opt(&c.access_key_id))?;
+                writeln!(w, "secret_access_key = {}", opt(&c.secret))?;
+                writeln!(w, "session_token = {}", opt(&c.session_token))?;
+                writeln!(w, "region = {}", opt(&c.region))?;
+                writeln!(w, "endpoint = {}", opt(&c.endpoint))?;
+                writeln!(w, "force_path_style = true")
             }
         }
         Emit::Env => {
             if is_presigned {
-                print_presigned(c);
+                write_presigned(c, w)
             } else {
-                print_env(c);
+                write_env(c, w)
             }
         }
         Emit::Human => {
             if is_presigned {
-                println!("Minted a presigned PUT credential (single-key, browser-friendly):");
-                print_presigned(c);
+                writeln!(
+                    w,
+                    "Minted a presigned PUT credential (single-key, browser-friendly):"
+                )?;
+                write_presigned(c, w)
             } else {
-                println!(
+                writeln!(
+                    w,
                     "Minted temporary S3 credentials (path-style; expires in {}s):",
                     c.expires_in_secs
-                );
-                println!("  bucket   {}", opt(&c.bucket));
-                println!("  endpoint {}", opt(&c.endpoint));
-                println!("  region   {}", opt(&c.region));
+                )?;
+                writeln!(w, "  bucket   {}", opt(&c.bucket))?;
+                writeln!(w, "  endpoint {}", opt(&c.endpoint))?;
+                writeln!(w, "  region   {}", opt(&c.region))?;
                 if !c.enforced.is_empty() {
-                    println!("  enforced {}", c.enforced.join(", "));
+                    writeln!(w, "  enforced {}", c.enforced.join(", "))?;
                 }
                 if !c.advisory.is_empty() {
-                    println!("  advisory {}", c.advisory.join(", "));
+                    writeln!(w, "  advisory {}", c.advisory.join(", "))?;
                 }
-                println!();
-                print_env(c);
+                writeln!(w)?;
+                write_env(c, w)
             }
         }
     }
 }
 
-/// Print the shell `export` block an S3 SDK reads for temp-credentials.
+/// Write the shell `export` block an S3 SDK reads for temp-credentials.
 #[cfg(feature = "blob-upload")]
-fn print_env(c: &client::MintUploadResult) {
-    println!("export AWS_ACCESS_KEY_ID={}", opt(&c.access_key_id));
-    println!("export AWS_SECRET_ACCESS_KEY={}", opt(&c.secret));
-    println!("export AWS_SESSION_TOKEN={}", opt(&c.session_token));
-    println!("export AWS_REGION={}", opt(&c.region));
-    println!("export AWS_ENDPOINT_URL={}", opt(&c.endpoint));
+fn write_env(c: &client::MintUploadResult, w: &mut dyn std::io::Write) -> std::io::Result<()> {
+    writeln!(w, "export AWS_ACCESS_KEY_ID={}", opt(&c.access_key_id))?;
+    writeln!(w, "export AWS_SECRET_ACCESS_KEY={}", opt(&c.secret))?;
+    writeln!(w, "export AWS_SESSION_TOKEN={}", opt(&c.session_token))?;
+    writeln!(w, "export AWS_REGION={}", opt(&c.region))?;
+    writeln!(w, "export AWS_ENDPOINT_URL={}", opt(&c.endpoint))?;
     // Path-style is mandatory for the local face (bucket = container in the path).
-    println!("export AWS_S3_FORCE_PATH_STYLE=true");
-    println!("# then: aws s3 cp <file> s3://{}/<key>", opt(&c.bucket));
+    writeln!(w, "export AWS_S3_FORCE_PATH_STYLE=true")?;
+    writeln!(w, "# then: aws s3 cp <file> s3://{}/<key>", opt(&c.bucket))
 }
 
-/// Print a presigned-put credential (the URL + any required headers + a ready `curl`).
+/// Write a presigned-put credential (the URL + any required headers + a ready `curl`).
 #[cfg(feature = "blob-upload")]
-fn print_presigned(c: &client::MintUploadResult) {
+fn write_presigned(
+    c: &client::MintUploadResult,
+    w: &mut dyn std::io::Write,
+) -> std::io::Result<()> {
     let url = opt(&c.url);
-    println!("  method  {}", opt(&c.method));
-    println!("  url     {url}");
+    writeln!(w, "  method  {}", opt(&c.method))?;
+    writeln!(w, "  url     {url}")?;
     for (k, v) in &c.required_headers {
-        println!("  header  {k}: {v}");
+        writeln!(w, "  header  {k}: {v}")?;
     }
-    println!("  expires in {}s", c.expires_in_secs);
+    writeln!(w, "  expires in {}s", c.expires_in_secs)?;
     let hdrs: String = c
         .required_headers
         .iter()
         .map(|(k, v)| format!(" -H '{k}: {v}'"))
         .collect();
-    println!(
+    writeln!(
+        w,
         "# curl -X {} '{url}'{hdrs} --data-binary @<file>",
         opt(&c.method)
-    );
+    )
 }
 
 /// Format an optional string field for display ("" when absent).

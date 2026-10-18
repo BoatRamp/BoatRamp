@@ -105,9 +105,53 @@ enum DnsCommand {
     },
 }
 
+/// The result of a `boatramp dns` subcommand, rendered by [`crate::output`].
+#[derive(Debug, serde::Serialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum DnsOutput {
+    /// `dns setup` — the `*.deploy.<host>` preview wildcard record was upserted.
+    Configured {
+        kind: String,
+        name: String,
+        value: String,
+    },
+    /// `dns configure-domain` — a verified custom domain was pointed at this server.
+    Pointed {
+        kind: String,
+        name: String,
+        value: String,
+        proxied: bool,
+    },
+    /// `dns cert` — the wildcard certificate is ready in the cache.
+    CertReady { wildcard: String, cache: String },
+}
+
+impl crate::output::Rendered for DnsOutput {
+    fn render_human(&self, w: &mut dyn std::io::Write) -> std::io::Result<()> {
+        match self {
+            Self::Configured { kind, name, value } => {
+                writeln!(w, "configured {kind} {name} -> {value}")
+            }
+            Self::Pointed {
+                kind,
+                name,
+                value,
+                proxied,
+            } => writeln!(
+                w,
+                "pointed {kind} {name} -> {value}{}",
+                if *proxied { " (proxied)" } else { "" }
+            ),
+            Self::CertReady { wildcard, cache } => {
+                writeln!(w, "certificate for {wildcard} ready under {cache}")
+            }
+        }
+    }
+}
+
 /// Entry point for `boatramp dns`.
-pub async fn run(args: DnsArgs, _config: &ProjectConfig) -> Result<()> {
-    match args.command {
+pub async fn run(args: DnsArgs, _config: &ProjectConfig) -> Result<DnsOutput> {
+    let out = match args.command {
         DnsCommand::Setup {
             provider,
             host,
@@ -117,12 +161,11 @@ pub async fn run(args: DnsArgs, _config: &ProjectConfig) -> Result<()> {
             let provider = build_provider(provider).await?;
             let record = preview_record(&host, &parse_target(&target), ttl);
             provider.upsert(&record).await?;
-            println!(
-                "configured {} {} -> {}",
-                record.kind.as_str(),
-                record.name,
-                record.value
-            );
+            DnsOutput::Configured {
+                kind: record.kind.as_str().to_string(),
+                name: record.name,
+                value: record.value,
+            }
         }
         DnsCommand::ConfigureDomain {
             provider,
@@ -144,13 +187,12 @@ pub async fn run(args: DnsArgs, _config: &ProjectConfig) -> Result<()> {
             let provider = build_provider_opts(provider, proxied).await?;
             let record = domain_record(&host, &parse_target(&target), ttl);
             provider.upsert(&record).await?;
-            println!(
-                "pointed {} {} -> {}{}",
-                record.kind.as_str(),
-                record.name,
-                record.value,
-                if proxied { " (proxied)" } else { "" }
-            );
+            DnsOutput::Pointed {
+                kind: record.kind.as_str().to_string(),
+                name: record.name,
+                value: record.value,
+                proxied,
+            }
         }
         DnsCommand::Cert {
             provider,
@@ -170,10 +212,13 @@ pub async fn run(args: DnsArgs, _config: &ProjectConfig) -> Result<()> {
                 timeout: Duration::from_secs(120),
             };
             obtain_or_load(&wildcard, &base, provider.as_ref(), &cache).await?;
-            println!("certificate for {wildcard} ready under {}", cache.display());
+            DnsOutput::CertReady {
+                wildcard,
+                cache: cache.display().to_string(),
+            }
         }
-    }
-    Ok(())
+    };
+    Ok(out)
 }
 
 /// Cloudflare + wildcard + DNS-only preflight: check the zone's **Universal SSL** and
@@ -192,18 +237,18 @@ async fn cloudflare_wildcard_ssl_preflight(disable: bool) {
     };
     match cf.universal_ssl_enabled().await {
         Ok(true) if disable => match cf.set_universal_ssl(false).await {
-            Ok(()) => eprintln!(
+            Ok(()) => tracing::info!(
                 "cloudflare: disabled Universal SSL on this zone (DNS-only) — now re-trigger the \
                  wildcard cert so DNS-01 can validate, e.g. `fly certs remove '*.<domain>'` then \
                  `fly certs add '*.<domain>'`."
             ),
-            Err(e) => eprintln!(
+            Err(e) => tracing::warn!(
                 "cloudflare: could not disable Universal SSL ({e}) — the token needs `Zone.SSL \
                  and Certificates:Edit`. Disable it in the dashboard (SSL/TLS → Edge \
                  Certificates) or via `PATCH /zones/<id>/ssl/universal/settings {{\"enabled\":false}}`."
             ),
         },
-        Ok(true) => eprintln!(
+        Ok(true) => tracing::warn!(
             "cloudflare: WARNING — Universal SSL is ENABLED on this zone. A wildcard cert \
              validated over DNS-01 (e.g. a fly wildcard) can be blocked: Cloudflare's own \
              domain-control-validation TXT records at `_acme-challenge.<domain>` clobber the \
@@ -215,7 +260,7 @@ async fn cloudflare_wildcard_ssl_preflight(disable: bool) {
              wildcard cert. See the wildcard-domain runbook."
         ),
         Ok(false) => {} // Universal SSL off — no conflict.
-        Err(e) => eprintln!(
+        Err(e) => tracing::warn!(
             "cloudflare: could not check Universal SSL ({e}) — the record-upsert token may lack \
              `Zone.SSL and Certificates:Read`. If a wildcard cert won't validate (stuck \"Not \
              verified\"), an enabled Universal SSL is the likely cause; see the wildcard-domain \

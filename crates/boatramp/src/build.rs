@@ -43,6 +43,58 @@ pub enum Error {
 /// `build` module result; `Err` is [`Error`].
 type Result<T> = std::result::Result<T, Error>;
 
+/// The result of `boatramp build`: the external build command that ran.
+///
+/// `build` itself emits no human text — the build tool it shells out to prints its
+/// own output on the inherited stdio — so [`render_human`](crate::output::Rendered::render_human)
+/// writes nothing. JSON callers still get the command that was executed.
+#[derive(Debug, serde::Serialize)]
+pub struct BuildOutput {
+    /// The build command that was run (e.g. `npm run build`).
+    command: String,
+}
+
+impl crate::output::Rendered for BuildOutput {
+    fn render_human(&self, _w: &mut dyn std::io::Write) -> std::io::Result<()> {
+        // `build` historically printed nothing of its own; the build tool's output
+        // goes to the inherited stdio. Preserve that: no extra line.
+        Ok(())
+    }
+}
+
+/// The result of `boatramp validate`: a parsed-and-compile-checked `project.cfg`
+/// summary (the counts of each routing surface). Rendered by [`crate::output`].
+#[derive(Debug, serde::Serialize)]
+pub struct ValidateOutput {
+    /// The config file that was validated.
+    path: String,
+    redirects: usize,
+    rewrites: usize,
+    headers: usize,
+    handlers: usize,
+    consumers: usize,
+    crons: usize,
+    streams: usize,
+}
+
+impl crate::output::Rendered for ValidateOutput {
+    fn render_human(&self, w: &mut dyn std::io::Write) -> std::io::Result<()> {
+        writeln!(
+            w,
+            "{} ok — {} redirect(s), {} rewrite(s), {} header rule(s)",
+            self.path, self.redirects, self.rewrites, self.headers,
+        )?;
+        if self.handlers > 0 || self.consumers > 0 || self.crons > 0 || self.streams > 0 {
+            writeln!(
+                w,
+                "  {} handler(s), {} consumer(s), {} cron(s), {} stream(s)",
+                self.handlers, self.consumers, self.crons, self.streams,
+            )?;
+        }
+        Ok(())
+    }
+}
+
 /// Arguments for `boatramp build`.
 #[derive(Debug, clap::Args)]
 pub struct BuildArgs {
@@ -52,9 +104,10 @@ pub struct BuildArgs {
 }
 
 /// Entry point for `boatramp build`.
-pub async fn run(args: BuildArgs, config: &ProjectConfig) -> Result<()> {
+pub async fn run(args: BuildArgs, config: &ProjectConfig) -> Result<BuildOutput> {
     let command = resolve_command(args.command, config)?;
-    run_command(&command).await
+    run_command(&command).await?;
+    Ok(BuildOutput { command })
 }
 
 /// Determine which build command to run, preferring an explicit override.
@@ -74,7 +127,7 @@ pub struct ValidateArgs {
 
 /// Entry point for `boatramp validate`: parse and compile-check a `project.cfg`
 /// (its `routing` section).
-pub fn validate(args: ValidateArgs) -> Result<()> {
+pub fn validate(args: ValidateArgs) -> Result<ValidateOutput> {
     let text = std::fs::read_to_string(&args.path).map_err(|source| Error::Read {
         path: args.path.display().to_string(),
         source,
@@ -84,27 +137,16 @@ pub fn validate(args: ValidateArgs) -> Result<()> {
         source,
     })?;
     let config = &project.routing;
-    println!(
-        "{} ok — {} redirect(s), {} rewrite(s), {} header rule(s)",
-        args.path.display(),
-        config.redirects.len(),
-        config.rewrites.len(),
-        config.headers.len(),
-    );
-    if !config.handlers.is_empty()
-        || !config.consumers.is_empty()
-        || !config.crons.is_empty()
-        || !config.streams.is_empty()
-    {
-        println!(
-            "  {} handler(s), {} consumer(s), {} cron(s), {} stream(s)",
-            config.handlers.len(),
-            config.consumers.len(),
-            config.crons.len(),
-            config.streams.len(),
-        );
-    }
-    Ok(())
+    Ok(ValidateOutput {
+        path: args.path.display().to_string(),
+        redirects: config.redirects.len(),
+        rewrites: config.rewrites.len(),
+        headers: config.headers.len(),
+        handlers: config.handlers.len(),
+        consumers: config.consumers.len(),
+        crons: config.crons.len(),
+        streams: config.streams.len(),
+    })
 }
 
 /// Run `command` via the system shell, failing on a non-zero exit.

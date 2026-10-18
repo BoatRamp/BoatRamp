@@ -183,8 +183,77 @@ fn render_role(role: &GrantedRole) -> String {
     }
 }
 
+/// The result of a `token` subcommand, rendered by [`crate::output`].
+///
+/// A freshly-minted `token` (and, for `--pop`, the `holder_key`) is shown ONCE and is
+/// not recoverable — it is the data the user must capture, so it is both the human
+/// stdout line and a JSON field here. The id + "store it now" guidance that used to go
+/// to stderr are diagnostics and move to `tracing`.
+#[derive(Debug, serde::Serialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum TokenOutput {
+    /// `token create` — a freshly minted token (shown once).
+    Created { token: String, id: String },
+    /// `token create --pop` — a PoP-bound token plus its holder private key (both
+    /// shown once; both must be captured).
+    CreatedPop {
+        token: String,
+        holder_key: String,
+        id: String,
+    },
+    /// `token bootstrap` — the first token minted via the bootstrap secret (shown once).
+    Bootstrapped { token: String, id: String },
+    /// `token mint` — a token signed offline (shown once; unlisted but revocable).
+    Minted { token: String },
+    /// `token attenuate` — the narrowed credential.
+    Attenuated { credential: String },
+    /// `token ls` — issued tokens (value-free metadata).
+    List { tokens: Vec<TokenMeta> },
+    /// A token was revoked.
+    Revoked { id: String },
+}
+
+impl crate::output::Rendered for TokenOutput {
+    fn render_human(&self, w: &mut dyn std::io::Write) -> std::io::Result<()> {
+        match self {
+            Self::Created { token, .. } => writeln!(w, "{token}"),
+            Self::CreatedPop {
+                token, holder_key, ..
+            } => {
+                // Ready-to-export shell lines, byte-for-byte as before.
+                writeln!(w, "BOATRAMP_TOKEN={token}")?;
+                writeln!(w, "BOATRAMP_TOKEN_HOLDER_KEY={holder_key}")
+            }
+            Self::Bootstrapped { token, .. } => writeln!(w, "{token}"),
+            Self::Minted { token } => writeln!(w, "{token}"),
+            Self::Attenuated { credential } => writeln!(w, "{credential}"),
+            Self::List { tokens } => {
+                if tokens.is_empty() {
+                    return writeln!(w, "no tokens");
+                }
+                for token in tokens {
+                    let roles = token
+                        .roles
+                        .iter()
+                        .map(render_role)
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    let short = &token.revocation_id[..token.revocation_id.len().min(12)];
+                    let expiry = match token.expires_at {
+                        Some(t) => format!("  expires@{t}"),
+                        None => String::new(),
+                    };
+                    writeln!(w, "{short}  {}  [{roles}]{expiry}", token.label)?;
+                }
+                Ok(())
+            }
+            Self::Revoked { id } => writeln!(w, "revoked {id}"),
+        }
+    }
+}
+
 /// Entry point for `boatramp token`.
-pub async fn run(args: TokenArgs, config: &ProjectConfig) -> Result<()> {
+pub async fn run(args: TokenArgs, config: &ProjectConfig) -> Result<TokenOutput> {
     // Attenuation is fully offline — no server or root key needed. Handle it
     // before resolving the control-plane endpoint.
     if let TokenCommand::Attenuate {
@@ -261,20 +330,27 @@ pub async fn run(args: TokenArgs, config: &ProjectConfig) -> Result<()> {
                 .json()
                 .await?;
             if let Some(holder) = pop_holder {
-                // Print both secrets as ready-to-export shell lines (matching
-                // `auth init`), guidance to stderr.
-                println!("BOATRAMP_TOKEN={}", response.token);
-                println!("BOATRAMP_TOKEN_HOLDER_KEY={}", holder.private_hex());
-                eprintln!("id: {}", response.id);
-                eprintln!(
+                // Both secrets are the data to capture (human stdout + JSON fields);
+                // id + guidance are diagnostics (stderr → tracing).
+                let holder_key = holder.private_hex();
+                tracing::info!("id: {}", response.id);
+                tracing::info!(
                     "PoP-bound token. Also set BOATRAMP_POP_ORIGIN to the server's \
                      [serve] pop_origin so the client binds the right origin."
                 );
-                eprintln!("store both secrets now — they cannot be recovered");
+                tracing::warn!("store both secrets now — they cannot be recovered");
+                Ok(TokenOutput::CreatedPop {
+                    token: response.token,
+                    holder_key,
+                    id: response.id,
+                })
             } else {
-                println!("{}", response.token);
-                eprintln!("id: {}", response.id);
-                eprintln!("store the token now — it cannot be recovered");
+                tracing::info!("id: {}", response.id);
+                tracing::warn!("store the token now — it cannot be recovered");
+                Ok(TokenOutput::Created {
+                    token: response.token,
+                    id: response.id,
+                })
             }
         }
         TokenCommand::Attenuate { .. }
@@ -290,34 +366,16 @@ pub async fn run(args: TokenArgs, config: &ProjectConfig) -> Result<()> {
                 .error_for_status()?
                 .json()
                 .await?;
-            if tokens.is_empty() {
-                println!("no tokens");
-                return Ok(());
-            }
-            for token in tokens {
-                let roles = token
-                    .roles
-                    .iter()
-                    .map(render_role)
-                    .collect::<Vec<_>>()
-                    .join(",");
-                let short = &token.revocation_id[..token.revocation_id.len().min(12)];
-                let expiry = match token.expires_at {
-                    Some(t) => format!("  expires@{t}"),
-                    None => String::new(),
-                };
-                println!("{short}  {}  [{roles}]{expiry}", token.label);
-            }
+            Ok(TokenOutput::List { tokens })
         }
         TokenCommand::Rm { id } => {
             http.delete(format!("{server}/api/tokens/{id}"))
                 .send()
                 .await?
                 .error_for_status()?;
-            println!("revoked {id}");
+            Ok(TokenOutput::Revoked { id })
         }
     }
-    Ok(())
 }
 
 use boatramp_core::time::now_unix;
@@ -328,7 +386,7 @@ async fn mint_offline(
     ttl_secs: Option<u64>,
     holder_pub: Option<&str>,
     signer_config: &std::path::Path,
-) -> Result<()> {
+) -> Result<TokenOutput> {
     use boatramp_core::cose::{self, Claims};
     let parsed: Vec<boatramp_core::authz::GrantedRole> = roles
         .iter()
@@ -360,9 +418,8 @@ async fn mint_offline(
         None => cose::mint(&claims, &*signer).await,
     }
     .map_err(|e| Error::Delegation(e.to_string()))?;
-    println!("{token}");
-    eprintln!("minted offline — unlisted (no server record) but revocable by id");
-    Ok(())
+    tracing::info!("minted offline — unlisted (no server record) but revocable by id");
+    Ok(TokenOutput::Minted { token })
 }
 
 /// Resolve the offline-mint signer: `BOATRAMP_AUTH_ROOT_PRIVATE_KEY` (local) first,
@@ -405,7 +462,7 @@ async fn bootstrap(
     config: &ProjectConfig,
     roles: &[String],
     ttl_secs: Option<u64>,
-) -> Result<()> {
+) -> Result<TokenOutput> {
     let server = client::resolve_server(server, config)?;
     let secret = std::env::var("BOATRAMP_BOOTSTRAP_SECRET")
         .ok()
@@ -423,13 +480,15 @@ async fn bootstrap(
         .error_for_status()?
         .json()
         .await?;
-    println!("{}", response.token);
-    eprintln!("id: {}", response.id);
-    eprintln!(
+    tracing::info!("id: {}", response.id);
+    tracing::warn!(
         "store the token now — it cannot be recovered; then unset the bootstrap \
          secret on the server"
     );
-    Ok(())
+    Ok(TokenOutput::Bootstrapped {
+        token: response.token,
+        id: response.id,
+    })
 }
 
 /// `token attenuate`: sign a restrict-only delegation block offline and print the
@@ -441,7 +500,7 @@ async fn attenuate(
     read_only: bool,
     not_after: Option<u64>,
     next_holder_pub: Option<&str>,
-) -> Result<()> {
+) -> Result<TokenOutput> {
     use boatramp_core::cose::{self, Caveats, LocalSigner, TokenPublicKey};
 
     let signer = LocalSigner::from_private_hex(holder_key)
@@ -463,8 +522,9 @@ async fn attenuate(
     let narrowed = cose::attenuate(credential, &signer, &caveats, next.as_ref(), now)
         .await
         .map_err(|e| Error::Delegation(e.to_string()))?;
-    println!("{narrowed}");
-    Ok(())
+    Ok(TokenOutput::Attenuated {
+        credential: narrowed,
+    })
 }
 
 #[cfg(test)]

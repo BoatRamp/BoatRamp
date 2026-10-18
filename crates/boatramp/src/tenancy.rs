@@ -111,7 +111,7 @@ fn test_extract(
     template: Option<&str>,
     regex: Option<&str>,
     namespace: Option<&str>,
-) -> Result<()> {
+) -> Result<TenancyOutput> {
     use boatramp_core::claim_extract::{
         DeriveOutcome, derive_tenant, validate_extract, validate_namespace,
     };
@@ -132,25 +132,28 @@ fn test_extract(
     if let Some(ext) = &extract
         && let Err(e) = validate_extract(ext)
     {
-        println!("extract INVALID — apply would reject: {e}");
-        return Ok(());
+        return Ok(TenancyOutput::TestExtract {
+            message: format!("extract INVALID — apply would reject: {e}"),
+        });
     }
     if let Some(ns) = namespace
         && let Err(e) = validate_namespace(ns)
     {
-        println!("namespace INVALID — apply would reject: {e}");
-        return Ok(());
+        return Ok(TenancyOutput::TestExtract {
+            message: format!("namespace INVALID — apply would reject: {e}"),
+        });
     }
     // No transform ⇒ the verbatim path (the host injects the claim value unchanged, unscreened).
     if extract.is_none() && namespace.is_none() {
-        println!("no transform configured — tenant = {value:?} (verbatim)");
-        return Ok(());
+        return Ok(TenancyOutput::TestExtract {
+            message: format!("no transform configured — tenant = {value:?} (verbatim)"),
+        });
     }
     let claim = serde_json::Value::String(value.to_string());
-    match derive_tenant(extract.as_ref(), namespace, &claim) {
-        DeriveOutcome::Resolved(key) => println!("resolved tenant key: {key}"),
-        DeriveOutcome::ClaimNonString => println!("DENY: claim is not a string"),
-        DeriveOutcome::NoMatch { empty_capture } => println!(
+    let message = match derive_tenant(extract.as_ref(), namespace, &claim) {
+        DeriveOutcome::Resolved(key) => format!("resolved tenant key: {key}"),
+        DeriveOutcome::ClaimNonString => "DENY: claim is not a string".to_string(),
+        DeriveOutcome::NoMatch { empty_capture } => format!(
             "DENY: extraction did not match the value{}",
             if empty_capture {
                 " (matched, but captured the empty string)"
@@ -158,13 +161,74 @@ fn test_extract(
                 ""
             }
         ),
-        DeriveOutcome::KeyRejected(reason) => println!("DENY: derived key rejected — {reason}"),
+        DeriveOutcome::KeyRejected(reason) => format!("DENY: derived key rejected — {reason}"),
+    };
+    Ok(TenancyOutput::TestExtract { message })
+}
+
+/// The result of a `tenancy` subcommand, rendered by [`crate::output`].
+#[derive(Debug, serde::Serialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum TenancyOutput {
+    /// `tenancy show` — the project's current tenancy schema.
+    Show {
+        schema: boatramp_core::tenancy::TenancySchema,
+    },
+    /// A schema was applied; `write_global` lists the writable-unscoped tables
+    /// surfaced as the operator-trust residual (#503).
+    Applied {
+        project: String,
+        tables: usize,
+        write_global: Vec<String>,
+    },
+    /// The schema was cleared (reverted to legacy Uniform scoping).
+    Cleared { project: String },
+    /// `tenancy test-extract` — the local dry-run verdict (resolved key or the exact
+    /// deny/invalid diagnosis). Carried as the rendered line, which is this diagnostic's
+    /// whole payload.
+    TestExtract { message: String },
+}
+
+impl crate::output::Rendered for TenancyOutput {
+    fn render_human(&self, w: &mut dyn std::io::Write) -> std::io::Result<()> {
+        match self {
+            Self::Show { schema } => {
+                let rendered =
+                    serde_json::to_string_pretty(schema).map_err(std::io::Error::other)?;
+                writeln!(w, "{rendered}")
+            }
+            Self::Applied {
+                project,
+                tables,
+                write_global,
+            } => {
+                writeln!(
+                    w,
+                    "applied tenancy schema to project `{project}` ({tables} table(s))"
+                )?;
+                if !write_global.is_empty() {
+                    writeln!(
+                        w,
+                        "  write-global (writable, any scoped route may write UNSTAMPED — ensure these \
+                         are genuinely tenant-less): {}",
+                        write_global.join(", ")
+                    )?;
+                }
+                Ok(())
+            }
+            Self::Cleared { project } => {
+                writeln!(
+                    w,
+                    "cleared tenancy schema for project `{project}` (legacy Uniform scoping)"
+                )
+            }
+            Self::TestExtract { message } => writeln!(w, "{message}"),
+        }
     }
-    Ok(())
 }
 
 /// Entry point for `boatramp tenancy`.
-pub async fn run(args: TenancyArgs, config: &ProjectConfig) -> Result<()> {
+pub async fn run(args: TenancyArgs, config: &ProjectConfig) -> Result<TenancyOutput> {
     // `test-extract` is a LOCAL dry-run — handle it before touching the control plane.
     if let TenancyCommand::TestExtract {
         value,
@@ -187,8 +251,10 @@ pub async fn run(args: TenancyArgs, config: &ProjectConfig) -> Result<()> {
     match args.command {
         TenancyCommand::Show => {
             let schema = cp.get_project_tenancy().await?;
-            let rendered = serde_json::to_string_pretty(&schema).map_err(Error::Render)?;
-            println!("{rendered}");
+            // Surface a serialization failure up-front as `Error::Render` (unchanged error
+            // path); the human/JSON rendering then renders from the structured `schema`.
+            serde_json::to_string_pretty(&schema).map_err(Error::Render)?;
+            Ok(TenancyOutput::Show { schema })
         }
         TenancyCommand::Apply { file } => {
             let path = file.display().to_string();
@@ -202,44 +268,36 @@ pub async fn run(args: TenancyArgs, config: &ProjectConfig) -> Result<()> {
                     source,
                 })?;
             cp.put_project_tenancy(&schema).await?;
-            println!(
-                "applied tenancy schema to project `{project}` ({} table(s))",
-                schema.tables.len()
-            );
             // #503: surface the WRITE-GLOBAL tables so the operator sees exactly which shared tables
             // any scoped route may write UNSTAMPED — the irreducible operator-trust residual (the
             // host cannot verify a declared-global table is truly tenant-less; a misdeclaration lets
             // any granted route write across tenants).
-            let write_global: Vec<&String> = schema
+            let write_global: Vec<String> = schema
                 .tables
                 .iter()
-                .filter_map(|(name, scope)| {
+                .filter(|&(_name, scope)| {
                     matches!(
                         scope,
                         boatramp_core::tenancy::TableScope::Unscoped { writable: true }
                     )
-                    .then_some(name)
                 })
+                .map(|(name, _scope)| name.clone())
                 .collect();
-            if !write_global.is_empty() {
-                let names: Vec<&str> = write_global.iter().map(|s| s.as_str()).collect();
-                println!(
-                    "  write-global (writable, any scoped route may write UNSTAMPED — ensure these \
-                     are genuinely tenant-less): {}",
-                    names.join(", ")
-                );
-            }
+            Ok(TenancyOutput::Applied {
+                project,
+                tables: schema.tables.len(),
+                write_global,
+            })
         }
         TenancyCommand::Clear => {
             cp.clear_project_tenancy().await?;
-            println!("cleared tenancy schema for project `{project}` (legacy Uniform scoping)");
+            Ok(TenancyOutput::Cleared { project })
         }
         // Handled by the early-return local dry-run above (no control plane).
         TenancyCommand::TestExtract { .. } => {
             unreachable!("test-extract is handled before connect")
         }
     }
-    Ok(())
 }
 
 #[cfg(test)]

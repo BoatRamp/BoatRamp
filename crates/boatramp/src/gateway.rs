@@ -218,7 +218,36 @@ enum RouteCommand {
 }
 
 /// Entry point for `boatramp gateway`.
-pub async fn run(args: GatewayArgs, config: &ProjectConfig) -> Result<()> {
+/// The result of a `gateway` subcommand, rendered by [`crate::output`].
+#[derive(Debug, serde::Serialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum GatewayOutput {
+    /// `gateway ls` — the site's current gateway (upstreams + routes).
+    Show { gateway: GatewayConfig },
+    /// An upstream was created or replaced.
+    UpstreamSet { name: String },
+    /// An upstream (and any routes that referenced it) was removed.
+    UpstreamRemoved { name: String },
+    /// A route was added (any existing route with the same match was replaced).
+    RouteAdded { matches: String, upstream: String },
+    /// A route was removed.
+    RouteRemoved { matches: String },
+}
+
+impl crate::output::Rendered for GatewayOutput {
+    fn render_human(&self, w: &mut dyn std::io::Write) -> std::io::Result<()> {
+        match self {
+            Self::Show { gateway } => write_gateway(gateway, w),
+            Self::UpstreamSet { name } => writeln!(w, "upstream {name} set"),
+            Self::UpstreamRemoved { name } => writeln!(w, "upstream {name} removed"),
+            // The human line stays terse (unchanged); the match/upstream ride the JSON shape.
+            Self::RouteAdded { .. } => writeln!(w, "route added"),
+            Self::RouteRemoved { .. } => writeln!(w, "route removed"),
+        }
+    }
+}
+
+pub async fn run(args: GatewayArgs, config: &ProjectConfig) -> Result<GatewayOutput> {
     let (server, site) = client::resolve_target(args.server, args.site, config)?;
     let cp = client::ControlPlane::new(
         server,
@@ -230,10 +259,12 @@ pub async fn run(args: GatewayArgs, config: &ProjectConfig) -> Result<()> {
         .gateway
         .get_or_insert_with(GatewayConfig::default);
 
-    match args.command {
+    let out = match args.command {
         GatewayCommand::Ls => {
-            print_gateway(gateway);
-            return Ok(()); // read-only; no write-back
+            // Read-only; no write-back.
+            return Ok(GatewayOutput::Show {
+                gateway: gateway.clone(),
+            });
         }
         GatewayCommand::Upstream(UpstreamCommand::Add {
             name,
@@ -319,7 +350,7 @@ pub async fn run(args: GatewayArgs, config: &ProjectConfig) -> Result<()> {
                     ..Default::default()
                 },
             );
-            println!("upstream {name} set");
+            GatewayOutput::UpstreamSet { name }
         }
         GatewayCommand::Upstream(UpstreamCommand::Rm { name }) => {
             if gateway.upstreams.remove(&name).is_none() {
@@ -327,15 +358,19 @@ pub async fn run(args: GatewayArgs, config: &ProjectConfig) -> Result<()> {
             }
             // Drop routes that referenced it (now dangling).
             gateway.routes.retain(|r| r.upstream != name);
-            println!("upstream {name} removed");
+            GatewayOutput::UpstreamRemoved { name }
         }
         GatewayCommand::Route(RouteCommand::Add { matches, upstream }) => {
             if !gateway.upstreams.contains_key(&upstream) {
                 return Err(Error::UpstreamMissing(upstream));
             }
             gateway.routes.retain(|r| r.matches != matches);
+            let out = GatewayOutput::RouteAdded {
+                matches: matches.clone(),
+                upstream: upstream.clone(),
+            };
             gateway.routes.push(GatewayRoute { matches, upstream });
-            println!("route added");
+            out
         }
         GatewayCommand::Route(RouteCommand::Rm { matches }) => {
             let before = gateway.routes.len();
@@ -343,9 +378,9 @@ pub async fn run(args: GatewayArgs, config: &ProjectConfig) -> Result<()> {
             if gateway.routes.len() == before {
                 return Err(Error::NoRoute(matches));
             }
-            println!("route removed");
+            GatewayOutput::RouteRemoved { matches }
         }
-    }
+    };
 
     // Drop an empty gateway entirely so the site config stays clean.
     if site_config
@@ -356,15 +391,15 @@ pub async fn run(args: GatewayArgs, config: &ProjectConfig) -> Result<()> {
         site_config.gateway = None;
     }
     cp.put_site_config(&site, &site_config).await?;
-    Ok(())
+    Ok(out)
 }
 
-fn print_gateway(gateway: &GatewayConfig) {
+fn write_gateway(gateway: &GatewayConfig, w: &mut dyn std::io::Write) -> std::io::Result<()> {
     if gateway.upstreams.is_empty() && gateway.routes.is_empty() {
-        println!("no gateway configured");
-        return;
+        writeln!(w, "no gateway configured")?;
+        return Ok(());
     }
-    println!("upstreams:");
+    writeln!(w, "upstreams:")?;
     for (name, up) in &gateway.upstreams {
         let mut notes = Vec::new();
         if let Some(h) = &up.host_header {
@@ -405,10 +440,11 @@ fn print_gateway(gateway: &GatewayConfig) {
         } else {
             up.target.clone()
         };
-        println!("  {name} → {dest}{suffix}");
+        writeln!(w, "  {name} → {dest}{suffix}")?;
     }
-    println!("routes:");
+    writeln!(w, "routes:")?;
     for route in &gateway.routes {
-        println!("  {} → {}", route.matches, route.upstream);
+        writeln!(w, "  {} → {}", route.matches, route.upstream)?;
     }
+    Ok(())
 }

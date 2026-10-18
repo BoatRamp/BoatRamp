@@ -4,12 +4,11 @@
 //! server (no `Server:` header, no public `/version`), so the remote query uses the client's
 //! control-plane token exactly like every other control-plane verb.
 //!
-//! This is distinct from clap's built-in `boatramp --version` flag: the subcommand adds `--json`
-//! and the `--server`/`--remote` remote read (answering "which build is ACTUALLY deployed?", which
-//! the local flag can't).
+//! This is distinct from clap's built-in `boatramp --version` flag: the subcommand adds the
+//! `--server`/`--remote` remote read (answering "which build is ACTUALLY deployed?", which the
+//! local flag can't), and honors the global `--output-format json`.
 
 use clap::Args;
-use serde_json::json;
 
 use crate::client;
 use crate::config::ProjectConfig;
@@ -24,6 +23,29 @@ pub enum Error {
 
 type Result<T> = std::result::Result<T, Error>;
 
+/// The result of `boatramp version`: the reported version, where it came from
+/// (`local` = this binary, `remote` = a running daemon), and — when remote — the
+/// server it was read from. Rendered by [`crate::output`].
+#[derive(Debug, serde::Serialize)]
+pub struct VersionOutput {
+    /// The boatramp version reported.
+    version: String,
+    /// `"local"` (this binary's own package version) or `"remote"` (a running daemon).
+    source: &'static str,
+    /// The daemon queried, when `source == "remote"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    server: Option<String>,
+}
+
+impl crate::output::Rendered for VersionOutput {
+    fn render_human(&self, w: &mut dyn std::io::Write) -> std::io::Result<()> {
+        match &self.server {
+            Some(server) => writeln!(w, "boatramp {} (server {server})", self.version),
+            None => writeln!(w, "boatramp {}", self.version),
+        }
+    }
+}
+
 /// Arguments for `boatramp version`.
 #[derive(Debug, Args)]
 pub struct VersionArgs {
@@ -36,25 +58,20 @@ pub struct VersionArgs {
     /// `--server` without retyping the URL. Ignored when `--server` is given.
     #[arg(long)]
     remote: bool,
-
-    /// Emit a JSON object (`{version, source[, server]}`) instead of a human line.
-    #[arg(long)]
-    json: bool,
 }
 
 /// Entry point for `boatramp version`. Local unless `--server`/`--remote` selects a running daemon.
-pub async fn run(args: VersionArgs, config: &ProjectConfig) -> Result<()> {
+pub async fn run(args: VersionArgs, config: &ProjectConfig) -> Result<VersionOutput> {
     let go_remote = args.server.is_some() || args.remote;
     if !go_remote {
         // LOCAL: this binary's own package version — no server, no token, no network. `CARGO_PKG_VERSION`
         // is the workspace version every crate shares, so it IS the boatramp release.
         let version = env!("CARGO_PKG_VERSION");
-        if args.json {
-            println!("{}", json!({ "version": version, "source": "local" }));
-        } else {
-            println!("boatramp {version}");
-        }
-        return Ok(());
+        return Ok(VersionOutput {
+            version: version.to_string(),
+            source: "local",
+            server: None,
+        });
     }
 
     // REMOTE: ask the running daemon which build it is (`GET /api/version`, `system·read`). The URL
@@ -66,13 +83,9 @@ pub async fn run(args: VersionArgs, config: &ProjectConfig) -> Result<()> {
         client::resolve_project(config),
     );
     let info = cp.node_version().await?;
-    if args.json {
-        println!(
-            "{}",
-            json!({ "version": info.version, "source": "remote", "server": server })
-        );
-    } else {
-        println!("boatramp {} (server {server})", info.version);
-    }
-    Ok(())
+    Ok(VersionOutput {
+        version: info.version,
+        source: "remote",
+        server: Some(server),
+    })
 }

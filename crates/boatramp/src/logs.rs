@@ -77,8 +77,34 @@ async fn fetch(
     })
 }
 
+/// The result of a bounded `boatramp logs` tail: the captured guest log lines (DATA).
+/// Reuses the wire [`client::LogsResponse`] (`{entries, dropped}`) so a JSON consumer
+/// reads the lines structurally.
+///
+/// The `--follow` mode is an *unbounded* streaming tail and does not produce this value:
+/// it renders lines to stdout as they arrive (see [`run`]).
+#[derive(Debug, serde::Serialize)]
+#[serde(transparent)]
+pub struct LogsOutput {
+    response: client::LogsResponse,
+}
+
+impl crate::output::Rendered for LogsOutput {
+    fn render_human(&self, w: &mut dyn std::io::Write) -> std::io::Result<()> {
+        for entry in &self.response.entries {
+            writeln!(w, "[{}] {}", entry.stream, entry.line)?;
+        }
+        Ok(())
+    }
+}
+
 /// Entry point for `boatramp logs`.
-pub async fn run(args: LogsArgs, config: &ProjectConfig) -> Result<()> {
+///
+/// A bounded tail (no `--follow`) returns the fetched lines as the typed result, which
+/// [`crate::output`] renders once. `--follow` is a continuous streaming-DATA case that the
+/// single-`emit` result model does not fit, so that branch renders lines to stdout directly
+/// as they arrive and never returns `Ok` (it loops until interrupted or a fetch errors).
+pub async fn run(args: LogsArgs, config: &ProjectConfig) -> Result<LogsOutput> {
     let stream = args.stream.as_deref();
     let http = client::http_client(client::token(config).as_deref());
     let project = client::resolve_project(config);
@@ -101,22 +127,33 @@ pub async fn run(args: LogsArgs, config: &ProjectConfig) -> Result<()> {
 
     // Initial fetch: the most recent `limit` lines.
     let first = fetch(&cp, &target, args.limit, 0, stream).await?;
+
+    if !args.follow {
+        // Bounded tail: the lines ARE the result. The rate-cap drop notice is a
+        // diagnostic (was stderr) → tracing; the count also rides the JSON shape.
+        if first.dropped > 0 {
+            tracing::warn!(
+                "(\u{2026} {} line(s) dropped by the rate cap)",
+                first.dropped
+            );
+        }
+        return Ok(LogsOutput { response: first });
+    }
+
+    // Follow: an unbounded streaming tail. Render lines to stdout as they arrive (the
+    // single-`emit` model does not fit a never-ending stream) and never return `Ok`.
     let mut cursor = first.entries.last().map(|e| e.seq).unwrap_or(0);
     for entry in &first.entries {
         print_line(entry);
     }
     if first.dropped > 0 {
-        eprintln!(
+        tracing::warn!(
             "(\u{2026} {} line(s) dropped by the rate cap)",
             first.dropped
         );
     }
-    if !args.follow {
-        return Ok(());
-    }
-
-    // Follow: poll for lines newer than the cursor (a stable monotonic seq, so
-    // no duplicates and no gaps across polls).
+    // Poll for lines newer than the cursor (a stable monotonic seq, so no duplicates
+    // and no gaps across polls).
     loop {
         tokio::time::sleep(Duration::from_secs(1)).await;
         let next = fetch(&cp, &target, args.limit.max(1000), cursor, stream).await?;
@@ -151,10 +188,29 @@ pub struct StatsArgs {
     instances: bool,
 }
 
+/// The result of `boatramp stats`: the stats document (DATA). Serializes transparently as
+/// the stats object itself, so a JSON consumer reads it unwrapped; the human view is the same
+/// pretty-printed JSON the command historically emitted.
+#[derive(Debug, serde::Serialize)]
+#[serde(transparent)]
+pub struct StatsOutput {
+    stats: serde_json::Value,
+}
+
+impl crate::output::Rendered for StatsOutput {
+    fn render_human(&self, w: &mut dyn std::io::Write) -> std::io::Result<()> {
+        writeln!(
+            w,
+            "{}",
+            serde_json::to_string_pretty(&self.stats).map_err(std::io::Error::other)?
+        )
+    }
+}
+
 /// Entry point for `boatramp stats`: a site's operator handler stats —
 /// per-`(trigger, route)` invocation counters, consumer backlog/dead-letters, and live stream
 /// connections — OR, with `--instances`, the node-global wasm instance-lifecycle + memory stats.
-pub async fn stats(args: StatsArgs, config: &ProjectConfig) -> Result<()> {
+pub async fn stats(args: StatsArgs, config: &ProjectConfig) -> Result<StatsOutput> {
     // The instance stats are node-global, so they need only a server + token, not a resolved site.
     if args.instances {
         let server = client::resolve_server(args.server, config)?;
@@ -164,8 +220,7 @@ pub async fn stats(args: StatsArgs, config: &ProjectConfig) -> Result<()> {
             client::resolve_project(config),
         );
         let stats = cp.fetch_instance_stats().await?;
-        println!("{}", serde_json::to_string_pretty(&stats)?);
-        return Ok(());
+        return Ok(StatsOutput { stats });
     }
     let (server, site) = client::resolve_target(args.server, args.site, config)?;
     let cp = client::ControlPlane::new(
@@ -174,6 +229,5 @@ pub async fn stats(args: StatsArgs, config: &ProjectConfig) -> Result<()> {
         client::resolve_project(config),
     );
     let stats = cp.fetch_handler_stats(&site).await?;
-    println!("{}", serde_json::to_string_pretty(&stats)?);
-    Ok(())
+    Ok(StatsOutput { stats })
 }

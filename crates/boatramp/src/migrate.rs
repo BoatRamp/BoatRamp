@@ -102,8 +102,98 @@ pub struct MigrateArgs {
     node_config: PathBuf,
 }
 
+/// The result of a `boatramp migrate` run, rendered by [`crate::output`].
+///
+/// The `--interactive` flow prints its plan + decision prompts live (it is an
+/// interactive stdin/stdout session); the terminal verdict it ends on is the typed
+/// result here, rendered once by `output::emit`.
+#[derive(Debug, serde::Serialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum MigrateOutput {
+    /// `--abort` rolled the staged migration back; `status` is the store's resulting layout.
+    Aborted { status: Status },
+    /// A non-interactive pass (forward / `--dry-run` / `--stage` / `--finalize`): the report.
+    Report {
+        report: MigrationReport,
+        dry_run: bool,
+    },
+    /// `-i`: the store is already at the current layout — nothing to do.
+    InteractiveReady,
+    /// `-i`: the store is already staged (dual soak).
+    InteractiveAlreadyStaged,
+    /// `-i`: the operator chose to abort at a decision prompt.
+    InteractiveAbortedAtDecision,
+    /// `-i`: out-of-band steps must be resolved first, then the plan re-run.
+    InteractivePendingExternal { steps: Vec<String> },
+    /// `-i`: the operator declined the final stage confirmation.
+    InteractiveCancelled,
+    /// `-i`: the apply engine aborted (a precheck returned `Aborted`).
+    InteractiveAbortedDuringApply,
+    /// `-i`: staged into the dual soak; `report` is the staged pass.
+    InteractiveStaged { report: MigrationReport },
+}
+
+impl crate::output::Rendered for MigrateOutput {
+    fn render_human(&self, w: &mut dyn std::io::Write) -> std::io::Result<()> {
+        match self {
+            Self::Aborted { status } => {
+                writeln!(
+                    w,
+                    "aborted the staged migration — the store is rolled back to its pre-migration layout \
+                     (old keys only); a prior binary can serve it, and `boatramp migrate` can re-stage it."
+                )?;
+                writeln!(w, "now: {}", describe(*status))
+            }
+            Self::Report { report, dry_run } => write_report(report, *dry_run, w),
+            Self::InteractiveReady => {
+                writeln!(
+                    w,
+                    "nothing to do: the store is already at the current layout."
+                )
+            }
+            Self::InteractiveAlreadyStaged => writeln!(
+                w,
+                "the store is already staged (dual soak). Re-home the blob + libsql substrates, then \
+                 `boatramp migrate --finalize` to complete it — or `boatramp migrate --abort` to roll \
+                 it back."
+            ),
+            Self::InteractiveAbortedAtDecision => {
+                writeln!(w, "\naborting the migration — nothing was changed.")
+            }
+            Self::InteractivePendingExternal { steps } => {
+                writeln!(
+                    w,
+                    "\nResolve these first (out of band), then re-run `boatramp migrate --interactive` (the \
+                     decision clears once the collision is gone):"
+                )?;
+                for step in steps {
+                    writeln!(w, "  • {step}")?;
+                }
+                Ok(())
+            }
+            Self::InteractiveCancelled => writeln!(w, "cancelled."),
+            Self::InteractiveAbortedDuringApply => {
+                writeln!(w, "aborted — nothing was changed.")
+            }
+            Self::InteractiveStaged { report } => {
+                write_report(report, false, w)?;
+                writeln!(
+                    w,
+                    "\nStaged into the dual soak. NEXT:\n  \
+                     1. RESTART the node so it adopts the new layout (a running daemon keeps serving the \
+                     OLD layout until restarted).\n  \
+                     2. Re-home the other substrates: `boatramp sql rehome-default` + `boatramp blob \
+                     rehome`.\n  \
+                     3. `boatramp migrate --finalize` to reclaim the old keys (gated until step 2).\n  \
+                     Reversible until finalize: `boatramp migrate --abort`."
+                )
+            }
+        }
+    }
+}
+
 /// Run the `migrate` command.
-pub async fn run(args: MigrateArgs, config: &ServerConfig) -> Result<(), Error> {
+pub async fn run(args: MigrateArgs, config: &ServerConfig) -> Result<MigrateOutput, Error> {
     let data_dir = args
         .data_dir
         .clone()
@@ -126,31 +216,29 @@ pub async fn run(args: MigrateArgs, config: &ServerConfig) -> Result<(), Error> 
     .await
     .map_err(|e| Box::new(crate::serve::Error::from(e)))?;
 
-    println!(
+    // Opening-status preamble: a diagnostic about the store being opened, not the
+    // command's result — it rides the `tracing` sink (stderr).
+    tracing::info!(
         "control-plane store ({:?} at {}): {}",
         args.kv,
         data_dir.display(),
         describe(migrate::status(kv.as_ref()).await?)
     );
 
-    // ABORT: roll a staged (dual-soak) migration back to the pre-migration layout. Prints what it did,
-    // flushes, and re-prints the resulting status.
+    // ABORT: roll a staged (dual-soak) migration back to the pre-migration layout. Flushes, then
+    // reports what it did plus the resulting status (both carried by the typed result).
     if args.abort {
         migrate::abort(kv.as_ref()).await?;
-        println!(
-            "aborted the staged migration — the store is rolled back to its pre-migration layout \
-             (old keys only); a prior binary can serve it, and `boatramp migrate` can re-stage it."
-        );
         kv.flush().await.map_err(|e| Error::Flush(e.to_string()))?;
-        println!("now: {}", describe(migrate::status(kv.as_ref()).await?));
-        return Ok(());
+        let status = migrate::status(kv.as_ref()).await?;
+        return Ok(MigrateOutput::Aborted { status });
     }
 
     // INTERACTIVE: the question-driven flow (plan → prompt decisions → stage honoring the answers).
     if args.interactive {
-        interactive_migrate(kv.as_ref()).await?;
+        let out = interactive_migrate(kv.as_ref()).await?;
         kv.flush().await.map_err(|e| Error::Flush(e.to_string()))?;
-        return Ok(());
+        return Ok(out);
     }
 
     let report = if args.finalize {
@@ -176,14 +264,15 @@ pub async fn run(args: MigrateArgs, config: &ServerConfig) -> Result<(), Error> 
         .await?
     };
 
-    print_report(&report, args.dry_run);
-
     // Force the migration durable (SlateDB flushes on a timer otherwise) before we
     // exit, so a `serve` started right after sees the completed layout.
     if !args.dry_run {
         kv.flush().await.map_err(|e| Error::Flush(e.to_string()))?;
     }
-    Ok(())
+    Ok(MigrateOutput::Report {
+        report,
+        dry_run: args.dry_run,
+    })
 }
 
 /// The interactive (question-driven) migration flow: show the plan, prompt the operator at each
@@ -191,24 +280,21 @@ pub async fn run(args: MigrateArgs, config: &ServerConfig) -> Result<(), Error> 
 /// of the interactive migration — it drives the SAME `migrate::plan` + `migrate_with_answers` engine
 /// the console wizard uses, so the two surfaces can never diverge. Thin stdin/stdout glue; the engine
 /// logic (skip/abort/refuse) is unit-tested in `boatramp-core`.
-async fn interactive_migrate(kv: &dyn boatramp_core::kv::KvStore) -> Result<(), Error> {
+async fn interactive_migrate(kv: &dyn boatramp_core::kv::KvStore) -> Result<MigrateOutput, Error> {
     let plan = migrate::plan(kv, None).await?; // offline CLI: no blob scanner (see the stage path above)
     match plan.status {
         Status::Ready => {
-            println!("nothing to do: the store is already at the current layout.");
-            return Ok(());
+            return Ok(MigrateOutput::InteractiveReady);
         }
         Status::Dual => {
-            println!(
-                "the store is already staged (dual soak). Re-home the blob + libsql substrates, then \
-                 `boatramp migrate --finalize` to complete it — or `boatramp migrate --abort` to roll \
-                 it back."
-            );
-            return Ok(());
+            return Ok(MigrateOutput::InteractiveAlreadyStaged);
         }
         Status::NeedsMigration => {}
     }
 
+    // The plan + decision prompts below are printed live: this is an interactive
+    // stdin/stdout session, so the operator must see them before answering. The
+    // terminal verdict the flow ends on is the typed `MigrateOutput` returned here.
     println!("\nMigration plan:");
     for line in &plan.summary {
         println!("  • {line}");
@@ -231,8 +317,7 @@ async fn interactive_migrate(kv: &dyn boatramp_core::kv::KvStore) -> Result<(), 
         }
         let chosen = prompt_route(d)?;
         if chosen.action == migrate::RouteAction::Abort {
-            println!("\naborting the migration — nothing was changed.");
-            return Ok(());
+            return Ok(MigrateOutput::InteractiveAbortedAtDecision);
         }
         // Collect the route's free-text input (e.g. a new name), if it asks for one.
         let value = if let Some(input) = &chosen.input {
@@ -272,42 +357,26 @@ async fn interactive_migrate(kv: &dyn boatramp_core::kv::KvStore) -> Result<(), 
         }
     }
 
-    // Any out-of-band route must be done first (through the proven deploy path) BEFORE staging — print
-    // the guidance and stop; the operator re-runs once the collisions are gone.
+    // Any out-of-band route must be done first (through the proven deploy path) BEFORE staging —
+    // report the guidance and stop; the operator re-runs once the collisions are gone.
     if !pending_external.is_empty() {
-        println!(
-            "\nResolve these first (out of band), then re-run `boatramp migrate --interactive` (the \
-             decision clears once the collision is gone):"
-        );
-        for step in &pending_external {
-            println!("  • {step}");
-        }
-        return Ok(());
+        return Ok(MigrateOutput::InteractivePendingExternal {
+            steps: pending_external,
+        });
     }
 
     if !prompt_yes(
         "\nProceed to STAGE the re-home now (non-destructive; reversible with --abort)?",
     )? {
-        println!("cancelled.");
-        return Ok(());
+        return Ok(MigrateOutput::InteractiveCancelled);
     }
 
     match migrate::migrate_with_answers(kv, &answers, None).await? {
-        migrate::InteractiveOutcome::Aborted => println!("aborted — nothing was changed."),
+        migrate::InteractiveOutcome::Aborted => Ok(MigrateOutput::InteractiveAbortedDuringApply),
         migrate::InteractiveOutcome::Staged(report) => {
-            print_report(&report, false);
-            println!(
-                "\nStaged into the dual soak. NEXT:\n  \
-                 1. RESTART the node so it adopts the new layout (a running daemon keeps serving the \
-                 OLD layout until restarted).\n  \
-                 2. Re-home the other substrates: `boatramp sql rehome-default` + `boatramp blob \
-                 rehome`.\n  \
-                 3. `boatramp migrate --finalize` to reclaim the old keys (gated until step 2).\n  \
-                 Reversible until finalize: `boatramp migrate --abort`."
-            );
+            Ok(MigrateOutput::InteractiveStaged { report })
         }
     }
-    Ok(())
 }
 
 /// Prompt the operator to choose one of a decision's routes (by number or by key); re-prompts on an
@@ -409,40 +478,52 @@ fn describe(status: Status) -> &'static str {
     }
 }
 
-/// Print a human-readable summary of a migration pass.
-fn print_report(report: &MigrationReport, dry_run: bool) {
+/// Write a human-readable summary of a migration pass.
+fn write_report(
+    report: &MigrationReport,
+    dry_run: bool,
+    w: &mut dyn std::io::Write,
+) -> std::io::Result<()> {
     if report.already_migrated {
-        println!("nothing to do: the store is already fully migrated.");
-        return;
+        return writeln!(w, "nothing to do: the store is already fully migrated.");
     }
     let verb = if dry_run { "would re-key" } else { "re-keyed" };
     if report.rekeyed.is_empty() && report.values_rewritten.is_empty() {
-        println!("no layout-1 records found.");
+        writeln!(w, "no layout-1 records found.")?;
     }
     for (family, n) in &report.rekeyed {
-        println!("  {verb} {n} key(s) under {family}");
+        writeln!(w, "  {verb} {n} key(s) under {family}")?;
     }
     for (family, n) in &report.values_rewritten {
         let v = if dry_run { "would rewrite" } else { "rewrote" };
-        println!("  {v} {n} {family} index value(s) to the (project, site) form");
+        writeln!(
+            w,
+            "  {v} {n} {family} index value(s) to the (project, site) form"
+        )?;
     }
     if report.created_default_project {
         let v = if dry_run { "would create" } else { "created" };
-        println!("  {v} the `default` project");
+        writeln!(w, "  {v} the `default` project")?;
     }
     if report.owner_entries > 0 {
-        println!(
+        writeln!(
+            w,
             "  built {} owner reverse-index entries",
             report.owner_entries
-        );
+        )?;
     }
     if dry_run {
-        println!("(dry run — nothing was written)");
+        writeln!(w, "(dry run — nothing was written)")?;
     } else if report.dual {
-        println!(
+        writeln!(
+            w,
             "staged to 2-dual — old keys kept; run `boatramp migrate --finalize` to reclaim them."
-        );
+        )?;
     } else {
-        println!("migration complete: store is at the project-scoped layout.");
+        writeln!(
+            w,
+            "migration complete: store is at the project-scoped layout."
+        )?;
     }
+    Ok(())
 }

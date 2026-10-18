@@ -183,8 +183,242 @@ fn parse_record_spec(raw: &str) -> Result<boatramp_core::record_verify::RecordSp
     Ok(spec)
 }
 
+/// One row of a `domain verify-records` report: the spec, its verdict, and the
+/// values actually observed. `found` carries the raw resolved values (JSON escapes
+/// control bytes safely); the human renderer sanitizes them for the terminal.
+#[derive(Debug, serde::Serialize)]
+pub struct RecordRow {
+    kind: String,
+    name: String,
+    value: String,
+    status: boatramp_core::record_verify::RecordState,
+    found: Vec<String>,
+}
+
+/// The verdict of the auto-continue check a self-serve HTTP `domain add` runs right
+/// after starting the challenge.
+#[derive(Debug, serde::Serialize)]
+#[serde(tag = "check", rename_all = "snake_case")]
+pub enum AddCheckOutcome {
+    /// Verified and attached in this `add`.
+    VerifiedAttached,
+    /// Verified; attach still pending (`domain verify` to attach).
+    VerifiedPending,
+    /// Not verified yet; `detail` explains why.
+    NotVerified { detail: String },
+    /// The host is not reachable here yet (a probe/transport error).
+    NotReachable,
+}
+
+/// The result of a `boatramp domain` subcommand, rendered by [`crate::output`].
+#[derive(Debug, serde::Serialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum DomainOutput {
+    /// `domain add --unverified`: the server's confirmation text (admin override).
+    AttachedUnverified { message: String },
+    /// `domain add`: ownership was already proven; `attached` says whether the host
+    /// is also attached now.
+    AlreadyVerified {
+        host: String,
+        site: String,
+        attached: bool,
+    },
+    /// `domain add`: a challenge was started. Carries the method + the instructions to
+    /// publish, and — when the `add` auto-continued (self-serve HTTP) — the check
+    /// verdict. `outcome: None` ⇒ a manual publish step remains (`--no-wait` or a DNS
+    /// challenge).
+    ChallengeStarted {
+        host: String,
+        site: String,
+        method: String,
+        instructions: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        outcome: Option<AddCheckOutcome>,
+    },
+    /// `domain add --provider`: the host was already verified before the dance started.
+    ProviderAlreadyVerified { host: String, site: String },
+    /// `domain add --provider`: the challenge published + resolved; `attached` says
+    /// whether it was also attached.
+    ProviderVerified {
+        host: String,
+        site: String,
+        attached: bool,
+    },
+    /// `domain verify`: the ownership check passed (attach follows on success).
+    Verified {
+        host: String,
+        site: String,
+        attached: bool,
+    },
+    /// `domain rm`: the host was detached from the site.
+    Detached { host: String, site: String },
+    /// `domain ls`: the site's attached hosts plus any pending verifications.
+    List {
+        site: String,
+        domains: boatramp_core::config::DomainConfig,
+        pending: Vec<boatramp_core::domain_verify::DomainVerification>,
+    },
+    /// `domain verify-records`: every record verified (a failing set prints the table
+    /// then returns `Err`, so this variant only ever carries a passing report).
+    Records {
+        host: String,
+        records: Vec<RecordRow>,
+        verified: bool,
+    },
+}
+
+/// Write the per-record verdict table of a `domain verify-records` report. Shared by
+/// the success renderer and the failure path (which prints it before failing).
+fn write_records_table(rows: &[RecordRow], w: &mut dyn std::io::Write) -> std::io::Result<()> {
+    use boatramp_core::record_verify::RecordState;
+    for row in rows {
+        let mark = match row.status {
+            RecordState::Ok => "ok",
+            RecordState::Mismatch => "MISMATCH",
+            RecordState::Missing => "MISSING",
+        };
+        let found = if row.found.is_empty() {
+            "(none)".to_string()
+        } else {
+            // Resolved record values are attacker-controllable (anyone who controls a
+            // queried zone can embed ESC/newline bytes in a TXT record), so escape
+            // control chars before printing them to the operator's terminal.
+            row.found
+                .iter()
+                .map(|v| sanitize_for_terminal(v))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        writeln!(
+            w,
+            "{mark}  {} {} = {}  [found: {found}]",
+            row.kind, row.name, row.value
+        )?;
+    }
+    Ok(())
+}
+
+impl crate::output::Rendered for DomainOutput {
+    fn render_human(&self, w: &mut dyn std::io::Write) -> std::io::Result<()> {
+        match self {
+            Self::AttachedUnverified { message } => write!(w, "{message}"),
+            Self::AlreadyVerified {
+                host,
+                site,
+                attached,
+            } => {
+                if *attached {
+                    writeln!(w, "{host} is already verified and attached to {site}")
+                } else {
+                    writeln!(w, "{host} is already verified for {site}")?;
+                    writeln!(w, "run `boatramp domain verify {host}` to attach it")
+                }
+            }
+            Self::ChallengeStarted {
+                host,
+                site,
+                method,
+                instructions,
+                outcome,
+            } => {
+                writeln!(w, "started {method} verification for {host}\n")?;
+                writeln!(w, "{instructions}")?;
+                match outcome {
+                    None => writeln!(w, "\nthen run `boatramp domain verify {host}`"),
+                    Some(AddCheckOutcome::VerifiedAttached) => {
+                        writeln!(w, "✓ verified {host} and attached it to {site}")
+                    }
+                    Some(AddCheckOutcome::VerifiedPending) => writeln!(
+                        w,
+                        "✓ verified {host}; run `boatramp domain verify {host}` to attach"
+                    ),
+                    Some(AddCheckOutcome::NotVerified { detail }) => {
+                        writeln!(w, "not verified yet ({detail})")?;
+                        writeln!(
+                            w,
+                            "complete the step above, then run `boatramp domain verify {host}`"
+                        )
+                    }
+                    Some(AddCheckOutcome::NotReachable) => {
+                        writeln!(w, "not reachable here yet")?;
+                        writeln!(
+                            w,
+                            "complete the step above, then run `boatramp domain verify {host}`"
+                        )
+                    }
+                }
+            }
+            Self::ProviderAlreadyVerified { host, site } => writeln!(
+                w,
+                "{host} is already verified for {site}; run `domain verify {host}` to attach"
+            ),
+            Self::ProviderVerified {
+                host,
+                site,
+                attached,
+            } => {
+                if *attached {
+                    writeln!(w, "verified {host} and attached it to {site}")
+                } else {
+                    writeln!(w, "verified {host} (run `domain verify {host}` to attach)")
+                }
+            }
+            Self::Verified {
+                host,
+                site,
+                attached,
+            } => {
+                if *attached {
+                    writeln!(w, "verified {host} and attached it to {site}")
+                } else {
+                    writeln!(w, "verified {host}")
+                }
+            }
+            Self::Detached { host, site } => writeln!(w, "detached {host} from {site}"),
+            Self::List {
+                site,
+                domains,
+                pending,
+            } => {
+                let mut any = false;
+                if let Some(primary) = &domains.primary {
+                    writeln!(w, "{primary}  (primary)")?;
+                    any = true;
+                }
+                for alias in &domains.aliases {
+                    writeln!(w, "{alias}")?;
+                    any = true;
+                }
+                for wildcard in &domains.wildcards {
+                    writeln!(w, "{wildcard}  (wildcard)")?;
+                    any = true;
+                }
+                if !any {
+                    writeln!(w, "no domains attached to {site}")?;
+                }
+                if !pending.is_empty() {
+                    writeln!(w, "\npending verification:")?;
+                    for v in pending {
+                        let state = if v.verified {
+                            "verified — run `domain verify` to attach"
+                        } else {
+                            "unverified"
+                        };
+                        writeln!(w, "  {}  ({}, {state})", v.host, v.method)?;
+                    }
+                }
+                Ok(())
+            }
+            Self::Records { host, records, .. } => {
+                write_records_table(records, w)?;
+                writeln!(w, "\nall {} record(s) verified for {host}", records.len())
+            }
+        }
+    }
+}
+
 /// Entry point for `boatramp domain`.
-pub async fn run(args: DomainArgs, config: &ProjectConfig) -> Result<()> {
+pub async fn run(args: DomainArgs, config: &ProjectConfig) -> Result<DomainOutput> {
     let (server, site) = client::resolve_target(args.server, args.site, config)?;
     let cp = client::ControlPlane::new(
         server,
@@ -203,9 +437,8 @@ pub async fn run(args: DomainArgs, config: &ProjectConfig) -> Result<()> {
         } => {
             // Admin override: attach without an ownership proof.
             if unverified {
-                let msg = cp.attach_domain_unverified(&site, &host).await?;
-                print!("{msg}");
-                return Ok(());
+                let message = cp.attach_domain_unverified(&site, &host).await?;
+                return Ok(DomainOutput::AttachedUnverified { message });
             }
             // A managed-DNS provider does the whole dance (publish TXT → poll →
             // attach) itself.
@@ -218,70 +451,69 @@ pub async fn run(args: DomainArgs, config: &ProjectConfig) -> Result<()> {
             if verification.verified {
                 // Ownership already proven earlier — (re)attach it now.
                 let result = cp.check_domain_verification(&site, &host).await?;
-                if result.attached {
-                    println!("{host} is already verified and attached to {site}");
-                } else {
-                    println!("{host} is already verified for {site}");
-                    println!("run `boatramp domain verify {host}` to attach it");
-                }
-                return Ok(());
+                return Ok(DomainOutput::AlreadyVerified {
+                    host,
+                    site,
+                    attached: result.attached,
+                });
             }
-            println!("started {} verification for {host}\n", verification.method);
-            println!("{}", verification.instructions());
+            let method = verification.method.to_string();
+            let instructions = verification.instructions();
 
             // Auto-continue only when there's no manual step left: an HTTP
             // challenge for a host that already resolves here is served by this
             // server, so a single `domain add` verifies + attaches. A DNS
             // challenge (or `--no-wait`) always has a manual publish step, so we
-            // stop after printing the instructions.
+            // stop after returning the instructions.
             let http_self_serve =
                 verification.method == boatramp_core::domain_verify::VerificationMethod::Http;
             if no_wait || !http_self_serve {
-                println!("\nthen run `boatramp domain verify {host}`");
-                return Ok(());
+                return Ok(DomainOutput::ChallengeStarted {
+                    host,
+                    site,
+                    method,
+                    instructions,
+                    outcome: None,
+                });
             }
-            println!("\nchecking whether {host} already resolves here…");
-            match cp.check_domain_verification(&site, &host).await {
-                Ok(result) if result.passed && result.attached => {
-                    println!("✓ verified {host} and attached it to {site}");
-                }
-                Ok(result) if result.passed => {
-                    println!("✓ verified {host}; run `boatramp domain verify {host}` to attach");
-                }
-                Ok(result) => {
-                    let detail = result
+            tracing::info!("checking whether {host} already resolves here…");
+            let outcome = match cp.check_domain_verification(&site, &host).await {
+                Ok(result) if result.passed && result.attached => AddCheckOutcome::VerifiedAttached,
+                Ok(result) if result.passed => AddCheckOutcome::VerifiedPending,
+                Ok(result) => AddCheckOutcome::NotVerified {
+                    detail: result
                         .detail
-                        .unwrap_or_else(|| "not reachable here yet".into());
-                    println!("not verified yet ({detail})");
-                    println!("complete the step above, then run `boatramp domain verify {host}`");
-                }
+                        .unwrap_or_else(|| "not reachable here yet".into()),
+                },
                 // A probe/transport error before the host is set up is expected —
                 // guide the operator on rather than failing the command.
-                Err(_) => {
-                    println!("not reachable here yet");
-                    println!("complete the step above, then run `boatramp domain verify {host}`");
-                }
-            }
-            Ok(())
+                Err(_) => AddCheckOutcome::NotReachable,
+            };
+            Ok(DomainOutput::ChallengeStarted {
+                host,
+                site,
+                method,
+                instructions,
+                outcome: Some(outcome),
+            })
         }
         DomainCommand::Verify { host } => {
             let result = cp.check_domain_verification(&site, &host).await?;
             if result.passed {
-                if result.attached {
-                    println!("verified {host} and attached it to {site}");
-                } else {
-                    println!("verified {host}");
-                }
+                Ok(DomainOutput::Verified {
+                    host,
+                    site,
+                    attached: result.attached,
+                })
             } else {
                 let detail = result
                     .detail
                     .unwrap_or_else(|| "challenge not satisfied yet".into());
-                return Err(Error::VerificationFailed {
+                Err(Error::VerificationFailed {
                     detail,
                     instructions: result.verification.instructions(),
-                });
+                })
             }
-            Ok(())
         }
         DomainCommand::Rm { host } => {
             let mut site_config = cp.fetch_site_config(&site).await?;
@@ -293,8 +525,7 @@ pub async fn run(args: DomainArgs, config: &ProjectConfig) -> Result<()> {
             domains.wildcards.retain(|wildcard| wildcard != &host);
             cp.put_site_config(&site, &site_config).await?;
             cp.remove_domain_verification(&site, &host).await?;
-            println!("detached {host} from {site}");
-            Ok(())
+            Ok(DomainOutput::Detached { host, site })
         }
         DomainCommand::VerifyRecords { host, records } => {
             let specs = records
@@ -302,35 +533,31 @@ pub async fn run(args: DomainArgs, config: &ProjectConfig) -> Result<()> {
                 .map(|r| parse_record_spec(r))
                 .collect::<Result<Vec<_>>>()?;
             let report = cp.verify_records(&site, &host, &specs).await?;
-            for (spec, status) in specs.iter().zip(report.records.iter()) {
-                let mark = match status.status {
-                    boatramp_core::record_verify::RecordState::Ok => "ok",
-                    boatramp_core::record_verify::RecordState::Mismatch => "MISMATCH",
-                    boatramp_core::record_verify::RecordState::Missing => "MISSING",
-                };
-                let found = if status.found.is_empty() {
-                    "(none)".to_string()
-                } else {
-                    // Resolved record values are attacker-controllable (anyone who
-                    // controls a queried zone can embed ESC/newline bytes in a TXT
-                    // record), so escape control chars before printing them to the
-                    // operator's terminal — no terminal-escape / log-spoofing.
-                    status
-                        .found
-                        .iter()
-                        .map(|v| sanitize_for_terminal(v))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                };
-                println!(
-                    "{mark}  {} {} = {}  [found: {found}]",
-                    spec.kind, spec.name, spec.value
-                );
-            }
+            let rows: Vec<RecordRow> = specs
+                .iter()
+                .zip(report.records.iter())
+                .map(|(spec, status)| RecordRow {
+                    kind: spec.kind.to_string(),
+                    name: spec.name.clone(),
+                    value: spec.value.clone(),
+                    status: status.status,
+                    found: status.found.clone(),
+                })
+                .collect();
             if report.verified {
-                println!("\nall {} record(s) verified for {host}", specs.len());
-                Ok(())
+                Ok(DomainOutput::Records {
+                    host,
+                    records: rows,
+                    verified: true,
+                })
             } else {
+                // The per-record table is shown on the failure path too (so the
+                // operator sees which records failed), then the command fails
+                // non-zero. This detail rides the error path, not `output::emit`.
+                use std::io::Write as _;
+                let mut out = std::io::stdout().lock();
+                let _ = write_records_table(&rows, &mut out);
+                let _ = out.flush();
                 Err(Error::Verify(format!(
                     "one or more records did not verify for {host}"
                 )))
@@ -349,7 +576,7 @@ async fn add_via_provider(
     site: &str,
     host: &str,
     provider: Option<&str>,
-) -> Result<()> {
+) -> Result<DomainOutput> {
     use std::time::Duration;
 
     use boatramp_acme::{DnsRecord, RecordKind};
@@ -367,8 +594,10 @@ async fn add_via_provider(
         .start_domain_verification(site, host, Some("dns"))
         .await?;
     if verification.verified {
-        println!("{host} is already verified for {site}; run `domain verify {host}` to attach");
-        return Ok(());
+        return Ok(DomainOutput::ProviderAlreadyVerified {
+            host: host.to_string(),
+            site: site.to_string(),
+        });
     }
 
     let provider = build_provider(kind).await?;
@@ -379,7 +608,7 @@ async fn add_via_provider(
         ttl: 60,
     };
     provider.upsert(&record).await?;
-    println!(
+    tracing::info!(
         "published {} TXT for {host}; waiting for it to resolve...",
         verification.dns_record_name()
     );
@@ -390,14 +619,13 @@ async fn add_via_provider(
     for attempt in 1..=ATTEMPTS {
         let result = cp.check_domain_verification(site, host).await?;
         if result.passed {
-            if result.attached {
-                println!("verified {host} and attached it to {site}");
-            } else {
-                println!("verified {host} (run `domain verify {host}` to attach)");
-            }
             // Ownership is recorded server-side now; retract the challenge TXT.
             let _ = provider.delete(&record).await;
-            return Ok(());
+            return Ok(DomainOutput::ProviderVerified {
+                host: host.to_string(),
+                site: site.to_string(),
+                attached: result.attached,
+            });
         }
         if attempt < ATTEMPTS {
             tokio::time::sleep(Duration::from_secs(EVERY_SECS)).await;
@@ -420,32 +648,16 @@ async fn add_via_provider(
     _site: &str,
     _host: &str,
     _provider: Option<&str>,
-) -> Result<()> {
+) -> Result<DomainOutput> {
     Err(Error::Verify(
         "`--provider` requires a build with `--features acme-dns`".into(),
     ))
 }
 
 /// List attached hostnames plus any started-but-not-yet-attached verifications.
-async fn ls(cp: &crate::client::ControlPlane, site: &str) -> Result<()> {
+async fn ls(cp: &crate::client::ControlPlane, site: &str) -> Result<DomainOutput> {
     let site_config = cp.fetch_site_config(site).await?;
-    let domains = &site_config.domains;
-    let mut any = false;
-    if let Some(primary) = &domains.primary {
-        println!("{primary}  (primary)");
-        any = true;
-    }
-    for alias in &domains.aliases {
-        println!("{alias}");
-        any = true;
-    }
-    for wildcard in &domains.wildcards {
-        println!("{wildcard}  (wildcard)");
-        any = true;
-    }
-    if !any {
-        println!("no domains attached to {site}");
-    }
+    let domains = site_config.domains.clone();
 
     // Surface challenges that have been started but whose host isn't attached
     // yet (unverified, or verified-but-detached) so the operator knows what's
@@ -462,18 +674,11 @@ async fn ls(cp: &crate::client::ControlPlane, site: &str) -> Result<()> {
         .into_iter()
         .filter(|v| !attached.contains(&v.host))
         .collect();
-    if !pending.is_empty() {
-        println!("\npending verification:");
-        for v in pending {
-            let state = if v.verified {
-                "verified — run `domain verify` to attach"
-            } else {
-                "unverified"
-            };
-            println!("  {}  ({}, {state})", v.host, v.method);
-        }
-    }
-    Ok(())
+    Ok(DomainOutput::List {
+        site: site.to_string(),
+        domains,
+        pending,
+    })
 }
 
 #[cfg(test)]

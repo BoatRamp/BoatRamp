@@ -288,9 +288,6 @@ enum ComputeCommand {
     Status {
         /// Show only this workload's replicas (default: every workload).
         workload: Option<String>,
-        /// Output format.
-        #[arg(long, value_enum, default_value_t = StatusFormat::Table)]
-        format: StatusFormat,
     },
     /// Force one replica's stored health flag — the escape hatch when a recovered
     /// replica is stuck `healthy=false` and the endpoint resolver therefore won't serve
@@ -360,15 +357,6 @@ enum DnsCommand {
     },
 }
 
-/// Output format for `compute status`.
-#[derive(Debug, Clone, Copy, clap::ValueEnum)]
-enum StatusFormat {
-    /// A plain text table.
-    Table,
-    /// The raw JSON array of replica views.
-    Json,
-}
-
 /// `boatramp compute volume …` — persistent-volume management.
 #[derive(Debug, Subcommand)]
 enum VolumeCommand {
@@ -427,8 +415,316 @@ struct PutComputeRequest {
     placement: PlacementConstraints,
 }
 
+/// The result of a `boatramp compute` subcommand, rendered by [`crate::output`].
+///
+/// Each variant carries the facts a JSON consumer reads; [`render_human`](crate::output::Rendered::render_human)
+/// reproduces the text the command historically printed (including the list/status tables). `compute
+/// get` renders its workload as pretty JSON (its historical human view); `--output-format json`
+/// renders the typed shape below for every subcommand.
+///
+/// `compute exec` is a raw stdout/stderr passthrough with exit-code mirroring and does NOT appear
+/// here — see the `Exec` arm of [`run`].
+#[derive(Debug, Serialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum ComputeOutput {
+    /// `compute ls` — the workloads (as returned by the control plane).
+    Ls { workloads: Vec<serde_json::Value> },
+    /// `compute get` — one workload's desired state.
+    Get { workload: serde_json::Value },
+    /// `compute set` — the workload was created/updated.
+    Set { name: String, spec: String },
+    /// `compute build` — the rootfs was built, uploaded, and the workload set.
+    Build { name: String, spec: String },
+    /// `compute rm` — the workload was removed.
+    Rm { name: String },
+    /// `compute bind-blob` — the injected blob-shim env (as `K=V` pairs).
+    BindBlob {
+        /// Whether `--export` was requested (prefixes each human line with `export `).
+        #[serde(skip)]
+        export: bool,
+        /// The env pairs to inject.
+        env: Vec<(String, String)>,
+    },
+    /// `compute volume ls` — the persistent volumes.
+    VolumeLs { volumes: Vec<serde_json::Value> },
+    /// `compute volume rm` — the volume was removed.
+    VolumeRm { name: String },
+    /// `compute status` — observed per-replica runtime state. The human view is a table;
+    /// `--output-format json` serializes `states` structurally.
+    Status {
+        /// The replica views (optionally filtered to one workload).
+        states: Vec<serde_json::Value>,
+    },
+    /// `compute set-health` — a replica's stored health flag was forced.
+    SetHealth {
+        project: String,
+        workload: String,
+        replica: u64,
+        healthy: bool,
+    },
+    /// `compute ip ls` — the IP-plane assignments, with duplicate collisions flagged.
+    IpLs {
+        assignments: Vec<serde_json::Value>,
+        duplicates: Vec<String>,
+    },
+    /// `compute reconcile` — a convergence pass was requested.
+    Reconcile,
+    /// `compute restart` — a replica was stopped for the reconcile loop to relaunch.
+    Restart { workload: String, replica: u32 },
+    /// `compute dns ls` — the internal name → healthy-replica-IP map.
+    DnsLs { entries: Vec<serde_json::Value> },
+    /// `compute dns resolve` — one workload's internal name resolution.
+    DnsResolve { name: String, addrs: Vec<String> },
+    /// `compute netdiag` — active per-replica TCP reachability probe results.
+    Netdiag {
+        workload: String,
+        replicas: Vec<serde_json::Value>,
+    },
+}
+
+impl crate::output::Rendered for ComputeOutput {
+    fn render_human(&self, w: &mut dyn std::io::Write) -> std::io::Result<()> {
+        match self {
+            Self::Ls { workloads } => write_ls(workloads, w),
+            Self::Get { workload } => writeln!(
+                w,
+                "{}",
+                serde_json::to_string_pretty(workload).map_err(std::io::Error::other)?
+            ),
+            Self::Set { name, spec } => writeln!(w, "workload {name} set (spec {spec})"),
+            Self::Build { name, spec } => {
+                writeln!(w, "workload {name} built + set (spec {spec})")
+            }
+            Self::Rm { name } => writeln!(w, "removed {name}"),
+            Self::BindBlob { export, env } => {
+                let prefix = if *export { "export " } else { "" };
+                for (k, v) in env {
+                    writeln!(w, "{prefix}{k}={v}")?;
+                }
+                Ok(())
+            }
+            Self::VolumeLs { volumes } => write_volume_ls(volumes, w),
+            Self::VolumeRm { name } => writeln!(w, "removed {name}"),
+            Self::Status { states } => write_status(states, w),
+            Self::SetHealth {
+                project,
+                workload,
+                replica,
+                healthy,
+            } => writeln!(
+                w,
+                "set {project}/{workload} replica {replica} healthy={healthy}"
+            ),
+            Self::IpLs {
+                assignments,
+                duplicates,
+            } => write_ip_ls(assignments, duplicates, w),
+            Self::Reconcile => writeln!(
+                w,
+                "reconcile pass requested; run `boatramp compute status` for the result"
+            ),
+            Self::Restart { workload, replica } => {
+                writeln!(
+                    w,
+                    "restarted {workload} replica {replica}; reconcile will relaunch it"
+                )
+            }
+            Self::DnsLs { entries } => write_dns_ls(entries, w),
+            Self::DnsResolve { name, addrs } => {
+                if addrs.is_empty() {
+                    writeln!(w, "{name} resolves to nothing (no healthy replica)")
+                } else {
+                    writeln!(w, "{name} -> {}", addrs.join(", "))
+                }
+            }
+            Self::Netdiag { workload, replicas } => write_netdiag(workload, replicas, w),
+        }
+    }
+}
+
+/// Render the `compute ls` listing.
+fn write_ls(workloads: &[serde_json::Value], w: &mut dyn std::io::Write) -> std::io::Result<()> {
+    if workloads.is_empty() {
+        return writeln!(w, "no workloads");
+    }
+    for wl in workloads {
+        let name = wl["name"].as_str().unwrap_or("?");
+        let replicas = wl["replicas"].as_u64().unwrap_or(0);
+        let active = wl["active"].as_str().unwrap_or("");
+        let short = &active[..active.len().min(12)];
+        writeln!(w, "{name}  replicas={replicas}  active={short}")?;
+    }
+    Ok(())
+}
+
+/// Render the `compute volume ls` table.
+fn write_volume_ls(
+    volumes: &[serde_json::Value],
+    w: &mut dyn std::io::Write,
+) -> std::io::Result<()> {
+    if volumes.is_empty() {
+        return writeln!(w, "no volumes");
+    }
+    let (name_h, size_h, in_use_h) = ("NAME", "SIZE", "IN-USE");
+    writeln!(w, "{name_h:<24}  {size_h:>12}  {in_use_h}")?;
+    for v in volumes {
+        let name = v["name"].as_str().unwrap_or("?");
+        let size = human_size(v["size_bytes"].as_u64().unwrap_or(0));
+        let in_use = if v["in_use"].as_bool().unwrap_or(false) {
+            "yes"
+        } else {
+            "no"
+        };
+        writeln!(w, "{name:<24}  {size:>12}  {in_use}")?;
+    }
+    Ok(())
+}
+
+/// Render the `compute status` table.
+fn write_status(states: &[serde_json::Value], w: &mut dyn std::io::Write) -> std::io::Result<()> {
+    if states.is_empty() {
+        return writeln!(w, "no replicas");
+    }
+    writeln!(
+        w,
+        "{:<28}  {:>3}  {:<7}  {:<21}  {:<7}  {:>6}  BACKEND",
+        "PROJECT/WORKLOAD", "REP", "HEALTHY", "ENDPOINT", "PHASE", "AGE"
+    )?;
+    for s in states {
+        let owner = format!(
+            "{}/{}",
+            s["project"].as_str().unwrap_or("?"),
+            s["workload"].as_str().unwrap_or("?")
+        );
+        let rep = s["replica"].as_u64().unwrap_or(0);
+        let healthy = if s["healthy"].as_bool().unwrap_or(false) {
+            "yes"
+        } else {
+            "NO"
+        };
+        let endpoint = format!(
+            "{}:{}",
+            s["host"].as_str().unwrap_or("?"),
+            s["port"].as_u64().unwrap_or(0)
+        );
+        let phase = s["phase"].as_str().unwrap_or("?");
+        let age = match s["age_secs"].as_u64() {
+            Some(a) => format!("{a}s"),
+            None => "-".to_string(),
+        };
+        let backend = s["backend"].as_str().unwrap_or("?");
+        writeln!(
+            w,
+            "{owner:<28}  {rep:>3}  {healthy:<7}  {endpoint:<21}  {phase:<7}  {age:>6}  {backend}"
+        )?;
+    }
+    Ok(())
+}
+
+/// Render the `compute ip ls` table, flagging duplicate-IP collisions.
+fn write_ip_ls(
+    assignments: &[serde_json::Value],
+    duplicates: &[String],
+    w: &mut dyn std::io::Write,
+) -> std::io::Result<()> {
+    if assignments.is_empty() {
+        return writeln!(w, "no IP assignments");
+    }
+    writeln!(w, "{:<16}  {:<30}  {:<7}  PHASE", "IP", "OWNER", "HEALTHY")?;
+    for a in assignments {
+        let ip = a["ip"].as_str().unwrap_or("?");
+        let owner = format!(
+            "{}/{}#{}",
+            a["project"].as_str().unwrap_or("?"),
+            a["workload"].as_str().unwrap_or("?"),
+            a["replica"].as_u64().unwrap_or(0)
+        );
+        let healthy = if a["healthy"].as_bool().unwrap_or(false) {
+            "yes"
+        } else {
+            "NO"
+        };
+        let phase = a["phase"].as_str().unwrap_or("?");
+        let flag = if duplicates.iter().any(|d| d == ip) {
+            "  <-- COLLISION"
+        } else {
+            ""
+        };
+        writeln!(w, "{ip:<16}  {owner:<30}  {healthy:<7}  {phase}{flag}")?;
+    }
+    if !duplicates.is_empty() {
+        writeln!(
+            w,
+            "\n{} duplicate IP(s) detected: {}",
+            duplicates.len(),
+            duplicates.join(", ")
+        )?;
+    }
+    Ok(())
+}
+
+/// Render the `compute dns ls` table.
+fn write_dns_ls(entries: &[serde_json::Value], w: &mut dyn std::io::Write) -> std::io::Result<()> {
+    if entries.is_empty() {
+        return writeln!(w, "no internal names");
+    }
+    writeln!(w, "{:<32}  {:>4}  HEALTHY ADDRS", "NAME", "REPS")?;
+    for e in entries {
+        let name = e["name"].as_str().unwrap_or("?");
+        let reps = e["replicas"].as_u64().unwrap_or(0);
+        let addrs: Vec<&str> = e["addrs"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+        let shown = if addrs.is_empty() {
+            "(none — unresolved)".to_string()
+        } else {
+            addrs.join(", ")
+        };
+        writeln!(w, "{name:<32}  {reps:>4}  {shown}")?;
+    }
+    Ok(())
+}
+
+/// Render the `compute netdiag` table.
+fn write_netdiag(
+    workload: &str,
+    replicas: &[serde_json::Value],
+    w: &mut dyn std::io::Write,
+) -> std::io::Result<()> {
+    if replicas.is_empty() {
+        return writeln!(w, "no replicas for {workload}");
+    }
+    writeln!(
+        w,
+        "{:>3}  {:<21}  {:<9}  {:<7}  {:<7}  BACKEND",
+        "REP", "ENDPOINT", "REACHABLE", "HEALTHY", "PHASE"
+    )?;
+    for r in replicas {
+        let rep = r["replica"].as_u64().unwrap_or(0);
+        let endpoint = r["endpoint"].as_str().unwrap_or("?");
+        let reachable = if r["tcp_reachable"].as_bool().unwrap_or(false) {
+            "yes"
+        } else {
+            "NO"
+        };
+        let healthy = if r["healthy"].as_bool().unwrap_or(false) {
+            "yes"
+        } else {
+            "NO"
+        };
+        let phase = r["phase"].as_str().unwrap_or("?");
+        let backend = r["backend"].as_str().unwrap_or("?");
+        writeln!(
+            w,
+            "{rep:>3}  {endpoint:<21}  {reachable:<9}  {healthy:<7}  {phase:<7}  {backend}"
+        )?;
+    }
+    Ok(())
+}
+
 /// Entry point for `boatramp compute`.
-pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<()> {
+pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<ComputeOutput> {
     let server = client::resolve_server(args.server, config)?;
     let http = client::http_client(client::token(config).as_deref());
     let cp = client::ControlPlane::new(
@@ -441,7 +737,7 @@ pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<()> {
     // longer silently dropped on the write path.
     let seg = client::project_seg(&client::resolve_project(config), "compute");
 
-    match args.command {
+    let out = match args.command {
         ComputeCommand::Ls => {
             let workloads: serde_json::Value = http
                 .get(format!("{server}/api/{seg}"))
@@ -451,17 +747,7 @@ pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<()> {
                 .json()
                 .await?;
             let arr = workloads.as_array().cloned().unwrap_or_default();
-            if arr.is_empty() {
-                println!("no workloads");
-                return Ok(());
-            }
-            for w in arr {
-                let name = w["name"].as_str().unwrap_or("?");
-                let replicas = w["replicas"].as_u64().unwrap_or(0);
-                let active = w["active"].as_str().unwrap_or("");
-                let short = &active[..active.len().min(12)];
-                println!("{name}  replicas={replicas}  active={short}");
-            }
+            ComputeOutput::Ls { workloads: arr }
         }
         ComputeCommand::Get { name } => {
             let workload: serde_json::Value = http
@@ -471,7 +757,7 @@ pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<()> {
                 .error_for_status()?
                 .json()
                 .await?;
-            println!("{}", serde_json::to_string_pretty(&workload)?);
+            ComputeOutput::Get { workload }
         }
         ComputeCommand::Set {
             name,
@@ -536,7 +822,7 @@ pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<()> {
                 parse_bindings(&bind)?,
             )?;
             let hash = put_workload(&http, &server, &seg, &name, spec, replicas, regions).await?;
-            println!("workload {name} set (spec {hash})");
+            ComputeOutput::Set { name, spec: hash }
         }
         ComputeCommand::Build {
             name,
@@ -571,7 +857,8 @@ pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<()> {
                 })
                 .collect::<Result<_>>()?;
             let out = std::env::temp_dir().join(format!("boatramp-build-{name}.ext4"));
-            eprintln!("building rootfs from {image} (requires e2fsprogs `mke2fs`)…");
+            // Build progress → tracing (diagnostic/stderr); the result is the set-workload line.
+            tracing::info!("building rootfs from {image} (requires e2fsprogs `mke2fs`)…");
             boatramp_firecracker::oci::build_rootfs(
                 &image,
                 &entrypoint,
@@ -592,7 +879,7 @@ pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<()> {
             // Hash + upload the freshly built rootfs as a content-addressed blob.
             let rootfs = cp.put_file_blob(&out).await?;
             let _ = std::fs::remove_file(&out);
-            eprintln!("rootfs blob {rootfs} uploaded");
+            tracing::info!("rootfs blob {rootfs} uploaded");
             let spec = build_spec(
                 RootSource::Rootfs(rootfs),
                 kernel,
@@ -611,14 +898,14 @@ pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<()> {
                 parse_bindings(&bind)?,
             )?;
             let hash = put_workload(&http, &server, &seg, &name, spec, replicas, regions).await?;
-            println!("workload {name} built + set (spec {hash})");
+            ComputeOutput::Build { name, spec: hash }
         }
         ComputeCommand::Rm { name } => {
             http.delete(format!("{server}/api/{seg}/{name}"))
                 .send()
                 .await?
                 .error_for_status()?;
-            println!("removed {name}");
+            ComputeOutput::Rm { name }
         }
         ComputeCommand::Exec { name, stdin, argv } => {
             use base64::Engine;
@@ -646,21 +933,23 @@ pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<()> {
                 )));
             }
             let out: serde_json::Value = resp.json().await?;
+            // RAW PASSTHROUGH: the child's stdout/stderr are DATA — write the decoded bytes straight
+            // through, never JSON-wrapped/base64'd, and mirror the child exit code. This leaf command
+            // exits directly (it does NOT route through `output::emit`), so the raw byte stream is
+            // never polluted by a trailing result object in either output mode.
+            let mut so = std::io::stdout();
             if let Some(s) = out["stdout_b64"].as_str() {
-                std::io::stdout()
-                    .write_all(&b64.decode(s).unwrap_or_default())
-                    .ok();
+                so.write_all(&b64.decode(s).unwrap_or_default()).ok();
             }
+            let mut se = std::io::stderr();
             if let Some(s) = out["stderr_b64"].as_str() {
-                std::io::stderr()
-                    .write_all(&b64.decode(s).unwrap_or_default())
-                    .ok();
+                se.write_all(&b64.decode(s).unwrap_or_default()).ok();
             }
-            // Mirror the command's exit code so scripts see failures.
+            let _ = so.flush();
+            let _ = se.flush();
             let code = out["exit_code"].as_i64().unwrap_or(0);
-            if code != 0 {
-                std::process::exit(code as i32);
-            }
+            // Tail expression (no `;`) so the arm's type is `!`, coercing to `ComputeOutput`.
+            std::process::exit(code as i32)
         }
         ComputeCommand::BindBlob {
             site,
@@ -689,12 +978,13 @@ pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<()> {
                 )));
             }
             let out: serde_json::Value = resp.json().await?;
-            let prefix = if export { "export " } else { "" };
+            let mut env = Vec::new();
             for pair in out["env"].as_array().into_iter().flatten() {
                 if let (Some(k), Some(v)) = (pair[0].as_str(), pair[1].as_str()) {
-                    println!("{prefix}{k}={v}");
+                    env.push((k.to_string(), v.to_string()));
                 }
             }
+            ComputeOutput::BindBlob { export, env }
         }
         ComputeCommand::Volume(VolumeCommand::Ls) => {
             let vols: serde_json::Value = http
@@ -705,22 +995,7 @@ pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<()> {
                 .json()
                 .await?;
             let arr = vols.as_array().cloned().unwrap_or_default();
-            if arr.is_empty() {
-                println!("no volumes");
-                return Ok(());
-            }
-            let (name_h, size_h, in_use_h) = ("NAME", "SIZE", "IN-USE");
-            println!("{name_h:<24}  {size_h:>12}  {in_use_h}");
-            for v in arr {
-                let name = v["name"].as_str().unwrap_or("?");
-                let size = human_size(v["size_bytes"].as_u64().unwrap_or(0));
-                let in_use = if v["in_use"].as_bool().unwrap_or(false) {
-                    "yes"
-                } else {
-                    "no"
-                };
-                println!("{name:<24}  {size:>12}  {in_use}");
-            }
+            ComputeOutput::VolumeLs { volumes: arr }
         }
         ComputeCommand::Volume(VolumeCommand::Rm { name, force }) => {
             let mut url = format!("{server}/api/{seg}/volumes/{name}");
@@ -729,7 +1004,7 @@ pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<()> {
             }
             let resp = http.delete(url).send().await?;
             match resp.status() {
-                s if s.is_success() => println!("removed {name}"),
+                s if s.is_success() => ComputeOutput::VolumeRm { name },
                 reqwest::StatusCode::NOT_FOUND => {
                     return Err(Error::Server(format!("no such volume {name:?}")));
                 }
@@ -750,7 +1025,7 @@ pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<()> {
         }
         // Node-global operator tools hit the direct `/api/compute/…` maintenance surface
         // (admin-scoped, tenant-agnostic) rather than the project-scoped `seg`.
-        ComputeCommand::Status { workload, format } => {
+        ComputeCommand::Status { workload } => {
             let mut states: Vec<serde_json::Value> = http
                 .get(format!("{server}/api/compute/status"))
                 .send()
@@ -761,48 +1036,7 @@ pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<()> {
             if let Some(wl) = &workload {
                 states.retain(|s| s["workload"].as_str() == Some(wl.as_str()));
             }
-            match format {
-                StatusFormat::Json => {
-                    println!("{}", serde_json::to_string_pretty(&states)?);
-                }
-                StatusFormat::Table => {
-                    if states.is_empty() {
-                        println!("no replicas");
-                        return Ok(());
-                    }
-                    println!(
-                        "{:<28}  {:>3}  {:<7}  {:<21}  {:<7}  {:>6}  BACKEND",
-                        "PROJECT/WORKLOAD", "REP", "HEALTHY", "ENDPOINT", "PHASE", "AGE"
-                    );
-                    for s in &states {
-                        let owner = format!(
-                            "{}/{}",
-                            s["project"].as_str().unwrap_or("?"),
-                            s["workload"].as_str().unwrap_or("?")
-                        );
-                        let rep = s["replica"].as_u64().unwrap_or(0);
-                        let healthy = if s["healthy"].as_bool().unwrap_or(false) {
-                            "yes"
-                        } else {
-                            "NO"
-                        };
-                        let endpoint = format!(
-                            "{}:{}",
-                            s["host"].as_str().unwrap_or("?"),
-                            s["port"].as_u64().unwrap_or(0)
-                        );
-                        let phase = s["phase"].as_str().unwrap_or("?");
-                        let age = match s["age_secs"].as_u64() {
-                            Some(a) => format!("{a}s"),
-                            None => "-".to_string(),
-                        };
-                        let backend = s["backend"].as_str().unwrap_or("?");
-                        println!(
-                            "{owner:<28}  {rep:>3}  {healthy:<7}  {endpoint:<21}  {phase:<7}  {age:>6}  {backend}"
-                        );
-                    }
-                }
-            }
+            ComputeOutput::Status { states }
         }
         ComputeCommand::SetHealth {
             workload,
@@ -823,13 +1057,12 @@ pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<()> {
             match resp.status() {
                 s if s.is_success() => {
                     let view: serde_json::Value = resp.json().await?;
-                    println!(
-                        "set {}/{} replica {} healthy={}",
-                        view["project"].as_str().unwrap_or("?"),
-                        view["workload"].as_str().unwrap_or("?"),
-                        view["replica"].as_u64().unwrap_or(0),
-                        view["healthy"].as_bool().unwrap_or(false)
-                    );
+                    ComputeOutput::SetHealth {
+                        project: view["project"].as_str().unwrap_or("?").to_string(),
+                        workload: view["workload"].as_str().unwrap_or("?").to_string(),
+                        replica: view["replica"].as_u64().unwrap_or(0),
+                        healthy: view["healthy"].as_bool().unwrap_or(false),
+                    }
                 }
                 reqwest::StatusCode::NOT_FOUND => {
                     return Err(Error::Server(format!(
@@ -863,38 +1096,9 @@ pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<()> {
                         .collect()
                 })
                 .unwrap_or_default();
-            if assignments.is_empty() {
-                println!("no IP assignments");
-                return Ok(());
-            }
-            println!("{:<16}  {:<30}  {:<7}  PHASE", "IP", "OWNER", "HEALTHY");
-            for a in &assignments {
-                let ip = a["ip"].as_str().unwrap_or("?");
-                let owner = format!(
-                    "{}/{}#{}",
-                    a["project"].as_str().unwrap_or("?"),
-                    a["workload"].as_str().unwrap_or("?"),
-                    a["replica"].as_u64().unwrap_or(0)
-                );
-                let healthy = if a["healthy"].as_bool().unwrap_or(false) {
-                    "yes"
-                } else {
-                    "NO"
-                };
-                let phase = a["phase"].as_str().unwrap_or("?");
-                let flag = if dups.iter().any(|d| d == ip) {
-                    "  <-- COLLISION"
-                } else {
-                    ""
-                };
-                println!("{ip:<16}  {owner:<30}  {healthy:<7}  {phase}{flag}");
-            }
-            if !dups.is_empty() {
-                println!(
-                    "\n{} duplicate IP(s) detected: {}",
-                    dups.len(),
-                    dups.join(", ")
-                );
+            ComputeOutput::IpLs {
+                assignments,
+                duplicates: dups,
             }
         }
         ComputeCommand::Reconcile => {
@@ -904,7 +1108,7 @@ pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<()> {
                 .await?;
             let status = resp.status();
             if status.is_success() {
-                println!("reconcile pass requested; run `boatramp compute status` for the result");
+                ComputeOutput::Reconcile
             } else {
                 let text = resp.text().await.unwrap_or_default();
                 return Err(Error::Server(format!(
@@ -925,9 +1129,7 @@ pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<()> {
                 .send()
                 .await?;
             match resp.status() {
-                s if s.is_success() => {
-                    println!("restarted {workload} replica {replica}; reconcile will relaunch it");
-                }
+                s if s.is_success() => ComputeOutput::Restart { workload, replica },
                 reqwest::StatusCode::NOT_FOUND => {
                     return Err(Error::Server(format!(
                         "no such replica: {workload} #{replica} (in project {:?})",
@@ -951,25 +1153,7 @@ pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<()> {
                 .error_for_status()?
                 .json()
                 .await?;
-            if entries.is_empty() {
-                println!("no internal names");
-                return Ok(());
-            }
-            println!("{:<32}  {:>4}  HEALTHY ADDRS", "NAME", "REPS");
-            for e in &entries {
-                let name = e["name"].as_str().unwrap_or("?");
-                let reps = e["replicas"].as_u64().unwrap_or(0);
-                let addrs: Vec<&str> = e["addrs"]
-                    .as_array()
-                    .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
-                    .unwrap_or_default();
-                let shown = if addrs.is_empty() {
-                    "(none — unresolved)".to_string()
-                } else {
-                    addrs.join(", ")
-                };
-                println!("{name:<32}  {reps:>4}  {shown}");
-            }
+            ComputeOutput::DnsLs { entries }
         }
         ComputeCommand::Dns(DnsCommand::Resolve { workload }) => {
             let body = serde_json::json!({
@@ -984,16 +1168,16 @@ pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<()> {
                 .error_for_status()?
                 .json()
                 .await?;
-            let name = e["name"].as_str().unwrap_or("?");
-            let addrs: Vec<&str> = e["addrs"]
+            let name = e["name"].as_str().unwrap_or("?").to_string();
+            let addrs: Vec<String> = e["addrs"]
                 .as_array()
-                .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
                 .unwrap_or_default();
-            if addrs.is_empty() {
-                println!("{name} resolves to nothing (no healthy replica)");
-            } else {
-                println!("{name} -> {}", addrs.join(", "));
-            }
+            ComputeOutput::DnsResolve { name, addrs }
         }
         ComputeCommand::Netdiag { workload } => {
             let body = serde_json::json!({
@@ -1008,36 +1192,10 @@ pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<()> {
                 .error_for_status()?
                 .json()
                 .await?;
-            if replicas.is_empty() {
-                println!("no replicas for {workload}");
-                return Ok(());
-            }
-            println!(
-                "{:>3}  {:<21}  {:<9}  {:<7}  {:<7}  BACKEND",
-                "REP", "ENDPOINT", "REACHABLE", "HEALTHY", "PHASE"
-            );
-            for r in &replicas {
-                let rep = r["replica"].as_u64().unwrap_or(0);
-                let endpoint = r["endpoint"].as_str().unwrap_or("?");
-                let reachable = if r["tcp_reachable"].as_bool().unwrap_or(false) {
-                    "yes"
-                } else {
-                    "NO"
-                };
-                let healthy = if r["healthy"].as_bool().unwrap_or(false) {
-                    "yes"
-                } else {
-                    "NO"
-                };
-                let phase = r["phase"].as_str().unwrap_or("?");
-                let backend = r["backend"].as_str().unwrap_or("?");
-                println!(
-                    "{rep:>3}  {endpoint:<21}  {reachable:<9}  {healthy:<7}  {phase:<7}  {backend}"
-                );
-            }
+            ComputeOutput::Netdiag { workload, replicas }
         }
-    }
-    Ok(())
+    };
+    Ok(out)
 }
 
 /// Render a byte count as a compact human-readable size for the `volume ls` table.

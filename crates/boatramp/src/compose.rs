@@ -38,6 +38,30 @@ pub enum Error {
 
 type Result<T> = std::result::Result<T, Error>;
 
+/// The result of `boatramp compose`: the fused component that was written.
+/// Rendered by [`crate::output`].
+#[derive(Debug, serde::Serialize)]
+pub struct ComposeOutput {
+    /// The root ("edge") component path.
+    edge: String,
+    /// How many plugins were fused in.
+    plugins: usize,
+    /// Where the fused component was written.
+    output: String,
+    /// The fused component's size in bytes.
+    bytes: usize,
+}
+
+impl crate::output::Rendered for ComposeOutput {
+    fn render_human(&self, w: &mut dyn std::io::Write) -> std::io::Result<()> {
+        writeln!(
+            w,
+            "composed {} + {} plugin(s) -> {} ({} bytes)",
+            self.edge, self.plugins, self.output, self.bytes
+        )
+    }
+}
+
 /// Arguments for `boatramp compose`.
 #[derive(Debug, clap::Args)]
 pub struct ComposeArgs {
@@ -92,7 +116,7 @@ pub(crate) fn compose_components(edge: &[u8], plugins: &[(String, Vec<u8>)]) -> 
 }
 
 /// Entry point for `boatramp compose`.
-pub fn run(args: ComposeArgs) -> Result<()> {
+pub fn run(args: ComposeArgs) -> Result<ComposeOutput> {
     let edge = read(&args.edge)?;
     let mut plugins = Vec::with_capacity(args.plugins.len());
     for (i, path) in args.plugins.iter().enumerate() {
@@ -108,14 +132,12 @@ pub fn run(args: ComposeArgs) -> Result<()> {
     }
     let fused = compose_components(&edge, &plugins)?;
     std::fs::write(&args.output, &fused).map_err(|e| Error::Write(args.output.clone(), e))?;
-    println!(
-        "composed {} + {} plugin(s) -> {} ({} bytes)",
-        args.edge.display(),
-        args.plugins.len(),
-        args.output.display(),
-        fused.len()
-    );
-    Ok(())
+    Ok(ComposeOutput {
+        edge: args.edge.display().to_string(),
+        plugins: args.plugins.len(),
+        output: args.output.display().to_string(),
+        bytes: fused.len(),
+    })
 }
 
 fn read(path: &Path) -> Result<Vec<u8>> {

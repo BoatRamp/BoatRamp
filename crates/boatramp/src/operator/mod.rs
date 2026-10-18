@@ -62,11 +62,77 @@ enum OperatorCommand {
     Manifests(manifests::ManifestArgs),
 }
 
+/// The result of an `operator` subcommand, rendered by [`crate::output`].
+///
+/// The manifest emitters (`crds` / `manifests`) are **DATA**: the human view
+/// writes their YAML byte-for-byte (so `operator crds | kubectl apply -f -` keeps
+/// working), while `--output-format json` emits the parsed documents as a JSON
+/// array. `operator run` is the long-running controller; it reports via `tracing`
+/// and has no stdout result.
+#[derive(Debug, serde::Serialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum OperatorOutput {
+    /// `operator run` — the controller ran until the process was signalled.
+    Ran,
+    /// `operator crds` — the CustomResourceDefinition YAML document stream.
+    Crds {
+        /// Parsed documents, for `--output-format json`.
+        documents: Vec<serde_json::Value>,
+        /// The exact YAML the human view prints.
+        #[serde(skip)]
+        yaml: String,
+    },
+    /// `operator manifests` — the full install bundle YAML document stream.
+    Manifests {
+        documents: Vec<serde_json::Value>,
+        #[serde(skip)]
+        yaml: String,
+    },
+}
+
+impl crate::output::Rendered for OperatorOutput {
+    fn render_human(&self, w: &mut dyn std::io::Write) -> std::io::Result<()> {
+        match self {
+            // The controller logs via `tracing`; it has no stdout result.
+            Self::Ran => Ok(()),
+            // Byte-for-byte YAML (the emitters used `print!`, no trailing newline added).
+            Self::Crds { yaml, .. } | Self::Manifests { yaml, .. } => {
+                write!(w, "{yaml}")
+            }
+        }
+    }
+}
+
+/// Parse a multi-document YAML stream (`---`-separated) into a JSON array — one
+/// element per document — for the `--output-format json` rendering of the manifest
+/// emitters. The manifests are serde-clean (string keys only), so the round-trip
+/// is lossless.
+fn yaml_documents(yaml: &str) -> Vec<serde_json::Value> {
+    use serde::Deserialize as _;
+    serde_yaml::Deserializer::from_str(yaml)
+        .filter_map(|doc| serde_yaml::Value::deserialize(doc).ok())
+        .filter_map(|value| serde_json::to_value(value).ok())
+        .collect()
+}
+
 /// Entry point for `boatramp operator`.
-pub async fn run(args: OperatorArgs) -> Result<()> {
+pub async fn run(args: OperatorArgs) -> Result<OperatorOutput> {
     match args.command {
-        OperatorCommand::Run(a) => controller::run(a).await,
-        OperatorCommand::Crds => manifests::print_crds(),
-        OperatorCommand::Manifests(a) => manifests::print_manifests(&a),
+        OperatorCommand::Run(a) => {
+            // The controller is a long-running reconcile loop; it returns only when
+            // the process is signalled, reporting progress via `tracing`.
+            controller::run(a).await?;
+            Ok(OperatorOutput::Ran)
+        }
+        OperatorCommand::Crds => {
+            let yaml = manifests::crds_yaml()?;
+            let documents = yaml_documents(&yaml);
+            Ok(OperatorOutput::Crds { documents, yaml })
+        }
+        OperatorCommand::Manifests(a) => {
+            let yaml = manifests::manifests_yaml(&a)?;
+            let documents = yaml_documents(&yaml);
+            Ok(OperatorOutput::Manifests { documents, yaml })
+        }
     }
 }

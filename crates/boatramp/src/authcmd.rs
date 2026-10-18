@@ -121,23 +121,99 @@ enum PolicyCommand {
     },
 }
 
+/// The result of an `auth` subcommand, rendered by [`crate::output`].
+///
+/// `auth init` prints the freshly generated **root private key** (shown once, the data
+/// the operator must capture) — it is both the human export line and a JSON field. The
+/// next-step guidance that used to go to stderr is diagnostic and moves to `tracing`.
+#[derive(Debug, serde::Serialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum AuthOutput {
+    /// `auth init` — a fresh ES256 root keypair (the private key is shown once).
+    Init {
+        private_key: String,
+        public_key: String,
+    },
+    /// `auth pubkey` — the public key derived from a root private key.
+    Pubkey { public_key: String },
+    /// `auth pin` — the resolved per-node TLS pin to export.
+    Pin { server_pubkey: String },
+    /// `auth policy get` — the active RBAC policy.
+    PolicyGet { policy: AuthzPolicy },
+    /// `auth policy set` — the policy was replaced.
+    PolicySet,
+    /// `auth rotate-root` — a new anchor was trusted (`added`), an old one retired
+    /// (`retired`), and/or (with neither flag) the extra anchors listed (`anchors`).
+    /// The add/retire acks + next-step guidance go to `tracing`; only the listing is
+    /// human stdout.
+    RotateRoot {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        added: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        retired: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        anchors: Option<Vec<String>>,
+    },
+}
+
+impl crate::output::Rendered for AuthOutput {
+    fn render_human(&self, w: &mut dyn std::io::Write) -> std::io::Result<()> {
+        match self {
+            Self::Init {
+                private_key,
+                public_key,
+            } => {
+                writeln!(w, "# boatramp control-plane root key (COSE/CWT — ES256)")?;
+                writeln!(
+                    w,
+                    "# Issuing node — keep secret (mints tokens, runs OIDC exchange):"
+                )?;
+                writeln!(w, "BOATRAMP_AUTH_ROOT_PRIVATE_KEY={private_key}")?;
+                writeln!(w, "# Verify-only nodes / public trust anchor:")?;
+                writeln!(w, "BOATRAMP_AUTH_ROOT_PUBLIC_KEY={public_key}")
+            }
+            Self::Pubkey { public_key } => writeln!(w, "{public_key}"),
+            Self::Pin { server_pubkey } => {
+                writeln!(w, "BOATRAMP_SERVER_PUBKEY={server_pubkey}")
+            }
+            Self::PolicyGet { policy } => {
+                let rendered =
+                    serde_json::to_string_pretty(policy).map_err(std::io::Error::other)?;
+                writeln!(w, "{rendered}")
+            }
+            Self::PolicySet => writeln!(w, "policy updated"),
+            Self::RotateRoot { anchors, .. } => {
+                // `added`/`retired` acks + guidance already went to `tracing` (stderr);
+                // only the `--list` anchors are stdout, as before.
+                if let Some(anchors) = anchors {
+                    if anchors.is_empty() {
+                        writeln!(
+                            w,
+                            "(no extra root anchors — running on the primary root key only)"
+                        )?;
+                    } else {
+                        for a in anchors {
+                            writeln!(w, "{a}")?;
+                        }
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
 /// Entry point for `boatramp auth`.
-pub async fn run(args: AuthArgs, config: &ProjectConfig) -> Result<()> {
+pub async fn run(args: AuthArgs, config: &ProjectConfig) -> Result<AuthOutput> {
     match args.command {
         AuthCommand::Init => {
             // ES256 is the portable default: every HSM/KMS can sign it (Ed25519 is
             // available for local/AWS/Vault via `--alg`).
             let signer = LocalSigner::generate(TokenAlg::Es256);
-            println!("# boatramp control-plane root key (COSE/CWT — ES256)");
-            println!("# Issuing node — keep secret (mints tokens, runs OIDC exchange):");
-            println!("BOATRAMP_AUTH_ROOT_PRIVATE_KEY={}", signer.private_hex());
-            println!("# Verify-only nodes / public trust anchor:");
-            println!(
-                "BOATRAMP_AUTH_ROOT_PUBLIC_KEY={}",
-                signer.public_key().to_hex()
-            );
-            eprintln!();
-            eprintln!(
+            let private_key = signer.private_hex();
+            let public_key = signer.public_key().to_hex();
+            tracing::info!("");
+            tracing::info!(
                 "Set this private key on the server to enable auth. On a fresh deploy, \
                  mint the FIRST token by also setting a single-use bootstrap secret \
                  (`serve --bootstrap-secret <secret>` / BOATRAMP_BOOTSTRAP_SECRET), then:\n  \
@@ -145,19 +221,24 @@ pub async fn run(args: AuthArgs, config: &ProjectConfig) -> Result<()> {
                  Use that admin token to mint scoped tokens (`boatramp token create \
                  publisher:<site>`), then unset the bootstrap secret on the server."
             );
+            Ok(AuthOutput::Init {
+                private_key,
+                public_key,
+            })
         }
         AuthCommand::Pubkey { private_key } => {
             let signer = LocalSigner::from_private_hex(&private_key)
                 .map_err(|e| Error::InvalidPrivateKey(e.to_string()))?;
-            println!("{}", signer.public_key().to_hex());
+            Ok(AuthOutput::Pubkey {
+                public_key: signer.public_key().to_hex(),
+            })
         }
-        AuthCommand::Pin { root_pubkey } => run_pin(args.server, root_pubkey, config).await?,
-        AuthCommand::Policy(command) => run_policy(command, args.server, config).await?,
+        AuthCommand::Pin { root_pubkey } => run_pin(args.server, root_pubkey, config).await,
+        AuthCommand::Policy(command) => run_policy(command, args.server, config).await,
         AuthCommand::RotateRoot { add, retire } => {
-            run_rotate_root(add, retire, args.server, config).await?;
+            run_rotate_root(add, retire, args.server, config).await
         }
     }
-    Ok(())
 }
 
 /// Resolve a `--tls rpk` server's TLS pin from the operator's root public key.
@@ -169,7 +250,7 @@ async fn run_pin(
     server: Option<String>,
     root_pubkey: String,
     config: &ProjectConfig,
-) -> Result<()> {
+) -> Result<AuthOutput> {
     use std::sync::{Arc, Mutex};
 
     let server = client::resolve_server(server, config)?;
@@ -217,9 +298,10 @@ async fn run_pin(
         ));
     }
 
-    eprintln!("verified {server} against the root key. Export this to pin it:");
-    println!("BOATRAMP_SERVER_PUBKEY={attested_hex}");
-    Ok(())
+    tracing::info!("verified {server} against the root key. Export this to pin it:");
+    Ok(AuthOutput::Pin {
+        server_pubkey: attested_hex,
+    })
 }
 
 /// Drive a make-before-break root rotation via the replicated anchor set.
@@ -228,9 +310,13 @@ async fn run_rotate_root(
     retire: Option<String>,
     server: Option<String>,
     config: &ProjectConfig,
-) -> Result<()> {
+) -> Result<AuthOutput> {
     let server = client::resolve_server(server, config)?;
     let http = client::http_client(client::token(config).as_deref());
+
+    let mut added = None;
+    let mut retired = None;
+    let mut anchors = None;
 
     if let Some(pubkey) = add.as_deref() {
         let pubkey = pubkey.trim();
@@ -242,12 +328,13 @@ async fn run_rotate_root(
             .send()
             .await?
             .error_for_status()?;
-        eprintln!("trusted new root anchor {pubkey} (make-before-break).");
-        eprintln!(
+        tracing::info!("trusted new root anchor {pubkey} (make-before-break).");
+        tracing::info!(
             "Now re-point [serve.signer] / BOATRAMP_AUTH_ROOT_PRIVATE_KEY to the new key so new \
              tokens + attestations use it, wait for every node to converge, then retire the old \
              anchor:\n  boatramp auth rotate-root --retire <old-pubkey>"
         );
+        added = Some(pubkey.to_string());
     }
     if let Some(pubkey) = retire.as_deref() {
         let pubkey = pubkey.trim();
@@ -255,32 +342,31 @@ async fn run_rotate_root(
             .send()
             .await?
             .error_for_status()?;
-        eprintln!("retired root anchor {pubkey}.");
+        tracing::info!("retired root anchor {pubkey}.");
+        retired = Some(pubkey.to_string());
     }
     if add.is_none() && retire.is_none() {
-        let anchors: Vec<String> = http
-            .get(format!("{server}/api/auth/root"))
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
-        if anchors.is_empty() {
-            println!("(no extra root anchors — running on the primary root key only)");
-        } else {
-            for a in anchors {
-                println!("{a}");
-            }
-        }
+        anchors = Some(
+            http.get(format!("{server}/api/auth/root"))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?,
+        );
     }
-    Ok(())
+    Ok(AuthOutput::RotateRoot {
+        added,
+        retired,
+        anchors,
+    })
 }
 
 async fn run_policy(
     command: PolicyCommand,
     server: Option<String>,
     config: &ProjectConfig,
-) -> Result<()> {
+) -> Result<AuthOutput> {
     let server = client::resolve_server(server, config)?;
     let http = client::http_client(client::token(config).as_deref());
     match command {
@@ -291,7 +377,10 @@ async fn run_policy(
                 .await?
                 .error_for_status()?;
             let policy: AuthzPolicy = resp.json().await?;
-            println!("{}", serde_json::to_string_pretty(&policy)?);
+            // Surface a serialization failure up-front as `Error::Json` (unchanged error
+            // path); the human/JSON rendering then renders from the structured `policy`.
+            serde_json::to_string_pretty(&policy)?;
+            Ok(AuthOutput::PolicyGet { policy })
         }
         PolicyCommand::Set { file } => {
             let raw = std::fs::read_to_string(&file).map_err(|e| Error::ReadPolicyFile {
@@ -327,8 +416,7 @@ async fn run_policy(
                 return Err(Error::PolicyConflict);
             }
             resp.error_for_status()?;
-            println!("policy updated");
+            Ok(AuthOutput::PolicySet)
         }
     }
-    Ok(())
 }

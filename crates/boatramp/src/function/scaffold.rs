@@ -3,6 +3,13 @@
 
 use super::{FunctionError, Result};
 
+/// What [`init_project`] scaffolded: the derived crate name and the created
+/// project directory. The caller reports the outcome.
+pub(super) struct Scaffolded {
+    pub crate_name: String,
+    pub dir: std::path::PathBuf,
+}
+
 /// The embedded function templates (`function init --lang <lang>`).
 static RUST_TEMPLATE: include_dir::Dir<'_> =
     include_dir::include_dir!("$CARGO_MANIFEST_DIR/templates/rust");
@@ -12,7 +19,11 @@ static PYTHON_TEMPLATE: include_dir::Dir<'_> =
     include_dir::include_dir!("$CARGO_MANIFEST_DIR/templates/python");
 
 /// Scaffold a new function project from a language template.
-pub(super) fn init_project(name: &str, lang: &str, dir: Option<std::path::PathBuf>) -> Result<()> {
+pub(super) fn init_project(
+    name: &str,
+    lang: &str,
+    dir: Option<std::path::PathBuf>,
+) -> Result<Scaffolded> {
     let template = match lang {
         "rust" => &RUST_TEMPLATE,
         "js" | "javascript" => &JS_TEMPLATE,
@@ -27,9 +38,10 @@ pub(super) fn init_project(name: &str, lang: &str, dir: Option<std::path::PathBu
         return Err(FunctionError::AlreadyExists(target));
     }
     write_template(template, &target, &crate_name)?;
-    println!("scaffolded {crate_name} in {}", target.display());
-    println!("  next: cd {crate_name} && boatramp function build");
-    Ok(())
+    Ok(Scaffolded {
+        crate_name,
+        dir: target,
+    })
 }
 
 /// Write every embedded template file to `dest_root`. Any `*.tmpl` file is written

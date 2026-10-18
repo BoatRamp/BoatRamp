@@ -53,8 +53,58 @@ enum AliasCommand {
     Ls,
 }
 
+/// The result of an `alias` subcommand, rendered by [`crate::output`].
+#[derive(Debug, serde::Serialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum AliasOutput {
+    /// `alias ls` — the site's named pointers (deployment ids full in JSON, shortened in the text).
+    List {
+        site: String,
+        aliases: Vec<AliasEntry>,
+    },
+    /// An alias was set (or moved) to a deployment.
+    Set {
+        site: String,
+        name: String,
+        deployment: String,
+    },
+    /// An alias was removed.
+    Removed { site: String, name: String },
+}
+
+/// One named pointer: `name -> deployment`.
+#[derive(Debug, serde::Serialize)]
+pub struct AliasEntry {
+    pub name: String,
+    pub deployment: String,
+}
+
+impl crate::output::Rendered for AliasOutput {
+    fn render_human(&self, w: &mut dyn std::io::Write) -> std::io::Result<()> {
+        match self {
+            Self::List { site, aliases } => {
+                if aliases.is_empty() {
+                    writeln!(w, "no aliases for {site}")?;
+                }
+                for a in aliases {
+                    writeln!(w, "{}  ->  {}", a.name, short(&a.deployment))?;
+                }
+                Ok(())
+            }
+            Self::Set {
+                site,
+                name,
+                deployment,
+            } => writeln!(w, "alias {name} -> {} for {site}", short(deployment)),
+            Self::Removed { site, name } => {
+                writeln!(w, "removed alias {name} from {site}")
+            }
+        }
+    }
+}
+
 /// Entry point for `boatramp alias`.
-pub async fn run(args: AliasArgs, config: &ProjectConfig) -> Result<()> {
+pub async fn run(args: AliasArgs, config: &ProjectConfig) -> Result<AliasOutput> {
     let (server, site) = client::resolve_target(args.server, args.site, config)?;
     let cp = client::ControlPlane::new(
         server,
@@ -62,14 +112,15 @@ pub async fn run(args: AliasArgs, config: &ProjectConfig) -> Result<()> {
         client::resolve_project(config),
     );
 
-    match args.command {
+    let out = match args.command {
         AliasCommand::Ls => {
             let aliases = cp.list_aliases(&site).await?;
-            if aliases.is_empty() {
-                println!("no aliases for {site}");
-            }
-            for (name, id) in &aliases {
-                println!("{name}  ->  {}", short(id));
+            AliasOutput::List {
+                site,
+                aliases: aliases
+                    .into_iter()
+                    .map(|(name, deployment)| AliasEntry { name, deployment })
+                    .collect(),
             }
         }
         AliasCommand::Set { name, deployment } => {
@@ -78,14 +129,18 @@ pub async fn run(args: AliasArgs, config: &ProjectConfig) -> Result<()> {
             let id =
                 resolve_id(&list, &deployment).ok_or_else(|| Error::NoMatch(deployment.clone()))?;
             cp.set_alias(&site, &name, &id).await?;
-            println!("alias {name} -> {} for {site}", short(&id));
+            AliasOutput::Set {
+                site,
+                name,
+                deployment: id,
+            }
         }
         AliasCommand::Rm { name } => {
             cp.remove_alias(&site, &name).await?;
-            println!("removed alias {name} from {site}");
+            AliasOutput::Removed { site, name }
         }
-    }
-    Ok(())
+    };
+    Ok(out)
 }
 
 fn short(id: &str) -> &str {

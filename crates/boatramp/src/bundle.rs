@@ -49,6 +49,53 @@ pub enum Error {
 /// `bundle` module result; `Err` is [`Error`].
 type Result<T> = std::result::Result<T, Error>;
 
+/// The result of `boatramp bundle`: what was bundled (JS and/or CSS outputs).
+/// Rendered by [`crate::output`].
+#[derive(Debug, serde::Serialize)]
+pub struct BundleOutput {
+    /// The JS bundle result, when JS entry points were bundled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    js: Option<JsBundled>,
+    /// One entry per bundled CSS stylesheet.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    css: Vec<CssBundled>,
+}
+
+/// The JS-bundling outcome: how many entry points, and where they were written.
+#[derive(Debug, serde::Serialize)]
+struct JsBundled {
+    entries: usize,
+    outdir: String,
+}
+
+/// One bundled CSS stylesheet: its source entry, the file written, and its size.
+#[derive(Debug, serde::Serialize)]
+struct CssBundled {
+    entry: String,
+    dest: String,
+    bytes: usize,
+}
+
+impl crate::output::Rendered for BundleOutput {
+    fn render_human(&self, w: &mut dyn std::io::Write) -> std::io::Result<()> {
+        if let Some(js) = &self.js {
+            writeln!(
+                w,
+                "bundled {} JS entry point(s) -> {}",
+                js.entries, js.outdir
+            )?;
+        }
+        for c in &self.css {
+            writeln!(
+                w,
+                "bundled CSS {} -> {} ({} bytes)",
+                c.entry, c.dest, c.bytes
+            )?;
+        }
+        Ok(())
+    }
+}
+
 /// Arguments for `boatramp bundle`.
 #[derive(Debug, clap::Args)]
 pub struct BundleArgs {
@@ -91,7 +138,7 @@ impl BundleArgs {
 }
 
 /// Entry point for `boatramp bundle`.
-pub async fn run(args: BundleArgs, config: &ProjectConfig) -> Result<()> {
+pub async fn run(args: BundleArgs, config: &ProjectConfig) -> Result<BundleOutput> {
     let bundle = args.resolve(config);
     if bundle.js.is_empty() && bundle.css.is_empty() {
         return Err(Error::NothingToBundle);
@@ -100,17 +147,20 @@ pub async fn run(args: BundleArgs, config: &ProjectConfig) -> Result<()> {
 }
 
 #[cfg(feature = "bundler")]
-async fn run_bundle(bundle: &BundleConfig) -> Result<()> {
+async fn run_bundle(bundle: &BundleConfig) -> Result<BundleOutput> {
     let outdir = std::path::PathBuf::from(&bundle.outdir);
     std::fs::create_dir_all(&outdir)?;
 
+    let mut out = BundleOutput {
+        js: None,
+        css: Vec::new(),
+    };
     if !bundle.js.is_empty() {
         bundle_js(&bundle.js, &bundle.outdir, bundle.minify).await?;
-        println!(
-            "bundled {} JS entry point(s) -> {}",
-            bundle.js.len(),
-            bundle.outdir
-        );
+        out.js = Some(JsBundled {
+            entries: bundle.js.len(),
+            outdir: bundle.outdir.clone(),
+        });
     }
     for entry in &bundle.css {
         let css = bundle_css(entry, bundle.minify)?;
@@ -120,13 +170,13 @@ async fn run_bundle(bundle: &BundleConfig) -> Result<()> {
             .unwrap_or_else(|| "bundle.css".to_string());
         let dest = outdir.join(&name);
         std::fs::write(&dest, css.as_bytes())?;
-        println!(
-            "bundled CSS {entry} -> {} ({} bytes)",
-            dest.display(),
-            css.len()
-        );
+        out.css.push(CssBundled {
+            entry: entry.clone(),
+            dest: dest.display().to_string(),
+            bytes: css.len(),
+        });
     }
-    Ok(())
+    Ok(out)
 }
 
 /// Bundle JS/TS entry points with Rolldown, writing chunks to `outdir`.
@@ -185,6 +235,6 @@ fn bundle_css(entry: &str, minify: bool) -> Result<String> {
 }
 
 #[cfg(not(feature = "bundler"))]
-async fn run_bundle(_bundle: &BundleConfig) -> Result<()> {
+async fn run_bundle(_bundle: &BundleConfig) -> Result<BundleOutput> {
     Err(Error::NoBundler)
 }

@@ -139,8 +139,8 @@ struct RevokeRequest {
 }
 
 /// One row from `GET /api/cluster/members` (mirrors the server's `MeshMember`).
-#[derive(Debug, Clone, Deserialize)]
-struct MemberRow {
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
+pub(crate) struct MemberRow {
     node: u64,
     #[serde(default)]
     voter: bool,
@@ -219,12 +219,66 @@ async fn resolve_node(http: &client::ApiClient, server: &str, target: &str) -> R
         .ok_or_else(|| Error::NoSuchMember(target.to_string()))
 }
 
+/// The result of a `cluster` subcommand, rendered by [`crate::output`]. The raw
+/// token / ticket / pubkey and the membership table are the command's result
+/// (stdout); the former stderr hints become `tracing` lines.
+#[derive(Debug, serde::Serialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum ClusterOutput {
+    /// `cluster add` — a one-paste join ticket (or the raw token with
+    /// `--print-token-only`). The human view prints the ticket, or the token
+    /// when `ticket` is `None`.
+    #[cfg(feature = "cluster")]
+    JoinTicket {
+        token: String,
+        ticket: Option<String>,
+        expires_at: Option<u64>,
+    },
+    /// `cluster join-token` — a single-use bearer mesh join token.
+    JoinToken {
+        token: String,
+        expires_at: Option<u64>,
+    },
+    /// `cluster status` — the mesh membership.
+    Status { members: Vec<MemberRow>, full: bool },
+    /// `cluster remove` — a node removed from the cluster.
+    Removed { target: String, node: u64 },
+    /// `cluster promote` — a learner promoted to a voter.
+    Promoted { target: String, node: u64 },
+    /// `cluster rotate-key` — the node's new mesh public key.
+    RotatedKey { pubkey: String },
+    /// `cluster revoke` — a node revoked from the mesh by id.
+    Revoked { node: u64 },
+}
+
+impl crate::output::Rendered for ClusterOutput {
+    fn render_human(&self, w: &mut dyn std::io::Write) -> std::io::Result<()> {
+        match self {
+            #[cfg(feature = "cluster")]
+            Self::JoinTicket { token, ticket, .. } => match ticket {
+                Some(ticket) => writeln!(w, "{ticket}"),
+                None => writeln!(w, "{token}"),
+            },
+            Self::JoinToken { token, .. } => writeln!(w, "{token}"),
+            Self::Status { members, full } => write!(w, "{}", format_status(members, *full)),
+            Self::Removed { target, node } => {
+                writeln!(w, "removed {target} (node {node}) from the cluster")
+            }
+            Self::Promoted { target, node } => {
+                writeln!(w, "promoted {target} (node {node}) to a voter")
+            }
+            Self::RotatedKey { pubkey } => writeln!(w, "{pubkey}"),
+            Self::Revoked { node } => writeln!(w, "node {node} revoked from the mesh"),
+        }
+    }
+}
+
 /// Entry point for `boatramp cluster`.
-pub async fn run(args: ClusterArgs, config: &ProjectConfig) -> Result<()> {
+pub async fn run(args: ClusterArgs, config: &ProjectConfig) -> Result<ClusterOutput> {
     let server = client::resolve_server(args.server, config)?;
     let http = client::http_client(client::token(config).as_deref());
 
-    match args.command {
+    let out = match args.command {
         #[cfg(feature = "cluster")]
         ClusterCommand::Add {
             root_pubkey,
@@ -240,12 +294,18 @@ pub async fn run(args: ClusterArgs, config: &ProjectConfig) -> Result<()> {
                 .error_for_status()?
                 .json()
                 .await?;
-            if print_token_only {
-                println!("{}", response.token);
+            let expires_at = response.expires_at;
+            let out = if print_token_only {
+                ClusterOutput::JoinTicket {
+                    token: response.token,
+                    ticket: None,
+                    expires_at,
+                }
             } else {
                 // The seed the joiner reaches defaults to the node we just minted
                 // against (its control plane serves `/api/cluster/join`).
                 let seed_addr = seed.unwrap_or_else(|| server.clone());
+                let token = response.token.clone();
                 let ticket = crate::join::JoinTicket {
                     seeds: vec![seed_addr.clone()],
                     root_pubkeys: vec![root_pubkey.trim().to_string()],
@@ -253,13 +313,18 @@ pub async fn run(args: ClusterArgs, config: &ProjectConfig) -> Result<()> {
                 }
                 .encode()
                 .map_err(|e| Error::Ticket(e.to_string()))?;
-                println!("{ticket}");
-                eprintln!("single-use join ticket — hand it to exactly one new node, e.g.:");
-                eprintln!("  boatramp serve --cluster-join {ticket}");
+                tracing::info!("single-use join ticket — hand it to exactly one new node, e.g.:");
+                tracing::info!("  boatramp serve --cluster-join {}", ticket);
+                ClusterOutput::JoinTicket {
+                    token,
+                    ticket: Some(ticket),
+                    expires_at,
+                }
+            };
+            if let Some(exp) = expires_at {
+                tracing::info!("expires at (unix): {}", exp);
             }
-            if let Some(exp) = response.expires_at {
-                eprintln!("expires at (unix): {exp}");
-            }
+            out
         }
         ClusterCommand::JoinToken { ttl_secs } => {
             let response: JoinTokenResponse = http
@@ -270,13 +335,16 @@ pub async fn run(args: ClusterArgs, config: &ProjectConfig) -> Result<()> {
                 .error_for_status()?
                 .json()
                 .await?;
-            println!("{}", response.token);
             if let Some(exp) = response.expires_at {
-                eprintln!("expires at (unix): {exp}");
+                tracing::info!("expires at (unix): {}", exp);
             }
-            eprintln!(
+            tracing::info!(
                 "single-use bearer — hand it to exactly one joining node; it cannot be recovered"
             );
+            ClusterOutput::JoinToken {
+                token: response.token,
+                expires_at: response.expires_at,
+            }
         }
         ClusterCommand::Status { full } => {
             let members: Vec<MemberRow> = http
@@ -286,7 +354,7 @@ pub async fn run(args: ClusterArgs, config: &ProjectConfig) -> Result<()> {
                 .error_for_status()?
                 .json()
                 .await?;
-            print!("{}", format_status(&members, full));
+            ClusterOutput::Status { members, full }
         }
         ClusterCommand::Remove { target } => {
             let node = resolve_node(&http, &server, &target).await?;
@@ -295,7 +363,7 @@ pub async fn run(args: ClusterArgs, config: &ProjectConfig) -> Result<()> {
                 .send()
                 .await?
                 .error_for_status()?;
-            eprintln!("removed {target} (node {node}) from the cluster");
+            ClusterOutput::Removed { target, node }
         }
         ClusterCommand::Promote { target } => {
             let node = resolve_node(&http, &server, &target).await?;
@@ -304,7 +372,7 @@ pub async fn run(args: ClusterArgs, config: &ProjectConfig) -> Result<()> {
                 .send()
                 .await?
                 .error_for_status()?;
-            eprintln!("promoted {target} (node {node}) to a voter");
+            ClusterOutput::Promoted { target, node }
         }
         ClusterCommand::RotateKey => {
             let response: RotateKeyResponse = http
@@ -314,10 +382,12 @@ pub async fn run(args: ClusterArgs, config: &ProjectConfig) -> Result<()> {
                 .error_for_status()?
                 .json()
                 .await?;
-            println!("{}", response.pubkey);
-            eprintln!(
+            tracing::info!(
                 "mesh key rotated (make-before-break); update this node's `pubkey` in peer config"
             );
+            ClusterOutput::RotatedKey {
+                pubkey: response.pubkey,
+            }
         }
         ClusterCommand::Revoke { node } => {
             http.post(format!("{server}/api/cluster/revoke"))
@@ -325,10 +395,10 @@ pub async fn run(args: ClusterArgs, config: &ProjectConfig) -> Result<()> {
                 .send()
                 .await?
                 .error_for_status()?;
-            eprintln!("node {node} revoked from the mesh");
+            ClusterOutput::Revoked { node }
         }
-    }
-    Ok(())
+    };
+    Ok(out)
 }
 
 #[cfg(test)]

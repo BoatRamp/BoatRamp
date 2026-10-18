@@ -126,31 +126,173 @@ struct ConfigResponse {
     config: DaemonConfig,
 }
 
+/// One dynamic config key and its one-line note (the `config list` rows).
+#[derive(Debug, serde::Serialize)]
+pub struct DynKey {
+    pub key: String,
+    pub note: String,
+}
+
+/// The result of a `boatramp config` subcommand, rendered by [`crate::output`].
+#[derive(Debug, serde::Serialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum ConfigOutput {
+    /// `config get` (no key) — the active dynamic config and its generation.
+    Get {
+        generation: Option<String>,
+        // Boxed to keep this large payload from dwarfing the other variants.
+        config: Box<DaemonConfig>,
+    },
+    /// `config get <key>` — one key's rendered value.
+    GetKey { key: String, value: String },
+    /// `config set` — the key was set and converged fleet-wide.
+    Set {
+        key: String,
+        value: String,
+        generation: String,
+    },
+    /// `config rollback` — rolled back to the prior generation (`None` = nothing to roll back to).
+    RolledBack { generation: Option<String> },
+    /// `config apply` — the whole dynamic config was replaced.
+    Applied { file: String, generation: String },
+    /// `config list` — the dynamic (runtime-settable) keys.
+    List { keys: Vec<DynKey> },
+    /// `config describe <key>` — the key's change class and note.
+    Describe {
+        key: String,
+        /// `"restart"`, `"dynamic"`, or `"unknown"`.
+        class: &'static str,
+        /// For a restart-class key: the `boatramp.cfg` section to edit.
+        section: Option<&'static str>,
+        /// For a dynamic key: the one-line note.
+        note: Option<&'static str>,
+    },
+    /// `config migrate` — an upgraded apply manifest.
+    Migrated {
+        /// `Some(path)` when rewritten in place (nothing to stdout); `None` when printed.
+        written_to: Option<String>,
+        manifest: String,
+    },
+    /// `config dump` — the resolved STATIC config, secret fields redacted.
+    Dump {
+        /// The exact `dump_redacted` text, for byte-for-byte human fidelity (not in JSON).
+        #[serde(skip)]
+        text: String,
+        /// The parsed redacted config, so a JSON consumer reads it structurally.
+        config: serde_json::Value,
+    },
+}
+
+impl crate::output::Rendered for ConfigOutput {
+    fn render_human(&self, w: &mut dyn std::io::Write) -> std::io::Result<()> {
+        match self {
+            Self::Get { generation, config } => {
+                writeln!(
+                    w,
+                    "generation: {}",
+                    generation.as_deref().unwrap_or("(file baseline)")
+                )?;
+                writeln!(
+                    w,
+                    "{}",
+                    serde_json::to_string_pretty(config).map_err(std::io::Error::other)?
+                )
+            }
+            Self::GetKey { value, .. } => writeln!(w, "{value}"),
+            Self::Set {
+                key,
+                value,
+                generation,
+            } => writeln!(w, "set {key} = {value}  (generation {generation})"),
+            Self::RolledBack { generation } => match generation {
+                None => writeln!(w, "no prior generation to roll back to"),
+                Some(g) => writeln!(w, "rolled back to generation {g}"),
+            },
+            Self::Applied { file, generation } => {
+                writeln!(w, "applied {file} (generation {generation})")
+            }
+            Self::List { keys } => {
+                writeln!(
+                    w,
+                    "Dynamic keys (change fleet-wide with `config set`, no restart):"
+                )?;
+                for k in keys {
+                    writeln!(w, "  {:<32} {}", k.key, k.note)?;
+                }
+                writeln!(w)?;
+                writeln!(
+                    w,
+                    "Trust anchors + posture + listener settings are restart-class"
+                )?;
+                writeln!(
+                    w,
+                    "(edit boatramp.cfg + restart). See `config describe <key>`."
+                )
+            }
+            Self::Describe {
+                key,
+                class,
+                section,
+                note,
+            } => match *class {
+                "restart" => writeln!(
+                    w,
+                    "{key}: restart-class — edit `[{}]` in boatramp.cfg + restart.",
+                    section.as_deref().unwrap_or("")
+                ),
+                "dynamic" => {
+                    writeln!(
+                        w,
+                        "{key}: dynamic — `config set` converges it fleet-wide without a restart."
+                    )?;
+                    writeln!(w, "  {}", note.as_deref().unwrap_or(""))
+                }
+                _ => writeln!(w, "{key}: unknown; run `config list`."),
+            },
+            Self::Migrated {
+                written_to,
+                manifest,
+            } => {
+                // Printed to stdout when not `--write` (no trailing newline, matching the
+                // former `print!`); the `--write` path logged its advisory to stderr and
+                // left stdout empty, so render nothing here.
+                if written_to.is_none() {
+                    write!(w, "{manifest}")
+                } else {
+                    Ok(())
+                }
+            }
+            Self::Dump { text, .. } => writeln!(w, "{text}"),
+        }
+    }
+}
+
 /// Entry point for `boatramp config`.
-pub async fn run(args: ConfigArgs, config: &ProjectConfig) -> Result<()> {
-    // `list` / `describe` / `migrate` are static — no server needed.
+pub async fn run(args: ConfigArgs, config: &ProjectConfig) -> Result<ConfigOutput> {
+    // `list` / `describe` / `migrate` / `dump` are static — no server needed.
     match &args.command {
         ConfigCommand::List => {
-            print_list();
-            return Ok(());
+            return Ok(ConfigOutput::List {
+                keys: dynamic_keys(),
+            });
         }
         ConfigCommand::Describe { key } => {
-            describe(key);
-            return Ok(());
+            return Ok(describe(key));
         }
         ConfigCommand::Migrate { file, write } => {
             return migrate_manifest(file, *write);
         }
         ConfigCommand::Dump { file, explain } => {
             let resolved = crate::config::ServerConfig::load(file, None)?;
-            println!("{}", resolved.dump_redacted()?);
+            let text = resolved.dump_redacted()?;
             if *explain {
-                eprintln!(
+                tracing::info!(
                     "resolved: built-in defaults < {} < BOATRAMP_* env  (secret fields redacted)",
                     file.display()
                 );
             }
-            return Ok(());
+            let config = serde_json::from_str(&text)?;
+            return Ok(ConfigOutput::Dump { text, config });
         }
         _ => {}
     }
@@ -174,19 +316,23 @@ pub async fn run(args: ConfigArgs, config: &ProjectConfig) -> Result<()> {
 /// pipeline on `file` and print (or, with `--write`, rewrite in place) the upgraded
 /// manifest. The upgraded output omits `version:` (current = absent). Client-side
 /// only — no server is contacted; the migration's advisory warnings go to stderr.
-fn migrate_manifest(file: &std::path::Path, write: bool) -> Result<()> {
+fn migrate_manifest(file: &std::path::Path, write: bool) -> Result<ConfigOutput> {
     let text = std::fs::read_to_string(file)?;
     // Runs the full loose-parse → migrate → typed pipeline (a version-less or
     // already-current manifest is a no-op that simply re-renders as current).
     let manifest = crate::apply::ApplyManifest::parse(&text)?;
     let upgraded = crate::apply_migrate::render_manifest(&manifest)?;
-    if write {
+    let written_to = if write {
         std::fs::write(file, &upgraded)?;
-        eprintln!("upgraded {} to the current (v0.6.0) schema", file.display());
+        tracing::info!("upgraded {} to the current (v0.6.0) schema", file.display());
+        Some(file.display().to_string())
     } else {
-        print!("{upgraded}");
-    }
-    Ok(())
+        None
+    };
+    Ok(ConfigOutput::Migrated {
+        written_to,
+        manifest: upgraded,
+    })
 }
 
 async fn fetch(http: &crate::client::ApiClient, server: &str) -> Result<ConfigResponse> {
@@ -212,56 +358,66 @@ async fn put(http: &crate::client::ApiClient, server: &str, cfg: &DaemonConfig) 
     Ok(v["generation"].as_str().unwrap_or("").to_string())
 }
 
-async fn get(http: &crate::client::ApiClient, server: &str, key: Option<String>) -> Result<()> {
+async fn get(
+    http: &crate::client::ApiClient,
+    server: &str,
+    key: Option<String>,
+) -> Result<ConfigOutput> {
     let r = fetch(http, server).await?;
-    match key {
-        None => {
-            println!(
-                "generation: {}",
-                r.generation.as_deref().unwrap_or("(file baseline)")
-            );
-            println!("{}", serde_json::to_string_pretty(&r.config)?);
+    Ok(match key {
+        None => ConfigOutput::Get {
+            generation: r.generation,
+            config: Box::new(r.config),
+        },
+        Some(k) => {
+            let value = read_key(&r.config, &k)?;
+            ConfigOutput::GetKey { key: k, value }
         }
-        Some(k) => println!("{}", read_key(&r.config, &k)?),
-    }
-    Ok(())
+    })
 }
 
-async fn set(http: &crate::client::ApiClient, server: &str, key: &str, value: &str) -> Result<()> {
+async fn set(
+    http: &crate::client::ApiClient,
+    server: &str,
+    key: &str,
+    value: &str,
+) -> Result<ConfigOutput> {
     let mut r = fetch(http, server).await?;
     write_key(&mut r.config, key, value)?;
     let generation = put(http, server, &r.config).await?;
-    println!("set {key} = {value}  (generation {generation})");
-    Ok(())
+    Ok(ConfigOutput::Set {
+        key: key.to_string(),
+        value: value.to_string(),
+        generation,
+    })
 }
 
-async fn rollback(http: &crate::client::ApiClient, server: &str) -> Result<()> {
+async fn rollback(http: &crate::client::ApiClient, server: &str) -> Result<ConfigOutput> {
     let resp = http
         .post(format!("{server}/api/daemon/config/rollback"))
         .send()
         .await?;
     if resp.status() == reqwest::StatusCode::CONFLICT {
-        println!("no prior generation to roll back to");
-        return Ok(());
+        return Ok(ConfigOutput::RolledBack { generation: None });
     }
     let v: serde_json::Value = resp.error_for_status()?.json().await?;
-    println!(
-        "rolled back to generation {}",
-        v["generation"].as_str().unwrap_or("?")
-    );
-    Ok(())
+    Ok(ConfigOutput::RolledBack {
+        generation: Some(v["generation"].as_str().unwrap_or("?").to_string()),
+    })
 }
 
 async fn apply(
     http: &crate::client::ApiClient,
     server: &str,
     file: &std::path::Path,
-) -> Result<()> {
+) -> Result<ConfigOutput> {
     let bytes = std::fs::read(file)?;
     let cfg: DaemonConfig = serde_json::from_slice(&bytes)?;
     let generation = put(http, server, &cfg).await?;
-    println!("applied {} (generation {generation})", file.display());
-    Ok(())
+    Ok(ConfigOutput::Applied {
+        file: file.display().to_string(),
+        generation,
+    })
 }
 
 /// A cleared value (`null`/`unset`/empty) resets the key to the file baseline.
@@ -377,26 +533,39 @@ fn read_key(cfg: &DaemonConfig, key: &str) -> Result<String> {
     })
 }
 
-fn print_list() {
-    println!("Dynamic keys (change fleet-wide with `config set`, no restart):");
-    for (k, class) in DYNAMIC_KEYS {
-        println!("  {k:<32} {class}");
-    }
-    println!("\nTrust anchors + posture + listener settings are restart-class");
-    println!("(edit boatramp.cfg + restart). See `config describe <key>`.");
+/// The dynamic-key rows for `config list` (JSON + human).
+fn dynamic_keys() -> Vec<DynKey> {
+    DYNAMIC_KEYS
+        .iter()
+        .map(|(key, note)| DynKey {
+            key: (*key).to_string(),
+            note: (*note).to_string(),
+        })
+        .collect()
 }
 
-fn describe(key: &str) {
+fn describe(key: &str) -> ConfigOutput {
     if let Some(section) = restart_class_section(key) {
-        println!("{key}: restart-class — edit `[{section}]` in boatramp.cfg + restart.");
-        return;
+        return ConfigOutput::Describe {
+            key: key.to_string(),
+            class: "restart",
+            section: Some(section),
+            note: None,
+        };
     }
     match DYNAMIC_KEYS.iter().find(|(k, _)| *k == key) {
-        Some((_, class)) => {
-            println!("{key}: dynamic — `config set` converges it fleet-wide without a restart.");
-            println!("  {class}");
-        }
-        None => println!("{key}: unknown; run `config list`."),
+        Some((_, class)) => ConfigOutput::Describe {
+            key: key.to_string(),
+            class: "dynamic",
+            section: None,
+            note: Some(*class),
+        },
+        None => ConfigOutput::Describe {
+            key: key.to_string(),
+            class: "unknown",
+            section: None,
+            note: None,
+        },
     }
 }
 

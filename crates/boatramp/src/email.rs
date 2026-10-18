@@ -114,15 +114,45 @@ enum EmailCommand {
     },
 }
 
+/// The result of an `email` subcommand, rendered by [`crate::output`].
+#[derive(Debug, serde::Serialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum EmailOutput {
+    /// `email set` — the created/updated profile (redacted).
+    Set { profile: EmailProfileInfo },
+    /// `email ls` — the project's profiles (redacted).
+    List { profiles: Vec<EmailProfileInfo> },
+    /// `email show` — one profile's redacted config.
+    Show { profile: EmailProfileInfo },
+    /// `email rm` — a profile removed by name.
+    Removed { name: String },
+}
+
+impl crate::output::Rendered for EmailOutput {
+    fn render_human(&self, w: &mut dyn std::io::Write) -> std::io::Result<()> {
+        match self {
+            // Never echo the password; confirm by redacted config only.
+            Self::Set { profile: p } => writeln!(
+                w,
+                "set email profile {} ({} {}:{} from {})",
+                p.name, p.security, p.host, p.port, p.from
+            ),
+            Self::List { profiles } => write_list(w, profiles),
+            Self::Show { profile: p } => write_show(w, p),
+            Self::Removed { name } => writeln!(w, "removed email profile {name}"),
+        }
+    }
+}
+
 /// Entry point for `boatramp email`.
-pub async fn run(args: EmailArgs, config: &ProjectConfig) -> Result<()> {
+pub async fn run(args: EmailArgs, config: &ProjectConfig) -> Result<EmailOutput> {
     let server = client::resolve_server(args.server, config)?;
     let http = client::http_client(client::token(config).as_deref());
     // The project-scoped collection segment (`email` for the default project, else
     // `projects/<proj>/email`) — the same `--project` routing as secrets/function.
     let seg = client::project_seg(&client::resolve_project(config), "email");
 
-    match args.command {
+    let out = match args.command {
         EmailCommand::Set {
             name,
             host,
@@ -150,11 +180,7 @@ pub async fn run(args: EmailArgs, config: &ProjectConfig) -> Result<()> {
                 .send()
                 .await?;
             let info: EmailProfileInfo = parse_json(resp).await?;
-            // Never echo the password; confirm by redacted config only.
-            println!(
-                "set email profile {} ({} {}:{} from {})",
-                info.name, info.security, info.host, info.port, info.from
-            );
+            EmailOutput::Set { profile: info }
         }
         EmailCommand::Ls => {
             let resp = http
@@ -162,24 +188,7 @@ pub async fn run(args: EmailArgs, config: &ProjectConfig) -> Result<()> {
                 .send()
                 .await?;
             let profiles: Vec<EmailProfileInfo> = parse_json(resp).await?;
-            if profiles.is_empty() {
-                println!("no email profiles");
-                return Ok(());
-            }
-            println!(
-                "{:<20}  {:<28}  {:<10}  {:<28}  DURABLE",
-                "NAME", "HOST", "SECURITY", "FROM"
-            );
-            for p in profiles {
-                println!(
-                    "{:<20}  {:<28}  {:<10}  {:<28}  {}",
-                    p.name,
-                    format!("{}:{}", p.host, p.port),
-                    p.security,
-                    p.from,
-                    p.durable
-                );
-            }
+            EmailOutput::List { profiles }
         }
         EmailCommand::Show { name } => {
             let resp = http
@@ -187,23 +196,7 @@ pub async fn run(args: EmailArgs, config: &ProjectConfig) -> Result<()> {
                 .send()
                 .await?;
             let p: EmailProfileInfo = parse_json(resp).await?;
-            println!("name:     {}", p.name);
-            println!("host:     {}:{}", p.host, p.port);
-            println!("security: {}", p.security);
-            println!(
-                "username: {}",
-                p.username.as_deref().unwrap_or("(none — unauthenticated)")
-            );
-            println!(
-                "password: {}",
-                if p.has_password {
-                    "(set, sealed)"
-                } else {
-                    "(none)"
-                }
-            );
-            println!("from:     {}", p.from);
-            println!("durable:  {}", p.durable);
+            EmailOutput::Show { profile: p }
         }
         EmailCommand::Rm { name } => {
             let resp = http
@@ -211,10 +204,57 @@ pub async fn run(args: EmailArgs, config: &ProjectConfig) -> Result<()> {
                 .send()
                 .await?;
             check_no_content(resp).await?;
-            println!("removed email profile {name}");
+            EmailOutput::Removed { name }
         }
+    };
+    Ok(out)
+}
+
+/// Write the redacted profile listing (`email ls`).
+fn write_list(w: &mut dyn std::io::Write, profiles: &[EmailProfileInfo]) -> std::io::Result<()> {
+    if profiles.is_empty() {
+        return writeln!(w, "no email profiles");
+    }
+    writeln!(
+        w,
+        "{:<20}  {:<28}  {:<10}  {:<28}  DURABLE",
+        "NAME", "HOST", "SECURITY", "FROM"
+    )?;
+    for p in profiles {
+        writeln!(
+            w,
+            "{:<20}  {:<28}  {:<10}  {:<28}  {}",
+            p.name,
+            format!("{}:{}", p.host, p.port),
+            p.security,
+            p.from,
+            p.durable
+        )?;
     }
     Ok(())
+}
+
+/// Write one profile's redacted config (`email show`).
+fn write_show(w: &mut dyn std::io::Write, p: &EmailProfileInfo) -> std::io::Result<()> {
+    writeln!(w, "name:     {}", p.name)?;
+    writeln!(w, "host:     {}:{}", p.host, p.port)?;
+    writeln!(w, "security: {}", p.security)?;
+    writeln!(
+        w,
+        "username: {}",
+        p.username.as_deref().unwrap_or("(none — unauthenticated)")
+    )?;
+    writeln!(
+        w,
+        "password: {}",
+        if p.has_password {
+            "(set, sealed)"
+        } else {
+            "(none)"
+        }
+    )?;
+    writeln!(w, "from:     {}", p.from)?;
+    writeln!(w, "durable:  {}", p.durable)
 }
 
 /// The `set` request body — mirrors the server's `SetEmailProfileRequest`. The

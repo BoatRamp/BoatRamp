@@ -163,8 +163,94 @@ enum TrustedProxyCommand {
     Clear,
 }
 
+/// The result of an `access` subcommand, rendered by [`crate::output`].
+#[derive(Debug, serde::Serialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum AccessOutput {
+    /// `access show` — the site's current access-control policy.
+    Show {
+        access: boatramp_core::access::AccessConfig,
+    },
+    /// A Basic-auth user was added or updated.
+    BasicAuthAdded { user: String, site: String },
+    /// A Basic-auth user was removed.
+    BasicAuthRemoved { user: String, site: String },
+    /// Basic auth was disabled (all credentials removed).
+    BasicAuthCleared { site: String },
+    /// An IP allow rule was added.
+    IpAllowed { cidr: String, site: String },
+    /// An IP deny rule was added.
+    IpDenied { cidr: String, site: String },
+    /// All IP rules were removed.
+    IpCleared { site: String },
+    /// Rate limiting was set. `burst` is the value the human line shows
+    /// (`burst.unwrap_or(rps)`).
+    RateLimitSet { rps: u32, burst: u32, site: String },
+    /// Rate limiting was disabled.
+    RateLimitOff { site: String },
+    /// A trusted reverse proxy was added.
+    TrustedProxyAdded { cidr: String, site: String },
+    /// All trusted proxies were removed.
+    TrustedProxyCleared { site: String },
+    /// WAF user-agent filtering was enabled.
+    WafUserAgentEnabled { site: String },
+    /// WAF user-agent filtering was disabled.
+    WafUserAgentDisabled { site: String },
+    /// WAF anomaly scoring was enabled; `threshold` is the resolved block threshold.
+    WafAnomalyEnabled { site: String, threshold: u32 },
+    /// WAF anomaly scoring was disabled.
+    WafAnomalyDisabled { site: String },
+}
+
+impl crate::output::Rendered for AccessOutput {
+    fn render_human(&self, w: &mut dyn std::io::Write) -> std::io::Result<()> {
+        match self {
+            Self::Show { access } => write_access(access, w),
+            Self::BasicAuthAdded { user, site } => {
+                writeln!(w, "added basic-auth user {user} to {site}")
+            }
+            Self::BasicAuthRemoved { user, site } => {
+                writeln!(w, "removed basic-auth user {user} from {site}")
+            }
+            Self::BasicAuthCleared { site } => {
+                writeln!(w, "disabled basic auth for {site}")
+            }
+            Self::IpAllowed { cidr, site } => writeln!(w, "allow {cidr} on {site}"),
+            Self::IpDenied { cidr, site } => writeln!(w, "deny {cidr} on {site}"),
+            Self::IpCleared { site } => writeln!(w, "cleared IP rules for {site}"),
+            Self::RateLimitSet { rps, burst, site } => {
+                writeln!(w, "rate limit {rps} req/s (burst {burst}) on {site}")
+            }
+            Self::RateLimitOff { site } => {
+                writeln!(w, "disabled rate limiting for {site}")
+            }
+            Self::TrustedProxyAdded { cidr, site } => {
+                writeln!(w, "trust proxy {cidr} on {site}")
+            }
+            Self::TrustedProxyCleared { site } => {
+                writeln!(w, "cleared trusted proxies for {site}")
+            }
+            Self::WafUserAgentEnabled { site } => {
+                writeln!(w, "waf: user-agent filtering enabled for {site}")
+            }
+            Self::WafUserAgentDisabled { site } => {
+                writeln!(w, "waf: user-agent filtering disabled for {site}")
+            }
+            Self::WafAnomalyEnabled { site, threshold } => {
+                writeln!(
+                    w,
+                    "waf: anomaly scoring enabled for {site} (threshold {threshold})"
+                )
+            }
+            Self::WafAnomalyDisabled { site } => {
+                writeln!(w, "waf: anomaly scoring disabled for {site}")
+            }
+        }
+    }
+}
+
 /// Entry point for `boatramp access`.
-pub async fn run(args: AccessArgs, config: &ProjectConfig) -> Result<()> {
+pub async fn run(args: AccessArgs, config: &ProjectConfig) -> Result<AccessOutput> {
     let (server, site) = client::resolve_target(args.server, args.site, config)?;
     let cp = client::ControlPlane::new(
         server,
@@ -174,10 +260,12 @@ pub async fn run(args: AccessArgs, config: &ProjectConfig) -> Result<()> {
     let mut site_config = cp.fetch_site_config(&site).await?;
     let access = &mut site_config.access;
 
-    match args.command {
+    let out = match args.command {
         AccessCommand::Show => {
-            print_access(&site_config.access);
-            return Ok(());
+            // Read-only; no write-back.
+            return Ok(AccessOutput::Show {
+                access: access.clone(),
+            });
         }
         AccessCommand::BasicAuth { command } => match command {
             BasicAuthCommand::Add {
@@ -201,7 +289,10 @@ pub async fn run(args: AccessArgs, config: &ProjectConfig) -> Result<()> {
                     basic.realm = realm;
                 }
                 basic.users.insert(user.clone(), hash);
-                println!("added basic-auth user {user} to {site}");
+                AccessOutput::BasicAuthAdded {
+                    user,
+                    site: site.clone(),
+                }
             }
             BasicAuthCommand::Rm { user } => {
                 if let Some(basic) = &mut access.basic_auth {
@@ -210,26 +301,35 @@ pub async fn run(args: AccessArgs, config: &ProjectConfig) -> Result<()> {
                         access.basic_auth = None;
                     }
                 }
-                println!("removed basic-auth user {user} from {site}");
+                AccessOutput::BasicAuthRemoved {
+                    user,
+                    site: site.clone(),
+                }
             }
             BasicAuthCommand::Clear => {
                 access.basic_auth = None;
-                println!("disabled basic auth for {site}");
+                AccessOutput::BasicAuthCleared { site: site.clone() }
             }
         },
         AccessCommand::Ip { command } => match command {
             IpCommand::Allow { cidr } => {
                 push_unique(&mut access.ip.allow, &cidr);
-                println!("allow {cidr} on {site}");
+                AccessOutput::IpAllowed {
+                    cidr,
+                    site: site.clone(),
+                }
             }
             IpCommand::Deny { cidr } => {
                 push_unique(&mut access.ip.deny, &cidr);
-                println!("deny {cidr} on {site}");
+                AccessOutput::IpDenied {
+                    cidr,
+                    site: site.clone(),
+                }
             }
             IpCommand::Clear => {
                 access.ip.allow.clear();
                 access.ip.deny.clear();
-                println!("cleared IP rules for {site}");
+                AccessOutput::IpCleared { site: site.clone() }
             }
         },
         AccessCommand::RateLimit { command } => match command {
@@ -241,24 +341,28 @@ pub async fn run(args: AccessArgs, config: &ProjectConfig) -> Result<()> {
                     rps,
                     burst: burst.unwrap_or(0),
                 });
-                println!(
-                    "rate limit {rps} req/s (burst {}) on {site}",
-                    burst.unwrap_or(rps)
-                );
+                AccessOutput::RateLimitSet {
+                    rps,
+                    burst: burst.unwrap_or(rps),
+                    site: site.clone(),
+                }
             }
             RateLimitCommand::Off => {
                 access.rate_limit = None;
-                println!("disabled rate limiting for {site}");
+                AccessOutput::RateLimitOff { site: site.clone() }
             }
         },
         AccessCommand::TrustedProxy { command } => match command {
             TrustedProxyCommand::Add { cidr } => {
                 push_unique(&mut access.trusted_proxies, &cidr);
-                println!("trust proxy {cidr} on {site}");
+                AccessOutput::TrustedProxyAdded {
+                    cidr,
+                    site: site.clone(),
+                }
             }
             TrustedProxyCommand::Clear => {
                 access.trusted_proxies.clear();
-                println!("cleared trusted proxies for {site}");
+                AccessOutput::TrustedProxyCleared { site: site.clone() }
             }
         },
         AccessCommand::Waf { command } => match command {
@@ -270,31 +374,31 @@ pub async fn run(args: AccessArgs, config: &ProjectConfig) -> Result<()> {
                 if !allow.is_empty() {
                     access.waf.user_agent.allow = allow;
                 }
-                println!("waf: user-agent filtering enabled for {site}");
+                AccessOutput::WafUserAgentEnabled { site: site.clone() }
             }
             WafCommand::UserAgentOff => {
                 access.waf.user_agent.enabled = false;
-                println!("waf: user-agent filtering disabled for {site}");
+                AccessOutput::WafUserAgentDisabled { site: site.clone() }
             }
             WafCommand::Anomaly { threshold } => {
                 access.waf.anomaly.enabled = true;
                 if let Some(t) = threshold {
                     access.waf.anomaly.threshold = t;
                 }
-                println!(
-                    "waf: anomaly scoring enabled for {site} (threshold {})",
-                    access.waf.anomaly.threshold
-                );
+                AccessOutput::WafAnomalyEnabled {
+                    site: site.clone(),
+                    threshold: access.waf.anomaly.threshold,
+                }
             }
             WafCommand::AnomalyOff => {
                 access.waf.anomaly.enabled = false;
-                println!("waf: anomaly scoring disabled for {site}");
+                AccessOutput::WafAnomalyDisabled { site: site.clone() }
             }
         },
-    }
+    };
 
     cp.put_site_config(&site, &site_config).await?;
-    Ok(())
+    Ok(out)
 }
 
 /// Append `value` if not already present.
@@ -311,34 +415,40 @@ fn read_stdin_line() -> Result<String> {
     Ok(buf.trim().to_string())
 }
 
-/// Print a human-readable summary of an access policy.
-fn print_access(access: &boatramp_core::access::AccessConfig) {
+/// Write a human-readable summary of an access policy to `w`.
+fn write_access(
+    access: &boatramp_core::access::AccessConfig,
+    w: &mut dyn std::io::Write,
+) -> std::io::Result<()> {
     if !access.is_enforced() && access.trusted_proxies.is_empty() {
-        println!("no access control configured");
-        return;
+        writeln!(w, "no access control configured")?;
+        return Ok(());
     }
     if let Some(basic) = &access.basic_auth {
         let users: Vec<&str> = basic.users.keys().map(String::as_str).collect();
-        println!(
+        writeln!(
+            w,
             "basic-auth   realm \"{}\", users: {}",
             basic.realm,
             users.join(", ")
-        );
+        )?;
     }
     if !access.ip.allow.is_empty() {
-        println!("ip allow     {}", access.ip.allow.join(", "));
+        writeln!(w, "ip allow     {}", access.ip.allow.join(", "))?;
     }
     if !access.ip.deny.is_empty() {
-        println!("ip deny      {}", access.ip.deny.join(", "));
+        writeln!(w, "ip deny      {}", access.ip.deny.join(", "))?;
     }
     if let Some(rl) = &access.rate_limit {
-        println!(
+        writeln!(
+            w,
             "rate limit   {} req/s, burst {}",
             rl.rps,
             rl.burst_capacity()
-        );
+        )?;
     }
     if !access.trusted_proxies.is_empty() {
-        println!("trusted px   {}", access.trusted_proxies.join(", "));
+        writeln!(w, "trusted px   {}", access.trusted_proxies.join(", "))?;
     }
+    Ok(())
 }

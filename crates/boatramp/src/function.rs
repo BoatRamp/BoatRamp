@@ -6,7 +6,7 @@
 //! carrying its own independent version line. `function invoke` lands in FA-3.
 
 use boatramp_core::function::FunctionSummary;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::client;
 use crate::config::ProjectConfig;
@@ -293,8 +293,8 @@ enum TriggerCommand {
 }
 
 /// A stored trigger as `/triggers` reports it (id + kind).
-#[derive(Debug, Deserialize)]
-struct TriggerView {
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct TriggerView {
     id: String,
     kind: serde_json::Value,
 }
@@ -317,8 +317,8 @@ struct StoredConfig {
 
 /// A durable invocation record as `/invoke` (async) and `/invocations/:id`
 /// report it — the fields the CLI surfaces.
-#[derive(Debug, Deserialize)]
-struct InvocationRecord {
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct InvocationRecord {
     id: String,
     status: String,
     #[serde(default)]
@@ -327,14 +327,14 @@ struct InvocationRecord {
     result: Option<InvocationResultView>,
 }
 
-#[derive(Debug, Deserialize)]
-struct InvocationResultView {
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct InvocationResultView {
     status: u16,
 }
 
 /// A function's usage aggregate as `/usage` reports it (FA-4).
-#[derive(Debug, Default, Deserialize)]
-struct UsageView {
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub(crate) struct UsageView {
     function: String,
     #[serde(default)]
     invocations: u64,
@@ -350,62 +350,230 @@ struct UsageView {
     bytes_out_total: u64,
 }
 
+/// The result of a `function` subcommand, rendered by [`crate::output`].
+// `Get`/`List` carry the full `FunctionSummary`; a larger result variant is fine
+// and clearer than boxing every data payload.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Serialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum FunctionOutput {
+    /// `function ls` — the functions view.
+    List { functions: Vec<FunctionSummary> },
+    /// `function get` — one function's detail.
+    Get { function: FunctionSummary },
+    /// `function get` — no function by that name.
+    GetNotFound { name: String },
+    /// A function version was deployed.
+    Deployed {
+        name: String,
+        runtime: String,
+        /// The full active version id (shortened in the human view).
+        version: String,
+    },
+    /// A function's active version was rolled back.
+    RolledBack {
+        name: String,
+        /// The full active version id (shortened in the human view).
+        version: String,
+    },
+    /// An alias label was pointed at a version.
+    Aliased {
+        name: String,
+        label: String,
+        /// The full target version id (shortened in the human view).
+        version: String,
+    },
+    /// A top-level function was removed.
+    Removed { name: String },
+    /// A synchronous invoke's response: the HTTP status and the raw response
+    /// body (written verbatim to stdout for humans; a lossy string in JSON).
+    Invoked {
+        status: u16,
+        #[serde(serialize_with = "serialize_body_lossy")]
+        body: Vec<u8>,
+    },
+    /// An async invoke was queued.
+    Queued { id: String, status: String },
+    /// `function invocation` — a durable invocation's status/result.
+    Invocation { invocation: InvocationRecord },
+    /// `function usage` — a function's usage aggregate.
+    Usage { usage: UsageView },
+    /// A trigger was added.
+    TriggerAdded { name: String, id: String },
+    /// `function trigger ls` — a function's triggers.
+    Triggers { triggers: Vec<TriggerView> },
+    /// A trigger was removed.
+    TriggerRemoved { name: String, id: String },
+    /// `function init` — a project was scaffolded.
+    Scaffolded {
+        crate_name: String,
+        dir: std::path::PathBuf,
+    },
+    /// `function build` — a component was produced.
+    Built { component: std::path::PathBuf },
+    /// `function test` — the harness ran one request and the assertions passed.
+    #[cfg(feature = "handlers")]
+    TestResult { status: u16, body: String },
+}
+
+impl crate::output::Rendered for FunctionOutput {
+    fn render_human(&self, w: &mut dyn std::io::Write) -> std::io::Result<()> {
+        match self {
+            Self::List { functions } => {
+                if functions.is_empty() {
+                    return writeln!(w, "no functions");
+                }
+                for f in functions {
+                    writeln!(
+                        w,
+                        "{}  [{}]  {}  {}",
+                        f.name,
+                        f.runtime,
+                        short(&f.version),
+                        f.triggers.join(", ")
+                    )?;
+                }
+                Ok(())
+            }
+            Self::Get { function } => write_function(function, w),
+            Self::GetNotFound { name } => writeln!(w, "no function {name:?}"),
+            Self::Deployed {
+                name,
+                runtime,
+                version,
+            } => writeln!(w, "deployed {name}  [{runtime}]  {}", short(version)),
+            Self::RolledBack { name, version } => {
+                writeln!(w, "rolled {name} back to {}", short(version))
+            }
+            Self::Aliased {
+                name,
+                label,
+                version,
+            } => writeln!(w, "aliased {name}:{label} -> {}", short(version)),
+            Self::Removed { name } => writeln!(w, "removed {name}"),
+            // Write the function's response body verbatim (status rides the JSON shape).
+            Self::Invoked { body, .. } => w.write_all(body),
+            Self::Queued { id, status } => writeln!(w, "queued {id} [{status}]"),
+            Self::Invocation { invocation } => {
+                writeln!(
+                    w,
+                    "{}  [{}]  attempts={}",
+                    invocation.id, invocation.status, invocation.attempts
+                )?;
+                if let Some(result) = &invocation.result {
+                    writeln!(w, "  result: HTTP {}", result.status)?;
+                }
+                Ok(())
+            }
+            Self::Usage { usage } => {
+                writeln!(w, "{}", usage.function)?;
+                writeln!(
+                    w,
+                    "  invocations: {} ({} ok, {} failed)",
+                    usage.invocations, usage.successes, usage.failures
+                )?;
+                writeln!(w, "  duration:    {} ms total", usage.duration_ms_total)?;
+                writeln!(
+                    w,
+                    "  bytes:       {} in / {} out",
+                    usage.bytes_in_total, usage.bytes_out_total
+                )
+            }
+            Self::TriggerAdded { name, id } => writeln!(w, "added trigger {name}/{id}"),
+            Self::Triggers { triggers } => {
+                if triggers.is_empty() {
+                    return writeln!(w, "no triggers");
+                }
+                for t in triggers {
+                    let kind = t.kind.get("type").and_then(|v| v.as_str()).unwrap_or("?");
+                    writeln!(w, "{}  [{}]", t.id, kind)?;
+                }
+                Ok(())
+            }
+            Self::TriggerRemoved { name, id } => {
+                writeln!(w, "removed trigger {name}/{id}")
+            }
+            Self::Scaffolded { crate_name, dir } => {
+                writeln!(w, "scaffolded {crate_name} in {}", dir.display())?;
+                writeln!(w, "  next: cd {crate_name} && boatramp function build")
+            }
+            Self::Built { component } => {
+                writeln!(w, "built {}", component.display())?;
+                writeln!(
+                    w,
+                    "  deploy: boatramp function deploy <name> --component {}",
+                    component.display()
+                )
+            }
+            #[cfg(feature = "handlers")]
+            Self::TestResult { status, body } => {
+                writeln!(w, "HTTP {status}")?;
+                write!(w, "{body}")?;
+                if !body.ends_with('\n') {
+                    writeln!(w)?;
+                }
+                writeln!(w, "ok")
+            }
+        }
+    }
+}
+
+/// Serialize a raw response body as a (lossy) UTF-8 string for JSON consumers.
+fn serialize_body_lossy<S>(body: &[u8], s: S) -> std::result::Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    s.serialize_str(&String::from_utf8_lossy(body))
+}
+
+/// Write one function's detail view (`function get`).
+fn write_function(f: &FunctionSummary, w: &mut dyn std::io::Write) -> std::io::Result<()> {
+    writeln!(w, "{}", f.name)?;
+    writeln!(w, "  runtime: {}", f.runtime)?;
+    writeln!(w, "  version: {}", f.version)?;
+    // The effective in-site tenancy so an operator can confirm pass-vs-deny without
+    // probing. `None` ⇒ the route declares no tenancy (inherits the site decision).
+    match &f.tenancy {
+        Some(t) => {
+            let mut parts = vec![format!("mode={}", t.mode)];
+            if let Some(c) = &t.column {
+                parts.push(format!("column={c}"));
+            }
+            if let Some(r) = &t.read {
+                parts.push(format!("read={r}"));
+            }
+            if let Some(wr) = &t.write {
+                parts.push(format!("write={wr}"));
+            }
+            if let Some(u) = &t.on_unresolved {
+                parts.push(format!("on_unresolved={u}"));
+            }
+            writeln!(w, "  tenancy: {}", parts.join(" "))?;
+        }
+        None => writeln!(w, "  tenancy: (none — inherits the site decision)")?,
+    }
+    for t in &f.triggers {
+        writeln!(w, "  trigger: {t}")?;
+    }
+    Ok(())
+}
+
 /// Run the `function` subcommand.
-pub async fn run(args: FunctionArgs, config: &ProjectConfig) -> Result<()> {
+pub async fn run(args: FunctionArgs, config: &ProjectConfig) -> Result<FunctionOutput> {
     // Honor `--project`: every function URL is scoped to the collection segment
     // (`functions` for default, else `projects/<proj>/functions`), so `--project` is
     // no longer silently dropped on the deploy/config path.
     let seg = client::project_seg(&client::resolve_project(config), "functions");
-    match args.command {
+    let out = match args.command {
         FunctionCommand::Ls { site, server } => {
             let funcs = fetch(server, site, config).await?;
-            if funcs.is_empty() {
-                println!("no functions");
-                return Ok(());
-            }
-            for f in funcs {
-                println!(
-                    "{}  [{}]  {}  {}",
-                    f.name,
-                    f.runtime,
-                    short(&f.version),
-                    f.triggers.join(", ")
-                );
-            }
+            FunctionOutput::List { functions: funcs }
         }
         FunctionCommand::Get { name, server } => {
             let funcs = fetch(server, None, config).await?;
             match funcs.into_iter().find(|f| f.name == name) {
-                Some(f) => {
-                    println!("{}", f.name);
-                    println!("  runtime: {}", f.runtime);
-                    println!("  version: {}", f.version);
-                    // The effective in-site tenancy so an operator can confirm pass-vs-deny without
-                    // probing. `None` ⇒ the route declares no tenancy (inherits the site decision).
-                    match &f.tenancy {
-                        Some(t) => {
-                            let mut parts = vec![format!("mode={}", t.mode)];
-                            if let Some(c) = &t.column {
-                                parts.push(format!("column={c}"));
-                            }
-                            if let Some(r) = &t.read {
-                                parts.push(format!("read={r}"));
-                            }
-                            if let Some(w) = &t.write {
-                                parts.push(format!("write={w}"));
-                            }
-                            if let Some(u) = &t.on_unresolved {
-                                parts.push(format!("on_unresolved={u}"));
-                            }
-                            println!("  tenancy: {}", parts.join(" "));
-                        }
-                        None => println!("  tenancy: (none — inherits the site decision)"),
-                    }
-                    for t in &f.triggers {
-                        println!("  trigger: {t}");
-                    }
-                }
-                None => println!("no function {name:?}"),
+                Some(f) => FunctionOutput::Get { function: f },
+                None => FunctionOutput::GetNotFound { name },
             }
         }
         FunctionCommand::Deploy {
@@ -451,12 +619,11 @@ pub async fn run(args: FunctionArgs, config: &ProjectConfig) -> Result<()> {
                 .error_for_status()?
                 .json()
                 .await?;
-            println!(
-                "deployed {}  [{}]  {}",
-                f.name,
-                f.config.runtime,
-                short(&f.active)
-            );
+            FunctionOutput::Deployed {
+                name: f.name,
+                runtime: f.config.runtime,
+                version: f.active,
+            }
         }
         FunctionCommand::Rollback { name, to, server } => {
             let (server, http) = client::connect(server, config)?;
@@ -468,7 +635,10 @@ pub async fn run(args: FunctionArgs, config: &ProjectConfig) -> Result<()> {
                 .error_for_status()?
                 .json()
                 .await?;
-            println!("rolled {} back to {}", f.name, short(&f.active));
+            FunctionOutput::RolledBack {
+                name: f.name,
+                version: f.active,
+            }
         }
         FunctionCommand::Alias {
             name,
@@ -482,7 +652,11 @@ pub async fn run(args: FunctionArgs, config: &ProjectConfig) -> Result<()> {
                 .send()
                 .await?
                 .error_for_status()?;
-            println!("aliased {name}:{label} -> {}", short(&version));
+            FunctionOutput::Aliased {
+                name,
+                label,
+                version,
+            }
         }
         FunctionCommand::Rm { name, server } => {
             let (server, http) = client::connect(server, config)?;
@@ -490,7 +664,7 @@ pub async fn run(args: FunctionArgs, config: &ProjectConfig) -> Result<()> {
                 .send()
                 .await?
                 .error_for_status()?;
-            println!("removed {name}");
+            FunctionOutput::Removed { name }
         }
         FunctionCommand::Invoke {
             name,
@@ -529,16 +703,29 @@ pub async fn run(args: FunctionArgs, config: &ProjectConfig) -> Result<()> {
             if r#async {
                 // 202 + a JSON invocation record: surface the id to poll.
                 match serde_json::from_slice::<InvocationRecord>(&bytes) {
-                    Ok(inv) => println!("queued {} [{}]", inv.id, inv.status),
-                    Err(_) => eprint!("{}", String::from_utf8_lossy(&bytes)),
+                    Ok(inv) => FunctionOutput::Queued {
+                        id: inv.id,
+                        status: inv.status,
+                    },
+                    Err(_) => {
+                        // The 202 body was not a parseable record: surface it as a
+                        // diagnostic (was an stderr print); nothing structured follows.
+                        tracing::warn!("{}", String::from_utf8_lossy(&bytes));
+                        FunctionOutput::Invoked {
+                            status: status.as_u16(),
+                            body: Vec::new(),
+                        }
+                    }
                 }
             } else {
-                // Print the function's response body verbatim; note a non-success
-                // status on stderr (a control-plane 404/401, or the guest's own).
-                use std::io::Write;
-                let _ = std::io::stdout().write_all(&bytes);
+                // The response body is the result (rendered verbatim to stdout). Note a
+                // non-success status on stderr (a control-plane 404/401, or the guest's own).
                 if !status.is_success() {
-                    eprintln!("invoke returned HTTP {}", status.as_u16());
+                    tracing::warn!("invoke returned HTTP {}", status.as_u16());
+                }
+                FunctionOutput::Invoked {
+                    status: status.as_u16(),
+                    body: bytes.to_vec(),
                 }
             }
         }
@@ -551,10 +738,7 @@ pub async fn run(args: FunctionArgs, config: &ProjectConfig) -> Result<()> {
                 .error_for_status()?
                 .json()
                 .await?;
-            println!("{}  [{}]  attempts={}", inv.id, inv.status, inv.attempts);
-            if let Some(result) = &inv.result {
-                println!("  result: HTTP {}", result.status);
-            }
+            FunctionOutput::Invocation { invocation: inv }
         }
         FunctionCommand::Usage { name, server } => {
             let (server, http) = client::connect(server, config)?;
@@ -565,20 +749,20 @@ pub async fn run(args: FunctionArgs, config: &ProjectConfig) -> Result<()> {
                 .error_for_status()?
                 .json()
                 .await?;
-            println!("{}", usage.function);
-            println!(
-                "  invocations: {} ({} ok, {} failed)",
-                usage.invocations, usage.successes, usage.failures
-            );
-            println!("  duration:    {} ms total", usage.duration_ms_total);
-            println!(
-                "  bytes:       {} in / {} out",
-                usage.bytes_in_total, usage.bytes_out_total
-            );
+            FunctionOutput::Usage { usage }
         }
         FunctionCommand::Trigger(args) => run_trigger(args, config).await?,
-        FunctionCommand::Init { name, lang, dir } => init_project(&name, &lang, dir)?,
-        FunctionCommand::Build { dir } => build_project(dir).await?,
+        FunctionCommand::Init { name, lang, dir } => {
+            let scaffolded = init_project(&name, &lang, dir)?;
+            FunctionOutput::Scaffolded {
+                crate_name: scaffolded.crate_name,
+                dir: scaffolded.dir,
+            }
+        }
+        FunctionCommand::Build { dir } => {
+            let component = build_project(dir).await?;
+            FunctionOutput::Built { component }
+        }
         #[cfg(feature = "handlers")]
         FunctionCommand::Test {
             component,
@@ -598,18 +782,21 @@ pub async fn run(args: FunctionArgs, config: &ProjectConfig) -> Result<()> {
                 expect_status,
                 expect_body,
             )
-            .await?;
+            .await?
         }
         #[cfg(feature = "handlers")]
-        FunctionCommand::Dev { component, port } => harness::dev_serve(component, port).await?,
-    }
-    Ok(())
+        FunctionCommand::Dev { component, port } => {
+            // A long-running local dev server: it only ever returns on error.
+            match harness::dev_serve(component, port).await? {}
+        }
+    };
+    Ok(out)
 }
 
 /// Run the `function trigger` subcommand.
-async fn run_trigger(args: TriggerArgs, config: &ProjectConfig) -> Result<()> {
+async fn run_trigger(args: TriggerArgs, config: &ProjectConfig) -> Result<FunctionOutput> {
     let seg = client::project_seg(&client::resolve_project(config), "functions");
-    match args.command {
+    let out = match args.command {
         TriggerCommand::Add {
             name,
             id,
@@ -636,7 +823,7 @@ async fn run_trigger(args: TriggerArgs, config: &ProjectConfig) -> Result<()> {
                 .send()
                 .await?
                 .error_for_status()?;
-            println!("added trigger {name}/{id}");
+            FunctionOutput::TriggerAdded { name, id }
         }
         TriggerCommand::Ls { name, server } => {
             let (server, http) = client::connect(server, config)?;
@@ -647,14 +834,7 @@ async fn run_trigger(args: TriggerArgs, config: &ProjectConfig) -> Result<()> {
                 .error_for_status()?
                 .json()
                 .await?;
-            if list.is_empty() {
-                println!("no triggers");
-                return Ok(());
-            }
-            for t in list {
-                let kind = t.kind.get("type").and_then(|v| v.as_str()).unwrap_or("?");
-                println!("{}  [{}]", t.id, kind);
-            }
+            FunctionOutput::Triggers { triggers: list }
         }
         TriggerCommand::Rm { name, id, server } => {
             let (server, http) = client::connect(server, config)?;
@@ -662,10 +842,10 @@ async fn run_trigger(args: TriggerArgs, config: &ProjectConfig) -> Result<()> {
                 .send()
                 .await?
                 .error_for_status()?;
-            println!("removed trigger {name}/{id}");
+            FunctionOutput::TriggerRemoved { name, id }
         }
-    }
-    Ok(())
+    };
+    Ok(out)
 }
 
 /// Read the invoke request body: `--data` inline, `--data-file <path>` (`-` =
@@ -696,14 +876,16 @@ async fn read_invoke_body(
 /// wired (the template's shape); capability-backed local testing is future.
 #[cfg(feature = "handlers")]
 mod harness {
-    use super::{FunctionError, Result};
+    use super::{FunctionError, FunctionOutput, Result};
     use boatramp_handlers::{Bindings, HandlerEngine, Limits};
     use http_body_util::{BodyExt, Full};
 
     /// The engine's compile-cache key for a locally-run component (one per run).
     const LOCAL_HASH: &str = "function-local";
 
-    /// Run `component` against one request; print the response and assert.
+    /// Run `component` against one request; assert, and return the response for
+    /// rendering. Assertion failures are reported as diagnostics (stderr) and
+    /// turn into a [`FunctionError::HarnessFailed`].
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn test_component(
         component: std::path::PathBuf,
@@ -713,7 +895,7 @@ mod harness {
         content_type: Option<String>,
         expect_status: Option<u16>,
         expect_body: Option<String>,
-    ) -> Result<()> {
+    ) -> Result<FunctionOutput> {
         let wasm = tokio::fs::read(&component).await?;
         let engine = HandlerEngine::new(Limits::default(), 4).map_err(harness_err)?;
         let (status, body) = run_once(
@@ -726,28 +908,25 @@ mod harness {
         )
         .await?;
         let text = String::from_utf8_lossy(&body);
-        println!("HTTP {status}");
-        print!("{text}");
-        if !text.ends_with('\n') {
-            println!();
-        }
 
         let mut ok = true;
         if let Some(exp) = expect_status
             && status != exp
         {
-            eprintln!("FAIL: expected status {exp}, got {status}");
+            tracing::warn!("FAIL: expected status {exp}, got {status}");
             ok = false;
         }
         if let Some(sub) = &expect_body
             && !text.contains(sub.as_str())
         {
-            eprintln!("FAIL: body does not contain {sub:?}");
+            tracing::warn!("FAIL: body does not contain {sub:?}");
             ok = false;
         }
         if ok {
-            println!("ok");
-            Ok(())
+            Ok(FunctionOutput::TestResult {
+                status,
+                body: text.into_owned(),
+            })
         } else {
             Err(FunctionError::HarnessFailed)
         }
@@ -755,7 +934,11 @@ mod harness {
 
     /// Serve `component` locally on `127.0.0.1:<port>` until interrupted. Each
     /// request runs the component; the response is buffered (fine for local dev).
-    pub(super) async fn dev_serve(component: std::path::PathBuf, port: u16) -> Result<()> {
+    /// Only ever returns on error (hence the uninhabited `Ok` type).
+    pub(super) async fn dev_serve(
+        component: std::path::PathBuf,
+        port: u16,
+    ) -> Result<std::convert::Infallible> {
         use hyper::server::conn::http1;
         use hyper::service::service_fn;
         use hyper_util::rt::TokioIo;
@@ -764,7 +947,7 @@ mod harness {
         let wasm = Arc::new(tokio::fs::read(&component).await?);
         let engine = Arc::new(HandlerEngine::new(Limits::default(), 16).map_err(harness_err)?);
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
-        println!(
+        tracing::info!(
             "serving {} on http://127.0.0.1:{port}  (Ctrl-C to stop)",
             component.display()
         );

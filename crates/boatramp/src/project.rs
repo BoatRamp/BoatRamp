@@ -389,7 +389,7 @@ fn owned_names(plan: &serde_json::Value) -> Vec<(String, String)> {
 /// `boatramp project doctor`: scan every project (and the names it owns) for
 /// identifiers the v0.7.0 slug allowlist rejects. Read-only. Prints a table (or JSON
 /// under `--json`) and exits non-zero when any non-conforming name is found.
-async fn doctor(cp: &client::ControlPlane, json: bool) -> Result<()> {
+async fn doctor(cp: &client::ControlPlane, json: bool) -> Result<ProjectOutput> {
     let projects = cp.list_projects().await?;
     let mut findings: Vec<Finding> = Vec::new();
 
@@ -449,10 +449,15 @@ async fn doctor(cp: &client::ControlPlane, json: bool) -> Result<()> {
         }
     }
 
+    // `doctor` keeps its own output contract: a bespoke `--json` serialization and a
+    // non-zero exit when any finding is present (a CI preflight). Those are incompatible
+    // with the emit-once model (`emit` renders only the `Ok` value, and the findings must
+    // print *and* exit non-zero), so the findings/`--json` paths write directly here and
+    // signal via `Err`; only the clean human path flows through the typed result.
     if json {
         println!("{}", serde_json::to_string_pretty(&findings)?);
     } else if findings.is_empty() {
-        println!("no non-conforming identifiers found — every name is a valid v0.7.0 slug");
+        return Ok(ProjectOutput::DoctorClean);
     } else {
         println!(
             "{} non-conforming identifier{} (v0.7.0 slug allowlist):\n",
@@ -469,7 +474,8 @@ async fn doctor(cp: &client::ControlPlane, json: bool) -> Result<()> {
     }
 
     if findings.is_empty() {
-        Ok(())
+        // The `--json` clean path already wrote `[]`; nothing left for `emit` to render.
+        Ok(ProjectOutput::Passthrough)
     } else {
         // Non-zero exit for CI preflight (mirrors the migration-gate refusal style).
         Err(Error::Aborted(format!(
@@ -480,8 +486,123 @@ async fn doctor(cp: &client::ControlPlane, json: bool) -> Result<()> {
     }
 }
 
+/// The result of a `project` subcommand, rendered by [`crate::output`].
+#[derive(Debug, serde::Serialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum ProjectOutput {
+    /// A project was created.
+    Created { name: String },
+    /// `project ls` — all projects (the control-plane records).
+    List { projects: Vec<serde_json::Value> },
+    /// `project show` — one project's full record.
+    Show { project: serde_json::Value },
+    /// `project doctor` found no non-conforming identifiers (clean).
+    DoctorClean,
+    /// `project rm --dry-run` — a teardown preview; nothing was deleted.
+    RmDryRun {
+        project: String,
+        plan: serde_json::Value,
+    },
+    /// A project was force-deleted (cascade teardown); `report` is what was removed.
+    ForceDeleted {
+        project: String,
+        report: serde_json::Value,
+    },
+    /// A project was deleted (non-cascade).
+    Deleted { name: String },
+    /// A project was exported to a bundle.
+    Exported {
+        project: String,
+        data_only: bool,
+        include_identity: bool,
+        out: String,
+    },
+    /// A bundle was imported (or dry-run planned); `report` is the server's plan/outcome.
+    Imported {
+        project: String,
+        applied: bool,
+        report: String,
+    },
+    /// The output was already written directly by this arm (a delegated subcommand's own
+    /// printing, or `doctor --json`); nothing is left for `emit` to render.
+    Passthrough,
+}
+
+impl crate::output::Rendered for ProjectOutput {
+    fn render_human(&self, w: &mut dyn std::io::Write) -> std::io::Result<()> {
+        match self {
+            Self::Created { name } => writeln!(w, "created project `{name}`"),
+            Self::List { projects } => {
+                if projects.is_empty() {
+                    return writeln!(w, "no projects");
+                }
+                for p in projects {
+                    let name = p.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                    let display = p
+                        .get("meta")
+                        .and_then(|m| m.get("display"))
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty());
+                    match display {
+                        Some(d) => writeln!(w, "{name}\t{d}")?,
+                        None => writeln!(w, "{name}")?,
+                    }
+                }
+                Ok(())
+            }
+            Self::Show { project } => {
+                let rendered =
+                    serde_json::to_string_pretty(project).map_err(std::io::Error::other)?;
+                writeln!(w, "{rendered}")
+            }
+            Self::DoctorClean => writeln!(
+                w,
+                "no non-conforming identifiers found — every name is a valid v0.7.0 slug"
+            ),
+            Self::RmDryRun { project, plan } => {
+                writeln!(
+                    w,
+                    "{} — nothing deleted (--dry-run)",
+                    summarize_plan(project, plan)
+                )
+            }
+            Self::ForceDeleted { project, report } => {
+                writeln!(w, "force-deleted {}", summarize_plan(project, report))
+            }
+            Self::Deleted { name } => writeln!(w, "deleted project `{name}`"),
+            Self::Exported {
+                project,
+                data_only,
+                include_identity,
+                out,
+            } => writeln!(
+                w,
+                "exported project `{project}` ({}{}) -> {out}",
+                if *data_only { "data-only" } else { "full" },
+                if *include_identity { " +identity" } else { "" },
+            ),
+            Self::Imported {
+                applied, report, ..
+            } => {
+                if !applied {
+                    writeln!(
+                        w,
+                        "project import DRY-RUN (no mutation; re-run with --apply):"
+                    )?;
+                }
+                write!(w, "{report}")?;
+                if !report.ends_with('\n') {
+                    writeln!(w)?;
+                }
+                Ok(())
+            }
+            Self::Passthrough => Ok(()),
+        }
+    }
+}
+
 /// Entry point for `boatramp project`.
-pub async fn run(args: ProjectArgs, config: &ProjectConfig) -> Result<()> {
+pub async fn run(args: ProjectArgs, config: &ProjectConfig) -> Result<ProjectOutput> {
     let (server, http) = client::connect(args.server, config)?;
     // The project-collection endpoints (list/create/get/delete) are not project-scoped, so
     // the resolved project is inert for them; `migrate`, however, targets the active
@@ -507,34 +628,17 @@ pub async fn run(args: ProjectArgs, config: &ProjectConfig) -> Result<()> {
                 body.insert("region".into(), serde_json::Value::String(r));
             }
             cp.create_project(&serde_json::Value::Object(body)).await?;
-            println!("created project `{name}`");
+            Ok(ProjectOutput::Created { name })
         }
         ProjectCommand::Ls => {
             let projects = cp.list_projects().await?;
-            if projects.is_empty() {
-                println!("no projects");
-            } else {
-                for p in projects {
-                    let name = p.get("name").and_then(|v| v.as_str()).unwrap_or("?");
-                    let display = p
-                        .get("meta")
-                        .and_then(|m| m.get("display"))
-                        .and_then(|v| v.as_str())
-                        .filter(|s| !s.is_empty());
-                    match display {
-                        Some(d) => println!("{name}\t{d}"),
-                        None => println!("{name}"),
-                    }
-                }
-            }
+            Ok(ProjectOutput::List { projects })
         }
         ProjectCommand::Show { name } => {
             let project = cp.get_project(&name).await?;
-            println!("{}", serde_json::to_string_pretty(&project)?);
+            Ok(ProjectOutput::Show { project })
         }
-        ProjectCommand::Doctor { json } => {
-            return doctor(&cp, json).await;
-        }
+        ProjectCommand::Doctor { json } => doctor(&cp, json).await,
         ProjectCommand::Rm {
             name,
             force,
@@ -544,12 +648,14 @@ pub async fn run(args: ProjectArgs, config: &ProjectConfig) -> Result<()> {
             if dry_run {
                 // Preview only — mutate nothing.
                 let plan = cp.project_teardown_plan(&name).await?;
-                println!(
-                    "{} — nothing deleted (--dry-run)",
-                    summarize_plan(&name, &plan)
-                );
+                Ok(ProjectOutput::RmDryRun {
+                    project: name,
+                    plan,
+                })
             } else if force {
-                // Always show the plan first, then require confirmation unless -y.
+                // Always show the plan first, then require confirmation unless -y. The
+                // preview + prompt are the interactive confirm flow (direct stdout/stdin),
+                // not the command's typed result.
                 let plan = cp.project_teardown_plan(&name).await?;
                 println!("{}", summarize_plan(&name, &plan));
                 if !yes {
@@ -575,26 +681,29 @@ pub async fn run(args: ProjectArgs, config: &ProjectConfig) -> Result<()> {
                     }
                 }
                 let report = cp.force_delete_project(&name).await?;
-                println!("force-deleted {}", summarize_plan(&name, &report));
+                Ok(ProjectOutput::ForceDeleted {
+                    project: name,
+                    report,
+                })
             } else {
                 match cp.delete_project(&name).await {
-                    Ok(()) => println!("deleted project `{name}`"),
+                    Ok(()) => Ok(ProjectOutput::Deleted { name }),
                     // The server's `409` enumerated refusal, printed verbatim plus a
                     // hint to cascade instead.
-                    Err(crate::client::ClientError::Refused(msg)) => {
-                        return Err(Error::Aborted(format!(
-                            "{msg}\n… or `project rm {name} --force` to cascade the teardown"
-                        )));
-                    }
-                    Err(e) => return Err(e.into()),
+                    Err(crate::client::ClientError::Refused(msg)) => Err(Error::Aborted(format!(
+                        "{msg}\n… or `project rm {name} --force` to cascade the teardown"
+                    ))),
+                    Err(e) => Err(e.into()),
                 }
             }
         }
         ProjectCommand::Migrate(margs) => {
             crate::project_migrate::run(margs, &cp).await?;
+            Ok(ProjectOutput::Passthrough)
         }
         ProjectCommand::Repair(rargs) => {
             crate::project_repair::run(rargs, &cp).await?;
+            Ok(ProjectOutput::Passthrough)
         }
         ProjectCommand::Export {
             name,
@@ -616,12 +725,12 @@ pub async fn run(args: ProjectArgs, config: &ProjectConfig) -> Result<()> {
             };
             cp.project_export(&name, data_only, include_identity, transport_key, &out)
                 .await?;
-            println!(
-                "exported project `{name}` ({}{}) -> {}",
-                if data_only { "data-only" } else { "full" },
-                if include_identity { " +identity" } else { "" },
-                out.display()
-            );
+            Ok(ProjectOutput::Exported {
+                project: name,
+                data_only,
+                include_identity,
+                out: out.display().to_string(),
+            })
         }
         ProjectCommand::Import {
             name,
@@ -651,19 +760,17 @@ pub async fn run(args: ProjectArgs, config: &ProjectConfig) -> Result<()> {
                     transport_key,
                 )
                 .await?;
-            if !apply {
-                println!("project import DRY-RUN (no mutation; re-run with --apply):");
-            }
-            print!("{report}");
-            if !report.ends_with('\n') {
-                println!();
-            }
+            Ok(ProjectOutput::Imported {
+                project: name,
+                applied: apply,
+                report,
+            })
         }
         ProjectCommand::TenantSecrets(tsargs) => {
             crate::project_tenant_secrets::run(tsargs, &cp).await?;
+            Ok(ProjectOutput::Passthrough)
         }
     }
-    Ok(())
 }
 
 #[cfg(test)]

@@ -74,6 +74,71 @@ pub enum Error {
 /// `sync` module result; `Err` is [`Error`].
 type Result<T> = std::result::Result<T, Error>;
 
+/// The terminal outcome of `boatramp sync`: either a deployment that went live, or
+/// one uploaded but left inactive (`--no-activate`). Intermediate progress (the
+/// scan, routing fold, blob upload) is not here — it rides the `tracing` sink.
+/// Rendered by [`crate::output`].
+#[derive(Debug, serde::Serialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum SyncOutput {
+    /// The deployment was uploaded and activated (the site is now live on it).
+    Activated {
+        /// The deployment id now serving.
+        deployment: String,
+        /// The activation target label (`site`, or `project/site` for a named project).
+        target: String,
+        /// The server base URL.
+        server: String,
+        /// The site slug.
+        site: String,
+        /// Whether a bare-name `/_sites/<site>/` URL resolves (only for the default project).
+        serving: bool,
+    },
+    /// The deployment was uploaded but NOT activated (`--no-activate`).
+    Uploaded {
+        /// The uploaded (inactive) deployment id.
+        deployment: String,
+        /// The server base URL.
+        server: String,
+        /// The project collection segment used in the activate URL.
+        seg: String,
+        /// The site slug.
+        site: String,
+    },
+}
+
+impl crate::output::Rendered for SyncOutput {
+    fn render_human(&self, w: &mut dyn std::io::Write) -> std::io::Result<()> {
+        match self {
+            Self::Activated {
+                deployment,
+                target,
+                server,
+                site,
+                serving,
+            } => {
+                writeln!(w, "activated {target} -> {deployment}")?;
+                // `/_sites/<name>` resolves a site by bare name, so it is only unambiguous for
+                // the default project; a named project reaches its site by its domain.
+                if *serving {
+                    writeln!(w, "now serving {server}/_sites/{site}/")?;
+                }
+                writeln!(w, "immutable preview: {server}/_deploy/{deployment}/")
+            }
+            Self::Uploaded {
+                deployment,
+                server,
+                seg,
+                site,
+            } => writeln!(
+                w,
+                "uploaded but not activated; preview at {server}/_deploy/{deployment}/\n  \
+                 activate with: curl -X POST {server}/api/{seg}/{site}/deployments/{deployment}/activate",
+            ),
+        }
+    }
+}
+
 /// boatramp's own files, never published as site content (mirrors how Netlify
 /// skips `netlify.toml`). `project.cfg` is local tooling (its `routing` section
 /// travels inside the manifest, not as an asset); `_redirects`/`_headers` are
@@ -129,7 +194,7 @@ pub struct SyncArgs {
 }
 
 /// Entry point for `boatramp sync`.
-pub async fn run(args: SyncArgs, config: &ProjectConfig) -> Result<()> {
+pub async fn run(args: SyncArgs, config: &ProjectConfig) -> Result<SyncOutput> {
     let (server, site) =
         crate::client::resolve_target(args.server.clone(), args.site.clone(), config)?;
     // Honor `--project` (via `[publish].project` / `BOATRAMP_PROJECT`): the site
@@ -174,12 +239,12 @@ pub async fn run(args: SyncArgs, config: &ProjectConfig) -> Result<()> {
     // `handlers` feature).
     crate::handler_validate::validate_deploy(&dir, &manifest.config)?;
     let variant_count: usize = manifest.files.values().map(|f| f.variants.len()).sum();
-    println!(
-        "scanned {} file(s) in {} ({} unique blob(s), {} precompressed variant(s))",
-        manifest.files.len(),
-        dir.display(),
-        blobs_by_hash.len(),
-        variant_count,
+    tracing::info!(
+        files = manifest.files.len(),
+        dir = %dir.display(),
+        blobs = blobs_by_hash.len(),
+        variants = variant_count,
+        "scanned deploy tree"
     );
 
     let client = crate::client::http_client(crate::client::token(config).as_deref());
@@ -216,10 +281,10 @@ pub async fn run(args: SyncArgs, config: &ProjectConfig) -> Result<()> {
         .json()
         .await?;
 
-    println!(
-        "deployment {} — uploading {} new blob(s)",
-        created.id,
-        created.missing.len()
+    tracing::info!(
+        deployment = %created.id,
+        missing = created.missing.len(),
+        "negotiated deployment; uploading new blobs"
     );
 
     for hash in &created.missing {
@@ -230,12 +295,12 @@ pub async fn run(args: SyncArgs, config: &ProjectConfig) -> Result<()> {
     }
 
     if args.no_activate {
-        println!(
-            "uploaded but not activated; preview at {server}/_deploy/{}/\n  \
-             activate with: curl -X POST {server}/api/{seg}/{site}/deployments/{}/activate",
-            created.id, created.id
-        );
-        return Ok(());
+        return Ok(SyncOutput::Uploaded {
+            deployment: created.id,
+            server,
+            seg,
+            site,
+        });
     }
 
     client
@@ -247,14 +312,14 @@ pub async fn run(args: SyncArgs, config: &ProjectConfig) -> Result<()> {
         .await?
         .error_for_status()?;
 
-    println!("activated {target} -> {}", created.id);
-    // `/_sites/<name>` resolves a site by bare name, so it is only unambiguous for
-    // the default project; a named project reaches its site by its domain.
-    if project == boatramp_core::project::DEFAULT_PROJECT {
-        println!("now serving {server}/_sites/{site}/");
-    }
-    println!("immutable preview: {server}/_deploy/{}/", created.id);
-    Ok(())
+    let serving = project == boatramp_core::project::DEFAULT_PROJECT;
+    Ok(SyncOutput::Activated {
+        deployment: created.id,
+        target,
+        server,
+        site,
+        serving,
+    })
 }
 
 /// Best-effort `(commit SHA, branch, release tag)` for the git repo containing
@@ -313,11 +378,11 @@ fn apply_deploy_config(config: &ProjectConfig, dir: &Path, manifest: &mut Manife
         || !manifest.config.rewrites.is_empty()
         || !manifest.config.headers.is_empty()
     {
-        println!(
-            "routing: {} redirect(s), {} rewrite(s), {} header rule(s)",
-            manifest.config.redirects.len(),
-            manifest.config.rewrites.len(),
-            manifest.config.headers.len(),
+        tracing::info!(
+            redirects = manifest.config.redirects.len(),
+            rewrites = manifest.config.rewrites.len(),
+            headers = manifest.config.headers.len(),
+            "folded project.cfg routing into the manifest"
         );
     }
 
@@ -329,11 +394,11 @@ fn apply_deploy_config(config: &ProjectConfig, dir: &Path, manifest: &mut Manife
         let (r, w) = (parsed.redirects.len(), parsed.rewrites.len());
         manifest.config.redirects.extend(parsed.redirects);
         manifest.config.rewrites.extend(parsed.rewrites);
-        println!("loaded _redirects: {r} redirect(s), {w} rewrite(s)");
+        tracing::info!(redirects = r, rewrites = w, "loaded _redirects shim");
     }
     if let Some(text) = read_optional(&dir.join("_headers"))? {
         let rules = boatramp_core::compat::parse_headers(&text);
-        println!("loaded _headers: {} header rule(s)", rules.len());
+        tracing::info!(headers = rules.len(), "loaded _headers shim");
         manifest.config.headers.extend(rules);
     }
     Ok(())

@@ -183,8 +183,95 @@ enum DlqCommand {
     },
 }
 
+/// Serializable projection of a [`DlqEntry`] for typed JSON output (the wire
+/// struct is deserialize-only). Fields mirror it 1:1.
+#[derive(Debug, serde::Serialize)]
+pub struct DlqEntryView {
+    pub id: String,
+    pub group: String,
+    pub attempts: u32,
+    pub last_error: Option<String>,
+    pub signed_context_present: bool,
+    pub payload_b64: Option<String>,
+}
+
+impl From<DlqEntry> for DlqEntryView {
+    fn from(e: DlqEntry) -> Self {
+        Self {
+            id: e.id,
+            group: e.group,
+            attempts: e.attempts,
+            last_error: e.last_error,
+            signed_context_present: e.signed_context_present,
+            payload_b64: e.payload_b64,
+        }
+    }
+}
+
+/// The result of a `dlq` subcommand, rendered by [`crate::output`].
+#[derive(Debug, serde::Serialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum DlqOutput {
+    /// `dlq ls` — a topic's dead-lettered messages (metadata only).
+    List {
+        topic: String,
+        entries: Vec<DlqEntryView>,
+    },
+    /// `dlq show` — one dead-letter in full (or absent).
+    Show {
+        topic: String,
+        id: String,
+        entry: Option<DlqEntryView>,
+    },
+    /// A `--dry-run` preview of a redrive/discard/purge: the matching set.
+    DryRun {
+        action: String,
+        topic: String,
+        affected: usize,
+        matched: Vec<DlqEntryView>,
+    },
+    /// A redrive/discard/purge that ran: how many were affected.
+    Mutated {
+        action: String,
+        topic: String,
+        affected: usize,
+    },
+}
+
+impl crate::output::Rendered for DlqOutput {
+    fn render_human(&self, w: &mut dyn std::io::Write) -> std::io::Result<()> {
+        match self {
+            Self::List { topic, entries } => write_list(w, topic, entries),
+            Self::Show { topic, id, entry } => match entry {
+                Some(entry) => write_show(w, entry),
+                None => writeln!(w, "no dead-letter {id:?} on topic {topic:?}"),
+            },
+            Self::DryRun {
+                action,
+                topic,
+                affected,
+                matched,
+            } => {
+                writeln!(
+                    w,
+                    "dry-run: {action} would affect {affected} dead-letter(s) on topic {topic:?}:"
+                )?;
+                write_list(w, topic, matched)
+            }
+            Self::Mutated {
+                action,
+                topic,
+                affected,
+            } => writeln!(
+                w,
+                "{action}: {affected} dead-lettered message(s) on topic {topic:?}"
+            ),
+        }
+    }
+}
+
 /// Entry point for `boatramp dlq`.
-pub async fn run(args: DlqArgs, config: &ProjectConfig) -> Result<()> {
+pub async fn run(args: DlqArgs, config: &ProjectConfig) -> Result<DlqOutput> {
     let (server, site) = client::resolve_target(args.server, args.site, config)?;
     let cp = client::ControlPlane::new(
         server,
@@ -192,7 +279,7 @@ pub async fn run(args: DlqArgs, config: &ProjectConfig) -> Result<()> {
         client::resolve_project(config),
     );
 
-    match &args.command {
+    let out = match &args.command {
         DlqCommand::Ls {
             topic,
             alias,
@@ -202,7 +289,10 @@ pub async fn run(args: DlqArgs, config: &ProjectConfig) -> Result<()> {
             let entries = cp
                 .list_dlq(scope, topic, false, &filter.to_filter())
                 .await?;
-            print_list(topic, &entries);
+            DlqOutput::List {
+                topic: topic.clone(),
+                entries: entries.into_iter().map(DlqEntryView::from).collect(),
+            }
         }
         DlqCommand::Show {
             topic,
@@ -217,9 +307,10 @@ pub async fn run(args: DlqArgs, config: &ProjectConfig) -> Result<()> {
                 ..Default::default()
             };
             let entries = cp.list_dlq(scope, topic, true, &filter).await?;
-            match entries.into_iter().next() {
-                Some(entry) => print_show(&entry),
-                None => println!("no dead-letter {id:?} on topic {topic:?}"),
+            DlqOutput::Show {
+                topic: topic.clone(),
+                id: id.clone(),
+                entry: entries.into_iter().next().map(DlqEntryView::from),
             }
         }
         DlqCommand::Redrive {
@@ -241,7 +332,7 @@ pub async fn run(args: DlqArgs, config: &ProjectConfig) -> Result<()> {
                     yes: *yes,
                 },
             )
-            .await?;
+            .await?
         }
         DlqCommand::Discard {
             topic,
@@ -262,7 +353,7 @@ pub async fn run(args: DlqArgs, config: &ProjectConfig) -> Result<()> {
                     yes: *yes,
                 },
             )
-            .await?;
+            .await?
         }
         DlqCommand::Purge { topic, alias, yes } => {
             let scope = dlq_scope(args.bus, &site, alias.as_deref())?;
@@ -284,10 +375,10 @@ pub async fn run(args: DlqArgs, config: &ProjectConfig) -> Result<()> {
                     yes: *yes,
                 },
             )
-            .await?;
+            .await?
         }
-    }
-    Ok(())
+    };
+    Ok(out)
 }
 
 /// One mutating `dlq` invocation (bundles the per-command flags).
@@ -300,7 +391,11 @@ struct Mutation<'a> {
 }
 
 /// Run a mutating op with the shared dry-run + whole-DLQ confirmation policy.
-async fn mutate(cp: &client::ControlPlane, scope: OpScope<'_>, m: Mutation<'_>) -> Result<()> {
+async fn mutate(
+    cp: &client::ControlPlane,
+    scope: OpScope<'_>,
+    m: Mutation<'_>,
+) -> Result<DlqOutput> {
     // A filter-less mutation touches the WHOLE queue — require an explicit --yes (unless it's a
     // preview). A filtered op is already narrowed, so it proceeds.
     if !m.dry_run && m.filter.is_empty() && !m.yes {
@@ -313,25 +408,29 @@ async fn mutate(cp: &client::ControlPlane, scope: OpScope<'_>, m: Mutation<'_>) 
         .operate_dlq(scope, m.topic, m.action, &m.filter.to_filter(), m.dry_run)
         .await?;
     if m.dry_run {
-        println!(
-            "dry-run: {} would affect {affected} dead-letter(s) on topic {:?}:",
-            m.action, m.topic
-        );
-        print_list(m.topic, &matched);
+        Ok(DlqOutput::DryRun {
+            action: m.action.to_string(),
+            topic: m.topic.to_string(),
+            affected,
+            matched: matched.into_iter().map(DlqEntryView::from).collect(),
+        })
     } else {
-        println!(
-            "{}: {affected} dead-lettered message(s) on topic {:?}",
-            m.action, m.topic
-        );
+        Ok(DlqOutput::Mutated {
+            action: m.action.to_string(),
+            topic: m.topic.to_string(),
+            affected,
+        })
     }
-    Ok(())
 }
 
-/// Print a metadata listing (id · lane · attempts · last_error).
-fn print_list(topic: &str, entries: &[DlqEntry]) {
+/// Write a metadata listing (id · lane · attempts · last_error).
+fn write_list(
+    w: &mut dyn std::io::Write,
+    topic: &str,
+    entries: &[DlqEntryView],
+) -> std::io::Result<()> {
     if entries.is_empty() {
-        println!("no dead-letters on topic {topic:?}");
-        return;
+        return writeln!(w, "no dead-letters on topic {topic:?}");
     }
     for e in entries {
         let lane = if e.group.is_empty() {
@@ -340,45 +439,48 @@ fn print_list(topic: &str, entries: &[DlqEntry]) {
             format!("group:{}", e.group)
         };
         let reason = e.last_error.as_deref().unwrap_or("-");
-        println!(
+        writeln!(
+            w,
             "{}  {lane}  attempts={}  last_error={reason}",
             e.id, e.attempts
-        );
+        )?;
     }
-    println!("{} dead-letter(s)", entries.len());
+    writeln!(w, "{} dead-letter(s)", entries.len())
 }
 
-/// Print one dead-letter in full, decoding its payload as UTF-8 when possible.
-fn print_show(entry: &DlqEntry) {
+/// Write one dead-letter in full, decoding its payload as UTF-8 when possible.
+fn write_show(w: &mut dyn std::io::Write, entry: &DlqEntryView) -> std::io::Result<()> {
     use base64::Engine as _;
     let lane = if entry.group.is_empty() {
         "work-queue".to_string()
     } else {
         format!("group:{}", entry.group)
     };
-    println!("id:             {}", entry.id);
-    println!("lane:           {lane}");
-    println!("attempts:       {}", entry.attempts);
-    println!(
+    writeln!(w, "id:             {}", entry.id)?;
+    writeln!(w, "lane:           {lane}")?;
+    writeln!(w, "attempts:       {}", entry.attempts)?;
+    writeln!(
+        w,
         "last_error:     {}",
         entry.last_error.as_deref().unwrap_or("-")
-    );
-    println!(
+    )?;
+    writeln!(
+        w,
         "signed_context: {}",
         if entry.signed_context_present {
             "present"
         } else {
             "none"
         }
-    );
+    )?;
     match &entry.payload_b64 {
         Some(b64) => match base64::engine::general_purpose::STANDARD.decode(b64) {
             Ok(bytes) => match std::str::from_utf8(&bytes) {
-                Ok(text) => println!("payload ({} bytes):\n{text}", bytes.len()),
-                Err(_) => println!("payload: {} bytes (binary)", bytes.len()),
+                Ok(text) => writeln!(w, "payload ({} bytes):\n{text}", bytes.len()),
+                Err(_) => writeln!(w, "payload: {} bytes (binary)", bytes.len()),
             },
-            Err(_) => println!("payload: <undecodable>"),
+            Err(_) => writeln!(w, "payload: <undecodable>"),
         },
-        None => println!("payload: <not loaded>"),
+        None => writeln!(w, "payload: <not loaded>"),
     }
 }

@@ -521,8 +521,718 @@ pub enum Error {
     Import(#[from] boatramp_core::kv_dump::ImportError),
 }
 
+/// The typed result of a `boatramp kv` subcommand, rendered once by [`crate::output`] as the
+/// historical human text or as JSON. Each subcommand's RESULT/DATA rides a struct-variant carrying
+/// the same facts the human text shows; transient progress/diagnostics go to `tracing` instead.
+#[derive(Debug, serde::Serialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
+// A short-lived, once-per-invocation result value (built then immediately rendered by `emit`), so the
+// spread between the stats-bearing variants and the one-line acks does not matter — boxing would only
+// obscure the shape and the JSON/Debug output.
+#[allow(clippy::large_enum_variant)]
+pub enum KvOutput {
+    /// A verb was invoked against a non-SlateDB control-plane backend it does not apply to (C7).
+    NotApplicable { message: String },
+    /// `kv export` wrote a portable dump.
+    Export {
+        records: usize,
+        bytes: usize,
+        store: String,
+        out: String,
+    },
+    /// `kv import` DRY-RUN plan.
+    ImportPlan {
+        store: String,
+        format_version: u32,
+        created_at: u64,
+        source_entries: usize,
+        source_reserved_skipped: usize,
+        dest_user_keys: usize,
+        dest_reserved_keys: usize,
+        dest_has_control_plane_id: bool,
+        dest_pristine: bool,
+        would_write: usize,
+        would_refuse_commingle: bool,
+    },
+    /// `kv import --apply` outcome.
+    ImportApplied {
+        store: String,
+        written: usize,
+        verified: usize,
+    },
+    /// `kv migrate` DRY-RUN plan.
+    MigratePlan {
+        from: String,
+        to: String,
+        source_entries: usize,
+        dest_user_keys: usize,
+        dest_reserved_keys: usize,
+        dest_has_control_plane_id: bool,
+        dest_pristine: bool,
+        would_write: usize,
+        would_refuse_commingle: bool,
+    },
+    /// `kv migrate --apply` outcome.
+    MigrateApplied {
+        from: String,
+        to: String,
+        written: usize,
+        verified: usize,
+    },
+    /// `kv repair` plan/outcome.
+    Repair {
+        report: RepairReportView,
+        /// Whether `--apply` was passed (the report label); distinct from whether a mutation landed.
+        applied_mode: bool,
+    },
+    /// `kv status --ack` — whether a breadcrumb existed and was cleared.
+    StatusAck { cleared: bool },
+    /// `kv status` — the durable DEGRADED breadcrumb (or `None` when the store is clean).
+    Status {
+        marker: Option<boatramp_core::kv::DegradedMarker>,
+    },
+    /// `kv checkpoint --live` — the server's response line.
+    CheckpointLive { server: String, message: String },
+    /// `kv checkpoint` (offline open+close).
+    CheckpointOffline,
+    /// `kv recover` — corrupt-`.compactions` reset plan/outcome.
+    RecoverCompactions {
+        report: CompactionsResetView,
+        applied_mode: bool,
+    },
+    /// `kv recover` — in-place WAL-tail plan/outcome (the superset of `kv repair`).
+    RecoverWal {
+        report: RepairReportView,
+        applied_mode: bool,
+    },
+    /// `kv recover` — last-good manifest-generation rollback plan/outcome.
+    RecoverManifest {
+        report: ManifestRecoveryView,
+        applied_mode: bool,
+    },
+    /// `kv recover --adopt-volume` DRY-RUN (validate + discard-delta).
+    AdoptVolumeDryRun {
+        volume_store: String,
+        target_store: String,
+    },
+    /// `kv recover --adopt-volume --apply` outcome.
+    AdoptVolumeApplied {
+        volume_store: String,
+        target_store: String,
+        retained: String,
+    },
+    /// `kv stats` — physical-vs-logical footprint.
+    Stats { stats: KvStatsView },
+    /// `kv compact` DRY-RUN — current footprint.
+    CompactDryRun { stats: KvStatsView },
+    /// `kv compact --apply` — before/after footprint, compaction + GC outcome.
+    CompactApply {
+        before: KvStatsView,
+        after: KvStatsView,
+        compaction: KvCompactView,
+        timeout_secs: u64,
+        dropped_checkpoints: usize,
+    },
+}
+
+/// One WAL candidate beyond the frontier (serializable mirror of the core `WalCandidate`).
+#[derive(Debug, serde::Serialize)]
+pub struct WalCandidateView {
+    pub id: u64,
+    pub size: u64,
+    /// The footer-probe class (the `WalClass` debug spelling, e.g. `Torn` / `Readable` / `Fence`).
+    pub class: String,
+}
+
+/// A torn SST object outside the safe WAL-tail scope (serializable mirror of the core `TornObject`).
+#[derive(Debug, serde::Serialize)]
+pub struct TornObjectView {
+    pub path: String,
+    pub size: u64,
+    pub class: String,
+    pub kind: String,
+}
+
+/// Serializable mirror of a [`RepairReport`].
+#[derive(Debug, serde::Serialize)]
+pub struct RepairReportView {
+    pub frontier: u64,
+    pub candidates: Vec<WalCandidateView>,
+    pub quarantined: Vec<u64>,
+    pub quarantine_dir: Option<String>,
+    pub applied: bool,
+    pub out_of_scope_torn: Vec<TornObjectView>,
+}
+
+impl RepairReportView {
+    fn from_report(r: &RepairReport) -> Self {
+        Self {
+            frontier: r.frontier,
+            candidates: r
+                .candidates
+                .iter()
+                .map(|c| WalCandidateView {
+                    id: c.id,
+                    size: c.size,
+                    class: format!("{:?}", c.class),
+                })
+                .collect(),
+            quarantined: r.quarantined.clone(),
+            quarantine_dir: r.quarantine_dir.clone(),
+            applied: r.applied,
+            out_of_scope_torn: r
+                .out_of_scope_torn
+                .iter()
+                .map(|t| TornObjectView {
+                    path: t.path.clone(),
+                    size: t.size,
+                    class: format!("{:?}", t.class),
+                    kind: format!("{:?}", t.kind),
+                })
+                .collect(),
+        }
+    }
+
+    /// Mirrors `RepairReport::is_noop`.
+    fn is_noop(&self) -> bool {
+        self.quarantined.is_empty() && self.out_of_scope_torn.is_empty()
+    }
+}
+
+/// Serializable mirror of a [`CompactionsResetReport`].
+#[derive(Debug, serde::Serialize)]
+pub struct CompactionsResetView {
+    pub quarantined_compactions_ids: Vec<u64>,
+    pub quarantine_dir: Option<String>,
+    pub boundary_removed: bool,
+    pub applied: bool,
+}
+
+impl CompactionsResetView {
+    fn from_report(r: &CompactionsResetReport) -> Self {
+        Self {
+            quarantined_compactions_ids: r.quarantined_compactions_ids.clone(),
+            quarantine_dir: r.quarantine_dir.clone(),
+            boundary_removed: r.boundary_removed,
+            applied: r.applied,
+        }
+    }
+}
+
+/// One rung of the manifest generation-walk ladder (mirror of the core `ManifestCandidate`).
+#[derive(Debug, serde::Serialize)]
+pub struct ManifestCandidateView {
+    pub generation: u64,
+    pub frontier: Option<u64>,
+    pub status: String,
+}
+
+/// Serializable mirror of a [`ManifestRecoveryReport`].
+#[derive(Debug, serde::Serialize)]
+pub struct ManifestRecoveryView {
+    pub rolled_back_to_generation: u64,
+    pub frontier: u64,
+    pub quarantined_manifest_ids: Vec<u64>,
+    pub manifest_quarantine_dir: Option<String>,
+    pub wal_repair: RepairReportView,
+    pub orphaned_nonacked_objects: Vec<String>,
+    pub candidate_ladder: Vec<ManifestCandidateView>,
+    pub applied: bool,
+}
+
+impl ManifestRecoveryView {
+    fn from_report(r: &ManifestRecoveryReport) -> Self {
+        Self {
+            rolled_back_to_generation: r.rolled_back_to_generation,
+            frontier: r.frontier,
+            quarantined_manifest_ids: r.quarantined_manifest_ids.clone(),
+            manifest_quarantine_dir: r.manifest_quarantine_dir.clone(),
+            wal_repair: RepairReportView::from_report(&r.wal_repair),
+            orphaned_nonacked_objects: r.orphaned_nonacked_objects.clone(),
+            candidate_ladder: r
+                .candidate_ladder
+                .iter()
+                .map(|c| ManifestCandidateView {
+                    generation: c.generation,
+                    frontier: c.frontier,
+                    status: c.status.clone(),
+                })
+                .collect(),
+            applied: r.applied,
+        }
+    }
+}
+
+/// Per-subdir physical footprint (mirror of the storage `KvDirStat`).
+#[derive(Debug, serde::Serialize)]
+pub struct KvDirStatView {
+    pub name: String,
+    pub objects: u64,
+    pub bytes: u64,
+}
+
+/// Physical-vs-logical store footprint (mirror of `KvPhysicalStats` + `KvLogicalStats`).
+#[derive(Debug, serde::Serialize)]
+pub struct KvStatsView {
+    pub physical_total_bytes: u64,
+    pub physical_total_objects: u64,
+    pub logical_live_bytes: u64,
+    pub logical_live_sst_count: u64,
+    pub manifest_id: u64,
+    pub l0_count: u64,
+    pub sorted_run_count: u64,
+    pub dirs: Vec<KvDirStatView>,
+}
+
+impl KvStatsView {
+    fn from_stats(
+        physical: &boatramp_storage::kv_slatedb::KvPhysicalStats,
+        logical: &boatramp_storage::kv_slatedb::KvLogicalStats,
+    ) -> Self {
+        Self {
+            physical_total_bytes: physical.total_bytes,
+            physical_total_objects: physical.total_objects,
+            logical_live_bytes: logical.live_bytes,
+            logical_live_sst_count: logical.live_sst_count,
+            manifest_id: logical.manifest_id,
+            l0_count: logical.l0_count,
+            sorted_run_count: logical.sorted_run_count,
+            dirs: physical
+                .dirs
+                .iter()
+                .map(|d| KvDirStatView {
+                    name: d.name.clone(),
+                    objects: d.objects,
+                    bytes: d.bytes,
+                })
+                .collect(),
+        }
+    }
+}
+
+/// Serializable mirror of a `KvCompactOutcome`.
+#[derive(Debug, serde::Serialize)]
+pub struct KvCompactView {
+    pub runs_before: u64,
+    pub runs_after: u64,
+    pub merged: bool,
+    pub spec: Option<String>,
+    pub timed_out: bool,
+}
+
+impl KvCompactView {
+    fn from_outcome(o: &boatramp_storage::kv_slatedb::KvCompactOutcome) -> Self {
+        Self {
+            runs_before: o.runs_before,
+            runs_after: o.runs_after,
+            merged: o.merged,
+            spec: o.spec.clone(),
+            timed_out: o.timed_out,
+        }
+    }
+}
+
+impl crate::output::Rendered for KvOutput {
+    fn render_human(&self, w: &mut dyn std::io::Write) -> std::io::Result<()> {
+        match self {
+            Self::NotApplicable { message } => writeln!(w, "{message}"),
+            Self::Export {
+                records,
+                bytes,
+                store,
+                out,
+            } => {
+                writeln!(
+                    w,
+                    "kv export: wrote {} record(s) ({} bytes) from `{}` to `{}`.",
+                    records, bytes, store, out
+                )?;
+                writeln!(
+                    w,
+                    "  A LOGICAL dump (CONTENT, not the physical LSM/manifest) — `kv import` rebuilds a FRESH \
+                     clean store, immune to the torn-manifest / corrupt-`.compactions` classes. The dump carries \
+                     SEALED secret ciphertext (no plaintext) + plaintext control-plane config/RBAC, and NO KEK \
+                     (a restore needs the separately-held envelope key). Treat it as SENSITIVE — protect it at \
+                     rest."
+                )
+            }
+            Self::ImportPlan {
+                store,
+                format_version,
+                created_at,
+                source_entries,
+                source_reserved_skipped,
+                dest_user_keys,
+                dest_reserved_keys,
+                dest_has_control_plane_id,
+                dest_pristine,
+                would_write,
+                would_refuse_commingle,
+            } => {
+                writeln!(w, "kv import (DRY-RUN — no mutation) into `{store}`")?;
+                writeln!(
+                    w,
+                    "  dump format v{} created at (unix): {}",
+                    format_version, created_at
+                )?;
+                writeln!(w, "  source dumpable records:    {}", source_entries)?;
+                if *source_reserved_skipped > 0 {
+                    writeln!(
+                        w,
+                        "  reserved records skipped:   {} (`_cp/*` / `_inval/*` regenerate; never imported)",
+                        source_reserved_skipped
+                    )?;
+                }
+                write_dest_state(
+                    w,
+                    *dest_user_keys,
+                    *dest_reserved_keys,
+                    *dest_has_control_plane_id,
+                    *dest_pristine,
+                )?;
+                writeln!(w, "  would copy:                 {}", would_write)?;
+                if *would_refuse_commingle {
+                    writeln!(
+                        w,
+                        "  REFUSAL: the destination is NON-EMPTY — `--apply` would be refused to avoid \
+                         commingling two control planes. Pass `--force` only to deliberately overlay it."
+                    )?;
+                }
+                writeln!(
+                    w,
+                    "\nDRY-RUN: re-run with `--apply` to import{}.",
+                    if *would_refuse_commingle {
+                        " (and `--force` to overlay the non-empty destination)"
+                    } else {
+                        ""
+                    }
+                )
+            }
+            Self::ImportApplied {
+                store,
+                written,
+                verified,
+            } => writeln!(
+                w,
+                "kv import: APPLIED {} record(s) into `{}` and VERIFIED {} byte-for-byte (re-read + count).",
+                written, store, verified
+            ),
+            Self::MigratePlan {
+                from,
+                to,
+                source_entries,
+                dest_user_keys,
+                dest_reserved_keys,
+                dest_has_control_plane_id,
+                dest_pristine,
+                would_write,
+                would_refuse_commingle,
+            } => {
+                writeln!(
+                    w,
+                    "kv migrate (DRY-RUN — no mutation): `{}` → `{}`",
+                    from, to
+                )?;
+                writeln!(w, "  source dumpable records:    {}", source_entries)?;
+                write_dest_state(
+                    w,
+                    *dest_user_keys,
+                    *dest_reserved_keys,
+                    *dest_has_control_plane_id,
+                    *dest_pristine,
+                )?;
+                writeln!(w, "  would copy:                 {}", would_write)?;
+                if *would_refuse_commingle {
+                    writeln!(
+                        w,
+                        "  REFUSAL: the destination is NON-EMPTY — `--apply` would be refused to avoid \
+                         commingling two control planes. Re-run with `--apply --force` only to overlay it."
+                    )?;
+                }
+                writeln!(
+                    w,
+                    "\nDRY-RUN: re-run with `--apply` to migrate (then it VERIFIES bytes + count)."
+                )
+            }
+            Self::MigrateApplied {
+                from,
+                to,
+                written,
+                verified,
+            } => writeln!(
+                w,
+                "kv migrate: APPLIED {} record(s) `{}` → `{}` and VERIFIED {} byte-for-byte.",
+                written, from, to, verified
+            ),
+            Self::Repair {
+                report,
+                applied_mode,
+            } => write_report(w, report, *applied_mode),
+            Self::StatusAck { cleared } => {
+                if *cleared {
+                    writeln!(
+                        w,
+                        "kv status: CLEARED the DEGRADED breadcrumb (acknowledged)."
+                    )
+                } else {
+                    writeln!(w, "kv status: no DEGRADED breadcrumb to acknowledge.")
+                }
+            }
+            Self::Status { marker } => match marker {
+                Some(m) if m.rolled_back_to_generation.is_some() => {
+                    // v0.11.0 F2 manifest-rollback shape (UX C2): LEAD with the lossless verdict and
+                    // SUPPRESS the version-0-SST "no recovery of acked pairs" NOTE unless a real
+                    // WAL-tail drop occurred.
+                    let generation = m.rolled_back_to_generation.unwrap_or_default();
+                    let wal_tail_dropped = !m.quarantined_ids.is_empty();
+                    if wal_tail_dropped {
+                        writeln!(
+                            w,
+                            "kv status: RECOVERED — auto-rolled-back to manifest gen {generation}; a torn WAL \
+                             tail beyond the frontier was ALSO quarantined (a bounded, forensic-only loss)."
+                        )?;
+                    } else {
+                        writeln!(
+                            w,
+                            "kv status: RECOVERED (lossless) — auto-rolled-back to manifest gen {generation}; \
+                             zero acked loss (N-1 + WAL replay = a normal open)."
+                        )?;
+                    }
+                    writeln!(w, "  recovered at (unix):        {}", m.stamp)?;
+                    writeln!(w, "  frontier_source:            {}", m.frontier_source)?;
+                    writeln!(w, "  last_durable_seq:           {}", m.frontier)?;
+                    writeln!(w, "  rolled back to generation:  {generation}")?;
+                    writeln!(
+                        w,
+                        "  quarantined manifest ids:   {:?}",
+                        m.quarantined_manifest_ids
+                    )?;
+                    writeln!(w, "  manifest-quarantine dir:    {}", m.quarantine_dir)?;
+                    if !m.orphaned_nonacked_objects.is_empty() {
+                        writeln!(
+                            w,
+                            "  reclaimable orphaned SST(s): {:?} (SPACE only, NOT loss — the reopened store's \
+                             GC reclaims them)",
+                            m.orphaned_nonacked_objects
+                        )?;
+                    }
+                    if wal_tail_dropped {
+                        writeln!(w, "  quarantined WAL ids:        {:?}", m.quarantined_ids)?;
+                        writeln!(w, "  loss window:                {}", m.loss_window)?;
+                        writeln!(
+                            w,
+                            "  NOTE: the ADDITIONALLY quarantined torn WAL tail preserves raw bytes for \
+                             FORENSICS ONLY — no supported recovery of acked pairs from a torn version-0 SST."
+                        )?;
+                    }
+                    writeln!(
+                        w,
+                        "  Acknowledge with `boatramp kv status --ack` once reviewed."
+                    )
+                }
+                Some(m) => {
+                    writeln!(
+                        w,
+                        "kv status: DEGRADED (a self-heal-on-open quarantined a torn WAL tail)"
+                    )?;
+                    writeln!(w, "  self-healed at (unix): {}", m.stamp)?;
+                    writeln!(w, "  frontier_source:       {}", m.frontier_source)?;
+                    writeln!(w, "  last_durable_seq:      {}", m.frontier)?;
+                    writeln!(w, "  quarantined WAL ids:   {:?}", m.quarantined_ids)?;
+                    writeln!(w, "  loss window:           {}", m.loss_window)?;
+                    writeln!(w, "  quarantine dir:        {}", m.quarantine_dir)?;
+                    writeln!(
+                        w,
+                        "  NOTE: the quarantined torn tail preserves raw bytes for FORENSICS ONLY — there \
+                         is no supported recovery of acked KV pairs from a torn version-0 SST."
+                    )?;
+                    writeln!(
+                        w,
+                        "  Acknowledge with `boatramp kv status --ack` once reviewed."
+                    )
+                }
+                None => writeln!(
+                    w,
+                    "kv status: OK — no DEGRADED breadcrumb (the store opened cleanly, a self-heal was \
+                     zero-loss, or a prior degraded state was acked). If the store will not open, run \
+                     `boatramp kv recover` (dry-run) to diagnose."
+                ),
+            },
+            Self::CheckpointLive { server, message } => {
+                write!(w, "kv checkpoint --live (server {server}): {message}")?;
+                if !message.ends_with('\n') {
+                    writeln!(w)?;
+                }
+                Ok(())
+            }
+            Self::CheckpointOffline => writeln!(
+                w,
+                "kv checkpoint: WAL drained to L0 and the durable frontier advanced — the on-disk store is \
+                 now a consistent, bootable snapshot point. Snapshot the volume now (a block snapshot of a \
+                 LIVE un-checkpointed store is not reliably bootable; that is the recurring root cause)."
+            ),
+            Self::RecoverCompactions {
+                report,
+                applied_mode,
+            } => {
+                write_compactions_recovery(w, report, *applied_mode)?;
+                if !*applied_mode {
+                    writeln!(
+                        w,
+                        "\nRe-run `boatramp kv recover --apply` to reset the corrupt `.compactions` \
+                         bookkeeping in place (lossless-for-acked — `.compactions` holds no committed \
+                         data; the objects are retained under `compactions-quarantine/` for forensics)."
+                    )?;
+                }
+                Ok(())
+            }
+            Self::RecoverWal {
+                report,
+                applied_mode,
+            } => {
+                write_report(w, report, *applied_mode)?;
+                if !*applied_mode && !report.quarantined.is_empty() {
+                    writeln!(
+                        w,
+                        "\nRe-run `boatramp kv recover --apply` to quarantine the safe trailing \
+                         tail in place (the crashed torn bytes are retained under `wal-quarantine/` \
+                         for forensics)."
+                    )?;
+                }
+                Ok(())
+            }
+            Self::RecoverManifest {
+                report,
+                applied_mode,
+            } => {
+                write_manifest_recovery(w, report, *applied_mode)?;
+                if !*applied_mode {
+                    writeln!(
+                        w,
+                        "\nRe-run `boatramp kv recover --apply` to adopt the newest manifest generation \
+                         that opens clean in place (lossless-for-acked; the quarantined manifest \
+                         generations are retained under `manifest-quarantine/` for forensics)."
+                    )?;
+                }
+                Ok(())
+            }
+            Self::AdoptVolumeDryRun {
+                volume_store,
+                target_store,
+            } => {
+                write_adopt_preamble(w, volume_store, target_store)?;
+                writeln!(
+                    w,
+                    "\nDRY-RUN: re-run with `--apply` to adopt (copy → verify-open the COPY → swap, retaining \
+                     the crashed copy). The source snapshot is never mutated."
+                )
+            }
+            Self::AdoptVolumeApplied {
+                volume_store,
+                target_store,
+                retained,
+            } => {
+                write_adopt_preamble(w, volume_store, target_store)?;
+                writeln!(
+                    w,
+                    "kv recover: ADOPTED the clean snapshot into `{}`. The crashed store is RETAINED at `{}` \
+                     (delete it once the node is confirmed serving). Start the daemon.",
+                    target_store, retained
+                )
+            }
+            Self::Stats { stats } => write_kv_stats(w, stats),
+            Self::CompactDryRun { stats } => {
+                writeln!(
+                    w,
+                    "kv compact: DRY-RUN (no changes made). Current store footprint:"
+                )?;
+                write_kv_stats(w, stats)?;
+                writeln!(
+                    w,
+                    "\n  A compaction + GC would merge every L0 SST + sorted run into one sorted run and \
+                     reclaim the now-unreferenced garbage (superseded SSTs + old manifests + replayed WAL).\n  \
+                     Running GC in DRY-RUN below (slatedb logs each delete CANDIDATE; nothing is deleted):"
+                )?;
+                writeln!(
+                    w,
+                    "\n  OFFLINE ONLY — STOP the daemon first, then re-run with `--apply` to compact + \
+                     reclaim (GC deletion is IRREVERSIBLE)."
+                )
+            }
+            Self::CompactApply {
+                before,
+                after,
+                compaction,
+                timeout_secs,
+                dropped_checkpoints,
+            } => {
+                writeln!(
+                    w,
+                    "kv compact --apply: OFFLINE full-merge compaction + GC reclaim. IRREVERSIBLE.\n  \
+                     WARNING: this command CANNOT detect a running daemon and does not stop one — STOP the \
+                     daemon on this node FIRST. Run against a live daemon it will fence/crash it and may delete \
+                     objects an in-flight reader still needs (possible data loss)."
+                )?;
+                writeln!(w, "\n  BEFORE:")?;
+                write_kv_stats(w, before)?;
+                match (&compaction.spec, compaction.merged, compaction.timed_out) {
+                    (Some(spec), true, _) => writeln!(
+                        w,
+                        "\n  COMPACTED: merged {} run(s) → {} sorted run [spec {spec}].",
+                        compaction.runs_before, compaction.runs_after
+                    )?,
+                    (Some(spec), false, true) => writeln!(
+                        w,
+                        "\n  WARNING: the full-merge compaction [spec {spec}] did NOT land within {}s (still {} \
+                         run(s)). GC will still reclaim any already-unreferenced garbage, but re-run with a larger \
+                         `--timeout-secs` to complete the merge.",
+                        timeout_secs, compaction.runs_after
+                    )?,
+                    (Some(spec), false, false) => writeln!(
+                        w,
+                        "\n  NOTE: the submitted full-merge [spec {spec}] did not reach a single sorted run \
+                         (still {} run(s)); proceeding to GC.",
+                        compaction.runs_after
+                    )?,
+                    (None, _, _) => writeln!(
+                        w,
+                        "\n  Nothing to merge ({} run(s) — already compact); proceeding to GC to reclaim old \
+                         manifests / WAL.",
+                        compaction.runs_before
+                    )?,
+                }
+                if *dropped_checkpoints > 0 {
+                    writeln!(
+                        w,
+                        "  GC: dropped {} protective checkpoint(s) (safe OFFLINE), then reclaimed unreferenced \
+                         SSTs + old manifests + replayed WAL.",
+                        dropped_checkpoints
+                    )?;
+                } else {
+                    writeln!(
+                        w,
+                        "  GC: reclaimed unreferenced SSTs + old manifests + replayed WAL."
+                    )?;
+                }
+                writeln!(w, "\n  AFTER:")?;
+                write_kv_stats(w, after)?;
+                let reclaimed = before
+                    .physical_total_bytes
+                    .saturating_sub(after.physical_total_bytes);
+                writeln!(
+                    w,
+                    "\n  RECLAIMED: {} ({} → {} physical).",
+                    human_bytes(reclaimed),
+                    human_bytes(before.physical_total_bytes),
+                    human_bytes(after.physical_total_bytes),
+                )
+            }
+        }
+    }
+}
+
 /// Dispatch `boatramp kv <subcommand>`.
-pub async fn run(args: KvArgs) -> Result<(), Error> {
+pub async fn run(args: KvArgs) -> Result<KvOutput, Error> {
     match args.command {
         KvCommand::Repair(repair) => run_repair(repair).await,
         KvCommand::Status(status) => run_status(status).await,
@@ -537,32 +1247,23 @@ pub async fn run(args: KvArgs) -> Result<(), Error> {
 }
 
 /// `boatramp kv export` — scan the store into the portable dump and write it to `--out` (kv-sql WS7).
-async fn run_export(args: ExportArgs) -> Result<(), Error> {
+async fn run_export(args: ExportArgs) -> Result<KvOutput, Error> {
     let store = open_endpoint(&args.store).await?;
     let bytes = boatramp_core::kv_dump::export_to_bytes(store.as_ref(), now_secs())
         .await
         .map_err(|e| Error::Store(e.to_string()))?;
     let decoded = boatramp_core::kv_dump::decode_dump(&bytes)?;
     std::fs::write(&args.out, &bytes)?;
-    println!(
-        "kv export: wrote {} record(s) ({} bytes) from `{}` to `{}`.",
-        decoded.entries.len(),
-        bytes.len(),
-        args.store,
-        args.out.display()
-    );
-    println!(
-        "  A LOGICAL dump (CONTENT, not the physical LSM/manifest) — `kv import` rebuilds a FRESH \
-         clean store, immune to the torn-manifest / corrupt-`.compactions` classes. The dump carries \
-         SEALED secret ciphertext (no plaintext) + plaintext control-plane config/RBAC, and NO KEK \
-         (a restore needs the separately-held envelope key). Treat it as SENSITIVE — protect it at \
-         rest."
-    );
-    Ok(())
+    Ok(KvOutput::Export {
+        records: decoded.entries.len(),
+        bytes: bytes.len(),
+        out: args.out.display().to_string(),
+        store: args.store,
+    })
 }
 
 /// `boatramp kv import <file>` — DRY-RUN plan by default; `--apply` imports + verifies (kv-sql WS7).
-async fn run_import(args: ImportArgs) -> Result<(), Error> {
+async fn run_import(args: ImportArgs) -> Result<KvOutput, Error> {
     let store = open_endpoint(&args.store).await?;
     let bytes = std::fs::read(&args.file)?;
     let decoded = boatramp_core::kv_dump::decode_dump(&bytes)?;
@@ -572,29 +1273,32 @@ async fn run_import(args: ImportArgs) -> Result<(), Error> {
             boatramp_core::kv_dump::plan_import(store.as_ref(), &decoded.entries, args.force)
                 .await
                 .map_err(|e| Error::Store(e.to_string()))?;
-        print_import_plan(&args.store, &decoded.header, &plan);
-        println!(
-            "\nDRY-RUN: re-run with `--apply` to import{}.",
-            if plan.would_refuse_commingle {
-                " (and `--force` to overlay the non-empty destination)"
-            } else {
-                ""
-            }
-        );
-        return Ok(());
+        return Ok(KvOutput::ImportPlan {
+            format_version: decoded.header.format_version,
+            created_at: decoded.header.created_at,
+            source_entries: plan.source_entries,
+            source_reserved_skipped: plan.source_reserved_skipped,
+            dest_user_keys: plan.dest.user_keys,
+            dest_reserved_keys: plan.dest.reserved_keys,
+            dest_has_control_plane_id: plan.dest.has_control_plane_id,
+            dest_pristine: plan.dest.is_pristine(),
+            would_write: plan.would_write,
+            would_refuse_commingle: plan.would_refuse_commingle,
+            store: args.store,
+        });
     }
 
     let report =
         boatramp_core::kv_dump::apply_import(store.as_ref(), &decoded.entries, args.force).await?;
-    println!(
-        "kv import: APPLIED {} record(s) into `{}` and VERIFIED {} byte-for-byte (re-read + count).",
-        report.written, args.store, report.verified
-    );
-    Ok(())
+    Ok(KvOutput::ImportApplied {
+        written: report.written,
+        verified: report.verified,
+        store: args.store,
+    })
 }
 
 /// `boatramp kv migrate --from <desc> --to <desc>` — store→store; DRY-RUN by default (kv-sql WS7).
-async fn run_migrate(args: MigrateArgs) -> Result<(), Error> {
+async fn run_migrate(args: MigrateArgs) -> Result<KvOutput, Error> {
     let src = open_endpoint(&args.from).await?;
     let dst = open_endpoint(&args.to).await?;
     let entries = boatramp_core::kv_dump::scan_dumpable(src.as_ref())
@@ -605,85 +1309,61 @@ async fn run_migrate(args: MigrateArgs) -> Result<(), Error> {
         let plan = boatramp_core::kv_dump::plan_import(dst.as_ref(), &entries, args.force)
             .await
             .map_err(|e| Error::Store(e.to_string()))?;
-        println!(
-            "kv migrate (DRY-RUN — no mutation): `{}` → `{}`",
-            args.from, args.to
-        );
-        println!("  source dumpable records:    {}", plan.source_entries);
-        print_dest_state(&plan.dest);
-        println!("  would copy:                 {}", plan.would_write);
-        if plan.would_refuse_commingle {
-            println!(
-                "  REFUSAL: the destination is NON-EMPTY — `--apply` would be refused to avoid \
-                 commingling two control planes. Re-run with `--apply --force` only to overlay it."
-            );
-        }
-        println!("\nDRY-RUN: re-run with `--apply` to migrate (then it VERIFIES bytes + count).");
-        return Ok(());
+        return Ok(KvOutput::MigratePlan {
+            source_entries: plan.source_entries,
+            dest_user_keys: plan.dest.user_keys,
+            dest_reserved_keys: plan.dest.reserved_keys,
+            dest_has_control_plane_id: plan.dest.has_control_plane_id,
+            dest_pristine: plan.dest.is_pristine(),
+            would_write: plan.would_write,
+            would_refuse_commingle: plan.would_refuse_commingle,
+            from: args.from,
+            to: args.to,
+        });
     }
 
     let report = boatramp_core::kv_dump::migrate(src.as_ref(), dst.as_ref(), args.force).await?;
-    println!(
-        "kv migrate: APPLIED {} record(s) `{}` → `{}` and VERIFIED {} byte-for-byte.",
-        report.written, args.from, args.to, report.verified
-    );
-    Ok(())
+    Ok(KvOutput::MigrateApplied {
+        written: report.written,
+        verified: report.verified,
+        from: args.from,
+        to: args.to,
+    })
 }
 
-/// Print the `kv import` dry-run plan (source count, dest state, would-copy, commingle verdict).
-fn print_import_plan(
-    store: &str,
-    header: &boatramp_core::kv_dump::DumpHeader,
-    plan: &boatramp_core::kv_dump::ImportPlan,
-) {
-    println!("kv import (DRY-RUN — no mutation) into `{store}`");
-    println!(
-        "  dump format v{} created at (unix): {}",
-        header.format_version, header.created_at
-    );
-    println!("  source dumpable records:    {}", plan.source_entries);
-    if plan.source_reserved_skipped > 0 {
-        println!(
-            "  reserved records skipped:   {} (`_cp/*` / `_inval/*` regenerate; never imported)",
-            plan.source_reserved_skipped
-        );
-    }
-    print_dest_state(&plan.dest);
-    println!("  would copy:                 {}", plan.would_write);
-    if plan.would_refuse_commingle {
-        println!(
-            "  REFUSAL: the destination is NON-EMPTY — `--apply` would be refused to avoid \
-             commingling two control planes. Pass `--force` only to deliberately overlay it."
-        );
-    }
-}
-
-/// Print the destination emptiness/identity portion of an import/migrate plan.
-fn print_dest_state(dest: &boatramp_core::kv_dump::DestState) {
-    println!(
+/// Write the destination emptiness/identity portion of an import/migrate plan.
+fn write_dest_state(
+    w: &mut dyn std::io::Write,
+    user_keys: usize,
+    reserved_keys: usize,
+    has_control_plane_id: bool,
+    pristine: bool,
+) -> std::io::Result<()> {
+    writeln!(
+        w,
         "  destination state:          {} user key(s), {} reserved, control-plane-id {}",
-        dest.user_keys,
-        dest.reserved_keys,
-        if dest.has_control_plane_id {
+        user_keys,
+        reserved_keys,
+        if has_control_plane_id {
             "PRESENT (commingle hazard)"
         } else {
             "absent"
         }
-    );
-    println!(
+    )?;
+    writeln!(
+        w,
         "  destination:                {}",
-        if dest.is_pristine() {
+        if pristine {
             "PRISTINE (safe to import without --force)"
         } else {
             "NON-EMPTY (needs --force)"
         }
-    );
+    )
 }
 
-async fn run_repair(args: RepairArgs) -> Result<(), Error> {
-    if let Some(msg) = args.addr.not_applicable("repair") {
-        println!("{msg}");
-        return Ok(());
+async fn run_repair(args: RepairArgs) -> Result<KvOutput, Error> {
+    if let Some(message) = args.addr.not_applicable("repair") {
+        return Ok(KvOutput::NotApplicable { message });
     }
     let (store, root) = args.addr.build()?;
     let mode = if args.apply {
@@ -692,100 +1372,34 @@ async fn run_repair(args: RepairArgs) -> Result<(), Error> {
         RepairMode::DryRun
     };
     let report = repair_wal_tail(&store, &root, mode).await?;
-    print_report(&report, args.apply);
-    Ok(())
+    Ok(KvOutput::Repair {
+        report: RepairReportView::from_report(&report),
+        applied_mode: args.apply,
+    })
 }
 
-async fn run_status(args: StatusArgs) -> Result<(), Error> {
-    if let Some(msg) = args.addr.not_applicable("status") {
-        println!("{msg}");
-        return Ok(());
+async fn run_status(args: StatusArgs) -> Result<KvOutput, Error> {
+    if let Some(message) = args.addr.not_applicable("status") {
+        return Ok(KvOutput::NotApplicable { message });
     }
     let (store, root) = args.addr.build()?;
     if args.ack {
         let existed = clear_degraded_marker(&store, &root)
             .await
             .map_err(|e| Error::Store(e.to_string()))?;
-        if existed {
-            println!("kv status: CLEARED the DEGRADED breadcrumb (acknowledged).");
-        } else {
-            println!("kv status: no DEGRADED breadcrumb to acknowledge.");
-        }
-        return Ok(());
+        return Ok(KvOutput::StatusAck { cleared: existed });
     }
-    match read_degraded_marker(&store, &root)
+    // The three breadcrumb shapes (RECOVERED / DEGRADED / OK) are rendered from the marker by
+    // `KvOutput::Status`; reading it (without opening the store) stays here.
+    let marker = read_degraded_marker(&store, &root)
         .await
-        .map_err(|e| Error::Store(e.to_string()))?
-    {
-        Some(m) if m.rolled_back_to_generation.is_some() => {
-            // v0.11.0 F2 manifest-rollback shape (UX C2): LEAD with the lossless verdict and SUPPRESS
-            // the version-0-SST "no recovery of acked pairs" NOTE unless a real WAL-tail drop occurred.
-            let generation = m.rolled_back_to_generation.unwrap_or_default();
-            let wal_tail_dropped = !m.quarantined_ids.is_empty();
-            if wal_tail_dropped {
-                println!(
-                    "kv status: RECOVERED — auto-rolled-back to manifest gen {generation}; a torn WAL \
-                     tail beyond the frontier was ALSO quarantined (a bounded, forensic-only loss)."
-                );
-            } else {
-                println!(
-                    "kv status: RECOVERED (lossless) — auto-rolled-back to manifest gen {generation}; \
-                     zero acked loss (N-1 + WAL replay = a normal open)."
-                );
-            }
-            println!("  recovered at (unix):        {}", m.stamp);
-            println!("  frontier_source:            {}", m.frontier_source);
-            println!("  last_durable_seq:           {}", m.frontier);
-            println!("  rolled back to generation:  {generation}");
-            println!(
-                "  quarantined manifest ids:   {:?}",
-                m.quarantined_manifest_ids
-            );
-            println!("  manifest-quarantine dir:    {}", m.quarantine_dir);
-            if !m.orphaned_nonacked_objects.is_empty() {
-                println!(
-                    "  reclaimable orphaned SST(s): {:?} (SPACE only, NOT loss — the reopened store's \
-                     GC reclaims them)",
-                    m.orphaned_nonacked_objects
-                );
-            }
-            if wal_tail_dropped {
-                println!("  quarantined WAL ids:        {:?}", m.quarantined_ids);
-                println!("  loss window:                {}", m.loss_window);
-                println!(
-                    "  NOTE: the ADDITIONALLY quarantined torn WAL tail preserves raw bytes for \
-                     FORENSICS ONLY — no supported recovery of acked pairs from a torn version-0 SST."
-                );
-            }
-            println!("  Acknowledge with `boatramp kv status --ack` once reviewed.");
-        }
-        Some(m) => {
-            println!("kv status: DEGRADED (a self-heal-on-open quarantined a torn WAL tail)");
-            println!("  self-healed at (unix): {}", m.stamp);
-            println!("  frontier_source:       {}", m.frontier_source);
-            println!("  last_durable_seq:      {}", m.frontier);
-            println!("  quarantined WAL ids:   {:?}", m.quarantined_ids);
-            println!("  loss window:           {}", m.loss_window);
-            println!("  quarantine dir:        {}", m.quarantine_dir);
-            println!(
-                "  NOTE: the quarantined torn tail preserves raw bytes for FORENSICS ONLY — there \
-                 is no supported recovery of acked KV pairs from a torn version-0 SST."
-            );
-            println!("  Acknowledge with `boatramp kv status --ack` once reviewed.");
-        }
-        None => println!(
-            "kv status: OK — no DEGRADED breadcrumb (the store opened cleanly, a self-heal was \
-             zero-loss, or a prior degraded state was acked). If the store will not open, run \
-             `boatramp kv recover` (dry-run) to diagnose."
-        ),
-    }
-    Ok(())
+        .map_err(|e| Error::Store(e.to_string()))?;
+    Ok(KvOutput::Status { marker })
 }
 
-async fn run_checkpoint(args: CheckpointArgs) -> Result<(), Error> {
-    if let Some(msg) = args.addr.not_applicable("checkpoint") {
-        println!("{msg}");
-        return Ok(());
+async fn run_checkpoint(args: CheckpointArgs) -> Result<KvOutput, Error> {
+    if let Some(message) = args.addr.not_applicable("checkpoint") {
+        return Ok(KvOutput::NotApplicable { message });
     }
     if args.live {
         return run_checkpoint_live(&args).await;
@@ -797,7 +1411,7 @@ async fn run_checkpoint(args: CheckpointArgs) -> Result<(), Error> {
 /// advance the RUNNING daemon's durable frontier WITHOUT stopping it, then the operator can snapshot a
 /// bootable volume of the live node. The URL comes from `--server`, else `[deploy].server` /
 /// `BOATRAMP_SERVER`; the control-plane token comes from the config / `BOATRAMP_TOKEN`.
-async fn run_checkpoint_live(args: &CheckpointArgs) -> Result<(), Error> {
+async fn run_checkpoint_live(args: &CheckpointArgs) -> Result<KvOutput, Error> {
     use crate::client;
     // `kv` runs before the project config is loaded (a store needing repair may predate a valid
     // config), so load `project.cfg` here best-effort — a missing file is the default, and an explicit
@@ -810,15 +1424,11 @@ async fn run_checkpoint_live(args: &CheckpointArgs) -> Result<(), Error> {
         client::http_client(client::token(&config).as_deref()),
         client::resolve_project(&config),
     );
-    let msg = cp.kv_checkpoint().await?;
-    print!("kv checkpoint --live (server {server}): {msg}");
-    if !msg.ends_with('\n') {
-        println!();
-    }
-    Ok(())
+    let message = cp.kv_checkpoint().await?;
+    Ok(KvOutput::CheckpointLive { server, message })
 }
 
-async fn run_checkpoint_offline(addr: StoreAddr) -> Result<(), Error> {
+async fn run_checkpoint_offline(addr: StoreAddr) -> Result<KvOutput, Error> {
     // Open STRICT (a torn store must be RECOVERED first, never checkpointed) then CLOSE: the close
     // drains the memtable → L0 and advances the durable frontier (slatedb `CloseOptions` default
     // `FlushType::MemTable` — the same primitive as the periodic checkpoint), leaving a consistent,
@@ -829,18 +1439,12 @@ async fn run_checkpoint_offline(addr: StoreAddr) -> Result<(), Error> {
     boatramp_core::kv::KvStore::close(&kv)
         .await
         .map_err(|e| Error::Store(e.to_string()))?;
-    println!(
-        "kv checkpoint: WAL drained to L0 and the durable frontier advanced — the on-disk store is \
-         now a consistent, bootable snapshot point. Snapshot the volume now (a block snapshot of a \
-         LIVE un-checkpointed store is not reliably bootable; that is the recurring root cause)."
-    );
-    Ok(())
+    Ok(KvOutput::CheckpointOffline)
 }
 
-async fn run_recover(args: RecoverArgs) -> Result<(), Error> {
-    if let Some(msg) = args.addr.not_applicable("recover") {
-        println!("{msg}");
-        return Ok(());
+async fn run_recover(args: RecoverArgs) -> Result<KvOutput, Error> {
+    if let Some(message) = args.addr.not_applicable("recover") {
+        return Ok(KvOutput::NotApplicable { message });
     }
     if let Some(volume) = args.adopt_volume.clone() {
         return run_recover_adopt_volume(&args.addr, &volume, args.apply).await;
@@ -878,20 +1482,15 @@ async fn run_recover(args: RecoverArgs) -> Result<(), Error> {
             // reset the `.compactions` bookkeeping (quarantine it + remove the compactions GC boundary).
             match recover_corrupt_compactions(&store, &root, mode).await {
                 Ok(CompactionsRecovery::Reset(report)) => {
-                    print_compactions_recovery(&report, args.apply);
-                    if !args.apply {
-                        println!(
-                            "\nRe-run `boatramp kv recover --apply` to reset the corrupt `.compactions` \
-                             bookkeeping in place (lossless-for-acked — `.compactions` holds no committed \
-                             data; the objects are retained under `compactions-quarantine/` for forensics)."
-                        );
-                    }
-                    return Ok(());
+                    return Ok(KvOutput::RecoverCompactions {
+                        report: CompactionsResetView::from_report(&report),
+                        applied_mode: args.apply,
+                    });
                 }
                 Ok(CompactionsRecovery::NotCorrupt) => {}
                 Err(e) => {
-                    eprintln!("kv recover: compactions reset cannot proceed — {e}");
-                    print_adopt_volume_guidance();
+                    tracing::warn!("kv recover: compactions reset cannot proceed — {e}");
+                    warn_adopt_volume_guidance();
                     return Err(e.into());
                 }
             }
@@ -899,23 +1498,18 @@ async fn run_recover(args: RecoverArgs) -> Result<(), Error> {
             // shape-split escalation to `--adopt-volume` (C10).
             match repair_wal_tail(&store, &root, mode).await {
                 Ok(report) => {
-                    print_report(&report, args.apply);
-                    if !args.apply && !report.quarantined.is_empty() {
-                        println!(
-                            "\nRe-run `boatramp kv recover --apply` to quarantine the safe trailing \
-                             tail in place (the crashed torn bytes are retained under `wal-quarantine/` \
-                             for forensics)."
-                        );
-                    }
                     if !report.out_of_scope_torn.is_empty() {
-                        print_adopt_volume_guidance();
+                        warn_adopt_volume_guidance();
                     }
-                    Ok(())
+                    Ok(KvOutput::RecoverWal {
+                        report: RepairReportView::from_report(&report),
+                        applied_mode: args.apply,
+                    })
                 }
                 Err(e) => {
                     // C10 shape-split: name the exact refusal, then point at the snapshot-restore path.
-                    eprintln!("kv recover: in-place repair cannot proceed — {e}");
-                    print_adopt_volume_guidance();
+                    tracing::warn!("kv recover: in-place repair cannot proceed — {e}");
+                    warn_adopt_volume_guidance();
                     Err(e.into())
                 }
             }
@@ -926,22 +1520,17 @@ async fn run_recover(args: RecoverArgs) -> Result<(), Error> {
             // WORKS (prints the walk ladder + the generation it will adopt) and `--apply` adopts the
             // newest generation that OPENS CLEAN in place, non-destructively (the quarantined manifest
             // generations are retained under `manifest-quarantine/` until verify).
-            print_manifest_recovery(&report, args.apply);
-            if !args.apply {
-                println!(
-                    "\nRe-run `boatramp kv recover --apply` to adopt the newest manifest generation \
-                     that opens clean in place (lossless-for-acked; the quarantined manifest \
-                     generations are retained under `manifest-quarantine/` for forensics)."
-                );
-            }
-            Ok(())
+            Ok(KvOutput::RecoverManifest {
+                report: ManifestRecoveryView::from_report(&report),
+                applied_mode: args.apply,
+            })
         }
         Err(e) => {
             // A manifest shape recovery REFUSED (no decodable generation, NO generation opens clean
             // [v0.11.1 NoOpenableManifest], a WAL GC hole, or below the GC boundary). Name the refusal,
             // then point at the clean-snapshot escalation (UX C4).
-            eprintln!("kv recover: manifest recovery cannot proceed — {e}");
-            print_adopt_volume_guidance();
+            tracing::warn!("kv recover: manifest recovery cannot proceed — {e}");
+            warn_adopt_volume_guidance();
             Err(e.into())
         }
     }
@@ -955,16 +1544,21 @@ fn is_cluster_node_data_dir(data_dir: &std::path::Path) -> bool {
     data_dir.join("raft").is_dir() || data_dir.join("mesh").is_dir()
 }
 
-/// Print the last-good-generation manifest-recovery plan / outcome (v0.11.0 F2 + v0.11.1 walk).
-fn print_manifest_recovery(report: &ManifestRecoveryReport, applied: bool) {
-    println!(
+/// Write the last-good-generation manifest-recovery plan / outcome (v0.11.0 F2 + v0.11.1 walk).
+fn write_manifest_recovery(
+    w: &mut dyn std::io::Write,
+    report: &ManifestRecoveryView,
+    applied: bool,
+) -> std::io::Result<()> {
+    writeln!(
+        w,
         "control-plane MANIFEST recovery {}",
         if applied {
             "(APPLY)"
         } else {
             "(DRY-RUN — no mutation)"
         }
-    );
+    )?;
     // v0.11.1: classify the shape. If any decodable generation above the adopted one was SKIPPED as
     // unopenable, the latest DECODES but won't OPEN (the invalid-compaction / missing-referenced-SST
     // shape) — NEVER "should open normally". Otherwise it is the classic empty/torn-latest shape.
@@ -973,57 +1567,64 @@ fn print_manifest_recovery(report: &ManifestRecoveryReport, applied: bool) {
         .iter()
         .any(|c| c.status.starts_with("skipped:"));
     if skipped_unopenable {
-        println!(
+        writeln!(
+            w,
             "  the LATEST manifest DECODES but will NOT open (invalid compaction / a referenced \
              compacted SST was removed or torn — a mid-compaction unclean exit). This is a \
              RECOVERABLE shape: walking back to the newest manifest generation that OPENS CLEAN."
-        );
+        )?;
     } else {
-        println!(
+        writeln!(
+            w,
             "  the LATEST manifest is empty/torn — rolling back to the last-good manifest generation."
-        );
+        )?;
     }
     // The candidate ladder (highest generation first): exactly which generations were skipped as
     // unopenable and which one is adopted — so a won't-open latest is never reported "should open
     // normally".
-    println!("  generation walk ladder (newest first):");
+    writeln!(w, "  generation walk ladder (newest first):")?;
     for c in &report.candidate_ladder {
         let frontier = c
             .frontier
             .map(|f| format!("frontier {f}"))
             .unwrap_or_else(|| "frontier n/a".to_string());
-        println!(
+        writeln!(
+            w,
             "    generation {:<12} {:<22} {}",
             c.generation, frontier, c.status
-        );
+        )?;
     }
-    println!(
+    writeln!(
+        w,
         "  adopt manifest generation (newest that OPENS CLEAN): {}",
         report.rolled_back_to_generation
-    );
-    println!(
+    )?;
+    writeln!(
+        w,
         "  durable frontier (replay_after_wal_id) at that generation: {}",
         report.frontier
-    );
+    )?;
     if report.quarantined_manifest_ids.is_empty() {
-        println!("  torn manifest generation(s) to quarantine: (none)");
+        writeln!(w, "  torn manifest generation(s) to quarantine: (none)")?;
     } else {
         let ids: Vec<String> = report
             .quarantined_manifest_ids
             .iter()
             .map(|id| format!("{id:020}"))
             .collect();
-        println!(
+        writeln!(
+            w,
             "  torn manifest generation(s) to quarantine (retained under manifest-quarantine/): [{}]",
             ids.join(", ")
-        );
+        )?;
     }
     // The embedded WAL-tail sub-plan at F: for the pure last-good-generation rollback this is empty
     // (discard = none, lossless-for-acked); a crash that ALSO tore a WAL tail beyond F shows it here.
     if report.wal_repair.quarantined.is_empty() {
-        println!(
+        writeln!(
+            w,
             "  WAL tail beyond the frontier to discard: none (discard = none — lossless-for-acked)."
-        );
+        )?;
     } else {
         let ids: Vec<String> = report
             .wal_repair
@@ -1031,20 +1632,23 @@ fn print_manifest_recovery(report: &ManifestRecoveryReport, applied: bool) {
             .iter()
             .map(|id| format!("{id:020}"))
             .collect();
-        println!(
+        writeln!(
+            w,
             "  ADDITIONALLY a torn WAL tail beyond the frontier would be quarantined [{}] — those \
              bytes are FORENSIC-ONLY (no supported recovery of acked pairs from a torn version-0 SST).",
             ids.join(", ")
-        );
+        )?;
     }
     if !report.orphaned_nonacked_objects.is_empty() {
-        println!(
+        writeln!(
+            w,
             "  reclaimable orphaned L0 SST(s) (SPACE only, NOT loss): {:?}",
             report.orphaned_nonacked_objects
-        );
+        )?;
     }
     if applied {
-        println!(
+        writeln!(
+            w,
             "  RECOVERED (lossless-for-acked): adopted generation {} (the newest that OPENS CLEAN) and \
              replayed the WAL forward — the store now opens with zero acked loss (adopted generation + \
              WAL replay, MF2-contiguity-verified). The quarantined manifest generation(s) are retained \
@@ -1054,46 +1658,55 @@ fn print_manifest_recovery(report: &ManifestRecoveryReport, applied: bool) {
                 .manifest_quarantine_dir
                 .as_deref()
                 .unwrap_or("<none>")
-        );
+        )
     } else {
-        println!(
+        writeln!(
+            w,
             "  WOULD adopt generation {} (the newest that OPENS CLEAN; lossless-for-acked, \
              MF2-contiguity-verified).",
             report.rolled_back_to_generation
-        );
+        )
     }
 }
 
-/// Print the v0.11.1 corrupt-`.compactions` reset plan / outcome.
-fn print_compactions_recovery(report: &CompactionsResetReport, applied: bool) {
-    println!(
+/// Write the v0.11.1 corrupt-`.compactions` reset plan / outcome.
+fn write_compactions_recovery(
+    w: &mut dyn std::io::Write,
+    report: &CompactionsResetView,
+    applied: bool,
+) -> std::io::Result<()> {
+    writeln!(
+        w,
         "control-plane COMPACTIONS reset {}",
         if applied {
             "(APPLY)"
         } else {
             "(DRY-RUN — no mutation)"
         }
-    );
-    println!(
+    )?;
+    writeln!(
+        w,
         "  the manifest + SSTs are intact, but the `.compactions` bookkeeping object is CORRUPT \
          (compactor-ON open fails `Invalid error: invalid compaction`). `.compactions` holds NO \
          committed data — only compactor bookkeeping — so a reset is lossless-for-acked: the compactor \
          fresh-starts from the manifest's current SST set."
-    );
+    )?;
     if report.quarantined_compactions_ids.is_empty() {
-        println!("  .compactions object(s) to quarantine: (none listed)");
+        writeln!(w, "  .compactions object(s) to quarantine: (none listed)")?;
     } else {
         let ids: Vec<String> = report
             .quarantined_compactions_ids
             .iter()
             .map(|id| format!("{id:020}"))
             .collect();
-        println!(
+        writeln!(
+            w,
             "  .compactions object(s) to quarantine (retained under compactions-quarantine/): [{}]",
             ids.join(", ")
-        );
+        )?;
     }
-    println!(
+    writeln!(
+        w,
         "  compactions GC boundary (`gc/compactions.boundary`) {}: required so the fresh id-1 \
          `.compactions` the compactor-ON reopen creates is not rejected (ObjectVersionExists).",
         if report.boundary_removed {
@@ -1101,24 +1714,30 @@ fn print_compactions_recovery(report: &CompactionsResetReport, applied: bool) {
         } else {
             "absent (nothing to remove)"
         }
-    );
+    )?;
     if applied {
-        println!(
+        writeln!(
+            w,
             "  RESET (lossless-for-acked): quarantined the corrupt `.compactions` + removed the \
              compactions GC boundary; a compactor-ON reopen now fresh-starts the compactor from the \
              manifest. The objects are retained under `{}` for forensics.",
             report.quarantine_dir.as_deref().unwrap_or("<none>")
-        );
+        )
     } else {
-        println!("  WOULD reset the corrupt `.compactions` bookkeeping (lossless-for-acked).");
+        writeln!(
+            w,
+            "  WOULD reset the corrupt `.compactions` bookkeeping (lossless-for-acked)."
+        )
     }
 }
 
 /// The `--adopt-volume` escalation guidance (C10): a shape beyond auto-heal AND beyond `kv repair`
-/// (tail-only) is recovered by adopting a clean volume snapshot. boatramp validates + adopts the
-/// volume the operator attaches; it never drives the fly volume lifecycle.
-fn print_adopt_volume_guidance() {
-    eprintln!(
+/// (tail-only) is recovered by adopting a clean volume snapshot. This is diagnostic guidance printed
+/// alongside a refusal (the command then returns `Err`), so it rides the `tracing` sink (stderr), not
+/// the command's typed result. boatramp validates + adopts the volume the operator attaches; it never
+/// drives the fly volume lifecycle.
+fn warn_adopt_volume_guidance() {
+    tracing::warn!(
         "\nUNSAFE SHAPE — beyond auto-heal and beyond `kv repair` (tail-only). Recover by adopting a \
          CLEAN volume snapshot:\n  \
          1. fly volumes create <name> --snapshot-id <snap>   (or restore/clone a known-good volume)\n  \
@@ -1129,6 +1748,26 @@ fn print_adopt_volume_guidance() {
     );
 }
 
+/// Write the `--adopt-volume` validate-and-discard-delta preamble (the stdout result text shared by
+/// the dry-run and apply outcomes).
+fn write_adopt_preamble(
+    w: &mut dyn std::io::Write,
+    volume_store: &str,
+    target_store: &str,
+) -> std::io::Result<()> {
+    writeln!(
+        w,
+        "adopt-volume: the attached store at `{}` passes the whole-store torn scan (ZERO torn) — \
+         validated READ-ONLY, the snapshot is left byte-pristine.\n  \
+         Adopting REPLACES the crashed store at `{}` with a COPY of the snapshot (a definitive \
+         real-open bootability verify then runs on the copy, never the source).\n  \
+         DISCARD-DELTA: every write in the crashed store made AFTER the snapshot's point-in-time is \
+         LOST (a snapshot is a point-in-time copy; boatramp cannot merge the crashed WAL into it).\n  \
+         The crashed copy is RETAINED (renamed aside) until the adopt is verified serving.",
+        volume_store, target_store
+    )
+}
+
 /// `kv recover --adopt-volume <mounted-path>`: validate an operator-attached CLEAN volume snapshot
 /// and (with `--apply`) adopt it in place of the crashed local store, RETAINING the crashed copy
 /// until the adopt is verified (C9). Local-disk / fly-volume only (a snapshot is a mounted path).
@@ -1136,7 +1775,7 @@ async fn run_recover_adopt_volume(
     target: &StoreAddr,
     volume: &std::path::Path,
     apply: bool,
-) -> Result<(), Error> {
+) -> Result<KvOutput, Error> {
     if target.kv_s3 {
         return Err(Error::Store(
             "--adopt-volume is a local-disk / fly-volume flow (a mounted snapshot path); it does \
@@ -1181,24 +1820,14 @@ async fn run_recover_adopt_volume(
         )));
     }
 
-    // 2. Discard-delta: adopting the snapshot DISCARDS the crashed store's post-snapshot writes.
-    println!(
-        "adopt-volume: the attached store at `{}` passes the whole-store torn scan (ZERO torn) — \
-         validated READ-ONLY, the snapshot is left byte-pristine.\n  \
-         Adopting REPLACES the crashed store at `{}` with a COPY of the snapshot (a definitive \
-         real-open bootability verify then runs on the copy, never the source).\n  \
-         DISCARD-DELTA: every write in the crashed store made AFTER the snapshot's point-in-time is \
-         LOST (a snapshot is a point-in-time copy; boatramp cannot merge the crashed WAL into it).\n  \
-         The crashed copy is RETAINED (renamed aside) until the adopt is verified serving.",
-        volume_dir.display(),
-        target_dir.display()
-    );
+    // 2. Discard-delta: adopting the snapshot DISCARDS the crashed store's post-snapshot writes. The
+    //    operator-facing preamble + discard-delta notice is rendered by `KvOutput` (see
+    //    `write_adopt_preamble`); here we only decide dry-run vs apply.
     if !apply {
-        println!(
-            "\nDRY-RUN: re-run with `--apply` to adopt (copy → verify-open the COPY → swap, retaining \
-             the crashed copy). The source snapshot is never mutated."
-        );
-        return Ok(());
+        return Ok(KvOutput::AdoptVolumeDryRun {
+            volume_store: volume_dir.display().to_string(),
+            target_store: target_dir.display().to_string(),
+        });
     }
 
     // 3. --apply: retain the crashed copy, copy the validated snapshot into place, verify it opens;
@@ -1253,13 +1882,11 @@ async fn run_recover_adopt_volume(
             )));
         }
     }
-    println!(
-        "kv recover: ADOPTED the clean snapshot into `{}`. The crashed store is RETAINED at `{}` \
-         (delete it once the node is confirmed serving). Start the daemon.",
-        target_dir.display(),
-        retained.display()
-    );
-    Ok(())
+    Ok(KvOutput::AdoptVolumeApplied {
+        volume_store: volume_dir.display().to_string(),
+        target_store: target_dir.display().to_string(),
+        retained: retained.display().to_string(),
+    })
 }
 
 /// Recursively copy a directory tree (`src` → `dst`) — the snapshot adopt copies the mounted volume
@@ -1279,26 +1906,35 @@ fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result
     Ok(())
 }
 
-/// Print the repair plan / outcome to stdout.
-fn print_report(report: &RepairReport, applied_mode: bool) {
-    println!(
+/// Write the repair plan / outcome.
+fn write_report(
+    w: &mut dyn std::io::Write,
+    report: &RepairReportView,
+    applied_mode: bool,
+) -> std::io::Result<()> {
+    writeln!(
+        w,
         "control-plane WAL repair {}",
         if applied_mode {
             "(APPLY)"
         } else {
             "(DRY-RUN — no mutation)"
         }
-    );
-    println!(
+    )?;
+    writeln!(
+        w,
         "  durable frontier (replay_after_wal_id): {}",
         report.frontier
-    );
-    println!("  WAL candidates beyond the frontier (highest id first):");
+    )?;
+    writeln!(
+        w,
+        "  WAL candidates beyond the frontier (highest id first):"
+    )?;
     if report.candidates.is_empty() {
-        println!("    (none)");
+        writeln!(w, "    (none)")?;
     } else {
         for c in &report.candidates {
-            println!("    {:020}.sst  {:>10} bytes  {:?}", c.id, c.size, c.class);
+            writeln!(w, "    {:020}.sst  {:>10} bytes  {}", c.id, c.size, c.class)?;
         }
     }
     // Out-of-scope torn SSTs (torn compacted/L0 SSTs + torn non-trailing WAL objects). These are
@@ -1307,26 +1943,31 @@ fn print_report(report: &RepairReport, applied_mode: bool) {
     // LOUDLY before the "should open normally" line so the compacted-SST case is unmistakable and
     // an apply's `UnrepairableTornObject` failure is explained.
     if !report.out_of_scope_torn.is_empty() {
-        println!(
+        writeln!(
+            w,
             "  OUT-OF-SCOPE torn SST(s) this tool will NOT auto-remove \
              (requires manifest-aware recovery; escalate):"
-        );
+        )?;
         for t in &report.out_of_scope_torn {
-            println!(
-                "    {}  {:>10} bytes  {:?}  [{:?}]",
+            writeln!(
+                w,
+                "    {}  {:>10} bytes  {}  [{}]",
                 t.path, t.size, t.class, t.kind
-            );
+            )?;
         }
-        println!(
+        writeln!(
+            w,
             "  A torn compacted/L0 SST cannot be quarantined safely (it is referenced by the \
              manifest); dropping it needs a manifest rollback. `--apply` will quarantine any safe \
              trailing WAL tail, then FAIL LOUD naming the object(s) above — the store will not open \
              until they are resolved out of band."
-        );
+        )?;
     }
     if report.is_noop() {
-        println!("  no torn SST found (WAL tail or compacted) — the store should open normally.");
-        return;
+        return writeln!(
+            w,
+            "  no torn SST found (WAL tail or compacted) — the store should open normally."
+        );
     }
     let ids: Vec<String> = report
         .quarantined
@@ -1334,33 +1975,36 @@ fn print_report(report: &RepairReport, applied_mode: bool) {
         .map(|id| format!("{id:020}"))
         .collect();
     if report.applied {
-        println!(
+        writeln!(
+            w,
             "  QUARANTINED the trailing torn tail [{}] to `{}`.",
             ids.join(", "),
             report.quarantine_dir.as_deref().unwrap_or("<unknown>")
-        );
-        println!(
+        )?;
+        writeln!(
+            w,
             "  The store should now open. NOTE (honest loss-window): a HARD-CRASH repair may have \
              lost the most-recent acked-into-WAL-but-not-yet-L0 writes — the graceful shutdown \
              path (quiesce-then-close) is lossless; only an abrupt crash/snapshot can lose the tail."
-        );
+        )
     } else {
-        println!(
+        writeln!(
+            w,
             "  WOULD quarantine the trailing torn tail [{}]. Re-run with `--apply` to perform it.",
             ids.join(", ")
-        );
-        println!(
+        )?;
+        writeln!(
+            w,
             "  NOTE (honest loss-window): applying on a HARD-CRASH store may lose the most-recent \
              acked-into-WAL-but-not-yet-L0 writes; a graceful shutdown is lossless."
-        );
+        )
     }
 }
 
 /// `boatramp kv stats` — report the store's physical-vs-logical footprint (kv-data-observability).
-async fn run_stats(args: StatsArgs) -> Result<(), Error> {
-    if let Some(msg) = args.addr.not_applicable("stats") {
-        println!("{msg}");
-        return Ok(());
+async fn run_stats(args: StatsArgs) -> Result<KvOutput, Error> {
+    if let Some(message) = args.addr.not_applicable("stats") {
+        return Ok(KvOutput::NotApplicable { message });
     }
     let (store, root) = args.addr.build()?;
     let physical = boatramp_storage::kv_slatedb::kv_physical_stats(&store, &root)
@@ -1369,18 +2013,18 @@ async fn run_stats(args: StatsArgs) -> Result<(), Error> {
     let logical = boatramp_storage::kv_slatedb::kv_logical_stats(&store, &root)
         .await
         .map_err(|e| Error::Store(e.to_string()))?;
-    print_kv_stats(&physical, &logical);
-    Ok(())
+    Ok(KvOutput::Stats {
+        stats: KvStatsView::from_stats(&physical, &logical),
+    })
 }
 
 /// `boatramp kv compact` — DRY-RUN (default) prints the stats + reclaimable delta and runs GC in
 /// dry-run; `--apply` runs the OFFLINE full-merge compaction then the IRREVERSIBLE GC reclaim.
-async fn run_compact(args: CompactArgs) -> Result<(), Error> {
+async fn run_compact(args: CompactArgs) -> Result<KvOutput, Error> {
     use boatramp_storage::kv_slatedb::{kv_compact, kv_gc, kv_logical_stats, kv_physical_stats};
 
-    if let Some(msg) = args.addr.not_applicable("compact") {
-        println!("{msg}");
-        return Ok(());
+    if let Some(message) = args.addr.not_applicable("compact") {
+        return Ok(KvOutput::NotApplicable { message });
     }
     let (store, root) = args.addr.build()?;
 
@@ -1392,21 +2036,15 @@ async fn run_compact(args: CompactArgs) -> Result<(), Error> {
         .map_err(|e| Error::Store(e.to_string()))?;
 
     if !args.apply {
-        println!("kv compact: DRY-RUN (no changes made). Current store footprint:");
-        print_kv_stats(&physical_before, &logical_before);
-        println!(
-            "\n  A compaction + GC would merge every L0 SST + sorted run into one sorted run and \
-             reclaim the now-unreferenced garbage (superseded SSTs + old manifests + replayed WAL).\n  \
-             Running GC in DRY-RUN below (slatedb logs each delete CANDIDATE; nothing is deleted):"
-        );
+        // Run GC in DRY-RUN for its side effect only — slatedb logs each delete CANDIDATE to the
+        // tracing sink and deletes nothing; the footprint + guidance text is rendered by
+        // `KvOutput::CompactDryRun`.
         kv_gc(&store, &root, true, std::time::Duration::ZERO)
             .await
             .map_err(|e| Error::Store(e.to_string()))?;
-        println!(
-            "\n  OFFLINE ONLY — STOP the daemon first, then re-run with `--apply` to compact + \
-             reclaim (GC deletion is IRREVERSIBLE)."
-        );
-        return Ok(());
+        return Ok(KvOutput::CompactDryRun {
+            stats: KvStatsView::from_stats(&physical_before, &logical_before),
+        });
     }
 
     // APPLY. OFFLINE ONLY + IRREVERSIBLE. This path drops EVERY protective checkpoint then runs GC
@@ -1416,16 +2054,8 @@ async fn run_compact(args: CompactArgs) -> Result<(), Error> {
     // would FENCE a live daemon (disrupting it + risking loss of its recently-acked writes) rather
     // than refuse — there is no safe in-process liveness probe, and no out-of-band daemon lock exists
     // to consult yet (tracked follow-up: an advisory flock the daemon holds + this verb checks). So we
-    // do NOT probe; the operator is responsible for stopping the daemon, and we warn plainly.
-    println!(
-        "kv compact --apply: OFFLINE full-merge compaction + GC reclaim. IRREVERSIBLE.\n  \
-         WARNING: this command CANNOT detect a running daemon and does not stop one — STOP the \
-         daemon on this node FIRST. Run against a live daemon it will fence/crash it and may delete \
-         objects an in-flight reader still needs (possible data loss)."
-    );
-    println!("\n  BEFORE:");
-    print_kv_stats(&physical_before, &logical_before);
-
+    // do NOT probe; the operator is responsible for stopping the daemon, and the warning rides the
+    // rendered result.
     let outcome = kv_compact(
         &store,
         &root,
@@ -1433,41 +2063,10 @@ async fn run_compact(args: CompactArgs) -> Result<(), Error> {
     )
     .await
     .map_err(|e| Error::Store(e.to_string()))?;
-    match (&outcome.spec, outcome.merged, outcome.timed_out) {
-        (Some(spec), true, _) => println!(
-            "\n  COMPACTED: merged {} run(s) → {} sorted run [spec {spec}].",
-            outcome.runs_before, outcome.runs_after
-        ),
-        (Some(spec), false, true) => println!(
-            "\n  WARNING: the full-merge compaction [spec {spec}] did NOT land within {}s (still {} \
-             run(s)). GC will still reclaim any already-unreferenced garbage, but re-run with a larger \
-             `--timeout-secs` to complete the merge.",
-            args.timeout_secs, outcome.runs_after
-        ),
-        (Some(spec), false, false) => println!(
-            "\n  NOTE: the submitted full-merge [spec {spec}] did not reach a single sorted run \
-             (still {} run(s)); proceeding to GC.",
-            outcome.runs_after
-        ),
-        (None, _, _) => println!(
-            "\n  Nothing to merge ({} run(s) — already compact); proceeding to GC to reclaim old \
-             manifests / WAL.",
-            outcome.runs_before
-        ),
-    }
 
     let gc = kv_gc(&store, &root, false, std::time::Duration::ZERO)
         .await
         .map_err(|e| Error::Store(e.to_string()))?;
-    if gc.dropped_checkpoints > 0 {
-        println!(
-            "  GC: dropped {} protective checkpoint(s) (safe OFFLINE), then reclaimed unreferenced \
-             SSTs + old manifests + replayed WAL.",
-            gc.dropped_checkpoints
-        );
-    } else {
-        println!("  GC: reclaimed unreferenced SSTs + old manifests + replayed WAL.");
-    }
 
     let physical_after = kv_physical_stats(&store, &root)
         .await
@@ -1475,60 +2074,60 @@ async fn run_compact(args: CompactArgs) -> Result<(), Error> {
     let logical_after = kv_logical_stats(&store, &root)
         .await
         .map_err(|e| Error::Store(e.to_string()))?;
-    println!("\n  AFTER:");
-    print_kv_stats(&physical_after, &logical_after);
-    let reclaimed = physical_before
-        .total_bytes
-        .saturating_sub(physical_after.total_bytes);
-    println!(
-        "\n  RECLAIMED: {} ({} → {} physical).",
-        human_bytes(reclaimed),
-        human_bytes(physical_before.total_bytes),
-        human_bytes(physical_after.total_bytes),
-    );
-    Ok(())
+
+    Ok(KvOutput::CompactApply {
+        before: KvStatsView::from_stats(&physical_before, &logical_before),
+        after: KvStatsView::from_stats(&physical_after, &logical_after),
+        compaction: KvCompactView::from_outcome(&outcome),
+        timeout_secs: args.timeout_secs,
+        dropped_checkpoints: gc.dropped_checkpoints,
+    })
 }
 
-/// Print a physical-vs-logical stats block: totals, the reclaimable delta, and the per-subdir
+/// Write a physical-vs-logical stats block: totals, the reclaimable delta, and the per-subdir
 /// physical breakdown.
-fn print_kv_stats(
-    physical: &boatramp_storage::kv_slatedb::KvPhysicalStats,
-    logical: &boatramp_storage::kv_slatedb::KvLogicalStats,
-) {
-    let reclaimable = physical.total_bytes.saturating_sub(logical.live_bytes);
-    let pct = if physical.total_bytes > 0 {
-        reclaimable as f64 / physical.total_bytes as f64 * 100.0
+fn write_kv_stats(w: &mut dyn std::io::Write, stats: &KvStatsView) -> std::io::Result<()> {
+    let reclaimable = stats
+        .physical_total_bytes
+        .saturating_sub(stats.logical_live_bytes);
+    let pct = if stats.physical_total_bytes > 0 {
+        reclaimable as f64 / stats.physical_total_bytes as f64 * 100.0
     } else {
         0.0
     };
-    println!(
+    writeln!(
+        w,
         "  physical:    {} in {} object(s)",
-        human_bytes(physical.total_bytes),
-        physical.total_objects
-    );
-    println!(
+        human_bytes(stats.physical_total_bytes),
+        stats.physical_total_objects
+    )?;
+    writeln!(
+        w,
         "  logical:     {} in {} live SST(s) (manifest gen {}, {} L0 + {} sorted run(s))",
-        human_bytes(logical.live_bytes),
-        logical.live_sst_count,
-        logical.manifest_id,
-        logical.l0_count,
-        logical.sorted_run_count,
-    );
-    println!(
+        human_bytes(stats.logical_live_bytes),
+        stats.logical_live_sst_count,
+        stats.manifest_id,
+        stats.l0_count,
+        stats.sorted_run_count,
+    )?;
+    writeln!(
+        w,
         "  reclaimable: {} ({pct:.1}% of physical — superseded SSTs + old manifests + replayed WAL)",
         human_bytes(reclaimable),
-    );
-    if !physical.dirs.is_empty() {
-        println!("  by subdir:");
-        for d in &physical.dirs {
-            println!(
+    )?;
+    if !stats.dirs.is_empty() {
+        writeln!(w, "  by subdir:")?;
+        for d in &stats.dirs {
+            writeln!(
+                w,
                 "    {:<12} {} in {} object(s)",
                 format!("{}/", d.name),
                 human_bytes(d.bytes),
                 d.objects
-            );
+            )?;
         }
     }
+    Ok(())
 }
 
 /// Human-readable bytes (binary units), e.g. `17.2 GiB`. Diagnostic-only formatting.

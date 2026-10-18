@@ -3,7 +3,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use boatramp_core::cert::CertStatus;
-use boatramp_core::deploy::{DeployMeta, DeploymentList, GcReport, ScrubReport};
+use boatramp_core::deploy::{DeployMeta, DeploymentList, GcReport, HistoryEntry, ScrubReport};
 
 use crate::client;
 use crate::config::ProjectConfig;
@@ -39,6 +39,213 @@ pub enum Error {
 /// `manage` module result; `Err` is [`Error`].
 type Result<T> = std::result::Result<T, Error>;
 
+/// `boatramp deployments`: a site's deployment history (the listed items).
+#[derive(Debug, serde::Serialize)]
+pub struct DeploymentsOutput {
+    /// The site inspected.
+    site: String,
+    /// The currently-active deployment id, if any (marks the `*` row).
+    current: Option<String>,
+    /// Total deployments in history (before the `--limit` cap).
+    total: usize,
+    /// The deployments shown (most recent first, capped at `--limit`).
+    deployments: Vec<HistoryEntry>,
+}
+
+impl crate::output::Rendered for DeploymentsOutput {
+    fn render_human(&self, w: &mut dyn std::io::Write) -> std::io::Result<()> {
+        if self.total == 0 {
+            return writeln!(w, "no deployments for {}", self.site);
+        }
+        for entry in &self.deployments {
+            let marker = if self.current.as_deref() == Some(entry.id.as_str()) {
+                "*"
+            } else {
+                " "
+            };
+            let detail = entry.meta.as_ref().map(meta_summary).unwrap_or_default();
+            writeln!(
+                w,
+                "{marker} {}  {}{detail}",
+                short(&entry.id),
+                ago(entry.at)
+            )?;
+        }
+        Ok(())
+    }
+}
+
+/// `boatramp rollback`: the site was activated at a target deployment.
+#[derive(Debug, serde::Serialize)]
+pub struct RollbackOutput {
+    site: String,
+    target: String,
+}
+
+impl crate::output::Rendered for RollbackOutput {
+    fn render_human(&self, w: &mut dyn std::io::Write) -> std::io::Result<()> {
+        writeln!(w, "rolled back {} -> {}", self.site, self.target)
+    }
+}
+
+/// `boatramp status`: a site's current deployment (or none).
+// The `Current` variant carries the full deployment detail + metadata; larger than the no-deployment
+// ack, but a short-lived build-then-emit value, so an allow over boxing.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, serde::Serialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum StatusOutput {
+    /// The site has no active deployment.
+    NoDeployment { site: String },
+    /// The site's current deployment and its provenance.
+    Current {
+        site: String,
+        /// Full current deployment id (rendered short).
+        deployment: String,
+        /// Coarse age of the activation (`None` ⇒ "unknown").
+        activated: Option<String>,
+        /// File count in the current manifest.
+        files: usize,
+        /// Total content bytes.
+        bytes: u64,
+        /// Number of deployments in history.
+        history: usize,
+        /// Deploy provenance, if recorded.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        meta: Option<DeployMeta>,
+    },
+}
+
+impl crate::output::Rendered for StatusOutput {
+    fn render_human(&self, w: &mut dyn std::io::Write) -> std::io::Result<()> {
+        match self {
+            Self::NoDeployment { site } => writeln!(w, "{site}: no active deployment"),
+            Self::Current {
+                site,
+                deployment,
+                activated,
+                files,
+                bytes,
+                history,
+                meta,
+            } => {
+                writeln!(w, "{site}")?;
+                writeln!(w, "  deployment  {}", short(deployment))?;
+                writeln!(
+                    w,
+                    "  activated   {}",
+                    activated.as_deref().unwrap_or("unknown")
+                )?;
+                writeln!(w, "  content     {files} file(s), {}", human_bytes(*bytes))?;
+                writeln!(w, "  history     {history} deployment(s)")?;
+                if let Some(meta) = meta {
+                    if let Some(message) = meta.message.as_deref().filter(|m| !m.is_empty()) {
+                        writeln!(w, "  message     {message}")?;
+                    }
+                    match (&meta.branch, &meta.source) {
+                        (Some(branch), Some(source)) => {
+                            writeln!(
+                                w,
+                                "  source      {branch}@{}",
+                                &source[..source.len().min(12)]
+                            )?;
+                        }
+                        (None, Some(source)) => {
+                            writeln!(w, "  source      {}", &source[..source.len().min(12)])?;
+                        }
+                        (Some(branch), None) => writeln!(w, "  source      {branch}")?,
+                        (None, None) => {}
+                    }
+                    if let Some(author) = meta.author.as_deref().filter(|a| !a.is_empty()) {
+                        writeln!(w, "  author      {author}")?;
+                    }
+                    if let Some(tag) = meta.tag.as_deref().filter(|t| !t.is_empty()) {
+                        writeln!(w, "  release     {tag}")?;
+                    }
+                    if !meta.tags.is_empty() {
+                        let kv = meta
+                            .tags
+                            .iter()
+                            .map(|(k, v)| format!("{k}={v}"))
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        writeln!(w, "  tags        {kv}")?;
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+/// `boatramp prune`: the garbage-collection outcome.
+#[derive(Debug, serde::Serialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum PruneOutput {
+    /// Nothing was reclaimable.
+    NothingToPrune,
+    /// `--dry-run`: the reclaimable report (printed before this verdict).
+    DryRun { report: GcReport },
+    /// The operator declined at the confirmation prompt.
+    Aborted { report: GcReport },
+    /// Deletion was committed; `report` is what was removed.
+    Pruned { report: GcReport },
+}
+
+impl crate::output::Rendered for PruneOutput {
+    fn render_human(&self, w: &mut dyn std::io::Write) -> std::io::Result<()> {
+        match self {
+            Self::NothingToPrune => writeln!(w, "nothing to prune"),
+            Self::DryRun { .. } => writeln!(w, "run `boatramp prune` to delete"),
+            Self::Aborted { .. } => writeln!(w, "aborted"),
+            Self::Pruned { report } => write_gc_report(report, "removed", w),
+        }
+    }
+}
+
+/// `boatramp scrub`: every blob verified intact. A scrub that finds corruption
+/// prints the per-blob findings and returns [`Error::ScrubFailed`] instead.
+#[derive(Debug, serde::Serialize)]
+pub struct ScrubOutput {
+    /// Blobs checked (all intact).
+    checked: usize,
+}
+
+impl crate::output::Rendered for ScrubOutput {
+    fn render_human(&self, w: &mut dyn std::io::Write) -> std::io::Result<()> {
+        writeln!(w, "{} blob(s) verified, all intact", self.checked)
+    }
+}
+
+/// `boatramp cert-status`: cluster-managed certificates.
+#[derive(Debug, serde::Serialize)]
+pub struct CertStatusOutput {
+    certs: Vec<CertStatus>,
+}
+
+impl crate::output::Rendered for CertStatusOutput {
+    fn render_human(&self, w: &mut dyn std::io::Write) -> std::io::Result<()> {
+        if self.certs.is_empty() {
+            return writeln!(w, "no cluster-managed certificates");
+        }
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        for cert in &self.certs {
+            let remaining = cert.not_after_unix.saturating_sub(now);
+            let days = remaining / 86_400;
+            let state = if cert.not_after_unix <= now {
+                "EXPIRED".to_string()
+            } else {
+                format!("{days}d left")
+            };
+            writeln!(w, "{}  ({state})", cert.domain)?;
+        }
+        Ok(())
+    }
+}
+
 /// Arguments for `boatramp deployments`.
 #[derive(Debug, clap::Args)]
 pub struct DeploymentsArgs {
@@ -56,7 +263,7 @@ pub struct DeploymentsArgs {
 }
 
 /// List a site's deployment history (most recent first; `*` marks current).
-pub async fn list(args: DeploymentsArgs, config: &ProjectConfig) -> Result<()> {
+pub async fn list(args: DeploymentsArgs, config: &ProjectConfig) -> Result<DeploymentsOutput> {
     let (server, site) = client::resolve_target(args.server, args.site, config)?;
     let cp = client::ControlPlane::new(
         server,
@@ -65,20 +272,15 @@ pub async fn list(args: DeploymentsArgs, config: &ProjectConfig) -> Result<()> {
     );
     let list = cp.fetch_deployments(&site).await?;
 
-    if list.deployments.is_empty() {
-        println!("no deployments for {site}");
-        return Ok(());
-    }
-    for entry in list.deployments.iter().take(args.limit) {
-        let marker = if list.current.as_deref() == Some(entry.id.as_str()) {
-            "*"
-        } else {
-            " "
-        };
-        let detail = entry.meta.as_ref().map(meta_summary).unwrap_or_default();
-        println!("{marker} {}  {}{detail}", short(&entry.id), ago(entry.at));
-    }
-    Ok(())
+    let total = list.deployments.len();
+    let current = list.current;
+    let deployments = list.deployments.into_iter().take(args.limit).collect();
+    Ok(DeploymentsOutput {
+        site,
+        current,
+        total,
+        deployments,
+    })
 }
 
 /// A compact one-line provenance summary:
@@ -139,7 +341,7 @@ pub struct RollbackArgs {
 }
 
 /// Roll a site back to its previous deployment, or to a specific id.
-pub async fn rollback(args: RollbackArgs, config: &ProjectConfig) -> Result<()> {
+pub async fn rollback(args: RollbackArgs, config: &ProjectConfig) -> Result<RollbackOutput> {
     let (server, site) = client::resolve_target(args.server, args.site, config)?;
     let cp = client::ControlPlane::new(
         server,
@@ -156,8 +358,7 @@ pub async fn rollback(args: RollbackArgs, config: &ProjectConfig) -> Result<()> 
     };
 
     cp.activate(&site, &target).await?;
-    println!("rolled back {site} -> {target}");
-    Ok(())
+    Ok(RollbackOutput { site, target })
 }
 
 /// Arguments for `boatramp status`.
@@ -173,7 +374,7 @@ pub struct StatusArgs {
 }
 
 /// Show a site's current deployment: id, age, and size.
-pub async fn status(args: StatusArgs, config: &ProjectConfig) -> Result<()> {
+pub async fn status(args: StatusArgs, config: &ProjectConfig) -> Result<StatusOutput> {
     let (server, site) = client::resolve_target(args.server, args.site, config)?;
     let cp = client::ControlPlane::new(
         server,
@@ -183,51 +384,26 @@ pub async fn status(args: StatusArgs, config: &ProjectConfig) -> Result<()> {
     let list = cp.fetch_deployments(&site).await?;
 
     let Some(current) = list.current.clone() else {
-        println!("{site}: no active deployment");
-        return Ok(());
+        return Ok(StatusOutput::NoDeployment { site });
     };
 
     let manifest = cp.fetch_manifest(&site, &current).await?;
     let files = manifest.files.len();
     let bytes: u64 = manifest.files.values().map(|entry| entry.size).sum();
     let current_entry = list.deployments.iter().find(|entry| entry.id == current);
-    let age = current_entry.map(|entry| ago(entry.at));
-    let meta = current_entry.and_then(|entry| entry.meta.as_ref());
+    let activated = current_entry.map(|entry| ago(entry.at));
+    let meta = current_entry.and_then(|entry| entry.meta.clone());
+    let history = list.deployments.len();
 
-    println!("{site}");
-    println!("  deployment  {}", short(&current));
-    println!("  activated   {}", age.as_deref().unwrap_or("unknown"));
-    println!("  content     {files} file(s), {}", human_bytes(bytes));
-    println!("  history     {} deployment(s)", list.deployments.len());
-    if let Some(meta) = meta {
-        if let Some(message) = meta.message.as_deref().filter(|m| !m.is_empty()) {
-            println!("  message     {message}");
-        }
-        match (&meta.branch, &meta.source) {
-            (Some(branch), Some(source)) => {
-                println!("  source      {branch}@{}", &source[..source.len().min(12)]);
-            }
-            (None, Some(source)) => println!("  source      {}", &source[..source.len().min(12)]),
-            (Some(branch), None) => println!("  source      {branch}"),
-            (None, None) => {}
-        }
-        if let Some(author) = meta.author.as_deref().filter(|a| !a.is_empty()) {
-            println!("  author      {author}");
-        }
-        if let Some(tag) = meta.tag.as_deref().filter(|t| !t.is_empty()) {
-            println!("  release     {tag}");
-        }
-        if !meta.tags.is_empty() {
-            let kv = meta
-                .tags
-                .iter()
-                .map(|(k, v)| format!("{k}={v}"))
-                .collect::<Vec<_>>()
-                .join(" ");
-            println!("  tags        {kv}");
-        }
-    }
-    Ok(())
+    Ok(StatusOutput::Current {
+        site,
+        deployment: current,
+        activated,
+        files,
+        bytes,
+        history,
+        meta,
+    })
 }
 
 /// Arguments for `boatramp prune`.
@@ -280,7 +456,7 @@ impl PruneArgs {
 ///
 /// Previews with a safe GET, then (unless `--yes`) asks for confirmation before
 /// committing the deletion with a POST. `--dry-run` only reports.
-pub async fn prune(args: PruneArgs, config: &ProjectConfig) -> Result<()> {
+pub async fn prune(args: PruneArgs, config: &ProjectConfig) -> Result<PruneOutput> {
     let server = client::resolve_server(args.server.clone(), config)?;
     let http = client::http_client(client::token(config).as_deref());
     let url = format!("{server}/api/prune");
@@ -297,15 +473,21 @@ pub async fn prune(args: PruneArgs, config: &ProjectConfig) -> Result<()> {
         .await?;
 
     if report.manifests_removed == 0 && report.blobs_removed == 0 {
-        println!("nothing to prune");
-        return Ok(());
+        return Ok(PruneOutput::NothingToPrune);
     }
 
-    print_report(&report, "reclaimable");
+    // The reclaimable preview is shown live — it is the context the operator reads
+    // before answering the confirmation prompt (and the body of a `--dry-run`); the
+    // terminal verdict is the typed result rendered by `output::emit`.
+    {
+        use std::io::Write as _;
+        let mut out = std::io::stdout().lock();
+        write_gc_report(&report, "reclaimable", &mut out)?;
+        out.flush()?;
+    }
 
     if args.dry_run {
-        println!("run `boatramp prune` to delete");
-        return Ok(());
+        return Ok(PruneOutput::DryRun { report });
     }
 
     if !args.yes {
@@ -316,8 +498,7 @@ pub async fn prune(args: PruneArgs, config: &ProjectConfig) -> Result<()> {
             human_bytes(report.bytes_reclaimed),
         );
         if !confirm(&prompt)? {
-            println!("aborted");
-            return Ok(());
+            return Ok(PruneOutput::Aborted { report });
         }
     }
 
@@ -330,22 +511,28 @@ pub async fn prune(args: PruneArgs, config: &ProjectConfig) -> Result<()> {
         .error_for_status()?
         .json()
         .await?;
-    print_report(&deleted, "removed");
-    Ok(())
+    Ok(PruneOutput::Pruned { report: deleted })
 }
 
-/// Print a prune/GC report: an outcome line plus the totals.
-fn print_report(report: &GcReport, verb: &str) {
-    println!(
+/// Write a prune/GC report: an outcome line plus the totals.
+fn write_gc_report(
+    report: &GcReport,
+    verb: &str,
+    w: &mut dyn std::io::Write,
+) -> std::io::Result<()> {
+    writeln!(
+        w,
         "{} orphan manifest(s), {} blob(s) {verb} ({})",
         report.manifests_removed,
         report.blobs_removed,
         human_bytes(report.bytes_reclaimed),
-    );
-    println!(
+    )?;
+    writeln!(
+        w,
         "  ({} blob(s), {} manifest(s) total)",
         report.blobs_total, report.manifests_total
-    );
+    )?;
+    Ok(())
 }
 
 /// Arguments for `boatramp scrub`.
@@ -359,7 +546,7 @@ pub struct ScrubArgs {
 /// Verify every stored blob still hashes to its key (integrity scrub).
 /// Read-only; exits non-zero if any corruption or unreadable blob is found, so
 /// it slots into a cron/healthcheck.
-pub async fn scrub(args: ScrubArgs, config: &ProjectConfig) -> Result<()> {
+pub async fn scrub(args: ScrubArgs, config: &ProjectConfig) -> Result<ScrubOutput> {
     let server = client::resolve_server(args.server, config)?;
     let http = client::http_client(client::token(config).as_deref());
     let report: ScrubReport = http
@@ -371,17 +558,27 @@ pub async fn scrub(args: ScrubArgs, config: &ProjectConfig) -> Result<()> {
         .await?;
 
     if report.is_clean() {
-        println!("{} blob(s) verified, all intact", report.checked);
-        return Ok(());
+        return Ok(ScrubOutput {
+            checked: report.checked,
+        });
     }
-    for m in &report.mismatched {
-        println!(
-            "CORRUPT    {} (expected {}, got {})",
-            m.key, m.expected, m.actual
-        );
-    }
-    for e in &report.errors {
-        println!("UNREADABLE {} ({})", e.key, e.error);
+    // Corruption/unreadable blobs found: show each finding, then fail non-zero (the
+    // scrub's exit code is the signal for a cron/healthcheck). The per-blob detail is
+    // on the error path, so it is written here rather than through `output::emit`.
+    {
+        use std::io::Write as _;
+        let mut out = std::io::stdout().lock();
+        for m in &report.mismatched {
+            writeln!(
+                out,
+                "CORRUPT    {} (expected {}, got {})",
+                m.key, m.expected, m.actual
+            )?;
+        }
+        for e in &report.errors {
+            writeln!(out, "UNREADABLE {} ({})", e.key, e.error)?;
+        }
+        out.flush()?;
     }
     Err(Error::ScrubFailed {
         checked: report.checked,
@@ -400,7 +597,7 @@ pub struct CertStatusArgs {
 
 /// Show cluster-managed certificate status (domain + expiry). Empty when certs
 /// live in a file cache (single-node `--tls acme`) rather than the control plane.
-pub async fn cert_status(args: CertStatusArgs, config: &ProjectConfig) -> Result<()> {
+pub async fn cert_status(args: CertStatusArgs, config: &ProjectConfig) -> Result<CertStatusOutput> {
     let server = client::resolve_server(args.server, config)?;
     let http = client::http_client(client::token(config).as_deref());
     let certs: Vec<CertStatus> = http
@@ -410,25 +607,7 @@ pub async fn cert_status(args: CertStatusArgs, config: &ProjectConfig) -> Result
         .error_for_status()?
         .json()
         .await?;
-    if certs.is_empty() {
-        println!("no cluster-managed certificates");
-        return Ok(());
-    }
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    for cert in certs {
-        let remaining = cert.not_after_unix.saturating_sub(now);
-        let days = remaining / 86_400;
-        let state = if cert.not_after_unix <= now {
-            "EXPIRED".to_string()
-        } else {
-            format!("{days}d left")
-        };
-        println!("{}  ({state})", cert.domain);
-    }
-    Ok(())
+    Ok(CertStatusOutput { certs })
 }
 
 /// Prompt on stderr and read a yes/no answer from stdin. EOF counts as "no".

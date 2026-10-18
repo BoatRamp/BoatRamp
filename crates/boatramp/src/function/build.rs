@@ -10,11 +10,11 @@ const COMPONENTIZE_PY_VERSION: &str = "0.25.0";
 /// The jco version `function build` pins for JS components (validated round-trip).
 const JCO_VERSION: &str = "1.25.2";
 
-/// Build a function project to a component and print the produced `.wasm` path.
+/// Build a function project to a component and return the produced `.wasm` path.
 /// The language is detected from the project files: `Cargo.toml` ⇒ Rust
 /// (`cargo build --target wasm32-wasip2`), `package.json` ⇒ JS
-/// (`jco componentize`).
-pub(super) async fn build_project(dir: Option<std::path::PathBuf>) -> Result<()> {
+/// (`jco componentize`). The caller reports the produced path.
+pub(super) async fn build_project(dir: Option<std::path::PathBuf>) -> Result<std::path::PathBuf> {
     let dir = dir.unwrap_or_else(|| std::path::PathBuf::from("."));
     let component = if dir.join("Cargo.toml").exists() {
         build_rust(&dir).await?
@@ -25,12 +25,7 @@ pub(super) async fn build_project(dir: Option<std::path::PathBuf>) -> Result<()>
     } else {
         return Err(FunctionError::NoComponent);
     };
-    println!("built {}", component.display());
-    println!(
-        "  deploy: boatramp function deploy <name> --component {}",
-        component.display()
-    );
-    Ok(())
+    Ok(component)
 }
 
 /// Compile a Rust function project → the produced component path.

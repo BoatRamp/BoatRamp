@@ -106,8 +106,90 @@ enum FrameCommand {
     Clear,
 }
 
+/// The result of a `security-headers` subcommand, rendered by [`crate::output`].
+#[derive(Debug, serde::Serialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum SecurityHeadersOutput {
+    /// `security-headers show` — the site's current policy.
+    Show {
+        site: String,
+        https_redirect: bool,
+        hsts: Option<Hsts>,
+        csp: Option<String>,
+        frame_options: Option<String>,
+    },
+    /// The HTTP→HTTPS redirect was toggled.
+    HttpsRedirect { site: String, enabled: bool },
+    /// HSTS was enabled with the given parameters.
+    HstsSet {
+        site: String,
+        max_age: u64,
+        include_subdomains: bool,
+        preload: bool,
+    },
+    /// HSTS was removed.
+    HstsOff { site: String },
+    /// The Content-Security-Policy was set.
+    CspSet { site: String },
+    /// The Content-Security-Policy was removed.
+    CspCleared { site: String },
+    /// X-Frame-Options was set.
+    FrameOptionsSet { site: String, value: String },
+    /// X-Frame-Options was removed.
+    FrameOptionsCleared { site: String },
+}
+
+impl crate::output::Rendered for SecurityHeadersOutput {
+    fn render_human(&self, w: &mut dyn std::io::Write) -> std::io::Result<()> {
+        match self {
+            Self::Show {
+                site,
+                https_redirect,
+                hsts,
+                csp,
+                frame_options,
+            } => {
+                writeln!(w, "security headers for {site}:")?;
+                writeln!(w, "  https_redirect: {https_redirect}")?;
+                match hsts {
+                    None => writeln!(w, "  hsts: off")?,
+                    Some(h) => writeln!(
+                        w,
+                        "  hsts: max-age={} include_subdomains={} preload={}",
+                        h.max_age, h.include_subdomains, h.preload
+                    )?,
+                }
+                writeln!(w, "  csp: {}", csp.as_deref().unwrap_or("(unset)"))?;
+                writeln!(
+                    w,
+                    "  frame_options: {}",
+                    frame_options.as_deref().unwrap_or("(unset)")
+                )
+            }
+            Self::HttpsRedirect { site, enabled } => {
+                writeln!(w, "https redirect {} for {site}", onoff(*enabled))
+            }
+            Self::HstsSet { site, max_age, .. } => {
+                writeln!(w, "hsts set for {site} (max-age {max_age})")
+            }
+            Self::HstsOff { site } => writeln!(w, "hsts off for {site}"),
+            Self::CspSet { site } => writeln!(w, "csp set for {site}"),
+            Self::CspCleared { site } => writeln!(w, "csp cleared for {site}"),
+            Self::FrameOptionsSet { site, value } => {
+                writeln!(w, "frame-options set to {value} for {site}")
+            }
+            Self::FrameOptionsCleared { site } => {
+                writeln!(w, "frame-options cleared for {site}")
+            }
+        }
+    }
+}
+
 /// Entry point for `boatramp security-headers`.
-pub async fn run(args: SecurityHeadersArgs, config: &ProjectConfig) -> Result<()> {
+pub async fn run(
+    args: SecurityHeadersArgs,
+    config: &ProjectConfig,
+) -> Result<SecurityHeadersOutput> {
     let (server, site) = client::resolve_target(args.server, args.site, config)?;
     let cp = client::ControlPlane::new(
         server,
@@ -117,30 +199,23 @@ pub async fn run(args: SecurityHeadersArgs, config: &ProjectConfig) -> Result<()
     let mut site_config = cp.fetch_site_config(&site).await?;
     let security = &mut site_config.security;
 
-    match args.command {
+    let out = match args.command {
         SecurityHeadersCommand::Show => {
-            println!("security headers for {site}:");
-            println!("  https_redirect: {}", security.https_redirect);
-            match &security.hsts {
-                None => println!("  hsts: off"),
-                Some(h) => println!(
-                    "  hsts: max-age={} include_subdomains={} preload={}",
-                    h.max_age, h.include_subdomains, h.preload
-                ),
-            }
-            println!("  csp: {}", security.csp.as_deref().unwrap_or("(unset)"));
-            println!(
-                "  frame_options: {}",
-                security.frame_options.as_deref().unwrap_or("(unset)")
-            );
-            return Ok(());
+            // Read-only; no write-back.
+            return Ok(SecurityHeadersOutput::Show {
+                https_redirect: security.https_redirect,
+                hsts: security.hsts.clone(),
+                csp: security.csp.clone(),
+                frame_options: security.frame_options.clone(),
+                site,
+            });
         }
         SecurityHeadersCommand::HttpsRedirect { state } => {
             security.https_redirect = matches!(state, Toggle::On);
-            println!(
-                "https redirect {} for {site}",
-                onoff(security.https_redirect)
-            );
+            SecurityHeadersOutput::HttpsRedirect {
+                site: site.clone(),
+                enabled: security.https_redirect,
+            }
         }
         SecurityHeadersCommand::Hsts { command } => match command {
             HstsCommand::Set {
@@ -153,37 +228,45 @@ pub async fn run(args: SecurityHeadersArgs, config: &ProjectConfig) -> Result<()
                     include_subdomains,
                     preload,
                 });
-                println!("hsts set for {site} (max-age {max_age})");
+                SecurityHeadersOutput::HstsSet {
+                    site: site.clone(),
+                    max_age,
+                    include_subdomains,
+                    preload,
+                }
             }
             HstsCommand::Off => {
                 security.hsts = None;
-                println!("hsts off for {site}");
+                SecurityHeadersOutput::HstsOff { site: site.clone() }
             }
         },
         SecurityHeadersCommand::Csp { command } => match command {
             CspCommand::Set { policy } => {
                 security.csp = Some(policy);
-                println!("csp set for {site}");
+                SecurityHeadersOutput::CspSet { site: site.clone() }
             }
             CspCommand::Clear => {
                 security.csp = None;
-                println!("csp cleared for {site}");
+                SecurityHeadersOutput::CspCleared { site: site.clone() }
             }
         },
         SecurityHeadersCommand::FrameOptions { command } => match command {
             FrameCommand::Set { value } => {
                 security.frame_options = Some(value.clone());
-                println!("frame-options set to {value} for {site}");
+                SecurityHeadersOutput::FrameOptionsSet {
+                    site: site.clone(),
+                    value,
+                }
             }
             FrameCommand::Clear => {
                 security.frame_options = None;
-                println!("frame-options cleared for {site}");
+                SecurityHeadersOutput::FrameOptionsCleared { site: site.clone() }
             }
         },
-    }
+    };
 
     cp.put_site_config(&site, &site_config).await?;
-    Ok(())
+    Ok(out)
 }
 
 /// Render a bool as `on`/`off`.
