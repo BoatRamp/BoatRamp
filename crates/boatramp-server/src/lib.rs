@@ -6382,6 +6382,129 @@ mod tests {
     /// resolved **principal** to a federated sub-fetch, so a subgraph resolver reached over the
     /// supergraph with NO request bearer still resolves its own-tenancy from the inherited principal
     /// (symmetric to `emit::invoke`). Drives the REAL `FederationRunner` → invoke → engine over a REAL
+    /// #11 — per-subscriber scoped-stream authz (claim membership), the multi-member isolation gate:
+    /// 2 subscribers × 2 mailboxes. Each subscriber authorizes ONLY its own mailbox (resolving its
+    /// own scoped topic), is refused (403) for a mailbox it isn't a member of (so a cross-mailbox
+    /// event — published to a topic the connection never subscribes — is structurally undeliverable),
+    /// and an anonymous connection is refused (401). Claim-based so it needs no libsql (runs in the
+    /// normal gate); the SQL method's binding is unit-tested + its end-to-end is the `#[ignore]`d
+    /// `scoped_stream_sql_membership_*` gate below.
+    #[cfg(feature = "oidc")]
+    #[tokio::test]
+    async fn scoped_stream_claim_membership_isolates_mailboxes() {
+        use base64::Engine;
+        use boatramp_core::config::{
+            HandlerGraphqlTokenClaims, StreamAuthz, StreamConfig, StreamMembership,
+        };
+        use boatramp_handlers::{HandlerEngine, Limits};
+        let b64 = |b: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b);
+        let key = ed25519_dalek::SigningKey::from_bytes(&[11u8; 32]);
+        let jwks = serde_json::json!({ "keys": [ {
+            "kty": "OKP", "crv": "Ed25519", "kid": "app-1",
+            "x": b64(key.verifying_key().as_bytes()),
+        } ] })
+        .to_string();
+        let token = |sub: &str, mailboxes: serde_json::Value| -> String {
+            use ed25519_dalek::Signer;
+            let header = b64(
+                serde_json::json!({ "alg": "EdDSA", "typ": "JWT", "kid": "app-1" })
+                    .to_string()
+                    .as_bytes(),
+            );
+            let payload = b64(serde_json::json!({
+                "iss": "https://idp.example",
+                "exp": 4_102_444_800u64, // 2100-01-01
+                "sub": sub,
+                "mailboxes": mailboxes,
+            })
+            .to_string()
+            .as_bytes());
+            let input = format!("{header}.{payload}");
+            let sig = key.sign(input.as_bytes());
+            format!("{input}.{}", b64(&sig.to_bytes()))
+        };
+
+        let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let storage = Arc::new(MemStorage::default());
+        let rt = HandlerRuntime::new(engine, kv, storage, None, None);
+        rt.set_env_source(Arc::new(
+            boatramp_core::env::MapEnv::new().with("IDP_JWKS", jwks),
+        ));
+        let inner = rt.inner.as_ref().unwrap();
+
+        let stream = StreamConfig {
+            route: "/events/shared/:mailbox".into(),
+            topics: vec!["shared/{mailbox}/events".into()],
+            websocket: false,
+            publish_topic: None,
+            authz: Some(StreamAuthz::Scoped {
+                token_claims: HandlerGraphqlTokenClaims {
+                    issuer: "https://idp.example".into(),
+                    jwks_env: Some("IDP_JWKS".into()),
+                    ..Default::default()
+                },
+                membership: vec![StreamMembership::Claim {
+                    param: "mailbox".into(),
+                    claim: "mailboxes".into(),
+                }],
+            }),
+        };
+        let authorize = |path: &'static str, bearer: Option<String>| {
+            let stream = stream.clone();
+            async move {
+                crate::stream::authorize_stream_topics(
+                    inner,
+                    "default",
+                    "console",
+                    &stream,
+                    path,
+                    bearer.as_deref(),
+                )
+                .await
+            }
+        };
+        let tok_a = token("userA", serde_json::json!(["mbxA"]));
+        let tok_b = token("userB", serde_json::json!(["mbxB"]));
+
+        // Each member authorizes ONLY its own mailbox, resolving its own scoped topic.
+        assert_eq!(
+            authorize("/events/shared/mbxA", Some(tok_a.clone()))
+                .await
+                .expect("A is a member of mbxA"),
+            vec!["shared/mbxA/events".to_string()]
+        );
+        assert_eq!(
+            authorize("/events/shared/mbxB", Some(tok_b.clone()))
+                .await
+                .expect("B is a member of mbxB"),
+            vec!["shared/mbxB/events".to_string()]
+        );
+        // Cross-mailbox is refused (403) — A can't attach to B's mailbox, and vice-versa.
+        assert_eq!(
+            authorize("/events/shared/mbxB", Some(tok_a))
+                .await
+                .unwrap_err()
+                .status(),
+            axum::http::StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            authorize("/events/shared/mbxA", Some(tok_b))
+                .await
+                .unwrap_err()
+                .status(),
+            axum::http::StatusCode::FORBIDDEN
+        );
+        // An anonymous connection is refused (401).
+        assert_eq!(
+            authorize("/events/shared/mbxA", None)
+                .await
+                .unwrap_err()
+                .status(),
+            axum::http::StatusCode::UNAUTHORIZED
+        );
+    }
+
     /// libsql-backed subgraph function (`graphql-scope-probe`, whose `items` field is host-scoped via
     /// the `{scope}` marker): running as tenant B returns ONLY B's rows; running with no principal
     /// fails closed (the pre-v0.4.6 behavior — never a leak). `#[ignore]`d (static-musl libsql
