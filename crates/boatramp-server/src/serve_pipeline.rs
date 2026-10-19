@@ -1195,10 +1195,15 @@ async fn serve_resolved(
                 // serve_ws_stream does the RFC 6455 handshake + takes over the
                 // connection via boatramp-http's upgrade seam (the request body
                 // isn't held across an await — WS carries none).
+                // #11: the host-resolved project the scoped-stream authz runs under (default-project
+                // fallback, mirroring handler dispatch).
+                let stream_project =
+                    project.unwrap_or(boatramp_core::project::ProjectRef::DEFAULT.as_str());
                 if stream.websocket && is_upgrade_request(request.headers()) {
                     return apply_vary(
                         serve_ws_stream(
                             inner,
+                            stream_project,
                             site,
                             site_handlers,
                             stream,
@@ -1210,21 +1215,31 @@ async fn serve_resolved(
                         &vary,
                     );
                 }
-                // Pull the only field needed from the request as an owned
-                // value: `&Request` is not `Send` (the body isn't `Sync`),
-                // so it must not be held across the dispatch await.
+                // Pull the owned bits the serve + authz need from the request: `&Request` is not
+                // `Send` (the body isn't `Sync`), so nothing borrowed from it is held across the
+                // dispatch await. `after` = Last-Event-ID resume; `bearer` = the scoped-stream
+                // principal.
                 let after = request
                     .headers()
                     .get("last-event-id")
                     .and_then(|value| value.to_str().ok())
                     .map(str::to_string);
+                let bearer = request
+                    .headers()
+                    .get(axum::http::header::AUTHORIZATION)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.strip_prefix("Bearer "))
+                    .map(str::to_string);
                 return apply_vary(
                     serve_stream(
                         inner,
+                        stream_project,
                         site,
                         site_handlers,
                         stream,
                         after,
+                        request_path,
+                        bearer.as_deref(),
                         client_ip,
                         preview,
                     )
