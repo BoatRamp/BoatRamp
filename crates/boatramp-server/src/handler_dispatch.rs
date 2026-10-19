@@ -345,6 +345,9 @@ pub(super) async fn dispatch_handler(
                             // immediately (no recomposition lag) and never widens.
                             &gql.edge_hidden_operations,
                             &gql.edge_hidden_subgraphs,
+                            // Per-site subgraph composition: this site's include list (absent ⇒ the
+                            // full project supergraph, unchanged).
+                            gql.subgraphs.as_deref(),
                             auth_us,
                         )
                         .await;
@@ -952,6 +955,12 @@ async fn federation_gateway(
     // entries ignored+warned) so a change takes effect immediately with no recomposition lag.
     edge_hidden_operations: &[String],
     edge_hidden_subgraphs: &[String],
+    // Per-site subgraph composition: the site's `graphql.subgraphs` include list. `None` ⇒ compose the
+    // full project supergraph (every existing site — byte-identical). `Some(names)` ⇒ compose a
+    // distinct supergraph from exactly those registered subgraphs, so this site's schema/planning/
+    // execution reflect only its subset. (This is COMPOSITION selection; `edge_hidden_*` above is
+    // reachability hiding WITHIN the composed set — orthogonal, both apply.)
+    subgraphs: Option<&[String]>,
     // Micros spent in the auth phase (token verify + any JWKS fetch) at the call site — folded into
     // the per-phase timing (structured log + `Server-Timing`) so the JWKS cost is visible.
     auth_us: u64,
@@ -960,19 +969,47 @@ async fn federation_gateway(
     // the plan) — the same `graphql_cache` the in-process `graphql::run` path uses, so neither
     // path re-lists/re-parses/re-plans a graph that only changes on deploy.
     let t_compose = std::time::Instant::now();
-    let cached = match inner
-        .graphql_cache
-        .supergraph(inner.kv.as_ref(), project)
-        .await
-    {
-        Ok(c) => c,
-        Err(err) => {
-            return (
-                StatusCode::BAD_GATEWAY,
-                format!("supergraph composition failed: {err}\n"),
-            )
-                .into_response();
+    // Resolve THIS site's supergraph: a per-site subgraph subset (its own composed supergraph, cached
+    // + plan-keyed under a stable set-hash `graph_id`) or — the default — the full project supergraph
+    // (`graph_id = ""`, byte-identical to before). `Some(names)` composes exactly that subset, even if
+    // empty (an empty set = "this site exposes no graph"); `None` composes everything.
+    let (cached, graph_id) = match subgraphs {
+        Some(names) => {
+            // Canonical (sorted, deduped) set ⇒ order-independent hash + composition; two sites with
+            // the same set share one composed supergraph.
+            let mut canon: Vec<String> = names.to_vec();
+            canon.sort_unstable();
+            canon.dedup();
+            let set_hash = crate::graphql_cache::subgraph_set_hash(&canon);
+            match inner
+                .graphql_cache
+                .supergraph_subset(inner.kv.as_ref(), project, &canon, &set_hash)
+                .await
+            {
+                Ok(c) => (c, set_hash),
+                Err(err) => {
+                    return (
+                        StatusCode::BAD_GATEWAY,
+                        format!("supergraph composition failed: {err}\n"),
+                    )
+                        .into_response();
+                }
+            }
         }
+        None => match inner
+            .graphql_cache
+            .supergraph(inner.kv.as_ref(), project)
+            .await
+        {
+            Ok(c) => (c, String::new()),
+            Err(err) => {
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    format!("supergraph composition failed: {err}\n"),
+                )
+                    .into_response();
+            }
+        },
     };
     // Warm: a cache hit (version match) — just the version `kv.get`, not a recompose.
     let compose_us = t_compose.elapsed().as_micros() as u64;
@@ -992,6 +1029,7 @@ async fn federation_gateway(
     let plan = match inner.graphql_cache.plan(
         project,
         cached.version,
+        &graph_id,
         &op_hash,
         query,
         &cached.supergraph,

@@ -163,6 +163,22 @@ pub(crate) async fn sql_subgraphs(
     out
 }
 
+/// The SQL-backed subgraphs of `project`, restricted to the named subgraph `subset` (per-site
+/// composition) — so a per-site router carries only the SQL routes of the subgraphs that site
+/// composes, matching its subset supergraph.
+pub(crate) async fn sql_subgraphs_subset(
+    kv: &dyn KvStore,
+    project: &str,
+    subset: &[String],
+) -> BTreeMap<String, (String, HandlerGraphqlDataConfig)> {
+    let wanted: std::collections::BTreeSet<&str> = subset.iter().map(String::as_str).collect();
+    sql_subgraphs(kv, project)
+        .await
+        .into_iter()
+        .filter(|(name, _)| wanted.contains(name.as_str()))
+        .collect()
+}
+
 /// Why a subgraph publish failed.
 #[derive(Debug)]
 pub(crate) enum PublishError {
@@ -329,6 +345,40 @@ pub(crate) async fn supergraph(
     project: &str,
 ) -> Result<Supergraph, CompositionError> {
     compose(&load_subgraphs(kv, project).await)
+}
+
+/// The composed supergraph for `project` restricted to the named subgraph `subset` — a site's
+/// per-site `graphql.subgraphs` include list (per-site subgraph composition). Composes exactly the
+/// registered subgraphs whose name is in `subset` (the intersection with what is currently
+/// registered — a name that is not registered right now is dropped and logged, so an unpublish after
+/// `apply` degrades gracefully rather than failing the edge; the fail-CLOSED check for an unknown
+/// include and for federation-subset validity lives at APPLY, see `validate_subset`).
+///
+/// NOTE: an **empty** resolved intersection composes an empty supergraph (no roots) — that site's
+/// `/graphql` then plans everything as `UnknownRootField`, which is the correct "this site exposes
+/// no graph" outcome, not an error. The apply-time validator rejects an empty/typo'd include set.
+pub(crate) async fn supergraph_subset(
+    kv: &dyn KvStore,
+    project: &str,
+    subset: &[String],
+) -> Result<Supergraph, CompositionError> {
+    let wanted: std::collections::BTreeSet<&str> = subset.iter().map(String::as_str).collect();
+    let all = load_subgraphs(kv, project).await;
+    let chosen: Vec<(String, String)> = all
+        .into_iter()
+        .filter(|(name, _)| wanted.contains(name.as_str()))
+        .collect();
+    if chosen.len() != wanted.len() {
+        let present: std::collections::BTreeSet<&str> =
+            chosen.iter().map(|(n, _)| n.as_str()).collect();
+        for missing in wanted.iter().filter(|n| !present.contains(*n)) {
+            tracing::warn!(
+                project, subgraph = %missing,
+                "per-site graphql.subgraphs names a subgraph not currently registered; composing without it"
+            );
+        }
+    }
+    compose(&chosen)
 }
 
 /// Whether `name` is a currently-registered subgraph of `project` (an SDL is stored). Used to

@@ -1376,6 +1376,30 @@ pub struct HandlerGraphqlConfig {
     /// nothing hidden (non-breaking, opt-out only).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub edge_hidden_subgraphs: Vec<String>,
+    /// **Per-site subgraph composition** for a `federated` gateway: an explicit **include list** of
+    /// registered subgraph names this site composes its `/graphql` supergraph from. The result is a
+    /// genuinely distinct composed supergraph per site — planning, execution, and introspection all
+    /// reflect only these subgraphs; an excluded subgraph is **absent from this site's schema**
+    /// (invisible to introspection, unplannable, uncallable), not merely unreachable.
+    ///
+    /// This is the **schema-level** boundary, distinct from `edge_hidden_*` (which hides the
+    /// *reachability* of roots that the site still composes). Composition selection decides *which
+    /// subgraphs exist on the site*; `edge_hidden_*` decides *which present roots are reachable*. Both
+    /// remain valid and compose (an `edge_hidden_*` entry naming a subgraph this site doesn't compose
+    /// is a harmless logged no-op).
+    ///
+    /// **Include** (not exclude) is the canonical form because the use case is a security boundary and
+    /// include is fail-safe: a newly-registered subgraph does NOT auto-appear on a locked-down site.
+    ///
+    /// **Absent ⇒ all registered subgraphs** (today's behavior — fully backward-compatible, the one
+    /// per-project supergraph, byte-identical). Set but naming an unregistered subgraph, or naming a
+    /// set that is not a valid Federation subset (an included subgraph references an entity owned by an
+    /// excluded one), is a **fail-closed apply-time error** — never silently ignored or auto-widened.
+    /// Internal paths (`graphql::run`, `emit::invoke`) compose the FULL project supergraph, independent
+    /// of this selection — this partitions only a site's external edge. Applies to `federated: true`
+    /// gateways; not to `data:` connector sites.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subgraphs: Option<Vec<String>>,
 }
 
 /// The declarative GraphQL data connector's configuration (see

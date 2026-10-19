@@ -84,6 +84,22 @@ fn hidden_hash(hidden: &BTreeSet<(String, String)>) -> String {
     crate::graphql_apq::sha256_hex(&canonical)
 }
 
+/// A stable hex hash over a canonical (sorted, deduped) subgraph-NAME set — the `set_hash` key
+/// dimension for per-site composed supergraphs (per-site `graphql.subgraphs`). Mirrors
+/// [`hidden_hash`]'s length-prefixed canonical form + the shared SHA-256 helper, so two sites with
+/// the same resolved include set hash identically (share one composed supergraph) across nodes. The
+/// caller passes the names; sorting + deduping here makes the hash order-independent.
+pub(crate) fn subgraph_set_hash(names: &[String]) -> String {
+    let mut canon: Vec<&str> = names.iter().map(String::as_str).collect();
+    canon.sort_unstable();
+    canon.dedup();
+    let mut canonical = String::new();
+    for name in canon {
+        canonical.push_str(&format!("{}:{name}\u{1f}", name.len()));
+    }
+    crate::graphql_apq::sha256_hex(&canonical)
+}
+
 /// The SQL-backed subgraph routing table (`name → (site, data config)`), cached alongside the
 /// supergraph (it's the *other* uncached `list_prefix` on the hot path, and changes on the same
 /// version bump).
@@ -92,7 +108,12 @@ type SqlSubgraphs = BTreeMap<String, (String, HandlerGraphqlDataConfig)>;
 /// The plan-cache key: `(project, version, op_hash, visibility_discriminant)` (#495). The trailing
 /// visibility discriminant separates the external edge's (possibly hidden) plan from the internal
 /// path's — see [`Visibility`].
-type PlanKey = (String, u64, String, String);
+/// `(project, version, graph_id, op_hash, visibility)`. `graph_id` is the per-site composed-supergraph
+/// identity: `""` for the full-project supergraph (every existing project — byte-identical to the
+/// pre-subset 4-tuple with a constant empty slot), or the [`subgraph_set_hash`] for a per-site subset.
+/// Without it two sites at the same registry version but different subgraph subsets would collide and
+/// serve each other's plans (a cross-site leak), since the plan is a function of the *subset* supergraph.
+type PlanKey = (String, u64, String, String, String);
 
 /// A composed supergraph for a project at a specific composition version. Cheaply cloned (the
 /// heavy `Supergraph` + routing table are behind `Arc`s).
@@ -112,6 +133,13 @@ const PLAN_CAPACITY: usize = 1024;
 /// in-process `graphql::run` paths).
 pub(crate) struct GraphqlCache {
     supergraphs: Mutex<LruCache<String, CachedGraph>>,
+    /// Per-site subgraph composition: composed supergraphs for a DECLARED SUBSET of a project's
+    /// subgraphs, keyed `(project, set_hash)` where `set_hash` is a stable hash of the canonical
+    /// (sorted, deduped) include set (see [`subgraph_set_hash`]). Version-filtered like
+    /// `supergraphs`, so two sites with the same set share one entry and recomposition still happens
+    /// only on a registry-version change. The full-project (`subgraphs` absent) path never touches
+    /// this — it stays in `supergraphs`, byte-identical to before.
+    subset_supergraphs: Mutex<LruCache<(String, String), CachedGraph>>,
     /// Keyed `(project, version, op_hash, visibility)` (#495): the trailing `visibility` component
     /// discriminates the external edge's (possibly hidden) plan from the internal path's — see
     /// [`Visibility`]. Without it the shared cache would fail open across the two paths.
@@ -140,6 +168,9 @@ impl Default for GraphqlCache {
     fn default() -> Self {
         Self {
             supergraphs: Mutex::new(LruCache::new(
+                NonZeroUsize::new(SUPERGRAPH_CAPACITY).expect("nonzero"),
+            )),
+            subset_supergraphs: Mutex::new(LruCache::new(
                 NonZeroUsize::new(SUPERGRAPH_CAPACITY).expect("nonzero"),
             )),
             plans: Mutex::new(LruCache::new(
@@ -174,6 +205,34 @@ impl GraphqlCache {
         }
     }
 
+    /// Read the current registry composition version for `project` through `read_kv` (the store the
+    /// caller resolved via [`registry_read_store`](Self::registry_read_store)). When `via_read_through`
+    /// (MF-3 fence can't confirm currency) a successful read re-confirms the fence; an unreachable
+    /// store FAILS CLOSED (`RegistryUnreachable`). Shared by the full-project and per-subset caches so
+    /// the fence logic lives in one place.
+    async fn read_version(
+        &self,
+        read_kv: &dyn KvStore,
+        project: &str,
+        via_read_through: bool,
+    ) -> Result<u64, CompositionError> {
+        if via_read_through {
+            match crate::graphql_registry::composition_version_checked(read_kv, project).await {
+                Ok(v) => {
+                    if let Some(rf) = self.registry_fence.get() {
+                        rf.fence.confirm();
+                    }
+                    Ok(v)
+                }
+                Err(e) => Err(CompositionError::RegistryUnreachable {
+                    message: e.to_string(),
+                }),
+            }
+        } else {
+            Ok(crate::graphql_registry::composition_version(read_kv, project).await)
+        }
+    }
+
     /// The composed supergraph + SQL routing for `project` at the current registry version,
     /// composing (and caching) on a version miss. A composition error is returned **uncached**.
     pub(crate) async fn supergraph(
@@ -184,25 +243,12 @@ impl GraphqlCache {
         // MF-3: read the registry version (and, on a miss, recompose) THROUGH the uncached backing
         // when the fence cannot confirm currency — so a peer's `@edgeHidden`/registry change whose
         // NOTIFY was dropped is seen within `T`. A store-unreachable read FAILS CLOSED (deny).
+        // `read_kv` is captured ONCE and reused for the version read and the recompose, so both see
+        // the same store even if the fence flips mid-call.
         let (read_kv, via_read_through) = self.registry_read_store(kv);
-        let version = if via_read_through {
-            match crate::graphql_registry::composition_version_checked(read_kv, project).await {
-                Ok(v) => {
-                    // A successful read-through re-confirms this keyspace's fence for the bound `T`.
-                    if let Some(rf) = self.registry_fence.get() {
-                        rf.fence.confirm();
-                    }
-                    v
-                }
-                Err(e) => {
-                    return Err(CompositionError::RegistryUnreachable {
-                        message: e.to_string(),
-                    });
-                }
-            }
-        } else {
-            crate::graphql_registry::composition_version(read_kv, project).await
-        };
+        let version = self
+            .read_version(read_kv, project, via_read_through)
+            .await?;
         // Fast path: a cached entry still at the current version. Bind the clone in its own
         // statement so the lock is released before we return / recompose.
         let hit = self
@@ -234,15 +280,64 @@ impl GraphqlCache {
         Ok(cached)
     }
 
-    /// The plan for `query` against `graph`, memoized by `(project, version, op_hash, visibility)`.
-    /// The planner is a pure function of (operation, supergraph, edge_hidden), so `version` pins the
-    /// supergraph dimension, `op_hash` the operation, and `visibility` the edge-visibility dimension
-    /// (#495) — the external edge's (possibly hidden) plan never collides with the internal path's.
-    /// A plan error is returned **uncached**.
+    /// The composed supergraph + SQL routing for `project` restricted to the canonical `subset` of
+    /// subgraph names (per-site `graphql.subgraphs`), composing + caching per `(project, set_hash)` on
+    /// a version miss. `subset` is the caller's CANONICAL (sorted, deduped) include set and `set_hash`
+    /// its [`subgraph_set_hash`]; two sites with the same set share one entry. Used only when a site
+    /// declares `subgraphs` — the absent case stays on [`supergraph`](Self::supergraph) (byte-identical
+    /// to before). A composition error is returned **uncached**.
+    pub(crate) async fn supergraph_subset(
+        &self,
+        kv: &dyn KvStore,
+        project: &str,
+        subset: &[String],
+        set_hash: &str,
+    ) -> Result<CachedGraph, CompositionError> {
+        // `read_kv` captured once (same store for version read + recompose), mirroring `supergraph`.
+        let (read_kv, via_read_through) = self.registry_read_store(kv);
+        let version = self
+            .read_version(read_kv, project, via_read_through)
+            .await?;
+        let key = (project.to_string(), set_hash.to_string());
+        let hit = self
+            .subset_supergraphs
+            .lock()
+            .unwrap()
+            .get(&key)
+            .filter(|c| c.version == version)
+            .cloned();
+        if let Some(hit) = hit {
+            return Ok(hit);
+        }
+        let supergraph =
+            Arc::new(crate::graphql_registry::supergraph_subset(read_kv, project, subset).await?);
+        let sql_subgraphs =
+            Arc::new(crate::graphql_registry::sql_subgraphs_subset(read_kv, project, subset).await);
+        let cached = CachedGraph {
+            version,
+            supergraph,
+            sql_subgraphs,
+        };
+        self.subset_supergraphs
+            .lock()
+            .unwrap()
+            .put(key, cached.clone());
+        Ok(cached)
+    }
+
+    /// The plan for `query` against `graph`, memoized by `(project, version, graph_id, op_hash,
+    /// visibility)`. The planner is a pure function of (operation, supergraph, edge_hidden), so
+    /// `version` pins the project's composition version, `graph_id` the per-site subgraph-subset
+    /// supergraph (`""` = full project), `op_hash` the operation, and `visibility` the edge-visibility
+    /// dimension (#495) — so neither two sites with different subsets, nor the external edge vs the
+    /// internal path, ever collide. A plan error is returned **uncached**.
     pub(crate) fn plan(
         &self,
         project: &str,
         version: u64,
+        // The composed-supergraph identity: `""` (full project) or a per-site subset's
+        // [`subgraph_set_hash`]. Pins the plan to the exact supergraph it was planned against.
+        graph_id: &str,
         op_hash: &str,
         query: &str,
         graph: &Supergraph,
@@ -251,6 +346,7 @@ impl GraphqlCache {
         let key = (
             project.to_string(),
             version,
+            graph_id.to_string(),
             op_hash.to_string(),
             visibility.cache_discriminant(),
         );
@@ -364,6 +460,7 @@ mod tests {
             .plan(
                 "acme",
                 graph.version,
+                "",
                 "op-a",
                 "{ me { id } }",
                 &graph.supergraph,
@@ -375,6 +472,7 @@ mod tests {
             .plan(
                 "acme",
                 graph.version,
+                "",
                 "op-a",
                 "{ me { id } }",
                 &graph.supergraph,
@@ -388,6 +486,7 @@ mod tests {
             .plan(
                 "other",
                 graph.version,
+                "",
                 "op-a",
                 "{ me { id } }",
                 &graph.supergraph,
@@ -419,6 +518,7 @@ mod tests {
             .plan(
                 "acme",
                 graph.version,
+                "",
                 "op-a",
                 "{ me { id } }",
                 &graph.supergraph,
@@ -430,6 +530,7 @@ mod tests {
             .plan(
                 "acme",
                 graph.version,
+                "",
                 "op-a",
                 "{ me { id } }",
                 &graph.supergraph,
@@ -447,6 +548,7 @@ mod tests {
             .plan(
                 "acme",
                 graph.version,
+                "",
                 "op-a",
                 "{ me { id } }",
                 &graph.supergraph,
@@ -464,6 +566,7 @@ mod tests {
             .plan(
                 "acme",
                 graph.version,
+                "",
                 "op-a",
                 "{ me { id } }",
                 &graph.supergraph,
@@ -473,6 +576,110 @@ mod tests {
         assert!(
             Arc::ptr_eq(&external_empty, &external_empty_again),
             "the same resolved hidden set is a warm cache hit"
+        );
+    }
+
+    #[test]
+    fn subgraph_set_hash_is_order_independent_and_dedups() {
+        let ab = subgraph_set_hash(&["a".into(), "b".into()]);
+        assert_eq!(
+            ab,
+            subgraph_set_hash(&["b".into(), "a".into()]),
+            "order-independent"
+        );
+        assert_eq!(
+            ab,
+            subgraph_set_hash(&["b".into(), "a".into(), "a".into()]),
+            "duplicate-independent"
+        );
+        assert_ne!(
+            ab,
+            subgraph_set_hash(&["a".into()]),
+            "a proper subset hashes distinctly"
+        );
+    }
+
+    #[tokio::test]
+    async fn per_site_subset_composes_only_its_set_and_caches_per_set() {
+        // A second, standalone subgraph so a subset can genuinely omit a root.
+        const CATALOG: &str = "type Query { products: [String] }";
+        let kv = MemoryKv::new();
+        crate::graphql_registry::publish(&kv, "acme", "accounts", ACCOUNTS)
+            .await
+            .unwrap();
+        crate::graphql_registry::publish(&kv, "acme", "catalog", CATALOG)
+            .await
+            .unwrap();
+        let cache = GraphqlCache::default();
+        let empty: BTreeSet<(String, String)> = BTreeSet::new();
+
+        // Subset {accounts}: its supergraph has `me` (accounts' root) but NOT `products` (catalog's).
+        let only_accounts = vec!["accounts".to_string()];
+        let h1 = subgraph_set_hash(&only_accounts);
+        let g1 = cache
+            .supergraph_subset(&kv, "acme", &only_accounts, &h1)
+            .await
+            .unwrap();
+        assert!(
+            cache
+                .plan(
+                    "acme",
+                    g1.version,
+                    &h1,
+                    "a",
+                    "{ me { id } }",
+                    &g1.supergraph,
+                    Visibility::External(&empty)
+                )
+                .is_ok(),
+            "accounts' root `me` plans in the {{accounts}} subset"
+        );
+        assert!(
+            cache
+                .plan(
+                    "acme",
+                    g1.version,
+                    &h1,
+                    "b",
+                    "{ products }",
+                    &g1.supergraph,
+                    Visibility::External(&empty)
+                )
+                .is_err(),
+            "catalog's root `products` is ABSENT from the {{accounts}} subset (genuinely unplannable)"
+        );
+
+        // Same set again ⇒ the very same composed supergraph Arc (per-set cache de-dupe).
+        let g1b = cache
+            .supergraph_subset(&kv, "acme", &only_accounts, &h1)
+            .await
+            .unwrap();
+        assert!(
+            Arc::ptr_eq(&g1.supergraph, &g1b.supergraph),
+            "equal subgraph sets share one composed supergraph"
+        );
+
+        // The fuller set {accounts, catalog} (order-independent) composes distinctly + includes both.
+        let both = vec!["catalog".to_string(), "accounts".to_string()];
+        let h2 = subgraph_set_hash(&both);
+        assert_ne!(h1, h2, "distinct sets ⇒ distinct set-hashes");
+        let g2 = cache
+            .supergraph_subset(&kv, "acme", &both, &h2)
+            .await
+            .unwrap();
+        assert!(
+            cache
+                .plan(
+                    "acme",
+                    g2.version,
+                    &h2,
+                    "b",
+                    "{ products }",
+                    &g2.supergraph,
+                    Visibility::External(&empty)
+                )
+                .is_ok(),
+            "catalog's root plans in the fuller {{accounts, catalog}} subset"
         );
     }
 

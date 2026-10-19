@@ -805,6 +805,9 @@ impl boatramp_handlers::SupergraphRunner for FederationRunner {
             .plan(
                 project,
                 cached.version,
+                // Internal paths compose the FULL project supergraph, independent of any site's
+                // per-site subgraph selection — so `graph_id` is the empty (full-project) identity.
+                "",
                 &hash,
                 &query,
                 &cached.supergraph,
