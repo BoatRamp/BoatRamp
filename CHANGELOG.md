@@ -5,6 +5,58 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.39.0] - 2026-10-19
+
+Per-site GraphQL subgraph composition. A `federated` gateway site can declare an explicit subgraph
+**include list** and then composes a genuinely distinct supergraph from exactly that subset —
+planning, execution, **and introspection** reflect only those subgraphs. An excluded subgraph is
+*absent* from that host's schema (invisible to introspection, unplannable, uncallable), not merely
+unreachable, with no dependence on the introspection switch. This turns "one project = one GraphQL
+API" into purpose-built per-host surfaces (admin vs. tenant, public vs. internal, full vs. partner
+slice) from one project and one subgraph library. Off by default: a site with no `subgraphs` composes
+one supergraph for every host, exactly as before.
+
+### Added
+
+- **Per-site subgraph composition** (`[handlers.graphql] subgraphs: Option<Vec<String>>`): an include
+  list of registered subgraph names a `federated` site composes. Absent ⇒ all registered subgraphs
+  (backward-compatible, byte-identical). Each distinct resolved set composes and caches its own
+  supergraph, keyed by a stable hash of the canonical (sorted, deduped) name set — two sites with the
+  same set share one composed supergraph, and recomposition still happens only on a registry-version
+  change.
+- **Federation introspection** on the gateway edge: a `__schema` / `__type` query against a
+  `federated` site is now answered from that site's composed (subset) type system, so introspection
+  honestly reflects only the site's subgraphs. Federation machinery (`@key` / `@external` /
+  `@shareable` / `@tenant` / `@edgeHidden` / `@link` directives, the `_Service` / `_Entity` / `_Any` /
+  `_FieldSet` types, the `_service` / `_entities` roots) is stripped, and edge-hidden roots are omitted
+  too — so introspection never reveals a root that plans as unknown. Internal paths (`graphql::run`,
+  `emit::invoke`) continue to compose the full project supergraph, independent of any site's subset.
+- A **"Per-host GraphQL surfaces"** how-to section with the admin-vs-tenant example and a
+  composition-selection-vs-edge-reachability (`subgraphs` vs `edge_hidden_*`) comparison.
+
+### Changed
+
+- **A `federated` site with `introspection = true` now serves a real composed `__schema`.** Before
+  this release the federated edge could not answer introspection at all (`__schema` planned as an
+  unknown root); it now returns the site's (subset) schema. Introspection still defaults to **off** and
+  the query guard enforces the policy, so only a site that has explicitly enabled introspection is
+  affected — but such a site will now disclose its composed schema. Audit the `introspection` flag on
+  existing federated sites if that is not intended.
+
+### Security
+
+- **Fail-closed at apply.** A site's `subgraphs` set is validated at both site-config write paths (the
+  HTTP config PUT and the guest `admin` path) before it is stored: an empty list, an unregistered
+  include, a non-`federated` gateway, or a set that is not a valid Federation subset (an included
+  subgraph references an entity whose base-owning subgraph is excluded) is rejected with a precise
+  error. A serve-time backstop re-validates, so a subtly-invalid live subset fails closed rather than
+  serving a broken schema. A safelisted operation declared for a subset site is rejected at apply if it
+  selects a root the subset does not contain.
+- The introspection disclosure boundary holds by construction — the synthesizer is built only from the
+  subset's SDLs and has no handle to the full project or any excluded subgraph — confirmed by a
+  security review with no critical/high findings; its low-severity findings (single-underscore
+  user-type stripping, dangling-name hardening, subscription over-rejection) are fixed.
+
 ## [0.38.0] - 2026-10-19
 
 Symmetric two-tier gateway. The reverse-proxy gateway, previously operator-only (`SiteConfig.gateway`),
