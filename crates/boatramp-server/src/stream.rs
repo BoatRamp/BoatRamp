@@ -417,10 +417,10 @@ async fn sql_membership(
     Ok(!rows.rows.is_empty())
 }
 
-/// Rewrite `$name` placeholders in a membership query to canonical positional `$1..$N` (the backend
-/// re-renders them per dialect) and collect the bound values in order. A `$name` binds the route
-/// param `name`, else the verified claim `name`, else `NULL` (so the predicate denies — fail-safe).
-/// A repeated `$name` reuses its one positional bind.
+/// Rewrite `$name` placeholders in a membership query to canonical positional `?1..?N` (the portable
+/// style the SQL backend re-renders per dialect) and collect the bound values in order. A `$name`
+/// binds the route param `name`, else the verified claim `name`, else `NULL` (so the predicate
+/// denies — fail-safe). A repeated `$name` reuses its one positional bind.
 #[cfg(feature = "handlers")]
 fn bind_named_params(
     query: &str,
@@ -468,7 +468,7 @@ fn bind_named_params(
                 seen.insert(name.to_string(), idx);
                 idx
             };
-            out.push('$');
+            out.push('?');
             out.push_str(&idx.to_string());
             i = j;
         } else {
@@ -788,10 +788,10 @@ mod tests {
             &params,
             &claims,
         );
-        // `$mailbox`→$1 (reused for `owner`), `$sub`→$2, `$absent`→$3: positional, first-seen order.
+        // `$mailbox`→?1 (reused for `owner`), `$sub`→?2, `$absent`→?3: positional, first-seen order.
         assert_eq!(
             sql,
-            "SELECT 1 FROM m WHERE mailbox=$1 AND subject=$2 AND owner=$1 AND x=$3"
+            "SELECT 1 FROM m WHERE mailbox=?1 AND subject=?2 AND owner=?1 AND x=?3"
         );
         assert_eq!(
             binds,

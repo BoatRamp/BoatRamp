@@ -6505,6 +6505,147 @@ mod tests {
         );
     }
 
+    /// #11 — the SQL-membership end-to-end on a REAL libsql engine (the sibling of the claim gate):
+    /// a seeded `mailbox_members(mailbox, subject)` table, 2 subscribers × 2 mailboxes. The
+    /// parameterized predicate (`WHERE mailbox=$mailbox AND subject=$sub`, bound from the route param
+    /// + the verified `sub` claim) authorizes a member and denies a non-member (403) — proving the
+    /// `$name`→positional bind + the managed-DB query path end-to-end. `#[ignore]`d (static-musl
+    /// libsql segfault); the CI job runs it on the host toolchain + greps `STREAM SQL-MEMBERSHIP OK`.
+    #[cfg(feature = "oidc")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "run on the host toolchain (real libsql static-musl segfault); wired in the CI stream-sql-membership gate"]
+    async fn scoped_stream_sql_membership_isolates_mailboxes() {
+        use base64::Engine;
+        use boatramp_core::config::{
+            HandlerGraphqlTokenClaims, StreamAuthz, StreamConfig, StreamMembership,
+        };
+        use boatramp_core::sql::{SqlBackends, SqlValue};
+        use boatramp_handlers::{HandlerEngine, Limits};
+
+        let b64 = |b: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b);
+        let key = ed25519_dalek::SigningKey::from_bytes(&[13u8; 32]);
+        let jwks = serde_json::json!({ "keys": [ {
+            "kty": "OKP", "crv": "Ed25519", "kid": "app-1",
+            "x": b64(key.verifying_key().as_bytes()),
+        } ] })
+        .to_string();
+        let token = |sub: &str| -> String {
+            use ed25519_dalek::Signer;
+            let header = b64(
+                serde_json::json!({ "alg": "EdDSA", "typ": "JWT", "kid": "app-1" })
+                    .to_string()
+                    .as_bytes(),
+            );
+            let payload = b64(serde_json::json!({
+                "iss": "https://idp.example", "exp": 4_102_444_800u64, "sub": sub,
+            })
+            .to_string()
+            .as_bytes());
+            let input = format!("{header}.{payload}");
+            let sig = key.sign(input.as_bytes());
+            format!("{input}.{}", b64(&sig.to_bytes()))
+        };
+
+        let storage = Arc::new(MemStorage::default());
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let sql_dir = std::env::temp_dir().join(format!("br-stream-member-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&sql_dir);
+        let backends = boatramp_storage::LibsqlSqlBackends::local(&sql_dir);
+        // Seed the membership table into the SAME database the stream's sql-membership queries:
+        // `database(project="default", site="console", name="")`.
+        let db = backends.database("default", "console", "").await.unwrap();
+        {
+            let mut tx = db.begin().await.unwrap();
+            tx.execute(
+                "CREATE TABLE mailbox_members (mailbox TEXT, subject TEXT)",
+                &[],
+            )
+            .await
+            .unwrap();
+            for (mbx, sub) in [("mbxA", "userA"), ("mbxB", "userB")] {
+                tx.execute(
+                    "INSERT INTO mailbox_members (mailbox, subject) VALUES (?1, ?2)",
+                    &[SqlValue::Text(mbx.into()), SqlValue::Text(sub.into())],
+                )
+                .await
+                .unwrap();
+            }
+            tx.commit().await.unwrap();
+        }
+        let sql: Arc<dyn SqlBackends> = Arc::new(backends);
+
+        let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
+        let rt = HandlerRuntime::new(engine, kv, storage, Some(sql), None);
+        rt.set_env_source(Arc::new(
+            boatramp_core::env::MapEnv::new().with("IDP_JWKS", jwks),
+        ));
+        let inner = rt.inner.as_ref().unwrap();
+
+        let stream = StreamConfig {
+            route: "/events/shared/:mailbox".into(),
+            topics: vec!["shared/{mailbox}/events".into()],
+            websocket: false,
+            publish_topic: None,
+            authz: Some(StreamAuthz::Scoped {
+                token_claims: HandlerGraphqlTokenClaims {
+                    issuer: "https://idp.example".into(),
+                    jwks_env: Some("IDP_JWKS".into()),
+                    ..Default::default()
+                },
+                membership: vec![StreamMembership::Sql {
+                    source: String::new(),
+                    query:
+                        "SELECT 1 FROM mailbox_members WHERE mailbox = $mailbox AND subject = $sub"
+                            .into(),
+                }],
+            }),
+        };
+        let authorize = |path: &'static str, bearer: Option<String>| {
+            let stream = stream.clone();
+            async move {
+                crate::stream::authorize_stream_topics(
+                    inner,
+                    "default",
+                    "console",
+                    &stream,
+                    path,
+                    bearer.as_deref(),
+                )
+                .await
+            }
+        };
+
+        assert_eq!(
+            authorize("/events/shared/mbxA", Some(token("userA")))
+                .await
+                .expect("A is a member of mbxA"),
+            vec!["shared/mbxA/events".to_string()]
+        );
+        assert_eq!(
+            authorize("/events/shared/mbxB", Some(token("userB")))
+                .await
+                .expect("B is a member of mbxB"),
+            vec!["shared/mbxB/events".to_string()]
+        );
+        // Cross-mailbox: A is not a member of mbxB ⇒ no row ⇒ 403 (never A reaching B's topic).
+        assert_eq!(
+            authorize("/events/shared/mbxB", Some(token("userA")))
+                .await
+                .unwrap_err()
+                .status(),
+            axum::http::StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            authorize("/events/shared/mbxA", Some(token("userB")))
+                .await
+                .unwrap_err()
+                .status(),
+            axum::http::StatusCode::FORBIDDEN
+        );
+        let _ = std::fs::remove_dir_all(&sql_dir);
+        println!("STREAM SQL-MEMBERSHIP OK");
+    }
+
     /// libsql-backed subgraph function (`graphql-scope-probe`, whose `items` field is host-scoped via
     /// the `{scope}` marker): running as tenant B returns ONLY B's rows; running with no principal
     /// fails closed (the pre-v0.4.6 behavior — never a leak). `#[ignore]`d (static-musl libsql

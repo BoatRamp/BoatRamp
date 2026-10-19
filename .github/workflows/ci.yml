@@ -2063,6 +2063,21 @@ jobs:
             || { echo "::error::gateway own-propagation gate did not pass (silent skip or failure?)" >&2; exit 1; }
           grep -q 'GATEWAY OWN-PROPAGATION OK' gwown.log \
             || { echo "::error::gateway own-principal propagation never reached its marker (a dropped principal, a cross-tenant leak, or an anon widening)" >&2; exit 1; }
+      - name: Live scoped-stream SQL-membership on a real libsql engine (#11)
+        run: |
+          set -eo pipefail
+          # #11: a per-subscriber scoped stream's SQL membership predicate (parameterized `$name`→`?N`,
+          # bound from the route param + the verified `sub` claim) authorizes a member and denies a
+          # non-member (403) end-to-end on a real libsql engine — the 2 subscribers × 2 mailboxes
+          # isolation matrix. A placeholder-bind regression (the `$N` vs `?N` bug) or a cross-mailbox
+          # leak fails the assertion.
+          cargo test -p boatramp-server --features handlers,oidc --lib \
+            scoped_stream_sql_membership_isolates_mailboxes \
+            -- --ignored --nocapture 2>&1 | tee streammember.log
+          grep -qE 'test result: ok\. 1 passed' streammember.log \
+            || { echo "::error::scoped-stream SQL-membership gate did not pass (silent skip or failure?)" >&2; exit 1; }
+          grep -q 'STREAM SQL-MEMBERSHIP OK' streammember.log \
+            || { echo "::error::scoped-stream SQL-membership never reached its marker (a placeholder-bind regression, a cross-mailbox leak, or a skipped test)" >&2; exit 1; }
       - name: Live present-token verify/seal/resolve chain + batch isolation (v0.4.7 Gap 3)
         run: |
           set -eo pipefail
