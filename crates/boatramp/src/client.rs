@@ -1567,20 +1567,23 @@ impl ControlPlane {
     /// is rejected server-side; registration is idempotent (an already-registered op
     /// re-registers to the same hash). **Register-only** — this never deletes/prunes.
     /// Project-scoped via `project_seg` (`graphql` for the default project, else
-    /// `projects/<proj>/graphql`).
-    pub async fn register_graphql_safelist(&self, query: &str) -> Result<()> {
+    /// `projects/<proj>/graphql`). `site`, when present (the declarative `apply` path), is sent as
+    /// `?site=<name>` so the server validates the op against that site's per-site subgraph subset
+    /// (fail-closed on a root absent from the subset). `None` ⇒ project-level, no subset check.
+    pub async fn register_graphql_safelist(&self, query: &str, site: Option<&str>) -> Result<()> {
         let seg = project_seg(&self.project, "graphql");
         let Self {
             http: client,
             base: server,
             ..
         } = self;
-        client
+        let mut req = client
             .post(format!("{server}/api/{seg}/safelist"))
-            .json(&serde_json::json!({ "query": query }))
-            .send()
-            .await?
-            .error_for_status()?;
+            .json(&serde_json::json!({ "query": query }));
+        if let Some(site) = site {
+            req = req.query(&[("site", site)]);
+        }
+        req.send().await?.error_for_status()?;
         Ok(())
     }
 

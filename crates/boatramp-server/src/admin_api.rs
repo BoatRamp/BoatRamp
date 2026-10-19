@@ -409,6 +409,39 @@ pub(super) async fn put_site_config(
         }
         Err(err) => return deploy_error_response(err),
     }
+    // Per-site subgraph composition (S2b): a site's `graphql.subgraphs` include list is validated
+    // fail-closed HERE, at the config-write chokepoint, against the live registry — an empty set, an
+    // unregistered include, or an invalid Federation subset is a `400` and the config is NOT stored.
+    // Absent ⇒ full-project (nothing to validate, byte-identical to before).
+    #[cfg(feature = "handlers")]
+    if let Some(gql) = config.handlers.as_ref().and_then(|h| h.graphql.as_ref()) {
+        if let Some(subset) = gql.subgraphs.as_ref() {
+            if !gql.federated {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "site \"{site}\": graphql.subgraphs is set but the graphql edge is not \
+                         `federated` — per-site subset composition applies only to a federated \
+                         supergraph gateway (set `federated = true`, or remove `subgraphs`)\n"
+                    ),
+                )
+                    .into_response();
+            }
+            if let Err(reason) = crate::graphql_registry::validate_site_subset(
+                deploy.kv().as_ref(),
+                &project.0,
+                subset,
+            )
+            .await
+            {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("site \"{site}\": {reason}\n"),
+                )
+                    .into_response();
+            }
+        }
+    }
     // Cooperative (apply-merge-contexts): a whole-config PUT preserves imperatively-written
     // `domains.contexts`/`aliases` the incoming config doesn't mention — so a declarative `apply`
     // (which calls this) can't wipe a tenant's runtime host routing. Removal stays via `domain rm`.
@@ -761,6 +794,101 @@ pub(super) struct SafelistEntry {
     query: String,
 }
 
+/// Query params for safelist registration. `site` (optional) names the site this operation is being
+/// safelisted *for* — when that site composes a per-site subgraph subset (`graphql.subgraphs`), the
+/// operation is validated fail-closed against THAT site's composed schema (S2b): an op selecting a
+/// root the subset doesn't contain is rejected. Absent ⇒ project-level registration with no per-site
+/// subset check (the direct `graphql safelist add` path).
+#[cfg(feature = "handlers")]
+#[derive(serde::Deserialize, Default)]
+pub(super) struct SafelistParams {
+    #[serde(default)]
+    site: Option<String>,
+}
+
+/// Fail-closed (S2b): if `site` composes a per-site subgraph subset, reject a safelisted operation
+/// that selects a root `Query`/`Mutation` field absent from that site's composed subset — the op
+/// could never run on this site's schema, so declaring it there is almost certainly a mistake
+/// (same spirit as the include-validation). Best-effort on a config/registry read blip (never blocks
+/// registration on an unrelated transient); the site-config PUT is the authoritative subset gate.
+/// A full-project site (no `subgraphs`) imposes no restriction. Introspection meta + `__typename`
+/// (`__`-prefixed) roots are never subset-scoped.
+#[cfg(feature = "handlers")]
+async fn check_op_in_site_subset(
+    deploy: &DeployStore,
+    project: &ProjectContext,
+    site: &str,
+    query: &str,
+) -> Result<(), Response> {
+    let cfg = match deploy.get_site_config(project.as_ref(), site).await {
+        Ok(Some(cfg)) => cfg,
+        // No such site yet, or a transient read error: the config PUT validates the subset itself —
+        // don't block a register-only call on it.
+        Ok(None) | Err(_) => return Ok(()),
+    };
+    let Some(subset) = cfg
+        .handlers
+        .as_ref()
+        .and_then(|h| h.graphql.as_ref())
+        .filter(|g| g.federated)
+        .and_then(|g| g.subgraphs.clone())
+    else {
+        return Ok(());
+    };
+    let sg =
+        match crate::graphql_registry::supergraph_subset(deploy.kv().as_ref(), &project.0, &subset)
+            .await
+        {
+            Ok(sg) => sg,
+            // The subset doesn't compose — that's the site-config PUT's error to report, not this one.
+            Err(_) => return Ok(()),
+        };
+    let Ok(doc) = async_graphql_parser::parse_query(query) else {
+        // Unparsable — `guard_query` already rejected it upstream; nothing to subset-check.
+        return Ok(());
+    };
+    let fragments = crate::graphql_root_fields::document_fragments(&doc);
+    let ops: Vec<&async_graphql_parser::types::OperationDefinition> = match &doc.operations {
+        async_graphql_parser::types::DocumentOperations::Single(op) => vec![&op.node],
+        async_graphql_parser::types::DocumentOperations::Multiple(m) => {
+            m.values().map(|o| &o.node).collect()
+        }
+    };
+    let mut missing: Vec<String> = Vec::new();
+    for op in ops {
+        for (root_ty, field) in crate::graphql_root_fields::expanded_root_fields(op, &fragments) {
+            if field.starts_with("__") {
+                continue; // introspection meta / __typename — never subset-scoped
+            }
+            let present = match root_ty {
+                crate::graphql_root_fields::RootType::Query => sg.root_query.contains_key(&field),
+                crate::graphql_root_fields::RootType::Mutation => {
+                    sg.root_mutation.contains_key(&field)
+                }
+                crate::graphql_root_fields::RootType::Subscription => false,
+            };
+            if !present {
+                missing.push(format!("{}.{}", root_ty.type_name(), field));
+            }
+        }
+    }
+    if missing.is_empty() {
+        return Ok(());
+    }
+    missing.sort_unstable();
+    missing.dedup();
+    Err((
+        StatusCode::BAD_REQUEST,
+        format!(
+            "site \"{site}\": safelisted operation selects root field(s) absent from this site's \
+             graphql.subgraphs subset: {} — the operation cannot run on this site's composed schema \
+             (adjust the subset or the operation)\n",
+            missing.join(", ")
+        ),
+    )
+        .into_response())
+}
+
 /// `POST /api/projects/{proj}/graphql/safelist` — register a **trusted operation** in the
 /// project's GraphQL **safelist** (the guest/agent operation allowlist) and return its hash.
 /// Guest runs (`graphql::run` / `run-persisted`) are deny-by-default: only safelisted operations
@@ -771,6 +899,7 @@ pub(super) struct SafelistEntry {
 pub(super) async fn register_graphql_safelist(
     State(deploy): State<DeployStore>,
     Extension(project): axum::extract::Extension<ProjectContext>,
+    Query(params): Query<SafelistParams>,
     Json(entry): Json<SafelistEntry>,
 ) -> Response {
     let query = entry.query.trim();
@@ -783,6 +912,13 @@ pub(super) async fn register_graphql_safelist(
         crate::graphql_guard::guard_query(query, &limits)
     {
         return (StatusCode::BAD_REQUEST, format!("{reason}\n")).into_response();
+    }
+    // S2b: when registered FOR a site that composes a per-site subset, fail closed on an op whose
+    // roots the subset doesn't contain.
+    if let Some(site) = params.site.as_deref() {
+        if let Err(resp) = check_op_in_site_subset(&deploy, &project, site, query).await {
+            return resp;
+        }
     }
     match crate::graphql_apq::register(deploy.kv().as_ref(), &project.0, query).await {
         Ok(hash) => (

@@ -386,6 +386,60 @@ pub(crate) async fn supergraph_subset(
     Ok(sg)
 }
 
+/// **Per-site subgraph composition — the apply-time fail-closed validator (S2b).** Validates a
+/// site's `graphql.subgraphs` include list against the live registry, returning a precise operator
+/// error (surfaced as a `400` at the config-write seam) or `Ok(())`. Fail-closed on every shape the
+/// request names: an empty include list, an unregistered include, and an invalid federation subset.
+///
+/// - **Empty** (`subgraphs = []`): a federated site that composes NO subgraph exposes no graph —
+///   almost always an authoring slip (an empty list rather than an omitted field). Rejected; omit
+///   the field to compose all registered subgraphs.
+/// - **Unknown include**: every named subgraph must currently be registered. All unknowns are
+///   listed — a typo would silently shrink the site's API, so it fails loudly rather than composing
+///   a smaller graph than the operator wrote.
+/// - **Invalid subset**: the resolved set is composed and run through [`validate_subset`]; a set that
+///   drops an entity's base-owning subgraph composes "successfully" but is not a valid Federation
+///   subset ([`CompositionError::IncompleteSubset`]) — rejected (a subtly-invalid composed subset is
+///   worse than the feature's absence). Any other composition error surfaces verbatim.
+///
+/// This is the authoritative fail-fast; the serve path keeps a defense-in-depth [`validate_subset`]
+/// backstop in [`supergraph_subset`]. Callers gate on `federated` + `subgraphs.is_some()` first.
+pub(crate) async fn validate_site_subset(
+    kv: &dyn KvStore,
+    project: &str,
+    subset: &[String],
+) -> Result<(), String> {
+    if subset.is_empty() {
+        return Err(
+            "graphql.subgraphs is an empty include list — a federated site must compose at least \
+             one subgraph (omit the field entirely to compose all registered subgraphs)"
+                .to_string(),
+        );
+    }
+    let registered: std::collections::BTreeSet<String> =
+        subgraph_names(kv, project).await.into_iter().collect();
+    let mut unknown: Vec<&str> = subset
+        .iter()
+        .map(String::as_str)
+        .filter(|n| !registered.contains(*n))
+        .collect();
+    if !unknown.is_empty() {
+        unknown.sort_unstable();
+        unknown.dedup();
+        return Err(format!(
+            "graphql.subgraphs names unregistered subgraph(s): {} — a typo would silently shrink \
+             this site's GraphQL API (register the subgraph first, or correct the name)",
+            unknown.join(", ")
+        ));
+    }
+    // Every name resolves; `supergraph_subset` composes exactly this set and runs `validate_subset`,
+    // so an incomplete subset (dangling `@key`) surfaces as `IncompleteSubset` here at apply.
+    supergraph_subset(kv, project, subset)
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
 /// Whether `name` is a currently-registered subgraph of `project` (an SDL is stored). Used to
 /// decide, on a function redeploy, whether to auto-refresh its registered SDL — first
 /// registration stays an explicit operator action.
@@ -663,5 +717,56 @@ extend schema @link(
         // stale and MUST be cleared (else the next same-hash function deploy would falsely skip).
         publish(&kv, "acme", "accounts", ACCOUNTS).await.unwrap();
         assert!(subgraph_hash(&kv, "acme", "accounts").await.is_none());
+    }
+
+    // S2b — the apply-time fail-closed validator for a site's `graphql.subgraphs` include list.
+    #[tokio::test]
+    async fn validate_site_subset_fails_closed_on_empty_unknown_and_incomplete() {
+        let kv = MemoryKv::new();
+        publish(&kv, "acme", "accounts", ACCOUNTS).await.unwrap();
+        publish(&kv, "acme", "reviews", REVIEWS).await.unwrap();
+
+        // Empty include list ⇒ rejected (a federated site composing no subgraph is a slip).
+        let err = validate_site_subset(&kv, "acme", &[]).await.unwrap_err();
+        assert!(err.contains("empty include list"), "empty: {err}");
+
+        // Unknown include ⇒ rejected, naming every unknown (sorted, deduped).
+        let err = validate_site_subset(
+            &kv,
+            "acme",
+            &["accounts".into(), "typo".into(), "nope".into()],
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.contains("unregistered subgraph(s): nope, typo"),
+            "unknown: {err}"
+        );
+
+        // Incomplete subset: `reviews` references entity `User` (its `@key(fields: "id")`) owned by
+        // the excluded `accounts` ⇒ not a valid Federation subset ⇒ rejected (IncompleteSubset).
+        let err = validate_site_subset(&kv, "acme", &["reviews".into()])
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("not a valid federation subset") && err.contains("User"),
+            "incomplete: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_site_subset_accepts_a_complete_set_and_a_self_contained_one() {
+        let kv = MemoryKv::new();
+        publish(&kv, "acme", "accounts", ACCOUNTS).await.unwrap();
+        publish(&kv, "acme", "reviews", REVIEWS).await.unwrap();
+
+        // The full set composes and is complete.
+        validate_site_subset(&kv, "acme", &["accounts".into(), "reviews".into()])
+            .await
+            .expect("complete set");
+        // `accounts` alone is self-contained (owns `User` + `me`, references nothing excluded).
+        validate_site_subset(&kv, "acme", &["accounts".into()])
+            .await
+            .expect("self-contained set");
     }
 }

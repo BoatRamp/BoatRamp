@@ -221,8 +221,9 @@ trait ControlPlane {
         schema: &boatramp_core::tenancy::TenancySchema,
     ) -> CpResult<()>;
     /// Register one trusted operation in the project's GraphQL safelist
-    /// (register-only; the server validates + stores it, idempotently).
-    async fn register_graphql_safelist(&self, query: &str) -> CpResult<()>;
+    /// (register-only; the server validates + stores it, idempotently). `site` is the site the op
+    /// is declared for, so the server can validate it against that site's per-site subgraph subset.
+    async fn register_graphql_safelist(&self, query: &str, site: &str) -> CpResult<()>;
     /// Declare (persist + eagerly provision) one managed database from the manifest
     /// `databases:` block (`PUT /api/{seg}/databases/{name}`, `Project·Admin`). The
     /// server enforces daemon-config-wins, identity-change refusal, and caller's-project
@@ -330,8 +331,8 @@ impl ControlPlane for client::ControlPlane {
             .await
             .map_err(CpError::Client)
     }
-    async fn register_graphql_safelist(&self, query: &str) -> CpResult<()> {
-        self.register_graphql_safelist(query)
+    async fn register_graphql_safelist(&self, query: &str, site: &str) -> CpResult<()> {
+        self.register_graphql_safelist(query, Some(site))
             .await
             .map_err(CpError::Client)
     }
@@ -1315,7 +1316,7 @@ async fn apply_safelists<C: ControlPlane>(
     }
 
     for op in &ops {
-        cp.register_graphql_safelist(op).await?;
+        cp.register_graphql_safelist(op, &site.name).await?;
     }
     tracing::info!(
         site = %site.name,
@@ -1575,7 +1576,7 @@ mod tests {
             self.rec(format!("put_project_tenancy {}", schema.tables.len()));
             Ok(())
         }
-        async fn register_graphql_safelist(&self, query: &str) -> CpResult<()> {
+        async fn register_graphql_safelist(&self, query: &str, _site: &str) -> CpResult<()> {
             // Record the op text so a test can assert POST-per-op (and that no DELETE
             // is ever issued — the mock has no delete method at all).
             self.rec(format!("register_graphql_safelist {query}"));
