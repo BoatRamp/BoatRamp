@@ -122,6 +122,10 @@ pub(crate) struct CachedGraph {
     pub version: u64,
     pub supergraph: Arc<Supergraph>,
     pub sql_subgraphs: Arc<SqlSubgraphs>,
+    /// The composed PUBLIC type system for introspection synthesis (S3) — the SAME composed set as
+    /// `supergraph` (full project, or the per-site subset), so a site's `__schema`/`__type` reflects
+    /// exactly its subgraphs. Built + cached alongside the routing model.
+    pub schema_types: Arc<crate::graphql_introspect::SchemaTypes>,
 }
 
 /// Bounded number of projects' composed supergraphs held at once.
@@ -268,10 +272,12 @@ impl GraphqlCache {
         let supergraph = Arc::new(crate::graphql_registry::supergraph(read_kv, project).await?);
         let sql_subgraphs =
             Arc::new(crate::graphql_registry::sql_subgraphs(read_kv, project).await);
+        let schema_types = Arc::new(crate::graphql_registry::schema_types(read_kv, project).await);
         let cached = CachedGraph {
             version,
             supergraph,
             sql_subgraphs,
+            schema_types,
         };
         self.supergraphs
             .lock()
@@ -313,10 +319,13 @@ impl GraphqlCache {
             Arc::new(crate::graphql_registry::supergraph_subset(read_kv, project, subset).await?);
         let sql_subgraphs =
             Arc::new(crate::graphql_registry::sql_subgraphs_subset(read_kv, project, subset).await);
+        let schema_types =
+            Arc::new(crate::graphql_registry::schema_types_subset(read_kv, project, subset).await);
         let cached = CachedGraph {
             version,
             supergraph,
             sql_subgraphs,
+            schema_types,
         };
         self.subset_supergraphs
             .lock()

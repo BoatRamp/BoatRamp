@@ -1025,6 +1025,21 @@ async fn federation_gateway(
         edge_hidden_subgraphs,
     );
     log_hidden_root_decisions(query, &effective_hidden, &op_hash);
+    // S3 — federation-introspection synthesis: a PURE introspection query (`__schema`/`__type`) is
+    // answered from THIS site's composed type system, not planned (the federation planner has no
+    // `__schema` root). The synthesized schema reflects only the composed subgraphs — an excluded
+    // subgraph's types + roots are genuinely absent — and omits the effective edge-hidden roots (so
+    // introspection never becomes an oracle for a root that plans as unknown). Introspection POLICY
+    // (allow/deny) is already enforced by the query guard upstream (`guard_query`), so reaching here
+    // means introspection is permitted on this site; a query mixing introspection with data roots
+    // is NOT intercepted (it plans as before).
+    if let Ok(doc) = async_graphql_parser::parse_query(query)
+        && crate::graphql_introspect::is_pure_introspection(&doc)
+    {
+        let body =
+            crate::graphql_introspect::execute(&doc, &cached.schema_types, &effective_hidden);
+        return axum::Json(body).into_response();
+    }
     let t_plan = std::time::Instant::now();
     let plan = match inner.graphql_cache.plan(
         project,

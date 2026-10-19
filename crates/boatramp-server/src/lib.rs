@@ -161,6 +161,8 @@ mod graphql_graphiql;
 #[cfg(feature = "handlers")]
 mod graphql_guard;
 #[cfg(feature = "handlers")]
+mod graphql_introspect;
+#[cfg(feature = "handlers")]
 mod graphql_plan;
 #[cfg(feature = "handlers")]
 mod graphql_registry;

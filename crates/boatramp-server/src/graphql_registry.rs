@@ -179,6 +179,34 @@ pub(crate) async fn sql_subgraphs_subset(
         .collect()
 }
 
+/// The composed PUBLIC type system of `project`'s full registered set — the subset-aware
+/// introspection view (S3). Built from the same SDLs the routing composer reads; federation
+/// machinery is stripped. Cached beside the `Supergraph` in [`crate::graphql_cache`].
+pub(crate) async fn schema_types(
+    kv: &dyn KvStore,
+    project: &str,
+) -> crate::graphql_introspect::SchemaTypes {
+    crate::graphql_introspect::compose_schema_types(&load_subgraphs(kv, project).await)
+}
+
+/// The composed public type system of exactly the named subgraph `subset` (per-site composition) —
+/// so a site's introspection reflects ONLY its subset (an excluded subgraph's types + roots are
+/// genuinely absent). An unknown name composes without it (warned at compose; rejected fail-closed
+/// at apply by [`validate_site_subset`]).
+pub(crate) async fn schema_types_subset(
+    kv: &dyn KvStore,
+    project: &str,
+    subset: &[String],
+) -> crate::graphql_introspect::SchemaTypes {
+    let wanted: std::collections::BTreeSet<&str> = subset.iter().map(String::as_str).collect();
+    let chosen: Vec<(String, String)> = load_subgraphs(kv, project)
+        .await
+        .into_iter()
+        .filter(|(name, _)| wanted.contains(name.as_str()))
+        .collect();
+    crate::graphql_introspect::compose_schema_types(&chosen)
+}
+
 /// Why a subgraph publish failed.
 #[derive(Debug)]
 pub(crate) enum PublishError {
