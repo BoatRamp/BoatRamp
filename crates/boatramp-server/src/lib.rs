@@ -6471,13 +6471,15 @@ mod tests {
         assert_eq!(
             authorize("/events/shared/mbxA", Some(tok_a.clone()))
                 .await
-                .expect("A is a member of mbxA"),
+                .expect("A is a member of mbxA")
+                .0,
             vec!["shared/mbxA/events".to_string()]
         );
         assert_eq!(
             authorize("/events/shared/mbxB", Some(tok_b.clone()))
                 .await
-                .expect("B is a member of mbxB"),
+                .expect("B is a member of mbxB")
+                .0,
             vec!["shared/mbxB/events".to_string()]
         );
         // Cross-mailbox is refused (403) — A can't attach to B's mailbox, and vice-versa.
@@ -6618,13 +6620,15 @@ mod tests {
         assert_eq!(
             authorize("/events/shared/mbxA", Some(token("userA")))
                 .await
-                .expect("A is a member of mbxA"),
+                .expect("A is a member of mbxA")
+                .0,
             vec!["shared/mbxA/events".to_string()]
         );
         assert_eq!(
             authorize("/events/shared/mbxB", Some(token("userB")))
                 .await
-                .expect("B is a member of mbxB"),
+                .expect("B is a member of mbxB")
+                .0,
             vec!["shared/mbxB/events".to_string()]
         );
         // Cross-mailbox: A is not a member of mbxB ⇒ no row ⇒ 403 (never A reaching B's topic).

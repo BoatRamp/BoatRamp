@@ -1208,6 +1208,7 @@ async fn serve_resolved(
                             site_handlers,
                             stream,
                             request,
+                            request_path,
                             client_ip,
                             preview,
                         )

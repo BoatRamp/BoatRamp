@@ -131,10 +131,10 @@ pub(super) async fn authorize_stream_topics(
     stream: &boatramp_core::config::StreamConfig,
     request_path: &str,
     bearer: Option<&str>,
-) -> Result<Vec<String>, Response> {
+) -> Result<(Vec<String>, std::collections::BTreeMap<String, String>), Response> {
     use boatramp_core::config::{StreamAuthz, StreamMembership};
     let Some(authz) = &stream.authz else {
-        return Ok(stream.topics.clone());
+        return Ok((stream.topics.clone(), std::collections::BTreeMap::new()));
     };
     // Resolve captured route params with the SAME matcher `route_matches` used (no differential).
     let path = if request_path.starts_with('/') {
@@ -147,6 +147,15 @@ pub(super) async fn authorize_stream_topics(
         .and_then(|p| p.match_path(&path))
         .map(|m| m.params)
         .unwrap_or_default();
+    // sec-review LOW-2: a captured scope must be a plain segment — reject `.`/`..` (messaging keys
+    // are opaque, so this is defense-in-depth for the disclosure boundary).
+    if params.values().any(|v| v == "." || v == "..") {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "not authorized for this stream scope\n",
+        )
+            .into_response());
+    }
 
     match authz {
         StreamAuthz::Scoped {
@@ -179,7 +188,7 @@ pub(super) async fn authorize_stream_topics(
                         .into_response());
                 }
             }
-            Ok(resolve_topic_templates(&stream.topics, &params))
+            Ok((resolve_topic_templates(&stream.topics, &params), params))
         }
         StreamAuthz::GuestMediated {
             token_claims,
@@ -200,7 +209,7 @@ pub(super) async fn authorize_stream_topics(
                 }
                 None => None,
             };
-            guest_authorize_topics(
+            let topics = guest_authorize_topics(
                 inner,
                 project,
                 handler,
@@ -209,7 +218,8 @@ pub(super) async fn authorize_stream_topics(
                 principal.as_ref(),
                 &stream.topics,
             )
-            .await
+            .await?;
+            Ok((topics, params))
         }
     }
 }
@@ -326,7 +336,8 @@ fn topic_matches_template(template: &str, topic: &str) -> bool {
     t.len() == s.len()
         && t.iter().zip(&s).all(|(tp, sg)| {
             if tp.starts_with('{') && tp.ends_with('}') && tp.len() > 2 {
-                !sg.is_empty()
+                // A captured segment must be a plain, non-empty, non-`.`/`..` segment (sec LOW-2).
+                !sg.is_empty() && *sg != "." && *sg != ".."
             } else {
                 tp == sg
             }
@@ -489,28 +500,34 @@ fn resolve_topic_templates(
 ) -> Vec<String> {
     topics
         .iter()
-        .map(|t| {
-            let mut out = String::with_capacity(t.len());
-            let bytes = t.as_bytes();
-            let mut i = 0;
-            while i < bytes.len() {
-                if bytes[i] == b'{'
-                    && let Some(end) = t[i..].find('}')
-                {
-                    let name = &t[i + 1..i + end];
-                    if let Some(v) = params.get(name) {
-                        out.push_str(v);
-                        i += end + 1;
-                        continue;
-                    }
-                }
-                let ch = t[i..].chars().next().expect("char boundary");
-                out.push(ch);
-                i += ch.len_utf8();
-            }
-            out
-        })
+        .map(|t| substitute_template(t, params))
         .collect()
+}
+
+/// Substitute `{name}` templates in one topic with the connection's resolved route params; an
+/// unknown `{name}` is left verbatim. A substituted value is not re-scanned (a value containing
+/// `{…}` can't trigger a second expansion).
+#[cfg(feature = "handlers")]
+fn substitute_template(t: &str, params: &std::collections::BTreeMap<String, String>) -> String {
+    let mut out = String::with_capacity(t.len());
+    let bytes = t.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'{'
+            && let Some(end) = t[i..].find('}')
+        {
+            let name = &t[i + 1..i + end];
+            if let Some(v) = params.get(name) {
+                out.push_str(v);
+                i += end + 1;
+                continue;
+            }
+        }
+        let ch = t[i..].chars().next().expect("char boundary");
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
 }
 
 /// Serve a configured SSE stream: subscribe to each of its (scope-namespaced)
@@ -547,9 +564,9 @@ pub(super) async fn serve_stream(
     };
     // #11: authorize the connection and resolve the per-connection topic set BEFORE acquiring any
     // permit (deny before resource use). No `authz` ⇒ the static broadcast topics.
-    let topics =
+    let (topics, _params) =
         match authorize_stream_topics(inner, project, site, stream, request_path, bearer).await {
-            Ok(topics) => topics,
+            Ok(resolved) => resolved,
             Err(resp) => return resp,
         };
 
@@ -888,6 +905,9 @@ pub(super) async fn serve_ws_stream(
     site_handlers: &boatramp_core::config::HandlersSiteConfig,
     stream: &boatramp_core::config::StreamConfig,
     mut request: Request,
+    // sec-review LOW-1: the SAME dispatch-resolved path the SSE path uses (prefix-stripped for the
+    // admin/preview path-form routes), so WS + SSE authz match the route identically.
+    request_path: &str,
     client_ip: IpAddr,
     preview: Option<&str>,
 ) -> Response {
@@ -907,9 +927,8 @@ pub(super) async fn serve_ws_stream(
     let (Some(accept), true) = (accept_key, version_ok) else {
         return (StatusCode::BAD_REQUEST, "invalid websocket handshake\n").into_response();
     };
-    // #11: capture the owned bits the authz check needs (bearer + path) BEFORE releasing the
-    // request — `&Request` must not be held across the authz awaits.
-    let request_path = request.uri().path().to_string();
+    // #11: capture the owned bearer BEFORE releasing the request — `&Request` must not be held
+    // across the authz awaits. The path is threaded in (LOW-1), matching the SSE path exactly.
     let bearer = request
         .headers()
         .get(axum::http::header::AUTHORIZATION)
@@ -932,17 +951,17 @@ pub(super) async fn serve_ws_stream(
         None => site.to_string(),
     };
     // #11: authorize + resolve the per-connection topic set (or 401/403) before acquiring a permit.
-    let topics = match authorize_stream_topics(
+    let (topics, params) = match authorize_stream_topics(
         inner,
         project,
         site,
         stream,
-        &request_path,
+        request_path,
         bearer.as_deref(),
     )
     .await
     {
-        Ok(topics) => topics,
+        Ok(resolved) => resolved,
         Err(resp) => return resp,
     };
     let site_permit = match acquire_stream_permit(inner, &scope, site_handlers) {
@@ -975,11 +994,13 @@ pub(super) async fn serve_ws_stream(
             .map(|e| e.payload)
             .boxed()
     }));
-    // client→server: messages publish to this scope-namespaced topic (if set).
+    // client→server: messages publish to this scope-namespaced topic (if set). sec-review MEDIUM-2:
+    // substitute the connection's resolved `{param}`s so the INBOUND topic carries the same scope as
+    // the outbound fan-out (an unscoped `publish_topic` would drop the per-connection write scope).
     let publish_topic = stream
         .publish_topic
         .as_ref()
-        .map(|topic| format!("{scope}/{topic}"));
+        .map(|topic| format!("{scope}/{}", substitute_template(topic, &params)));
 
     // The fan-out runs once the serve loop hands us the upgraded connection (after it
     // writes our 101). tungstenite drives the WebSocket framing over the raw stream.

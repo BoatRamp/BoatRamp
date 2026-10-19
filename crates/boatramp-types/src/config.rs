@@ -238,7 +238,7 @@ impl DeployConfig {
                 )));
             }
             if let Some(authz) = &stream.authz {
-                let params: std::collections::BTreeSet<&str> =
+                let route_params: std::collections::BTreeSet<&str> =
                     pattern.param_names().iter().map(String::as_str).collect();
                 match authz {
                     StreamAuthz::Scoped {
@@ -246,6 +246,16 @@ impl DeployConfig {
                         membership,
                     } => {
                         token_claims.validate()?;
+                        // Sec LOW-3: a scoped stream must carry a usable JWKS source, else every
+                        // connection fails bearer verification (401) at runtime — catch it at apply.
+                        if !token_claims_has_jwks_source(token_claims) {
+                            return Err(ConfigError::parse(format!(
+                                "stream {} scoped authz: token_claims has no JWKS source (set \
+                                 jwks_env / jwks_url, or issuer_trust + jwks) — every connection \
+                                 would fail verification",
+                                stream.route
+                            )));
+                        }
                         if membership.is_empty() {
                             return Err(ConfigError::parse(format!(
                                 "stream {} authz is `scoped` but declares no membership check — \
@@ -253,10 +263,13 @@ impl DeployConfig {
                                 stream.route
                             )));
                         }
+                        // The route params each membership check GATES.
+                        let mut gated: std::collections::BTreeSet<&str> =
+                            std::collections::BTreeSet::new();
                         for m in membership {
                             match m {
                                 StreamMembership::Claim { param, claim } => {
-                                    if !params.contains(param.as_str()) {
+                                    if !route_params.contains(param.as_str()) {
                                         return Err(ConfigError::parse(format!(
                                             "stream {} claim-membership references route param \
                                              `:{param}` the route does not declare",
@@ -269,6 +282,7 @@ impl DeployConfig {
                                             stream.route
                                         )));
                                     }
+                                    gated.insert(param.as_str());
                                 }
                                 StreamMembership::Sql { query, .. } => {
                                     if query.trim().is_empty() {
@@ -277,6 +291,27 @@ impl DeployConfig {
                                             stream.route
                                         )));
                                     }
+                                    for name in sql_dollar_names(query) {
+                                        if route_params.contains(name) {
+                                            gated.insert(name);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        // Sec MEDIUM-1 + MEDIUM-2: every route param substituted into a `topics` OR
+                        // `publish_topic` template must be gated by a membership check — else an
+                        // ungated, attacker-controlled route capture flows into the subscribed /
+                        // published topic (a connection could bind a scope it was never authorized for).
+                        for tmpl in stream.topics.iter().chain(stream.publish_topic.as_ref()) {
+                            for name in template_names(tmpl) {
+                                if route_params.contains(name) && !gated.contains(name) {
+                                    return Err(ConfigError::parse(format!(
+                                        "stream {} template references route param `{{{name}}}` that \
+                                         no membership check gates — gate it with a claim or sql check \
+                                         (an ungated scope would be subscribed/published unauthorized)",
+                                        stream.route
+                                    )));
                                 }
                             }
                         }
@@ -293,6 +328,21 @@ impl DeployConfig {
                                 "stream {} authz is `guest_mediated` but the handler route is empty",
                                 stream.route
                             )));
+                        }
+                        // Sec MEDIUM-2: the host can't gate a route-param scope for a guest-mediated
+                        // stream's INBOUND write (the guest returns only the OUTBOUND topic set), so a
+                        // templated `publish_topic` is refused — use a static publish_topic, or none.
+                        if let Some(pt) = &stream.publish_topic {
+                            for name in template_names(pt) {
+                                if route_params.contains(name) {
+                                    return Err(ConfigError::parse(format!(
+                                        "stream {} guest_mediated publish_topic references route param \
+                                         `{{{name}}}` — a guest-mediated stream can't host-gate an \
+                                         inbound scope; use a static publish_topic",
+                                        stream.route
+                                    )));
+                                }
+                            }
                         }
                     }
                 }
@@ -1149,6 +1199,57 @@ pub enum StreamMembership {
         /// The membership predicate (returns ≥1 row ⇒ member).
         query: String,
     },
+}
+
+/// The `{name}` placeholders a topic/publish template references — matches the serve-side
+/// `substitute_template` ( `{` to the next `}` ). Borrowed from `s`.
+fn template_names(s: &str) -> impl Iterator<Item = &str> {
+    let mut rest = s;
+    std::iter::from_fn(move || {
+        let open = rest.find('{')?;
+        let after = &rest[open + 1..];
+        let close = after.find('}')?;
+        let name = &after[..close];
+        rest = &after[close + 1..];
+        Some(name)
+    })
+}
+
+/// The `$name` placeholders a membership SQL predicate references — matches the serve-side
+/// `bind_named_params` (`$` + an alpha/`_` start, then alphanumerics/`_`). Borrowed from `query`.
+fn sql_dollar_names(query: &str) -> impl Iterator<Item = &str> {
+    let bytes = query.as_bytes();
+    let mut i = 0;
+    std::iter::from_fn(move || {
+        while i < bytes.len() {
+            if bytes[i] == b'$'
+                && query[i + 1..]
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            {
+                let start = i + 1;
+                let mut j = start;
+                while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+                    j += 1;
+                }
+                let name = &query[start..j];
+                i = j;
+                return Some(name);
+            }
+            i += 1;
+        }
+        None
+    })
+}
+
+/// Whether a scoped stream's `token_claims` carries a usable JWKS source (single-issuer `jwks_env` /
+/// `jwks_url`, or the multi-issuer `issuer_trust` + `jwks`) — without one, bearer verification can
+/// never succeed and every connection 401s at runtime.
+fn token_claims_has_jwks_source(tc: &HandlerGraphqlTokenClaims) -> bool {
+    tc.jwks_env.is_some()
+        || tc.jwks_url.is_some()
+        || (tc.issuer_trust.is_some() && tc.jwks.is_some())
 }
 
 /// A **duplex, resumable session** route (`PLAN-session-primitive`): a long-lived,
@@ -2934,6 +3035,121 @@ mod tests {
             }))
             .is_err(),
             "empty guest handler rejected"
+        );
+    }
+
+    // Security-review MEDIUM-1 / MEDIUM-2 / LOW-3 — the apply-time coverage + JWKS-source gates.
+    #[test]
+    fn stream_authz_rejects_ungated_template_params_and_missing_jwks() {
+        let mk = |s: StreamConfig| {
+            DeployConfig {
+                streams: vec![s],
+                ..Default::default()
+            }
+            .compile_check()
+        };
+        let claims = || {
+            serde_json::from_str::<HandlerGraphqlTokenClaims>(
+                r#"{"issuer":"https://idp.example","jwks_env":"IDP_JWKS"}"#,
+            )
+            .unwrap()
+        };
+
+        // MEDIUM-1: `org` is substituted into the topic but gated by NO membership check ⇒ rejected.
+        assert!(
+            mk(StreamConfig {
+                route: "/events/:org/:mailbox".into(),
+                topics: vec!["shared/{org}/{mailbox}/events".into()],
+                websocket: false,
+                publish_topic: None,
+                authz: Some(StreamAuthz::Scoped {
+                    token_claims: claims(),
+                    membership: vec![StreamMembership::Claim {
+                        param: "mailbox".into(),
+                        claim: "mailboxes".into(),
+                    }],
+                }),
+            })
+            .is_err(),
+            "an ungated topic-template route param is rejected"
+        );
+
+        // Gating `org` too (an `$org` in the SQL predicate) makes the same config valid.
+        mk(StreamConfig {
+            route: "/events/:org/:mailbox".into(),
+            topics: vec!["shared/{org}/{mailbox}/events".into()],
+            websocket: false,
+            publish_topic: None,
+            authz: Some(StreamAuthz::Scoped {
+                token_claims: claims(),
+                membership: vec![
+                    StreamMembership::Claim {
+                        param: "mailbox".into(),
+                        claim: "mailboxes".into(),
+                    },
+                    StreamMembership::Sql {
+                        source: String::new(),
+                        query: "SELECT 1 FROM m WHERE org = $org".into(),
+                    },
+                ],
+            }),
+        })
+        .expect("gating every topic param passes");
+
+        // MEDIUM-2: an ungated `publish_topic` route param is rejected.
+        assert!(
+            mk(StreamConfig {
+                route: "/events/:org/:mailbox".into(),
+                topics: vec!["shared/{mailbox}/out".into()],
+                websocket: true,
+                publish_topic: Some("shared/{org}/in".into()),
+                authz: Some(StreamAuthz::Scoped {
+                    token_claims: claims(),
+                    membership: vec![StreamMembership::Claim {
+                        param: "mailbox".into(),
+                        claim: "mailboxes".into(),
+                    }],
+                }),
+            })
+            .is_err(),
+            "an ungated publish_topic route param is rejected"
+        );
+
+        // MEDIUM-2 (guest): a guest-mediated stream can't host-gate an inbound scope ⇒ a templated
+        // publish_topic is rejected.
+        assert!(
+            mk(StreamConfig {
+                route: "/events/:mailbox".into(),
+                topics: vec!["shared/{mailbox}/out".into()],
+                websocket: true,
+                publish_topic: Some("shared/{mailbox}/in".into()),
+                authz: Some(StreamAuthz::GuestMediated {
+                    token_claims: None,
+                    handler: "authz".into(),
+                }),
+            })
+            .is_err(),
+            "a guest-mediated templated publish_topic is rejected"
+        );
+
+        // LOW-3: scoped token_claims with no JWKS source is rejected at apply (not a runtime 401).
+        assert!(
+            mk(StreamConfig {
+                route: "/events/:mailbox".into(),
+                topics: vec!["shared/{mailbox}/out".into()],
+                websocket: false,
+                publish_topic: None,
+                authz: Some(StreamAuthz::Scoped {
+                    token_claims: serde_json::from_str(r#"{"issuer":"https://idp.example"}"#)
+                        .unwrap(),
+                    membership: vec![StreamMembership::Claim {
+                        param: "mailbox".into(),
+                        claim: "mailboxes".into(),
+                    }],
+                }),
+            })
+            .is_err(),
+            "scoped token_claims with no JWKS source is rejected"
         );
     }
 }
