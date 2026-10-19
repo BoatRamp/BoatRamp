@@ -88,6 +88,20 @@ pub(crate) enum CompositionError {
     /// could not be confirmed within the fence bound `T`). The edge DENIES (does not serve a possibly
     /// now-hidden field from a stale cache) rather than compose against unconfirmed registry state.
     RegistryUnreachable { message: String },
+    /// **Per-site subgraph composition — an INVALID federation subset.** A site's `graphql.subgraphs`
+    /// include list composed a supergraph in which an entity's `@key` field is referenced
+    /// (`@key`/`@external`/`extends`) by an included subgraph but **owned by no included subgraph** —
+    /// its base-owning subgraph was excluded. Such a subset is not a valid Federation v2 supergraph
+    /// (the entity's base fields / `_entities` resolution are unsatisfiable). Fail-closed: a subtly
+    /// invalid subset would be worse than the feature's absence. Fix by including the owning subgraph
+    /// (or dropping the referencing one from this site's set).
+    IncompleteSubset {
+        entity: String,
+        key_field: String,
+        /// The included subgraph(s) that reference the entity (declare its `@key`) but do not own its
+        /// base — i.e. the ones whose reference now dangles.
+        referencing_subgraphs: Vec<String>,
+    },
 }
 
 impl std::fmt::Display for CompositionError {
@@ -123,6 +137,19 @@ impl std::fmt::Display for CompositionError {
             Self::RegistryUnreachable { message } => write!(
                 f,
                 "GraphQL registry currency could not be confirmed (shared-mode fence): {message}"
+            ),
+            Self::IncompleteSubset {
+                entity,
+                key_field,
+                referencing_subgraphs,
+            } => write!(
+                f,
+                "graphql subgraph set is not a valid federation subset — entity `{entity}` is \
+                 referenced by subgraph(s) ({}) via its `@key(fields: \"{key_field}\")` but no \
+                 included subgraph OWNS `{entity}.{key_field}`; the entity's base-owning subgraph is \
+                 excluded from this site's `graphql.subgraphs`. Include it, or drop the referencing \
+                 subgraph(s) from this site's set.",
+                referencing_subgraphs.join(", ")
             ),
         }
     }
@@ -184,6 +211,35 @@ pub(crate) fn compose(subgraphs: &[(String, String)]) -> Result<Supergraph, Comp
         owners.sort();
     }
     Ok(sg)
+}
+
+/// Validate that a composed supergraph is a VALID federation subset — every entity's `@key` field is
+/// OWNED by a subgraph present in the composition. For per-site subgraph composition (a site's
+/// `graphql.subgraphs` include list): a subset that references an entity whose base-owning subgraph is
+/// excluded composes "successfully" with that key field ABSENT from `field_owners` (the composer skips
+/// `@external` references and does no entity-completeness check), so this is the fail-closed check
+/// `compose` itself does not do. Returns [`CompositionError::IncompleteSubset`] naming the dangling
+/// entity + key field + the referencing subgraph(s). A no-op on a full-project composition (every
+/// entity's base is present) — so it is safe to run unconditionally.
+pub(crate) fn validate_subset(sg: &Supergraph) -> Result<(), CompositionError> {
+    for (name, entity) in &sg.entities {
+        for key_field in &entity.key {
+            // The key field must be OWNED (non-`@external`) by some included subgraph. If it is not in
+            // `field_owners`, every included subgraph that touches this entity declared the key as
+            // `@external` (a mere reference) — the base-owning subgraph is excluded ⇒ dangling.
+            if !sg
+                .field_owners
+                .contains_key(&(name.clone(), key_field.clone()))
+            {
+                return Err(CompositionError::IncompleteSubset {
+                    entity: name.clone(),
+                    key_field: key_field.clone(),
+                    referencing_subgraphs: entity.subgraphs.clone(),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Fold one object type (or `extend type`) from subgraph `subgraph` into the model.
@@ -421,6 +477,35 @@ mod tests {
 
     fn sub(name: &str, sdl: &str) -> (String, String) {
         (name.to_string(), sdl.to_string())
+    }
+
+    #[test]
+    fn validate_subset_rejects_a_dangling_entity_and_accepts_a_complete_set() {
+        // Per-site subset {reviews} alone references the `User` entity (via `extend ... @key`, `id`
+        // `@external`) but its base owner `accounts` is EXCLUDED → compose SUCCEEDS (fail-open), so
+        // `validate_subset` is what fails it closed.
+        let dangling = compose(&[sub("reviews", REVIEWS)]).expect("subset composes (fail-open)");
+        match validate_subset(&dangling) {
+            Err(CompositionError::IncompleteSubset {
+                entity,
+                key_field,
+                referencing_subgraphs,
+            }) => {
+                assert_eq!(entity, "User");
+                assert_eq!(key_field, "id");
+                assert_eq!(referencing_subgraphs, vec!["reviews".to_string()]);
+            }
+            other => panic!("expected IncompleteSubset, got {other:?}"),
+        }
+        // The complete set {accounts, reviews} includes `User`'s base owner → a VALID subset.
+        let complete = compose(&[sub("accounts", ACCOUNTS), sub("reviews", REVIEWS)]).unwrap();
+        assert!(
+            validate_subset(&complete).is_ok(),
+            "the complete set is valid"
+        );
+        // {accounts} alone references no excluded base → valid.
+        let just_accounts = compose(&[sub("accounts", ACCOUNTS)]).unwrap();
+        assert!(validate_subset(&just_accounts).is_ok());
     }
 
     /// A **real** async-graphql federation subgraph: build a schema, emit its SDL exactly

@@ -5,7 +5,7 @@
 //! incompatible change** so a bad publish never corrupts the registry. The composed
 //! supergraph model is what the query planner (a later landing) plans against.
 
-use crate::graphql_federation::{CompositionError, Supergraph, compose};
+use crate::graphql_federation::{CompositionError, Supergraph, compose, validate_subset};
 use boatramp_core::config::HandlerGraphqlDataConfig;
 use boatramp_core::kv::{KvStore, WriteOp};
 use std::collections::BTreeMap;
@@ -378,7 +378,12 @@ pub(crate) async fn supergraph_subset(
             );
         }
     }
-    compose(&chosen)
+    let sg = compose(&chosen)?;
+    // Fail CLOSED on an invalid subset (an entity whose base-owning subgraph is excluded) even at
+    // serve — a subtly-invalid composed subset must never serve. The authoritative fail-fast is the
+    // apply-time check (S2b); this is the defense-in-depth backstop.
+    validate_subset(&sg)?;
+    Ok(sg)
 }
 
 /// Whether `name` is a currently-registered subgraph of `project` (an SDL is stored). Used to
