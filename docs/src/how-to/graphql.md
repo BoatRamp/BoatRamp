@@ -387,6 +387,62 @@ subgraph — the schema semantics stay in your code.
 > (`@interfaceObject`, progressive `@override`, deep `@requires` chains) are not
 > yet planned; a query that needs them will not compose or plan.
 
+### Per-host GraphQL surfaces (`subgraphs`)
+
+A project can host several **sites** (distinct hosts — `admin.<base>`, `console.<base>`,
+`portal.<base>`), each with its own `graphql` config. By default every site's gateway serves the
+**same** composed supergraph (all registered subgraphs). To give a host a *different* API — as a
+schema-level fact, not a filter bolted on top — set the site's **subgraph include list**:
+
+```ron
+// admin.<base> — composes the tenant subgraphs AND the platform-owner subgraph
+graphql: ( enabled: true, federated: true, subgraphs: Some(["accounts", "catalog", "platform"]) )
+```
+
+```ron
+// console.<base> — composes only the tenant subgraphs; `platform` is ABSENT here
+graphql: ( enabled: true, federated: true, subgraphs: Some(["accounts", "catalog"]) )
+```
+
+Each site composes a **genuinely distinct supergraph** from exactly its named subgraphs: planning,
+execution, **and introspection** reflect only that set. A subgraph a site omits is **not part of
+that host's schema** — invisible to `__schema`/`__type`, unplannable, uncallable — not merely
+blocked. So `console` can run with introspection *on* and still never reveal the `platform`
+operations, because they genuinely are not in its schema.
+
+- **Include, not exclude.** The list is an allow-list because the headline use case is a
+  security/visibility boundary and include is fail-safe: a newly-registered subgraph does **not**
+  auto-appear on a locked-down host. A site that wants *everything* omits the field (the default).
+- **Absent ⇒ all registered subgraphs** — fully backward-compatible; every existing project composes
+  one supergraph for every site, byte-for-byte as before.
+- **Fail-closed at apply.** An unknown include name, an empty list, or a set that is not a valid
+  Federation subset (an included subgraph references an entity whose base-owning subgraph is
+  excluded) is a **`400` at apply** with a precise reason — never silently ignored (which would
+  over- or under-expose a host). A project authored for a newer host but applied to one that predates
+  `subgraphs` also fails loudly (unknown config field), never silently composing everything.
+- **Internal calls stay full-project.** Guest `graphql::run` and `emit::invoke` compose the **whole**
+  project supergraph regardless of any site's `subgraphs` — server-side orchestration across all
+  subgraphs keeps working; only each site's *external* `/graphql` edge is partitioned.
+- **Safelisted ops** declared on a site validate against **that site's** composed subset: an op that
+  selects a root the subset does not contain is a fail-closed apply error.
+
+#### Composition selection vs. edge reachability
+
+`subgraphs` is the **schema-level** boundary; it composes cleanly with the reachability-level
+overrides (`edge_hidden_operations` / `edge_hidden_subgraphs`, and the `@edgeHidden` SDL directive):
+
+| | `subgraphs` (composition selection) | `edge_hidden_*` (edge reachability) |
+| --- | --- | --- |
+| **Decides** | *which subgraphs exist* on the host | *which present roots are reachable* at the edge |
+| **Scope** | a whole subgraph (its types + roots) | individual root `Query`/`Mutation` fields |
+| **Introspection** | an excluded subgraph is **absent** from `__schema` | a hidden root is **absent** from `__schema` too (no oracle), but its subgraph is still composed |
+| **Use it for** | "this host has a different API" (admin vs tenant) | "this host composes the subgraph but must not expose *this one* root" |
+
+Use `subgraphs` to draw the API boundary between hosts; use `edge_hidden_*` to hide a specific root
+*within* a host that still composes its subgraph (e.g. expose a subgraph for reads but keep one
+mutation off that edge). Both remain valid; an `edge_hidden_*` entry naming a subgraph the site does
+not compose is a harmless, logged no-op.
+
 ## Cross-tenant target fields
 
 A root Query/Mutation field can serve **another** tenant `B`'s *public* subset — a

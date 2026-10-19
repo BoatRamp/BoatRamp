@@ -692,6 +692,51 @@ mod tests {
         );
     }
 
+    // The per-set subset cache recomposes on a registry-version change (and only then): a hit at the
+    // same version shares the Arc; a publish bumps the version, so the next resolve recomposes.
+    #[tokio::test]
+    async fn per_site_subset_recomposes_only_on_a_registry_version_change() {
+        const CATALOG: &str = "type Query { products: [String] }";
+        let kv = MemoryKv::new();
+        crate::graphql_registry::publish(&kv, "acme", "accounts", ACCOUNTS)
+            .await
+            .unwrap();
+        let cache = GraphqlCache::default();
+        let set = vec!["accounts".to_string()];
+        let h = subgraph_set_hash(&set);
+
+        let g1 = cache
+            .supergraph_subset(&kv, "acme", &set, &h)
+            .await
+            .unwrap();
+        let g1b = cache
+            .supergraph_subset(&kv, "acme", &set, &h)
+            .await
+            .unwrap();
+        assert!(
+            Arc::ptr_eq(&g1.supergraph, &g1b.supergraph),
+            "no registry change ⇒ no recompose (same Arc)"
+        );
+
+        // A publish bumps the composition version → the next resolve recomposes this set.
+        crate::graphql_registry::publish(&kv, "acme", "catalog", CATALOG)
+            .await
+            .unwrap();
+        let g2 = cache
+            .supergraph_subset(&kv, "acme", &set, &h)
+            .await
+            .unwrap();
+        assert!(g2.version > g1.version, "the registry version advanced");
+        assert!(
+            !Arc::ptr_eq(&g1.supergraph, &g2.supergraph),
+            "a version change ⇒ a recompose"
+        );
+        // The set is still {accounts} — the newly-published `catalog` did NOT leak into this site's
+        // include set (include-list stability).
+        assert!(g2.supergraph.root_query.contains_key("me"));
+        assert!(!g2.supergraph.root_query.contains_key("products"));
+    }
+
     // ===== MF-3 (extended): GraphQL registry stale-authz fence =====================================
     //
     // A cross-node registry change (a field becoming `@edgeHidden`) that misses its NOTIFY must not

@@ -797,4 +797,107 @@ extend schema @link(
             .await
             .expect("self-contained set");
     }
+
+    // S4 — the request's checklist, end-to-end: a two-site project where site A composes {a, b} and
+    // site B composes {b, c}. Independent subgraphs (no cross-entity references) so every subset is a
+    // valid Federation subset; the dangling-`@key` fail-closed case is covered by
+    // `validate_site_subset_fails_closed_on_empty_unknown_and_incomplete`.
+    #[tokio::test]
+    async fn per_site_two_site_composition_end_to_end() {
+        use std::collections::BTreeSet;
+        const A: &str = "type Query { fromA: [TypeA] } type TypeA { id: ID! }";
+        const B: &str = "type Query { fromB: [TypeB] } type TypeB { id: ID! }";
+        const C: &str = "type Query { fromC: [TypeC] } type TypeC { id: ID! }";
+        let kv = MemoryKv::new();
+        publish(&kv, "p", "a", A).await.unwrap();
+        publish(&kv, "p", "b", B).await.unwrap();
+        publish(&kv, "p", "c", C).await.unwrap();
+        let site_a = vec!["a".to_string(), "b".to_string()];
+        let site_b = vec!["b".to_string(), "c".to_string()];
+        let empty: BTreeSet<(String, String)> = BTreeSet::new();
+
+        // (1) Each site's INTROSPECTION shows only its set — exercised through the real executor.
+        let st_a = schema_types_subset(&kv, "p", &site_a).await;
+        let st_b = schema_types_subset(&kv, "p", &site_b).await;
+        let q = "{ __schema { types { name } } }";
+        let doc = async_graphql_parser::parse_query(q).unwrap();
+        let type_names = |st: &crate::graphql_introspect::SchemaTypes| -> BTreeSet<String> {
+            let v = crate::graphql_introspect::execute(&doc, st, &empty);
+            v["data"]["__schema"]["types"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t["name"].as_str().unwrap().to_string())
+                .collect()
+        };
+        let na = type_names(&st_a);
+        assert!(na.contains("TypeA") && na.contains("TypeB") && !na.contains("TypeC"));
+        let nb = type_names(&st_b);
+        assert!(nb.contains("TypeB") && nb.contains("TypeC") && !nb.contains("TypeA"));
+
+        // (2) A root owned by an EXCLUDED subgraph plans as genuinely-unknown on the wrong site.
+        let sg_a = supergraph_subset(&kv, "p", &site_a).await.unwrap();
+        let sg_b = supergraph_subset(&kv, "p", &site_b).await.unwrap();
+        assert!(
+            matches!(
+                crate::graphql_plan::plan("{ fromC { id } }", &sg_a, Some(&empty)),
+                Err(crate::graphql_plan::PlanError::UnknownRootField(_))
+            ),
+            "c's root is genuinely unknown on site A"
+        );
+        assert!(
+            matches!(
+                crate::graphql_plan::plan("{ fromA { id } }", &sg_b, Some(&empty)),
+                Err(crate::graphql_plan::PlanError::UnknownRootField(_))
+            ),
+            "a's root is genuinely unknown on site B"
+        );
+        assert!(crate::graphql_plan::plan("{ fromB { id } }", &sg_a, Some(&empty)).is_ok());
+        assert!(crate::graphql_plan::plan("{ fromB { id } }", &sg_b, Some(&empty)).is_ok());
+
+        // (3) The field-absent path is byte-identical to the single full-project supergraph: composing
+        // the FULL set as a "subset" matches the plain full composition.
+        let full = supergraph(&kv, "p").await.unwrap();
+        let full_as_subset = supergraph_subset(&kv, "p", &["a".into(), "b".into(), "c".into()])
+            .await
+            .unwrap();
+        assert_eq!(full.root_query, full_as_subset.root_query);
+        assert_eq!(full.field_owners, full_as_subset.field_owners);
+
+        // (4) The internal path composes the FULL project (reaches every subgraph regardless of any
+        // site's subset) — `graphql::run` / `emit::invoke` use `supergraph`, not a site subset.
+        assert!(
+            full.root_query.contains_key("fromA")
+                && full.root_query.contains_key("fromB")
+                && full.root_query.contains_key("fromC"),
+            "the full-project supergraph reaches an excluded-from-a-site subgraph"
+        );
+
+        // (5) `edge_hidden_*` still works WITHIN a subset: hiding b's root on site A makes it
+        // unreachable AND absent from introspection, yet b's TypeB remains composed (composition
+        // selection vs reachability hiding are orthogonal).
+        let hidden = BTreeSet::from([("Query".to_string(), "fromB".to_string())]);
+        assert!(
+            matches!(
+                crate::graphql_plan::plan("{ fromB { id } }", &sg_a, Some(&hidden)),
+                Err(crate::graphql_plan::PlanError::UnknownRootField(_))
+            ),
+            "edge-hidden root is unreachable within the subset"
+        );
+        assert!(
+            st_a.types.contains_key("TypeB"),
+            "edge_hidden hides the root, not the type"
+        );
+        let docf =
+            async_graphql_parser::parse_query("{ __type(name: \"Query\") { fields { name } } }")
+                .unwrap();
+        let v = crate::graphql_introspect::execute(&docf, &st_a, &hidden);
+        let roots: BTreeSet<String> = v["data"]["__type"]["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["name"].as_str().unwrap().to_string())
+            .collect();
+        assert!(roots.contains("fromA") && !roots.contains("fromB"));
+    }
 }
