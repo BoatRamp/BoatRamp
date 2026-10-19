@@ -1313,6 +1313,14 @@ impl DeployStore {
         config: &SiteConfig,
         cooperative: bool,
     ) -> Result<(), DeployError> {
+        // Validate the gateway on EVERY write, not just the CLI `gateway`/`apply` paths: a raw
+        // operator-API PUT or a guest `admin:site` write must not persist a gateway a `gateway apply`
+        // would reject (a malformed reserved-path glob, a route referencing a missing upstream, a
+        // project upstream marked `shared`, …). Defense in depth atop the serve-time structural guards.
+        if let Some(gw) = config.gateway.as_ref() {
+            crate::gateway::validate_site_gateway(gw)
+                .map_err(|e| DeployError::Invalid(format!("gateway: {e}")))?;
+        }
         let owner = DomainOwner::new(project.as_str(), site);
         // The current config ONCE (its `domains.contexts` already overlaid from the context store
         // by `get_site_config`). Reused for the context base, the alias oracle, and the

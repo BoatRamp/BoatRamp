@@ -58,6 +58,7 @@ lru.workspace = true
 ron.workspace = true
 hex.workspace = true
 ipnet.workspace = true
+url.workspace = true
 argon2.workspace = true
 getrandom.workspace = true
 # For `domain_verify`'s injected `DomainProbe` async trait (pure, wasm-clean).

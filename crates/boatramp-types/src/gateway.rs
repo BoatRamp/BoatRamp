@@ -252,9 +252,14 @@ pub fn resolve_gateway<'a>(
     if gateway_mutation().as_deref() != Some("skip_reserved")
         && let Some(site) = site
         && site.reserved_paths.iter().any(|r| {
+            // Fail CLOSED: an uncompilable reserved glob is treated as MATCHING (reserved), so a
+            // malformed operator reservation can never silently open a reserved path to a project
+            // route. (Contrast route matching at `match_route`, where `unwrap_or(false)` fails closed
+            // by NOT routing — the safe direction there.) `validate_site_gateway` rejects a bad glob
+            // at the config write; this is the serve-time backstop.
             Pattern::compile(r)
                 .map(|p| p.is_match(path))
-                .unwrap_or(false)
+                .unwrap_or(true)
         })
     {
         return GatewayResolution::NoMatch;
@@ -450,32 +455,32 @@ fn upstream_literal_hosts(up: &Upstream) -> Vec<String> {
 }
 
 /// Extract the host of an upstream target: `scheme://[user@]host[:port][/path]`, `host:port`, a bare
-/// host, or a bracketed IPv6 literal. `None` when empty.
+/// host, or a bracketed IPv6 literal. `None` when empty or unparsable.
+///
+/// SECURITY: this parses with the WHATWG `url` crate — the SAME parser `reqwest::Url` re-exports and
+/// the gateway connection actually uses (`resolve_target` in `boatramp-server`). A hand-rolled
+/// authority split diverges from WHATWG on tricks like a `\`/`@` authority (`http://evil.com\@ok.com`
+/// → the connection dials `evil.com`, but a split that treats `\` as a normal char sees `ok.com`),
+/// which would let a project-tier upstream slip past the egress-host allowlist and reach a host the
+/// operator meant to block. Parsing with the connection's own parser makes the allowlist decision and
+/// the dial agree by construction. A scheme-less input is a bare `host[:port]` (a `discover` host or
+/// pool entry); synthesize an `http://` scheme so the identical WHATWG authority rules apply.
 fn extract_host(s: &str) -> Option<String> {
     let s = s.trim();
     if s.is_empty() {
         return None;
     }
-    let after_scheme = match s.find("://") {
-        Some(i) => &s[i + 3..],
-        None => s,
-    };
-    let authority = after_scheme
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or(after_scheme);
-    let authority = authority.rsplit('@').next().unwrap_or(authority);
-    if let Some(rest) = authority.strip_prefix('[') {
-        // Bracketed IPv6 literal: `[::1]:port`.
-        if let Some(end) = rest.find(']') {
-            return Some(rest[..end].to_string());
-        }
-    }
-    let host = authority.split(':').next().unwrap_or(authority);
-    if host.is_empty() {
-        None
+    let parsed = if s.contains("://") {
+        url::Url::parse(s).ok()?
     } else {
-        Some(host.to_string())
+        url::Url::parse(&format!("http://{s}")).ok()?
+    };
+    // Use `host()` (not `host_str()`) so an IPv6 literal comes back WITHOUT brackets, matching the
+    // IP-literal screen (`host_is_literal_private`) and the glob matcher.
+    match parsed.host()? {
+        url::Host::Domain(d) => Some(d.to_string()),
+        url::Host::Ipv4(a) => Some(a.to_string()),
+        url::Host::Ipv6(a) => Some(a.to_string()),
     }
 }
 
@@ -1307,6 +1312,33 @@ mod tests {
         assert!(!project_raw_egress_allowed(
             &pool,
             &["*.vendor.com".to_string()],
+            &[]
+        ));
+    }
+
+    #[test]
+    fn egress_host_matches_the_connection_parser_on_a_backslash_authority() {
+        // SECURITY regression (0.38.0): a `\`/`@` authority trick must NOT let the egress allowlist
+        // see a different host than the connection dials. The `url` crate (what `reqwest::Url`
+        // re-exports) treats `\` as `/`, so `http://evil.com\@allowed.com` has host `evil.com` — and
+        // `extract_host` must agree, so the allowlist check and the dial can't diverge.
+        assert_eq!(
+            extract_host("http://evil.com\\@allowed.com").as_deref(),
+            Some("evil.com"),
+        );
+        // The allowlist permits only `allowed.com`; the crafted target resolves to `evil.com`, so it
+        // must be REFUSED (pre-fix, a hand-rolled split saw `allowed.com` and let it through).
+        let evil = upstream("http://evil.com\\@allowed.com", None);
+        assert!(!project_raw_egress_allowed(
+            &evil,
+            &["allowed.com".to_string()],
+            &[]
+        ));
+        // A legitimate target on the allowlist still passes (no false refusal from the stricter parse).
+        let ok = upstream("https://allowed.com/path", None);
+        assert!(project_raw_egress_allowed(
+            &ok,
+            &["allowed.com".to_string()],
             &[]
         ));
     }

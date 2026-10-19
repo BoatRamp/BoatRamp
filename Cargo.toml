@@ -160,6 +160,10 @@ getrandom = "0.2"
 # to wasm32 (unlike a C-backed hash), and the modern recommended password hash.
 argon2 = "0.5"
 ipnet = "2"
+# WHATWG URL parser (what `reqwest::Url` re-exports). Used in `boatramp-types` so the gateway
+# egress-host allowlist parses an upstream target with the SAME parser the connection uses — a
+# hand-rolled authority split diverges on `\`/`@` tricks and bypasses the allowlist. wasm-clean.
+url = "2.5"
 base64 = "0.22"
 
 brotli = "7"

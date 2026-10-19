@@ -16,7 +16,7 @@ use std::path::PathBuf;
 /// declarative analogue of the imperative `upstream add` / `route add` + the caps.
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
-struct GatewayDoc {
+pub(crate) struct GatewayDoc {
     /// Upstreams + routes (+ reserved_paths) — the `SiteConfig.gateway`.
     gateway: GatewayConfig,
     /// Site-operator ceilings on what the project tier may declare — the `SiteConfig.gateway_caps`.
