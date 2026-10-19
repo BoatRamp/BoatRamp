@@ -5493,6 +5493,7 @@ async fn websocket_stream_fans_out_and_publishes() {
                 topics: vec!["events".to_string()],
                 websocket: true,
                 publish_topic: Some("ingest".to_string()),
+                authz: None,
             }],
             ..Default::default()
         },
