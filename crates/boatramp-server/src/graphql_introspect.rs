@@ -29,8 +29,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum TypeRef {
     Named(String),
-    NonNull(Box<TypeRef>),
-    List(Box<TypeRef>),
+    NonNull(Box<Self>),
+    List(Box<Self>),
 }
 
 /// One argument / input field (`__InputValue`).
@@ -111,7 +111,7 @@ impl SchemaTypes {
     fn with_hidden_removed<'a>(
         &'a self,
         hidden: &BTreeSet<(String, String)>,
-    ) -> std::borrow::Cow<'a, SchemaTypes> {
+    ) -> std::borrow::Cow<'a, Self> {
         if hidden.is_empty() {
             return std::borrow::Cow::Borrowed(self);
         }
@@ -503,7 +503,7 @@ fn visit_inner<'a>(
         match &item.node {
             Selection::Field(field) => f(&field.node),
             Selection::InlineFragment(inl) => {
-                visit_inner(&inl.node.selection_set.node, fragments, f, stack)
+                visit_inner(&inl.node.selection_set.node, fragments, f, stack);
             }
             Selection::FragmentSpread(fs) => {
                 let name = fs.node.fragment_name.node.as_str();

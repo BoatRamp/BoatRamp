@@ -374,6 +374,30 @@ impl AdminController for ServerAdminController {
             DomainGuard::Ok => {}
             DomainGuard::Unverified(reason) => return Err(AdminError::NotVerified(reason)),
         }
+        // Per-site subgraph composition (S2b): fail-closed on an invalid `graphql.subgraphs` set on
+        // THIS write path too — the guest `admin` `site-config-put`, symmetric to the HTTP
+        // `put_site_config` gate — so neither path can store an unregistered / incomplete /
+        // non-federated subset that would then compose an invalid per-site supergraph.
+        #[cfg(feature = "handlers")]
+        if let Some(gql) = next.handlers.as_ref().and_then(|h| h.graphql.as_ref())
+            && let Some(subset) = gql.subgraphs.as_ref()
+        {
+            if !gql.federated {
+                return Err(AdminError::InvalidInput(format!(
+                    "site {site:?}: graphql.subgraphs is set but the graphql edge is not `federated` \
+                     — per-site subset composition applies only to a federated gateway"
+                )));
+            }
+            if let Err(reason) = crate::graphql_registry::validate_site_subset(
+                self.deploy.kv().as_ref(),
+                self.project().as_str(),
+                subset,
+            )
+            .await
+            {
+                return Err(AdminError::InvalidInput(format!("site {site:?}: {reason}")));
+            }
+        }
         // Cooperative (apply-merge-contexts): preserve `domains.contexts`/`aliases` this PUT
         // doesn't mention, so a partial guest config write (or an `apply`) can't wipe another
         // invocation's per-host tenant tags. Removal stays explicit via `domain rm`.

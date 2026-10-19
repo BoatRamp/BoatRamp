@@ -1737,6 +1737,7 @@ mod tests {
                 .plan(
                     project,
                     graph.version,
+                    "", // full-project internal path (no per-site subset) ⇒ empty graph_id
                     op_hash,
                     query,
                     graph.supergraph.as_ref(),

@@ -414,32 +414,29 @@ pub(super) async fn put_site_config(
     // unregistered include, or an invalid Federation subset is a `400` and the config is NOT stored.
     // Absent ⇒ full-project (nothing to validate, byte-identical to before).
     #[cfg(feature = "handlers")]
-    if let Some(gql) = config.handlers.as_ref().and_then(|h| h.graphql.as_ref()) {
-        if let Some(subset) = gql.subgraphs.as_ref() {
-            if !gql.federated {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    format!(
-                        "site \"{site}\": graphql.subgraphs is set but the graphql edge is not \
-                         `federated` — per-site subset composition applies only to a federated \
-                         supergraph gateway (set `federated = true`, or remove `subgraphs`)\n"
-                    ),
-                )
-                    .into_response();
-            }
-            if let Err(reason) = crate::graphql_registry::validate_site_subset(
-                deploy.kv().as_ref(),
-                &project.0,
-                subset,
+    if let Some(gql) = config.handlers.as_ref().and_then(|h| h.graphql.as_ref())
+        && let Some(subset) = gql.subgraphs.as_ref()
+    {
+        if !gql.federated {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "site \"{site}\": graphql.subgraphs is set but the graphql edge is not \
+                     `federated` — per-site subset composition applies only to a federated \
+                     supergraph gateway (set `federated = true`, or remove `subgraphs`)\n"
+                ),
             )
-            .await
-            {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    format!("site \"{site}\": {reason}\n"),
-                )
-                    .into_response();
-            }
+                .into_response();
+        }
+        if let Err(reason) =
+            crate::graphql_registry::validate_site_subset(deploy.kv().as_ref(), &project.0, subset)
+                .await
+        {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("site \"{site}\": {reason}\n"),
+            )
+                .into_response();
         }
     }
     // Cooperative (apply-merge-contexts): a whole-config PUT preserves imperatively-written
@@ -915,10 +912,10 @@ pub(super) async fn register_graphql_safelist(
     }
     // S2b: when registered FOR a site that composes a per-site subset, fail closed on an op whose
     // roots the subset doesn't contain.
-    if let Some(site) = params.site.as_deref() {
-        if let Err(resp) = check_op_in_site_subset(&deploy, &project, site, query).await {
-            return resp;
-        }
+    if let Some(site) = params.site.as_deref()
+        && let Err(resp) = check_op_in_site_subset(&deploy, &project, site, query).await
+    {
+        return resp;
     }
     match crate::graphql_apq::register(deploy.kv().as_ref(), &project.0, query).await {
         Ok(hash) => (

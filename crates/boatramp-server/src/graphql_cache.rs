@@ -340,6 +340,7 @@ impl GraphqlCache {
     /// supergraph (`""` = full project), `op_hash` the operation, and `visibility` the edge-visibility
     /// dimension (#495) — so neither two sites with different subsets, nor the external edge vs the
     /// internal path, ever collide. A plan error is returned **uncached**.
+    #[allow(clippy::too_many_arguments)] // the plan cache key is genuinely 5-dimensional (+ graph + visibility)
     pub(crate) fn plan(
         &self,
         project: &str,
