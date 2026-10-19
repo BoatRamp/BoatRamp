@@ -5,6 +5,52 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.38.0] - 2026-10-19
+
+Symmetric two-tier gateway. The reverse-proxy gateway, previously operator-only (`SiteConfig.gateway`),
+becomes a grant/reference model shared by a **site operator** (owns `SiteConfig.gateway` + the ceilings,
+via `Site·Write`) and an **app author** (`project.cfg`/`DeployConfig.gateway`, bounded by the site,
+deny-by-default), under a global-admin posture floor. Invariant: a tier may only DECLARE reach it already
+holds; reaching further requires REFERENCING a grant from the tier that holds it, and references only
+narrow. Off by default (a `project.cfg` with no `gateway` behaves exactly as before).
+
+### Added
+
+- **Project-tier gateway** (`DeployConfig.gateway`): an app author may declare `upstreams` + `routes`.
+  A project upstream may target only its **own compute** (by name), a **public** host, or a **shared**
+  site upstream (by name) — a raw private/loopback/metadata/ULA address is REFUSED at the project tier,
+  **posture-independently** (a relaxed node posture cannot open it), enforced at declare AND on every
+  resolved address at serve (HTTP + websocket-upgrade, no TOCTOU).
+- **Site grants + ceilings**: a site upstream may be `shared` (its NAME enters the project namespace,
+  opaque — the project never sees its target/creds); `GatewaySiteCaps` (max project upstreams, max
+  backends/fan-out, a `project_egress_hosts` glob allowlist); and `reserved_paths` (globs a project route
+  can never shadow — operator-routes-win precedence, enforced structurally at resolution).
+- **Node posture floor** `[security] gateway_egress_allow` (global admin): a project raw-target host must
+  clear BOTH the site allowlist and this node allowlist.
+- **Declarative `gateway apply <file> [--dry-run]` / `gateway export [file]`** (RON/JSON): round-trip a
+  site's whole gateway + ceilings as one `GatewayDoc`. Project gateways ride the existing `project.cfg`
+  apply; the project-tier ceilings are enforced at server-side deployment activation (the
+  reference-opacity-correct point — the app author can't read the site config; the server can).
+
+### Security
+
+- The project egress-host allowlist parses an upstream target with the **authoritative WHATWG `url`
+  parser** (the one `reqwest::Url` uses to dial), not a hand-rolled split — so the allowlist decision and
+  the connection agree by construction (a `\`/`@` authority trick can't make them diverge). Verified by an
+  A2+B+C security review + a mutation gate that proves the reserved-path and egress checks are load-bearing.
+- The reserved-path guard fails **closed** on a malformed glob; `validate_site_gateway` runs at the core
+  config-write chokepoint (so a raw-API or guest `admin:site` write can't persist an invalid gateway).
+
+### Notes
+
+- Site ceilings (`max_project_upstreams`/`max_backends`) are enforced at deployment **activation**; tightening
+  them re-bounds a project on its next activation, not retroactively.
+- A guest granted `admin:site` is the site operator for its project and can write the gateway grants/ceilings
+  (it cannot relax the posture floor or the project-tier private-reach bright line).
+- `gateway export` serializes the operator's own `SiteConfig.gateway`, which may include upstream credential
+  headers — treat exported files as secret-bearing. An IPv6-literal egress-allowlist entry is written
+  bracket-free (e.g. `::1`, not `[::1]`).
+
 ## [0.37.0] - 2026-10-19
 
 Consistent command output across the whole CLI. Every `boatramp` subcommand now produces a *typed
