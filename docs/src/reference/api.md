@@ -51,7 +51,7 @@ counterparts are identical but scoped to `:project`.
 | `POST` | `/api/sites/:site/deployments/:id/activate` | Make a deployment the live one. |
 | `GET` | `/api/sites/:site/current` | The currently active deployment. |
 | `GET`/`PUT` | `/api/sites/:site/config` | Read / replace the [site config](./siteconfig.md). |
-| `GET`/`PUT`/`DELETE` | `/api/sites/:site/aliases/:name` | Manage named aliases. |
+| `PUT`/`DELETE` | `/api/sites/:site/aliases/:name` | Manage named aliases. |
 | `GET` | `/api/sites/:site/aliases` | List aliases. |
 
 ## Blobs
@@ -207,16 +207,16 @@ Top-level (`default`-project) function and workflow endpoints; the
 | Method | Path | Purpose |
 | --- | --- | --- |
 | `GET` | `/api/functions` | List functions. |
-| `GET`/`PUT`/`DELETE` | `/api/functions/:name` | Manage one function (its current version). |
-| `POST` | `/api/functions/:name/versions` | Deploy a new function version. |
+| `PUT`/`DELETE` | `/api/functions/:name` | Manage one function — `PUT` deploys/replaces the current version. |
 | `POST` | `/api/functions/:name/rollback` | Roll back to a prior version. |
-| `PUT`/`DELETE` | `/api/functions/:name/aliases/:label` | Manage a version alias. |
+| `PUT` | `/api/functions/:name/aliases/:label` | Manage a version alias. |
 | `POST` | `/api/functions/:name/invoke` | Invoke synchronously / async / scheduled. |
 | `GET` | `/api/functions/:name/invocations/:id` | Get an async invocation record. |
-| `GET`/`POST`/`DELETE` | `/api/functions/:name/triggers[/:id]` | Manage event triggers (webhook/queue/cron/blob). |
+| `GET`/`PUT`/`DELETE` | `/api/functions/:name/triggers[/:id]` | Manage event triggers (webhook/queue/cron/blob) — create/update via `PUT` on `/:id`. |
 | `GET` | `/api/functions/:name/usage` | Metering / quota counters. |
 | `GET`/`PUT`/`DELETE` | `/api/workflows/:name` | Manage a declarative workflow. |
-| `GET` | `/api/workflows/:name/runs[/:id]` | List / get workflow runs. |
+| `POST` | `/api/workflows/:name/runs` | Start a workflow run. |
+| `GET` | `/api/workflows/:name/runs/:id` | Get one workflow run. |
 
 ## Compute
 
@@ -301,7 +301,7 @@ target the `default` project; `/api/projects/:project/repair/…` scopes to anot
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `POST` | `/api/repair/:db/apply` | Apply the reconcile — converge provisioning against spec. `project` · `admin`. |
+| `POST` | `/api/repair/:db` | Apply the reconcile — converge provisioning against spec. `project` · `admin`. |
 | `POST` | `/api/repair/:db/dry-run` | Drift-detect + report the plan, changing nothing (the default CLI posture). `project` · `admin`. |
 
 ## Managed databases (declarative)

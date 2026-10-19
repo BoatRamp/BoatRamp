@@ -26,7 +26,7 @@ component that exports the session handler:
 ```ron
 routing: (
     sessions: [
-        ( route: "GET /agent",
+        ( route: "/agent",
           component: "agent.wasm",
           // Extra per-frame capabilities the handler uses. The session backchannel
           // itself is intrinsic to the route — you may list `session` for clarity, but
@@ -62,7 +62,7 @@ use boatramp_uchron_compat as compat;
 use compat::session::Session;
 use compat::CompatError;
 
-#[compat::session(route = "GET /agent", requires = ["session"])]
+#[compat::session(route = "/agent", requires = ["session"])]
 fn handle(mut s: Session) -> Result<(), CompatError> {
     // Rehydrate turn count from the resume checkpoint (never a static/in-memory value).
     let mut turns: u32 = s.resumed()

@@ -18,6 +18,7 @@ daemon-config env vars resolve the same for all of them.
 | `--config <path>` | Config file (`project.cfg` for client commands, `boatramp.cfg` for `serve`). |
 | `-h`, `--help` | Print help for the binary or a subcommand. |
 | `-V`, `--version` | Print the version. |
+| `--output-format <human\|json>` | How command results are rendered: `human` (default) or `json`. Global — accepted on any subcommand; env `BOATRAMP_OUTPUT_FORMAT`. |
 
 ## Common client flags
 
@@ -444,7 +445,7 @@ Operator SQL to a managed database. See [Handler bindings](../how-to/handler-bin
 | Sub-action | Description |
 | --- | --- |
 | `exec [--db <name>] [--file <path>]` | Apply a migration **script** (multiple statements — `CREATE EXTENSION`, tables, RLS, chained DDL/DML) to a managed database, from `--file` or stdin. `--db` is the binding name (empty = the site's default database). |
-| `query <sql> [--db <name>] [--format table\|json]` | Run one row-returning query and print the result. |
+| `query <sql> [--db <name>]` | Run one row-returning query and print the result (add the global `--output-format json` for structured rows). |
 | `ping [--db <name>]` | Actively TCP-probe each replica of a managed database — a reachability check that bypasses the stored-health gate `query` trips on (distinguishes "the DB is down" from "up but the resolver won't serve it"). Admin-scoped. |
 
 ## `boatramp token`
@@ -559,7 +560,7 @@ Manage Firecracker microVM compute workloads. See
 | `exec <name> -- <cmd…>` | Run a command inside a running workload replica (docker-exec style) — e.g. pipe a SQL file into `psql`, or run `pg_dump`. `--stdin` feeds this process's stdin to the command. Requires the `allow_compute_exec` posture; container + docker backends only. |
 | `volume ls` | List persistent volumes on the node (`NAME`, `SIZE`, and whether a registered workload still references it). |
 | `volume rm <name>` | Remove a persistent volume. Refused (`409`) while a registered workload's active spec still mounts it, unless `--force`. |
-| `status [<workload>] [--format table\|json]` | Show observed per-replica runtime state — stored health, lifecycle phase, assigned IP:port, age vs startup grace, backend (the record the endpoint resolver reads). Node-global; admin-scoped. |
+| `status [<workload>]` | Show observed per-replica runtime state — stored health, lifecycle phase, assigned IP:port, age vs startup grace, backend (the record the endpoint resolver reads). Node-global; admin-scoped. Add the global `--output-format json` for the structured view. |
 | `set-health <workload> <replica> --healthy <true\|false>` | Force one replica's stored health flag — the escape hatch when a recovered replica is stuck `healthy=false` and the resolver won't serve it. Node-global; admin-scoped. |
 | `reconcile` | Force the reconcile loop to run a convergence pass now (the "kick it" lever for a workload stuck mid-reconcile). Fire-and-forget; follow with `compute status`. Node-global; admin-scoped. |
 | `restart <workload> <replica>` | Stop one replica and let the reconcile loop relaunch a fresh one (re-running IP allocation) — the live workaround for a wedged replica or a stale IP. Node-global; admin-scoped. |
@@ -615,7 +616,7 @@ these read verbs are `Project·Read`. Takes the common `--server` flag.
 | `get <name>` | Show one declared database's declaration. |
 | `status <name>` | Show one declared database's provisioning/health status (declaration + the derived server-workload handle). |
 
-`--json` (a global flag on the group) emits the raw record instead of the human table.
+The global `--output-format json` emits the raw record instead of the human table.
 To declare or change a database, edit the manifest's `databases:` block — see
 [Declare a managed database](../how-to/managed-databases.md),
 [Declare a project with `apply`](../how-to/apply.md), and the
@@ -667,7 +668,8 @@ resolved source/dest identities are echoed and an equal source==dest is refused.
 | `--no-verify` | verify on | Skip the post-copy verify pass. By default, every source object is head-confirmed present in the destination; any miss is a **non-zero exit**. |
 | `--dry-run` | — | Enumerate + classify (would-copy / would-skip) and report; copy nothing. |
 | `--prefix <p>` | all | Restrict the copy to source keys under this prefix. |
-| `--json` | — | Emit the run summary as JSON instead of a human line. |
+
+JSON output: pass the global `--output-format json` flag (see [Global flags](#global-flags)).
 
 A verified `fallback secondary → primary` drain additionally prints
 `SECONDARY FULLY DRAINED — safe to remove [serve].blob_fallback and restart the node.`
@@ -692,7 +694,8 @@ re-run.
 | `--dry-run` | Enumerate + classify on the daemon and report; copy nothing. |
 | `--concurrency <n>` | Bounded copy concurrency on the daemon. |
 | `--prefix <p>` | Restrict the drain to secondary keys under this prefix. |
-| `--json` | Emit the final report as JSON (progress lines stay on stderr). |
+
+JSON output: pass the global `--output-format json` flag; progress lines stay on stderr.
 
 ### `blob purge`
 
@@ -706,7 +709,8 @@ what *would* be reclaimed and deletes nothing) — pass `--apply` to execute. Ga
 | `--drained-source` | The migration **decommission**: after a `drain`/`migrate`, delete each old-secondary object **only once it is byte-confirmed** (present at a matching size) in the primary. **Fail-closed** — an unconfirmed object survives, never deleted. Requires a configured `[serve.blob_fallback]` (else `422`). |
 | `--apply` | Actually delete (default: dry-run — report only). |
 | `--prefix <p>` | Restrict a `--drained-source` purge to source keys under this prefix (ignored by `--unreferenced`). |
-| `--json` | Emit the final report as JSON (progress lines stay on stderr). |
+
+JSON output: pass the global `--output-format json` flag; progress lines stay on stderr.
 
 ### `blob status`
 
@@ -715,9 +719,7 @@ is currently attached (the node is mid-migration) — as `{ "blob_fallback_activ
 The direct answer to "is this node still in transition mode?", instead of grepping the
 startup log warning. Read-only (`System·Read`).
 
-| Flag | Description |
-| --- | --- |
-| `--json` | Emit the posture as JSON instead of a human line. |
+Pass the global `--output-format json` flag for the structured `{ "blob_fallback_active": <bool> }` posture.
 
 ## `boatramp config`
 

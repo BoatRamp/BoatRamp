@@ -20,7 +20,7 @@ endpoint resolver reads to decide "is there a healthy replica to serve?".
 ```sh
 boatramp compute status              # every workload, every tenant
 boatramp compute status pg           # just the `pg` workload
-boatramp compute status --format json
+boatramp compute status --output-format json
 ```
 
 ```

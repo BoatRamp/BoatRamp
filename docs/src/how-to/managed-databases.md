@@ -117,7 +117,7 @@ database `app`
   declared:        yes
 ```
 
-Add `--json` to any of them for the raw structured view. To declare, change, or
+Add the global `--output-format json` to any of them for the raw structured view. To declare, change, or
 tear down a database, edit the manifest and `apply` (or use the imperative
 teardown verb) — not this command.
 

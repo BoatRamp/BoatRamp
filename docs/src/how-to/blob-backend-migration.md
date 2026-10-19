@@ -95,7 +95,7 @@ $ boatramp blob migrate --from ./old.cfg --to ./new.cfg
 Useful flags: `--dry-run` (probe reachability + classify, copy nothing),
 `--concurrency N` (objects in flight, default 8), `--prefix <p>` (restrict to a
 key prefix), `--no-verify` (skip the post-copy verification pass — on by
-default), `--json`. An equal source == destination is refused.
+default). Use the global `--output-format json` for the structured report. An equal source == destination is refused.
 
 ### Option B — daemon-mediated (`boatramp blob drain`, no SSH needed)
 
@@ -115,7 +115,7 @@ The client names **no** source or destination — the daemon drains only its own
 configured pair, which is a tighter authorization surface than the offline CLI's
 arbitrary `--from`/`--to`. It is gated at **`System·Admin`** (a project admin,
 publisher, or deployer cannot reach it). No `[serve.blob_fallback]` configured ⇒
-`422`. `--dry-run` / `--concurrency` / `--prefix` / `--json` pass through. Because
+`422`. `--dry-run` / `--concurrency` / `--prefix` pass through; use the global `--output-format json` for the structured report. Because
 the copy is resumable, a dropped connection on a long drain is safe to re-run
 (re-invoke and it resumes) — this sidesteps an edge idle-timeout.
 
@@ -140,7 +140,7 @@ blob purge: reclaimed 1400 object(s) from the drained secondary (5.0 GiB)
 each key with a pure predicate (deletable iff the primary holds that exact key at
 a matching size). An unconfirmed key **survives** — it is never deleted. Dry-run
 is the default; add `--apply` to actually delete. `--prefix` restricts the sweep;
-`--json` emits the structured report. `System·Admin`; a configured
+the global `--output-format json` emits the structured report. `System·Admin`; a configured
 `[serve.blob_fallback]` is required (else `422`).
 
 ## 4. Finish the switch
@@ -154,7 +154,7 @@ grepping the startup log:
 ```console
 $ boatramp blob status --server https://cp.acme.com
 blob status: a read-fallback secondary is ATTACHED ([serve.blob_fallback]) — the node is mid-migration (TRANSITION mode). Drain it (blob drain / blob purge --drained-source), drop [serve.blob_fallback], and restart to finish.
-$ boatramp blob status --json --server https://cp.acme.com
+$ boatramp blob status --output-format json --server https://cp.acme.com
 { "blob_fallback_active": true }
 ```
 

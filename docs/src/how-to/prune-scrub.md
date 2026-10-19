@@ -96,7 +96,7 @@ blob purge: reclaimed 87 unreferenced blob(s) (214 MiB)
 
 - Gated at **`System·Admin`** (the node operator) — a project admin, publisher,
   or deployer cannot reach it.
-- `--json` emits the structured report.
+- the global `--output-format json` emits the structured report.
 - **Refused with a `409`** while a read-fallback secondary is attached
   (`[serve.blob_fallback]`): a union `list` over a primary-only `delete` would
   otherwise reclaim a secondary-only object that a read could resurrect. **Drain
