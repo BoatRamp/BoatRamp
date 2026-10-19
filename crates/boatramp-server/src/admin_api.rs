@@ -862,7 +862,10 @@ async fn check_op_in_site_subset(
                 crate::graphql_root_fields::RootType::Mutation => {
                     sg.root_mutation.contains_key(&field)
                 }
-                crate::graphql_root_fields::RootType::Subscription => false,
+                // Federated subscriptions aren't subset-tracked (the composed supergraph carries
+                // only Query/Mutation roots); don't over-restrict apply by rejecting a safelisted
+                // subscription op here (sec-review LOW-3). Skip it rather than mark it absent.
+                crate::graphql_root_fields::RootType::Subscription => continue,
             };
             if !present {
                 missing.push(format!("{}.{}", root_ty.type_name(), field));

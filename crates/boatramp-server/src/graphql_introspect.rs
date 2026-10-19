@@ -136,11 +136,23 @@ struct DirectiveDef {
 
 // ---- Composition: subgraph SDLs → the merged public type system --------------------------------
 
-/// Whether `name` is a federation-internal type that must never surface in the public schema:
-/// the `_`-prefixed federation types (`_Service`, `_Entity`, `_Any`, `_FieldSet`) and the
-/// `@link`/`federation` namespaced imports (`link__Purpose`, `federation__*`).
+/// Whether `name` is a federation-internal type that must never surface in the public schema: the
+/// four federation-defined `_`-prefixed types, the GraphQL-reserved `__` prefix, and the `@link` /
+/// federation namespaced imports.
+///
+/// NOTE: this matches the EXACT `_`-prefixed federation set — NOT every single-underscore name. A
+/// user type `_Foo` is legal GraphQL (only the `__` double-underscore prefix is reserved); stripping
+/// every `_` would drop a legitimate user type from `__schema` while the planner still serves it,
+/// leaving a dangling reference a client's `buildClientSchema` can't resolve (sec-review LOW-1).
 fn is_federation_type(name: &str) -> bool {
-    name.starts_with('_') || name.starts_with("link__") || name.starts_with("federation__")
+    matches!(name, "_Service" | "_Entity" | "_Any" | "_FieldSet")
+        || name.starts_with("__")
+        || name.starts_with("link__")
+        || name.starts_with("federation__")
+        || name.starts_with("join__")
+        || name.starts_with("policy__")
+        || name.starts_with("inaccessible__")
+        || name.starts_with("tag__")
 }
 
 /// Whether a root `Query` field is federation plumbing (`_service`, `_entities`) rather than a
@@ -707,6 +719,9 @@ fn resolve_type_field(
             | Some(TypeDef::Interface { interfaces, .. }) => serde_json::Value::Array(
                 interfaces
                     .iter()
+                    // Defense-in-depth (sec-review LOW-2): only surface a name the subset actually
+                    // defines, so a stray/dangling reference can never appear in introspection.
+                    .filter(|i| schema.types.contains_key(*i))
                     .map(|i| {
                         resolve_object(
                             &INode::Type(TypeRef::Named(i.clone())),
@@ -723,6 +738,9 @@ fn resolve_type_field(
             Some(TypeDef::Union { possible_types, .. }) => serde_json::Value::Array(
                 possible_types
                     .iter()
+                    // Defense-in-depth (sec-review LOW-2): a union member not defined in the subset
+                    // is omitted rather than rendered as a bare dangling `SCALAR` stub.
+                    .filter(|p| schema.types.contains_key(*p))
                     .map(|p| {
                         resolve_object(
                             &INode::Type(TypeRef::Named(p.clone())),
@@ -1069,5 +1087,30 @@ mod tests {
             !is_pure_introspection(&doc2),
             "mixed query falls through to the planner"
         );
+    }
+
+    // sec-review LOW-1: only the exact federation `_`-prefixed types are stripped — a legal
+    // single-underscore USER type must survive (else introspection dangles a reference the planner
+    // still serves).
+    #[test]
+    fn single_underscore_user_type_survives_but_federation_types_are_stripped() {
+        const S: &str = r#"
+            type Query { foo: _Foo }
+            type _Foo { id: ID! }
+            type _Service { sdl: String }
+        "#;
+        let st = compose_schema_types(&subgraphs(&[("s", S)]));
+        assert!(
+            st.types.contains_key("_Foo"),
+            "a legal `_Foo` user type is kept"
+        );
+        assert!(
+            !st.types.contains_key("_Service"),
+            "the federation `_Service` type is stripped"
+        );
+        // `Query.foo` (returning `_Foo`) is present and its type resolves — no dangling reference.
+        let v = run(r#"{ __type(name: "_Foo") { kind name } }"#, &st);
+        assert_eq!(v["data"]["__type"]["name"], "_Foo");
+        assert_eq!(v["data"]["__type"]["kind"], "OBJECT");
     }
 }
