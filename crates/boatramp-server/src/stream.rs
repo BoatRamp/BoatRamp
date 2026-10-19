@@ -181,12 +181,156 @@ pub(super) async fn authorize_stream_topics(
             }
             Ok(resolve_topic_templates(&stream.topics, &params))
         }
-        StreamAuthz::GuestMediated { .. } => Err((
-            StatusCode::NOT_IMPLEMENTED,
-            "guest-mediated stream authz is not yet wired\n",
-        )
-            .into_response()),
+        StreamAuthz::GuestMediated {
+            token_claims,
+            handler,
+        } => {
+            // When `token_claims` is set the host verifies the principal first (401 on failure) and
+            // forwards the verified claims to the guest; otherwise the guest authorizes from the raw
+            // request alone.
+            let principal = match token_claims {
+                Some(tc) => {
+                    let Some(bearer) = bearer else {
+                        return Err(
+                            (StatusCode::UNAUTHORIZED, "stream requires a bearer token\n")
+                                .into_response(),
+                        );
+                    };
+                    Some(verify_stream_bearer(inner, tc, bearer).await?)
+                }
+                None => None,
+            };
+            guest_authorize_topics(
+                inner,
+                project,
+                handler,
+                request_path,
+                bearer,
+                principal.as_ref(),
+                &stream.topics,
+            )
+            .await
+        }
     }
+}
+
+/// (B) Invoke the guest authorizer `handler` (a deployed function) with the connection's request
+/// (GET + path + bearer, plus the host-verified principal as `x-boatramp-stream-principal` when
+/// `token_claims` resolved one), and return the per-subscriber topic set it grants — CONFINED to the
+/// declared `topics` templates (the ceiling), so a compromised guest can only select declared scopes,
+/// never invent a new topic namespace. A non-2xx from the guest, or an invalid topic body, denies.
+#[cfg(feature = "handlers")]
+async fn guest_authorize_topics(
+    inner: &Arc<HandlerRuntimeInner>,
+    project: &str,
+    handler: &str,
+    request_path: &str,
+    bearer: Option<&str>,
+    principal: Option<&serde_json::Map<String, serde_json::Value>>,
+    templates: &[String],
+) -> Result<Vec<String>, Response> {
+    let Some(invoker) = inner.invoker.get() else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "guest-mediated stream authz requires the invoke runtime\n",
+        )
+            .into_response());
+    };
+    let scoped = invoker.scoped(
+        boatramp_core::project::ProjectRef::new(project),
+        Vec::new(),
+        None,
+    );
+    let mut headers: Vec<(String, Vec<u8>)> = Vec::new();
+    if let Some(b) = bearer {
+        headers.push((
+            "authorization".to_string(),
+            format!("Bearer {b}").into_bytes(),
+        ));
+    }
+    if let Some(p) = principal
+        && let Ok(json) = serde_json::to_vec(p)
+    {
+        headers.push(("x-boatramp-stream-principal".to_string(), json));
+    }
+    let request = boatramp_handlers::InvokeRequest {
+        method: "GET".to_string(),
+        path: request_path.to_string(),
+        headers,
+        body: Vec::new(),
+    };
+    let deny = || -> Response {
+        (
+            StatusCode::FORBIDDEN,
+            "not authorized for this stream scope\n",
+        )
+            .into_response()
+    };
+    let resp = match scoped.invoke(handler, request, 0).await {
+        Ok(resp) => resp,
+        Err(boatramp_handlers::InvokeError::NotFound) => {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "guest-mediated stream authz handler is not deployed\n",
+            )
+                .into_response());
+        }
+        Err(_) => return Err(deny()),
+    };
+    // Any non-2xx is a refusal (no oracle: same 403 as a non-member).
+    if !(200..300).contains(&resp.status) {
+        return Err(deny());
+    }
+    let Some(returned) = parse_guest_topics(&resp.body) else {
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            "guest stream authorizer returned an invalid topic set\n",
+        )
+            .into_response());
+    };
+    // Confine to the declared templates (the ceiling). A topic the operator never declared is dropped
+    // (never a new namespace), so the resolved set is ⊆ what `topics` permits.
+    Ok(returned
+        .into_iter()
+        .filter(|t| templates.iter().any(|tmpl| topic_matches_template(tmpl, t)))
+        .collect())
+}
+
+/// Parse a guest authorizer's topic set: a bare JSON array `["a","b"]` or `{"topics":["a","b"]}`.
+/// Any non-string element, or another shape, is rejected (fail-closed).
+#[cfg(feature = "handlers")]
+fn parse_guest_topics(body: &[u8]) -> Option<Vec<String>> {
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let array = match value {
+        serde_json::Value::Array(a) => a,
+        serde_json::Value::Object(mut o) => match o.remove("topics") {
+            Some(serde_json::Value::Array(a)) => a,
+            _ => return None,
+        },
+        _ => return None,
+    };
+    array
+        .into_iter()
+        .map(|v| v.as_str().map(str::to_string))
+        .collect()
+}
+
+/// Whether `topic` matches a `{name}`-templated `template`, segment-wise: equal segment count, each
+/// template segment either a whole-segment `{name}` placeholder (matches one non-empty segment) or a
+/// literal that must match exactly. Used to confine a guest authorizer's returned topics to the
+/// declared `topics` ceiling.
+#[cfg(feature = "handlers")]
+fn topic_matches_template(template: &str, topic: &str) -> bool {
+    let t: Vec<&str> = template.split('/').collect();
+    let s: Vec<&str> = topic.split('/').collect();
+    t.len() == s.len()
+        && t.iter().zip(&s).all(|(tp, sg)| {
+            if tp.starts_with('{') && tp.ends_with('}') && tp.len() > 2 {
+                !sg.is_empty()
+            } else {
+                tp == sg
+            }
+        })
 }
 
 /// Verify the connection's bearer against the stream's `token_claims` and return its claims, or an
@@ -670,6 +814,48 @@ mod tests {
             resolve_topic_templates(&topics, &params),
             vec!["shared/abc/events".to_string(), "sys/{unknown}".to_string(),]
         );
+    }
+
+    use super::{parse_guest_topics, topic_matches_template};
+
+    #[test]
+    fn guest_topics_parse_array_and_object_reject_otherwise() {
+        assert_eq!(
+            parse_guest_topics(br#"["a","b"]"#).unwrap(),
+            vec!["a".to_string(), "b".to_string()]
+        );
+        assert_eq!(
+            parse_guest_topics(br#"{"topics":["x"]}"#).unwrap(),
+            vec!["x".to_string()]
+        );
+        assert!(
+            parse_guest_topics(br#"[1,2]"#).is_none(),
+            "non-string elements rejected"
+        );
+        assert!(parse_guest_topics(br#"{"other":[]}"#).is_none());
+        assert!(parse_guest_topics(b"not json").is_none());
+    }
+
+    #[test]
+    fn guest_topics_confine_to_declared_templates() {
+        assert!(topic_matches_template(
+            "shared/{mailbox}/events",
+            "shared/abc/events"
+        ));
+        assert!(
+            !topic_matches_template("shared/{mailbox}/events", "shared/abc/presence"),
+            "a literal tail segment must match"
+        );
+        assert!(
+            !topic_matches_template("shared/{mailbox}/events", "shared//events"),
+            "an empty captured segment is rejected"
+        );
+        assert!(
+            !topic_matches_template("shared/{mailbox}", "shared/a/b"),
+            "segment count must match (no namespace invention)"
+        );
+        assert!(topic_matches_template("fixed/topic", "fixed/topic"));
+        assert!(!topic_matches_template("fixed/topic", "fixed/other"));
     }
 }
 
