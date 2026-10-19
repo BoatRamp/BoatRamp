@@ -230,12 +230,72 @@ impl DeployConfig {
             }
         }
         for stream in &self.streams {
-            Pattern::compile(&stream.route)?;
+            let pattern = Pattern::compile(&stream.route)?;
             if stream.topics.is_empty() {
                 return Err(ConfigError::parse(format!(
                     "stream {} subscribes to no topics",
                     stream.route
                 )));
+            }
+            if let Some(authz) = &stream.authz {
+                let params: std::collections::BTreeSet<&str> =
+                    pattern.param_names().iter().map(String::as_str).collect();
+                match authz {
+                    StreamAuthz::Scoped {
+                        token_claims,
+                        membership,
+                    } => {
+                        token_claims.validate()?;
+                        if membership.is_empty() {
+                            return Err(ConfigError::parse(format!(
+                                "stream {} authz is `scoped` but declares no membership check — \
+                                 deny-by-default, so add at least one (claim or sql)",
+                                stream.route
+                            )));
+                        }
+                        for m in membership {
+                            match m {
+                                StreamMembership::Claim { param, claim } => {
+                                    if !params.contains(param.as_str()) {
+                                        return Err(ConfigError::parse(format!(
+                                            "stream {} claim-membership references route param \
+                                             `:{param}` the route does not declare",
+                                            stream.route
+                                        )));
+                                    }
+                                    if claim.trim().is_empty() {
+                                        return Err(ConfigError::parse(format!(
+                                            "stream {} claim-membership has an empty claim name",
+                                            stream.route
+                                        )));
+                                    }
+                                }
+                                StreamMembership::Sql { query, .. } => {
+                                    if query.trim().is_empty() {
+                                        return Err(ConfigError::parse(format!(
+                                            "stream {} sql-membership has an empty query",
+                                            stream.route
+                                        )));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    StreamAuthz::GuestMediated {
+                        token_claims,
+                        handler,
+                    } => {
+                        if let Some(tc) = token_claims {
+                            tc.validate()?;
+                        }
+                        if handler.trim().is_empty() {
+                            return Err(ConfigError::parse(format!(
+                                "stream {} authz is `guest_mediated` but the handler route is empty",
+                                stream.route
+                            )));
+                        }
+                    }
+                }
             }
         }
         for session in &self.sessions {
@@ -1014,6 +1074,81 @@ pub struct StreamConfig {
     /// sends are dropped).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub publish_topic: Option<String>,
+    /// **Per-connection authorization (#11).** Absent ⇒ the stream is an unauthenticated broadcast of
+    /// its (static) `topics` to every connection — today's behavior, backward-compatible. Present ⇒
+    /// every connection is authorized BEFORE it attaches, and it receives ONLY the topics it is
+    /// authorized for (a non-member is refused `403`; a cross-scope event is never delivered). This is
+    /// the streaming analog of the platform's per-request tenancy scoping + session authz.
+    ///
+    /// When authz is set, `route` captures a per-connection scope with the matcher's `:name` syntax
+    /// (e.g. `route: "/events/shared/:mailbox"`), and `topics` reference it with the messaging
+    /// `{name}` template syntax (e.g. `topics: ["shared/{mailbox}/events"]`): the captured segment is
+    /// substituted into the subscribed topic(s) per connection, so each connection binds to its own
+    /// scope. `topics` always bounds the surface — even a `guest_mediated` authz can only return
+    /// topics that match a declared template (a compromised guest can't invent a new topic namespace).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authz: Option<StreamAuthz>,
+}
+
+/// Per-connection authorization strategy for a host [`StreamConfig`] (#11).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum StreamAuthz {
+    /// **(A) HOST-resolved scope + authorization.** The host verifies the connection's bearer via
+    /// `token_claims` (the same primitive handlers / sessions / the data connector use), resolves the
+    /// route's dynamic path param(s), and evaluates every [`membership`](Self::Scoped::membership)
+    /// check against the verified principal + resolved param(s). The connection attaches only if ALL
+    /// checks pass (fail-closed AND); otherwise `403`. The host then subscribes ONLY the resolved,
+    /// authorized topic(s) — never the whole `topics` set unscoped.
+    Scoped {
+        /// Verify + bind the connection's principal (bearer token). Its claims are available to the
+        /// membership checks (e.g. a `sub` bound into a SQL predicate).
+        token_claims: HandlerGraphqlTokenClaims,
+        /// The membership checks — **at least one** required (deny-by-default). Both methods may be
+        /// combined, in which case every one must pass.
+        membership: Vec<StreamMembership>,
+    },
+    /// **(B) GUEST-mediated.** The host verifies the principal (when `token_claims` is set), then
+    /// invokes the guest `handler` with the principal + the requested path; the guest returns the
+    /// per-subscriber topic set (or refuses → `403`). The host confines each returned topic to this
+    /// site's scope AND to a declared `topics` template (the ceiling) before subscribing — so the
+    /// guest decides *which* authorized scopes, never a new namespace. Use this when membership can't
+    /// reduce to a claim or a SQL predicate (arbitrary app logic).
+    GuestMediated {
+        /// Optional principal binding passed to the guest authorizer. `None` ⇒ the guest authorizes
+        /// from the raw request alone.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token_claims: Option<HandlerGraphqlTokenClaims>,
+        /// The guest handler route that authorizes the connection and returns its topic set.
+        handler: String,
+    },
+}
+
+/// One membership check for a [`StreamAuthz::Scoped`] stream (#11). Both methods ship; a stream may
+/// use either or both.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum StreamMembership {
+    /// **(A-i) Claim-based.** A verified-token claim enumerates the scope values the principal may
+    /// join; the resolved route param `param` must appear in claim `claim` (a string array, or a
+    /// single / comma-separated string). No database round-trip.
+    Claim {
+        /// The route path param whose resolved value must be authorized (e.g. `mailbox`).
+        param: String,
+        /// The verified-token claim holding the allowed values for that param.
+        claim: String,
+    },
+    /// **(A-ii) SQL-predicate.** Membership holds iff a parameterized query against the site's managed
+    /// database returns at least one row. `$name` placeholders bind the verified claim `name` OR the
+    /// resolved route param `name` as query PARAMETERS — never string-interpolated (no injection).
+    /// Example: `SELECT 1 FROM mailbox_members WHERE mailbox = $mailbox AND subject = $sub`.
+    Sql {
+        /// The managed database to query (the site's default database if empty).
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        source: String,
+        /// The membership predicate (returns ≥1 row ⇒ member).
+        query: String,
+    },
 }
 
 /// A **duplex, resumable session** route (`PLAN-session-primitive`): a long-lived,
@@ -2693,5 +2828,112 @@ mod tests {
         let reparsed: HandlerGraphqlTokenClaims =
             serde_json::from_str(&serde_json::to_string(&with).unwrap()).unwrap();
         assert_eq!(reparsed.system_when, with.system_when);
+    }
+
+    // #11 — per-connection stream authz config surface.
+    #[test]
+    fn stream_authz_round_trips_scoped_and_guest_mediated() {
+        let scoped: StreamConfig = serde_json::from_str(
+            r#"{"route":"/events/shared/:mailbox","topics":["shared/{mailbox}/events"],
+                "authz":{"scoped":{
+                    "token_claims":{"issuer":"https://idp.example","jwks_env":"IDP_JWKS"},
+                    "membership":[
+                        {"claim":{"param":"mailbox","claim":"mailboxes"}},
+                        {"sql":{"query":"SELECT 1 FROM mailbox_members WHERE mailbox=$mailbox AND subject=$sub"}}
+                    ]}}}"#,
+        )
+        .unwrap();
+        assert!(matches!(scoped.authz, Some(StreamAuthz::Scoped { .. })));
+        let reparsed: StreamConfig =
+            serde_json::from_str(&serde_json::to_string(&scoped).unwrap()).unwrap();
+        assert_eq!(reparsed, scoped, "scoped authz round-trips");
+
+        let guest: StreamConfig = serde_json::from_str(
+            r#"{"route":"/events/shared/:mailbox","topics":["shared/{mailbox}/events"],
+                "authz":{"guest_mediated":{"handler":"/authz/stream"}}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            guest.authz,
+            Some(StreamAuthz::GuestMediated { .. })
+        ));
+
+        // Absent authz ⇒ None (backward-compatible broadcast).
+        let plain: StreamConfig =
+            serde_json::from_str(r#"{"route":"/events","topics":["orders/created"]}"#).unwrap();
+        assert!(plain.authz.is_none());
+    }
+
+    #[test]
+    fn stream_authz_validation_is_fail_closed() {
+        let mk = |s: StreamConfig| {
+            DeployConfig {
+                streams: vec![s],
+                ..Default::default()
+            }
+            .compile_check()
+        };
+        let claims = || {
+            serde_json::from_str::<HandlerGraphqlTokenClaims>(
+                r#"{"issuer":"https://idp.example","jwks_env":"IDP_JWKS"}"#,
+            )
+            .unwrap()
+        };
+        let stream = |authz| StreamConfig {
+            route: "/events/shared/:mailbox".into(),
+            topics: vec!["shared/{mailbox}/events".into()],
+            websocket: false,
+            publish_topic: None,
+            authz: Some(authz),
+        };
+
+        // Valid: scoped with claim + sql membership, param declared in the route.
+        mk(stream(StreamAuthz::Scoped {
+            token_claims: claims(),
+            membership: vec![
+                StreamMembership::Claim {
+                    param: "mailbox".into(),
+                    claim: "mailboxes".into(),
+                },
+                StreamMembership::Sql {
+                    source: String::new(),
+                    query: "SELECT 1".into(),
+                },
+            ],
+        }))
+        .expect("valid scoped authz");
+
+        // Scoped with NO membership ⇒ deny-by-default refusal.
+        assert!(
+            mk(stream(StreamAuthz::Scoped {
+                token_claims: claims(),
+                membership: vec![],
+            }))
+            .is_err(),
+            "empty membership rejected"
+        );
+
+        // Claim references a param the route does not declare.
+        assert!(
+            mk(stream(StreamAuthz::Scoped {
+                token_claims: claims(),
+                membership: vec![StreamMembership::Claim {
+                    param: "room".into(),
+                    claim: "rooms".into(),
+                }],
+            }))
+            .is_err(),
+            "claim param not in route rejected"
+        );
+
+        // GuestMediated with an empty handler.
+        assert!(
+            mk(stream(StreamAuthz::GuestMediated {
+                token_claims: None,
+                handler: String::new(),
+            }))
+            .is_err(),
+            "empty guest handler rejected"
+        );
     }
 }

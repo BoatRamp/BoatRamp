@@ -1184,6 +1184,7 @@ mod tests {
                 topics: vec!["ticks".into()],
                 websocket: false,
                 publish_topic: None,
+                authz: None,
             }],
             ..Default::default()
         };

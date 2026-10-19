@@ -173,6 +173,12 @@ impl Pattern {
         let splat = caps.name("splat").map(|m| m.as_str().to_string());
         Some(Match { params, splat })
     }
+
+    /// The `:name` params this pattern declares (the single source of truth for a route's
+    /// capture names — callers validate against these rather than re-parsing the route string).
+    pub fn param_names(&self) -> &[String] {
+        &self.names
+    }
 }
 
 impl Match {
