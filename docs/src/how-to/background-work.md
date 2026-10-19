@@ -173,7 +173,7 @@ routing: (
     streams: [
         // Browsers GET /live/inbox as an EventSource; every message published to either
         // bus topic is delivered to all connected subscribers.
-        ( route: "GET /live/inbox",
+        ( route: "/live/inbox",
           topics: ["bus:inbox.presence", "bus:inbox.assignment"] ),
     ],
 ),
@@ -207,9 +207,62 @@ instead of SSE (full-duplex), and give it a `publish_topic` so messages the clie
 published onto that topic for a consumer to process:
 
 ```ron
-( route: "GET /live/chat", topics: ["bus:chat.out"],
+( route: "/live/chat", topics: ["bus:chat.out"],
   websocket: true, publish_topic: "bus:chat.in" ),
 ```
+
+### Per-subscriber scoped streams (`authz`)
+
+By default a `stream` broadcasts its fixed `topics` to **every** connection. For a multi-scope feed —
+shared inboxes, per-room chat, per-user notifications — where a subscriber must receive events only
+for the scopes it belongs to, add an `authz` block. The connection is then **authorized before it
+attaches** and subscribes **only** the topics it is authorized for: a non-member is refused `403`, an
+anonymous connection `401`, and a cross-scope event (published to a topic the connection never
+subscribes) is structurally undeliverable. It is the streaming analog of the platform's per-request
+tenancy scoping. Absent `authz` ⇒ the broadcast behavior above, unchanged.
+
+Capture the per-connection scope in the `route` with the matcher's `:name` syntax, and reference it
+in `topics` with the `{name}` template:
+
+```ron
+// A shared-inbox feed scoped per mailbox the subscriber belongs to.
+( route: "/events/shared/:mailbox",
+  topics: ["shared/{mailbox}/presence", "shared/{mailbox}/assignment"],
+  authz: scoped(
+      // Verify the subscriber's bearer (the same app-IdP token verification handlers + the data
+      // connector use); its claims feed the membership checks.
+      token_claims: ( issuer: "https://idp.example", jwks_env: "IDP_JWKS" ),
+      // Deny-by-default: EVERY check must pass. Use either method, or both.
+      membership: [
+          // (A-i) the verified token enumerates the mailboxes the subscriber may join
+          claim( param: "mailbox", claim: "mailboxes" ),
+          // (A-ii) OR a parameterized predicate against the site's managed DB (member iff ≥1 row);
+          // `$name` binds the route param or a verified claim — never string-interpolated.
+          sql( query: "SELECT 1 FROM mailbox_members WHERE mailbox = $mailbox AND subject = $sub" ),
+      ],
+  ) ),
+```
+
+- **Claim membership** suits scopes small enough to enumerate in the token; **SQL membership** suits a
+  membership table in the site's managed database. The resolved topic is *exactly* the subscriber's
+  scope (`shared/<mailbox>/presence`), so a publisher to another mailbox's topic can never reach this
+  connection — the isolation is the topic subscription itself, not a post-hoc filter.
+
+When membership can't reduce to a claim or a SQL predicate, hand the decision to a guest:
+
+```ron
+( route: "/events/shared/:mailbox", topics: ["shared/{mailbox}/events"],
+  authz: guest_mediated( handler: "stream-authorizer" ) ),
+```
+
+The host invokes the `stream-authorizer` function with the connection's request (and, when
+`token_claims` is set, the host-verified principal as the `x-boatramp-stream-principal` header); the
+function returns the topic set to grant (`["shared/abc/events"]` or `{"topics": […]}`) or a non-2xx to
+refuse. The returned topics are **confined to the declared `topics` templates** — a guest chooses
+*which* declared scopes, never a new topic namespace.
+
+> Scoped-stream bearer verification needs the `oidc` feature (like the data connector's token
+> claims); without it a scoped stream fails closed.
 
 ### Which push primitive?
 
