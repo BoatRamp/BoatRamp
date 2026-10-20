@@ -134,7 +134,7 @@ fn posture_label(client_auth: &str) -> AttrValue {
 /// at the overlay role rather than leaving a bare "forbidden".
 fn forbidden_note() -> Html {
     html! {
-        <div class="rounded-lg border border-amber-200 bg-amber-50 px-4 py-3">
+        <div role="status" aria-live="polite" class="rounded-lg border border-amber-200 bg-amber-50 px-4 py-3">
             <p class="text-sm font-medium text-amber-800">
                 { "You need an overlay role to view the directory." }
             </p>
@@ -155,7 +155,7 @@ fn empty_note() -> Html {
     html! {
         <div class="rounded-lg border border-dashed border-slate-300 bg-white p-10 text-center">
             <p class="text-slate-500">{ "No services are published to the overlay directory." }</p>
-            <p class="mt-1 text-sm text-slate-400">
+            <p class="mt-1 text-sm text-slate-500">
                 { "A node advertises forward-able services under its " }
                 <code class="rounded bg-slate-100 px-1.5 py-0.5 text-sm">{ "[overlay]" }</code>
                 { " config." }
