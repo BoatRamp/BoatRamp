@@ -171,6 +171,43 @@ See [Migrate the blob backend](../how-to/blob-backend-migration.md).
 See [Deploy a self-hosted cluster](../how-to/deploy-cluster.md) and
 [Run on Kubernetes](../how-to/kubernetes.md).
 
+## Overlay
+
+The overlay forward-flow **discovery** surface — what backs self-serve
+[`boatramp forward svc/<name>`](./cli.md#boatramp-forward). An explicit right (not
+the deny-safe `System·Admin` default) so an operator role can self-serve without
+full node-admin. Present with the `overlay` feature.
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `POST` | `/api/overlay/dial` | Resolve a service to its relay/egress topology and mint a holder-bound dial capability for it (signed by the node's root issuer, still scope-verified at the egress). `Overlay·Write`. |
+| `GET` | `/api/overlay/services` | List the overlay service directory — the services you can `forward` to. `Overlay·Read`. |
+
+The dial request names the service and the caller's overlay identity (an
+`ed25519:<hex>` holder key); `ttl_secs` is optional and clamped to the node's
+`[overlay].max_dial_ttl_secs`:
+
+```json
+{ "service": "svc/db", "holder_pubkey": "ed25519:<hex>", "ttl_secs": 3600 }
+```
+
+The response is the resolved topology plus the minted capability:
+
+```json
+{
+  "relay": "10.0.0.1:9100",
+  "relay_id": "ed25519:<relay-key>",
+  "egress_id": "ed25519:<egress-key>",
+  "relay_client_auth": "capability-only",
+  "token": "<minted dial capability>",
+  "expires_at": 1760000000
+}
+```
+
+A node with no root private key cannot mint and returns `501`; an unknown service
+is `404`; a non-`ed25519` `holder_pubkey` is `400`. See the
+[`[overlay]`](./boatramp-cfg.md#overlay) serve roles.
+
 ## Root anchors
 
 Make-before-break root-key rotation (`auth rotate-root`). Admin-scoped.

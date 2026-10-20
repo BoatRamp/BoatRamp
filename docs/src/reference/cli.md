@@ -45,6 +45,7 @@ flags unique to each command:
 | [`bundle`](#boatramp-bundle) | Bundle JS/TS + CSS in-process (`bundler` feature). |
 | [`compose`](#boatramp-compose) | Fuse several Wasm components into one linked handler. |
 | [`validate`](#boatramp-validate) | Parse and check a `project.cfg` (its `routing` section). |
+| [`capabilities`](#boatramp-capabilities) | Print the capability surface this host implements, or check a component's `requires` against this build. |
 | [`deployments`](#boatramp-deployments) | List a site's deployment history. |
 | [`rollback`](#boatramp-rollback) | Roll back to the previous (or a specific) deployment. |
 | [`status`](#boatramp-status) | Show a site's current deployment. |
@@ -52,7 +53,10 @@ flags unique to each command:
 | [`alias`](#boatramp-alias) | Manage named pointers to deployments. |
 | [`access`](#boatramp-access) | Configure visitor access control. |
 | [`handlers`](#boatramp-handlers) | Manage a site's handler policy (enable/disable, import allowlist, caps, edge cache, cookie auth). |
+| [`compression`](#boatramp-compression) | Configure on-the-fly response compression for a site (`compression` feature). |
+| [`security-headers`](#boatramp-security-headers) | Configure a site's response security headers (HTTPS redirect, HSTS, CSP, X-Frame-Options). |
 | [`function`](#boatramp-function) | Manage top-level functions (deploy, invoke, triggers, local dev). |
+| [`workflow`](#boatramp-workflow) | Define + run declarative function-orchestration workflows. |
 | [`graphql`](#boatramp-graphql) | Manage a project's GraphQL admin (persisted-op safelist + federation subgraphs). |
 | [`tenancy`](#boatramp-tenancy) | Manage a project's tenancy schema (the per-table tenant-key map). |
 | [`secrets`](#boatramp-secrets) | Manage a project's internal sealed secret store. |
@@ -67,15 +71,18 @@ flags unique to each command:
 | [`compute`](#boatramp-compute) | Manage microVM compute workloads. |
 | [`db`](#boatramp-db) | Inspect the project's declarative managed databases (read-only). |
 | [`blob`](#boatramp-blob) | Upload artifacts, and migrate/drain/purge the node blob backend. |
+| [`kv`](#boatramp-kv) | Maintain the control-plane SlateDB store — WAL/manifest recovery, checkpoint, compact, portable dump (`slatedb` feature). |
 | [`config`](#boatramp-config) | Read/change the dynamic daemon config (no restart); migrate an `apply` manifest. |
 | [`mcp`](#boatramp-mcp) | Run the Model Context Protocol server (drive boatramp from an AI agent). |
 | [`dns`](#boatramp-dns) | Configure DNS and issue wildcard preview certs (`acme-dns` feature). |
 | [`logs`](#boatramp-logs) | Tail a site's captured guest stdout/stderr. |
 | [`stats`](#boatramp-stats) | Show handler stats, consumer lag, and dead letters. |
 | [`dlq`](#boatramp-dlq) | Purge or redrive a consumer topic's dead-letter queue. |
+| [`queue`](#boatramp-queue) | Inspect a consumer topic's live work-queue (peek/replay/groups) and manage its delivery. |
 | [`prune`](#boatramp-prune) | Delete orphan deployments and unreferenced blobs. |
 | [`scrub`](#boatramp-scrub) | Verify every stored blob still hashes to its key. |
 | [`cert-status`](#boatramp-cert-status) | Show cluster-managed certificate status. |
+| [`version`](#boatramp-version) | Report the boatramp version — this binary's, or a running daemon's. |
 | [`completions <shell>`](#boatramp-completions-man) | Print a shell-completion script. |
 | [`man`](#boatramp-completions-man) | Render the man page to stdout. |
 | [`cloudflare`](#boatramp-cloudflare) | Deploy to Cloudflare Containers natively over the REST API (`cluster` feature). |
@@ -283,6 +290,21 @@ Parse and check a `project.cfg` (its `routing` section). Argument: `[PATH]` —
 the config to validate (default `project.cfg`). See the
 [routing schema](./routing.md).
 
+## `boatramp capabilities`
+
+Print the capability surface this host implements — the `boatramp:handlers`
+package version, the imports a deploy may declare, and the capability features a
+guest may `require` in its manifest (each with its stability). Same data as
+`GET /api/capabilities`. The global `--output-format json` emits the raw surface
+object. With no flag it is a plain report; `--check <component.wasm>` is the
+shift-left CI gate — it scans a component's manifest `requires` and exits
+non-zero if this build is missing any required capability (needs the `handlers`
+feature).
+
+| Flag | Description |
+| --- | --- |
+| `--check <component.wasm>` | Scan a component's `requires` against this build and exit non-zero on a gap (CI gating), instead of printing the surface. |
+
 ## `boatramp deployments`
 
 List a site's deployment history.
@@ -363,6 +385,34 @@ caps, the edge response cache, and browser cookie auth. See
 | `cache enable [--max-entry-bytes <n>] [--max-ttl-secs <n>]` / `cache disable` | Configure the edge response cache for handler routes. |
 | `cookie-auth set --cookie-name <c> [--allowed-origin <o>…]` / `cookie-auth clear` | Treat the named cookie as the application bearer (with an optional cross-origin CSRF allowlist), or turn cookie session auth off. |
 
+## `boatramp compression`
+
+Turn on-the-fly response compression on or off for a site (edits the site's
+`compression` policy over the control-plane API). Needs the `compression`
+feature. Takes the common `--server` / `--site` flags.
+
+| Sub-action | Description |
+| --- | --- |
+| `show` | Show the site's current compression policy (enabled + min-size). |
+| `on [--min-size <bytes>]` | Enable compression; `--min-size` only compresses responses at least this many bytes. |
+| `off` | Disable response compression. |
+
+## `boatramp security-headers`
+
+Configure a site's response **security headers** — the HTTP→HTTPS redirect,
+HSTS, Content-Security-Policy, and X-Frame-Options (edits the site's `security`
+policy over the control-plane API). This is the **site**'s edge headers,
+distinct from [`boatramp security`](#boatramp-security) (the operator posture).
+Takes the common `--server` / `--site` flags.
+
+| Sub-action | Description |
+| --- | --- |
+| `show` | Show the site's current security-header policy. |
+| `https-redirect <on\|off>` | Turn the HTTP→HTTPS redirect on or off. |
+| `hsts set [--max-age <secs>] [--include-subdomains] [--preload]` / `hsts off` | Set `Strict-Transport-Security` (`--max-age` default `31536000`), or remove it. |
+| `csp set <policy>` / `csp clear` | Set or remove the `Content-Security-Policy` header. |
+| `frame-options set <value>` / `frame-options clear` | Set `X-Frame-Options` (`DENY` / `SAMEORIGIN`), or remove it. |
+
 ## `boatramp function`
 
 Manage top-level [functions](../how-to/functions.md) — deploy, roll back/alias,
@@ -385,6 +435,22 @@ sub-actions also read `--site`.
 | `build [<dir>]` | Build a function project to a `wasi:http` component; prints the produced `.wasm` path. |
 | `test <wasm> [--path <p>] [--method <m>] [--body <b>] [--content-type <ct>] [--expect-status <n>] [--expect-body <substr>]` | Run a component locally against one request and assert on the response. |
 | `dev <wasm> [--port <n>]` | Serve a component locally on an HTTP port (the local dev harness). |
+
+## `boatramp workflow`
+
+Define and run declarative **function-orchestration workflows** — a small DAG of
+function-invocation steps. `define` uploads the step DAG (validated
+server-side), `run` starts a durable run the executor advances, and `run-status`
+polls it. Takes a `--server` flag.
+
+| Sub-action | Description |
+| --- | --- |
+| `define <name> --file <path>` | Define/replace a workflow from a JSON steps file (a bare array, or an object with a `steps` array; `-` = stdin). |
+| `ls` | List defined workflows. |
+| `get <name>` | Show one workflow definition (its steps). |
+| `run <name> [--data <body>]` | Start a run (optionally with an input body delivered to the root steps) and print its id. |
+| `run-status <name> <id>` | Show a run's status + per-step state (status, attempts). |
+| `rm <name>` | Remove a workflow definition. |
 
 ## `boatramp graphql`
 
@@ -413,6 +479,7 @@ tenant-key map that scopes guest `sql`/`orm` queries. `Project·Admin`. See
 | `show` | Print the project's current tenancy schema as JSON (a project with none prints the default `tenant_id`/no-tables schema). |
 | `apply <file>` | Replace the project's tenancy schema from a JSON file (as produced by `tenancy show`). |
 | `clear` | Clear the schema, reverting to legacy single-column scoping. Idempotent. |
+| `test-extract --value <v> [--template <t>\|--regex <re>] [--namespace <ns>]` | Dry-run a `token`-source claim transform **locally** (no server), through the same `derive_tenant` the host runs. Prints the derived tenant key, or the exact stage that denied it — so a `--template` (`{tenant}`/`{_}`) or `--regex` (`(?<tenant>…)`) misconfiguration is a quick local check instead of staring at fail-closed requests. |
 
 ## `boatramp secrets`
 
@@ -631,6 +698,8 @@ Publish a private service through the reverse-proxy gateway. See
 | `upstream rm <name>` | Remove an upstream and any routes that reference it. |
 | `route add <match> <upstream>` | Forward a path `match` to an upstream (appended to the end). |
 | `route rm <match>` | Remove the route with this `match`. |
+| `apply [-f/--file <path>] [--format <ron\|json>] [--dry-run]` | Declaratively apply a whole gateway (upstreams + routes + project ceilings) from a file, **replacing** the site's current gateway — the declarative analogue of the imperative verbs above. `--file` defaults to `gateway.cfg` (RON or JSON, auto-detected by extension); `--dry-run` validates and shows what would change without writing it. |
+| `export [-f/--file <path>] [--format <ron\|json>]` | Export the site's current gateway as a declarative document that round-trips with `apply`. Writes to `--file`, or stdout when omitted (stdout defaults to RON; a `.json` path ⇒ JSON). |
 
 ## `boatramp compute`
 
@@ -810,6 +879,34 @@ startup log warning. Read-only (`System·Read`).
 
 Pass the global `--output-format json` flag for the structured `{ "blob_fallback_active": <bool> }` posture.
 
+## `boatramp kv`
+
+Maintain the control-plane **SlateDB** store. Needs the `slatedb` feature. These
+are SlateDB-specific tools (manifest / WAL / `.compactions`): run against a
+non-SlateDB `--kv` backend they print a clear "not applicable" message rather
+than acting. The mutating verbs are **dry-run by default** (pass `--apply`), and
+the recovery/compaction verbs are **offline** (stop the daemon first — SlateDB is
+single-writer). Every verb addresses the store with the shared `--kv` /
+`--data-dir` (local `<data-dir>/kv-slate`) or `--kv-s3` + `--s3-*` flags.
+
+| Sub-action | Description |
+| --- | --- |
+| `repair [--apply]` | Quarantine a torn **trailing WAL tail** so the store opens again after a crash/partial-snapshot (the offline tail-only recovery). Refuses on a mid-range gap or unreadable manifest. |
+| `recover [--apply] [--adopt-volume <path>]` | The superset of `repair`: dry-run diagnoses the whole store; `--apply` repairs a recoverable shape in place; for an unsafe shape (a torn compacted/L0 SST), `--adopt-volume` validates + adopts an operator-attached clean volume snapshot. |
+| `status [--ack]` | Show the durable `DEGRADED` breadcrumb a self-heal-on-open wrote (reads without opening the store); `--ack` clears it once the loss window is reviewed. |
+| `checkpoint [--live]` | Flush the store to a consistent, guaranteed-bootable state (drain WAL→L0) so a volume snapshot is reliable. Offline (open+close) by default; `--live` checkpoints a running daemon over `POST /api/kv-checkpoint` (`System·Admin`). |
+| `stats` | Report the store's physical-vs-logical footprint (per-subdir); the gap is reclaimable garbage. Read-only. |
+| `compact [--apply] [--timeout-secs <n>]` | Full-merge compact + GC to reclaim the physical-vs-logical gap. Dry-run by default; `--apply` is offline-only and the GC is irreversible. |
+| `export --out <file> [--store <endpoint>]` | Write a portable, backend-agnostic logical dump (sealed secret ciphertext + plaintext config/RBAC, never the KEK). Sensitive — protect it at rest. |
+| `import <file> [--apply] [--force] [--store <endpoint>]` | Import a dump into a store, rebuilding a fresh clean store. Dry-run by default; `--apply` imports + verifies byte-for-byte; a non-empty destination is refused unless `--force`. |
+| `migrate --from <endpoint> --to <endpoint> [--apply] [--force]` | Migrate a store→store over the portable dump (the SlateDB⇄SQL adoption path). Dry-run by default; refuses a non-empty `--to` unless `--force`. |
+
+An endpoint descriptor (for `export`/`import`/`migrate`) is `memory`,
+`slatedb:<data-dir>`, `sqlite:<path>`, or `postgres:<ENV_VAR>` / `mysql:<ENV_VAR>`
+(the env var **names** the var holding the connection URL). This `kv migrate` is a
+KV store→store copy — unrelated to the top-level [`boatramp migrate`](#boatramp-migrate)
+and [`boatramp blob migrate`](#boatramp-blob).
+
 ## `boatramp config`
 
 Read and change the **dynamic daemon config** — operational knobs that converge
@@ -915,6 +1012,25 @@ Purge or redrive a consumer topic's dead-letter queue. See
 | `purge <topic>` | Drop a topic's dead-lettered messages (records + payloads). |
 | `redrive <topic>` | Requeue a topic's dead-lettered messages with a fresh attempt count. |
 
+## `boatramp queue`
+
+Inspect and manage a consumer topic's **live** work-queue — as opposed to its
+dead-letter store, which [`dlq`](#boatramp-dlq) manages. Takes the common
+`--server` / `--site` flags. Add `--bus` to target the shared **project bus**
+(`{project}/bus/{topic}`) instead of a single site's queues: reads then need
+`Project·Read`, the destructive ops `Project·Admin`. See
+[Run background work](../how-to/background-work.md).
+
+| Sub-action | Description |
+| --- | --- |
+| `peek <topic> [--alias <a>] [--limit <n>]` | Show the head of a topic's live work-queue (id, attempts, leased/claimable, payload) **without consuming** — no lease, no attempt charged. |
+| `replay <topic> [--after <id>] [--limit <n>] [--alias <a>]` | Replay a **grouped** topic's retained history from an offset, without consuming (no lease, no cursor touched). |
+| `groups <topic> [--alias <a>]` | List a topic's consumer groups (cursor, in-flight, lag). |
+| `group-reset <topic> <group> [--earliest\|--latest] [--alias <a>]` | Reset a group's cursor — re-consume from earliest (default) or skip to the head (`--latest`). |
+| `group-delete <topic> <group> [--alias <a>]` | Delete a consumer group (its state + dead-letters). |
+| `pause <topic> [--alias <a>]` / `resume <topic> [--alias <a>]` | Suppress delivery for a topic (publish + in-flight ack/nack keep flowing), or resume it. |
+| `policy <topic> [--max-depth <n>] [--max-rate <n>] [--max-unflushed <n>] [--alias <a>]` | Set a per-topic operator flow-control policy; omit a flag to leave that axis uncapped (`--max-unflushed` is single-node only). |
+
 ## `boatramp prune`
 
 Delete orphan deployments and unreferenced blobs. See
@@ -937,6 +1053,19 @@ command-specific flags.
 
 Show cluster-managed certificate status (domain + expiry). No command-specific
 flags.
+
+## `boatramp version`
+
+Report the boatramp version: this binary's by default, or — with `--server <url>`
+(or `--remote` for the configured `[publish].server`) — a **running daemon's**,
+read from `GET /api/version` (gated at `system·read`; there is no unauthenticated
+version surface). Distinct from the built-in `boatramp --version` flag, and honors
+the global `--output-format json`.
+
+| Flag | Description |
+| --- | --- |
+| `--server <url>` | Query the running daemon at this URL instead of reporting this binary's version. |
+| `--remote` | Query the configured daemon (`[publish].server` / `BOATRAMP_SERVER`); ignored when `--server` is given. |
 
 ## `boatramp completions` / `man`
 

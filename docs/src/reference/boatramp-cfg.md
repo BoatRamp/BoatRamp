@@ -30,6 +30,7 @@ Top-level sections, all optional:
 | `secrets` | Envelope encryption for cert private keys at rest. |
 | `handlers` | Wasm handler runtime (needs the `handlers` feature). |
 | `cluster` | Self-hosted Raft cluster (needs the `cluster` feature). |
+| `overlay` | Forward-flow serve roles — relay/ingress + egress/terminator (needs the `overlay` feature). |
 | `compute` | Container / microVM execution backends. |
 
 ## `serve`
@@ -56,6 +57,11 @@ Top-level sections, all optional:
 | `s3_ingress_mint_max_ttl_secs` | int | `3600` | Operator ceiling on a minted upload credential's TTL; see [S3 upload ingress](#serves3-upload-ingress). |
 | `s3_ingress_mint_max_bytes` | int | — | Operator ceiling on a minted credential's object-size cap; see [S3 upload ingress](#serves3-upload-ingress). |
 | `s3_ingress_cloud` | table | — | Cloud-brokering identity for the ingress minter (upload direct to a cloud store). See [`serve.s3_ingress_cloud`](#serves3_ingress_cloud). |
+| `blob_backends` | map | — | Per-project blob object-store backends (`[serve.blob_backends.<project>]`). See [`serve.blob_backends`](#serveblob_backends). |
+| `console` | table | — | The embedded web management console's static baseline (`console` feature). See [`serve.console`](#serveconsole). |
+| `kv` | table | — | Control-plane SlateDB KV durability cadence + shutdown budget. See [`serve.kv`](#servekv). |
+| `listeners` | map | — | Host-owned inbound-TCP listeners (`[serve.listeners.<name>]`; `tcp-listener` feature). See [`serve.listeners`](#servelisteners). |
+| `on_demand_tls` | table | — | Per-SNI on-demand ACME certificate issuance. See [`serve.on_demand_tls`](#serveon_demand_tls). |
 
 > **Warning:** with no `auth_root_*` key configured, control-plane auth is
 > disabled. Under the default `multi-tenant` posture, `serve` refuses to start
@@ -225,6 +231,131 @@ blob backend are consulted; absent ⇒ the local S3 face mints. See
 | `azure_account` | string | blob-arg | **Azure:** the storage account name (SAS signature + blob URL). Absent ⇒ taken from the `azure_account` blob-backend arg. |
 | `azure_service_url` | string | derived | **Azure:** the blob service URL (`https://{account}.blob.core.windows.net/`). Absent ⇒ derived from the account name. |
 | `azure_hns` | bool | `false` | **Azure:** declare the account has a **hierarchical namespace** (HNS/ADLS-Gen2). A directory-scoped SAS only confines to a sub-prefix on an HNS account, so a **prefix** mint is refused unless this is `true` (fail-closed). A single-key mint is unaffected. |
+
+### `serve.blob_backends`
+
+**Per-project** blob object-store backends: a `[serve.blob_backends.<project>]`
+block points one project's `wasi:blobstore` data at its **own**
+bucket/endpoint/credential instead of the one node-wide `[serve]` backend. A
+project with no entry — and the reserved `default` project — resolves the global
+default (an all-global deployment is byte-for-byte unchanged); a
+`[serve.blob_backends.default]` entry is refused at load. Operator-configured
+(this config + the sealed `[secrets]` store), bound to the serve's host-resolved
+project, never to guest input. Key-prefix confinement still runs on top, so a
+separate bucket adds *physical* isolation, it does not replace the confinement. A
+declared backend whose credential/bucket cannot be built **refuses the serve**
+(fail-closed — never a silent fallback). Each block takes the same S3 descriptor
+shape as the `[serve]` primary plus its own sealed credential. Env parity:
+`BOATRAMP_SERVE_BLOB_BACKEND_<PROJECT>_*`.
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `blobs` | `fs` \| `s3` \| `gcs` \| `azure` | — | The backend kind. **Required** — a per-project backend with no explicit kind is a startup error (so a forgotten `blobs = s3` can't silently build an unisolated `fs` backend at the shared node dir). First cut is `s3` (and the degenerate `fs`, which shares the node dir); a per-project `gcs`/`azure` is a follow-up and fails closed at build. |
+| `s3_bucket` | string | — | The project's own S3 bucket (`blobs = s3`). |
+| `s3_endpoint` | string | — | S3 endpoint URL (a MinIO/R2/Tigris endpoint) for this project's backend. |
+| `s3_region` | string | — | S3 region for this project's backend. |
+| `s3_path_style` | bool | `false` | Path-style S3 addressing (MinIO) for this project's backend. |
+| `s3_credential` | table | — | This project's own sealed base S3 credential ([`serve.s3_credential`](#serves3_credential) shape), resolved under THIS project's sealed `[secrets]` store. The `secret_access_key` is a `boatramp:`/`env:` **reference**, never the raw secret. Absent ⇒ the ambient AWS env chain. |
+
+```ron
+serve: ( blob_backends: {
+    "acme": (
+        blobs: s3,
+        s3_bucket: "acme-private",
+        s3_region: "auto",
+        s3_credential: ( access_key_id: "tid_public", secret_access_key: "boatramp:acme-s3" ),
+    ),
+} )
+```
+
+### `serve.console`
+
+The **embedded web management console** (a Wasm SPA baked in with the `console`
+feature). Absent, or `enabled: false`, ⇒ not served. This is the static
+**baseline** for the dynamic `console.*` daemon config, which can
+enable/move it at runtime without a restart (`boatramp config set console.enabled
+true`) — see the [dynamic daemon config reference](./daemon-config.md).
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `enabled` | bool | `false` | Serve the embedded console. Requires the `console` build feature; enabling it in a build without the feature is a logged no-op. |
+| `host` | string | `*` | Host(s) the console answers on: `*` (any host), an exact host (`console.example.com`), or a leading wildcard (`*.example.com`). |
+| `path` | string | `/_console` | URL path prefix the console mounts at. Kept under the reserved `/_` namespace so it never collides with a published site path. |
+
+### `serve.kv`
+
+Control-plane **KV** configuration. The backend itself is selected by `--kv` /
+`BOATRAMP_KV` (`slatedb` default, `sql`, `memory`, `cloudflare`); this block holds
+the backend-specific settings, nested so a knob can never silently mislead under
+the wrong backend. Absent ⇒ the SlateDB defaults apply.
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `slatedb` | table | — | SlateDB durability knobs (see below). Nested under `slatedb` so they don't appear to apply under `--kv sql`/`memory`. |
+| `sql` | table | — | The SQL KV backend's connection (`--kv sql`). Absent under `--kv sql` ⇒ configured entirely by the `BOATRAMP_KV_SQL_*` env. |
+
+`[serve.kv.slatedb]` fields (the per-write frontier-sync durability is
+unconditional and independent of these — they are backstops/tuning):
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `checkpoint_interval` | int (secs) | `10` | Periodic checkpoint cadence. `0` disables the cadence (the per-write frontier-sync still runs). |
+| `close_deadline` | int (secs) | `20` | Graceful drain+close budget on shutdown. `0` is rejected (a zero budget would abandon every close and guarantee a torn tail). |
+| `gc_interval` | int (secs) | `3600` | Online maintenance-GC cadence. `0` disables the supervised GC task (leaving only SlateDB's embedded GC). |
+| `gc_min_age` | int (secs) | `3600` | Minimum object age before maintenance-GC may reclaim it (never zero, so a reader mid-scan can't have a needed object reclaimed). |
+
+### `serve.listeners`
+
+Host-owned **inbound-TCP listeners**: a `[serve.listeners.<name>]` block makes the
+node bind + listen + accept on an address and dispatch each accepted connection to
+a guest `component`'s `tcp-connection-handler` (or, in session mode,
+`session-handler`) export, with tenancy **operator-pinned** here (a raw socket
+carries no Host/path/principal). The guest is handed only the connection's
+`wasi:io` byte streams — it holds **no** `wasi:sockets` authority. Needs the
+`tcp-listener` feature, and is **posture-gated**: off unless
+`allow_guest_tcp_listener` is set (off under `multi-tenant`) **and** a listener is
+declared here — so compiling the feature in binds nothing by itself. Phase 1 is
+plaintext-only with no per-listener egress: a declared `tls` block or a non-empty
+`egress_allowlist` is **refused at config load** (fail-closed), not silently
+ignored. Env parity: `BOATRAMP_SERVE_LISTENER_<NAME>_*`.
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `bind` | socket address | — | The address the node binds + accepts on (e.g. `0.0.0.0:9000`). **Required** (a blank `bind` is refused at load). |
+| `component` | string | — | Path to the guest `.wasm` within the pinned site's deployment (exports the connection handler). **Required**. |
+| `project` | string | — | The project whose active deployment holds `component` (host-resolved). **Required**. |
+| `site` | string | — | The site within `project` whose active deployment holds `component`. **Required**. |
+| `imports` | list | `[]` | Requested capability interfaces the component uses per connection (`sql`/`orm`/`kv`/…) — never `wasi:sockets`. |
+| `env` | map | — | Static environment variables injected into the component (never secrets). |
+| `tenancy` | tenancy | plain | Operator-pinned Dimension-0 tenancy for this listener's `sql`/`orm`, carried on every connection. Absent ⇒ plain (project = database). |
+| `max_conns` | int | `256` | Cap on simultaneously-live connections for this listener. `0` is refused. |
+| `idle_timeout_ms` | int | `60000` | Tear a connection down after this long with no bytes in either direction (in session mode, reinterpreted as the per-re-entry processing deadline). `0` is refused. |
+| `max_conn_duration_ms` | int | `3600000` | Absolute cap on a single connection's lifetime regardless of activity. `0` is refused. |
+| `mode` | `connection` \| `session` | `connection` | How the accepted connection is driven. `connection` pins one wasm instance per connection for its whole life (exports `tcp-connection-handler`). `session` drives it through the re-entrant session model — the host owns the socket, holds no instance between batches, and a protocol-idle-but-alive peer (IMAP IDLE) is never reaped for inactivity (exports `session-handler`). |
+
+A listener's optional `tls` block (deferred in Phase 1) may set `on_demand = true`
+to share the `[serve.on_demand_tls]` engine for per-SNI issuance on a verified
+custom domain in its own project.
+
+### `serve.on_demand_tls`
+
+**On-demand per-SNI TLS** issuance at scale. Off unless `enabled`. When on, the
+edge issues + caches a certificate on the first TLS handshake for an
+unknown-but-already-**verified** (`domain add`) custom domain; an arbitrary or
+unverified SNI is refused (fail-closed), so a flood of unknown names can't become
+an ACME storm. The ACME account + issued certs persist in the control-plane cert
+store and replicate across the cluster (the leader issues; followers serve the
+replicated cert).
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `enabled` | bool | `false` | Master toggle; `false` ⇒ the whole feature is off (the static `--tls acme-dns` resolver is unchanged). |
+| `challenge` | `tls-alpn-01` \| `dns-01` | `tls-alpn-01` | How to prove control of a name to the CA. `tls-alpn-01` validates on the 443 edge (no extra port); `dns-01` uses the node's configured ACME DNS provider. |
+| `directory_url` | string | ACME client default | ACME directory URL. Absent ⇒ Let's Encrypt production. |
+| `contact_email` | string | — | ACME account contact email (optional). |
+| `max_inflight` | int | `4` | Max concurrent in-flight issuances (global). |
+| `negative_ttl_secs` | int | `300` | How long a refused/failed SNI is negatively cached. |
+| `rate_limit_per_hour` | int | `50` | Max CA orders per rolling hour (the account rate-limit floor). `0` ⇒ unlimited. |
 
 ## `security`
 
