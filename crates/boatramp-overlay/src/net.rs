@@ -32,7 +32,7 @@ use quinn::{Connection, Endpoint, RecvStream, SendStream};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, Semaphore, mpsc};
 use tokio::time::timeout;
 
 use crate::circuit::{CircuitError, LinkHalves, run_circuit_duplex};
@@ -51,6 +51,18 @@ const PROMOTE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Upper bound on a dial request/verdict JSON message.
 const MAX_DIAL_MSG: usize = 16 * 1024;
+
+/// How long a terminator/relay waits for the client to complete the handshake and present its dial
+/// control message before abandoning the connection (MEDIUM-B). Bounds a slow-loris: a connection
+/// that completes TLS but stalls before (or during) the sealed-capability exchange cannot park a
+/// task — holding derived session keys — indefinitely. Generous (a real handshake + first message is
+/// milliseconds); the data phase, once authorized, runs with no such deadline.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Max concurrently in-flight flows a serve loop ([`run_egress_router`]/[`run_forwarding_router`])
+/// admits (MEDIUM-B). Bounds the task/connection count a flood — unauthenticated at the egress —
+/// can pin; the accept loop backpressures past this. High enough not to throttle a busy node.
+const MAX_INFLIGHT_FLOWS: usize = 1024;
 
 /// A forwarded-flow failure.
 #[derive(Debug, thiserror::Error)]
@@ -377,12 +389,19 @@ pub async fn forward_relay<F>(
 where
     F: Fn(&str) -> Option<(SocketAddr, OverlayId, bool)>,
 {
-    let (mut client_send, mut client_recv) = client
-        .accept_bi()
-        .await
-        .map_err(|e| NetError::Stream(e.to_string()))?;
-
-    let request: DialRequest = read_msg(&mut client_recv).await?;
+    // Bound the accept + dial-request read with a deadline (MEDIUM-B): a client that opens a stream
+    // but stalls before sending its request cannot park a relay task. (The relay is mutual-auth —
+    // only enrolled clients reach here — so this is defense in depth; the egress's is load-bearing.)
+    let (mut client_send, client_recv, request) = timeout(HANDSHAKE_TIMEOUT, async {
+        let (client_send, mut client_recv) = client
+            .accept_bi()
+            .await
+            .map_err(|e| NetError::Stream(e.to_string()))?;
+        let request: DialRequest = read_msg(&mut client_recv).await?;
+        Ok::<_, NetError>((client_send, client_recv, request))
+    })
+    .await
+    .map_err(|_| NetError::Stream("relay dial-request timed out".into()))??;
     let client_id = peer_identity(&client)?;
 
     let Some((egress_addr, egress_id, enc_required)) = resolve(&request.service) else {
@@ -470,28 +489,36 @@ pub async fn terminate_one<F>(
 where
     F: Fn(&str) -> Option<SocketAddr>,
 {
-    let (mut send, mut recv) = conn
-        .accept_bi()
-        .await
-        .map_err(|e| NetError::Stream(e.to_string()))?;
+    // Bound the whole pre-authorization phase (bi-stream accept + E2EE handshake + the sealed
+    // dial-capability exchange) with a deadline (MEDIUM-B): the egress is reachable unauthenticated
+    // at the TLS layer, so a connection that stalls here must not park a task holding derived session
+    // keys indefinitely. The data phase, once authorized, runs with no deadline.
+    let (send, recv, sealer, opener, client_id, request) = timeout(HANDSHAKE_TIMEOUT, async {
+        let (mut send, mut recv) = conn
+            .accept_bi()
+            .await
+            .map_err(|e| NetError::Stream(e.to_string()))?;
+        // The E2EE handshake learns the client identity (the responder does not pin it in advance);
+        // it is the identity the dial capability must be holder-bound to, and that direct-path
+        // promotion pins its link to.
+        let (session, client_id) =
+            establish(&mut send, &mut recv, secret, Role::Responder, None, None).await?;
+        let (sealer, mut opener) = session.split();
+        // Zero-trust: open the sealed dial capability the client presents end-to-end (the first
+        // record after the handshake); it is verified below against the trust root + the E2EE-proven
+        // client identity — not on the relay's say-so — before touching the backend.
+        let sealed = read_lp(&mut recv, MAX_DIAL_MSG).await?.ok_or_else(|| {
+            NetError::Stream("client closed before presenting the dial capability".into())
+        })?;
+        let control = opener
+            .open(&sealed)
+            .map_err(|e| NetError::Splice(e.into()))?;
+        let request: DialRequest = serde_json::from_slice(&control)?;
+        Ok::<_, NetError>((send, recv, sealer, opener, client_id, request))
+    })
+    .await
+    .map_err(|_| NetError::Stream("handshake/dial-capability timed out".into()))??;
 
-    // The E2EE handshake learns the client identity (the responder does not pin it in advance); it
-    // is the identity the dial capability must be holder-bound to, and that direct-path promotion
-    // pins its link to.
-    let (session, client_id) =
-        establish(&mut send, &mut recv, secret, Role::Responder, None, None).await?;
-    let (sealer, mut opener) = session.split();
-
-    // Zero-trust authz: open the sealed dial capability the client presents end-to-end (the first
-    // record after the handshake) and verify it against the trust root + the E2EE-proven client
-    // identity — not on the relay's say-so — before touching the backend.
-    let sealed = read_lp(&mut recv, MAX_DIAL_MSG).await?.ok_or_else(|| {
-        NetError::Stream("client closed before presenting the dial capability".into())
-    })?;
-    let control = opener
-        .open(&sealed)
-        .map_err(|e| NetError::Splice(e.into()))?;
-    let request: DialRequest = serde_json::from_slice(&control)?;
     // HIGH-A: anchor authorization to the services THIS egress actually fronts. Resolve the requested
     // service to a backend from the egress's own map; an unmapped service is refused here, so
     // `authorize_dial`'s `scope == request.service` check binds the capability scope to a service the
@@ -551,10 +578,20 @@ pub async fn run_forwarding_router<F>(endpoint: Endpoint, trust_root: TokenPubli
 where
     F: Fn(&str) -> Option<(SocketAddr, OverlayId, bool)> + Clone + Send + Sync + 'static,
 {
-    while let Ok(Some(conn)) = quic::accept(&endpoint).await {
+    // Bound concurrent in-flight flows (MEDIUM-B): the accept loop waits for a permit, so a flood
+    // cannot pin unbounded tasks; a permit is held for the connection's lifetime.
+    let limiter = Arc::new(Semaphore::new(MAX_INFLIGHT_FLOWS));
+    loop {
+        let Ok(permit) = Arc::clone(&limiter).acquire_owned().await else {
+            return;
+        };
+        let Ok(Some(conn)) = quic::accept(&endpoint).await else {
+            return;
+        };
         let trust_root = trust_root.clone();
         let resolve = resolve.clone();
         tokio::spawn(async move {
+            let _permit = permit;
             if let Err(e) = forward_relay(conn, &trust_root, resolve).await {
                 tracing::debug!(error = %e, "overlay relay: flow ended with error");
             }
@@ -578,7 +615,17 @@ pub async fn run_egress_router<F>(
     F: Fn(&str) -> Option<SocketAddr> + Clone + Send + Sync + 'static,
 {
     let seed = secret.seed_hex();
-    while let Ok(Some(conn)) = quic::accept(&endpoint).await {
+    // Bound concurrent in-flight terminations (MEDIUM-B): the egress is reachable unauthenticated at
+    // the TLS layer, so the accept loop waits for a permit before admitting a connection — a flood
+    // cannot pin unbounded tasks/session-state. A permit is held for the connection's lifetime.
+    let limiter = Arc::new(Semaphore::new(MAX_INFLIGHT_FLOWS));
+    loop {
+        let Ok(permit) = Arc::clone(&limiter).acquire_owned().await else {
+            return;
+        };
+        let Ok(Some(conn)) = quic::accept(&endpoint).await else {
+            return;
+        };
         // Each terminator needs its own OverlaySecret (not Clone — it holds a zeroized seed); rebuild
         // from the one seed, so every connection presents the same egress identity.
         let Ok(secret) = OverlaySecret::from_seed_hex(&seed) else {
@@ -587,6 +634,7 @@ pub async fn run_egress_router<F>(
         let resolve_backend = resolve_backend.clone();
         let trust_root = trust_root.clone();
         tokio::spawn(async move {
+            let _permit = permit;
             if let Err(e) = terminate_one(
                 conn,
                 &secret,

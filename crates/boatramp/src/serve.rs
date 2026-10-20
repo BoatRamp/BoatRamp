@@ -681,15 +681,35 @@ fn load_overlay_identity(spec: Option<&str>) -> Result<boatramp_overlay::Overlay
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 let secret = OverlaySecret::generate().map_err(mk)?;
                 let seed = secret.seed_hex();
+                let perr = |e: std::io::Error| {
+                    Error::ClusterStartup(format!("[overlay] identity file {path}: {e}"))
+                };
                 if let Some(parent) = std::path::Path::new(path).parent() {
-                    let _ = std::fs::create_dir_all(parent);
+                    std::fs::create_dir_all(parent).map_err(perr)?;
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        let _ =
+                            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+                    }
                 }
-                std::fs::write(path, seed.as_bytes())
-                    .map_err(|e| Error::ClusterStartup(format!("[overlay] identity file {path}: {e}")))?;
+                // Create the key file atomically with owner-only perms (LOW-C): no write-then-chmod
+                // window in which the Ed25519 seed is group/world-readable.
                 #[cfg(unix)]
                 {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+                    use std::io::Write as _;
+                    use std::os::unix::fs::OpenOptionsExt;
+                    let mut f = std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .mode(0o600)
+                        .open(path)
+                        .map_err(perr)?;
+                    f.write_all(seed.as_bytes()).map_err(perr)?;
+                }
+                #[cfg(not(unix))]
+                {
+                    std::fs::write(path, seed.as_bytes()).map_err(perr)?;
                 }
                 Ok(secret)
             }
