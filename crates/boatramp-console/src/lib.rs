@@ -19,6 +19,7 @@ mod ndjson;
 mod node_ops;
 mod observability;
 mod oidc;
+mod overlay;
 mod project;
 mod project_transfer;
 mod store_migration;
@@ -37,6 +38,7 @@ use maintenance::Maintenance;
 use models::{FunctionSummary, WhoAmI};
 use monitoring::{Monitoring, NodeVersionBadge};
 use observability::{FunctionLogs, SiteObservability};
+use overlay::OverlayDirectory;
 use project::ProjectSelector;
 use tokens::Tokens;
 use wasm_bindgen_futures::spawn_local;
@@ -100,6 +102,9 @@ pub(crate) enum Route {
     /// Node-global monitoring: version, instance stats, blob/KV health, metrics.
     #[at("/monitoring")]
     Monitoring,
+    /// Node-global overlay forward-flow directory (what you can `forward` to).
+    #[at("/overlay")]
+    Overlay,
     /// Any unknown path redirects to the overview.
     #[not_found]
     #[at("/404")]
@@ -112,7 +117,7 @@ pub(crate) enum Route {
 pub(crate) fn is_node_route(route: &Route) -> bool {
     matches!(
         route,
-        Route::Monitoring | Route::Maintenance | Route::Tokens
+        Route::Monitoring | Route::Overlay | Route::Maintenance | Route::Tokens
     )
 }
 
@@ -125,7 +130,8 @@ fn nav_group(route: &Route) -> u8 {
         Route::Monitoring => 2,
         Route::Maintenance => 3,
         Route::Tokens => 4,
-        Route::NotFound => 5,
+        Route::Overlay => 5,
+        Route::NotFound => 6,
     }
 }
 
@@ -137,6 +143,7 @@ fn switch(route: Route) -> Html {
         Route::Functions => html! { <FunctionsPage /> },
         Route::Function { name } => html! { <FunctionPage name={name} /> },
         Route::Monitoring => html! { <Monitoring /> },
+        Route::Overlay => html! { <OverlayDirectory /> },
         Route::Maintenance => html! { <Maintenance /> },
         Route::Tokens => html! { <Tokens /> },
         Route::NotFound => html! { <Redirect<Route> to={Route::Sites} /> },
@@ -202,6 +209,7 @@ fn shell() -> Html {
                             <span class="mr-0.5 text-[11px] uppercase tracking-wide text-slate-500"
                                   title="node-global — not scoped to a project">{ "node" }</span>
                             <NavItem to={Route::Monitoring} label="Monitoring" />
+                            <NavItem to={Route::Overlay} label="Overlay" />
                             <NavItem to={Route::Maintenance} label="Maintenance" />
                             <NavItem to={Route::Tokens} label="Tokens" />
                         </nav>

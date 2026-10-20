@@ -2,9 +2,9 @@
 
 boatramp ships a small web **management console** — a WebAssembly single-page app
 that drives the control-plane `/api` (sites, deployments, tokens, config,
-observability). It is **baked into the binary** and served, when you turn it on,
-from the same origin as the API. Nothing to deploy separately, no CORS to
-configure.
+observability, the overlay directory). It is **baked into the binary** and served,
+when you turn it on, from the same origin as the API. Nothing to deploy
+separately, no CORS to configure.
 
 ## Turn it on
 
@@ -76,6 +76,21 @@ console: ( enabled: true, host: "console.example.com", path: "/" ),
 The console has a real client-side router, so pages are deep-linkable URLs under
 the mount path (e.g. `/_console/sites/blog`) — a refresh or a shared link lands
 on the right page.
+
+## Overlay directory
+
+The **Overlay** page (node-global, under the `node` nav group) lists the overlay
+forward-flow service directory — the console view of
+[`boatramp overlay ls`](../reference/cli.md#boatramp-overlay). It shows what is
+joinable: each service name, the relay to dial, the relay and egress overlay
+**identities** a client pins, and the relay's client-auth posture
+(`capability-only` or `mutual-pin`). It is read-only; minting a dial capability
+stays a CLI action (`boatramp forward` / `overlay grant`).
+
+Viewing it needs the `Overlay·Read` right (the `overlay` role, or `admin`); a
+token without it sees a note explaining which role to ask an admin for rather
+than a bare error. When no services are published (`[overlay] routes` unset), the
+page says so. Backed by [`GET /api/overlay/services`](../reference/api.md#overlay).
 
 ## Sign in
 

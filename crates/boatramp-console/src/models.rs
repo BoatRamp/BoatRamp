@@ -255,3 +255,29 @@ pub struct ProjectMeta {
     #[serde(default)]
     pub description: String,
 }
+
+// ---- Overlay directory (the Overlay directory page) -----------------------
+
+/// One entry from `GET /api/overlay/services` — the overlay forward-flow
+/// **discovery** surface (server: `OverlayServiceEntry`, defined inline in
+/// boatramp-server, NOT in `boatramp-types`; the CLI mirrors it as
+/// `boatramp::overlay::ServiceEntry`). Each row is a service you can
+/// `boatramp forward svc/<name>` to, with the relay to dial, the relay + egress
+/// overlay identities a client pins, and the relay's client-auth posture.
+/// Mirrored field-for-field so the wire format stays in lock-step with the
+/// server and the CLI; `client_auth` is `#[serde(default)]`-tolerant exactly as
+/// the CLI's mirror is (the server always sends it, but an older node might not).
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct OverlayService {
+    /// The in-cluster service name, e.g. `svc/db` — the `forward svc/<name>` target.
+    pub service: String,
+    /// The relay/ingress `host:port` a client dials to reach the service.
+    pub relay: String,
+    /// The relay's overlay identity to pin (`ed25519:<hex>`).
+    pub relay_id: String,
+    /// The egress/terminator's overlay identity to pin for the E2EE session.
+    pub egress_id: String,
+    /// The relay's client-auth posture (`capability-only` | `mutual-pin`).
+    #[serde(default)]
+    pub client_auth: String,
+}
