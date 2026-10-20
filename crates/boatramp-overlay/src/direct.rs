@@ -74,7 +74,6 @@ mod tests {
     use boatramp_overlay_proto::ice::{Candidate, CandidateKind, CandidateSet};
     use boatramp_overlay_proto::identity::OverlaySecret;
     use boatramp_overlay_proto::peer_policy::OverlayPeerPolicy::Pin;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     /// Two peers hole-punch over mutual-pinned peer_endpoints and get a working, authenticated
     /// direct link (loopback): Initiator dials the Responder's candidate, Responder accepts, a

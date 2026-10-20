@@ -15,7 +15,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use boatramp_overlay::{
-    DialRequest, OverlayId, OverlayPeerPolicy, OverlaySecret, client_endpoint, forward_flow,
+    DialRequest, OverlayId, OverlayPeerPolicy, OverlaySecret, PathMode, client_endpoint,
+    forward_flow,
 };
 use clap::Args;
 use tokio::net::TcpListener;
@@ -122,7 +123,16 @@ pub async fn run(args: ForwardArgs) -> Result<(), ForwardError> {
                 token: (*token).clone(),
                 e2ee: true,
             };
-            if let Err(e) = forward_flow(sock, &endpoint, relay, &secret, egress_id, request).await
+            if let Err(e) = forward_flow(
+                sock,
+                &endpoint,
+                relay,
+                &secret,
+                egress_id,
+                request,
+                PathMode::PreferDirect,
+            )
+            .await
             {
                 tracing::warn!(error = %e, "overlay forward connection failed");
             }

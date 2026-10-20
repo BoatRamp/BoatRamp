@@ -17,10 +17,14 @@
 use std::net::SocketAddr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use std::sync::Arc;
+use std::time::Duration;
+
 use boatramp_core::cose::TokenPublicKey;
 use boatramp_overlay_proto::circuit::{DEFAULT_SEGMENT, DEFAULT_WINDOW};
 use boatramp_overlay_proto::dial::{DialRequest, DialVerdict, authorize_dial};
 use boatramp_overlay_proto::e2ee::{Role, Session};
+use boatramp_overlay_proto::ice::Signal;
 use boatramp_overlay_proto::identity::{OverlayId, OverlaySecret};
 use boatramp_overlay_proto::peer_policy::OverlayPeerPolicy;
 use boatramp_overlay_proto::wire;
@@ -28,16 +32,22 @@ use quinn::{Connection, Endpoint, RecvStream, SendStream};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, mpsc};
 use tokio::time::timeout;
 
 use crate::circuit::{CircuitError, LinkHalves, run_circuit_duplex};
+use crate::direct::{PathMode, negotiate_direct};
 use crate::e2ee::{SpliceError, establish, splice};
+use crate::ice::gather;
 use crate::quic::{self, QuicError};
 
 /// Buffer for the in-memory pipe that connects the E2EE splice to the circuit pump (the pump
 /// carries the splice's sealed-record byte stream over the link).
 const SEALED_PIPE_BUF: usize = 256 * 1024;
+
+/// How long the promotion attempt (candidate exchange + hole-punch) may take before the flow stays
+/// on the relay.
+const PROMOTE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Upper bound on a dial request/verdict JSON message.
 const MAX_DIAL_MSG: usize = 16 * 1024;
@@ -57,6 +67,8 @@ pub enum NetError {
     Splice(#[from] SpliceError),
     #[error(transparent)]
     Circuit(#[from] CircuitError),
+    #[error("a direct path was required (DirectOnly) but could not be established")]
+    DirectUnavailable,
     #[error("dial wire: {0}")]
     Json(#[from] serde_json::Error),
     #[error("dial message too large: {0} bytes")]
@@ -119,6 +131,7 @@ pub async fn forward_flow<L>(
     secret: &OverlaySecret,
     egress_id: OverlayId,
     request: DialRequest,
+    path_mode: PathMode,
 ) -> Result<(), NetError>
 where
     L: AsyncRead + AsyncWrite + Unpin,
@@ -146,36 +159,157 @@ where
     )
     .await?;
     let (lr, lw) = tokio::io::split(local);
-    run_spliced_circuit(session, lr, lw, recv, send).await
+    let owned = OverlaySecret::from_seed_hex(&secret.seed_hex())?;
+    run_spliced_circuit_promotable(
+        session,
+        lr,
+        lw,
+        recv,
+        send,
+        owned,
+        egress_id,
+        Role::Initiator,
+        path_mode,
+        relay_addr,
+    )
+    .await
+}
+
+/// The wildcard bind of the same address family as `toward`.
+fn wildcard_for(toward: SocketAddr) -> SocketAddr {
+    if toward.is_ipv4() {
+        SocketAddr::from(([0, 0, 0, 0], 0))
+    } else {
+        SocketAddr::from(([0u16; 8], 0))
+    }
+}
+
+/// Receive the peer's candidate set from the signaling channel within `deadline`.
+async fn recv_candidates(
+    signaling: &mut mpsc::Receiver<Vec<u8>>,
+    deadline: Duration,
+) -> Option<boatramp_overlay_proto::ice::CandidateSet> {
+    let msg = timeout(deadline, signaling.recv()).await.ok()??;
+    match Signal::decode(&msg).ok()? {
+        Signal::Candidates(set) => Some(set),
+        Signal::Observed(_) => None,
+    }
+}
+
+/// Promotion task (IU-7): gather candidates, exchange them over the sealed signaling channel,
+/// hole-punch a direct link pinned to `peer_id`, prime it with the promote marker, and rebind the
+/// circuit pump onto it. Holds the direct connection as the drain handle until the flow ends. A
+/// no-op under `Relay`; fails closed under `DirectOnly`; falls back to the relay under `PreferDirect`.
+async fn promote(
+    secret: OverlaySecret,
+    peer_id: OverlayId,
+    role: Role,
+    path_mode: PathMode,
+    toward: SocketAddr,
+    sig_out: mpsc::Sender<Vec<u8>>,
+    mut sig_in: mpsc::Receiver<Vec<u8>>,
+    rebind: mpsc::Sender<LinkHalves>,
+    direct_slot: Arc<Mutex<Option<Connection>>>,
+) -> Result<(), NetError> {
+    if !path_mode.attempts_direct() {
+        return Ok(()); // Relay: never leave the relay
+    }
+    let fallback = |mode: PathMode| {
+        if mode == PathMode::DirectOnly {
+            Err(NetError::DirectUnavailable)
+        } else {
+            Ok(())
+        }
+    };
+
+    // A peer_endpoint mutually pinned to the peer, for the hole-punch.
+    let pin = OverlayPeerPolicy::Pin(peer_id);
+    let endpoint = quic::peer_endpoint(&secret, &pin, &pin, wildcard_for(toward))?;
+    let local_port = endpoint.local_addr()?.port();
+
+    // Exchange candidates over the sealed signaling channel.
+    let local = gather(local_port, toward, None, None)?;
+    let encoded = Signal::Candidates(local)
+        .encode()
+        .map_err(|e| NetError::Stream(e.to_string()))?;
+    let _ = sig_out.send(encoded).await;
+    let Some(peer_candidates) = recv_candidates(&mut sig_in, PROMOTE_TIMEOUT).await else {
+        return fallback(path_mode);
+    };
+
+    // Hole-punch an authenticated direct link.
+    let Some(conn) = negotiate_direct(&endpoint, &peer_candidates, role, PROMOTE_TIMEOUT).await
+    else {
+        return fallback(path_mode);
+    };
+
+    // Open/accept the promotion bi-stream, priming it with the marker (deadlock MUST #1: quinn
+    // surfaces an opened bi-stream to the peer only on first write).
+    let halves = match role {
+        Role::Initiator => {
+            let (mut s, r) = conn
+                .open_bi()
+                .await
+                .map_err(|e| NetError::Stream(e.to_string()))?;
+            s.write_all(wire::PROMOTE_MARKER)
+                .await
+                .map_err(|e| NetError::Stream(e.to_string()))?;
+            LinkHalves::new(r, s)
+        }
+        Role::Responder => {
+            let (s, mut r) = conn
+                .accept_bi()
+                .await
+                .map_err(|e| NetError::Stream(e.to_string()))?;
+            let mut marker = vec![0u8; wire::PROMOTE_MARKER.len()];
+            if r.read_exact(&mut marker).await.is_err() || marker != wire::PROMOTE_MARKER {
+                return fallback(path_mode);
+            }
+            LinkHalves::new(r, s)
+        }
+    };
+
+    // Rebind the pump onto the direct link (lossless swap; the relay link is then abandoned).
+    if rebind.send(halves).await.is_err() {
+        return Ok(()); // the pump has already finished — flow ending
+    }
+    // Keep the direct connection alive for the flow's duration (deadlock MUST #2). The runner holds
+    // this slot through the splice + pump and closes it once they finish — so the pump's bi-stream
+    // stays valid and the final Fin flushes, without lingering on quinn's ~30s idle timeout.
+    *direct_slot.lock().await = Some(conn);
+    Ok(())
 }
 
 /// Run the E2EE splice over the resumable circuit pump (which carries the sealed records over the
-/// link) as two concurrent tasks joined by an in-memory pipe. The pump is **inline** so a
-/// direct-path promotion (IU-7) can `rebind` it onto a direct link with zero loss; until promotion
-/// lands the rebind channel is unused and the pump runs on the single link.
-async fn run_spliced_circuit<AR, AW>(
+/// link), with a concurrent promotion task (IU-7) that may hole-punch a direct link and rebind the
+/// pump onto it. The pump is **inline** so the rebind is lossless. Three tasks joined: splice, pump,
+/// and promotion — `try_join!` so a `DirectOnly` promotion failure tears the flow down.
+#[allow(clippy::too_many_arguments)]
+async fn run_spliced_circuit_promotable<AR, AW>(
     session: Session,
     app_r: AR,
     app_w: AW,
     link_recv: RecvStream,
     link_send: SendStream,
+    secret: OverlaySecret,
+    peer_id: OverlayId,
+    role: Role,
+    path_mode: PathMode,
+    toward: SocketAddr,
 ) -> Result<(), NetError>
 where
     AR: AsyncRead + Unpin,
     AW: AsyncWrite + Unpin,
 {
     let (sealer, opener) = session.split();
-    // The splice's sealed-record stream <-> the pump's "local" side, via a pipe.
     let (splice_side, pump_side) = tokio::io::duplex(SEALED_PIPE_BUF);
     let (ss_r, ss_w) = tokio::io::split(splice_side);
     let (ps_r, ps_w) = tokio::io::split(pump_side);
-    // Promotion (IU-7) will hold this sender and feed it the direct link; for now it's unused, so
-    // the pump runs on its single link.
-    let (_rebind_tx, rebind_rx) = mpsc::channel::<LinkHalves>(1);
+    let (rebind_tx, rebind_rx) = mpsc::channel::<LinkHalves>(1);
+    // Real signaling: the splice <-> the promotion task carry the ICE exchange.
+    let (sig_out_tx, sig_out_rx) = mpsc::channel::<Vec<u8>>(16);
+    let (sig_in_tx, sig_in_rx) = mpsc::channel::<Vec<u8>>(16);
 
-    // Idle signaling on the relay path (no ICE yet); IU-7's promotion wires real channels here.
-    let (_sig_out_tx, sig_out_rx) = mpsc::channel::<Vec<u8>>(16);
-    let (sig_in_tx, _sig_in_rx) = mpsc::channel::<Vec<u8>>(16);
     let splice_fut = splice(
         sealer, opener, app_r, app_w, ss_w, ss_r, sig_out_rx, sig_in_tx,
     );
@@ -188,9 +322,30 @@ where
         DEFAULT_WINDOW,
         DEFAULT_SEGMENT,
     );
-    let (splice_res, pump_res) = tokio::join!(splice_fut, pump_fut);
-    splice_res?;
-    pump_res?;
+    // Holds the promoted direct connection alive for the flow's duration; closed below once the
+    // splice + pump finish, so a promoted flow does not linger on quinn's idle timeout.
+    let direct_slot: Arc<Mutex<Option<Connection>>> = Arc::new(Mutex::new(None));
+    let promo_fut = promote(
+        secret,
+        peer_id,
+        role,
+        path_mode,
+        toward,
+        sig_out_tx,
+        sig_in_rx,
+        rebind_tx,
+        direct_slot.clone(),
+    );
+
+    // Splice/pump errors propagate; a DirectOnly promotion failure also tears the flow down.
+    tokio::try_join!(
+        async { splice_fut.await.map_err(NetError::from) },
+        async { pump_fut.await.map_err(NetError::from) },
+        promo_fut,
+    )?;
+    if let Some(conn) = direct_slot.lock().await.take() {
+        conn.close(0u32.into(), b"flow complete");
+    }
     Ok(())
 }
 
@@ -275,20 +430,38 @@ pub async fn terminate_one(
     conn: Connection,
     secret: &OverlaySecret,
     backend_addr: SocketAddr,
+    path_mode: PathMode,
 ) -> Result<(), NetError> {
     let (mut send, mut recv) = conn
         .accept_bi()
         .await
         .map_err(|e| NetError::Stream(e.to_string()))?;
 
-    let (session, _client) =
+    // The E2EE handshake learns the client identity (the responder does not pin it in advance); it
+    // is the identity the direct-path promotion pins its link to.
+    let (session, client_id) =
         establish(&mut send, &mut recv, secret, Role::Responder, None, None).await?;
 
     let backend = tokio::net::TcpStream::connect(backend_addr).await?;
     let (br, bw) = backend.into_split();
-    run_spliced_circuit(session, br, bw, recv, send).await?;
-    // Hold the connection open until the relay has drained the sealed echo and closes (bounded),
-    // so the final records are delivered before this connection drops.
+    let owned = OverlaySecret::from_seed_hex(&secret.seed_hex())?;
+    // Toward: the relay we were reached through — the routing hint for our host candidate.
+    let toward = conn.remote_address();
+    run_spliced_circuit_promotable(
+        session,
+        br,
+        bw,
+        recv,
+        send,
+        owned,
+        client_id,
+        Role::Responder,
+        path_mode,
+        toward,
+    )
+    .await?;
+    // Hold the (relay) connection open until it has drained the final records and closes (bounded),
+    // so a relay-path flow's last bytes are delivered before this connection drops.
     let _ = timeout(wire::DIRECT_DRAIN, conn.closed()).await;
     Ok(())
 }
@@ -333,7 +506,7 @@ mod tests {
                 while let Ok(Some(conn)) = quic::accept(&egress_ep).await {
                     let egress = OverlaySecret::from_seed_hex(&egress.seed_hex()).unwrap();
                     tokio::spawn(async move {
-                        let _ = terminate_one(conn, &egress, backend_addr).await;
+                        let _ = terminate_one(conn, &egress, backend_addr, PathMode::Relay).await;
                     });
                 }
             });
@@ -385,6 +558,7 @@ mod tests {
                     token,
                     e2ee: true,
                 },
+                PathMode::Relay,
             )
             .await
         });
@@ -421,11 +595,128 @@ mod tests {
                 token: bad,
                 e2ee: true,
             },
+            PathMode::Relay,
         )
         .await;
         assert!(
             matches!(rejected, Err(NetError::DialRejected(_))),
             "an out-of-scope token must be refused at the gate, got {rejected:?}"
         );
+    }
+
+    /// §6 promotion proof: a `PreferDirect` flow starts over the relay, both ends promote onto a
+    /// hole-punched direct link, and the flow SURVIVES the relay being severed — which it can only
+    /// do if it is no longer riding the relay. (On loopback the direct dial always succeeds.)
+    #[tokio::test]
+    async fn flow_promotes_to_direct_and_survives_relay_severance() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let root = OverlaySecret::generate().unwrap();
+        let client = OverlaySecret::generate().unwrap();
+        let relay = OverlaySecret::generate().unwrap();
+        let egress = OverlaySecret::generate().unwrap();
+        let (client_id, relay_id, egress_id) = (client.id(), relay.id(), egress.id());
+
+        // Backend echo.
+        let backend = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = backend.accept().await {
+                tokio::spawn(async move {
+                    let (mut r, mut w) = s.split();
+                    let _ = tokio::io::copy(&mut r, &mut w).await;
+                });
+            }
+        });
+
+        // Egress (PreferDirect — it will accept the hole-punch).
+        let egress_ep =
+            quic::server_endpoint(&egress, &AcceptAny, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let egress_addr = egress_ep.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok(Some(conn)) = quic::accept(&egress_ep).await {
+                let egress = OverlaySecret::from_seed_hex(&egress.seed_hex()).unwrap();
+                tokio::spawn(async move {
+                    let _ =
+                        terminate_one(conn, &egress, backend_addr, PathMode::PreferDirect).await;
+                });
+            }
+        });
+
+        // Relay — hold a handle so we can SEVER it mid-flow.
+        let relay_ep = quic::server_endpoint(
+            &relay,
+            &Allowlist(BTreeSet::from([client_id])),
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .unwrap();
+        let relay_addr = relay_ep.local_addr().unwrap();
+        let relay_handle = relay_ep.clone();
+        let root_pub = root.id().to_public();
+        tokio::spawn(async move {
+            while let Ok(Some(conn)) = quic::accept(&relay_ep).await {
+                let root_pub = root_pub.clone();
+                tokio::spawn(async move {
+                    let resolve =
+                        |svc: &str| (svc == "svc/echo").then_some((egress_addr, egress_id, true));
+                    let _ = forward_relay(conn, &root_pub, resolve).await;
+                });
+            }
+        });
+
+        let token = mint_overlay_dial(
+            &client.id().to_public(),
+            "svc/echo",
+            3600,
+            now_unix(),
+            &root.signer(),
+        )
+        .await
+        .unwrap();
+        let client_ep = quic::client_endpoint(&client, &Pin(relay_id)).unwrap();
+        let (mut app, app_far) = tokio::io::duplex(64 * 1024);
+        let fwd = tokio::spawn(async move {
+            forward_flow(
+                app_far,
+                &client_ep,
+                relay_addr,
+                &client,
+                egress_id,
+                DialRequest {
+                    service: "svc/echo".into(),
+                    token,
+                    e2ee: true,
+                },
+                PathMode::PreferDirect,
+            )
+            .await
+        });
+
+        // Round 1: the flow is up (over the relay, or already promoting).
+        app.write_all(b"first").await.unwrap();
+        let mut r1 = [0u8; 5];
+        tokio::time::timeout(std::time::Duration::from_secs(5), app.read_exact(&mut r1))
+            .await
+            .expect("round 1 echo in time")
+            .unwrap();
+        assert_eq!(&r1, b"first");
+
+        // Give promotion time to gather, exchange candidates, hole-punch, and rebind both pumps.
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+        // SEVER the relay: close its endpoint and every connection through it.
+        relay_handle.close(0u32.into(), b"severed");
+
+        // Round 2: if the flow survives with the relay gone, it promoted onto the direct link.
+        app.write_all(b"second").await.unwrap();
+        let mut r2 = [0u8; 6];
+        tokio::time::timeout(std::time::Duration::from_secs(5), app.read_exact(&mut r2))
+            .await
+            .expect("round 2 echo must still arrive over the DIRECT link after relay severance")
+            .unwrap();
+        assert_eq!(&r2, b"second");
+
+        drop(app); // end the flow
+        let _ = fwd.await;
     }
 }

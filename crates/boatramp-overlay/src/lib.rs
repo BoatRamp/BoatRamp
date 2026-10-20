@@ -25,6 +25,7 @@ pub mod quic;
 pub use circuit::{
     CircuitError, CircuitId, CircuitRegistry, CircuitStats, LinkHalves, run_circuit_duplex,
 };
+pub use direct::{PathMode, negotiate_direct};
 pub use e2ee::{SpliceError, establish, splice};
 pub use net::{NetError, forward_flow, forward_relay, terminate_one};
 pub use quic::{
