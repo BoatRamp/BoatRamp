@@ -1892,6 +1892,7 @@ dependencies = [
  "bech32",
  "boatramp-core",
  "boatramp-rpktls",
+ "bytes",
  "hex",
  "thiserror 2.0.18",
  "zeroize",

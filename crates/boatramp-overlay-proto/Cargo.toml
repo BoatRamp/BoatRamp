@@ -24,6 +24,8 @@ boatramp-core = { workspace = true, features = ["authz"] }
 boatramp-rpktls = { workspace = true }
 thiserror = { workspace = true }
 hex = { workspace = true }
+# Zero-copy byte buffers for the circuit frame payloads / retransmit segments.
+bytes = { workspace = true }
 # Secret seed material is held in a zeroizing buffer (matches rpktls).
 zeroize = "1"
 # bech32m rendering of identities (`bro1…`) — a friendly form only; the
