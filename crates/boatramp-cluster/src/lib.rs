@@ -24,3 +24,6 @@ pub mod mesh;
 
 #[cfg(feature = "http")]
 pub mod node;
+
+#[cfg(feature = "overlay")]
+pub mod overlay;

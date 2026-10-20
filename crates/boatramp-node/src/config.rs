@@ -1252,6 +1252,11 @@ pub struct MeshConfig {
     /// **private** key on every node (each mints + presents its own capability);
     /// default `false`.
     pub gate_client_writes: Option<bool>,
+    /// Which transport carries the Raft peer-mesh RPC (IU-9): `"http"` (default — reqwest/axum
+    /// over the mutual-TLS mesh) or `"overlay"` (boatramp's own overlay-QUIC fabric, reusing the
+    /// mesh identity + live trust set verbatim). `None` ⇒ `"http"`. Both bind the same
+    /// `cluster.listen` address — HTTP over TCP, overlay over UDP/QUIC.
+    pub transport: Option<String>,
 }
 
 /// `handlers` section — server-side handler runtime config (read by `serve`).

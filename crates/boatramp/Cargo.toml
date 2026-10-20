@@ -285,6 +285,10 @@ cluster = [
   "tls",
   "dep:boatramp-cluster",
   "boatramp-cluster/http",
+  # The overlay-QUIC peer-mesh transport (IU-9): selectable at runtime via
+  # `[cluster.mesh] transport = "overlay"` (default stays HTTP). Compiled in with every
+  # cluster build so the choice is pure config, not a rebuild.
+  "boatramp-cluster/overlay",
   "dep:axum",
   # The `MeshAdmitter` impl bridging the join route to `ClusterNode::admit`.
   "dep:async-trait",

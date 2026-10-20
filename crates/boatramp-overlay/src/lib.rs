@@ -29,8 +29,13 @@ pub use direct::{PathMode, negotiate_direct};
 pub use e2ee::{SpliceError, establish, splice};
 pub use net::{NetError, forward_flow, forward_relay, terminate_one};
 pub use quic::{
-    QuicError, client_endpoint, client_endpoint_server_auth, peer_endpoint, server_endpoint,
+    QuicError, accept, client_endpoint, client_endpoint_server_auth, dial, dial_mesh_peer,
+    mesh_endpoint, peer_endpoint, server_endpoint,
 };
+// Re-export the rpktls types the mesh transport (IU-9) builds endpoints from, and quinn itself, so
+// a consumer (e.g. boatramp-cluster's overlay mesh transport) depends on this one integration crate.
+pub use boatramp_rpktls::{PeerId, RpkTls};
+pub use quinn;
 
 // Re-export the pure-core types a consumer (e.g. the `boatramp forward` CLI) needs, so it can
 // depend on this one crate.

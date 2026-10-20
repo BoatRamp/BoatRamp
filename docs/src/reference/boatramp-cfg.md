@@ -432,7 +432,13 @@ defined by its **root of trust** — there is no peer map; nodes self-identify a
 | `seeds` | list of strings | — | Control-plane addresses of existing members. Present ⇒ this node **joins**; absent + `--cluster-init` ⇒ it **founds**. |
 | `join_token` | string | — | The single-use bearer join token used when `seeds` are set. Keep the secret out of the file: `env:VAR`, `path:/file`, or an inline literal. |
 | `store_dir` | path | `<data-dir>/raft` | This node's durable Raft store. Never shared between nodes. |
-| `mesh` | table | — | Mesh identity + TLS: `key_file`, `key_rotation`, `join_token_ttl`, `gate_client_writes`. |
+| `mesh` | table | — | Mesh identity + TLS: `key_file`, `key_rotation`, `join_token_ttl`, `gate_client_writes`, `transport`. |
+
+The `[cluster.mesh]` table also selects the peer-mesh **transport**:
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `transport` | string | `"http"` | How the Raft peer mesh RPC travels: `"http"` (reqwest/axum over the mutual-TLS mesh) or `"overlay"` (boatramp's own overlay-QUIC fabric, reusing the mesh identity + live trust set verbatim). Both bind the same `cluster.listen` — HTTP over TCP, overlay over UDP/QUIC. Same RFC 7250 raw-public-key mutual auth either way; an untrusted peer is rejected at the handshake. |
 
 The node id is **derived** from the node's mesh key — there is no `node_id`
 field. Founding and joining are driven from the command line: `serve

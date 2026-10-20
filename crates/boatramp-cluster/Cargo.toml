@@ -32,6 +32,11 @@ http = [
   "dep:rustls",
   "dep:tokio-rustls",
 ]
+# The overlay-QUIC transport for the Raft peer mesh (IU-9): boatramp's own mesh
+# RPC rides the overlay fabric (boatramp-overlay) instead of HTTP, reusing the
+# mesh's RFC 7250 raw-public-key identity + live trust set verbatim. Builds on
+# `http` (shares the peer directory, the client-write authorizer, and MeshTls).
+overlay = ["http", "dep:boatramp-overlay"]
 
 [dependencies]
 boatramp-core.workspace = true
@@ -39,6 +44,9 @@ boatramp-core.workspace = true
 # rustls configs) — shared with the control-plane bootstrap TLS mode. The mesh
 # layers its durable trust-key format + per-peer client cache on top.
 boatramp-rpktls = { workspace = true, optional = true }
+# The overlay fabric: boatramp's own mesh RPC can ride overlay QUIC (IU-9) instead of HTTP,
+# reusing the mesh's RPK identity + live trust set verbatim. Optional (the `overlay` feature).
+boatramp-overlay = { workspace = true, optional = true }
 async-trait.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true

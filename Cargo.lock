@@ -1649,6 +1649,7 @@ dependencies = [
  "axum",
  "axum-server",
  "boatramp-core",
+ "boatramp-overlay",
  "boatramp-rpktls",
  "bytes",
  "futures",

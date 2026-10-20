@@ -3362,6 +3362,39 @@ async fn run_cluster(
     let daemon_observer: Arc<dyn boatramp_cluster::raft::ApplyObserver> =
         Arc::new(DaemonConfigObserver(daemon_runtime));
 
+    // Peer-mesh transport (IU-9): `transport = "overlay"` rides boatramp's own overlay-QUIC fabric
+    // (reusing the mesh identity + live trust set verbatim); anything else (incl. unset) uses the
+    // HTTP mesh. Both bind the same `cluster.listen` (HTTP over TCP, overlay over UDP/QUIC). The
+    // overlay server gates client-writes with the same authorizer, passed in (the overlay has no
+    // HTTP header layer); the HTTP server layers it on the router below.
+    let use_overlay_mesh = match mesh_cfg
+        .transport
+        .as_deref()
+        .unwrap_or("http")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "overlay" => true,
+        "http" => false,
+        other => {
+            return Err(Error::ClusterStartup(format!(
+                "unknown [cluster.mesh] transport {other:?} (want \"http\" or \"overlay\")"
+            )));
+        }
+    };
+    let transport = if use_overlay_mesh {
+        tracing::info!(
+            listen = %cluster_cfg.listen,
+            "cluster: peer mesh on the overlay-QUIC transport (IU-9)"
+        );
+        boatramp_cluster::node::MeshTransport::Overlay {
+            bind: cluster_cfg.listen,
+            write_authz: write_authz.clone(),
+        }
+    } else {
+        boatramp_cluster::node::MeshTransport::Http
+    };
+
     let node = Arc::new(
         build_node(ClusterParams {
             node_id,
@@ -3376,6 +3409,7 @@ async fn run_cluster(
             mesh: mesh_tls.clone(),
             cluster_write_capability: write_capability,
             extra_observers: vec![daemon_observer],
+            transport,
         })
         .await?,
     );
@@ -3388,34 +3422,42 @@ async fn run_cluster(
         return Err(Error::MeshUnconfigured(cluster_cfg.listen));
     }
 
-    // Serve this node's peer mesh over RFC 7250 raw-public-key mutual TLS 1.3:
-    // every `/raft/*` + `/stream/*` request must present a trusted peer key. The
-    // application `client-write` is additionally gated by the authorizer.
-    let mesh_router = match write_authz {
-        Some(authz) => node.router.clone().layer(axum::Extension::<
-            boatramp_cluster::http::WriteAuthz,
-        >(Some(authz))),
-        None => node.router.clone(),
-    };
-    let mut mesh_config = mesh_tls.server()?;
-    mesh_config.alpn_protocols = boatramp_server::alpn_h1_h2();
-    let listen = cluster_cfg.listen;
-    tracing::info!(
-        node_id, %listen,
-        "cluster: serving peer mesh (mutual TLS)"
-    );
-    tokio::spawn(async move {
-        if let Err(err) = boatramp_server::serve_tls(
-            listen,
-            mesh_config.into(),
-            mesh_router,
-            boatramp_server::shutdown_signal(),
-        )
-        .await
-        {
-            tracing::error!(%err, "cluster: peer mesh server exited");
-        }
-    });
+    // Serve this node's peer mesh. The overlay transport already stood up its own QUIC listener
+    // inside `build_node` (so `node.router` is empty); only the HTTP transport mounts a router on
+    // an axum mutual-TLS listener here, where every `/raft/*` + `/stream/*` request must present a
+    // trusted peer key and the application `client-write` is additionally gated by the authorizer.
+    if use_overlay_mesh {
+        tracing::info!(
+            node_id, listen = %cluster_cfg.listen,
+            "cluster: serving peer mesh (overlay QUIC, mutual RPK auth)"
+        );
+    } else {
+        let mesh_router = match write_authz {
+            Some(authz) => node.router.clone().layer(axum::Extension::<
+                boatramp_cluster::http::WriteAuthz,
+            >(Some(authz))),
+            None => node.router.clone(),
+        };
+        let mut mesh_config = mesh_tls.server()?;
+        mesh_config.alpn_protocols = boatramp_server::alpn_h1_h2();
+        let listen = cluster_cfg.listen;
+        tracing::info!(
+            node_id, %listen,
+            "cluster: serving peer mesh (HTTP, mutual TLS)"
+        );
+        tokio::spawn(async move {
+            if let Err(err) = boatramp_server::serve_tls(
+                listen,
+                mesh_config.into(),
+                mesh_router,
+                boatramp_server::shutdown_signal(),
+            )
+            .await
+            {
+                tracing::error!(%err, "cluster: peer mesh server exited");
+            }
+        });
+    }
 
     // Initialize a brand-new cluster from this node (once) when founding.
     if do_bootstrap {

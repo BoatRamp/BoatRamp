@@ -152,6 +152,30 @@ pub fn peer_endpoint(
     Ok(endpoint)
 }
 
+/// A **mesh** endpoint built directly from an existing [`RpkTls`] — identity plus a **live**
+/// [`boatramp_rpktls::TrustSet`] — rather than an [`OverlaySecret`] + [`OverlayPeerPolicy`]. It
+/// accepts mutual-authenticated peer connections (every dialing peer's key is verified against the
+/// live trust set) and is the base socket for [`dial_mesh_peer`]. This is the IU-9 seam: boatramp's
+/// own cluster mesh rides overlay QUIC while reusing its existing mesh identity + trust **verbatim**,
+/// so a replicated join / rotation / revocation is honored live with no second identity domain.
+pub fn mesh_endpoint(tls: &RpkTls, bind: SocketAddr) -> Result<Endpoint, QuicError> {
+    let sc = quic_server_config(tls.server()?)?;
+    Ok(Endpoint::server(sc, bind)?)
+}
+
+/// Dial mesh `peer` (a cluster `NodeId`) at `addr` over a [`mesh_endpoint`], pinning the connection
+/// to that peer's trusted key(s) from the live trust set carried by `tls`. An untrusted or unknown
+/// peer fails the mutual-auth handshake rather than completing an unauthenticated dial.
+pub async fn dial_mesh_peer(
+    endpoint: &Endpoint,
+    tls: &RpkTls,
+    peer: boatramp_rpktls::PeerId,
+    addr: SocketAddr,
+) -> Result<Connection, QuicError> {
+    let cc = quic_client_config(tls.client_for(peer)?)?;
+    Ok(endpoint.connect_with(cc, addr, RPK_SNI)?.await?)
+}
+
 /// Dial `addr` from a dial-capable `endpoint` (one built by [`client_endpoint`]
 /// or [`peer_endpoint`]) and complete the handshake.
 pub async fn dial(endpoint: &Endpoint, addr: SocketAddr) -> Result<Connection, QuicError> {
@@ -172,6 +196,51 @@ mod tests {
     use super::*;
     use boatramp_overlay_proto::OverlayPeerPolicy::{Allowlist, Pin};
     use std::collections::BTreeSet;
+
+    /// The IU-9 mesh seam: two mutually-trusting mesh identities (an `RpkTls` each over a shared
+    /// trust set, exactly as `boatramp-cluster` holds them) form a mutual-authenticated overlay
+    /// QUIC link via `mesh_endpoint` + `dial_mesh_peer`, and a bi-stream round-trips.
+    #[tokio::test]
+    async fn mesh_endpoints_round_trip_over_shared_trust() {
+        use boatramp_rpktls::{RpkIdentity, RpkTls, TrustSet};
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+
+        // Node 1 and node 2, both in one trust set (NodeId -> SPKI).
+        let id1 = Arc::new(RpkIdentity::generate().unwrap());
+        let id2 = Arc::new(RpkIdentity::generate().unwrap());
+        let trust = TrustSet::from_map(BTreeMap::from([
+            (1u64, id1.public_key().to_vec()),
+            (2u64, id2.public_key().to_vec()),
+        ]));
+        let tls1 = RpkTls::new(id1, trust.clone());
+        let tls2 = RpkTls::new(id2, trust);
+
+        let server = mesh_endpoint(&tls2, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let dialer = mesh_endpoint(&tls1, "127.0.0.1:0".parse().unwrap()).unwrap();
+
+        let srv = tokio::spawn(async move {
+            let conn = accept(&server).await.unwrap().unwrap();
+            let (mut send, mut recv) = conn.accept_bi().await.unwrap();
+            let got = recv.read_to_end(64).await.unwrap();
+            send.write_all(&got).await.unwrap();
+            send.finish().unwrap();
+            conn.closed().await;
+        });
+
+        // Node 1 dials node 2 (by id) over its mesh endpoint.
+        let conn = dial_mesh_peer(&dialer, &tls1, 2, server_addr)
+            .await
+            .unwrap();
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        send.write_all(b"mesh-ping").await.unwrap();
+        send.finish().unwrap();
+        let echo = recv.read_to_end(64).await.unwrap();
+        assert_eq!(&echo, b"mesh-ping");
+        conn.close(0u32.into(), b"done");
+        let _ = srv.await;
+    }
 
     /// A mutual-auth loopback handshake: the client pins the server and the
     /// server allowlists the client; a bi-stream round-trips through the
