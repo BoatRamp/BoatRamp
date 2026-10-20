@@ -67,6 +67,10 @@ const CLAIM_APP: &str = "br_app";
 /// host-stamped `{project, site, container, key|prefix, perms, constraints}`. The full scope lives in
 /// the SIGNED payload so a client can never widen it (the URL/headers are never consulted for scope).
 const CLAIM_S3: &str = "br_s3";
+/// Text claim key for an overlay-dial capability's authorized dial scope (boatramp overlay fabric):
+/// the in-cluster service/target the holder may dial (`"*"` = any within the issuer's authority).
+/// The scope lives in the SIGNED payload, so a client can never widen it.
+const CLAIM_OVERLAY_SCOPE: &str = "br_ovscope";
 
 /// Bounds on the opaque app-context (R6): a capability may carry at most this many entries, and its
 /// keys+values may total at most this many bytes. Enforced at mint so a guest can't inflate a token.
@@ -139,6 +143,13 @@ pub const KIND_CAPABILITY: &str = "capability";
 /// context/session token, and none of those can be redeemed as an S3 session (the `br_kind` check is
 /// exact on both mint and verify).
 pub const KIND_S3_SESSION: &str = "s3-session";
+/// Token kind: an **overlay-dial capability** (boatramp overlay fabric) — a holder-key-bound,
+/// offline-verifiable CWT authorizing the holder identity to dial a scoped in-cluster service over
+/// the overlay. A relay/egress verifies it (signature + expiry + `br_kind == "overlay-dial"`) and
+/// checks `cnf` against the dialing peer's TLS/E2EE-proven identity, with NO control-plane
+/// round-trip. Domain-separated: the exact `br_kind` check means it can never be redeemed as any
+/// other token kind, nor they as it.
+pub const KIND_OVERLAY_DIAL: &str = "overlay-dial";
 
 /// PoP claim: the bound HTTP method (upper-case).
 const CLAIM_HTM: &str = "htm";
@@ -936,6 +947,83 @@ pub fn verify_session(
         return Err(TokenError::Claims("not a session cookie".into()));
     }
     sid.ok_or_else(|| TokenError::Claims("session cookie has no sid".into()))
+}
+
+/// The verified contents of an overlay-dial capability ([`verify_overlay_dial`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedOverlayDial {
+    /// The holder key (`cnf`, `"<alg>:<hex>"`) the dialing peer must prove possession of — the
+    /// caller checks it equals the peer's TLS/E2EE-proven overlay identity.
+    pub holder: String,
+    /// The dial scope this capability authorizes (a service/target, or `"*"`).
+    pub scope: String,
+}
+
+/// Mint an **overlay-dial capability** (`br_kind = "overlay-dial"`): a holder-key-bound,
+/// offline-verifiable `COSE_Sign1` CWT authorizing `holder` to dial `scope` over the overlay fabric,
+/// signed by the fleet `Signer` trust root with `iat = now`, `exp = now + ttl_secs`, and a `cti`.
+/// A relay/egress authorizes a dial from it with [`verify_overlay_dial`] plus a holder-key check
+/// against the dialing peer's proven identity — no control-plane round-trip. The holder's private
+/// key never leaves the holder; only its public half (`cnf`) is embedded.
+pub async fn mint_overlay_dial(
+    holder: &TokenPublicKey,
+    scope: &str,
+    ttl_secs: u64,
+    now_unix: u64,
+    signer: &dyn Signer,
+) -> Result<String, TokenError> {
+    let claims = ClaimsSetBuilder::new()
+        .issued_at(Timestamp::WholeSeconds(now_unix as i64))
+        .cwt_id(random_cti()?)
+        .expiration_time(Timestamp::WholeSeconds(
+            now_unix.saturating_add(ttl_secs) as i64
+        ))
+        .text_claim(
+            CLAIM_KIND.to_string(),
+            CborValue::Text(KIND_OVERLAY_DIAL.to_string()),
+        )
+        .text_claim(CLAIM_CNF.to_string(), CborValue::Text(holder.to_hex()))
+        .text_claim(
+            CLAIM_OVERLAY_SCOPE.to_string(),
+            CborValue::Text(scope.to_string()),
+        )
+        .build();
+    sign_claims(claims, signer).await
+}
+
+/// Verify an overlay-dial capability against the fleet public key at `now_unix`: checks the COSE
+/// signature, the expiry, and `br_kind == "overlay-dial"`, returning the bound holder key and
+/// scope. Fail-closed: a forged/unsigned/expired/wrong-kind token never verifies. The caller MUST
+/// additionally confirm the returned `holder` equals the dialing peer's proven identity (holder
+/// binding) before honoring the dial.
+pub fn verify_overlay_dial(
+    token: &str,
+    public: &TokenPublicKey,
+    now_unix: u64,
+) -> Result<VerifiedOverlayDial, TokenError> {
+    let claims = verify_envelope(token, public)?;
+    check_exp(&claims, now_unix)?;
+    let mut kind = None;
+    let mut holder = None;
+    let mut scope = None;
+    for (name, value) in &claims.rest {
+        if let (coset::cwt::ClaimName::Text(t), CborValue::Text(v)) = (name, value) {
+            match t.as_str() {
+                CLAIM_KIND => kind = Some(v.clone()),
+                CLAIM_CNF => holder = Some(v.clone()),
+                CLAIM_OVERLAY_SCOPE => scope = Some(v.clone()),
+                _ => {}
+            }
+        }
+    }
+    if kind.as_deref() != Some(KIND_OVERLAY_DIAL) {
+        return Err(TokenError::Claims("not an overlay-dial capability".into()));
+    }
+    let holder =
+        holder.ok_or_else(|| TokenError::Claims("overlay-dial capability has no holder".into()))?;
+    let scope =
+        scope.ok_or_else(|| TokenError::Claims("overlay-dial capability has no scope".into()))?;
+    Ok(VerifiedOverlayDial { holder, scope })
 }
 
 /// The fully-verified contents of a durable signed-context envelope (R1 + async-lane persona,
