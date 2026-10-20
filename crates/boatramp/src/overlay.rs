@@ -207,8 +207,14 @@ impl Rendered for OverlayOutput {
                 if services.is_empty() {
                     return writeln!(w, "no overlay services in the directory");
                 }
+                // Headerless, tab-separated for pipe purity (columns documented in cli.md):
+                // service, relay addr, egress id, client-auth posture.
                 for s in services {
-                    writeln!(w, "{}\t{}\tegress {}", s.service, s.relay, s.egress_id)?;
+                    writeln!(
+                        w,
+                        "{}\t{}\t{}\t{}",
+                        s.service, s.relay, s.egress_id, s.client_auth
+                    )?;
                 }
                 Ok(())
             }
@@ -241,10 +247,14 @@ impl Rendered for OverlayOutput {
                 )?;
                 writeln!(
                     w,
-                    "# Enroll on the relay node ([overlay] allowed_clients), then reload:"
+                    "# If the relay is mutual-pin, enroll this client id in [overlay] allowed_clients"
+                )?;
+                writeln!(
+                    w,
+                    "# and reload; a capability-only relay needs NO enrollment — the ticket works as-is."
                 )?;
                 writeln!(w, "#   client id: {client_id}")?;
-                writeln!(w, "#   allowed_clients entry: {enroll}")
+                writeln!(w, "#   allowed_clients entry (mutual-pin only): {enroll}")
             }
         }
     }
@@ -283,7 +293,10 @@ pub async fn run(
                 .find(|s| s.service == name)
                 .map(OverlayOutput::Resolved)
                 .ok_or_else(|| {
-                    Error::Overlay(format!("no overlay service `{name}` in the directory"))
+                    Error::Overlay(format!(
+                        "no overlay service `{name}` in the directory — run `boatramp overlay ls` to \
+                         see available services"
+                    ))
                 })
         }
         OverlayCommand::Grant {
@@ -409,6 +422,12 @@ pub(crate) fn operator_identity() -> Result<OverlaySecret> {
             {
                 std::fs::write(&path, secret.seed_hex().as_bytes()).map_err(io)?;
             }
+            // Finding G: announce the new persistent identity the way `ssh-keygen` announces its path,
+            // so first-run `forward`/`overlay id` doesn't silently create a key the operator can't find.
+            eprintln!(
+                "boatramp overlay: generated a persistent overlay identity at {}",
+                path.display()
+            );
             Ok(secret)
         }
         Err(e) => Err(io(e)),

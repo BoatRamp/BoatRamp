@@ -507,21 +507,25 @@ Overlay forward-flow tooling (the server side is configured under
 | Command | Meaning |
 | --- | --- |
 | `id` | Print this operator's overlay identity (`ed25519:<hex>` + `bro1…`), load-or-generated at `~/.config/boatramp/overlay.key` (0600, like an SSH key). It is what self-serve `forward svc/<name>` binds its dial capability to. |
-| `ls` | List the cluster's overlay service directory (`GET /api/overlay/services`) — the services you can `forward` to, with their relay + egress identities. |
-| `resolve <name>` | Resolve one service name to its topology (relay + egress identities). |
+| `ls` | List the cluster's overlay service directory (`GET /api/overlay/services`) — the services you can `forward` to. |
+| `resolve <name>` | Resolve one service name to its topology (relay + egress identities + relay posture). |
 | `grant <service>` | **Control-plane-less** path: mint a dial capability + a one-flag forward ticket (below). |
 
 **`overlay ls` / `resolve`** read the live directory over your boatramp token (`Overlay·Read`); they
 take `--server` (else `[publish].server`). This is the discovery that lets `boatramp forward svc/db`
-work with no topology flags.
+work with no topology flags. Human `ls` output is headerless, tab-separated (pipe-friendly), one row
+per service with the columns **service, relay address, egress id, client-auth posture**
+(`capability-only` or `mutual-pin`); `--output-format json` emits the same fields as objects. On a
+`resolve` miss the error points you at `overlay ls`.
 
 **`overlay grant <service>`** is the offline/airgapped alternative to self-serve: it mints a
 holder-bound overlay-dial capability (signing with the cluster root key — `[serve.signer]` /
 `--auth-root-private-key` / `BOATRAMP_AUTH_ROOT_PRIVATE_KEY`, the same signer `token mint` uses) and
 packages the relay + egress identities, the capability, and (by default) a fresh client identity into
 a single **forward ticket** (`brfwd1.…`, the overlay analog of a cluster join ticket) redeemed with
-`boatramp forward <local> --ticket <blob>`. It also prints the exact `[overlay] allowed_clients`
-entry to add on the relay node. Flags: `--relay <host:port>`, `--relay-id`/`--egress-id`,
+`boatramp forward <local> --ticket <blob>`. It also prints a client id + `[overlay] allowed_clients`
+entry: **enroll it only if the relay is `mutual-pin`** — a `capability-only` relay needs no
+enrollment, the ticket works as-is. Flags: `--relay <host:port>`, `--relay-id`/`--egress-id`,
 `--holder-pub <id>` (bind a client-generated identity; the ticket then carries no secret),
 `--ttl-secs <n>` (default 3600), `--config <path>`.
 
@@ -568,11 +572,17 @@ For deployments **without** a reachable control plane, a `--ticket` from
 | `--ticket <blob>` | A `brfwd1.…` forward ticket (control-plane-less). Conflicts with the explicit flags. |
 | `--relay <addr>` / `--relay-id <id>` / `--egress-id <id>` / `--token <cap>` / `--token-file <path>` | The fully explicit escape hatch. |
 | `--identity <seed\|path>` | Override the overlay identity (defaults to the persistent operator key; required with a `--holder-pub` ticket). |
+| `--capability-only` | Dial the relay server-auth-only (present no client cert) — for a **capability-only** relay reached via `--ticket`/explicit flags. Ignored on self-serve (the posture comes from the control plane, with a note on stderr if you pass it anyway). |
 
-Runs until interrupted (Ctrl-C). Each accepted local connection opens a capability-gated, relay-blind
-flow to the service; the flow promotes to a direct link when one is reachable. If the **first**
-connection fails (identity not enrolled on a mutual-pin relay, capability out of scope, or expired),
-`forward` logs a loud, actionable error rather than leaving a silently dead port.
+Before binding the port, `forward` runs **one eager preflight dial** that validates the whole path —
+relay reachable, capability authorized, egress reachable — and only prints the `ready` banner after it
+succeeds; on failure it prints an actionable error and exits **without binding**, so you never get a
+silently dead port. (The preflight opens one brief backend connection that closes immediately with no
+application bytes.) Runs until interrupted (Ctrl-C); each accepted connection opens a capability-gated,
+relay-blind flow that promotes to a direct link when one is reachable. The first runtime failure after
+startup is also surfaced loudly (on stderr, not just the log), with causes matched to the relay
+posture — a capability-only self-serve relay has no `allowed_clients`, so enrollment is never blamed
+there.
 
 ## `boatramp operator`
 

@@ -96,6 +96,14 @@ pub enum ForwardError {
     TicketServiceMismatch { ticket: String, arg: String },
     #[error("overlay discovery: {0}")]
     Discovery(String),
+    /// 401 from the control plane — authentication, not authorization (finding D).
+    #[error(
+        "your boatramp token is missing, invalid, or expired — re-authenticate (e.g. `boatramp \
+         login`) and try again."
+    )]
+    Unauthenticated,
+    /// 403 from the control plane — authenticated but lacks `Overlay·Write` (finding D). Kept in sync
+    /// with the server's `overlay_deny_body` (auth.rs).
     #[error(
         "not authorized to self-serve overlay forwards — your boatramp token needs the \
          `Overlay·Write` right.\n  \
@@ -103,6 +111,76 @@ pub enum ForwardError {
          use a `--ticket` from `boatramp overlay grant` for a control-plane-less forward."
     )]
     Unauthorized,
+    /// The eager startup preflight dial failed, so we refuse to bind a dead port (finding C).
+    #[error("overlay preflight failed: {0}")]
+    Preflight(String),
+}
+
+/// Actionable causes for a failed overlay dial, branched on the relay posture (finding A). A
+/// capability-only self-serve relay runs `AcceptAny` with NO allowlist, so "not enrolled" is never a
+/// cause there — enrollment is a mutual-pin-only concept.
+fn dial_failure_causes(capability_only: bool) -> &'static str {
+    if capability_only {
+        "the capability is not authorized for this service or has expired, or the relay/egress is \
+         unreachable"
+    } else {
+        "this client identity is not enrolled in the relay's `allowed_clients`, the capability is not \
+         authorized for this service or has expired, or the relay/egress is unreachable"
+    }
+}
+
+/// Bound on the eager preflight dial — a hung handshake (unreachable/unresponsive egress) must fail
+/// the preflight, not hang the command before it even prints the banner.
+const PREFLIGHT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// One eager dial before binding the port (finding C): validate relay reachability + capability
+/// authorization + egress reachability end to end, so a misconfigured forward fails loudly and
+/// immediately instead of as a silently dead bound port. The local side is already closed, so the
+/// flow sends an immediate Fin — the backend observes a single bare connect that closes with no
+/// application bytes (a one-off cost for a definitely-working tunnel). Reusing this connection for the
+/// first client would require splitting `forward_flow` into establish/splice phases; a clean single
+/// preflight connect/close is the simpler, reviewer-accepted choice.
+async fn preflight_dial(
+    endpoint: &boatramp_overlay::quinn::Endpoint,
+    relay: SocketAddr,
+    secret: &OverlaySecret,
+    egress_id: OverlayId,
+    service: &str,
+    token: &str,
+    capability_only: bool,
+) -> Result<(), ForwardError> {
+    let (near, far) = tokio::io::duplex(1);
+    drop(near); // the local side is already closed → the preflight flow sends an immediate Fin
+    let request = DialRequest {
+        service: service.to_string(),
+        token: token.to_string(),
+        e2ee: true,
+    };
+    let flow = forward_flow(
+        far,
+        endpoint,
+        relay,
+        secret,
+        egress_id,
+        request,
+        PathMode::Relay,
+    );
+    let outcome = match tokio::time::timeout(PREFLIGHT_TIMEOUT, flow).await {
+        Ok(r) => r.map_err(|e| e.to_string()),
+        Err(_) => Err(format!(
+            "no response within {}s",
+            PREFLIGHT_TIMEOUT.as_secs()
+        )),
+    };
+    if let Err(cause) = outcome {
+        let causes = dial_failure_causes(capability_only);
+        eprintln!(
+            "boatramp forward: preflight dial to `{service}` via relay {relay} FAILED — not binding \
+             a dead port.\n  likely: {causes}.\n  cause: {cause}"
+        );
+        return Err(ForwardError::Preflight(cause));
+    }
+    Ok(())
 }
 
 impl From<crate::overlay::Error> for ForwardError {
@@ -230,10 +308,14 @@ async fn resolve_via_control_plane(
         .await
         .map_err(|e| ForwardError::Discovery(e.to_string()))?;
     // Read the status explicitly (not `.error_for_status()`, which drops the server's actionable
-    // body): a 401/403 means the operator's token lacks `Overlay·Write` — surface the fix, not a
-    // bare status line (UX Blocker #2); any other non-success carries the server's own message.
+    // body) and split 401 vs 403 (finding D): 401 is an authentication problem (fix your token), 403
+    // is a missing `Overlay·Write` right (ask an admin / use a ticket). Any other non-success carries
+    // the server's own message.
     let status = resp.status();
-    if matches!(status.as_u16(), 401 | 403) {
+    if status.as_u16() == 401 {
+        return Err(ForwardError::Unauthenticated);
+    }
+    if status.as_u16() == 403 {
         return Err(ForwardError::Unauthorized);
     }
     if !status.is_success() {
@@ -249,6 +331,14 @@ async fn resolve_via_control_plane(
         .json()
         .await
         .map_err(|e| ForwardError::Discovery(e.to_string()))?;
+    // Finding E: on self-serve the server's posture is authoritative; a passed `--capability-only` is
+    // ignored — say so rather than silently dropping it.
+    if args.capability_only {
+        eprintln!(
+            "boatramp forward: --capability-only ignored on self-serve; posture is taken from the \
+             control plane"
+        );
+    }
     let relay = resp
         .relay
         .parse::<SocketAddr>()
@@ -300,19 +390,33 @@ pub async fn run(
     } else {
         client_endpoint(&secret, &OverlayPeerPolicy::Pin(relay_id))?
     };
+
+    // Finding C — eager preflight BEFORE bind + banner: validate the whole dial path so a
+    // misconfigured forward fails loudly and immediately rather than as a silently dead port.
+    preflight_dial(
+        &endpoint,
+        relay,
+        &secret,
+        egress_id,
+        &service,
+        &token,
+        capability_only,
+    )
+    .await?;
+
     let listener = TcpListener::bind(&args.local).await?;
     let bound = listener.local_addr()?;
 
     eprintln!(
-        "boatramp forward: {bound} → {service} via relay {relay} (overlay, relay-blind E2EE) — Ctrl-C to stop"
+        "boatramp forward: {bound} → {service} via relay {relay} (overlay, relay-blind E2EE) — ready, Ctrl-C to stop"
     );
 
     let secret = Arc::new(secret);
     let token = Arc::new(token);
     let service = Arc::new(service);
-    // A healthy-looking bound port whose every dial fails (not enrolled / cap not authorized /
-    // expired) is a silent trap. Escalate the FIRST failure to `error!` with the fix, so the
-    // operator sees "why" rather than a dead port; later failures stay at `warn!` (UX should-fix).
+    // The preflight above already proved the path, but a cap can expire or a backend can drop between
+    // then and a real connection — so still escalate the FIRST runtime failure loudly; later failures
+    // stay at `warn!`.
     let first_failure = Arc::new(AtomicBool::new(false));
 
     loop {
@@ -342,13 +446,18 @@ pub async fn run(
                 if first_failure.swap(true, Ordering::Relaxed) {
                     tracing::warn!(error = %e, "overlay forward connection failed");
                 } else {
+                    // Finding A — causes branched on posture (no bogus "not enrolled" on the
+                    // capability-only self-serve path). Finding H — ALSO eprintln! so this single most
+                    // important "why is my port dead" line can't be filtered away by RUST_LOG.
+                    let causes = dial_failure_causes(capability_only);
                     tracing::error!(
-                        error = %e, %service, %relay,
-                        "overlay forward FAILED on the first connection — the port is bound but the \
-                         dial is not getting through. Likely causes: this client identity is not \
-                         enrolled in the relay's `allowed_clients`; the dial capability is not \
-                         authorized for this service; or it has expired. Fix enrollment/authorization \
-                         and reconnect (later failures are logged at warn)."
+                        error = %e, service = %*service, %relay,
+                        "overlay forward FAILED on the first connection; likely: {causes}"
+                    );
+                    eprintln!(
+                        "boatramp forward: the first connection FAILED — the port is bound but the \
+                         dial is not getting through.\n  likely: {causes}.\n  cause: {e}\n  (later \
+                         failures are logged at warn)"
                     );
                 }
             }
@@ -862,5 +971,87 @@ mod tests {
         .unwrap();
         assert_eq!(got, b"never-enrolled -> live backend");
         let _ = fwd.await;
+    }
+
+    /// Finding A: the capability-only first-failure guidance does NOT blame enrollment (impossible on
+    /// an AcceptAny self-serve relay) and names the right causes; mutual-pin keeps the enrollment
+    /// cause. This is the exact text the first-failure error! / eprintln! and the preflight print.
+    #[test]
+    fn capability_only_failure_guidance_omits_enrollment() {
+        let cap = dial_failure_causes(true);
+        assert!(
+            !cap.contains("enroll") && !cap.contains("allowed_clients"),
+            "capability-only guidance must not blame enrollment: {cap}"
+        );
+        assert!(
+            cap.contains("not authorized")
+                && cap.contains("expired")
+                && cap.contains("unreachable"),
+            "capability-only guidance must name the real causes: {cap}"
+        );
+        let pin = dial_failure_causes(false);
+        assert!(
+            pin.contains("allowed_clients"),
+            "mutual-pin guidance must keep the enrollment cause: {pin}"
+        );
+    }
+
+    /// Finding C: a FAILED preflight aborts BEFORE the ready banner AND BEFORE binding the local port.
+    /// We squat the local addr (so a bind would fail with Io/AddrInUse if it were reached), point
+    /// `forward` at a LIVE capability-only relay that rejects our (bogus) capability, and assert
+    /// `run()` returns `Preflight` — proving the preflight runs first and the port is never bound.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn failed_preflight_aborts_before_bind_and_banner() {
+        use boatramp_overlay::{
+            OverlayPeerPolicy, OverlaySecret, RelayClientAuth, run_forwarding_router,
+            server_endpoint,
+        };
+
+        // Squat the local port: if `run()` ever reached TcpListener::bind it would fail AddrInUse (Io).
+        let squatter = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local = squatter.local_addr().unwrap();
+
+        // A live capability-only relay (AcceptAny) that will reject the bogus capability at the gate.
+        let root = OverlaySecret::generate().unwrap();
+        let relay = OverlaySecret::generate().unwrap();
+        let relay_id = relay.id();
+        let egress_id = OverlaySecret::generate().unwrap().id();
+        let client = OverlaySecret::generate().unwrap();
+        let relay_ep = server_endpoint(
+            &relay,
+            &OverlayPeerPolicy::AcceptAny,
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .unwrap();
+        let relay_addr = relay_ep.local_addr().unwrap();
+        tokio::spawn(run_forwarding_router(
+            relay_ep,
+            root.id().to_public(),
+            RelayClientAuth::CapabilityOnly,
+            move |s: &str| {
+                (s == "svc/db").then_some(("127.0.0.1:9".parse().unwrap(), egress_id, true))
+            },
+        ));
+
+        let args = ForwardArgs {
+            local: local.to_string(),
+            target: Some("svc/db".into()),
+            ticket: None,
+            server: None,
+            relay: Some(relay_addr),
+            relay_id: Some(relay_id.to_hex()),
+            egress_id: Some(egress_id.to_hex()),
+            token: Some("not-a-valid-cose-capability".into()),
+            token_file: None,
+            identity: Some(client.seed_hex().to_string()),
+            capability_only: true,
+        };
+        let config = crate::config::ProjectConfig::default();
+        let res = run(args, &config).await;
+        assert!(
+            matches!(res, Err(ForwardError::Preflight(_))),
+            "expected a preflight abort before bind, got {res:?}"
+        );
+        drop(squatter);
     }
 }
