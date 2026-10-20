@@ -17,6 +17,7 @@
 
 pub mod circuit;
 pub mod e2ee;
+pub mod ice;
 pub mod net;
 pub mod quic;
 
