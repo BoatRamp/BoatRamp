@@ -107,7 +107,7 @@ where
     let mut framed_r = FramedRead::new(link.read, codec());
     let mut framed_w = FramedWrite::new(link.write, codec());
     let mut tx = TxPortal::new(window);
-    let mut rx = RxPortal::new();
+    let mut rx = RxPortal::new(window);
     // Segments sent but not yet cumulatively acked, kept for retransmit on rebind.
     let mut outstanding: BTreeMap<u64, Bytes> = BTreeMap::new();
     let mut live = true;
@@ -257,6 +257,9 @@ impl CircuitId {
     }
 }
 
+/// The rebind-sender routing table: `(circuit, peer)` → the running pump's rebind channel.
+type RebindRoutes = HashMap<(CircuitId, OverlayId), mpsc::Sender<LinkHalves>>;
+
 /// In-memory map from `(circuit, peer)` to the running pump's rebind sender.
 ///
 /// Runtime state only — never persisted (overlay guardrail 3). A relay/egress
@@ -264,7 +267,7 @@ impl CircuitId {
 /// stream is handed to that pump via [`CircuitRegistry::route_resume`].
 #[derive(Clone, Default)]
 pub struct CircuitRegistry {
-    inner: Arc<RwLock<HashMap<(CircuitId, OverlayId), mpsc::Sender<LinkHalves>>>>,
+    inner: Arc<RwLock<RebindRoutes>>,
 }
 
 impl CircuitRegistry {

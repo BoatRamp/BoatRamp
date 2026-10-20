@@ -1002,7 +1002,13 @@ pub fn verify_overlay_dial(
     now_unix: u64,
 ) -> Result<VerifiedOverlayDial, TokenError> {
     let claims = verify_envelope(token, public)?;
-    check_exp(&claims, now_unix)?;
+    // An overlay-dial capability MUST be time-bounded (LOW-3): a token with no `exp` is refused
+    // rather than treated as immortal — an unbounded dial capability is never acceptable.
+    if check_exp(&claims, now_unix)?.is_none() {
+        return Err(TokenError::Claims(
+            "overlay-dial capability has no expiry".into(),
+        ));
+    }
     let mut kind = None;
     let mut holder = None;
     let mut scope = None;
@@ -3408,5 +3414,45 @@ mod tests {
         raw[mid] ^= 0x01;
         let tampered = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&raw);
         assert!(verify_s3_session(&tampered, &public, NOW + 1).is_err());
+    }
+
+    #[tokio::test]
+    async fn overlay_dial_round_trips_and_requires_an_expiry() {
+        let root = LocalSigner::generate(TokenAlg::Es256);
+        let root_pub = root.public_key();
+        let holder = LocalSigner::generate(TokenAlg::Es256);
+        let holder_pub = holder.public_key();
+
+        // A properly-minted capability (exp = now + ttl) verifies and carries holder + scope.
+        let good = mint_overlay_dial(&holder_pub, "svc/db", 300, NOW, &root)
+            .await
+            .unwrap();
+        let v = verify_overlay_dial(&good, &root_pub, NOW).unwrap();
+        assert_eq!(v.holder, holder_pub.to_hex());
+        assert_eq!(v.scope, "svc/db");
+
+        // A token with NO `exp` claim — otherwise identical and correctly signed — is REFUSED
+        // (LOW-3): an overlay-dial capability is never treated as immortal.
+        let no_exp = ClaimsSetBuilder::new()
+            .issued_at(Timestamp::WholeSeconds(NOW as i64))
+            .cwt_id(random_cti().unwrap())
+            .text_claim(
+                CLAIM_KIND.to_string(),
+                CborValue::Text(KIND_OVERLAY_DIAL.to_string()),
+            )
+            .text_claim(CLAIM_CNF.to_string(), CborValue::Text(holder_pub.to_hex()))
+            .text_claim(
+                CLAIM_OVERLAY_SCOPE.to_string(),
+                CborValue::Text("svc/db".to_string()),
+            )
+            .build();
+        let no_exp = sign_claims(no_exp, &root).await.unwrap();
+        assert!(
+            matches!(
+                verify_overlay_dial(&no_exp, &root_pub, NOW),
+                Err(TokenError::Claims(_))
+            ),
+            "an overlay-dial capability with no expiry must be refused"
+        );
     }
 }

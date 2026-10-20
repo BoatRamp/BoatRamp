@@ -10,9 +10,9 @@
 //!
 //! This first vertical splices E2EE records straight over the QUIC bi-stream. The resumable circuit
 //! pump (IU-5) is wired into the data path with direct-path promotion (IU-7), where its rebind is
-//! what makes promotion lossless. The `forward_flow_fd` C-ABI seam (adopting an OS socket fd) is for
-//! wiretangler's native OS clients and is added with that client lib; the `boatramp forward` CLI
-//! (IU-10) calls [`forward_flow`] directly with the accepted connection.
+//! what makes promotion lossless. A future `forward_flow_fd` C-ABI seam (adopting an OS socket fd)
+//! for a native OS client library can wrap [`forward_flow`]; the `boatramp forward` CLI (IU-10)
+//! calls [`forward_flow`] directly with the accepted connection.
 
 use std::net::SocketAddr;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -23,7 +23,7 @@ use std::time::Duration;
 use boatramp_core::cose::TokenPublicKey;
 use boatramp_overlay_proto::circuit::{DEFAULT_SEGMENT, DEFAULT_WINDOW};
 use boatramp_overlay_proto::dial::{DialRequest, DialVerdict, authorize_dial};
-use boatramp_overlay_proto::e2ee::{Role, Session};
+use boatramp_overlay_proto::e2ee::{Opener, Role, Sealer};
 use boatramp_overlay_proto::ice::Signal;
 use boatramp_overlay_proto::identity::{OverlayId, OverlaySecret};
 use boatramp_overlay_proto::peer_policy::OverlayPeerPolicy;
@@ -37,7 +37,7 @@ use tokio::time::timeout;
 
 use crate::circuit::{CircuitError, LinkHalves, run_circuit_duplex};
 use crate::direct::{PathMode, negotiate_direct};
-use crate::e2ee::{SpliceError, establish, splice};
+use crate::e2ee::{SpliceError, establish, read_lp, splice, write_lp};
 use crate::ice::gather;
 use crate::quic::{self, QuicError};
 
@@ -158,10 +158,24 @@ where
         None,
     )
     .await?;
+    // Zero-trust egress: present the dial capability END-TO-END, sealed inside the E2EE channel, so
+    // the egress authorizes against its own trust root and the cryptographically-proven client
+    // identity — the relay's gate is only a best-effort DoS filter, never the authz boundary.
+    let (mut sealer, opener) = session.split();
+    let control = serde_json::to_vec(&request)?;
+    write_lp(
+        &mut send,
+        &sealer
+            .seal(&control)
+            .map_err(|e| NetError::Splice(e.into()))?,
+    )
+    .await?;
+
     let (lr, lw) = tokio::io::split(local);
     let owned = OverlaySecret::from_seed_hex(&secret.seed_hex())?;
     run_spliced_circuit_promotable(
-        session,
+        sealer,
+        opener,
         lr,
         lw,
         recv,
@@ -191,7 +205,9 @@ async fn recv_candidates(
 ) -> Option<boatramp_overlay_proto::ice::CandidateSet> {
     let msg = timeout(deadline, signaling.recv()).await.ok()??;
     match Signal::decode(&msg).ok()? {
-        Signal::Candidates(set) => Some(set),
+        // Sanitize the peer-supplied set at this untrusted boundary (LOW-1): cap the count and drop
+        // undialable addresses before it can steer the hole-punch.
+        Signal::Candidates(set) => Some(set.sanitized()),
         Signal::Observed(_) => None,
     }
 }
@@ -200,6 +216,7 @@ async fn recv_candidates(
 /// hole-punch a direct link pinned to `peer_id`, prime it with the promote marker, and rebind the
 /// circuit pump onto it. Holds the direct connection as the drain handle until the flow ends. A
 /// no-op under `Relay`; fails closed under `DirectOnly`; falls back to the relay under `PreferDirect`.
+#[allow(clippy::too_many_arguments)]
 async fn promote(
     secret: OverlaySecret,
     peer_id: OverlayId,
@@ -286,7 +303,8 @@ async fn promote(
 /// and promotion — `try_join!` so a `DirectOnly` promotion failure tears the flow down.
 #[allow(clippy::too_many_arguments)]
 async fn run_spliced_circuit_promotable<AR, AW>(
-    session: Session,
+    sealer: Sealer,
+    opener: Opener,
     app_r: AR,
     app_w: AW,
     link_recv: RecvStream,
@@ -301,7 +319,6 @@ where
     AR: AsyncRead + Unpin,
     AW: AsyncWrite + Unpin,
 {
-    let (sealer, opener) = session.split();
     let (splice_side, pump_side) = tokio::io::duplex(SEALED_PIPE_BUF);
     let (ss_r, ss_w) = tokio::io::split(splice_side);
     let (ps_r, ps_w) = tokio::io::split(pump_side);
@@ -425,11 +442,25 @@ async fn bridge(
 }
 
 /// Egress/terminator: complete the E2EE handshake on the accepted connection (learning the client
-/// identity), then bridge the session to the backend service at `backend_addr`.
+/// identity), **independently authorize** the dial capability the client presents end-to-end, then
+/// bridge the session to the backend service at `backend_addr`.
+///
+/// Zero-trust (Security HIGH-1): the egress never trusts the relay's gate as its authorization
+/// boundary. After the handshake it reads the overlay-dial capability the client seals into the
+/// E2EE channel and verifies it HERE — against its own `trust_root` and the cryptographically
+/// proven (E2EE-learned) `client_id`, scope-matching the requested service — **before** connecting
+/// the backend. A relay that skips, forges, or is bypassed around its gate cannot reach the backend:
+/// the capability is signed by the trust root and holder-bound to the client's key, and it rides the
+/// sealed channel the relay is blind to, so the relay can neither mint nor read it. The service →
+/// backend mapping is the egress's own deployment config (this terminator serves one `backend_addr`;
+/// a multi-service egress resolves `request.service` against its own service map); the capability's
+/// scope — not the relay's routing — is the authorization.
 pub async fn terminate_one(
     conn: Connection,
     secret: &OverlaySecret,
     backend_addr: SocketAddr,
+    trust_root: &TokenPublicKey,
+    encryption_required: bool,
     path_mode: PathMode,
 ) -> Result<(), NetError> {
     let (mut send, mut recv) = conn
@@ -438,9 +469,35 @@ pub async fn terminate_one(
         .map_err(|e| NetError::Stream(e.to_string()))?;
 
     // The E2EE handshake learns the client identity (the responder does not pin it in advance); it
-    // is the identity the direct-path promotion pins its link to.
+    // is the identity the dial capability must be holder-bound to, and that direct-path promotion
+    // pins its link to.
     let (session, client_id) =
         establish(&mut send, &mut recv, secret, Role::Responder, None, None).await?;
+    let (sealer, mut opener) = session.split();
+
+    // Zero-trust authz: open the sealed dial capability the client presents end-to-end (the first
+    // record after the handshake) and verify it against the trust root + the E2EE-proven client
+    // identity — not on the relay's say-so — before touching the backend.
+    let sealed = read_lp(&mut recv, MAX_DIAL_MSG).await?.ok_or_else(|| {
+        NetError::Stream("client closed before presenting the dial capability".into())
+    })?;
+    let control = opener
+        .open(&sealed)
+        .map_err(|e| NetError::Splice(e.into()))?;
+    let request: DialRequest = serde_json::from_slice(&control)?;
+    match authorize_dial(
+        &request,
+        &client_id,
+        trust_root,
+        now_unix(),
+        encryption_required,
+    ) {
+        DialVerdict::Accept { .. } => {}
+        DialVerdict::Reject(reason) => {
+            let _ = timeout(wire::DIRECT_DRAIN, conn.closed()).await;
+            return Err(NetError::DialRejected(reason));
+        }
+    }
 
     let backend = tokio::net::TcpStream::connect(backend_addr).await?;
     let (br, bw) = backend.into_split();
@@ -448,7 +505,8 @@ pub async fn terminate_one(
     // Toward: the relay we were reached through — the routing hint for our host candidate.
     let toward = conn.remote_address();
     run_spliced_circuit_promotable(
-        session,
+        sealer,
+        opener,
         br,
         bw,
         recv,
@@ -502,11 +560,21 @@ mod tests {
         let egress_addr = egress_ep.local_addr().unwrap();
         {
             let egress = OverlaySecret::from_seed_hex(&egress.seed_hex()).unwrap();
+            let egress_root = root.id().to_public();
             tokio::spawn(async move {
                 while let Ok(Some(conn)) = quic::accept(&egress_ep).await {
                     let egress = OverlaySecret::from_seed_hex(&egress.seed_hex()).unwrap();
+                    let egress_root = egress_root.clone();
                     tokio::spawn(async move {
-                        let _ = terminate_one(conn, &egress, backend_addr, PathMode::Relay).await;
+                        let _ = terminate_one(
+                            conn,
+                            &egress,
+                            backend_addr,
+                            &egress_root,
+                            true,
+                            PathMode::Relay,
+                        )
+                        .await;
                     });
                 }
             });
@@ -633,12 +701,21 @@ mod tests {
         let egress_ep =
             quic::server_endpoint(&egress, &AcceptAny, "127.0.0.1:0".parse().unwrap()).unwrap();
         let egress_addr = egress_ep.local_addr().unwrap();
+        let egress_root = root.id().to_public();
         tokio::spawn(async move {
             while let Ok(Some(conn)) = quic::accept(&egress_ep).await {
                 let egress = OverlaySecret::from_seed_hex(&egress.seed_hex()).unwrap();
+                let egress_root = egress_root.clone();
                 tokio::spawn(async move {
-                    let _ =
-                        terminate_one(conn, &egress, backend_addr, PathMode::PreferDirect).await;
+                    let _ = terminate_one(
+                        conn,
+                        &egress,
+                        backend_addr,
+                        &egress_root,
+                        true,
+                        PathMode::PreferDirect,
+                    )
+                    .await;
                 });
             }
         });
@@ -718,5 +795,144 @@ mod tests {
 
         drop(app); // end the flow
         let _ = fwd.await;
+    }
+
+    /// Zero-trust egress proof (Security HIGH-1): a COMPROMISED relay that rubber-stamps every dial
+    /// (never runs the gate) still cannot get an unauthorized flow to the backend. The egress
+    /// verifies the sealed capability itself — against the trust root and the E2EE-proven client
+    /// identity — and refuses an out-of-scope token, so the backend is never even connected.
+    #[tokio::test]
+    async fn egress_refuses_unauthorized_dial_even_when_the_relay_does_not_gate() {
+        use tokio::io::AsyncWriteExt;
+
+        let root = OverlaySecret::generate().unwrap(); // dial-token trust root
+        let client = OverlaySecret::generate().unwrap();
+        let relay = OverlaySecret::generate().unwrap();
+        let egress = OverlaySecret::generate().unwrap();
+        let (client_id, relay_id, egress_id) = (client.id(), relay.id(), egress.id());
+
+        // Backend: a listener that MUST never be connected (the egress refuses first). It signals
+        // on the channel the instant anything connects — the test asserts that never happens.
+        let backend = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend.local_addr().unwrap();
+        let (hit_tx, mut hit_rx) = mpsc::channel::<()>(1);
+        tokio::spawn(async move {
+            if backend.accept().await.is_ok() {
+                let _ = hit_tx.send(()).await;
+            }
+        });
+
+        // Egress: zero-trust — trust_root = root, encryption required.
+        let egress_ep =
+            quic::server_endpoint(&egress, &AcceptAny, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let egress_addr = egress_ep.local_addr().unwrap();
+        let egress_root = root.id().to_public();
+        tokio::spawn(async move {
+            while let Ok(Some(conn)) = quic::accept(&egress_ep).await {
+                let egress = OverlaySecret::from_seed_hex(&egress.seed_hex()).unwrap();
+                let egress_root = egress_root.clone();
+                tokio::spawn(async move {
+                    let _ = terminate_one(
+                        conn,
+                        &egress,
+                        backend_addr,
+                        &egress_root,
+                        true,
+                        PathMode::Relay,
+                    )
+                    .await;
+                });
+            }
+        });
+
+        // A COMPROMISED relay: it accepts ANY dial WITHOUT gating (no `authorize_dial`), then
+        // bridges the stream to the egress blind. This is the whole point — the relay is not the
+        // authorization boundary.
+        let relay_ep = quic::server_endpoint(
+            &relay,
+            &Allowlist(BTreeSet::from([client_id])),
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .unwrap();
+        let relay_addr = relay_ep.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok(Some(conn)) = quic::accept(&relay_ep).await {
+                tokio::spawn(async move {
+                    let Ok((mut cs, mut cr)) = conn.accept_bi().await else {
+                        return;
+                    };
+                    let Ok(_req) = read_msg::<DialRequest>(&mut cr).await else {
+                        return;
+                    };
+                    // Rubber-stamp: Accept, unconditionally, with no capability check at all.
+                    if write_msg(&mut cs, &DialVerdict::Accept { scope: "*".into() })
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    let Ok(ep) =
+                        quic::client_endpoint_server_auth(&OverlayPeerPolicy::Pin(egress_id))
+                    else {
+                        return;
+                    };
+                    let Ok(ec) = quic::dial(&ep, egress_addr).await else {
+                        return;
+                    };
+                    let Ok((es, er)) = ec.open_bi().await else {
+                        return;
+                    };
+                    let _ = bridge(cr, cs, er, es).await;
+                });
+            }
+        });
+
+        // The client holds a token scoped to `svc/other`, but asks for `svc/echo` — out of scope.
+        let token = mint_overlay_dial(
+            &client.id().to_public(),
+            "svc/other",
+            3600,
+            now_unix(),
+            &root.signer(),
+        )
+        .await
+        .unwrap();
+        let client_ep = quic::client_endpoint(&client, &Pin(relay_id)).unwrap();
+        let (mut app, app_far) = tokio::io::duplex(64 * 1024);
+        let fwd = tokio::spawn(async move {
+            forward_flow(
+                app_far,
+                &client_ep,
+                relay_addr,
+                &client,
+                egress_id,
+                DialRequest {
+                    service: "svc/echo".into(),
+                    token,
+                    e2ee: true,
+                },
+                PathMode::Relay,
+            )
+            .await
+        });
+
+        // Push bytes at it; the egress must refuse before the backend is ever connected.
+        let _ = app.write_all(b"unauthorized").await;
+
+        // The backend must NEVER be connected: nothing arrives on the hit channel.
+        let connected =
+            tokio::time::timeout(std::time::Duration::from_secs(3), hit_rx.recv()).await;
+        assert!(
+            connected.is_err(),
+            "the backend must never be connected for an unauthorized dial that only the compromised relay let through"
+        );
+
+        // And the client's flow fails — the egress tore it down.
+        drop(app);
+        let outcome = fwd.await.unwrap();
+        assert!(
+            outcome.is_err(),
+            "an unauthorized flow must fail at the zero-trust egress, got {outcome:?}"
+        );
     }
 }

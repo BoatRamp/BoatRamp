@@ -159,34 +159,72 @@ impl TxPortal {
 
 /// Receive-side reassembly: buffers out-of-order segments, delivers the
 /// contiguous prefix in order, and dedups by offset so a retransmitted segment
-/// is harmless.
-#[derive(Debug, Default)]
+/// is harmless. Out-of-order buffering is bounded to one receive `window` (both
+/// by starting offset and by total retained bytes) so a hostile or buggy peer
+/// cannot pin unbounded memory ahead of the contiguous frontier.
+#[derive(Debug)]
 pub struct RxPortal {
     next_expected: u64,
     buffered: BTreeMap<u64, Bytes>,
+    /// Out-of-order buffering ceiling, in bytes — mirrors the sender's in-flight
+    /// window, which a correct sender never exceeds.
+    window: u64,
+    /// Bytes currently held in `buffered` (kept in step with it).
+    buffered_bytes: usize,
 }
 
 impl RxPortal {
+    /// A receive portal that buffers at most `window` bytes of out-of-order data
+    /// ahead of the contiguous frontier.
     #[must_use]
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(window: usize) -> Self {
+        Self {
+            next_expected: 0,
+            buffered: BTreeMap::new(),
+            window: window as u64,
+            buffered_bytes: 0,
+        }
     }
 
     /// Accept a payload segment. A segment entirely below `next_expected` has
     /// already been delivered (a retransmit) and is dropped; a duplicate of a
     /// still-buffered segment is ignored.
+    ///
+    /// Out-of-contract segments are dropped rather than buffered: one whose end
+    /// offset overflows `u64` (LOW-2 — malformed; a correct sender never nears
+    /// `u64::MAX`), one that begins at or beyond `next_expected + window`, or one
+    /// that would push retained bytes past the window (MEDIUM-1 — a correct
+    /// sender bounds its in-flight bytes to the window, so neither ever fires for
+    /// it; a peer that violates the contract simply does not get its bytes
+    /// buffered). The in-order segment (`offset == next_expected`) is always
+    /// admitted so the stream can always drain.
     pub fn accept(&mut self, offset: u64, data: Bytes) {
         if data.is_empty() {
             return;
         }
-        let end = offset + data.len() as u64;
+        let Some(end) = offset.checked_add(data.len() as u64) else {
+            return; // LOW-2: malformed offset (u64 overflow)
+        };
         if end <= self.next_expected {
-            return; // wholly delivered already
+            return; // wholly delivered already (retransmit)
+        }
+        // MEDIUM-1: bound out-of-order buffering to one window — but always admit
+        // the in-order segment so progress is never starved.
+        if offset != self.next_expected {
+            if offset >= self.next_expected.saturating_add(self.window) {
+                return; // begins beyond the window
+            }
+            if self.buffered_bytes.saturating_add(data.len()) > self.window as usize {
+                return; // would exceed the retained-bytes ceiling
+            }
         }
         // Whole-segment retransmit model: offsets are assigned per segment and
         // retransmitted verbatim, so a live segment starts exactly at its
         // original offset. Keep the first copy seen.
-        self.buffered.entry(offset).or_insert(data);
+        if let std::collections::btree_map::Entry::Vacant(e) = self.buffered.entry(offset) {
+            self.buffered_bytes = self.buffered_bytes.saturating_add(data.len());
+            e.insert(data);
+        }
     }
 
     /// Pop the contiguous run of segments starting at `next_expected`, advancing
@@ -198,7 +236,8 @@ impl RxPortal {
                 break;
             }
             let data = self.buffered.remove(&offset).expect("just peeked");
-            self.next_expected += data.len() as u64;
+            self.buffered_bytes = self.buffered_bytes.saturating_sub(data.len());
+            self.next_expected = self.next_expected.saturating_add(data.len() as u64);
             ready.push(data);
         }
         ready
@@ -261,7 +300,7 @@ mod tests {
 
     #[test]
     fn rx_reassembles_in_order_and_cumulative_acks() {
-        let mut rx = RxPortal::new();
+        let mut rx = RxPortal::new(DEFAULT_WINDOW);
         // Out-of-order arrival: [5..10) before [0..5).
         rx.accept(5, Bytes::from_static(b"world"));
         assert!(rx.take_ready().is_empty()); // nothing contiguous yet
@@ -274,7 +313,7 @@ mod tests {
 
     #[test]
     fn rx_dedups_a_retransmitted_segment() {
-        let mut rx = RxPortal::new();
+        let mut rx = RxPortal::new(DEFAULT_WINDOW);
         rx.accept(0, Bytes::from_static(b"abcd"));
         assert_eq!(rx.take_ready().concat(), b"abcd");
         // Retransmit of an already-delivered segment is dropped (no dup).
@@ -287,5 +326,35 @@ mod tests {
         rx.accept(4, Bytes::from_static(b"efgh"));
         assert_eq!(rx.take_ready().concat(), b"efghijkl");
         assert_eq!(rx.ack(), 12);
+    }
+
+    #[test]
+    fn rx_bounds_out_of_order_buffering_to_one_window() {
+        // MEDIUM-1: a peer cannot pin unbounded memory ahead of the frontier.
+        let mut rx = RxPortal::new(8);
+        // A segment that begins at or beyond next_expected + window is dropped.
+        rx.accept(8, Bytes::from_static(b"X"));
+        assert_eq!(rx.ack(), 0);
+        assert!(rx.take_ready().is_empty());
+
+        // Fill most of the window with out-of-order bytes (offsets within [0, 8)).
+        rx.accept(2, Bytes::from_static(b"cdef")); // [2..6) -> 4 bytes buffered
+        rx.accept(6, Bytes::from_static(b"gh")); // [6..8) -> 6 bytes buffered
+        // A further in-window but OVERLAPPING segment that would push retained bytes past the
+        // window is dropped (defends against overlapping-offset flooding): 6 + 5 = 11 > 8.
+        rx.accept(3, Bytes::from_static(b"ZZZZZ"));
+        // The in-order segment is always admitted, even when the buffer is full.
+        rx.accept(0, Bytes::from_static(b"ab"));
+        assert_eq!(rx.take_ready().concat(), b"abcdefgh");
+        assert_eq!(rx.ack(), 8);
+    }
+
+    #[test]
+    fn rx_drops_a_segment_whose_offset_overflows() {
+        // LOW-2: a malformed near-u64::MAX offset must not panic on overflow.
+        let mut rx = RxPortal::new(DEFAULT_WINDOW);
+        rx.accept(u64::MAX - 1, Bytes::from_static(b"overflow"));
+        assert!(rx.take_ready().is_empty());
+        assert_eq!(rx.ack(), 0);
     }
 }

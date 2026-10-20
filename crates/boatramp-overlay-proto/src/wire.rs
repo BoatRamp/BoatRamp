@@ -64,10 +64,9 @@ pub const TAG_IDENTITY_FP: &[u8] = b"bro-identity-fp-v1";
 /// (IU-7). Must be written before the stream is handed to the circuit pump.
 pub const PROMOTE_MARKER: &[u8] = b"bro-promote-v1";
 
-/// Capability-root context stamped into / checked on the overlay-dial COSE
-/// token (IU-2) — the audience/context that scopes a dial capability to the
-/// overlay (vs. boatramp's other COSE token kinds).
-pub const ROOT_CONTEXT: &str = "bro-root";
+// A dial capability is scoped by its COSE trust-root key plus the `br_kind =
+// "overlay-dial"` token kind and scope claim (see `boatramp_core::cose`), so no
+// separate wire-level root-context string is needed or shipped.
 
 // --- E2EE record framing (IU-4) --------------------------------------------
 
@@ -119,7 +118,6 @@ mod tests {
             std::str::from_utf8(TAG_SAS).unwrap(),
             std::str::from_utf8(TAG_IDENTITY_FP).unwrap(),
             std::str::from_utf8(PROMOTE_MARKER).unwrap(),
-            ROOT_CONTEXT,
         ] {
             assert!(!s.contains("wt"), "wire id `{s}` leaks `wt`");
             assert!(

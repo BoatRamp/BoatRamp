@@ -37,7 +37,10 @@ pub enum SpliceError {
 }
 
 /// Write a length-delimited blob (4-byte big-endian length prefix).
-async fn write_lp(w: &mut (impl AsyncWrite + Unpin), buf: &[u8]) -> Result<(), SpliceError> {
+pub(crate) async fn write_lp(
+    w: &mut (impl AsyncWrite + Unpin),
+    buf: &[u8],
+) -> Result<(), SpliceError> {
     w.write_all(&(buf.len() as u32).to_be_bytes()).await?;
     w.write_all(buf).await?;
     w.flush().await?;
@@ -45,7 +48,7 @@ async fn write_lp(w: &mut (impl AsyncWrite + Unpin), buf: &[u8]) -> Result<(), S
 }
 
 /// Read a length-delimited blob, bounded by `max`. `Ok(None)` on a clean EOF at a frame boundary.
-async fn read_lp(
+pub(crate) async fn read_lp(
     r: &mut (impl AsyncRead + Unpin),
     max: usize,
 ) -> Result<Option<Vec<u8>>, SpliceError> {
@@ -124,6 +127,7 @@ where
 /// a side channel, so a relay cannot read or forge it. Delivery to `signaling_in` is non-blocking: a
 /// full/closed signaling queue must never stall the data path. A clean EOF on either side
 /// half-closes the other.
+#[allow(clippy::too_many_arguments)]
 pub async fn splice<AR, AW, LS, LR>(
     mut sealer: Sealer,
     mut opener: Opener,

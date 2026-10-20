@@ -222,11 +222,10 @@ pub fn open_signed_share(
     let (pubkey, sig) = tail.split_at(X25519_PUB_LEN);
     let id = OverlayId::try_from_bytes(pubkey.try_into().expect("32 bytes"))
         .map_err(|e| E2eeError::Signature(e.to_string()))?;
-    if let Some(expected) = expect {
-        if id != *expected {
+    if let Some(expected) = expect
+        && id != *expected {
             return Err(E2eeError::IdentityMismatch);
         }
-    }
     let mut tbs = Vec::with_capacity(wire::TAG_E2EE_SHARE.len() + share.len());
     tbs.extend_from_slice(wire::TAG_E2EE_SHARE);
     tbs.extend_from_slice(share);

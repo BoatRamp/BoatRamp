@@ -214,7 +214,7 @@ impl OverlaySecret {
     /// The tagged `"ed25519:<hex>"` seed, for persistence. Zeroized on drop.
     #[must_use]
     pub fn seed_hex(&self) -> Zeroizing<String> {
-        Zeroizing::new(format!("ed25519:{}", hex::encode(&*self.seed)))
+        Zeroizing::new(format!("ed25519:{}", hex::encode(*self.seed)))
     }
 
     /// This identity's public [`OverlayId`].

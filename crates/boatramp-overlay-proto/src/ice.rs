@@ -6,9 +6,27 @@
 //! network-facing gathering (the connect-trick for the local source IP, STUN-lite reflexive
 //! discovery) lives in the runtime crate; this module is the pure model + the signaling wire type.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 
 use serde::{Deserialize, Serialize};
+
+/// Upper bound on candidates in a set. Caps the hole-punch dial loop and the memory a peer-supplied
+/// set can pin — a legitimate endpoint gathers a small handful (host interfaces + reflexive + relay).
+const MAX_CANDIDATES: usize = 16;
+
+/// Whether `addr` is a plausible dial target. Rejects the structurally-undialable — the unspecified
+/// address, port 0, multicast, and IPv4 broadcast — which a hole-punch must never aim at. Loopback
+/// and private/link-local ranges are kept: they are the valid on-box / same-LAN direct paths (and
+/// the loopback floor the tests and single-host deployments rely on).
+fn is_dialable(addr: &SocketAddr) -> bool {
+    if addr.port() == 0 {
+        return false;
+    }
+    match addr.ip() {
+        IpAddr::V4(ip) => !ip.is_unspecified() && !ip.is_multicast() && !ip.is_broadcast(),
+        IpAddr::V6(ip) => !ip.is_unspecified() && !ip.is_multicast(),
+    }
+}
 
 /// The kind of transport address a candidate names, most-preferred first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -57,18 +75,34 @@ impl CandidateSet {
         Self::default()
     }
 
-    /// Add a candidate (deduped); the set stays priority-ordered.
+    /// Add a candidate (deduped, count-capped at [`MAX_CANDIDATES`]); the set stays priority-ordered.
     pub fn add(&mut self, candidate: Candidate) {
-        if !self.0.contains(&candidate) {
-            self.0.push(candidate);
-            self.sort();
+        if self.0.len() >= MAX_CANDIDATES || self.0.contains(&candidate) {
+            return;
         }
+        self.0.push(candidate);
+        self.sort();
+    }
+
+    /// A copy sanitized for a candidate set learned from an **untrusted peer** (over `CH_SIGNAL`):
+    /// undialable addresses are dropped and the count is capped (LOW-1), so a hostile peer can
+    /// neither aim the hole-punch at a bogus address nor flood the dial loop. Applied at the
+    /// signaling boundary before the set reaches [`crate`]'s direct-path negotiation.
+    #[must_use]
+    pub fn sanitized(&self) -> Self {
+        let mut out = Self::new();
+        for c in &self.0 {
+            if is_dialable(&c.addr) {
+                out.add(*c); // enforces the cap, dedup, and priority order
+            }
+        }
+        out
     }
 
     fn sort(&mut self) {
         // Highest priority first; ties keep insertion order (stable sort).
         self.0
-            .sort_by(|a, b| b.kind.priority().cmp(&a.kind.priority()));
+            .sort_by_key(|c| std::cmp::Reverse(c.kind.priority()));
     }
 
     /// The candidates, most-preferred first.
@@ -177,5 +211,30 @@ mod tests {
 
         let obs = Signal::Observed(addr("203.0.113.7:51000"));
         assert_eq!(Signal::decode(&obs.encode().unwrap()).unwrap(), obs);
+    }
+
+    #[test]
+    fn sanitized_drops_undialable_but_keeps_loopback() {
+        let set = CandidateSet::from_iter([
+            Candidate::new(CandidateKind::Host, addr("0.0.0.0:5000")), // unspecified: drop
+            Candidate::new(CandidateKind::Host, addr("192.168.1.2:0")), // port 0: drop
+            Candidate::new(CandidateKind::Host, addr("224.0.0.1:5000")), // multicast: drop
+            Candidate::new(CandidateKind::Host, addr("192.168.1.2:5000")), // private: keep
+            Candidate::new(CandidateKind::Relay, addr("127.0.0.1:9000")), // loopback: keep (floor)
+        ]);
+        let addrs: Vec<_> = set.sanitized().as_slice().iter().map(|c| c.addr).collect();
+        assert_eq!(addrs, [addr("192.168.1.2:5000"), addr("127.0.0.1:9000")]);
+    }
+
+    #[test]
+    fn candidate_count_is_capped() {
+        let mut set = CandidateSet::new();
+        for p in 0..(MAX_CANDIDATES as u16 + 10) {
+            set.add(Candidate::new(
+                CandidateKind::Host,
+                addr(&format!("10.0.0.1:{}", p + 1)),
+            ));
+        }
+        assert_eq!(set.len(), MAX_CANDIDATES);
     }
 }
