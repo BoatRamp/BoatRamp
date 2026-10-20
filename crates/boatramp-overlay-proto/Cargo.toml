@@ -1,0 +1,34 @@
+[package]
+name = "boatramp-overlay-proto"
+version.workspace = true
+readme.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "boatramp overlay fabric — pure protocol & crypto core (identity, peer policy, relay-blind E2EE, resumable circuit framing, capability dial). No async or transport stack; depends only on boatramp substrate."
+
+[dependencies]
+# Substrate only (overlay guardrail 1): identity/capability come from the COSE
+# machinery, raw-pubkey trust from rpktls. NOTHING from the platform
+# (boatramp-server/-node/-handlers) and NO tokio/quinn — this crate is the pure
+# core so the relay-blind/local-signer invariants hold by the crate graph.
+# `authz` exposes `boatramp_core::cose` — the identity/signer/capability
+# machinery the overlay is built on (not optional for the overlay).
+boatramp-core = { workspace = true, features = ["authz"] }
+boatramp-rpktls = { workspace = true }
+thiserror = { workspace = true }
+hex = { workspace = true }
+# Secret seed material is held in a zeroizing buffer (matches rpktls).
+zeroize = "1"
+# bech32m rendering of identities (`bro1…`) — a friendly form only; the
+# canonical identity stays boatramp-core hex. No bech32 existed in the tree.
+bech32 = "0.11"
+
+[lints]
+workspace = true

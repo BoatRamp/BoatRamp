@@ -9,6 +9,7 @@ members = [
   "crates/boatramp-handlers",
   "crates/boatramp-acme",
   "crates/boatramp-rpktls",
+  "crates/boatramp-overlay-proto",
   "crates/boatramp-cluster",
   "crates/boatramp-firecracker",
   "crates/boatramp-container",
@@ -86,6 +87,7 @@ result_large_err = "allow"
 boatramp-types = { path = "crates/boatramp-types", version = "0.40.0" }
 boatramp-core = { path = "crates/boatramp-core", version = "0.40.0" }
 boatramp-rpktls = { path = "crates/boatramp-rpktls", version = "0.40.0" }
+boatramp-overlay-proto = { path = "crates/boatramp-overlay-proto", version = "0.40.0" }
 boatramp-mcp = { path = "crates/boatramp-mcp", version = "0.40.0" }
 boatramp-storage = { path = "crates/boatramp-storage", version = "0.40.0" }
 boatramp-server = { path = "crates/boatramp-server", version = "0.40.0" }
