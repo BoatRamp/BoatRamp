@@ -35,6 +35,16 @@ env:
   PORTABLE_FEATURES: "tls,handlers,cluster,s3,cloudflare-kv,compression,bundler,oidc"
 
 jobs:
+  # Pre-delivery PRECONDITION: the full nightly matrix (all-features test + nix checks + NixOS-service
+  # VM + operator kind-e2e), run on the EXACT tagged commit via the shared reusable workflow. Every
+  # publishing job below gates on this (`needs: … preflight`), so nothing — GHCR image, GitHub
+  # release, or crates.io — ships unless the whole matrix is green on the release commit. (Owner
+  # decision: nightly is a release precondition; this enforces the ordering structurally instead of
+  # relying on running it by hand before the tag.)
+  preflight:
+    uses: ./.github/workflows/preflight-matrix.yml
+    secrets: inherit
+
   # The web console (`console`, a default feature) is a wasm32 Trunk build — no
   # cross-OS toolchain, so build it once here via the Nix flake and hand the dist
   # to every native binary build as an artifact. `boatramp-server/build.rs` bakes
@@ -235,7 +245,7 @@ jobs:
 
   release:
     name: publish release
-    needs: build
+    needs: [build, preflight]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -273,7 +283,7 @@ jobs:
 
   container:
     name: GHCR images (base + cloudflare, Nix)
-    needs: build
+    needs: [build, preflight]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
@@ -416,11 +426,12 @@ jobs:
           nix run nixpkgs#kubernetes-helm -- push \
             "dist/boatramp-operator-${tag}.tgz" "oci://ghcr.io/${owner}/charts"
 
-  # Publish the workspace to crates.io. Gated three ways: it runs only on a real
-  # `vX.Y.Z` tag push (never the workflow_dispatch dry run), only after `build`
-  # AND `container` (the GHCR images) are green, and only once a human approves the
-  # `crates-io` environment (a required-reviewer rule set in repo Settings >
-  # Environments). The `needs: [build, container]` is load-bearing: a crates.io
+  # Publish the workspace to crates.io. Gated four ways: it runs only on a real
+  # `vX.Y.Z` tag push (never the workflow_dispatch dry run), only after `preflight`
+  # (the full nightly matrix on the release commit), only after `build` AND `container`
+  # (the GHCR images) are green, and only once a human approves the `crates-io`
+  # environment (a required-reviewer rule set in repo Settings >
+  # Environments). The `needs: [build, container, preflight]` is load-bearing: a crates.io
   # publish is IRREVERSIBLE (a version can't be overwritten — a later break forces a
   # version bump + re-cut), while the binaries and GHCR images are rebuildable from
   # the tag. So the irreversible step MUST go last: gating it on `container` means
@@ -433,7 +444,7 @@ jobs:
   # rerun after a rate-limit stall picks up where it left off.
   crates-io:
     name: publish to crates.io
-    needs: [build, container]
+    needs: [build, container, preflight]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     environment: crates-io
     runs-on: ubuntu-latest

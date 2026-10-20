@@ -1,0 +1,200 @@
+name: Preflight matrix
+
+# The heavy, comprehensive pre-delivery sweep — a REUSABLE workflow (`workflow_call`) invoked by BOTH
+# the scheduled `Nightly` (daily drift detection) AND the `Release` workflow (as a `preflight` job the
+# publish jobs gate on, so nothing ships until this whole matrix is green on the exact release commit;
+# owner decision: nightly is a release PRECONDITION). Split out of per-push CI because on a stock
+# runner these take ~80 min (all-features) and ~175 min (nix) — too slow to gate
+# every push. Runs daily (via Nightly), before every release (via Release), or on demand.
+#   • test (all features)  — runs the whole feature matrix's test suite (a network-
+#                            capable runner, which the nix sandbox can't provide)
+#   • nix (…)              — the reproducible nix checks + the release-cache warm, FANNED
+#                            OUT across parallel runners (was one serial `nix flake check`
+#                            job that summed to ~1h43m): glibc clippy, musl clippy (all-
+#                            features, shipped target), the NixOS-service VM, and the
+#                            static-musl + OCI-image release artifacts — each ALONE on its
+#                            own runner so it uses all cores and the critical path is the
+#                            slowest single leg, not their sum. The crane dep closure is
+#                            shared via cachix (each leg substitutes it, never recompiles).
+#   • nix (flake eval …)   — whole-flake eval hygiene (`--no-build`) + the fast pre-commit
+#                            check (rustfmt · typos · anyhow-ban), kept off the heavy legs.
+# all-features *compile* coverage on musl now runs PER-PUSH as CI's `shipped-clippy`
+# Tier 1 gate (the crane-cached `musl-clippy` check), not here — so the only thing left
+# on the host toolchain in this workflow is the all-features test *run* (target-agnostic
+# logic a network-capable runner can host, which the nix sandbox can't).
+on:
+  workflow_call: # invoked by Nightly (scheduled) and Release (as a publish-gating preflight job)
+  workflow_dispatch: # on-demand (Run workflow ▸)
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+
+jobs:
+  test:
+    name: test (all features)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # Stock runners ship ~14 GB free — not enough for a debug `--all-features`
+      # build of this workspace. Reclaim the preinstalled toolchains we don't use
+      # (Android SDK, .NET, GHC, CodeQL) for ~25 GB of headroom.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          df -h /
+
+      # Compiling all features (wasmtime, cranelift, cedar, openraft, …) peaks above
+      # the runner's 7 GB RAM and rustc gets OOM-killed. A big swapfile on the roomy
+      # /mnt disk absorbs the spikes.
+      - name: Add swap
+        run: |
+          sudo swapoff -a || true
+          sudo rm -f /mnt/swapfile
+          sudo fallocate -l 12G /mnt/swapfile
+          sudo chmod 600 /mnt/swapfile
+          sudo mkswap /mnt/swapfile
+          sudo swapon /mnt/swapfile
+          free -h
+
+      # aws-lc-rs (pulled by the `tls` / `s3` features) needs cmake + nasm. Both are
+      # preinstalled on the runner, so skip apt (and its flaky third-party repos)
+      # unless they're genuinely missing.
+      - name: Ensure build deps
+        run: |
+          if command -v cmake >/dev/null && command -v nasm >/dev/null; then
+            echo "cmake + nasm already present"
+          else
+            sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake nasm
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # all-features *clippy* runs per-push as CI's `shipped-clippy` gate (the crane-cached
+      # `checks.musl-clippy` derivation on the shipped musl target). This lane runs the
+      # all-features test *suite* on a network-capable runner (the nix sandbox can't host it).
+      - name: Test (all features)
+        run: cargo test --workspace --all-features
+
+  # The heavy nix work, FANNED OUT across parallel runners. Was a single serial job
+  # (`nix flake check` then the release-cache warm) that summed to ~1h43m; each leg now
+  # runs ALONE on its own 4-vCPU/16 GB runner, so the critical path is the slowest single
+  # leg (~30m) instead of the sum. `fail-fast: false` so one failing leg still lets the
+  # others report. The crane dep closure is shared through cachix — each leg substitutes
+  # it rather than recompiling the third-party graph.
+  #
+  # The `release artifacts` leg builds the EXACT Linux release outputs — the fully-static
+  # musl + jemalloc binary AND both OCI images. Per-push CI compiles glibc only, so a
+  # musl-only breakage (e.g. a dep constructing `cmsghdr`/`msghdr` with struct literals
+  # that omit musl's private fields) sails through every green gate and only surfaces at
+  # release time. Building `.#container` / `.#container-cloudflare` here (not just
+  # `.#boatramp-static`) also warms the release GHCR cache: in v0.4.15 the GHCR job's
+  # `.#container` resolved its embedded binary to a DIFFERENT store path than the cached
+  # `.#boatramp-static` (static = cavx8…, container = 6vqi…, same tag), so caching only the
+  # bare binary left GHCR cold — a ~36 min recompile. Building the exact container closure
+  # here (pushed to cachix via the post-step) lets the release GHCR job substitute it.
+  nix:
+    name: nix (${{ matrix.leg.label }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        leg:
+          - label: glibc clippy
+            build: .#checks.x86_64-linux.clippy
+          # musl clippy (--all-features --all-targets on the shipped target) now runs
+          # per-push as CI's `shipped-clippy` Tier 1 gate, so it's dropped here to avoid
+          # duplicating a ~30-min leg on the same commit. glibc clippy stays — a distinct
+          # target that catches glibc-only lints the musl gate can't.
+          - label: nixos-service vm
+            build: .#checks.x86_64-linux.nixos-service
+          - label: release artifacts + OCI images
+            build: .#boatramp-static .#container .#container-cloudflare
+    steps:
+      - uses: actions/checkout@v5
+      # A leg compiles the whole workspace (and, for the VM leg, a NixOS image) into
+      # /nix/store on the runner's cramped root disk. Reclaim the preinstalled toolchains
+      # (Android SDK, .NET, GHC, CodeQL) for ~25 GB of headroom.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          df -h /
+      # An all-features compile peaks above the runner's 16 GB RAM and rustc gets
+      # OOM-killed (signal 9); swap on the roomy /mnt disk absorbs the spikes so a leg can
+      # safely use all cores (`--cores 4` below).
+      - name: Add swap
+        run: |
+          sudo swapoff -a || true
+          sudo rm -f /mnt/swapfile
+          sudo fallocate -l 12G /mnt/swapfile
+          sudo chmod 600 /mnt/swapfile
+          sudo mkswap /mnt/swapfile
+          sudo swapon /mnt/swapfile
+          free -h
+      - uses: DeterminateSystems/nix-installer-action@main
+      # Pull the compiled dependency closure from the project's own Cachix (kept warm by
+      # `cache.yml` on every push to main), and push newly-built derivations back so later
+      # runs — and the release GHCR job — reuse them.
+      - uses: cachix/cachix-action@v15
+        with:
+          name: boatramp
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+      # Each leg is the only heavy build on its runner, so `--cores 4` uses the whole box
+      # (swap absorbs the RAM spike). `--max-jobs 1` still serializes any uncached
+      # sub-derivations (e.g. the release leg's static-binary → container chain) so a cold
+      # cache can't run two full compiles at once and OOM.
+      - name: Build ${{ matrix.leg.label }}
+        run: nix build ${{ matrix.leg.build }} --print-build-logs --max-jobs 1 --cores 4
+
+  # Whole-flake eval hygiene (every output on every system evaluates — catches a broken
+  # devShell / package / nixosModule that the per-leg builds above don't force) plus the
+  # fast pre-commit check (rustfmt · typos · anyhow-ban). Both cheap, kept off the heavy
+  # legs so they report in ~1-2 min.
+  nix-eval:
+    name: nix (flake eval + pre-commit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: cachix/cachix-action@v15
+        with:
+          name: boatramp
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+      - name: Flake eval (all outputs, no build)
+        run: nix flake check --no-build --print-build-logs
+      - name: Pre-commit check (rustfmt, typos, anyhow ban)
+        run: nix build .#checks.x86_64-linux.pre-commit --print-build-logs --max-jobs 1 --cores 4
+
+  k8s-e2e:
+    name: operator e2e (kind)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          df -h /
+      - uses: helm/kind-action@v1
+        with:
+          cluster_name: boatramp-e2e
+      - uses: azure/setup-helm@v4
+      # Install → found a 3-node cluster → scale 3→5→3 → rolling upgrade →
+      # kill-pod recovery, quorum-verified at each step. The kind cluster is
+      # created by kind-action above; the script reuses it (KEEP=1) and builds +
+      # loads the operator image itself.
+      - name: Operator e2e
+        env:
+          PROVIDER: kind
+          CLUSTER: boatramp-e2e
+          KEEP: "1"
+        run: scripts/e2e-k8s.sh
