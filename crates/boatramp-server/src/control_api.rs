@@ -553,6 +553,57 @@ pub(super) async fn create_join_token(
 /// Default lifetime of a minted overlay-dial capability (an overlay-dial cap MUST be time-bounded).
 const DEFAULT_OVERLAY_DIAL_TTL_SECS: u64 = 3600;
 
+/// Clamp a dial request's requested TTL (Security MEDIUM-D): an absent request defaults to
+/// [`DEFAULT_OVERLAY_DIAL_TTL_SECS`], and any requested value is capped at the server `max` — so a
+/// caller cannot mint a near-immortal, irrevocable (offline-verified) dial capability.
+fn clamp_dial_ttl(requested: Option<u64>, max: u64) -> u64 {
+    requested.unwrap_or(DEFAULT_OVERLAY_DIAL_TTL_SECS).min(max)
+}
+
+/// Defense-in-depth (INFO-1, mirrors [`assert_kv_checkpoint_is_system_admin`]): re-derive that `POST
+/// /api/overlay/dial` is gated `Overlay·Write` inside the handler, so a router/table refactor that
+/// drops it from the authed group cannot silently open unauthenticated dial-capability minting.
+fn assert_overlay_dial_is_overlay_write() -> Option<Response> {
+    use boatramp_core::authz::{Action, Resource, Right};
+    match Right::required("POST", "/api/overlay/dial") {
+        Some(right)
+            if right.resource == Resource::Overlay
+                && right.target.is_none()
+                && right.action == Action::Write =>
+        {
+            None
+        }
+        _ => Some(
+            (
+                StatusCode::FORBIDDEN,
+                "overlay dial requires Overlay·Write\n",
+            )
+                .into_response(),
+        ),
+    }
+}
+
+/// Defense-in-depth (INFO-1): re-derive that `GET /api/overlay/services` is gated `Overlay·Read`.
+fn assert_overlay_services_is_overlay_read() -> Option<Response> {
+    use boatramp_core::authz::{Action, Resource, Right};
+    match Right::required("GET", "/api/overlay/services") {
+        Some(right)
+            if right.resource == Resource::Overlay
+                && right.target.is_none()
+                && right.action == Action::Read =>
+        {
+            None
+        }
+        _ => Some(
+            (
+                StatusCode::FORBIDDEN,
+                "overlay service directory requires Overlay·Read\n",
+            )
+                .into_response(),
+        ),
+    }
+}
+
 /// `POST /api/overlay/dial` request: resolve `service` + mint a dial capability bound to the
 /// caller's overlay identity (`holder_pubkey`, `ed25519:<hex>`).
 #[derive(Deserialize)]
@@ -569,6 +620,8 @@ struct OverlayDialResponse {
     relay: String,
     relay_id: String,
     egress_id: String,
+    /// The relay's client-auth posture — the client uses it to choose its TLS posture when dialing.
+    relay_client_auth: String,
     token: String,
     expires_at: u64,
 }
@@ -580,6 +633,7 @@ struct OverlayServiceEntry {
     relay: String,
     relay_id: String,
     egress_id: String,
+    client_auth: String,
 }
 
 /// Resolve a service to its overlay topology and mint a holder-bound dial capability for it, signed
@@ -590,6 +644,9 @@ pub(super) async fn overlay_dial(
     Extension(directory): Extension<OverlayDirectory>,
     Json(request): Json<OverlayDialRequest>,
 ) -> Response {
+    if let Some(forbidden) = assert_overlay_dial_is_overlay_write() {
+        return forbidden;
+    }
     let Some(signer) = issuer.0 else {
         return (
             StatusCode::NOT_IMPLEMENTED,
@@ -617,7 +674,18 @@ pub(super) async fn overlay_dial(
                 .into_response();
         }
     };
-    let ttl = request.ttl_secs.unwrap_or(DEFAULT_OVERLAY_DIAL_TTL_SECS);
+    // INFO-2 — an overlay identity is ed25519-only; an es256 holder would yield a silently-unusable
+    // cap (the overlay handshake can't present it), so reject it early with an actionable 400.
+    if holder.alg() != cose::TokenAlg::Ed25519 {
+        return (
+            StatusCode::BAD_REQUEST,
+            "holder_pubkey must be an ed25519 overlay identity (es256 keys cannot dial)\n",
+        )
+            .into_response();
+    }
+    // MEDIUM-D — clamp the requested lifetime to the server cap (an offline-verified dial cap has no
+    // revocation, so an unbounded TTL is a standing risk).
+    let ttl = clamp_dial_ttl(request.ttl_secs, directory.max_dial_ttl_secs());
     let now = now_unix();
     match cose::mint_overlay_dial(&holder, &request.service, ttl, now, &*signer).await {
         Ok(token) => (
@@ -626,6 +694,7 @@ pub(super) async fn overlay_dial(
                 relay: target.relay.clone(),
                 relay_id: target.relay_id.clone(),
                 egress_id: target.egress_id.clone(),
+                relay_client_auth: target.client_auth.clone(),
                 token,
                 expires_at: now.saturating_add(ttl),
             }),
@@ -639,6 +708,9 @@ pub(super) async fn overlay_dial(
 pub(super) async fn overlay_services(
     Extension(directory): Extension<OverlayDirectory>,
 ) -> Response {
+    if let Some(forbidden) = assert_overlay_services_is_overlay_read() {
+        return forbidden;
+    }
     let services: Vec<OverlayServiceEntry> = directory
         .iter()
         .map(|(service, t)| OverlayServiceEntry {
@@ -646,6 +718,7 @@ pub(super) async fn overlay_services(
             relay: t.relay.clone(),
             relay_id: t.relay_id.clone(),
             egress_id: t.egress_id.clone(),
+            client_auth: t.client_auth.clone(),
         })
         .collect();
     Json(services).into_response()
@@ -1540,5 +1613,40 @@ pub(super) async fn delete_email_profile(
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => (StatusCode::NOT_FOUND, "no matching email profile\n").into_response(),
         Err(err) => email_error_response(err),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// MEDIUM-D: an oversized (or unset) `ttl_secs` is clamped to the server cap; a value under the
+    /// cap is honored verbatim. This is the exact decision `overlay_dial` applies before minting.
+    #[test]
+    fn dial_ttl_is_clamped_to_the_server_max() {
+        let max = 24 * 60 * 60;
+        // A near-immortal request is capped at the server max (the attack MEDIUM-D closes).
+        assert_eq!(clamp_dial_ttl(Some(u64::MAX), max), max);
+        assert_eq!(clamp_dial_ttl(Some(max + 1), max), max);
+        // A request at/under the cap is honored.
+        assert_eq!(clamp_dial_ttl(Some(60), max), 60);
+        assert_eq!(clamp_dial_ttl(Some(max), max), max);
+        // An absent ttl defaults, then is itself subject to the cap.
+        assert_eq!(clamp_dial_ttl(None, max), DEFAULT_OVERLAY_DIAL_TTL_SECS);
+        assert_eq!(clamp_dial_ttl(None, 60), 60);
+    }
+
+    /// INFO-1: the handler-level re-checks agree with the router `Right::required` table — so the
+    /// defense-in-depth guard admits exactly the right the route is gated at, not a stale mismatch.
+    #[test]
+    fn overlay_handler_rechecks_match_the_route_table() {
+        assert!(
+            assert_overlay_dial_is_overlay_write().is_none(),
+            "POST /api/overlay/dial must be gated Overlay·Write"
+        );
+        assert!(
+            assert_overlay_services_is_overlay_read().is_none(),
+            "GET /api/overlay/services must be gated Overlay·Read"
+        );
     }
 }

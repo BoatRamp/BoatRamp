@@ -733,7 +733,7 @@ async fn spawn_overlay_roles(
 ) -> Result<boatramp_server::OverlayDirectory> {
     use boatramp_core::cose::TokenPublicKey;
     use boatramp_overlay::{
-        OverlayId, OverlayPeerPolicy, OverlaySecret, PathMode, run_egress_router,
+        OverlayId, OverlayPeerPolicy, OverlaySecret, PathMode, RelayClientAuth, run_egress_router,
         run_forwarding_router, server_endpoint,
     };
     use std::collections::{BTreeMap, BTreeSet};
@@ -798,6 +798,54 @@ async fn spawn_overlay_roles(
                 Error::ClusterStartup(format!("[overlay] allowed_client {c}: {e}"))
             })?);
         }
+        // Client-auth posture (Security Blocker #1 / Option A). EXPLICIT — never inferred from an
+        // empty allowlist (the empty→accept-any inference was a fail-closed→fail-open-on-omission
+        // footgun). `capability-only` = AcceptAny at TLS + the capability gate + egress re-authz;
+        // `mutual-pin` = the allowlist RPK pin as a strictly-more-restrictive pre-filter. A relay with
+        // neither a posture nor any allowed_clients is a HARD ERROR (we will not guess open).
+        let (policy, client_auth, client_auth_str) = match ov.client_auth.as_deref() {
+            Some("capability-only") => (
+                OverlayPeerPolicy::AcceptAny,
+                RelayClientAuth::CapabilityOnly,
+                "capability-only",
+            ),
+            Some("mutual-pin") => {
+                if clients.is_empty() {
+                    return Err(Error::ClusterStartup(
+                        "[overlay] client_auth = \"mutual-pin\" needs a non-empty `allowed_clients` \
+                         to pin (or use \"capability-only\")"
+                            .into(),
+                    ));
+                }
+                (
+                    OverlayPeerPolicy::Allowlist(clients),
+                    RelayClientAuth::MutualPin,
+                    "mutual-pin",
+                )
+            }
+            Some(other) => {
+                return Err(Error::ClusterStartup(format!(
+                    "[overlay] client_auth {other:?} is unknown (want \"capability-only\" or \
+                     \"mutual-pin\")"
+                )));
+            }
+            // Back-compat: a non-empty allowlist with no explicit posture is the mutual-pin it always
+            // was (the strictly-more-restrictive choice). An EMPTY allowlist with no posture is the
+            // footgun — refuse rather than silently flip to accept-any.
+            None if !clients.is_empty() => (
+                OverlayPeerPolicy::Allowlist(clients),
+                RelayClientAuth::MutualPin,
+                "mutual-pin",
+            ),
+            None => {
+                return Err(Error::ClusterStartup(
+                    "[overlay] a relay needs an explicit `client_auth` (\"capability-only\" or \
+                     \"mutual-pin\"); with neither a posture nor any `allowed_clients` it would \
+                     accept any client, which must be opted into, never defaulted"
+                        .into(),
+                ));
+            }
+        };
         let relay_id_hex = overlay_id.to_hex();
         let mut routes: BTreeMap<String, (std::net::SocketAddr, OverlayId, bool)> = BTreeMap::new();
         for r in &ov.routes {
@@ -823,17 +871,19 @@ async fn spawn_overlay_roles(
                     relay: bind.to_string(),
                     relay_id: relay_id_hex.clone(),
                     egress_id: id.to_string(),
+                    client_auth: client_auth_str.to_string(),
                 },
             ));
         }
-        let ep = server_endpoint(&secret, &OverlayPeerPolicy::Allowlist(clients), bind)
+        let ep = server_endpoint(&secret, &policy, bind)
             .map_err(|e| Error::ClusterStartup(format!("[overlay] relay listen {bind}: {e}")))?;
         let trust = trust_root.clone();
         let resolve = move |s: &str| routes.get(s).copied();
-        tracing::info!(%bind, overlay_id = %overlay_id.to_hex(), routes = ov.routes.len(), "overlay: serving relay/ingress");
-        tokio::spawn(run_forwarding_router(ep, trust, resolve));
+        tracing::info!(%bind, overlay_id = %overlay_id.to_hex(), routes = ov.routes.len(), ?client_auth, "overlay: serving relay/ingress");
+        tokio::spawn(run_forwarding_router(ep, trust, client_auth, resolve));
     }
-    Ok(boatramp_server::OverlayDirectory::from_entries(directory))
+    Ok(boatramp_server::OverlayDirectory::from_entries(directory)
+        .with_max_dial_ttl(ov.max_dial_ttl_secs))
 }
 
 pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {

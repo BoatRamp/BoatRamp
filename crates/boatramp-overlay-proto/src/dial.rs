@@ -73,6 +73,40 @@ pub fn authorize_dial(
     if verified.holder != presented.to_hex() {
         return DialVerdict::Reject(DialReject::HolderMismatch);
     }
+    finish_scope_and_encryption(verified, request, encryption_required)
+}
+
+/// Authorize a dial WITHOUT holder-binding — the relay in **capability-only** mode (Security
+/// Blocker #1 / Option A). Verifies the capability under `trust_root` (signature + expiry + kind),
+/// confirms the requested service is within scope, and enforces `encryption_required` — but does NOT
+/// bind to a transport identity, because an `AcceptAny` relay has no proven client cert to bind to.
+///
+/// Holder-binding is NOT skipped overall: it is still enforced downstream at the **egress**, against
+/// the cryptographically E2EE-proven client identity (the load-bearing zero-trust authority, HIGH-1).
+/// This gate's job is the relay's remaining load-bearing duty: a dial carrying no valid, in-scope,
+/// unexpired capability is refused HERE, so the relay never amplifies an unauthenticated flood into
+/// an egress dial. It is NOT a blind forwarder.
+#[must_use]
+pub fn authorize_dial_capability_only(
+    request: &DialRequest,
+    trust_root: &TokenPublicKey,
+    now_unix: u64,
+    encryption_required: bool,
+) -> DialVerdict {
+    let verified = match verify_overlay_dial(&request.token, trust_root, now_unix) {
+        Ok(v) => v,
+        Err(e) => return DialVerdict::Reject(DialReject::InvalidCapability(e.to_string())),
+    };
+    finish_scope_and_encryption(verified, request, encryption_required)
+}
+
+/// The scope + encryption tail shared by [`authorize_dial`] and [`authorize_dial_capability_only`],
+/// so the two gates can never drift on what "in scope" or "E2EE-required" means.
+fn finish_scope_and_encryption(
+    verified: boatramp_core::cose::VerifiedOverlayDial,
+    request: &DialRequest,
+    encryption_required: bool,
+) -> DialVerdict {
     if verified.scope != "*" && verified.scope != request.service {
         return DialVerdict::Reject(DialReject::ServiceNotAuthorized);
     }

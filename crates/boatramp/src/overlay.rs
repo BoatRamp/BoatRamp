@@ -191,6 +191,9 @@ pub struct ServiceEntry {
     pub relay: String,
     pub relay_id: String,
     pub egress_id: String,
+    /// The relay's client-auth posture ("capability-only" | "mutual-pin").
+    #[serde(default)]
+    pub client_auth: String,
 }
 
 impl Rendered for OverlayOutput {
@@ -210,9 +213,13 @@ impl Rendered for OverlayOutput {
                 Ok(())
             }
             Self::Resolved(s) => {
-                writeln!(w, "service:   {}", s.service)?;
-                writeln!(w, "relay:     {} ({})", s.relay, s.relay_id)?;
-                writeln!(w, "egress id: {}", s.egress_id)
+                writeln!(w, "service:     {}", s.service)?;
+                writeln!(w, "relay:       {} ({})", s.relay, s.relay_id)?;
+                writeln!(w, "egress id:   {}", s.egress_id)?;
+                if !s.client_auth.is_empty() {
+                    writeln!(w, "client auth: {}", s.client_auth)?;
+                }
+                Ok(())
             }
             Self::Granted {
                 ticket,
@@ -420,6 +427,10 @@ pub(crate) struct DialResponseBody {
     pub relay: String,
     pub relay_id: String,
     pub egress_id: String,
+    /// The relay's client-auth posture ("capability-only" | "mutual-pin"); selects the client's TLS
+    /// posture when dialing (capability-only ⇒ present no client cert).
+    #[serde(default)]
+    pub relay_client_auth: String,
     pub token: String,
 }
 

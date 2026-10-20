@@ -16,10 +16,11 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use boatramp_overlay::{
     DialRequest, OverlayId, OverlayPeerPolicy, OverlaySecret, PathMode, client_endpoint,
-    forward_flow,
+    client_endpoint_server_auth, forward_flow,
 };
 use clap::Args;
 use tokio::net::TcpListener;
@@ -63,6 +64,11 @@ pub struct ForwardArgs {
     /// with a `--holder-pub` ticket.
     #[arg(long)]
     pub identity: Option<String>,
+    /// Dial the relay server-auth-only (present NO client certificate) — for a **capability-only**
+    /// relay reached via `--ticket`/explicit flags (where the egress is the authority). Self-serve
+    /// learns the relay's posture from the control plane and sets this automatically.
+    #[arg(long)]
+    pub capability_only: bool,
 }
 
 /// A `forward` failure.
@@ -90,6 +96,13 @@ pub enum ForwardError {
     TicketServiceMismatch { ticket: String, arg: String },
     #[error("overlay discovery: {0}")]
     Discovery(String),
+    #[error(
+        "not authorized to self-serve overlay forwards — your boatramp token needs the \
+         `Overlay·Write` right.\n  \
+         Ask an admin to grant you an overlay role (e.g. a token minted with `--role overlay`), or \
+         use a `--ticket` from `boatramp overlay grant` for a control-plane-less forward."
+    )]
+    Unauthorized,
 }
 
 impl From<crate::overlay::Error> for ForwardError {
@@ -126,11 +139,23 @@ fn load_token(args: &ForwardArgs) -> Result<String, ForwardError> {
     Err(ForwardError::NoToken)
 }
 
+/// The fully-resolved inputs a forward needs, from any source (self-serve, ticket, explicit flags).
+struct ResolvedForward {
+    relay: SocketAddr,
+    relay_id: String,
+    egress_id: String,
+    service: String,
+    token: String,
+    identity: String,
+    /// The relay's client-auth posture. `true` ⇒ **capability-only** relay: dial server-auth-only,
+    /// presenting NO client cert (the relay accepts any key; the egress is the authority). `false` ⇒
+    /// **mutual-pin** relay: present the client's RPK cert so the relay can pin it. Self-serve learns
+    /// this from the control plane; ticket/explicit take it from `--capability-only` (default mutual).
+    capability_only: bool,
+}
+
 /// Resolve the connection parameters from a `--ticket` (the common case) or the explicit flags.
-/// Returns `(relay, relay_id, egress_id, service, token, identity_spec)`.
-fn resolve_params(
-    args: &ForwardArgs,
-) -> Result<(SocketAddr, String, String, String, String, String), ForwardError> {
+fn resolve_params(args: &ForwardArgs) -> Result<ResolvedForward, ForwardError> {
     if let Some(blob) = &args.ticket {
         let t = crate::overlay::ForwardTicket::decode(blob)
             .map_err(|e| ForwardError::Ticket(e.to_string()))?;
@@ -153,7 +178,15 @@ fn resolve_params(
             .relay
             .parse::<SocketAddr>()
             .map_err(|_| ForwardError::Ticket(format!("bad relay address `{}`", t.relay)))?;
-        Ok((relay, t.relay_id, t.egress_id, t.service, t.token, identity))
+        Ok(ResolvedForward {
+            relay,
+            relay_id: t.relay_id,
+            egress_id: t.egress_id,
+            service: t.service,
+            token: t.token,
+            identity,
+            capability_only: args.capability_only,
+        })
     } else {
         let service = args.target.clone().ok_or(ForwardError::NoTarget)?;
         let token = load_token(args)?;
@@ -161,24 +194,33 @@ fn resolve_params(
         let relay = args.relay.ok_or(ForwardError::NoRelay)?;
         let relay_id = args.relay_id.clone().ok_or(ForwardError::NoRelay)?;
         let egress_id = args.egress_id.clone().ok_or(ForwardError::NoRelay)?;
-        Ok((relay, relay_id, egress_id, service, token, identity))
+        Ok(ResolvedForward {
+            relay,
+            relay_id,
+            egress_id,
+            service,
+            token,
+            identity,
+            capability_only: args.capability_only,
+        })
     }
 }
 
 /// Self-serve resolution: resolve the service's topology AND mint a dial capability via the control
 /// plane, authenticated by the operator's own boatramp token + persistent overlay identity. This is
-/// the headline `boatramp forward svc/<name>` path — zero hand-typed topology, zero manual grant.
+/// the headline `boatramp forward svc/<name>` path — zero hand-typed topology, and no per-dial grant
+/// once the operator's token carries `Overlay·Write`.
 async fn resolve_via_control_plane(
     args: &ForwardArgs,
     config: &crate::config::ProjectConfig,
-) -> Result<(SocketAddr, String, String, String, String, String), ForwardError> {
+) -> Result<ResolvedForward, ForwardError> {
     let service = args.target.clone().ok_or(ForwardError::NoTarget)?;
     // The operator's persistent overlay identity (its seed is also the forward identity).
     let secret = crate::overlay::operator_identity()?;
     let holder_pubkey = secret.id().to_hex();
     let (server, http) = crate::client::connect(args.server.clone(), config)
         .map_err(|e| ForwardError::Discovery(e.to_string()))?;
-    let resp: crate::overlay::DialResponseBody = http
+    let resp = http
         .post(format!("{server}/api/overlay/dial"))
         .json(&crate::overlay::DialRequestBody {
             service: service.clone(),
@@ -186,9 +228,24 @@ async fn resolve_via_control_plane(
         })
         .send()
         .await
-        .map_err(|e| ForwardError::Discovery(e.to_string()))?
-        .error_for_status()
-        .map_err(|e| ForwardError::Discovery(e.to_string()))?
+        .map_err(|e| ForwardError::Discovery(e.to_string()))?;
+    // Read the status explicitly (not `.error_for_status()`, which drops the server's actionable
+    // body): a 401/403 means the operator's token lacks `Overlay·Write` — surface the fix, not a
+    // bare status line (UX Blocker #2); any other non-success carries the server's own message.
+    let status = resp.status();
+    if matches!(status.as_u16(), 401 | 403) {
+        return Err(ForwardError::Unauthorized);
+    }
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        let body = body.trim();
+        return Err(ForwardError::Discovery(if body.is_empty() {
+            format!("control plane returned {status} resolving `{service}`")
+        } else {
+            format!("control plane returned {status} resolving `{service}`: {body}")
+        }));
+    }
+    let resp: crate::overlay::DialResponseBody = resp
         .json()
         .await
         .map_err(|e| ForwardError::Discovery(e.to_string()))?;
@@ -196,14 +253,16 @@ async fn resolve_via_control_plane(
         .relay
         .parse::<SocketAddr>()
         .map_err(|_| ForwardError::Discovery(format!("bad relay address `{}`", resp.relay)))?;
-    Ok((
+    Ok(ResolvedForward {
         relay,
-        resp.relay_id,
-        resp.egress_id,
+        relay_id: resp.relay_id,
+        egress_id: resp.egress_id,
         service,
-        resp.token,
-        secret.seed_hex().to_string(),
-    ))
+        token: resp.token,
+        identity: secret.seed_hex().to_string(),
+        // The relay told us its posture; a capability-only relay is server-auth-only at TLS.
+        capability_only: resp.relay_client_auth == "capability-only",
+    })
 }
 
 /// Run the forwarder until interrupted.
@@ -213,19 +272,34 @@ pub async fn run(
 ) -> Result<(), ForwardError> {
     // Precedence: an explicit `--ticket` or `--relay` is the control-plane-less escape hatch;
     // otherwise `forward svc/<name>` self-serves through the control plane.
-    let (relay, relay_id_spec, egress_id_spec, service, token, identity_spec) =
-        if args.ticket.is_some() || args.relay.is_some() {
-            resolve_params(&args)?
-        } else {
-            resolve_via_control_plane(&args, config).await?
-        };
+    let resolved = if args.ticket.is_some() || args.relay.is_some() {
+        resolve_params(&args)?
+    } else {
+        resolve_via_control_plane(&args, config).await?
+    };
+    let ResolvedForward {
+        relay,
+        relay_id: relay_id_spec,
+        egress_id: egress_id_spec,
+        service,
+        token,
+        identity: identity_spec,
+        capability_only,
+    } = resolved;
 
     let secret = load_identity(&identity_spec)?;
     let relay_id = parse_id(&relay_id_spec)?;
     let egress_id = parse_id(&egress_id_spec)?;
 
-    // One dial-only endpoint pinning the relay, reused for every accepted connection.
-    let endpoint = client_endpoint(&secret, &OverlayPeerPolicy::Pin(relay_id))?;
+    // One dial-only endpoint pinning the relay, reused for every accepted connection. A capability-only
+    // relay is server-auth-only at TLS (it requests no client cert), so present NONE; a mutual-pin
+    // relay pins our RPK cert, so present it. (The E2EE identity to the egress is unaffected either
+    // way — it rides the sealed handshake, not the relay TLS.)
+    let endpoint = if capability_only {
+        client_endpoint_server_auth(&OverlayPeerPolicy::Pin(relay_id))?
+    } else {
+        client_endpoint(&secret, &OverlayPeerPolicy::Pin(relay_id))?
+    };
     let listener = TcpListener::bind(&args.local).await?;
     let bound = listener.local_addr()?;
 
@@ -236,6 +310,10 @@ pub async fn run(
     let secret = Arc::new(secret);
     let token = Arc::new(token);
     let service = Arc::new(service);
+    // A healthy-looking bound port whose every dial fails (not enrolled / cap not authorized /
+    // expired) is a silent trap. Escalate the FIRST failure to `error!` with the fix, so the
+    // operator sees "why" rather than a dead port; later failures stay at `warn!` (UX should-fix).
+    let first_failure = Arc::new(AtomicBool::new(false));
 
     loop {
         let (sock, _peer) = listener.accept().await?;
@@ -243,6 +321,7 @@ pub async fn run(
         let secret = Arc::clone(&secret);
         let token = Arc::clone(&token);
         let service = Arc::clone(&service);
+        let first_failure = Arc::clone(&first_failure);
         tokio::spawn(async move {
             let request = DialRequest {
                 service: (*service).clone(),
@@ -260,7 +339,18 @@ pub async fn run(
             )
             .await
             {
-                tracing::warn!(error = %e, "overlay forward connection failed");
+                if first_failure.swap(true, Ordering::Relaxed) {
+                    tracing::warn!(error = %e, "overlay forward connection failed");
+                } else {
+                    tracing::error!(
+                        error = %e, %service, %relay,
+                        "overlay forward FAILED on the first connection — the port is bound but the \
+                         dial is not getting through. Likely causes: this client identity is not \
+                         enrolled in the relay's `allowed_clients`; the dial capability is not \
+                         authorized for this service; or it has expired. Fix enrollment/authorization \
+                         and reconnect (later failures are logged at warn)."
+                    );
+                }
             }
         });
     }
@@ -321,17 +411,18 @@ mod tests {
         let w = Wrap::try_parse_from(["forward", "127.0.0.1:5432", "--ticket", &ticket]).unwrap();
         assert_eq!(w.args.local, "127.0.0.1:5432");
         assert!(w.args.target.is_none());
-        let (relay, relay_id, egress_id, service, token, identity) =
-            resolve_params(&w.args).unwrap();
-        assert_eq!(relay.to_string(), "10.0.0.1:9100");
+        let r = resolve_params(&w.args).unwrap();
+        assert_eq!(r.relay.to_string(), "10.0.0.1:9100");
         assert_eq!(
-            (relay_id, egress_id),
+            (r.relay_id, r.egress_id),
             ("ed25519:aa".into(), "ed25519:bb".into())
         );
         assert_eq!(
-            (service, token, identity),
+            (r.service, r.token, r.identity),
             ("svc/db".into(), "tok".into(), "ed25519:cc".into())
         );
+        // A ticket defaults to mutual-pin (grant enrolls the client); no --capability-only here.
+        assert!(!r.capability_only);
     }
 
     /// `--ticket` conflicts with the explicit relay flags.
@@ -379,8 +470,8 @@ mod tests {
     async fn ticket_drives_a_live_forward_to_the_backend() {
         use boatramp_core::cose::{LocalSigner, TokenAlg, mint_overlay_dial};
         use boatramp_overlay::{
-            OverlayPeerPolicy, OverlaySecret, PathMode, forward_flow, run_egress_router,
-            run_forwarding_router, server_endpoint,
+            OverlayPeerPolicy, OverlaySecret, PathMode, RelayClientAuth, forward_flow,
+            run_egress_router, run_forwarding_router, server_endpoint,
         };
         use std::collections::BTreeSet;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -436,9 +527,12 @@ mod tests {
         )
         .unwrap();
         let relay_addr = relay_ep.local_addr().unwrap();
-        tokio::spawn(run_forwarding_router(relay_ep, root_pub, move |s: &str| {
-            (s == "svc/db").then_some((egress_addr, egress_id, true))
-        }));
+        tokio::spawn(run_forwarding_router(
+            relay_ep,
+            root_pub,
+            RelayClientAuth::MutualPin,
+            move |s: &str| (s == "svc/db").then_some((egress_addr, egress_id, true)),
+        ));
 
         // Mint the dial capability the way `overlay grant` does, and package it as a ticket.
         let now = std::time::SystemTime::now()
@@ -460,7 +554,7 @@ mod tests {
         .unwrap();
 
         // Redeem it exactly as `forward --ticket` does: decode → connection params → forward_flow.
-        let (_r, rid, eid, service, tok, ident) = resolve_params(&ForwardArgs {
+        let r = resolve_params(&ForwardArgs {
             local: "unused".into(),
             target: None,
             ticket: Some(ticket),
@@ -471,8 +565,11 @@ mod tests {
             token: None,
             token_file: None,
             identity: None,
+            capability_only: false,
         })
         .unwrap();
+        let (rid, eid, service, tok, ident) =
+            (r.relay_id, r.egress_id, r.service, r.token, r.identity);
         let secret = load_identity(&ident).unwrap();
         let endpoint = quinn_client(&secret, &rid);
         let eid = parse_id(&eid).unwrap();
@@ -530,8 +627,8 @@ mod tests {
     async fn directory_resolve_and_mint_drives_a_live_forward() {
         use boatramp_core::cose::{LocalSigner, TokenAlg, mint_overlay_dial};
         use boatramp_overlay::{
-            OverlayPeerPolicy, OverlaySecret, PathMode, forward_flow, run_egress_router,
-            run_forwarding_router, server_endpoint,
+            OverlayPeerPolicy, OverlaySecret, PathMode, RelayClientAuth, forward_flow,
+            run_egress_router, run_forwarding_router, server_endpoint,
         };
         use boatramp_server::{OverlayDirectory, OverlayTarget};
         use std::collections::BTreeSet;
@@ -584,9 +681,12 @@ mod tests {
         )
         .unwrap();
         let relay_addr = relay_ep.local_addr().unwrap();
-        tokio::spawn(run_forwarding_router(relay_ep, root_pub, move |s: &str| {
-            (s == "svc/db").then_some((egress_addr, egress_id, true))
-        }));
+        tokio::spawn(run_forwarding_router(
+            relay_ep,
+            root_pub,
+            RelayClientAuth::MutualPin,
+            move |s: &str| (s == "svc/db").then_some((egress_addr, egress_id, true)),
+        ));
 
         // The directory the resolve route serves (built as `spawn_overlay_roles` builds it).
         let directory = OverlayDirectory::from_entries([(
@@ -595,6 +695,7 @@ mod tests {
                 relay: relay_addr.to_string(),
                 relay_id: relay_id.to_hex(),
                 egress_id: egress_id.to_hex(),
+                client_auth: "mutual-pin".to_string(),
             },
         )]);
 
@@ -640,6 +741,126 @@ mod tests {
         .expect("the discovery-driven forward delivers the echo in time")
         .unwrap();
         assert_eq!(got, b"discovery -> live backend");
+        let _ = fwd.await;
+    }
+
+    /// Security Blocker #1, the load-bearing proof: a FRESH client identity never pre-enrolled in any
+    /// allowlist self-serves end to end through a **capability-only** relay (`AcceptAny` + the
+    /// capability gate) → the egress's E2EE-proven holder-binding → the backend. This is the test
+    /// whose absence masked the bound-but-dead bug: it proves the relay does NOT need pre-enrollment
+    /// and that the egress re-authz is the real authority. The relay still gates the capability (a
+    /// no-cap dial is refused there) — the companion `capability_only_relay_refuses_a_dial_with_no_capability`
+    /// in the overlay crate proves that half.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn capability_only_relay_admits_a_never_enrolled_client_end_to_end() {
+        use boatramp_core::cose::{LocalSigner, TokenAlg, mint_overlay_dial};
+        use boatramp_overlay::{
+            OverlayPeerPolicy, OverlaySecret, PathMode, RelayClientAuth,
+            client_endpoint_server_auth, forward_flow, run_egress_router, run_forwarding_router,
+            server_endpoint,
+        };
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let root = LocalSigner::generate(TokenAlg::Es256);
+        let root_pub = {
+            use boatramp_core::cose::Signer;
+            root.public_key()
+        };
+        // A brand-new client identity. It is added to NO allowlist anywhere in this test.
+        let client = OverlaySecret::generate().unwrap();
+        let relay = OverlaySecret::generate().unwrap();
+        let egress = OverlaySecret::generate().unwrap();
+        let (relay_id, egress_id) = (relay.id(), egress.id());
+
+        let backend = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = backend.accept().await {
+                tokio::spawn(async move {
+                    let (mut r, mut w) = s.split();
+                    let _ = tokio::io::copy(&mut r, &mut w).await;
+                });
+            }
+        });
+
+        // Egress fronting svc/db, verifying dials against the root (E2EE-proven holder-binding here).
+        let egress_ep = server_endpoint(
+            &egress,
+            &OverlayPeerPolicy::AcceptAny,
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .unwrap();
+        let egress_addr = egress_ep.local_addr().unwrap();
+        {
+            let rp = root_pub.clone();
+            tokio::spawn(run_egress_router(
+                egress_ep,
+                egress,
+                move |s: &str| (s == "svc/db").then_some(backend_addr),
+                rp,
+                true,
+                PathMode::Relay,
+            ));
+        }
+
+        // Relay in CAPABILITY-ONLY mode: AcceptAny at TLS (no allowlist, no pre-enrollment) +
+        // RelayClientAuth::CapabilityOnly (the capability gate; holder-binding deferred to the egress).
+        let relay_ep = server_endpoint(
+            &relay,
+            &OverlayPeerPolicy::AcceptAny,
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .unwrap();
+        let relay_addr = relay_ep.local_addr().unwrap();
+        tokio::spawn(run_forwarding_router(
+            relay_ep,
+            root_pub,
+            RelayClientAuth::CapabilityOnly,
+            move |s: &str| (s == "svc/db").then_some((egress_addr, egress_id, true)),
+        ));
+
+        // A legitimately-minted cap for the fresh client, scope svc/db.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let token = mint_overlay_dial(&client.id().to_public(), "svc/db", 3600, now, &root)
+            .await
+            .unwrap();
+
+        // Dial through the relay exactly as self-serve `forward` does against a capability-only relay:
+        // server-auth-only (present NO client cert, since the relay is AcceptAny at TLS).
+        let endpoint = client_endpoint_server_auth(&OverlayPeerPolicy::Pin(relay_id)).unwrap();
+        let (mut app, app_far) = tokio::io::duplex(64 * 1024);
+        let fwd = tokio::spawn(async move {
+            forward_flow(
+                app_far,
+                &endpoint,
+                relay_addr,
+                &client,
+                egress_id,
+                DialRequest {
+                    service: "svc/db".into(),
+                    token,
+                    e2ee: true,
+                },
+                PathMode::Relay,
+            )
+            .await
+        });
+        app.write_all(b"never-enrolled -> live backend")
+            .await
+            .unwrap();
+        app.shutdown().await.unwrap();
+        let mut got = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            app.read_to_end(&mut got),
+        )
+        .await
+        .expect("a capability-only relay admits a never-enrolled client's valid cap in time")
+        .unwrap();
+        assert_eq!(got, b"never-enrolled -> live backend");
         let _ = fwd.await;
     }
 }

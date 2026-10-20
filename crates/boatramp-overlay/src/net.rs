@@ -22,7 +22,9 @@ use std::time::Duration;
 
 use boatramp_core::cose::TokenPublicKey;
 use boatramp_overlay_proto::circuit::{DEFAULT_SEGMENT, DEFAULT_WINDOW};
-use boatramp_overlay_proto::dial::{DialRequest, DialVerdict, authorize_dial};
+use boatramp_overlay_proto::dial::{
+    DialRequest, DialVerdict, authorize_dial, authorize_dial_capability_only,
+};
 use boatramp_overlay_proto::e2ee::{Opener, Role, Sealer};
 use boatramp_overlay_proto::ice::Signal;
 use boatramp_overlay_proto::identity::{OverlayId, OverlaySecret};
@@ -378,20 +380,40 @@ where
     Ok(())
 }
 
+/// How a relay authenticates dialing clients at the transport layer (Security Blocker #1 / Option A).
+/// The posture is set EXPLICITLY from `[overlay] client_auth` — never inferred from an empty
+/// allowlist (that empty→open inference was the fail-closed→fail-open-on-omission footgun the
+/// reviewer flagged).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RelayClientAuth {
+    /// The relay required + pinned the client's raw-public-key cert (an `Allowlist` endpoint), so it
+    /// has a proven client identity and enforces holder-binding too — a strictly-more-restrictive
+    /// pre-filter layered on top of the capability gate.
+    MutualPin,
+    /// The relay accepts any client key at TLS (`AcceptAny`) and has NO proven client identity, so it
+    /// gates on the capability alone (signature/expiry/kind/scope/encryption) and defers holder-binding
+    /// to the egress's E2EE-proven re-authz. A dial with no valid, in-scope capability is still refused
+    /// here (never a blind forwarder).
+    CapabilityOnly,
+}
+
 /// Relay/ingress: accept one client connection, capability-gate the dial, and forward the sealed
 /// stream to the egress **blind**. `resolve` maps a requested service to its egress
-/// `(addr, identity, encryption_required)`; `trust_root` verifies the dial capability.
+/// `(addr, identity, encryption_required)`; `trust_root` verifies the dial capability. `client_auth`
+/// selects whether the relay can also prove holder-binding (mutual-pin) or defers it to the egress
+/// (capability-only); in BOTH cases a dial with no valid in-scope capability is refused here.
 pub async fn forward_relay<F>(
     client: Connection,
     trust_root: &TokenPublicKey,
+    client_auth: RelayClientAuth,
     resolve: F,
 ) -> Result<(), NetError>
 where
     F: Fn(&str) -> Option<(SocketAddr, OverlayId, bool)>,
 {
     // Bound the accept + dial-request read with a deadline (MEDIUM-B): a client that opens a stream
-    // but stalls before sending its request cannot park a relay task. (The relay is mutual-auth —
-    // only enrolled clients reach here — so this is defense in depth; the egress's is load-bearing.)
+    // but stalls before sending its request cannot park a relay task. (Defense in depth under
+    // mutual-pin; load-bearing under capability-only, where any key may connect.)
     let (mut client_send, client_recv, request) = timeout(HANDSHAKE_TIMEOUT, async {
         let (client_send, mut client_recv) = client
             .accept_bi()
@@ -402,8 +424,10 @@ where
     })
     .await
     .map_err(|_| NetError::Stream("relay dial-request timed out".into()))??;
-    let client_id = peer_identity(&client)?;
 
+    // The client never names an egress ADDRESS — only a service string. `resolve` maps it to the
+    // FIXED, operator-configured egress set; an unmapped service is refused and no dial is made. This
+    // is what keeps the relay from being an open proxy / SSRF primitive (Security condition 3).
     let Some((egress_addr, egress_id, enc_required)) = resolve(&request.service) else {
         write_msg(
             &mut client_send,
@@ -414,7 +438,18 @@ where
         return Err(NetError::UnresolvedService(request.service));
     };
 
-    let verdict = authorize_dial(&request, &client_id, trust_root, now_unix(), enc_required);
+    // Capability gate. Mutual-pin additionally binds the proven TLS client id (a stronger pre-filter);
+    // capability-only has no client cert, so it defers holder-binding to the egress but STILL refuses
+    // a dial with no valid, in-scope, unexpired capability (CONDITION 1 — not a blind forwarder).
+    let verdict = match client_auth {
+        RelayClientAuth::MutualPin => {
+            let client_id = peer_identity(&client)?;
+            authorize_dial(&request, &client_id, trust_root, now_unix(), enc_required)
+        }
+        RelayClientAuth::CapabilityOnly => {
+            authorize_dial_capability_only(&request, trust_root, now_unix(), enc_required)
+        }
+    };
     write_msg(&mut client_send, &verdict).await?;
     if !matches!(verdict, DialVerdict::Accept { .. }) {
         // Hold the connection so the Reject verdict delivers before it drops (bounded).
@@ -570,12 +605,17 @@ where
 
 /// Relay/ingress **serve loop** (IU-8): accept client connections on `endpoint` and, per connection,
 /// capability-gate the dial against `trust_root` and forward the sealed stream to the egress
-/// `resolve` maps the requested service to — **blind**. Runs until the endpoint is closed; each
-/// connection is handled on its own task, so one slow flow never blocks the accept loop. This is the
-/// server side of [`forward_flow`]: `boatramp serve` stands one of these up so a remote
-/// `boatramp forward` can actually reach the cluster.
-pub async fn run_forwarding_router<F>(endpoint: Endpoint, trust_root: TokenPublicKey, resolve: F)
-where
+/// `resolve` maps the requested service to — **blind**. `client_auth` carries the relay's EXPLICIT
+/// transport posture (mutual-pin vs capability-only, Security Blocker #1); it must agree with the
+/// `endpoint`'s own peer policy (`Allowlist` ⇒ `MutualPin`, `AcceptAny` ⇒ `CapabilityOnly`). Runs
+/// until the endpoint is closed; each connection is handled on its own task, so one slow flow never
+/// blocks the accept loop. This is the server side of [`forward_flow`].
+pub async fn run_forwarding_router<F>(
+    endpoint: Endpoint,
+    trust_root: TokenPublicKey,
+    client_auth: RelayClientAuth,
+    resolve: F,
+) where
     F: Fn(&str) -> Option<(SocketAddr, OverlayId, bool)> + Clone + Send + Sync + 'static,
 {
     // Bound concurrent in-flight flows (MEDIUM-B): the accept loop waits for a permit, so a flood
@@ -592,7 +632,7 @@ where
         let resolve = resolve.clone();
         tokio::spawn(async move {
             let _permit = permit;
-            if let Err(e) = forward_relay(conn, &trust_root, resolve).await {
+            if let Err(e) = forward_relay(conn, &trust_root, client_auth, resolve).await {
                 tracing::debug!(error = %e, "overlay relay: flow ended with error");
             }
         });
@@ -722,7 +762,8 @@ mod tests {
                 tokio::spawn(async move {
                     let resolve =
                         |svc: &str| (svc == "svc/echo").then_some((egress_addr, egress_id, true));
-                    let _ = forward_relay(conn, &root_pub, resolve).await;
+                    let _ =
+                        forward_relay(conn, &root_pub, RelayClientAuth::MutualPin, resolve).await;
                 });
             }
         });
@@ -863,7 +904,8 @@ mod tests {
                 tokio::spawn(async move {
                     let resolve =
                         |svc: &str| (svc == "svc/echo").then_some((egress_addr, egress_id, true));
-                    let _ = forward_relay(conn, &root_pub, resolve).await;
+                    let _ =
+                        forward_relay(conn, &root_pub, RelayClientAuth::MutualPin, resolve).await;
                 });
             }
         });
@@ -1255,9 +1297,12 @@ mod tests {
         )
         .unwrap();
         let relay_addr = relay_ep.local_addr().unwrap();
-        tokio::spawn(run_forwarding_router(relay_ep, root_pub, move |s: &str| {
-            (s == "svc/db").then_some((egress_addr, egress_id, true))
-        }));
+        tokio::spawn(run_forwarding_router(
+            relay_ep,
+            root_pub,
+            RelayClientAuth::MutualPin,
+            move |s: &str| (s == "svc/db").then_some((egress_addr, egress_id, true)),
+        ));
 
         // Client-edge: a valid svc/db capability; dial through the served relay.
         let token = mint_overlay_dial(
@@ -1303,5 +1348,129 @@ mod tests {
         .unwrap();
         assert_eq!(got, b"reach the in-cluster service");
         let _ = fwd.await;
+    }
+
+    /// Security Blocker #1, CONDITION 1: a **capability-only** relay still runs the capability gate —
+    /// a dial carrying no valid capability is refused AT THE RELAY (`InvalidCapability`) and never
+    /// forwarded to the egress. The relay is not a blind forwarder; this is what stops unauthenticated
+    /// flood amplification. (The relay rejects before the egress-dial code runs, so the bogus egress
+    /// address below is never dialed — a hang/connect error would fail this test instead.)
+    #[tokio::test]
+    async fn capability_only_relay_refuses_a_dial_with_no_capability() {
+        let root = OverlaySecret::generate().unwrap();
+        let client = OverlaySecret::generate().unwrap();
+        let relay = OverlaySecret::generate().unwrap();
+        let relay_id = relay.id();
+        let egress_id = OverlaySecret::generate().unwrap().id();
+        let bogus: SocketAddr = "127.0.0.1:9".parse().unwrap(); // discard port; must never be dialed
+
+        // Relay in capability-only mode: AcceptAny TLS (no allowlist, no pre-enrollment).
+        let relay_ep =
+            quic::server_endpoint(&relay, &AcceptAny, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let relay_addr = relay_ep.local_addr().unwrap();
+        let root_pub = root.id().to_public();
+        tokio::spawn(async move {
+            if let Ok(Some(conn)) = quic::accept(&relay_ep).await {
+                let resolve =
+                    move |svc: &str| (svc == "svc/db").then_some((bogus, egress_id, true));
+                let _ =
+                    forward_relay(conn, &root_pub, RelayClientAuth::CapabilityOnly, resolve).await;
+            }
+        });
+
+        // Capability-only relay is server-auth-only at TLS — dial without a client cert.
+        let client_ep = quic::client_endpoint_server_auth(&Pin(relay_id)).unwrap();
+        let (_app, app_far) = tokio::io::duplex(64 * 1024);
+        let res = forward_flow(
+            app_far,
+            &client_ep,
+            relay_addr,
+            &client,
+            egress_id,
+            DialRequest {
+                service: "svc/db".into(),
+                token: "not-a-valid-cose-capability".into(),
+                e2ee: true,
+            },
+            PathMode::Relay,
+        )
+        .await;
+        assert!(
+            matches!(
+                res,
+                Err(NetError::DialRejected(
+                    boatramp_overlay_proto::dial::DialReject::InvalidCapability(_)
+                ))
+            ),
+            "a capability-only relay must refuse a no-/bad-capability dial at the relay, got {res:?}"
+        );
+    }
+
+    /// Security Blocker #1, CONDITION 3 (SSRF / open-proxy): the client names a SERVICE, never an
+    /// address — `DialRequest` carries no address field. The relay maps the service to its FIXED,
+    /// operator-configured egress set via `resolve`; an unmapped service is refused and no egress is
+    /// dialed, EVEN with a wildcard-scoped capability that authorizes any service. So a relay can
+    /// never be driven to dial a client-chosen target.
+    #[tokio::test]
+    async fn capability_only_relay_is_not_an_open_proxy_for_an_unconfigured_service() {
+        let root = OverlaySecret::generate().unwrap();
+        let client = OverlaySecret::generate().unwrap();
+        let relay = OverlaySecret::generate().unwrap();
+        let relay_id = relay.id();
+        let egress_id = OverlaySecret::generate().unwrap().id();
+        let configured: SocketAddr = "127.0.0.1:9".parse().unwrap();
+
+        let relay_ep =
+            quic::server_endpoint(&relay, &AcceptAny, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let relay_addr = relay_ep.local_addr().unwrap();
+        let root_pub = root.id().to_public();
+        tokio::spawn(async move {
+            if let Ok(Some(conn)) = quic::accept(&relay_ep).await {
+                // The relay only knows `svc/db` → its fixed egress. It knows no other service.
+                let resolve =
+                    move |svc: &str| (svc == "svc/db").then_some((configured, egress_id, true));
+                let _ =
+                    forward_relay(conn, &root_pub, RelayClientAuth::CapabilityOnly, resolve).await;
+            }
+        });
+
+        // A VALID wildcard-scoped capability — authorizes ANY service — yet the relay still refuses an
+        // unconfigured service name (resolve returns None), proving the egress set, not the client, is
+        // authoritative over the dial target.
+        let token = mint_overlay_dial(
+            &client.id().to_public(),
+            "*",
+            3600,
+            now_unix(),
+            &root.signer(),
+        )
+        .await
+        .unwrap();
+        // Capability-only relay is server-auth-only at TLS — dial without a client cert.
+        let client_ep = quic::client_endpoint_server_auth(&Pin(relay_id)).unwrap();
+        let (_app, app_far) = tokio::io::duplex(64 * 1024);
+        let res = forward_flow(
+            app_far,
+            &client_ep,
+            relay_addr,
+            &client,
+            egress_id,
+            DialRequest {
+                service: "evil/arbitrary-target".into(),
+                token,
+                e2ee: true,
+            },
+            PathMode::Relay,
+        )
+        .await;
+        assert!(
+            matches!(
+                res,
+                Err(NetError::DialRejected(
+                    boatramp_overlay_proto::dial::DialReject::ServiceNotAuthorized
+                ))
+            ),
+            "the relay must refuse an unconfigured service even with a wildcard cap, got {res:?}"
+        );
     }
 }

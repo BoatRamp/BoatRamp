@@ -537,7 +537,25 @@ boatramp forward 127.0.0.1:5432 svc/db
 The headline case is **self-serve**: give a local address and a service name and nothing else — the
 CLI uses your boatramp token to resolve the service's topology and mint a dial capability via the
 control plane (`POST /api/overlay/dial`, `Overlay·Write`), binding it to your persistent overlay
-identity (`~/.config/boatramp/overlay.key`). Zero hand-typed topology, zero manual grant.
+identity (`~/.config/boatramp/overlay.key`). Zero hand-typed topology, and **no per-dial grant** once
+your token carries the `Overlay·Write` right — the mint happens for you on every `forward`.
+
+**First-run setup (one-time, by an admin).** Self-serve needs your boatramp token to hold the
+`Overlay·Write` right (admins have it already via the `admin` role). For a non-admin operator, an
+admin grants an overlay role — e.g. mint a token with `boatramp token mint --role overlay` (a role
+whose policy includes `Overlay·Write`, and `Overlay·Read` to browse the directory). With that, you
+never touch a per-service grant again.
+
+**Walkthrough.**
+
+```
+boatramp overlay ls                 # see which services you can reach
+boatramp forward 127.0.0.1:5432 svc/db   # resolve + mint + forward, in one step
+psql -h 127.0.0.1 -p 5432 …         # your local tool, now tunnelled to svc/db
+```
+
+If your token lacks `Overlay·Write`, `forward` fails with an actionable message (ask an admin for an
+overlay role, or use a `--ticket`) rather than a dead port.
 
 For deployments **without** a reachable control plane, a `--ticket` from
 [`overlay grant`](#boatramp-overlay) or the explicit flags supply the same inputs by hand.
@@ -552,7 +570,9 @@ For deployments **without** a reachable control plane, a `--ticket` from
 | `--identity <seed\|path>` | Override the overlay identity (defaults to the persistent operator key; required with a `--holder-pub` ticket). |
 
 Runs until interrupted (Ctrl-C). Each accepted local connection opens a capability-gated, relay-blind
-flow to the service; the flow promotes to a direct link when one is reachable.
+flow to the service; the flow promotes to a direct link when one is reachable. If the **first**
+connection fails (identity not enrolled on a mutual-pin relay, capability out of scope, or expired),
+`forward` logs a loud, actionable error rather than leaving a silently dead port.
 
 ## `boatramp operator`
 

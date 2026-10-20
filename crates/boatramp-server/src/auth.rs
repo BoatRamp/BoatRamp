@@ -381,7 +381,7 @@ impl Auth {
         // them before consulting the RBAC policy.
         if !verified.caveats.allows(&required, now) {
             return Err(Reject::forbidden(
-                "token not authorized for this resource\n",
+                overlay_deny_body(path).unwrap_or("token not authorized for this resource\n"),
             ));
         }
         // MF-3/MF-4 — the policy read is fenced + fails CLOSED in shared mode: a cached policy older
@@ -398,7 +398,7 @@ impl Auth {
         let roles = policy.normalize_grants(&verified.roles);
         if !compiled.authorize(&roles, &required) {
             return Err(Reject::forbidden(
-                "token not authorized for this resource\n",
+                overlay_deny_body(path).unwrap_or("token not authorized for this resource\n"),
             ));
         }
         // PLAN-system-principal P2 — derive the deployer's CLASS from the SAME verified, normalized
@@ -642,6 +642,26 @@ impl AuthInner {
 /// How long a shed (503) control-plane request should wait before retrying, in seconds. Mirrors the
 /// managed-dependency readiness gate's `Retry-After` (`scheduler.rs` `sql_starting_response`).
 const SHED_RETRY_AFTER_SECS: u32 = 2;
+
+/// A `/api/overlay/*`-specific 403 body naming the exact Overlay right the token lacks (UX Blocker
+/// #2), so an operator sees how to fix it instead of the generic "not authorized" line. `None` for
+/// every other path (the caller falls back to the generic body).
+fn overlay_deny_body(path: &str) -> Option<&'static str> {
+    if path == "/api/overlay/dial" {
+        return Some(
+            "token not authorized to self-serve overlay forwards — needs the `Overlay·Write` right. \
+             Ask an admin to grant you an overlay role (e.g. a token minted with `--role overlay`), \
+             or use a `--ticket` from `boatramp overlay grant` for a control-plane-less forward.\n",
+        );
+    }
+    if path == "/api/overlay/services" || path.starts_with("/api/overlay/services/") {
+        return Some(
+            "token not authorized to read the overlay service directory — needs the `Overlay·Read` \
+             right.\n",
+        );
+    }
+    None
+}
 
 /// A rejected request: the HTTP status, a short body, and an optional `Retry-After` (for a shed 503).
 struct Reject {

@@ -238,8 +238,10 @@ pub struct ServerConfig {
 /// `[overlay]` — the forward-flow **serve roles** this node runs (the server side of
 /// `boatramp forward`). A node may be a **relay/ingress** (accepts external client dials and
 /// forwards them, blind, into the cluster), an **egress/terminator** (fronts local backend
-/// services), or both. Client-side target addressing / auto-discovery is a separate concern (the
-/// `boatramp forward` CLI takes the relay + egress identities explicitly for now).
+/// services), or both. A relay's `routes` double as the self-serve **discovery directory**: the
+/// control plane resolves `boatramp forward svc/<name>` against them and mints the dial capability,
+/// so the CLI needs no hand-typed topology (the explicit flags / `overlay grant --ticket` remain for
+/// control-plane-less forwards).
 #[cfg_attr(not(feature = "overlay"), allow(dead_code))]
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -253,11 +255,23 @@ pub struct OverlayServeConfig {
     pub trust_root: Option<String>,
     /// Whether dials must be end-to-end encrypted (fail-closed). Default `true`.
     pub encryption_required: Option<bool>,
+    /// Server cap on a minted dial capability's lifetime (seconds). A `POST /api/overlay/dial`
+    /// request's `ttl_secs` is clamped to this (overlay-dial caps are offline-verified — no
+    /// revocation — so an unbounded TTL is a standing risk). Unset ⇒ 24h.
+    pub max_dial_ttl_secs: Option<u64>,
     /// Bind a **relay/ingress** here (UDP/QUIC). Unset ⇒ this node runs no relay.
     pub relay_listen: Option<SocketAddr>,
+    /// The relay's transport-layer client-auth posture (Security Blocker #1):
+    /// `"capability-only"` accepts any client key at TLS and rests authorization on the capability
+    /// gate + the egress's E2EE-proven re-authz (self-serve, no pre-enrollment); `"mutual-pin"` keeps
+    /// the `allowed_clients` RPK pin as a strictly-more-restrictive pre-filter. REQUIRED for a relay
+    /// unless `allowed_clients` is non-empty (which defaults to mutual-pin); a relay with neither is a
+    /// hard error — an empty allowlist is never silently treated as accept-any.
+    pub client_auth: Option<String>,
     /// The client overlay identities (`ed25519:`/`es256:` tagged hex) the relay mutual-authenticates
-    /// — the enrolled operators/clients allowed to dial. (A capability is still required and is the
-    /// authority; this is the relay's transport-layer admission. Auto-enrollment is a later layer.)
+    /// — the enrolled operators/clients allowed to dial under `client_auth = "mutual-pin"`. (A
+    /// capability is still required and is the authority; this is the relay's transport-layer
+    /// pre-filter. Ignored under `"capability-only"`.)
     pub allowed_clients: Vec<String>,
     /// Relay routing: a requested service → its egress. Used when `relay_listen` is set.
     pub routes: Vec<OverlayRoute>,

@@ -469,16 +469,39 @@ re-authorizes the sealed capability end-to-end against the cryptographically-pro
 | `identity` | string | `<data-dir>/overlay/identity.key` | This node's overlay identity: an `ed25519:<hex>` seed inline, or a key-file path (load-or-generate). Required when a role is set; it is the identity a relay's clients and an egress's relay pin. |
 | `trust_root` | string | `serve.auth_root_public_key` | The dial-capability trust root (`ed25519:`/`es256:` tagged hex) every dial verifies against. |
 | `encryption_required` | bool | `true` | Refuse a non-E2EE dial (fail-closed). |
+| `max_dial_ttl_secs` | integer | `86400` (24h) | Server cap on a self-serve–minted dial capability's lifetime. A `POST /api/overlay/dial` request's `ttl_secs` is clamped to this. Overlay-dial caps are offline-verified (no revocation), so this bounds how long a minted cap outlives its grant. |
 | `relay_listen` | socket address | — | Bind a relay/ingress here (UDP/QUIC). Unset ⇒ no relay. |
-| `allowed_clients` | list of strings | `[]` | Client overlay identities (`ed25519:` tagged hex) the relay mutual-authenticates — the enrolled clients allowed to dial. (A capability is still required and is the authority.) |
-| `routes` | list of `{ service, egress, egress_id }` | `[]` | Relay routing: a requested service → the egress overlay address + identity to forward it to. |
+| `client_auth` | string | — (required for a relay unless `allowed_clients` is non-empty) | Relay transport-auth posture: `"capability-only"` (accept any client key at TLS; rest authorization on the capability gate + the egress's E2EE re-authz — this is what lets an operator self-serve without pre-enrollment) or `"mutual-pin"` (keep the `allowed_clients` RPK pin as a strictly-more-restrictive pre-filter). A relay with a non-empty `allowed_clients` and no `client_auth` defaults to `"mutual-pin"`; a relay with **neither** is a hard error — an empty allowlist is never silently treated as accept-any. |
+| `allowed_clients` | list of strings | `[]` | Client overlay identities (`ed25519:` tagged hex) the relay mutual-authenticates under `client_auth = "mutual-pin"`. (A capability is still required and is the authority; this is only the transport-layer pre-filter. Ignored under `"capability-only"`.) |
+| `routes` | list of `{ service, egress, egress_id }` | `[]` | Relay routing: a requested service → the egress overlay address + identity to forward it to. These also form the **self-serve discovery directory** the control plane resolves `boatramp forward svc/<name>` against. |
 | `egress_listen` | socket address | — | Bind an egress/terminator here (UDP/QUIC). Unset ⇒ no egress. |
 | `services` | list of `{ name, backend }` | `[]` | Egress service map: a service name → the local backend it fronts. A service not listed is refused — the egress authorizes only what it fronts. |
 
+**Relay posture vs. the mesh (a deliberate asymmetry).** A relay's transport auth may relax to
+`capability-only` precisely because a **stronger** authority sits behind it: the egress re-authorizes
+every sealed capability end-to-end against the cryptographically-proven client identity, so relaxing
+the relay's TLS pin loses only a best-effort DoS pre-filter, never the real authorization boundary.
+The Raft peer **mesh** (`cluster.transport = "overlay"`) has no such second authority behind a mesh
+RPC, so it correctly stays mutual-auth against the pre-known live trust set — there is no
+`capability-only` mesh, and the overlay-mesh transport keeps RFC 7250 mutual auth verbatim.
+
 ```ron
+// Relay/ingress, self-serve (capability-only): any operator whose boatramp token holds
+// `Overlay·Write` may `boatramp forward svc/db` with no pre-enrollment; the egress is the authority.
 overlay: (
     identity: "/var/lib/boatramp/overlay/identity.key",   // load-or-generate
     relay_listen: "0.0.0.0:9100",                          // this node is the ingress
+    client_auth: "capability-only",
+    routes: [( service: "svc/db", egress: "10.0.0.5:9101", egress_id: "ed25519:<egress-key>" )],
+)
+```
+
+```ron
+// Relay/ingress, mutual-pin: additionally pin a fixed set of enrolled client keys at the TLS layer.
+overlay: (
+    identity: "/var/lib/boatramp/overlay/identity.key",
+    relay_listen: "0.0.0.0:9100",
+    client_auth: "mutual-pin",
     allowed_clients: ["ed25519:<operator-laptop-key>"],
     routes: [( service: "svc/db", egress: "10.0.0.5:9101", egress_id: "ed25519:<egress-key>" )],
 )
@@ -492,10 +515,13 @@ overlay: (
 )
 ```
 
-A remote client then reaches the service with `boatramp forward 127.0.0.1:5432 svc/db --relay
-<ingress>:9100 --relay-id <relay-key> --egress-id <egress-key> --token <cap> --identity <client-key>`.
-Client-side auto-discovery of the relay/target (so the identities need not be passed explicitly) is a
-later layer; the roles themselves are served here.
+A remote operator then reaches the service with just `boatramp forward 127.0.0.1:5432 svc/db` — the
+control plane resolves the relay/egress topology from the relay's `routes` and mints the dial
+capability, authorized by the operator's own boatramp token (`Overlay·Write`). For an airgapped or
+pre-provisioned deployment with no reachable control plane, the fully explicit form still works:
+`boatramp forward 127.0.0.1:5432 svc/db --relay <ingress>:9100 --relay-id <relay-key> --egress-id
+<egress-key> --token <cap> --identity <client-key>`, or a one-flag `--ticket` from
+[`boatramp overlay grant`](cli.md#boatramp-overlay).
 
 ## `compute`
 

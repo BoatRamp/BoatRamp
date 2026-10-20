@@ -2269,12 +2269,19 @@ impl HandlerRuntime {
     }
 }
 
+/// Fallback server cap on a minted dial capability's lifetime (24h) when `[overlay]
+/// max_dial_ttl_secs` is unset. Overlay-dial caps are offline-verified (no revocation), so an
+/// unbounded TTL is a standing risk — the dial route clamps every request to this (Security MEDIUM-D).
+pub const DEFAULT_MAX_DIAL_TTL_SECS: u64 = 24 * 60 * 60;
+
 /// The overlay forward-flow **service directory**: a service name → the relay + egress a dial to it
 /// uses. Built from `[overlay] routes` at serve setup and read by the `/api/overlay/*` handlers to
 /// resolve a self-serve `boatramp forward svc/<name>` and mint its dial capability.
 #[derive(Default, Clone)]
 pub struct OverlayDirectory {
     services: std::collections::BTreeMap<String, OverlayTarget>,
+    /// Server cap on a minted dial cap's TTL (seconds); `None` ⇒ [`DEFAULT_MAX_DIAL_TTL_SECS`].
+    max_dial_ttl: Option<u64>,
 }
 
 /// One overlay service target: where a dial to it goes.
@@ -2286,14 +2293,31 @@ pub struct OverlayTarget {
     pub relay_id: String,
     /// The egress/terminator's overlay identity to pin for the E2EE session.
     pub egress_id: String,
+    /// The relay's client-auth posture — `"capability-only"` or `"mutual-pin"` (Security Blocker #1).
+    /// It tells a self-serve client its TLS posture when dialing: capability-only relays are
+    /// server-auth-only (the client presents NO cert), mutual-pin relays pin the client's cert.
+    pub client_auth: String,
 }
 
 impl OverlayDirectory {
-    /// Build from `(service, target)` entries.
+    /// Build from `(service, target)` entries (the TTL cap defaults to [`DEFAULT_MAX_DIAL_TTL_SECS`]).
     pub fn from_entries(entries: impl IntoIterator<Item = (String, OverlayTarget)>) -> Self {
         Self {
             services: entries.into_iter().collect(),
+            max_dial_ttl: None,
         }
+    }
+    /// Set the server cap on a minted dial cap's TTL (from `[overlay] max_dial_ttl_secs`; `None` keeps
+    /// the [`DEFAULT_MAX_DIAL_TTL_SECS`] fallback).
+    #[must_use]
+    pub fn with_max_dial_ttl(mut self, secs: Option<u64>) -> Self {
+        self.max_dial_ttl = secs;
+        self
+    }
+    /// The effective TTL cap a dial request is clamped to.
+    #[must_use]
+    pub fn max_dial_ttl_secs(&self) -> u64 {
+        self.max_dial_ttl.unwrap_or(DEFAULT_MAX_DIAL_TTL_SECS)
     }
     /// Resolve a service name to its target.
     #[must_use]
