@@ -1024,6 +1024,57 @@ pub(crate) async fn standalone_mint_site_ok(
         .unwrap_or(false)
 }
 
+/// The anti-hollow mutation seam for the `blob_site` scope gate (gate `blob_site_bare_scope`): under
+/// the mutation the site-qualification is DROPPED, reproducing the fn-private/bare-scope bug so the
+/// gate goes RED (the function then reads the WRONG `hblob/{site}/…` namespace instead of
+/// `hblob/{project-qualified-site}/…`). Present ONLY under `cfg(test)`; a shipped build has no seam
+/// and folds this to a constant `None`.
+#[cfg(test)]
+fn blob_site_mutation() -> Option<String> {
+    std::env::var("BOATRAMP_BLOBSITE_MUTATION").ok()
+}
+#[cfg(not(test))]
+fn blob_site_mutation() -> Option<String> {
+    None
+}
+
+/// Resolve a standalone function's config-declared `blob_site` (#13) to the SITE blob scope
+/// (`project.qualified(site)`), or `None` (fail-closed) when the function must NOT bind the site
+/// blob: the named site does not exist in the (host-forced) `project`, or the site does not grant
+/// `wasi:blobstore` in its `[handlers].allow_imports` — the same least-privilege consent a site's own
+/// consumer passes, so a site must opt into exposing its blob to a function. Cluster-uniform: reads
+/// only the project-scoped control-plane KV (like [`standalone_mint_site_ok`]), so every node agrees
+/// and a fresh deploy/revoke is reflected immediately. The guest never names the site — it is
+/// host-forced from the function's own config, and the project is the host-resolved invocation
+/// project, so a `blob_site` can never cross a project boundary.
+#[cfg(feature = "handlers")]
+async fn blob_site_scope(
+    inner: &HandlerRuntimeInner,
+    project: ProjectRef<'_>,
+    site: &str,
+) -> Option<String> {
+    let cfg = boatramp_core::deploy::load_site_config(inner.kv.as_ref(), project, site)
+        .await
+        .ok()
+        .flatten()?;
+    // The named site must enable handlers AND grant `wasi:blobstore` in its allow_imports ceiling —
+    // else the function may not reach the site's blob (fail-closed, no binding).
+    let grants_blob = cfg
+        .handlers
+        .as_ref()
+        .is_some_and(|h| h.enabled && h.allow_imports.iter().any(|a| a == "wasi:blobstore"));
+    if !grants_blob {
+        return None;
+    }
+    if blob_site_mutation().as_deref() == Some("bare_scope") {
+        // MUTATION SEAM (gate only): drop the project/site qualification → the fn reads the bare,
+        // cross-project-colliding `hblob/{site}/…` namespace instead of `hblob/{project-qualified-
+        // site}/…`. Folded away in every shipped build.
+        return Some(site.to_string());
+    }
+    Some(project.qualified(site))
+}
+
 /// Build a top-level function's bindings. Unlike a site handler (whose grants are
 /// the site allowlist ∩ its imports), a top-level function is admin-deployed, so
 /// its declared `imports` **are** its grants — served under its own `fn/<name>`
@@ -1312,40 +1363,74 @@ pub(super) async fn build_function_bindings(
     // target/anon/unscoped invocation ⇒ `{tenant}` entries fail closed).
     if granted("wasi:blobstore") {
         use boatramp_core::tenancy::Tenancy;
-        let max_blob = inner.max_blob_bytes.get().copied().unwrap_or(0);
-        // Security MEDIUM-1: only a SCOPING tenancy (`Scoped`/`Target`) makes the function multi-tenant.
-        // An explicit `Tenancy::Disabled` is deliberate single-tenant (Some but not multi-tenant), so
-        // the deny-default must not fire for it. `host_tenancy.is_some()` is already correct (Disabled
-        // resolves to `None`) and still covers a forced/inherited target invocation.
-        let multi_tenant = matches!(
-            config.tenancy,
-            Some(Tenancy::Scoped { .. } | Tenancy::Target { .. })
-        ) || host_tenancy.is_some();
-        // UX (C4): a multi-tenant function that grants `wasi:blobstore` without declaring an
-        // allowlist will DENY every container op — surface it loudly at bind, naming the remedy.
-        if multi_tenant && config.blobstore_containers.is_empty() {
-            tracing::warn!(
-                project = %project.as_str(),
-                scope,
-                "multi-tenant function grants wasi:blobstore but declares no blobstore_containers — \
-                 every container op will be denied; add blobstore_containers: [\"assets-{{tenant}}\"]"
-            );
+        // #13: a `blob_site` binds the blob scope to a NAMED site's shared container namespace
+        // (`hblob/{project-qualified-site}/…`) instead of this function's private `fn/<name>` one —
+        // the blob analog of binding a shared `sql` database by name. HOST-FORCED to this function's
+        // project and site-CONSENTED (the named site must grant `wasi:blobstore` in its allow_imports);
+        // fail-closed (no binding — NEVER a silent fn-private fallback) if the site is missing or does
+        // not consent. Absent ⇒ the function's private `fn/<name>` scope (no regression). The
+        // `blobstore_containers` allowlist + `{tenant}` confinement + object-key screening below all
+        // still apply on top of whichever scope resolves, so a `blob_site` binding gets EXACTLY what a
+        // same-site handler gets, never more.
+        let blob_scope: Option<String> = match config.blob_site.as_deref() {
+            None => Some(scope.to_string()),
+            Some(site) => blob_site_scope(inner, project, site).await,
+        };
+        match blob_scope {
+            // `blob_site` named but invalid (missing site / no `wasi:blobstore` consent) ⇒ fail closed:
+            // attach NO binding (never a silent fn-private fallback that would serve the wrong
+            // namespace). The guest's blob ops then get `access-denied`, surfacing the misconfig. The
+            // rest of the grants (messaging/stats/secrets/…) continue unaffected.
+            None => {
+                tracing::warn!(
+                    project = %project.as_str(),
+                    scope,
+                    blob_site = config.blob_site.as_deref().unwrap_or(""),
+                    "function declares blob_site but it does not exist in the project or does not grant \
+                     wasi:blobstore in its [handlers].allow_imports — refusing the blobstore binding \
+                     (fail-closed; the guest's blob ops get access-denied, never the fn-private namespace)"
+                );
+            }
+            Some(blob_scope) => {
+                let max_blob = inner.max_blob_bytes.get().copied().unwrap_or(0);
+                // Security MEDIUM-1: only a SCOPING tenancy (`Scoped`/`Target`) makes the function
+                // multi-tenant. An explicit `Tenancy::Disabled` is deliberate single-tenant (Some but
+                // not multi-tenant), so the deny-default must not fire for it. `host_tenancy.is_some()`
+                // is already correct (Disabled resolves to `None`) and still covers a forced/inherited
+                // target invocation.
+                let multi_tenant = matches!(
+                    config.tenancy,
+                    Some(Tenancy::Scoped { .. } | Tenancy::Target { .. })
+                ) || host_tenancy.is_some();
+                // UX (C4): a multi-tenant function that grants `wasi:blobstore` without declaring an
+                // allowlist will DENY every container op — surface it loudly at bind, naming the remedy.
+                if multi_tenant && config.blobstore_containers.is_empty() {
+                    tracing::warn!(
+                        project = %project.as_str(),
+                        scope,
+                        "multi-tenant function grants wasi:blobstore but declares no blobstore_containers \
+                         — every container op will be denied; add blobstore_containers: [\"assets-{{tenant}}\"]"
+                    );
+                }
+                bindings = bindings.with_blobstore(
+                    // The site scope for a declared `blob_site`, else this function's own `fn/<name>`.
+                    &blob_scope,
+                    // Per-project blob backend (PLAN-per-project-blob-backend): resolve for THIS
+                    // invocation's HOST-resolved `project` (never guest input, invariant 1);
+                    // unconfigured ⇒ global default. Key-prefix confinement still runs on top
+                    // (invariant 2).
+                    inner.blob_backends.backend(project),
+                    max_blob,
+                    resolved_tenant_string(&caller_tenant),
+                    config.blobstore_containers.clone(),
+                    multi_tenant,
+                    // Honor `on_unresolved: "pass"` uniformly on the async/invoke lane too.
+                    host_tenancy
+                        .as_ref()
+                        .is_some_and(boatramp_handlers::HostTenancy::pass_unresolved),
+                );
+            }
         }
-        bindings = bindings.with_blobstore(
-            scope,
-            // Per-project blob backend (PLAN-per-project-blob-backend): resolve for THIS invocation's
-            // HOST-resolved `project` (never guest input, invariant 1); unconfigured ⇒ global default.
-            // Key-prefix confinement still runs on top (invariant 2).
-            inner.blob_backends.backend(project),
-            max_blob,
-            resolved_tenant_string(&caller_tenant),
-            config.blobstore_containers.clone(),
-            multi_tenant,
-            // Honor `on_unresolved: "pass"` uniformly on the async/invoke lane too.
-            host_tenancy
-                .as_ref()
-                .is_some_and(boatramp_handlers::HostTenancy::pass_unresolved),
-        );
     }
     // The host-verified sealed principal for THIS invocation (PLAN-async-persona): only on a lane that
     // carries a verified seal — the durable async lane (verify the envelope now), or an inherited
@@ -4115,6 +4200,146 @@ mod blobstore_dimension0_tests {
             "the consumer read the exact body the edge wrote to the site `mail` container"
         );
         println!("CONSUMER SITE BLOB OK");
+    }
+
+    /// #13 FUNCTION-PATH symmetry (marker `FUNCTION BLOB SITE OK`) — a STANDALONE bus-triggered
+    /// function (the `build_function_bindings` / `FnTenant::Durable` path, the one genuinely
+    /// fn-private) with `blob_site` set binds its `wasi:blobstore` at the NAMED site's shared scope
+    /// (`hblob/{project-qualified-site}/{container}/`) and reads back the EXACT bytes a site handler /
+    /// `compute bind-blob --site` producer wrote — the blob analog of binding a shared `sql` database
+    /// by name. Gated like the consumer path: the function imports `wasi:blobstore` AND the named site
+    /// grants it in `[handlers].allow_imports`; the `blobstore_containers` allowlist + `validate_object_key`
+    /// screening still apply. Absent `blob_site` ⇒ the fn-private scope (no regression). Mutation-
+    /// verified: `BOATRAMP_BLOBSITE_MUTATION=bare_scope` drops the site-qualification → the resolved key
+    /// diverges from the producer key → RED.
+    #[tokio::test]
+    async fn standalone_function_blob_site_reads_the_site_blob_container_end_to_end() {
+        use boatramp_core::function::FunctionConfig;
+        use futures::StreamExt;
+
+        let project = ProjectRef::new("mailroom-prod");
+        let site = "mailroom";
+
+        // A runtime whose `mailroom` site GRANTS wasi:blobstore in its allow_imports ceiling (the
+        // consent a `blob_site` function needs) — mirrors `runtime_with_site` with the ceiling set.
+        let storage = Arc::new(MemStorage::default());
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let deploy = DeployStore::new(storage.clone(), kv.clone());
+        deploy
+            .set_site_config(
+                project,
+                site,
+                &SiteConfig {
+                    handlers: Some(HandlersSiteConfig {
+                        enabled: true,
+                        allow_imports: vec!["wasi:blobstore".to_string()],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
+        let rt = HandlerRuntime::new(engine, kv, storage, None, None);
+        rt.set_tenancy_posture(true, false);
+        let inner = rt.inner.as_ref().unwrap();
+
+        // The edge / `compute bind-blob --site mailroom --container mail` producer wrote the body here.
+        let backend = inner.blob_backends.backend(project);
+        let body_key = format!("hblob/{}/mail/body.eml", project.qualified(site));
+        let body = b"Subject: hi\r\n\r\ndelivery body for the worker".to_vec();
+        {
+            let seed = body.clone();
+            let stream: boatramp_core::ByteStream =
+                futures::stream::once(async move { Ok(bytes::Bytes::from(seed)) }).boxed();
+            backend
+                .put(&body_key, stream, boatramp_core::PutMeta::default())
+                .await
+                .expect("seed the site `mail` container (producer/edge write)");
+        }
+
+        // A STANDALONE bus-triggered function binding the mailroom site's `mail` container.
+        let config = FunctionConfig {
+            imports: vec!["wasi:blobstore".to_string()],
+            blob_site: Some(site.to_string()),
+            blobstore_containers: vec!["mail".to_string()],
+            tenancy: Some(Tenancy::Disabled),
+            ..Default::default()
+        };
+        let bindings = build_function_bindings(
+            inner,
+            project,
+            "mailroom-prod/fn/delivery",
+            "fn/delivery",
+            &config,
+            0,
+            &FnTenant::Background,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("a standalone function with blob_site builds");
+        let blob = bindings
+            .blobstore()
+            .expect("blob_site attaches the blobstore binding at the site scope");
+        let (resolved, key) = blob
+            .resolve_blob_ref("mail", "body.eml")
+            .expect("the site `mail` container resolves for the blob_site function");
+        assert_eq!(
+            key, body_key,
+            "blob_site binds the SITE container key (hblob/{{project-qualified-site}}/mail/…), not the \
+             function-private fn/<name> namespace"
+        );
+        let got = resolved
+            .get(&key)
+            .await
+            .expect("read the body back through the blob_site binding");
+        let mut buf = Vec::new();
+        let mut stream = got.body;
+        while let Some(chunk) = stream.next().await {
+            buf.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(
+            buf, body,
+            "the blob_site function read the exact bytes the producer wrote to the site container"
+        );
+
+        // WITHOUT blob_site the SAME function binds its PRIVATE fn scope — proving blob_site is what
+        // moves the scope (and that the default is unchanged, no regression).
+        let private = FunctionConfig {
+            blob_site: None,
+            ..config.clone()
+        };
+        let pb = build_function_bindings(
+            inner,
+            project,
+            "mailroom-prod/fn/delivery",
+            "fn/delivery",
+            &private,
+            0,
+            &FnTenant::Background,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("the same function without blob_site builds");
+        let (_s, pkey) = pb
+            .blobstore()
+            .expect("fn-private blobstore still binds")
+            .resolve_blob_ref("mail", "body.eml")
+            .expect("the fn-private `mail` container resolves");
+        assert_eq!(
+            pkey, "hblob/mailroom-prod/fn/delivery/mail/body.eml",
+            "absent blob_site ⇒ the function-private fn/<name> blob scope (no regression)"
+        );
+        assert_ne!(
+            pkey, body_key,
+            "the fn-private namespace must NOT collide with the site container"
+        );
+        println!("FUNCTION BLOB SITE OK");
     }
 
     /// **v0.8.0 mutation-verified blob Dimension-0 gate** (marker `BLOB DIMENSION-0 GATE OK`). Drives

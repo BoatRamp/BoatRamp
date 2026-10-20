@@ -750,6 +750,30 @@ pub async fn site_pointer_exists(
     Ok(kv.get(&keys::site_pointer(project, site)).await?.is_some())
 }
 
+/// Load a site's [`SiteConfig`] from the control-plane KV alone — the site pointer
+/// ([`keys::site_pointer`]) → the config blob ([`keys::site_config_blob`]) — WITHOUT a
+/// [`DeployStore`], for a bind hot path that holds only a `&dyn KvStore` (a `HandlerRuntimeInner`,
+/// e.g. the function runtime validating a `blob_site` grant against the named site's
+/// `[handlers].allow_imports` ceiling). Unlike [`DeployStore::get_site_config`] it does NOT overlay
+/// the authoritative per-host context store (irrelevant to the import ceiling); use the method when
+/// the contexts are needed. `None` = no such site in `project` (unset pointer / GC'd body) ⇒ the
+/// caller fails closed. Mirrors [`site_pointer_exists`] (same project-scoped KV source of truth, so
+/// every node agrees and a fresh deploy/delete is reflected immediately).
+pub async fn load_site_config(
+    kv: &dyn KvStore,
+    project: ProjectRef<'_>,
+    site: &str,
+) -> Result<Option<SiteConfig>, DeployError> {
+    let Some(hash) = kv.get(&keys::site_pointer(project, site)).await? else {
+        return Ok(None);
+    };
+    let hash = String::from_utf8_lossy(&hash).into_owned();
+    match kv.get(&keys::site_config_blob(&hash)).await? {
+        Some(bytes) => Ok(Some(SiteConfig::from_json(&bytes)?)),
+        None => Ok(None),
+    }
+}
+
 impl DeployStore {
     /// Build a deploy store over a blob `storage` and a metadata `kv`.
     pub fn new(storage: Arc<dyn Storage>, kv: Arc<dyn KvStore>) -> Self {

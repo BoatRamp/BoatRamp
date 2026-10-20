@@ -169,6 +169,23 @@ pub struct FunctionConfig {
     /// never override it. Only consulted when `imports` contains a `blob-upload:*` right.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blob_upload_site: Option<String>,
+    /// Bind the plain `wasi:blobstore` capability to a NAMED SITE's shared blob container namespace
+    /// (`hblob/{project-qualified-site}/{container}/`) instead of this function's private
+    /// `hblob/{project-qualified-fn}/…` one — the blob analog of binding a shared `sql` database by
+    /// name (#13). A bus-triggered **standalone** function (the only path whose `wasi:blobstore` is
+    /// fn-private; a `routing.consumers` consumer is already site-scoped) can then read/write the SAME
+    /// objects a same-site HTTP handler and a `compute bind-blob --site` producer use — e.g. a delivery
+    /// worker reading the body the MX edge wrote. **HOST-FORCED** to this function's project (the guest
+    /// never names a project/site); the named site must EXIST in the project AND grant `wasi:blobstore`
+    /// in its `[handlers].allow_imports` (the same least-privilege consent a site's own consumer passes)
+    /// — else the blob binding **fails closed** (not attached; a guest blob op is `access-denied`, never
+    /// silently served from the fn-private namespace). The `blobstore_containers` allowlist, `{tenant}`
+    /// confinement, and object-key screening all still apply unchanged on top of the site scope, so a
+    /// `blob_site` binding gets EXACTLY what a same-site handler gets, never more. Absent ⇒ the
+    /// function's private `fn/<name>` blob scope (no regression). Only consulted when `imports` contains
+    /// `wasi:blobstore`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blob_site: Option<String>,
     /// In-site tenancy decision for this function's `sql`/`orm` access (Dimension 0). Absent ⇒
     /// *undeclared* (refused under the `multi-tenant` posture, treated as `Disabled` — plain
     /// queries — under single-tenant/dev). `Scoped` opts into host-injected row scoping. Parsed via
@@ -268,6 +285,9 @@ impl FunctionConfig {
             // `blob_upload_site` field is exclusively the STANDALONE top-level function's way to name
             // the site it mints for.
             blob_upload_site: None,
+            // Likewise `blob_site` (shared `wasi:blobstore` namespace) is a standalone top-level
+            // function's field — a desugared site handler is already site-scoped on the dispatch path.
+            blob_site: None,
             // A desugared handler-function carries its own per-handler tenancy when declared;
             // absent ⇒ inherit the site config (the dispatch path applies the site decision).
             tenancy: h.tenancy.clone(),
