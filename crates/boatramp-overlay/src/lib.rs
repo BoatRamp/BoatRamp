@@ -16,6 +16,7 @@
 #![forbid(unsafe_code)]
 
 pub mod circuit;
+pub mod direct;
 pub mod e2ee;
 pub mod ice;
 pub mod net;
