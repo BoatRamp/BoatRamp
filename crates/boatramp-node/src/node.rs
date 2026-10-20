@@ -518,17 +518,40 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
     #[cfg(not(feature = "handlers"))]
     let blob_resolver: Option<Arc<dyn boatramp_core::compute::ComputeBindingResolver>> = None;
 
+    // Activate the compute messaging-shim (PLAN-compute-bindings): the symmetric sibling of the
+    // sql/blob shims — bind its listener + build the resolver when a messaging substrate and
+    // `compute.messaging_shim_url` are both present, so a workload's `--bind messaging` publishes
+    // to the SAME `{project}/bus/<topic>` project bus a `wasi:messaging` producer's `bus:` publish
+    // reaches (the native-MX-edge → `bus:deliver` → consumer-function round-trip, M28 28b).
+    #[cfg(feature = "handlers")]
+    let messaging_resolver = boatramp_server::messaging_shim::spawn_messaging_shim(
+        handlers.messaging(),
+        config
+            .compute
+            .as_ref()
+            .and_then(|c| c.messaging_shim_url.clone()),
+    )
+    .await;
+    #[cfg(not(feature = "handlers"))]
+    let messaging_resolver: Option<Arc<dyn boatramp_core::compute::ComputeBindingResolver>> = None;
+
     // Retain a clone of the blob resolver (before it is moved into the reconcile chain) so
     // the dev/CI affordance `POST /api/compute/dev-bind-blob` can mint + register a blob
     // credential for a non-managed local process through the EXACT managed `resolve` path.
     // `None` when the blob-shim is inactive ⇒ that endpoint returns `501`.
     let dev_blob_bind_resolver = blob_resolver.clone();
+    // The symmetric clone for `POST /api/compute/dev-bind-messaging` (the messaging dev-bind
+    // affordance). `None` when the messaging-shim is inactive ⇒ that endpoint returns `501`.
+    let dev_messaging_bind_resolver = messaging_resolver.clone();
 
     // One resolver for the reconcile: each shim filters to its own binding kind, so chaining
-    // them lets a workload declaring both `sql` and `blob` bindings be served by both from a
-    // single `resolve` call.
-    let binding_resolver =
-        boatramp_core::compute::ChainedBindingResolver::chain([sql_resolver, blob_resolver]);
+    // them lets a workload declaring `sql`, `blob`, and/or `messaging` bindings be served by all
+    // three from a single `resolve` call.
+    let binding_resolver = boatramp_core::compute::ChainedBindingResolver::chain([
+        sql_resolver,
+        blob_resolver,
+        messaging_resolver,
+    ]);
 
     // Managed compute-backed SQL (PLAN-managed-compute-sql P2-b): if the handler
     // `sql` config declares any managed database, inject its `POSTGRES_*`/`MYSQL_*`
@@ -925,6 +948,7 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
     options.tenant_deprovisioner = tenant_deprovisioner;
     options.compute_exec = compute_exec;
     options.dev_blob_bind = dev_blob_bind_resolver;
+    options.dev_messaging_bind = dev_messaging_bind_resolver;
     options.compute_volumes = compute_volumes;
     options.compute_control = compute_control;
     // The internal secret store backs the admin secrets API (set/list/delete). Not

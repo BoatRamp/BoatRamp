@@ -589,6 +589,7 @@ const COMPUTE_ENV_VARS: &[&str] = &[
     "BOATRAMP_COMPUTE_REGION",
     "BOATRAMP_COMPUTE_SQL_SHIM_URL",
     "BOATRAMP_COMPUTE_BLOB_SHIM_URL",
+    "BOATRAMP_COMPUTE_MESSAGING_SHIM_URL",
     "BOATRAMP_COMPUTE_BLOB_SHIM_MAX_OBJECT_BYTES",
     "BOATRAMP_COMPUTE_MANAGED_DB_PRIVILEGE",
     "BOATRAMP_COMPUTE_DOCKER_ENDPOINT",
@@ -622,6 +623,7 @@ const SECURITY_ENV_VARS: &[&str] = &[
     "BOATRAMP_SECURITY_ALLOW_SHARED_KERNEL_COMPUTE",
     "BOATRAMP_SECURITY_ALLOW_COMPUTE_EXEC",
     "BOATRAMP_SECURITY_ALLOW_DEV_BLOB_BIND",
+    "BOATRAMP_SECURITY_ALLOW_DEV_MESSAGING_BIND",
     "BOATRAMP_SECURITY_RATELIMIT_FAIL_OPEN",
     "BOATRAMP_SECURITY_ALLOW_IMPLICIT_ROUTING",
     "BOATRAMP_SECURITY_REQUIRE_POP",
@@ -1023,6 +1025,17 @@ pub struct ComputeConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(not(feature = "handlers"), allow(dead_code))]
     pub blob_shim_url: Option<String>,
+    /// Guest-reachable base URL of the compute **messaging-shim** (PLAN-compute-bindings) —
+    /// e.g. `http://10.0.0.1:8083` (the compute bridge gateway) or the docker bridge gateway.
+    /// Set ⇒ a workload's `--bind messaging` publishes to the SAME `{project}/bus/<topic>`
+    /// project bus a `wasi:messaging` producer's `bus:` publish reaches, through a listener
+    /// bound on the **host:port this URL names** (the bridge-gateway IP / loopback — NOT all
+    /// interfaces; the token-gated `{project}/bus/` data plane must not be off-node reachable).
+    /// `None` (default) ⇒ compute messaging bindings off. The direct analogue of
+    /// [`Self::sql_shim_url`] / [`Self::blob_shim_url`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(not(feature = "handlers"), allow(dead_code))]
+    pub messaging_shim_url: Option<String>,
     /// Per-object PUT ceiling (bytes) for the compute blob-shim — bounds a single write so a
     /// compromised/buggy workload cannot exhaust node/bucket storage with one unbounded PUT (`413`
     /// on an oversize PUT). `None` (default) ⇒ the shim's built-in default (5 GiB, S3's single-PUT
@@ -1182,6 +1195,7 @@ impl Default for ComputeConfig {
             docker_ephemeral_timeout_secs: 0,
             sql_shim_url: None,
             blob_shim_url: None,
+            messaging_shim_url: None,
             blob_shim_max_object_bytes: None,
             managed_db_privilege: ManagedDbPrivilege::default(),
             internal_dns: default_internal_dns(),

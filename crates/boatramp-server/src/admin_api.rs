@@ -2452,6 +2452,115 @@ pub(super) async fn compute_dev_bind_blob(
 }
 
 // ---------------------------------------------------------------------------
+// Dev/CI messaging-shim affordance (`POST /api/compute/dev-bind-messaging`)
+// ---------------------------------------------------------------------------
+
+/// A distinct Extension newtype for the messaging dev-bind resolver, so axum's TYPE-keyed
+/// `Extension` layer does not collide with the blob dev-bind's
+/// `Extension<Option<Arc<dyn ComputeBindingResolver>>>` (both resolvers are the same trait
+/// object type). `None` ⇒ the messaging-shim is inactive on this node.
+#[derive(Clone)]
+pub(super) struct DevMessagingBind(
+    pub(super) Option<Arc<dyn boatramp_core::compute::ComputeBindingResolver>>,
+);
+
+/// `POST /api/compute/dev-bind-messaging` body: bind a NON-managed local process to the
+/// messaging-shim for one project bus (a dev/CI test-harness affordance). `topic` optionally
+/// confines the credential to one `--bind messaging:<topic>`; `project` selects the bus's
+/// project (default `"default"`). Unlike the blob bind there is NO `site`: the project bus is
+/// project-scoped (`{project}/bus/…`), shared across every site in the project.
+#[derive(Debug, Deserialize)]
+pub(super) struct DevBindMessagingRequest {
+    #[serde(default)]
+    topic: Option<String>,
+    #[serde(default)]
+    project: Option<String>,
+}
+
+/// `POST /api/compute/dev-bind-messaging` response: the env the caller exports into the local
+/// process — `BOATRAMP_MESSAGING_URL` + `BOATRAMP_MESSAGING_URL_AUTH_TOKEN` (the messaging
+/// analogue of `DATABASE_URL`).
+#[derive(Debug, Serialize)]
+pub(super) struct DevBindMessagingResponse {
+    env: Vec<(String, String)>,
+}
+
+/// A synthetic workload name a dev messaging bind derives its token under. The project bus is
+/// project-scoped, so the workload does not enter the resolved keyspace (unlike the blob bind,
+/// where `site` IS the keyspace); this is only a stable, distinct token-derivation input. Paired
+/// with [`DEV_BIND_REPLICA`] (`u32::MAX`), it never collides with a managed replica's token.
+const DEV_MESSAGING_WORKLOAD: &str = "_dev-bind-messaging";
+
+/// Mint + register a messaging-shim credential for a NON-managed local process (dev/CI). Gated
+/// `System·Admin` (node-global, `is_compute_maintenance_path`) AND the `allow_dev_messaging_bind`
+/// posture (off outside `dev`). Reuses the EXACT managed `resolve()` path — the same token
+/// derivation + scope resolution + registry insert a `--bind messaging` workload gets — so the
+/// dev credential is identical in strength + confinement (project-bus-scoped, topic-bound when
+/// named) to a managed one, just handed to an external process. `501` when the messaging-shim is
+/// not wired on this node.
+pub(super) async fn compute_dev_bind_messaging(
+    Extension(posture): Extension<boatramp_core::security::SecurityPosture>,
+    Extension(DevMessagingBind(resolver)): Extension<DevMessagingBind>,
+    Json(req): Json<DevBindMessagingRequest>,
+) -> Response {
+    // Defense-in-depth: re-derive that this path is `System·Admin` (node-global), so a
+    // routing/table regression cannot silently downgrade a credential-minting endpoint.
+    if let Some(forbidden) = assert_project_export_is_system_admin(
+        "POST",
+        "/api/compute/dev-bind-messaging",
+        "compute dev-bind-messaging",
+    ) {
+        return forbidden;
+    }
+    if !posture.allow_dev_messaging_bind {
+        return (
+            StatusCode::FORBIDDEN,
+            "compute dev-bind-messaging is disabled; set the `allow_dev_messaging_bind` posture \
+             (BOATRAMP_SECURITY_ALLOW_DEV_MESSAGING_BIND=true — on by default only in the `dev` \
+             profile) to enable it\n",
+        )
+            .into_response();
+    }
+    let Some(resolver) = resolver else {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            "the compute messaging-shim is not active on this node (no messaging substrate or \
+             `compute.messaging_shim_url` configured)\n",
+        )
+            .into_response();
+    };
+    let project = req.project.as_deref().unwrap_or("default");
+    // Slug-validate the project (it flows into the token scope + the `{project}/bus/` key
+    // prefix). The topic, when named, is re-validated inside the resolver's `scope`
+    // (`validate_object_key` — a bus topic legitimately has `/`/`.`); a reject there yields an
+    // empty env → `400` below (fail-closed, never a silent empty 200).
+    if let Some(resp) = reject_invalid_name("project", project) {
+        return resp;
+    }
+    let binding = boatramp_core::compute::ComputeBinding {
+        kind: boatramp_core::compute::BindingKind::Messaging,
+        name: req.topic.unwrap_or_default(),
+        url_env: None,
+    };
+    let env = resolver
+        .resolve(
+            project,
+            DEV_MESSAGING_WORKLOAD,
+            DEV_BIND_REPLICA,
+            std::slice::from_ref(&binding),
+        )
+        .await;
+    if env.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "the messaging binding did not resolve (check the topic name)\n",
+        )
+            .into_response();
+    }
+    (StatusCode::OK, Json(DevBindMessagingResponse { env })).into_response()
+}
+
+// ---------------------------------------------------------------------------
 // Native project export / import (`POST /api/project-export` / `/api/project-import`)
 // ---------------------------------------------------------------------------
 
@@ -4187,6 +4296,119 @@ mod tests {
         let resp = compute_dev_bind_blob(
             Extension(posture_with_dev_bind(true)),
             Extension(Some(empty)),
+            Json(req()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// A `ComputeBindingResolver` that returns a canned env for a `messaging` binding — the
+    /// messaging analogue of [`FakeBlobResolver`], so the `dev-bind-messaging` handler's GATE
+    /// matrix (posture / 501 / empty-resolve) is testable without the live shim. `env` empty ⇒
+    /// simulate a binding the resolver rejected (e.g. a bad topic).
+    struct FakeMessagingResolver {
+        env: Vec<(String, String)>,
+    }
+
+    #[async_trait::async_trait]
+    impl boatramp_core::compute::ComputeBindingResolver for FakeMessagingResolver {
+        async fn resolve(
+            &self,
+            _project: &str,
+            _workload: &str,
+            _replica: u32,
+            bindings: &[boatramp_core::compute::ComputeBinding],
+        ) -> Vec<(String, String)> {
+            if bindings
+                .iter()
+                .any(|b| b.kind == boatramp_core::compute::BindingKind::Messaging)
+            {
+                self.env.clone()
+            } else {
+                Vec::new()
+            }
+        }
+        async fn release(
+            &self,
+            _project: &str,
+            _workload: &str,
+            _replica: u32,
+            _bindings: &[boatramp_core::compute::ComputeBinding],
+        ) {
+        }
+    }
+
+    fn posture_with_dev_messaging_bind(on: bool) -> boatramp_core::security::SecurityPosture {
+        boatramp_core::security::SecurityPosture {
+            allow_dev_messaging_bind: on,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn dev_bind_messaging_gate_matrix() {
+        let env = vec![
+            (
+                "BOATRAMP_MESSAGING_URL".to_string(),
+                "http://10.0.0.1:8083".to_string(),
+            ),
+            (
+                "BOATRAMP_MESSAGING_URL_AUTH_TOKEN".to_string(),
+                "tok-msg".to_string(),
+            ),
+        ];
+        let resolver: Arc<dyn boatramp_core::compute::ComputeBindingResolver> =
+            Arc::new(FakeMessagingResolver { env: env.clone() });
+        let req = || DevBindMessagingRequest {
+            topic: Some("deliver".into()),
+            project: None,
+        };
+
+        // Posture OFF ⇒ 403 even with a resolver wired (the gate, not availability).
+        let resp = compute_dev_bind_messaging(
+            Extension(posture_with_dev_messaging_bind(false)),
+            Extension(DevMessagingBind(Some(resolver.clone()))),
+            Json(req()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        // Posture ON but no resolver (messaging-shim inactive) ⇒ 501.
+        let resp = compute_dev_bind_messaging(
+            Extension(posture_with_dev_messaging_bind(true)),
+            Extension(DevMessagingBind(None)),
+            Json(req()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+
+        // Posture ON + resolver ⇒ 200 with the MESSAGING_URL + token env.
+        let resp = compute_dev_bind_messaging(
+            Extension(posture_with_dev_messaging_bind(true)),
+            Extension(DevMessagingBind(Some(resolver.clone()))),
+            Json(req()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let pairs = body["env"].as_array().expect("env array");
+        assert!(
+            pairs.iter().any(|p| p[0] == "BOATRAMP_MESSAGING_URL"),
+            "env carries BOATRAMP_MESSAGING_URL"
+        );
+        assert!(
+            pairs
+                .iter()
+                .any(|p| p[0] == "BOATRAMP_MESSAGING_URL_AUTH_TOKEN"),
+            "env carries the auth token"
+        );
+
+        // Resolver returns EMPTY (a rejected topic) ⇒ 400, never a silent empty 200.
+        let empty: Arc<dyn boatramp_core::compute::ComputeBindingResolver> =
+            Arc::new(FakeMessagingResolver { env: Vec::new() });
+        let resp = compute_dev_bind_messaging(
+            Extension(posture_with_dev_messaging_bind(true)),
+            Extension(DevMessagingBind(Some(empty))),
             Json(req()),
         )
         .await;

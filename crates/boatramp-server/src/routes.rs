@@ -54,6 +54,7 @@ pub fn router_with_fast(
     let tenant_deprovisioner_cap = options.tenant_deprovisioner.clone();
     let compute_exec_cap = options.compute_exec.clone();
     let dev_blob_bind_cap = options.dev_blob_bind.clone();
+    let dev_messaging_bind_cap = DevMessagingBind(options.dev_messaging_bind.clone());
     let project_export_cap = options.project_export.clone();
     let compute_volumes_cap = options.compute_volumes.clone();
     let compute_control_cap = options.compute_control.clone();
@@ -416,6 +417,13 @@ pub fn router_with_fast(
         // local process. System·Admin (node-global, `is_compute_maintenance_path`) AND
         // gated at the handler by the `allow_dev_blob_bind` posture (off outside `dev`).
         .route("/api/compute/dev-bind-blob", post(compute_dev_bind_blob))
+        // Dev/CI messaging-shim affordance: mint a BOATRAMP_MESSAGING_URL + token for a
+        // non-managed local process. System·Admin (node-global, `is_compute_maintenance_path`)
+        // AND gated at the handler by the `allow_dev_messaging_bind` posture (off outside `dev`).
+        .route(
+            "/api/compute/dev-bind-messaging",
+            post(compute_dev_bind_messaging),
+        )
         // Native project export/import (env-clone): stream a project's BRPROJ bundle out,
         // or import one in. System·Admin (the SINGULAR hyphen paths never match a
         // `/api/<family>/*` project matcher) + re-checked defense-in-depth at the handler.
@@ -699,6 +707,7 @@ pub fn router_with_fast(
         .layer(Extension(tenant_deprovisioner_cap))
         .layer(Extension(compute_exec_cap))
         .layer(Extension(dev_blob_bind_cap))
+        .layer(Extension(dev_messaging_bind_cap))
         .layer(Extension(project_export_cap))
         .layer(Extension(compute_volumes_cap))
         .layer(Extension(compute_control_cap))

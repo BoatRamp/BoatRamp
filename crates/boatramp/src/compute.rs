@@ -158,11 +158,13 @@ enum ComputeCommand {
         regions: Vec<String>,
         /// Managed binding the workload depends on, `<kind>[:<name>]` (repeatable):
         /// `sql` binds the site database, `sql:analytics` a named external DB; `blob`
-        /// binds the site blob store, `blob:assets` one named container. The endpoint
-        /// URL + token are injected into the guest env (`BOATRAMP_SQL_URL` /
-        /// `BOATRAMP_BLOB_URL`). NOTE: a bare `blob` (no `:<name>`) is SITE-WIDE — the
-        /// workload can read/write EVERY container in its site's `hblob/{site}/` space;
-        /// use `blob:<name>` to confine it to one container.
+        /// binds the site blob store, `blob:assets` one named container; `messaging` binds
+        /// the project bus, `messaging:deliver` one topic. The endpoint URL + token are
+        /// injected into the guest env (`BOATRAMP_SQL_URL` / `BOATRAMP_BLOB_URL` /
+        /// `BOATRAMP_MESSAGING_URL`). NOTE: a bare `blob` (no `:<name>`) is SITE-WIDE — the
+        /// workload can read/write EVERY container in its site's `hblob/{site}/` space; use
+        /// `blob:<name>` to confine it. Likewise a bare `messaging` is PROJECT-BUS-WIDE (any
+        /// topic under `{project}/bus/`); use `messaging:<topic>` to confine it to one topic.
         #[arg(long = "bind")]
         bind: Vec<String>,
     },
@@ -268,6 +270,25 @@ enum ComputeCommand {
         #[arg(long)]
         container: Option<String>,
         /// The project owning the blob namespace (default `default`).
+        #[arg(long)]
+        project: Option<String>,
+        /// Prefix each line with `export ` so the output is `eval`-able in a shell.
+        #[arg(long)]
+        export: bool,
+    },
+    /// Mint a messaging-shim credential for a NON-managed local process (dev/CI) and print it as
+    /// env — the messaging analogue of `bind-blob` (#07) / `DATABASE_URL`. The process then
+    /// publishes to the SAME `{project}/bus/<topic>` project bus a managed `--bind messaging`
+    /// workload (or a `wasi:messaging` producer's `bus:` publish) for that project reaches, so a
+    /// native-producer → consumer-function bus round-trip can be exercised offline. Requires the
+    /// server's `allow_dev_messaging_bind` posture (on by default only in `dev`); System·Admin.
+    /// Example: `eval "$(boatramp compute bind-messaging --topic deliver --export)"`.
+    BindMessaging {
+        /// Confine the credential to one topic (`--bind messaging:<topic>`); omit for a
+        /// project-bus-wide credential (any topic under `{project}/bus/`).
+        #[arg(long)]
+        topic: Option<String>,
+        /// The project owning the bus (default `default`).
         #[arg(long)]
         project: Option<String>,
         /// Prefix each line with `export ` so the output is `eval`-able in a shell.
@@ -445,6 +466,14 @@ pub enum ComputeOutput {
         /// The env pairs to inject.
         env: Vec<(String, String)>,
     },
+    /// `compute bind-messaging` — the injected messaging-shim env (as `K=V` pairs).
+    BindMessaging {
+        /// Whether `--export` was requested (prefixes each human line with `export `).
+        #[serde(skip)]
+        export: bool,
+        /// The env pairs to inject.
+        env: Vec<(String, String)>,
+    },
     /// `compute volume ls` — the persistent volumes.
     VolumeLs { volumes: Vec<serde_json::Value> },
     /// `compute volume rm` — the volume was removed.
@@ -496,7 +525,7 @@ impl crate::output::Rendered for ComputeOutput {
                 writeln!(w, "workload {name} built + set (spec {spec})")
             }
             Self::Rm { name } => writeln!(w, "removed {name}"),
-            Self::BindBlob { export, env } => {
+            Self::BindBlob { export, env } | Self::BindMessaging { export, env } => {
                 let prefix = if *export { "export " } else { "" };
                 for (k, v) in env {
                     writeln!(w, "{prefix}{k}={v}")?;
@@ -985,6 +1014,39 @@ pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<ComputeOut
                 }
             }
             ComputeOutput::BindBlob { export, env }
+        }
+        ComputeCommand::BindMessaging {
+            topic,
+            project,
+            export,
+        } => {
+            let body = serde_json::json!({
+                "topic": topic,
+                "project": project,
+            });
+            // Node-global endpoint (System·Admin); the bus-namespace project is carried in the
+            // BODY, not the path.
+            let resp = http
+                .post(format!("{server}/api/compute/dev-bind-messaging"))
+                .json(&body)
+                .send()
+                .await?;
+            let status = resp.status();
+            if !status.is_success() {
+                let text = resp.text().await.unwrap_or_default();
+                return Err(Error::Server(format!(
+                    "compute bind-messaging failed: {status}: {}",
+                    text.trim()
+                )));
+            }
+            let out: serde_json::Value = resp.json().await?;
+            let mut env = Vec::new();
+            for pair in out["env"].as_array().into_iter().flatten() {
+                if let (Some(k), Some(v)) = (pair[0].as_str(), pair[1].as_str()) {
+                    env.push((k.to_string(), v.to_string()));
+                }
+            }
+            ComputeOutput::BindMessaging { export, env }
         }
         ComputeCommand::Volume(VolumeCommand::Ls) => {
             let vols: serde_json::Value = http

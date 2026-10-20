@@ -823,6 +823,11 @@ fn is_compute_maintenance_path(path: &str) -> bool {
             // it to a `Project` right any tenant's token satisfies). Posture-gated
             // (`allow_dev_blob_bind`) at the handler too.
             || rest == "dev-bind-blob"
+            // The dev/CI messaging-bind affordance (`compute bind-messaging`) mints a
+            // project-bus-scoped messaging-shim credential for a NON-managed process for ANY
+            // project on the node — node-global like the tools above, so `system·admin`, never a
+            // per-project grant. Posture-gated (`allow_dev_messaging_bind`) at the handler too.
+            || rest == "dev-bind-messaging"
     )
 }
 
@@ -1864,10 +1869,12 @@ mod tests {
             // project/site — node-global, so system·admin in both forms (NOT the per-project
             // right the general `/api/compute/*` mapping would otherwise give).
             ("POST", "/api/compute/dev-bind-blob"),
+            ("POST", "/api/compute/dev-bind-messaging"),
             // Project-scoped form (the `project_scope` rewrite's original path).
             ("GET", "/api/projects/acme/compute/status"),
             ("POST", "/api/projects/acme/compute/maintenance/set-health"),
             ("POST", "/api/projects/acme/compute/dev-bind-blob"),
+            ("POST", "/api/projects/acme/compute/dev-bind-messaging"),
         ] {
             let required = Right::required(method, path).expect("route is gated");
             assert_eq!(required, admin, "{method} {path} must need system·admin");

@@ -163,6 +163,16 @@ system-principal-gate-mutation = [
 # live under this crate's own `cfg(test)`, so the in-crate gate arms them).
 compute-blob-shim-gate-mutation = ["handlers"]
 
+# TEST-ONLY anti-hollow lane for the compute messaging-shim (PLAN-compute-bindings): arms the three
+# `BOATRAMP_COMPUTEMESSAGING_MUTATION` seams in `messaging_shim.rs` — `allow_cross_topic` (a
+# topic-bound token reaches a DIFFERENT topic), `allow_traversal` (a `../` topic escapes the
+# `{project}/bus/` prefix), `admit_unmatched` (a missing/unknown bearer token is admitted) — each
+# turning the `COMPUTE MESSAGING-SHIM SCOPED OK` gate RED. The shared-bus positive proof claims the
+# shim's publish back off the REAL `LogMessaging` substrate (boatramp-core, no guest binding), so the
+# gate builds+runs with NO extra features. Compiled OUT of every real build (the seams also live
+# under this crate's own `cfg(test)`, so the in-crate gate arms them).
+compute-messaging-shim-gate-mutation = []
+
 # The default-scope project-reservation gate lane (v0.31.0 Finding 8, `DEFAULT-SCOPE RESERVE OK`).
 # When ON, `create_project` compiles a `BOATRAMP_DEFAULTSCOPE_MUTATE_ACCEPT_DEFAULT` seam that drops
 # the reserved-name rejection (accepts a `default` project), turning the reservation gate RED —

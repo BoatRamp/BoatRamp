@@ -46,23 +46,25 @@ pub mod aot;
 #[cfg(feature = "handlers")]
 mod blob_ref;
 pub mod blob_shim;
+pub mod messaging_shim;
 pub mod sql_shim;
 #[cfg(feature = "oidc")]
 pub(crate) use admin_api::auth_exchange;
 #[cfg(feature = "blob-upload")]
 pub(crate) use admin_api::blob_mint_upload;
 pub(crate) use admin_api::{
-    activate_deployment, cert_status, compute_dev_bind_blob, compute_dns, compute_dns_resolve,
-    compute_exec, compute_ipam, compute_netdiag, compute_reconcile, compute_restart,
-    compute_set_health, compute_status, create_deployment, current_deployment, database_status,
-    declare_database, delete_compute, delete_compute_volume, delete_project_tenancy, delete_site,
-    ensure_database, get_compute, get_daemon_config, get_database, get_deployment,
-    get_project_tenancy, get_site_config, invalidate_cache, list_aliases, list_compute,
-    list_compute_volumes, list_databases, list_deployments, list_sites, migrate_apply,
-    migrate_baseline, migrate_dry_run, migrate_status, project_export, project_import,
-    prune_delete, prune_report, put_blob, put_compute, put_daemon_config, put_project_tenancy,
-    put_site_config, remove_alias, repair_apply, repair_dry_run, rollback_daemon_config,
-    scrub_blobs, set_alias, sql_exec, sql_move, sql_ping, sql_query,
+    DevMessagingBind, activate_deployment, cert_status, compute_dev_bind_blob,
+    compute_dev_bind_messaging, compute_dns, compute_dns_resolve, compute_exec, compute_ipam,
+    compute_netdiag, compute_reconcile, compute_restart, compute_set_health, compute_status,
+    create_deployment, current_deployment, database_status, declare_database, delete_compute,
+    delete_compute_volume, delete_project_tenancy, delete_site, ensure_database, get_compute,
+    get_daemon_config, get_database, get_deployment, get_project_tenancy, get_site_config,
+    invalidate_cache, list_aliases, list_compute, list_compute_volumes, list_databases,
+    list_deployments, list_sites, migrate_apply, migrate_baseline, migrate_dry_run, migrate_status,
+    project_export, project_import, prune_delete, prune_report, put_blob, put_compute,
+    put_daemon_config, put_project_tenancy, put_site_config, remove_alias, repair_apply,
+    repair_dry_run, rollback_daemon_config, scrub_blobs, set_alias, sql_exec, sql_move, sql_ping,
+    sql_query,
 };
 #[cfg(feature = "handlers")]
 pub(crate) use admin_api::{
@@ -1440,6 +1442,18 @@ impl HandlerRuntime {
         self.inner.as_ref().map(|inner| inner.blob_backends.clone())
     }
 
+    /// The internal messaging substrate, if a handler runtime with messaging is present. Backs
+    /// the compute messaging-shim (PLAN-compute-bindings) so an opaque workload publishes to the
+    /// SAME `{project}/bus/<topic>` project bus — over the SAME [`Messaging`](boatramp_core::messaging::Messaging)
+    /// substrate — a `wasi:messaging` producer's `bus:` publish reaches. The symmetric analogue of
+    /// [`Self::sql_backends`] / [`Self::blob_backends`]; `None` ⇒ no messaging substrate wired.
+    #[cfg(feature = "handlers")]
+    pub fn messaging(&self) -> Option<Arc<dyn boatramp_core::messaging::Messaging>> {
+        self.inner
+            .as_ref()
+            .and_then(|inner| inner.messaging.clone())
+    }
+
     /// The RAW (undecorated) DEFAULT-project blob backend, for the store-migration data-aware
     /// collision scan (Security LOW-A2). `None` ⇒ no separate raw handle was wired (the global
     /// `new()` path / tests); the caller then falls back to `blob_backends().backend(DEFAULT)`.
@@ -2389,6 +2403,13 @@ pub struct ServerOptions {
     /// `System·Admin`. Wired by the node with the blob-shim (a clone of the reconcile
     /// resolver), so the dev bind mints + registers through the EXACT managed path.
     pub dev_blob_bind: Option<Arc<dyn boatramp_core::compute::ComputeBindingResolver>>,
+    /// The compute **messaging-shim** binding resolver, retained so the dev/CI affordance
+    /// `POST /api/compute/dev-bind-messaging` can mint a `BOATRAMP_MESSAGING_URL` + token for a
+    /// NON-managed local process (the messaging analogue of `DATABASE_URL`). `None` ⇒ `501`.
+    /// Gated at the handler by the `allow_dev_messaging_bind` posture (off outside `dev`) AND
+    /// `System·Admin`. Wired by the node with the messaging-shim (a clone of the reconcile
+    /// resolver), so the dev bind mints + registers through the EXACT managed path.
+    pub dev_messaging_bind: Option<Arc<dyn boatramp_core::compute::ComputeBindingResolver>>,
     /// Native project export/import capability (env-clone). Backs
     /// `POST /api/project-export` / `POST /api/project-import` (`System·Admin`); `None`
     /// ⇒ those routes return `501`. Wired by the node when the `project-export` driver
