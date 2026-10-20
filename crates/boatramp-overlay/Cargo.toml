@@ -26,7 +26,14 @@ quinn = { version = "0.11", default-features = false, features = [
   "runtime-tokio",
   "rustls-aws-lc-rs",
 ] }
-tokio = { workspace = true }
+# `sync` (mpsc rebind channel + the circuit registry RwLock) and `time`
+# (rebind grace deadline) on top of the workspace feature set.
+tokio = { workspace = true, features = ["sync", "time"] }
+# Length-delimited framing for circuit frames — FramedRead.next() is
+# cancellation-safe, which the pump's select! loop requires.
+tokio-util = { workspace = true, features = ["codec"] }
+futures = { workspace = true }
+bytes = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 

@@ -15,6 +15,10 @@
 
 #![forbid(unsafe_code)]
 
+pub mod circuit;
 pub mod quic;
 
+pub use circuit::{
+    CircuitError, CircuitId, CircuitRegistry, CircuitStats, LinkHalves, run_circuit_duplex,
+};
 pub use quic::{QuicError, client_endpoint, peer_endpoint, server_endpoint};
