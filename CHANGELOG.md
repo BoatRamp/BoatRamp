@@ -54,13 +54,14 @@ binding for consumers and standalone functions).
 
 ### Fixed
 
-- **Host stream fan-out was unreachable by any deployed producer** (mailroom #14). `serve_stream` /
-  `serve_ws_stream` subscribed the bare-site scope `{site}/<topic>`, but a deployed guest
-  `wasi:messaging` binding publishes the project-qualified `{project}/{site}/<topic>`, so no handler,
-  function, nor the #12 messaging shim could reach a host stream's keyspace. The subscription scope is
-  now project-qualified structurally via `ProjectRef::qualified`, with a ≥2-tenant test asserting a
-  foreign tenant's events are never delivered. (`serve_graphql_subscription` keeps the bare-site scope
-  pending a separate decision.)
+- **Host stream fan-out was unreachable by any deployed producer** (mailroom #14). The host stream
+  surfaces subscribed the bare-site scope `{site}/<topic>`, but a deployed guest `wasi:messaging`
+  binding publishes the project-qualified `{project}/{site}/<topic>`, so no handler, function, nor the
+  #12 messaging shim could reach a host stream's keyspace, and two projects on the same site-name
+  shared one keyspace (a cross-project collision). The subscription scope is now project-qualified
+  structurally via `ProjectRef::qualified` across all three fan-out surfaces — SSE (`serve_stream`),
+  WebSocket (`serve_ws_stream`), and GraphQL-SSE subscriptions (`serve_graphql_subscription`) — each
+  with a ≥2-tenant test asserting a foreign tenant's events are never delivered.
 
 ### Security
 
