@@ -18,19 +18,26 @@ use std::net::SocketAddr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use boatramp_core::cose::TokenPublicKey;
+use boatramp_overlay_proto::circuit::{DEFAULT_SEGMENT, DEFAULT_WINDOW};
 use boatramp_overlay_proto::dial::{DialRequest, DialVerdict, authorize_dial};
-use boatramp_overlay_proto::e2ee::Role;
+use boatramp_overlay_proto::e2ee::{Role, Session};
 use boatramp_overlay_proto::identity::{OverlayId, OverlaySecret};
 use boatramp_overlay_proto::peer_policy::OverlayPeerPolicy;
 use boatramp_overlay_proto::wire;
-use quinn::{Connection, Endpoint};
+use quinn::{Connection, Endpoint, RecvStream, SendStream};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::sync::mpsc;
 use tokio::time::timeout;
 
+use crate::circuit::{CircuitError, LinkHalves, run_circuit_duplex};
 use crate::e2ee::{SpliceError, establish, splice};
 use crate::quic::{self, QuicError};
+
+/// Buffer for the in-memory pipe that connects the E2EE splice to the circuit pump (the pump
+/// carries the splice's sealed-record byte stream over the link).
+const SEALED_PIPE_BUF: usize = 256 * 1024;
 
 /// Upper bound on a dial request/verdict JSON message.
 const MAX_DIAL_MSG: usize = 16 * 1024;
@@ -48,6 +55,8 @@ pub enum NetError {
     Io(#[from] std::io::Error),
     #[error(transparent)]
     Splice(#[from] SpliceError),
+    #[error(transparent)]
+    Circuit(#[from] CircuitError),
     #[error("dial wire: {0}")]
     Json(#[from] serde_json::Error),
     #[error("dial message too large: {0} bytes")]
@@ -136,9 +145,47 @@ where
         None,
     )
     .await?;
-    let (sealer, opener) = session.split();
     let (lr, lw) = tokio::io::split(local);
-    splice(sealer, opener, lr, lw, send, recv).await?;
+    run_spliced_circuit(session, lr, lw, recv, send).await
+}
+
+/// Run the E2EE splice over the resumable circuit pump (which carries the sealed records over the
+/// link) as two concurrent tasks joined by an in-memory pipe. The pump is **inline** so a
+/// direct-path promotion (IU-7) can `rebind` it onto a direct link with zero loss; until promotion
+/// lands the rebind channel is unused and the pump runs on the single link.
+async fn run_spliced_circuit<AR, AW>(
+    session: Session,
+    app_r: AR,
+    app_w: AW,
+    link_recv: RecvStream,
+    link_send: SendStream,
+) -> Result<(), NetError>
+where
+    AR: AsyncRead + Unpin,
+    AW: AsyncWrite + Unpin,
+{
+    let (sealer, opener) = session.split();
+    // The splice's sealed-record stream <-> the pump's "local" side, via a pipe.
+    let (splice_side, pump_side) = tokio::io::duplex(SEALED_PIPE_BUF);
+    let (ss_r, ss_w) = tokio::io::split(splice_side);
+    let (ps_r, ps_w) = tokio::io::split(pump_side);
+    // Promotion (IU-7) will hold this sender and feed it the direct link; for now it's unused, so
+    // the pump runs on its single link.
+    let (_rebind_tx, rebind_rx) = mpsc::channel::<LinkHalves>(1);
+
+    let splice_fut = splice(sealer, opener, app_r, app_w, ss_w, ss_r);
+    let pump_fut = run_circuit_duplex(
+        ps_r,
+        ps_w,
+        LinkHalves::new(link_recv, link_send),
+        rebind_rx,
+        wire::DEFAULT_REBIND_GRACE,
+        DEFAULT_WINDOW,
+        DEFAULT_SEGMENT,
+    );
+    let (splice_res, pump_res) = tokio::join!(splice_fut, pump_fut);
+    splice_res?;
+    pump_res?;
     Ok(())
 }
 
@@ -231,11 +278,10 @@ pub async fn terminate_one(
 
     let (session, _client) =
         establish(&mut send, &mut recv, secret, Role::Responder, None, None).await?;
-    let (sealer, opener) = session.split();
 
     let backend = tokio::net::TcpStream::connect(backend_addr).await?;
     let (br, bw) = backend.into_split();
-    splice(sealer, opener, br, bw, send, recv).await?;
+    run_spliced_circuit(session, br, bw, recv, send).await?;
     // Hold the connection open until the relay has drained the sealed echo and closes (bounded),
     // so the final records are delivered before this connection drops.
     let _ = timeout(wire::DIRECT_DRAIN, conn.closed()).await;
