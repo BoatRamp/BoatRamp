@@ -5,6 +5,36 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.41.0] - 2026-10-20
+
+The compute messaging bind is now live. A native or container workload can use the project messaging
+bus the same way it already uses SQL and blob storage: `compute set --bind messaging` is a real
+binding, symmetric with `--bind sql` and `--bind blob`. Previously the binding was parsed but dead —
+only a WebAssembly guest could reach the bus — so a native MX edge, a batch producer, or an event
+consumer had no way to enqueue or drain work. Now it can both publish to and consume from
+`{project}/bus/<topic>` over a scoped local shim.
+
+### Added
+
+- **Compute `--bind messaging` shim.** `compute set --bind messaging` injects a live
+  `BOATRAMP_MESSAGING_URL` plus a project/topic-scoped `BOATRAMP_MESSAGING_URL_AUTH_TOKEN`. The shim
+  serves the project bus `{project}/bus/<topic>`:
+  - `POST /publish/{topic}` — publish (optional `delay_ms` / `ttl_ms` / `priority`);
+  - `POST /claim/{topic}` — lease up to `max` messages for `lease_ms` (at-least-once, competing
+    consumer), returning each payload plus an opaque ack handle;
+  - `POST /ack` — delete a claimed message; `POST /nack` — redeliver it (optionally after `delay_ms`).
+
+  The project is taken only from the token's bus prefix, so cross-project access is impossible, and a
+  claimed message's ack handle is re-authorized through the same scope check on `ack`/`nack` — a
+  forged handle cannot escape the token's scope. A new **`boatramp compute bind-messaging [--export]`**
+  dev/CI affordance lets a local process use the bind in offline proofs, mirroring `bind-blob`. Closes
+  mailroom request #12.
+
+### Security
+
+- Publish and consume enforce the same project / topic confinement, proven by a mutation-verified CI
+  gate: a cross-topic, traversal, or unauthenticated `claim`/`ack` each fails the gate.
+
 ## [0.40.0] - 2026-10-20
 
 Per-subscriber-filtered, authorized live streams. A host `stream` (the SSE / WebSocket topic fan-out)
