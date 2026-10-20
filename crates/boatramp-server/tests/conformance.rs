@@ -5347,8 +5347,12 @@ async fn stream_route_fans_out_text_and_binary_events() {
     // so a publish now reaches this connection.
     let mut body = response.into_body().into_data_stream();
 
-    // UTF-8 payload → verbatim under the topic's event name.
-    log.publish("blog/orders/created", b"hello").await.unwrap();
+    // UTF-8 payload → verbatim under the topic's event name. #14: publish at the PROJECT-QUALIFIED
+    // scope `default/blog/<topic>` — exactly where a deployed handler/function `wasi:messaging`
+    // binding lands (`ProjectRef::qualified` prefixes `default`), which the stream now subscribes.
+    log.publish("default/blog/orders/created", b"hello")
+        .await
+        .unwrap();
     let chunk = tokio::time::timeout(Duration::from_secs(5), body.next())
         .await
         .expect("timed out waiting for text event")
@@ -5360,7 +5364,7 @@ async fn stream_route_fans_out_text_and_binary_events() {
     assert!(text.contains("id: "), "event must carry an id: {text:?}");
 
     // Binary payload → base64 under a `{topic}.b64` event.
-    log.publish("blog/orders/created", &[0xff, 0xfe, 0x00])
+    log.publish("default/blog/orders/created", &[0xff, 0xfe, 0x00])
         .await
         .unwrap();
     let chunk = tokio::time::timeout(Duration::from_secs(5), body.next())
@@ -5380,6 +5384,111 @@ async fn stream_route_fans_out_text_and_binary_events() {
 fn base64_encode_bytes(bytes: &[u8]) -> String {
     use base64::Engine;
     base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+/// #14 — the host `stream` subscription scope is project-qualified, so (a) a publish at the
+/// PROJECT-QUALIFIED scope `default/blog/<topic>` — exactly where a deployed handler's
+/// `wasi:messaging` binding lands (`ProjectRef::qualified`) — DOES fan out to the subscriber (the
+/// fan-out the old bare-site scope made unreachable by any deployed producer), and (b) a FOREIGN
+/// tenant's event seeded on `acme/blog/<topic>` in the same shared messaging keyspace is NEVER
+/// delivered (zero foreign-tenant bytes). Two tenants seeded; the project prefix isolates.
+#[cfg(feature = "handlers")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stream_scope_is_project_qualified_and_isolates_foreign_tenants() {
+    use boatramp_core::config::{HandlersSiteConfig, StreamConfig};
+    use boatramp_core::messaging::{LogMessaging, Messaging};
+    use boatramp_core::project::ProjectRef;
+    use boatramp_handlers::{HandlerEngine, Limits};
+    use std::time::Duration;
+
+    let storage = Arc::new(MemStorage::default());
+    let kv = Arc::new(MemoryKv::new());
+    let deploy = DeployStore::new(storage.clone(), kv.clone());
+
+    let manifest = Manifest {
+        files: BTreeMap::new(),
+        config: DeployConfig {
+            streams: vec![StreamConfig {
+                route: "/events".to_string(),
+                topics: vec!["orders/created".to_string()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let id = deploy.put_manifest(&manifest).await.unwrap();
+    deploy
+        .activate(ProjectRef::DEFAULT, "blog", &id)
+        .await
+        .unwrap();
+    deploy
+        .set_site_config(
+            ProjectRef::DEFAULT,
+            "blog",
+            &SiteConfig {
+                handlers: Some(HandlersSiteConfig {
+                    enabled: true,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let log = Arc::new(LogMessaging::new(storage.clone(), kv.clone()));
+    let messaging: Arc<dyn Messaging> = log.clone();
+    let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
+    let runtime = HandlerRuntime::new(engine, kv, storage, None, Some(messaging));
+    let app = router(deploy, Auth::disabled(), runtime);
+
+    let mut req = Request::builder()
+        .method("GET")
+        .uri("/_sites/blog/events")
+        .body(Body::empty())
+        .unwrap();
+    req.extensions_mut()
+        .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40001))));
+    let response = app.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body().into_data_stream();
+
+    // Derive the two tenants' publish scopes the SAME way a guest `wasi:messaging` binding does
+    // (`ProjectRef::qualified`), so the test tracks the real producer key — not a hardcoded string.
+    let mine = format!(
+        "{}/orders/created",
+        ProjectRef::new("default").qualified("blog")
+    );
+    let foreign = format!(
+        "{}/orders/created",
+        ProjectRef::new("acme").qualified("blog")
+    );
+    assert_ne!(
+        mine, foreign,
+        "the project prefix must segregate the two tenants"
+    );
+
+    // Seed a FOREIGN tenant's event (acme) in the shared keyspace, then the subscriber's own (default).
+    log.publish(&foreign, b"FOREIGN-TENANT").await.unwrap();
+    log.publish(&mine, b"mine").await.unwrap();
+
+    // The default-project subscriber receives ITS event — the guest-scope fan-out the bare-site
+    // scope could not reach — and never the foreign tenant's bytes.
+    let chunk = tokio::time::timeout(Duration::from_secs(5), body.next())
+        .await
+        .expect("timed out waiting for the subscriber's own event")
+        .expect("stream ended")
+        .expect("body error");
+    let text = String::from_utf8_lossy(&chunk);
+    assert!(
+        text.contains("data: mine"),
+        "subscriber must receive its own project's guest-scoped event: {text:?}"
+    );
+    assert!(
+        !text.contains("FOREIGN"),
+        "a foreign tenant's bytes must never reach the subscriber: {text:?}"
+    );
 }
 
 /// The per-site SSE connection cap (`maxStreamConnections`) is enforced: with a
@@ -5537,8 +5646,10 @@ async fn websocket_stream_fans_out_and_publishes() {
     });
 
     // Subscribe to the publish topic up front so the client→server direction is
-    // observable (live broadcast only delivers post-subscribe messages).
-    let mut ingest = log.subscribe("blog/ingest", None);
+    // observable (live broadcast only delivers post-subscribe messages). #14: the WS client→server
+    // publish now lands at the project-qualified scope `default/blog/ingest` (same derivation as the
+    // fan-out subscribe), so observe there.
+    let mut ingest = log.subscribe("default/blog/ingest", None);
 
     let url = format!("ws://127.0.0.1:{port}/_sites/blog/ws");
     let (mut ws, _resp) = tokio_tungstenite::connect_async(&url)
@@ -5548,7 +5659,10 @@ async fn websocket_stream_fans_out_and_publishes() {
     // server→client: the subscription is registered in the upgrade task, so give
     // it a beat, then a publish reaches the client.
     tokio::time::sleep(Duration::from_millis(150)).await;
-    log.publish("blog/events", b"hello-ws").await.unwrap();
+    // #14: project-qualified scope (the guest-producible key the WS stream now subscribes).
+    log.publish("default/blog/events", b"hello-ws")
+        .await
+        .unwrap();
     let msg = tokio::time::timeout(Duration::from_secs(5), ws.next())
         .await
         .expect("recv within timeout")
