@@ -256,7 +256,7 @@ impl MessagingShimResolver {
     }
 
     /// The [`MessagingScope`] for a `messaging` binding on this `project`: the SAME substrate
-    /// + `{project}/bus/` prefix the `wasi:messaging` host binding's `bus:` publish resolves.
+    /// and `{project}/bus/` prefix the `wasi:messaging` host binding's `bus:` publish resolves.
     /// The workload does NOT enter the prefix (the bus is project-scoped, not site-scoped — see
     /// the module docs). A `--bind messaging:<topic>` additionally binds the one named topic;
     /// an invalid topic fails closed (`None` returned ⇒ the binding is skipped). Pure given the
@@ -921,12 +921,15 @@ mod tests {
         }
     }
 
+    /// One recorded publish: `(topic, payload, signed_context)`.
+    type Recorded = (String, Vec<u8>, Option<String>);
+
     /// A [`Messaging`] that records every `(topic, payload, signed_context)` it is asked to
     /// publish — enough to assert the wire → bus-key mapping + the unscoped-producer context
     /// without a durable substrate.
     #[derive(Default)]
     struct RecordingMessaging {
-        published: Mutex<Vec<(String, Vec<u8>, Option<String>)>>,
+        published: Mutex<Vec<Recorded>>,
     }
 
     #[async_trait::async_trait]
