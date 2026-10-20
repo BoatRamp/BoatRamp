@@ -5,6 +5,52 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.40.0] - 2026-10-20
+
+Per-subscriber-filtered, authorized live streams. A host `stream` (the SSE / WebSocket topic fan-out)
+can now authorize each connection and deliver only the topics it is entitled to — the streaming
+analog of the platform's per-request tenancy scoping. A subscriber to a shared inbox, a chat room, or
+a per-user feed receives events only for the scopes it belongs to; a non-member is refused, and a
+cross-scope event is never delivered. Off by default: a `stream` with no `authz` broadcasts exactly
+as before.
+
+### Added
+
+- **Per-connection stream authorization** (`routing.streams[].authz`), in two forms:
+  - **`scoped`** — the host verifies the connection's bearer (`token_claims`, the same app-IdP
+    verification handlers and the data connector use), resolves the route's `:name` scope capture,
+    and requires every membership check to pass: **`claim`** (a verified-token claim enumerates the
+    scopes the subscriber may join) and/or **`sql`** (a parameterized predicate against the site's
+    managed database). The connection then subscribes only its `{name}`-substituted topics.
+  - **`guest_mediated`** — the host invokes a guest authorizer function (forwarding the bearer, and
+    the host-verified principal when `token_claims` is set); it returns the per-subscriber topic set,
+    confined to the declared `topics` templates.
+  - A missing / invalid token is `401`; a non-member (or a non-existent scope — no oracle) is `403`.
+    A bidirectional WebSocket stream scopes its inbound `publish_topic` per connection too.
+- A **"Per-subscriber scoped streams"** how-to, plus a pre-release documentation pass that fixed
+  accumulated drift (broken route examples, stale CLI output flags, wrong API endpoints) and filled
+  gaps (a project export / import / clone how-to; the streams-`authz` and per-site-subgraph reference
+  rows).
+
+### Changed
+
+- **Release process:** the full nightly preflight matrix (all-features tests + nix checks + the
+  NixOS-service VM + the operator kind-e2e) is now a structural **precondition** of publishing — the
+  Release workflow runs it on the exact release commit and gates the GHCR images, the GitHub release,
+  and the crates.io publish on it, so nothing ships unless it is green. The matrix is defined once in
+  a reusable workflow that the scheduled Nightly also calls.
+
+### Security
+
+- The disclosure boundary is fail-closed and was security-reviewed (no critical / high findings).
+  Apply-time validation rejects an ungated `topics` / `publish_topic` scope template, an empty
+  membership set, a scoped `token_claims` with no JWKS source, and a guest-mediated templated
+  `publish_topic`. The SQL membership predicate **binds** its `$name` placeholders as parameters
+  (never string-interpolated); a guest authorizer's principal header is host-set only (not
+  client-spoofable); `.`/`..` scope segments are rejected. A multi-member isolation gate (2
+  subscribers × 2 mailboxes) proves 403-non-member + zero cross-delivery, with an end-to-end libsql
+  SQL-membership CI gate.
+
 ## [0.39.0] - 2026-10-19
 
 Per-site GraphQL subgraph composition. A `federated` gateway site can declare an explicit subgraph
