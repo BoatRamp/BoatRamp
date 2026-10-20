@@ -1889,12 +1889,15 @@ dependencies = [
 name = "boatramp-overlay-proto"
 version = "0.40.0"
 dependencies = [
+ "aws-lc-rs",
  "bech32",
  "boatramp-core",
  "boatramp-rpktls",
  "bytes",
  "hex",
+ "sha2 0.10.9",
  "thiserror 2.0.18",
+ "tokio",
  "zeroize",
 ]
 

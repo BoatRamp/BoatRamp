@@ -26,11 +26,22 @@ thiserror = { workspace = true }
 hex = { workspace = true }
 # Zero-copy byte buffers for the circuit frame payloads / retransmit segments.
 bytes = { workspace = true }
+# The relay-blind E2EE core: ML-KEM-768 + X25519 hybrid KEM, AES-256-GCM AEAD,
+# HKDF. aws-lc-rs has no single X25519MLKEM768 primitive, so the hybrid is
+# assembled here; all in the default build (same backend rpktls uses).
+aws-lc-rs = "1.17"
+# Handshake transcript (SHA-256 channel binding over both shares + both ids).
+sha2 = { workspace = true }
 # Secret seed material is held in a zeroizing buffer (matches rpktls).
 zeroize = "1"
 # bech32m rendering of identities (`bro1…`) — a friendly form only; the
 # canonical identity stays boatramp-core hex. No bech32 existed in the tree.
 bech32 = "0.11"
+
+[dev-dependencies]
+# The E2EE handshake signs via the async Signer trait; the pure crate stays
+# tokio-free at runtime (tokio is test-only, as in boatramp-rpktls).
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [lints]
 workspace = true
