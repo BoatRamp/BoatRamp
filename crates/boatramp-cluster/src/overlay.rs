@@ -53,9 +53,28 @@ const K_SNAPSHOT: u8 = 3;
 const K_CLIENT_WRITE: u8 = 4;
 const K_STREAM: u8 = 5;
 
-/// Upper bound on a single framed mesh RPC body (64 MiB). Generous because one `InstallSnapshot`
-/// chunk rides one frame; a larger frame is a protocol error, not a buffer to grow.
+/// Upper bound on a single framed mesh RPC body (64 MiB). Generous because an append-entries batch
+/// or an `InstallSnapshot` chunk rides one frame; a larger frame is a protocol error, not a buffer
+/// to grow. Only the large-by-nature kinds (append / snapshot) get this ceiling (see
+/// [`max_for_kind`]); the small kinds get [`SMALL_MESH_FRAME`].
 const MAX_MESH_FRAME: usize = 64 * 1024 * 1024;
+
+/// Body ceiling for the inherently-small RPC kinds (vote / client-write / stream). Bounding these
+/// well under [`MAX_MESH_FRAME`] shrinks the blast radius of a trusted-but-compromised peer.
+const SMALL_MESH_FRAME: usize = 4 * 1024 * 1024;
+
+/// Max concurrently-dispatched mesh RPCs per peer connection (MEDIUM-A): a peer cannot pin unbounded
+/// tasks/buffers by opening many bi-streams at once — the accept loop backpressures past this.
+const MAX_INFLIGHT_STREAMS_PER_CONN: usize = 64;
+
+/// The body ceiling for an RPC `kind`: consensus append-entries and snapshot chunks can be large;
+/// vote, client-write, and stream frames are small.
+fn max_for_kind(kind: u8) -> usize {
+    match kind {
+        K_APPEND | K_SNAPSHOT => MAX_MESH_FRAME,
+        _ => SMALL_MESH_FRAME,
+    }
+}
 
 /// Application error code used to reset the client-write stream on an authorization refusal, so the
 /// forwarder sees a transport failure (mirroring the HTTP path's `403` → retry/degrade) and never
@@ -114,7 +133,10 @@ async fn write_lp(send: &mut SendStream, body: &[u8]) -> Result<(), MeshError> {
     Ok(())
 }
 
-/// Read a length-delimited body (bounded by `max`) from a QUIC recv stream.
+/// Read a length-delimited body (bounded by `max`) from a QUIC recv stream. The body is read in
+/// bounded chunks and the buffer grows only as bytes actually arrive (MEDIUM-A): a peer that
+/// declares a huge length but stalls pins at most one chunk, not the declared size — so a
+/// trusted-but-compromised peer cannot eager-allocate us out of memory with length prefixes alone.
 async fn read_lp(recv: &mut RecvStream, max: usize) -> Result<Vec<u8>, MeshError> {
     let mut len = [0u8; 4];
     recv.read_exact(&mut len)
@@ -124,10 +146,17 @@ async fn read_lp(recv: &mut RecvStream, max: usize) -> Result<Vec<u8>, MeshError
     if n > max {
         return Err(MeshError::TooLarge(n));
     }
-    let mut buf = vec![0u8; n];
-    recv.read_exact(&mut buf)
-        .await
-        .map_err(|e| MeshError::Stream(e.to_string()))?;
+    let mut buf = Vec::new();
+    let mut remaining = n;
+    let mut chunk = [0u8; 64 * 1024];
+    while remaining > 0 {
+        let want = remaining.min(chunk.len());
+        recv.read_exact(&mut chunk[..want])
+            .await
+            .map_err(|e| MeshError::Stream(e.to_string()))?;
+        buf.extend_from_slice(&chunk[..want]);
+        remaining -= want;
+    }
     Ok(buf)
 }
 
@@ -177,9 +206,10 @@ impl OverlayMesh {
         {
             let cache = self.conns.lock().await;
             if let Some(c) = cache.get(&peer)
-                && c.close_reason().is_none() {
-                    return Ok(c.clone());
-                }
+                && c.close_reason().is_none()
+            {
+                return Ok(c.clone());
+            }
         }
         let addr = peer_addr(&self.peers, peer)?;
         let conn = overlay::dial_mesh_peer(&self.endpoint, &self.tls, peer, addr).await?;
@@ -458,15 +488,25 @@ pub fn serve_mesh(
     });
 }
 
-/// Dispatch every bi-stream on one accepted peer connection until the peer closes it.
+/// Dispatch every bi-stream on one accepted peer connection until the peer closes it. In-flight
+/// dispatches are capped per connection ([`MAX_INFLIGHT_STREAMS_PER_CONN`], MEDIUM-A): the accept
+/// loop waits for a permit before accepting the next stream, so a peer cannot pin unbounded
+/// tasks/buffers by opening a flood of bi-streams.
 async fn serve_conn(conn: Connection, ctx: MeshServer) {
+    let limiter = Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_STREAMS_PER_CONN));
     loop {
+        // Acquire a permit first → backpressure the accept loop when the connection is at capacity.
+        let permit = match Arc::clone(&limiter).acquire_owned().await {
+            Ok(p) => p,
+            Err(_) => return, // semaphore closed
+        };
         let (send, recv) = match conn.accept_bi().await {
             Ok(s) => s,
             Err(_) => return, // connection closed / faulted
         };
         let ctx = ctx.clone();
         tokio::spawn(async move {
+            let _permit = permit; // released when this dispatch finishes
             let _ = dispatch(send, recv, ctx).await;
         });
     }
@@ -483,7 +523,7 @@ async fn dispatch(
     recv.read_exact(&mut kind)
         .await
         .map_err(|e| MeshError::Stream(e.to_string()))?;
-    let body = read_lp(&mut recv, MAX_MESH_FRAME).await?;
+    let body = read_lp(&mut recv, max_for_kind(kind[0])).await?;
     match kind[0] {
         K_APPEND => {
             let req: AppendEntriesRequest<TypeConfig> = serde_json::from_slice(&body)?;

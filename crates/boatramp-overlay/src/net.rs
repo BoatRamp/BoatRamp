@@ -455,10 +455,12 @@ async fn bridge(
 /// backend mapping is the egress's own deployment config (this terminator serves one `backend_addr`;
 /// a multi-service egress resolves `request.service` against its own service map); the capability's
 /// scope — not the relay's routing — is the authorization.
+#[allow(clippy::too_many_arguments)]
 pub async fn terminate_one(
     conn: Connection,
     secret: &OverlaySecret,
     backend_addr: SocketAddr,
+    service: &str,
     trust_root: &TokenPublicKey,
     encryption_required: bool,
     path_mode: PathMode,
@@ -485,6 +487,18 @@ pub async fn terminate_one(
         .open(&sealed)
         .map_err(|e| NetError::Splice(e.into()))?;
     let request: DialRequest = serde_json::from_slice(&control)?;
+    // HIGH-A: anchor the scope authorization to the service THIS egress actually fronts, never to a
+    // string the client typed. The client's asserted `request.service` must equal our own `service`,
+    // so `authorize_dial`'s `scope == request.service` check binds the capability scope to the real
+    // target — a capability for a different service cannot be redeemed here even under a misrouting
+    // relay. (A multi-service egress would resolve `request.service` against its own service map
+    // instead of this single-service equality.)
+    if request.service != service {
+        let _ = timeout(wire::DIRECT_DRAIN, conn.closed()).await;
+        return Err(NetError::DialRejected(
+            boatramp_overlay_proto::dial::DialReject::ServiceNotAuthorized,
+        ));
+    }
     match authorize_dial(
         &request,
         &client_id,
@@ -570,6 +584,7 @@ mod tests {
                             conn,
                             &egress,
                             backend_addr,
+                            "svc/echo",
                             &egress_root,
                             true,
                             PathMode::Relay,
@@ -711,6 +726,7 @@ mod tests {
                         conn,
                         &egress,
                         backend_addr,
+                        "svc/echo",
                         &egress_root,
                         true,
                         PathMode::PreferDirect,
@@ -836,6 +852,7 @@ mod tests {
                         conn,
                         &egress,
                         backend_addr,
+                        "svc/echo",
                         &egress_root,
                         true,
                         PathMode::Relay,
@@ -933,6 +950,147 @@ mod tests {
         assert!(
             outcome.is_err(),
             "an unauthorized flow must fail at the zero-trust egress, got {outcome:?}"
+        );
+    }
+
+    /// Egress service-anchor proof (Security HIGH-A): the egress authorizes the capability against
+    /// the service IT fronts, not a string the client types. A client holding a VALID capability for
+    /// `svc/echo` cannot reach a `svc/db` egress by naming `svc/echo` — even when a compromised relay
+    /// misroutes the flow to that egress. The backend is never connected.
+    #[tokio::test]
+    async fn egress_binds_scope_to_its_own_service_not_the_client_claim() {
+        use tokio::io::AsyncWriteExt;
+
+        let root = OverlaySecret::generate().unwrap();
+        let client = OverlaySecret::generate().unwrap();
+        let relay = OverlaySecret::generate().unwrap();
+        let egress = OverlaySecret::generate().unwrap();
+        let (client_id, relay_id, egress_id) = (client.id(), relay.id(), egress.id());
+
+        // The db-egress backend MUST never be connected.
+        let backend = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend.local_addr().unwrap();
+        let (hit_tx, mut hit_rx) = mpsc::channel::<()>(1);
+        tokio::spawn(async move {
+            if backend.accept().await.is_ok() {
+                let _ = hit_tx.send(()).await;
+            }
+        });
+
+        // This egress fronts `svc/db` — NOT `svc/echo`.
+        let egress_ep =
+            quic::server_endpoint(&egress, &AcceptAny, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let egress_addr = egress_ep.local_addr().unwrap();
+        let egress_root = root.id().to_public();
+        tokio::spawn(async move {
+            while let Ok(Some(conn)) = quic::accept(&egress_ep).await {
+                let egress = OverlaySecret::from_seed_hex(&egress.seed_hex()).unwrap();
+                let egress_root = egress_root.clone();
+                tokio::spawn(async move {
+                    let _ = terminate_one(
+                        conn,
+                        &egress,
+                        backend_addr,
+                        "svc/db", // the service THIS egress fronts
+                        &egress_root,
+                        true,
+                        PathMode::Relay,
+                    )
+                    .await;
+                });
+            }
+        });
+
+        // A relay that MISROUTES: it gates the dial honestly (the svc/echo cap is valid for svc/echo)
+        // but forwards to the svc/db egress (a compromise/misconfig). The dial passes the relay gate.
+        let relay_ep = quic::server_endpoint(
+            &relay,
+            &Allowlist(BTreeSet::from([client_id])),
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .unwrap();
+        let relay_addr = relay_ep.local_addr().unwrap();
+        let relay_root = root.id().to_public();
+        tokio::spawn(async move {
+            while let Ok(Some(conn)) = quic::accept(&relay_ep).await {
+                let relay_root = relay_root.clone();
+                tokio::spawn(async move {
+                    let Ok((mut cs, mut cr)) = conn.accept_bi().await else {
+                        return;
+                    };
+                    let Ok(req) = read_msg::<DialRequest>(&mut cr).await else {
+                        return;
+                    };
+                    let Ok(cid) = peer_identity(&conn) else {
+                        return;
+                    };
+                    // Honest gate: the svc/echo cap IS valid for svc/echo.
+                    let verdict = authorize_dial(&req, &cid, &relay_root, now_unix(), true);
+                    if write_msg(&mut cs, &verdict).await.is_err()
+                        || !matches!(verdict, DialVerdict::Accept { .. })
+                    {
+                        return;
+                    }
+                    // ...but it dials the WRONG egress (svc/db) for a svc/echo request.
+                    let Ok(ep) =
+                        quic::client_endpoint_server_auth(&OverlayPeerPolicy::Pin(egress_id))
+                    else {
+                        return;
+                    };
+                    let Ok(ec) = quic::dial(&ep, egress_addr).await else {
+                        return;
+                    };
+                    let Ok((es, er)) = ec.open_bi().await else {
+                        return;
+                    };
+                    let _ = bridge(cr, cs, er, es).await;
+                });
+            }
+        });
+
+        // A VALID capability scoped to svc/echo; the client asks for svc/echo.
+        let token = mint_overlay_dial(
+            &client.id().to_public(),
+            "svc/echo",
+            3600,
+            now_unix(),
+            &root.signer(),
+        )
+        .await
+        .unwrap();
+        let client_ep = quic::client_endpoint(&client, &Pin(relay_id)).unwrap();
+        let (mut app, app_far) = tokio::io::duplex(64 * 1024);
+        let fwd = tokio::spawn(async move {
+            forward_flow(
+                app_far,
+                &client_ep,
+                relay_addr,
+                &client,
+                egress_id,
+                DialRequest {
+                    service: "svc/echo".into(),
+                    token,
+                    e2ee: true,
+                },
+                PathMode::Relay,
+            )
+            .await
+        });
+
+        let _ = app.write_all(b"wrong egress").await;
+
+        // The svc/db backend must NEVER be connected — the egress anchors scope to svc/db.
+        let connected =
+            tokio::time::timeout(std::time::Duration::from_secs(3), hit_rx.recv()).await;
+        assert!(
+            connected.is_err(),
+            "a svc/echo capability must not reach a svc/db egress even via a misrouting relay"
+        );
+        drop(app);
+        let outcome = fwd.await.unwrap();
+        assert!(
+            outcome.is_err(),
+            "the flow must fail at the service-anchored egress, got {outcome:?}"
         );
     }
 }

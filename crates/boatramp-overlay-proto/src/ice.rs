@@ -101,8 +101,7 @@ impl CandidateSet {
 
     fn sort(&mut self) {
         // Highest priority first; ties keep insertion order (stable sort).
-        self.0
-            .sort_by_key(|c| std::cmp::Reverse(c.kind.priority()));
+        self.0.sort_by_key(|c| std::cmp::Reverse(c.kind.priority()));
     }
 
     /// The candidates, most-preferred first.
