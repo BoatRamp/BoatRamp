@@ -498,14 +498,21 @@ async fn async_main() -> Result<(), CliError> {
         return Ok(());
     }
 
-    // `forward` is a long-running overlay client-edge (like `serve`) — it needs no daemon/project
-    // config, just its explicit flags.
+    // `forward` is a long-running overlay client-edge (like `serve`). Explicit-flag / `--ticket`
+    // forwards consult no config; the self-serve `forward svc/<name>` path reads the project config
+    // (server URL + token) to resolve via the control plane — so load it best-effort (a missing
+    // `project.cfg` is fine for the explicit paths).
     #[cfg(feature = "overlay")]
     if matches!(cli.command, Command::Forward(_)) {
+        let path = cli
+            .config
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("project.cfg"));
         let Command::Forward(args) = cli.command else {
             unreachable!("guarded by matches! above")
         };
-        forward::run(args).await?;
+        let config = config::ProjectConfig::load(&path, None).unwrap_or_default();
+        forward::run(args, &config).await?;
         return Ok(());
     }
 
@@ -623,7 +630,7 @@ async fn async_main() -> Result<(), CliError> {
         Command::Graphql(args) => output::emit(mode, &graphql::run(args, &config).await?)?,
         Command::Token(args) => output::emit(mode, &token::run(args, &config).await?)?,
         #[cfg(feature = "overlay")]
-        Command::Overlay(args) => output::emit(mode, &overlay::run(args).await?)?,
+        Command::Overlay(args) => output::emit(mode, &overlay::run(args, &config).await?)?,
         Command::Secrets(args) => output::emit(mode, &secrets::run(args, &config).await?)?,
         Command::Tenancy(args) => output::emit(mode, &tenancy::run(args, &config).await?)?,
         #[cfg(feature = "email")]

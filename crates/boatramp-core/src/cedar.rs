@@ -195,6 +195,7 @@ fn resource_type(resource: Resource) -> &'static str {
         Resource::Certs => "Certs",
         Resource::Cache => "Cache",
         Resource::System => "System",
+        Resource::Overlay => "Overlay",
     }
 }
 

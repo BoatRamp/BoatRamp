@@ -134,8 +134,9 @@ pub(crate) use control_api::{
     cluster_revoke, cluster_rotate_key, create_join_token, create_token, delete_email_profile,
     delete_secret, delete_tenant_secret, get_authz_policy, kv_checkpoint, kv_export, kv_import,
     kv_status, list_email_profiles, list_root_anchors, list_secrets, list_tenant_secrets,
-    list_tokens, node_version, put_authz_policy, remove_root_anchor, revoke_token,
-    set_email_profile, set_secret, set_tenant_secret, show_email_profile,
+    list_tokens, node_version, overlay_dial, overlay_services, put_authz_policy,
+    remove_root_anchor, revoke_token, set_email_profile, set_secret, set_tenant_secret,
+    show_email_profile,
 };
 #[cfg(feature = "email")]
 pub use email_spool::NodeEmailSpool;
@@ -2268,6 +2269,48 @@ impl HandlerRuntime {
     }
 }
 
+/// The overlay forward-flow **service directory**: a service name → the relay + egress a dial to it
+/// uses. Built from `[overlay] routes` at serve setup and read by the `/api/overlay/*` handlers to
+/// resolve a self-serve `boatramp forward svc/<name>` and mint its dial capability.
+#[derive(Default, Clone)]
+pub struct OverlayDirectory {
+    services: std::collections::BTreeMap<String, OverlayTarget>,
+}
+
+/// One overlay service target: where a dial to it goes.
+#[derive(Clone)]
+pub struct OverlayTarget {
+    /// The relay/ingress `host:port` the client dials.
+    pub relay: String,
+    /// The relay's overlay identity to pin (`ed25519:<hex>`).
+    pub relay_id: String,
+    /// The egress/terminator's overlay identity to pin for the E2EE session.
+    pub egress_id: String,
+}
+
+impl OverlayDirectory {
+    /// Build from `(service, target)` entries.
+    pub fn from_entries(entries: impl IntoIterator<Item = (String, OverlayTarget)>) -> Self {
+        Self {
+            services: entries.into_iter().collect(),
+        }
+    }
+    /// Resolve a service name to its target.
+    #[must_use]
+    pub fn resolve(&self, service: &str) -> Option<&OverlayTarget> {
+        self.services.get(service)
+    }
+    /// Every `(service, target)`, service-ordered — for the directory listing.
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &OverlayTarget)> {
+        self.services.iter()
+    }
+    /// Whether the directory carries no services (no `[overlay] routes` configured).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.services.is_empty()
+    }
+}
+
 /// Server runtime knobs that aren't part of the core (deploy, auth, handlers)
 /// triple: operational request [`limits`](ServerLimits) and an optional custom
 /// domain-ownership [`DomainProbe`] (defaults to the live network probe).
@@ -2321,6 +2364,10 @@ pub struct ServerOptions {
     /// `ClusterNode`. Backs `POST /api/cluster/join` + `/rotate-key`; `None`
     /// (single-node) ⇒ those routes return `501`.
     pub mesh_control: Option<Arc<dyn MeshControl>>,
+    /// The overlay forward-flow service directory (`[overlay]` routes). Backs the self-serve
+    /// `GET /api/overlay/services` + `POST /api/overlay/dial` (resolve + mint). Empty ⇒ those
+    /// routes report an empty directory / 404 on resolve.
+    pub overlay_directory: OverlayDirectory,
     /// Origins allowed to call the control-plane `/api/*` routes cross-origin
     /// (CORS). Empty (the default) ⇒ no `Access-Control-*` headers at all, i.e.
     /// same-origin only — which is exactly the dogfood console, served from the

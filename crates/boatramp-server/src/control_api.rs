@@ -550,6 +550,107 @@ pub(super) async fn create_join_token(
     }
 }
 
+/// Default lifetime of a minted overlay-dial capability (an overlay-dial cap MUST be time-bounded).
+const DEFAULT_OVERLAY_DIAL_TTL_SECS: u64 = 3600;
+
+/// `POST /api/overlay/dial` request: resolve `service` + mint a dial capability bound to the
+/// caller's overlay identity (`holder_pubkey`, `ed25519:<hex>`).
+#[derive(Deserialize)]
+pub(super) struct OverlayDialRequest {
+    pub(super) service: String,
+    pub(super) holder_pubkey: String,
+    #[serde(default)]
+    pub(super) ttl_secs: Option<u64>,
+}
+
+/// `POST /api/overlay/dial` response: the resolved topology + the minted capability.
+#[derive(Serialize)]
+struct OverlayDialResponse {
+    relay: String,
+    relay_id: String,
+    egress_id: String,
+    token: String,
+    expires_at: u64,
+}
+
+/// One entry of `GET /api/overlay/services`.
+#[derive(Serialize)]
+struct OverlayServiceEntry {
+    service: String,
+    relay: String,
+    relay_id: String,
+    egress_id: String,
+}
+
+/// Resolve a service to its overlay topology and mint a holder-bound dial capability for it, signed
+/// by the node's root issuer (self-serve `boatramp forward svc/<name>`). The capability is still
+/// holder-bound + scope-verified at the egress — this route gates WHO may obtain one (`Overlay·Write`).
+pub(super) async fn overlay_dial(
+    Extension(issuer): Extension<Issuer>,
+    Extension(directory): Extension<OverlayDirectory>,
+    Json(request): Json<OverlayDialRequest>,
+) -> Response {
+    let Some(signer) = issuer.0 else {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            "this node has no root private key and cannot mint dial capabilities\n",
+        )
+            .into_response();
+    };
+    let Some(target) = directory.resolve(&request.service) else {
+        return (
+            StatusCode::NOT_FOUND,
+            format!(
+                "no overlay service `{}` in the directory\n",
+                request.service
+            ),
+        )
+            .into_response();
+    };
+    let holder = match cose::TokenPublicKey::from_hex(&request.holder_pubkey) {
+        Ok(h) => h,
+        Err(err) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("invalid holder_pubkey: {err}\n"),
+            )
+                .into_response();
+        }
+    };
+    let ttl = request.ttl_secs.unwrap_or(DEFAULT_OVERLAY_DIAL_TTL_SECS);
+    let now = now_unix();
+    match cose::mint_overlay_dial(&holder, &request.service, ttl, now, &*signer).await {
+        Ok(token) => (
+            StatusCode::CREATED,
+            Json(OverlayDialResponse {
+                relay: target.relay.clone(),
+                relay_id: target.relay_id.clone(),
+                egress_id: target.egress_id.clone(),
+                token,
+                expires_at: now.saturating_add(ttl),
+            }),
+        )
+            .into_response(),
+        Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
+    }
+}
+
+/// `GET /api/overlay/services` — list the overlay service directory (`Overlay·Read`).
+pub(super) async fn overlay_services(
+    Extension(directory): Extension<OverlayDirectory>,
+) -> Response {
+    let services: Vec<OverlayServiceEntry> = directory
+        .iter()
+        .map(|(service, t)| OverlayServiceEntry {
+            service: service.clone(),
+            relay: t.relay.clone(),
+            relay_id: t.relay_id.clone(),
+            egress_id: t.egress_id.clone(),
+        })
+        .collect();
+    Json(services).into_response()
+}
+
 /// A principal's own identity (`GET /api/auth/whoami`): the roles its token
 /// grants. Gated only by holding a valid token (the handler verifies it).
 #[derive(Serialize)]

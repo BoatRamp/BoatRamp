@@ -6,9 +6,12 @@
 //! port-forward`; the basic tier is explicit per-port forwards, with no OS capture.
 //!
 //! This is the first NATIVE consumer of the overlay fabric — boatramp's own CLI exercises dial →
-//! relay-blind E2EE → egress end to end. Target addressing + relay/egress discovery (26.1 §7e) are a
-//! deferred design decision; the first slice takes the relay address + the pinned identities + the
-//! dial token explicitly on the command line.
+//! relay-blind E2EE → egress end to end. The headline path is **self-serve** (26.1 §7e discovery):
+//! `boatramp forward 127.0.0.1:5432 svc/db` resolves the service's topology and mints the dial
+//! capability through the control plane ([`resolve_via_control_plane`]), authenticated by the
+//! operator's own boatramp token and bound to their persistent overlay identity — zero hand-typed
+//! topology. A `--ticket` (from `overlay grant`) or the explicit relay/egress/token flags are the
+//! control-plane-less escape hatches for airgapped or pre-provisioned deployments.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -23,27 +26,31 @@ use tokio::net::TcpListener;
 
 /// Arguments for `boatramp forward`.
 ///
-/// The common case is a single `--ticket` from `boatramp overlay grant` (which bundles the relay,
-/// the pinned identities, the dial token, and — in convenience mode — the client identity). The
-/// explicit flags remain as a power-user / debugging escape hatch and conflict with `--ticket`.
+/// The common case is just `boatramp forward <local> svc/<name>` — the operator self-serves via the
+/// control plane (topology + dial capability resolved from their boatramp token). A `--ticket` from
+/// `boatramp overlay grant`, or the explicit relay flags, are the control-plane-less escape hatches.
 #[derive(Args, Debug)]
 pub struct ForwardArgs {
     /// Local address to bind and forward (e.g. `127.0.0.1:5432`).
     pub local: String,
-    /// The in-cluster target to reach (e.g. `svc/db`). Optional with `--ticket` (the ticket's
-    /// service is authoritative); if both are given they must match.
+    /// The in-cluster service to reach (e.g. `svc/db`). Resolved via the control plane when no
+    /// `--ticket`/explicit flags are given. Optional with `--ticket` (the ticket's service wins); if
+    /// both are given they must match.
     pub target: Option<String>,
-    /// A forward ticket (`brfwd1.…`) from `boatramp overlay grant` — the one-flag common case.
+    /// A forward ticket (`brfwd1.…`) from `boatramp overlay grant` — a control-plane-less path.
     #[arg(long, conflicts_with_all = ["relay", "relay_id", "egress_id", "token", "token_file"])]
     pub ticket: Option<String>,
-    /// The cluster relay/ingress socket address to dial.
-    #[arg(long, required_unless_present = "ticket")]
+    /// boatramp server base URL for self-serve resolution (overrides `[publish].server`).
+    #[arg(long, env = "BOATRAMP_SERVER")]
+    pub server: Option<String>,
+    /// The cluster relay/ingress socket address to dial (explicit escape hatch).
+    #[arg(long)]
     pub relay: Option<SocketAddr>,
     /// The relay's overlay identity to pin (`bro1…` or `ed25519:<hex>`).
-    #[arg(long, required_unless_present = "ticket")]
+    #[arg(long)]
     pub relay_id: Option<String>,
     /// The egress/terminator's overlay identity to pin for the E2EE session.
-    #[arg(long, required_unless_present = "ticket")]
+    #[arg(long)]
     pub egress_id: Option<String>,
     /// The dial capability token (COSE), holder-bound to this client's identity.
     #[arg(long, conflicts_with = "token_file")]
@@ -81,6 +88,14 @@ pub enum ForwardError {
     Ticket(String),
     #[error("--target `{arg}` does not match the ticket's service `{ticket}`")]
     TicketServiceMismatch { ticket: String, arg: String },
+    #[error("overlay discovery: {0}")]
+    Discovery(String),
+}
+
+impl From<crate::overlay::Error> for ForwardError {
+    fn from(e: crate::overlay::Error) -> Self {
+        Self::Discovery(e.to_string())
+    }
 }
 
 /// Parse an overlay identity given as bech32 (`bro1…`) or canonical hex (`ed25519:<hex>`).
@@ -150,10 +165,60 @@ fn resolve_params(
     }
 }
 
+/// Self-serve resolution: resolve the service's topology AND mint a dial capability via the control
+/// plane, authenticated by the operator's own boatramp token + persistent overlay identity. This is
+/// the headline `boatramp forward svc/<name>` path — zero hand-typed topology, zero manual grant.
+async fn resolve_via_control_plane(
+    args: &ForwardArgs,
+    config: &crate::config::ProjectConfig,
+) -> Result<(SocketAddr, String, String, String, String, String), ForwardError> {
+    let service = args.target.clone().ok_or(ForwardError::NoTarget)?;
+    // The operator's persistent overlay identity (its seed is also the forward identity).
+    let secret = crate::overlay::operator_identity()?;
+    let holder_pubkey = secret.id().to_hex();
+    let (server, http) = crate::client::connect(args.server.clone(), config)
+        .map_err(|e| ForwardError::Discovery(e.to_string()))?;
+    let resp: crate::overlay::DialResponseBody = http
+        .post(format!("{server}/api/overlay/dial"))
+        .json(&crate::overlay::DialRequestBody {
+            service: service.clone(),
+            holder_pubkey,
+        })
+        .send()
+        .await
+        .map_err(|e| ForwardError::Discovery(e.to_string()))?
+        .error_for_status()
+        .map_err(|e| ForwardError::Discovery(e.to_string()))?
+        .json()
+        .await
+        .map_err(|e| ForwardError::Discovery(e.to_string()))?;
+    let relay = resp
+        .relay
+        .parse::<SocketAddr>()
+        .map_err(|_| ForwardError::Discovery(format!("bad relay address `{}`", resp.relay)))?;
+    Ok((
+        relay,
+        resp.relay_id,
+        resp.egress_id,
+        service,
+        resp.token,
+        secret.seed_hex().to_string(),
+    ))
+}
+
 /// Run the forwarder until interrupted.
-pub async fn run(args: ForwardArgs) -> Result<(), ForwardError> {
+pub async fn run(
+    args: ForwardArgs,
+    config: &crate::config::ProjectConfig,
+) -> Result<(), ForwardError> {
+    // Precedence: an explicit `--ticket` or `--relay` is the control-plane-less escape hatch;
+    // otherwise `forward svc/<name>` self-serves through the control plane.
     let (relay, relay_id_spec, egress_id_spec, service, token, identity_spec) =
-        resolve_params(&args)?;
+        if args.ticket.is_some() || args.relay.is_some() {
+            resolve_params(&args)?
+        } else {
+            resolve_via_control_plane(&args, config).await?
+        };
 
     let secret = load_identity(&identity_spec)?;
     let relay_id = parse_id(&relay_id_spec)?;
@@ -399,6 +464,7 @@ mod tests {
             local: "unused".into(),
             target: None,
             ticket: Some(ticket),
+            server: None,
             relay: None,
             relay_id: None,
             egress_id: None,
@@ -453,5 +519,127 @@ mod tests {
             &boatramp_overlay::OverlayPeerPolicy::Pin(relay_id),
         )
         .unwrap()
+    }
+
+    /// Self-serve discovery, the real path: the control-plane's `OverlayDirectory` resolve + the
+    /// root-signer dial mint (exactly what the `/api/overlay/dial` handler does) drive a
+    /// `forward_flow` through a LIVE served relay → egress → TCP backend. Proves resolve→mint→
+    /// forward→served-egress→backend end to end; the HTTP handler is thin glue over
+    /// `OverlayDirectory::resolve` + `mint_overlay_dial`, both exercised here.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn directory_resolve_and_mint_drives_a_live_forward() {
+        use boatramp_core::cose::{LocalSigner, TokenAlg, mint_overlay_dial};
+        use boatramp_overlay::{
+            OverlayPeerPolicy, OverlaySecret, PathMode, forward_flow, run_egress_router,
+            run_forwarding_router, server_endpoint,
+        };
+        use boatramp_server::{OverlayDirectory, OverlayTarget};
+        use std::collections::BTreeSet;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let root = LocalSigner::generate(TokenAlg::Es256);
+        let root_pub = {
+            use boatramp_core::cose::Signer;
+            root.public_key()
+        };
+        let client = OverlaySecret::generate().unwrap();
+        let relay = OverlaySecret::generate().unwrap();
+        let egress = OverlaySecret::generate().unwrap();
+        let (client_id, relay_id, egress_id) = (client.id(), relay.id(), egress.id());
+
+        let backend = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = backend.accept().await {
+                tokio::spawn(async move {
+                    let (mut r, mut w) = s.split();
+                    let _ = tokio::io::copy(&mut r, &mut w).await;
+                });
+            }
+        });
+
+        let egress_ep = server_endpoint(
+            &egress,
+            &OverlayPeerPolicy::AcceptAny,
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .unwrap();
+        let egress_addr = egress_ep.local_addr().unwrap();
+        {
+            let rp = root_pub.clone();
+            tokio::spawn(run_egress_router(
+                egress_ep,
+                egress,
+                move |s: &str| (s == "svc/db").then_some(backend_addr),
+                rp,
+                true,
+                PathMode::Relay,
+            ));
+        }
+
+        let relay_ep = server_endpoint(
+            &relay,
+            &OverlayPeerPolicy::Allowlist(BTreeSet::from([client_id])),
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .unwrap();
+        let relay_addr = relay_ep.local_addr().unwrap();
+        tokio::spawn(run_forwarding_router(relay_ep, root_pub, move |s: &str| {
+            (s == "svc/db").then_some((egress_addr, egress_id, true))
+        }));
+
+        // The directory the resolve route serves (built as `spawn_overlay_roles` builds it).
+        let directory = OverlayDirectory::from_entries([(
+            "svc/db".to_string(),
+            OverlayTarget {
+                relay: relay_addr.to_string(),
+                relay_id: relay_id.to_hex(),
+                egress_id: egress_id.to_hex(),
+            },
+        )]);
+
+        // Resolve + mint exactly as `POST /api/overlay/dial` does.
+        let target = directory.resolve("svc/db").expect("svc/db resolves");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let token = mint_overlay_dial(&client.id().to_public(), "svc/db", 3600, now, &root)
+            .await
+            .unwrap();
+
+        // Drive forward_flow with the resolved topology + minted token (what `forward svc/db` does).
+        let resolved_relay: SocketAddr = target.relay.parse().unwrap();
+        let eid = parse_id(&target.egress_id).unwrap();
+        let endpoint = quinn_client(&client, &target.relay_id);
+        let (mut app, app_far) = tokio::io::duplex(64 * 1024);
+        let fwd = tokio::spawn(async move {
+            forward_flow(
+                app_far,
+                &endpoint,
+                resolved_relay,
+                &client,
+                eid,
+                DialRequest {
+                    service: "svc/db".into(),
+                    token,
+                    e2ee: true,
+                },
+                PathMode::Relay,
+            )
+            .await
+        });
+        app.write_all(b"discovery -> live backend").await.unwrap();
+        app.shutdown().await.unwrap();
+        let mut got = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            app.read_to_end(&mut got),
+        )
+        .await
+        .expect("the discovery-driven forward delivers the echo in time")
+        .unwrap();
+        assert_eq!(got, b"discovery -> live backend");
+        let _ = fwd.await;
     }
 }

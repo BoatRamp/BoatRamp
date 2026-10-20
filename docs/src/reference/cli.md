@@ -501,29 +501,29 @@ Operate a self-hosted cluster's dynamic-join membership. See
 
 ## `boatramp overlay`
 
-Admin tooling for the overlay forward-flow (the server side is configured under
+Overlay forward-flow tooling (the server side is configured under
 [`[overlay]`](./boatramp-cfg.md#overlay)). Requires the `overlay` feature.
 
-`boatramp overlay grant <service>` mints a holder-bound overlay-dial capability for `service` and
-packages everything a client needs — the relay address, the relay + egress identities to pin, the
-capability, and (by default) a freshly generated client identity — into a single **forward ticket**
-(`brfwd1.…`), the overlay analog of a cluster join ticket. The operator redeems it with one flag:
-`boatramp forward <local> --ticket <blob>`. The grant is **offline**: it signs with the cluster root
-key (`[serve.signer]` / `--auth-root-private-key` / `BOATRAMP_AUTH_ROOT_PRIVATE_KEY`), the same
-signer `token mint` uses, so the capability verifies against an already-deployed cluster.
-
-| Flag | Meaning |
+| Command | Meaning |
 | --- | --- |
-| `<service>` | The in-cluster service to authorize (e.g. `svc/db`); must match the relay route + egress service name. |
-| `--relay <host:port>` | The relay/ingress the client will dial. |
-| `--relay-id <id>` / `--egress-id <id>` | The relay and egress overlay identities to pin (`ed25519:<hex>`/`bro1…`). |
-| `--holder-pub <id>` | Bind to a client identity the client already generated (the ticket then carries **no** secret; the client supplies `--identity`). Omit to generate + embed the client identity (convenience — the ticket is then secret). |
-| `--ttl-secs <n>` | Capability lifetime (default `3600`; an overlay-dial capability must be time-bounded). |
-| `--config <path>` | Config holding the root signer (default `boatramp.cfg`). |
+| `id` | Print this operator's overlay identity (`ed25519:<hex>` + `bro1…`), load-or-generated at `~/.config/boatramp/overlay.key` (0600, like an SSH key). It is what self-serve `forward svc/<name>` binds its dial capability to. |
+| `ls` | List the cluster's overlay service directory (`GET /api/overlay/services`) — the services you can `forward` to, with their relay + egress identities. |
+| `resolve <name>` | Resolve one service name to its topology (relay + egress identities). |
+| `grant <service>` | **Control-plane-less** path: mint a dial capability + a one-flag forward ticket (below). |
 
-The grant also prints the exact `[overlay] allowed_clients` entry to add on the relay node (the relay
-mutual-authenticates enrolled client identities at the TLS layer — a capability alone is not enough).
-Server-side minting + auto-enrollment is a follow-up; today the enrollment line is applied by hand.
+**`overlay ls` / `resolve`** read the live directory over your boatramp token (`Overlay·Read`); they
+take `--server` (else `[publish].server`). This is the discovery that lets `boatramp forward svc/db`
+work with no topology flags.
+
+**`overlay grant <service>`** is the offline/airgapped alternative to self-serve: it mints a
+holder-bound overlay-dial capability (signing with the cluster root key — `[serve.signer]` /
+`--auth-root-private-key` / `BOATRAMP_AUTH_ROOT_PRIVATE_KEY`, the same signer `token mint` uses) and
+packages the relay + egress identities, the capability, and (by default) a fresh client identity into
+a single **forward ticket** (`brfwd1.…`, the overlay analog of a cluster join ticket) redeemed with
+`boatramp forward <local> --ticket <blob>`. It also prints the exact `[overlay] allowed_clients`
+entry to add on the relay node. Flags: `--relay <host:port>`, `--relay-id`/`--egress-id`,
+`--holder-pub <id>` (bind a client-generated identity; the ticket then carries no secret),
+`--ttl-secs <n>` (default 3600), `--config <path>`.
 
 ## `boatramp forward`
 
@@ -531,21 +531,25 @@ Forward a local port to an in-cluster service over the overlay fabric — relay-
 `ssh -L`-shaped, with no OS capture. Requires the `overlay` feature.
 
 ```
-boatramp forward <local-addr> [target] --ticket <brfwd1.…>
+boatramp forward 127.0.0.1:5432 svc/db
 ```
 
-The common case is a single `--ticket` from [`overlay grant`](#boatramp-overlay): it supplies the
-relay, the pinned identities, the dial token, and (in convenience mode) the client identity, so the
-positional `target` and the explicit flags below are unnecessary.
+The headline case is **self-serve**: give a local address and a service name and nothing else — the
+CLI uses your boatramp token to resolve the service's topology and mint a dial capability via the
+control plane (`POST /api/overlay/dial`, `Overlay·Write`), binding it to your persistent overlay
+identity (`~/.config/boatramp/overlay.key`). Zero hand-typed topology, zero manual grant.
+
+For deployments **without** a reachable control plane, a `--ticket` from
+[`overlay grant`](#boatramp-overlay) or the explicit flags supply the same inputs by hand.
 
 | Flag | Meaning |
 | --- | --- |
 | `<local-addr>` | Local address to bind and forward (e.g. `127.0.0.1:5432`). |
-| `[target]` | The in-cluster service (e.g. `svc/db`). Optional with `--ticket` (the ticket's service wins); if both are given they must match. |
-| `--ticket <blob>` | A `brfwd1.…` forward ticket (the one-flag path). Conflicts with the explicit flags below. |
-| `--identity <seed\|path>` | This client's overlay identity. Needed only with a `--holder-pub` ticket (a convenience ticket carries it) or the explicit-flag form. |
-| `--relay <addr>` / `--relay-id <id>` / `--egress-id <id>` | The explicit escape hatch (required without `--ticket`). |
-| `--token <cap>` / `--token-file <path>` | The dial capability, explicitly (required without `--ticket`). |
+| `<service>` | The in-cluster service (e.g. `svc/db`). With no `--ticket`/explicit flags it is resolved via the control plane. |
+| `--server <url>` | boatramp server for self-serve resolution (else `[publish].server`). |
+| `--ticket <blob>` | A `brfwd1.…` forward ticket (control-plane-less). Conflicts with the explicit flags. |
+| `--relay <addr>` / `--relay-id <id>` / `--egress-id <id>` / `--token <cap>` / `--token-file <path>` | The fully explicit escape hatch. |
+| `--identity <seed\|path>` | Override the overlay identity (defaults to the persistent operator key; required with a `--holder-pub` ticket). |
 
 Runs until interrupted (Ctrl-C). Each accepted local connection opens a capability-gated, relay-blind
 flow to the service; the flow promotes to a direct link when one is reachable.

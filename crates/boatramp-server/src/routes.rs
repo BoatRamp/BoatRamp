@@ -105,6 +105,8 @@ pub fn router_with_fast(
     let kv_coord = KvCoord(options.kv_coordination.clone());
     // The mesh join admitter, for `POST /api/cluster/join`.
     let mesh_control = MeshControlHandle(options.mesh_control.clone());
+    // The overlay forward-flow directory, for `/api/overlay/*` (resolve + dial-mint).
+    let overlay_directory = options.overlay_directory.clone();
     #[cfg(feature = "oidc")]
     let oidc_state = OidcState(options.oidc_verifier.clone());
     let probe = options.probe.unwrap_or_else(|| {
@@ -269,6 +271,13 @@ pub fn router_with_fast(
         // itself (`Right::required` returns `None` for exactly this path), not an
         // admin bearer — the handler verifies the join token.
         .route("/api/cluster/join", post(cluster_join))
+        // Overlay forward-flow discovery: resolve a service to its topology + mint a dial
+        // capability (`Overlay·Write`), and list the service directory (`Overlay·Read`).
+        .route("/api/overlay/dial", post(overlay_dial))
+        .route(
+            "/api/overlay/services",
+            axum::routing::get(overlay_services),
+        )
         // Rotate this node's mesh key (make-before-break). Admin-scoped via the
         // deny-safe `Right::required` default for `/api/cluster/*`.
         .route("/api/cluster/rotate-key", post(cluster_rotate_key))
@@ -698,6 +707,7 @@ pub fn router_with_fast(
         .layer(Extension(issuer))
         .layer(Extension(bootstrap))
         .layer(Extension(mesh_control))
+        .layer(Extension(overlay_directory))
         .layer(Extension(probe))
         .layer(Extension(record_probe))
         .layer(Extension(operator_sql_cap))

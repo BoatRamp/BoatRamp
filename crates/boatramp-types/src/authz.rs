@@ -80,11 +80,15 @@ pub enum Resource {
     Cache,
     /// Node/system operations: metrics, prune, scrub, site listing.
     System,
+    /// Overlay forward-flow directory + dial minting (`/api/overlay/*`):
+    /// `Overlay·Read` lists/resolves the service directory; `Overlay·Write` mints a
+    /// holder-bound dial capability (self-serve `boatramp forward svc/<name>`).
+    Overlay,
 }
 
 impl Resource {
     /// Every resource variant — used to expand the `admin` role to "all rights".
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::Site,
         Self::Project,
         Self::Secrets,
@@ -94,6 +98,7 @@ impl Resource {
         Self::Certs,
         Self::Cache,
         Self::System,
+        Self::Overlay,
     ];
 
     /// The serde term for this resource (matches `rename_all`).
@@ -108,6 +113,7 @@ impl Resource {
             Self::Certs => "certs",
             Self::Cache => "cache",
             Self::System => "system",
+            Self::Overlay => "overlay",
         }
     }
 }
@@ -212,6 +218,18 @@ impl Right {
         // a deploy-grade action.
         if path.starts_with("/api/blobs/") {
             return Some(Self::new(Resource::Blobs, None, Action::Deploy));
+        }
+
+        // Overlay forward-flow discovery. Minting a dial capability (the self-serve
+        // `boatramp forward svc/<name>` path) is `Overlay·Write` — it grants a holder-bound,
+        // scope-checked capability the egress still verifies; listing/resolving the service
+        // directory is `Overlay·Read`. An explicit right (not the deny-safe System·Admin default)
+        // so an operator role can self-serve without full node-admin.
+        if path == "/api/overlay/dial" {
+            return Some(Self::new(Resource::Overlay, None, Action::Write));
+        }
+        if path == "/api/overlay/services" || path.starts_with("/api/overlay/services/") {
+            return Some(Self::new(Resource::Overlay, None, Action::Read));
         }
 
         // Attaching a host **without** an ownership proof (`domain add

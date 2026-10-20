@@ -78,6 +78,23 @@ enum OverlayCommand {
         #[arg(long, default_value = "boatramp.cfg")]
         config: std::path::PathBuf,
     },
+    /// Print this operator's overlay identity (load-or-generate at `~/.config/boatramp/overlay.key`).
+    /// This is the identity self-serve `boatramp forward svc/<name>` binds its dial capability to.
+    Id,
+    /// List the cluster's overlay service directory (`GET /api/overlay/services`).
+    Ls {
+        /// boatramp server base URL (overrides `[publish].server`).
+        #[arg(long, env = "BOATRAMP_SERVER")]
+        server: Option<String>,
+    },
+    /// Resolve one overlay service name to its topology (relay + egress identities).
+    Resolve {
+        /// The service name (e.g. `svc/db`).
+        name: String,
+        /// boatramp server base URL (overrides `[publish].server`).
+        #[arg(long, env = "BOATRAMP_SERVER")]
+        server: Option<String>,
+    },
 }
 
 /// A copy-pasteable **forward ticket**: everything `boatramp forward` needs to reach a service,
@@ -154,11 +171,49 @@ pub enum OverlayOutput {
         /// Whether the ticket carries the client's secret seed (convenience mode).
         secret_ticket: bool,
     },
+    /// `overlay id` — this operator's overlay identity.
+    Identity {
+        /// Canonical `ed25519:<hex>`.
+        id: String,
+        /// Friendly `bro1…` rendering.
+        bech32: String,
+    },
+    /// `overlay ls` — the service directory.
+    Directory { services: Vec<ServiceEntry> },
+    /// `overlay resolve <name>` — one service's topology.
+    Resolved(ServiceEntry),
+}
+
+/// One overlay service directory entry (the CLI mirror of the server's response).
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+pub struct ServiceEntry {
+    pub service: String,
+    pub relay: String,
+    pub relay_id: String,
+    pub egress_id: String,
 }
 
 impl Rendered for OverlayOutput {
     fn render_human(&self, w: &mut dyn std::io::Write) -> std::io::Result<()> {
         match self {
+            Self::Identity { id, bech32 } => {
+                writeln!(w, "{id}")?;
+                writeln!(w, "{bech32}")
+            }
+            Self::Directory { services } => {
+                if services.is_empty() {
+                    return writeln!(w, "no overlay services in the directory");
+                }
+                for s in services {
+                    writeln!(w, "{}\t{}\tegress {}", s.service, s.relay, s.egress_id)?;
+                }
+                Ok(())
+            }
+            Self::Resolved(s) => {
+                writeln!(w, "service:   {}", s.service)?;
+                writeln!(w, "relay:     {} ({})", s.relay, s.relay_id)?;
+                writeln!(w, "egress id: {}", s.egress_id)
+            }
             Self::Granted {
                 ticket,
                 client_id,
@@ -197,8 +252,33 @@ fn parse_id(s: &str) -> Result<OverlayId> {
 }
 
 /// Run an `overlay` command.
-pub async fn run(args: OverlayArgs) -> Result<OverlayOutput> {
+pub async fn run(
+    args: OverlayArgs,
+    config: &crate::config::ProjectConfig,
+) -> Result<OverlayOutput> {
     match args.command {
+        OverlayCommand::Id => {
+            let secret = operator_identity()?;
+            let id = secret.id();
+            Ok(OverlayOutput::Identity {
+                id: id.to_hex(),
+                bech32: id.to_bech32(),
+            })
+        }
+        OverlayCommand::Ls { server } => {
+            let services = fetch_directory(server, config).await?;
+            Ok(OverlayOutput::Directory { services })
+        }
+        OverlayCommand::Resolve { name, server } => {
+            let services = fetch_directory(server, config).await?;
+            services
+                .into_iter()
+                .find(|s| s.service == name)
+                .map(OverlayOutput::Resolved)
+                .ok_or_else(|| {
+                    Error::Overlay(format!("no overlay service `{name}` in the directory"))
+                })
+        }
         OverlayCommand::Grant {
             service,
             relay,
@@ -271,6 +351,94 @@ async fn mint_dial(
     mint_overlay_dial(holder, service, ttl_secs, now, &*signer)
         .await
         .map_err(|e| Error::Overlay(format!("minting dial capability: {e}")))
+}
+
+/// The operator's overlay identity key path: `$XDG_CONFIG_HOME/boatramp/overlay.key`, else
+/// `~/.config/boatramp/overlay.key` (the established CLI config dir).
+fn operator_key_path() -> Result<std::path::PathBuf> {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))
+        .ok_or_else(|| {
+            Error::Overlay("cannot locate the config dir (set HOME or XDG_CONFIG_HOME)".into())
+        })?;
+    Ok(base.join("boatramp").join("overlay.key"))
+}
+
+/// Load the operator's persistent overlay identity, generating + persisting one (`0600`, atomic) on
+/// first use — like an SSH key. This is the identity self-serve `forward svc/<name>` binds its dial
+/// capability to and uses for the E2EE handshake.
+pub(crate) fn operator_identity() -> Result<OverlaySecret> {
+    let path = operator_key_path()?;
+    let io = |e: std::io::Error| Error::Overlay(format!("{}: {e}", path.display()));
+    match std::fs::read_to_string(&path) {
+        Ok(seed) => {
+            OverlaySecret::from_seed_hex(seed.trim()).map_err(|e| Error::Overlay(e.to_string()))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let secret = OverlaySecret::generate().map_err(|e| Error::Overlay(e.to_string()))?;
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).map_err(io)?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ =
+                        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+                }
+            }
+            #[cfg(unix)]
+            {
+                use std::io::Write as _;
+                use std::os::unix::fs::OpenOptionsExt;
+                let mut f = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(&path)
+                    .map_err(io)?;
+                f.write_all(secret.seed_hex().as_bytes()).map_err(io)?;
+            }
+            #[cfg(not(unix))]
+            {
+                std::fs::write(&path, secret.seed_hex().as_bytes()).map_err(io)?;
+            }
+            Ok(secret)
+        }
+        Err(e) => Err(io(e)),
+    }
+}
+
+/// `POST /api/overlay/dial` request/response (CLI mirror of the server types).
+#[derive(serde::Serialize)]
+pub(crate) struct DialRequestBody {
+    pub service: String,
+    pub holder_pubkey: String,
+}
+
+#[derive(serde::Deserialize)]
+pub(crate) struct DialResponseBody {
+    pub relay: String,
+    pub relay_id: String,
+    pub egress_id: String,
+    pub token: String,
+}
+
+/// GET the overlay service directory from the control plane.
+async fn fetch_directory(
+    server: Option<String>,
+    config: &crate::config::ProjectConfig,
+) -> Result<Vec<ServiceEntry>> {
+    let (server, http) =
+        crate::client::connect(server, config).map_err(|e| Error::Overlay(e.to_string()))?;
+    http.get(format!("{server}/api/overlay/services"))
+        .send()
+        .await
+        .map_err(|e| Error::Overlay(e.to_string()))?
+        .error_for_status()
+        .map_err(|e| Error::Overlay(e.to_string()))?
+        .json()
+        .await
+        .map_err(|e| Error::Overlay(e.to_string()))
 }
 
 #[cfg(test)]

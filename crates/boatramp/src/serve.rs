@@ -730,7 +730,7 @@ fn load_overlay_identity(spec: Option<&str>) -> Result<boatramp_overlay::Overlay
 async fn spawn_overlay_roles(
     config: &ServerConfig,
     serve_cfg: &crate::config::ServeConfig,
-) -> Result<()> {
+) -> Result<boatramp_server::OverlayDirectory> {
     use boatramp_core::cose::TokenPublicKey;
     use boatramp_overlay::{
         OverlayId, OverlayPeerPolicy, OverlaySecret, PathMode, run_egress_router,
@@ -739,10 +739,10 @@ async fn spawn_overlay_roles(
     use std::collections::{BTreeMap, BTreeSet};
 
     let Some(ov) = &config.overlay else {
-        return Ok(());
+        return Ok(boatramp_server::OverlayDirectory::default());
     };
     if ov.relay_listen.is_none() && ov.egress_listen.is_none() {
-        return Ok(()); // declared no role
+        return Ok(boatramp_server::OverlayDirectory::default()); // declared no role
     }
 
     let secret = load_overlay_identity(ov.identity.as_deref())?;
@@ -787,7 +787,10 @@ async fn spawn_overlay_roles(
         ));
     }
 
-    // Relay/ingress: accept enrolled clients and forward to the routed egress, blind.
+    // Relay/ingress: accept enrolled clients and forward to the routed egress, blind. Also build
+    // the service DIRECTORY (service → {this relay's endpoint + id, the route's egress id}) that the
+    // control-plane `/api/overlay/*` routes serve for self-serve `boatramp forward svc/<name>`.
+    let mut directory: Vec<(String, boatramp_server::OverlayTarget)> = Vec::new();
     if let Some(bind) = ov.relay_listen {
         let mut clients = BTreeSet::new();
         for c in &ov.allowed_clients {
@@ -795,6 +798,7 @@ async fn spawn_overlay_roles(
                 Error::ClusterStartup(format!("[overlay] allowed_client {c}: {e}"))
             })?);
         }
+        let relay_id_hex = overlay_id.to_hex();
         let mut routes: BTreeMap<String, (std::net::SocketAddr, OverlayId, bool)> = BTreeMap::new();
         for r in &ov.routes {
             let addr = r.egress.ok_or_else(|| {
@@ -813,6 +817,14 @@ async fn spawn_overlay_roles(
                 Error::ClusterStartup(format!("[overlay] route egress_id {id}: {e}"))
             })?;
             routes.insert(r.service.clone(), (addr, eid, enc));
+            directory.push((
+                r.service.clone(),
+                boatramp_server::OverlayTarget {
+                    relay: bind.to_string(),
+                    relay_id: relay_id_hex.clone(),
+                    egress_id: id.to_string(),
+                },
+            ));
         }
         let ep = server_endpoint(&secret, &OverlayPeerPolicy::Allowlist(clients), bind)
             .map_err(|e| Error::ClusterStartup(format!("[overlay] relay listen {bind}: {e}")))?;
@@ -821,7 +833,7 @@ async fn spawn_overlay_roles(
         tracing::info!(%bind, overlay_id = %overlay_id.to_hex(), routes = ov.routes.len(), "overlay: serving relay/ingress");
         tokio::spawn(run_forwarding_router(ep, trust, resolve));
     }
-    Ok(())
+    Ok(boatramp_server::OverlayDirectory::from_entries(directory))
 }
 
 pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
@@ -871,7 +883,9 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
     // services. Spawned before the mode fork so it applies to both the plain-serve and cluster
     // paths; a no-op when `[overlay]` is absent or declares no listener.
     #[cfg(feature = "overlay")]
-    spawn_overlay_roles(config, &serve_cfg).await?;
+    {
+        options.overlay_directory = spawn_overlay_roles(config, &serve_cfg).await?;
+    }
     // Implicit host routing (first-label `<site>.host` / sole-site at root) is a
     // dev / single-operator convenience: enable it when the posture allows, or
     // unconditionally on a loopback bind (only local clients reach it, so there
