@@ -36,6 +36,14 @@ binding for consumers and standalone functions).
   bundling the relay, the pinned identities, and the token; the operator redeems it with
   `boatramp forward <local> --ticket <blob>` — the `ssh -L`-shaped one-liner. The five explicit flags
   remain as the escape hatch.
+- **Self-serve forward discovery.** `boatramp forward 127.0.0.1:5432 svc/db` with no topology flags:
+  the relay, egress, and a holder-bound dial capability are resolved from the operator's own boatramp
+  token via the control plane (`/api/overlay/dial`, `/api/overlay/services`), the overlay identity is
+  auto-managed, and the relay's client-auth posture is auto-detected. `boatramp overlay ls` and
+  `boatramp overlay resolve <name>` list and inspect the cluster's overlay directory. An eager
+  preflight dial validates reachability before the local port is bound, so a failure is immediate and
+  actionable rather than a silently dead port. The explicit `--relay` / `--egress-id` / `--ticket`
+  flags remain for control-plane-less forwards.
 - **Cluster mesh on the overlay.** `[cluster.mesh] transport = "overlay"` carries the Raft peer mesh
   (consensus RPCs + client-write forwarding + stream fan-out) over overlay QUIC instead of HTTP,
   reusing the mesh's existing raw-public-key identity + **live** trust set. Default stays HTTP.
@@ -44,6 +52,16 @@ binding for consumers and standalone functions).
   consumer / handler / producer scope — gated by the same `allow_imports` consent + container
   allowlist + per-tenant confinement, fail-closed.
 
+### Fixed
+
+- **Host stream fan-out was unreachable by any deployed producer** (mailroom #14). `serve_stream` /
+  `serve_ws_stream` subscribed the bare-site scope `{site}/<topic>`, but a deployed guest
+  `wasi:messaging` binding publishes the project-qualified `{project}/{site}/<topic>`, so no handler,
+  function, nor the #12 messaging shim could reach a host stream's keyspace. The subscription scope is
+  now project-qualified structurally via `ProjectRef::qualified`, with a ≥2-tenant test asserting a
+  foreign tenant's events are never delivered. (`serve_graphql_subscription` keeps the bare-site scope
+  pending a separate decision.)
+
 ### Security
 
 - The overlay was reviewed to convergence. The egress is **zero-trust**: it re-authorizes the sealed
@@ -51,8 +69,15 @@ binding for consumers and standalone functions).
   identity before connecting a backend, so a compromised or misrouting relay cannot reach one;
   authorization is anchored to the service the egress actually fronts. The consensus mesh and the
   network-exposed egress are bounded against resource-exhaustion (handshake timeouts + concurrency
-  caps + chunked reads). The overlay-dial capability must be time-bounded. No reference-project
-  vocabulary survives in the shipped crates.
+  caps + chunked reads). No reference-project vocabulary survives in the shipped crates.
+- The self-serve relay runs **capability-only** by default — any client may connect at TLS, and the
+  signed, scoped, holder-bound dial capability plus the egress's end-to-end re-authorization are the
+  authority; the posture is an explicit `[overlay] client_auth` setting with no silent accept-any
+  fallback (`mutual-pin` keeps a static client-certificate allowlist where wanted). The dial
+  capability's TTL is clamped (`max_dial_ttl_secs`, default 24h; the per-request default is 1h), so an
+  offline-verified, irrevocable capability cannot grant unbounded access. Minting the capability
+  (`Overlay·Write`) is admin-only by default; delegating self-serve to a non-admin operator takes an
+  explicit overlay role grant.
 
 ## [0.41.0] - 2026-10-20
 
