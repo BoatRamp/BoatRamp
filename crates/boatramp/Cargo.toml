@@ -84,7 +84,7 @@ fs = ["boatramp-storage/fs", "boatramp-node/fs", "fallback"]
 project-export = ["sql-postgres", "fs", "boatramp-node/project-export"]
 # The `boatramp forward` overlay client-edge (IU-10): binds a local listener and
 # forwards connections into the cluster over the relay-blind overlay fabric.
-overlay = ["dep:boatramp-overlay"]
+overlay = ["dep:boatramp-overlay", "boatramp-node/overlay"]
 s3 = ["boatramp-storage/s3", "boatramp-node/s3", "fallback"]
 gcs = ["boatramp-storage/gcs", "boatramp-node/gcs", "fallback"]
 azure = ["boatramp-storage/azure", "boatramp-node/azure", "fallback"]

@@ -97,6 +97,8 @@ mod migrate;
 #[cfg(feature = "operator")]
 mod operator;
 mod output;
+#[cfg(feature = "overlay")]
+mod overlay;
 mod project;
 mod project_migrate;
 mod project_repair;
@@ -150,6 +152,10 @@ enum Command {
     /// relay-blind, capability-gated, `ssh -L`-shaped (requires `--features overlay`).
     #[cfg(feature = "overlay")]
     Forward(forward::ForwardArgs),
+    /// Admin tooling for the overlay forward-flow: mint a dial capability and emit a one-flag
+    /// forward ticket (`overlay grant`) for `boatramp forward --ticket` (requires `--features overlay`).
+    #[cfg(feature = "overlay")]
+    Overlay(overlay::OverlayArgs),
     /// Build (optional) and publish a folder as a new atomic deployment.
     Sync(sync::SyncArgs),
     /// Reconcile a whole project (sites + functions + compute) to a declarative
@@ -616,6 +622,8 @@ async fn async_main() -> Result<(), CliError> {
         }
         Command::Graphql(args) => output::emit(mode, &graphql::run(args, &config).await?)?,
         Command::Token(args) => output::emit(mode, &token::run(args, &config).await?)?,
+        #[cfg(feature = "overlay")]
+        Command::Overlay(args) => output::emit(mode, &overlay::run(args).await?)?,
         Command::Secrets(args) => output::emit(mode, &secrets::run(args, &config).await?)?,
         Command::Tenancy(args) => output::emit(mode, &tenancy::run(args, &config).await?)?,
         #[cfg(feature = "email")]

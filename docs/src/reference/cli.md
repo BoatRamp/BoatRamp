@@ -79,6 +79,8 @@ flags unique to each command:
 | [`completions <shell>`](#boatramp-completions-man) | Print a shell-completion script. |
 | [`man`](#boatramp-completions-man) | Render the man page to stdout. |
 | [`cloudflare`](#boatramp-cloudflare) | Deploy to Cloudflare Containers natively over the REST API (`cluster` feature). |
+| [`forward`](#boatramp-forward) | Forward a local port to an in-cluster service over the overlay fabric (`overlay` feature). |
+| [`overlay`](#boatramp-overlay) | Admin tooling for overlay forwarding: mint a dial capability + forward ticket (`overlay` feature). |
 
 Exit status is `0` on success and non-zero on failure; see
 [Errors & exit codes](./errors.md).
@@ -496,6 +498,57 @@ Operate a self-hosted cluster's dynamic-join membership. See
 | `join-token [--ttl-secs <n>]` | Mint a raw single-use bearer join token (low-level; prefer `add`). |
 | `rotate-key` | Rotate the `--server` node's own mesh key, make-before-break (node-local). |
 | `revoke <node>` | Revoke a node by raw node id (low-level; prefer `remove`). |
+
+## `boatramp overlay`
+
+Admin tooling for the overlay forward-flow (the server side is configured under
+[`[overlay]`](./boatramp-cfg.md#overlay)). Requires the `overlay` feature.
+
+`boatramp overlay grant <service>` mints a holder-bound overlay-dial capability for `service` and
+packages everything a client needs — the relay address, the relay + egress identities to pin, the
+capability, and (by default) a freshly generated client identity — into a single **forward ticket**
+(`brfwd1.…`), the overlay analog of a cluster join ticket. The operator redeems it with one flag:
+`boatramp forward <local> --ticket <blob>`. The grant is **offline**: it signs with the cluster root
+key (`[serve.signer]` / `--auth-root-private-key` / `BOATRAMP_AUTH_ROOT_PRIVATE_KEY`), the same
+signer `token mint` uses, so the capability verifies against an already-deployed cluster.
+
+| Flag | Meaning |
+| --- | --- |
+| `<service>` | The in-cluster service to authorize (e.g. `svc/db`); must match the relay route + egress service name. |
+| `--relay <host:port>` | The relay/ingress the client will dial. |
+| `--relay-id <id>` / `--egress-id <id>` | The relay and egress overlay identities to pin (`ed25519:<hex>`/`bro1…`). |
+| `--holder-pub <id>` | Bind to a client identity the client already generated (the ticket then carries **no** secret; the client supplies `--identity`). Omit to generate + embed the client identity (convenience — the ticket is then secret). |
+| `--ttl-secs <n>` | Capability lifetime (default `3600`; an overlay-dial capability must be time-bounded). |
+| `--config <path>` | Config holding the root signer (default `boatramp.cfg`). |
+
+The grant also prints the exact `[overlay] allowed_clients` entry to add on the relay node (the relay
+mutual-authenticates enrolled client identities at the TLS layer — a capability alone is not enough).
+Server-side minting + auto-enrollment is a follow-up; today the enrollment line is applied by hand.
+
+## `boatramp forward`
+
+Forward a local port to an in-cluster service over the overlay fabric — relay-blind, capability-gated,
+`ssh -L`-shaped, with no OS capture. Requires the `overlay` feature.
+
+```
+boatramp forward <local-addr> [target] --ticket <brfwd1.…>
+```
+
+The common case is a single `--ticket` from [`overlay grant`](#boatramp-overlay): it supplies the
+relay, the pinned identities, the dial token, and (in convenience mode) the client identity, so the
+positional `target` and the explicit flags below are unnecessary.
+
+| Flag | Meaning |
+| --- | --- |
+| `<local-addr>` | Local address to bind and forward (e.g. `127.0.0.1:5432`). |
+| `[target]` | The in-cluster service (e.g. `svc/db`). Optional with `--ticket` (the ticket's service wins); if both are given they must match. |
+| `--ticket <blob>` | A `brfwd1.…` forward ticket (the one-flag path). Conflicts with the explicit flags below. |
+| `--identity <seed\|path>` | This client's overlay identity. Needed only with a `--holder-pub` ticket (a convenience ticket carries it) or the explicit-flag form. |
+| `--relay <addr>` / `--relay-id <id>` / `--egress-id <id>` | The explicit escape hatch (required without `--ticket`). |
+| `--token <cap>` / `--token-file <path>` | The dial capability, explicitly (required without `--ticket`). |
+
+Runs until interrupted (Ctrl-C). Each accepted local connection opens a capability-gated, relay-blind
+flow to the service; the flow promotes to a direct link when one is reachable.
 
 ## `boatramp operator`
 

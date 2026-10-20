@@ -27,6 +27,10 @@ pub enum CliError {
     #[cfg(feature = "overlay")]
     #[error(transparent)]
     Forward(#[from] crate::forward::ForwardError),
+    /// The `overlay` command group (admin-side grant/ticket).
+    #[cfg(feature = "overlay")]
+    #[error(transparent)]
+    Overlay(#[from] crate::overlay::Error),
     /// The `sync` command.
     #[error(transparent)]
     Sync(#[from] crate::sync::Error),

@@ -425,7 +425,7 @@ async fn mint_offline(
 /// Resolve the offline-mint signer: `BOATRAMP_AUTH_ROOT_PRIVATE_KEY` (local) first,
 /// else `[serve.signer]` / `auth_root_private_key` from `boatramp.cfg` — so KMS/HSM
 /// works identically to the server.
-async fn resolve_signer(
+pub(crate) async fn resolve_signer(
     config_path: &std::path::Path,
 ) -> Result<std::sync::Arc<dyn boatramp_core::cose::Signer>> {
     use boatramp_core::cose::{LocalSigner, Signer};

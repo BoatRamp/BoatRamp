@@ -31,6 +31,11 @@ binding for consumers and standalone functions).
   plain client-edge, explicit per-port forward, no OS capture), plus the **relay/ingress** and
   **egress/terminator** roles served from a new `[overlay]` config section (`relay_listen` +
   `allowed_clients` + `routes`; `egress_listen` + `services`), so a cluster can accept a forward.
+- **`boatramp overlay grant` + one-flag forward.** An admin mints a holder-bound dial capability for
+  a service (offline, signed by the cluster root) and gets a single `brfwd1` **forward ticket**
+  bundling the relay, the pinned identities, and the token; the operator redeems it with
+  `boatramp forward <local> --ticket <blob>` — the `ssh -L`-shaped one-liner. The five explicit flags
+  remain as the escape hatch.
 - **Cluster mesh on the overlay.** `[cluster.mesh] transport = "overlay"` carries the Raft peer mesh
   (consensus RPCs + client-write forwarding + stream fan-out) over overlay QUIC instead of HTTP,
   reusing the mesh's existing raw-public-key identity + **live** trust set. Default stays HTTP.

@@ -89,6 +89,9 @@ clap = ["dep:clap"]
 cloudflare-kv = ["dep:boatramp-storage", "boatramp-storage/cloudflare-kv"]
 cluster = []
 console = ["boatramp-server/console"]
+# Marker for the overlay forward-flow serve config (`[overlay]`): parsed in every build, but its
+# structs are dead-code-allowed unless the binary's `overlay` feature consumes them.
+overlay = []
 # The read-fallback composite (blob-backend migration Part 2): `[serve.blob_fallback]` wraps
 # `FallbackStorage` over the built primary. The type is generic (no cloud dep of its own — just
 # `bytes`/`tokio::time`), so this is a thin re-export of `boatramp-storage/fallback` that each
