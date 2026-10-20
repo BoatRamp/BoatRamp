@@ -56,6 +56,7 @@
 - [Control caching](./how-to/caching.md)
 - [Enable compression](./how-to/compression.md)
 - [Back up & restore](./how-to/backup.md)
+- [Export, import & clone a project](./how-to/clone-project.md)
 - [Garbage-collect & verify integrity](./how-to/prune-scrub.md)
 - [Switch the blob backend with zero downtime](./how-to/blob-backend-migration.md)
 - [Observe: logs, metrics, health, stats](./how-to/observe.md)

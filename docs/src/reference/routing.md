@@ -325,6 +325,7 @@ A host-level endpoint that fans out messaging topics to connected clients.
 | `topics` | list\<string\> | — | Topics broadcast to clients (server→client). |
 | `websocket` | bool | `false` | Serve as a WebSocket instead of SSE (adds a client→server direction). |
 | `publish_topic` | string? | — | For a WebSocket, the topic client→server messages publish to. Omitted = receive-only. |
+| `authz` | StreamAuthz? | `None` (open broadcast) | **Per-connection authorization.** Absent ⇒ the fixed `topics` broadcast to every connection. Present ⇒ each connection is authorized before it attaches and subscribes only the topics it is authorized for. Capture the scope in `route` with `:name` and reference it in `topics` with `{name}`. Two forms: `scoped(token_claims, membership: [claim(param, claim) \| sql(source?, query)])` (host-resolved — verify the bearer, check each membership, subscribe only the resolved topics; deny-by-default AND) or `guest_mediated(token_claims?, handler)` (a guest handler returns the topic set, confined to the declared `topics` templates). See [Per-subscriber scoped streams](../how-to/background-work.md#per-subscriber-scoped-streams-authz). |
 
 ## `sessions`
 
