@@ -807,17 +807,22 @@ jobs:
       # PLAN-compute-bindings COMPUTE MESSAGING-SHIM SCOPED GATE (marker `COMPUTE MESSAGING-SHIM
       # SCOPED OK`). The compute messaging-shim gives an opaque workload the SAME `{project}/bus/
       # <topic>` project bus — over the SAME `Messaging` substrate — a `wasi:messaging` producer's
-      # `bus:` publish reaches, scoped by a bearer token the shim mints (the project is bound by the
-      # TOKEN, never a client field). This gate drives the SINGLE enforced decision
-      # `messaging_shim::authorize` + `MessagingShim::authenticate` (the same code the publish
-      # handler calls, so tested == enforced) across the three security dimensions, AND proves the
-      # shared-bus property by publishing through the shim into the REAL `LogMessaging` substrate and
-      # CLAIMING the message back off the exact `{project}/bus/<topic>` key a consumer subscribes.
-      # Asserts the marker + pass count catch a silent skip/rename. MUTATION-VERIFIED: the SAME test
-      # re-run under each `BOATRAMP_COMPUTEMESSAGING_MUTATION` neuters ONE check and MUST FAIL —
-      # `allow_cross_topic` (a token scoped to topic X reaches a DIFFERENT topic), `allow_traversal`
-      # (a `../` topic escapes the `{project}/bus/` prefix), `admit_unmatched` (an unauthenticated/
-      # mismatched token is admitted). A pass-under-mutation (a hollow gate) fails the merge.
+      # `bus:` publish AND a `wasi:messaging` consumer's claim/ack/nack reach, scoped by a bearer
+      # token the shim mints (the project is bound by the TOKEN, never a client field). This gate
+      # drives the SINGLE enforced decision `messaging_shim::authorize` + `MessagingShim::
+      # authenticate` (the same code the `publish`/`claim`/`ack`/`nack` handlers all call, so
+      # tested == enforced) across the three security dimensions — EXERCISED FIRST through the
+      # real `POST /claim` and `POST /ack` consume endpoints (not just publish or a direct
+      # function call), so a mutation's failure is a direct demonstration that CLAIM/ACK, not only
+      # publish, go RED — then again via the direct `authorize()`/`authenticate()` calls. It also
+      # proves the shared-bus property END TO END THROUGH THE SHIM: publish → claim → ack (not
+      # redelivered) and publish → claim → nack (redelivered, attempt charged again) against the
+      # REAL `LogMessaging` substrate. Asserts the marker + pass count catch a silent skip/rename.
+      # MUTATION-VERIFIED: the SAME test re-run under each `BOATRAMP_COMPUTEMESSAGING_MUTATION`
+      # neuters ONE check and MUST FAIL — `allow_cross_topic` (a token scoped to topic X reaches a
+      # DIFFERENT topic via CLAIM), `allow_traversal` (a `../` topic escapes the `{project}/bus/`
+      # prefix via CLAIM), `admit_unmatched` (an unauthenticated/mismatched token is admitted to a
+      # CLAIM). A pass-under-mutation (a hollow gate) fails the merge.
       - name: "compute messaging-shim scoped gate (project-bus/topic-bound, traversal-safe, authed; shared bus)"
         run: |
           set -eo pipefail

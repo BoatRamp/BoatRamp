@@ -3,15 +3,25 @@
 //! end.
 //!
 //! An opaque compute workload (container / micro-VM) cannot import the `wasi:messaging`
-//! host interface a handler uses. This shim gives it the *same* project-bus publish
-//! capability over a plain HTTP wire: a single per-node endpoint exposing `POST /{topic}`
-//! whose body is the message payload, so an off-the-shelf HTTP client in the guest
-//! publishes to exactly the `{project}/bus/<topic>` keyspace a `wasi:messaging` producer
-//! that calls `publish("bus:<topic>", …)` for the same project reaches — the SAME
-//! [`Messaging`] substrate (`inner.messaging`) the host binding resolves. A handler and a
-//! native worker therefore meet on ONE project bus: a native MX edge can `enqueue` a
-//! `DeliverJob` to `bus:deliver` that a consumer *function* subscribing the same topic
-//! then drains.
+//! host interface a handler uses. This shim gives it the *same* project-bus capability — both
+//! halves, **publish AND consume** — over a plain HTTP wire, so an off-the-shelf HTTP client in
+//! the guest meets a `wasi:messaging` handler on ONE project bus. One per-node listener, one
+//! scoped bearer token, verb-prefixed routes:
+//!
+//! - `POST /publish/{*topic}` — body = payload → publishes to `{project}/bus/<topic>`, the exact
+//!   keyspace a `wasi:messaging` producer that calls `publish("bus:<topic>", …)` reaches.
+//! - `POST /claim/{*topic}`  — leases up to `?max` messages for `?lease_ms` (at-least-once,
+//!   competing-consumer work queue — the trait's [`Messaging::claim`]); returns each payload +
+//!   an opaque ack handle.
+//! - `POST /ack`             — delete a claimed message for good ([`Messaging::ack`]).
+//! - `POST /nack`            — redeliver it, immediately or after `?delay_ms`
+//!   ([`Messaging::nack`] / [`Messaging::nack_after`]).
+//!
+//! All five run on the SAME [`Messaging`] substrate (`inner.messaging`) the host binding
+//! resolves, so a native MX edge can `enqueue` a `DeliverJob` to `bus:deliver` AND a native
+//! worker can drain it, exactly as a consumer *function* would. (The bus has no
+//! visibility-extend primitive, so the shim exposes none — it never invents a semantic the
+//! substrate lacks.)
 //!
 //! ## Isolation (mirrors the blob-shim's token→resolved-scope model)
 //!
@@ -64,18 +74,18 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use axum::Router;
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
+use axum::{Json, Router};
 use base64::Engine as _;
 use boatramp_core::compute::{BindingKind, ComputeBinding, ComputeBindingResolver};
-use boatramp_core::messaging::Messaging;
+use boatramp_core::messaging::{ClaimedMessage, Messaging};
 use boatramp_core::project::{ProjectRef, validate_object_key};
 use hmac::{Hmac, Mac};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
 
@@ -165,11 +175,24 @@ impl MessagingShim {
         None
     }
 
-    /// The axum router: `POST /{*topic}` (the topic may contain `/`, e.g. `orders/created`).
-    /// Mount it on a node-internal listener (see [`spawn_messaging_shim`]).
+    /// The axum router — verb-prefixed so publish and the consume (claim/ack/nack) ops share
+    /// ONE bind yet never collide with each other or with a freeform topic (the topic may
+    /// contain `/`, e.g. `orders/created`; a topic literally named `claim` is published via
+    /// `POST /publish/claim` and claimed via `POST /claim/claim` — the verb is always the first
+    /// segment). Mount it on a node-internal listener (see [`spawn_messaging_shim`]).
+    ///
+    /// - `POST /publish/{*topic}` — body = payload (optional `?delay_ms`/`?ttl_ms`/`?priority`).
+    /// - `POST /claim/{*topic}`   — lease up to `?max` msgs for `?lease_ms` (`?max_attempts`);
+    ///   returns each payload + an opaque ack handle.
+    /// - `POST /ack`              — body `{ "handle": … }`: delete the message for good.
+    /// - `POST /nack`             — body `{ "handle": …, "delay_ms"?: … }`: redeliver (now, or
+    ///   after a backoff).
     pub fn router(&self) -> Router {
         Router::new()
-            .route("/{*topic}", post(publish))
+            .route("/publish/{*topic}", post(publish))
+            .route("/claim/{*topic}", post(claim))
+            .route("/ack", post(ack))
+            .route("/nack", post(nack))
             .with_state(self.clone())
     }
 }
@@ -444,9 +467,9 @@ fn bearer(headers: &HeaderMap) -> Option<String> {
         .map(|s| s.trim().to_string())
 }
 
-/// Optional delivery-mode query params on a `POST /{topic}`, mirroring the guest producer's
-/// `publish_delayed` / `publish_with_ttl` / `publish_with_priority` verbs. At most one is
-/// honored, in the precedence delay > ttl > priority; none ⇒ a plain `publish`.
+/// Optional delivery-mode query params on a `POST /publish/{topic}`, mirroring the guest
+/// producer's `publish_delayed` / `publish_with_ttl` / `publish_with_priority` verbs. At most
+/// one is honored, in the precedence delay > ttl > priority; none ⇒ a plain `publish`.
 #[derive(Debug, Default, Deserialize)]
 struct PublishParams {
     /// Visibility delay in milliseconds (`publish_delayed`).
@@ -460,11 +483,11 @@ struct PublishParams {
     priority: Option<u8>,
 }
 
-/// `POST /{*topic}`: authenticate the bearer token to a resolved project-bus scope, authorize
-/// the topic, and publish the request body to `{project}/bus/<topic>`. A native producer is
-/// **unscoped** (no in-guest tenant to seal) — `signed_context` is `None`, so a consumer
-/// requiring a signed context fails such a message closed, identical to a guest producer with
-/// no resolved own-tenant (see the module docs).
+/// `POST /publish/{*topic}`: authenticate the bearer token to a resolved project-bus scope,
+/// authorize the topic, and publish the request body to `{project}/bus/<topic>`. A native
+/// producer is **unscoped** (no in-guest tenant to seal) — `signed_context` is `None`, so a
+/// consumer requiring a signed context fails such a message closed, identical to a guest
+/// producer with no resolved own-tenant (see the module docs).
 async fn publish(
     State(shim): State<MessagingShim>,
     headers: HeaderMap,
@@ -504,6 +527,252 @@ async fn publish(
             // a coarse, non-leaking reason — the same discipline the blob shim's `storage_fault`
             // enforces.
             tracing::warn!(key, error = %err, "compute messaging-shim publish fault");
+            (StatusCode::BAD_GATEWAY, "messaging backend unavailable\n").into_response()
+        }
+    }
+}
+
+// ---- the consume half (claim / ack / nack) ----------------------------------
+
+/// Default `claim` batch size (lease ONE message) when `?max` is absent.
+const DEFAULT_CLAIM_MAX: usize = 1;
+/// Hard cap on a single `claim`'s batch size — bounds the response body a buggy/greedy consumer
+/// can pull in one call (the claim-side analogue of the publish `max_object_bytes`/batch caps).
+const MAX_CLAIM_MAX: usize = 1024;
+/// Default visibility lease (ms) when `?lease_ms` is absent — the window a claimed message stays
+/// invisible before redelivery if not acked.
+const DEFAULT_LEASE_MS: u64 = 30_000;
+/// Default `max_attempts` (dead-letter after this many deliveries) when `?max_attempts` is absent.
+const DEFAULT_MAX_ATTEMPTS: u32 = 5;
+
+/// Query params for `POST /claim/{topic}` — the [`Messaging::claim`] knobs. All optional;
+/// absent ⇒ the defaults above. `max` is clamped to `[1, MAX_CLAIM_MAX]`.
+#[derive(Debug, Default, Deserialize)]
+struct ClaimParams {
+    /// Max messages to lease in this claim (default 1, clamped to [`MAX_CLAIM_MAX`]).
+    #[serde(default)]
+    max: Option<usize>,
+    /// Visibility lease in milliseconds (default [`DEFAULT_LEASE_MS`]).
+    #[serde(default)]
+    lease_ms: Option<u64>,
+    /// Dead-letter threshold — deliveries before the message is quarantined (default
+    /// [`DEFAULT_MAX_ATTEMPTS`]).
+    #[serde(default)]
+    max_attempts: Option<u32>,
+}
+
+/// One claimed message on the wire. `ClaimedMessage` is not `Serialize`, so this is a
+/// shim-local DTO: the payload rides base64 and the `handle` is an opaque, self-contained
+/// string the consumer presents back to `ack`/`nack`.
+#[derive(Debug, Serialize)]
+struct ClaimedDto {
+    /// The substrate's unique, roughly time-ordered message id.
+    id: String,
+    /// The BARE topic the consumer claimed (not the full `{project}/bus/` key) — its own naming.
+    topic: String,
+    /// Delivery attempts so far, including this one (starts at 1).
+    attempts: u32,
+    /// Base64 (standard) of the message payload.
+    payload_b64: String,
+    /// Opaque ack/nack handle (see [`AckHandle`]).
+    handle: String,
+}
+
+/// The `POST /claim/{topic}` response body.
+#[derive(Debug, Serialize)]
+struct ClaimResponse {
+    messages: Vec<ClaimedDto>,
+}
+
+/// The opaque ack/nack **handle**: everything needed to faithfully reconstruct the
+/// [`ClaimedMessage`] the trait's `ack`/`nack` identify a message by — base64url(JSON) of these
+/// fields. It carries the BARE topic (re-authorized against the bearer's scope on every
+/// ack/nack, so a tampered handle can never reach another project/topic) and the exact payload
+/// (so `ack`'s inline byte-budget accounting is exact). It is NOT a bearer credential — the
+/// `Authorization` token is the authority; a self-contained handle keeps the shim stateless (no
+/// claimed-message map to GC or lose across a restart).
+#[derive(Debug, Serialize, Deserialize)]
+struct AckHandle {
+    /// The substrate message id ([`ClaimedMessage::id`]).
+    id: String,
+    /// The BARE topic (re-authorized on ack/nack; the full key is recomposed from the scope).
+    topic: String,
+    /// The consumer group ([`ClaimedMessage::group`]) — `""` for the default work queue; `ack`/
+    /// `nack` branch on it.
+    group: String,
+    /// Whether the payload was inlined in the index record ([`ClaimedMessage::inline`]) — `ack`
+    /// skips the object-store delete + adjusts the inline byte budget when set.
+    inline: bool,
+    /// Delivery attempts ([`ClaimedMessage::attempts`]) — preserved across a nack.
+    attempts: u32,
+    /// Base64 (standard) of the payload, so the reconstructed message's `payload.len()` (the
+    /// only field `ack` reads from the payload — the inline budget) is exact.
+    payload_b64: String,
+    /// The host-sealed signed-context envelope, if any ([`ClaimedMessage::signed_context`]).
+    signed_context: Option<String>,
+}
+
+impl AckHandle {
+    /// Encode a claimed message (keyed on the consumer's BARE `topic`) into its opaque wire
+    /// handle.
+    fn encode(bare_topic: &str, msg: &ClaimedMessage) -> String {
+        let h = Self {
+            id: msg.id.clone(),
+            topic: bare_topic.to_string(),
+            group: msg.group.clone(),
+            inline: msg.inline,
+            attempts: msg.attempts,
+            payload_b64: base64::engine::general_purpose::STANDARD.encode(&msg.payload),
+            signed_context: msg.signed_context.clone(),
+        };
+        let json = serde_json::to_vec(&h).expect("AckHandle serializes");
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json)
+    }
+
+    /// Decode an opaque wire handle, or `None` when it is malformed (→ 400, never a panic).
+    fn decode(handle: &str) -> Option<Self> {
+        let json = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(handle)
+            .ok()?;
+        serde_json::from_slice(&json).ok()
+    }
+
+    /// Reconstruct the [`ClaimedMessage`] the trait acks/nacks, given the FULL namespaced topic
+    /// key (recomposed from the re-authorized scope). The payload is decoded back to bytes so
+    /// `ack`'s inline accounting is exact.
+    fn into_message(self, full_key: String) -> ClaimedMessage {
+        ClaimedMessage {
+            id: self.id,
+            topic: full_key,
+            payload: base64::engine::general_purpose::STANDARD
+                .decode(&self.payload_b64)
+                .unwrap_or_default(),
+            attempts: self.attempts,
+            group: self.group,
+            signed_context: self.signed_context,
+            inline: self.inline,
+        }
+    }
+}
+
+/// `POST /claim/{*topic}`: authenticate + authorize the topic (the SAME scope gate publish uses
+/// — cross-topic refused, traversal screened), then lease up to `?max` messages for `?lease_ms`
+/// off `{project}/bus/<topic>` via [`Messaging::claim`] and return each payload + an ack handle.
+async fn claim(
+    State(shim): State<MessagingShim>,
+    headers: HeaderMap,
+    Path(topic): Path<String>,
+    Query(params): Query<ClaimParams>,
+) -> Response {
+    let token = bearer(&headers);
+    let scope = shim.authenticate(token.as_deref()).await;
+    let (messaging, key) = match authorize(scope.as_ref(), &topic) {
+        Ok(v) => v,
+        Err(denied) => return denied.into_response(),
+    };
+    let max = params
+        .max
+        .unwrap_or(DEFAULT_CLAIM_MAX)
+        .clamp(1, MAX_CLAIM_MAX);
+    let lease = std::time::Duration::from_millis(params.lease_ms.unwrap_or(DEFAULT_LEASE_MS));
+    let max_attempts = params.max_attempts.unwrap_or(DEFAULT_MAX_ATTEMPTS);
+
+    match messaging.claim(&key, lease, max, max_attempts).await {
+        Ok(claimed) => {
+            let messages = claimed
+                .iter()
+                .map(|m| ClaimedDto {
+                    id: m.id.clone(),
+                    topic: topic.clone(),
+                    attempts: m.attempts,
+                    payload_b64: base64::engine::general_purpose::STANDARD.encode(&m.payload),
+                    handle: AckHandle::encode(&topic, m),
+                })
+                .collect();
+            Json(ClaimResponse { messages }).into_response()
+        }
+        Err(err) => {
+            tracing::warn!(key, error = %err, "compute messaging-shim claim fault");
+            (StatusCode::BAD_GATEWAY, "messaging backend unavailable\n").into_response()
+        }
+    }
+}
+
+/// `POST /ack` body: the opaque handle from a prior claim.
+#[derive(Debug, Deserialize)]
+struct AckBody {
+    handle: String,
+}
+
+/// `POST /nack` body: the handle, plus an optional redelivery backoff (ms) → [`Messaging::nack_after`].
+#[derive(Debug, Deserialize)]
+struct NackBody {
+    handle: String,
+    #[serde(default)]
+    delay_ms: Option<u64>,
+}
+
+/// Decode the handle and RE-AUTHORIZE its bare topic against the presented bearer's scope — so
+/// ack/nack enforce the IDENTICAL scope as publish/claim (a tampered or cross-topic handle is
+/// refused), then recompose the full `{project}/bus/<topic>` key and reconstruct the message.
+/// Returns the substrate + the reconstructed [`ClaimedMessage`], or a response (401/403/400).
+async fn resolve_ack(
+    shim: &MessagingShim,
+    headers: &HeaderMap,
+    handle: &str,
+) -> Result<(Arc<dyn Messaging>, ClaimedMessage), Response> {
+    let token = bearer(headers);
+    let scope = shim.authenticate(token.as_deref()).await;
+    let Some(decoded) = AckHandle::decode(handle) else {
+        return Err((StatusCode::BAD_REQUEST, "malformed ack handle\n").into_response());
+    };
+    // The SAME enforced decision publish/claim run — the handle's bare topic must be within the
+    // token's scope (cross-topic refused, traversal screened). The full key comes ONLY from the
+    // scope's bus prefix, never the handle, so a tampered handle cannot reach another project.
+    let (messaging, full_key) = authorize(scope.as_ref(), &decoded.topic)
+        .map_err(axum::response::IntoResponse::into_response)?;
+    Ok((messaging, decoded.into_message(full_key)))
+}
+
+/// `POST /ack`: delete a claimed message for good ([`Messaging::ack`]).
+async fn ack(
+    State(shim): State<MessagingShim>,
+    headers: HeaderMap,
+    Json(body): Json<AckBody>,
+) -> Response {
+    let (messaging, msg) = match resolve_ack(&shim, &headers, &body.handle).await {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    match messaging.ack(&msg).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(err) => {
+            tracing::warn!(topic = %msg.topic, id = %msg.id, error = %err, "compute messaging-shim ack fault");
+            (StatusCode::BAD_GATEWAY, "messaging backend unavailable\n").into_response()
+        }
+    }
+}
+
+/// `POST /nack`: redeliver a claimed message — immediately ([`Messaging::nack`]) or after a
+/// `delay_ms` backoff ([`Messaging::nack_after`]). The attempt count is preserved, so it still
+/// dead-letters after `max_attempts`.
+async fn nack(
+    State(shim): State<MessagingShim>,
+    headers: HeaderMap,
+    Json(body): Json<NackBody>,
+) -> Response {
+    let (messaging, msg) = match resolve_ack(&shim, &headers, &body.handle).await {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let result = match body.delay_ms {
+        Some(delay) if delay > 0 => messaging.nack_after(&msg, delay).await,
+        _ => messaging.nack(&msg).await,
+    };
+    match result {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(err) => {
+            tracing::warn!(topic = %msg.topic, id = %msg.id, error = %err, "compute messaging-shim nack fault");
             (StatusCode::BAD_GATEWAY, "messaging backend unavailable\n").into_response()
         }
     }
@@ -695,14 +964,20 @@ mod tests {
         }
     }
 
-    /// Drive one request through the real router (the enforced HTTP path).
+    /// Drive one request through the real router (the enforced HTTP path). The
+    /// `content-type: application/json` header is set unconditionally — harmless for the
+    /// `publish`/`claim` handlers (which read `Bytes` / no body) and required by the `ack`/`nack`
+    /// `Json` extractors.
     async fn request(
         shim: &MessagingShim,
         path: &str,
         token: Option<&str>,
         body: &[u8],
     ) -> (StatusCode, Vec<u8>) {
-        let mut builder = Request::builder().method("POST").uri(path);
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("content-type", "application/json");
         if let Some(t) = token {
             builder = builder.header("authorization", format!("Bearer {t}"));
         }
@@ -711,6 +986,51 @@ mod tests {
         let status = resp.status();
         let bytes = to_bytes(resp.into_body(), 1 << 20).await.unwrap().to_vec();
         (status, bytes)
+    }
+
+    /// Claim through the shim's real `POST /claim/{topic}` and decode the DTOs to
+    /// `(payload, handle, attempts)` — the consumer's view.
+    async fn claim_via_shim(
+        shim: &MessagingShim,
+        topic_and_query: &str,
+        token: &str,
+    ) -> (StatusCode, Vec<(Vec<u8>, String, u32)>) {
+        let (status, body) =
+            request(shim, &format!("/claim/{topic_and_query}"), Some(token), b"").await;
+        if status != StatusCode::OK {
+            return (status, Vec::new());
+        }
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+        let msgs = v["messages"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .map(|m| {
+                        let payload = base64::engine::general_purpose::STANDARD
+                            .decode(m["payload_b64"].as_str().unwrap())
+                            .unwrap();
+                        let handle = m["handle"].as_str().unwrap().to_string();
+                        let attempts = m["attempts"].as_u64().unwrap() as u32;
+                        (payload, handle, attempts)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        (status, msgs)
+    }
+
+    /// Ack (or, with `delay_ms`, nack) a handle through the shim's real `POST /ack` / `/nack`.
+    async fn ack_via_shim(shim: &MessagingShim, token: &str, handle: &str) -> StatusCode {
+        let body = serde_json::json!({ "handle": handle });
+        request(shim, "/ack", Some(token), body.to_string().as_bytes())
+            .await
+            .0
+    }
+    async fn nack_via_shim(shim: &MessagingShim, token: &str, handle: &str) -> StatusCode {
+        let body = serde_json::json!({ "handle": handle });
+        request(shim, "/nack", Some(token), body.to_string().as_bytes())
+            .await
+            .0
     }
 
     fn resolver(shim: &MessagingShim, messaging: Arc<dyn Messaging>) -> MessagingShimResolver {
@@ -756,11 +1076,11 @@ mod tests {
         assert_eq!(resolver.resolve("default", "mx", 0, &bindings).await, env);
 
         // The token now authorizes a publish to its bound topic …
-        let (status, _) = request(&shim, "/deliver", Some(&token), b"job").await;
+        let (status, _) = request(&shim, "/publish/deliver", Some(&token), b"job").await;
         assert_eq!(status, StatusCode::OK);
         // … and release revokes it.
         resolver.release("default", "mx", 0, &bindings).await;
-        let (status, _) = request(&shim, "/deliver", Some(&token), b"job").await;
+        let (status, _) = request(&shim, "/publish/deliver", Some(&token), b"job").await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
 
@@ -775,7 +1095,7 @@ mod tests {
             .resolve("acme", "mx", 0, &[messaging_binding("")])
             .await;
         let token = token_of(&env);
-        let (status, _) = request(&shim, "/orders/created", Some(&token), b"evt").await;
+        let (status, _) = request(&shim, "/publish/orders/created", Some(&token), b"evt").await;
         assert_eq!(status, StatusCode::OK);
         let published = backend.published.lock().unwrap();
         assert_eq!(
@@ -798,7 +1118,13 @@ mod tests {
             .resolve("default", "mx", 0, &[messaging_binding("")])
             .await;
         let token = token_of(&env);
-        let (status, _) = request(&shim, "/deliver?delay_ms=60000", Some(&token), b"later").await;
+        let (status, _) = request(
+            &shim,
+            "/publish/deliver?delay_ms=60000",
+            Some(&token),
+            b"later",
+        )
+        .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(
             backend.published.lock().unwrap()[0].0,
@@ -837,7 +1163,91 @@ mod tests {
             .await
             .expect("scope registered");
 
-        // ---- (i) cross-topic / cross-project confinement ------------------------------
+        // A bus-wide (bare `--bind messaging`) scope, for the traversal checks below — a
+        // topic-bound scope would trip the cross-topic check before the traversal screen ever
+        // runs, so the screen needs a scope with no bound topic to reach it at all.
+        let wide_env = resolver
+            .resolve("default", "mx", 1, &[messaging_binding("")])
+            .await;
+        let wide_token = token_of(&wide_env);
+        let wide_scope = shim
+            .authenticate(Some(&wide_token))
+            .await
+            .expect("bus-wide scope registered");
+
+        // ---- (iv) consume-side scope FIRST: a CLAIM and an ACK must enforce the SAME gate as
+        // publish, through the REAL router (not a direct `authorize()`/`authenticate()` call) —
+        // placed ahead of (i)-(iii) so that under EACH mutation value, the FIRST assertion the
+        // test trips is a consume-path (claim/ack) one: the mutation loop's per-mutation failure
+        // is thereby a direct demonstration that CLAIM/ACK — not just publish — go RED, rather
+        // than an inference from a shared-function argument. ----------------------------------
+        //
+        // Cross-topic CLAIM: the `deliver`-bound token claiming a DIFFERENT topic is 403 (under
+        // `allow_cross_topic` it would be admitted → 200 → this assert fails → gate RED).
+        let (status, _) = claim_via_shim(&shim, "forbidden", &token).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "a topic-bound token must be refused a CLAIM on a different topic"
+        );
+        // Cross-topic ACK: a handle minted for a topic OUTSIDE the token's scope is 403 at `/ack`
+        // (same mutation sensitivity — the consume endpoints re-run `authorize`).
+        let forged = AckHandle::encode(
+            "forbidden",
+            &ClaimedMessage {
+                id: "x".into(),
+                topic: "default/bus/forbidden".into(),
+                payload: b"x".to_vec(),
+                attempts: 1,
+                group: String::new(),
+                signed_context: None,
+                inline: true,
+            },
+        );
+        assert_eq!(
+            ack_via_shim(&shim, &token, &forged).await,
+            StatusCode::FORBIDDEN,
+            "an ACK whose handle names a topic outside the token's scope must be refused"
+        );
+        // Traversal CLAIM: a bus-wide token claiming a `../` topic is 400 at `/claim` (under
+        // `allow_traversal` the screen is skipped → 200 → this assert fails → gate RED).
+        let (status, _) = claim_via_shim(&shim, "../escape", &wide_token).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "a CLAIM on a traversal topic must be refused"
+        );
+        // Traversal ACK: a bus-wide token's handle naming a `../` topic is 400 at `/ack` (under
+        // `allow_traversal` the screen is skipped → 204 → this assert fails → gate RED).
+        let traversal = AckHandle::encode(
+            "../escape",
+            &ClaimedMessage {
+                id: "y".into(),
+                topic: "default/bus/../escape".into(),
+                payload: b"y".to_vec(),
+                attempts: 1,
+                group: String::new(),
+                signed_context: None,
+                inline: true,
+            },
+        );
+        assert_eq!(
+            ack_via_shim(&shim, &wide_token, &traversal).await,
+            StatusCode::BAD_REQUEST,
+            "an ACK whose handle names a traversal topic must be refused"
+        );
+        // Unauthenticated/mismatched CLAIM: a missing or unknown bearer is 401 at `/claim` (under
+        // `admit_unmatched` it would be admitted to SOME registered scope → 200 → this assert
+        // fails → gate RED).
+        let (status, _) = claim_via_shim(&shim, "deliver", "not-a-real-token").await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "a CLAIM with an unknown/mismatched bearer token must not authenticate"
+        );
+
+        // ---- (i) cross-topic / cross-project confinement (direct `authorize()`, same decision
+        // the publish handler calls) -----------------------------------------------------------
         // The token is bound to `deliver`; a different topic is refused …
         assert!(
             matches!(authorize(Some(&scope), "other"), Err(Denied::CrossTopic)),
@@ -849,19 +1259,11 @@ mod tests {
         assert_eq!(key, "default/bus/deliver");
         assert!(key.starts_with(&scope.bus_prefix));
 
-        // ---- (ii) path-traversal confinement ------------------------------------------
+        // ---- (ii) path-traversal confinement (direct `authorize()`) -------------------------
         // The topic is the single addressable dimension, so the traversal screen is exercised on
-        // a BUS-WIDE (bare `--bind messaging`) scope — a topic-bound scope would trip the
-        // cross-topic check (i) before the screen. A bus-wide token still cannot escape its
-        // `{project}/bus/` prefix: every topic is screened.
-        let wide_env = resolver
-            .resolve("default", "mx", 1, &[messaging_binding("")])
-            .await;
-        let wide_token = token_of(&wide_env);
-        let wide_scope = shim
-            .authenticate(Some(&wide_token))
-            .await
-            .expect("bus-wide scope registered");
+        // the BUS-WIDE (bare `--bind messaging`) scope from above — a topic-bound scope would
+        // trip the cross-topic check (i) before the screen. A bus-wide token still cannot escape
+        // its `{project}/bus/` prefix: every topic is screened.
         for bad in ["../escape", "a/../../b", "/abs", ".boatramp-reserved"] {
             assert!(
                 matches!(authorize(Some(&wide_scope), bad), Err(Denied::BadTopic(_))),
@@ -869,7 +1271,7 @@ mod tests {
             );
         }
 
-        // ---- (iii) authentication ------------------------------------------------------
+        // ---- (iii) authentication (direct `authenticate()`) ----------------------------------
         assert!(
             shim.authenticate(None).await.is_none(),
             "a missing bearer token must not authenticate"
@@ -879,22 +1281,60 @@ mod tests {
             "an unknown/mismatched bearer token must not authenticate"
         );
 
-        // ---- SHARED-BUS positive round-trip -------------------------------------------
-        // A message published via the shim POST is CLAIMABLE at the IDENTICAL
-        // `{project}/bus/<topic>` key a real `wasi:messaging` consumer subscribes.
-        let (status, _) = request(&shim, "/deliver", Some(&token), b"DeliverJob-1").await;
+        // ---- SHARED-BUS positive round-trip, END TO END THROUGH THE SHIM ---------------
+        // Publish → claim → ack → (second claim is empty); then publish → claim → nack →
+        // (re-claim redelivers). Every hop goes through the real router, so tested == enforced,
+        // and the REAL `LogMessaging` substrate proves the message is genuinely on the bus a
+        // `wasi:messaging` consumer drains — not a tautology.
+        let (status, _) = request(&shim, "/publish/deliver", Some(&token), b"DeliverJob-1").await;
         assert_eq!(status, StatusCode::OK);
-        let claimed = messaging
-            .claim("default/bus/deliver", Duration::from_secs(30), 10, 5)
-            .await
-            .expect("claim the shim-published message off the real bus");
-        assert_eq!(claimed.len(), 1, "exactly the shim's publish is on the bus");
+
+        // Lease 0 ⇒ the message is immediately re-claimable, so the post-ack emptiness below is
+        // explained ONLY by the ack having DELETED it (a no-op ack would leave a lease-0 message
+        // re-claimable, failing the assert — the check is load-bearing, not a leased-hidden tautology).
+        let (status, claimed) = claim_via_shim(&shim, "deliver?max=10&lease_ms=0", &token).await;
+        assert_eq!(status, StatusCode::OK);
         assert_eq!(
-            claimed[0].payload, b"DeliverJob-1",
-            "the shim publish is consumer-claimable at {{project}}/bus/<topic>"
+            claimed.len(),
+            1,
+            "the shim-published message is claimable through the shim"
         );
-        // A native producer is unscoped — no signed-context envelope on the message.
-        assert_eq!(claimed[0].signed_context, None);
+        assert_eq!(
+            claimed[0].0, b"DeliverJob-1",
+            "claim returns the published payload"
+        );
+        assert_eq!(claimed[0].2, 1, "first delivery is attempt 1");
+
+        // ACK it → a second claim sees NOTHING (acked, deleted for good — not redelivered).
+        assert_eq!(
+            ack_via_shim(&shim, &token, &claimed[0].1).await,
+            StatusCode::NO_CONTENT
+        );
+        let (status, after_ack) = claim_via_shim(&shim, "deliver?lease_ms=0", &token).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            after_ack.is_empty(),
+            "an ACKed message must NOT be redelivered on a subsequent claim"
+        );
+
+        // NACK path: publish → claim → nack → re-claim REDELIVERS it (attempt charged again).
+        let (status, _) = request(&shim, "/publish/deliver", Some(&token), b"DeliverJob-2").await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, claimed2) = claim_via_shim(&shim, "deliver?lease_ms=30000", &token).await;
+        assert_eq!(claimed2.len(), 1);
+        assert_eq!(claimed2[0].0, b"DeliverJob-2");
+        assert_eq!(
+            nack_via_shim(&shim, &token, &claimed2[0].1).await,
+            StatusCode::NO_CONTENT
+        );
+        let (_, redelivered) = claim_via_shim(&shim, "deliver?lease_ms=30000", &token).await;
+        assert_eq!(
+            redelivered.len(),
+            1,
+            "a NACKed message MUST be redelivered on a subsequent claim"
+        );
+        assert_eq!(redelivered[0].0, b"DeliverJob-2");
+        assert_eq!(redelivered[0].2, 2, "redelivery charges a second attempt");
 
         println!("COMPUTE MESSAGING-SHIM SCOPED OK");
     }
