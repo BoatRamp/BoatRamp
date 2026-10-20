@@ -664,6 +664,146 @@ fn server_limits(
 
 /// Entry point for `boatramp serve`. Resolution precedence for the overridable
 /// settings is flag/env > `serve` in `boatramp.cfg` > built-in default.
+/// Load this node's overlay identity from `[overlay] identity`: an `ed25519:<hex>` seed inline, or a
+/// file path (load-or-generate — a missing file is created with a fresh seed, `0600`). An unset
+/// identity is an error when an overlay role is configured (a stable identity is what the role's
+/// peers pin).
+#[cfg(feature = "overlay")]
+fn load_overlay_identity(spec: Option<&str>) -> Result<boatramp_overlay::OverlaySecret> {
+    use boatramp_overlay::OverlaySecret;
+    let mk = |e: boatramp_overlay::OverlayIdError| {
+        Error::ClusterStartup(format!("[overlay] identity: {e}"))
+    };
+    match spec {
+        Some(s) if s.starts_with("ed25519:") => OverlaySecret::from_seed_hex(s).map_err(mk),
+        Some(path) => match std::fs::read_to_string(path) {
+            Ok(seed) => OverlaySecret::from_seed_hex(seed.trim()).map_err(mk),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let secret = OverlaySecret::generate().map_err(mk)?;
+                let seed = secret.seed_hex();
+                if let Some(parent) = std::path::Path::new(path).parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                std::fs::write(path, seed.as_bytes())
+                    .map_err(|e| Error::ClusterStartup(format!("[overlay] identity file {path}: {e}")))?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+                }
+                Ok(secret)
+            }
+            Err(e) => Err(Error::ClusterStartup(format!("[overlay] identity file {path}: {e}"))),
+        },
+        None => Err(Error::ClusterStartup(
+            "[overlay] with a relay/egress role requires `identity` (an ed25519:<hex> seed or a key file path)".into(),
+        )),
+    }
+}
+
+/// Stand up this node's overlay forward-flow serve roles from `[overlay]` (the server side of
+/// `boatramp forward`): a relay/ingress (`relay_listen`) that capability-gates client dials and
+/// forwards them blind to the routed egress, and/or an egress/terminator (`egress_listen`) that
+/// fronts local backend services. Each runs as a background accept loop. A no-op when `[overlay]`
+/// is absent or declares neither listener.
+#[cfg(feature = "overlay")]
+async fn spawn_overlay_roles(
+    config: &ServerConfig,
+    serve_cfg: &crate::config::ServeConfig,
+) -> Result<()> {
+    use boatramp_core::cose::TokenPublicKey;
+    use boatramp_overlay::{
+        OverlayId, OverlayPeerPolicy, OverlaySecret, PathMode, run_egress_router,
+        run_forwarding_router, server_endpoint,
+    };
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let Some(ov) = &config.overlay else {
+        return Ok(());
+    };
+    if ov.relay_listen.is_none() && ov.egress_listen.is_none() {
+        return Ok(()); // declared no role
+    }
+
+    let secret = load_overlay_identity(ov.identity.as_deref())?;
+    // The dial-capability trust root: explicit, else the control-plane auth root.
+    let trust_spec = ov
+        .trust_root
+        .clone()
+        .or_else(|| serve_cfg.auth_root_public_key.clone())
+        .ok_or_else(|| {
+            Error::ClusterStartup(
+                "[overlay] needs a `trust_root` (or serve.auth_root_public_key) to verify dial capabilities".into(),
+            )
+        })?;
+    let trust_root = TokenPublicKey::from_hex(&trust_spec)
+        .map_err(|e| Error::ClusterStartup(format!("[overlay] trust_root: {e}")))?;
+    let enc = ov.encryption_required.unwrap_or(true);
+    let overlay_id = secret.id();
+
+    // Egress/terminator: front local backends for the services this node declares.
+    if let Some(bind) = ov.egress_listen {
+        let mut services: BTreeMap<String, std::net::SocketAddr> = BTreeMap::new();
+        for s in &ov.services {
+            let backend = s.backend.ok_or_else(|| {
+                Error::ClusterStartup(format!("[overlay] service {:?} needs a `backend`", s.name))
+            })?;
+            services.insert(s.name.clone(), backend);
+        }
+        let ep = server_endpoint(&secret, &OverlayPeerPolicy::AcceptAny, bind)
+            .map_err(|e| Error::ClusterStartup(format!("[overlay] egress listen {bind}: {e}")))?;
+        let egress_secret = OverlaySecret::from_seed_hex(&secret.seed_hex())
+            .map_err(|e| Error::ClusterStartup(format!("[overlay] identity: {e}")))?;
+        let trust = trust_root.clone();
+        let resolve = move |s: &str| services.get(s).copied();
+        tracing::info!(%bind, overlay_id = %overlay_id.to_hex(), services = ov.services.len(), "overlay: serving egress/terminator");
+        tokio::spawn(run_egress_router(
+            ep,
+            egress_secret,
+            resolve,
+            trust,
+            enc,
+            PathMode::Relay,
+        ));
+    }
+
+    // Relay/ingress: accept enrolled clients and forward to the routed egress, blind.
+    if let Some(bind) = ov.relay_listen {
+        let mut clients = BTreeSet::new();
+        for c in &ov.allowed_clients {
+            clients.insert(OverlayId::from_hex(c).map_err(|e| {
+                Error::ClusterStartup(format!("[overlay] allowed_client {c}: {e}"))
+            })?);
+        }
+        let mut routes: BTreeMap<String, (std::net::SocketAddr, OverlayId, bool)> = BTreeMap::new();
+        for r in &ov.routes {
+            let addr = r.egress.ok_or_else(|| {
+                Error::ClusterStartup(format!(
+                    "[overlay] route {:?} needs an `egress` address",
+                    r.service
+                ))
+            })?;
+            let id = r.egress_id.as_deref().ok_or_else(|| {
+                Error::ClusterStartup(format!(
+                    "[overlay] route {:?} needs an `egress_id`",
+                    r.service
+                ))
+            })?;
+            let eid = OverlayId::from_hex(id).map_err(|e| {
+                Error::ClusterStartup(format!("[overlay] route egress_id {id}: {e}"))
+            })?;
+            routes.insert(r.service.clone(), (addr, eid, enc));
+        }
+        let ep = server_endpoint(&secret, &OverlayPeerPolicy::Allowlist(clients), bind)
+            .map_err(|e| Error::ClusterStartup(format!("[overlay] relay listen {bind}: {e}")))?;
+        let trust = trust_root.clone();
+        let resolve = move |s: &str| routes.get(s).copied();
+        tracing::info!(%bind, overlay_id = %overlay_id.to_hex(), routes = ov.routes.len(), "overlay: serving relay/ingress");
+        tokio::spawn(run_forwarding_router(ep, trust, resolve));
+    }
+    Ok(())
+}
+
 pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
     let serve_cfg = config.serve.clone().unwrap_or_default();
     // Resolve the operator security posture once (profile preset + overrides);
@@ -705,6 +845,13 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
     let addr = serve_cfg
         .addr
         .unwrap_or_else(|| "127.0.0.1:8080".parse().expect("valid default addr"));
+
+    // Overlay forward-flow serve roles (IU-8/IU-10 server side): stand up a relay/ingress and/or
+    // egress/terminator from `[overlay]` so a remote `boatramp forward` can reach in-cluster
+    // services. Spawned before the mode fork so it applies to both the plain-serve and cluster
+    // paths; a no-op when `[overlay]` is absent or declares no listener.
+    #[cfg(feature = "overlay")]
+    spawn_overlay_roles(config, &serve_cfg).await?;
     // Implicit host routing (first-label `<site>.host` / sole-site at root) is a
     // dev / single-operator convenience: enable it when the posture allows, or
     // unconditionally on a loopback bind (only local clients reach it, so there

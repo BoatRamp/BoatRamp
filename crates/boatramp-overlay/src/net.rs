@@ -443,28 +443,33 @@ async fn bridge(
 
 /// Egress/terminator: complete the E2EE handshake on the accepted connection (learning the client
 /// identity), **independently authorize** the dial capability the client presents end-to-end, then
-/// bridge the session to the backend service at `backend_addr`.
+/// bridge the session to the backend its requested service resolves to.
 ///
 /// Zero-trust (Security HIGH-1): the egress never trusts the relay's gate as its authorization
 /// boundary. After the handshake it reads the overlay-dial capability the client seals into the
 /// E2EE channel and verifies it HERE — against its own `trust_root` and the cryptographically
-/// proven (E2EE-learned) `client_id`, scope-matching the requested service — **before** connecting
-/// the backend. A relay that skips, forges, or is bypassed around its gate cannot reach the backend:
-/// the capability is signed by the trust root and holder-bound to the client's key, and it rides the
-/// sealed channel the relay is blind to, so the relay can neither mint nor read it. The service →
-/// backend mapping is the egress's own deployment config (this terminator serves one `backend_addr`;
-/// a multi-service egress resolves `request.service` against its own service map); the capability's
-/// scope — not the relay's routing — is the authorization.
-#[allow(clippy::too_many_arguments)]
-pub async fn terminate_one(
+/// proven (E2EE-learned) `client_id` — **before** connecting the backend. A relay that skips,
+/// forges, or is bypassed around its gate cannot reach the backend: the capability is signed by the
+/// trust root and holder-bound to the client's key, and it rides the sealed channel the relay is
+/// blind to, so the relay can neither mint nor read it.
+///
+/// Service-anchored (Security HIGH-A): `resolve_backend` is the egress's OWN service→backend map
+/// (its deployment config). The requested `request.service` is resolved to a backend HERE; a service
+/// this egress does not front resolves to `None` and is refused, so `authorize_dial`'s
+/// `scope == request.service` check binds the capability scope to a service the egress actually
+/// serves — a capability for a different service cannot be redeemed here even under a misrouting
+/// relay, because `request.service` must be one this egress fronts AND the scope must authorize it.
+pub async fn terminate_one<F>(
     conn: Connection,
     secret: &OverlaySecret,
-    backend_addr: SocketAddr,
-    service: &str,
+    resolve_backend: F,
     trust_root: &TokenPublicKey,
     encryption_required: bool,
     path_mode: PathMode,
-) -> Result<(), NetError> {
+) -> Result<(), NetError>
+where
+    F: Fn(&str) -> Option<SocketAddr>,
+{
     let (mut send, mut recv) = conn
         .accept_bi()
         .await
@@ -487,18 +492,16 @@ pub async fn terminate_one(
         .open(&sealed)
         .map_err(|e| NetError::Splice(e.into()))?;
     let request: DialRequest = serde_json::from_slice(&control)?;
-    // HIGH-A: anchor the scope authorization to the service THIS egress actually fronts, never to a
-    // string the client typed. The client's asserted `request.service` must equal our own `service`,
-    // so `authorize_dial`'s `scope == request.service` check binds the capability scope to the real
-    // target — a capability for a different service cannot be redeemed here even under a misrouting
-    // relay. (A multi-service egress would resolve `request.service` against its own service map
-    // instead of this single-service equality.)
-    if request.service != service {
+    // HIGH-A: anchor authorization to the services THIS egress actually fronts. Resolve the requested
+    // service to a backend from the egress's own map; an unmapped service is refused here, so
+    // `authorize_dial`'s `scope == request.service` check binds the capability scope to a service the
+    // egress serves — never a string the client simply typed.
+    let Some(backend_addr) = resolve_backend(&request.service) else {
         let _ = timeout(wire::DIRECT_DRAIN, conn.closed()).await;
         return Err(NetError::DialRejected(
             boatramp_overlay_proto::dial::DialReject::ServiceNotAuthorized,
         ));
-    }
+    };
     match authorize_dial(
         &request,
         &client_id,
@@ -536,6 +539,68 @@ pub async fn terminate_one(
     // so a relay-path flow's last bytes are delivered before this connection drops.
     let _ = timeout(wire::DIRECT_DRAIN, conn.closed()).await;
     Ok(())
+}
+
+/// Relay/ingress **serve loop** (IU-8): accept client connections on `endpoint` and, per connection,
+/// capability-gate the dial against `trust_root` and forward the sealed stream to the egress
+/// `resolve` maps the requested service to — **blind**. Runs until the endpoint is closed; each
+/// connection is handled on its own task, so one slow flow never blocks the accept loop. This is the
+/// server side of [`forward_flow`]: `boatramp serve` stands one of these up so a remote
+/// `boatramp forward` can actually reach the cluster.
+pub async fn run_forwarding_router<F>(endpoint: Endpoint, trust_root: TokenPublicKey, resolve: F)
+where
+    F: Fn(&str) -> Option<(SocketAddr, OverlayId, bool)> + Clone + Send + Sync + 'static,
+{
+    while let Ok(Some(conn)) = quic::accept(&endpoint).await {
+        let trust_root = trust_root.clone();
+        let resolve = resolve.clone();
+        tokio::spawn(async move {
+            if let Err(e) = forward_relay(conn, &trust_root, resolve).await {
+                tracing::debug!(error = %e, "overlay relay: flow ended with error");
+            }
+        });
+    }
+}
+
+/// Egress/terminator **serve loop** (IU-8): accept connections on `endpoint` (reached through a
+/// relay, or dialed directly once promoted) and terminate each over the backend its requested
+/// service resolves to via `resolve_backend` (this egress's own service→backend map). Every dial is
+/// independently authorized against `trust_root` + the E2EE-proven client identity (zero-trust,
+/// HIGH-1) and anchored to a served service (HIGH-A). Runs until the endpoint is closed.
+pub async fn run_egress_router<F>(
+    endpoint: Endpoint,
+    secret: OverlaySecret,
+    resolve_backend: F,
+    trust_root: TokenPublicKey,
+    encryption_required: bool,
+    path_mode: PathMode,
+) where
+    F: Fn(&str) -> Option<SocketAddr> + Clone + Send + Sync + 'static,
+{
+    let seed = secret.seed_hex();
+    while let Ok(Some(conn)) = quic::accept(&endpoint).await {
+        // Each terminator needs its own OverlaySecret (not Clone — it holds a zeroized seed); rebuild
+        // from the one seed, so every connection presents the same egress identity.
+        let Ok(secret) = OverlaySecret::from_seed_hex(&seed) else {
+            continue;
+        };
+        let resolve_backend = resolve_backend.clone();
+        let trust_root = trust_root.clone();
+        tokio::spawn(async move {
+            if let Err(e) = terminate_one(
+                conn,
+                &secret,
+                resolve_backend,
+                &trust_root,
+                encryption_required,
+                path_mode,
+            )
+            .await
+            {
+                tracing::debug!(error = %e, "overlay egress: flow ended with error");
+            }
+        });
+    }
 }
 
 #[cfg(test)]
@@ -583,8 +648,7 @@ mod tests {
                         let _ = terminate_one(
                             conn,
                             &egress,
-                            backend_addr,
-                            "svc/echo",
+                            |s: &str| (s == "svc/echo").then_some(backend_addr),
                             &egress_root,
                             true,
                             PathMode::Relay,
@@ -725,8 +789,7 @@ mod tests {
                     let _ = terminate_one(
                         conn,
                         &egress,
-                        backend_addr,
-                        "svc/echo",
+                        |s: &str| (s == "svc/echo").then_some(backend_addr),
                         &egress_root,
                         true,
                         PathMode::PreferDirect,
@@ -851,8 +914,7 @@ mod tests {
                     let _ = terminate_one(
                         conn,
                         &egress,
-                        backend_addr,
-                        "svc/echo",
+                        |s: &str| (s == "svc/echo").then_some(backend_addr),
                         &egress_root,
                         true,
                         PathMode::Relay,
@@ -990,8 +1052,7 @@ mod tests {
                     let _ = terminate_one(
                         conn,
                         &egress,
-                        backend_addr,
-                        "svc/db", // the service THIS egress fronts
+                        |s: &str| (s == "svc/db").then_some(backend_addr), // the service THIS egress fronts
                         &egress_root,
                         true,
                         PathMode::Relay,
@@ -1092,5 +1153,107 @@ mod tests {
             outcome.is_err(),
             "the flow must fail at the service-anchored egress, got {outcome:?}"
         );
+    }
+
+    /// §5 "Done" over the SERVED roles: `forward_flow` (client-edge) → `run_forwarding_router` (a
+    /// served relay/ingress) → `run_egress_router` (a served egress) → a TCP backend, capability-
+    /// gated and relay-blind — the full deployable vertical through the actual serve loops, not an
+    /// ad-hoc per-connection harness. This is what `boatramp serve` stands up for a remote
+    /// `boatramp forward` to reach an in-cluster service.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn served_relay_and_egress_routers_forward_a_capability_gated_flow() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let root = OverlaySecret::generate().unwrap();
+        let client = OverlaySecret::generate().unwrap();
+        let relay = OverlaySecret::generate().unwrap();
+        let egress = OverlaySecret::generate().unwrap();
+        let (client_id, relay_id, egress_id) = (client.id(), relay.id(), egress.id());
+        let root_pub = root.id().to_public();
+
+        // Backend echo (the in-cluster service `svc/db` fronts).
+        let backend = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = backend.accept().await {
+                tokio::spawn(async move {
+                    let (mut r, mut w) = s.split();
+                    let _ = tokio::io::copy(&mut r, &mut w).await;
+                });
+            }
+        });
+
+        // Served EGRESS: accept-any endpoint + the egress router fronting svc/db -> backend.
+        let egress_ep =
+            quic::server_endpoint(&egress, &AcceptAny, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let egress_addr = egress_ep.local_addr().unwrap();
+        {
+            let root_pub = root_pub.clone();
+            tokio::spawn(run_egress_router(
+                egress_ep,
+                egress,
+                move |s: &str| (s == "svc/db").then_some(backend_addr),
+                root_pub,
+                true,
+                PathMode::Relay,
+            ));
+        }
+
+        // Served RELAY/ingress: allowlist the client + the relay router resolving svc/db -> egress.
+        let relay_ep = quic::server_endpoint(
+            &relay,
+            &Allowlist(BTreeSet::from([client_id])),
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .unwrap();
+        let relay_addr = relay_ep.local_addr().unwrap();
+        tokio::spawn(run_forwarding_router(relay_ep, root_pub, move |s: &str| {
+            (s == "svc/db").then_some((egress_addr, egress_id, true))
+        }));
+
+        // Client-edge: a valid svc/db capability; dial through the served relay.
+        let token = mint_overlay_dial(
+            &client.id().to_public(),
+            "svc/db",
+            3600,
+            now_unix(),
+            &root.signer(),
+        )
+        .await
+        .unwrap();
+        let client_ep = quic::client_endpoint(&client, &Pin(relay_id)).unwrap();
+        let (mut app, app_far) = tokio::io::duplex(64 * 1024);
+        let fwd = tokio::spawn(async move {
+            forward_flow(
+                app_far,
+                &client_ep,
+                relay_addr,
+                &client,
+                egress_id,
+                DialRequest {
+                    service: "svc/db".into(),
+                    token,
+                    e2ee: true,
+                },
+                PathMode::Relay,
+            )
+            .await
+        });
+
+        // Drive the end-to-end round-trip through the served routers.
+        app.write_all(b"reach the in-cluster service")
+            .await
+            .unwrap();
+        app.shutdown().await.unwrap();
+        let mut got = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            app.read_to_end(&mut got),
+        )
+        .await
+        .expect("served relay+egress deliver the echo in time")
+        .unwrap();
+        assert_eq!(got, b"reach the in-cluster service");
+        let _ = fwd.await;
     }
 }
