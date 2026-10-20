@@ -85,6 +85,8 @@ mod workflow;
 // the cluster runtime's join-at-startup path (`run_cluster`).
 #[cfg(feature = "email")]
 mod email;
+#[cfg(feature = "overlay")]
+mod forward;
 #[cfg(feature = "cluster")]
 mod join;
 mod logs;
@@ -144,6 +146,10 @@ struct Cli {
 enum Command {
     /// Run the HTTP server and publishing API.
     Serve(serve::ServeArgs),
+    /// Forward a local port to an in-cluster target over the overlay fabric —
+    /// relay-blind, capability-gated, `ssh -L`-shaped (requires `--features overlay`).
+    #[cfg(feature = "overlay")]
+    Forward(forward::ForwardArgs),
     /// Build (optional) and publish a folder as a new atomic deployment.
     Sync(sync::SyncArgs),
     /// Reconcile a whole project (sites + functions + compute) to a declarative
@@ -486,6 +492,17 @@ async fn async_main() -> Result<(), CliError> {
         return Ok(());
     }
 
+    // `forward` is a long-running overlay client-edge (like `serve`) — it needs no daemon/project
+    // config, just its explicit flags.
+    #[cfg(feature = "overlay")]
+    if matches!(cli.command, Command::Forward(_)) {
+        let Command::Forward(args) = cli.command else {
+            unreachable!("guarded by matches! above")
+        };
+        forward::run(args).await?;
+        return Ok(());
+    }
+
     // `security` also reads the server daemon config (`boatramp.cfg`), like
     // `serve`, since the posture lives there — not in the project config.
     if matches!(cli.command, Command::Security(_)) {
@@ -564,6 +581,8 @@ async fn async_main() -> Result<(), CliError> {
     let mode = cli.output_format;
     match cli.command {
         Command::Serve(_) => unreachable!("handled above"),
+        #[cfg(feature = "overlay")]
+        Command::Forward(_) => unreachable!("handled above"),
         Command::Security(_) => unreachable!("handled above"),
         Command::Migrate(_) => unreachable!("handled above"),
         #[cfg(feature = "operator")]

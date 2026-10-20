@@ -70,6 +70,7 @@ default = [
   "operator",
   "mcp",
   "project-export",
+  "overlay",
 ]
 # The read-fallback composite (blob-backend migration Part 2): `[serve.blob_fallback]` wraps
 # `FallbackStorage` over the built primary. Generic (no cloud dep of its own), so each blob-backend
@@ -81,6 +82,9 @@ fs = ["boatramp-storage/fs", "boatramp-node/fs", "fallback"]
 # `project export|import` client verbs are always built (thin HTTP clients); this
 # gates the SERVE-side capability that answers `/api/project-{export,import}`.
 project-export = ["sql-postgres", "fs", "boatramp-node/project-export"]
+# The `boatramp forward` overlay client-edge (IU-10): binds a local listener and
+# forwards connections into the cluster over the relay-blind overlay fabric.
+overlay = ["dep:boatramp-overlay"]
 s3 = ["boatramp-storage/s3", "boatramp-node/s3", "fallback"]
 gcs = ["boatramp-storage/gcs", "boatramp-node/gcs", "fallback"]
 azure = ["boatramp-storage/azure", "boatramp-node/azure", "fallback"]
@@ -323,6 +327,9 @@ tikv-jemallocator = { version = "0.6", optional = true }
 boatramp-core = { workspace = true, features = ["authz"] }
 boatramp-storage.workspace = true
 boatramp-server.workspace = true
+# The overlay network fabric — backs the `boatramp forward` client-edge (behind
+# the `overlay` feature; pulls quinn, so a lean build can opt out).
+boatramp-overlay = { workspace = true, optional = true }
 # The node config model (moved out of the binary so it is a library value the
 # serve path and embedders share). Feature flags below forward to its matching
 # cfg markers so config parsing stays consistent per feature.

@@ -25,4 +25,12 @@ pub use circuit::{
 };
 pub use e2ee::{SpliceError, establish, splice};
 pub use net::{NetError, forward_flow, forward_relay, terminate_one};
-pub use quic::{QuicError, client_endpoint, peer_endpoint, server_endpoint};
+pub use quic::{
+    QuicError, client_endpoint, client_endpoint_server_auth, peer_endpoint, server_endpoint,
+};
+
+// Re-export the pure-core types a consumer (e.g. the `boatramp forward` CLI) needs, so it can
+// depend on this one crate.
+pub use boatramp_overlay_proto::{
+    DialRequest, DialVerdict, OverlayId, OverlayIdError, OverlayPeerPolicy, OverlaySecret,
+};

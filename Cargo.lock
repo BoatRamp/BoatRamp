@@ -1553,6 +1553,7 @@ dependencies = [
  "boatramp-handlers",
  "boatramp-mcp",
  "boatramp-node",
+ "boatramp-overlay",
  "boatramp-rpktls",
  "boatramp-server",
  "boatramp-storage",
