@@ -98,8 +98,8 @@ pub enum ForwardError {
     Discovery(String),
     /// 401 from the control plane — authentication, not authorization (finding D).
     #[error(
-        "your boatramp token is missing, invalid, or expired — re-authenticate (e.g. `boatramp \
-         login`) and try again."
+        "your boatramp token is missing, invalid, or expired — set a valid, unexpired token in \
+         `BOATRAMP_TOKEN` or `[publish].token` (ask an admin to mint one if needed) and try again."
     )]
     Unauthenticated,
     /// 403 from the control plane — authenticated but lacks `Overlay·Write` (finding D). Kept in sync
