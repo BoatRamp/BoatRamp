@@ -103,7 +103,7 @@ over its file value; an unset one defers to the file/default). See
 | `BOATRAMP_COMPUTE_REGION` | `compute.region` | This node's region tag for nearest-replica routing. |
 | `BOATRAMP_COMPUTE_SQL_SHIM_URL` | `compute.sql_shim_url` | Guest-reachable base URL of the compute SQL shim (enables a workload's `--bind sql`). |
 | `BOATRAMP_COMPUTE_BLOB_SHIM_URL` | `compute.blob_shim_url` | Guest-reachable base URL of the compute blob shim (enables a workload's `--bind blob`). |
-| `BOATRAMP_COMPUTE_MESSAGING_SHIM_URL` | `compute.messaging_shim_url` | Guest-reachable base URL of the compute messaging shim (enables a workload's `--bind messaging`). |
+| `BOATRAMP_COMPUTE_MESSAGING_SHIM_URL` | `compute.messaging_shim_url` | Guest-reachable base URL of the compute messaging shim (enables a workload's `--bind messaging` — both publish and consume: `/publish`, `/claim`, `/ack`, `/nack`). |
 | `BOATRAMP_COMPUTE_MANAGED_DB_PRIVILEGE` | `compute.managed_db_privilege` | How a managed DB image runs on a shared-kernel backend: `rootless` (default) or `caps`. |
 | `BOATRAMP_COMPUTE_DOCKER_ENDPOINT` | `compute.docker_endpoint` | Remote-Docker endpoint mode: `published` (default) or `bridge`. |
 | `BOATRAMP_COMPUTE_DOCKER_VOLUME_MODE` | `compute.docker_volume_mode` | Remote-Docker volume mode: `named` (default) or `bind`. |
@@ -150,7 +150,7 @@ See [boatramp.cfg](./boatramp-cfg.md) and
 | `BOATRAMP_SECURITY_ALLOW_SHARED_KERNEL_COMPUTE` | `overrides.allow_shared_kernel_compute` | Permit untrusted workloads on shared-kernel compute backends. |
 | `BOATRAMP_SECURITY_ALLOW_COMPUTE_EXEC` | `overrides.allow_compute_exec` | Permit `boatramp compute exec` (run a command inside a running workload). **Off** in every profile but `dev` — it is arbitrary code execution in the workload; opt in for migrations/backups/debug. |
 | `BOATRAMP_SECURITY_ALLOW_DEV_BLOB_BIND` | `overrides.allow_dev_blob_bind` | Permit `boatramp compute bind-blob` (mint a blob-shim URL + token for a non-managed local process — a dev/CI affordance). **Off** in every profile but `dev`. |
-| `BOATRAMP_SECURITY_ALLOW_DEV_MESSAGING_BIND` | `overrides.allow_dev_messaging_bind` | Permit `boatramp compute bind-messaging` (mint a messaging-shim URL + token for a non-managed local process — a dev/CI affordance). **Off** in every profile but `dev`. |
+| `BOATRAMP_SECURITY_ALLOW_DEV_MESSAGING_BIND` | `overrides.allow_dev_messaging_bind` | Permit `boatramp compute bind-messaging` (mint a messaging-shim URL + token — publish AND consume — for a non-managed local process — a dev/CI affordance). **Off** in every profile but `dev`. |
 | `BOATRAMP_SECURITY_RATELIMIT_FAIL_OPEN` | `overrides.ratelimit_fail_open` | Fail **open** instead of closed when the rate-limit KV is unreadable. |
 | `BOATRAMP_SECURITY_ALLOW_IMPLICIT_ROUTING` | `overrides.allow_implicit_routing` | Resolve an unmatched `Host` to a site without an explicit domain registration. |
 | `BOATRAMP_SECURITY_REQUIRE_POP` | `overrides.require_pop` | Require every token to be `cnf`-bound and PoP-proven fleet-wide. |

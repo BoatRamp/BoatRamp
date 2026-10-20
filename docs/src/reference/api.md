@@ -229,7 +229,7 @@ scopes to another project.
 | `GET`/`PUT`/`DELETE` | `/api/compute/:name` | Manage one workload. |
 | `POST` | `/api/compute/:name/exec` | Run a command inside a running replica (docker-exec style; posture-gated by `allow_compute_exec`). Since 0.3.9. |
 | `POST` | `/api/compute/dev-bind-blob` | Mint a blob-shim `BOATRAMP_BLOB_URL` + token for a non-managed local process (dev/CI). System·Admin; posture-gated by `allow_dev_blob_bind`. |
-| `POST` | `/api/compute/dev-bind-messaging` | Mint a messaging-shim `BOATRAMP_MESSAGING_URL` + token for a non-managed local process (dev/CI). System·Admin; posture-gated by `allow_dev_messaging_bind`. |
+| `POST` | `/api/compute/dev-bind-messaging` | Mint a messaging-shim `BOATRAMP_MESSAGING_URL` + token (publish AND consume) for a non-managed local process (dev/CI). System·Admin; posture-gated by `allow_dev_messaging_bind`. |
 
 The control-plane surface is uniform whether or not execution is available on the
 node. Only the **microVM** backend needs `/dev/kvm`; the native **container** backend

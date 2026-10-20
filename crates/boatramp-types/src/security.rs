@@ -275,11 +275,11 @@ pub struct PostureOverrides {
     pub allow_dev_blob_bind: Option<bool>,
     /// Permit `boatramp compute bind-messaging` — minting a messaging-shim
     /// `BOATRAMP_MESSAGING_URL` + token for a **non-managed** local process (a dev/CI
-    /// test-harness affordance so a locally-run native binary publishes to a project's
-    /// `{project}/bus/<topic>` bus, the messaging analogue of `DATABASE_URL`). It hands a
-    /// project-bus-scoped credential to a process OUTSIDE the sandboxed-workload model, so
-    /// **off** in every profile but `dev`; a single-tenant CI node opts in explicitly. The
-    /// direct analogue of [`Self::allow_dev_blob_bind`].
+    /// test-harness affordance so a locally-run native binary publishes to AND consumes
+    /// (claim/ack/nack) a project's `{project}/bus/<topic>` bus, the messaging analogue of
+    /// `DATABASE_URL`). It hands a project-bus-scoped credential to a process OUTSIDE the
+    /// sandboxed-workload model, so **off** in every profile but `dev`; a single-tenant CI node
+    /// opts in explicitly. The direct analogue of [`Self::allow_dev_blob_bind`].
     pub allow_dev_messaging_bind: Option<bool>,
     /// Fail **open** (allow) instead of closed when the rate-limit KV is unreadable.
     pub ratelimit_fail_open: Option<bool>,

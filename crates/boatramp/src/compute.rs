@@ -159,12 +159,13 @@ enum ComputeCommand {
         /// Managed binding the workload depends on, `<kind>[:<name>]` (repeatable):
         /// `sql` binds the site database, `sql:analytics` a named external DB; `blob`
         /// binds the site blob store, `blob:assets` one named container; `messaging` binds
-        /// the project bus, `messaging:deliver` one topic. The endpoint URL + token are
-        /// injected into the guest env (`BOATRAMP_SQL_URL` / `BOATRAMP_BLOB_URL` /
-        /// `BOATRAMP_MESSAGING_URL`). NOTE: a bare `blob` (no `:<name>`) is SITE-WIDE — the
-        /// workload can read/write EVERY container in its site's `hblob/{site}/` space; use
-        /// `blob:<name>` to confine it. Likewise a bare `messaging` is PROJECT-BUS-WIDE (any
-        /// topic under `{project}/bus/`); use `messaging:<topic>` to confine it to one topic.
+        /// the project bus — BOTH halves, publish AND consume (claim/ack/nack) — `messaging:
+        /// deliver` one topic. The endpoint URL + token are injected into the guest env
+        /// (`BOATRAMP_SQL_URL` / `BOATRAMP_BLOB_URL` / `BOATRAMP_MESSAGING_URL`). NOTE: a bare
+        /// `blob` (no `:<name>`) is SITE-WIDE — the workload can read/write EVERY container in
+        /// its site's `hblob/{site}/` space; use `blob:<name>` to confine it. Likewise a bare
+        /// `messaging` is PROJECT-BUS-WIDE (any topic under `{project}/bus/`, for both publish
+        /// and claim); use `messaging:<topic>` to confine it to one topic.
         #[arg(long = "bind")]
         bind: Vec<String>,
     },
@@ -277,11 +278,12 @@ enum ComputeCommand {
         export: bool,
     },
     /// Mint a messaging-shim credential for a NON-managed local process (dev/CI) and print it as
-    /// env — the messaging analogue of `bind-blob` (#07) / `DATABASE_URL`. The process then
-    /// publishes to the SAME `{project}/bus/<topic>` project bus a managed `--bind messaging`
-    /// workload (or a `wasi:messaging` producer's `bus:` publish) for that project reaches, so a
-    /// native-producer → consumer-function bus round-trip can be exercised offline. Requires the
-    /// server's `allow_dev_messaging_bind` posture (on by default only in `dev`); System·Admin.
+    /// env — the messaging analogue of `bind-blob` (#07) / `DATABASE_URL`. The credential covers
+    /// BOTH halves of the SAME `{project}/bus/<topic>` project bus a managed `--bind messaging`
+    /// workload (or a `wasi:messaging` handler) for that project reaches: the process can publish
+    /// AND claim/ack/nack, so either a native-producer → consumer-function, or a function-producer
+    /// → native-consumer, bus round-trip can be exercised offline. Requires the server's
+    /// `allow_dev_messaging_bind` posture (on by default only in `dev`); System·Admin.
     /// Example: `eval "$(boatramp compute bind-messaging --topic deliver --export)"`.
     BindMessaging {
         /// Confine the credential to one topic (`--bind messaging:<topic>`); omit for a

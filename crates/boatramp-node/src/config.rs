@@ -1027,9 +1027,10 @@ pub struct ComputeConfig {
     pub blob_shim_url: Option<String>,
     /// Guest-reachable base URL of the compute **messaging-shim** (PLAN-compute-bindings) —
     /// e.g. `http://10.0.0.1:8083` (the compute bridge gateway) or the docker bridge gateway.
-    /// Set ⇒ a workload's `--bind messaging` publishes to the SAME `{project}/bus/<topic>`
-    /// project bus a `wasi:messaging` producer's `bus:` publish reaches, through a listener
-    /// bound on the **host:port this URL names** (the bridge-gateway IP / loopback — NOT all
+    /// Set ⇒ a workload's `--bind messaging` reaches BOTH halves of the SAME `{project}/bus/
+    /// <topic>` project bus a `wasi:messaging` handler sees — `POST /publish/{topic}` AND the
+    /// consume ops `POST /claim/{topic}`, `POST /ack`, `POST /nack` — through a listener bound
+    /// on the **host:port this URL names** (the bridge-gateway IP / loopback — NOT all
     /// interfaces; the token-gated `{project}/bus/` data plane must not be off-node reachable).
     /// `None` (default) ⇒ compute messaging bindings off. The direct analogue of
     /// [`Self::sql_shim_url`] / [`Self::blob_shim_url`].
