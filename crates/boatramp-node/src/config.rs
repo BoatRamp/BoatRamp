@@ -229,6 +229,67 @@ pub struct ServerConfig {
     /// Secrets-at-rest envelope. Absent ⇒ private
     /// keys stored cleartext in the (replicated) control plane.
     pub secrets: Option<SecretsConfig>,
+    /// Overlay forward-flow serve roles (consumed only with the `overlay` feature): stand up a
+    /// relay/ingress and/or egress/terminator so a remote `boatramp forward` can reach in-cluster
+    /// services over the relay-blind overlay. Absent ⇒ this node serves no overlay roles.
+    pub overlay: Option<OverlayServeConfig>,
+}
+
+/// `[overlay]` — the forward-flow **serve roles** this node runs (the server side of
+/// `boatramp forward`). A node may be a **relay/ingress** (accepts external client dials and
+/// forwards them, blind, into the cluster), an **egress/terminator** (fronts local backend
+/// services), or both. Client-side target addressing / auto-discovery is a separate concern (the
+/// `boatramp forward` CLI takes the relay + egress identities explicitly for now).
+#[cfg_attr(not(feature = "overlay"), allow(dead_code))]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct OverlayServeConfig {
+    /// This node's overlay identity — an `ed25519:<hex>` seed inline, or a path to a file holding
+    /// one. Auto-generated at `<data-dir>/overlay/identity.key` when unset. This is the identity a
+    /// relay's clients and an egress's relay pin.
+    pub identity: Option<String>,
+    /// The dial-capability **trust root** (`ed25519:`/`es256:` tagged hex) every dial is verified
+    /// against. Defaults to `serve.auth_root_public_key` (the cluster's control-plane root).
+    pub trust_root: Option<String>,
+    /// Whether dials must be end-to-end encrypted (fail-closed). Default `true`.
+    pub encryption_required: Option<bool>,
+    /// Bind a **relay/ingress** here (UDP/QUIC). Unset ⇒ this node runs no relay.
+    pub relay_listen: Option<SocketAddr>,
+    /// The client overlay identities (`ed25519:`/`es256:` tagged hex) the relay mutual-authenticates
+    /// — the enrolled operators/clients allowed to dial. (A capability is still required and is the
+    /// authority; this is the relay's transport-layer admission. Auto-enrollment is a later layer.)
+    pub allowed_clients: Vec<String>,
+    /// Relay routing: a requested service → its egress. Used when `relay_listen` is set.
+    pub routes: Vec<OverlayRoute>,
+    /// Bind an **egress/terminator** here (UDP/QUIC). Unset ⇒ this node runs no egress.
+    pub egress_listen: Option<SocketAddr>,
+    /// Egress service map: a service name → the local backend it fronts. Used when `egress_listen`
+    /// is set; a service not listed here is refused (the egress authorizes only what it fronts).
+    pub services: Vec<OverlayService>,
+}
+
+/// One relay route: the egress a requested `service` is forwarded to.
+#[cfg_attr(not(feature = "overlay"), allow(dead_code))]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct OverlayRoute {
+    /// The in-cluster service name (e.g. `svc/db`).
+    pub service: String,
+    /// The egress's overlay UDP address to forward to.
+    pub egress: Option<SocketAddr>,
+    /// The egress's overlay identity (`ed25519:`/`es256:` tagged hex) to pin.
+    pub egress_id: Option<String>,
+}
+
+/// One egress service: the local backend a `service` name fronts.
+#[cfg_attr(not(feature = "overlay"), allow(dead_code))]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct OverlayService {
+    /// The in-cluster service name this egress fronts (e.g. `svc/db`).
+    pub name: String,
+    /// The local backend address the service maps to (e.g. `127.0.0.1:5432`).
+    pub backend: Option<SocketAddr>,
 }
 
 /// `secrets` section — envelope encryption for private keys at rest.
@@ -1267,6 +1328,11 @@ pub struct MeshConfig {
     /// **private** key on every node (each mints + presents its own capability);
     /// default `false`.
     pub gate_client_writes: Option<bool>,
+    /// Which transport carries the Raft peer-mesh RPC (IU-9): `"http"` (default — reqwest/axum
+    /// over the mutual-TLS mesh) or `"overlay"` (boatramp's own overlay-QUIC fabric, reusing the
+    /// mesh identity + live trust set verbatim). `None` ⇒ `"http"`. Both bind the same
+    /// `cluster.listen` address — HTTP over TCP, overlay over UDP/QUIC.
+    pub transport: Option<String>,
 }
 
 /// `handlers` section — server-side handler runtime config (read by `serve`).

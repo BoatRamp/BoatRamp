@@ -26,11 +26,16 @@ use crate::http::{
     HttpForwarder, HttpNetworkFactory, HttpStreamBus, Peers, raft_router, stream_router,
 };
 use crate::mesh::{MeshClients, MeshTls, TrustSet};
-use crate::messaging::RaftMessaging;
+use crate::messaging::{RaftMessaging, StreamBus};
 use crate::persist::{PersistentLogStore, PersistentStateMachine};
 use crate::raft::{
-    ApplyObserver, ClientWriteRaftError, MembershipError, NodeId, RaftKv, TypeConfig, WriteOp,
-    WriteResponse, add_voter, is_leader, remove_voter,
+    ApplyObserver, ClientWriteRaftError, Forwarder, MembershipError, NodeId, RaftKv, TypeConfig,
+    WriteOp, WriteResponse, add_voter, is_leader, remove_voter,
+};
+
+#[cfg(feature = "overlay")]
+use crate::overlay::{
+    OverlayForwarder, OverlayMesh, OverlayNetworkFactory, OverlayStreamBus, serve_mesh,
 };
 
 /// Mirrors committed `mesh/trust/*` writes into this node's live [`TrustSet`], so
@@ -149,6 +154,9 @@ pub enum BootstrapError {
     /// Generating or swapping a mesh identity (key rotation) failed.
     #[error("mesh key: {0}")]
     Mesh(#[from] crate::mesh::MeshError),
+    /// Standing up the overlay mesh transport (IU-9) failed (e.g. binding the QUIC endpoint).
+    #[error("overlay mesh transport: {0}")]
+    MeshTransport(String),
 }
 
 /// Inputs to assemble one cluster node.
@@ -180,6 +188,29 @@ pub struct ClusterParams {
     /// one — e.g. a daemon-config observer that reloads a node's live config when
     /// a replicated `daemon/*` write is applied (push convergence, no polling).
     pub extra_observers: Vec<Arc<dyn crate::raft::ApplyObserver>>,
+    /// Which transport carries the Raft peer-mesh RPC (HTTP by default; overlay QUIC per IU-9).
+    pub transport: MeshTransport,
+}
+
+/// Which transport carries the Raft peer-mesh RPC.
+#[derive(Default)]
+pub enum MeshTransport {
+    /// reqwest/axum over RFC-7250 raw-public-key mutual TLS (the default). [`build_node`] returns
+    /// the mesh [`ClusterNode::router`]; the caller serves it on the node's mesh listener.
+    #[default]
+    Http,
+    /// Overlay QUIC (IU-9): [`build_node`] builds the QUIC mesh endpoint on `bind`, wires the
+    /// overlay transport seams, and **serves the mesh itself**; the returned
+    /// [`ClusterNode::router`] is empty and the caller must not serve it.
+    #[cfg(feature = "overlay")]
+    Overlay {
+        /// The UDP address to bind the overlay mesh endpoint (the cluster mesh listen address —
+        /// the same `host:port` the HTTP transport would bind over TCP).
+        bind: std::net::SocketAddr,
+        /// The optional client-write authorizer the overlay server gates forwards against (the
+        /// overlay has no HTTP header layer, so it is passed in rather than layered on a router).
+        write_authz: crate::http::WriteAuthz,
+    },
 }
 
 /// A fully-wired cluster node: the Raft handle, the serving-path facades, and
@@ -570,6 +601,7 @@ pub async fn build_node(params: ClusterParams) -> Result<ClusterNode, BootstrapE
         mesh,
         cluster_write_capability,
         extra_observers,
+        transport,
     } = params;
     // The live trust set (shared with the TLS verifiers) — mutated by the apply
     // observer as trust changes replicate; hydrated from durable state below.
@@ -674,33 +706,84 @@ pub async fn build_node(params: ClusterParams) -> Result<ClusterNode, BootstrapE
     // The seed to persist at bootstrap (post-hydration ⇒ the config seed on a
     // fresh node; unused on a restart, where bootstrap is a no-op).
     let genesis_trust = trust.snapshot();
-    let raft = Raft::new(
-        node_id,
-        config,
-        HttpNetworkFactory::new(peers.clone(), mesh_clients.clone()),
-        log,
-        sm.clone(),
-    )
-    .await?;
+    let hubs = Arc::new(StreamHubs::new());
 
-    // Leader forwarding over the mesh, shared by both facades. Attaches the
-    // node's cluster-write capability so the leader admits its forwards.
-    let forward = Arc::new(
-        HttpForwarder::new(raft.clone(), peers.clone(), mesh_clients.clone())
-            .with_capability(cluster_write_capability),
-    );
+    // Wire the consensus network factory, the leader-forwarder, the stream-fan-out bus, and the
+    // node's mesh serving for the selected transport. raft/messaging are transport-agnostic (they
+    // take trait objects), so only this block differs between HTTP and overlay QUIC (IU-9). The
+    // HTTP transport returns a router the caller serves; the overlay transport builds its QUIC
+    // endpoint, serves the mesh itself, and returns an empty router.
+    let (raft, forward, bus, router): (
+        Raft<TypeConfig>,
+        Arc<dyn Forwarder>,
+        Arc<dyn StreamBus>,
+        axum::Router,
+    ) = match transport {
+        MeshTransport::Http => {
+            let raft = Raft::new(
+                node_id,
+                config,
+                HttpNetworkFactory::new(peers.clone(), mesh_clients.clone()),
+                log,
+                sm.clone(),
+            )
+            .await?;
+            // Leader forwarding over the mesh, with this node's cluster-write capability so the
+            // leader admits its forwards.
+            let forward: Arc<dyn Forwarder> = Arc::new(
+                HttpForwarder::new(raft.clone(), peers.clone(), mesh_clients.clone())
+                    .with_capability(cluster_write_capability),
+            );
+            let bus: Arc<dyn StreamBus> = Arc::new(HttpStreamBus::new(
+                node_id,
+                hubs.clone(),
+                peers.clone(),
+                mesh_clients.clone(),
+            ));
+            // The node's mesh router: consensus RPCs + client-write + stream relay.
+            let router = raft_router(raft.clone()).merge(stream_router(hubs.clone()));
+            (raft, forward, bus, router)
+        }
+        #[cfg(feature = "overlay")]
+        MeshTransport::Overlay { bind, write_authz } => {
+            // One QUIC endpoint (its socket both accepts and dials), built from this node's mesh
+            // identity + live trust set — the same RFC-7250 raw-public-key mutual auth as HTTP.
+            let endpoint = boatramp_overlay::mesh_endpoint(&mesh, bind)
+                .map_err(|e| BootstrapError::MeshTransport(e.to_string()))?;
+            let overlay_mesh = Arc::new(OverlayMesh::new(
+                endpoint.clone(),
+                mesh.clone(),
+                peers.clone(),
+            ));
+            let raft = Raft::new(
+                node_id,
+                config,
+                OverlayNetworkFactory::new(overlay_mesh.clone()),
+                log,
+                sm.clone(),
+            )
+            .await?;
+            let forward: Arc<dyn Forwarder> = Arc::new(
+                OverlayForwarder::new(raft.clone(), overlay_mesh.clone(), peers.clone())
+                    .with_capability(cluster_write_capability),
+            );
+            let bus: Arc<dyn StreamBus> = Arc::new(OverlayStreamBus::new(
+                node_id,
+                hubs.clone(),
+                peers.clone(),
+                overlay_mesh,
+            ));
+            // Serve the mesh ourselves over the QUIC endpoint; the caller must not serve the
+            // (empty) router — the overlay has no axum surface.
+            serve_mesh(endpoint, raft.clone(), hubs.clone(), write_authz);
+            (raft, forward, bus, axum::Router::new())
+        }
+    };
 
     // Control-plane KvStore facade (writes→leader, reads→local durable state).
     let kv = Arc::new(RaftKv::new(forward.clone(), Arc::new(sm.clone())));
 
-    // Messaging coordinator + cross-node stream fan-out over the mesh.
-    let hubs = Arc::new(StreamHubs::new());
-    let bus = Arc::new(HttpStreamBus::new(
-        node_id,
-        hubs.clone(),
-        peers.clone(),
-        mesh_clients.clone(),
-    ));
+    // Messaging coordinator over the shared fan-out bus + hubs.
     let messaging = Arc::new(RaftMessaging::new(
         storage,
         forward,
@@ -709,9 +792,6 @@ pub async fn build_node(params: ClusterParams) -> Result<ClusterNode, BootstrapE
         hubs.clone(),
         bus,
     ));
-
-    // The node's mesh router: consensus RPCs + client-write + stream relay.
-    let router = raft_router(raft.clone()).merge(stream_router(hubs));
 
     Ok(ClusterNode {
         node_id,
@@ -885,6 +965,7 @@ mod tests {
                 mesh: tls[&id].clone(),
                 cluster_write_capability: None,
                 extra_observers: Vec::new(),
+                transport: MeshTransport::Http,
             })
             .await
             .unwrap();
@@ -999,6 +1080,7 @@ mod tests {
                 mesh: tls[&id].clone(),
                 cluster_write_capability: None,
                 extra_observers: Vec::new(),
+                transport: MeshTransport::Http,
             })
             .await
             .unwrap();
@@ -1081,6 +1163,7 @@ mod tests {
             mesh: mesh1.clone(),
             cluster_write_capability: None,
             extra_observers: Vec::new(),
+            transport: MeshTransport::Http,
         })
         .await
         .unwrap();
@@ -1119,6 +1202,7 @@ mod tests {
             mesh: mesh1b.clone(),
             cluster_write_capability: None,
             extra_observers: Vec::new(),
+            transport: MeshTransport::Http,
         })
         .await
         .unwrap();
@@ -1182,6 +1266,7 @@ mod tests {
                 mesh: mesh.clone(),
                 cluster_write_capability: None,
                 extra_observers: Vec::new(),
+                transport: MeshTransport::Http,
             })
             .await
             .unwrap();
@@ -1278,6 +1363,7 @@ mod tests {
             mesh: mesh1.clone(),
             cluster_write_capability: None,
             extra_observers: Vec::new(),
+            transport: MeshTransport::Http,
         })
         .await
         .unwrap();
@@ -1308,6 +1394,7 @@ mod tests {
             mesh: mesh2.clone(),
             cluster_write_capability: None,
             extra_observers: Vec::new(),
+            transport: MeshTransport::Http,
         })
         .await
         .unwrap();
@@ -1440,6 +1527,7 @@ mod tests {
                 mesh: mesh.clone(),
                 cluster_write_capability: None,
                 extra_observers: Vec::new(),
+                transport: MeshTransport::Http,
             })
             .await
             .unwrap();
@@ -1548,6 +1636,7 @@ mod tests {
                 mesh: mesh.clone(),
                 cluster_write_capability: None,
                 extra_observers: Vec::new(),
+                transport: MeshTransport::Http,
             })
             .await
             .unwrap();

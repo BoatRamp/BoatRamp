@@ -1,0 +1,46 @@
+[package]
+name = "boatramp-overlay"
+version.workspace = true
+readme.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "boatramp overlay fabric — the async runtime: QUIC-on-raw-pubkey-TLS endpoints, relay-blind E2EE splice, resumable circuit pump, ICE/NAT traversal, direct-path promotion, and the relay/egress/client-edge node roles."
+
+[dependencies]
+# The pure protocol/crypto core (identity, peer policy, wire contract, …).
+boatramp-overlay-proto = { workspace = true }
+# For the dial trust-root `TokenPublicKey` the egress gate verifies against.
+boatramp-core = { workspace = true, features = ["authz"] }
+# Raw-public-key TLS configs wired into quinn (reused, not rebuilt).
+boatramp-rpktls = { workspace = true }
+# Dial-handshake request/verdict wire codec.
+serde = { workspace = true }
+serde_json = { workspace = true }
+# The rustls configs rpktls hands back (to set ALPN before wrapping for QUIC).
+rustls = { workspace = true }
+# QUIC. default-features off → pin the crypto backend to aws-lc-rs so there is
+# ONE rustls provider in the graph (rpktls's configs are aws-lc-rs); tokio runtime.
+quinn = { version = "0.11", default-features = false, features = [
+  "runtime-tokio",
+  "rustls-aws-lc-rs",
+] }
+# `sync` (mpsc rebind channel + the circuit registry RwLock) and `time`
+# (rebind grace deadline) on top of the workspace feature set.
+tokio = { workspace = true, features = ["sync", "time"] }
+# Length-delimited framing for circuit frames — FramedRead.next() is
+# cancellation-safe, which the pump's select! loop requires.
+tokio-util = { workspace = true, features = ["codec"] }
+futures = { workspace = true }
+bytes = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[lints]
+workspace = true

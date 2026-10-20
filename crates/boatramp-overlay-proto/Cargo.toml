@@ -1,0 +1,50 @@
+[package]
+name = "boatramp-overlay-proto"
+version.workspace = true
+readme.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "boatramp overlay fabric — pure protocol & crypto core (identity, peer policy, relay-blind E2EE, resumable circuit framing, capability dial). No async or transport stack; depends only on boatramp substrate."
+
+[dependencies]
+# Substrate only (overlay guardrail 1): identity/capability come from the COSE
+# machinery, raw-pubkey trust from rpktls. NOTHING from the platform
+# (boatramp-server/-node/-handlers) and NO tokio/quinn — this crate is the pure
+# core so the relay-blind/local-signer invariants hold by the crate graph.
+# `authz` exposes `boatramp_core::cose` — the identity/signer/capability
+# machinery the overlay is built on (not optional for the overlay).
+boatramp-core = { workspace = true, features = ["authz"] }
+boatramp-rpktls = { workspace = true }
+thiserror = { workspace = true }
+hex = { workspace = true }
+# Serialize the dial-handshake request/verdict + the ICE signaling messages (pure).
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Zero-copy byte buffers for the circuit frame payloads / retransmit segments.
+bytes = { workspace = true }
+# The relay-blind E2EE core: ML-KEM-768 + X25519 hybrid KEM, AES-256-GCM AEAD,
+# HKDF. aws-lc-rs has no single X25519MLKEM768 primitive, so the hybrid is
+# assembled here; all in the default build (same backend rpktls uses).
+aws-lc-rs = "1.17"
+# Handshake transcript (SHA-256 channel binding over both shares + both ids).
+sha2 = { workspace = true }
+# Secret seed material is held in a zeroizing buffer (matches rpktls).
+zeroize = "1"
+# bech32m rendering of identities (`bro1…`) — a friendly form only; the
+# canonical identity stays boatramp-core hex. No bech32 existed in the tree.
+bech32 = "0.11"
+
+[dev-dependencies]
+# The E2EE handshake signs via the async Signer trait; the pure crate stays
+# tokio-free at runtime (tokio is test-only, as in boatramp-rpktls).
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

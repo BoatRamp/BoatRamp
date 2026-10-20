@@ -130,6 +130,20 @@ impl RpkIdentity {
         })
     }
 
+    /// Rebuild an identity from a raw 32-byte Ed25519 seed (the RFC 8032 secret
+    /// scalar seed). This lets a caller that already owns an Ed25519 seed — e.g.
+    /// one shared with a COSE signer so the TLS identity and a capability
+    /// holder-key are provably the same principal — present it at the TLS layer.
+    /// The seed is turned into a PKCS#8 key by `aws-lc-rs` (not a hand-rolled
+    /// DER) and handed to [`Self::from_pkcs8`], so the derived SPKI matches
+    /// [`Self::generate`]'s exactly.
+    pub fn from_ed25519_seed(seed: &[u8; 32]) -> Result<Self, RpkError> {
+        let kp =
+            Ed25519KeyPair::from_seed_unchecked(seed).map_err(|e| RpkError::Key(e.to_string()))?;
+        let pkcs8 = kp.to_pkcs8().map_err(|e| RpkError::Key(e.to_string()))?;
+        Self::from_pkcs8(pkcs8.as_ref().to_vec())
+    }
+
     /// Load the identity from `path`, generating + persisting one (`0600`) if the
     /// file does not exist. The key file holds the raw PKCS#8 DER.
     pub fn load_or_generate(path: &Path) -> Result<Self, RpkError> {

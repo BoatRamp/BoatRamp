@@ -58,6 +58,13 @@ boatramp serve --config boatramp.cfg --cluster-init
 The node generates its mesh identity, derives its id, and bootstraps a 1-node
 cluster. No `node_id`, no `voters`, no `bootstrap` flag, no `peers` map.
 
+> **Mesh transport.** By default the peer mesh runs over HTTP (mutual TLS). To
+> carry it over boatramp's own **overlay-QUIC fabric** instead — same RFC 7250
+> raw-public-key mutual auth, reusing the mesh identity + live trust set
+> verbatim — set `mesh: ( transport: "overlay" )` under `cluster`. Every node in
+> the cluster must agree on the transport; both bind the same `cluster.listen`
+> (HTTP over TCP, overlay over UDP/QUIC).
+
 ## 2. Grow the cluster (two commands, one paste)
 
 On the running node, mint a **join ticket**. It bundles a single-use token, the

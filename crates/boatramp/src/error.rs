@@ -23,6 +23,10 @@ pub enum CliError {
     /// The `serve` command.
     #[error(transparent)]
     Serve(#[from] crate::serve::Error),
+    /// The `forward` command (overlay client-edge).
+    #[cfg(feature = "overlay")]
+    #[error(transparent)]
+    Forward(#[from] crate::forward::ForwardError),
     /// The `sync` command.
     #[error(transparent)]
     Sync(#[from] crate::sync::Error),

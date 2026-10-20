@@ -1381,6 +1381,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
+name = "bech32"
+version = "0.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32637268377fc7b10a8c6d51de3e7fba1ce5dd371a96e342b34e6078db558e7f"
+
+[[package]]
 name = "bigdecimal"
 version = "0.4.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1547,6 +1553,7 @@ dependencies = [
  "boatramp-handlers",
  "boatramp-mcp",
  "boatramp-node",
+ "boatramp-overlay",
  "boatramp-rpktls",
  "boatramp-server",
  "boatramp-storage",
@@ -1642,6 +1649,7 @@ dependencies = [
  "axum",
  "axum-server",
  "boatramp-core",
+ "boatramp-overlay",
  "boatramp-rpktls",
  "bytes",
  "futures",
@@ -1864,6 +1872,43 @@ dependencies = [
  "tokio-util",
  "tower 0.5.3",
  "tracing",
+]
+
+[[package]]
+name = "boatramp-overlay"
+version = "0.41.0"
+dependencies = [
+ "boatramp-core",
+ "boatramp-overlay-proto",
+ "boatramp-rpktls",
+ "bytes",
+ "futures",
+ "quinn",
+ "rustls 0.23.40",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "boatramp-overlay-proto"
+version = "0.41.0"
+dependencies = [
+ "aws-lc-rs",
+ "bech32",
+ "boatramp-core",
+ "boatramp-rpktls",
+ "bytes",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.18",
+ "tokio",
+ "zeroize",
 ]
 
 [[package]]

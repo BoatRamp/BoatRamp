@@ -434,7 +434,13 @@ defined by its **root of trust** — there is no peer map; nodes self-identify a
 | `seeds` | list of strings | — | Control-plane addresses of existing members. Present ⇒ this node **joins**; absent + `--cluster-init` ⇒ it **founds**. |
 | `join_token` | string | — | The single-use bearer join token used when `seeds` are set. Keep the secret out of the file: `env:VAR`, `path:/file`, or an inline literal. |
 | `store_dir` | path | `<data-dir>/raft` | This node's durable Raft store. Never shared between nodes. |
-| `mesh` | table | — | Mesh identity + TLS: `key_file`, `key_rotation`, `join_token_ttl`, `gate_client_writes`. |
+| `mesh` | table | — | Mesh identity + TLS: `key_file`, `key_rotation`, `join_token_ttl`, `gate_client_writes`, `transport`. |
+
+The `[cluster.mesh]` table also selects the peer-mesh **transport**:
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `transport` | string | `"http"` | How the Raft peer mesh RPC travels: `"http"` (reqwest/axum over the mutual-TLS mesh) or `"overlay"` (boatramp's own overlay-QUIC fabric, reusing the mesh identity + live trust set verbatim). Both bind the same `cluster.listen` — HTTP over TCP, overlay over UDP/QUIC. Same RFC 7250 raw-public-key mutual auth either way; an untrusted peer is rejected at the handshake. |
 
 The node id is **derived** from the node's mesh key — there is no `node_id`
 field. Founding and joining are driven from the command line: `serve
@@ -448,6 +454,48 @@ field. Founding and joining are driven from the command line: `serve
 
 See [Deploy a self-hosted cluster](../how-to/deploy-cluster.md) and
 [Mesh identity & the single root anchor](../explanation/SECURITY-mesh-identity.md).
+
+## `overlay`
+
+The forward-flow **serve roles** this node runs — the server side of
+[`boatramp forward`](cli.md). A node can be a **relay/ingress** (accepts external client dials and
+forwards them, relay-blind, into the cluster), an **egress/terminator** (fronts local backend
+services), or both. Every dial is capability-gated against a trust root; the egress additionally
+re-authorizes the sealed capability end-to-end against the cryptographically-proven client identity
+(zero-trust), so a misrouting or compromised relay cannot reach a backend.
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `identity` | string | `<data-dir>/overlay/identity.key` | This node's overlay identity: an `ed25519:<hex>` seed inline, or a key-file path (load-or-generate). Required when a role is set; it is the identity a relay's clients and an egress's relay pin. |
+| `trust_root` | string | `serve.auth_root_public_key` | The dial-capability trust root (`ed25519:`/`es256:` tagged hex) every dial verifies against. |
+| `encryption_required` | bool | `true` | Refuse a non-E2EE dial (fail-closed). |
+| `relay_listen` | socket address | — | Bind a relay/ingress here (UDP/QUIC). Unset ⇒ no relay. |
+| `allowed_clients` | list of strings | `[]` | Client overlay identities (`ed25519:` tagged hex) the relay mutual-authenticates — the enrolled clients allowed to dial. (A capability is still required and is the authority.) |
+| `routes` | list of `{ service, egress, egress_id }` | `[]` | Relay routing: a requested service → the egress overlay address + identity to forward it to. |
+| `egress_listen` | socket address | — | Bind an egress/terminator here (UDP/QUIC). Unset ⇒ no egress. |
+| `services` | list of `{ name, backend }` | `[]` | Egress service map: a service name → the local backend it fronts. A service not listed is refused — the egress authorizes only what it fronts. |
+
+```ron
+overlay: (
+    identity: "/var/lib/boatramp/overlay/identity.key",   // load-or-generate
+    relay_listen: "0.0.0.0:9100",                          // this node is the ingress
+    allowed_clients: ["ed25519:<operator-laptop-key>"],
+    routes: [( service: "svc/db", egress: "10.0.0.5:9101", egress_id: "ed25519:<egress-key>" )],
+)
+```
+
+```ron
+overlay: (
+    identity: "/var/lib/boatramp/overlay/identity.key",
+    egress_listen: "0.0.0.0:9101",                         // this node fronts svc/db
+    services: [( name: "svc/db", backend: "127.0.0.1:5432" )],
+)
+```
+
+A remote client then reaches the service with `boatramp forward 127.0.0.1:5432 svc/db --relay
+<ingress>:9100 --relay-id <relay-key> --egress-id <egress-key> --token <cap> --identity <client-key>`.
+Client-side auto-discovery of the relay/target (so the identities need not be passed explicitly) is a
+later layer; the roles themselves are served here.
 
 ## `compute`
 
