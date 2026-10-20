@@ -1790,4 +1790,39 @@ mod consumer_scope_gate {
         );
         println!("CONSUMER BLOB SCOPE OK");
     }
+
+    /// GATE (boatramp-13-consumer-site-blob) — a `routing.consumers` bus consumer addresses the SAME
+    /// site blob container that a same-site HTTP handler (JMAP/IMAP) and a `compute bind-blob --site`
+    /// producer do: `hblob/{project-qualified-site}/{container}/`. Its `wasi:blobstore` is bound at
+    /// the consumer dispatch scope, which equals `project.qualified(site)` — so a consumer importing
+    /// `wasi:blobstore` + `blobstore_containers: ["mail"]` reads the body the edge wrote and JMAP/IMAP
+    /// read (the blob analog of `--bind sql`, delivered by the site-scoped dispatch — NOT the
+    /// function-private `fn/<name>` scope of the queue-triggered *function* path). Mutation-verified:
+    /// `BOATRAMP_CONSUMERSCOPE_MUTATION=bare_scope` drops the qualification → the consumer's container
+    /// prefix diverges from the producer/handler → RED. Marker `CONSUMER SITE BLOB CONTAINER OK`.
+    #[test]
+    fn consumer_blob_container_matches_handler_and_producer() {
+        let p = ProjectRef::new("mailroom-prod");
+        let (site, container) = ("mailroom", "mail");
+        // `with_blobstore(scope, …)` (boatramp-handlers) confines a container to
+        // `hblob/{scope}/{container}/` — the exact prefix `BlobBinding::resolve_blob_ref` resolves.
+        let container_prefix = |scope: &str| format!("hblob/{scope}/{container}/");
+        // The site HTTP handler binds blobstore at `project.qualified(site)`.
+        let handler = container_prefix(&p.qualified(site));
+        // A `compute bind-blob --site mailroom --container mail` producer (blob_shim `BlobScope`) writes
+        // under `hblob/{project-qualified-site}/{container}/`.
+        let producer = format!("hblob/{}/{container}/", p.qualified(site));
+        // The `routing.consumers` consumer is dispatched at `consumer_dispatch_scope(project, site)`.
+        let consumer = container_prefix(&consumer_dispatch_scope(p, site));
+        assert_eq!(
+            consumer, handler,
+            "a consumer must address the SAME site container an HTTP handler does"
+        );
+        assert_eq!(
+            consumer, producer,
+            "a consumer must read the SAME bytes a `compute bind-blob --site` producer wrote"
+        );
+        assert_eq!(consumer, "hblob/mailroom-prod/mailroom/mail/");
+        println!("CONSUMER SITE BLOB CONTAINER OK");
+    }
 }

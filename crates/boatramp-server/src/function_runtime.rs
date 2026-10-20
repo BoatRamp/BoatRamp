@@ -4012,6 +4012,111 @@ mod blobstore_dimension0_tests {
         );
     }
 
+    /// #13 END-TO-END (marker `CONSUMER SITE BLOB OK`) — a `routing.consumers` bus consumer, built
+    /// via the REAL scheduler consumer-binding path ([`crate::handler_dispatch::ConsumerRebuild`],
+    /// the exact call `scheduler::tick` makes), binds its plain `wasi:blobstore` at the SITE dispatch
+    /// scope (`project.qualified(site)`), so it reads/writes the EXACT site container
+    /// `hblob/{project-qualified-site}/{container}/` that a same-site HTTP handler (JMAP/IMAP) and a
+    /// `compute bind-blob --site` producer use — the blob analog of `--bind sql`. The edge writes the
+    /// message body to that container; this proves the consumer resolves the SAME key and reads the
+    /// SAME bytes back (NOT a function-private `fn/<name>` namespace). Imports only `wasi:blobstore`
+    /// + `blobstore_containers: ["mail"]` + `tenancy: disabled` — exactly mailroom's `consumer-delivery`
+    /// shape, so adding those three to its config lets it drop the inline `raw_b64` body-on-the-wire.
+    #[tokio::test]
+    async fn consumer_reads_the_site_blob_container_end_to_end() {
+        use crate::handler_dispatch::ConsumerRebuild;
+        use futures::StreamExt;
+
+        let project = ProjectRef::new("mailroom-prod");
+        let site = "mailroom";
+        let rt = runtime_with_site("mailroom-prod", site).await;
+        let inner = rt.inner.as_ref().unwrap();
+
+        // The consumer's blob scope IS the site dispatch scope — `project.qualified(site)`, proven
+        // equal to `scheduler::consumer_dispatch_scope(project, site)` by the scheduler scope gate,
+        // and byte-identical to both the HTTP-handler blob scope and the `compute bind-blob --site`
+        // producer prefix.
+        let scope = project.qualified(site);
+        // The site grants `wasi:blobstore` in its `[handlers].allow_imports` ceiling — build_bindings
+        // grants a capability only when BOTH the component imports it AND the site allows it (the same
+        // least-privilege ceiling that gates `sql`/`wasi:messaging`). This is the one config addition
+        // a site needs so its consumer may bind the shared blob container.
+        let site_cfg = HandlersSiteConfig {
+            enabled: true,
+            allow_imports: vec!["wasi:blobstore".to_string()],
+            ..Default::default()
+        };
+
+        // The edge / `compute bind-blob --site mailroom --container mail` producer wrote the body
+        // here — the exact key a JMAP/IMAP handler reads it back from.
+        let storage = inner.blob_backends.backend(project);
+        let body_key = format!("hblob/{scope}/mail/body.eml");
+        let body = b"Subject: hello\r\n\r\nthe body the consumer must classify".to_vec();
+        {
+            let seed = body.clone();
+            let stream: boatramp_core::ByteStream =
+                futures::stream::once(async move { Ok(bytes::Bytes::from(seed)) }).boxed();
+            storage
+                .put(&body_key, stream, boatramp_core::PutMeta::default())
+                .await
+                .expect("seed the site `mail` container (producer/edge write)");
+        }
+
+        // Build the consumer's bindings via the REAL scheduler consumer path.
+        let imports = vec!["wasi:blobstore".to_string()];
+        let containers = vec!["mail".to_string()];
+        let tenancy = Tenancy::Disabled;
+        let rebuild = ConsumerRebuild {
+            inner,
+            project,
+            site,
+            scope: &scope,
+            imports: &imports,
+            site_handlers: &site_cfg,
+            tenancy: Some(&tenancy),
+            token_claims: None,
+            stats_topics: &[],
+            tenant_secret_names: &[],
+            upload_containers: &[],
+            blobstore_containers: &containers,
+            egress_allowlist: &[],
+            secret_allowlist: &[],
+        };
+        let bindings = rebuild
+            .bindings_for(None)
+            .await
+            .expect("a consumer importing wasi:blobstore + blobstore_containers builds");
+        let blob = bindings
+            .blobstore()
+            .expect("the consumer's wasi:blobstore is bound at the site scope");
+
+        // The consumer resolves the SAME site-container key the producer wrote (NOT `fn/<name>`).
+        let (resolved_storage, key) = blob
+            .resolve_blob_ref("mail", "body.eml")
+            .expect("the site `mail` container is permitted for the consumer");
+        assert_eq!(
+            key, body_key,
+            "the consumer must resolve the site container key \
+             `hblob/{{project-qualified-site}}/mail/body.eml`, not a function-private `fn/<name>` one"
+        );
+
+        // …and reads back the SAME bytes the edge wrote — the capability #13 asks for, already present.
+        let got = resolved_storage
+            .get(&key)
+            .await
+            .expect("read the body back through the consumer's bound blobstore");
+        let mut buf = Vec::new();
+        let mut stream = got.body;
+        while let Some(chunk) = stream.next().await {
+            buf.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(
+            buf, body,
+            "the consumer read the exact body the edge wrote to the site `mail` container"
+        );
+        println!("CONSUMER SITE BLOB OK");
+    }
+
     /// **v0.8.0 mutation-verified blob Dimension-0 gate** (marker `BLOB DIMENSION-0 GATE OK`). Drives
     /// the REAL [`build_function_bindings`] path and asserts the HIGH-1/MEDIUM-1 bind-time invariants:
     /// `wasi:blobstore` is a tenant-scoped data capability, so under the strict multi-tenant posture an
