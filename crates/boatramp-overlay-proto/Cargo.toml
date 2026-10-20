@@ -24,6 +24,8 @@ boatramp-core = { workspace = true, features = ["authz"] }
 boatramp-rpktls = { workspace = true }
 thiserror = { workspace = true }
 hex = { workspace = true }
+# Serialize the dial-handshake request/verdict on the wire (derive only; pure).
+serde = { workspace = true }
 # Zero-copy byte buffers for the circuit frame payloads / retransmit segments.
 bytes = { workspace = true }
 # The relay-blind E2EE core: ML-KEM-768 + X25519 hybrid KEM, AES-256-GCM AEAD,

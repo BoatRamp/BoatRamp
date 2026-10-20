@@ -16,8 +16,13 @@ description = "boatramp overlay fabric — the async runtime: QUIC-on-raw-pubkey
 [dependencies]
 # The pure protocol/crypto core (identity, peer policy, wire contract, …).
 boatramp-overlay-proto = { workspace = true }
+# For the dial trust-root `TokenPublicKey` the egress gate verifies against.
+boatramp-core = { workspace = true, features = ["authz"] }
 # Raw-public-key TLS configs wired into quinn (reused, not rebuilt).
 boatramp-rpktls = { workspace = true }
+# Dial-handshake request/verdict wire codec.
+serde = { workspace = true }
+serde_json = { workspace = true }
 # The rustls configs rpktls hands back (to set ALPN before wrapping for QUIC).
 rustls = { workspace = true }
 # QUIC. default-features off → pin the crypto backend to aws-lc-rs so there is

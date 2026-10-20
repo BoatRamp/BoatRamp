@@ -110,6 +110,20 @@ pub fn client_endpoint(
     Ok(endpoint)
 }
 
+/// A dial-only endpoint that pins the server (`policy` must [`OverlayPeerPolicy::Pin`]) but presents
+/// **no client certificate** — for dialing a server-auth-only acceptor (an `AcceptAny` egress whose
+/// peer identity is instead learned at the E2EE layer). This is the relay→egress hop: the relay is
+/// blind and unauthenticated to the egress at the TLS layer.
+pub fn client_endpoint_server_auth(policy: &OverlayPeerPolicy) -> Result<Endpoint, QuicError> {
+    let (_, peer) = policy.pinned().ok_or(QuicError::NotPinned)?;
+    let mut tls = boatramp_rpktls::client_config_server_auth(policy.trust_set(), peer)?;
+    tls.alpn_protocols = vec![wire::ALPN.to_vec()];
+    let qcc = QuicClientConfig::try_from(tls).map_err(|_| QuicError::NoInitialCipherSuite)?;
+    let mut endpoint = Endpoint::client("0.0.0.0:0".parse().expect("valid wildcard addr"))?;
+    endpoint.set_default_client_config(ClientConfig::new(Arc::new(qcc)));
+    Ok(endpoint)
+}
+
 /// An accept-only endpoint bound to `bind` under `policy` (a relay/ingress or
 /// egress/terminator).
 pub fn server_endpoint(

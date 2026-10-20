@@ -9,12 +9,13 @@
 //! runtime crate's client-edge/egress.
 
 use boatramp_core::cose::{TokenPublicKey, verify_overlay_dial};
+use serde::{Deserialize, Serialize};
 
 use crate::identity::OverlayId;
 
 /// What the client presents in the dial handshake. (`resume` — reconnecting an in-flight circuit —
 /// arrives with direct-path promotion, IU-7; the first slice dials fresh.)
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DialRequest {
     /// The in-cluster target the client wants to reach (e.g. `svc/db`, `node/<id>`).
     pub service: String,
@@ -26,7 +27,7 @@ pub struct DialRequest {
 }
 
 /// Why a dial was refused. Returned to the client as a reason (a verdict, not an error).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DialReject {
     /// The capability's holder key is not the dialing peer's proven identity (a stolen token used
     /// by a different identity).
@@ -40,7 +41,7 @@ pub enum DialReject {
 }
 
 /// The gate's decision.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DialVerdict {
     /// Admitted; the authorized scope the capability carried.
     Accept { scope: String },
