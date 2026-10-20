@@ -173,7 +173,12 @@ where
     // the pump runs on its single link.
     let (_rebind_tx, rebind_rx) = mpsc::channel::<LinkHalves>(1);
 
-    let splice_fut = splice(sealer, opener, app_r, app_w, ss_w, ss_r);
+    // Idle signaling on the relay path (no ICE yet); IU-7's promotion wires real channels here.
+    let (_sig_out_tx, sig_out_rx) = mpsc::channel::<Vec<u8>>(16);
+    let (sig_in_tx, _sig_in_rx) = mpsc::channel::<Vec<u8>>(16);
+    let splice_fut = splice(
+        sealer, opener, app_r, app_w, ss_w, ss_r, sig_out_rx, sig_in_tx,
+    );
     let pump_fut = run_circuit_duplex(
         ps_r,
         ps_w,

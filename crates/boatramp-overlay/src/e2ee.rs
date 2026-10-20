@@ -14,7 +14,7 @@ use boatramp_overlay_proto::e2ee::{
 use boatramp_overlay_proto::identity::{OverlayId, OverlaySecret};
 use boatramp_overlay_proto::wire;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 
 /// Application read chunk → one sealed record.
 const READ_CHUNK: usize = 16 * 1024;
@@ -117,11 +117,13 @@ where
     Ok((session, peer))
 }
 
-/// Run the two record-mux pumps of an established session: seal application bytes from `app_r` onto
-/// `link_send` (channel [`wire::CH_DATA`]), and open records from `link_recv` back to `app_w`.
-/// Muxed control signaling ([`wire::CH_SIGNAL`], ICE in IU-6) shares the same sealed stream; until
-/// that lands, an inbound signal record is dropped. A clean EOF on either side half-closes the
-/// other.
+/// Run the two record-mux pumps of an established session: seal application bytes from `app_r` and
+/// control signals from `signaling_out` onto `link_send` ([`wire::CH_DATA`] / [`wire::CH_SIGNAL`]),
+/// and open records from `link_recv` back to `app_w` (data) or `signaling_in` (signals). The
+/// signaling channel carries the ICE candidate exchange (IU-6) inside the SAME sealed stream — never
+/// a side channel, so a relay cannot read or forge it. Delivery to `signaling_in` is non-blocking: a
+/// full/closed signaling queue must never stall the data path. A clean EOF on either side
+/// half-closes the other.
 pub async fn splice<AR, AW, LS, LR>(
     mut sealer: Sealer,
     mut opener: Opener,
@@ -129,6 +131,8 @@ pub async fn splice<AR, AW, LS, LR>(
     mut app_w: AW,
     mut link_send: LS,
     mut link_recv: LR,
+    mut signaling_out: mpsc::Receiver<Vec<u8>>,
+    signaling_in: mpsc::Sender<Vec<u8>>,
 ) -> Result<(), SpliceError>
 where
     AR: AsyncRead + Unpin,
@@ -138,16 +142,31 @@ where
 {
     let outbound = async {
         let mut buf = vec![0u8; READ_CHUNK];
+        let mut signaling_open = true;
         loop {
-            let n = app_r.read(&mut buf).await?;
-            if n == 0 {
-                link_send.shutdown().await?;
-                break;
+            tokio::select! {
+                r = app_r.read(&mut buf) => {
+                    let n = r?;
+                    if n == 0 {
+                        link_send.shutdown().await?; // app EOF → clean FIN
+                        break;
+                    }
+                    let mut plaintext = Vec::with_capacity(1 + n);
+                    plaintext.push(wire::CH_DATA);
+                    plaintext.extend_from_slice(&buf[..n]);
+                    write_lp(&mut link_send, &sealer.seal(&plaintext)?).await?;
+                }
+                msg = signaling_out.recv(), if signaling_open => match msg {
+                    Some(m) if m.len() <= wire::MAX_SIGNAL_LEN => {
+                        let mut plaintext = Vec::with_capacity(1 + m.len());
+                        plaintext.push(wire::CH_SIGNAL);
+                        plaintext.extend_from_slice(&m);
+                        write_lp(&mut link_send, &sealer.seal(&plaintext)?).await?;
+                    }
+                    Some(_) => {} // oversized control message — drop, never stall data
+                    None => signaling_open = false, // no more signals to send
+                },
             }
-            let mut plaintext = Vec::with_capacity(1 + n);
-            plaintext.push(wire::CH_DATA);
-            plaintext.extend_from_slice(&buf[..n]);
-            write_lp(&mut link_send, &sealer.seal(&plaintext)?).await?;
         }
         Ok::<(), SpliceError>(())
     };
@@ -166,7 +185,8 @@ where
                 app_w.write_all(payload).await?;
                 app_w.flush().await?;
             } else if tag == wire::CH_SIGNAL {
-                // ICE/control mux (IU-6) not yet wired — drop in the first slice.
+                // Non-blocking: a full/closed signaling queue must never stall the data path.
+                let _ = signaling_in.try_send(payload.to_vec());
             } else {
                 return Err(SpliceError::UnknownChannel(tag));
             }
@@ -242,6 +262,8 @@ mod tests {
                 tap: tap_w,
             },
             la_r,
+            mpsc::channel::<Vec<u8>>(1).1,
+            mpsc::channel::<Vec<u8>>(1).0,
         ));
         // B: collect what arrives.
         let (mut collector, coll_pump) = tokio::io::duplex(64 * 1024);
@@ -252,6 +274,8 @@ mod tests {
             coll_pump,
             lb_w,
             lb_r,
+            mpsc::channel::<Vec<u8>>(1).1,
+            mpsc::channel::<Vec<u8>>(1).0,
         ));
 
         a_side.await.unwrap().unwrap();
@@ -269,6 +293,71 @@ mod tests {
             !wire_bytes.windows(b"hello".len()).any(|w| w == b"hello"),
             "a relay must see only ciphertext"
         );
+    }
+
+    /// A `CH_SIGNAL` message (the ICE carrier) muxes through the sealed splice to the peer's
+    /// signaling sink, alongside (pending) app data.
+    #[tokio::test]
+    async fn splice_muxes_signaling_to_the_peer() {
+        let a = OverlaySecret::generate().unwrap();
+        let b = OverlaySecret::generate().unwrap();
+        let b_id = b.id();
+
+        let (ha, hb) = tokio::io::duplex(64 * 1024);
+        let (mut ha_r, mut ha_w) = tokio::io::split(ha);
+        let (mut hb_r, mut hb_w) = tokio::io::split(hb);
+        let a2 = OverlaySecret::from_seed_hex(&a.seed_hex()).unwrap();
+        let at = tokio::spawn(async move {
+            establish(&mut ha_w, &mut ha_r, &a2, Role::Initiator, Some(b_id), None).await
+        });
+        let (sess_b, _) = establish(&mut hb_w, &mut hb_r, &b, Role::Responder, None, None)
+            .await
+            .unwrap();
+        let (sess_a, _) = at.await.unwrap().unwrap();
+
+        let (la, lb) = tokio::io::duplex(64 * 1024);
+        let (la_r, la_w) = tokio::io::split(la);
+        let (lb_r, lb_w) = tokio::io::split(lb);
+        let (seal_a, open_a) = sess_a.split();
+        let (seal_b, open_b) = sess_b.split();
+
+        // App sources that never EOF (write ends held), so the outbound pumps stay alive to
+        // service signaling.
+        let (_a_hold, a_app) = tokio::io::duplex(64);
+        let (_b_hold, b_app) = tokio::io::duplex(64);
+        let (a_app_r, a_app_w) = tokio::io::split(a_app);
+        let (b_app_r, b_app_w) = tokio::io::split(b_app);
+
+        let (a_sig_out, a_sig_out_rx) = mpsc::channel::<Vec<u8>>(4);
+        let (b_sig_in, mut b_sig_in_rx) = mpsc::channel::<Vec<u8>>(4);
+
+        let _a = tokio::spawn(splice(
+            seal_a,
+            open_a,
+            a_app_r,
+            a_app_w,
+            la_w,
+            la_r,
+            a_sig_out_rx,
+            mpsc::channel::<Vec<u8>>(1).0,
+        ));
+        let _b = tokio::spawn(splice(
+            seal_b,
+            open_b,
+            b_app_r,
+            b_app_w,
+            lb_w,
+            lb_r,
+            mpsc::channel::<Vec<u8>>(1).1,
+            b_sig_in,
+        ));
+
+        a_sig_out.send(b"bro-candidate-xyz".to_vec()).await.unwrap();
+        let got = tokio::time::timeout(std::time::Duration::from_secs(5), b_sig_in_rx.recv())
+            .await
+            .expect("signaling delivered within the timeout")
+            .expect("a signal arrived");
+        assert_eq!(got, b"bro-candidate-xyz");
     }
 
     /// A tiny `AsyncWrite` that mirrors everything written into a tap (for the relay-blind check).
