@@ -804,6 +804,41 @@ jobs:
             fi
           done
 
+      # PLAN-compute-bindings COMPUTE MESSAGING-SHIM SCOPED GATE (marker `COMPUTE MESSAGING-SHIM
+      # SCOPED OK`). The compute messaging-shim gives an opaque workload the SAME `{project}/bus/
+      # <topic>` project bus — over the SAME `Messaging` substrate — a `wasi:messaging` producer's
+      # `bus:` publish reaches, scoped by a bearer token the shim mints (the project is bound by the
+      # TOKEN, never a client field). This gate drives the SINGLE enforced decision
+      # `messaging_shim::authorize` + `MessagingShim::authenticate` (the same code the publish
+      # handler calls, so tested == enforced) across the three security dimensions, AND proves the
+      # shared-bus property by publishing through the shim into the REAL `LogMessaging` substrate and
+      # CLAIMING the message back off the exact `{project}/bus/<topic>` key a consumer subscribes.
+      # Asserts the marker + pass count catch a silent skip/rename. MUTATION-VERIFIED: the SAME test
+      # re-run under each `BOATRAMP_COMPUTEMESSAGING_MUTATION` neuters ONE check and MUST FAIL —
+      # `allow_cross_topic` (a token scoped to topic X reaches a DIFFERENT topic), `allow_traversal`
+      # (a `../` topic escapes the `{project}/bus/` prefix), `admit_unmatched` (an unauthenticated/
+      # mismatched token is admitted). A pass-under-mutation (a hollow gate) fails the merge.
+      - name: "compute messaging-shim scoped gate (project-bus/topic-bound, traversal-safe, authed; shared bus)"
+        run: |
+          set -eo pipefail
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-server \
+            compute_messaging_shim_scoped_gate -- --nocapture 2>&1 | tee compute-messaging-shim.log
+          grep -qE 'test result: ok\. 1 passed' compute-messaging-shim.log \
+            || { echo "::error::compute messaging-shim gate did not run (silent skip or a failure)" >&2; exit 1; }
+          grep -q 'COMPUTE MESSAGING-SHIM SCOPED OK' compute-messaging-shim.log \
+            || { echo "::error::compute messaging-shim gate never reached its marker (a token-scope / traversal / auth / shared-bus regression)" >&2; exit 1; }
+          # Mutation guard: each mutation MUST fail the gate (proving each check is load-bearing).
+          for mut in allow_cross_topic allow_traversal admit_unmatched; do
+            if BOATRAMP_COMPUTEMESSAGING_MUTATION="$mut" cargo-zigbuild test --target x86_64-unknown-linux-musl \
+              -p boatramp-server compute_messaging_shim_scoped_gate \
+              -- --nocapture > "compute-messaging-shim-mutation-$mut.log" 2>&1; then
+              echo "::error::compute messaging-shim gate is HOLLOW — it passed under mutation '$mut' (a messaging-shim scope/auth security property is not actually enforced)" >&2
+              exit 1
+            else
+              echo "compute messaging-shim mutation verified: '$mut' fails the gate as expected."
+            fi
+          done
+
       # DEFAULT-SCOPE DISJOINTNESS gate (v0.31.0 Finding 8): `ProjectRef::qualified` is two-segment
       # for EVERY project INCLUDING the reserved `default` (`default/{base}`), so a default-project
       # workload's client-composed-key keyspace (`hblob/`, `hkv/`, `mq*/`) is prefix-disjoint from
